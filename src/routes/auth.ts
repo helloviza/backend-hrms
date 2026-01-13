@@ -1,0 +1,1022 @@
+// apps/backend/src/routes/auth.ts
+import { Router } from "express";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+
+import User from "../models/User.js";
+import Customer from "../models/Customer.js";
+import Vendor from "../models/Vendor.js";
+
+import CustomerMember from "../models/CustomerMember.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import MasterData from "../models/MasterData.js";
+
+const r = Router();
+
+/* ───────────────────────────────────────────────
+ * Constants
+ * ─────────────────────────────────────────────── */
+const ACCESS_EXPIRES_IN = "15m";
+const REFRESH_EXPIRES_IN = "7d";
+const REFRESH_COOKIE_NAME = "refreshToken";
+
+// Access token cookie (read by approvals.ts extractTokenFromReq)
+const ACCESS_COOKIE_NAME = "hrms_accessToken";
+
+const isProd = process.env.NODE_ENV === "production";
+
+/* ───────────────────────────────────────────────
+ * Helpers
+ * ─────────────────────────────────────────────── */
+function normalizeRoles(roles: string[] = []) {
+  return roles
+    .map((rr) => String(rr).trim().toUpperCase())
+    .filter(Boolean)
+    .map((rr) => (rr === "SUPER_ADMIN" ? "SUPERADMIN" : rr));
+}
+
+function normalizeEmail(email: string): string {
+  return String(email || "").trim().toLowerCase();
+}
+
+function safeEnv(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env: ${name}`);
+  return v;
+}
+
+function isValidObjectId(id: any) {
+  return /^[a-fA-F0-9]{24}$/.test(String(id || "").trim());
+}
+
+function normStr(v: any) {
+  return String(v ?? "").trim();
+}
+
+function escapeRegExp(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function emailDomain(email: string) {
+  const e = normalizeEmail(email);
+  const at = e.lastIndexOf("@");
+  return at >= 0 ? e.slice(at + 1) : "";
+}
+
+function authHeaderBearer(req: any): string | null {
+  const auth = req.headers?.authorization;
+  if (!auth || typeof auth !== "string") return null;
+  if (!auth.startsWith("Bearer ")) return null;
+  const parts = auth.split(" ");
+  return parts[1] || null;
+}
+
+function extractAccessToken(req: any): string | null {
+  // 1) Authorization: Bearer
+  const b = authHeaderBearer(req);
+  if (b) return b;
+
+  // 2) Cookie
+  const ck = req.cookies?.[ACCESS_COOKIE_NAME];
+  if (ck && typeof ck === "string") return ck;
+
+  return null;
+}
+
+function verifyAccessTokenOrThrow(token: string) {
+  try {
+    return jwt.verify(token, safeEnv("JWT_SECRET")) as any;
+  } catch (err: any) {
+    const name = err?.name || "JsonWebTokenError";
+    const msg = err?.message || "Invalid token";
+    const e: any = new Error(msg);
+    e.name = name;
+    e.original = err;
+    throw e;
+  }
+}
+
+function send401ForJwtError(res: any, err: any) {
+  if (err?.name === "TokenExpiredError") {
+    return res.status(401).json({
+      error: "Token expired",
+      hint: "Please login again (or refresh session) and retry.",
+    });
+  }
+  return res.status(401).json({
+    error: "Invalid token",
+    hint: "Please login again and retry.",
+  });
+}
+
+function signAccessToken(params: {
+  userId: string;
+  email: string;
+  roles: string[];
+  customerId?: string | null;
+  vendorId?: string | null;
+  businessId?: string | null;
+  customerMemberRole?: string | null;
+}) {
+  const payload: any = {
+    sub: String(params.userId),
+    roles: normalizeRoles(params.roles || []),
+    email: normalizeEmail(params.email || ""),
+  };
+
+  if (params.customerId) payload.customerId = String(params.customerId);
+  if (params.businessId) payload.businessId = String(params.businessId);
+  if (params.vendorId) payload.vendorId = String(params.vendorId);
+  if (params.customerMemberRole)
+    payload.customerMemberRole = String(params.customerMemberRole).toUpperCase();
+
+  return jwt.sign(payload, safeEnv("JWT_SECRET"), { expiresIn: ACCESS_EXPIRES_IN });
+}
+
+function signRefresh(user: any) {
+  return jwt.sign({ sub: String(user._id) }, safeEnv("JWT_REFRESH_SECRET"), {
+    expiresIn: REFRESH_EXPIRES_IN,
+  });
+}
+
+function verifyRefresh(token: string) {
+  return jwt.verify(token, safeEnv("JWT_REFRESH_SECRET"));
+}
+
+function cookieDomainOption() {
+  // optional, keeps local dev safe
+  const d = String(process.env.COOKIE_DOMAIN || "").trim();
+  return d ? { domain: d } : {};
+}
+
+function setRefreshCookie(res: any, refreshToken: string) {
+  res.cookie(REFRESH_COOKIE_NAME, refreshToken, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
+    path: "/api/auth/refresh",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    ...cookieDomainOption(),
+  });
+}
+
+function clearRefreshCookie(res: any) {
+  res.clearCookie(REFRESH_COOKIE_NAME, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
+    path: "/api/auth/refresh",
+    ...cookieDomainOption(),
+  });
+}
+
+function setAccessCookie(res: any, accessToken: string) {
+  res.cookie(ACCESS_COOKIE_NAME, accessToken, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
+    path: "/api",
+    maxAge: 15 * 60 * 1000,
+    ...cookieDomainOption(),
+  });
+}
+
+function clearAccessCookie(res: any) {
+  res.clearCookie(ACCESS_COOKIE_NAME, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
+    path: "/api",
+    ...cookieDomainOption(),
+  });
+}
+
+function generateRandomPassword(length = 12): string {
+  const chars =
+    "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*";
+  let out = "";
+  for (let i = 0; i < length; i += 1)
+    out += chars.charAt(Math.floor(Math.random() * chars.length));
+  return out;
+}
+
+function isHrOrAdmin(user: any | null | undefined): boolean {
+  if (!user) return false;
+  const roles = normalizeRoles(user.roles || []);
+  return (
+    roles.includes("HR") ||
+    roles.includes("ADMIN") ||
+    roles.includes("HR_ADMIN") ||
+    roles.includes("SUPERADMIN") ||
+    roles.includes("STAFF")
+  );
+}
+
+/**
+ * ✅ STAFF detector (prevents customer auto-link + customer role pollution)
+ * Treat as STAFF if:
+ * - hrmsAccessLevel/accountType/userType explicitly STAFF
+ * - OR role claims include ADMIN / SUPERADMIN / HR / HR_ADMIN / STAFF
+ */
+function isStaffActor(userLike: any): boolean {
+  if (!userLike) return false;
+
+  const lvl = String(userLike.hrmsAccessLevel || "").trim().toUpperCase();
+  const at = String(userLike.accountType || "").trim().toUpperCase();
+  const ut = String(userLike.userType || "").trim().toUpperCase();
+  if (lvl === "STAFF" || at === "STAFF" || ut === "STAFF") return true;
+
+  const roles = normalizeRoles(userLike.roles || []);
+  return (
+    roles.includes("ADMIN") ||
+    roles.includes("SUPERADMIN") ||
+    roles.includes("HR") ||
+    roles.includes("HR_ADMIN") ||
+    roles.includes("STAFF")
+  );
+}
+
+/* =========================================================
+ * MasterData Business resolver
+ * ======================================================= */
+function customerTypeClause() {
+  const rx = /^(business|customer)$/i;
+  return {
+    $or: [
+      { type: rx },
+      { entityType: rx },
+      { "payload.type": rx },
+      { "payload.entityType": rx },
+    ],
+  };
+}
+
+async function findBusinessMasterDataByEmailOrOwner(params: {
+  email: string;
+  ownerId: string;
+  userId?: string;
+}) {
+  const email = normalizeEmail(params.email);
+  const ownerId = normStr(params.ownerId);
+  const userId = normStr(params.userId || "");
+
+  const or: any[] = [];
+
+  if (email) {
+    const rx = new RegExp(`^${escapeRegExp(email)}$`, "i");
+    or.push(
+      { email: rx },
+      { officialEmail: rx },
+      { official_email: rx },
+
+      { "payload.email": rx },
+      { "payload.officialEmail": rx },
+      { "payload.primaryEmail": rx },
+      { "payload.ownerEmail": rx },
+      { "payload.createdByEmail": rx },
+      { "payload.companyEmail": rx },
+      { "payload.contactEmail": rx },
+      { "payload.billingEmail": rx },
+      { "payload.adminEmail": rx },
+
+      { "payload.contact.email": rx },
+      { "payload.contactEmail.email": rx }
+    );
+  }
+
+  const ids = [ownerId, userId].filter(Boolean);
+  for (const id of ids) {
+    or.push(
+      { ownerId: id },
+      { "payload.ownerId": id },
+      { "payload.createdBy": id },
+      { "payload.userId": id }
+    );
+  }
+
+  if (!or.length) return null;
+
+  return MasterData.findOne({ $and: [customerTypeClause(), { $or: or }] })
+    .sort({ updatedAt: -1, createdAt: -1 })
+    .lean()
+    .exec();
+}
+
+/* =========================================================
+ * Ensure workspace + leader for customerId (ObjectId style)
+ * ======================================================= */
+async function ensureWorkspaceAndLeader(params: {
+  customerId: string;
+  email: string;
+  name?: string;
+}) {
+  const customerId = String(params.customerId || "").trim();
+  const email = normalizeEmail(params.email);
+  if (!isValidObjectId(customerId) || !email) return;
+
+  await CustomerWorkspace.updateOne(
+    { customerId },
+    {
+      $setOnInsert: {
+        customerId,
+        allowedDomains: [],
+        allowedEmails: [],
+        defaultApproverEmails: [],
+        canApproverCreateUsers: true,
+        userCreationEnabled: false, // default safety
+        status: "ACTIVE",
+        createdAt: new Date(),
+      },
+      $set: { updatedAt: new Date() },
+    },
+    { upsert: true }
+  ).exec();
+
+  const rx = new RegExp(`^${escapeRegExp(email)}$`, "i");
+  const setFields: any = {
+    role: "WORKSPACE_LEADER",
+    isActive: true,
+    updatedAt: new Date(),
+  };
+  if (params.name) setFields.name = normStr(params.name);
+
+  await CustomerMember.updateOne(
+    { customerId, email: rx },
+    {
+      $setOnInsert: {
+        customerId,
+        email,
+        invitedAt: new Date(),
+        createdBy: "auth:auto-link",
+      },
+      $set: setFields,
+    },
+    { upsert: true }
+  ).exec();
+}
+
+/* =========================================================
+ * Customer/Vendor linking
+ * ======================================================= */
+async function findLinkedCustomerVendor(userId: any, email: string) {
+  const e = normalizeEmail(email);
+
+  const customer =
+    (await Customer.findOne({ ownerId: userId }).lean()) ||
+    (await Customer.findOne({
+      $or: [{ email: e }, { officialEmail: e }, { official_email: e }],
+    }).lean());
+
+  const vendor =
+    (await Vendor.findOne({ ownerId: userId }).lean()) ||
+    (await Vendor.findOne({
+      $or: [{ email: e }, { officialEmail: e }, { official_email: e }],
+    }).lean());
+
+  return { customer, vendor };
+}
+
+async function buildAuthSafeUser(userDoc: any) {
+  const base = userDoc?.toJSON ? userDoc.toJSON() : userDoc;
+
+  const email = normalizeEmail(base?.email || "");
+  const userId = String(base?._id || "");
+
+  const baseRoles = normalizeRoles(base.roles || []);
+  const staff = isStaffActor({ ...base, roles: baseRoles });
+
+  const { customer, vendor } = await findLinkedCustomerVendor(base._id, email);
+
+  // Workspace member lookup (latest active membership) — ONLY for non-staff
+  let member: any = null;
+  if (!staff && email) {
+    const rx = new RegExp(`^${escapeRegExp(email)}$`, "i");
+    member = await CustomerMember.findOne({
+      email: rx,
+      $or: [{ isActive: { $exists: false } }, { isActive: true }],
+    })
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .lean()
+      .exec();
+  }
+
+  const set = new Set<string>(baseRoles);
+
+  // Only add CUSTOMER/VENDOR links for non-staff
+  if (!staff) {
+    if (customer) set.add("CUSTOMER");
+    if (vendor) set.add("VENDOR");
+
+    let customerMemberRole: string | null = null;
+    if (member?.customerId) {
+      set.add("CUSTOMER");
+      if (member?.role) {
+        const mr = String(member.role).toUpperCase();
+        set.add(mr);
+        customerMemberRole = mr;
+      }
+    }
+
+    if (set.size === 0) set.add("EMPLOYEE");
+
+    // Order: ensure CUSTOMER/VENDOR early, but keep all roles present
+    const ordered: string[] = [];
+    if (set.has("VENDOR")) ordered.push("VENDOR");
+    if (set.has("CUSTOMER")) ordered.push("CUSTOMER");
+
+    const priority = [
+      "SUPERADMIN",
+      "ADMIN",
+      "HR",
+      "HR_ADMIN",
+      "STAFF",
+      "MANAGER",
+      "EMPLOYEE",
+    ];
+    for (const p of priority) if (set.has(p)) ordered.push(p);
+    for (const rr of Array.from(set)) if (!ordered.includes(rr)) ordered.push(rr);
+
+    const roles = ordered.filter(Boolean);
+
+    // Resolve customerId (non-staff only)
+    let rawCustomerId: any =
+      (base?.customerId ? base.customerId : null) ||
+      (member?.customerId ? member.customerId : null) ||
+      (customer?._id ? customer._id : null) ||
+      null;
+
+    if (!rawCustomerId && email) {
+      const md = await findBusinessMasterDataByEmailOrOwner({
+        email,
+        ownerId: String(base?.sub || ""),
+        userId,
+      });
+      if (md?._id) rawCustomerId = md._id;
+    }
+
+    if (!rawCustomerId && email) {
+      const domain = emailDomain(email);
+      const ws: any = await CustomerWorkspace.findOne({
+        $or: [
+          { allowedEmails: email },
+          ...(domain ? [{ allowedDomains: domain }] : []),
+        ],
+      })
+        .sort({ updatedAt: -1, createdAt: -1 })
+        .lean()
+        .exec();
+
+      if (ws?.customerId) rawCustomerId = ws.customerId;
+    }
+
+    const customerId = rawCustomerId ? String(rawCustomerId) : null;
+
+    const vendorId =
+      (base?.vendorId ? String(base.vendorId) : null) ||
+      (vendor?._id ? String(vendor._id) : null);
+
+    const hasCustomerRole = roles.includes("CUSTOMER");
+    const hasVendorRole = roles.includes("VENDOR");
+
+    const accountType =
+      hasVendorRole || vendorId
+        ? "VENDOR"
+        : hasCustomerRole || customerId
+        ? "CUSTOMER"
+        : "EMPLOYEE";
+
+    const safe: any = {
+      ...base,
+      roles,
+      role: roles[0],
+      accountType,
+      userType: accountType,
+      customerMemberRole: customerMemberRole || undefined,
+    };
+
+    if (customerId) {
+      safe.customerId = customerId;
+      if (!safe.businessId) safe.businessId = customerId;
+    }
+    if (vendorId) safe.vendorId = vendorId;
+
+    // IMPORTANT: stop "Employee" labeling for Customer/Vendor accounts
+    if (accountType === "CUSTOMER") {
+      safe.hrmsAccessRole = "CUSTOMER";
+      safe.hrmsAccessLevel = "CUSTOMER";
+    }
+    if (accountType === "VENDOR") {
+      safe.hrmsAccessRole = "VENDOR";
+      safe.hrmsAccessLevel = "VENDOR";
+    }
+
+    return {
+      safe,
+      roles,
+      customerId,
+      vendorId,
+      customerMemberRole: customerMemberRole || null,
+      staff: false,
+    };
+  }
+
+  // ───────────────────────────────────────────────
+  // STAFF-safe path: never infer CUSTOMER/VENDOR/member roles
+  // ───────────────────────────────────────────────
+  if (set.size === 0) set.add("STAFF");
+
+  const ordered: string[] = [];
+  const priority = [
+    "SUPERADMIN",
+    "ADMIN",
+    "HR",
+    "HR_ADMIN",
+    "STAFF",
+    "MANAGER",
+    "EMPLOYEE",
+  ];
+  for (const p of priority) if (set.has(p)) ordered.push(p);
+  for (const rr of Array.from(set)) if (!ordered.includes(rr)) ordered.push(rr);
+
+  const roles = ordered.filter(Boolean);
+
+  const safe: any = {
+    ...base,
+    roles,
+    role: roles[0],
+    accountType: "STAFF",
+    userType: "STAFF",
+  };
+
+  // Ensure STAFF labels remain STAFF (do not override to CUSTOMER)
+  if (!safe.hrmsAccessLevel) safe.hrmsAccessLevel = "STAFF";
+  if (!safe.hrmsAccessRole) {
+    if (roles.includes("SUPERADMIN")) safe.hrmsAccessRole = "SUPER_ADMIN";
+    else if (roles.includes("ADMIN")) safe.hrmsAccessRole = "ADMIN";
+    else if (roles.includes("HR")) safe.hrmsAccessRole = "HR";
+    else safe.hrmsAccessRole = "STAFF";
+  }
+
+  // Strip any accidental customer/vendor fields from stored doc
+  delete safe.customerId;
+  delete safe.businessId;
+  delete safe.customerMemberRole;
+  delete safe.vendorId;
+
+  return {
+    safe,
+    roles,
+    customerId: null,
+    vendorId: null,
+    customerMemberRole: null,
+    staff: true,
+  };
+}
+
+/* =========================================================
+ * Workspace -> User resolver for admin reset
+ * ======================================================= */
+async function findCustomerMemberByEmail(email: string) {
+  const e = normalizeEmail(email);
+  const rx = new RegExp(`^${escapeRegExp(e)}$`, "i");
+  return CustomerMember.findOne({ email: rx }).lean().exec();
+}
+
+async function findWorkspaceByCustomerId(customerId: string) {
+  if (!customerId) return null;
+  return CustomerWorkspace.findOne({ customerId }).lean().exec();
+}
+
+async function ensureUserFromWorkspaceMember(email: string, passwordHash: string) {
+  const member: any = await findCustomerMemberByEmail(email);
+  if (!member) return { user: null, createdFromWorkspace: false };
+
+  const roles = normalizeRoles(["CUSTOMER", member.role || "REQUESTER"]);
+  const name = String(member.name || "").trim();
+  const firstName = name || "Workspace User";
+
+  const user: any = await User.create({
+    email,
+    officialEmail: email,
+    personalEmail: email,
+    firstName,
+    lastName: "",
+    roles,
+    passwordHash,
+    customerId: member.customerId,
+    businessId: member.customerId,
+    role: "CUSTOMER",
+    accountType: "CUSTOMER",
+    userType: "CUSTOMER",
+    hrmsAccessRole: "CUSTOMER",
+    hrmsAccessLevel: "CUSTOMER",
+  });
+
+  const ws = await findWorkspaceByCustomerId(String(member.customerId || ""));
+  return {
+    user,
+    createdFromWorkspace: true,
+    workspaceInfo: {
+      customerId: String(member.customerId || ""),
+      memberRole: String(member.role || ""),
+      hasWorkspace: Boolean(ws),
+    },
+  };
+}
+
+/* ───────────────────────────────────────────────
+ * REGISTER
+ * ─────────────────────────────────────────────── */
+r.post("/register", async (req, res) => {
+  try {
+    const { email, password, firstName, lastName, roles } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password are required" });
+    }
+
+    const normalizedEmail = normalizeEmail(email);
+
+    const existing = await User.findOne({ email: normalizedEmail });
+    if (existing) return res.status(400).json({ error: "User already exists" });
+
+    let finalRoles: string[] = normalizeRoles(Array.isArray(roles) ? roles : []);
+    if (!finalRoles.length) finalRoles = ["EMPLOYEE"];
+
+    const passwordHash = await bcrypt.hash(password, 12);
+    const user = await User.create({
+      email: normalizedEmail,
+      officialEmail: normalizedEmail,
+      personalEmail: normalizedEmail,
+      firstName,
+      lastName,
+      roles: finalRoles,
+      passwordHash,
+    });
+
+    res.json({ id: user._id });
+  } catch (err) {
+    console.error("[auth/register] failed:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ───────────────────────────────────────────────
+ * LOGIN
+ * ─────────────────────────────────────────────── */
+r.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || typeof email !== "string" || !password) {
+      return res.status(400).json({ error: "Email and password are required" });
+    }
+
+    const normalizedEmail = normalizeEmail(email);
+
+    const user: any = await User.findOne({
+      $or: [
+        { email: normalizedEmail },
+        { officialEmail: normalizedEmail },
+        { personalEmail: normalizedEmail },
+      ],
+    });
+
+    if (!user || !user.passwordHash) {
+      return res.status(400).json({ error: "Invalid credentials or password not set" });
+    }
+
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(400).json({ error: "Invalid credentials" });
+
+    // 1) Build safe
+    let built = await buildAuthSafeUser(user);
+
+    // ✅ STAFF: never auto-link workspace leader
+    if (!built.staff) {
+      // 2) Auto-link workspace + leader if customerId is ObjectId
+      if (built.customerId && isValidObjectId(built.customerId)) {
+        await ensureWorkspaceAndLeader({
+          customerId: built.customerId,
+          email: built.safe.email,
+          name: built.safe.firstName || built.safe.name,
+        });
+
+        if (!user.customerId) {
+          user.customerId = built.customerId;
+          user.businessId = built.customerId;
+          await user.save();
+        }
+
+        // 3) Rebuild so roles include member role immediately
+        built = await buildAuthSafeUser(user);
+      }
+    }
+
+    const accessToken = signAccessToken({
+      userId: String(user._id),
+      email: built.safe.email,
+      roles: built.roles,
+      customerId: built.staff ? undefined : built.customerId || undefined,
+      businessId: built.staff ? undefined : built.customerId || undefined,
+      vendorId: built.staff ? undefined : built.vendorId || undefined,
+      customerMemberRole: built.staff ? undefined : built.customerMemberRole || undefined,
+    });
+
+    const refreshToken = signRefresh(user);
+
+    setRefreshCookie(res, refreshToken);
+    setAccessCookie(res, accessToken);
+
+    res.json({ accessToken, user: built.safe });
+  } catch (err) {
+    console.error("[auth/login] failed:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ───────────────────────────────────────────────
+ * REFRESH
+ * ─────────────────────────────────────────────── */
+r.post("/refresh", async (req, res) => {
+  try {
+    const token = (req.cookies && req.cookies[REFRESH_COOKIE_NAME]) || null;
+    if (!token) return res.status(401).json({ error: "Missing refresh token" });
+
+    const payload: any = verifyRefresh(token);
+    const user: any = await User.findById(payload.sub);
+    if (!user) return res.status(401).json({ error: "User not found" });
+
+    let built = await buildAuthSafeUser(user);
+
+    // ✅ STAFF: never auto-link workspace leader
+    if (!built.staff) {
+      if (built.customerId && isValidObjectId(built.customerId)) {
+        await ensureWorkspaceAndLeader({
+          customerId: built.customerId,
+          email: built.safe.email,
+          name: built.safe.firstName || built.safe.name,
+        });
+
+        if (!user.customerId) {
+          user.customerId = built.customerId;
+          user.businessId = built.customerId;
+          await user.save();
+        }
+
+        built = await buildAuthSafeUser(user);
+      }
+    }
+
+    const newAccessToken = signAccessToken({
+      userId: String(user._id),
+      email: built.safe.email,
+      roles: built.roles,
+      customerId: built.staff ? undefined : built.customerId || undefined,
+      businessId: built.staff ? undefined : built.customerId || undefined,
+      vendorId: built.staff ? undefined : built.vendorId || undefined,
+      customerMemberRole: built.staff ? undefined : built.customerMemberRole || undefined,
+    });
+
+    const newRefreshToken = signRefresh(user);
+
+    setRefreshCookie(res, newRefreshToken);
+    setAccessCookie(res, newAccessToken);
+
+    res.json({ accessToken: newAccessToken, user: built.safe });
+  } catch (err) {
+    console.error("[auth/refresh] failed:", err);
+    res.status(401).json({ error: "Invalid or expired refresh token" });
+  }
+});
+
+/* ───────────────────────────────────────────────
+ * CURRENT USER
+ * ─────────────────────────────────────────────── */
+r.get("/me", async (req, res) => {
+  try {
+    const token = extractAccessToken(req);
+    if (!token) return res.status(401).json({ error: "Missing token" });
+
+    let payload: any;
+    try {
+      payload = verifyAccessTokenOrThrow(token);
+    } catch (err: any) {
+      return send401ForJwtError(res, err);
+    }
+
+    const user: any = await User.findById(payload.sub);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const { safe } = await buildAuthSafeUser(user);
+    res.json({ user: safe });
+  } catch (err) {
+    console.error("[auth/me] error", err);
+    res.status(401).json({ error: "Invalid token" });
+  }
+});
+
+/* ───────────────────────────────────────────────
+ * CHANGE PASSWORD (self-service)
+ * ─────────────────────────────────────────────── */
+r.post("/change-password", async (req, res) => {
+  try {
+    const token = extractAccessToken(req);
+    if (!token) return res.status(401).json({ error: "Missing token" });
+
+    let payload: any;
+    try {
+      payload = verifyAccessTokenOrThrow(token);
+    } catch (err: any) {
+      return send401ForJwtError(res, err);
+    }
+
+    const user: any = await User.findById(payload.sub);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const { currentPassword, newPassword } = req.body || {};
+    if (
+      !currentPassword ||
+      typeof currentPassword !== "string" ||
+      !newPassword ||
+      typeof newPassword !== "string"
+    ) {
+      return res.status(400).json({ error: "Current password and new password are required" });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: "New password must be at least 8 characters" });
+    }
+
+    if (!user.passwordHash) {
+      return res.status(400).json({
+        error: "Your account does not have a password set yet. Contact HR / Admin.",
+      });
+    }
+
+    const ok = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!ok) return res.status(400).json({ error: "Current password is incorrect" });
+
+    user.passwordHash = await bcrypt.hash(newPassword, 12);
+    await user.save();
+
+    res.json({ message: "Password updated successfully" });
+  } catch (err: any) {
+    console.error("[auth/change-password] error", err);
+    res.status(500).json({ error: "Failed to update password", detail: err?.message });
+  }
+});
+
+/* ───────────────────────────────────────────────
+ * ADMIN RESET PASSWORD (HR/Admin only)
+ * ─────────────────────────────────────────────── */
+r.post("/admin/reset-password", async (req, res) => {
+  try {
+    const token = extractAccessToken(req);
+    if (!token) return res.status(401).json({ error: "Missing token" });
+
+    let payload: any;
+    try {
+      payload = verifyAccessTokenOrThrow(token);
+    } catch (err: any) {
+      return send401ForJwtError(res, err);
+    }
+
+    const actor: any = await User.findById(payload.sub);
+    if (!actor) return res.status(404).json({ error: "Actor not found" });
+    if (!isHrOrAdmin(actor)) return res.status(403).json({ error: "HR/Admin access required" });
+
+    const { email, newPassword } = req.body || {};
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ error: "Email is required to reset password" });
+    }
+
+    const normalizedEmail = normalizeEmail(email);
+
+    const finalPassword =
+      typeof newPassword === "string" && newPassword.length >= 8
+        ? newPassword
+        : generateRandomPassword(12);
+
+    const finalHash = await bcrypt.hash(finalPassword, 12);
+
+    let user: any = await User.findOne({
+      $or: [
+        { email: normalizedEmail },
+        { officialEmail: normalizedEmail },
+        { personalEmail: normalizedEmail },
+      ],
+    });
+
+    let created = false;
+    let createdFromWorkspace = false;
+    let workspaceInfo: any = null;
+
+    const customer = await Customer.findOne({
+      $or: [
+        { email: normalizedEmail },
+        { officialEmail: normalizedEmail },
+        { official_email: normalizedEmail },
+      ],
+    });
+
+    const vendor = await Vendor.findOne({
+      $or: [
+        { email: normalizedEmail },
+        { officialEmail: normalizedEmail },
+        { official_email: normalizedEmail },
+      ],
+    });
+
+    if (!user) {
+      const ensured = await ensureUserFromWorkspaceMember(normalizedEmail, finalHash);
+      if (ensured.user) {
+        user = ensured.user;
+        created = true;
+        createdFromWorkspace = true;
+        workspaceInfo = ensured.workspaceInfo || null;
+      }
+    }
+
+    if (!user) {
+      if (!customer && !vendor) {
+        return res.status(404).json({
+          error: "No user, customer or vendor found with this email",
+          hint: "If created via Customer Workspace users, ensure it exists in CustomerMember.",
+        });
+      }
+
+      const roles: string[] = [];
+      if (vendor) roles.push("VENDOR");
+      if (customer) roles.push("CUSTOMER");
+
+      const baseDoc: any = customer || vendor;
+
+      const firstName =
+        baseDoc?.contactPerson ||
+        baseDoc?.contactName ||
+        baseDoc?.inviteeName ||
+        baseDoc?.name ||
+        baseDoc?.companyName ||
+        "";
+
+      user = await User.create({
+        email: normalizedEmail,
+        officialEmail: normalizedEmail,
+        personalEmail: normalizedEmail,
+        firstName,
+        lastName: "",
+        roles: normalizeRoles(roles.length ? roles : ["EMPLOYEE"]),
+        passwordHash: finalHash,
+      });
+
+      created = true;
+    } else {
+      user.passwordHash = finalHash;
+
+      const set = new Set<string>(normalizeRoles(user.roles || []));
+      if (vendor) set.add("VENDOR");
+      if (customer) set.add("CUSTOMER");
+      if (createdFromWorkspace) set.add("CUSTOMER");
+      if (set.size === 0) set.add("EMPLOYEE");
+
+      user.roles = Array.from(set);
+      await user.save();
+    }
+
+    if (customer && !(customer as any).ownerId) {
+      (customer as any).ownerId = user._id;
+      await (customer as any).save();
+    }
+
+    if (vendor && !(vendor as any).ownerId) {
+      (vendor as any).ownerId = user._id;
+      await (vendor as any).save();
+    }
+
+    const { safe } = await buildAuthSafeUser(user);
+
+    res.json({
+      ok: true,
+      user: safe,
+      email: safe.email,
+      tempPassword: finalPassword,
+      created,
+      createdFromWorkspace,
+      workspaceInfo,
+    });
+  } catch (err: any) {
+    console.error("[auth/admin/reset-password] error", err);
+    res.status(500).json({ error: "Failed to reset password", detail: err?.message });
+  }
+});
+
+/* ───────────────────────────────────────────────
+ * LOGOUT
+ * ─────────────────────────────────────────────── */
+r.post("/logout", (_req, res) => {
+  clearRefreshCookie(res);
+  clearAccessCookie(res);
+  res.json({ ok: true });
+});
+
+export default r;
