@@ -3,6 +3,7 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import { requireAuth } from "../middleware/auth.js";
 import User from "../models/User.js";
+import Employee from "../models/Employee.js";
 
 const router = Router();
 
@@ -67,18 +68,29 @@ function sanitise(user: AnyUser) {
  */
 router.get("/", requireAuth, async (_req, res, next) => {
   try {
-    const docs: AnyUser[] = await User.find({
-      $or: [
-        { employeeCode: { $exists: true, $ne: "" } },
-        { roles: { $in: ["EMPLOYEE", "MANAGER", "ADMIN", "SUPERADMIN"] } },
-      ],
-    })
-      .select("-passwordHash")
+    const employees = await Employee.find({})
       .sort({ employeeCode: 1, createdAt: 1 })
-      .lean()
-      .exec();
+      .lean();
 
-    res.json(docs);
+    const emails = employees.map((e: any) => e.email).filter(Boolean);
+    const users = await User.find({ email: { $in: emails } })
+      .select("email roles isActive activatedByAdmin tempPassword avatarKey avatarUrl")
+      .lean();
+
+    const userMap = new Map(users.map((u: any) => [u.email, u]));
+
+    const enriched = employees.map((e: any) => ({
+      ...e,
+      roles: userMap.get(e.email)?.roles || ["EMPLOYEE"],
+      isActive: userMap.get(e.email)?.isActive ?? e.isActive,
+      avatarKey: userMap.get(e.email)?.avatarKey || "",
+      avatarUrl: userMap.get(e.email)?.avatarUrl || "",
+      hasLogin: userMap.has(e.email),
+      activatedByAdmin: userMap.get(e.email)?.activatedByAdmin || false,
+      tempPassword: userMap.get(e.email)?.tempPassword || false,
+    }));
+
+    return res.json(enriched);
   } catch (err) {
     next(err);
   }
