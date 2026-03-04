@@ -49,6 +49,9 @@ const UserSchema = new Schema(
 
     passwordHash: { type: String, required: true },
 
+    resetTokenHash:   { type: String },
+    resetTokenExpiry: { type: Date },
+
     name: { type: String, trim: true },
     firstName: { type: String, trim: true },
     middleName: { type: String, trim: true },

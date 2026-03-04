@@ -2,8 +2,10 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 
 import User from "../models/User.js";
+import { sendMail } from "../utils/mailer.js";
 import Customer from "../models/Customer.js";
 import Vendor from "../models/Vendor.js";
 
@@ -1007,6 +1009,98 @@ r.post("/admin/reset-password", async (req, res) => {
   } catch (err: any) {
     console.error("[auth/admin/reset-password] error", err);
     res.status(500).json({ error: "Failed to reset password", detail: err?.message });
+  }
+});
+
+/* ───────────────────────────────────────────────
+ * FORGOT PASSWORD
+ * ─────────────────────────────────────────────── */
+r.post("/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body || {};
+
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ error: "Email is required" });
+    }
+
+    const normalizedEmail = normalizeEmail(email);
+
+    const user: any = await User.findOne({
+      $or: [
+        { email: normalizedEmail },
+        { officialEmail: normalizedEmail },
+        { personalEmail: normalizedEmail },
+      ],
+    });
+
+    // Always return ok — never reveal whether the email exists
+    if (!user) return res.json({ ok: true });
+
+    const rawToken = crypto.randomBytes(32).toString("hex");
+    const hash = crypto.createHash("sha256").update(rawToken).digest("hex");
+
+    user.resetTokenHash = hash;
+    user.resetTokenExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    await user.save();
+
+    const frontendOrigin = String(process.env.FRONTEND_ORIGIN || "http://localhost:5173").replace(/\/$/, "");
+    const resetLink = `${frontendOrigin}/reset-password?token=${rawToken}`;
+
+    await sendMail({
+      to: normalizedEmail,
+      subject: "Reset your Plumtrips password",
+      kind: "CONFIRMATIONS",
+      html: `
+        <p>Hi${user.firstName ? ` ${user.firstName}` : ""},</p>
+        <p>We received a request to reset your password. Click the link below to set a new password. This link expires in 1 hour.</p>
+        <p><a href="${resetLink}">${resetLink}</a></p>
+        <p>If you didn't request this, you can safely ignore this email.</p>
+        <p>— Plumtrips</p>
+      `,
+    });
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[auth/forgot-password] error", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ───────────────────────────────────────────────
+ * RESET PASSWORD
+ * ─────────────────────────────────────────────── */
+r.post("/reset-password", async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+
+    if (!token || typeof token !== "string") {
+      return res.status(400).json({ error: "Reset token is required" });
+    }
+
+    if (!newPassword || typeof newPassword !== "string" || newPassword.length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters" });
+    }
+
+    const hash = crypto.createHash("sha256").update(token).digest("hex");
+
+    const user: any = await User.findOne({
+      resetTokenHash: hash,
+      resetTokenExpiry: { $gt: new Date() },
+    });
+
+    if (!user) {
+      return res.status(400).json({ error: "Invalid or expired reset token" });
+    }
+
+    user.passwordHash = await bcrypt.hash(newPassword, 12);
+    user.resetTokenHash = undefined;
+    user.resetTokenExpiry = undefined;
+    await user.save();
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[auth/reset-password] error", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
