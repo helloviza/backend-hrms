@@ -18,6 +18,7 @@ function requireEnv(key: string, fallback?: string): string {
 export const env = {
   NODE_ENV: process.env.NODE_ENV || "development",
   PORT: Number(process.env.PORT) || 8080,
+
   MONGO_URI: requireEnv("MONGO_URI"),
   JWT_SECRET: requireEnv("JWT_SECRET"),
   JWT_REFRESH_SECRET: requireEnv("JWT_REFRESH_SECRET", process.env.JWT_SECRET),
@@ -32,4 +33,7 @@ export const env = {
   // Optional credentials (used in local dev; IAM takes over in production)
   AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
   AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+
+  // --- Voucher Extractor / Gemini ---
+  GEMINI_API_KEY: requireEnv("GEMINI_API_KEY"),
 } as const;

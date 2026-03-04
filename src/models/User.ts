@@ -24,7 +24,22 @@ const UserSchema = new Schema(
     accountType: { type: String, trim: true }, // CUSTOMER | VENDOR | EMPLOYEE
     userType: { type: String, trim: true }, // same as accountType in some modules
 
-    // Persisted profile photo URL used by MyProfile avatar
+    /**
+     * ✅ AWS S3 only: source-of-truth avatar object key
+     * Example: avatars/<tenantId>/<userId>/<timestamp>-<rand>-file.png
+     */
+    avatarKey: { type: String, trim: true, default: "" },
+
+    /**
+     * ✅ Optional: when avatarKey last changed (useful for audit + cache bust)
+     */
+    avatarUpdatedAt: { type: Date },
+
+    /**
+     * Legacy field (DO NOT STORE SIGNED URLS HERE).
+     * Kept to avoid breaking older code that may read avatarUrl from user documents.
+     * New system must always compute signed url at runtime.
+     */
     avatarUrl: { type: String, trim: true, default: "" },
 
     personalEmail: { type: String, trim: true },

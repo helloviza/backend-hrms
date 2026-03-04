@@ -1,5 +1,6 @@
 {
   "name": "@plumtrips/hrms-backend",
+  "version": "1.0.0",
   "type": "module",
   "main": "dist/server.js",
   "packageManager": "pnpm@8.15.4",
@@ -8,18 +9,23 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "seed": "tsx src/seed/seed.ts",
-    "test": "vitest"
+    "test": "vitest",
+    "clean": "Remove-Item -Recurse -Force node_modules, pnpm-lock.yaml"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.693.0",
     "@aws-sdk/s3-presigned-post": "^3.908.0",
     "@aws-sdk/s3-request-presigner": "^3.693.0",
+    "@google-cloud/speech": "^7.2.1",
+    "@google/genai": "^1.41.0",
+    "@google/generative-ai": "^0.24.1",
+    "axios": "^1.7.9",
     "bcryptjs": "^2.4.3",
     "compression": "^1.8.1",
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "dayjs": "^1.11.13",
-    "dotenv": "^16",
+    "dotenv": "^16.4.7",
     "express": "^4.19.2",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
@@ -27,7 +33,7 @@
     "morgan": "^1.10.0",
     "multer": "^2.0.2",
     "nodemailer": "^7.0.11",
-    "openai": "^6.9.0",
+    "openai": "^4.0.0",
     "pdfkit": "^0.17.2",
     "xlsx": "^0.18.5"
   },

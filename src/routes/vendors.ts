@@ -2,6 +2,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import MasterData from "../models/MasterData.js";
+import Vendor from "../models/Vendor.js";
 
 const router = Router();
 
@@ -9,40 +10,57 @@ const router = Router();
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
 
-function isHrmsAdmin(currentUser: any): boolean {
-  if (!currentUser) return false;
+function upperRoles(user: any): string[] {
   const roles: string[] = [];
+  if (!user) return roles;
 
-  if (Array.isArray(currentUser.roles)) roles.push(...currentUser.roles);
-  if (currentUser.role) roles.push(currentUser.role);
-  if (currentUser.hrmsAccessLevel) roles.push(currentUser.hrmsAccessLevel);
-  if (currentUser.hrmsAccessRole) roles.push(currentUser.hrmsAccessRole);
+  if (Array.isArray(user.roles)) roles.push(...user.roles);
+  if (user.role) roles.push(user.role);
+  if (user.hrmsAccessLevel) roles.push(user.hrmsAccessLevel);
+  if (user.hrmsAccessRole) roles.push(user.hrmsAccessRole);
+  if (user.accountType) roles.push(user.accountType);
+  if (user.userType) roles.push(user.userType);
 
-  const upper = roles.map((r) => String(r).toUpperCase());
+  return roles.map((r) => String(r).toUpperCase()).filter(Boolean);
+}
+
+function isHrmsAdmin(user: any): boolean {
+  const r = upperRoles(user);
   return (
-    upper.includes("ADMIN") ||
-    upper.includes("SUPER_ADMIN") ||
-    upper.includes("SUPERADMIN") ||
-    upper.includes("HR_ADMIN")
+    r.includes("ADMIN") ||
+    r.includes("SUPER_ADMIN") ||
+    r.includes("SUPERADMIN") ||
+    r.includes("HR_ADMIN") ||
+    r.includes("HR")
   );
 }
 
-function buildVendorQueryFromUser(user: any) {
-  const email = String(
-    user?.officialEmail || user?.email || user?.sub || ""
-  )
-    .toLowerCase()
-    .trim();
+function isVendorUser(user: any): boolean {
+  const r = upperRoles(user);
+  return r.includes("VENDOR");
+}
+
+function normEmail(v: any): string {
+  return String(v || "").trim().toLowerCase();
+}
+
+function buildKeysFromUser(user: any) {
+  const emails = [user?.officialEmail, user?.email]
+    .filter(Boolean)
+    .map(normEmail)
+    .filter(Boolean);
 
   const ownerId = String(user?.sub || user?.id || "").trim();
+  const vendorId = String(user?.vendorId || "").trim();
 
-  const base: any = {
-    type: "Vendor",
-  };
+  return { emails, ownerId, vendorId };
+}
 
+function buildMasterDataQuery(emails: string[], ownerId: string) {
+  const base: any = { type: "Vendor" };
   const or: any[] = [];
 
-  if (email) {
+  for (const email of emails) {
     or.push(
       { email },
       { officialEmail: email },
@@ -56,11 +74,24 @@ function buildVendorQueryFromUser(user: any) {
     or.push({ ownerId }, { "payload.ownerId": ownerId });
   }
 
-  if (or.length > 0) {
-    base.$or = or;
+  if (or.length > 0) base.$or = or;
+
+  return { query: base, hasMatchKeys: or.length > 0 };
+}
+
+function buildVendorCollectionQuery(emails: string[], ownerId: string) {
+  const or: any[] = [];
+
+  for (const email of emails) {
+    // some deployments store vendor emails as email or officialEmail
+    or.push({ email }, { officialEmail: email });
   }
 
-  return { base, hasMatchKeys: or.length > 0 };
+  // Vendor.ownerId is ObjectId; mongoose will cast if ownerId looks valid.
+  if (ownerId) or.push({ ownerId });
+
+  if (or.length === 0) return { query: null, hasMatchKeys: false };
+  return { query: { $or: or }, hasMatchKeys: true };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -69,33 +100,92 @@ function buildVendorQueryFromUser(user: any) {
 
 /**
  * GET /api/vendors/me
- * Resolve the vendor record linked to the current user.
- * - Vendor login: matches by email / ownerId.
- * - HR/Admin: if not found, returns the most recently updated Vendor as preview.
- * - Never returns 404; instead { vendor: null }.
+ *
+ * ✅ Vendor user:
+ *  - Resolve ONLY from Vendor collection
+ *  - Never leak MasterData vendor profiles
+ *
+ * ✅ Admin/HR:
+ *  - Resolve from vendorId (JWT) OR MasterData(type=Vendor) OR Vendor collection
+ *  - Preview fallback allowed (latest MasterData Vendor)
+ *
+ * Never 404; returns { vendor: null } when not found.
  */
 router.get("/me", requireAuth, async (req: any, res, next) => {
   try {
-    const { base, hasMatchKeys } = buildVendorQueryFromUser(req.user || {});
-    let doc = null;
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
 
-    if (hasMatchKeys) {
-      doc = await MasterData.findOne(base).lean().exec();
+    const user = req.user || {};
+    const { emails, ownerId, vendorId } = buildKeysFromUser(user);
+
+    // 0) vendorId from JWT is most deterministic
+    if (vendorId) {
+      const v = await Vendor.findById(vendorId).lean().exec();
+      if (v) return res.json({ vendor: v });
+      // fall through if stale
     }
 
-    // Admin / HR preview fallback – pick any vendor if user is HR/admin.
-    if (!doc && isHrmsAdmin(req.user)) {
+    // Vendor login: ONLY Vendor collection lookup
+    if (isVendorUser(user)) {
+      if (emails.length === 0 && !ownerId) return res.json({ vendor: null });
+
+      const { query: vQuery, hasMatchKeys: vHasKeys } = buildVendorCollectionQuery(
+        emails,
+        ownerId
+      );
+
+      if (!vHasKeys || !vQuery) return res.json({ vendor: null });
+
+      const v = await Vendor.findOne(vQuery).lean().exec();
+      return res.json({ vendor: v || null });
+    }
+
+    // Admin/HR path
+    if (emails.length === 0 && !ownerId) {
+      // if no keys and admin, allow preview fallback
+      if (isHrmsAdmin(user)) {
+        const preview = await MasterData.findOne({ type: "Vendor" })
+          .sort({ updatedAt: -1, createdAt: -1 })
+          .lean()
+          .exec();
+        return res.json({ vendor: preview || null });
+      }
+      return res.json({ vendor: null });
+    }
+
+    let doc: any = null;
+
+    // 1) MasterData first for admin workflows
+    const { query: mdQuery, hasMatchKeys: mdHasKeys } = buildMasterDataQuery(
+      emails,
+      ownerId
+    );
+    if (mdHasKeys) {
+      doc = await MasterData.findOne(mdQuery).lean().exec();
+    }
+
+    // 2) fallback to Vendor collection
+    if (!doc) {
+      const { query: vQuery, hasMatchKeys: vHasKeys } = buildVendorCollectionQuery(
+        emails,
+        ownerId
+      );
+      if (vHasKeys && vQuery) {
+        doc = await Vendor.findOne(vQuery).lean().exec();
+      }
+    }
+
+    // 3) preview fallback for admin
+    if (!doc && isHrmsAdmin(user)) {
       doc = await MasterData.findOne({ type: "Vendor" })
         .sort({ updatedAt: -1, createdAt: -1 })
         .lean()
         .exec();
     }
 
-    if (!doc) {
-      return res.json({ vendor: null });
-    }
-
-    return res.json({ vendor: doc });
+    return res.json({ vendor: doc || null });
   } catch (err) {
     next(err);
   }
@@ -103,20 +193,32 @@ router.get("/me", requireAuth, async (req: any, res, next) => {
 
 /**
  * GET /api/vendors/:id
- * Simple fetch by master-data id (used by admin screens if needed).
+ *
+ * ✅ Admin/HR only.
+ * Vendor users are forbidden.
  */
-router.get("/:id", requireAuth, async (req, res, next) => {
+router.get("/:id", requireAuth, async (req: any, res, next) => {
   try {
-    const { id } = req.params;
-    const doc = await MasterData.findOne({ _id: id, type: "Vendor" })
-      .lean()
-      .exec();
+    const user = req.user || {};
 
-    if (!doc) {
-      return res.status(404).json({ error: "Vendor profile not found" });
+    // Vendor should never be able to fetch arbitrary vendor by id
+    if (isVendorUser(user) && !isHrmsAdmin(user)) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
-    res.json({ vendor: doc });
+    const { id } = req.params;
+
+    // Try MasterData
+    let doc: any = await MasterData.findOne({ _id: id, type: "Vendor" })
+      .lean()
+      .exec();
+    if (doc) return res.json({ vendor: doc });
+
+    // Fallback to Vendor collection
+    doc = await Vendor.findOne({ _id: id }).lean().exec();
+    if (doc) return res.json({ vendor: doc });
+
+    return res.status(404).json({ error: "Vendor profile not found" });
   } catch (err) {
     next(err);
   }

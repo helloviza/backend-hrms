@@ -146,7 +146,7 @@ async function generateNextEmployeeCode(): Promise<string> {
   const START_NUM = 1031; // 001031 → first employee
   const re = /^PTS(\d{6})$/;
 
-  const docs: any[] = await User.find({
+  const docs: any[] = await (User as any).find({
     employeeCode: { $regex: /^PTS\d{6}$/ },
   })
     .select("employeeCode")
@@ -300,7 +300,7 @@ async function syncEmployeeFromOnboarding(
       update.photoKey = doc.photoKey;
     }
 
-    let user: any = await User.findOne({ email }).exec();
+    let user: any = await (User as any).findOne({ email }).exec();
 
     if (!user) {
       const tempPassword =
@@ -310,7 +310,7 @@ async function syncEmployeeFromOnboarding(
       const passwordHash = await bcrypt.hash(tempPassword, 10);
       const employeeCode = await generateNextEmployeeCode();
 
-      user = await User.create({
+      user = await (User as any).create({
         ...update,
         employeeCode,
         roles: ["EMPLOYEE"],
@@ -391,7 +391,7 @@ const safeName =
     if (!normEmail) return res.status(400).json({ error: "email is required" });
 
     // ❌ Invalidate previous active invites for same type + email
-await Onboarding.updateMany(
+await (Onboarding as any).updateMany(
   {
     email: normEmail,
     type: resolveType(type),
@@ -411,7 +411,7 @@ await Onboarding.updateMany(
     const tat = Number.isFinite(+turnaroundHours) ? +turnaroundHours : 72;
     const expiresAt = new Date(now.getTime() + tat * 60 * 60 * 1000);
 
-    const doc = await Onboarding.create({
+    const doc = await (Onboarding as any).create({
   type: resolveType(type),
   email: normEmail,
 
@@ -468,12 +468,12 @@ try {
 });
 
 /** 📋 List invites */
-router.get("/invites", noStore, async (req, res, next) => {
+router.get("/invites", requireAuth, noStore, async (req, res, next) => {
   try {
     const { type } = req.query as { type?: string };
     const filter: Record<string, any> = {};
     if (type) filter.type = resolveType(type);
-    const docs = (await Onboarding.find(filter)
+    const docs = (await (Onboarding as any).find(filter)
       .sort({ createdAt: -1 })
       .limit(100)
       .lean()
@@ -518,7 +518,7 @@ router.post(
     try {
       const { id } = req.params;
 
-      const invite: any = await Onboarding.findById(id).exec();
+      const invite: any = await (Onboarding as any).findById(id).exec();
       if (!invite) {
         return res.status(404).json({ error: "Invite not found" });
       }
@@ -584,7 +584,7 @@ router.post("/draft/:token", noStore, async (req, res) => {
   const { token } = req.params;
   const { core, attachments } = req.body ?? {};
   try {
-    const invite = (await Onboarding.findOne({ token })
+    const invite = (await (Onboarding as any).findOne({ token })
       .lean()
       .exec()) as OnboardingDoc | null;
     if (!invite) return res.status(404).json({ error: "Invite not found" });
@@ -623,7 +623,7 @@ router.post("/draft/:token", noStore, async (req, res) => {
       }
     }
 
-    await Onboarding.updateOne({ token }, { $set: updates }).exec();
+    await (Onboarding as any).updateOne({ token }, { $set: updates }).exec();
     res.json({ ok: true });
   } catch (e: any) {
     res.status(500).json({ error: e?.message || "Draft save failed" });
@@ -634,7 +634,7 @@ router.post("/draft/:token", noStore, async (req, res) => {
 router.post("/submit/:token", upload.none(), noStore, async (req, res) => {
   const { token } = req.params;
   try {
-    const invite: any = await Onboarding.findOne({ token }).exec();
+    const invite: any = await (Onboarding as any).findOne({ token }).exec();
     if (!invite) return res.status(404).json({ error: "Invalid token" });
 
     const currentStatus = (invite.status || "").toLowerCase();
@@ -748,12 +748,12 @@ await syncCustomerFromOnboarding(invite);
 });
 
 /** 🧾 Pipeline summary */
-router.get("/pipeline", noStore, async (req, res, next) => {
+router.get("/pipeline", requireAuth, noStore, async (req, res, next) => {
   try {
     const { type } = req.query as { type?: string };
     const filter: Record<string, any> = {};
     if (type) filter.type = resolveType(type);
-    const docs = (await Onboarding.find(filter)
+    const docs = (await (Onboarding as any).find(filter)
       .sort({ updatedAt: -1 })
       .lean()
       .exec()) as OnboardingDoc[];
@@ -770,7 +770,7 @@ router.get("/pipeline", noStore, async (req, res, next) => {
     for (const d of docs) {
       const expired = isExpired(d.expiresAt);
       if (expired && d.status !== "expired") {
-        await Onboarding.updateOne(
+        await (Onboarding as any).updateOne(
           { _id: d._id },
           { $set: { status: "expired" } }
         ).exec();
@@ -877,7 +877,7 @@ for (const kind of ["vendors", "businesses", "employees"] as const) {
 router.get("/public/:token/details", noStore, async (req, res, next) => {
   try {
     const { token } = req.params;
-    const doc = (await Onboarding.findOne({ token })
+    const doc = (await (Onboarding as any).findOne({ token })
       .lean()
       .exec()) as OnboardingDoc | null;
     if (!doc) return res.status(404).json({ error: "Not found" });
@@ -929,14 +929,53 @@ router.get("/view/:token", noStore, async (req, res) => {
 <body>Redirecting...</body></html>`);
 });
 
+/** 📎 Generate presigned GET URL for a private S3 document
+ *  MUST be registered before /:token/details to avoid route interception
+ */
+router.get("/document/presign", requireAuth, noStore, async (req, res, next) => {
+  try {
+    console.log("[presign] HIT — key:", req.query.key);
+
+    if (!S3_BUCKET)
+      return res.status(500).json({ error: "S3_BUCKET not configured" });
+    if (!getSignedUrl)
+      return res.status(500).json({ error: "@aws-sdk/s3-request-presigner not installed — run: npm install @aws-sdk/s3-request-presigner" });
+
+    const { key } = req.query as { key?: string };
+    if (!key || !String(key).trim())
+      return res.status(400).json({ error: "key is required" });
+
+    const { GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const cmd = new GetObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: String(key).trim(),
+    });
+
+    const url = await getSignedUrl(s3, cmd, { expiresIn: 300 }); // 5 min TTL
+    res.json({ url });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /** 🧑‍💼 Admin details (authed) – also triggers sync to HRMS */
 router.get("/:token/details", requireAuth, noStore, async (req, res, next) => {
   try {
     const { token } = req.params;
-    const doc = (await Onboarding.findOne({ token })
-      .lean()
-      .exec()) as OnboardingDoc | null;
+
+    // Support lookup by MongoDB _id (24-char hex) OR by token string
+    const isObjectId = /^[0-9a-f]{24}$/i.test(token);
+    let doc: OnboardingDoc | null = null;
+    if (isObjectId) {
+      // findById correctly casts string → ObjectId
+      doc = (await (Onboarding as any).findById(token).lean().exec()) as OnboardingDoc | null;
+    }
+    // If not found by _id (or not an ObjectId), try token string
+    if (!doc) {
+      doc = (await (Onboarding as any).findOne({ token }).lean().exec()) as OnboardingDoc | null;
+    }
     if (!doc) return res.status(404).json({ error: "Not found" });
+    console.log("[details] doc._id:", String(doc._id), "| documents field:", JSON.stringify(doc.documents), "| formPayload keys:", Object.keys(doc.formPayload || {}));
 
     // Ensure HRMS sync whenever admin opens details
     await syncEmployeeFromOnboarding(doc);
@@ -961,19 +1000,11 @@ router.get("/:token/details", requireAuth, noStore, async (req, res, next) => {
       formData = {};
     }
 
-    const baseUrl =
-      process.env.S3_BASE_URL ||
-      (process.env.S3_BUCKET
-        ? `https://${process.env.S3_BUCKET}.s3.${
-            process.env.AWS_REGION || "ap-south-1"
-          }.amazonaws.com`
-        : "");
-
     const documents = (doc.documents || []).map((d: any) => {
-      const key = d.key || d.Key || d.path || d.name || "";
-      const name = d.name || d.filename || key.split("/").pop() || "Document";
-      const url = d.url || (baseUrl && key ? `${baseUrl}/${key}` : null);
-      return { name, url };
+      // ✅ objectKey is what upload/presign stores — check it first
+      const key = d.objectKey || d.key || d.Key || d.path || d.s3Key || "";
+      const name = d.name || d.filename || d.originalName || key.split("/").pop() || "Document";
+      return { name, key, url: d.url || null };
     });
 
     res.json({
@@ -983,10 +1014,12 @@ router.get("/:token/details", requireAuth, noStore, async (req, res, next) => {
       email: doc.email,
       type: doc.type,
       status: doc.status,
-      payload: formData,
-      documents,
+      ticket: doc.ticket,
       submittedAt: doc.submittedAt,
       updatedAt: doc.updatedAt,
+      formPayload: formData,  // ✅ frontend reads this
+      payload: formData,      // ✅ backward compat
+      documents,
     });
   } catch (err) {
     next(err);
@@ -1001,7 +1034,7 @@ router.post("/:token/decision", requireAuth, noStore, async (req, res, next) => 
       action: "approved" | "rejected" | "hold";
       remarks?: string;
     };
-    const doc: any = await Onboarding.findOne({ token }).exec();
+    const doc: any = await (Onboarding as any).findOne({ token }).exec();
     if (!doc) return res.status(404).json({ error: "Not found" });
     const newStatus =
       action === "approved"
@@ -1029,7 +1062,7 @@ router.post("/:token/decision", requireAuth, noStore, async (req, res, next) => 
 router.get("/invite/:token", noStore, async (req, res) => {
   const { token } = req.params;
   try {
-    const doc = (await Onboarding.findOne({ token })
+    const doc = (await (Onboarding as any).findOne({ token })
       .lean()
       .exec()) as OnboardingDoc | null;
     if (!doc) return res.status(404).json({ error: "Invite not found" });

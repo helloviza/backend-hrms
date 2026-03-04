@@ -4,12 +4,14 @@ import cookieParser from "cookie-parser";
 import morgan from "morgan";
 import compression from "compression";
 import path from "path";
+import { fileURLToPath } from "url";
 
 import { connectDb } from "./config/db.js";
 import { corsMiddleware } from "./config/cors.js";
 import { helmetMiddleware } from "./config/helmet.js";
 import { errorHandler } from "./middleware/error.js";
 import { env } from "./config/env.js";
+import vouchers from "./routes/vouchers.js";
 
 // ─────────────── CORE ROUTES ───────────────
 import auth from "./routes/auth.js";
@@ -20,6 +22,11 @@ import uploads from "./routes/uploads.js";
 import * as onboarding from "./routes/onboarding.js";
 import masterDataRouter from "./routes/masterData.js";
 import customerUsersRouter from "./routes/customerUsers.js";
+import previewRoutes from "./routes/preview.js";
+import flightRoutes from "./routes/flightRoutes.js";
+
+// ✅ Approvals (MUST be statically mounted; do NOT safeMount)
+import approvalsRouter from "./routes/approvals.js";
 
 // ✅ Booking History (Booked/Cancelled outcomes + admin PDFs)
 import bookingHistory from "./routes/bookingHistory.js";
@@ -37,6 +44,14 @@ import employeesRouter from "./routes/employees.js";
 // ✅ HR assistant routers
 import assistantRouter from "./routes/assistant.js";
 import assistantHrRouter from "./routes/assistantHr.js";
+import travelCopilotRoutes from "./routes/copilot.travel.js";
+import plutoVideoRouter from "./routes/pluto.video.js";
+import copilotVideoConsent from "./routes/copilot.videoConsent.js";
+import adminVideoRouter from "./routes/admin.video.js";
+
+
+// 🔥 Background workers (NEW – safe add)
+import { startBackgroundWorkers } from "./workers/index.js";
 
 // ✅ Copilot router (manager / HR queries)
 import copilotRouter from "./routes/copilot.js";
@@ -65,6 +80,12 @@ import vendorCustomerSelfRouter from "./routes/vendorCustomerSelf.js";
 
 // ✅ Workspace (customer/vendor/business logo + workspace meta)
 import workspaceRouter from "./routes/workspace.js";
+
+// ✅ Google Places (Hotels)
+import placesRouter from "./routes/places.js";
+
+// ✅ NEW WORKFLOW: proposals
+import proposalsRouter from "./routes/proposals.js";
 
 const app = express();
 
@@ -109,7 +130,7 @@ app.use(
         }
       }
     },
-  }),
+  })
 );
 
 // URL-encoded
@@ -122,7 +143,7 @@ app.use(cookieParser());
 app.use(compression());
 
 /**
- * No-store for fresh admin data
+ * No-store for fresh workflow data
  */
 function noStore(_req: any, res: any, next: any) {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
@@ -131,13 +152,34 @@ function noStore(_req: any, res: any, next: any) {
   next();
 }
 
-// approvals + booking history + refresh should never be cached
+// approvals + proposals + booking history + refresh should never be cached
 app.use("/api/approvals", noStore);
+app.use("/api/proposals", noStore);
 app.use("/api/booking-history", noStore);
 app.use("/api/auth/refresh", noStore);
+app.use("/api/vouchers", vouchers);
 
-// Static uploads
-app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
+/* ────────────────────────────────────────────────────────────────
+ * STATIC UPLOADS
+ * ──────────────────────────────────────────────────────────────── */
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const uploadsDir = path.join(process.cwd(), "uploads");
+
+const disableLocalUploads =
+  String(process.env.DISABLE_LOCAL_UPLOADS || "").toLowerCase() === "true";
+
+if (!disableLocalUploads) {
+  app.use("/uploads", express.static(uploadsDir));
+  if (process.env.NODE_ENV !== "production") {
+    console.log("🖼️  Serving /uploads from =", uploadsDir);
+  }
+} else {
+  if (process.env.NODE_ENV !== "production") {
+    console.log("🧼 Local /uploads serving is DISABLED (S3-only mode).");
+  }
+}
 
 /* ────────────────────────────────────────────────────────────────
  * HEALTH / PROBE
@@ -164,12 +206,10 @@ async function safeMount(prefix: string, modulePath: string) {
     const router = (mod as any).default || mod;
     if (router) {
       app.use(prefix, router);
-      // eslint-disable-next-line no-console
       console.log(`✅ Mounted ${prefix} <- ${modulePath}`);
     }
   } catch {
     if (process.env.NODE_ENV !== "production") {
-      // eslint-disable-next-line no-console
       console.log(`ℹ️ Skipped mount ${prefix} (missing/failed): ${modulePath}`);
     }
   }
@@ -179,50 +219,59 @@ async function safeMount(prefix: string, modulePath: string) {
  * API ROUTES
  * ──────────────────────────────────────────────────────────────── */
 
+// Google Places
+app.use("/api", placesRouter);
+
+// Proposals
+app.use("/api/proposals", proposalsRouter);
+
 // Auth & users
 app.use("/api/auth", auth);
 app.use("/api/users", users);
 
-// HRMS employee master
+// HRMS
 app.use("/api/employees", employeesRouter);
-
-// Core HRMS data
 app.use("/api/stats", stats);
 app.use("/api/logs", logs);
 app.use("/api/attendance", attendance);
 app.use("/api/leave", leaves);
 app.use("/api/holidays", holidays);
+
+// Uploads
 app.use("/api/uploads", uploads);
+
+// Onboarding & master
 app.use("/api/onboarding", (onboarding as any).default || onboarding);
 app.use("/api/master-data", masterDataRouter);
 app.use("/api/password", passwordRoutes);
 
-// Vendor & Business service matrices
+// Vendor & business
 app.use("/api/vendor-services", vendorServicesRouter);
 app.use("/api/business-services", businessServicesRouter);
-
-// Vendor / Customer master + “me” endpoints
 app.use("/api/vendors", vendorsRouter);
 app.use("/api/customers", customersRouter);
-
-// Customer User Management
 app.use("/api/customer/users", customerUsersRouter);
-
-// Legacy / extra self routes if still used
 app.use("/api", vendorCustomerSelfRouter);
 
-// Workspace v1
+// Workspace
 app.use("/api/v1/workspace", workspaceRouter);
+
+// Copilot & Pluto
+app.use("/api/v1/copilot/travel", travelCopilotRoutes);
+app.use("/api/v1/pluto/video", plutoVideoRouter);
+app.use("/api/copilot", copilotRouter);
+app.use("/api/assistant", assistantRouter);
+app.use("/api/assistant", assistantHrRouter);
+app.use("/api/v1/copilot/video", copilotVideoConsent);
+app.use("/api/v1/admin", adminVideoRouter);
+
+// Flights
+app.use("/api/v1/flights", flightRoutes);
 
 // Dashboards
 app.use("/api/dashboard", dashboardRouter);
 
-// Assistants & copilot
-app.use("/api/assistant", assistantRouter);
-app.use("/api/assistant", assistantHrRouter);
-app.use("/api/copilot", copilotRouter);
-
-// HR policies & org chart
+// HR
 app.use("/api/hr/policies", hrPoliciesRouter);
 app.use("/api/hr", hrOrgChartRouter);
 
@@ -230,28 +279,23 @@ app.use("/api/hr", hrOrgChartRouter);
 app.use("/api/admin", adminRouter);
 app.use("/api/admin", adminAnalyticsRouter);
 
-/**
- * ✅ Booking History MUST match frontend calls:
- * Frontend calls: /api/approvals/history
- * So we mount bookingHistory under /api/approvals.
- *
- * Also keep /api/booking-history as an alias (optional).
- */
+// Approvals & booking history
+app.use("/api/approvals", approvalsRouter);
 app.use("/api/approvals", bookingHistory);
 app.use("/api/booking-history", bookingHistory);
 
-// Optional modules
-void safeMount("/api/approvals", "./routes/approvals.js");
+// Optional
 void safeMount("/api/settings", "./routes/settings.js");
 
-/* ────────────────────────────────────────────────────────────────
- * FALLBACKS
- * ──────────────────────────────────────────────────────────────── */
-app.use("/api", stubs);
+// Stubs
+app.use("/api/stubs", stubs);
 
-/* ────────────────────────────────────────────────────────────────
- * ERROR HANDLER
- * ──────────────────────────────────────────────────────────────── */
+// 404
+app.use("/api", (_req, res) => {
+  return res.status(404).json({ ok: false, message: "API route not found" });
+});
+
+// Error handler
 app.use(errorHandler);
 
 export default app;
@@ -264,13 +308,14 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
     try {
       await connectDb();
 
+      // 🔥 START BACKGROUND WORKERS (ADDED – SAFE)
+      startBackgroundWorkers();
+
       const server = app.listen(env.PORT, () => {
-        // eslint-disable-next-line no-console
         console.log(`✅ API running on port ${env.PORT}`);
       });
 
       const shutdown = () => {
-        // eslint-disable-next-line no-console
         console.log("🛑 Gracefully shutting down server...");
         server.close(() => process.exit(0));
       };
@@ -278,7 +323,6 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       process.on("SIGINT", shutdown);
       process.on("SIGTERM", shutdown);
     } catch (err) {
-      // eslint-disable-next-line no-console
       console.error("❌ Failed to start server:", err);
       process.exit(1);
     }

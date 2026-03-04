@@ -110,6 +110,7 @@ function normalizeWorkspaceIds(payload: any) {
  */
 function attachDevUser(req: Request) {
   const email = normEmail(req.headers["x-dev-email"] || "dev@local");
+  const officialEmail = normEmail(req.headers["x-dev-official-email"] || email);
   const sub = normStr(req.headers["x-dev-sub"] || "dev-user");
 
   const parsed = parseRolesHeader(req.headers["x-dev-roles"]);
@@ -142,6 +143,7 @@ function attachDevUser(req: Request) {
     _id: sub,
     id: sub,
     email,
+    officialEmail,
     name,
     roles,
     role: roles[0],
@@ -192,11 +194,23 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
       payload?.hrmsAccessLevel,
     ]);
 
+    // compute a stable accountType even if token doesn't include it
+    const upperRoles = roles.map((r) => String(r).toUpperCase());
+    const accountType =
+      payload?.accountType ||
+      payload?.userType ||
+      (upperRoles.includes("VENDOR") ? "VENDOR" : upperRoles.includes("CUSTOMER") || upperRoles.includes("BUSINESS") ? "CUSTOMER" : "EMPLOYEE");
+
     const merged: any = {
       ...payload,
-      email: normEmail(payload?.email),
       sub: normStr(payload?.sub || payload?._id || payload?.id),
+      id: normStr(payload?.id || payload?._id || payload?.sub),
+      _id: normStr(payload?._id || payload?.id || payload?.sub),
+      email: normEmail(payload?.email),
+      officialEmail: normEmail(payload?.officialEmail || payload?.official_email || ""),
       roles,
+      accountType,
+      userType: accountType,
     };
 
     normalizeWorkspaceIds(merged);

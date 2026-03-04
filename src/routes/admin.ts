@@ -1,5 +1,7 @@
 // apps/backend/src/routes/admin.ts
 import { Router, Request, Response } from "express";
+import { requireAuth } from "../middleware/auth.js";
+import { requireAdmin } from "../middleware/rbac.js";
 import Vendor from "../models/Vendor.js";
 import Attendance from "../models/Attendance.js";
 import Employee from "../models/Employee.js";
@@ -71,7 +73,7 @@ function parseRange(q: any): { from?: Date; to?: Date } {
 /* /api/admin/reports/vendors.csv                                             */
 /* -------------------------------------------------------------------------- */
 
-router.get("/reports/vendors.csv", async (_req: Request, res: Response) => {
+router.get("/reports/vendors.csv", requireAuth, requireAdmin, async (_req: Request, res: Response) => {
   try {
     const vendors = await Vendor.find({}).lean().exec();
     console.log("[ADMIN] vendors.csv – total vendors:", vendors.length);
@@ -152,6 +154,8 @@ router.get("/reports/vendors.csv", async (_req: Request, res: Response) => {
 
 router.get(
   "/reports/attendance.csv",
+  requireAuth,
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const { from, to } = parseRange(req.query);
@@ -364,7 +368,7 @@ router.get(
 /* /api/admin/reports/leaves.csv – uses LeaveRequest (all statuses)          */
 /* -------------------------------------------------------------------------- */
 
-router.get("/reports/leaves.csv", async (_req: Request, res: Response) => {
+router.get("/reports/leaves.csv", requireAuth, requireAdmin, async (_req: Request, res: Response) => {
   try {
     // Export ALL leave requests in LeaveRequest collection
     const leaveRecords: any[] = await LeaveRequest.find({})

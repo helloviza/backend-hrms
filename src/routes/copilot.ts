@@ -1,6 +1,7 @@
 // apps/backend/src/routes/copilot.ts
 import { Router } from "express";
 import OpenAI from "openai";
+import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
@@ -19,7 +20,7 @@ function getRequesterContext(user: any) {
   return `${name} (id: ${user.id || user._id || "n/a"})`;
 }
 
-router.post("/manager", async (req, res) => {
+router.post("/manager", requireAuth, async (req, res) => {
   try {
     const user = (req as any).user || null;
     const body = req.body || {};
