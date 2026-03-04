@@ -1,6 +1,7 @@
 // apps/backend/src/routes/onboarding.ts
 // 🔥 FULL EXTENDED VERSION — pipeline, public viewer, S3 presign, admin decision, no-store caching
 import { Router, Request, Response, NextFunction } from "express";
+import { z } from "zod";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
@@ -374,21 +375,42 @@ function noStore(_: Request, res: Response, next: NextFunction) {
   next();
 }
 
+/* -------------------- Validation Schemas -------------------- */
+const inviteSchema = z.object({
+  type: z.enum(["Business", "Vendor", "Employee", "BusinessAssociation"]),
+  inviteeEmail: z.string().email(),
+  inviteeName: z.string().min(1).max(200).optional(),
+  turnaroundHours: z.number().min(1).max(720).optional(),
+});
+
+const decisionSchema = z.object({
+  action: z.enum(["approved", "rejected", "hold"]),
+  remarks: z.string().max(1000).optional(),
+});
+
+const presignQuerySchema = z.object({
+  key: z.string().min(1).max(500),
+});
+
 /* -------------------- ROUTES -------------------- */
 /** 📨 Create invite */
 router.post("/invites", requireAuth, noStore, async (req, res, next) => {
   try {
-    
-    const { type, inviteeEmail, inviteeName, email, name, turnaroundHours, status } =
-      req.body ?? {};
+    const validation = inviteSchema.safeParse(req.body);
+    if (!validation.success)
+      return res.status(400).json({
+        error: "Validation failed",
+        fields: validation.error.flatten().fieldErrors,
+      });
+
+    const { type, inviteeEmail, inviteeName, turnaroundHours } = validation.data;
+    const { email, name, status } = req.body ?? {};
     const normEmail = String(inviteeEmail ?? email ?? "").trim();
     const rawName = inviteeName;
 const safeName =
   typeof rawName === "string" && rawName.trim().length > 0
     ? rawName.trim()
     : undefined;
-
-    if (!normEmail) return res.status(400).json({ error: "email is required" });
 
     // ❌ Invalidate previous active invites for same type + email
 await (Onboarding as any).updateMany(
@@ -936,19 +958,24 @@ router.get("/document/presign", requireAuth, noStore, async (req, res, next) => 
   try {
     console.log("[presign] HIT — key:", req.query.key);
 
+    const validation = presignQuerySchema.safeParse(req.query);
+    if (!validation.success)
+      return res.status(400).json({
+        error: "Validation failed",
+        fields: validation.error.flatten().fieldErrors,
+      });
+
     if (!S3_BUCKET)
       return res.status(500).json({ error: "S3_BUCKET not configured" });
     if (!getSignedUrl)
       return res.status(500).json({ error: "@aws-sdk/s3-request-presigner not installed — run: npm install @aws-sdk/s3-request-presigner" });
 
-    const { key } = req.query as { key?: string };
-    if (!key || !String(key).trim())
-      return res.status(400).json({ error: "key is required" });
+    const { key } = validation.data;
 
     const { GetObjectCommand } = await import("@aws-sdk/client-s3");
     const cmd = new GetObjectCommand({
       Bucket: S3_BUCKET,
-      Key: String(key).trim(),
+      Key: key,
     });
 
     const url = await getSignedUrl(s3, cmd, { expiresIn: 300 }); // 5 min TTL
@@ -1029,11 +1056,15 @@ router.get("/:token/details", requireAuth, noStore, async (req, res, next) => {
 /** 🧑‍💼 Admin decision – also sync on approval */
 router.post("/:token/decision", requireAuth, noStore, async (req, res, next) => {
   try {
+    const validation = decisionSchema.safeParse(req.body);
+    if (!validation.success)
+      return res.status(400).json({
+        error: "Validation failed",
+        fields: validation.error.flatten().fieldErrors,
+      });
+
     const { token } = req.params;
-    const { action, remarks } = req.body as {
-      action: "approved" | "rejected" | "hold";
-      remarks?: string;
-    };
+    const { action, remarks } = validation.data;
     const doc: any = await (Onboarding as any).findOne({ token }).exec();
     if (!doc) return res.status(404).json({ error: "Not found" });
     const newStatus =
