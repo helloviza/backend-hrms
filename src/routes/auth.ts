@@ -3,6 +3,7 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
+import { rateLimit } from "express-rate-limit";
 
 import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
@@ -666,7 +667,15 @@ r.post("/register", async (req, res) => {
 /* ───────────────────────────────────────────────
  * LOGIN
  * ─────────────────────────────────────────────── */
-r.post("/login", async (req, res) => {
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // 10 attempts per window
+  message: { error: "Too many login attempts. Try again in 15 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+r.post("/login", loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || typeof email !== "string" || !password) {
