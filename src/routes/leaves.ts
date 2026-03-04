@@ -1,5 +1,6 @@
 // apps/backend/src/routes/leaves.ts
 import { Router, Request, Response, NextFunction } from "express";
+import { z } from "zod";
 import Leave from "../models/LeaveRequest.js";
 import requireAuth from "../middleware/auth.js";
 import { audit } from "../middleware/audit.js";
@@ -8,14 +9,29 @@ const r = Router();
 
 r.use(requireAuth);
 
-const ALLOWED_TYPES = [
-  "CASUAL",
-  "SICK",
-  "PAID",
-  "UNPAID",
-  "MATERNITY",
-  "COMPOFF",
-];
+const applySchema = z.object({
+  type: z.enum([
+    "CASUAL",
+    "SICK",
+    "EARNED",
+    "MATERNITY",
+    "PATERNITY",
+    "BEREAVEMENT",
+    "COMP_OFF",
+    "LWP",
+  ]),
+  from: z.string().min(1),
+  to: z.string().min(1),
+  reason: z.string().min(1).max(500),
+});
+
+const approveSchema = z.object({
+  remarks: z.string().max(500).optional(),
+});
+
+const rejectSchema = z.object({
+  remarks: z.string().min(1).max(500),
+});
 
 // ───────────────── APPLY LEAVE ─────────────────
 r.post(
@@ -23,21 +39,17 @@ r.post(
   audit("leave-apply"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const userId = (req as any).user.sub;
-
-      const rawType = String((req.body as any)?.type || "").trim();
-      const normalizedType = rawType.toUpperCase();
-
-      if (!ALLOWED_TYPES.includes(normalizedType)) {
+      const result = applySchema.safeParse(req.body);
+      if (!result.success)
         return res.status(400).json({
-          ok: false,
-          message: `Unsupported leave type: ${rawType}`,
+          error: "Validation failed",
+          fields: result.error.flatten().fieldErrors,
         });
-      }
 
+      const userId = (req as any).user.sub;
       const lr = await Leave.create({
         ...(req.body as any),
-        type: normalizedType, // ✅ ensure enum-safe
+        type: result.data.type,
         userId,
         status: "PENDING",
       });
@@ -55,6 +67,13 @@ r.post(
   audit("leave-approve"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
+      const result = approveSchema.safeParse(req.body);
+      if (!result.success)
+        return res.status(400).json({
+          error: "Validation failed",
+          fields: result.error.flatten().fieldErrors,
+        });
+
       const userRoles = (req as any).user?.roles || [];
       const canApprove = userRoles.some((r: string) =>
         ["MANAGER", "HR", "ADMIN", "SUPERADMIN"].includes(r.toUpperCase())
@@ -67,7 +86,12 @@ r.post(
           status: "APPROVED",
           approverId,
           $push: {
-            history: { at: new Date(), by: approverId, action: "APPROVED" },
+            history: {
+              at: new Date(),
+              by: approverId,
+              action: "APPROVED",
+              note: result.data.remarks,
+            },
           },
         },
         { new: true }
@@ -85,6 +109,13 @@ r.post(
   audit("leave-reject"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
+      const result = rejectSchema.safeParse(req.body);
+      if (!result.success)
+        return res.status(400).json({
+          error: "Validation failed",
+          fields: result.error.flatten().fieldErrors,
+        });
+
       const userRoles = (req as any).user?.roles || [];
       const canApprove = userRoles.some((r: string) =>
         ["MANAGER", "HR", "ADMIN", "SUPERADMIN"].includes(r.toUpperCase())
@@ -101,7 +132,7 @@ r.post(
               at: new Date(),
               by: approverId,
               action: "REJECTED",
-              note: (req.body as any)?.note,
+              note: result.data.remarks,
             },
           },
         },
