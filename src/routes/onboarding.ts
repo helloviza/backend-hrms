@@ -1027,11 +1027,16 @@ router.get("/:token/details", requireAuth, noStore, async (req, res, next) => {
       formData = {};
     }
 
+    const S3_BASE = process.env.S3_BUCKET
+      ? `https://${process.env.S3_BUCKET}.s3.${process.env.AWS_REGION || "ap-south-1"}.amazonaws.com`
+      : "";
+
     const documents = (doc.documents || []).map((d: any) => {
       // ✅ objectKey is what upload/presign stores — check it first
       const key = d.objectKey || d.key || d.Key || d.path || d.s3Key || "";
       const name = d.name || d.filename || d.originalName || key.split("/").pop() || "Document";
-      return { name, key, url: d.url || null };
+      const url = d.url || (S3_BASE && key ? `${S3_BASE}/${encodeURIComponent(key)}` : null);
+      return { name, key, url };
     });
 
     res.json({
