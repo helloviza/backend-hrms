@@ -279,6 +279,7 @@ app.use("/api/hr", hrOrgChartRouter);
 // Admin
 app.use("/api/admin", adminRouter);
 app.use("/api/admin", adminAnalyticsRouter);
+app.use("/api/admin", users);
 
 // Approvals & booking history
 app.use("/api/approvals", approvalsRouter);

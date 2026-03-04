@@ -2,6 +2,8 @@
 import { Router, Request, Response, NextFunction } from "express";
 import User from "../models/User.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireRoles } from "../middleware/roles.js";
+import bcrypt from "bcryptjs";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -229,6 +231,62 @@ r.post(
 
       const avatarUrl = await signAvatarUrl(key);
       res.json({ avatarKey: key, avatarUrl });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/* ─────────────── POST /create-staff (mounted at /api/admin/create-staff) ─────────────── */
+
+r.post(
+  "/create-staff",
+  requireAuth,
+  requireRoles("ADMIN", "SUPERADMIN"),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { name, email, password, role, department, phone } = req.body as {
+        name?: string;
+        email?: string;
+        password?: string;
+        role?: string;
+        department?: string;
+        phone?: string;
+      };
+
+      if (!name || !email || !password || !role) {
+        return res.status(400).json({ error: "name, email, password and role are required." });
+      }
+      if (password.length < 6) {
+        return res.status(400).json({ error: "Password must be at least 6 characters." });
+      }
+
+      const existing = await User.findOne({ email: email.trim().toLowerCase() });
+      if (existing) {
+        return res.status(409).json({ error: "A user with this email already exists." });
+      }
+
+      const hashed = await bcrypt.hash(password, 10);
+
+      const newUser = await User.create({
+        name: name.trim(),
+        email: email.trim().toLowerCase(),
+        passwordHash: hashed,
+        roles: [role.toUpperCase()],
+        ...(department ? { department: department.trim() } : {}),
+        ...(phone ? { phone: phone.trim() } : {}),
+        isActive: true,
+      });
+
+      return res.status(201).json({
+        success: true,
+        user: {
+          _id: newUser._id,
+          name: newUser.name,
+          email: newUser.email,
+          roles: newUser.roles,
+        },
+      });
     } catch (err) {
       next(err);
     }
