@@ -5,13 +5,6 @@ import { requireAuth } from "../middleware/auth.js";
 const r = Router();
 
 // ---------- LEAVE ----------
-r.get("/leave/my", requireAuth, (req, res) => {
-  res.json([
-    { id: "lv_1001", type: "Casual", from: "2025-09-20", to: "2025-09-20", status: "Approved" },
-    { id: "lv_1002", type: "Sick", from: "2025-09-25", to: "2025-09-26", status: "Pending" },
-  ]);
-});
-
 r.get("/leave/team", requireAuth, (req, res) => {
   res.json([
     { id: "lv_t2001", employee: "Alex J", type: "Casual", days: 1, status: "Pending" },
