@@ -55,6 +55,11 @@ r.post(
   audit("leave-approve"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
+      const userRoles = (req as any).user?.roles || [];
+      const canApprove = userRoles.some((r: string) =>
+        ["MANAGER", "HR", "ADMIN", "SUPERADMIN"].includes(r.toUpperCase())
+      );
+      if (!canApprove) return res.status(403).json({ error: "Not authorized" });
       const approverId = (req as any).user.sub;
       const lr = await Leave.findByIdAndUpdate(
         req.params.id,
@@ -80,6 +85,11 @@ r.post(
   audit("leave-reject"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
+      const userRoles = (req as any).user?.roles || [];
+      const canApprove = userRoles.some((r: string) =>
+        ["MANAGER", "HR", "ADMIN", "SUPERADMIN"].includes(r.toUpperCase())
+      );
+      if (!canApprove) return res.status(403).json({ error: "Not authorized" });
       const approverId = (req as any).user.sub;
       const lr = await Leave.findByIdAndUpdate(
         req.params.id,
