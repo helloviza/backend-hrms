@@ -90,7 +90,58 @@ router.get("/", requireAuth, async (_req, res, next) => {
       tempPassword: userMap.get(e.email)?.tempPassword || false,
     }));
 
-    return res.json(enriched);
+    const flattened = enriched.map((e: any) => {
+      const snap = e.onboardingSnapshot || {};
+      const nameParts = (e.fullName || snap.fullName || e.name || "").trim().split(" ");
+
+      return {
+        ...e,
+        // Name fields
+        firstName: e.firstName || nameParts[0] || "",
+        lastName: e.lastName || nameParts.slice(1).join(" ") || "",
+        name: e.fullName || snap.fullName || e.name || "",
+
+        // Contact
+        personalContact: e.personalContact || snap.contact?.personalMobile || e.phone || "",
+        personalEmail: e.personalEmail || snap.contact?.personalEmail || "",
+        officialEmail: e.officialEmail || e.email || "",
+
+        // Emergency
+        emergencyContactName: e.emergencyContactName || snap.emergency?.name || "",
+        emergencyContactNumber: e.emergencyContactNumber || snap.emergency?.mobile || "",
+        emergencyContactRelation: e.emergencyContactRelation || snap.emergency?.relationship || "",
+
+        // IDs
+        pan: e.pan || snap.ids?.pan || "",
+        aadhaar: e.aadhaar || snap.ids?.aadhaar || "",
+        voterId: e.voterId || snap.ids?.voterId || "",
+        passportNumber: e.passportNumber || snap.ids?.passport || "",
+
+        // Personal
+        dateOfBirth: e.dateOfBirth || snap.dateOfBirth || "",
+        gender: e.gender || snap.gender || "",
+        maritalStatus: e.maritalStatus || snap.employment?.maritalStatus || "",
+
+        // Address
+        currentAddress: e.currentAddress || snap.address?.current || "",
+        permanentAddress: e.permanentAddress || snap.address?.permanent || "",
+
+        // Bank
+        bankAccountNumber: e.bankAccountNumber || snap.bank?.accountNumber || "",
+        bankName: e.bankName || snap.bank?.bankName || "",
+        ifsc: e.ifsc || snap.bank?.ifsc || "",
+        bankBranch: e.bankBranch || snap.bank?.branch || "",
+
+        // Education
+        highestDegree: e.highestDegree || snap.education?.highestDegree || "",
+        institution: e.institution || snap.education?.institution || "",
+
+        // Employment
+        joiningDate: e.joiningDate || snap.employment?.dateOfJoining || "",
+      };
+    });
+
+    return res.json(flattened);
   } catch (err) {
     next(err);
   }
