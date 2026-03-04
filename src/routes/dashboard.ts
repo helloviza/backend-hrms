@@ -5,6 +5,7 @@ import { Router, Request, Response } from "express";
 import Employee from "../models/Employee.js";
 import LeaveRequest from "../models/LeaveRequest.js";
 import Attendance from "../models/Attendance.js";
+import Onboarding from "../models/Onboarding.js";
 
 // For Excel export
 import XLSX from "xlsx";
@@ -226,6 +227,11 @@ router.get("/hr-admin", async (req: Request, res: Response) => {
 
     const openLeaveRequests = openLeaves.length;
 
+    // ── ONBOARDING ──
+    const pendingOnboarding = await (Onboarding as any).countDocuments({
+      status: { $in: ["started", "in-progress", "submitted"] },
+    });
+
     // ── ATTENDANCE ──
     // date stored as "YYYY-MM-DD" string
     const todayStr = toStr; // last day of selected range
@@ -282,7 +288,7 @@ router.get("/hr-admin", async (req: Request, res: Response) => {
         totalEmployees,
         activeEmployees,
         inactiveEmployees,
-        pendingOnboarding: 0, // TODO: wire from onboarding table
+        pendingOnboarding,
         openLeaveRequests,
         todaysAbsents,
       },
