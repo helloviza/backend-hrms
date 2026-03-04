@@ -260,6 +260,7 @@ app.use("/api/v1/workspace", workspaceRouter);
 app.use("/api/v1/copilot/travel", travelCopilotRoutes);
 app.use("/api/v1/pluto/video", plutoVideoRouter);
 app.use("/api/copilot", copilotRouter);
+app.use("/api/v1/copilot/manager", copilotRouter);
 app.use("/api/assistant", assistantRouter);
 app.use("/api/assistant", assistantHrRouter);
 app.use("/api/v1/copilot/video", copilotVideoConsent);
