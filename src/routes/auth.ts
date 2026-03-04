@@ -4,6 +4,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { rateLimit } from "express-rate-limit";
+import { z } from "zod";
 
 import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
@@ -675,12 +676,21 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1),
+});
+
 r.post("/login", loginLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body || {};
-    if (!email || typeof email !== "string" || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
+    const result = loginSchema.safeParse(req.body);
+    if (!result.success) {
+      return res.status(400).json({
+        error: "Validation failed",
+        fields: result.error.flatten().fieldErrors,
+      });
     }
+    const { email, password } = result.data;
 
     const normalizedEmail = normalizeEmail(email);
 
@@ -1024,13 +1034,20 @@ r.post("/admin/reset-password", async (req, res) => {
 /* ───────────────────────────────────────────────
  * FORGOT PASSWORD
  * ─────────────────────────────────────────────── */
+const forgotPasswordSchema = z.object({
+  email: z.string().email(),
+});
+
 r.post("/forgot-password", async (req, res) => {
   try {
-    const { email } = req.body || {};
-
-    if (!email || typeof email !== "string") {
-      return res.status(400).json({ error: "Email is required" });
+    const result = forgotPasswordSchema.safeParse(req.body);
+    if (!result.success) {
+      return res.status(400).json({
+        error: "Validation failed",
+        fields: result.error.flatten().fieldErrors,
+      });
     }
+    const { email } = result.data;
 
     const normalizedEmail = normalizeEmail(email);
 
@@ -1078,17 +1095,21 @@ r.post("/forgot-password", async (req, res) => {
 /* ───────────────────────────────────────────────
  * RESET PASSWORD
  * ─────────────────────────────────────────────── */
+const resetPasswordSchema = z.object({
+  token: z.string().min(1),
+  newPassword: z.string().min(8, "Password must be at least 8 characters"),
+});
+
 r.post("/reset-password", async (req, res) => {
   try {
-    const { token, newPassword } = req.body || {};
-
-    if (!token || typeof token !== "string") {
-      return res.status(400).json({ error: "Reset token is required" });
+    const result = resetPasswordSchema.safeParse(req.body);
+    if (!result.success) {
+      return res.status(400).json({
+        error: "Validation failed",
+        fields: result.error.flatten().fieldErrors,
+      });
     }
-
-    if (!newPassword || typeof newPassword !== "string" || newPassword.length < 8) {
-      return res.status(400).json({ error: "Password must be at least 8 characters" });
-    }
+    const { token, newPassword } = result.data;
 
     const hash = crypto.createHash("sha256").update(token).digest("hex");
 
