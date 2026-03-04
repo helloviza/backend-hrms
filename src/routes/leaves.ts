@@ -189,4 +189,55 @@ async function handleMyLeaves(
 r.get("/mine", handleMyLeaves);
 r.get("/my", handleMyLeaves); // ✅ keep existing /my endpoint working
 
+// ───────────────── BALANCE (remaining days per type for current year) ─────────────────
+const LEAVE_TYPES = [
+  "CASUAL", "SICK", "PAID", "UNPAID",
+  "MATERNITY", "PATERNITY", "COMPOFF", "BEREAVEMENT",
+] as const;
+
+r.get(
+  "/balance",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const userId = (req as any).user.sub;
+      const year = new Date().getFullYear();
+
+      let balance = await LeaveBalance.findOne({ userId, year });
+      if (!balance) {
+        balance = await LeaveBalance.create({ userId, year });
+      }
+
+      // Compute approved days used this year per leave type
+      const yearStart = new Date(year, 0, 1);
+      const yearEnd = new Date(year + 1, 0, 1);
+      const approved = await Leave.find({
+        userId,
+        status: "APPROVED",
+        from: { $gte: yearStart, $lt: yearEnd },
+      });
+
+      const used: Record<string, number> = {};
+      for (const leave of approved) {
+        const days =
+          leave.days ??
+          Math.ceil(
+            (new Date(leave.to).getTime() - new Date(leave.from).getTime()) /
+              (1000 * 60 * 60 * 24)
+          ) + 1;
+        used[leave.type] = (used[leave.type] || 0) + days;
+      }
+
+      const remaining: Record<string, number> = {};
+      for (const type of LEAVE_TYPES) {
+        const quota = balance.balances[type];
+        remaining[type] = Math.max(0, quota - (used[type] || 0));
+      }
+
+      return res.json({ year, balances: remaining });
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
 export default r;
