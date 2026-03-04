@@ -234,7 +234,7 @@ app.use("/api/employees", employeesRouter);
 app.use("/api/stats", stats);
 app.use("/api/logs", logs);
 app.use("/api/attendance", attendance);
-app.use("/api/leave", leaves);
+app.use("/api/leaves", leaves);
 app.use("/api/holidays", holidays);
 
 // Uploads
