@@ -349,16 +349,6 @@ export async function resolveLeaderCustomerIds(email: string): Promise<string[]>
 
 export async function requireApprovalsAdminRead(req: AnyObj, res: any, next: any) {
   try {
-    if (DISABLE_AUTH) {
-      (req as AnyObj).user = {
-        sub: "dev-user",
-        email: "dev@local",
-        roles: ["ADMIN"],
-        name: "Dev Admin",
-      };
-      return next();
-    }
-
     return requireAuth(req as any, res as any, async () => {
       let user = (req as AnyObj).user;
       user = await hydrateUserFromDb(user);
@@ -392,16 +382,6 @@ export async function requireApprovalsAdminRead(req: AnyObj, res: any, next: any
 
 export async function requireApprovalsAdminWrite(req: AnyObj, res: any, next: any) {
   try {
-    if (DISABLE_AUTH) {
-      (req as AnyObj).user = {
-        sub: "dev-user",
-        email: "dev@local",
-        roles: ["ADMIN"],
-        name: "Dev Admin",
-      };
-      return next();
-    }
-
     return requireAuth(req as any, res as any, async () => {
       let user = (req as AnyObj).user;
       user = await hydrateUserFromDb(user);

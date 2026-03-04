@@ -21,7 +21,6 @@ import {
 import {
   AnyObj,
   EmailAction,
-  DISABLE_AUTH,
   DISABLE_EMAILS,
   applyLeaderScopeIfNeeded,
   assertEmailAction,
