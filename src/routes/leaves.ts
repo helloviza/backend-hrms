@@ -2,6 +2,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { z } from "zod";
 import Leave from "../models/LeaveRequest.js";
+import LeaveBalance from "../models/LeaveBalance.js";
 import requireAuth from "../middleware/auth.js";
 import { audit } from "../middleware/audit.js";
 
@@ -47,11 +48,36 @@ r.post(
         });
 
       const userId = (req as any).user.sub;
+
+      // Quota enforcement
+      const from = new Date(result.data.from);
+      const to = new Date(result.data.to);
+      const daysRequested = Math.ceil((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+
+      const year = new Date().getFullYear();
+      let balance = await LeaveBalance.findOne({ userId, year });
+      if (!balance) {
+        balance = await LeaveBalance.create({ userId, year });
+      }
+
+      const leaveType = result.data.type as keyof typeof balance.balances;
+      const remaining = balance.balances[leaveType] ?? 999;
+
+      if (remaining !== 999 && daysRequested > remaining) {
+        return res.status(400).json({
+          error: "Insufficient leave balance",
+          type: leaveType,
+          requested: daysRequested,
+          remaining,
+        });
+      }
+
       const lr = await Leave.create({
         ...(req.body as any),
         type: result.data.type,
         userId,
         status: "PENDING",
+        days: daysRequested,
       });
 
       return res.json(lr);
