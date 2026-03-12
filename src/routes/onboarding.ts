@@ -318,6 +318,7 @@ async function syncEmployeeFromOnboarding(
         role: "EMPLOYEE",
         status: "ACTIVE",
         passwordHash,
+        tempPassword: true,
       });
     } else {
       Object.assign(user, update);

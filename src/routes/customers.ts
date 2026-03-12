@@ -1,11 +1,12 @@
 // apps/backend/src/routes/customers.ts
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
+import { requireAdmin } from "../middleware/rbac.js";
 import Customer from "../models/Customer.js";
 
 const router = Router();
 
-router.get("/", requireAuth, async (_req, res, next) => {
+router.get("/", requireAuth, requireAdmin, async (_req, res, next) => {
   try {
     const docs = await Customer.find({})
       .sort({ updatedAt: -1 })

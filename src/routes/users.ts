@@ -1,6 +1,7 @@
 // apps/backend/src/routes/users.ts
 import { Router, Request, Response, NextFunction } from "express";
 import User from "../models/User.js";
+import { Onboarding } from "../models/Onboarding.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRoles } from "../middleware/roles.js";
 import bcrypt from "bcryptjs";
@@ -292,5 +293,193 @@ r.post(
     }
   },
 );
+
+/* ─────────────── GET /admin/onboarded-without-access ─────────────── */
+
+r.get(
+  "/admin/onboarded-without-access",
+  requireAuth,
+  requireRoles("ADMIN", "SUPERADMIN", "HR"),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const users = await User.find({
+        $or: [
+          { tempPassword: true },
+          { tempPassword: { $exists: false } },
+        ],
+        roles: { $in: ["EMPLOYEE", "MANAGER", "HR"] },
+      })
+        .select("name email roles employeeCode createdAt tempPassword activatedByAdmin")
+        .lean();
+
+      res.json(users);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/* ─────────────── POST /admin/grant-access ─────────────── */
+
+r.post(
+  "/admin/grant-access",
+  requireAuth,
+  requireRoles("ADMIN", "SUPERADMIN", "HR"),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { userId, onboardingId, role, password } = req.body as {
+        userId?: string;
+        onboardingId?: string;
+        role?: string;
+        password?: string;
+      };
+
+      if (!role || !password) {
+        return res.status(400).json({ error: "role and password are required." });
+      }
+      if (password.length < 6) {
+        return res.status(400).json({ error: "Password must be at least 6 characters." });
+      }
+
+      const hashed = await bcrypt.hash(password, 10);
+      const activation = {
+        passwordHash: hashed,
+        roles: [role.toUpperCase()],
+        tempPassword: false,
+        activatedByAdmin: true,
+        activatedAt: new Date(),
+      };
+
+      // Path A: grant access to an existing User doc (from tempPassword flow)
+      if (userId) {
+        const target = await User.findById(userId);
+        if (!target) return res.status(404).json({ error: "User not found." });
+        Object.assign(target, activation);
+        await (target as any).save();
+        return res.json({
+          success: true,
+          user: { _id: target._id, name: (target as any).name, email: (target as any).email, roles: (target as any).roles },
+        });
+      }
+
+      // Path B: create from onboarding doc (no User exists yet)
+      if (!onboardingId) {
+        return res.status(400).json({ error: "userId or onboardingId is required." });
+      }
+
+      const onboarding = await (Onboarding as any).findById(onboardingId).lean();
+      if (!onboarding) {
+        return res.status(404).json({ error: "Onboarding record not found." });
+      }
+
+      const email = (onboarding as any).email?.trim().toLowerCase();
+      if (!email) {
+        return res.status(400).json({ error: "Onboarding record has no email." });
+      }
+
+      const o = onboarding as any;
+      const payload = o.formPayload || {};
+      const name =
+        o.inviteeName ||
+        payload.name ||
+        payload.fullName ||
+        [payload.firstName, payload.lastName].filter(Boolean).join(" ") ||
+        email;
+
+      const existing = await User.findOne({ email });
+      if (existing) {
+        Object.assign(existing, activation);
+        await (existing as any).save();
+        return res.json({
+          success: true,
+          user: { _id: existing._id, name: (existing as any).name, email: (existing as any).email, roles: (existing as any).roles },
+        });
+      }
+
+      const newUser = await User.create({ name, email, isActive: true, ...activation });
+
+      return res.status(201).json({
+        success: true,
+        user: {
+          _id: newUser._id,
+          name: (newUser as any).name,
+          email: (newUser as any).email,
+          roles: (newUser as any).roles,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+r.patch("/admin/users/:id/sbt", requireAuth, async (req: any, res: any) => {
+  try {
+    const actor = req.user || {};
+    const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role]).map((r: any) =>
+      String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, "")
+    );
+    const isAdmin = actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
+
+    if (!isAdmin && !isLeader) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const { sbtEnabled, sbtBookingType } = req.body;
+
+    const targetUser: any = await User.findById(req.params.id).select("customerId email").lean();
+    if (!targetUser) return res.status(404).json({ error: "User not found" });
+
+    // WORKSPACE_LEADER: scoped checks
+    if (isLeader && !isAdmin) {
+      const actorCustomerId = String(actor.customerId || actor.businessId || "");
+      const targetCustomerId = String(targetUser.customerId || "");
+
+      // Cannot modify users outside their own company
+      if (!actorCustomerId || actorCustomerId !== targetCustomerId) {
+        return res.status(403).json({ error: "You can only manage users in your own company" });
+      }
+
+      // Cannot modify their own SBT
+      const actorId = String(actor.sub || actor.id || actor._id || "");
+      const targetId = String(req.params.id);
+      const actorEmail = String(actor.email || "").trim().toLowerCase();
+      const targetEmail = String(targetUser.email || "").trim().toLowerCase();
+      if ((actorId && actorId === targetId) || (actorEmail && actorEmail === targetEmail)) {
+        return res.status(403).json({
+          error: "You cannot modify your own permissions. Contact Plumtrips Admin.",
+          code: "SELF_MODIFICATION_DENIED",
+        });
+      }
+    }
+
+    // If enabling SBT, check workspace travelMode for conflicts
+    if (sbtEnabled) {
+      if (targetUser?.customerId) {
+        const CustomerWorkspace = (await import("../models/CustomerWorkspace.js")).default;
+        const ws: any = await CustomerWorkspace.findOne({ customerId: targetUser.customerId })
+          .select("travelMode")
+          .lean();
+        if (ws?.travelMode === "APPROVAL_FLOW") {
+          return res.status(409).json({
+            error: "Cannot enable SBT for this user. Company travel mode is set to Approval Flow.",
+            code: "APPROVAL_FLOW_CONFLICT",
+          });
+        }
+      }
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { sbtEnabled, sbtBookingType },
+      { new: true }
+    ).select("name email sbtEnabled sbtBookingType");
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json({ success: true, user });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 export default r;

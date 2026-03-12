@@ -5,6 +5,8 @@ import morgan from "morgan";
 import compression from "compression";
 import path from "path";
 import { fileURLToPath } from "url";
+import { randomUUID } from "crypto";
+import logger from "./utils/logger.js";
 
 import { connectDb } from "./config/db.js";
 import { corsMiddleware } from "./config/cors.js";
@@ -87,6 +89,9 @@ import placesRouter from "./routes/places.js";
 // ✅ NEW WORKFLOW: proposals
 import proposalsRouter from "./routes/proposals.js";
 
+// ✅ Image proxy (same-origin fetch for S3 assets)
+import proxyRouter from "./routes/proxy.js";
+
 const app = express();
 
 /* ────────────────────────────────────────────────────────────────
@@ -106,14 +111,32 @@ if (process.env.NODE_ENV !== "production") {
  * MIDDLEWARE ORDER (IMPORTANT)
  * ──────────────────────────────────────────────────────────────── */
 
+// Request ID middleware — adds unique ID to every request for log correlation
+app.use((req: any, res, next) => {
+  req.requestId = randomUUID();
+  res.setHeader("X-Request-Id", req.requestId);
+  next();
+});
+
 // Logging first
-app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+morgan.token("request-id", (req: any) => req.requestId);
+app.use(
+  morgan(
+    process.env.NODE_ENV === "production"
+      ? ":request-id :method :url :status :response-time ms"
+      : ":request-id :method :url :status :response-time ms"
+  )
+);
 
 // Security headers
 app.use(helmetMiddleware);
 
 // CORS
 app.use(corsMiddleware);
+
+// Razorpay webhook — MUST be before express.json() to receive raw body
+import razorpayWebhookRouter from "./routes/razorpay.webhook.js";
+app.use("/api/webhooks", express.raw({ type: "application/json" }), razorpayWebhookRouter);
 
 // JSON parser
 app.use(
@@ -173,11 +196,11 @@ const disableLocalUploads =
 if (!disableLocalUploads) {
   app.use("/uploads", express.static(uploadsDir));
   if (process.env.NODE_ENV !== "production") {
-    console.log("🖼️  Serving /uploads from =", uploadsDir);
+    logger.info("Serving /uploads from", { path: uploadsDir });
   }
 } else {
   if (process.env.NODE_ENV !== "production") {
-    console.log("🧼 Local /uploads serving is DISABLED (S3-only mode).");
+    logger.info("Local /uploads serving is DISABLED (S3-only mode)");
   }
 }
 
@@ -206,11 +229,11 @@ async function safeMount(prefix: string, modulePath: string) {
     const router = (mod as any).default || mod;
     if (router) {
       app.use(prefix, router);
-      console.log(`✅ Mounted ${prefix} <- ${modulePath}`);
+      logger.info("Mounted route", { prefix, modulePath });
     }
   } catch {
     if (process.env.NODE_ENV !== "production") {
-      console.log(`ℹ️ Skipped mount ${prefix} (missing/failed): ${modulePath}`);
+      logger.info("Skipped mount (missing/failed)", { prefix, modulePath });
     }
   }
 }
@@ -269,6 +292,24 @@ app.use("/api/v1/admin", adminVideoRouter);
 // Flights
 app.use("/api/v1/flights", flightRoutes);
 
+// SBT (Self-Booking Tool) — TBO integration
+import sbtFlightsRouter from "./routes/sbt.flights.js";
+app.use("/api/sbt/flights", sbtFlightsRouter);
+
+import sbtHotelsRouter from "./routes/sbt.hotels.js";
+app.use("/api/sbt/hotels", sbtHotelsRouter);
+
+import sbtRequestsRouter from "./routes/sbt.requests.js";
+app.use("/api/sbt/requests", sbtRequestsRouter);
+
+// SBT Admin (offer config)
+import adminSBTRouter from "./routes/admin.sbt.js";
+app.use("/api/admin/sbt", adminSBTRouter);
+
+// Admin Billing Console
+import adminBillingRouter from "./routes/admin.billing.js";
+app.use("/api/admin/billing", adminBillingRouter);
+
 // Dashboards
 app.use("/api/dashboard", dashboardRouter);
 
@@ -281,6 +322,14 @@ app.use("/api/admin", adminRouter);
 app.use("/api/admin", adminAnalyticsRouter);
 app.use("/api/admin", users);
 
+// Admin — Payment orphans (Razorpay webhook mismatches)
+import adminPaymentOrphansRouter from "./routes/admin.paymentOrphans.js";
+app.use("/api/admin/payment-orphans", adminPaymentOrphansRouter);
+
+// Admin — Session logs (Winston logging + session tracking)
+import adminSessionsRouter from "./routes/admin.sessions.js";
+app.use("/api/admin/sessions", adminSessionsRouter);
+
 // Approvals & booking history
 app.use("/api/approvals", approvalsRouter);
 app.use("/api/approvals", bookingHistory);
@@ -291,6 +340,9 @@ void safeMount("/api/settings", "./routes/settings.js");
 
 // Stubs
 app.use("/api/stubs", stubs);
+
+// Image proxy
+app.use("/api/proxy", proxyRouter);
 
 // 404
 app.use("/api", (_req, res) => {
@@ -314,18 +366,18 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       startBackgroundWorkers();
 
       const server = app.listen(env.PORT, () => {
-        console.log(`✅ API running on port ${env.PORT}`);
+        logger.info("API running", { port: env.PORT });
       });
 
       const shutdown = () => {
-        console.log("🛑 Gracefully shutting down server...");
+        logger.info("Gracefully shutting down server...");
         server.close(() => process.exit(0));
       };
 
       process.on("SIGINT", shutdown);
       process.on("SIGTERM", shutdown);
     } catch (err) {
-      console.error("❌ Failed to start server:", err);
+      logger.error("Failed to start server", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
       process.exit(1);
     }
   })();

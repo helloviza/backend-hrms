@@ -11,5 +11,5 @@ const CustomerWhitelistEmailSchema = new Schema(
 
 CustomerWhitelistEmailSchema.index({ workspaceId: 1, email: 1 }, { unique: true });
 
-export default mongoose.models.CustomerWhitelistEmail ||
-  mongoose.model("CustomerWhitelistEmail", CustomerWhitelistEmailSchema);
+export default (mongoose.models.CustomerWhitelistEmail ||
+  mongoose.model("CustomerWhitelistEmail", CustomerWhitelistEmailSchema)) as mongoose.Model<any>;

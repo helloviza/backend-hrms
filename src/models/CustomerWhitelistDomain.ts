@@ -11,5 +11,5 @@ const CustomerWhitelistDomainSchema = new Schema(
 
 CustomerWhitelistDomainSchema.index({ workspaceId: 1, domain: 1 }, { unique: true });
 
-export default mongoose.models.CustomerWhitelistDomain ||
-  mongoose.model("CustomerWhitelistDomain", CustomerWhitelistDomainSchema);
+export default (mongoose.models.CustomerWhitelistDomain ||
+  mongoose.model("CustomerWhitelistDomain", CustomerWhitelistDomainSchema)) as mongoose.Model<any>;

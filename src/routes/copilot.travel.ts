@@ -37,6 +37,8 @@ import {
   searchFlightRoutes,
 } from "../services/flightService.js";
 
+import { searchFlights as tboSearchFlights } from "../services/tbo.flight.service.js";
+
 // ✅ VIDEO CONTEXT ADAPTER (AUTHORITATIVE)
 import {
   attachVideoContext,
@@ -48,6 +50,115 @@ import {
   handoffTriggered,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
+
+// ── TBO mapper: TBO Search response → FlightListing shape for concierge UI ──
+function mapTBOToFlightResults(tboResults: any[], traceId: string): any[] {
+  return tboResults
+    .filter(r => r?.Segments?.[0]?.[0] && r?.Fare)
+    .map(r => {
+      const seg = r.Segments[0][0];
+      const price = r.Fare.PublishedFare || r.Fare.TotalFare || 0;
+      const depTime = seg.Origin?.DepTime || "";
+      const arrTime = seg.Destination?.ArrTime || "";
+      const durationMins = seg.Duration || 0;
+      const airlineCode = seg.Airline?.AirlineCode || "";
+      const stops = r.Segments[0].length - 1;
+
+      return {
+        airline: seg.Airline?.AirlineName || airlineCode,
+        flightNo: seg.Airline?.FlightNumber || "",
+        airlineCode,
+        logoUrl: `/assets/airlines/${airlineCode}.gif`,
+        departure: {
+          iata: seg.Origin?.Airport?.AirportCode || "",
+          city: seg.Origin?.Airport?.CityName || "",
+          time: new Date(depTime).toLocaleTimeString("en-IN", {
+            hour: "2-digit", minute: "2-digit", hour12: true,
+          }),
+          isoTime: depTime,
+        },
+        arrival: {
+          iata: seg.Destination?.Airport?.AirportCode || "",
+          city: seg.Destination?.Airport?.CityName || "",
+          time: new Date(arrTime).toLocaleTimeString("en-IN", {
+            hour: "2-digit", minute: "2-digit", hour12: true,
+          }),
+          isoTime: arrTime,
+        },
+        duration: durationMins,
+        durationLabel: `${Math.floor(durationMins / 60)}h ${durationMins % 60}m`,
+        stops,
+        stopDetail: stops === 0 ? "Non-stop" : `${stops} stop`,
+        price: `₹${price.toLocaleString("en-IN")}`,
+        fare: {
+          total: price,
+          base: r.Fare.BaseFare || 0,
+          taxes: r.Fare.Tax || 0,
+          currency: "INR",
+        },
+        cabin: "Economy",
+        bookUrl: null,
+        resultIndex: r.ResultIndex,
+        traceId,
+        isLcc: r.IsLCC || false,
+        nonRefundable: r.NonRefundable || false,
+        baggage: seg.Baggage || "15 Kg",
+        cabinBaggage: seg.CabinBaggage || "7 Kg",
+        seatsAvailable: seg.SeatsAvailable || 9,
+        source: "tbo",
+      };
+    });
+}
+
+// ── TBO-first search with SerpAPI fallback ──
+async function searchFlightsTBOFirst(params: {
+  origin: string;
+  destination: string;
+  departDate: string;
+  adults?: number;
+  children?: number;
+  infants?: number;
+  cabinClass?: number;
+  serpApiSearch?: () => Promise<any[]>;
+}): Promise<{ flights: any[]; traceId: string; source: "tbo" | "serp" | "none" }> {
+  const { origin, destination, departDate, adults = 1, children = 0, infants = 0, cabinClass = 2, serpApiSearch } = params;
+
+  // ── TBO first ──
+  try {
+    const tboResult: any = await tboSearchFlights({
+      origin,
+      destination,
+      departDate,
+      adults,
+      children,
+      infants,
+      cabinClass,
+    });
+
+    const traceId = tboResult?.Response?.TraceId || "";
+    const results = tboResult?.Response?.Results?.[0] || [];
+
+    if (Array.isArray(results) && results.length > 0) {
+      console.log(`[ConciergeFlights] TBO returned ${results.length} results`);
+      return { flights: mapTBOToFlightResults(results, traceId), traceId, source: "tbo" };
+    }
+    console.log("[ConciergeFlights] TBO returned 0 results, falling back to SerpAPI");
+  } catch (err: any) {
+    console.warn("[ConciergeFlights] TBO failed:", err.message, "— falling back to SerpAPI");
+  }
+
+  // ── SerpAPI fallback ──
+  if (serpApiSearch) {
+    try {
+      const serpFlights = await serpApiSearch();
+      return { flights: serpFlights || [], traceId: "", source: "serp" };
+    } catch (err: any) {
+      console.warn("[ConciergeFlights] SerpAPI also failed:", err.message);
+    }
+  }
+
+  return { flights: [], traceId: "", source: "none" };
+}
 
 const router = Router();
 
@@ -312,16 +423,35 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
 
     console.log(`[FlightSearch/POST] ${originIATA} → ${destIATA} on ${date} | ${adults}A ${children}C ${infants}I | ${cabin} | ${tripType}`);
 
-    if (!process.env.SERPAPI_API_KEY) {
-      return res.status(503).json({
-        ok: false,
-        error: "Flight search API not configured. Set SERPAPI_API_KEY in environment.",
-      });
-    }
+    const cabinClassMap: Record<string, number> = {
+      Economy: 2, "Premium Economy": 3, Business: 4, First: 6,
+    };
+    const cabinClass = cabinClassMap[cabin as string] ?? 2;
 
-    const result = await searchFlightRoutes(originIATA, destIATA, date);
+    const { flights, traceId, source } = await searchFlightsTBOFirst({
+      origin: originIATA,
+      destination: destIATA,
+      departDate: date,
+      adults: Number(adults),
+      children: Number(children),
+      infants: Number(infants),
+      cabinClass,
+      serpApiSearch: process.env.SERPAPI_API_KEY
+        ? async () => {
+            const r = await searchFlightRoutes(originIATA, destIATA, date);
+            return r.flights || [];
+          }
+        : undefined,
+    });
 
-    console.log(`[FlightSearch/POST] Found ${result.flights.length} flights`);
+    console.log(`[FlightSearch/POST] Found ${flights.length} flights via ${source}`);
+
+    const cheapest = flights.length
+      ? flights.reduce((a: any, b: any) => (a.fare?.total || 0) < (b.fare?.total || 0) ? a : b)
+      : null;
+    const fastest = flights.length
+      ? flights.reduce((a: any, b: any) => (a.duration || 9999) < (b.duration || 9999) ? a : b)
+      : null;
 
     return res.json({
       ok:          true,
@@ -331,11 +461,11 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
       tripType,
       pax:         { adults, children, infants },
       cabin,
-      flights:     result.flights,
-      cheapest:    result.cheapest,
-      fastest:     result.fastest,
-      currency:    result.currency,
-      source:      result.source,
+      flights,
+      cheapest,
+      fastest,
+      traceId,
+      source,
     });
 
   } catch (err: any) {
@@ -487,23 +617,40 @@ router.post("/", optionalAuth, async (req, res) => {
 
       const isoDate = parseDateToISO(travelDate);
 
-      // Call SerpAPI Google Flights for live results
-      let serpResult: any = null;
-      let serpError: string | null = null;
+      // TBO-first with SerpAPI fallback
+      let chatFlights: any[] = [];
+      let chatTraceId = "";
+      let chatSource: "tbo" | "serp" | "none" = "none";
 
-      if (isoDate && process.env.SERPAPI_API_KEY) {
-        try {
-          serpResult = await searchFlightRoutes(originIATA, destIATA, isoDate);
-          console.log(`[FlightSearch] Live results: ${serpResult.flights.length} flights`);
-        } catch (e: any) {
-          console.error("[FlightSearch] SerpAPI error:", e.message);
-          serpError = e.message;
-        }
-      } else if (!isoDate) {
+      if (isoDate) {
+        const chatResult = await searchFlightsTBOFirst({
+          origin: originIATA,
+          destination: destIATA,
+          departDate: isoDate,
+          adults: 1,
+          serpApiSearch: process.env.SERPAPI_API_KEY
+            ? async () => {
+                const r = await searchFlightRoutes(originIATA, destIATA, isoDate);
+                return r.flights || [];
+              }
+            : undefined,
+        });
+        chatFlights = chatResult.flights;
+        chatTraceId = chatResult.traceId;
+        chatSource  = chatResult.source;
+        console.log(`[FlightSearch] Live results: ${chatFlights.length} flights via ${chatSource}`);
+      } else {
         console.warn("[FlightSearch] No parseable date — skipping live search");
       }
 
-      const hasLiveFlights = serpResult && serpResult.flights.length > 0;
+      const chatCheapest = chatFlights.length
+        ? chatFlights.reduce((a: any, b: any) => (a.fare?.total || 0) < (b.fare?.total || 0) ? a : b)
+        : null;
+      const chatFastest = chatFlights.length
+        ? chatFlights.reduce((a: any, b: any) => (a.duration || 9999) < (b.duration || 9999) ? a : b)
+        : null;
+
+      const hasLiveFlights = chatFlights.length > 0;
 
       // Fallback booking links (always included)
       const googleFlightsUrl = `https://www.google.com/travel/flights/search?q=flights+from+${encodeURIComponent(origin)}+to+${encodeURIComponent(destination)}${travelDate ? "+on+" + encodeURIComponent(travelDate) : ""}`;
@@ -515,16 +662,18 @@ router.post("/", optionalAuth, async (req, res) => {
         reply: {
           title: `Flights: ${origin} → ${destination}${travelDate ? "  ·  " + travelDate : ""}`,
           context: hasLiveFlights
-            ? `Found ${serpResult.flights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live from Google Flights, shown in INR.`
-            : `Showing booking options for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. ${serpError ? "Live pricing temporarily unavailable — " : ""}Use the links below for real-time fares.`,
+            ? `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.`
+            : `Showing booking options for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Live pricing temporarily unavailable — use the links below for real-time fares.`,
           flightSearch: {
             origin:      { city: origin,      iata: originIATA },
             destination: { city: destination, iata: destIATA   },
             date:        travelDate,
             isoDate,
-            flights:     serpResult?.flights  || [],
-            cheapest:    serpResult?.cheapest || null,
-            fastest:     serpResult?.fastest  || null,
+            flights:     chatFlights,
+            cheapest:    chatCheapest,
+            fastest:     chatFastest,
+            traceId:     chatTraceId,
+            source:      chatSource,
             links: {
               googleFlights: googleFlightsUrl,
               makemytrip:    makemytripUrl,

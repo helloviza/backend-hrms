@@ -6,6 +6,7 @@ import crypto from "crypto";
 
 import { requireAuth } from "../middleware/auth.js";
 import MasterData from "../models/MasterData.js";
+import Customer from "../models/Customer.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import User from "../models/User.js";
@@ -13,6 +14,7 @@ import Onboarding from "../models/Onboarding.js";
 
 import { sendMail } from "../utils/mailer.js";
 import { signEmailActionToken } from "../utils/emailActionToken.js";
+import { isGenericDomain } from "../utils/blockedDomains.js";
 
 const router = Router();
 
@@ -203,6 +205,9 @@ function ensureUserCreationWhitelisted(actor: any, member: any, ws: any) {
   if (!role) return { ok: false as const, status: 403, error: "Not a member of this customer workspace" };
   if (role === "REQUESTER") return { ok: false as const, status: 403, error: "Requesters cannot manage users" };
 
+  // WORKSPACE_LEADER owns the workspace — bypass allowlist + userCreationEnabled checks
+  if (role === "WORKSPACE_LEADER") return { ok: true as const };
+
   if (!isUserCreationEnabled(ws)) {
     return {
       ok: false as const,
@@ -234,7 +239,6 @@ function ensureUserCreationWhitelisted(actor: any, member: any, ws: any) {
     };
   }
 
-  if (role === "WORKSPACE_LEADER") return { ok: true as const };
   if (role === "APPROVER") {
     if ((ws as any)?.canApproverCreateUsers) return { ok: true as const };
     return { ok: false as const, status: 403, error: "Approvers cannot manage users in this workspace" };
@@ -250,6 +254,57 @@ function emailAllowedByWorkspace(ws: any, invitedEmail: string) {
   if (emails.includes(e)) return true;
   if (d && domains.includes(d)) return true;
   return false;
+}
+
+async function validateEmailAccess(
+  email: string,
+  workspace: any
+): Promise<{ allowed: boolean; reason?: string }> {
+  const emailDom = email.split("@")[1]?.toLowerCase();
+  const mode = workspace.accessMode || "INVITE_ONLY";
+
+  switch (mode) {
+    case "INVITE_ONLY":
+      return { allowed: true };
+
+    case "COMPANY_DOMAIN":
+      if (!emailDom) return { allowed: false, reason: "Invalid email format" };
+      if (isGenericDomain(emailDom)) {
+        return {
+          allowed: false,
+          reason: "Generic email domains (Gmail, Hotmail etc.) are not allowed for company domain access. Use Email Allowlist mode instead.",
+        };
+      }
+      {
+        const domainAllowed = (workspace.allowedDomains || [])
+          .map((d: string) => d.toLowerCase().trim())
+          .includes(emailDom);
+        if (!domainAllowed) {
+          return {
+            allowed: false,
+            reason: `Email domain @${emailDom} is not in the company's allowed domains.`,
+          };
+        }
+      }
+      return { allowed: true };
+
+    case "EMAIL_ALLOWLIST":
+      {
+        const emailAllowed = (workspace.allowedEmails || [])
+          .map((e: string) => e.toLowerCase().trim())
+          .includes(email.toLowerCase().trim());
+        if (!emailAllowed) {
+          return {
+            allowed: false,
+            reason: "This email is not in the workspace allowlist. Ask your Workspace Leader to add it.",
+          };
+        }
+      }
+      return { allowed: true };
+
+    default:
+      return { allowed: true };
+  }
 }
 
 /**
@@ -290,10 +345,19 @@ function pickBusinessView(found: any | null) {
     d?.name ||
     d?.companyName ||
     d?.businessName ||
+    d?.inviteeName ||
+    d?.fullName ||
+    d?.contactName ||
     d?.title ||
     d?.payload?.name ||
     d?.payload?.companyName ||
     d?.payload?.businessName ||
+    d?.payload?.inviteeName ||
+    d?.payload?.fullName ||
+    d?.payload?.title ||
+    d?.email ||
+    d?.officialEmail ||
+    d?.payload?.email ||
     "";
 
   const email = d?.email || d?.officialEmail || d?.payload?.email || d?.payload?.officialEmail || "";
@@ -318,28 +382,37 @@ async function ensureWorkspace(customerId: string) {
   let ws: any = await CustomerWorkspace.findOne({ customerId: cid }).exec();
 
   if (!ws) {
-    ws = await CustomerWorkspace.create({
-      customerId: cid,
+    ws = await CustomerWorkspace.findOneAndUpdate(
+      { customerId: cid },
+      {
+        $setOnInsert: {
+          customerId: cid,
 
-      // legacy allowlist (kept for back-compat)
-      allowedDomains: [],
-      allowedEmails: [],
+          // legacy allowlist (kept for back-compat)
+          allowedDomains: [],
+          allowedEmails: [],
 
-      // approvals
-      defaultApproverEmails: [],
-      canApproverCreateUsers: true,
+          // approvals
+          defaultApproverEmails: [],
+          canApproverCreateUsers: true,
 
-      // gate switch
-      userCreationEnabled: false,
+          // gate switch
+          userCreationEnabled: false,
 
-      // new allowlist (preferred)
-      userCreationAllowlistEmails: [],
-      userCreationAllowlistDomains: [],
-      userCreationAllowlistUpdatedBy: "",
-      userCreationAllowlistUpdatedAt: null,
+          // access mode
+          accessMode: "INVITE_ONLY",
 
-      status: "ACTIVE",
-    });
+          // new allowlist (preferred)
+          userCreationAllowlistEmails: [],
+          userCreationAllowlistDomains: [],
+          userCreationAllowlistUpdatedBy: "",
+          userCreationAllowlistUpdatedAt: null,
+
+          status: "ACTIVE",
+        },
+      },
+      { upsert: true, new: true }
+    );
     return ws;
   }
 
@@ -1269,7 +1342,29 @@ router.get("/", requireAuth, async (req: any, res) => {
     const wh = ensureUserCreationWhitelisted(actor, member, ws);
     if (!wh.ok) return res.status((wh as any).status || 403).json({ error: (wh as any).error });
 
-    const rows = await CustomerMember.find({ customerId }).sort({ role: 1, email: 1 }).lean().exec();
+    const rawRows = await CustomerMember.find({ customerId }).sort({ role: 1, email: 1 }).lean().exec();
+
+    // Enrich rows with User._id, sbtEnabled, and sbtRole for admin SBT toggle
+    const memberEmails = rawRows.map((r: any) => normEmail(r.email));
+    const userLookup: Record<string, { userId: string; sbtEnabled: boolean; sbtRole: string | null }> = {};
+    if (memberEmails.length) {
+      const users = await User.find(
+        { email: { $in: memberEmails } },
+        { _id: 1, email: 1, sbtEnabled: 1, sbtRole: 1 }
+      ).lean().exec();
+      for (const u of users as any[]) {
+        userLookup[normEmail(u.email)] = {
+          userId: String(u._id),
+          sbtEnabled: u.sbtEnabled === true,
+          sbtRole: u.sbtRole || null,
+        };
+      }
+    }
+    const rows = rawRows.map((r: any) => {
+      const lu = userLookup[normEmail(r.email)];
+      return { ...r, userId: lu?.userId || null, sbtEnabled: lu?.sbtEnabled ?? false, sbtRole: lu?.sbtRole || null };
+    });
+
     const eff = getEffectiveAllowlist(ws);
 
     res.json({
@@ -1286,6 +1381,8 @@ router.get("/", requireAuth, async (req: any, res) => {
         defaultApproverEmails: normalizeEmailList((ws as any).defaultApproverEmails),
         canApproverCreateUsers: !!(ws as any).canApproverCreateUsers,
         userCreationEnabled: (ws as any).userCreationEnabled === true,
+        accessMode: (ws as any).accessMode || "INVITE_ONLY",
+        travelMode: (ws as any).travelMode || "APPROVAL_FLOW",
 
         userCreationAllowlistDomains: eff.domains,
         userCreationAllowlistEmails: eff.emails,
@@ -1350,6 +1447,7 @@ router.get("/workspace/config", requireAuth, async (req: any, res) => {
         defaultApproverEmails: normalizeEmailList(defaults),
         canApproverCreateUsers: !!(ws as any).canApproverCreateUsers,
         userCreationEnabled: (ws as any).userCreationEnabled === true,
+        accessMode: (ws as any).accessMode || "INVITE_ONLY",
 
         userCreationAllowlistEmails: eff.emails,
         userCreationAllowlistDomains: eff.domains,
@@ -1446,6 +1544,7 @@ router.post("/workspace/config", requireAuth, async (req: any, res) => {
         defaultApproverEmails: normalizeEmailList(defaults),
         canApproverCreateUsers: !!(ws as any).canApproverCreateUsers,
         userCreationEnabled: (ws as any).userCreationEnabled === true,
+        accessMode: (ws as any).accessMode || "INVITE_ONLY",
 
         userCreationAllowlistEmails: eff.emails,
         userCreationAllowlistDomains: eff.domains,
@@ -1458,6 +1557,86 @@ router.post("/workspace/config", requireAuth, async (req: any, res) => {
   } catch (err: any) {
     console.error("[customerUsers:setWorkspaceConfig] error", err);
     res.status(500).json({ error: "Failed to update workspace config", detail: err?.message });
+  }
+});
+
+/**
+ * PATCH /api/customer/users/workspace/access-mode
+ * Update workspace access mode (Admin, WL, or Staff)
+ */
+router.patch("/workspace/access-mode", requireAuth, async (req: any, res) => {
+  try {
+    const actor = req.user || {};
+    const actorEmail = normEmail(actor.email || "");
+    const customerId = await resolveCustomerId(req);
+
+    if (!customerId) {
+      return res.status(400).json({ error: "Customer workspace not found" });
+    }
+
+    const ws: any = await ensureWorkspace(customerId);
+
+    if (!isStaffPrivileged(actor)) {
+      const member = await getActorMember(customerId, actorEmail);
+      const role = String(member?.role || "").toUpperCase();
+      if (role !== "WORKSPACE_LEADER") {
+        return res.status(403).json({ error: "Only Admin, Staff, or Workspace Leader can change access mode" });
+      }
+    }
+
+    const { accessMode, allowedDomains, allowedEmails } = req.body;
+
+    if (!accessMode || !["INVITE_ONLY", "COMPANY_DOMAIN", "EMAIL_ALLOWLIST"].includes(accessMode)) {
+      return res.status(400).json({ error: "accessMode must be INVITE_ONLY | COMPANY_DOMAIN | EMAIL_ALLOWLIST" });
+    }
+
+    if (accessMode === "COMPANY_DOMAIN") {
+      const domains = normalizeDomainList(allowedDomains);
+      if (!domains.length) {
+        return res.status(400).json({
+          error: "At least one domain is required for Company Domain mode",
+          code: "DOMAINS_REQUIRED",
+        });
+      }
+      for (const domain of domains) {
+        if (isGenericDomain(domain)) {
+          return res.status(400).json({
+            error: `"${domain}" is a generic email domain and cannot be used as a company domain. Switch to Email Allowlist mode for individual email access.`,
+            code: "GENERIC_DOMAIN_BLOCKED",
+          });
+        }
+      }
+      ws.allowedDomains = domains;
+      ws.userCreationAllowlistDomains = domains;
+    }
+
+    if (accessMode === "EMAIL_ALLOWLIST") {
+      const emails = normalizeEmailList(allowedEmails);
+      if (!emails.length) {
+        return res.status(400).json({
+          error: "At least one email is required for Email Allowlist mode",
+          code: "EMAILS_REQUIRED",
+        });
+      }
+      ws.allowedEmails = emails;
+      ws.userCreationAllowlistEmails = emails;
+    }
+
+    ws.accessMode = accessMode;
+    ws.userCreationAllowlistUpdatedBy = actorEmail;
+    ws.userCreationAllowlistUpdatedAt = new Date();
+    await ws.save();
+
+    res.json({
+      ok: true,
+      customerId,
+      accessMode: ws.accessMode,
+      allowedDomains: ws.allowedDomains || [],
+      allowedEmails: ws.allowedEmails || [],
+    });
+  } catch (err: any) {
+    console.error("[customerUsers:setAccessMode] error", err);
+    res.status(500).json({ error: "Failed to update access mode", detail: err?.message });
   }
 });
 
@@ -1511,9 +1690,16 @@ router.post("/bulk", requireAuth, upload.single("file"), async (req: any, res) =
         results.push({ ok: false, error: "Invalid role", email, role });
         continue;
       }
-      if (!isStaffPrivileged(actor) && !emailAllowedByWorkspace(ws, email)) {
-        results.push({ ok: false, error: "Email/domain not allowed", email, domain: emailDomain(email) });
+      if (!isStaffPrivileged(actor) && role === "WORKSPACE_LEADER") {
+        results.push({ ok: false, error: "Only Admin/HR can create Workspace Leader accounts", email, role });
         continue;
+      }
+      if (!isStaffPrivileged(actor)) {
+        const accessCheck = await validateEmailAccess(email, ws);
+        if (!accessCheck.allowed) {
+          results.push({ ok: false, error: accessCheck.reason || "Email/domain not allowed", email, domain: emailDomain(email) });
+          continue;
+        }
       }
 
       let managerUser: any = null;
@@ -1655,19 +1841,62 @@ router.post("/", requireAuth, async (req: any, res) => {
     const email = normEmail(req.body?.email);
     const name = normStr(req.body?.name);
     const role = normRole(req.body?.role) as MemberRole;
+    const sbtRole = req.body?.sbtRole ? normStr(req.body.sbtRole).toUpperCase() : null;
+    const sbtAssignedBookerId = normStr(req.body?.sbtAssignedBookerId) || null;
 
     if (!email) return res.status(400).json({ error: "email is required" });
     if (!role || !["WORKSPACE_LEADER", "APPROVER", "REQUESTER"].includes(role)) {
       return res.status(400).json({ error: "role must be WORKSPACE_LEADER | APPROVER | REQUESTER" });
     }
 
-    if (!isStaffPrivileged(actor) && !emailAllowedByWorkspace(ws, email)) {
-      return res.status(400).json({
-        error: "Email/domain not allowed for this workspace",
-        hint: "HR/Admin must whitelist allowlist domains/emails for this customer.",
-        email,
-        domain: emailDomain(email),
+    // WORKSPACE_LEADER cannot change their own role
+    const actorMemberRole = String(member?.role || "").toUpperCase();
+    if (actorMemberRole === "WORKSPACE_LEADER" && !isStaffPrivileged(actor) && email === actorEmail) {
+      return res.status(403).json({
+        error: "You cannot modify your own role. Contact Plumtrips Admin.",
+        code: "SELF_MODIFICATION_DENIED",
       });
+    }
+
+    // WORKSPACE_LEADER cannot create users with elevated roles
+    if (!isStaffPrivileged(actor) && role === "WORKSPACE_LEADER") {
+      return res.status(403).json({
+        error: "Only Admin/HR can create Workspace Leader accounts.",
+        code: "ELEVATED_ROLE_DENIED",
+      });
+    }
+
+    if (!isStaffPrivileged(actor)) {
+      const accessCheck = await validateEmailAccess(email, ws);
+      if (!accessCheck.allowed) {
+        return res.status(400).json({
+          error: accessCheck.reason || "Email/domain not allowed for this workspace",
+          code: "EMAIL_ACCESS_DENIED",
+          email,
+          domain: emailDomain(email),
+        });
+      }
+    }
+
+    // SBT role validation
+    if (sbtRole && !["L1", "L2", "BOTH"].includes(sbtRole)) {
+      return res.status(400).json({ error: "sbtRole must be L1, L2, or BOTH" });
+    }
+
+    if (sbtRole && (sbtRole === "L1" || sbtRole === "BOTH") && sbtAssignedBookerId) {
+      const booker = await User.findOne({
+        _id: sbtAssignedBookerId,
+        customerId,
+      }).lean().exec();
+      if (!booker) {
+        return res.status(400).json({ error: "Assigned booker not found in this workspace" });
+      }
+      const bookerSbtRole = String((booker as any).sbtRole || "").toUpperCase();
+      const bookerRoles = Array.isArray((booker as any).roles) ? (booker as any).roles.map((r: any) => String(r).toUpperCase()) : [];
+      const isValidBooker = ["L2", "BOTH"].includes(bookerSbtRole) || bookerRoles.includes("WORKSPACE_LEADER");
+      if (!isValidBooker) {
+        return res.status(400).json({ error: "Assigned booker must have SBT role L2, BOTH, or be a Workspace Leader" });
+      }
     }
 
     const requestedApproverEmail = normEmail(req.body?.approverEmail || "");
@@ -1744,6 +1973,14 @@ router.post("/", requireAuth, async (req: any, res) => {
       managerUser,
     });
 
+    // Apply SBT fields if provided
+    if (sbtRole && user) {
+      user.sbtRole = sbtRole;
+      user.sbtEnabled = true;
+      if (sbtAssignedBookerId) user.sbtAssignedBookerId = sbtAssignedBookerId;
+      await user.save();
+    }
+
     const setAsDefaultApprover = normBool(req.body?.setAsDefaultApprover);
     if (role === "APPROVER" && setAsDefaultApprover) {
       const list = normalizeEmailList((ws as any).defaultApproverEmails);
@@ -1814,6 +2051,18 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
     if (!id) return res.status(400).json({ error: "id is required" });
     if (active === undefined) return res.status(400).json({ error: "active is required" });
 
+    // WORKSPACE_LEADER cannot deactivate/modify themselves
+    const actorRole = String(member?.role || "").toUpperCase();
+    if (actorRole === "WORKSPACE_LEADER" && !isStaffPrivileged(actor)) {
+      const target: any = await CustomerMember.findOne({ _id: id, customerId }).lean().exec();
+      if (target && normEmail(target.email) === actorEmail) {
+        return res.status(403).json({
+          error: "You cannot modify your own account. Contact Plumtrips Admin.",
+          code: "SELF_MODIFICATION_DENIED",
+        });
+      }
+    }
+
     const updated = await CustomerMember.findOneAndUpdate({ _id: id, customerId }, { $set: { isActive: active } }, { new: true })
       .lean()
       .exec();
@@ -1873,6 +2122,338 @@ router.post("/:id/reinvite", requireAuth, async (req: any, res) => {
   }
 });
 
+/**
+ * PATCH /api/customer/users/workspace/travel-mode
+ * Staff-only: set company-level travel mode and bulk-update User.sbtEnabled
+ */
+router.patch("/workspace/travel-mode", requireAuth, async (req: any, res) => {
+  try {
+    const actor = req.user || {};
+    if (!isStaffPrivileged(actor)) {
+      return res.status(403).json({ error: "Access restricted" });
+    }
+
+    const travelMode = normStr(req.body?.travelMode);
+    const validModes = ["SBT", "FLIGHTS_ONLY", "HOTELS_ONLY", "BOTH", "APPROVAL_FLOW"];
+    if (!validModes.includes(travelMode)) {
+      return res.status(400).json({ error: `travelMode must be one of: ${validModes.join(", ")}` });
+    }
+
+    const customerId = normStr(req.body?.customerId) || (await resolveCustomerId(req));
+    if (!customerId) {
+      return res.status(400).json({ error: "customerId is required" });
+    }
+
+    const ws: any = await ensureWorkspace(customerId);
+    ws.travelMode = travelMode;
+    await ws.save();
+
+    // Bulk-update users based on travel mode
+    const members = await CustomerMember.find({ customerId }).lean().exec();
+    const memberEmails = members
+      .filter((m: any) => !!m.email)
+      .map((m: any) => normEmail(m.email));
+
+    let updatedCount = 0;
+    if (memberEmails.length) {
+      if (travelMode === "APPROVAL_FLOW") {
+        // Disable SBT for all users when switching to approval flow
+        const result = await User.updateMany(
+          { email: { $in: memberEmails } },
+          { $set: { sbtEnabled: false } }
+        );
+        updatedCount = result.modifiedCount ?? 0;
+      } else {
+        // For SBT modes: enable SBT and set sbtBookingType based on mode
+        const sbtBookingTypeMap: Record<string, string> = {
+          FLIGHTS_ONLY: "flight",
+          HOTELS_ONLY: "hotel",
+          BOTH: "both",
+          SBT: "both",
+        };
+        const bookingType = sbtBookingTypeMap[travelMode] || "both";
+
+        // Enable SBT for all users
+        const result = await User.updateMany(
+          { email: { $in: memberEmails } },
+          { $set: { sbtEnabled: true, sbtBookingType: bookingType } }
+        );
+        updatedCount = result.modifiedCount ?? 0;
+      }
+    }
+
+    res.json({ ok: true, travelMode, updatedCount });
+  } catch (err: any) {
+    console.error("[customerUsers:travel-mode] error", err);
+    res.status(500).json({ error: "Failed to update travel mode", detail: err?.message });
+  }
+});
+
+/* =========================================================
+ * GET /workspace/available-bookers — L2/BOTH/WL users for "Reporting To" dropdown
+ * ======================================================= */
+router.get("/workspace/available-bookers", requireAuth, async (req: any, res: any) => {
+  try {
+    const actor = req.user || {};
+    const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role])
+      .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
+    const isAdmin = actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
+
+    if (!isAdmin && !isLeader) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    let customerId = "";
+    if (isLeader && !isAdmin) {
+      customerId = String(actor.customerId || actor.businessId || "");
+      if (!customerId) return res.status(403).json({ error: "No workspace linked to your account" });
+    } else {
+      customerId = String(req.query.customerId || "").trim();
+      if (!customerId) return res.status(400).json({ error: "customerId query param is required for admin" });
+    }
+
+    const users = await User.find({
+      customerId,
+      $or: [
+        { sbtRole: { $in: ["L2", "BOTH"] } },
+        { roles: "WORKSPACE_LEADER" },
+      ],
+      status: { $ne: "INACTIVE" },
+    })
+      .select("name email sbtRole roles")
+      .lean();
+
+    const bookers = users.map((u: any) => {
+      const uRoles = (Array.isArray(u.roles) ? u.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
+      return {
+        _id: String(u._id),
+        name: u.name || "",
+        email: u.email || "",
+        sbtRole: u.sbtRole || null,
+        isWorkspaceLeader: uRoles.includes("WORKSPACELEADER"),
+      };
+    });
+
+    res.json({ ok: true, bookers });
+  } catch (err: any) {
+    console.error("[customerUsers:workspace/available-bookers] error", err);
+    res.status(500).json({ error: "Failed to load available bookers", detail: err?.message });
+  }
+});
+
+/* =========================================================
+ * GET /workspace/permissions — list users with permission fields
+ * ======================================================= */
+router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => {
+  try {
+    const actor = req.user || {};
+    const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role])
+      .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
+    const isAdmin = actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
+
+    if (!isAdmin && !isLeader) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    let customerId = "";
+
+    if (isLeader && !isAdmin) {
+      customerId = String(actor.customerId || actor.businessId || "");
+      if (!customerId) return res.status(403).json({ error: "No workspace linked to your account" });
+    } else {
+      customerId = String(req.query.customerId || "").trim();
+      if (!customerId) return res.status(400).json({ error: "customerId query param is required for admin" });
+    }
+
+    const ws: any = await CustomerWorkspace.findOne({ customerId }).select("travelMode allowedDomains").lean();
+
+    const users = await User.find({ customerId })
+      .select("name email roles role status sbtEnabled sbtRole sbtAssignedBookerId canRaiseRequest canViewBilling canManageUsers")
+      .lean();
+
+    const rows = users.map((u: any) => {
+      const allRoles = (Array.isArray(u.roles) ? u.roles : [u.role]).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
+      const isWL = allRoles.includes("WORKSPACELEADER");
+      return {
+        _id: u._id,
+        name: u.name || "",
+        email: u.email || "",
+        role: (Array.isArray(u.roles) && u.roles[0]) || u.role || "EMPLOYEE",
+        isActive: (u.status || "ACTIVE").toUpperCase() === "ACTIVE",
+        sbtEnabled: u.sbtEnabled ?? false,
+        sbtRole: u.sbtRole || null,
+        sbtAssignedBookerId: u.sbtAssignedBookerId || null,
+        canRaiseRequest: u.canRaiseRequest ?? true,
+        canViewBilling: u.canViewBilling ?? false,
+        canManageUsers: u.canManageUsers ?? false,
+        isWorkspaceLeader: isWL,
+      };
+    });
+
+    res.json({
+      workspace: {
+        customerId,
+        travelMode: ws?.travelMode || "APPROVAL_FLOW",
+        allowedDomains: ws?.allowedDomains || [],
+        totalUsers: rows.length,
+      },
+      rows,
+    });
+  } catch (err: any) {
+    console.error("[customerUsers:workspace/permissions GET] error", err);
+    res.status(500).json({ error: "Failed to load permissions", detail: err?.message });
+  }
+});
+
+/* =========================================================
+ * PATCH /workspace/permissions/:userId — toggle a single permission
+ * ======================================================= */
+router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res: any) => {
+  try {
+    const actor = req.user || {};
+    const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role])
+      .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
+    const isAdmin = actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
+
+    if (!isAdmin && !isLeader) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const { permission, value } = req.body || {};
+    const validPerms = ["sbtEnabled", "canRaiseRequest", "canViewBilling", "canManageUsers", "sbtRole", "sbtAssignedBookerId"];
+    if (!validPerms.includes(permission)) {
+      return res.status(400).json({ error: "Invalid permission" });
+    }
+
+    // Validate value types
+    if (["sbtEnabled", "canRaiseRequest", "canViewBilling", "canManageUsers"].includes(permission)) {
+      if (typeof value !== "boolean") {
+        return res.status(400).json({ error: "Invalid value — must be boolean" });
+      }
+    }
+    if (permission === "sbtRole") {
+      if (value !== null && value !== "L1" && value !== "L2" && value !== "BOTH") {
+        return res.status(400).json({ error: "Invalid sbtRole — must be L1, L2, BOTH, or null" });
+      }
+    }
+    if (permission === "sbtAssignedBookerId") {
+      if (value !== null && typeof value !== "string") {
+        return res.status(400).json({ error: "Invalid sbtAssignedBookerId" });
+      }
+    }
+
+    const targetUser: any = await User.findById(req.params.userId)
+      .select("customerId email roles")
+      .lean();
+    if (!targetUser) return res.status(404).json({ error: "User not found" });
+
+    // WORKSPACE_LEADER scoped checks
+    if (isLeader && !isAdmin) {
+      const actorCustomerId = String(actor.customerId || actor.businessId || "");
+      const targetCustomerId = String(targetUser.customerId || "");
+      if (!actorCustomerId || actorCustomerId !== targetCustomerId) {
+        return res.status(403).json({ error: "You can only manage users in your own company" });
+      }
+
+      // Prevent self-modification of ANY permission
+      const actorId = String(actor.sub || actor.id || actor._id || "");
+      if (actorId === String(req.params.userId)) {
+        return res.status(403).json({
+          error: "You cannot modify your own permissions. Contact Plumtrips Admin.",
+          code: "SELF_MODIFICATION_DENIED",
+        });
+      }
+
+      // WORKSPACE_LEADER cannot grant admin/HR roles (not applicable here but guard anyway)
+      const targetRoles = (Array.isArray(targetUser.roles) ? targetUser.roles : [])
+        .map((r: string) => String(r).toUpperCase().replace(/[\s\-_]/g, ""));
+      if (targetRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r))) {
+        return res.status(403).json({ error: "Cannot modify permissions for admin/HR users" });
+      }
+    }
+
+    // If enabling SBT, check travelMode conflict
+    if (permission === "sbtEnabled" && value === true) {
+      const cid = String(targetUser.customerId || "");
+      if (cid) {
+        const ws: any = await CustomerWorkspace.findOne({ customerId: cid }).select("travelMode").lean();
+        if (ws?.travelMode === "APPROVAL_FLOW") {
+          return res.status(409).json({
+            error: "Cannot enable SBT. Company uses approval flow.",
+            code: "APPROVAL_FLOW_CONFLICT",
+          });
+        }
+      }
+    }
+
+    // Build update
+    const $set: any = {};
+
+    if (permission === "sbtAssignedBookerId") {
+      if (value) {
+        // Validate: target booker must have sbtRole L2/BOTH or be WORKSPACE_LEADER, same customerId, not self
+        const booker: any = await User.findById(value).select("sbtRole customerId roles").lean();
+        if (!booker) return res.status(400).json({ error: "Assigned booker user not found" });
+        const bookerRoles = (Array.isArray(booker.roles) ? booker.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
+        const bookerIsWL = bookerRoles.includes("WORKSPACELEADER");
+        if (booker.sbtRole !== "L2" && booker.sbtRole !== "BOTH" && !bookerIsWL) {
+          return res.status(400).json({ error: "Assigned booker must have SBT role L2 or BOTH, or be a Workspace Leader" });
+        }
+        if (String(booker.customerId) !== String(targetUser.customerId)) {
+          return res.status(400).json({ error: "Assigned booker must belong to the same company" });
+        }
+        if (String(value) === String(req.params.userId)) {
+          return res.status(400).json({ error: "Cannot assign user as their own booker" });
+        }
+        $set.sbtAssignedBookerId = value;
+      } else {
+        $set.sbtAssignedBookerId = null;
+      }
+    } else if (permission === "sbtRole") {
+      $set.sbtRole = value;
+      // Clear assigned booker if role is set to L2 or null (no longer a requestor)
+      if (value === "L2" || value === null) {
+        $set.sbtAssignedBookerId = null;
+      }
+    } else {
+      $set[permission] = value;
+      // sbtEnabled ON → canRaiseRequest OFF (and vice versa)
+      if (permission === "sbtEnabled" && value === true) {
+        $set.canRaiseRequest = false;
+      }
+      if (permission === "sbtEnabled" && value === false) {
+        $set.canRaiseRequest = true;
+      }
+    }
+
+    const updated: any = await User.findByIdAndUpdate(req.params.userId, { $set }, { new: true })
+      .select("sbtEnabled sbtRole sbtAssignedBookerId canRaiseRequest canViewBilling canManageUsers")
+      .lean();
+
+    console.info("Permission changed", {
+      changedBy: String(actor.sub || actor.id || actor._id || actor.email || ""),
+      targetUserId: req.params.userId,
+      permission,
+      value,
+    });
+
+    res.json({
+      sbtEnabled: updated?.sbtEnabled ?? false,
+      sbtRole: updated?.sbtRole || null,
+      sbtAssignedBookerId: updated?.sbtAssignedBookerId || null,
+      canRaiseRequest: updated?.canRaiseRequest ?? true,
+      canViewBilling: updated?.canViewBilling ?? false,
+      canManageUsers: updated?.canManageUsers ?? false,
+    });
+  } catch (err: any) {
+    console.error("[customerUsers:workspace/permissions PATCH] error", err);
+    res.status(500).json({ error: "Failed to update permission", detail: err?.message });
+  }
+});
+
 export default router;
 
 /* =========================================================
@@ -1880,7 +2461,39 @@ export default router;
  * ======================================================= */
 async function staffSearchBusinesses(q: string) {
   const query = normStr(q || "");
-  if (!query || query.length < 2) return { rows: [] as any[], ids: [] as string[] };
+  if (query === undefined || query === null) return { rows: [] as any[], ids: [] as string[] };
+
+  // Short / empty query → return most recent businesses (preload)
+  if (query.length < 2) {
+    const [mdRecent, custRecent] = await Promise.all([
+      MasterData.find({ type: /business|customer/i })
+        .sort({ createdAt: -1 }).limit(20).lean().exec(),
+      Customer.find()
+        .sort({ createdAt: -1 }).limit(20).lean().exec(),
+    ]);
+
+    const merged = new Map<string, any>();
+    for (const c of (custRecent as any[]) || []) {
+      const id = String(c._id);
+      merged.set(id, {
+        id,
+        source: "Customer",
+        name: c.name || c.legalName || c.email || "",
+        email: c.email || "",
+        domain: c.email ? emailDomain(c.email) : "",
+        status: c.status || "",
+        type: c.type || "",
+        updatedAt: c.updatedAt || null,
+      });
+    }
+    for (const r of (mdRecent as any[]) || []) {
+      const view = pickBusinessView({ source: "MasterData", doc: r });
+      if (view?.id && !merged.has(view.id)) merged.set(view.id, view);
+    }
+
+    const rows = Array.from(merged.values()).slice(0, 20);
+    return { rows, ids: rows.map((r: any) => String(r.id)) };
+  }
 
   const qEsc = escapeRegex(query);
   const re = new RegExp(qEsc, "i");
@@ -1948,11 +2561,37 @@ async function staffSearchBusinesses(q: string) {
     .lean()
     .exec()) as any;
 
+  const custRows: any[] = (await Customer.find({
+    $or: [
+      { name: re },
+      { legalName: re },
+      { email: re },
+      { customerCode: re },
+    ],
+  })
+    .sort({ updatedAt: -1, createdAt: -1 })
+    .limit(25)
+    .lean()
+    .exec()) as any;
+
   const merged = new Map<string, any>();
 
+  for (const c of custRows || []) {
+    const id = String(c._id);
+    merged.set(id, {
+      id,
+      source: "Customer",
+      name: c.name || c.legalName || c.email || "",
+      email: c.email || "",
+      domain: c.email ? emailDomain(c.email) : "",
+      status: c.status || "",
+      type: c.type || "",
+      updatedAt: c.updatedAt || null,
+    });
+  }
   for (const md of mdRows || []) {
     const view = pickBusinessView({ source: "MasterData", doc: md });
-    if (view?.id) merged.set(view.id, view);
+    if (view?.id && !merged.has(view.id)) merged.set(view.id, view);
   }
   for (const ob of obRows || []) {
     const view = pickBusinessView({ source: "Onboarding", doc: ob });

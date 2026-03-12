@@ -8,6 +8,8 @@ import { z } from "zod";
 
 import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
+import { authLogger } from "../utils/logger.js";
+import SessionLog from "../models/SessionLog.js";
 import Customer from "../models/Customer.js";
 import Vendor from "../models/Vendor.js";
 
@@ -660,7 +662,7 @@ r.post("/register", async (req, res) => {
 
     res.json({ id: user._id });
   } catch (err) {
-    console.error("[auth/register] failed:", err);
+    authLogger.error("Register failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -703,11 +705,33 @@ r.post("/login", loginLimiter, async (req, res) => {
     });
 
     if (!user || !user.passwordHash) {
+      authLogger.warn("Failed login attempt", { email: normalizedEmail, ip: req.ip, reason: "user_not_found_or_no_password" });
+      SessionLog.create({
+        email: normalizedEmail,
+        event: "LOGIN_FAILED",
+        ipAddress: req.ip || req.headers["x-forwarded-for"] as string,
+        userAgent: req.headers["user-agent"],
+        success: false,
+        failureReason: "user_not_found_or_no_password",
+      }).catch(() => {});
       return res.status(400).json({ error: "Invalid credentials or password not set" });
     }
 
     const ok = await bcrypt.compare(password, user.passwordHash);
-    if (!ok) return res.status(400).json({ error: "Invalid credentials" });
+    if (!ok) {
+      authLogger.warn("Failed login attempt", { email: normalizedEmail, ip: req.ip, reason: "invalid_credentials" });
+      SessionLog.create({
+        userId: user._id,
+        email: normalizedEmail,
+        role: normalizeRoles(user.roles || [])[0],
+        event: "LOGIN_FAILED",
+        ipAddress: req.ip || req.headers["x-forwarded-for"] as string,
+        userAgent: req.headers["user-agent"],
+        success: false,
+        failureReason: "invalid_credentials",
+      }).catch(() => {});
+      return res.status(400).json({ error: "Invalid credentials" });
+    }
 
     // 1) Build safe
     let built = await buildAuthSafeUser(user);
@@ -748,9 +772,20 @@ r.post("/login", loginLimiter, async (req, res) => {
     setRefreshCookie(res, refreshToken);
     setAccessCookie(res, accessToken);
 
+    authLogger.info("User login", { userId: user._id, email: built.safe.email, role: built.roles[0], ip: req.ip });
+    SessionLog.create({
+      userId: user._id,
+      email: built.safe.email,
+      role: built.roles[0],
+      event: "LOGIN",
+      ipAddress: req.ip || req.headers["x-forwarded-for"] as string,
+      userAgent: req.headers["user-agent"],
+      success: true,
+    }).catch(() => {});
+
     res.json({ accessToken, user: built.safe });
   } catch (err) {
-    console.error("[auth/login] failed:", err);
+    authLogger.error("Login failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -803,9 +838,20 @@ r.post("/refresh", async (req, res) => {
     setRefreshCookie(res, newRefreshToken);
     setAccessCookie(res, newAccessToken);
 
+    authLogger.info("Token refresh", { userId: user._id, email: built.safe.email });
+    SessionLog.create({
+      userId: user._id,
+      email: built.safe.email,
+      role: built.roles[0],
+      event: "TOKEN_REFRESH",
+      ipAddress: req.ip || req.headers["x-forwarded-for"] as string,
+      userAgent: req.headers["user-agent"],
+      success: true,
+    }).catch(() => {});
+
     res.json({ accessToken: newAccessToken, user: built.safe });
   } catch (err) {
-    console.error("[auth/refresh] failed:", err);
+    authLogger.error("Refresh failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
     res.status(401).json({ error: "Invalid or expired refresh token" });
   }
 });
@@ -831,7 +877,7 @@ r.get("/me", async (req, res) => {
     const { safe } = await buildAuthSafeUser(user);
     res.json({ user: safe });
   } catch (err) {
-    console.error("[auth/me] error", err);
+    authLogger.error("Me endpoint error", { error: err instanceof Error ? err.message : String(err) });
     res.status(401).json({ error: "Invalid token" });
   }
 });
@@ -882,7 +928,7 @@ r.post("/change-password", async (req, res) => {
 
     res.json({ message: "Password updated successfully" });
   } catch (err: any) {
-    console.error("[auth/change-password] error", err);
+    authLogger.error("Change password error", { error: err?.message, stack: err?.stack });
     res.status(500).json({ error: "Failed to update password", detail: err?.message });
   }
 });
@@ -1026,7 +1072,7 @@ r.post("/admin/reset-password", async (req, res) => {
       workspaceInfo,
     });
   } catch (err: any) {
-    console.error("[auth/admin/reset-password] error", err);
+    authLogger.error("Admin reset password error", { error: err?.message, stack: err?.stack });
     res.status(500).json({ error: "Failed to reset password", detail: err?.message });
   }
 });
@@ -1087,7 +1133,7 @@ r.post("/forgot-password", async (req, res) => {
 
     res.json({ ok: true });
   } catch (err: any) {
-    console.error("[auth/forgot-password] error", err);
+    authLogger.error("Forgot password error", { error: err?.message, stack: err?.stack });
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -1129,7 +1175,7 @@ r.post("/reset-password", async (req, res) => {
 
     res.json({ ok: true });
   } catch (err: any) {
-    console.error("[auth/reset-password] error", err);
+    authLogger.error("Reset password error", { error: err?.message, stack: err?.stack });
     res.status(500).json({ error: "Server error" });
   }
 });

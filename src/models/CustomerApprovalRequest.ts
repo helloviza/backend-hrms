@@ -44,5 +44,5 @@ const CustomerApprovalRequestSchema = new Schema(
 
 CustomerApprovalRequestSchema.index({ workspaceId: 1, status: 1, updatedAt: -1 });
 
-export default mongoose.models.CustomerApprovalRequest ||
-  mongoose.model("CustomerApprovalRequest", CustomerApprovalRequestSchema);
+export default (mongoose.models.CustomerApprovalRequest ||
+  mongoose.model("CustomerApprovalRequest", CustomerApprovalRequestSchema)) as mongoose.Model<any>;

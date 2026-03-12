@@ -1,5 +1,32 @@
 // apps/backend/src/models/Vendor.ts
-import { Schema, model } from "mongoose";
+import { Schema, model, Document } from "mongoose";
+
+interface IVendor extends Document {
+  name?: string;
+  vendorCode?: string;
+  email?: string;
+  phone?: string;
+  type?: string;
+  kycDocs?: Array<{ key?: string; name?: string }>;
+  status?: string;
+  businessAssociations?: string[];
+  services?: {
+    flights?: { enabled?: boolean; notes?: string };
+    hotels?: { enabled?: boolean; notes?: string };
+    cabs?: { enabled?: boolean; notes?: string };
+    forex?: { enabled?: boolean; notes?: string };
+    esims?: { enabled?: boolean; notes?: string };
+    corporateGifting?: { enabled?: boolean; notes?: string };
+    decor?: { enabled?: boolean; notes?: string };
+    other?: { enabled?: boolean; notes?: string };
+    visa?: { enabled?: boolean; notes?: string; visaCountries?: string[]; tatInDays?: number };
+    miceEvents?: { enabled?: boolean; notes?: string; eventTypes?: string[]; maxGroupSize?: number };
+    holidays?: { enabled?: boolean; notes?: string; destinations?: string[]; minPax?: number; maxPax?: number };
+  };
+  ownerId?: Schema.Types.ObjectId;
+  onboardingId?: Schema.Types.ObjectId;
+  onboardingSnapshot?: any;
+}
 
 // Core Plumtrips verticals you mentioned
 const BUSINESS_ASSOCIATIONS = [
@@ -109,7 +136,7 @@ const HolidayServiceSchema = new Schema(
   { _id: false },
 );
 
-const VendorSchema = new Schema(
+const VendorSchema = new Schema<IVendor>(
   {
     name: { type: String, trim: true },
 
@@ -205,4 +232,4 @@ VendorSchema.methods.toJSON = function () {
   return obj;
 };
 
-export default model("Vendor", VendorSchema);
+export default model<IVendor>("Vendor", VendorSchema);

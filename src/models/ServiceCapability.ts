@@ -51,11 +51,10 @@ export type ServiceCapabilityDoc = InferSchemaType<
   _id: mongoose.Types.ObjectId;
 };
 
-const ServiceCapability =
-  mongoose.models.ServiceCapability ||
+const ServiceCapability = (mongoose.models.ServiceCapability ||
   mongoose.model<ServiceCapabilityDoc>(
     "ServiceCapability",
     ServiceCapabilitySchema,
-  );
+  )) as mongoose.Model<ServiceCapabilityDoc>;
 
 export default ServiceCapability;

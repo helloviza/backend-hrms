@@ -87,8 +87,7 @@ export type OnboardingDoc = InferSchemaType<typeof OnboardingSchema> & {
 };
 
 /* ---------- Model export ---------- */
-export const Onboarding =
-  mongoose.models.Onboarding ||
-  mongoose.model<OnboardingDoc>("Onboarding", OnboardingSchema);
+export const Onboarding = (mongoose.models.Onboarding ||
+  mongoose.model<OnboardingDoc>("Onboarding", OnboardingSchema)) as mongoose.Model<OnboardingDoc>;
 
 export default Onboarding;

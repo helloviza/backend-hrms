@@ -309,6 +309,23 @@ router.post("/requests", requireAuth, async (req: AnyObj, res, next) => {
     const email = normEmail(user?.email);
     const name = normStr(user?.name || user?.firstName || "");
 
+    // SBT users must book directly — block approval flow
+    if (sub) {
+      const sbtCheck = await User.findById(sub).select("sbtEnabled canRaiseRequest").lean();
+      if (sbtCheck?.sbtEnabled === true) {
+        return res.status(403).json({
+          error: "Direct booking is enabled for your account. Please use the Self Booking Tool.",
+          code: "SBT_USER_CANNOT_RAISE_REQUEST",
+        });
+      }
+      if (sbtCheck?.canRaiseRequest === false) {
+        return res.status(403).json({
+          error: "You don't have permission to raise travel requests.",
+          code: "RAISE_REQUEST_DISABLED",
+        });
+      }
+    }
+
     const { customerId, cartItems, comments, ticketId } = req.body || {};
     const cid = String(customerId || "").trim();
 
