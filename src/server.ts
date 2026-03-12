@@ -12,6 +12,7 @@ import { connectDb } from "./config/db.js";
 import { corsMiddleware } from "./config/cors.js";
 import { helmetMiddleware } from "./config/helmet.js";
 import { errorHandler } from "./middleware/error.js";
+import { apiLimiter, authLimiter, flightSearchLimiter, hotelSearchLimiter } from "./middleware/rateLimit.js";
 import { env } from "./config/env.js";
 import vouchers from "./routes/vouchers.js";
 
@@ -164,6 +165,12 @@ app.use(cookieParser());
 
 // Compression AFTER parsers
 app.use(compression());
+
+// Rate limiting — after CORS, before routes
+app.use("/api", apiLimiter);
+app.use("/api/auth", authLimiter);
+app.use("/api/sbt/flights/search", flightSearchLimiter);
+app.use("/api/sbt/hotels/search", hotelSearchLimiter);
 
 /**
  * No-store for fresh workflow data

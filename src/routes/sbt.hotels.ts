@@ -10,6 +10,61 @@ import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { sendMail } from "../utils/mailer.js";
 
+// ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
+const MOCK_CITIES = [
+  { CityCode: "100537", CityName: "Mumbai", CountryCode: "IN", CountryName: "India" },
+  { CityCode: "100077", CityName: "Delhi", CountryCode: "IN", CountryName: "India" },
+  { CityCode: "100217", CityName: "Bangalore", CountryCode: "IN", CountryName: "India" },
+  { CityCode: "100418", CityName: "Chennai", CountryCode: "IN", CountryName: "India" },
+  { CityCode: "100290", CityName: "Hyderabad", CountryCode: "IN", CountryName: "India" },
+  { CityCode: "100364", CityName: "Kolkata", CountryCode: "IN", CountryName: "India" },
+  { CityCode: "100447", CityName: "Pune", CountryCode: "IN", CountryName: "India" },
+  { CityCode: "100158", CityName: "Goa", CountryCode: "IN", CountryName: "India" },
+];
+
+const MOCK_HOTEL_RESULTS = [
+  {
+    HotelCode: "MOCK001",
+    HotelName: "Mock Grand Hotel",
+    StarRating: 5,
+    Address: "123 Mock Street",
+    Latitude: 19.076,
+    Longitude: 72.877,
+    HotelPicture: "",
+    Rooms: [
+      {
+        RoomIndex: 1,
+        RoomTypeName: "Deluxe Room",
+        RatePlanCode: "RP001",
+        Price: { RoomPrice: 4500, Tax: 810, TotalFare: 5310, Currency: "INR" },
+        MealType: "Breakfast Included",
+        IsRefundable: true,
+      },
+    ],
+    cheapestFare: 5310,
+  },
+  {
+    HotelCode: "MOCK002",
+    HotelName: "Mock Business Inn",
+    StarRating: 3,
+    Address: "456 Mock Avenue",
+    Latitude: 19.082,
+    Longitude: 72.881,
+    HotelPicture: "",
+    Rooms: [
+      {
+        RoomIndex: 1,
+        RoomTypeName: "Standard Room",
+        RatePlanCode: "RP002",
+        Price: { RoomPrice: 2200, Tax: 396, TotalFare: 2596, Currency: "INR" },
+        MealType: "Room Only",
+        IsRefundable: false,
+      },
+    ],
+    cheapestFare: 2596,
+  },
+];
+
 const router = express.Router();
 router.use(requireAuth);
 
@@ -207,6 +262,15 @@ function chunk<T>(arr: T[], size: number): T[][] {
 
 router.get("/cities", async (req: any, res: any) => {
   try {
+    if (process.env.TBO_ENV === "mock") {
+      const q = (req.query.q as string || "").toLowerCase();
+      const matches = MOCK_CITIES.filter(c =>
+        c.CityName.toLowerCase().includes(q) ||
+        c.CountryName.toLowerCase().includes(q)
+      ).slice(0, 15);
+      return res.json({ success: true, cities: matches, source: "mock" });
+    }
+
     const q = ((req.query.q as string) || "").toLowerCase().trim();
     if (!q || q.length < 2) return res.json([]);
 
@@ -258,6 +322,16 @@ router.get("/cities", async (req: any, res: any) => {
 
 router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any) => {
   try {
+    if (process.env.TBO_ENV === "mock") {
+      const searchId = Math.random().toString(36).slice(2, 10);
+      return res.json({
+        success: true,
+        searchId,
+        hotels: MOCK_HOTEL_RESULTS,
+        source: "mock",
+      });
+    }
+
     const {
       CityCode,
       CityName,
@@ -374,6 +448,15 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
 
 router.post("/prebook", async (req: any, res: any) => {
   try {
+    if (process.env.TBO_ENV === "mock") {
+      return res.json({
+        success: true,
+        prebookId: "MOCK-PREBOOK-" + Date.now(),
+        status: "Prebooked",
+        source: "mock",
+      });
+    }
+
     const { BookingCode } = req.body;
     if (!BookingCode) return res.status(400).json({ error: "BookingCode required" });
 
@@ -933,6 +1016,14 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
 
 router.get("/details", async (req: any, res: any) => {
   try {
+    if (process.env.TBO_ENV === "mock") {
+      return res.json({
+        success: true,
+        hotel: MOCK_HOTEL_RESULTS[0],
+        source: "mock",
+      });
+    }
+
     const hotelCodes = (req.query.hotelCodes as string) || "";
     if (!hotelCodes) return res.status(400).json({ error: "hotelCodes required" });
 
