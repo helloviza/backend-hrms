@@ -1,0 +1,481 @@
+// apps/backend/src/routes/workspace.ts
+import express from "express";
+import path from "path";
+import fs from "fs";
+import multer from "multer";
+import mongoose, { Schema } from "mongoose";
+import jwt from "jsonwebtoken";
+import { env } from "../config/env.js";
+
+import User from "../models/User.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import CustomerMember from "../models/CustomerMember.js";
+
+const router = express.Router();
+
+/* -------------------------------------------------------------------------- */
+/* Uploads setup                                                              */
+/* -------------------------------------------------------------------------- */
+
+const uploadsRoot = path.join(process.cwd(), "uploads");
+const logosDir = path.join(uploadsRoot, "workspace-logos");
+
+function ensureDir(dir: string) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+ensureDir(logosDir);
+
+function safeExtFromMimetype(mime: string) {
+  const m = String(mime || "").toLowerCase();
+  if (m.includes("png")) return ".png";
+  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
+  if (m.includes("webp")) return ".webp";
+  return "";
+}
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, logosDir),
+  filename: (_req, file, cb) => {
+    const ext =
+      safeExtFromMimetype(file.mimetype) ||
+      path.extname(file.originalname) ||
+      ".png";
+    const stamp = Date.now();
+    const rand = Math.random().toString(36).slice(2, 10);
+    cb(null, `ws_logo_${stamp}_${rand}${ext}`);
+  },
+});
+
+// ✅ TS-safe: never pass Error to cb (avoids "Error | null not assignable to null")
+const upload = multer({
+  storage,
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+  fileFilter: (_req, file, cb) => {
+    const ok =
+      file.mimetype === "image/png" ||
+      file.mimetype === "image/jpeg" ||
+      file.mimetype === "image/webp";
+    cb(null, ok);
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/* Mongo model (branding only)                                                */
+/* -------------------------------------------------------------------------- */
+
+type WorkspaceBrandingDoc = {
+  scopeType: "BUSINESS" | "CUSTOMER" | "VENDOR" | "USER";
+  scopeId: string;
+  logoUrl?: string;
+  updatedAt?: Date;
+  createdAt?: Date;
+};
+
+const WorkspaceBrandingSchema = new Schema<WorkspaceBrandingDoc>(
+  {
+    scopeType: { type: String, required: true },
+    scopeId: { type: String, required: true },
+    logoUrl: { type: String, default: "" },
+  },
+  { timestamps: true }
+);
+
+WorkspaceBrandingSchema.index({ scopeType: 1, scopeId: 1 }, { unique: true });
+
+const WorkspaceBranding =
+  (mongoose.models.WorkspaceBranding as mongoose.Model<WorkspaceBrandingDoc>) ||
+  mongoose.model<WorkspaceBrandingDoc>("WorkspaceBranding", WorkspaceBrandingSchema);
+
+/* -------------------------------------------------------------------------- */
+/* Auth helpers                                                               */
+/* -------------------------------------------------------------------------- */
+
+type AnyObj = Record<string, any>;
+
+function pickFrom(obj: AnyObj, keys: string[]) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+  }
+  return undefined;
+}
+
+function getTokenFromReq(req: AnyObj): string | null {
+  const auth = String(req.headers?.authorization || "");
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (m?.[1]) return m[1].trim();
+
+  const cookies = req.cookies || {};
+  const c =
+    cookies.accessToken ||
+    cookies.token ||
+    cookies.jwt ||
+    cookies.session ||
+    cookies["hrms_token"];
+  if (c) return String(c);
+
+  return null;
+}
+
+function decodeUser(req: AnyObj): AnyObj | null {
+  if (req.user) return req.user;
+
+  const token = getTokenFromReq(req);
+  if (!token) return null;
+
+  try {
+    const secret = (env as any).JWT_SECRET || process.env.JWT_SECRET;
+    if (!secret) return null;
+
+    const payload = jwt.verify(token, secret) as AnyObj;
+    req.user = payload;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function requireAuth(req: AnyObj, res: express.Response): AnyObj | null {
+  const u = decodeUser(req);
+  if (!u) {
+    res.status(401).json({ ok: false, error: "Unauthorized" });
+    return null;
+  }
+  return u;
+}
+
+function normalizeEmail(v: any) {
+  const s = String(v || "").trim().toLowerCase();
+  return s.includes("@") ? s : "";
+}
+
+function safeStr(v: any) {
+  return String(v ?? "").trim();
+}
+
+function escapeRegExp(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isValidObjectId(v: any) {
+  return mongoose.isValidObjectId(v);
+}
+
+function isStaffish(user: AnyObj): boolean {
+  if (user?.staff === true) return true;
+  const rolesRaw =
+    user?.roles || user?.role || user?.hrmsAccessRole || user?.hrmsAccessLevel;
+  const roles = Array.isArray(rolesRaw) ? rolesRaw : [rolesRaw].filter(Boolean);
+  const up = roles.map((r: any) => String(r).toUpperCase());
+  return up.some((r: string) =>
+    ["ADMIN", "HR", "SUPERADMIN", "SUPER_ADMIN", "OWNER", "MANAGER"].includes(r)
+  );
+}
+
+function roleList(user: AnyObj): string[] {
+  const raw = user?.roles || [];
+  const arr = Array.isArray(raw) ? raw : [raw].filter(Boolean);
+  return arr.map((x: any) => String(x || "").trim().toUpperCase()).filter(Boolean);
+}
+
+function looksCustomerish(user: AnyObj): boolean {
+  const roles = roleList(user);
+  const at = String(user?.accountType || user?.userType || "").toUpperCase();
+  return at === "CUSTOMER" || roles.includes("CUSTOMER") || roles.includes("REQUESTER") || roles.includes("APPROVER");
+}
+
+function looksVendorish(user: AnyObj): boolean {
+  const roles = roleList(user);
+  const at = String(user?.accountType || user?.userType || "").toUpperCase();
+  return at === "VENDOR" || roles.includes("VENDOR");
+}
+
+/* -------------------------------------------------------------------------- */
+/* Workspace resolution (NO env defaults; DB-first)                            */
+/* -------------------------------------------------------------------------- */
+
+type ResolvedScope = {
+  scopeType: WorkspaceBrandingDoc["scopeType"];
+  scopeId: string;        // IMPORTANT: for CUSTOMER, this will be customerId (string)
+  customerId?: string;    // same as scopeId for CUSTOMER
+  vendorId?: string;
+  memberRole?: string;    // WORKSPACE_LEADER / APPROVER / REQUESTER (if found)
+  workspaceMeta?: AnyObj; // small workspace details (domains/approvers)
+  reason?: string;
+  debug?: AnyObj;
+};
+
+async function resolveCustomerIdFromWorkspaceRef(ref: string): Promise<string | null> {
+  const r = safeStr(ref);
+  if (!r) return null;
+
+  // A) by customerId string
+  const byCustomerId = await CustomerWorkspace.findOne({ customerId: r }).lean().exec();
+  if (byCustomerId?.customerId) return String(byCustomerId.customerId);
+
+  // B) by _id (if someone passes workspace _id)
+  if (isValidObjectId(r)) {
+    const byId = await CustomerWorkspace.findById(r).lean().exec();
+    if (byId?.customerId) return String(byId.customerId);
+  }
+
+  return null;
+}
+
+async function loadWorkspaceMeta(customerId: string) {
+  const ws = await CustomerWorkspace.findOne({ customerId }).lean().exec();
+  if (!ws) return null;
+  return {
+    allowedDomains: (ws as any).allowedDomains || [],
+    allowedEmails: (ws as any).allowedEmails || [],
+    defaultApproverEmails: (ws as any).defaultApproverEmails || [],
+    canApproverCreateUsers: Boolean((ws as any).canApproverCreateUsers),
+    status: (ws as any).status || "ACTIVE",
+  };
+}
+
+async function resolveWorkspaceScope(user: AnyObj, req: AnyObj): Promise<ResolvedScope> {
+  const staff = isStaffish(user);
+
+  // 0) Staff override via query (ONLY for staff)
+  const qCustomerId = safeStr(req.query?.customerId);
+  if (qCustomerId && staff) {
+    const cid = await resolveCustomerIdFromWorkspaceRef(qCustomerId);
+    if (cid) {
+      return {
+        scopeType: "CUSTOMER",
+        scopeId: cid,
+        customerId: cid,
+        workspaceMeta: (await loadWorkspaceMeta(cid)) || undefined,
+        reason: "query:customerId",
+        debug: { staff: true, queryCustomerId: qCustomerId, resolvedCustomerId: cid },
+      };
+    }
+    // If query passed but no workspace exists, still return CUSTOMER scope (so UI can show mismatch)
+    return {
+      scopeType: "CUSTOMER",
+      scopeId: qCustomerId,
+      customerId: qCustomerId,
+      reason: "query:customerId(no-workspace)",
+      debug: { staff: true, queryCustomerId: qCustomerId },
+    };
+  }
+
+  // 1) Token-based workspace references (customerId/businessId/workspaceId)
+  const tokenWorkspaceRef = safeStr(
+    pickFrom(user, [
+      "customerId",
+      "customer_id",
+      "businessId",
+      "business_id",
+      "customerBusinessId",
+      "customer_business_id",
+      "workspaceId",
+      "workspace_id",
+    ])
+  );
+  if (tokenWorkspaceRef) {
+    const cid = await resolveCustomerIdFromWorkspaceRef(tokenWorkspaceRef);
+    if (cid) {
+      return {
+        scopeType: "CUSTOMER",
+        scopeId: cid,
+        customerId: cid,
+        workspaceMeta: (await loadWorkspaceMeta(cid)) || undefined,
+        reason: "token:customerRef->workspace",
+        debug: { tokenWorkspaceRef, resolvedCustomerId: cid },
+      };
+    }
+
+    // If token already carries the new-style string customerId (like dev_customer_workspace), accept it.
+    return {
+      scopeType: "CUSTOMER",
+      scopeId: tokenWorkspaceRef,
+      customerId: tokenWorkspaceRef,
+      workspaceMeta: (await loadWorkspaceMeta(tokenWorkspaceRef)) || undefined,
+      reason: "token:customerRef(raw)",
+      debug: { tokenWorkspaceRef },
+    };
+  }
+
+  // 2) Vendor id from token (if any)
+  const tokenVendor = safeStr(pickFrom(user, ["vendorId", "vendor_id", "vendorProfileId"]));
+  if (tokenVendor) {
+    return { scopeType: "VENDOR", scopeId: tokenVendor, vendorId: tokenVendor, reason: "token:vendor" };
+  }
+
+  // 3) ✅ FIX: USER-scope token → load User doc → read user.customerId → map to customer workspace
+  const sub = safeStr(pickFrom(user, ["sub", "id", "_id", "userId", "user_id"]));
+  const actorEmail = normalizeEmail(pickFrom(user, ["email", "mail", "username", "userEmail"]));
+
+  if (sub && isValidObjectId(sub)) {
+    const u: any = await User.findById(sub).lean().exec();
+
+    const dbEmail = normalizeEmail(u?.email || "");
+    const mergedEmail = actorEmail || dbEmail;
+
+    const userCustomerId = safeStr(u?.customerId || u?.businessId);
+    const userVendorId = safeStr(u?.vendorId);
+
+    // If user is customer-ish, prefer customerId
+    if (userCustomerId && (looksCustomerish(u) || looksCustomerish(user) || !looksVendorish(u))) {
+      // If someone mistakenly stored workspace _id in user.customerId, normalize it
+      const cid = (await resolveCustomerIdFromWorkspaceRef(userCustomerId)) || userCustomerId;
+
+      // Also attempt to fetch member role for this email in this workspace
+      let memberRole: string | undefined;
+      if (mergedEmail) {
+        const rx = new RegExp(`^${escapeRegExp(mergedEmail)}$`, "i");
+        const mem: any = await CustomerMember.findOne({
+          customerId: cid,
+          email: rx,
+          $or: [{ isActive: { $exists: false } }, { isActive: true }],
+        })
+          .sort({ updatedAt: -1, createdAt: -1 })
+          .lean()
+          .exec();
+        if (mem?.role) memberRole = String(mem.role);
+      }
+
+      return {
+        scopeType: "CUSTOMER",
+        scopeId: cid,
+        customerId: cid,
+        memberRole,
+        workspaceMeta: (await loadWorkspaceMeta(cid)) || undefined,
+        reason: "db:user.customerId",
+        debug: { sub, dbEmail: dbEmail || null },
+      };
+    }
+
+    // Vendor
+    if (userVendorId && (looksVendorish(u) || looksVendorish(user))) {
+      return {
+        scopeType: "VENDOR",
+        scopeId: userVendorId,
+        vendorId: userVendorId,
+        reason: "db:user.vendorId",
+        debug: { sub },
+      };
+    }
+  }
+
+  // 4) Member lookup by email → use member.customerId (works even if User.customerId missing)
+  if (actorEmail) {
+    const rx = new RegExp(`^${escapeRegExp(actorEmail)}$`, "i");
+    const mem: any = await CustomerMember.findOne({
+      email: rx,
+      $or: [{ isActive: { $exists: false } }, { isActive: true }],
+    })
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .lean()
+      .exec();
+
+    if (mem?.customerId) {
+      const cid = String(mem.customerId);
+      return {
+        scopeType: "CUSTOMER",
+        scopeId: cid,
+        customerId: cid,
+        memberRole: mem?.role ? String(mem.role) : undefined,
+        workspaceMeta: (await loadWorkspaceMeta(cid)) || undefined,
+        reason: "db:customermembers.email",
+        debug: { actorEmail },
+      };
+    }
+  }
+
+  // 5) Fallback to USER scope
+  const uid = sub || "unknown";
+  return {
+    scopeType: "USER",
+    scopeId: uid,
+    reason: "fallback:user",
+    debug: { actorEmail: actorEmail || null, staff },
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Routes                                                                     */
+/* -------------------------------------------------------------------------- */
+
+router.get("/me", async (req: AnyObj, res) => {
+  const user = requireAuth(req, res);
+  if (!user) return;
+
+  const scope = await resolveWorkspaceScope(user, req);
+
+  const branding = (await WorkspaceBranding.findOne({
+    scopeType: scope.scopeType,
+    scopeId: scope.scopeId,
+  }).lean()) as null | { logoUrl?: string };
+
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    ok: true,
+
+    // Backward compat + what approvals need
+    customerId:
+      scope.customerId ||
+      (scope.scopeType === "CUSTOMER" ? scope.scopeId : undefined),
+
+    workspaceId: scope.scopeId,
+
+    workspace: {
+      scopeType: scope.scopeType,
+      scopeId: scope.scopeId,
+      logoUrl: branding?.logoUrl || "",
+    },
+
+    // Extra helpful info (safe to ignore on frontend)
+    memberRole: scope.memberRole,
+    workspaceMeta: scope.workspaceMeta,
+
+    hint:
+      scope.scopeType === "USER"
+        ? "You are in USER scope. Fix is: link this login to a Customer workspace via User.customerId OR a CustomerMember record (customermembers). No .env default is used."
+        : undefined,
+
+    debug:
+      process.env.NODE_ENV !== "production"
+        ? {
+            reason: scope.reason,
+            ...scope.debug,
+            staff: isStaffish(user),
+          }
+        : undefined,
+  });
+});
+
+// Small guard to return a clean message when fileFilter rejects
+function logoMimeGuard(_req: AnyObj, _res: express.Response, next: express.NextFunction) {
+  // multer will still call next() with req.file undefined if rejected by fileFilter
+  next();
+}
+
+router.post("/logo", logoMimeGuard, upload.single("logo"), async (req: AnyObj, res) => {
+  const user = requireAuth(req, res);
+  if (!user) return;
+
+  if (!req.file?.filename) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Logo upload failed. Use field name 'logo' and upload PNG/JPG/WEBP (max 2MB).",
+    });
+  }
+
+  const scope = await resolveWorkspaceScope(user, req);
+  const logoUrl = `/uploads/workspace-logos/${req.file.filename}`;
+
+  await WorkspaceBranding.findOneAndUpdate(
+    { scopeType: scope.scopeType, scopeId: scope.scopeId },
+    { $set: { logoUrl } },
+    { upsert: true, new: true }
+  );
+
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ ok: true, logoUrl });
+});
+
+export default router;

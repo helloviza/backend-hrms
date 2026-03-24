@@ -1,0 +1,36 @@
+# dependencies
+node_modules/
+
+# builds
+dist/
+build/
+
+# env
+.env
+.env.*
+!.env.example
+
+# logs
+logs/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+
+# uploads & runtime files
+uploads/
+
+# tests & coverage
+coverage/
+
+# misc
+*.pdf
+*.zip
+backend-src-tree.txt

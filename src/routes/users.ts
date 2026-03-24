@@ -1,0 +1,485 @@
+// apps/backend/src/routes/users.ts
+import { Router, Request, Response, NextFunction } from "express";
+import User from "../models/User.js";
+import { Onboarding } from "../models/Onboarding.js";
+import { requireAuth } from "../middleware/auth.js";
+import { requireRoles } from "../middleware/roles.js";
+import bcrypt from "bcryptjs";
+import { s3 } from "../config/aws.js";
+import { env } from "../config/env.js";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import {
+  GetObjectCommand,
+  HeadObjectCommand,
+  DeleteObjectCommand,
+} from "@aws-sdk/client-s3";
+
+const r = Router();
+
+/**
+ * Tenant isolation (multi-domain / multi-account safe)
+ * We derive tenantId from JWT claims already present in your system.
+ */
+function resolveTenantId(req: any) {
+  const u = req.user || {};
+  // Prefer customer/business first, then vendor, else fallback
+  return String(u.customerId || u.businessId || u.vendorId || "staff");
+}
+
+/**
+ * In-memory cache for signed avatar URLs to reduce signing overhead.
+ * Keyed by S3 object key.
+ */
+type CacheEntry = { url: string; expAt: number };
+const AVATAR_URL_CACHE = new Map<string, CacheEntry>();
+
+/**
+ * Create a short-lived signed URL for S3 avatar key.
+ * - Uses a small in-memory cache to reduce AWS signing calls.
+ * - Falls back to empty string if key is missing.
+ */
+async function signAvatarUrl(key?: string) {
+  if (!key) return "";
+
+  const now = Date.now();
+  const cached = AVATAR_URL_CACHE.get(key);
+  if (cached && cached.expAt > now + 30_000) {
+    // keep 30s safety buffer
+    return cached.url;
+  }
+
+  const cmd = new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: key });
+  const url = await getSignedUrl(s3, cmd, { expiresIn: 900 }); // 15 minutes
+
+  // cache for ~14 minutes (buffer before real expiry)
+  AVATAR_URL_CACHE.set(key, { url, expAt: now + 14 * 60 * 1000 });
+  return url;
+}
+
+/**
+ * Best-effort delete an older avatar object.
+ * Requires s3:DeleteObject on avatars/* (optional).
+ */
+async function tryDeleteOldAvatar(oldKey?: string) {
+  if (!oldKey) return;
+  try {
+    await s3.send(new DeleteObjectCommand({ Bucket: env.S3_BUCKET, Key: oldKey }));
+  } catch {
+    // ignore (no permission or already deleted)
+  }
+}
+
+/* ─────────────── ROUTES ─────────────── */
+
+/**
+ * GET /api/users/profile
+ * Get current user profile
+ *
+ * ✅ Returns:
+ * - avatarKey (source of truth)
+ * - avatarUrl (short-lived signed URL for display)
+ */
+r.get(
+  "/profile",
+  requireAuth,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const userId = (req as any).user?.sub;
+      if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+      const user = await User.findById(userId).select("-passwordHash").lean();
+      if (!user) return res.status(404).json({ error: "User not found" });
+
+      const u: any = user;
+      const avatarKey = u.avatarKey || "";
+      const avatarUrl = avatarKey ? await signAvatarUrl(avatarKey) : "";
+
+      res.json({
+        _id: u._id,
+        email: u.email,
+        roles: u.roles,
+        name: u.name || u.firstName || u.email?.split("@")[0],
+        phone: u.phone || "",
+        department: u.department || "",
+        location: u.location || "",
+        managerName: u.managerName || "",
+        avatarKey,
+        avatarUrl, // ✅ signed (use directly in <img src>)
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/**
+ * POST /api/users/profile/update
+ * Update profile fields (no upload here)
+ *
+ * ✅ Supports updating profile basics.
+ * ✅ If you pass avatarKey, it will validate & save it (optional convenience).
+ */
+r.post(
+  "/profile/update",
+  requireAuth,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const userId = (req as any).user?.sub;
+      if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+      const { name, phone, department, location, avatarKey } = req.body || {};
+
+      const $set: any = {};
+      if (name !== undefined) $set.name = name;
+      if (phone !== undefined) $set.phone = phone;
+      if (department !== undefined) $set.department = department;
+      if (location !== undefined) $set.location = location;
+
+      // Optional: allow avatarKey update via this endpoint too
+      if (avatarKey) {
+        const tenantId = resolveTenantId(req);
+        const expectedPrefix = `avatars/${tenantId}/${userId}/`;
+        if (!String(avatarKey).startsWith(expectedPrefix)) {
+          return res.status(403).json({ error: "Forbidden" });
+        }
+
+        // ensure object exists (better error)
+        try {
+          await s3.send(
+            new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: avatarKey }),
+          );
+        } catch {
+          return res.status(404).json({ error: "Avatar object not found on S3" });
+        }
+
+        $set.avatarKey = avatarKey;
+        $set.avatarUpdatedAt = new Date();
+        // legacy field: do not store signed urls
+        $set.avatarUrl = "";
+      }
+
+      const updated = await User.findByIdAndUpdate(userId, { $set }, { new: true })
+        .select("-passwordHash")
+        .lean();
+
+      if (!updated) return res.status(404).json({ error: "User not found" });
+
+      // attach signed avatar url for convenience
+      const out: any = updated;
+      out.avatarUrl = out.avatarKey ? await signAvatarUrl(out.avatarKey) : "";
+
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/**
+ * POST /api/users/profile/avatar/confirm
+ * Body: { key: "avatars/<tenantId>/<userId>/..." }
+ *
+ * Frontend flow:
+ * 1) POST /api/uploads/presign-avatar-upload -> { key, uploadUrl }
+ * 2) PUT file to S3 using uploadUrl
+ * 3) POST /api/users/profile/avatar/confirm -> saves avatarKey & returns signed avatarUrl
+ */
+r.post(
+  "/profile/avatar/confirm",
+  requireAuth,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const userId = (req as any).user?.sub;
+      if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+      const { key } = req.body || {};
+      if (!key || typeof key !== "string") {
+        return res.status(400).json({ error: "key is required" });
+      }
+
+      const tenantId = resolveTenantId(req);
+      const expectedPrefix = `avatars/${tenantId}/${userId}/`;
+
+      // tenant + user isolation
+      if (!key.startsWith(expectedPrefix)) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      // ensure object exists (nicer UX)
+      try {
+        await s3.send(new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: key }));
+      } catch {
+        return res.status(404).json({ error: "Avatar object not found on S3" });
+      }
+
+      // load current user to optionally delete old avatar object
+      const current = await User.findById(userId).select("avatarKey").lean();
+      const oldKey = (current as any)?.avatarKey || "";
+
+      await User.findByIdAndUpdate(userId, {
+        $set: {
+          avatarKey: key,
+          avatarUpdatedAt: new Date(),
+          avatarUrl: "", // legacy local/signed url must not be stored
+        },
+      });
+
+      // best-effort cleanup old avatar
+      if (oldKey && oldKey !== key) {
+        await tryDeleteOldAvatar(oldKey);
+        AVATAR_URL_CACHE.delete(oldKey);
+      }
+
+      const avatarUrl = await signAvatarUrl(key);
+      res.json({ avatarKey: key, avatarUrl });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/* ─────────────── POST /create-staff (mounted at /api/admin/create-staff) ─────────────── */
+
+r.post(
+  "/create-staff",
+  requireAuth,
+  requireRoles("ADMIN", "SUPERADMIN"),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { name, email, password, role, department, phone } = req.body as {
+        name?: string;
+        email?: string;
+        password?: string;
+        role?: string;
+        department?: string;
+        phone?: string;
+      };
+
+      if (!name || !email || !password || !role) {
+        return res.status(400).json({ error: "name, email, password and role are required." });
+      }
+      if (password.length < 6) {
+        return res.status(400).json({ error: "Password must be at least 6 characters." });
+      }
+
+      const existing = await User.findOne({ email: email.trim().toLowerCase() });
+      if (existing) {
+        return res.status(409).json({ error: "A user with this email already exists." });
+      }
+
+      const hashed = await bcrypt.hash(password, 10);
+
+      const newUser = await User.create({
+        name: name.trim(),
+        email: email.trim().toLowerCase(),
+        passwordHash: hashed,
+        roles: [role.toUpperCase()],
+        ...(department ? { department: department.trim() } : {}),
+        ...(phone ? { phone: phone.trim() } : {}),
+        isActive: true,
+      });
+
+      return res.status(201).json({
+        success: true,
+        user: {
+          _id: newUser._id,
+          name: newUser.name,
+          email: newUser.email,
+          roles: newUser.roles,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/* ─────────────── GET /admin/onboarded-without-access ─────────────── */
+
+r.get(
+  "/admin/onboarded-without-access",
+  requireAuth,
+  requireRoles("ADMIN", "SUPERADMIN", "HR"),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const users = await User.find({
+        $or: [
+          { tempPassword: true },
+          { tempPassword: { $exists: false } },
+        ],
+        roles: { $in: ["EMPLOYEE", "MANAGER", "HR"] },
+      })
+        .select("name email roles employeeCode createdAt tempPassword activatedByAdmin")
+        .lean();
+
+      res.json(users);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/* ─────────────── POST /admin/grant-access ─────────────── */
+
+r.post(
+  "/admin/grant-access",
+  requireAuth,
+  requireRoles("ADMIN", "SUPERADMIN", "HR"),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { userId, onboardingId, role, password } = req.body as {
+        userId?: string;
+        onboardingId?: string;
+        role?: string;
+        password?: string;
+      };
+
+      if (!role || !password) {
+        return res.status(400).json({ error: "role and password are required." });
+      }
+      if (password.length < 6) {
+        return res.status(400).json({ error: "Password must be at least 6 characters." });
+      }
+
+      const hashed = await bcrypt.hash(password, 10);
+      const activation = {
+        passwordHash: hashed,
+        roles: [role.toUpperCase()],
+        tempPassword: false,
+        activatedByAdmin: true,
+        activatedAt: new Date(),
+      };
+
+      // Path A: grant access to an existing User doc (from tempPassword flow)
+      if (userId) {
+        const target = await User.findById(userId);
+        if (!target) return res.status(404).json({ error: "User not found." });
+        Object.assign(target, activation);
+        await (target as any).save();
+        return res.json({
+          success: true,
+          user: { _id: target._id, name: (target as any).name, email: (target as any).email, roles: (target as any).roles },
+        });
+      }
+
+      // Path B: create from onboarding doc (no User exists yet)
+      if (!onboardingId) {
+        return res.status(400).json({ error: "userId or onboardingId is required." });
+      }
+
+      const onboarding = await (Onboarding as any).findById(onboardingId).lean();
+      if (!onboarding) {
+        return res.status(404).json({ error: "Onboarding record not found." });
+      }
+
+      const email = (onboarding as any).email?.trim().toLowerCase();
+      if (!email) {
+        return res.status(400).json({ error: "Onboarding record has no email." });
+      }
+
+      const o = onboarding as any;
+      const payload = o.formPayload || {};
+      const name =
+        o.inviteeName ||
+        payload.name ||
+        payload.fullName ||
+        [payload.firstName, payload.lastName].filter(Boolean).join(" ") ||
+        email;
+
+      const existing = await User.findOne({ email });
+      if (existing) {
+        Object.assign(existing, activation);
+        await (existing as any).save();
+        return res.json({
+          success: true,
+          user: { _id: existing._id, name: (existing as any).name, email: (existing as any).email, roles: (existing as any).roles },
+        });
+      }
+
+      const newUser = await User.create({ name, email, isActive: true, ...activation });
+
+      return res.status(201).json({
+        success: true,
+        user: {
+          _id: newUser._id,
+          name: (newUser as any).name,
+          email: (newUser as any).email,
+          roles: (newUser as any).roles,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+r.patch("/admin/users/:id/sbt", requireAuth, async (req: any, res: any) => {
+  try {
+    const actor = req.user || {};
+    const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role]).map((r: any) =>
+      String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, "")
+    );
+    const isAdmin = actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
+
+    if (!isAdmin && !isLeader) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const { sbtEnabled, sbtBookingType } = req.body;
+
+    const targetUser: any = await User.findById(req.params.id).select("customerId email").lean();
+    if (!targetUser) return res.status(404).json({ error: "User not found" });
+
+    // WORKSPACE_LEADER: scoped checks
+    if (isLeader && !isAdmin) {
+      const actorCustomerId = String(actor.customerId || actor.businessId || "");
+      const targetCustomerId = String(targetUser.customerId || "");
+
+      // Cannot modify users outside their own company
+      if (!actorCustomerId || actorCustomerId !== targetCustomerId) {
+        return res.status(403).json({ error: "You can only manage users in your own company" });
+      }
+
+      // Cannot modify their own SBT
+      const actorId = String(actor.sub || actor.id || actor._id || "");
+      const targetId = String(req.params.id);
+      const actorEmail = String(actor.email || "").trim().toLowerCase();
+      const targetEmail = String(targetUser.email || "").trim().toLowerCase();
+      if ((actorId && actorId === targetId) || (actorEmail && actorEmail === targetEmail)) {
+        return res.status(403).json({
+          error: "You cannot modify your own permissions. Contact Plumtrips Admin.",
+          code: "SELF_MODIFICATION_DENIED",
+        });
+      }
+    }
+
+    // If enabling SBT, check workspace travelMode for conflicts
+    if (sbtEnabled) {
+      if (targetUser?.customerId) {
+        const CustomerWorkspace = (await import("../models/CustomerWorkspace.js")).default;
+        const ws: any = await CustomerWorkspace.findOne({ customerId: targetUser.customerId })
+          .select("travelMode")
+          .lean();
+        if (ws?.travelMode === "APPROVAL_FLOW") {
+          return res.status(409).json({
+            error: "Cannot enable SBT for this user. Company travel mode is set to Approval Flow.",
+            code: "APPROVAL_FLOW_CONFLICT",
+          });
+        }
+      }
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { sbtEnabled, sbtBookingType },
+      { new: true }
+    ).select("name email sbtEnabled sbtBookingType");
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json({ success: true, user });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+export default r;
