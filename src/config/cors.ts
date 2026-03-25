@@ -2,22 +2,21 @@
 import cors from "cors";
 import { env } from "./env.js";
 
-const fromEnv = (env.FRONTEND_ORIGIN || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-const devOrigins =
-  process.env.NODE_ENV !== "production"
+// FRONTEND_ORIGIN supports comma-separated list: "https://a.com,https://b.com"
+const allowedOrigins = [
+  ...(env.FRONTEND_ORIGIN
+    ? env.FRONTEND_ORIGIN.split(",").map((o) => o.trim()).filter(Boolean)
+    : []),
+  ...(process.env.NODE_ENV !== "production"
     ? [
         "http://localhost:5173",
-        "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
       ]
-    : [];
+    : []),
+];
 
-const ALLOW_LIST = new Set<string>([...fromEnv, ...devOrigins]);
+const ALLOW_LIST = new Set<string>(allowedOrigins);
 const LOCAL_REGEX = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i;
 
 // Allow only hrms.plumtrips.com subdomains (not whole plumtrips.com)
