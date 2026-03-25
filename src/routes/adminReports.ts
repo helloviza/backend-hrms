@@ -1,10 +1,14 @@
 // apps/backend/src/routes/adminReports.ts
 import express from "express";
+import { requireAuth } from "../middleware/auth.js";
+import { requireAdmin } from "../middleware/rbac.js";
 import Attendance from "../models/Attendance.js";
 import Leave from "../models/Leave.js";
 import Vendor from "../models/Vendor.js";
 
 const router = express.Router();
+router.use(requireAuth);
+router.use(requireAdmin);
 
 function csvEscape(value: unknown): string {
   if (value === null || value === undefined) return "";

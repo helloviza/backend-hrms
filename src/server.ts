@@ -396,9 +396,18 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
         logger.info("API running", { port: env.PORT });
       });
 
-      const shutdown = () => {
+      const shutdown = async () => {
         logger.info("Gracefully shutting down server...");
-        server.close(() => process.exit(0));
+        server.close(async () => {
+          try {
+            const mongoose = await import("mongoose");
+            await mongoose.default.disconnect();
+            logger.info("MongoDB disconnected on shutdown");
+          } catch (e) {
+            // ignore disconnect errors during shutdown
+          }
+          process.exit(0);
+        });
       };
 
       process.on("SIGINT", shutdown);

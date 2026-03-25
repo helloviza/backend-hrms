@@ -331,7 +331,7 @@ router.post("/calendar", requireSBT, requireFlightAccess, async (req: any, res: 
     const lastDay = `${yearStr}-${monthStr}-${String(lastDayDate.getDate()).padStart(2, "0")}T00:00:00`;
 
     const payload = {
-      EndUserIp: req.ip || "1.1.1.1",
+      EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
       TokenId: token,
       JourneyType: "1",
       PreferredAirlines: null,

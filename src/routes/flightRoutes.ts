@@ -1,9 +1,10 @@
 import { Router } from 'express';
+import { requireAuth } from '../middleware/auth.js';
 import { getFlightStatus } from '../controllers/flightController.js';
 
 const router = Router();
+router.use(requireAuth);
 
-// This maps the specific function to the HTTP GET method
 router.get('/status', getFlightStatus);
 
 export default router;

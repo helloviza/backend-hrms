@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import { env } from "./env.js";
+import logger from "../utils/logger.js";
 
 export async function connectDb() {
   if (!env.MONGO_URI) {
@@ -7,5 +8,17 @@ export async function connectDb() {
   }
   mongoose.set("strictQuery", true);
   await mongoose.connect(env.MONGO_URI);
-  console.log("✅ Mongo connected");
+  logger.info("MongoDB connected");
+
+  mongoose.connection.on("disconnected", () => {
+    logger.warn("MongoDB disconnected");
+  });
+
+  mongoose.connection.on("error", (err) => {
+    logger.error("MongoDB connection error", { error: err.message });
+  });
+
+  mongoose.connection.on("reconnected", () => {
+    logger.info("MongoDB reconnected");
+  });
 }

@@ -1,6 +1,8 @@
 import { Router, Request, Response } from "express";
+import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
+router.use(requireAuth);
 
 const SERP_API_KEY = process.env.SERPAPI_API_KEY!;
 const SERP_BASE = "https://serpapi.com/search.json";

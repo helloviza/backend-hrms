@@ -1,11 +1,15 @@
 // apps/backend/src/routes/adminAnalytics.ts
 import express from "express";
+import { requireAuth } from "../middleware/auth.js";
+import { requireAdmin } from "../middleware/rbac.js";
 import Employee from "../models/Employee.js";
 import Attendance from "../models/Attendance.js";
 import Leave from "../models/Leave.js";
 import Vendor from "../models/Vendor.js";
 
 const router = express.Router();
+router.use(requireAuth);
+router.use(requireAdmin);
 
 /**
  * Parse time window from query.

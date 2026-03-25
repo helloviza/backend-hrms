@@ -1,7 +1,9 @@
 // apps/backend/src/routes/places.ts
 import { Router } from "express";
+import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
+router.use(requireAuth);
 
 const API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const REGION_CODE = (process.env.GOOGLE_PLACES_REGION || "IN").toUpperCase(); // IN

@@ -170,10 +170,14 @@ function attachDevUser(req: Request) {
 export function requireAuth(req: Request, res: Response, next: NextFunction) {
   const disableAuth = normBool(process.env.DISABLE_AUTH);
 
-  // ✅ DEV BYPASS
+  // ✅ DEV BYPASS — blocked in production
   if (disableAuth) {
-    attachDevUser(req);
-    return next();
+    if (process.env.NODE_ENV === "production") {
+      console.error("[SECURITY] DISABLE_AUTH=true is not allowed in production. Ignoring.");
+    } else {
+      attachDevUser(req);
+      return next();
+    }
   }
 
   // ✅ NORMAL AUTH (Bearer token OR Cookie token)

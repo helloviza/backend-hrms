@@ -7,10 +7,14 @@
 // ─────────────────────────────────────────────
 
 import { Router } from "express";
+import { requireAuth } from "../middleware/auth.js";
+import { requireAdmin } from "../middleware/rbac.js";
 import VideoAnalysis from "../models/VideoAnalysis.js";
 import { startVideoAnalysis } from "../services/video/startVideoAnalysis.js";
 
 const router = Router();
+router.use(requireAuth);
+router.use(requireAdmin);
 
 router.post("/video/:videoId/reanalyze", async (req, res) => {
   try {
