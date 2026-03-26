@@ -3,7 +3,7 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
-import { rateLimit } from "express-rate-limit";
+import { rateLimit, ipKeyGenerator } from "express-rate-limit";
 import { z } from "zod";
 
 import User from "../models/User.js";
@@ -674,8 +674,9 @@ const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   keyGenerator: (req) => {
-    return (req.body?.email || req.ip || "unknown")
-      .toString().toLowerCase();
+    const email = req.body?.email;
+    if (email) return email.toString().toLowerCase();
+    return ipKeyGenerator(req.ip || "unknown");
   },
   message: { error: "Too many login attempts for this account. Please try again in 15 minutes." },
   standardHeaders: true,
