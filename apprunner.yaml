@@ -1,0 +1,14 @@
+version: 1.0
+runtime: nodejs18
+build:
+  commands:
+    pre-build:
+      - npm install -g pnpm
+    build:
+      - pnpm install
+      - pnpm run build
+run:
+  command: node dist/server.js
+  network:
+    port: 8080
+    env: PORT
