@@ -132,9 +132,13 @@ const FLIGHT_BASE =
   process.env.TBO_FLIGHT_BASE_URL ||
   "http://api.tektravels.com/BookingEngineService_Air/AirService.svc/rest";
 
+const FLIGHT_BOOK_BASE =
+  process.env.TBO_FLIGHT_BOOK_BASE_URL ||
+  "http://api.tektravels.com/BookingEngineService_AirBook/AirService.svc/rest";
+
 const TIMEOUT = Number(process.env.TBO_HTTP_TIMEOUT_MS || 300_000);
 
-async function post(path: string, body: object, _retried = false): Promise<unknown> {
+async function post(path: string, body: object, _retried = false, base = FLIGHT_BASE): Promise<unknown> {
   const method = path.replace(/^\//, ""); // "/FareQuote" → "FareQuote"
   const traceId = (body as any)?.TraceId || undefined;
 
@@ -142,7 +146,7 @@ async function post(path: string, body: object, _retried = false): Promise<unkno
   const timer = setTimeout(() => controller.abort(), TIMEOUT);
   const start = Date.now();
   try {
-    const res = await fetch(`${FLIGHT_BASE}${path}`, {
+    const res = await fetch(`${base}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(body),
@@ -170,7 +174,7 @@ async function post(path: string, body: object, _retried = false): Promise<unkno
       clearTBOToken();
       const freshToken = await getTBOToken({ forceRefresh: true });
       const retryBody = { ...body, TokenId: freshToken };
-      return post(path, retryBody, true);
+      return post(path, retryBody, true, base);
     }
 
     return json;
@@ -424,9 +428,18 @@ function sanitizeDOB(dob: string | undefined, paxType: number): string {
 export async function bookFlight(params: {
   TraceId: string;
   ResultIndex: string;
-  Passengers: unknown[];
+  Passengers: Array<Record<string, any> & {
+    guardianDetails?: {
+      Title?: string;
+      FirstName: string;
+      LastName: string;
+      PAN?: string;
+      PassportNo?: string;
+    };
+  }>;
   isPassportFullDetailRequired?: boolean;
   isNDC?: boolean;
+  IsGSTMandatory?: boolean;
   GSTCompanyInfo?: {
     GSTCompanyName: string;
     GSTCompanyAddress: string;
@@ -437,6 +450,10 @@ export async function bookFlight(params: {
 }) {
   if (!Array.isArray(params.Passengers) || params.Passengers.length === 0) {
     throw new Error("bookFlight: Passengers array is missing or empty");
+  }
+
+  if (params.IsGSTMandatory === true && !params.GSTCompanyInfo) {
+    throw new Error("GST company details are mandatory for this fare. Please provide your company GSTIN.");
   }
 
   // CRITICAL: TBO requires the SAME TokenId across the entire
@@ -464,10 +481,8 @@ export async function bookFlight(params: {
   // NDC Book: adds CellCountryCode, email on every pax, dots stripped from names,
   // and full passport fields always sent.
   const sanitizedPassengers = (params.Passengers as any[]).map((p: any) => {
-    const rawFirst = sanitizeName(p.FirstName);
-    const rawLast = sanitizeName(p.LastName);
-    const firstName = ndcMode ? rawFirst.replace(/\./g, "") : rawFirst;
-    const lastName = ndcMode ? rawLast.replace(/\./g, "") : rawLast;
+    const firstName = sanitizeName(p.FirstName);
+    const lastName = sanitizeName(p.LastName);
     const paxType = Number(p.PaxType) || 1;
 
     const pax: Record<string, unknown> = {
@@ -476,7 +491,11 @@ export async function bookFlight(params: {
       LastName: lastName.length < 2 ? "XX" : lastName,
       PaxType: paxType,
       DateOfBirth: sanitizeDOB(p.DateOfBirth, paxType),
-      Gender: Number(p.Gender) || 1,
+      Gender: (() => {
+        const g = Number(p.Gender);
+        if (g !== 1 && g !== 2) throw new Error(`Gender is required for passenger: ${firstName} ${lastName.length < 2 ? "XX" : lastName}`);
+        return g;
+      })(),
       PassportNo: p.PassportNo || "",
       PassportExpiry: sanitizePassportDate(p.PassportExpiry),
       PassportIssueCountryCode: "IN",
@@ -530,6 +549,22 @@ export async function bookFlight(params: {
       pax.PassportIssueDate = sanitizePassportDate(p.PassportIssueDate) || "2015-01-01T00:00:00";
     }
 
+    // Infant title override — TBO requires "Mstr" for male, "Miss" for female
+    if (paxType === 3) {
+      pax.Title = pax.Gender === 1 ? "Mstr" : "Miss";
+    }
+
+    // GuardianDetails for Child/Infant passengers
+    if ((paxType === 2 || paxType === 3) && p.guardianDetails) {
+      pax.GuardianDetails = {
+        Title: sanitizeTitle(p.guardianDetails.Title),
+        FirstName: sanitizeName(p.guardianDetails.FirstName),
+        LastName: sanitizeName(p.guardianDetails.LastName),
+        ...(p.guardianDetails.PAN ? { PAN: p.guardianDetails.PAN } : {}),
+        ...(p.guardianDetails.PassportNo ? { PassportNo: p.guardianDetails.PassportNo } : {}),
+      };
+    }
+
     return pax;
   });
 
@@ -546,7 +581,7 @@ export async function bookFlight(params: {
   console.log('[BOOK-PAX0-FARE]', JSON.stringify((payload.Passengers as any[])[0]?.Fare, null, 2));
   console.log('[BOOK-PAYLOAD-TO-TBO]', JSON.stringify(payload).slice(0, 1000));
 
-  return post("/Book", payload);
+  return post("/Book", payload, false, FLIGHT_BOOK_BASE);
 }
 
 export async function ticketFlight(params: {
@@ -556,14 +591,24 @@ export async function ticketFlight(params: {
 }) {
   const token = await getTBOToken();
   console.log('[TBO-TOKEN-USED] Ticket TokenId:', token.slice(0, 8));
-  // GDS Ticket requires only these 5 fields — NO Passengers array
-  return post("/Ticket", {
+  const gdsPayload = {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
     TraceId: params.TraceId,
     PNR: params.PNR,
     BookingId: params.BookingId,
-  });
+  };
+  // GDS Ticket requires only these 5 fields — NO Passengers array
+  const gdsResult = await post("/Ticket", gdsPayload, false, FLIGHT_BOOK_BASE) as any;
+
+  // Auto-retry with IsPriceChangeAccepted if TBO signals price changed
+  const gdsChanged = gdsResult?.Response?.IsPriceChanged === true
+    || gdsResult?.Response?.Response?.IsPriceChanged === true;
+  if (gdsChanged) {
+    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangeAccepted=true");
+    return post("/Ticket", { ...gdsPayload, IsPriceChangeAccepted: true }, false, FLIGHT_BOOK_BASE);
+  }
+  return gdsResult;
 }
 
 /* ── SSR sanitizers — strip extra fields TBO rejects ──────────────────── */
@@ -632,9 +677,21 @@ function sanitizeSeatDynamic(seats: any[]): any[] {
 export async function ticketLCC(params: {
   TraceId: string;
   ResultIndex: string;
-  Passengers: unknown[];
+  Passengers: Array<Record<string, any> & {
+    guardianDetails?: {
+      Title?: string;
+      FirstName: string;
+      LastName: string;
+      PAN?: string;
+      PassportNo?: string;
+    };
+  }>;
   IsPriceChangeAccepted?: boolean;
   isNDC?: boolean;
+  isInternational?: boolean;
+  Segments?: Array<Array<{ Origin: { Airport: { CountryCode?: string } }; Destination: { Airport: { CountryCode?: string } } }>>;
+  FreeBaggage?: Array<{ AirlineCode: string; FlightNumber: string; WayType: number; Code: string; Description: number; Weight: number; Currency: string; Price: number; Origin: string; Destination: string }>;
+  IsGSTMandatory?: boolean;
   GSTCompanyInfo?: {
     GSTCompanyName: string;
     GSTCompanyAddress: string;
@@ -643,6 +700,10 @@ export async function ticketLCC(params: {
     GSTIN: string;
   };
 }) {
+  if (params.IsGSTMandatory === true && !params.GSTCompanyInfo) {
+    throw new Error("GST company details are mandatory for this fare. Please provide your company GSTIN.");
+  }
+
   const token = await getTBOToken();
   console.log('[TBO-TOKEN-USED] TicketLCC TokenId:', token.slice(0, 8));
   const ndcMode = params.isNDC === true;
@@ -651,19 +712,31 @@ export async function ticketLCC(params: {
     : null;
   const lccLeadEmail = lccLeadPax?.Email || "";
 
+  // Derive international flag: explicit param, or check if any segment leaves/enters India
+  const isInternational = params.isInternational ?? (
+    Array.isArray(params.Segments) && params.Segments.some(journey =>
+      journey.some(seg =>
+        seg.Origin?.Airport?.CountryCode !== "IN" ||
+        seg.Destination?.Airport?.CountryCode !== "IN"
+      )
+    )
+  );
+
   // Sanitize passengers for TBO: ensure correct types, formats, and all required fields
   const sanitizedPassengers = (params.Passengers as any[]).map((p: any) => {
-    const rawFirst = sanitizeName(p.FirstName);
-    const rawLast = sanitizeName(p.LastName);
-    const firstName = ndcMode ? rawFirst.replace(/\./g, "") : rawFirst;
-    const lastName = ndcMode ? rawLast.replace(/\./g, "") : rawLast;
+    const firstName = sanitizeName(p.FirstName);
+    const lastName = sanitizeName(p.LastName);
     const pax: Record<string, unknown> = {
       Title: sanitizeTitle(p.Title),
       FirstName: firstName,
       LastName: lastName.length < 2 ? "XX" : lastName,
       PaxType: Number(p.PaxType) || 1,
       DateOfBirth: sanitizeDOB(p.DateOfBirth, Number(p.PaxType) || 1),
-      Gender: Number(p.Gender) || 1,
+      Gender: (() => {
+        const g = Number(p.Gender);
+        if (g !== 1 && g !== 2) throw new Error(`Gender is required for passenger: ${firstName} ${lastName.length < 2 ? "XX" : lastName}`);
+        return g;
+      })(),
       PassportNo: p.PassportNo || "",
       PassportExpiry: sanitizePassportDate(p.PassportExpiry),
       ContactNo: sanitizeContactNo(p.ContactNo),
@@ -711,6 +784,17 @@ export async function ticketLCC(params: {
       pax.Title = pax.Gender === 1 ? "Mstr" : "Miss";
     }
 
+    // GuardianDetails for Child/Infant passengers
+    if ((pax.PaxType === 2 || pax.PaxType === 3) && p.guardianDetails) {
+      pax.GuardianDetails = {
+        Title: sanitizeTitle(p.guardianDetails.Title),
+        FirstName: sanitizeName(p.guardianDetails.FirstName),
+        LastName: sanitizeName(p.guardianDetails.LastName),
+        ...(p.guardianDetails.PAN ? { PAN: p.guardianDetails.PAN } : {}),
+        ...(p.guardianDetails.PassportNo ? { PassportNo: p.guardianDetails.PassportNo } : {}),
+      };
+    }
+
     // NDC: CellCountryCode mandatory, full passport always sent
     if (ndcMode) {
       pax.CellCountryCode = "91";
@@ -731,15 +815,22 @@ export async function ticketLCC(params: {
       );
       if (validMeals.length > 0) pax.MealDynamic = validMeals;
     }
+    // TBO requirement: free baggage (Price:0) must be auto-included for international LCC
     if (Array.isArray(p.Baggage) && p.Baggage.length > 0) {
       const validBaggage = sanitizeBaggage(p.Baggage).filter((b: any) =>
         b.Code &&
         !BAG_PLACEHOLDERS.includes(b.Code.toLowerCase()) &&
         b.AirlineCode &&
         b.FlightNumber &&
-        (b.Price > 0 || b.Weight > 0)
+        (isInternational || b.Price > 0 || b.Weight > 0)
       );
       if (validBaggage.length > 0) pax.Baggage = validBaggage;
+    } else if (isInternational && Array.isArray(params.FreeBaggage) && params.FreeBaggage.length > 0 && Number(p.PaxType) !== 3) {
+      // Auto-include free baggage from SSR for international LCC when user selected none
+      const freeBags = sanitizeBaggage(params.FreeBaggage).filter((b: any) =>
+        b.Code && b.AirlineCode && b.FlightNumber && b.Price === 0
+      );
+      if (freeBags.length > 0) pax.Baggage = freeBags;
     }
     if (Array.isArray(p.SeatDynamic) && p.SeatDynamic.length > 0) {
       const cleaned = sanitizeSeatDynamic(p.SeatDynamic);
@@ -813,7 +904,16 @@ export async function ticketLCC(params: {
 
   console.log('[TICKET-LCC FULL PAYLOAD]', JSON.stringify(payload, null, 2));
 
-  return post("/Ticket", payload);
+  const lccResult = await post("/Ticket", payload, false, FLIGHT_BOOK_BASE) as any;
+
+  // Auto-retry with IsPriceChangeAccepted if TBO signals price changed
+  const lccChanged = lccResult?.Response?.IsPriceChanged === true
+    || lccResult?.Response?.Response?.IsPriceChanged === true;
+  if (lccChanged && !payload.IsPriceChangeAccepted) {
+    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangeAccepted=true");
+    return post("/Ticket", { ...payload, IsPriceChangeAccepted: true }, false, FLIGHT_BOOK_BASE);
+  }
+  return lccResult;
 }
 
 export async function releasePNR(params: {
@@ -835,7 +935,7 @@ export async function getBookingDetails(params: { bookingId: string }) {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
     BookingId: params.bookingId,
-  });
+  }, false, FLIGHT_BOOK_BASE);
 }
 
 export async function getBookingDetailsByPNR(params: {
@@ -850,5 +950,5 @@ export async function getBookingDetailsByPNR(params: {
     PNR: params.PNR,
     FirstName: params.FirstName,
     LastName: params.LastName || "",
-  });
+  }, false, FLIGHT_BOOK_BASE);
 }

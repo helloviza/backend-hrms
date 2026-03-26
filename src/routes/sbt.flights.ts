@@ -80,11 +80,19 @@ function validateTBOBookingRequirements(
   // PAN / Passport per passenger
   for (const pax of passengers) {
     const name = `${pax.FirstName || ""} ${pax.LastName || ""}`.trim();
-    if (fareResults?.IsPanRequiredAtBook && !pax.PAN) {
-      return `PAN required for passenger: ${name}`;
+    const paxType = Number(pax.PaxType) || 1;
+    if (fareResults?.IsPanRequiredAtBook) {
+      if (paxType === 1 && !pax.PAN) {
+        return `PAN required for passenger: ${name}`;
+      }
+      if ((paxType === 2 || paxType === 3) && !pax.guardianDetails?.PAN) {
+        return `Guardian PAN required for Child/Infant: ${name}`;
+      }
     }
-    if (fareResults?.IsPassportRequiredAtBook && !pax.PassportNo) {
-      return `Passport required for passenger: ${name}`;
+    if (fareResults?.IsPassportRequiredAtBook) {
+      if (!pax.PassportNo && !(paxType !== 1 && pax.guardianDetails?.PassportNo)) {
+        return `Passport required for passenger: ${name}`;
+      }
     }
   }
   return null;
@@ -828,6 +836,10 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
     const lccValErr = validateTBOBookingRequirements(lccFareResults, lccPassengers);
     if (lccValErr) return res.status(400).json({ error: lccValErr });
 
+    const lccIsInternational = req.body.isInternational ?? lccIsIntl;
+    const lccSegments = lccFareResults?.Segments ?? req.body.Segments ?? [];
+    const lccFreeBaggage = (req.body.FreeBaggage ?? []).filter((b: any) => b.Price === 0);
+
     // Convert SeatPreference → SeatDynamic if frontend sent old format
     function convertSeatPreferences(passengers: any[]) {
       for (const pax of passengers) {
@@ -874,7 +886,11 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
         Passengers: obPassengers,
         IsPriceChangeAccepted: req.body.IsPriceChangeAccepted,
         isNDC: ticketIsNDC,
+        isInternational: lccIsInternational,
+        Segments: lccSegments,
+        FreeBaggage: lccFreeBaggage,
         ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
+        ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
       }) as any;
 
       const ticketStatus = result?.Response?.ResponseStatus;
@@ -920,7 +936,11 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
         Passengers: obPassengers,
         IsPriceChangeAccepted: req.body.IsPriceChangeAccepted,
         isNDC: ticketIsNDC,
+        isInternational: lccIsInternational,
+        Segments: lccSegments,
+        FreeBaggage: lccFreeBaggage,
         ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
+        ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
       };
       let obResult = await ticketLCC(obPayload) as any;
 
@@ -935,6 +955,7 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
         obResult = await ticketLCC({
           ...obPayload,
           Passengers: obPassengersNoMeal,
+          FreeBaggage: [],
         }) as any;
       }
 
@@ -967,6 +988,8 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
           ResultIndex: returnResultIndex,
           Passengers: ibPassengers,
           isNDC: ticketIsNDC,
+          ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
+          ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
         }) as any;
 
         ibPNR = ibBookResult?.Response?.Response?.PNR
@@ -1008,13 +1031,19 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
         // ── Both legs LCC → ticketLCC for IB ──
         console.log('[TICKET-LCC] Ticketing IB LCC leg...');
         console.log('[TICKET-LCC IB MEAL]', JSON.stringify(ibPassengers[0]?.MealDynamic));
+        const ibSegments = req.body.ReturnSegments ?? [];
+        const ibFreeBaggage = (req.body.ReturnFreeBaggage ?? []).filter((b: any) => b.Price === 0);
         const ibPayload = {
           TraceId: ibTraceId,
           ResultIndex: returnResultIndex,
           Passengers: ibPassengers,
           IsPriceChangeAccepted: req.body.IsPriceChangeAccepted,
           isNDC: ticketIsNDC,
+          isInternational: lccIsInternational,
+          Segments: ibSegments,
+          FreeBaggage: ibFreeBaggage,
           ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
+          ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
         };
         ibResult = await ticketLCC(ibPayload) as any;
 
@@ -1029,6 +1058,7 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
           ibResult = await ticketLCC({
             ...ibPayload,
             Passengers: ibPassengersNoMeal,
+            FreeBaggage: [],
           }) as any;
         }
 
@@ -1099,7 +1129,12 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
     }
 
     // ── One-way LCC (existing logic) ──
-    let result = await ticketLCC(req.body) as any;
+    let result = await ticketLCC({
+      ...req.body,
+      isInternational: lccIsInternational,
+      Segments: lccSegments,
+      FreeBaggage: lccFreeBaggage,
+    }) as any;
 
     // Retry without meals/baggage if TBO rejects meal data
     const onewayErr = result?.Response?.Error?.ErrorMessage
@@ -1116,6 +1151,9 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
       result = await ticketLCC({
         ...req.body,
         Passengers: passengersNoMeal,
+        isInternational: lccIsInternational,
+        Segments: lccSegments,
+        FreeBaggage: [],
       }) as any;
     }
 
