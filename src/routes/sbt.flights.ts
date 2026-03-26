@@ -64,6 +64,32 @@ function resolveCaseLabel(params: {
   return "Case_Unknown";
 }
 
+/* ── TBO pre-booking validation (seat/meal/PAN/passport) ─────────────── */
+function validateTBOBookingRequirements(
+  fareResults: any,
+  passengers: any[],
+): string | null {
+  // Seat mandatory (e.g. SpiceMax, Super6E)
+  if (fareResults?.isseatmandatory && !passengers.some((p: any) => p.SeatDynamic?.length || p.SeatPreference?.length)) {
+    return "Seat selection is mandatory for this fare type (e.g. SpiceMax/Super6E)";
+  }
+  // Meal mandatory
+  if (fareResults?.ismealmandatory && !passengers.some((p: any) => p.MealDynamic?.length)) {
+    return "Meal selection is mandatory for this fare type";
+  }
+  // PAN / Passport per passenger
+  for (const pax of passengers) {
+    const name = `${pax.FirstName || ""} ${pax.LastName || ""}`.trim();
+    if (fareResults?.IsPanRequiredAtBook && !pax.PAN) {
+      return `PAN required for passenger: ${name}`;
+    }
+    if (fareResults?.IsPassportRequiredAtBook && !pax.PassportNo) {
+      return `Passport required for passenger: ${name}`;
+    }
+  }
+  return null;
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 function loadJson<T>(filename: string): T {
   const file = path.join(__dirname, "../data", filename);
@@ -542,8 +568,14 @@ router.post("/farequote", async (req: any, res: any) => {
         },
       });
     }
-    const result = await getFareQuote(req.body);
-    res.json(result);
+    const result = await getFareQuote(req.body) as any;
+    const fareResults = result?.Response?.Results;
+    res.json({
+      ...result,
+      isPriceChanged: fareResults?.IsPriceChanged || false,
+      isTimeChanged: fareResults?.IsTimeChanged || false,
+      flightDetailChangeInfo: fareResults?.FlightDetailChangeInfo || null,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -607,6 +639,12 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
         code: "LCC_USE_TICKET",
       });
     }
+
+    // Validate seat/meal/PAN/passport requirements from stored FareQuote
+    const bookFareResults = req.body?.fareQuoteResults || req.body?.fareResults;
+    const bookPassengers: any[] = req.body?.Passengers ?? [];
+    const bookValErr = validateTBOBookingRequirements(bookFareResults, bookPassengers);
+    if (bookValErr) return res.status(400).json({ error: bookValErr });
 
     // NDC detection — primary signal is req.body.isNDC (set by frontend),
     // airlineCode is secondary insurance
@@ -783,6 +821,12 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
       hasReturnResultIndex: !!returnResultIndex,
       isNDC: ticketIsNDC,
     });
+
+    // Validate seat/meal/PAN/passport requirements from stored FareQuote
+    const lccFareResults = req.body?.fareQuoteResults || req.body?.fareResults;
+    const lccPassengers: any[] = req.body?.Passengers ?? [];
+    const lccValErr = validateTBOBookingRequirements(lccFareResults, lccPassengers);
+    if (lccValErr) return res.status(400).json({ error: lccValErr });
 
     // Convert SeatPreference → SeatDynamic if frontend sent old format
     function convertSeatPreferences(passengers: any[]) {

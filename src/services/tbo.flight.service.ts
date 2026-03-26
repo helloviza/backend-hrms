@@ -1,4 +1,4 @@
-import { getTBOToken, getTokenAcquiredAt } from "./tbo.auth.service.js";
+import { getTBOToken, getTokenAcquiredAt, clearTBOToken } from "./tbo.auth.service.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
 
 /* ── NDC airline detection ──────────────────────────────────────────────────── */
@@ -132,9 +132,9 @@ const FLIGHT_BASE =
   process.env.TBO_FLIGHT_BASE_URL ||
   "http://api.tektravels.com/BookingEngineService_Air/AirService.svc/rest";
 
-const TIMEOUT = Number(process.env.TBO_HTTP_TIMEOUT_MS || 90_000);
+const TIMEOUT = Number(process.env.TBO_HTTP_TIMEOUT_MS || 300_000);
 
-async function post(path: string, body: object) {
+async function post(path: string, body: object, _retried = false): Promise<unknown> {
   const method = path.replace(/^\//, ""); // "/FareQuote" → "FareQuote"
   const traceId = (body as any)?.TraceId || undefined;
 
@@ -162,6 +162,16 @@ async function post(path: string, body: object) {
 
     // Fire-and-forget file log — never awaited to avoid slowing the flow
     logTBOCall({ method, traceId, request: body, response: json, durationMs });
+
+    // ErrorCode 6 = invalid/expired token — clear cache and retry once with fresh token
+    const errCode = (json as any)?.Response?.Error?.ErrorCode;
+    if (errCode === 6 && !_retried) {
+      console.warn(`[TBO] ErrorCode 6 on ${method} — clearing token and retrying`);
+      clearTBOToken();
+      const freshToken = await getTBOToken({ forceRefresh: true });
+      const retryBody = { ...body, TokenId: freshToken };
+      return post(path, retryBody, true);
+    }
 
     return json;
   } finally {
