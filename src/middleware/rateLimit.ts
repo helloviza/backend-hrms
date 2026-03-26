@@ -13,7 +13,7 @@ export const apiLimiter = rateLimit({
 // Auth limiter — login, register, forgot-password
 export const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: 200,
   keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
   standardHeaders: true,
   legacyHeaders: false,
