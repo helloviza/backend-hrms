@@ -13,7 +13,8 @@ export function hashToken(token: string) {
 
 export function signEmailActionToken(
   payload: Record<string, any>,
-  expiresIn: NonNullable<SignOptions["expiresIn"]> = "48h"
+  // Default 12h — configurable per workspace
+  expiresIn: NonNullable<SignOptions["expiresIn"]> = "12h"
 ) {
   const options: SignOptions = { expiresIn };
   return jwt.sign(payload, SECRET, options);

@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
+import { requireTravelMode } from "../middleware/travelModeGuard.js";
 
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import TravelBooking from "../models/TravelBooking.js";
@@ -303,7 +304,7 @@ function buildAdminApprovedQueryFromParams(req: AnyObj) {
  * POST /api/approvals/requests
  * ──────────────────────────────────────────────────────────────── */
 
-router.post("/requests", requireAuth, async (req: AnyObj, res, next) => {
+router.post("/requests", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     const user = req.user;
     const sub = String(user?.sub || user?._id || "");
@@ -513,7 +514,7 @@ router.post("/requests", requireAuth, async (req: AnyObj, res, next) => {
   }
 });
 
-router.get("/requests/mine", requireAuth, async (req: AnyObj, res, next) => {
+router.get("/requests/mine", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     // SBT users must not access approval flow
     const sbtUser = await User.findById(req.user?.sub || req.user?._id).select("sbtEnabled").lean();
@@ -541,7 +542,7 @@ router.get("/requests/mine", requireAuth, async (req: AnyObj, res, next) => {
   }
 });
 
-router.get("/requests/inbox", requireAuth, async (req: AnyObj, res, next) => {
+router.get("/requests/inbox", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     // SBT users must not access approval flow
     const sbtUser = await User.findById(req.user?.sub || req.user?._id).select("sbtEnabled").lean();
@@ -651,7 +652,7 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
   }
 });
 
-router.put("/requests/:id/action", requireAuth, async (req: AnyObj, res, next) => {
+router.put("/requests/:id/action", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     const id = String(req.params.id || "");
     const sub = String(req.user?.sub || req.user?._id || "");

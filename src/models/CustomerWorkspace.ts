@@ -23,6 +23,26 @@ export interface CustomerWorkspaceDocument extends Document {
 
   travelMode: "SBT" | "FLIGHTS_ONLY" | "HOTELS_ONLY" | "BOTH" | "APPROVAL_FLOW";
 
+  config: {
+    travelFlow: "SBT" | "APPROVAL_FLOW" | "APPROVAL_DIRECT" | "HYBRID";
+    approval: {
+      requireL2: boolean;
+      requireL0: boolean;
+      requireProposal: boolean;
+    };
+    tokenExpiryHours: number;
+    features: {
+      sbtEnabled: boolean;
+      approvalFlowEnabled: boolean;
+      approvalDirectEnabled: boolean;
+      flightBookingEnabled: boolean;
+      hotelBookingEnabled: boolean;
+      visaEnabled: boolean;
+      miceEnabled: boolean;
+      forexEnabled: boolean;
+    };
+  };
+
   status: "ACTIVE" | "INACTIVE" | "DELETED";
 
   createdAt?: Date;
@@ -50,6 +70,26 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
     userCreationAllowlistUpdatedAt: { type: Date },
 
     travelMode: { type: String, enum: ["SBT", "FLIGHTS_ONLY", "HOTELS_ONLY", "BOTH", "APPROVAL_FLOW"], default: "APPROVAL_FLOW" },
+
+    config: {
+      travelFlow: { type: String, enum: ["SBT", "APPROVAL_FLOW", "APPROVAL_DIRECT", "HYBRID"], default: "APPROVAL_FLOW" },
+      approval: {
+        requireL2: { type: Boolean, default: true },
+        requireL0: { type: Boolean, default: false },
+        requireProposal: { type: Boolean, default: true },
+      },
+      tokenExpiryHours: { type: Number, default: 12 },
+      features: {
+        sbtEnabled: { type: Boolean, default: false },
+        approvalFlowEnabled: { type: Boolean, default: true },
+        approvalDirectEnabled: { type: Boolean, default: false },
+        flightBookingEnabled: { type: Boolean, default: true },
+        hotelBookingEnabled: { type: Boolean, default: true },
+        visaEnabled: { type: Boolean, default: false },
+        miceEnabled: { type: Boolean, default: false },
+        forexEnabled: { type: Boolean, default: false },
+      },
+    },
 
     status: { type: String, default: "ACTIVE", index: true },
   },

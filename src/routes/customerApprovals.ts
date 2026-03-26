@@ -4,8 +4,10 @@ import requireAuth from "../middleware/auth.js";
 import User from "../models/User.js";
 import MasterData from "../models/MasterData.js";
 import CustomerApprovalRequest from "../models/CustomerApprovalRequest.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { requireCustomer, requireHrmsAdmin, resolveCustomerWorkspaceId, assertWorkspaceEmailAllowed } from "../middleware/customerApprovalGuard.js";
 import { hashToken, signEmailActionToken, verifyEmailActionToken } from "../utils/emailActionToken.js";
+import { requireTravelMode } from "../middleware/travelModeGuard.js";
 
 const r = Router();
 
@@ -44,7 +46,7 @@ function generateTicketId(prefix = "PTS") {
 POST /api/customer-approvals/submit
 body: { cartItems:[], comments?:string, approverUserId?:string }
 */
-r.post("/submit", requireAuth, requireCustomer, async (req: any, res, next) => {
+r.post("/submit", requireAuth, requireCustomer, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: any, res, next) => {
   try {
     const cartItems = Array.isArray(req.body?.cartItems) ? req.body.cartItems : [];
     const comments = String(req.body?.comments || "").trim();
@@ -109,11 +111,15 @@ r.post("/submit", requireAuth, requireCustomer, async (req: any, res, next) => {
       wid: String(workspaceId),
     };
 
-    const approveToken = signEmailActionToken({ ...basePayload, act: "approved" }, "48h");
-    const declineToken = signEmailActionToken({ ...basePayload, act: "declined" }, "48h");
-    const holdToken = signEmailActionToken({ ...basePayload, act: "on_hold" }, "48h");
+    const wsDoc: any = await CustomerWorkspace.findOne({ customerId: String(workspaceId) }).select("config").lean();
+    const tokenExpiryHours: number = wsDoc?.config?.tokenExpiryHours ?? 12;
+    const tokenExpiry = `${tokenExpiryHours}h` as const;
 
-    const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
+    const approveToken = signEmailActionToken({ ...basePayload, act: "approved" }, tokenExpiry);
+    const declineToken = signEmailActionToken({ ...basePayload, act: "declined" }, tokenExpiry);
+    const holdToken = signEmailActionToken({ ...basePayload, act: "on_hold" }, tokenExpiry);
+
+    const expiresAt = new Date(Date.now() + tokenExpiryHours * 60 * 60 * 1000);
 
     await CustomerApprovalRequest.updateOne(
       { _id: doc._id },
@@ -145,7 +151,7 @@ r.post("/submit", requireAuth, requireCustomer, async (req: any, res, next) => {
           <a href="${holdUrl}" style="padding:10px 14px;border-radius:10px;background:#f59e0b;color:#111;text-decoration:none;font-weight:700">Put On Hold</a>
           <a href="${declineUrl}" style="padding:10px 14px;border-radius:10px;background:#dc2626;color:#fff;text-decoration:none;font-weight:700">Decline</a>
         </div>
-        <p style="color:#64748b;margin-top:12px">Links expire in 48 hours.</p>
+        <p style="color:#64748b;margin-top:12px">Links expire in ${tokenExpiryHours} hours.</p>
       </div>
     `;
 
@@ -177,7 +183,7 @@ r.get("/approver/inbox", requireAuth, requireCustomer, async (req: any, res, nex
 PUT /api/customer-approvals/:id/approver/action
 body: { action: "approved"|"declined"|"on_hold", comment? }
 */
-r.put("/:id/approver/action", requireAuth, requireCustomer, async (req: any, res, next) => {
+r.put("/:id/approver/action", requireAuth, requireCustomer, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: any, res, next) => {
   try {
     if (!hasRole(req.user, "CUSTOMER_APPROVER")) {
       return res.status(403).json({ error: "Approver access required" });

@@ -7,6 +7,7 @@ import fs from "fs";
 import path from "path";
 
 import { requireAuth } from "../middleware/auth.js";
+import { requireTravelMode } from "../middleware/travelModeGuard.js";
 import Proposal from "../models/Proposal.js";
 import ApprovalRequest, { type ApprovalStage } from "../models/ApprovalRequest.js";
 
@@ -1233,7 +1234,7 @@ router.get("/by-request/:requestId", requireAnyAuth, requireStaff, async (req: R
 /**
  * POST /api/proposals/by-request/:requestId/draft (staff-only)
  */
-router.post("/by-request/:requestId/draft", requireAnyAuth, requireStaff, async (req: Request, res: Response, next: NextFunction) => {
+router.post("/by-request/:requestId/draft", requireAnyAuth, requireStaff, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1341,7 +1342,7 @@ router.put("/:id", requireAnyAuth, requireStaff, async (req: Request, res: Respo
  * - Sets status SUBMITTED
  * - Sends email to L2 with token actions
  */
-router.post("/:id/submit", requireAnyAuth, requireStaff, async (req: Request, res: Response, next: NextFunction) => {
+router.post("/:id/submit", requireAnyAuth, requireStaff, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1668,7 +1669,7 @@ router.post(
 /**
  * POST /api/proposals/:id/decide (existing UI decisions)
  */
-router.post("/:id/decide", requireAnyAuth, requireProposalViewer, async (req: Request, res: Response, next: NextFunction) => {
+router.post("/:id/decide", requireAnyAuth, requireProposalViewer, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1758,7 +1759,7 @@ router.post("/:id/decide", requireAnyAuth, requireProposalViewer, async (req: Re
 /**
  * ✅ POST /api/proposals/:id/action (customer action)
  */
-router.post("/:id/action", requireAnyAuth, requireProposalViewer, async (req: Request, res: Response, next: NextFunction) => {
+router.post("/:id/action", requireAnyAuth, requireProposalViewer, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 

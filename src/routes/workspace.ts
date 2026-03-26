@@ -478,4 +478,155 @@ router.post("/logo", logoMimeGuard, upload.single("logo"), async (req: AnyObj, r
   res.json({ ok: true, logoUrl });
 });
 
+/* -------------------------------------------------------------------------- */
+/* Workspace config (travelFlow / features / approval)                        */
+/* -------------------------------------------------------------------------- */
+
+const SBT_MODES = new Set(["SBT", "FLIGHTS_ONLY", "HOTELS_ONLY", "BOTH"]);
+
+function deriveConfigFromLegacy(travelMode: string | undefined) {
+  const mode = travelMode || "APPROVAL_FLOW";
+  const isSBT = SBT_MODES.has(mode);
+  return {
+    travelFlow: isSBT ? "SBT" : "APPROVAL_FLOW",
+    approval: { requireL2: true, requireL0: false, requireProposal: true },
+    tokenExpiryHours: 12,
+    features: {
+      sbtEnabled: isSBT,
+      approvalFlowEnabled: !isSBT,
+      approvalDirectEnabled: false,
+      flightBookingEnabled: true,
+      hotelBookingEnabled: true,
+      visaEnabled: false,
+      miceEnabled: false,
+      forexEnabled: false,
+    },
+  };
+}
+
+/**
+ * GET /api/v1/workspace/config
+ * Returns workspace config for the current user's workspace.
+ */
+router.get("/config", async (req: AnyObj, res) => {
+  const user = requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const scope = await resolveWorkspaceScope(user, req);
+    const customerId = scope.customerId || scope.scopeId;
+
+    if (scope.scopeType !== "CUSTOMER" || !customerId) {
+      return res.status(400).json({ error: "No customer workspace found" });
+    }
+
+    const ws: any = await CustomerWorkspace.findOne({ customerId }).lean();
+    if (!ws) {
+      return res.status(404).json({ error: "Workspace not configured" });
+    }
+
+    // Use config subdocument if present, otherwise derive from legacy travelMode
+    const config = ws.config?.travelFlow
+      ? ws.config
+      : deriveConfigFromLegacy(ws.travelMode);
+
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, customerId, config });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to read workspace config", detail: err?.message });
+  }
+});
+
+const VALID_TRAVEL_FLOWS = ["SBT", "APPROVAL_FLOW", "APPROVAL_DIRECT", "HYBRID"];
+
+const FLOW_TO_FEATURES: Record<string, { sbtEnabled: boolean; approvalFlowEnabled: boolean; approvalDirectEnabled: boolean }> = {
+  SBT:              { sbtEnabled: true,  approvalFlowEnabled: false, approvalDirectEnabled: false },
+  APPROVAL_FLOW:    { sbtEnabled: false, approvalFlowEnabled: true,  approvalDirectEnabled: false },
+  APPROVAL_DIRECT:  { sbtEnabled: false, approvalFlowEnabled: false, approvalDirectEnabled: true  },
+  HYBRID:           { sbtEnabled: true,  approvalFlowEnabled: true,  approvalDirectEnabled: false },
+};
+
+const FLOW_TO_LEGACY: Record<string, string> = {
+  SBT:             "SBT",
+  APPROVAL_FLOW:   "APPROVAL_FLOW",
+  APPROVAL_DIRECT: "APPROVAL_FLOW",
+  HYBRID:          "BOTH",
+};
+
+/**
+ * PATCH /api/v1/workspace/config/travel-flow
+ * Admin-only: update workspace travelFlow + sync features + bulk-update users.
+ * Body: { customerId, travelFlow }
+ */
+router.patch("/config/travel-flow", async (req: AnyObj, res) => {
+  const user = requireAuth(req, res);
+  if (!user) return;
+
+  // Admin-only
+  const roles = roleList(user);
+  if (!roles.includes("SUPERADMIN") && !roles.includes("ADMIN")) {
+    return res.status(403).json({ error: "Admin access required" });
+  }
+
+  try {
+    const travelFlow = safeStr(req.body?.travelFlow);
+    const customerId = safeStr(req.body?.customerId);
+
+    if (!VALID_TRAVEL_FLOWS.includes(travelFlow)) {
+      return res.status(400).json({ error: `travelFlow must be one of: ${VALID_TRAVEL_FLOWS.join(", ")}` });
+    }
+    if (!customerId) {
+      return res.status(400).json({ error: "customerId is required" });
+    }
+
+    const ws: any = await CustomerWorkspace.findOne({ customerId });
+    if (!ws) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
+
+    // Update config.travelFlow and config.features
+    const featureUpdate = FLOW_TO_FEATURES[travelFlow];
+    if (!ws.config) {
+      ws.config = deriveConfigFromLegacy(ws.travelMode);
+    }
+    ws.config.travelFlow = travelFlow;
+    ws.config.features.sbtEnabled = featureUpdate.sbtEnabled;
+    ws.config.features.approvalFlowEnabled = featureUpdate.approvalFlowEnabled;
+    ws.config.features.approvalDirectEnabled = featureUpdate.approvalDirectEnabled;
+
+    // Keep legacy travelMode in sync
+    ws.travelMode = FLOW_TO_LEGACY[travelFlow] || "APPROVAL_FLOW";
+
+    await ws.save();
+
+    // Bulk-update all workspace users
+    const members = await CustomerMember.find({ customerId }).lean().exec();
+    const memberEmails = members
+      .filter((m: any) => !!m.email)
+      .map((m: any) => normalizeEmail(m.email))
+      .filter(Boolean);
+
+    let updatedCount = 0;
+    if (memberEmails.length) {
+      if (featureUpdate.sbtEnabled) {
+        const result = await User.updateMany(
+          { email: { $in: memberEmails } },
+          { $set: { sbtEnabled: true, sbtBookingType: "both" } },
+        );
+        updatedCount = result.modifiedCount ?? 0;
+      } else {
+        const result = await User.updateMany(
+          { email: { $in: memberEmails } },
+          { $set: { sbtEnabled: false } },
+        );
+        updatedCount = result.modifiedCount ?? 0;
+      }
+    }
+
+    res.json({ ok: true, config: ws.config, travelFlow, updatedCount });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to update travel flow", detail: err?.message });
+  }
+});
+
 export default router;

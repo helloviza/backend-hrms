@@ -177,6 +177,17 @@ app.use("/api/auth", authLimiter);
 app.use("/api/sbt/flights/search", flightSearchLimiter);
 app.use("/api/sbt/hotels/search", hotelSearchLimiter);
 
+// Strip trailing slashes from all API routes
+app.use((req, res, next) => {
+  if (req.path !== '/' && req.path.endsWith('/')) {
+    const query = req.url.slice(req.path.length);
+    const safepath = req.path.slice(0, -1).replace(/\/+/g, '/');
+    res.redirect(301, safepath + query);
+    return;
+  }
+  next();
+});
+
 /**
  * No-store for fresh workflow data
  */
