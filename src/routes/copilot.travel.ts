@@ -4,6 +4,7 @@ import { Router } from "express";
 import { Types } from "mongoose";
 import crypto from "crypto";
 import { optionalAuth } from "../middleware/optionalAuth.js";
+import { requireAuth } from "../middleware/auth.js";
 import VideoAnalysis from "../models/VideoAnalysis.js";
 import { invokePluto } from "../utils/plutoInvoke.js";
 
@@ -38,6 +39,10 @@ import {
 } from "../services/flightService.js";
 
 import { searchFlights as tboSearchFlights } from "../services/tbo.flight.service.js";
+import SBTRequest from "../models/SBTRequest.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import User from "../models/User.js";
+import { sendMail } from "../utils/mailer.js";
 
 // ✅ VIDEO CONTEXT ADAPTER (AUTHORITATIVE)
 import {
@@ -427,46 +432,94 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
       Economy: 2, "Premium Economy": 3, Business: 4, First: 6,
     };
     const cabinClass = cabinClassMap[cabin as string] ?? 2;
+    const journeyType = tripType === "round-trip" && returnDate ? 2 : 1;
 
-    const { flights, traceId, source } = await searchFlightsTBOFirst({
-      origin: originIATA,
-      destination: destIATA,
-      departDate: date,
-      adults: Number(adults),
-      children: Number(children),
-      infants: Number(infants),
-      cabinClass,
-      serpApiSearch: process.env.SERPAPI_API_KEY
-        ? async () => {
-            const r = await searchFlightRoutes(originIATA, destIATA, date);
-            return r.flights || [];
-          }
-        : undefined,
-    });
+    // ── TBO Search (direct, no SerpAPI fallback) ──
+    let tboRaw: any;
+    try {
+      tboRaw = await tboSearchFlights({
+        origin: originIATA,
+        destination: destIATA,
+        departDate: date,
+        returnDate: journeyType === 2 ? returnDate : undefined,
+        adults: Number(adults),
+        children: Number(children),
+        infants: Number(infants),
+        JourneyType: journeyType as 1 | 2,
+        cabinClass,
+      });
+    } catch (err: any) {
+      console.error("[FlightSearch/POST] TBO error:", err.message);
+      return res.json({ ok: true, results: [], message: "No flights found" });
+    }
 
-    console.log(`[FlightSearch/POST] Found ${flights.length} flights via ${source}`);
+    const traceId = tboRaw?.Response?.TraceId || "";
+    const raw: any[] = tboRaw?.Response?.Results?.[0] || [];
 
-    const cheapest = flights.length
-      ? flights.reduce((a: any, b: any) => (a.fare?.total || 0) < (b.fare?.total || 0) ? a : b)
-      : null;
-    const fastest = flights.length
-      ? flights.reduce((a: any, b: any) => (a.duration || 9999) < (b.duration || 9999) ? a : b)
-      : null;
+    if (!Array.isArray(raw) || raw.length === 0) {
+      console.log("[FlightSearch/POST] TBO returned 0 results");
+      return res.json({ ok: true, results: [], traceId, message: "No flights found" });
+    }
 
-    return res.json({
-      ok:          true,
-      origin:      { iata: originIATA, city: toIATA(originIATA) },
-      destination: { iata: destIATA,   city: toIATA(destIATA)   },
-      date,
-      tripType,
-      pax:         { adults, children, infants },
-      cabin,
-      flights,
-      cheapest,
-      fastest,
-      traceId,
-      source,
-    });
+    const CABIN_LABELS: Record<number, string> = { 1: "All", 2: "Economy", 3: "Premium Economy", 4: "Business", 5: "Premium Business", 6: "First" };
+
+    const results = raw.slice(0, 10).map((r: any) => {
+      const segs: any[] = r.Segments?.[0] || [];
+      const first = segs[0];
+      const last  = segs[segs.length - 1];
+      if (!first) return null;
+
+      const airlineCode = first.Airline?.AirlineCode || "";
+      const depDt = new Date(first.Origin?.DepTime || "");
+      const arrDt = new Date(last.Destination?.ArrTime || "");
+      const totalMin = segs.reduce((s: number, seg: any) => s + (seg.Duration || 0), 0);
+      const h = Math.floor(totalMin / 60);
+      const m = totalMin % 60;
+
+      return {
+        ResultIndex: r.ResultIndex,
+        TraceId: traceId,
+        airline: {
+          name: first.Airline?.AirlineName || airlineCode,
+          code: airlineCode,
+          logo: `https://pics.avs.io/60/60/${airlineCode}.png`,
+        },
+        flightNo: `${airlineCode}-${first.Airline?.FlightNumber || ""}`,
+        origin: {
+          code: first.Origin?.Airport?.AirportCode || originIATA,
+          city: first.Origin?.Airport?.CityName || "",
+          terminal: first.Origin?.Airport?.Terminal || "",
+        },
+        destination: {
+          code: last.Destination?.Airport?.AirportCode || destIATA,
+          city: last.Destination?.Airport?.CityName || "",
+          terminal: last.Destination?.Airport?.Terminal || "",
+        },
+        departure: {
+          time: isNaN(depDt.getTime()) ? "" : depDt.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true }),
+          date: isNaN(depDt.getTime()) ? "" : depDt.toISOString().slice(0, 10),
+        },
+        arrival: {
+          time: isNaN(arrDt.getTime()) ? "" : arrDt.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true }),
+          date: isNaN(arrDt.getTime()) ? "" : arrDt.toISOString().slice(0, 10),
+        },
+        duration: `${h}h ${m}m`,
+        stops: segs.length - 1,
+        fare: {
+          published: r.Fare?.PublishedFare || 0,
+          offered: r.Fare?.OfferedFare || r.Fare?.PublishedFare || 0,
+          currency: r.Fare?.Currency || "INR",
+        },
+        cabin: CABIN_LABELS[first.CabinClass] || cabin,
+        baggage: first.Baggage || "",
+        isLCC: r.IsLCC ?? false,
+        isRefundable: !(r.NonRefundable ?? true),
+      };
+    }).filter(Boolean);
+
+    console.log(`[FlightSearch/POST] TBO returned ${results.length} results (traceId: ${traceId.slice(0, 8)}…)`);
+
+    return res.json({ ok: true, results, traceId });
 
   } catch (err: any) {
     console.error("[FlightSearch/POST] Error:", err.message);
@@ -1271,6 +1324,121 @@ ${prompt}
       ok: false,
       message: err?.message || "Failed to generate travel response",
     });
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
+ * POST /raise-request — Concierge → SBT request pipeline
+ * ──────────────────────────────────────────────────────────────── */
+router.post("/raise-request", requireAuth, async (req: any, res: any) => {
+  try {
+    const user = req.user;
+    if (!user?._id) return res.status(401).json({ error: "Unauthorized" });
+
+    const { flightData, passengers, notes } = req.body;
+
+    if (!flightData || !flightData.ResultIndex || !flightData.TraceId) {
+      return res.status(400).json({
+        error: "flightData with ResultIndex and TraceId is required",
+      });
+    }
+
+    // Resolve workspace
+    const workspace = user.customerId
+      ? await CustomerWorkspace.findById(user.customerId).lean() as any
+      : null;
+
+    if (!workspace) {
+      return res.status(400).json({
+        error: "No workspace found for your account",
+      });
+    }
+
+    // Resolve assigned booker — workspace defaultApproverEmails → find User → _id
+    let assignedBookerId: string | null = null;
+    const approverEmails: string[] = workspace.defaultApproverEmails || [];
+
+    if (approverEmails.length > 0) {
+      const approver = await User.findOne({
+        email: { $in: approverEmails.map((e: string) => e.toLowerCase()) },
+      }).select("_id name email").lean() as any;
+      if (approver) assignedBookerId = approver._id;
+    }
+
+    // Fallback: workspace leader
+    if (!assignedBookerId) {
+      const leader = await User.findOne({
+        customerId: workspace._id,
+        roles: { $in: ["WORKSPACE_LEADER"] },
+        _id: { $ne: user._id },
+      }).select("_id name email").lean() as any;
+      if (leader) assignedBookerId = leader._id;
+    }
+
+    if (!assignedBookerId) {
+      return res.status(400).json({
+        error: "No approver/booker configured for this workspace. Contact your admin.",
+      });
+    }
+
+    // Build searchParams from flightData for SBTRequest compatibility
+    const searchParams = {
+      origin: flightData.origin?.code || "",
+      destination: flightData.destination?.code || "",
+      departDate: flightData.departure?.date || "",
+      cabin: flightData.cabin || "Economy",
+      source: "CONCIERGE",
+    };
+
+    const request = await SBTRequest.create({
+      customerId: workspace._id,
+      requesterId: user._id,
+      assignedBookerId,
+      type: "flight",
+      searchParams,
+      selectedOption: flightData,
+      requesterNotes: notes || null,
+      passengerDetails: passengers || [],
+      contactDetails: { email: user.email },
+      status: "PENDING",
+    });
+
+    // Send email to assigned booker
+    const booker = await User.findById(assignedBookerId)
+      .select("name email").lean() as any;
+
+    if (booker?.email) {
+      const route = `${flightData.origin?.code || "?"} → ${flightData.destination?.code || "?"}`;
+      const date = flightData.departure?.date || "";
+      const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
+
+      await sendMail({
+        to: booker.email,
+        subject: `New Concierge Flight Request from ${user.name || user.email} — ${route}`,
+        kind: "REQUESTS",
+        html: `
+          <h3>New Flight Request (via Concierge)</h3>
+          <p><strong>From:</strong> ${user.name || user.email}</p>
+          <p><strong>Flight:</strong> ${flightData.airline?.name || ""} ${flightData.flightNo || ""}</p>
+          <p><strong>Route:</strong> ${route}</p>
+          ${date ? `<p><strong>Date:</strong> ${date}</p>` : ""}
+          <p><strong>Fare:</strong> ₹${(flightData.fare?.offered || flightData.fare?.published || 0).toLocaleString("en-IN")}</p>
+          ${notes ? `<p><strong>Notes:</strong> ${notes}</p>` : ""}
+          <p><a href="${frontendUrl}/sbt/inbox">View in Booking Inbox</a></p>
+        `,
+      }).catch((e: any) => console.warn("[Concierge] Failed to send request email:", e?.message));
+    }
+
+    console.log(`[Concierge/RaiseRequest] Created SBTRequest ${request._id} for ${user.email}`);
+
+    return res.status(201).json({
+      success: true,
+      requestId: request._id,
+      message: "Request raised successfully",
+    });
+  } catch (err: any) {
+    console.error("[Concierge/RaiseRequest] Error:", err.message);
+    return res.status(500).json({ error: "Failed to raise request" });
   }
 });
 
