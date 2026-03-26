@@ -255,7 +255,7 @@ async function safeMount(prefix: string, modulePath: string) {
  * ──────────────────────────────────────────────────────────────── */
 
 // Google Places
-app.use("/api", placesRouter);
+app.use("/api/places", placesRouter);
 
 // Proposals
 app.use("/api/proposals", proposalsRouter);
