@@ -137,6 +137,9 @@ app.use(
 // Security headers
 app.use(helmetMiddleware);
 
+// Handle preflight requests explicitly
+app.options("*", corsMiddleware);
+
 // CORS
 app.use(corsMiddleware);
 

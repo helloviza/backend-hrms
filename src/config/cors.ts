@@ -39,4 +39,6 @@ export const corsMiddleware = cors({
   ],
   exposedHeaders: ["X-Request-ID"],
   maxAge: 86400,
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
 });
