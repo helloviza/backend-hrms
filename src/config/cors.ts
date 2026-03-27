@@ -2,67 +2,41 @@
 import cors from "cors";
 import { env } from "./env.js";
 
-// FRONTEND_ORIGIN supports comma-separated list: "https://a.com,https://b.com"
-const allowedOrigins = [
+const ALLOWED_ORIGINS = [
+  "https://plumbox.plumtrips.com",
+  "https://hrms.plumtrips.com",
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "http://localhost:8080",
+  // Include any extra origins from FRONTEND_ORIGIN env var
   ...(env.FRONTEND_ORIGIN
     ? env.FRONTEND_ORIGIN.split(",").map((o) => o.trim()).filter(Boolean)
     : []),
-  ...(process.env.NODE_ENV !== "production"
-    ? [
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:5173",
-      ]
-    : []),
 ];
-
-const ALLOW_LIST = new Set<string>(allowedOrigins);
-const LOCAL_REGEX = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i;
-
-// Allow only hrms.plumtrips.com subdomains (not whole plumtrips.com)
-const PROD_SUBDOMAIN_REGEX = /^https:\/\/([a-z0-9-]+\.)?hrms\.plumtrips\.com$/i;
 
 export const corsMiddleware = cors({
   origin(origin, callback) {
-    // Server-to-server / curl often has no Origin
-    if (!origin) return callback(null, true);
-
-    // Sandboxed "null" origin — dev only
-    if (origin === "null" && process.env.NODE_ENV !== "production") {
+    // Allow requests with no origin (mobile apps, Postman in dev, server-to-server)
+    if (!origin) {
+      if (process.env.NODE_ENV === "production") {
+        return callback(new Error("Direct API access not allowed"), false);
+      }
       return callback(null, true);
     }
-
-    if (ALLOW_LIST.has(origin)) {
+    if (ALLOWED_ORIGINS.includes(origin)) {
       return callback(null, true);
     }
-
-    // Allow localhost pattern in dev only
-    if (process.env.NODE_ENV !== "production" && LOCAL_REGEX.test(origin)) {
-      return callback(null, true);
-    }
-
-    if (PROD_SUBDOMAIN_REGEX.test(origin)) {
-      return callback(null, true);
-    }
-
-    console.warn(`⚠️  CORS blocked origin: ${origin}`);
-    return callback(new Error(`CORS: Origin not allowed -> ${origin}`));
+    console.warn(`[CORS BLOCKED] Origin: ${origin}`);
+    return callback(new Error(`Origin ${origin} not allowed`), false);
   },
-
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
     "Authorization",
+    "X-Request-ID",
     "X-Requested-With",
-    "Accept",
-    // optional future-proofing
-    "X-CSRF-Token",
-    "X-Admin-Price-Key",
-    "X-Admin-Key",
   ],
-  exposedHeaders: ["Content-Disposition"],
-  optionsSuccessStatus: 200,
-  preflightContinue: false,
+  exposedHeaders: ["X-Request-ID"],
   maxAge: 86400,
 });

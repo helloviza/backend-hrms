@@ -140,6 +140,23 @@ app.use(helmetMiddleware);
 // CORS
 app.use(corsMiddleware);
 
+// Log suspicious requests
+app.use((req, res, next) => {
+  const suspicious = [
+    "/.env", "/wp-admin", "/phpmyadmin",
+    "/admin.php", "/.git", "/config",
+    "/shell", "/cmd", "/eval",
+  ];
+  const path = req.path.toLowerCase();
+  if (suspicious.some(s => path.includes(s))) {
+    console.warn(
+      `[SECURITY] Suspicious request blocked: ${req.method} ${req.path} IP: ${req.ip} UA: ${req.headers["user-agent"]}`
+    );
+    return res.status(404).json({ error: "Not found" });
+  }
+  next();
+});
+
 // Razorpay webhook — MUST be before express.json() to receive raw body
 import razorpayWebhookRouter from "./routes/razorpay.webhook.js";
 app.use("/api/webhooks", express.raw({ type: "application/json" }), razorpayWebhookRouter);

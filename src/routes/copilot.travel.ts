@@ -455,7 +455,6 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
 
     const traceId = tboRaw?.Response?.TraceId || "";
     const raw: any[] = tboRaw?.Response?.Results?.[0] || [];
-    console.log("[TBO FARE SAMPLE]", JSON.stringify(tboRaw?.Response?.Results?.[0]?.[0]?.Fare, null, 2));
 
     if (!Array.isArray(raw) || raw.length === 0) {
       console.log("[FlightSearch/POST] TBO returned 0 results");
