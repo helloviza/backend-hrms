@@ -5,6 +5,7 @@ import { Onboarding } from "../models/Onboarding.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRoles } from "../middleware/roles.js";
 import bcrypt from "bcryptjs";
+import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -357,6 +358,15 @@ r.post(
         if (!target) return res.status(404).json({ error: "User not found." });
         Object.assign(target, activation, ...(officialEmail ? [{ officialEmail }] : []));
         await (target as any).save();
+        const loginUrl = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
+        sendCredentialsEmail({
+          to: (target as any).officialEmail || (target as any).email,
+          name: (target as any).name || (target as any).email,
+          officialEmail: (target as any).officialEmail || (target as any).email,
+          tempPassword: password,
+          loginUrl,
+          employeeCode: (target as any).employeeCode || undefined,
+        }).catch(err => console.error("[grant-access] credentials email failed:", err));
         return res.json({
           success: true,
           user: { _id: target._id, name: (target as any).name, email: (target as any).email, roles: (target as any).roles },
@@ -391,6 +401,15 @@ r.post(
       if (existing) {
         Object.assign(existing, activation, ...(officialEmail ? [{ officialEmail }] : []));
         await (existing as any).save();
+        const loginUrlB = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
+        sendCredentialsEmail({
+          to: officialEmail || (existing as any).email,
+          name: (existing as any).name || (existing as any).email,
+          officialEmail: officialEmail || (existing as any).email,
+          tempPassword: password,
+          loginUrl: loginUrlB,
+          employeeCode: (existing as any).employeeCode || undefined,
+        }).catch(err => console.error("[grant-access] credentials email failed:", err));
         return res.json({
           success: true,
           user: { _id: existing._id, name: (existing as any).name, email: (existing as any).email, roles: (existing as any).roles },
@@ -398,6 +417,15 @@ r.post(
       }
 
       const newUser = await User.create({ name, email, isActive: true, ...activation, ...(officialEmail && { officialEmail }) });
+      const loginUrlC = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
+      sendCredentialsEmail({
+        to: (newUser as any).officialEmail || (newUser as any).email,
+        name: (newUser as any).name || (newUser as any).email,
+        officialEmail: (newUser as any).officialEmail || (newUser as any).email,
+        tempPassword: password,
+        loginUrl: loginUrlC,
+        employeeCode: (newUser as any).employeeCode || undefined,
+      }).catch(err => console.error("[grant-access] credentials email failed:", err));
 
       return res.status(201).json({
         success: true,

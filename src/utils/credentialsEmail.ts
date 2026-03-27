@@ -7,8 +7,12 @@ export function buildCredentialsHtml(opts: {
   officialEmail: string;
   tempPassword: string;
   loginUrl: string;
+  employeeCode?: string;
 }): string {
-  const { name, officialEmail, tempPassword, loginUrl } = opts;
+  const { name, officialEmail, tempPassword, loginUrl, employeeCode } = opts;
+  const employeeIdRow = employeeCode
+    ? `<tr><td style="padding:4px 0;font-weight:600;width:160px;">Employee ID</td><td style="padding:4px 0;">${employeeCode}</td></tr>`
+    : "";
   return `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width"/></head>
 <body style="margin:0;padding:0;background:#f4f6f8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
@@ -21,6 +25,7 @@ export function buildCredentialsHtml(opts: {
 <p style="margin:0 0 20px;font-size:14px;color:#334155;">Your HRMS account has been activated. Here are your login credentials:</p>
 <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:18px 20px;margin:0 0 20px;">
 <table cellpadding="0" cellspacing="0" style="width:100%;font-size:13px;color:#334155;">
+${employeeIdRow}
 <tr><td style="padding:4px 0;font-weight:600;width:160px;">Login URL</td><td style="padding:4px 0;"><a href="${loginUrl}" style="color:#00477f;text-decoration:underline;">${loginUrl}</a></td></tr>
 <tr><td style="padding:4px 0;font-weight:600;">Official Email (Login ID)</td><td style="padding:4px 0;">${officialEmail}</td></tr>
 <tr><td style="padding:4px 0;font-weight:600;">Temporary Password</td><td style="padding:4px 0;font-family:monospace;font-size:14px;color:#0f172a;font-weight:700;">${tempPassword}</td></tr>
@@ -44,6 +49,7 @@ export async function sendCredentialsEmail(opts: {
   officialEmail: string;
   tempPassword: string;
   loginUrl: string;
+  employeeCode?: string;
 }): Promise<void> {
   const html = buildCredentialsHtml(opts);
   await sendMail({
