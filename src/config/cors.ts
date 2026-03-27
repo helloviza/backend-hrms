@@ -16,13 +16,8 @@ const ALLOWED_ORIGINS = [
 
 export const corsMiddleware = cors({
   origin(origin, callback) {
-    // Allow requests with no origin (mobile apps, Postman in dev, server-to-server)
-    if (!origin) {
-      if (process.env.NODE_ENV === "production") {
-        return callback(new Error("Direct API access not allowed"), false);
-      }
-      return callback(null, true);
-    }
+    // Allow no-origin requests (health checks, server-to-server, mobile apps)
+    if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) {
       return callback(null, true);
     }
