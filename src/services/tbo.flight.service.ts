@@ -381,9 +381,11 @@ function sanitizeTitle(title: string): string {
   return titleMap[upper] || "Mr";
 }
 
-function sanitizeContactNo(raw: string | undefined): string {
+function sanitizeContactNo(raw: string | undefined, isLeadPax?: boolean): string {
   const digits = (raw || "").replace(/\D/g, "").slice(-10);
-  return digits.length >= 10 ? digits : "9999999999";
+  if (digits.length >= 10) return digits;
+  if (isLeadPax) throw new Error("Valid 10-digit phone number is required for lead passenger");
+  throw new Error("Valid 10-digit phone number is required for passenger contact");
 }
 
 function sanitizePassportDate(dateStr: string | undefined): string {
@@ -400,9 +402,9 @@ function sanitizePassportDate(dateStr: string | undefined): string {
 }
 
 function sanitizeDOB(dob: string | undefined, paxType: number): string {
-  if (!dob) {
-    if (paxType === 2) return "2015-01-01T00:00:00";
-    if (paxType === 3) return "2024-01-01T00:00:00";
+  if (!dob || !dob.trim()) {
+    if (paxType === 2) throw new Error("Date of birth is required for Child passengers");
+    if (paxType === 3) throw new Error("Date of birth is required for Infant passengers");
     return "";
   }
   // Already ISO: "1990-01-01T00:00:00" or "1990-01-01"
@@ -419,10 +421,65 @@ function sanitizeDOB(dob: string | undefined, paxType: number): string {
     const [day, month, year] = dob.split("-");
     return `${year}-${month}-${day}T00:00:00`;
   }
-  // Fallback defaults
-  if (paxType === 2) return "2015-01-01T00:00:00";
-  if (paxType === 3) return "2024-01-01T00:00:00";
+  // Unparseable DOB — hard-reject for child/infant, allow empty for adult
+  if (paxType === 2) throw new Error("Invalid date of birth format for Child passenger");
+  if (paxType === 3) throw new Error("Invalid date of birth format for Infant passenger");
   return "";
+}
+
+/* ── Airline-specific pre-booking validations ──────────────────────────────── */
+
+const SPICEJET_GULF_DESTINATIONS = new Set(["DXB", "RUH", "SHJ"]);
+const NEPAL_DESTINATIONS = new Set(["KTM"]);
+
+function validateAirlineSpecific(
+  airlineCode: string,
+  passengers: Array<Record<string, any>>,
+  destinationCode: string,
+): void {
+  const code = (airlineCode || "").toUpperCase();
+
+  // AirAsia (I5 = AirAsia India, AK = AirAsia): first passenger must have CountryCode + CountryName
+  if (code === "I5" || code === "AK") {
+    const firstPax = passengers[0];
+    if (firstPax && (!firstPax.CountryCode || !firstPax.CountryName)) {
+      throw new Error("AirAsia requires CountryCode and CountryName for the first passenger");
+    }
+  }
+
+  // SpiceJet (SG): FirstName and LastName must be distinct
+  if (code === "SG") {
+    for (const pax of passengers) {
+      const first = (pax.FirstName || "").trim().toUpperCase();
+      const last = (pax.LastName || "").trim().toUpperCase();
+      if (first && last && first === last) {
+        throw new Error(`SpiceJet requires First Name and Last Name to be different for passenger: ${pax.FirstName} ${pax.LastName}`);
+      }
+    }
+  }
+
+  const dest = (destinationCode || "").toUpperCase();
+
+  // SpiceJet Gulf routes (Dubai/Riyadh/Sharjah): passport mandatory for all pax
+  if (code === "SG" && SPICEJET_GULF_DESTINATIONS.has(dest)) {
+    for (const pax of passengers) {
+      if (!pax.PassportNo) {
+        const name = `${pax.FirstName || ""} ${pax.LastName || ""}`.trim();
+        throw new Error(`Passport is mandatory for SpiceJet Gulf route (${dest}) — missing for: ${name}`);
+      }
+    }
+  }
+
+  // SpiceJet/IndiGo to Nepal (KTM): passport mandatory for Adult + Child
+  if ((code === "SG" || code === "6E") && NEPAL_DESTINATIONS.has(dest)) {
+    for (const pax of passengers) {
+      const paxType = Number(pax.PaxType) || 1;
+      if ((paxType === 1 || paxType === 2) && !pax.PassportNo) {
+        const name = `${pax.FirstName || ""} ${pax.LastName || ""}`.trim();
+        throw new Error(`Passport is mandatory for ${code === "SG" ? "SpiceJet" : "IndiGo"} flights to Nepal — missing for: ${name}`);
+      }
+    }
+  }
 }
 
 export async function bookFlight(params: {
@@ -439,6 +496,8 @@ export async function bookFlight(params: {
   }>;
   isPassportFullDetailRequired?: boolean;
   isNDC?: boolean;
+  airlineCode?: string;
+  destinationCode?: string;
   IsGSTMandatory?: boolean;
   GSTCompanyInfo?: {
     GSTCompanyName: string;
@@ -498,14 +557,14 @@ export async function bookFlight(params: {
       })(),
       PassportNo: p.PassportNo || "",
       PassportExpiry: sanitizePassportDate(p.PassportExpiry),
-      PassportIssueCountryCode: "IN",
+      PassportIssueCountryCode: p.PassportIssueCountryCode || p.passportIssueCountry || "IN",
       Nationality: p.Nationality || "IN",
       AddressLine1: p.AddressLine1 || "India",
       AddressLine2: p.AddressLine2 || "",
       City: p.City || "Delhi",
       CountryCode: p.CountryCode || "IN",
       CountryName: p.CountryName || "India",
-      ContactNo: sanitizeContactNo(p.ContactNo),
+      ContactNo: sanitizeContactNo(p.ContactNo, p.IsLeadPax),
       Email: ndcMode ? (p.Email || leadEmail) : leadEmail,
       IsLeadPax: p.IsLeadPax ?? false,
       FFAirlineCode: p.FFAirlineCode || null,
@@ -568,6 +627,11 @@ export async function bookFlight(params: {
     return pax;
   });
 
+  // Airline-specific validations (AirAsia, SpiceJet, etc.)
+  if (params.airlineCode) {
+    validateAirlineSpecific(params.airlineCode, sanitizedPassengers, params.destinationCode || "");
+  }
+
   const payload: Record<string, unknown> = {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
@@ -601,12 +665,12 @@ export async function ticketFlight(params: {
   // GDS Ticket requires only these 5 fields — NO Passengers array
   const gdsResult = await post("/Ticket", gdsPayload, false, FLIGHT_BOOK_BASE) as any;
 
-  // Auto-retry with IsPriceChangeAccepted if TBO signals price changed
+  // Auto-retry with IsPriceChangedAccepted if TBO signals price changed
   const gdsChanged = gdsResult?.Response?.IsPriceChanged === true
     || gdsResult?.Response?.Response?.IsPriceChanged === true;
   if (gdsChanged) {
-    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangeAccepted=true");
-    return post("/Ticket", { ...gdsPayload, IsPriceChangeAccepted: true }, false, FLIGHT_BOOK_BASE);
+    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangedAccepted=true");
+    return post("/Ticket", { ...gdsPayload, IsPriceChangedAccepted: true }, false, FLIGHT_BOOK_BASE);
   }
   return gdsResult;
 }
@@ -686,9 +750,11 @@ export async function ticketLCC(params: {
       PassportNo?: string;
     };
   }>;
-  IsPriceChangeAccepted?: boolean;
+  IsPriceChangedAccepted?: boolean;
   isNDC?: boolean;
   isInternational?: boolean;
+  airlineCode?: string;
+  destinationCode?: string;
   Segments?: Array<Array<{ Origin: { Airport: { CountryCode?: string } }; Destination: { Airport: { CountryCode?: string } } }>>;
   FreeBaggage?: Array<{ AirlineCode: string; FlightNumber: string; WayType: number; Code: string; Description: number; Weight: number; Currency: string; Price: number; Origin: string; Destination: string }>;
   IsGSTMandatory?: boolean;
@@ -739,7 +805,8 @@ export async function ticketLCC(params: {
       })(),
       PassportNo: p.PassportNo || "",
       PassportExpiry: sanitizePassportDate(p.PassportExpiry),
-      ContactNo: sanitizeContactNo(p.ContactNo),
+      PassportIssueCountryCode: p.PassportIssueCountryCode || p.passportIssueCountry || "IN",
+      ContactNo: sanitizeContactNo(p.ContactNo, p.IsLeadPax),
       Email: ndcMode ? (p.Email || lccLeadEmail) : (p.Email || ""),
       IsLeadPax: p.IsLeadPax ?? false,
       CountryCode: p.CountryCode || "IN",
@@ -877,13 +944,18 @@ export async function ticketLCC(params: {
     }
   }
 
+  // Airline-specific validations (AirAsia, SpiceJet, etc.)
+  if (params.airlineCode) {
+    validateAirlineSpecific(params.airlineCode, sanitizedPassengers, params.destinationCode || "");
+  }
+
   const payload: Record<string, unknown> = {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
     TraceId: params.TraceId,
     ResultIndex: params.ResultIndex,
     Passengers: sanitizedPassengers,
-    IsPriceChangeAccepted: params.IsPriceChangeAccepted ?? false,
+    IsPriceChangedAccepted: params.IsPriceChangedAccepted ?? false,
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
@@ -906,12 +978,12 @@ export async function ticketLCC(params: {
 
   const lccResult = await post("/Ticket", payload, false, FLIGHT_BOOK_BASE) as any;
 
-  // Auto-retry with IsPriceChangeAccepted if TBO signals price changed
+  // Auto-retry with IsPriceChangedAccepted if TBO signals price changed
   const lccChanged = lccResult?.Response?.IsPriceChanged === true
     || lccResult?.Response?.Response?.IsPriceChanged === true;
-  if (lccChanged && !payload.IsPriceChangeAccepted) {
-    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangeAccepted=true");
-    return post("/Ticket", { ...payload, IsPriceChangeAccepted: true }, false, FLIGHT_BOOK_BASE);
+  if (lccChanged && !payload.IsPriceChangedAccepted) {
+    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangedAccepted=true");
+    return post("/Ticket", { ...payload, IsPriceChangedAccepted: true }, false, FLIGHT_BOOK_BASE);
   }
   return lccResult;
 }

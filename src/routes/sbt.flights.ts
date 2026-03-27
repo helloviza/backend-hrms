@@ -33,6 +33,82 @@ import { consolidateCertificationLogs } from "../services/tbo.log.consolidator.j
 
 const router = express.Router();
 
+/* ── Duplicate booking prevention (24-hour window) ─────────────────────── */
+async function checkDuplicateBooking(params: {
+  userId: string;
+  originCode: string;
+  destinationCode: string;
+  departureDate: string;
+  airlineCode: string;
+  flightNumber: string;
+  passengerNames: string[];
+}): Promise<string | null> {
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const existing = await SBTBooking.findOne({
+    userId: params.userId,
+    "origin.code": params.originCode,
+    "destination.code": params.destinationCode,
+    airlineCode: params.airlineCode,
+    flightNumber: params.flightNumber,
+    status: { $in: ["CONFIRMED", "PENDING"] },
+    createdAt: { $gte: cutoff },
+  }).lean();
+
+  if (!existing) return null;
+
+  // Check if at least one passenger name matches
+  const existingNames = ((existing as any).passengers || []).map(
+    (p: any) => `${(p.firstName || "").trim()} ${(p.lastName || "").trim()}`.toUpperCase()
+  );
+  const hasMatchingPax = params.passengerNames.some(
+    name => existingNames.includes(name.toUpperCase())
+  );
+  if (!hasMatchingPax) return null;
+
+  return `Potential duplicate booking detected — a ${(existing as any).status} booking for ${params.airlineCode} ${params.flightNumber} (${params.originCode}→${params.destinationCode}) was made within the last 24 hours (PNR: ${(existing as any).pnr || "pending"}). If this is intentional, cancel the previous booking first.`;
+}
+
+/* ── Timeout recovery: poll GetBookingDetails after TBO timeout ─────────── */
+async function pollBookingOnTimeout(
+  bookingId: string | undefined,
+  traceId: string | undefined,
+): Promise<{ found: boolean; data?: any }> {
+  if (!bookingId) return { found: false };
+
+  const MAX_POLLS = 5;
+  const POLL_INTERVAL_MS = 15_000;
+  const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+  for (let i = 0; i < MAX_POLLS; i++) {
+    if (i > 0) await delay(POLL_INTERVAL_MS);
+    try {
+      const details = await getBookingDetails({ bookingId: String(bookingId) }) as any;
+      const status = details?.Response?.ResponseStatus;
+      const innerStatus = details?.Response?.Response?.BookingStatus;
+
+      logTBOCall({
+        method: "GetBookingDetails_TimeoutPoll",
+        traceId: traceId || "timeout-recovery",
+        request: { BookingId: bookingId, pollAttempt: i + 1 },
+        response: details,
+      });
+
+      // BookingStatus 1 = Confirmed
+      if (status === 1 && innerStatus === 1) {
+        sbtLogger.info("Timeout recovery: booking confirmed via polling", { bookingId, pollAttempt: i + 1 });
+        return { found: true, data: details };
+      }
+    } catch (pollErr: any) {
+      sbtLogger.warn("Timeout recovery poll failed", { bookingId, pollAttempt: i + 1, error: pollErr?.message });
+    }
+  }
+  return { found: false };
+}
+
+function isTBOTimeoutError(err: any): boolean {
+  return err?.name === "AbortError" || err?.message?.includes("aborted") || err?.code === "ABORT_ERR";
+}
+
 /* ── Dynamic TBO certification case label ─────────────────────────────── */
 function resolveCaseLabel(params: {
   isLCC: boolean;
@@ -92,6 +168,31 @@ function validateTBOBookingRequirements(
     if (fareResults?.IsPassportRequiredAtBook) {
       if (!pax.PassportNo && !(paxType !== 1 && pax.guardianDetails?.PassportNo)) {
         return `Passport required for passenger: ${name}`;
+      }
+    }
+  }
+  return null;
+}
+
+/* ── TBO pre-ticket validation (PAN/passport at ticket time) ───────────── */
+function validateTBOTicketRequirements(
+  fareResults: any,
+  passengers: any[],
+): string | null {
+  for (const pax of passengers) {
+    const name = `${pax.FirstName || ""} ${pax.LastName || ""}`.trim();
+    const paxType = Number(pax.PaxType) || 1;
+    if (fareResults?.IsPanRequiredAtTicket) {
+      if (paxType === 1 && !pax.PAN) {
+        return `PAN required at ticketing for passenger: ${name}`;
+      }
+      if ((paxType === 2 || paxType === 3) && !pax.guardianDetails?.PAN) {
+        return `Guardian PAN required at ticketing for Child/Infant: ${name}`;
+      }
+    }
+    if (fareResults?.IsPassportRequiredAtTicket) {
+      if (!pax.PassportNo && !(paxType !== 1 && pax.guardianDetails?.PassportNo)) {
+        return `Passport required at ticketing for passenger: ${name}`;
       }
     }
   }
@@ -663,7 +764,23 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
     const bookIsNDC = isNDCFlight(bookAirlineCode, bookIsNDCFlag);
     if (bookIsNDC) console.log("[NDC BOOK]", bookAirlineCode);
 
-    const data = await bookFlight({ ...req.body, isNDC: bookIsNDC }) as any;
+    // Duplicate booking prevention (24hr window)
+    const userId = req.user?.id || req.user?._id;
+    if (userId && bookAirlineCode && req.body?.flightNumber) {
+      const paxNames = bookPassengers.map((p: any) => `${p.FirstName || ""} ${p.LastName || ""}`.trim());
+      const dupErr = await checkDuplicateBooking({
+        userId,
+        originCode: req.body?.originCode || "",
+        destinationCode: req.body?.destinationCode || "",
+        departureDate: req.body?.departureDate || "",
+        airlineCode: bookAirlineCode,
+        flightNumber: req.body.flightNumber,
+        passengerNames: paxNames,
+      });
+      if (dupErr) return res.status(409).json({ error: dupErr, code: "DUPLICATE_BOOKING" });
+    }
+
+    const data = await bookFlight({ ...req.body, isNDC: bookIsNDC, airlineCode: bookAirlineCode, destinationCode: req.body?.destinationCode }) as any;
 
     // Check for TBO-level failure
     const responseStatus = data?.Response?.ResponseStatus;
@@ -678,13 +795,17 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
       });
     }
 
+    // Check if price changed during booking
+    const bookIsPriceChanged = data?.Response?.IsPriceChanged === true
+      || data?.Response?.Response?.IsPriceChanged === true;
+
     // TBO Book response is double-nested: { Response: { Response: { PNR, BookingId, ... } } }
     const inner = data?.Response?.Response;
     const pnr = inner?.PNR ?? "";
     const bookingId = inner?.BookingId ?? "";
     const bookedPassengers = inner?.FlightItinerary?.Passenger ?? [];
 
-    sbtLogger.info("TBO Book result", { pnr, bookingId, passengerCount: bookedPassengers.length });
+    sbtLogger.info("TBO Book result", { pnr, bookingId, passengerCount: bookedPassengers.length, isPriceChanged: bookIsPriceChanged });
 
     // Compute certification case label while full payload is available
     const bookLeadPax = (req.body?.Passengers ?? [])[0] ?? {};
@@ -707,8 +828,22 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
       BookingId: bookingId,
       BookedPassengers: bookedPassengers,
       caseLabel: bookCaseLabel,
+      isPriceChanged: bookIsPriceChanged,
     });
   } catch (err: any) {
+    // Timeout recovery: poll GetBookingDetails to check if TBO processed it
+    if (isTBOTimeoutError(err)) {
+      sbtLogger.warn("TBO Book timeout — starting polling recovery", { traceId: req.body?.TraceId });
+      const pollResult = await pollBookingOnTimeout(req.body?.lastKnownBookingId, req.body?.TraceId);
+      if (pollResult.found) {
+        return res.json({ ...pollResult.data, recoveredFromTimeout: true });
+      }
+      return res.status(504).json({
+        status: "timeout_unconfirmed",
+        message: "Booking may be pending — check My Bookings",
+        traceId: req.body?.TraceId,
+      });
+    }
     console.error("[BOOK ERROR]", err?.message, err?.stack?.slice(0, 300));
     res.status(500).json({ error: err?.message || "Book failed", stack: err?.stack?.slice(0, 200) });
   }
@@ -717,6 +852,13 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
 // POST /api/sbt/flights/ticket
 router.post("/ticket", async (req: any, res: any) => {
   try {
+    // Validate ticket-level PAN/passport requirements
+    const ticketFareResults = req.body?.fareQuoteResults || req.body?.fareResults;
+    if (ticketFareResults) {
+      const ticketValErr = validateTBOTicketRequirements(ticketFareResults, req.body?.Passengers ?? []);
+      if (ticketValErr) return res.status(400).json({ error: ticketValErr });
+    }
+
     const result = await ticketFlight(req.body) as any;
 
     // TBO certification: call GetBookingDetails after successful Ticket
@@ -749,6 +891,19 @@ router.post("/ticket", async (req: any, res: any) => {
 
     res.json(result);
   } catch (err: any) {
+    if (isTBOTimeoutError(err)) {
+      sbtLogger.warn("TBO Ticket timeout — starting polling recovery", { bookingId: req.body?.BookingId });
+      const pollResult = await pollBookingOnTimeout(req.body?.BookingId?.toString(), req.body?.TraceId);
+      if (pollResult.found) {
+        return res.json({ ...pollResult.data, recoveredFromTimeout: true });
+      }
+      return res.status(504).json({
+        status: "timeout_unconfirmed",
+        message: "Booking may be pending — check My Bookings",
+        bookingId: req.body?.BookingId,
+        traceId: req.body?.TraceId,
+      });
+    }
     console.error("[TICKET ERROR]", err?.message, err?.stack?.slice(0, 300));
     res.status(500).json({ error: err?.message || "Ticket failed", stack: err?.stack?.slice(0, 200) });
   }
@@ -836,9 +991,31 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
     const lccValErr = validateTBOBookingRequirements(lccFareResults, lccPassengers);
     if (lccValErr) return res.status(400).json({ error: lccValErr });
 
+    // Duplicate booking prevention (24hr window)
+    const lccUserId = req.user?.id || req.user?._id;
+    if (lccUserId && ticketAirlineCode && req.body?.flightNumber) {
+      const paxNames = lccPassengers.map((p: any) => `${p.FirstName || ""} ${p.LastName || ""}`.trim());
+      const dupErr = await checkDuplicateBooking({
+        userId: lccUserId,
+        originCode: req.body?.originCode || "",
+        destinationCode: req.body?.destinationCode || "",
+        departureDate: req.body?.departureDate || "",
+        airlineCode: ticketAirlineCode,
+        flightNumber: req.body.flightNumber,
+        passengerNames: paxNames,
+      });
+      if (dupErr) return res.status(409).json({ error: dupErr, code: "DUPLICATE_BOOKING" });
+    }
+
+    // Validate ticket-level PAN/passport requirements
+    const lccTicketValErr = validateTBOTicketRequirements(lccFareResults, lccPassengers);
+    if (lccTicketValErr) return res.status(400).json({ error: lccTicketValErr });
+
     const lccIsInternational = req.body.isInternational ?? lccIsIntl;
     const lccSegments = lccFareResults?.Segments ?? req.body.Segments ?? [];
     const lccFreeBaggage = (req.body.FreeBaggage ?? []).filter((b: any) => b.Price === 0);
+    const lccAirlineCode = ticketAirlineCode || req.body?.airlineCode || "";
+    const lccDestCode = req.body?.destinationCode || "";
 
     // Convert SeatPreference → SeatDynamic if frontend sent old format
     function convertSeatPreferences(passengers: any[]) {
@@ -884,9 +1061,11 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
         TraceId: req.body.TraceId,
         ResultIndex: req.body.ResultIndex,
         Passengers: obPassengers,
-        IsPriceChangeAccepted: req.body.IsPriceChangeAccepted,
+        IsPriceChangedAccepted: req.body.IsPriceChangedAccepted,
         isNDC: ticketIsNDC,
         isInternational: lccIsInternational,
+        airlineCode: lccAirlineCode,
+        destinationCode: lccDestCode,
         Segments: lccSegments,
         FreeBaggage: lccFreeBaggage,
         ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
@@ -934,9 +1113,11 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
         TraceId: req.body.TraceId,
         ResultIndex: req.body.ResultIndex,
         Passengers: obPassengers,
-        IsPriceChangeAccepted: req.body.IsPriceChangeAccepted,
+        IsPriceChangedAccepted: req.body.IsPriceChangedAccepted,
         isNDC: ticketIsNDC,
         isInternational: lccIsInternational,
+        airlineCode: lccAirlineCode,
+        destinationCode: lccDestCode,
         Segments: lccSegments,
         FreeBaggage: lccFreeBaggage,
         ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
@@ -1037,9 +1218,11 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
           TraceId: ibTraceId,
           ResultIndex: returnResultIndex,
           Passengers: ibPassengers,
-          IsPriceChangeAccepted: req.body.IsPriceChangeAccepted,
+          IsPriceChangedAccepted: req.body.IsPriceChangedAccepted,
           isNDC: ticketIsNDC,
           isInternational: lccIsInternational,
+          airlineCode: lccAirlineCode,
+          destinationCode: req.body?.returnDestinationCode || lccDestCode,
           Segments: ibSegments,
           FreeBaggage: ibFreeBaggage,
           ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
@@ -1132,6 +1315,8 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
     let result = await ticketLCC({
       ...req.body,
       isInternational: lccIsInternational,
+      airlineCode: lccAirlineCode,
+      destinationCode: lccDestCode,
       Segments: lccSegments,
       FreeBaggage: lccFreeBaggage,
     }) as any;
@@ -1186,6 +1371,18 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
 
     res.json(result);
   } catch (err: any) {
+    if (isTBOTimeoutError(err)) {
+      sbtLogger.warn("TBO TicketLCC timeout — starting polling recovery", { traceId: req.body?.TraceId });
+      const pollResult = await pollBookingOnTimeout(req.body?.lastKnownBookingId, req.body?.TraceId);
+      if (pollResult.found) {
+        return res.json({ ...pollResult.data, recoveredFromTimeout: true });
+      }
+      return res.status(504).json({
+        status: "timeout_unconfirmed",
+        message: "Booking may be pending — check My Bookings",
+        traceId: req.body?.TraceId,
+      });
+    }
     console.error("[TICKET-LCC ERROR]", err?.message, err?.stack?.slice(0, 300));
     res.status(500).json({ error: err.message });
   }
