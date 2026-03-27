@@ -22,7 +22,7 @@ const r = Router();
 /* ───────────────────────────────────────────────
  * Constants
  * ─────────────────────────────────────────────── */
-const ACCESS_EXPIRES_IN = "15m";
+const ACCESS_EXPIRES_IN = "30m";
 const REFRESH_EXPIRES_IN = "7d";
 const REFRESH_COOKIE_NAME = "refreshToken";
 
@@ -182,7 +182,7 @@ function setAccessCookie(res: any, accessToken: string) {
     secure: isProd,
     sameSite: isProd ? "none" : "lax",
     path: "/api",
-    maxAge: 15 * 60 * 1000,
+    maxAge: 30 * 60 * 1000,
     ...cookieDomainOption(),
   });
 }
