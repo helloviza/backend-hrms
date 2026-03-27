@@ -349,6 +349,7 @@ r.post(
         roles: [role.toUpperCase()],
         tempPassword: false,
         activatedByAdmin: true,
+        isActive: true,
         activatedAt: new Date(),
       };
 
