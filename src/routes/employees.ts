@@ -286,7 +286,22 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
     if (body.employeeCode) existing.employeeCode = body.employeeCode;
     if (body.hrmsAccessRole) existing.hrmsAccessRole = body.hrmsAccessRole;
 
-    Object.assign(existing, body);
+    const {
+      _id: _employeeId,
+      id: _id,
+      __v: _v,
+      email: _email,
+      officialEmail: _officialEmail,
+      passwordHash: _passwordHash,
+      refreshToken: _refreshToken,
+      roles: _roles,
+      ownerId: _ownerId,
+      onboardingId: _onboardingId,
+      onboardingSnapshot: _onboardingSnapshot,
+      ...safeBody
+    } = body;
+
+    Object.assign(existing, safeBody);
 
     const saved = await existing.save();
     res.json(sanitise(saved));
