@@ -256,7 +256,10 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
     // Never allow passwordHash updates from this endpoint
     delete (body as any).passwordHash;
 
-    const existing: AnyUser | null = await User.findById(id).exec();
+    // First try to find by Employee doc to get ownerId
+    const employeeDoc = await Employee.findById(id).exec();
+    const userId = employeeDoc?.ownerId ?? id;
+    const existing: AnyUser | null = await User.findById(userId).exec();
     if (!existing) {
       return res.status(404).json({ error: "Employee not found" });
     }
