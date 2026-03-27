@@ -309,7 +309,7 @@ r.get(
         ],
         roles: { $in: ["EMPLOYEE", "MANAGER", "HR"] },
       })
-        .select("name email roles employeeCode createdAt tempPassword activatedByAdmin")
+        .select("name email officialEmail roles employeeCode createdAt tempPassword activatedByAdmin")
         .lean();
 
       res.json(users);
@@ -327,11 +327,12 @@ r.post(
   requireRoles("ADMIN", "SUPERADMIN", "HR"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { userId, onboardingId, role, password } = req.body as {
+      const { userId, onboardingId, role, password, officialEmail } = req.body as {
         userId?: string;
         onboardingId?: string;
         role?: string;
         password?: string;
+        officialEmail?: string;
       };
 
       if (!role || !password) {
@@ -354,7 +355,7 @@ r.post(
       if (userId) {
         const target = await User.findById(userId);
         if (!target) return res.status(404).json({ error: "User not found." });
-        Object.assign(target, activation);
+        Object.assign(target, activation, ...(officialEmail ? [{ officialEmail }] : []));
         await (target as any).save();
         return res.json({
           success: true,
@@ -388,7 +389,7 @@ r.post(
 
       const existing = await User.findOne({ email });
       if (existing) {
-        Object.assign(existing, activation);
+        Object.assign(existing, activation, ...(officialEmail ? [{ officialEmail }] : []));
         await (existing as any).save();
         return res.json({
           success: true,
@@ -396,7 +397,7 @@ r.post(
         });
       }
 
-      const newUser = await User.create({ name, email, isActive: true, ...activation });
+      const newUser = await User.create({ name, email, isActive: true, ...activation, ...(officialEmail && { officialEmail }) });
 
       return res.status(201).json({
         success: true,
