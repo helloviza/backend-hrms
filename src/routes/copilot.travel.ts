@@ -73,7 +73,7 @@ function mapTBOToFlightResults(tboResults: any[], traceId: string): any[] {
         airline: seg.Airline?.AirlineName || airlineCode,
         flightNo: seg.Airline?.FlightNumber || "",
         airlineCode,
-        logoUrl: `/assets/airlines/${airlineCode}.gif`,
+        logoUrl: airlineCode ? `https://pics.avs.io/60/60/${airlineCode}.png` : "",
         departure: {
           iata: seg.Origin?.Airport?.AirportCode || "",
           city: seg.Origin?.Airport?.CityName || "",
@@ -455,6 +455,7 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
 
     const traceId = tboRaw?.Response?.TraceId || "";
     const raw: any[] = tboRaw?.Response?.Results?.[0] || [];
+    console.log("[TBO FARE SAMPLE]", JSON.stringify(tboRaw?.Response?.Results?.[0]?.[0]?.Fare, null, 2));
 
     if (!Array.isArray(raw) || raw.length === 0) {
       console.log("[FlightSearch/POST] TBO returned 0 results");
@@ -482,7 +483,7 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
         airline: {
           name: first.Airline?.AirlineName || airlineCode,
           code: airlineCode,
-          logo: `https://pics.avs.io/60/60/${airlineCode}.png`,
+          logo: airlineCode ? `https://pics.avs.io/60/60/${airlineCode}.png` : "",
         },
         flightNo: `${airlineCode}-${first.Airline?.FlightNumber || ""}`,
         origin: {
@@ -506,8 +507,8 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
         duration: `${h}h ${m}m`,
         stops: segs.length - 1,
         fare: {
-          published: r.Fare?.PublishedFare || 0,
-          offered: r.Fare?.OfferedFare || r.Fare?.PublishedFare || 0,
+          published: r.Fare?.PublishedFare || r.Fare?.TotalFare || r.FareBreakdown?.[0]?.BaseFare || 0,
+          offered: r.Fare?.OfferedFare || r.Fare?.PublishedFare || r.Fare?.TotalFare || 0,
           currency: r.Fare?.Currency || "INR",
         },
         cabin: CABIN_LABELS[first.CabinClass] || cabin,
@@ -595,6 +596,30 @@ router.post("/", optionalAuth, async (req, res) => {
       const ctxDest   = context?.locked?.destination?.name || context?.assumed?.destination?.name || null;
       const ctxDate   = context?.locked?.dates?.start  || null;
 
+      // Extract passenger count
+      const paxMatch = prompt.match(
+        /\bfor\s+(\d+)\s*(?:people|persons?|pax|passengers?|travell?ers?|adults?)/i
+      ) || prompt.match(
+        /(\d+)\s*(?:people|persons?|pax|passengers?|travell?ers?|adults?)/i
+      );
+      const extractedAdults = paxMatch ? Math.min(parseInt(paxMatch[1]), 9) : 1;
+
+      // Extract cabin class
+      const cabinMatch = prompt.match(
+        /\b(business|first\s*class|premium\s*economy|economy)\b/i
+      );
+      const extractedCabin = cabinMatch
+        ? cabinMatch[1].toLowerCase().includes("business") ? "Business"
+        : cabinMatch[1].toLowerCase().includes("first") ? "First"
+        : cabinMatch[1].toLowerCase().includes("premium") ? "Premium Economy"
+        : "Economy"
+        : "Economy";
+
+      const cabinClassMap_chat: Record<string, number> = {
+        Economy: 2, "Premium Economy": 3, Business: 4, First: 6,
+      };
+      const extractedCabinClass = cabinClassMap_chat[extractedCabin] ?? 2;
+
       const rawOrigin      = promptOriginMatch?.[1]?.trim() || ctxOrigin || null;
       const rawDestination = promptDestMatch?.[1]?.trim()   || ctxDest   || null;
       const travelDate     = dateMatch?.[0]?.trim()         || ctxDate   || null;
@@ -628,7 +653,7 @@ router.post("/", optionalAuth, async (req, res) => {
       const originIATA = toIATA(origin);
       const destIATA   = toIATA(destination);
 
-      console.log(`[FlightSearch] Parsed — origin: "${origin}" (${originIATA}), dest: "${destination}" (${destIATA}), date: "${travelDate}");`);
+      console.log(`[FlightSearch] Parsed — origin: "${origin}" (${originIATA}), dest: "${destination}" (${destIATA}), date: "${travelDate}", pax: ${extractedAdults}, cabin: ${extractedCabin}`);
 
       // Parse any date format to YYYY-MM-DD for SerpAPI
       const parseDateToISO = (raw: string | null): string => {
@@ -680,7 +705,8 @@ router.post("/", optionalAuth, async (req, res) => {
           origin: originIATA,
           destination: destIATA,
           departDate: isoDate,
-          adults: 1,
+          adults: extractedAdults,
+          cabinClass: extractedCabinClass,
           serpApiSearch: process.env.SERPAPI_API_KEY
             ? async () => {
                 const r = await searchFlightRoutes(originIATA, destIATA, isoDate);
