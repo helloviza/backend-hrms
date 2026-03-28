@@ -74,14 +74,24 @@ router.get("/", requireAuth, async (_req, res, next) => {
 
     const emails = employees.map((e: any) => e.email).filter(Boolean);
     const users = await User.find({ email: { $in: emails } })
-      .select("email roles isActive activatedByAdmin tempPassword avatarKey avatarUrl")
+      .select("email roles hrmsAccessRole isActive activatedByAdmin tempPassword avatarKey avatarUrl")
       .lean();
 
     const userMap = new Map(users.map((u: any) => [u.email, u]));
 
+    // Debug: log raw User fields for role verification
+    for (const u of users) {
+      console.log("[GET /employees] User →", {
+        email: (u as any).email,
+        roles: (u as any).roles,
+        hrmsAccessRole: (u as any).hrmsAccessRole,
+      });
+    }
+
     const enriched = employees.map((e: any) => ({
       ...e,
       roles: userMap.get(e.email)?.roles || ["EMPLOYEE"],
+      hrmsAccessRole: userMap.get(e.email)?.hrmsAccessRole || "EMPLOYEE",
       isActive: userMap.get(e.email)?.isActive ?? e.isActive,
       avatarKey: userMap.get(e.email)?.avatarKey || "",
       avatarUrl: userMap.get(e.email)?.avatarUrl || "",
@@ -284,7 +294,6 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
     }
 
     if (body.employeeCode) existing.employeeCode = body.employeeCode;
-    if (body.hrmsAccessRole) existing.hrmsAccessRole = body.hrmsAccessRole;
 
     const {
       _id: _employeeId,
@@ -295,6 +304,7 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
       passwordHash: _passwordHash,
       refreshToken: _refreshToken,
       roles: _roles,
+      role: _role,
       ownerId: _ownerId,
       onboardingId: _onboardingId,
       onboardingSnapshot: _onboardingSnapshot,
@@ -303,7 +313,30 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
 
     Object.assign(existing, safeBody);
 
+    // Sync roles AFTER Object.assign so nothing can overwrite them
+    if (body.hrmsAccessRole) {
+      const canonical = String(body.hrmsAccessRole).toUpperCase();
+      existing.hrmsAccessRole = canonical;
+      existing.roles =
+        canonical === "EMPLOYEE" ? ["EMPLOYEE"] : ["EMPLOYEE", canonical];
+      existing.markModified("roles");
+    }
+
+    console.log("[PUT /employees/:id] PRE-SAVE →", {
+      id: existing._id?.toString(),
+      email: existing.email,
+      roles: existing.roles,
+      hrmsAccessRole: existing.hrmsAccessRole,
+    });
+
     const saved = await existing.save();
+
+    console.log("[PUT /employees/:id] POST-SAVE →", {
+      id: saved._id?.toString(),
+      roles: saved.roles,
+      hrmsAccessRole: saved.hrmsAccessRole,
+    });
+
     res.json(sanitise(saved));
   } catch (err) {
     next(err);
