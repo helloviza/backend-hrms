@@ -140,7 +140,7 @@ router.get(
  */
 router.post(
   "/",
-  requireRoles("ADMIN", "SUPERADMIN") as any,
+  requireRoles("ADMIN", "SUPERADMIN", "HR") as any,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { date, name, type, region, description } = req.body || {};
@@ -174,7 +174,7 @@ router.post(
  */
 router.post(
   "/bulk",
-  requireRoles("ADMIN", "SUPERADMIN") as any,
+  requireRoles("ADMIN", "SUPERADMIN", "HR") as any,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { holidays } = req.body || {};
@@ -282,7 +282,7 @@ router.post(
  */
 router.put(
   "/:id",
-  requireRoles("ADMIN", "SUPERADMIN") as any,
+  requireRoles("ADMIN", "SUPERADMIN", "HR") as any,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { id } = req.params;
@@ -324,7 +324,7 @@ router.put(
  */
 router.delete(
   "/:id",
-  requireRoles("ADMIN", "SUPERADMIN") as any,
+  requireRoles("ADMIN", "SUPERADMIN", "HR") as any,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { id } = req.params;
