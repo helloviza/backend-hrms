@@ -1,37 +1,83 @@
-import mongoose, { Schema, Document } from "mongoose";
+// apps/backend/src/models/LeaveBalance.ts
+import mongoose, { Schema } from "mongoose";
 
-export interface ILeaveBalance extends Document {
+interface IBalanceEntry {
+  entitled: number;
+  accrued: number;
+  used: number;
+  pending: number;
+  adjusted: number;
+  carriedForward?: number; // only EL
+}
+
+interface IEventLeaveEntry {
+  occurrences: number;
+  daysUsed: number;
+}
+
+export interface ILeaveBalance {
   userId: mongoose.Types.ObjectId;
   year: number;
   balances: {
-    CASUAL: number;
-    SICK: number;
-    PAID: number;
-    UNPAID: number;
-    MATERNITY: number;
-    PATERNITY: number;
-    COMPOFF: number;
-    BEREAVEMENT: number;
+    CL: IBalanceEntry;
+    SL: IBalanceEntry;
+    EL: IBalanceEntry & { carriedForward: number };
   };
+  eventLeaves: {
+    BEREAVEMENT: IEventLeaveEntry;
+    PATERNITY: IEventLeaveEntry;
+  };
+  lastAccrualMonth: number;
+  probationEndDate?: Date;
+  isConfirmed: boolean;
+  joinDate?: Date;
   updatedAt: Date;
 }
 
-const LeaveBalanceSchema = new Schema<ILeaveBalance>({
-  userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
-  year: { type: Number, required: true },
-  balances: {
-    CASUAL:      { type: Number, default: 12 },
-    SICK:        { type: Number, default: 10 },
-    PAID:        { type: Number, default: 18 },
-    UNPAID:      { type: Number, default: 999 },
-    MATERNITY:   { type: Number, default: 182 },
-    PATERNITY:   { type: Number, default: 7 },
-    COMPOFF:     { type: Number, default: 999 },
-    BEREAVEMENT: { type: Number, default: 5 },
+const BalanceEntrySchema = {
+  entitled: { type: Number, default: 0 },
+  accrued: { type: Number, default: 0 },
+  used: { type: Number, default: 0 },
+  pending: { type: Number, default: 0 },
+  adjusted: { type: Number, default: 0 },
+};
+
+const LeaveBalanceSchema = new Schema<ILeaveBalance>(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    year: { type: Number, required: true },
+
+    balances: {
+      CL: { ...BalanceEntrySchema },
+      SL: { ...BalanceEntrySchema },
+      EL: {
+        ...BalanceEntrySchema,
+        carriedForward: { type: Number, default: 0 },
+      },
+    },
+
+    eventLeaves: {
+      BEREAVEMENT: {
+        occurrences: { type: Number, default: 0 },
+        daysUsed: { type: Number, default: 0 },
+      },
+      PATERNITY: {
+        occurrences: { type: Number, default: 0 },
+        daysUsed: { type: Number, default: 0 },
+      },
+    },
+
+    lastAccrualMonth: { type: Number, default: 0 }, // 1–12
+    probationEndDate: { type: Date },
+    isConfirmed: { type: Boolean, default: false },
+    joinDate: { type: Date },
   },
-  updatedAt: { type: Date, default: Date.now },
-}, { timestamps: true });
+  { timestamps: true },
+);
 
 LeaveBalanceSchema.index({ userId: 1, year: 1 }, { unique: true });
 
-export default mongoose.model<ILeaveBalance>("LeaveBalance", LeaveBalanceSchema);
+export default mongoose.model<ILeaveBalance>(
+  "LeaveBalance",
+  LeaveBalanceSchema,
+);
