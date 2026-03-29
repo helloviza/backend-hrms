@@ -109,7 +109,7 @@ r.post("/presign-avatar-download", async (req, res) => {
   }
 
   const cmd = new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: key });
-  const url = await getSignedUrl(s3, cmd, { expiresIn: 900 });
+  const url = await getSignedUrl(s3, cmd, { expiresIn: 3600 });
 
   return res.json({ url });
 });
