@@ -2,6 +2,7 @@ import express from "express";
 import { randomUUID } from "crypto";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import SBTRequest from "../models/SBTRequest.js";
@@ -71,6 +72,7 @@ const MOCK_HOTEL_RESULTS = [
 
 const router = express.Router();
 router.use(requireAuth);
+router.use(requireWorkspace);
 router.use(requireFeature("hotelBookingEnabled"));
 
 // ─── SBT access guard ────────────────────────────────────────────────────────
@@ -88,7 +90,7 @@ async function requireSBT(req: any, res: any, next: any) {
     const userId = req.user?.id || req.user?._id;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceId }).select("sbtEnabled").lean();
+    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId }).select("sbtEnabled").lean();
     if (!user || !(user as any).sbtEnabled) {
       return res.status(403).json({ error: "SBT access not enabled for this account" });
     }
@@ -109,7 +111,7 @@ async function requireHotelAccess(req: any, res: any, next: any) {
     }
 
     const userId = req.user?.id || req.user?._id;
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceId })
+    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId })
       .select("sbtBookingType customerId")
       .lean();
 

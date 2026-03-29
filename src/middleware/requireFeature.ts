@@ -23,7 +23,8 @@ export const requireFeature = (featureKey: keyof WorkspaceFeatures) =>
       let workspace = (req as any).workspace as CustomerWorkspaceDocument | null;
 
       if (!workspace) {
-        workspace = await CustomerWorkspace.findById(req.workspaceId)
+        const wsId = req.workspaceObjectId || req.workspaceId;
+        workspace = await CustomerWorkspace.findById(wsId)
           .select("config.features status")
           .lean() as unknown as CustomerWorkspaceDocument | null;
       }

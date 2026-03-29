@@ -5,6 +5,7 @@ import { fileURLToPath } from "url";
 import path from "path";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTRequest from "../models/SBTRequest.js";
@@ -34,7 +35,6 @@ import {
 import { consolidateCertificationLogs } from "../services/tbo.log.consolidator.js";
 
 const router = express.Router();
-router.use(requireFeature("flightBookingEnabled"));
 
 /* ── Duplicate booking prevention (24-hour window) ─────────────────────── */
 async function checkDuplicateBooking(params: {
@@ -213,8 +213,44 @@ type Airport = {
   cityCode: string; country: string; countryCode: string; label: string;
 };
 
+/* ── Public endpoints — no auth / workspace / feature gate ────────────── */
 
+// GET /api/sbt/flights/airports?q=del
+router.get("/airports", (req, res) => {
+  try {
+    const airports = loadJson<Airport[]>("airports.json");
+    const q = (req.query.q as string || "").toLowerCase().trim();
+    if (!q || q.length < 2) return res.json([]);
+    const codeExact = airports.filter(a => a.code?.toLowerCase() === q);
+    const cityStarts = airports.filter(a => a.city?.toLowerCase().startsWith(q) && a.code?.toLowerCase() !== q);
+    const nameStarts = airports.filter(
+      a => a.name?.toLowerCase().startsWith(q) &&
+        !a.city?.toLowerCase().startsWith(q) &&
+        a.code?.toLowerCase() !== q
+    );
+    const matches = [...codeExact, ...cityStarts, ...nameStarts];
+    res.json(matches.slice(0, 10));
+  } catch (err: any) {
+    sbtLogger.error("Airport search failed", { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sbt/flights/airlines
+router.get("/airlines", (_req, res) => {
+  try {
+    const airlines = loadJson<Record<string, string>>("airlines.json");
+    res.json(airlines);
+  } catch (err: any) {
+    sbtLogger.error("Airlines list failed", { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Auth + workspace + feature middleware (all subsequent routes) ─────── */
 router.use(requireAuth);
+router.use(requireWorkspace);
+router.use(requireFeature("flightBookingEnabled"));
 
 // ─── SBT access guard ────────────────────────────────────────────────────────
 // Verifies the user has sbtEnabled=true in the DB.
@@ -231,7 +267,7 @@ async function requireSBT(req: any, res: any, next: any) {
     const userId = req.user?.id || req.user?._id;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceId }).select("sbtEnabled").lean();
+    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId }).select("sbtEnabled").lean();
     if (!user || !(user as any).sbtEnabled) {
       return res.status(403).json({ error: "SBT access not enabled for this account" });
     }
@@ -252,7 +288,7 @@ async function requireFlightAccess(req: any, res: any, next: any) {
     }
 
     const userId = req.user?.id || req.user?._id;
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceId })
+    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId })
       .select("sbtBookingType customerId")
       .lean();
 
@@ -345,38 +381,6 @@ router.get("/logs/:traceId/:filename", requireAdmin, async (req: any, res: any) 
     res.json({ ok: true, data });
   } catch (err: any) {
     res.status(404).json({ error: "Log file not found" });
-  }
-});
-
-// GET /api/sbt/flights/airports?q=del
-router.get("/airports", (req, res) => {
-  try {
-    const airports = loadJson<Airport[]>("airports.json");
-    const q = (req.query.q as string || "").toLowerCase().trim();
-    if (!q || q.length < 2) return res.json([]);
-    const codeExact = airports.filter(a => a.code?.toLowerCase() === q);
-    const cityStarts = airports.filter(a => a.city?.toLowerCase().startsWith(q) && a.code?.toLowerCase() !== q);
-    const nameStarts = airports.filter(
-      a => a.name?.toLowerCase().startsWith(q) &&
-        !a.city?.toLowerCase().startsWith(q) &&
-        a.code?.toLowerCase() !== q
-    );
-    const matches = [...codeExact, ...cityStarts, ...nameStarts];
-    res.json(matches.slice(0, 10));
-  } catch (err: any) {
-    sbtLogger.error("Airport search failed", { error: err.message });
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// GET /api/sbt/flights/airlines
-router.get("/airlines", (_req, res) => {
-  try {
-    const airlines = loadJson<Record<string, string>>("airlines.json");
-    res.json(airlines);
-  } catch (err: any) {
-    sbtLogger.error("Airlines list failed", { error: err.message });
-    res.status(500).json({ error: err.message });
   }
 });
 
