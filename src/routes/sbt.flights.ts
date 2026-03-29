@@ -213,11 +213,6 @@ type Airport = {
   cityCode: string; country: string; countryCode: string; label: string;
 };
 
-// Debug: log every request entering the SBT flights router (temporary)
-router.use((req: any, _res: any, next: any) => {
-  console.log(`[SBT-FLIGHTS] ${req.method} ${req.path}`);
-  next();
-});
 
 router.use(requireAuth);
 

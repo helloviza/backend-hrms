@@ -834,7 +834,7 @@ router.post("/bookings/save", async (req: any, res: any) => {
 
 // ─── 8. GET /bookings ────────────────────────────────────────────────────────
 
-router.get("/bookings", requireSBT, async (req: any, res: any) => {
+const getHotelBookingsHandler = async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
@@ -848,7 +848,9 @@ router.get("/bookings", requireSBT, async (req: any, res: any) => {
     sbtLogger.error("Hotel bookings list failed", { userId: req.user?.id, error: msg });
     res.status(500).json({ error: msg });
   }
-});
+};
+router.get("/bookings", requireSBT, getHotelBookingsHandler);
+router.get("/my-bookings", requireSBT, getHotelBookingsHandler);
 
 // ─── 9a. POST /bookings/sync-all-pending ─────────────────────────────────────
 
