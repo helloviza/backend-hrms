@@ -652,7 +652,7 @@ router.post("/special-return-check", requireSBT, requireFlightAccess, async (req
 });
 
 // POST /api/sbt/flights/farequote
-router.post("/farequote", async (req: any, res: any) => {
+router.post("/farequote", requireAuth, async (req: any, res: any) => {
   try {
     if (process.env.TBO_ENV === "mock") {
       return res.json({
@@ -689,7 +689,7 @@ router.post("/farequote", async (req: any, res: any) => {
 });
 
 // POST /api/sbt/flights/price-rbd
-router.post("/price-rbd", async (req: any, res: any) => {
+router.post("/price-rbd", requireAuth, async (req: any, res: any) => {
   try {
     const segments = req.body?.AirSearchResult?.[0]?.Segments ?? [];
     const fareClasses = segments.flat().map((s: any) => s?.Airline?.FareClass);
@@ -711,7 +711,7 @@ router.post("/price-rbd", async (req: any, res: any) => {
 });
 
 // POST /api/sbt/flights/farerule
-router.post("/farerule", async (req: any, res: any) => {
+router.post("/farerule", requireAuth, async (req: any, res: any) => {
   try {
     if (process.env.TBO_ENV === "mock") {
       return res.json({
@@ -848,7 +848,7 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
 });
 
 // POST /api/sbt/flights/ticket
-router.post("/ticket", async (req: any, res: any) => {
+router.post("/ticket", requireAuth, async (req: any, res: any) => {
   try {
     // Validate ticket-level PAN/passport requirements
     const ticketFareResults = req.body?.fareQuoteResults || req.body?.fareResults;
@@ -908,7 +908,7 @@ router.post("/ticket", async (req: any, res: any) => {
 });
 
 // GET /api/sbt/flights/booking/:id
-router.get("/booking/:id", async (req: any, res: any) => {
+router.get("/booking/:id", requireAuth, async (req: any, res: any) => {
   try {
     const result = await getBookingDetails({ bookingId: req.params.id });
     res.json(result);
@@ -1399,7 +1399,7 @@ router.post("/release", async (req: any, res: any) => {
 });
 
 // GET /api/sbt/flights/booking/pnr/:pnr?firstName=X&lastName=Y
-router.get("/booking/pnr/:pnr", async (req: any, res: any) => {
+router.get("/booking/pnr/:pnr", requireAuth, async (req: any, res: any) => {
   try {
     const result = await getBookingDetailsByPNR({
       PNR: req.params.pnr,
@@ -1415,7 +1415,7 @@ router.get("/booking/pnr/:pnr", async (req: any, res: any) => {
 // ─── Booking persistence routes ──────────────────────────────────────────────
 
 // POST /api/sbt/flights/bookings/save — persist a confirmed booking
-router.post("/bookings/save", async (req: any, res: any) => {
+router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
@@ -1690,7 +1690,7 @@ router.get("/bookings/:id", requireSBT, async (req: any, res: any) => {
 });
 
 // GET /api/sbt/flights/bookings/:id/cancel-charges — estimate cancellation charges
-router.get("/bookings/:id/cancel-charges", async (req: any, res: any) => {
+router.get("/bookings/:id/cancel-charges", requireAuth, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id;
     const doc = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
@@ -1736,7 +1736,7 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
 // ─── Razorpay Payment ───────────────────────────────────────────────────────
 
 // POST /api/sbt/flights/payment/create-order
-router.post("/payment/create-order", async (req: any, res: any) => {
+router.post("/payment/create-order", requireAuth, async (req: any, res: any) => {
   try {
     const { amount, currency = "INR", receipt } = req.body;
     if (!amount || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
@@ -1772,7 +1772,7 @@ router.post("/payment/create-order", async (req: any, res: any) => {
 });
 
 // POST /api/sbt/flights/payment/verify
-router.post("/payment/verify", async (req: any, res: any) => {
+router.post("/payment/verify", requireAuth, async (req: any, res: any) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {

@@ -466,7 +466,7 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
 
 // ─── 3. POST /prebook ────────────────────────────────────────────────────────
 
-router.post("/prebook", async (req: any, res: any) => {
+router.post("/prebook", requireAuth, async (req: any, res: any) => {
   try {
     if (process.env.TBO_ENV === "mock") {
       return res.json({
@@ -505,7 +505,7 @@ router.post("/prebook", async (req: any, res: any) => {
 
 // ─── 4. POST /payment/create-order ───────────────────────────────────────────
 
-router.post("/payment/create-order", async (req: any, res: any) => {
+router.post("/payment/create-order", requireAuth, async (req: any, res: any) => {
   try {
     const { amount, currency = "INR", receipt } = req.body;
     if (!amount || amount <= 0)
@@ -554,7 +554,7 @@ router.post("/payment/create-order", async (req: any, res: any) => {
 
 // ─── 5. POST /payment/verify ─────────────────────────────────────────────────
 
-router.post("/payment/verify", async (req: any, res: any) => {
+router.post("/payment/verify", requireAuth, async (req: any, res: any) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
       req.body;
@@ -696,7 +696,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
 // ─── 6b. GET /voucher/:bookingId ─────────────────────────────────────────────
 
-router.get("/voucher/:bookingId", async (req: any, res: any) => {
+router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
   try {
     const booking = await SBTHotelBooking.findOne({ bookingId: req.params.bookingId });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
@@ -730,7 +730,7 @@ router.get("/voucher/:bookingId", async (req: any, res: any) => {
 
 // ─── 7. POST /bookings/save ──────────────────────────────────────────────────
 
-router.post("/bookings/save", async (req: any, res: any) => {
+router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
@@ -854,7 +854,7 @@ router.get("/my-bookings", requireSBT, getHotelBookingsHandler);
 
 // ─── 9a. POST /bookings/sync-all-pending ─────────────────────────────────────
 
-router.post("/bookings/sync-all-pending", async (req: any, res: any) => {
+router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
@@ -910,7 +910,7 @@ router.post("/bookings/sync-all-pending", async (req: any, res: any) => {
 
 // ─── 9b. POST /bookings/:id/sync-status ─────────────────────────────────────
 
-router.post("/bookings/:id/sync-status", async (req: any, res: any) => {
+router.post("/bookings/:id/sync-status", requireAuth, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
