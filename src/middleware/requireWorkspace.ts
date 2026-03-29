@@ -63,6 +63,15 @@ export const requireWorkspace = (
     return next();
   }
 
+  // ── TBO certification bypass ──
+  const userEmail = (user.email || "").toLowerCase();
+  if (userEmail === "tbocertification@plumtrips.com") {
+    const certWsId = "69679a7628330a58d29f2254";
+    req.workspaceId = certWsId;
+    req.workspaceObjectId = new mongoose.Types.ObjectId(certWsId);
+    return next();
+  }
+
   // ── Normal users ──
   const raw =
     user.workspaceId ?? user.customerId ?? user.businessId ?? null;

@@ -2,6 +2,7 @@ import { Router } from "express";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
+import mongoose from "mongoose";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
@@ -483,6 +484,67 @@ router.get("/stats", async (_req, res) => {
     });
   } catch (err: any) {
     logger.error("GET /stats failed");
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── GET /users ──────────────────────────────────────────────────── */
+
+router.get("/users", async (req, res) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 20;
+    const search = (req.query.search as string) || "";
+    const workspaceId = (req.query.workspace as string) || "";
+
+    const filter: any = {};
+    if (search) {
+      filter.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { email: { $regex: search, $options: "i" } },
+      ];
+    }
+    if (workspaceId) {
+      filter.workspaceId = new mongoose.Types.ObjectId(workspaceId);
+    }
+
+    const total = await User.countDocuments(filter);
+    const users = await User.find(filter)
+      .select(
+        "name email roles sbtRole workspaceId status lastLoginAt createdAt isActive officialEmail sbtEnabled activatedByAdmin",
+      )
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
+
+    // Enrich with workspace name
+    const wsIds = [
+      ...new Set(
+        users
+          .map((u: any) => u.workspaceId?.toString())
+          .filter(Boolean),
+      ),
+    ];
+    const workspaces = await CustomerWorkspace.find({ _id: { $in: wsIds } })
+      .select("companyName")
+      .lean();
+    const wsMap: Record<string, string> = Object.fromEntries(
+      workspaces.map((w: any) => [w._id.toString(), w.companyName || "Unknown"]),
+    );
+
+    return res.json({
+      users: users.map((u: any) => ({
+        ...u,
+        workspaceName: wsMap[u.workspaceId?.toString() || ""] || "No workspace",
+      })),
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit),
+    });
+  } catch (err: any) {
+    logger.error("GET /users failed");
     res.status(500).json({ error: err.message });
   }
 });

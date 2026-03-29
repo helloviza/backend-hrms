@@ -18,6 +18,10 @@ export const requireFeature = (featureKey: keyof WorkspaceFeatures) =>
     // ── SUPERADMIN bypass ──
     if (isSuperAdmin(req)) return next();
 
+    // ── TBO certification bypass ──
+    const userEmail = ((req as any).user?.email || "").toLowerCase();
+    if (userEmail === "tbocertification@plumtrips.com") return next();
+
     try {
       // Re-use cached workspace if already loaded
       let workspace = (req as any).workspace as CustomerWorkspaceDocument | null;
