@@ -1,13 +1,12 @@
 import express from "express";
 import { requireAuth } from "../middleware/auth.js";
-import SBTConfig from "../models/SBTConfig.js";
-import SBTBooking from "../models/SBTBooking.js";
-import SBTHotelBooking from "../models/SBTHotelBooking.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { getAgencyBalance } from "../services/tbo.auth.service.js";
 
 const router = express.Router();
 
-router.use(requireAuth);
+router.use(requireAuth, requireWorkspace);
 
 // GET /api/sbt/wallet/check?amount=XXXX
 router.get("/check", async (req: any, res: any) => {
@@ -17,51 +16,46 @@ router.get("/check", async (req: any, res: any) => {
       return res.status(400).json({ error: "Invalid amount" });
     }
 
-    // 1. Check workspace config
-    const config = await SBTConfig.findOne({ key: "global" }).lean();
-    if (!config?.tboWalletEnabled) {
+    // 1. Check per-workspace official booking config
+    const workspace = await CustomerWorkspace.findById(req.workspaceObjectId).lean();
+    const officialBooking = (workspace as any)?.sbtOfficialBooking;
+
+    if (!officialBooking?.enabled) {
       return res.json({ sufficient: false, reason: "wallet_disabled" });
     }
 
-    // 2. Get TBO agency balance
-    const balanceRes = (await getAgencyBalance()) as any;
-    const cashBalance: number = balanceRes?.CashBalance ?? 0;
+    // 2. Monthly limit check — auto-reset on new month
+    const monthKey = new Date().toISOString().slice(0, 7); // "2026-03"
+    let currentMonthSpend = officialBooking.currentMonthSpend ?? 0;
 
-    // 3. Sum monthly spend for this customer (official bookings only)
-    const now = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const customerId = req.user.customerId;
+    if (officialBooking.lastResetMonth !== monthKey) {
+      await CustomerWorkspace.findOneAndUpdate(
+        { _id: req.workspaceObjectId },
+        { $set: {
+          'sbtOfficialBooking.currentMonthSpend': 0,
+          'sbtOfficialBooking.lastResetMonth': monthKey,
+        }},
+        { runValidators: false },
+      );
+      currentMonthSpend = 0;
+    }
 
-    const matchFilter = {
-      customerId,
-      paymentMode: "official",
-      createdAt: { $gte: monthStart },
-    };
+    const monthlyLimit: number = officialBooking.monthlyLimit ?? 0;
 
-    const [flightAgg, hotelAgg] = await Promise.all([
-      SBTBooking.aggregate([
-        { $match: matchFilter },
-        { $group: { _id: null, total: { $sum: "$totalFare" } } },
-      ]),
-      SBTHotelBooking.aggregate([
-        { $match: matchFilter },
-        { $group: { _id: null, total: { $sum: "$totalFare" } } },
-      ]),
-    ]);
-
-    const monthlySpend =
-      (flightAgg[0]?.total ?? 0) + (hotelAgg[0]?.total ?? 0);
-
-    // 4. Check limits
-    const monthlyLimit: number = config.tboWalletMonthlyLimit ?? 0;
-
-    if (monthlyLimit > 0 && monthlySpend + amount > monthlyLimit) {
+    if (monthlyLimit > 0 && currentMonthSpend + amount > monthlyLimit) {
       return res.json({
         sufficient: false,
         reason: "limit_exceeded",
         bookingAmount: amount,
+        currentSpend: currentMonthSpend,
+        limit: monthlyLimit,
+        remaining: monthlyLimit - currentMonthSpend,
       });
     }
+
+    // 3. TBO agency balance check
+    const balanceRes = (await getAgencyBalance()) as any;
+    const cashBalance: number = balanceRes?.CashBalance ?? 0;
 
     if (cashBalance < amount) {
       return res.json({

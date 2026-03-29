@@ -1482,6 +1482,15 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
       raw: b.raw,
     });
 
+    // Increment workspace monthly spend for official bookings
+    if (b.paymentMode === "official" && req.workspaceObjectId) {
+      CustomerWorkspace.findOneAndUpdate(
+        { _id: req.workspaceObjectId },
+        { $inc: { 'sbtOfficialBooking.currentMonthSpend': b.totalFare ?? 0 } },
+        { runValidators: false },
+      ).catch((e: any) => sbtLogger.warn("Failed to increment official booking spend", { error: e?.message }));
+    }
+
     // If this booking fulfils an SBT request, mark it as BOOKED and notify L1
     if (b.sbtRequestId) {
       try {

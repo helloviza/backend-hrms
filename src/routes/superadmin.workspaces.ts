@@ -281,6 +281,38 @@ router.put("/workspaces/:workspaceId/features", async (req: any, res) => {
   }
 });
 
+/* ── PUT /workspaces/:workspaceId/official-booking ─────────────── */
+
+router.put("/workspaces/:workspaceId/official-booking", async (req: any, res) => {
+  try {
+    const { enabled, monthlyLimit } = req.body as { enabled?: boolean; monthlyLimit?: number };
+
+    const update: Record<string, any> = {};
+    if (typeof enabled === "boolean") update["sbtOfficialBooking.enabled"] = enabled;
+    if (typeof monthlyLimit === "number" && monthlyLimit >= 0) update["sbtOfficialBooking.monthlyLimit"] = monthlyLimit;
+
+    const workspace = await CustomerWorkspace.findByIdAndUpdate(
+      req.params.workspaceId,
+      { $set: update },
+      { new: true, runValidators: false },
+    ).select("sbtOfficialBooking").lean();
+
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+
+    logger.info("SUPERADMIN updated official booking config", {
+      workspaceId: req.params.workspaceId,
+      enabled,
+      monthlyLimit,
+      changedBy: req.user?._id,
+    });
+
+    res.json({ success: true, sbtOfficialBooking: (workspace as any).sbtOfficialBooking });
+  } catch (err: any) {
+    logger.error("PUT /workspaces/:workspaceId/official-booking failed");
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* ── POST /workspaces/:workspaceId/impersonate ───────────────────── */
 
 router.post("/workspaces/:workspaceId/impersonate", async (req: any, res) => {

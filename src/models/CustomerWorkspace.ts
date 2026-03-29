@@ -120,6 +120,14 @@ export interface CustomerWorkspaceDocument extends Document {
     minHoursForPresent: number;
   };
 
+  // SBT Official Booking (per-workspace TBO wallet)
+  sbtOfficialBooking?: {
+    enabled: boolean;
+    monthlyLimit: number;
+    currentMonthSpend: number;
+    lastResetMonth: string;
+  };
+
   // Legacy orphan flag (migration)
   _isLegacyOrphan?: boolean;
 
@@ -277,6 +285,14 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
       graceMinutes: { type: Number, default: 15 },
       halfDayHours: { type: Number, default: 4.5 },
       minHoursForPresent: { type: Number, default: 2 },
+    },
+
+    // ── SBT Official Booking (per-workspace TBO wallet) ──
+    sbtOfficialBooking: {
+      enabled: { type: Boolean, default: false },
+      monthlyLimit: { type: Number, default: 100000 },
+      currentMonthSpend: { type: Number, default: 0 },
+      lastResetMonth: { type: String, default: '' },
     },
 
     // ── Migration flag ──

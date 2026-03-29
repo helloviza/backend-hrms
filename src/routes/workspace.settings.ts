@@ -131,6 +131,39 @@ r.put(
   }
 );
 
+/* ─── PUT /official-booking — Toggle SBT Official Booking ─── */
+r.put(
+  "/official-booking",
+  requireRoles("WORKSPACE_ADMIN", "ADMIN"),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const workspaceId = req.workspaceId;
+      const { enabled, monthlyLimit } = req.body;
+
+      if (!workspaceId) {
+        return res.status(400).json({
+          success: false,
+          error: "No workspace context.",
+        });
+      }
+
+      const update: Record<string, any> = {};
+      if (typeof enabled === "boolean") update["sbtOfficialBooking.enabled"] = enabled;
+      if (typeof monthlyLimit === "number" && monthlyLimit >= 0) update["sbtOfficialBooking.monthlyLimit"] = monthlyLimit;
+
+      const ws = await CustomerWorkspace.findByIdAndUpdate(
+        workspaceId,
+        { $set: update },
+        { new: true, runValidators: false },
+      ).select("sbtOfficialBooking").lean();
+
+      return res.json({ success: true, sbtOfficialBooking: (ws as any)?.sbtOfficialBooking });
+    } catch (err) {
+      return next(err);
+    }
+  },
+);
+
 /* ─── GET / — Get workspace configs ─── */
 r.get(
   "/",
