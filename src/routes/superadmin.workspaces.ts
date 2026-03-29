@@ -313,6 +313,33 @@ router.put("/workspaces/:workspaceId/official-booking", async (req: any, res) =>
   }
 });
 
+/* ── POST /workspaces/:workspaceId/reset-spend ───────────────────── */
+
+router.post("/workspaces/:workspaceId/reset-spend", async (req: any, res) => {
+  try {
+    const monthKey = new Date().toISOString().slice(0, 7);
+    const workspace = await CustomerWorkspace.findOneAndUpdate(
+      { _id: req.params.workspaceId },
+      { $set: {
+        'sbtOfficialBooking.currentMonthSpend': 0,
+        'sbtOfficialBooking.lastResetMonth': monthKey,
+      }},
+      { new: true, runValidators: false },
+    );
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+
+    logger.info("SUPERADMIN reset monthly spend", {
+      workspaceId: req.params.workspaceId,
+      resetBy: req.user?._id,
+    });
+
+    res.json({ success: true, message: "Monthly spend reset to 0" });
+  } catch (err: any) {
+    logger.error("POST /workspaces/:workspaceId/reset-spend failed");
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* ── POST /workspaces/:workspaceId/impersonate ───────────────────── */
 
 router.post("/workspaces/:workspaceId/impersonate", async (req: any, res) => {

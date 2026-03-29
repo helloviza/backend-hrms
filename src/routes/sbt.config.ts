@@ -15,11 +15,30 @@ router.get("/wallet", async (req: any, res: any) => {
       .lean();
 
     const ob = (workspace as any)?.sbtOfficialBooking;
+    const monthKey = new Date().toISOString().slice(0, 7); // "2026-03"
+
+    let currentMonthSpend = ob?.currentMonthSpend ?? 0;
+
+    // Lazy reset if new month
+    if (ob?.lastResetMonth && ob.lastResetMonth !== monthKey) {
+      await CustomerWorkspace.findOneAndUpdate(
+        { _id: req.workspaceObjectId },
+        { $set: {
+          'sbtOfficialBooking.currentMonthSpend': 0,
+          'sbtOfficialBooking.lastResetMonth': monthKey,
+        }},
+        { runValidators: false },
+      );
+      currentMonthSpend = 0;
+    }
+
+    const monthlyLimit = ob?.monthlyLimit ?? 100000;
 
     return res.json({
       tboWalletEnabled: ob?.enabled ?? false,
-      monthlyLimit: ob?.monthlyLimit ?? 100000,
-      currentMonthSpend: ob?.currentMonthSpend ?? 0,
+      monthlyLimit,
+      currentMonthSpend,
+      remaining: Math.max(0, monthlyLimit - currentMonthSpend),
     });
   } catch (err: any) {
     console.error("[SBT Config Wallet]", err.message);

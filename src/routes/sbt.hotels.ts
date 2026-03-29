@@ -791,11 +791,19 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
 
     // Increment workspace monthly spend for official bookings
     if (b.paymentMode === "official" && req.workspaceObjectId) {
-      CustomerWorkspace.findOneAndUpdate(
-        { _id: req.workspaceObjectId },
-        { $inc: { 'sbtOfficialBooking.currentMonthSpend': b.totalFare ?? 0 } },
-        { runValidators: false },
-      ).catch((e: any) => sbtLogger.warn("Failed to increment official booking spend", { error: e?.message }));
+      try {
+        await CustomerWorkspace.findOneAndUpdate(
+          { _id: req.workspaceObjectId },
+          { $inc: { 'sbtOfficialBooking.currentMonthSpend': b.totalFare ?? 0 } },
+          { runValidators: false },
+        );
+      } catch (spendErr) {
+        sbtLogger.error('[OfficialBooking] Failed to track spend', {
+          workspaceId: req.workspaceObjectId,
+          amount: b.totalFare,
+          error: spendErr,
+        });
+      }
     }
 
     // If this booking fulfils an SBT request, mark it as BOOKED and notify L1
@@ -1115,6 +1123,35 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     doc.status = "CANCELLED";
     doc.cancelledAt = new Date();
     await doc.save();
+
+    // Decrement spend if official booking in same calendar month
+    if ((doc as any).paymentMode === 'official' && (doc as any).workspaceId) {
+      const bookingMonth = doc.createdAt.toISOString().slice(0, 7);
+      const currentMonth = new Date().toISOString().slice(0, 7);
+      if (bookingMonth === currentMonth) {
+        try {
+          await CustomerWorkspace.findOneAndUpdate(
+            { _id: (doc as any).workspaceId },
+            [{ $set: {
+              'sbtOfficialBooking.currentMonthSpend': {
+                $max: [0, { $subtract: ['$sbtOfficialBooking.currentMonthSpend', (doc as any).totalFare || 0] }],
+              },
+            }}],
+            { runValidators: false },
+          );
+          sbtLogger.info('[OfficialBooking] Spend reversed on cancellation', {
+            bookingId: doc._id,
+            amount: (doc as any).totalFare,
+            workspaceId: (doc as any).workspaceId,
+          });
+        } catch (err) {
+          sbtLogger.error('[OfficialBooking] Failed to reverse spend on cancellation', {
+            bookingId: doc._id,
+            error: err,
+          });
+        }
+      }
+    }
 
     res.json({ ok: true, booking: doc });
   } catch (err: unknown) {
