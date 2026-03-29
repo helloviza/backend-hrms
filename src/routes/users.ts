@@ -164,7 +164,7 @@ r.get(
       const userId = (req as any).user?.sub;
       if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-      const user = await User.findOne({ _id: userId, workspaceId: (req as any).workspaceId }).select("-passwordHash").lean();
+      const user = await User.findById(userId).select("-passwordHash").lean();
       if (!user) return res.status(404).json({ error: "User not found" });
 
       const u: any = user;

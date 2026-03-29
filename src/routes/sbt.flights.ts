@@ -1524,6 +1524,27 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
 });
 
 // GET /api/sbt/flights/bookings — list current user's bookings
+// GET /api/sbt/flights/my-bookings — lightweight endpoint for any authenticated
+// user to fetch their own bookings (used by MyProfile dashboard widget).
+// Does NOT require SBT access so non-SBT users get an empty list instead of 403.
+router.get("/my-bookings", requireAuth, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const { limit, status } = req.query;
+    const filter: any = { userId };
+    if (status) filter.status = String(status).toUpperCase();
+
+    const lim = Math.min(50, Math.max(1, parseInt(limit as string, 10) || 10));
+    const bookings = await SBTBooking.find(filter).sort({ createdAt: -1 }).limit(lim).lean();
+    res.json({ ok: true, bookings });
+  } catch (err: any) {
+    sbtLogger.error("my-bookings failed", { userId: req.user?.id, error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get("/bookings", requireSBT, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id;
