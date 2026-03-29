@@ -1,5 +1,6 @@
 // apps/backend/src/middleware/rbac.ts
 import type { Request, Response, NextFunction } from "express";
+import { isSuperAdmin } from "./isSuperAdmin.js";
 
 function norm(v: any) {
   return String(v ?? "")
@@ -30,6 +31,8 @@ function hasAnyRole(user: any, allowed: string[]) {
 }
 
 export function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  if (isSuperAdmin(req)) return next();
+
   const user: any = (req as any).user;
 
   // ✅ treat these as admin/staff privileged roles

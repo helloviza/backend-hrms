@@ -14,7 +14,7 @@ import { invokePluto } from "../../utils/plutoInvoke.js";
  */
 
 export async function writeVideoSummary(videoAnalysisId: string) {
-  const record = await VideoAnalysis.findById(videoAnalysisId);
+  const record = await VideoAnalysis.findOne({ _id: videoAnalysisId });
   if (!record) {
     throw new Error("VideoAnalysis record not found");
   }

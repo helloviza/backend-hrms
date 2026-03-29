@@ -1,5 +1,6 @@
 // apps/backend/src/models/Onboarding.ts
 import mongoose, { Schema, InferSchemaType } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 export type OnboardingType = "vendor" | "business" | "employee";
 export type OnboardingStatus =
@@ -27,6 +28,7 @@ const DocumentSchema = new Schema(
 /* ---------- Main Onboarding schema ---------- */
 const OnboardingSchema = new Schema(
   {
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
     type: {
       type: String,
       enum: ["vendor", "business", "employee"],
@@ -69,7 +71,10 @@ const OnboardingSchema = new Schema(
   { timestamps: true }
 );
 
+OnboardingSchema.plugin(workspaceScopePlugin);
+
 /* ---------- Helpful compound indexes ---------- */
+OnboardingSchema.index({ workspaceId: 1, employeeId: 1 });
 OnboardingSchema.index({ email: 1, type: 1, status: 1 });
 OnboardingSchema.index({ createdAt: -1 }); // ✅ keep these only once
 

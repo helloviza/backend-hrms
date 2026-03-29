@@ -205,15 +205,54 @@ r.post("/presign-upload", async (req, res) => {
   res.json({ key, url });
 });
 
-// SECURITY WARNING: This endpoint has no tenant prefix
-// validation. Any authenticated user can generate a
-// presigned download URL for any S3 key by crafting
-// the key manually. Do NOT expose this endpoint to
-// untrusted frontend callers without adding tenant
-// prefix validation first. Use presign-avatar-download
-// or presign-download (onboarding) for user-facing flows.
-r.post("/presign-download", async (req, res) => {
+/**
+ * ✅ Presign GET for generic downloads (tenant-validated)
+ * Body: { key }
+ * Returns: { url }
+ *
+ * Validation rules:
+ *  - Workspace-prefixed keys ({workspaceId}/...): workspaceId must match req.workspaceObjectId
+ *  - proofs/{workspaceId}/... keys: same workspace check
+ *  - Legacy/other keys: allowed only if SUPERADMIN or key contains the user's own userId
+ *  - SUPERADMIN always bypasses workspace validation
+ */
+r.post("/presign-download", async (req: any, res) => {
   const { key } = req.body || {};
+  if (!key || typeof key !== "string") {
+    return res.status(400).json({ error: "key is required" });
+  }
+
+  const userId = String(req.user?.sub || req.user?._id || req.user?.id || "");
+  const wsId = req.workspaceObjectId ? String(req.workspaceObjectId) : "";
+  const superAdmin =
+    Array.isArray(req.user?.roles) && req.user.roles.includes("SUPERADMIN") ||
+    req.user?.role === "SUPERADMIN" ||
+    req.user?.isSuperAdmin === true;
+
+  if (!superAdmin) {
+    const segments = key.split("/");
+    const firstSegment = segments[0] || "";
+
+    // Pattern: proofs/{workspaceId}/{userId}/{FY}/{filename}
+    if (firstSegment === "proofs" && segments.length >= 3) {
+      const keyWsId = segments[1];
+      if (wsId && keyWsId !== wsId) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+    }
+    // Pattern: {workspaceId}/{category}/{userId}/{filename} — first segment looks like an ObjectId (24 hex chars)
+    else if (/^[a-f0-9]{24}$/.test(firstSegment)) {
+      if (wsId && firstSegment !== wsId) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+    }
+    // Known prefixed paths (avatars, videos, onboarding, user) — these have their own presign endpoints
+    // but allow here if the key contains the user's own ID
+    else if (!userId || !key.includes(userId)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+  }
+
   const cmd = new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: key });
   const url = await getSignedUrl(s3, cmd, { expiresIn: 300 });
   res.json({ url });

@@ -21,7 +21,7 @@ export function startVideoAnalysis(videoId: string) {
   // Run asynchronously so API responds instantly
   setImmediate(async () => {
     try {
-      const record = await VideoAnalysis.findById(videoId);
+      const record = await VideoAnalysis.findOne({ _id: videoId });
       if (!record) return;
 
       // 🔒 Safety: do not re-run analysis
@@ -49,7 +49,7 @@ export function startVideoAnalysis(videoId: string) {
     } catch (err: any) {
       console.error("Video analysis failed:", err);
 
-      await VideoAnalysis.findByIdAndUpdate(videoId, {
+      await VideoAnalysis.findOneAndUpdate({ _id: videoId }, {
         status: "failed",
         error: err?.message || "Video analysis failed",
         progress: 0,

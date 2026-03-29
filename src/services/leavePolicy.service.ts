@@ -2,6 +2,7 @@
 import type { ILeavePolicy } from "../models/LeavePolicy.js";
 import LeaveBalance from "../models/LeaveBalance.js";
 import LeaveRequest from "../models/LeaveRequest.js";
+import Holiday from "../models/Holiday.js";
 import User from "../models/User.js";
 
 // ─────────────────────────────────────────────────────────────
@@ -28,6 +29,57 @@ function addDays(date: Date, days: number): Date {
   const d = new Date(date);
   d.setDate(d.getDate() + days);
   return d;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 2.0 Calculate leave days (excluding weekends + GENERAL holidays)
+// ─────────────────────────────────────────────────────────────
+
+export async function calculateLeaveDays(
+  from: Date,
+  to: Date,
+  dayLength: string | undefined,
+  workspaceId: string,
+): Promise<number> {
+  // Format dates to YYYY-MM-DD strings for comparison
+  const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`);
+  const toYMD = (d: Date) =>
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+  const fromStr = toYMD(from);
+  const toStr = toYMD(to);
+
+  // Fetch GENERAL holidays in range for this workspace
+  const holidays = await Holiday.find({
+    workspaceId,
+    date: { $gte: fromStr, $lte: toStr },
+    type: "GENERAL",
+  })
+    .select("date")
+    .lean();
+
+  const holidaySet = new Set(holidays.map((h: any) => h.date));
+
+  // Count working days (Mon-Fri, not a GENERAL holiday)
+  let workingDays = 0;
+  const cur = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+  const end = new Date(to.getFullYear(), to.getMonth(), to.getDate());
+
+  while (cur <= end) {
+    const dow = cur.getDay(); // 0=Sun, 6=Sat
+    const dateStr = toYMD(cur);
+    if (dow !== 0 && dow !== 6 && !holidaySet.has(dateStr)) {
+      workingDays++;
+    }
+    cur.setDate(cur.getDate() + 1);
+  }
+
+  // Half day: subtract 0.5 from total
+  if (dayLength === "HALF") {
+    return Math.max(0, workingDays > 0 ? workingDays - 0.5 : 0);
+  }
+
+  return workingDays;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -129,6 +181,7 @@ export async function initializeLeaveBalance(
   joinDate: Date,
   year: number,
   policy: ILeavePolicy,
+  workspaceId?: string,
 ): Promise<any> {
   const clEntitled = computeProRataEntitlement(joinDate, "CL", policy);
   const slEntitled = computeProRataEntitlement(joinDate, "SL", policy);
@@ -140,6 +193,7 @@ export async function initializeLeaveBalance(
   const slAccrued = policy.slCreditMode === "UPFRONT" ? slEntitled : 0;
 
   const balance = await LeaveBalance.create({
+    ...(workspaceId ? { workspaceId } : {}),
     userId,
     year,
     balances: {
@@ -166,6 +220,7 @@ export async function initializeLeaveBalance(
 
 export async function validateLeaveApplication(
   userId: string,
+  workspaceId: string,
   leaveRequest: {
     type: string;
     from: Date;
@@ -194,7 +249,7 @@ export async function validateLeaveApplication(
   let balance: any = await LeaveBalance.findOne({ userId, year });
   if (!balance) {
     // Try to initialize
-    const user = await User.findById(userId);
+    const user = await User.findOne({ _id: userId, workspaceId });
     const joinDate = user?.dateOfJoining
       ? new Date(user.dateOfJoining)
       : new Date();

@@ -6,6 +6,7 @@ import Attendance from "../models/Attendance.js";
 import LeaveRequest from "../models/LeaveRequest.js";
 import Document from "../models/Document.js";
 import User from "../models/User.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 
 const router = Router();
 
@@ -217,11 +218,12 @@ async function getDashboardStatsForUser(
  * Use the same User model as /api/users/profile.
  */
 async function getProfileForUser(
-  userId: UserId
+  userId: UserId,
+  workspaceId?: string,
 ): Promise<ProfileLike | null> {
   const uid = String(userId);
 
-  const user = await User.findById(uid)
+  const user = await User.findOne({ _id: uid, ...(workspaceId ? { workspaceId } : {}) })
     .select("name firstName email department location managerName")
     .lean();
 
@@ -393,12 +395,13 @@ async function buildBackendContext(req: Request): Promise<AssistantContext> {
   }
 
   try {
+    const workspaceId = String((req as any).workspaceId || "");
     const [dashboard, profileData, docsSummary] = await Promise.all([
       getDashboardStatsForUser(userId).catch((err) => {
         console.error("[assistant] dashboard stats error:", err);
         return null;
       }),
-      getProfileForUser(userId).catch((err) => {
+      getProfileForUser(userId, workspaceId || undefined).catch((err) => {
         console.error("[assistant] profile info error:", err);
         return null;
       }),

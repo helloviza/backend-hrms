@@ -1,5 +1,6 @@
 // apps/backend/src/models/VoucherExtraction.ts
 import mongoose, { Schema } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 export type VoucherStatus = "PROCESSING" | "SUCCESS" | "FAILED";
 
@@ -28,7 +29,8 @@ const FileSchema = new Schema(
 
 const VoucherExtractionSchema = new Schema(
   {
-    customerId: { type: String, required: true, index: true },
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
+    customerId: { type: String, index: true }, // legacy
     createdBy: {
       type: Schema.Types.ObjectId,
       ref: "User",
@@ -96,6 +98,9 @@ const VoucherExtractionSchema = new Schema(
   },
   { timestamps: true }
 );
+
+VoucherExtractionSchema.plugin(workspaceScopePlugin);
+VoucherExtractionSchema.index({ workspaceId: 1, bookingId: 1 });
 
 // Helpful compound index for listing + filtering
 VoucherExtractionSchema.index({ customerId: 1, createdAt: -1 });

@@ -5,6 +5,7 @@ import mongoose from "mongoose";
 
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 
 import VoucherExtraction from "../models/VoucherExtraction.js";
 import type { VoucherType } from "../types/index.js";
@@ -490,7 +491,7 @@ router.post("/:id/render", requireAuth, async (req: any, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-  const row: any = await VoucherExtraction.findById(id);
+  const row: any = await scopedFindById(VoucherExtraction, id, req.workspaceId);
   if (!row) return res.status(404).json({ message: "Not found" });
 
   const isAdmin = isRequesterAdmin(req);
@@ -573,7 +574,7 @@ router.get("/:id", requireAuth, async (req: any, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-  const row: any = await VoucherExtraction.findById(id).lean();
+  const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceId }).lean();
   if (!row) return res.status(404).json({ message: "Not found" });
 
   const isAdmin = isRequesterAdmin(req);
@@ -592,7 +593,7 @@ router.get("/:id/open", requireAuth, async (req: any, res) => {
     const { id } = req.params;
     if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-    const row: any = await VoucherExtraction.findById(id).lean();
+    const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceId }).lean();
     if (!row) return res.status(404).json({ message: "Not found" });
 
     const isAdmin = isRequesterAdmin(req);
@@ -625,7 +626,7 @@ router.get("/:id/open-rendered", requireAuth, async (req: any, res) => {
     const { id } = req.params;
     if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-    const row: any = await VoucherExtraction.findById(id).lean();
+    const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceId }).lean();
     if (!row) return res.status(404).json({ message: "Not found" });
 
     const isAdmin = isRequesterAdmin(req);
@@ -667,7 +668,7 @@ router.patch("/:id", requireAuth, requireAdmin, async (req: any, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-  const row: any = await VoucherExtraction.findById(id);
+  const row: any = await scopedFindById(VoucherExtraction, id, req.workspaceId);
   if (!row) return res.status(404).json({ message: "Not found" });
 
   const { extractedJson, docType, status, error } = req.body || {};

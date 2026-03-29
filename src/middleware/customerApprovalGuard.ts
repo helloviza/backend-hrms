@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import MasterData from "../models/MasterData.js";
 import CustomerWhitelistDomain from "../models/CustomerWhitelistDomain.js";
 import CustomerWhitelistEmail from "../models/CustomerWhitelistEmail.js";
+import { isSuperAdmin } from "./isSuperAdmin.js";
 
 function normalizeEmail(e: string) {
   return String(e || "").trim().toLowerCase();
@@ -76,6 +77,7 @@ export async function assertWorkspaceEmailAllowed(workspaceId: string, email: st
 
 export function requireCustomer(req: any, res: any, next: any) {
   if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+  if (isSuperAdmin(req)) return next();
   if (!hasRole(req.user, "CUSTOMER")) {
     return res.status(403).json({ error: "Customer access only" });
   }
@@ -83,6 +85,7 @@ export function requireCustomer(req: any, res: any, next: any) {
 }
 
 export function requireHrmsAdmin(req: any, res: any, next: any) {
+  if (isSuperAdmin(req)) return next();
   const ok =
     hasRole(req.user, "ADMIN") ||
     hasRole(req.user, "SUPERADMIN") ||

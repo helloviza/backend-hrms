@@ -1,6 +1,7 @@
 // apps/backend/src/workers/videoProcessingWorker.ts
 
 import VideoAnalysis from "../models/VideoAnalysis.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { ingestVideoTranscript } from "../services/video/videoIngest.service.js";
 import { extractVideoInsights } from "../services/video/videoInsightExtractor.js";
 
@@ -11,6 +12,7 @@ let isRunning = false;
  * Video Processing Worker
  * -----------------------
  * Finds uploaded videos and processes them asynchronously.
+ * Now scoped per workspace to enforce tenant isolation.
  *
  * PIPELINE:
  * uploaded
@@ -18,12 +20,6 @@ let isRunning = false;
  *   → transcript ingestion (Google STT)
  *   → insight extraction
  *   → analyzed
- *
- * SAFE GUARANTEES:
- * - Single-process lock
- * - Status-based idempotency
- * - Crash-safe (DB is source of truth)
- * - Graceful degradation (STT failure does NOT break pipeline)
  */
 
 export function startVideoProcessingWorker() {
@@ -34,35 +30,38 @@ export function startVideoProcessingWorker() {
 
   setInterval(async () => {
     try {
-      /**
-       * Pick ONE unprocessed video at a time.
-       * Atomic update ensures no double-processing.
-       */
-      const video = await VideoAnalysis.findOneAndUpdate(
-        { status: "uploaded" },
-        { status: "processing", progress: 1 },
-        { sort: { createdAt: 1 }, new: true }
-      );
+      // Process per workspace
+      const workspaces = await CustomerWorkspace.find({ status: "ACTIVE" }).select("_id").lean();
 
-      if (!video) {
-        return; // nothing to process
+      for (const workspace of workspaces) {
+        try {
+          /**
+           * Pick ONE unprocessed video per workspace at a time.
+           * Atomic update ensures no double-processing.
+           */
+          const video = await VideoAnalysis.findOneAndUpdate(
+            { workspaceId: workspace._id, status: "uploaded" },
+            { status: "processing", progress: 1 },
+            { sort: { createdAt: 1 }, new: true }
+          );
+
+          if (!video) continue; // nothing to process in this workspace
+
+          console.log(`[VideoWorker] Processing video ${video._id} (workspace ${workspace._id})`);
+
+          /**
+           * STEP 1: Ingest audio → generate transcript
+           */
+          await ingestVideoTranscript(video._id.toString());
+
+          /**
+           * STEP 2: Extract normalized travel insights
+           */
+          await extractVideoInsights(video._id.toString());
+        } catch (err) {
+          console.error(`[VideoWorker] Error in workspace ${workspace._id}:`, err);
+        }
       }
-
-      console.log(`🎬 Processing video ${video._id}`);
-
-      /**
-       * STEP 1: Ingest audio → generate transcript
-       * - Uses Google Speech-to-Text
-       * - Safe to fail (extractor still runs)
-       */
-      await ingestVideoTranscript(video._id.toString());
-
-      /**
-       * STEP 2: Extract normalized travel insights
-       * - Writes insights + injectedContext
-       * - Marks status = analyzed
-       */
-      await extractVideoInsights(video._id.toString());
     } catch (err) {
       console.error("❌ Video worker error:", err);
     }

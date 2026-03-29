@@ -1,5 +1,6 @@
 // apps/backend/src/models/TravelBooking.ts
 import { Schema, model, type Document } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 export interface ITravelBooking extends Document {
   tenantId: string;
@@ -46,7 +47,8 @@ const SERVICE_ENUM = [
 
 const TravelBookingSchema = new Schema(
   {
-    tenantId: { type: String, default: "default", index: true },
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
+    tenantId: { type: String, default: "default", index: true }, // legacy
     service: { type: String, enum: SERVICE_ENUM, required: true },
     amount: { type: Number, required: true, default: 0 },
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
@@ -76,6 +78,8 @@ const TravelBookingSchema = new Schema(
   { timestamps: true },
 );
 
+TravelBookingSchema.plugin(workspaceScopePlugin);
+TravelBookingSchema.index({ workspaceId: 1, userId: 1 });
 TravelBookingSchema.index({ userId: 1, bookedAt: -1 });
 TravelBookingSchema.index({ tenantId: 1, bookedAt: -1 });
 TravelBookingSchema.index({ service: 1, bookedAt: -1 });

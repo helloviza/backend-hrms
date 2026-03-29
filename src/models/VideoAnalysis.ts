@@ -1,4 +1,5 @@
 import { Schema, model, Types } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 /**
  * VideoAnalysis
@@ -15,10 +16,10 @@ import { Schema, model, Types } from "mongoose";
 const VideoAnalysisSchema = new Schema(
   {
     /* ───────── Ownership & Scope ───────── */
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
     tenantId: {
       type: String,
-      required: true,
-      index: true,
+      index: true, // legacy — kept for migration
     },
 
     userId: {
@@ -172,7 +173,10 @@ classification: {
   }
 );
 
+VideoAnalysisSchema.plugin(workspaceScopePlugin);
+
 /* ───────── Indexes ───────── */
+VideoAnalysisSchema.index({ workspaceId: 1, status: 1 });
 VideoAnalysisSchema.index({ userId: 1, createdAt: -1 });
 VideoAnalysisSchema.index({ tenantId: 1, status: 1 });
 VideoAnalysisSchema.index({ conversationId: 1 });

@@ -11,6 +11,8 @@ import SBTRequest from "../models/SBTRequest.js";
 import SBTConfig from "../models/SBTConfig.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
+import { requireFeature } from "../middleware/requireFeature.js";
 import { sendMail } from "../utils/mailer.js";
 import { clearTBOToken, logoutTBO, getTBOTokenStatus, getAgencyBalance, getTBOToken } from "../services/tbo.auth.service.js";
 import { listTBOLogs, readTBOLog, logTBOCall } from "../utils/tboFileLogger.js";
@@ -32,6 +34,7 @@ import {
 import { consolidateCertificationLogs } from "../services/tbo.log.consolidator.js";
 
 const router = express.Router();
+router.use(requireFeature("flightBookingEnabled"));
 
 /* ── Duplicate booking prevention (24-hour window) ─────────────────────── */
 async function checkDuplicateBooking(params: {
@@ -233,7 +236,7 @@ async function requireSBT(req: any, res: any, next: any) {
     const userId = req.user?.id || req.user?._id;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const user = await User.findById(userId).select("sbtEnabled").lean();
+    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceId }).select("sbtEnabled").lean();
     if (!user || !(user as any).sbtEnabled) {
       return res.status(403).json({ error: "SBT access not enabled for this account" });
     }
@@ -254,7 +257,7 @@ async function requireFlightAccess(req: any, res: any, next: any) {
     }
 
     const userId = req.user?.id || req.user?._id;
-    const user = await User.findById(userId)
+    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceId })
       .select("sbtBookingType customerId")
       .lean();
 
@@ -1483,7 +1486,7 @@ router.post("/bookings/save", async (req: any, res: any) => {
     // If this booking fulfils an SBT request, mark it as BOOKED and notify L1
     if (b.sbtRequestId) {
       try {
-        const sbtReq = await SBTRequest.findById(b.sbtRequestId);
+        const sbtReq = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceId);
         if (sbtReq && sbtReq.status === "PENDING") {
           sbtReq.status = "BOOKED";
           (sbtReq as any).bookingId = doc._id;
@@ -1491,7 +1494,7 @@ router.post("/bookings/save", async (req: any, res: any) => {
           await sbtReq.save();
 
           // Send confirmation email to L1 requester
-          const requester = await User.findById(sbtReq.requesterId)
+          const requester = await User.findOne({ _id: sbtReq.requesterId, workspaceId: req.workspaceId })
             .select("name email").lean() as any;
           if (requester?.email) {
             const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";

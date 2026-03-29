@@ -4,6 +4,11 @@ import User from "../models/User.js";
 import { Onboarding } from "../models/Onboarding.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRoles } from "../middleware/roles.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
+import mongoose from "mongoose";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import bcrypt from "bcryptjs";
 import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
 import { s3 } from "../config/aws.js";
@@ -73,6 +78,77 @@ async function tryDeleteOldAvatar(oldKey?: string) {
 /* ─────────────── ROUTES ─────────────── */
 
 /**
+ * GET /api/users
+ * List workspace-scoped users (for payroll, salary structure, etc.)
+ *
+ * SUPERADMIN: may not have workspaceId in JWT. Resolves from
+ * query param, x-workspace-id header, or falls back to the
+ * first active workspace in the DB.
+ */
+r.get(
+  "/",
+  requireAuth,
+  requireWorkspace,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      let workspaceId: mongoose.Types.ObjectId | null = req.workspaceObjectId || null;
+
+      // SUPERADMIN fallback: resolve from query / header / first active workspace
+      if (!workspaceId && isSuperAdmin(req)) {
+        const explicit =
+          (req.query as any).workspaceId ||
+          req.headers["x-workspace-id"];
+        if (explicit) {
+          workspaceId = new mongoose.Types.ObjectId(String(explicit));
+        } else {
+          const ws = await CustomerWorkspace.findOne({ status: "ACTIVE" })
+            .select("_id")
+            .lean();
+          if (ws) {
+            console.warn(
+              `[SUPERADMIN AUTO-RESOLVE] No workspaceId provided. ` +
+              `Falling back to first active workspace: ${ws._id}. ` +
+              `User: ${(req as any).user?.email}. Path: ${req.path}`
+            );
+            workspaceId = ws._id as mongoose.Types.ObjectId;
+          }
+        }
+      }
+
+      if (!workspaceId) {
+        return res.status(400).json({ success: false, error: "workspaceId required" });
+      }
+
+      const { limit = "500", department, status, search } = req.query as any;
+
+      const filter: any = { workspaceId };
+      if (status !== "all") filter.status = { $ne: "INACTIVE" };
+      if (department) filter.department = department;
+      if (search) {
+        filter.$or = [
+          { name: { $regex: search, $options: "i" } },
+          { firstName: { $regex: search, $options: "i" } },
+          { lastName: { $regex: search, $options: "i" } },
+          { email: { $regex: search, $options: "i" } },
+        ];
+      }
+
+      const lim = Math.min(1000, Math.max(1, parseInt(limit, 10) || 500));
+
+      const users = await User.find(filter)
+        .select("_id name firstName lastName email employeeCode designation department status dateOfJoining ctc workspaceId")
+        .limit(lim)
+        .sort({ name: 1 })
+        .lean();
+
+      return res.json({ success: true, users, total: users.length });
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
+/**
  * GET /api/users/profile
  * Get current user profile
  *
@@ -88,7 +164,7 @@ r.get(
       const userId = (req as any).user?.sub;
       if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-      const user = await User.findById(userId).select("-passwordHash").lean();
+      const user = await User.findOne({ _id: userId, workspaceId: (req as any).workspaceId }).select("-passwordHash").lean();
       if (!user) return res.status(404).json({ error: "User not found" });
 
       const u: any = user;
@@ -214,7 +290,7 @@ r.post(
       }
 
       // load current user to optionally delete old avatar object
-      const current = await User.findById(userId).select("avatarKey").lean();
+      const current = await User.findOne({ _id: userId, workspaceId: (req as any).workspaceId }).select("avatarKey").lean();
       const oldKey = (current as any)?.avatarKey || "";
 
       await User.findByIdAndUpdate(userId, {
@@ -355,7 +431,7 @@ r.post(
 
       // Path A: grant access to an existing User doc (from tempPassword flow)
       if (userId) {
-        const target = await User.findById(userId);
+        const target = await scopedFindById(User, userId, (req as any).workspaceId);
         if (!target) return res.status(404).json({ error: "User not found." });
         Object.assign(target, activation, ...(officialEmail ? [{ officialEmail }] : []));
         await (target as any).save();
@@ -379,7 +455,7 @@ r.post(
         return res.status(400).json({ error: "userId or onboardingId is required." });
       }
 
-      const onboarding = await (Onboarding as any).findById(onboardingId).lean();
+      const onboarding = await (Onboarding as any).findOne({ _id: onboardingId, workspaceId: (req as any).workspaceId }).lean();
       if (!onboarding) {
         return res.status(404).json({ error: "Onboarding record not found." });
       }
@@ -458,7 +534,7 @@ r.patch("/admin/users/:id/sbt", requireAuth, async (req: any, res: any) => {
 
     const { sbtEnabled, sbtBookingType } = req.body;
 
-    const targetUser: any = await User.findById(req.params.id).select("customerId email").lean();
+    const targetUser: any = await User.findOne({ _id: req.params.id, workspaceId: req.workspaceId }).select("customerId email").lean();
     if (!targetUser) return res.status(404).json({ error: "User not found" });
 
     // WORKSPACE_LEADER: scoped checks

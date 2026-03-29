@@ -43,6 +43,7 @@ import SBTRequest from "../models/SBTRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 
 // ✅ VIDEO CONTEXT ADAPTER (AUTHORITATIVE)
 import {
@@ -190,7 +191,7 @@ router.post(
         });
       }
 
-      const video = await VideoAnalysis.findById(videoId);
+      const video = await scopedFindById(VideoAnalysis, videoId, (req as any).workspaceId);
       if (!video) {
         return res.status(404).json({
           ok: false,
@@ -875,7 +876,7 @@ router.post("/", optionalAuth, async (req, res) => {
     // Always rebuild from DB — never trust client-sent contextPatch
     // This ensures locked context wins over soft video assumptions
     if (videoAnalysisId) {
-      const video = await VideoAnalysis.findById(videoAnalysisId)
+      const video = await VideoAnalysis.findOne({ _id: videoAnalysisId, workspaceId: (req as any).workspaceId })
         .select("userConsent insights")
         .lean();
 
@@ -952,7 +953,7 @@ router.post("/", optionalAuth, async (req, res) => {
 
     /* ───────── VIDEO RELEVANCE GATE (ABSOLUTE TRUTH) ───────── */
     if (videoAnalysisId) {
-      const video = await VideoAnalysis.findById(videoAnalysisId)
+      const video = await VideoAnalysis.findOne({ _id: videoAnalysisId, workspaceId: (req as any).workspaceId })
         .select("classification status summaryType")
         .lean();
 
@@ -1429,7 +1430,7 @@ router.post("/raise-request", requireAuth, async (req: any, res: any) => {
     });
 
     // Send email to assigned booker
-    const booker = await User.findById(assignedBookerId)
+    const booker = await User.findOne({ _id: assignedBookerId, workspaceId: (req as any).workspaceId })
       .select("name email").lean() as any;
 
     if (booker?.email) {

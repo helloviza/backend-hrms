@@ -8,6 +8,7 @@ import { z } from "zod";
 
 import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 import { authLogger } from "../utils/logger.js";
 import SessionLog from "../models/SessionLog.js";
 import Customer from "../models/Customer.js";
@@ -804,6 +805,7 @@ r.post("/refresh", async (req, res) => {
     if (!token) return res.status(401).json({ error: "Missing refresh token" });
 
     const payload: any = verifyRefresh(token);
+    // NOTE: pre-auth lookup, workspace not yet available
     const user: any = await User.findById(payload.sub);
     if (!user) return res.status(401).json({ error: "User not found" });
 
@@ -876,6 +878,7 @@ r.get("/me", async (req, res) => {
       return send401ForJwtError(res, err);
     }
 
+    // NOTE: pre-auth lookup, workspace not yet available
     const user: any = await User.findById(payload.sub);
     if (!user) return res.status(404).json({ error: "User not found" });
 
@@ -902,6 +905,7 @@ r.post("/change-password", async (req, res) => {
       return send401ForJwtError(res, err);
     }
 
+    // NOTE: pre-auth lookup, workspace not yet available
     const user: any = await User.findById(payload.sub);
     if (!user) return res.status(404).json({ error: "User not found" });
 
@@ -953,6 +957,7 @@ r.post("/admin/reset-password", async (req, res) => {
       return send401ForJwtError(res, err);
     }
 
+    // NOTE: pre-auth lookup, workspace not yet available
     const actor: any = await User.findById(payload.sub);
     if (!actor) return res.status(404).json({ error: "Actor not found" });
     if (!isHrOrAdmin(actor)) return res.status(403).json({ error: "HR/Admin access required" });

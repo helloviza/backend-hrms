@@ -1,8 +1,11 @@
 // apps/backend/src/models/LeaveRequest.ts
 import { Schema, model } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 const LeaveRequestSchema = new Schema(
   {
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
+
     // Who is requesting the leave
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
 
@@ -86,5 +89,8 @@ const LeaveRequestSchema = new Schema(
     timestamps: true,
   },
 );
+
+LeaveRequestSchema.plugin(workspaceScopePlugin);
+LeaveRequestSchema.index({ workspaceId: 1, userId: 1, status: 1, createdAt: -1 });
 
 export default model("LeaveRequest", LeaveRequestSchema);

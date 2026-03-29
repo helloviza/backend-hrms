@@ -11,6 +11,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import User from "../models/User.js";
 import Onboarding from "../models/Onboarding.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 
 import { sendMail } from "../utils/mailer.js";
 import { signEmailActionToken } from "../utils/emailActionToken.js";
@@ -2367,7 +2368,7 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
       }
     }
 
-    const targetUser: any = await User.findById(req.params.userId)
+    const targetUser: any = await User.findOne({ _id: req.params.userId, workspaceId: req.workspaceId })
       .select("customerId email roles")
       .lean();
     if (!targetUser) return res.status(404).json({ error: "User not found" });
@@ -2417,7 +2418,7 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
     if (permission === "sbtAssignedBookerId") {
       if (value) {
         // Validate: target booker must have sbtRole L2/BOTH or be WORKSPACE_LEADER, same customerId, not self
-        const booker: any = await User.findById(value).select("sbtRole customerId roles").lean();
+        const booker: any = await User.findOne({ _id: value, workspaceId: req.workspaceId }).select("sbtRole customerId roles").lean();
         if (!booker) return res.status(400).json({ error: "Assigned booker user not found" });
         const bookerRoles = (Array.isArray(booker.roles) ? booker.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
         const bookerIsWL = bookerRoles.includes("WORKSPACELEADER");

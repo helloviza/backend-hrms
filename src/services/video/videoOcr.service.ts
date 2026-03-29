@@ -31,7 +31,7 @@ const s3 = new S3Client({
  * NEVER fails the video pipeline.
  */
 export async function ingestVideoOcr(videoAnalysisId: string) {
-  const record = await VideoAnalysis.findById(videoAnalysisId);
+  const record = await VideoAnalysis.findOne({ _id: videoAnalysisId });
   if (!record) {
     throw new Error("VideoAnalysis not found");
   }

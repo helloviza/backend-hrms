@@ -1,9 +1,11 @@
 import { Schema, model, type Document } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import TravelBooking from "./TravelBooking.js";
 
 export interface ISBTBooking extends Document {
   userId: Schema.Types.ObjectId;
-  customerId?: string;
+  workspaceId: Schema.Types.ObjectId;
+  customerId?: string; // legacy
   traceId?: string;
   pnr: string;
   bookingId: string;
@@ -68,7 +70,8 @@ export interface ISBTBooking extends Document {
 const SBTBookingSchema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
-    customerId: { type: String, trim: true, index: true },
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
+    customerId: { type: String, trim: true, index: true }, // legacy
     traceId: { type: String, default: "", index: true },
     pnr: { type: String, default: "" },
     bookingId: { type: String, default: "" },
@@ -149,6 +152,8 @@ const SBTBookingSchema = new Schema(
   { timestamps: true },
 );
 
+SBTBookingSchema.plugin(workspaceScopePlugin);
+SBTBookingSchema.index({ workspaceId: 1, userId: 1, status: 1 });
 SBTBookingSchema.index({ userId: 1, createdAt: -1 });
 SBTBookingSchema.index({ pnr: 1 });
 SBTBookingSchema.index({ bookingId: 1 });

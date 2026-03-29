@@ -309,7 +309,7 @@ async function resolveWorkspaceScope(user: AnyObj, req: AnyObj): Promise<Resolve
   const actorEmail = normalizeEmail(pickFrom(user, ["email", "mail", "username", "userEmail"]));
 
   if (sub && isValidObjectId(sub)) {
-    const u: any = await User.findById(sub).lean().exec();
+    const u: any = await User.findOne({ _id: sub, workspaceId: req.workspaceId }).lean().exec();
 
     const dbEmail = normalizeEmail(u?.email || "");
     const mergedEmail = actorEmail || dbEmail;
@@ -529,6 +529,15 @@ router.get("/config", async (req: AnyObj, res) => {
     const config = ws.config?.travelFlow
       ? ws.config
       : deriveConfigFromLegacy(ws.travelMode);
+
+    // Merge feature flags that may have been set directly on config.features
+    // (e.g. payrollEnabled set via workspace.settings payroll-enable endpoint)
+    if (ws.config?.features) {
+      if (!config.features) config.features = {};
+      if (ws.config.features.payrollEnabled !== undefined) {
+        config.features.payrollEnabled = ws.config.features.payrollEnabled;
+      }
+    }
 
     res.setHeader("Cache-Control", "no-store");
     res.json({ ok: true, customerId, config });

@@ -1,8 +1,9 @@
 // apps/backend/src/models/LeavePolicy.ts
 import mongoose, { Schema, Document, Model } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 export interface ILeavePolicy extends Document {
-  workspaceId?: mongoose.Types.ObjectId;
+  workspaceId: mongoose.Types.ObjectId;
   probationDays: number;
   leaveYearStart: string;
   slCreditMode: "MONTHLY" | "UPFRONT";
@@ -32,7 +33,7 @@ interface ILeavePolicyModel extends Model<ILeavePolicy> {
 
 const LeavePolicySchema = new Schema<ILeavePolicy>(
   {
-    workspaceId: { type: Schema.Types.ObjectId, default: null },
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
 
     // Probation
     probationDays: { type: Number, default: 90 },
@@ -77,6 +78,9 @@ const LeavePolicySchema = new Schema<ILeavePolicy>(
   },
   { timestamps: true },
 );
+
+LeavePolicySchema.plugin(workspaceScopePlugin);
+LeavePolicySchema.index({ workspaceId: 1, name: 1 });
 
 LeavePolicySchema.statics.getOrCreate = async function (
   workspaceId?: mongoose.Types.ObjectId,

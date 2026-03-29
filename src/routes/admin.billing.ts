@@ -5,6 +5,7 @@ import logger from "../utils/logger.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import User from "../models/User.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -24,7 +25,7 @@ async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction
   const sub = String(user?.sub || user?._id || user?.id || "");
   if (!sub) return res.status(403).json({ error: "Access denied" });
 
-  const dbUser: any = await User.findById(sub).select("sbtEnabled customerId canViewBilling").lean();
+  const dbUser: any = await User.findOne({ _id: sub, workspaceId: (req as any).workspaceId }).select("sbtEnabled customerId canViewBilling").lean();
   if (dbUser?.sbtEnabled === true && dbUser?.customerId) {
     if (dbUser?.canViewBilling !== true) {
       return res.status(403).json({

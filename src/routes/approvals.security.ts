@@ -1,6 +1,7 @@
 // apps/backend/src/routes/approvals.security.ts
 import { requireAuth } from "../middleware/auth.js";
 import User from "../models/User.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 import CustomerMember from "../models/CustomerMember.js";
 
 export type AnyObj = Record<string, any>;
@@ -301,6 +302,7 @@ export async function hydrateUserFromDb(user: AnyObj | null | undefined): Promis
     let doc: any = null;
 
     if (sub && isValidObjectId(sub)) {
+      // NOTE: pre-auth hydration utility — no req.workspaceId available in this standalone function
       doc = await User.findById(sub).lean().exec();
     }
     if (!doc && sub) {

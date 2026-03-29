@@ -2,8 +2,14 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import User from "../models/User.js";
 import Employee from "../models/Employee.js";
+import WorkspaceInvite from "../models/WorkspaceInvite.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { sendEmployeeInvite } from "../services/email.service.js";
+import crypto from "crypto";
 
 const router = Router();
 
@@ -64,29 +70,64 @@ function sanitise(user: AnyUser) {
 
 /**
  * GET /api/employees
- * List all HRMS employees (for TeamProfiles page).
+ * List HRMS employees with search, filtering, and pagination.
+ * Query params: search, department, designation, status (active|inactive|all), page, limit
  */
-router.get("/", requireAuth, async (_req, res, next) => {
+router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
-    const employees = await Employee.find({})
-      .sort({ employeeCode: 1, createdAt: 1 })
-      .lean();
+    const search = String(req.query.search || "").trim();
+    const department = String(req.query.department || "").trim();
+    const designation = String(req.query.designation || "").trim();
+    const statusParam = String(req.query.status || "active").toLowerCase();
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10));
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || "50"), 10)));
+
+    const filter: any = {};
+    if (req.workspaceObjectId) filter.workspaceId = req.workspaceObjectId;
+
+    if (statusParam === "inactive") {
+      filter.status = "INACTIVE";
+    } else if (statusParam !== "all") {
+      filter.status = { $ne: "INACTIVE" };
+    }
+    if (department) filter.department = department;
+    if (designation) filter.designation = designation;
+    if (search) {
+      filter.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { fullName: { $regex: search, $options: "i" } },
+        { email: { $regex: search, $options: "i" } },
+        { employeeCode: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const [employees, total] = await Promise.all([
+      Employee.find(filter)
+        .sort({ employeeCode: 1, createdAt: 1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Employee.countDocuments(filter),
+    ]);
 
     const emails = employees.map((e: any) => e.email).filter(Boolean);
     const users = await User.find({ email: { $in: emails } })
-      .select("email roles hrmsAccessRole isActive activatedByAdmin tempPassword avatarKey avatarUrl")
+      .select("email roles hrmsAccessRole isActive activatedByAdmin tempPassword avatarKey avatarUrl lastLoginAt")
       .lean();
 
     const userMap = new Map(users.map((u: any) => [u.email, u]));
 
-    // Debug: log raw User fields for role verification
-    for (const u of users) {
-      console.log("[GET /employees] User →", {
-        email: (u as any).email,
-        roles: (u as any).roles,
-        hrmsAccessRole: (u as any).hrmsAccessRole,
-      });
-    }
+    // Look up pending invites for invite status badges
+    const pendingInvites = req.workspaceObjectId
+      ? await WorkspaceInvite.find({
+          workspaceId: req.workspaceObjectId,
+          status: "pending",
+          expiresAt: { $gt: new Date() },
+        })
+          .select("email")
+          .lean()
+      : [];
+    const pendingEmails = new Set(pendingInvites.map((i: any) => i.email));
 
     const enriched = employees.map((e: any) => ({
       ...e,
@@ -98,6 +139,12 @@ router.get("/", requireAuth, async (_req, res, next) => {
       hasLogin: userMap.has(e.email),
       activatedByAdmin: userMap.get(e.email)?.activatedByAdmin || false,
       tempPassword: userMap.get(e.email)?.tempPassword || false,
+      lastLoginAt: userMap.get(e.email)?.lastLoginAt || null,
+      inviteStatus: userMap.get(e.email)?.lastLoginAt
+        ? "ACTIVE"
+        : pendingEmails.has(e.email)
+          ? "INVITE_PENDING"
+          : "NOT_INVITED",
     }));
 
     const flattened = enriched.map((e: any) => {
@@ -106,52 +153,93 @@ router.get("/", requireAuth, async (_req, res, next) => {
 
       return {
         ...e,
-        // Name fields
         firstName: e.firstName || nameParts[0] || "",
         lastName: e.lastName || nameParts.slice(1).join(" ") || "",
         name: e.fullName || snap.fullName || e.name || "",
-
-        // Contact
         personalContact: e.personalContact || snap.contact?.personalMobile || e.phone || "",
         personalEmail: e.personalEmail || snap.contact?.personalEmail || "",
         officialEmail: e.officialEmail || e.email || "",
-
-        // Emergency
         emergencyContactName: e.emergencyContactName || snap.emergency?.name || "",
         emergencyContactNumber: e.emergencyContactNumber || snap.emergency?.mobile || "",
         emergencyContactRelation: e.emergencyContactRelation || snap.emergency?.relationship || "",
-
-        // IDs
         pan: e.pan || snap.ids?.pan || "",
         aadhaar: e.aadhaar || snap.ids?.aadhaar || "",
         voterId: e.voterId || snap.ids?.voterId || "",
         passportNumber: e.passportNumber || snap.ids?.passport || "",
-
-        // Personal
         dateOfBirth: e.dateOfBirth || snap.dateOfBirth || "",
         gender: e.gender || snap.gender || "",
         maritalStatus: e.maritalStatus || snap.employment?.maritalStatus || "",
-
-        // Address
         currentAddress: e.currentAddress || snap.address?.current || "",
         permanentAddress: e.permanentAddress || snap.address?.permanent || "",
-
-        // Bank
         bankAccountNumber: e.bankAccountNumber || snap.bank?.accountNumber || "",
         bankName: e.bankName || snap.bank?.bankName || "",
         ifsc: e.ifsc || snap.bank?.ifsc || "",
         bankBranch: e.bankBranch || snap.bank?.branch || "",
-
-        // Education
         highestDegree: e.highestDegree || snap.education?.highestDegree || "",
         institution: e.institution || snap.education?.institution || "",
-
-        // Employment
         joiningDate: e.joiningDate || snap.employment?.dateOfJoining || "",
       };
     });
 
-    return res.json(flattened);
+    return res.json({
+      employees: flattened,
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/employees/bulk-update
+ * Bulk update department, designation, or status for selected employees.
+ */
+router.post("/bulk-update", requireAuth, requireWorkspace, async (req: any, res, next) => {
+  try {
+    if (!isAdminish(req.user)) {
+      return res.status(403).json({ error: "Only admins can bulk update employees" });
+    }
+
+    const { userIds, updates } = req.body || {};
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ error: "userIds array is required" });
+    }
+    if (!updates || typeof updates !== "object") {
+      return res.status(400).json({ error: "updates object is required" });
+    }
+
+    const $set: any = {};
+    if (updates.department !== undefined) $set.department = String(updates.department).trim();
+    if (updates.designation !== undefined) $set.designation = String(updates.designation).trim();
+    if (updates.status !== undefined) $set.status = String(updates.status).toUpperCase();
+
+    if (Object.keys($set).length === 0) {
+      return res.status(400).json({ error: "No valid updates provided" });
+    }
+
+    // Update User records
+    const userResult = await User.updateMany(
+      { _id: { $in: userIds }, ...(req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {}) },
+      { $set },
+    );
+
+    // Also update Employee records (by ownerId match)
+    const employeeSet: any = {};
+    if ($set.department) employeeSet.department = $set.department;
+    if ($set.designation) employeeSet.designation = $set.designation;
+    if ($set.status) employeeSet.status = $set.status;
+
+    if (Object.keys(employeeSet).length > 0) {
+      await Employee.updateMany(
+        { ownerId: { $in: userIds }, ...(req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {}) },
+        { $set: employeeSet },
+      );
+    }
+
+    return res.json({ updated: userResult.modifiedCount });
   } catch (err) {
     next(err);
   }
@@ -242,7 +330,52 @@ router.post("/", requireAuth, async (req: any, res, next) => {
     };
 
     const created = await User.create(payload);
-    return res.status(201).json(sanitise(created));
+
+    // ── Optional: send workspace invite ──
+    let inviteSent = false;
+    if (body.sendInvite && officialEmail && req.workspaceObjectId) {
+      try {
+        // Check for existing pending invite
+        const existingInvite = await WorkspaceInvite.findOne({
+          workspaceId: req.workspaceObjectId,
+          email: officialEmail,
+          status: "pending",
+          expiresAt: { $gt: new Date() },
+        });
+
+        if (!existingInvite) {
+          const token = crypto.randomBytes(32).toString("hex");
+          const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+
+          await WorkspaceInvite.create({
+            workspaceId: req.workspaceObjectId,
+            email: officialEmail,
+            name: fullName || undefined,
+            role: hrmsAccessRole,
+            department: body.department || undefined,
+            designation: body.designation || undefined,
+            invitedBy: req.user._id ?? req.user.id ?? req.user.sub,
+            token,
+            expiresAt,
+            status: "pending",
+          });
+
+          const workspace = await CustomerWorkspace.findById(req.workspaceObjectId).select("companyName").lean();
+          const inviteUrl = `https://plumbox.plumtrips.com/join?token=${token}`;
+          await sendEmployeeInvite(officialEmail, {
+            companyName: (workspace as any)?.companyName || "your company",
+            inviterName: req.user.name || req.user.email || "HR",
+            inviteUrl,
+            expiresAt,
+          });
+          inviteSent = true;
+        }
+      } catch (inviteErr: any) {
+        console.error("[POST /employees] invite send failed:", inviteErr?.message);
+      }
+    }
+
+    return res.status(201).json({ ...sanitise(created), inviteSent, inviteEmail: officialEmail });
   } catch (err) {
     next(err);
   }
@@ -267,9 +400,9 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
     delete (body as any).passwordHash;
 
     // First try to find by Employee doc to get ownerId
-    const employeeDoc = await Employee.findById(id).exec();
+    const employeeDoc = await Employee.findOne({ _id: id, workspaceId: req.workspaceId }).exec();
     const userId = employeeDoc?.ownerId ?? id;
-    const existing: AnyUser | null = await User.findById(userId).exec();
+    const existing: AnyUser | null = await scopedFindById(User, userId, req.workspaceId);
     if (!existing) {
       return res.status(404).json({ error: "Employee not found" });
     }

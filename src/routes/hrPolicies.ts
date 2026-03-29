@@ -6,6 +6,7 @@ import path from "path";
 
 import Policy from "../models/Policy.js";
 import { requireAuth } from "../middleware/auth.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 
 const router = express.Router();
 
@@ -323,7 +324,7 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
       return res.status(403).json({ error: "Not allowed" });
     }
 
-    const policy = await Policy.findById(req.params.id);
+    const policy = await scopedFindById(Policy, req.params.id, req.workspaceId);
     if (!policy) {
       return res.status(404).json({ error: "Policy not found" });
     }
@@ -390,7 +391,7 @@ router.delete("/:id", requireAuth, async (req: any, res, next) => {
     }
 
     const { id } = req.params;
-    const policy = await Policy.findById(id);
+    const policy = await scopedFindById(Policy, id, req.workspaceId);
 
     if (!policy) {
       return res.status(404).json({ error: "Policy not found" });

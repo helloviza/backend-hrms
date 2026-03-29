@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
 import requireAuth from "../middleware/auth.js";
 import User from "../models/User.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 import CustomerWhitelistDomain from "../models/CustomerWhitelistDomain.js";
 import CustomerWhitelistEmail from "../models/CustomerWhitelistEmail.js";
 import MasterData from "../models/MasterData.js";
@@ -130,7 +131,7 @@ r.put("/settings/approver", requireAuth, requireCustomer, async (req: any, res, 
     }
 
     // ensure approver belongs to same workspace
-    const u: any = await User.findById(approverUserId).lean();
+    const u: any = await scopedFindById(User, approverUserId, workspaceId);
     if (!u) return res.status(404).json({ error: "Approver user not found" });
     if (String(u.customerWorkspaceId || "") !== String(workspaceId)) {
       return res.status(400).json({ error: "Approver must belong to the same workspace" });

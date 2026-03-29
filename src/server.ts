@@ -12,6 +12,8 @@ import { connectDb } from "./config/db.js";
 import { corsMiddleware } from "./config/cors.js";
 import { helmetMiddleware } from "./config/helmet.js";
 import { errorHandler } from "./middleware/error.js";
+import { requireWorkspace } from "./middleware/requireWorkspace.js";
+import { requireAuth } from "./middleware/auth.js";
 import { apiLimiter, authLimiter, flightSearchLimiter, hotelSearchLimiter } from "./middleware/rateLimit.js";
 import { env } from "./config/env.js";
 import vouchers from "./routes/vouchers.js";
@@ -197,6 +199,19 @@ app.use("/api/auth", authLimiter);
 app.use("/api/sbt/flights/search", flightSearchLimiter);
 app.use("/api/sbt/hotels/search", hotelSearchLimiter);
 
+/* ────────────────────────────────────────────────────────────────
+ * WORKSPACE SCOPING — runs after per-route requireAuth sets req.user.
+ * Skips when req.user is absent (public/webhook routes).
+ * Exempts: /api/auth, /api/health, /api/_probe, /api/webhooks
+ * ──────────────────────────────────────────────────────────────── */
+const WORKSPACE_EXEMPT = new Set(["/api/auth", "/api/health", "/api/_probe", "/api/webhooks", "/api/stubs"]);
+app.use("/api", (req: any, res, next) => {
+  // Skip public routes
+  const basePath = "/api" + (req.path.split("/").slice(0, 2).join("/") || "");
+  if (WORKSPACE_EXEMPT.has(basePath) || !req.user) return next();
+  return requireWorkspace(req, res, next);
+});
+
 // Strip trailing slashes from all API routes
 app.use((req, res, next) => {
   if (req.path !== '/' && req.path.endsWith('/')) {
@@ -291,7 +306,9 @@ app.use("/api/places", placesRouter);
 // Proposals
 app.use("/api/proposals", proposalsRouter);
 
-// Auth & users
+// Auth & users (signup/invite-accept are public routes on the same prefix)
+import signupRouter from "./routes/auth.signup.js";
+app.use("/api/auth", signupRouter);
 app.use("/api/auth", auth);
 app.use("/api/users", users);
 
@@ -306,9 +323,18 @@ app.use("/api/holidays", holidays);
 // Uploads
 app.use("/api/uploads", uploads);
 
+// Documents (employee document vault)
+import documentsRouter from "./routes/documents.js";
+app.use("/api/documents", documentsRouter);
+
 // Onboarding & master
 app.use("/api/onboarding", (onboarding as any).default || onboarding);
 app.use("/api/master-data", masterDataRouter);
+
+// Department & Designation master lists
+import masterDataDeptRouter from "./routes/masterData.departments.js";
+app.use("/api/master-data", masterDataDeptRouter);
+
 app.use("/api/password", passwordRoutes);
 
 // Vendor & business
@@ -321,6 +347,17 @@ app.use("/api", vendorCustomerSelfRouter);
 
 // Workspace
 app.use("/api/v1/workspace", workspaceRouter);
+
+// Workspace provisioning (onboarding, invites)
+import onboardingRouter from "./routes/workspace.onboarding.js";
+import inviteRouter from "./routes/workspace.invites.js";
+app.use("/api/workspace/onboarding", onboardingRouter);
+app.use("/api/workspace/invites", inviteRouter);
+
+// SUPERADMIN provisioning
+import { requireSuperAdmin } from "./middleware/requireSuperAdmin.js";
+import superadminWorkspacesRouter from "./routes/superadmin.workspaces.js";
+app.use("/api/superadmin", requireAuth, requireSuperAdmin, superadminWorkspacesRouter);
 
 // Copilot & Pluto
 app.use("/api/v1/copilot/travel", travelCopilotRoutes);
@@ -375,6 +412,10 @@ app.use("/api/admin", adminRouter);
 app.use("/api/admin", adminAnalyticsRouter);
 app.use("/api/admin", users);
 
+// Admin — Data export (DPDP Act 2023 compliance)
+import adminDataExportRouter from "./routes/admin.dataExport.js";
+app.use("/api/admin", adminDataExportRouter);
+
 // Admin — Payment orphans (Razorpay webhook mismatches)
 import adminPaymentOrphansRouter from "./routes/admin.paymentOrphans.js";
 app.use("/api/admin/payment-orphans", adminPaymentOrphansRouter);
@@ -401,6 +442,20 @@ app.use("/api/proxy", proxyRouter);
 app.use("/api/activity", activityRoutes);
 app.use("/api/presence", presenceRoutes);
 app.use("/api/meetings", meetingRoutes);
+
+// ✅ Payroll routes
+import payrollSalaryRouter from "./routes/payroll.salary.js";
+import payrollRunRouter from "./routes/payroll.run.js";
+import payrollPayslipRouter from "./routes/payroll.payslip.js";
+import payrollReimbursementsRouter from "./routes/payroll.reimbursements.js";
+import payrollDeclarationRouter from "./routes/payroll.declaration.js";
+import workspaceSettingsRouter from "./routes/workspace.settings.js";
+app.use("/api/payroll/salary", payrollSalaryRouter);
+app.use("/api/payroll/runs", payrollRunRouter);
+app.use("/api/payroll/payslip", payrollPayslipRouter);
+app.use("/api/payroll/reimbursements", payrollReimbursementsRouter);
+app.use("/api/payroll/declaration", payrollDeclarationRouter);
+app.use("/api/workspace/settings", workspaceSettingsRouter);
 
 // 404
 app.use("/api", (_req, res) => {

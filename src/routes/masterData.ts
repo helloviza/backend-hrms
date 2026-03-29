@@ -9,6 +9,7 @@ import Vendor from "../models/Vendor.js";
 import Customer from "../models/Customer.js";
 import Employee from "../models/Employee.js";
 import { requireAuth } from "../middleware/auth.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 import { sendMail } from "../utils/mailer.js";
 import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
 import { sendOnboardingWelcomeEmail } from "../utils/onboardingWelcomeEmail.js";
@@ -385,7 +386,7 @@ router.patch("/:id", requireAuth, async (req: any, res, next) => {
     const { id } = req.params;
     const body = req.body || {};
 
-    const onboardingDoc: any = await Onboarding.findById(id).exec();
+    const onboardingDoc: any = await Onboarding.findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
     if (!onboardingDoc) {
       return res.status(404).json({ error: "Master record not found" });
     }
@@ -579,7 +580,7 @@ router.post(
 
       const { id } = req.params;
 
-      const onboardingDoc: any = await Onboarding.findById(id).exec();
+      const onboardingDoc: any = await Onboarding.findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
       if (!onboardingDoc) {
         return res.status(404).json({ error: "Onboarding record not found" });
       }
@@ -858,7 +859,7 @@ router.post(
       }
 
       const { id } = req.params;
-      const onboardingDoc: any = await Onboarding.findById(id).exec();
+      const onboardingDoc: any = await Onboarding.findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
       if (!onboardingDoc) {
         return res
           .status(404)
@@ -997,7 +998,7 @@ router.post(
       }
 
       const { id } = req.params;
-      const onboardingDoc: any = await Onboarding.findById(id).exec();
+      const onboardingDoc: any = await Onboarding.findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
       if (!onboardingDoc) {
         return res
           .status(404)

@@ -1,5 +1,6 @@
 // apps/backend/src/models/LeaveBalance.ts
 import mongoose, { Schema } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 interface IBalanceEntry {
   entitled: number;
@@ -16,6 +17,7 @@ interface IEventLeaveEntry {
 }
 
 export interface ILeaveBalance {
+  workspaceId: mongoose.Types.ObjectId;
   userId: mongoose.Types.ObjectId;
   year: number;
   balances: {
@@ -27,6 +29,13 @@ export interface ILeaveBalance {
     BEREAVEMENT: IEventLeaveEntry;
     PATERNITY: IEventLeaveEntry;
   };
+  adjustmentLog?: {
+    adjustedBy: mongoose.Types.ObjectId;
+    days: number;
+    reason: string;
+    leaveType: string;
+    adjustedAt: Date;
+  }[];
   lastAccrualMonth: number;
   probationEndDate?: Date;
   isConfirmed: boolean;
@@ -44,6 +53,7 @@ const BalanceEntrySchema = {
 
 const LeaveBalanceSchema = new Schema<ILeaveBalance>(
   {
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
     year: { type: Number, required: true },
 
@@ -67,6 +77,16 @@ const LeaveBalanceSchema = new Schema<ILeaveBalance>(
       },
     },
 
+    adjustmentLog: [
+      {
+        adjustedBy: { type: Schema.Types.ObjectId, ref: "User" },
+        days: Number,
+        reason: String,
+        leaveType: String,
+        adjustedAt: { type: Date, default: Date.now },
+      },
+    ],
+
     lastAccrualMonth: { type: Number, default: 0 }, // 1–12
     probationEndDate: { type: Date },
     isConfirmed: { type: Boolean, default: false },
@@ -75,6 +95,8 @@ const LeaveBalanceSchema = new Schema<ILeaveBalance>(
   { timestamps: true },
 );
 
+LeaveBalanceSchema.plugin(workspaceScopePlugin);
+LeaveBalanceSchema.index({ workspaceId: 1, userId: 1, year: 1 }, { unique: true });
 LeaveBalanceSchema.index({ userId: 1, year: 1 }, { unique: true });
 
 export default mongoose.model<ILeaveBalance>(

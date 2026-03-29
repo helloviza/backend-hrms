@@ -44,8 +44,28 @@
 - Sort options: 5 sort modes including High→Low
 - Form submit bug: type="button" added to all non-submit buttons in hotel and flight search forms
 
+### Sprint T — Security Hardening + Employee Profile Fixes (2026-03-27)
+
+**Security:**
+- AWS WAF: 10 backend rules deployed (Common, SQLi, Bad Inputs, Known Bad Inputs, IP Reputation, Anonymous IP, Admin Protection override, rate limit 2000/5min, Bot Control, BodySizeRestriction Count)
+- CORS: no-origin fix, preflight fix, S3 CORS plumbox.plumtrips.com
+- Helmet: CSP, HSTS, frameguard
+
+**Grant HRMS Access:**
+- Credentials email in all 3 paths (A/B/C)
+- isActive: true, activatedByAdmin fix for 4 users
+
+**Employee Profile:**
+- PUT /employees/:id: ownerId lookup, dangerous field stripping
+- Access token 15m → 30m
+
 ## Pending
 
+- [ ] BodySizeRestrictionRule → Block (after 48hr monitoring, ~2026-03-29)
+- [ ] IP allowlist for WAF (collect client IPs first)
+- [ ] App Runner private endpoint (VPC link)
+- [ ] Razorpay webhook secret configuration
+- [ ] /api/sbt/flights/my-bookings 404 fix
 - [ ] Case 6: LCC Special Return — awaiting TBO confirmation
 - [ ] Browser testing: JT=5 Special Return, PriceRBD, NDC
 - [ ] Remove ~200 console.log calls from non-priority files
@@ -54,3 +74,4 @@
 - [ ] Ticket PDF: IB leg on page 2
 - [ ] Send TBO hotel cert logs to TBO (Cases 1-8 zipped)
 - [ ] Send TBO flight cert logs to TBO (Cases 1-5,7-12 ready)
+- [ ] MyLearnEx Jitsi JWT role escalation bug

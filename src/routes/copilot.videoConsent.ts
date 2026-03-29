@@ -2,6 +2,8 @@
 
 import { Router } from "express";
 import requireAuth from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 import VideoAnalysis from "../models/VideoAnalysis.js";
 
 const router = Router();
@@ -76,7 +78,7 @@ function extractDestinationFromTranscript(transcript?: string) {
  * -------------------------------------
  * Phase 4: User consent gate
  */
-router.post("/:id/consent", requireAuth, async (req, res) => {
+router.post("/:id/consent", requireAuth, requireWorkspace, async (req, res) => {
   try {
     const { id } = req.params;
     const { consent } = req.body;
@@ -88,7 +90,7 @@ router.post("/:id/consent", requireAuth, async (req, res) => {
       });
     }
 
-    const video = await VideoAnalysis.findById(id);
+    const video = await scopedFindById(VideoAnalysis, id, req.workspaceId);
     if (!video) {
       return res.status(404).json({
         ok: false,

@@ -7,6 +7,7 @@ import Customer from "../models/Customer.js";
 import Vendor from "../models/Vendor.js";
 import User from "../models/User.js";
 import Employee from "../models/Employee.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 
 const router = Router();
 
@@ -129,14 +130,14 @@ router.patch(
         if (!input?.userId) return null;
 
         // 1. Try User collection directly (in case a User _id was passed)
-        let u: any = await User.findById(input.userId)
+        let u: any = await User.findOne({ _id: input.userId, workspaceId: req.workspaceId })
           .select("name fullName firstName lastName email phone mobile contactNo personalContact")
           .lean()
           .exec();
 
         // 2. If not found, try Employee collection → then find linked User by email
         if (!u) {
-          const emp: any = await Employee.findById(input.userId)
+          const emp: any = await Employee.findOne({ _id: input.userId, workspaceId: req.workspaceId })
             .select("email officialEmail companyEmail")
             .lean()
             .exec();

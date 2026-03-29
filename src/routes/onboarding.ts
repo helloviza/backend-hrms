@@ -12,6 +12,7 @@ import Onboarding from "../models/Onboarding.js";
 import { requireAuth } from "../middleware/auth.js";
 import { env } from "../config/env.js";
 import User from "../models/User.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 import { sendOnboardingEmail } from "../emails/index.js";
 import { sendOnboardingWelcomeEmail } from "../utils/onboardingWelcomeEmail.js";
 import { sendRejectionEmail } from "../utils/credentialsEmail.js";
@@ -565,7 +566,7 @@ router.post(
     try {
       const { id } = req.params;
 
-      const invite: any = await (Onboarding as any).findById(id).exec();
+      const invite: any = await (Onboarding as any).findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
       if (!invite) {
         return res.status(404).json({ error: "Invite not found" });
       }
@@ -1027,7 +1028,7 @@ router.get("/:token/details", requireAuth, noStore, async (req, res, next) => {
     let doc: OnboardingDoc | null = null;
     if (isObjectId) {
       // findById correctly casts string → ObjectId
-      doc = (await (Onboarding as any).findById(token).lean().exec()) as OnboardingDoc | null;
+      doc = (await (Onboarding as any).findOne({ _id: token, workspaceId: (req as any).workspaceId }).lean().exec()) as OnboardingDoc | null;
     }
     // If not found by _id (or not an ObjectId), try token string
     if (!doc) {
@@ -1094,7 +1095,7 @@ router.get("/:token/details", requireAuth, noStore, async (req, res, next) => {
 router.post("/:id/extend-expiry", requireAuth, noStore, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const doc: any = await (Onboarding as any).findById(id).exec();
+    const doc: any = await (Onboarding as any).findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
     if (!doc) return res.status(404).json({ error: "Onboarding record not found" });
 
     // Extend from current expiresAt if still in the future, otherwise from now

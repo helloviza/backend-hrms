@@ -1,5 +1,6 @@
 // apps/backend/src/models/Role.ts
 import mongoose, { Schema, Document, Model } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 export type RoleKey =
   | "EMPLOYEE"
@@ -13,6 +14,7 @@ export type RoleKey =
   | "VENDOR";
 
 export interface RoleDocument extends Document {
+  workspaceId: Schema.Types.ObjectId;
   key: RoleKey;            // machine key used in code / JWT / profile
   label: string;           // human label -> "HR Manager", "Employee"
   description?: string;    // optional description for UI / docs
@@ -30,6 +32,7 @@ export interface RoleDocument extends Document {
 
 const RoleSchema = new Schema<RoleDocument>(
   {
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
     key: {
       type: String,
       required: true,
@@ -65,6 +68,9 @@ const RoleSchema = new Schema<RoleDocument>(
     collection: "roles",
   },
 );
+
+RoleSchema.plugin(workspaceScopePlugin);
+RoleSchema.index({ workspaceId: 1, name: 1 }, { unique: true });
 
 // Avoid model overwrite in watch mode
 export const Role: Model<RoleDocument> =

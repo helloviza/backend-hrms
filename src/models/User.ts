@@ -1,5 +1,6 @@
 // apps/backend/src/models/User.ts
 import { Schema, model } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 const UserSchema = new Schema(
   {
@@ -15,9 +16,10 @@ const UserSchema = new Schema(
     },
     officialEmail: { type: String, trim: true }, // company email alias
 
-    // ✅ Workspace linkage (production fix)
-    customerId: { type: String, trim: true, index: true }, // MasterData Business _id
-    businessId: { type: String, trim: true, index: true }, // alias if other code uses businessId
+    // ✅ Workspace linkage (multi-tenancy)
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
+    customerId: { type: String, trim: true, index: true }, // legacy — kept for migration
+    businessId: { type: String, trim: true, index: true }, // legacy alias
     vendorId: { type: String, trim: true, index: true },
 
     // ✅ helpful normalized identity fields (optional but safe)
@@ -137,7 +139,7 @@ const UserSchema = new Schema(
     /* -------------------------------------------------------------- */
     salaryStructure: { type: String, trim: true },
     payGrade: { type: String, trim: true },
-    ctc: { type: String, trim: true },
+    ctc: { type: Number },
 
     bankName: { type: String, trim: true },
     bankAccountNumber: { type: String, trim: true },
@@ -156,7 +158,31 @@ const UserSchema = new Schema(
     overtimeDetails: { type: String, trim: true },
     leaveEncashmentPolicy: { type: String, trim: true },
     deductions: { type: String, trim: true },
-    investmentDeclarations: { type: String, trim: true },
+    investmentDeclarationsLegacy: { type: String, trim: true },
+    investmentDeclarations: {
+      section80C: { type: Number, default: 0 },
+      section80D: { type: Number, default: 0 },
+      section80CCD1B: { type: Number, default: 0 },
+      hra: { type: Number, default: 0 },
+      lta: { type: Number, default: 0 },
+      homeLoanInterest: { type: Number, default: 0 },
+      otherDeductions: { type: Number, default: 0 },
+      parentsHealthInsurance: { type: Number, default: 0 },
+      parentsAreSenior: { type: Boolean, default: false },
+      educationLoanInterest: { type: Number, default: 0 },
+      savingsInterest: { type: Number, default: 0 },
+      ltaClaimedThisYear: { type: Number, default: 0 },
+      donations: [
+        {
+          organizationName: { type: String, trim: true },
+          amount: { type: Number, default: 0 },
+          deductionPercent: { type: Number, default: 50 },
+        },
+      ],
+    },
+    uanNumber: { type: String },
+    salaryEffectiveDate: { type: Date },
+    taxRegimePreference: { type: String, enum: ['OLD', 'NEW'], default: 'NEW' },
     taxFormRecords: { type: String, trim: true },
 
     /* -------------------------------------------------------------- */
@@ -249,6 +275,9 @@ const UserSchema = new Schema(
     toObject: { virtuals: true },
   },
 );
+
+UserSchema.plugin(workspaceScopePlugin);
+UserSchema.index({ workspaceId: 1, email: 1 }, { unique: true });
 
 // Virtual: fullName
 UserSchema.virtual("fullName").get(function () {

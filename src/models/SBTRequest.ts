@@ -1,7 +1,9 @@
 import { Schema, model, type Document } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 export interface ISBTRequest extends Document {
-  customerId: Schema.Types.ObjectId;
+  workspaceId: Schema.Types.ObjectId;
+  customerId: Schema.Types.ObjectId; // legacy
   requesterId: Schema.Types.ObjectId;
   assignedBookerId: Schema.Types.ObjectId;
   type: "flight" | "hotel";
@@ -35,7 +37,8 @@ export interface ISBTRequest extends Document {
 }
 
 const SBTRequestSchema = new Schema({
-  customerId: { type: Schema.Types.ObjectId, required: true, index: true },
+  workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
+  customerId: { type: Schema.Types.ObjectId, index: true }, // legacy
   requesterId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
   assignedBookerId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
   type: { type: String, enum: ["flight", "hotel"], required: true },
@@ -79,6 +82,8 @@ const SBTRequestSchema = new Schema({
   cancelledAt: { type: Date, default: null },
 });
 
+SBTRequestSchema.plugin(workspaceScopePlugin);
+SBTRequestSchema.index({ workspaceId: 1, status: 1, createdAt: -1 });
 SBTRequestSchema.index({ requesterId: 1, status: 1 });
 SBTRequestSchema.index({ assignedBookerId: 1, status: 1 });
 SBTRequestSchema.index({ customerId: 1, status: 1 });

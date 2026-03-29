@@ -1,5 +1,6 @@
 // apps/backend/src/models/ApprovalRequest.ts
 import mongoose, { Schema, type Document, type Model } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 /**
  * Legacy fields kept for backward compatibility with current UI/routes
@@ -106,6 +107,7 @@ export interface ApprovalHistoryItem {
 export interface ApprovalRequestDocument extends Document {
   ticketId?: string;
 
+  workspaceId: Schema.Types.ObjectId;
   customerId: string;
   customerName?: string;
   customerEmailDomain?: string;
@@ -375,7 +377,8 @@ const ApprovalRequestSchema = new Schema<ApprovalRequestDocument>(
   {
     ticketId: { type: String, index: true },
 
-    customerId: { type: String, required: true, index: true },
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
+    customerId: { type: String, index: true }, // legacy — kept for migration
     customerName: { type: String },
     customerEmailDomain: { type: String, index: true },
 
@@ -478,6 +481,9 @@ doc.fsm.current = deriveFsmCurrent(doc.fsm, stageFinal);
     return next();
   }
 });
+
+ApprovalRequestSchema.plugin(workspaceScopePlugin);
+ApprovalRequestSchema.index({ workspaceId: 1, status: 1, updatedAt: -1 });
 
 const ApprovalRequest: Model<ApprovalRequestDocument> =
   mongoose.models.ApprovalRequest ||

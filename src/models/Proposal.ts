@@ -1,5 +1,6 @@
 // apps/backend/src/models/Proposal.ts
 import mongoose, { Schema, type InferSchemaType, type Model } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 /**
  * Proposal workflow:
@@ -210,6 +211,7 @@ const historySchema = new Schema<ProposalHistoryEntry>(
 
 const proposalSchema = new Schema(
   {
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
     requestId: {
       type: Schema.Types.ObjectId,
       required: true,
@@ -268,6 +270,9 @@ const proposalSchema = new Schema(
 );
 
 /* ───────────────────────── Indexes ───────────────────────── */
+
+proposalSchema.plugin(workspaceScopePlugin);
+proposalSchema.index({ workspaceId: 1, status: 1, createdAt: -1 });
 
 // Ensure only one proposal version per requestId
 proposalSchema.index({ requestId: 1, version: 1 }, { unique: true });

@@ -8,6 +8,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { requireCustomer, requireHrmsAdmin, resolveCustomerWorkspaceId, assertWorkspaceEmailAllowed } from "../middleware/customerApprovalGuard.js";
 import { hashToken, signEmailActionToken, verifyEmailActionToken } from "../utils/emailActionToken.js";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
 
 const r = Router();
 
@@ -75,7 +76,7 @@ r.post("/submit", requireAuth, requireCustomer, requireTravelMode("APPROVAL_FLOW
       return res.status(400).json({ error: "No approver (L2) configured for this workspace" });
     }
 
-    const approver: any = await User.findById(approverId).lean();
+    const approver: any = await User.findOne({ _id: approverId, workspaceId: req.workspaceId }).lean();
     if (!approver) return res.status(404).json({ error: "Approver user not found" });
 
     // ensure approver belongs to same workspace
@@ -195,7 +196,7 @@ r.put("/:id/approver/action", requireAuth, requireCustomer, requireTravelMode("A
       return res.status(400).json({ error: "Invalid action" });
     }
 
-    const doc: any = await CustomerApprovalRequest.findById(req.params.id);
+    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceId);
     if (!doc) return res.status(404).json({ error: "Not found" });
 
     const approverId = String(req.user?.sub || req.user?.id);
@@ -243,7 +244,8 @@ r.get("/email/:token", async (req: any, res, next) => {
       return res.status(400).send(htmlResult("Invalid Link", "This approval link is invalid."));
     }
 
-    const doc: any = await CustomerApprovalRequest.findById(rid);
+    const wid = String(payload?.wid || "");
+    const doc: any = await CustomerApprovalRequest.findOne({ _id: rid, workspaceId: wid });
     if (!doc) return res.status(404).send(htmlResult("Not Found", "Request not found."));
 
     // single-use / anti-tamper: token hash must match one of stored hashes
@@ -321,7 +323,7 @@ r.get("/admin/approved", requireAuth, requireHrmsAdmin, async (req: any, res, ne
 r.put("/admin/:id/assign", requireAuth, requireHrmsAdmin, async (req: any, res, next) => {
   try {
     const { agentType, agentName, comment } = req.body || {};
-    const doc: any = await CustomerApprovalRequest.findById(req.params.id);
+    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     if (doc.status !== "approved") return res.status(400).json({ error: "Only approved can be assigned" });
 
@@ -336,7 +338,7 @@ r.put("/admin/:id/assign", requireAuth, requireHrmsAdmin, async (req: any, res, 
 
 r.put("/admin/:id/done", requireAuth, requireHrmsAdmin, async (req: any, res, next) => {
   try {
-    const doc: any = await CustomerApprovalRequest.findById(req.params.id);
+    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     doc.adminState = "done";
     doc.history.push({ action: "booking_done", by: req.user?.sub, comment: String(req.body?.comment || "") });
@@ -347,7 +349,7 @@ r.put("/admin/:id/done", requireAuth, requireHrmsAdmin, async (req: any, res, ne
 
 r.put("/admin/:id/on-hold", requireAuth, requireHrmsAdmin, async (req: any, res, next) => {
   try {
-    const doc: any = await CustomerApprovalRequest.findById(req.params.id);
+    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     doc.adminState = "on_hold";
     doc.history.push({ action: "admin_on_hold", by: req.user?.sub, comment: String(req.body?.comment || "") });
@@ -358,7 +360,7 @@ r.put("/admin/:id/on-hold", requireAuth, requireHrmsAdmin, async (req: any, res,
 
 r.put("/admin/:id/cancel", requireAuth, requireHrmsAdmin, async (req: any, res, next) => {
   try {
-    const doc: any = await CustomerApprovalRequest.findById(req.params.id);
+    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     doc.adminState = "cancelled";
     doc.history.push({ action: "admin_cancelled", by: req.user?.sub, comment: String(req.body?.comment || "") });

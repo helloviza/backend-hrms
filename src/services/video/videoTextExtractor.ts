@@ -16,7 +16,7 @@ import VideoAnalysis from "../../models/VideoAnalysis.js";
  */
 
 export async function extractVideoText(videoAnalysisId: string) {
-  const record = await VideoAnalysis.findById(videoAnalysisId);
+  const record = await VideoAnalysis.findOne({ _id: videoAnalysisId });
   if (!record) {
     throw new Error("VideoAnalysis record not found");
   }

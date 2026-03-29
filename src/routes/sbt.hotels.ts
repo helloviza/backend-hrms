@@ -11,6 +11,8 @@ import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { sendMail } from "../utils/mailer.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
+import { scopedFindById } from "../middleware/scopedFindById.js";
+import { requireFeature } from "../middleware/requireFeature.js";
 
 // ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
 const MOCK_CITIES = [
@@ -69,6 +71,7 @@ const MOCK_HOTEL_RESULTS = [
 
 const router = express.Router();
 router.use(requireAuth);
+router.use(requireFeature("hotelBookingEnabled"));
 
 // ─── SBT access guard ────────────────────────────────────────────────────────
 // Verifies the user has sbtEnabled=true in the DB.
@@ -85,7 +88,7 @@ async function requireSBT(req: any, res: any, next: any) {
     const userId = req.user?.id || req.user?._id;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const user = await User.findById(userId).select("sbtEnabled").lean();
+    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceId }).select("sbtEnabled").lean();
     if (!user || !(user as any).sbtEnabled) {
       return res.status(403).json({ error: "SBT access not enabled for this account" });
     }
@@ -106,7 +109,7 @@ async function requireHotelAccess(req: any, res: any, next: any) {
     }
 
     const userId = req.user?.id || req.user?._id;
-    const user = await User.findById(userId)
+    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceId })
       .select("sbtBookingType customerId")
       .lean();
 
@@ -787,14 +790,14 @@ router.post("/bookings/save", async (req: any, res: any) => {
     // If this booking fulfils an SBT request, mark it as BOOKED and notify L1
     if (b.sbtRequestId) {
       try {
-        const sbtReq = await SBTRequest.findById(b.sbtRequestId);
+        const sbtReq = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceId);
         if (sbtReq && sbtReq.status === "PENDING") {
           sbtReq.status = "BOOKED";
           (sbtReq as any).hotelBookingId = doc._id;
           sbtReq.actedAt = new Date();
           await sbtReq.save();
 
-          const requester = await User.findById(sbtReq.requesterId)
+          const requester = await User.findOne({ _id: sbtReq.requesterId, workspaceId: req.workspaceId })
             .select("name email").lean() as any;
           if (requester?.email) {
             const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
@@ -1038,7 +1041,7 @@ router.post("/bookings/:id/mark-failed", requireAdmin, async (req: any, res: any
     const userId = req.user?._id ?? req.user?.id;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
-    const doc = await SBTHotelBooking.findById(req.params.id);
+    const doc = await scopedFindById(SBTHotelBooking, req.params.id, req.workspaceId);
     if (!doc) return res.status(404).json({ error: "Booking not found" });
 
     if (doc.bookingId && doc.bookingId.length > 0) {

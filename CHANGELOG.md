@@ -1,5 +1,29 @@
 # Backend Changelog
 
+## [2026-03-27]
+
+### Sprint T — Security Hardening + Employee Profile Fixes
+
+#### Security
+- AWS WAF: 10 backend rules (Common, SQLi, Bad Inputs, Known Bad Inputs, IP Reputation, Anonymous IP, Admin Protection override for /api/admin/*, rate limit 2000/5min, Bot Control, BodySizeRestriction Count mode)
+- CORS hardened: no-origin request fix, preflight fix
+- S3 CORS: added plumbox.plumtrips.com to AllowedOrigins (avatar upload fix)
+- Helmet CSP, HSTS, frameguard configured
+
+#### Grant HRMS Access
+- Credentials email sent in all 3 paths (A: existing user, B: new user, C: onboarding approval)
+- Email includes Employee ID, login URL, officialEmail
+- isActive: true added to activation object
+- activatedByAdmin fixed for 4 existing users (DB migration)
+
+#### Employee Profile (PUT /employees/:id)
+- Employee _id → ownerId → User lookup (was using Employee _id directly as User _id)
+- Object.assign: strip dangerous fields before applying to User document (_id, passwordHash, refreshToken, roles, ownerId, onboardingId, onboardingSnapshot)
+- Prefixed unused destructured vars with _ for linter compliance
+
+#### Session
+- Access token TTL extended from 15 minutes → 30 minutes
+
 ## [2026-03-21]
 
 ### Sprint R — Hotel Certification + Browser Testing + UI Polish

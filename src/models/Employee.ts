@@ -1,7 +1,9 @@
 // apps/backend/src/models/Employee.ts
 import { Schema, model, Document } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 export interface EmployeeDoc extends Document {
+  workspaceId: Schema.Types.ObjectId;
   fullName?: string;
   name?: string;
   email?: string;
@@ -31,6 +33,8 @@ export interface EmployeeDoc extends Document {
 
 const EmployeeSchema = new Schema<EmployeeDoc>(
   {
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
+
     /* ============================================================
        CORE IDENTITY
        ============================================================ */
@@ -85,6 +89,9 @@ const EmployeeSchema = new Schema<EmployeeDoc>(
   },
   { timestamps: true },
 );
+
+EmployeeSchema.plugin(workspaceScopePlugin);
+EmployeeSchema.index({ workspaceId: 1, userId: 1 }, { unique: true });
 
 // Indexes for performance
 EmployeeSchema.index({ employeeCode: 1 });

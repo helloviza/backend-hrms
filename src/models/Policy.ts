@@ -1,5 +1,6 @@
 // apps/backend/src/models/Policy.ts
 import { Schema, model } from "mongoose";
+import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 
 const PolicySchema = new Schema(
   {
@@ -31,7 +32,9 @@ const PolicySchema = new Schema(
       default: "GLOBAL",
     },
 
-    // Only set when scope === 'ORG' — the customer/business org this belongs to
+    // Multi-tenant workspace scope
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
+    // Legacy — kept for migration
     customerId: { type: String, trim: true, index: true },
 
     // Who can see this policy
@@ -58,5 +61,7 @@ const PolicySchema = new Schema(
     timestamps: true,
   },
 );
+PolicySchema.plugin(workspaceScopePlugin);
+PolicySchema.index({ workspaceId: 1, type: 1 });
 
 export default model("Policy", PolicySchema);
