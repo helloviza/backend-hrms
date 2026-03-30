@@ -956,7 +956,7 @@ export async function ticketLCC(params: {
     TraceId: params.TraceId,
     ResultIndex: params.ResultIndex,
     Passengers: sanitizedPassengers,
-    IsPriceChangedAccepted: params.IsPriceChangedAccepted ?? true,
+    IsPriceChangedAccepted: true,
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
