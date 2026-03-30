@@ -638,6 +638,7 @@ export async function bookFlight(params: {
     TraceId: params.TraceId,
     ResultIndex: params.ResultIndex,
     Passengers: sanitizedPassengers,
+    IsPriceChangedAccepted: true,
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
