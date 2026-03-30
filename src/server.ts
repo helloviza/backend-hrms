@@ -149,11 +149,12 @@ app.use(corsMiddleware);
 app.use((req, res, next) => {
   const suspicious = [
     "/.env", "/wp-admin", "/phpmyadmin",
-    "/admin.php", "/.git", "/config",
+    "/admin.php", "/.git", "/config.php",
+    "/config.json", "/config.yml", "/config.xml",
     "/shell", "/cmd", "/eval",
   ];
   const path = req.path.toLowerCase();
-  if (suspicious.some(s => path.includes(s))) {
+  if (suspicious.some(s => path.includes(s)) && !path.startsWith("/api/")) {
     console.warn(
       `[SECURITY] Suspicious request blocked: ${req.method} ${req.path} IP: ${req.ip} UA: ${req.headers["user-agent"]}`
     );
