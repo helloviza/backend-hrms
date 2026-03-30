@@ -686,6 +686,8 @@ router.post("/farequote", requireAuth, async (req: any, res: any) => {
       isPriceChanged: fareResults?.IsPriceChanged || false,
       isTimeChanged: fareResults?.IsTimeChanged || false,
       flightDetailChangeInfo: fareResults?.FlightDetailChangeInfo || null,
+      isseatmandatory: fareResults?.isseatmandatory || false,
+      ismealmandatory: fareResults?.ismealmandatory || false,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
