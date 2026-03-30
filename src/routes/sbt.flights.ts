@@ -1056,6 +1056,21 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
     const obPassengers: any[] = req.body?.Passengers ?? [];
     convertSeatPreferences(obPassengers);
 
+    // Normalize WayType for one-way bookings — all SSR must be WayType=1 (onward)
+    if (!isReturn) {
+      for (const p of obPassengers) {
+        p.MealDynamic?.forEach((m: any) => { m.WayType = 1; });
+        p.Baggage?.forEach((b: any) => { b.WayType = 1; });
+        p.SeatDynamic?.forEach((sd: any) => {
+          sd.SegmentSeat?.forEach((ss: any) => {
+            ss.RowSeats?.forEach((rs: any) => {
+              rs.Seats?.forEach((s: any) => { s.SeatWayType = 1; });
+            });
+          });
+        });
+      }
+    }
+
     // ── Special Return: single ticketLCC call, TBO returns one PNR for both legs ──
     if (isSpecialReturn && isReturn) {
       console.log('[TICKET-LCC] Special Return — single ticket call for combined OB+IB');
