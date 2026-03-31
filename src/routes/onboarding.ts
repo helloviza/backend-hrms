@@ -8,8 +8,12 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import multer from "multer";
 import bcrypt from "bcryptjs";
 
+import mongoose from "mongoose";
 import Onboarding from "../models/Onboarding.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { env } from "../config/env.js";
 import User from "../models/User.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
@@ -407,7 +411,7 @@ const presignQuerySchema = z.object({
 
 /* -------------------- ROUTES -------------------- */
 /** 📨 Create invite */
-router.post("/invites", requireAuth, noStore, async (req, res, next) => {
+router.post("/invites", requireAuth, requireWorkspace, noStore, async (req, res, next) => {
   try {
     const validation = inviteSchema.safeParse(req.body);
     if (!validation.success)
@@ -415,6 +419,36 @@ router.post("/invites", requireAuth, noStore, async (req, res, next) => {
         error: "Validation failed",
         fields: validation.error.flatten().fieldErrors,
       });
+
+    // ── Resolve workspaceId (SUPERADMIN fallback to first active workspace) ──
+    let workspaceId: mongoose.Types.ObjectId | null =
+      req.workspaceObjectId || null;
+
+    if (!workspaceId && isSuperAdmin(req)) {
+      const explicit =
+        (req.body as any)?.workspaceId ||
+        (req.query as any)?.workspaceId ||
+        req.headers["x-workspace-id"];
+      if (explicit) {
+        workspaceId = new mongoose.Types.ObjectId(String(explicit));
+      } else {
+        const ws = await CustomerWorkspace.findOne({ status: "ACTIVE" })
+          .select("_id")
+          .lean();
+        if (ws) {
+          console.warn(
+            `[SUPERADMIN AUTO-RESOLVE] No workspaceId provided. ` +
+            `Falling back to first active workspace: ${ws._id}. ` +
+            `User: ${(req as any).user?.email}. Path: ${req.path}`
+          );
+          workspaceId = ws._id as mongoose.Types.ObjectId;
+        }
+      }
+    }
+
+    if (!workspaceId) {
+      return res.status(400).json({ error: "workspaceId is required" });
+    }
 
     const { type, inviteeEmail, inviteeName, turnaroundHours } = validation.data;
     const { email, name, status } = req.body ?? {};
@@ -449,6 +483,7 @@ await (Onboarding as any).updateMany(
     const doc = await (Onboarding as any).create({
   type: resolveType(type),
   email: normEmail,
+  workspaceId,
 
   // ✅ SOURCE OF TRUTH
  inviteeName: safeName,
