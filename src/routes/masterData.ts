@@ -1,6 +1,7 @@
 // apps/backend/src/routes/masterData.ts
-import { Router } from "express";
+import { Router, Request } from "express";
 import { randomBytes } from "crypto";
+import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
 import Onboarding from "../models/Onboarding.js";
 import MasterData from "../models/MasterData.js";
@@ -8,7 +9,10 @@ import User from "../models/User.js";
 import Vendor from "../models/Vendor.js";
 import Customer from "../models/Customer.js";
 import Employee from "../models/Employee.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { sendMail } from "../utils/mailer.js";
 import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
@@ -176,6 +180,35 @@ async function generateNextCustomerCode(): Promise<string> {
   return prefix + String(next).padStart(5, "0");
 }
 
+/**
+ * Resolve workspaceObjectId from req, with SUPERADMIN fallback to first active workspace.
+ */
+async function resolveWorkspaceId(req: Request): Promise<mongoose.Types.ObjectId | null> {
+  if ((req as any).workspaceObjectId) return (req as any).workspaceObjectId;
+
+  if (isSuperAdmin(req)) {
+    const explicit =
+      (req.body as any)?.workspaceId ||
+      (req.query as any)?.workspaceId ||
+      req.headers["x-workspace-id"];
+    if (explicit) return new mongoose.Types.ObjectId(String(explicit));
+
+    const ws = await CustomerWorkspace.findOne({ status: "ACTIVE" })
+      .select("_id")
+      .lean();
+    if (ws) {
+      console.warn(
+        `[SUPERADMIN AUTO-RESOLVE] No workspaceId provided. ` +
+        `Falling back to first active workspace: ${ws._id}. ` +
+        `User: ${(req as any).user?.email}. Path: ${req.path}`
+      );
+      return ws._id as mongoose.Types.ObjectId;
+    }
+  }
+
+  return null;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Routes – Master list                                                       */
 /* -------------------------------------------------------------------------- */
@@ -254,12 +287,17 @@ router.get("/", requireAuth, async (req, res, next) => {
  * Create a simple master record (Vendor / Business) directly from HRMS.
  * Used by "+ New Vendor" / "+ New Business" buttons.
  */
-router.post("/", requireAuth, async (req: any, res, next) => {
+router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     if (!isHrmsAdmin(req.user)) {
       return res
         .status(403)
         .json({ error: "Only HR Admin / Admin can create master records" });
+    }
+
+    const workspaceId = await resolveWorkspaceId(req);
+    if (!workspaceId) {
+      return res.status(400).json({ error: "Workspace context required" });
     }
 
     const body = req.body || {};
@@ -316,6 +354,7 @@ router.post("/", requireAuth, async (req: any, res, next) => {
 
     const onboarding = await Onboarding.create({
       type,
+      workspaceId,
       status: "approved",
       isActive,
       token: randomBytes(20).toString("hex"),
@@ -375,7 +414,7 @@ router.patch("/:id/status", requireAuth, async (req, res, next) => {
  * Generic PATCH – update Vendor / Business master fields.
  * This is what VendorProfiles.tsx & BusinessProfiles.tsx call.
  */
-router.patch("/:id", requireAuth, async (req: any, res, next) => {
+router.patch("/:id", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     if (!isHrmsAdmin(req.user)) {
       return res
@@ -386,7 +425,10 @@ router.patch("/:id", requireAuth, async (req: any, res, next) => {
     const { id } = req.params;
     const body = req.body || {};
 
-    const onboardingDoc: any = await Onboarding.findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
+    const workspaceId = await resolveWorkspaceId(req);
+    const query: any = { _id: id };
+    if (workspaceId) query.workspaceId = workspaceId;
+    const onboardingDoc: any = await Onboarding.findOne(query).exec();
     if (!onboardingDoc) {
       return res.status(404).json({ error: "Master record not found" });
     }
@@ -570,6 +612,7 @@ router.patch("/:id", requireAuth, async (req: any, res, next) => {
 router.post(
   "/:id/promote-employee",
   requireAuth,
+  requireWorkspace,
   async (req: any, res, next) => {
     try {
       if (!isHrmsAdmin(req.user)) {
@@ -580,7 +623,10 @@ router.post(
 
       const { id } = req.params;
 
-      const onboardingDoc: any = await Onboarding.findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
+      const workspaceId = await resolveWorkspaceId(req);
+      const query: any = { _id: id };
+      if (workspaceId) query.workspaceId = workspaceId;
+      const onboardingDoc: any = await Onboarding.findOne(query).exec();
       if (!onboardingDoc) {
         return res.status(404).json({ error: "Onboarding record not found" });
       }
@@ -850,6 +896,7 @@ return res.json({
 router.post(
   "/:id/promote-vendor",
   requireAuth,
+  requireWorkspace,
   async (req: any, res, next) => {
     try {
       if (!isHrmsAdmin(req.user)) {
@@ -859,7 +906,10 @@ router.post(
       }
 
       const { id } = req.params;
-      const onboardingDoc: any = await Onboarding.findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
+      const workspaceId = await resolveWorkspaceId(req);
+      const query: any = { _id: id };
+      if (workspaceId) query.workspaceId = workspaceId;
+      const onboardingDoc: any = await Onboarding.findOne(query).exec();
       if (!onboardingDoc) {
         return res
           .status(404)
@@ -989,6 +1039,7 @@ return res.json({
 router.post(
   "/:id/promote-customer",
   requireAuth,
+  requireWorkspace,
   async (req: any, res, next) => {
     try {
       if (!isHrmsAdmin(req.user)) {
@@ -998,7 +1049,10 @@ router.post(
       }
 
       const { id } = req.params;
-      const onboardingDoc: any = await Onboarding.findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
+      const workspaceId = await resolveWorkspaceId(req);
+      const query: any = { _id: id };
+      if (workspaceId) query.workspaceId = workspaceId;
+      const onboardingDoc: any = await Onboarding.findOne(query).exec();
       if (!onboardingDoc) {
         return res
           .status(404)
