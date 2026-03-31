@@ -3,6 +3,7 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import User from "../models/User.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 
 const router = Router();
@@ -40,7 +41,7 @@ function validatePassword(pw: string): string | null {
 /* POST /api/password/change  (self-service)                                  */
 /* -------------------------------------------------------------------------- */
 
-router.post("/change", requireAuth, async (req: any, res, next) => {
+router.post("/change", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     const { currentPassword, newPassword } = req.body as {
       currentPassword?: string;
@@ -63,7 +64,7 @@ router.post("/change", requireAuth, async (req: any, res, next) => {
       return res.status(401).json({ error: "Unauthorised" });
     }
 
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceId }).exec();
+    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId }).exec();
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
@@ -87,7 +88,7 @@ router.post("/change", requireAuth, async (req: any, res, next) => {
 /* POST /api/password/admin-set  (HR/Admin can reset any user)                */
 /* -------------------------------------------------------------------------- */
 
-router.post("/admin-set", requireAuth, async (req: any, res, next) => {
+router.post("/admin-set", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     if (!isHrmsAdmin(req.user)) {
       return res
@@ -109,7 +110,7 @@ router.post("/admin-set", requireAuth, async (req: any, res, next) => {
       return res.status(400).json({ error: pwError });
     }
 
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceId }).exec();
+    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId }).exec();
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }

@@ -7,6 +7,7 @@ import LeavePolicy from "../models/LeavePolicy.js";
 import Employee from "../models/Employee.js";
 import User from "../models/User.js";
 import requireAuth from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireRoles } from "../middleware/roles.js";
 import { audit } from "../middleware/audit.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
@@ -20,6 +21,7 @@ import { executeLeaveAccrual } from "../workers/leaveAccrual.worker.js";
 const r = Router();
 
 r.use(requireAuth);
+r.use(requireWorkspace);
 
 // ─── Helpers ────────────────────────────────────────────────
 
@@ -103,7 +105,7 @@ r.post(
 
       const from = new Date(data.from);
       const to = new Date(data.to);
-      const wsId = (req as any).workspaceId as string;
+      const wsId = (req as any).workspaceObjectId as string;
       const days = await calculateLeaveDays(from, to, data.dayLength, wsId);
 
       if (days <= 0) {
@@ -116,7 +118,7 @@ r.post(
       const policy = await LeavePolicy.getOrCreate();
       const validation = await validateLeaveApplication(
         userId,
-        (req as any).workspaceId as string,
+        (req as any).workspaceObjectId as string,
         { type: leaveType, from, to, days, dayLength: data.dayLength },
         policy,
       );
@@ -175,7 +177,7 @@ r.post(
         return res.status(403).json({ error: "Not authorized" });
 
       const approverId = (req as any).user.sub;
-      const lr = await scopedFindById(Leave, req.params.id, (req as any).workspaceId);
+      const lr = await scopedFindById(Leave, req.params.id, (req as any).workspaceObjectId);
       if (!lr) return res.status(404).json({ error: "Leave request not found" });
       if (lr.status !== "PENDING")
         return res.status(400).json({ error: "Only PENDING leaves can be approved" });
@@ -243,7 +245,7 @@ r.post(
         return res.status(403).json({ error: "Not authorized" });
 
       const approverId = (req as any).user.sub;
-      const lr = await scopedFindById(Leave, req.params.id, (req as any).workspaceId);
+      const lr = await scopedFindById(Leave, req.params.id, (req as any).workspaceObjectId);
       if (!lr) return res.status(404).json({ error: "Leave request not found" });
       if (lr.status !== "PENDING")
         return res.status(400).json({ error: "Only PENDING leaves can be rejected" });
@@ -294,7 +296,7 @@ r.post(
         return res.status(400).json({ error: "Validation failed" });
 
       const userId = (req as any).user.sub;
-      const lr = await scopedFindById(Leave, req.params.id, (req as any).workspaceId);
+      const lr = await scopedFindById(Leave, req.params.id, (req as any).workspaceObjectId);
       if (!lr) return res.status(404).json({ error: "Leave request not found" });
 
       const isOwner = String(lr.userId) === userId;
@@ -390,7 +392,7 @@ r.get(
       let balance: any = await LeaveBalance.findOne({ userId, year });
       if (!balance) {
         const policy = await LeavePolicy.getOrCreate();
-        const user = await scopedFindById(User, userId, (req as any).workspaceId);
+        const user = await scopedFindById(User, userId, (req as any).workspaceObjectId);
         const joinDate = user?.dateOfJoining
           ? new Date(user.dateOfJoining as string)
           : new Date();
@@ -520,7 +522,7 @@ r.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const userId = (req as any).user.sub;
-      const wsId = (req as any).workspaceId as string;
+      const wsId = (req as any).workspaceObjectId as string;
       const { month } = req.query as any;
 
       if (!month || !/^\d{4}-\d{2}$/.test(month)) {
@@ -741,7 +743,7 @@ r.post(
       }
 
       const adminId = (req as any).user.sub;
-      const wsId = (req as any).workspaceId as string;
+      const wsId = (req as any).workspaceObjectId as string;
       const year = new Date().getFullYear();
       const policy = await LeavePolicy.getOrCreate();
       let processed = 0;
@@ -818,7 +820,7 @@ r.get(
       if (!hasRole(req, "HR", "ADMIN"))
         return res.status(403).json({ error: "Not authorized" });
 
-      const wsId = (req as any).workspaceId as string;
+      const wsId = (req as any).workspaceObjectId as string;
       const year = parseInt((req.query.year as string) || String(new Date().getFullYear()), 10);
 
       const balances = await LeaveBalance.find({
@@ -883,7 +885,7 @@ r.post(
       if (!hasRole(req, "ADMIN"))
         return res.status(403).json({ error: "Not authorized" });
 
-      const wsId = (req as any).workspaceId as string;
+      const wsId = (req as any).workspaceObjectId as string;
       const { runYearEndCarryForward } = await import("../services/leavePolicy.service.js");
 
       const fromYear = new Date().getFullYear() - 1;

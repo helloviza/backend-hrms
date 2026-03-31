@@ -596,12 +596,13 @@ router.get("/invites", requireAuth, noStore, async (req, res, next) => {
 router.post(
   "/invites/:id/resend",
   requireAuth,
+  requireWorkspace,
   noStore,
   async (req, res, next) => {
     try {
       const { id } = req.params;
 
-      const invite: any = await (Onboarding as any).findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
+      const invite: any = await (Onboarding as any).findOne({ _id: id, workspaceId: (req as any).workspaceObjectId }).exec();
       if (!invite) {
         return res.status(404).json({ error: "Invite not found" });
       }
@@ -1054,7 +1055,7 @@ router.get("/document/presign", requireAuth, noStore, async (req, res, next) => 
 });
 
 /** 🧑‍💼 Admin details (authed) – also triggers sync to HRMS */
-router.get("/:token/details", requireAuth, noStore, async (req, res, next) => {
+router.get("/:token/details", requireAuth, requireWorkspace, noStore, async (req, res, next) => {
   try {
     const { token } = req.params;
 
@@ -1063,7 +1064,7 @@ router.get("/:token/details", requireAuth, noStore, async (req, res, next) => {
     let doc: OnboardingDoc | null = null;
     if (isObjectId) {
       // findById correctly casts string → ObjectId
-      doc = (await (Onboarding as any).findOne({ _id: token, workspaceId: (req as any).workspaceId }).lean().exec()) as OnboardingDoc | null;
+      doc = (await (Onboarding as any).findOne({ _id: token, workspaceId: (req as any).workspaceObjectId }).lean().exec()) as OnboardingDoc | null;
     }
     // If not found by _id (or not an ObjectId), try token string
     if (!doc) {
@@ -1127,10 +1128,10 @@ router.get("/:token/details", requireAuth, noStore, async (req, res, next) => {
 });
 
 /** 🔄 Extend expiry — admin manually extends an invite by 30 days */
-router.post("/:id/extend-expiry", requireAuth, noStore, async (req, res, next) => {
+router.post("/:id/extend-expiry", requireAuth, requireWorkspace, noStore, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const doc: any = await (Onboarding as any).findOne({ _id: id, workspaceId: (req as any).workspaceId }).exec();
+    const doc: any = await (Onboarding as any).findOne({ _id: id, workspaceId: (req as any).workspaceObjectId }).exec();
     if (!doc) return res.status(404).json({ error: "Onboarding record not found" });
 
     // Extend from current expiresAt if still in the future, otherwise from now

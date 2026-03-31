@@ -5,6 +5,7 @@ import mongoose from "mongoose";
 
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 
 import VoucherExtraction from "../models/VoucherExtraction.js";
@@ -487,11 +488,11 @@ router.post("/extract", requireAuth, upload.single("file"), async (req: any, res
  * Force regenerate PDF from extractedJson.
  * USER can only render own record; ADMIN can render any.
  */
-router.post("/:id/render", requireAuth, async (req: any, res) => {
+router.post("/:id/render", requireAuth, requireWorkspace, async (req: any, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-  const row: any = await scopedFindById(VoucherExtraction, id, req.workspaceId);
+  const row: any = await scopedFindById(VoucherExtraction, id, req.workspaceObjectId);
   if (!row) return res.status(404).json({ message: "Not found" });
 
   const isAdmin = isRequesterAdmin(req);
@@ -570,11 +571,11 @@ router.get("/", requireAuth, requireAdmin, async (req: any, res) => {
  * GET /api/vouchers/:id
  * USER can only open own record; ADMIN can open any
  */
-router.get("/:id", requireAuth, async (req: any, res) => {
+router.get("/:id", requireAuth, requireWorkspace, async (req: any, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-  const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceId }).lean();
+  const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceObjectId }).lean();
   if (!row) return res.status(404).json({ message: "Not found" });
 
   const isAdmin = isRequesterAdmin(req);
@@ -588,12 +589,12 @@ router.get("/:id", requireAuth, async (req: any, res) => {
  * GET /api/vouchers/:id/open
  * Signed URL for UPLOADED ORIGINAL voucher file.
  */
-router.get("/:id/open", requireAuth, async (req: any, res) => {
+router.get("/:id/open", requireAuth, requireWorkspace, async (req: any, res) => {
   try {
     const { id } = req.params;
     if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-    const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceId }).lean();
+    const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceObjectId }).lean();
     if (!row) return res.status(404).json({ message: "Not found" });
 
     const isAdmin = isRequesterAdmin(req);
@@ -621,12 +622,12 @@ router.get("/:id/open", requireAuth, async (req: any, res) => {
  * ✅ GET /api/vouchers/:id/open-rendered
  * Signed URL for REGENERATED PDF stored in record.renderedS3
  */
-router.get("/:id/open-rendered", requireAuth, async (req: any, res) => {
+router.get("/:id/open-rendered", requireAuth, requireWorkspace, async (req: any, res) => {
   try {
     const { id } = req.params;
     if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-    const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceId }).lean();
+    const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceObjectId }).lean();
     if (!row) return res.status(404).json({ message: "Not found" });
 
     const isAdmin = isRequesterAdmin(req);
@@ -664,11 +665,11 @@ router.get("/:id/open-rendered", requireAuth, async (req: any, res) => {
  * PATCH /api/vouchers/:id (admin correction optional)
  * body: { extractedJson?, docType?, status?, error? }
  */
-router.patch("/:id", requireAuth, requireAdmin, async (req: any, res) => {
+router.patch("/:id", requireAuth, requireAdmin, requireWorkspace, async (req: any, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-  const row: any = await scopedFindById(VoucherExtraction, id, req.workspaceId);
+  const row: any = await scopedFindById(VoucherExtraction, id, req.workspaceObjectId);
   if (!row) return res.status(404).json({ message: "Not found" });
 
   const { extractedJson, docType, status, error } = req.body || {};
