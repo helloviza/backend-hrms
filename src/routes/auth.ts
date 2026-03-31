@@ -602,6 +602,8 @@ async function ensureUserFromWorkspaceMember(email: string, passwordHash: string
   const name = String(member.name || "").trim();
   const firstName = name || "Workspace User";
 
+  const ws = await findWorkspaceByCustomerId(String(member.customerId || ""));
+
   const user: any = await User.create({
     email,
     officialEmail: email,
@@ -612,6 +614,7 @@ async function ensureUserFromWorkspaceMember(email: string, passwordHash: string
     passwordHash,
     customerId: member.customerId,
     businessId: member.customerId,
+    workspaceId: ws?._id || member.customerId,
     role: "CUSTOMER",
     accountType: "CUSTOMER",
     userType: "CUSTOMER",
@@ -619,7 +622,6 @@ async function ensureUserFromWorkspaceMember(email: string, passwordHash: string
     hrmsAccessLevel: "CUSTOMER",
   });
 
-  const ws = await findWorkspaceByCustomerId(String(member.customerId || ""));
   return {
     user,
     createdFromWorkspace: true,
@@ -636,7 +638,7 @@ async function ensureUserFromWorkspaceMember(email: string, passwordHash: string
  * ─────────────────────────────────────────────── */
 r.post("/register", async (req, res) => {
   try {
-    const { email, password, firstName, lastName, roles } = req.body;
+    const { email, password, firstName, lastName, roles, workspaceId: bodyWsId } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ error: "Email and password are required" });
@@ -650,6 +652,23 @@ r.post("/register", async (req, res) => {
     let finalRoles: string[] = normalizeRoles(Array.isArray(roles) ? roles : []);
     if (!finalRoles.length) finalRoles = ["EMPLOYEE"];
 
+    // Resolve workspaceId: explicit body param → member lookup → first active workspace
+    let resolvedWsId = bodyWsId || null;
+    if (!resolvedWsId) {
+      const member: any = await findCustomerMemberByEmail(normalizedEmail);
+      if (member?.customerId) {
+        const ws = await findWorkspaceByCustomerId(String(member.customerId));
+        resolvedWsId = ws?._id || member.customerId;
+      }
+    }
+    if (!resolvedWsId) {
+      const ws = await CustomerWorkspace.findOne({ status: "ACTIVE" }).select("_id").lean();
+      resolvedWsId = ws?._id || null;
+    }
+    if (!resolvedWsId) {
+      return res.status(400).json({ error: "workspaceId is required for registration" });
+    }
+
     const passwordHash = await bcrypt.hash(password, 12);
     const user = await User.create({
       email: normalizedEmail,
@@ -659,6 +678,7 @@ r.post("/register", async (req, res) => {
       lastName,
       roles: finalRoles,
       passwordHash,
+      workspaceId: resolvedWsId,
     });
 
     res.json({ id: user._id });
@@ -1036,6 +1056,18 @@ r.post("/admin/reset-password", async (req, res) => {
         baseDoc?.companyName ||
         "";
 
+      // Resolve workspaceId from customer/vendor → workspace, or actor's workspace
+      const customerId = String((customer as any)?._id || (vendor as any)?.customerId || "");
+      let wsId = customerId ? (await findWorkspaceByCustomerId(customerId))?._id : null;
+      if (!wsId) {
+        // Fallback: use the actor's (admin's) workspace
+        wsId = actor.workspaceId || null;
+      }
+      if (!wsId) {
+        const ws = await CustomerWorkspace.findOne({ status: "ACTIVE" }).select("_id").lean();
+        wsId = ws?._id || null;
+      }
+
       user = await User.create({
         email: normalizedEmail,
         officialEmail: normalizedEmail,
@@ -1044,6 +1076,7 @@ r.post("/admin/reset-password", async (req, res) => {
         lastName: "",
         roles: normalizeRoles(roles.length ? roles : ["EMPLOYEE"]),
         passwordHash: finalHash,
+        workspaceId: wsId,
       });
 
       created = true;
