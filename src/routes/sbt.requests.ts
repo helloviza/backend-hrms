@@ -1,5 +1,6 @@
 import express from "express";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import { sendMail } from "../utils/mailer.js";
 import SBTRequest from "../models/SBTRequest.js";
@@ -12,6 +13,7 @@ import { requireFeature } from "../middleware/requireFeature.js";
 
 const router = express.Router();
 router.use(requireAuth);
+router.use(requireWorkspace);
 router.use(requireFeature("sbtEnabled"));
 
 /* ─── helpers ─────────────────────────────────────────────────────────────── */
@@ -42,7 +44,7 @@ function travelDate(type: string, params: any): string {
 router.post("/", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceId })
+    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId })
       .select("sbtRole sbtAssignedBookerId customerId name email")
       .lean() as any;
 
@@ -112,7 +114,7 @@ router.post("/", async (req: any, res: any) => {
     });
 
     // Send email to L2 booker
-    const booker = await User.findOne({ _id: assignedBookerId, workspaceId: req.workspaceId })
+    const booker = await User.findOne({ _id: assignedBookerId, workspaceId: req.workspaceObjectId })
       .select("name email")
       .lean() as any;
 
@@ -156,7 +158,7 @@ router.post("/", async (req: any, res: any) => {
 router.get("/my", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceId }).select("sbtRole").lean() as any;
+    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId }).select("sbtRole").lean() as any;
 
     if (!user || (user.sbtRole !== "L1" && user.sbtRole !== "BOTH")) {
       return res.status(403).json({ error: "SBT Requestor access required", code: "NOT_L1" });
@@ -207,7 +209,7 @@ router.delete("/:id/cancel", async (req: any, res: any) => {
 router.get("/inbox", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceId }).select("sbtRole roles customerId").lean() as any;
+    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId }).select("sbtRole roles customerId").lean() as any;
 
     const allRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
     const isWL = allRoles.includes("WORKSPACELEADER");
@@ -246,7 +248,7 @@ router.get("/inbox", async (req: any, res: any) => {
 router.get("/:id", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const request = await SBTRequest.findOne({ _id: req.params.id, workspaceId: req.workspaceId })
+    const request = await SBTRequest.findOne({ _id: req.params.id, workspaceId: req.workspaceObjectId })
       .populate("requesterId", "name email")
       .populate("assignedBookerId", "name email")
       .lean() as any;
@@ -257,7 +259,7 @@ router.get("/:id", async (req: any, res: any) => {
     const isBooker = String(request.assignedBookerId?._id || request.assignedBookerId) === uid;
 
     // Workspace Leader can view any request in their company
-    const detailUser = await User.findOne({ _id: uid, workspaceId: req.workspaceId }).select("roles customerId").lean() as any;
+    const detailUser = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId }).select("roles customerId").lean() as any;
     const detailRoles = (Array.isArray(detailUser?.roles) ? detailUser.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
     const isWLDetail = detailRoles.includes("WORKSPACELEADER") && String(detailUser?.customerId) === String(request.customerId);
 
@@ -277,7 +279,7 @@ router.get("/:id", async (req: any, res: any) => {
 router.post("/:id/book", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceId }).select("sbtRole roles customerId").lean() as any;
+    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId }).select("sbtRole roles customerId").lean() as any;
 
     const bookRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
     const isWLBooker = bookRoles.includes("WORKSPACELEADER");
@@ -567,7 +569,7 @@ router.post("/:id/book", async (req: any, res: any) => {
     await request.save();
 
     // Send email to L1
-    const requester = await User.findOne({ _id: request.requesterId, workspaceId: req.workspaceId })
+    const requester = await User.findOne({ _id: request.requesterId, workspaceId: req.workspaceObjectId })
       .select("name email")
       .lean() as any;
 
@@ -609,7 +611,7 @@ router.post("/:id/book", async (req: any, res: any) => {
 router.post("/:id/reject", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceId }).select("sbtRole roles customerId").lean() as any;
+    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId }).select("sbtRole roles customerId").lean() as any;
 
     const rejRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
     const isWLReject = rejRoles.includes("WORKSPACELEADER");
@@ -640,7 +642,7 @@ router.post("/:id/reject", async (req: any, res: any) => {
     await request.save();
 
     // Send email to L1
-    const requester = await User.findOne({ _id: request.requesterId, workspaceId: req.workspaceId })
+    const requester = await User.findOne({ _id: request.requesterId, workspaceId: req.workspaceObjectId })
       .select("name email")
       .lean() as any;
 

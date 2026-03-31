@@ -9,6 +9,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import VideoAnalysis from "../models/VideoAnalysis.js";
 import { startVideoAnalysis } from "../services/video/startVideoAnalysis.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
@@ -16,12 +17,13 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 const router = Router();
 router.use(requireAuth);
 router.use(requireAdmin);
+router.use(requireWorkspace);
 
 router.post("/video/:videoId/reanalyze", async (req, res) => {
   try {
     const { videoId } = req.params;
 
-    const video = await scopedFindById(VideoAnalysis, videoId, (req as any).workspaceId);
+    const video = await scopedFindById(VideoAnalysis, videoId, (req as any).workspaceObjectId);
     if (!video) {
       return res.status(404).json({ ok: false, message: "Video not found" });
     }

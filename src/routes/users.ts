@@ -264,6 +264,7 @@ r.post(
 r.post(
   "/profile/avatar/confirm",
   requireAuth,
+  requireWorkspace,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const userId = (req as any).user?.sub;
@@ -290,7 +291,7 @@ r.post(
       }
 
       // load current user to optionally delete old avatar object
-      const current = await User.findOne({ _id: userId, workspaceId: (req as any).workspaceId }).select("avatarKey").lean();
+      const current = await User.findOne({ _id: userId, workspaceId: (req as any).workspaceObjectId }).select("avatarKey").lean();
       const oldKey = (current as any)?.avatarKey || "";
 
       await User.findByIdAndUpdate(userId, {
@@ -401,6 +402,7 @@ r.get(
 r.post(
   "/admin/grant-access",
   requireAuth,
+  requireWorkspace,
   requireRoles("ADMIN", "SUPERADMIN", "HR"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -431,7 +433,7 @@ r.post(
 
       // Path A: grant access to an existing User doc (from tempPassword flow)
       if (userId) {
-        const target = await scopedFindById(User, userId, (req as any).workspaceId);
+        const target = await scopedFindById(User, userId, (req as any).workspaceObjectId);
         if (!target) return res.status(404).json({ error: "User not found." });
         Object.assign(target, activation, ...(officialEmail ? [{ officialEmail }] : []));
         await (target as any).save();
@@ -455,7 +457,7 @@ r.post(
         return res.status(400).json({ error: "userId or onboardingId is required." });
       }
 
-      const onboarding = await (Onboarding as any).findOne({ _id: onboardingId, workspaceId: (req as any).workspaceId }).lean();
+      const onboarding = await (Onboarding as any).findOne({ _id: onboardingId, workspaceId: (req as any).workspaceObjectId }).lean();
       if (!onboarding) {
         return res.status(404).json({ error: "Onboarding record not found." });
       }
@@ -519,7 +521,7 @@ r.post(
   }
 );
 
-r.patch("/admin/users/:id/sbt", requireAuth, async (req: any, res: any) => {
+r.patch("/admin/users/:id/sbt", requireAuth, requireWorkspace, async (req: any, res: any) => {
   try {
     const actor = req.user || {};
     const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role]).map((r: any) =>
@@ -534,7 +536,7 @@ r.patch("/admin/users/:id/sbt", requireAuth, async (req: any, res: any) => {
 
     const { sbtEnabled, sbtBookingType } = req.body;
 
-    const targetUser: any = await User.findOne({ _id: req.params.id, workspaceId: req.workspaceId }).select("customerId email").lean();
+    const targetUser: any = await User.findOne({ _id: req.params.id, workspaceId: req.workspaceObjectId }).select("customerId email").lean();
     if (!targetUser) return res.status(404).json({ error: "User not found" });
 
     // WORKSPACE_LEADER: scoped checks

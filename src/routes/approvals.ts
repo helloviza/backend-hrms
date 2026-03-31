@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 
@@ -68,6 +69,7 @@ import {
 } from "./approvals.email.js";
 
 const router = Router();
+router.use(requireWorkspace);
 router.use(requireFeature("approvalFlowEnabled"));
 
 /* ───────────────────────── uploads (PDF attachments) ───────────────────────── */
@@ -317,7 +319,7 @@ router.post("/requests", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROV
 
     // SBT users must book directly — block approval flow
     if (sub) {
-      const sbtCheck = await User.findOne({ _id: sub, workspaceId: req.workspaceId }).select("sbtEnabled canRaiseRequest").lean();
+      const sbtCheck = await User.findOne({ _id: sub, workspaceId: req.workspaceObjectId }).select("sbtEnabled canRaiseRequest").lean();
       if (sbtCheck?.sbtEnabled === true) {
         return res.status(403).json({
           error: "Direct booking is enabled for your account. Please use the Self Booking Tool.",
@@ -521,7 +523,7 @@ router.post("/requests", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROV
 router.get("/requests/mine", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     // SBT users must not access approval flow
-    const sbtUser = await User.findOne({ _id: req.user?.sub || req.user?._id, workspaceId: req.workspaceId }).select("sbtEnabled").lean();
+    const sbtUser = await User.findOne({ _id: req.user?.sub || req.user?._id, workspaceId: req.workspaceObjectId }).select("sbtEnabled").lean();
     if (sbtUser?.sbtEnabled === true) {
       return res.status(403).json({ error: "SBT users cannot access approval requests.", code: "SBT_USER_CANNOT_ACCESS_APPROVALS" });
     }
@@ -549,7 +551,7 @@ router.get("/requests/mine", requireAuth, requireTravelMode("APPROVAL_FLOW", "AP
 router.get("/requests/inbox", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     // SBT users must not access approval flow
-    const sbtUser = await User.findOne({ _id: req.user?.sub || req.user?._id, workspaceId: req.workspaceId }).select("sbtEnabled").lean();
+    const sbtUser = await User.findOne({ _id: req.user?.sub || req.user?._id, workspaceId: req.workspaceObjectId }).select("sbtEnabled").lean();
     if (sbtUser?.sbtEnabled === true) {
       return res.status(403).json({ error: "SBT users cannot access approval inbox.", code: "SBT_USER_CANNOT_ACCESS_APPROVALS" });
     }
@@ -587,7 +589,7 @@ router.get("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
       return res.status(400).json({ error: "Invalid request id" });
     }
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceId }).lean().exec();
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId }).lean().exec();
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     const user = req.user;
@@ -609,7 +611,7 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
       return res.status(400).json({ error: "Invalid request id" });
     }
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceId });
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     const user = req.user;
@@ -673,7 +675,7 @@ router.put("/requests/:id/action", requireAuth, requireTravelMode("APPROVAL_FLOW
       return res.status(400).json({ error: "Invalid action" });
     }
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceId });
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     // resend logic (unchanged)
@@ -956,7 +958,7 @@ router.put("/admin/:id/assign", requireApprovalsAdminWrite, async (req: AnyObj, 
     const id = String(req.params.id || "");
     const { agentType, agentName, comment } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceId });
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     doc.adminState = "assigned";
@@ -994,7 +996,7 @@ router.put(
       const id = String(req.params.id || "");
       const { comment } = req.body || {};
 
-      const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceId });
+      const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
       if (!doc) return res.status(404).json({ error: "Request not found" });
 
       const st = String(doc.stage || "").toUpperCase();
@@ -1037,7 +1039,7 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
     const id = String(req.params.id || "");
     const { comment, notifyEmail, bookingAmount, actualBookingPrice } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceId });
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     if (doc.stage !== "BOOKING_IN_PROGRESS") {
@@ -1240,7 +1242,7 @@ router.post(
 
       if (!file) return res.status(400).json({ error: "File is required" });
 
-      const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceId });
+      const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
       if (!doc) return res.status(404).json({ error: "Request not found" });
 
       const base = (process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 8080}`).replace(
@@ -1435,7 +1437,7 @@ router.post("/email/consume", async (req: AnyObj, res) => {
       return res.status(400).json({ error: "Token/action mismatch" });
     }
 
-    const doc: any = await ApprovalRequest.findOne({ _id: rid, workspaceId: req.workspaceId });
+    const doc: any = await ApprovalRequest.findOne({ _id: rid, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     if (!exactIRegex(approverEmail).test(String(doc.managerEmail || ""))) {
