@@ -153,6 +153,9 @@ async function post(path: string, body: object, _retried = false, base = FLIGHT_
       signal: controller.signal,
     });
     const rawText = await res.text();
+    if (method === "Ticket") {
+      console.log(`[TBO-DEBUG ${method}] HTTP ${res.status} | raw (first 500):`, rawText.substring(0, 500));
+    }
     if (rawText.startsWith("<") || rawText.startsWith("<?")) {
       throw new Error(`TBO returned XML instead of JSON (likely malformed request): ${rawText.slice(0, 300)}`);
     }
@@ -161,6 +164,10 @@ async function post(path: string, body: object, _retried = false, base = FLIGHT_
       json = JSON.parse(rawText);
     } catch {
       throw new Error(`TBO returned non-JSON response (HTTP ${res.status}): ${rawText.slice(0, 300)}`);
+    }
+    if (method === "Ticket") {
+      const resp = (json as any)?.Response;
+      console.log(`[TBO-DEBUG ${method}] ErrorCode:`, resp?.Error?.ErrorCode, '| ErrorMessage:', resp?.Error?.ErrorMessage, '| ResponseStatus:', resp?.ResponseStatus);
     }
     const durationMs = Date.now() - start;
 
