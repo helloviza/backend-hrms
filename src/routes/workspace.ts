@@ -551,7 +551,7 @@ const VALID_TRAVEL_FLOWS = ["SBT", "APPROVAL_FLOW", "APPROVAL_DIRECT", "HYBRID"]
 const FLOW_TO_FEATURES: Record<string, { sbtEnabled: boolean; approvalFlowEnabled: boolean; approvalDirectEnabled: boolean }> = {
   SBT:              { sbtEnabled: true,  approvalFlowEnabled: false, approvalDirectEnabled: false },
   APPROVAL_FLOW:    { sbtEnabled: false, approvalFlowEnabled: true,  approvalDirectEnabled: false },
-  APPROVAL_DIRECT:  { sbtEnabled: false, approvalFlowEnabled: false, approvalDirectEnabled: true  },
+  APPROVAL_DIRECT:  { sbtEnabled: false, approvalFlowEnabled: true,  approvalDirectEnabled: true  },
   HYBRID:           { sbtEnabled: true,  approvalFlowEnabled: true,  approvalDirectEnabled: false },
 };
 

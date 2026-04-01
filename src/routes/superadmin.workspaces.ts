@@ -254,9 +254,25 @@ router.put("/workspaces/:workspaceId/features", async (req: any, res) => {
       return res.status(400).json({ error: "feature (string) and enabled (boolean) are required" });
     }
 
+    const $set: Record<string, any> = { [`config.features.${feature}`]: enabled };
+
+    // Keep travelFlow in sync when toggling approval/SBT features
+    if (feature === "approvalFlowEnabled" && enabled) {
+      $set["config.features.sbtEnabled"] = false;
+      $set["config.travelFlow"] = "APPROVAL_FLOW";
+    } else if (feature === "approvalDirectEnabled" && enabled) {
+      $set["config.features.approvalFlowEnabled"] = true;
+      $set["config.features.sbtEnabled"] = false;
+      $set["config.travelFlow"] = "APPROVAL_DIRECT";
+    } else if (feature === "sbtEnabled" && enabled) {
+      $set["config.features.approvalFlowEnabled"] = false;
+      $set["config.features.approvalDirectEnabled"] = false;
+      $set["config.travelFlow"] = "SBT";
+    }
+
     const workspace = await CustomerWorkspace.findByIdAndUpdate(
       req.params.workspaceId,
-      { $set: { [`config.features.${feature}`]: enabled } },
+      { $set },
       { new: true },
     );
     if (!workspace) return res.status(404).json({ error: "Workspace not found" });
