@@ -111,6 +111,7 @@ router.post("/", async (req: any, res: any) => {
       passengerDetails: passengerDetails || [],
       contactDetails: contactDetails || {},
       status: "PENDING",
+      workspaceId: req.workspaceObjectId,
     });
 
     // Send email to L2 booker
@@ -501,6 +502,7 @@ router.post("/:id/book", async (req: any, res: any) => {
         userId: request.requesterId,
         customerId: String(request.customerId || ""),
         sbtRequestId: request._id,
+        workspaceId: (req as any).workspaceObjectId,
         traceId: traceId || "",
         pnr: tboPNR || `REQ-${Date.now()}`,
         bookingId: tboBookingId || `BK-${Date.now()}`,
@@ -539,6 +541,7 @@ router.post("/:id/book", async (req: any, res: any) => {
         userId: request.requesterId,
         customerId: String(request.customerId || ""),
         sbtRequestId: request._id,
+        workspaceId: (req as any).workspaceObjectId,
         bookingId: opt?.BookingId || "",
         confirmationNo: opt?.ConfirmationNo || "",
         bookingRefNo: opt?.BookingRefNo || "",

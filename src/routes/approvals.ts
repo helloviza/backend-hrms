@@ -612,7 +612,10 @@ router.get("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
       return res.status(400).json({ error: "Invalid request id" });
     }
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId }).lean().exec();
+    const detailQuery = isStaffAdmin(req.user) && !req.workspaceObjectId
+      ? { _id: id }
+      : { _id: id, workspaceId: req.workspaceObjectId };
+    const doc: any = await ApprovalRequest.findOne(detailQuery).lean().exec();
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     const user = req.user;

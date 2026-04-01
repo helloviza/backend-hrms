@@ -760,6 +760,7 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
       userId,
       customerId: (req.user as any)?.customerId ?? undefined,
       sbtRequestId: b.sbtRequestId || undefined,
+      workspaceId: req.workspaceObjectId,
       bookingId: b.bookingId || "",
       confirmationNo: b.confirmationNo || "",
       bookingRefNo: b.bookingRefNo || "",

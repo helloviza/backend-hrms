@@ -7,6 +7,7 @@ import MasterData from "../models/MasterData.js";
 import CustomerApprovalRequest from "../models/CustomerApprovalRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { requireCustomer, requireHrmsAdmin, resolveCustomerWorkspaceId, assertWorkspaceEmailAllowed } from "../middleware/customerApprovalGuard.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { hashToken, signEmailActionToken, verifyEmailActionToken } from "../utils/emailActionToken.js";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
@@ -322,7 +323,9 @@ r.get("/admin/approved", requireAuth, requireWorkspace, requireHrmsAdmin, async 
 r.put("/admin/:id/assign", requireAuth, requireWorkspace, requireHrmsAdmin, async (req: any, res, next) => {
   try {
     const { agentType, agentName, comment } = req.body || {};
-    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
+    const doc: any = isSuperAdmin(req)
+      ? await CustomerApprovalRequest.findById(req.params.id)
+      : await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     if (doc.status !== "approved") return res.status(400).json({ error: "Only approved can be assigned" });
 
@@ -337,7 +340,9 @@ r.put("/admin/:id/assign", requireAuth, requireWorkspace, requireHrmsAdmin, asyn
 
 r.put("/admin/:id/done", requireAuth, requireWorkspace, requireHrmsAdmin, async (req: any, res, next) => {
   try {
-    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
+    const doc: any = isSuperAdmin(req)
+      ? await CustomerApprovalRequest.findById(req.params.id)
+      : await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     doc.adminState = "done";
     doc.history.push({ action: "booking_done", by: req.user?.sub, comment: String(req.body?.comment || "") });
@@ -348,7 +353,9 @@ r.put("/admin/:id/done", requireAuth, requireWorkspace, requireHrmsAdmin, async 
 
 r.put("/admin/:id/on-hold", requireAuth, requireWorkspace, requireHrmsAdmin, async (req: any, res, next) => {
   try {
-    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
+    const doc: any = isSuperAdmin(req)
+      ? await CustomerApprovalRequest.findById(req.params.id)
+      : await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     doc.adminState = "on_hold";
     doc.history.push({ action: "admin_on_hold", by: req.user?.sub, comment: String(req.body?.comment || "") });
@@ -359,7 +366,9 @@ r.put("/admin/:id/on-hold", requireAuth, requireWorkspace, requireHrmsAdmin, asy
 
 r.put("/admin/:id/cancel", requireAuth, requireWorkspace, requireHrmsAdmin, async (req: any, res, next) => {
   try {
-    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
+    const doc: any = isSuperAdmin(req)
+      ? await CustomerApprovalRequest.findById(req.params.id)
+      : await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     doc.adminState = "cancelled";
     doc.history.push({ action: "admin_cancelled", by: req.user?.sub, comment: String(req.body?.comment || "") });

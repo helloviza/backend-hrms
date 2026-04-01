@@ -40,7 +40,10 @@ const upload = multer({
 
 const r = Router();
 
-r.use(requireAuth, requireWorkspace, requireFeature("payrollEnabled"));
+r.use(requireAuth, requireWorkspace, requireFeature("payrollEnabled"), (req: Request, res: Response, next: NextFunction) => {
+  if (!req.workspaceObjectId) return res.status(400).json({ error: "workspaceId query param required for SUPERADMIN" });
+  next();
+});
 
 /* ────────────────────────────────────────────────────────────
  * HELPERS
