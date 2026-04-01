@@ -390,6 +390,13 @@ router.post("/requests", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROV
     const managerId = String(mgrUser?.sub || mgrUser?._id || "");
     const managerName = normStr(mgrUser?.name || mgrUser?.firstName || "") || "Approver";
 
+    // Resolve workspace travel flow (requireTravelMode attaches req.workspace)
+    const wsTravelFlow =
+      (req as any).workspace?.config?.travelFlow ||
+      (req as any).workspace?.travelMode ||
+      "";
+    const isDirectFlow = wsTravelFlow === "APPROVAL_DIRECT";
+
     const doc: any = await ApprovalRequest.create({
       workspaceId: req.workspaceObjectId,
       ticketId: ticketId ? String(ticketId) : undefined,
@@ -406,14 +413,16 @@ router.post("/requests", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROV
       managerEmail: approverEmail,
       managerName,
 
-      status: "pending",
-      stage: "REQUEST_RAISED",
+      status: isDirectFlow ? "approved" : "pending",
+      adminState: isDirectFlow ? "pending" : undefined,
+      stage: isDirectFlow ? "APPROVED" : "REQUEST_RAISED",
       cartItems,
       comments: comments ? String(comments) : undefined,
 
       meta: {
         ...(wsInternalId ? { customerWorkspaceId: wsInternalId } : {}),
         ccLeaders: leaderEmails,
+        ...(isDirectFlow ? { autoApproved: true, autoApprovedReason: "APPROVAL_DIRECT" } : {}),
       },
 
       history: [
@@ -425,6 +434,16 @@ router.post("/requests", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROV
           userEmail: email,
           userName: name,
         },
+        ...(isDirectFlow
+          ? [
+              {
+                action: "auto_approved",
+                at: new Date(),
+                by: "system",
+                comment: "Auto-approved — APPROVAL_DIRECT workspace (no manager approval required).",
+              },
+            ]
+          : []),
       ],
     });
 
@@ -1554,6 +1573,60 @@ router.post("/email/consume", async (req: AnyObj, res) => {
           ? { message: String(err?.message || err), stack: err?.stack }
           : undefined,
     });
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
+ * Temporary: Fix stuck APPROVAL_DIRECT requests (pending → approved)
+ * GET /api/approvals/fix-approval-direct-requests
+ * Remove this endpoint once all stuck requests are fixed.
+ * ──────────────────────────────────────────────────────────────── */
+
+router.get("/fix-approval-direct-requests", requireAuth, requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
+  try {
+    if (!isStaffAdmin(req.user)) {
+      return res.status(403).json({ error: "SUPERADMIN or ADMIN only" });
+    }
+
+    const directWorkspaces = await CustomerWorkspace.find({
+      "config.travelFlow": "APPROVAL_DIRECT",
+    })
+      .select("customerId")
+      .lean();
+
+    const customerIds = directWorkspaces.map((w: any) => String(w.customerId)).filter(Boolean);
+
+    if (!customerIds.length) {
+      return res.json({ fixed: 0, message: "No APPROVAL_DIRECT workspaces found." });
+    }
+
+    const result = await ApprovalRequest.updateMany(
+      {
+        customerId: { $in: customerIds },
+        status: "pending",
+      },
+      {
+        $set: {
+          status: "approved",
+          adminState: "pending",
+          stage: "APPROVED",
+          "meta.autoApproved": true,
+          "meta.autoApprovedReason": "APPROVAL_DIRECT workspace — bulk fix",
+        },
+        $push: {
+          history: {
+            action: "auto_approved",
+            at: new Date(),
+            by: "system",
+            comment: "Bulk fix — auto-approved stuck APPROVAL_DIRECT request.",
+          },
+        },
+      },
+    );
+
+    return res.json({ fixed: result.modifiedCount, customerIds });
+  } catch (err) {
+    next(err);
   }
 });
 
