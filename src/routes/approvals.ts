@@ -1023,7 +1023,7 @@ router.put(
       const st = String(doc.stage || "").toUpperCase();
       const legacyOk = !st && String(doc.status || "").toLowerCase() === "approved";
 
-      if (!["PROPOSAL_APPROVED", "BOOKING_ON_HOLD", "PROPOSAL_ON_HOLD"].includes(st) && !legacyOk) {
+      if (!["APPROVED", "PROPOSAL_APPROVED", "BOOKING_ON_HOLD", "PROPOSAL_ON_HOLD"].includes(st) && !legacyOk) {
         return res.status(400).json({ error: "Only proposal-approved requests can start booking" });
       }
       if (st === "PROPOSAL_ON_HOLD" && !legacyOk) {
