@@ -56,8 +56,6 @@ r.post(
   requireRoles("HR", "ADMIN"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      console.log("[PayrollSalary] POST /structure body:", JSON.stringify(req.body, null, 2));
-
       const workspaceId = await resolveWorkspaceId(req);
       if (!workspaceId) {
         return res.status(400).json({ error: "workspaceId required" });
