@@ -1,5 +1,37 @@
 # Backend Changelog
 
+## [2026-04-01/02]
+
+### Session — Security Audit + MT Migration + TBO Investigation
+
+#### Security Audit (120 issues across 53 files)
+- P0 Critical: `/register` role escalation fixed (stripped roles/workspaceId from body), `/ticket-lcc` auth added
+- P1 High: workspace isolation filters added to 9 route files (leaves, attendance, employees, vendors, policies, holidays, approvals, onboarding, documents)
+- P2 Medium: SUPERADMIN empty results fixed (workspace filter bypass), frontend role guards hardened
+- P3: rate limiting on auth endpoints, console.log cleanup in priority files
+- P4: removed temp test endpoints, cleaned dead code
+
+#### Multi-Tenant (MT) Migration
+- `requireWorkspace` middleware resolves real `workspace._id` via DB lookup (not raw JWT value)
+- `workspaceId` embedded in JWT for staff users
+- `WORKSPACE_LEADER` role no longer auto-added to JWT
+- Customer approval flow (Flow 2) working end-to-end with L1/L2 routing
+- L1/L2/L0 nav access control fixed in frontend
+
+#### TBO Flight Ticketing Fixes
+- SeatDynamic: changed from nested `SegmentSeat → RowSeats → Seats` to **flat array** per official API docs
+- `sanitizeSeatObj`: stopped forcing `AvailablityType`, `SeatWayType`, `Compartment`, `Deck` — now passes SSR values verbatim
+- `convertSeatPreferences`: outputs flat seat array (not nested)
+- Meal filter: removed `Price > 0` restriction — NoMeal (Price:0) now included per official docs
+- TraceId threading confirmed correct (Search → FareQuote → SSR → Ticket)
+- `IsPriceChangeAccepted`: set to `false` (correct default)
+- Status: **BLOCKED** — "Invalid Resource Requested" on TicketLCC, needs fresh investigation
+
+#### Diagnostic Improvements
+- TraceId + full error response logged on ticket failures
+- Price:0 meal filtering added to ticket payload builder
+- Payload pre-call logging enhanced with SeatDynamic structure visibility
+
 ## [2026-03-27]
 
 ### Sprint T — Security Hardening + Employee Profile Fixes
