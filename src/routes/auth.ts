@@ -120,6 +120,7 @@ function signAccessToken(params: {
   userId: string;
   email: string;
   roles: string[];
+  workspaceId?: string | null;
   customerId?: string | null;
   vendorId?: string | null;
   businessId?: string | null;
@@ -131,6 +132,7 @@ function signAccessToken(params: {
     email: normalizeEmail(params.email || ""),
   };
 
+  if (params.workspaceId) payload.workspaceId = String(params.workspaceId);
   if (params.customerId) payload.customerId = String(params.customerId);
   if (params.businessId) payload.businessId = String(params.businessId);
   if (params.vendorId) payload.vendorId = String(params.vendorId);
@@ -796,6 +798,7 @@ r.post("/login", loginLimiter, async (req, res) => {
       userId: String(user._id),
       email: built.safe.email,
       roles: built.roles,
+      workspaceId: user.workspaceId?.toString() || undefined,
       customerId: built.staff ? undefined : built.customerId || undefined,
       businessId: built.staff ? undefined : built.customerId || undefined,
       vendorId: built.staff ? undefined : built.vendorId || undefined,
@@ -864,6 +867,7 @@ r.post("/refresh", async (req, res) => {
       userId: String(user._id),
       email: built.safe.email,
       roles: built.roles,
+      workspaceId: user.workspaceId?.toString() || undefined,
       customerId: built.staff ? undefined : built.customerId || undefined,
       businessId: built.staff ? undefined : built.customerId || undefined,
       vendorId: built.staff ? undefined : built.vendorId || undefined,
