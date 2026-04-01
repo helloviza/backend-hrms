@@ -59,18 +59,42 @@
 - PUT /employees/:id: ownerId lookup, dangerous field stripping
 - Access token 15m → 30m
 
+### Security Audit + MT Migration + TBO Investigation (2026-04-01/02)
+
+**Security Audit (120 issues, 53 files):**
+- P0: /register role escalation, /ticket-lcc missing auth — FIXED
+- P1: workspace isolation filters on 9 route files — FIXED
+- P2: SUPERADMIN empty results, frontend role guards — FIXED
+- P3: rate limiting on auth endpoints, console.log cleanup — DONE
+- P4: temp endpoints removed, dead code cleaned — DONE
+
+**Multi-Tenant Migration:**
+- requireWorkspace resolves real workspace._id via DB lookup
+- workspaceId in JWT for staff users
+- WORKSPACE_LEADER no longer auto-added to JWT
+- Customer approval flow (Flow 2) end-to-end working
+- L1/L2/L0 nav access control fixed
+
+**TBO Flight Ticketing:**
+- SeatDynamic: flat array format (per official API docs)
+- sanitizeSeatObj: SSR values passed verbatim (no forced overrides)
+- Meal filter: NoMeal (Price:0) included per docs
+- TraceId threading confirmed correct
+- Status: BLOCKED — "Invalid Resource Requested" on TicketLCC
+
 ## Pending
 
-- [ ] BodySizeRestrictionRule → Block (after 48hr monitoring, ~2026-03-29)
+- [ ] TBO flight ticketing — "Invalid Resource Requested" needs fresh investigation
+- [ ] Profile /profile/me {code,city} React render error
+- [ ] Attendance CSV lopDays bug (attendance.ts line 775)
+- [ ] Bundleojoy onboarding setup
+- [ ] BodySizeRestrictionRule → Block (WAF)
 - [ ] IP allowlist for WAF (collect client IPs first)
 - [ ] App Runner private endpoint (VPC link)
 - [ ] Razorpay webhook secret configuration
-- [ ] /api/sbt/flights/my-bookings 404 fix
 - [ ] Case 6: LCC Special Return — awaiting TBO confirmation
 - [ ] Browser testing: JT=5 Special Return, PriceRBD, NDC
-- [ ] Remove ~200 console.log calls from non-priority files
 - [ ] Payroll Engine (on hold)
-- [ ] Multi-tenant Phase A (295 unscoped queries)
 - [ ] Ticket PDF: IB leg on page 2
 - [ ] Send TBO hotel cert logs to TBO (Cases 1-8 zipped)
 - [ ] Send TBO flight cert logs to TBO (Cases 1-5,7-12 ready)
