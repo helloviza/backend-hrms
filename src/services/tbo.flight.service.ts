@@ -715,23 +715,39 @@ function sanitizeBaggage(bags: any[]): any[] {
 
 /**
  * Sanitize a single seat object to TBO Ticket format fields.
+ *
+ * IMPORTANT: AvailablityType, Compartment, Deck are FORCED to 0 —
+ * SSR returns different values (1, 1, 1) but the certified Ticket
+ * request always uses 0 for these fields.
+ *
+ * SeatWayType is determined by segment position (passed via segIdx param):
+ *   segment 0 (outbound) → 1, segment 1 (return) → 2.
+ *
+ * SeatNo must be the full combined value (e.g. "12A"), not just the letter.
  */
-function sanitizeSeatObj(s: any): Record<string, any> {
+function sanitizeSeatObj(s: any, segIdx = 0): Record<string, any> {
+  const rowNo = s.RowNo ?? (s.Code ? s.Code.replace(/[A-Z]/gi, "") : "");
+  // SeatNo: if it already contains digits (e.g. "12A"), use as-is;
+  // otherwise combine RowNo + SeatNo letter (e.g. "12" + "A" → "12A")
+  const rawSeatNo = s.SeatNo ?? "";
+  const alreadyCombined = rawSeatNo.length > 1 && /\d/.test(rawSeatNo);
+  const seatNo = alreadyCombined ? rawSeatNo : `${rowNo}${rawSeatNo}` || s.Code || "";
+
   return {
     AirlineCode: s.AirlineCode ?? "",
     FlightNumber: s.FlightNumber ?? "",
     CraftType: s.CraftType ?? "",
     Origin: s.Origin ?? "",
     Destination: s.Destination ?? "",
-    AvailablityType: s.AvailablityType ?? 0,
+    AvailablityType: 0,       // FORCED: always 0 in ticket request
     Description: Number(s.Description) || 2,
     Code: s.Code ?? "",
-    RowNo: s.RowNo ?? "",
-    SeatNo: s.SeatNo ?? "",
+    RowNo: rowNo,
+    SeatNo: seatNo,
     SeatType: s.SeatType ?? 0,
-    SeatWayType: s.SeatWayType ?? 1,
-    Compartment: s.Compartment ?? 0,
-    Deck: s.Deck ?? 0,
+    SeatWayType: segIdx === 0 ? 1 : 2,  // FORCED: 1=outbound, 2=return
+    Compartment: 0,           // FORCED: always 0 in ticket request
+    Deck: 0,                  // FORCED: always 0 in ticket request
     Currency: s.Currency ?? "INR",
     Price: Number(s.Price) || 0,
   };
@@ -756,11 +772,12 @@ function sanitizeSeatDynamic(seats: any[]): any[] {
   // Check if input is already SSR nested format (a)
   if (seats[0]?.SegmentSeat !== undefined) {
     // Sanitize seat fields but preserve the SegmentSeat → RowSeats → Seats nesting
+    // segIdx tracks segment position: 0=outbound, 1=return (drives SeatWayType)
     return seats.map((item: any) => ({
-      SegmentSeat: (item.SegmentSeat || []).map((ss: any) => ({
+      SegmentSeat: (item.SegmentSeat || []).map((ss: any, segIdx: number) => ({
         RowSeats: (ss.RowSeats || []).map((rs: any) => ({
           Seats: (rs.Seats || [])
-            .map(sanitizeSeatObj)
+            .map((s: any) => sanitizeSeatObj(s, segIdx))
             .filter((s: any) => s.Code && !SEAT_SKIP.includes(s.Code.toLowerCase()) && s.SeatNo),
         })).filter((rs: any) => rs.Seats.length > 0),
       })).filter((ss: any) => ss.RowSeats.length > 0),
@@ -1004,12 +1021,15 @@ export async function ticketLCC(params: {
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
-  // Log SeatDynamic for debugging TBO seat format issues
-  for (const p of (payload.Passengers as any[]) || []) {
-    if (p.SeatDynamic) {
-      console.warn("[TBO TICKET] SeatDynamic for pax", p.FirstName, JSON.stringify(p.SeatDynamic));
-    }
-  }
+  // Log full SSR payload for debugging TBO ticket format issues
+  console.warn("[TBO TICKET FULL PAYLOAD]", JSON.stringify({
+    passengers: (payload.Passengers as any[]).map((p: any) => ({
+      name: `${p.FirstName} ${p.LastName}`,
+      SeatDynamic: p.SeatDynamic,
+      MealDynamic: p.MealDynamic,
+      Baggage: p.Baggage,
+    })),
+  }));
 
   const lccResult = await post("/Ticket", payload, false, FLIGHT_BOOK_BASE) as any;
 
