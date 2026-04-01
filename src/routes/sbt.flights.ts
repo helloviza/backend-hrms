@@ -1051,11 +1051,19 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
     const obPassengers: any[] = req.body?.Passengers ?? [];
     convertSeatPreferences(obPassengers);
 
-    // Log full SSR payload for debugging before any ticketLCC call
-    sbtLogger.info("[TBO TICKET FULL PAYLOAD]", {
+    // Log full payload for debugging before any ticketLCC call
+    sbtLogger.info("[TBO TICKET PRE-CALL]", {
       module: "sbt",
+      TraceId: req.body.TraceId,
+      ResultIndex: req.body.ResultIndex?.substring(0, 30) + "...",
+      isSpecialReturn,
+      isReturn,
+      isNDC: ticketIsNDC,
+      isInternational: lccIsInternational,
+      airlineCode: lccAirlineCode,
       passengers: obPassengers.map((p: any) => ({
         name: `${p.FirstName} ${p.LastName}`,
+        PaxType: p.PaxType,
         SeatDynamic: p.SeatDynamic,
         MealDynamic: p.MealDynamic,
         Baggage: p.Baggage,

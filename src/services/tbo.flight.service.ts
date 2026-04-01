@@ -953,7 +953,8 @@ export async function ticketLCC(params: {
         m.Code &&
         !MEAL_PLACEHOLDERS.includes(m.Code.toLowerCase()) &&
         m.AirlineCode &&
-        m.FlightNumber
+        m.FlightNumber &&
+        m.Price > 0  // Only send paid meals — free/no-meal selections must be omitted
       );
       if (validMeals.length > 0) pax.MealDynamic = validMeals;
     }
@@ -1021,10 +1022,15 @@ export async function ticketLCC(params: {
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
-  // Log full SSR payload for debugging TBO ticket format issues
+  // Log full ticket payload for debugging TBO issues
   console.warn("[TBO TICKET FULL PAYLOAD]", JSON.stringify({
+    TraceId: payload.TraceId,
+    TokenId: String(payload.TokenId).substring(0, 8) + "...",
+    ResultIndex: String(payload.ResultIndex).substring(0, 30) + "...",
+    IsPriceChangedAccepted: payload.IsPriceChangedAccepted,
     passengers: (payload.Passengers as any[]).map((p: any) => ({
       name: `${p.FirstName} ${p.LastName}`,
+      PaxType: p.PaxType,
       SeatDynamic: p.SeatDynamic,
       MealDynamic: p.MealDynamic,
       Baggage: p.Baggage,
@@ -1032,6 +1038,18 @@ export async function ticketLCC(params: {
   }));
 
   const lccResult = await post("/Ticket", payload, false, FLIGHT_BOOK_BASE) as any;
+
+  // Log TBO response for debugging
+  const respStatus = lccResult?.Response?.ResponseStatus ?? lccResult?.Response?.Response?.ResponseStatus;
+  const respError = lccResult?.Response?.Error ?? lccResult?.Response?.Response?.Error;
+  if (respStatus !== 1) {
+    console.warn("[TBO TICKET ERROR]", JSON.stringify({
+      ResponseStatus: respStatus,
+      Error: respError,
+      TraceId: lccResult?.Response?.TraceId,
+      fullResponse: lccResult?.Response,
+    }));
+  }
 
   // Auto-retry with IsPriceChangedAccepted if TBO signals price changed
   const lccChanged = lccResult?.Response?.IsPriceChanged === true
