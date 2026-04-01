@@ -713,32 +713,83 @@ function sanitizeBaggage(bags: any[]): any[] {
   }));
 }
 
+/**
+ * Sanitize a single seat object to TBO Ticket format fields.
+ */
+function sanitizeSeatObj(s: any): Record<string, any> {
+  return {
+    AirlineCode: s.AirlineCode ?? "",
+    FlightNumber: s.FlightNumber ?? "",
+    CraftType: s.CraftType ?? "",
+    Origin: s.Origin ?? "",
+    Destination: s.Destination ?? "",
+    AvailablityType: s.AvailablityType ?? 1,
+    Description: Number(s.Description) || 2,
+    Code: s.Code ?? "",
+    RowNo: s.RowNo ?? "",
+    SeatNo: s.SeatNo ?? "",
+    SeatType: s.SeatType ?? 2,
+    SeatWayType: s.SeatWayType ?? 1,
+    Compartment: s.Compartment ?? 2,
+    Deck: s.Deck ?? 1,
+    Currency: s.Currency ?? "INR",
+    Price: Number(s.Price) || 0,
+  };
+}
+
+/**
+ * Convert SeatDynamic from SSR/frontend format into TBO Ticket format.
+ *
+ * TBO Ticket expects:
+ *   SeatDynamic: [{ WayType: 1, Seat: [seatObj, ...] }, ...]
+ *
+ * Input may be:
+ *   a) Already correct format: [{ WayType, Seat: [...] }]
+ *   b) SSR nested format: [{ SegmentSeat: [{ RowSeats: [{ Seats: [...] }] }] }]
+ *   c) Flat seat objects: [seatObj, seatObj, ...]
+ */
 function sanitizeSeatDynamic(seats: any[]): any[] {
-  if (!Array.isArray(seats)) return [];
-  return seats.map((seg: any) => ({
-    SegmentSeat: (Array.isArray(seg.SegmentSeat) ? seg.SegmentSeat : []).map((ss: any) => ({
-      RowSeats: (Array.isArray(ss.RowSeats) ? ss.RowSeats : []).map((rs: any) => ({
-        Seats: (Array.isArray(rs.Seats) ? rs.Seats : []).map((s: any) => ({
-          AirlineCode: s.AirlineCode ?? "",
-          FlightNumber: s.FlightNumber ?? "",
-          CraftType: s.CraftType ?? "",
-          Origin: s.Origin ?? "",
-          Destination: s.Destination ?? "",
-          AvailablityType: s.AvailablityType ?? 0,
-          Description: Number(s.Description) || 2,
-          Code: s.Code ?? "",
-          RowNo: s.RowNo ?? "",
-          SeatNo: s.SeatNo ?? "",
-          SeatType: s.SeatType ?? 0,
-          SeatWayType: s.SeatWayType ?? 0,
-          Compartment: s.Compartment ?? 0,
-          Deck: s.Deck ?? 0,
-          Currency: s.Currency ?? "INR",
-          Price: Number(s.Price) || 0,
-        })),
-      })),
-    })),
-  }));
+  if (!Array.isArray(seats) || seats.length === 0) return [];
+
+  const SEAT_SKIP = ["", "noseat", "no_seat"];
+  const result: any[] = [];
+
+  for (const item of seats) {
+    // Format (a): already has WayType + Seat array
+    if (item.WayType !== undefined && Array.isArray(item.Seat)) {
+      const validSeats = item.Seat
+        .map(sanitizeSeatObj)
+        .filter((s: any) => s.Code && !SEAT_SKIP.includes(s.Code.toLowerCase()) && s.SeatNo);
+      if (validSeats.length > 0) {
+        result.push({ WayType: item.WayType, Seat: validSeats });
+      }
+      continue;
+    }
+
+    // Format (b): SSR nested format with SegmentSeat → RowSeats → Seats
+    if (Array.isArray(item.SegmentSeat)) {
+      for (const ss of item.SegmentSeat) {
+        for (const rs of (ss.RowSeats || [])) {
+          for (const s of (rs.Seats || [])) {
+            if (!s.Code || SEAT_SKIP.includes(s.Code.toLowerCase()) || !s.SeatNo) continue;
+            const clean = sanitizeSeatObj(s);
+            result.push({ WayType: clean.SeatWayType || 1, Seat: [clean] });
+          }
+        }
+      }
+      continue;
+    }
+
+    // Format (c): flat seat object
+    if (item.Code && item.SeatNo) {
+      const clean = sanitizeSeatObj(item);
+      if (!SEAT_SKIP.includes(clean.Code.toLowerCase())) {
+        result.push({ WayType: clean.SeatWayType || 1, Seat: [clean] });
+      }
+    }
+  }
+
+  return result;
 }
 
 export async function ticketLCC(params: {
@@ -903,21 +954,8 @@ export async function ticketLCC(params: {
       if (freeBags.length > 0) pax.Baggage = freeBags;
     }
     if (Array.isArray(p.SeatDynamic) && p.SeatDynamic.length > 0) {
-      const cleaned = sanitizeSeatDynamic(p.SeatDynamic);
-      // Filter innermost seats — strip placeholders
-      const filtered = cleaned.map((seg: any) => ({
-        SegmentSeat: (seg.SegmentSeat ?? []).map((ss: any) => ({
-          RowSeats: (ss.RowSeats ?? []).map((rs: any) => ({
-            Seats: (rs.Seats ?? []).filter((s: any) =>
-              s.Code &&
-              !SEAT_PLACEHOLDERS.includes(s.Code.toLowerCase()) &&
-              s.SeatNo != null &&
-              s.SeatNo !== ""
-            ),
-          })).filter((rs: any) => rs.Seats.length > 0),
-        })).filter((ss: any) => ss.RowSeats.length > 0),
-      })).filter((seg: any) => seg.SegmentSeat.length > 0);
-      if (filtered.length > 0) pax.SeatDynamic = filtered;
+      const seatDynamic = sanitizeSeatDynamic(p.SeatDynamic);
+      if (seatDynamic.length > 0) pax.SeatDynamic = seatDynamic;
     }
     if (p.SeatPreference !== undefined) {
       pax.SeatPreference = p.SeatPreference;
@@ -962,10 +1000,12 @@ export async function ticketLCC(params: {
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
-  (payload.Passengers as any[])?.forEach((p: any, i: number) => {
-
-  });
-
+  // Log SeatDynamic for debugging TBO seat format issues
+  for (const p of (payload.Passengers as any[]) || []) {
+    if (p.SeatDynamic) {
+      console.warn("[TBO TICKET] SeatDynamic for pax", p.FirstName, JSON.stringify(p.SeatDynamic));
+    }
+  }
 
   const lccResult = await post("/Ticket", payload, false, FLIGHT_BOOK_BASE) as any;
 
