@@ -458,6 +458,9 @@ app.use("/api/payroll/reimbursements", payrollReimbursementsRouter);
 app.use("/api/payroll/declaration", payrollDeclarationRouter);
 app.use("/api/workspace/settings", workspaceSettingsRouter);
 
+// Preview (flight/hotel inventory for approval flow)
+app.use("/api/preview", previewRoutes);
+
 // 404
 app.use("/api", (_req, res) => {
   return res.status(404).json({ ok: false, message: "API route not found" });
