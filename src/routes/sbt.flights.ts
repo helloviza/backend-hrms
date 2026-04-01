@@ -1051,6 +1051,17 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
     const obPassengers: any[] = req.body?.Passengers ?? [];
     convertSeatPreferences(obPassengers);
 
+    // Log full SSR payload for debugging before any ticketLCC call
+    sbtLogger.info("[TBO TICKET FULL PAYLOAD]", {
+      module: "sbt",
+      passengers: obPassengers.map((p: any) => ({
+        name: `${p.FirstName} ${p.LastName}`,
+        SeatDynamic: p.SeatDynamic,
+        MealDynamic: p.MealDynamic,
+        Baggage: p.Baggage,
+      })),
+    });
+
     // ── Special Return: single ticketLCC call, TBO returns one PNR for both legs ──
     if (isSpecialReturn && isReturn) {
 
