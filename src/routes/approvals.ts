@@ -391,6 +391,7 @@ router.post("/requests", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROV
     const managerName = normStr(mgrUser?.name || mgrUser?.firstName || "") || "Approver";
 
     const doc: any = await ApprovalRequest.create({
+      workspaceId: req.workspaceObjectId,
       ticketId: ticketId ? String(ticketId) : undefined,
 
       customerId: finalCustomerId,
