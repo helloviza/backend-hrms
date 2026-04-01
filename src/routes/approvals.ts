@@ -69,6 +69,7 @@ import {
 } from "./approvals.email.js";
 
 const router = Router();
+router.use(requireAuth);
 router.use(requireWorkspace);
 router.use(requireFeature("approvalFlowEnabled"));
 
