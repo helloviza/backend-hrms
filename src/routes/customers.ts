@@ -4,6 +4,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireRoles } from "../middleware/roles.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import Customer from "../models/Customer.js";
 import Vendor from "../models/Vendor.js";
 import User from "../models/User.js";
@@ -12,9 +13,10 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 
 const router = Router();
 
-router.get("/", requireAuth, requireAdmin, async (_req, res, next) => {
+router.get("/", requireAuth, requireWorkspace, requireAdmin, async (_req: any, res, next) => {
   try {
-    const docs = await Customer.find({})
+    const custFilter = isSuperAdmin(_req) ? {} : { workspaceId: _req.workspaceObjectId };
+    const docs = await Customer.find(custFilter)
       .sort({ updatedAt: -1 })
       .lean()
       .exec();
@@ -45,11 +47,13 @@ router.get("/", requireAuth, requireAdmin, async (_req, res, next) => {
 router.get(
   "/admin/all",
   requireAuth,
+  requireWorkspace,
   requireRoles("ADMIN", "SUPERADMIN") as any,
-  async (_req, res, next) => {
+  async (_req: any, res, next) => {
     try {
-      const customers = await Customer.find({}).sort({ updatedAt: -1 }).lean().exec();
-      const vendors = await Vendor.find({}).sort({ updatedAt: -1 }).lean().exec();
+      const allFilter = isSuperAdmin(_req) ? {} : { workspaceId: _req.workspaceObjectId };
+      const customers = await Customer.find(allFilter).sort({ updatedAt: -1 }).lean().exec();
+      const vendors = await Vendor.find(allFilter).sort({ updatedAt: -1 }).lean().exec();
 
       const items = [
         ...customers.map((c: any) => ({
@@ -173,9 +177,12 @@ router.patch(
       if (escalationManager) team.escalationManager = await resolveContact(escalationManager);
       if (supportContact) team.supportContact = await resolveContact(supportContact);
 
-      // Try Customer
-      let doc: any = await Customer.findByIdAndUpdate(
-        id,
+      // Try Customer (workspace-scoped)
+      const acctQuery: any = { _id: id };
+      if (!isSuperAdmin(req) && req.workspaceObjectId) acctQuery.workspaceId = req.workspaceObjectId;
+
+      let doc: any = await Customer.findOneAndUpdate(
+        acctQuery,
         { $set: { accountTeam: team } },
         { new: true },
       )
@@ -184,8 +191,8 @@ router.patch(
 
       // Fallback to Vendor
       if (!doc) {
-        doc = await Vendor.findByIdAndUpdate(
-          id,
+        doc = await Vendor.findOneAndUpdate(
+          acctQuery,
           { $set: { accountTeam: team } },
           { new: true },
         )

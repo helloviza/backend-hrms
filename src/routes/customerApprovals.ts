@@ -173,7 +173,7 @@ r.get("/approver/inbox", requireAuth, requireWorkspace, requireCustomer, async (
     }
 
     const approverId = String(req.user?.sub || req.user?.id);
-    const rows = await CustomerApprovalRequest.find({ approverId, status: { $in: ["pending", "on_hold"] } })
+    const rows = await CustomerApprovalRequest.find({ approverId, status: { $in: ["pending", "on_hold"] }, workspaceId: req.workspaceObjectId })
       .sort({ updatedAt: -1 })
       .lean();
 
@@ -311,9 +311,7 @@ GET /api/customer-approvals/admin/approved
 */
 r.get("/admin/approved", requireAuth, requireWorkspace, requireHrmsAdmin, async (req: any, res, next) => {
   try {
-    const workspaceId = String(req.query.workspaceId || "").trim();
-    const match: any = { status: "approved" };
-    if (mongoose.isValidObjectId(workspaceId)) match.workspaceId = new mongoose.Types.ObjectId(workspaceId);
+    const match: any = { status: "approved", workspaceId: req.workspaceObjectId };
 
     const rows = await CustomerApprovalRequest.find(match).sort({ updatedAt: -1 }).lean();
     res.json({ rows });

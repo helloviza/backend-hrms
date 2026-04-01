@@ -970,7 +970,7 @@ router.get("/email-action", async (req: Request, res: Response) => {
       return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=0&msg=Invalid%20proposal`);
     }
 
-    const doc: any = await scopedFindById(Proposal, proposalId, (req as any).workspaceObjectId);
+    const doc: any = await Proposal.findById(proposalId);
     if (!doc) {
       return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=0&msg=Proposal%20not%20found`);
     }
@@ -1011,7 +1011,7 @@ router.get("/email-action", async (req: Request, res: Response) => {
 
     // Determine final proposal status
     let ar: any = null;
-    if (doc.requestId) ar = await ApprovalRequest.findOne({ _id: doc.requestId, workspaceId: (req as any).workspaceObjectId }).lean();
+    if (doc.requestId) ar = await ApprovalRequest.findOne({ _id: doc.requestId, workspaceId: doc.workspaceId }).lean();
     const needL0 = requiresL0Approval(ar, doc);
 
     const l2 = String(doc.approvals?.l2?.decision || "PENDING").toUpperCase();
@@ -1052,10 +1052,13 @@ router.get("/inbox", requireAnyAuth, requireWorkspace, async (req: Request, res:
     const userEmail = normEmail(aReq.user?.email);
     if (!userEmail) return res.status(401).json({ error: "Unauthenticated" });
 
-    const proposals = await Proposal.find({
+    const proposalFilter: any = {
       status: "SUBMITTED",
       $or: [{ "approvals.l2.decision": "PENDING" }, { "approvals.l0.decision": "PENDING" }],
-    })
+    };
+    const qsWsInbox = String((req.query as any)?.workspaceId || "").trim();
+    if (qsWsInbox && mongoose.Types.ObjectId.isValid(qsWsInbox)) proposalFilter.workspaceId = new mongoose.Types.ObjectId(qsWsInbox);
+    const proposals = await Proposal.find(proposalFilter)
       .sort({ updatedAt: -1 })
       .limit(200)
       .lean();
@@ -1124,6 +1127,7 @@ router.get("/mine", requireAnyAuth, requireWorkspace, async (req: Request, res: 
 
     const candidateRequests = await ApprovalRequest.find({
       $or: [{ frontlinerEmail: userEmail }, { managerEmail: userEmail }, { "meta.ccLeaders": userEmail }],
+      workspaceId: (req as any).workspaceObjectId,
     })
       .sort({ updatedAt: -1, createdAt: -1 })
       .limit(1000)

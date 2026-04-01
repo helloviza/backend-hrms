@@ -554,6 +554,7 @@ router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("A
 
     const rows = await ApprovalRequest.find({
       $or: [{ frontlinerId: sub }, { frontlinerEmail: exactIRegex(email) }],
+      workspaceId: req.workspaceObjectId,
     })
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
@@ -584,6 +585,7 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
         {
           status: "pending",
           stage: { $in: ["REQUEST_RAISED", "REQUEST_ON_HOLD"] },
+          workspaceId: req.workspaceObjectId,
         },
         {
           $or: [{ managerEmail: exactIRegex(email) }, { "meta.ccLeaders": exactIRegex(email) }],
@@ -899,7 +901,10 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
 router.get("/admin/pending", requireApprovalsAdminRead, async (req: AnyObj, res, next) => {
   try {
     setNoStore(res);
-    const scoped = applyLeaderScopeIfNeeded(req, adminQueueFilter("pending"));
+    const baseFilter = adminQueueFilter("pending");
+    const qsWs = String(req.query?.workspaceId || "").trim();
+    if (qsWs && mongoose.Types.ObjectId.isValid(qsWs)) (baseFilter as any).workspaceId = new mongoose.Types.ObjectId(qsWs);
+    const scoped = applyLeaderScopeIfNeeded(req, baseFilter);
     const rows = await ApprovalRequest.find(scoped)
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
@@ -915,6 +920,8 @@ router.get("/admin/approved", requireApprovalsAdminRead, async (req: AnyObj, res
     setNoStore(res);
 
     const { includeClosed, adminState, q, filter } = buildAdminApprovedQueryFromParams(req);
+    const qsWs = String(req.query?.workspaceId || "").trim();
+    if (qsWs && mongoose.Types.ObjectId.isValid(qsWs)) (filter as any).workspaceId = new mongoose.Types.ObjectId(qsWs);
 
     if (process.env.NODE_ENV !== "production") {
       // eslint-disable-next-line no-console
@@ -943,7 +950,10 @@ router.get("/admin/approved", requireApprovalsAdminRead, async (req: AnyObj, res
 router.get("/admin/done", requireApprovalsAdminRead, async (req: AnyObj, res, next) => {
   try {
     setNoStore(res);
-    const scoped = applyLeaderScopeIfNeeded(req, adminQueueFilter("done"));
+    const doneFilter = adminQueueFilter("done");
+    const qsWsDone = String(req.query?.workspaceId || "").trim();
+    if (qsWsDone && mongoose.Types.ObjectId.isValid(qsWsDone)) (doneFilter as any).workspaceId = new mongoose.Types.ObjectId(qsWsDone);
+    const scoped = applyLeaderScopeIfNeeded(req, doneFilter);
     const rows = await ApprovalRequest.find(scoped)
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
@@ -957,7 +967,10 @@ router.get("/admin/done", requireApprovalsAdminRead, async (req: AnyObj, res, ne
 router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res, next) => {
   try {
     setNoStore(res);
-    const scoped = applyLeaderScopeIfNeeded(req, adminQueueFilter("rejected"));
+    const rejFilter = adminQueueFilter("rejected");
+    const qsWsRej = String(req.query?.workspaceId || "").trim();
+    if (qsWsRej && mongoose.Types.ObjectId.isValid(qsWsRej)) (rejFilter as any).workspaceId = new mongoose.Types.ObjectId(qsWsRej);
+    const scoped = applyLeaderScopeIfNeeded(req, rejFilter);
     const rows = await ApprovalRequest.find(scoped)
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()

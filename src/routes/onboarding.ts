@@ -543,6 +543,7 @@ router.get("/invites", requireAuth, noStore, async (req, res, next) => {
     const { type } = req.query as { type?: string };
     const filter: Record<string, any> = {};
     if (type) filter.type = resolveType(type);
+    if ((req as any).workspaceObjectId) filter.workspaceId = (req as any).workspaceObjectId;
     const docs = (await (Onboarding as any).find(filter)
       .sort({ createdAt: -1 })
       .limit(100)
@@ -843,6 +844,7 @@ router.get("/pipeline", requireAuth, noStore, async (req, res, next) => {
     const { type } = req.query as { type?: string };
     const filter: Record<string, any> = {};
     if (type) filter.type = resolveType(type);
+    if ((req as any).workspaceObjectId) filter.workspaceId = (req as any).workspaceObjectId;
     const docs = (await (Onboarding as any).find(filter)
       .sort({ updatedAt: -1 })
       .lean()
@@ -1171,7 +1173,13 @@ router.post("/:token/decision", requireAuth, noStore, async (req, res, next) => 
 
     const { token } = req.params;
     const { action, remarks } = validation.data;
-    const doc: any = await (Onboarding as any).findOne({ token }).exec();
+
+    // Workspace-scope the lookup for non-SUPERADMIN
+    const decisionQuery: any = { token };
+    if (!isSuperAdmin(req) && (req as any).workspaceObjectId) {
+      decisionQuery.workspaceId = (req as any).workspaceObjectId;
+    }
+    const doc: any = await (Onboarding as any).findOne(decisionQuery).exec();
     if (!doc) return res.status(404).json({ error: "Not found" });
     const newStatus =
       action === "approved"

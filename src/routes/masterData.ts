@@ -193,17 +193,8 @@ async function resolveWorkspaceId(req: Request): Promise<mongoose.Types.ObjectId
       req.headers["x-workspace-id"];
     if (explicit) return new mongoose.Types.ObjectId(String(explicit));
 
-    const ws = await CustomerWorkspace.findOne({ status: "ACTIVE" })
-      .select("_id")
-      .lean();
-    if (ws) {
-      console.warn(
-        `[SUPERADMIN AUTO-RESOLVE] No workspaceId provided. ` +
-        `Falling back to first active workspace: ${ws._id}. ` +
-        `User: ${(req as any).user?.email}. Path: ${req.path}`
-      );
-      return ws._id as mongoose.Types.ObjectId;
-    }
+    // SUPERADMIN must provide explicit workspaceId — no auto-fallback
+    return null;
   }
 
   return null;
@@ -216,12 +207,15 @@ async function resolveWorkspaceId(req: Request): Promise<mongoose.Types.ObjectId
 /**
  * List approved onboardings (Master Data)
  */
-router.get("/", requireAuth, async (req, res, next) => {
+router.get("/", requireAuth, requireWorkspace, async (req, res, next) => {
   try {
     const { type, status } = req.query as Record<string, string>;
+    const wsFilter = isSuperAdmin(req)
+      ? {}
+      : { workspaceId: (req as any).workspaceObjectId };
 
     // --- Onboarding collection ---
-    const obFilter: any = { status: { $in: ["approved", "submitted", "verified"] } };
+    const obFilter: any = { status: { $in: ["approved", "submitted", "verified"] }, ...wsFilter };
     if (type && type !== "All") obFilter.type = new RegExp(`^${type}$`, "i");
     if (status && /inactive/i.test(status)) obFilter.isActive = false;
     else if (status && /active/i.test(status) && !/inactive/i.test(status)) obFilter.isActive = true;
@@ -246,7 +240,7 @@ router.get("/", requireAuth, async (req, res, next) => {
     }));
 
     // --- MasterData collection ---
-    const mdFilter: any = {};
+    const mdFilter: any = { ...wsFilter };
     if (type && type !== "All") mdFilter.type = new RegExp(`^${type}$`, "i");
     if (status && /inactive/i.test(status)) mdFilter.isActive = false;
     else if (status && /active/i.test(status) && !/inactive/i.test(status)) mdFilter.isActive = true;
@@ -390,14 +384,20 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
 /**
  * Toggle Active/Inactive state
  */
-router.patch("/:id/status", requireAuth, async (req, res, next) => {
+router.patch("/:id/status", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
+    if (!isHrmsAdmin(req.user)) {
+      return res.status(403).json({ error: "Only HR Admin / Admin can toggle status" });
+    }
+
     const { id } = req.params;
     const { status } = req.body as { status: string };
     const isActive = !/inactive/i.test(status);
 
-    const doc = await Onboarding.findByIdAndUpdate(
-      id,
+    const query: any = { _id: id };
+    if (!isSuperAdmin(req) && req.workspaceObjectId) query.workspaceId = req.workspaceObjectId;
+    const doc = await Onboarding.findOneAndUpdate(
+      query,
       { isActive },
       { new: true },
     ).exec();

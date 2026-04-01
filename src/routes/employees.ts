@@ -255,7 +255,7 @@ router.post("/bulk-update", requireAuth, requireWorkspace, async (req: any, res,
  * - officialEmail/email is mandatory.
  * - If a user already exists with same email, we update that record instead.
  */
-router.post("/", requireAuth, async (req: any, res, next) => {
+router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     if (!isAdminish(req.user)) {
       return res.status(403).json({ error: "Only admins can create employees" });
@@ -289,25 +289,42 @@ router.post("/", requireAuth, async (req: any, res, next) => {
     const hrmsAccessRole: string =
       body.hrmsAccessRole || (user as any)?.hrmsAccessRole || "EMPLOYEE";
 
-    // Build common fields – explicit overrides come AFTER spreading body
-    const commonFields: any = {
-      ...body,
-      name: fullName || undefined,
-      firstName: body.firstName || undefined,
-      middleName: body.middleName || undefined,
-      lastName: body.lastName || undefined,
-      employeeCode,
-      department: body.department || undefined,
-      designation: body.designation || undefined,
-      managerName: body.reportingL1 || body.managerName || undefined,
-      jobLocation: body.jobLocation || undefined,
-      employmentStatus: body.employmentStatus || undefined,
-      employeeType: body.employeeType || undefined,
-      hrmsAccessRole,
-      officialEmail,
-      email: officialEmail,
-      personalEmail: body.personalEmail || body.personalEmailId || undefined,
-    };
+    // Build common fields – whitelist allowed fields
+    const ALLOWED_EMPLOYEE_FIELDS = [
+      "firstName", "middleName", "lastName", "name",
+      "phone", "personalContact", "personalEmail", "personalEmailId",
+      "department", "designation", "dateOfJoining", "dateOfBirth",
+      "employmentType", "employeeType", "employmentStatus",
+      "reportingManager", "reportingL1", "managerName",
+      "jobLocation", "gender", "maritalStatus",
+      "currentAddress", "permanentAddress",
+      "pan", "aadhaar", "voterId", "passportNumber",
+      "bankAccountNumber", "bankName", "ifsc", "bankBranch",
+      "highestDegree", "institution",
+      "emergencyContactName", "emergencyContactNumber", "emergencyContactRelation",
+      "sendInvite",
+    ] as const;
+    const commonFields: any = {};
+    for (const field of ALLOWED_EMPLOYEE_FIELDS) {
+      if (body[field] !== undefined) commonFields[field] = body[field];
+    }
+    // Always set these derived fields
+    commonFields.name = fullName || undefined;
+    commonFields.firstName = body.firstName || undefined;
+    commonFields.middleName = body.middleName || undefined;
+    commonFields.lastName = body.lastName || undefined;
+    commonFields.employeeCode = employeeCode;
+    commonFields.department = body.department || undefined;
+    commonFields.designation = body.designation || undefined;
+    commonFields.managerName = body.reportingL1 || body.managerName || undefined;
+    commonFields.jobLocation = body.jobLocation || undefined;
+    commonFields.employmentStatus = body.employmentStatus || undefined;
+    commonFields.employeeType = body.employeeType || undefined;
+    commonFields.hrmsAccessRole = hrmsAccessRole;
+    commonFields.officialEmail = officialEmail;
+    commonFields.email = officialEmail;
+    commonFields.personalEmail = body.personalEmail || body.personalEmailId || undefined;
+    commonFields.workspaceId = req.workspaceObjectId;
 
     if (user) {
       // UPDATE existing user
@@ -390,7 +407,7 @@ router.post("/", requireAuth, async (req: any, res, next) => {
  * - Requires Admin / SuperAdmin.
  * - Does not allow direct passwordHash changes here.
  */
-router.put("/:id", requireAuth, async (req: any, res, next) => {
+router.put("/:id", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     if (!isAdminish(req.user)) {
       return res.status(403).json({ error: "Only admins can edit employees" });
