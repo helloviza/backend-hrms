@@ -14,14 +14,18 @@ export function requireTravelMode(...allowedFlows: string[]) {
         return next();
       }
 
-      const customerId = user.customerId || user.businessId;
-      if (!customerId) {
-        return res.status(403).json({
-          error: "No workspace assigned to this user",
-        });
+      // Use workspace already resolved by requireWorkspace, or fall back to DB lookup
+      let ws = (req as any).workspace;
+      if (!ws) {
+        const customerId = user.customerId || user.businessId;
+        if (!customerId) {
+          return res.status(403).json({
+            error: "No workspace assigned to this user",
+          });
+        }
+        ws = await CustomerWorkspace.findOne({ customerId });
       }
 
-      const ws = await CustomerWorkspace.findOne({ customerId });
       if (!ws) {
         return res.status(403).json({
           error: "Workspace not configured",
@@ -39,8 +43,6 @@ export function requireTravelMode(...allowedFlows: string[]) {
         });
       }
 
-      // Attach workspace to request for downstream use
-      (req as any).workspace = ws;
       next();
     } catch (err) {
       next(err);

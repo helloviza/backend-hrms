@@ -39,7 +39,8 @@ type AuthedReq = Request & {
 };
 
 const router = Router();
-router.use(requireWorkspace);
+// NOTE: requireWorkspace is applied per-route AFTER requireAnyAuth
+// (it needs req.user which requireAnyAuth sets)
 
 /* ───────────────────────── storage (PDF attachments) ───────────────────────── */
 
@@ -918,6 +919,7 @@ function buildPdfAttachmentsForEmail(p: any, maxFiles = 10) {
 router.get(
   "/attachments/download",
   requireAnyAuth,
+  requireWorkspace,
   requireProposalViewerFromDownloadPath,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -1042,7 +1044,7 @@ router.get("/email-action", async (req: Request, res: Response) => {
 /**
  * ✅ GET /api/proposals/inbox
  */
-router.get("/inbox", requireAnyAuth, async (req: Request, res: Response, next: NextFunction) => {
+router.get("/inbox", requireAnyAuth, requireWorkspace, async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1112,7 +1114,7 @@ router.get("/inbox", requireAnyAuth, async (req: Request, res: Response, next: N
 /**
  * ✅ GET /api/proposals/mine
  */
-router.get("/mine", requireAnyAuth, async (req: Request, res: Response, next: NextFunction) => {
+router.get("/mine", requireAnyAuth, requireWorkspace, async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1190,7 +1192,7 @@ router.get("/mine", requireAnyAuth, async (req: Request, res: Response, next: Ne
 /**
  * GET /api/proposals/queue (staff only)
  */
-router.get("/queue", requireAnyAuth, requireStaff, async (req: Request, res: Response, next: NextFunction) => {
+router.get("/queue", requireAnyAuth, requireWorkspace, requireStaff, async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1216,7 +1218,7 @@ router.get("/queue", requireAnyAuth, requireStaff, async (req: Request, res: Res
 /**
  * GET /api/proposals/by-request/:requestId (staff-only)
  */
-router.get("/by-request/:requestId", requireAnyAuth, requireStaff, async (req: Request, res: Response, next: NextFunction) => {
+router.get("/by-request/:requestId", requireAnyAuth, requireWorkspace, requireStaff, async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1237,7 +1239,7 @@ router.get("/by-request/:requestId", requireAnyAuth, requireStaff, async (req: R
 /**
  * POST /api/proposals/by-request/:requestId/draft (staff-only)
  */
-router.post("/by-request/:requestId/draft", requireAnyAuth, requireStaff, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
+router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, requireStaff, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1309,7 +1311,7 @@ router.post("/by-request/:requestId/draft", requireAnyAuth, requireStaff, requir
 /**
  * PUT /api/proposals/:id (staff-only) - Update DRAFT only.
  */
-router.put("/:id", requireAnyAuth, requireStaff, async (req: Request, res: Response, next: NextFunction) => {
+router.put("/:id", requireAnyAuth, requireWorkspace, requireStaff, async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1345,7 +1347,7 @@ router.put("/:id", requireAnyAuth, requireStaff, async (req: Request, res: Respo
  * - Sets status SUBMITTED
  * - Sends email to L2 with token actions
  */
-router.post("/:id/submit", requireAnyAuth, requireStaff, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
+router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1502,6 +1504,7 @@ function extractUploadedFiles(req: Request): Array<{ filename: string; originaln
 router.post(
   "/:id/options/:optionNo/attachments",
   requireAnyAuth,
+  requireWorkspace,
   requireStaff,
   uploadOptionAttachmentsMiddleware,
   async (req: Request, res: Response, next: NextFunction) => {
@@ -1562,6 +1565,7 @@ router.post(
 router.post(
   "/:id/options/:optionNo/attachment",
   requireAnyAuth,
+  requireWorkspace,
   requireStaff,
   uploadOptionAttachmentsMiddleware,
   async (req: Request, res: Response, next: NextFunction) => {
@@ -1618,6 +1622,7 @@ router.post(
 router.post(
   "/:id/booking/attachment",
   requireAnyAuth,
+  requireWorkspace,
   requireStaff,
   (req: Request, res: Response, next: NextFunction) => {
     proposalUpload.single("file")(req as any, res as any, (err: any) => {
@@ -1672,7 +1677,7 @@ router.post(
 /**
  * POST /api/proposals/:id/decide (existing UI decisions)
  */
-router.post("/:id/decide", requireAnyAuth, requireProposalViewer, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
+router.post("/:id/decide", requireAnyAuth, requireWorkspace, requireProposalViewer, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1762,7 +1767,7 @@ router.post("/:id/decide", requireAnyAuth, requireProposalViewer, requireTravelM
 /**
  * ✅ POST /api/proposals/:id/action (customer action)
  */
-router.post("/:id/action", requireAnyAuth, requireProposalViewer, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
+router.post("/:id/action", requireAnyAuth, requireWorkspace, requireProposalViewer, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1812,7 +1817,7 @@ router.post("/:id/action", requireAnyAuth, requireProposalViewer, requireTravelM
  * GET /api/proposals/:id
  * Keep LAST.
  */
-router.get("/:id", requireAnyAuth, requireProposalViewer, async (req: Request, res: Response, next: NextFunction) => {
+router.get("/:id", requireAnyAuth, requireWorkspace, requireProposalViewer, async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
