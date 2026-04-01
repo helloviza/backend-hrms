@@ -146,10 +146,10 @@ async function searchFlightsTBOFirst(params: {
     const results = tboResult?.Response?.Results?.[0] || [];
 
     if (Array.isArray(results) && results.length > 0) {
-      console.log(`[ConciergeFlights] TBO returned ${results.length} results`);
+
       return { flights: mapTBOToFlightResults(results, traceId), traceId, source: "tbo" };
     }
-    console.log("[ConciergeFlights] TBO returned 0 results, falling back to SerpAPI");
+
   } catch (err: any) {
     console.warn("[ConciergeFlights] TBO failed:", err.message, "— falling back to SerpAPI");
   }
@@ -172,7 +172,7 @@ const router = Router();
 // ✅ PHASE 4 — VIDEO CONSENT ROUTE (TOP-LEVEL, AUTHORITATIVE)
 router.post(
   "/video/:videoId/consent",
-  optionalAuth,
+  requireAuth,
   async (req, res) => {
     try {
       const { videoId } = req.params;
@@ -387,7 +387,7 @@ function buildFlightTipLines(originIATA: string, destIATA: string, date: string 
  * Accepts IATA codes + ISO date directly, no NLP parsing needed
  * TBO API replacement: swap searchFlightRoutes() for TBO SDK call
  */
-router.post("/flights/search", optionalAuth, async (req, res) => {
+router.post("/flights/search", requireAuth, async (req, res) => {
   try {
     const {
       origin,
@@ -428,7 +428,6 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
       });
     }
 
-    console.log(`[FlightSearch/POST] ${originIATA} → ${destIATA} on ${date} | ${adults}A ${children}C ${infants}I | ${cabin} | ${tripType}`);
 
     const cabinClassMap: Record<string, number> = {
       Economy: 2, "Premium Economy": 3, Business: 4, First: 6,
@@ -459,7 +458,7 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
     const raw: any[] = tboRaw?.Response?.Results?.[0] || [];
 
     if (!Array.isArray(raw) || raw.length === 0) {
-      console.log("[FlightSearch/POST] TBO returned 0 results");
+
       return res.json({ ok: true, results: [], traceId, message: "No flights found" });
     }
 
@@ -519,7 +518,6 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
       };
     }).filter(Boolean);
 
-    console.log(`[FlightSearch/POST] TBO returned ${results.length} results (traceId: ${traceId.slice(0, 8)}…)`);
 
     return res.json({ ok: true, results, traceId });
 
@@ -536,7 +534,7 @@ router.post("/flights/search", optionalAuth, async (req, res) => {
  * POST /api/v1/copilot/travel
  * Public / semi-auth AI concierge
  */
-router.post("/", optionalAuth, async (req, res) => {
+router.post("/", requireAuth, async (req, res) => {
   try {
     const { prompt, context, lastReply, videoAnalysisId } = req.body;
 
@@ -654,7 +652,6 @@ router.post("/", optionalAuth, async (req, res) => {
       const originIATA = toIATA(origin);
       const destIATA   = toIATA(destination);
 
-      console.log(`[FlightSearch] Parsed — origin: "${origin}" (${originIATA}), dest: "${destination}" (${destIATA}), date: "${travelDate}", pax: ${extractedAdults}, cabin: ${extractedCabin}`);
 
       // Parse any date format to YYYY-MM-DD for SerpAPI
       const parseDateToISO = (raw: string | null): string => {
@@ -718,7 +715,7 @@ router.post("/", optionalAuth, async (req, res) => {
         chatFlights = chatResult.flights;
         chatTraceId = chatResult.traceId;
         chatSource  = chatResult.source;
-        console.log(`[FlightSearch] Live results: ${chatFlights.length} flights via ${chatSource}`);
+
       } else {
         console.warn("[FlightSearch] No parseable date — skipping live search");
       }
@@ -1107,8 +1104,6 @@ router.post("/", optionalAuth, async (req, res) => {
     if (detectedFlightNumber) {
       try {
         // ✅ Diagnostic log — confirms API key + flight number being used
-        console.log("[FlightService] Fetching live data for:", detectedFlightNumber);
-        console.log("[FlightService] API Key present:", Boolean(process.env.FLIGHTAWARE_API_KEY));
 
         liveFlightData = await fetchFlightFromApi(detectedFlightNumber);
 
@@ -1117,7 +1112,7 @@ router.post("/", optionalAuth, async (req, res) => {
           console.error("[FlightService] API returned error:", liveFlightData.error);
           liveFlightData = null;
         } else {
-          console.log("[FlightService] Live data fetched successfully:", detectedFlightNumber);
+
         }
       } catch (err: any) {
         console.error("[FlightService] Flight fetch failed:", err?.message || err);
@@ -1456,7 +1451,6 @@ router.post("/raise-request", requireAuth, requireWorkspace, async (req: any, re
       }).catch((e: any) => console.warn("[Concierge] Failed to send request email:", e?.message));
     }
 
-    console.log(`[Concierge/RaiseRequest] Created SBTRequest ${request._id} for ${user.email}`);
 
     return res.status(201).json({
       success: true,

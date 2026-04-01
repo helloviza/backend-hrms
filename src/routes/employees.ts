@@ -8,6 +8,7 @@ import User from "../models/User.js";
 import Employee from "../models/Employee.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
+import { validateObjectId } from "../middleware/validateObjectId.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { sendEmployeeInvite } from "../services/email.service.js";
 import crypto from "crypto";
@@ -407,7 +408,7 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
  * - Requires Admin / SuperAdmin.
  * - Does not allow direct passwordHash changes here.
  */
-router.put("/:id", requireAuth, requireWorkspace, async (req: any, res, next) => {
+router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     if (!isAdminish(req.user)) {
       return res.status(403).json({ error: "Only admins can edit employees" });

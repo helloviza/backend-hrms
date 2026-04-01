@@ -380,9 +380,17 @@ router.post("/workspaces/:workspaceId/impersonate", async (req: any, res) => {
     const workspace = await CustomerWorkspace.findById(req.params.workspaceId).lean();
     if (!workspace) return res.status(404).json({ error: "Workspace not found" });
 
+    // Find an admin user for this workspace to use as JWT sub
+    const adminUser = await User.findOne({
+      workspaceId: req.params.workspaceId,
+      roles: { $in: ["ADMIN", "WORKSPACE_LEADER"] },
+    }).select("_id").lean();
+
+    if (!adminUser) return res.status(404).json({ error: "No admin user found for workspace" });
+
     const token = jwt.sign(
       {
-        sub: "superadmin-impersonation",
+        sub: String(adminUser._id),
         customerId: workspace.customerId,
         roles: ["SUPERADMIN"],
         _impersonating: true,

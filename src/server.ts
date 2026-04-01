@@ -14,7 +14,7 @@ import { helmetMiddleware } from "./config/helmet.js";
 import { errorHandler } from "./middleware/error.js";
 import { requireWorkspace } from "./middleware/requireWorkspace.js";
 import { requireAuth } from "./middleware/auth.js";
-import { apiLimiter, authLimiter, flightSearchLimiter, hotelSearchLimiter } from "./middleware/rateLimit.js";
+import { apiLimiter, authLimiter, flightSearchLimiter, hotelSearchLimiter, copilotLimiter } from "./middleware/rateLimit.js";
 import { env } from "./config/env.js";
 import vouchers from "./routes/vouchers.js";
 
@@ -199,6 +199,7 @@ app.use("/api", apiLimiter);
 app.use("/api/auth", authLimiter);
 app.use("/api/sbt/flights/search", flightSearchLimiter);
 app.use("/api/sbt/hotels/search", hotelSearchLimiter);
+app.use("/api/copilot", copilotLimiter);
 
 /* ────────────────────────────────────────────────────────────────
  * WORKSPACE SCOPING — runs after per-route requireAuth sets req.user.

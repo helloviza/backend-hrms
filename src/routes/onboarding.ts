@@ -329,10 +329,7 @@ async function syncEmployeeFromOnboarding(
         tempPassword: true,
       });
 
-      console.log(
-        "[onboarding:sync] created employee from onboarding for",
-        email
-      );
+
       return { tempPassword, email };
     } else {
       Object.assign(user, update);
@@ -342,10 +339,7 @@ async function syncEmployeeFromOnboarding(
       await user.save();
     }
 
-    console.log(
-      "[onboarding:sync] updated employee from onboarding for",
-      email
-    );
+
     return null;
   } catch (err) {
     console.error("[onboarding:sync] error while syncing employee:", err);
@@ -370,7 +364,7 @@ try {
   createPresignedPostFn = _require(
     "@aws-sdk/s3-presigned-post"
   ).createPresignedPost;
-  console.log("[onboarding] ✅ Loaded @aws-sdk/s3-presigned-post");
+
 } catch {
   console.warn("[onboarding] ⚠️ @aws-sdk/s3-presigned-post not installed");
 }
@@ -378,7 +372,7 @@ try {
   getSignedUrl = _require(
     "@aws-sdk/s3-request-presigner"
   ).getSignedUrl;
-  console.log("[onboarding] ✅ Loaded @aws-sdk/s3-request-presigner");
+
 } catch {
   console.warn("[onboarding] ⚠️ @aws-sdk/s3-request-presigner not installed");
 }
@@ -902,7 +896,7 @@ router.get("/pipeline", requireAuth, noStore, async (req, res, next) => {
 });
 
 /** 📤 S3 upload presign */
-router.post("/upload/presign", noStore, async (req, res, next) => {
+router.post("/upload/presign", requireAuth, noStore, async (req, res, next) => {
   try {
     if (!S3_BUCKET)
       return res.status(500).json({ message: "S3_BUCKET not configured" });
@@ -1027,7 +1021,6 @@ router.get("/view/:token", noStore, async (req, res) => {
  */
 router.get("/document/presign", requireAuth, noStore, async (req, res, next) => {
   try {
-    console.log("[presign] HIT — key:", req.query.key);
 
     const validation = presignQuerySchema.safeParse(req.query);
     if (!validation.success)
@@ -1073,7 +1066,6 @@ router.get("/:token/details", requireAuth, requireWorkspace, noStore, async (req
       doc = (await (Onboarding as any).findOne({ token }).lean().exec()) as OnboardingDoc | null;
     }
     if (!doc) return res.status(404).json({ error: "Not found" });
-    console.log("[details] doc._id:", String(doc._id), "| documents field:", JSON.stringify(doc.documents), "| formPayload keys:", Object.keys(doc.formPayload || {}));
 
     // Ensure HRMS sync whenever admin opens details
     await syncEmployeeFromOnboarding(doc);

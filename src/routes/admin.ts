@@ -76,7 +76,6 @@ function parseRange(q: any): { from?: Date; to?: Date } {
 router.get("/reports/vendors.csv", requireAuth, requireAdmin, async (_req: Request, res: Response) => {
   try {
     const vendors = await Vendor.find({}).lean().exec();
-    console.log("[ADMIN] vendors.csv – total vendors:", vendors.length);
 
     const header = [
       "Name",
@@ -170,10 +169,6 @@ router.get(
       const attendanceRecords: any[] = await Attendance.find(findQuery)
         .lean()
         .exec();
-      console.log(
-        "[ADMIN] attendance.csv – total records:",
-        attendanceRecords.length,
-      );
 
       const userIds = Array.from(
         new Set(
@@ -376,10 +371,6 @@ router.get("/reports/leaves.csv", requireAuth, requireAdmin, async (_req: Reques
       .lean()
       .exec();
 
-    console.log(
-      "[ADMIN] leaves.csv – total leaveRequests:",
-      leaveRecords.length,
-    );
 
     const userIds = Array.from(
       new Set(

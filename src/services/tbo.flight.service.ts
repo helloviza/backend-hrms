@@ -154,7 +154,7 @@ async function post(path: string, body: object, _retried = false, base = FLIGHT_
     });
     const rawText = await res.text();
     if (method === "Ticket") {
-      console.log(`[TBO-DEBUG ${method}] HTTP ${res.status} | raw (first 500):`, rawText.substring(0, 500));
+
     }
     if (rawText.startsWith("<") || rawText.startsWith("<?")) {
       throw new Error(`TBO returned XML instead of JSON (likely malformed request): ${rawText.slice(0, 300)}`);
@@ -167,7 +167,7 @@ async function post(path: string, body: object, _retried = false, base = FLIGHT_
     }
     if (method === "Ticket") {
       const resp = (json as any)?.Response;
-      console.log(`[TBO-DEBUG ${method}] ErrorCode:`, resp?.Error?.ErrorCode, '| ErrorMessage:', resp?.Error?.ErrorMessage, '| ResponseStatus:', resp?.ResponseStatus);
+
     }
     const durationMs = Date.now() - start;
 
@@ -203,7 +203,7 @@ export async function searchFlights(params: {
   Sources?: string | null;
 }) {
   const token = await getTBOToken();
-  console.log('[TBO-TOKEN-USED] Search TokenId:', token.slice(0, 8));
+
   const endUserIp = process.env.TBO_EndUserIp || "1.1.1.1";
 
   const cabinClass = String(params.cabinClass ?? 1);
@@ -259,7 +259,7 @@ export async function searchMultiCity(params: {
   infants?: number;
 }) {
   const token = await getTBOToken();
-  console.log('[TBO-TOKEN-USED] SearchMultiCity TokenId:', token.slice(0, 8));
+
   const endUserIp = process.env.TBO_EndUserIp || "1.1.1.1";
 
   const Segments = params.segments.map(seg => ({
@@ -290,7 +290,7 @@ export async function getFareQuote(params: {
   ResultIndex: string;
 }) {
   const token = await getTBOToken();
-  console.log('[TBO-TOKEN-USED] FareQuote TokenId:', token.slice(0, 8));
+
   // ResultIndex may be comma-separated for Special Return (e.g. "OB3,IB7") — TBO handles natively
   return post("/FareQuote", {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
@@ -325,7 +325,7 @@ export async function getPriceRBD(params: {
   }>;
 }) {
   const token = await getTBOToken();
-  console.log('[TBO-TOKEN-USED] PriceRBD TokenId:', token.slice(0, 8));
+
   return post("/PriceRBD", {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
@@ -342,7 +342,7 @@ export async function getFareRule(params: {
   ResultIndex: string;
 }) {
   const token = await getTBOToken();
-  console.log('[TBO-TOKEN-USED] FareRule TokenId:', token.slice(0, 8));
+
   return post("/FareRule", {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
@@ -356,7 +356,7 @@ export async function getSSR(params: {
   ResultIndex: string;
 }) {
   const token = await getTBOToken();
-  console.log('[TBO-TOKEN-USED] SSR TokenId:', token.slice(0, 8));
+
   return post("/SSR", {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
@@ -534,8 +534,6 @@ export async function bookFlight(params: {
   }
 
   const tokenAcquiredAt = getTokenAcquiredAt();
-  console.log('[TBO-TOKEN-USED] Book TokenId:', token.slice(0, 8),
-    'age minutes:', ((Date.now() - tokenAcquiredAt) / 60000).toFixed(2));
 
   const leadPax = (params.Passengers as any[]).find((p: any) => p.IsLeadPax) || (params.Passengers as any[])[0];
   const leadEmail = leadPax?.Email || "";
@@ -649,9 +647,6 @@ export async function bookFlight(params: {
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
-  console.log('[BOOK-PAX-KEYS]', Object.keys((payload.Passengers as any[])[0]));
-  console.log('[BOOK-PAX0-FARE]', JSON.stringify((payload.Passengers as any[])[0]?.Fare, null, 2));
-  console.log('[BOOK-PAYLOAD-TO-TBO]', JSON.stringify(payload).slice(0, 1000));
 
   return post("/Book", payload, false, FLIGHT_BOOK_BASE);
 }
@@ -662,7 +657,7 @@ export async function ticketFlight(params: {
   BookingId: number;
 }) {
   const token = await getTBOToken();
-  console.log('[TBO-TOKEN-USED] Ticket TokenId:', token.slice(0, 8));
+
   const gdsPayload = {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
@@ -779,7 +774,7 @@ export async function ticketLCC(params: {
   }
 
   const token = await getTBOToken();
-  console.log('[TBO-TOKEN-USED] TicketLCC TokenId:', token.slice(0, 8));
+
   const ndcMode = params.isNDC === true;
   const lccLeadPax = ndcMode
     ? ((params.Passengers as any[]).find((p: any) => p.IsLeadPax) || (params.Passengers as any[])[0])
@@ -968,21 +963,9 @@ export async function ticketLCC(params: {
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
   (payload.Passengers as any[])?.forEach((p: any, i: number) => {
-    console.log(`[TICKET-LCC PAX ${i + 1}]`, JSON.stringify({
-      Title: p.Title, FirstName: p.FirstName,
-      PaxType: p.PaxType, DateOfBirth: p.DateOfBirth,
-      IsLeadPax: p.IsLeadPax,
-      hasMeal: !!p.MealDynamic?.length,
-      hasSeat: !!p.SeatDynamic?.length,
-      hasBaggage: !!p.Baggage?.length,
-      FareBaseFare: p.Fare?.BaseFare,
-      mealWayType: p.MealDynamic?.[0]?.WayType,
-      seatWayType: p.SeatDynamic?.[0]?.SegmentSeat?.[0]
-        ?.RowSeats?.[0]?.Seats?.[0]?.SeatWayType,
-    }));
+
   });
 
-  console.log('[TICKET-LCC FULL PAYLOAD]', JSON.stringify(payload, null, 2));
 
   const lccResult = await post("/Ticket", payload, false, FLIGHT_BOOK_BASE) as any;
 

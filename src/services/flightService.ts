@@ -119,7 +119,7 @@ function toAeroApiIdent(flightIata: string): string {
   const [, iataPrefix, flightNum] = match;
   const icaoPrefix = IATA_TO_ICAO[iataPrefix];
   if (icaoPrefix) {
-    console.log(`[FlightService] IATA→ICAO: ${iataPrefix}${flightNum} → ${icaoPrefix}${flightNum}`);
+
     return `${icaoPrefix}${flightNum}`;
   }
   // No mapping — try sending as-is (some carriers use same prefix)
@@ -131,8 +131,6 @@ export const getDelightfulFlightStatus = async (
   flightIata: string
 ): Promise<EnhancedFlightInfo | any> => {
   try {
-    console.log("[FlightService] FLIGHTAWARE_KEY present:", Boolean(FLIGHTAWARE_KEY));
-    console.log("[FlightService] Raw input:", flightIata);
 
     if (!FLIGHTAWARE_KEY) {
       console.error("[FlightService] FLIGHTAWARE_API_KEY is missing from environment!");
@@ -142,7 +140,6 @@ export const getDelightfulFlightStatus = async (
     // Normalize IATA → ICAO ident for AeroAPI
     const aeroIdent = toAeroApiIdent(flightIata);
     const cleanIata = flightIata.replace(/[-\s]/g, "").toUpperCase();
-    console.log("[FlightService] AeroAPI ident:", aeroIdent);
 
     // ✅ FlightAware AeroAPI — /flights/{ident}
     const response = await axios.get(`${AEROAPI_BASE}/flights/${aeroIdent}`, {
@@ -156,7 +153,6 @@ export const getDelightfulFlightStatus = async (
       timeout: 10000,
     });
 
-    console.log("[FlightService] AeroAPI HTTP status:", response.status);
 
     const flights = response.data?.flights;
 
@@ -173,7 +169,6 @@ export const getDelightfulFlightStatus = async (
     // Take the most recent / currently active flight
     const f = flights.find((fl: any) => fl.status !== "Cancelled") || flights[0];
 
-    console.log("[FlightService] Flight found:", f.ident, "Status:", f.status);
 
     return {
       flight_status: normalizeStatus(f.status),
@@ -340,7 +335,6 @@ export async function searchFlightRoutes(
     throw new Error("SERPAPI_API_KEY not configured");
   }
 
-  console.log(`[FlightSearch] Searching ${originIATA} → ${destinationIATA} on ${departureDate}`);
 
   const response = await axios.get(SERPAPI_BASE, {
     params: {
@@ -357,9 +351,6 @@ export async function searchFlightRoutes(
   });
 
   const data = response.data;
-  console.log("[FlightSearch] SerpAPI status:", response.status);
-  console.log("[FlightSearch] best_flights count:", data?.best_flights?.length ?? 0);
-  console.log("[FlightSearch] other_flights count:", data?.other_flights?.length ?? 0);
 
   const rawFlights = [
     ...(data?.best_flights  || []),

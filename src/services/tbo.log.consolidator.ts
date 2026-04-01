@@ -117,7 +117,7 @@ async function consolidateLeg(
             ?? content?.response?.BookingId);
 
         if (fileBookingId === bookingId) {
-          console.log(`[CERT] Copying: ${fname} → ${outDir} (as ${txtName})`);
+
           await writeFile(path.join(outDir, txtName), toTBOTextFormat(content), "utf-8");
           writtenFiles.push(txtName);
           found = true;
@@ -127,7 +127,7 @@ async function consolidateLeg(
       // Fallback: if only one file exists (no ambiguity), use it anyway
       if (!found && candidates.length === 1) {
         const content = JSON.parse(await readFile(path.join(traceDir, candidates[0]), "utf-8"));
-        console.log(`[CERT] Copying (fallback): ${candidates[0]} → ${outDir} (as ${txtName})`);
+
         await writeFile(path.join(outDir, txtName), toTBOTextFormat(content), "utf-8");
         writtenFiles.push(txtName);
       }
@@ -141,7 +141,7 @@ async function consolidateLeg(
 
     const match = candidates[fileIndex] ?? candidates[0];
     const content = JSON.parse(await readFile(path.join(traceDir, match), "utf-8"));
-    console.log(`[CERT] Copying: ${match} → ${outDir} (as ${txtName})`);
+
     await writeFile(path.join(outDir, txtName), toTBOTextFormat(content), "utf-8");
     writtenFiles.push(txtName);
   }
@@ -378,7 +378,7 @@ export async function consolidateHotelCertificationLogs(
       const match = candidates[0];
       const content = JSON.parse(await readFile(path.join(traceDir, match), "utf-8"));
       const txtName = `${method}.txt`;
-      console.log(`[CERT] Copying: ${match} → ${rootDir} (as ${txtName})`);
+
       await writeFile(path.join(rootDir, txtName), toTBOTextFormat(content), "utf-8");
       writtenFiles.push(txtName);
     }

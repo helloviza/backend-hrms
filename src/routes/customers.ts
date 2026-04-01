@@ -10,6 +10,7 @@ import Vendor from "../models/Vendor.js";
 import User from "../models/User.js";
 import Employee from "../models/Employee.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
+import { validateObjectId } from "../middleware/validateObjectId.js";
 
 const router = Router();
 
@@ -123,6 +124,7 @@ router.get("/account-team", requireAuth, async (req: any, res, next) => {
  */
 router.patch(
   "/:id/account-team",
+  validateObjectId("id"),
   requireAuth,
   requireWorkspace,
   requireRoles("ADMIN", "SUPERADMIN", "HR") as any,

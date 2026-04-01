@@ -30,7 +30,7 @@ function htmlResult(title: string, msg: string) {
 
 // ✅ replace with your real mailer (Nodemailer / SES / etc.)
 async function sendApprovalEmail(to: string, subject: string, html: string) {
-  console.log("[email] to:", to, "subject:", subject);
+
   // TODO: integrate your existing mailer util here
   return true;
 }
