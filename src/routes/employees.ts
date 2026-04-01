@@ -3,6 +3,7 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import User from "../models/User.js";
 import Employee from "../models/Employee.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
@@ -83,7 +84,8 @@ router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
     const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || "50"), 10)));
 
     const filter: any = {};
-    if (req.workspaceObjectId) filter.workspaceId = req.workspaceObjectId;
+    // SUPERADMIN sees all employees across workspaces
+    if (!isSuperAdmin(req) && req.workspaceObjectId) filter.workspaceId = req.workspaceObjectId;
 
     if (statusParam === "inactive") {
       filter.status = "INACTIVE";
@@ -220,9 +222,10 @@ router.post("/bulk-update", requireAuth, requireWorkspace, async (req: any, res,
       return res.status(400).json({ error: "No valid updates provided" });
     }
 
-    // Update User records
+    // Update User records — SUPERADMIN can update across workspaces
+    const wsScope = !isSuperAdmin(req) && req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {};
     const userResult = await User.updateMany(
-      { _id: { $in: userIds }, ...(req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {}) },
+      { _id: { $in: userIds }, ...wsScope },
       { $set },
     );
 
@@ -234,7 +237,7 @@ router.post("/bulk-update", requireAuth, requireWorkspace, async (req: any, res,
 
     if (Object.keys(employeeSet).length > 0) {
       await Employee.updateMany(
-        { ownerId: { $in: userIds }, ...(req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {}) },
+        { ownerId: { $in: userIds }, ...wsScope },
         { $set: employeeSet },
       );
     }
@@ -400,9 +403,13 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
     delete (body as any).passwordHash;
 
     // First try to find by Employee doc to get ownerId
-    const employeeDoc = await Employee.findOne({ _id: id, workspaceId: req.workspaceObjectId }).exec();
+    const empQuery: any = { _id: id };
+    if (!isSuperAdmin(req) && req.workspaceObjectId) empQuery.workspaceId = req.workspaceObjectId;
+    const employeeDoc = await Employee.findOne(empQuery).exec();
     const userId = employeeDoc?.ownerId ?? id;
-    const existing: AnyUser | null = await scopedFindById(User, userId, req.workspaceObjectId);
+    const existing: AnyUser | null = isSuperAdmin(req)
+      ? await User.findById(userId)
+      : await scopedFindById(User, userId, req.workspaceObjectId);
     if (!existing) {
       return res.status(404).json({ error: "Employee not found" });
     }
