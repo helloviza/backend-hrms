@@ -457,6 +457,12 @@ router.post("/logo", logoMimeGuard, upload.single("logo"), async (req: AnyObj, r
   const user = requireAuth(req, res);
   if (!user) return;
 
+  // Admin-only
+  const logoRoles = roleList(user);
+  if (!logoRoles.includes("SUPERADMIN") && !logoRoles.includes("ADMIN") && !logoRoles.includes("HR") && !logoRoles.includes("WORKSPACE_LEADER")) {
+    return res.status(403).json({ error: "Admin access required to upload logo" });
+  }
+
   if (!req.file?.filename) {
     return res.status(400).json({
       ok: false,
@@ -621,13 +627,13 @@ router.patch("/config/travel-flow", async (req: AnyObj, res) => {
     if (memberEmails.length) {
       if (featureUpdate.sbtEnabled) {
         const result = await User.updateMany(
-          { email: { $in: memberEmails } },
+          { email: { $in: memberEmails }, workspaceId: ws._id },
           { $set: { sbtEnabled: true, sbtBookingType: "both" } },
         );
         updatedCount = result.modifiedCount ?? 0;
       } else {
         const result = await User.updateMany(
-          { email: { $in: memberEmails } },
+          { email: { $in: memberEmails }, workspaceId: ws._id },
           { $set: { sbtEnabled: false } },
         );
         updatedCount = result.modifiedCount ?? 0;

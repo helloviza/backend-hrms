@@ -203,13 +203,6 @@ async function getDashboardStatsForUser(
   };
 
   // Debug log so you can see exactly what we are computing
-  console.log("[assistant] getDashboardStatsForUser", {
-    uid,
-    attendanceCount,
-    leaveCount,
-    pendingCount,
-    stats,
-  });
 
   return stats;
 }
@@ -378,19 +371,9 @@ async function buildBackendContext(req: Request): Promise<AssistantContext> {
     clientProfile.employeeCode;
 
   // Helpful debug to confirm what we're seeing on server side
-  console.log("[assistant] authUser id fields", {
-    sub: authUser.sub,
-    id: authUser.id,
-    userId: authUser.userId,
-    user_id: authUser.user_id,
-    employeeId: authUser.employeeId,
-    _id: authUser._id,
-    clientProfileKeys: Object.keys(clientProfile || {}),
-    resolvedUserId: userId,
-  });
 
   if (!userId) {
-    console.log("[assistant] buildBackendContext: no userId resolved");
+
     return {};
   }
 
@@ -550,17 +533,6 @@ router.post(
     const docsUploaded = toNumber(stats?.docsUploaded);
 
     // Debug – see exactly what numbers the copilot is using
-    console.log("[assistant:/hr] merged context", {
-      backendContext,
-      clientContext,
-      mergedStats: stats,
-      numeric: {
-        attendancePercent,
-        leavesTaken,
-        pendingApprovals,
-        docsUploaded,
-      },
-    });
 
     const managerName =
       (profile?.managerName || "").toString().trim() || "Not mapped yet";

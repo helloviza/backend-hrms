@@ -101,8 +101,7 @@ r.post(
 
       const diff = Math.abs(total - ctcAnnual);
       if (diff > 1) {
-        console.log("[PayrollSalary] Validation failed — total:", total, "ctcAnnual:", ctcAnnual, "diff:", diff,
-          "pfEmployer:", pfEmployerAnnual, "gratuity:", gratuityAnnual, "reimb:", totalReimbursements);
+
         return res.status(400).json({
           error: "Components do not add up to CTC",
           difference: ctcAnnual - total,
@@ -194,6 +193,15 @@ r.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { userId } = req.params;
+      const reqUser = (req as any).user;
+      const isOwnData = String(reqUser?.sub || reqUser?._id || reqUser?.id) === userId;
+      const userRoles: string[] = reqUser?.roles || [];
+      const isPrivileged = isSuperAdmin(req) || userRoles.some((r: string) => ["ADMIN", "HR"].includes(r.toUpperCase()));
+
+      if (!isOwnData && !isPrivileged) {
+        return res.status(403).json({ error: "Cannot view other employees salary structure" });
+      }
+
       const workspaceId = await resolveWorkspaceId(req);
       if (!workspaceId) {
         return res.status(400).json({ error: "workspaceId required" });

@@ -1054,7 +1054,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
 
     // ── Special Return: single ticketLCC call, TBO returns one PNR for both legs ──
     if (isSpecialReturn && isReturn) {
-      console.log('[TICKET-LCC] Special Return — single ticket call for combined OB+IB');
+
       const result = await ticketLCC({
         TraceId: req.body.TraceId,
         ResultIndex: req.body.ResultIndex,

@@ -14,6 +14,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
+import { validateObjectId } from "../middleware/validateObjectId.js";
 import { sendMail } from "../utils/mailer.js";
 import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
 import { sendOnboardingWelcomeEmail } from "../utils/onboardingWelcomeEmail.js";
@@ -384,7 +385,7 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
 /**
  * Toggle Active/Inactive state
  */
-router.patch("/:id/status", requireAuth, requireWorkspace, async (req: any, res, next) => {
+router.patch("/:id/status", validateObjectId("id"), requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     if (!isHrmsAdmin(req.user)) {
       return res.status(403).json({ error: "Only HR Admin / Admin can toggle status" });
@@ -414,7 +415,7 @@ router.patch("/:id/status", requireAuth, requireWorkspace, async (req: any, res,
  * Generic PATCH – update Vendor / Business master fields.
  * This is what VendorProfiles.tsx & BusinessProfiles.tsx call.
  */
-router.patch("/:id", requireAuth, requireWorkspace, async (req: any, res, next) => {
+router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     if (!isHrmsAdmin(req.user)) {
       return res

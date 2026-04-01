@@ -107,7 +107,7 @@ export function isTokenStale(): boolean {
 
 export function clearTBOToken(): void {
   cache = null;
-  console.log("[TBO] Token cache cleared manually — will re-authenticate on next request");
+
 }
 
 export async function logoutTBO(): Promise<void> {
@@ -127,7 +127,7 @@ export async function logoutTBO(): Promise<void> {
     });
     const logoutData = await logoutRes.json().catch(() => ({}));
     logTBOCall({ method: "Logout", request: logoutPayload, response: logoutData, durationMs: Date.now() - start });
-    console.log("[TBO] Logout successful");
+
   } catch (e) {
     console.warn("[TBO] Logout call failed (cache cleared anyway):", e);
   } finally {

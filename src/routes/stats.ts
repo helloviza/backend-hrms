@@ -154,19 +154,6 @@ router.get(
       // ───────── Leaves (all time – new LeaveRequest model) ─────────
       const leavesDocs: any[] = await LeaveRequest.find({ userId }).lean();
 
-      console.log(
-        "[stats] LeaveRequest docs for user",
-        userId,
-        "=> count:",
-        leavesDocs.length,
-        leavesDocs.map((l) => ({
-          id: l._id,
-          status: l.status,
-          type: l.type,
-          from: l.from,
-          to: l.to,
-        }))
-      );
 
       let leavesTakenDays = 0;
       let pendingApprovals = 0;
@@ -213,12 +200,6 @@ router.get(
         leaveMix,
       };
 
-      console.log("[stats] dashboard payload (reduced)", {
-        attendancePercent: payload.attendancePercent,
-        leavesTaken: payload.leavesTaken,
-        pendingApprovals: payload.pendingApprovals,
-        leaveMix: payload.leaveMix,
-      });
 
       return res.json(payload);
     } catch (err) {

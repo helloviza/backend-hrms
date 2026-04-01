@@ -928,14 +928,7 @@ router.get("/admin/approved", requireApprovalsAdminRead, async (req: AnyObj, res
 
     if (process.env.NODE_ENV !== "production") {
       // eslint-disable-next-line no-console
-      console.log("[approvals] /admin/approved user", {
-        email: req.user?.email,
-        roles: collectRoles(req.user),
-        includeClosed,
-        adminState,
-        q,
-        leaderCustomerIds: req.__leaderCustomerIds || undefined,
-      });
+
     }
 
     const scoped = applyLeaderScopeIfNeeded(req, filter);

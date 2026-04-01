@@ -39,3 +39,13 @@ export const hotelSearchLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, message: 'Too many hotel search requests, please slow down.' },
 });
+
+// Copilot AI limiter — Gemini API calls
+export const copilotLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many AI requests, please slow down.' },
+});

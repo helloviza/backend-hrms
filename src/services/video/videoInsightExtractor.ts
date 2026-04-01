@@ -99,9 +99,7 @@ Respond ONLY with this exact JSON:
         classificationConfidence =
           typeof parsed.confidence === "number" ? parsed.confidence : 0;
 
-        console.log(
-          `[VideoClassifier] isTravelContent=${isTravelContent} confidence=${classificationConfidence} reason=${parsed.reason}`
-        );
+
       } catch (err) {
         console.error("Classification call failed — defaulting to travel-safe:", err);
         // ✅ SAFE DEFAULT: If the AI call itself fails, assume travel
