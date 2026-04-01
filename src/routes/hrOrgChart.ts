@@ -2,6 +2,7 @@
 import express from "express";
 import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireRoles } from "../middleware/roles.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import EmployeeModel from "../models/Employee.js";
@@ -95,6 +96,7 @@ router.get(
 router.post(
   "/org-chart/map",
   requireAuth as any,
+  requireWorkspace as any,
   requireRoles("ADMIN", "SUPERADMIN", "HR") as any,
   async (req: any, res: any, next: any) => {
     try {
@@ -110,14 +112,14 @@ router.post(
         });
       }
 
-      const emp = await scopedFindById(EmployeeModel, employeeId, req.workspaceId);
+      const emp = await scopedFindById(EmployeeModel, employeeId, req.workspaceObjectId);
       if (!emp) {
         return res.status(404).json({ error: "Employee not found" });
       }
 
       if (managerId) {
         // Validate manager exists
-        const mgr = await scopedFindById(EmployeeModel, managerId, req.workspaceId);
+        const mgr = await scopedFindById(EmployeeModel, managerId, req.workspaceObjectId);
         if (!mgr) {
           return res.status(400).json({ error: "Manager not found" });
         }

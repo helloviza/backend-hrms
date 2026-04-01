@@ -1,6 +1,7 @@
 import { Router } from "express";
 import mongoose from "mongoose";
 import requireAuth from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import User from "../models/User.js";
 import MasterData from "../models/MasterData.js";
 import CustomerApprovalRequest from "../models/CustomerApprovalRequest.js";
@@ -47,7 +48,7 @@ function generateTicketId(prefix = "PTS") {
 POST /api/customer-approvals/submit
 body: { cartItems:[], comments?:string, approverUserId?:string }
 */
-r.post("/submit", requireAuth, requireCustomer, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: any, res, next) => {
+r.post("/submit", requireAuth, requireWorkspace, requireCustomer, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: any, res, next) => {
   try {
     const cartItems = Array.isArray(req.body?.cartItems) ? req.body.cartItems : [];
     const comments = String(req.body?.comments || "").trim();
@@ -76,7 +77,7 @@ r.post("/submit", requireAuth, requireCustomer, requireTravelMode("APPROVAL_FLOW
       return res.status(400).json({ error: "No approver (L2) configured for this workspace" });
     }
 
-    const approver: any = await User.findOne({ _id: approverId, workspaceId: req.workspaceId }).lean();
+    const approver: any = await User.findOne({ _id: approverId, workspaceId: req.workspaceObjectId }).lean();
     if (!approver) return res.status(404).json({ error: "Approver user not found" });
 
     // ensure approver belongs to same workspace
@@ -165,7 +166,7 @@ r.post("/submit", requireAuth, requireCustomer, requireTravelMode("APPROVAL_FLOW
 /* ---------------- L2: inbox (console) ----------------
 GET /api/customer-approvals/approver/inbox
 */
-r.get("/approver/inbox", requireAuth, requireCustomer, async (req: any, res, next) => {
+r.get("/approver/inbox", requireAuth, requireWorkspace, requireCustomer, async (req: any, res, next) => {
   try {
     if (!hasRole(req.user, "CUSTOMER_APPROVER")) {
       return res.status(403).json({ error: "Approver access required" });
@@ -184,7 +185,7 @@ r.get("/approver/inbox", requireAuth, requireCustomer, async (req: any, res, nex
 PUT /api/customer-approvals/:id/approver/action
 body: { action: "approved"|"declined"|"on_hold", comment? }
 */
-r.put("/:id/approver/action", requireAuth, requireCustomer, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: any, res, next) => {
+r.put("/:id/approver/action", requireAuth, requireWorkspace, requireCustomer, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: any, res, next) => {
   try {
     if (!hasRole(req.user, "CUSTOMER_APPROVER")) {
       return res.status(403).json({ error: "Approver access required" });
@@ -196,7 +197,7 @@ r.put("/:id/approver/action", requireAuth, requireCustomer, requireTravelMode("A
       return res.status(400).json({ error: "Invalid action" });
     }
 
-    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceId);
+    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Not found" });
 
     const approverId = String(req.user?.sub || req.user?.id);
@@ -308,7 +309,7 @@ r.get("/email/:token", async (req: any, res, next) => {
 /* ---------------- ADMIN QUEUE (internal HRMS admin) ----------------
 GET /api/customer-approvals/admin/approved
 */
-r.get("/admin/approved", requireAuth, requireHrmsAdmin, async (req: any, res, next) => {
+r.get("/admin/approved", requireAuth, requireWorkspace, requireHrmsAdmin, async (req: any, res, next) => {
   try {
     const workspaceId = String(req.query.workspaceId || "").trim();
     const match: any = { status: "approved" };
@@ -320,10 +321,10 @@ r.get("/admin/approved", requireAuth, requireHrmsAdmin, async (req: any, res, ne
 });
 
 /* Admin actions: assign/done/on-hold/cancel */
-r.put("/admin/:id/assign", requireAuth, requireHrmsAdmin, async (req: any, res, next) => {
+r.put("/admin/:id/assign", requireAuth, requireWorkspace, requireHrmsAdmin, async (req: any, res, next) => {
   try {
     const { agentType, agentName, comment } = req.body || {};
-    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceId);
+    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     if (doc.status !== "approved") return res.status(400).json({ error: "Only approved can be assigned" });
 
@@ -336,9 +337,9 @@ r.put("/admin/:id/assign", requireAuth, requireHrmsAdmin, async (req: any, res, 
   } catch (e) { next(e); }
 });
 
-r.put("/admin/:id/done", requireAuth, requireHrmsAdmin, async (req: any, res, next) => {
+r.put("/admin/:id/done", requireAuth, requireWorkspace, requireHrmsAdmin, async (req: any, res, next) => {
   try {
-    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceId);
+    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     doc.adminState = "done";
     doc.history.push({ action: "booking_done", by: req.user?.sub, comment: String(req.body?.comment || "") });
@@ -347,9 +348,9 @@ r.put("/admin/:id/done", requireAuth, requireHrmsAdmin, async (req: any, res, ne
   } catch (e) { next(e); }
 });
 
-r.put("/admin/:id/on-hold", requireAuth, requireHrmsAdmin, async (req: any, res, next) => {
+r.put("/admin/:id/on-hold", requireAuth, requireWorkspace, requireHrmsAdmin, async (req: any, res, next) => {
   try {
-    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceId);
+    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     doc.adminState = "on_hold";
     doc.history.push({ action: "admin_on_hold", by: req.user?.sub, comment: String(req.body?.comment || "") });
@@ -358,9 +359,9 @@ r.put("/admin/:id/on-hold", requireAuth, requireHrmsAdmin, async (req: any, res,
   } catch (e) { next(e); }
 });
 
-r.put("/admin/:id/cancel", requireAuth, requireHrmsAdmin, async (req: any, res, next) => {
+r.put("/admin/:id/cancel", requireAuth, requireWorkspace, requireHrmsAdmin, async (req: any, res, next) => {
   try {
-    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceId);
+    const doc: any = await scopedFindById(CustomerApprovalRequest, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Not found" });
     doc.adminState = "cancelled";
     doc.history.push({ action: "admin_cancelled", by: req.user?.sub, comment: String(req.body?.comment || "") });
