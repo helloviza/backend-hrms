@@ -1021,27 +1021,24 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
         if (pax.SeatPreference && !pax.SeatDynamic) {
           const items = Array.isArray(pax.SeatPreference) ? pax.SeatPreference : [pax.SeatPreference];
           pax.SeatDynamic = items.map((sp: any) => ({
-            SegmentSeat: [{
-              RowSeats: [{
-                Seats: [{
-                  AirlineCode: sp.AirlineCode || "",
-                  FlightNumber: sp.FlightNumber || "",
-                  CraftType: sp.CraftType || "",
-                  Origin: sp.Origin || "",
-                  Destination: sp.Destination || "",
-                  AvailablityType: 0,
-                  Description: 2,
-                  Code: sp.Code || "",
-                  RowNo: sp.RowNo || (sp.Code?.replace(/[A-Z]/gi, "") || "0"),
-                  SeatNo: sp.Code || null,
-                  SeatType: sp.SeatType || 0,
-                  SeatWayType: sp.WayType || 2,
-                  Compartment: 0,
-                  Deck: 0,
-                  Currency: sp.Currency || "INR",
-                  Price: sp.Price || 0,
-                }],
-              }],
+            WayType: sp.WayType || sp.SeatWayType || 1,
+            Seat: [{
+              AirlineCode: sp.AirlineCode || "",
+              FlightNumber: sp.FlightNumber || "",
+              CraftType: sp.CraftType || "",
+              Origin: sp.Origin || "",
+              Destination: sp.Destination || "",
+              AvailablityType: sp.AvailablityType ?? 1,
+              Description: Number(sp.Description) || 2,
+              Code: sp.Code || "",
+              RowNo: sp.RowNo || (sp.Code?.replace(/[A-Z]/gi, "") || "0"),
+              SeatNo: sp.Code || "",
+              SeatType: sp.SeatType || 2,
+              SeatWayType: sp.WayType || sp.SeatWayType || 1,
+              Compartment: sp.Compartment || 2,
+              Deck: sp.Deck || 1,
+              Currency: sp.Currency || "INR",
+              Price: sp.Price || 0,
             }],
           }));
           delete pax.SeatPreference;
