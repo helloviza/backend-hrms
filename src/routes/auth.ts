@@ -833,6 +833,14 @@ r.post("/login", loginLimiter, async (req, res) => {
  * ─────────────────────────────────────────────── */
 r.post("/refresh", async (req, res) => {
   try {
+    console.log('[REFRESH DEBUG]', {
+      hasCookie: !!req.cookies?.refreshToken,
+      hasHeader: !!req.headers?.authorization,
+      cookieKeys: Object.keys(req.cookies || {}),
+      path: req.path,
+      originalUrl: req.originalUrl,
+      error: null,
+    });
     const token = (req.cookies && req.cookies[REFRESH_COOKIE_NAME]) || null;
     if (!token) return res.status(401).json({ error: "Missing refresh token" });
 
@@ -892,6 +900,7 @@ r.post("/refresh", async (req, res) => {
 
     res.json({ accessToken: newAccessToken, user: built.safe });
   } catch (err) {
+    console.log('[REFRESH ERROR]', err instanceof Error ? err.message : String(err));
     authLogger.error("Refresh failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
     res.status(401).json({ error: "Invalid or expired refresh token" });
   }
@@ -1244,6 +1253,15 @@ r.post("/logout", (_req, res) => {
   clearRefreshCookie(res);
   clearAccessCookie(res);
   res.json({ ok: true });
+});
+
+/* ───────────────────────────────────────────────
+ * CLEAR SESSION (escape hatch for stuck sessions)
+ * ─────────────────────────────────────────────── */
+r.get("/clear-session", (_req, res) => {
+  clearRefreshCookie(res);
+  clearAccessCookie(res);
+  res.json({ ok: true, message: "Session cleared" });
 });
 
 export default r;
