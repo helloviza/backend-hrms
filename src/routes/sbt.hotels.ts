@@ -468,7 +468,7 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
 
 // ─── 3. POST /prebook ────────────────────────────────────────────────────────
 
-router.post("/prebook", requireAuth, async (req: any, res: any) => {
+router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     if (process.env.TBO_ENV === "mock") {
       return res.json({

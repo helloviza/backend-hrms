@@ -462,20 +462,7 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
       existing.markModified("roles");
     }
 
-    console.log("[PUT /employees/:id] PRE-SAVE →", {
-      id: existing._id?.toString(),
-      email: existing.email,
-      roles: existing.roles,
-      hrmsAccessRole: existing.hrmsAccessRole,
-    });
-
     const saved = await existing.save();
-
-    console.log("[PUT /employees/:id] POST-SAVE →", {
-      id: saved._id?.toString(),
-      roles: saved.roles,
-      hrmsAccessRole: saved.hrmsAccessRole,
-    });
 
     res.json(sanitise(saved));
   } catch (err) {

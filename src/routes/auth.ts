@@ -648,7 +648,7 @@ async function ensureUserFromWorkspaceMember(email: string, passwordHash: string
  * ─────────────────────────────────────────────── */
 r.post("/register", async (req, res) => {
   try {
-    const { email, password, firstName, lastName, roles, workspaceId: bodyWsId } = req.body;
+    const { email, password, firstName, lastName, workspaceId: bodyWsId, inviteToken } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ error: "Email and password are required" });
@@ -659,12 +659,12 @@ r.post("/register", async (req, res) => {
     const existing = await User.findOne({ email: normalizedEmail });
     if (existing) return res.status(400).json({ error: "User already exists" });
 
-    let finalRoles: string[] = normalizeRoles(Array.isArray(roles) ? roles : []);
-    if (!finalRoles.length) finalRoles = ["EMPLOYEE"];
+    // Never accept roles from request body — all self-registrations are CUSTOMER
+    const finalRoles: string[] = ["CUSTOMER"];
 
-    // Resolve workspaceId: explicit body param → member lookup → first active workspace
+    // Resolve workspaceId: explicit body param → invite token → member lookup
     let resolvedWsId = bodyWsId || null;
-    if (!resolvedWsId) {
+    if (!resolvedWsId && inviteToken) {
       const member: any = await findCustomerMemberByEmail(normalizedEmail);
       if (member?.customerId) {
         const ws = await findWorkspaceByCustomerId(String(member.customerId));
@@ -672,11 +672,7 @@ r.post("/register", async (req, res) => {
       }
     }
     if (!resolvedWsId) {
-      const ws = await CustomerWorkspace.findOne({ status: "ACTIVE" }).select("_id").lean();
-      resolvedWsId = ws?._id || null;
-    }
-    if (!resolvedWsId) {
-      return res.status(400).json({ error: "workspaceId is required for registration" });
+      return res.status(400).json({ error: "workspaceId is required" });
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
@@ -833,14 +829,6 @@ r.post("/login", loginLimiter, async (req, res) => {
  * ─────────────────────────────────────────────── */
 r.post("/refresh", async (req, res) => {
   try {
-    console.log('[REFRESH DEBUG]', {
-      hasCookie: !!req.cookies?.refreshToken,
-      hasHeader: !!req.headers?.authorization,
-      cookieKeys: Object.keys(req.cookies || {}),
-      path: req.path,
-      originalUrl: req.originalUrl,
-      error: null,
-    });
     const token = (req.cookies && req.cookies[REFRESH_COOKIE_NAME]) || null;
     if (!token) return res.status(401).json({ error: "Missing refresh token" });
 
@@ -900,7 +888,6 @@ r.post("/refresh", async (req, res) => {
 
     res.json({ accessToken: newAccessToken, user: built.safe });
   } catch (err) {
-    console.log('[REFRESH ERROR]', err instanceof Error ? err.message : String(err));
     authLogger.error("Refresh failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
     res.status(401).json({ error: "Invalid or expired refresh token" });
   }

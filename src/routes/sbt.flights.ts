@@ -656,7 +656,7 @@ router.post("/special-return-check", requireSBT, requireFlightAccess, async (req
 });
 
 // POST /api/sbt/flights/farequote
-router.post("/farequote", requireAuth, async (req: any, res: any) => {
+router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     if (process.env.TBO_ENV === "mock") {
       return res.json({
@@ -695,14 +695,11 @@ router.post("/farequote", requireAuth, async (req: any, res: any) => {
 });
 
 // POST /api/sbt/flights/price-rbd
-router.post("/price-rbd", requireAuth, async (req: any, res: any) => {
+router.post("/price-rbd", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     const segments = req.body?.AirSearchResult?.[0]?.Segments ?? [];
     const fareClasses = segments.flat().map((s: any) => s?.Airline?.FareClass);
-    console.log("[PRICE-RBD] TraceId:", req.body?.TraceId, "FareClasses:", fareClasses,
-      "ResultIndex:", req.body?.AirSearchResult?.[0]?.ResultIndex);
     const result = await getPriceRBD(req.body);
-    console.log("[PRICE-RBD] TBO response:", JSON.stringify(result).slice(0, 1000));
     logTBOCall({
       method: "PriceRBD",
       traceId: req.body?.TraceId || "unknown",
@@ -711,13 +708,13 @@ router.post("/price-rbd", requireAuth, async (req: any, res: any) => {
     });
     res.json(result);
   } catch (err: any) {
-    console.error("[PRICE-RBD] error:", err.message);
+    sbtLogger.error("[PRICE-RBD] error", { error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
 
 // POST /api/sbt/flights/farerule
-router.post("/farerule", requireAuth, async (req: any, res: any) => {
+router.post("/farerule", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     if (process.env.TBO_ENV === "mock") {
       return res.json({
@@ -766,7 +763,7 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
       || "";
     const bookIsNDCFlag = req.body?.isNDC === true;
     const bookIsNDC = isNDCFlight(bookAirlineCode, bookIsNDCFlag);
-    if (bookIsNDC) console.log("[NDC BOOK]", bookAirlineCode);
+    if (bookIsNDC) sbtLogger.info("[NDC BOOK]", { airlineCode: bookAirlineCode });
 
     // Duplicate booking prevention (24hr window)
     const userId = req.user?.id || req.user?._id;
@@ -848,13 +845,13 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
         traceId: req.body?.TraceId,
       });
     }
-    console.error("[BOOK ERROR]", err?.message, err?.stack?.slice(0, 300));
-    res.status(500).json({ error: err?.message || "Book failed", stack: err?.stack?.slice(0, 200) });
+    sbtLogger.error("[BOOK ERROR]", { error: err?.message });
+    res.status(500).json({ error: err?.message || "Book failed" });
   }
 });
 
 // POST /api/sbt/flights/ticket
-router.post("/ticket", requireAuth, async (req: any, res: any) => {
+router.post("/ticket", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     // Validate ticket-level PAN/passport requirements
     const ticketFareResults = req.body?.fareQuoteResults || req.body?.fareResults;
@@ -908,8 +905,8 @@ router.post("/ticket", requireAuth, async (req: any, res: any) => {
         traceId: req.body?.TraceId,
       });
     }
-    console.error("[TICKET ERROR]", err?.message, err?.stack?.slice(0, 300));
-    res.status(500).json({ error: err?.message || "Ticket failed", stack: err?.stack?.slice(0, 200) });
+    sbtLogger.error("[TICKET ERROR]", { error: err?.message });
+    res.status(500).json({ error: err?.message || "Ticket failed" });
   }
 });
 
@@ -953,7 +950,7 @@ router.post("/ssr", requireSBT, async (req: any, res: any) => {
 });
 
 // POST /api/sbt/flights/ticket-lcc
-router.post("/ticket-lcc", async (req: any, res: any) => {
+router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     const { isReturn, returnResultIndex, returnTraceId, returnPassengers, isSpecialReturn, isReturnGDS } = req.body;
 
@@ -964,7 +961,7 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
       || "";
     const ticketIsNDCFlag = req.body?.isNDC === true;
     const ticketIsNDC = isNDCFlight(ticketAirlineCode, ticketIsNDCFlag);
-    if (ticketIsNDC) console.log("[NDC TICKET-LCC]", ticketAirlineCode);
+    if (ticketIsNDC) sbtLogger.info("[NDC TICKET-LCC]", { airlineCode: ticketAirlineCode });
 
     // Resolve dynamic certification case label
     const lccLeadPax = (req.body?.Passengers ?? [])[0] ?? {};
@@ -980,12 +977,9 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
       isPriceRBD: req.body?.isPriceRBD === true || req.body?.isAdvanceSearch === true,
     });
 
-    console.log('[TICKET-LCC ENTRY]', {
-      hasResultIndex: !!req.body?.ResultIndex,
-      hasTraceId: !!req.body?.TraceId,
+    sbtLogger.info('[TICKET-LCC ENTRY]', {
       passengerCount: req.body?.Passengers?.length,
       isReturn: !!isReturn,
-      hasReturnResultIndex: !!returnResultIndex,
       isNDC: ticketIsNDC,
     });
 
@@ -1111,8 +1105,7 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
       convertSeatPreferences(ibPassengers);
 
       // 1. Ticket OB leg
-      console.log('[TICKET-LCC] Ticketing OB leg...');
-      console.log('[TICKET-LCC OB MEAL]', JSON.stringify(obPassengers[0]?.MealDynamic));
+      sbtLogger.info('[TICKET-LCC] Ticketing OB leg...');
       const obPayload = {
         TraceId: req.body.TraceId,
         ResultIndex: req.body.ResultIndex,
@@ -1133,7 +1126,7 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
       const obErr = obResult?.Response?.Error?.ErrorMessage
         ?? obResult?.Response?.Response?.Error?.ErrorMessage ?? "";
       if (obResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(obErr) || /meal.*mandatory/i.test(obErr) || /mandatory.*meal/i.test(obErr))) {
-        console.log('[TICKET-LCC] OB "Invalid Meal" — retrying without meals/baggage');
+        sbtLogger.info('[TICKET-LCC] OB "Invalid Meal" — retrying without meals/baggage');
         const obPassengersNoMeal = obPassengers.map((p: any) => ({
           ...p, MealDynamic: [], Baggage: [],
         }));
@@ -1153,10 +1146,10 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
       if (obStatus !== 1 || !obBookingId) {
         const obError = obResult?.Response?.Error?.ErrorMessage
           ?? obResult?.Response?.Response?.Error?.ErrorMessage ?? "OB ticketing failed";
-        console.error('[TICKET-LCC] OB leg failed:', obError);
+        sbtLogger.error('[TICKET-LCC] OB leg failed', { error: obError });
         return res.json(obResult);
       }
-      console.log('[TICKET-LCC] OB leg success:', { obPNR, obBookingId });
+      sbtLogger.info('[TICKET-LCC] OB leg success');
 
       // 2. Ticket IB leg
       const ibTraceId = returnTraceId || req.body.TraceId;
@@ -1166,7 +1159,7 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
 
       if (isReturnGDS) {
         // ── Mixed carrier: IB is GDS → Book first, then Ticket ──
-        console.log('[TICKET-LCC] IB leg is GDS — using Book + Ticket flow');
+        sbtLogger.info('[TICKET-LCC] IB leg is GDS — using Book + Ticket flow');
 
         const ibBookResult = await bookFlight({
           TraceId: ibTraceId,
@@ -1185,7 +1178,7 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
         if (!ibPNR || !ibBookingId) {
           const ibBookError = ibBookResult?.Response?.Error?.ErrorMessage
             ?? ibBookResult?.Response?.Response?.Error?.ErrorMessage ?? "IB GDS Book failed";
-          console.error('[TICKET-LCC] IB GDS Book failed:', ibBookError);
+          sbtLogger.error('[TICKET-LCC] IB GDS Book failed', { error: ibBookError });
           // OB succeeded but IB Book failed — return OB result with IB error
           return res.json({
             ...obResult,
@@ -1197,7 +1190,7 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
           });
         }
 
-        console.log('[TICKET-LCC] IB GDS Book success:', { ibPNR, ibBookingId });
+        sbtLogger.info('[TICKET-LCC] IB GDS Book success');
 
         const ibTicketResult = await ticketFlight({
           TraceId: ibTraceId,
@@ -1205,17 +1198,14 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
           BookingId: Number(ibBookingId),
         }) as any;
 
-        console.log('[TICKET-LCC] IB GDS Ticket result:', {
+        sbtLogger.info('[TICKET-LCC] IB GDS Ticket complete', {
           status: ibTicketResult?.Response?.ResponseStatus,
-          ibPNR,
-          ibBookingId,
         });
 
         ibResult = ibTicketResult;
       } else {
         // ── Both legs LCC → ticketLCC for IB ──
-        console.log('[TICKET-LCC] Ticketing IB LCC leg...');
-        console.log('[TICKET-LCC IB MEAL]', JSON.stringify(ibPassengers[0]?.MealDynamic));
+        sbtLogger.info('[TICKET-LCC] Ticketing IB LCC leg...');
         const ibSegments = req.body.ReturnSegments ?? [];
         const ibFreeBaggage = (req.body.ReturnFreeBaggage ?? []).filter((b: any) => b.Price === 0);
         const ibPayload = {
@@ -1238,7 +1228,7 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
         const ibErr = ibResult?.Response?.Error?.ErrorMessage
           ?? ibResult?.Response?.Response?.Error?.ErrorMessage ?? "";
         if (ibResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(ibErr) || /meal.*mandatory/i.test(ibErr) || /mandatory.*meal/i.test(ibErr))) {
-          console.log('[TICKET-LCC] IB "Invalid Meal" — retrying without meals/baggage');
+          sbtLogger.info('[TICKET-LCC] IB "Invalid Meal" — retrying without meals/baggage');
           const ibPassengersNoMeal = ibPassengers.map((p: any) => ({
             ...p, MealDynamic: [], Baggage: [],
           }));
@@ -1257,9 +1247,8 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
 
       const ibStatus = ibResult?.Response?.ResponseStatus;
 
-      console.log('[TICKET-LCC] IB leg result:', {
-        ibStatus, ibPNR, ibBookingId, isReturnGDS: !!isReturnGDS,
-        ibError: ibResult?.Response?.Error?.ErrorMessage,
+      sbtLogger.info('[TICKET-LCC] IB leg result', {
+        ibStatus, isReturnGDS: !!isReturnGDS,
       });
 
       // 3. GetBookingDetails for both
@@ -1332,7 +1321,7 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
       result?.Response?.ResponseStatus !== 1 &&
       (/invalid meal/i.test(onewayErr) || /meal.*mandatory/i.test(onewayErr) || /mandatory.*meal/i.test(onewayErr))
     ) {
-      console.log('[TICKET-LCC] One-way meal error — retrying without meals/baggage');
+      sbtLogger.info('[TICKET-LCC] One-way meal error — retrying without meals/baggage');
       const passengersNoMeal = (req.body.Passengers ?? []).map((p: any) => {
         const { MealDynamic, Baggage, ...rest } = p;
         return rest;
@@ -1387,14 +1376,14 @@ router.post("/ticket-lcc", async (req: any, res: any) => {
         traceId: req.body?.TraceId,
       });
     }
-    console.error("[TICKET-LCC ERROR]", err?.message, err?.stack?.slice(0, 300));
+    sbtLogger.error("[TICKET-LCC ERROR]", { error: err?.message });
     res.status(500).json({ error: err.message });
   }
 });
 
 // POST /api/sbt/flights/release
 // Supports both JSON and text/plain (sendBeacon from browser tab close)
-router.post("/release", async (req: any, res: any) => {
+router.post("/release", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const result = await releasePNR(body);
