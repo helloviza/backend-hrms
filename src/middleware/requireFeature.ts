@@ -29,14 +29,12 @@ export const requireFeature = (featureKey: keyof WorkspaceFeatures) =>
       if (!workspace) {
         const wsId = req.workspaceObjectId || req.workspaceId;
         workspace = await CustomerWorkspace.findById(wsId)
-          .select("config.features status")
-          .lean() as unknown as CustomerWorkspaceDocument | null;
+          .select("config.features status") as CustomerWorkspaceDocument | null;
 
         // wsId may be a customerId (from JWT), not the workspace _id
         if (!workspace && wsId) {
           workspace = await CustomerWorkspace.findOne({ customerId: String(wsId) })
-            .select("config.features status")
-            .lean() as unknown as CustomerWorkspaceDocument | null;
+            .select("config.features status") as CustomerWorkspaceDocument | null;
         }
       }
 
