@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import mongoose from "mongoose";
 import { isSuperAdmin } from "./isSuperAdmin.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 
 /* ── Extend Express Request with workspace fields ───────────────── */
 declare global {
@@ -8,28 +9,44 @@ declare global {
     interface Request {
       workspaceId: string;
       workspaceObjectId: mongoose.Types.ObjectId;
-      workspace?: any; // populated later by requireFeature
+      workspace?: any; // resolved workspace document
     }
   }
 }
 
 /**
- * requireWorkspace — extracts workspaceId from the authenticated user
- * and attaches it to `req.workspaceId` (string) and
- * `req.workspaceObjectId` (ObjectId).
+ * resolveWorkspace — given a raw id (could be workspace _id OR customerId),
+ * returns the actual workspace document.
+ */
+async function resolveWorkspace(raw: string) {
+  let workspace = await CustomerWorkspace.findById(raw)
+    .select("_id customerId status config.features")
+    .lean();
+  if (!workspace) {
+    workspace = await CustomerWorkspace.findOne({ customerId: raw })
+      .select("_id customerId status config.features")
+      .lean();
+  }
+  return workspace;
+}
+
+/**
+ * requireWorkspace — resolves the actual CustomerWorkspace document
+ * and attaches `req.workspaceId` (string _id), `req.workspaceObjectId`
+ * (ObjectId _id), and `req.workspace` (lean doc).
  *
- * SUPERADMIN bypass: skips the user-JWT extraction entirely.
+ * SUPERADMIN bypass: skips the DB lookup entirely.
  * Instead reads workspaceId from body / query / params / header.
  * If none provided, continues without workspace context.
  *
  * Priority (normal users): workspaceId > customerId > businessId
- * Returns 403 if none found (non-SUPERADMIN only).
+ * Returns 403 if none found or workspace not active (non-SUPERADMIN only).
  */
-export const requireWorkspace = (
+export const requireWorkspace = async (
   req: Request,
   res: Response,
   next: NextFunction,
-): void => {
+): Promise<void> => {
   const user = (req as any).user;
   if (!user) {
     res.status(403).json({ success: false, error: "Workspace context required" });
@@ -81,14 +98,26 @@ export const requireWorkspace = (
     return;
   }
 
-  const id = String(raw);
-  req.workspaceId = id;
-
   try {
-    req.workspaceObjectId = new mongoose.Types.ObjectId(id);
-  } catch {
-    req.workspaceObjectId = id as any;
-  }
+    const workspace = await resolveWorkspace(String(raw));
 
-  next();
+    if (!workspace) {
+      res.status(403).json({ success: false, error: "Workspace context required" });
+      return;
+    }
+
+    if (workspace.status !== "ACTIVE") {
+      res.status(403).json({ success: false, error: "Workspace not active" });
+      return;
+    }
+
+    // Always set to the ACTUAL workspace _id
+    req.workspaceId = workspace._id.toString();
+    req.workspaceObjectId = workspace._id as mongoose.Types.ObjectId;
+    req.workspace = workspace;
+
+    next();
+  } catch (err) {
+    next(err);
+  }
 };

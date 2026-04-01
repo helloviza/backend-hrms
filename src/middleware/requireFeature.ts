@@ -23,20 +23,8 @@ export const requireFeature = (featureKey: keyof WorkspaceFeatures) =>
     if (userEmail === "tbocertification@plumtrips.com") return next();
 
     try {
-      // Re-use cached workspace if already loaded
-      let workspace = (req as any).workspace as CustomerWorkspaceDocument | null;
-
-      if (!workspace) {
-        const wsId = req.workspaceObjectId || req.workspaceId;
-        workspace = await CustomerWorkspace.findById(wsId)
-          .select("config.features status") as CustomerWorkspaceDocument | null;
-
-        // wsId may be a customerId (from JWT), not the workspace _id
-        if (!workspace && wsId) {
-          workspace = await CustomerWorkspace.findOne({ customerId: String(wsId) })
-            .select("config.features status") as CustomerWorkspaceDocument | null;
-        }
-      }
+      // Workspace already resolved by requireWorkspace middleware
+      const workspace = (req as any).workspace as CustomerWorkspaceDocument | null;
 
       if (!workspace || workspace.status !== "ACTIVE") {
         res.status(403).json({ success: false, error: "Workspace not active" });
@@ -51,8 +39,6 @@ export const requireFeature = (featureKey: keyof WorkspaceFeatures) =>
         return;
       }
 
-      // Cache for downstream use
-      (req as any).workspace = workspace;
       next();
     } catch (err) {
       next(err);
