@@ -979,7 +979,7 @@ router.put("/admin/:id/assign", requireApprovalsAdminWrite, async (req: AnyObj, 
     const id = String(req.params.id || "");
     const { agentType, agentName, comment } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    const doc: any = await ApprovalRequest.findById(id);
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     doc.adminState = "assigned";
@@ -1017,7 +1017,7 @@ router.put(
       const id = String(req.params.id || "");
       const { comment } = req.body || {};
 
-      const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+      const doc: any = await ApprovalRequest.findById(id);
       if (!doc) return res.status(404).json({ error: "Request not found" });
 
       const st = String(doc.stage || "").toUpperCase();
@@ -1060,7 +1060,7 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
     const id = String(req.params.id || "");
     const { comment, notifyEmail, bookingAmount, actualBookingPrice } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    const doc: any = await ApprovalRequest.findById(id);
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     if (doc.stage !== "BOOKING_IN_PROGRESS") {
