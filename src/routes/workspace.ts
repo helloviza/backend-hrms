@@ -607,6 +607,7 @@ router.patch("/config/travel-flow", async (req: AnyObj, res) => {
     // Keep legacy travelMode in sync
     ws.travelMode = FLOW_TO_LEGACY[travelFlow] || "APPROVAL_FLOW";
 
+    ws.markModified("config");
     await ws.save();
 
     // Bulk-update all workspace users
