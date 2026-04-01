@@ -565,4 +565,63 @@ router.get("/users", async (req, res) => {
   }
 });
 
+/* ── FIX: demo workspace travelFlow (temporary, do NOT commit) ──── */
+
+router.post("/fix-demo-workspace", async (req, res) => {
+  try {
+    const result = await CustomerWorkspace.findOneAndUpdate(
+      { _id: new mongoose.Types.ObjectId("69679a7628330a58d29f2254") },
+      {
+        $set: {
+          travelMode: "APPROVAL_FLOW",
+          "config.travelFlow": "APPROVAL_FLOW",
+          "config.features.approvalFlowEnabled": true,
+          "config.features.approvalDirectEnabled": false,
+          "config.features.sbtEnabled": false,
+        },
+      },
+      { new: true, runValidators: false },
+    );
+    return res.json({
+      ok: true,
+      travelFlow: result?.config?.travelFlow,
+      features: result?.config?.features,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── DEBUG: demo users workspace data (temporary, do NOT commit) ── */
+
+router.get("/debug-demo-users", async (req, res) => {
+  try {
+    const emails = [
+      "salescynosurechannel@gmail.com",
+      "thesaatphereindia@gmail.com",
+    ];
+
+    const users = await User.find({
+      email: { $in: emails },
+    })
+      .select("email customerId workspaceId roles")
+      .lean();
+
+    const customerIds = users.map((u: any) => u.customerId).filter(Boolean);
+
+    const workspaces = await CustomerWorkspace.find({
+      $or: [
+        { customerId: { $in: customerIds } },
+        { _id: { $in: users.map((u: any) => u.workspaceId).filter(Boolean) } },
+      ],
+    })
+      .select("_id customerId status config.travelFlow config.features travelMode")
+      .lean();
+
+    return res.json({ users, workspaces });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;
