@@ -809,14 +809,14 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
     // If this booking fulfils an SBT request, mark it as BOOKED and notify L1
     if (b.sbtRequestId) {
       try {
-        const sbtReq = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceId);
+        const sbtReq = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceObjectId);
         if (sbtReq && sbtReq.status === "PENDING") {
           sbtReq.status = "BOOKED";
           (sbtReq as any).hotelBookingId = doc._id;
           sbtReq.actedAt = new Date();
           await sbtReq.save();
 
-          const requester = await User.findOne({ _id: sbtReq.requesterId, workspaceId: req.workspaceId })
+          const requester = await User.findOne({ _id: sbtReq.requesterId, workspaceId: req.workspaceObjectId })
             .select("name email").lean() as any;
           if (requester?.email) {
             const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
@@ -1062,7 +1062,7 @@ router.post("/bookings/:id/mark-failed", requireAdmin, async (req: any, res: any
     const userId = req.user?._id ?? req.user?.id;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
-    const doc = await scopedFindById(SBTHotelBooking, req.params.id, req.workspaceId);
+    const doc = await scopedFindById(SBTHotelBooking, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Booking not found" });
 
     if (doc.bookingId && doc.bookingId.length > 0) {

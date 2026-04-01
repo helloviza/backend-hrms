@@ -2,6 +2,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireRoles } from "../middleware/roles.js";
 import Customer from "../models/Customer.js";
 import Vendor from "../models/Vendor.js";
@@ -119,6 +120,7 @@ router.get("/account-team", requireAuth, async (req: any, res, next) => {
 router.patch(
   "/:id/account-team",
   requireAuth,
+  requireWorkspace,
   requireRoles("ADMIN", "SUPERADMIN", "HR") as any,
   async (req: any, res, next) => {
     try {
@@ -130,14 +132,14 @@ router.patch(
         if (!input?.userId) return null;
 
         // 1. Try User collection directly (in case a User _id was passed)
-        let u: any = await User.findOne({ _id: input.userId, workspaceId: req.workspaceId })
+        let u: any = await User.findOne({ _id: input.userId, workspaceId: req.workspaceObjectId })
           .select("name fullName firstName lastName email phone mobile contactNo personalContact")
           .lean()
           .exec();
 
         // 2. If not found, try Employee collection → then find linked User by email
         if (!u) {
-          const emp: any = await Employee.findOne({ _id: input.userId, workspaceId: req.workspaceId })
+          const emp: any = await Employee.findOne({ _id: input.userId, workspaceId: req.workspaceObjectId })
             .select("email officialEmail companyEmail")
             .lean()
             .exec();

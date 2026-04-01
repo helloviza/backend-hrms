@@ -5,6 +5,7 @@ import { Types } from "mongoose";
 import crypto from "crypto";
 import { optionalAuth } from "../middleware/optionalAuth.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import VideoAnalysis from "../models/VideoAnalysis.js";
 import { invokePluto } from "../utils/plutoInvoke.js";
 
@@ -191,7 +192,7 @@ router.post(
         });
       }
 
-      const video = await scopedFindById(VideoAnalysis, videoId, (req as any).workspaceId);
+      const video = await scopedFindById(VideoAnalysis, videoId, (req as any).workspaceObjectId);
       if (!video) {
         return res.status(404).json({
           ok: false,
@@ -876,7 +877,7 @@ router.post("/", optionalAuth, async (req, res) => {
     // Always rebuild from DB — never trust client-sent contextPatch
     // This ensures locked context wins over soft video assumptions
     if (videoAnalysisId) {
-      const video = await VideoAnalysis.findOne({ _id: videoAnalysisId, workspaceId: (req as any).workspaceId })
+      const video = await VideoAnalysis.findOne({ _id: videoAnalysisId, workspaceId: (req as any).workspaceObjectId })
         .select("userConsent insights")
         .lean();
 
@@ -953,7 +954,7 @@ router.post("/", optionalAuth, async (req, res) => {
 
     /* ───────── VIDEO RELEVANCE GATE (ABSOLUTE TRUTH) ───────── */
     if (videoAnalysisId) {
-      const video = await VideoAnalysis.findOne({ _id: videoAnalysisId, workspaceId: (req as any).workspaceId })
+      const video = await VideoAnalysis.findOne({ _id: videoAnalysisId, workspaceId: (req as any).workspaceObjectId })
         .select("classification status summaryType")
         .lean();
 
@@ -1356,7 +1357,7 @@ ${prompt}
 /* ────────────────────────────────────────────────────────────────
  * POST /raise-request — Concierge → SBT request pipeline
  * ──────────────────────────────────────────────────────────────── */
-router.post("/raise-request", requireAuth, async (req: any, res: any) => {
+router.post("/raise-request", requireAuth, requireWorkspace, async (req: any, res: any) => {
   try {
     const user = req.user;
     if (!user?._id) return res.status(401).json({ error: "Unauthorized" });
@@ -1430,7 +1431,7 @@ router.post("/raise-request", requireAuth, async (req: any, res: any) => {
     });
 
     // Send email to assigned booker
-    const booker = await User.findOne({ _id: assignedBookerId, workspaceId: (req as any).workspaceId })
+    const booker = await User.findOne({ _id: assignedBookerId, workspaceId: (req as any).workspaceObjectId })
       .select("name email").lean() as any;
 
     if (booker?.email) {

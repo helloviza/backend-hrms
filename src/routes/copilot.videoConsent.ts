@@ -90,7 +90,7 @@ router.post("/:id/consent", requireAuth, requireWorkspace, async (req, res) => {
       });
     }
 
-    const video = await scopedFindById(VideoAnalysis, id, req.workspaceId);
+    const video = await scopedFindById(VideoAnalysis, id, req.workspaceObjectId);
     if (!video) {
       return res.status(404).json({
         ok: false,

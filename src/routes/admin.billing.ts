@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import logger from "../utils/logger.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
@@ -9,6 +10,7 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 
 const router = express.Router();
 router.use(requireAuth);
+router.use(requireWorkspace);
 
 /* Allow admin (full access) OR sbtEnabled user (scoped to their customerId) */
 async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction) {
@@ -25,7 +27,7 @@ async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction
   const sub = String(user?.sub || user?._id || user?.id || "");
   if (!sub) return res.status(403).json({ error: "Access denied" });
 
-  const dbUser: any = await User.findOne({ _id: sub, workspaceId: (req as any).workspaceId }).select("sbtEnabled customerId canViewBilling").lean();
+  const dbUser: any = await User.findOne({ _id: sub, workspaceId: (req as any).workspaceObjectId }).select("sbtEnabled customerId canViewBilling").lean();
   if (dbUser?.sbtEnabled === true && dbUser?.customerId) {
     if (dbUser?.canViewBilling !== true) {
       return res.status(403).json({

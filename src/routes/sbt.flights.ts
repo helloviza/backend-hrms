@@ -1504,7 +1504,7 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
     // If this booking fulfils an SBT request, mark it as BOOKED and notify L1
     if (b.sbtRequestId) {
       try {
-        const sbtReq = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceId);
+        const sbtReq = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceObjectId);
         if (sbtReq && sbtReq.status === "PENDING") {
           sbtReq.status = "BOOKED";
           (sbtReq as any).bookingId = doc._id;
@@ -1512,7 +1512,7 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
           await sbtReq.save();
 
           // Send confirmation email to L1 requester
-          const requester = await User.findOne({ _id: sbtReq.requesterId, workspaceId: req.workspaceId })
+          const requester = await User.findOne({ _id: sbtReq.requesterId, workspaceId: req.workspaceObjectId })
             .select("name email").lean() as any;
           if (requester?.email) {
             const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";

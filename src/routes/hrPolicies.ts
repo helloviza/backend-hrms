@@ -6,6 +6,7 @@ import path from "path";
 
 import Policy from "../models/Policy.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 
 const router = express.Router();
@@ -317,14 +318,14 @@ router.post(
    L0: can only edit their own org's policies.
    L1/L2/Employee: 403.
 ----------------------------------------------------------- */
-router.put("/:id", requireAuth, async (req: any, res, next) => {
+router.put("/:id", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     const mgmt = canManage(req.user);
     if (!mgmt) {
       return res.status(403).json({ error: "Not allowed" });
     }
 
-    const policy = await scopedFindById(Policy, req.params.id, req.workspaceId);
+    const policy = await scopedFindById(Policy, req.params.id, req.workspaceObjectId);
     if (!policy) {
       return res.status(404).json({ error: "Policy not found" });
     }
@@ -383,7 +384,7 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
    L0: can only delete their own org's policies.
    L1/L2/Employee: 403.
 ----------------------------------------------------------- */
-router.delete("/:id", requireAuth, async (req: any, res, next) => {
+router.delete("/:id", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     const mgmt = canManage(req.user);
     if (!mgmt) {
@@ -391,7 +392,7 @@ router.delete("/:id", requireAuth, async (req: any, res, next) => {
     }
 
     const { id } = req.params;
-    const policy = await scopedFindById(Policy, id, req.workspaceId);
+    const policy = await scopedFindById(Policy, id, req.workspaceObjectId);
 
     if (!policy) {
       return res.status(404).json({ error: "Policy not found" });

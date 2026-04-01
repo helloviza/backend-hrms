@@ -400,9 +400,9 @@ router.put("/:id", requireAuth, async (req: any, res, next) => {
     delete (body as any).passwordHash;
 
     // First try to find by Employee doc to get ownerId
-    const employeeDoc = await Employee.findOne({ _id: id, workspaceId: req.workspaceId }).exec();
+    const employeeDoc = await Employee.findOne({ _id: id, workspaceId: req.workspaceObjectId }).exec();
     const userId = employeeDoc?.ownerId ?? id;
-    const existing: AnyUser | null = await scopedFindById(User, userId, req.workspaceId);
+    const existing: AnyUser | null = await scopedFindById(User, userId, req.workspaceObjectId);
     if (!existing) {
       return res.status(404).json({ error: "Employee not found" });
     }
