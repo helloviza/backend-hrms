@@ -20,11 +20,11 @@ declare global {
  */
 async function resolveWorkspace(raw: string) {
   let workspace = await CustomerWorkspace.findById(raw)
-    .select("_id customerId status config.features")
+    .select("_id customerId status config travelMode")
     .lean();
   if (!workspace) {
     workspace = await CustomerWorkspace.findOne({ customerId: raw })
-      .select("_id customerId status config.features")
+      .select("_id customerId status config travelMode")
       .lean();
   }
   return workspace;

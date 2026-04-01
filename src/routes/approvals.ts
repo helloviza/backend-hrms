@@ -311,7 +311,7 @@ function buildAdminApprovedQueryFromParams(req: AnyObj) {
  * POST /api/approvals/requests
  * ──────────────────────────────────────────────────────────────── */
 
-router.post("/requests", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
+router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     const user = req.user;
     const sub = String(user?.sub || user?._id || "");
@@ -541,7 +541,7 @@ router.post("/requests", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROV
   }
 });
 
-router.get("/requests/mine", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
+router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     // SBT users must not access approval flow
     const sbtUser = await User.findOne({ _id: req.user?.sub || req.user?._id, workspaceId: req.workspaceObjectId }).select("sbtEnabled").lean();
@@ -569,7 +569,7 @@ router.get("/requests/mine", requireAuth, requireTravelMode("APPROVAL_FLOW", "AP
   }
 });
 
-router.get("/requests/inbox", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
+router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     // SBT users must not access approval flow
     const sbtUser = await User.findOne({ _id: req.user?.sub || req.user?._id, workspaceId: req.workspaceObjectId }).select("sbtEnabled").lean();
@@ -679,7 +679,7 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
   }
 });
 
-router.put("/requests/:id/action", requireAuth, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
+router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     const id = String(req.params.id || "");
     const sub = String(req.user?.sub || req.user?._id || "");
