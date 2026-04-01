@@ -1015,32 +1015,34 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
     const lccAirlineCode = ticketAirlineCode || req.body?.airlineCode || "";
     const lccDestCode = req.body?.destinationCode || "";
 
-    // Convert SeatPreference → SeatDynamic if frontend sent old format
+    // Convert SeatPreference → SeatDynamic (SSR nested format) if frontend sent old format
     function convertSeatPreferences(passengers: any[]) {
       for (const pax of passengers) {
         if (pax.SeatPreference && !pax.SeatDynamic) {
           const items = Array.isArray(pax.SeatPreference) ? pax.SeatPreference : [pax.SeatPreference];
-          pax.SeatDynamic = items.map((sp: any) => ({
-            WayType: sp.WayType || sp.SeatWayType || 1,
-            Seat: [{
-              AirlineCode: sp.AirlineCode || "",
-              FlightNumber: sp.FlightNumber || "",
-              CraftType: sp.CraftType || "",
-              Origin: sp.Origin || "",
-              Destination: sp.Destination || "",
-              AvailablityType: sp.AvailablityType ?? 1,
-              Description: Number(sp.Description) || 2,
-              Code: sp.Code || "",
-              RowNo: sp.RowNo || (sp.Code?.replace(/[A-Z]/gi, "") || "0"),
-              SeatNo: sp.Code || "",
-              SeatType: sp.SeatType || 2,
-              SeatWayType: sp.WayType || sp.SeatWayType || 1,
-              Compartment: sp.Compartment || 2,
-              Deck: sp.Deck || 1,
-              Currency: sp.Currency || "INR",
-              Price: sp.Price || 0,
+          const segmentSeats = items.map((sp: any) => ({
+            RowSeats: [{
+              Seats: [{
+                AirlineCode: sp.AirlineCode || "",
+                FlightNumber: sp.FlightNumber || "",
+                CraftType: sp.CraftType || "",
+                Origin: sp.Origin || "",
+                Destination: sp.Destination || "",
+                AvailablityType: sp.AvailablityType ?? 0,
+                Description: Number(sp.Description) || 2,
+                Code: sp.Code || "",
+                RowNo: sp.RowNo || (sp.Code?.replace(/[A-Z]/gi, "") || "0"),
+                SeatNo: sp.Code || "",
+                SeatType: sp.SeatType ?? 0,
+                SeatWayType: sp.WayType || sp.SeatWayType || 1,
+                Compartment: sp.Compartment ?? 0,
+                Deck: sp.Deck ?? 0,
+                Currency: sp.Currency || "INR",
+                Price: sp.Price || 0,
+              }],
             }],
           }));
+          pax.SeatDynamic = [{ SegmentSeat: segmentSeats }];
           delete pax.SeatPreference;
         }
       }
