@@ -2284,7 +2284,7 @@ router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => 
       if (!customerId) return res.status(400).json({ error: "customerId query param is required for admin" });
     }
 
-    const ws: any = await CustomerWorkspace.findOne({ customerId }).select("travelMode allowedDomains").lean();
+    const ws: any = await CustomerWorkspace.findOne({ customerId }).select("travelMode allowedDomains config.travelFlow").lean();
 
     const users = await User.find({ customerId })
       .select("name email roles role status sbtEnabled sbtRole sbtAssignedBookerId canRaiseRequest canViewBilling canManageUsers")
@@ -2312,7 +2312,7 @@ router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => 
     res.json({
       workspace: {
         customerId,
-        travelMode: ws?.travelMode || "APPROVAL_FLOW",
+        travelMode: ws?.config?.travelFlow || ws?.travelMode || "APPROVAL_FLOW",
         allowedDomains: ws?.allowedDomains || [],
         totalUsers: rows.length,
       },
@@ -2368,7 +2368,7 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
       }
     }
 
-    const targetUser: any = await User.findOne({ _id: req.params.userId, workspaceId: req.workspaceId })
+    const targetUser: any = await User.findOne({ _id: req.params.userId, workspaceId: req.workspaceObjectId })
       .select("customerId email roles")
       .lean();
     if (!targetUser) return res.status(404).json({ error: "User not found" });
@@ -2418,7 +2418,7 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
     if (permission === "sbtAssignedBookerId") {
       if (value) {
         // Validate: target booker must have sbtRole L2/BOTH or be WORKSPACE_LEADER, same customerId, not self
-        const booker: any = await User.findOne({ _id: value, workspaceId: req.workspaceId }).select("sbtRole customerId roles").lean();
+        const booker: any = await User.findOne({ _id: value, workspaceId: req.workspaceObjectId }).select("sbtRole customerId roles").lean();
         if (!booker) return res.status(400).json({ error: "Assigned booker user not found" });
         const bookerRoles = (Array.isArray(booker.roles) ? booker.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
         const bookerIsWL = bookerRoles.includes("WORKSPACELEADER");
