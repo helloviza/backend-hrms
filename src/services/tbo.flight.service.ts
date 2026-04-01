@@ -643,7 +643,7 @@ export async function bookFlight(params: {
     TraceId: params.TraceId,
     ResultIndex: params.ResultIndex,
     Passengers: sanitizedPassengers,
-    IsPriceChangedAccepted: true,
+    IsPriceChangedAccepted: false,
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
@@ -723,73 +723,77 @@ function sanitizeSeatObj(s: any): Record<string, any> {
     CraftType: s.CraftType ?? "",
     Origin: s.Origin ?? "",
     Destination: s.Destination ?? "",
-    AvailablityType: s.AvailablityType ?? 1,
+    AvailablityType: s.AvailablityType ?? 0,
     Description: Number(s.Description) || 2,
     Code: s.Code ?? "",
     RowNo: s.RowNo ?? "",
     SeatNo: s.SeatNo ?? "",
-    SeatType: s.SeatType ?? 2,
+    SeatType: s.SeatType ?? 0,
     SeatWayType: s.SeatWayType ?? 1,
-    Compartment: s.Compartment ?? 2,
-    Deck: s.Deck ?? 1,
+    Compartment: s.Compartment ?? 0,
+    Deck: s.Deck ?? 0,
     Currency: s.Currency ?? "INR",
     Price: Number(s.Price) || 0,
   };
 }
 
 /**
- * Convert SeatDynamic from SSR/frontend format into TBO Ticket format.
+ * Sanitize SeatDynamic — preserve SSR nested format verbatim.
  *
- * TBO Ticket expects:
- *   SeatDynamic: [{ WayType: 1, Seat: [seatObj, ...] }, ...]
+ * TBO Ticket expects the same SegmentSeat → RowSeats → Seats nesting
+ * returned by the SSR response. The frontend already builds this structure.
  *
  * Input may be:
- *   a) Already correct format: [{ WayType, Seat: [...] }]
- *   b) SSR nested format: [{ SegmentSeat: [{ RowSeats: [{ Seats: [...] }] }] }]
- *   c) Flat seat objects: [seatObj, seatObj, ...]
+ *   a) SSR nested format: [{ SegmentSeat: [{ RowSeats: [{ Seats: [...] }] }] }]
+ *   b) Legacy WayType+Seat format: [{ WayType, Seat: [...] }] — convert to SSR nesting
+ *   c) Flat seat objects: [seatObj, ...] — wrap into SSR nesting
  */
 function sanitizeSeatDynamic(seats: any[]): any[] {
   if (!Array.isArray(seats) || seats.length === 0) return [];
 
   const SEAT_SKIP = ["", "noseat", "no_seat"];
-  const result: any[] = [];
 
+  // Check if input is already SSR nested format (a)
+  if (seats[0]?.SegmentSeat !== undefined) {
+    // Sanitize seat fields but preserve the SegmentSeat → RowSeats → Seats nesting
+    return seats.map((item: any) => ({
+      SegmentSeat: (item.SegmentSeat || []).map((ss: any) => ({
+        RowSeats: (ss.RowSeats || []).map((rs: any) => ({
+          Seats: (rs.Seats || [])
+            .map(sanitizeSeatObj)
+            .filter((s: any) => s.Code && !SEAT_SKIP.includes(s.Code.toLowerCase()) && s.SeatNo),
+        })).filter((rs: any) => rs.Seats.length > 0),
+      })).filter((ss: any) => ss.RowSeats.length > 0),
+    })).filter((item: any) => item.SegmentSeat.length > 0);
+  }
+
+  // Legacy format (b): WayType + Seat array — convert to SSR nesting
+  // Legacy format (c): flat seat objects — wrap into SSR nesting
+  const allSeats: any[] = [];
   for (const item of seats) {
-    // Format (a): already has WayType + Seat array
     if (item.WayType !== undefined && Array.isArray(item.Seat)) {
-      const validSeats = item.Seat
-        .map(sanitizeSeatObj)
-        .filter((s: any) => s.Code && !SEAT_SKIP.includes(s.Code.toLowerCase()) && s.SeatNo);
-      if (validSeats.length > 0) {
-        result.push({ WayType: item.WayType, Seat: validSeats });
-      }
-      continue;
-    }
-
-    // Format (b): SSR nested format with SegmentSeat → RowSeats → Seats
-    if (Array.isArray(item.SegmentSeat)) {
-      for (const ss of item.SegmentSeat) {
-        for (const rs of (ss.RowSeats || [])) {
-          for (const s of (rs.Seats || [])) {
-            if (!s.Code || SEAT_SKIP.includes(s.Code.toLowerCase()) || !s.SeatNo) continue;
-            const clean = sanitizeSeatObj(s);
-            result.push({ WayType: clean.SeatWayType || 1, Seat: [clean] });
-          }
+      for (const s of item.Seat) {
+        const clean = sanitizeSeatObj(s);
+        if (clean.Code && !SEAT_SKIP.includes(clean.Code.toLowerCase()) && clean.SeatNo) {
+          allSeats.push(clean);
         }
       }
-      continue;
-    }
-
-    // Format (c): flat seat object
-    if (item.Code && item.SeatNo) {
+    } else if (item.Code && item.SeatNo) {
       const clean = sanitizeSeatObj(item);
       if (!SEAT_SKIP.includes(clean.Code.toLowerCase())) {
-        result.push({ WayType: clean.SeatWayType || 1, Seat: [clean] });
+        allSeats.push(clean);
       }
     }
   }
 
-  return result;
+  if (allSeats.length === 0) return [];
+
+  // Wrap flat seats into SSR nesting: one RowSeats entry per seat
+  return [{
+    SegmentSeat: [{
+      RowSeats: allSeats.map((s: any) => ({ Seats: [s] })),
+    }],
+  }];
 }
 
 export async function ticketLCC(params: {
@@ -996,7 +1000,7 @@ export async function ticketLCC(params: {
     TraceId: params.TraceId,
     ResultIndex: params.ResultIndex,
     Passengers: sanitizedPassengers,
-    IsPriceChangedAccepted: true,
+    IsPriceChangedAccepted: false,
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
@@ -1012,7 +1016,7 @@ export async function ticketLCC(params: {
   // Auto-retry with IsPriceChangedAccepted if TBO signals price changed
   const lccChanged = lccResult?.Response?.IsPriceChanged === true
     || lccResult?.Response?.Response?.IsPriceChanged === true;
-  if (lccChanged && !payload.IsPriceChangedAccepted) {
+  if (lccChanged) {
     console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangedAccepted=true");
     return post("/Ticket", { ...payload, IsPriceChangedAccepted: true }, false, FLIGHT_BOOK_BASE);
   }
