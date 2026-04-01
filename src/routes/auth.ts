@@ -316,6 +316,7 @@ async function ensureWorkspaceAndLeader(params: {
   customerId: string;
   email: string;
   name?: string;
+  userRoles?: string[];
 }) {
   const customerId = String(params.customerId || "").trim();
   const email = normalizeEmail(params.email);
@@ -339,9 +340,17 @@ async function ensureWorkspaceAndLeader(params: {
     { upsert: true }
   ).exec();
 
+  // Derive member role from explicit DB roles — don't hardcode WORKSPACE_LEADER
+  const dbRoles = (params.userRoles || []).map((r) => r.toUpperCase());
+  const memberRole = dbRoles.includes("WORKSPACE_LEADER")
+    ? "WORKSPACE_LEADER"
+    : dbRoles.includes("APPROVER")
+    ? "APPROVER"
+    : "REQUESTER";
+
   const rx = new RegExp(`^${escapeRegExp(email)}$`, "i");
   const setFields: any = {
-    role: "WORKSPACE_LEADER",
+    role: memberRole,
     isActive: true,
     updatedAt: new Date(),
   };
@@ -419,7 +428,6 @@ async function buildAuthSafeUser(userDoc: any) {
       set.add("CUSTOMER");
       if (member?.role) {
         const mr = String(member.role).toUpperCase();
-        set.add(mr);
         customerMemberRole = mr;
       }
     }
@@ -770,6 +778,7 @@ r.post("/login", loginLimiter, async (req, res) => {
           customerId: built.customerId,
           email: built.safe.email,
           name: built.safe.firstName || built.safe.name,
+          userRoles: user.roles || [],
         });
 
         if (!user.customerId) {
@@ -778,7 +787,7 @@ r.post("/login", loginLimiter, async (req, res) => {
           await user.save();
         }
 
-        // 3) Rebuild so roles include member role immediately
+        // 3) Rebuild so roles reflect member role immediately
         built = await buildAuthSafeUser(user);
       }
     }
@@ -838,6 +847,7 @@ r.post("/refresh", async (req, res) => {
           customerId: built.customerId,
           email: built.safe.email,
           name: built.safe.firstName || built.safe.name,
+          userRoles: user.roles || [],
         });
 
         if (!user.customerId) {
