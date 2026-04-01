@@ -8,7 +8,10 @@ import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
 
 const r = Router();
 
-r.use(requireAuth, requireWorkspace, requireFeature("payrollEnabled"));
+r.use(requireAuth, requireWorkspace, requireFeature("payrollEnabled"), (req: Request, res: Response, next: NextFunction) => {
+  if (!req.workspaceId) return res.status(400).json({ error: "workspaceId query param required for SUPERADMIN" });
+  next();
+});
 
 function hasRole(req: Request, ...roles: string[]): boolean {
   const userRoles: string[] = (req as any).user?.roles || [];

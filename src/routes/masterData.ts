@@ -792,6 +792,9 @@ router.post(
       };
 
       if (existingUser) {
+  if (!existingUser.workspaceId && (workspaceId || req.workspaceObjectId)) {
+    existingUser.workspaceId = workspaceId || req.workspaceObjectId;
+  }
   Object.assign(existingUser, payload);
   const saved = await existingUser.save();
   await syncEmployeeRecord({
@@ -843,6 +846,7 @@ router.post(
       const newPayload: any = {
         ...payload,
         passwordHash,
+        workspaceId: workspaceId || req.workspaceObjectId,
       };
 
       const user = await User.create(newPayload);

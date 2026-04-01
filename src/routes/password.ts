@@ -41,7 +41,7 @@ function validatePassword(pw: string): string | null {
 /* POST /api/password/change  (self-service)                                  */
 /* -------------------------------------------------------------------------- */
 
-router.post("/change", requireAuth, requireWorkspace, async (req: any, res, next) => {
+router.post("/change", requireAuth, async (req: any, res, next) => {
   try {
     const { currentPassword, newPassword } = req.body as {
       currentPassword?: string;
@@ -59,12 +59,13 @@ router.post("/change", requireAuth, requireWorkspace, async (req: any, res, next
       return res.status(400).json({ error: pwError });
     }
 
-    const userId = req.user?._id || req.user?.id;
+    const userId = req.user?._id || req.user?.id || req.user?.sub;
     if (!userId) {
       return res.status(401).json({ error: "Unauthorised" });
     }
 
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId }).exec();
+    // Self password change — find by userId only (no workspace check needed)
+    const user = await User.findById(userId).exec();
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }

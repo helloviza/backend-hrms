@@ -23,13 +23,14 @@ r.use(requireAuth);
  * - If last punch was OUT → next is IN
  * - If no punches yet     → start with IN
  */
-r.post("/punch", audit("punch-toggle"), async (req, res) => {
-  const userId = (req as any).user.sub;
+r.post("/punch", requireWorkspace, audit("punch-toggle"), async (req: any, res) => {
+  const userId = req.user.sub;
   const date = dayjs().format("YYYY-MM-DD");
   const geo = req.body?.geo || null;
+  const workspaceId = req.workspaceObjectId;
 
   // Find today's record to see last punch type
-  const today: any = await Attendance.findOne({ userId, date }).lean();
+  const today: any = await Attendance.findOne({ userId, date, workspaceId }).lean();
 
   let nextType: "IN" | "OUT" = "IN";
   if (today && Array.isArray(today.punches) && today.punches.length > 0) {
@@ -38,7 +39,7 @@ r.post("/punch", audit("punch-toggle"), async (req, res) => {
   }
 
   const doc = await Attendance.findOneAndUpdate(
-    { userId, date },
+    { userId, date, workspaceId },
     { $push: { punches: { ts: new Date(), type: nextType, geo } } },
     { upsert: true, new: true }
   );
@@ -46,24 +47,24 @@ r.post("/punch", audit("punch-toggle"), async (req, res) => {
   res.json(doc);
 });
 
-r.post("/punch-in", audit("punch-in"), async (req, res) => {
-  const userId = (req as any).user.sub;
+r.post("/punch-in", requireWorkspace, audit("punch-in"), async (req: any, res) => {
+  const userId = req.user.sub;
   const date = dayjs().format("YYYY-MM-DD");
   const geo = req.body.geo || null;
   const doc = await Attendance.findOneAndUpdate(
-    { userId, date },
+    { userId, date, workspaceId: req.workspaceObjectId },
     { $push: { punches: { ts: new Date(), type: "IN", geo } } },
     { upsert: true, new: true }
   );
   res.json(doc);
 });
 
-r.post("/punch-out", audit("punch-out"), async (req, res) => {
-  const userId = (req as any).user.sub;
+r.post("/punch-out", requireWorkspace, audit("punch-out"), async (req: any, res) => {
+  const userId = req.user.sub;
   const date = dayjs().format("YYYY-MM-DD");
   const geo = req.body.geo || null;
   const doc = await Attendance.findOneAndUpdate(
-    { userId, date },
+    { userId, date, workspaceId: req.workspaceObjectId },
     { $push: { punches: { ts: new Date(), type: "OUT", geo } } },
     { upsert: true, new: true }
   );
@@ -131,8 +132,16 @@ r.get("/reports", async (req, res) => {
   }
 
   // ───────────────── legacy list mode (admin reports etc.) ─────────────────
+  const authUserId2 = (req as any).user?.sub;
+  const targetUserId = userIdParam || authUserId2;
+
+  // Non-admin users can only view their own attendance
+  if (userIdParam && !hasRole(req, "MANAGER", "HR", "ADMIN") && String(userIdParam) !== String(authUserId2)) {
+    return res.status(403).json({ error: "Cannot view other users attendance" });
+  }
+
   const q: any = {};
-  if (userIdParam) q.userId = userIdParam;
+  if (targetUserId) q.userId = targetUserId;
   if (from && to) q.date = { $gte: from, $lte: to };
 
   const items = await Attendance.find(q).lean();

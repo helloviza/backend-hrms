@@ -1439,6 +1439,7 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
       userId,
       customerId: (req.user as any)?.customerId ?? undefined,
       sbtRequestId: b.sbtRequestId || undefined,
+      workspaceId: req.workspaceObjectId,
       traceId: b.traceId || "",
       pnr: b.pnr || `MOCK-${Date.now()}`,
       bookingId: b.bookingId || `BK-${Date.now()}`,

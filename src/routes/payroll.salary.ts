@@ -32,23 +32,16 @@ async function resolveWorkspaceId(req: Request): Promise<string | null> {
     req.headers["x-workspace-id"];
   if (explicit) return String(explicit);
 
-  const ws = await CustomerWorkspace.findOne({ status: "ACTIVE" })
-    .select("_id")
-    .lean();
-  if (ws) {
-    console.warn(
-      `[SUPERADMIN AUTO-RESOLVE] No workspaceId provided. ` +
-      `Falling back to first active workspace: ${ws._id}. ` +
-      `User: ${(req as any).user?.email}. Path: ${req.path}`
-    );
-    return String(ws._id);
-  }
+  // SUPERADMIN must provide explicit workspaceId — no auto-fallback
   return null;
 }
 
 const r = Router();
 
-r.use(requireAuth, requireWorkspace, requireFeature("payrollEnabled"));
+r.use(requireAuth, requireWorkspace, requireFeature("payrollEnabled"), (req: Request, res: Response, next: NextFunction) => {
+  if (!req.workspaceId && !req.workspaceObjectId) return res.status(400).json({ error: "workspaceId query param required for SUPERADMIN" });
+  next();
+});
 
 /* ─── POST /structure — Create or update salary structure ─── */
 r.post(
