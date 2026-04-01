@@ -599,6 +599,7 @@ router.patch("/config/travel-flow", async (req: AnyObj, res) => {
       ws.config = deriveConfigFromLegacy(ws.travelMode);
     }
     ws.config.travelFlow = travelFlow;
+    if (!ws.config.features) ws.config.features = {};
     ws.config.features.sbtEnabled = featureUpdate.sbtEnabled;
     ws.config.features.approvalFlowEnabled = featureUpdate.approvalFlowEnabled;
     ws.config.features.approvalDirectEnabled = featureUpdate.approvalDirectEnabled;
