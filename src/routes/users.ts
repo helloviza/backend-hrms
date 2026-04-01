@@ -321,6 +321,7 @@ r.post(
 r.post(
   "/create-staff",
   requireAuth,
+  requireWorkspace,
   requireRoles("ADMIN", "SUPERADMIN"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -355,6 +356,7 @@ r.post(
         ...(department ? { department: department.trim() } : {}),
         ...(phone ? { phone: phone.trim() } : {}),
         isActive: true,
+        workspaceId: (req as any).workspaceObjectId,
       });
 
       return res.status(201).json({
@@ -377,6 +379,7 @@ r.post(
 r.get(
   "/admin/onboarded-without-access",
   requireAuth,
+  requireWorkspace,
   requireRoles("ADMIN", "SUPERADMIN", "HR"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -386,6 +389,7 @@ r.get(
           { tempPassword: { $exists: false } },
         ],
         roles: { $in: ["EMPLOYEE", "MANAGER", "HR"] },
+        workspaceId: (req as any).workspaceObjectId,
       })
         .select("name email officialEmail roles employeeCode createdAt tempPassword activatedByAdmin")
         .lean();
@@ -476,7 +480,7 @@ r.post(
         [payload.firstName, payload.lastName].filter(Boolean).join(" ") ||
         email;
 
-      const existing = await User.findOne({ email });
+      const existing = await User.findOne({ email, workspaceId: (req as any).workspaceObjectId });
       if (existing) {
         Object.assign(existing, activation, ...(officialEmail ? [{ officialEmail }] : []));
         await (existing as any).save();
@@ -495,7 +499,7 @@ r.post(
         });
       }
 
-      const newUser = await User.create({ name, email, isActive: true, ...activation, ...(officialEmail && { officialEmail }) });
+      const newUser = await User.create({ name, email, isActive: true, ...activation, ...(officialEmail && { officialEmail }), workspaceId: (req as any).workspaceObjectId });
       const loginUrlC = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
       sendCredentialsEmail({
         to: (newUser as any).officialEmail || (newUser as any).email,

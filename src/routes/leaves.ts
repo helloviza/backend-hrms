@@ -139,6 +139,7 @@ r.post(
 
       const lr = await Leave.create({
         userId,
+        workspaceId: (req as any).workspaceObjectId,
         type: leaveType,
         from,
         to,
@@ -371,7 +372,7 @@ async function handleMyLeaves(
 ) {
   try {
     const userId = (req as any).user.sub;
-    const items = await Leave.find({ userId }).sort({ createdAt: -1 });
+    const items = await Leave.find({ userId, workspaceId: (req as any).workspaceObjectId }).sort({ createdAt: -1 });
     return res.json({ items });
   } catch (err) {
     return next(err);
@@ -471,7 +472,7 @@ r.get(
 
       if (isHrAdmin) {
         // HR/Admin sees all pending leaves
-        const items = await Leave.find({ status: "PENDING" })
+        const items = await Leave.find({ status: "PENDING", workspaceId: (req as any).workspaceObjectId })
           .populate("userId", "firstName lastName email name")
           .sort({ createdAt: -1 });
         return res.json(
@@ -694,7 +695,7 @@ r.post(
 
       const year = new Date().getFullYear();
       const policy = await LeavePolicy.getOrCreate();
-      const users = await User.find({ status: { $ne: "INACTIVE" } })
+      const users = await User.find({ status: { $ne: "INACTIVE" }, workspaceId: (req as any).workspaceObjectId })
         .select("_id dateOfJoining")
         .lean();
 
