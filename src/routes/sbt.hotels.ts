@@ -479,7 +479,7 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       });
     }
 
-    const { BookingCode } = req.body;
+    const { BookingCode, searchPrice } = req.body;
     if (!BookingCode) return res.status(400).json({ error: "BookingCode required" });
 
     const tboPayload = { BookingCode };
@@ -495,9 +495,19 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
         body: JSON.stringify(tboPayload),
       }
     );
-    const data = await tboRes.json();
+    const data = (await tboRes.json()) as any;
     logTBOCall({ method: "HotelPreBook", traceId: BookingCode.split("!TB!")[4] || "hotel-prebook", request: tboPayload, response: data, durationMs: Date.now() - t0 });
-    res.json(data);
+
+    // Compare PreBook NetAmount against the search price the user saw
+    const prebookHotel = data?.HotelResult?.[0] || data?.PreBookResult?.HotelResult?.[0];
+    const netAmount = prebookHotel?.Rooms?.[0]?.NetAmount
+      ?? prebookHotel?.Rooms?.[0]?.TotalFare ?? 0;
+    const priceChanged = typeof searchPrice === "number" && searchPrice > 0
+      ? netAmount !== searchPrice
+      : false;
+    const priceDiff = priceChanged ? netAmount - searchPrice : 0;
+
+    res.json({ ...data, priceChanged, priceDiff, netAmount });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "PreBook failed";
     sbtLogger.error("Hotel prebook failed", { error: msg });
@@ -609,8 +619,8 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
     const mapGuest = (g: any) => ({
       Title: g.Title || "Mr",
-      FirstName: g.FirstName,
-      LastName: g.LastName,
+      FirstName: g.FirstName?.substring(0, 25),
+      LastName: g.LastName?.substring(0, 25),
       MiddleName: "",
       Phoneno: g.Phone || "",
       Email: g.Email || "",
@@ -629,65 +639,184 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         }))
       : [{ HotelPassenger: (Guests || []).map(mapGuest) }];
 
+    const clientRef = `PLM-${Date.now()}`;
     const tboPayload = {
       EndUserIp: UserIp,
       BookingCode,
-      ClientReferenceId: `PLM-${Date.now()}`,
+      ClientReferenceId: clientRef,
       GuestNationality,
       IsVoucherBooking: true,
       RequestedBookingMode: 5,
       NetAmount,
       HotelRoomsDetails,
     };
-    const t0 = Date.now();
-    const tboRes = await fetch(
-      "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: hotelAuthHeader(),
-        },
-        body: JSON.stringify(tboPayload),
-      }
-    );
-    const data = (await tboRes.json()) as any;
-    const bookTraceId = data?.BookResult?.TraceId || BookingCode.split("!TB!")[4] || "hotel-book";
-    logTBOCall({ method: "HotelBook", traceId: bookTraceId, request: tboPayload, response: data, durationMs: Date.now() - t0 });
 
-    const result = data?.BookResult || data;
-    res.json({
-      ok: true,
-      BookingId: result?.BookingId ?? "",
-      ConfirmationNo: result?.ConfirmationNo ?? "",
-      BookingRefNo: result?.BookingRefNo ?? "",
-      HotelBookingStatus: result?.HotelBookingStatus ?? result?.BookingStatus ?? "",
-      PaymentId,
-      raw: data,  // Full TBO BookHotel response for debugging & backfill
-    });
-
-    // Fire-and-forget: generate hotel voucher
-    const tboBookingId = Number(result?.BookingId);
-    if (tboBookingId) {
-      generateHotelVoucher(tboBookingId)
-        .then(async (voucherRes) => {
-          // Will be linked to saved booking later via bookingId field
-          try {
-            await SBTHotelBooking.findOneAndUpdate(
-              { bookingId: String(tboBookingId) },
-              {
-                tboVoucherData: voucherRes,
-                voucherStatus: voucherRes?.Response?.ResponseStatus === 1
-                  ? "GENERATED" : "FAILED",
-              }
-            );
-          } catch { /* silent */ }
-        })
-        .catch(() => {});
+    // Helper: call GetBookingDetail to verify actual booking status
+    async function verifyBookingStatus(bookingId: number): Promise<any> {
+      const detailPayload = { EndUserIp: "1.1.1.1", BookingId: bookingId };
+      const dt0 = Date.now();
+      const detailRes = await fetch(
+        "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: hotelAuthHeader(),
+          },
+          body: JSON.stringify(detailPayload),
+        }
+      );
+      const detailData = (await detailRes.json()) as any;
+      logTBOCall({ method: "HotelGetBookingDetail", traceId: `hotel-book-verify-${bookingId}`, request: detailPayload, response: detailData, durationMs: Date.now() - dt0 });
+      return detailData?.GetBookingDetailResult || detailData?.BookResult || detailData;
     }
 
-    sbtLogger.info("Hotel booking TBO response stored", {
-      BookingId: result?.BookingId, userId: req.user?.id,
+    // Helper: send success response and fire-and-forget voucher generation
+    function sendSuccessAndVoucher(result: any, data: any) {
+      res.json({
+        ok: true,
+        BookingId: result?.BookingId ?? "",
+        ConfirmationNo: result?.ConfirmationNo ?? "",
+        BookingRefNo: result?.BookingRefNo ?? "",
+        HotelBookingStatus: result?.HotelBookingStatus ?? result?.BookingStatus ?? "",
+        PaymentId,
+        raw: data,
+      });
+
+      const tboBookingId = Number(result?.BookingId);
+      if (tboBookingId) {
+        generateHotelVoucher(tboBookingId)
+          .then(async (voucherRes) => {
+            try {
+              await SBTHotelBooking.findOneAndUpdate(
+                { bookingId: String(tboBookingId) },
+                {
+                  tboVoucherData: voucherRes,
+                  voucherStatus: voucherRes?.Response?.ResponseStatus === 1
+                    ? "GENERATED" : "FAILED",
+                }
+              );
+            } catch { /* silent */ }
+          })
+          .catch(() => {});
+      }
+
+      sbtLogger.info("Hotel booking TBO response stored", {
+        BookingId: result?.BookingId, userId: req.user?.id,
+      });
+    }
+
+    const t0 = Date.now();
+    let data: any;
+    let bookTimedOut = false;
+
+    try {
+      const bookController = new AbortController();
+      const bookTimer = setTimeout(() => bookController.abort(), 90_000);
+      try {
+        const tboRes = await fetch(
+          "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: hotelAuthHeader(),
+            },
+            body: JSON.stringify(tboPayload),
+            signal: bookController.signal,
+          }
+        );
+        data = (await tboRes.json()) as any;
+      } finally {
+        clearTimeout(bookTimer);
+      }
+    } catch (bookErr: any) {
+      const isTimeout = bookErr?.name === "AbortError";
+      bookTimedOut = true;
+      sbtLogger.warn("TBO Hotel Book call failed, verifying via GetBookingDetail", {
+        userId: req.user?.id, isTimeout, error: bookErr?.message, clientRef,
+      });
+      logTBOCall({ method: "HotelBook", traceId: `hotel-book-${clientRef}`, request: tboPayload, response: { error: bookErr?.message, isTimeout }, durationMs: Date.now() - t0 });
+    }
+
+    // Happy path: Book call succeeded with a response
+    if (data && !bookTimedOut) {
+      const bookTraceId = data?.BookResult?.TraceId || BookingCode.split("!TB!")[4] || "hotel-book";
+      logTBOCall({ method: "HotelBook", traceId: bookTraceId, request: tboPayload, response: data, durationMs: Date.now() - t0 });
+
+      const result = data?.BookResult || data;
+      const bookingId = Number(result?.BookingId);
+      const status = (result?.HotelBookingStatus || result?.BookingStatus || "").toLowerCase();
+
+      // If TBO returned a BookingId but status is unclear, verify
+      if (bookingId && status !== "confirmed" && status !== "vouchered") {
+        try {
+          const verified = await verifyBookingStatus(bookingId);
+          const verifiedStatus = (verified?.HotelBookingStatus || verified?.BookingStatus || "").toLowerCase();
+          if (verifiedStatus === "confirmed" || verifiedStatus === "vouchered") {
+            return sendSuccessAndVoucher(verified, data);
+          }
+        } catch { /* fall through to return original result */ }
+      }
+
+      return sendSuccessAndVoucher(result, data);
+    }
+
+    // Timeout/error path: verify booking status via GetBookingDetail
+    // TBO may have processed the booking despite the timeout
+    // We don't have a BookingId yet, so we need to search by ClientReferenceId
+    // Unfortunately GetBookingDetail requires BookingId, so we check if the
+    // error response contained a partial BookingId
+    const partialBookingId = Number(data?.BookResult?.BookingId || data?.BookingId || 0);
+
+    if (partialBookingId) {
+      try {
+        const verified = await verifyBookingStatus(partialBookingId);
+        const verifiedStatus = (verified?.HotelBookingStatus || verified?.BookingStatus || "").toLowerCase();
+
+        if (verifiedStatus === "confirmed" || verifiedStatus === "vouchered") {
+          sbtLogger.info("Hotel booking confirmed via GetBookingDetail after timeout", {
+            BookingId: partialBookingId, userId: req.user?.id,
+          });
+          return sendSuccessAndVoucher(verified, { recovered: true, original: data });
+        }
+
+        if (verifiedStatus === "failed" || verifiedStatus === "cancelled") {
+          return res.status(502).json({
+            ok: false,
+            error: `Booking ${verifiedStatus} — ${verified?.FailureReason || "TBO did not confirm the reservation"}`,
+            HotelBookingStatus: verifiedStatus,
+            BookingId: partialBookingId,
+          });
+        }
+
+        // Status is pending or unknown
+        return res.status(202).json({
+          ok: false,
+          status: "BOOKING_UNCERTAIN",
+          error: "Booking status is uncertain — please contact support",
+          HotelBookingStatus: verifiedStatus || "unknown",
+          BookingId: partialBookingId,
+        });
+      } catch (verifyErr: any) {
+        sbtLogger.error("GetBookingDetail also failed after Book timeout", {
+          BookingId: partialBookingId, userId: req.user?.id,
+          error: verifyErr?.message,
+        });
+        return res.status(202).json({
+          ok: false,
+          status: "BOOKING_UNCERTAIN",
+          error: "Booking status could not be verified — please contact support",
+          BookingId: partialBookingId,
+        });
+      }
+    }
+
+    // No BookingId at all — booking likely never reached TBO
+    return res.status(202).json({
+      ok: false,
+      status: "BOOKING_UNCERTAIN",
+      error: "Booking timed out and status could not be verified — please contact support",
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Hotel booking failed";
@@ -1098,12 +1227,15 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
       return res.status(400).json({ error: "Already cancelled" });
 
     // Call TBO Cancel with shared token (token-based auth)
+    const tboBookingId = Number(doc.bookingId) || 0;
+    let cancelSucceeded = false;
+
     try {
       const token = await getTBOToken();
       const cancelPayload = {
         EndUserIp: req.body.UserIp || "1.1.1.1",
         TokenId: token,
-        BookingId: Number(doc.bookingId) || 0,
+        BookingId: tboBookingId,
         RequestType: 2, // actual cancellation
       };
       const t0 = Date.now();
@@ -1115,10 +1247,68 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
           body: JSON.stringify(cancelPayload),
         }
       );
-      const cancelData = await cancelRes.json();
+      const cancelData = await cancelRes.json() as any;
       logTBOCall({ method: "HotelCancel", traceId: `hotel-cancel-${doc.bookingId}`, request: cancelPayload, response: cancelData, durationMs: Date.now() - t0 });
+
+      const cancelStatus = (cancelData?.ChangeRequestStatus ?? cancelData?.Status ?? "").toString().toLowerCase();
+      if (cancelStatus === "3" || cancelStatus === "cancelled" || cancelData?.ChangeRequestId) {
+        cancelSucceeded = true;
+      }
     } catch (e) {
-      sbtLogger.warn("TBO hotel cancel call failed", { bookingId: doc.bookingId, error: e instanceof Error ? e.message : String(e) });
+      sbtLogger.warn("TBO hotel cancel call failed, verifying via GetBookingDetail", { bookingId: doc.bookingId, error: e instanceof Error ? e.message : String(e) });
+    }
+
+    // On cancel failure/timeout, verify actual status via GetBookingDetail
+    if (!cancelSucceeded) {
+      try {
+        const detailPayload = { EndUserIp: "1.1.1.1", BookingId: tboBookingId };
+        const t0 = Date.now();
+        const detailRes = await fetch(
+          "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: hotelAuthHeader(),
+            },
+            body: JSON.stringify(detailPayload),
+          }
+        );
+        const detailData = (await detailRes.json()) as any;
+        logTBOCall({ method: "HotelGetBookingDetail", traceId: `hotel-cancel-verify-${doc.bookingId}`, request: detailPayload, response: detailData, durationMs: Date.now() - t0 });
+
+        const result = detailData?.GetBookingDetailResult || detailData?.BookResult || detailData;
+        const tboStatus = (result?.HotelBookingStatus || result?.BookingStatus || "").toLowerCase();
+
+        if (tboStatus === "cancelled") {
+          cancelSucceeded = true;
+        } else {
+          sbtLogger.warn("TBO GetBookingDetail shows booking NOT cancelled after cancel attempt", {
+            bookingId: doc.bookingId,
+            tboStatus,
+          });
+        }
+      } catch (e2) {
+        sbtLogger.error("GetBookingDetail also failed after cancel failure — marking CANCEL_PENDING for ops review", {
+          bookingId: doc.bookingId,
+          error: e2 instanceof Error ? e2.message : String(e2),
+        });
+        doc.status = "CANCEL_PENDING";
+        await doc.save();
+        return res.status(202).json({
+          ok: false,
+          status: "CANCEL_PENDING",
+          error: "Cancellation could not be verified — ops team has been alerted",
+        });
+      }
+    }
+
+    if (!cancelSucceeded) {
+      return res.status(409).json({
+        ok: false,
+        status: doc.status,
+        error: "TBO did not confirm cancellation — booking remains active",
+      });
     }
 
     doc.status = "CANCELLED";
