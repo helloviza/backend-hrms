@@ -132,9 +132,6 @@ const FLIGHT_BASE =
   process.env.TBO_FLIGHT_BASE_URL ||
   "http://api.tektravels.com/BookingEngineService_Air/AirService.svc/rest";
 
-const FLIGHT_BOOK_BASE =
-  process.env.TBO_FLIGHT_BOOK_BASE_URL ||
-  "http://api.tektravels.com/BookingEngineService_AirBook/AirService.svc/rest";
 
 const TIMEOUT = Number(process.env.TBO_HTTP_TIMEOUT_MS || 300_000);
 
@@ -643,12 +640,12 @@ export async function bookFlight(params: {
     TraceId: params.TraceId,
     ResultIndex: params.ResultIndex,
     Passengers: sanitizedPassengers,
-    IsPriceChangedAccepted: false,
+    IsPriceChangeAccepted: false,
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
 
-  return post("/Book", payload, false, FLIGHT_BOOK_BASE);
+  return post("/Book", payload, false, FLIGHT_BASE);
 }
 
 export async function ticketFlight(params: {
@@ -666,14 +663,14 @@ export async function ticketFlight(params: {
     BookingId: params.BookingId,
   };
   // GDS Ticket requires only these 5 fields — NO Passengers array
-  const gdsResult = await post("/Ticket", gdsPayload, false, FLIGHT_BOOK_BASE) as any;
+  const gdsResult = await post("/Ticket", gdsPayload, false, FLIGHT_BASE) as any;
 
-  // Auto-retry with IsPriceChangedAccepted if TBO signals price changed
+  // Auto-retry with IsPriceChangeAccepted if TBO signals price changed
   const gdsChanged = gdsResult?.Response?.IsPriceChanged === true
     || gdsResult?.Response?.Response?.IsPriceChanged === true;
   if (gdsChanged) {
-    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangedAccepted=true");
-    return post("/Ticket", { ...gdsPayload, IsPriceChangedAccepted: true }, false, FLIGHT_BOOK_BASE);
+    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangeAccepted=true");
+    return post("/Ticket", { ...gdsPayload, IsPriceChangeAccepted: true }, false, FLIGHT_BASE);
   }
   return gdsResult;
 }
@@ -795,6 +792,43 @@ function sanitizeSeatDynamic(seats: any[]): any[] {
   return result;
 }
 
+function buildNoMealPlaceholder(ref: any): object {
+  return {
+    AirlineCode: ref?.AirlineCode || "",
+    FlightNumber: ref?.FlightNumber || "",
+    WayType: ref?.WayType ?? 2,
+    Code: "NoMeal",
+    Description: 2,
+    AirlineDescription: "",
+    Quantity: 0,
+    Currency: "INR",
+    Price: 0,
+    Origin: ref?.Origin || "",
+    Destination: ref?.Destination || "",
+  };
+}
+
+function buildNoSeatPlaceholder(ref: any): object {
+  return {
+    AirlineCode: ref?.AirlineCode || "",
+    FlightNumber: ref?.FlightNumber || "",
+    CraftType: ref?.CraftType || "",
+    Origin: ref?.Origin || "",
+    Destination: ref?.Destination || "",
+    AvailablityType: 0,
+    Description: 2,
+    Code: "NoSeat",
+    RowNo: "0",
+    SeatNo: null,
+    SeatType: 0,
+    SeatWayType: ref?.WayType ?? 2,
+    Compartment: 0,
+    Deck: 0,
+    Currency: "INR",
+    Price: 0,
+  };
+}
+
 export async function ticketLCC(params: {
   TraceId: string;
   ResultIndex: string;
@@ -807,7 +841,7 @@ export async function ticketLCC(params: {
       PassportNo?: string;
     };
   }>;
-  IsPriceChangedAccepted?: boolean;
+  IsPriceChangeAccepted?: boolean;
   isNDC?: boolean;
   isInternational?: boolean;
   airlineCode?: string;
@@ -862,7 +896,6 @@ export async function ticketLCC(params: {
       })(),
       PassportNo: p.PassportNo || "",
       PassportExpiry: sanitizePassportDate(p.PassportExpiry),
-      PassportIssueCountryCode: p.PassportIssueCountryCode || p.passportIssueCountry || "IN",
       ContactNo: sanitizeContactNo(p.ContactNo, p.IsLeadPax),
       Email: ndcMode ? (p.Email || lccLeadEmail) : (p.Email || ""),
       IsLeadPax: p.IsLeadPax ?? false,
@@ -925,46 +958,57 @@ export async function ticketLCC(params: {
       pax.PassportIssueDate = sanitizePassportDate(p.PassportIssueDate) || "2015-01-01T00:00:00";
     }
 
-    // SSR arrays — strict field sanitization; omit placeholders & empty arrays
     const MEAL_PLACEHOLDERS = ["", "nomeal", "no_meal", "none", "no meal preference"];
-    const BAG_PLACEHOLDERS = ["", "nobaggage", "no baggage", "no_baggage", "no extra baggage"];
-    const SEAT_PLACEHOLDERS = ["", "noseat", "no_seat"];
+    const BAG_PLACEHOLDERS  = ["", "nobaggage", "no baggage", "no_baggage", "no extra baggage"];
 
-    if (Array.isArray(p.MealDynamic) && p.MealDynamic.length > 0) {
-      const validMeals = sanitizeMealDynamic(p.MealDynamic).filter((m: any) =>
-        m.Code &&
-        !MEAL_PLACEHOLDERS.includes(m.Code.toLowerCase()) &&
-        m.AirlineCode &&
-        m.FlightNumber
-      );
-      if (validMeals.length > 0) pax.MealDynamic = validMeals;
-    }
-    // TBO requirement: free baggage (Price:0) must be auto-included for international LCC
-    if (Array.isArray(p.Baggage) && p.Baggage.length > 0) {
-      const validBaggage = sanitizeBaggage(p.Baggage).filter((b: any) =>
-        b.Code &&
-        !BAG_PLACEHOLDERS.includes(b.Code.toLowerCase()) &&
-        b.AirlineCode &&
-        b.FlightNumber &&
-        (isInternational || b.Price > 0 || b.Weight > 0)
-      );
-      if (validBaggage.length > 0) pax.Baggage = validBaggage;
-    } else if (isInternational && Array.isArray(params.FreeBaggage) && params.FreeBaggage.length > 0 && Number(p.PaxType) !== 3) {
-      // Auto-include free baggage from SSR for international LCC when user selected none
-      const freeBags = sanitizeBaggage(params.FreeBaggage).filter((b: any) =>
-        b.Code && b.AirlineCode && b.FlightNumber && b.Price === 0
-      );
-      if (freeBags.length > 0) pax.Baggage = freeBags;
-    }
+    const rawMeals = Array.isArray(p.MealDynamic) ? p.MealDynamic : [];
+    const validMeals = sanitizeMealDynamic(rawMeals).filter((m: any) =>
+      m.Code && !MEAL_PLACEHOLDERS.includes(m.Code.toLowerCase()) && m.AirlineCode && m.FlightNumber
+    );
+    const mealRef = rawMeals[0];
+    pax.MealDynamic = validMeals.length > 0
+      ? validMeals
+      : mealRef ? [buildNoMealPlaceholder(mealRef)] : [];
+
+    // SeatDynamic: nested SegmentSeat → RowSeats → Seats structure (matches working cert PNR OP4U4V)
     if (Array.isArray(p.SeatDynamic) && p.SeatDynamic.length > 0) {
-      const seatDynamic = sanitizeSeatDynamic(p.SeatDynamic);
-      if (seatDynamic.length > 0) pax.SeatDynamic = seatDynamic;
+      pax.SeatDynamic = p.SeatDynamic.map((segSeatObj: any) => ({
+        SegmentSeat: (segSeatObj.SegmentSeat || []).map((seg: any) => ({
+          RowSeats: (seg.RowSeats || []).map((row: any) => ({
+            Seats: (row.Seats || []).map((s: any) => {
+              const rowNo = s.RowNo ?? "";
+              const rawSeatNo = s.SeatNo ?? "";
+              // Combine RowNo + letter if SeatNo is just a letter (e.g. "A" → "12A")
+              const alreadyCombined = rawSeatNo.length > 1 && /\d/.test(rawSeatNo);
+              const seatNo = alreadyCombined ? rawSeatNo : `${rowNo}${rawSeatNo}`;
+              return {
+                AirlineCode: s.AirlineCode ?? "",
+                FlightNumber: s.FlightNumber ?? "",
+                CraftType: s.CraftType ?? "",
+                Origin: s.Origin ?? "",
+                Destination: s.Destination ?? "",
+                AvailablityType: 0,
+                Description: s.Description ?? 2,
+                Code: s.Code ?? "",
+                RowNo: rowNo,
+                SeatNo: seatNo,
+                SeatType: s.SeatType ?? 0,
+                SeatWayType: 1,
+                Compartment: 0,
+                Deck: 0,
+                Currency: s.Currency ?? "INR",
+                Price: Number(s.Price) || 0,
+              };
+            })
+          }))
+        }))
+      }));
     }
-    if (p.SeatPreference !== undefined) {
+
+    if (p.SeatPreference !== undefined && !pax.SeatDynamic) {
       pax.SeatPreference = p.SeatPreference;
     }
 
-    // Infant (PaxType 3) must NOT have any SSR — strip as safety net
     if (Number(p.PaxType) === 3) {
       delete pax.MealDynamic;
       delete pax.Baggage;
@@ -999,26 +1043,14 @@ export async function ticketLCC(params: {
     TraceId: params.TraceId,
     ResultIndex: params.ResultIndex,
     Passengers: sanitizedPassengers,
-    IsPriceChangedAccepted: false,
+    IsPriceChangeAccepted: false,
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
   // Log full ticket payload for debugging TBO issues
-  console.warn("[TBO TICKET FULL PAYLOAD]", JSON.stringify({
-    TraceId: payload.TraceId,
-    TokenId: String(payload.TokenId).substring(0, 8) + "...",
-    ResultIndex: String(payload.ResultIndex).substring(0, 30) + "...",
-    IsPriceChangedAccepted: payload.IsPriceChangedAccepted,
-    passengers: (payload.Passengers as any[]).map((p: any) => ({
-      name: `${p.FirstName} ${p.LastName}`,
-      PaxType: p.PaxType,
-      SeatDynamic: p.SeatDynamic,
-      MealDynamic: p.MealDynamic,
-      Baggage: p.Baggage,
-    })),
-  }));
+  console.warn("[TBO TICKET FULL PAYLOAD]", JSON.stringify(payload, null, 2));
 
-  const lccResult = await post("/Ticket", payload, false, FLIGHT_BOOK_BASE) as any;
+  const lccResult = await post("/Ticket", payload, false, FLIGHT_BASE) as any;
 
   // Log TBO response for debugging
   const respStatus = lccResult?.Response?.ResponseStatus ?? lccResult?.Response?.Response?.ResponseStatus;
@@ -1032,12 +1064,12 @@ export async function ticketLCC(params: {
     }));
   }
 
-  // Auto-retry with IsPriceChangedAccepted if TBO signals price changed
+  // Auto-retry with IsPriceChangeAccepted if TBO signals price changed
   const lccChanged = lccResult?.Response?.IsPriceChanged === true
     || lccResult?.Response?.Response?.IsPriceChanged === true;
   if (lccChanged) {
-    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangedAccepted=true");
-    return post("/Ticket", { ...payload, IsPriceChangedAccepted: true }, false, FLIGHT_BOOK_BASE);
+    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangeAccepted=true");
+    return post("/Ticket", { ...payload, IsPriceChangeAccepted: true }, false, FLIGHT_BASE);
   }
   return lccResult;
 }
@@ -1061,7 +1093,7 @@ export async function getBookingDetails(params: { bookingId: string }) {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
     BookingId: params.bookingId,
-  }, false, FLIGHT_BOOK_BASE);
+  }, false, FLIGHT_BASE);
 }
 
 export async function getBookingDetailsByPNR(params: {
@@ -1076,5 +1108,5 @@ export async function getBookingDetailsByPNR(params: {
     PNR: params.PNR,
     FirstName: params.FirstName,
     LastName: params.LastName || "",
-  }, false, FLIGHT_BOOK_BASE);
+  }, false, FLIGHT_BASE);
 }
