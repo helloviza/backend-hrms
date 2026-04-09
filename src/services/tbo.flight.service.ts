@@ -669,7 +669,6 @@ export async function ticketFlight(params: {
   const gdsChanged = gdsResult?.Response?.IsPriceChanged === true
     || gdsResult?.Response?.Response?.IsPriceChanged === true;
   if (gdsChanged) {
-    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangeAccepted=true");
     return post("/Ticket", { ...gdsPayload, IsPriceChangeAccepted: true }, false, FLIGHT_BASE);
   }
   return gdsResult;
@@ -1047,12 +1046,8 @@ export async function ticketLCC(params: {
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
 
-  // Log full ticket payload for debugging TBO issues
-  console.warn("[TBO TICKET FULL PAYLOAD]", JSON.stringify(payload, null, 2));
-
   const lccResult = await post("/Ticket", payload, false, FLIGHT_BASE) as any;
 
-  // Log TBO response for debugging
   const respStatus = lccResult?.Response?.ResponseStatus ?? lccResult?.Response?.Response?.ResponseStatus;
   const respError = lccResult?.Response?.Error ?? lccResult?.Response?.Response?.Error;
   if (respStatus !== 1) {
@@ -1068,7 +1063,6 @@ export async function ticketLCC(params: {
   const lccChanged = lccResult?.Response?.IsPriceChanged === true
     || lccResult?.Response?.Response?.IsPriceChanged === true;
   if (lccChanged) {
-    console.warn("[TBO TICKET] IsPriceChanged in ticket response — retrying with IsPriceChangeAccepted=true");
     return post("/Ticket", { ...payload, IsPriceChangeAccepted: true }, false, FLIGHT_BASE);
   }
   return lccResult;
