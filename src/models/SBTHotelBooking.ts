@@ -29,7 +29,10 @@ export interface ISBTHotelBooking extends Document {
   currency: string;
   isRefundable: boolean;
   cancelPolicies: unknown[];
-  status: "CONFIRMED" | "CANCELLED" | "FAILED" | "PENDING" | "CANCEL_PENDING";
+  status: "CONFIRMED" | "CANCELLED" | "FAILED" | "PENDING" | "CANCEL_PENDING" | "HELD";
+  isHeld?: boolean;
+  lastVoucherDate?: Date;
+  voucherGeneratedAt?: Date;
   paymentStatus: "paid" | "failed" | "pending";
   paymentId: string;
   razorpayOrderId: string;
@@ -83,9 +86,12 @@ const SBTHotelBookingSchema = new Schema(
     cancelPolicies: { type: [Schema.Types.Mixed], default: [] },
     status: {
       type: String,
-      enum: ["CONFIRMED", "CANCELLED", "FAILED", "PENDING", "CANCEL_PENDING"],
+      enum: ["CONFIRMED", "CANCELLED", "FAILED", "PENDING", "CANCEL_PENDING", "HELD"],
       default: "CONFIRMED",
     },
+    isHeld: { type: Boolean, default: false },
+    lastVoucherDate: { type: Date },
+    voucherGeneratedAt: { type: Date },
     paymentStatus: {
       type: String,
       enum: ["paid", "failed", "pending"],
@@ -123,7 +129,7 @@ function mapStatus(s: string): "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" 
   if (s === "CONFIRMED") return "CONFIRMED";
   if (s === "CANCELLED") return "CANCELLED";
   if (s === "FAILED") return "FAILED";
-  return "PENDING";
+  return "PENDING"; // HELD and unknown map to PENDING in TravelBooking
 }
 
 SBTHotelBookingSchema.post("save", async function (doc: any) {

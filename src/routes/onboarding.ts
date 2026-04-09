@@ -351,7 +351,15 @@ async function syncEmployeeFromOnboarding(
 const S3_REGION = env.AWS_REGION || process.env.AWS_REGION || "ap-south-1";
 const S3_BUCKET = env.S3_BUCKET || process.env.S3_BUCKET;
 const PRESIGN_TTL = Number(env.PRESIGN_TTL || process.env.PRESIGN_TTL || 60);
-const s3 = new S3Client({ region: S3_REGION });
+const s3 = new S3Client({
+  region: S3_REGION,
+  ...(process.env.AWS_ACCESS_KEY_ID && {
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+    },
+  }),
+});
 
 let createPresignedPostFn:
   | undefined
@@ -902,6 +910,7 @@ router.post("/upload/presign", requireAuth, noStore, async (req, res, next) => {
       return res.status(500).json({ message: "S3_BUCKET not configured" });
 
     const { type, kind, filename, contentType, size } = req.body || {};
+    console.log('[S3 PRESIGN] request:', { type, kind, filename, contentType, size });
     if (!type || !kind || !filename || !contentType || typeof size !== "number") {
       return res.status(400).json({ message: "Missing required fields" });
     }
@@ -937,7 +946,14 @@ router.post("/upload/presign", requireAuth, noStore, async (req, res, next) => {
       message:
         "S3 presign helpers not installed. Install '@aws-sdk/s3-presigned-post' or '@aws-sdk/s3-request-presigner'.",
     });
-  } catch (err) {
+  } catch (err: any) {
+    console.error('[S3 UPLOAD ERROR]', {
+      message: err.message,
+      code: err.Code || err.code,
+      statusCode: err.$metadata?.httpStatusCode,
+      bucket: S3_BUCKET,
+      region: S3_REGION,
+    });
     next(err);
   }
 });
