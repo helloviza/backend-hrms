@@ -185,6 +185,9 @@ const CITY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
 const searchCache = new Map<string, { data: unknown; ts: number }>();
 const SEARCH_CACHE_TTL = 5 * 60 * 1000; // 5min
 
+const hotelDetailsCache = new Map<string, { data: any; ts: number }>();
+const DETAILS_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
@@ -613,6 +616,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       Guests,
       UserIp = "1.1.1.1",
       PaymentId,
+      bookingMode = "voucher",
     } = req.body;
 
     if (!BookingCode) return res.status(400).json({ error: "BookingCode required" });
@@ -645,7 +649,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       BookingCode,
       ClientReferenceId: clientRef,
       GuestNationality,
-      IsVoucherBooking: true,
+      IsVoucherBooking: bookingMode !== "hold",
       RequestedBookingMode: 5,
       NetAmount,
       HotelRoomsDetails,
@@ -671,8 +675,11 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       return detailData?.GetBookingDetailResult || detailData?.BookResult || detailData;
     }
 
-    // Helper: send success response and fire-and-forget voucher generation
+    // Helper: send success response and (if not hold) fire-and-forget voucher generation
     function sendSuccessAndVoucher(result: any, data: any) {
+      const isHeld = bookingMode === "hold";
+      const lastVoucherDate = result?.LastVoucherDate ?? null;
+
       res.json({
         ok: true,
         BookingId: result?.BookingId ?? "",
@@ -680,11 +687,13 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         BookingRefNo: result?.BookingRefNo ?? "",
         HotelBookingStatus: result?.HotelBookingStatus ?? result?.BookingStatus ?? "",
         PaymentId,
+        isHeld,
+        lastVoucherDate,
         raw: data,
       });
 
       const tboBookingId = Number(result?.BookingId);
-      if (tboBookingId) {
+      if (tboBookingId && !isHeld) {
         generateHotelVoucher(tboBookingId)
           .then(async (voucherRes) => {
             try {
@@ -702,7 +711,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       }
 
       sbtLogger.info("Hotel booking TBO response stored", {
-        BookingId: result?.BookingId, userId: req.user?.id,
+        BookingId: result?.BookingId, isHeld, userId: req.user?.id,
       });
     }
 
@@ -859,6 +868,49 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
   }
 });
 
+// ─── 6c. POST /bookings/:id/generate-voucher ─────────────────────────────────
+
+router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (req: any, res: any) => {
+  try {
+    const booking = await SBTHotelBooking.findOne({
+      _id: req.params.id,
+      userId: req.user?._id ?? req.user?.id,
+    });
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    if (!booking.isHeld) return res.status(400).json({ error: "Booking is not in held state" });
+
+    if (booking.lastVoucherDate && new Date() > booking.lastVoucherDate) {
+      return res.status(400).json({ error: "Hold period has expired — booking may have been auto-cancelled by the supplier" });
+    }
+
+    const numericId = Number(booking.bookingId);
+    if (!numericId) return res.status(400).json({ error: "Invalid booking ID" });
+
+    const voucherRes = await generateHotelVoucher(numericId);
+    const success = voucherRes?.Response?.ResponseStatus === 1;
+
+    await SBTHotelBooking.findByIdAndUpdate(booking._id, {
+      isHeld: false,
+      voucherGeneratedAt: new Date(),
+      status: success ? "CONFIRMED" : booking.status,
+      tboVoucherData: voucherRes,
+      voucherStatus: success ? "GENERATED" : "FAILED",
+      isVouchered: success,
+    });
+
+    if (!success) {
+      const errMsg = voucherRes?.Response?.Error?.ErrorMessage || "Voucher generation failed at supplier";
+      return res.status(502).json({ error: errMsg, voucherData: voucherRes });
+    }
+
+    sbtLogger.info("Hotel hold booking vouchered", { bookingId: booking.bookingId, userId: req.user?.id });
+    res.json({ ok: true, voucherStatus: "GENERATED", voucherData: voucherRes });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Voucher generation failed";
+    res.status(500).json({ error: msg });
+  }
+});
+
 // ─── 7. POST /bookings/save ──────────────────────────────────────────────────
 
 router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
@@ -907,13 +959,15 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
       currency: b.currency || "INR",
       isRefundable: b.isRefundable ?? false,
       cancelPolicies: b.cancelPolicies || [],
-      status: b.status || "CONFIRMED",
+      status: b.isHeld ? "HELD" : (b.status || "CONFIRMED"),
       failureReason: b.failureReason || "",
       paymentStatus: b.paymentStatus || "paid",
       paymentId: b.paymentId || "",
       razorpayOrderId: b.razorpayOrderId || "",
       razorpayAmount: b.razorpayAmount || 0,
-      isVouchered: b.isVouchered ?? true,
+      isVouchered: b.isHeld ? false : (b.isVouchered ?? true),
+      isHeld: b.isHeld ?? false,
+      lastVoucherDate: b.lastVoucherDate ? new Date(b.lastVoucherDate) : undefined,
       paymentMode: b.paymentMode === "official" ? "official" : "personal",
       raw: b.raw ?? null,
       bookedAt: new Date(),
@@ -1403,9 +1457,12 @@ router.get("/images", async (req: any, res: any) => {
     const imageMap: Record<string, string> = {};
     for (const h of hotels) {
       const code = h.HotelCode || h.TBOHotelCode || "";
-      const imgs: string[] = h.Images || [];
-      if (code && imgs.length > 0) {
-        imageMap[code] = imgs[0];
+      const imgs = h.Images || [];
+      const imageUrls = imgs.map((img: any) =>
+        typeof img === "string" ? img : (img.Url || img.url || "")
+      ).filter(Boolean);
+      if (code && imageUrls.length > 0) {
+        imageMap[code] = imageUrls[0];
       }
     }
 
@@ -1432,25 +1489,132 @@ router.get("/details", async (req: any, res: any) => {
     const hotelCodes = (req.query.hotelCodes as string) || "";
     if (!hotelCodes) return res.status(400).json({ error: "hotelCodes required" });
 
+    // Check cache first (keyed by hotelCodes string)
+    const cached = hotelDetailsCache.get(hotelCodes);
+    if (cached && Date.now() - cached.ts < DETAILS_CACHE_TTL) {
+      return res.json(cached.data);
+    }
+
     const tboPayload = { Hotelcodes: hotelCodes, Language: "en", IsRoomDetailRequired: true };
-    const t0 = Date.now();
-    const tboRes = await fetch(
-      "https://api.tbotechnology.in/TBOHolidays_HotelAPI/HotelDetails",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: hotelStaticAuthHeader(),
-        },
-        body: JSON.stringify(tboPayload),
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    let data: any;
+    try {
+      const t0 = Date.now();
+      const tboRes = await fetch(
+        "https://api.tbotechnology.in/TBOHolidays_HotelAPI/HotelDetails",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: hotelStaticAuthHeader(),
+          },
+          body: JSON.stringify(tboPayload),
+          signal: controller.signal,
+        }
+      );
+      data = await tboRes.json();
+      logTBOCall({ method: "HotelDetails", traceId: `hotel-details-${hotelCodes.split(",")[0]}`, request: tboPayload, response: data, durationMs: Date.now() - t0 });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    // Normalize Images arrays to string URLs
+    const hotelList: any[] = data?.HotelDetails || data?.Hotels || [];
+    for (const h of hotelList) {
+      if (Array.isArray(h.Images)) {
+        h.Images = h.Images.map((img: any) =>
+          typeof img === "string" ? img : (img.Url || img.url || "")
+        ).filter(Boolean);
       }
-    );
-    const data = await tboRes.json();
-    logTBOCall({ method: "HotelDetails", traceId: `hotel-details-${hotelCodes.split(",")[0]}`, request: tboPayload, response: data, durationMs: Date.now() - t0 });
+    }
+
+    hotelDetailsCache.set(hotelCodes, { data, ts: Date.now() });
     res.json(data);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Hotel details failed";
     sbtLogger.error("Hotel details failed", { error: msg });
+    res.status(500).json({ error: msg });
+  }
+});
+
+// ─── 10c. POST /rooms ────────────────────────────────────────────────────────
+
+router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: any, res: any) => {
+  try {
+    const {
+      hotelCode,
+      checkIn,
+      checkOut,
+      adults = 1,
+      children = 0,
+      childrenAges = null,
+      rooms = 1,
+      guestNationality = "IN",
+    } = req.body;
+
+    if (!hotelCode || !checkIn || !checkOut) {
+      return res.status(400).json({ error: "hotelCode, checkIn, checkOut required" });
+    }
+
+    const paxRooms = Array.from({ length: rooms }, () => ({
+      Adults: adults,
+      Children: children,
+      ChildrenAges: childrenAges,
+    }));
+
+    const tboPayload = {
+      CheckIn: checkIn,
+      CheckOut: checkOut,
+      HotelCodes: String(hotelCode),
+      GuestNationality: guestNationality,
+      PaxRooms: paxRooms,
+      ResponseTime: 23,
+      IsDetailedResponse: true,
+      Filters: { Refundable: false, NoOfRooms: 0, MealType: "All" },
+    };
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    let data: any;
+    try {
+      const t0 = Date.now();
+      const tboRes = await fetch("https://affiliate.tektravels.com/HotelAPI/Search", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: hotelAuthHeader(),
+        },
+        body: JSON.stringify(tboPayload),
+        signal: controller.signal,
+      });
+      data = await tboRes.json();
+      logTBOCall({
+        method: "HotelRooms",
+        traceId: `hotel-rooms-${hotelCode}`,
+        request: tboPayload,
+        response: data,
+        durationMs: Date.now() - t0,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const results: any[] = data?.HotelResult || data?.HotelSearchResult?.HotelResults || [];
+    const match = results.find(
+      (h: any) => String(h.HotelCode) === String(hotelCode)
+    );
+
+    if (!match || !match.Rooms?.length) {
+      return res.status(404).json({ error: "No rooms found for the selected hotel and dates" });
+    }
+
+    res.json({ ok: true, rooms: match.Rooms });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Room fetch failed";
+    sbtLogger.error("Hotel rooms fetch failed", { error: msg });
     res.status(500).json({ error: msg });
   }
 });
