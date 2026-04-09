@@ -188,6 +188,47 @@ const SEARCH_CACHE_TTL = 5 * 60 * 1000; // 5min
 const hotelDetailsCache = new Map<string, { data: any; ts: number }>();
 const DETAILS_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
+// ─── Hotel name search index ──────────────────────────────────────────────────
+
+interface HotelIndexEntry extends HotelCodeEntry {
+  CityCode: string;
+}
+const hotelNameIndex: HotelIndexEntry[] = [];
+const hotelIndexedCities = new Set<string>();
+
+const HOTEL_INDEX_CITIES = [
+  { code: "130443", country: "IN" }, // New Delhi
+  { code: "144306", country: "IN" }, // Mumbai
+  { code: "111124", country: "IN" }, // Bengaluru
+  { code: "127343", country: "IN" }, // Chennai
+  { code: "145710", country: "IN" }, // Hyderabad
+];
+
+async function ensureHotelIndexed(cityCode: string, countryCode: string): Promise<void> {
+  if (hotelIndexedCities.has(cityCode)) return;
+  hotelIndexedCities.add(cityCode);
+  try {
+    const hotels = await fetchHotelCodeList(cityCode, countryCode);
+    for (const h of hotels) hotelNameIndex.push({ ...h, CityCode: cityCode });
+  } catch (err) {
+    console.error(`[HOTEL-INDEX] Failed to index city ${cityCode}:`, err instanceof Error ? err.message : String(err));
+    hotelIndexedCities.delete(cityCode);
+  }
+}
+
+/** Resolve a city name → TBO CityId using the already-cached Indian city list. */
+async function resolveCityCode(cityName: string): Promise<string | null> {
+  try {
+    const cities = await fetchCityList("IN");
+    const lc = cityName.toLowerCase();
+    const match = cities.find(c => c.CityName.toLowerCase() === lc)
+      || cities.find(c => c.CityName.toLowerCase().includes(lc));
+    return match?.CityId ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
@@ -222,13 +263,32 @@ async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
   return cities;
 }
 
-// Pre-load Indian cities on startup
+// Pre-load Indian cities and popular hotel names on startup
 (async () => {
   try {
     await fetchCityList("IN");
     sbtLogger.info("Indian city list cached on startup");
+
+    // Fixed codes for top metro cities
+    for (const { code, country } of HOTEL_INDEX_CITIES) {
+      await ensureHotelIndexed(code, country);
+    }
+
+    // Dynamically resolve additional city codes from the cached TBOCityList
+    const additionalCityNames = ["Goa", "Jaipur", "Agra", "Kolkata", "Pune", "Ahmedabad"];
+    for (const cityName of additionalCityNames) {
+      const code = await resolveCityCode(cityName);
+      if (code) {
+        await ensureHotelIndexed(code, "IN");
+      } else {
+        sbtLogger.warn(`[HOTEL-INDEX] Could not resolve CityCode for: ${cityName}`);
+      }
+    }
+
+    console.log('[HOTEL-INDEX] Loaded', hotelNameIndex.length, 'hotels for name search');
+    sbtLogger.info(`Hotel name index built: ${hotelNameIndex.length} hotels`);
   } catch (e) {
-    sbtLogger.warn("Failed to pre-load Indian cities", { error: e instanceof Error ? e.message : String(e) });
+    sbtLogger.warn("Failed to pre-load hotel data", { error: e instanceof Error ? e.message : String(e) });
   }
 })();
 
@@ -280,53 +340,78 @@ router.get("/cities", async (req: any, res: any) => {
   try {
     if (process.env.TBO_ENV === "mock") {
       const q = (req.query.q as string || "").toLowerCase();
-      const matches = MOCK_CITIES.filter(c =>
+      const cityMatches = MOCK_CITIES.filter(c =>
         c.CityName.toLowerCase().includes(q) ||
         c.CountryName.toLowerCase().includes(q)
-      ).slice(0, 15);
-      return res.json({ success: true, cities: matches, source: "mock" });
+      ).slice(0, 10).map(c => ({ type: "city" as const, CityId: c.CityCode, ...c }));
+      return res.json(cityMatches);
     }
 
     const q = ((req.query.q as string) || "").toLowerCase().trim();
     if (!q || q.length < 2) return res.json([]);
 
-    // Search Indian cities first
-    let cities = await fetchCityList("IN");
-    let matches = cities.filter((c) =>
-      c.CityName.toLowerCase().includes(q)
-    );
+    // ── City search (TBO) — failures must not block hotel name results ──────────
+    type CityResult = { type: "city"; CityId: string; CityName: string; CountryCode: string; CountryName: string };
+    let cityResults: CityResult[] = [];
+    try {
+      // Search Indian cities first (uses 24h in-memory cache)
+      const cities = await fetchCityList("IN");
+      let matches = cities.filter((c) => c.CityName.toLowerCase().includes(q));
 
-    // If no Indian results and query is long enough, search a few countries
-    if (!matches.length && q.length > 2) {
-      const countryRes = await fetch(
-        "https://api.tbotechnology.in/TBOHolidays_HotelAPI/CountryList",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: hotelStaticAuthHeader(),
-          },
-          body: "{}",
-        }
-      );
-      const countryData = (await countryRes.json()) as {
-        CountryList?: { Code: string; Name: string }[];
-      };
-      const countries = (countryData?.CountryList || [])
-        .filter((c) => c.Code !== "IN")
-        .slice(0, 5);
-
-      for (const country of countries) {
-        const intlCities = await fetchCityList(country.Code);
-        const intlMatches = intlCities.filter((c) =>
-          c.CityName.toLowerCase().includes(q)
+      // If no Indian results, search a few international countries
+      if (!matches.length && q.length > 2) {
+        const countryRes = await fetch(
+          "https://api.tbotechnology.in/TBOHolidays_HotelAPI/CountryList",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: hotelStaticAuthHeader(),
+            },
+            body: "{}",
+          }
         );
-        matches.push(...intlMatches);
-        if (matches.length >= 10) break;
+        const countryData = (await countryRes.json()) as {
+          CountryList?: { Code: string; Name: string }[];
+        };
+        const countries = (countryData?.CountryList || [])
+          .filter((c) => c.Code !== "IN")
+          .slice(0, 5);
+
+        for (const country of countries) {
+          const intlCities = await fetchCityList(country.Code);
+          const intlMatches = intlCities.filter((c) =>
+            c.CityName.toLowerCase().includes(q)
+          );
+          matches.push(...intlMatches);
+          if (matches.length >= 10) break;
+        }
       }
+
+      cityResults = matches.slice(0, 10).map(c => ({ type: "city" as const, ...c }));
+    } catch (cityErr) {
+      console.error(
+        "[HOTEL-SEARCH] City search failed, returning hotel-only results:",
+        cityErr instanceof Error ? cityErr.message : String(cityErr)
+      );
     }
 
-    res.json(matches.slice(0, 15));
+    // ── Hotel name search — always runs, uses local in-memory index ──────────────
+    const hotelMatches = q.length >= 3
+      ? hotelNameIndex
+          .filter(h => h.HotelName.toLowerCase().includes(q.toLowerCase()))
+          .slice(0, 8)
+          .map(h => ({
+            type: "hotel" as const,
+            HotelCode: h.HotelCode,
+            HotelName: h.HotelName,
+            CityName: h.CityName,
+            CityCode: h.CityCode,
+          }))
+      : [];
+
+
+    res.json([...cityResults, ...hotelMatches]);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "City search failed";
     sbtLogger.error("Hotel city search failed", { error: msg });
@@ -356,24 +441,39 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       Rooms,
       GuestNationality = "IN",
       CountryCode = "IN",
+      HotelCodes: directHotelCodes,
     } = req.body;
 
-    if (!CityCode || !CheckIn || !CheckOut) {
-      return res.status(400).json({ error: "CityCode, CheckIn, CheckOut required" });
+    const directCodes: string[] = Array.isArray(directHotelCodes) ? directHotelCodes : [];
+
+    if (!directCodes.length && !CityCode) {
+      return res.status(400).json({ error: "CityCode or HotelCodes required" });
+    }
+    if (!CheckIn || !CheckOut) {
+      return res.status(400).json({ error: "CheckIn and CheckOut required" });
     }
 
-    // 1. Get hotel code list (includes metadata: name, rating, address)
-    const hotelList = await fetchHotelCodeList(CityCode, CountryCode);
-    if (!hotelList.length) {
-      return res.json({ Hotels: [], SearchId: randomUUID(), CityName });
-    }
-
-    // Build a lookup map: HotelCode → metadata
+    // Build hotel metadata map and collect codes to search
     const hotelMeta = new Map<string, HotelCodeEntry>();
-    for (const h of hotelList) hotelMeta.set(h.HotelCode, h);
+    let allCodes: string[];
+
+    if (directCodes.length) {
+      // Hotel name search: use provided codes directly, pull metadata from index
+      for (const entry of hotelNameIndex) {
+        if (directCodes.includes(entry.HotelCode)) hotelMeta.set(entry.HotelCode, entry);
+      }
+      allCodes = directCodes;
+    } else {
+      // City search: fetch all hotels in the city
+      const hotelList = await fetchHotelCodeList(CityCode, CountryCode);
+      if (!hotelList.length) {
+        return res.json({ Hotels: [], SearchId: randomUUID(), CityName });
+      }
+      for (const h of hotelList) hotelMeta.set(h.HotelCode, h);
+      allCodes = hotelList.map((h) => h.HotelCode);
+    }
 
     // 2. Split hotel codes into chunks of 100
-    const allCodes = hotelList.map((h) => h.HotelCode);
     const chunks = chunk(allCodes, 100);
 
     // 3. Build PaxRooms
@@ -453,6 +553,14 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       return fa - fb;
     });
 
+    // 7. Return clean error if TBO returned no availability
+    if (allResults.length === 0) {
+      return res.status(404).json({
+        message: "No hotels found for selected dates. Please try different dates or destination.",
+        code: "NO_HOTELS_FOUND",
+      });
+    }
+
     const searchId = randomUUID();
     searchCache.set(searchId, { data: allResults, ts: Date.now() });
 
@@ -501,16 +609,18 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
     const data = (await tboRes.json()) as any;
     logTBOCall({ method: "HotelPreBook", traceId: BookingCode.split("!TB!")[4] || "hotel-prebook", request: tboPayload, response: data, durationMs: Date.now() - t0 });
 
-    // Compare PreBook NetAmount against the search price the user saw
     const prebookHotel = data?.HotelResult?.[0] || data?.PreBookResult?.HotelResult?.[0];
-    const netAmount = prebookHotel?.Rooms?.[0]?.NetAmount
-      ?? prebookHotel?.Rooms?.[0]?.TotalFare ?? 0;
+    const room0 = prebookHotel?.Rooms?.[0];
+
+    // Compare PreBook NetAmount against the search price the user saw
+    const netAmount = room0?.NetAmount ?? room0?.TotalFare ?? 0;
+    const recommendedSellingRate = room0?.RecommendedSellingRate ?? null;
     const priceChanged = typeof searchPrice === "number" && searchPrice > 0
       ? netAmount !== searchPrice
       : false;
     const priceDiff = priceChanged ? netAmount - searchPrice : 0;
 
-    res.json({ ...data, priceChanged, priceDiff, netAmount });
+    res.json({ ...data, priceChanged, priceDiff, netAmount, recommendedSellingRate });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "PreBook failed";
     sbtLogger.error("Hotel prebook failed", { error: msg });
@@ -676,12 +786,39 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     }
 
     // Helper: send success response and (if not hold) fire-and-forget voucher generation
-    function sendSuccessAndVoucher(result: any, data: any) {
+    async function sendSuccessAndVoucher(result: any, data: any) {
       const isHeld = bookingMode === "hold";
-      const lastVoucherDate = result?.LastVoucherDate ?? null;
+
+      // For hold bookings: Book response rarely includes LastVoucherDate.
+      // Call GetBookingDetail immediately to retrieve it.
+      if (isHeld && result?.BookingId) {
+        try {
+          const details = await verifyBookingStatus(Number(result.BookingId));
+          const detailVoucherDate =
+            details?.LastVoucherDate ??
+            details?.HotelRoomsDetails?.[0]?.LastVoucherDate ??
+            null;
+          if (detailVoucherDate && !result.LastVoucherDate) {
+            result = { ...result, LastVoucherDate: detailVoucherDate };
+          }
+        } catch (detailErr) {
+          console.warn('[HOLD-BOOK] GetBookingDetail for LastVoucherDate failed:', detailErr);
+        }
+      }
+
+
+      const lastVoucherDate =
+        result?.LastVoucherDate ??
+        result?.LastCancellationDate ??
+        result?.VoucherDate ??
+        null;
+
+      // Invalidate search cache so next search shows fresh availability
+      searchCache.clear();
 
       res.json({
         ok: true,
+        bookingId: String(result?.BookingId ?? ""),
         BookingId: result?.BookingId ?? "",
         ConfirmationNo: result?.ConfirmationNo ?? "",
         BookingRefNo: result?.BookingRefNo ?? "",
@@ -753,9 +890,36 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       const bookTraceId = data?.BookResult?.TraceId || BookingCode.split("!TB!")[4] || "hotel-book";
       logTBOCall({ method: "HotelBook", traceId: bookTraceId, request: tboPayload, response: data, durationMs: Date.now() - t0 });
 
+
       const result = data?.BookResult || data;
       const bookingId = Number(result?.BookingId);
       const status = (result?.HotelBookingStatus || result?.BookingStatus || "").toLowerCase();
+
+      // TBO returns BookingId: 0 and null status when the booking is rejected
+      // (e.g. expired BookingCode, insufficient inventory, session timeout).
+      // Treat this as a hard failure — never surface it as success.
+      if (!bookingId && !status) {
+        const tboError =
+          result?.Error?.ErrorMessage ||
+          data?.BookResult?.Error?.ErrorMessage ||
+          data?.Error?.ErrorMessage ||
+          "TBO rejected the booking (BookingId: 0)";
+        const tboCode =
+          result?.Error?.ErrorCode ??
+          data?.BookResult?.Error?.ErrorCode ??
+          data?.Error?.ErrorCode ??
+          null;
+        sbtLogger.error("Hotel booking rejected by TBO — BookingId: 0", {
+          tboError, tboCode, bookingMode, userId: req.user?.id, BookingCode,
+        });
+        return res.status(502).json({
+          ok: false,
+          error: "Hotel booking failed at supplier",
+          tboError,
+          tboCode,
+          BookingId: 0,
+        });
+      }
 
       // If TBO returned a BookingId but status is unclear, verify
       if (bookingId && status !== "confirmed" && status !== "vouchered") {
@@ -886,8 +1050,52 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
     const numericId = Number(booking.bookingId);
     if (!numericId) return res.status(400).json({ error: "Invalid booking ID" });
 
+    // ── Optional payment before generating voucher ────────────────────
+    const { paymentId, walletPayment } = req.body as { paymentId?: string; walletPayment?: boolean };
+
+    if (walletPayment && req.workspaceObjectId) {
+      // Deduct from agency wallet before calling TBO
+      try {
+        await CustomerWorkspace.findOneAndUpdate(
+          { _id: req.workspaceObjectId },
+          { $inc: { 'sbtOfficialBooking.currentMonthSpend': booking.netAmount ?? 0 } },
+          { runValidators: false },
+        );
+      } catch (walletErr) {
+        sbtLogger.error('[GEN-VOUCHER] Failed to deduct wallet spend', { bookingId: booking.bookingId, error: walletErr });
+      }
+    }
+
+    if (paymentId) {
+      // Save Razorpay payment ID against the booking before generating
+      await SBTHotelBooking.findByIdAndUpdate(booking._id, { razorpayPaymentId: paymentId }).catch(() => {});
+    }
+
     const voucherRes = await generateHotelVoucher(numericId);
-    const success = voucherRes?.Response?.ResponseStatus === 1;
+
+    // ── Detect ErrorCode 2 = genuine agency balance insufficient ─────
+    const gvr = voucherRes?.GenerateVoucherResult;
+    const tboErrorCode = gvr?.Error?.ErrorCode;
+    const tboErrorMsg = gvr?.Error?.ErrorMessage || "";
+    const isBalanceError =
+      tboErrorCode === 2 &&
+      (tboErrorMsg.toLowerCase().includes("balance") ||
+       tboErrorMsg.toLowerCase().includes("insufficient") ||
+       tboErrorMsg.toLowerCase().includes("credit"));
+
+    if (isBalanceError) {
+      console.log('[GEN-VOUCHER] TBO agency balance insufficient', { tboErrorCode, tboErrorMsg });
+      return res.status(402).json({
+        requiresPayment: true,
+        amount: booking.netAmount ?? booking.totalFare ?? 0,
+        bookingId: booking._id,
+        message: "Agency wallet balance insufficient to confirm this booking",
+        code: "PAYMENT_REQUIRED",
+        tboError: tboErrorMsg,
+      });
+    }
+
+    const success = gvr?.ResponseStatus === 1;
 
     await SBTHotelBooking.findByIdAndUpdate(booking._id, {
       isHeld: false,
@@ -899,7 +1107,8 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
     });
 
     if (!success) {
-      const errMsg = voucherRes?.Response?.Error?.ErrorMessage || "Voucher generation failed at supplier";
+      const errMsg = tboErrorMsg || "Voucher generation failed at supplier";
+      console.log('[GEN-VOUCHER] failed — TBO error:', errMsg, '| ResponseStatus:', gvr?.ResponseStatus);
       return res.status(502).json({ error: errMsg, voucherData: voucherRes });
     }
 
@@ -973,8 +1182,8 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
       bookedAt: new Date(),
     });
 
-    // Increment workspace monthly spend for official bookings
-    if (b.paymentMode === "official" && req.workspaceObjectId) {
+    // Increment workspace monthly spend for official bookings — never for hold bookings
+    if (b.paymentMode === "official" && !b.isHeld && req.workspaceObjectId) {
       try {
         await CustomerWorkspace.findOneAndUpdate(
           { _id: req.workspaceObjectId },
