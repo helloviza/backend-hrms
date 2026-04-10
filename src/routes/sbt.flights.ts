@@ -16,6 +16,7 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { sendMail } from "../utils/mailer.js";
 import { clearTBOToken, logoutTBO, getTBOTokenStatus, getAgencyBalance, getTBOToken } from "../services/tbo.auth.service.js";
+import { getMarginConfig, applyMargin, isDomestic } from "../utils/margin.js";
 import { listTBOLogs, readTBOLog, logTBOCall } from "../utils/tboFileLogger.js";
 import {
   searchFlights,
@@ -595,6 +596,48 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
         tboResponse: result?.Response,
       });
     }
+
+    // Apply margin to flight fares (server-side only)
+    const flightMargins = await getMarginConfig();
+    if (flightMargins.enabled) {
+      const originCountry = (req.body as any).originCountry;
+      const destCountry = (req.body as any).destCountry;
+      const isFlightDomestic = isDomestic(originCountry, destCountry);
+      const marginPct = isFlightDomestic
+        ? flightMargins.flight.domestic
+        : flightMargins.flight.international;
+
+      if (marginPct > 0 && result?.Response?.Results) {
+        const applyToFlightArray = (arr: any[]): any[] =>
+          arr.map((flight: any) => {
+            const fare = flight?.Fare;
+            if (!fare) return flight;
+            const netPublished = fare.PublishedFare ?? 0;
+            const netOffered = fare.OfferedFare ?? 0;
+            return {
+              ...flight,
+              Fare: {
+                ...fare,
+                _netPublishedFare: netPublished,
+                _netOfferedFare: netOffered,
+                PublishedFare: applyMargin(netPublished, marginPct),
+                OfferedFare: applyMargin(netOffered, marginPct),
+                _marginPercent: marginPct,
+                _marginAmount: applyMargin(netOffered, marginPct) - netOffered,
+              },
+            };
+          });
+
+        const raw = result.Response.Results;
+        if (Array.isArray(raw[0])) {
+          // Round-trip: [[outbound], [inbound]]
+          result.Response.Results = raw.map((leg: any[]) => applyToFlightArray(leg));
+        } else {
+          result.Response.Results = applyToFlightArray(raw);
+        }
+      }
+    }
+
     res.json(result);
   } catch (err: any) {
     sbtLogger.error("Flight search failed", { userId: req.user?.id, error: err.message });
