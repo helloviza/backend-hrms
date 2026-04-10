@@ -65,6 +65,11 @@ export interface ISBTBooking extends Document {
   ticketingStatus: "NOT_ATTEMPTED" | "TICKETED" | "FAILED" | "TICKET_FAILED" | "PENDING";
   ticketingError?: string;
   raw?: unknown;
+  cancelPolicies?: any[];
+  isRefundable?: boolean;
+  cancellationCharge?: number;
+  refundedAmount?: number;
+  changeRequestId?: string;
   bookedAt: Date;
   cancelledAt?: Date;
   createdAt: Date;
@@ -153,6 +158,11 @@ const SBTBookingSchema = new Schema(
     },
     ticketingError: { type: String, default: "" },
     raw: { type: Schema.Types.Mixed },
+    cancelPolicies: { type: [Schema.Types.Mixed], default: [] },
+    isRefundable: { type: Boolean },
+    cancellationCharge: { type: Number },
+    refundedAmount: { type: Number },
+    changeRequestId: { type: String },
     sbtRequestId: { type: Schema.Types.ObjectId, ref: "SBTRequest", default: null, index: true },
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },

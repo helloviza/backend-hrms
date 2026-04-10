@@ -1117,6 +1117,21 @@ export async function ticketLCC(params: {
   return lccResult;
 }
 
+export async function cancelFlight(params: {
+  BookingId: number | string;
+  PNR: string;
+  Remarks?: string;
+}): Promise<any> {
+  const token = await getTBOToken();
+  return post("/CancelPNR", {
+    EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+    TokenId: token,
+    BookingId: params.BookingId,
+    PNR: params.PNR,
+    Remarks: params.Remarks || "Cancelled by user",
+  }, false, FLIGHT_BASE);
+}
+
 export async function releasePNR(params: {
   BookingId: number;
   PNR: string;
