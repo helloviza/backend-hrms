@@ -8,7 +8,7 @@ build:
       - pnpm install --filter "@plumtrips/hrms-backend..." --frozen-lockfile
       - pnpm --filter "@plumtrips/hrms-backend" build
 run:
-  command: node apps/backend/dist/server.js
+  command: node dist/server.js
   network:
     port: 8080
     env: PORT
