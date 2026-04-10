@@ -1,14 +1,14 @@
 version: 1.0
-runtime: nodejs18
+runtime: nodejs20
 build:
   commands:
     pre-build:
       - npm install -g pnpm
     build:
-      - pnpm install
-      - pnpm run build
+      - pnpm install --filter "@plumtrips/hrms-backend..." --frozen-lockfile
+      - pnpm --filter "@plumtrips/hrms-backend" build
 run:
-  command: node dist/server.js
+  command: node apps/backend/dist/server.js
   network:
     port: 8080
     env: PORT
