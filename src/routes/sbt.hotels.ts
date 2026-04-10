@@ -6,7 +6,6 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import SBTRequest from "../models/SBTRequest.js";
-import { getTBOToken } from "../services/tbo.auth.service.js";
 import { generateHotelVoucher } from "../services/tbo.hotel.service.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
@@ -14,6 +13,8 @@ import { sendMail } from "../utils/mailer.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
+import { getMarginConfig, applyMargin } from "../utils/margin.js";
+import { getTBOToken } from "../services/tbo.auth.service.js";
 
 // ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
 const MOCK_CITIES = [
@@ -564,9 +565,35 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
     const searchId = randomUUID();
     searchCache.set(searchId, { data: allResults, ts: Date.now() });
 
+    // Apply margin to display prices (net prices stay in _net* fields for TBO booking)
+    const margins = await getMarginConfig();
+    let hotelsToSend: any[] = allResults;
+    if (margins.enabled) {
+      const isHotelDomestic = (CountryCode || "IN") === "IN";
+      const marginPct = isHotelDomestic ? margins.hotel.domestic : margins.hotel.international;
+      if (marginPct > 0) {
+        hotelsToSend = allResults.map((hotel: any) => ({
+          ...hotel,
+          Rooms: hotel.Rooms?.map((room: any) => {
+            const net = room.TotalFare ?? 0;
+            const display = applyMargin(net, marginPct);
+            return {
+              ...room,
+              _netTotalFare: net,
+              _netAmount: room.NetAmount ?? net,
+              TotalFare: display,
+              TotalTax: applyMargin(room.TotalTax ?? 0, marginPct),
+              _marginPercent: marginPct,
+              _marginAmount: display - net,
+            };
+          }),
+        }));
+      }
+    }
+
     res.json({
       TraceId: "",
-      Hotels: allResults,
+      Hotels: hotelsToSend,
       SearchId: searchId,
       CityName: CityName || "",
     });
@@ -620,7 +647,30 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       : false;
     const priceDiff = priceChanged ? netAmount - searchPrice : 0;
 
-    res.json({ ...data, priceChanged, priceDiff, netAmount, recommendedSellingRate });
+    // Apply margin to display TotalFare (NetAmount stays original for TBO Book)
+    const prebookMargins = await getMarginConfig();
+    let displayTotalFare = room0?.TotalFare ?? netAmount;
+    let prebookMarginPct = 0;
+    if (prebookMargins.enabled) {
+      // Default to domestic (IN) — caller can pass countryCode in body for international
+      const isHotelDomestic = ((req.body as any).countryCode || "IN") === "IN";
+      prebookMarginPct = isHotelDomestic
+        ? prebookMargins.hotel.domestic
+        : prebookMargins.hotel.international;
+      if (prebookMarginPct > 0) {
+        displayTotalFare = applyMargin(room0?.TotalFare ?? netAmount, prebookMarginPct);
+      }
+    }
+
+    res.json({
+      ...data,
+      priceChanged,
+      priceDiff,
+      netAmount,
+      recommendedSellingRate,
+      displayTotalFare,
+      marginPercent: prebookMarginPct,
+    });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "PreBook failed";
     sbtLogger.error("Hotel prebook failed", { error: msg });
@@ -721,13 +771,21 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
   try {
     const {
       BookingCode,
-      GuestNationality = "IN",
+      GuestNationality: _reqNationality,
       NetAmount,
       Guests,
       UserIp = "1.1.1.1",
       PaymentId,
       bookingMode = "voucher",
     } = req.body;
+
+    // Derive GuestNationality: lead guest in HotelRoomsDetails > explicit field > "IN"
+    const _allGuests: any[] =
+      (req.body.HotelRoomsDetails as any[] | undefined)?.flatMap((r: any) => r.Guests || []) ??
+      (Guests as any[] | undefined) ??
+      [];
+    const _leadGuest = _allGuests.find((g: any) => g.LeadPassenger) ?? _allGuests[0];
+    const GuestNationality: string = _leadGuest?.Nationality || _reqNationality || "IN";
 
     if (!BookingCode) return res.status(400).json({ error: "BookingCode required" });
 
@@ -745,6 +803,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       PassportIssueDate: g.PassportIssueDate || "0001-01-01T00:00:00",
       PassportExpDate: g.PassportExpDate || "0001-01-01T00:00:00",
       PAN: g.PAN || "",
+      CorporatePAN: g.CorporatePAN || "",
     });
 
     const HotelRoomsDetails = req.body.HotelRoomsDetails
@@ -753,8 +812,10 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         }))
       : [{ HotelPassenger: (Guests || []).map(mapGuest) }];
 
+    const { DepartureCity, DepartureDate, FlightNumber } = req.body as any;
+
     const clientRef = `PLM-${Date.now()}`;
-    const tboPayload = {
+    const tboPayload: Record<string, unknown> = {
       EndUserIp: UserIp,
       BookingCode,
       ClientReferenceId: clientRef,
@@ -764,6 +825,11 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       NetAmount,
       HotelRoomsDetails,
     };
+    if (DepartureCity) {
+      tboPayload.DepartureCity = DepartureCity;
+      tboPayload.DepartureDate = DepartureDate || "";
+      tboPayload.FlightNumber = FlightNumber || "";
+    }
 
     // Helper: call GetBookingDetail to verify actual booking status
     async function verifyBookingStatus(bookingId: number): Promise<any> {
@@ -1479,6 +1545,72 @@ router.post("/bookings/:id/mark-failed", requireAdmin, async (req: any, res: any
   }
 });
 
+// ─── 10a. GET /bookings/:id/cancel-preview ──────────────────────────────────
+
+router.get("/bookings/:id/cancel-preview", requireSBT, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id;
+    const booking = await SBTHotelBooking.findOne({ _id: req.params.id, userId });
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const today = new Date();
+    const totalFare = booking.totalFare || 0;
+    const policies = (booking.cancelPolicies || []) as any[];
+
+    let cancellationCharge = 0;
+    let chargePercent = 0;
+    let isFreeCancel = true;
+    let policyApplied = "Free cancellation";
+
+    // Find the latest policy whose FromDate is on or before today
+    const sortedPolicies = [...policies].sort(
+      (a, b) => new Date(b.FromDate).getTime() - new Date(a.FromDate).getTime()
+    );
+
+    let applicablePolicy: any = null;
+    for (const policy of sortedPolicies) {
+      if (new Date(policy.FromDate) <= today) {
+        applicablePolicy = policy;
+        break;
+      }
+    }
+
+    if (applicablePolicy) {
+      if (!applicablePolicy.CancellationCharge || applicablePolicy.CancellationCharge === 0) {
+        isFreeCancel = true;
+        cancellationCharge = 0;
+        policyApplied = "Free cancellation — no charges apply";
+      } else if (applicablePolicy.ChargeType === "Percentage") {
+        chargePercent = applicablePolicy.CancellationCharge;
+        cancellationCharge = Math.round((chargePercent / 100) * totalFare);
+        isFreeCancel = false;
+        policyApplied = `${chargePercent}% cancellation charge applies from ${new Date(applicablePolicy.FromDate).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}`;
+      } else {
+        // Fixed charge
+        cancellationCharge = applicablePolicy.CancellationCharge;
+        isFreeCancel = cancellationCharge === 0;
+        policyApplied = `Fixed charge of ₹${cancellationCharge.toLocaleString("en-IN")} applies`;
+      }
+    }
+
+    const refundAmount = Math.max(0, totalFare - cancellationCharge);
+
+    return res.json({
+      cancellationCharge,
+      refundAmount,
+      totalFare,
+      chargePercent,
+      isFreeCancel,
+      policyApplied,
+      isHeld: booking.isHeld || false,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Preview failed";
+    sbtLogger.error("Hotel cancel-preview error", { bookingId: req.params.id, error: msg });
+    res.status(500).json({ error: msg });
+  }
+});
+
 // ─── 10. POST /bookings/:id/cancel ──────────────────────────────────────────
 
 router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
@@ -1487,127 +1619,158 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     const doc = await SBTHotelBooking.findOne({ _id: req.params.id, userId });
     if (!doc) return res.status(404).json({ error: "Booking not found" });
     if (doc.status === "CANCELLED")
-      return res.status(400).json({ error: "Already cancelled" });
+      return res.status(409).json({ error: "Booking already cancelled" });
 
-    // Call TBO Cancel with shared token (token-based auth)
-    const tboBookingId = Number(doc.bookingId) || 0;
-    let cancelSucceeded = false;
+    const numericBookingId = Number(doc.bookingId);
+    const tokenId = await getTBOToken();
+    const endUserIp = process.env.TBO_EndUserIp || "1.1.1.1";
 
-    try {
-      const token = await getTBOToken();
-      const cancelPayload = {
-        EndUserIp: req.body.UserIp || "1.1.1.1",
-        TokenId: token,
-        BookingId: tboBookingId,
-        RequestType: 2, // actual cancellation
-      };
-      const t0 = Date.now();
-      const cancelRes = await fetch(
-        "https://hotelbe.tektravels.com/hotelservice.svc/rest/cancel/",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(cancelPayload),
-        }
-      );
-      const cancelData = await cancelRes.json() as any;
-      logTBOCall({ method: "HotelCancel", traceId: `hotel-cancel-${doc.bookingId}`, request: cancelPayload, response: cancelData, durationMs: Date.now() - t0 });
-
-      const cancelStatus = (cancelData?.ChangeRequestStatus ?? cancelData?.Status ?? "").toString().toLowerCase();
-      if (cancelStatus === "3" || cancelStatus === "cancelled" || cancelData?.ChangeRequestId) {
-        cancelSucceeded = true;
+    // ── Step 1: SendChangeRequest ────────────────────────────────────────────
+    const changeReqPayload = {
+      BookingMode: 5,
+      RequestType: 4,
+      Remarks: "Cancelled by user",
+      BookingId: numericBookingId,
+      EndUserIp: endUserIp,
+      TokenId: tokenId,
+    };
+    const t0 = Date.now();
+    const changeRes = await fetch(
+      "https://HotelBE.tektravels.com/hotelservice.svc/rest/SendChangeRequest",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: hotelAuthHeader(),
+        },
+        body: JSON.stringify(changeReqPayload),
       }
-    } catch (e) {
-      sbtLogger.warn("TBO hotel cancel call failed, verifying via GetBookingDetail", { bookingId: doc.bookingId, error: e instanceof Error ? e.message : String(e) });
+    );
+
+    const changeRawText = await changeRes.text();
+    console.log("[CANCEL] SendChangeRequest response:", changeRawText.substring(0, 500));
+
+    let changeData: any;
+    try {
+      changeData = JSON.parse(changeRawText);
+    } catch {
+      throw new Error(`TBO SendChangeRequest returned non-JSON: ${changeRawText.substring(0, 200)}`);
+    }
+    logTBOCall({ method: "HotelSendChangeRequest", traceId: `hotel-cancel-${doc.bookingId}`, request: changeReqPayload, response: changeData, durationMs: Date.now() - t0 });
+
+    const changeResult = changeData?.HotelChangeRequestResult;
+    if (!changeResult || changeResult.ResponseStatus !== 1) {
+      throw new Error(`TBO cancel failed: ${changeResult?.Error?.ErrorMessage || "Unknown error"}`);
     }
 
-    // On cancel failure/timeout, verify actual status via GetBookingDetail
-    if (!cancelSucceeded) {
-      try {
-        const detailPayload = { EndUserIp: "1.1.1.1", BookingId: tboBookingId };
-        const t0 = Date.now();
-        const detailRes = await fetch(
-          "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+    const changeRequestId: string = changeResult.ChangeRequestId;
+    let cancelStatus: number = changeResult.ChangeRequestStatus;
+    let cancellationCharge = 0;
+    let refundedAmount = 0;
+
+    // ── Step 2: Poll GetChangeRequestStatus if pending/in-progress ───────────
+    if (cancelStatus === 1 || cancelStatus === 2) {
+      for (let i = 0; i < 3; i++) {
+        await new Promise<void>((r) => setTimeout(r, 2000));
+
+        const statusPayload = {
+          BookingMode: 5,
+          ChangeRequestId: changeRequestId,
+          EndUserIp: endUserIp,
+          TokenId: tokenId,
+        };
+        const t1 = Date.now();
+        const statusRes = await fetch(
+          "https://HotelBE.tektravels.com/hotelservice.svc/rest/GetChangeRequestStatus",
           {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
               Authorization: hotelAuthHeader(),
             },
-            body: JSON.stringify(detailPayload),
+            body: JSON.stringify(statusPayload),
           }
         );
-        const detailData = (await detailRes.json()) as any;
-        logTBOCall({ method: "HotelGetBookingDetail", traceId: `hotel-cancel-verify-${doc.bookingId}`, request: detailPayload, response: detailData, durationMs: Date.now() - t0 });
 
-        const result = detailData?.GetBookingDetailResult || detailData?.BookResult || detailData;
-        const tboStatus = (result?.HotelBookingStatus || result?.BookingStatus || "").toLowerCase();
+        const statusData = (await statusRes.json()) as any;
+        logTBOCall({ method: "HotelGetChangeRequestStatus", traceId: `hotel-cancel-status-${doc.bookingId}-${i}`, request: statusPayload, response: statusData, durationMs: Date.now() - t1 });
 
-        if (tboStatus === "cancelled") {
-          cancelSucceeded = true;
-        } else {
-          sbtLogger.warn("TBO GetBookingDetail shows booking NOT cancelled after cancel attempt", {
-            bookingId: doc.bookingId,
-            tboStatus,
-          });
-        }
-      } catch (e2) {
-        sbtLogger.error("GetBookingDetail also failed after cancel failure — marking CANCEL_PENDING for ops review", {
-          bookingId: doc.bookingId,
-          error: e2 instanceof Error ? e2.message : String(e2),
-        });
-        doc.status = "CANCEL_PENDING";
-        await doc.save();
-        return res.status(202).json({
-          ok: false,
-          status: "CANCEL_PENDING",
-          error: "Cancellation could not be verified — ops team has been alerted",
-        });
+        const statusResult = statusData?.HotelChangeRequestStatusResult;
+        cancelStatus = statusResult?.ChangeRequestStatus;
+        cancellationCharge = statusResult?.CancellationCharge || 0;
+        refundedAmount = statusResult?.RefundedAmount || 0;
+
+        console.log("[CANCEL] Status poll:", { attempt: i + 1, cancelStatus, cancellationCharge, refundedAmount });
+
+        if (cancelStatus === 3 || cancelStatus === 4) break;
       }
     }
 
-    if (!cancelSucceeded) {
-      return res.status(409).json({
-        ok: false,
-        status: doc.status,
-        error: "TBO did not confirm cancellation — booking remains active",
+    // ── Evaluate final status ────────────────────────────────────────────────
+    if (cancelStatus === 3) {
+      // Processed — successfully cancelled
+      doc.status = "CANCELLED";
+      doc.cancelledAt = new Date();
+      doc.cancellationCharge = cancellationCharge;
+      doc.refundedAmount = refundedAmount;
+      doc.changeRequestId = changeRequestId;
+      await doc.save();
+
+      sbtLogger.info("Hotel booking cancelled", {
+        module: "sbt",
+        bookingId: doc.bookingId,
+        changeRequestId,
+        cancellationCharge,
+        refundedAmount,
+        userId,
+      });
+
+      // Decrement spend if official booking in same calendar month
+      if ((doc as any).paymentMode === "official" && (doc as any).workspaceId) {
+        const bookingMonth = doc.createdAt.toISOString().slice(0, 7);
+        const currentMonth = new Date().toISOString().slice(0, 7);
+        if (bookingMonth === currentMonth) {
+          try {
+            await CustomerWorkspace.findOneAndUpdate(
+              { _id: (doc as any).workspaceId },
+              [{ $set: {
+                "sbtOfficialBooking.currentMonthSpend": {
+                  $max: [0, { $subtract: ["$sbtOfficialBooking.currentMonthSpend", (doc as any).totalFare || 0] }],
+                },
+              }}],
+              { runValidators: false }
+            );
+            sbtLogger.info("[OfficialBooking] Spend reversed on cancellation", {
+              bookingId: doc._id,
+              amount: (doc as any).totalFare,
+              workspaceId: (doc as any).workspaceId,
+            });
+          } catch (err) {
+            sbtLogger.error("[OfficialBooking] Failed to reverse spend on cancellation", {
+              bookingId: doc._id,
+              error: err,
+            });
+          }
+        }
+      }
+
+      return res.json({ ok: true, cancellationCharge, refundedAmount, changeRequestId });
+    } else if (cancelStatus === 4) {
+      // Rejected by TBO
+      return res.status(409).json({ error: "TBO rejected the cancellation request", changeRequestId });
+    } else {
+      // Still pending after polling — mark CANCEL_PENDING for ops review
+      doc.status = "CANCEL_PENDING";
+      doc.changeRequestId = changeRequestId;
+      await doc.save();
+
+      return res.status(202).json({
+        ok: true,
+        pending: true,
+        message: "Cancellation is being processed",
+        changeRequestId,
       });
     }
-
-    doc.status = "CANCELLED";
-    doc.cancelledAt = new Date();
-    await doc.save();
-
-    // Decrement spend if official booking in same calendar month
-    if ((doc as any).paymentMode === 'official' && (doc as any).workspaceId) {
-      const bookingMonth = doc.createdAt.toISOString().slice(0, 7);
-      const currentMonth = new Date().toISOString().slice(0, 7);
-      if (bookingMonth === currentMonth) {
-        try {
-          await CustomerWorkspace.findOneAndUpdate(
-            { _id: (doc as any).workspaceId },
-            [{ $set: {
-              'sbtOfficialBooking.currentMonthSpend': {
-                $max: [0, { $subtract: ['$sbtOfficialBooking.currentMonthSpend', (doc as any).totalFare || 0] }],
-              },
-            }}],
-            { runValidators: false },
-          );
-          sbtLogger.info('[OfficialBooking] Spend reversed on cancellation', {
-            bookingId: doc._id,
-            amount: (doc as any).totalFare,
-            workspaceId: (doc as any).workspaceId,
-          });
-        } catch (err) {
-          sbtLogger.error('[OfficialBooking] Failed to reverse spend on cancellation', {
-            bookingId: doc._id,
-            error: err,
-          });
-        }
-      }
-    }
-
-    res.json({ ok: true, booking: doc });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Cancellation failed";
     sbtLogger.error("Hotel cancel failed", { bookingId: req.params.id, error: msg });
@@ -1756,6 +1919,7 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
       hotelCode,
       checkIn,
       checkOut,
+      Rooms: roomsArray,
       adults = 1,
       children = 0,
       childrenAges = null,
@@ -1767,11 +1931,18 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
       return res.status(400).json({ error: "hotelCode, checkIn, checkOut required" });
     }
 
-    const paxRooms = Array.from({ length: rooms }, () => ({
-      Adults: adults,
-      Children: children,
-      ChildrenAges: childrenAges,
-    }));
+    const paxRooms: Array<{ Adults: number; Children: number; ChildrenAges: number[] | null }> =
+      Array.isArray(roomsArray) && roomsArray.length > 0
+        ? roomsArray.map((r: any) => ({
+            Adults: r.Adults || r.adults || 1,
+            Children: r.Children ?? r.children ?? 0,
+            ChildrenAges: r.ChildrenAges ?? r.childrenAges ?? null,
+          }))
+        : Array.from({ length: rooms }, () => ({
+            Adults: adults,
+            Children: children,
+            ChildrenAges: childrenAges,
+          }));
 
     const tboPayload = {
       CheckIn: checkIn,

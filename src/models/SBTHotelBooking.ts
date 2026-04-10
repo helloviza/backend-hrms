@@ -45,9 +45,15 @@ export interface ISBTHotelBooking extends Document {
   refundStatus?: string;
   refundProcessedAt?: Date;
   paymentMode?: "official" | "personal";
+  marginPercent?: number;
+  marginAmount?: number;
+  displayAmount?: number;
   raw?: unknown;
   tboVoucherData?: unknown;
-  voucherStatus?: "GENERATED" | "FAILED" | "PENDING";
+  voucherStatus?: "PENDING" | "CONFIRMED" | "FAILED" | "GENERATED" | "PAYMENT_COLLECTED" | "HELD" | "CANCELLED" | "CANCEL_PENDING";
+  cancellationCharge?: number;
+  refundedAmount?: number;
+  changeRequestId?: string;
   bookedAt: Date;
   cancelledAt?: Date;
   createdAt: Date;
@@ -108,10 +114,20 @@ const SBTHotelBookingSchema = new Schema(
     refundStatus: { type: String },
     refundProcessedAt: { type: Date },
     paymentMode: { type: String, enum: ["official", "personal"], default: "personal" },
+    marginPercent: { type: Number, default: 0 },
+    marginAmount: { type: Number, default: 0 },
+    displayAmount: { type: Number, default: 0 },
     raw: { type: Schema.Types.Mixed, default: null },
     tboVoucherData: { type: Schema.Types.Mixed, default: null },
-    voucherStatus: { type: String, enum: ["GENERATED", "FAILED", "PENDING"], default: null },
+    voucherStatus: {
+      type: String,
+      enum: ["PENDING", "CONFIRMED", "FAILED", "GENERATED", "PAYMENT_COLLECTED", "HELD", "CANCELLED", "CANCEL_PENDING"],
+      default: null,
+    },
     sbtRequestId: { type: Schema.Types.ObjectId, ref: "SBTRequest", default: null, index: true },
+    cancellationCharge: { type: Number, default: 0 },
+    refundedAmount: { type: Number, default: 0 },
+    changeRequestId: { type: String },
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
   },

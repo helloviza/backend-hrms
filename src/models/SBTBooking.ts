@@ -58,6 +58,10 @@ export interface ISBTBooking extends Document {
   refundStatus?: string;
   refundProcessedAt?: Date;
   paymentMode?: "official" | "personal";
+  netAmount?: number;
+  displayAmount?: number;
+  marginPercent?: number;
+  marginAmount?: number;
   ticketingStatus: "NOT_ATTEMPTED" | "TICKETED" | "FAILED" | "TICKET_FAILED" | "PENDING";
   ticketingError?: string;
   raw?: unknown;
@@ -138,6 +142,10 @@ const SBTBookingSchema = new Schema(
     refundStatus: { type: String },
     refundProcessedAt: { type: Date },
     paymentMode: { type: String, enum: ["official", "personal"], default: "personal" },
+    netAmount: { type: Number, default: 0 },
+    displayAmount: { type: Number, default: 0 },
+    marginPercent: { type: Number, default: 0 },
+    marginAmount: { type: Number, default: 0 },
     ticketingStatus: {
       type: String,
       enum: ["NOT_ATTEMPTED", "TICKETED", "FAILED", "TICKET_FAILED", "PENDING"],
