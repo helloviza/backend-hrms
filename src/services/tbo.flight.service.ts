@@ -962,47 +962,95 @@ export async function ticketLCC(params: {
     const BAG_PLACEHOLDERS  = ["", "nobaggage", "no baggage", "no_baggage", "no extra baggage"];
 
     const rawMeals = Array.isArray(p.MealDynamic) ? p.MealDynamic : [];
+    // Filter meals to only those matching the booked flight segments (prevents stale SSR data from
+    // a different session/flight being sent to TBO, which causes "Invalid Meal" errors)
+    const bookedFlightNumbers = params.Segments
+      ? (params.Segments as any[][]).flat().map((s: any) => s.FlightNumber).filter(Boolean)
+      : [];
     const validMeals = sanitizeMealDynamic(rawMeals).filter((m: any) =>
       m.Code && !MEAL_PLACEHOLDERS.includes(m.Code.toLowerCase()) && m.AirlineCode && m.FlightNumber
+      && (bookedFlightNumbers.length === 0 || bookedFlightNumbers.includes(m.FlightNumber))
     );
     const mealRef = rawMeals[0];
     pax.MealDynamic = validMeals.length > 0
       ? validMeals
       : mealRef ? [buildNoMealPlaceholder(mealRef)] : [];
 
-    // SeatDynamic: nested SegmentSeat → RowSeats → Seats structure (matches working cert PNR OP4U4V)
+    // SeatDynamic: TBO Ticket expects nested SegmentSeat → RowSeats → Seats structure.
+    // Input may arrive as nested (from SSR screen) or flat (from convertSeatPreferences in route).
+    // Detect which format and handle accordingly — flat input was previously silently producing
+    // [{ SegmentSeat: [] }] which TBO interpreted as "no seat selected".
     if (Array.isArray(p.SeatDynamic) && p.SeatDynamic.length > 0) {
-      pax.SeatDynamic = p.SeatDynamic.map((segSeatObj: any) => ({
-        SegmentSeat: (segSeatObj.SegmentSeat || []).map((seg: any) => ({
-          RowSeats: (seg.RowSeats || []).map((row: any) => ({
-            Seats: (row.Seats || []).map((s: any) => {
-              const rowNo = s.RowNo ?? "";
-              const rawSeatNo = s.SeatNo ?? "";
-              // Combine RowNo + letter if SeatNo is just a letter (e.g. "A" → "12A")
-              const alreadyCombined = rawSeatNo.length > 1 && /\d/.test(rawSeatNo);
-              const seatNo = alreadyCombined ? rawSeatNo : `${rowNo}${rawSeatNo}`;
-              return {
-                AirlineCode: s.AirlineCode ?? "",
-                FlightNumber: s.FlightNumber ?? "",
-                CraftType: s.CraftType ?? "",
-                Origin: s.Origin ?? "",
-                Destination: s.Destination ?? "",
-                AvailablityType: 0,
-                Description: s.Description ?? 2,
-                Code: s.Code ?? "",
-                RowNo: rowNo,
-                SeatNo: seatNo,
-                SeatType: s.SeatType ?? 0,
-                SeatWayType: 1,
-                Compartment: 0,
-                Deck: 0,
-                Currency: s.Currency ?? "INR",
-                Price: Number(s.Price) || 0,
-              };
-            })
+      const firstItem = p.SeatDynamic[0];
+      const isAlreadyNested = firstItem != null && "SegmentSeat" in firstItem;
+
+      if (isAlreadyNested) {
+        // Already in nested format — re-map to normalise field values
+        pax.SeatDynamic = p.SeatDynamic.map((segSeatObj: any) => ({
+          SegmentSeat: (segSeatObj.SegmentSeat || []).map((seg: any) => ({
+            RowSeats: (seg.RowSeats || []).map((row: any) => ({
+              Seats: (row.Seats || []).map((s: any) => {
+                const rowNo = String(s.RowNo ?? "");
+                const rawSeatNo = s.SeatNo ?? "";
+                const alreadyCombined = rawSeatNo.length > 1 && /\d/.test(rawSeatNo);
+                const seatNo = alreadyCombined ? rawSeatNo : `${rowNo}${rawSeatNo}` || s.Code || "";
+                return {
+                  AirlineCode: s.AirlineCode ?? "",
+                  FlightNumber: s.FlightNumber ?? "",
+                  CraftType: s.CraftType ?? "",
+                  Origin: s.Origin ?? "",
+                  Destination: s.Destination ?? "",
+                  AvailablityType: s.AvailablityType ?? 1,
+                  Description: s.Description ?? 2,
+                  Code: s.Code ?? "",
+                  RowNo: rowNo,
+                  SeatNo: seatNo,
+                  SeatType: s.SeatType ?? 1,
+                  SeatWayType: s.SeatWayType ?? 1,
+                  Compartment: s.Compartment ?? 1,
+                  Deck: s.Deck ?? 1,
+                  Currency: s.Currency ?? "INR",
+                  Price: Number(s.Price) || 0,
+                };
+              })
+            }))
           }))
-        }))
-      }));
+        }));
+      } else {
+        // Flat array — produced by convertSeatPreferences in the route (SeatPreference → SeatDynamic)
+        // or sent directly from the frontend. Wrap into TBO's required nested structure.
+        const seatObjects = p.SeatDynamic.map((s: any) => {
+          const rowNo = String(s.RowNo ?? "");
+          const rawSeatNo = s.SeatNo ?? "";
+          const alreadyCombined = rawSeatNo.length > 1 && /\d/.test(rawSeatNo);
+          const seatNo = alreadyCombined ? rawSeatNo : `${rowNo}${rawSeatNo}` || s.Code || "";
+          return {
+            AirlineCode: s.AirlineCode ?? "",
+            FlightNumber: s.FlightNumber ?? "",
+            CraftType: s.CraftType ?? "",
+            Origin: s.Origin ?? "",
+            Destination: s.Destination ?? "",
+            AvailablityType: s.AvailablityType ?? 1,
+            Description: s.Description ?? 2,
+            Code: s.Code ?? "",
+            RowNo: rowNo,
+            SeatNo: seatNo,
+            SeatType: s.SeatType ?? 1,
+            SeatWayType: s.SeatWayType ?? 1,
+            Compartment: s.Compartment ?? 1,
+            Deck: s.Deck ?? 1,
+            Currency: s.Currency ?? "INR",
+            Price: Number(s.Price) || 0,
+          };
+        });
+        pax.SeatDynamic = [{
+          SegmentSeat: [{
+            RowSeats: [{
+              Seats: seatObjects,
+            }],
+          }],
+        }];
+      }
     }
 
     if (p.SeatPreference !== undefined && !pax.SeatDynamic) {
