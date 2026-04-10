@@ -566,7 +566,8 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
     // JT=4 (AdvanceSearch): don't force Sources — let TBO return all results,
     // frontend filters to GDS (IsLCC=false) client-side
     const resolvedSources = Sources ?? null;
-    const result: any = await searchFlights({ ...rest, JourneyType: jt as 1 | 2 | 4 | 5, Sources: resolvedSources });
+    const tboSearchPayload = { ...rest, JourneyType: jt as 1 | 2 | 4 | 5, Sources: resolvedSources };
+    const result: any = await searchFlights(tboSearchPayload);
 
     // Temporary logging for Advance Search debugging
     if (jt === 4) {
