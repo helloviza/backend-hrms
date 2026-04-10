@@ -463,7 +463,10 @@ router.post("/calendar", requireSBT, requireFlightAccess, async (req: any, res: 
     }
 
     const token = await getTBOToken();
-    const firstDay = `${month}-01T00:00:00`;
+    const todayStr = new Date().toISOString().split("T")[0];
+    const requestedFirst = `${month}-01`;
+    const effectiveFromDate = requestedFirst < todayStr ? `${todayStr}T00:00:00` : `${requestedFirst}T00:00:00`;
+    const firstDay = effectiveFromDate;
     const [yearStr, monthStr] = month.split("-");
     const lastDayDate = new Date(+yearStr, +monthStr, 0); // last day of month
     const lastDay = `${yearStr}-${monthStr}-${String(lastDayDate.getDate()).padStart(2, "0")}T00:00:00`;
