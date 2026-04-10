@@ -229,7 +229,7 @@ export async function searchFlights(params: {
     });
   }
 
-  return post("/Search", {
+  const tboRequestBody = {
     EndUserIp: endUserIp,
     TokenId: token,
     AdultCount: String(params.adults ?? 1),
@@ -241,7 +241,8 @@ export async function searchFlights(params: {
     PreferredAirlines: null,
     Segments: segments,
     Sources: params.Sources ?? null,
-  });
+  };
+  return post("/Search", tboRequestBody);
 }
 
 export async function searchMultiCity(params: {
