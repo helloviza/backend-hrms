@@ -833,7 +833,13 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
     // Helper: call GetBookingDetail to verify actual booking status
     async function verifyBookingStatus(bookingId: number): Promise<any> {
-      const detailPayload = { EndUserIp: "1.1.1.1", BookingId: bookingId };
+      let detailToken = "";
+      try { detailToken = await getTBOToken(); } catch {}
+      const detailPayload = {
+        EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+        TokenId: detailToken,
+        BookingId: bookingId,
+      };
       const dt0 = Date.now();
       const detailRes = await fetch(
         "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
@@ -924,7 +930,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
     try {
       const bookController = new AbortController();
-      const bookTimer = setTimeout(() => bookController.abort(), 90_000);
+      const bookTimer = setTimeout(() => bookController.abort(), 120_000);
       try {
         const tboRes = await fetch(
           "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
@@ -1051,11 +1057,16 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       }
     }
 
-    // No BookingId at all — booking likely never reached TBO
+    // No BookingId in response — TBO may not have received the request at all.
+    // Surface the ClientReferenceId so ops can look up the booking in the TBO portal.
+    sbtLogger.warn("Hotel book timed out with no BookingId — manual verification needed", {
+      clientRef, userId: req.user?.id, bookingMode,
+    });
     return res.status(202).json({
       ok: false,
       status: "BOOKING_UNCERTAIN",
-      error: "Booking timed out and status could not be verified — please contact support",
+      clientReferenceId: clientRef,
+      message: `Booking status unknown. Please check TBO portal with reference: ${clientRef}`,
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Hotel booking failed";
@@ -1342,11 +1353,18 @@ router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any
       return res.json({ ok: true, synced: 0, updated: 0 });
     }
 
+    let syncToken = "";
+    try { syncToken = await getTBOToken(); } catch {}
+
     let updated = 0;
     for (const doc of pendingBookings) {
       if (!doc.bookingId) continue;
       try {
-        const detailPayload = { EndUserIp: "1.1.1.1", BookingId: Number(doc.bookingId) || 0 };
+        const detailPayload = {
+          EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+          TokenId: syncToken,
+          BookingId: Number(doc.bookingId) || 0,
+        };
         const t0 = Date.now();
         const tboRes = await fetch(
           "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
@@ -1404,7 +1422,13 @@ router.post("/bookings/:id/sync-status", requireAuth, async (req: any, res: any)
       return res.json({ ok: true, status: doc.status, updated: false });
     }
 
-    const detailPayload = { EndUserIp: "1.1.1.1", BookingId: Number(doc.bookingId) || 0 };
+    let statusToken = "";
+    try { statusToken = await getTBOToken(); } catch {}
+    const detailPayload = {
+      EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+      TokenId: statusToken,
+      BookingId: Number(doc.bookingId) || 0,
+    };
     const t0 = Date.now();
     const tboRes = await fetch(
       "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
