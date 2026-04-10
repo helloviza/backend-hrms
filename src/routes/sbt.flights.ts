@@ -30,6 +30,7 @@ import {
   getBookingDetailsByPNR,
   getSSR,
   releasePNR,
+  cancelFlight,
   getPriceRBD,
   isNDCFlight,
 } from "../services/tbo.flight.service.js";
@@ -1182,19 +1183,31 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
       };
       let obResult = await ticketLCC(obPayload) as any;
 
-      // Retry without meals/baggage if TBO rejects meal data (expired SSR session)
+      // Retry 1: strip seat only, keep meal — TBO may accept meal without seat
       const obErr = obResult?.Response?.Error?.ErrorMessage
         ?? obResult?.Response?.Response?.Error?.ErrorMessage ?? "";
-      if (obResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(obErr) || /meal.*mandatory/i.test(obErr) || /mandatory.*meal/i.test(obErr))) {
-        sbtLogger.info('[TICKET-LCC] OB "Invalid Meal" — retrying without meals/baggage');
-        const obPassengersNoMeal = obPassengers.map((p: any) => ({
-          ...p, MealDynamic: [], Baggage: [],
-        }));
+      if (obResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(obErr) || /meal.*mandatory/i.test(obErr) || /mandatory.*meal/i.test(obErr) || /seat/i.test(obErr))) {
+        sbtLogger.info('[TICKET-LCC] OB SSR error — retry 1: strip seat, keep meal', { module: 'sbt', error: obErr });
+        const obPassengersNoSeat = obPassengers.map((p: any) => ({ ...p, SeatDynamic: [] }));
         obResult = await ticketLCC({
           ...obPayload,
-          Passengers: obPassengersNoMeal,
-          FreeBaggage: [],
+          Passengers: obPassengersNoSeat,
         }) as any;
+
+        // Retry 2: strip both seat and meal if still failing
+        const obErr2 = obResult?.Response?.Error?.ErrorMessage
+          ?? obResult?.Response?.Response?.Error?.ErrorMessage ?? "";
+        if (obResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(obErr2) || /meal.*mandatory/i.test(obErr2) || /mandatory.*meal/i.test(obErr2) || /seat/i.test(obErr2))) {
+          sbtLogger.info('[TICKET-LCC] OB SSR error — retry 2: strip seat and meal', { module: 'sbt', error: obErr2 });
+          const obPassengersNoSSR = obPassengers.map((p: any) => ({
+            ...p, SeatDynamic: [], MealDynamic: [], Baggage: [],
+          }));
+          obResult = await ticketLCC({
+            ...obPayload,
+            Passengers: obPassengersNoSSR,
+            FreeBaggage: [],
+          }) as any;
+        }
       }
 
       const obStatus = obResult?.Response?.ResponseStatus;
@@ -1284,19 +1297,31 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
         };
         ibResult = await ticketLCC(ibPayload) as any;
 
-        // Retry without meals/baggage if TBO rejects meal data
+        // Retry 1: strip seat only, keep meal — TBO may accept meal without seat
         const ibErr = ibResult?.Response?.Error?.ErrorMessage
           ?? ibResult?.Response?.Response?.Error?.ErrorMessage ?? "";
-        if (ibResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(ibErr) || /meal.*mandatory/i.test(ibErr) || /mandatory.*meal/i.test(ibErr))) {
-          sbtLogger.info('[TICKET-LCC] IB "Invalid Meal" — retrying without meals/baggage');
-          const ibPassengersNoMeal = ibPassengers.map((p: any) => ({
-            ...p, MealDynamic: [], Baggage: [],
-          }));
+        if (ibResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(ibErr) || /meal.*mandatory/i.test(ibErr) || /mandatory.*meal/i.test(ibErr) || /seat/i.test(ibErr))) {
+          sbtLogger.info('[TICKET-LCC] IB SSR error — retry 1: strip seat, keep meal', { module: 'sbt', error: ibErr });
+          const ibPassengersNoSeat = ibPassengers.map((p: any) => ({ ...p, SeatDynamic: [] }));
           ibResult = await ticketLCC({
             ...ibPayload,
-            Passengers: ibPassengersNoMeal,
-            FreeBaggage: [],
+            Passengers: ibPassengersNoSeat,
           }) as any;
+
+          // Retry 2: strip both seat and meal if still failing
+          const ibErr2 = ibResult?.Response?.Error?.ErrorMessage
+            ?? ibResult?.Response?.Response?.Error?.ErrorMessage ?? "";
+          if (ibResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(ibErr2) || /meal.*mandatory/i.test(ibErr2) || /mandatory.*meal/i.test(ibErr2) || /seat/i.test(ibErr2))) {
+            sbtLogger.info('[TICKET-LCC] IB SSR error — retry 2: strip seat and meal', { module: 'sbt', error: ibErr2 });
+            const ibPassengersNoSSR = ibPassengers.map((p: any) => ({
+              ...p, SeatDynamic: [], MealDynamic: [], Baggage: [],
+            }));
+            ibResult = await ticketLCC({
+              ...ibPayload,
+              Passengers: ibPassengersNoSSR,
+              FreeBaggage: [],
+            }) as any;
+          }
         }
 
         ibBookingId = ibResult?.Response?.Response?.BookingId
@@ -1374,25 +1399,46 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
       FreeBaggage: lccFreeBaggage,
     }) as any;
 
-    // Retry without meals/baggage if TBO rejects meal data
+    // Retry 1: strip seat only, keep meal — TBO may accept meal without seat
     const onewayErr = result?.Response?.Error?.ErrorMessage
       ?? result?.Response?.Response?.Error?.ErrorMessage ?? "";
     if (
       result?.Response?.ResponseStatus !== 1 &&
-      (/invalid meal/i.test(onewayErr) || /meal.*mandatory/i.test(onewayErr) || /mandatory.*meal/i.test(onewayErr))
+      (/invalid meal/i.test(onewayErr) || /meal.*mandatory/i.test(onewayErr) || /mandatory.*meal/i.test(onewayErr) || /seat/i.test(onewayErr))
     ) {
-      sbtLogger.info('[TICKET-LCC] One-way meal error — retrying without meals/baggage');
-      const passengersNoMeal = (req.body.Passengers ?? []).map((p: any) => {
-        const { MealDynamic, Baggage, ...rest } = p;
-        return rest;
-      });
+      sbtLogger.info('[TICKET-LCC] One-way SSR error — retry 1: strip seat, keep meal', { module: 'sbt', error: onewayErr });
+      const passengersNoSeat = obPassengers.map((p: any) => ({ ...p, SeatDynamic: [] }));
       result = await ticketLCC({
         ...req.body,
-        Passengers: passengersNoMeal,
+        Passengers: passengersNoSeat,
         isInternational: lccIsInternational,
+        airlineCode: lccAirlineCode,
+        destinationCode: lccDestCode,
         Segments: lccSegments,
-        FreeBaggage: [],
+        FreeBaggage: lccFreeBaggage,
       }) as any;
+
+      // Retry 2: strip both seat and meal if still failing
+      const onewayErr2 = result?.Response?.Error?.ErrorMessage
+        ?? result?.Response?.Response?.Error?.ErrorMessage ?? "";
+      if (
+        result?.Response?.ResponseStatus !== 1 &&
+        (/invalid meal/i.test(onewayErr2) || /meal.*mandatory/i.test(onewayErr2) || /mandatory.*meal/i.test(onewayErr2) || /seat/i.test(onewayErr2))
+      ) {
+        sbtLogger.info('[TICKET-LCC] One-way SSR error — retry 2: strip seat and meal', { module: 'sbt', error: onewayErr2 });
+        const passengersNoSSR = obPassengers.map((p: any) => ({
+          ...p, SeatDynamic: [], MealDynamic: [], Baggage: [],
+        }));
+        result = await ticketLCC({
+          ...req.body,
+          Passengers: passengersNoSSR,
+          isInternational: lccIsInternational,
+          airlineCode: lccAirlineCode,
+          destinationCode: lccDestCode,
+          Segments: lccSegments,
+          FreeBaggage: [],
+        }) as any;
+      }
     }
 
     // TBO certification: call GetBookingDetails after successful LCC Ticket
@@ -1532,6 +1578,18 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
       ticketingStatus: b.ticketingStatus || "NOT_ATTEMPTED",
       bookedAt: new Date(),
       raw: b.raw,
+      cancelPolicies: (() => {
+        const raw = b.raw as any;
+        return raw?.Response?.Response?.FlightItinerary?.FareRules
+          ?? raw?.Response?.FlightItinerary?.FareRules
+          ?? [];
+      })(),
+      isRefundable: (() => {
+        const raw = b.raw as any;
+        const v = raw?.Response?.Response?.FlightItinerary?.IsRefundable
+          ?? raw?.Response?.FlightItinerary?.IsRefundable;
+        return v != null ? Boolean(v) : undefined;
+      })(),
     });
 
     // Increment workspace monthly spend for official bookings
@@ -1783,27 +1841,78 @@ router.get("/bookings/:id", requireSBT, async (req: any, res: any) => {
   }
 });
 
-// GET /api/sbt/flights/bookings/:id/cancel-charges — estimate cancellation charges
-router.get("/bookings/:id/cancel-charges", requireAuth, async (req: any, res: any) => {
+// GET /api/sbt/flights/bookings/:id/cancel-preview — preview cancellation charges
+router.get("/bookings/:id/cancel-preview", requireAuth, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id;
-    const doc = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
-    if (!doc) return res.status(404).json({ error: "Booking not found" });
-    if (doc.status === "CANCELLED") return res.status(400).json({ error: "Already cancelled" });
+    const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    if (booking.status === "CANCELLED") return res.status(400).json({ error: "Already cancelled" });
 
-    // Estimate: cancellation fee is ~15% of base fare (placeholder logic)
-    const cancellationFee = Math.round(doc.baseFare * 0.15);
-    const refundAmount = Math.max(0, doc.totalFare - cancellationFee);
-    res.json({
-      ok: true,
-      bookingId: doc.bookingId,
-      pnr: doc.pnr,
-      cancellationFee,
+    const isPast = booking.departureTime
+      ? new Date(booking.departureTime) < new Date()
+      : false;
+
+    if (isPast) {
+      return res.json({ canCancel: false, reason: "Flight has already departed" });
+    }
+
+    // Read fare rules from the stored raw TBO response
+    const raw = booking.raw as any;
+    const fareRules: any[] =
+      (booking as any).cancelPolicies?.length
+        ? (booking as any).cancelPolicies
+        : raw?.Response?.Response?.FlightItinerary?.FareRules
+          ?? raw?.Response?.FlightItinerary?.FareRules
+          ?? [];
+
+    const totalFare = booking.totalFare || 0;
+    let cancellationCharge = 0;
+    let isRefundable = true;
+    let policyText = "";
+
+    const fareRuleText = fareRules
+      .map((r: any) => r.FareRuleDetail || "")
+      .join(" ")
+      .toUpperCase();
+
+    if (
+      fareRuleText.includes("NON REFUNDABLE") ||
+      fareRuleText.includes("NON-REFUNDABLE") ||
+      fareRuleText.includes("NO REFUND") ||
+      (booking as any).isRefundable === false
+    ) {
+      isRefundable = false;
+      cancellationCharge = totalFare;
+      policyText = "This fare is non-refundable";
+    } else {
+      const isLCC = booking.isLCC || false;
+      cancellationCharge = isLCC
+        ? Math.min(3000, totalFare)
+        : Math.round(totalFare * 0.1);
+      isRefundable = true;
+      policyText = isLCC
+        ? "LCC cancellation charges apply (approx)"
+        : "Cancellation charges as per fare rules";
+    }
+
+    const refundAmount = Math.max(0, totalFare - cancellationCharge);
+
+    return res.json({
+      canCancel: true,
+      isRefundable,
+      cancellationCharge,
       refundAmount,
-      currency: doc.currency,
+      totalFare,
+      policyText,
+      isPast,
+      currency: booking.currency || "INR",
+      ticketingStatus: booking.ticketingStatus,
+      pnr: booking.pnr,
+      airlineName: booking.airlineName,
     });
   } catch (err: any) {
-    sbtLogger.error("Cancel charges failed", { userId: req.user?.id, bookingId: req.params.id, error: err.message });
+    sbtLogger.error("Flight cancel-preview failed", { userId: req.user?.id, bookingId: req.params.id, error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
@@ -1816,12 +1925,71 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     if (!doc) return res.status(404).json({ error: "Booking not found" });
     if (doc.status === "CANCELLED") return res.status(400).json({ error: "Already cancelled" });
 
+    // Call TBO CancelPNR if the booking has a real PNR and was ticketed
+    if (doc.pnr && doc.bookingId && doc.ticketingStatus === "TICKETED") {
+      const t0 = Date.now();
+      let cancelResult: any;
+      try {
+        cancelResult = await cancelFlight({
+          BookingId: Number(doc.bookingId) || doc.bookingId,
+          PNR: doc.pnr,
+        });
+        logTBOCall({
+          method: "CancelPNR",
+          traceId: (doc as any).traceId || doc.bookingId,
+          request: { BookingId: doc.bookingId, PNR: doc.pnr },
+          response: cancelResult,
+          durationMs: Date.now() - t0,
+        });
+      } catch (tboErr: any) {
+        sbtLogger.error("[CancelFlight] TBO CancelPNR threw", { bookingId: doc._id, error: tboErr?.message });
+        return res.status(502).json({ error: `TBO cancellation failed: ${tboErr?.message || "Unknown error"}` });
+      }
+
+      const cancelStatus = cancelResult?.Response?.ResponseStatus;
+      const tboError = cancelResult?.Response?.Error?.ErrorMessage;
+
+      if (cancelStatus !== 1) {
+        sbtLogger.error("[CancelFlight] TBO returned non-success", { bookingId: doc._id, cancelStatus, tboError });
+        return res.status(409).json({ error: tboError || "TBO did not confirm cancellation" });
+      }
+
+      sbtLogger.info("[CancelFlight] TBO CancelPNR success", { bookingId: doc._id, pnr: doc.pnr });
+    } else {
+      sbtLogger.info("[CancelFlight] Skipping TBO call — not ticketed or missing PNR", {
+        bookingId: doc._id, ticketingStatus: doc.ticketingStatus, pnr: doc.pnr,
+      });
+    }
+
+    // Compute cancellation charge to store (mirrors cancel-preview logic)
+    const totalFare = doc.totalFare || 0;
+    const raw = doc.raw as any;
+    const fareRules: any[] =
+      (doc as any).cancelPolicies?.length
+        ? (doc as any).cancelPolicies
+        : raw?.Response?.Response?.FlightItinerary?.FareRules
+          ?? raw?.Response?.FlightItinerary?.FareRules
+          ?? [];
+    const fareRuleText = fareRules.map((r: any) => r.FareRuleDetail || "").join(" ").toUpperCase();
+    const nonRefundable =
+      fareRuleText.includes("NON REFUNDABLE") ||
+      fareRuleText.includes("NON-REFUNDABLE") ||
+      fareRuleText.includes("NO REFUND") ||
+      (doc as any).isRefundable === false;
+    const charge = nonRefundable
+      ? totalFare
+      : doc.isLCC
+        ? Math.min(3000, totalFare)
+        : Math.round(totalFare * 0.1);
+
     doc.status = "CANCELLED";
     doc.cancelledAt = new Date();
+    (doc as any).cancellationCharge = charge;
+    (doc as any).refundedAmount = Math.max(0, totalFare - charge);
     await doc.save();
 
     // Decrement spend if official booking in same calendar month
-    if ((doc as any).paymentMode === 'official' && (doc as any).workspaceId) {
+    if ((doc as any).paymentMode === "official" && (doc as any).workspaceId) {
       const bookingMonth = doc.createdAt.toISOString().slice(0, 7);
       const currentMonth = new Date().toISOString().slice(0, 7);
       if (bookingMonth === currentMonth) {
@@ -1829,22 +1997,17 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
           await CustomerWorkspace.findOneAndUpdate(
             { _id: (doc as any).workspaceId },
             [{ $set: {
-              'sbtOfficialBooking.currentMonthSpend': {
-                $max: [0, { $subtract: ['$sbtOfficialBooking.currentMonthSpend', (doc as any).totalFare || 0] }],
+              "sbtOfficialBooking.currentMonthSpend": {
+                $max: [0, { $subtract: ["$sbtOfficialBooking.currentMonthSpend", totalFare] }],
               },
             }}],
             { runValidators: false },
           );
-          sbtLogger.info('[OfficialBooking] Spend reversed on cancellation', {
-            bookingId: doc._id,
-            amount: (doc as any).totalFare,
-            workspaceId: (doc as any).workspaceId,
+          sbtLogger.info("[OfficialBooking] Spend reversed on cancellation", {
+            bookingId: doc._id, amount: totalFare, workspaceId: (doc as any).workspaceId,
           });
         } catch (err) {
-          sbtLogger.error('[OfficialBooking] Failed to reverse spend on cancellation', {
-            bookingId: doc._id,
-            error: err,
-          });
+          sbtLogger.error("[OfficialBooking] Failed to reverse spend on cancellation", { bookingId: doc._id, error: err });
         }
       }
     }
