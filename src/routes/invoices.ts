@@ -559,7 +559,7 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
     await Invoice.collection.updateOne(
       { _id: new mongoose.Types.ObjectId(req.params.id) },
       {
-        $push: { lineItems: { $each: newLineItems } as any },
+        $push: { lineItems: { $each: newLineItems } },
         $addToSet: {
           bookingIds: {
             $each: bookingIds.map((id) => new mongoose.Types.ObjectId(id)),
@@ -570,7 +570,7 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
           totalGST:   updatedTotalGST,
           grandTotal: updatedGrandTotal,
         },
-      },
+      } as any,
     );
 
     // Mark new bookings as INVOICED
