@@ -460,6 +460,10 @@ void safeMount("/api/settings", "./routes/settings.js");
 // Stubs
 app.use("/api/stubs", stubs);
 
+// EOD WhatsApp Report
+import eodReportRouter from "./routes/eodReport.js";
+app.use("/api/eod-report", eodReportRouter);
+
 // Image proxy
 app.use("/api/proxy", proxyRouter);
 
@@ -509,6 +513,10 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       // ✅ START REPORT SCHEDULER
       const { startReportScheduler } = await import("./jobs/reportScheduler.js");
       startReportScheduler();
+
+      // ✅ START EOD WHATSAPP CRON
+      const { startEodCron } = await import("./jobs/eodCron.js");
+      startEodCron().catch((e: unknown) => logger.error("[EOD] Cron start failed", { e }));
 
       const server = app.listen(env.PORT, () => {
         logger.info("API running", { port: env.PORT });

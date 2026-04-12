@@ -1,0 +1,13 @@
+2026/04/13-01:49:03.623 79cc Reusing MANIFEST D:\plumtrips-hrms\apps\backend\.wwebjs_auth\session-plumtrips-eod\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/04/13-01:49:03.623 79cc Recovering log #97
+2026/04/13-01:49:03.662 79cc Reusing old log D:\plumtrips-hrms\apps\backend\.wwebjs_auth\session-plumtrips-eod\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/000097.log 
+2026/04/13-01:49:10.484 7aa4 Level-0 table #103: started
+2026/04/13-01:49:10.506 7aa4 Level-0 table #103: 990987 bytes OK
+2026/04/13-01:49:10.508 7aa4 Delete type=0 #97
+2026/04/13-01:49:17.717 7aa4 Compacting 1@1 + 2@2 files
+2026/04/13-01:49:17.786 7aa4 Generated table #104@1: 50350 keys, 2173148 bytes
+2026/04/13-01:49:17.786 7aa4 Compacted 1@1 + 2@2 files => 2173148 bytes
+2026/04/13-01:49:17.787 7aa4 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/04/13-01:49:17.787 7aa4 Delete type=2 #99
+2026/04/13-01:49:17.787 7aa4 Delete type=2 #100
+2026/04/13-01:49:17.787 7aa4 Delete type=2 #103
