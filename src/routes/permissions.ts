@@ -10,6 +10,35 @@ import logger from '../utils/logger.js'
 
 const router = express.Router()
 
+function levelToRole(code: string): string {
+  switch (code) {
+    case 'L1': return 'EMPLOYEE'
+    case 'L2': return 'EMPLOYEE'
+    case 'L3': return 'MANAGER'
+    case 'L4': return 'MANAGER'
+    case 'L5': return 'HR'
+    case 'L6': return 'ADMIN'
+    case 'L7': return 'ADMIN'
+    case 'L8': return 'SUPERADMIN'
+    case 'CUSTOMER_SBT': return 'CUSTOMER'
+    case 'CUSTOMER_APPROVAL': return 'CUSTOMER'
+    case 'VENDOR': return 'VENDOR'
+    default: return 'EMPLOYEE'
+  }
+}
+
+function roleToRolesArray(hrmsAccessRole: string): string[] {
+  switch (hrmsAccessRole) {
+    case 'SUPERADMIN': return ['SuperAdmin']
+    case 'ADMIN':      return ['ADMIN']
+    case 'HR':         return ['HR']
+    case 'MANAGER':    return ['MANAGER']
+    case 'CUSTOMER':   return ['CUSTOMER']
+    case 'VENDOR':     return ['VENDOR']
+    default:           return ['EMPLOYEE']
+  }
+}
+
 // ── GET /api/permissions/my-access ──────────────────────────────────────────
 // Open to all authenticated users. Fast path — called on every page load.
 router.get('/my-access', requireAuth, async (req: any, res: any) => {
@@ -72,6 +101,17 @@ router.get('/list', async (req: any, res: any) => {
     if (universe) filter.universe = universe
     if (workspaceId) filter.workspaceId = workspaceId
     if (search) filter.email = { $regex: String(search), $options: 'i' }
+
+    // Source filter applies to everyone
+    filter.source = { $in: ['onboarding', 'manual'] }
+
+    // WorkspaceId only for non-SuperAdmin
+    if (!isSuperAdmin(req)) {
+      filter.workspaceId = String(req.workspaceObjectId)
+    }
+
+    // Only show active and suspended grants (not revoked)
+    filter.status = { $in: ['active', 'suspended'] }
 
     const pageNum = Math.max(1, parseInt(page as string, 10))
     const limitNum = Math.min(100, Math.max(1, parseInt(limit as string, 10)))
@@ -159,12 +199,24 @@ router.post('/grant', async (req: any, res: any) => {
             designation: designation || '',
           },
           modules,
+          source: 'manual',
           grantedBy: adminEmail,
           grantedAt: new Date(),
         },
       },
       { upsert: true, new: true }
     )
+
+    // Sync hrmsAccessRole to User doc — non-fatal
+    const grantRole = levelToRole(levelCode)
+    try {
+      await User.findOneAndUpdate(
+        { email: normalizedEmail },
+        { $set: { hrmsAccessRole: grantRole, roles: roleToRolesArray(grantRole) } }
+      )
+    } catch (syncErr) {
+      logger.warn('[permissions/grant] hrmsAccessRole sync failed:', syncErr)
+    }
 
     logger.info(`[PERMISSION] GRANT ${normalizedEmail} → ${levelCode} by ${adminEmail}`)
     return res.json({ success: true, data: saved })
@@ -209,6 +261,17 @@ router.patch('/update', async (req: any, res: any) => {
 
     await existing.save()
 
+    // Sync hrmsAccessRole to User doc — non-fatal
+    const updateRole = levelToRole(existing.level.code)
+    try {
+      await User.findOneAndUpdate(
+        { email: existing.email.toLowerCase() },
+        { $set: { hrmsAccessRole: updateRole, roles: roleToRolesArray(updateRole) } }
+      )
+    } catch (syncErr) {
+      logger.warn('[permissions/update] hrmsAccessRole sync failed:', syncErr)
+    }
+
     logger.info(`[PERMISSION] UPDATE ${existing.email} by ${adminEmail}`)
     return res.json({ success: true, data: existing })
   } catch (err: any) {
@@ -244,10 +307,22 @@ router.post('/apply-template', async (req: any, res: any) => {
     // designation intentionally preserved
 
     const adminEmail = String(req.user?.email || req.user?._id || 'unknown')
+    existing.source = 'manual'
     existing.updatedBy = adminEmail
     existing.updatedAt = new Date()
 
     await existing.save()
+
+    // Sync hrmsAccessRole to User doc — non-fatal
+    const templateRole = levelToRole(levelCode)
+    try {
+      await User.findOneAndUpdate(
+        { email: existing.email.toLowerCase() },
+        { $set: { hrmsAccessRole: templateRole, roles: roleToRolesArray(templateRole) } }
+      )
+    } catch (syncErr) {
+      logger.warn('[permissions/apply-template] hrmsAccessRole sync failed:', syncErr)
+    }
 
     logger.info(`[PERMISSION] TEMPLATE ${existing.email} → ${levelCode} by ${adminEmail}`)
     return res.json({ success: true, data: existing })
