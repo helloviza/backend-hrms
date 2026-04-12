@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "dev:test": "node --env-file=.env.test --import tsx src/server.ts",
+    "postinstall": "node node_modules/puppeteer/install.mjs",
     "build": "tsc -p tsconfig.json && cp -r src/data dist/",
     "start": "node dist/server.js",
     "seed": "tsx src/seed/seed.ts",
