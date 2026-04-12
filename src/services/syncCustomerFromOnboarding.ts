@@ -14,27 +14,26 @@ export async function syncCustomerFromOnboarding(invite: any) {
     // ---------- Identity ----------
     name: p.legalName || invite.name || invite.inviteeName || "Business",
     email: p.officialEmail || invite.email,
-    phone: p.contacts?.primaryPhone || "",
+    phone: p.contacts?.primaryPhone || p.phone || "",
     type: "CUSTOMER",
     status: "ACTIVE",
     segment: p.industry || "CUSTOMER",
 
     // ---------- Business master ----------
-    companyName: p.legalName || "",
-    officialEmail: p.officialEmail || "",
+    legalName: p.legalName || p.companyName || "",
+    gstNumber: p.gstNumber || p.gstin || "",
+    panNumber: p.panNumber || "",
     industry: p.industry || "",
-    gstin: p.gstNumber || "",
-    pan: p.panNumber || "",
 
     registeredAddress: p.registeredAddress || "",
     operationalAddress: p.operationalAddress || "",
 
-    // ---------- Primary contact ----------
-    contactName: p.signatory?.name || "",
-    contactEmail:
-      p.keyContacts?.[0]?.email || p.officialEmail || invite.email,
-    contactMobile:
-      p.keyContacts?.[0]?.mobile || p.contacts?.primaryPhone || "",
+    contacts: {
+      primaryPhone: p.contacts?.primaryPhone || p.phone || "",
+      officialEmail: p.officialEmail || invite.email || "",
+    },
+
+    keyContacts: Array.isArray(p.keyContacts) ? p.keyContacts : [],
 
     // ---------- Finance ----------
     creditLimit: p.creditLimit || "",

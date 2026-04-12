@@ -187,6 +187,152 @@ const CustomerSchema = new Schema(
           .map((r) => String(r || "").trim().toUpperCase())
           .filter(Boolean),
     },
+
+    /* ============================================================
+       IMPORT METADATA
+       ============================================================ */
+    zohoContactId: { type: String, trim: true },
+
+    source: { type: String, trim: true },
+
+    importedAt: { type: Date },
+
+    /* ============================================================
+       ADDRESS
+       ============================================================ */
+    address: {
+      street: { type: String, trim: true },
+      street2: { type: String, trim: true },
+      city: { type: String, trim: true },
+      state: { type: String, trim: true },
+      country: { type: String, trim: true },
+      pincode: { type: String, trim: true },
+    },
+
+    /* ============================================================
+       ZOHO FIELDS
+       ============================================================ */
+    firstName: { type: String, trim: true },
+
+    lastName: { type: String, trim: true },
+
+    mobile: { type: String, trim: true },
+
+    gstTreatment: { type: String, trim: true },
+
+    subType: { type: String, trim: true },
+
+    companyName: { type: String, trim: true },
+
+    /* ============================================================
+       ZOHO METADATA
+       ============================================================ */
+    createdTime: { type: Date },
+
+    lastModifiedTime: { type: Date },
+
+    zohoCurrency: { type: String, trim: true },
+
+    zohoNotes: { type: String, trim: true },
+
+    zohoCreatedBy: { type: String, trim: true },
+
+    openingBalance: { type: Number },
+
+    creditLimit: { type: Number },
+
+    portalEnabled: { type: Boolean },
+
+    bankAccountPayment: { type: Boolean },
+
+    priceList: { type: String, trim: true },
+
+    paymentTerms: { type: String, trim: true },
+
+    paymentTermsLabel: { type: String, trim: true },
+
+    ownerName: { type: String, trim: true },
+
+    primaryContactId: { type: String, trim: true },
+
+    contactAddressId: { type: String, trim: true },
+
+    zohoSource: { type: String, trim: true },
+
+    /* ============================================================
+       TAX
+       ============================================================ */
+    taxable: { type: Boolean },
+
+    taxId: { type: String, trim: true },
+
+    taxName: { type: String, trim: true },
+
+    taxPercentage: { type: Number },
+
+    exemptionReason: { type: String, trim: true },
+
+    placeOfContact: { type: String, trim: true },
+
+    placeOfContactWithStateCode: { type: String, trim: true },
+
+    /* ============================================================
+       BILLING ADDRESS EXTRAS
+       ============================================================ */
+    billingAttention: { type: String, trim: true },
+
+    billingPhone: { type: String, trim: true },
+
+    billingFax: { type: String, trim: true },
+
+    billingLatitude: { type: String, trim: true },
+
+    billingLongitude: { type: String, trim: true },
+
+    billingCounty: { type: String, trim: true },
+
+    /* ============================================================
+       SHIPPING ADDRESS
+       ============================================================ */
+    shippingAddress: {
+      attention: { type: String, trim: true },
+      street: { type: String, trim: true },
+      street2: { type: String, trim: true },
+      city: { type: String, trim: true },
+      state: { type: String, trim: true },
+      country: { type: String, trim: true },
+      county: { type: String, trim: true },
+      pincode: { type: String, trim: true },
+      phone: { type: String, trim: true },
+      fax: { type: String, trim: true },
+      latitude: { type: String, trim: true },
+      longitude: { type: String, trim: true },
+    },
+
+    /* ============================================================
+       SOCIAL
+       ============================================================ */
+    skype: { type: String, trim: true },
+
+    facebook: { type: String, trim: true },
+
+    twitter: { type: String, trim: true },
+
+    /* ============================================================
+       PROFESSIONAL
+       ============================================================ */
+    department: { type: String, trim: true },
+
+    designation: { type: String, trim: true },
+
+    salutation: { type: String, trim: true },
+
+    /* ============================================================
+       CONTACT DETAILS
+       ============================================================ */
+    contactName: { type: String, trim: true },
+
+    contactType: { type: String, trim: true },
   },
   { timestamps: true }
 );

@@ -3,6 +3,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import User from "../models/User.js";
 import { Onboarding } from "../models/Onboarding.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/requirePermission.js";
 import { requireRoles } from "../middleware/roles.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
@@ -172,16 +173,112 @@ r.get(
       const avatarUrl = avatarKey ? await signAvatarUrl(avatarKey) : "";
 
       res.json({
-        _id: u._id,
-        email: u.email,
-        roles: u.roles,
-        name: u.name || u.firstName || u.email?.split("@")[0],
-        phone: u.phone || "",
-        department: u.department || "",
-        location: u.location || "",
-        managerName: u.managerName || "",
+        // Identity
+        _id:              u._id,
+        email:            u.email,
+        officialEmail:    u.officialEmail || "",
+        roles:            u.roles || [],
+
+        // Name
+        name:             u.name || u.firstName || u.email?.split("@")[0] || "",
+        firstName:        u.firstName || "",
+        middleName:       u.middleName || "",
+        lastName:         u.lastName || "",
+
+        // Personal
+        dateOfBirth:      u.dateOfBirth || null,
+        gender:           u.gender || "",
+        maritalStatus:    u.maritalStatus || "",
+        nationality:      u.nationality || "",
+        bloodGroup:       u.bloodGroup || "",
+
+        // Contact
+        phone:            u.phone || u.personalContact || "",
+        personalContact:  u.personalContact || "",
+        personalEmail:    u.personalEmail || "",
+
+        // Address
+        currentAddress:   u.currentAddress || "",
+        permanentAddress: u.permanentAddress || "",
+
+        // Emergency Contact
+        emergencyContactName:     u.emergencyContactName || "",
+        emergencyContactNumber:   u.emergencyContactNumber || "",
+        emergencyContactRelation: u.emergencyContactRelation || "",
+
+        // Identity Documents
+        pan:              u.pan || "",
+        aadhaar:          u.aadhaar || "",
+        passportNumber:   u.passportNumber || "",
+        passportExpiry:   u.passportExpiry || null,
+        voterId:          u.voterId || "",
+        disabilityStatus: u.disabilityStatus || "",
+
+        // Employment
+        department:         u.department || "",
+        designation:        u.designation || "",
+        employeeCode:       u.employeeCode || "",
+        employeeType:       u.employeeType || "",
+        dateOfJoining:      u.dateOfJoining || null,
+        dateOfConfirmation: u.dateOfConfirmation || null,
+        probationPeriod:    u.probationPeriod || "",
+        contractStartDate:  u.contractStartDate || null,
+        contractEndDate:    u.contractEndDate || null,
+        exitDate:           u.exitDate || null,
+        exitReason:         u.exitReason || "",
+        jobLocation:        u.jobLocation || "",
+        employmentStatus:   u.employmentStatus || "",
+        shiftDetails:       u.shiftDetails || "",
+
+        // Reporting Chain
+        managerName:       u.managerName || u.reportingL1 || "",
+        reportingL1:       u.reportingL1 || u.managerName || "",
+        reportingL2:       u.reportingL2 || "",
+        reportingL3:       u.reportingL3 || "",
+        supervisorDetails: u.supervisorDetails || "",
+
+        // Bank & Statutory
+        bankName:          u.bankName || "",
+        bankAccountNumber: u.bankAccountNumber || "",
+        bankIfsc:          u.bankIfsc || "",
+        pfNumber:          u.pfNumber || "",
+        uanNumber:         u.uanNumber || "",
+        esiNumber:         u.esiNumber || "",
+        salaryPaymentMode: u.salaryPaymentMode || "",
+
+        // Attendance & Leave
+        attendanceNotes:           u.attendanceNotes || "",
+        leaveHistoryNotes:         u.leaveHistoryNotes || "",
+        wfhRecords:                u.wfhRecords || "",
+        shiftPatterns:             u.shiftPatterns || "",
+        timesheetDetails:          u.timesheetDetails || "",
+        holidayCalendarReference:  u.holidayCalendarReference || "",
+        leaveEntitlements:         u.leaveEntitlements || "",
+
+        // Learning & Performance
+        educationalQualifications: u.educationalQualifications || "",
+        professionalCertifications: u.professionalCertifications || "",
+        trainingHistory:           u.trainingHistory || "",
+        skills:                    u.skills || "",
+        performanceAppraisals:     u.performanceAppraisals || "",
+        promotionsTransfers:       u.promotionsTransfers || "",
+        disciplinaryRecords:       u.disciplinaryRecords || "",
+        rewardsRecognition:        u.rewardsRecognition || "",
+        employmentContracts:       u.employmentContracts || "",
+        ndaOrNonCompete:           u.ndaOrNonCompete || "",
+        backgroundVerification:    u.backgroundVerification || "",
+        medicalHealthRecords:      u.medicalHealthRecords || "",
+        workPermits:               u.workPermits || "",
+        legalNotices:              u.legalNotices || "",
+
+        // Avatar
         avatarKey,
         avatarUrl, // ✅ signed (use directly in <img src>)
+        photoUrl:  u.photoUrl || avatarUrl || "",
+
+        // HRMS Access
+        hrmsAccessRole:  u.hrmsAccessRole || "EMPLOYEE",
+        hrmsAccessLevel: u.hrmsAccessLevel || "EMPLOYEE",
       });
     } catch (err) {
       next(err);
@@ -199,6 +296,7 @@ r.get(
 r.post(
   "/profile/update",
   requireAuth,
+  requirePermission("people", "WRITE"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const userId = (req as any).user?.sub;
@@ -264,6 +362,7 @@ r.post(
 r.post(
   "/profile/avatar/confirm",
   requireAuth,
+  requirePermission("people", "WRITE"),
   requireWorkspace,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
