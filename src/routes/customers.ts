@@ -34,6 +34,15 @@ router.get("/", requireAuth, requireWorkspace, requireAdmin, async (_req: any, r
         onboardingId: c.onboardingId,
         updatedAt: c.updatedAt,
         submittedAt: c.createdAt,
+        phone: c.phone || c.mobile || "",
+        mobile: c.mobile || "",
+        gstNumber: c.gstNumber || "",
+        legalName: c.legalName || c.name,
+        website: c.website || "",
+        address: c.address || {},
+        subType: c.subType || "",
+        source: c.source || "",
+        workspaceId: c.workspaceId || "",
       })),
     });
   } catch (err) {
@@ -113,6 +122,22 @@ router.get("/account-team", requireAuth, async (req: any, res, next) => {
     }
 
     res.json({ accountTeam: record.accountTeam || null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/customers/:id
+ * Returns the full Customer document by _id.
+ */
+router.get("/:id", validateObjectId("id"), requireAuth, async (req: any, res, next) => {
+  try {
+    const customer = await Customer.findById(req.params.id).lean().exec();
+    if (!customer) {
+      return res.status(404).json({ error: "Not found" });
+    }
+    return res.json(customer);
   } catch (err) {
     next(err);
   }

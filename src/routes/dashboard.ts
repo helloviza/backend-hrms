@@ -6,6 +6,10 @@ import Employee from "../models/Employee.js";
 import LeaveRequest from "../models/LeaveRequest.js";
 import Attendance from "../models/Attendance.js";
 import Onboarding from "../models/Onboarding.js";
+import User from "../models/User.js";
+
+import { requireAuth } from "../middleware/auth.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 
 // For Excel export
 import XLSX from "xlsx";
@@ -310,7 +314,7 @@ router.get("/hr-admin", async (req: Request, res: Response) => {
 // GET /api/dashboard/manager
 // Manager overview – matches Manager.tsx expectations
 // ---------------------------------------------------------------------------
-router.get("/manager", async (req: Request, res: Response) => {
+router.get("/manager", requireAuth, async (req: Request, res: Response) => {
   try {
     const {
       fromDate,
@@ -322,34 +326,91 @@ router.get("/manager", async (req: Request, res: Response) => {
       attendanceFilter,
     } = buildFiltersFromQuery(req.query);
 
-    // Basic manager context (if auth middleware attaches user)
-    const authUser: any = (req as any).user || null;
+    // ── FIX 2: Resolve manager's own Employee doc to scope team ──
+    const userId = String(
+      (req as any).user?._id || (req as any).user?.id || (req as any).user?.sub
+    );
 
-    // Start from the same employeeFilter (status/department/location)
-    const teamFilter: any = { ...employeeFilter };
+    const managerEmployee = await Employee.findOne({
+      $or: [
+        { ownerId: userId },
+        { email: (req as any).user?.email },
+      ],
+    }).lean();
 
-    // OPTIONAL: try to narrow down by manager info if present.
-    // These fields are guesses and safe even if they don't exist in schema.
-    if (authUser?.employeeCode) {
-      // If your Employee schema has managerCode / reportingManagerCode, align here.
-      teamFilter.managerCode = authUser.employeeCode;
-    } else if (authUser?._id) {
-      // Or if you store managerId
-      teamFilter.managerId = authUser._id;
+    const managerEmpId = (managerEmployee as any)?._id;
+
+    const teamFilter: any = { ...employeeFilter, isActive: true };
+    if (managerEmpId) {
+      teamFilter.managerId = managerEmpId;
+    }
+    // SuperAdmin sees all
+    if (isSuperAdmin(req)) {
+      delete teamFilter.managerId;
     }
 
-    // Team = employees that match the filter (possibly whole org for now)
-    const team = await Employee.find(teamFilter)
+    // ── FIX 3: Include phone + email in select ──
+    const employees = await Employee.find(teamFilter)
       .select(
-        "fullName name employeeCode employeeId department location jobTitle status joiningDate"
+        "fullName name email employeeCode employeeId department location jobTitle designation hrmsAccessRole status joiningDate managerId phone email"
       )
       .sort({ fullName: 1 })
       .limit(200)
       .lean();
 
-    const teamIds = team
+    const teamIds = employees
       .map((e: any) => e._id)
       .filter((id: any) => !!id);
+
+    // ── USER JOIN: pull designation / hrmsAccessRole / department / dateOfBirth from User ──
+    const emails = employees.map((e: any) => e.email).filter(Boolean);
+    const userDocs = emails.length
+      ? await User.find(
+          { email: { $in: emails } },
+          "email designation hrmsAccessRole department jobTitle _id dateOfBirth"
+        ).lean()
+      : [];
+    const userMap = new Map(
+      (userDocs as any[]).map((u: any) => [u.email, u])
+    );
+
+    const enriched = employees.map((e: any) => ({
+      ...e,
+      designation:
+        userMap.get(e.email)?.designation || e.designation || e.jobTitle || "",
+      roleTitle:
+        userMap.get(e.email)?.hrmsAccessRole ||
+        e.hrmsAccessRole ||
+        e.jobTitle ||
+        "",
+      department:
+        userMap.get(e.email)?.department || e.department || "",
+      location: e.location || "",
+    }));
+
+    // ── FIX 4: Resolve manager name for each team member ──
+    const managerIds = [...new Set(
+      employees
+        .map((e: any) => e.managerId?.toString())
+        .filter(Boolean)
+    )];
+
+    const managers = await Employee.find(
+      { _id: { $in: managerIds } },
+      "fullName name email"
+    ).lean();
+
+    const managerMap = new Map(
+      (managers as any[]).map((m: any) => [
+        m._id.toString(),
+        m.fullName || m.name || m.email,
+      ])
+    );
+
+    const withManager = enriched.map((e: any) => ({
+      ...e,
+      managerName: managerMap.get(e.managerId?.toString()) || "—",
+    }));
 
     // ── LEAVES for this manager's team (PENDING only) ──
     let openLeaves: any[] = [];
@@ -380,6 +441,139 @@ router.get("/manager", async (req: Request, res: Response) => {
       (row: any) => !row.punches || row.punches.length === 0
     ).length;
 
+    // ── TODAY STATUS: compute from attendance punches ──
+    // Attendance.userId refs User._id (not Employee._id); use userDocs for mapping
+    const userIds = (userDocs as any[]).map((u: any) => u._id).filter(Boolean);
+    const todayAttendanceFull = userIds.length
+      ? await Attendance.find(
+          { userId: { $in: userIds }, date: todayStr },
+          "userId punches"
+        ).lean()
+      : [];
+    const attMap = new Map(
+      (todayAttendanceFull as any[]).map((a: any) => [a.userId.toString(), a])
+    );
+
+    const withStatus = withManager.map((e: any) => {
+      const u = userMap.get(e.email);
+      const att = u ? attMap.get(u._id.toString()) : undefined;
+      let todayStatus = "absent";
+      if (att && Array.isArray((att as any).punches) && (att as any).punches.length > 0) {
+        const hasIn = (att as any).punches.some((p: any) => p.type === "IN");
+        const hasOut = (att as any).punches.some((p: any) => p.type === "OUT");
+        if (hasIn && hasOut) todayStatus = "present";
+        else if (hasIn) todayStatus = "active";
+      }
+      return { ...e, todayStatus };
+    });
+
+    // ── ATTENDANCE HEALTH: last 30 days punch rate per user ──
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const thirtyDaysAgoStr = thirtyDaysAgo.toISOString().split("T")[0];
+
+    const recentAtt = userIds.length
+      ? await Attendance.find(
+          { userId: { $in: userIds }, date: { $gte: thirtyDaysAgoStr } },
+          "userId punches"
+        ).lean()
+      : [];
+
+    const attCountMap = new Map<string, number>();
+    (recentAtt as any[]).forEach((a: any) => {
+      const uid = a.userId.toString();
+      if (Array.isArray(a.punches) && a.punches.length > 0) {
+        attCountMap.set(uid, (attCountMap.get(uid) || 0) + 1);
+      }
+    });
+
+    const withHealth = withStatus.map((e: any) => {
+      const u = userMap.get(e.email);
+      const uid = u ? u._id.toString() : undefined;
+      const days = uid ? (attCountMap.get(uid) || 0) : 0;
+      const pct = Math.round((days / 30) * 100);
+      return {
+        ...e,
+        attendanceScore: pct,
+        attendanceHealth:
+          pct >= 90 ? "Excellent" :
+          pct >= 75 ? "Good" :
+          pct >= 50 ? "Fair" : "Low",
+      };
+    });
+
+    // ── FIX 5: YTD leaves per team member ──
+    const currentYear = new Date().getFullYear();
+    const yearStart = new Date(currentYear, 0, 1);
+
+    const teamUserIds = (userDocs as any[]).map((u: any) => u._id);
+
+    const ytdLeaves = teamUserIds.length
+      ? await LeaveRequest.find({
+          userId: { $in: teamUserIds },
+          status: "APPROVED",
+          from: { $gte: yearStart },
+        }, "userId from to").lean()
+      : [];
+
+    const leaveMap = new Map<string, number>();
+    (ytdLeaves as any[]).forEach((l: any) => {
+      const uid = l.userId.toString();
+      const days =
+        l.to && l.from
+          ? Math.ceil(
+              (new Date(l.to).getTime() - new Date(l.from).getTime()) /
+                86400000
+            ) + 1
+          : 1;
+      leaveMap.set(uid, (leaveMap.get(uid) || 0) + days);
+    });
+
+    const withLeaves = withHealth.map((e: any) => {
+      const uid = userMap.get(e.email)?._id?.toString();
+      return {
+        ...e,
+        ytdLeaves: leaveMap.get(uid) || 0,
+        leaveDaysYtd: leaveMap.get(uid) || 0,
+      };
+    });
+
+    // ── FIX 6: Upcoming birthdays (next 30 days, month+day only) ──
+    const today = new Date();
+    const in30 = new Date();
+    in30.setDate(in30.getDate() + 30);
+
+    const todayMD = `${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const in30MD = `${String(in30.getMonth() + 1).padStart(2, "0")}-${String(in30.getDate()).padStart(2, "0")}`;
+
+    const upcomingBirthdays = (userDocs as any[])
+      .filter((u: any) => {
+        if (!u.dateOfBirth) return false;
+        const md = u.dateOfBirth.slice(5); // "MM-DD"
+        return md >= todayMD && md <= in30MD;
+      })
+      .map((u: any) => ({
+        name: u.name || u.firstName || u.email,
+        dateOfBirth: u.dateOfBirth,
+        employeeCode: u.employeeCode,
+      }));
+
+    // ── FIX 7: Upcoming anniversaries (next 30 days) ──
+    const upcomingAnniversaries = withLeaves
+      .filter((e: any) => {
+        if (!e.joiningDate) return false;
+        const jd = new Date(e.joiningDate);
+        const anniversaryMD =
+          `${String(jd.getMonth() + 1).padStart(2, "0")}-${String(jd.getDate()).padStart(2, "0")}`;
+        return anniversaryMD >= todayMD && anniversaryMD <= in30MD;
+      })
+      .map((e: any) => ({
+        name: e.fullName || e.name,
+        joiningDate: e.joiningDate,
+        employeeCode: e.employeeCode,
+        years: new Date().getFullYear() - new Date(e.joiningDate).getFullYear(),
+      }));
+
     // ── Manager Alerts ──
     const alerts: string[] = [];
     if (openLeaveRequests > 0) {
@@ -397,6 +591,7 @@ router.get("/manager", async (req: Request, res: Response) => {
       );
     }
 
+    // ── FIX 8: Return all new fields ──
     const response = {
       meta: {
         from: fromDate.toISOString(),
@@ -405,14 +600,16 @@ router.get("/manager", async (req: Request, res: Response) => {
         toStr,
       },
       counts: {
-        teamSize: team.length,
+        teamSize: employees.length,
         openLeaveRequests,
         todaysAbsents,
-        pendingOnboarding: 0, // TODO: wire if you track onboarding per manager
+        pendingOnboarding: 0,
       },
-      team,
+      team: withLeaves,
       alerts,
       openLeaves,
+      upcomingBirthdays,
+      upcomingAnniversaries,
     };
 
     res.json(response);

@@ -415,13 +415,14 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
 
       status: isDirectFlow ? "approved" : "pending",
       adminState: isDirectFlow ? "pending" : undefined,
-      stage: isDirectFlow ? "APPROVED" : "REQUEST_RAISED",
+      stage: isDirectFlow ? "REQUEST_APPROVED" : "REQUEST_RAISED",
       cartItems,
       comments: comments ? String(comments) : undefined,
 
       meta: {
         ...(wsInternalId ? { customerWorkspaceId: wsInternalId } : {}),
         ccLeaders: leaderEmails,
+        travelFlow: wsTravelFlow || "APPROVAL_FLOW",
         ...(isDirectFlow ? { autoApproved: true, autoApprovedReason: "APPROVAL_DIRECT" } : {}),
       },
 
@@ -978,8 +979,53 @@ router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res
 });
 
 /* ────────────────────────────────────────────────────────────────
+ * Admin: single request detail (READ)
+ * ──────────────────────────────────────────────────────────────── */
+
+router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj, res, next) => {
+  try {
+    const doc = await ApprovalRequest
+      .findById(req.params.id)
+      .populate("workspaceId", "name companyName config")
+      .lean();
+
+    if (!doc) return res.status(404).json({ error: "Request not found" });
+
+    console.log('[ApprovalRequest] full doc:', JSON.stringify(doc, null, 2));
+
+    res.json(doc);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
  * Admin: actions (WRITE — STAFF ONLY)
  * ──────────────────────────────────────────────────────────────── */
+
+router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
+  try {
+    const doc: any = await ApprovalRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ error: "Not found" });
+
+    doc.adminState = "in_progress";
+    doc.stage = "BOOKING_IN_PROGRESS";
+    doc.history = [
+      ...(doc.history || []),
+      {
+        action: "booking_started",
+        by: (req as AnyObj).user?.email || "admin",
+        at: new Date(),
+        note: "Admin started direct booking via SBT",
+      },
+    ];
+    await doc.save();
+
+    res.json({ success: true, doc });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 router.put("/admin/:id/assign", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
   try {
@@ -1032,7 +1078,7 @@ router.put(
       const st = String(doc.stage || "").toUpperCase();
       const legacyOk = !st && String(doc.status || "").toLowerCase() === "approved";
 
-      if (!["APPROVED", "PROPOSAL_APPROVED", "BOOKING_ON_HOLD", "PROPOSAL_ON_HOLD"].includes(st) && !legacyOk) {
+      if (!["APPROVED", "PROPOSAL_APPROVED", "REQUEST_APPROVED", "BOOKING_ON_HOLD", "PROPOSAL_ON_HOLD"].includes(st) && !legacyOk) {
         return res.status(400).json({ error: "Only proposal-approved requests can start booking" });
       }
       if (st === "PROPOSAL_ON_HOLD" && !legacyOk) {

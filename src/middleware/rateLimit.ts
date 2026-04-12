@@ -11,9 +11,13 @@ export const apiLimiter = rateLimit({
 });
 
 // Auth limiter — login, register, forgot-password
+// login and refresh are skipped here; they're still covered by apiLimiter (500/15 min)
 export const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
+  skip: (req) =>
+    req.path.includes('/login') ||
+    req.path.includes('/refresh'),
   keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
   standardHeaders: true,
   legacyHeaders: false,

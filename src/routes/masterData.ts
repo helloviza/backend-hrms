@@ -83,6 +83,7 @@ async function syncEmployeeRecord({
     onboardingSnapshot: form,
 
     ownerId: user._id,
+    workspaceId: user.workspaceId || user.customerId || user.businessId || null,
   };
 
   const existing = await Employee.findOne({

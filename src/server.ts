@@ -409,6 +409,13 @@ app.use("/api/dashboard", dashboardRouter);
 app.use("/api/hr/policies", hrPoliciesRouter);
 app.use("/api/hr", hrOrgChartRouter);
 
+// Manual Bookings — mounted before broad /api/admin routers so that
+// adminAnalyticsRouter's router.use(requireAdmin) does not intercept
+// these paths before manualBookingsRouter (which uses billing-access
+// instead of requireAdmin to allow RM-scoped access).
+import manualBookingsRouter from "./routes/manualBookings.js";
+app.use("/api/admin/manual-bookings", manualBookingsRouter);
+
 // Admin
 app.use("/api/admin", adminRouter);
 app.use("/api/admin", adminAnalyticsRouter);
@@ -425,6 +432,22 @@ app.use("/api/admin/payment-orphans", adminPaymentOrphansRouter);
 // Admin — Session logs (Winston logging + session tracking)
 import adminSessionsRouter from "./routes/admin.sessions.js";
 app.use("/api/admin/sessions", adminSessionsRouter);
+
+// Invoices, Reports, Company Settings (admin-only via router-level requireAdmin)
+import invoicesRouter from "./routes/invoices.js";
+import reportsRouter from "./routes/reports.js";
+import companySettingsRouter from "./routes/companySettings.js";
+app.use("/api/admin/invoices", invoicesRouter);
+app.use("/api/admin/reports", reportsRouter);
+app.use("/api/admin/company-settings", companySettingsRouter);
+
+// Billing Permissions (Super Admin grant/revoke + my-access for all users)
+import billingPermissionsRouter from "./routes/billingPermissions.js";
+app.use("/api/billing-permissions", billingPermissionsRouter);
+
+// Unified Permissions (UserPermission model — replaces BillingPermission long-term)
+import permissionsRouter from "./routes/permissions.js";
+app.use("/api/permissions", permissionsRouter);
 
 // Approvals & booking history
 app.use("/api/approvals", approvalsRouter);
@@ -482,6 +505,10 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
 
       // 🔥 START BACKGROUND WORKERS (ADDED – SAFE)
       startBackgroundWorkers();
+
+      // ✅ START REPORT SCHEDULER
+      const { startReportScheduler } = await import("./jobs/reportScheduler.js");
+      startReportScheduler();
 
       const server = app.listen(env.PORT, () => {
         logger.info("API running", { port: env.PORT });

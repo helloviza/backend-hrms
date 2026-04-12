@@ -386,6 +386,20 @@ function pickBusinessView(found: any | null) {
     status: d?.status || "",
     type: d?.type || "",
     updatedAt: d?.updatedAt || null,
+
+    // billing fields for invoice generation
+    legalName:         d?.legalName         || "",
+    companyName:       d?.companyName       || name || "",
+    gstNumber:         d?.gstNumber         || "",
+    gstin:             d?.gstin             || "",
+    registeredAddress: d?.registeredAddress || "",
+    phone:             d?.phone
+                       || d?.contacts?.primaryPhone
+                       || "",
+    officialEmail:     d?.contacts?.officialEmail
+                       || d?.officialEmail
+                       || email
+                       || "",
   };
 }
 
@@ -999,9 +1013,6 @@ router.get("/workspace/resolve", requireAuth, async (req: any, res) => {
  */
 router.get("/workspace/search", requireAuth, async (req: any, res) => {
   try {
-    const actor = req.user || {};
-    if (!isStaffPrivileged(actor)) return res.status(403).json({ error: "Access restricted" });
-
     const q = normStr(req.query?.q || "");
     const result = await staffSearchBusinesses(q);
     return res.json({ ok: true, q, rows: result.rows });
@@ -2488,33 +2499,28 @@ async function staffSearchBusinesses(q: string) {
 
   // Short / empty query → return most recent businesses (preload)
   if (query.length < 2) {
-    const [mdRecent, custRecent] = await Promise.all([
-      MasterData.find({ type: /business|customer/i })
-        .sort({ createdAt: -1 }).limit(20).lean().exec(),
-      Customer.find()
-        .sort({ createdAt: -1 }).limit(20).lean().exec(),
-    ]);
+    const custRecent: any[] = await Customer.find({ status: { $in: ["ACTIVE", "Active", "active"] } })
+      .sort({ name: 1 }).limit(200).lean().exec();
 
-    const merged = new Map<string, any>();
-    for (const c of (custRecent as any[]) || []) {
-      const id = String(c._id);
-      merged.set(id, {
-        id,
-        source: "Customer",
-        name: c.name || c.legalName || c.email || "",
-        email: c.email || "",
-        domain: c.email ? emailDomain(c.email) : "",
-        status: c.status || "",
-        type: c.type || "",
-        updatedAt: c.updatedAt || null,
-      });
-    }
-    for (const r of (mdRecent as any[]) || []) {
-      const view = pickBusinessView({ source: "MasterData", doc: r });
-      if (view?.id && !merged.has(view.id)) merged.set(view.id, view);
-    }
+    const rows = (custRecent || []).map((c: any) => ({
+      id:                String(c._id),
+      source:            "Customer",
+      name:              c.name || c.legalName || c.email || "",
+      email:             c.email || "",
+      domain:            c.email ? emailDomain(c.email) : "",
+      status:            c.status || "",
+      type:              c.type || "",
+      updatedAt:         c.updatedAt || null,
+      legalName:         c.legalName         || "",
+      companyName:       c.companyName       || c.name || "",
+      gstNumber:         c.gstNumber         || "",
+      registeredAddress: c.registeredAddress || [c.address?.street, c.address?.city, c.address?.state, c.address?.pincode].filter(Boolean).join(', ') || "",
+      address:           c.address           || {},
+      mobile:            c.mobile            || c.phone || "",
+      phone:             c.phone || c.contacts?.primaryPhone || "",
+      officialEmail:     c.contacts?.officialEmail || c.email || "",
+    }));
 
-    const rows = Array.from(merged.values()).slice(0, 20);
     return { rows, ids: rows.map((r: any) => String(r.id)) };
   }
 
@@ -2593,7 +2599,7 @@ async function staffSearchBusinesses(q: string) {
     ],
   })
     .sort({ updatedAt: -1, createdAt: -1 })
-    .limit(25)
+    .limit(100)
     .lean()
     .exec()) as any;
 
@@ -2610,6 +2616,19 @@ async function staffSearchBusinesses(q: string) {
       status: c.status || "",
       type: c.type || "",
       updatedAt: c.updatedAt || null,
+
+      // billing fields for invoice generation
+      legalName:         c.legalName         || "",
+      companyName:       c.legalName         || c.name || "",
+      gstNumber:         c.gstNumber         || "",
+      gstin:             c.gstNumber         || "",
+      registeredAddress: c.registeredAddress || "",
+      phone:             c.phone
+                         || c.contacts?.primaryPhone
+                         || "",
+      officialEmail:     c.contacts?.officialEmail
+                         || c.email
+                         || "",
     });
   }
   for (const md of mdRows || []) {

@@ -12,6 +12,10 @@ import { validateObjectId } from "../middleware/validateObjectId.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { sendEmployeeInvite } from "../services/email.service.js";
 import crypto from "crypto";
+import { s3 } from "../config/aws.js";
+import { env } from "../config/env.js";
+import { HeadObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const router = Router();
 
@@ -57,9 +61,14 @@ function isAdminish(user: any): boolean {
     ...(Array.isArray(user.roles) ? user.roles : []),
     ...(user.role ? [user.role] : []),
     ...(user.hrmsAccessRole ? [user.hrmsAccessRole] : []),
-  ].map((r) => String(r || "").toUpperCase());
+    ...(user.hrmsAccessLevel ? [user.hrmsAccessLevel] : []),
+  ]
+    .filter(Boolean)
+    .map((r) => String(r).toUpperCase());
 
-  return roles.includes("ADMIN") || roles.includes("SUPERADMIN");
+  return roles.some((r) =>
+    ["ADMIN", "SUPERADMIN", "SUPER_ADMIN", "HR", "HR_MANAGER", "HR_ADMIN"].includes(r)
+  );
 }
 
 function sanitise(user: AnyUser) {
@@ -115,7 +124,7 @@ router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
 
     const emails = employees.map((e: any) => e.email).filter(Boolean);
     const users = await User.find({ email: { $in: emails } })
-      .select("email roles hrmsAccessRole isActive activatedByAdmin tempPassword avatarKey avatarUrl lastLoginAt")
+      .select("-passwordHash -resetTokenHash -resetTokenExpiry")
       .lean();
 
     const userMap = new Map(users.map((u: any) => [u.email, u]));
@@ -139,6 +148,83 @@ router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       isActive: userMap.get(e.email)?.isActive ?? e.isActive,
       avatarKey: userMap.get(e.email)?.avatarKey || "",
       avatarUrl: userMap.get(e.email)?.avatarUrl || "",
+      firstName: userMap.get(e.email)?.firstName || e.firstName || "",
+      lastName:  userMap.get(e.email)?.lastName  || e.lastName  || "",
+      name:      userMap.get(e.email)?.name      || e.fullName  || e.name || "",
+      // ── PERSONAL ─────────────────────────────────────────────────
+      middleName:               userMap.get(e.email)?.middleName               || e.middleName               || "",
+      dateOfBirth:              userMap.get(e.email)?.dateOfBirth              || e.dateOfBirth              || "",
+      gender:                   userMap.get(e.email)?.gender                   || e.gender                   || "",
+      maritalStatus:            userMap.get(e.email)?.maritalStatus            || e.maritalStatus            || "",
+      nationality:              userMap.get(e.email)?.nationality              || e.nationality              || "",
+      bloodGroup:               userMap.get(e.email)?.bloodGroup               || e.bloodGroup               || "",
+      permanentAddress:         userMap.get(e.email)?.permanentAddress         || e.permanentAddress         || "",
+      currentAddress:           userMap.get(e.email)?.currentAddress           || e.currentAddress           || "",
+      phone:                    userMap.get(e.email)?.phone                    || e.phone                    || "",
+      personalContact:          userMap.get(e.email)?.personalContact          || e.personalContact          || "",
+      personalEmail:            userMap.get(e.email)?.personalEmail            || e.personalEmail            || "",
+      emergencyContactName:     userMap.get(e.email)?.emergencyContactName     || e.emergencyContactName     || "",
+      emergencyContactNumber:   userMap.get(e.email)?.emergencyContactNumber   || e.emergencyContactNumber   || "",
+      emergencyContactRelation: userMap.get(e.email)?.emergencyContactRelation || e.emergencyContactRelation || "",
+      photoUrl:                 userMap.get(e.email)?.photoUrl                 || e.photoUrl                 || "",
+      pan:                      userMap.get(e.email)?.pan                      || e.pan                      || "",
+      aadhaar:                  userMap.get(e.email)?.aadhaar                  || e.aadhaar                  || "",
+      passportNumber:           userMap.get(e.email)?.passportNumber           || e.passportNumber           || "",
+      passportExpiry:           userMap.get(e.email)?.passportExpiry           || e.passportExpiry           || "",
+      voterId:                  userMap.get(e.email)?.voterId                  || e.voterId                  || "",
+      disabilityStatus:         userMap.get(e.email)?.disabilityStatus         || e.disabilityStatus         || "",
+      // ── EMPLOYMENT ───────────────────────────────────────────────
+      officialEmail:            userMap.get(e.email)?.officialEmail            || e.officialEmail            || "",
+      employeeCode:             userMap.get(e.email)?.employeeCode             || e.employeeCode             || "",
+      department:               userMap.get(e.email)?.department               || e.department               || "",
+      designation:              userMap.get(e.email)?.designation              || e.designation              || "",
+      employeeType:             userMap.get(e.email)?.employeeType             || e.employeeType             || "",
+      dateOfJoining:            userMap.get(e.email)?.dateOfJoining            || e.dateOfJoining            || "",
+      dateOfConfirmation:       userMap.get(e.email)?.dateOfConfirmation       || e.dateOfConfirmation       || "",
+      reportingL1:              userMap.get(e.email)?.reportingL1              || e.reportingL1              || "",
+      reportingL2:              userMap.get(e.email)?.reportingL2              || e.reportingL2              || "",
+      reportingL3:              userMap.get(e.email)?.reportingL3              || e.reportingL3              || "",
+      managerName:              userMap.get(e.email)?.managerName              || e.managerName              || "",
+      jobLocation:              userMap.get(e.email)?.jobLocation              || e.jobLocation              || "",
+      employmentStatus:         userMap.get(e.email)?.employmentStatus         || e.employmentStatus         || "",
+      shiftDetails:             userMap.get(e.email)?.shiftDetails             || e.shiftDetails             || "",
+      probationPeriod:          userMap.get(e.email)?.probationPeriod          || e.probationPeriod          || "",
+      contractStartDate:        userMap.get(e.email)?.contractStartDate        || e.contractStartDate        || "",
+      contractEndDate:          userMap.get(e.email)?.contractEndDate          || e.contractEndDate          || "",
+      exitDate:                 userMap.get(e.email)?.exitDate                 || e.exitDate                 || "",
+      exitReason:               userMap.get(e.email)?.exitReason               || e.exitReason               || "",
+      supervisorDetails:        userMap.get(e.email)?.supervisorDetails        || e.supervisorDetails        || "",
+      // ── BANK & STATUTORY ─────────────────────────────────────────
+      bankName:                 userMap.get(e.email)?.bankName                 || e.bankName                 || "",
+      bankAccountNumber:        userMap.get(e.email)?.bankAccountNumber        || e.bankAccountNumber        || "",
+      bankIfsc:                 userMap.get(e.email)?.bankIfsc                 || e.bankIfsc                 || "",
+      pfNumber:                 userMap.get(e.email)?.pfNumber                 || e.pfNumber                 || "",
+      uanNumber:                userMap.get(e.email)?.uanNumber                || e.uanNumber                || "",
+      esiNumber:                userMap.get(e.email)?.esiNumber                || e.esiNumber                || "",
+      salaryPaymentMode:        userMap.get(e.email)?.salaryPaymentMode        || e.salaryPaymentMode        || "",
+      // ── ATTENDANCE & LEAVE ───────────────────────────────────────
+      attendanceNotes:          userMap.get(e.email)?.attendanceNotes          || e.attendanceNotes          || "",
+      wfhRecords:               userMap.get(e.email)?.wfhRecords               || e.wfhRecords               || "",
+      shiftPatterns:            userMap.get(e.email)?.shiftPatterns            || e.shiftPatterns            || "",
+      timesheetDetails:         userMap.get(e.email)?.timesheetDetails         || e.timesheetDetails         || "",
+      holidayCalendarReference: userMap.get(e.email)?.holidayCalendarReference || e.holidayCalendarReference || "",
+      leaveEntitlements:        userMap.get(e.email)?.leaveEntitlements        || e.leaveEntitlements        || "",
+      leaveHistoryNotes:        userMap.get(e.email)?.leaveHistoryNotes        || e.leaveHistoryNotes        || "",
+      // ── LEARNING & PERFORMANCE ───────────────────────────────────
+      educationalQualifications:  userMap.get(e.email)?.educationalQualifications  || e.educationalQualifications  || "",
+      professionalCertifications: userMap.get(e.email)?.professionalCertifications || e.professionalCertifications || "",
+      trainingHistory:            userMap.get(e.email)?.trainingHistory            || e.trainingHistory            || "",
+      skills:                     userMap.get(e.email)?.skills                     || e.skills                     || "",
+      performanceAppraisals:      userMap.get(e.email)?.performanceAppraisals      || e.performanceAppraisals      || "",
+      promotionsTransfers:        userMap.get(e.email)?.promotionsTransfers        || e.promotionsTransfers        || "",
+      disciplinaryRecords:        userMap.get(e.email)?.disciplinaryRecords        || e.disciplinaryRecords        || "",
+      rewardsRecognition:         userMap.get(e.email)?.rewardsRecognition         || e.rewardsRecognition         || "",
+      employmentContracts:        userMap.get(e.email)?.employmentContracts        || e.employmentContracts        || "",
+      ndaOrNonCompete:            userMap.get(e.email)?.ndaOrNonCompete            || e.ndaOrNonCompete            || "",
+      backgroundVerification:     userMap.get(e.email)?.backgroundVerification     || e.backgroundVerification     || "",
+      medicalHealthRecords:       userMap.get(e.email)?.medicalHealthRecords       || e.medicalHealthRecords       || "",
+      workPermits:                userMap.get(e.email)?.workPermits                || e.workPermits                || "",
+      legalNotices:               userMap.get(e.email)?.legalNotices               || e.legalNotices               || "",
       hasLogin: userMap.has(e.email),
       activatedByAdmin: userMap.get(e.email)?.activatedByAdmin || false,
       tempPassword: userMap.get(e.email)?.tempPassword || false,
@@ -152,13 +238,12 @@ router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
 
     const flattened = enriched.map((e: any) => {
       const snap = e.onboardingSnapshot || {};
-      const nameParts = (e.fullName || snap.fullName || e.name || "").trim().split(" ");
 
       return {
         ...e,
-        firstName: e.firstName || nameParts[0] || "",
-        lastName: e.lastName || nameParts.slice(1).join(" ") || "",
-        name: e.fullName || snap.fullName || e.name || "",
+        firstName: e.firstName || "",
+        lastName: e.lastName || "",
+        name: e.fullName || [e.firstName, e.lastName].filter(Boolean).join(" ") || e.name || "",
         personalContact: e.personalContact || snap.contact?.personalMobile || e.phone || "",
         personalEmail: e.personalEmail || snap.contact?.personalEmail || "",
         officialEmail: e.officialEmail || e.email || "",
@@ -403,9 +488,60 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
 });
 
 /**
+ * POST /api/employees/:id/avatar/confirm
+ * Saves an uploaded S3 avatar key to a specific employee's User record.
+ * Requires Admin / HR. Called after frontend PUT-to-S3 presign flow.
+ * Body: { key: "avatars/..." }
+ * Returns: { avatarKey, avatarUrl }
+ */
+router.post("/:id/avatar/confirm", validateObjectId("id"), requireAuth, requireWorkspace, async (req: any, res, next) => {
+  try {
+    if (!isAdminish(req.user)) {
+      return res.status(403).json({ error: "Only admins or HR can update employee avatars" });
+    }
+
+    const { id } = req.params;
+    const { key } = req.body || {};
+    if (!key || typeof key !== "string" || !key.startsWith("avatars/")) {
+      return res.status(400).json({ error: "key is required and must begin with avatars/" });
+    }
+
+    // Resolve employee → user
+    const empQuery: any = { _id: id };
+    if (!isSuperAdmin(req) && req.workspaceObjectId) empQuery.workspaceId = req.workspaceObjectId;
+    const employeeDoc = await Employee.findOne(empQuery).exec();
+    const userId = employeeDoc?.ownerId ?? id;
+    const existing: AnyUser | null = isSuperAdmin(req)
+      ? await User.findById(userId)
+      : await scopedFindById(User, userId, req.workspaceObjectId);
+    if (!existing) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    // Verify object exists in S3 before committing
+    try {
+      await s3.send(new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: key }));
+    } catch {
+      return res.status(404).json({ error: "Avatar object not found on S3" });
+    }
+
+    await User.findByIdAndUpdate(userId, {
+      $set: { avatarKey: key, avatarUpdatedAt: new Date(), avatarUrl: "" },
+    });
+
+    const cmd = new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: key });
+    const avatarUrl = await getSignedUrl(s3, cmd, { expiresIn: env.PRESIGN_TTL || 3600 });
+
+    res.json({ avatarKey: key, avatarUrl });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * PUT /api/employees/:id
  * Update an existing employee record.
- * - Requires Admin / SuperAdmin.
+ * - Requires Admin / HR.
  * - Does not allow direct passwordHash changes here.
  */
 router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async (req: any, res, next) => {
@@ -423,7 +559,13 @@ router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async 
     // First try to find by Employee doc to get ownerId
     const empQuery: any = { _id: id };
     if (!isSuperAdmin(req) && req.workspaceObjectId) empQuery.workspaceId = req.workspaceObjectId;
-    const employeeDoc = await Employee.findOne(empQuery).exec();
+    let employeeDoc = await Employee.findOne(empQuery).exec();
+
+    // Fallback for docs with missing workspaceId (SuperAdmin only)
+    if (!employeeDoc && isSuperAdmin(req)) {
+      employeeDoc = await Employee.findOne({ _id: id }).exec();
+    }
+
     const userId = employeeDoc?.ownerId ?? id;
     const existing: AnyUser | null = isSuperAdmin(req)
       ? await User.findById(userId)
@@ -470,6 +612,18 @@ router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async 
     } = body;
 
     Object.assign(existing, safeBody);
+
+    // Mirror reporting fields — keep both in sync
+    if (safeBody.reportingL1 !== undefined) {
+      existing.managerName = safeBody.reportingL1;
+    }
+    if (safeBody.managerName !== undefined && !safeBody.reportingL1) {
+      existing.reportingL1 = safeBody.managerName;
+    }
+    if (safeBody.managerL1 !== undefined) {
+      existing.reportingL1 = safeBody.managerL1;
+      existing.managerName = safeBody.managerL1;
+    }
 
     // Sync roles AFTER Object.assign so nothing can overwrite them
     if (body.hrmsAccessRole) {
