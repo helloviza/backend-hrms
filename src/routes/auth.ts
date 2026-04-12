@@ -17,6 +17,7 @@ import Vendor from "../models/Vendor.js";
 import CustomerMember from "../models/CustomerMember.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import MasterData from "../models/MasterData.js";
+import { UserPermission } from "../models/UserPermission.js";
 
 const r = Router();
 
@@ -656,6 +657,28 @@ r.post("/register", async (req, res) => {
 
     const normalizedEmail = normalizeEmail(email);
 
+    // Check pre-existing permission grant
+    // SuperAdmin emails bypass this check
+    const SUPERADMIN_EMAILS = [
+      'admin@plumtrips.com',
+      'imran.ali@plumtrips.com',
+    ];
+
+    const isSAEmail = SUPERADMIN_EMAILS.includes(normalizedEmail);
+
+    if (!isSAEmail) {
+      const permission = await UserPermission.findOne({
+        email: normalizedEmail,
+        status: { $ne: 'revoked' },
+      }).lean();
+
+      if (!permission) {
+        return res.status(403).json({
+          error: 'You are not authorized to create an account. Please contact your administrator to request access.',
+        });
+      }
+    }
+
     const existing = await User.findOne({ email: normalizedEmail });
     if (existing) return res.status(400).json({ error: "User already exists" });
 
@@ -747,6 +770,41 @@ r.post("/login", loginLimiter, async (req, res) => {
         failureReason: "user_not_found_or_no_password",
       }).catch(() => {});
       return res.status(400).json({ error: "Invalid credentials or password not set" });
+    }
+
+    // SuperAdmin bypass — role-based or email-based
+    const SUPERADMIN_EMAILS = [
+      'admin@plumtrips.com',
+      'imran.ali@plumtrips.com',
+    ];
+    const isSAEmail = SUPERADMIN_EMAILS.includes(normalizedEmail);
+
+    const isSA =
+      user.roles?.includes('SuperAdmin') ||
+      user.hrmsAccessRole === 'SuperAdmin';
+
+    if (!isSA && !isSAEmail) {
+      const permission = await UserPermission.findOne({
+        email: normalizedEmail,
+      }).lean();
+
+      if (!permission) {
+        return res.status(403).json({
+          error: 'Your account has not been activated yet. Please contact your administrator.',
+        });
+      }
+
+      if (permission.status === 'revoked') {
+        return res.status(403).json({
+          error: 'Your access to Plumbox has been revoked. Please contact your administrator.',
+        });
+      }
+
+      if (permission.status === 'suspended') {
+        return res.status(403).json({
+          error: `Your account has been temporarily suspended.${permission.suspendReason ? ` Reason: ${permission.suspendReason}` : ''} Please contact your administrator.`,
+        });
+      }
     }
 
     const ok = await bcrypt.compare(password, user.passwordHash);

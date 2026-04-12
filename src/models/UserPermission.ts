@@ -16,17 +16,33 @@ const modulePermissionSchema = new Schema<ModulePermission>(
   { _id: false }
 )
 
+export type PermissionStatus = 'active' | 'suspended' | 'revoked'
+export type PermissionTier = 0 | 1 | 2 | 3
+export type PermissionRoleType = 'EMPLOYEE' | 'CLIENT' | 'VENDOR' | 'SUPERADMIN'
+export type PermissionSource = 'onboarding' | 'manual' | 'migration' | 'system'
+
 export interface UserPermissionDoc extends Document {
   userId: string
   email: string
   workspaceId: string
   universe: 'STAFF' | 'CUSTOMER' | 'VENDOR'
+  source: PermissionSource
 
   level: {
     code: string
     name: string
     designation: string
   }
+
+  status: PermissionStatus
+  tier: PermissionTier
+  grantedModules: string[]
+  roleType: PermissionRoleType
+
+  suspendedAt: Date | null
+  revokedAt: Date | null
+  suspendReason: string
+  revokeReason: string
 
   modules: {
     // HR & People
@@ -147,6 +163,33 @@ const userPermissionSchema = new Schema<UserPermissionDoc>(
     },
 
     modules: { type: modulesSchema, default: () => ({}) },
+
+    status: {
+      type: String,
+      enum: ['active', 'suspended', 'revoked'],
+      default: 'active',
+    },
+    tier: {
+      type: Number,
+      enum: [0, 1, 2, 3],
+      default: 0,
+    },
+    grantedModules: { type: [String], default: [] },
+    roleType: {
+      type: String,
+      enum: ['EMPLOYEE', 'CLIENT', 'VENDOR', 'SUPERADMIN'],
+      default: 'EMPLOYEE',
+    },
+    suspendedAt: { type: Date, default: null },
+    revokedAt: { type: Date, default: null },
+    suspendReason: { type: String, default: '' },
+    revokeReason: { type: String, default: '' },
+
+    source: {
+      type: String,
+      enum: ['onboarding', 'manual', 'migration', 'system'],
+      default: 'manual',
+    },
 
     grantedBy: { type: String, required: true },
     grantedAt: { type: Date, required: true, default: () => new Date() },

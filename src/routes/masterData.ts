@@ -18,7 +18,8 @@ import { validateObjectId } from "../middleware/validateObjectId.js";
 import { sendMail } from "../utils/mailer.js";
 import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
 import { sendOnboardingWelcomeEmail } from "../utils/onboardingWelcomeEmail.js";
-import { sendEmployeeWelcomeEmail } from "../utils/employeeWelcomeEmail.js";
+import { sendEmployeeWelcomeEmail, sendClientWelcomeEmail } from "../utils/employeeWelcomeEmail.js";
+import { UserPermission } from "../models/UserPermission.js";
 
 
 const router = Router();
@@ -829,6 +830,37 @@ router.post(
     (onboardingDoc as any).welcomeEmailSent = true;
   }
 
+  // Auto-create UserPermission at Tier 0
+  try {
+    await UserPermission.findOneAndUpdate(
+      { email: email.toLowerCase() },
+      {
+        $setOnInsert: {
+          userId:     String(saved._id),
+          email:      email.toLowerCase(),
+          workspaceId: String(workspaceId || req.workspaceObjectId),
+          universe:   'STAFF' as const,
+          level: {
+            code:        'L1',
+            name:        'Employee',
+            designation: (req.body as any)?.jobTitle || 'Employee',
+          },
+          status:        'active',
+          tier:          0,
+          roleType:      'EMPLOYEE',
+          grantedModules: [],
+          modules:       {},
+          source:        'onboarding',
+          grantedBy:     'system',
+          grantedAt:     new Date(),
+        },
+      },
+      { upsert: true, new: true },
+    )
+  } catch (permErr) {
+    console.warn('[promote-employee] UserPermission upsert failed:', permErr)
+  }
+
   await onboardingDoc.save();
 
   return res.json({
@@ -881,6 +913,37 @@ if (!(onboardingDoc as any).welcomeEmailSent) {
     console.error("[promote-employee] welcome email failed:", empEmailErr);
   }
   (onboardingDoc as any).welcomeEmailSent = true;
+}
+
+// Auto-create UserPermission at Tier 0
+try {
+  await UserPermission.findOneAndUpdate(
+    { email: email.toLowerCase() },
+    {
+      $setOnInsert: {
+        userId:     String(user._id),
+        email:      email.toLowerCase(),
+        workspaceId: String(workspaceId || req.workspaceObjectId),
+        universe:   'STAFF' as const,
+        level: {
+          code:        'L1',
+          name:        'Employee',
+          designation: (req.body as any)?.jobTitle || 'Employee',
+        },
+        status:        'active',
+        tier:          0,
+        roleType:      'EMPLOYEE',
+        grantedModules: [],
+        modules:       {},
+        source:        'onboarding',
+        grantedBy:     'system',
+        grantedAt:     new Date(),
+      },
+    },
+    { upsert: true, new: true },
+  )
+} catch (permErr) {
+  console.warn('[promote-employee] UserPermission upsert failed:', permErr)
 }
 
 await onboardingDoc.save();
@@ -1025,6 +1088,74 @@ if (!(onboardingDoc as any).welcomeEmailSent) {
 }
 
 await onboardingDoc.save();
+
+// Create User account + UserPermission for vendor
+if (email) {
+  let vendorUser: any = await User.findOne({ email: email.toLowerCase() }).lean()
+
+  if (!vendorUser) {
+    const tempPassword =
+      'PLMX-' + Math.random().toString(36).slice(2, 10).toUpperCase()
+    const passwordHash = await bcrypt.hash(tempPassword, 10)
+
+    vendorUser = await User.create({
+      email:          email.toLowerCase(),
+      name:           form.companyName || name,
+      passwordHash,
+      roles:          ['VENDOR'],
+      role:           'VENDOR',
+      hrmsAccessRole: 'VENDOR',
+      status:         'ACTIVE',
+      workspaceId:    workspaceId || req.workspaceObjectId,
+      tempPassword:   true,
+    })
+
+    try {
+      await sendClientWelcomeEmail({
+        to:        email,
+        name:      (vendorUser as any).name,
+        tempPassword,
+        loginUrl:  'https://plumbox.plumtrips.com',
+      })
+    } catch (emailErr) {
+      console.warn('[promote-vendor] Welcome email failed:', emailErr)
+    }
+  }
+
+  try {
+    await UserPermission.findOneAndUpdate(
+      { email: email.toLowerCase() },
+      {
+        $setOnInsert: {
+          userId:     String((vendorUser as any)._id),
+          email:      email.toLowerCase(),
+          workspaceId: String(workspaceId || req.workspaceObjectId),
+          universe:   'VENDOR' as const,
+          level: {
+            code:        'VENDOR',
+            name:        'Vendor',
+            designation: 'Vendor Partner',
+          },
+          status:        'active',
+          tier:          1,
+          roleType:      'VENDOR',
+          grantedModules: ['profile', 'myServices'],
+          modules:       {},
+          source:        'onboarding',
+          grantedBy:     'system',
+          grantedAt:     new Date(),
+        },
+      },
+      { upsert: true, new: true },
+    )
+  } catch (permErr) {
+    console.warn('[promote-vendor] UserPermission upsert failed:', permErr)
+  }
+
+  await Vendor.findByIdAndUpdate(vendor._id, {
+    linkedUserId: String((vendorUser as any)._id),
+  })
+}
 
 return res.json({
   ok: true,
@@ -1251,6 +1382,75 @@ if (!(onboardingDoc as any).welcomeEmailSent) {
 }
 
 await onboardingDoc.save();
+
+// Create User account + UserPermission for business client
+if (email) {
+  let clientUser: any = await User.findOne({ email: email.toLowerCase() }).lean()
+
+  if (!clientUser) {
+    const tempPassword =
+      'PLMX-' + Math.random().toString(36).slice(2, 10).toUpperCase()
+    const passwordHash = await bcrypt.hash(tempPassword, 10)
+
+    clientUser = await User.create({
+      email:          email.toLowerCase(),
+      officialEmail:  email.toLowerCase(),
+      name:           form.legalName || name,
+      passwordHash,
+      roles:          ['CUSTOMER'],
+      role:           'CUSTOMER',
+      hrmsAccessRole: 'CUSTOMER',
+      status:         'ACTIVE',
+      workspaceId:    workspaceId || req.workspaceObjectId,
+      tempPassword:   true,
+    })
+
+    try {
+      await sendClientWelcomeEmail({
+        to:        email,
+        name:      (clientUser as any).name,
+        tempPassword,
+        loginUrl:  'https://plumbox.plumtrips.com',
+      })
+    } catch (emailErr) {
+      console.warn('[promote-customer] Welcome email failed:', emailErr)
+    }
+  }
+
+  try {
+    await UserPermission.findOneAndUpdate(
+      { email: email.toLowerCase() },
+      {
+        $setOnInsert: {
+          userId:     String((clientUser as any)._id),
+          email:      email.toLowerCase(),
+          workspaceId: String(workspaceId || req.workspaceObjectId),
+          universe:   'CUSTOMER' as const,
+          level: {
+            code:        'CUSTOMER_APPROVAL',
+            name:        'Business Client',
+            designation: 'Client',
+          },
+          status:        'active',
+          tier:          1,
+          roleType:      'CLIENT',
+          grantedModules: ['profile', 'myBookings', 'myInvoices'],
+          modules:       {},
+          source:        'onboarding',
+          grantedBy:     'system',
+          grantedAt:     new Date(),
+        },
+      },
+      { upsert: true, new: true },
+    )
+  } catch (permErr) {
+    console.warn('[promote-customer] UserPermission upsert failed:', permErr)
+  }
+
+  await Customer.findByIdAndUpdate(customer._id, {
+    linkedUserId: String((clientUser as any)._id),
+  })
+}
 
 return res.json({
   ok: true,

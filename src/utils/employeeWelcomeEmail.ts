@@ -98,3 +98,68 @@ This is an automated message from PlumTrips HRMS. Do not reply to this email.<br
     kind: "WELCOME",
   });
 }
+
+export async function sendClientWelcomeEmail(params: {
+  to: string;
+  name: string;
+  tempPassword: string;
+  loginUrl: string;
+}): Promise<void> {
+  const { to, name, tempPassword, loginUrl } = params;
+  const firstName = String(name || "").trim().split(/\s+/)[0] || "there";
+
+  const html = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width"/></head>
+<body style="margin:0;padding:0;background:#f4f6f8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:580px;margin:32px auto;">
+
+<!-- HEADER BAR -->
+<tr><td style="background:#00477f;padding:18px 28px;border-radius:14px 14px 0 0;">
+<span style="color:#ffffff;font-size:17px;font-weight:700;letter-spacing:0.5px;">Plumbox by PlumTrips</span>
+</td></tr>
+
+<!-- BODY -->
+<tr><td style="background:#ffffff;padding:32px 28px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">
+
+<h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#1e293b;">Welcome to Plumbox, ${firstName}!</h1>
+
+<p style="margin:0 0 20px;font-size:15px;color:#475569;line-height:1.6;">
+Your Plumbox account has been created. Use the credentials below to log in.
+</p>
+
+<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:18px 20px;margin:24px 0;">
+<table cellpadding="0" cellspacing="0" style="width:100%;font-size:13px;color:#334155;">
+<tr><td style="padding:5px 0;font-weight:600;width:170px;">Login URL</td><td style="padding:5px 0;"><a href="${loginUrl}" style="color:#00477f;text-decoration:underline;">${loginUrl}</a></td></tr>
+<tr><td style="padding:5px 0;font-weight:600;">Email</td><td style="padding:5px 0;">${to}</td></tr>
+<tr><td style="padding:5px 0;font-weight:600;">Temporary Password</td><td style="padding:5px 0;font-family:monospace;font-size:14px;color:#0f172a;font-weight:700;">${tempPassword}</td></tr>
+</table>
+</div>
+
+<p style="margin:12px 0 0;font-size:13px;color:#b45309;font-weight:700;">Please change your password after first login.</p>
+
+<div style="text-align:center;margin:28px 0 8px;">
+<a href="${loginUrl}" style="display:inline-block;background:#00477f;color:#ffffff;font-size:15px;font-weight:600;padding:14px 40px;border-radius:10px;text-decoration:none;">Log In to Plumbox</a>
+</div>
+
+</td></tr>
+
+<!-- FOOTER -->
+<tr><td style="background:#f8fafc;padding:18px 28px;text-align:center;font-size:11px;color:#94a3b8;border:1px solid #e2e8f0;border-top:0;border-radius:0 0 14px 14px;">
+This is an automated message from Plumbox. Do not reply to this email.<br/>
+&copy; Peachmint Trips and Planners Private Limited
+</td></tr>
+
+</table>
+</body></html>`;
+
+  await sendMail({
+    to,
+    subject: "Welcome to Plumbox \u2014 Your Account is Ready",
+    html,
+    from:
+      process.env.MAIL_FROM_ONBOARDING ||
+      "Plumbox <onboarding@plumtrips.com>",
+    bcc: BCC_VERIFY,
+    kind: "WELCOME",
+  });
+}
