@@ -4,6 +4,7 @@ build:
   commands:
     pre-build:
       - npm install -g pnpm
+      - yum install -y atk at-spi2-atk cups-libs libdrm libXcomposite libXdamage libXfixes libXrandr libgbm libxkbcommon nspr nss alsa-lib
     build:
       - pnpm install --filter "@plumtrips/hrms-backend..." --frozen-lockfile
       - pnpm --filter "@plumtrips/hrms-backend" build
