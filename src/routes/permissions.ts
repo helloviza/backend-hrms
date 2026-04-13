@@ -29,7 +29,7 @@ function levelToRole(code: string): string {
 
 function roleToRolesArray(hrmsAccessRole: string): string[] {
   switch (hrmsAccessRole) {
-    case 'SUPERADMIN': return ['SuperAdmin']
+    case 'SUPERADMIN': return ['SUPERADMIN']
     case 'ADMIN':      return ['ADMIN']
     case 'HR':         return ['HR']
     case 'MANAGER':    return ['MANAGER']
@@ -53,6 +53,14 @@ router.get('/my-access', requireAuth, async (req: any, res: any) => {
         isSuperAdmin: true,
         level: { code: 'L8', name: 'Super Admin' },
         modules: allModules,
+        tier: 3,
+        roleType: 'SUPERADMIN',
+        status: 'active',
+        grantedModules: [
+          'bookings', 'billing', 'hrops',
+          'payroll', 'reports', 'adminQueue',
+          'people', 'access', 'onboarding',
+        ],
       })
     }
 
@@ -64,7 +72,34 @@ router.get('/my-access', requireAuth, async (req: any, res: any) => {
     const perm = await UserPermission.findOne({ userId }).lean()
 
     if (!perm) {
+      const userDoc = await User.findById(userId, 'roles').lean() as any
+      const isExternal =
+        userDoc?.roles?.includes('CUSTOMER') ||
+        userDoc?.roles?.includes('VENDOR') ||
+        userDoc?.roles?.includes('CLIENT')
+
+      if (isExternal) {
+        return res.json({
+          tier: 1,
+          roleType: 'CLIENT',
+          status: 'active',
+          grantedModules: ['bookings', 'billing', 'profile'],
+          source: 'auto',
+        })
+      }
+
       return res.json({ notGranted: true })
+    }
+
+    // For CUSTOMER_SBT / CUSTOMER_APPROVAL level grants that predate the
+    // grantedModules field, backfill the customer module list so hasModule()
+    // returns true for bookings/billing/profile on the frontend.
+    const isCustomerLevel =
+      perm.level?.code === 'CUSTOMER_SBT' || perm.level?.code === 'CUSTOMER_APPROVAL'
+    if (isCustomerLevel && (!perm.grantedModules || perm.grantedModules.length === 0)) {
+      const doc: any = { ...perm }
+      doc.grantedModules = ['bookings', 'billing', 'profile']
+      return res.json(doc)
     }
 
     return res.json(perm)

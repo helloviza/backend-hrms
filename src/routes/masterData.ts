@@ -349,6 +349,22 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       paymentTerms,
     };
 
+    // Duplicate check — same email + type + workspaceId
+    if (email) {
+      const existing = await Onboarding.findOne({
+        email,
+        type,
+        workspaceId,
+      }).lean();
+      if (existing) {
+        return res.status(409).json({
+          error: "A record with this email already exists",
+          existingId: existing._id,
+          token: (existing as any).token,
+        });
+      }
+    }
+
     const onboarding = await Onboarding.create({
       type,
       workspaceId,
@@ -427,7 +443,6 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
 
     const { id } = req.params;
     const body = req.body || {};
-
     const workspaceId = await resolveWorkspaceId(req);
     const query: any = { _id: id };
     if (workspaceId) query.workspaceId = workspaceId;
@@ -570,8 +585,39 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
     payload.billingAddress = billingAddress || payload.billingAddress;
     payload.creditLimit = creditLimit || payload.creditLimit;
     payload.paymentTerms = paymentTerms || payload.paymentTerms;
+    payload.legalName = body.legalName || body.companyName || body.name || payload.legalName;
 
     onboardingDoc.payload = payload;
+
+    // ----- also sync to formPayload (used by detail panel display) -----
+    if (!onboardingDoc.formPayload) {
+      onboardingDoc.formPayload = {};
+    }
+
+    const syncToFormPayload: Record<string, any> = {
+      legalName: body.legalName || body.companyName || body.name,
+      companyName: body.companyName || body.name,
+      gstNumber: body.gstNumber || body.gstin,
+      panNumber: body.panNumber || body.pan,
+      entityType: body.entityType,
+      registeredAddress: body.registeredAddress,
+      website: body.website,
+      industry: body.industry,
+      employeesCount: body.employeesCount,
+      incorporationDate: body.incorporationDate,
+      description: body.description,
+      officialEmail: body.officialEmail || body.email,
+      cin: body.cin,
+    };
+
+    Object.entries(syncToFormPayload).forEach(([key, val]) => {
+      if (val !== undefined && val !== null) {
+        onboardingDoc.formPayload[key] = val;
+      }
+    });
+
+    // Mark formPayload as modified (Mongoose won't detect nested changes)
+    onboardingDoc.markModified('formPayload');
 
     const saved = await onboardingDoc.save();
 
@@ -1069,6 +1115,14 @@ router.post(
         Object.assign(existingVendor, base);
         vendor = await existingVendor.save();
       } else {
+        // Check if Vendor already exists for this email + workspace
+        const dupVendor = await Vendor.findOne({ email, workspaceId }).lean();
+        if (dupVendor) {
+          return res.status(409).json({
+            error: "Vendor already exists for this email",
+            vendorId: dupVendor._id,
+          });
+        }
         vendor = await Vendor.create(base);
       }
 
@@ -1355,14 +1409,27 @@ router.post(
 
   // 🔐 Optional but HIGHLY recommended
   onboardingSnapshot: form,
+
+  workspaceId: workspaceId || String(req.workspaceObjectId),
 };
 
 
       let customer: any;
       if (existingCustomer) {
-        Object.assign(existingCustomer, base);
+        Object.assign(existingCustomer, {
+          ...base,
+          workspaceId: workspaceId || String(req.workspaceObjectId),
+        });
         customer = await existingCustomer.save();
       } else {
+        // Check if Customer already exists for this email + workspace
+        const dupCustomer = await Customer.findOne({ email, workspaceId }).lean();
+        if (dupCustomer) {
+          return res.status(409).json({
+            error: "Customer already exists for this email",
+            customerId: dupCustomer._id,
+          });
+        }
         customer = await Customer.create(base);
       }
 

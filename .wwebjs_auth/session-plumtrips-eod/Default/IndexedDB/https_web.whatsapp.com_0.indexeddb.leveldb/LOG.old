@@ -1,15 +1,13 @@
-2026/04/13-01:44:15.269 7ee0 Reusing MANIFEST D:\plumtrips-hrms\apps\backend\.wwebjs_auth\session-plumtrips-eod\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
-2026/04/13-01:44:15.269 7ee0 Recovering log #93
-2026/04/13-01:44:15.282 7ee0 Reusing old log D:\plumtrips-hrms\apps\backend\.wwebjs_auth\session-plumtrips-eod\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/000093.log 
-2026/04/13-01:44:15.283 7ee0 Delete type=2 #92
-2026/04/13-01:44:15.283 7ee0 Delete type=2 #94
-2026/04/13-01:44:18.616 7ee0 Level-0 table #98: started
-2026/04/13-01:44:18.641 7ee0 Level-0 table #98: 1132384 bytes OK
-2026/04/13-01:44:18.642 7ee0 Delete type=0 #93
-2026/04/13-01:44:18.646 7ee0 Compacting 1@1 + 1@2 files
-2026/04/13-01:44:18.719 7ee0 Generated table #99@1: 50930 keys, 2209757 bytes
-2026/04/13-01:44:18.724 7ee0 Generated table #100@1: 2257 keys, 119231 bytes
-2026/04/13-01:44:18.725 7ee0 Compacted 1@1 + 1@2 files => 2328988 bytes
-2026/04/13-01:44:18.725 7ee0 compacted to: files[ 0 0 2 0 0 0 0 ]
-2026/04/13-01:44:18.725 7ee0 Delete type=2 #95
-2026/04/13-01:44:18.725 7ee0 Delete type=2 #98
+2026/04/13-01:49:03.623 79cc Reusing MANIFEST D:\plumtrips-hrms\apps\backend\.wwebjs_auth\session-plumtrips-eod\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/04/13-01:49:03.623 79cc Recovering log #97
+2026/04/13-01:49:03.662 79cc Reusing old log D:\plumtrips-hrms\apps\backend\.wwebjs_auth\session-plumtrips-eod\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/000097.log 
+2026/04/13-01:49:10.484 7aa4 Level-0 table #103: started
+2026/04/13-01:49:10.506 7aa4 Level-0 table #103: 990987 bytes OK
+2026/04/13-01:49:10.508 7aa4 Delete type=0 #97
+2026/04/13-01:49:17.717 7aa4 Compacting 1@1 + 2@2 files
+2026/04/13-01:49:17.786 7aa4 Generated table #104@1: 50350 keys, 2173148 bytes
+2026/04/13-01:49:17.786 7aa4 Compacted 1@1 + 2@2 files => 2173148 bytes
+2026/04/13-01:49:17.787 7aa4 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/04/13-01:49:17.787 7aa4 Delete type=2 #99
+2026/04/13-01:49:17.787 7aa4 Delete type=2 #100
+2026/04/13-01:49:17.787 7aa4 Delete type=2 #103

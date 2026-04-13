@@ -268,6 +268,8 @@ const UserSchema = new Schema(
       },
     ],
 
+    lastSeenAt: { type: Date, default: null },
+
     createdAt: { type: Date, default: Date.now },
   },
   {
