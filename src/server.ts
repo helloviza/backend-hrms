@@ -472,6 +472,10 @@ app.use("/api/activity", activityRoutes);
 app.use("/api/presence", presenceRoutes);
 app.use("/api/meetings", meetingRoutes);
 
+// Plumbox internal chat (SSE + conversations + messages)
+import chatRouter from "./routes/chat.js";
+app.use("/api/chat", chatRouter);
+
 // ✅ Payroll routes
 import payrollSalaryRouter from "./routes/payroll.salary.js";
 import payrollRunRouter from "./routes/payroll.run.js";

@@ -128,16 +128,52 @@ router.get("/account-team", requireAuth, async (req: any, res, next) => {
 });
 
 /**
- * GET /api/customers/:id
- * Returns the full Customer document by _id.
+ * GET /api/customers/workspace-members
+ * Returns all users in the same customer workspace (same customerId).
  */
-router.get("/:id", validateObjectId("id"), requireAuth, async (req: any, res, next) => {
+router.get("/workspace-members", requireAuth, async (req: any, res) => {
   try {
-    const customer = await Customer.findById(req.params.id).lean().exec();
-    if (!customer) {
-      return res.status(404).json({ error: "Not found" });
+    const userId = String(req.user._id || req.user.id);
+    const user = await User.findById(userId, "customerId workspaceId").lean() as any;
+
+    if (!user?.customerId) {
+      return res.json({ ok: true, members: [] });
     }
-    return res.json(customer);
+
+    const members = await User.find(
+      { customerId: user.customerId, isActive: { $ne: false } },
+      "name firstName lastName email roles customerMemberRole",
+    ).lean();
+
+    const mapped = (members as any[]).map((m) => ({
+      name:
+        m.name ||
+        `${m.firstName || ""} ${m.lastName || ""}`.trim() ||
+        m.email,
+      email: m.email,
+      role: m.customerMemberRole || m.roles?.[0] || "Member",
+    }));
+
+    return res.json({ ok: true, members: mapped });
+  } catch {
+    return res.status(500).json({ error: "Failed to fetch members" });
+  }
+});
+
+/**
+ * GET /api/customers/:id
+ * Returns the full Customer document by _id, scoped to the workspace.
+ * No role check — a CUSTOMER user needs to read their own record.
+ * Workspace scope is sufficient isolation.
+ */
+router.get("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async (req: any, res, next) => {
+  try {
+    const wsId = String(req.workspaceObjectId);
+    const customer = await Customer.findOne({ _id: req.params.id, workspaceId: wsId }).lean().exec();
+    if (!customer) {
+      return res.status(404).json({ error: "Customer not found" });
+    }
+    return res.json({ ok: true, customer });
   } catch (err) {
     next(err);
   }
@@ -232,6 +268,102 @@ router.patch(
       }
 
       res.json({ ok: true, accountTeam: (doc as any).accountTeam });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+// ── PATCH /api/customers/:id ─────────────────────────────────────────────────
+// Generic field update for Zoho-imported business records (no onboarding doc).
+router.patch(
+  "/:id",
+  validateObjectId("id"),
+  requireAuth,
+  requireWorkspace,
+  requireRoles("ADMIN", "SUPERADMIN", "HR") as any,
+  async (req: any, res, next) => {
+    try {
+      const { id } = req.params;
+      const wsId = String(req.workspaceObjectId);
+
+      const updated = await Customer.findOneAndUpdate(
+        { _id: id, workspaceId: wsId },
+        { $set: { ...req.body, updatedAt: new Date() } },
+        { new: true },
+      ).lean();
+
+      if (!updated) {
+        return res.status(404).json({ error: "Customer not found" });
+      }
+
+      // Sync to Onboarding formPayload if onboardingId exists
+      if ((updated as any).onboardingId) {
+        try {
+          const syncFields: Record<string, any> = {};
+
+          // Legal name — sent as name/companyName
+          if (req.body.companyName !== undefined || req.body.name !== undefined) {
+            syncFields["formPayload.legalName"] = req.body.companyName || req.body.name;
+          }
+
+          // GST — sent as gstin
+          if (req.body.gstin !== undefined) {
+            syncFields["formPayload.gstNumber"] = req.body.gstin;
+          }
+
+          // PAN — sent as pan
+          if (req.body.pan !== undefined) {
+            syncFields["formPayload.panNumber"] = req.body.pan;
+          }
+
+          // Direct field mappings (same name)
+          const directFields = [
+            "registeredAddress",
+            "entityType",
+            "industry",
+            "website",
+            "employeesCount",
+            "incorporationDate",
+            "description",
+            "officialEmail",
+          ];
+          directFields.forEach((f) => {
+            if (req.body[f] !== undefined) {
+              syncFields[`formPayload.${f}`] = req.body[f];
+            }
+          });
+
+          // Bank — sent as flat fields
+          if (req.body.bankName !== undefined) {
+            syncFields["formPayload.bank.bankName"] = req.body.bankName;
+          }
+          if (req.body.bankAccountNumber !== undefined) {
+            syncFields["formPayload.bank.accountNumber"] = req.body.bankAccountNumber;
+          }
+          if (req.body.bankIfsc !== undefined) {
+            syncFields["formPayload.bank.ifsc"] = req.body.bankIfsc;
+          }
+          if (req.body.bankBranch !== undefined) {
+            syncFields["formPayload.bank.branch"] = req.body.bankBranch;
+          }
+
+          if (Object.keys(syncFields).length > 0) {
+            const { default: Onboarding } = await import("../models/Onboarding.js");
+            await Onboarding.findByIdAndUpdate((updated as any).onboardingId, { $set: syncFields });
+            console.log(
+              "[PATCH /customers/:id] synced",
+              Object.keys(syncFields).length,
+              "fields to Onboarding",
+              (updated as any).onboardingId,
+            );
+          }
+        } catch (err) {
+          console.error("[PATCH /customers/:id] onboarding sync failed:", err);
+        }
+      }
+
+      return res.json({ ok: true, customer: updated });
     } catch (err) {
       next(err);
     }

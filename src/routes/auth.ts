@@ -783,7 +783,13 @@ r.post("/login", loginLimiter, async (req, res) => {
       user.roles?.includes('SuperAdmin') ||
       user.hrmsAccessRole === 'SuperAdmin';
 
-    if (!isSA && !isSAEmail) {
+    const userRoles = user.roles || [];
+    const isExternalUser =
+      userRoles.includes('CUSTOMER') ||
+      userRoles.includes('VENDOR') ||
+      userRoles.includes('CLIENT');
+
+    if (!isSA && !isSAEmail && !isExternalUser) {
       const permission = await UserPermission.findOne({
         email: normalizedEmail,
       }).lean();
