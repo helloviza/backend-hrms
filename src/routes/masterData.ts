@@ -1451,25 +1451,50 @@ if (!(onboardingDoc as any).welcomeEmailSent) {
 await onboardingDoc.save();
 
 // Create User account + UserPermission for business client
+// Is this the onboarding submitter?
+const isPrimaryContact =
+  !!emailRaw &&
+  (emailRaw === onboardingDoc.email || emailRaw === onboardingDoc.inviteeEmail)
+
+// Assign role based on whether they initiated the onboarding
+const customerRole = isPrimaryContact ? 'WORKSPACE_LEADER' : 'CUSTOMER'
+const customerMemberRole = isPrimaryContact ? 'WORKSPACE_LEADER' : 'CUSTOMER_L1'
+
 if (email) {
   let clientUser: any = await User.findOne({ email: email.toLowerCase() }).lean()
 
-  if (!clientUser) {
+  if (clientUser) {
+    // Upgrade existing CUSTOMER to WORKSPACE_LEADER if they are the primary contact
+    if (isPrimaryContact && (clientUser as any).role === 'CUSTOMER') {
+      await User.findByIdAndUpdate(
+        (clientUser as any)._id,
+        {
+          $set: {
+            role:               'WORKSPACE_LEADER',
+            hrmsAccessRole:     'WORKSPACE_LEADER',
+            customerMemberRole: 'WORKSPACE_LEADER',
+            roles:              ['CUSTOMER', 'WORKSPACE_LEADER'],
+          },
+        },
+      )
+    }
+  } else {
     const tempPassword =
       'PLMX-' + Math.random().toString(36).slice(2, 10).toUpperCase()
     const passwordHash = await bcrypt.hash(tempPassword, 10)
 
     clientUser = await User.create({
-      email:          email.toLowerCase(),
-      officialEmail:  email.toLowerCase(),
-      name:           form.legalName || name,
+      email:              email.toLowerCase(),
+      officialEmail:      email.toLowerCase(),
+      name:               form.legalName || name,
       passwordHash,
-      roles:          ['CUSTOMER'],
-      role:           'CUSTOMER',
-      hrmsAccessRole: 'CUSTOMER',
-      status:         'ACTIVE',
-      workspaceId:    workspaceId || req.workspaceObjectId,
-      tempPassword:   true,
+      roles:              [customerRole],
+      role:               customerRole,
+      hrmsAccessRole:     customerRole,
+      customerMemberRole: customerMemberRole,
+      status:             'ACTIVE',
+      workspaceId:        workspaceId || req.workspaceObjectId,
+      tempPassword:       true,
     })
 
     try {

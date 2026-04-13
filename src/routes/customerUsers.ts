@@ -1014,7 +1014,7 @@ router.get("/workspace/resolve", requireAuth, async (req: any, res) => {
 router.get("/workspace/search", requireAuth, async (req: any, res) => {
   try {
     const q = normStr(req.query?.q || "");
-    const result = await staffSearchBusinesses(q);
+    const result = await staffSearchBusinesses(q, req.workspaceObjectId);
     return res.json({ ok: true, q, rows: result.rows });
   } catch (err: any) {
     console.error("[customerUsers:workspaceSearch] error", err);
@@ -1106,7 +1106,7 @@ router.get("/workspace/allowlists", requireAuth, async (req: any, res) => {
     if (!Number.isFinite(limit) || limit <= 0) limit = 50;
     limit = Math.min(limit, 200);
 
-    const bizSearch = q && q.length >= 2 ? await staffSearchBusinesses(q) : { rows: [], ids: [] as string[] };
+    const bizSearch = q && q.length >= 2 ? await staffSearchBusinesses(q, req.workspaceObjectId) : { rows: [], ids: [] as string[] };
 
     const emailQ = normEmail(q);
     const domQ = normalizeDomain(q);
@@ -2493,14 +2493,18 @@ export default router;
 /* =========================================================
  * Shared staff business search (MasterData + Onboarding)
  * ======================================================= */
-async function staffSearchBusinesses(q: string) {
+async function staffSearchBusinesses(q: string, wsId?: any) {
   const query = normStr(q || "");
   if (query === undefined || query === null) return { rows: [] as any[], ids: [] as string[] };
 
+  const wsFilter = wsId ? { workspaceId: wsId } : {};
+
   // Short / empty query → return most recent businesses (preload)
   if (query.length < 2) {
-    const custRecent: any[] = await Customer.find({ status: { $in: ["ACTIVE", "Active", "active"] } })
-      .sort({ name: 1 }).limit(200).lean().exec();
+    const custRecent: any[] = await Customer.find({
+      ...wsFilter,
+      status: { $in: ["ACTIVE", "Active", "active"] },
+    }).sort({ name: 1 }).limit(200).lean().exec();
 
     const rows = (custRecent || []).map((c: any) => ({
       id:                String(c._id),
@@ -2527,70 +2531,8 @@ async function staffSearchBusinesses(q: string) {
   const qEsc = escapeRegex(query);
   const re = new RegExp(qEsc, "i");
 
-  const mdRows: any[] = (await MasterData.find({
-    type: /business|customer/i,
-    $or: [
-      { name: re },
-      { title: re },
-      { companyName: re },
-      { businessName: re },
-      { contactName: re },
-      { fullName: re },
-      { inviteeName: re },
-      { email: re },
-      { officialEmail: re },
-      { website: re },
-      { officialWebsite: re },
-      { domain: re },
-      { "payload.name": re },
-      { "payload.companyName": re },
-      { "payload.businessName": re },
-      { "payload.contactName": re },
-      { "payload.fullName": re },
-      { "payload.inviteeName": re },
-      { "payload.email": re },
-      { "payload.domain": re },
-      { "payload.website": re },
-    ],
-  })
-    .sort({ updatedAt: -1, createdAt: -1 })
-    .limit(25)
-    .lean()
-    .exec()) as any;
-
-  const obRows: any[] = (await Onboarding.find({
-    type: /business|customer/i,
-    $or: [
-      { name: re },
-      { title: re },
-      { companyName: re },
-      { businessName: re },
-      { contactName: re },
-      { fullName: re },
-      { inviteeName: re },
-      { email: re },
-      { officialEmail: re },
-      { website: re },
-      { officialWebsite: re },
-      { domain: re },
-      { status: re },
-      { "payload.name": re },
-      { "payload.companyName": re },
-      { "payload.businessName": re },
-      { "payload.contactName": re },
-      { "payload.fullName": re },
-      { "payload.inviteeName": re },
-      { "payload.email": re },
-      { "payload.domain": re },
-      { "payload.website": re },
-    ],
-  })
-    .sort({ updatedAt: -1, createdAt: -1 })
-    .limit(25)
-    .lean()
-    .exec()) as any;
-
   const custRows: any[] = (await Customer.find({
+    ...wsFilter,
     $or: [
       { name: re },
       { legalName: re },
@@ -2599,49 +2541,29 @@ async function staffSearchBusinesses(q: string) {
     ],
   })
     .sort({ updatedAt: -1, createdAt: -1 })
-    .limit(100)
+    .limit(25)
     .lean()
     .exec()) as any;
 
-  const merged = new Map<string, any>();
+  const rows = (custRows || []).map((c: any) => ({
+    id:                String(c._id),
+    source:            "Customer",
+    name:              c.name || c.legalName || c.email || "",
+    email:             c.email || "",
+    domain:            c.email ? emailDomain(c.email) : "",
+    status:            c.status || "",
+    type:              c.type || "",
+    updatedAt:         c.updatedAt || null,
+    legalName:         c.legalName         || "",
+    companyName:       c.legalName         || c.name || "",
+    gstNumber:         c.gstNumber         || "",
+    gstin:             c.gstNumber         || "",
+    registeredAddress: c.registeredAddress || "",
+    phone:             c.phone || c.contacts?.primaryPhone || "",
+    officialEmail:     c.contacts?.officialEmail || c.email || "",
+  }));
 
-  for (const c of custRows || []) {
-    const id = String(c._id);
-    merged.set(id, {
-      id,
-      source: "Customer",
-      name: c.name || c.legalName || c.email || "",
-      email: c.email || "",
-      domain: c.email ? emailDomain(c.email) : "",
-      status: c.status || "",
-      type: c.type || "",
-      updatedAt: c.updatedAt || null,
-
-      // billing fields for invoice generation
-      legalName:         c.legalName         || "",
-      companyName:       c.legalName         || c.name || "",
-      gstNumber:         c.gstNumber         || "",
-      gstin:             c.gstNumber         || "",
-      registeredAddress: c.registeredAddress || "",
-      phone:             c.phone
-                         || c.contacts?.primaryPhone
-                         || "",
-      officialEmail:     c.contacts?.officialEmail
-                         || c.email
-                         || "",
-    });
-  }
-  for (const md of mdRows || []) {
-    const view = pickBusinessView({ source: "MasterData", doc: md });
-    if (view?.id && !merged.has(view.id)) merged.set(view.id, view);
-  }
-  for (const ob of obRows || []) {
-    const view = pickBusinessView({ source: "Onboarding", doc: ob });
-    if (view?.id && !merged.has(view.id)) merged.set(view.id, view);
-  }
-
-  const rows = Array.from(merged.values()).slice(0, 25);
-  const ids = rows.map((r) => String(r.id)).filter(Boolean);
+  const ids = rows.map((r: any) => String(r.id)).filter(Boolean);
 
   return { rows, ids };
 }
