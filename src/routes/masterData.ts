@@ -20,6 +20,7 @@ import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
 import { sendOnboardingWelcomeEmail } from "../utils/onboardingWelcomeEmail.js";
 import { sendEmployeeWelcomeEmail, sendClientWelcomeEmail } from "../utils/employeeWelcomeEmail.js";
 import { UserPermission } from "../models/UserPermission.js";
+import CustomerMember from "../models/CustomerMember.js";
 
 
 const router = Router();
@@ -1477,6 +1478,15 @@ if (email) {
           },
         },
       )
+      // Also sync CustomerMember role
+      await CustomerMember.findOneAndUpdate(
+        {
+          email: emailRaw,
+          customerId: String(existingCustomer._id),
+        },
+        { $set: { role: customerRole } },
+        { new: true },
+      )
     }
   } else {
     const tempPassword =
@@ -1507,6 +1517,24 @@ if (email) {
     } catch (emailErr) {
       console.warn('[promote-customer] Welcome email failed:', emailErr)
     }
+
+    // Create/update CustomerMember for new user
+    await CustomerMember.findOneAndUpdate(
+      {
+        email: emailRaw,
+        customerId: String(customer._id),
+      },
+      {
+        $set: {
+          role:        customerRole,
+          customerId:  String(customer._id),
+          email:       emailRaw,
+          userId:      String((clientUser as any)._id),
+          workspaceId: workspaceId || String(req.workspaceObjectId),
+        },
+      },
+      { upsert: true, new: true },
+    )
   }
 
   try {
