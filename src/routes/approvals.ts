@@ -15,6 +15,7 @@ import MasterData from "../models/MasterData.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
+import Proposal from "../models/Proposal.js";
 
 import { sendMail } from "../utils/mailer.js";
 import {
@@ -67,6 +68,18 @@ import {
   moneyINR,
   escapeHtml,
 } from "./approvals.email.js";
+
+async function syncProposalBookingStatus(proposalId: string, status: "IN_PROGRESS" | "DONE") {
+  try {
+    const proposal: any = await Proposal.findById(proposalId);
+    if (!proposal) return;
+    proposal.booking = proposal.booking || {};
+    proposal.booking.status = status;
+    await proposal.save();
+  } catch {
+    // non-blocking
+  }
+}
 
 const router = Router();
 router.use(requireAuth);
@@ -318,6 +331,22 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     const email = normEmail(user?.email);
     const name = normStr(user?.name || user?.firstName || "");
 
+    // Resolve requester display name — JWT may omit name if token was issued before profile was set
+    let requesterDisplayName = name;
+    if (!requesterDisplayName && (sub || email)) {
+      const dbFrontliner = await User.findOne(
+        sub ? { _id: sub } : { email: exactIRegex(email) }
+      ).select("name firstName lastName").lean();
+      if (dbFrontliner) {
+        requesterDisplayName = normStr(
+          (dbFrontliner as any).name ||
+          [(dbFrontliner as any).firstName || "", (dbFrontliner as any).lastName || ""]
+            .filter(Boolean).join(" ")
+        );
+      }
+    }
+    if (!requesterDisplayName) requesterDisplayName = email?.split("@")[0] || "User";
+
     // SBT users must book directly — block approval flow
     if (sub) {
       const sbtCheck = await User.findOne({ _id: sub, workspaceId: req.workspaceObjectId }).select("sbtEnabled canRaiseRequest").lean();
@@ -407,7 +436,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
 
       frontlinerId: sub,
       frontlinerEmail: email,
-      frontlinerName: name || undefined,
+      frontlinerName: requesterDisplayName || undefined,
 
       managerId: managerId || undefined,
       managerEmail: approverEmail,
@@ -479,7 +508,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
           replyTo: email || undefined,
           html: buildApproverEmailHtml({
             requestId: String(doc._id),
-            requesterName: name || "User",
+            requesterName: requesterDisplayName,
             requesterEmail: email,
             customerName,
             ticketId: doc.ticketId,
@@ -502,7 +531,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
             subject: `FYI — New Request Submitted — ${customerName}`,
             replyTo: email || undefined,
             html: buildLeaderFyiHtml({
-              requesterName: name || "User",
+              requesterName: requesterDisplayName,
               requesterEmail: email,
               customerName,
               ticketId: doc.ticketId,
@@ -705,6 +734,24 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
     const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
+    // Resolve frontliner display name from DB if stored name is missing or was "User"
+    let frontlinerDisplayName = normStr(doc.frontlinerName || "");
+    if (!frontlinerDisplayName || frontlinerDisplayName === "User") {
+      const dbFrontliner = doc.frontlinerId
+        ? await User.findById(doc.frontlinerId).select("name firstName lastName").lean()
+        : doc.frontlinerEmail
+          ? await User.findOne({ email: exactIRegex(normEmail(doc.frontlinerEmail)) }).select("name firstName lastName").lean()
+          : null;
+      if (dbFrontliner) {
+        frontlinerDisplayName = normStr(
+          (dbFrontliner as any).name ||
+          [(dbFrontliner as any).firstName || "", (dbFrontliner as any).lastName || ""]
+            .filter(Boolean).join(" ")
+        ) || frontlinerDisplayName;
+      }
+    }
+    if (!frontlinerDisplayName) frontlinerDisplayName = normEmail(doc.frontlinerEmail)?.split("@")[0] || "User";
+
     // resend logic (unchanged)
     if (action === "resend_email") {
       if (!isOwnerOfRequest(doc, req.user) && !isStaffAdmin(req.user)) {
@@ -758,7 +805,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
             replyTo: normEmail(doc.frontlinerEmail) || undefined,
             html: buildApproverEmailHtml({
               requestId: String(doc._id),
-              requesterName: doc.frontlinerName || "User",
+              requesterName: frontlinerDisplayName,
               requesterEmail: normEmail(doc.frontlinerEmail),
               customerName: doc.customerName || "Workspace",
               ticketId: doc.ticketId,
@@ -861,7 +908,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
             html: buildRequesterApprovedHtml({
               customerName: doc.customerName || "Workspace",
               ticketId: doc.ticketId,
-              requesterName: doc.frontlinerName || "User",
+              requesterName: frontlinerDisplayName,
               requesterEmail,
               approverName: doc.approvedByName || userName || doc.managerName,
               approverEmail: email,
@@ -1101,6 +1148,13 @@ router.put(
       });
 
       await doc.save();
+
+      // Sync proposal booking status if a proposal is linked
+      const linkedProposalUp = await Proposal.findOne({ requestId: doc._id }).select("_id").lean();
+      if (linkedProposalUp) {
+        await syncProposalBookingStatus(String((linkedProposalUp as any)._id), "IN_PROGRESS");
+      }
+
       return res.json({ ok: true, request: doc, message: "Marked as under process" });
     } catch (err) {
       next(err);
@@ -1143,6 +1197,16 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
     });
 
     await doc.save();
+
+    // Sync proposal booking status if a proposal is linked
+    try {
+      const linkedProposalDone = await Proposal.findOne({ requestId: doc._id }).select("_id").lean();
+      if (linkedProposalDone) {
+        await syncProposalBookingStatus(String((linkedProposalDone as any)._id), "DONE");
+      }
+    } catch {
+      // non-blocking
+    }
 
     // Auto-create TravelBooking for concierge booking
     try {
@@ -1516,6 +1580,24 @@ router.post("/email/consume", async (req: AnyObj, res) => {
     const doc: any = await ApprovalRequest.findOne({ _id: rid, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
+    // Resolve frontliner display name from DB if stored name is missing or was "User"
+    let frontlinerDisplayNameEmail = normStr(doc.frontlinerName || "");
+    if (!frontlinerDisplayNameEmail || frontlinerDisplayNameEmail === "User") {
+      const dbFrontliner2 = doc.frontlinerId
+        ? await User.findById(doc.frontlinerId).select("name firstName lastName").lean()
+        : doc.frontlinerEmail
+          ? await User.findOne({ email: exactIRegex(normEmail(doc.frontlinerEmail)) }).select("name firstName lastName").lean()
+          : null;
+      if (dbFrontliner2) {
+        frontlinerDisplayNameEmail = normStr(
+          (dbFrontliner2 as any).name ||
+          [(dbFrontliner2 as any).firstName || "", (dbFrontliner2 as any).lastName || ""]
+            .filter(Boolean).join(" ")
+        ) || frontlinerDisplayNameEmail;
+      }
+    }
+    if (!frontlinerDisplayNameEmail) frontlinerDisplayNameEmail = normEmail(doc.frontlinerEmail)?.split("@")[0] || "User";
+
     if (!exactIRegex(approverEmail).test(String(doc.managerEmail || ""))) {
       return res.status(403).json({ error: "Token not valid for this request" });
     }
@@ -1580,7 +1662,7 @@ router.post("/email/consume", async (req: AnyObj, res) => {
             html: buildRequesterApprovedHtml({
               customerName: doc.customerName || "Workspace",
               ticketId: doc.ticketId,
-              requesterName: doc.frontlinerName || "User",
+              requesterName: frontlinerDisplayNameEmail,
               requesterEmail,
               approverName: doc.approvedByName || doc.managerName || "Approver",
               approverEmail: approverEmail,

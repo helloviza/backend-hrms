@@ -32,7 +32,7 @@ router.put("/offers", async (req: any, res: any) => {
   try {
     const { flight, hotel } = req.body;
     const value = { flight: Array.isArray(flight) ? flight : [], hotel: Array.isArray(hotel) ? hotel : [] };
-    const userId = req.user?._id ?? req.user?.id ?? "";
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub ?? "";
     const doc = await SBTConfig.findOneAndUpdate(
       { key: "offers" },
       { $set: { value, updatedBy: String(userId) } },
@@ -124,7 +124,7 @@ router.get("/config", async (_req: any, res: any) => {
 router.patch("/config", async (req: any, res: any) => {
   try {
     const { tboWalletEnabled, tboWalletMonthlyLimit } = req.body;
-    const userId = req.user?._id ?? req.user?.id ?? "";
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub ?? "";
     const update: Record<string, any> = { updatedBy: String(userId) };
 
     if (typeof tboWalletEnabled === "boolean") update.tboWalletEnabled = tboWalletEnabled;
@@ -162,7 +162,7 @@ router.get("/margins", async (_req: any, res: any) => {
 router.put("/margins", async (req: any, res: any) => {
   try {
     const { enabled, flight, hotel } = req.body;
-    const userId = req.user?._id ?? req.user?.id ?? "";
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub ?? "";
     const value: MarginConfig = {
       enabled: !!enabled,
       flight: {

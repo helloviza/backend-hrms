@@ -858,7 +858,10 @@ r.post("/login", loginLimiter, async (req, res) => {
       userId: String(user._id),
       email: built.safe.email,
       roles: built.roles,
-      workspaceId: user.workspaceId?.toString() || undefined,
+      // Staff users carry workspaceId in JWT (their workspaceId is reliable).
+      // Customer users must not — their workspaceId on the User doc may be stale
+      // or point to the wrong workspace. requireWorkspace resolves them via customerId.
+      workspaceId: built.staff ? (user.workspaceId?.toString() || undefined) : undefined,
       customerId: built.staff ? undefined : built.customerId || undefined,
       businessId: built.staff ? undefined : built.customerId || undefined,
       vendorId: built.staff ? undefined : built.vendorId || undefined,
@@ -927,7 +930,7 @@ r.post("/refresh", async (req, res) => {
       userId: String(user._id),
       email: built.safe.email,
       roles: built.roles,
-      workspaceId: user.workspaceId?.toString() || undefined,
+      workspaceId: built.staff ? (user.workspaceId?.toString() || undefined) : undefined,
       customerId: built.staff ? undefined : built.customerId || undefined,
       businessId: built.staff ? undefined : built.customerId || undefined,
       vendorId: built.staff ? undefined : built.vendorId || undefined,

@@ -350,6 +350,10 @@ app.use("/api", vendorCustomerSelfRouter);
 // Workspace
 app.use("/api/v1/workspace", workspaceRouter);
 
+// Expense Bands
+import expenseBandsRouter from "./routes/expenseBands.js";
+app.use("/api/v1/workspace", expenseBandsRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";

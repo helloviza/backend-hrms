@@ -262,6 +262,10 @@ const proposalSchema = new Schema(
     },
 
     history: { type: [historySchema], required: true, default: [] },
+
+    createdBy: { type: Schema.Types.ObjectId, ref: "User" },
+    requesterEmail: { type: String, default: "" },
+    requesterName: { type: String, default: "" },
   },
   {
     timestamps: true,

@@ -92,6 +92,7 @@ export async function getTBOToken(opts?: { forceRefresh?: boolean }): Promise<st
     agencyId: data?.Member?.AgencyId ?? data?.TokenAgencyId,
     memberId: data?.Member?.MemberId ?? data?.TokenMemberId,
   };
+  console.log('[TBO] Token refreshed successfully at', new Date().toISOString());
 
   return token;
 }

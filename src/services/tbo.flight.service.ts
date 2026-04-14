@@ -171,10 +171,11 @@ async function post(path: string, body: object, _retried = false, base = FLIGHT_
     // Fire-and-forget file log — never awaited to avoid slowing the flow
     logTBOCall({ method, traceId, request: body, response: json, durationMs });
 
-    // ErrorCode 6 = invalid/expired token — clear cache and retry once with fresh token
+    // ErrorCode 6 = invalid/expired token; ErrorCode 2 = InvalidCredentials (session rejected)
+    // Both trigger a fresh token fetch and a single retry.
     const errCode = (json as any)?.Response?.Error?.ErrorCode;
-    if (errCode === 6 && !_retried) {
-      console.warn(`[TBO] ErrorCode 6 on ${method} — clearing token and retrying`);
+    if ((errCode === 6 || errCode === 2) && !_retried) {
+      console.warn(`[TBO] ErrorCode ${errCode} on ${method} — clearing token and retrying`);
       clearTBOToken();
       const freshToken = await getTBOToken({ forceRefresh: true });
       const retryBody = { ...body, TokenId: freshToken };

@@ -1115,7 +1115,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
   try {
     const booking = await SBTHotelBooking.findOne({
       _id: req.params.id,
-      userId: req.user?._id ?? req.user?.id,
+      userId: req.user?._id ?? req.user?.id ?? req.user?.sub,
     });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
     if (!booking.isHeld) return res.status(400).json({ error: "Booking is not in held state" });
@@ -1201,7 +1201,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
 
 router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
     const b = req.body;
@@ -1325,7 +1325,7 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
 
 const getHotelBookingsHandler = async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
     const bookings = await SBTHotelBooking.find({ userId })
@@ -1345,7 +1345,7 @@ router.get("/my-bookings", requireSBT, getHotelBookingsHandler);
 
 router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
     const pendingBookings = await SBTHotelBooking.find({ userId, status: "PENDING" });
@@ -1408,7 +1408,7 @@ router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any
 
 router.post("/bookings/:id/sync-status", requireAuth, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
     const doc = await SBTHotelBooking.findOne({ _id: req.params.id, userId });
@@ -1542,7 +1542,7 @@ router.post("/bookings/refund-orphaned", requireAdmin, async (req: any, res: any
 
 router.post("/bookings/:id/mark-failed", requireAdmin, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
     const doc = await scopedFindById(SBTHotelBooking, req.params.id, req.workspaceObjectId);
@@ -1573,7 +1573,7 @@ router.post("/bookings/:id/mark-failed", requireAdmin, async (req: any, res: any
 
 router.get("/bookings/:id/cancel-preview", requireSBT, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const booking = await SBTHotelBooking.findOne({ _id: req.params.id, userId });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
@@ -1639,7 +1639,7 @@ router.get("/bookings/:id/cancel-preview", requireSBT, async (req: any, res: any
 
 router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const doc = await SBTHotelBooking.findOne({ _id: req.params.id, userId });
     if (!doc) return res.status(404).json({ error: "Booking not found" });
     if (doc.status === "CANCELLED")

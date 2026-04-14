@@ -14,20 +14,45 @@ declare global {
   }
 }
 
+const CUSTOMER_ROLES = new Set([
+  "CUSTOMER",
+  "WORKSPACE_LEADER",
+  "REQUESTER",
+  "APPROVER",
+  "BUSINESS",
+]);
+
+function isCustomerUser(user: any): boolean {
+  const roles: string[] = Array.isArray(user?.roles) ? user.roles : [];
+  return roles.some((r) => CUSTOMER_ROLES.has(String(r).toUpperCase()));
+}
+
+const WS_SELECT = "_id customerId status config travelMode";
+
 /**
- * resolveWorkspace — given a raw id (could be workspace _id OR customerId),
- * returns the actual workspace document.
+ * resolveWorkspaceById — resolves by workspace _id, then falls back to customerId.
+ * Used for staff users whose JWT carries a reliable workspaceId.
  */
-async function resolveWorkspace(raw: string) {
+async function resolveWorkspaceById(raw: string) {
   let workspace = await CustomerWorkspace.findById(raw)
-    .select("_id customerId status config travelMode")
+    .select(WS_SELECT)
     .lean();
   if (!workspace) {
     workspace = await CustomerWorkspace.findOne({ customerId: raw })
-      .select("_id customerId status config travelMode")
+      .select(WS_SELECT)
       .lean();
   }
   return workspace;
+}
+
+/**
+ * resolveWorkspaceByCustomerId — resolves directly via customerId field.
+ * Used for customer-type users where workspaceId in JWT may be stale/wrong.
+ */
+async function resolveWorkspaceByCustomerId(customerId: string) {
+  return CustomerWorkspace.findOne({ customerId })
+    .select(WS_SELECT)
+    .lean();
 }
 
 /**
@@ -90,8 +115,15 @@ export const requireWorkspace = async (
   }
 
   // ── Normal users ──
-  const raw =
+  // Customer-type users: always resolve via customerId — their JWT workspaceId
+  // may be stale or point to the wrong workspace. customerId is the stable key.
+  // Staff users: keep existing findById-first logic (their workspaceId is reliable).
+  const customerRaw =
+    user.customerId ?? user.businessId ?? null;
+  const staffRaw =
     user.workspaceId ?? user.customerId ?? user.businessId ?? null;
+
+  const raw = isCustomerUser(user) ? customerRaw : staffRaw;
 
   if (!raw) {
     res.status(403).json({ success: false, error: "Workspace context required" });
@@ -99,7 +131,9 @@ export const requireWorkspace = async (
   }
 
   try {
-    const workspace = await resolveWorkspace(String(raw));
+    const workspace = isCustomerUser(user)
+      ? await resolveWorkspaceByCustomerId(String(raw))
+      : await resolveWorkspaceById(String(raw));
 
     if (!workspace) {
       res.status(403).json({ success: false, error: "Workspace context required" });

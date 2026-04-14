@@ -142,16 +142,18 @@ router.get("/workspace-members", requireAuth, async (req: any, res) => {
 
     const members = await User.find(
       { customerId: user.customerId, isActive: { $ne: false } },
-      "name firstName lastName email roles customerMemberRole",
+      "name firstName lastName email roles customerMemberRole bandNumber",
     ).lean();
 
     const mapped = (members as any[]).map((m) => ({
+      userId: String(m._id),
       name:
         m.name ||
         `${m.firstName || ""} ${m.lastName || ""}`.trim() ||
         m.email,
       email: m.email,
       role: m.customerMemberRole || m.roles?.[0] || "Member",
+      bandNumber: m.bandNumber ?? null,
     }));
 
     return res.json({ ok: true, members: mapped });

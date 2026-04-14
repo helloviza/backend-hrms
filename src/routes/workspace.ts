@@ -1,29 +1,40 @@
 // apps/backend/src/routes/workspace.ts
 import express from "express";
-import path from "path";
-import fs from "fs";
 import multer from "multer";
-import mongoose, { Schema } from "mongoose";
+import mongoose from "mongoose";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
+import WorkspaceBranding from "../models/WorkspaceBranding.js";
 
 const router = express.Router();
 
 /* -------------------------------------------------------------------------- */
-/* Uploads setup                                                              */
+/* S3 client for logo uploads                                                 */
 /* -------------------------------------------------------------------------- */
 
-const uploadsRoot = path.join(process.cwd(), "uploads");
-const logosDir = path.join(uploadsRoot, "workspace-logos");
+const s3Logo = new S3Client({
+  region: env.AWS_REGION,
+  credentials:
+    env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY
+      ? { accessKeyId: env.AWS_ACCESS_KEY_ID, secretAccessKey: env.AWS_SECRET_ACCESS_KEY }
+      : undefined,
+});
 
-function ensureDir(dir: string) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+const s3LogoPublicBase = (process.env.S3_BASE_URL || process.env.AWS_S3_PUBLIC_BASE_URL || "").trim();
+
+function buildLogoPublicUrl(key: string) {
+  const bucket = env.S3_BUCKET;
+  if (s3LogoPublicBase) return `${s3LogoPublicBase.replace(/\/+$/, "")}/${key}`;
+  return `https://${bucket}.s3.${env.AWS_REGION}.amazonaws.com/${key}`;
 }
-ensureDir(logosDir);
 
 function safeExtFromMimetype(mime: string) {
   const m = String(mime || "").toLowerCase();
@@ -33,22 +44,27 @@ function safeExtFromMimetype(mime: string) {
   return "";
 }
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, logosDir),
-  filename: (_req, file, cb) => {
-    const ext =
-      safeExtFromMimetype(file.mimetype) ||
-      path.extname(file.originalname) ||
-      ".png";
-    const stamp = Date.now();
-    const rand = Math.random().toString(36).slice(2, 10);
-    cb(null, `ws_logo_${stamp}_${rand}${ext}`);
-  },
-});
+/* -------------------------------------------------------------------------- */
+/* Logo presigned URL helper (identical pattern to signAvatarUrl in users.ts) */
+/* -------------------------------------------------------------------------- */
+
+type LogoUrlCacheEntry = { url: string; expAt: number };
+const LOGO_URL_CACHE = new Map<string, LogoUrlCacheEntry>();
+
+async function signLogoUrl(key?: string): Promise<string> {
+  if (!key) return "";
+  const now = Date.now();
+  const cached = LOGO_URL_CACHE.get(key);
+  if (cached && cached.expAt > now + 30_000) return cached.url;
+  const cmd = new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: key });
+  const url = await getSignedUrl(s3, cmd, { expiresIn: 900 }); // 15 minutes
+  LOGO_URL_CACHE.set(key, { url, expAt: now + 14 * 60 * 1000 });
+  return url;
+}
 
 // ✅ TS-safe: never pass Error to cb (avoids "Error | null not assignable to null")
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
   fileFilter: (_req, file, cb) => {
     const ok =
@@ -58,33 +74,6 @@ const upload = multer({
     cb(null, ok);
   },
 });
-
-/* -------------------------------------------------------------------------- */
-/* Mongo model (branding only)                                                */
-/* -------------------------------------------------------------------------- */
-
-type WorkspaceBrandingDoc = {
-  scopeType: "BUSINESS" | "CUSTOMER" | "VENDOR" | "USER";
-  scopeId: string;
-  logoUrl?: string;
-  updatedAt?: Date;
-  createdAt?: Date;
-};
-
-const WorkspaceBrandingSchema = new Schema<WorkspaceBrandingDoc>(
-  {
-    scopeType: { type: String, required: true },
-    scopeId: { type: String, required: true },
-    logoUrl: { type: String, default: "" },
-  },
-  { timestamps: true }
-);
-
-WorkspaceBrandingSchema.index({ scopeType: 1, scopeId: 1 }, { unique: true });
-
-const WorkspaceBranding =
-  (mongoose.models.WorkspaceBranding as mongoose.Model<WorkspaceBrandingDoc>) ||
-  mongoose.model<WorkspaceBrandingDoc>("WorkspaceBranding", WorkspaceBrandingSchema);
 
 /* -------------------------------------------------------------------------- */
 /* Auth helpers                                                               */
@@ -195,7 +184,7 @@ function looksVendorish(user: AnyObj): boolean {
 /* -------------------------------------------------------------------------- */
 
 type ResolvedScope = {
-  scopeType: WorkspaceBrandingDoc["scopeType"];
+  scopeType: "BUSINESS" | "CUSTOMER" | "VENDOR" | "USER";
   scopeId: string;        // IMPORTANT: for CUSTOMER, this will be customerId (string)
   customerId?: string;    // same as scopeId for CUSTOMER
   vendorId?: string;
@@ -400,15 +389,25 @@ async function resolveWorkspaceScope(user: AnyObj, req: AnyObj): Promise<Resolve
 /* -------------------------------------------------------------------------- */
 
 router.get("/me", async (req: AnyObj, res) => {
+  try {
   const user = requireAuth(req, res);
   if (!user) return;
 
   const scope = await resolveWorkspaceScope(user, req);
 
   const branding = (await WorkspaceBranding.findOne({
-    scopeType: scope.scopeType,
-    scopeId: scope.scopeId,
-  }).lean()) as null | { logoUrl?: string };
+    subjectType: scope.scopeType,
+    subjectId: scope.scopeId,
+  }).lean()) as null | { logoKey?: string; logoUrl?: string };
+
+  let logoUrl = branding?.logoUrl || "";
+  if (branding?.logoKey) {
+    try {
+      logoUrl = await signLogoUrl(branding.logoKey);
+    } catch {
+      // S3 sign failure is non-fatal — return without logo
+    }
+  }
 
   res.setHeader("Cache-Control", "no-store");
   res.json({
@@ -424,7 +423,7 @@ router.get("/me", async (req: AnyObj, res) => {
     workspace: {
       scopeType: scope.scopeType,
       scopeId: scope.scopeId,
-      logoUrl: branding?.logoUrl || "",
+      logoUrl,
     },
 
     // Extra helpful info (safe to ignore on frontend)
@@ -445,6 +444,9 @@ router.get("/me", async (req: AnyObj, res) => {
           }
         : undefined,
   });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Failed to load workspace" });
+  }
 });
 
 // Small guard to return a clean message when fileFilter rejects
@@ -457,28 +459,50 @@ router.post("/logo", logoMimeGuard, upload.single("logo"), async (req: AnyObj, r
   const user = requireAuth(req, res);
   if (!user) return;
 
-  // Admin-only
+  // Allow workspace admins and customer/business users
+  // (WORKSPACE_LEADER in roles[] OR customer account type via looksCustomerish)
   const logoRoles = roleList(user);
-  if (!logoRoles.includes("SUPERADMIN") && !logoRoles.includes("ADMIN") && !logoRoles.includes("HR") && !logoRoles.includes("WORKSPACE_LEADER")) {
+  if (
+    !logoRoles.includes("SUPERADMIN") &&
+    !logoRoles.includes("ADMIN") &&
+    !logoRoles.includes("HR") &&
+    !logoRoles.includes("WORKSPACE_LEADER") &&
+    !looksCustomerish(user)
+  ) {
     return res.status(403).json({ error: "Admin access required to upload logo" });
   }
 
-  if (!req.file?.filename) {
+  if (!req.file?.buffer?.length) {
     return res.status(400).json({
       ok: false,
-      error:
-        "Logo upload failed. Use field name 'logo' and upload PNG/JPG/WEBP (max 2MB).",
+      error: "Logo upload failed. Use field name 'logo' and upload PNG/JPG/WEBP (max 2MB).",
     });
   }
 
   const scope = await resolveWorkspaceScope(user, req);
-  const logoUrl = `/uploads/workspace-logos/${req.file.filename}`;
+
+  const ext =
+    safeExtFromMimetype(req.file.mimetype) ||
+    ("." + (req.file.originalname.split(".").pop() || "png"));
+  const rand = crypto.randomBytes(10).toString("hex");
+  const key = `workspace-logos/${scope.scopeId}/${Date.now()}-${rand}${ext}`;
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: env.S3_BUCKET,
+      Key: key,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    })
+  );
 
   await WorkspaceBranding.findOneAndUpdate(
-    { scopeType: scope.scopeType, scopeId: scope.scopeId },
-    { $set: { logoUrl } },
+    { subjectType: scope.scopeType, subjectId: scope.scopeId },
+    { $set: { logoKey: key, logoUrl: "" } },
     { upsert: true, new: true }
   );
+
+  const logoUrl = await signLogoUrl(key);
 
   res.setHeader("Cache-Control", "no-store");
   res.json({ ok: true, logoUrl });

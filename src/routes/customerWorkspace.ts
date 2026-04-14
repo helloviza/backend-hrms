@@ -1,8 +1,13 @@
 // apps/backend/src/routes/customerWorkspace.ts
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
+import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { s3 } from "../config/aws.js";
+import { env } from "../config/env.js";
 import MasterData from "../models/MasterData.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import WorkspaceBranding from "../models/WorkspaceBranding.js";
 
 const router = Router();
 
@@ -82,7 +87,15 @@ router.get("/me", requireAuth, async (req: any, res, next) => {
     if (!customer) return res.status(400).json({ error: "Customer profile not found" });
 
     const ws = await getOrCreateWorkspace(String(customer._id));
-    res.json({ ok: true, workspace: ws, customer });
+    const branding = await WorkspaceBranding.findOne({
+      subjectType: "CUSTOMER",
+      subjectId: String(customer._id),
+    }).lean() as null | { logoKey?: string; logoUrl?: string };
+    const logoKey = branding?.logoKey || "";
+    const logoUrl = logoKey
+      ? await getSignedUrl(s3, new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: logoKey }), { expiresIn: 900 })
+      : branding?.logoUrl || null;
+    res.json({ ok: true, workspace: { ...ws, logoUrl }, customer });
   } catch (e) {
     next(e);
   }
