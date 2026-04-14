@@ -10,6 +10,7 @@ import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import { getFareQuote, bookFlight } from "../services/tbo.flight.service.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
+import { buildEmailShell, eCard, eRow, eLabel, eBtn, escapeHtml } from "./approvals.email.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -19,7 +20,7 @@ router.use(requireFeature("sbtEnabled"));
 /* ─── helpers ─────────────────────────────────────────────────────────────── */
 
 function userId(req: any): string {
-  return String(req.user?._id ?? req.user?.id ?? "");
+  return String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? "");
 }
 
 function describeOption(type: string, opt: any, params: any): string {
@@ -44,13 +45,20 @@ function travelDate(type: string, params: any): string {
 router.post("/", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId })
-      .select("sbtRole sbtAssignedBookerId customerId name email")
+    const user = await User.findById(uid)
+      .select("sbtRole sbtAssignedBookerId customerId name email roles")
       .lean() as any;
 
-    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    const userCustomerId = user?.customerId?.toString();
+    const wsCustomerId = req.workspace?.customerId?.toString();
+    if (!user || userCustomerId !== wsCustomerId) {
+      return res.status(403).json({ error: "Access denied", code: "WORKSPACE_MISMATCH" });
+    }
 
-    if (user.sbtRole !== "L1" && user.sbtRole !== "BOTH") {
+    const postRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
+    const isWLPost = postRoles.includes("WORKSPACELEADER");
+
+    if (!isWLPost && user.sbtRole !== "L1" && user.sbtRole !== "BOTH") {
       return res.status(403).json({ error: "SBT Requestor access required", code: "NOT_L1" });
     }
 
@@ -115,29 +123,47 @@ router.post("/", async (req: any, res: any) => {
     });
 
     // Send email to L2 booker
-    const booker = await User.findOne({ _id: assignedBookerId, workspaceId: req.workspaceObjectId })
+    const booker = await User.findById(assignedBookerId)
       .select("name email")
       .lean() as any;
+
+    sbtLogger.info("[SBT EMAIL] Attempting to send to:", { userId: assignedBookerId, email: booker?.email, event: "request_raised" });
+    if (!booker) {
+      sbtLogger.warn("[SBT EMAIL] User not found:", { userId: assignedBookerId, event: "request_raised" });
+    }
 
     if (booker?.email) {
       const desc = describeOption(type, selectedOption, searchParams);
       const date = travelDate(type, searchParams);
       const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
 
+      const sbtEmailBody = `
+        ${eCard(`
+          ${eLabel("Request Details")}
+          <table cellpadding="0" cellspacing="0">
+            ${eRow("From", escapeHtml(user.name || user.email))}
+            ${eRow("Type", escapeHtml(type === "flight" ? "Flight" : "Hotel"))}
+            ${eRow("Route / Hotel", escapeHtml(desc))}
+            ${date ? eRow("Travel Date", escapeHtml(date)) : ""}
+            ${requesterNotes ? eRow("Notes", escapeHtml(requesterNotes)) : ""}
+          </table>
+        `)}
+        <div style="margin-top:16px;">
+          ${eBtn("View in Booking Inbox", `${frontendUrl}/sbt/inbox`, "#4f46e5", "#ffffff")}
+        </div>
+      `;
+
       await sendMail({
         to: booker.email,
         subject: `New SBT Request from ${user.name || user.email} — ${desc}`,
         kind: "REQUESTS",
-        html: `
-          <h3>New Travel Request</h3>
-          <p><strong>From:</strong> ${user.name || user.email}</p>
-          <p><strong>Type:</strong> ${type === "flight" ? "Flight" : "Hotel"}</p>
-          <p><strong>Route/Hotel:</strong> ${desc}</p>
-          ${date ? `<p><strong>Travel Date:</strong> ${date}</p>` : ""}
-          ${requesterNotes ? `<p><strong>Notes:</strong> ${requesterNotes}</p>` : ""}
-          <p><a href="${frontendUrl}/sbt/inbox">View in Booking Inbox</a></p>
-        `,
-      }).catch((e: any) => sbtLogger.warn("Failed to send SBT request email", { error: e?.message }));
+        html: buildEmailShell(sbtEmailBody, {
+          title: "New Booking Request",
+          subtitle: "A travel request needs your attention",
+          badgeText: "ACTION REQUIRED",
+          badgeColor: "#f59e0b",
+        }),
+      }).catch((e: any) => sbtLogger.error("[SBT EMAIL FAILED]", { event: "request_raised", recipient: booker.email, error: e?.message || e }));
     }
 
     sbtLogger.info("SBT request raised", {
@@ -159,9 +185,18 @@ router.post("/", async (req: any, res: any) => {
 router.get("/my", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId }).select("sbtRole").lean() as any;
+    const user = await User.findById(uid).select("sbtRole customerId roles").lean() as any;
 
-    if (!user || (user.sbtRole !== "L1" && user.sbtRole !== "BOTH")) {
+    const myCustomerId = user?.customerId?.toString();
+    const myWsCustomerId = req.workspace?.customerId?.toString();
+    if (!user || myCustomerId !== myWsCustomerId) {
+      return res.status(403).json({ error: "Access denied", code: "WORKSPACE_MISMATCH" });
+    }
+
+    const myRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
+    const isWLMy = myRoles.includes("WORKSPACELEADER");
+
+    if (!isWLMy && (user.sbtRole !== "L1" && user.sbtRole !== "BOTH")) {
       return res.status(403).json({ error: "SBT Requestor access required", code: "NOT_L1" });
     }
 
@@ -210,12 +245,18 @@ router.delete("/:id/cancel", async (req: any, res: any) => {
 router.get("/inbox", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId }).select("sbtRole roles customerId").lean() as any;
+    const user = await User.findById(uid).select("sbtRole roles customerId").lean() as any;
+
+    const inboxUserCustomerId = user?.customerId?.toString();
+    const inboxWsCustomerId = req.workspace?.customerId?.toString();
+    if (!user || inboxUserCustomerId !== inboxWsCustomerId) {
+      return res.status(403).json({ error: "Access denied", code: "WORKSPACE_MISMATCH" });
+    }
 
     const allRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
     const isWL = allRoles.includes("WORKSPACELEADER");
 
-    if (!user || (user.sbtRole !== "L2" && user.sbtRole !== "BOTH" && !isWL)) {
+    if (user.sbtRole !== "L2" && user.sbtRole !== "BOTH" && !isWL) {
       return res.status(403).json({ error: "SBT Booker access required", code: "NOT_L2" });
     }
 
@@ -260,7 +301,7 @@ router.get("/:id", async (req: any, res: any) => {
     const isBooker = String(request.assignedBookerId?._id || request.assignedBookerId) === uid;
 
     // Workspace Leader can view any request in their company
-    const detailUser = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId }).select("roles customerId").lean() as any;
+    const detailUser = await User.findById(uid).select("roles customerId").lean() as any;
     const detailRoles = (Array.isArray(detailUser?.roles) ? detailUser.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
     const isWLDetail = detailRoles.includes("WORKSPACELEADER") && String(detailUser?.customerId) === String(request.customerId);
 
@@ -280,7 +321,13 @@ router.get("/:id", async (req: any, res: any) => {
 router.post("/:id/book", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId }).select("sbtRole roles customerId").lean() as any;
+    const user = await User.findById(uid).select("sbtRole roles customerId").lean() as any;
+
+    const bookUserCustomerId = user?.customerId?.toString();
+    const bookWsCustomerId = req.workspace?.customerId?.toString();
+    if (!user || bookUserCustomerId !== bookWsCustomerId) {
+      return res.status(403).json({ error: "Access denied", code: "WORKSPACE_MISMATCH" });
+    }
 
     const bookRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
     const isWLBooker = bookRoles.includes("WORKSPACELEADER");
@@ -298,11 +345,6 @@ router.post("/:id/book", async (req: any, res: any) => {
 
     if (!request) {
       return res.status(403).json({ error: "Request not found or not assigned to you" });
-    }
-
-    // Prevent self-booking
-    if (String(request.requesterId) === uid) {
-      return res.status(403).json({ error: "You cannot book your own request" });
     }
 
     const { bookerNotes } = req.body || {};
@@ -498,6 +540,11 @@ router.post("/:id/book", async (req: any, res: any) => {
         0;
       const finalCurrency = fqFare?.Currency ?? opt?.Fare?.Currency ?? opt?.currency ?? "INR";
 
+      console.log('[BOOKING CREATE]', {
+        requesterId: String(request.requesterId),
+        bookerUserId: String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? ""),
+        requestId: String(request._id)
+      });
       booking = await SBTBooking.create({
         userId: request.requesterId,
         customerId: String(request.customerId || ""),
@@ -572,28 +619,51 @@ router.post("/:id/book", async (req: any, res: any) => {
     await request.save();
 
     // Send email to L1
-    const requester = await User.findOne({ _id: request.requesterId, workspaceId: req.workspaceObjectId })
+    const requester = await User.findById(request.requesterId)
       .select("name email")
       .lean() as any;
+
+    sbtLogger.info("[SBT EMAIL] Attempting to send to:", { userId: request.requesterId, email: requester?.email, event: "request_booked" });
+    if (!requester) {
+      sbtLogger.warn("[SBT EMAIL] User not found:", { userId: request.requesterId, event: "request_booked" });
+    }
 
     if (requester?.email) {
       const desc = describeOption(request.type, request.selectedOption, request.searchParams);
       const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
+      const paxNames = ((request as any).passengerDetails || [])
+        .map((p: any) => `${p.firstName || ""} ${p.lastName || ""}`.trim())
+        .filter(Boolean)
+        .join(", ");
+
+      const confirmedBody = `
+        ${eCard(`
+          ${eLabel("Booking Details")}
+          <table cellpadding="0" cellspacing="0">
+            ${request.type === "flight" && (booking as any)?.pnr ? eRow("PNR", escapeHtml((booking as any).pnr)) : ""}
+            ${request.type === "hotel" && (booking as any)?.confirmationNo ? eRow("Booking Ref", escapeHtml((booking as any).confirmationNo)) : ""}
+            ${eRow(request.type === "flight" ? "Route" : "Hotel", escapeHtml(desc))}
+            ${paxNames ? eRow("Passengers", escapeHtml(paxNames)) : ""}
+            ${(booking as any)?.totalFare ? eRow("Total Fare", escapeHtml(`${(booking as any).currency || "INR"} ${(booking as any).totalFare}`)) : ""}
+            ${bookerNotes ? eRow("Booker Notes", escapeHtml(bookerNotes)) : ""}
+          </table>
+        `)}
+        <div style="margin-top:16px;">
+          ${eBtn("Download Ticket", `${frontendUrl}/sbt/my-bookings`, "#10b981", "#ffffff")}
+        </div>
+      `;
 
       await sendMail({
         to: requester.email,
         subject: `Your travel request has been booked — ${desc}`,
         kind: "CONFIRMATIONS",
-        html: `
-          <h3>Booking Confirmed</h3>
-          <p>Your ${request.type === "flight" ? "flight" : "hotel"} request has been booked.</p>
-          <p><strong>Route/Hotel:</strong> ${desc}</p>
-          ${request.type === "flight" && booking?.pnr ? `<p><strong>PNR:</strong> ${booking.pnr}</p>` : ""}
-          ${request.type === "hotel" && booking?.confirmationNo ? `<p><strong>Booking Ref:</strong> ${booking.confirmationNo}</p>` : ""}
-          ${bookerNotes ? `<p><strong>Booker Notes:</strong> ${bookerNotes}</p>` : ""}
-          <p><a href="${frontendUrl}/sbt/my-requests">View My Requests</a></p>
-        `,
-      }).catch((e: any) => sbtLogger.warn("Failed to send SBT booked email", { error: e?.message }));
+        html: buildEmailShell(confirmedBody, {
+          title: "Your Trip is Confirmed",
+          subtitle: "Your booking has been processed",
+          badgeText: "CONFIRMED",
+          badgeColor: "#10b981",
+        }),
+      }).catch((e: any) => sbtLogger.error("[SBT EMAIL FAILED]", { event: "request_booked", recipient: requester.email, error: e?.message || e }));
     }
 
     sbtLogger.info("SBT request booked by L2", {
@@ -614,7 +684,13 @@ router.post("/:id/book", async (req: any, res: any) => {
 router.post("/:id/reject", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findOne({ _id: uid, workspaceId: req.workspaceObjectId }).select("sbtRole roles customerId").lean() as any;
+    const user = await User.findById(uid).select("sbtRole roles customerId").lean() as any;
+
+    const rejUserCustomerId = user?.customerId?.toString();
+    const rejWsCustomerId = req.workspace?.customerId?.toString();
+    if (!user || rejUserCustomerId !== rejWsCustomerId) {
+      return res.status(403).json({ error: "Access denied", code: "WORKSPACE_MISMATCH" });
+    }
 
     const rejRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
     const isWLReject = rejRoles.includes("WORKSPACELEADER");
@@ -645,27 +721,44 @@ router.post("/:id/reject", async (req: any, res: any) => {
     await request.save();
 
     // Send email to L1
-    const requester = await User.findOne({ _id: request.requesterId, workspaceId: req.workspaceObjectId })
+    const requester = await User.findById(request.requesterId)
       .select("name email")
       .lean() as any;
+
+    sbtLogger.info("[SBT EMAIL] Attempting to send to:", { userId: request.requesterId, email: requester?.email, event: "request_rejected" });
+    if (!requester) {
+      sbtLogger.warn("[SBT EMAIL] User not found:", { userId: request.requesterId, event: "request_rejected" });
+    }
 
     if (requester?.email) {
       const desc = describeOption(request.type, request.selectedOption, request.searchParams);
       const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
 
+      const rejectedBody = `
+        ${eCard(`
+          ${eLabel("Request Details")}
+          <table cellpadding="0" cellspacing="0">
+            ${eRow(request.type === "flight" ? "Route" : "Hotel", escapeHtml(desc))}
+            ${eRow("Reason", escapeHtml(rejectionReason))}
+            ${alternativeSuggestion ? eRow("Alternative Suggestion", escapeHtml(alternativeSuggestion)) : ""}
+          </table>
+        `)}
+        <div style="margin-top:16px;">
+          ${eBtn("Raise a New Request", `${frontendUrl}/sbt/my-requests`, "#6366f1", "#ffffff")}
+        </div>
+      `;
+
       await sendMail({
         to: requester.email,
         subject: `Your travel request needs attention — ${desc}`,
         kind: "REQUESTS",
-        html: `
-          <h3>Request Update</h3>
-          <p>Your ${request.type === "flight" ? "flight" : "hotel"} request was not approved.</p>
-          <p><strong>Route/Hotel:</strong> ${desc}</p>
-          <p><strong>Reason:</strong> ${rejectionReason}</p>
-          ${alternativeSuggestion ? `<p><strong>Suggested Alternative:</strong> ${alternativeSuggestion}</p>` : ""}
-          <p><a href="${frontendUrl}/sbt/my-requests">Raise a New Request</a></p>
-        `,
-      }).catch((e: any) => sbtLogger.warn("Failed to send SBT rejection email", { error: e?.message }));
+        html: buildEmailShell(rejectedBody, {
+          title: "Booking Request Update",
+          subtitle: "Your travel request has been reviewed",
+          badgeText: "NOT APPROVED",
+          badgeColor: "#ef4444",
+        }),
+      }).catch((e: any) => sbtLogger.error("[SBT EMAIL FAILED]", { event: "request_rejected", recipient: requester.email, error: e?.message || e }));
     }
 
     sbtLogger.info("SBT request rejected", {

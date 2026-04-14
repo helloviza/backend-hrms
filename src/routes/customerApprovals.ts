@@ -1,6 +1,7 @@
 import { Router } from "express";
 import mongoose from "mongoose";
 import requireAuth from "../middleware/auth.js";
+import { sendMail } from "../utils/mailer.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import User from "../models/User.js";
 import MasterData from "../models/MasterData.js";
@@ -11,6 +12,113 @@ import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { hashToken, signEmailActionToken, verifyEmailActionToken } from "../utils/emailActionToken.js";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
+
+/* -------- Email template helpers -------- */
+
+function detailRow(label: string, value: string): string {
+  return `
+    <tr>
+      <td width="120" style="color:#9ca3af;font-size:12px;padding:2px 0;vertical-align:top;">${label}</td>
+      <td style="color:#374151;font-size:12px;font-weight:500;padding:2px 0;">${value}</td>
+    </tr>`;
+}
+
+function fmt(v: any): string {
+  return v !== undefined && v !== null && String(v).trim() !== "" ? String(v).trim() : "";
+}
+
+function fmtFare(v: any): string {
+  const n = Number(v);
+  if (!v || !Number.isFinite(n)) return "";
+  return `₹${n.toLocaleString("en-IN")}`;
+}
+
+function buildItemsHtml(cartItems: any[]): string {
+  if (!Array.isArray(cartItems) || cartItems.length === 0) {
+    return `<p style="color:#9ca3af;font-size:13px;">No items in cart.</p>`;
+  }
+
+  return cartItems.map((item) => {
+    const type = fmt(item?.type || item?.itemType || "").toUpperCase();
+    const isHotel = type === "HOTEL" || (!!(item?.hotelName || item?.propertyName) && !item?.origin);
+
+    if (isHotel) {
+      const propertyName = fmt(item?.hotelName || item?.propertyName);
+      const checkIn = fmt(item?.checkIn || item?.checkInDate);
+      const checkOut = fmt(item?.checkOut || item?.checkOutDate);
+      const rooms = fmt(item?.rooms || item?.roomCount);
+      const guests = fmt(item?.guests || item?.guestCount || item?.adults);
+      const fare = fmtFare(item?.fare || item?.amount || item?.totalFare);
+
+      return `
+<table width="100%" cellpadding="0" cellspacing="0"
+  style="background:#f4f5f7;border-radius:10px;margin-bottom:12px;overflow:hidden;">
+  <tr>
+    <td style="padding:16px 20px;">
+      <div style="font-size:18px;font-weight:700;color:#111827;letter-spacing:-0.3px;margin-bottom:4px;">
+        ${propertyName || "Hotel"}
+      </div>
+      <div style="color:#6b7280;font-size:12px;margin-bottom:12px;">
+        ${[rooms ? rooms + " Room(s)" : "", guests ? guests + " Guest(s)" : ""].filter(Boolean).join(" · ")}
+      </div>
+      <table width="100%" cellpadding="0" cellspacing="0">
+        ${checkIn ? detailRow("Check-In", checkIn) : ""}
+        ${checkOut ? detailRow("Check-Out", checkOut) : ""}
+        ${fare ? detailRow("Fare", fare) : ""}
+      </table>
+    </td>
+    <td width="80" align="right" valign="top" style="padding:16px 20px 0 0;">
+      <div style="background:#fef3c7;color:#92400e;font-size:11px;font-weight:600;padding:4px 10px;border-radius:20px;display:inline-block;">
+        HOTEL
+      </div>
+    </td>
+  </tr>
+</table>`;
+    }
+
+    // Default: FLIGHT
+    const origin = fmt(item?.origin || item?.from);
+    const destination = fmt(item?.destination || item?.to);
+    const departDate = fmt(item?.departDate || item?.travelDate);
+    const tripType = fmt(item?.tripType || "");
+    const cabinClass = fmt(item?.cabinClass || item?.cabin || "");
+    const adults = fmt(item?.adults || item?.passengers?.adults || "");
+
+    const travellers = Array.isArray(item?.travellers)
+      ? item.travellers
+          .map((t: any) => [fmt(t?.firstName || t?.first_name), fmt(t?.lastName || t?.last_name)].filter(Boolean).join(" "))
+          .filter(Boolean)
+          .join(", ")
+      : "";
+
+    const fare = fmtFare(item?.fare || item?.amount || item?.totalFare);
+
+    const meta = [tripType, cabinClass, adults ? adults + " Adult(s)" : ""].filter(Boolean).join(" · ");
+
+    return `
+<table width="100%" cellpadding="0" cellspacing="0"
+  style="background:#f4f5f7;border-radius:10px;margin-bottom:12px;overflow:hidden;">
+  <tr>
+    <td style="padding:16px 20px;">
+      <div style="font-size:18px;font-weight:700;color:#111827;letter-spacing:-0.3px;margin-bottom:4px;">
+        ${origin || "?"} → ${destination || "?"}
+      </div>
+      ${meta ? `<div style="color:#6b7280;font-size:12px;margin-bottom:12px;">${meta}</div>` : ""}
+      <table width="100%" cellpadding="0" cellspacing="0">
+        ${departDate ? detailRow("Depart Date", departDate) : ""}
+        ${travellers ? detailRow("Travellers", travellers) : ""}
+        ${fare ? detailRow("Fare", fare) : ""}
+      </table>
+    </td>
+    <td width="80" align="right" valign="top" style="padding:16px 20px 0 0;">
+      <div style="background:#eef2ff;color:#4f46e5;font-size:11px;font-weight:600;padding:4px 10px;border-radius:20px;display:inline-block;">
+        FLIGHT
+      </div>
+    </td>
+  </tr>
+</table>`;
+  }).join("");
+}
 
 const r = Router();
 
@@ -28,11 +136,8 @@ function htmlResult(title: string, msg: string) {
   <h2>${title}</h2><p>${msg}</p></body></html>`;
 }
 
-// ✅ replace with your real mailer (Nodemailer / SES / etc.)
 async function sendApprovalEmail(to: string, subject: string, html: string) {
-
-  // TODO: integrate your existing mailer util here
-  return true;
+  return sendMail({ to, subject, html, kind: "APPROVALS" });
 }
 
 /** Generate PTS-like ticket id */
@@ -142,21 +247,130 @@ r.post("/submit", requireAuth, requireWorkspace, requireCustomer, requireTravelM
     const declineUrl = `${base}/customer-approvals/email/${encodeURIComponent(declineToken)}`;
     const holdUrl = `${base}/customer-approvals/email/${encodeURIComponent(holdToken)}`;
 
-    const html = `
-      <div style="font-family:system-ui;max-width:720px;margin:0 auto;padding:12px">
-        <h2>Approval Needed: ${ticketId}</h2>
-        <p>A new request is waiting for your action.</p>
-        <p><b>Requester:</b> ${requesterEmail}</p>
-        <p><b>Comments:</b> ${comments || "-"}</p>
-        <pre style="background:#f8fafc;padding:12px;border-radius:10px;white-space:pre-wrap">${JSON.stringify(cartItems, null, 2)}</pre>
-        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px">
-          <a href="${approveUrl}" style="padding:10px 14px;border-radius:10px;background:#16a34a;color:#fff;text-decoration:none;font-weight:700">Approve</a>
-          <a href="${holdUrl}" style="padding:10px 14px;border-radius:10px;background:#f59e0b;color:#111;text-decoration:none;font-weight:700">Put On Hold</a>
-          <a href="${declineUrl}" style="padding:10px 14px;border-radius:10px;background:#dc2626;color:#fff;text-decoration:none;font-weight:700">Decline</a>
-        </div>
-        <p style="color:#64748b;margin-top:12px">Links expire in ${tokenExpiryHours} hours.</p>
-      </div>
-    `;
+    const requestId = String(doc._id);
+    const itemsHtml = buildItemsHtml(cartItems);
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Approval Needed</title>
+</head>
+<body style="margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,'Segoe UI',Arial,sans-serif;">
+
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:40px 20px;">
+    <tr><td align="center">
+
+      <table width="600" cellpadding="0" cellspacing="0"
+        style="background:#ffffff;border-radius:16px;border:1px solid #e5e7eb;overflow:hidden;max-width:600px;width:100%;">
+
+        <!-- HEADER BAND -->
+        <tr>
+          <td style="background:#4f46e5;padding:28px 36px;">
+            <div style="color:#ffffff;font-size:11px;font-weight:600;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px;">
+              Plumtrips · AI Travel Ops
+            </div>
+            <div style="color:#ffffff;font-size:24px;font-weight:700;letter-spacing:-0.5px;">
+              Approval Needed
+            </div>
+            <div style="color:#a5b4fc;font-size:13px;margin-top:6px;">
+              Review the request below and take action.
+            </div>
+          </td>
+        </tr>
+
+        <!-- BODY -->
+        <tr>
+          <td style="padding:32px 36px;">
+
+            <!-- Meta row -->
+            <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+              <tr>
+                <td style="background:#f4f5f7;border-radius:10px;padding:16px 20px;">
+                  <table width="100%" cellpadding="0" cellspacing="0">
+                    <tr>
+                      <td width="50%" style="padding:4px 0;">
+                        <div style="color:#9ca3af;font-size:11px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:3px;">Ticket ID</div>
+                        <div style="color:#111827;font-size:13px;font-weight:600;font-family:monospace;">${ticketId}</div>
+                      </td>
+                      <td width="50%" style="padding:4px 0;">
+                        <div style="color:#9ca3af;font-size:11px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:3px;">Requested By</div>
+                        <div style="color:#111827;font-size:13px;font-weight:600;">${requesterEmail}</div>
+                      </td>
+                    </tr>
+                    ${comments ? `
+                    <tr>
+                      <td colspan="2" style="padding-top:12px;border-top:1px solid #e5e7eb;">
+                        <div style="color:#9ca3af;font-size:11px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:3px;">Note</div>
+                        <div style="color:#374151;font-size:13px;">${comments}</div>
+                      </td>
+                    </tr>` : ""}
+                  </table>
+                </td>
+              </tr>
+            </table>
+
+            <!-- TRIP SNAPSHOT HEADER -->
+            <div style="color:#9ca3af;font-size:11px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px;">
+              Trip / Service Snapshot
+            </div>
+
+            ${itemsHtml}
+
+            <!-- DIVIDER -->
+            <hr style="border:none;border-top:1px solid #e5e7eb;margin:28px 0;">
+
+            <!-- ACTION BUTTONS -->
+            <div style="color:#9ca3af;font-size:11px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:16px;">
+              Your Action
+            </div>
+            <table cellpadding="0" cellspacing="0">
+              <tr>
+                <td style="padding-right:10px;">
+                  <a href="${approveUrl}"
+                    style="display:inline-block;background:#4f46e5;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;">
+                    &#10003; Approve
+                  </a>
+                </td>
+                <td style="padding-right:10px;">
+                  <a href="${declineUrl}"
+                    style="display:inline-block;background:#ffffff;color:#dc2626;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;border:1.5px solid #fca5a5;">
+                    &#10005; Reject
+                  </a>
+                </td>
+                <td>
+                  <a href="${holdUrl}"
+                    style="display:inline-block;background:#ffffff;color:#92400e;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;border:1.5px solid #fcd34d;">
+                    &#9646; On Hold
+                  </a>
+                </td>
+              </tr>
+            </table>
+
+            <div style="color:#9ca3af;font-size:12px;margin-top:16px;">
+              These links expire in ${tokenExpiryHours} hours. Do not forward this email.
+            </div>
+
+          </td>
+        </tr>
+
+        <!-- FOOTER -->
+        <tr>
+          <td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:20px 36px;">
+            <div style="color:#9ca3af;font-size:12px;">
+              Request ID: ${requestId} &middot; You&rsquo;re receiving this because you&rsquo;re listed as an approver for a Plumtrips workspace.
+            </div>
+          </td>
+        </tr>
+
+      </table>
+
+    </td></tr>
+  </table>
+
+</body>
+</html>`;
 
     await sendApprovalEmail(normalizeEmail(approver.email), `Approval Needed: ${ticketId}`, html);
 

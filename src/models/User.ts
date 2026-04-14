@@ -247,6 +247,7 @@ const UserSchema = new Schema(
     sbtEnabled: { type: Boolean, default: false },
     sbtBookingType: { type: String, enum: ["flight", "hotel", "both"], default: "both" },
     sbtRole: { type: String, enum: ["L1", "L2", "BOTH"], default: null },
+    bandNumber: { type: Number, default: null, min: 1, max: 10 },
     sbtAssignedBookerId: { type: Schema.Types.ObjectId, ref: "User", default: null },
     canRaiseRequest: { type: Boolean, default: true },
     canViewBilling: { type: Boolean, default: false },

@@ -11,6 +11,8 @@ export interface CustomerMemberDocument extends Document {
 
   isActive: boolean;
 
+  bandNumber?: number | null;
+
   createdBy?: string; // sub/email of creator
   invitedAt?: Date;
   lastInviteAt?: Date;
@@ -27,6 +29,8 @@ const CustomerMemberSchema = new Schema<CustomerMemberDocument>(
     role: { type: String, required: true, index: true },
 
     isActive: { type: Boolean, default: true, index: true },
+
+    bandNumber: { type: Number, default: null, min: 1, max: 10 },
 
     createdBy: { type: String },
     invitedAt: { type: Date },

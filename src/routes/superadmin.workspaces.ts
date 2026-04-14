@@ -4,6 +4,7 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import mongoose from "mongoose";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import Customer from "../models/Customer.js";
 import User from "../models/User.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
 import { sendWorkspaceCredentials } from "../services/email.service.js";
@@ -42,7 +43,7 @@ function generateTempPassword(length = 12): string {
 router.get("/workspaces", async (req: any, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
-    const limit = Math.max(1, parseInt(req.query.limit as string) || 20);
+    const limit = Math.max(1, parseInt(req.query.limit as string) || 100);
     const { search, plan, status } = req.query as Record<string, string>;
 
     const filter: Record<string, any> = {};
@@ -68,25 +69,31 @@ router.get("/workspaces", async (req: any, res) => {
     ]);
     const userCountMap = new Map(userCounts.map((u: any) => [String(u._id), u.count as number]));
 
-    // Batch: admin user per workspace
+    // Batch: admin user per workspace — keyed by customerId, not workspaceId.
+    // User.workspaceId can be stale/inconsistent; customerId is always correct.
+    const allCustomerIds = workspaces
+      .map((ws: any) => String(ws.customerId))
+      .filter(Boolean);
+
     const adminUsers = await User.find({
-      workspaceId: { $in: wsIds },
-      $or: [
-        { roles: { $in: ["WORKSPACE_ADMIN", "ADMIN", "SUPERADMIN"] } },
-      ],
+      customerId: { $in: allCustomerIds },
+      roles: { $in: [
+        "WORKSPACE_ADMIN", "ADMIN", "SUPERADMIN",
+        "WORKSPACE_LEADER",
+      ]},
     })
-      .select("workspaceId name firstName lastName email")
+      .select("customerId name firstName lastName email roles")
       .sort({ createdAt: 1 })
       .lean();
 
-    const adminByWs = new Map<string, any>();
+    const adminByCustomerId = new Map<string, any>();
     for (const u of adminUsers) {
-      const key = String((u as any).workspaceId);
-      if (!adminByWs.has(key)) adminByWs.set(key, u);
+      const cid = String((u as any).customerId);
+      if (!adminByCustomerId.has(cid)) adminByCustomerId.set(cid, u);
     }
 
     const workspacesWithCounts = workspaces.map((ws: any) => {
-      const admin = adminByWs.get(String(ws._id));
+      const admin = adminByCustomerId.get(String(ws.customerId));
       const adminName = admin
         ? (admin.firstName && admin.lastName ? `${admin.firstName} ${admin.lastName}` : admin.name || admin.email)
         : "—";
@@ -104,7 +111,45 @@ router.get("/workspaces", async (req: any, res) => {
       };
     });
 
-    res.json({ workspaces: workspacesWithCounts, total, page, limit });
+    // Fix B: Customer docs with no matching CustomerWorkspace
+    // Link: CustomerWorkspace.customerId === String(Customer._id)
+    const existingWsCustomerIds = new Set(
+      workspaces.map((ws: any) => ws.customerId as string)
+        .concat(await CustomerWorkspace.distinct("customerId") as string[])
+    );
+
+    const allCustomers = await Customer.find({})
+      .select("_id name companyName email adminEmails allowedDomains createdAt status")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const orphanCustomers = (allCustomers as any[])
+      .filter((c) => !existingWsCustomerIds.has(String(c._id)))
+      .map((c) => ({
+        _id: String(c._id),
+        customerId: String(c._id),
+        companyName: c.companyName || c.name || "—",
+        adminEmail: (Array.isArray(c.adminEmails) && c.adminEmails[0]) || c.email || "—",
+        adminName: "—",
+        plan: "—",
+        status: c.status || "ACTIVE",
+        userCount: 0,
+        features: {},
+        createdAt: c.createdAt,
+        hasWorkspace: false as const,
+      }));
+
+    // Merge CustomerWorkspace rows + orphan Customer rows into one sorted list
+    const allWorkspaces = [
+      ...workspacesWithCounts,
+      ...orphanCustomers,
+    ].sort((a: any, b: any) => {
+      const da = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const db = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return db - da;
+    });
+
+    res.json({ workspaces: allWorkspaces, total: allWorkspaces.length, page, limit });
   } catch (err: any) {
     logger.error("GET /workspaces failed");
     res.status(500).json({ error: err.message });

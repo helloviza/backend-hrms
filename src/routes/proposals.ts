@@ -12,6 +12,7 @@ import { requireTravelMode } from "../middleware/travelModeGuard.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import Proposal from "../models/Proposal.js";
 import ApprovalRequest, { type ApprovalStage } from "../models/ApprovalRequest.js";
+import User from "../models/User.js";
 
 // ✅ reuse existing utilities (same as approvals flow)
 // NOTE: signatures may vary in your codebase; we call as `any` safely.
@@ -20,6 +21,7 @@ import {
   signEmailActionToken as signEmailActionTokenAny,
   verifyEmailActionToken as verifyEmailActionTokenAny,
 } from "../utils/emailActionToken.js";
+import { buildEmailShell, eBtn, escapeHtml as escHtml, eLabel, eCard, eRow } from "./approvals.email.js";
 
 type AnyObj = Record<string, any>;
 type ProposalStatus = "DRAFT" | "SUBMITTED" | "APPROVED" | "DECLINED" | "EXPIRED";
@@ -772,6 +774,17 @@ function moneyINR(n: any) {
   return `₹${v.toLocaleString("en-IN")}`;
 }
 
+function itemLabel(li: any): string {
+  const origin = String(li?.meta?.origin || li?.from || li?.origin || "").trim();
+  const dest   = String(li?.meta?.destination || li?.to || li?.destination || "").trim();
+  const raw    = String(li?.meta?.tripType || li?.tripType || "").trim();
+  const trip   = raw.toLowerCase() === "oneway" ? "One Way"
+               : raw.toLowerCase() === "roundtrip" ? "Round Trip"
+               : raw || "";
+  if (origin && dest) return `${origin} → ${dest}${trip ? ` (${trip})` : ""}`;
+  return String(li?.description || li?.title || li?.name || li?.category || "Travel Service");
+}
+
 function buildProposalSummaryHtml(p: any) {
   const options = ensureArray(p?.options).slice().sort((a: any, b: any) => Number(a?.optionNo || 0) - Number(b?.optionNo || 0));
 
@@ -781,7 +794,7 @@ function buildProposalSummaryHtml(p: any) {
 
       const rows = lines
         .map((li: any) => {
-          const title = String(li?.title || li?.category || "Item");
+          const title = itemLabel(li);
           const qty = Number(li?.qty || 1);
           const unit = Number(li?.unitPrice || 0);
           const total = Number(li?.totalPrice || qty * unit || 0);
@@ -832,15 +845,31 @@ function buildProposalSummaryHtml(p: any) {
     })
     .join("");
 
+  const requesterSectionHtml =
+    p?.requesterName || p?.requesterEmail
+      ? `<div style="margin-bottom:16px;">
+          ${eLabel("Requested By")}
+          ${eCard(`
+            <table cellpadding="0" cellspacing="0" width="100%">
+              ${p?.requesterName ? eRow("Name", escHtml(p.requesterName)) : ""}
+              ${p?.requesterEmail ? eRow("Email", escHtml(p.requesterEmail)) : ""}
+            </table>
+          `)}
+        </div>`
+      : "";
+
   return `
     <div style="font-family:Arial,sans-serif;max-width:720px;">
       <h2 style="margin:0 0 8px;">Proposal submitted for approval</h2>
+      ${requesterSectionHtml}
       <div style="color:#666;margin-bottom:10px;">Proposal ID: <b>${String(p?._id || "")}</b></div>
 
-      <div style="display:flex;justify-content:space-between;margin:8px 0 6px;">
-        <div style="color:#666;">Grand Total</div>
-        <div style="font-weight:900;">${moneyINR(p?.totalAmount)}</div>
-      </div>
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin:8px 0 6px;">
+        <tr>
+          <td style="color:#666;font-size:14px;">Grand Total</td>
+          <td align="right" style="font-weight:900;font-size:14px;">&#8377;${Number(p?.totalAmount || 0).toLocaleString("en-IN")}</td>
+        </tr>
+      </table>
 
       ${optBlocks || `<div style="color:#666;">No options</div>`}
     </div>
@@ -1125,6 +1154,18 @@ router.get("/mine", requireAnyAuth, requireWorkspace, async (req: Request, res: 
     const userEmail = normEmail(aReq.user?.email);
     if (!userEmail) return res.status(401).json({ error: "Unauthenticated" });
 
+    const userRoles: string[] = (aReq.user?.roles || []).map((r: string) => String(r).toUpperCase());
+    const isL1Only =
+      !userRoles.some((r) =>
+        ["ADMIN", "SUPERADMIN", "HR", "OPS", "MANAGER", "WORKSPACE_LEADER", "APPROVER"].includes(r)
+      ) &&
+      !String(aReq.user?.sbtRole || "").toUpperCase().includes("L2") &&
+      String(aReq.user?.sbtRole || "").toUpperCase() !== "BOTH";
+
+    if (isL1Only) {
+      return res.status(403).json({ message: "Proposals are not accessible to requestors" });
+    }
+
     const candidateRequests = await ApprovalRequest.find({
       $or: [{ frontlinerEmail: userEmail }, { managerEmail: userEmail }, { "meta.ccLeaders": userEmail }],
       workspaceId: (req as any).workspaceObjectId,
@@ -1254,11 +1295,27 @@ router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, re
     const ar: any = await ApprovalRequest.findOne({ _id: rid, workspaceId: (req as any).workspaceObjectId }).lean();
     if (!ar) return res.status(404).json({ error: "ApprovalRequest not found" });
 
+    const arTravelFlow = String(ar?.meta?.travelFlow || ar?.travelFlow || "").toUpperCase();
+    if (arTravelFlow === "APPROVAL_DIRECT" || ar?.meta?.autoApproved === true) {
+      return res.status(400).json({ error: "Direct booking requests do not require a proposal" });
+    }
+
     if (!isRequestFullyApproved(ar)) {
       return res.status(403).json({
         error: "Request must be approved by L2 and L0 before proposal can be created.",
       });
     }
+
+    // Resolve requester identity from the authenticated user
+    const authedUser: AnyObj = (req as AuthedReq).user ?? {};
+    const requesterUser: any = authedUser.sub
+      ? await User.findById(authedUser.sub).select("firstName lastName name email").lean()
+      : null;
+    const requesterName =
+      requesterUser?.name ||
+      [requesterUser?.firstName, requesterUser?.lastName].filter(Boolean).join(" ") ||
+      authedUser.email ||
+      "";
 
     const latest = await latestProposalForRequest(rid);
 
@@ -1286,6 +1343,10 @@ router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, re
       const currency = normStr((req as any).body?.currency || "");
       if (currency) doc.currency = currency.toUpperCase();
 
+      doc.createdBy = authedUser.sub || undefined;
+      doc.requesterEmail = authedUser.email || "";
+      doc.requesterName = requesterName;
+
       await doc.save();
       await safeAdvanceStage(rid, "PROPOSAL_PENDING", { workspaceId: (req as any).workspaceObjectId });
 
@@ -1298,6 +1359,10 @@ router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, re
 
     const currency = normStr((req as any).body?.currency || "");
     if (currency) doc.currency = currency.toUpperCase();
+
+    doc.createdBy = authedUser.sub || undefined;
+    doc.requesterEmail = authedUser.email || "";
+    doc.requesterName = requesterName;
 
     doc.history = ensureArray(doc.history);
     doc.history.push(pushHistory((req as AuthedReq).user || {}, "DRAFT_CREATED", `Draft created v${doc.version}`));
@@ -1417,39 +1482,108 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
     const reqCode = getPublicRequestCode(ar);
     const summaryHtml = buildProposalSummaryHtml(doc);
 
-    const html = `
-      <div style="font-family:Arial,sans-serif;max-width:720px;">
-        <div style="font-size:18px;font-weight:800;margin-bottom:6px;">PlumTrips HRMS — Proposal Approval</div>
-        <div style="color:#666;margin-bottom:14px;">Request: <b>${reqCode || String(doc.requestId || "")}</b></div>
+    const proposalEmailBody = `
+      <div style="font-size:12px;color:#64748b;margin-bottom:14px;">
+        Request: <b style="color:#0f172a;">${escHtml(reqCode || String(doc.requestId || ""))}</b>
+      </div>
 
-        ${summaryHtml}
+      ${summaryHtml}
 
-        <div style="margin-top:16px;">
-          ${buttonHtml("Approve", approveUrl, "green")}
-          ${buttonHtml("Reject", declineUrl, "red")}
-          ${buttonHtml("Hold", holdUrl, "gray")}
-        </div>
+      <div style="margin-top:20px;">
+        ${eBtn("✓ Approve", approveUrl, "#4f46e5", "#ffffff")}
+        ${eBtn("✕ Reject", declineUrl, "#ffffff", "#dc2626", "#fca5a5")}
+        ${eBtn("▮ On Hold", holdUrl, "#ffffff", "#92400e", "#fcd34d")}
+      </div>
 
-        <div style="color:#666;font-size:12px;margin-top:14px;">
-          If you didn’t request this email, you can ignore it.
+      <div style="margin-top:20px;padding:12px 14px;border-radius:14px;background:#0b1220;color:#e2e8f0;">
+        <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:900;color:#94a3b8;">Security</div>
+        <div style="margin-top:6px;font-size:13px;line-height:1.55;">
+          Do not forward this email. Action links are intended for the assigned approver only.
         </div>
       </div>
     `;
 
+    const html = buildEmailShell(proposalEmailBody, {
+      title: "Proposal Approval Needed",
+      subtitle: "Review the proposal and take action",
+      badgeText: "AWAITING APPROVAL",
+      badgeColor: "#f59e0b",
+    });
+
     // Send email (signature may vary; we call as any)
     try {
       const sendMail = sendMailAny as any;
-      const toList = Array.from(new Set([l2Email, ...ensureArray(l0Emails)].filter(Boolean)));
+      const attachments = buildPdfAttachmentsForEmail(doc, 10);
 
-const attachments = buildPdfAttachmentsForEmail(doc, 10);
+      // Send L2 email with L2 tokens
+      await sendMail({
+        to: l2Email,
+        subject: `Proposal Approval Needed — ${reqCode || "Request"}`,
+        html,
+        attachments,
+      });
 
-await sendMail({
-  to: toList,
-  subject: `Proposal Approval Needed — ${reqCode || "Request"}`,
-  html,
-  attachments,
-});
+      // Send separate L0 emails with L0-specific tokens
+      const l0List = ensureArray(l0Emails).filter(Boolean);
+      for (const l0Addr of l0List) {
+        const l0ApproveToken = await sign({
+          proposalId: String(doc._id),
+          action: "approve",
+          role: "L0",
+          email: l0Addr,
+        });
+        const l0DeclineToken = await sign({
+          proposalId: String(doc._id),
+          action: "decline",
+          role: "L0",
+          email: l0Addr,
+        });
+        const l0HoldToken = await sign({
+          proposalId: String(doc._id),
+          action: "hold",
+          role: "L0",
+          email: l0Addr,
+        });
 
+        const l0ApproveUrl = buildEmailActionUrl(l0ApproveToken);
+        const l0DeclineUrl = buildEmailActionUrl(l0DeclineToken);
+        const l0HoldUrl = buildEmailActionUrl(l0HoldToken);
+
+        const l0EmailBody = `
+          <div style="font-size:12px;color:#64748b;margin-bottom:14px;">
+            Request: <b style="color:#0f172a;">${escHtml(reqCode || String(doc.requestId || ""))}</b>
+          </div>
+
+          ${summaryHtml}
+
+          <div style="margin-top:20px;">
+            ${eBtn("✓ Approve", l0ApproveUrl, "#4f46e5", "#ffffff")}
+            ${eBtn("✕ Reject", l0DeclineUrl, "#ffffff", "#dc2626", "#fca5a5")}
+            ${eBtn("▮ On Hold", l0HoldUrl, "#ffffff", "#92400e", "#fcd34d")}
+          </div>
+
+          <div style="margin-top:20px;padding:12px 14px;border-radius:14px;background:#0b1220;color:#e2e8f0;">
+            <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:900;color:#94a3b8;">Security</div>
+            <div style="margin-top:6px;font-size:13px;line-height:1.55;">
+              Do not forward this email. Action links are intended for the assigned approver only.
+            </div>
+          </div>
+        `;
+
+        const l0Html = buildEmailShell(l0EmailBody, {
+          title: "Proposal Approval Needed",
+          subtitle: "Review the proposal and take action",
+          badgeText: "AWAITING APPROVAL",
+          badgeColor: "#f59e0b",
+        });
+
+        await sendMail({
+          to: l0Addr,
+          subject: `Proposal Approval Needed — ${reqCode || "Request"}`,
+          html: l0Html,
+          attachments,
+        });
+      }
 
     } catch (e) {
       // Do not fail submit if SMTP misconfigured; you can enforce later if needed.

@@ -639,10 +639,12 @@ r.patch("/admin/users/:id/sbt", requireAuth, requireWorkspace, async (req: any, 
 
     const { sbtEnabled, sbtBookingType } = req.body;
 
-    const targetUser: any = await User.findOne({ _id: req.params.id, workspaceId: req.workspaceObjectId }).select("customerId email").lean();
+    // Step 1: find by ID only — no workspaceId filter (CUSTOMER users have a
+    // CustomerWorkspace._id as their workspaceId, not a staff workspace _id)
+    const targetUser: any = await User.findById(req.params.id).lean();
     if (!targetUser) return res.status(404).json({ error: "User not found" });
 
-    // WORKSPACE_LEADER: scoped checks
+    // Step 2: authorization check for WORKSPACE_LEADER callers
     if (isLeader && !isAdmin) {
       const actorCustomerId = String(actor.customerId || actor.businessId || "");
       const targetCustomerId = String(targetUser.customerId || "");
@@ -664,6 +666,7 @@ r.patch("/admin/users/:id/sbt", requireAuth, requireWorkspace, async (req: any, 
         });
       }
     }
+    // Staff admins (ADMIN/SUPERADMIN/HR) can update anyone — no additional check needed
 
     // If enabling SBT, check workspace travelMode for conflicts
     if (sbtEnabled) {

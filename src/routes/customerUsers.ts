@@ -708,6 +708,7 @@ async function ensureAuthUserForCustomer(params: {
   email: string;
   name?: string;
   customerId: string;
+  workspaceId?: any; // CustomerWorkspace._id
   memberRole: MemberRole;
   passwordPlain?: string | null;
   managerUser?: any | null;
@@ -736,6 +737,7 @@ async function ensureAuthUserForCustomer(params: {
       passwordHash,
       customerId: params.customerId,
       businessId: params.customerId,
+      workspaceId: params.workspaceId,
       accountType: "CUSTOMER",
       userType: "CUSTOMER",
       hrmsAccessRole: "EMPLOYEE",
@@ -756,6 +758,7 @@ async function ensureAuthUserForCustomer(params: {
 
   user.customerId = user.customerId || params.customerId;
   user.businessId = user.businessId || params.customerId;
+  if (params.workspaceId && !user.workspaceId) user.workspaceId = params.workspaceId;
   user.accountType = user.accountType || "CUSTOMER";
   user.userType = user.userType || "CUSTOMER";
 
@@ -832,6 +835,7 @@ router.post("/workspace/leader", requireAuth, async (req: any, res) => {
       email: leaderEmail,
       name: leaderName,
       customerId,
+      workspaceId: ws._id,
       memberRole: "WORKSPACE_LEADER",
       passwordPlain: null,
       managerUser: null,
@@ -1798,6 +1802,7 @@ router.post("/bulk", requireAuth, upload.single("file"), async (req: any, res) =
         email,
         name,
         customerId,
+        workspaceId: ws._id,
         memberRole: role,
         passwordPlain,
         managerUser,
@@ -1996,6 +2001,7 @@ router.post("/", requireAuth, async (req: any, res) => {
       email,
       name,
       customerId,
+      workspaceId: ws._id,
       memberRole: role,
       passwordPlain,
       managerUser,
@@ -2526,9 +2532,11 @@ router.post("/workspace/invite", requireAuth, async (req: any, res: any) => {
       ? "APPROVER"
       : "REQUESTER";
 
+    const wsForInvite: any = await ensureWorkspace(customerId);
     const { user: targetUser } = await ensureAuthUserForCustomer({
       email,
       customerId,
+      workspaceId: wsForInvite._id,
       memberRole,
     });
 

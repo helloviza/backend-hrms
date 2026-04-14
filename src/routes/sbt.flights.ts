@@ -1,4 +1,5 @@
 import express from "express";
+import mongoose from "mongoose";
 import { readFileSync } from "fs";
 import { writeFile as fsWriteFile, mkdir as fsMkdir } from "fs/promises";
 import { fileURLToPath } from "url";
@@ -15,6 +16,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { sendMail } from "../utils/mailer.js";
+import { buildEmailShell, eRow, eCard, eBtn, eLabel, escapeHtml } from "./approvals.email.js";
 import { clearTBOToken, logoutTBO, getTBOTokenStatus, getAgencyBalance, getTBOToken } from "../services/tbo.auth.service.js";
 import { getMarginConfig, applyMargin, isDomestic } from "../utils/margin.js";
 import { listTBOLogs, readTBOLog, logTBOCall } from "../utils/tboFileLogger.js";
@@ -254,22 +256,38 @@ router.use(requireAuth);
 router.use(requireWorkspace);
 router.use(requireFeature("flightBookingEnabled"));
 
+// ─── Privileged SBT user check ───────────────────────────────────────────────
+// ADMIN / SUPERADMIN / HR / WORKSPACE_LEADER are never blocked by SBT guards.
+function isPrivilegedSBTUser(req: any): boolean {
+  const roles = (req.user?.roles || [])
+    .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""));
+  return (
+    roles.includes("SUPERADMIN") ||
+    roles.includes("ADMIN") ||
+    roles.includes("HR") ||
+    roles.includes("WORKSPACELEADER") ||
+    req.user?.customerMemberRole === "WORKSPACE_LEADER"
+  );
+}
+
 // ─── SBT access guard ────────────────────────────────────────────────────────
 // Verifies the user has sbtEnabled=true in the DB.
-// Admin/SuperAdmin/HR users bypass this check so they can always inspect SBT data.
+// Privileged users (ADMIN/SUPERADMIN/HR/WORKSPACE_LEADER) always bypass.
 async function requireSBT(req: any, res: any, next: any) {
   try {
-    const roles: string[] = (req.user?.roles || []).map((r: string) =>
-      String(r).toUpperCase()
-    );
-    if (roles.includes("ADMIN") || roles.includes("SUPERADMIN") || roles.includes("HR")) {
-      return next();
-    }
+    if (isPrivilegedSBTUser(req)) return next();
 
     const userId = req.user?.id || req.user?._id;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId }).select("sbtEnabled").lean();
+    const user = await User.findById(userId).select("sbtEnabled customerId").lean();
+
+    const wsCustomerId = req.workspace?.customerId?.toString();
+    const userCustomerId = (user as any)?.customerId?.toString();
+    if (wsCustomerId && userCustomerId && wsCustomerId !== userCustomerId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
     if (!user || !(user as any).sbtEnabled) {
       return res.status(403).json({ error: "SBT access not enabled for this account" });
     }
@@ -282,15 +300,10 @@ async function requireSBT(req: any, res: any, next: any) {
 // ─── Travel-mode / booking-type guard for flights ────────────────────────────
 async function requireFlightAccess(req: any, res: any, next: any) {
   try {
-    const roles: string[] = (req.user?.roles || []).map((r: string) =>
-      String(r).toUpperCase()
-    );
-    if (roles.includes("ADMIN") || roles.includes("SUPERADMIN") || roles.includes("HR")) {
-      return next();
-    }
+    if (isPrivilegedSBTUser(req)) return next();
 
     const userId = req.user?.id || req.user?._id;
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId })
+    const user = await User.findById(userId)
       .select("sbtBookingType customerId")
       .lean();
 
@@ -1518,10 +1531,19 @@ router.get("/booking/pnr/:pnr", requireAuth, async (req: any, res: any) => {
 // POST /api/sbt/flights/bookings/save — persist a confirmed booking
 router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
-    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+    const rawId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    if (!rawId) return res.status(401).json({ error: "Not authenticated" });
+    const bookerId = mongoose.Types.ObjectId.isValid(rawId)
+      ? new mongoose.Types.ObjectId(String(rawId)) : rawId;
 
     const b = req.body;
+
+    // When booking on behalf of an L1 requester, use their ID as the owner
+    let bookingUserId: any = bookerId;
+    if (b.sbtRequestId) {
+      const sbtReqForUser = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceObjectId);
+      if (sbtReqForUser?.requesterId) bookingUserId = sbtReqForUser.requesterId;
+    }
 
     // Task 7: Check if webhook already created/confirmed this booking
     if (b.razorpayOrderId) {
@@ -1542,7 +1564,7 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
     }
 
     const doc = await SBTBooking.create({
-      userId,
+      userId: bookingUserId,
       customerId: (req.user as any)?.customerId ?? undefined,
       sbtRequestId: b.sbtRequestId || undefined,
       workspaceId: req.workspaceObjectId,
@@ -1620,23 +1642,43 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
           await sbtReq.save();
 
           // Send confirmation email to L1 requester
-          const requester = await User.findOne({ _id: sbtReq.requesterId, workspaceId: req.workspaceObjectId })
-            .select("name email").lean() as any;
+          const requester = await User.findById(sbtReq.requesterId)
+            .select("name email customerId").lean() as any;
+          sbtLogger.info("[SBT EMAIL] Attempting to send to:", { userId: sbtReq.requesterId, email: requester?.email, event: "booking_saved" });
+          if (!requester) {
+            sbtLogger.warn("[SBT EMAIL] User not found:", { userId: sbtReq.requesterId, event: "booking_saved" });
+          }
           if (requester?.email) {
             const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
+            const confirmedBody = `
+              ${eLabel('Booking Confirmed')}
+              ${eCard(`
+                <table cellpadding="0" cellspacing="0" width="100%">
+                  ${eRow('PNR', escapeHtml(doc.pnr || b.pnr || '—'))}
+                  ${eRow('Route', escapeHtml(`${b.origin?.city || b.searchParams?.origin || '?'} → ${b.destination?.city || b.searchParams?.destination || '?'}`))}
+                  ${eRow('Departure', escapeHtml(b.departureTime || b.searchParams?.departDate || '—'))}
+                  ${eRow('Passenger', escapeHtml(requester?.name || requester?.email || '—'))}
+                  ${eRow('Booked by', escapeHtml(req.user?.email || '—'))}
+                </table>
+              `)}
+              ${eBtn(
+                'View My Requests',
+                frontendUrl + '/sbt/my-requests',
+                '#4f46e5', '#ffffff'
+              )}
+            `;
+            const html = buildEmailShell(confirmedBody, {
+              title: 'Your Trip is Confirmed',
+              subtitle: 'Your flight has been booked successfully',
+              badgeText: 'CONFIRMED',
+              badgeColor: '#10b981',
+            });
             await sendMail({
               to: requester.email,
               subject: `Your flight has been booked — PNR ${doc.pnr}`,
               kind: "CONFIRMATIONS",
-              html: `
-                <h3>Booking Confirmed</h3>
-                <p>Your flight request has been booked successfully.</p>
-                <p><strong>PNR:</strong> ${doc.pnr}</p>
-                <p><strong>Route:</strong> ${b.origin?.city || ""} → ${b.destination?.city || ""}</p>
-                <p><strong>Departure:</strong> ${b.departureTime || ""}</p>
-                <p><a href="${frontendUrl}/sbt/my-requests">View My Requests</a></p>
-              `,
-            }).catch((e: any) => sbtLogger.warn("Failed to send SBT booked email", { error: e?.message }));
+              html,
+            }).catch((e: any) => sbtLogger.error("[SBT EMAIL FAILED]", { event: "booking_saved", recipient: requester.email, error: e?.message || e }));
           }
           sbtLogger.info("SBT request marked BOOKED via flight booking", {
             sbtRequestId: b.sbtRequestId, bookingDocId: doc._id,
@@ -1678,10 +1720,18 @@ router.get("/my-bookings", requireAuth, async (req: any, res: any) => {
 
 router.get("/bookings", requireSBT, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
-    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+    const rawId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    if (!rawId) return res.status(401).json({ error: "Not authenticated" });
+
+    const userId = mongoose.Types.ObjectId.isValid(rawId)
+      ? new mongoose.Types.ObjectId(rawId)
+      : rawId;
 
     const bookings = await SBTBooking.find({ userId }).sort({ createdAt: -1 }).lean();
+    console.log('[BOOKINGS DEBUG2]', {
+      rawId: req.user?._id ?? req.user?.id ?? req.user?.sub,
+      userId: userId.toString(),
+    });
     res.json({ ok: true, bookings });
   } catch (err: any) {
     sbtLogger.error("Bookings list failed", { userId: req.user?.id, error: err.message });
@@ -1831,7 +1881,7 @@ router.post("/bookings/refund-orphaned", requireAuth, requireAdmin, async (req: 
 // GET /api/sbt/flights/bookings/:id — single booking detail
 router.get("/bookings/:id", requireSBT, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const doc = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
     if (!doc) return res.status(404).json({ error: "Booking not found" });
     res.json({ ok: true, booking: doc });
@@ -1844,7 +1894,7 @@ router.get("/bookings/:id", requireSBT, async (req: any, res: any) => {
 // GET /api/sbt/flights/bookings/:id/cancel-preview — preview cancellation charges
 router.get("/bookings/:id/cancel-preview", requireAuth, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
     if (!booking) return res.status(404).json({ error: "Booking not found" });
     if (booking.status === "CANCELLED") return res.status(400).json({ error: "Already cancelled" });
@@ -1920,7 +1970,7 @@ router.get("/bookings/:id/cancel-preview", requireAuth, async (req: any, res: an
 // POST /api/sbt/flights/bookings/:id/cancel — cancel a booking
 router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id;
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const doc = await SBTBooking.findOne({ _id: req.params.id, userId });
     if (!doc) return res.status(404).json({ error: "Booking not found" });
     if (doc.status === "CANCELLED") return res.status(400).json({ error: "Already cancelled" });

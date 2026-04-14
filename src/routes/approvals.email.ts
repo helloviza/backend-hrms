@@ -425,7 +425,7 @@ export function buildRequesterApprovedHtml(opts: {
       </div>
       <div style="margin-top:6px;color:${slate};font-size:13px;line-height:1.55;">
         <b style="color:${ink};">Trip:</b> ${escapeHtml(seg)}<br/>
-        <b style="color:${ink};">Requested by:</b> ${requesterName} &lt;${requesterEmail}&gt;<br/>
+        <b style="color:${ink};">Requested by:</b> ${requesterName}<br/>
         ${
           approverEmail
             ? `<b style="color:${ink};">Approved by:</b> ${approverName || approverEmail} <br/>`
@@ -465,11 +465,6 @@ export function buildAdminProcessedEmailHtml(opts: {
   bookingAmount?: number;
   attachments?: Array<{ url?: string; filename?: string }>;
 }) {
-  const brand = "#00477f";
-  const accent = "#d06549";
-  const slate = "#94a3b8";
-
-  const customerName = escapeHtml(opts.customerName || "Workspace");
   const ticketId = escapeHtml(opts.ticketId || "");
   const requesterEmail = escapeHtml(opts.requesterEmail || "");
   const processedByEmail = escapeHtml(opts.processedByEmail || "");
@@ -478,7 +473,6 @@ export function buildAdminProcessedEmailHtml(opts: {
   const safeComment = escapeHtml(sanitizeAdminCommentForEmail(opts.comment || ""));
 
   const items = Array.isArray(opts.items) ? opts.items : [];
-  const { seg } = pickTripSummary(items);
 
   const totalBookingAmount =
     Number.isFinite(Number(opts.bookingAmount))
@@ -489,122 +483,82 @@ export function buildAdminProcessedEmailHtml(opts: {
   const atts = Array.isArray(opts.attachments) ? opts.attachments : [];
   const attList =
     atts.length > 0
-      ? `<ul style="margin:10px 0 0 18px;color:#e2e8f0;padding-left:18px;">
+      ? `<ul style="margin:8px 0 0 18px;padding-left:18px;">
           ${atts
             .map((a) => {
               const f = escapeHtml(a?.filename || "Attachment.pdf");
-              return `<li style="margin:8px 0;"><span style="color:#f1f5f9;font-weight:900;">${f}</span>
-                        <span style="color:#94a3b8;font-weight:700;"> • attached</span>
-                      </li>`;
+              return `<li style="margin:6px 0;color:#0f172a;font-weight:600;">${f} <span style="color:#64748b;font-weight:400;">— attached</span></li>`;
             })
             .join("")}
         </ul>`
-      : `<div style="margin-top:10px;color:#cbd5e1;">No attachments were added for this request.</div>`;
+      : `<div style="color:#64748b;">No attachments were added for this request.</div>`;
 
-  const itineraryRows = items
-    .map((it, idx) => {
-      const typeLabel = escapeHtml(serviceTypeOfItem(it).toUpperCase());
-      const title = escapeHtml(String(it?.title || it?.type || "Item").trim());
-      const desc = escapeHtml(firstLine(it?.description || "", 220));
-      const qty = it?.qty != null ? escapeHtml(String(it.qty)) : "—";
-
-      const bookingAmount = getItemBookingAmount(it);
-      const estimateAmount = getItemEstimate(it);
-      const rawPrice = Number.isFinite(Number(it?.price)) ? Number(it.price) : undefined;
-
-      const displayAmount =
-        bookingAmount != null
-          ? bookingAmount
-          : estimateAmount != null
-            ? estimateAmount
-            : rawPrice != null
-              ? rawPrice
-              : undefined;
-
-      const price =
-        displayAmount != null ? `₹${escapeHtml(moneyINR(displayAmount))}` : "—";
-
-      const meta = pickMeta(it);
-
-const itineraryText =
-  meta?.itineraryText ||
-  meta?.detailedItinerary ||
-  meta?.itinerary ||
-  meta?.routeSummary ||
-  "";
-
-const itineraryBlock = itineraryText
-  ? `
-    <div style="margin-top:10px;padding:12px 14px;border-radius:14px;background:#f8fafc;border:1px solid #e8eef6;">
-      <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#64748b;font-weight:900;">
-        Detailed Itinerary
-      </div>
-      <div style="margin-top:8px;font-size:13px;line-height:1.6;color:#0f172a;white-space:pre-line;">
-        ${escapeHtml(String(itineraryText))}
-      </div>
-    </div>
-  `
-  : "";
-
-const metaBlock =
-  meta && Object.keys(meta).length ? metaTableHtml(meta) : "";
-
-      return `
-        <div style="
-          margin-top:12px;
-          border:1px solid rgba(148,163,184,0.18);
-          border-radius:16px;
-          overflow:hidden;
-          background:rgba(2,6,23,0.55);
-        ">
-          <div style="padding:12px 14px;background:rgba(255,255,255,0.04);border-bottom:1px solid rgba(148,163,184,0.16);">
-            <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#94a3b8;font-weight:900;">
-              Item ${idx + 1} • ${typeLabel}
-            </div>
-            <div style="margin-top:8px;font-size:16px;line-height:1.25;color:#f8fafc;font-weight:950;">
-              ${title}
-            </div>
-            ${
-              desc
-                ? `<div style="margin-top:8px;font-size:13px;line-height:1.6;color:#cbd5e1;">${desc}</div>`
-                : ""
-            }
-          </div>
-
-          <div style="padding:12px 14px;">
-            <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
-              <tr>
-                <td style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#94a3b8;font-weight:900;">
-                  Qty
-                </td>
-                <td align="right" style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#94a3b8;font-weight:900;">
-                  Amount
-                </td>
-              </tr>
-              <tr>
-                <td style="padding-top:6px;font-size:14px;color:#f1f5f9;font-weight:950;">
-                  ${qty}
-                </td>
-                <td align="right" style="padding-top:6px;font-size:14px;color:#f1f5f9;font-weight:950;">
-                  ${price}
-                </td>
-              </tr>
-            </table>
-
-            ${itineraryBlock}
-${metaBlock}
-
-          </div>
-        </div>
-      `;
-    })
-    .join("");
+  const uniqueItems = items.filter((item, index, arr) =>
+    arr.findIndex(i =>
+      (i.meta?.origin || i.origin) === (item.meta?.origin || item.origin) &&
+      (i.meta?.destination || i.destination) === (item.meta?.destination || item.destination) &&
+      (i.meta?.departDate || i.departDate) === (item.meta?.departDate || item.departDate)
+    ) === index
+  );
+  const itineraryRows = uniqueItems.map((it) => buildCleanItemHtml(it)).join("");
 
   const itineraryBlock =
     itineraryRows ||
-    `<div style="margin-top:12px;padding:14px;border:1px dashed rgba(148,163,184,0.35);border-radius:16px;color:#cbd5e1;font-size:13px;">
+    `<div style="margin-top:12px;padding:14px;border:1px dashed #e2e8f0;border-radius:14px;color:#64748b;font-size:13px;">
       No itinerary items found for this request.
      </div>`;
+
+  const bodyContent = `
+    ${eCard(`
+      ${eLabel("Summary")}
+      <div style="font-size:13px;line-height:1.65;color:#334155;">
+        <b style="color:#0f172a;">Requester:</b> ${requesterEmail}<br/>
+        <b style="color:#0f172a;">Processed by:</b> ${processedByName || processedByEmail}
+        ${ticketId ? `<br/><b style="color:#0f172a;">Ticket:</b> ${ticketId}` : ""}
+        ${totalBookingAmount ? `<br/><b style="color:#0f172a;">Booking Amount:</b> &#8377;${escapeHtml(moneyINR(totalBookingAmount))}` : ""}
+      </div>
+    `)}
+
+    ${safeComment ? eCard(`
+      ${eLabel("Ops Note")}
+      <div style="font-size:13px;line-height:1.65;color:#334155;">${safeComment}</div>
+    `) : ""}
+
+    <div style="margin-top:16px;">
+      ${eLabel("Itinerary")}
+      ${itineraryBlock}
+    </div>
+
+    ${eCard(`
+      ${eLabel("Documents Attached")}
+      <div style="font-size:13px;line-height:1.6;color:#334155;">${attList}</div>
+    `)}
+
+    <div style="margin-top:16px;color:#64748b;font-size:12px;line-height:1.7;">
+      If any detail looks incorrect, connect to your Relationship Manager — our concierge team will correct it quickly.
+    </div>
+  `;
+
+  return buildEmailShell(bodyContent, {
+    title: "Booking Confirmed",
+    subtitle: "Your travel has been processed by our ops team. Attached documents (if any) are included.",
+    badgeText: "CONFIRMED",
+    badgeColor: "#10b981",
+  });
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * Shared email design system
+ * ──────────────────────────────────────────────────────────────── */
+
+export function buildEmailShell(
+  content: string,
+  opts: { title: string; subtitle?: string; badgeText?: string; badgeColor?: string },
+): string {
+  const brand = "#00477f";
+  const accent = "#d06549";
+  const badge = opts.badgeColor || "#4f46e5";
+  const badgeText = opts.badgeText || "";
 
   return `<!doctype html>
 <html>
@@ -613,128 +567,228 @@ ${metaBlock}
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="x-apple-disable-message-reformatting" />
 </head>
-<body style="margin:0;background:#0b1220;padding:24px;font-family:Arial,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#0b1220;padding:28px 12px;">
+<body style="margin:0;background:#f5f7fb;padding:24px;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" bgcolor="#f5f7fb" style="background:#f5f7fb;padding:28px 12px;">
     <tr>
       <td align="center">
-        <table width="640" cellpadding="0" cellspacing="0" role="presentation" style="width:640px;max-width:640px;">
+        <table width="620" cellpadding="0" cellspacing="0" role="presentation" style="width:620px;max-width:620px;">
           <tr>
             <td style="padding:0 6px 12px 6px;">
               <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
-                style="border-radius:22px;overflow:hidden;
-                       background: radial-gradient(900px 420px at 15% 0%, rgba(0,71,127,.55), rgba(11,18,32,0)),
-                                  radial-gradient(900px 420px at 100% 10%, rgba(208,101,73,.35), rgba(11,18,32,0)),
-                                  linear-gradient(135deg, ${brand} 0%, #052b57 55%, ${accent} 140%);">
+                bgcolor="${brand}"
+                style="border-radius:20px;overflow:hidden;
+                       background:linear-gradient(135deg,${brand} 0%,#052b57 55%,${accent} 140%);">
                 <tr>
-                  <td style="padding:18px 18px 16px 18px;">
-                    <div style="font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:rgba(255,255,255,.82);font-weight:900;">
-                      PlumTrips • Confirmation
+                  <td bgcolor="${brand}" style="background:linear-gradient(135deg,${brand} 0%,#052b57 55%,${accent} 140%);padding:20px 20px 18px 20px;">
+                    <div style="font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:rgba(255,255,255,.75);font-weight:900;">
+                      PlumTrips
                     </div>
-                    <div style="margin-top:10px;font-size:26px;line-height:1.15;color:#ffffff;font-weight:950;">
-                      Booking Processed ✅
+                    ${badgeText ? `<div style="margin-top:10px;display:inline-block;padding:5px 12px;border-radius:999px;background:${badge};color:#fff;font-size:11px;font-weight:900;letter-spacing:.08em;text-transform:uppercase;">${escapeHtml(badgeText)}</div>` : ""}
+                    <div style="margin-top:10px;font-size:24px;line-height:1.2;color:#ffffff;font-weight:900;">
+                      ${escapeHtml(opts.title)}
                     </div>
-                    <div style="margin-top:10px;font-size:13px;line-height:1.6;color:rgba(255,255,255,.9);">
-                      Your request has been processed by our travel ops team. Attached documents (if any) are included with this email.
-                    </div>
-
-                    <div style="height:12px;"></div>
-
-                    <div style="display:inline-block;padding:8px 10px;border-radius:999px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);
-                                color:#ffffff;font-size:12px;font-weight:900;">
-                      Trip: ${escapeHtml(seg)}
-                    </div>
-
-                    ${
-                      totalBookingAmount
-                        ? `<span style="display:inline-block;margin-left:8px;padding:8px 10px;border-radius:999px;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.16);
-                                color:#ffffff;font-size:12px;font-weight:900;">
-                            Booking Amount: ₹${escapeHtml(moneyINR(totalBookingAmount))}
-                          </span>`
-                        : ""
-                    }
-
-                    ${
-                      ticketId
-                        ? `<span style="display:inline-block;margin-left:8px;padding:8px 10px;border-radius:999px;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.16);
-                                color:#ffffff;font-size:12px;font-weight:900;">
-                            Ticket: ${ticketId}
-                          </span>`
-                        : ""
-                    }
+                    ${opts.subtitle ? `<div style="margin-top:8px;font-size:13px;line-height:1.55;color:rgba(255,255,255,.85);">${escapeHtml(opts.subtitle)}</div>` : ""}
                   </td>
                 </tr>
-                <tr><td style="height:4px;background:${accent};"></td></tr>
+                <tr><td bgcolor="${accent}" style="height:4px;background:${accent};"></td></tr>
               </table>
             </td>
           </tr>
-
           <tr>
             <td style="padding:0 6px;">
               <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
-                style="background:#0b1220;border:1px solid rgba(148,163,184,0.18);border-radius:22px;
-                       box-shadow:0 18px 60px rgba(0,0,0,.35);overflow:hidden;">
+                bgcolor="#ffffff"
+                style="background:#ffffff;border:1px solid #e8eef6;border-radius:20px;
+                       box-shadow:0 10px 28px rgba(15,23,42,.08);overflow:hidden;">
                 <tr>
-                  <td style="padding:18px;font-family:Arial,sans-serif;">
-
-                    <div style="padding:14px 14px;border-radius:18px;background:rgba(255,255,255,0.04);border:1px solid rgba(148,163,184,0.16);">
-                      <div style="font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#94a3b8;font-weight:900;">
-                        Summary
-                      </div>
-                      <div style="margin-top:10px;color:#e2e8f0;font-size:13px;line-height:1.65;">
-                        <b style="color:#f8fafc;">Requester:</b> ${requesterEmail}<br/>
-                        <b style="color:#f8fafc;">Processed by:</b> ${processedByName || processedByEmail}
-                      </div>
-                    </div>
-
-                    ${
-                      safeComment
-                        ? `<div style="margin-top:12px;padding:14px 14px;border-radius:18px;background:rgba(2,6,23,0.60);border:1px solid rgba(148,163,184,0.16);">
-                            <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:900;color:#94a3b8;">
-                              Ops note
-                            </div>
-                            <div style="margin-top:8px;font-size:13px;line-height:1.65;color:#e2e8f0;">
-                              ${safeComment}
-                            </div>
-                          </div>`
-                        : ""
-                    }
-
-                    <div style="margin-top:16px;">
-                      <div style="font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#94a3b8;font-weight:900;">
-                        Itinerary (Structured)
-                      </div>
-                      ${itineraryBlock}
-                    </div>
-
-                    <div style="margin-top:16px;padding:14px 14px;border-radius:18px;background:rgba(255,255,255,0.04);border:1px solid rgba(148,163,184,0.16);">
-                      <div style="font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#94a3b8;font-weight:900;">
-                        Documents Attached
-                      </div>
-                      <div style="margin-top:8px;color:#cbd5e1;font-size:13px;line-height:1.6;">
-                        ${attList}
-                      </div>
-                    </div>
-
-                    <div style="margin-top:16px;color:${slate};font-size:12px;line-height:1.7;">
-                      If any detail looks incorrect, connect to your Relationship Manager — our concierge team will correct it quickly.
-                    </div>
-
+                  <td bgcolor="#ffffff" style="background:#ffffff;padding:20px;font-family:Arial,sans-serif;">
+                    ${content}
                   </td>
                 </tr>
               </table>
-
-              <div style="padding:14px 6px 0 6px;font-family:Arial,sans-serif;font-size:12px;color:#64748b;line-height:1.6;text-align:center;">
-                © Plumtrips • Crafted for seamless journeys.
+              <div style="padding:14px 6px 0 6px;font-size:12px;color:#94a3b8;line-height:1.6;text-align:center;">
+                &copy; Plumtrips &bull; Crafted for seamless journeys.
               </div>
             </td>
           </tr>
-
         </table>
       </td>
     </tr>
   </table>
 </body>
 </html>`;
+}
+
+export function eRow(label: string, value: string): string {
+  if (!value) return "";
+  return `<tr>
+    <td style="color:#64748b;font-size:12px;width:140px;padding:4px 0;vertical-align:top;">${escapeHtml(label)}</td>
+    <td style="color:#0f172a;font-size:12px;font-weight:600;padding:4px 0;">${value}</td>
+  </tr>`;
+}
+
+export function eLabel(text: string): string {
+  return `<div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#64748b;font-weight:900;margin-bottom:8px;">${escapeHtml(text)}</div>`;
+}
+
+export function eCard(content: string): string {
+  return `<div style="margin-top:12px;padding:14px;border:1px solid #e8eef6;border-radius:14px;background:#f8fafc;">${content}</div>`;
+}
+
+export function eBtn(
+  label: string,
+  url: string,
+  bg: string,
+  color: string,
+  border?: string,
+): string {
+  const borderStyle = border ? `border:1.5px solid ${border};` : "";
+  return `<a href="${url}" style="display:inline-block;background:${bg};color:${color};text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;${borderStyle}margin-right:10px;">${escapeHtml(label)}</a>`;
+}
+
+export function eFlightCard(it: any): string {
+  return buildCleanItemHtml(it);
+}
+
+export function eHotelCard(it: any): string {
+  return buildCleanItemHtml(it);
+}
+
+export function eItemsHtml(items: any[]): string {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) {
+    return `<div style="padding:14px;border:1px dashed #e2e8f0;border-radius:14px;color:#64748b;font-size:13px;">No items found in this request.</div>`;
+  }
+  return list.map((it) => buildCleanItemHtml(it)).join("");
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * Clean item card helpers (used by buildApproverEmailHtml)
+ * ──────────────────────────────────────────────────────────────── */
+
+function approverDetailRow(label: string, value: string): string {
+  return (
+    "<tr>" +
+    '<td style="color:#9ca3af;font-size:12px;width:130px;padding:3px 0;vertical-align:top;">' + label + "</td>" +
+    '<td style="color:#374151;font-size:12px;font-weight:500;padding:3px 0;">' + value + "</td>" +
+    "</tr>"
+  );
+}
+
+function safeStr(v: any): string {
+  if (v === undefined || v === null) return "";
+  return String(v).trim();
+}
+
+function buildCleanItemHtml(it: any): string {
+  const svcType = serviceTypeOfItem(it);
+  const isHotel = svcType === "hotel";
+  // meta is the primary source; direct item fields are fallbacks
+  const m = pickMeta(it);
+
+  if (isHotel) {
+    const propertyName = safeStr(m?.hotelName || m?.propertyName || it?.hotelName || it?.propertyName || it?.title);
+    const checkIn      = safeStr(m?.checkIn || m?.checkInDate || it?.checkIn || it?.checkInDate);
+    const checkOut     = safeStr(m?.checkOut || m?.checkOutDate || it?.checkOut || it?.checkOutDate);
+    const rooms        = safeStr(m?.rooms || m?.roomCount || it?.rooms || it?.roomCount);
+    const guests       = safeStr(m?.guests || m?.guestCount || m?.adults || it?.guests || it?.adults);
+    const fareNum      = Number(m?.fare || m?.amount || it?.fare || it?.amount || it?.totalFare || it?.price);
+    const fare         = Number.isFinite(fareNum) && fareNum > 0 ? "&#8377;" + fareNum.toLocaleString("en-IN") : "";
+    const subline      = [rooms ? rooms + " Room(s)" : "", guests ? guests + " Guest(s)" : ""].filter(Boolean).join(" · ");
+
+    return `
+<table width="100%" cellpadding="0" cellspacing="0"
+  bgcolor="#f4f5f7" style="background:#f4f5f7;border-radius:10px;margin-bottom:12px;">
+  <tr>
+    <td bgcolor="#f4f5f7" style="background:#f4f5f7;padding:20px;">
+      <div style="font-size:19px;font-weight:700;color:#111827;letter-spacing:-0.3px;margin-bottom:3px;">
+        ${escapeHtml(propertyName || "Hotel")}
+      </div>
+      ${subline ? `<div style="color:#6b7280;font-size:12px;margin-bottom:14px;">${escapeHtml(subline)}</div>` : ""}
+      <table cellpadding="0" cellspacing="0">
+        ${checkIn  ? approverDetailRow("Check-In",  escapeHtml(checkIn))  : ""}
+        ${checkOut ? approverDetailRow("Check-Out", escapeHtml(checkOut)) : ""}
+        ${fare     ? approverDetailRow("Fare",      fare)                 : ""}
+      </table>
+    </td>
+    <td width="70" valign="top" align="right">
+      <span style="background:#fef3c7;color:#92400e;font-size:11px;font-weight:700;letter-spacing:1px;padding:4px 10px;border-radius:20px;text-transform:uppercase;display:inline-block;">
+        Hotel
+      </span>
+    </td>
+  </tr>
+</table>`;
+  }
+
+  // Default: Flight
+  // Read meta.* first, fall back to direct item fields
+  const origin      = safeStr(m?.origin || m?.from || m?.src || m?.fromCity || it?.origin || it?.from);
+  const destination = safeStr(m?.destination || m?.to || m?.dst || m?.toCity || it?.destination || it?.to);
+
+  // If still empty, try to extract from item.title (e.g. "DEL → MAA (One Way)")
+  const routeHeadline = (origin && destination)
+    ? `${escapeHtml(origin)} &#x2192; ${escapeHtml(destination)}`
+    : escapeHtml(safeStr(it?.title || it?.description) || "Flight");
+
+  const departDate    = safeStr(m?.departDate || m?.travelDate || m?.departureDate || it?.departDate || it?.travelDate);
+  const returnDate    = safeStr(m?.returnDate || it?.returnDate);
+
+  const tripTypeRaw   = safeStr(m?.tripType || it?.tripType || it?.TripType);
+  const tripType      = tripTypeRaw.toLowerCase() === "oneway"    ? "One Way"
+                      : tripTypeRaw.toLowerCase() === "roundtrip" ? "Return"
+                      : tripTypeRaw.toLowerCase() === "return"    ? "Return"
+                      : tripTypeRaw || "One Way";
+
+  const cabinClass    = safeStr(m?.cabinClass || m?.cabin || it?.cabinClass || it?.cabin) || "Economy";
+  const adults        = safeStr(m?.adults ?? it?.adults ?? it?.passengers?.adults) || "1";
+  const preferredTime = safeStr(m?.preferredTime || m?.preferredFlightTime || it?.preferredTime);
+  const priority      = safeStr(m?.priority || it?.priority);
+  const notes         = safeStr(m?.notes || it?.notes || it?.description);
+
+  // Travellers array: meta.travellers is primary, then item.travellers
+  const travellersArr = Array.isArray(m?.travellers) ? m.travellers
+                      : Array.isArray(it?.travellers) ? it.travellers
+                      : [];
+  const travellers = travellersArr
+    .map((t: any) => {
+      const fn = safeStr(t?.firstName || t?.first_name || t?.FirstName);
+      const ln = safeStr(t?.lastName  || t?.last_name  || t?.LastName);
+      return [fn, ln].filter(Boolean).join(" ");
+    })
+    .filter(Boolean)
+    .join(", ");
+
+  const fareNum = Number(m?.fare || m?.amount || it?.fare || it?.amount || it?.totalFare || it?.price);
+  const fare    = Number.isFinite(fareNum) && fareNum > 0 ? "&#8377;" + fareNum.toLocaleString("en-IN") : "";
+
+  const subline = [tripType, cabinClass, adults ? adults + " Adult(s)" : ""].filter(Boolean).join(" &nbsp;&middot;&nbsp; ");
+
+  return `
+<table width="100%" cellpadding="0" cellspacing="0"
+  bgcolor="#f4f5f7" style="background:#f4f5f7;border-radius:10px;margin-bottom:12px;">
+  <tr>
+    <td bgcolor="#f4f5f7" style="background:#f4f5f7;padding:20px;">
+      <div style="font-size:19px;font-weight:700;color:#111827;letter-spacing:-0.3px;margin-bottom:3px;">
+        ${routeHeadline}
+      </div>
+      ${subline ? `<div style="color:#6b7280;font-size:12px;margin-bottom:14px;">${subline}</div>` : ""}
+      <table cellpadding="0" cellspacing="0">
+        ${departDate    ? approverDetailRow("Depart Date",    escapeHtml(departDate))    : ""}
+        ${returnDate    ? approverDetailRow("Return Date",    escapeHtml(returnDate))    : ""}
+        ${preferredTime ? approverDetailRow("Preferred Time", escapeHtml(preferredTime)) : ""}
+        ${priority      ? approverDetailRow("Priority",       escapeHtml(priority))      : ""}
+        ${notes         ? approverDetailRow("Notes",          escapeHtml(notes))         : ""}
+        ${travellers    ? approverDetailRow("Travellers",     escapeHtml(travellers))    : ""}
+        ${fare          ? approverDetailRow("Fare",           fare)                      : ""}
+      </table>
+    </td>
+    <td width="70" valign="top" align="right" style="padding:20px 20px 0 0;">
+      <span style="background:#eef2ff;color:#4f46e5;font-size:11px;font-weight:700;letter-spacing:1px;padding:4px 10px;border-radius:20px;text-transform:uppercase;display:inline-block;">
+        Flight
+      </span>
+    </td>
+  </tr>
+</table>`;
 }
 
 /* ────────────────────────────────────────────────────────────────
@@ -821,90 +875,27 @@ export function buildApproverEmailHtml(opts: {
         ${escapeHtml(seg)}
       </div>
       <div style="margin-top:8px;font-size:13px;line-height:1.55;color:${slate};">
-        <b style="color:${ink};">Requested by:</b> ${requesterName} &lt;${requesterEmail}&gt;
+        <b style="color:${ink};">Requested by:</b> ${requesterName}
       </div>
     </div>
   `;
 
-  const rows = items
-    .map((it, idx) => {
-      const title = escapeHtml(String(it?.title || it?.type || "Item").trim());
-      const desc = escapeHtml(firstLine(it?.description || "", 240));
-      const qty = it?.qty != null ? escapeHtml(String(it.qty)) : "—";
-      const price = it?.price != null ? `₹${escapeHtml(moneyINR(it.price))}` : "—";
+  const uniqueItems = items.filter((item, index, arr) =>
+    arr.findIndex(i =>
+      (i.meta?.origin || i.origin) === (item.meta?.origin || item.origin) &&
+      (i.meta?.destination || i.destination) === (item.meta?.destination || item.destination) &&
+      (i.meta?.departDate || i.departDate) === (item.meta?.departDate || item.departDate)
+    ) === index
+  );
+  const itemCards = uniqueItems.map((it) => buildCleanItemHtml(it)).join("");
 
-      const meta = pickMeta(it);
-      const metaBlock = meta && Object.keys(meta).length ? metaTableHtml(meta) : "";
-
-      const typeLabel = escapeHtml(serviceTypeOfItem(it).toUpperCase());
-
-      return `
-        <tr>
-          <td style="padding:0 0 12px 0;">
-            <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
-              style="border:1px solid #e8eef6;border-radius:16px;background:#ffffff;overflow:hidden;">
-              <tr>
-                <td style="padding:14px 14px 0 14px;">
-                  <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#64748b;font-weight:900;">
-                    Item ${idx + 1} • ${typeLabel}
-                  </div>
-
-                  <div style="margin-top:8px;font-size:16px;font-weight:900;color:${ink};line-height:1.25;">
-                    ${title}
-                  </div>
-
-                  ${
-                    desc
-                      ? `<div style="margin-top:8px;font-size:13px;line-height:1.6;color:${slate};">${desc}</div>`
-                      : ""
-                  }
-
-                  <div style="height:10px;"></div>
-                  ${metaBlock}
-
-                  <div style="height:12px;"></div>
-                </td>
-              </tr>
-
-              <tr>
-                <td style="padding:12px 14px;border-top:1px solid #eef2f7;background:#fbfdff;">
-                  <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
-                    <tr>
-                      <td style="font-size:12px;color:#64748b;font-weight:900;letter-spacing:.08em;text-transform:uppercase;">
-                        Qty
-                      </td>
-                      <td align="right" style="font-size:12px;color:#64748b;font-weight:900;letter-spacing:.08em;text-transform:uppercase;">
-                        Amount
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="padding-top:6px;font-size:14px;color:${ink};font-weight:900;">
-                        ${qty}
-                      </td>
-                      <td align="right" style="padding-top:6px;font-size:14px;color:${ink};font-weight:900;">
-                        ${price}
-                      </td>
-                    </tr>
-                  </table>
-                </td>
-              </tr>
-
-            </table>
-          </td>
-        </tr>
-      `;
-    })
-    .join("");
-
-  const itemsBlock = rows
+  const itemsBlock = itemCards
     ? `
       <div style="margin-top:14px;">
         <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#64748b;font-weight:900;margin-bottom:10px;">
           Full Itinerary (All Items)
         </div>
-        <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
-          ${rows}
-        </table>
+        ${itemCards}
       </div>
     `
     : `
@@ -918,23 +909,16 @@ export function buildApproverEmailHtml(opts: {
       <tr>
         <td align="left" style="padding:0;">
           <a href="${opts.approveUrl}"
-            style="display:inline-block;text-decoration:none;background:${brand};color:#ffffff;
-                   padding:14px 18px;border-radius:14px;font-size:14px;font-weight:900;font-family:Arial,sans-serif;">
-            ✅ Approve
+            style="display:inline-block;background:#4f46e5;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;margin-right:10px;">
+            &#10003; Approve
           </a>
-
           <a href="${opts.declineUrl}"
-            style="display:inline-block;text-decoration:none;background:#ffffff;color:#b42318;
-                   padding:14px 18px;border-radius:14px;font-size:14px;font-weight:900;font-family:Arial,sans-serif;
-                   border:1px solid #f2c3be;margin-left:10px;">
-            ⛔ Reject
+            style="display:inline-block;background:#ffffff;color:#dc2626;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;border:1.5px solid #fca5a5;margin-right:10px;">
+            &#10005; Reject
           </a>
-
           <a href="${opts.holdUrl}"
-            style="display:inline-block;text-decoration:none;background:#ffffff;color:#334155;
-                   padding:14px 18px;border-radius:14px;font-size:14px;font-weight:900;font-family:Arial,sans-serif;
-                   border:1px solid #e2e8f0;margin-left:10px;">
-            ⏳ On Hold
+            style="display:inline-block;background:#ffffff;color:#92400e;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;border:1.5px solid #fcd34d;">
+            &#9646; On Hold
           </a>
         </td>
       </tr>
@@ -1147,7 +1131,7 @@ export function buildLeaderFyiHtml(opts: {
                         ${escapeHtml(seg)}
                       </div>
                       <div style="margin-top:8px;font-size:13px;color:${slate};line-height:1.55;">
-                        <b style="color:${ink};">Requested by:</b> ${requesterName} &lt;${requesterEmail}&gt;
+                        <b style="color:${ink};">Requested by:</b> ${requesterName}
                       </div>
                     </div>
 
