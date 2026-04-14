@@ -2301,14 +2301,15 @@ router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => 
       .select("name email roles role status sbtEnabled sbtRole sbtAssignedBookerId canRaiseRequest canViewBilling canManageUsers")
       .lean();
 
+    const memberRoles = await CustomerMember.find({ customerId }).select("email role").lean();
+    const memberRoleMap = new Map(memberRoles.map((m: any) => [m.email, m.role]));
+
     const rows = users.map((u: any) => {
-      const allRoles = (Array.isArray(u.roles) ? u.roles : [u.role]).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
-      const isWL = allRoles.includes("WORKSPACELEADER");
       return {
         _id: u._id,
         name: u.name || "",
         email: u.email || "",
-        role: (Array.isArray(u.roles) && u.roles[0]) || u.role || "EMPLOYEE",
+        role: memberRoleMap.get(u.email) || (Array.isArray(u.roles) && u.roles[0]) || u.role || "CUSTOMER",
         isActive: (u.status || "ACTIVE").toUpperCase() === "ACTIVE",
         sbtEnabled: u.sbtEnabled ?? false,
         sbtRole: u.sbtRole || null,
@@ -2316,7 +2317,10 @@ router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => 
         canRaiseRequest: u.canRaiseRequest ?? true,
         canViewBilling: u.canViewBilling ?? false,
         canManageUsers: u.canManageUsers ?? false,
-        isWorkspaceLeader: isWL,
+        isWorkspaceLeader:
+          memberRoleMap.get(u.email) === "WORKSPACE_LEADER" ||
+          u.roles?.includes("WORKSPACE_LEADER") ||
+          u.role === "WORKSPACE_LEADER",
       };
     });
 
@@ -2379,7 +2383,7 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
       }
     }
 
-    const targetUser: any = await User.findOne({ _id: req.params.userId, workspaceId: req.workspaceObjectId })
+    const targetUser: any = await User.findOne({ _id: req.params.userId })
       .select("customerId email roles")
       .lean();
     if (!targetUser) return res.status(404).json({ error: "User not found" });
@@ -2429,7 +2433,7 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
     if (permission === "sbtAssignedBookerId") {
       if (value) {
         // Validate: target booker must have sbtRole L2/BOTH or be WORKSPACE_LEADER, same customerId, not self
-        const booker: any = await User.findOne({ _id: value, workspaceId: req.workspaceObjectId }).select("sbtRole customerId roles").lean();
+        const booker: any = await User.findOne({ _id: value }).select("sbtRole customerId roles").lean();
         if (!booker) return res.status(400).json({ error: "Assigned booker user not found" });
         const bookerRoles = (Array.isArray(booker.roles) ? booker.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
         const bookerIsWL = bookerRoles.includes("WORKSPACELEADER");
@@ -2485,6 +2489,66 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
   } catch (err: any) {
     console.error("[customerUsers:workspace/permissions PATCH] error", err);
     res.status(500).json({ error: "Failed to update permission", detail: err?.message });
+  }
+});
+
+/* =========================================================
+ * POST /workspace/invite — add/invite a user to a workspace
+ * Allowed: ADMIN / SUPERADMIN / HR  OR  WORKSPACE_LEADER for their own workspace
+ * ======================================================= */
+router.post("/workspace/invite", requireAuth, async (req: any, res: any) => {
+  try {
+    const { email, role, customerId } = req.body;
+
+    if (!email || !customerId) {
+      return res.status(400).json({ error: "Email and customerId are required" });
+    }
+
+    const callerRoles: string[] = (Array.isArray(req.user?.roles) ? req.user.roles : [req.user?.role])
+      .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
+
+    const isAdmin = callerRoles.some((r) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    const isLeader = callerRoles.some((r) => r === "WORKSPACELEADER");
+
+    if (!isAdmin && !isLeader) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+
+    // WORKSPACE_LEADER may only invite into their own workspace
+    if (isLeader && !isAdmin) {
+      const callerDoc: any = await User.findById(req.user._id || req.user.id, "customerId").lean();
+      if (String(callerDoc?.customerId) !== String(customerId)) {
+        return res.status(403).json({ error: "Cannot manage other workspaces" });
+      }
+    }
+
+    const memberRole: MemberRole = (String(role || "REQUESTER").toUpperCase() as MemberRole) === "APPROVER"
+      ? "APPROVER"
+      : "REQUESTER";
+
+    const { user: targetUser } = await ensureAuthUserForCustomer({
+      email,
+      customerId,
+      memberRole,
+    });
+
+    await CustomerMember.findOneAndUpdate(
+      { email: normEmail(email), customerId },
+      { $set: { role: memberRole, customerId, email: normEmail(email), userId: String(targetUser._id), isActive: true } },
+      { upsert: true, new: true },
+    );
+
+    const emailResult = await trySendInviteEmailSafe({
+      to: normEmail(email),
+      customerId,
+      inviterEmail: normEmail(req.user?.email || ""),
+      inviteeName: targetUser?.name || targetUser?.firstName || undefined,
+    });
+
+    return res.json({ ok: true, ...emailResult });
+  } catch (err: any) {
+    console.error("[customerUsers:workspace/invite POST] error", err);
+    res.status(500).json({ error: "Failed to invite user", detail: err?.message });
   }
 });
 

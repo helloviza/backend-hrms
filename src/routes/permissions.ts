@@ -79,11 +79,16 @@ router.get('/my-access', requireAuth, async (req: any, res: any) => {
         userDoc?.roles?.includes('CLIENT')
 
       if (isExternal) {
+        const isWL = userDoc?.roles?.some(
+          (r: string) => r.toUpperCase().replace(/[\s\-_]/g, '') === 'WORKSPACELEADER'
+        )
         return res.json({
-          tier: 1,
+          tier: isWL ? 2 : 1,
           roleType: 'CLIENT',
           status: 'active',
-          grantedModules: ['bookings', 'billing', 'profile'],
+          grantedModules: isWL
+            ? ['bookings', 'billing', 'profile', 'access']
+            : ['bookings', 'billing', 'profile'],
           source: 'auto',
         })
       }

@@ -91,7 +91,9 @@ router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
     const designation = String(req.query.designation || "").trim();
     const statusParam = String(req.query.status || "active").toLowerCase();
     const page = Math.max(1, parseInt(String(req.query.page || "1"), 10));
-    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || "50"), 10)));
+    const limit = req.query.rmEligible === "true"
+      ? 200
+      : Math.min(100, Math.max(1, parseInt(String(req.query.limit || "50"), 10)));
 
     const filter: any = {};
     // SUPERADMIN sees all employees across workspaces
@@ -104,6 +106,7 @@ router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
     }
     if (department) filter.department = department;
     if (designation) filter.designation = designation;
+    if (req.query.rmEligible === "true") filter["relationshipManager.isEligible"] = true;
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: "i" } },
@@ -635,6 +638,21 @@ router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async 
     }
 
     const saved = await existing.save();
+
+    // Update Employee doc for fields that live on Employee schema
+    const employeeFields: any = {};
+
+    if (safeBody.relationshipManager !== undefined) {
+      employeeFields.relationshipManager = safeBody.relationshipManager;
+    }
+
+    if (employeeDoc && Object.keys(employeeFields).length > 0) {
+      await Employee.findByIdAndUpdate(
+        employeeDoc._id,
+        { $set: employeeFields },
+        { new: true }
+      );
+    }
 
     res.json(sanitise(saved));
   } catch (err) {

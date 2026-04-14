@@ -29,6 +29,12 @@ export interface EmployeeDoc extends Document {
 
   // ownership
   ownerId?: Schema.Types.ObjectId;
+
+  // relationship manager eligibility
+  relationshipManager?: {
+    isEligible: boolean;
+    eligibleRoles: string[];
+  };
 }
 
 const EmployeeSchema = new Schema<EmployeeDoc>(
@@ -86,6 +92,18 @@ const EmployeeSchema = new Schema<EmployeeDoc>(
        OWNERSHIP
        ============================================================ */
     ownerId: { type: Schema.Types.ObjectId, ref: "User" },
+
+    /* ============================================================
+       RELATIONSHIP MANAGER ELIGIBILITY
+       ============================================================ */
+    relationshipManager: {
+      isEligible: { type: Boolean, default: false },
+      eligibleRoles: {
+        type: [String],
+        enum: ["accountManager", "escalationManager", "supportContact"],
+        default: [],
+      },
+    },
   },
   { timestamps: true },
 );
