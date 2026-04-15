@@ -699,7 +699,7 @@ async function sendInviteEmail(params: { to: string; customerId: string; inviter
     </div>
   `;
 
-  await sendMail({ to: params.to, subject, html: body });
+  await sendMail({ kind: "ONBOARDING", to: params.to, subject, html: body });
 }
 
 type MemberRole = "WORKSPACE_LEADER" | "APPROVER" | "REQUESTER";

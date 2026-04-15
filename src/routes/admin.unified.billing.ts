@@ -76,6 +76,14 @@ function resolveAccessScope(user: any): AccessScope {
     }
   }
 
+  // WORKSPACE_LEADER → ORG (full workspace scope, same as CUSTOMERAPPROVER)
+  const isWL =
+    normRoles.includes("WORKSPACELEADER") ||
+    String(user?.customerMemberRole || "").toUpperCase().replace(/[\s_-]+/g, "") === "WORKSPACELEADER";
+  if (isWL && tenantId) {
+    return { matchFilter: { tenantId }, accessLevel: "ORG" };
+  }
+
   // L1 / all other users → OWN (only their own bookings)
   // user._id from JWT is a string; TravelBooking.userId is ObjectId — must cast
   const uid = user?._id || user?.sub;
