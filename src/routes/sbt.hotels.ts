@@ -76,22 +76,31 @@ router.use(requireAuth);
 router.use(requireWorkspace);
 router.use(requireFeature("hotelBookingEnabled"));
 
+// ─── Privileged SBT user check ───────────────────────────────────────────────
+// ADMIN / SUPERADMIN / HR / WORKSPACE_LEADER are never blocked by SBT guards.
+function isPrivilegedSBTUser(req: any): boolean {
+  const roles = (req.user?.roles || [])
+    .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""));
+  return (
+    roles.includes("SUPERADMIN") ||
+    roles.includes("ADMIN") ||
+    roles.includes("HR") ||
+    roles.includes("WORKSPACELEADER") ||
+    req.user?.customerMemberRole === "WORKSPACE_LEADER"
+  );
+}
+
 // ─── SBT access guard ────────────────────────────────────────────────────────
 // Verifies the user has sbtEnabled=true in the DB.
-// Admin/SuperAdmin users bypass this check so they can always inspect SBT data.
+// Privileged users (ADMIN/SUPERADMIN/HR/WORKSPACE_LEADER) always bypass.
 async function requireSBT(req: any, res: any, next: any) {
   try {
-    const roles: string[] = (req.user?.roles || []).map((r: string) =>
-      String(r).toUpperCase()
-    );
-    if (roles.includes("ADMIN") || roles.includes("SUPERADMIN") || roles.includes("HR")) {
-      return next();
-    }
+    if (isPrivilegedSBTUser(req)) return next();
 
     const userId = req.user?.id || req.user?._id;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId }).select("sbtEnabled").lean();
+    const user = await User.findById(userId).select("sbtEnabled customerId").lean();
     if (!user || !(user as any).sbtEnabled) {
       return res.status(403).json({ error: "SBT access not enabled for this account" });
     }
@@ -104,15 +113,10 @@ async function requireSBT(req: any, res: any, next: any) {
 // ─── Travel-mode / booking-type guard for hotels ─────────────────────────────
 async function requireHotelAccess(req: any, res: any, next: any) {
   try {
-    const roles: string[] = (req.user?.roles || []).map((r: string) =>
-      String(r).toUpperCase()
-    );
-    if (roles.includes("ADMIN") || roles.includes("SUPERADMIN") || roles.includes("HR")) {
-      return next();
-    }
+    if (isPrivilegedSBTUser(req)) return next();
 
     const userId = req.user?.id || req.user?._id;
-    const user = await User.findOne({ _id: userId, workspaceId: req.workspaceObjectId })
+    const user = await User.findById(userId)
       .select("sbtBookingType customerId")
       .lean();
 
@@ -1286,7 +1290,7 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
           sbtReq.actedAt = new Date();
           await sbtReq.save();
 
-          const requester = await User.findOne({ _id: sbtReq.requesterId, workspaceId: req.workspaceObjectId })
+          const requester = await User.findById(sbtReq.requesterId)
             .select("name email").lean() as any;
           if (requester?.email) {
             const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
