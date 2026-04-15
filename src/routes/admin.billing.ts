@@ -36,6 +36,15 @@ async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction
 
   const dbUser: any = await User.findOne({ _id: sub, workspaceId: (req as any).workspaceObjectId }).select("sbtEnabled customerId canViewBilling").lean();
 
+  console.log('[BILLING AUTH]', {
+    roles: (req as any).user?.roles,
+    customerMemberRole: (req as any).user?.customerMemberRole,
+    isWL,
+    customerId: dbUser?.customerId,
+    sbtEnabled: dbUser?.sbtEnabled,
+    canViewBilling: dbUser?.canViewBilling,
+  });
+
   if (dbUser?.customerId && (dbUser?.sbtEnabled === true || isWL)) {
     // WL bypasses canViewBilling; regular SBT users still need the flag
     if (!isWL && dbUser?.canViewBilling !== true) {
