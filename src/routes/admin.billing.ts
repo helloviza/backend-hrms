@@ -12,7 +12,9 @@ const router = express.Router();
 router.use(requireAuth);
 router.use(requireWorkspace);
 
-/* Allow admin (full access) OR sbtEnabled user (scoped to their customerId) */
+/* Allow admin (full access) OR sbtEnabled user (scoped to their customerId).
+ * WORKSPACE_LEADER users bypass the canViewBilling flag — they always get
+ * workspace-scoped billing access. */
 async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction) {
   const user: any = (req as any).user;
   const roles: string[] = [
@@ -23,13 +25,20 @@ async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction
   const adminRoles = ["ADMIN", "SUPERADMIN", "HR", "HRADMIN", "OPS"];
   if (roles.some((r) => adminRoles.includes(r))) return next(); // admin — full access
 
-  // Check sbtEnabled for non-admin users
+  // Detect WORKSPACE_LEADER via roles array or JWT customerMemberRole claim
+  const isWL =
+    roles.includes("WORKSPACELEADER") ||
+    String(user?.customerMemberRole || "").toUpperCase().replace(/[\s_-]/g, "") === "WORKSPACELEADER";
+
+  // Check sbtEnabled / WL for non-admin users
   const sub = String(user?.sub || user?._id || user?.id || "");
   if (!sub) return res.status(403).json({ error: "Access denied" });
 
   const dbUser: any = await User.findOne({ _id: sub, workspaceId: (req as any).workspaceObjectId }).select("sbtEnabled customerId canViewBilling").lean();
-  if (dbUser?.sbtEnabled === true && dbUser?.customerId) {
-    if (dbUser?.canViewBilling !== true) {
+
+  if (dbUser?.customerId && (dbUser?.sbtEnabled === true || isWL)) {
+    // WL bypasses canViewBilling; regular SBT users still need the flag
+    if (!isWL && dbUser?.canViewBilling !== true) {
       return res.status(403).json({
         error: "Billing access not enabled for your account.",
         code: "BILLING_ACCESS_DENIED",
