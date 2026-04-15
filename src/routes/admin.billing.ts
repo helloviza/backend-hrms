@@ -34,7 +34,9 @@ async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction
   const sub = String(user?.sub || user?._id || user?.id || "");
   if (!sub) return res.status(403).json({ error: "Access denied" });
 
-  const dbUser: any = await User.findOne({ _id: sub, workspaceId: (req as any).workspaceObjectId }).select("sbtEnabled customerId canViewBilling").lean();
+  const dbUser: any = await User.findById(sub)
+    .select("customerId sbtEnabled canViewBilling roles")
+    .lean();
 
   console.log('[BILLING AUTH]', {
     roles: (req as any).user?.roles,
@@ -44,6 +46,14 @@ async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction
     sbtEnabled: dbUser?.sbtEnabled,
     canViewBilling: dbUser?.canViewBilling,
   });
+
+  // Verify this user belongs to the current workspace
+  if (dbUser?.customerId) {
+    const wsCustomerId = (req as any).workspace?.customerId;
+    if (wsCustomerId && String(dbUser.customerId) !== String(wsCustomerId) && !isWL) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+  }
 
   if (dbUser?.customerId && (dbUser?.sbtEnabled === true || isWL)) {
     // WL bypasses canViewBilling; regular SBT users still need the flag
