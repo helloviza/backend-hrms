@@ -625,20 +625,24 @@ router.patch("/config/travel-flow", async (req: AnyObj, res) => {
 
     // Update config.travelFlow and config.features
     const featureUpdate = FLOW_TO_FEATURES[travelFlow];
-    if (!ws.config) {
-      ws.config = deriveConfigFromLegacy(ws.travelMode);
-    }
-    ws.config.travelFlow = travelFlow;
-    if (!ws.config.features) ws.config.features = {};
-    ws.config.features.sbtEnabled = featureUpdate.sbtEnabled;
-    ws.config.features.approvalFlowEnabled = featureUpdate.approvalFlowEnabled;
-    ws.config.features.approvalDirectEnabled = featureUpdate.approvalDirectEnabled;
+    const legacyMode = FLOW_TO_LEGACY[travelFlow] || "APPROVAL_FLOW";
 
-    // Keep legacy travelMode in sync
-    ws.travelMode = FLOW_TO_LEGACY[travelFlow] || "APPROVAL_FLOW";
-
-    ws.markModified("config");
-    await ws.save();
+    // Use updateOne with $set to avoid Mongoose full-document validation
+    // (other fields like `industry` may hold values outside their enum if set
+    // via older code paths — a full ws.save() would throw ValidationError for
+    // those unrelated fields and block this config update)
+    await CustomerWorkspace.updateOne(
+      { customerId },
+      {
+        $set: {
+          travelMode: legacyMode,
+          "config.travelFlow": travelFlow,
+          "config.features.sbtEnabled": featureUpdate.sbtEnabled,
+          "config.features.approvalFlowEnabled": featureUpdate.approvalFlowEnabled,
+          "config.features.approvalDirectEnabled": featureUpdate.approvalDirectEnabled,
+        },
+      },
+    );
 
     // Bulk-update all workspace users
     const members = await CustomerMember.find({ customerId }).lean().exec();
@@ -664,7 +668,7 @@ router.patch("/config/travel-flow", async (req: AnyObj, res) => {
       }
     }
 
-    res.json({ ok: true, config: ws.config, travelFlow, updatedCount });
+    res.json({ ok: true, travelFlow, updatedCount });
   } catch (err: any) {
     res.status(500).json({ error: "Failed to update travel flow", detail: err?.message });
   }

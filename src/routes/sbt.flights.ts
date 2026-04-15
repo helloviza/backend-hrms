@@ -1723,15 +1723,22 @@ router.get("/bookings", requireSBT, async (req: any, res: any) => {
     const rawId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!rawId) return res.status(401).json({ error: "Not authenticated" });
 
-    const userId = mongoose.Types.ObjectId.isValid(rawId)
-      ? new mongoose.Types.ObjectId(rawId)
-      : rawId;
+    const isWL = (req.user?.roles || [])
+      .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ''))
+      .includes('WORKSPACELEADER') ||
+      req.user?.customerMemberRole === 'WORKSPACE_LEADER';
 
-    const bookings = await SBTBooking.find({ userId }).sort({ createdAt: -1 }).lean();
-    console.log('[BOOKINGS DEBUG2]', {
-      rawId: req.user?._id ?? req.user?.id ?? req.user?.sub,
-      userId: userId.toString(),
-    });
+    let bookings;
+    if (isWL) {
+      const customerId = (req as any).workspace?.customerId || req.user?.customerId;
+      bookings = await SBTBooking.find({ customerId }).sort({ createdAt: -1 }).lean();
+    } else {
+      const userId = mongoose.Types.ObjectId.isValid(rawId)
+        ? new mongoose.Types.ObjectId(rawId)
+        : rawId;
+      bookings = await SBTBooking.find({ userId }).sort({ createdAt: -1 }).lean();
+    }
+
     res.json({ ok: true, bookings });
   } catch (err: any) {
     sbtLogger.error("Bookings list failed", { userId: req.user?.id, error: err.message });

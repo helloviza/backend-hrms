@@ -649,7 +649,7 @@ router.post("/:id/book", async (req: any, res: any) => {
           </table>
         `)}
         <div style="margin-top:16px;">
-          ${eBtn("Download Ticket", `${frontendUrl}/sbt/my-bookings`, "#10b981", "#ffffff")}
+          ${eBtn("View My Requests & Tickets", `${frontendUrl}/sbt/my-requests`, "#10b981", "#ffffff")}
         </div>
       `;
 

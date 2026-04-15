@@ -21,7 +21,16 @@ import {
   signEmailActionToken as signEmailActionTokenAny,
   verifyEmailActionToken as verifyEmailActionTokenAny,
 } from "../utils/emailActionToken.js";
-import { buildEmailShell, eBtn, escapeHtml as escHtml, eLabel, eCard, eRow } from "./approvals.email.js";
+import {
+  buildEmailShell,
+  eBtn,
+  escapeHtml as escHtml,
+  eLabel,
+  eCard,
+  eRow,
+  buildAdminProcessedEmailHtml,
+  sanitizeAdminCommentForEmail,
+} from "./approvals.email.js";
 
 type AnyObj = Record<string, any>;
 type ProposalStatus = "DRAFT" | "SUBMITTED" | "APPROVED" | "DECLINED" | "EXPIRED";
@@ -1517,6 +1526,7 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
 
       // Send L2 email with L2 tokens
       await sendMail({
+        kind: "REQUESTS",
         to: l2Email,
         subject: `Proposal Approval Needed — ${reqCode || "Request"}`,
         html,
@@ -1578,6 +1588,7 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
         });
 
         await sendMail({
+          kind: "REQUESTS",
           to: l0Addr,
           subject: `Proposal Approval Needed — ${reqCode || "Request"}`,
           html: l0Html,
@@ -1813,6 +1824,228 @@ router.post(
 );
 
 /**
+ * POST /:id/booking/start — staff marks proposal booking as IN_PROGRESS
+ */
+router.post(
+  "/:id/booking/start",
+  requireAnyAuth,
+  requireWorkspace,
+  requireStaff,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      setNoStore(res);
+
+      const id = String(req.params.id || "");
+      if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
+
+      const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+      if (!doc) return res.status(404).json({ error: "Proposal not found" });
+
+      if (String(doc.status || "") !== "APPROVED") {
+        return res.status(400).json({ error: "Booking actions allowed only when proposal is APPROVED" });
+      }
+
+      let ar: any = null;
+      if (doc.requestId) ar = await ApprovalRequest.findById(doc.requestId);
+      if (!ar) return res.status(404).json({ error: "Linked approval request not found" });
+
+      ar.adminState = "in_progress";
+      ar.stage = "BOOKING_IN_PROGRESS";
+      ar.history = Array.isArray(ar.history) ? ar.history : [];
+      ar.history.push({
+        action: "booking_started",
+        by: (req as AuthedReq).user?.email || "admin",
+        at: new Date(),
+        note: "Booking started via proposal",
+      });
+      await ar.save();
+
+      doc.booking = doc.booking || {};
+      doc.booking.status = "IN_PROGRESS";
+      doc.history = ensureArray(doc.history);
+      doc.history.push(pushHistory((req as AuthedReq).user || {}, "BOOKING_STARTED", ""));
+      doc.markModified("booking");
+      await doc.save();
+
+      return res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /:id/booking/done — staff marks proposal booking as DONE and notifies L1
+ */
+router.post(
+  "/:id/booking/done",
+  requireAnyAuth,
+  requireWorkspace,
+  requireStaff,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      setNoStore(res);
+
+      const id = String(req.params.id || "");
+      if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
+
+      const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+      if (!doc) return res.status(404).json({ error: "Proposal not found" });
+
+      if (String(doc.status || "") !== "APPROVED") {
+        return res.status(400).json({ error: "Booking actions allowed only when proposal is APPROVED" });
+      }
+
+      let ar: any = null;
+      if (doc.requestId) ar = await ApprovalRequest.findById(doc.requestId);
+      if (!ar) return res.status(404).json({ error: "Linked approval request not found" });
+
+      const adminUser: AnyObj = (req as AuthedReq).user || {};
+      const adminEmail = normEmail(adminUser.email || "");
+      const adminName = normStr(adminUser.name || adminUser.firstName || "");
+
+      ar.adminState = "done";
+      ar.stage = "COMPLETED";
+      ar.history = Array.isArray(ar.history) ? ar.history : [];
+      ar.history.push({
+        action: "admin_done",
+        by: String(adminUser.sub || adminUser._id || ""),
+        at: new Date(),
+        userEmail: adminEmail,
+        userName: adminName,
+      });
+      await ar.save();
+
+      doc.booking = doc.booking || {};
+      doc.booking.status = "DONE";
+      doc.history = ensureArray(doc.history);
+      doc.history.push(pushHistory(adminUser, "BOOKING_DONE", ""));
+      doc.markModified("booking");
+      await doc.save();
+
+      // Notify L1 (frontliner)
+      const to = normEmail(ar.frontlinerEmail || "");
+      if (to) {
+        try {
+          const sendMail = sendMailAny as any;
+          const subject = `Your Booking has been Processed — ${ar.customerName || "Workspace"}${ar.ticketId ? ` (${ar.ticketId})` : ""}`;
+          await sendMail({
+            kind: "CONFIRMATIONS",
+            to,
+            subject,
+            replyTo: adminEmail || undefined,
+            html: buildAdminProcessedEmailHtml({
+              customerName: ar.customerName || "Workspace",
+              ticketId: ar.ticketId,
+              requesterEmail: to,
+              processedByEmail: adminEmail,
+              processedByName: adminName,
+              comment: sanitizeAdminCommentForEmail(""),
+              items: Array.isArray(ar.cartItems) ? ar.cartItems : [],
+              bookingAmount: ar.bookingAmount,
+            }),
+          });
+        } catch {
+          // non-blocking
+        }
+      }
+
+      return res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /:id/booking/cancel — staff cancels proposal booking and notifies L1
+ */
+router.post(
+  "/:id/booking/cancel",
+  requireAnyAuth,
+  requireWorkspace,
+  requireStaff,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      setNoStore(res);
+
+      const id = String(req.params.id || "");
+      if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
+
+      const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+      if (!doc) return res.status(404).json({ error: "Proposal not found" });
+
+      let ar: any = null;
+      if (doc.requestId) ar = await ApprovalRequest.findById(doc.requestId);
+      if (!ar) return res.status(404).json({ error: "Linked approval request not found" });
+
+      const adminUser: AnyObj = (req as AuthedReq).user || {};
+      const adminEmail = normEmail(adminUser.email || "");
+      const adminName = normStr(adminUser.name || adminUser.firstName || "");
+      const body = (req as any).body || {};
+      const reason = normStr(body?.reason || body?.comment || "");
+
+      ar.adminState = "cancelled";
+      ar.stage = "REQUEST_DECLINED";
+      ar.history = Array.isArray(ar.history) ? ar.history : [];
+      ar.history.push({
+        action: "booking_cancelled",
+        by: String(adminUser.sub || adminUser._id || ""),
+        at: new Date(),
+        userEmail: adminEmail,
+        userName: adminName,
+        comment: reason || undefined,
+      });
+      await ar.save();
+
+      doc.booking = doc.booking || {};
+      doc.booking.status = "CANCELLED";
+      doc.history = ensureArray(doc.history);
+      doc.history.push(pushHistory(adminUser, "BOOKING_CANCELLED", reason));
+      doc.markModified("booking");
+      await doc.save();
+
+      // Notify L1 (frontliner)
+      const to = normEmail(ar.frontlinerEmail || "");
+      if (to) {
+        try {
+          const sendMail = sendMailAny as any;
+          const routeLabel = String(doc.options?.[0]?.title || ar.cartItems?.[0]?.title || ar.cartItems?.[0]?.meta?.origin && ar.cartItems?.[0]?.meta?.destination ? `${ar.cartItems[0].meta.origin} → ${ar.cartItems[0].meta.destination}` : "");
+          const cancelBody = buildEmailShell(
+            `<div style="font-size:14px;color:#334155;line-height:1.65;">
+              <p>Hi,</p>
+              <p>We wanted to let you know that your booking request has been cancelled${routeLabel ? ` for <b>${escHtml(routeLabel)}</b>` : ""}.</p>
+              ${reason ? `<p><b>Reason:</b> ${escHtml(reason)}</p>` : ""}
+              <p>If you'd like to raise a new request, please click below.</p>
+              <div style="margin-top:20px;">
+                ${eBtn("Raise a New Request", `${process.env.FRONTEND_ORIGIN || "https://hrms.plumtrips.com"}/sbt/my-requests`, "#4f46e5", "#ffffff")}
+              </div>
+            </div>`,
+            {
+              title: "Booking Update — Request Cancelled",
+              badgeText: "CANCELLED",
+              badgeColor: "#dc2626",
+            }
+          );
+          await sendMail({
+            kind: "REQUESTS",
+            to,
+            subject: `Booking Update — Request Cancelled${ar.ticketId ? ` (${ar.ticketId})` : ""}`,
+            html: cancelBody,
+          });
+        } catch {
+          // non-blocking
+        }
+      }
+
+      return res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
  * POST /api/proposals/:id/decide (existing UI decisions)
  */
 router.post("/:id/decide", requireAnyAuth, requireWorkspace, requireProposalViewer, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
@@ -1971,6 +2204,40 @@ router.get("/:id", requireAnyAuth, requireWorkspace, requireProposalViewer, asyn
 
     const enrichedList = await enrichProposalsWithRequestData([{ ...(p as any) }]);
     const enriched = enrichedList[0] || (p as any);
+
+    // L1 owner (request submitter, not an approver): strip internal cost/margin fields
+    if (isOwner && !myRoles.length) {
+      const sanitized: any = { ...(enriched as any) };
+
+      if (Array.isArray(sanitized.options)) {
+        sanitized.options = sanitized.options.map((opt: any) => {
+          const clean = { ...opt };
+          delete clean.netAmount;
+          delete clean.margin;
+          delete clean.supplierCost;
+          delete clean.costBreakdown;
+          delete clean.internalNotes;
+          return clean;
+        });
+      }
+
+      delete sanitized.margins;
+      delete sanitized.supplierNotes;
+      delete sanitized.history;
+      delete sanitized.internalComments;
+      delete sanitized.bookingActualPrice;
+      delete sanitized.bookingAmount;
+
+      return res.json({
+        ok: true,
+        proposal: {
+          ...sanitized,
+          _myRoles: myRoles,
+          _isOwner: true,
+          _sanitized: true,
+        },
+      });
+    }
 
     return res.json({
       ok: true,

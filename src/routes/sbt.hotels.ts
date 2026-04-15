@@ -428,6 +428,13 @@ router.get("/cities", async (req: any, res: any) => {
 
 router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any) => {
   try {
+    console.log('[HOTEL SEARCH DEBUG]', {
+      sub: req.user?.sub,
+      workspaceId: (req as any).workspaceId,
+      workspaceObjectId: (req as any).workspaceObjectId,
+      customerId: (req as any).workspace?.customerId,
+      body: req.body
+    });
     if (process.env.TBO_ENV === "mock") {
       const searchId = Math.random().toString(36).slice(2, 10);
       return res.json({
@@ -471,6 +478,11 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
     } else {
       // City search: fetch all hotels in the city
       const hotelList = await fetchHotelCodeList(CityCode, CountryCode);
+      console.log('[HOTEL CODELIST]', {
+        cityCode: CityCode,
+        countryCode: CountryCode,
+        hotelCount: hotelList.length
+      });
       if (!hotelList.length) {
         return res.json({ Hotels: [], SearchId: randomUUID(), CityName });
       }
@@ -1329,12 +1341,22 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
 
 const getHotelBookingsHandler = async (req: any, res: any) => {
   try {
-    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
-    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+    const rawId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    if (!rawId) return res.status(401).json({ error: "Not authenticated" });
 
-    const bookings = await SBTHotelBooking.find({ userId })
-      .sort({ createdAt: -1 })
-      .lean();
+    const isWL = (req.user?.roles || [])
+      .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ''))
+      .includes('WORKSPACELEADER') ||
+      req.user?.customerMemberRole === 'WORKSPACE_LEADER';
+
+    let bookings;
+    if (isWL) {
+      const customerId = (req as any).workspace?.customerId || req.user?.customerId;
+      bookings = await SBTHotelBooking.find({ customerId }).sort({ createdAt: -1 }).lean();
+    } else {
+      bookings = await SBTHotelBooking.find({ userId: rawId }).sort({ createdAt: -1 }).lean();
+    }
+
     res.json({ ok: true, bookings });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Failed to list hotel bookings";
