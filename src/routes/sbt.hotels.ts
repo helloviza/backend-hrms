@@ -9,6 +9,7 @@ import SBTRequest from "../models/SBTRequest.js";
 import { generateHotelVoucher } from "../services/tbo.hotel.service.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import Customer from "../models/Customer.js";
 import { sendMail } from "../utils/mailer.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
@@ -428,13 +429,6 @@ router.get("/cities", async (req: any, res: any) => {
 
 router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any) => {
   try {
-    console.log('[HOTEL SEARCH DEBUG]', {
-      sub: req.user?.sub,
-      workspaceId: (req as any).workspaceId,
-      workspaceObjectId: (req as any).workspaceObjectId,
-      customerId: (req as any).workspace?.customerId,
-      body: req.body
-    });
     if (process.env.TBO_ENV === "mock") {
       const searchId = Math.random().toString(36).slice(2, 10);
       return res.json({
@@ -478,11 +472,6 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
     } else {
       // City search: fetch all hotels in the city
       const hotelList = await fetchHotelCodeList(CityCode, CountryCode);
-      console.log('[HOTEL CODELIST]', {
-        cityCode: CityCode,
-        countryCode: CountryCode,
-        hotelCount: hotelList.length
-      });
       if (!hotelList.length) {
         return res.json({ Hotels: [], SearchId: randomUUID(), CityName });
       }
@@ -805,6 +794,18 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
     if (!BookingCode) return res.status(400).json({ error: "BookingCode required" });
 
+    // Resolve corporate PAN from workspace
+    const hotelCustomerId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
+    const hotelWorkspace = hotelCustomerId
+      ? await CustomerWorkspace.findOne({ customerId: hotelCustomerId }).select("pan").lean()
+      : null;
+    let hotelCorporatePAN = (hotelWorkspace as any)?.pan || "";
+    if (!hotelCorporatePAN && (hotelWorkspace as any)?.customerId) {
+      const hotelCustomer = await Customer.findOne({ _id: (hotelWorkspace as any).customerId }).select("pan").lean();
+      hotelCorporatePAN = (hotelCustomer as any)?.pan || "";
+    }
+    const hotelIsCorporate = req.body.isCorporate === true && !!hotelCorporatePAN;
+
     const mapGuest = (g: any) => ({
       Title: g.Title || "Mr",
       FirstName: g.FirstName?.substring(0, 25),
@@ -840,6 +841,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       RequestedBookingMode: 5,
       NetAmount,
       HotelRoomsDetails,
+      ...(hotelIsCorporate && hotelCorporatePAN ? { IsCorporate: true, CorporatePAN: hotelCorporatePAN } : {}),
     };
     if (DepartureCity) {
       tboPayload.DepartureCity = DepartureCity;

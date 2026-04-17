@@ -96,6 +96,37 @@ router.get('/my-access', requireAuth, async (req: any, res: any) => {
       return res.json({ notGranted: true })
     }
 
+    // TENANT_ADMIN / Workspace Admin: perm doc has roleType SUPERADMIN but
+    // user.roles[] does not contain SUPERADMIN so isSuperAdmin(req) is false.
+    // Treat these docs as full-access superadmin so PermissionGuard passes.
+    if (perm.roleType === 'SUPERADMIN') {
+      const allModules: Record<string, { access: string; scope: string }> = {}
+      const moduleKeys = Object.keys(LEVEL_TEMPLATES['L8'] ?? {})
+      // Fall back to the known module list if template is unavailable
+      const keys = moduleKeys.length > 0 ? moduleKeys : [
+        'myProfile', 'attendance', 'leaves', 'leaveApprovals', 'holidays',
+        'holidayManagement', 'orgChart', 'policies', 'teamProfiles', 'teamPresence',
+        'teamCalendar', 'hrWorkspace', 'onboarding', 'people', 'masterData',
+        'payroll', 'payrollAdmin', 'adminQueue', 'manualBookings', 'invoices',
+        'reports', 'companySettings', 'adminVouchers', 'voucherExtract',
+        'analytics', 'workspaceSettings', 'accessConsole', 'sbt',
+        'sbtSearch', 'sbtBookings', 'sbtRequest', 'approvals', 'travelSpend',
+        'vendorProfile',
+      ]
+      for (const k of keys) {
+        allModules[k] = { access: 'FULL', scope: 'ALL' }
+      }
+      return res.json({
+        isSuperAdmin: true,
+        level: perm.level,
+        modules: allModules,
+        tier: 3,
+        roleType: 'SUPERADMIN',
+        status: 'active',
+        grantedModules: perm.grantedModules,
+      })
+    }
+
     // For CUSTOMER_SBT / CUSTOMER_APPROVAL level grants that predate the
     // grantedModules field, backfill the customer module list so hasModule()
     // returns true for bookings/billing/profile on the frontend.

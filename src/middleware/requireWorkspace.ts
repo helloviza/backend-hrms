@@ -22,9 +22,23 @@ const CUSTOMER_ROLES = new Set([
   "BUSINESS",
 ]);
 
+// TENANT_ADMIN is a staff role — it takes the staff (findById) path
+// even if the user also carries WORKSPACE_LEADER in their roles array.
+const STAFF_OVERRIDE_ROLES = new Set([
+  "TENANT_ADMIN",
+  "ADMIN",
+  "SUPERADMIN",
+  "HR",
+  "HR_ADMIN",
+]);
+
 function isCustomerUser(user: any): boolean {
-  const roles: string[] = Array.isArray(user?.roles) ? user.roles : [];
-  return roles.some((r) => CUSTOMER_ROLES.has(String(r).toUpperCase()));
+  const roles: string[] = Array.isArray(user?.roles)
+    ? user.roles.map((r: string) => String(r).toUpperCase())
+    : [];
+  // If any staff-override role is present, treat as staff regardless
+  if (roles.some((r) => STAFF_OVERRIDE_ROLES.has(r))) return false;
+  return roles.some((r) => CUSTOMER_ROLES.has(r));
 }
 
 const WS_SELECT = "_id customerId status config travelMode";

@@ -512,6 +512,8 @@ export async function bookFlight(params: {
     GSTCompanyEmail: string;
     GSTIN: string;
   };
+  isCorporate?: boolean;
+  corporatePAN?: string;
 }) {
   if (!Array.isArray(params.Passengers) || params.Passengers.length === 0) {
     throw new Error("bookFlight: Passengers array is missing or empty");
@@ -645,7 +647,10 @@ export async function bookFlight(params: {
     IsPriceChangeAccepted: false,
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
-
+  if (params.isCorporate && params.corporatePAN) {
+    payload.IsCorporate = true;
+    payload.CorporatePAN = params.corporatePAN;
+  }
 
   return post("/Book", payload, false, FLIGHT_BASE);
 }
@@ -857,6 +862,8 @@ export async function ticketLCC(params: {
     GSTCompanyEmail: string;
     GSTIN: string;
   };
+  isCorporate?: boolean;
+  corporatePAN?: string;
 }) {
   if (params.IsGSTMandatory === true && !params.GSTCompanyInfo) {
     throw new Error("GST company details are mandatory for this fare. Please provide your company GSTIN.");
@@ -1095,6 +1102,10 @@ export async function ticketLCC(params: {
     IsPriceChangeAccepted: false,
   };
   if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
+  if (params.isCorporate && params.corporatePAN) {
+    payload.IsCorporate = true;
+    payload.CorporatePAN = params.corporatePAN;
+  }
 
   const lccResult = await post("/Ticket", payload, false, FLIGHT_BASE) as any;
 

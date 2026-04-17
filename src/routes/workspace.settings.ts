@@ -164,6 +164,43 @@ r.put(
   },
 );
 
+/* ─── PATCH /pan — Update workspace Company PAN and GST number ─── */
+r.patch(
+  "/pan",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const workspaceId = req.workspaceId;
+      if (!workspaceId) {
+        return res.status(400).json({ success: false, error: "No workspace context." });
+      }
+
+      const update: Record<string, any> = {};
+      if (typeof req.body.pan === "string") {
+        update.pan = req.body.pan.trim().toUpperCase();
+      }
+      if (typeof req.body.gstNumber === "string") {
+        update.gstNumber = req.body.gstNumber.trim().toUpperCase();
+      }
+
+      if (Object.keys(update).length === 0) {
+        return res.status(400).json({ success: false, error: "No valid fields to update." });
+      }
+
+      const ws = await CustomerWorkspace.findByIdAndUpdate(
+        workspaceId,
+        { $set: update },
+        { new: true },
+      )
+        .select("pan gstNumber")
+        .lean();
+
+      return res.json({ success: true, pan: (ws as any)?.pan || "", gstNumber: (ws as any)?.gstNumber || "" });
+    } catch (err) {
+      return next(err);
+    }
+  },
+);
+
 /* ─── GET / — Get workspace configs ─── */
 r.get(
   "/",
@@ -171,12 +208,14 @@ r.get(
     try {
       const workspaceId = req.workspaceId;
       const ws = await CustomerWorkspace.findById(workspaceId)
-        .select("payrollConfig attendanceConfig")
+        .select("payrollConfig attendanceConfig pan gstNumber")
         .lean();
 
       return res.json({
         payrollConfig: (ws as any)?.payrollConfig || {},
         attendanceConfig: (ws as any)?.attendanceConfig || {},
+        pan: (ws as any)?.pan || "",
+        gstNumber: (ws as any)?.gstNumber || "",
       });
     } catch (err) {
       return next(err);

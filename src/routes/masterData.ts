@@ -860,7 +860,7 @@ router.post(
   // 🔒 Send welcome email ONLY ONCE — use warm employee template
   if (!(onboardingDoc as any).welcomeEmailSent) {
     try {
-      const loginUrl = (process.env.FRONTEND_ORIGIN || "https://hrms.plumtrips.com").replace(/\/+$/, "") + "/login";
+      const loginUrl = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
       await sendEmployeeWelcomeEmail({
         name: baseName || "Employee",
         email: email!,
@@ -944,7 +944,7 @@ router.post(
 // 🔒 Send employee welcome + credentials email only once
 if (!(onboardingDoc as any).welcomeEmailSent) {
   try {
-    const loginUrl = (process.env.FRONTEND_ORIGIN || "https://hrms.plumtrips.com").replace(/\/+$/, "") + "/login";
+    const loginUrl = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
     await sendEmployeeWelcomeEmail({
       name: baseName || "Employee",
       email: email!,

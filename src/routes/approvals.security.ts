@@ -120,7 +120,7 @@ export function frontendBaseUrl() {
     .filter(Boolean);
 
   if (!list.length) {
-    return (isProd ? "" : "http://localhost:5173").replace(/\/$/, "");
+    return (isProd ? "https://plumbox.plumtrips.com" : "http://localhost:5173").replace(/\/$/, "");
   }
 
   if (!isProd) {

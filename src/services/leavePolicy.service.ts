@@ -253,7 +253,7 @@ export async function validateLeaveApplication(
     const joinDate = user?.dateOfJoining
       ? new Date(user.dateOfJoining)
       : new Date();
-    balance = await initializeLeaveBalance(userId, joinDate, year, policy);
+    balance = await initializeLeaveBalance(userId, joinDate, year, policy, workspaceId);
   }
 
   const onProbation =
@@ -353,7 +353,7 @@ export async function runYearEndCarryForward(
   let newBalance: any = await LeaveBalance.findOne({ userId, year: toYear });
   if (!newBalance) {
     const joinDate = oldBalance.joinDate || new Date();
-    newBalance = await initializeLeaveBalance(userId, joinDate, toYear, policy);
+    newBalance = await initializeLeaveBalance(userId, joinDate, toYear, policy, (oldBalance as any).workspaceId);
   }
 
   newBalance.balances.EL.carriedForward = carryForward;

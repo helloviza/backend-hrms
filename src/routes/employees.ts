@@ -363,8 +363,8 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
         .json({ error: "Official email is required for employee" });
     }
 
-    // Try to find existing user by company email
-    let user: AnyUser | null = await User.findOne({ email: officialEmail }).exec();
+    // Try to find existing user by company email — scoped to workspace to prevent cross-tenant contamination
+    let user: AnyUser | null = await User.findOne({ email: officialEmail, workspaceId: req.workspaceObjectId }).exec();
 
     const fullName: string =
       body.name ||

@@ -1209,7 +1209,7 @@ router.post("/:token/decision", requireAuth, noStore, async (req, res, next) => 
       const docType = String(doc.type || "").toLowerCase();
       if (!doc.welcomeEmailSent) {
         try {
-          const loginUrl = (env.FRONTEND_ORIGIN || "https://hrms.plumtrips.com").replace(/\/+$/, "") + "/login";
+          const loginUrl = (env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
 
           if (docType === "employee") {
             // Employee: warm welcome with credentials included

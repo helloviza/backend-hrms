@@ -60,6 +60,11 @@ import {
   buildLeaderFyiHtml,
   buildRequesterApprovedHtml,
   buildEmailAttachmentsFromMeta,
+  buildEmailShell,
+  eLabel,
+  eCard,
+  eRow,
+  eBtn,
   sanitizeAdminCommentForEmail,
   sumBookingAmount,
   pickTripSummary,
@@ -348,7 +353,12 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     if (!requesterDisplayName) requesterDisplayName = email?.split("@")[0] || "User";
 
     // SBT users must book directly — block approval flow
-    if (sub) {
+    // WORKSPACE_LEADER always bypasses SBT/canRaiseRequest restrictions
+    const isWL = (req.user?.roles || [])
+      .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
+      .includes("WORKSPACELEADER");
+
+    if (sub && !isWL) {
       const sbtCheck = await User.findOne({ _id: sub, workspaceId: req.workspaceObjectId }).select("sbtEnabled canRaiseRequest").lean();
       if (sbtCheck?.sbtEnabled === true) {
         return res.status(403).json({
@@ -376,6 +386,8 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       customerId: cid,
       actorEmail: email,
     });
+
+    const isSelfApproval = Boolean(approverEmail && normEmail(approverEmail) === normEmail(email));
 
     let customerName = "Workspace";
     let customerEmailDomain = "";
@@ -442,16 +454,21 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       managerEmail: approverEmail,
       managerName,
 
-      status: isDirectFlow ? "approved" : "pending",
-      adminState: isDirectFlow ? "pending" : undefined,
-      stage: isDirectFlow ? "REQUEST_APPROVED" : "REQUEST_RAISED",
+      status: isSelfApproval || isDirectFlow ? "approved" : "pending",
+      adminState: isSelfApproval || isDirectFlow ? "pending" : undefined,
+      stage: isSelfApproval ? "PROPOSAL_PENDING" : isDirectFlow ? "REQUEST_APPROVED" : "REQUEST_RAISED",
       cartItems,
       comments: comments ? String(comments) : undefined,
+
+      ...(isSelfApproval
+        ? { approvedByEmail: approverEmail, approvedByName: managerName }
+        : {}),
 
       meta: {
         ...(wsInternalId ? { customerWorkspaceId: wsInternalId } : {}),
         ccLeaders: leaderEmails,
         travelFlow: wsTravelFlow || "APPROVAL_FLOW",
+        ...(isSelfApproval ? { selfApproved: true, selfApprovedReason: "WL_IS_REQUESTER" } : {}),
         ...(isDirectFlow ? { autoApproved: true, autoApprovedReason: "APPROVAL_DIRECT" } : {}),
       },
 
@@ -464,7 +481,18 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
           userEmail: email,
           userName: name,
         },
-        ...(isDirectFlow
+        ...(isSelfApproval
+          ? [
+              {
+                action: "approved",
+                at: new Date(),
+                by: sub || "unknown",
+                comment: "Self-approved — requester is the designated approver for this workspace.",
+                userEmail: email,
+                userName: name,
+              },
+            ]
+          : isDirectFlow
           ? [
               {
                 action: "auto_approved",
@@ -501,24 +529,56 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
 
     try {
       if (!DISABLE_EMAILS) {
-        await sendMail({
-          kind: "REQUESTS",
-          to: approverEmail,
-          subject,
-          replyTo: email || undefined,
-          html: buildApproverEmailHtml({
-            requestId: String(doc._id),
-            requesterName: requesterDisplayName,
-            requesterEmail: email,
-            customerName,
-            ticketId: doc.ticketId,
-            items: cartItems,
-            comments: doc.comments,
-            approveUrl,
-            declineUrl,
-            holdUrl,
-          }),
-        });
+        if (!isSelfApproval) {
+          await sendMail({
+            kind: "REQUESTS",
+            to: approverEmail,
+            subject,
+            replyTo: email || undefined,
+            html: buildApproverEmailHtml({
+              requestId: String(doc._id),
+              requesterName: requesterDisplayName,
+              requesterEmail: email,
+              customerName,
+              ticketId: doc.ticketId,
+              items: cartItems,
+              comments: doc.comments,
+              approveUrl,
+              declineUrl,
+              holdUrl,
+            }),
+          });
+        } else {
+          const frontendUrl = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "");
+          const html = buildEmailShell(
+            `${eLabel("Request Auto-Approved")}
+             ${eCard(`
+               <table cellpadding="0" cellspacing="0" width="100%">
+                 ${eRow("Request ID", escapeHtml(doc.ticketId || doc._id.toString()))}
+                 ${eRow("Status", "Approved — Sent to Admin Queue")}
+                 ${eRow("Travel Flow", escapeHtml(doc.meta?.travelFlow || "—"))}
+               </table>
+             `)}
+             ${eBtn(
+               "View My Requests",
+               frontendUrl + "/approvals/requests/mine",
+               "#10b981",
+               "#ffffff"
+             )}`,
+            {
+              title: "Your Request Has Been Approved",
+              subtitle: "Your request has been auto-approved and sent to the admin queue for processing.",
+              badgeText: "APPROVED",
+              badgeColor: "#10b981",
+            }
+          );
+          sendMail({
+            kind: "APPROVALS",
+            to: normEmail(email),
+            subject: `Request Approved — ${doc.ticketId || "New Request"}`,
+            html,
+          }).catch(() => {});
+        }
 
         const leaderTargets = leaderEmails
           .map(normEmail)
@@ -610,18 +670,31 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
 
     const email = normEmail(req.user?.email);
 
-    const rows = await ApprovalRequest.find({
-      $and: [
-        {
+    // WORKSPACE_LEADER sees all pending requests in their workspace
+    const isWLInbox = (req.user?.roles || [])
+      .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
+      .includes("WORKSPACELEADER");
+
+    const inboxQuery = isWLInbox
+      ? {
           status: "pending",
           stage: { $in: ["REQUEST_RAISED", "REQUEST_ON_HOLD"] },
           workspaceId: req.workspaceObjectId,
-        },
-        {
-          $or: [{ managerEmail: exactIRegex(email) }, { "meta.ccLeaders": exactIRegex(email) }],
-        },
-      ],
-    })
+        }
+      : {
+          $and: [
+            {
+              status: "pending",
+              stage: { $in: ["REQUEST_RAISED", "REQUEST_ON_HOLD"] },
+              workspaceId: req.workspaceObjectId,
+            },
+            {
+              $or: [{ managerEmail: exactIRegex(email) }, { "meta.ccLeaders": exactIRegex(email) }],
+            },
+          ],
+        };
+
+    const rows = await ApprovalRequest.find(inboxQuery)
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
@@ -844,7 +917,12 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
     }
 
     // normal approver action
-    if (!exactIRegex(email).test(String(doc.managerEmail || ""))) {
+    // WORKSPACE_LEADER can approve any request in their workspace
+    const isWLAction = (req.user?.roles || [])
+      .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
+      .includes("WORKSPACELEADER");
+
+    if (!isWLAction && !exactIRegex(email).test(String(doc.managerEmail || ""))) {
       return res.status(403).json({ error: "Not allowed (not assigned approver)" });
     }
 

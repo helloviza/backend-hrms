@@ -312,6 +312,10 @@ app.use("/api/proposals", proposalsRouter);
 import signupRouter from "./routes/auth.signup.js";
 app.use("/api/auth", signupRouter);
 app.use("/api/auth", auth);
+
+// Self-service signup (fully public — no requireAuth)
+import selfServiceSignupRouter from "./routes/signup.js";
+app.use("/api/signup", selfServiceSignupRouter);
 app.use("/api/users", users);
 
 // HRMS
@@ -438,9 +442,10 @@ import adminSessionsRouter from "./routes/admin.sessions.js";
 app.use("/api/admin/sessions", adminSessionsRouter);
 
 // Invoices, Reports, Company Settings (admin-only via router-level requireAdmin)
-import invoicesRouter from "./routes/invoices.js";
+import invoicesRouter, { workspaceRouter as invoicesWorkspaceRouter } from "./routes/invoices.js";
 import reportsRouter from "./routes/reports.js";
 import companySettingsRouter from "./routes/companySettings.js";
+app.use("/api/invoices/workspace", invoicesWorkspaceRouter);
 app.use("/api/admin/invoices", invoicesRouter);
 app.use("/api/admin/reports", reportsRouter);
 app.use("/api/admin/company-settings", companySettingsRouter);

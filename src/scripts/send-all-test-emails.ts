@@ -81,9 +81,10 @@ async function sendSbtRequestEmail(doc: any) {
       .join("");
   }
 
-  const approveUrl = "https://api.hrms.plumtrips.com/api/customer-approvals/email/TEST_TOKEN_APPROVE";
-  const declineUrl = "https://api.hrms.plumtrips.com/api/customer-approvals/email/TEST_TOKEN_DECLINE";
-  const holdUrl = "https://api.hrms.plumtrips.com/api/customer-approvals/email/TEST_TOKEN_HOLD";
+  const apiBase = process.env.PUBLIC_API_BASE || "https://api.hrms.plumtrips.com/api";
+  const approveUrl = `${apiBase}/customer-approvals/email/TEST_TOKEN_APPROVE`;
+  const declineUrl = `${apiBase}/customer-approvals/email/TEST_TOKEN_DECLINE`;
+  const holdUrl = `${apiBase}/customer-approvals/email/TEST_TOKEN_HOLD`;
   const tokenExpiryHours = 12;
   const itemsHtml = buildItemsHtml(cartItems);
 
@@ -331,9 +332,10 @@ function buildProposalSummaryHtml(p: any): string {
 }
 
 async function sendProposalApprovalEmail(doc: any) {
-  const approveUrl = "https://api.hrms.plumtrips.com/api/proposals/email/TEST_TOKEN_APPROVE";
-  const declineUrl = "https://api.hrms.plumtrips.com/api/proposals/email/TEST_TOKEN_DECLINE";
-  const holdUrl = "https://api.hrms.plumtrips.com/api/proposals/email/TEST_TOKEN_HOLD";
+  const apiBase = process.env.PUBLIC_API_BASE || "https://api.hrms.plumtrips.com/api";
+  const approveUrl = `${apiBase}/proposals/email/TEST_TOKEN_APPROVE`;
+  const declineUrl = `${apiBase}/proposals/email/TEST_TOKEN_DECLINE`;
+  const holdUrl = `${apiBase}/proposals/email/TEST_TOKEN_HOLD`;
 
   const summaryHtml = buildProposalSummaryHtml(doc);
 

@@ -8,9 +8,14 @@ import Customer from "../models/Customer.js";
 import User from "../models/User.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
 import { sendWorkspaceCredentials } from "../services/email.service.js";
-import logger from "../utils/logger.js";
+import logger, { sbtLogger } from "../utils/logger.js";
 import requireAuth from "../middleware/auth.js";
 import { env } from "../config/env.js";
+import {
+  generateSlug,
+  ensureUniqueSlug,
+  provisionNewTenant,
+} from "../services/tenantProvisioning.js";
 
 const router = Router();
 
@@ -160,7 +165,7 @@ router.get("/workspaces", async (req: any, res) => {
 
 router.post("/workspaces", async (req: any, res) => {
   try {
-    const { companyName, industry, employeeCount, adminEmail, adminName, plan, features, notes } =
+    const { companyName, industry, employeeCount, adminEmail, adminName, plan, features, notes, phone } =
       req.body as {
         companyName: string;
         industry?: string;
@@ -170,6 +175,7 @@ router.post("/workspaces", async (req: any, res) => {
         plan: "trial" | "starter" | "growth" | "enterprise";
         features?: Record<string, boolean>;
         notes?: string;
+        phone?: string;
       };
 
     if (!companyName || !adminEmail || !adminName || !plan) {
@@ -178,6 +184,10 @@ router.post("/workspaces", async (req: any, res) => {
 
     // Build customerId: slug + 6 random hex chars
     const customerId = `${slugify(companyName)}-${crypto.randomBytes(3).toString("hex")}`;
+
+    // Generate workspace slug (URL-safe, unique)
+    const baseSlug = generateSlug(companyName);
+    const slug = await ensureUniqueSlug(baseSlug, CustomerWorkspace);
 
     // Resolve features for the plan, then apply any overrides
     const defaultFeatures = CustomerWorkspace.getDefaultFeaturesForPlan(plan);
@@ -190,9 +200,15 @@ router.post("/workspaces", async (req: any, res) => {
       employeeCount,
       plan,
       notes,
+      phone: phone || "",
+      source: "SUPERADMIN",
       status: "ACTIVE",
       "config.features": mergedFeatures,
     });
+
+    // Persist slug onto the workspace document
+    workspace.slug = slug;
+    await workspace.save();
 
     // Generate temp password and hash it
     const tempPassword = generateTempPassword();
@@ -218,6 +234,15 @@ router.post("/workspaces", async (req: any, res) => {
     } catch (emailErr: any) {
       logger.warn("Failed to send workspace credentials email");
     }
+
+    // Fire-and-forget provisioning — never blocks the response
+    provisionNewTenant(
+      workspace._id.toString(),
+      workspace.customerId,
+      slug,
+    ).catch((err) =>
+      sbtLogger.error("[TENANT PROVISION ERROR]", { err }),
+    );
 
     const userObj = user.toObject() as Record<string, any>;
     delete userObj.passwordHash;
@@ -279,7 +304,7 @@ router.put("/workspaces/:workspaceId", async (req, res) => {
   try {
     const ALLOWED_FIELDS = [
       "status", "name", "config", "travelMode",
-      "allowedDomains", "plan", "notes",
+      "allowedDomains", "plan", "notes", "phone",
     ];
     const safeUpdate: Record<string, any> = {};
     for (const key of ALLOWED_FIELDS) {
