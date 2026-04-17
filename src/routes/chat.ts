@@ -59,7 +59,10 @@ router.get("/stream", async (req: Request, res: Response) => {
   );
 
   // Notify workspace peers this user came online
-  const workspaceUsers = await User.find({ workspaceId }, "_id").lean();
+  // Guard: skip DB query if workspaceId is absent from token (CastError prevention)
+  const workspaceUsers = workspaceId
+    ? await User.find({ workspaceId }, "_id").lean()
+    : [];
   const allUserIds = (workspaceUsers as any[])
     .map((u) => String(u._id))
     .filter((id) => id !== userId);
