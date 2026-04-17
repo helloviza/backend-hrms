@@ -7,7 +7,100 @@ import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import { requirePermission } from "../middleware/requirePermission.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import Invoice from "../models/Invoice.js";
+
+/* ── Workspace router (no requireAdmin — separate mount) ──────────── */
+// Mounted at: /api/invoices/workspace
+// Accessible to WORKSPACE_LEADER, TENANT_ADMIN, CUSTOMER with a valid workspace
+
+export const workspaceRouter = express.Router();
+
+workspaceRouter.use(requireAuth);
+workspaceRouter.use(requireWorkspace);
+
+// GET /api/invoices/workspace/mine
+workspaceRouter.get("/mine", async (req: any, res: any) => {
+  try {
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 20);
+
+    const filter: Record<string, any> = {
+      workspaceId: req.workspaceObjectId,
+    };
+
+    if (req.query.status) filter.status = req.query.status;
+
+    if (req.query.dateFrom || req.query.dateTo) {
+      filter.generatedAt = {};
+      if (req.query.dateFrom) filter.generatedAt.$gte = new Date(req.query.dateFrom);
+      if (req.query.dateTo)   filter.generatedAt.$lte = new Date(req.query.dateTo);
+    }
+
+    if (req.query.search) {
+      filter.invoiceNo = { $regex: req.query.search, $options: "i" };
+    }
+
+    const [invoices, total] = await Promise.all([
+      Invoice.find(filter)
+        .sort({ generatedAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Invoice.countDocuments(filter),
+    ]);
+
+    res.json({ ok: true, invoices, total, page, totalPages: Math.ceil(total / limit) });
+  } catch (err: any) {
+    console.error("[Invoices workspace/mine]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/invoices/workspace/:id/pdf
+// Workspace-scoped PDF generation — no requireAdmin needed.
+// Invoice must belong to req.workspaceObjectId.
+workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
+  try {
+    const invoice = await Invoice.collection.findOne({
+      _id: new mongoose.Types.ObjectId(req.params.id),
+      workspaceId: req.workspaceObjectId,
+    });
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+
+    const pdfBuffer = await generateInvoicePdf(invoice as any);
+
+    const s3 = new S3Client({
+      region: env.AWS_REGION,
+      credentials:
+        env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY
+          ? { accessKeyId: env.AWS_ACCESS_KEY_ID, secretAccessKey: env.AWS_SECRET_ACCESS_KEY }
+          : undefined,
+    });
+
+    const key    = `invoices/${invoice.invoiceNo}.pdf`;
+    const bucket = env.S3_BUCKET;
+
+    await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: pdfBuffer, ContentType: "application/pdf" }));
+
+    const pdfUrl = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: bucket, Key: key, ResponseContentDisposition: `inline; filename="${invoice.invoiceNo}.pdf"` }),
+      { expiresIn: 3600 },
+    );
+
+    await Invoice.collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(req.params.id) },
+      { $set: { pdfUrl } },
+    );
+
+    res.json({ ok: true, pdfUrl });
+  } catch (err: any) {
+    console.error("[Invoices workspace/pdf]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 import ManualBooking from "../models/ManualBooking.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
@@ -127,6 +220,14 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
                  || (customer as any).name
                : 'NOT FOUND')
     console.log('[Invoice generate] wsId used:', wsId)
+
+    // Resolve the CustomerWorkspace._id for this customer so workspaceId
+    // on the invoice matches what requireWorkspace sets on req.workspaceObjectId.
+    // bookings store Customer._id in workspaceId, so we must look up the workspace.
+    const resolvedWorkspace = await CustomerWorkspace
+      .findOne({ customerId: wsId })
+      .lean()
+    const invoiceWorkspaceId = resolvedWorkspace?._id ?? wsId
 
     const companySettings = await getCompanySettings();
     const issuerState = companySettings.state || process.env.COMPANY_STATE || "";
@@ -276,7 +377,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     console.log('lineItems sample:', JSON.stringify(invoiceLineItems[0]));
 
     const invoice = await Invoice.create({
-      workspaceId: wsIds[0],
+      workspaceId: invoiceWorkspaceId,
       billingPeriod,
       bookingIds: bookings.map((b: any) => b._id),
       subtotal: parseFloat(subtotal.toFixed(2)),

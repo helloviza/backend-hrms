@@ -30,6 +30,9 @@ export type OnboardingStep =
 
 export interface CustomerWorkspaceDocument extends Document {
   customerId: string;
+  slug?: string;
+  phone?: string;
+  source?: "SUPERADMIN" | "SELF_SERVICE";
 
   // Company identity
   companyName: string;
@@ -129,6 +132,9 @@ export interface CustomerWorkspaceDocument extends Document {
     lastResetMonth: string;
   };
 
+  // Admin user (set after first user creation during self-service signup)
+  adminUserId?: Schema.Types.ObjectId;
+
   // Legacy orphan flag (migration)
   _isLegacyOrphan?: boolean;
 
@@ -144,31 +150,25 @@ export interface CustomerWorkspaceModel extends Model<CustomerWorkspaceDocument>
 
 /* ── Schema ──────────────────────────────────────────────────────── */
 
-const INDUSTRY_ENUM = [
-  "Technology",
-  "Manufacturing",
-  "Healthcare",
-  "Finance",
-  "Retail",
-  "Education",
-  "Hospitality",
-  "Travel",
-  "Other",
-];
-
-const EMPLOYEE_COUNT_ENUM = ["1-10", "11-50", "51-200", "201-500", "500+"];
-
 const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
   {
     customerId: { type: String, required: true, index: true, unique: true },
+    slug: {
+      type: String,
+      unique: true,
+      sparse: true,
+      index: true,
+      trim: true,
+      lowercase: true,
+    },
 
     // ── Company identity ──
     companyName: { type: String, trim: true, default: "" },
     companyLogo: { type: String },
     gstNumber: { type: String, trim: true },
     pan: { type: String, trim: true },
-    industry: { type: String, enum: INDUSTRY_ENUM },
-    employeeCount: { type: String, enum: EMPLOYEE_COUNT_ENUM },
+    industry: { type: String, trim: true },
+    employeeCount: { type: String, trim: true },
     address: {
       line1: { type: String },
       line2: { type: String },
@@ -296,6 +296,16 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
       currentMonthSpend: { type: Number, default: 0 },
       lastResetMonth: { type: String, default: '' },
     },
+
+    phone: { type: String, trim: true, default: "" },
+    source: {
+      type: String,
+      enum: ["SUPERADMIN", "SELF_SERVICE"],
+      default: "SUPERADMIN",
+    },
+
+    // ── Admin user (set after signup) ──
+    adminUserId: { type: Schema.Types.ObjectId, ref: "User" },
 
     // ── Migration flag ──
     _isLegacyOrphan: { type: Boolean },

@@ -2018,7 +2018,7 @@ router.post(
               ${reason ? `<p><b>Reason:</b> ${escHtml(reason)}</p>` : ""}
               <p>If you'd like to raise a new request, please click below.</p>
               <div style="margin-top:20px;">
-                ${eBtn("Raise a New Request", `${process.env.FRONTEND_ORIGIN || "https://hrms.plumtrips.com"}/sbt/my-requests`, "#4f46e5", "#ffffff")}
+                ${eBtn("Raise a New Request", `${process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com"}/sbt/my-requests`, "#4f46e5", "#ffffff")}
               </div>
             </div>`,
             {

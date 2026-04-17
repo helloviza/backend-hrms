@@ -38,15 +38,6 @@ async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction
     .select("customerId sbtEnabled canViewBilling roles")
     .lean();
 
-  console.log('[BILLING AUTH]', {
-    roles: (req as any).user?.roles,
-    customerMemberRole: (req as any).user?.customerMemberRole,
-    isWL,
-    customerId: dbUser?.customerId,
-    sbtEnabled: dbUser?.sbtEnabled,
-    canViewBilling: dbUser?.canViewBilling,
-  });
-
   // Verify this user belongs to the current workspace
   if (dbUser?.customerId) {
     const wsCustomerId = (req as any).workspace?.customerId;

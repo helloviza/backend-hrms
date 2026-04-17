@@ -242,7 +242,8 @@ function isStaffActor(userLike: any): boolean {
     roles.includes("SUPERADMIN") ||
     roles.includes("HR") ||
     roles.includes("HR_ADMIN") ||
-    roles.includes("STAFF")
+    roles.includes("STAFF") ||
+    roles.includes("TENANT_ADMIN")
   );
 }
 

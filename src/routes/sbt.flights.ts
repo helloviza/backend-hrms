@@ -13,6 +13,7 @@ import SBTRequest from "../models/SBTRequest.js";
 import SBTConfig from "../models/SBTConfig.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import Customer from "../models/Customer.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { sendMail } from "../utils/mailer.js";
@@ -742,6 +743,8 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
     }
     const result = await getFareQuote(req.body) as any;
     const fareResults = result?.Response?.Results;
+    const corporateBookingAllowed =
+      fareResults?.CorporateBookingAllowed || false;
     res.json({
       ...result,
       isPriceChanged: fareResults?.IsPriceChanged || false,
@@ -749,6 +752,7 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
       flightDetailChangeInfo: fareResults?.FlightDetailChangeInfo || null,
       isseatmandatory: fareResults?.isseatmandatory || false,
       ismealmandatory: fareResults?.ismealmandatory || false,
+      corporateBookingAllowed,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -842,7 +846,19 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
       if (dupErr) return res.status(409).json({ error: dupErr, code: "DUPLICATE_BOOKING" });
     }
 
-    const data = await bookFlight({ ...req.body, isNDC: bookIsNDC, airlineCode: bookAirlineCode, destinationCode: req.body?.destinationCode }) as any;
+    // Resolve corporate PAN from workspace
+    const bookCustomerId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
+    const bookWorkspace = bookCustomerId
+      ? await CustomerWorkspace.findOne({ customerId: bookCustomerId }).select("pan").lean()
+      : null;
+    let bookCorporatePAN = (bookWorkspace as any)?.pan || "";
+    if (!bookCorporatePAN && (bookWorkspace as any)?.customerId) {
+      const bookCustomer = await Customer.findOne({ _id: (bookWorkspace as any).customerId }).select("pan").lean();
+      bookCorporatePAN = (bookCustomer as any)?.pan || "";
+    }
+    const bookIsCorporate = req.body.corporateBookingAllowed === true && !!bookCorporatePAN;
+
+    const data = await bookFlight({ ...req.body, isNDC: bookIsNDC, airlineCode: bookAirlineCode, destinationCode: req.body?.destinationCode, isCorporate: bookIsCorporate, corporatePAN: bookCorporatePAN }) as any;
 
     // Check for TBO-level failure
     const responseStatus = data?.Response?.ResponseStatus;
@@ -1070,6 +1086,19 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
     const lccTicketValErr = validateTBOTicketRequirements(lccFareResults, lccPassengers);
     if (lccTicketValErr) return res.status(400).json({ error: lccTicketValErr });
 
+    // Resolve corporate PAN from workspace
+    const lccCustomerId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
+    const lccWorkspace = lccCustomerId
+      ? await CustomerWorkspace.findOne({ customerId: lccCustomerId }).select("pan").lean()
+      : null;
+    let lccCorporatePAN = (lccWorkspace as any)?.pan || "";
+    if (!lccCorporatePAN && (lccWorkspace as any)?.customerId) {
+      const lccCustomer = await Customer.findOne({ _id: (lccWorkspace as any).customerId }).select("pan").lean();
+      lccCorporatePAN = (lccCustomer as any)?.pan || "";
+    }
+    const lccIsCorporate = req.body.corporateBookingAllowed === true && !!lccCorporatePAN;
+    const corpParams = lccIsCorporate ? { isCorporate: true as const, corporatePAN: lccCorporatePAN } : {};
+
     const lccIsInternational = req.body.isInternational ?? lccIsIntl;
     const lccSegments = lccFareResults?.Segments ?? req.body.Segments ?? [];
     const lccFreeBaggage = (req.body.FreeBaggage ?? []).filter((b: any) => b.Price === 0);
@@ -1142,6 +1171,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
         FreeBaggage: lccFreeBaggage,
         ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
         ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
+        ...corpParams,
       }) as any;
 
       const ticketStatus = result?.Response?.ResponseStatus;
@@ -1193,6 +1223,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
         FreeBaggage: lccFreeBaggage,
         ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
         ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
+        ...corpParams,
       };
       let obResult = await ticketLCC(obPayload) as any;
 
@@ -1254,6 +1285,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
           isNDC: ticketIsNDC,
           ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
           ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
+          ...corpParams,
         }) as any;
 
         ibPNR = ibBookResult?.Response?.Response?.PNR
@@ -1307,6 +1339,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
           FreeBaggage: ibFreeBaggage,
           ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
           ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
+          ...corpParams,
         };
         ibResult = await ticketLCC(ibPayload) as any;
 
@@ -1410,6 +1443,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
       destinationCode: lccDestCode,
       Segments: lccSegments,
       FreeBaggage: lccFreeBaggage,
+      ...corpParams,
     }) as any;
 
     // Retry 1: strip seat only, keep meal — TBO may accept meal without seat
@@ -1429,6 +1463,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
         destinationCode: lccDestCode,
         Segments: lccSegments,
         FreeBaggage: lccFreeBaggage,
+        ...corpParams,
       }) as any;
 
       // Retry 2: strip both seat and meal if still failing
@@ -1450,6 +1485,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
           destinationCode: lccDestCode,
           Segments: lccSegments,
           FreeBaggage: [],
+          ...corpParams,
         }) as any;
       }
     }

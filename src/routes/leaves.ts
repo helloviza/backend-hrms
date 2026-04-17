@@ -115,7 +115,7 @@ r.post(
       }
 
       // Load policy and validate
-      const policy = await LeavePolicy.getOrCreate();
+      const policy = await LeavePolicy.getOrCreate((req as any).workspaceObjectId);
       const validation = await validateLeaveApplication(
         userId,
         (req as any).workspaceObjectId as string,
@@ -392,12 +392,12 @@ r.get(
 
       let balance: any = await LeaveBalance.findOne({ userId, year });
       if (!balance) {
-        const policy = await LeavePolicy.getOrCreate();
+        const policy = await LeavePolicy.getOrCreate((req as any).workspaceObjectId);
         const user = await scopedFindById(User, userId, (req as any).workspaceObjectId);
         const joinDate = user?.dateOfJoining
           ? new Date(user.dateOfJoining as string)
           : new Date();
-        balance = await initializeLeaveBalance(userId, joinDate, year, policy);
+        balance = await initializeLeaveBalance(userId, joinDate, year, policy, (req as any).workspaceObjectId);
       }
 
       const b = balance.balances;
@@ -619,7 +619,7 @@ r.get(
       if (!hasRole(req, "HR", "ADMIN"))
         return res.status(403).json({ error: "Not authorized" });
 
-      const policy = await LeavePolicy.getOrCreate();
+      const policy = await LeavePolicy.getOrCreate((req as any).workspaceObjectId);
       return res.json(policy);
     } catch (err) {
       return next(err);
@@ -635,7 +635,7 @@ r.put(
       if (!hasRole(req, "HR", "ADMIN"))
         return res.status(403).json({ error: "Not authorized" });
 
-      const policy = await LeavePolicy.getOrCreate();
+      const policy = await LeavePolicy.getOrCreate((req as any).workspaceObjectId);
 
       // Whitelist updatable fields
       const allowed = [
@@ -694,7 +694,7 @@ r.post(
         return res.status(403).json({ error: "Not authorized" });
 
       const year = new Date().getFullYear();
-      const policy = await LeavePolicy.getOrCreate();
+      const policy = await LeavePolicy.getOrCreate((req as any).workspaceObjectId);
       const users = await User.find({ status: { $ne: "INACTIVE" }, workspaceId: (req as any).workspaceObjectId })
         .select("_id dateOfJoining")
         .lean();
@@ -715,7 +715,7 @@ r.post(
         const joinDate = user.dateOfJoining
           ? new Date(user.dateOfJoining as string)
           : new Date();
-        await initializeLeaveBalance(String(user._id), joinDate, year, policy);
+        await initializeLeaveBalance(String(user._id), joinDate, year, policy, (req as any).workspaceObjectId);
         created++;
       }
 
@@ -746,7 +746,7 @@ r.post(
       const adminId = (req as any).user.sub;
       const wsId = (req as any).workspaceObjectId as string;
       const year = new Date().getFullYear();
-      const policy = await LeavePolicy.getOrCreate();
+      const policy = await LeavePolicy.getOrCreate((req as any).workspaceObjectId);
       let processed = 0;
       const failed: { userId: string; reason: string }[] = [];
 
@@ -891,7 +891,7 @@ r.post(
 
       const fromYear = new Date().getFullYear() - 1;
       const toYear = new Date().getFullYear();
-      const policy = await LeavePolicy.getOrCreate();
+      const policy = await LeavePolicy.getOrCreate((req as any).workspaceObjectId);
 
       // Find all users in workspace
       const users = await User.find({
