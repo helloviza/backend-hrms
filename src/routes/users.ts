@@ -168,13 +168,6 @@ r.get(
       const user = await User.findById(userId).select("-passwordHash").lean();
       if (!user) return res.status(404).json({ error: "User not found" });
 
-      console.log('[EMPLOYEE PROFILE]', {
-        email: (req as any).user?.email,
-        workspaceId: (req as any).workspaceObjectId?.toString(),
-        workspaceFromMiddleware: (req as any).workspace?.companyName,
-        userDocWorkspaceId: (user as any).workspaceId?.toString(),
-      });
-
       const u: any = user;
       const avatarKey = u.avatarKey || "";
       const avatarUrl = avatarKey ? await signAvatarUrl(avatarKey) : "";

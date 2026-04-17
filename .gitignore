@@ -27,6 +27,9 @@ Thumbs.db
 # uploads & runtime files
 uploads/
 
+# puppeteer / playwright cache
+.cache/
+
 # tests & coverage
 coverage/
 

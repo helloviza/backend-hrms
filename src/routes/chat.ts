@@ -11,6 +11,7 @@ import {
   removeClient,
   sendToUsers,
   getOnlineUsers,
+  getClientCount,
   isOnline,
 } from "../services/chatSSE.js";
 import logger from "../utils/logger.js";
@@ -32,9 +33,10 @@ router.get("/stream", async (req: Request, res: Response) => {
 
   let userId: string;
   let workspaceId: string;
+  let decoded: any;
 
   try {
-    const decoded = verifyToken(rawToken) as any;
+    decoded = verifyToken(rawToken) as any;
     userId = String(decoded._id || decoded.id || decoded.sub || "");
     workspaceId = String(decoded.workspaceId || decoded.customerId || "");
     if (!userId) throw new Error("no user id in token");
@@ -47,6 +49,13 @@ router.get("/stream", async (req: Request, res: Response) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
+  // Disable Nagle's algorithm — without this, small SSE frames get buffered
+  // and may not be flushed to the client for hundreds of milliseconds.
+  const socket = (res as any).socket;
+  if (socket) {
+    socket.setNoDelay(true);
+    socket.setTimeout(0);
+  }
   console.log('[SSE] Client connected:', userId);
 
   addClient(userId, res);
@@ -57,6 +66,14 @@ router.get("/stream", async (req: Request, res: Response) => {
       onlineUsers: getOnlineUsers(),
     })}\n\n`
   );
+
+  // Send immediate ping so the client's heartbeat timer resets right away.
+  // Without this, a reconnect leaves a 0–15s window with no ping → the 30s
+  // heartbeat fires → triggers another reconnect → infinite loop.
+  res.write("event: ping\ndata: {}\n\n");
+  if (typeof (res as any).flush === "function") {
+    (res as any).flush();
+  }
 
   // Notify workspace peers this user came online
   // Guard: skip DB query if workspaceId is absent from token (CastError prevention)
@@ -69,17 +86,28 @@ router.get("/stream", async (req: Request, res: Response) => {
 
   sendToUsers(allUserIds, "user_online", { userId });
 
-  const pingInterval = setInterval(() => {
-    try {
-      res.write(": ping\n\n");
-    } catch {
-      clearInterval(pingInterval);
+  const keepaliveInterval = setInterval(() => {
+    if (!res.writableEnded) {
+      const wrote = res.write("event: ping\ndata: {}\n\n");
+      if (!wrote) {
+        // Backpressure — resume when drained
+        res.once("drain", () => {});
+      }
+      if (typeof (res as any).flush === "function") {
+        (res as any).flush();
+      }
+      const sock = (res as any).socket;
+      if (sock && typeof sock.flush === "function") {
+        sock.flush();
+      }
+    } else {
+      clearInterval(keepaliveInterval);
     }
-  }, 30_000);
+  }, 10_000);
 
   req.on("close", async () => {
     console.log('[SSE] Client disconnected:', userId);
-    clearInterval(pingInterval);
+    clearInterval(keepaliveInterval);
     removeClient(userId, res);
     sendToUsers(allUserIds, "user_offline", { userId });
     try {
@@ -279,8 +307,10 @@ router.post(
       $inc: Object.fromEntries(others.map((uid) => [`unreadCounts.${uid}`, 1])),
     });
 
+    const allParticipantIds = (conv.participants as any[]).map((p: any) => String(p));
+
     sendToUsers(
-      (conv.participants as any[]).map((p: any) => String(p)),
+      allParticipantIds,
       "new_message",
       { conversationId: id, message }
     );

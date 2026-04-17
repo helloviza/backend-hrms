@@ -19,17 +19,34 @@ export function removeClient(userId: string, res: Response): void {
 }
 
 export function sendToUser(userId: string, event: string, data: unknown): void {
-  const userClients = clients.get(userId);
-  console.log('[SSE] Sending to:', userId, 'event:', event, 'clients:', userClients?.length);
-  if (!userClients) return;
+  const conns = clients.get(userId);
+  console.log('[SSE] Sending to:', userId, 'event:', event, 'clients:', conns?.length);
+  if (!conns?.length) return;
+
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  userClients.forEach((res) => {
+  const alive: Response[] = [];
+
+  for (const res of conns) {
     try {
+      if (res.writableEnded || res.destroyed) {
+        // Stale connection — skip and don't keep
+        continue;
+      }
       res.write(payload);
+      alive.push(res);
     } catch {
-      // client already disconnected — will be cleaned up on 'close'
+      // Write failed — connection is dead, don't add to alive list
     }
-  });
+  }
+
+  // Prune Map to only living connections
+  if (alive.length !== conns.length) {
+    if (alive.length === 0) {
+      clients.delete(userId);
+    } else {
+      clients.set(userId, alive);
+    }
+  }
 }
 
 export function sendToUsers(userIds: string[], event: string, data: unknown): void {
@@ -42,4 +59,8 @@ export function getOnlineUsers(): string[] {
 
 export function isOnline(userId: string): boolean {
   return clients.has(userId);
+}
+
+export function getClientCount(userId: string): number {
+  return clients.get(userId)?.length ?? 0;
 }
