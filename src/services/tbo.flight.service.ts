@@ -150,9 +150,6 @@ async function post(path: string, body: object, _retried = false, base = FLIGHT_
       signal: controller.signal,
     });
     const rawText = await res.text();
-    if (method === "Ticket") {
-
-    }
     if (rawText.startsWith("<") || rawText.startsWith("<?")) {
       throw new Error(`TBO returned XML instead of JSON (likely malformed request): ${rawText.slice(0, 300)}`);
     }
@@ -161,10 +158,6 @@ async function post(path: string, body: object, _retried = false, base = FLIGHT_
       json = JSON.parse(rawText);
     } catch {
       throw new Error(`TBO returned non-JSON response (HTTP ${res.status}): ${rawText.slice(0, 300)}`);
-    }
-    if (method === "Ticket") {
-      const resp = (json as any)?.Response;
-
     }
     const durationMs = Date.now() - start;
 
@@ -199,6 +192,9 @@ export async function searchFlights(params: {
   JourneyType?: 1 | 2 | 3 | 4 | 5;
   cabinClass?: number;
   Sources?: string | null;
+  SearchType?: number;
+  Pnr?: string;
+  BookingId?: string;
 }) {
   const token = await getTBOToken();
 
@@ -230,7 +226,7 @@ export async function searchFlights(params: {
     });
   }
 
-  const tboRequestBody = {
+  const tboRequestBody: Record<string, unknown> = {
     EndUserIp: endUserIp,
     TokenId: token,
     AdultCount: String(params.adults ?? 1),
@@ -243,6 +239,15 @@ export async function searchFlights(params: {
     Segments: segments,
     Sources: params.Sources ?? null,
   };
+  if (params.SearchType != null) tboRequestBody.SearchType = String(params.SearchType);
+  if (params.Pnr) tboRequestBody.Pnr = params.Pnr;
+  if (params.BookingId) {
+    tboRequestBody.Bookingid = params.BookingId;
+    tboRequestBody.BookingId = params.BookingId;
+  }
+  if (tboRequestBody.SearchType) {
+    console.log('[TBO RAW SEARCH BODY]', JSON.stringify(tboRequestBody, null, 2));
+  }
   return post("/Search", tboRequestBody);
 }
 
@@ -1178,5 +1183,71 @@ export async function getBookingDetailsByPNR(params: {
     PNR: params.PNR,
     FirstName: params.FirstName,
     LastName: params.LastName || "",
+  }, false, FLIGHT_BASE);
+}
+
+export async function reissueSearch(params: {
+  origin: string;
+  destination: string;
+  departDate: string;
+  adults?: number;
+  children?: number;
+  infants?: number;
+  cabinClass?: number;
+  Pnr: string;
+  BookingId: string;
+}): Promise<unknown> {
+  const token = await getTBOToken();
+  const endUserIp = process.env.TBO_EndUserIp || "1.1.1.1";
+  const cabinClass = String(params.cabinClass ?? 2);
+
+  return post("/Search", {
+    EndUserIp: endUserIp,
+    TokenId: token,
+    AdultCount: String(params.adults ?? 1),
+    ChildCount: String(params.children ?? 0),
+    InfantCount: String(params.infants ?? 0),
+    DirectFlight: "false",
+    OneStopFlight: "false",
+    JourneyType: "1",
+    PreferredAirlines: null,
+    Segments: [
+      {
+        Origin: params.origin,
+        Destination: params.destination,
+        FlightCabinClass: cabinClass,
+        PreferredDepartureTime: `${params.departDate}T00:00:00`,
+        PreferredArrivalTime: `${params.departDate}T00:00:00`,
+      },
+    ],
+    Sources: null,
+    SearchType: "1",
+    Pnr: params.Pnr,
+    Bookingid: params.BookingId,
+    BookingId: params.BookingId,
+  }, false, FLIGHT_BASE);
+}
+
+export async function ticketReissue(params: {
+  TraceId: string;
+  ResultIndex: string;
+  Passengers: Array<Record<string, unknown>>;
+  TicketData?: {
+    TourCode?: string;
+    Endorsement?: string;
+    CorporateCode?: string;
+    AgentDealCode?: string;
+  };
+}): Promise<unknown> {
+  const token = await getTBOToken();
+
+  return post("/TicketReIssue", {
+    EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+    TokenId: token,
+    TraceId: params.TraceId,
+    ResultIndex: params.ResultIndex,
+    Passengers: params.Passengers,
+    IsPriceChangeAccepted: true,
+    TicketData: params.TicketData ?? {},
   }, false, FLIGHT_BASE);
 }

@@ -36,6 +36,8 @@ import {
   cancelFlight,
   getPriceRBD,
   isNDCFlight,
+  reissueSearch,
+  ticketReissue,
 } from "../services/tbo.flight.service.js";
 import { consolidateCertificationLogs } from "../services/tbo.log.consolidator.js";
 
@@ -44,6 +46,7 @@ const router = express.Router();
 /* ── Duplicate booking prevention (24-hour window) ─────────────────────── */
 async function checkDuplicateBooking(params: {
   userId: string;
+  workspaceId: any;
   originCode: string;
   destinationCode: string;
   departureDate: string;
@@ -54,6 +57,7 @@ async function checkDuplicateBooking(params: {
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const existing = await SBTBooking.findOne({
     userId: params.userId,
+    workspaceId: params.workspaceId,
     "origin.code": params.originCode,
     "destination.code": params.destinationCode,
     airlineCode: params.airlineCode,
@@ -582,6 +586,7 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
     // frontend filters to GDS (IsLCC=false) client-side
     const resolvedSources = Sources ?? null;
     const tboSearchPayload = { ...rest, JourneyType: jt as 1 | 2 | 4 | 5, Sources: resolvedSources };
+    console.log('[TBO SEARCH PAYLOAD]', JSON.stringify({ SearchType: tboSearchPayload.SearchType, Pnr: tboSearchPayload.Pnr, Bookingid: tboSearchPayload.Bookingid, BookingId: tboSearchPayload.BookingId }, null, 2));
     const result: any = await searchFlights(tboSearchPayload);
 
     // Temporary logging for Advance Search debugging
@@ -836,6 +841,7 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
       const paxNames = bookPassengers.map((p: any) => `${p.FirstName || ""} ${p.LastName || ""}`.trim());
       const dupErr = await checkDuplicateBooking({
         userId,
+        workspaceId: req.workspaceObjectId,
         originCode: req.body?.originCode || "",
         destinationCode: req.body?.destinationCode || "",
         departureDate: req.body?.departureDate || "",
@@ -988,7 +994,7 @@ router.post("/ticket", requireAuth, requireSBT, async (req: any, res: any) => {
 });
 
 // GET /api/sbt/flights/booking/:id
-router.get("/booking/:id", requireAuth, async (req: any, res: any) => {
+router.get("/booking/:id", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     const result = await getBookingDetails({ bookingId: req.params.id });
     res.json(result);
@@ -1072,6 +1078,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
       const paxNames = lccPassengers.map((p: any) => `${p.FirstName || ""} ${p.LastName || ""}`.trim());
       const dupErr = await checkDuplicateBooking({
         userId: lccUserId,
+        workspaceId: req.workspaceObjectId,
         originCode: req.body?.originCode || "",
         destinationCode: req.body?.destinationCode || "",
         departureDate: req.body?.departureDate || "",
@@ -1551,10 +1558,15 @@ router.post("/release", requireAuth, requireSBT, async (req: any, res: any) => {
 // GET /api/sbt/flights/booking/pnr/:pnr?firstName=X&lastName=Y
 router.get("/booking/pnr/:pnr", requireAuth, async (req: any, res: any) => {
   try {
+    const firstName = String(req.query.firstName || "").trim().slice(0, 50);
+    const lastName = String(req.query.lastName || "").trim().slice(0, 50);
+    if (!firstName || !lastName) {
+      return res.status(400).json({ error: "firstName and lastName are required" });
+    }
     const result = await getBookingDetailsByPNR({
       PNR: req.params.pnr,
-      FirstName: req.query.firstName || "",
-      LastName: req.query.lastName || "",
+      FirstName: firstName,
+      LastName: lastName,
     });
     res.json(result);
   } catch (err: any) {
@@ -1565,7 +1577,7 @@ router.get("/booking/pnr/:pnr", requireAuth, async (req: any, res: any) => {
 // ─── Booking persistence routes ──────────────────────────────────────────────
 
 // POST /api/sbt/flights/bookings/save — persist a confirmed booking
-router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
+router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     const rawId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!rawId) return res.status(401).json({ error: "Not authenticated" });
@@ -1599,14 +1611,18 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
       }
     }
 
+    if (!b.pnr || !b.bookingId) {
+      return res.status(400).json({ error: "Missing PNR or BookingId — booking not saved" });
+    }
+
     const doc = await SBTBooking.create({
       userId: bookingUserId,
       customerId: (req.user as any)?.customerId ?? undefined,
       sbtRequestId: b.sbtRequestId || undefined,
       workspaceId: req.workspaceObjectId,
       traceId: b.traceId || "",
-      pnr: b.pnr || `MOCK-${Date.now()}`,
-      bookingId: b.bookingId || `BK-${Date.now()}`,
+      pnr: b.pnr,
+      bookingId: b.bookingId,
       ticketId: b.ticketId ?? "",
       status: b.status ?? "CONFIRMED",
       origin: b.origin,
@@ -1635,7 +1651,18 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
       fareBreakdown: b.fareBreakdown || undefined,
       ticketingStatus: b.ticketingStatus || "NOT_ATTEMPTED",
       bookedAt: new Date(),
-      raw: b.raw,
+      raw: (() => {
+        const r = b.raw as any;
+        if (!r || typeof r !== 'object') return r;
+        const fi = r?.Response?.Response?.FlightItinerary
+          ?? r?.Response?.FlightItinerary
+          ?? {};
+        return {
+          ...r,
+          MiniFareRules: fi.MiniFareRules ?? r?.MiniFareRules ?? [],
+          OnlineReissueAllowed: fi.OnlineReissueAllowed ?? r?.OnlineReissueAllowed,
+        };
+      })(),
       cancelPolicies: (() => {
         const raw = b.raw as any;
         return raw?.Response?.Response?.FlightItinerary?.FareRules
@@ -1775,7 +1802,16 @@ router.get("/bookings", requireSBT, async (req: any, res: any) => {
       bookings = await SBTBooking.find({ userId }).sort({ createdAt: -1 }).lean();
     }
 
-    res.json({ ok: true, bookings });
+    const bookingsWithReissue = bookings.map((booking: any) => {
+      const miniFareRules = (booking.raw as any)?.MiniFareRules || [];
+      const onlineReissueAllowed = miniFareRules.some(
+        (ruleSet: any) => Array.isArray(ruleSet) &&
+          ruleSet.some((r: any) => r.OnlineReissueAllowed === true)
+      );
+      return { ...booking, onlineReissueAllowed };
+    });
+
+    res.json({ ok: true, bookings: bookingsWithReissue });
   } catch (err: any) {
     sbtLogger.error("Bookings list failed", { userId: req.user?.id, error: err.message });
     res.status(500).json({ error: err.message });
@@ -1935,7 +1971,7 @@ router.get("/bookings/:id", requireSBT, async (req: any, res: any) => {
 });
 
 // GET /api/sbt/flights/bookings/:id/cancel-preview — preview cancellation charges
-router.get("/bookings/:id/cancel-preview", requireAuth, async (req: any, res: any) => {
+router.get("/bookings/:id/cancel-preview", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
@@ -2108,6 +2144,417 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     res.json({ ok: true, booking: doc });
   } catch (err: any) {
     sbtLogger.error("Booking cancel failed", { userId: req.user?.id, bookingId: req.params.id, error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Re-Issuance (Reschedule) ────────────────────────────────────────────────
+
+// GET /api/sbt/flights/bookings/:id/reissue-charges — preview reissue charges from stored MiniFareRules
+router.get("/bookings/:id/reissue-charges", requireAuth, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    if (!booking.isLCC) return res.status(400).json({ error: "Reissue is only supported for LCC bookings" });
+
+    const raw = booking.raw as any;
+    const miniFareRules: any[][] =
+      raw?.Response?.Response?.FlightItinerary?.MiniFareRules
+      ?? raw?.Response?.FlightItinerary?.MiniFareRules
+      ?? [];
+
+    const reissueRules = miniFareRules
+      .flat()
+      .filter((r: any) => r?.Type?.toLowerCase()?.includes("reissue") || r?.Type?.toLowerCase()?.includes("date change"));
+
+    return res.json({
+      pnr: booking.pnr,
+      bookingId: booking.bookingId,
+      totalFare: booking.totalFare,
+      currency: booking.currency || "INR",
+      reissueRules,
+      hasRules: reissueRules.length > 0,
+    });
+  } catch (err: any) {
+    sbtLogger.error("Reissue-charges failed", { bookingId: req.params.id, error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sbt/flights/bookings/:id/reissue-search — initiate reissue search for new date
+router.get("/bookings/:id/reissue-search", requireAuth, requireSBT, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    if (!booking.isLCC) return res.status(400).json({ error: "Reissue is only supported for LCC bookings" });
+    if (!["CONFIRMED"].includes(booking.status)) {
+      return res.status(400).json({ error: "Only confirmed bookings can be reissued" });
+    }
+    if (booking.ticketingStatus !== "TICKETED") {
+      return res.status(400).json({ error: "Booking must be ticketed before reissue" });
+    }
+
+    const departDate = (req.query.departDate as string) || "";
+    if (!departDate) return res.status(400).json({ error: "departDate query param is required (YYYY-MM-DD)" });
+
+    // Derive pax counts from stored passengers
+    const passengers = (booking as any).passengers ?? [];
+    let adults = 0; let children = 0; let infants = 0;
+    for (const p of passengers) {
+      const pt = String(p.paxType || "").toUpperCase();
+      if (pt === "ADT" || pt === "1") adults++;
+      else if (pt === "CHD" || pt === "2") children++;
+      else if (pt === "INF" || pt === "3") infants++;
+      else adults++; // default to adult
+    }
+    if (adults === 0) adults = 1;
+
+    const rawData: any = (booking as any).rawResponse || (booking as any).raw || {};
+    const miniFareRules = rawData?.MiniFareRules || rawData?.Results?.MiniFareRules || [];
+    const reissueAllowed = miniFareRules.some((ruleSet: any[]) =>
+      Array.isArray(ruleSet) && ruleSet.some((rule: any) =>
+        rule?.Type === "Reissue" || rule?.OnlineReissueAllowed === true
+      )
+    );
+    const onlineReissueAllowed = rawData?.OnlineReissueAllowed || rawData?.Results?.OnlineReissueAllowed;
+    if (!reissueAllowed && !onlineReissueAllowed) {
+      console.log('[REISSUE] OnlineReissueAllowed not found in raw data');
+    }
+
+    const searchResult = await reissueSearch({
+      origin: booking.origin.code,
+      destination: booking.destination.code,
+      departDate,
+      adults,
+      children,
+      infants,
+      cabinClass: booking.cabin || 2,
+      Pnr: booking.pnr,
+      BookingId: booking.bookingId,
+    });
+
+    return res.json({
+      searchResult,
+      originalBooking: {
+        _id: booking._id,
+        pnr: booking.pnr,
+        bookingId: booking.bookingId,
+        origin: booking.origin,
+        destination: booking.destination,
+        departureTime: booking.departureTime,
+        totalFare: booking.totalFare,
+        currency: booking.currency,
+        cabin: booking.cabin,
+        passengers: booking.passengers,
+      },
+    });
+  } catch (err: any) {
+    sbtLogger.error("Reissue-search failed", { bookingId: req.params.id, error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sbt/flights/bookings/:id/reissue-farequote — farequote for a reissue result
+router.post("/bookings/:id/reissue-farequote", requireAuth, requireSBT, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    if (!booking.isLCC) return res.status(400).json({ error: "Reissue is only supported for LCC bookings" });
+    if (booking.ticketingStatus !== "TICKETED") {
+      return res.status(400).json({ error: "Booking must be ticketed before reissue" });
+    }
+
+    const { ResultIndex, TraceId } = req.body;
+    if (!ResultIndex || !TraceId) {
+      return res.status(400).json({ error: "ResultIndex and TraceId are required" });
+    }
+
+    const fareQuoteResult = await getFareQuote({ TraceId, ResultIndex });
+    return res.json({ fareQuoteResult, originalBooking: { pnr: booking.pnr, bookingId: booking.bookingId } });
+  } catch (err: any) {
+    sbtLogger.error("Reissue-farequote failed", { bookingId: req.params.id, error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sbt/flights/bookings/:id/reissue-preview — original booking info + estimated reissue charges
+router.get("/bookings/:id/reissue-preview", requireAuth, requireSBT, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const raw = booking.raw as any;
+    const miniFareRules: any[][] =
+      raw?.Response?.Response?.FlightItinerary?.MiniFareRules
+      ?? raw?.Response?.FlightItinerary?.MiniFareRules
+      ?? [];
+    const reissueRules = miniFareRules
+      .flat()
+      .filter((r: any) => r?.Type?.toLowerCase()?.includes("reissue") || r?.Type?.toLowerCase()?.includes("date change"));
+
+    const reissueCharges = reissueRules.reduce(
+      (sum: number, r: any) => sum + Number(r?.StructuredFare?.Amount ?? r?.Amount ?? 0),
+      0,
+    );
+
+    return res.json({
+      originalBooking: {
+        pnr: booking.pnr,
+        paidFare: booking.totalFare,
+        paymentMode: (booking as any).paymentMode === "official" ? "WALLET" : "GATEWAY",
+        segments: [{
+          originCode: booking.origin.code,
+          origin: booking.origin.city,
+          destCode: booking.destination.code,
+          destination: booking.destination.city,
+          departureTime: booking.departureTime,
+        }],
+        passengers: booking.passengers,
+      },
+      reissueCharges,
+    });
+  } catch (err: any) {
+    sbtLogger.error("Reissue-preview failed", { bookingId: req.params.id, error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sbt/flights/bookings/:id/reissue-order — create Razorpay order for price difference
+router.post("/bookings/:id/reissue-order", requireAuth, requireSBT, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const { priceDiff } = req.body;
+    if (!priceDiff || Number(priceDiff) <= 0) {
+      return res.status(400).json({ error: "Invalid price difference — must be positive" });
+    }
+
+    const keyId = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!keyId || !keySecret) return res.status(503).json({ error: "Payment gateway not configured" });
+
+    const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+    const orderRes = await fetch("https://api.razorpay.com/v1/orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Basic ${auth}` },
+      body: JSON.stringify({
+        amount: Math.round(Number(priceDiff) * 100),
+        currency: "INR",
+        receipt: `reissue_${req.params.id}_${Date.now()}`,
+      }),
+    });
+    const order = await orderRes.json() as any;
+    if (!orderRes.ok) {
+      return res.status(502).json({ error: order?.error?.description || "Razorpay order creation failed" });
+    }
+    res.json({ ok: true, orderId: order.id, amount: order.amount, currency: order.currency, keyId });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Reissue order creation failed";
+    res.status(500).json({ error: msg });
+  }
+});
+
+// POST /api/sbt/flights/bookings/:id/reissue — execute reissue (TicketReissue)
+router.post("/bookings/:id/reissue", requireAuth, requireSBT, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const workspaceId = (req as any).workspace?._id ?? (req.user as any)?.workspaceId;
+    const doc = await SBTBooking.findOne({ _id: req.params.id, userId });
+    if (!doc) return res.status(404).json({ error: "Booking not found" });
+    if (!doc.isLCC) return res.status(400).json({ error: "Reissue is only supported for LCC bookings" });
+    if (!["CONFIRMED"].includes(doc.status)) {
+      return res.status(400).json({ error: "Only confirmed bookings can be reissued" });
+    }
+    if (doc.ticketingStatus !== "TICKETED") {
+      return res.status(400).json({ error: "Booking must be ticketed before reissue" });
+    }
+
+    const { ResultIndex, TraceId, paymentMode, razorpayPaymentId, razorpayOrderId, razorpaySignature, priceDiff } = req.body;
+    if (!ResultIndex || !TraceId) {
+      return res.status(400).json({ error: "ResultIndex and TraceId are required" });
+    }
+
+    // Use full passenger data from original booking (stored at ticket time)
+    const fullPassengers: any[] = (doc as any).passengers || [];
+    const leadPax = fullPassengers.find((p: any) => p.isLead) || fullPassengers[0];
+    const leadContactNo = leadPax?.contactNo || leadPax?.phone || doc.contactPhone || "";
+    const leadEmail = leadPax?.email || doc.contactEmail || "";
+
+    const tboPassengers = fullPassengers.map((p: any) => {
+      const pt = String(p.paxType || "adult").toLowerCase();
+      const paxTypeNum = pt === "adult" || pt === "1" ? 1 : pt === "child" || pt === "2" ? 2 : pt === "infant" || pt === "3" ? 3 : 1;
+      return {
+        Title: p.title || "Mr",
+        FirstName: p.firstName || "",
+        LastName: p.lastName || "",
+        PaxType: paxTypeNum,
+        IsLeadPax: p.isLead || false,
+        ContactNo: p.contactNo || p.phone || leadContactNo,
+        Email: p.email || leadEmail,
+        DateOfBirth: p.dob || p.dateOfBirth || "",
+        PassportNo: p.passportNo || "",
+        PassportExpiry: p.passportExpiry || "",
+        PassportIssueDate: p.passportIssueDate || "",
+        Nationality: p.nationality || "IN",
+        AddressLine1: p.address || "India",
+        AddressLine2: "",
+        City: p.city || "Delhi",
+        CountryCode: p.countryCode || "IN",
+        CountryName: p.countryName || "India",
+        CellCountryCode: p.cellCountryCode || "+91",
+        Fare: {
+          BaseFare: p.fare?.BaseFare || 0,
+          Tax: p.fare?.Tax || 0,
+          YQTax: p.fare?.YQTax || 0,
+          AdditionalTxnFeeOfrd: p.fare?.AdditionalTxnFeeOfrd || 0,
+          AdditionalTxnFeePub: p.fare?.AdditionalTxnFeePub || 0,
+          OtherCharges: p.fare?.OtherCharges || 0,
+          SupplierReissueCharges: 0,
+        },
+        SSR_Meal: [],
+        SSR_Baggage: [],
+        SSR_MealDynamic: [],
+        SSR_SeatPref: [],
+        SeatDynamic: [],
+      };
+    });
+
+    if (tboPassengers.length === 0) {
+      return res.status(400).json({ error: "No passenger data found for this booking" });
+    }
+
+    const numericPriceDiff = Number(priceDiff ?? 0);
+
+    // ── Payment handling for reissue ──────────────────────────────────
+    if (numericPriceDiff > 0 && paymentMode) {
+      if (paymentMode === "GATEWAY") {
+        if (!razorpayPaymentId || !razorpayOrderId || !razorpaySignature) {
+          return res.status(400).json({ error: "Payment details required for gateway payment" });
+        }
+        const keySecret = process.env.RAZORPAY_KEY_SECRET;
+        if (!keySecret) return res.status(503).json({ error: "Payment gateway not configured" });
+        const { createHmac } = await import("crypto");
+        const expectedSig = createHmac("sha256", keySecret)
+          .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+          .digest("hex");
+        if (expectedSig !== razorpaySignature) {
+          return res.status(400).json({ error: "Payment verification failed — signature mismatch" });
+        }
+      } else if (paymentMode === "WALLET") {
+        const wsId = workspaceId ?? (doc as any).workspaceId;
+        const workspace = await CustomerWorkspace.findById(wsId).lean();
+        const ob = (workspace as any)?.sbtOfficialBooking;
+        if (!ob?.enabled) {
+          return res.status(400).json({ error: "Official booking (wallet) is not enabled for this workspace" });
+        }
+        const monthKey = new Date().toISOString().slice(0, 7);
+        let currentSpend = ob.currentMonthSpend ?? 0;
+        if (ob.lastResetMonth !== monthKey) currentSpend = 0;
+        const monthlyLimit = ob.monthlyLimit ?? 0;
+        if (monthlyLimit > 0 && currentSpend + numericPriceDiff > monthlyLimit) {
+          return res.status(400).json({ error: "This reissue would exceed your monthly travel limit" });
+        }
+        await CustomerWorkspace.findOneAndUpdate(
+          { _id: wsId },
+          { $inc: { "sbtOfficialBooking.currentMonthSpend": numericPriceDiff } },
+          { runValidators: false },
+        );
+      }
+    }
+
+    // Extract TicketData from the original booking's raw TBO response if available
+    const raw = doc.raw as any;
+    const itinerary = raw?.Response?.Response?.FlightItinerary ?? raw?.Response?.FlightItinerary;
+    const ticketData = {
+      TourCode: itinerary?.TourCode || "",
+      Endorsement: itinerary?.Endorsement || "",
+      CorporateCode: itinerary?.CorporateCode || "",
+      AgentDealCode: itinerary?.AgentDealCode || "",
+    };
+
+    const t0 = Date.now();
+    const reissueResult = await ticketReissue({ TraceId, ResultIndex, Passengers: tboPassengers, TicketData: ticketData }) as any;
+    logTBOCall({
+      method: "TicketReissue",
+      traceId: TraceId,
+      request: { TraceId, ResultIndex, BookingId: doc.bookingId, PNR: doc.pnr },
+      response: reissueResult,
+      durationMs: Date.now() - t0,
+    });
+
+    const respStatus = reissueResult?.Response?.ResponseStatus ?? reissueResult?.Response?.Response?.ResponseStatus;
+    if (respStatus !== 1) {
+      const tboErr = reissueResult?.Response?.Error?.ErrorMessage
+        ?? reissueResult?.Response?.Response?.Error?.ErrorMessage
+        ?? "Reissue failed from supplier side";
+      sbtLogger.error("TicketReissue TBO error", { bookingId: doc._id, tboErr });
+      return res.status(400).json({ error: tboErr, tboStatus: respStatus });
+    }
+
+    const inner = reissueResult?.Response?.Response ?? reissueResult?.Response;
+    const newPnr = inner?.PNR ?? inner?.FlightItinerary?.PNR ?? doc.pnr;
+    const newBookingId = String(inner?.BookingId ?? inner?.FlightItinerary?.BookingId ?? "");
+    const newItinerary = inner?.FlightItinerary ?? {};
+
+    // Mark original booking as reissued
+    const originalPNR = doc.pnr;
+    doc.status = "REISSUED" as any;
+    (doc as any).isReissued = true;
+    await doc.save();
+
+    // Create new booking record for the reissued ticket
+    const newBookingData: Record<string, unknown> = {
+      userId: doc.userId,
+      workspaceId: workspaceId ?? (doc as any).workspaceId,
+      traceId: TraceId,
+      pnr: newPnr,
+      bookingId: newBookingId,
+      ticketId: newBookingId,
+      isReturn: false,
+      status: "CONFIRMED",
+      origin: doc.origin,
+      destination: doc.destination,
+      departureTime: newItinerary.Segments?.[0]?.[0]?.Origin?.DepTime ?? doc.departureTime,
+      arrivalTime: newItinerary.Segments?.[0]?.[0]?.Destination?.ArrTime ?? doc.arrivalTime,
+      airlineCode: doc.airlineCode,
+      airlineName: doc.airlineName,
+      flightNumber: doc.flightNumber,
+      cabin: doc.cabin,
+      passengers: doc.passengers,
+      contactEmail: doc.contactEmail,
+      contactPhone: doc.contactPhone,
+      baseFare: Number(inner?.Fare?.BaseFare ?? doc.baseFare),
+      taxes: Number(inner?.Fare?.Tax ?? doc.taxes),
+      extras: 0,
+      totalFare: Number(inner?.Fare?.TotalFare ?? doc.totalFare),
+      currency: doc.currency,
+      isLCC: true,
+      ticketingStatus: "TICKETED",
+      paymentMode: (doc as any).paymentMode || "personal",
+      reissuePaymentMode: paymentMode === "GATEWAY" || paymentMode === "WALLET" ? paymentMode : undefined,
+      reissuedFromBookingId: doc._id,
+      isReissued: false,
+      originalPNR,
+      raw: reissueResult,
+      bookedAt: new Date(),
+    };
+
+    const newBooking = new SBTBooking(newBookingData);
+    await newBooking.save();
+
+    sbtLogger.info("Reissue complete", {
+      originalBookingId: doc._id, originalPNR, newPnr, newBookingId,
+    });
+
+    return res.json({ ok: true, newBooking, originalBookingId: doc._id });
+  } catch (err: any) {
+    sbtLogger.error("Reissue failed", { bookingId: req.params.id, error: err.message });
     res.status(500).json({ error: err.message });
   }
 });

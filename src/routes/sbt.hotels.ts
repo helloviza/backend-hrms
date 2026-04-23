@@ -16,6 +16,7 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { getMarginConfig, applyMargin } from "../utils/margin.js";
 import { getTBOToken } from "../services/tbo.auth.service.js";
+import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES } from "@plumtrips/shared";
 
 // ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
 const MOCK_CITIES = [
@@ -202,13 +203,11 @@ interface HotelIndexEntry extends HotelCodeEntry {
 const hotelNameIndex: HotelIndexEntry[] = [];
 const hotelIndexedCities = new Set<string>();
 
-const HOTEL_INDEX_CITIES = [
-  { code: "130443", country: "IN" }, // New Delhi
-  { code: "144306", country: "IN" }, // Mumbai
-  { code: "111124", country: "IN" }, // Bengaluru
-  { code: "127343", country: "IN" }, // Chennai
-  { code: "145710", country: "IN" }, // Hyderabad
-];
+// Adapter: preserve the local { code, country } shape used by ensureHotelIndexed below.
+const HOTEL_INDEX_CITIES = SHARED_HOTEL_INDEX_CITIES.map((c) => ({
+  code: c.cityId,
+  country: c.countryCode,
+}));
 
 async function ensureHotelIndexed(cityCode: string, countryCode: string): Promise<void> {
   if (hotelIndexedCities.has(cityCode)) return;
@@ -236,6 +235,59 @@ async function resolveCityCode(cityName: string): Promise<string | null> {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Validate PaxRooms against TBO-certified limits.
+ * Returns a user-facing error string if invalid, or null if OK.
+ * Limits:
+ *  - Max 4 rooms per booking
+ *  - Max 4 adults per room
+ *  - Max 3 children per room
+ *  - Children ages (if provided) must be between 2 and 12 inclusive
+ */
+function validatePaxRooms(paxRooms: unknown): string | null {
+  if (!Array.isArray(paxRooms) || paxRooms.length === 0) {
+    return "At least one room is required.";
+  }
+  if (paxRooms.length > 4) {
+    return "Maximum 4 rooms per booking.";
+  }
+  for (let i = 0; i < paxRooms.length; i++) {
+    const r: any = paxRooms[i];
+    const adults = Number(r?.Adults ?? r?.adults ?? 0);
+    const children = Number(r?.Children ?? r?.children ?? 0);
+
+    if (!Number.isFinite(adults) || adults < 1) {
+      return `Room ${i + 1}: at least 1 adult is required.`;
+    }
+    if (adults > 4) {
+      return `Room ${i + 1}: maximum 4 adults per room.`;
+    }
+    if (!Number.isFinite(children) || children < 0) {
+      return `Room ${i + 1}: children count is invalid.`;
+    }
+    if (children > 3) {
+      return `Room ${i + 1}: maximum 3 children per room.`;
+    }
+
+    const ages = r?.ChildrenAges ?? r?.childrenAges;
+    if (ages !== null && ages !== undefined) {
+      if (!Array.isArray(ages)) {
+        return `Room ${i + 1}: children ages must be a list.`;
+      }
+      if (children > 0 && ages.length !== children) {
+        return `Room ${i + 1}: please provide an age for each child.`;
+      }
+      for (const age of ages) {
+        const n = Number(age);
+        if (!Number.isFinite(n) || n < 2 || n > 12) {
+          return `Room ${i + 1}: child age must be between 2 and 12.`;
+        }
+      }
+    }
+  }
+  return null;
+}
 
 async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
   const cached = cityCache.get(countryCode);
@@ -291,7 +343,6 @@ async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
       }
     }
 
-    console.log('[HOTEL-INDEX] Loaded', hotelNameIndex.length, 'hotels for name search');
     sbtLogger.info(`Hotel name index built: ${hotelNameIndex.length} hotels`);
   } catch (e) {
     sbtLogger.warn("Failed to pre-load hotel data", { error: e instanceof Error ? e.message : String(e) });
@@ -485,11 +536,36 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
     // 3. Build PaxRooms
     const PaxRooms = (Rooms || [{ Adults: 1, Children: 0, ChildrenAges: null }]).map(
       (r: any) => ({
-        Adults: r.Adults || r.adults || 1,
-        Children: r.Children || r.children || 0,
+        Adults: r.Adults ?? r.adults ?? 1,
+        Children: r.Children ?? r.children ?? 0,
         ChildrenAges: r.ChildrenAges || r.childrenAges || null,
       })
     );
+
+    const paxError = validatePaxRooms(PaxRooms);
+    if (paxError) {
+      return res.status(400).json({ error: paxError });
+    }
+
+    // Validate and build TBO Filters from request body
+    const ALLOWED_MEAL_TYPES = new Set([
+      "All", "Room_Only", "BreakFast", "Half_Board",
+      "Full_Board", "All_Inclusive_All_Meal",
+    ]);
+    const reqFilters = (req.body as any)?.Filters ?? {};
+    if (reqFilters.MealType && !ALLOWED_MEAL_TYPES.has(reqFilters.MealType)) {
+      return res.status(400).json({ error: "Invalid meal type filter." });
+    }
+    const filtersPayload: Record<string, unknown> = {
+      Refundable: reqFilters.Refundable === true,
+      NoOfRooms: Number.isFinite(Number(reqFilters.NoOfRooms)) ? Number(reqFilters.NoOfRooms) : 0,
+      MealType: typeof reqFilters.MealType === "string" && reqFilters.MealType.length > 0
+        ? reqFilters.MealType
+        : "All",
+    };
+    if (Number.isFinite(Number(reqFilters.StarRating))) {
+      filtersPayload.StarRating = Number(reqFilters.StarRating);
+    }
 
     // 4. Fire parallel search requests (max 5 concurrent)
     const MAX_CONCURRENT = 5;
@@ -507,7 +583,7 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
           PaxRooms,
           ResponseTime: 23,
           IsDetailedResponse: true,
-          Filters: { Refundable: false, NoOfRooms: 0, MealType: "All" },
+          Filters: filtersPayload,
         };
         const t0 = Date.now();
         try {
@@ -647,8 +723,9 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
     // Compare PreBook NetAmount against the search price the user saw
     const netAmount = room0?.NetAmount ?? room0?.TotalFare ?? 0;
     const recommendedSellingRate = room0?.RecommendedSellingRate ?? null;
+    const PRICE_CHANGE_TOLERANCE = 1; // rupees — below this is rounding noise
     const priceChanged = typeof searchPrice === "number" && searchPrice > 0
-      ? netAmount !== searchPrice
+      ? Math.abs(netAmount - searchPrice) > PRICE_CHANGE_TOLERANCE
       : false;
     const priceDiff = priceChanged ? netAmount - searchPrice : 0;
 
@@ -794,6 +871,79 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
     if (!BookingCode) return res.status(400).json({ error: "BookingCode required" });
 
+    // Tracks whether TBO triggered a price change on the Book response (persisted for finance reporting)
+    let priceChangedDuringBook = false;
+    let priceChangeAmount = 0;
+
+    if (typeof GuestNationality !== "string" || GuestNationality.length !== 2) {
+      return res.status(400).json({ error: "Valid guest nationality is required." });
+    }
+
+    const hotelRoomsDetailsRaw: any[] | undefined = req.body.HotelRoomsDetails;
+    if (Array.isArray(hotelRoomsDetailsRaw)) {
+      for (let i = 0; i < hotelRoomsDetailsRaw.length; i++) {
+        const roomGuests: any[] = hotelRoomsDetailsRaw[i]?.Guests ?? hotelRoomsDetailsRaw[i]?.HotelPassenger ?? [];
+        const adultCount = roomGuests.filter((g: any) => Number(g?.PaxType) === 1).length;
+        const childCount = roomGuests.filter((g: any) => Number(g?.PaxType) === 2).length;
+        if (adultCount < 1) {
+          return res.status(400).json({ error: `Room ${i + 1}: at least 1 adult is required.` });
+        }
+        if (adultCount > 4) {
+          return res.status(400).json({ error: `Room ${i + 1}: maximum 4 adults per room.` });
+        }
+        if (childCount > 3) {
+          return res.status(400).json({ error: `Room ${i + 1}: maximum 3 children per room.` });
+        }
+      }
+    }
+
+    // Flatten all guests for cross-room validations
+    const allGuests: any[] = [];
+    for (const room of hotelRoomsDetailsRaw ?? []) {
+      for (const g of (room?.Guests ?? room?.HotelPassenger ?? [])) {
+        allGuests.push(g);
+      }
+    }
+
+    // Duplicate name check
+    const nameSeen = new Set<string>();
+    for (const g of allGuests) {
+      const key = `${String(g.FirstName || "").trim().toLowerCase()}|${String(g.LastName || "").trim().toLowerCase()}`;
+      if (key === "|") continue;
+      if (nameSeen.has(key)) {
+        return res.status(400).json({
+          error: "Each guest must have a unique full name. Two guests share the same first and last name.",
+        });
+      }
+      nameSeen.add(key);
+    }
+
+    // Title validation
+    const VALID_TITLES = new Set(["Mr", "Mrs", "Miss", "Ms", "Mstr"]);
+    for (const g of allGuests) {
+      if (!VALID_TITLES.has(g.Title)) {
+        return res.status(400).json({
+          error: "Invalid title for one or more guests. Allowed: Mr, Mrs, Miss, Ms, Mstr.",
+        });
+      }
+    }
+
+    // Name minimum length and character validation
+    for (const g of allGuests) {
+      const fn = String(g.FirstName || "").trim();
+      const ln = String(g.LastName || "").trim();
+      if (fn.length < 3 || ln.length < 3) {
+        return res.status(400).json({
+          error: "Each guest's first and last name must be at least 3 characters.",
+        });
+      }
+      if (!/^[a-zA-Z\s'-]+$/.test(fn) || !/^[a-zA-Z\s'-]+$/.test(ln)) {
+        return res.status(400).json({
+          error: "Guest names can only contain letters, spaces, hyphens, and apostrophes.",
+        });
+      }
+    }
+
     // Resolve corporate PAN from workspace
     const hotelCustomerId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
     const hotelWorkspace = hotelCustomerId
@@ -804,24 +954,66 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       const hotelCustomer = await Customer.findOne({ _id: (hotelWorkspace as any).customerId }).select("pan").lean();
       hotelCorporatePAN = (hotelCustomer as any)?.pan || "";
     }
-    const hotelIsCorporate = req.body.isCorporate === true && !!hotelCorporatePAN;
+    // Read PreBook validation flags; default false so fields are omitted when not required.
+    const validationFlags = req.body?.ValidationFlags ?? {};
+    const panMandatory = validationFlags.PanMandatory === true;
+    const crpPanMandatory = validationFlags.CrpPANMandatory === true;
+    const passportMandatory = validationFlags.PassportMandatory === true;
+    const hotelIsCorporate =
+      (validationFlags.IsCorporate === true || req.body?.isCorporate === true) &&
+      !!hotelCorporatePAN;
+    const isDomestic = GuestNationality === "IN";
 
-    const mapGuest = (g: any) => ({
-      Title: g.Title || "Mr",
-      FirstName: g.FirstName?.substring(0, 25),
-      LastName: g.LastName?.substring(0, 25),
-      MiddleName: "",
-      Phoneno: g.Phone || "",
-      Email: g.Email || "",
-      PaxType: g.PaxType || 1,
-      LeadPassenger: g.LeadPassenger || false,
-      Age: g.PaxType === 2 ? (g.Age || 8) : 0,
-      PassportNo: g.PassportNo || "",
-      PassportIssueDate: g.PassportIssueDate || "0001-01-01T00:00:00",
-      PassportExpDate: g.PassportExpDate || "0001-01-01T00:00:00",
-      PAN: g.PAN || "",
-      CorporatePAN: g.CorporatePAN || "",
-    });
+    // PAN format check — only when we're going to send PAN (domestic + mandate).
+    if (isDomestic && panMandatory) {
+      for (const room of hotelRoomsDetailsRaw ?? []) {
+        const roomGuests: any[] = room?.Guests ?? room?.HotelPassenger ?? [];
+        for (const g of roomGuests) {
+          if (Number(g?.PaxType) !== 1) continue;
+          const pan = String(g?.PAN || "").trim();
+          if (!pan) {
+            return res.status(400).json({ error: "PAN is required for each adult guest on this booking." });
+          }
+          if (!/^[A-Z]{5}[0-9]{4}[A-Z]$/i.test(pan)) {
+            return res.status(400).json({ error: "Please enter a valid PAN number (format: AAAAA9999A)." });
+          }
+        }
+      }
+    }
+
+    const mapGuest = (g: any) => {
+      const base: Record<string, unknown> = {
+        Title: g.Title || "Mr",
+        FirstName: g.FirstName?.substring(0, 25),
+        LastName: g.LastName?.substring(0, 25),
+        MiddleName: "",
+        Phoneno: g.Phone || "",
+        Email: g.Email || "",
+        PaxType: g.PaxType || 1,
+        LeadPassenger: g.LeadPassenger || false,
+        Age: g.PaxType === 2 ? (g.Age || 8) : 0,
+      };
+
+      // Passport: include only if PreBook explicitly requires it.
+      // TBO baseline: passport is not required for hotel bookings.
+      if (passportMandatory) {
+        base.PassportNo = g.PassportNo || "";
+        base.PassportIssueDate = g.PassportIssueDate || "0001-01-01T00:00:00";
+        base.PassportExpDate = g.PassportExpDate || "0001-01-01T00:00:00";
+      }
+
+      // PAN: domestic only, and only when PreBook requires it.
+      if (isDomestic && panMandatory) {
+        base.PAN = g.PAN || "";
+      }
+
+      // Corporate PAN: domestic only, when PreBook requires it AND booking is tagged corporate.
+      if (isDomestic && crpPanMandatory && hotelIsCorporate) {
+        base.CorporatePAN = g.CorporatePAN || "";
+      }
+
+      return base;
+    };
 
     const HotelRoomsDetails = req.body.HotelRoomsDetails
       ? (req.body.HotelRoomsDetails as any[]).map((room: any) => ({
@@ -841,7 +1033,8 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       RequestedBookingMode: 5,
       NetAmount,
       HotelRoomsDetails,
-      ...(hotelIsCorporate && hotelCorporatePAN ? { IsCorporate: true, CorporatePAN: hotelCorporatePAN } : {}),
+      ...(hotelIsCorporate ? { IsCorporate: true } : {}),
+      ...(hotelIsCorporate && hotelCorporatePAN ? { CorporatePAN: hotelCorporatePAN } : {}),
     };
     if (DepartureCity) {
       tboPayload.DepartureCity = DepartureCity;
@@ -892,7 +1085,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             result = { ...result, LastVoucherDate: detailVoucherDate };
           }
         } catch (detailErr) {
-          console.warn('[HOLD-BOOK] GetBookingDetail for LastVoucherDate failed:', detailErr);
+          console.debug('[HOLD-BOOK] GetBookingDetail for LastVoucherDate failed:', detailErr instanceof Error ? detailErr.message : String(detailErr));
         }
       }
 
@@ -916,6 +1109,8 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         PaymentId,
         isHeld,
         lastVoucherDate,
+        priceChangedDuringBook,
+        priceChangeAmount,
         raw: data,
       });
 
@@ -940,6 +1135,19 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       sbtLogger.info("Hotel booking TBO response stored", {
         BookingId: result?.BookingId, isHeld, userId: req.user?.id,
       });
+    }
+
+    // Defense-in-depth: strip any empty-string or placeholder-date PAN/Passport
+    // keys that may have slipped through mapGuest. Supplier treats "" as present.
+    for (const room of (tboPayload.HotelRoomsDetails as any[]) ?? []) {
+      for (const g of room?.HotelPassenger ?? []) {
+        if (g.PAN === "") delete g.PAN;
+        if (g.CorporatePAN === "") delete g.CorporatePAN;
+        if (g.PassportNo === "") delete g.PassportNo;
+        if (g.PassportIssueDate === "0001-01-01T00:00:00") delete g.PassportIssueDate;
+        if (g.PassportExpDate === "0001-01-01T00:00:00") delete g.PassportExpDate;
+        if (!tboPayload.IsCorporate && "CorporatePAN" in g) delete g.CorporatePAN;
+      }
     }
 
     const t0 = Date.now();
@@ -981,32 +1189,79 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       logTBOCall({ method: "HotelBook", traceId: bookTraceId, request: tboPayload, response: data, durationMs: Date.now() - t0 });
 
 
-      const result = data?.BookResult || data;
+      let result = data?.BookResult || data;
+
+      // IsPriceChanged=true: TBO requires re-send with updated NetAmount (TBO doc §3411)
+      if (result?.IsPriceChanged === true) {
+        const newNetAmount: number | undefined =
+          result?.NetAmount ??
+          result?.HotelResult?.[0]?.Rooms?.[0]?.NetAmount;
+        if (typeof newNetAmount === "number" && newNetAmount > 0) {
+          priceChangedDuringBook = true;
+          priceChangeAmount = newNetAmount - (typeof NetAmount === "number" ? NetAmount : 0);
+          sbtLogger.info("Book IsPriceChanged=true — retrying with new NetAmount", {
+            original: NetAmount, updated: newNetAmount, userId: req.user?.id,
+          });
+          const retryPayload = { ...tboPayload, NetAmount: newNetAmount };
+          try {
+            const retryController = new AbortController();
+            const retryTimer = setTimeout(() => retryController.abort(), 120_000);
+            let retryData: any;
+            try {
+              const retryT0 = Date.now();
+              const retryRes = await fetch(
+                "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
+                  body: JSON.stringify(retryPayload),
+                  signal: retryController.signal,
+                }
+              );
+              retryData = (await retryRes.json()) as any;
+              logTBOCall({ method: "HotelBook-PriceRetry", traceId: `hotel-book-retry-${clientRef}`, request: retryPayload, response: retryData, durationMs: Date.now() - retryT0 });
+            } finally {
+              clearTimeout(retryTimer);
+            }
+            const retryResult = retryData?.BookResult || retryData;
+            if (retryResult?.IsPriceChanged === true) {
+              return res.status(409).json({
+                error: "The room price changed during booking. Please start a fresh search with the updated price.",
+              });
+            }
+            data = retryData;
+            result = retryResult;
+          } catch (retryErr: any) {
+            sbtLogger.warn("Book IsPriceChanged retry failed — proceeding with original result", {
+              error: retryErr?.message, userId: req.user?.id,
+            });
+          }
+        }
+      }
+
       const bookingId = Number(result?.BookingId);
       const status = (result?.HotelBookingStatus || result?.BookingStatus || "").toLowerCase();
 
-      // TBO returns BookingId: 0 and null status when the booking is rejected
+      // Supplier returns BookingId: 0 and null status when the booking is rejected
       // (e.g. expired BookingCode, insufficient inventory, session timeout).
       // Treat this as a hard failure — never surface it as success.
       if (!bookingId && !status) {
-        const tboError =
+        const providerError =
           result?.Error?.ErrorMessage ||
           data?.BookResult?.Error?.ErrorMessage ||
           data?.Error?.ErrorMessage ||
-          "TBO rejected the booking (BookingId: 0)";
-        const tboCode =
+          "Booking rejected (BookingId: 0)";
+        const providerCode =
           result?.Error?.ErrorCode ??
           data?.BookResult?.Error?.ErrorCode ??
           data?.Error?.ErrorCode ??
           null;
-        sbtLogger.error("Hotel booking rejected by TBO — BookingId: 0", {
-          tboError, tboCode, bookingMode, userId: req.user?.id, BookingCode,
+        sbtLogger.error("Hotel booking rejected by supplier — BookingId: 0", {
+          providerError, providerCode, bookingMode, userId: req.user?.id, BookingCode,
         });
         return res.status(502).json({
           ok: false,
-          error: "Hotel booking failed at supplier",
-          tboError,
-          tboCode,
+          error: "Plumtrips could not confirm this reservation. Please try again or contact support.",
           BookingId: 0,
         });
       }
@@ -1047,7 +1302,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         if (verifiedStatus === "failed" || verifiedStatus === "cancelled") {
           return res.status(502).json({
             ok: false,
-            error: `Booking ${verifiedStatus} — ${verified?.FailureReason || "TBO did not confirm the reservation"}`,
+            error: `The reservation could not be confirmed. Please try again or contact Plumtrips support.`,
             HotelBookingStatus: verifiedStatus,
             BookingId: partialBookingId,
           });
@@ -1084,7 +1339,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       ok: false,
       status: "BOOKING_UNCERTAIN",
       clientReferenceId: clientRef,
-      message: `Booking status unknown. Please check TBO portal with reference: ${clientRef}`,
+      message: `Booking status unknown. Please contact Plumtrips support with reference: ${clientRef}`,
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Hotel booking failed";
@@ -1097,7 +1352,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
 router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
   try {
-    const booking = await SBTHotelBooking.findOne({ bookingId: req.params.bookingId });
+    const booking = await SBTHotelBooking.findOne({ bookingId: req.params.bookingId, userId: req.user?._id ?? req.user?.id }).lean();
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
     if (booking.tboVoucherData) {
@@ -1179,7 +1434,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
        tboErrorMsg.toLowerCase().includes("credit"));
 
     if (isBalanceError) {
-      console.log('[GEN-VOUCHER] TBO agency balance insufficient', { tboErrorCode, tboErrorMsg });
+      console.debug('[GEN-VOUCHER] TBO agency balance insufficient', { tboErrorCode, tboErrorMsg });
       return res.status(402).json({
         requiresPayment: true,
         amount: booking.netAmount ?? booking.totalFare ?? 0,
@@ -1203,7 +1458,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
 
     if (!success) {
       const errMsg = tboErrorMsg || "Voucher generation failed at supplier";
-      console.log('[GEN-VOUCHER] failed — TBO error:', errMsg, '| ResponseStatus:', gvr?.ResponseStatus);
+      console.debug('[GEN-VOUCHER] failed — TBO error:', errMsg, '| ResponseStatus:', gvr?.ResponseStatus);
       return res.status(502).json({ error: errMsg, voucherData: voucherRes });
     }
 
@@ -1217,7 +1472,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
 
 // ─── 7. POST /bookings/save ──────────────────────────────────────────────────
 
-router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
+router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
@@ -1274,6 +1529,11 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
       lastVoucherDate: b.lastVoucherDate ? new Date(b.lastVoucherDate) : undefined,
       paymentMode: b.paymentMode === "official" ? "official" : "personal",
       raw: b.raw ?? null,
+      inclusion: typeof b.inclusion === "string" ? b.inclusion : "",
+      rateConditions: Array.isArray(b.rateConditions) ? b.rateConditions.map(String) : [],
+      amenities: Array.isArray(b.amenities) ? b.amenities.map(String) : [],
+      priceChangedDuringBook: b.priceChangedDuringBook === true,
+      priceChangeAmount: typeof b.priceChangeAmount === "number" ? b.priceChangeAmount : 0,
       bookedAt: new Date(),
     });
 
@@ -1282,7 +1542,7 @@ router.post("/bookings/save", requireAuth, async (req: any, res: any) => {
       try {
         await CustomerWorkspace.findOneAndUpdate(
           { _id: req.workspaceObjectId },
-          { $inc: { 'sbtOfficialBooking.currentMonthSpend': b.totalFare ?? 0 } },
+          { $inc: { 'sbtOfficialBooking.currentMonthSpend': b.netAmount ?? b.totalFare ?? 0 } },
           { runValidators: false },
         );
       } catch (spendErr) {
@@ -1353,8 +1613,7 @@ const getHotelBookingsHandler = async (req: any, res: any) => {
 
     let bookings;
     if (isWL) {
-      const customerId = (req as any).workspace?.customerId || req.user?.customerId;
-      bookings = await SBTHotelBooking.find({ customerId }).sort({ createdAt: -1 }).lean();
+      bookings = await SBTHotelBooking.find({ workspaceId: req.workspaceObjectId }).sort({ createdAt: -1 }).lean();
     } else {
       bookings = await SBTHotelBooking.find({ userId: rawId }).sort({ createdAt: -1 }).lean();
     }
@@ -1536,7 +1795,7 @@ router.post("/bookings/refund-orphaned", requireAdmin, async (req: any, res: any
         if (refundData?.id) {
           await SBTHotelBooking.findByIdAndUpdate(doc._id, {
             status: "FAILED",
-            failureReason: `TBO booking failed. Razorpay refund initiated: ${refundData.id}`,
+            failureReason: `Booking failed. Razorpay refund initiated: ${refundData.id}`,
           });
           refunded.push({
             hotelName: doc.hotelName,
@@ -1549,7 +1808,7 @@ router.post("/bookings/refund-orphaned", requireAdmin, async (req: any, res: any
           sbtLogger.warn("Refund failed", { hotelName: doc.hotelName, response: refundData });
           await SBTHotelBooking.findByIdAndUpdate(doc._id, {
             status: "FAILED",
-            failureReason: `TBO booking failed. Refund attempt failed: ${refundData?.error?.description || JSON.stringify(refundData)}`,
+            failureReason: `Booking failed. Refund attempt failed: ${refundData?.error?.description || JSON.stringify(refundData)}`,
           });
         }
       } catch (e) {
@@ -1577,13 +1836,13 @@ router.post("/bookings/:id/mark-failed", requireAdmin, async (req: any, res: any
     if (!doc) return res.status(404).json({ error: "Booking not found" });
 
     if (doc.bookingId && doc.bookingId.length > 0) {
-      return res.status(400).json({ error: "Booking has a valid TBO BookingId — cannot mark as failed" });
+      return res.status(400).json({ error: "Booking has a confirmed BookingId — cannot mark as failed" });
     }
     if (doc.status !== "PENDING") {
       return res.status(400).json({ error: `Booking status is ${doc.status}, not PENDING` });
     }
 
-    const reason = req.body.reason || "TBO booking failed after payment. No BookingId received.";
+    const reason = req.body.reason || "Booking failed after payment. No BookingId received.";
     await SBTHotelBooking.findByIdAndUpdate(doc._id, {
       status: "FAILED",
       failureReason: reason,
@@ -1700,7 +1959,6 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     );
 
     const changeRawText = await changeRes.text();
-    console.log("[CANCEL] SendChangeRequest response:", changeRawText.substring(0, 500));
 
     let changeData: any;
     try {
@@ -1752,7 +2010,7 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
         cancellationCharge = statusResult?.CancellationCharge || 0;
         refundedAmount = statusResult?.RefundedAmount || 0;
 
-        console.log("[CANCEL] Status poll:", { attempt: i + 1, cancelStatus, cancellationCharge, refundedAmount });
+        console.debug("[CANCEL] Poll status:", { attempt: i + 1, cancelStatus });
 
         if (cancelStatus === 3 || cancelStatus === 4) break;
       }
@@ -1809,7 +2067,7 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
       return res.json({ ok: true, cancellationCharge, refundedAmount, changeRequestId });
     } else if (cancelStatus === 4) {
       // Rejected by TBO
-      return res.status(409).json({ error: "TBO rejected the cancellation request", changeRequestId });
+      return res.status(409).json({ error: "The cancellation request could not be processed. Please contact Plumtrips support.", changeRequestId });
     } else {
       // Still pending after polling — mark CANCEL_PENDING for ops review
       doc.status = "CANCEL_PENDING";
@@ -1832,7 +2090,7 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
 
 // ─── 10a. GET /images?hotelCodes=xxx,yyy ────────────────────────────────────
 
-router.get("/images", async (req: any, res: any) => {
+router.get("/images", requireAuth, async (req: any, res: any) => {
   try {
     const hotelCodes = (req.query.hotelCodes as string) || "";
     if (!hotelCodes) return res.status(400).json({ error: "hotelCodes required" });
@@ -1900,7 +2158,7 @@ router.get("/images", async (req: any, res: any) => {
 
 // ─── 10b. GET /details?hotelCodes=xxx,yyy ────────────────────────────────────
 
-router.get("/details", async (req: any, res: any) => {
+router.get("/details", requireAuth, async (req: any, res: any) => {
   try {
     if (process.env.TBO_ENV === "mock") {
       return res.json({
@@ -1986,7 +2244,7 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
     const paxRooms: Array<{ Adults: number; Children: number; ChildrenAges: number[] | null }> =
       Array.isArray(roomsArray) && roomsArray.length > 0
         ? roomsArray.map((r: any) => ({
-            Adults: r.Adults || r.adults || 1,
+            Adults: r.Adults ?? r.adults ?? 1,
             Children: r.Children ?? r.children ?? 0,
             ChildrenAges: r.ChildrenAges ?? r.childrenAges ?? null,
           }))
@@ -1995,6 +2253,11 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
             Children: children,
             ChildrenAges: childrenAges,
           }));
+
+    const paxError = validatePaxRooms(paxRooms);
+    if (paxError) {
+      return res.status(400).json({ error: paxError });
+    }
 
     const tboPayload = {
       CheckIn: checkIn,

@@ -14,7 +14,7 @@ export interface ISBTBooking extends Document {
   returnPnr?: string;
   returnBookingId?: number;
   returnTraceId?: string;
-  status: "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED";
+  status: "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" | "REISSUED";
   origin: { code: string; city: string };
   destination: { code: string; city: string };
   departureTime: string;
@@ -29,6 +29,28 @@ export interface ISBTBooking extends Document {
     lastName: string;
     paxType: string;
     isLead: boolean;
+    contactNo?: string;
+    phone?: string;
+    email?: string;
+    dob?: string;
+    dateOfBirth?: string;
+    passportNo?: string;
+    passportExpiry?: string;
+    passportIssueDate?: string;
+    nationality?: string;
+    address?: string;
+    city?: string;
+    countryCode?: string;
+    countryName?: string;
+    cellCountryCode?: string;
+    fare?: {
+      BaseFare?: number;
+      Tax?: number;
+      YQTax?: number;
+      OtherCharges?: number;
+      AdditionalTxnFeeOfrd?: number;
+      AdditionalTxnFeePub?: number;
+    };
   }[];
   contactEmail: string;
   contactPhone: string;
@@ -58,6 +80,7 @@ export interface ISBTBooking extends Document {
   refundStatus?: string;
   refundProcessedAt?: Date;
   paymentMode?: "official" | "personal";
+  reissuePaymentMode?: "GATEWAY" | "WALLET";
   netAmount?: number;
   displayAmount?: number;
   marginPercent?: number;
@@ -70,6 +93,11 @@ export interface ISBTBooking extends Document {
   cancellationCharge?: number;
   refundedAmount?: number;
   changeRequestId?: string;
+  reissuedFromBookingId?: Schema.Types.ObjectId;
+  isReissued?: boolean;
+  originalPNR?: string;
+  onlineReissueAllowed?: boolean;
+  sbtRequestId?: Schema.Types.ObjectId;
   bookedAt: Date;
   cancelledAt?: Date;
   createdAt: Date;
@@ -91,7 +119,7 @@ const SBTBookingSchema = new Schema(
     returnTraceId: { type: String, default: "" },
     status: {
       type: String,
-      enum: ["CONFIRMED", "CANCELLED", "PENDING", "FAILED"],
+      enum: ["CONFIRMED", "CANCELLED", "PENDING", "FAILED", "REISSUED"],
       default: "CONFIRMED",
     },
     origin: {
@@ -115,6 +143,28 @@ const SBTBookingSchema = new Schema(
         lastName: String,
         paxType: String,
         isLead: Boolean,
+        contactNo: String,
+        phone: String,
+        email: String,
+        dob: String,
+        dateOfBirth: String,
+        passportNo: String,
+        passportExpiry: String,
+        passportIssueDate: String,
+        nationality: String,
+        address: String,
+        city: String,
+        countryCode: String,
+        countryName: String,
+        cellCountryCode: String,
+        fare: {
+          BaseFare: Number,
+          Tax: Number,
+          YQTax: Number,
+          OtherCharges: Number,
+          AdditionalTxnFeeOfrd: Number,
+          AdditionalTxnFeePub: Number,
+        },
       },
     ],
     contactEmail: { type: String, default: "" },
@@ -147,6 +197,7 @@ const SBTBookingSchema = new Schema(
     refundStatus: { type: String },
     refundProcessedAt: { type: Date },
     paymentMode: { type: String, enum: ["official", "personal"], default: "personal" },
+    reissuePaymentMode: { type: String, enum: ["GATEWAY", "WALLET"] },
     netAmount: { type: Number, default: 0 },
     displayAmount: { type: Number, default: 0 },
     marginPercent: { type: Number, default: 0 },
@@ -163,6 +214,10 @@ const SBTBookingSchema = new Schema(
     cancellationCharge: { type: Number },
     refundedAmount: { type: Number },
     changeRequestId: { type: String },
+    reissuedFromBookingId: { type: Schema.Types.ObjectId, ref: "SBTBooking" },
+    isReissued: { type: Boolean, default: false },
+    originalPNR: { type: String, default: "" },
+    onlineReissueAllowed: { type: Boolean },
     sbtRequestId: { type: Schema.Types.ObjectId, ref: "SBTRequest", default: null, index: true },
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
@@ -213,7 +268,7 @@ SBTBookingSchema.post("save", async function (doc: any) {
       { upsert: true, new: true },
     );
   } catch (e) {
-    console.error("[TravelBooking sync] SBTBooking hook failed:", e);
+    console.warn("TravelBooking sync failed:", (e as any)?.message);
   }
 });
 
