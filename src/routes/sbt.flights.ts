@@ -34,12 +34,14 @@ import {
   getSSR,
   releasePNR,
   cancelFlight,
+  getCancellationCharges,
   getPriceRBD,
   isNDCFlight,
   reissueSearch,
   ticketReissue,
 } from "../services/tbo.flight.service.js";
 import { consolidateCertificationLogs } from "../services/tbo.log.consolidator.js";
+import { getCompanySettings } from "../utils/companySettings.js";
 
 const router = express.Router();
 
@@ -571,12 +573,12 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
       const result: any = await searchMultiCity({ segments, adults: rest.adults, children: rest.children, infants: rest.infants });
       const mcStatus = result?.Response?.ResponseStatus ?? result?.Response?.Status;
       if (mcStatus !== undefined && mcStatus !== 1) {
-        const errMsg = result?.Response?.Error?.ErrorMessage || "Unknown TBO error";
+        const errMsg = result?.Response?.Error?.ErrorMessage || "Unknown error";
         const errCode = result?.Response?.Error?.ErrorCode ?? "unknown";
+        sbtLogger.error("TBO multi-city search failed", { errCode, errMsg });
         return res.status(502).json({
-          error: `TBO Error ${errCode}: ${errMsg}`,
+          error: "Flight search failed. Please try different dates or contact Plumtrips support.",
           tboStatus: mcStatus,
-          tboResponse: result?.Response,
         });
       }
       return res.json(result);
@@ -612,12 +614,16 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
         sbtLogger.warn("TBO search returned results with non-success status", { tboStatus });
         return res.json(result);
       }
-      const errMsg = result?.Response?.Error?.ErrorMessage || "Unknown TBO error";
+      const errMsg = result?.Response?.Error?.ErrorMessage || "Unknown error";
       const errCode = result?.Response?.Error?.ErrorCode ?? "unknown";
+      const isReissueSearch = tboSearchPayload.SearchType != null;
+      sbtLogger.error("TBO search failed", { errCode, errMsg, isReissueSearch });
+      const userMsg = isReissueSearch
+        ? "Unable to find alternative flights for this booking. Please try different dates or contact Plumtrips support."
+        : "Flight search failed. Please try different dates or contact Plumtrips support.";
       return res.status(502).json({
-        error: `TBO Error ${errCode}: ${errMsg}`,
+        error: userMsg,
         tboStatus,
-        tboResponse: result?.Response,
       });
     }
 
@@ -1601,6 +1607,10 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
         existing.pnr = b.pnr || existing.pnr;
         existing.bookingId = b.bookingId || existing.bookingId;
         existing.ticketId = b.ticketId || existing.ticketId;
+        if (b.ticketId) {
+          const tid = Number(b.ticketId);
+          if (tid > 0) (existing as any).ticketIds = [tid];
+        }
         (existing as any).traceId = b.traceId || (existing as any).traceId;
         existing.passengers = b.passengers?.length ? b.passengers : existing.passengers;
         existing.contactEmail = b.contactEmail || existing.contactEmail;
@@ -1624,6 +1634,7 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       pnr: b.pnr,
       bookingId: b.bookingId,
       ticketId: b.ticketId ?? "",
+      ticketIds: b.ticketId ? [Number(b.ticketId)].filter((n: number) => n > 0) : [],
       status: b.status ?? "CONFIRMED",
       origin: b.origin,
       destination: b.destination,
@@ -1808,7 +1819,10 @@ router.get("/bookings", requireSBT, async (req: any, res: any) => {
         (ruleSet: any) => Array.isArray(ruleSet) &&
           ruleSet.some((r: any) => r.OnlineReissueAllowed === true)
       );
-      return { ...booking, onlineReissueAllowed };
+      const hasOpenRescheduleRequest = booking.changeRequests?.some(
+        (cr: any) => cr.requestType === "reissue" && cr.status === "submitted"
+      ) ?? false;
+      return { ...booking, onlineReissueAllowed, hasOpenRescheduleRequest };
     });
 
     res.json({ ok: true, bookings: bookingsWithReissue });
@@ -2054,68 +2068,155 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     if (!doc) return res.status(404).json({ error: "Booking not found" });
     if (doc.status === "CANCELLED") return res.status(400).json({ error: "Already cancelled" });
 
-    // Call TBO CancelPNR if the booking has a real PNR and was ticketed
+    const totalFare = doc.totalFare || 0;
+
+    // Build TicketId array — prefer the typed numeric array, fall back to string field
+    const ticketIdArray: number[] =
+      (doc as any).ticketIds?.length > 0
+        ? ((doc as any).ticketIds as number[]).filter((n: number) => n > 0)
+        : String(doc.ticketId || "")
+            .split(",")
+            .map((t: string) => Number(t.trim()))
+            .filter((n: number) => Number.isFinite(n) && n > 0);
+
+    // Call TBO SendChangeRequest if the booking has a real PNR and was ticketed
     if (doc.pnr && doc.bookingId && doc.ticketingStatus === "TICKETED") {
+      // TicketId is only required for partial cancellations (RequestType !== 1).
+      // Full cancellation (RequestType=1, the default here) does not need it.
+      const cancelRequestType = req.body?.requestType ?? 1;
+      if (cancelRequestType !== 1 && ticketIdArray.length === 0) {
+        return res.status(400).json({
+          error: "This booking cannot be cancelled online — ticket reference not found. Please contact Plumtrips support.",
+        });
+      }
+
+      // For GDS/NDC flights, fetch live cancellation charges from supplier first
+      let tboRefundAmount: number | undefined;
+      let tboCancellationCharge: number | undefined;
+      if (!doc.isLCC) {
+        try {
+          const chargesResult = await getCancellationCharges({
+            BookingId: Number(doc.bookingId),
+          });
+          if (chargesResult.ok) {
+            tboRefundAmount = chargesResult.refundAmount;
+            tboCancellationCharge = chargesResult.cancellationCharge;
+          } else {
+            sbtLogger.warn("[CancelFlight] GetCancellationCharges failed — using local estimate", {
+              bookingId: doc._id, error: chargesResult.error,
+            });
+          }
+        } catch (chargesErr: any) {
+          sbtLogger.warn("[CancelFlight] GetCancellationCharges threw — using local estimate", {
+            bookingId: doc._id, error: chargesErr?.message,
+          });
+        }
+      }
+
       const t0 = Date.now();
       let cancelResult: any;
       try {
         cancelResult = await cancelFlight({
-          BookingId: Number(doc.bookingId) || doc.bookingId,
-          PNR: doc.pnr,
+          BookingId: Number(doc.bookingId),
+          TicketId: ticketIdArray,
+          RequestType: 1,
+          CancellationType: 3,
+          Remarks: req.body?.remarks || "Cancelled by passenger",
         });
         logTBOCall({
-          method: "CancelPNR",
+          method: "SendChangeRequest",
           traceId: (doc as any).traceId || doc.bookingId,
-          request: { BookingId: doc.bookingId, PNR: doc.pnr },
+          request: { BookingId: doc.bookingId, TicketId: ticketIdArray },
           response: cancelResult,
           durationMs: Date.now() - t0,
         });
       } catch (tboErr: any) {
-        sbtLogger.error("[CancelFlight] TBO CancelPNR threw", { bookingId: doc._id, error: tboErr?.message });
-        return res.status(502).json({ error: `TBO cancellation failed: ${tboErr?.message || "Unknown error"}` });
+        sbtLogger.error("[CancelFlight] SendChangeRequest threw", { bookingId: doc._id, error: tboErr?.message });
+        return res.status(502).json({
+          error: "Cancellation could not be processed. Please try again or contact Plumtrips support.",
+        });
       }
 
       const cancelStatus = cancelResult?.Response?.ResponseStatus;
       const tboError = cancelResult?.Response?.Error?.ErrorMessage;
 
       if (cancelStatus !== 1) {
-        sbtLogger.error("[CancelFlight] TBO returned non-success", { bookingId: doc._id, cancelStatus, tboError });
-        return res.status(409).json({ error: tboError || "TBO did not confirm cancellation" });
+        sbtLogger.error("[CancelFlight] Supplier returned non-success", { bookingId: doc._id, cancelStatus, tboError });
+        return res.status(409).json({
+          error: tboError || "Cancellation could not be processed. Please try again or contact Plumtrips support.",
+        });
       }
 
-      sbtLogger.info("[CancelFlight] TBO CancelPNR success", { bookingId: doc._id, pnr: doc.pnr });
+      const crInfo = cancelResult?.Response?.TicketCRInfo?.[0];
+      if (crInfo?.ChangeRequestId) {
+        (doc as any).changeRequestId = String(crInfo.ChangeRequestId);
+      }
+      if (typeof crInfo?.CancellationCharge === "number") tboCancellationCharge = crInfo.CancellationCharge;
+      if (typeof crInfo?.RefundedAmount === "number") tboRefundAmount = crInfo.RefundedAmount;
+
+      sbtLogger.info("[CancelFlight] SendChangeRequest success", {
+        bookingId: doc._id, pnr: doc.pnr, changeRequestId: crInfo?.ChangeRequestId,
+      });
+
+      // Resolve final charge/refund (supplier values take precedence over local estimate)
+      const finalCharge = tboCancellationCharge ?? (() => {
+        const raw = doc.raw as any;
+        const fareRules: any[] =
+          (doc as any).cancelPolicies?.length
+            ? (doc as any).cancelPolicies
+            : raw?.Response?.Response?.FlightItinerary?.FareRules
+              ?? raw?.Response?.FlightItinerary?.FareRules
+              ?? [];
+        const fareRuleText = fareRules.map((r: any) => r.FareRuleDetail || "").join(" ").toUpperCase();
+        const nonRefundable =
+          fareRuleText.includes("NON REFUNDABLE") ||
+          fareRuleText.includes("NON-REFUNDABLE") ||
+          fareRuleText.includes("NO REFUND") ||
+          (doc as any).isRefundable === false;
+        return nonRefundable
+          ? totalFare
+          : doc.isLCC
+            ? Math.min(3000, totalFare)
+            : Math.round(totalFare * 0.1);
+      })();
+      const finalRefund = tboRefundAmount ?? Math.max(0, totalFare - finalCharge);
+
+      doc.status = "CANCELLED";
+      doc.cancelledAt = new Date();
+      (doc as any).cancellationCharge = finalCharge;
+      (doc as any).refundedAmount = finalRefund;
+      await doc.save();
     } else {
-      sbtLogger.info("[CancelFlight] Skipping TBO call — not ticketed or missing PNR", {
+      sbtLogger.info("[CancelFlight] Skipping supplier call — not ticketed or missing PNR", {
         bookingId: doc._id, ticketingStatus: doc.ticketingStatus, pnr: doc.pnr,
       });
+
+      // Compute cancellation charge locally for non-ticketed bookings
+      const raw = doc.raw as any;
+      const fareRules: any[] =
+        (doc as any).cancelPolicies?.length
+          ? (doc as any).cancelPolicies
+          : raw?.Response?.Response?.FlightItinerary?.FareRules
+            ?? raw?.Response?.FlightItinerary?.FareRules
+            ?? [];
+      const fareRuleText = fareRules.map((r: any) => r.FareRuleDetail || "").join(" ").toUpperCase();
+      const nonRefundable =
+        fareRuleText.includes("NON REFUNDABLE") ||
+        fareRuleText.includes("NON-REFUNDABLE") ||
+        fareRuleText.includes("NO REFUND") ||
+        (doc as any).isRefundable === false;
+      const charge = nonRefundable
+        ? totalFare
+        : doc.isLCC
+          ? Math.min(3000, totalFare)
+          : Math.round(totalFare * 0.1);
+
+      doc.status = "CANCELLED";
+      doc.cancelledAt = new Date();
+      (doc as any).cancellationCharge = charge;
+      (doc as any).refundedAmount = Math.max(0, totalFare - charge);
+      await doc.save();
     }
-
-    // Compute cancellation charge to store (mirrors cancel-preview logic)
-    const totalFare = doc.totalFare || 0;
-    const raw = doc.raw as any;
-    const fareRules: any[] =
-      (doc as any).cancelPolicies?.length
-        ? (doc as any).cancelPolicies
-        : raw?.Response?.Response?.FlightItinerary?.FareRules
-          ?? raw?.Response?.FlightItinerary?.FareRules
-          ?? [];
-    const fareRuleText = fareRules.map((r: any) => r.FareRuleDetail || "").join(" ").toUpperCase();
-    const nonRefundable =
-      fareRuleText.includes("NON REFUNDABLE") ||
-      fareRuleText.includes("NON-REFUNDABLE") ||
-      fareRuleText.includes("NO REFUND") ||
-      (doc as any).isRefundable === false;
-    const charge = nonRefundable
-      ? totalFare
-      : doc.isLCC
-        ? Math.min(3000, totalFare)
-        : Math.round(totalFare * 0.1);
-
-    doc.status = "CANCELLED";
-    doc.cancelledAt = new Date();
-    (doc as any).cancellationCharge = charge;
-    (doc as any).refundedAmount = Math.max(0, totalFare - charge);
-    await doc.save();
 
     // Decrement spend if official booking in same calendar month
     if ((doc as any).paymentMode === "official" && (doc as any).workspaceId) {
@@ -2223,6 +2324,27 @@ router.get("/bookings/:id/reissue-search", requireAuth, requireSBT, async (req: 
       console.log('[REISSUE] OnlineReissueAllowed not found in raw data');
     }
 
+    if (!booking.pnr) {
+      return res.status(400).json({ error: "PNR not available for this booking. Please contact Plumtrips support." });
+    }
+    const hasPendingReschedule = (booking as any).changeRequests?.some(
+      (cr: any) => cr.requestType === "reissue" && cr.status === "submitted"
+    );
+    if (hasPendingReschedule) {
+      const settings = await getCompanySettings();
+      return res.status(200).json({
+        reissueUnavailable: true,
+        pendingReschedule: true,
+        supportEmail: settings.supportEmail,
+        message: "A reschedule request is already pending for this booking. Our team will contact you shortly.",
+      });
+    }
+
+    const numericBookingId = Number(booking.bookingId);
+    if (!Number.isFinite(numericBookingId) || numericBookingId <= 0) {
+      return res.status(400).json({ error: "Booking reference not found. Please contact Plumtrips support." });
+    }
+
     const searchResult = await reissueSearch({
       origin: booking.origin.code,
       destination: booking.destination.code,
@@ -2234,6 +2356,33 @@ router.get("/bookings/:id/reissue-search", requireAuth, requireSBT, async (req: 
       Pnr: booking.pnr,
       BookingId: booking.bookingId,
     });
+
+    const tboResponse = (searchResult as any)?.Response ?? searchResult;
+    const tboStatus = (tboResponse as any)?.ResponseStatus;
+    const tboErrorCode = (tboResponse as any)?.Error?.ErrorCode ?? 0;
+    const tboErrorMsg = (tboResponse as any)?.Error?.ErrorMessage ?? "";
+    const hasResults = Array.isArray((tboResponse as any)?.Results) && (tboResponse as any).Results.length > 0;
+
+    if (tboStatus !== 1 || tboErrorCode !== 0 || !hasResults) {
+      sbtLogger.warn("Reissue search returned no results", {
+        bookingId: booking._id,
+        pnr: booking.pnr,
+        tboStatus,
+        tboErrorCode,
+        tboErrorMsg,
+      });
+      const csettings = await getCompanySettings();
+      return res.status(200).json({
+        searchResult: null,
+        originalBooking: {
+          pnr: booking.pnr,
+          route: `${booking.origin.code}→${booking.destination.code}`,
+        },
+        reissueUnavailable: true,
+        supportEmail: csettings.supportEmail,
+        message: "Online rescheduling is not available for this booking. Please contact Plumtrips support to reschedule.",
+      });
+    }
 
     return res.json({
       searchResult,
@@ -2249,10 +2398,145 @@ router.get("/bookings/:id/reissue-search", requireAuth, requireSBT, async (req: 
         cabin: booking.cabin,
         passengers: booking.passengers,
       },
+      reissueUnavailable: false,
     });
   } catch (err: any) {
     sbtLogger.error("Reissue-search failed", { bookingId: req.params.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Unable to search for alternative flights. Please try again or contact Plumtrips support." });
+  }
+});
+
+// POST /api/sbt/flights/bookings/:id/manual-reissue — submit manual reschedule request via ops team
+router.post("/bookings/:id/manual-reissue", requireSBT, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const doc = await SBTBooking.findOne({ _id: req.params.id, userId });
+    if (!doc) return res.status(404).json({ error: "Booking not found." });
+
+    const { newDate, remarks } = req.body;
+
+    if (!newDate || typeof newDate !== "string") {
+      return res.status(400).json({ error: "Please provide a new departure date." });
+    }
+    const parsedDate = new Date(newDate);
+    if (isNaN(parsedDate.getTime())) {
+      return res.status(400).json({ error: "Invalid date format. Use YYYY-MM-DD." });
+    }
+    if (parsedDate <= new Date()) {
+      return res.status(400).json({ error: "Please select a future date." });
+    }
+
+    const cleanRemarks = remarks ? String(remarks).trim().slice(0, 500) : "";
+
+    const numericBookingId = Number(doc.bookingId);
+    if (!Number.isFinite(numericBookingId) || numericBookingId <= 0) {
+      return res.status(400).json({
+        error: "Booking reference not found. Please contact Plumtrips support.",
+      });
+    }
+
+    const tboRemarks = `Passenger requests reschedule to ${newDate}` +
+      (cleanRemarks ? `. ${cleanRemarks}` : "");
+
+    let cancelResult: any;
+    try {
+      cancelResult = await cancelFlight({
+        BookingId: numericBookingId,
+        TicketId: [],
+        RequestType: 3,
+        CancellationType: 3,
+        Remarks: tboRemarks,
+      });
+    } catch (tboErr: any) {
+      sbtLogger.error("Manual reissue TBO call threw", { bookingId: doc._id, error: tboErr?.message });
+      return res.status(502).json({
+        error: "Unable to submit reschedule request. Please try again or contact Plumtrips support.",
+      });
+    }
+
+    const tboStatus = cancelResult?.Response?.ResponseStatus;
+    if (tboStatus !== 1) {
+      sbtLogger.error("Manual reissue TBO call failed", {
+        bookingId: doc._id,
+        error: cancelResult?.Response?.Error?.ErrorMessage,
+      });
+      return res.status(502).json({
+        error: "Unable to submit reschedule request. Please try again or contact Plumtrips support.",
+      });
+    }
+
+    const changeRequestId =
+      cancelResult?.Response?.TicketCRInfo?.[0]?.ChangeRequestId ?? null;
+
+    if (!doc.changeRequests) doc.changeRequests = [];
+    doc.changeRequests.push({
+      changeRequestId: changeRequestId ?? undefined,
+      requestType: "reissue",
+      requestedNewDate: newDate,
+      remarks: cleanRemarks,
+      status: "submitted",
+      raisedAt: new Date(),
+      raisedBy: req.user?._id,
+    });
+    await doc.save();
+
+    try {
+      const settings = await getCompanySettings();
+
+      const pax0 = doc.passengers?.[0];
+      const passengerName = pax0
+        ? `${pax0.title ? pax0.title + " " : ""}${pax0.firstName || ""} ${pax0.lastName || ""}`.trim()
+        : "Passenger";
+
+      const originalDate = doc.departureTime || "N/A";
+
+      await sendMail({
+        to: settings.opsEmail,
+        cc: settings.accountManagerEmail ? [settings.accountManagerEmail] : [],
+        from: settings.supportEmail,
+        subject: `Manual Reschedule Request — PNR: ${doc.pnr} — ${doc.origin?.code} → ${doc.destination?.code}`,
+        html: `
+          <h2 style="color:#00477f">Manual Reschedule Request</h2>
+          <table style="border-collapse:collapse;width:100%;max-width:560px">
+            <tr><td style="padding:8px;border:1px solid #e2e8f0;font-weight:600">PNR</td>
+                <td style="padding:8px;border:1px solid #e2e8f0">${doc.pnr || "N/A"}</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e2e8f0;font-weight:600">Route</td>
+                <td style="padding:8px;border:1px solid #e2e8f0">${doc.origin?.code} → ${doc.destination?.code}</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e2e8f0;font-weight:600">Original Date</td>
+                <td style="padding:8px;border:1px solid #e2e8f0">${originalDate}</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e2e8f0;font-weight:600">Requested New Date</td>
+                <td style="padding:8px;border:1px solid #e2e8f0">${newDate}</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e2e8f0;font-weight:600">Passenger</td>
+                <td style="padding:8px;border:1px solid #e2e8f0">${passengerName}</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e2e8f0;font-weight:600">Remarks</td>
+                <td style="padding:8px;border:1px solid #e2e8f0">${cleanRemarks || "None"}</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e2e8f0;font-weight:600">Change Request ID</td>
+                <td style="padding:8px;border:1px solid #e2e8f0">${changeRequestId ?? "Pending"}</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e2e8f0;font-weight:600">MongoDB Booking ID</td>
+                <td style="padding:8px;border:1px solid #e2e8f0">${doc._id}</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e2e8f0;font-weight:600">Supplier Booking ID</td>
+                <td style="padding:8px;border:1px solid #e2e8f0">${doc.bookingId}</td></tr>
+          </table>
+          <p style="margin-top:16px;color:#64748b;font-size:13px">
+            Please process this reschedule request with the supplier ops team.
+          </p>
+        `,
+      });
+    } catch (emailErr: any) {
+      sbtLogger.error("Manual reissue notification email failed", {
+        bookingId: doc._id,
+        error: emailErr?.message,
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      changeRequestId,
+      message: "Reschedule request submitted successfully. Our team will contact you within 4 business hours.",
+    });
+  } catch (err: any) {
+    sbtLogger.error("Manual reissue failed", { bookingId: req.params.id, error: err.message });
+    res.status(500).json({ error: "Something went wrong. Please try again or contact Plumtrips support." });
   }
 });
 
@@ -2478,8 +2762,21 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, async (req: any, r
       AgentDealCode: itinerary?.AgentDealCode || "",
     };
 
+    if (!doc.pnr) {
+      return res.status(400).json({
+        error: "This booking cannot be rescheduled online — PNR reference not found. Please contact Plumtrips support.",
+      });
+    }
+
     const t0 = Date.now();
-    const reissueResult = await ticketReissue({ TraceId, ResultIndex, Passengers: tboPassengers, TicketData: ticketData }) as any;
+    const reissueResult = await ticketReissue({
+      TraceId,
+      ResultIndex,
+      Passengers: tboPassengers,
+      PNR: doc.pnr,
+      BookingId: Number(doc.bookingId) || 0,
+      TicketData: ticketData,
+    }) as any;
     logTBOCall({
       method: "TicketReissue",
       traceId: TraceId,
@@ -2492,9 +2789,11 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, async (req: any, r
     if (respStatus !== 1) {
       const tboErr = reissueResult?.Response?.Error?.ErrorMessage
         ?? reissueResult?.Response?.Response?.Error?.ErrorMessage
-        ?? "Reissue failed from supplier side";
+        ?? "Reissue failed";
       sbtLogger.error("TicketReissue TBO error", { bookingId: doc._id, tboErr });
-      return res.status(400).json({ error: tboErr, tboStatus: respStatus });
+      return res.status(502).json({
+        error: "Online rescheduling is not available for this booking. Please contact Plumtrips support to reschedule.",
+      });
     }
 
     const inner = reissueResult?.Response?.Response ?? reissueResult?.Response;

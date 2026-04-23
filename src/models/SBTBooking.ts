@@ -10,6 +10,7 @@ export interface ISBTBooking extends Document {
   pnr: string;
   bookingId: string;
   ticketId: string;
+  ticketIds?: number[];
   isReturn?: boolean;
   returnPnr?: string;
   returnBookingId?: number;
@@ -98,6 +99,15 @@ export interface ISBTBooking extends Document {
   originalPNR?: string;
   onlineReissueAllowed?: boolean;
   sbtRequestId?: Schema.Types.ObjectId;
+  changeRequests?: Array<{
+    changeRequestId?: number;
+    requestType?: string;
+    requestedNewDate?: string;
+    remarks?: string;
+    status?: string;
+    raisedAt?: Date;
+    raisedBy?: any;
+  }>;
   bookedAt: Date;
   cancelledAt?: Date;
   createdAt: Date;
@@ -113,6 +123,7 @@ const SBTBookingSchema = new Schema(
     pnr: { type: String, default: "" },
     bookingId: { type: String, default: "" },
     ticketId: { type: String, default: "" },
+    ticketIds: { type: [Number], default: [] },
     isReturn: { type: Boolean, default: false },
     returnPnr: { type: String, default: "" },
     returnBookingId: { type: Number },
@@ -219,6 +230,15 @@ const SBTBookingSchema = new Schema(
     originalPNR: { type: String, default: "" },
     onlineReissueAllowed: { type: Boolean },
     sbtRequestId: { type: Schema.Types.ObjectId, ref: "SBTRequest", default: null, index: true },
+    changeRequests: [{
+      changeRequestId: { type: Number },
+      requestType: { type: String },
+      requestedNewDate: { type: String },
+      remarks: { type: String },
+      status: { type: String, default: "submitted" },
+      raisedAt: { type: Date, default: Date.now },
+      raisedBy: { type: Schema.Types.ObjectId, ref: "User" },
+    }],
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
   },

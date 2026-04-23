@@ -20,6 +20,10 @@ export interface ICompanySettings extends Document {
   // Report Email
   reportsFromEmail: string;
   reportsFromName: string;
+  // Notification email routing
+  supportEmail?: string;
+  opsEmail?: string;
+  accountManagerEmail?: string;
   // Invoice Numbering
   invoiceStartNumber: number;
 }
@@ -41,6 +45,9 @@ const CompanySettingsSchema = new Schema<ICompanySettings>(
     bankAccountType:     { type: String, default: "Current Account" },
     reportsFromEmail:    { type: String, default: "" },
     reportsFromName:     { type: String, default: "Plumtrips Reports" },
+    supportEmail:        { type: String, default: "hello@plumtrips.com", trim: true },
+    opsEmail:            { type: String, default: "neelb@plumtrips.com", trim: true },
+    accountManagerEmail: { type: String, default: "", trim: true },
     invoiceStartNumber:  { type: Number, default: 1 },
   },
   { timestamps: true },

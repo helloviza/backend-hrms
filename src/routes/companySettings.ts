@@ -6,6 +6,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import CompanySettings, { getCompanySettings } from "../models/CompanySettings.js";
+import { invalidateCompanySettingsCache } from "../utils/companySettings.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 
@@ -37,6 +38,7 @@ router.put("/", requirePermission("companySettings", "WRITE"), async (req: any, 
       { $set: body },
       { new: true, upsert: true, runValidators: false },
     );
+    invalidateCompanySettingsCache();
     res.json({ ok: true, settings });
   } catch (err: any) {
     console.error("[CompanySettings PUT]", err.message);
