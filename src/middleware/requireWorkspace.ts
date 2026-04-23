@@ -2,6 +2,7 @@ import type { Request, Response, NextFunction } from "express";
 import mongoose from "mongoose";
 import { isSuperAdmin } from "./isSuperAdmin.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import User from "../models/User.js";
 
 /* ── Extend Express Request with workspace fields ───────────────── */
 declare global {
@@ -30,6 +31,11 @@ const STAFF_OVERRIDE_ROLES = new Set([
   "SUPERADMIN",
   "HR",
   "HR_ADMIN",
+  "MANAGER",    // internal Plumtrips staff
+  "EMPLOYEE",   // internal Plumtrips staff
+  "LEAD",       // internal role key (Role.ts)
+  "TEAM_LEAD",  // internal role key (Role.ts)
+  "OWNER",      // internal role key (Role.ts)
 ]);
 
 function isCustomerUser(user: any): boolean {
@@ -137,11 +143,34 @@ export const requireWorkspace = async (
   const staffRaw =
     user.workspaceId ?? user.customerId ?? user.businessId ?? null;
 
-  const raw = isCustomerUser(user) ? customerRaw : staffRaw;
+  let raw: string | null = isCustomerUser(user) ? customerRaw : staffRaw;
 
   if (!raw) {
-    res.status(403).json({ success: false, error: "Workspace context required" });
-    return;
+    // JWT was minted before workspace fix — DB fallback for existing sessions
+    try {
+      const userId = user?.sub || user?.id;
+      if (userId) {
+        const userDoc: any = await User.findById(userId)
+          .select("workspaceId email")
+          .lean();
+        if (userDoc?.workspaceId) {
+          raw = String(userDoc.workspaceId);
+        } else if (userDoc?.email) {
+          const domain = String(userDoc.email).split("@")[1]?.toLowerCase();
+          const INTERNAL_DOMAINS = new Set(["plumtrips.com", "helloviza.com"]);
+          if (domain && INTERNAL_DOMAINS.has(domain)) {
+            raw = "69679a7628330a58d29f2254";
+          }
+        }
+      }
+    } catch (dbErr) {
+      console.error("[requireWorkspace] DB fallback failed", dbErr);
+    }
+
+    if (!raw) {
+      res.status(403).json({ success: false, error: "Workspace context required" });
+      return;
+    }
   }
 
   try {

@@ -226,7 +226,7 @@ function isHrOrAdmin(user: any | null | undefined): boolean {
  * ✅ STAFF detector (prevents customer auto-link + customer role pollution)
  * Treat as STAFF if:
  * - hrmsAccessLevel/accountType/userType explicitly STAFF
- * - OR role claims include ADMIN / SUPERADMIN / HR / HR_ADMIN / STAFF
+ * - OR role claims include any internal Plumtrips role
  */
 function isStaffActor(userLike: any): boolean {
   if (!userLike) return false;
@@ -238,12 +238,17 @@ function isStaffActor(userLike: any): boolean {
 
   const roles = normalizeRoles(userLike.roles || []);
   return (
-    roles.includes("ADMIN") ||
     roles.includes("SUPERADMIN") ||
+    roles.includes("ADMIN") ||
     roles.includes("HR") ||
     roles.includes("HR_ADMIN") ||
     roles.includes("STAFF") ||
-    roles.includes("TENANT_ADMIN")
+    roles.includes("TENANT_ADMIN") ||
+    roles.includes("MANAGER") ||
+    roles.includes("EMPLOYEE") ||
+    roles.includes("LEAD") ||
+    roles.includes("TEAM_LEAD") ||
+    roles.includes("OWNER")
   );
 }
 

@@ -309,6 +309,15 @@ async function syncEmployeeFromOnboarding(
       update.photoKey = doc.photoKey;
     }
 
+    const INTERNAL_DOMAINS = ["plumtrips.com", "helloviza.com"];
+    const INTERNAL_WS_ID = "69679a7628330a58d29f2254";
+    const emailDomain = (doc.email || "").split("@")[1]?.toLowerCase() ?? "";
+    const resolvedWorkspaceId: any =
+      (doc as any).workspaceId ||
+      (INTERNAL_DOMAINS.includes(emailDomain)
+        ? new mongoose.Types.ObjectId(INTERNAL_WS_ID)
+        : null);
+
     let user: any = await (User as any).findOne({ email }).exec();
 
     if (!user) {
@@ -321,6 +330,7 @@ async function syncEmployeeFromOnboarding(
 
       user = await (User as any).create({
         ...update,
+        ...(resolvedWorkspaceId ? { workspaceId: resolvedWorkspaceId } : {}),
         employeeCode,
         roles: ["EMPLOYEE"],
         role: "EMPLOYEE",
@@ -329,20 +339,25 @@ async function syncEmployeeFromOnboarding(
         tempPassword: true,
       });
 
-
       return { tempPassword, email };
     } else {
       Object.assign(user, update);
+      if (!user.workspaceId && resolvedWorkspaceId) {
+        user.workspaceId = resolvedWorkspaceId;
+      }
       if (!user.employeeCode) {
         user.employeeCode = await generateNextEmployeeCode();
       }
       await user.save();
     }
 
-
     return null;
   } catch (err) {
-    console.error("[onboarding:sync] error while syncing employee:", err);
+    console.error("[onboarding:sync] failed", {
+      error: err instanceof Error ? err.message : String(err),
+      email: (rawDoc as any)?.email,
+      onboardingId: (rawDoc as any)?._id,
+    });
     return null;
   }
 }
