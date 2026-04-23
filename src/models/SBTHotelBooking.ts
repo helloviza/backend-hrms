@@ -9,6 +9,7 @@ export interface ISBTHotelBooking extends Document {
   bookingId: string;
   confirmationNo: string;
   bookingRefNo: string;
+  invoiceNumber?: string;
   hotelCode: string;
   hotelName: string;
   cityName: string;
@@ -84,6 +85,7 @@ const SBTHotelBookingSchema = new Schema(
     bookingId: { type: String, default: "" },
     confirmationNo: { type: String, default: "" },
     bookingRefNo: { type: String, default: "" },
+    invoiceNumber: { type: String, default: "" },
     hotelCode: { type: String, default: "" },
     hotelName: { type: String, required: true },
     cityName: { type: String, default: "" },

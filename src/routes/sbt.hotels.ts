@@ -77,6 +77,41 @@ const MOCK_HOTEL_RESULTS = [
 const router = express.Router();
 router.use(requireAuth);
 router.use(requireWorkspace);
+
+// ─── READ-ONLY BOOKING ROUTES (no feature gate) ──────────────────────────────
+// Users must always be able to see their past bookings regardless of whether
+// hotelBookingEnabled is on — the feature gate only blocks new booking actions.
+
+const getHotelBookingsHandler = async (req: any, res: any) => {
+  try {
+    const rawId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    if (!rawId) return res.status(401).json({ error: "Not authenticated" });
+
+    const isWL = (req.user?.roles || [])
+      .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ''))
+      .includes('WORKSPACELEADER') ||
+      req.user?.customerMemberRole === 'WORKSPACE_LEADER';
+
+    let bookings;
+    if (isWL) {
+      bookings = await SBTHotelBooking.find({ workspaceId: req.workspaceObjectId }).sort({ createdAt: -1 }).lean();
+    } else {
+      bookings = await SBTHotelBooking.find({ userId: rawId }).sort({ createdAt: -1 }).lean();
+    }
+
+    res.json({ ok: true, bookings });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Failed to list hotel bookings";
+    sbtLogger.error("Hotel bookings list failed", { userId: req.user?.id, error: msg });
+    res.status(500).json({ error: msg });
+  }
+};
+
+router.get("/bookings", requireSBT, getHotelBookingsHandler);
+router.get("/my-bookings", requireSBT, getHotelBookingsHandler);
+
+// ─── BOOKING FEATURE GATE ────────────────────────────────────────────────────
+// All routes below require hotelBookingEnabled = true on the workspace.
 router.use(requireFeature("hotelBookingEnabled"));
 
 // ─── Privileged SBT user check ───────────────────────────────────────────────
@@ -732,7 +767,7 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       }
     );
     const data = (await tboRes.json()) as any;
-    logTBOCall({ method: "HotelPreBook", traceId: BookingCode.split("!TB!")[4] || "hotel-prebook", request: tboPayload, response: data, durationMs: Date.now() - t0 });
+    logTBOCall({ method: "HotelPreBook", traceId: BookingCode.split("!TB!")[2] || "hotel-prebook", request: tboPayload, response: data, durationMs: Date.now() - t0 });
 
     const prebookHotel = data?.HotelResult?.[0] || data?.PreBookResult?.HotelResult?.[0];
     const room0 = prebookHotel?.Rooms?.[0];
@@ -1122,6 +1157,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         BookingId: result?.BookingId ?? "",
         ConfirmationNo: result?.ConfirmationNo ?? "",
         BookingRefNo: result?.BookingRefNo ?? "",
+        invoiceNumber: result?.InvoiceNumber ?? "",
         HotelBookingStatus: result?.HotelBookingStatus ?? result?.BookingStatus ?? "",
         PaymentId,
         isHeld,
@@ -1133,20 +1169,35 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
       const tboBookingId = Number(result?.BookingId);
       if (tboBookingId && !isHeld) {
-        generateHotelVoucher(tboBookingId)
-          .then(async (voucherRes) => {
-            try {
-              await SBTHotelBooking.findOneAndUpdate(
-                { bookingId: String(tboBookingId) },
-                {
-                  tboVoucherData: voucherRes,
-                  voucherStatus: voucherRes?.Response?.ResponseStatus === 1
-                    ? "GENERATED" : "FAILED",
-                }
-              );
-            } catch { /* silent */ }
-          })
-          .catch(() => {});
+        // When TBO auto-generates the voucher at Book time (IsVoucherBooking + VoucherStatus both
+        // true), the explicit GenerateVoucher call would return "already generated" (ErrorCode 2).
+        // Skip it and set voucherStatus directly from the Book response.
+        const isAutoVouchered =
+          result?.IsVoucherBooking === true && result?.VoucherStatus === true;
+
+        if (isAutoVouchered) {
+          SBTHotelBooking.findOneAndUpdate(
+            { bookingId: String(tboBookingId) },
+            { $set: { voucherStatus: "GENERATED", invoiceNumber: result?.InvoiceNumber || "" } }
+          ).catch((err: any) =>
+            sbtLogger.error("Failed to update voucher status after auto-voucher", { err: err?.message })
+          );
+        } else {
+          generateHotelVoucher(tboBookingId)
+            .then(async (voucherRes) => {
+              try {
+                await SBTHotelBooking.findOneAndUpdate(
+                  { bookingId: String(tboBookingId) },
+                  {
+                    tboVoucherData: voucherRes,
+                    voucherStatus: voucherRes?.GenerateVoucherResult?.ResponseStatus === 1
+                      ? "GENERATED" : "FAILED",
+                  }
+                );
+              } catch { /* silent */ }
+            })
+            .catch(() => {});
+        }
       }
 
       sbtLogger.info("Hotel booking TBO response stored", {
@@ -1202,7 +1253,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
     // Happy path: Book call succeeded with a response
     if (data && !bookTimedOut) {
-      const bookTraceId = data?.BookResult?.TraceId || BookingCode.split("!TB!")[4] || "hotel-book";
+      const bookTraceId = data?.BookResult?.TraceId || BookingCode.split("!TB!")[2] || "hotel-book";
       logTBOCall({ method: "HotelBook", traceId: bookTraceId, request: tboPayload, response: data, durationMs: Date.now() - t0 });
 
 
@@ -1385,7 +1436,7 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
     if (!numericId) return res.status(400).json({ error: "Invalid booking ID" });
 
     const voucherRes = await generateHotelVoucher(numericId);
-    const status = voucherRes?.Response?.ResponseStatus === 1 ? "GENERATED" : "FAILED";
+    const status = voucherRes?.GenerateVoucherResult?.ResponseStatus === 1 ? "GENERATED" : "FAILED";
 
     await SBTHotelBooking.findByIdAndUpdate(booking._id, {
       tboVoucherData: voucherRes,
@@ -1521,6 +1572,7 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       bookingId: b.bookingId || "",
       confirmationNo: b.confirmationNo || "",
       bookingRefNo: b.bookingRefNo || "",
+      invoiceNumber: b.invoiceNumber || b.InvoiceNumber || "",
       hotelCode: b.hotelCode || "",
       hotelName: b.hotelName || "",
       cityName: b.cityName || "",
@@ -1617,35 +1669,6 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
     res.status(500).json({ error: msg });
   }
 });
-
-// ─── 8. GET /bookings ────────────────────────────────────────────────────────
-
-const getHotelBookingsHandler = async (req: any, res: any) => {
-  try {
-    const rawId = req.user?._id ?? req.user?.id ?? req.user?.sub;
-    if (!rawId) return res.status(401).json({ error: "Not authenticated" });
-
-    const isWL = (req.user?.roles || [])
-      .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ''))
-      .includes('WORKSPACELEADER') ||
-      req.user?.customerMemberRole === 'WORKSPACE_LEADER';
-
-    let bookings;
-    if (isWL) {
-      bookings = await SBTHotelBooking.find({ workspaceId: req.workspaceObjectId }).sort({ createdAt: -1 }).lean();
-    } else {
-      bookings = await SBTHotelBooking.find({ userId: rawId }).sort({ createdAt: -1 }).lean();
-    }
-
-    res.json({ ok: true, bookings });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Failed to list hotel bookings";
-    sbtLogger.error("Hotel bookings list failed", { userId: req.user?.id, error: msg });
-    res.status(500).json({ error: msg });
-  }
-};
-router.get("/bookings", requireSBT, getHotelBookingsHandler);
-router.get("/my-bookings", requireSBT, getHotelBookingsHandler);
 
 // ─── 9a. POST /bookings/sync-all-pending ─────────────────────────────────────
 
