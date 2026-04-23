@@ -1,4 +1,5 @@
 import { sendMail } from "./mailer.js";
+import { getCompanySettings } from "./companySettings.js";
 
 type RelationshipType = "Employee" | "Vendor" | "Customer";
 
@@ -27,6 +28,7 @@ export async function sendOnboardingWelcomeEmail(
     effectiveDate,
     relationshipType,
   } = input;
+  const { supportEmail } = await getCompanySettings();
 
   const displayName = toTitleCase(counterpartyName);
 
@@ -203,8 +205,8 @@ export async function sendOnboardingWelcomeEmail(
   <strong style="color:#00477f;">Welcome to Plumtrips</strong><br/>
   Peachmint Trips & Planners Pvt. Ltd.<br/>
   Gurugram, India<br/>
-  <a href="mailto:hello@plumtrips.com" style="color:#d06549;text-decoration:none;">
-    hello@plumtrips.com
+  <a href="mailto:${supportEmail}" style="color:#d06549;text-decoration:none;">
+    ${supportEmail}
   </a>
   &nbsp;•&nbsp;
   <a href="https://www.plumtrips.com" style="color:#d06549;text-decoration:none;">
@@ -242,6 +244,6 @@ export async function sendOnboardingWelcomeEmail(
     subject,
     html,
     kind: "WELCOME",
-    replyTo: "hello@plumtrips.com",
+    replyTo: supportEmail,
   });
 }

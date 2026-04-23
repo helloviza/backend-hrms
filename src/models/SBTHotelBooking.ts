@@ -12,6 +12,8 @@ export interface ISBTHotelBooking extends Document {
   hotelCode: string;
   hotelName: string;
   cityName: string;
+  cityCode?: string;
+  countryCode?: string;
   checkIn: string;
   checkOut: string;
   rooms: number;
@@ -55,6 +57,14 @@ export interface ISBTHotelBooking extends Document {
   cancellationCharge?: number;
   refundedAmount?: number;
   changeRequestId?: string;
+  changeRequests?: Array<{
+    requestType?: string;
+    requestedCheckIn?: string;
+    requestedCheckOut?: string;
+    remarks?: string;
+    status?: string;
+    raisedAt?: Date;
+  }>;
   inclusion?: string;
   rateConditions?: string[];
   amenities?: string[];
@@ -77,6 +87,8 @@ const SBTHotelBookingSchema = new Schema(
     hotelCode: { type: String, default: "" },
     hotelName: { type: String, required: true },
     cityName: { type: String, default: "" },
+    cityCode: { type: String, default: "" },
+    countryCode: { type: String, default: "" },
     checkIn: { type: String, required: true },
     checkOut: { type: String, required: true },
     rooms: { type: Number, default: 1 },
@@ -134,6 +146,14 @@ const SBTHotelBookingSchema = new Schema(
     cancellationCharge: { type: Number, default: 0 },
     refundedAmount: { type: Number, default: 0 },
     changeRequestId: { type: String },
+    changeRequests: [{
+      requestType: { type: String },
+      requestedCheckIn: { type: String },
+      requestedCheckOut: { type: String },
+      remarks: { type: String },
+      status: { type: String, default: "submitted" },
+      raisedAt: { type: Date, default: Date.now },
+    }],
     inclusion: { type: String, default: "" },
     rateConditions: { type: [String], default: [] },
     amenities: { type: [String], default: [] },

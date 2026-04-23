@@ -16,7 +16,8 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { getMarginConfig, applyMargin } from "../utils/margin.js";
 import { getTBOToken } from "../services/tbo.auth.service.js";
-import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES } from "@plumtrips/shared";
+import { getCompanySettings } from "../utils/companySettings.js";
+import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES } from "@plumtrips/shared";
 
 // ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
 const MOCK_CITIES = [
@@ -195,6 +196,10 @@ const SEARCH_CACHE_TTL = 5 * 60 * 1000; // 5min
 const hotelDetailsCache = new Map<string, { data: any; ts: number }>();
 const DETAILS_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
+let countryListCache: { Code: string; Name: string }[] = [];
+let countryListCacheTime = 0;
+const COUNTRY_LIST_TTL = 24 * 60 * 60 * 1000; // 24h
+
 // ─── Hotel name search index ──────────────────────────────────────────────────
 
 interface HotelIndexEntry extends HotelCodeEntry {
@@ -208,6 +213,13 @@ const HOTEL_INDEX_CITIES = SHARED_HOTEL_INDEX_CITIES.map((c) => ({
   code: c.cityId,
   country: c.countryCode,
 }));
+
+// Set of non-IN country codes from our catalog — used to prioritise CountryList searches.
+const PRIORITY_COUNTRY_CODES = new Set(
+  SHARED_HOTEL_CITIES
+    .filter((c) => c.countryCode !== "IN")
+    .map((c) => c.countryCode)
+);
 
 async function ensureHotelIndexed(cityCode: string, countryCode: string): Promise<void> {
   if (hotelIndexedCities.has(cityCode)) return;
@@ -321,6 +333,22 @@ async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
   return cities;
 }
 
+async function getCachedCountryList(): Promise<{ Code: string; Name: string }[]> {
+  const now = Date.now();
+  if (countryListCache.length > 0 && now - countryListCacheTime < COUNTRY_LIST_TTL) {
+    return countryListCache;
+  }
+  const res = await fetch("https://api.tbotechnology.in/TBOHolidays_HotelAPI/CountryList", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: hotelStaticAuthHeader() },
+    body: "{}",
+  });
+  const data = (await res.json()) as { CountryList?: { Code: string; Name: string }[] };
+  countryListCache = data?.CountryList ?? [];
+  countryListCacheTime = now;
+  return countryListCache;
+}
+
 // Pre-load Indian cities and popular hotel names on startup
 (async () => {
   try {
@@ -415,27 +443,15 @@ router.get("/cities", async (req: any, res: any) => {
       const cities = await fetchCityList("IN");
       let matches = cities.filter((c) => c.CityName.toLowerCase().includes(q));
 
-      // If no Indian results, search a few international countries
+      // If no Indian results, search known international countries first, then any remaining
       if (!matches.length && q.length > 2) {
-        const countryRes = await fetch(
-          "https://api.tbotechnology.in/TBOHolidays_HotelAPI/CountryList",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: hotelStaticAuthHeader(),
-            },
-            body: "{}",
-          }
-        );
-        const countryData = (await countryRes.json()) as {
-          CountryList?: { Code: string; Name: string }[];
-        };
-        const countries = (countryData?.CountryList || [])
-          .filter((c) => c.Code !== "IN")
-          .slice(0, 5);
-
-        for (const country of countries) {
+        const allCountries = await getCachedCountryList();
+        // Priority: countries in our catalog (guaranteed to have hotels); then the rest
+        const prioritised = [
+          ...allCountries.filter((c) => c.Code !== "IN" && PRIORITY_COUNTRY_CODES.has(c.Code)),
+          ...allCountries.filter((c) => c.Code !== "IN" && !PRIORITY_COUNTRY_CODES.has(c.Code)),
+        ];
+        for (const country of prioritised) {
           const intlCities = await fetchCityList(country.Code);
           const intlMatches = intlCities.filter((c) =>
             c.CityName.toLowerCase().includes(q)
@@ -464,6 +480,7 @@ router.get("/cities", async (req: any, res: any) => {
             HotelName: h.HotelName,
             CityName: h.CityName,
             CityCode: h.CityCode,
+            CountryCode: h.CountryCode || "IN",
           }))
       : [];
 
@@ -1507,6 +1524,8 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       hotelCode: b.hotelCode || "",
       hotelName: b.hotelName || "",
       cityName: b.cityName || "",
+      cityCode: b.cityCode || b.CityCode || "",
+      countryCode: b.countryCode || b.CountryCode || b.GuestNationality || "IN",
       checkIn: b.checkIn,
       checkOut: b.checkOut,
       rooms: b.rooms || 1,
@@ -2311,6 +2330,102 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
     const msg = err instanceof Error ? err.message : "Room fetch failed";
     sbtLogger.error("Hotel rooms fetch failed", { error: msg });
     res.status(500).json({ error: msg });
+  }
+});
+
+// ─── 11. POST /bookings/:id/request-date-change ─────────────────────────────
+
+router.post("/bookings/:id/request-date-change", requireSBT, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const doc = await SBTHotelBooking.findOne({ _id: req.params.id, userId });
+    if (!doc) return res.status(404).json({ error: "Booking not found" });
+
+    const { newCheckIn, newCheckOut, remarks } = req.body;
+
+    if (!newCheckIn || !/^\d{4}-\d{2}-\d{2}$/.test(String(newCheckIn))) {
+      return res.status(400).json({ error: "New check-in date is required (YYYY-MM-DD)." });
+    }
+    if (!newCheckOut || !/^\d{4}-\d{2}-\d{2}$/.test(String(newCheckOut))) {
+      return res.status(400).json({ error: "New check-out date is required (YYYY-MM-DD)." });
+    }
+    const todayMidnight = new Date();
+    todayMidnight.setHours(0, 0, 0, 0);
+    if (new Date(newCheckIn) < todayMidnight) {
+      return res.status(400).json({ error: "New check-in date must be in the future." });
+    }
+    if (new Date(newCheckOut) <= new Date(newCheckIn)) {
+      return res.status(400).json({ error: "New check-out date must be after the new check-in date." });
+    }
+    if (!["CONFIRMED", "HELD"].includes(doc.status)) {
+      return res.status(400).json({ error: "Date change requests can only be made for confirmed or held bookings." });
+    }
+
+    const cleanRemarks = typeof remarks === "string" ? remarks.slice(0, 500).trim() : "";
+
+    const firstGuest = doc.guests?.[0];
+    const guestName = firstGuest
+      ? (`${firstGuest.FirstName || ""} ${firstGuest.LastName || ""}`).trim() || "Guest"
+      : "Guest";
+
+    try {
+      const settings = await getCompanySettings();
+      const ccList: string[] = settings.accountManagerEmail ? [settings.accountManagerEmail] : [];
+      await sendMail({
+        to: settings.opsEmail,
+        ...(ccList.length ? { cc: ccList } : {}),
+        from: settings.supportEmail,
+        subject: `Hotel Date Change Request — ${doc.hotelName} — ${doc.checkIn} → ${doc.checkOut}`,
+        kind: "REQUESTS",
+        html: `
+<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px">
+  <h2 style="color:#00477f;margin-bottom:4px">Hotel Date Change Request</h2>
+  <p style="color:#64748b;margin-top:0">A guest has requested a date change for their hotel booking.</p>
+  <table style="width:100%;border-collapse:collapse;margin-top:16px;font-size:14px">
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;width:42%">Hotel</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${doc.hotelName}</td></tr>
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Current Check-in</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${doc.checkIn}</td></tr>
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Current Check-out</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${doc.checkOut}</td></tr>
+    <tr><td style="padding:8px 12px;background:#fffbeb;font-weight:700;color:#92400e">Requested Check-in</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:700;color:#92400e">${newCheckIn}</td></tr>
+    <tr><td style="padding:8px 12px;background:#fffbeb;font-weight:700;color:#92400e">Requested Check-out</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:700;color:#92400e">${newCheckOut}</td></tr>
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Room Type</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${doc.roomName || "—"}</td></tr>
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Guest Name</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${guestName}</td></tr>
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Confirmation No</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${doc.confirmationNo || "—"}</td></tr>
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Booking ID</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${doc.bookingId || "—"}</td></tr>
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">MongoDB ID</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${String(doc._id)}</td></tr>
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Total Fare</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">₹${doc.totalFare?.toLocaleString("en-IN") ?? "—"}</td></tr>
+    ${cleanRemarks ? `<tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Remarks</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${cleanRemarks}</td></tr>` : ""}
+  </table>
+  <p style="margin-top:20px;padding:12px 16px;background:#f0fdf4;border-left:4px solid #16a34a;color:#15803d;font-weight:600">
+    Please process this date change request.
+  </p>
+</div>`,
+      });
+    } catch (mailErr) {
+      sbtLogger.error("Hotel date-change email failed", {
+        bookingId: doc._id,
+        error: mailErr instanceof Error ? mailErr.message : String(mailErr),
+      });
+    }
+
+    doc.changeRequests = doc.changeRequests || [];
+    doc.changeRequests.push({
+      requestType: "date-change",
+      requestedCheckIn: newCheckIn,
+      requestedCheckOut: newCheckOut,
+      remarks: cleanRemarks,
+      status: "submitted",
+      raisedAt: new Date(),
+    });
+    await doc.save();
+
+    return res.json({
+      ok: true,
+      message: "Date change request submitted. Our team will contact you within 4 business hours.",
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Request failed";
+    sbtLogger.error("Hotel date-change request failed", { bookingId: req.params.id, error: msg });
+    return res.status(502).json({ error: "Could not submit the date change request. Please try again." });
   }
 });
 

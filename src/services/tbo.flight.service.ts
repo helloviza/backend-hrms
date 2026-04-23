@@ -239,11 +239,20 @@ export async function searchFlights(params: {
     Segments: segments,
     Sources: params.Sources ?? null,
   };
-  if (params.SearchType != null) tboRequestBody.SearchType = String(params.SearchType);
-  if (params.Pnr) tboRequestBody.Pnr = params.Pnr;
+  // SearchType must be integer for TBO reissue search (not string)
+  if (params.SearchType != null) {
+    tboRequestBody.SearchType = Number(params.SearchType);
+  }
+  // TBO Search spells this field "Pnr" (not "PNR")
+  if (params.Pnr) {
+    tboRequestBody.Pnr = params.Pnr;
+  }
+  // Bookingid: TBO Search uses "Bookingid" (lowercase id), must be a positive integer
   if (params.BookingId) {
-    tboRequestBody.Bookingid = params.BookingId;
-    tboRequestBody.BookingId = params.BookingId;
+    const numericBookingId = Number(params.BookingId);
+    if (Number.isFinite(numericBookingId) && numericBookingId > 0) {
+      tboRequestBody.Bookingid = numericBookingId;
+    }
   }
   if (tboRequestBody.SearchType) {
     console.log('[TBO RAW SEARCH BODY]', JSON.stringify(tboRequestBody, null, 2));
@@ -1135,18 +1144,64 @@ export async function ticketLCC(params: {
 }
 
 export async function cancelFlight(params: {
-  BookingId: number | string;
-  PNR: string;
+  BookingId: number;
+  TicketId: number[];
+  RequestType?: number;
+  CancellationType?: number;
   Remarks?: string;
 }): Promise<any> {
   const token = await getTBOToken();
-  return post("/CancelPNR", {
+  const requestType = params.RequestType ?? 1;
+  const payload: Record<string, unknown> = {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
-    BookingId: params.BookingId,
-    PNR: params.PNR,
+    BookingId: Number(params.BookingId),
+    RequestType: requestType,
+    CancellationType: params.CancellationType ?? 3,
     Remarks: params.Remarks || "Cancelled by user",
-  }, false, FLIGHT_BASE);
+  };
+  // TicketId and Sectors are only valid for partial cancellation (RequestType !== 1).
+  // Full cancellation must NOT include these fields or the supplier rejects the request.
+  if (requestType !== 1 && params.TicketId?.length) {
+    payload.TicketId = params.TicketId;
+  }
+  return post("/SendChangeRequest", payload, false, FLIGHT_BASE);
+}
+
+export async function getCancellationCharges(params: {
+  BookingId: number;
+  RequestType?: number;
+  BookingMode?: number;
+}): Promise<{
+  ok: boolean;
+  refundAmount?: number;
+  cancellationCharge?: number;
+  remarks?: string;
+  raw: unknown;
+  error?: { code: number; message: string };
+}> {
+  const token = await getTBOToken();
+  const raw = await post("/GetCancellationCharges", {
+    EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+    TokenId: token,
+    RequestType: params.RequestType ?? 1,
+    BookingId: Number(params.BookingId),
+    BookingMode: params.BookingMode ?? 5,
+  }, false, FLIGHT_BASE) as any;
+
+  const status = raw?.Response?.ResponseStatus;
+  if (status !== 1) {
+    const errCode: number = raw?.Response?.Error?.ErrorCode ?? 0;
+    const errMsg: string = raw?.Response?.Error?.ErrorMessage ?? "Could not retrieve cancellation charges";
+    return { ok: false, raw, error: { code: errCode, message: errMsg } };
+  }
+  return {
+    ok: true,
+    refundAmount: raw?.Response?.RefundAmount,
+    cancellationCharge: raw?.Response?.CancellationCharge,
+    remarks: raw?.Response?.Remarks,
+    raw,
+  };
 }
 
 export async function releasePNR(params: {
@@ -1221,10 +1276,9 @@ export async function reissueSearch(params: {
       },
     ],
     Sources: null,
-    SearchType: "1",
+    SearchType: 1,
     Pnr: params.Pnr,
-    Bookingid: params.BookingId,
-    BookingId: params.BookingId,
+    Bookingid: Number(params.BookingId),
   }, false, FLIGHT_BASE);
 }
 
@@ -1232,6 +1286,8 @@ export async function ticketReissue(params: {
   TraceId: string;
   ResultIndex: string;
   Passengers: Array<Record<string, unknown>>;
+  PNR: string;
+  BookingId: number;
   TicketData?: {
     TourCode?: string;
     Endorsement?: string;
@@ -1247,6 +1303,8 @@ export async function ticketReissue(params: {
     TraceId: params.TraceId,
     ResultIndex: params.ResultIndex,
     Passengers: params.Passengers,
+    PNR: params.PNR,
+    BookingId: Number(params.BookingId),
     IsPriceChangeAccepted: true,
     TicketData: params.TicketData ?? {},
   }, false, FLIGHT_BASE);
