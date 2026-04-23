@@ -926,8 +926,11 @@ router.post("/upload/presign", requireAuth, noStore, async (req, res, next) => {
         Bucket: S3_BUCKET,
         Key: objectKey,
         Expires: PRESIGN_TTL,
-        Conditions: [["content-length-range", 0, 20 * 1024 * 1024]],
-        Fields: { "Content-Type": contentType },
+        Conditions: [
+          ["content-length-range", 0, 20 * 1024 * 1024],
+          ["starts-with", "$Content-Type", ""],
+        ],
+        Fields: {},
       });
       return res.json({ objectKey, upload: { method: "POST", url, fields } });
     }

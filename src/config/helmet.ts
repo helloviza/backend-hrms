@@ -46,6 +46,10 @@ export const helmetMiddleware = helmet({
       ],
       connectSrc: [
         "'self'",
+        "https://plumtrips-hrms-prod.s3.ap-south-1.amazonaws.com",
+        "https://plumtrips-hrms-prod.s3.amazonaws.com",
+        "https://*.s3.amazonaws.com",
+        "https://*.s3.ap-south-1.amazonaws.com",
         "https://api.hrms.plumtrips.com",
         "https://plumbox.plumtrips.com",
         "https://api.razorpay.com",
