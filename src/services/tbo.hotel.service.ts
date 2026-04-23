@@ -22,6 +22,9 @@ export async function generateHotelVoucher(bookingId: number): Promise<any> {
       body: JSON.stringify(payload),
     }
   );
+  if (!response.ok) {
+    throw new Error(`TBO GenerateVoucher failed: HTTP ${response.status}`);
+  }
   const data = await response.json();
   logTBOCall({
     method: "GenerateHotelVoucher",

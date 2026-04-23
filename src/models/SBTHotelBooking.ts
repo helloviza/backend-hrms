@@ -51,9 +51,15 @@ export interface ISBTHotelBooking extends Document {
   raw?: unknown;
   tboVoucherData?: unknown;
   voucherStatus?: "PENDING" | "CONFIRMED" | "FAILED" | "GENERATED" | "PAYMENT_COLLECTED" | "HELD" | "CANCELLED" | "CANCEL_PENDING";
+  sbtRequestId?: Schema.Types.ObjectId;
   cancellationCharge?: number;
   refundedAmount?: number;
   changeRequestId?: string;
+  inclusion?: string;
+  rateConditions?: string[];
+  amenities?: string[];
+  priceChangedDuringBook?: boolean;
+  priceChangeAmount?: number;
   bookedAt: Date;
   cancelledAt?: Date;
   createdAt: Date;
@@ -128,6 +134,11 @@ const SBTHotelBookingSchema = new Schema(
     cancellationCharge: { type: Number, default: 0 },
     refundedAmount: { type: Number, default: 0 },
     changeRequestId: { type: String },
+    inclusion: { type: String, default: "" },
+    rateConditions: { type: [String], default: [] },
+    amenities: { type: [String], default: [] },
+    priceChangedDuringBook: { type: Boolean, default: false },
+    priceChangeAmount: { type: Number, default: 0 },
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
   },
@@ -178,7 +189,7 @@ SBTHotelBookingSchema.post("save", async function (doc: any) {
       { upsert: true, new: true },
     );
   } catch (e) {
-    console.error("[TravelBooking sync] SBTHotelBooking hook failed:", e);
+    console.warn("TravelBooking sync failed:", (e as any)?.message);
   }
 });
 
