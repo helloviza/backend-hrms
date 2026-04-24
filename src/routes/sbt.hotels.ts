@@ -17,7 +17,7 @@ import { requireFeature } from "../middleware/requireFeature.js";
 import { getMarginConfig, applyMargin } from "../utils/margin.js";
 import { getTBOToken } from "../services/tbo.auth.service.js";
 import { getCompanySettings } from "../utils/companySettings.js";
-import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES } from "@plumtrips/shared";
+import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES } from "../shared/cities.js";
 
 // ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
 const MOCK_CITIES = [
