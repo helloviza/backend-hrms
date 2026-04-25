@@ -8,6 +8,7 @@ import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import Customer from "../models/Customer.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import CustomerMember from "../models/CustomerMember.js";
 
 const router = express.Router();
 
@@ -87,6 +88,7 @@ const BOOKING_COLUMNS = [
   "Partner",
   "Req Date",
   "Pax Name",
+  "Traveler ID",
   "Booked By",
   "Given By",
   "Type",
@@ -100,6 +102,7 @@ const BOOKING_COLUMNS = [
   "Base Price",
   "Grand Total",
   "Status",
+  "Sub Status",
   "Price Benefits",
   "Request Process TAT",
   "Invoice Raised Date",
@@ -109,10 +112,10 @@ const BOOKING_COLUMNS = [
   "Booking Month",
 ];
 
-// Money column indices (1-based): Quoted=14, Actual=15, Diff=16, GST=17, Base=18, Grand=19
-const MONEY_COLS = [14, 15, 16, 17, 18, 19];
+// Money column indices (1-based): Quoted=15, Actual=16, Diff=17, GST=18, Base=19, Grand=20
+const MONEY_COLS = [15, 16, 17, 18, 19, 20];
 
-function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = {}): (string | number | undefined)[] {
+function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = {}, tidMap: Record<string, string> = {}): (string | number | undefined)[] {
   const wsName =
     wsNameMap[b.workspaceId?.toString() ?? ""] ||
     b.workspaceId?.name || b.workspaceId?.companyName || String(b.workspaceId ?? "");
@@ -126,6 +129,9 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
       : b.itinerary?.hotelName || "");
   const paxNames = (b.passengers || []).map((p: any) => p.name).join(" | ");
   const tat = b.requestProcessTAT ? `${b.requestProcessTAT} days` : "";
+  const wid = b.workspaceId?.toString() ?? "";
+  const firstPaxEmail = String(b.passengers?.[0]?.email || "").toLowerCase();
+  const travelerId = firstPaxEmail ? (tidMap[`${wid}:${firstPaxEmail}`] || "") : "";
 
   return [
     srNo,
@@ -135,6 +141,7 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
     b.supplierName ?? "",
     fmtDateDMY(b.reqDate),
     paxNames,
+    travelerId,
     b.bookedBy?.email ?? b.bookedBy?.name ?? "",
     b.givenBy ?? "",
     b.type ?? "",
@@ -148,6 +155,7 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
     b.pricing?.basePrice ?? 0,
     b.pricing?.grandTotal ?? b.pricing?.quotedPrice ?? 0,
     b.status ?? "",
+    b.subStatus ?? "",
     b.priceBenefits ?? "",
     tat,
     invDate,
@@ -256,13 +264,34 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
       wsNameMap[c._id.toString()] = c.legalName || c.companyName || c.name || "";
     });
 
+    // Build travelerIdMap: "workspaceId:email" → travelerId
+    const tidEntries: Array<{ customerId: string; email: string }> = [];
+    for (const b of docs) {
+      const wid = (b as any).workspaceId?.toString() ?? "";
+      for (const p of ((b as any).passengers || [])) {
+        if (p.email && wid) tidEntries.push({ customerId: wid, email: String(p.email).toLowerCase() });
+      }
+    }
+    const tidMap: Record<string, string> = {};
+    if (tidEntries.length > 0) {
+      const memberDocs = await CustomerMember.find({
+        $or: tidEntries.map((e) => ({ customerId: e.customerId, email: e.email })),
+      })
+        .select("customerId email travelerId")
+        .lean();
+      for (const m of memberDocs) {
+        const key = `${(m as any).customerId}:${String((m as any).email).toLowerCase()}`;
+        tidMap[key] = String((m as any).travelerId || "");
+      }
+    }
+
     if (format === "csv") {
       res.setHeader("Content-Type", "text/csv");
       res.setHeader("Content-Disposition", 'attachment; filename="bookings-export.csv"');
 
       res.write(csvRow(BOOKING_COLUMNS));
       docs.forEach((b, idx) => {
-        res.write(csvRow(bookingToRow(b, idx + 1, wsNameMap)));
+        res.write(csvRow(bookingToRow(b, idx + 1, wsNameMap, tidMap)));
       });
       res.end();
       return;
@@ -279,8 +308,8 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     headerRow.font = { bold: true };
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
 
-    // Column widths
-    const colWidths = [7, 22, 14, 18, 16, 12, 28, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 25, 20, 14, 14, 16, 12, 16];
+    // Column widths (29 cols: Traveler ID inserted after Pax Name)
+    const colWidths = [7, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16];
     colWidths.forEach((width, i) => {
       sheet.getColumn(i + 1).width = width;
     });
@@ -294,7 +323,7 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     MONEY_COLS.forEach((ci) => { totals[ci] = 0; });
 
     docs.forEach((b, idx) => {
-      const row = bookingToRow(b, idx + 1, wsNameMap);
+      const row = bookingToRow(b, idx + 1, wsNameMap, tidMap);
       sheet.addRow(row);
       MONEY_COLS.forEach((ci) => {
         totals[ci] = (totals[ci] || 0) + (Number(row[ci - 1]) || 0);

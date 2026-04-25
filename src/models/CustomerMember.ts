@@ -13,6 +13,7 @@ export interface CustomerMemberDocument extends Document {
 
   bandNumber?: number | null;
   formTier?: "standard" | "relaxed";
+  travelerId?: string;
 
   createdBy?: string; // sub/email of creator
   invitedAt?: Date;
@@ -33,6 +34,7 @@ const CustomerMemberSchema = new Schema<CustomerMemberDocument>(
 
     bandNumber: { type: Number, default: null, min: 1, max: 10 },
     formTier: { type: String, enum: ["standard", "relaxed"], default: "standard" },
+    travelerId: { type: String, default: "" },
 
     createdBy: { type: String },
     invitedAt: { type: Date },
@@ -43,6 +45,12 @@ const CustomerMemberSchema = new Schema<CustomerMemberDocument>(
 
 // unique per customer workspace
 CustomerMemberSchema.index({ customerId: 1, email: 1 }, { unique: true });
+
+// unique travelerId per workspace (only enforced when non-empty)
+CustomerMemberSchema.index(
+  { travelerId: 1 },
+  { unique: true, partialFilterExpression: { travelerId: { $gt: "" } } }
+);
 
 const CustomerMember: Model<CustomerMemberDocument> =
   mongoose.models.CustomerMember ||

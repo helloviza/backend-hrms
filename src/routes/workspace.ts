@@ -569,7 +569,7 @@ router.get("/config", async (req: AnyObj, res) => {
       }
     }
 
-    // Attach per-user formTier from CustomerMember
+    // Attach per-user formTier and travelerId from CustomerMember
     const userEmail = String(user.email || user.sub || "").toLowerCase().trim();
     if (userEmail && userEmail.includes("@")) {
       const member = await CustomerMember.findOne({
@@ -577,8 +577,10 @@ router.get("/config", async (req: AnyObj, res) => {
         email: userEmail,
       }).lean();
       (config as any).formTier = (member as any)?.formTier || "standard";
+      (config as any).travelerId = (member as any)?.travelerId || "";
     } else {
       (config as any).formTier = "standard";
+      (config as any).travelerId = "";
     }
 
     res.setHeader("Cache-Control", "no-store");

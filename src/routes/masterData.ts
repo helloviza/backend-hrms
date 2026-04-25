@@ -21,6 +21,7 @@ import { sendOnboardingWelcomeEmail } from "../utils/onboardingWelcomeEmail.js";
 import { sendEmployeeWelcomeEmail, sendClientWelcomeEmail } from "../utils/employeeWelcomeEmail.js";
 import { UserPermission } from "../models/UserPermission.js";
 import CustomerMember from "../models/CustomerMember.js";
+import { generateTravelerId } from "../utils/travelerId.js";
 
 
 const router = Router();
@@ -1519,22 +1520,45 @@ if (email) {
     }
 
     // Create/update CustomerMember for new user
-    await CustomerMember.findOneAndUpdate(
-      {
-        email: emailRaw,
-        customerId: String(customer._id),
-      },
-      {
-        $set: {
-          role:        customerRole,
-          customerId:  String(customer._id),
-          email:       emailRaw,
-          userId:      String((clientUser as any)._id),
-          workspaceId: workspaceId || String(req.workspaceObjectId),
+    const promoteCompanyName = (customer as any).legalName || (customer as any).name || "PLUM";
+    const promoteTravelerId = await generateTravelerId(String(customer._id), promoteCompanyName);
+    const promoteSetOnInsert: any = { travelerId: promoteTravelerId };
+    try {
+      await CustomerMember.findOneAndUpdate(
+        { email: emailRaw, customerId: String(customer._id) },
+        {
+          $set: {
+            role:        customerRole,
+            customerId:  String(customer._id),
+            email:       emailRaw,
+            userId:      String((clientUser as any)._id),
+            workspaceId: workspaceId || String(req.workspaceObjectId),
+          },
+          $setOnInsert: promoteSetOnInsert,
         },
-      },
-      { upsert: true, new: true },
-    )
+        { upsert: true, new: true },
+      );
+    } catch (err: any) {
+      if (err?.code === 11000) {
+        delete promoteSetOnInsert.travelerId;
+        await CustomerMember.findOneAndUpdate(
+          { email: emailRaw, customerId: String(customer._id) },
+          {
+            $set: {
+              role:        customerRole,
+              customerId:  String(customer._id),
+              email:       emailRaw,
+              userId:      String((clientUser as any)._id),
+              workspaceId: workspaceId || String(req.workspaceObjectId),
+            },
+            $setOnInsert: promoteSetOnInsert,
+          },
+          { upsert: true, new: true },
+        );
+      } else {
+        throw err;
+      }
+    }
   }
 
   try {

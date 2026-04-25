@@ -160,7 +160,7 @@ function generateDomesticPdf(form: ITravelForm): Promise<Buffer> {
     [
       "Name of the Researcher/Staff (Gender: M/F)",
       form.travelerName
-        ? `${form.travelerName} (${form.travelerGender === "M" ? "Male" : form.travelerGender === "F" ? "Female" : form.travelerGender || "—"})`
+        ? `${form.travelerName} (${form.travelerGender === "M" ? "Male" : form.travelerGender === "F" ? "Female" : form.travelerGender || "—"})${form.travelerId ? " | ID: " + form.travelerId : ""}`
         : "",
       RH,
     ],
@@ -312,7 +312,7 @@ function generateInternationalPdf(form: ITravelForm): Promise<Buffer> {
   // Header table (2 x 2)
   const HCW = Math.round(CW / 2);
   const HRH = 24;
-  drawCell(doc, fn, fb, L, y, HCW, HRH, `Name: ${form.travelerName || ""}`, { size: 8.5 });
+  drawCell(doc, fn, fb, L, y, HCW, HRH, `Name: ${form.travelerName || ""}${form.travelerId ? " | ID: " + form.travelerId : ""}`, { size: 8.5 });
   drawCell(doc, fn, fb, L + HCW, y, CW - HCW, HRH, `Designation: ${form.designation || ""}`, { size: 8.5 });
   y += HRH;
   drawCell(doc, fn, fb, L, y, HCW, HRH, `Project: ${form.projectDebitability || ""}`, { size: 8.5 });

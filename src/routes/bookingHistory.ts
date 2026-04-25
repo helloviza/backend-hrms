@@ -4,6 +4,7 @@ import type { Request, Response } from "express";
 import path from "path";
 import fs from "fs";
 import ApprovalRequest from "../models/ApprovalRequest.js";
+import CustomerMember from "../models/CustomerMember.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
@@ -321,6 +322,22 @@ function buildEmailScopeOrs(email: string) {
   ];
 }
 
+async function buildTravelerIdMap(rows: any[]): Promise<Map<string, string>> {
+  const emails = [...new Set(
+    rows
+      .map((r) => String(r.requesterEmail || r.frontlinerEmail || "").toLowerCase())
+      .filter(Boolean),
+  )];
+  if (!emails.length) return new Map();
+  const members = await CustomerMember.find({ email: { $in: emails } })
+    .select("email travelerId")
+    .lean()
+    .exec();
+  return new Map<string, string>(
+    (members as any[]).map((m) => [String(m.email).toLowerCase(), m.travelerId || ""]),
+  );
+}
+
 /* ────────────────────────────────────────────────────────────────
  * Routes
  * ──────────────────────────────────────────────────────────────── */
@@ -341,6 +358,8 @@ router.get("/admin/history", requireAuth, async (req: Request, res: Response) =>
     .sort({ updatedAt: -1 })
     .lean();
 
+  const travelerMap = await buildTravelerIdMap(rows);
+
   const out = rows.map((r: any) => {
     const hist = Array.isArray(r?.history) ? r.history : [];
     const latest = hist.length ? hist[hist.length - 1] : null;
@@ -348,9 +367,11 @@ router.get("/admin/history", requireAuth, async (req: Request, res: Response) =>
 
     const pdfCandidate = pickPdfCandidate(r);
     const attachmentDownloadUrl = pdfCandidate ? makeAttachmentDownloadUrl(pdfCandidate) : "";
+    const requesterEmail = String(r.requesterEmail || r.frontlinerEmail || "").toLowerCase();
 
     return {
       ...r,
+      requesterTravelerId: travelerMap.get(requesterEmail) || "",
       _latestParsed: {
         mode: parsed.mode,
         service: parsed.service,
@@ -390,6 +411,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
   // Staff sees all
   if (isStaffViewer(user)) {
     const rows = await ApprovalRequest.find(base as any).sort({ updatedAt: -1 }).lean();
+    const travelerMap = await buildTravelerIdMap(rows);
     return res.json({
       ok: true,
       rows: rows.map((r: any) => {
@@ -399,9 +421,11 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
 
         const pdfCandidate = pickPdfCandidate(r);
         const attachmentDownloadUrl = pdfCandidate ? makeAttachmentDownloadUrl(pdfCandidate) : "";
+        const requesterEmail = String(r.requesterEmail || r.frontlinerEmail || "").toLowerCase();
 
         return {
           ...r,
+          requesterTravelerId: travelerMap.get(requesterEmail) || "",
           _latestParsed: {
             mode: parsed.mode,
             service: parsed.service,
@@ -436,6 +460,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
     const query = ors.length ? ({ ...base, $or: ors } as any) : (base as any);
 
     const rows = await ApprovalRequest.find(query).sort({ updatedAt: -1 }).lean();
+    const travelerMap = await buildTravelerIdMap(rows);
 
     const out = rows.map((r: any) => {
       const hist = Array.isArray(r?.history) ? r.history : [];
@@ -453,10 +478,12 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
 
       const pdfCandidate = pickPdfCandidate({ ...r, history: safeHist });
       const attachmentDownloadUrl = pdfCandidate ? makeAttachmentDownloadUrl(pdfCandidate) : "";
+      const requesterEmail = String(r.requesterEmail || r.frontlinerEmail || "").toLowerCase();
 
       return {
         ...r,
         history: safeHist,
+        requesterTravelerId: travelerMap.get(requesterEmail) || "",
         _latestParsed: {
           mode: parsed.mode,
           service: parsed.service,
@@ -481,6 +508,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
   const query = emailOrs.length ? ({ ...base, $or: emailOrs } as any) : (base as any);
 
   const rows = await ApprovalRequest.find(query).sort({ updatedAt: -1 }).lean();
+  const travelerMap = await buildTravelerIdMap(rows);
 
   const out = rows.map((r: any) => {
     const hist = Array.isArray(r?.history) ? r.history : [];
@@ -497,10 +525,12 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
 
     const pdfCandidate = pickPdfCandidate({ ...r, history: safeHist });
     const attachmentDownloadUrl = pdfCandidate ? makeAttachmentDownloadUrl(pdfCandidate) : "";
+    const requesterEmail = String(r.requesterEmail || r.frontlinerEmail || "").toLowerCase();
 
     return {
       ...r,
       history: safeHist,
+      requesterTravelerId: travelerMap.get(requesterEmail) || "",
       _latestParsed: {
         mode: parsed.mode,
         service: parsed.service,
