@@ -12,6 +12,7 @@ export interface CustomerMemberDocument extends Document {
   isActive: boolean;
 
   bandNumber?: number | null;
+  formTier?: "standard" | "relaxed";
 
   createdBy?: string; // sub/email of creator
   invitedAt?: Date;
@@ -31,6 +32,7 @@ const CustomerMemberSchema = new Schema<CustomerMemberDocument>(
     isActive: { type: Boolean, default: true, index: true },
 
     bandNumber: { type: Number, default: null, min: 1, max: 10 },
+    formTier: { type: String, enum: ["standard", "relaxed"], default: "standard" },
 
     createdBy: { type: String },
     invitedAt: { type: Date },

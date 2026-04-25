@@ -76,7 +76,10 @@ router.get('/my-access', requireAuth, async (req: any, res: any) => {
       const isExternal =
         userDoc?.roles?.includes('CUSTOMER') ||
         userDoc?.roles?.includes('VENDOR') ||
-        userDoc?.roles?.includes('CLIENT')
+        userDoc?.roles?.includes('CLIENT') ||
+        userDoc?.roles?.includes('WORKSPACE_LEADER') ||
+        userDoc?.roles?.includes('REQUESTER') ||
+        userDoc?.roles?.includes('APPROVER')
 
       if (isExternal) {
         const isWL = userDoc?.roles?.some(

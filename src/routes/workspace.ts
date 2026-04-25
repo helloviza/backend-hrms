@@ -569,6 +569,18 @@ router.get("/config", async (req: AnyObj, res) => {
       }
     }
 
+    // Attach per-user formTier from CustomerMember
+    const userEmail = String(user.email || user.sub || "").toLowerCase().trim();
+    if (userEmail && userEmail.includes("@")) {
+      const member = await CustomerMember.findOne({
+        customerId: String(customerId),
+        email: userEmail,
+      }).lean();
+      (config as any).formTier = (member as any)?.formTier || "standard";
+    } else {
+      (config as any).formTier = "standard";
+    }
+
     res.setHeader("Cache-Control", "no-store");
     res.json({ ok: true, customerId, config });
   } catch (err: any) {
