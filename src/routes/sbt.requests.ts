@@ -11,6 +11,7 @@ import { getFareQuote, bookFlight } from "../services/tbo.flight.service.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { buildEmailShell, eCard, eRow, eLabel, eBtn, escapeHtml } from "./approvals.email.js";
+import TravelForm from "../models/TravelForm.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -83,9 +84,29 @@ router.post("/", async (req: any, res: any) => {
       });
     }
 
-    const { type, searchParams, selectedOption, requesterNotes, passengerDetails, contactDetails } = req.body;
+    const { type, searchParams, selectedOption, requesterNotes, passengerDetails, contactDetails, travelFormId } = req.body;
     if (!type || !searchParams || !selectedOption) {
       return res.status(400).json({ error: "type, searchParams, and selectedOption are required" });
+    }
+
+    // Travel form enforcement — only when feature is enabled for this workspace
+    if (req.workspace?.config?.features?.travelFormEnabled) {
+      if (!travelFormId) {
+        return res.status(400).json({
+          error: "Travel form is required before submitting this request. Please complete the travel form.",
+          requiresTravelForm: true,
+        });
+      }
+      const travelForm = await TravelForm.findOne({
+        _id: travelFormId,
+        workspaceId: req.workspaceObjectId,
+      }).lean();
+      if (!travelForm) {
+        return res.status(400).json({
+          error: "Travel form not found. Please complete the travel form before submitting.",
+          requiresTravelForm: true,
+        });
+      }
     }
 
     // Validate passenger details
@@ -121,6 +142,14 @@ router.post("/", async (req: any, res: any) => {
       status: "PENDING",
       workspaceId: req.workspaceObjectId,
     });
+
+    // Link travel form to this request if provided
+    if (travelFormId) {
+      await TravelForm.findByIdAndUpdate(travelFormId, {
+        $set: { requestId: request._id, status: "submitted" },
+        $addToSet: { requestIds: request._id },
+      });
+    }
 
     // Send email to L2 booker
     const booker = await User.findById(assignedBookerId)

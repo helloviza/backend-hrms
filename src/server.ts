@@ -398,6 +398,9 @@ app.use("/api/sbt/wallet", sbtWalletRouter);
 import sbtConfigRouter from "./routes/sbt.config.js";
 app.use("/api/sbt/config", sbtConfigRouter);
 
+import travelFormRouter from "./routes/travelForm.js";
+app.use("/api/travel-forms", travelFormRouter);
+
 // SBT Admin (offer config)
 import adminSBTRouter from "./routes/admin.sbt.js";
 app.use("/api/admin/sbt", adminSBTRouter);

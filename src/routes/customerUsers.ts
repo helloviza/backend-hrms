@@ -2055,6 +2055,51 @@ router.post("/", requireAuth, async (req: any, res) => {
 });
 
 /**
+ * PATCH /api/customer/users/:id/form-tier  (set per-member form tier)
+ * Only WORKSPACE_LEADER or staff admin.
+ */
+router.patch("/:id/form-tier", requireAuth, async (req: any, res) => {
+  try {
+    const actor = req.user || {};
+    const actorEmail = normEmail(actor.email || "");
+
+    const customerId = await resolveCustomerId(req);
+    if (!customerId) {
+      if (isStaffPrivileged(actor)) {
+        return res.status(400).json({ error: "Please set Customer ID first (Business id) to load the workspace." });
+      }
+      return res.status(400).json({ error: "Customer workspace not found for this login" });
+    }
+
+    const member = await getActorMember(customerId, actorEmail);
+    const actorRole = String(member?.role || "").toUpperCase();
+    if (actorRole !== "WORKSPACE_LEADER" && !isStaffPrivileged(actor)) {
+      return res.status(403).json({ error: "Only WORKSPACE_LEADER or Admin can change form tier." });
+    }
+
+    const { formTier } = req.body;
+    if (!["standard", "relaxed"].includes(formTier)) {
+      return res.status(400).json({ error: "formTier must be 'standard' or 'relaxed'" });
+    }
+
+    const id = normStr(req.params?.id);
+    if (!id) return res.status(400).json({ error: "id is required" });
+
+    const updated = await CustomerMember.findOneAndUpdate(
+      { _id: id, customerId },
+      { $set: { formTier } },
+      { new: true }
+    ).lean().exec();
+
+    if (!updated) return res.status(404).json({ error: "Member not found" });
+    res.json({ ok: true, member: updated });
+  } catch (err: any) {
+    console.error("[customerUsers:form-tier] error", err);
+    res.status(500).json({ error: "Failed to update form tier", detail: err?.message });
+  }
+});
+
+/**
  * PATCH /api/customer/users/:id  (activate/deactivate)
  */
 router.patch("/:id", requireAuth, async (req: any, res) => {

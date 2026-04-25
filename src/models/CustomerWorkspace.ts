@@ -18,6 +18,7 @@ export interface WorkspaceFeatures {
   onboardingEnabled: boolean;
   analyticsEnabled: boolean;
   expenseBandEnabled: boolean;
+  travelFormEnabled?: boolean;
 }
 
 export type WorkspacePlan = "trial" | "starter" | "growth" | "enterprise";
@@ -231,6 +232,7 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         onboardingEnabled: { type: Boolean, default: false },
         analyticsEnabled: { type: Boolean, default: false },
         expenseBandEnabled: { type: Boolean, default: false },
+        travelFormEnabled: { type: Boolean, default: false },
       },
     },
 

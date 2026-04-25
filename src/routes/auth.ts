@@ -793,7 +793,10 @@ r.post("/login", loginLimiter, async (req, res) => {
     const isExternalUser =
       userRoles.includes('CUSTOMER') ||
       userRoles.includes('VENDOR') ||
-      userRoles.includes('CLIENT');
+      userRoles.includes('CLIENT') ||
+      userRoles.includes('WORKSPACE_LEADER') ||
+      userRoles.includes('REQUESTER') ||
+      userRoles.includes('APPROVER');
 
     if (!isSA && !isSAEmail && !isExternalUser) {
       const permission = await UserPermission.findOne({
