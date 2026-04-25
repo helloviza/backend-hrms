@@ -3,6 +3,7 @@ import { Router } from "express";
 import multer from "multer";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
+import ExcelJS from "exceljs";
 
 import { requireAuth } from "../middleware/auth.js";
 import MasterData from "../models/MasterData.js";
@@ -16,6 +17,7 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 import { sendMail } from "../utils/mailer.js";
 import { signEmailActionToken } from "../utils/emailActionToken.js";
 import { isGenericDomain } from "../utils/blockedDomains.js";
+import { generateTravelerId } from "../utils/travelerId.js";
 
 const router = Router();
 
@@ -531,24 +533,49 @@ async function ensureOwnerIsLeaderSafe(customerId: string, ws: any, actor: any, 
 
   // Promote or create as leader (safe because we passed allow checks above)
   const now = new Date();
-  await CustomerMember.updateOne(
-    { customerId: cid, email: actorEmail },
-    {
-      $set: {
-        customerId: cid,
-        email: actorEmail,
-        role: "WORKSPACE_LEADER",
-        isActive: true,
-        name: actorName || "Workspace Leader",
-        lastInviteAt: now,
+  const ownerCompanyName = businessView?.legalName || businessView?.companyName || businessView?.name || "PLUM";
+  const ownerTravelerId = await generateTravelerId(cid, ownerCompanyName);
+
+  const ownerSetOnInsert: any = { invitedAt: now, createdBy: actorEmail, travelerId: ownerTravelerId };
+
+  try {
+    await CustomerMember.updateOne(
+      { customerId: cid, email: actorEmail },
+      {
+        $set: {
+          customerId: cid,
+          email: actorEmail,
+          role: "WORKSPACE_LEADER",
+          isActive: true,
+          name: actorName || "Workspace Leader",
+          lastInviteAt: now,
+        },
+        $setOnInsert: ownerSetOnInsert,
       },
-      $setOnInsert: {
-        invitedAt: now,
-        createdBy: actorEmail,
-      },
-    },
-    { upsert: true },
-  ).exec();
+      { upsert: true },
+    ).exec();
+  } catch (err: any) {
+    if (err?.code === 11000) {
+      delete ownerSetOnInsert.travelerId;
+      await CustomerMember.updateOne(
+        { customerId: cid, email: actorEmail },
+        {
+          $set: {
+            customerId: cid,
+            email: actorEmail,
+            role: "WORKSPACE_LEADER",
+            isActive: true,
+            name: actorName || "Workspace Leader",
+            lastInviteAt: now,
+          },
+          $setOnInsert: ownerSetOnInsert,
+        },
+        { upsert: true },
+      ).exec();
+    } else {
+      throw err;
+    }
+  }
 
   return actorEmail;
 }
@@ -810,25 +837,42 @@ router.post("/workspace/leader", requireAuth, async (req: any, res) => {
     }
 
     const now = new Date();
+    const leaderCompanyName = business?.legalName || business?.name || "PLUM";
+    const leaderTravelerId = await generateTravelerId(customerId, leaderCompanyName);
 
-    const member = await CustomerMember.findOneAndUpdate(
-      { customerId, email: leaderEmail },
-      {
-        $set: {
-          name: leaderName || undefined,
-          role: "WORKSPACE_LEADER",
-          isActive: true,
-          lastInviteAt: now,
+    const leaderSetOnInsert: any = {
+      customerId,
+      email: leaderEmail,
+      invitedAt: now,
+      createdBy: actorEmail,
+      travelerId: leaderTravelerId,
+    };
+
+    let member: any;
+    try {
+      member = await CustomerMember.findOneAndUpdate(
+        { customerId, email: leaderEmail },
+        {
+          $set: { name: leaderName || undefined, role: "WORKSPACE_LEADER", isActive: true, lastInviteAt: now },
+          $setOnInsert: leaderSetOnInsert,
         },
-        $setOnInsert: {
-          customerId,
-          email: leaderEmail,
-          invitedAt: now,
-          createdBy: actorEmail,
-        },
-      },
-      { upsert: true, new: true },
-    ).exec();
+        { upsert: true, new: true },
+      ).exec();
+    } catch (err: any) {
+      if (err?.code === 11000) {
+        delete leaderSetOnInsert.travelerId;
+        member = await CustomerMember.findOneAndUpdate(
+          { customerId, email: leaderEmail },
+          {
+            $set: { name: leaderName || undefined, role: "WORKSPACE_LEADER", isActive: true, lastInviteAt: now },
+            $setOnInsert: leaderSetOnInsert,
+          },
+          { upsert: true, new: true },
+        ).exec();
+      } else {
+        throw err;
+      }
+    }
 
     // Ensure auth user exists for leader
     await ensureAuthUserForCustomer({
@@ -1788,14 +1832,35 @@ router.post("/bulk", requireAuth, upload.single("file"), async (req: any, res) =
       }
 
       const now = new Date();
-      const memberDoc = await CustomerMember.findOneAndUpdate(
-        { customerId, email },
-        {
-          $set: { name: name || undefined, role, isActive: true, lastInviteAt: now },
-          $setOnInsert: { customerId, email, invitedAt: now, createdBy: actorEmail },
-        },
-        { upsert: true, new: true },
-      ).exec();
+      const bulkCompanyName = business?.legalName || business?.name || "PLUM";
+      const bulkTravelerId = await generateTravelerId(customerId, bulkCompanyName);
+      const bulkSetOnInsert: any = { customerId, email, invitedAt: now, createdBy: actorEmail, travelerId: bulkTravelerId };
+
+      let memberDoc: any;
+      try {
+        memberDoc = await CustomerMember.findOneAndUpdate(
+          { customerId, email },
+          {
+            $set: { name: name || undefined, role, isActive: true, lastInviteAt: now },
+            $setOnInsert: bulkSetOnInsert,
+          },
+          { upsert: true, new: true },
+        ).exec();
+      } catch (err: any) {
+        if (err?.code === 11000) {
+          delete bulkSetOnInsert.travelerId;
+          memberDoc = await CustomerMember.findOneAndUpdate(
+            { customerId, email },
+            {
+              $set: { name: name || undefined, role, isActive: true, lastInviteAt: now },
+              $setOnInsert: bulkSetOnInsert,
+            },
+            { upsert: true, new: true },
+          ).exec();
+        } else {
+          throw err;
+        }
+      }
 
       const passwordPlain = row.password ? String(row.password) : null;
       const { user, created, tempPassword } = await ensureAuthUserForCustomer({
@@ -1987,14 +2052,35 @@ router.post("/", requireAuth, async (req: any, res) => {
     }
 
     const now = new Date();
-    const up = await CustomerMember.findOneAndUpdate(
-      { customerId, email },
-      {
-        $set: { name: name || undefined, role, isActive: true, lastInviteAt: now },
-        $setOnInsert: { customerId, email, invitedAt: now, createdBy: actorEmail },
-      },
-      { upsert: true, new: true },
-    ).exec();
+    const postCompanyName = business?.legalName || business?.name || "PLUM";
+    const postTravelerId = await generateTravelerId(customerId, postCompanyName);
+    const postSetOnInsert: any = { customerId, email, invitedAt: now, createdBy: actorEmail, travelerId: postTravelerId };
+
+    let up: any;
+    try {
+      up = await CustomerMember.findOneAndUpdate(
+        { customerId, email },
+        {
+          $set: { name: name || undefined, role, isActive: true, lastInviteAt: now },
+          $setOnInsert: postSetOnInsert,
+        },
+        { upsert: true, new: true },
+      ).exec();
+    } catch (err: any) {
+      if (err?.code === 11000) {
+        delete postSetOnInsert.travelerId;
+        up = await CustomerMember.findOneAndUpdate(
+          { customerId, email },
+          {
+            $set: { name: name || undefined, role, isActive: true, lastInviteAt: now },
+            $setOnInsert: postSetOnInsert,
+          },
+          { upsert: true, new: true },
+        ).exec();
+      } else {
+        throw err;
+      }
+    }
 
     const passwordPlain = req.body?.password ? String(req.body.password) : null;
     const { user, created, tempPassword } = await ensureAuthUserForCustomer({
@@ -2602,6 +2688,63 @@ router.post("/workspace/invite", requireAuth, async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[customerUsers:workspace/invite POST] error", err);
     res.status(500).json({ error: "Failed to invite user", detail: err?.message });
+  }
+});
+
+/* =========================================================
+ * GET /export/download — XLSX export of all workspace members
+ * ======================================================= */
+router.get("/export/download", requireAuth, async (req: any, res) => {
+  try {
+    const customerId = await resolveCustomerId(req);
+    if (!customerId) {
+      return res.status(400).json({ error: "Customer workspace not found for this login" });
+    }
+
+    const members = await CustomerMember.find({ customerId }).sort({ role: 1, email: 1 }).lean().exec();
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Team Members");
+
+    sheet.columns = [
+      { header: "Name",        key: "name",       width: 25 },
+      { header: "Email",       key: "email",      width: 30 },
+      { header: "Role",        key: "role",       width: 20 },
+      { header: "Department",  key: "department", width: 20 },
+      { header: "SBT Access",  key: "sbtEnabled", width: 12 },
+      { header: "SBT Role",    key: "sbtRole",    width: 12 },
+      { header: "Form Tier",   key: "formTier",   width: 12 },
+      { header: "Traveler ID", key: "travelerId", width: 15 },
+      { header: "Active",      key: "isActive",   width: 10 },
+      { header: "Joined",      key: "createdAt",  width: 20 },
+    ];
+
+    for (const m of members as any[]) {
+      sheet.addRow({
+        name:       m.name       || "",
+        email:      m.email      || "",
+        role:       m.role       || "",
+        department: m.department || "",
+        sbtEnabled: m.sbtEnabled ? "Yes" : "No",
+        sbtRole:    m.sbtRole    || "",
+        formTier:   m.formTier   || "standard",
+        travelerId: m.travelerId || "",
+        isActive:   m.isActive !== false ? "Yes" : "No",
+        createdAt:  m.createdAt ? new Date(m.createdAt).toLocaleDateString("en-IN") : "",
+      });
+    }
+
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF00477F" } };
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="team-members-${Date.now()}.xlsx"`);
+    return res.send(buffer);
+  } catch (err: any) {
+    console.error("[customerUsers:export/download]", err.message);
+    res.status(500).json({ error: "Failed to export members", detail: err?.message });
   }
 });
 

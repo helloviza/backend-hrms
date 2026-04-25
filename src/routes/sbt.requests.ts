@@ -7,6 +7,7 @@ import SBTRequest from "../models/SBTRequest.js";
 import User from "../models/User.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
+import CustomerMember from "../models/CustomerMember.js";
 import { getFareQuote, bookFlight } from "../services/tbo.flight.service.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
@@ -307,7 +308,32 @@ router.get("/inbox", async (req: any, res: any) => {
       .sort({ requestedAt: -1 })
       .lean();
 
-    res.json({ ok: true, requests });
+    // Batch-lookup requester travelerIds
+    const requesterEmails = [
+      ...new Set(
+        (requests as any[]).map((r: any) => r.requesterId?.email).filter(Boolean)
+      ),
+    ] as string[];
+
+    const inboxTidMap: Record<string, string> = {};
+    if (requesterEmails.length > 0 && user?.customerId) {
+      const memberDocs = await CustomerMember.find({
+        customerId: user.customerId,
+        email: { $in: requesterEmails },
+      })
+        .select("email travelerId")
+        .lean();
+      for (const m of memberDocs) {
+        inboxTidMap[String((m as any).email).toLowerCase()] = String((m as any).travelerId || "");
+      }
+    }
+
+    const enriched = (requests as any[]).map((r: any) => ({
+      ...r,
+      requesterTravelerId: inboxTidMap[String(r.requesterId?.email || "").toLowerCase()] || "",
+    }));
+
+    res.json({ ok: true, requests: enriched });
   } catch (err: any) {
     sbtLogger.error("SBT inbox failed", { error: err.message });
     res.status(500).json({ error: "Failed to load inbox" });

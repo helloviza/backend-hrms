@@ -7,6 +7,7 @@ import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import SBTRequest from "../models/SBTRequest.js";
 import TravelForm from "../models/TravelForm.js";
+import CustomerMember from "../models/CustomerMember.js";
 import { uploadTravelFormPdf } from "../utils/travelFormPdf.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
@@ -229,12 +230,25 @@ router.post("/", async (req: any, res: any) => {
       return res.status(400).json({ error: "formType is required" });
     }
 
+    // Look up requester's travelerId
+    const requesterEmail = String(req.user?.email || "").toLowerCase().trim();
+    const wsCustomerId = (req as any).workspace?.customerId;
+    let formTravelerId = "";
+    if (requesterEmail && wsCustomerId) {
+      const memberDoc = await CustomerMember.findOne({
+        customerId: wsCustomerId,
+        email: requesterEmail,
+      }).select("travelerId").lean();
+      formTravelerId = (memberDoc as any)?.travelerId || "";
+    }
+
     const form = await TravelForm.create({
       workspaceId: req.workspaceObjectId,
       bookingId: hasBookingId ? bookingId : null,
       bookingType,
       formType: resolvedFormType,
       status: "draft",
+      travelerId: formTravelerId,
       ...safeAutoFields,
       ...fields,
       ...(incomingRequestId ? {

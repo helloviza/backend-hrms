@@ -6,6 +6,7 @@ import logger from "../utils/logger.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import User from "../models/User.js";
+import CustomerMember from "../models/CustomerMember.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 
 const router = express.Router();
@@ -215,18 +216,34 @@ router.get("/bookings/export.csv", requireAdminOrSBT, async (req: any, res: any)
     ];
     const userMap = await buildUserLookup(userIds);
 
+    // Batch-lookup travelerId by user email
+    const allEmails = [...new Set(
+      Object.values(userMap)
+        .map((u: any) => String(u.email || "").toLowerCase())
+        .filter(Boolean),
+    )];
+    const travelerMembers = await CustomerMember.find({ email: { $in: allEmails } })
+      .select("email travelerId")
+      .lean()
+      .exec();
+    const travelerMap = new Map<string, string>(
+      (travelerMembers as any[]).map((m) => [String(m.email).toLowerCase(), m.travelerId || ""]),
+    );
+
     const lines: string[] = [];
 
     if (type === "all") {
-      lines.push("Type,BookingId,PNR/ConfirmationNo,UserName,UserEmail,Route/Hotel,BookedAt,Amount,Status,CustomerId");
+      lines.push("Type,BookingId,PNR/ConfirmationNo,UserName,UserEmail,Traveler ID,Route/Hotel,BookedAt,Amount,Status,CustomerId");
       for (const f of flights) {
         const u = userMap[String(f.userId)] || { name: "", email: "" };
+        const email = String(u.email || "").toLowerCase();
         lines.push([
           csvEscape("Flight"),
           csvEscape(f.bookingId),
           csvEscape(f.pnr),
           csvEscape(u.name),
-          csvEscape(u.email),
+          csvEscape(email),
+          csvEscape(travelerMap.get(email) || ""),
           csvEscape(`${f.origin?.city} → ${f.destination?.city}`),
           csvEscape(f.bookedAt),
           csvEscape(f.totalFare),
@@ -236,12 +253,14 @@ router.get("/bookings/export.csv", requireAdminOrSBT, async (req: any, res: any)
       }
       for (const h of hotels) {
         const u = userMap[String(h.userId)] || { name: "", email: "" };
+        const email = String(u.email || "").toLowerCase();
         lines.push([
           csvEscape("Hotel"),
           csvEscape(h.bookingId),
           csvEscape(h.confirmationNo),
           csvEscape(u.name),
-          csvEscape(u.email),
+          csvEscape(email),
+          csvEscape(travelerMap.get(email) || ""),
           csvEscape(h.hotelName),
           csvEscape(h.bookedAt),
           csvEscape(h.totalFare),
@@ -250,14 +269,16 @@ router.get("/bookings/export.csv", requireAdminOrSBT, async (req: any, res: any)
         ].join(","));
       }
     } else if (type === "flights") {
-      lines.push("BookingId,PNR,UserName,UserEmail,Origin,Destination,BookedAt,Amount,Status,CustomerId");
+      lines.push("BookingId,PNR,UserName,UserEmail,Traveler ID,Origin,Destination,BookedAt,Amount,Status,CustomerId");
       for (const f of flights) {
         const u = userMap[String(f.userId)] || { name: "", email: "" };
+        const email = String(u.email || "").toLowerCase();
         lines.push([
           csvEscape(f.bookingId),
           csvEscape(f.pnr),
           csvEscape(u.name),
-          csvEscape(u.email),
+          csvEscape(email),
+          csvEscape(travelerMap.get(email) || ""),
           csvEscape(f.origin?.city),
           csvEscape(f.destination?.city),
           csvEscape(f.bookedAt),
@@ -267,14 +288,16 @@ router.get("/bookings/export.csv", requireAdminOrSBT, async (req: any, res: any)
         ].join(","));
       }
     } else {
-      lines.push("BookingId,ConfirmationNo,UserName,UserEmail,HotelName,CheckIn,CheckOut,BookedAt,Amount,Status,CustomerId");
+      lines.push("BookingId,ConfirmationNo,UserName,UserEmail,Traveler ID,HotelName,CheckIn,CheckOut,BookedAt,Amount,Status,CustomerId");
       for (const h of hotels) {
         const u = userMap[String(h.userId)] || { name: "", email: "" };
+        const email = String(u.email || "").toLowerCase();
         lines.push([
           csvEscape(h.bookingId),
           csvEscape(h.confirmationNo),
           csvEscape(u.name),
-          csvEscape(u.email),
+          csvEscape(email),
+          csvEscape(travelerMap.get(email) || ""),
           csvEscape(h.hotelName),
           csvEscape(h.checkIn),
           csvEscape(h.checkOut),

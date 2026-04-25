@@ -6,6 +6,7 @@ import { requireAuth } from "../middleware/auth.js";
 import TravelBooking from "../models/TravelBooking.js";
 import User from "../models/User.js";
 import Employee from "../models/Employee.js";
+import CustomerMember from "../models/CustomerMember.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -567,7 +568,7 @@ router.get("/bookings", async (req: Request, res: Response) => {
 router.get("/bookings/export.csv", async (req: Request, res: Response) => {
   try {
     const CSV_HEADER =
-      "Date,Service,Traveller,Email,Department,Origin,Destination,Amount,Status,Payment Mode,Source,Booking Reference";
+      "Date,Service,Traveller,Email,Traveler ID,Department,Origin,Destination,Amount,Status,Payment Mode,Source,Booking Reference";
 
     const match = buildScopedMatch(req);
     if (req.query.status) match.status = req.query.status;
@@ -591,6 +592,21 @@ router.get("/bookings/export.csv", async (req: Request, res: Response) => {
       empMap[String(e.ownerId)] = e.department || "";
     }
 
+    // Batch-lookup travelerId by traveller email
+    const emails = [...new Set(
+      (bookings as any[])
+        .map((b) => (b.userId && typeof b.userId === "object" ? b.userId.email : ""))
+        .filter(Boolean)
+        .map((e: string) => String(e).toLowerCase()),
+    )];
+    const travelerMembers = await CustomerMember.find({ email: { $in: emails } })
+      .select("email travelerId")
+      .lean()
+      .exec();
+    const travelerMap = new Map<string, string>(
+      (travelerMembers as any[]).map((m) => [String(m.email).toLowerCase(), m.travelerId || ""]),
+    );
+
     const lines: string[] = [CSV_HEADER];
 
     for (const b of bookings as any[]) {
@@ -599,7 +615,7 @@ router.get("/bookings/export.csv", async (req: Request, res: Response) => {
       const name = pop
         ? pop.name || [pop.firstName, pop.lastName].filter(Boolean).join(" ") || ""
         : "";
-      const email = pop ? pop.email || "" : "";
+      const email = pop ? String(pop.email || "").toLowerCase() : "";
 
       lines.push(
         [
@@ -607,6 +623,7 @@ router.get("/bookings/export.csv", async (req: Request, res: Response) => {
           csvEscape(b.service),
           csvEscape(name),
           csvEscape(email),
+          csvEscape(travelerMap.get(email) || ""),
           csvEscape(empMap[uid] || ""),
           csvEscape(b.origin),
           csvEscape(b.destination),

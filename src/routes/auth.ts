@@ -18,6 +18,7 @@ import CustomerMember from "../models/CustomerMember.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import MasterData from "../models/MasterData.js";
 import { UserPermission } from "../models/UserPermission.js";
+import { generateTravelerId } from "../utils/travelerId.js";
 
 const r = Router();
 
@@ -365,19 +366,38 @@ async function ensureWorkspaceAndLeader(params: {
   };
   if (params.name) setFields.name = normStr(params.name);
 
-  await CustomerMember.updateOne(
-    { customerId, email: rx },
-    {
-      $setOnInsert: {
-        customerId,
-        email,
-        invitedAt: new Date(),
-        createdBy: "auth:auto-link",
-      },
-      $set: setFields,
-    },
-    { upsert: true }
-  ).exec();
+  const customerDoc = await Customer.findById(customerId)
+    .select("legalName name companyName")
+    .lean() as any;
+  const companyName = customerDoc?.legalName || customerDoc?.name || customerDoc?.companyName || "PLUM";
+  const newTravelerId = await generateTravelerId(customerId, companyName);
+
+  const authSetOnInsert: any = {
+    customerId,
+    email,
+    invitedAt: new Date(),
+    createdBy: "auth:auto-link",
+    travelerId: newTravelerId,
+  };
+
+  try {
+    await CustomerMember.updateOne(
+      { customerId, email: rx },
+      { $setOnInsert: authSetOnInsert, $set: setFields },
+      { upsert: true }
+    ).exec();
+  } catch (err: any) {
+    if (err?.code === 11000) {
+      delete authSetOnInsert.travelerId;
+      await CustomerMember.updateOne(
+        { customerId, email: rx },
+        { $setOnInsert: authSetOnInsert, $set: setFields },
+        { upsert: true }
+      ).exec();
+    } else {
+      throw err;
+    }
+  }
 }
 
 /* =========================================================

@@ -1,5 +1,26 @@
 import { Schema, model, type Document } from "mongoose";
 
+export const PENDING_SUB_STATUSES = [
+  "Pending for Customer Confirmation",
+  "Pending for Supplier Confirmation",
+] as const;
+
+export const CANCELLED_SUB_STATUSES = [
+  "Fare Difference",
+  "Price sudden increase",
+  "Not Sure for dates",
+  "Not Sure for Location",
+  "Plan changed",
+  "Travel cancelled",
+] as const;
+
+export const ALL_SUB_STATUSES = [
+  ...PENDING_SUB_STATUSES,
+  ...CANCELLED_SUB_STATUSES,
+] as const;
+
+export type SubStatus = (typeof ALL_SUB_STATUSES)[number] | "";
+
 export interface IManualBooking extends Document {
   workspaceId: Schema.Types.ObjectId;
   bookingRef: string;
@@ -14,8 +35,12 @@ export interface IManualBooking extends Document {
   bookingMonth?: string;
   requestProcessTAT?: number;
   invoiceRaisedDate?: Date;
-  type: "FLIGHT" | "HOTEL" | "VISA" | "TRANSFER" | "OTHER";
+  type:
+    | "FLIGHT" | "HOTEL" | "VISA" | "TRANSFER" | "OTHER"
+    | "CAB" | "FOREX" | "ESIM" | "HOLIDAYS" | "EVENTS"
+    | "DUMMY_FLIGHT" | "DUMMY_HOTEL";
   status: "PENDING" | "WIP" | "CONFIRMED" | "INVOICED" | "CANCELLED";
+  subStatus?: SubStatus;
   source: "MANUAL" | "SBT" | "ADMIN_QUEUE" | "SBT_AUTO";
   sourceBookingId?: Schema.Types.ObjectId;
   sourceBookingRef?: string;
@@ -81,8 +106,17 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     bookingMonth: { type: String },
     requestProcessTAT: { type: Number },
     invoiceRaisedDate: { type: Date },
-    type: { type: String, enum: ["FLIGHT", "HOTEL", "VISA", "TRANSFER", "OTHER"], required: true },
+    type: {
+      type: String,
+      enum: [
+        "FLIGHT", "HOTEL", "VISA", "TRANSFER", "OTHER",
+        "CAB", "FOREX", "ESIM", "HOLIDAYS", "EVENTS",
+        "DUMMY_FLIGHT", "DUMMY_HOTEL",
+      ],
+      required: true,
+    },
     status: { type: String, enum: ["PENDING", "WIP", "CONFIRMED", "INVOICED", "CANCELLED"], default: "PENDING" },
+    subStatus: { type: String, enum: [...ALL_SUB_STATUSES, ""], default: "" },
     source: { type: String, enum: ["MANUAL", "SBT", "ADMIN_QUEUE", "SBT_AUTO"], default: "MANUAL" },
     sourceBookingId: { type: Schema.Types.ObjectId },
     sourceBookingRef: { type: String },

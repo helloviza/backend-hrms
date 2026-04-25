@@ -17,6 +17,8 @@ const CustomerSchema = new Schema(
       index: true,
     },
 
+    workspaceCode: { type: String, trim: true, default: "" },
+
     email: {
       type: String,
       trim: true,

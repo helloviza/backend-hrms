@@ -56,6 +56,8 @@ export interface ITravelForm extends Document {
   approverSignature: string;
   approverSignatureDate: string;
 
+  travelerId?: string;
+
   // PDF
   pdfS3Key: string;
   pdfGeneratedAt?: Date;
@@ -124,6 +126,8 @@ const TravelFormSchema = new Schema<ITravelForm>(
     requestorSignatureDate: { type: String, default: "" },
     approverSignature: { type: String, default: "" },
     approverSignatureDate: { type: String, default: "" },
+
+    travelerId: { type: String, default: "" },
 
     pdfS3Key: { type: String, default: "" },
     pdfGeneratedAt: { type: Date },
