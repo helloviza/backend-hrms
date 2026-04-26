@@ -93,6 +93,27 @@ router.get("/export", async (req, res) => {
     const filter = conditions.length > 0 ? { $and: conditions } : {};
     const contacts = await CRMContact.find(filter).sort({ createdAt: -1 }).limit(5000).lean();
 
+    const exportAssignedIds = contacts
+      .map((c: any) => c.assignedTo?.toString())
+      .filter(Boolean) as string[];
+
+    const exportAssignedUsers =
+      exportAssignedIds.length > 0
+        ? ((await User.find({ _id: { $in: exportAssignedIds } })
+            .select("_id name firstName lastName email")
+            .lean()) as any[])
+        : [];
+
+    const exportUserMap = new Map<string, string>(
+      exportAssignedUsers.map((u: any) => [
+        u._id.toString(),
+        u.name ||
+          `${u.firstName || ""} ${u.lastName || ""}`.trim() ||
+          u.email ||
+          "",
+      ])
+    );
+
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet("Contacts");
     sheet.views = [{ state: "frozen", ySplit: 1 }];
@@ -124,7 +145,7 @@ router.get("/export", async (req, res) => {
         c.country || "",
         c.source || "",
         c.status || "",
-        "",
+        c.assignedTo ? exportUserMap.get(c.assignedTo.toString()) || "" : "",
         (c.tags || []).join(", "),
         c.source || "",
         fmtDate(c.createdAt),
@@ -198,7 +219,33 @@ router.get("/", async (req, res) => {
       CRMContact.countDocuments(filter),
     ]);
 
-    return res.json({ contacts, total, page, pages: Math.ceil(total / limit) });
+    const assignedIds = contacts
+      .map((c: any) => c.assignedTo?.toString())
+      .filter(Boolean) as string[];
+
+    const assignedUsers =
+      assignedIds.length > 0
+        ? ((await User.find({ _id: { $in: assignedIds } })
+            .select("_id name firstName lastName email")
+            .lean()) as any[])
+        : [];
+
+    const userMap = new Map<string, string>(
+      assignedUsers.map((u: any) => [
+        u._id.toString(),
+        u.name ||
+          `${u.firstName || ""} ${u.lastName || ""}`.trim() ||
+          u.email ||
+          "",
+      ])
+    );
+
+    const enriched = contacts.map((c: any) => ({
+      ...c,
+      assignedToName: c.assignedTo ? userMap.get(c.assignedTo.toString()) || "" : "",
+    }));
+
+    return res.json({ contacts: enriched, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
     logger.error("crm.contacts GET / error", { err });
     return res.status(500).json({ error: "Failed to list contacts." });
@@ -225,7 +272,21 @@ router.get("/:id", async (req, res) => {
         .lean();
     }
 
-    return res.json({ contact, linkedLead });
+    let assignedToName = "";
+    if (contact.assignedTo) {
+      const assignedUser = (await User.findById(contact.assignedTo)
+        .select("name firstName lastName email")
+        .lean()) as any;
+      if (assignedUser) {
+        assignedToName =
+          assignedUser.name ||
+          `${assignedUser.firstName || ""} ${assignedUser.lastName || ""}`.trim() ||
+          assignedUser.email ||
+          "";
+      }
+    }
+
+    return res.json({ contact: { ...(contact as any), assignedToName }, linkedLead });
   } catch (err) {
     logger.error("crm.contacts GET /:id error", { err });
     return res.status(500).json({ error: "Failed to get contact." });
