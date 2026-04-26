@@ -99,6 +99,9 @@ import proxyRouter from "./routes/proxy.js";
 import activityRoutes from "./routes/activity.js";
 import presenceRoutes from "./routes/presence.js";
 import meetingRoutes from "./routes/meetings.js";
+import leadsRouter from "./routes/leads.js";
+import crmCompaniesRouter from "./routes/crm.companies.js";
+import crmContactsRouter from "./routes/crm.contacts.js";
 
 const app = express();
 
@@ -483,6 +486,11 @@ app.use("/api/proxy", proxyRouter);
 app.use("/api/activity", activityRoutes);
 app.use("/api/presence", presenceRoutes);
 app.use("/api/meetings", meetingRoutes);
+
+// Sales CRM
+app.use("/api/leads", leadsRouter);
+app.use("/api/crm/companies", crmCompaniesRouter);
+app.use("/api/crm/contacts", crmContactsRouter);
 
 // Plumbox internal chat (SSE + conversations + messages)
 import chatRouter from "./routes/chat.js";

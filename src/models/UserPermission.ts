@@ -90,6 +90,11 @@ export interface UserPermissionDoc extends Document {
 
     // Vendor universe
     vendorProfile: ModulePermission
+
+    // Sales CRM
+    leads?: ModulePermission
+    crmContacts?: ModulePermission
+    crmCompanies?: ModulePermission
   }
 
   grantedBy: string
@@ -145,6 +150,11 @@ const modulesSchema = new Schema(
 
     // Vendor universe
     vendorProfile: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+
+    // Sales CRM
+    leads: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    crmContacts: { type: modulePermissionSchema, default: () => ({}) },
+    crmCompanies: { type: modulePermissionSchema, default: () => ({}) },
   },
   { _id: false }
 )
