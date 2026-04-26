@@ -204,7 +204,7 @@ router.post("/", async (req, res) => {
         type: "note" as ActivityType,
         note: String(body.notes),
         createdBy: lead.createdBy,
-        createdByName: user.name || "",
+        createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
       });
     }
 
@@ -509,6 +509,29 @@ router.get("/export/activities", async (_req, res) => {
 
     const leadMap = new Map((leads as any[]).map((l) => [l._id.toString(), l]));
 
+    const missingUserIds = [...new Set(
+      (activities as any[])
+        .filter((a) => !a.createdByName && a.createdBy)
+        .map((a) => a.createdBy?.toString())
+        .filter(Boolean),
+    )];
+
+    const userDocs = missingUserIds.length > 0
+      ? await User.find({ _id: { $in: missingUserIds } })
+          .select("_id name firstName lastName email")
+          .lean()
+      : [];
+
+    const userMap = new Map(
+      (userDocs as any[]).map((u) => [
+        u._id.toString(),
+        u.name ||
+          `${u.firstName || ""} ${u.lastName || ""}`.trim() ||
+          u.email ||
+          "Unknown",
+      ]),
+    );
+
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet("Lead Activities");
 
@@ -539,7 +562,9 @@ router.get("/export/activities", async (_req, res) => {
         note: activity.note || "—",
         fromStage: activity.fromStage || "—",
         toStage: activity.toStage || "—",
-        createdByName: activity.createdByName || "—",
+        createdByName: activity.createdByName ||
+          userMap.get(activity.createdBy?.toString()) ||
+          "—",
         createdAt: activity.createdAt
           ? new Date(activity.createdAt).toLocaleString("en-IN", {
               day: "2-digit", month: "short", year: "numeric",
@@ -676,7 +701,7 @@ router.put("/:id/stage", async (req, res) => {
       createdBy: mongoose.isValidObjectId(userId(user))
         ? new mongoose.Types.ObjectId(userId(user))
         : undefined,
-      createdByName: user.name || "",
+      createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
 
     return res.json({ lead });
@@ -724,7 +749,7 @@ router.post("/:id/activity", async (req, res) => {
       createdBy: mongoose.isValidObjectId(userId(user))
         ? new mongoose.Types.ObjectId(userId(user))
         : undefined,
-      createdByName: user.name || "",
+      createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
 
     return res.status(201).json({ activity });
@@ -770,7 +795,7 @@ router.post("/:id/assign", async (req, res) => {
       createdBy: mongoose.isValidObjectId(userId(user))
         ? new mongoose.Types.ObjectId(userId(user))
         : undefined,
-      createdByName: user.name || "",
+      createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
 
     return res.json({ lead });
@@ -826,7 +851,7 @@ router.post("/:id/win", async (req, res) => {
       type: "won" as ActivityType,
       note: "Lead marked as won.",
       createdBy: createdById,
-      createdByName: user.name || "",
+      createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
 
     if (sendInvite && inviteEmail) {
@@ -835,7 +860,7 @@ router.post("/:id/win", async (req, res) => {
         type: "invite_sent" as ActivityType,
         note: `Onboarding invite pending for ${inviteEmail}. SuperAdmin can send from Onboarding module.`,
         createdBy: createdById,
-        createdByName: user.name || "",
+        createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
       });
     }
 
@@ -893,7 +918,7 @@ router.post("/:id/win", async (req, res) => {
       type: "invite_sent" as ActivityType,
       note: `Auto-converted: Contact ${newContact.firstName} and Company ${newCompany?.name || "N/A"} created`,
       createdBy: createdById,
-      createdByName: user.name || "System",
+      createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
 
     return res.json({ lead });
@@ -933,7 +958,7 @@ router.post("/:id/lose", async (req, res) => {
       createdBy: mongoose.isValidObjectId(userId(user))
         ? new mongoose.Types.ObjectId(userId(user))
         : undefined,
-      createdByName: user.name || "",
+      createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
 
     return res.json({ lead });
