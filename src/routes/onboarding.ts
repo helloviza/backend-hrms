@@ -976,6 +976,66 @@ router.post("/upload/presign", requireAuth, noStore, async (req, res, next) => {
   }
 });
 
+/** 📤 S3 upload presign (public — validated via onboarding invite token) */
+router.post("/upload/presign-public", noStore, async (req, res, next) => {
+  try {
+    if (!S3_BUCKET)
+      return res.status(500).json({ message: "S3_BUCKET not configured" });
+
+    const { token, type, kind, filename, contentType, size } = req.body || {};
+
+    if (!token || typeof token !== "string")
+      return res.status(400).json({ error: "Onboarding token required" });
+
+    const invite = await Onboarding.findOne({
+      token,
+      status: { $in: ["sent", "started"] },
+    }).lean();
+    if (!invite)
+      return res.status(401).json({ error: "Invalid or expired onboarding token" });
+
+    if (!kind || !filename || !contentType || typeof size !== "number")
+      return res.status(400).json({ message: "Missing required fields" });
+
+    const resolvedType = type || invite.type || "doc";
+    const clean = String(filename).replace(/[^a-zA-Z0-9._-]/g, "_");
+    const objectKey = `onboarding/${String(resolvedType).toLowerCase()}/${kind}/${Date.now()}-${crypto
+      .randomBytes(8)
+      .toString("hex")}-${clean}`;
+
+    if (createPresignedPostFn) {
+      const { url, fields } = await createPresignedPostFn(s3, {
+        Bucket: S3_BUCKET,
+        Key: objectKey,
+        Expires: PRESIGN_TTL,
+        Conditions: [
+          ["content-length-range", 0, 20 * 1024 * 1024],
+          ["starts-with", "$Content-Type", ""],
+        ],
+        Fields: {},
+      });
+      return res.json({ objectKey, upload: { method: "POST", url, fields } });
+    }
+
+    if (getSignedUrl) {
+      const cmd = new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: objectKey,
+        ContentType: contentType,
+      });
+      const url = await getSignedUrl(s3, cmd, { expiresIn: PRESIGN_TTL });
+      return res.json({ objectKey, upload: { method: "PUT", url } });
+    }
+
+    res.status(500).json({
+      message:
+        "S3 presign helpers not installed. Install '@aws-sdk/s3-presigned-post' or '@aws-sdk/s3-request-presigner'.",
+    });
+  } catch (err: any) {
+    next(err);
+  }
+});
+
 /** 🧩 Aliases for vendor/business/employee doc upload */
 for (const kind of ["vendors", "businesses", "employees"] as const) {
   router.post(`/${kind}/upload-doc`, async (req, res, next) => {
