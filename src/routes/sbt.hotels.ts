@@ -99,6 +99,23 @@ const getHotelBookingsHandler = async (req: any, res: any) => {
       bookings = await SBTHotelBooking.find({ userId: rawId }).sort({ createdAt: -1 }).lean();
     }
 
+    // GAP-36c: on-read expiry — HELD bookings past lastCancellationDate (or lastVoucherDate fallback) flip to EXPIRED
+    const now = new Date();
+    const expiredIds = (bookings as any[])
+      .filter((b) =>
+        b.status === "HELD" && (
+          (b.lastCancellationDate && new Date(b.lastCancellationDate) < now) ||
+          (!b.lastCancellationDate && b.lastVoucherDate && new Date(b.lastVoucherDate) < now)
+        )
+      )
+      .map((b) => b._id);
+    if (expiredIds.length > 0) {
+      await SBTHotelBooking.updateMany({ _id: { $in: expiredIds } }, { $set: { status: "EXPIRED" } });
+      for (const b of bookings as any[]) {
+        if (expiredIds.some((id: any) => String(id) === String(b._id))) b.status = "EXPIRED";
+      }
+    }
+
     res.json({ ok: true, bookings });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Failed to list hotel bookings";
@@ -928,6 +945,15 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
     if (!BookingCode) return res.status(400).json({ error: "BookingCode required" });
 
+    // GAP-36a: block hold for non-refundable rates (spec FAQ: "non refundable bookings can not be put on hold")
+    const isRefundable: boolean = req.body.isRefundable !== false;
+    if (bookingMode === "hold" && !isRefundable) {
+      return res.status(400).json({
+        code: "NON_REFUNDABLE_HOLD_FORBIDDEN",
+        error: "This rate cannot be held. Please complete payment to confirm booking.",
+      });
+    }
+
     // Tracks whether TBO triggered a price change on the Book response (persisted for finance reporting)
     let priceChangedDuringBook = false;
     let priceChangeAmount = 0;
@@ -1720,6 +1746,7 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       isVouchered: b.isHeld ? false : (b.isVouchered ?? true),
       isHeld: b.isHeld ?? false,
       lastVoucherDate: b.lastVoucherDate ? new Date(b.lastVoucherDate) : undefined,
+      lastCancellationDate: b.lastCancellationDate ? new Date(b.lastCancellationDate) : null,
       paymentMode: b.paymentMode === "official" ? "official" : "personal",
       raw: b.raw ?? null,
       inclusion: typeof b.inclusion === "string" ? b.inclusion : "",
