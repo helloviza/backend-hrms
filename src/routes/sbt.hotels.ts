@@ -980,13 +980,32 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       }
     }
 
-    // Name minimum length and character validation
+    // Read PreBook validation flags; default false so fields are omitted when not required.
+    const validationFlags = req.body?.ValidationFlags ?? {};
+
+    // Name length validation for ADULTS (PaxType 1).
+    // GAP-04: derive limits from PreBook validationFlags.
+    // Spec inconsistency: Nodes Explanation treats PaxNameMinLength as the direct minimum;
+    // inline PreBook example shows +1 offset (effectiveMin = PaxNameMinLength + 1).
+    // Trust the inline example — it matches TBO sandbox behaviour.
+    const charLimit: boolean = validationFlags.CharLimit === true;
+    const paxNameMinLength: number = Number(validationFlags.PaxNameMinLength ?? 2);
+    const paxNameMaxLength: number = Number(validationFlags.PaxNameMaxLength ?? 50);
+    const nameMinLen = charLimit ? paxNameMinLength + 1 : 2;
+    const nameMaxLen = charLimit ? paxNameMaxLength : 50;
+
     for (const g of allGuests) {
+      if (Number(g.PaxType) !== 1) continue; // children validated under GAP-09
       const fn = String(g.FirstName || "").trim();
       const ln = String(g.LastName || "").trim();
-      if (fn.length < 3 || ln.length < 3) {
+      if (fn.length < nameMinLen || ln.length < nameMinLen) {
         return res.status(400).json({
-          error: "Each guest's first and last name must be at least 3 characters.",
+          error: `Each adult guest's first and last name must be at least ${nameMinLen} characters.`,
+        });
+      }
+      if (fn.length > nameMaxLen || ln.length > nameMaxLen) {
+        return res.status(400).json({
+          error: `Each adult guest's first and last name must be at most ${nameMaxLen} characters.`,
         });
       }
       if (!/^[a-zA-Z\s'-]+$/.test(fn) || !/^[a-zA-Z\s'-]+$/.test(ln)) {
@@ -1006,8 +1025,6 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       const hotelCustomer = await Customer.findOne({ _id: (hotelWorkspace as any).customerId }).select("pan").lean();
       hotelCorporatePAN = (hotelCustomer as any)?.pan || "";
     }
-    // Read PreBook validation flags; default false so fields are omitted when not required.
-    const validationFlags = req.body?.ValidationFlags ?? {};
     const panMandatory = validationFlags.PanMandatory === true;
     const crpPanMandatory = validationFlags.CrpPANMandatory === true;
     const passportMandatory = validationFlags.PassportMandatory === true;
