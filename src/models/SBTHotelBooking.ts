@@ -35,9 +35,10 @@ export interface ISBTHotelBooking extends Document {
   currency: string;
   isRefundable: boolean;
   cancelPolicies: unknown[];
-  status: "CONFIRMED" | "CANCELLED" | "FAILED" | "PENDING" | "CANCEL_PENDING" | "HELD";
+  status: "CONFIRMED" | "CANCELLED" | "FAILED" | "PENDING" | "CANCEL_PENDING" | "HELD" | "EXPIRED";
   isHeld?: boolean;
   lastVoucherDate?: Date;
+  lastCancellationDate?: Date | null;
   voucherGeneratedAt?: Date;
   paymentStatus: "paid" | "failed" | "pending";
   paymentId: string;
@@ -119,11 +120,12 @@ const SBTHotelBookingSchema = new Schema(
     cancelPolicies: { type: [Schema.Types.Mixed], default: [] },
     status: {
       type: String,
-      enum: ["CONFIRMED", "CANCELLED", "FAILED", "PENDING", "CANCEL_PENDING", "HELD"],
+      enum: ["CONFIRMED", "CANCELLED", "FAILED", "PENDING", "CANCEL_PENDING", "HELD", "EXPIRED"],
       default: "CONFIRMED",
     },
     isHeld: { type: Boolean, default: false },
     lastVoucherDate: { type: Date },
+    lastCancellationDate: { type: Date, default: null },
     voucherGeneratedAt: { type: Date },
     paymentStatus: {
       type: String,
