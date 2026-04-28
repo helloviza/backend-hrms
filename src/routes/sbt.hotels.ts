@@ -1249,6 +1249,17 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       | { DepartureTransportType?: number; TransportInfoId?: string; Time?: string }
       | undefined;
 
+    const isPackageFare: boolean = req.body.IsPackageFare === true;
+    const arrivalTransport = req.body.ArrivalTransport as
+      | { ArrivalTransportType?: number; TransportInfoId?: string; Time?: string }
+      | undefined;
+
+    // GAP-02: implication-rule sanity check — spec says PackageDetailsMandatory:true implies IsPackageFare:true.
+    // Log warning if we see PackageDetailsMandatory (signalled by ArrivalTransport present) without IsPackageFare.
+    if (arrivalTransport?.TransportInfoId && !isPackageFare) {
+      console.warn('[GAP-02] Spec violation: ArrivalTransport present but IsPackageFare false. Expected impossible per TBO Package Fare Validation.');
+    }
+
     const clientRef = `PLM-${Date.now()}`;
     const tboPayload: Record<string, unknown> = {
       EndUserIp: UserIp,
@@ -1262,6 +1273,16 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       ...(hotelIsCorporate ? { IsCorporate: true } : {}),
       ...(hotelIsCorporate && hotelCorporatePAN ? { CorporatePAN: hotelCorporatePAN } : {}),
     };
+    if (isPackageFare) {
+      tboPayload.IsPackageFare = true;
+    }
+    if (arrivalTransport?.TransportInfoId) {
+      tboPayload.ArrivalTransport = {
+        ArrivalTransportType: arrivalTransport.ArrivalTransportType ?? 0,
+        TransportInfoId: arrivalTransport.TransportInfoId,
+        Time: arrivalTransport.Time || "0001-01-01T00:00:00",
+      };
+    }
     if (departureTransport?.TransportInfoId) {
       tboPayload.DepartureTransport = {
         DepartureTransportType: departureTransport.DepartureTransportType ?? 0,
