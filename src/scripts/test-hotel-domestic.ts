@@ -326,7 +326,7 @@ async function main() {
   const tboBookPayload = {
     EndUserIp: END_USER_IP,
     BookingCode: updatedBookingCode,
-    ClientReferenceId: `PLM-${Date.now()}`,
+    ClientReferenceId: `PLM-${randomUUID()}`,
     GuestNationality: "IN",
     IsVoucherBooking: true,
     RequestedBookingMode: 5,

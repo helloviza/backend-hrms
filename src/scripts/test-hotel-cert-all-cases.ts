@@ -30,6 +30,7 @@
 import fs from "fs";
 import path from "path";
 import dotenv from "dotenv";
+import { randomUUID } from "crypto";
 
 dotenv.config({ path: ".env" });
 
@@ -351,7 +352,7 @@ async function runCase(cfg: CaseConfig, authLog: { req: unknown; res: unknown })
   fs.mkdirSync(caseDir, { recursive: true });
 
   const hotelCodes = cfg.isInternational ? INTL_HOTEL_CODES : DOMESTIC_HOTEL_CODES;
-  const clientRef = `PLM-CERT-${Date.now()}`;
+  const clientRef = `PLM-CERT-${randomUUID()}`;
 
   log(`\n${"=".repeat(60)}`);
   log(`Running ${cfg.label}`);
