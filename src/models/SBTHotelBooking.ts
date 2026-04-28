@@ -62,6 +62,7 @@ export interface ISBTHotelBooking extends Document {
   cancellationCharge?: number;
   refundedAmount?: number;
   changeRequestId?: string;
+  clientReferenceId?: string;
   changeRequests?: Array<{
     requestType?: string;
     requestedCheckIn?: string;
@@ -92,12 +93,12 @@ const SBTHotelBookingSchema = new Schema(
     bookingRefNo: { type: String, default: "" },
     invoiceNumber: { type: String, default: "" },
     hotelCode: { type: String, default: "" },
-    hotelName: { type: String, required: true },
+    hotelName: { type: String, default: "" },
     cityName: { type: String, default: "" },
     cityCode: { type: String, default: "" },
     countryCode: { type: String, default: "" },
-    checkIn: { type: String, required: true },
-    checkOut: { type: String, required: true },
+    checkIn: { type: String, default: "" },
+    checkOut: { type: String, default: "" },
     rooms: { type: Number, default: 1 },
     guests: [
       {
@@ -110,7 +111,7 @@ const SBTHotelBookingSchema = new Schema(
     ],
     roomName: { type: String, default: "" },
     mealType: { type: String, default: "" },
-    totalFare: { type: Number, required: true },
+    totalFare: { type: Number, default: 0 },
     netAmount: { type: Number, default: 0 },
     isPublishedFare: { type: Boolean, default: false },
     tds: { type: Number, default: 0 },
@@ -156,6 +157,7 @@ const SBTHotelBookingSchema = new Schema(
     sbtRequestId: { type: Schema.Types.ObjectId, ref: "SBTRequest", default: null, index: true },
     cancellationCharge: { type: Number, default: 0 },
     refundedAmount: { type: Number, default: 0 },
+    clientReferenceId: { type: String, sparse: true },
     changeRequestId: { type: String },
     changeRequests: [{
       requestType: { type: String },
@@ -182,6 +184,7 @@ SBTHotelBookingSchema.index({ workspaceId: 1, userId: 1, status: 1 });
 SBTHotelBookingSchema.index({ userId: 1, createdAt: -1 });
 SBTHotelBookingSchema.index({ bookingId: 1 });
 SBTHotelBookingSchema.index({ confirmationNo: 1 });
+SBTHotelBookingSchema.index({ clientReferenceId: 1 }, { unique: true, sparse: true });
 
 /* ── Sync to TravelBooking on save ── */
 function mapStatus(s: string): "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" {

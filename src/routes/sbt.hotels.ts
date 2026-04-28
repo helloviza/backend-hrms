@@ -953,6 +953,7 @@ router.post("/payment/verify", requireAuth, async (req: any, res: any) => {
 // ─── 6. POST /book ───────────────────────────────────────────────────────────
 
 router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) => {
+  let clientRef = "";
   try {
     const {
       BookingCode,
@@ -1260,7 +1261,83 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       console.warn('[GAP-02] Spec violation: ArrivalTransport present but IsPackageFare false. Expected impossible per TBO Package Fare Validation.');
     }
 
-    const clientRef = `PLM-${Date.now()}`;
+    // GAP-01: UUID-based ClientReferenceId (replaces Date.now(); cert mandate).
+    // Frontend owns the value — generate once per booking attempt and reuse across retries.
+    // Backend falls back to a new UUID if the frontend doesn't send one.
+    const _clientRefInput = typeof req.body.ClientReferenceId === "string" ? req.body.ClientReferenceId.trim() : "";
+    clientRef = _clientRefInput || `PLM-${randomUUID()}`;
+
+    // Pre-persist pattern: create a PENDING skeleton record BEFORE calling TBO.
+    // The unique sparse index on clientReferenceId serializes concurrent identical requests,
+    // closing the race window between TBO call and save.
+    const _bookUserId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    if (_bookUserId && req.workspaceObjectId) {
+      try {
+        await SBTHotelBooking.create({
+          clientReferenceId: clientRef,
+          status: "PENDING",
+          userId: _bookUserId,
+          workspaceId: req.workspaceObjectId,
+          bookingId: "",
+          confirmationNo: "",
+          hotelName: "",
+          checkIn: "",
+          checkOut: "",
+          totalFare: 0,
+          isRefundable: req.body.isRefundable !== false,
+          currency: "INR",
+          guests: [],
+          rooms: 1,
+          cancelPolicies: [],
+          paymentStatus: "pending",
+          paymentId: PaymentId || "",
+          razorpayOrderId: "",
+          razorpayAmount: 0,
+          isVouchered: false,
+        });
+      } catch (_ce: any) {
+        if (_ce?.code === 11000) {
+          // De-dupe triggered — a request with this clientReferenceId already exists.
+          const _existing = await SBTHotelBooking.findOne({ clientReferenceId: clientRef }).lean();
+          if (!_existing) return res.status(500).json({ error: "De-dupe lookup failed" });
+          if (_existing.status === "CONFIRMED" || _existing.status === "HELD") {
+            return res.json({
+              ok: true,
+              bookingId: String(_existing.bookingId ?? ""),
+              BookingId: _existing.bookingId ?? "",
+              ConfirmationNo: _existing.confirmationNo ?? "",
+              BookingRefNo: _existing.bookingRefNo ?? "",
+              isHeld: _existing.isHeld ?? _existing.status === "HELD",
+              lastVoucherDate: _existing.lastVoucherDate ?? null,
+              clientReferenceId: clientRef,
+              deduplicated: true,
+            });
+          }
+          if (_existing.status === "PENDING") {
+            return res.status(202).json({
+              ok: false,
+              status: "BOOKING_PENDING",
+              clientReferenceId: clientRef,
+              message: "A booking with this reference is already in progress.",
+              deduplicated: true,
+            });
+          }
+          // FAILED — idempotent failure return. Frontend must use a new clientReferenceId to retry.
+          return res.json({
+            ok: false,
+            status: _existing.status,
+            clientReferenceId: clientRef,
+            failureReason: _existing.failureReason || "Booking previously failed.",
+            deduplicated: true,
+          });
+        }
+        // Non-duplicate error: log and continue — don't block the booking.
+        sbtLogger.warn("Hotel pre-persist failed (non-E11000) — continuing without de-dupe guard", {
+          error: _ce?.message, clientRef,
+        });
+      }
+    }
+
     const tboPayload: Record<string, unknown> = {
       EndUserIp: UserIp,
       BookingCode,
@@ -1349,6 +1426,19 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       searchCache.clear();
       bookingCodeTimestamps.clear();
 
+      // GAP-01: Update pre-persist skeleton to CONFIRMED/HELD with TBO booking details.
+      try {
+        await SBTHotelBooking.findOneAndUpdate(
+          { clientReferenceId: clientRef },
+          { $set: {
+            status: isHeld ? "HELD" : "CONFIRMED",
+            bookingId: String(result?.BookingId ?? ""),
+            confirmationNo: String(result?.ConfirmationNo ?? ""),
+            bookingRefNo: String(result?.BookingRefNo ?? ""),
+          }},
+        );
+      } catch { /* non-fatal — booking succeeded; DB update is best-effort */ }
+
       res.json({
         ok: true,
         bookingId: String(result?.BookingId ?? ""),
@@ -1362,6 +1452,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         lastVoucherDate,
         priceChangedDuringBook,
         priceChangeAmount,
+        clientReferenceId: clientRef,
         raw: data,
       });
 
@@ -1586,6 +1677,10 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         sbtLogger.error("Hotel booking rejected by supplier — BookingId: 0", {
           providerError, providerCode, bookingMode, userId: req.user?.id, BookingCode,
         });
+        SBTHotelBooking.findOneAndUpdate(
+          { clientReferenceId: clientRef },
+          { $set: { status: "FAILED", failureReason: providerError } },
+        ).catch(() => {});
         return res.status(502).json({
           ok: false,
           error: "Plumtrips could not confirm this reservation. Please try again or contact support.",
@@ -1671,6 +1766,12 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Hotel booking failed";
     sbtLogger.error("Hotel booking failed", { userId: req.user?.id, error: msg });
+    if (clientRef) {
+      SBTHotelBooking.findOneAndUpdate(
+        { clientReferenceId: clientRef },
+        { $set: { status: "FAILED", failureReason: msg } },
+      ).catch(() => {});
+    }
     res.status(500).json({ error: msg });
   }
 });
@@ -1823,7 +1924,8 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       }
     }
 
-    const doc = await SBTHotelBooking.create({
+    // GAP-01: Shared booking data for both pre-persist update and fresh create paths.
+    const _bookingData = {
       userId,
       customerId: (req.user as any)?.customerId ?? undefined,
       sbtRequestId: b.sbtRequestId || undefined,
@@ -1870,7 +1972,31 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       tds: typeof b.tds === "number" ? b.tds : 0,
       agentCommission: typeof b.agentCommission === "number" ? b.agentCommission : 0,
       bookedAt: new Date(),
-    });
+    };
+
+    // GAP-01: If clientReferenceId is provided, try to fill in the pre-persist skeleton created
+    // by /book, so we end up with ONE record (not two) for the same booking.
+    // Using existing.set().save() triggers the TravelBooking post-save sync hook.
+    let doc: any;
+    const b_cref = typeof b.clientReferenceId === "string" ? b.clientReferenceId : "";
+    if (b_cref) {
+      const prePersist = await SBTHotelBooking.findOne({ clientReferenceId: b_cref });
+      if (prePersist) {
+        if (prePersist.hotelName) {
+          // Already fully saved — idempotent return (e.g. double submit, webhook race).
+          return res.json({ ok: true, booking: prePersist.toJSON(), idempotent: true });
+        }
+        // Pre-persist skeleton — update with full booking data and save (triggers post-save hook).
+        prePersist.set(_bookingData);
+        doc = await prePersist.save();
+      }
+    }
+    if (!doc) {
+      doc = await SBTHotelBooking.create({
+        ...(b_cref ? { clientReferenceId: b_cref } : {}),
+        ..._bookingData,
+      });
+    }
 
     // Increment workspace monthly spend for official bookings — never for hold bookings
     if (b.paymentMode === "official" && !b.isHeld && req.workspaceObjectId) {
