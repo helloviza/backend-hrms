@@ -102,6 +102,7 @@ export interface ApprovalHistoryItem {
   comment?: string;
   userName?: string;
   userEmail?: string;
+  tokenHash?: string;
 }
 
 export interface ApprovalRequestDocument extends Document {
@@ -347,6 +348,7 @@ const HistorySchema = new Schema<ApprovalHistoryItem>(
     comment: { type: String },
     userName: { type: String },
     userEmail: { type: String },
+    tokenHash: { type: String, default: "" },
   },
   { _id: false },
 );

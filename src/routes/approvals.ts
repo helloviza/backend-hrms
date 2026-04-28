@@ -1,6 +1,7 @@
 // apps/backend/src/routes/approvals.ts
 import { Router } from "express";
 import mongoose from "mongoose";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import multer from "multer";
@@ -59,6 +60,8 @@ import {
   buildApproverEmailHtml,
   buildLeaderFyiHtml,
   buildRequesterApprovedHtml,
+  buildRequestDeclinedEmailHtml,
+  buildRequestOnHoldEmailHtml,
   buildEmailAttachmentsFromMeta,
   buildEmailShell,
   eLabel,
@@ -1017,6 +1020,48 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
       }
     }
 
+    // Notify requester when declined
+    if (action === "declined" && !DISABLE_EMAILS) {
+      const requesterEmailDecl = normEmail(doc.frontlinerEmail || "");
+      if (requesterEmailDecl) {
+        try {
+          await sendMail({
+            kind: "CONFIRMATIONS",
+            to: requesterEmailDecl,
+            subject: `Your Travel Request Has Been Declined — ${doc.ticketId || ""}`,
+            html: buildRequestDeclinedEmailHtml({
+              ticketId: doc.ticketId,
+              requesterName: frontlinerDisplayName,
+              managerName: userName || doc.managerName || "Approver",
+              comment: comment || "",
+              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
+            }),
+          });
+        } catch { /* non-blocking */ }
+      }
+    }
+
+    // Notify requester when on hold
+    if (action === "on_hold" && !DISABLE_EMAILS) {
+      const requesterEmailHld = normEmail(doc.frontlinerEmail || "");
+      if (requesterEmailHld) {
+        try {
+          await sendMail({
+            kind: "CONFIRMATIONS",
+            to: requesterEmailHld,
+            subject: `Your Travel Request is On Hold — ${doc.ticketId || ""}`,
+            html: buildRequestOnHoldEmailHtml({
+              ticketId: doc.ticketId,
+              requesterName: frontlinerDisplayName,
+              managerName: userName || doc.managerName || "Approver",
+              comment: comment || "",
+              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
+            }),
+          });
+        } catch { /* non-blocking */ }
+      }
+    }
+
     res.json({ ok: true, request: doc, message: "Updated" });
   } catch (err) {
     next(err);
@@ -1110,13 +1155,11 @@ router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res
 router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj, res, next) => {
   try {
     const doc = await ApprovalRequest
-      .findById(req.params.id)
+      .findOne({ _id: req.params.id, workspaceId: req.workspaceObjectId })
       .populate("workspaceId", "name companyName config")
       .lean();
 
     if (!doc) return res.status(404).json({ error: "Request not found" });
-
-    console.log('[ApprovalRequest] full doc:', JSON.stringify(doc, null, 2));
 
     res.json(doc);
   } catch (err: any) {
@@ -1130,7 +1173,7 @@ router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj,
 
 router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
   try {
-    const doc: any = await ApprovalRequest.findById(req.params.id);
+    const doc: any = await ApprovalRequest.findOne({ _id: req.params.id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Not found" });
 
     doc.adminState = "in_progress";
@@ -1159,7 +1202,7 @@ router.put("/admin/:id/assign", requireApprovalsAdminWrite, async (req: AnyObj, 
     const id = String(req.params.id || "");
     const { agentType, agentName, comment } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findById(id);
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     doc.adminState = "assigned";
@@ -1197,7 +1240,7 @@ router.put(
       const id = String(req.params.id || "");
       const { comment } = req.body || {};
 
-      const doc: any = await ApprovalRequest.findById(id);
+      const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
       if (!doc) return res.status(404).json({ error: "Request not found" });
 
       const st = String(doc.stage || "").toUpperCase();
@@ -1247,7 +1290,7 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
     const id = String(req.params.id || "");
     const { comment, notifyEmail, bookingAmount, actualBookingPrice } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findById(id);
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     if (doc.stage !== "BOOKING_IN_PROGRESS") {
@@ -1655,8 +1698,14 @@ router.post("/email/consume", async (req: AnyObj, res) => {
       return res.status(400).json({ error: "Token/action mismatch" });
     }
 
-    const doc: any = await ApprovalRequest.findOne({ _id: rid, workspaceId: req.workspaceObjectId });
+    const doc: any = await ApprovalRequest.findOne({ _id: rid });
     if (!doc) return res.status(404).json({ error: "Request not found" });
+
+    // Single-use token enforcement
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    if (Array.isArray(doc.history) && doc.history.some((h: any) => h.tokenHash && h.tokenHash === tokenHash)) {
+      return res.status(409).json({ error: "This approval link has already been used." });
+    }
 
     // Resolve frontliner display name from DB if stored name is missing or was "User"
     let frontlinerDisplayNameEmail = normStr(doc.frontlinerName || "");
@@ -1719,6 +1768,7 @@ router.post("/email/consume", async (req: AnyObj, res) => {
       comment,
       userEmail: approverEmail,
       userName: doc.managerName || "Approver",
+      tokenHash,
     });
 
     await doc.save();
@@ -1773,6 +1823,48 @@ router.post("/email/consume", async (req: AnyObj, res) => {
       }
     }
 
+    // notify requester if declined via email link
+    if (action === "declined" && !DISABLE_EMAILS) {
+      const requesterEmailDecline = normEmail(doc.frontlinerEmail || "");
+      if (requesterEmailDecline) {
+        try {
+          await sendMail({
+            kind: "CONFIRMATIONS",
+            to: requesterEmailDecline,
+            subject: `Your Travel Request Has Been Declined — ${doc.ticketId || ""}`,
+            html: buildRequestDeclinedEmailHtml({
+              ticketId: doc.ticketId,
+              requesterName: frontlinerDisplayNameEmail,
+              managerName: doc.managerName || "Approver",
+              comment: comment || "",
+              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
+            }),
+          });
+        } catch { /* non-blocking */ }
+      }
+    }
+
+    // notify requester if on_hold via email link
+    if (action === "on_hold" && !DISABLE_EMAILS) {
+      const requesterEmailHold = normEmail(doc.frontlinerEmail || "");
+      if (requesterEmailHold) {
+        try {
+          await sendMail({
+            kind: "CONFIRMATIONS",
+            to: requesterEmailHold,
+            subject: `Your Travel Request is On Hold — ${doc.ticketId || ""}`,
+            html: buildRequestOnHoldEmailHtml({
+              ticketId: doc.ticketId,
+              requesterName: frontlinerDisplayNameEmail,
+              managerName: doc.managerName || "Approver",
+              comment: comment || "",
+              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
+            }),
+          });
+        } catch { /* non-blocking */ }
+      }
+    }
+
     return res.json({
       ok: true,
       request: doc.toObject(),
@@ -1788,6 +1880,229 @@ router.post("/email/consume", async (req: AnyObj, res) => {
           ? { message: String(err?.message || err), stack: err?.stack }
           : undefined,
     });
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
+ * Admin: on-hold
+ * PUT /admin/:id/on-hold
+ * ──────────────────────────────────────────────────────────────── */
+
+router.put("/admin/:id/on-hold", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
+  try {
+    setNoStore(res);
+
+    const id = String(req.params.id || "");
+    const { comment } = req.body || {};
+
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    if (!doc) return res.status(404).json({ error: "Request not found" });
+
+    doc.adminState = "on_hold";
+
+    doc.history = Array.isArray(doc.history) ? doc.history : [];
+    doc.history.push({
+      action: "admin_on_hold",
+      at: new Date(),
+      by: String(req.user?.sub || req.user?._id || ""),
+      comment: String(comment || "").trim() || undefined,
+      userEmail: normEmail(req.user?.email),
+      userName: req.user?.name || req.user?.firstName || "",
+    });
+
+    await doc.save();
+    res.json({ ok: true, request: doc, message: "Placed on hold" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
+ * Admin: cancel
+ * PUT /admin/:id/cancel
+ * ──────────────────────────────────────────────────────────────── */
+
+router.put("/admin/:id/cancel", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
+  try {
+    setNoStore(res);
+
+    const id = String(req.params.id || "");
+    const { comment } = req.body || {};
+
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    if (!doc) return res.status(404).json({ error: "Request not found" });
+
+    doc.adminState = "cancelled";
+    doc.stage = "BOOKING_CANCELLED";
+
+    doc.history = Array.isArray(doc.history) ? doc.history : [];
+    doc.history.push({
+      action: "admin_cancelled",
+      at: new Date(),
+      by: String(req.user?.sub || req.user?._id || ""),
+      comment: String(comment || "").trim() || undefined,
+      userEmail: normEmail(req.user?.email),
+      userName: req.user?.name || req.user?.firstName || "",
+    });
+
+    await doc.save();
+    res.json({ ok: true, request: doc, message: "Cancelled" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
+ * L1: Revoke (owner-only, pending requests)
+ * PUT /requests/:id/revoke
+ * ──────────────────────────────────────────────────────────────── */
+
+router.put("/requests/:id/revoke", requireAuth, requireWorkspace, async (req: AnyObj, res, next) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid request id" });
+    }
+
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    if (!doc) return res.status(404).json({ error: "Request not found" });
+
+    if (!isOwnerOfRequest(doc, req.user) && !isStaffAdmin(req.user)) {
+      return res.status(403).json({ error: "Only the requester can revoke this request" });
+    }
+
+    const statusNow = String(doc.status || "").toLowerCase();
+    if (statusNow !== "pending") {
+      return res.status(400).json({ error: "Only pending requests can be revoked" });
+    }
+
+    const sub = String(req.user?.sub || req.user?._id || "");
+    const comment = normStr(req.body?.comment || "");
+
+    const updated = await ApprovalRequest.findOneAndUpdate(
+      { _id: id, workspaceId: req.workspaceObjectId },
+      {
+        $set: { status: "declined", stage: "REQUEST_DECLINED", adminState: "cancelled", "meta.revoked": true },
+        $push: {
+          history: {
+            action: "revoked",
+            at: new Date(),
+            by: sub || "unknown",
+            comment: comment || "Revoked by requester",
+            userEmail: normEmail(req.user?.email),
+            userName: normStr(req.user?.name || req.user?.firstName || ""),
+          },
+        },
+      },
+      { new: true }
+    );
+
+    res.json({ ok: true, request: updated, message: "Request revoked" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
+ * L1: Resubmit (owner-only, declined requests)
+ * PUT /requests/:id/resubmit
+ * ──────────────────────────────────────────────────────────────── */
+
+router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid request id" });
+    }
+
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    if (!doc) return res.status(404).json({ error: "Request not found" });
+
+    if (!isOwnerOfRequest(doc, req.user) && !isStaffAdmin(req.user)) {
+      return res.status(403).json({ error: "Only the requester can resubmit this request" });
+    }
+
+    const statusNow = String(doc.status || "").toLowerCase();
+    if (statusNow !== "declined") {
+      return res.status(400).json({ error: "Only declined requests can be resubmitted" });
+    }
+
+    const sub = String(req.user?.sub || req.user?._id || "");
+    const email = normEmail(req.user?.email);
+    const userName = normStr(req.user?.name || req.user?.firstName || "");
+    const { cartItems, comment } = req.body || {};
+
+    const approverEmail = normEmail(doc.managerEmail || "");
+    if (!approverEmail) {
+      return res.status(400).json({ error: "Approver email missing on this request" });
+    }
+
+    const setFields: AnyObj = {
+      status: "pending",
+      stage: "REQUEST_RAISED",
+      "meta.revoked": false,
+    };
+    if (Array.isArray(cartItems) && cartItems.length > 0) {
+      setFields.cartItems = cartItems;
+    }
+
+    const updated: any = await ApprovalRequest.findOneAndUpdate(
+      { _id: id, workspaceId: req.workspaceObjectId },
+      {
+        $set: setFields,
+        $unset: { adminState: "" },
+        $push: {
+          history: {
+            action: "resubmitted",
+            at: new Date(),
+            by: sub || "unknown",
+            comment: String(comment || "").trim() || "Resubmitted by requester",
+            userEmail: email,
+            userName,
+          },
+        },
+      },
+      { new: true }
+    );
+
+    // Re-send approval email to L2
+    try {
+      if (!DISABLE_EMAILS) {
+        const requesterDisplayName = normStr(doc.frontlinerName || email.split("@")[0] || "User");
+        const items = Array.isArray(updated.cartItems) ? updated.cartItems : Array.isArray(doc.cartItems) ? doc.cartItems : [];
+
+        const tokenApprove = signEmailActionToken({ rid: id, approverEmail, action: "approved" });
+        const tokenDecline = signEmailActionToken({ rid: id, approverEmail, action: "declined" });
+        const tokenHold = signEmailActionToken({ rid: id, approverEmail, action: "on_hold" });
+
+        const approveUrl = buildEmailUiActionUrl(tokenApprove, "approved");
+        const declineUrl = buildEmailUiActionUrl(tokenDecline, "declined");
+        const holdUrl = buildEmailUiActionUrl(tokenHold, "on_hold");
+
+        await sendMail({
+          kind: "REQUESTS",
+          to: approverEmail,
+          subject: `Approval Needed (Resubmit) — ${doc.customerName || "Workspace"}${doc.ticketId ? ` (${doc.ticketId})` : ""}`,
+          replyTo: email || undefined,
+          html: buildApproverEmailHtml({
+            requestId: id,
+            requesterName: requesterDisplayName,
+            requesterEmail: email,
+            customerName: doc.customerName || "Workspace",
+            ticketId: updated.ticketId,
+            items,
+            comments: updated.comments,
+            approveUrl,
+            declineUrl,
+            holdUrl,
+          }),
+        });
+      }
+    } catch { /* non-blocking */ }
+
+    res.json({ ok: true, request: updated, message: "Resubmitted" });
+  } catch (err) {
+    next(err);
   }
 });
 

@@ -29,6 +29,8 @@ import {
   eCard,
   eRow,
   buildAdminProcessedEmailHtml,
+  buildProposalApprovedEmailHtml,
+  buildProposalDeclinedEmailHtml,
   sanitizeAdminCommentForEmail,
 } from "./approvals.email.js";
 
@@ -1060,6 +1062,25 @@ router.get("/email-action", async (req: Request, res: Response) => {
       doc.status = "DECLINED";
       await doc.save();
       if (doc.requestId) await safeAdvanceStage(doc.requestId, "PROPOSAL_DECLINED", { workspaceId: doc.workspaceId });
+
+      // Notify L1
+      try {
+        const arDecline: any = doc.requestId ? await ApprovalRequest.findById(doc.requestId).select("frontlinerEmail frontlinerName ticketId").lean() : null;
+        if (arDecline?.frontlinerEmail) {
+          const sendMail = sendMailAny as any;
+          await sendMail({
+            kind: "CONFIRMATIONS",
+            to: normEmail(arDecline.frontlinerEmail),
+            subject: `Your Travel Proposal Has Been Declined — ${arDecline.ticketId || ""}`,
+            html: buildProposalDeclinedEmailHtml({
+              requesterName: normStr(arDecline.frontlinerName || ""),
+              ticketId: arDecline.ticketId,
+              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
+            }),
+          });
+        }
+      } catch { /* non-blocking */ }
+
       return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=1&status=DECLINED`);
     }
 
@@ -1068,6 +1089,25 @@ router.get("/email-action", async (req: Request, res: Response) => {
       doc.status = "APPROVED";
       await doc.save();
       if (doc.requestId) await safeAdvanceStage(doc.requestId, "PROPOSAL_APPROVED", { workspaceId: doc.workspaceId });
+
+      // Notify L1
+      try {
+        const arApprove: any = doc.requestId ? await ApprovalRequest.findById(doc.requestId).select("frontlinerEmail frontlinerName ticketId").lean() : null;
+        if (arApprove?.frontlinerEmail) {
+          const sendMail = sendMailAny as any;
+          await sendMail({
+            kind: "CONFIRMATIONS",
+            to: normEmail(arApprove.frontlinerEmail),
+            subject: `Your Travel Proposal Has Been Approved — ${arApprove.ticketId || ""}`,
+            html: buildProposalApprovedEmailHtml({
+              requesterName: normStr(arApprove.frontlinerName || ""),
+              ticketId: arApprove.ticketId,
+              loginUrl: `${frontendBaseUrl()}/customer/approvals/proposals`,
+            }),
+          });
+        }
+      } catch { /* non-blocking */ }
+
       return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=1&status=APPROVED`);
     }
 
@@ -1092,10 +1132,9 @@ router.get("/inbox", requireAnyAuth, requireWorkspace, async (req: Request, res:
 
     const proposalFilter: any = {
       status: "SUBMITTED",
+      workspaceId: (req as any).workspaceObjectId,
       $or: [{ "approvals.l2.decision": "PENDING" }, { "approvals.l0.decision": "PENDING" }],
     };
-    const qsWsInbox = String((req.query as any)?.workspaceId || "").trim();
-    if (qsWsInbox && mongoose.Types.ObjectId.isValid(qsWsInbox)) proposalFilter.workspaceId = new mongoose.Types.ObjectId(qsWsInbox);
     const proposals = await Proposal.find(proposalFilter)
       .sort({ updatedAt: -1 })
       .limit(200)
@@ -1255,7 +1294,7 @@ router.get("/queue", requireAnyAuth, requireWorkspace, requireStaff, async (req:
     const l0 = normStr(req.query?.l0 || "").toUpperCase();
     const bookingStatus = normStr(req.query?.bookingStatus || "").toUpperCase();
 
-    const q: AnyObj = {};
+    const q: AnyObj = { workspaceId: (req as any).workspaceObjectId };
     if (["DRAFT", "SUBMITTED", "APPROVED", "DECLINED", "EXPIRED"].includes(status)) q.status = status;
     if (["PENDING", "APPROVED", "DECLINED"].includes(l2)) q["approvals.l2.decision"] = l2;
     if (["PENDING", "APPROVED", "DECLINED"].includes(l0)) q["approvals.l0.decision"] = l0;
@@ -1986,7 +2025,7 @@ router.post(
       const reason = normStr(body?.reason || body?.comment || "");
 
       ar.adminState = "cancelled";
-      ar.stage = "REQUEST_DECLINED";
+      ar.stage = "BOOKING_CANCELLED";
       ar.history = Array.isArray(ar.history) ? ar.history : [];
       ar.history.push({
         action: "booking_cancelled",
@@ -2113,6 +2152,24 @@ router.post("/:id/decide", requireAnyAuth, requireWorkspace, requireProposalView
       await doc.save();
       if (doc.requestId) await safeAdvanceStage(doc.requestId, "PROPOSAL_DECLINED", { workspaceId: (req as any).workspaceObjectId });
 
+      // Notify L1 (frontliner)
+      try {
+        const arForNotify: any = ar || (doc.requestId ? await ApprovalRequest.findById(doc.requestId).select("frontlinerEmail frontlinerName ticketId").lean() : null);
+        if (arForNotify?.frontlinerEmail) {
+          const sendMail = sendMailAny as any;
+          await sendMail({
+            kind: "CONFIRMATIONS",
+            to: normEmail(arForNotify.frontlinerEmail),
+            subject: `Your Travel Proposal Has Been Declined — ${arForNotify.ticketId || ""}`,
+            html: buildProposalDeclinedEmailHtml({
+              requesterName: normStr(arForNotify.frontlinerName || ""),
+              ticketId: arForNotify.ticketId,
+              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
+            }),
+          });
+        }
+      } catch { /* non-blocking */ }
+
       const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
       return res.json({ ok: true, proposal: enriched[0], needL0 });
     }
@@ -2122,6 +2179,24 @@ router.post("/:id/decide", requireAnyAuth, requireWorkspace, requireProposalView
       doc.status = "APPROVED" as ProposalStatus;
       await doc.save();
       if (doc.requestId) await safeAdvanceStage(doc.requestId, "PROPOSAL_APPROVED", { workspaceId: (req as any).workspaceObjectId });
+
+      // Notify L1 (frontliner)
+      try {
+        const arForNotify: any = ar || (doc.requestId ? await ApprovalRequest.findById(doc.requestId).select("frontlinerEmail frontlinerName ticketId").lean() : null);
+        if (arForNotify?.frontlinerEmail) {
+          const sendMail = sendMailAny as any;
+          await sendMail({
+            kind: "CONFIRMATIONS",
+            to: normEmail(arForNotify.frontlinerEmail),
+            subject: `Your Travel Proposal Has Been Approved — ${arForNotify.ticketId || ""}`,
+            html: buildProposalApprovedEmailHtml({
+              requesterName: normStr(arForNotify.frontlinerName || ""),
+              ticketId: arForNotify.ticketId,
+              loginUrl: `${frontendBaseUrl()}/customer/approvals/proposals`,
+            }),
+          });
+        }
+      } catch { /* non-blocking */ }
 
       const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
       return res.json({ ok: true, proposal: enriched[0], needL0 });
