@@ -15,7 +15,7 @@ import { logTBOCall } from "../utils/tboFileLogger.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { getMarginConfig, applyMargin } from "../utils/margin.js";
-import { getTBOToken } from "../services/tbo.auth.service.js";
+import { getTBOToken, clearTBOToken } from "../services/tbo.auth.service.js";
 import { getCompanySettings } from "../utils/companySettings.js";
 import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES } from "../shared/cities.js";
 
@@ -1406,6 +1406,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     const t0 = Date.now();
     let data: any;
     let bookTimedOut = false;
+    let _retried = false;
 
     try {
       const bookController = new AbortController();
@@ -1426,6 +1427,54 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         data = (await tboRes.json()) as any;
       } finally {
         clearTimeout(bookTimer);
+      }
+
+      // GAP-03: InValidSession retry — mirrors tbo.flight.service.ts:167 (ResponseStatus=4 or ErrorCode=6)
+      // Distinct from GAP-31: BookingCode age (410) is checked before the TBO call; this check runs after.
+      const _bookResult0 = data?.BookResult || data;
+      if (
+        (_bookResult0?.ResponseStatus === 4 || _bookResult0?.Error?.ErrorCode === 6) &&
+        !_retried
+      ) {
+        _retried = true;
+        sbtLogger.warn("TBO Hotel Book InValidSession — clearing token and retrying", {
+          userId: req.user?.id, clientRef,
+          ResponseStatus: _bookResult0?.ResponseStatus,
+          ErrorCode: _bookResult0?.Error?.ErrorCode,
+        });
+        clearTBOToken();
+        await getTBOToken({ forceRefresh: true });
+        const _srController = new AbortController();
+        const _srTimer = setTimeout(() => _srController.abort(), 120_000);
+        const _srT0 = Date.now();
+        try {
+          const _srRes = await fetch(
+            "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
+              body: JSON.stringify(tboPayload),
+              signal: _srController.signal,
+            }
+          );
+          data = (await _srRes.json()) as any;
+          logTBOCall({
+            method: "HotelBook-SessionRetry",
+            traceId: `hotel-book-session-retry-${clientRef}`,
+            request: tboPayload,
+            response: data,
+            durationMs: Date.now() - _srT0,
+          });
+        } finally {
+          clearTimeout(_srTimer);
+        }
+        const _retryResult0 = data?.BookResult || data;
+        if (_retryResult0?.ResponseStatus === 4 || _retryResult0?.Error?.ErrorCode === 6) {
+          return res.status(502).json({
+            code: "TBO_AUTH_PERSISTENT_FAILURE",
+            message: "Authentication failed after retry. Please try again later.",
+          });
+        }
       }
     } catch (bookErr: any) {
       const isTimeout = bookErr?.name === "AbortError";
