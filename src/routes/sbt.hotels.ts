@@ -1245,7 +1245,9 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         }))
       : [{ HotelPassenger: buildRoomPassengers({ Guests: Guests || [] }) }];
 
-    const { DepartureCity, DepartureDate, FlightNumber } = req.body as any;
+    const departureTransport = req.body.DepartureTransport as
+      | { DepartureTransportType?: number; TransportInfoId?: string; Time?: string }
+      | undefined;
 
     const clientRef = `PLM-${Date.now()}`;
     const tboPayload: Record<string, unknown> = {
@@ -1260,10 +1262,12 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       ...(hotelIsCorporate ? { IsCorporate: true } : {}),
       ...(hotelIsCorporate && hotelCorporatePAN ? { CorporatePAN: hotelCorporatePAN } : {}),
     };
-    if (DepartureCity) {
-      tboPayload.DepartureCity = DepartureCity;
-      tboPayload.DepartureDate = DepartureDate || "";
-      tboPayload.FlightNumber = FlightNumber || "";
+    if (departureTransport?.TransportInfoId) {
+      tboPayload.DepartureTransport = {
+        DepartureTransportType: departureTransport.DepartureTransportType ?? 0,
+        TransportInfoId: departureTransport.TransportInfoId,
+        Time: departureTransport.Time || "0001-01-01T00:00:00",
+      };
     }
 
     // Helper: call GetBookingDetail to verify actual booking status
