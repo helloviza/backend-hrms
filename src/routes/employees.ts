@@ -11,6 +11,9 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 import { validateObjectId } from "../middleware/validateObjectId.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { sendEmployeeInvite } from "../services/email.service.js";
+import { UserPermission } from "../models/UserPermission.js";
+import { LEVEL_TEMPLATES } from "../config/levelTemplates.js";
+import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
 import crypto from "crypto";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
@@ -419,12 +422,35 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       // UPDATE existing user
       Object.assign(user, commonFields);
       const saved = await user.save();
+
+      // Create UserPermission if this user doesn't have one yet
+      try {
+        const existingPerm = await UserPermission.findOne({ userId: String(user._id) }).lean();
+        if (!existingPerm) {
+          await UserPermission.create({
+            userId: String(user._id),
+            email: officialEmail,
+            workspaceId: String(req.workspaceObjectId),
+            universe: "STAFF",
+            level: { code: "L1", name: "Employee", designation: "" },
+            modules: { ...LEVEL_TEMPLATES["L1"] },
+            tier: 1,
+            roleType: "EMPLOYEE",
+            source: "system",
+            status: "active",
+            grantedBy: req.user?.email || String(req.user?._id || "system"),
+            grantedAt: new Date(),
+          });
+        }
+      } catch (permErr: any) {
+        console.error("[POST /employees] UserPermission create for existing user failed:", permErr?.message);
+      }
+
       return res.json(sanitise(saved));
     }
 
     // CREATE new user – we must provide a passwordHash.
-    const tempPassword =
-      "HRMS-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const tempPassword = "Welcome@123";
     const passwordHash = await bcrypt.hash(tempPassword, 10);
 
     const payload: any = {
@@ -439,6 +465,44 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
     };
 
     const created = await User.create(payload);
+
+    // ── Auto-create UserPermission with L1 (Employee) defaults ──
+    try {
+      const existingPerm = await UserPermission.findOne({ userId: String(created._id) }).lean();
+      if (!existingPerm) {
+        await UserPermission.create({
+          userId: String(created._id),
+          email: officialEmail,
+          workspaceId: String(req.workspaceObjectId),
+          universe: "STAFF",
+          level: { code: "L1", name: "Employee", designation: "" },
+          modules: { ...LEVEL_TEMPLATES["L1"] },
+          tier: 1,
+          roleType: "EMPLOYEE",
+          source: "system",
+          status: "active",
+          grantedBy: req.user?.email || String(req.user?._id || "system"),
+          grantedAt: new Date(),
+        });
+      }
+    } catch (permErr: any) {
+      console.error("[POST /employees] UserPermission auto-create failed:", permErr?.message);
+    }
+
+    // ── Send welcome email with credentials ──
+    try {
+      const loginUrl = String(process.env.FRONTEND_ORIGIN || "http://localhost:5173").replace(/\/+$/, "");
+      await sendCredentialsEmail({
+        to: officialEmail,
+        name: fullName || officialEmail,
+        officialEmail,
+        tempPassword,
+        loginUrl,
+        employeeCode: (created as any).employeeCode || employeeCode || "",
+      });
+    } catch (emailErr: any) {
+      console.error("[POST /employees] welcome email failed:", emailErr?.message);
+    }
 
     // ── Optional: send workspace invite ──
     let inviteSent = false;
