@@ -994,6 +994,19 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     const nameMinLen = charLimit ? paxNameMinLength + 1 : 2;
     const nameMaxLen = charLimit ? paxNameMaxLength : 50;
 
+    // GAP-05: dynamic name character set and adult uniqueness from PreBook validationFlags.
+    // SpaceAllowed/SpecialCharAllowed default true (conservative — allow unless explicitly denied).
+    // SamePaxNameAllowed default false (conservative — enforce uniqueness unless explicitly allowed).
+    // SamePaxNameAllowed spec default not verified from file (spec not in repo); conservative default applied.
+    const spaceAllowed: boolean = validationFlags.SpaceAllowed !== false;
+    const specialCharAllowed: boolean = validationFlags.SpecialCharAllowed !== false;
+    const samePaxNameAllowed: boolean = validationFlags.SamePaxNameAllowed === true;
+    let nameCharClass = "a-zA-Z";
+    if (spaceAllowed) nameCharClass += "\\s";
+    if (specialCharAllowed) nameCharClass += "'-";
+    const nameCharRegex = new RegExp(`^[${nameCharClass}]+$`);
+    const adultNameSeen = new Set<string>();
+
     for (const g of allGuests) {
       if (Number(g.PaxType) !== 1) continue; // children validated under GAP-09
       const fn = String(g.FirstName || "").trim();
@@ -1008,10 +1021,22 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           error: `Each adult guest's first and last name must be at most ${nameMaxLen} characters.`,
         });
       }
-      if (!/^[a-zA-Z\s'-]+$/.test(fn) || !/^[a-zA-Z\s'-]+$/.test(ln)) {
+      if (!nameCharRegex.test(fn) || !nameCharRegex.test(ln)) {
+        const allowed = ["letters"];
+        if (spaceAllowed) allowed.push("spaces");
+        if (specialCharAllowed) allowed.push("hyphens and apostrophes");
         return res.status(400).json({
-          error: "Guest names can only contain letters, spaces, hyphens, and apostrophes.",
+          error: `Guest names can only contain ${allowed.join(", ")}.`,
         });
+      }
+      if (!samePaxNameAllowed) {
+        const nameKey = `${fn.toLowerCase()}|${ln.toLowerCase()}`;
+        if (adultNameSeen.has(nameKey)) {
+          return res.status(400).json({
+            error: "Two adult guests share the same name, which is not permitted for this property.",
+          });
+        }
+        adultNameSeen.add(nameKey);
       }
     }
 
