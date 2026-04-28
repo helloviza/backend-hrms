@@ -7,6 +7,7 @@ import { LEVEL_TEMPLATES, LEVEL_METADATA } from '../config/levelTemplates.js'
 import BillingPermission from '../models/BillingPermission.js'
 import User from '../models/User.js'
 import logger from '../utils/logger.js'
+import { MODULE_GROUP_MAP } from '../utils/moduleGroups.js'
 
 const router = express.Router()
 
@@ -147,6 +148,24 @@ router.get('/my-access', requireAuth, async (req: any, res: any) => {
       const doc: any = { ...perm }
       doc.grantedModules = ['bookings', 'billing', 'profile']
       return res.json(doc)
+    }
+
+    // Derive grantedModules from modules object for STAFF users so that
+    // nav sections appear even when the DB doc's grantedModules array is empty.
+    if (perm.universe === 'STAFF') {
+      const modules = (perm.modules as any) || {}
+      const existingGranted = perm.grantedModules || []
+      const derived = new Set<string>(existingGranted)
+
+      for (const [group, children] of Object.entries(MODULE_GROUP_MAP)) {
+        const hasAny = children.some((child: string) => {
+          const m = modules[child]
+          return m?.access && m.access !== 'NONE'
+        })
+        if (hasAny) derived.add(group)
+      }
+
+      return res.json({ ...perm, grantedModules: Array.from(derived) })
     }
 
     return res.json(perm)
