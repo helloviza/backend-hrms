@@ -242,8 +242,21 @@ interface CityEntry {
 const cityCache = new Map<string, { data: CityEntry[]; ts: number }>();
 const CITY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
 
+const HOTEL_SESSION_TTL_MS = 40 * 60 * 1000; // 40 minutes per TBO Op Rule 7
+
 const searchCache = new Map<string, { data: unknown; ts: number }>();
-const SEARCH_CACHE_TTL = 5 * 60 * 1000; // 5min
+// bookingCodeTimestamps maps each TBO BookingCode → search timestamp for session-age validation
+const bookingCodeTimestamps = new Map<string, number>();
+
+function validateBookingCodeAge(bookingCode: string): boolean {
+  const ts = bookingCodeTimestamps.get(bookingCode);
+  if (!ts) return false;
+  if (Date.now() - ts > HOTEL_SESSION_TTL_MS) {
+    bookingCodeTimestamps.delete(bookingCode);
+    return false;
+  }
+  return true;
+}
 
 const hotelDetailsCache = new Map<string, { data: any; ts: number }>();
 const DETAILS_CACHE_TTL = 60 * 60 * 1000; // 1 hour
@@ -713,7 +726,16 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
     }
 
     const searchId = randomUUID();
-    searchCache.set(searchId, { data: allResults, ts: Date.now() });
+    const searchTs = Date.now();
+    searchCache.set(searchId, { data: allResults, ts: searchTs });
+    // Register every BookingCode from this search for 40-minute session-age validation
+    for (const h of allResults as any[]) {
+      if (Array.isArray(h?.Rooms)) {
+        for (const r of h.Rooms) {
+          if (r?.BookingCode) bookingCodeTimestamps.set(r.BookingCode, searchTs);
+        }
+      }
+    }
 
     // RC1: TotalFare stays TBO-raw (Rule 1 compliance). Markup exposed separately
     // via _markupAmount + _displayTotalFare so frontend can show transparent breakdown.
@@ -765,6 +787,13 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
 
     const { BookingCode, searchPrice } = req.body;
     if (!BookingCode) return res.status(400).json({ error: "BookingCode required" });
+
+    if (!validateBookingCodeAge(BookingCode)) {
+      return res.status(410).json({
+        code: "SESSION_EXPIRED_RESEARCH_REQUIRED",
+        message: "Your search session has expired. Please search again to continue.",
+      });
+    }
 
     const tboPayload = { BookingCode };
     const t0 = Date.now();
@@ -944,6 +973,13 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     const GuestNationality: string = _leadGuest?.Nationality || _reqNationality || "IN";
 
     if (!BookingCode) return res.status(400).json({ error: "BookingCode required" });
+
+    if (!validateBookingCodeAge(BookingCode)) {
+      return res.status(410).json({
+        code: "SESSION_EXPIRED_RESEARCH_REQUIRED",
+        message: "Your search session has expired. Please search again to continue.",
+      });
+    }
 
     // GAP-36a: block hold for non-refundable rates (spec FAQ: "non refundable bookings can not be put on hold")
     const isRefundable: boolean = req.body.isRefundable !== false;
@@ -1284,8 +1320,9 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         result?.VoucherDate ??
         null;
 
-      // Invalidate search cache so next search shows fresh availability
+      // Invalidate search cache and booking-code timestamps so next search shows fresh availability
       searchCache.clear();
+      bookingCodeTimestamps.clear();
 
       res.json({
         ok: true,
