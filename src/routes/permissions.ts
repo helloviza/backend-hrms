@@ -2,7 +2,7 @@ import express from 'express'
 import { requireAuth } from '../middleware/auth.js'
 import { requireSuperAdmin } from '../middleware/requireSuperAdmin.js'
 import { isSuperAdmin } from '../middleware/isSuperAdmin.js'
-import { UserPermission } from '../models/UserPermission.js'
+import { UserPermission, PermissionTier } from '../models/UserPermission.js'
 import { LEVEL_TEMPLATES, LEVEL_METADATA } from '../config/levelTemplates.js'
 import BillingPermission from '../models/BillingPermission.js'
 import User from '../models/User.js'
@@ -24,6 +24,14 @@ function levelToRole(code: string): string {
     case 'CUSTOMER_APPROVAL': return 'CUSTOMER'
     case 'VENDOR': return 'VENDOR'
     default: return 'EMPLOYEE'
+  }
+}
+
+function levelToTier(code: string): PermissionTier {
+  switch (code) {
+    case 'L8': return 3
+    case 'L5': case 'L6': case 'L7': return 2
+    default: return 1
   }
 }
 
@@ -273,6 +281,7 @@ router.post('/grant', async (req: any, res: any) => {
             designation: designation || '',
           },
           modules,
+          tier: levelToTier(levelCode),
           source: 'manual',
           grantedBy: adminEmail,
           grantedAt: new Date(),
@@ -303,7 +312,7 @@ router.post('/grant', async (req: any, res: any) => {
 // ── PATCH /api/permissions/update ────────────────────────────────────────────
 router.patch('/update', async (req: any, res: any) => {
   try {
-    const { userId, modules: moduleChanges, level: levelChanges, designation } = req.body
+    const { userId, modules: moduleChanges, level: levelChanges, levelCode: levelCodeBody, designation } = req.body
 
     if (!userId) {
       return res.status(400).json({ success: false, message: 'userId is required' })
@@ -320,8 +329,14 @@ router.patch('/update', async (req: any, res: any) => {
       }
     }
 
-    if (levelChanges) {
-      if (levelChanges.code) existing.level.code = levelChanges.code
+    // Accept levelCode as a top-level field (sent by AccessConsole frontend)
+    const resolvedLevelCode = levelCodeBody || levelChanges?.code
+    if (resolvedLevelCode) {
+      existing.level.code = resolvedLevelCode
+      const levelMeta = LEVEL_METADATA.find(l => l.code === resolvedLevelCode)
+      if (levelMeta) existing.level.name = levelMeta.name
+      existing.tier = levelToTier(resolvedLevelCode)
+    } else if (levelChanges) {
       if (levelChanges.name) existing.level.name = levelChanges.name
     }
 
@@ -378,6 +393,7 @@ router.post('/apply-template', async (req: any, res: any) => {
     existing.modules = { ...template } as any
     existing.level.code = levelCode
     existing.level.name = levelMeta?.name || levelCode
+    existing.tier = levelToTier(levelCode)
     // designation intentionally preserved
 
     const adminEmail = String(req.user?.email || req.user?._id || 'unknown')

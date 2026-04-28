@@ -1175,6 +1175,142 @@ export function buildLeaderFyiHtml(opts: {
  * Attachment helper (used by approvals.ts)
  * ──────────────────────────────────────────────────────────────── */
 
+export function buildRequestDeclinedEmailHtml(opts: {
+  ticketId?: string;
+  requesterName?: string;
+  managerName?: string;
+  comment?: string;
+  loginUrl?: string;
+}): string {
+  const ticketId = escapeHtml(opts.ticketId || "");
+  const requesterName = escapeHtml(opts.requesterName || "User");
+  const managerName = escapeHtml(opts.managerName || "Approver");
+  const comment = escapeHtml(opts.comment || "");
+  const loginUrl = opts.loginUrl || "";
+
+  const bodyContent = `
+    ${eCard(`
+      ${eLabel("Request Declined")}
+      <div style="font-size:13px;line-height:1.65;color:#334155;">
+        Hi <b style="color:#0f172a;">${requesterName}</b>,<br/><br/>
+        Your travel request${ticketId ? ` <b style="color:#d06549;">(${ticketId})</b>` : ""} has been <b style="color:#dc2626;">declined</b> by <b style="color:#0f172a;">${managerName}</b>.
+        ${comment ? `<br/><br/><b style="color:#0f172a;">Reason:</b> ${comment}` : ""}
+      </div>
+    `)}
+    ${loginUrl ? `<div style="margin-top:16px;">${eBtn("View My Requests", loginUrl, "#00477f", "#ffffff")}</div>` : ""}
+    <div style="margin-top:16px;color:#94a3b8;font-size:12px;line-height:1.6;">
+      If you believe this is an error, you may resubmit your request or contact your travel manager.
+    </div>
+  `;
+
+  return buildEmailShell(bodyContent, {
+    title: "Travel Request Declined",
+    subtitle: "Your request has been reviewed and declined.",
+    badgeText: "DECLINED",
+    badgeColor: "#dc2626",
+  });
+}
+
+export function buildRequestOnHoldEmailHtml(opts: {
+  ticketId?: string;
+  requesterName?: string;
+  managerName?: string;
+  comment?: string;
+  loginUrl?: string;
+}): string {
+  const ticketId = escapeHtml(opts.ticketId || "");
+  const requesterName = escapeHtml(opts.requesterName || "User");
+  const managerName = escapeHtml(opts.managerName || "Approver");
+  const comment = escapeHtml(opts.comment || "");
+  const loginUrl = opts.loginUrl || "";
+
+  const bodyContent = `
+    ${eCard(`
+      ${eLabel("Request On Hold")}
+      <div style="font-size:13px;line-height:1.65;color:#334155;">
+        Hi <b style="color:#0f172a;">${requesterName}</b>,<br/><br/>
+        Your travel request${ticketId ? ` <b style="color:#d06549;">(${ticketId})</b>` : ""} has been placed <b style="color:#92400e;">on hold</b> by <b style="color:#0f172a;">${managerName}</b>.
+        ${comment ? `<br/><br/><b style="color:#0f172a;">Note:</b> ${comment}` : ""}
+      </div>
+    `)}
+    ${loginUrl ? `<div style="margin-top:16px;">${eBtn("View My Requests", loginUrl, "#00477f", "#ffffff")}</div>` : ""}
+    <div style="margin-top:16px;color:#94a3b8;font-size:12px;line-height:1.6;">
+      No action is needed right now. You will be notified when the hold is lifted.
+    </div>
+  `;
+
+  return buildEmailShell(bodyContent, {
+    title: "Travel Request On Hold",
+    subtitle: "Your request requires additional review.",
+    badgeText: "ON HOLD",
+    badgeColor: "#f59e0b",
+  });
+}
+
+export function buildProposalApprovedEmailHtml(opts: {
+  requesterName?: string;
+  ticketId?: string;
+  loginUrl?: string;
+}): string {
+  const requesterName = escapeHtml(opts.requesterName || "User");
+  const ticketId = escapeHtml(opts.ticketId || "");
+  const loginUrl = opts.loginUrl || "";
+
+  const bodyContent = `
+    ${eCard(`
+      ${eLabel("Proposal Approved")}
+      <div style="font-size:13px;line-height:1.65;color:#334155;">
+        Hi <b style="color:#0f172a;">${requesterName}</b>,<br/><br/>
+        Great news! The travel proposal for your request${ticketId ? ` <b style="color:#d06549;">(${ticketId})</b>` : ""} has been <b style="color:#10b981;">approved</b>.
+        <br/><br/>Our team will now proceed with booking your travel arrangements.
+      </div>
+    `)}
+    ${loginUrl ? `<div style="margin-top:16px;">${eBtn("View Proposals", loginUrl, "#10b981", "#ffffff")}</div>` : ""}
+    <div style="margin-top:16px;color:#94a3b8;font-size:12px;line-height:1.6;">
+      You will receive a confirmation email once the booking is complete.
+    </div>
+  `;
+
+  return buildEmailShell(bodyContent, {
+    title: "Proposal Approved",
+    subtitle: "Your travel proposal has been approved and booking is in progress.",
+    badgeText: "APPROVED",
+    badgeColor: "#10b981",
+  });
+}
+
+export function buildProposalDeclinedEmailHtml(opts: {
+  requesterName?: string;
+  ticketId?: string;
+  loginUrl?: string;
+}): string {
+  const requesterName = escapeHtml(opts.requesterName || "User");
+  const ticketId = escapeHtml(opts.ticketId || "");
+  const loginUrl = opts.loginUrl || "";
+
+  const bodyContent = `
+    ${eCard(`
+      ${eLabel("Proposal Declined")}
+      <div style="font-size:13px;line-height:1.65;color:#334155;">
+        Hi <b style="color:#0f172a;">${requesterName}</b>,<br/><br/>
+        The travel proposal for your request${ticketId ? ` <b style="color:#d06549;">(${ticketId})</b>` : ""} has been <b style="color:#dc2626;">declined</b>.
+        <br/><br/>Our team may reach out to discuss alternatives or submit a revised proposal.
+      </div>
+    `)}
+    ${loginUrl ? `<div style="margin-top:16px;">${eBtn("View My Requests", loginUrl, "#00477f", "#ffffff")}</div>` : ""}
+    <div style="margin-top:16px;color:#94a3b8;font-size:12px;line-height:1.6;">
+      If you have questions, please contact your travel manager.
+    </div>
+  `;
+
+  return buildEmailShell(bodyContent, {
+    title: "Proposal Declined",
+    subtitle: "The travel proposal for your request has been declined.",
+    badgeText: "DECLINED",
+    badgeColor: "#dc2626",
+  });
+}
+
 export function buildEmailAttachmentsFromMeta(doc: any) {
   const list = Array.isArray(doc?.meta?.attachments) ? doc.meta.attachments : [];
   const out: Array<{ filename: string; path: string; contentType?: string }> = [];
