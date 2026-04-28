@@ -1722,6 +1722,7 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       inclusion: typeof b.inclusion === "string" ? b.inclusion : "",
       rateConditions: Array.isArray(b.rateConditions) ? b.rateConditions.map(String) : [],
       amenities: Array.isArray(b.amenities) ? b.amenities.map(String) : [],
+      supplements: Array.isArray(b.supplements) ? b.supplements : [],
       priceChangedDuringBook: b.priceChangedDuringBook === true,
       priceChangeAmount: typeof b.priceChangeAmount === "number" ? b.priceChangeAmount : 0,
       isPublishedFare: b.isPublishedFare === true,

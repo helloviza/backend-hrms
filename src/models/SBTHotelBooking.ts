@@ -72,6 +72,7 @@ export interface ISBTHotelBooking extends Document {
   inclusion?: string;
   rateConditions?: string[];
   amenities?: string[];
+  supplements?: unknown[];
   priceChangedDuringBook?: boolean;
   priceChangeAmount?: number;
   bookedAt: Date;
@@ -165,6 +166,7 @@ const SBTHotelBookingSchema = new Schema(
     inclusion: { type: String, default: "" },
     rateConditions: { type: [String], default: [] },
     amenities: { type: [String], default: [] },
+    supplements: { type: [Schema.Types.Mixed], default: [] },
     priceChangedDuringBook: { type: Boolean, default: false },
     priceChangeAmount: { type: Number, default: 0 },
     bookedAt: { type: Date, default: Date.now },
