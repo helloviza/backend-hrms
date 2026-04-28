@@ -29,6 +29,9 @@ export interface ISBTHotelBooking extends Document {
   mealType: string;
   totalFare: number;
   netAmount: number;
+  isPublishedFare?: boolean;
+  tds?: number;
+  agentCommission?: number;
   currency: string;
   isRefundable: boolean;
   cancelPolicies: unknown[];
@@ -107,6 +110,9 @@ const SBTHotelBookingSchema = new Schema(
     mealType: { type: String, default: "" },
     totalFare: { type: Number, required: true },
     netAmount: { type: Number, default: 0 },
+    isPublishedFare: { type: Boolean, default: false },
+    tds: { type: Number, default: 0 },
+    agentCommission: { type: Number, default: 0 },
     currency: { type: String, default: "INR" },
     isRefundable: { type: Boolean, default: false },
     cancelPolicies: { type: [Schema.Types.Mixed], default: [] },
