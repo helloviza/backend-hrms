@@ -323,7 +323,8 @@ async function main() {
   const updatedBookingCode: string = prebookRoom?.BookingCode || bookingCode;
   const validationInfo = prebookData?.ValidationInfo || {};
   const panMandatory = validationInfo?.PanMandatory === true;
-  const passportMandatory = validationInfo?.PassportMandatory === true;
+  // Honor both TBO spellings: spec table uses "PassportMandatory"; FAQ uses "IsPassportRequired".
+  const passportMandatory = validationInfo?.PassportMandatory === true || validationInfo?.IsPassportRequired === true;
 
   console.log(`[PREBOOK] NetAmount: ${netAmount}`);
   console.log(`[PREBOOK] UpdatedBookingCode: ${updatedBookingCode.slice(0, 40)}...`);

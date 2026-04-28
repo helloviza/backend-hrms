@@ -1075,7 +1075,10 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     const corporateBookingAllowed =
       validationFlags.CorporateBookingAllowed === true ||
       validationFlags.CorporateBokingAllowed === true;
-    const passportMandatory = validationFlags.PassportMandatory === true;
+    // Honor both TBO spellings: spec table uses "PassportMandatory"; FAQ uses "IsPassportRequired".
+    const passportMandatory =
+      validationFlags.PassportMandatory === true ||
+      validationFlags.IsPassportRequired === true;
     const hotelIsCorporate =
       (validationFlags.IsCorporate === true || req.body?.isCorporate === true) &&
       !!hotelCorporatePAN;
