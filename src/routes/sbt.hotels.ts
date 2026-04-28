@@ -258,6 +258,206 @@ function validateBookingCodeAge(bookingCode: string): boolean {
   return true;
 }
 
+// ─── GAP-40: Shared booking validation (single source of truth) ───────────────
+// Called by both /validate-before-payment and /book. Returns all errors at once
+// (collect-all, not first-fail) so the frontend can display every issue together.
+
+interface ValidationError {
+  field: string;
+  code: string;
+  message: string;
+}
+
+interface BookingValidationPayload {
+  hotelRoomsDetails: any[];
+  validationFlags: any;
+  guestNationality: string;
+  isRefundable: boolean;
+  isVoucherBooking: boolean;
+  departureTransport?: any;
+  arrivalTransport?: any;
+  isPackageFare?: boolean;
+  isCorporate?: boolean;
+  corporatePAN?: string;
+  destinationCountryCode?: string;
+  gstInfo?: { gstin?: string; [key: string]: any };
+}
+
+function validateBookingCriteria(p: BookingValidationPayload): ValidationError[] {
+  const errors: ValidationError[] = [];
+  const vf = p.validationFlags ?? {};
+  const rooms: any[] = p.hotelRoomsDetails ?? [];
+  const isDomestic = p.guestNationality === "IN";
+
+  const fp = (ri: number, pi: number, field: string) =>
+    `HotelRoomsDetails[${ri}].Guests[${pi}].${field}`;
+
+  // Flatten with room/index context for field paths
+  const allIndexed: Array<{ g: any; ri: number; pi: number }> = rooms.flatMap((room: any, ri: number) =>
+    (room?.Guests ?? room?.HotelPassenger ?? []).map((g: any, pi: number) => ({ g, ri, pi }))
+  );
+  const adults = allIndexed.filter(({ g }) => Number(g?.PaxType) === 1);
+  const children = allIndexed.filter(({ g }) => Number(g?.PaxType) === 2);
+
+  // ── Room occupancy limits ──
+  for (let ri = 0; ri < rooms.length; ri++) {
+    const rg: any[] = rooms[ri]?.Guests ?? rooms[ri]?.HotelPassenger ?? [];
+    const ac = rg.filter((g: any) => Number(g?.PaxType) === 1).length;
+    const cc = rg.filter((g: any) => Number(g?.PaxType) === 2).length;
+    if (ac < 1) errors.push({ field: `HotelRoomsDetails[${ri}]`, code: "ROOM_NO_ADULTS", message: `Room ${ri + 1}: at least 1 adult is required.` });
+    if (ac > 4) errors.push({ field: `HotelRoomsDetails[${ri}]`, code: "ROOM_TOO_MANY_ADULTS", message: `Room ${ri + 1}: maximum 4 adults per room.` });
+    if (cc > 3) errors.push({ field: `HotelRoomsDetails[${ri}]`, code: "ROOM_TOO_MANY_CHILDREN", message: `Room ${ri + 1}: maximum 3 children per room.` });
+  }
+
+  // ── Rule 13: Title enum — adults only ──
+  const VALID_TITLES = new Set(["Mr", "Mrs", "Miss", "Ms"]);
+  for (const { g, ri, pi } of adults) {
+    if (!VALID_TITLES.has(g?.Title)) {
+      errors.push({ field: fp(ri, pi, "Title"), code: "TITLE_INVALID", message: "Adult title must be Mr, Mrs, Miss, or Ms." });
+    }
+  }
+
+  // ── Rules 2 + 3: Name length (GAP-04) + characters + uniqueness (GAP-05) ──
+  const charLimit = vf.CharLimit === true;
+  const nameMinLen = charLimit ? Number(vf.PaxNameMinLength ?? 2) + 1 : 2;
+  const nameMaxLen = charLimit ? Number(vf.PaxNameMaxLength ?? 50) : 50;
+  const spaceAllowed = vf.SpaceAllowed !== false;
+  const specialCharAllowed = vf.SpecialCharAllowed !== false;
+  const samePaxNameAllowed = vf.SamePaxNameAllowed === true;
+  let nameCharClass = "a-zA-Z";
+  if (spaceAllowed) nameCharClass += "\\s";
+  if (specialCharAllowed) nameCharClass += "'\\-";
+  const nameCharRegex = new RegExp(`^[${nameCharClass}]+$`);
+  const nameAllowedDesc = ["letters", ...(spaceAllowed ? ["spaces"] : []), ...(specialCharAllowed ? ["hyphens", "apostrophes"] : [])].join(", ");
+  const adultNameSeen = new Set<string>();
+
+  for (const { g, ri, pi } of adults) {
+    const fn = String(g?.FirstName || "").trim();
+    const ln = String(g?.LastName || "").trim();
+    for (const [val, fieldName] of [[fn, "FirstName"] as [string, string], [ln, "LastName"] as [string, string]]) {
+      if (val.length < nameMinLen) {
+        errors.push({ field: fp(ri, pi, fieldName), code: "NAME_TOO_SHORT", message: `${fieldName === "FirstName" ? "First" : "Last"} name must be at least ${nameMinLen} characters.` });
+      } else if (val.length > nameMaxLen) {
+        errors.push({ field: fp(ri, pi, fieldName), code: "NAME_TOO_LONG", message: `${fieldName === "FirstName" ? "First" : "Last"} name must be at most ${nameMaxLen} characters.` });
+      } else if (!nameCharRegex.test(val)) {
+        errors.push({ field: fp(ri, pi, fieldName), code: "NAME_CHARS_INVALID", message: `Guest names can only contain ${nameAllowedDesc}.` });
+      }
+    }
+    if (!samePaxNameAllowed) {
+      const key = `${fn.toLowerCase()}|${ln.toLowerCase()}`;
+      if (key !== "|" && adultNameSeen.has(key)) {
+        errors.push({ field: fp(ri, pi, "FirstName"), code: "DUPLICATE_NAME", message: "Two adult guests share the same name, which is not permitted for this property." });
+      }
+      adultNameSeen.add(key);
+    }
+  }
+
+  // ── Rule 5: Child validation — age range + forbidden fields (GAP-09a, 9b) ──
+  const FORBIDDEN_CHILD_FIELDS = ["PAN", "Phoneno", "Email", "PassportNo"];
+  for (const { g, ri, pi } of children) {
+    const age = Number(g?.Age);
+    if (!age || age < 1 || age > 12) {
+      errors.push({ field: fp(ri, pi, "Age"), code: "CHILD_AGE_INVALID", message: `Child age must be between 1 and 12. Received: ${g?.Age ?? "none"}.` });
+    }
+    for (const f of FORBIDDEN_CHILD_FIELDS) {
+      if (g[f] !== undefined && g[f] !== null && String(g[f]).trim() !== "") {
+        errors.push({ field: fp(ri, pi, f), code: "CHILD_FIELDS_NOT_ALLOWED", message: `Field '${f}' must not be set for child passengers.` });
+      }
+    }
+  }
+
+  // ── Rule 4: Adult PAN — format + count (GAP-09c) ──
+  const panMandatoryV = vf.PanMandatory === true;
+  const panCountRequiredV = Number(vf.PanCountRequired ?? 0);
+  if (isDomestic && panMandatoryV) {
+    for (const { g, ri, pi } of adults) {
+      const pan = String(g?.PAN || "").trim().toUpperCase();
+      if (!pan) {
+        errors.push({ field: fp(ri, pi, "PAN"), code: "PAN_REQUIRED", message: "PAN is required for each adult guest on this booking." });
+      } else if (!/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) {
+        errors.push({ field: fp(ri, pi, "PAN"), code: "PAN_FORMAT_INVALID", message: "Please enter a valid PAN number (format: AAAAA9999A)." });
+      }
+    }
+  }
+  if (isDomestic && panCountRequiredV > 0) {
+    const uniquePANs = new Set(adults.map(({ g }) => String(g?.PAN || "").trim().toUpperCase()).filter(Boolean));
+    if (uniquePANs.size < panCountRequiredV) {
+      errors.push({ field: "passengers.PAN", code: "PAN_COUNT_INSUFFICIENT", message: `${panCountRequiredV} unique PAN(s) required, but only ${uniquePANs.size} provided.` });
+    }
+  }
+
+  // ── Rule 9: Corporate booking flag (GAP-09c) ──
+  const corporateBookingAllowedV = vf.CorporateBookingAllowed === true || vf.CorporateBokingAllowed === true;
+  if (p.isCorporate && !corporateBookingAllowedV) {
+    errors.push({ field: "isCorporate", code: "CORPORATE_BOOKING_NOT_ALLOWED", message: "Corporate booking is not allowed for this property." });
+  }
+
+  // ── Rule 6: Passport — all three fields required (GAP-34) ──
+  const passportMandatoryV = vf.PassportMandatory === true || vf.IsPassportRequired === true;
+  if (passportMandatoryV) {
+    for (const { g, ri, pi } of adults) {
+      if (!String(g?.PassportNo || "").trim()) {
+        errors.push({ field: fp(ri, pi, "PassportNo"), code: "PASSPORT_REQUIRED", message: "Passport number is required for this booking." });
+      }
+      if (!String(g?.PassportIssueDate || "").trim() || g?.PassportIssueDate === "0001-01-01T00:00:00") {
+        errors.push({ field: fp(ri, pi, "PassportIssueDate"), code: "PASSPORT_ISSUE_DATE_REQUIRED", message: "Passport issue date is required for this booking." });
+      }
+      if (!String(g?.PassportExpDate || "").trim() || g?.PassportExpDate === "0001-01-01T00:00:00") {
+        errors.push({ field: fp(ri, pi, "PassportExpDate"), code: "PASSPORT_EXP_DATE_REQUIRED", message: "Passport expiry date is required for this booking." });
+      }
+    }
+  }
+
+  // ── Rule 7: Nationality-destination compatibility ──
+  const dest = p.destinationCountryCode || "";
+  if (dest && dest !== "IN" && p.guestNationality !== "IN") {
+    errors.push({ field: "guestNationality", code: "INTERNATIONAL_REQUIRES_INDIAN_NATIONALITY", message: "For international bookings, guest nationality must be Indian (IN)." });
+  }
+
+  // ── Rule 8: Hold guard — non-refundable rates cannot be held (GAP-36) ──
+  if (!p.isVoucherBooking && !p.isRefundable) {
+    errors.push({ field: "isRefundable", code: "NON_REFUNDABLE_HOLD_FORBIDDEN", message: "This rate cannot be held. Please complete payment to confirm booking." });
+  }
+
+  // ── Rule 10: Package fare transport requirements (GAP-02, GAP-07) ──
+  if (vf.PackageDetailsMandatory === true || p.isPackageFare === true) {
+    if (!p.arrivalTransport?.TransportInfoId || String(p.arrivalTransport.TransportInfoId).trim() === "") {
+      errors.push({ field: "arrivalTransport.TransportInfoId", code: "ARRIVAL_TRANSPORT_REQUIRED", message: "Arrival transport details are required for package fare bookings." });
+    }
+  }
+  if (vf.DepartureDetailsMandatory === true) {
+    if (!p.departureTransport?.TransportInfoId || String(p.departureTransport.TransportInfoId).trim() === "") {
+      errors.push({ field: "departureTransport.TransportInfoId", code: "DEPARTURE_TRANSPORT_REQUIRED", message: "Departure transport details are required for this booking." });
+    }
+  }
+
+  // ── Rule 11: GST format (defensive; audit ref P1) ──
+  if (vf.GSTAllowed === true && p.gstInfo?.gstin) {
+    const gstin = String(p.gstInfo.gstin).trim().toUpperCase();
+    if (gstin && !/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(gstin)) {
+      errors.push({ field: "gstInfo.gstin", code: "GST_FORMAT_INVALID", message: "Please enter a valid GSTIN (format: 22AAAAA0000A1Z5)." });
+    }
+  }
+
+  // ── Rule 12: Lead pax — phone + email required ──
+  for (let ri = 0; ri < rooms.length; ri++) {
+    const rg: any[] = rooms[ri]?.Guests ?? rooms[ri]?.HotelPassenger ?? [];
+    const leadPax = rg.find((g: any) => Number(g?.PaxType) === 1 && g?.LeadPassenger) ?? rg.find((g: any) => Number(g?.PaxType) === 1);
+    if (!leadPax) continue;
+    const leadPi = rg.indexOf(leadPax);
+    const phone = String(leadPax?.Phone || leadPax?.Phoneno || "").trim().replace(/\D/g, "");
+    if (phone.length < 10) {
+      errors.push({ field: fp(ri, leadPi, "Phone"), code: "PHONE_REQUIRED", message: "Lead guest phone number must be at least 10 digits." });
+    }
+    const email = String(leadPax?.Email || "").trim();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      errors.push({ field: fp(ri, leadPi, "Email"), code: "EMAIL_REQUIRED", message: "Lead guest email is required and must be valid." });
+    }
+  }
+
+  return errors;
+}
+
 const hotelDetailsCache = new Map<string, { data: any; ts: number }>();
 const DETAILS_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
@@ -863,6 +1063,78 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
   }
 });
 
+// ─── GAP-40: Pre-payment validation gate ─────────────────────────────────────
+// Called by frontend BEFORE Razorpay create-order. Returns {valid:true} or
+// {valid:false, errors:[...]} so the UI can block Pay Now and show all issues.
+
+router.post("/validate-before-payment", requireSBT, requireHotelAccess, async (req: any, res: any) => {
+  try {
+    const {
+      BookingCode,
+      HotelRoomsDetails: hotelRoomsDetails,
+      GuestNationality: _guestNat,
+      isRefundable,
+      isVoucherBooking,
+      DepartureTransport: departureTransport,
+      ArrivalTransport: arrivalTransport,
+      IsPackageFare: isPackageFare,
+      isCorporate,
+      ValidationFlags: validationFlags = {},
+      destinationCountryCode,
+    } = req.body;
+
+    // Session check — same guard as /book (validateBookingCodeAge uses in-memory map)
+    if (BookingCode && !validateBookingCodeAge(BookingCode)) {
+      return res.status(400).json({
+        valid: false,
+        errors: [{ field: "session", code: "SESSION_EXPIRED", message: "Your search session has expired. Please search again to continue." }],
+      });
+    }
+
+    // Derive guestNationality from lead guest or request field
+    const _allRoomGuests: any[] = (hotelRoomsDetails as any[] | undefined)?.flatMap(
+      (r: any) => r?.Guests ?? r?.HotelPassenger ?? []
+    ) ?? [];
+    const _leadGuest = _allRoomGuests.find((g: any) => g?.LeadPassenger) ?? _allRoomGuests[0];
+    const guestNationality: string = _leadGuest?.Nationality || _guestNat || "IN";
+
+    // Corporate PAN lookup — same as /book (needed for corporate rule check)
+    const _custId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
+    let _corporatePAN = "";
+    if (_custId) {
+      const _ws = await CustomerWorkspace.findOne({ customerId: _custId }).select("pan").lean();
+      _corporatePAN = (_ws as any)?.pan || "";
+      if (!_corporatePAN) {
+        const _cust = await Customer.findOne({ _id: _custId }).select("pan").lean();
+        _corporatePAN = (_cust as any)?.pan || "";
+      }
+    }
+
+    const errors = validateBookingCriteria({
+      hotelRoomsDetails: (hotelRoomsDetails as any[]) ?? [],
+      validationFlags: validationFlags ?? {},
+      guestNationality,
+      isRefundable: isRefundable !== false,
+      isVoucherBooking: isVoucherBooking !== false,
+      departureTransport,
+      arrivalTransport,
+      isPackageFare: isPackageFare === true,
+      isCorporate: isCorporate === true,
+      corporatePAN: _corporatePAN,
+      destinationCountryCode: destinationCountryCode || "",
+      gstInfo: req.body?.gstInfo,
+    });
+
+    if (errors.length > 0) {
+      return res.status(400).json({ valid: false, errors });
+    }
+    return res.status(200).json({ valid: true });
+  } catch (err: any) {
+    console.error("[validate-before-payment]", err);
+    return res.status(500).json({ error: "Validation check failed. Please try again." });
+  }
+});
+
 // ─── 4. POST /payment/create-order ───────────────────────────────────────────
 
 router.post("/payment/create-order", requireAuth, async (req: any, res: any) => {
@@ -1000,129 +1272,20 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     }
 
     const hotelRoomsDetailsRaw: any[] | undefined = req.body.HotelRoomsDetails;
-    if (Array.isArray(hotelRoomsDetailsRaw)) {
-      for (let i = 0; i < hotelRoomsDetailsRaw.length; i++) {
-        const roomGuests: any[] = hotelRoomsDetailsRaw[i]?.Guests ?? hotelRoomsDetailsRaw[i]?.HotelPassenger ?? [];
-        const adultCount = roomGuests.filter((g: any) => Number(g?.PaxType) === 1).length;
-        const childCount = roomGuests.filter((g: any) => Number(g?.PaxType) === 2).length;
-        if (adultCount < 1) {
-          return res.status(400).json({ error: `Room ${i + 1}: at least 1 adult is required.` });
-        }
-        if (adultCount > 4) {
-          return res.status(400).json({ error: `Room ${i + 1}: maximum 4 adults per room.` });
-        }
-        if (childCount > 3) {
-          return res.status(400).json({ error: `Room ${i + 1}: maximum 3 children per room.` });
-        }
-      }
-    }
 
-    // Flatten all guests for cross-room validations
-    const allGuests: any[] = [];
-    for (const room of hotelRoomsDetailsRaw ?? []) {
-      for (const g of (room?.Guests ?? room?.HotelPassenger ?? [])) {
-        allGuests.push(g);
-      }
-    }
+    // Transport + package fare fields — declared early for both validation and TBO payload
+    const departureTransport = req.body.DepartureTransport as
+      | { DepartureTransportType?: number; TransportInfoId?: string; Time?: string }
+      | undefined;
+    const isPackageFare: boolean = req.body.IsPackageFare === true;
+    const arrivalTransport = req.body.ArrivalTransport as
+      | { ArrivalTransportType?: number; TransportInfoId?: string; Time?: string }
+      | undefined;
 
-    // Duplicate name check — skip children (names are auto-generated by backend)
-    const nameSeen = new Set<string>();
-    for (const g of allGuests) {
-      if (Number(g.PaxType) === 2) continue;
-      const key = `${String(g.FirstName || "").trim().toLowerCase()}|${String(g.LastName || "").trim().toLowerCase()}`;
-      if (key === "|") continue;
-      if (nameSeen.has(key)) {
-        return res.status(400).json({
-          error: "Each guest must have a unique full name. Two guests share the same first and last name.",
-        });
-      }
-      nameSeen.add(key);
-    }
-
-    // Child age validation — backend defensive check (frontend validates too)
-    for (const g of allGuests) {
-      if (Number(g.PaxType) !== 2) continue;
-      const age = Number(g.Age);
-      if (!age || age < 1 || age > 12) {
-        return res.status(400).json({
-          code: "CHILD_AGE_INVALID",
-          error: `Child age must be between 1 and 12. Received: ${g.Age}`,
-        });
-      }
-    }
-
-    // Title validation — adults only (children's title is auto-generated by backend per Design C)
-    const VALID_TITLES = new Set(["Mr", "Mrs", "Miss", "Ms"]);
-    for (const g of allGuests) {
-      if (Number(g.PaxType) === 2) continue;
-      if (!VALID_TITLES.has(g.Title)) {
-        return res.status(400).json({
-          error: "Invalid title for one or more guests. Allowed: Mr, Mrs, Miss, Ms.",
-        });
-      }
-    }
-
-    // Read PreBook validation flags; default false so fields are omitted when not required.
+    // Read PreBook validation flags; retained for buildRoomPassengers field-inclusion logic.
     const validationFlags = req.body?.ValidationFlags ?? {};
 
-    // Name length validation for ADULTS (PaxType 1).
-    // GAP-04: derive limits from PreBook validationFlags.
-    // Spec inconsistency: Nodes Explanation treats PaxNameMinLength as the direct minimum;
-    // inline PreBook example shows +1 offset (effectiveMin = PaxNameMinLength + 1).
-    // Trust the inline example — it matches TBO sandbox behaviour.
-    const charLimit: boolean = validationFlags.CharLimit === true;
-    const paxNameMinLength: number = Number(validationFlags.PaxNameMinLength ?? 2);
-    const paxNameMaxLength: number = Number(validationFlags.PaxNameMaxLength ?? 50);
-    const nameMinLen = charLimit ? paxNameMinLength + 1 : 2;
-    const nameMaxLen = charLimit ? paxNameMaxLength : 50;
-
-    // GAP-05: dynamic name character set and adult uniqueness from PreBook validationFlags.
-    // SpaceAllowed/SpecialCharAllowed default true (conservative — allow unless explicitly denied).
-    // SamePaxNameAllowed default false (conservative — enforce uniqueness unless explicitly allowed).
-    // SamePaxNameAllowed spec default not verified from file (spec not in repo); conservative default applied.
-    const spaceAllowed: boolean = validationFlags.SpaceAllowed !== false;
-    const specialCharAllowed: boolean = validationFlags.SpecialCharAllowed !== false;
-    const samePaxNameAllowed: boolean = validationFlags.SamePaxNameAllowed === true;
-    let nameCharClass = "a-zA-Z";
-    if (spaceAllowed) nameCharClass += "\\s";
-    if (specialCharAllowed) nameCharClass += "'-";
-    const nameCharRegex = new RegExp(`^[${nameCharClass}]+$`);
-    const adultNameSeen = new Set<string>();
-
-    for (const g of allGuests) {
-      if (Number(g.PaxType) !== 1) continue; // children validated under GAP-09
-      const fn = String(g.FirstName || "").trim();
-      const ln = String(g.LastName || "").trim();
-      if (fn.length < nameMinLen || ln.length < nameMinLen) {
-        return res.status(400).json({
-          error: `Each adult guest's first and last name must be at least ${nameMinLen} characters.`,
-        });
-      }
-      if (fn.length > nameMaxLen || ln.length > nameMaxLen) {
-        return res.status(400).json({
-          error: `Each adult guest's first and last name must be at most ${nameMaxLen} characters.`,
-        });
-      }
-      if (!nameCharRegex.test(fn) || !nameCharRegex.test(ln)) {
-        const allowed = ["letters"];
-        if (spaceAllowed) allowed.push("spaces");
-        if (specialCharAllowed) allowed.push("hyphens and apostrophes");
-        return res.status(400).json({
-          error: `Guest names can only contain ${allowed.join(", ")}.`,
-        });
-      }
-      if (!samePaxNameAllowed) {
-        const nameKey = `${fn.toLowerCase()}|${ln.toLowerCase()}`;
-        if (adultNameSeen.has(nameKey)) {
-          return res.status(400).json({
-            error: "Two adult guests share the same name, which is not permitted for this property.",
-          });
-        }
-        adultNameSeen.add(nameKey);
-      }
-    }
-
-    // Resolve corporate PAN from workspace
+    // Corporate PAN lookup — needed by validateBookingCriteria and buildRoomPassengers.
     const hotelCustomerId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
     const hotelWorkspace = hotelCustomerId
       ? await CustomerWorkspace.findOne({ customerId: hotelCustomerId }).select("pan").lean()
@@ -1132,8 +1295,9 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       const hotelCustomer = await Customer.findOne({ _id: (hotelWorkspace as any).customerId }).select("pan").lean();
       hotelCorporatePAN = (hotelCustomer as any)?.pan || "";
     }
+
+    // Flags retained for buildRoomPassengers TBO field-inclusion logic (not validation).
     const panMandatory = validationFlags.PanMandatory === true;
-    const panCountRequired = Number(validationFlags.PanCountRequired ?? 0);
     // Read CorporateBookingAllowed — also tolerate TBO spec typo "CorporateBokingAllowed" (one 'o').
     const corporateBookingAllowed =
       validationFlags.CorporateBookingAllowed === true ||
@@ -1147,42 +1311,24 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       !!hotelCorporatePAN;
     const isDomestic = GuestNationality === "IN";
 
-    // PAN format check — adults only, domestic, when PreBook requires it.
-    if (isDomestic && panMandatory) {
-      for (const room of hotelRoomsDetailsRaw ?? []) {
-        const roomGuests: any[] = room?.Guests ?? room?.HotelPassenger ?? [];
-        for (const g of roomGuests) {
-          if (Number(g?.PaxType) !== 1) continue;
-          const pan = String(g?.PAN || "").trim().toUpperCase();
-          if (!pan) {
-            return res.status(400).json({
-              code: "PAN_FORMAT_INVALID",
-              error: "PAN is required for each adult guest on this booking.",
-            });
-          }
-          if (!/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) {
-            return res.status(400).json({
-              code: "PAN_FORMAT_INVALID",
-              error: "Please enter a valid PAN number (format: AAAAA9999A).",
-            });
-          }
-        }
-      }
-    }
-
-    // PanCountRequired: enforce unique PAN count across all adult passengers.
-    if (panCountRequired > 0 && isDomestic) {
-      const adultPANs = allGuests
-        .filter((g: any) => Number(g.PaxType) === 1)
-        .map((g: any) => String(g.PAN || "").trim().toUpperCase())
-        .filter(Boolean);
-      const uniquePANs = new Set(adultPANs);
-      if (uniquePANs.size < panCountRequired) {
-        return res.status(400).json({
-          code: "PAN_COUNT_INSUFFICIENT",
-          error: `${panCountRequired} unique PAN(s) required across adult passengers, but only ${uniquePANs.size} provided.`,
-        });
-      }
+    // GAP-40: Shared validation gate — collect-all errors, same logic as /validate-before-payment.
+    // Defense-in-depth: /book validates independently even when frontend calls /validate-before-payment first.
+    const _valErrors = validateBookingCriteria({
+      hotelRoomsDetails: hotelRoomsDetailsRaw ?? [],
+      validationFlags,
+      guestNationality: GuestNationality,
+      isRefundable,
+      isVoucherBooking: bookingMode !== "hold",
+      departureTransport,
+      arrivalTransport,
+      isPackageFare,
+      isCorporate: req.body?.isCorporate === true || validationFlags.IsCorporate === true,
+      corporatePAN: hotelCorporatePAN,
+      destinationCountryCode: "",
+      gstInfo: req.body?.gstInfo,
+    });
+    if (_valErrors.length > 0) {
+      return res.status(400).json({ error: _valErrors[0].message, errors: _valErrors, valid: false });
     }
 
     // Design C: per-room passenger builder — children auto-generated, adults fully mapped.
@@ -1245,15 +1391,6 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           HotelPassenger: buildRoomPassengers(room),
         }))
       : [{ HotelPassenger: buildRoomPassengers({ Guests: Guests || [] }) }];
-
-    const departureTransport = req.body.DepartureTransport as
-      | { DepartureTransportType?: number; TransportInfoId?: string; Time?: string }
-      | undefined;
-
-    const isPackageFare: boolean = req.body.IsPackageFare === true;
-    const arrivalTransport = req.body.ArrivalTransport as
-      | { ArrivalTransportType?: number; TransportInfoId?: string; Time?: string }
-      | undefined;
 
     // GAP-02: implication-rule sanity check — spec says PackageDetailsMandatory:true implies IsPackageFare:true.
     // Log warning if we see PackageDetailsMandatory (signalled by ArrivalTransport present) without IsPackageFare.
