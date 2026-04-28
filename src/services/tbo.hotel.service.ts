@@ -1,11 +1,14 @@
 import { logTBOCall } from "../utils/tboFileLogger.js";
+import { getTBOToken } from "./tbo.auth.service.js";
 
 export async function generateHotelVoucher(bookingId: number): Promise<any> {
   const creds = Buffer.from(
     `${process.env.TBO_HOTEL_USERNAME}:${process.env.TBO_HOTEL_PASSWORD}`
   ).toString("base64");
+  const tokenId = await getTBOToken();
   const payload = {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+    TokenId: tokenId,
     BookingId: bookingId,
     RequestedBookingMode: 5,
   };
