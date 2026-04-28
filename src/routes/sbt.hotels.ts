@@ -698,31 +698,27 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
     const searchId = randomUUID();
     searchCache.set(searchId, { data: allResults, ts: Date.now() });
 
-    // Apply margin to display prices (net prices stay in _net* fields for TBO booking)
+    // RC1: TotalFare stays TBO-raw (Rule 1 compliance). Markup exposed separately
+    // via _markupAmount + _displayTotalFare so frontend can show transparent breakdown.
     const margins = await getMarginConfig();
-    let hotelsToSend: any[] = allResults;
-    if (margins.enabled) {
-      const isHotelDomestic = (CountryCode || "IN") === "IN";
-      const marginPct = isHotelDomestic ? margins.hotel.domestic : margins.hotel.international;
-      if (marginPct > 0) {
-        hotelsToSend = allResults.map((hotel: any) => ({
-          ...hotel,
-          Rooms: hotel.Rooms?.map((room: any) => {
-            const net = room.TotalFare ?? 0;
-            const display = applyMargin(net, marginPct);
-            return {
-              ...room,
-              _netTotalFare: net,
-              _netAmount: room.NetAmount ?? net,
-              TotalFare: display,
-              TotalTax: applyMargin(room.TotalTax ?? 0, marginPct),
-              _marginPercent: marginPct,
-              _marginAmount: display - net,
-            };
-          }),
-        }));
-      }
-    }
+    const isHotelDomestic = (CountryCode || "IN") === "IN";
+    const marginPct = margins.enabled
+      ? (isHotelDomestic ? margins.hotel.domestic : margins.hotel.international)
+      : 0;
+    const hotelsToSend: any[] = allResults.map((hotel: any) => ({
+      ...hotel,
+      Rooms: hotel.Rooms?.map((room: any) => {
+        const net = room.TotalFare ?? 0;
+        const markupAmount = marginPct > 0 ? applyMargin(net, marginPct) - net : 0;
+        return {
+          ...room,
+          _netAmount: room.NetAmount ?? net,
+          _markupAmount: markupAmount,
+          _displayTotalFare: net + markupAmount,
+          _marginPercent: marginPct,
+        };
+      }),
+    }));
 
     res.json({
       TraceId: "",
@@ -772,29 +768,35 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
     const prebookHotel = data?.HotelResult?.[0] || data?.PreBookResult?.HotelResult?.[0];
     const room0 = prebookHotel?.Rooms?.[0];
 
-    // Compare PreBook NetAmount against the search price the user saw
     const netAmount = room0?.NetAmount ?? room0?.TotalFare ?? 0;
+    const prebookTotalFare = room0?.TotalFare ?? netAmount;
     const recommendedSellingRate = room0?.RecommendedSellingRate ?? null;
+
+    // RC2: compare TBO-raw TotalFare on both sides (searchPrice is now raw TBO TotalFare from frontend)
     const PRICE_CHANGE_TOLERANCE = 1; // rupees — below this is rounding noise
     const priceChanged = typeof searchPrice === "number" && searchPrice > 0
-      ? Math.abs(netAmount - searchPrice) > PRICE_CHANGE_TOLERANCE
+      ? Math.abs(prebookTotalFare - searchPrice) > PRICE_CHANGE_TOLERANCE
       : false;
-    const priceDiff = priceChanged ? netAmount - searchPrice : 0;
+    const priceDiff = priceChanged ? prebookTotalFare - searchPrice : 0;
 
-    // Apply margin to display TotalFare (NetAmount stays original for TBO Book)
+    // Markup for display (NetAmount stays TBO-raw for Book payload)
     const prebookMargins = await getMarginConfig();
-    let displayTotalFare = room0?.TotalFare ?? netAmount;
-    let prebookMarginPct = 0;
-    if (prebookMargins.enabled) {
-      // Default to domestic (IN) — caller can pass countryCode in body for international
-      const isHotelDomestic = ((req.body as any).countryCode || "IN") === "IN";
-      prebookMarginPct = isHotelDomestic
-        ? prebookMargins.hotel.domestic
-        : prebookMargins.hotel.international;
-      if (prebookMarginPct > 0) {
-        displayTotalFare = applyMargin(room0?.TotalFare ?? netAmount, prebookMarginPct);
-      }
-    }
+    const isPrebookDomestic = ((req.body as any).countryCode || "IN") === "IN";
+    const prebookMarginPct = prebookMargins.enabled
+      ? (isPrebookDomestic ? prebookMargins.hotel.domestic : prebookMargins.hotel.international)
+      : 0;
+    const displayTotalFare = prebookMarginPct > 0
+      ? applyMargin(prebookTotalFare, prebookMarginPct)
+      : prebookTotalFare;
+
+    // RC3a: Published Fare TDS extraction from PriceBreakUp node
+    const priceBreakup: any[] = room0?.PriceBreakUp ?? [];
+    const firstBreakup = priceBreakup[0] ?? {};
+    const agentCommission: number = typeof firstBreakup.AgentCommission === "number"
+      ? firstBreakup.AgentCommission : 0;
+    const tds: number = agentCommission > 0
+      ? Math.round(agentCommission * 0.02 * 100) / 100 : 0;
+    const isPublishedFare: boolean = agentCommission > 0 && netAmount > prebookTotalFare + 0.5;
 
     res.json({
       ...data,
@@ -804,6 +806,9 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       recommendedSellingRate,
       displayTotalFare,
       marginPercent: prebookMarginPct,
+      tds,
+      agentCommission,
+      isPublishedFare,
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "PreBook failed";
@@ -1719,6 +1724,9 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       amenities: Array.isArray(b.amenities) ? b.amenities.map(String) : [],
       priceChangedDuringBook: b.priceChangedDuringBook === true,
       priceChangeAmount: typeof b.priceChangeAmount === "number" ? b.priceChangeAmount : 0,
+      isPublishedFare: b.isPublishedFare === true,
+      tds: typeof b.tds === "number" ? b.tds : 0,
+      agentCommission: typeof b.agentCommission === "number" ? b.agentCommission : 0,
       bookedAt: new Date(),
     });
 
