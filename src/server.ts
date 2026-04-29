@@ -546,6 +546,15 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       const { startHoldBookingReminderCron } = await import("./jobs/hold-booking-reminder.js");
       startHoldBookingReminderCron();
 
+      // BUCKET-C-1: TBO static data refresh (15-day spec rule)
+      const { startStaticDataRefreshCron, seedStaticDataIfEmpty } = await import("./jobs/static-data-refresh.js");
+      startStaticDataRefreshCron();
+      seedStaticDataIfEmpty().catch((e: unknown) => logger.warn("[StaticRefresh] Seed failed", { e }));
+
+      // BUCKET-C-3: Orphaned PENDING booking cleanup (hourly)
+      const { startOrphanPendingCleanupCron } = await import("./jobs/orphan-pending-cleanup.js");
+      startOrphanPendingCleanupCron();
+
       const server = app.listen(env.PORT, () => {
         logger.info("API running", { port: env.PORT });
       });

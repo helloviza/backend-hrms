@@ -2352,6 +2352,94 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
   }
 });
 
+// ─── 9z. POST /bookings/check-status ─────────────────────────────────────────
+// BUCKET-C-2: Booking Uncertain recovery — poll TBO for real booking status by clientReferenceId.
+
+router.post("/bookings/check-status", requireAuth, async (req: any, res: any) => {
+  try {
+    const { clientReferenceId } = req.body ?? {};
+    if (!clientReferenceId) {
+      return res.status(400).json({ error: "clientReferenceId required" });
+    }
+
+    const booking = await SBTHotelBooking.findOne({ clientReferenceId }).lean();
+    if (!booking) {
+      return res.json({ found: false, clientReferenceId });
+    }
+
+    const numericId = booking.bookingId ? Number(booking.bookingId) : 0;
+
+    // If DB already has a confirmed/held booking, return immediately
+    if (booking.status === "CONFIRMED" || booking.status === "HELD") {
+      return res.json({
+        found: true,
+        bookingId: booking.bookingId,
+        confirmationNo: booking.confirmationNo,
+        bookingRefNo: booking.bookingRefNo,
+        status: booking.status,
+        isHeld: booking.isHeld ?? false,
+        lastVoucherDate: booking.lastVoucherDate ?? null,
+      });
+    }
+
+    if (!numericId) {
+      // PENDING with no BookingId — TBO didn't receive the request
+      return res.json({ found: false, clientReferenceId, dbStatus: booking.status });
+    }
+
+    // Has a BookingId but still PENDING — ask TBO
+    const rawData = await withTBOSessionRetry(
+      async (tokenId) => {
+        const payload = {
+          EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+          TokenId: tokenId,
+          BookingId: numericId,
+        };
+        const r = await fetch(
+          "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(15_000),
+          },
+        );
+        return (await r.json()) as any;
+      },
+      (r: any) => {
+        const inner = r?.GetBookingDetailResult || r;
+        return inner?.ResponseStatus === 4 || inner?.Error?.ErrorCode === 6;
+      },
+    );
+
+    const detail = rawData?.GetBookingDetailResult || rawData;
+    const tboStatus = (detail?.HotelBookingStatus || detail?.BookingStatus || "").toLowerCase();
+
+    if (tboStatus === "confirmed" || tboStatus === "vouchered") {
+      // Backfill the DB record
+      const newStatus = booking.isHeld ? "HELD" : "CONFIRMED";
+      await SBTHotelBooking.findOneAndUpdate(
+        { clientReferenceId },
+        { $set: { status: newStatus, confirmationNo: detail.ConfirmationNo || booking.confirmationNo || "", bookingRefNo: detail.BookingRefNo || booking.bookingRefNo || "" } },
+      ).catch(() => {});
+      return res.json({
+        found: true,
+        bookingId: booking.bookingId,
+        confirmationNo: detail.ConfirmationNo || booking.confirmationNo || "",
+        bookingRefNo: detail.BookingRefNo || booking.bookingRefNo || "",
+        status: newStatus,
+        isHeld: booking.isHeld ?? false,
+        lastVoucherDate: detail.LastVoucherDate ?? booking.lastVoucherDate ?? null,
+      });
+    }
+
+    return res.json({ found: false, clientReferenceId, tboStatus });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Status check failed";
+    res.status(500).json({ error: msg });
+  }
+});
+
 // ─── 9a. POST /bookings/sync-all-pending ─────────────────────────────────────
 
 router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any) => {
@@ -2576,6 +2664,20 @@ router.post("/bookings/:id/mark-failed", requireAdmin, async (req: any, res: any
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Mark failed operation failed";
     sbtLogger.error("Hotel mark failed error", { bookingId: req.params.id, error: msg });
+    res.status(500).json({ error: msg });
+  }
+});
+
+// ─── 9f. POST /admin/refresh-static-data ─────────────────────────────────────
+// BUCKET-C-1: Manual trigger for static data refresh (admin only).
+
+router.post("/admin/refresh-static-data", requireAdmin, async (_req: any, res: any) => {
+  try {
+    const { runStaticDataRefresh } = await import("../jobs/static-data-refresh.js");
+    const result = await runStaticDataRefresh("manual");
+    res.json({ ok: true, ...result });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Static data refresh failed";
     res.status(500).json({ error: msg });
   }
 });
