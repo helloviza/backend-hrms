@@ -6,7 +6,7 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import SBTRequest from "../models/SBTRequest.js";
-import { generateHotelVoucher } from "../services/tbo.hotel.service.js";
+import { generateHotelVoucher, getBookingDetail } from "../services/tbo.hotel.service.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
@@ -1704,6 +1704,35 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         }
       }
 
+      // Fire-and-forget: fetch GetBookingDetail to capture TBOReferenceNo + room description.
+      // Non-blocking — user already has confirmation. Populates tboReferenceNo within seconds.
+      if (tboBookingId && !isHeld) {
+        setImmediate(async () => {
+          try {
+            const detail = await getBookingDetail([{ mode: "bookingId", bookingId: tboBookingId }]);
+            if (detail?.HotelBookingDetail) {
+              const d = detail.HotelBookingDetail;
+              await SBTHotelBooking.findOneAndUpdate(
+                { bookingId: String(tboBookingId) },
+                {
+                  tboReferenceNo: d.TBOReferenceNo || d.HotelBookingId || null,
+                  roomDescription: d.HotelRoomsDetails?.[0]?.RoomDescription ||
+                                   d.HotelRoomsDetails?.[0]?.RoomTypeName || null,
+                  bookingDetailFetched: true,
+                  bookingDetailFetchedAt: new Date(),
+                  bookingDetailRaw: d,
+                  ...(d.LastCancellationDate ? { lastCancellationDate: parseTBODate(d.LastCancellationDate) } : {}),
+                  ...(d.LastVoucherDate ? { lastVoucherDate: parseTBODate(d.LastVoucherDate) } : {}),
+                },
+              );
+              sbtLogger.info("GetBookingDetail persisted post-Book", { tboBookingId, tboReferenceNo: d.TBOReferenceNo });
+            }
+          } catch (err: any) {
+            sbtLogger.error("GetBookingDetail post-Book failed (non-blocking)", { tboBookingId, error: err?.message });
+          }
+        });
+      }
+
       sbtLogger.info("Hotel booking TBO response stored", {
         BookingId: result?.BookingId, isHeld, userId: req.user?.id,
       });
@@ -2381,6 +2410,7 @@ router.post("/bookings/check-status", requireAuth, async (req: any, res: any) =>
         status: booking.status,
         isHeld: booking.isHeld ?? false,
         lastVoucherDate: booking.lastVoucherDate ?? null,
+        tboReferenceNo: (booking as any).tboReferenceNo ?? null,
       });
     }
 
