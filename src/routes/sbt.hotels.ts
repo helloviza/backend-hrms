@@ -1133,12 +1133,8 @@ router.post("/validate-before-payment", requireSBT, requireHotelAccess, async (r
       });
     }
 
-    // Derive guestNationality from lead guest or request field
-    const _allRoomGuests: any[] = (hotelRoomsDetails as any[] | undefined)?.flatMap(
-      (r: any) => r?.Guests ?? r?.HotelPassenger ?? []
-    ) ?? [];
-    const _leadGuest = _allRoomGuests.find((g: any) => g?.LeadPassenger) ?? _allRoomGuests[0];
-    const guestNationality: string = _leadGuest?.Nationality || _guestNat || "IN";
+    // GuestNationality must equal Search-time value — never derive from per-guest field (TBO cert rule).
+    const guestNationality: string = _guestNat || "IN";
 
     // Corporate PAN lookup — same as /book (needed for corporate rule check)
     const _custId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
@@ -1279,13 +1275,16 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       bookingMode = "voucher",
     } = req.body;
 
-    // Derive GuestNationality: lead guest in HotelRoomsDetails > explicit field > "IN"
+    // GuestNationality must equal Search-time value — never derive from per-guest field (TBO cert rule).
+    const GuestNationality: string = _reqNationality || "IN";
     const _allGuests: any[] =
       (req.body.HotelRoomsDetails as any[] | undefined)?.flatMap((r: any) => r.Guests || []) ??
       (Guests as any[] | undefined) ??
       [];
-    const _leadGuest = _allGuests.find((g: any) => g.LeadPassenger) ?? _allGuests[0];
-    const GuestNationality: string = _leadGuest?.Nationality || _reqNationality || "IN";
+    const _natMismatches = _allGuests.filter((g: any) => g?.Nationality && g.Nationality !== GuestNationality);
+    if (_natMismatches.length > 0) {
+      console.warn(`[NATIONALITY-LOCK] ${_natMismatches.length} guest(s) had mismatched nationality — overriding all to ${GuestNationality}`);
+    }
 
     if (!BookingCode) return res.status(400).json({ error: "BookingCode required" });
 
@@ -1405,6 +1404,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           FirstName: String(g.FirstName || "").trim().substring(0, 25),
           LastName: String(g.LastName || "").trim().substring(0, 25),
           MiddleName: "",
+          Nationality: GuestNationality,
           PaxType: 1,
           LeadPassenger: g.LeadPassenger || false,
           Age: 0,
