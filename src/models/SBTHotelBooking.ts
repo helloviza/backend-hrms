@@ -94,6 +94,11 @@ export interface ISBTHotelBooking extends Document {
   }>;
   panMandatory?: boolean;
   rebookFromBookingId?: string;
+  tboReferenceNo?: string | null;
+  roomDescription?: string | null;
+  bookingDetailFetched?: boolean;
+  bookingDetailFetchedAt?: Date | null;
+  bookingDetailRaw?: unknown;
   bookedAt: Date;
   cancelledAt?: Date;
   closedAt?: Date;
@@ -200,6 +205,11 @@ const SBTHotelBookingSchema = new Schema(
     }],
     panMandatory: { type: Boolean, default: false },
     rebookFromBookingId: { type: String, default: null },
+    tboReferenceNo: { type: String, default: null, index: true },
+    roomDescription: { type: String, default: null },
+    bookingDetailFetched: { type: Boolean, default: false },
+    bookingDetailFetchedAt: { type: Date, default: null },
+    bookingDetailRaw: { type: Schema.Types.Mixed, default: null },
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
     closedAt: { type: Date },
