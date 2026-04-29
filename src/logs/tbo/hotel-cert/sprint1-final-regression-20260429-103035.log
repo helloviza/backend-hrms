@@ -1,0 +1,129 @@
+[2026-04-29T05:00:39.476Z] TBO Hotel Certification — All 8 Cases
+[2026-04-29T05:00:39.477Z] Output directory: D:\plumtrips-hrms\apps\backend\src\logs\tbo\hotel-cert
+[2026-04-29T05:00:39.477Z] Check-in: 2026-05-06  Check-out: 2026-05-07
+[2026-04-29T05:00:39.477Z] 
+[2026-04-29T05:00:39.477Z] Authenticating with TBO SharedData API...
+[2026-04-29T05:00:39.830Z] ✅ Auth OK — TokenId: c3614531-b365-4e02-9...
+[2026-04-29T05:00:39.832Z] ✅ Authentication.txt written (shared)
+
+[2026-04-29T05:00:39.833Z] 
+============================================================
+[2026-04-29T05:00:39.833Z] Running Case1_Hotel_Domestic_1R_1A
+[2026-04-29T05:00:39.833Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:00:39.833Z] Rooms: 1  Intl: false
+[2026-04-29T05:00:39.833Z] ============================================================
+[2026-04-29T05:00:39.833Z] Step 1/4: HotelSearch...
+[2026-04-29T05:00:41.905Z] ✅ Search OK — Hotel: Hotel-1000648 (1000648), BookingCode: 1000648!TB!1!TB!60dc8b57-4388-11f1-96fe-...
+[2026-04-29T05:00:41.906Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:00:44.181Z] ✅ PreBook OK — NetAmount: 5392.2584381179995
+[2026-04-29T05:00:44.182Z] Step 3/4: HotelBook...
+[2026-04-29T05:00:50.510Z] ❌ Case1_Hotel_Domestic_1R_1A FAILED: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"60dc8b57-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:00:50.510Z] 
+============================================================
+[2026-04-29T05:00:50.510Z] Running Case2_Hotel_Domestic_1R_2A2C
+[2026-04-29T05:00:50.510Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:00:50.510Z] Rooms: 1  Intl: false
+[2026-04-29T05:00:50.510Z] ============================================================
+[2026-04-29T05:00:50.510Z] Step 1/4: HotelSearch...
+[2026-04-29T05:00:51.262Z] ✅ Search OK — Hotel: Hotel-1000027 (1000027), BookingCode: 1000027!TB!1!TB!6739510f-4388-11f1-96fe-...
+[2026-04-29T05:00:51.262Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:00:53.819Z] ✅ PreBook OK — NetAmount: 17127.463698972
+[2026-04-29T05:00:53.819Z] Step 3/4: HotelBook...
+[2026-04-29T05:00:55.355Z] ❌ Case2_Hotel_Domestic_1R_2A2C FAILED: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"6739510f-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:00:55.355Z] 
+============================================================
+[2026-04-29T05:00:55.355Z] Running Case3_Hotel_Domestic_2R_1A_1A
+[2026-04-29T05:00:55.355Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:00:55.355Z] Rooms: 2  Intl: false
+[2026-04-29T05:00:55.355Z] ============================================================
+[2026-04-29T05:00:55.356Z] Step 1/4: HotelSearch...
+[2026-04-29T05:00:56.062Z] ✅ Search OK — Hotel: Hotel-1000538 (1000538), BookingCode: 1000538!TB!7!TB!6a06073b-4388-11f1-96fe-...
+[2026-04-29T05:00:56.062Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:00:58.440Z] ✅ PreBook OK — NetAmount: 20873.060362858003
+[2026-04-29T05:00:58.441Z] Step 3/4: HotelBook...
+[2026-04-29T05:00:59.683Z] ❌ Case3_Hotel_Domestic_2R_1A_1A FAILED: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"6a06073b-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:00:59.683Z] 
+============================================================
+[2026-04-29T05:00:59.683Z] Running Case4_Hotel_Domestic_2R_1A2C_2A
+[2026-04-29T05:00:59.683Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:00:59.683Z] Rooms: 2  Intl: false
+[2026-04-29T05:00:59.683Z] ============================================================
+[2026-04-29T05:00:59.683Z] Step 1/4: HotelSearch...
+[2026-04-29T05:01:00.506Z] ✅ Search OK — Hotel: Hotel-1000027 (1000027), BookingCode: 1000027!TB!1!TB!6c9a85fe-4388-11f1-96fe-...
+[2026-04-29T05:01:00.506Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:01:02.358Z] ✅ PreBook OK — NetAmount: 29462.722912808997
+[2026-04-29T05:01:02.359Z] Step 3/4: HotelBook...
+[2026-04-29T05:01:03.270Z] ❌ Case4_Hotel_Domestic_2R_1A2C_2A FAILED: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"6c9a85fe-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:03.270Z] 
+============================================================
+[2026-04-29T05:01:03.270Z] Running Case5_Hotel_Intl_1R_1A
+[2026-04-29T05:01:03.270Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:01:03.270Z] Rooms: 1  Intl: true
+[2026-04-29T05:01:03.270Z] ============================================================
+[2026-04-29T05:01:03.270Z] Step 1/4: HotelSearch...
+[2026-04-29T05:01:04.414Z] ✅ Search OK — Hotel: Hotel-1001049 (1001049), BookingCode: 1001049!TB!1!TB!6ebd6ddf-4388-11f1-96fe-...
+[2026-04-29T05:01:04.414Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:01:06.573Z] ✅ PreBook OK — NetAmount: 12822.661457315
+[2026-04-29T05:01:06.573Z] Step 3/4: HotelBook...
+[2026-04-29T05:01:08.152Z] ❌ Case5_Hotel_Intl_1R_1A FAILED: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"6ebd6ddf-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:08.152Z] 
+============================================================
+[2026-04-29T05:01:08.152Z] Running Case6_Hotel_Intl_1R_2A2C
+[2026-04-29T05:01:08.152Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:01:08.152Z] Rooms: 1  Intl: true
+[2026-04-29T05:01:08.152Z] ============================================================
+[2026-04-29T05:01:08.152Z] Step 1/4: HotelSearch...
+[2026-04-29T05:01:23.206Z] ✅ Search OK — Hotel: Hotel-1001046 (1001046), BookingCode: 1001046!TB!1!TB!71a683af-4388-11f1-96fe-...
+[2026-04-29T05:01:23.206Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:01:25.296Z] ✅ PreBook OK — NetAmount: 20398.181473851997
+[2026-04-29T05:01:25.296Z] Step 3/4: HotelBook...
+[2026-04-29T05:01:27.022Z] ❌ Case6_Hotel_Intl_1R_2A2C FAILED: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"71a683af-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:27.023Z] 
+============================================================
+[2026-04-29T05:01:27.023Z] Running Case7_Hotel_Intl_2R_1A_1A
+[2026-04-29T05:01:27.023Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:01:27.023Z] Rooms: 2  Intl: true
+[2026-04-29T05:01:27.023Z] ============================================================
+[2026-04-29T05:01:27.023Z] Step 1/4: HotelSearch...
+[2026-04-29T05:01:27.780Z] ✅ Search OK — Hotel: Hotel-1491912 (1491912), BookingCode: 1491912!TB!1!TB!7ce664bd-4388-11f1-96fe-...
+[2026-04-29T05:01:27.780Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:01:29.865Z] ✅ PreBook OK — NetAmount: 35260.045250902
+[2026-04-29T05:01:29.865Z] Step 3/4: HotelBook...
+[2026-04-29T05:01:30.928Z] ❌ Case7_Hotel_Intl_2R_1A_1A FAILED: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"7ce664bd-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:30.929Z] 
+============================================================
+[2026-04-29T05:01:30.929Z] Running Case8_Hotel_Intl_2R_1A2C_2A
+[2026-04-29T05:01:30.929Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:01:30.929Z] Rooms: 2  Intl: true
+[2026-04-29T05:01:30.929Z] ============================================================
+[2026-04-29T05:01:30.929Z] Step 1/4: HotelSearch...
+[2026-04-29T05:01:31.514Z] ✅ Search OK — Hotel: Hotel-1001056 (1001056), BookingCode: 1001056!TB!1!TB!7f3a1985-4388-11f1-96fe-...
+[2026-04-29T05:01:31.514Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:01:33.340Z] ✅ PreBook OK — NetAmount: 22333.670314744
+[2026-04-29T05:01:33.340Z] Step 3/4: HotelBook...
+[2026-04-29T05:01:34.222Z] ❌ Case8_Hotel_Intl_2R_1A2C_2A FAILED: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"7f3a1985-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:34.222Z] 
+============================================================
+[2026-04-29T05:01:34.222Z] CERTIFICATION RUN COMPLETE
+[2026-04-29T05:01:34.222Z] ============================================================
+[2026-04-29T05:01:34.222Z] 
+❌ FAILED CASES:
+[2026-04-29T05:01:34.223Z]    Case1_Hotel_Domestic_1R_1A: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"60dc8b57-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:34.223Z]    Case2_Hotel_Domestic_1R_2A2C: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"6739510f-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:34.223Z]    Case3_Hotel_Domestic_2R_1A_1A: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"6a06073b-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:34.223Z]    Case4_Hotel_Domestic_2R_1A2C_2A: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"6c9a85fe-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:34.223Z]    Case5_Hotel_Intl_1R_1A: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"6ebd6ddf-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:34.223Z]    Case6_Hotel_Intl_1R_2A2C: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"71a683af-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:34.223Z]    Case7_Hotel_Intl_2R_1A_1A: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"7ce664bd-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:34.223Z]    Case8_Hotel_Intl_2R_1A2C_2A: Book failed — no BookingId. Response: {"BookResult":{"TBOReferenceNo":null,"VoucherStatus":false,"ResponseStatus":2,"Error":{"ErrorCode":37,"ErrorMessage":"Unable to book as PAN: GSBPM2112A has exceeded the TCS exemption amount for foreign remittance.Please contact our helpdesk."},"TraceId":"7f3a1985-4388-11f1-96fe-720abae076dd","Status
+[2026-04-29T05:01:34.223Z] 
+📁 Logs at: D:\plumtrips-hrms\apps\backend\src\logs\tbo\hotel-cert
+[2026-04-29T05:01:34.223Z]    Each case folder contains:
+[2026-04-29T05:01:34.223Z]      Authentication.txt
+[2026-04-29T05:01:34.223Z]      HotelSearch.txt
+[2026-04-29T05:01:34.223Z]      HotelPreBook.txt
+[2026-04-29T05:01:34.223Z]      HotelBook.txt
+[2026-04-29T05:01:34.223Z]      HotelGetBookingDetail.txt
+[2026-04-29T05:01:34.223Z]      _summary.json
+[2026-04-29T05:01:34.223Z] 
+Next: zip each case folder individually and send to TBO.
