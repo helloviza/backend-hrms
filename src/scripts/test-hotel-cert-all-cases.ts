@@ -85,7 +85,7 @@ const ADULT_1 = {
   PassportNo: "",
   PassportIssueDate: "0001-01-01T00:00:00",
   PassportExpDate: "0001-01-01T00:00:00",
-  PAN: "GSBPM2112A",
+  PAN: "AAAAP0042B",
 };
 
 const ADULT_2 = {
@@ -101,7 +101,7 @@ const ADULT_2 = {
   PassportNo: "",
   PassportIssueDate: "0001-01-01T00:00:00",
   PassportExpDate: "0001-01-01T00:00:00",
-  PAN: "GSBPM2112A",
+  PAN: "AAAAP0042B",
 };
 
 const CHILD_1 = {
@@ -117,7 +117,7 @@ const CHILD_1 = {
   PassportNo: "",
   PassportIssueDate: "0001-01-01T00:00:00",
   PassportExpDate: "0001-01-01T00:00:00",
-  PAN: "GSBPM2112A",
+  PAN: "AAAAP0042B",
 };
 
 const CHILD_2 = {
@@ -133,7 +133,7 @@ const CHILD_2 = {
   PassportNo: "",
   PassportIssueDate: "0001-01-01T00:00:00",
   PassportExpDate: "0001-01-01T00:00:00",
-  PAN: "GSBPM2112A",
+  PAN: "AAAAP0042B",
 };
 
 // ─── CASE DEFINITIONS ─────────────────────────────────────────────────────
