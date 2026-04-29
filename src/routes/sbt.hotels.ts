@@ -2647,6 +2647,82 @@ router.get("/bookings/:id/cancel-preview", requireSBT, async (req: any, res: any
   }
 });
 
+// ── Background poller for cancel status (5×5s) ──────────────────────────────
+
+async function pollCancelStatusBackground(
+  mongoId: string,
+  changeRequestId: string,
+  endUserIp: string,
+  tboBookingId: string,
+  paymentMode: string,
+  workspaceId: any,
+  totalFare: number,
+  createdAt: Date,
+): Promise<void> {
+  let cancelStatus = 0;
+  let cancellationCharge = 0;
+  let refundedAmount = 0;
+
+  for (let i = 0; i < 5; i++) {
+    await new Promise<void>((r) => setTimeout(r, 5000));
+
+    try {
+      const statusData = await withTBOSessionRetry(
+        async (tokenId) => {
+          const statusPayload = { BookingMode: 5, ChangeRequestId: changeRequestId, EndUserIp: endUserIp, TokenId: tokenId };
+          const t1 = Date.now();
+          const statusRes = await fetch(
+            "https://HotelBE.tektravels.com/hotelservice.svc/rest/GetChangeRequestStatus",
+            { method: "POST", headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() }, body: JSON.stringify(statusPayload) }
+          );
+          const sd = (await statusRes.json()) as any;
+          logTBOCall({ method: "HotelGetChangeRequestStatus", traceId: `hotel-cancel-bg-${tboBookingId}-${i}`, request: statusPayload, response: sd, durationMs: Date.now() - t1 });
+          return sd;
+        },
+        (r: any) => r?.HotelChangeRequestStatusResult?.ResponseStatus === 4 || r?.HotelChangeRequestStatusResult?.Error?.ErrorCode === 6,
+      );
+
+      const statusResult = statusData?.HotelChangeRequestStatusResult;
+      cancelStatus = statusResult?.ChangeRequestStatus ?? 0;
+      cancellationCharge = statusResult?.CancellationCharge || 0;
+      refundedAmount = statusResult?.RefundedAmount || 0;
+
+      sbtLogger.info("[CANCEL-BG] Poll", { attempt: i + 1, cancelStatus, changeRequestId });
+      if (cancelStatus === 3 || cancelStatus === 4) break;
+    } catch (e: any) {
+      sbtLogger.error("[CANCEL-BG] Poll error", { attempt: i + 1, error: e?.message });
+    }
+  }
+
+  if (cancelStatus === 3) {
+    await SBTHotelBooking.findByIdAndUpdate(mongoId, {
+      status: "CANCELLED",
+      cancelledAt: new Date(),
+      cancellationCharge,
+      refundedAmount,
+    });
+    sbtLogger.info("[CANCEL-BG] Booking marked CANCELLED", { mongoId, changeRequestId, cancellationCharge });
+
+    if (paymentMode === "official" && workspaceId) {
+      const bookingMonth = createdAt.toISOString().slice(0, 7);
+      if (bookingMonth === new Date().toISOString().slice(0, 7)) {
+        await CustomerWorkspace.findOneAndUpdate(
+          { _id: workspaceId },
+          [{ $set: { "sbtOfficialBooking.currentMonthSpend": { $max: [0, { $subtract: ["$sbtOfficialBooking.currentMonthSpend", totalFare] }] } } }],
+          { runValidators: false }
+        ).catch((e: any) => sbtLogger.error("[CANCEL-BG] Spend reversal failed", { mongoId, error: e?.message }));
+      }
+    }
+  } else if (cancelStatus === 4) {
+    // Rejected — restore CONFIRMED so ops can decide
+    await SBTHotelBooking.findByIdAndUpdate(mongoId, { status: "CONFIRMED" });
+    sbtLogger.warn("[CANCEL-BG] Cancellation rejected by TBO — restored CONFIRMED", { mongoId, changeRequestId });
+  } else {
+    // Exhausted polls — leave CANCEL_PENDING for ops review
+    sbtLogger.warn("[CANCEL-BG] Poll exhausted — booking remains CANCEL_PENDING", { mongoId, changeRequestId });
+  }
+}
+
 // ─── 10. POST /bookings/:id/cancel ──────────────────────────────────────────
 
 router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
@@ -2696,115 +2772,44 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     }
 
     const changeRequestId: string = changeResult.ChangeRequestId;
-    let cancelStatus: number = changeResult.ChangeRequestStatus;
-    let cancellationCharge = 0;
-    let refundedAmount = 0;
+    const initialStatus: number = changeResult.ChangeRequestStatus;
 
-    // ── Step 2: Poll GetChangeRequestStatus (CROSS-002: retry per poll iteration) ──
-    if (cancelStatus === 1 || cancelStatus === 2) {
-      for (let i = 0; i < 3; i++) {
-        await new Promise<void>((r) => setTimeout(r, 2000));
+    // ── Step 2: Async background poll 5×5s ──────────────────────────────────
+    // Mark CANCEL_PENDING immediately and respond to client.
+    doc.status = "CANCEL_PENDING";
+    doc.changeRequestId = changeRequestId;
+    await doc.save();
 
-        const statusData = await withTBOSessionRetry(
-          async (tokenId) => {
-            const statusPayload = {
-              BookingMode: 5,
-              ChangeRequestId: changeRequestId,
-              EndUserIp: endUserIp,
-              TokenId: tokenId,
-            };
-            const t1 = Date.now();
-            const statusRes = await fetch(
-              "https://HotelBE.tektravels.com/hotelservice.svc/rest/GetChangeRequestStatus",
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
-                body: JSON.stringify(statusPayload),
-              }
-            );
-            const sd = (await statusRes.json()) as any;
-            logTBOCall({ method: "HotelGetChangeRequestStatus", traceId: `hotel-cancel-status-${doc.bookingId}-${i}`, request: statusPayload, response: sd, durationMs: Date.now() - t1 });
-            return sd;
-          },
-          (r: any) => r?.HotelChangeRequestStatusResult?.ResponseStatus === 4 || r?.HotelChangeRequestStatusResult?.Error?.ErrorCode === 6,
-        );
-
-        const statusResult = statusData?.HotelChangeRequestStatusResult;
-        cancelStatus = statusResult?.ChangeRequestStatus;
-        cancellationCharge = statusResult?.CancellationCharge || 0;
-        refundedAmount = statusResult?.RefundedAmount || 0;
-
-        console.debug("[CANCEL] Poll status:", { attempt: i + 1, cancelStatus });
-
-        if (cancelStatus === 3 || cancelStatus === 4) break;
-      }
-    }
-
-    // ── Evaluate final status ────────────────────────────────────────────────
-    if (cancelStatus === 3) {
-      // Processed — successfully cancelled
-      doc.status = "CANCELLED";
-      doc.cancelledAt = new Date();
-      doc.cancellationCharge = cancellationCharge;
-      doc.refundedAmount = refundedAmount;
-      doc.changeRequestId = changeRequestId;
-      await doc.save();
-
-      sbtLogger.info("Hotel booking cancelled", {
-        module: "sbt",
-        bookingId: doc.bookingId,
+    // Background: poll 5×5s — updates DB when TBO confirms/rejects.
+    setImmediate(() => {
+      pollCancelStatusBackground(
+        String(doc._id),
         changeRequestId,
-        cancellationCharge,
-        refundedAmount,
-        userId,
-      });
+        endUserIp,
+        doc.bookingId,
+        (doc as any).paymentMode || "personal",
+        (doc as any).workspaceId,
+        (doc as any).totalFare || 0,
+        doc.createdAt,
+      ).catch((e: any) =>
+        sbtLogger.error("[CANCEL-BG] Unhandled poller error", { bookingId: doc.bookingId, error: e?.message })
+      );
+    });
 
-      // Decrement spend if official booking in same calendar month
-      if ((doc as any).paymentMode === "official" && (doc as any).workspaceId) {
-        const bookingMonth = doc.createdAt.toISOString().slice(0, 7);
-        const currentMonth = new Date().toISOString().slice(0, 7);
-        if (bookingMonth === currentMonth) {
-          try {
-            await CustomerWorkspace.findOneAndUpdate(
-              { _id: (doc as any).workspaceId },
-              [{ $set: {
-                "sbtOfficialBooking.currentMonthSpend": {
-                  $max: [0, { $subtract: ["$sbtOfficialBooking.currentMonthSpend", (doc as any).totalFare || 0] }],
-                },
-              }}],
-              { runValidators: false }
-            );
-            sbtLogger.info("[OfficialBooking] Spend reversed on cancellation", {
-              bookingId: doc._id,
-              amount: (doc as any).totalFare,
-              workspaceId: (doc as any).workspaceId,
-            });
-          } catch (err) {
-            sbtLogger.error("[OfficialBooking] Failed to reverse spend on cancellation", {
-              bookingId: doc._id,
-              error: err,
-            });
-          }
-        }
-      }
+    sbtLogger.info("Hotel cancellation initiated (async)", {
+      module: "sbt",
+      bookingId: doc.bookingId,
+      changeRequestId,
+      initialStatus,
+      userId,
+    });
 
-      return res.json({ ok: true, cancellationCharge, refundedAmount, changeRequestId });
-    } else if (cancelStatus === 4) {
-      // Rejected by TBO
-      return res.status(409).json({ error: "The cancellation request could not be processed. Please contact Plumtrips support.", changeRequestId });
-    } else {
-      // Still pending after polling — mark CANCEL_PENDING for ops review
-      doc.status = "CANCEL_PENDING";
-      doc.changeRequestId = changeRequestId;
-      await doc.save();
-
-      return res.status(202).json({
-        ok: true,
-        pending: true,
-        message: "Cancellation is being processed",
-        changeRequestId,
-      });
-    }
+    return res.status(202).json({
+      ok: true,
+      pending: true,
+      message: "Cancellation is being processed",
+      changeRequestId,
+    });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Cancellation failed";
     sbtLogger.error("Hotel cancel failed", { bookingId: req.params.id, error: msg });
@@ -2812,7 +2817,85 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
   }
 });
 
-// ─── 10a. GET /images?hotelCodes=xxx,yyy ────────────────────────────────────
+// ─── 10a. GET /bookings/:id/status ──────────────────────────────────────────
+// Item 2: Frontend polls this after async cancel to learn final status.
+
+router.get("/bookings/:id/status", requireSBT, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const doc = await SBTHotelBooking.findOne({ _id: req.params.id, userId }, "status changeRequestId cancellationCharge refundedAmount").lean();
+    if (!doc) return res.status(404).json({ error: "Booking not found" });
+    return res.json({ status: doc.status, changeRequestId: doc.changeRequestId ?? null, cancellationCharge: doc.cancellationCharge ?? 0, refundedAmount: doc.refundedAmount ?? 0 });
+  } catch (err: unknown) {
+    res.status(500).json({ error: "Status fetch failed" });
+  }
+});
+
+// ─── 10b. POST /bookings/:id/close ───────────────────────────────────────────
+// Item 5: User-driven soft-delete of FAILED bookings (status → CLOSED).
+
+router.post("/bookings/:id/close", requireSBT, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const doc = await SBTHotelBooking.findOne({ _id: req.params.id, userId });
+    if (!doc) return res.status(404).json({ error: "Booking not found" });
+    if (doc.status !== "FAILED") return res.status(400).json({ error: "Only FAILED bookings can be closed" });
+    doc.status = "CLOSED";
+    (doc as any).closedAt = new Date();
+    await doc.save();
+    sbtLogger.info("Hotel booking closed by user", { bookingId: doc._id, userId });
+    return res.json({ ok: true });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Close failed";
+    res.status(500).json({ error: msg });
+  }
+});
+
+// ─── 10c. GET /bookings/:id/voucher-summary ──────────────────────────────────
+// Item 7: Voucher display page fetches this by MongoDB _id.
+
+router.get("/bookings/:id/voucher-summary", requireAuth, async (req: any, res: any) => {
+  try {
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    const booking = await SBTHotelBooking.findOne({ _id: req.params.id, userId }).lean();
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const summary = extractVoucherSummary(booking.tboVoucherData);
+    return res.json({
+      ok: true,
+      booking: {
+        _id: booking._id,
+        hotelName: booking.hotelName,
+        cityName: booking.cityName,
+        checkIn: booking.checkIn,
+        checkOut: booking.checkOut,
+        guests: booking.guests,
+        rooms: booking.rooms,
+        roomName: booking.roomName,
+        mealType: booking.mealType,
+        totalFare: booking.totalFare,
+        netAmount: booking.netAmount,
+        displayAmount: booking.displayAmount,
+        currency: booking.currency,
+        isRefundable: booking.isRefundable,
+        cancelPolicies: booking.cancelPolicies,
+        status: booking.status,
+        paymentStatus: booking.paymentStatus,
+        confirmationNo: booking.confirmationNo,
+        bookingRefNo: booking.bookingRefNo,
+        bookingId: booking.bookingId,
+        isVouchered: booking.isVouchered,
+        voucherStatus: booking.voucherStatus,
+        bookedAt: booking.bookedAt,
+      },
+      voucherSummary: summary,
+    });
+  } catch (err: unknown) {
+    res.status(500).json({ error: "Voucher summary fetch failed" });
+  }
+});
+
+// ─── 10d. GET /images?hotelCodes=xxx,yyy ────────────────────────────────────
 
 router.get("/images", requireAuth, async (req: any, res: any) => {
   try {

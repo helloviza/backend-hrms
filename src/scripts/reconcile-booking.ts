@@ -2,34 +2,35 @@ import "dotenv/config";
 import mongoose from "mongoose";
 import { connectDb } from "../config/db.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
-import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
 import { parseTBODate } from "../lib/tbo-date.js";
-import { logTBOCall } from "../utils/tboFileLogger.js";
+import { getBookingDetail } from "../services/tbo.hotel.service.js";
 
 // Run: npx tsx -r dotenv/config src/scripts/reconcile-booking.ts <BookingId>
+// POST-004: Also supports --confirmationNo <no> --name <guest> and --traceId <id> fallback modes.
 // Backfills a partial SBTHotelBooking record from TBO GetBookingDetail.
 // Safe to re-run: idempotent if the record is already fully populated.
 
-const bookingIdArg = process.argv[2];
-if (!bookingIdArg) {
+const args = process.argv.slice(2);
+const argMap: Record<string, string> = {};
+for (let i = 0; i < args.length; i++) {
+  if (args[i].startsWith("--")) { argMap[args[i].slice(2)] = args[i + 1] ?? ""; i++; }
+  else if (!argMap.bookingId) { argMap.bookingId = args[i]; }
+}
+
+const bookingIdArg = argMap.bookingId;
+const confirmationNoArg = argMap.confirmationNo;
+const nameArg = argMap.name;
+const traceIdArg = argMap.traceId;
+
+if (!bookingIdArg && !confirmationNoArg && !traceIdArg) {
   console.error("Usage: tsx src/scripts/reconcile-booking.ts <BookingId>");
+  console.error("       tsx src/scripts/reconcile-booking.ts --bookingId <id>");
+  console.error("       tsx src/scripts/reconcile-booking.ts --confirmationNo <no> --name <guest>");
+  console.error("       tsx src/scripts/reconcile-booking.ts --traceId <id>");
   process.exit(1);
 }
 
-const tboBookingId = Number(bookingIdArg);
-if (!tboBookingId || isNaN(tboBookingId)) {
-  console.error(`Invalid BookingId: "${bookingIdArg}" — must be a positive integer`);
-  process.exit(1);
-}
-
-function hotelAuthHeader(): string {
-  return (
-    "Basic " +
-    Buffer.from(
-      `${process.env.TBO_HOTEL_USERNAME}:${process.env.TBO_HOTEL_PASSWORD}`
-    ).toString("base64")
-  );
-}
+const tboBookingId = bookingIdArg ? Number(bookingIdArg) : NaN;
 
 // Convert TBO DD-MM-YYYY (or ISO) to YYYY-MM-DD string for checkIn/checkOut storage.
 function tboDateToYMD(raw: string | null | undefined): string {
@@ -45,16 +46,34 @@ function tboDateToYMD(raw: string | null | undefined): string {
 }
 
 async function main() {
-  console.log(`\n=== Reconcile TBO Hotel Booking ${tboBookingId} ===\n`);
+  const displayKey = bookingIdArg
+    ? `BookingId=${tboBookingId}`
+    : confirmationNoArg
+    ? `ConfirmationNo=${confirmationNoArg}`
+    : `TraceId=${traceIdArg}`;
+  console.log(`\n=== Reconcile TBO Hotel Booking [${displayKey}] ===\n`);
 
   await connectDb();
   console.log("[1/4] MongoDB connected");
 
   // Step 1: Locate the partial DB record
-  const doc = await SBTHotelBooking.findOne({ bookingId: String(tboBookingId) });
+  let doc =
+    !isNaN(tboBookingId) && tboBookingId > 0
+      ? await SBTHotelBooking.findOne({ bookingId: String(tboBookingId) })
+      : null;
+
+  if (!doc && confirmationNoArg) {
+    doc = await SBTHotelBooking.findOne({ confirmationNo: confirmationNoArg });
+    if (doc) console.log(`  [INFO] Found by confirmationNo="${confirmationNoArg}"`);
+  }
+  if (!doc && traceIdArg) {
+    doc = await SBTHotelBooking.findOne({ clientReferenceId: traceIdArg });
+    if (doc) console.log(`  [INFO] Found by clientReferenceId/traceId="${traceIdArg}"`);
+  }
+
   if (!doc) {
     console.error(
-      `[FAIL] No SBTHotelBooking found with bookingId="${tboBookingId}". ` +
+      `[FAIL] No SBTHotelBooking found for [${displayKey}]. ` +
         "Try querying by clientReferenceId if the bookingId was not persisted."
     );
     await mongoose.disconnect();
@@ -101,53 +120,40 @@ async function main() {
     process.exit(0);
   }
 
-  // Step 2: Call TBO GetBookingDetail
-  console.log("\n[3/4] Calling TBO GetBookingDetail...");
-  const rawResponse = await withTBOSessionRetry(
-    async (tokenId) => {
-      const payload = {
-        EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
-        TokenId: tokenId,
-        BookingId: tboBookingId,
-      };
-      const t0 = Date.now();
-      const res = await fetch(
-        "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: hotelAuthHeader(),
-          },
-          body: JSON.stringify(payload),
-        }
-      );
-      const data = (await res.json()) as any;
-      logTBOCall({
-        method: "HotelGetBookingDetail",
-        traceId: `reconcile-${tboBookingId}`,
-        request: payload,
-        response: data,
-        durationMs: Date.now() - t0,
-      });
-      return data;
-    },
-    (r: any) => {
-      const inner = r?.GetBookingDetailResult || r?.BookResult || r;
-      return inner?.ResponseStatus === 4 || inner?.Error?.ErrorCode === 6;
-    }
-  );
+  // Step 2: Call TBO GetBookingDetail — POST-004: try all three lookup modes
+  console.log("\n[3/4] Calling TBO GetBookingDetail (with fallback modes)...");
 
-  const result =
-    rawResponse?.GetBookingDetailResult || rawResponse?.BookResult || rawResponse;
+  const lookups: import("../services/tbo.hotel.service.js").BookingDetailLookup[] = [];
 
-  if (!result || result.ResponseStatus !== 1) {
-    const errCode = result?.Error?.ErrorCode ?? "unknown";
-    const errMsg = result?.Error?.ErrorMessage ?? "No message";
-    console.error(
-      `[FAIL] GetBookingDetail returned failure — ErrorCode ${errCode}: ${errMsg}`
-    );
-    console.error("Full TBO response:", JSON.stringify(rawResponse, null, 2));
+  // Primary: BookingId (from DB record or CLI arg)
+  const numericId = !isNaN(tboBookingId) && tboBookingId > 0
+    ? tboBookingId
+    : Number(doc.bookingId);
+  if (numericId > 0) lookups.push({ mode: "bookingId", bookingId: numericId });
+
+  // Fallback 1: ConfirmationNo + lead guest name
+  const confNo = confirmationNoArg || doc.confirmationNo;
+  const leadGuest = doc.guests?.[0];
+  const guestName = nameArg || (leadGuest ? `${leadGuest.FirstName} ${leadGuest.LastName}`.trim() : "");
+  if (confNo && guestName) lookups.push({ mode: "confirmationNo", confirmationNo: confNo, guestName });
+
+  // Fallback 2: TraceId (passed via --traceId or stored as clientReferenceId)
+  const traceId = traceIdArg || (doc as any).clientReferenceId;
+  if (traceId) lookups.push({ mode: "traceId", traceId });
+
+  if (lookups.length === 0) {
+    console.error("[FAIL] No valid lookup parameters available (no bookingId, confirmationNo, or traceId).");
+    await mongoose.disconnect();
+    process.exit(1);
+  }
+
+  console.log(`  Lookup chain: ${lookups.map((l) => l.mode).join(" → ")}`);
+
+  let result: any;
+  try {
+    result = await getBookingDetail(lookups);
+  } catch (e: any) {
+    console.error(`[FAIL] ${e?.message || String(e)}`);
     await mongoose.disconnect();
     process.exit(1);
   }

@@ -43,7 +43,7 @@ export interface ISBTHotelBooking extends Document {
   currency: string;
   isRefundable: boolean;
   cancelPolicies: unknown[];
-  status: "CONFIRMED" | "CANCELLED" | "FAILED" | "PENDING" | "CANCEL_PENDING" | "HELD" | "EXPIRED";
+  status: "CONFIRMED" | "CANCELLED" | "FAILED" | "PENDING" | "CANCEL_PENDING" | "HELD" | "EXPIRED" | "CLOSED";
   isHeld?: boolean;
   lastVoucherDate?: Date;
   lastCancellationDate?: Date | null;
@@ -95,6 +95,8 @@ export interface ISBTHotelBooking extends Document {
   panMandatory?: boolean;
   bookedAt: Date;
   cancelledAt?: Date;
+  closedAt?: Date;
+  reminders?: Array<{ type: "24h" | "1h"; sentAt: Date }>;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -137,7 +139,7 @@ const SBTHotelBookingSchema = new Schema(
     cancelPolicies: { type: [Schema.Types.Mixed], default: [] },
     status: {
       type: String,
-      enum: ["CONFIRMED", "CANCELLED", "FAILED", "PENDING", "CANCEL_PENDING", "HELD", "EXPIRED"],
+      enum: ["CONFIRMED", "CANCELLED", "FAILED", "PENDING", "CANCEL_PENDING", "HELD", "EXPIRED", "CLOSED"],
       default: "CONFIRMED",
     },
     isHeld: { type: Boolean, default: false },
@@ -198,6 +200,11 @@ const SBTHotelBookingSchema = new Schema(
     panMandatory: { type: Boolean, default: false },
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
+    closedAt: { type: Date },
+    reminders: [{
+      type: { type: String, enum: ["24h", "1h"] },
+      sentAt: { type: Date, default: Date.now },
+    }],
   },
   { timestamps: true },
 );

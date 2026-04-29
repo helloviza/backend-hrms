@@ -542,6 +542,10 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       const { startEodCron } = await import("./jobs/eodCron.js");
       startEodCron().catch((e: unknown) => logger.error("[EOD] Cron start failed", { e }));
 
+      // PLUMBOX-005: Hold-booking voucher deadline reminders (24h + 1h)
+      const { startHoldBookingReminderCron } = await import("./jobs/hold-booking-reminder.js");
+      startHoldBookingReminderCron();
+
       const server = app.listen(env.PORT, () => {
         logger.info("API running", { port: env.PORT });
       });
