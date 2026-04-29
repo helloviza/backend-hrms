@@ -15,7 +15,8 @@ import { logTBOCall } from "../utils/tboFileLogger.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { getMarginConfig, applyMargin } from "../utils/margin.js";
-import { getTBOToken, clearTBOToken } from "../services/tbo.auth.service.js";
+import { getTBOToken, logoutTBO } from "../services/tbo.auth.service.js";
+import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
 import { getCompanySettings } from "../utils/companySettings.js";
 import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES } from "../shared/cities.js";
 
@@ -995,21 +996,26 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       });
     }
 
+    // CROSS-002: withTBOSessionRetry handles InValidSession (ResponseStatus=4/ErrorCode=6).
+    // PreBook uses Basic Auth (tokenId ignored in fn body) but TBO can still return ErrorCode=6.
     const tboPayload = { BookingCode };
     const t0 = Date.now();
-    const tboRes = await fetch(
-      "https://affiliate.tektravels.com/HotelAPI/PreBook",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: hotelAuthHeader(),
-        },
-        body: JSON.stringify(tboPayload),
-      }
+    const data = await withTBOSessionRetry(
+      async (_tokenId) => {
+        const res = await fetch(
+          "https://affiliate.tektravels.com/HotelAPI/PreBook",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
+            body: JSON.stringify(tboPayload),
+          }
+        );
+        const d = (await res.json()) as any;
+        logTBOCall({ method: "HotelPreBook", traceId: BookingCode.split("!TB!")[2] || "hotel-prebook", request: tboPayload, response: d, durationMs: Date.now() - t0 });
+        return d;
+      },
+      (r: any) => r?.Error?.ErrorCode === 6 || r?.ResponseStatus === 4,
     );
-    const data = (await tboRes.json()) as any;
-    logTBOCall({ method: "HotelPreBook", traceId: BookingCode.split("!TB!")[2] || "hotel-prebook", request: tboPayload, response: data, durationMs: Date.now() - t0 });
 
     const prebookHotel = data?.HotelResult?.[0] || data?.PreBookResult?.HotelResult?.[0];
     const room0 = prebookHotel?.Rooms?.[0];
@@ -1333,7 +1339,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
     // Design C: per-room passenger builder — children auto-generated, adults fully mapped.
     // Children must NOT carry PAN/Phoneno/Email/PassportNo keys (TBO Op Rule 2: omit, not null).
-    const buildRoomPassengers = (room: any): Record<string, unknown>[] => {
+    const buildRoomPassengers = (room: any, roomIndex: number): Record<string, unknown>[] => {
       const roomGuests: any[] = room.Guests ?? room.HotelPassenger ?? [];
       const leadAdult = roomGuests.find((g: any) => Number(g.PaxType) === 1 && g.LeadPassenger)
         ?? roomGuests.find((g: any) => Number(g.PaxType) === 1);
@@ -1382,15 +1388,25 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           base.CorporatePAN = g.CorporatePAN || "";
         }
 
+        // BOOK-013: GST fields — lead adult of first room only when GSTAllowed=true.
+        if (roomIndex === 0 && !!g.LeadPassenger && validationFlags.GSTAllowed === true && req.body?.gstInfo) {
+          const gst = req.body.gstInfo;
+          if (gst.gstin)          base.GSTNumber                = gst.gstin;
+          if (gst.companyName)    base.GSTCompanyName           = gst.companyName;
+          if (gst.companyAddress) base.GSTCompanyAddress        = gst.companyAddress;
+          if (gst.companyPhone)   base.GSTCompanyContactNumber  = gst.companyPhone;
+          if (gst.companyEmail)   base.GSTCompanyEmail          = gst.companyEmail;
+        }
+
         return base;
       });
     };
 
     const HotelRoomsDetails = req.body.HotelRoomsDetails
-      ? (req.body.HotelRoomsDetails as any[]).map((room: any) => ({
-          HotelPassenger: buildRoomPassengers(room),
+      ? (req.body.HotelRoomsDetails as any[]).map((room: any, roomIdx: number) => ({
+          HotelPassenger: buildRoomPassengers(room, roomIdx),
         }))
-      : [{ HotelPassenger: buildRoomPassengers({ Guests: Guests || [] }) }];
+      : [{ HotelPassenger: buildRoomPassengers({ Guests: Guests || [] }, 0) }];
 
     // GAP-02: implication-rule sanity check — spec says PackageDetailsMandatory:true implies IsPackageFare:true.
     // Log warning if we see PackageDetailsMandatory (signalled by ArrivalTransport present) without IsPackageFare.
@@ -1505,30 +1521,35 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       };
     }
 
-    // Helper: call GetBookingDetail to verify actual booking status
+    // Helper: call GetBookingDetail to verify actual booking status.
+    // CROSS-002: withTBOSessionRetry handles InValidSession with single retry.
     async function verifyBookingStatus(bookingId: number): Promise<any> {
-      let detailToken = "";
-      try { detailToken = await getTBOToken(); } catch {}
-      const detailPayload = {
-        EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
-        TokenId: detailToken,
-        BookingId: bookingId,
-      };
-      const dt0 = Date.now();
-      const detailRes = await fetch(
-        "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: hotelAuthHeader(),
-          },
-          body: JSON.stringify(detailPayload),
-        }
+      const rawData = await withTBOSessionRetry(
+        async (tokenId) => {
+          const detailPayload = {
+            EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+            TokenId: tokenId,
+            BookingId: bookingId,
+          };
+          const dt0 = Date.now();
+          const detailRes = await fetch(
+            "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
+              body: JSON.stringify(detailPayload),
+            }
+          );
+          const detailData = (await detailRes.json()) as any;
+          logTBOCall({ method: "HotelGetBookingDetail", traceId: `hotel-book-verify-${bookingId}`, request: detailPayload, response: detailData, durationMs: Date.now() - dt0 });
+          return detailData;
+        },
+        (r: any) => {
+          const inner = r?.GetBookingDetailResult || r?.BookResult || r;
+          return inner?.ResponseStatus === 4 || inner?.Error?.ErrorCode === 6;
+        },
       );
-      const detailData = (await detailRes.json()) as any;
-      logTBOCall({ method: "HotelGetBookingDetail", traceId: `hotel-book-verify-${bookingId}`, request: detailPayload, response: detailData, durationMs: Date.now() - dt0 });
-      return detailData?.GetBookingDetailResult || detailData?.BookResult || detailData;
+      return rawData?.GetBookingDetailResult || rawData?.BookResult || rawData;
     }
 
     // Helper: send success response and (if not hold) fire-and-forget voucher generation
@@ -1536,7 +1557,8 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       const isHeld = bookingMode === "hold";
 
       // For hold bookings: Book response rarely includes LastVoucherDate.
-      // Call GetBookingDetail immediately to retrieve it.
+      // Call GetBookingDetail immediately to retrieve it and store PaxIds for PAN-at-voucher-time.
+      let holdPaxDetails: Array<{ paxId: string; firstName: string; lastName: string; paxType: number }> = [];
       if (isHeld && result?.BookingId) {
         try {
           const details = await verifyBookingStatus(Number(result.BookingId));
@@ -1547,8 +1569,20 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           if (detailVoucherDate && !result.LastVoucherDate) {
             result = { ...result, LastVoucherDate: detailVoucherDate };
           }
+          // POST-001: Extract PaxIds for PAN-at-voucher-time (hold + PanMandatory flow).
+          const allPassengers: any[] = (details?.HotelRoomsDetails ?? []).flatMap(
+            (room: any) => room?.HotelPassenger ?? []
+          );
+          holdPaxDetails = allPassengers
+            .filter((p: any) => p?.PaxId)
+            .map((p: any) => ({
+              paxId: String(p.PaxId),
+              firstName: p.FirstName || "",
+              lastName: p.LastName || "",
+              paxType: Number(p.PaxType) || 1,
+            }));
         } catch (detailErr) {
-          console.debug('[HOLD-BOOK] GetBookingDetail for LastVoucherDate failed:', detailErr instanceof Error ? detailErr.message : String(detailErr));
+          console.debug('[HOLD-BOOK] GetBookingDetail failed:', detailErr instanceof Error ? detailErr.message : String(detailErr));
         }
       }
 
@@ -1559,9 +1593,12 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         result?.VoucherDate ??
         null;
 
-      // Invalidate search cache and booking-code timestamps so next search shows fresh availability
+      // Invalidate search cache and evict only this booking's code — clearing the entire map would
+      // terminate every concurrent user's 40-min session window (CROSS-011).
       searchCache.clear();
-      bookingCodeTimestamps.clear();
+      if (BookingCode) {
+        bookingCodeTimestamps.delete(BookingCode);
+      }
 
       // GAP-01: Update pre-persist skeleton to CONFIRMED/HELD with TBO booking details.
       try {
@@ -1572,6 +1609,9 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             bookingId: String(result?.BookingId ?? ""),
             confirmationNo: String(result?.ConfirmationNo ?? ""),
             bookingRefNo: String(result?.BookingRefNo ?? ""),
+            // POST-001: store PaxIds and PAN requirement for generate-voucher-with-PAN flow.
+            ...(isHeld && holdPaxDetails.length > 0 ? { paxDetails: holdPaxDetails } : {}),
+            ...(isHeld ? { panMandatory: !!panMandatory } : {}),
           }},
         );
       } catch { /* non-fatal — booking succeeded; DB update is best-effort */ }
@@ -1695,7 +1735,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           ResponseStatus: _bookResult0?.ResponseStatus,
           ErrorCode: _bookResult0?.Error?.ErrorCode,
         });
-        clearTBOToken();
+        await logoutTBO();
         await getTBOToken({ forceRefresh: true });
         const _srController = new AbortController();
         const _srTimer = setTimeout(() => _srController.abort(), 120_000);
@@ -1792,6 +1832,23 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             });
           }
         }
+      }
+
+      // BOOK-018: IsCancellationPolicyChanged requires re-confirmation — surface to frontend.
+      // IsPriceChanged is handled above via auto-retry; CancelPolicy change has no auto-extractable
+      // field to re-send, so we require explicit user acceptance before re-booking.
+      // When the frontend re-sends with isCancellationPolicyChangedAccepted=true, skip this gate.
+      if (result?.IsCancellationPolicyChanged === true && req.body?.isCancellationPolicyChangedAccepted !== true) {
+        sbtLogger.warn("Book IsCancellationPolicyChanged=true — returning 409 for user acceptance", {
+          userId: req.user?.id, clientRef, BookingCode,
+        });
+        return res.status(409).json({
+          code: "BOOKING_TERMS_CHANGED",
+          message: "The cancellation policy for this room has changed. Please review and accept the new policy to continue.",
+          isCancellationPolicyChanged: true,
+          updatedCancellationPolicy: result?.CancelPolicies ?? result?.CancellationPolicies ?? [],
+          bookingCode: BookingCode,
+        });
       }
 
       const bookingId = Number(result?.BookingId);
@@ -1966,7 +2023,12 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
     if (!numericId) return res.status(400).json({ error: "Invalid booking ID" });
 
     // ── Optional payment before generating voucher ────────────────────
-    const { paymentId, walletPayment } = req.body as { paymentId?: string; walletPayment?: boolean };
+    const { paymentId, walletPayment, panData } = req.body as {
+      paymentId?: string;
+      walletPayment?: boolean;
+      // POST-001: panData supplied by frontend for HOLD+PanMandatory bookings.
+      panData?: { isCorporate?: boolean; passengers: Array<{ paxId: string; PAN: string }> };
+    };
 
     if (walletPayment && req.workspaceObjectId) {
       // Deduct from agency wallet before calling TBO
@@ -1986,7 +2048,23 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
       await SBTHotelBooking.findByIdAndUpdate(booking._id, { razorpayPaymentId: paymentId }).catch(() => {});
     }
 
-    const voucherRes = await generateHotelVoucher(numericId);
+    // POST-001: Build PAN payload for HOLD+PanMandatory bookings.
+    // Pair user-supplied PAN with stored PaxIds from GetBookingDetail at Book time.
+    let voucherPanPayload: import("../services/tbo.hotel.service.js").VoucherPanPayload | undefined;
+    if (panData?.passengers?.length && booking.paxDetails?.length) {
+      const paxMap = new Map(booking.paxDetails.map((p: any) => [p.paxId, p]));
+      const validPairs = panData.passengers.filter(
+        (pr) => paxMap.has(pr.paxId) && pr.PAN?.trim()
+      );
+      if (validPairs.length > 0) {
+        voucherPanPayload = {
+          isCorporate: panData.isCorporate === true,
+          hotelRoomsDetails: [{ hotelPassenger: validPairs.map((pr) => ({ PaxId: pr.paxId, PAN: pr.PAN.trim().toUpperCase() })) }],
+        };
+      }
+    }
+
+    const voucherRes = await generateHotelVoucher(numericId, voucherPanPayload);
 
     // ── Detect ErrorCode 2 = genuine agency balance insufficient ─────
     const gvr = voucherRes?.GenerateVoucherResult;
@@ -2502,40 +2580,37 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
       return res.status(409).json({ error: "Booking already cancelled" });
 
     const numericBookingId = Number(doc.bookingId);
-    const tokenId = await getTBOToken();
     const endUserIp = process.env.TBO_EndUserIp || "1.1.1.1";
 
-    // ── Step 1: SendChangeRequest ────────────────────────────────────────────
-    const changeReqPayload = {
-      BookingMode: 5,
-      RequestType: 4,
-      Remarks: "Cancelled by user",
-      BookingId: numericBookingId,
-      EndUserIp: endUserIp,
-      TokenId: tokenId,
-    };
-    const t0 = Date.now();
-    const changeRes = await fetch(
-      "https://HotelBE.tektravels.com/hotelservice.svc/rest/SendChangeRequest",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: hotelAuthHeader(),
-        },
-        body: JSON.stringify(changeReqPayload),
-      }
+    // ── Step 1: SendChangeRequest (CROSS-002: withTBOSessionRetry for InValidSession) ──
+    const changeData = await withTBOSessionRetry(
+      async (tokenId) => {
+        const changeReqPayload = {
+          BookingMode: 5,
+          RequestType: 4,
+          Remarks: "Cancelled by user",
+          BookingId: numericBookingId,
+          EndUserIp: endUserIp,
+          TokenId: tokenId,
+        };
+        const t0 = Date.now();
+        const changeRes = await fetch(
+          "https://HotelBE.tektravels.com/hotelservice.svc/rest/SendChangeRequest",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
+            body: JSON.stringify(changeReqPayload),
+          }
+        );
+        const rawText = await changeRes.text();
+        let parsed: any;
+        try { parsed = JSON.parse(rawText); }
+        catch { throw new Error(`TBO SendChangeRequest returned non-JSON: ${rawText.substring(0, 200)}`); }
+        logTBOCall({ method: "HotelSendChangeRequest", traceId: `hotel-cancel-${doc.bookingId}`, request: changeReqPayload, response: parsed, durationMs: Date.now() - t0 });
+        return parsed;
+      },
+      (r: any) => r?.HotelChangeRequestResult?.ResponseStatus === 4 || r?.HotelChangeRequestResult?.Error?.ErrorCode === 6,
     );
-
-    const changeRawText = await changeRes.text();
-
-    let changeData: any;
-    try {
-      changeData = JSON.parse(changeRawText);
-    } catch {
-      throw new Error(`TBO SendChangeRequest returned non-JSON: ${changeRawText.substring(0, 200)}`);
-    }
-    logTBOCall({ method: "HotelSendChangeRequest", traceId: `hotel-cancel-${doc.bookingId}`, request: changeReqPayload, response: changeData, durationMs: Date.now() - t0 });
 
     const changeResult = changeData?.HotelChangeRequestResult;
     if (!changeResult || changeResult.ResponseStatus !== 1) {
@@ -2547,32 +2622,34 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     let cancellationCharge = 0;
     let refundedAmount = 0;
 
-    // ── Step 2: Poll GetChangeRequestStatus if pending/in-progress ───────────
+    // ── Step 2: Poll GetChangeRequestStatus (CROSS-002: retry per poll iteration) ──
     if (cancelStatus === 1 || cancelStatus === 2) {
       for (let i = 0; i < 3; i++) {
         await new Promise<void>((r) => setTimeout(r, 2000));
 
-        const statusPayload = {
-          BookingMode: 5,
-          ChangeRequestId: changeRequestId,
-          EndUserIp: endUserIp,
-          TokenId: tokenId,
-        };
-        const t1 = Date.now();
-        const statusRes = await fetch(
-          "https://HotelBE.tektravels.com/hotelservice.svc/rest/GetChangeRequestStatus",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: hotelAuthHeader(),
-            },
-            body: JSON.stringify(statusPayload),
-          }
+        const statusData = await withTBOSessionRetry(
+          async (tokenId) => {
+            const statusPayload = {
+              BookingMode: 5,
+              ChangeRequestId: changeRequestId,
+              EndUserIp: endUserIp,
+              TokenId: tokenId,
+            };
+            const t1 = Date.now();
+            const statusRes = await fetch(
+              "https://HotelBE.tektravels.com/hotelservice.svc/rest/GetChangeRequestStatus",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
+                body: JSON.stringify(statusPayload),
+              }
+            );
+            const sd = (await statusRes.json()) as any;
+            logTBOCall({ method: "HotelGetChangeRequestStatus", traceId: `hotel-cancel-status-${doc.bookingId}-${i}`, request: statusPayload, response: sd, durationMs: Date.now() - t1 });
+            return sd;
+          },
+          (r: any) => r?.HotelChangeRequestStatusResult?.ResponseStatus === 4 || r?.HotelChangeRequestStatusResult?.Error?.ErrorCode === 6,
         );
-
-        const statusData = (await statusRes.json()) as any;
-        logTBOCall({ method: "HotelGetChangeRequestStatus", traceId: `hotel-cancel-status-${doc.bookingId}-${i}`, request: statusPayload, response: statusData, durationMs: Date.now() - t1 });
 
         const statusResult = statusData?.HotelChangeRequestStatusResult;
         cancelStatus = statusResult?.ChangeRequestStatus;

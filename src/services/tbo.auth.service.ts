@@ -119,6 +119,8 @@ export async function logoutTBO(): Promise<void> {
       UserName: process.env.TBO_UserName,
       TokenId: cache.token,
       EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+      TokenAgencyId: cache.agencyId ?? 0,
+      TokenMemberId: cache.memberId ?? 0,
     };
     const start = Date.now();
     const logoutRes = await fetch(`${TBO_SHARED_BASE}/Logout`, {

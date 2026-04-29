@@ -77,6 +77,14 @@ export interface ISBTHotelBooking extends Document {
   supplements?: unknown[];
   priceChangedDuringBook?: boolean;
   priceChangeAmount?: number;
+  // POST-001: PaxIds from GetBookingDetail — required for PAN-at-voucher-time (HOLD bookings).
+  paxDetails?: Array<{
+    paxId: string;
+    firstName: string;
+    lastName: string;
+    paxType: number;
+  }>;
+  panMandatory?: boolean;
   bookedAt: Date;
   cancelledAt?: Date;
   createdAt: Date;
@@ -173,6 +181,13 @@ const SBTHotelBookingSchema = new Schema(
     supplements: { type: [Schema.Types.Mixed], default: [] },
     priceChangedDuringBook: { type: Boolean, default: false },
     priceChangeAmount: { type: Number, default: 0 },
+    paxDetails: [{
+      paxId: { type: String },
+      firstName: { type: String },
+      lastName: { type: String },
+      paxType: { type: Number },
+    }],
+    panMandatory: { type: Boolean, default: false },
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
   },
