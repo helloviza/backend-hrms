@@ -20,6 +20,7 @@ import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
 import { getCompanySettings } from "../utils/companySettings.js";
 import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES } from "../shared/cities.js";
 import { parseTBODate } from "../lib/tbo-date.js";
+import { normalizeTitle } from "../lib/normalize.js";
 
 // ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
 const MOCK_CITIES = [
@@ -854,6 +855,8 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
     // 4. Fire parallel search requests (max 5 concurrent)
     const MAX_CONCURRENT = 5;
     const allResults: any[] = [];
+    let apiErrorBatches = 0;
+    let totalBatches = 0;
     const searchTraceId = `hotel-search-${randomUUID().slice(0, 8)}`;
 
     for (let i = 0; i < chunks.length; i += MAX_CONCURRENT) {
@@ -889,10 +892,16 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       });
       const results = await Promise.all(promises);
       for (const r of results) {
+        totalBatches++;
         const d = r as any;
-        if (d?.HotelResult) allResults.push(...d.HotelResult);
-        else if (d?.HotelSearchResult?.HotelResults)
+        if (d?.HotelResult) {
+          allResults.push(...d.HotelResult);
+        } else if (d?.HotelSearchResult?.HotelResults) {
           allResults.push(...d.HotelSearchResult.HotelResults);
+        } else if (d == null || (d.ResponseStatus !== undefined && d.ResponseStatus !== 1)) {
+          // Batch returned a TBO error (ResponseStatus≠1) or fetch failed (null)
+          apiErrorBatches++;
+        }
       }
     }
 
@@ -919,8 +928,15 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       return fa - fb;
     });
 
-    // 7. Return clean error if TBO returned no availability
+    // 7. Return clean error if TBO returned no availability.
+    // Distinguish genuine zero-result (ResponseStatus=1, HotelResult=[]) from API-level failure.
     if (allResults.length === 0) {
+      if (apiErrorBatches > 0 && totalBatches > 0 && apiErrorBatches >= totalBatches) {
+        return res.status(502).json({
+          message: "Hotel search service is temporarily unavailable. Please try again.",
+          code: "HOTEL_API_ERROR",
+        });
+      }
       return res.status(404).json({
         message: "No hotels found for selected dates. Please try different dates or destination.",
         code: "NO_HOTELS_FOUND",
@@ -999,7 +1015,8 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
 
     // CROSS-002: withTBOSessionRetry handles InValidSession (ResponseStatus=4/ErrorCode=6).
     // PreBook uses Basic Auth (tokenId ignored in fn body) but TBO can still return ErrorCode=6.
-    const tboPayload = { BookingCode };
+    // PREBOOK-011: PaymentMode="Limit" added defensively — matches spec sample (SQ-01).
+    const tboPayload = { BookingCode, PaymentMode: "Limit" };
     const t0 = Date.now();
     const data = await withTBOSessionRetry(
       async (_tokenId) => {
@@ -1017,6 +1034,23 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       },
       (r: any) => r?.Error?.ErrorCode === 6 || r?.ResponseStatus === 4,
     );
+
+    // CROSS-003: explicit handling for ResponseStatus 2/3/5 in PreBook flow.
+    const prebookRS = data?.ResponseStatus ?? data?.PreBookResult?.ResponseStatus;
+    if (prebookRS === 2) {
+      const msg = data?.Error?.ErrorMessage || data?.PreBookResult?.Error?.ErrorMessage || "PreBook failed";
+      sbtLogger.error("TBO PreBook ResponseStatus=2 (Failed)", { BookingCode, error: msg });
+      return res.status(502).json({ code: "TBO_FAILED", error: msg, responseStatus: 2 });
+    }
+    if (prebookRS === 3) {
+      const msg = data?.Error?.ErrorMessage || data?.PreBookResult?.Error?.ErrorMessage || "Invalid PreBook request";
+      sbtLogger.error("TBO PreBook ResponseStatus=3 (InvalidRequest)", { BookingCode, error: msg });
+      return res.status(400).json({ code: "TBO_INVALID_REQUEST", error: msg, responseStatus: 3 });
+    }
+    if (prebookRS === 5) {
+      sbtLogger.error("TBO PreBook ResponseStatus=5 (InvalidCredentials)", { BookingCode });
+      return res.status(502).json({ code: "TBO_INVALID_CREDENTIALS", error: "Authentication configuration error. Please contact support.", responseStatus: 5 });
+    }
 
     const prebookHotel = data?.HotelResult?.[0] || data?.PreBookResult?.HotelResult?.[0];
     const room0 = prebookHotel?.Rooms?.[0];
@@ -1363,17 +1397,19 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         }
 
         // Adult passenger
+        // Item 1: normalizeTitle strips trailing period (TBO spec: Mr/Mrs/Ms not Mr./Mrs./Ms.)
+        // Item 2: Phoneno/Email omitted entirely when empty (TBO rejects empty-string contact fields)
         const base: Record<string, unknown> = {
-          Title: g.Title || "Mr",
+          Title: normalizeTitle(g.Title || "Mr"),
           FirstName: String(g.FirstName || "").trim().substring(0, 25),
           LastName: String(g.LastName || "").trim().substring(0, 25),
           MiddleName: "",
-          Phoneno: g.Phone || "",
-          Email: g.Email || "",
           PaxType: 1,
           LeadPassenger: g.LeadPassenger || false,
           Age: 0,
         };
+        if (g.Phone) base.Phoneno = g.Phone;
+        if (g.Email) base.Email = g.Email;
 
         if (passportMandatory) {
           base.PassportNo = g.PassportNo || "";
@@ -1787,6 +1823,26 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
       let result = data?.BookResult || data;
 
+      // CROSS-003: explicit handling for ResponseStatus 2/3/5 in Book flow.
+      const bookRS = result?.ResponseStatus;
+      if (bookRS === 2) {
+        const errMsg = result?.Error?.ErrorMessage || "TBO booking failed (ResponseStatus=2)";
+        sbtLogger.error("TBO Book ResponseStatus=2 (Failed)", { userId: req.user?.id, clientRef, errMsg });
+        SBTHotelBooking.findOneAndUpdate({ clientReferenceId: clientRef }, { $set: { status: "FAILED", failureReason: errMsg } }).catch(() => {});
+        return res.status(502).json({ code: "TBO_FAILED", error: errMsg, responseStatus: 2 });
+      }
+      if (bookRS === 3) {
+        const errMsg = result?.Error?.ErrorMessage || "Invalid booking request (ResponseStatus=3)";
+        sbtLogger.error("TBO Book ResponseStatus=3 (InvalidRequest)", { userId: req.user?.id, clientRef, errMsg });
+        SBTHotelBooking.findOneAndUpdate({ clientReferenceId: clientRef }, { $set: { status: "FAILED", failureReason: errMsg } }).catch(() => {});
+        return res.status(400).json({ code: "TBO_INVALID_REQUEST", error: errMsg, responseStatus: 3 });
+      }
+      if (bookRS === 5) {
+        sbtLogger.error("TBO Book ResponseStatus=5 (InvalidCredentials)", { userId: req.user?.id, clientRef });
+        SBTHotelBooking.findOneAndUpdate({ clientReferenceId: clientRef }, { $set: { status: "FAILED", failureReason: "TBO credential failure" } }).catch(() => {});
+        return res.status(502).json({ code: "TBO_INVALID_CREDENTIALS", error: "Authentication configuration error. Please contact support.", responseStatus: 5 });
+      }
+
       // IsPriceChanged=true: TBO requires re-send with updated NetAmount (TBO doc §3411)
       if (result?.IsPriceChanged === true) {
         const newNetAmount: number | undefined =
@@ -1973,6 +2029,25 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
 // ─── 6b. GET /voucher/:bookingId ─────────────────────────────────────────────
 
+/** PLUMBOX-006: Extract key voucher fields from raw TBO GenerateVoucherResult for frontend display. */
+function extractVoucherSummary(voucherData: any) {
+  const gvr = voucherData?.GenerateVoucherResult;
+  if (!gvr) return null;
+  return {
+    confirmationNo: gvr.ConfirmationNo ?? gvr.BookingRefNo ?? null,
+    bookingRefNo: gvr.BookingRefNo ?? null,
+    invoiceNumber: gvr.InvoiceNumber ?? null,
+    hotelBookingStatus: gvr.HotelBookingStatus ?? null,
+    hotelName: gvr.HotelName ?? gvr.HotelDetails?.HotelName ?? null,
+    checkIn: gvr.HotelDetails?.CheckInDate ?? null,
+    checkOut: gvr.HotelDetails?.CheckOutDate ?? null,
+    guestName: gvr.HotelDetails?.GuestName ?? null,
+    roomType: gvr.HotelDetails?.RoomTypeName ?? null,
+    totalFare: gvr.HotelDetails?.TotalFare ?? null,
+    netAmount: gvr.HotelDetails?.NetAmount ?? null,
+  };
+}
+
 router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
   try {
     const booking = await SBTHotelBooking.findOne({ bookingId: req.params.bookingId, userId: req.user?._id ?? req.user?.id }).lean();
@@ -1983,6 +2058,7 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
         ok: true,
         voucherStatus: booking.voucherStatus,
         voucherData: booking.tboVoucherData,
+        voucherSummary: extractVoucherSummary(booking.tboVoucherData),
       });
     }
 
@@ -1998,7 +2074,7 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
       voucherStatus: status,
     }).catch(() => {});
 
-    res.json({ ok: true, voucherStatus: status, voucherData: voucherRes });
+    res.json({ ok: true, voucherStatus: status, voucherData: voucherRes, voucherSummary: extractVoucherSummary(voucherRes) });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Voucher retrieval failed";
     res.status(500).json({ error: msg });
