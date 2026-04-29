@@ -19,6 +19,7 @@ import { getTBOToken, logoutTBO } from "../services/tbo.auth.service.js";
 import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
 import { getCompanySettings } from "../utils/companySettings.js";
 import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES } from "../shared/cities.js";
+import { parseTBODate } from "../lib/tbo-date.js";
 
 // ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
 const MOCK_CITIES = [
@@ -2173,8 +2174,8 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       razorpayAmount: b.razorpayAmount || 0,
       isVouchered: b.isHeld ? false : (b.isVouchered ?? true),
       isHeld: b.isHeld ?? false,
-      lastVoucherDate: b.lastVoucherDate ? new Date(b.lastVoucherDate) : undefined,
-      lastCancellationDate: b.lastCancellationDate ? new Date(b.lastCancellationDate) : null,
+      lastVoucherDate: parseTBODate(b.lastVoucherDate) ?? undefined,
+      lastCancellationDate: parseTBODate(b.lastCancellationDate),
       paymentMode: b.paymentMode === "official" ? "official" : "personal",
       raw: b.raw ?? null,
       inclusion: typeof b.inclusion === "string" ? b.inclusion : "",
@@ -2522,12 +2523,13 @@ router.get("/bookings/:id/cancel-preview", requireSBT, async (req: any, res: any
 
     // Find the latest policy whose FromDate is on or before today
     const sortedPolicies = [...policies].sort(
-      (a, b) => new Date(b.FromDate).getTime() - new Date(a.FromDate).getTime()
+      (a, b) => (parseTBODate(b.FromDate)?.getTime() ?? 0) - (parseTBODate(a.FromDate)?.getTime() ?? 0)
     );
 
     let applicablePolicy: any = null;
     for (const policy of sortedPolicies) {
-      if (new Date(policy.FromDate) <= today) {
+      const fd = parseTBODate(policy.FromDate);
+      if (fd !== null && fd <= today) {
         applicablePolicy = policy;
         break;
       }
@@ -2542,7 +2544,7 @@ router.get("/bookings/:id/cancel-preview", requireSBT, async (req: any, res: any
         chargePercent = applicablePolicy.CancellationCharge;
         cancellationCharge = Math.round((chargePercent / 100) * totalFare);
         isFreeCancel = false;
-        policyApplied = `${chargePercent}% cancellation charge applies from ${new Date(applicablePolicy.FromDate).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}`;
+        policyApplied = `${chargePercent}% cancellation charge applies from ${(parseTBODate(applicablePolicy.FromDate) ?? new Date()).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}`;
       } else {
         // Fixed charge
         cancellationCharge = applicablePolicy.CancellationCharge;

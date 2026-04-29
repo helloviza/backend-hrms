@@ -1,6 +1,14 @@
 import { Schema, model, type Document } from "mongoose";
 import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import TravelBooking from "./TravelBooking.js";
+import { parseTBODate } from "../lib/tbo-date.js";
+
+function tboDateSetter(v: any): Date | null | undefined {
+  if (v === null || v === undefined) return v;
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+  if (typeof v === "string") return parseTBODate(v);
+  return null;
+}
 
 export interface ISBTHotelBooking extends Document {
   userId: Schema.Types.ObjectId;
@@ -133,8 +141,8 @@ const SBTHotelBookingSchema = new Schema(
       default: "CONFIRMED",
     },
     isHeld: { type: Boolean, default: false },
-    lastVoucherDate: { type: Date },
-    lastCancellationDate: { type: Date, default: null },
+    lastVoucherDate: { type: Date, set: tboDateSetter },
+    lastCancellationDate: { type: Date, default: null, set: tboDateSetter },
     voucherGeneratedAt: { type: Date },
     paymentStatus: {
       type: String,
