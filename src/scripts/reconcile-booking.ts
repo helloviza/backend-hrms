@@ -169,7 +169,7 @@ async function main() {
   console.log(`  LastVoucherDate:      ${result.LastVoucherDate}`);
 
   // Step 3: Map TBO response → SBTHotelBooking fields
-  const allPassengers: any[] = (result.HotelRoomsDetails ?? []).flatMap(
+  const allPassengers: any[] = (result.Rooms ?? []).flatMap(
     (room: any) => room?.HotelPassenger ?? []
   );
 
@@ -190,7 +190,7 @@ async function main() {
       paxType: Number(p.PaxType) || 1,
     }));
 
-  const roomInfo = result.HotelRoomsDetails?.[0];
+  const roomInfo = result.Rooms?.[0];
 
   const tboStatus = (
     result.HotelBookingStatus ||

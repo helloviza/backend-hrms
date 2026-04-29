@@ -1710,22 +1710,21 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         setImmediate(async () => {
           try {
             const detail = await getBookingDetail([{ mode: "bookingId", bookingId: tboBookingId }]);
-            if (detail?.HotelBookingDetail) {
-              const d = detail.HotelBookingDetail;
+            if (detail?.TBOReferenceNo || detail?.Rooms) {
               await SBTHotelBooking.findOneAndUpdate(
                 { bookingId: String(tboBookingId) },
                 {
-                  tboReferenceNo: d.TBOReferenceNo || d.HotelBookingId || null,
-                  roomDescription: d.HotelRoomsDetails?.[0]?.RoomDescription ||
-                                   d.HotelRoomsDetails?.[0]?.RoomTypeName || null,
+                  tboReferenceNo: detail.TBOReferenceNo || null,
+                  roomDescription: detail.Rooms?.[0]?.RoomDescription ||
+                                   detail.Rooms?.[0]?.RoomTypeName || null,
                   bookingDetailFetched: true,
                   bookingDetailFetchedAt: new Date(),
-                  bookingDetailRaw: d,
-                  ...(d.LastCancellationDate ? { lastCancellationDate: parseTBODate(d.LastCancellationDate) } : {}),
-                  ...(d.LastVoucherDate ? { lastVoucherDate: parseTBODate(d.LastVoucherDate) } : {}),
+                  bookingDetailRaw: detail,
+                  ...(detail.LastCancellationDate ? { lastCancellationDate: parseTBODate(detail.LastCancellationDate) } : {}),
+                  ...(detail.LastVoucherDate ? { lastVoucherDate: parseTBODate(detail.LastVoucherDate) } : {}),
                 },
               );
-              sbtLogger.info("GetBookingDetail persisted post-Book", { tboBookingId, tboReferenceNo: d.TBOReferenceNo });
+              sbtLogger.info("GetBookingDetail persisted post-Book", { tboBookingId, tboReferenceNo: detail.TBOReferenceNo });
             }
           } catch (err: any) {
             sbtLogger.error("GetBookingDetail post-Book failed (non-blocking)", { tboBookingId, error: err?.message });
