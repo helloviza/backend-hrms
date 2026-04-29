@@ -1,0 +1,151 @@
+[2026-04-29T05:06:14.968Z] TBO Hotel Certification — All 8 Cases
+[2026-04-29T05:06:14.969Z] Output directory: D:\plumtrips-hrms\apps\backend\src\logs\tbo\hotel-cert
+[2026-04-29T05:06:14.969Z] Check-in: 2026-05-06  Check-out: 2026-05-07
+[2026-04-29T05:06:14.969Z] 
+[2026-04-29T05:06:14.969Z] Authenticating with TBO SharedData API...
+[2026-04-29T05:06:15.253Z] ✅ Auth OK — TokenId: 678d05db-b9d9-49ec-a...
+[2026-04-29T05:06:15.255Z] ✅ Authentication.txt written (shared)
+
+[2026-04-29T05:06:15.258Z] 
+============================================================
+[2026-04-29T05:06:15.258Z] Running Case1_Hotel_Domestic_1R_1A
+[2026-04-29T05:06:15.259Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:06:15.259Z] Rooms: 1  Intl: false
+[2026-04-29T05:06:15.259Z] ============================================================
+[2026-04-29T05:06:15.259Z] Step 1/4: HotelSearch...
+[2026-04-29T05:06:16.149Z] ✅ Search OK — Hotel: Hotel-1000171 (1000171), BookingCode: 1000171!TB!1!TB!28c929ab-4389-11f1-96fe-...
+[2026-04-29T05:06:16.149Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:06:18.071Z] ✅ PreBook OK — NetAmount: 7499.526409876002
+[2026-04-29T05:06:18.071Z] Step 3/4: HotelBook...
+[2026-04-29T05:06:30.861Z] ✅ Book OK — BookingId: 2117508, ConfirmationNo: 7914269402075
+[2026-04-29T05:06:30.861Z] Step 4/4: HotelGetBookingDetail...
+[2026-04-29T05:06:31.759Z] ✅ GetBookingDetail OK — Status: undefined
+[2026-04-29T05:06:31.760Z] ✅ Case1_Hotel_Domestic_1R_1A COMPLETE — BookingId 2117508
+[2026-04-29T05:06:33.763Z] 
+============================================================
+[2026-04-29T05:06:33.764Z] Running Case2_Hotel_Domestic_1R_2A2C
+[2026-04-29T05:06:33.764Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:06:33.764Z] Rooms: 1  Intl: false
+[2026-04-29T05:06:33.764Z] ============================================================
+[2026-04-29T05:06:33.764Z] Step 1/4: HotelSearch...
+[2026-04-29T05:06:34.659Z] ✅ Search OK — Hotel: Hotel-1000027 (1000027), BookingCode: 1000027!TB!1!TB!33cc510d-4389-11f1-96fe-...
+[2026-04-29T05:06:34.659Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:06:36.540Z] ✅ PreBook OK — NetAmount: 17127.463698972
+[2026-04-29T05:06:36.540Z] Step 3/4: HotelBook...
+[2026-04-29T05:06:45.406Z] ✅ Book OK — BookingId: 2117510, ConfirmationNo: 7977862612196
+[2026-04-29T05:06:45.406Z] Step 4/4: HotelGetBookingDetail...
+[2026-04-29T05:06:46.384Z] ✅ GetBookingDetail OK — Status: undefined
+[2026-04-29T05:06:46.386Z] ✅ Case2_Hotel_Domestic_1R_2A2C COMPLETE — BookingId 2117510
+[2026-04-29T05:06:48.400Z] 
+============================================================
+[2026-04-29T05:06:48.400Z] Running Case3_Hotel_Domestic_2R_1A_1A
+[2026-04-29T05:06:48.400Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:06:48.400Z] Rooms: 2  Intl: false
+[2026-04-29T05:06:48.400Z] ============================================================
+[2026-04-29T05:06:48.400Z] Step 1/4: HotelSearch...
+[2026-04-29T05:06:49.105Z] ✅ Search OK — Hotel: Hotel-1000027 (1000027), BookingCode: 1000027!TB!1!TB!3c81bc1f-4389-11f1-96fe-...
+[2026-04-29T05:06:49.105Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:06:50.874Z] ✅ PreBook OK — NetAmount: 24673.825556067997
+[2026-04-29T05:06:50.874Z] Step 3/4: HotelBook...
+[2026-04-29T05:07:04.577Z] ✅ Book OK — BookingId: 2117512, ConfirmationNo: 7467810957820
+[2026-04-29T05:07:04.577Z] Step 4/4: HotelGetBookingDetail...
+[2026-04-29T05:07:05.361Z] ✅ GetBookingDetail OK — Status: undefined
+[2026-04-29T05:07:05.362Z] ✅ Case3_Hotel_Domestic_2R_1A_1A COMPLETE — BookingId 2117512
+[2026-04-29T05:07:07.368Z] 
+============================================================
+[2026-04-29T05:07:07.368Z] Running Case4_Hotel_Domestic_2R_1A2C_2A
+[2026-04-29T05:07:07.368Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:07:07.368Z] Rooms: 2  Intl: false
+[2026-04-29T05:07:07.368Z] ============================================================
+[2026-04-29T05:07:07.368Z] Step 1/4: HotelSearch...
+[2026-04-29T05:07:09.119Z] ✅ Search OK — Hotel: Hotel-1000538 (1000538), BookingCode: 1000538!TB!1!TB!47d01637-4389-11f1-96fe-...
+[2026-04-29T05:07:09.119Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:07:10.998Z] ✅ PreBook OK — NetAmount: 31324.946400832996
+[2026-04-29T05:07:10.998Z] Step 3/4: HotelBook...
+[2026-04-29T05:07:19.424Z] ✅ Book OK — BookingId: 2117513, ConfirmationNo: 7259192850421
+[2026-04-29T05:07:19.425Z] Step 4/4: HotelGetBookingDetail...
+[2026-04-29T05:07:20.229Z] ✅ GetBookingDetail OK — Status: undefined
+[2026-04-29T05:07:20.231Z] ✅ Case4_Hotel_Domestic_2R_1A2C_2A COMPLETE — BookingId 2117513
+[2026-04-29T05:07:22.232Z] 
+============================================================
+[2026-04-29T05:07:22.232Z] Running Case5_Hotel_Intl_1R_1A
+[2026-04-29T05:07:22.232Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:07:22.232Z] Rooms: 1  Intl: true
+[2026-04-29T05:07:22.232Z] ============================================================
+[2026-04-29T05:07:22.232Z] Step 1/4: HotelSearch...
+[2026-04-29T05:07:22.992Z] ✅ Search OK — Hotel: Hotel-1001056 (1001056), BookingCode: 1001056!TB!1!TB!50ad79f3-4389-11f1-96fe-...
+[2026-04-29T05:07:22.992Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:07:25.040Z] ✅ PreBook OK — NetAmount: 10642.460371113
+[2026-04-29T05:07:25.040Z] Step 3/4: HotelBook...
+[2026-04-29T05:07:34.937Z] ✅ Book OK — BookingId: 2117514, ConfirmationNo: 7755837992009
+[2026-04-29T05:07:34.937Z] Step 4/4: HotelGetBookingDetail...
+[2026-04-29T05:07:35.670Z] ✅ GetBookingDetail OK — Status: undefined
+[2026-04-29T05:07:35.672Z] ✅ Case5_Hotel_Intl_1R_1A COMPLETE — BookingId 2117514
+[2026-04-29T05:07:37.685Z] 
+============================================================
+[2026-04-29T05:07:37.685Z] Running Case6_Hotel_Intl_1R_2A2C
+[2026-04-29T05:07:37.685Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:07:37.685Z] Rooms: 1  Intl: true
+[2026-04-29T05:07:37.685Z] ============================================================
+[2026-04-29T05:07:37.685Z] Step 1/4: HotelSearch...
+[2026-04-29T05:07:38.487Z] ✅ Search OK — Hotel: Hotel-1001046 (1001046), BookingCode: 1001046!TB!1!TB!59ec3140-4389-11f1-96fe-...
+[2026-04-29T05:07:38.487Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:07:40.197Z] ✅ PreBook OK — NetAmount: 20398.181473851997
+[2026-04-29T05:07:40.197Z] Step 3/4: HotelBook...
+[2026-04-29T05:07:49.058Z] ✅ Book OK — BookingId: 2117516, ConfirmationNo: 7384732909588
+[2026-04-29T05:07:49.058Z] Step 4/4: HotelGetBookingDetail...
+[2026-04-29T05:07:49.886Z] ✅ GetBookingDetail OK — Status: undefined
+[2026-04-29T05:07:49.888Z] ✅ Case6_Hotel_Intl_1R_2A2C COMPLETE — BookingId 2117516
+[2026-04-29T05:07:51.892Z] 
+============================================================
+[2026-04-29T05:07:51.892Z] Running Case7_Hotel_Intl_2R_1A_1A
+[2026-04-29T05:07:51.892Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:07:51.892Z] Rooms: 2  Intl: true
+[2026-04-29T05:07:51.892Z] ============================================================
+[2026-04-29T05:07:51.892Z] Step 1/4: HotelSearch...
+[2026-04-29T05:07:52.571Z] ✅ Search OK — Hotel: Hotel-1001143 (1001143), BookingCode: 1001143!TB!1!TB!625ac225-4389-11f1-96fe-...
+[2026-04-29T05:07:52.571Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:07:54.348Z] ✅ PreBook OK — NetAmount: 7959.566446006
+[2026-04-29T05:07:54.348Z] Step 3/4: HotelBook...
+[2026-04-29T05:08:03.968Z] ✅ Book OK — BookingId: 2117517, ConfirmationNo: 7142369146478
+[2026-04-29T05:08:03.968Z] Step 4/4: HotelGetBookingDetail...
+[2026-04-29T05:08:04.725Z] ✅ GetBookingDetail OK — Status: undefined
+[2026-04-29T05:08:04.727Z] ✅ Case7_Hotel_Intl_2R_1A_1A COMPLETE — BookingId 2117517
+[2026-04-29T05:08:06.728Z] 
+============================================================
+[2026-04-29T05:08:06.728Z] Running Case8_Hotel_Intl_2R_1A2C_2A
+[2026-04-29T05:08:06.728Z] CheckIn: 2026-05-06  CheckOut: 2026-05-07
+[2026-04-29T05:08:06.728Z] Rooms: 2  Intl: true
+[2026-04-29T05:08:06.728Z] ============================================================
+[2026-04-29T05:08:06.728Z] Step 1/4: HotelSearch...
+[2026-04-29T05:08:07.630Z] ✅ Search OK — Hotel: Hotel-1001049 (1001049), BookingCode: 1001049!TB!1!TB!6b33b90d-4389-11f1-96fe-...
+[2026-04-29T05:08:07.630Z] Step 2/4: HotelPreBook...
+[2026-04-29T05:08:10.488Z] ✅ PreBook OK — NetAmount: 33581.459771368
+[2026-04-29T05:08:10.488Z] Step 3/4: HotelBook...
+[2026-04-29T05:08:19.593Z] ✅ Book OK — BookingId: 2117518, ConfirmationNo: 7241828895292
+[2026-04-29T05:08:19.593Z] Step 4/4: HotelGetBookingDetail...
+[2026-04-29T05:08:20.361Z] ✅ GetBookingDetail OK — Status: undefined
+[2026-04-29T05:08:20.362Z] ✅ Case8_Hotel_Intl_2R_1A2C_2A COMPLETE — BookingId 2117518
+[2026-04-29T05:08:22.369Z] 
+============================================================
+[2026-04-29T05:08:22.370Z] CERTIFICATION RUN COMPLETE
+[2026-04-29T05:08:22.370Z] ============================================================
+[2026-04-29T05:08:22.370Z] ✅ Case1_Hotel_Domestic_1R_1A — BookingId: 2117508 | Hotel-1000171
+[2026-04-29T05:08:22.370Z] ✅ Case2_Hotel_Domestic_1R_2A2C — BookingId: 2117510 | Hotel-1000027
+[2026-04-29T05:08:22.370Z] ✅ Case3_Hotel_Domestic_2R_1A_1A — BookingId: 2117512 | Hotel-1000027
+[2026-04-29T05:08:22.370Z] ✅ Case4_Hotel_Domestic_2R_1A2C_2A — BookingId: 2117513 | Hotel-1000538
+[2026-04-29T05:08:22.370Z] ✅ Case5_Hotel_Intl_1R_1A — BookingId: 2117514 | Hotel-1001056
+[2026-04-29T05:08:22.370Z] ✅ Case6_Hotel_Intl_1R_2A2C — BookingId: 2117516 | Hotel-1001046
+[2026-04-29T05:08:22.370Z] ✅ Case7_Hotel_Intl_2R_1A_1A — BookingId: 2117517 | Hotel-1001143
+[2026-04-29T05:08:22.370Z] ✅ Case8_Hotel_Intl_2R_1A2C_2A — BookingId: 2117518 | Hotel-1001049
+[2026-04-29T05:08:22.370Z] 
+📁 Logs at: D:\plumtrips-hrms\apps\backend\src\logs\tbo\hotel-cert
+[2026-04-29T05:08:22.370Z]    Each case folder contains:
+[2026-04-29T05:08:22.370Z]      Authentication.txt
+[2026-04-29T05:08:22.370Z]      HotelSearch.txt
+[2026-04-29T05:08:22.370Z]      HotelPreBook.txt
+[2026-04-29T05:08:22.370Z]      HotelBook.txt
+[2026-04-29T05:08:22.370Z]      HotelGetBookingDetail.txt
+[2026-04-29T05:08:22.370Z]      _summary.json
+[2026-04-29T05:08:22.370Z] 
+Next: zip each case folder individually and send to TBO.
