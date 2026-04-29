@@ -21,6 +21,7 @@ import { getCompanySettings } from "../utils/companySettings.js";
 import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES } from "../shared/cities.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 import { normalizeTitle } from "../lib/normalize.js";
+import ManualDateChangeRequest from "../models/ManualDateChangeRequest.js";
 
 // ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
 const MOCK_CITIES = [
@@ -2262,6 +2263,7 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       priceChangeAmount: typeof b.priceChangeAmount === "number" ? b.priceChangeAmount : 0,
       isPublishedFare: b.isPublishedFare === true,
       tds: typeof b.tds === "number" ? b.tds : 0,
+      ...(b.rebookFromBookingId ? { rebookFromBookingId: String(b.rebookFromBookingId) } : {}),
       agentCommission: typeof b.agentCommission === "number" ? b.agentCommission : 0,
       bookedAt: new Date(),
     };
@@ -3308,6 +3310,32 @@ router.post("/bookings/:id/request-date-change", requireSBT, async (req: any, re
     });
     await doc.save();
 
+    // Dual-write to ManualDateChangeRequest for ops dashboard
+    try {
+      const requestorUser = await User.findById(userId).select("email").lean() as any;
+      await ManualDateChangeRequest.create({
+        bookingId: doc.bookingId || "",
+        mongoBookingId: String(doc._id),
+        hotelName: doc.hotelName || "",
+        originalCheckIn: doc.checkIn || "",
+        originalCheckOut: doc.checkOut || "",
+        requestedNewCheckIn: newCheckIn,
+        requestedNewCheckOut: newCheckOut,
+        customerNotes: cleanRemarks,
+        guestName,
+        guestEmail: requestorUser?.email || "",
+        workspaceId: doc.workspaceId,
+        userId,
+        status: "REQUESTED",
+        opsNotes: "",
+      });
+    } catch (dcrErr) {
+      sbtLogger.warn("ManualDateChangeRequest dual-write failed", {
+        bookingId: doc._id,
+        error: dcrErr instanceof Error ? dcrErr.message : String(dcrErr),
+      });
+    }
+
     return res.json({
       ok: true,
       message: "Date change request submitted. Our team will contact you within 4 business hours.",
@@ -3316,6 +3344,110 @@ router.post("/bookings/:id/request-date-change", requireSBT, async (req: any, re
     const msg = err instanceof Error ? err.message : "Request failed";
     sbtLogger.error("Hotel date-change request failed", { bookingId: req.params.id, error: msg });
     return res.status(502).json({ error: "Could not submit the date change request. Please try again." });
+  }
+});
+
+// ─── 12. GET /admin/date-change-requests ─────────────────────────────────────
+
+router.get("/admin/date-change-requests", requireAdmin, async (req: any, res: any) => {
+  try {
+    const { status, bookingId, from, to, page = "1", limit = "50" } = req.query as Record<string, string>;
+    const filter: Record<string, any> = {};
+    if (status && status !== "ALL") filter.status = status;
+    if (bookingId) filter.$or = [
+      { bookingId: { $regex: bookingId, $options: "i" } },
+      { mongoBookingId: { $regex: bookingId, $options: "i" } },
+    ];
+    if (from || to) {
+      filter.createdAt = {};
+      if (from) filter.createdAt.$gte = new Date(from);
+      if (to) filter.createdAt.$lte = new Date(to + "T23:59:59.999Z");
+    }
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const pageSize = Math.min(100, parseInt(limit, 10) || 50);
+    const skip = (pageNum - 1) * pageSize;
+
+    const [requests, total] = await Promise.all([
+      ManualDateChangeRequest.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(pageSize)
+        .lean(),
+      ManualDateChangeRequest.countDocuments(filter),
+    ]);
+
+    return res.json({ ok: true, requests, total, page: pageNum, limit: pageSize });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Fetch failed";
+    sbtLogger.error("Admin date-change-requests list failed", { error: msg });
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// ─── 13. POST /admin/date-change-requests/:id/update ─────────────────────────
+
+router.post("/admin/date-change-requests/:id/update", requireAdmin, async (req: any, res: any) => {
+  try {
+    const dcr = await ManualDateChangeRequest.findById(req.params.id);
+    if (!dcr) return res.status(404).json({ error: "Request not found" });
+
+    const { status, opsNotes } = req.body;
+    const VALID_STATUSES = ["REQUESTED", "IN_DISCUSSION", "APPROVED", "DENIED", "RESOLVED"];
+    if (status && !VALID_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_STATUSES.join(", ")}` });
+    }
+
+    const prevStatus = dcr.status;
+    if (status) dcr.status = status;
+    if (typeof opsNotes === "string") dcr.opsNotes = opsNotes.slice(0, 2000).trim();
+    if (status === "RESOLVED" || status === "APPROVED" || status === "DENIED") {
+      dcr.resolvedBy = req.user?.name || req.user?.email || "ops";
+      dcr.resolvedAt = new Date();
+    }
+    await dcr.save();
+
+    // Email customer on status change
+    if (status && status !== prevStatus && dcr.guestEmail) {
+      const statusLabel: Record<string, string> = {
+        IN_DISCUSSION: "In Discussion",
+        APPROVED: "Approved",
+        DENIED: "Denied",
+        RESOLVED: "Resolved",
+      };
+      const label = statusLabel[status];
+      if (label) {
+        const settings = await getCompanySettings();
+        await sendMail({
+          to: dcr.guestEmail,
+          from: settings.supportEmail,
+          subject: `Hotel Date Change Request — Status: ${label}`,
+          kind: "REQUESTS",
+          html: `
+<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px">
+  <h2 style="color:#00477f;margin-bottom:4px">Date Change Request Update</h2>
+  <p style="color:#64748b;margin-top:0">Your date change request has been updated.</p>
+  <table style="width:100%;border-collapse:collapse;margin-top:16px;font-size:14px">
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;width:42%">Hotel</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${dcr.hotelName}</td></tr>
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Requested Check-in</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${dcr.requestedNewCheckIn}</td></tr>
+    <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Requested Check-out</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${dcr.requestedNewCheckOut}</td></tr>
+    <tr><td style="padding:8px 12px;background:#fffbeb;font-weight:700;color:#92400e">New Status</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:700;color:#92400e">${label}</td></tr>
+    ${dcr.opsNotes ? `<tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600">Notes from ops</td><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${dcr.opsNotes}</td></tr>` : ""}
+  </table>
+  <p style="margin-top:20px;color:#64748b;font-size:13px">
+    If you have questions, please contact our support team.
+  </p>
+</div>`,
+        }).catch((e: any) => {
+          sbtLogger.warn("Date change status email failed", { id: dcr._id, error: e?.message });
+        });
+      }
+    }
+
+    return res.json({ ok: true, request: dcr.toJSON() });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Update failed";
+    sbtLogger.error("Admin date-change-request update failed", { id: req.params.id, error: msg });
+    return res.status(500).json({ error: msg });
   }
 });
 

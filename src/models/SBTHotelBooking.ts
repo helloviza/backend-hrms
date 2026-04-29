@@ -93,6 +93,7 @@ export interface ISBTHotelBooking extends Document {
     paxType: number;
   }>;
   panMandatory?: boolean;
+  rebookFromBookingId?: string;
   bookedAt: Date;
   cancelledAt?: Date;
   closedAt?: Date;
@@ -198,6 +199,7 @@ const SBTHotelBookingSchema = new Schema(
       paxType: { type: Number },
     }],
     panMandatory: { type: Boolean, default: false },
+    rebookFromBookingId: { type: String, default: null },
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
     closedAt: { type: Date },
