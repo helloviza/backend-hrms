@@ -9,6 +9,61 @@ export interface VoucherPanPayload {
   }>;
 }
 
+export type BookingDetailLookup =
+  | { mode: "bookingId"; bookingId: number }
+  | { mode: "confirmationNo"; confirmationNo: string; guestName: string }
+  | { mode: "traceId"; traceId: string };
+
+/**
+ * POST-004: GetBookingDetail with three fallback lookup modes.
+ * Tries each mode in order and returns the first successful result.
+ */
+export async function getBookingDetail(lookups: BookingDetailLookup[]): Promise<any> {
+  const creds = Buffer.from(
+    `${process.env.TBO_HOTEL_USERNAME}:${process.env.TBO_HOTEL_PASSWORD}`
+  ).toString("base64");
+
+  const errors: string[] = [];
+
+  for (const lookup of lookups) {
+    try {
+      const result = await withTBOSessionRetry(
+        async (tokenId) => {
+          let payload: Record<string, unknown>;
+          if (lookup.mode === "bookingId") {
+            payload = { EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1", TokenId: tokenId, BookingId: lookup.bookingId };
+          } else if (lookup.mode === "confirmationNo") {
+            payload = { EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1", TokenId: tokenId, ConfirmationNo: lookup.confirmationNo, Name: lookup.guestName };
+          } else {
+            payload = { EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1", TokenId: tokenId, TraceId: lookup.traceId };
+          }
+
+          const t0 = Date.now();
+          const res = await fetch(
+            "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+            { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Basic ${creds}` }, body: JSON.stringify(payload) }
+          );
+          const data = await res.json();
+          logTBOCall({ method: "HotelGetBookingDetail", traceId: `gbd-${lookup.mode}`, request: payload, response: data, durationMs: Date.now() - t0 });
+          return data;
+        },
+        (r: any) => {
+          const inner = r?.GetBookingDetailResult || r?.BookResult || r;
+          return inner?.ResponseStatus === 4 || inner?.Error?.ErrorCode === 6;
+        },
+      );
+      const inner = result?.GetBookingDetailResult || result?.BookResult || result;
+      if (inner?.ResponseStatus === 1) return inner;
+      const errMsg = inner?.Error?.ErrorMessage || `mode=${lookup.mode} ResponseStatus=${inner?.ResponseStatus}`;
+      errors.push(errMsg);
+    } catch (e: any) {
+      errors.push(`mode=${lookup.mode}: ${e?.message || String(e)}`);
+    }
+  }
+
+  throw new Error(`GetBookingDetail failed all lookup modes. Errors: ${errors.join(" | ")}`);
+}
+
 export async function generateHotelVoucher(bookingId: number, panPayload?: VoucherPanPayload): Promise<any> {
   const creds = Buffer.from(
     `${process.env.TBO_HOTEL_USERNAME}:${process.env.TBO_HOTEL_PASSWORD}`
