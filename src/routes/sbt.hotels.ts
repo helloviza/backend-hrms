@@ -3020,6 +3020,7 @@ router.get("/bookings/:id/voucher-summary", requireAuth, async (req: any, res: a
         isVouchered: booking.isVouchered,
         voucherStatus: booking.voucherStatus,
         bookedAt: booking.bookedAt,
+        bookingDetailRaw: booking.bookingDetailRaw ?? null,
       },
       voucherSummary: summary,
     });
