@@ -106,6 +106,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
 import { generateInvoicePdf } from "../utils/invoicePdf.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
+import { buildLineItemsForBooking } from "../utils/invoiceLineItems.js";
 import { env } from "../config/env.js";
 
 const router = express.Router();
@@ -173,12 +174,13 @@ function invoiceToRow(inv: any): (string | number | undefined)[] {
 // POST /api/admin/invoices/generate
 router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
   try {
-    const { bookingIds, billingPeriod, dueDate, notes, terms } = req.body as {
+    const { bookingIds, billingPeriod, dueDate, notes, terms, showInclusiveTaxNote } = req.body as {
       bookingIds: string[];
       billingPeriod?: string;
       dueDate?: string;
       notes?: string;
       terms?: string;
+      showInclusiveTaxNote?: boolean;
     };
 
     if (!Array.isArray(bookingIds) || !bookingIds.length) {
@@ -276,86 +278,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     // Build TWO line items per booking: COST row + SERVICE_FEE row
     const invoiceLineItems: any[] = [];
     for (const b of bookings as any[]) {
-      const passengerNames = (b.passengers || []).map((p: any) => p.name);
-      const paxStr = passengerNames.join(", ") || "—";
-
-      const route =
-        b.itinerary?.origin && b.itinerary?.destination
-          ? `${b.itinerary.origin} → ${b.itinerary.destination}`
-          : b.itinerary?.hotelName
-          ? b.itinerary.hotelName
-          : b.itinerary?.description || "—";
-
-      const travelDateStr = b.travelDate
-        ? new Date(b.travelDate).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })
-        : "";
-      const pnr = b.supplierPNR || "";
-
-      const typeLabels: Record<string, string> = {
-        FLIGHT: "Flight Cost",
-        HOTEL: "Hotel Cost",
-        VISA: "Visa Cost",
-        SERVICE: "Service Cost",
-        TRANSFER: "Transfer Cost",
-        OTHER: "Service Cost",
-      };
-      const costLabel = typeLabels[b.type] || "Service Cost";
-
-      const supplierCost = b.pricing?.supplierCost ?? 0;
-      const markupAmount = b.pricing?.markupAmount ?? 0;
-      const gstPercent = b.pricing?.gstPercent ?? 18;
-      const gstMode = b.pricing?.gstMode || "ON_MARKUP";
-      const diff = b.pricing?.diff
-        || ((b.pricing?.quotedPrice ?? 0) - (b.pricing?.actualPrice ?? 0))
-        || markupAmount
-        || 0;
-      let igst = 0;
-      if (gstMode === "ON_MARKUP") {
-        igst = parseFloat((diff * gstPercent / (100 + gstPercent)).toFixed(2));
-      } else {
-        igst = parseFloat(((b.pricing?.quotedPrice ?? 0) * gstPercent / 100).toFixed(2));
-      }
-
-      const costSubDesc = [
-        paxStr,
-        route,
-        travelDateStr ? `Travel Date: ${travelDateStr}` : "",
-        pnr ? `PNR: ${pnr}` : "",
-      ]
-        .filter(Boolean)
-        .join(" || ");
-
-      const svcSubDesc = [paxStr, route].filter(Boolean).join(" || ");
-
-      // Row A — Cost
-      invoiceLineItems.push({
-        bookingRef: b.bookingRef,
-        rowType: "COST",
-        description: costLabel,
-        subDescription: costSubDesc,
-        qty: 1,
-        rate: supplierCost,
-        igst: 0,
-        amount: supplierCost,
-        passengerNames,
-        travelDate: b.travelDate,
-        type: b.type,
-      });
-
-      // Row B — Service Fee
-      invoiceLineItems.push({
-        bookingRef: b.bookingRef,
-        rowType: "SERVICE_FEE",
-        description: "Transaction Fees",
-        subDescription: svcSubDesc,
-        qty: 1,
-        rate: markupAmount,
-        igst,
-        amount: markupAmount,
-        passengerNames,
-        travelDate: b.travelDate,
-        type: b.type,
-      });
+      invoiceLineItems.push(...buildLineItemsForBooking(b));
     }
 
     const subtotal = invoiceLineItems.reduce((s, li) => s + (li.amount ?? 0), 0);
@@ -390,6 +313,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       clientDetails,
       terms,
       notes,
+      showInclusiveTaxNote: showInclusiveTaxNote === true,
       dueDate: dueDate ? new Date(dueDate) : undefined,
       createdBy: req.user._id,
     });
@@ -553,89 +477,7 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
     // Build new line items (same two-row pattern as /generate)
     const newLineItems: any[] = [];
     for (const b of newBookings as any[]) {
-      const passengerNames = (b.passengers || []).map((p: any) => p.name);
-      const paxStr = passengerNames.join(", ") || "—";
-
-      const route =
-        b.itinerary?.origin && b.itinerary?.destination
-          ? `${b.itinerary.origin} → ${b.itinerary.destination}`
-          : b.itinerary?.hotelName
-          ? b.itinerary.hotelName
-          : b.itinerary?.description || "—";
-
-      const travelDateStr = b.travelDate
-        ? new Date(b.travelDate).toLocaleDateString("en-IN", {
-            day: "2-digit",
-            month: "short",
-            year: "numeric",
-          })
-        : "";
-      const pnr = b.supplierPNR || "";
-
-      const typeLabels: Record<string, string> = {
-        FLIGHT: "Flight Cost",
-        HOTEL: "Hotel Cost",
-        VISA: "Visa Cost",
-        SERVICE: "Service Cost",
-        TRANSFER: "Transfer Cost",
-        OTHER: "Service Cost",
-      };
-      const costLabel = typeLabels[b.type] || "Service Cost";
-
-      const supplierCost = b.pricing?.supplierCost ?? 0;
-      const markupAmount = b.pricing?.markupAmount ?? 0;
-      const gstPercent = b.pricing?.gstPercent ?? 18;
-      const gstMode = b.pricing?.gstMode || "ON_MARKUP";
-      const diff =
-        b.pricing?.diff ||
-        (b.pricing?.quotedPrice ?? 0) - (b.pricing?.actualPrice ?? 0) ||
-        markupAmount ||
-        0;
-      let igst = 0;
-      if (gstMode === "ON_MARKUP") {
-        igst = parseFloat(((diff * gstPercent) / (100 + gstPercent)).toFixed(2));
-      } else {
-        igst = parseFloat((((b.pricing?.quotedPrice ?? 0) * gstPercent) / 100).toFixed(2));
-      }
-
-      const costSubDesc = [
-        paxStr,
-        route,
-        travelDateStr ? `Travel Date: ${travelDateStr}` : "",
-        pnr ? `PNR: ${pnr}` : "",
-      ]
-        .filter(Boolean)
-        .join(" || ");
-
-      const svcSubDesc = [paxStr, route].filter(Boolean).join(" || ");
-
-      newLineItems.push({
-        bookingRef: b.bookingRef,
-        rowType: "COST",
-        description: costLabel,
-        subDescription: costSubDesc,
-        qty: 1,
-        rate: supplierCost,
-        igst: 0,
-        amount: supplierCost,
-        passengerNames,
-        travelDate: b.travelDate,
-        type: b.type,
-      });
-
-      newLineItems.push({
-        bookingRef: b.bookingRef,
-        rowType: "SERVICE_FEE",
-        description: "Transaction Fees",
-        subDescription: svcSubDesc,
-        qty: 1,
-        rate: markupAmount,
-        igst,
-        amount: markupAmount,
-        passengerNames,
-        travelDate: b.travelDate,
-        type: b.type,
-      });
+      newLineItems.push(...buildLineItemsForBooking(b));
     }
 
     // Recalculate totals
