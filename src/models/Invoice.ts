@@ -1,5 +1,4 @@
 import mongoose, { Schema, model, type Document } from "mongoose";
-import { getCompanySettings } from "./CompanySettings.js";
 
 export interface IInvoiceLineItem {
   bookingRef: string;
@@ -117,21 +116,21 @@ InvoiceSchema.pre("save", async function (next) {
     if (!this.isNew || this.invoiceNo) return next();
 
     const now = new Date();
+    const month = now.getMonth() + 1; // 1-12
     const year = now.getFullYear();
-    const month = now.getMonth() + 1; // 1-based
-    const fyStart = month >= 4 ? year : year - 1;
-    const fyEnd = fyStart + 1;
-    const fyCode = String(fyStart).slice(2) + String(fyEnd).slice(2); // e.g. "2526"
+    const fyStartYear = month >= 4 ? year : year - 1;
 
-    const prefix = `INV-${fyCode}-`;
-    const [existingCount, settings] = await Promise.all([
-      (this.constructor as any).countDocuments({ invoiceNo: { $regex: `^${prefix}` } }),
-      getCompanySettings(),
-    ]);
+    const prefix = `INV-${fyStartYear}`; // e.g. "INV-2026"
 
-    const startNumber = settings.invoiceStartNumber ?? 1;
+    const existingCount = await (this.constructor as any).countDocuments({
+      invoiceNo: { $regex: `^${prefix}` },
+    });
+
+    // One-time offset for FY 2026-27; all subsequent FYs start at 1
+    const startNumber = fyStartYear === 2026 ? 40 : 1;
     const sequenceNumber = existingCount + startNumber;
     this.invoiceNo = `${prefix}${String(sequenceNumber).padStart(4, "0")}`;
+    // Example: "INV-20260040"
 
     next();
   } catch (err) {
