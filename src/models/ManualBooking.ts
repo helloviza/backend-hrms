@@ -52,6 +52,7 @@ export interface IManualBooking extends Document {
     hotelName?: string;
     roomType?: string;
     nights?: number;
+    roomCount?: number;
     description?: string;
   };
   passengers: {
@@ -128,6 +129,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
       hotelName: String,
       roomType: String,
       nights: Number,
+      roomCount: { type: Number, default: 1, min: 1 },
       description: String,
     },
     passengers: [
@@ -219,12 +221,10 @@ ManualBookingSchema.pre("save", async function (next) {
     }
 
     if (gstMode === "ON_FULL") {
-      // GST charged on top of full quoted price
+      // GST charged on top of full quoted price; the full markup is net profit
       gstAmount  = parseFloat((quotedPrice * gstPercent / 100).toFixed(2));
       grandTotal = parseFloat((quotedPrice + gstAmount).toFixed(2));
-      // Internal profit calc: markup is still tax-inclusive
-      basePrice  = parseFloat((diff * 100 / (100 + gstPercent)).toFixed(2));
-      // (basePrice here = your net margin after paying GST on markup portion)
+      basePrice  = parseFloat(diff.toFixed(2));
     }
 
     p.diff         = parseFloat(diff.toFixed(2));
@@ -233,8 +233,8 @@ ManualBookingSchema.pre("save", async function (next) {
     p.basePrice    = basePrice;
     p.grandTotal   = grandTotal;
     p.totalWithGST = grandTotal;
-    p.profitMargin = quotedPrice > 0
-      ? parseFloat(((diff / quotedPrice) * 100).toFixed(2))
+    p.profitMargin = actualPrice > 0
+      ? parseFloat(((basePrice / actualPrice) * 100).toFixed(2))
       : 0;
   }
 

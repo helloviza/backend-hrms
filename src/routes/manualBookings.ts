@@ -1,6 +1,8 @@
 import express from "express";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
+import multer from "multer";
+import XLSX from "xlsx";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import ManualBooking from "../models/ManualBooking.js";
@@ -11,6 +13,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 
 const router = express.Router();
+const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 router.use(requireAuth);
 
@@ -468,6 +471,454 @@ router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req
     res.json({ items, total: items.length });
   } catch (err: any) {
     console.error("[ManualBookings sbt-queue]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Markup Analysis ──────────────────────────────────────────────── */
+
+// POST /api/admin/manual-bookings/markup-analysis
+router.post("/markup-analysis", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
+  try {
+    const { workspaceId, clientId, type, route, actualPrice, quotedPrice } = req.body as {
+      workspaceId: string; clientId?: string; type: string;
+      route?: string; actualPrice: number; quotedPrice: number;
+    };
+
+    const INSUFFICIENT: any = {
+      verdict: "INSUFFICIENT_DATA", currentMarkupPct: 0, median: null,
+      p25: null, p75: null, sampleSize: 0, confidence: 0,
+      comparisonScope: "none",
+      message: "Insufficient historical data to evaluate this markup.",
+    };
+
+    if (!workspaceId || !type || !(actualPrice > 0)) return res.json(INSUFFICIENT);
+
+    const currentMarkupPct = parseFloat((((quotedPrice - actualPrice) / actualPrice) * 100).toFixed(2));
+
+    const docs = await ManualBooking.aggregate([
+      {
+        $match: {
+          workspaceId: new mongoose.Types.ObjectId(workspaceId),
+          type,
+          status: { $in: ["CONFIRMED", "INVOICED"] },
+          "pricing.actualPrice": { $gt: 0 },
+        },
+      },
+      {
+        $project: {
+          workspaceId: 1,
+          origin: "$itinerary.origin",
+          destination: "$itinerary.destination",
+          hotelName: "$itinerary.hotelName",
+          actualPrice: "$pricing.actualPrice",
+          quotedPrice: "$pricing.quotedPrice",
+        },
+      },
+    ]);
+
+    function docRoute(origin: string, dest: string, hotelName: string): string {
+      if (type === "FLIGHT") {
+        const o = (origin || "").trim().toUpperCase();
+        const d = (dest || "").trim().toUpperCase();
+        return o && d ? `${o}-${d}` : "";
+      }
+      if (type === "HOTEL") return (dest || hotelName || "").trim() || "—";
+      return "";
+    }
+
+    const enriched = docs.map((d: any) => ({
+      wsId: d.workspaceId?.toString(),
+      computedRoute: docRoute(d.origin || "", d.destination || "", d.hotelName || ""),
+      markupPct: parseFloat((((d.quotedPrice - d.actualPrice) / d.actualPrice) * 100).toFixed(2)),
+    }));
+
+    const MIN = 10;
+    const incomingRoute = (route || "").trim();
+    const effectiveClientId = (clientId || workspaceId).toString();
+
+    type ScopeKey = "client_route_type" | "route_type" | "type" | "none";
+    let samples: number[] = [];
+    let scope: ScopeKey = "none";
+
+    if (incomingRoute) {
+      const tierA = enriched.filter((d: any) => d.wsId === effectiveClientId && d.computedRoute === incomingRoute);
+      if (tierA.length >= MIN) { samples = tierA.map((d: any) => d.markupPct); scope = "client_route_type"; }
+
+      if (!samples.length) {
+        const tierB = enriched.filter((d: any) => d.computedRoute === incomingRoute);
+        if (tierB.length >= MIN) { samples = tierB.map((d: any) => d.markupPct); scope = "route_type"; }
+      }
+    }
+
+    if (!samples.length && enriched.length >= MIN) {
+      samples = enriched.map((d: any) => d.markupPct);
+      scope = "type";
+    }
+
+    if (!samples.length) {
+      return res.json({ ...INSUFFICIENT, currentMarkupPct, sampleSize: enriched.length });
+    }
+
+    const sorted = [...samples].sort((a, b) => a - b);
+    const n = sorted.length;
+    function pct(p: number): number {
+      const idx = (p / 100) * (n - 1);
+      const lo = Math.floor(idx), hi = Math.ceil(idx);
+      if (lo === hi) return parseFloat(sorted[lo].toFixed(2));
+      return parseFloat((sorted[lo] + (idx - lo) * (sorted[hi] - sorted[lo])).toFixed(2));
+    }
+
+    const p25 = pct(25), median = pct(50), p75 = pct(75);
+    const sampleSize = n;
+    const confidence = Math.min(95, 50 + sampleSize * 5);
+
+    let verdict: "NORMAL" | "HIGH" | "LOW";
+    if (currentMarkupPct < p25) verdict = "LOW";
+    else if (currentMarkupPct > p75) verdict = "HIGH";
+    else verdict = "NORMAL";
+
+    const message =
+      verdict === "HIGH" ? "Markup is higher than typical (above the 75th percentile of past bookings)."
+      : verdict === "LOW" ? "Markup is lower than typical (below the 25th percentile of past bookings)."
+      : scope === "client_route_type" ? "Markup is within the normal range for this client and route."
+      : scope === "route_type" ? "Markup is within the normal range for this route."
+      : "Markup is within the normal range for this service type.";
+
+    res.json({ verdict, currentMarkupPct, median, p25, p75, sampleSize, confidence, comparisonScope: scope, message });
+  } catch (err: any) {
+    console.error("[ManualBookings markup-analysis]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Excel Import Template ────────────────────────────────────────── */
+
+// GET /api/admin/manual-bookings/import-template
+router.get("/import-template", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
+  try {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("Bookings");
+    ws.views = [{ state: "frozen", ySplit: 1 }];
+
+    const headers = [
+      "type", "clientName", "clientGSTIN", "source", "bookingDate",
+      "travelDate", "returnDate",
+      "origin", "destination", "flightNo", "airline",
+      "hotelName", "roomType", "roomCount", "description",
+      "passengerName", "passengerType",
+      "phone", "pan",
+      "actualPrice", "quotedPrice", "gstMode", "gstPercent",
+      "supplierName", "supplierPNR", "notes",
+    ];
+
+    const hRow = ws.addRow(headers);
+    hRow.font = { bold: true };
+    hRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
+
+    ws.addRow([
+      "FLIGHT", "Acme Corp", "", "MANUAL", "01-04-2025",
+      "10-04-2025", "",
+      "DEL", "BOM", "6E123", "IndiGo",
+      "", "", "", "",
+      "Nandurka Ravi Kumar // Arun Joseph", "ADULT",
+      "9999999999 // 8888888888", "ABCDE1234F // FGHIJ5678K",
+      "8000", "9500", "ON_MARKUP", "18",
+      "IndiGo", "ABCDEF", "Sample notes",
+    ]);
+
+    [14, 24, 20, 12, 14, 14, 14, 8, 8, 10, 14, 20, 14, 10, 22, 22, 12, 16, 14, 12, 12, 12, 12, 18, 14, 28]
+      .forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+
+    const instr = wb.addWorksheet("Instructions");
+    instr.addRow(["Field", "Required", "Notes"]);
+    ([
+      ["type", "YES", "FLIGHT, HOTEL, VISA, TRANSFER, OTHER, CAB, FOREX, ESIM, HOLIDAYS, EVENTS, DUMMY_FLIGHT, DUMMY_HOTEL"],
+      ["clientName", "YES (or clientGSTIN)", "Must match an existing client's company or legal name"],
+      ["clientGSTIN", "YES (or clientName)", "Alternative client lookup by GST number"],
+      ["source", "NO", "MANUAL (default), SBT, ADMIN_QUEUE"],
+      ["bookingDate", "NO", "DD-MM-YYYY. Defaults to today."],
+      ["travelDate", "YES", "DD-MM-YYYY"],
+      ["returnDate", "NO", "DD-MM-YYYY. For hotels: check-out date."],
+      ["origin", "FLIGHT only", "IATA code or city, e.g. DEL"],
+      ["destination", "FLIGHT/HOTEL", "IATA code or city, e.g. BOM"],
+      ["flightNo", "NO", "e.g. 6E123"],
+      ["airline", "NO", "e.g. IndiGo"],
+      ["hotelName", "HOTEL only", "Full hotel name"],
+      ["roomType", "NO", "e.g. Deluxe Double"],
+      ["roomCount", "NO", "HOTEL/DUMMY_HOTEL only — number of rooms. Defaults to 1 if blank."],
+      ["description", "NO", "For non-flight/hotel types"],
+      ["passengerName", "YES", "Full name. For multiple passengers, separate with ' // ' (e.g. 'John Doe // Jane Smith'). Email auto-resolved from CustomerMember records if name matches; otherwise stored with name only."],
+      ["passengerType", "NO", "ADULT (default), CHILD, or INFANT. Single value applies to all passengers in the row."],
+      ["phone", "NO", "Optional. For multiple passengers, use ' // ' separator matching passenger order. Empty slots OK (e.g. '9999 //  // 8888'). Stored as last 10 digits."],
+      ["pan", "NO", "Optional. Parallel ' // ' format like phone. Stored uppercase. No format validation."],
+      ["actualPrice", "YES", "Supplier cost in INR. Must be >= 0."],
+      ["quotedPrice", "YES", "Price charged to client. Must be > 0."],
+      ["gstMode", "NO", "ON_MARKUP (default) or ON_FULL"],
+      ["gstPercent", "NO", "0, 5, 12, or 18. Default: 18"],
+      ["supplierName", "NO", "e.g. IndiGo, TBO"],
+      ["supplierPNR", "NO", "PNR or confirmation number"],
+      ["notes", "NO", "Internal notes"],
+    ] as string[][]).forEach((r) => instr.addRow(r));
+    instr.getColumn(1).width = 18;
+    instr.getColumn(2).width = 22;
+    instr.getColumn(3).width = 70;
+    instr.getRow(1).font = { bold: true };
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", 'attachment; filename="manual-bookings-template.xlsx"');
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err: any) {
+    console.error("[ManualBookings import-template]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Excel Import ─────────────────────────────────────────────────── */
+
+const IMPORT_VALID_TYPES = [
+  "FLIGHT", "HOTEL", "VISA", "TRANSFER", "OTHER",
+  "CAB", "FOREX", "ESIM", "HOLIDAYS", "EVENTS", "DUMMY_FLIGHT", "DUMMY_HOTEL",
+];
+const IMPORT_VALID_SOURCES = ["MANUAL", "SBT", "ADMIN_QUEUE", "SBT_AUTO"];
+const IMPORT_VALID_PAX   = ["ADULT", "CHILD", "INFANT"];
+const IMPORT_VALID_GST   = ["ON_FULL", "ON_MARKUP"];
+
+function parseDateDMY(val: any): Date | null {
+  if (!val) return null;
+  if (val instanceof Date) return isNaN(val.getTime()) ? null : val;
+  const s = String(val).trim();
+  const m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+  if (m) {
+    const d = new Date(`${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}T00:00:00.000Z`);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// POST /api/admin/manual-bookings/import
+router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.single("file"), async (req: any, res: any) => {
+  try {
+    const dryRun = req.query.dryRun !== "false";
+
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+    const wb = XLSX.read(req.file.buffer, { type: "buffer", cellDates: true });
+    const sheetName = wb.SheetNames[0];
+    if (!sheetName) return res.status(400).json({ error: "Empty workbook" });
+
+    const sheet = wb.Sheets[sheetName];
+    const rows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false });
+
+    if (rows.length < 2) {
+      return res.json(dryRun
+        ? { rows: [], summary: { valid: 0, invalid: 0 } }
+        : { inserted: 0, skipped: 0, errors: [] });
+    }
+
+    const rawHeaders = (rows[0] as any[]).map((h: any) => String(h ?? "").trim().toLowerCase().replace(/\s+/g, ""));
+    const COLS: Record<string, number> = {};
+    [
+      "type", "clientname", "clientgstin", "source", "bookingdate",
+      "traveldate", "returndate", "origin", "destination", "flightno", "airline",
+      "hotelname", "roomtype", "roomcount", "description", "passengername", "passengertype",
+      "phone", "pan",
+      "actualprice", "quotedprice", "gstmode", "gstpercent",
+      "suppliername", "supplierpnr", "notes",
+    ].forEach((h) => { COLS[h] = rawHeaders.indexOf(h); });
+
+    function cell(row: any[], key: string): string {
+      const idx = COLS[key];
+      if (idx === undefined || idx === -1) return "";
+      return String(row[idx] ?? "").trim();
+    }
+
+    // Pre-resolve all client names / GSTINs mentioned in the file
+    const nameLookup = new Set<string>();
+    const gstinLookup = new Set<string>();
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i] as any[];
+      if (!r.some(Boolean)) continue;
+      const n = cell(r, "clientname"); if (n) nameLookup.add(n.toLowerCase());
+      const g = cell(r, "clientgstin"); if (g) gstinLookup.add(g.toUpperCase());
+    }
+
+    const clientMap: Record<string, string> = {};
+    if (nameLookup.size) {
+      const byName = await Customer.find({
+        $or: [
+          { legalName:   { $in: [...nameLookup].map((n) => new RegExp(`^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i")) } },
+          { companyName: { $in: [...nameLookup].map((n) => new RegExp(`^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i")) } },
+        ],
+      }).select("_id legalName companyName").lean() as any[];
+      byName.forEach((c: any) => {
+        clientMap[(c.legalName || c.companyName || "").toLowerCase()] = c._id.toString();
+      });
+    }
+    if (gstinLookup.size) {
+      const byGst = await Customer.find({ gstNumber: { $in: [...gstinLookup] } })
+        .select("_id gstNumber").lean() as any[];
+      byGst.forEach((c: any) => {
+        if (c.gstNumber) clientMap[c.gstNumber.toUpperCase()] = c._id.toString();
+      });
+    }
+
+    type RowErr = { field: string; error: string };
+    type RowResult = { rowNumber: number; valid: boolean; data?: any; errors?: RowErr[] };
+    const results: RowResult[] = [];
+
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i] as any[];
+      if (!r.some((v) => v !== null && v !== undefined && String(v).trim() !== "")) continue;
+
+      const rowNumber = i + 1;
+      const errs: RowErr[] = [];
+
+      const type = cell(r, "type").toUpperCase();
+      if (!type) errs.push({ field: "type", error: "required" });
+      else if (!IMPORT_VALID_TYPES.includes(type)) errs.push({ field: "type", error: `"${type}" is not a valid type` });
+
+      const travelDate = parseDateDMY(COLS["traveldate"] !== -1 ? r[COLS["traveldate"]] : "");
+      if (!travelDate) errs.push({ field: "travelDate", error: "required, use DD-MM-YYYY" });
+
+      const bookingDate = parseDateDMY(COLS["bookingdate"] !== -1 ? r[COLS["bookingdate"]] : "") || new Date();
+      const returnDate  = parseDateDMY(COLS["returndate"]  !== -1 ? r[COLS["returndate"]]  : "") || undefined;
+
+      const actualPrice = parseFloat(cell(r, "actualprice").replace(/,/g, ""));
+      const quotedPrice = parseFloat(cell(r, "quotedprice").replace(/,/g, ""));
+
+      if (!cell(r, "actualprice") || isNaN(actualPrice)) errs.push({ field: "actualPrice", error: "required, must be a number" });
+      else if (actualPrice < 0) errs.push({ field: "actualPrice", error: "must be >= 0" });
+
+      if (!cell(r, "quotedprice") || isNaN(quotedPrice)) errs.push({ field: "quotedPrice", error: "required, must be a number" });
+      else if (quotedPrice <= 0) errs.push({ field: "quotedPrice", error: "must be > 0" });
+
+      const passengerRaw = cell(r, "passengername");
+      const rawNames = passengerRaw.split(/\s*\/\/\s*/).map((n) => n.trim()).filter((n) => n.length > 0);
+      if (rawNames.length === 0) errs.push({ field: "passengerName", error: "required, at least 1 passenger" });
+      for (const pName of rawNames) {
+        if (pName.length > 60) errs.push({ field: "passengerName", error: `Passenger '${pName}' name exceeds 60 characters` });
+      }
+
+      const phoneRaw = cell(r, "phone");
+      const phoneSlots = phoneRaw ? phoneRaw.split(/\s*\/\/\s*/).map((s) => s.trim()) : [];
+      if (phoneSlots.length > rawNames.length) errs.push({ field: "phone", error: "more values than passenger names" });
+
+      const panRaw = cell(r, "pan");
+      const panSlots = panRaw ? panRaw.split(/\s*\/\/\s*/).map((s) => s.trim()) : [];
+      if (panSlots.length > rawNames.length) errs.push({ field: "pan", error: "more values than passenger names" });
+
+      const passengerType = cell(r, "passengertype").toUpperCase() || "ADULT";
+      if (!IMPORT_VALID_PAX.includes(passengerType)) errs.push({ field: "passengerType", error: `must be ADULT, CHILD, or INFANT` });
+
+      const gstMode = cell(r, "gstmode").toUpperCase() || "ON_MARKUP";
+      if (!IMPORT_VALID_GST.includes(gstMode)) errs.push({ field: "gstMode", error: "must be ON_MARKUP or ON_FULL" });
+
+      const gstPercent = parseFloat(cell(r, "gstpercent") || "18");
+
+      const clientName  = cell(r, "clientname");
+      const clientGstin = cell(r, "clientgstin").toUpperCase();
+      const resolvedWs  =
+        (clientGstin && clientMap[clientGstin]) ||
+        (clientName && clientMap[clientName.toLowerCase()]) || "";
+
+      if (!resolvedWs) {
+        const ref = clientName || clientGstin;
+        errs.push({ field: "clientName", error: ref ? `client "${ref}" not found` : "clientName or clientGSTIN required" });
+      }
+
+      const sourceRaw = cell(r, "source").toUpperCase();
+      const source = IMPORT_VALID_SOURCES.includes(sourceRaw) ? sourceRaw : "MANUAL";
+
+      if (errs.length) { results.push({ rowNumber, valid: false, errors: errs }); continue; }
+
+      const paxType = (IMPORT_VALID_PAX.includes(passengerType) ? passengerType : "ADULT") as "ADULT" | "CHILD" | "INFANT";
+      const passengers: any[] = [];
+      for (let pi = 0; pi < rawNames.length; pi++) {
+        const pName = rawNames[pi];
+        const pax: any = { name: pName, type: paxType };
+
+        const phoneVal = phoneSlots[pi] ?? "";
+        if (phoneVal) {
+          const digits = phoneVal.replace(/\D/g, "");
+          if (digits) pax.phone = digits.length >= 10 ? digits.slice(-10) : digits;
+        }
+
+        const panVal = panSlots[pi] ?? "";
+        if (panVal) pax.panNo = panVal.toUpperCase();
+
+        if (resolvedWs) {
+          try {
+            const escapedName = pName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const member: any = await CustomerMember.findOne({
+              customerId: resolvedWs,
+              name: { $regex: `^${escapedName}$`, $options: "i" },
+            }).select("email travelerId").lean();
+            if (member) {
+              if (member.email) pax.email = member.email;
+              if (member.travelerId) pax.travelerId = member.travelerId;
+            }
+          } catch {
+            // fall back to name-only on lookup failure
+          }
+        }
+        passengers.push(pax);
+      }
+
+      results.push({
+        rowNumber,
+        valid: true,
+        data: {
+          workspaceId: resolvedWs,
+          type,
+          source,
+          bookingDate,
+          travelDate,
+          returnDate,
+          itinerary: {
+            origin:      cell(r, "origin"),
+            destination: cell(r, "destination"),
+            flightNo:    cell(r, "flightno"),
+            airline:     cell(r, "airline"),
+            hotelName:   cell(r, "hotelname"),
+            roomType:    cell(r, "roomtype"),
+            roomCount:   Math.max(1, parseInt(cell(r, "roomcount") || "1") || 1),
+            description: cell(r, "description"),
+          },
+          passengers,
+          pricing: {
+            actualPrice, quotedPrice,
+            gstMode: IMPORT_VALID_GST.includes(gstMode) ? gstMode : "ON_MARKUP",
+            gstPercent: isNaN(gstPercent) ? 18 : gstPercent,
+            currency: "INR",
+          },
+          supplierName: cell(r, "suppliername"),
+          supplierPNR:  cell(r, "supplierpnr"),
+          notes:        cell(r, "notes"),
+          bookedBy:     req.user._id,
+          status:       "PENDING",
+        },
+      });
+    }
+
+    const validRows = results.filter((r) => r.valid);
+
+    if (dryRun) {
+      return res.json({ rows: results, summary: { valid: validRows.length, invalid: results.length - validRows.length } });
+    }
+
+    const insertResults = await Promise.allSettled(validRows.map((row) => ManualBooking.create(row.data)));
+    const inserted = insertResults.filter((r) => r.status === "fulfilled").length;
+    const skipped  = insertResults.filter((r) => r.status === "rejected").length;
+    const commitErrors = insertResults
+      .map((r, i) => r.status === "rejected" ? { rowNumber: validRows[i].rowNumber, error: (r as PromiseRejectedResult).reason?.message } : null)
+      .filter(Boolean);
+
+    res.json({ inserted, skipped, errors: commitErrors });
+  } catch (err: any) {
+    console.error("[ManualBookings import]", err.message);
     res.status(500).json({ error: err.message });
   }
 });

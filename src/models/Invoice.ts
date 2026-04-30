@@ -47,6 +47,7 @@ export interface IInvoice extends Document {
   status: "DRAFT" | "SENT" | "PAID" | "CANCELLED";
   terms?: string;
   notes?: string;
+  showInclusiveTaxNote?: boolean;
   dueDate?: Date;
   pdfUrl?: string;
   generatedAt: Date;
@@ -90,6 +91,7 @@ const InvoiceSchema = new Schema<IInvoice>(
     status: { type: String, enum: ["DRAFT", "SENT", "PAID", "CANCELLED"], default: "DRAFT" },
     terms: String,
     notes: String,
+    showInclusiveTaxNote: { type: Boolean, default: false },
     dueDate: Date,
     pdfUrl: String,
     generatedAt: { type: Date, default: Date.now },

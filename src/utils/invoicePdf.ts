@@ -7,6 +7,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import type { IInvoice } from "../models/Invoice.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
+import logger from "./logger.js";
 
 /* ── Font paths — resolved relative to this file ───── */
 const __filename = fileURLToPath(import.meta.url);
@@ -180,7 +181,15 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
   console.log('[PDF] clientDetails:', JSON.stringify((invoice as any).clientDetails));
   const issuer = (invoice as any).issuerDetails ?? {};
   const client = (invoice as any).clientDetails ?? {};
-  const isIgst = invoice.supplyType !== "CGST_SGST";
+  let isIgst: boolean;
+  if (invoice.supplyType === "IGST") {
+    isIgst = true;
+  } else if (invoice.supplyType === "CGST_SGST") {
+    isIgst = false;
+  } else {
+    logger.warn(`[PDF] Unexpected supplyType: "${invoice.supplyType ?? "(undefined)"}" — defaulting to IGST`);
+    isIgst = true;
+  }
   const lineItems = invoice.lineItems ?? [];
 
   // index of last SERVICE_FEE row (for disclaimer)
@@ -208,13 +217,18 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
     doc.on("error", reject);
 
     // ── Table column widths & x positions ──
-    // No S.No column — DESCRIPTION | QTY | RATE | IGST | AMOUNT
-    const COL_W = [CW * 0.55, CW * 0.08, CW * 0.13, CW * 0.12, CW * 0.12];
+    const COL_W = isIgst
+      ? [CW * 0.55, CW * 0.08, CW * 0.13, CW * 0.12, CW * 0.12]
+      : [CW * 0.44, CW * 0.07, CW * 0.12, CW * 0.12, CW * 0.12, CW * 0.13];
     const COL_X: number[] = [L];
     for (let i = 0; i < COL_W.length - 1; i++) COL_X.push(COL_X[i] + COL_W[i]);
     const HDR_H = 20;
-    const HDRS = ["DESCRIPTION", "QTY", "RATE", "IGST", "AMOUNT"];
-    const ALIGNS: Array<"center" | "left" | "right"> = ["left", "center", "right", "right", "right"];
+    const HDRS = isIgst
+      ? ["DESCRIPTION", "QTY", "RATE", "IGST (18%)", "AMOUNT"]
+      : ["DESCRIPTION", "QTY", "RATE", "CGST (9%)", "SGST (9%)", "AMOUNT"];
+    const ALIGNS: Array<"center" | "left" | "right"> = isIgst
+      ? ["left", "center", "right", "right", "right"]
+      : ["left", "center", "right", "right", "right", "right"];
 
     function drawTableHeader(y: number) {
       doc.rect(L, y, CW, HDR_H).fill(C_SURF_LOW);
@@ -404,8 +418,7 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
       const li = lineItems[idx] as any;
 
       const isLastSvc = idx === lastSvcIdx;
-      const rawDesc = (li.description || "").replace(/Transaction Fees/g, "Service Fees");
-      const descLine1 = rawDesc;
+      const descLine1 = li.description || "";
 
       let descLine2 = (li.subDescription || "")
         .replace(/→/g, "->")
@@ -425,7 +438,7 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
         doc.font(FONT_NORMAL).fontSize(subFontSize);
         estH += 3 + doc.heightOfString(descLine2, { width: COL_W[0] - 8 });
       }
-      if (isLastSvc) {
+      if (isLastSvc && (invoice as any).showInclusiveTaxNote) {
         doc.font(FONT_NORMAL).fontSize(discFontSize);
         estH += 3 + doc.heightOfString(DISCLAIMER, { width: COL_W[0] - 8 });
       }
@@ -457,14 +470,14 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
         dY += doc.heightOfString(descLine2, { width: descW, fontSize: subFontSize }) + 3;
       }
 
-      if (isLastSvc) {
+      if (isLastSvc && (invoice as any).showInclusiveTaxNote) {
         doc.fontSize(discFontSize).font(FONT_NORMAL).fillColor(C_MID)
           .text(DISCLAIMER, descX, dY, { width: descW });
       }
 
       // QTY
       doc.fontSize(9).font(FONT_NORMAL).fillColor(C_BODY)
-        .text("1", COL_X[1] + 1, y + 7, {
+        .text(String(li.qty ?? 1), COL_X[1] + 1, y + 7, {
           width: COL_W[1] - 2,
           align: "center",
           lineBreak: false,
@@ -477,22 +490,45 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
         lineBreak: false,
       });
 
-      // IGST
-      const igstVal = li.igst ?? 0;
-      doc.fillColor(igstVal > 0 ? C_BODY : C_MID)
-        .text(igstVal > 0 ? fmtCur(igstVal) : "—", COL_X[3] + 2, y + 7, {
-          width: COL_W[3] - 4,
-          align: "right",
-          lineBreak: false,
-        });
-
-      // AMOUNT
-      doc.fillColor(C_BODY)
-        .text(fmtCur(li.amount ?? 0), COL_X[4] + 2, y + 7, {
-          width: COL_W[4] - 4,
-          align: "right",
-          lineBreak: false,
-        });
+      if (isIgst) {
+        // IGST
+        const igstVal = li.igst ?? 0;
+        doc.fillColor(igstVal > 0 ? C_BODY : C_MID)
+          .text(igstVal > 0 ? fmtCur(igstVal) : "—", COL_X[3] + 2, y + 7, {
+            width: COL_W[3] - 4,
+            align: "right",
+            lineBreak: false,
+          });
+        // AMOUNT
+        doc.fillColor(C_BODY)
+          .text(fmtCur(li.amount ?? 0), COL_X[4] + 2, y + 7, {
+            width: COL_W[4] - 4,
+            align: "right",
+            lineBreak: false,
+          });
+      } else {
+        // CGST + SGST (each = igst / 2)
+        const halfGst = (li.igst ?? 0) / 2;
+        doc.fillColor(halfGst > 0 ? C_BODY : C_MID)
+          .text(halfGst > 0 ? fmtCur(halfGst) : "—", COL_X[3] + 2, y + 7, {
+            width: COL_W[3] - 4,
+            align: "right",
+            lineBreak: false,
+          });
+        doc.fillColor(halfGst > 0 ? C_BODY : C_MID)
+          .text(halfGst > 0 ? fmtCur(halfGst) : "—", COL_X[4] + 2, y + 7, {
+            width: COL_W[4] - 4,
+            align: "right",
+            lineBreak: false,
+          });
+        // AMOUNT
+        doc.fillColor(C_BODY)
+          .text(fmtCur(li.amount ?? 0), COL_X[5] + 2, y + 7, {
+            width: COL_W[5] - 4,
+            align: "right",
+            lineBreak: false,
+          });
+      }
 
       y += estH;
     }
