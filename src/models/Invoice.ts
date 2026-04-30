@@ -48,6 +48,7 @@ export interface IInvoice extends Document {
   terms?: string;
   notes?: string;
   showInclusiveTaxNote?: boolean;
+  invoiceDate: Date;
   dueDate?: Date;
   pdfUrl?: string;
   generatedAt: Date;
@@ -92,6 +93,7 @@ const InvoiceSchema = new Schema<IInvoice>(
     terms: String,
     notes: String,
     showInclusiveTaxNote: { type: Boolean, default: false },
+    invoiceDate: { type: Date, required: true, default: () => new Date() },
     dueDate: Date,
     pdfUrl: String,
     generatedAt: { type: Date, default: Date.now },

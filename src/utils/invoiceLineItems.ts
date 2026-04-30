@@ -5,6 +5,7 @@ const TYPE_COST_LABELS: Record<string, string> = {
   DUMMY_FLIGHT: "Flight Cost",
   HOTEL:        "Hotel Cost",
   DUMMY_HOTEL:  "Hotel Cost",
+  TRAIN:        "Train Cost",
   VISA:         "Visa Cost",
   TRANSFER:     "Transfer Cost",
   CAB:          "Cab Cost",
@@ -62,7 +63,7 @@ function buildUnitCountPrefix(booking: any): string {
     const roomLabel  = rooms  === 1 ? "Room"  : "Rooms";
     return `${nights} ${nightLabel} x ${rooms} ${roomLabel}`;
   }
-  if (t === "FLIGHT" || t === "DUMMY_FLIGHT") {
+  if (t === "FLIGHT" || t === "DUMMY_FLIGHT" || t === "TRAIN") {
     return `${paxCount} ${paxCount === 1 ? "Passenger" : "Passengers"}`;
   }
   if (t === "VISA") {
@@ -93,6 +94,15 @@ function buildSubDescription(booking: any, paxStr: string): string {
     const airline     = booking.itinerary?.airline || "";
     const flightNo    = booking.itinerary?.flightNo || "";
     const carrier     = [airline, flightNo].filter(Boolean).join(" ");
+    const dateStr     = fmtDate(booking.travelDate);
+    parts = [paxStr, route, carrier || undefined, dateStr ? `Travel Date: ${dateStr}` : undefined];
+  } else if (t === "TRAIN") {
+    const origin      = booking.itinerary?.origin || "";
+    const destination = booking.itinerary?.destination || "";
+    const route       = origin && destination ? `${origin}-${destination}` : origin || destination || "—";
+    const trainClass  = booking.itinerary?.trainClass || "";
+    const trainNo     = booking.itinerary?.flightNo || "";
+    const carrier     = [trainClass, trainNo].filter(Boolean).join(" ");
     const dateStr     = fmtDate(booking.travelDate);
     parts = [paxStr, route, carrier || undefined, dateStr ? `Travel Date: ${dateStr}` : undefined];
   } else if (t === "HOTEL" || t === "DUMMY_HOTEL") {
