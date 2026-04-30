@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express'
 import { UserPermission, hasAccess } from '../models/UserPermission.js'
 import { isSuperAdmin } from './isSuperAdmin.js'
+import logger from '../utils/logger.js'
 
 declare global {
   namespace Express {
@@ -31,6 +32,22 @@ export function requirePermission(
         success: false,
         message: 'Not authenticated',
       })
+    }
+
+    // Belt-and-suspenders SUPERADMIN bypass — grants full access without a
+    // UserPermission record. isSuperAdmin() above covers most cases; this
+    // catches any edge where role normalization hasn't propagated to the
+    // isSuperAdmin check (e.g. old JWTs with non-array role field).
+    if (Array.isArray(user.roles) && user.roles.includes('SUPERADMIN')) {
+      logger.info('SUPERADMIN bypass: permission check skipped', {
+        userId,
+        module,
+        minAccess,
+        email: user.email,
+      })
+      req.permissionScope  = 'ALL'
+      req.permissionAccess = 'FULL'
+      return next()
     }
 
     const perm = await UserPermission.findOne({ userId }).lean()
