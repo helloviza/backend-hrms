@@ -174,18 +174,23 @@ function invoiceToRow(inv: any): (string | number | undefined)[] {
 // POST /api/admin/invoices/generate
 router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
   try {
-    const { bookingIds, billingPeriod, dueDate, notes, terms, showInclusiveTaxNote } = req.body as {
+    const { bookingIds, billingPeriod, dueDate, notes, terms, showInclusiveTaxNote, invoiceDate } = req.body as {
       bookingIds: string[];
       billingPeriod?: string;
       dueDate?: string;
       notes?: string;
       terms?: string;
       showInclusiveTaxNote?: boolean;
+      invoiceDate?: string;
     };
 
     if (!Array.isArray(bookingIds) || !bookingIds.length) {
       return res.status(400).json({ error: "bookingIds array is required" });
     }
+
+    // Resolve invoiceDate — no restrictions, default to today if omitted
+    const resolvedInvoiceDate = invoiceDate ? new Date(invoiceDate) : new Date();
+    resolvedInvoiceDate.setHours(0, 0, 0, 0);
 
     // Validate bookings
     const bookings = await ManualBooking.find({
@@ -314,6 +319,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       terms,
       notes,
       showInclusiveTaxNote: showInclusiveTaxNote === true,
+      invoiceDate: resolvedInvoiceDate,
       dueDate: dueDate ? new Date(dueDate) : undefined,
       createdBy: req.user._id,
     });

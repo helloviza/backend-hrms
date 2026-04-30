@@ -193,7 +193,7 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
 router.get("/", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, parseInt(req.query.limit) || 20);
+    const limit = Math.min(200, parseInt(req.query.limit) || 25);
     const filter = buildSearchFilter(req.query);
 
     // Scope non-ALL users to their own bookings only
@@ -604,7 +604,7 @@ router.get("/import-template", requirePermission("manualBookings", "READ"), asyn
     const headers = [
       "type", "clientName", "clientGSTIN", "source", "bookingDate",
       "travelDate", "returnDate",
-      "origin", "destination", "flightNo", "airline",
+      "origin", "destination", "flightNo", "airline", "trainClass",
       "hotelName", "roomType", "roomCount", "description",
       "passengerName", "passengerType",
       "phone", "pan",
@@ -619,7 +619,7 @@ router.get("/import-template", requirePermission("manualBookings", "READ"), asyn
     ws.addRow([
       "FLIGHT", "Acme Corp", "", "MANUAL", "01-04-2025",
       "10-04-2025", "",
-      "DEL", "BOM", "6E123", "IndiGo",
+      "DEL", "BOM", "6E123", "IndiGo", "",
       "", "", "", "",
       "Nandurka Ravi Kumar // Arun Joseph", "ADULT",
       "9999999999 // 8888888888", "ABCDE1234F // FGHIJ5678K",
@@ -627,7 +627,7 @@ router.get("/import-template", requirePermission("manualBookings", "READ"), asyn
       "IndiGo", "ABCDEF", "Sample notes",
     ]);
 
-    [14, 24, 20, 12, 14, 14, 14, 8, 8, 10, 14, 20, 14, 10, 22, 22, 12, 16, 14, 12, 12, 12, 12, 18, 14, 28]
+    [14, 24, 20, 12, 14, 14, 14, 8, 8, 10, 14, 10, 20, 14, 10, 22, 22, 12, 16, 14, 12, 12, 12, 12, 18, 14, 28]
       .forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
     const instr = wb.addWorksheet("Instructions");
@@ -644,6 +644,7 @@ router.get("/import-template", requirePermission("manualBookings", "READ"), asyn
       ["destination", "FLIGHT/HOTEL", "IATA code or city, e.g. BOM"],
       ["flightNo", "NO", "e.g. 6E123"],
       ["airline", "NO", "e.g. IndiGo"],
+      ["trainClass", "NO", "For TRAIN type only. Examples: 1AC, 2AC, 3AC, SL, CC, EC"],
       ["hotelName", "HOTEL only", "Full hotel name"],
       ["roomType", "NO", "e.g. Deluxe Double"],
       ["roomCount", "NO", "HOTEL/DUMMY_HOTEL only — number of rooms. Defaults to 1 if blank."],
@@ -679,7 +680,7 @@ router.get("/import-template", requirePermission("manualBookings", "READ"), asyn
 
 const IMPORT_VALID_TYPES = [
   "FLIGHT", "HOTEL", "VISA", "TRANSFER", "OTHER",
-  "CAB", "FOREX", "ESIM", "HOLIDAYS", "EVENTS", "DUMMY_FLIGHT", "DUMMY_HOTEL",
+  "CAB", "FOREX", "ESIM", "HOLIDAYS", "EVENTS", "DUMMY_FLIGHT", "DUMMY_HOTEL", "TRAIN",
 ];
 const IMPORT_VALID_SOURCES = ["MANUAL", "SBT", "ADMIN_QUEUE", "SBT_AUTO"];
 const IMPORT_VALID_PAX   = ["ADULT", "CHILD", "INFANT"];
@@ -722,7 +723,7 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
     const COLS: Record<string, number> = {};
     [
       "type", "clientname", "clientgstin", "source", "bookingdate",
-      "traveldate", "returndate", "origin", "destination", "flightno", "airline",
+      "traveldate", "returndate", "origin", "destination", "flightno", "airline", "trainclass",
       "hotelname", "roomtype", "roomcount", "description", "passengername", "passengertype",
       "phone", "pan",
       "actualprice", "quotedprice", "gstmode", "gstpercent",
@@ -734,6 +735,18 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
       if (idx === undefined || idx === -1) return "";
       return String(row[idx] ?? "").trim();
     }
+
+    const trimStr = (v: any): string | undefined => {
+      if (v == null) return undefined;
+      const s = String(v).trim();
+      return s.length === 0 ? undefined : s;
+    };
+
+    const normalizeRoute = (v: any): string | undefined => {
+      const s = trimStr(v);
+      if (!s || !s.includes("-")) return s;
+      return s.split("-").map((p) => p.trim()).filter(Boolean).join("-");
+    };
 
     // Pre-resolve all client names / GSTINs mentioned in the file
     const nameLookup = new Set<string>();
@@ -776,7 +789,7 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
       const rowNumber = i + 1;
       const errs: RowErr[] = [];
 
-      const type = cell(r, "type").toUpperCase();
+      const type = (trimStr(cell(r, "type")) ?? "").toUpperCase();
       if (!type) errs.push({ field: "type", error: "required" });
       else if (!IMPORT_VALID_TYPES.includes(type)) errs.push({ field: "type", error: `"${type}" is not a valid type` });
 
@@ -813,7 +826,7 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
       const passengerType = cell(r, "passengertype").toUpperCase() || "ADULT";
       if (!IMPORT_VALID_PAX.includes(passengerType)) errs.push({ field: "passengerType", error: `must be ADULT, CHILD, or INFANT` });
 
-      const gstMode = cell(r, "gstmode").toUpperCase() || "ON_MARKUP";
+      const gstMode = (trimStr(cell(r, "gstmode")) ?? "ON_MARKUP").toUpperCase();
       if (!IMPORT_VALID_GST.includes(gstMode)) errs.push({ field: "gstMode", error: "must be ON_MARKUP or ON_FULL" });
 
       const gstPercent = parseFloat(cell(r, "gstpercent") || "18");
@@ -878,14 +891,15 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
           travelDate,
           returnDate,
           itinerary: {
-            origin:      cell(r, "origin"),
-            destination: cell(r, "destination"),
-            flightNo:    cell(r, "flightno"),
-            airline:     cell(r, "airline"),
-            hotelName:   cell(r, "hotelname"),
-            roomType:    cell(r, "roomtype"),
+            origin:      normalizeRoute(cell(r, "origin")),
+            destination: normalizeRoute(cell(r, "destination")),
+            flightNo:    trimStr(cell(r, "flightno")),
+            airline:     trimStr(cell(r, "airline")),
+            trainClass:  type === "TRAIN" ? trimStr(cell(r, "trainclass")) : undefined,
+            hotelName:   trimStr(cell(r, "hotelname")),
+            roomType:    trimStr(cell(r, "roomtype")),
             roomCount:   Math.max(1, parseInt(cell(r, "roomcount") || "1") || 1),
-            description: cell(r, "description"),
+            description: trimStr(cell(r, "description")),
           },
           passengers,
           pricing: {
@@ -894,9 +908,9 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
             gstPercent: isNaN(gstPercent) ? 18 : gstPercent,
             currency: "INR",
           },
-          supplierName: cell(r, "suppliername"),
-          supplierPNR:  cell(r, "supplierpnr"),
-          notes:        cell(r, "notes"),
+          supplierName: trimStr(cell(r, "suppliername")),
+          supplierPNR:  trimStr(cell(r, "supplierpnr")),
+          notes:        trimStr(cell(r, "notes")),
           bookedBy:     req.user._id,
           status:       "PENDING",
         },
@@ -909,7 +923,15 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
       return res.json({ rows: results, summary: { valid: validRows.length, invalid: results.length - validRows.length } });
     }
 
-    const insertResults = await Promise.allSettled(validRows.map((row) => ManualBooking.create(row.data)));
+    const insertResults: PromiseSettledResult<any>[] = [];
+    for (const row of validRows) {
+      try {
+        const booking = await ManualBooking.create(row.data);
+        insertResults.push({ status: "fulfilled", value: booking });
+      } catch (err: any) {
+        insertResults.push({ status: "rejected", reason: err });
+      }
+    }
     const inserted = insertResults.filter((r) => r.status === "fulfilled").length;
     const skipped  = insertResults.filter((r) => r.status === "rejected").length;
     const commitErrors = insertResults

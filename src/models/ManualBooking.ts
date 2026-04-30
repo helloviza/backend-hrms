@@ -38,7 +38,7 @@ export interface IManualBooking extends Document {
   type:
     | "FLIGHT" | "HOTEL" | "VISA" | "TRANSFER" | "OTHER"
     | "CAB" | "FOREX" | "ESIM" | "HOLIDAYS" | "EVENTS"
-    | "DUMMY_FLIGHT" | "DUMMY_HOTEL";
+    | "DUMMY_FLIGHT" | "DUMMY_HOTEL" | "TRAIN";
   status: "PENDING" | "WIP" | "CONFIRMED" | "INVOICED" | "CANCELLED";
   subStatus?: SubStatus;
   source: "MANUAL" | "SBT" | "ADMIN_QUEUE" | "SBT_AUTO";
@@ -47,13 +47,14 @@ export interface IManualBooking extends Document {
   itinerary: {
     origin?: string;
     destination?: string;
-    flightNo?: string;
+    flightNo?: string;    // reused as trainNo for TRAIN bookings
     airline?: string;
     hotelName?: string;
     roomType?: string;
     nights?: number;
     roomCount?: number;
     description?: string;
+    trainClass?: string;
   };
   passengers: {
     name: string;
@@ -112,7 +113,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
       enum: [
         "FLIGHT", "HOTEL", "VISA", "TRANSFER", "OTHER",
         "CAB", "FOREX", "ESIM", "HOLIDAYS", "EVENTS",
-        "DUMMY_FLIGHT", "DUMMY_HOTEL",
+        "DUMMY_FLIGHT", "DUMMY_HOTEL", "TRAIN",
       ],
       required: true,
     },
@@ -131,6 +132,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
       nights: Number,
       roomCount: { type: Number, default: 1, min: 1 },
       description: String,
+      trainClass: String,
     },
     passengers: [
       {

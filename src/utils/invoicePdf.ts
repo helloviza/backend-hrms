@@ -264,13 +264,16 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
       logoBottomY = y + 50;
     }
 
-    // "TAX INVOICE" + invoice number below logo
+    // "TAX INVOICE" + invoice number + invoice date below logo
     doc.fillColor(C_PRIMARY).fontSize(26).font(FONT_BOLD)
       .text("TAX INVOICE", L, logoBottomY + 6, { width: LEFT_COL_W, lineBreak: false });
     doc.fontSize(12).font(FONT_NORMAL).fillColor(C_MID)
       .text(`# ${invoice.invoiceNo}`, L, logoBottomY + 36, { width: LEFT_COL_W, lineBreak: false });
+    const invoiceDateDisplay = fmtDate((invoice as any).invoiceDate || invoice.generatedAt);
+    doc.fontSize(10).font(FONT_NORMAL).fillColor(C_MID)
+      .text(`Date: ${invoiceDateDisplay}`, L, logoBottomY + 52, { width: LEFT_COL_W, lineBreak: false });
 
-    const leftTitleBottomY = logoBottomY + 54;
+    const leftTitleBottomY = logoBottomY + 68;
 
     // Right — two stat boxes side by side
     const BOX_W = 100;
