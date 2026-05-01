@@ -39,7 +39,8 @@ function getHeader(
   headers: { name?: string | null; value?: string | null }[],
   name: string,
 ): string {
-  return headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
+  const target = name.toLowerCase();
+  return headers.find((h) => h.name?.toLowerCase() === target)?.value || "";
 }
 
 function parseFrom(raw: string): { email: string; name: string } {
@@ -121,6 +122,13 @@ export function parseEmail(gmailMsg: gmail_v1.Schema$Message): ParsedEmail {
       extractParts(payload, acc);
     }
   }
+
+  // [DIAG] — remove after debugging rfcMessageId
+  console.log("[DIAG] Email headers:", JSON.stringify(headers, null, 2));
+  const msgIdHeader = headers.find((h) => h.name?.toLowerCase() === "message-id");
+  console.log("[DIAG] Found message-id header entry:", msgIdHeader);
+  console.log("[DIAG] getHeader result for message-id:", getHeader(headers, "message-id"));
+  // [/DIAG]
 
   return {
     fromEmail,

@@ -1,4 +1,5 @@
 import express from "express";
+import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import Ticket from "../models/Ticket.js";
@@ -7,7 +8,15 @@ import TicketLead from "../models/TicketLead.js";
 import TicketAttachment from "../models/TicketAttachment.js";
 import User from "../models/User.js";
 import { sendReply } from "../services/gmail.js";
+import { uploadTicketAttachment } from "../services/ticketAttachments.js";
+import { presignGetObject } from "../utils/s3Presign.js";
+import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 5 },
+}).array("attachments", 5);
 
 const router = express.Router();
 
@@ -271,14 +280,42 @@ router.get("/:id", async (req, res) => {
 });
 
 /* ── POST /:id/reply — send reply or internal note ──────────────── */
-router.post("/:id/reply", async (req, res) => {
+router.post("/:id/reply", upload, async (req, res) => {
   try {
-    const { bodyHtml, isInternalNote } = req.body;
+    const bodyHtml = req.body?.bodyHtml || "";
+    const isInternalNote = req.body?.isInternalNote === "true" || req.body?.isInternalNote === true;
     const userId = (req as any).user?._id || (req as any).user?.id;
     const userEmail = (req as any).user?.email || "";
+    const uploadedFiles = (req.files as Express.Multer.File[]) || [];
 
     const ticket = await Ticket.findById(req.params.id);
     if (!ticket) return res.status(404).json({ success: false, error: "Ticket not found" });
+
+    // Upload any attached files to S3 first (applies to both notes and replies)
+    const attachmentDocs: Array<InstanceType<typeof TicketAttachment>> = [];
+    for (const file of uploadedFiles) {
+      try {
+        const upload = await uploadTicketAttachment(ticket.ticketRef, {
+          filename: file.originalname,
+          mimeType: file.mimetype,
+          data: file.buffer,
+        });
+        // TicketAttachment will be linked to the message after the message is created
+        attachmentDocs.push(
+          new TicketAttachment({
+            ticketId: ticket._id,
+            fileName: file.originalname,
+            mimeType: file.mimetype,
+            size: upload.size,
+            s3Key: upload.s3Key,
+            s3Bucket: upload.s3Bucket,
+            checksum: upload.checksum,
+          }),
+        );
+      } catch (err) {
+        logger.error("[TicketsConsole] Attachment upload failed", { filename: file.originalname, err });
+      }
+    }
 
     if (isInternalNote) {
       const msg = await TicketMessage.create({
@@ -288,37 +325,69 @@ router.post("/:id/reply", async (req, res) => {
         fromEmail: userEmail,
         toEmail: [],
         subject: ticket.subject,
-        bodyHtml: bodyHtml || "",
+        bodyHtml,
         bodyText: "",
         sentBy: userId,
         sentAt: new Date(),
         deliveryStatus: "SENT",
       });
+
+      // Link attachment docs to this message
+      if (attachmentDocs.length > 0) {
+        for (const att of attachmentDocs) (att as any).messageId = msg._id;
+        const saved = await TicketAttachment.insertMany(attachmentDocs);
+        await TicketMessage.findByIdAndUpdate(msg._id, {
+          $set: { attachmentRefs: saved.map((a) => a._id) },
+        });
+      }
+
       const populated = await TicketMessage.findById(msg._id).populate("sentBy", "name email").lean();
       return res.json({ success: true, message: populated, ticket });
     }
 
+    // Outbound email reply
     const lastInbound = await TicketMessage.findOne({
       ticketId: ticket._id,
       direction: "INBOUND",
-    }).sort({ createdAt: -1 });
+    }).sort({ sentAt: -1, createdAt: -1 });
 
-    const inReplyTo = lastInbound?.gmailMessageId || "";
+    const inReplyToRfcId = lastInbound?.rfcMessageId || "";
+
+    // Build references chain from all prior messages that have an RFC Message-ID
+    const priorMessages = await TicketMessage.find({
+      ticketId: ticket._id,
+      rfcMessageId: { $nin: [null, ""] },
+    }).sort({ sentAt: 1, createdAt: 1 }).select("rfcMessageId").lean();
+    const referencesChain = priorMessages.map((m) => m.rfcMessageId).filter(Boolean) as string[];
 
     let gmailMessageId = "";
-    if (ticket.gmailThreadId && inReplyTo) {
-      const result = await sendReply(
-        ticket.gmailThreadId,
-        inReplyTo,
-        ticket.fromEmail,
-        ticket.subject,
-        bodyHtml || "",
-      );
-      gmailMessageId = result.messageId;
+    let rfcMessageId = "";
+
+    if (ticket.gmailThreadId) {
+      try {
+        const result = await sendReply({
+          threadId: ticket.gmailThreadId,
+          inReplyToRfcId,
+          referencesChain,
+          to: ticket.fromEmail,
+          subject: ticket.subject,
+          htmlBody: bodyHtml,
+          attachments: uploadedFiles.map((f) => ({
+            filename: f.originalname,
+            mimeType: f.mimetype,
+            content: f.buffer,
+          })),
+        });
+        gmailMessageId = result.gmailMessageId;
+        rfcMessageId = result.rfcMessageId;
+      } catch (err) {
+        logger.error("[TicketsConsole] Gmail sendReply failed", {
+          ticketId: ticket._id, threadId: ticket.gmailThreadId, err,
+        });
+        return res.status(502).json({ success: false, error: "Failed to send email via Gmail" });
+      }
     } else {
-      logger.warn("[TicketsConsole] No threadId/inReplyTo — skipping Gmail send", {
-        ticketId: ticket._id, threadId: ticket.gmailThreadId, inReplyTo,
-      });
+      logger.warn("[TicketsConsole] No gmailThreadId — skipping Gmail send", { ticketId: ticket._id });
     }
 
     const msg = await TicketMessage.create({
@@ -328,15 +397,25 @@ router.post("/:id/reply", async (req, res) => {
       fromEmail: userEmail,
       toEmail: [ticket.fromEmail],
       subject: ticket.subject,
-      bodyHtml: bodyHtml || "",
+      bodyHtml,
       bodyText: "",
       gmailMessageId: gmailMessageId || undefined,
+      rfcMessageId: rfcMessageId || undefined,
       gmailThreadId: ticket.gmailThreadId,
-      inReplyTo: inReplyTo || undefined,
+      inReplyTo: inReplyToRfcId || undefined,
       sentBy: userId,
       sentAt: new Date(),
       deliveryStatus: "SENT",
     });
+
+    // Link attachment docs to this message
+    if (attachmentDocs.length > 0) {
+      for (const att of attachmentDocs) (att as any).messageId = msg._id;
+      const saved = await TicketAttachment.insertMany(attachmentDocs);
+      await TicketMessage.findByIdAndUpdate(msg._id, {
+        $set: { attachmentRefs: saved.map((a) => a._id) },
+      });
+    }
 
     if (!ticket.firstResponseAt) {
       ticket.firstResponseAt = new Date();
@@ -427,6 +506,29 @@ router.patch("/:id/assign", async (req, res) => {
   } catch (err) {
     logger.error("[TicketsConsole] assign error", { err });
     return res.status(500).json({ success: false, error: "Failed to assign ticket" });
+  }
+});
+
+/* ── GET /:id/attachments/:attachmentId/download ─────────────── */
+router.get("/:id/attachments/:attachmentId/download", async (req, res) => {
+  try {
+    const att = await TicketAttachment.findOne({
+      _id: req.params.attachmentId,
+      ticketId: req.params.id,
+    }).lean();
+
+    if (!att) return res.status(404).json({ success: false, error: "Attachment not found" });
+
+    const url = await presignGetObject({
+      bucket: att.s3Bucket,
+      key: att.s3Key,
+      expiresInSeconds: 300,
+    });
+
+    return res.json({ success: true, url });
+  } catch (err) {
+    logger.error("[TicketsConsole] attachment download error", { err });
+    return res.status(500).json({ success: false, error: "Failed to generate download URL" });
   }
 });
 
