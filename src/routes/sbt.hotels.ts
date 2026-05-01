@@ -443,23 +443,66 @@ function validateBookingCriteria(p: BookingValidationPayload): ValidationError[]
     }
   }
 
-  // ── Rule 12: Lead pax — phone + email required ──
+  // ── Rule 12: Lead pax — phone + email required (single primary contact, industry-norm) ──
+  // Customer provides ONE phone + ONE email; primary contact propagates to all rooms in TBO payload.
+  const primaryContact = getPrimaryLeadContact(rooms);
+  const primaryPhoneDigits = String(primaryContact.phone).replace(/\D/g, "");
+  const primaryEmailValid = !!primaryContact.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(primaryContact.email);
+
+  if (primaryPhoneDigits.length < 10) {
+    errors.push({ field: "HotelRoomsDetails[0].Guests[0].Phone", code: "PHONE_REQUIRED", message: "Lead guest phone number must be at least 10 digits." });
+  }
+  if (!primaryEmailValid) {
+    errors.push({ field: "HotelRoomsDetails[0].Guests[0].Email", code: "EMAIL_REQUIRED", message: "Lead guest email is required and must be valid." });
+  }
+
+  // Per-room: only flag if an explicit value is present but invalid (empty = will be filled from primary contact).
   for (let ri = 0; ri < rooms.length; ri++) {
     const rg: any[] = rooms[ri]?.Guests ?? rooms[ri]?.HotelPassenger ?? [];
     const leadPax = rg.find((g: any) => Number(g?.PaxType) === 1 && g?.LeadPassenger) ?? rg.find((g: any) => Number(g?.PaxType) === 1);
     if (!leadPax) continue;
     const leadPi = rg.indexOf(leadPax);
-    const phone = String(leadPax?.Phone || leadPax?.Phoneno || "").trim().replace(/\D/g, "");
-    if (phone.length < 10) {
-      errors.push({ field: fp(ri, leadPi, "Phone"), code: "PHONE_REQUIRED", message: "Lead guest phone number must be at least 10 digits." });
+
+    const explicitPhone = String(leadPax?.Phone || leadPax?.Phoneno || "").trim();
+    if (explicitPhone && explicitPhone.replace(/\D/g, "").length < 10) {
+      errors.push({ field: fp(ri, leadPi, "Phone"), code: "PHONE_INVALID", message: `Room ${ri + 1} lead guest phone, if provided, must be at least 10 digits.` });
     }
-    const email = String(leadPax?.Email || "").trim();
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      errors.push({ field: fp(ri, leadPi, "Email"), code: "EMAIL_REQUIRED", message: "Lead guest email is required and must be valid." });
+
+    const explicitEmail = String(leadPax?.Email || "").trim();
+    if (explicitEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(explicitEmail)) {
+      errors.push({ field: fp(ri, leadPi, "Email"), code: "EMAIL_INVALID", message: `Room ${ri + 1} lead guest email, if provided, must be valid.` });
     }
   }
 
   return errors;
+}
+
+/**
+ * Industry-norm: customer provides ONE primary lead phone + email at booking time.
+ * TBO API requires every room's lead pax to have phone + email populated.
+ * Extracts the single primary contact for propagation across rooms in TBO payload.
+ */
+function getPrimaryLeadContact(rooms: any[]): { phone: string; email: string } {
+  for (const room of rooms) {
+    const guests: any[] = room?.Guests ?? room?.HotelPassenger ?? [];
+    const lead = guests.find((g: any) => Number(g?.PaxType) === 1 && g?.LeadPassenger === true);
+    if (lead) {
+      const phone = String(lead?.Phone || lead?.Phoneno || "").trim();
+      const email = String(lead?.Email || "").trim();
+      if (phone || email) return { phone, email };
+    }
+  }
+  for (const room of rooms) {
+    const guests: any[] = room?.Guests ?? room?.HotelPassenger ?? [];
+    for (const g of guests) {
+      if (Number(g?.PaxType) === 1) {
+        const phone = String(g?.Phone || g?.Phoneno || "").trim();
+        const email = String(g?.Email || "").trim();
+        if (phone || email) return { phone, email };
+      }
+    }
+  }
+  return { phone: "", email: "" };
 }
 
 const hotelDetailsCache = new Map<string, { data: any; ts: number }>();
@@ -1265,34 +1308,6 @@ router.post("/payment/verify", requireAuth, async (req: any, res: any) => {
 router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) => {
   let clientRef = "";
   try {
-    // [TBO-CERT-DIAG] TEMPORARY: capture incoming book request for cert verification
-    console.log('[BOOK-DIAG] === Incoming /book request ===');
-    console.log('[BOOK-DIAG] Headers:', JSON.stringify({
-      'user-agent': req.headers['user-agent'],
-      'content-type': req.headers['content-type'],
-      'authorization': req.headers['authorization'] ? '[PRESENT]' : '[ABSENT]',
-      'x-workspace-id': req.headers['x-workspace-id'] || '[ABSENT]',
-    }));
-    console.log('[BOOK-DIAG] User context:', JSON.stringify({
-      userId: (req as any).user?._id,
-      workspaceId: (req as any).workspace?._id,
-      role: (req as any).user?.role,
-    }));
-    console.log('[BOOK-DIAG] Body keys:', Object.keys(req.body || {}));
-    console.log('[BOOK-DIAG] BookingMode:', req.body?.bookingMode);
-    const _diagRooms: any[] = req.body?.HotelRoomsDetails || (req.body?.Guests ? [{ Guests: req.body.Guests }] : []);
-    console.log('[BOOK-DIAG] Rooms count:', _diagRooms.length);
-    _diagRooms.forEach((room: any, ri: number) => {
-      const guests: any[] = room?.Guests ?? room?.HotelPassenger ?? [];
-      console.log(`[BOOK-DIAG] Room ${ri}: ${guests.length} guests`);
-      guests.forEach((g: any, gi: number) => {
-        const ph = g.Phone ? g.Phone.substring(0, 3) + '...' + g.Phone.substring(g.Phone.length - 2) : 'EMPTY';
-        console.log(`[BOOK-DIAG]   Guest ${gi}: PaxType=${g.PaxType}, LeadPassenger=${g.LeadPassenger}, FN="${String(g.FirstName || '').substring(0, 3)}", Phone="${ph}", Phoneno="${g.Phoneno ? '[PRESENT]' : 'EMPTY'}", Email="${g.Email ? '[PRESENT]' : 'EMPTY'}"`);
-      });
-    });
-    console.log('[BOOK-DIAG] ValidationFlags:', JSON.stringify(req.body?.ValidationFlags ?? {}));
-    // [/TBO-CERT-DIAG]
-
     const {
       BookingCode,
       GuestNationality: _reqNationality,
@@ -1397,17 +1412,12 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       gstInfo: req.body?.gstInfo,
     });
     if (_valErrors.length > 0) {
-      // [TBO-CERT-DIAG] TEMPORARY
-      console.log('[BOOK-DIAG] === Validation FAILED ===');
-      console.log('[BOOK-DIAG] Errors:', JSON.stringify(_valErrors, null, 2));
-      console.log('[BOOK-DIAG] === END Validation Failed ===');
-      // [/TBO-CERT-DIAG]
       return res.status(400).json({ error: _valErrors[0].message, errors: _valErrors, valid: false });
     }
 
     // Design C: per-room passenger builder — children auto-generated, adults fully mapped.
     // Children must NOT carry PAN/Phoneno/Email/PassportNo keys (TBO Op Rule 2: omit, not null).
-    const buildRoomPassengers = (room: any, roomIndex: number): Record<string, unknown>[] => {
+    const buildRoomPassengers = (room: any, roomIndex: number, primaryContact: { phone: string; email: string }): Record<string, unknown>[] => {
       const roomGuests: any[] = room.Guests ?? room.HotelPassenger ?? [];
       const leadAdult = roomGuests.find((g: any) => Number(g.PaxType) === 1 && g.LeadPassenger)
         ?? roomGuests.find((g: any) => Number(g.PaxType) === 1);
@@ -1432,6 +1442,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         // Adult passenger
         // Item 1: normalizeTitle strips trailing period (TBO spec: Mr/Mrs/Ms not Mr./Mrs./Ms.)
         // Item 2: Phoneno/Email omitted entirely when empty (TBO rejects empty-string contact fields)
+        const isRoomLead = g === leadAdult;
         const base: Record<string, unknown> = {
           Title: normalizeTitle(g.Title || "Mr"),
           FirstName: String(g.FirstName || "").trim().substring(0, 25),
@@ -1439,11 +1450,13 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           MiddleName: "",
           Nationality: GuestNationality,
           PaxType: 1,
-          LeadPassenger: g.LeadPassenger || false,
+          LeadPassenger: isRoomLead,
           Age: 0,
         };
-        if (g.Phone) base.Phoneno = g.Phone;
-        if (g.Email) base.Email = g.Email;
+        const phoneToUse = String(g.Phone || g.Phoneno || "").trim() || (isRoomLead ? primaryContact.phone : "");
+        const emailToUse = String(g.Email || "").trim() || (isRoomLead ? primaryContact.email : "");
+        if (phoneToUse) base.Phoneno = phoneToUse;
+        if (emailToUse) base.Email = emailToUse;
 
         if (passportMandatory) {
           base.PassportNo = g.PassportNo || "";
@@ -1473,11 +1486,14 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       });
     };
 
+    const primaryContactForPayload = getPrimaryLeadContact(
+      req.body.HotelRoomsDetails ?? (Guests ? [{ Guests }] : [])
+    );
     const HotelRoomsDetails = req.body.HotelRoomsDetails
       ? (req.body.HotelRoomsDetails as any[]).map((room: any, roomIdx: number) => ({
-          HotelPassenger: buildRoomPassengers(room, roomIdx),
+          HotelPassenger: buildRoomPassengers(room, roomIdx, primaryContactForPayload),
         }))
-      : [{ HotelPassenger: buildRoomPassengers({ Guests: Guests || [] }, 0) }];
+      : [{ HotelPassenger: buildRoomPassengers({ Guests: Guests || [] }, 0, primaryContactForPayload) }];
 
     // GAP-02: implication-rule sanity check — spec says PackageDetailsMandatory:true implies IsPackageFare:true.
     // Log warning if we see PackageDetailsMandatory (signalled by ArrivalTransport present) without IsPackageFare.
@@ -2077,12 +2093,6 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       message: `Booking status unknown. Please contact Plumtrips support with reference: ${clientRef}`,
     });
   } catch (err: unknown) {
-    // [TBO-CERT-DIAG] TEMPORARY
-    console.log('[BOOK-DIAG] === Exception in /book ===');
-    console.log('[BOOK-DIAG] Error:', err instanceof Error ? err.message : String(err));
-    console.log('[BOOK-DIAG] Stack:', err instanceof Error ? (err.stack?.substring(0, 500) ?? '') : '');
-    console.log('[BOOK-DIAG] === END Exception ===');
-    // [/TBO-CERT-DIAG]
     const msg = err instanceof Error ? err.message : "Hotel booking failed";
     sbtLogger.error("Hotel booking failed", { userId: req.user?.id, error: msg });
     if (clientRef) {
