@@ -563,6 +563,10 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       const { startOrphanPendingCleanupCron } = await import("./jobs/orphan-pending-cleanup.js");
       startOrphanPendingCleanupCron();
 
+      // TICKETING: Auto-ingest Gmail → tickets (every 60s)
+      const { startTicketIngestionCron } = await import("./jobs/ticketIngestionCron.js");
+      startTicketIngestionCron();
+
       const server = app.listen(env.PORT, () => {
         logger.info("API running", { port: env.PORT });
       });
