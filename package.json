@@ -8,7 +8,7 @@
     "dev": "tsx watch src/server.ts",
     "dev:test": "node --env-file=.env.test --import tsx src/server.ts",
     "postinstall": "npx puppeteer browsers install chrome",
-    "build": "npx puppeteer browsers install chrome && node --max-old-space-size=4096 ./node_modules/.bin/tsc -p tsconfig.json && cp -r src/data dist/",
+    "build": "npx puppeteer browsers install chrome && NODE_OPTIONS=--max-old-space-size=4096 tsc -p tsconfig.json && cp -r src/data dist/",
     "start": "node dist/server.js",
     "seed": "tsx src/seed/seed.ts",
     "test": "vitest",
