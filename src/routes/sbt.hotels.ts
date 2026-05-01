@@ -1659,6 +1659,8 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       // For hold bookings: Book response rarely includes LastVoucherDate.
       // Call GetBookingDetail immediately to retrieve it and store PaxIds for PAN-at-voucher-time.
       let holdPaxDetails: Array<{ paxId: string; firstName: string; lastName: string; paxType: number }> = [];
+      let holdTboReferenceNo: string | null = null;
+      let holdRoomDescription: string | null = null;
       if (isHeld && result?.BookingId) {
         try {
           const details = await verifyBookingStatus(Number(result.BookingId));
@@ -1681,6 +1683,10 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
               lastName: p.LastName || "",
               paxType: Number(p.PaxType) || 1,
             }));
+          holdTboReferenceNo = details?.TBOReferenceNo || null;
+          holdRoomDescription =
+            details?.HotelRoomsDetails?.[0]?.RoomDescription ||
+            details?.HotelRoomsDetails?.[0]?.RoomTypeName || null;
         } catch (detailErr) {
           console.debug('[HOLD-BOOK] GetBookingDetail failed:', detailErr instanceof Error ? detailErr.message : String(detailErr));
         }
@@ -1712,6 +1718,8 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             // POST-001: store PaxIds and PAN requirement for generate-voucher-with-PAN flow.
             ...(isHeld && holdPaxDetails.length > 0 ? { paxDetails: holdPaxDetails } : {}),
             ...(isHeld ? { panMandatory: !!panMandatory } : {}),
+            ...(isHeld && holdTboReferenceNo ? { tboReferenceNo: holdTboReferenceNo, bookingDetailFetched: true, bookingDetailFetchedAt: new Date() } : {}),
+            ...(isHeld && holdRoomDescription ? { roomDescription: holdRoomDescription } : {}),
           }},
         );
       } catch { /* non-fatal — booking succeeded; DB update is best-effort */ }
