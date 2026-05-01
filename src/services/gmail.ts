@@ -230,7 +230,7 @@ export async function sendReply(opts: SendReplyOptions): Promise<SendReplyResult
       "",
       `--${boundary}`,
       "Content-Type: text/html; charset=UTF-8",
-      "Content-Transfer-Encoding: quoted-printable",
+      "Content-Transfer-Encoding: 8bit",
       "",
       htmlBody,
     ];

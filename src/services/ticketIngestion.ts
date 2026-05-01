@@ -228,7 +228,7 @@ export async function ingestEmailToTicket(
       try {
         const ackResult = await sendReply({
           threadId: parsed.threadId,
-          inReplyToRfcId: parsed.messageId,
+          inReplyToRfcId: normalizeRfcId(parsed.messageId) || "",
           referencesChain: [],
           to: replyTo,
           subject: parsed.subject,
