@@ -447,6 +447,14 @@ app.use("/api/admin/payment-orphans", adminPaymentOrphansRouter);
 import adminSessionsRouter from "./routes/admin.sessions.js";
 app.use("/api/admin/sessions", adminSessionsRouter);
 
+// Ticketing — manual ingest trigger (SUPERADMIN only)
+import ticketsAdminRouter from "./routes/tickets.admin.js";
+app.use("/api/admin/tickets", ticketsAdminRouter);
+
+// Ticketing — agent console (list, detail, reply, status, assign, tags)
+import ticketsConsoleRouter from "./routes/tickets.console.js";
+app.use("/api/admin/tickets", ticketsConsoleRouter);
+
 // Invoices, Reports, Company Settings (admin-only via router-level requireAdmin)
 import invoicesRouter, { workspaceRouter as invoicesWorkspaceRouter } from "./routes/invoices.js";
 import reportsRouter from "./routes/reports.js";
