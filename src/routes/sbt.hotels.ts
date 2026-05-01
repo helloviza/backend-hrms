@@ -1265,6 +1265,34 @@ router.post("/payment/verify", requireAuth, async (req: any, res: any) => {
 router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) => {
   let clientRef = "";
   try {
+    // [TBO-CERT-DIAG] TEMPORARY: capture incoming book request for cert verification
+    console.log('[BOOK-DIAG] === Incoming /book request ===');
+    console.log('[BOOK-DIAG] Headers:', JSON.stringify({
+      'user-agent': req.headers['user-agent'],
+      'content-type': req.headers['content-type'],
+      'authorization': req.headers['authorization'] ? '[PRESENT]' : '[ABSENT]',
+      'x-workspace-id': req.headers['x-workspace-id'] || '[ABSENT]',
+    }));
+    console.log('[BOOK-DIAG] User context:', JSON.stringify({
+      userId: (req as any).user?._id,
+      workspaceId: (req as any).workspace?._id,
+      role: (req as any).user?.role,
+    }));
+    console.log('[BOOK-DIAG] Body keys:', Object.keys(req.body || {}));
+    console.log('[BOOK-DIAG] BookingMode:', req.body?.bookingMode);
+    const _diagRooms: any[] = req.body?.HotelRoomsDetails || (req.body?.Guests ? [{ Guests: req.body.Guests }] : []);
+    console.log('[BOOK-DIAG] Rooms count:', _diagRooms.length);
+    _diagRooms.forEach((room: any, ri: number) => {
+      const guests: any[] = room?.Guests ?? room?.HotelPassenger ?? [];
+      console.log(`[BOOK-DIAG] Room ${ri}: ${guests.length} guests`);
+      guests.forEach((g: any, gi: number) => {
+        const ph = g.Phone ? g.Phone.substring(0, 3) + '...' + g.Phone.substring(g.Phone.length - 2) : 'EMPTY';
+        console.log(`[BOOK-DIAG]   Guest ${gi}: PaxType=${g.PaxType}, LeadPassenger=${g.LeadPassenger}, FN="${String(g.FirstName || '').substring(0, 3)}", Phone="${ph}", Phoneno="${g.Phoneno ? '[PRESENT]' : 'EMPTY'}", Email="${g.Email ? '[PRESENT]' : 'EMPTY'}"`);
+      });
+    });
+    console.log('[BOOK-DIAG] ValidationFlags:', JSON.stringify(req.body?.ValidationFlags ?? {}));
+    // [/TBO-CERT-DIAG]
+
     const {
       BookingCode,
       GuestNationality: _reqNationality,
@@ -1369,6 +1397,11 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       gstInfo: req.body?.gstInfo,
     });
     if (_valErrors.length > 0) {
+      // [TBO-CERT-DIAG] TEMPORARY
+      console.log('[BOOK-DIAG] === Validation FAILED ===');
+      console.log('[BOOK-DIAG] Errors:', JSON.stringify(_valErrors, null, 2));
+      console.log('[BOOK-DIAG] === END Validation Failed ===');
+      // [/TBO-CERT-DIAG]
       return res.status(400).json({ error: _valErrors[0].message, errors: _valErrors, valid: false });
     }
 
@@ -2044,6 +2077,12 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       message: `Booking status unknown. Please contact Plumtrips support with reference: ${clientRef}`,
     });
   } catch (err: unknown) {
+    // [TBO-CERT-DIAG] TEMPORARY
+    console.log('[BOOK-DIAG] === Exception in /book ===');
+    console.log('[BOOK-DIAG] Error:', err instanceof Error ? err.message : String(err));
+    console.log('[BOOK-DIAG] Stack:', err instanceof Error ? (err.stack?.substring(0, 500) ?? '') : '');
+    console.log('[BOOK-DIAG] === END Exception ===');
+    // [/TBO-CERT-DIAG]
     const msg = err instanceof Error ? err.message : "Hotel booking failed";
     sbtLogger.error("Hotel booking failed", { userId: req.user?.id, error: msg });
     if (clientRef) {
