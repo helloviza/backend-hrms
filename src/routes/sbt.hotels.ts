@@ -371,22 +371,35 @@ function validateBookingCriteria(p: BookingValidationPayload): ValidationError[]
   }
 
   // ── Rule 4: Adult PAN — format + count (GAP-09c) ──
+  // Industry norm: PAN is collected from the booker (lead guest), not every adult.
+  // TBO's PanCountRequired tells us how many unique PANs the booking needs (typically 1).
   const panMandatoryV = vf.PanMandatory === true;
   const panCountRequiredV = Number(vf.PanCountRequired ?? 0);
+
+  // Format validation — if any adult provided a PAN, it must be valid
   if (isDomestic && panMandatoryV) {
     for (const { g, ri, pi } of adults) {
       const pan = String(g?.PAN || "").trim().toUpperCase();
-      if (!pan) {
-        errors.push({ field: fp(ri, pi, "PAN"), code: "PAN_REQUIRED", message: "PAN is required for each adult guest on this booking." });
-      } else if (!/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) {
-        errors.push({ field: fp(ri, pi, "PAN"), code: "PAN_FORMAT_INVALID", message: "Please enter a valid PAN number (format: AAAAA9999A)." });
+      if (pan && !/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) {
+        errors.push({ field: fp(ri, pi, "PAN"), code: "PAN_FORMAT_INVALID", message: "Please enter a valid PAN number (format: AAAAA1234A)." });
       }
     }
   }
-  if (isDomestic && panCountRequiredV > 0) {
-    const uniquePANs = new Set(adults.map(({ g }) => String(g?.PAN || "").trim().toUpperCase()).filter(Boolean));
+
+  // Count validation — booking must have at least PanCountRequired unique valid PANs
+  if (isDomestic && panMandatoryV && panCountRequiredV > 0) {
+    const validPANs = adults
+      .map(({ g }) => String(g?.PAN || "").trim().toUpperCase())
+      .filter((pan: string) => pan && /^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan));
+    const uniquePANs = new Set(validPANs);
     if (uniquePANs.size < panCountRequiredV) {
-      errors.push({ field: "passengers.PAN", code: "PAN_COUNT_INSUFFICIENT", message: `${panCountRequiredV} unique PAN(s) required, but only ${uniquePANs.size} provided.` });
+      errors.push({
+        field: "passengers.PAN",
+        code: "PAN_COUNT_INSUFFICIENT",
+        message: panCountRequiredV === 1
+          ? "PAN of the lead guest is required for this booking."
+          : `${panCountRequiredV} unique valid PANs are required for this booking; only ${uniquePANs.size} provided.`,
+      });
     }
   }
 
