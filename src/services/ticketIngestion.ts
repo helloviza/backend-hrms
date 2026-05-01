@@ -11,6 +11,12 @@ import { shouldSkipIngestionEntirely, shouldSendAutoAck } from "./ticketEmailFil
 import { buildAutoAckHtml } from "../utils/ticketAutoAck.js";
 import logger from "../utils/logger.js";
 
+function normalizeRfcId(raw: string | null | undefined): string | undefined {
+  const s = raw?.trim();
+  if (!s) return undefined;
+  return s.startsWith("<") ? s : `<${s}>`;
+}
+
 const GEMINI_EXTRACTION_PROMPT = `Extract booking request details from this email. Return JSON only:
 { "origin": "string or null", "destination": "string or null",
   "travelDate": "ISO date string or null", "returnDate": "ISO date string or null",
@@ -132,6 +138,11 @@ export async function ingestEmailToTicket(
     }),
   );
 
+  // [DIAG] — remove after debugging rfcMessageId
+  console.log("[DIAG] parsed.messageId:", JSON.stringify(parsed.messageId));
+  console.log("[DIAG] About to save with rfcMessageId:", normalizeRfcId(parsed.messageId));
+  // [/DIAG]
+
   // Create TicketMessage first (without attachmentRefs)
   const ticketMessage = await TicketMessage.create({
     ticketId: ticket._id,
@@ -145,6 +156,7 @@ export async function ingestEmailToTicket(
     bodyHtml: parsed.bodyHtml,
     bodyText: parsed.bodyText,
     gmailMessageId: parsed.gmailId || undefined,
+    rfcMessageId: normalizeRfcId(parsed.messageId),
     gmailThreadId: parsed.threadId || undefined,
     inReplyTo: parsed.inReplyTo || undefined,
     sentAt: new Date(),
@@ -214,16 +226,35 @@ export async function ingestEmailToTicket(
       const replyTo = parsed.fromEmail;
       const ackHtml = buildAutoAckHtml(ticket.ticketRef);
       try {
-        await sendReply(
-          parsed.threadId,
-          parsed.messageId,
-          replyTo,
-          parsed.subject,
-          ackHtml,
-        );
+        const ackResult = await sendReply({
+          threadId: parsed.threadId,
+          inReplyToRfcId: parsed.messageId,
+          referencesChain: [],
+          to: replyTo,
+          subject: parsed.subject,
+          htmlBody: ackHtml,
+        });
+        // Store auto-ack as OUTBOUND so future reply references chains include it
+        await TicketMessage.create({
+          ticketId: ticket._id,
+          direction: "OUTBOUND",
+          channel: "EMAIL",
+          fromEmail: process.env.TICKETING_INBOX_EMAIL || "booking@plumtrips.com",
+          toEmail: [replyTo],
+          subject: parsed.subject,
+          bodyHtml: ackHtml,
+          bodyText: "",
+          gmailMessageId: ackResult.gmailMessageId || undefined,
+          rfcMessageId: normalizeRfcId(ackResult.rfcMessageId),
+          gmailThreadId: parsed.threadId || undefined,
+          inReplyTo: parsed.messageId || undefined,
+          sentAt: new Date(),
+          deliveryStatus: "SENT",
+        });
         logger.info("[TicketIngestion] Auto-ack sent", {
           ticketRef: ticket.ticketRef,
           to: replyTo,
+          rfcMessageId: ackResult.rfcMessageId,
         });
       } catch (err) {
         logger.error("[TicketIngestion] Auto-ack send failed", { ticketRef: ticket.ticketRef, err });

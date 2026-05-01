@@ -12,6 +12,7 @@ export interface ITicketMessage extends Document {
   bodyHtml: string;
   bodyText: string;
   gmailMessageId?: string;
+  rfcMessageId?: string;
   gmailThreadId?: string;
   inReplyTo?: string;
   attachmentRefs: Schema.Types.ObjectId[];
@@ -35,6 +36,7 @@ const TicketMessageSchema = new Schema<ITicketMessage>(
     bodyHtml: { type: String, default: "" },
     bodyText: { type: String, default: "" },
     gmailMessageId: { type: String, unique: true, sparse: true },
+    rfcMessageId: { type: String, index: true, sparse: true },
     gmailThreadId: String,
     inReplyTo: String,
     attachmentRefs: [{ type: Schema.Types.ObjectId, ref: "TicketAttachment" }],

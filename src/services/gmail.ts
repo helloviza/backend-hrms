@@ -1,5 +1,6 @@
 import { google, type gmail_v1 } from "googleapis";
 import { JWT } from "google-auth-library";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import logger from "../utils/logger.js";
@@ -163,31 +164,94 @@ export async function markMessageAsProcessed(messageId: string): Promise<void> {
   }
 }
 
-export async function sendReply(
-  threadId: string,
-  inReplyTo: string,
-  to: string,
-  subject: string,
-  htmlBody: string,
-): Promise<{ messageId: string }> {
+export interface SendReplyAttachment {
+  filename: string;
+  mimeType: string;
+  content: Buffer;
+}
+
+export interface SendReplyOptions {
+  threadId: string;
+  inReplyToRfcId: string;
+  referencesChain: string[];
+  to: string;
+  subject: string;
+  htmlBody: string;
+  attachments?: SendReplyAttachment[];
+}
+
+export interface SendReplyResult {
+  gmailMessageId: string;
+  rfcMessageId: string;
+}
+
+export async function sendReply(opts: SendReplyOptions): Promise<SendReplyResult> {
+  const { threadId, inReplyToRfcId, referencesChain, to, subject, htmlBody, attachments } = opts;
+
   const gmail = initGmailClient();
   const fromAddress = process.env.TICKETING_INBOX_EMAIL || "booking@plumtrips.com";
   const from = `Plumtrips Concierge <${fromAddress}>`;
-  const replySubject = subject.startsWith("Re:") ? subject : `Re: ${subject}`;
+
+  // Strip any leading "Re:" stack to avoid "Re: Re: Re:" accumulation
+  const replySubject = "Re: " + subject.replace(/^(Re:\s*)+/i, "").trim();
   const date = new Date().toUTCString();
 
-  const mimeLines = [
+  // Build References chain: all prior RFC Message-IDs + inReplyToRfcId at end
+  const refsSet = referencesChain.filter(Boolean);
+  if (inReplyToRfcId && !refsSet.includes(inReplyToRfcId)) {
+    refsSet.push(inReplyToRfcId);
+  }
+  const references = refsSet.join(" ");
+
+  const headerLines = [
     "MIME-Version: 1.0",
     `From: ${from}`,
     `To: ${to}`,
     `Subject: ${replySubject}`,
-    `In-Reply-To: ${inReplyTo}`,
-    `References: ${inReplyTo}`,
+    ...(inReplyToRfcId ? [`In-Reply-To: ${inReplyToRfcId}`] : []),
+    ...(references ? [`References: ${references}`] : []),
     `Date: ${date}`,
-    "Content-Type: text/html; charset=UTF-8",
-    "",
-    htmlBody,
   ];
+
+  let mimeLines: string[];
+
+  if (!attachments || attachments.length === 0) {
+    mimeLines = [
+      ...headerLines,
+      "Content-Type: text/html; charset=UTF-8",
+      "",
+      htmlBody,
+    ];
+  } else {
+    const boundary = `==Plumtrips_${crypto.randomBytes(12).toString("hex")}==`;
+    mimeLines = [
+      ...headerLines,
+      `Content-Type: multipart/mixed; boundary="${boundary}"`,
+      "",
+      `--${boundary}`,
+      "Content-Type: text/html; charset=UTF-8",
+      "Content-Transfer-Encoding: quoted-printable",
+      "",
+      htmlBody,
+    ];
+
+    for (const att of attachments) {
+      const safeName = att.filename.replace(/"/g, "_");
+      const b64 = att.content.toString("base64");
+      // RFC 2045: base64 lines must be at most 76 chars
+      const b64Lines = b64.match(/.{1,76}/g) || [];
+      mimeLines.push(
+        `--${boundary}`,
+        `Content-Type: ${att.mimeType}; name="${safeName}"`,
+        `Content-Disposition: attachment; filename="${safeName}"`,
+        "Content-Transfer-Encoding: base64",
+        "",
+        ...b64Lines,
+      );
+    }
+
+    mimeLines.push(`--${boundary}--`);
+  }
 
   const raw = Buffer.from(mimeLines.join("\r\n"))
     .toString("base64")
@@ -195,15 +259,41 @@ export async function sendReply(
     .replace(/\//g, "_")
     .replace(/=+$/, "");
 
+  let newGmailId = "";
+  let rfcMessageId = "";
+
   try {
     const res = await gmail.users.messages.send({
       userId: "me",
       requestBody: { raw, threadId },
     });
-    logger.info("[Gmail] Reply sent", { to, subject: replySubject, threadId, gmailId: res.data.id });
-    return { messageId: res.data.id || "" };
+
+    newGmailId = res.data.id || "";
+    logger.info("[Gmail] Reply sent", { to, subject: replySubject, threadId, gmailId: newGmailId });
   } catch (err) {
     logger.error("[Gmail] sendReply failed", { to, subject: replySubject, threadId, err });
     throw err;
   }
+
+  // Fetch the RFC Message-ID of the sent message so callers can store it for threading
+  if (newGmailId) {
+    try {
+      const fetchRes = await gmail.users.messages.get({
+        userId: "me",
+        id: newGmailId,
+        format: "metadata",
+        metadataHeaders: ["Message-ID"],
+      });
+      const rawId =
+        (fetchRes.data.payload?.headers || [])
+          .find((h) => h.name?.toLowerCase() === "message-id")?.value || "";
+      const trimmedId = rawId.trim();
+      rfcMessageId = trimmedId && !trimmedId.startsWith("<") ? `<${trimmedId}>` : trimmedId;
+      logger.info("[Gmail] Captured rfcMessageId for sent reply", { gmailId: newGmailId, rfcMessageId });
+    } catch (err) {
+      logger.warn("[Gmail] Could not fetch rfcMessageId for sent reply", { newGmailId, err });
+    }
+  }
+
+  return { gmailMessageId: newGmailId, rfcMessageId };
 }
