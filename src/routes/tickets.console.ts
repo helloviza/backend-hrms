@@ -1,7 +1,8 @@
 import express from "express";
 import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
-import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { requirePermission } from "../middleware/requirePermission.js";
+import { UserPermission } from "../models/UserPermission.js";
 import Ticket from "../models/Ticket.js";
 import TicketMessage from "../models/TicketMessage.js";
 import TicketLead from "../models/TicketLead.js";
@@ -22,15 +23,9 @@ const upload = multer({
 const router = express.Router();
 
 router.use(requireAuth);
-router.use((req, res, next) => {
-  if (!isSuperAdmin(req)) {
-    return res.status(403).json({ success: false, error: "SUPERADMIN access required" });
-  }
-  next();
-});
 
 /* ── GET / — list tickets with filters ────────────────────────── */
-router.get("/", async (req, res) => {
+router.get("/", requirePermission("supportTickets", "READ"), async (req, res) => {
   try {
     const { status, priority, assignedTo, search, scope, page = 1, limit = 25, sort = "-createdAt" } = req.query;
     const userId = (req as any).user?._id || (req as any).user?.id;
@@ -116,7 +111,7 @@ function computeSlaInfo(ticket: any, now: Date): {
 }
 
 /* ── GET /dashboard — operational triage (must be before /:id) ── */
-router.get("/dashboard", async (req, res) => {
+router.get("/dashboard", requirePermission("supportTickets", "READ"), async (req, res) => {
   try {
     const now = new Date();
     const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -184,11 +179,13 @@ router.get("/dashboard", async (req, res) => {
         extractedRequestType: (t.extractedFields as any)?.requestType ?? null,
       }));
 
-    // Agent load: all staff users, include those with 0 open tickets
-    const agents = await User.find(
-      { roles: { $in: ["SUPERADMIN", "ADMIN", "HR", "OPS"] } },
-      "name email",
+    // Agent load: only users with supportTickets access
+    const agentPermDocs = await UserPermission.find(
+      { "modules.supportTickets.access": { $in: ["READ", "WRITE", "FULL"] } },
+      "userId",
     ).lean();
+    const agentUserIds = agentPermDocs.map((p) => p.userId);
+    const agents = await User.find({ _id: { $in: agentUserIds } }, "name email").lean();
 
     const agentLoad = await Promise.all(
       (agents as any[]).map(async (a) => {
@@ -242,13 +239,15 @@ router.get("/dashboard", async (req, res) => {
   }
 });
 
-/* ── GET /users — admin users for assign dropdown (must be before /:id) ── */
-router.get("/users", async (req, res) => {
+/* ── GET /users — assignable users for ticket console (must be before /:id) ── */
+router.get("/users", requirePermission("supportTickets", "READ"), async (req, res) => {
   try {
-    const users = await User.find(
-      { roles: { $in: ["SUPERADMIN", "ADMIN", "HR", "OPS"] } },
-      "name email roles",
+    const permDocs = await UserPermission.find(
+      { "modules.supportTickets.access": { $in: ["READ", "WRITE", "FULL"] } },
+      "userId",
     ).lean();
+    const userIds = permDocs.map((p) => p.userId);
+    const users = await User.find({ _id: { $in: userIds } }, "name email roles").lean();
     return res.json({ success: true, users });
   } catch (err) {
     logger.error("[TicketsConsole] users list error", { err });
@@ -257,7 +256,7 @@ router.get("/users", async (req, res) => {
 });
 
 /* ── GET /:id — ticket detail with messages ─────────────────────── */
-router.get("/:id", async (req, res) => {
+router.get("/:id", requirePermission("supportTickets", "READ"), async (req, res) => {
   try {
     const ticket = await Ticket.findById(req.params.id)
       .populate("assignedTo", "name email")
@@ -281,7 +280,7 @@ router.get("/:id", async (req, res) => {
 });
 
 /* ── POST /:id/reply — send reply or internal note ──────────────── */
-router.post("/:id/reply", upload, async (req, res) => {
+router.post("/:id/reply", requirePermission("supportTickets", "WRITE"), upload, async (req, res) => {
   try {
     const bodyHtml = req.body?.bodyHtml || "";
     const isInternalNote = req.body?.isInternalNote === "true" || req.body?.isInternalNote === true;
@@ -447,7 +446,7 @@ router.post("/:id/reply", upload, async (req, res) => {
 });
 
 /* ── PATCH /:id/status — change ticket status ─────────────────── */
-router.patch("/:id/status", async (req, res) => {
+router.patch("/:id/status", requirePermission("supportTickets", "WRITE"), async (req, res) => {
   try {
     const { status } = req.body;
     const userId = (req as any).user?._id || (req as any).user?.id;
@@ -484,7 +483,7 @@ router.patch("/:id/status", async (req, res) => {
 });
 
 /* ── PATCH /:id/assign — assign ticket to user ───────────────── */
-router.patch("/:id/assign", async (req, res) => {
+router.patch("/:id/assign", requirePermission("supportTickets", "WRITE"), async (req, res) => {
   try {
     const { userId: assignUserId } = req.body;
     const actorId = (req as any).user?._id || (req as any).user?.id;
@@ -526,7 +525,7 @@ router.patch("/:id/assign", async (req, res) => {
 });
 
 /* ── GET /:id/attachments/:attachmentId/download ─────────────── */
-router.get("/:id/attachments/:attachmentId/download", async (req, res) => {
+router.get("/:id/attachments/:attachmentId/download", requirePermission("supportTickets", "READ"), async (req, res) => {
   try {
     const att = await TicketAttachment.findOne({
       _id: req.params.attachmentId,
@@ -549,7 +548,7 @@ router.get("/:id/attachments/:attachmentId/download", async (req, res) => {
 });
 
 /* ── PATCH /:id/tags — update tags ─────────────────────────── */
-router.patch("/:id/tags", async (req, res) => {
+router.patch("/:id/tags", requirePermission("supportTickets", "WRITE"), async (req, res) => {
   try {
     const { tags } = req.body;
     const ticket = await Ticket.findByIdAndUpdate(

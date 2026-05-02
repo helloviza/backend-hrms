@@ -56,6 +56,8 @@ type ModulesTemplate = {
   travelSpend:       ModulePermission
   // Vendor universe
   vendorProfile:     ModulePermission
+  // Operations
+  supportTickets:    ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -94,6 +96,7 @@ const L1: ModulesTemplate = {
   approvals:         NONE,
   travelSpend:       NONE,
   vendorProfile:     NONE,
+  supportTickets:    NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -200,6 +203,7 @@ const L8: ModulesTemplate = {
   approvals:         FULL_ALL,
   travelSpend:       FULL_ALL,
   vendorProfile:     FULL_ALL,
+  supportTickets:    FULL_ALL,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -238,6 +242,7 @@ const VENDOR: ModulesTemplate = {
   approvals:         NONE,
   travelSpend:       READ_OWN,
   vendorProfile:     FULL_OWN,
+  supportTickets:    NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -276,6 +281,7 @@ const CUSTOMER_SBT: ModulesTemplate = {
   approvals:         NONE,
   travelSpend:       READ_WS,
   vendorProfile:     NONE,
+  supportTickets:    NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -314,6 +320,7 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   approvals:         WRITE_OWN,
   travelSpend:       READ_WS,
   vendorProfile:     NONE,
+  supportTickets:    NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
