@@ -123,13 +123,6 @@ export function parseEmail(gmailMsg: gmail_v1.Schema$Message): ParsedEmail {
     }
   }
 
-  // [DIAG] — remove after debugging rfcMessageId
-  console.log("[DIAG] Email headers:", JSON.stringify(headers, null, 2));
-  const msgIdHeader = headers.find((h) => h.name?.toLowerCase() === "message-id");
-  console.log("[DIAG] Found message-id header entry:", msgIdHeader);
-  console.log("[DIAG] getHeader result for message-id:", getHeader(headers, "message-id"));
-  // [/DIAG]
-
   return {
     fromEmail,
     fromName,

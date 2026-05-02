@@ -348,6 +348,169 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
   }
 });
 
+/* ── Bulk Generate (one invoice per booking) ────────────────────── */
+
+// POST /api/admin/invoices/bulk-generate
+router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  try {
+    const {
+      bookingIds,
+      invoiceDate,
+      dueDate,
+      notes,
+    } = req.body as {
+      bookingIds: string[];
+      invoiceDate?: string;
+      dueDate?: string;
+      notes?: string;
+      gstApplied?: boolean;
+    };
+
+    if (!Array.isArray(bookingIds) || !bookingIds.length) {
+      return res.status(400).json({ error: "bookingIds array is required" });
+    }
+
+    const resolvedInvoiceDate = invoiceDate ? new Date(invoiceDate) : new Date();
+    resolvedInvoiceDate.setHours(0, 0, 0, 0);
+
+    const resolvedDueDate = dueDate
+      ? new Date(dueDate)
+      : new Date(resolvedInvoiceDate.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+    // Auto-compute billing period from invoice date (e.g. "April 2026")
+    const billingPeriod = resolvedInvoiceDate.toLocaleDateString("en-IN", {
+      month: "long",
+      year: "numeric",
+    });
+
+    // Fetch all bookings upfront and validate same workspace
+    const allBookings = await ManualBooking.find({
+      _id: { $in: bookingIds.map((id) => new mongoose.Types.ObjectId(id)) },
+    }).lean();
+
+    if (allBookings.length !== bookingIds.length) {
+      return res.status(400).json({ error: "One or more booking IDs not found" });
+    }
+
+    const wsIds = [...new Set(allBookings.map((b: any) => b.workspaceId.toString()))];
+    if (wsIds.length > 1) {
+      return res.status(400).json({ error: "All bookings must belong to the same workspace" });
+    }
+
+    const wsId = wsIds[0];
+
+    // Resolve billing details once for the whole batch
+    const customer = await Customer.findById(wsId).lean() as any;
+    const resolvedWorkspace = await CustomerWorkspace.findOne({ customerId: wsId }).lean();
+    const invoiceWorkspaceId = resolvedWorkspace?._id ?? wsId;
+
+    const companySettings = await getCompanySettings();
+    const issuerState = companySettings.state || process.env.COMPANY_STATE || "";
+
+    const cust = customer || {};
+    const clientDetails = {
+      companyName:    cust.legalName || cust.companyName || cust.name || "",
+      gstin:          cust.gstNumber || cust.gstin || "",
+      billingAddress: cust.registeredAddress || cust.billingAddress || "",
+      contactPerson:  cust.contacts?.primaryContact || cust.contacts?.keyContacts?.[0]?.name || "",
+      email:          cust.contacts?.officialEmail || cust.email || "",
+      state:          "",
+    };
+
+    const issuerDetails = {
+      companyName: companySettings.companyName || process.env.COMPANY_NAME,
+      gstin:       companySettings.gstin       || process.env.COMPANY_GSTIN,
+      address:     companySettings.address     || process.env.COMPANY_ADDRESS,
+      email:       companySettings.email       || process.env.COMPANY_EMAIL,
+      phone:       companySettings.phone       || process.env.COMPANY_PHONE,
+      website:     companySettings.website     || process.env.COMPANY_WEBSITE,
+      state:       issuerState,
+    };
+
+    const clientState = clientDetails.state;
+    const supplyType =
+      issuerState && clientState && issuerState.toLowerCase() === clientState.toLowerCase()
+        ? "CGST_SGST"
+        : "IGST";
+
+    const generated: { bookingId: string; invoiceId: string; invoiceNo: string }[] = [];
+    const failed: { bookingId: string; bookingRef: string; error: string }[] = [];
+
+    // Process bookings SEQUENTIALLY to maintain invoice number order
+    for (const booking of allBookings as any[]) {
+      const bookingId = booking._id.toString();
+
+      // Per-booking validation
+      if (booking.invoiceId) {
+        failed.push({ bookingId, bookingRef: booking.bookingRef, error: "Already invoiced" });
+        continue;
+      }
+      if (booking.status === "INVOICED") {
+        failed.push({ bookingId, bookingRef: booking.bookingRef, error: "Status is already INVOICED" });
+        continue;
+      }
+      if (booking.status === "CANCELLED") {
+        failed.push({ bookingId, bookingRef: booking.bookingRef, error: "Booking is CANCELLED" });
+        continue;
+      }
+
+      try {
+        const lineItems = buildLineItemsForBooking(booking);
+
+        const subtotal = lineItems.reduce((s: number, li: any) => s + (li.amount ?? 0), 0);
+        const totalGST = lineItems.reduce((s: number, li: any) => s + (li.igst ?? 0), 0);
+
+        const gstMode = booking.pricing?.gstMode || "ON_MARKUP";
+        const grandTotal = parseFloat(
+          (gstMode === "ON_MARKUP"
+            ? (booking.pricing?.quotedPrice ?? 0)
+            : (booking.pricing?.grandTotal ?? ((booking.pricing?.quotedPrice ?? 0) + (booking.pricing?.gstAmount ?? 0)))
+          ).toFixed(2),
+        );
+
+        const invoice = await Invoice.create({
+          workspaceId: invoiceWorkspaceId,
+          billingPeriod,
+          bookingIds: [booking._id],
+          subtotal: parseFloat(subtotal.toFixed(2)),
+          totalGST: parseFloat(totalGST.toFixed(2)),
+          grandTotal,
+          supplyType,
+          issuerState,
+          clientState,
+          issuerDetails,
+          clientDetails,
+          notes: notes || undefined,
+          invoiceDate: resolvedInvoiceDate,
+          dueDate: resolvedDueDate,
+          createdBy: req.user._id,
+        });
+
+        // Store lineItems bypassing mongoose validation (same pattern as /generate)
+        await Invoice.collection.updateOne(
+          { _id: invoice._id },
+          { $set: { lineItems } },
+        );
+
+        await ManualBooking.updateOne(
+          { _id: booking._id },
+          { $set: { status: "INVOICED", invoiceId: invoice._id, invoiceRaisedDate: new Date() } },
+        );
+
+        generated.push({ bookingId, invoiceId: invoice._id.toString(), invoiceNo: invoice.invoiceNo });
+      } catch (err: any) {
+        console.error(`[Invoices bulk-generate] booking ${booking.bookingRef}:`, err.message);
+        failed.push({ bookingId, bookingRef: booking.bookingRef, error: err.message });
+      }
+    }
+
+    res.status(201).json({ ok: true, generated, failed });
+  } catch (err: any) {
+    console.error("[Invoices bulk-generate]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* ── List ─────────────────────────────────────────────────────────── */
 
 // GET /api/admin/invoices
