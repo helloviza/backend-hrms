@@ -159,8 +159,8 @@ const modulesSchema = new Schema(
 
     // Sales CRM
     leads: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
-    crmContacts: { type: modulePermissionSchema, default: () => ({}) },
-    crmCompanies: { type: modulePermissionSchema, default: () => ({}) },
+    crmContacts: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    crmCompanies: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
   },
   { _id: false }
 )
