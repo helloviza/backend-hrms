@@ -1,5 +1,6 @@
 import mongoose, { Schema, model, type Document } from "mongoose";
 import Counter from "./Counter.js";
+import { getCompanySettings } from "./CompanySettings.js";
 
 export interface ITicket extends Document {
   ticketRef: string;
@@ -70,19 +71,36 @@ TicketSchema.index({ status: 1, assignedTo: 1 });
 TicketSchema.pre("save", async function (next) {
   if (!this.isNew || this.ticketRef) return next();
   try {
+    const settings = await getCompanySettings();
+    const prefix = settings?.ticketPrefix || "PT";
+    const width = settings?.ticketSeqWidth || 3;
+    const startNum = settings?.ticketStartNumber || 1;
+
     const now = new Date();
     const yy = String(now.getFullYear()).slice(-2);
     const mm = String(now.getMonth() + 1).padStart(2, "0");
-    const dd = String(now.getDate()).padStart(2, "0");
-    const dateCode = `${yy}${mm}${dd}`;
+    const monthCode = `${yy}${mm}`;
+    const counterKey = `ticket:${monthCode}`;
 
     const counter = await Counter.findByIdAndUpdate(
-      `ticket:${dateCode}`,
+      counterKey,
       { $inc: { seq: 1 } },
       { new: true, upsert: true },
     );
 
-    this.ticketRef = `PT-BR-${dateCode}-${String(counter!.seq).padStart(3, "0")}`;
+    let seq = counter!.seq;
+
+    // First ticket of a new month: bump seq up to startNum if below it
+    if (seq < startNum) {
+      const adjusted = await Counter.findByIdAndUpdate(
+        counterKey,
+        { $max: { seq: startNum } },
+        { new: true },
+      );
+      seq = adjusted!.seq;
+    }
+
+    this.ticketRef = `${prefix}${monthCode}${String(seq).padStart(width, "0")}`;
     next();
   } catch (err) {
     next(err as Error);

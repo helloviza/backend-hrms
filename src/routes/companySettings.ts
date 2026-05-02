@@ -56,6 +56,23 @@ router.put("/", requirePermission("companySettings", "WRITE"), async (req: any, 
       );
     }
 
+    // Wire ticketStartNumber to the atomic Counter so it takes effect on next ticket
+    if (typeof body.ticketStartNumber === "number" && body.ticketStartNumber > 0) {
+      const now = new Date();
+      const yy = String(now.getFullYear()).slice(-2);
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const monthCode = `${yy}${mm}`;
+      const counterKey = `ticket:${monthCode}`;
+      // targetFloor = startNumber - 1: next $inc produces exactly startNumber
+      // $max ensures we never move the counter backward (no duplicate risk)
+      const targetFloor = body.ticketStartNumber - 1;
+      await Counter.findByIdAndUpdate(
+        counterKey,
+        { $max: { seq: targetFloor } },
+        { upsert: true, new: true },
+      );
+    }
+
     res.json({ ok: true, settings });
   } catch (err: any) {
     console.error("[CompanySettings PUT]", err.message);

@@ -455,6 +455,10 @@ app.use("/api/admin/tickets", ticketsAdminRouter);
 import ticketsConsoleRouter from "./routes/tickets.console.js";
 app.use("/api/admin/tickets", ticketsConsoleRouter);
 
+// Email templates (workspace-scoped, supportTickets permission)
+import emailTemplatesRouter from "./routes/emailTemplates.js";
+app.use("/api/admin/email-templates", emailTemplatesRouter);
+
 // Invoices, Reports, Company Settings (admin-only via router-level requireAdmin)
 import invoicesRouter, { workspaceRouter as invoicesWorkspaceRouter } from "./routes/invoices.js";
 import reportsRouter from "./routes/reports.js";

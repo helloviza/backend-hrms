@@ -220,6 +220,11 @@ export async function ingestEmailToTicket(
       });
     } else {
       const replyTo = parsed.fromEmail;
+      const ticketingEmail = (process.env.TICKETING_INBOX_EMAIL || "booking@plumtrips.com").toLowerCase();
+      const replyCc = [...parsed.to, ...parsed.cc]
+        .filter((addr) => addr !== replyTo)
+        .filter((addr) => addr !== ticketingEmail)
+        .filter((addr, i, arr) => arr.indexOf(addr) === i);
       const ackHtml = buildAutoAckHtml(ticket.ticketRef);
       const fullAckBody = buildQuotedBody(ackHtml, [{
         fromName: parsed.fromName || parsed.fromEmail.split("@")[0],
@@ -233,6 +238,7 @@ export async function ingestEmailToTicket(
           inReplyToRfcId: normalizeRfcId(parsed.messageId) || "",
           referencesChain: [],
           to: replyTo,
+          cc: replyCc,
           subject: parsed.subject,
           htmlBody: fullAckBody,
         });
@@ -243,6 +249,7 @@ export async function ingestEmailToTicket(
           channel: "EMAIL",
           fromEmail: process.env.TICKETING_INBOX_EMAIL || "booking@plumtrips.com",
           toEmail: [replyTo],
+          ccEmail: replyCc,
           subject: parsed.subject,
           bodyHtml: fullAckBody,
           bodyText: "",
