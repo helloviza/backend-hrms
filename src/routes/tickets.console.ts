@@ -279,6 +279,19 @@ router.get("/:id", requirePermission("supportTickets", "READ"), async (req, res)
   }
 });
 
+/* ── email helpers ──────────────────────────────────────────────── */
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function dedupeEmails(addrs: string[]): string[] {
+  const seen = new Set<string>();
+  return addrs.filter((a) => {
+    const lower = a.toLowerCase();
+    if (seen.has(lower)) return false;
+    seen.add(lower);
+    return true;
+  });
+}
+
 /* ── POST /:id/reply — send reply or internal note ──────────────── */
 router.post("/:id/reply", requirePermission("supportTickets", "WRITE"), upload, async (req, res) => {
   try {
@@ -353,6 +366,37 @@ router.post("/:id/reply", requirePermission("supportTickets", "WRITE"), upload, 
 
     const inReplyToRfcId = lastInbound?.rfcMessageId || "";
 
+    const ticketingEmail = (process.env.TICKETING_INBOX_EMAIL || "booking@plumtrips.com").toLowerCase();
+
+    // Validate agent-supplied recipients (if provided)
+    const rawTo = typeof req.body.to === "string" ? req.body.to.trim() : "";
+    const rawCc: string[] = Array.isArray(req.body.cc) ? req.body.cc.map(String) : [];
+    const rawBcc: string[] = Array.isArray(req.body.bcc) ? req.body.bcc.map(String) : [];
+
+    const allSupplied = [...(rawTo ? [rawTo] : []), ...rawCc, ...rawBcc];
+    const invalidAddrs = allSupplied.filter((a) => !EMAIL_REGEX.test(a));
+    if (invalidAddrs.length > 0) {
+      return res.status(400).json({ success: false, error: `Invalid email address(es): ${invalidAddrs.join(", ")}` });
+    }
+
+    const replyTo = rawTo || lastInbound?.fromEmail || ticket.fromEmail;
+
+    const derivedCc = lastInbound
+      ? [...(lastInbound.toEmail || []), ...(lastInbound.ccEmail || [])]
+          .map((a) => a.toLowerCase())
+          .filter((addr) => addr !== replyTo.toLowerCase())
+          .filter((addr) => addr !== ticketingEmail)
+          .filter((addr, i, arr) => arr.indexOf(addr) === i)
+      : [];
+
+    const replyCc = rawCc.length > 0
+      ? dedupeEmails(rawCc.map((a) => a.toLowerCase()).filter((a) => a !== replyTo.toLowerCase()))
+      : derivedCc;
+
+    const replyBcc = rawBcc.length > 0
+      ? dedupeEmails(rawBcc.map((a) => a.toLowerCase()).filter((a) => a !== replyTo.toLowerCase()))
+      : [];
+
     // Build references chain from all prior messages that have an RFC Message-ID
     const priorMessages = await TicketMessage.find({
       ticketId: ticket._id,
@@ -384,7 +428,9 @@ router.post("/:id/reply", requirePermission("supportTickets", "WRITE"), upload, 
           threadId: ticket.gmailThreadId,
           inReplyToRfcId,
           referencesChain,
-          to: ticket.fromEmail,
+          to: replyTo,
+          cc: replyCc,
+          bcc: replyBcc,
           subject: ticket.subject,
           htmlBody: htmlBodyWithQuote,
           attachments: uploadedFiles.map((f) => ({
@@ -410,7 +456,9 @@ router.post("/:id/reply", requirePermission("supportTickets", "WRITE"), upload, 
       direction: "OUTBOUND",
       channel: "EMAIL",
       fromEmail: userEmail,
-      toEmail: [ticket.fromEmail],
+      toEmail: [replyTo],
+      ccEmail: replyCc,
+      bccEmail: replyBcc,
       subject: ticket.subject,
       bodyHtml: htmlBodyWithQuote,
       bodyText: "",

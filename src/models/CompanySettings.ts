@@ -26,6 +26,10 @@ export interface ICompanySettings extends Document {
   accountManagerEmail?: string;
   // Invoice Numbering
   invoiceStartNumber: number;
+  // Ticket Numbering
+  ticketPrefix: string;
+  ticketSeqWidth: number;
+  ticketStartNumber: number;
 }
 
 const CompanySettingsSchema = new Schema<ICompanySettings>(
@@ -49,6 +53,16 @@ const CompanySettingsSchema = new Schema<ICompanySettings>(
     opsEmail:            { type: String, default: "neelb@plumtrips.com", trim: true },
     accountManagerEmail: { type: String, default: "", trim: true },
     invoiceStartNumber:  { type: Number, default: 1 },
+    ticketPrefix: {
+      type: String,
+      default: "PT",
+      validate: {
+        validator: (v: string) => /^[A-Z]{2,10}$/.test(v),
+        message: "Ticket prefix must be 2-10 uppercase letters only",
+      },
+    },
+    ticketSeqWidth:      { type: Number, default: 3, enum: [3, 4, 5] },
+    ticketStartNumber:   { type: Number, default: 1, min: 1, max: 99999 },
   },
   { timestamps: true },
 );

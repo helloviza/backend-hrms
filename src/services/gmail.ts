@@ -175,6 +175,8 @@ export interface SendReplyOptions {
   inReplyToRfcId: string;
   referencesChain: string[];
   to: string;
+  cc?: string[];
+  bcc?: string[];
   subject: string;
   htmlBody: string;
   attachments?: SendReplyAttachment[];
@@ -186,7 +188,7 @@ export interface SendReplyResult {
 }
 
 export async function sendReply(opts: SendReplyOptions): Promise<SendReplyResult> {
-  const { threadId, inReplyToRfcId, referencesChain, to, subject, htmlBody, attachments } = opts;
+  const { threadId, inReplyToRfcId, referencesChain, to, cc, bcc, subject, htmlBody, attachments } = opts;
 
   const gmail = initGmailClient();
   const fromAddress = process.env.TICKETING_INBOX_EMAIL || "booking@plumtrips.com";
@@ -207,6 +209,8 @@ export async function sendReply(opts: SendReplyOptions): Promise<SendReplyResult
     "MIME-Version: 1.0",
     `From: ${from}`,
     `To: ${to}`,
+    ...(cc && cc.length > 0 ? [`Cc: ${cc.join(", ")}`] : []),
+    ...(bcc && bcc.length > 0 ? [`Bcc: ${bcc.join(", ")}`] : []),
     `Subject: ${replySubject}`,
     ...(inReplyToRfcId ? [`In-Reply-To: ${inReplyToRfcId}`] : []),
     ...(references ? [`References: ${references}`] : []),
