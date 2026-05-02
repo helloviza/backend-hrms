@@ -8,6 +8,7 @@ import TicketLead from "../models/TicketLead.js";
 import TicketAttachment from "../models/TicketAttachment.js";
 import User from "../models/User.js";
 import { sendReply } from "../services/gmail.js";
+import { buildQuotedBody } from "../utils/emailQuoteBuilder.js";
 import { uploadTicketAttachment } from "../services/ticketAttachments.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
@@ -360,6 +361,21 @@ router.post("/:id/reply", upload, async (req, res) => {
     }).sort({ sentAt: 1, createdAt: 1 }).select("rfcMessageId").lean();
     const referencesChain = priorMessages.map((m) => m.rfcMessageId).filter(Boolean) as string[];
 
+    // Build quoted body — embed the most recent email message as a blockquote trail
+    const lastEmailMsg = await TicketMessage.findOne({
+      ticketId: ticket._id,
+      channel: "EMAIL",
+    }).sort({ sentAt: -1, createdAt: -1 }).select("fromEmail bodyHtml sentAt").lean();
+
+    const htmlBodyWithQuote = lastEmailMsg
+      ? buildQuotedBody(bodyHtml, [{
+          fromName: lastEmailMsg.fromEmail.split("@")[0],
+          fromEmail: lastEmailMsg.fromEmail,
+          sentAt: (lastEmailMsg.sentAt as Date) || new Date(),
+          bodyHtml: lastEmailMsg.bodyHtml || "",
+        }])
+      : bodyHtml;
+
     let gmailMessageId = "";
     let rfcMessageId = "";
 
@@ -371,7 +387,7 @@ router.post("/:id/reply", upload, async (req, res) => {
           referencesChain,
           to: ticket.fromEmail,
           subject: ticket.subject,
-          htmlBody: bodyHtml,
+          htmlBody: htmlBodyWithQuote,
           attachments: uploadedFiles.map((f) => ({
             filename: f.originalname,
             mimeType: f.mimetype,
@@ -397,7 +413,7 @@ router.post("/:id/reply", upload, async (req, res) => {
       fromEmail: userEmail,
       toEmail: [ticket.fromEmail],
       subject: ticket.subject,
-      bodyHtml,
+      bodyHtml: htmlBodyWithQuote,
       bodyText: "",
       gmailMessageId: gmailMessageId || undefined,
       rfcMessageId: rfcMessageId || undefined,
