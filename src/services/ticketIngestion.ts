@@ -9,6 +9,7 @@ import { uploadTicketAttachment } from "./ticketAttachments.js";
 import { fetchAttachmentData, markMessageAsProcessed, sendReply } from "./gmail.js";
 import { shouldSkipIngestionEntirely, shouldSendAutoAck } from "./ticketEmailFilter.js";
 import { buildAutoAckHtml } from "../utils/ticketAutoAck.js";
+import { buildQuotedBody } from "../utils/emailQuoteBuilder.js";
 import logger from "../utils/logger.js";
 
 function normalizeRfcId(raw: string | null | undefined): string | undefined {
@@ -225,6 +226,12 @@ export async function ingestEmailToTicket(
     } else {
       const replyTo = parsed.fromEmail;
       const ackHtml = buildAutoAckHtml(ticket.ticketRef);
+      const fullAckBody = buildQuotedBody(ackHtml, [{
+        fromName: parsed.fromName || parsed.fromEmail.split("@")[0],
+        fromEmail: parsed.fromEmail,
+        sentAt: new Date(),
+        bodyHtml: parsed.bodyHtml || parsed.bodyText || "",
+      }]);
       try {
         const ackResult = await sendReply({
           threadId: parsed.threadId,
@@ -232,7 +239,7 @@ export async function ingestEmailToTicket(
           referencesChain: [],
           to: replyTo,
           subject: parsed.subject,
-          htmlBody: ackHtml,
+          htmlBody: fullAckBody,
         });
         // Store auto-ack as OUTBOUND so future reply references chains include it
         await TicketMessage.create({
@@ -242,7 +249,7 @@ export async function ingestEmailToTicket(
           fromEmail: process.env.TICKETING_INBOX_EMAIL || "booking@plumtrips.com",
           toEmail: [replyTo],
           subject: parsed.subject,
-          bodyHtml: ackHtml,
+          bodyHtml: fullAckBody,
           bodyText: "",
           gmailMessageId: ackResult.gmailMessageId || undefined,
           rfcMessageId: normalizeRfcId(ackResult.rfcMessageId),
