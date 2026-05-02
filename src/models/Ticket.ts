@@ -1,4 +1,5 @@
 import mongoose, { Schema, model, type Document } from "mongoose";
+import Counter from "./Counter.js";
 
 export interface ITicket extends Document {
   ticketRef: string;
@@ -70,16 +71,18 @@ TicketSchema.pre("save", async function (next) {
   if (!this.isNew || this.ticketRef) return next();
   try {
     const now = new Date();
-    const yyyy = now.getFullYear();
+    const yy = String(now.getFullYear()).slice(-2);
     const mm = String(now.getMonth() + 1).padStart(2, "0");
     const dd = String(now.getDate()).padStart(2, "0");
-    const datePrefix = `TKT-${yyyy}${mm}${dd}`;
+    const dateCode = `${yy}${mm}${dd}`;
 
-    const count = await (this.constructor as any).countDocuments({
-      ticketRef: { $regex: `^${datePrefix}-` },
-    });
+    const counter = await Counter.findByIdAndUpdate(
+      `ticket:${dateCode}`,
+      { $inc: { seq: 1 } },
+      { new: true, upsert: true },
+    );
 
-    this.ticketRef = `${datePrefix}-${String(count + 1).padStart(4, "0")}`;
+    this.ticketRef = `PT-BR-${dateCode}-${String(counter!.seq).padStart(3, "0")}`;
     next();
   } catch (err) {
     next(err as Error);

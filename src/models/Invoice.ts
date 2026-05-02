@@ -1,4 +1,5 @@
 import mongoose, { Schema, model, type Document } from "mongoose";
+import Counter from "./Counter.js";
 
 export interface IInvoiceLineItem {
   bookingRef: string;
@@ -108,30 +109,33 @@ InvoiceSchema.index({ workspaceId: 1, generatedAt: -1 });
 
 InvoiceSchema.pre("save", async function (next) {
   try {
-    console.log('[Invoice pre-save] isNew:', this.isNew);
-    console.log('[Invoice pre-save] lineItems type:', typeof this.lineItems);
-    console.log('[Invoice pre-save] lineItems isArray:', Array.isArray(this.lineItems));
-    console.log('[Invoice pre-save] lineItems[0]:', this.lineItems?.[0]);
-
     if (!this.isNew || this.invoiceNo) return next();
 
     const now = new Date();
-    const month = now.getMonth() + 1; // 1-12
+    const month = now.getMonth() + 1;
     const year = now.getFullYear();
     const fyStartYear = month >= 4 ? year : year - 1;
+    const fyKey = `invoice:FY${fyStartYear}`;
 
-    const prefix = `INV-${fyStartYear}`; // e.g. "INV-2026"
+    // Atomically claim the next sequence number
+    let counter = await Counter.findByIdAndUpdate(
+      fyKey,
+      { $inc: { seq: 1 } },
+      { new: true, upsert: true },
+    );
+    let nextSeq = counter!.seq;
 
-    const existingCount = await (this.constructor as any).countDocuments({
-      invoiceNo: { $regex: `^${prefix}` },
-    });
+    // FY 2026-27 minimum: if counter hasn't been seeded yet, catch up to 40
+    if (fyStartYear === 2026 && nextSeq < 40) {
+      const adjusted = await Counter.findByIdAndUpdate(
+        fyKey,
+        { $max: { seq: 40 } },
+        { new: true },
+      );
+      nextSeq = adjusted!.seq;
+    }
 
-    // One-time offset for FY 2026-27; all subsequent FYs start at 1
-    const startNumber = fyStartYear === 2026 ? 40 : 1;
-    const sequenceNumber = existingCount + startNumber;
-    this.invoiceNo = `${prefix}${String(sequenceNumber).padStart(4, "0")}`;
-    // Example: "INV-20260040"
-
+    this.invoiceNo = `INV-${fyStartYear}${String(nextSeq).padStart(4, "0")}`;
     next();
   } catch (err) {
     next(err as Error);

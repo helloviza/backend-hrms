@@ -139,11 +139,6 @@ export async function ingestEmailToTicket(
     }),
   );
 
-  // [DIAG] — remove after debugging rfcMessageId
-  console.log("[DIAG] parsed.messageId:", JSON.stringify(parsed.messageId));
-  console.log("[DIAG] About to save with rfcMessageId:", normalizeRfcId(parsed.messageId));
-  // [/DIAG]
-
   // Create TicketMessage first (without attachmentRefs)
   const ticketMessage = await TicketMessage.create({
     ticketId: ticket._id,
