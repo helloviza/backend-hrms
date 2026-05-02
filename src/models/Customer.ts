@@ -335,9 +335,27 @@ const CustomerSchema = new Schema(
     contactName: { type: String, trim: true },
 
     contactType: { type: String, trim: true },
+
+    /* ============================================================
+       DEDUP INDEX
+       ============================================================ */
+    legalNameNormalized: { type: String, index: true },
   },
   { timestamps: true }
 );
+
+// Keep legalNameNormalized in sync with the canonical business name.
+// The unique index on this field (created by the migration script) prevents
+// case-duplicate customer records from being inserted.
+CustomerSchema.pre("save", function (next) {
+  const raw =
+    (this as any).legalName ||
+    (this as any).companyName ||
+    (this as any).name ||
+    "";
+  (this as any).legalNameNormalized = raw.trim().replace(/\s+/g, " ").toLowerCase();
+  next();
+});
 
 CustomerSchema.methods.toJSON = function () {
   const obj: any = this.toObject();

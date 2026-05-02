@@ -1432,6 +1432,18 @@ router.post(
             customerId: dupCustomer._id,
           });
         }
+
+        // Case-insensitive name uniqueness check
+        const normalizedName = name.trim().replace(/\s+/g, " ").toLowerCase();
+        const dupByName = await Customer.findOne({ legalNameNormalized: normalizedName }).lean();
+        if (dupByName) {
+          return res.status(409).json({
+            error: "Customer with this business name already exists",
+            existingId: (dupByName as any)._id,
+            existingName: (dupByName as any).legalName || (dupByName as any).name,
+          });
+        }
+
         customer = await Customer.create(base);
       }
 

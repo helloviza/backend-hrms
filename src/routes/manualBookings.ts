@@ -11,6 +11,8 @@ import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import Customer from "../models/Customer.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
+import Invoice from "../models/Invoice.js";
+import User from "../models/User.js";
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -22,7 +24,15 @@ router.use(requireAuth);
 function buildSearchFilter(query: Record<string, any>) {
   const filter: Record<string, any> = {};
 
-  if (query.workspaceId) filter.workspaceId = query.workspaceId;
+  // Bug 5 fix: explicit ObjectId cast so the query is always typed correctly
+  if (query.workspaceId) {
+    try {
+      filter.workspaceId = new mongoose.Types.ObjectId(query.workspaceId);
+    } catch {
+      filter._id = { $in: [] }; // invalid id → force empty result
+    }
+  }
+
   if (query.status) filter.status = query.status;
   if (query.type) filter.type = query.type;
   if (query.source) filter.source = query.source;
@@ -32,10 +42,14 @@ function buildSearchFilter(query: Record<string, any>) {
   if (query.month) filter.bookingMonth = query.month;
   if (query.sourceBookingId) filter.sourceBookingId = query.sourceBookingId;
 
+  // createdBy is stored as a plain string (String(user._id))
+  if (query.createdBy) filter.createdBy = String(query.createdBy);
+
+  // Bug 1+2 fix: filter bookingDate (what the UI column shows), and include full last day
   if (query.dateFrom || query.dateTo) {
-    filter.travelDate = {};
-    if (query.dateFrom) filter.travelDate.$gte = new Date(query.dateFrom);
-    if (query.dateTo) filter.travelDate.$lte = new Date(query.dateTo);
+    filter.bookingDate = {};
+    if (query.dateFrom) filter.bookingDate.$gte = new Date(query.dateFrom);
+    if (query.dateTo)   filter.bookingDate.$lte = new Date(`${query.dateTo}T23:59:59.999Z`);
   }
 
   if (query.search) {
@@ -51,6 +65,19 @@ function buildSearchFilter(query: Record<string, any>) {
   }
 
   return filter;
+}
+
+// Bug 3 fix: async invoice-number filter applied after buildSearchFilter
+async function applyInvoiceFilter(filter: Record<string, any>, invoiceNo: string) {
+  const matches = await Invoice.find({
+    invoiceNo: { $regex: invoiceNo, $options: "i" },
+  }).select("_id").lean();
+  const ids = matches.map((inv: any) => inv._id);
+  if (ids.length === 0) {
+    filter._id = { $in: [] };
+  } else {
+    filter.invoiceId = { $in: ids };
+  }
 }
 
 function invoicePendingDays(b: any): number {
@@ -122,7 +149,8 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
   const wsName =
     wsNameMap[b.workspaceId?.toString() ?? ""] ||
     b.workspaceId?.name || b.workspaceId?.companyName || String(b.workspaceId ?? "");
-  const invDate = fmtDateDMY(b.invoiceRaisedDate);
+  const invoiceDocDate    = fmtDateDMY(b.invoiceId?.invoiceDate);  // Invoice document's issued date
+  const invoiceRaisedDate = fmtDateDMY(b.invoiceRaisedDate);       // booking-level raised date
   const invNo   = b.invoiceId?.invoiceNo ?? "";
   const invStatus = b.invoiceId?.status ?? "";
   const sector  =
@@ -139,7 +167,7 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
   return [
     srNo,
     wsName,
-    invDate,
+    invoiceDocDate,
     invNo,
     b.supplierName ?? "",
     fmtDateDMY(b.reqDate),
@@ -161,7 +189,7 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
     b.subStatus ?? "",
     b.priceBenefits ?? "",
     tat,
-    invDate,
+    invoiceRaisedDate,
     invStatus,
     invoicePendingDays(b),
     b.bookingWeek ? `Week ${b.bookingWeek}` : "",
@@ -202,7 +230,10 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
       filter.createdBy = String(req.user._id || req.user.id || req.user.sub);
     }
 
-    const [docs, total] = await Promise.all([
+    // Bug 3 fix: resolve invoice number to booking invoiceId
+    if (req.query.invoiceNo) await applyInvoiceFilter(filter, req.query.invoiceNo);
+
+    const [docs, total, statsAgg] = await Promise.all([
       ManualBooking.find(filter)
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
@@ -212,7 +243,19 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
         .populate("invoiceId", "invoiceNo status")
         .lean(),
       ManualBooking.countDocuments(filter),
+      // Bug 4 fix: aggregate over the full filtered set, not just the current page
+      ManualBooking.aggregate([
+        { $match: filter },
+        { $group: {
+          _id: null,
+          grossValue:      { $sum: "$pricing.quotedPrice" },
+          totalProfit:     { $sum: "$pricing.basePrice" },
+          pendingInvoices: { $sum: { $cond: [{ $ne: ["$status", "INVOICED"] }, 1, 0] } },
+        }},
+      ]),
     ]);
+
+    const aggStats = statsAgg[0] ?? { grossValue: 0, totalProfit: 0, pendingInvoices: 0 };
 
     // Resolve client names from Customer collection
     // (ManualBooking.workspaceId stores Customer._id, not CustomerWorkspace._id)
@@ -236,7 +279,19 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     }));
 
     console.log('[manualBookings GET] enriched[0].clientName:', enriched?.[0]?.clientName);
-    res.json({ ok: true, docs: enriched, total, page, pages: Math.ceil(total / limit) });
+    res.json({
+      ok: true,
+      docs: enriched,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
+      stats: {
+        totalBookings: total,
+        grossValue:      aggStats.grossValue,
+        totalProfit:     aggStats.totalProfit,
+        pendingInvoices: aggStats.pendingInvoices,
+      },
+    });
   } catch (err: any) {
     console.error("[ManualBookings GET list]", err.message);
     res.status(500).json({ error: err.message });
@@ -247,12 +302,13 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
 router.get("/export", requirePermission("manualBookings", "FULL"), async (req: any, res: any) => {
   try {
     const filter = buildSearchFilter(req.query);
+    if (req.query.invoiceNo) await applyInvoiceFilter(filter, req.query.invoiceNo);
     const format = req.query.format === "xlsx" ? "xlsx" : "csv";
     const docs = await ManualBooking.find(filter)
       .sort({ createdAt: -1 })
       .populate("bookedBy", "name email")
       .populate("workspaceId", "name companyName")
-      .populate("invoiceId", "invoiceNo status")
+      .populate("invoiceId", "invoiceNo status invoiceDate")
       .lean();
 
     // Build workspace name map via Customer (has legalName / companyName / name)
@@ -754,20 +810,18 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
     for (let i = 1; i < rows.length; i++) {
       const r = rows[i] as any[];
       if (!r.some(Boolean)) continue;
-      const n = cell(r, "clientname"); if (n) nameLookup.add(n.toLowerCase());
+      const n = cell(r, "clientname");
+      if (n) nameLookup.add(n.trim().replace(/\s+/g, " ").toLowerCase());
       const g = cell(r, "clientgstin"); if (g) gstinLookup.add(g.toUpperCase());
     }
 
     const clientMap: Record<string, string> = {};
     if (nameLookup.size) {
       const byName = await Customer.find({
-        $or: [
-          { legalName:   { $in: [...nameLookup].map((n) => new RegExp(`^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i")) } },
-          { companyName: { $in: [...nameLookup].map((n) => new RegExp(`^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i")) } },
-        ],
-      }).select("_id legalName companyName").lean() as any[];
+        legalNameNormalized: { $in: [...nameLookup] },
+      }).select("_id legalNameNormalized").lean() as any[];
       byName.forEach((c: any) => {
-        clientMap[(c.legalName || c.companyName || "").toLowerCase()] = c._id.toString();
+        if (c.legalNameNormalized) clientMap[c.legalNameNormalized] = c._id.toString();
       });
     }
     if (gstinLookup.size) {
@@ -835,7 +889,7 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
       const clientGstin = cell(r, "clientgstin").toUpperCase();
       const resolvedWs  =
         (clientGstin && clientMap[clientGstin]) ||
-        (clientName && clientMap[clientName.toLowerCase()]) || "";
+        (clientName && clientMap[clientName.trim().replace(/\s+/g, " ").toLowerCase()]) || "";
 
       if (!resolvedWs) {
         const ref = clientName || clientGstin;
@@ -941,6 +995,45 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
     res.json({ inserted, skipped, errors: commitErrors });
   } catch (err: any) {
     console.error("[ManualBookings import]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/manual-bookings/creators
+// Returns the distinct set of staff users who have created at least one booking
+router.get("/creators", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
+  try {
+    const raw = await ManualBooking.aggregate([
+      { $match: { createdBy: { $exists: true, $nin: [null, ""] } } },
+      { $group: { _id: "$createdBy", email: { $first: "$createdByEmail" } } },
+      { $match: { _id: { $nin: [null, ""] } } },
+      // Attempt to join to User for display name; createdBy is stored as String(ObjectId)
+      { $addFields: {
+        createdByObjId: {
+          $cond: {
+            if: { $regexMatch: { input: { $ifNull: ["$_id", ""] }, regex: "^[0-9a-fA-F]{24}$" } },
+            then: { $toObjectId: "$_id" },
+            else: null,
+          },
+        },
+      }},
+      { $lookup: {
+        from: "users",
+        localField: "createdByObjId",
+        foreignField: "_id",
+        as: "user",
+      }},
+      { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } },
+      { $project: {
+        _id: 1,
+        name:  { $ifNull: ["$user.name",  ""] },
+        email: { $ifNull: ["$user.email", "$email", ""] },
+      }},
+      { $sort: { email: 1 } },
+    ]);
+    res.json({ ok: true, creators: raw });
+  } catch (err: any) {
+    console.error("[ManualBookings creators]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
