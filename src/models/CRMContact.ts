@@ -39,7 +39,7 @@ const CRMContactSchema = new Schema<CRMContactDoc>(
     contactCode: { type: String, trim: true },
     firstName: { type: String, required: true, trim: true },
     lastName: { type: String, trim: true, default: "" },
-    jobTitle: { type: String, required: true, trim: true },
+    jobTitle: { type: String, trim: true, default: "" },
     phone: { type: String, required: true, trim: true },
     phone2: { type: String, trim: true, default: "" },
     email: { type: String, trim: true, default: "" },
