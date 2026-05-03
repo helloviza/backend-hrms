@@ -68,7 +68,8 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
     });
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
-    const pdfBuffer = await generateInvoicePdf(invoice as any);
+    const enrichedClient = await enrichClientDetails(invoice);
+    const pdfBuffer = await generateInvoicePdf({ ...invoice, clientDetails: enrichedClient } as any);
 
     const s3 = new S3Client({
       region: env.AWS_REGION,
@@ -129,6 +130,77 @@ function resolveCustomerState(cust: any): { state: string; country: string } {
     cust?.shippingAddress?.country ||
     "India";
   return { state, country };
+}
+
+function buildAddressStr(o: {
+  addressLine1?: string; addressLine2?: string;
+  city?: string; state?: string; country?: string; pincode?: string;
+}): string {
+  return [o.addressLine1, o.addressLine2, o.city, o.state, o.country, o.pincode]
+    .filter(Boolean).join(", ");
+}
+
+// Merges stored clientDetails snapshot with live Customer/Workspace data.
+// Snapshot wins for any non-empty field (preserves audit trail).
+// Live data fills gaps — handles old invoices where some fields were not
+// snapshotted, and the Molnlycke-pattern where address only exists on CWS.
+async function enrichClientDetails(invoice: any): Promise<any> {
+  const snap = invoice.clientDetails ?? {};
+  const wsIdStr = invoice.workspaceId?.toString();
+
+  let liveCustomer: any = null;
+  let cwsAddrRaw: any = {};
+
+  if (wsIdStr) {
+    // invoice.workspaceId is CustomerWorkspace._id in new invoices
+    const cws = await CustomerWorkspace.findById(wsIdStr).lean() as any;
+    if (cws?.customerId) {
+      liveCustomer = await Customer.findById(cws.customerId).lean();
+      cwsAddrRaw = cws.address ?? {};
+    } else {
+      // Legacy: workspaceId stored as Customer._id directly
+      liveCustomer = await Customer.findById(wsIdStr).lean();
+      if (liveCustomer) {
+        const linkedCws = await CustomerWorkspace.findOne({
+          customerId: (liveCustomer as any)._id.toString(),
+        }).lean() as any;
+        cwsAddrRaw = linkedCws?.address ?? {};
+      }
+    }
+  }
+
+  const custAddr: any = (liveCustomer as any)?.address ?? {};
+  // Only fall back to workspace address when Customer has no structured address
+  const addrSrc: any = (!custAddr.street && !custAddr.city) ? cwsAddrRaw : {};
+
+  const merged: any = {
+    companyName:    snap.companyName    || (liveCustomer as any)?.legalName    || (liveCustomer as any)?.companyName || (liveCustomer as any)?.name || "",
+    gstin:          snap.gstin          || (liveCustomer as any)?.gstNumber    || (liveCustomer as any)?.gstin || "",
+    state:          snap.state          || (liveCustomer as any)?.gstRegisteredState || custAddr.state || addrSrc.state  || "",
+    addressLine1:   snap.addressLine1   || custAddr.street  || addrSrc.line1   || "",
+    addressLine2:   snap.addressLine2   || custAddr.street2 || addrSrc.line2   || "",
+    city:           snap.city           || custAddr.city    || addrSrc.city    || "",
+    pincode:        snap.pincode        || custAddr.pincode  || addrSrc.pincode || "",
+    country:        snap.country        || custAddr.country || addrSrc.country || "India",
+    email:          snap.email          || (liveCustomer as any)?.contacts?.officialEmail || (liveCustomer as any)?.email || "",
+    contactPerson:  snap.contactPerson  || "",
+    billingAddress: snap.billingAddress || (liveCustomer as any)?.registeredAddress || "",
+  };
+
+  // Build billingAddress from structured fields when still empty (Loom Solar pattern:
+  // has address.street but no registeredAddress)
+  if (!merged.billingAddress && (merged.addressLine1 || merged.city)) {
+    merged.billingAddress = buildAddressStr({
+      addressLine1: merged.addressLine1,
+      addressLine2: merged.addressLine2,
+      city:         merged.city,
+      state:        merged.state,
+      country:      merged.country,
+      pincode:      merged.pincode,
+    });
+  }
+
+  return merged;
 }
 
 /* ── GST Preview ─────────────────────────────────────────────────── */
@@ -304,10 +376,18 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     const issuerState = companySettings.supplierState || companySettings.state || process.env.COMPANY_STATE || "Karnataka";
 
     const cust = (customer || {}) as any;
+    const custAddr: any = cust.address ?? {};
+    // Workspace address fallback for customers with no structured address (Molnlycke-pattern)
+    const addrFallback: any = (!custAddr.street && !custAddr.city)
+      ? ((resolvedWorkspace as any)?.address ?? {})
+      : {};
+
     const { state: customerStateRaw, country: customerCountry } = resolveCustomerState(cust);
+    const effectiveState   = customerStateRaw   || addrFallback.state   || "";
+    const effectiveCountry = customerCountry    || addrFallback.country || "India";
 
     // GST detection
-    const detection = detectGSTType({ supplierState: issuerState, customerState: customerStateRaw, customerCountry });
+    const detection = detectGSTType({ supplierState: issuerState, customerState: effectiveState, customerCountry: effectiveCountry });
     if (!detection.canCalculate) {
       return res.status(400).json({
         error: "GST_DETECTION_FAILED",
@@ -326,10 +406,22 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     }
     const resolvedGstType: GSTType = useOverride ? gstTypeOverride! : detection.gstType;
 
+    const custAddrLine1 = custAddr.street  || addrFallback.line1   || "";
+    const custAddrLine2 = custAddr.street2 || addrFallback.line2   || "";
+    const custCity      = custAddr.city    || addrFallback.city    || "";
+    const custCountry   = custAddr.country || addrFallback.country || "India";
+    const custPincode   = custAddr.pincode  || addrFallback.pincode || "";
+
     let clientDetails = {
       companyName:    cust.legalName || cust.companyName || cust.name || '',
       gstin:          cust.gstNumber || cust.gstin || '',
-      billingAddress: cust.registeredAddress || cust.billingAddress || '',
+      billingAddress: cust.registeredAddress || cust.billingAddress ||
+        buildAddressStr({ addressLine1: custAddrLine1, addressLine2: custAddrLine2, city: custCity, state: detection.customerState, country: custCountry, pincode: custPincode }),
+      addressLine1:   custAddrLine1,
+      addressLine2:   custAddrLine2,
+      city:           custCity,
+      country:        custCountry,
+      pincode:        custPincode,
       contactPerson:  cust.contacts?.primaryContact || cust.contacts?.keyContacts?.[0]?.name || '',
       email:          cust.contacts?.officialEmail || cust.email || '',
       state:          detection.customerState,
@@ -338,13 +430,18 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     console.log('[Invoice generate] clientDetails built:', JSON.stringify(clientDetails));
 
     const issuerDetails = {
-      companyName: companySettings.companyName || process.env.COMPANY_NAME,
-      gstin:       companySettings.gstin       || process.env.COMPANY_GSTIN,
-      address:     companySettings.address     || process.env.COMPANY_ADDRESS,
-      email:       companySettings.email       || process.env.COMPANY_EMAIL,
-      phone:       companySettings.phone       || process.env.COMPANY_PHONE,
-      website:     companySettings.website     || process.env.COMPANY_WEBSITE,
-      state:       issuerState,
+      companyName:  companySettings.companyName || process.env.COMPANY_NAME,
+      gstin:        companySettings.gstin       || process.env.COMPANY_GSTIN,
+      address:      companySettings.address     || process.env.COMPANY_ADDRESS,
+      addressLine1: (companySettings as any).addressLine1 || "",
+      addressLine2: (companySettings as any).addressLine2 || "",
+      city:         (companySettings as any).city         || "",
+      country:      (companySettings as any).country      || "India",
+      pincode:      (companySettings as any).pincode       || "",
+      email:        companySettings.email       || process.env.COMPANY_EMAIL,
+      phone:        companySettings.phone       || process.env.COMPANY_PHONE,
+      website:      companySettings.website     || process.env.COMPANY_WEBSITE,
+      state:        issuerState,
     };
 
     const clientState = detection.customerState;
@@ -518,23 +615,40 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
     const resolvedGstType: GSTType = detection.gstType;
     const clientState = detection.customerState;
 
+    const bulkAddrLine1 = (cust.address as any)?.street  || "";
+    const bulkAddrLine2 = (cust.address as any)?.street2 || "";
+    const bulkCity      = (cust.address as any)?.city    || "";
+    const bulkCountry   = (cust.address as any)?.country || "India";
+    const bulkPincode   = (cust.address as any)?.pincode  || "";
+
     const clientDetails = {
       companyName:    cust.legalName || cust.companyName || cust.name || "",
       gstin:          cust.gstNumber || cust.gstin || "",
-      billingAddress: cust.registeredAddress || cust.billingAddress || "",
+      billingAddress: cust.registeredAddress || cust.billingAddress ||
+        buildAddressStr({ addressLine1: bulkAddrLine1, addressLine2: bulkAddrLine2, city: bulkCity, state: clientState, country: bulkCountry, pincode: bulkPincode }),
+      addressLine1:   bulkAddrLine1,
+      addressLine2:   bulkAddrLine2,
+      city:           bulkCity,
+      country:        bulkCountry,
+      pincode:        bulkPincode,
       contactPerson:  cust.contacts?.primaryContact || cust.contacts?.keyContacts?.[0]?.name || "",
       email:          cust.contacts?.officialEmail || cust.email || "",
       state:          clientState,
     };
 
     const issuerDetails = {
-      companyName: companySettings.companyName || process.env.COMPANY_NAME,
-      gstin:       companySettings.gstin       || process.env.COMPANY_GSTIN,
-      address:     companySettings.address     || process.env.COMPANY_ADDRESS,
-      email:       companySettings.email       || process.env.COMPANY_EMAIL,
-      phone:       companySettings.phone       || process.env.COMPANY_PHONE,
-      website:     companySettings.website     || process.env.COMPANY_WEBSITE,
-      state:       issuerState,
+      companyName:  companySettings.companyName || process.env.COMPANY_NAME,
+      gstin:        companySettings.gstin       || process.env.COMPANY_GSTIN,
+      address:      companySettings.address     || process.env.COMPANY_ADDRESS,
+      addressLine1: (companySettings as any).addressLine1 || "",
+      addressLine2: (companySettings as any).addressLine2 || "",
+      city:         (companySettings as any).city         || "",
+      country:      (companySettings as any).country      || "India",
+      pincode:      (companySettings as any).pincode       || "",
+      email:        companySettings.email       || process.env.COMPANY_EMAIL,
+      phone:        companySettings.phone       || process.env.COMPANY_PHONE,
+      website:      companySettings.website     || process.env.COMPANY_WEBSITE,
+      state:        issuerState,
     };
 
     const generated: { bookingId: string; invoiceId: string; invoiceNo: string }[] = [];
@@ -1007,6 +1121,104 @@ router.post("/:id/cancel", requirePermission("invoices", "FULL"), async (req: an
   }
 });
 
+/* ── Edit Draft Invoice ───────────────────────────────────────────── */
+
+// PATCH /api/admin/invoices/:id
+router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+
+    if (invoice.status !== "DRAFT") {
+      return res.status(400).json({ error: "Cannot edit non-draft invoice. Use cancel + reissue." });
+    }
+
+    const { dueDate, notes, supplyType, gstOverrideReason } = req.body as {
+      dueDate?: string;
+      notes?: string;
+      supplyType?: GSTType;
+      gstOverrideReason?: string;
+    };
+
+    const allowedSupplyTypes: GSTType[] = ["CGST_SGST", "CGST_UTGST", "IGST", "EXPORT", "NONE"];
+    if (supplyType && !allowedSupplyTypes.includes(supplyType)) {
+      return res.status(400).json({ error: "Invalid supplyType" });
+    }
+
+    const oldValues: Record<string, unknown> = {};
+    const newValues: Record<string, unknown> = {};
+    const fieldsChanged: string[] = [];
+
+    if (dueDate !== undefined) {
+      const newDate = dueDate ? new Date(dueDate) : undefined;
+      const oldStr = invoice.dueDate ? new Date(invoice.dueDate).toISOString().slice(0, 10) : "";
+      const newStr = newDate ? newDate.toISOString().slice(0, 10) : "";
+      if (oldStr !== newStr) {
+        oldValues.dueDate = invoice.dueDate ?? null;
+        newValues.dueDate = newDate ?? null;
+        fieldsChanged.push("dueDate");
+        invoice.dueDate = newDate;
+      }
+    }
+
+    if (notes !== undefined) {
+      const trimmed = notes.slice(0, 1000);
+      if (trimmed !== (invoice.notes ?? "")) {
+        oldValues.notes = invoice.notes ?? "";
+        newValues.notes = trimmed;
+        fieldsChanged.push("notes");
+        invoice.notes = trimmed;
+      }
+    }
+
+    if (supplyType && supplyType !== invoice.supplyType) {
+      const isAutoDetected = supplyType === (invoice.gstTypeAutoDetected as GSTType | undefined);
+      if (!isAutoDetected && !gstOverrideReason?.trim()) {
+        return res.status(400).json({ error: "gstOverrideReason is required when changing GST type" });
+      }
+
+      const gstAmounts = calculateGSTAmounts(invoice.totalGST, supplyType);
+      oldValues.supplyType = invoice.supplyType;
+      newValues.supplyType = supplyType;
+      if (!isAutoDetected && gstOverrideReason?.trim()) newValues.gstOverrideReason = gstOverrideReason.trim();
+      fieldsChanged.push("supplyType");
+
+      invoice.supplyType = supplyType;
+      invoice.cgstAmount = gstAmounts.cgst;
+      invoice.sgstAmount = gstAmounts.sgst;
+      invoice.utgstAmount = gstAmounts.utgst;
+      invoice.igstAmount = gstAmounts.igst;
+
+      if (isAutoDetected) {
+        invoice.gstTypeOverridden = false;
+        invoice.gstOverrideReason = undefined;
+        (invoice as any).gstOverrideBy = undefined;
+      } else {
+        invoice.gstTypeOverridden = true;
+        invoice.gstOverrideReason = gstOverrideReason!.trim();
+        invoice.gstOverrideBy = req.user._id;
+      }
+    }
+
+    if (!fieldsChanged.length) {
+      return res.json({ ok: true, invoice });
+    }
+
+    const now = new Date();
+    const iv = invoice as any;
+    iv.editedAt = now;
+    iv.editedBy = req.user._id;
+    if (!iv.editHistory) iv.editHistory = [];
+    iv.editHistory.push({ editedAt: now, editedBy: req.user._id, fieldsChanged, oldValues, newValues });
+
+    await invoice.save();
+    res.json({ ok: true, invoice });
+  } catch (err: any) {
+    console.error("[Invoices PATCH]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* ── Single ───────────────────────────────────────────────────────── */
 
 // GET /api/admin/invoices/:id
@@ -1014,7 +1226,8 @@ router.get("/:id", requirePermission("invoices", "READ"), async (req: any, res: 
   try {
     const invoice = await Invoice.findById(req.params.id).lean();
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
-    res.json({ ok: true, invoice });
+    const enrichedClient = await enrichClientDetails(invoice);
+    res.json({ ok: true, invoice: { ...invoice, clientDetails: enrichedClient } });
   } catch (err: any) {
     console.error("[Invoices GET one]", err.message);
     res.status(500).json({ error: err.message });
@@ -1056,7 +1269,8 @@ router.post("/:id/pdf", requirePermission("invoices", "WRITE"), async (req: any,
     });
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
-    const pdfBuffer = await generateInvoicePdf(invoice as any);
+    const enrichedClient = await enrichClientDetails(invoice);
+    const pdfBuffer = await generateInvoicePdf({ ...invoice, clientDetails: enrichedClient } as any);
 
     const s3 = new S3Client({
       region: env.AWS_REGION,

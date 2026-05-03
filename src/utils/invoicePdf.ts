@@ -179,7 +179,20 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
   const logoBuffer = dbSettings.logoUrl ? await fetchBuffer(dbSettings.logoUrl) : null;
 
   console.log('[PDF] clientDetails:', JSON.stringify((invoice as any).clientDetails));
-  const issuer = (invoice as any).issuerDetails ?? {};
+  const issuerSnap = (invoice as any).issuerDetails ?? {};
+  const issuer = {
+    companyName:  issuerSnap.companyName  || dbSettings.companyName  || "",
+    address:      issuerSnap.address      || dbSettings.address      || "",
+    addressLine1: issuerSnap.addressLine1 || (dbSettings as any).addressLine1 || "",
+    addressLine2: issuerSnap.addressLine2 || (dbSettings as any).addressLine2 || "",
+    city:         issuerSnap.city         || (dbSettings as any).city         || "",
+    country:      issuerSnap.country      || (dbSettings as any).country      || "India",
+    pincode:      issuerSnap.pincode      || (dbSettings as any).pincode       || "",
+    state:        issuerSnap.state        || dbSettings.supplierState || dbSettings.state || "",
+    gstin:        issuerSnap.gstin        || dbSettings.gstin         || "",
+    email:        issuerSnap.email        || dbSettings.email         || "",
+    website:      issuerSnap.website      || dbSettings.website       || "",
+  };
   const client = (invoice as any).clientDetails ?? {};
   let isIgst: boolean;
   let gstLabel2 = "SGST"; // second GST column label for split tax
@@ -321,28 +334,48 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
     doc.fillColor(C_PRIMARY).fontSize(12).font(FONT_BOLD)
       .text(issuer.companyName || "—", L, y, { width: leftColW });
     y += doc.heightOfString(issuer.companyName || "—", { width: leftColW, fontSize: 12 }) + 4;
-    doc.fontSize(10).font(FONT_NORMAL).fillColor(C_MID);
-    if (issuer.address) {
-      doc.text(issuer.address, L, y, { width: leftColW });
-      y += doc.heightOfString(issuer.address, { width: leftColW }) + 4;
+    doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID);
+    const hasStructuredIssuer = !!(issuer.addressLine1 || issuer.city);
+    if (hasStructuredIssuer) {
+      if (issuer.addressLine1) {
+        doc.text(issuer.addressLine1, L, y, { width: leftColW });
+        y += doc.heightOfString(issuer.addressLine1, { width: leftColW }) + 3;
+      }
+      if (issuer.addressLine2) {
+        doc.text(issuer.addressLine2, L, y, { width: leftColW });
+        y += doc.heightOfString(issuer.addressLine2, { width: leftColW }) + 3;
+      }
+      const issuerCityLine = [issuer.city, issuer.state, issuer.pincode].filter(Boolean).join(", ");
+      if (issuerCityLine) {
+        doc.text(issuerCityLine, L, y, { width: leftColW });
+        y += 13;
+      }
+      if (issuer.country) {
+        doc.text(issuer.country, L, y, { width: leftColW });
+        y += 13;
+      }
+    } else {
+      doc.fontSize(10);
+      if (issuer.address) {
+        doc.text(issuer.address, L, y, { width: leftColW });
+        y += doc.heightOfString(issuer.address, { width: leftColW }) + 4;
+      }
+      if (issuer.state) {
+        doc.fontSize(9).text(issuer.state, L, y, { width: leftColW });
+        y += 13;
+      }
     }
-    if (issuer.state) {
-      doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID)
-        .text(issuer.state, L, y, { width: leftColW });
-      y += 13;
-    }
+    doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID);
     if (issuer.gstin) {
       doc.text(`GSTIN: ${issuer.gstin}`, L, y, { width: leftColW });
       y += 13;
     }
     if (issuer.email) {
-      doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID)
-        .text(issuer.email, L, y, { width: leftColW });
+      doc.text(issuer.email, L, y, { width: leftColW });
       y += doc.heightOfString(issuer.email, { width: leftColW }) + 2;
     }
     if (issuer.website) {
-      doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID)
-        .text(issuer.website, L, y, { width: leftColW });
+      doc.text(issuer.website, L, y, { width: leftColW });
       y += doc.heightOfString(issuer.website, { width: leftColW }) + 2;
     }
 
@@ -362,30 +395,44 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
       doc.fillColor(C_PRIMARY).fontSize(12).font(FONT_BOLD)
         .text(clientName, billToX, billY, { width: rightColW });
       billY += doc.heightOfString(clientName, { width: rightColW, fontSize: 12 }) + 4;
-      doc.fontSize(10).font(FONT_NORMAL).fillColor(C_MID);
-      if (clientAddress) {
-        const addressText = clientAddress
-          .replace(/\n+/g, ", ")
-          .replace(/,\s*,/g, ",")
-          .replace(/\s+/g, " ")
-          .trim();
-        doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID)
-          .text(addressText, billToX, billY, { width: rightColW });
-        billY += doc.heightOfString(addressText, { width: rightColW, fontSize: 9 }) + 4;
-      }
-      if ((client as any).state) {
-        doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID)
-          .text((client as any).state, billToX, billY, { width: rightColW });
-        billY += 13;
+      doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID);
+      const hasStructuredClient = !!((client as any).addressLine1 || (client as any).city);
+      if (hasStructuredClient) {
+        if ((client as any).addressLine1) {
+          doc.text((client as any).addressLine1, billToX, billY, { width: rightColW });
+          billY += doc.heightOfString((client as any).addressLine1, { width: rightColW }) + 3;
+        }
+        if ((client as any).addressLine2) {
+          doc.text((client as any).addressLine2, billToX, billY, { width: rightColW });
+          billY += doc.heightOfString((client as any).addressLine2, { width: rightColW }) + 3;
+        }
+        const clientCityLine = [(client as any).city, (client as any).state, (client as any).pincode].filter(Boolean).join(", ");
+        if (clientCityLine) {
+          doc.text(clientCityLine, billToX, billY, { width: rightColW });
+          billY += 13;
+        }
+        if ((client as any).country) {
+          doc.text((client as any).country, billToX, billY, { width: rightColW });
+          billY += 13;
+        }
+      } else {
+        if (clientAddress) {
+          const addressText = clientAddress
+            .replace(/\n+/g, ", ")
+            .replace(/,\s*,/g, ",")
+            .replace(/\s+/g, " ")
+            .trim();
+          doc.text(addressText, billToX, billY, { width: rightColW });
+          billY += doc.heightOfString(addressText, { width: rightColW, fontSize: 9 }) + 4;
+        }
+        if ((client as any).state) {
+          doc.text((client as any).state, billToX, billY, { width: rightColW });
+          billY += 13;
+        }
       }
       if ((client as any).gstin) {
         doc.text(`GSTIN: ${(client as any).gstin}`, billToX, billY, { width: rightColW });
         billY += 13;
-      }
-      if ((client as any).email) {
-        doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID)
-          .text((client as any).email, billToX, billY, { width: rightColW });
-        billY += doc.heightOfString((client as any).email, { width: rightColW }) + 2;
       }
     } else {
       doc.fontSize(10).font(FONT_NORMAL).fillColor(C_MID)
@@ -431,9 +478,14 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
       const descLine1 = li.description || "";
 
       let descLine2 = (li.subDescription || "")
-        .replace(/→/g, "->")
-        .replace(/[^\x00-\x7F₹]/g, "?");
-      if (!useNoto) descLine2 = descLine2.replace(/₹/g, "Rs.");
+        .split(" || ").filter(p => p !== "?").join(" || ")
+        .replace(/→/g, "->");
+      if (!useNoto) {
+        descLine2 = descLine2
+          .replace(/—/g, "-")
+          .replace(/₹/g, "Rs.")
+          .replace(/[^\x00-\x7F]/g, "?");
+      }
 
       // Estimate row height
       const descFontSize = 9;
