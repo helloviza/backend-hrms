@@ -106,13 +106,13 @@ function buildSubDescription(booking: any, paxStr: string): string {
     const dateStr     = fmtDate(booking.travelDate);
     parts = [paxStr, route, carrier || undefined, dateStr ? `Travel Date: ${dateStr}` : undefined];
   } else if (t === "HOTEL" || t === "DUMMY_HOTEL") {
-    const hotelName = booking.itinerary?.hotelName || "—";
+    const hotelName = booking.itinerary?.hotelName || "";
     const city      = booking.itinerary?.destination || booking.sector || "";
     const checkIn   = fmtDate(booking.travelDate);
     const checkOut  = fmtDate(booking.returnDate);
     parts = [
       paxStr,
-      hotelName,
+      hotelName || undefined,
       city     || undefined,
       checkIn  ? `Check-in: ${checkIn}`   : undefined,
       checkOut ? `Check-out: ${checkOut}` : undefined,

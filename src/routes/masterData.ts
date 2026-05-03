@@ -604,6 +604,11 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
       panNumber: body.panNumber || body.pan,
       entityType: body.entityType,
       registeredAddress: body.registeredAddress,
+      addressLine1: body.addressLine1,
+      addressLine2: body.addressLine2,
+      city: body.city,
+      country: body.country,
+      pincode: body.pincode,
       website: body.website,
       industry: body.industry,
       employeesCount: body.employeesCount,
@@ -645,6 +650,23 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
         if (body.gstRegisteredState) {
           (customer as any).gstRegisteredState = String(body.gstRegisteredState).trim();
           (customer as any).gstRegisteredStateCode = GST_STATE_CODES[String(body.gstRegisteredState).trim()] || "";
+        }
+        // Sync structured address to Customer.address.*
+        const hasAddrUpdate = body.addressLine1 !== undefined || body.addressLine2 !== undefined ||
+          body.city !== undefined || body.country !== undefined || body.pincode !== undefined;
+        if (hasAddrUpdate) {
+          const existing = (customer as any).address || {};
+          (customer as any).address = {
+            street:  body.addressLine1 !== undefined ? body.addressLine1 : (existing.street  || ""),
+            street2: body.addressLine2 !== undefined ? body.addressLine2 : (existing.street2 || ""),
+            city:    body.city         !== undefined ? body.city         : (existing.city    || ""),
+            state:   body.gstRegisteredState         || existing.state   || "",
+            country: body.country      !== undefined ? body.country      : (existing.country || "India"),
+            pincode: body.pincode      !== undefined ? body.pincode       : (existing.pincode  || ""),
+          };
+        }
+        if (body.registeredAddress) {
+          (customer as any).registeredAddress = body.registeredAddress;
         }
         await customer.save();
       }

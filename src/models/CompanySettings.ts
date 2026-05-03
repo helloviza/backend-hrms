@@ -5,7 +5,12 @@ export interface ICompanySettings extends Document {
   // Company Info
   companyName: string;
   gstin: string;
-  address: string;
+  address: string;        // legacy freeform — kept for backward compat
+  addressLine1: string;
+  addressLine2: string;
+  city: string;
+  country: string;
+  pincode: string;
   email: string;
   phone: string;
   website: string;
@@ -38,7 +43,12 @@ const CompanySettingsSchema = new Schema<ICompanySettings>(
   {
     companyName:         { type: String, default: "" },
     gstin:               { type: String, default: "" },
-    address:             { type: String, default: "" },
+    address:             { type: String, default: "" },   // legacy freeform
+    addressLine1:        { type: String, default: "" },
+    addressLine2:        { type: String, default: "" },
+    city:                { type: String, default: "" },
+    country:             { type: String, default: "India" },
+    pincode:             { type: String, default: "" },
     email:               { type: String, default: "" },
     phone:               { type: String, default: "" },
     website:             { type: String, default: "" },

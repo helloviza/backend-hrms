@@ -15,6 +15,14 @@ export interface IInvoiceLineItem {
   type: string;
 }
 
+export interface IEditHistoryEntry {
+  editedAt: Date;
+  editedBy: Schema.Types.ObjectId;
+  fieldsChanged: string[];
+  oldValues: Record<string, unknown>;
+  newValues: Record<string, unknown>;
+}
+
 export interface IInvoice extends Document {
   invoiceNo: string;
   workspaceId: Schema.Types.ObjectId;
@@ -33,13 +41,21 @@ export interface IInvoice extends Document {
   gstTypeOverridden?: boolean;
   gstOverrideReason?: string;
   gstOverrideBy?: Schema.Types.ObjectId;
+  editedAt?: Date;
+  editedBy?: Schema.Types.ObjectId;
+  editHistory?: IEditHistoryEntry[];
   placeOfSupply?: string;
   issuerState?: string;
   clientState?: string;
   issuerDetails?: {
     companyName?: string;
     gstin?: string;
-    address?: string;
+    address?: string;        // legacy freeform
+    addressLine1?: string;
+    addressLine2?: string;
+    city?: string;
+    country?: string;
+    pincode?: string;
     email?: string;
     phone?: string;
     website?: string;
@@ -48,7 +64,12 @@ export interface IInvoice extends Document {
   clientDetails?: {
     companyName?: string;
     gstin?: string;
-    billingAddress?: string;
+    billingAddress?: string; // legacy freeform
+    addressLine1?: string;
+    addressLine2?: string;
+    city?: string;
+    country?: string;
+    pincode?: string;
     contactPerson?: string;
     email?: string;
     state?: string;
@@ -97,7 +118,12 @@ const InvoiceSchema = new Schema<IInvoice>(
     issuerDetails: {
       companyName: String,
       gstin: String,
-      address: String,
+      address: String,       // legacy freeform
+      addressLine1: String,
+      addressLine2: String,
+      city: String,
+      country: String,
+      pincode: String,
       email: String,
       phone: String,
       website: String,
@@ -106,7 +132,12 @@ const InvoiceSchema = new Schema<IInvoice>(
     clientDetails: {
       companyName: String,
       gstin: String,
-      billingAddress: String,
+      billingAddress: String, // legacy freeform
+      addressLine1: String,
+      addressLine2: String,
+      city: String,
+      country: String,
+      pincode: String,
       contactPerson: String,
       email: String,
       state: String,
@@ -126,6 +157,15 @@ const InvoiceSchema = new Schema<IInvoice>(
     sentAt: Date,
     paidAt: Date,
     createdBy: { type: Schema.Types.ObjectId, ref: "User" },
+    editedAt: Date,
+    editedBy: { type: Schema.Types.ObjectId, ref: "User" },
+    editHistory: [{
+      editedAt: Date,
+      editedBy: { type: Schema.Types.ObjectId, ref: "User" },
+      fieldsChanged: [String],
+      oldValues: { type: Schema.Types.Mixed },
+      newValues: { type: Schema.Types.Mixed },
+    }],
   },
   { timestamps: true },
 );
