@@ -279,20 +279,28 @@ router.get("/", async (req, res) => {
 // ROUTE 3 — GET /reports/summary
 // ═══════════════════════════════════════════════════════════════
 
-router.get("/reports/summary", async (_req, res) => {
+router.get("/reports/summary", async (req, res) => {
   try {
+    const q = req.query as AnyObj;
+    const dateFilter: AnyObj = {};
+    if (q.dateFrom || q.dateTo) {
+      dateFilter.createdAt = {};
+      if (q.dateFrom) dateFilter.createdAt.$gte = new Date(String(q.dateFrom));
+      if (q.dateTo) dateFilter.createdAt.$lte = new Date(String(q.dateTo));
+    }
+
     const [byStage, bySource, wonCount, lostCount, pipelineAgg, avgAgg] =
       await Promise.all([
-        Lead.aggregate([{ $group: { _id: "$stage", count: { $sum: 1 } } }]),
-        Lead.aggregate([{ $group: { _id: "$source", count: { $sum: 1 } } }]),
-        Lead.countDocuments({ stage: "won" }),
-        Lead.countDocuments({ stage: "lost" }),
+        Lead.aggregate([{ $match: dateFilter }, { $group: { _id: "$stage", count: { $sum: 1 } } }]),
+        Lead.aggregate([{ $match: dateFilter }, { $group: { _id: "$source", count: { $sum: 1 } } }]),
+        Lead.countDocuments({ ...dateFilter, stage: "won" }),
+        Lead.countDocuments({ ...dateFilter, stage: "lost" }),
         Lead.aggregate([
-          { $match: { stage: { $nin: ["won", "lost"] } } },
+          { $match: { ...dateFilter, stage: { $nin: ["won", "lost"] } } },
           { $group: { _id: null, total: { $sum: "$dealValue" } } },
         ]),
         Lead.aggregate([
-          { $match: { stage: "won" } },
+          { $match: { ...dateFilter, stage: "won" } },
           { $group: { _id: null, avg: { $avg: "$dealValue" } } },
         ]),
       ]);
@@ -422,6 +430,7 @@ router.get("/export", async (req, res) => {
   try {
     const user = (req as any).user as AnyObj;
     const leadsScope = (req as any).leadsScope as string;
+    const q = req.query as AnyObj;
     const filter: AnyObj = {};
 
     if (leadsScope === "OWN") {
@@ -429,6 +438,12 @@ router.get("/export", async (req, res) => {
       if (mongoose.isValidObjectId(uid)) {
         filter.assignedTo = new mongoose.Types.ObjectId(uid);
       }
+    }
+
+    if (q.dateFrom || q.dateTo) {
+      filter.createdAt = {};
+      if (q.dateFrom) filter.createdAt.$gte = new Date(String(q.dateFrom));
+      if (q.dateTo) filter.createdAt.$lte = new Date(String(q.dateTo));
     }
 
     const leads = await Lead.find(filter).sort({ createdAt: -1 }).limit(5000).lean();
@@ -588,6 +603,26 @@ router.get("/export/activities", async (_req, res) => {
   } catch (err) {
     logger.error("leads GET /export/activities error", { err });
     return res.status(500).json({ error: "Export failed." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTE 6c — GET /counts-by-stage
+// ═══════════════════════════════════════════════════════════════
+
+router.get("/counts-by-stage", async (_req, res) => {
+  try {
+    const agg = await Lead.aggregate([
+      { $group: { _id: "$stage", count: { $sum: 1 } } },
+    ]);
+    const counts: Record<string, number> = {};
+    for (const item of agg as Array<{ _id: string; count: number }>) {
+      if (item._id) counts[item._id] = item.count;
+    }
+    return res.json(counts);
+  } catch (err) {
+    logger.error("leads GET /counts-by-stage error", { err });
+    return res.status(500).json({ error: "Failed to load stage counts." });
   }
 });
 
@@ -965,6 +1000,151 @@ router.post("/:id/lose", async (req, res) => {
   } catch (err) {
     logger.error("leads POST /:id/lose error", { err });
     return res.status(500).json({ error: "Failed to mark lead as lost." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTE 13b — POST /:id/convert
+// ═══════════════════════════════════════════════════════════════
+
+router.post("/:id/convert", async (req, res) => {
+  try {
+    if (!canWrite((req as any).leadsAccess)) {
+      return res.status(403).json({ error: "Write access required." });
+    }
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid lead ID." });
+    }
+
+    const lead = await Lead.findById(req.params.id);
+    if (!lead) return res.status(404).json({ error: "Lead not found." });
+
+    if (lead.convertedToContactId) {
+      return res.status(409).json({
+        error: "Lead already converted.",
+        contactId: String(lead.convertedToContactId),
+      });
+    }
+
+    const user = (req as any).user as AnyObj;
+    const createdById = mongoose.isValidObjectId(userId(user))
+      ? new mongoose.Types.ObjectId(userId(user))
+      : undefined;
+    const byName =
+      user.name ||
+      `${user.firstName || ""} ${user.lastName || ""}`.trim() ||
+      user.email ||
+      "System";
+
+    const {
+      firstName,
+      lastName = "",
+      phone,
+      email = "",
+      jobTitle = "",
+      companyName = "",
+      useExistingContactId,
+      linkContactToCompany = true,
+    } = req.body as AnyObj;
+
+    let contact: any;
+
+    if (useExistingContactId) {
+      if (!mongoose.isValidObjectId(useExistingContactId)) {
+        return res.status(400).json({ error: "Invalid existing contact ID." });
+      }
+      contact = await CRMContact.findById(useExistingContactId);
+      if (!contact) return res.status(404).json({ error: "Existing contact not found." });
+    } else {
+      if (!firstName || !phone) {
+        return res.status(400).json({ error: "firstName and phone are required." });
+      }
+      if (email) {
+        const dup = (await CRMContact.findOne({
+          email: String(email).trim().toLowerCase(),
+        }).lean()) as any;
+        if (dup) {
+          return res.status(409).json({
+            error: "Duplicate contact",
+            errors: [
+              {
+                type: "duplicate_contact",
+                id: String(dup._id),
+                name: `${dup.firstName} ${dup.lastName}`.trim(),
+                email: dup.email,
+              },
+            ],
+          });
+        }
+      }
+      contact = await CRMContact.create({
+        firstName: String(firstName).trim(),
+        lastName: String(lastName).trim(),
+        jobTitle: String(jobTitle).trim(),
+        phone: String(phone).trim(),
+        email: email ? String(email).trim().toLowerCase() : "",
+        companyName: String(companyName || lead.companyName || ""),
+        source: lead.source,
+        notes: lead.notes || "",
+        leadId: lead._id,
+        assignedTo: lead.assignedTo || null,
+        createdBy: createdById,
+        isPrivate: false,
+        status: "active",
+      });
+    }
+
+    let company: any = null;
+    const targetCompanyName = String(companyName || lead.companyName || "").trim();
+    if (targetCompanyName) {
+      const escaped = targetCompanyName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const existing = (await CRMCompany.findOne({
+        name: { $regex: new RegExp(`^${escaped}$`, "i") },
+      }).lean()) as any;
+      if (existing) {
+        company = existing;
+      } else {
+        company = await CRMCompany.create({
+          name: targetCompanyName,
+          industry: lead.industry || "",
+          companySize: lead.companySize || "",
+          city: lead.location || "",
+          phone: lead.contactPhone || "",
+          email: lead.contactEmail || "",
+          website: lead.website || "",
+          leadId: lead._id,
+          createdBy: createdById,
+          isPrivate: false,
+        });
+      }
+    }
+
+    if (company && linkContactToCompany && !useExistingContactId) {
+      contact.companyId = company._id;
+      contact.companyName = company.name;
+      await contact.save();
+    }
+
+    lead.convertedToContactId = contact._id;
+    lead.convertedToCompanyId = company?._id ?? null;
+    lead.stage = "won";
+    lead.wonDate = new Date();
+    await lead.save();
+
+    const contactLabel = `${contact.firstName} ${contact.lastName}`.trim();
+    const companyLabel = company ? ` and Company "${company.name}"` : "";
+    await LeadActivity.create({
+      leadId: lead._id,
+      type: "won" as ActivityType,
+      note: `Converted: Contact "${contactLabel}"${companyLabel} created.`,
+      createdBy: createdById,
+      createdByName: byName,
+    });
+
+    return res.json({ contact, company, lead });
+  } catch (err) {
+    logger.error("leads POST /:id/convert error", { err });
+    return res.status(500).json({ error: "Failed to convert lead." });
   }
 });
 
