@@ -24,7 +24,16 @@ export interface IInvoice extends Document {
   subtotal: number;
   totalGST: number;
   grandTotal: number;
-  supplyType: "IGST" | "CGST_SGST";
+  supplyType: "IGST" | "CGST_SGST" | "CGST_UTGST" | "EXPORT" | "NONE";
+  cgstAmount: number;
+  sgstAmount: number;
+  utgstAmount: number;
+  igstAmount: number;
+  gstTypeAutoDetected?: string;
+  gstTypeOverridden?: boolean;
+  gstOverrideReason?: string;
+  gstOverrideBy?: Schema.Types.ObjectId;
+  placeOfSupply?: string;
   issuerState?: string;
   clientState?: string;
   issuerDetails?: {
@@ -45,6 +54,10 @@ export interface IInvoice extends Document {
     state?: string;
   };
   status: "DRAFT" | "SENT" | "PAID" | "CANCELLED";
+  cancelledAt?: Date;
+  cancelledBy?: Schema.Types.ObjectId;
+  cancellationReason?: string;
+  cancellationNote?: string;
   terms?: string;
   notes?: string;
   showInclusiveTaxNote?: boolean;
@@ -69,7 +82,16 @@ const InvoiceSchema = new Schema<IInvoice>(
     subtotal: { type: Number, default: 0 },
     totalGST: { type: Number, default: 0 },
     grandTotal: { type: Number, default: 0 },
-    supplyType: { type: String, enum: ["IGST", "CGST_SGST"], default: "IGST" },
+    supplyType: { type: String, enum: ["IGST", "CGST_SGST", "CGST_UTGST", "EXPORT", "NONE"], default: "IGST" },
+    cgstAmount: { type: Number, default: 0 },
+    sgstAmount: { type: Number, default: 0 },
+    utgstAmount: { type: Number, default: 0 },
+    igstAmount: { type: Number, default: 0 },
+    gstTypeAutoDetected: { type: String },
+    gstTypeOverridden: { type: Boolean, default: false },
+    gstOverrideReason: { type: String },
+    gstOverrideBy: { type: Schema.Types.ObjectId, ref: "User" },
+    placeOfSupply: { type: String },
     issuerState: String,
     clientState: String,
     issuerDetails: {
@@ -90,6 +112,10 @@ const InvoiceSchema = new Schema<IInvoice>(
       state: String,
     },
     status: { type: String, enum: ["DRAFT", "SENT", "PAID", "CANCELLED"], default: "DRAFT" },
+    cancelledAt: Date,
+    cancelledBy: { type: Schema.Types.ObjectId, ref: "User" },
+    cancellationReason: String,
+    cancellationNote: String,
     terms: String,
     notes: String,
     showInclusiveTaxNote: { type: Boolean, default: false },

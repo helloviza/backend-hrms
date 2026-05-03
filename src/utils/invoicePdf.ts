@@ -30,8 +30,8 @@ async function ensureFonts() {
 /* ── Page geometry ──────────────────────────────────── */
 const PG_W = 595.28;
 const PG_H = 841.89;
-const M = 42.52; // 15mm in points
-const CW = PG_W - 2 * M; // content width ~510
+const M = 34.02; // 12mm in points (was 15mm / 42.52)
+const CW = PG_W - 2 * M; // content width ~527
 const L = M;
 const R = PG_W - M;
 
@@ -182,10 +182,15 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
   const issuer = (invoice as any).issuerDetails ?? {};
   const client = (invoice as any).clientDetails ?? {};
   let isIgst: boolean;
-  if (invoice.supplyType === "IGST") {
+  let gstLabel2 = "SGST"; // second GST column label for split tax
+  if (invoice.supplyType === "IGST" || invoice.supplyType === "EXPORT") {
     isIgst = true;
   } else if (invoice.supplyType === "CGST_SGST") {
     isIgst = false;
+    gstLabel2 = "SGST";
+  } else if (invoice.supplyType === "CGST_UTGST") {
+    isIgst = false;
+    gstLabel2 = "UTGST";
   } else {
     logger.warn(`[PDF] Unexpected supplyType: "${invoice.supplyType ?? "(undefined)"}" — defaulting to IGST`);
     isIgst = true;
@@ -217,15 +222,17 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
     doc.on("error", reject);
 
     // ── Table column widths & x positions ──
+    // IGST (5 cols): DESC 50 | QTY 6 | RATE 13 | IGST 13 | AMT 18
+    // Split (6 cols): DESC 41 | QTY 5 | RATE 12 | CGST 12 | SGST 12 | AMT 18
     const COL_W = isIgst
-      ? [CW * 0.55, CW * 0.08, CW * 0.13, CW * 0.12, CW * 0.12]
-      : [CW * 0.44, CW * 0.07, CW * 0.12, CW * 0.12, CW * 0.12, CW * 0.13];
+      ? [CW * 0.50, CW * 0.06, CW * 0.13, CW * 0.13, CW * 0.18]
+      : [CW * 0.41, CW * 0.05, CW * 0.12, CW * 0.12, CW * 0.12, CW * 0.18];
     const COL_X: number[] = [L];
     for (let i = 0; i < COL_W.length - 1; i++) COL_X.push(COL_X[i] + COL_W[i]);
     const HDR_H = 20;
     const HDRS = isIgst
       ? ["DESCRIPTION", "QTY", "RATE", "IGST (18%)", "AMOUNT"]
-      : ["DESCRIPTION", "QTY", "RATE", "CGST (9%)", "SGST (9%)", "AMOUNT"];
+      : ["DESCRIPTION", "QTY", "RATE", "CGST (9%)", `${gstLabel2} (9%)`, "AMOUNT"];
     const ALIGNS: Array<"center" | "left" | "right"> = isIgst
       ? ["left", "center", "right", "right", "right"]
       : ["left", "center", "right", "right", "right", "right"];
@@ -276,8 +283,8 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
     const leftTitleBottomY = logoBottomY + 68;
 
     // Right — two stat boxes side by side
-    const BOX_W = 100;
-    const BOX_H = 55;
+    const BOX_W = 120; // was 100 — wider to accommodate large amounts without clipping
+    const BOX_H = 58;
     const BOX_GAP = 8;
     const BOX2_X = R - BOX_W;
     const BOX1_X = BOX2_X - BOX_W - BOX_GAP;
@@ -285,18 +292,18 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
 
     // Box 1: BALANCE DUE
     doc.rect(BOX1_X, BOX_Y, BOX_W, BOX_H).fill(C_PRIMARY);
-    doc.fillColor("#aab4c4").fontSize(8).font(FONT_NORMAL)
-      .text("BALANCE DUE", BOX1_X + 8, BOX_Y + 8, { width: BOX_W - 16, lineBreak: false });
-    doc.fillColor("#ffffff").fontSize(16).font(FONT_BOLD)
-      .text(fmtCur(invoice.grandTotal ?? 0), BOX1_X + 8, BOX_Y + 22, { width: BOX_W - 16, lineBreak: false });
+    doc.fillColor("#aab4c4").fontSize(9).font(FONT_NORMAL)
+      .text("BALANCE DUE", BOX1_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
+    doc.fillColor("#ffffff").fontSize(14).font(FONT_BOLD)
+      .text(fmtCur(invoice.grandTotal ?? 0), BOX1_X + 8, BOX_Y + 24, { width: BOX_W - 16, lineBreak: false });
 
     // Box 2: DUE DATE
     doc.rect(BOX2_X, BOX_Y, BOX_W, BOX_H).fill(C_SURF_LOW);
-    doc.fillColor(C_MID).fontSize(8).font(FONT_NORMAL)
-      .text("DUE DATE", BOX2_X + 8, BOX_Y + 8, { width: BOX_W - 16, lineBreak: false });
+    doc.fillColor(C_MID).fontSize(9).font(FONT_NORMAL)
+      .text("DUE DATE", BOX2_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
     const dueDateStr = invoice.dueDate ? fmtDate(invoice.dueDate) : "On Receipt";
-    doc.fillColor(C_PRIMARY).fontSize(14).font(FONT_BOLD)
-      .text(dueDateStr, BOX2_X + 8, BOX_Y + 24, { width: BOX_W - 16, lineBreak: false });
+    doc.fillColor(C_PRIMARY).fontSize(11).font(FONT_BOLD)
+      .text(dueDateStr, BOX2_X + 8, BOX_Y + 26, { width: BOX_W - 16, lineBreak: false });
 
     y = Math.max(leftTitleBottomY, BOX_Y + BOX_H) + 24;
 
@@ -306,8 +313,8 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
     const HALF = CW / 2;
     const fromBillY = y;
 
-    // FROM (left)
-    const leftColW = 220;
+    // FROM (left) — ~44% of content width, scales with margins
+    const leftColW = Math.floor(CW * 0.44);
     doc.fillColor(C_MID).fontSize(8).font(FONT_NORMAL)
       .text("FROM", L, y, { width: leftColW, lineBreak: false });
     y += 14;
@@ -339,9 +346,9 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
       y += doc.heightOfString(issuer.website, { width: leftColW }) + 2;
     }
 
-    // BILL TO (right)
-    const rightColW = 220;
-    const billToX = L + HALF + 16;
+    // BILL TO (right) — mirror of leftColW, starts just past center
+    const rightColW = Math.floor(CW * 0.44);
+    const billToX = L + Math.floor(CW / 2) + 12;
     let billY = fromBillY;
 
     doc.fillColor(C_MID).fontSize(8).font(FONT_NORMAL)
@@ -604,11 +611,14 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
 
     totRow("Sub Total", fmtCur(invoice.subtotal ?? 0));
     if (isIgst) {
-      totRow("IGST (18%)", fmtCur(invoice.totalGST ?? 0));
+      totRow("IGST (18%)", fmtCur((invoice as any).igstAmount ?? invoice.totalGST ?? 0));
     } else {
-      const half = (invoice.totalGST ?? 0) / 2;
-      totRow("CGST (9%)", fmtCur(half));
-      totRow("SGST (9%)", fmtCur(half));
+      const cgst = (invoice as any).cgstAmount ?? (invoice.totalGST ?? 0) / 2;
+      const sgstOrUtgst = (invoice as any).utgstAmount > 0
+        ? (invoice as any).utgstAmount
+        : (invoice as any).sgstAmount ?? (invoice.totalGST ?? 0) / 2;
+      totRow("CGST (9%)", fmtCur(cgst));
+      totRow(`${gstLabel2} (9%)`, fmtCur(sgstOrUtgst));
     }
 
     // Thin rule
@@ -617,12 +627,12 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
     totY += 8;
 
     // "Total" label
-    doc.fontSize(14).font(FONT_BOLD).fillColor(C_PRIMARY)
+    doc.fontSize(13).font(FONT_BOLD).fillColor(C_PRIMARY)
       .text("Total", TOT_X, totY, { width: TOT_LW, align: "right", lineBreak: false });
-    // Grand total in deep blue
-    doc.fontSize(20).font(FONT_BOLD).fillColor("#00477f")
-      .text(fmtCur(invoice.grandTotal ?? 0), TOT_VX, totY - 3, { width: TOT_VW, align: "right", lineBreak: false });
-    totY += 28;
+    // Grand total in deep blue — reduced from 20→16 to prevent overflow in value column
+    doc.fontSize(16).font(FONT_BOLD).fillColor("#00477f")
+      .text(fmtCur(invoice.grandTotal ?? 0), TOT_VX, totY - 2, { width: TOT_VW, align: "right", lineBreak: false });
+    totY += 22;
 
     // Total in words
     const words = numberToWords(invoice.grandTotal ?? 0);

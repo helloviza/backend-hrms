@@ -10,6 +10,8 @@ export interface ICompanySettings extends Document {
   phone: string;
   website: string;
   state: string;
+  supplierState: string;
+  supplierStateCode: string;
   logoUrl: string;
   // Bank Details
   bankAccountHolder: string;
@@ -41,6 +43,21 @@ const CompanySettingsSchema = new Schema<ICompanySettings>(
     phone:               { type: String, default: "" },
     website:             { type: String, default: "" },
     state:               { type: String, default: "" },
+    supplierState: {
+      type: String,
+      default: "Karnataka",
+      enum: [
+        "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
+        "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand",
+        "Karnataka", "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur",
+        "Meghalaya", "Mizoram", "Nagaland", "Odisha", "Punjab",
+        "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana", "Tripura",
+        "Uttar Pradesh", "Uttarakhand", "West Bengal",
+        "Andaman and Nicobar Islands", "Chandigarh", "Dadra and Nagar Haveli and Daman and Diu",
+        "Delhi", "Jammu and Kashmir", "Ladakh", "Lakshadweep", "Puducherry",
+      ],
+    },
+    supplierStateCode:   { type: String, default: "29" },
     logoUrl:             { type: String, default: "" },
     bankAccountHolder:   { type: String, default: "" },
     bankAccountNumber:   { type: String, default: "" },

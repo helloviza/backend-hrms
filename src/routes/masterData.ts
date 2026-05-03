@@ -22,6 +22,7 @@ import { sendEmployeeWelcomeEmail, sendClientWelcomeEmail } from "../utils/emplo
 import { UserPermission } from "../models/UserPermission.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { generateTravelerId } from "../utils/travelerId.js";
+import { GST_STATE_CODES } from "../utils/gstDetection.js";
 
 
 const router = Router();
@@ -610,6 +611,7 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
       description: body.description,
       officialEmail: body.officialEmail || body.email,
       cin: body.cin,
+      gstRegisteredState: body.gstRegisteredState,
     };
 
     Object.entries(syncToFormPayload).forEach(([key, val]) => {
@@ -640,6 +642,10 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
         if (companyName) customer.name = companyName;
         if (email) customer.email = email;
         if (contactMobile) customer.phone = contactMobile;
+        if (body.gstRegisteredState) {
+          (customer as any).gstRegisteredState = String(body.gstRegisteredState).trim();
+          (customer as any).gstRegisteredStateCode = GST_STATE_CODES[String(body.gstRegisteredState).trim()] || "";
+        }
         await customer.save();
       }
     }
