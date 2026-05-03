@@ -58,6 +58,8 @@ type ModulesTemplate = {
   vendorProfile:     ModulePermission
   // Operations
   supportTickets:    ModulePermission
+  tasks:             ModulePermission
+  directCustomers:   ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -97,6 +99,8 @@ const L1: ModulesTemplate = {
   travelSpend:       NONE,
   vendorProfile:     NONE,
   supportTickets:    NONE,
+  tasks:             WRITE_OWN,
+  directCustomers:   NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -109,10 +113,11 @@ const L2: ModulesTemplate = {
 // ── L3 — Team Leader ──────────────────────────────────────────────────────────
 const L3: ModulesTemplate = {
   ...L2,
-  leaveApprovals: WRITE_TEAM,
-  teamProfiles:   WRITE_TEAM,
-  attendance:     READ_TEAM,
-  teamPresence:   READ_TEAM,
+  leaveApprovals:  WRITE_TEAM,
+  teamProfiles:    WRITE_TEAM,
+  attendance:      READ_TEAM,
+  teamPresence:    READ_TEAM,
+  directCustomers: WRITE_OWN,
 }
 
 // ── L4 — Manager ─────────────────────────────────────────────────────────────
@@ -122,6 +127,7 @@ const L4: ModulesTemplate = {
   leaveApprovals: FULL_TEAM,
   reports:        READ_TEAM,
   analytics:      READ_TEAM,
+  tasks:          WRITE_TEAM,
 }
 
 // ── L5 — HR ───────────────────────────────────────────────────────────────────
@@ -138,6 +144,8 @@ const L5: ModulesTemplate = {
   reports:           READ_WS,
   analytics:         READ_WS,
   workspaceSettings: READ_WS,
+  tasks:             FULL_WS,
+  directCustomers:   WRITE_TEAM,
 }
 
 // ── L6 — Admin ────────────────────────────────────────────────────────────────
@@ -155,6 +163,8 @@ const L6: ModulesTemplate = {
   sbt:               FULL_WS,
   payrollAdmin:      FULL_WS,
   accessConsole:     NONE, // Admin cannot manage access — SuperAdmin only
+  tasks:             FULL_WS,
+  directCustomers:   FULL_WS,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -165,6 +175,7 @@ const L7: ModulesTemplate = {
   manualBookings: READ_ALL,
   invoices:       READ_ALL,
   adminVouchers:  READ_ALL,
+  tasks:          FULL_WS,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -204,6 +215,8 @@ const L8: ModulesTemplate = {
   travelSpend:       FULL_ALL,
   vendorProfile:     FULL_ALL,
   supportTickets:    FULL_ALL,
+  tasks:             FULL_ALL,
+  directCustomers:   FULL_ALL,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -243,6 +256,8 @@ const VENDOR: ModulesTemplate = {
   travelSpend:       READ_OWN,
   vendorProfile:     FULL_OWN,
   supportTickets:    NONE,
+  tasks:             NONE,
+  directCustomers:   NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -282,6 +297,8 @@ const CUSTOMER_SBT: ModulesTemplate = {
   travelSpend:       READ_WS,
   vendorProfile:     NONE,
   supportTickets:    NONE,
+  tasks:             NONE,
+  directCustomers:   NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -321,6 +338,8 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   travelSpend:       READ_WS,
   vendorProfile:     NONE,
   supportTickets:    NONE,
+  tasks:             NONE,
+  directCustomers:   NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

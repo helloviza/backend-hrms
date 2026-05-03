@@ -10,6 +10,7 @@ import { fetchAttachmentData, markMessageAsProcessed, sendReply } from "./gmail.
 import { shouldSkipIngestionEntirely, shouldSendAutoAck } from "./ticketEmailFilter.js";
 import { buildAutoAckHtml } from "../utils/ticketAutoAck.js";
 import { buildQuotedBody } from "../utils/emailQuoteBuilder.js";
+import { triggerTaskAutomation } from "./taskAutomation.js";
 import logger from "../utils/logger.js";
 
 function normalizeRfcId(raw: string | null | undefined): string | undefined {
@@ -120,6 +121,21 @@ export async function ingestEmailToTicket(
       status: "NEW",
     });
     logger.info("[TicketIngestion] Created ticket", { ticketRef: ticket.ticketRef, ticketId: ticket._id });
+
+    // Task automation hook — fire-and-forget
+    if (workspaceId) {
+      triggerTaskAutomation("ticket.created", {
+        workspaceId: String(workspaceId),
+        entityType: "TICKET",
+        entityId: ticket._id,
+        entityRef: ticket.ticketRef,
+        ownerId: (ticket as any).assignedTo ?? null,
+        variables: {
+          ticketRef: ticket.ticketRef,
+          customerName: parsed.fromName || parsed.fromEmail || "",
+        },
+      }).catch(() => {});
+    }
   }
 
   // Resolve attachment data for any that require separate API call

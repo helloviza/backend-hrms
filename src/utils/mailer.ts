@@ -10,6 +10,7 @@ export type MailKind =
   | "CONFIRMATIONS"
   | "ONBOARDING"
   | "WELCOME"
+  | "NOTIFICATIONS"
   | "DEFAULT";
 
 /**
@@ -60,6 +61,7 @@ function normKind(k?: string): MailKind {
   if (s === "CONFIRMATIONS") return "CONFIRMATIONS";
   if (s === "ONBOARDING") return "ONBOARDING";
   if (s === "WELCOME") return "WELCOME";
+  if (s === "NOTIFICATIONS") return "NOTIFICATIONS";
   return "DEFAULT";
 }
 
@@ -94,6 +96,18 @@ function pickFrom(args: SendMailArgs) {
 
   if (kind === "CONFIRMATIONS" && process.env.MAIL_FROM_CONFIRMATIONS)
     return String(process.env.MAIL_FROM_CONFIRMATIONS).trim();
+
+  if (kind === "NOTIFICATIONS") {
+    const raw = String(
+      process.env.MAIL_FROM_NOTIFICATIONS ||
+      process.env.MAIL_FROM_CONFIRMATIONS ||
+      process.env.MAIL_FROM ||
+      "Plumtrips <confirmations@plumtrips.com>",
+    ).trim();
+    const emailMatch = raw.match(/<([^>]+)>/);
+    const email = emailMatch ? emailMatch[1] : raw;
+    return `Plumtrips Notification <${email}>`;
+  }
 
   // 4️⃣ Safe default (NO no-reply dependency)
   return String(

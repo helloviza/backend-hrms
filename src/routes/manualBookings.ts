@@ -5,6 +5,7 @@ import multer from "multer";
 import XLSX from "xlsx";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
+import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import ManualBooking from "../models/ManualBooking.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
@@ -210,6 +211,19 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
       createdBy: String(req.user._id || req.user.id || req.user.sub),
       createdByEmail: req.user.email,
     });
+
+    // Task automation hook for pending bookings
+    if ((booking as any).status === "PENDING" && (booking as any).workspaceId) {
+      triggerTaskAutomation("booking.created_pending", {
+        workspaceId: String((booking as any).workspaceId),
+        entityType: "BOOKING",
+        entityId: booking._id as any,
+        entityRef: (booking as any).bookingRef,
+        ownerId: req.user._id,
+        variables: { bookingRef: (booking as any).bookingRef || "" },
+      }).catch(() => {});
+    }
+
     res.status(201).json({ ok: true, booking });
   } catch (err: any) {
     console.error("[ManualBookings POST]", err.message);
@@ -228,6 +242,14 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     const isAllScope = req.permissionScope === "ALL";
     if (!isAllScope) {
       filter.createdBy = String(req.user._id || req.user.id || req.user.sub);
+    }
+
+    // Soft delete filter — hide deleted rows unless SuperAdmin requests them
+    const isSuperAdmin = Array.isArray(req.user.roles) && req.user.roles.includes("SUPERADMIN");
+    if (req.query.showDeleted === "true" && isSuperAdmin) {
+      filter.isActive = false;
+    } else {
+      filter.isActive = { $ne: false };
     }
 
     // Bug 3 fix: resolve invoice number to booking invoiceId
@@ -1081,18 +1103,119 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
   }
 });
 
-// DELETE /api/admin/manual-bookings/:id
+// POST /api/admin/manual-bookings/:id/cancel
+router.post("/:id/cancel", requirePermission("manualBookings", "FULL"), async (req: any, res: any) => {
+  try {
+    const VALID_REASONS = ["DUPLICATE_ENTRY", "WRONG_CUSTOMER", "CUSTOMER_CANCELLED", "WRONG_DETAILS", "OTHER"];
+    const { reason, reasonNote } = req.body || {};
+
+    if (!reason || !VALID_REASONS.includes(reason)) {
+      return res.status(400).json({ error: "Valid reason is required", validReasons: VALID_REASONS });
+    }
+    if (reason === "OTHER" && !String(reasonNote || "").trim()) {
+      return res.status(400).json({ error: "reasonNote is required when reason is OTHER" });
+    }
+
+    const booking: any = await ManualBooking.findById(req.params.id);
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    if (booking.status === "CANCELLED") return res.status(400).json({ error: "Already cancelled" });
+    if (booking.isActive === false) return res.status(400).json({ error: "Cannot cancel a deleted booking" });
+
+    const invoiceCount = await Invoice.countDocuments({
+      bookingIds: booking._id,
+      status: { $ne: "CANCELLED" },
+    });
+    if (invoiceCount > 0) {
+      return res.status(409).json({
+        error: "INVOICE_EXISTS",
+        message: "Invoice already generated for this booking. Cancellation not allowed. Reverse the invoice first.",
+        invoiceCount,
+      });
+    }
+
+    booking.status = "CANCELLED";
+    booking.cancelledAt = new Date();
+    booking.cancelledBy = req.user._id;
+    booking.cancellationReason = reason;
+    booking.cancellationNote = reasonNote ? String(reasonNote).trim() : undefined;
+    await booking.save();
+
+    res.json({ ok: true, booking });
+  } catch (err: any) {
+    console.error("[ManualBookings CANCEL]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/admin/manual-bookings/:id  (soft delete — SuperAdmin only)
 router.delete("/:id", requirePermission("manualBookings", "FULL"), async (req: any, res: any) => {
   try {
-    const booking = await ManualBooking.findById(req.params.id);
-    if (!booking) return res.status(404).json({ error: "Booking not found" });
-    if (booking.status !== "PENDING" && booking.status !== "DRAFT" as any) {
-      return res.status(400).json({ message: "Only PENDING bookings can be deleted" });
+    const isSuperAdmin = Array.isArray(req.user.roles) && req.user.roles.includes("SUPERADMIN");
+    if (!isSuperAdmin) {
+      return res.status(403).json({ error: "Only SuperAdmin can delete bookings" });
     }
-    await booking.deleteOne();
+
+    const VALID_REASONS = ["DUPLICATE_ENTRY", "WRONG_CUSTOMER", "CUSTOMER_CANCELLED", "WRONG_DETAILS", "OTHER"];
+    const { reason, reasonNote } = req.body || {};
+
+    if (!reason || !VALID_REASONS.includes(reason)) {
+      return res.status(400).json({ error: "Valid reason is required", validReasons: VALID_REASONS });
+    }
+    if (reason === "OTHER" && !String(reasonNote || "").trim()) {
+      return res.status(400).json({ error: "reasonNote is required when reason is OTHER" });
+    }
+
+    const booking: any = await ManualBooking.findById(req.params.id);
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    if (booking.isActive === false) return res.status(400).json({ error: "Already deleted" });
+
+    const invoiceCount = await Invoice.countDocuments({
+      bookingIds: booking._id,
+      status: { $ne: "CANCELLED" },
+    });
+    if (invoiceCount > 0) {
+      return res.status(409).json({
+        error: "INVOICE_EXISTS",
+        message: "Invoice already generated for this booking. Deletion not allowed. Reverse the invoice first.",
+        invoiceCount,
+      });
+    }
+
+    booking.isActive = false;
+    booking.deletedAt = new Date();
+    booking.deletedBy = req.user._id;
+    booking.deletionReason = reason;
+    booking.deletionNote = reasonNote ? String(reasonNote).trim() : undefined;
+    await booking.save();
+
     res.json({ ok: true, success: true });
   } catch (err: any) {
     console.error("[ManualBookings DELETE]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/manual-bookings/:id/restore  (SuperAdmin only)
+router.post("/:id/restore", requirePermission("manualBookings", "FULL"), async (req: any, res: any) => {
+  try {
+    const isSuperAdmin = Array.isArray(req.user.roles) && req.user.roles.includes("SUPERADMIN");
+    if (!isSuperAdmin) {
+      return res.status(403).json({ error: "Only SuperAdmin can restore bookings" });
+    }
+
+    const booking: any = await ManualBooking.findOne({ _id: req.params.id, isActive: false });
+    if (!booking) return res.status(404).json({ error: "Deleted booking not found" });
+
+    booking.isActive = true;
+    booking.deletedAt = undefined;
+    booking.deletedBy = undefined;
+    booking.deletionReason = undefined;
+    booking.deletionNote = undefined;
+    await booking.save();
+
+    res.json({ ok: true, booking });
+  } catch (err: any) {
+    console.error("[ManualBookings RESTORE]", err.message);
     res.status(500).json({ error: err.message });
   }
 });

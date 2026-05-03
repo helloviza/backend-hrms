@@ -81,6 +81,7 @@ import businessServicesRouter from "./routes/businessServices.js";
 // ✅ Vendor / Customer master + self endpoints
 import vendorsRouter from "./routes/vendors.js";
 import customersRouter from "./routes/customers.js";
+import directCustomersRouter from "./routes/directCustomers.js";
 import vendorCustomerSelfRouter from "./routes/vendorCustomerSelf.js";
 
 // ✅ Workspace (customer/vendor/business logo + workspace meta)
@@ -351,6 +352,7 @@ app.use("/api/vendor-services", vendorServicesRouter);
 app.use("/api/business-services", businessServicesRouter);
 app.use("/api/vendors", vendorsRouter);
 app.use("/api/customers", customersRouter);
+app.use("/api/admin/direct-customers", directCustomersRouter);
 app.use("/api/customer/users", customerUsersRouter);
 app.use("/api", vendorCustomerSelfRouter);
 
@@ -504,6 +506,18 @@ app.use("/api/leads", leadsRouter);
 app.use("/api/crm/companies", crmCompaniesRouter);
 app.use("/api/crm/contacts", crmContactsRouter);
 
+// Tasks / Reminders
+import tasksRouter from "./routes/tasks.js";
+app.use("/api/admin/tasks", tasksRouter);
+
+// Task Automations (settings)
+import taskAutomationsRouter from "./routes/admin.task-automations.js";
+app.use("/api/admin/task-automations", taskAutomationsRouter);
+
+// In-app notifications
+import notificationsRouter from "./routes/notifications.js";
+app.use("/api/admin/notifications", notificationsRouter);
+
 // Plumbox internal chat (SSE + conversations + messages)
 import chatRouter from "./routes/chat.js";
 app.use("/api/chat", chatRouter);
@@ -570,6 +584,14 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       // TICKETING: Auto-ingest Gmail → tickets (every 60s)
       const { startTicketIngestionCron } = await import("./jobs/ticketIngestionCron.js");
       startTicketIngestionCron();
+
+      // TASKS: Email reminders (due-soon / due-now / overdue) — every 5 min
+      const { startTaskReminderCron } = await import("./jobs/taskReminderCron.js");
+      startTaskReminderCron();
+
+      // TASKS: Daily digest at 10:00 AM IST
+      const { startTaskDigestCron } = await import("./jobs/taskDigestCron.js");
+      startTaskDigestCron();
 
       const server = app.listen(env.PORT, () => {
         logger.info("API running", { port: env.PORT });

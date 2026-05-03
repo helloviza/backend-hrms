@@ -7,6 +7,8 @@ import Lead from "../models/Lead.js";
 import User from "../models/User.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
+import { triggerTaskAutomation } from "../services/taskAutomation.js";
+import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import logger from "../utils/logger.js";
 
 const router = express.Router();
@@ -60,6 +62,20 @@ router.post("/", async (req, res) => {
         ? new mongoose.Types.ObjectId(userId(user))
         : undefined,
     });
+
+    // Task automation hook
+    triggerTaskAutomation("contact.created", {
+      workspaceId: SYSTEM_WORKSPACE_ID,
+      entityType: "CONTACT",
+      entityId: contact._id as mongoose.Types.ObjectId,
+      entityRef: String(contact._id),
+      ownerId: mongoose.isValidObjectId(userId(user))
+        ? new mongoose.Types.ObjectId(userId(user))
+        : undefined,
+      variables: {
+        contactName: `${body.firstName || ""} ${body.lastName || ""}`.trim() || "Contact",
+      },
+    }).catch(() => {});
 
     return res.status(201).json({ contact });
   } catch (err) {

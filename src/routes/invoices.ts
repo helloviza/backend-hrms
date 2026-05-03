@@ -108,6 +108,7 @@ import { generateInvoicePdf } from "../utils/invoicePdf.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { buildLineItemsForBooking } from "../utils/invoiceLineItems.js";
 import { env } from "../config/env.js";
+import { triggerTaskAutomation } from "../services/taskAutomation.js";
 
 const router = express.Router();
 
@@ -341,6 +342,19 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       { $set: { status: "INVOICED", invoiceId: invoice._id, invoiceRaisedDate: now } },
     );
 
+    // Task automation hook
+    triggerTaskAutomation("invoice.created", {
+      workspaceId: String(invoiceWorkspaceId),
+      entityType: "INVOICE",
+      entityId: invoice._id,
+      entityRef: invoice.invoiceNo,
+      ownerId: req.user._id,
+      variables: {
+        invoiceNo: invoice.invoiceNo,
+        customerName: clientDetails.companyName || "",
+      },
+    }).catch(() => {});
+
     res.status(201).json({ ok: true, invoice: completeInvoice });
   } catch (err: any) {
     console.error("[Invoices generate]", err.message);
@@ -496,6 +510,19 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
           { _id: booking._id },
           { $set: { status: "INVOICED", invoiceId: invoice._id, invoiceRaisedDate: new Date() } },
         );
+
+        // Task automation hook per invoice
+        triggerTaskAutomation("invoice.created", {
+          workspaceId: String(invoiceWorkspaceId),
+          entityType: "INVOICE",
+          entityId: invoice._id,
+          entityRef: invoice.invoiceNo,
+          ownerId: req.user._id,
+          variables: {
+            invoiceNo: invoice.invoiceNo,
+            customerName: clientDetails.companyName || "",
+          },
+        }).catch(() => {});
 
         generated.push({ bookingId, invoiceId: invoice._id.toString(), invoiceNo: invoice.invoiceNo });
       } catch (err: any) {

@@ -18,5 +18,5 @@ export const MODULE_GROUP_MAP: Record<string, string[]> = {
   analytics: ['analytics'],
   crm: ['leads', 'crmContacts', 'crmCompanies'],
   vendor: ['vendorProfile'],
-  operations: ['supportTickets'],
+  operations: ['supportTickets', 'tasks', 'directCustomers'],
 }

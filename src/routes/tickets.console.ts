@@ -14,6 +14,7 @@ import { uploadTicketAttachment } from "../services/ticketAttachments.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
+import { notifyUser } from "../services/notificationDispatch.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -565,6 +566,22 @@ router.patch("/:id/assign", requirePermission("supportTickets", "WRITE"), async 
     });
 
     await ticket.populate("assignedTo", "name email");
+
+    // Notify the newly assigned user
+    if (assignUserId) {
+      const workspaceId = String((req as any).user?.workspaceId || "");
+      notifyUser(
+        assignUserId,
+        workspaceId,
+        "TICKET_ASSIGNED",
+        "Ticket assigned to you",
+        ticket.subject,
+        `/admin/tickets/${ticket._id}`,
+        "TICKET",
+        ticket._id as any,
+      ).catch(() => {/* non-fatal */});
+    }
+
     return res.json({ success: true, ticket });
   } catch (err) {
     logger.error("[TicketsConsole] assign error", { err });

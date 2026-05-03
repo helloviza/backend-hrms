@@ -93,6 +93,8 @@ export interface UserPermissionDoc extends Document {
 
     // Operations
     supportTickets: ModulePermission
+    tasks: ModulePermission
+    directCustomers: ModulePermission
 
     // Sales CRM
     leads?: ModulePermission
@@ -156,6 +158,8 @@ const modulesSchema = new Schema(
 
     // Operations
     supportTickets: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    tasks: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'OWN' }) },
+    directCustomers: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'OWN' }) },
 
     // Sales CRM
     leads: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },

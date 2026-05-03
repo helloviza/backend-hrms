@@ -340,6 +340,26 @@ const CustomerSchema = new Schema(
        DEDUP INDEX
        ============================================================ */
     legalNameNormalized: { type: String, index: true },
+
+    /* ============================================================
+       WORKSPACE & CLASSIFICATION
+       ============================================================ */
+    workspaceId: {
+      type: Schema.Types.ObjectId,
+      ref: "CustomerWorkspace",
+      index: true,
+    },
+
+    customerType: {
+      type: String,
+      enum: ["BUSINESS", "DIRECT"],
+      default: "BUSINESS",
+      index: true,
+    },
+
+    createdBy: { type: Schema.Types.ObjectId, ref: "User" },
+
+    notes: { type: String, trim: true },
   },
   { timestamps: true }
 );

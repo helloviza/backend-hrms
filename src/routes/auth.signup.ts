@@ -10,6 +10,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
 import { requireAuth } from "../middleware/auth.js";
 import { sendWelcomeEmail, sendEmailVerification } from "../services/email.service.js";
+import { seedTaskAutomations } from "../services/taskAutomationSeed.js";
 
 const r = Router();
 
@@ -136,6 +137,9 @@ r.post("/signup", async (req, res) => {
         features,
       },
     });
+
+    // Seed default task automations for this workspace
+    seedTaskAutomations(workspace._id.toString()).catch(() => {});
 
     // 5. Create admin User
     const passwordHash = bcrypt.hashSync(password, 10);

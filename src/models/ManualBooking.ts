@@ -87,6 +87,15 @@ export interface IManualBooking extends Document {
   bookedBy: Schema.Types.ObjectId;
   notes?: string;
   invoiceId?: Schema.Types.ObjectId;
+  isActive?: boolean;
+  cancelledAt?: Date;
+  cancelledBy?: Schema.Types.ObjectId;
+  cancellationReason?: string;
+  cancellationNote?: string;
+  deletedAt?: Date;
+  deletedBy?: Schema.Types.ObjectId;
+  deletionReason?: string;
+  deletionNote?: string;
   createdBy?: string;
   createdByEmail?: string;
   createdAt: Date;
@@ -167,6 +176,15 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     bookedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     notes: String,
     invoiceId: { type: Schema.Types.ObjectId, ref: "Invoice" },
+    isActive: { type: Boolean, default: true, index: true },
+    cancelledAt: { type: Date },
+    cancelledBy: { type: Schema.Types.ObjectId, ref: 'User' },
+    cancellationReason: { type: String },
+    cancellationNote: { type: String },
+    deletedAt: { type: Date },
+    deletedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+    deletionReason: { type: String },
+    deletionNote: { type: String },
     createdBy: { type: String, index: true },
     createdByEmail: { type: String },
   },

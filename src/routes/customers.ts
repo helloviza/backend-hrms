@@ -43,6 +43,7 @@ router.get("/", requireAuth, requireWorkspace, requireAdmin, async (_req: any, r
         subType: c.subType || "",
         source: c.source || "",
         workspaceId: c.workspaceId || "",
+        customerType: c.customerType || "BUSINESS",
       })),
     });
   } catch (err) {

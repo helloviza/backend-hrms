@@ -9,6 +9,7 @@ import User from "../models/User.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
 import { sendWorkspaceCredentials } from "../services/email.service.js";
 import logger, { sbtLogger } from "../utils/logger.js";
+import { seedTaskAutomations } from "../services/taskAutomationSeed.js";
 import requireAuth from "../middleware/auth.js";
 import { env } from "../config/env.js";
 import {
@@ -209,6 +210,9 @@ router.post("/workspaces", async (req: any, res) => {
     // Persist slug onto the workspace document
     workspace.slug = slug;
     await workspace.save();
+
+    // Seed default task automations for this workspace
+    seedTaskAutomations(workspace._id.toString()).catch(() => {});
 
     // Generate temp password and hash it
     const tempPassword = generateTempPassword();
