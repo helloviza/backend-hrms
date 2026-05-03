@@ -5,6 +5,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import Customer from "../models/Customer.js";
+import { GST_STATE_CODES } from "../utils/gstDetection.js";
 
 const router = Router();
 
@@ -42,6 +43,7 @@ router.post(
         phone,
         address,
         gstNumber,
+        gstRegisteredState,
         panNumber,
         notes,
       } = req.body || {};
@@ -107,22 +109,26 @@ router.post(
         pincode: String(address.pincode || "").trim(),
       } : {};
 
+      const gstState = gstRegisteredState ? String(gstRegisteredState).trim() : undefined;
+
       const doc = await Customer.create({
-        workspaceId:  wsId,
-        customerType: "DIRECT",
+        workspaceId:          wsId,
+        customerType:         "DIRECT",
         customerCode,
         name,
-        legalName:    name,
-        companyName:  name,
+        legalName:            name,
+        companyName:          name,
         email,
-        phone:        phone ? String(phone).trim() : undefined,
-        address:      normalizedAddress,
-        gstNumber:    gstNumber ? String(gstNumber).toUpperCase().trim() : undefined,
-        panNumber:    panNumber ? String(panNumber).toUpperCase().trim() : undefined,
-        notes:        notes ? String(notes).trim() : undefined,
-        type:         "CUSTOMER",
-        status:       "ACTIVE",
-        createdBy:    new mongoose.Types.ObjectId(String(req.user._id || req.user.id || req.user.sub)),
+        phone:                phone ? String(phone).trim() : undefined,
+        address:              normalizedAddress,
+        gstNumber:            gstNumber ? String(gstNumber).toUpperCase().trim() : undefined,
+        gstRegisteredState:   gstState,
+        gstRegisteredStateCode: gstState ? (GST_STATE_CODES[gstState] || "") : undefined,
+        panNumber:            panNumber ? String(panNumber).toUpperCase().trim() : undefined,
+        notes:                notes ? String(notes).trim() : undefined,
+        type:                 "CUSTOMER",
+        status:               "ACTIVE",
+        createdBy:            new mongoose.Types.ObjectId(String(req.user._id || req.user.id || req.user.sub)),
       } as any);
 
       return res.status(201).json({

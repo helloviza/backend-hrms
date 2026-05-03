@@ -262,6 +262,12 @@ const CustomerSchema = new Schema(
     zohoSource: { type: String, trim: true },
 
     /* ============================================================
+       GST REGISTRATION STATE (for invoice tax calculation)
+       ============================================================ */
+    gstRegisteredState: { type: String, trim: true },
+    gstRegisteredStateCode: { type: String, trim: true },
+
+    /* ============================================================
        TAX
        ============================================================ */
     taxable: { type: Boolean },
