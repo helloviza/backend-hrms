@@ -13,6 +13,7 @@ import {
   ensureUniqueSlug,
   provisionNewTenant,
 } from "../services/tenantProvisioning.js";
+import { seedTaskAutomations } from "../services/taskAutomationSeed.js";
 import { env } from "../config/env.js";
 import { sbtLogger } from "../utils/logger.js";
 
@@ -121,6 +122,9 @@ router.post("/", async (req, res) => {
       trialEndsAt,
       "config.features": defaultFeatures,
     });
+
+    // Seed default task automations for this workspace
+    seedTaskAutomations(workspace._id.toString()).catch(() => {});
 
     const passwordHash = await bcrypt.hash(String(password), 12);
 

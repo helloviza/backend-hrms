@@ -9,7 +9,10 @@ import type { LeadStage } from "../models/Lead.js";
 import type { ActivityType } from "../models/LeadActivity.js";
 import { UserPermission } from "../models/UserPermission.js";
 import User from "../models/User.js";
+import Task from "../models/Task.js";
 import { requireAuth } from "../middleware/auth.js";
+import { triggerTaskAutomation } from "../services/taskAutomation.js";
+import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import logger from "../utils/logger.js";
 
 const router = express.Router();
@@ -207,6 +210,19 @@ router.post("/", async (req, res) => {
         createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
       });
     }
+
+    // Task automation hook — fire-and-forget, never breaks lead creation
+    triggerTaskAutomation("lead.created", {
+      workspaceId: SYSTEM_WORKSPACE_ID,
+      entityType: "LEAD",
+      entityId: lead._id as mongoose.Types.ObjectId,
+      entityRef: lead.leadCode,
+      ownerId: lead.assignedTo,
+      variables: {
+        leadName: lead.contactName || lead.companyName || "Lead",
+        ownerName: lead.assignedToName || "",
+      },
+    }).catch(() => {});
 
     return res.status(201).json({ lead });
   } catch (err) {
@@ -676,6 +692,7 @@ router.put("/:id", async (req, res) => {
     ]);
 
     const body = req.body as AnyObj;
+    const hadFollowUpDate = !!(lead as any).nextFollowUpDate;
     for (const key of Object.keys(body)) {
       if (!PROTECTED.has(key)) {
         (lead as any)[key] = body[key];
@@ -683,6 +700,23 @@ router.put("/:id", async (req, res) => {
     }
 
     await lead.save();
+
+    // Task automation for next follow-up date change
+    if (body.nextFollowUpDate && lead.nextFollowUpDate) {
+      const followUpDate = new Date(body.nextFollowUpDate);
+      if (!isNaN(followUpDate.getTime())) {
+        triggerTaskAutomation("lead.next_followup", {
+          workspaceId: SYSTEM_WORKSPACE_ID,
+          entityType: "LEAD",
+          entityId: lead._id as mongoose.Types.ObjectId,
+          entityRef: lead.leadCode,
+          ownerId: lead.assignedTo,
+          eventDate: followUpDate,
+          variables: { leadName: lead.contactName || lead.companyName || "Lead" },
+        }).catch(() => {});
+      }
+    }
+
     return res.json({ lead });
   } catch (err) {
     logger.error("leads PUT /:id error", { err });
@@ -738,6 +772,24 @@ router.put("/:id/stage", async (req, res) => {
         : undefined,
       createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
+
+    // Task automation hook for stage transitions
+    const stageMap: Record<string, string> = {
+      contacted: "lead.stage_contacted",
+      demo_scheduled: "lead.stage_demo",
+      proposal_sent: "lead.stage_proposal",
+    };
+    const stageTrigger = stageMap[stage];
+    if (stageTrigger) {
+      triggerTaskAutomation(stageTrigger, {
+        workspaceId: SYSTEM_WORKSPACE_ID,
+        entityType: "LEAD",
+        entityId: lead._id as mongoose.Types.ObjectId,
+        entityRef: lead.leadCode,
+        ownerId: lead.assignedTo,
+        variables: { leadName: lead.contactName || lead.companyName || "Lead" },
+      }).catch(() => {});
+    }
 
     return res.json({ lead });
   } catch (err) {
@@ -832,6 +884,17 @@ router.post("/:id/assign", async (req, res) => {
         : undefined,
       createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
+
+    // Reassignment cascade: update all open auto-tasks for this lead
+    Task.updateMany(
+      {
+        linkedType: "LEAD",
+        linkedId: lead._id,
+        status: { $in: ["OPEN", "IN_PROGRESS"] },
+        autoTriggerKey: { $exists: true },
+      },
+      { $set: { assignedTo: lead.assignedTo } }
+    ).catch((err: any) => logger.error("leads assign cascade error", { err }));
 
     return res.json({ lead });
   } catch (err) {
@@ -955,6 +1018,16 @@ router.post("/:id/win", async (req, res) => {
       createdBy: createdById,
       createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
+
+    // Task automation hook
+    triggerTaskAutomation("lead.won", {
+      workspaceId: SYSTEM_WORKSPACE_ID,
+      entityType: "LEAD",
+      entityId: lead._id as mongoose.Types.ObjectId,
+      entityRef: lead.leadCode,
+      ownerId: lead.assignedTo,
+      variables: { leadName: lead.contactName || lead.companyName || "Lead" },
+    }).catch(() => {});
 
     return res.json({ lead });
   } catch (err) {
@@ -1140,6 +1213,15 @@ router.post("/:id/convert", async (req, res) => {
       createdBy: createdById,
       createdByName: byName,
     });
+
+    triggerTaskAutomation("lead.won", {
+      workspaceId: SYSTEM_WORKSPACE_ID,
+      entityType: "LEAD",
+      entityId: lead._id as mongoose.Types.ObjectId,
+      entityRef: lead.leadCode,
+      ownerId: lead.assignedTo,
+      variables: { leadName: lead.contactName || lead.companyName || "Lead" },
+    }).catch(() => {});
 
     return res.json({ contact, company, lead });
   } catch (err) {
