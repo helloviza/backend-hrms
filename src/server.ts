@@ -325,6 +325,10 @@ app.use("/api/signup", selfServiceSignupRouter);
 import saasSignupRouter from "./routes/saas.signup.js";
 app.use("/api/saas", saasSignupRouter);
 
+// SaaS HRMS setup-progress API (authenticated)
+import saasSetupRouter from "./routes/saas.setup.js";
+app.use("/api/saas", saasSetupRouter);
+
 app.use("/api/users", users);
 
 // HRMS
