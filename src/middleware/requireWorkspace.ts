@@ -47,7 +47,7 @@ function isCustomerUser(user: any): boolean {
   return roles.some((r) => CUSTOMER_ROLES.has(r));
 }
 
-const WS_SELECT = "_id customerId status config travelMode";
+const WS_SELECT = "_id customerId status config travelMode tenantType";
 
 /**
  * resolveWorkspaceById — resolves by workspace _id, then falls back to customerId.
