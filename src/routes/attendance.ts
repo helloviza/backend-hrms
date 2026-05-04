@@ -79,7 +79,7 @@ r.post("/punch-out", requireWorkspace, audit("punch-out"), async (req: any, res)
  *    used by /api/stats/dashboard
  * 2) from/to/userId           → legacy mode, returns { items }
  */
-r.get("/reports", async (req, res) => {
+r.get("/reports", requireWorkspace, async (req, res) => {
   const { from, to, userId: userIdParam, range } = req.query as any;
 
   // ───────────────── monthly summary for current user (used by stats.ts) ─────────────────
@@ -97,6 +97,7 @@ r.get("/reports", async (req, res) => {
     const toStr = end.format("YYYY-MM-DD");
 
     const records: any[] = await Attendance.find({
+      workspaceId: (req as any).workspaceObjectId,
       userId: authUserId,
       date: { $gte: fromStr, $lte: toStr },
     }).lean();
@@ -140,7 +141,7 @@ r.get("/reports", async (req, res) => {
     return res.status(403).json({ error: "Cannot view other users attendance" });
   }
 
-  const q: any = {};
+  const q: any = { workspaceId: (req as any).workspaceObjectId };
   if (targetUserId) q.userId = targetUserId;
   if (from && to) q.date = { $gte: from, $lte: to };
 
