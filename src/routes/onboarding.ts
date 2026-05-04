@@ -555,7 +555,7 @@ try {
 });
 
 /** 📋 List invites */
-router.get("/invites", requireAuth, noStore, async (req, res, next) => {
+router.get("/invites", requireAuth, requireWorkspace, noStore, async (req, res, next) => {
   try {
     const { type } = req.query as { type?: string };
     const filter: Record<string, any> = {};
@@ -856,7 +856,7 @@ await syncCustomerFromOnboarding(invite);
 });
 
 /** 🧾 Pipeline summary */
-router.get("/pipeline", requireAuth, noStore, async (req, res, next) => {
+router.get("/pipeline", requireAuth, requireWorkspace, noStore, async (req, res, next) => {
   try {
     const { type } = req.query as { type?: string };
     const filter: Record<string, any> = {};
