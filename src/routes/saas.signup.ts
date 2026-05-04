@@ -12,6 +12,7 @@ import { sendMail } from "../utils/mailer.js";
 import { buildEmailShell, escapeHtml } from "./approvals.email.js";
 import { generateSlug, ensureUniqueSlug } from "../services/tenantProvisioning.js";
 import { env } from "../config/env.js";
+import TenantSetupProgress from "../models/TenantSetupProgress.js";
 
 const r = Router();
 
@@ -127,7 +128,15 @@ r.post("/signup", async (req, res) => {
     workspace.adminUserId = user._id as any;
     await workspace.save();
 
-    // 9. Welcome email (non-blocking)
+    // 9. Initialize TenantSetupProgress for this new SaaS HRMS tenant
+    await TenantSetupProgress.create({
+      workspaceId: workspace._id,
+      tenantType: "SAAS_HRMS",
+      currentStage: "WELCOME",
+      lastActivityAt: new Date(),
+    });
+
+    // 10. Welcome email (non-blocking)
     const loginUrl = String(env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com");
     const emailContent = `
       <p>Hi ${escapeHtml(adminName.trim())},</p>
@@ -158,7 +167,7 @@ r.post("/signup", async (req, res) => {
       html,
     }).catch(() => {});
 
-    // 10. Return response
+    // 11. Return response
     return res.status(201).json({
       success: true,
       workspaceId: workspace._id.toString(),
