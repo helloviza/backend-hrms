@@ -44,6 +44,8 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction) {
     "HR_ADMIN",
     "OPS",
     "OPS_ADMIN",
+    "TENANT_ADMIN",
+    "WORKSPACE_ADMIN",
   ]);
 
   if (!ok) {

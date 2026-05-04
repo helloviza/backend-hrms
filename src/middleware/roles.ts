@@ -6,7 +6,7 @@ import { isSuperAdmin } from "./isSuperAdmin.js";
  * the same guards as canonical roles.
  */
 const ROLE_ALIASES: Record<string, string[]> = {
-  ADMIN: ["ADMIN", "WORKSPACE_ADMIN"],
+  ADMIN: ["ADMIN", "WORKSPACE_ADMIN", "TENANT_ADMIN"],
   HR: ["HR", "HR_MANAGER"],
   MANAGER: ["MANAGER"],
   EMPLOYEE: ["EMPLOYEE"],
