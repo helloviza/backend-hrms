@@ -6,6 +6,7 @@ import fs from "fs";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 
 const router = Router();
 
@@ -345,7 +346,7 @@ async function buildTravelerIdMap(rows: any[]): Promise<Map<string, string>> {
 /**
  * GET /api/booking-history/admin/history?states=done,cancelled   (Admin only)
  */
-router.get("/admin/history", requireAuth, async (req: Request, res: Response) => {
+router.get("/admin/history", requireAuth, requireWorkspace, async (req: Request, res: Response) => {
   const user = (req as any).user;
   if (!isAdmin(user)) return res.status(403).json({ ok: false, error: "Forbidden" });
 
@@ -354,7 +355,8 @@ router.get("/admin/history", requireAuth, async (req: Request, res: Response) =>
     .map((s: string) => s.trim())
     .filter(Boolean);
 
-  const rows = await ApprovalRequest.find({ adminState: { $in: states } } as any)
+  const wsFilter = (req as any).workspaceObjectId ? { workspaceId: (req as any).workspaceObjectId } : {};
+  const rows = await ApprovalRequest.find({ adminState: { $in: states }, ...wsFilter } as any)
     .sort({ updatedAt: -1 })
     .lean();
 
@@ -394,7 +396,7 @@ router.get("/admin/history", requireAuth, async (req: Request, res: Response) =>
  * - Workspace Leader (Customer/Business) => org-wide view (resolved via email)
  * - Requester => email-scoped view
  */
-router.get("/history", requireAuth, async (req: Request, res: Response) => {
+router.get("/history", requireAuth, requireWorkspace, async (req: Request, res: Response) => {
   const user = (req as any).user;
 
   if (!canViewBookingHistory(user)) {
@@ -408,8 +410,9 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
 
   const base: any = { adminState: { $in: states } };
 
-  // Staff sees all
+  // Staff sees all (within their workspace)
   if (isStaffViewer(user)) {
+    if ((req as any).workspaceObjectId) base.workspaceId = (req as any).workspaceObjectId;
     const rows = await ApprovalRequest.find(base as any).sort({ updatedAt: -1 }).lean();
     const travelerMap = await buildTravelerIdMap(rows);
     return res.json({

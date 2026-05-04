@@ -1076,8 +1076,7 @@ router.get("/admin/pending", requireApprovalsAdminRead, async (req: AnyObj, res,
   try {
     setNoStore(res);
     const baseFilter = adminQueueFilter("pending");
-    const qsWs = String(req.query?.workspaceId || "").trim();
-    if (qsWs && mongoose.Types.ObjectId.isValid(qsWs)) (baseFilter as any).workspaceId = new mongoose.Types.ObjectId(qsWs);
+    if (req.workspaceObjectId) (baseFilter as any).workspaceId = req.workspaceObjectId;
     const scoped = applyLeaderScopeIfNeeded(req, baseFilter);
     const rows = await ApprovalRequest.find(scoped)
       .sort({ updatedAt: -1, createdAt: -1 })
@@ -1094,8 +1093,7 @@ router.get("/admin/approved", requireApprovalsAdminRead, async (req: AnyObj, res
     setNoStore(res);
 
     const { includeClosed, adminState, q, filter } = buildAdminApprovedQueryFromParams(req);
-    const qsWs = String(req.query?.workspaceId || "").trim();
-    if (qsWs && mongoose.Types.ObjectId.isValid(qsWs)) (filter as any).workspaceId = new mongoose.Types.ObjectId(qsWs);
+    if (req.workspaceObjectId) (filter as any).workspaceId = req.workspaceObjectId;
 
     if (process.env.NODE_ENV !== "production") {
       // eslint-disable-next-line no-console
@@ -1118,8 +1116,7 @@ router.get("/admin/done", requireApprovalsAdminRead, async (req: AnyObj, res, ne
   try {
     setNoStore(res);
     const doneFilter = adminQueueFilter("done");
-    const qsWsDone = String(req.query?.workspaceId || "").trim();
-    if (qsWsDone && mongoose.Types.ObjectId.isValid(qsWsDone)) (doneFilter as any).workspaceId = new mongoose.Types.ObjectId(qsWsDone);
+    if (req.workspaceObjectId) (doneFilter as any).workspaceId = req.workspaceObjectId;
     const scoped = applyLeaderScopeIfNeeded(req, doneFilter);
     const rows = await ApprovalRequest.find(scoped)
       .sort({ updatedAt: -1, createdAt: -1 })
@@ -1135,8 +1132,7 @@ router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res
   try {
     setNoStore(res);
     const rejFilter = adminQueueFilter("rejected");
-    const qsWsRej = String(req.query?.workspaceId || "").trim();
-    if (qsWsRej && mongoose.Types.ObjectId.isValid(qsWsRej)) (rejFilter as any).workspaceId = new mongoose.Types.ObjectId(qsWsRej);
+    if (req.workspaceObjectId) (rejFilter as any).workspaceId = req.workspaceObjectId;
     const scoped = applyLeaderScopeIfNeeded(req, rejFilter);
     const rows = await ApprovalRequest.find(scoped)
       .sort({ updatedAt: -1, createdAt: -1 })

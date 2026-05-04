@@ -501,6 +501,7 @@ r.get(
       const items = await Leave.find({
         userId: { $in: teamUserIds },
         status: "PENDING",
+        workspaceId: (req as any).workspaceObjectId,
       })
         .populate("userId", "firstName lastName email name")
         .sort({ createdAt: -1 });
@@ -569,6 +570,7 @@ r.get(
 
       const leaveQuery: any = {
         status: "APPROVED",
+        ...(wsId ? { workspaceId: wsId } : {}),
         $or: [{ from: { $lte: monthEnd }, to: { $gte: monthStart } }],
         ...userFilter,
       };

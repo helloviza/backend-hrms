@@ -11,6 +11,7 @@ import { UserPermission } from "../models/UserPermission.js";
 import User from "../models/User.js";
 import Task from "../models/Task.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import logger from "../utils/logger.js";
@@ -164,6 +165,7 @@ router.use(requireAuth);
 
 // ── Leads access gate (all routes below require leads module) ───
 router.use(requireLeadsAccess);
+router.use(requireWorkspace);
 
 // ═══════════════════════════════════════════════════════════════
 // ROUTE 1 — POST /  (create lead)
@@ -241,6 +243,8 @@ router.get("/", async (req, res) => {
     const leadsScope = (req as any).leadsScope as string;
     const q = req.query as AnyObj;
     const filter: AnyObj = {};
+    // TODO(T-015): Lead model lacks workspaceId stamp — defense-in-depth, returns empty until backfilled
+    if ((req as any).workspaceObjectId) filter.workspaceId = (req as any).workspaceObjectId;
 
     if (leadsScope === "OWN") {
       const uid = userId(user);
