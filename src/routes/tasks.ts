@@ -2,7 +2,6 @@ import express from 'express'
 import mongoose from 'mongoose'
 import { requireAuth } from '../middleware/auth.js'
 import { requirePermission } from '../middleware/requirePermission.js'
-import { requireWorkspace } from '../middleware/requireWorkspace.js'
 import Task, { TASK_PRIORITIES, TASK_STATUSES, TASK_LINKED_TYPES } from '../models/Task.js'
 import Lead from '../models/Lead.js'
 import User from '../models/User.js'
@@ -12,7 +11,6 @@ import { notifyUser } from '../services/notificationDispatch.js'
 const router = express.Router()
 
 router.use(requireAuth)
-router.use(requireWorkspace)
 
 type AnyObj = Record<string, any>
 
@@ -81,9 +79,7 @@ router.get('/counts', requirePermission('tasks', 'READ'), async (req, res) => {
     const todayEnd = endOfDay(now)
     const weekEnd = endOfDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 7))
 
-    const wsId = (req as any).workspaceObjectId
     const baseFilter: AnyObj = { isActive: true }
-    if (wsId) baseFilter.workspaceId = wsId
     if (access !== 'FULL') {
       if (mongoose.isValidObjectId(myId)) {
         baseFilter.assignedTo = new mongoose.Types.ObjectId(myId)
@@ -135,9 +131,7 @@ router.get('/', requirePermission('tasks', 'READ'), async (req, res) => {
     const myId = uid(user)
     const q = req.query as AnyObj
 
-    const wsId = (req as any).workspaceObjectId
     const filter: AnyObj = { isActive: true }
-    if (wsId) filter.workspaceId = wsId
 
     // Assignee filter
     const assignedTo = q.assignedTo || 'me'
@@ -261,7 +255,7 @@ router.post('/', requirePermission('tasks', 'WRITE'), async (req, res) => {
 
     const createdById = uid(user)
     const task = await Task.create({
-      workspaceId: (req as any).workspaceObjectId || undefined,
+      workspaceId: (user as any).workspaceId || undefined,
       title: String(body.title).trim().slice(0, 200),
       description: body.description ? String(body.description).trim() : undefined,
       assignedTo: new mongoose.Types.ObjectId(assignedToId),
@@ -316,12 +310,7 @@ router.get('/:id', requirePermission('tasks', 'READ'), async (req, res) => {
     const access = (req as any).permissionAccess as string
     const myId = uid(user)
 
-    const taskWsId = (req as any).workspaceObjectId
-    const task = await Task.findOne({
-      _id: req.params.id,
-      isActive: true,
-      ...(taskWsId && { workspaceId: taskWsId }),
-    })
+    const task = await Task.findOne({ _id: req.params.id, isActive: true })
       .populate('assignedTo', 'name email')
       .populate('createdBy', 'name email')
       .lean() as any
@@ -358,12 +347,7 @@ router.patch('/:id', requirePermission('tasks', 'WRITE'), async (req, res) => {
     const myId = uid(user)
     const body = req.body as AnyObj
 
-    const patchWsId = (req as any).workspaceObjectId
-    const task = await Task.findOne({
-      _id: req.params.id,
-      isActive: true,
-      ...(patchWsId && { workspaceId: patchWsId }),
-    })
+    const task = await Task.findOne({ _id: req.params.id, isActive: true })
     if (!task) return res.status(404).json({ error: 'Task not found' })
 
     // Reassignment requires FULL permission or being the creator
@@ -425,12 +409,7 @@ router.delete('/:id', requirePermission('tasks', 'FULL'), async (req, res) => {
       return res.status(400).json({ error: 'Invalid task ID' })
     }
 
-    const delWsId = (req as any).workspaceObjectId
-    const task = await Task.findOne({
-      _id: req.params.id,
-      isActive: true,
-      ...(delWsId && { workspaceId: delWsId }),
-    })
+    const task = await Task.findOne({ _id: req.params.id, isActive: true })
     if (!task) return res.status(404).json({ error: 'Task not found' })
 
     task.isActive = false

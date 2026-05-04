@@ -639,10 +639,9 @@ r.patch("/admin/users/:id/sbt", requireAuth, requireWorkspace, async (req: any, 
 
     const { sbtEnabled, sbtBookingType } = req.body;
 
-    const targetUser: any = await User.findOne({
-      _id: req.params.id,
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
-    }).lean();
+    // Step 1: find by ID only — no workspaceId filter (CUSTOMER users have a
+    // CustomerWorkspace._id as their workspaceId, not a staff workspace _id)
+    const targetUser: any = await User.findById(req.params.id).lean();
     if (!targetUser) return res.status(404).json({ error: "User not found" });
 
     // Step 2: authorization check for WORKSPACE_LEADER callers

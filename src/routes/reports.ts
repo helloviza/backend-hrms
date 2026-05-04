@@ -5,7 +5,6 @@ import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import { requirePermission } from "../middleware/requirePermission.js";
-import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import ManualBooking from "../models/ManualBooking.js";
 import Invoice from "../models/Invoice.js";
 import ReportSchedule from "../models/ReportSchedule.js";
@@ -15,7 +14,6 @@ import { sendReportEmail } from "../utils/reportMailer.js";
 
 const router = express.Router();
 router.use(requireAuth);
-router.use(requireWorkspace);
 
 /* ── Types ─────────────────────────────────────────────────────── */
 
@@ -646,8 +644,8 @@ export async function getReportData(filters: {
 
 router.get("/summary", requirePermission("reports", "READ"), async (req, res, next) => {
   try {
-    const { dateFrom, dateTo, type, status } = req.query as Record<string, string>;
-    const data = await getReportData({ dateFrom, dateTo, workspaceId: req.workspaceObjectId?.toString(), type, status });
+    const { dateFrom, dateTo, workspaceId, type, status } = req.query as Record<string, string>;
+    const data = await getReportData({ dateFrom, dateTo, workspaceId, type, status });
     res.json(data);
   } catch (err) {
     next(err);
@@ -671,9 +669,9 @@ function fmtNum(n: number | null | undefined): number {
 
 router.get("/export", requirePermission("reports", "FULL"), async (req, res, next) => {
   try {
-    const { dateFrom, dateTo, type, status, format } = req.query as Record<string, string>;
+    const { dateFrom, dateTo, workspaceId, type, status, format } = req.query as Record<string, string>;
 
-    const data = await getReportData({ dateFrom, dateTo, workspaceId: req.workspaceObjectId?.toString(), type, status });
+    const data = await getReportData({ dateFrom, dateTo, workspaceId, type, status });
 
     const fname = `plumtrips-report-${dateFrom || "all"}-${dateTo || "all"}`;
 
@@ -824,12 +822,14 @@ router.post("/send-now", requirePermission("reports", "WRITE"), async (req, res,
       recipients,
       dateFrom,
       dateTo,
+      workspaceId,
       type,
       // includeUnpaid intentionally kept for future use but we always include
     } = req.body as {
       recipients: string[];
       dateFrom?: string;
       dateTo?: string;
+      workspaceId?: string;
       type?: string;
       includeUnpaid?: boolean;
     };
@@ -838,7 +838,7 @@ router.post("/send-now", requirePermission("reports", "WRITE"), async (req, res,
       return res.status(400).json({ error: "recipients is required" });
     }
 
-    const data = await getReportData({ dateFrom, dateTo, workspaceId: req.workspaceObjectId?.toString(), type });
+    const data = await getReportData({ dateFrom, dateTo, workspaceId, type });
 
     const fromStr = dateFrom ? new Date(dateFrom).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "All time";
     const toStr = dateTo ? new Date(dateTo).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "Today";
