@@ -45,11 +45,13 @@ function hasOrgManageRights(user: any): boolean {
 router.get(
   "/org-chart",
   requireAuth as any,
+  requireWorkspace as any,
   requireRoles("ADMIN", "SUPERADMIN", "HR", "MANAGER", "EMPLOYEE") as any,
   async (req: any, res: any, next: any) => {
     try {
       const employees = await EmployeeModel.find(
         {
+          workspaceId: req.workspaceObjectId,
           // treat isActive=false as hidden if field exists
           $or: [{ isActive: { $ne: false } }, { isActive: { $exists: false } }],
         },
