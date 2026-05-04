@@ -2,7 +2,6 @@ import express from "express";
 import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
-import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { UserPermission } from "../models/UserPermission.js";
 import Ticket from "../models/Ticket.js";
 import TicketMessage from "../models/TicketMessage.js";
@@ -25,7 +24,6 @@ const upload = multer({
 const router = express.Router();
 
 router.use(requireAuth);
-router.use(requireWorkspace);
 
 /* ── GET / — list tickets with filters ────────────────────────── */
 router.get("/", requirePermission("supportTickets", "READ"), async (req, res) => {
@@ -34,7 +32,6 @@ router.get("/", requirePermission("supportTickets", "READ"), async (req, res) =>
     const userId = (req as any).user?._id || (req as any).user?.id;
 
     const filter: Record<string, any> = {};
-    if (req.workspaceObjectId) filter.workspaceId = req.workspaceObjectId;
     if (status) filter.status = status;
     if (priority) filter.priority = priority;
 
@@ -262,10 +259,7 @@ router.get("/users", requirePermission("supportTickets", "READ"), async (req, re
 /* ── GET /:id — ticket detail with messages ─────────────────────── */
 router.get("/:id", requirePermission("supportTickets", "READ"), async (req, res) => {
   try {
-    const ticket = await Ticket.findOne({
-      _id: req.params.id,
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
-    })
+    const ticket = await Ticket.findById(req.params.id)
       .populate("assignedTo", "name email")
       .lean();
     if (!ticket) return res.status(404).json({ success: false, error: "Ticket not found" });
@@ -308,10 +302,7 @@ router.post("/:id/reply", requirePermission("supportTickets", "WRITE"), upload, 
     const userEmail = (req as any).user?.email || "";
     const uploadedFiles = (req.files as Express.Multer.File[]) || [];
 
-    const ticket = await Ticket.findOne({
-      _id: req.params.id,
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
-    });
+    const ticket = await Ticket.findById(req.params.id);
     if (!ticket) return res.status(404).json({ success: false, error: "Ticket not found" });
 
     // Upload any attached files to S3 first (applies to both notes and replies)
@@ -510,10 +501,7 @@ router.patch("/:id/status", requirePermission("supportTickets", "WRITE"), async 
     const userId = (req as any).user?._id || (req as any).user?.id;
     const userEmail = (req as any).user?.email || "";
 
-    const ticket = await Ticket.findOne({
-      _id: req.params.id,
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
-    });
+    const ticket = await Ticket.findById(req.params.id);
     if (!ticket) return res.status(404).json({ success: false, error: "Ticket not found" });
 
     const prevStatus = ticket.status;

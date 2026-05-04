@@ -116,7 +116,6 @@ const router = express.Router();
 
 router.use(requireAuth);
 router.use(requireAdmin);
-router.use(requireWorkspace);
 
 /* ── GST helpers ─────────────────────────────────────────────────── */
 
@@ -762,7 +761,7 @@ router.get("/", requirePermission("invoices", "READ"), async (req: any, res: any
     const limit = Math.min(100, parseInt(req.query.limit) || 20);
     const filter: Record<string, any> = {};
 
-    if (req.workspaceObjectId) filter.workspaceId = req.workspaceObjectId;
+    if (req.query.workspaceId) filter.workspaceId = req.query.workspaceId;
     if (req.query.status) filter.status = req.query.status;
 
     if (req.query.dateFrom || req.query.dateTo) {
@@ -789,7 +788,7 @@ router.get("/", requirePermission("invoices", "READ"), async (req: any, res: any
 router.get("/export", requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
     const filter: Record<string, any> = {};
-    if (req.workspaceObjectId) filter.workspaceId = req.workspaceObjectId;
+    if (req.query.workspaceId) filter.workspaceId = req.query.workspaceId;
     if (req.query.status) filter.status = req.query.status;
     if (req.query.dateFrom || req.query.dateTo) {
       filter.generatedAt = {};
@@ -850,7 +849,6 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
 
     const invoice = await Invoice.collection.findOne({
       _id: new mongoose.Types.ObjectId(req.params.id),
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
     });
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
@@ -943,7 +941,6 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
 
     const updatedInvoice = await Invoice.collection.findOne({
       _id: new mongoose.Types.ObjectId(req.params.id),
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
     });
 
     res.json({ ok: true, invoice: updatedInvoice });
@@ -967,11 +964,9 @@ function timeAgo(date: Date): string {
 }
 
 // GET /api/admin/invoices/activity
-router.get("/activity", requirePermission("invoices", "READ"), async (req: any, res: any) => {
+router.get("/activity", requirePermission("invoices", "READ"), async (_req: any, res: any) => {
   try {
-    const activityFilter: Record<string, any> = {};
-    if (req.workspaceObjectId) activityFilter.workspaceId = req.workspaceObjectId;
-    const invoices = await Invoice.find(activityFilter)
+    const invoices = await Invoice.find({})
       .sort({ updatedAt: -1 })
       .limit(10)
       .lean();
@@ -1015,26 +1010,22 @@ router.get("/activity", requirePermission("invoices", "READ"), async (req: any, 
 /* ── Insight ──────────────────────────────────────────────────────── */
 
 // GET /api/admin/invoices/insight
-router.get("/insight", requirePermission("invoices", "READ"), async (req: any, res: any) => {
+router.get("/insight", requirePermission("invoices", "READ"), async (_req: any, res: any) => {
   try {
     const now            = new Date();
     const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const wsFilter = req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {};
 
     const [totalThisMonth, paidThisMonth, paidWithin15, outstandingAgg] =
       await Promise.all([
         Invoice.countDocuments({
-          ...wsFilter,
           generatedAt: { $gte: thisMonthStart },
           status: { $ne: "CANCELLED" },
         }),
         Invoice.countDocuments({
-          ...wsFilter,
           generatedAt: { $gte: thisMonthStart },
           status: "PAID",
         }),
         Invoice.countDocuments({
-          ...wsFilter,
           generatedAt: { $gte: thisMonthStart },
           status: "PAID",
           $expr: {
@@ -1045,7 +1036,7 @@ router.get("/insight", requirePermission("invoices", "READ"), async (req: any, r
           },
         }),
         Invoice.aggregate([
-          { $match: { ...wsFilter, status: { $in: ["DRAFT", "SENT"] } } },
+          { $match: { status: { $in: ["DRAFT", "SENT"] } } },
           { $group: { _id: null, total: { $sum: "$grandTotal" } } },
         ]),
       ]);
@@ -1094,10 +1085,7 @@ router.post("/:id/cancel", requirePermission("invoices", "FULL"), async (req: an
       return res.status(400).json({ error: "Cancellation reason is required" });
     }
 
-    const invoice = await Invoice.findOne({
-      _id: req.params.id,
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
-    });
+    const invoice = await Invoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
     if (invoice.status === "CANCELLED") {
@@ -1140,10 +1128,7 @@ router.post("/:id/cancel", requirePermission("invoices", "FULL"), async (req: an
 // PATCH /api/admin/invoices/:id
 router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
   try {
-    const invoice = await Invoice.findOne({
-      _id: req.params.id,
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
-    });
+    const invoice = await Invoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
     if (invoice.status !== "DRAFT") {
@@ -1241,10 +1226,7 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
 // GET /api/admin/invoices/:id
 router.get("/:id", requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
-    const invoice = await Invoice.findOne({
-      _id: req.params.id,
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
-    }).lean();
+    const invoice = await Invoice.findById(req.params.id).lean();
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
     const enrichedClient = await enrichClientDetails(invoice);
     res.json({ ok: true, invoice: { ...invoice, clientDetails: enrichedClient } });
@@ -1264,10 +1246,7 @@ router.put("/:id/status", requirePermission("invoices", "WRITE"), async (req: an
       paidAt?: string;
     };
 
-    const invoice = await Invoice.findOne({
-      _id: req.params.id,
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
-    });
+    const invoice = await Invoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
     invoice.status = status;
@@ -1289,7 +1268,6 @@ router.post("/:id/pdf", requirePermission("invoices", "WRITE"), async (req: any,
   try {
     const invoice = await Invoice.collection.findOne({
       _id: new mongoose.Types.ObjectId(req.params.id),
-      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
     });
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 

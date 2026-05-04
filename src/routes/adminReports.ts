@@ -2,7 +2,6 @@
 import express from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
-import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import Attendance from "../models/Attendance.js";
 import Leave from "../models/Leave.js";
 import Vendor from "../models/Vendor.js";
@@ -10,7 +9,6 @@ import Vendor from "../models/Vendor.js";
 const router = express.Router();
 router.use(requireAuth);
 router.use(requireAdmin);
-router.use(requireWorkspace);
 
 function csvEscape(value: unknown): string {
   if (value === null || value === undefined) return "";
@@ -58,8 +56,7 @@ router.get("/reports/attendance.csv", async (req, res, next) => {
       ? { date: { $gte: from, $lte: to } }
       : {};
 
-    const wsFilter = (req as any).workspaceObjectId ? { workspaceId: (req as any).workspaceObjectId } : {};
-    const rows = await Attendance.find({ ...dateFilter, ...wsFilter }).lean();
+    const rows = await Attendance.find(dateFilter).lean();
 
     const header = [
       "UserId",
@@ -119,8 +116,7 @@ router.get("/reports/leaves.csv", async (req, res, next) => {
       ? { startDate: { $gte: from, $lte: to } }
       : {};
 
-    const wsFilter = (req as any).workspaceObjectId ? { workspaceId: (req as any).workspaceObjectId } : {};
-    const rows = await Leave.find({ ...dateFilter, ...wsFilter }).lean();
+    const rows = await Leave.find(dateFilter).lean();
 
     const header = [
       "EmployeeId",
@@ -173,9 +169,7 @@ router.get("/reports/leaves.csv", async (req, res, next) => {
 
 router.get("/reports/vendors.csv", async (req, res, next) => {
   try {
-    // TODO(T-015): Vendor model may lack workspaceId stamp — filter is defense-in-depth
-    const wsFilter = (req as any).workspaceObjectId ? { workspaceId: (req as any).workspaceObjectId } : {};
-    const rows = await Vendor.find(wsFilter).lean();
+    const rows = await Vendor.find({}).lean();
 
     const header = [
       "VendorId",
