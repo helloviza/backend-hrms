@@ -5,6 +5,7 @@ import CRMCompany from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import logger from "../utils/logger.js";
 
 const router = express.Router();
@@ -27,6 +28,7 @@ function fmtDate(d: Date | null | undefined): string {
 
 router.use(requireAuth);
 router.use(requireCRMAccess("crmCompanies"));
+router.use(requireWorkspace);
 
 // ═══════════════════════════════════════════════════════════════
 // POST / — create company
@@ -77,6 +79,8 @@ router.get("/export", async (req, res) => {
     }
 
     const filter = conditions.length > 0 ? { $and: conditions } : {};
+    // TODO(T-015): CRMCompany lacks workspaceId stamp — defense-in-depth only
+    if ((req as any).workspaceObjectId) Object.assign(filter, { workspaceId: (req as any).workspaceObjectId });
     const companies = await CRMCompany.find(filter).sort({ createdAt: -1 }).limit(5000).lean();
 
     const workbook = new ExcelJS.Workbook();
@@ -154,6 +158,8 @@ router.get("/", async (req, res) => {
     if (q.industry) conditions.push({ industry: String(q.industry) });
 
     const filter = conditions.length > 0 ? { $and: conditions } : {};
+    // TODO(T-015): CRMCompany lacks workspaceId stamp — defense-in-depth only
+    if ((req as any).workspaceObjectId) Object.assign(filter, { workspaceId: (req as any).workspaceObjectId });
 
     const page = Math.max(1, parseInt(String(q.page || "1"), 10));
     const limit = Math.min(100, Math.max(1, parseInt(String(q.limit || "20"), 10)));
@@ -181,7 +187,11 @@ router.get("/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid company ID." });
     }
 
-    const company = await CRMCompany.findById(req.params.id).lean();
+    // TODO(T-015): CRMCompany lacks workspaceId stamp — defense-in-depth only
+    const company = await CRMCompany.findOne({
+      _id: req.params.id,
+      ...((req as any).workspaceObjectId && { workspaceId: (req as any).workspaceObjectId }),
+    }).lean();
     if (!company) return res.status(404).json({ error: "Company not found." });
 
     const contacts = await CRMContact.find({ companyId: company._id })
@@ -208,7 +218,11 @@ router.put("/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid company ID." });
     }
 
-    const company = await CRMCompany.findById(req.params.id);
+    // TODO(T-015): CRMCompany lacks workspaceId stamp — defense-in-depth only
+    const company = await CRMCompany.findOne({
+      _id: req.params.id,
+      ...((req as any).workspaceObjectId && { workspaceId: (req as any).workspaceObjectId }),
+    });
     if (!company) return res.status(404).json({ error: "Company not found." });
 
     const user = (req as any).user as AnyObj;
@@ -250,7 +264,11 @@ router.delete("/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid company ID." });
     }
 
-    const company = await CRMCompany.findById(req.params.id);
+    // TODO(T-015): CRMCompany lacks workspaceId stamp — defense-in-depth only
+    const company = await CRMCompany.findOne({
+      _id: req.params.id,
+      ...((req as any).workspaceObjectId && { workspaceId: (req as any).workspaceObjectId }),
+    });
     if (!company) return res.status(404).json({ error: "Company not found." });
 
     await Promise.all([

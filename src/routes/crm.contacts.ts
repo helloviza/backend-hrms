@@ -7,6 +7,7 @@ import Lead from "../models/Lead.js";
 import User from "../models/User.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import logger from "../utils/logger.js";
@@ -31,6 +32,7 @@ function fmtDate(d: Date | null | undefined): string {
 
 router.use(requireAuth);
 router.use(requireCRMAccess("crmContacts"));
+router.use(requireWorkspace);
 
 // ═══════════════════════════════════════════════════════════════
 // POST / — create contact
@@ -107,6 +109,8 @@ router.get("/export", async (req, res) => {
     }
 
     const filter = conditions.length > 0 ? { $and: conditions } : {};
+    // TODO(T-015): CRMContact lacks workspaceId stamp — defense-in-depth only
+    if ((req as any).workspaceObjectId) Object.assign(filter, { workspaceId: (req as any).workspaceObjectId });
     const contacts = await CRMContact.find(filter).sort({ createdAt: -1 }).limit(5000).lean();
 
     const exportAssignedIds = contacts
@@ -225,6 +229,8 @@ router.get("/", async (req, res) => {
     if (q.status) conditions.push({ status: String(q.status) });
 
     const filter = conditions.length > 0 ? { $and: conditions } : {};
+    // TODO(T-015): CRMContact lacks workspaceId stamp — defense-in-depth only
+    if ((req as any).workspaceObjectId) Object.assign(filter, { workspaceId: (req as any).workspaceObjectId });
 
     const page = Math.max(1, parseInt(String(q.page || "1"), 10));
     const limit = Math.min(100, Math.max(1, parseInt(String(q.limit || "20"), 10)));
@@ -278,7 +284,11 @@ router.get("/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid contact ID." });
     }
 
-    const contact = await CRMContact.findById(req.params.id).lean();
+    // TODO(T-015): CRMContact lacks workspaceId stamp — defense-in-depth only
+    const contact = await CRMContact.findOne({
+      _id: req.params.id,
+      ...((req as any).workspaceObjectId && { workspaceId: (req as any).workspaceObjectId }),
+    }).lean();
     if (!contact) return res.status(404).json({ error: "Contact not found." });
 
     let linkedLead = null;
@@ -322,7 +332,11 @@ router.put("/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid contact ID." });
     }
 
-    const contact = await CRMContact.findById(req.params.id);
+    // TODO(T-015): CRMContact lacks workspaceId stamp — defense-in-depth only
+    const contact = await CRMContact.findOne({
+      _id: req.params.id,
+      ...((req as any).workspaceObjectId && { workspaceId: (req as any).workspaceObjectId }),
+    });
     if (!contact) return res.status(404).json({ error: "Contact not found." });
 
     const user = (req as any).user as AnyObj;
@@ -371,7 +385,11 @@ router.delete("/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid contact ID." });
     }
 
-    const contact = await CRMContact.findById(req.params.id);
+    // TODO(T-015): CRMContact lacks workspaceId stamp — defense-in-depth only
+    const contact = await CRMContact.findOne({
+      _id: req.params.id,
+      ...((req as any).workspaceObjectId && { workspaceId: (req as any).workspaceObjectId }),
+    });
     if (!contact) return res.status(404).json({ error: "Contact not found." });
 
     await CRMContact.deleteOne({ _id: contact._id });

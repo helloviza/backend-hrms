@@ -2,6 +2,7 @@
 import { Router, Request, Response } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import Vendor from "../models/Vendor.js";
 import Attendance from "../models/Attendance.js";
 import Employee from "../models/Employee.js";
@@ -73,9 +74,11 @@ function parseRange(q: any): { from?: Date; to?: Date } {
 /* /api/admin/reports/vendors.csv                                             */
 /* -------------------------------------------------------------------------- */
 
-router.get("/reports/vendors.csv", requireAuth, requireAdmin, async (_req: Request, res: Response) => {
+router.get("/reports/vendors.csv", requireAuth, requireAdmin, requireWorkspace, async (req: Request, res: Response) => {
   try {
-    const vendors = await Vendor.find({}).lean().exec();
+    // TODO(T-015): Vendor model may lack workspaceId stamp — filter is defense-in-depth
+    const wsFilter = (req as any).workspaceObjectId ? { workspaceId: (req as any).workspaceObjectId } : {};
+    const vendors = await Vendor.find(wsFilter).lean().exec();
 
     const header = [
       "Name",
@@ -155,11 +158,13 @@ router.get(
   "/reports/attendance.csv",
   requireAuth,
   requireAdmin,
+  requireWorkspace,
   async (req: Request, res: Response) => {
     try {
       const { from, to } = parseRange(req.query);
 
       const findQuery: any = {};
+      if ((req as any).workspaceObjectId) findQuery.workspaceId = (req as any).workspaceObjectId;
       if (from && to) {
         const fromYmd = from.toISOString().slice(0, 10);
         const toYmd = to.toISOString().slice(0, 10);
@@ -363,10 +368,11 @@ router.get(
 /* /api/admin/reports/leaves.csv – uses LeaveRequest (all statuses)          */
 /* -------------------------------------------------------------------------- */
 
-router.get("/reports/leaves.csv", requireAuth, requireAdmin, async (_req: Request, res: Response) => {
+router.get("/reports/leaves.csv", requireAuth, requireAdmin, requireWorkspace, async (req: Request, res: Response) => {
   try {
     // Export ALL leave requests in LeaveRequest collection
-    const leaveRecords: any[] = await LeaveRequest.find({})
+    const wsFilter = (req as any).workspaceObjectId ? { workspaceId: (req as any).workspaceObjectId } : {};
+    const leaveRecords: any[] = await LeaveRequest.find(wsFilter)
       .sort({ createdAt: -1 })
       .lean()
       .exec();

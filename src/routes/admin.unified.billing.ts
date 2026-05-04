@@ -3,6 +3,7 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import TravelBooking from "../models/TravelBooking.js";
 import User from "../models/User.js";
 import Employee from "../models/Employee.js";
@@ -10,6 +11,7 @@ import CustomerMember from "../models/CustomerMember.js";
 
 const router = Router();
 router.use(requireAuth);
+router.use(requireWorkspace);
 
 /* ─────────────────────────────────────────────────────────────
  * Helpers
@@ -117,7 +119,11 @@ function buildScopedMatch(req: any): any {
 
   // Apply role-based access scope
   const { matchFilter } = resolveAccessScope(req.user);
-  Object.assign(match, matchFilter);
+  // GLOBAL scope (admin/superadmin) with no own filter — scope to workspace if set
+  const effectiveFilter = (req.workspaceObjectId && Object.keys(matchFilter).length === 0)
+    ? { workspaceId: req.workspaceObjectId }
+    : matchFilter;
+  Object.assign(match, effectiveFilter);
 
   return match;
 }

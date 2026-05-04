@@ -2,6 +2,7 @@
 import express from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import Employee from "../models/Employee.js";
 import Attendance from "../models/Attendance.js";
 import Leave from "../models/Leave.js";
@@ -10,6 +11,7 @@ import Vendor from "../models/Vendor.js";
 const router = express.Router();
 router.use(requireAuth);
 router.use(requireAdmin);
+router.use(requireWorkspace);
 
 /**
  * Parse time window from query.
@@ -88,6 +90,8 @@ router.get("/analytics", async (req, res, next) => {
   try {
     const { mode, from, to } = parseDateRange(req.query);
     const dimension = String(req.query.dimension || "overall").toLowerCase();
+    const wsId = (req as any).workspaceObjectId;
+    const wsFilter = wsId ? { workspaceId: wsId } : {};
 
     const dateFilter =
       from && to
@@ -106,24 +110,26 @@ router.get("/analytics", async (req, res, next) => {
     ] = await Promise.all([
       // Active employees
       Employee.countDocuments({
+        ...wsFilter,
         $or: [{ isActive: { $exists: false } }, { isActive: true }],
       }),
 
-      // All vendors
-      Vendor.find({}).lean(),
+      // TODO(T-015): Vendor model may lack workspaceId stamp — filter is defense-in-depth
+      Vendor.find(wsFilter).lean(),
 
       // Attendance in range (if range applied)
       Attendance.find(
-        dateFilter ? { date: dateFilter } : {},
+        dateFilter ? { ...wsFilter, date: dateFilter } : wsFilter,
       ).lean(),
 
       // Leaves in range (if range applied)
       Leave.find(
-        dateFilter ? { startDate: dateFilter } : {},
+        dateFilter ? { ...wsFilter, startDate: dateFilter } : wsFilter,
       ).lean(),
 
       // Attrition: employees with exit / resigned / terminated status
       Employee.countDocuments({
+        ...wsFilter,
         status: { $in: ["EXITED", "RESIGNED", "TERMINATED"] },
         ...(dateFilter
           ? {

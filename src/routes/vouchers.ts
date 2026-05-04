@@ -239,7 +239,7 @@ async function generateAndStoreRenderedPdf(args: {
 /**
  * POST /api/vouchers/extract
  */
-router.post("/extract", requireAuth, upload.single("file"), async (req: any, res) => {
+router.post("/extract", requireAuth, requireWorkspace, upload.single("file"), async (req: any, res) => {
   const correlationId =
     req.headers["x-request-id"] ||
     req.headers["x-correlation-id"] ||
@@ -270,6 +270,7 @@ router.post("/extract", requireAuth, upload.single("file"), async (req: any, res
     const record: any = await VoucherExtraction.create({
       customerId,
       createdBy: new mongoose.Types.ObjectId(createdBy),
+      workspaceId: (req as any).workspaceObjectId || undefined,
       s3,
       file: {
         originalName: file.originalname,

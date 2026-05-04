@@ -5,6 +5,7 @@ import multer from "multer";
 import XLSX from "xlsx";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import ManualBooking from "../models/ManualBooking.js";
 import SBTBooking from "../models/SBTBooking.js";
@@ -19,6 +20,7 @@ const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 router.use(requireAuth);
+router.use(requireWorkspace);
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -237,6 +239,7 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(200, parseInt(req.query.limit) || 25);
     const filter = buildSearchFilter(req.query);
+    if (req.workspaceObjectId) filter.workspaceId = req.workspaceObjectId;
 
     // Scope non-ALL users to their own bookings only
     const isAllScope = req.permissionScope === "ALL";
@@ -324,6 +327,7 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
 router.get("/export", requirePermission("manualBookings", "FULL"), async (req: any, res: any) => {
   try {
     const filter = buildSearchFilter(req.query);
+    if (req.workspaceObjectId) filter.workspaceId = req.workspaceObjectId;
     if (req.query.invoiceNo) await applyInvoiceFilter(filter, req.query.invoiceNo);
     const format = req.query.format === "xlsx" ? "xlsx" : "csv";
     const docs = await ManualBooking.find(filter)
@@ -438,16 +442,18 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
 // GET /api/admin/manual-bookings/sbt-queue
 router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
   try {
+    const wsFilter = req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {};
     // Fetch already-imported IDs (include all, flag with alreadyImported instead of excluding)
     const [importedRaw, importedHotelRaw] = await Promise.all([
-      ManualBooking.find({ source: "SBT", type: { $ne: "HOTEL" } }).distinct("sourceBookingId"),
-      ManualBooking.find({ source: "SBT", type: "HOTEL" }).distinct("sourceBookingId"),
+      ManualBooking.find({ ...wsFilter, source: "SBT", type: { $ne: "HOTEL" } }).distinct("sourceBookingId"),
+      ManualBooking.find({ ...wsFilter, source: "SBT", type: "HOTEL" }).distinct("sourceBookingId"),
     ]);
     const importedSet = new Set(importedRaw.map((id: any) => id.toString()));
     const importedHotelSet = new Set(importedHotelRaw.map((id: any) => id.toString()));
 
     const [flights, hotels] = await Promise.all([
       SBTBooking.find({
+        ...wsFilter,
         status: { $in: ["CONFIRMED", "PENDING", "CANCELLED"] },
       })
         .populate("workspaceId", "name companyName customerId")
@@ -455,6 +461,7 @@ router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req
         .limit(200)
         .lean(),
       SBTHotelBooking.find({
+        ...wsFilter,
         status: { $in: ["CONFIRMED", "PENDING", "HELD", "CANCELLED"] },
       })
         .populate("workspaceId", "name companyName customerId")
@@ -1025,8 +1032,9 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
 // Returns the distinct set of staff users who have created at least one booking
 router.get("/creators", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
   try {
+    const wsMatch = req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {};
     const raw = await ManualBooking.aggregate([
-      { $match: { createdBy: { $exists: true, $nin: [null, ""] } } },
+      { $match: { ...wsMatch, createdBy: { $exists: true, $nin: [null, ""] } } },
       { $group: { _id: "$createdBy", email: { $first: "$createdByEmail" } } },
       { $match: { _id: { $nin: [null, ""] } } },
       // Attempt to join to User for display name; createdBy is stored as String(ObjectId)
@@ -1063,7 +1071,10 @@ router.get("/creators", requirePermission("manualBookings", "READ"), async (req:
 // GET /api/admin/manual-bookings/:id
 router.get("/:id", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
   try {
-    const booking: any = await ManualBooking.findById(req.params.id)
+    const booking: any = await ManualBooking.findOne({
+      _id: req.params.id,
+      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
+    })
       .populate("bookedBy", "name email")
       .populate("workspaceId", "name companyName")
       .populate("invoiceId", "invoiceNo status")
@@ -1088,7 +1099,10 @@ router.get("/:id", requirePermission("manualBookings", "READ"), async (req: any,
 // PUT /api/admin/manual-bookings/:id
 router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any, res: any) => {
   try {
-    const booking = await ManualBooking.findById(req.params.id);
+    const booking = await ManualBooking.findOne({
+      _id: req.params.id,
+      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
+    });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
     if (booking.status === "INVOICED") {
       return res.status(400).json({ message: "Cannot edit an invoiced booking" });
@@ -1116,7 +1130,10 @@ router.post("/:id/cancel", requirePermission("manualBookings", "FULL"), async (r
       return res.status(400).json({ error: "reasonNote is required when reason is OTHER" });
     }
 
-    const booking: any = await ManualBooking.findById(req.params.id);
+    const booking: any = await ManualBooking.findOne({
+      _id: req.params.id,
+      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
+    });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
     if (booking.status === "CANCELLED") return res.status(400).json({ error: "Already cancelled" });
     if (booking.isActive === false) return res.status(400).json({ error: "Cannot cancel a deleted booking" });
@@ -1165,7 +1182,10 @@ router.delete("/:id", requirePermission("manualBookings", "FULL"), async (req: a
       return res.status(400).json({ error: "reasonNote is required when reason is OTHER" });
     }
 
-    const booking: any = await ManualBooking.findById(req.params.id);
+    const booking: any = await ManualBooking.findOne({
+      _id: req.params.id,
+      ...(req.workspaceObjectId && { workspaceId: req.workspaceObjectId }),
+    });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
     if (booking.isActive === false) return res.status(400).json({ error: "Already deleted" });
 
