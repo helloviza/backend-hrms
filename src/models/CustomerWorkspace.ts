@@ -35,6 +35,9 @@ export interface CustomerWorkspaceDocument extends Document {
   phone?: string;
   source?: "SUPERADMIN" | "SELF_SERVICE";
 
+  // Tenant Type — set ONLY by SaaS HRMS signup path; absent for Travel workspaces
+  tenantType?: "SAAS_HRMS";
+
   // Company identity
   companyName: string;
   companyLogo?: string;
@@ -304,6 +307,13 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
       type: String,
       enum: ["SUPERADMIN", "SELF_SERVICE"],
       default: "SUPERADMIN",
+    },
+
+    tenantType: {
+      type: String,
+      enum: ["SAAS_HRMS"],
+      required: false,
+      index: true,
     },
 
     // ── Admin user (set after signup) ──

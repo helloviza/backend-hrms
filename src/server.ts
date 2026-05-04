@@ -320,6 +320,11 @@ app.use("/api/auth", auth);
 // Self-service signup (fully public — no requireAuth)
 import selfServiceSignupRouter from "./routes/signup.js";
 app.use("/api/signup", selfServiceSignupRouter);
+
+// SaaS HRMS self-service signup (fully public — no requireAuth)
+import saasSignupRouter from "./routes/saas.signup.js";
+app.use("/api/saas", saasSignupRouter);
+
 app.use("/api/users", users);
 
 // HRMS
