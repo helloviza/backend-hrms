@@ -153,12 +153,32 @@ export function buildLineItemsForBooking(booking: any): any[] {
       ? booking.pricing.diff
       : (booking.pricing?.quotedPrice ?? 0) - (booking.pricing?.actualPrice ?? 0);
 
-  let igst = 0;
-  if (gstMode === "ON_MARKUP") {
-    igst = parseFloat(((diff * gstPercent) / (100 + gstPercent)).toFixed(2));
-  } else {
-    igst = parseFloat(((booking.pricing?.quotedPrice ?? 0) * gstPercent / 100).toFixed(2));
+  const subDesc   = buildSubDescription(booking, paxStr);
+  const costLabel = TYPE_COST_LABELS[booking.type] || "Service Cost";
+
+  // ON_FULL: single combined line — GST charged on full quoted price
+  if (gstMode === "ON_FULL") {
+    const quotedPrice = booking.pricing?.quotedPrice ?? 0;
+    const igst = parseFloat((quotedPrice * gstPercent / 100).toFixed(2));
+    return [
+      {
+        bookingRef:     booking.bookingRef,
+        rowType:        "COST",
+        description:    costLabel,
+        subDescription: subDesc,
+        qty:            1,
+        rate:           parseFloat(quotedPrice.toFixed(2)),
+        igst,
+        amount:         parseFloat(quotedPrice.toFixed(2)),
+        passengerNames,
+        travelDate:     booking.travelDate,
+        type:           booking.type,
+      },
+    ];
   }
+
+  // ON_MARKUP (default): 2 lines — COST (no GST) + SERVICE_FEE (GST embedded in markup, tax-inclusive back-calc)
+  const igst = parseFloat(((diff * gstPercent) / (100 + gstPercent)).toFixed(2));
 
   const qty      = computeQty(booking);
   const costRate = parseFloat((supplierCost / qty).toFixed(2));
@@ -184,9 +204,6 @@ export function buildLineItemsForBooking(booking: any): any[] {
       bookingRef: booking.bookingRef, expected: markupAmount, got: svcAmt,
     });
   }
-
-  const subDesc  = buildSubDescription(booking, paxStr);
-  const costLabel = TYPE_COST_LABELS[booking.type] || "Service Cost";
 
   return [
     {

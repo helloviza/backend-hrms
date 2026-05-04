@@ -446,7 +446,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
 
     const clientState = detection.customerState;
 
-    // Build TWO line items per booking: COST row + SERVICE_FEE row
+    // Build line items per booking: 1 line (ON_FULL) or 2 lines — COST + SERVICE_FEE (ON_MARKUP)
     const invoiceLineItems: any[] = [];
     for (const b of bookings as any[]) {
       invoiceLineItems.push(...buildLineItemsForBooking(b));
