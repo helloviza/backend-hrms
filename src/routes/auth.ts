@@ -19,6 +19,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import MasterData from "../models/MasterData.js";
 import { UserPermission } from "../models/UserPermission.js";
 import { generateTravelerId } from "../utils/travelerId.js";
+import TenantSetupProgress from "../models/TenantSetupProgress.js";
 
 const r = Router();
 
@@ -1009,7 +1010,47 @@ r.get("/me", async (req, res) => {
     if (!user) return res.status(404).json({ error: "User not found" });
 
     const { safe } = await buildAuthSafeUser(user);
-    res.json({ user: safe });
+
+    // Resolve workspace (best-effort — never block /me on workspace lookup failure)
+    let workspaceData = null;
+    let setupProgressData = null;
+
+    try {
+      const wsId = (user as any).workspaceId;
+      if (wsId) {
+        const ws = await CustomerWorkspace.findById(wsId)
+          .select("_id customerId slug companyName companyLogo plan status source tenantType config onboardingStep trialEndsAt")
+          .lean();
+
+        if (ws) {
+          workspaceData = ws;
+
+          // Only fetch setupProgress for SaaS HRMS tenants
+          if ((ws as any).tenantType === "SAAS_HRMS") {
+            const progress = await TenantSetupProgress.findOne({ workspaceId: ws._id }).lean();
+            if (progress) {
+              // Convert moduleProgress Map to plain object for JSON serialization
+              const moduleProgressObj = (progress as any).moduleProgress instanceof Map
+                ? Object.fromEntries((progress as any).moduleProgress)
+                : (progress as any).moduleProgress || {};
+              setupProgressData = {
+                ...progress,
+                moduleProgress: moduleProgressObj,
+              };
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // Defensive: never block /me on workspace/progress fetch errors.
+      console.error("[/auth/me] workspace/progress lookup failed:", err);
+    }
+
+    res.json({
+      user: safe,
+      workspace: workspaceData,
+      setupProgress: setupProgressData,
+    });
   } catch (err) {
     authLogger.error("Me endpoint error", { error: err instanceof Error ? err.message : String(err) });
     res.status(401).json({ error: "Invalid token" });
