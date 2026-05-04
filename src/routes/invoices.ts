@@ -206,15 +206,17 @@ async function enrichClientDetails(invoice: any): Promise<any> {
 /* ── GST Preview ─────────────────────────────────────────────────── */
 
 // GET /api/admin/invoices/gst-preview?customerId=X
-router.get("/gst-preview", requirePermission("invoices", "READ"), async (req: any, res: any) => {
+router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
     const { customerId } = req.query as { customerId?: string };
     if (!customerId) return res.status(400).json({ error: "customerId is required" });
 
     const [customer, companySettings] = await Promise.all([
-      Customer.findById(customerId).lean(),
+      Customer.findOne({ _id: customerId, workspaceId: req.workspaceObjectId }).lean(),
       getCompanySettings(),
     ]);
+
+    if (!customer) return res.status(404).json({ error: "Customer not found" });
 
     const supplierState = companySettings.supplierState || companySettings.state || "Karnataka";
     const { state: customerState, country: customerCountry } = resolveCustomerState(customer);
