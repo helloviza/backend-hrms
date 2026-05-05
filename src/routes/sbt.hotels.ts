@@ -9,7 +9,6 @@ import SBTRequest from "../models/SBTRequest.js";
 import { generateHotelVoucher, getBookingDetail } from "../services/tbo.hotel.service.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
-import Customer from "../models/Customer.js";
 import { sendMail } from "../utils/mailer.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
@@ -281,17 +280,24 @@ interface BookingValidationPayload {
   departureTransport?: any;
   arrivalTransport?: any;
   isPackageFare?: boolean;
-  isCorporate?: boolean;
+  // True when the user has toggled "Corporate" on the payment page (international only).
+  isCorporateBooking?: boolean;
+  // User-entered Corporate PAN (only when isCorporateBooking=true).
   corporatePAN?: string;
   destinationCountryCode?: string;
   gstInfo?: { gstin?: string; [key: string]: any };
 }
 
+const PAN_REGEX = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
+
 function validateBookingCriteria(p: BookingValidationPayload): ValidationError[] {
   const errors: ValidationError[] = [];
   const vf = p.validationFlags ?? {};
   const rooms: any[] = p.hotelRoomsDetails ?? [];
-  const isDomestic = p.guestNationality === "IN";
+  // PAN gating is driven by HOTEL DESTINATION country, not guest nationality.
+  // TBO confirmed (2026-05-05): domestic India hotels never require PAN regardless of guest passport.
+  const isDomesticHotel = String(p.destinationCountryCode || "IN").toUpperCase() === "IN";
+  const isInternationalHotel = !isDomesticHotel;
 
   const fp = (ri: number, pi: number, field: string) =>
     `HotelRoomsDetails[${ri}].Guests[${pi}].${field}`;
@@ -357,7 +363,9 @@ function validateBookingCriteria(p: BookingValidationPayload): ValidationError[]
   }
 
   // ── Rule 5: Child validation — age range + forbidden fields (GAP-09a, 9b) ──
-  const FORBIDDEN_CHILD_FIELDS = ["PAN", "Phoneno", "Email", "PassportNo"];
+  // PAN is permitted on children for international hotels (backend copies lead's PAN onto every passenger
+  // per TBO confirmation 2026-05-05) — so PAN is NOT in this forbidden list.
+  const FORBIDDEN_CHILD_FIELDS = ["Phoneno", "Email", "PassportNo"];
   for (const { g, ri, pi } of children) {
     const age = Number(g?.Age);
     if (!age || age < 1 || age > 12) {
@@ -370,44 +378,51 @@ function validateBookingCriteria(p: BookingValidationPayload): ValidationError[]
     }
   }
 
-  // ── Rule 4: Adult PAN — format + count (GAP-09c) ──
-  // Industry norm: PAN is collected from the booker (lead guest), not every adult.
-  // TBO's PanCountRequired tells us how many unique PANs the booking needs (typically 1).
-  const panMandatoryV = vf.PanMandatory === true;
-  const panCountRequiredV = Number(vf.PanCountRequired ?? 0);
+  // ── Rule 4: PAN logic — driven by HOTEL DESTINATION (TBO confirmation 2026-05-05) ──
+  //   Domestic India hotel  → no PAN required for any guest.
+  //   International hotel   → Lead PAN required; backend copies it onto every passenger.
+  //                           Corporate booking additionally requires Corporate PAN.
+  if (isInternationalHotel) {
+    const leadAdult = adults.find(({ g }) => g?.LeadPassenger === true) ?? adults[0];
+    const leadAdultPAN = String(leadAdult?.g?.PAN || "").trim().toUpperCase();
+    const leadAdultRi = leadAdult?.ri ?? 0;
+    const leadAdultPi = leadAdult?.pi ?? 0;
 
-  // Format validation — if any adult provided a PAN, it must be valid
-  if (isDomestic && panMandatoryV) {
-    for (const { g, ri, pi } of adults) {
-      const pan = String(g?.PAN || "").trim().toUpperCase();
-      if (pan && !/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) {
-        errors.push({ field: fp(ri, pi, "PAN"), code: "PAN_FORMAT_INVALID", message: "Please enter a valid PAN number (format: AAAAA1234A)." });
+    if (!leadAdultPAN) {
+      errors.push({
+        field: fp(leadAdultRi, leadAdultPi, "PAN"),
+        code: "PAN_REQUIRED",
+        message: "Lead adult PAN is required for international hotel bookings.",
+      });
+    } else if (!PAN_REGEX.test(leadAdultPAN)) {
+      errors.push({
+        field: fp(leadAdultRi, leadAdultPi, "PAN"),
+        code: "PAN_FORMAT_INVALID",
+        message: "Please enter a valid PAN number (format: AAAAA1234A).",
+      });
+    }
+
+    // Corporate booking → Corporate PAN required, separate from lead PAN.
+    if (p.isCorporateBooking) {
+      const corpPAN = String(p.corporatePAN || "").trim().toUpperCase();
+      if (!corpPAN) {
+        errors.push({
+          field: "corporatePAN",
+          code: "CORPORATE_PAN_REQUIRED",
+          message: "Corporate PAN is required for corporate international bookings.",
+        });
+      } else if (!PAN_REGEX.test(corpPAN)) {
+        errors.push({
+          field: "corporatePAN",
+          code: "CORPORATE_PAN_FORMAT_INVALID",
+          message: "Please enter a valid Corporate PAN (format: AAAAA1234A).",
+        });
       }
     }
   }
-
-  // Count validation — booking must have at least PanCountRequired unique valid PANs
-  if (isDomestic && panMandatoryV && panCountRequiredV > 0) {
-    const validPANs = adults
-      .map(({ g }) => String(g?.PAN || "").trim().toUpperCase())
-      .filter((pan: string) => pan && /^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan));
-    const uniquePANs = new Set(validPANs);
-    if (uniquePANs.size < panCountRequiredV) {
-      errors.push({
-        field: "passengers.PAN",
-        code: "PAN_COUNT_INSUFFICIENT",
-        message: panCountRequiredV === 1
-          ? "PAN of the lead guest is required for this booking."
-          : `${panCountRequiredV} unique valid PANs are required for this booking; only ${uniquePANs.size} provided.`,
-      });
-    }
-  }
-
-  // ── Rule 9: Corporate booking flag (GAP-09c) ──
-  const corporateBookingAllowedV = vf.CorporateBookingAllowed === true || vf.CorporateBokingAllowed === true;
-  if (p.isCorporate && !corporateBookingAllowedV) {
-    errors.push({ field: "isCorporate", code: "CORPORATE_BOOKING_NOT_ALLOWED", message: "Corporate booking is not allowed for this property." });
-  }
+  // Domestic hotels: no PAN validation, even when the property's TBO ValidationInfo
+  // claims PanMandatory. TBO support confirmed (2026-05-05) those flags fire spuriously
+  // for domestic stays and PAN must NOT be sent.
 
   // ── Rule 6: Passport — all three fields required (GAP-34) ──
   const passportMandatoryV = vf.PassportMandatory === true || vf.IsPassportRequired === true;
@@ -1176,9 +1191,10 @@ router.post("/validate-before-payment", requireSBT, requireHotelAccess, async (r
       DepartureTransport: departureTransport,
       ArrivalTransport: arrivalTransport,
       IsPackageFare: isPackageFare,
-      isCorporate,
       ValidationFlags: validationFlags = {},
       destinationCountryCode,
+      isCorporateBooking,
+      corporatePAN,
     } = req.body;
 
     // Session check — same guard as /book (validateBookingCodeAge uses in-memory map)
@@ -1192,17 +1208,11 @@ router.post("/validate-before-payment", requireSBT, requireHotelAccess, async (r
     // GuestNationality must equal Search-time value — never derive from per-guest field (TBO cert rule).
     const guestNationality: string = _guestNat || "IN";
 
-    // Corporate PAN lookup — same as /book (needed for corporate rule check)
-    const _custId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
-    let _corporatePAN = "";
-    if (_custId) {
-      const _ws = await CustomerWorkspace.findOne({ customerId: _custId }).select("pan").lean();
-      _corporatePAN = (_ws as any)?.pan || "";
-      if (!_corporatePAN) {
-        const _cust = await Customer.findOne({ _id: _custId }).select("pan").lean();
-        _corporatePAN = (_cust as any)?.pan || "";
-      }
-    }
+    // PAN gating now keyed off hotel destination + user's Corporate toggle (TBO conf 2026-05-05).
+    const _destCountry = String(destinationCountryCode || "IN").toUpperCase();
+    const _isInternational = _destCountry !== "IN";
+    const _isCorporateBooking = _isInternational && isCorporateBooking === true;
+    const _corporatePAN = String(corporatePAN || "").trim().toUpperCase();
 
     const errors = validateBookingCriteria({
       hotelRoomsDetails: (hotelRoomsDetails as any[]) ?? [],
@@ -1213,9 +1223,9 @@ router.post("/validate-before-payment", requireSBT, requireHotelAccess, async (r
       departureTransport,
       arrivalTransport,
       isPackageFare: isPackageFare === true,
-      isCorporate: isCorporate === true,
+      isCorporateBooking: _isCorporateBooking,
       corporatePAN: _corporatePAN,
-      destinationCountryCode: destinationCountryCode || "",
+      destinationCountryCode: _destCountry,
       gstInfo: req.body?.gstInfo,
     });
 
@@ -1382,31 +1392,53 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     // Read PreBook validation flags; retained for buildRoomPassengers field-inclusion logic.
     const validationFlags = req.body?.ValidationFlags ?? {};
 
-    // Corporate PAN lookup — needed by validateBookingCriteria and buildRoomPassengers.
-    const hotelCustomerId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
-    const hotelWorkspace = hotelCustomerId
-      ? await CustomerWorkspace.findOne({ customerId: hotelCustomerId }).select("pan").lean()
-      : null;
-    let hotelCorporatePAN = (hotelWorkspace as any)?.pan || "";
-    if (!hotelCorporatePAN && (hotelWorkspace as any)?.customerId) {
-      const hotelCustomer = await Customer.findOne({ _id: (hotelWorkspace as any).customerId }).select("pan").lean();
-      hotelCorporatePAN = (hotelCustomer as any)?.pan || "";
+    // PAN is now driven by HOTEL DESTINATION COUNTRY, not by per-property TBO flags.
+    // TBO support confirmation (2026-05-05): domestic India hotels never require PAN;
+    // international hotels always require lead PAN regardless of property's PanMandatory flag.
+    const destinationCountryCode = String(
+      req.body?.destinationCountryCode || req.body?.countryCode || "IN"
+    ).toUpperCase();
+    const isDomesticHotel = destinationCountryCode === "IN";
+    const isInternationalHotel = !isDomesticHotel;
+
+    // Corporate is gated PER RATE by TBO's ValidationInfo.CorporateBookingAllowed
+    // (spec §2774). Spec table uses the typo "CorporateBokingAllowed"; live PreBook
+    // responses use the correct spelling. Honor both.
+    const corporateBookingAllowed =
+      validationFlags?.CorporateBookingAllowed === true ||
+      validationFlags?.CorporateBokingAllowed === true;
+
+    // Defensive gate: if the client requested Corporate but the rate disallows it,
+    // reject before the TBO call rather than waste a Book attempt.
+    if (req.body?.isCorporateBooking === true && !corporateBookingAllowed) {
+      return res.status(400).json({
+        code: "CORPORATE_NOT_ALLOWED_ON_RATE",
+        error: "Corporate booking is not allowed on this hotel/rate. Please switch to Personal booking.",
+      });
     }
 
-    // Flags retained for buildRoomPassengers TBO field-inclusion logic (not validation).
+    // Corporate booking flag + PAN come from the user (Corporate toggle on payment page),
+    // NOT from CustomerWorkspace lookup. Only honored for international bookings on rates
+    // where TBO's ValidationInfo.CorporateBookingAllowed is true.
+    const isCorporateBooking =
+      isInternationalHotel && req.body?.isCorporateBooking === true && corporateBookingAllowed;
+    const corporatePAN = String(req.body?.corporatePAN || "").trim().toUpperCase();
+
+    // Flags retained for buildRoomPassengers TBO field-inclusion logic (passport, GST).
     const panMandatory = validationFlags.PanMandatory === true;
-    // Read CorporateBookingAllowed — also tolerate TBO spec typo "CorporateBokingAllowed" (one 'o').
-    const corporateBookingAllowed =
-      validationFlags.CorporateBookingAllowed === true ||
-      validationFlags.CorporateBokingAllowed === true;
     // Honor both TBO spellings: spec table uses "PassportMandatory"; FAQ uses "IsPassportRequired".
     const passportMandatory =
       validationFlags.PassportMandatory === true ||
       validationFlags.IsPassportRequired === true;
-    const hotelIsCorporate =
-      (validationFlags.IsCorporate === true || req.body?.isCorporate === true) &&
-      !!hotelCorporatePAN;
-    const isDomestic = GuestNationality === "IN";
+
+    // Resolve lead-adult PAN from request — copied to every passenger when international.
+    const _allRoomGuests: any[] = (hotelRoomsDetailsRaw ?? []).flatMap(
+      (r: any) => r?.Guests ?? r?.HotelPassenger ?? []
+    );
+    const _leadAdult = _allRoomGuests.find(
+      (g: any) => Number(g?.PaxType) === 1 && g?.LeadPassenger
+    ) ?? _allRoomGuests.find((g: any) => Number(g?.PaxType) === 1);
+    const leadAdultPAN = String(_leadAdult?.PAN || "").trim().toUpperCase();
 
     // GAP-40: Shared validation gate — collect-all errors, same logic as /validate-before-payment.
     // Defense-in-depth: /book validates independently even when frontend calls /validate-before-payment first.
@@ -1419,9 +1451,9 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       departureTransport,
       arrivalTransport,
       isPackageFare,
-      isCorporate: req.body?.isCorporate === true || validationFlags.IsCorporate === true,
-      corporatePAN: hotelCorporatePAN,
-      destinationCountryCode: "",
+      isCorporateBooking,
+      corporatePAN,
+      destinationCountryCode,
       gstInfo: req.body?.gstInfo,
     });
     if (_valErrors.length > 0) {
@@ -1429,7 +1461,10 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     }
 
     // Design C: per-room passenger builder — children auto-generated, adults fully mapped.
-    // Children must NOT carry PAN/Phoneno/Email/PassportNo keys (TBO Op Rule 2: omit, not null).
+    // PAN handling per TBO confirmation (2026-05-05):
+    //   Domestic India hotel  → omit PAN entirely on every passenger.
+    //   International hotel   → copy lead-adult's PAN onto every passenger (adults + children).
+    //                           Corporate bookings additionally attach CorporatePAN to lead adult.
     const buildRoomPassengers = (room: any, roomIndex: number, primaryContact: { phone: string; email: string }): Record<string, unknown>[] => {
       const roomGuests: any[] = room.Guests ?? room.HotelPassenger ?? [];
       const leadAdult = roomGuests.find((g: any) => Number(g.PaxType) === 1 && g.LeadPassenger)
@@ -1440,8 +1475,8 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       return roomGuests.map((g: any) => {
         if (Number(g.PaxType) === 2) {
           // Auto-generate child: Title="Miss", FirstName="Child<N>", LastName=lead adult's last name.
-          // No PAN/Phoneno/Email/Passport keys — field must be absent, not null.
-          return {
+          // No Phoneno/Email/Passport keys — field must be absent, not null.
+          const childPax: Record<string, unknown> = {
             Title: "Miss",
             FirstName: `Child${++childIdx}`,
             LastName: leadAdultLastName,
@@ -1450,6 +1485,11 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             LeadPassenger: false,
             Age: Number(g.Age) || 8,
           };
+          // International: TBO requires lead's PAN to be carried on children too.
+          if (isInternationalHotel && leadAdultPAN) {
+            childPax.PAN = leadAdultPAN;
+          }
+          return childPax;
         }
 
         // Adult passenger
@@ -1477,12 +1517,14 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           base.PassportExpDate = g.PassportExpDate || "0001-01-01T00:00:00";
         }
 
-        if (isDomestic && panMandatory) {
-          base.PAN = String(g.PAN || "").trim().toUpperCase();
+        // International: every adult carries the lead's PAN (lead supplies, others get a copy).
+        if (isInternationalHotel && leadAdultPAN) {
+          base.PAN = leadAdultPAN;
         }
 
-        if (isDomestic && corporateBookingAllowed && hotelIsCorporate) {
-          base.CorporatePAN = g.CorporatePAN || "";
+        // International + Corporate: attach CorporatePAN to the lead adult only.
+        if (isInternationalHotel && isCorporateBooking && corporatePAN && isRoomLead) {
+          base.CorporatePAN = corporatePAN;
         }
 
         // BOOK-013: GST fields — lead adult of first room only when GSTAllowed=true.
@@ -1600,8 +1642,10 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       RequestedBookingMode: 5,
       NetAmount,
       HotelRoomsDetails,
-      ...(hotelIsCorporate ? { IsCorporate: true } : {}),
-      ...(hotelIsCorporate && hotelCorporatePAN ? { CorporatePAN: hotelCorporatePAN } : {}),
+      // International + Corporate booking: surface IsCorporate + CorporatePAN at top level too,
+      // matching the per-passenger CorporatePAN attached in buildRoomPassengers.
+      ...(isInternationalHotel && isCorporateBooking ? { IsCorporate: true } : {}),
+      ...(isInternationalHotel && isCorporateBooking && corporatePAN ? { CorporatePAN: corporatePAN } : {}),
     };
     if (isPackageFare) {
       tboPayload.IsPackageFare = true;
@@ -1717,7 +1761,12 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             bookingRefNo: String(result?.BookingRefNo ?? ""),
             // POST-001: store PaxIds and PAN requirement for generate-voucher-with-PAN flow.
             ...(isHeld && holdPaxDetails.length > 0 ? { paxDetails: holdPaxDetails } : {}),
-            ...(isHeld ? { panMandatory: !!panMandatory } : {}),
+            // panMandatory now persisted on every booking (was previously HELD-only).
+            // Captures TBO's prebook flag for audit/diagnostics — actual PAN logic is destination-driven.
+            panMandatory: !!panMandatory,
+            // PAN audit (TBO conf 2026-05-05) — international + corporate flow.
+            isCorporateBooking: !!isCorporateBooking,
+            ...(isCorporateBooking && corporatePAN ? { corporatePAN } : {}),
             ...(isHeld && holdTboReferenceNo ? { tboReferenceNo: holdTboReferenceNo, bookingDetailFetched: true, bookingDetailFetchedAt: new Date() } : {}),
             ...(isHeld && holdRoomDescription ? { roomDescription: holdRoomDescription } : {}),
           }},
@@ -1807,28 +1856,34 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       });
     }
 
-    // Defense-in-depth: strip empty/placeholder-date fields and ensure children carry no PAN.
-    // TBO Op Rule 2: PAN must be absent (not null/empty) for child passengers.
+    // Defense-in-depth: strip empty/placeholder-date fields. PAN handling per TBO confirmation
+    // (2026-05-05): domestic = strip PAN/CorporatePAN entirely; international = preserve on all
+    // passengers (children inherit lead's PAN). Children always shed contact/passport keys.
     for (const room of (tboPayload.HotelRoomsDetails as any[]) ?? []) {
       for (const g of room?.HotelPassenger ?? []) {
         if (Number(g.PaxType) === 2) {
-          // Children must never carry these keys regardless of how they arrived.
-          if ("PAN" in g) { sbtLogger.warn("GAP-09: PAN key found on child passenger — stripping"); delete g.PAN; }
+          // Children: contact/passport must be absent; CorporatePAN never applies.
           if ("Phoneno" in g) delete g.Phoneno;
           if ("Email" in g) delete g.Email;
           if ("PassportNo" in g) delete g.PassportNo;
           if ("PassportIssueDate" in g) delete g.PassportIssueDate;
           if ("PassportExpDate" in g) delete g.PassportExpDate;
           if ("CorporatePAN" in g) delete g.CorporatePAN;
-          continue;
+        } else {
+          // Adult field cleanup
+          if (g.PassportNo === "") delete g.PassportNo;
+          if (g.PassportIssueDate === "0001-01-01T00:00:00") delete g.PassportIssueDate;
+          if (g.PassportExpDate === "0001-01-01T00:00:00") delete g.PassportExpDate;
         }
-        // Adult field cleanup
-        if (g.PAN === "") delete g.PAN;
-        if (g.CorporatePAN === "") delete g.CorporatePAN;
-        if (g.PassportNo === "") delete g.PassportNo;
-        if (g.PassportIssueDate === "0001-01-01T00:00:00") delete g.PassportIssueDate;
-        if (g.PassportExpDate === "0001-01-01T00:00:00") delete g.PassportExpDate;
-        if (!tboPayload.IsCorporate && "CorporatePAN" in g) delete g.CorporatePAN;
+
+        // PAN/CorporatePAN gating by hotel destination
+        if (isDomesticHotel) {
+          if ("PAN" in g) delete g.PAN;
+          if ("CorporatePAN" in g) delete g.CorporatePAN;
+        } else {
+          if (g.PAN === "") delete g.PAN;
+          if (g.CorporatePAN === "") delete g.CorporatePAN;
+        }
       }
     }
 
@@ -1922,23 +1977,39 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
       let result = data?.BookResult || data;
 
+      // Audit fields persisted on every FAILED write so diagnostics see what was attempted.
+      const _failedAudit = {
+        isCorporateBooking: !!isCorporateBooking,
+        corporatePAN: corporatePAN || "",
+        panMandatory: !!panMandatory,
+      };
+
       // CROSS-003: explicit handling for ResponseStatus 2/3/5 in Book flow.
       const bookRS = result?.ResponseStatus;
       if (bookRS === 2) {
         const errMsg = result?.Error?.ErrorMessage || "TBO booking failed (ResponseStatus=2)";
         sbtLogger.error("TBO Book ResponseStatus=2 (Failed)", { userId: req.user?.id, clientRef, errMsg });
-        SBTHotelBooking.findOneAndUpdate({ clientReferenceId: clientRef }, { $set: { status: "FAILED", failureReason: errMsg } }).catch(() => {});
+        SBTHotelBooking.findOneAndUpdate({ clientReferenceId: clientRef }, { $set: { status: "FAILED", failureReason: errMsg, ..._failedAudit } }).catch(() => {});
         return res.status(502).json({ code: "TBO_FAILED", error: errMsg, responseStatus: 2 });
       }
       if (bookRS === 3) {
         const errMsg = result?.Error?.ErrorMessage || "Invalid booking request (ResponseStatus=3)";
         sbtLogger.error("TBO Book ResponseStatus=3 (InvalidRequest)", { userId: req.user?.id, clientRef, errMsg });
-        SBTHotelBooking.findOneAndUpdate({ clientReferenceId: clientRef }, { $set: { status: "FAILED", failureReason: errMsg } }).catch(() => {});
+        SBTHotelBooking.findOneAndUpdate({ clientReferenceId: clientRef }, { $set: { status: "FAILED", failureReason: errMsg, ..._failedAudit } }).catch(() => {});
+        // Friendly mapping: TBO returns "Corporate booking is not allowed" when the rate
+        // rejects IsCorporate even though our pre-check passed. Surface a clear next step.
+        if (/corporate booking is not allowed/i.test(errMsg)) {
+          return res.status(400).json({
+            code: "CORPORATE_NOT_ALLOWED_ON_RATE",
+            error: "This hotel doesn't accept Corporate bookings. Please switch to Personal booking and try again.",
+            responseStatus: 3,
+          });
+        }
         return res.status(400).json({ code: "TBO_INVALID_REQUEST", error: errMsg, responseStatus: 3 });
       }
       if (bookRS === 5) {
         sbtLogger.error("TBO Book ResponseStatus=5 (InvalidCredentials)", { userId: req.user?.id, clientRef });
-        SBTHotelBooking.findOneAndUpdate({ clientReferenceId: clientRef }, { $set: { status: "FAILED", failureReason: "TBO credential failure" } }).catch(() => {});
+        SBTHotelBooking.findOneAndUpdate({ clientReferenceId: clientRef }, { $set: { status: "FAILED", failureReason: "TBO credential failure", ..._failedAudit } }).catch(() => {});
         return res.status(502).json({ code: "TBO_INVALID_CREDENTIALS", error: "Authentication configuration error. Please contact support.", responseStatus: 5 });
       }
 
@@ -2029,7 +2100,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         });
         SBTHotelBooking.findOneAndUpdate(
           { clientReferenceId: clientRef },
-          { $set: { status: "FAILED", failureReason: providerError } },
+          { $set: { status: "FAILED", failureReason: providerError, ..._failedAudit } },
         ).catch(() => {});
         return res.status(502).json({
           ok: false,
