@@ -20,6 +20,7 @@ import {
   HeadObjectCommand,
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
+import { stripTravelFields } from "../utils/stripTravelFields.js";
 
 const r = Router();
 
@@ -343,7 +344,7 @@ r.post(
       const out: any = updated;
       out.avatarUrl = out.avatarKey ? await signAvatarUrl(out.avatarKey) : "";
 
-      res.json(out);
+      res.json(stripTravelFields(out));
     } catch (err) {
       next(err);
     }
