@@ -206,10 +206,17 @@ export function buildLineItemsForBooking(booking: any): any[] {
   const subDesc   = buildSubDescription(booking, paxStr);
   const costLabel = TYPE_COST_LABELS[booking.type] || "Service Cost";
 
-  // ON_FULL: single combined line — GST charged on full quoted price
+  // ON_FULL: single combined line — GST charged on full quoted price.
+  // Per-row contract: Rate is pre-GST base, GST is broken out, Amount = Rate × Qty + GST.
   if (gstMode === "ON_FULL") {
     const quotedPrice = booking.pricing?.quotedPrice ?? 0;
     const igst = parseFloat((quotedPrice * gstPercent / 100).toFixed(2));
+    const amountWithGst = parseFloat((quotedPrice + igst).toFixed(2));
+    // Sanity: should equal pricing.grandTotal. Use authoritative value if drift ≤ 1 paisa.
+    const grandTotalRef = booking.pricing?.grandTotal ?? amountWithGst;
+    const amountFinal = Math.abs(amountWithGst - grandTotalRef) <= 1
+      ? parseFloat(grandTotalRef.toFixed(2))
+      : amountWithGst;
     return [
       {
         bookingRef:     booking.bookingRef,
@@ -219,7 +226,7 @@ export function buildLineItemsForBooking(booking: any): any[] {
         qty:            1,
         rate:           parseFloat(quotedPrice.toFixed(2)),
         igst,
-        amount:         parseFloat(quotedPrice.toFixed(2)),
+        amount:         amountFinal,
         passengerNames,
         travelDate:     booking.travelDate,
         type:           booking.type,
@@ -247,11 +254,16 @@ export function buildLineItemsForBooking(booking: any): any[] {
 
   // Transaction Fees row: flat per-booking charge.
   // Under ON_MARKUP, markupAmount is GST-inclusive, so:
-  //   - the customer-payable line amount is the pre-GST base
-  //     (= markup − igst)
-  //   - the GST sits in its own column, not embedded in amount
+  //   - Rate is the pre-GST base (= markup − igst)
+  //   - GST sits in its own column
+  //   - Amount = Rate + GST = customer-payable line total (= markupAmount)
   //   - qty is always 1 (a transaction fee is not per-unit)
   const txnFeeBase = parseFloat((markupAmount - igst).toFixed(2));
+  const txnFeeAmount = parseFloat((txnFeeBase + igst).toFixed(2));
+  // Use authoritative markupAmount when drift ≤ 1 paisa to avoid float jitter.
+  const txnFeeAmountFinal = Math.abs(txnFeeAmount - markupAmount) <= 1
+    ? parseFloat(markupAmount.toFixed(2))
+    : txnFeeAmount;
 
   return [
     {
@@ -275,7 +287,7 @@ export function buildLineItemsForBooking(booking: any): any[] {
       qty:            1,
       rate:           txnFeeBase,
       igst,
-      amount:         txnFeeBase,
+      amount:         txnFeeAmountFinal,
       passengerNames,
       travelDate:     booking.travelDate,
       type:           booking.type,
