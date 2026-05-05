@@ -93,6 +93,10 @@ export interface ISBTHotelBooking extends Document {
     paxType: number;
   }>;
   panMandatory?: boolean;
+  // PAN audit trail (TBO confirmation 2026-05-05). PAN is applied to international hotels only;
+  // when isCorporateBooking=true, corporatePAN is the company PAN supplied at the payment page.
+  isCorporateBooking?: boolean;
+  corporatePAN?: string;
   rebookFromBookingId?: string;
   tboReferenceNo?: string | null;
   roomDescription?: string | null;
@@ -204,6 +208,8 @@ const SBTHotelBookingSchema = new Schema(
       paxType: { type: Number },
     }],
     panMandatory: { type: Boolean, default: false },
+    isCorporateBooking: { type: Boolean, default: false },
+    corporatePAN: { type: String, default: "" },
     rebookFromBookingId: { type: String, default: null },
     tboReferenceNo: { type: String, default: null, index: true },
     roomDescription: { type: String, default: null },
