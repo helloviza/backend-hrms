@@ -20,6 +20,7 @@ import MasterData from "../models/MasterData.js";
 import { UserPermission } from "../models/UserPermission.js";
 import { generateTravelerId } from "../utils/travelerId.js";
 import TenantSetupProgress from "../models/TenantSetupProgress.js";
+import { stripTravelFields } from "../utils/stripTravelFields.js";
 
 const r = Router();
 
@@ -556,7 +557,7 @@ async function buildAuthSafeUser(userDoc: any) {
     }
 
     return {
-      safe,
+      safe: stripTravelFields(safe),
       roles,
       customerId,
       vendorId,
@@ -609,7 +610,7 @@ async function buildAuthSafeUser(userDoc: any) {
   delete safe.vendorId;
 
   return {
-    safe,
+    safe: stripTravelFields(safe),
     roles,
     customerId: null,
     vendorId: null,
