@@ -467,6 +467,18 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     }
     grandTotal = parseFloat(grandTotal.toFixed(2));
 
+    // Sanity: subtotal + totalGST should equal grandTotal under the new
+    // contract (Transaction Fees row is now pre-GST). If it does not,
+    // there is a builder/route inconsistency to investigate.
+    const reconciled = parseFloat((subtotal + totalGST).toFixed(2));
+    if (Math.abs(reconciled - grandTotal) > 1) {
+      const bookingRefs = (bookings as any[]).map((b: any) => b.bookingRef).join(",");
+      console.warn(
+        `[invoice ${bookingRefs}] reconciliation drift: ` +
+        `subtotal+totalGST=${reconciled} vs grandTotal=${grandTotal}`
+      );
+    }
+
     const rawTotalGST = parseFloat(totalGST.toFixed(2));
     const gstAmounts = calculateGSTAmounts(rawTotalGST, resolvedGstType);
 
