@@ -454,8 +454,13 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       invoiceLineItems.push(...buildLineItemsForBooking(b));
     }
 
-    const subtotal = invoiceLineItems.reduce((s, li) => s + (li.amount ?? 0), 0);
-    const totalGST = invoiceLineItems.reduce((s, li) => s + (li.igst ?? 0), 0);
+    // Per-row Amount now = Rate × Qty + GST (customer-payable line total),
+    // so Σ amount across all rows equals grandTotal. Subtotal is back-extracted
+    // as (Σ amount − Σ GST). pricing-based grandTotal below remains the source
+    // of truth and serves as a defensive cross-check.
+    const totalAmount = invoiceLineItems.reduce((s, li) => s + (li.amount ?? 0), 0);
+    const totalGST   = invoiceLineItems.reduce((s, li) => s + (li.igst ?? 0), 0);
+    const subtotal   = parseFloat((totalAmount - totalGST).toFixed(2));
     let grandTotal = 0;
     for (const b of bookings as any[]) {
       const gstMode = b.pricing?.gstMode || "ON_MARKUP";
@@ -467,15 +472,13 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     }
     grandTotal = parseFloat(grandTotal.toFixed(2));
 
-    // Sanity: subtotal + totalGST should equal grandTotal under the new
-    // contract (Transaction Fees row is now pre-GST). If it does not,
-    // there is a builder/route inconsistency to investigate.
-    const reconciled = parseFloat((subtotal + totalGST).toFixed(2));
-    if (Math.abs(reconciled - grandTotal) > 1) {
+    // Sanity: Σ amount should equal pricing.grandTotal under the new contract.
+    const reconciledFromAmounts = parseFloat(totalAmount.toFixed(2));
+    if (Math.abs(reconciledFromAmounts - grandTotal) > 1) {
       const bookingRefs = (bookings as any[]).map((b: any) => b.bookingRef).join(",");
       console.warn(
         `[invoice ${bookingRefs}] reconciliation drift: ` +
-        `subtotal+totalGST=${reconciled} vs grandTotal=${grandTotal}`
+        `Σ amount=${reconciledFromAmounts} vs pricing.grandTotal=${grandTotal}`
       );
     }
 
