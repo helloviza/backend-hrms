@@ -13,6 +13,7 @@ import { corsMiddleware } from "./config/cors.js";
 import { helmetMiddleware } from "./config/helmet.js";
 import { errorHandler } from "./middleware/error.js";
 import { requireWorkspace } from "./middleware/requireWorkspace.js";
+import { blockTravelForSaas } from "./middleware/blockTravelForSaas.js";
 import { requireAuth } from "./middleware/auth.js";
 import { apiLimiter, authLimiter, flightSearchLimiter, hotelSearchLimiter, copilotLimiter } from "./middleware/rateLimit.js";
 import { env } from "./config/env.js";
@@ -169,7 +170,11 @@ app.use((req, res, next) => {
 
 // Razorpay webhook — MUST be before express.json() to receive raw body
 import razorpayWebhookRouter from "./routes/razorpay.webhook.js";
-app.use("/api/webhooks", express.raw({ type: "application/json" }), razorpayWebhookRouter);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Razorpay webhook (Plumtrips Travel payments).
+  // Must be mounted BEFORE express.json() so it receives the raw body.
+  app.use("/api/webhooks", express.raw({ type: "application/json" }), razorpayWebhookRouter);
+}
 
 // JSON parser
 app.use(
@@ -218,6 +223,9 @@ app.use("/api", (req: any, res, next) => {
   return requireWorkspace(req, res, next);
 });
 
+// SaaS HRMS tenant route gate — blocks Travel routes for SAAS_HRMS workspaces
+app.use("/api", blockTravelForSaas);
+
 // Strip trailing slashes from all API routes
 app.use((req, res, next) => {
   if (req.path !== '/' && req.path.endsWith('/')) {
@@ -244,7 +252,10 @@ app.use("/api/approvals", noStore);
 app.use("/api/proposals", noStore);
 app.use("/api/booking-history", noStore);
 app.use("/api/auth/refresh", noStore);
-app.use("/api/vouchers", vouchers);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // SHARED_API — Vouchers (will be exposed via tenant API in Phase 4)
+  app.use("/api/vouchers", vouchers);
+}
 
 /* ────────────────────────────────────────────────────────────────
  * STATIC UPLOADS
@@ -306,11 +317,13 @@ async function safeMount(prefix: string, modulePath: string) {
  * API ROUTES
  * ──────────────────────────────────────────────────────────────── */
 
-// Google Places
-app.use("/api/places", placesRouter);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // SHARED_API — Google Places (Hotels) (will be exposed via tenant API in Phase 4)
+  app.use("/api/places", placesRouter);
 
-// Proposals
-app.use("/api/proposals", proposalsRouter);
+  // KEEP_IN_PLUMBOX — Proposals (Plumtrips Travel workflow)
+  app.use("/api/proposals", proposalsRouter);
+}
 
 // Auth & users (signup/invite-accept are public routes on the same prefix)
 import signupRouter from "./routes/auth.signup.js";
@@ -357,13 +370,16 @@ app.use("/api/master-data", masterDataDeptRouter);
 app.use("/api/password", passwordRoutes);
 
 // Vendor & business
-app.use("/api/vendor-services", vendorServicesRouter);
-app.use("/api/business-services", businessServicesRouter);
-app.use("/api/vendors", vendorsRouter);
-app.use("/api/customers", customersRouter);
-app.use("/api/admin/direct-customers", directCustomersRouter);
-app.use("/api/customer/users", customerUsersRouter);
-app.use("/api", vendorCustomerSelfRouter);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Vendor / Business / Customer master + self endpoints (Plumtrips Travel)
+  app.use("/api/vendor-services", vendorServicesRouter);
+  app.use("/api/business-services", businessServicesRouter);
+  app.use("/api/vendors", vendorsRouter);
+  app.use("/api/customers", customersRouter);
+  app.use("/api/admin/direct-customers", directCustomersRouter);
+  app.use("/api/customer/users", customerUsersRouter);
+  app.use("/api", vendorCustomerSelfRouter);
+}
 
 // Workspace
 app.use("/api/v1/workspace", workspaceRouter);
@@ -384,7 +400,10 @@ import superadminWorkspacesRouter from "./routes/superadmin.workspaces.js";
 app.use("/api/superadmin", requireAuth, requireSuperAdmin, superadminWorkspacesRouter);
 
 // Copilot & Pluto
-app.use("/api/v1/copilot/travel", travelCopilotRoutes);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Travel copilot (Plumtrips Travel ops)
+  app.use("/api/v1/copilot/travel", travelCopilotRoutes);
+}
 app.use("/api/v1/pluto/video", plutoVideoRouter);
 app.use("/api/copilot", copilotRouter);
 app.use("/api/v1/copilot/manager", copilotRouter);
@@ -394,38 +413,42 @@ app.use("/api/v1/copilot/video", copilotVideoConsent);
 app.use("/api/v1/admin", adminVideoRouter);
 
 // Flights
-app.use("/api/v1/flights", flightRoutes);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Legacy flight routes (Plumtrips Travel)
+  app.use("/api/v1/flights", flightRoutes);
+}
 
 // SBT (Self-Booking Tool) — TBO integration
 import sbtFlightsRouter from "./routes/sbt.flights.js";
-app.use("/api/sbt/flights", sbtFlightsRouter);
-
 import sbtHotelsRouter from "./routes/sbt.hotels.js";
-app.use("/api/sbt/hotels", sbtHotelsRouter);
-
 import sbtRequestsRouter from "./routes/sbt.requests.js";
-app.use("/api/sbt/requests", sbtRequestsRouter);
-
 import sbtWalletRouter from "./routes/sbt.wallet.js";
-app.use("/api/sbt/wallet", sbtWalletRouter);
-
 import sbtConfigRouter from "./routes/sbt.config.js";
-app.use("/api/sbt/config", sbtConfigRouter);
-
 import travelFormRouter from "./routes/travelForm.js";
-app.use("/api/travel-forms", travelFormRouter);
+
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // SHARED_API — SBT (Self-Booking Tool) routes (will be exposed via tenant API in Phase 4)
+  app.use("/api/sbt/flights", sbtFlightsRouter);
+  app.use("/api/sbt/hotels", sbtHotelsRouter);
+  app.use("/api/sbt/requests", sbtRequestsRouter);
+  app.use("/api/sbt/wallet", sbtWalletRouter);
+  app.use("/api/sbt/config", sbtConfigRouter);
+  app.use("/api/travel-forms", travelFormRouter);
+}
 
 // SBT Admin (offer config)
 import adminSBTRouter from "./routes/admin.sbt.js";
-app.use("/api/admin/sbt", adminSBTRouter);
-
 // Admin Billing Console
 import adminBillingRouter from "./routes/admin.billing.js";
-app.use("/api/admin/billing", adminBillingRouter);
-
 // Unified Billing (TravelBooking — all services)
 import unifiedBillingRoutes from "./routes/admin.unified.billing.js";
-app.use("/api/admin/unified", unifiedBillingRoutes);
+
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Travel admin (SBT config, billing console, unified billing)
+  app.use("/api/admin/sbt", adminSBTRouter);
+  app.use("/api/admin/billing", adminBillingRouter);
+  app.use("/api/admin/unified", unifiedBillingRoutes);
+}
 
 // Dashboards
 app.use("/api/dashboard", dashboardRouter);
@@ -439,11 +462,16 @@ app.use("/api/hr", hrOrgChartRouter);
 // these paths before manualBookingsRouter (which uses billing-access
 // instead of requireAdmin to allow RM-scoped access).
 import manualBookingsRouter from "./routes/manualBookings.js";
-app.use("/api/admin/manual-bookings", manualBookingsRouter);
 
-// Admin
-app.use("/api/admin", adminRouter);
-app.use("/api/admin", adminAnalyticsRouter);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Manual bookings + broad /api/admin routers (Plumtrips Travel).
+  // Order matters: manualBookings must precede adminRouter/adminAnalyticsRouter
+  // so the broad mounts do not intercept the manual-bookings paths.
+  app.use("/api/admin/manual-bookings", manualBookingsRouter);
+  // Admin
+  app.use("/api/admin", adminRouter);
+  app.use("/api/admin", adminAnalyticsRouter);
+}
 app.use("/api/admin", users);
 
 // Admin — Data export (DPDP Act 2023 compliance)
@@ -452,7 +480,10 @@ app.use("/api/admin", adminDataExportRouter);
 
 // Admin — Payment orphans (Razorpay webhook mismatches)
 import adminPaymentOrphansRouter from "./routes/admin.paymentOrphans.js";
-app.use("/api/admin/payment-orphans", adminPaymentOrphansRouter);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Razorpay payment-orphans console (Plumtrips Travel)
+  app.use("/api/admin/payment-orphans", adminPaymentOrphansRouter);
+}
 
 // Admin — Session logs (Winston logging + session tracking)
 import adminSessionsRouter from "./routes/admin.sessions.js";
@@ -460,37 +491,43 @@ app.use("/api/admin/sessions", adminSessionsRouter);
 
 // Ticketing — manual ingest trigger (SUPERADMIN only)
 import ticketsAdminRouter from "./routes/tickets.admin.js";
-app.use("/api/admin/tickets", ticketsAdminRouter);
-
 // Ticketing — agent console (list, detail, reply, status, assign, tags)
 import ticketsConsoleRouter from "./routes/tickets.console.js";
-app.use("/api/admin/tickets", ticketsConsoleRouter);
-
 // Email templates (workspace-scoped, supportTickets permission)
 import emailTemplatesRouter from "./routes/emailTemplates.js";
-app.use("/api/admin/email-templates", emailTemplatesRouter);
-
 // Invoices, Reports, Company Settings (admin-only via router-level requireAdmin)
 import invoicesRouter, { workspaceRouter as invoicesWorkspaceRouter } from "./routes/invoices.js";
 import reportsRouter from "./routes/reports.js";
 import companySettingsRouter from "./routes/companySettings.js";
-app.use("/api/invoices/workspace", invoicesWorkspaceRouter);
-app.use("/api/admin/invoices", invoicesRouter);
-app.use("/api/admin/reports", reportsRouter);
-app.use("/api/admin/company-settings", companySettingsRouter);
-
 // Billing Permissions (Super Admin grant/revoke + my-access for all users)
 import billingPermissionsRouter from "./routes/billingPermissions.js";
-app.use("/api/billing-permissions", billingPermissionsRouter);
+
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Travel-specific admin features:
+  //   ticketing, email templates, invoices, reports, company settings,
+  //   billing permissions (all Plumtrips Travel admin surfaces).
+  app.use("/api/admin/tickets", ticketsAdminRouter);
+  app.use("/api/admin/tickets", ticketsConsoleRouter);
+  app.use("/api/admin/email-templates", emailTemplatesRouter);
+  app.use("/api/invoices/workspace", invoicesWorkspaceRouter);
+  app.use("/api/admin/invoices", invoicesRouter);
+  app.use("/api/admin/reports", reportsRouter);
+  app.use("/api/admin/company-settings", companySettingsRouter);
+  app.use("/api/billing-permissions", billingPermissionsRouter);
+}
 
 // Unified Permissions (UserPermission model — replaces BillingPermission long-term)
 import permissionsRouter from "./routes/permissions.js";
 app.use("/api/permissions", permissionsRouter);
 
 // Approvals & booking history
-app.use("/api/approvals", approvalsRouter);
-app.use("/api/approvals", bookingHistory);
-app.use("/api/booking-history", bookingHistory);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // SHARED_API — Approvals router (will be exposed via tenant API in Phase 4)
+  app.use("/api/approvals", approvalsRouter);
+  // KEEP_IN_PLUMBOX — Booking history (Plumtrips Travel-specific outcomes + admin PDFs)
+  app.use("/api/approvals", bookingHistory);
+  app.use("/api/booking-history", bookingHistory);
+}
 
 // Optional
 void safeMount("/api/settings", "./routes/settings.js");
@@ -500,7 +537,10 @@ app.use("/api/stubs", stubs);
 
 // EOD WhatsApp Report
 import eodReportRouter from "./routes/eodReport.js";
-app.use("/api/eod-report", eodReportRouter);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — EOD WhatsApp report (Plumtrips Travel ops)
+  app.use("/api/eod-report", eodReportRouter);
+}
 
 // Image proxy
 app.use("/api/proxy", proxyRouter);
@@ -511,17 +551,23 @@ app.use("/api/presence", presenceRoutes);
 app.use("/api/meetings", meetingRoutes);
 
 // Sales CRM
-app.use("/api/leads", leadsRouter);
-app.use("/api/crm/companies", crmCompaniesRouter);
-app.use("/api/crm/contacts", crmContactsRouter);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Sales CRM (Plumtrips Travel)
+  app.use("/api/leads", leadsRouter);
+  app.use("/api/crm/companies", crmCompaniesRouter);
+  app.use("/api/crm/contacts", crmContactsRouter);
+}
 
 // Tasks / Reminders
 import tasksRouter from "./routes/tasks.js";
-app.use("/api/admin/tasks", tasksRouter);
-
 // Task Automations (settings)
 import taskAutomationsRouter from "./routes/admin.task-automations.js";
-app.use("/api/admin/task-automations", taskAutomationsRouter);
+
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Tasks & task automations (Plumtrips Travel ops)
+  app.use("/api/admin/tasks", tasksRouter);
+  app.use("/api/admin/task-automations", taskAutomationsRouter);
+}
 
 // In-app notifications
 import notificationsRouter from "./routes/notifications.js";
@@ -546,7 +592,10 @@ app.use("/api/payroll/declaration", payrollDeclarationRouter);
 app.use("/api/workspace/settings", workspaceSettingsRouter);
 
 // Preview (flight/hotel inventory for approval flow)
-app.use("/api/preview", previewRoutes);
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // SHARED_API — Preview (will be exposed via tenant API in Phase 4)
+  app.use("/api/preview", previewRoutes);
+}
 
 // 404
 app.use("/api", (_req, res) => {
