@@ -227,33 +227,31 @@ export function buildLineItemsForBooking(booking: any): any[] {
     ];
   }
 
-  // ON_MARKUP (default): 2 lines — COST (no GST) + SERVICE_FEE (GST embedded in markup, tax-inclusive back-calc)
+  // ON_MARKUP: 2 lines — COST (no GST, qty=units) + SERVICE_FEE (flat per-booking, pre-GST amount, GST broken out)
   const igst = parseFloat(((diff * gstPercent) / (100 + gstPercent)).toFixed(2));
 
   const qty      = computeQty(booking);
   const costRate = parseFloat((supplierCost / qty).toFixed(2));
-  const svcRate  = parseFloat((markupAmount  / qty).toFixed(2));
   const costAmtRaw = parseFloat((costRate * qty).toFixed(2));
-  const svcAmtRaw  = parseFloat((svcRate  * qty).toFixed(2));
 
-  // Absorb cent-level rounding drift: amounts use authoritative totals.
+  // Cost row: rounding-drift absorber preserves authoritative supplierCost
   const costAmt = Math.abs(costAmtRaw - supplierCost) <= 1
     ? parseFloat(supplierCost.toFixed(2))
     : costAmtRaw;
-  const svcAmt  = Math.abs(svcAmtRaw  - markupAmount) <= 1
-    ? parseFloat(markupAmount.toFixed(2))
-    : svcAmtRaw;
 
   if (Math.abs(costAmt - supplierCost) > 1) {
     logger.warn("[invoiceLineItems] COST row drift > ±1", {
       bookingRef: booking.bookingRef, expected: supplierCost, got: costAmt,
     });
   }
-  if (Math.abs(svcAmt - markupAmount) > 1) {
-    logger.warn("[invoiceLineItems] SERVICE_FEE row drift > ±1", {
-      bookingRef: booking.bookingRef, expected: markupAmount, got: svcAmt,
-    });
-  }
+
+  // Transaction Fees row: flat per-booking charge.
+  // Under ON_MARKUP, markupAmount is GST-inclusive, so:
+  //   - the customer-payable line amount is the pre-GST base
+  //     (= markup − igst)
+  //   - the GST sits in its own column, not embedded in amount
+  //   - qty is always 1 (a transaction fee is not per-unit)
+  const txnFeeBase = parseFloat((markupAmount - igst).toFixed(2));
 
   return [
     {
@@ -274,10 +272,10 @@ export function buildLineItemsForBooking(booking: any): any[] {
       rowType:        "SERVICE_FEE",
       description:    "Transaction Fees",
       subDescription: subDesc,
-      qty,
-      rate:           svcRate,
+      qty:            1,
+      rate:           txnFeeBase,
       igst,
-      amount:         svcAmt,
+      amount:         txnFeeBase,
       passengerNames,
       travelDate:     booking.travelDate,
       type:           booking.type,
