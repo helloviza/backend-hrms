@@ -24,12 +24,57 @@ function fmtDate(d: Date | string | null | undefined): string {
   return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
 }
 
+/**
+ * Compute nights between check-in and check-out dates.
+ * Returns null if either date is missing or invalid; never returns 0.
+ * Same-day check-in/out → 1 (treated as a 1-night stay for billing).
+ */
+function computeNightsFromDates(
+  travelDate: unknown,
+  returnDate: unknown
+): number | null {
+  if (!travelDate || !returnDate) return null;
+  const ci = new Date(travelDate as string | Date);
+  const co = new Date(returnDate as string | Date);
+  if (isNaN(ci.getTime()) || isNaN(co.getTime())) return null;
+  const ms = co.getTime() - ci.getTime();
+  if (ms < 0) return null;  // return-before-checkin = invalid
+  const days = Math.round(ms / 86_400_000);
+  return Math.max(1, days);  // same-day stay clamps to 1
+}
+
+/**
+ * Resolve nights for a HOTEL booking using a clear precedence:
+ * 1. itinerary.nights if present and > 0
+ * 2. computed from travelDate/returnDate
+ * 3. fallback to 1 (preserves existing rendering for malformed docs)
+ */
+function resolveHotelNights(booking: any): number {
+  const stored = Number(booking?.itinerary?.nights);
+  if (Number.isFinite(stored) && stored > 0) return stored;
+  const computed = computeNightsFromDates(
+    booking?.travelDate,
+    booking?.returnDate
+  );
+  if (computed != null) return computed;
+  return 1;
+}
+
+/**
+ * Resolve room count with similar precedence.
+ */
+function resolveHotelRooms(booking: any): number {
+  const stored = Number(booking?.itinerary?.roomCount);
+  if (Number.isFinite(stored) && stored > 0) return stored;
+  return 1;
+}
+
 function computeQty(booking: any): number {
   const t: string = booking.type;
 
   if (t === "HOTEL" || t === "DUMMY_HOTEL") {
-    const nights = booking.itinerary?.nights || 1;
-    const rooms  = booking.itinerary?.roomCount || 1;
+    const nights = resolveHotelNights(booking);
+    const rooms = resolveHotelRooms(booking);
     const qty    = nights * rooms;
     if (!qty || isNaN(qty) || qty <= 0) {
       logger.warn("[invoiceLineItems] hotel QTY is zero/NaN, falling back to 1", {
@@ -41,6 +86,8 @@ function computeQty(booking: any): number {
   }
 
   if (t === "OTHER") return 1;
+
+  if (t === "FOREX" || t === "ESIM") return 1;
 
   const pax = (booking.passengers || []).length || 1;
   if (!pax || isNaN(pax) || pax <= 0) {
@@ -57,10 +104,10 @@ function buildUnitCountPrefix(booking: any): string {
   const paxCount = (booking.passengers || []).length || 1;
 
   if (t === "HOTEL" || t === "DUMMY_HOTEL") {
-    const nights = booking.itinerary?.nights || 1;
-    const rooms  = booking.itinerary?.roomCount || 1;
+    const nights = resolveHotelNights(booking);
+    const rooms = resolveHotelRooms(booking);
     const nightLabel = nights === 1 ? "Night" : "Nights";
-    const roomLabel  = rooms  === 1 ? "Room"  : "Rooms";
+    const roomLabel = rooms === 1 ? "Room" : "Rooms";
     return `${nights} ${nightLabel} x ${rooms} ${roomLabel}`;
   }
   if (t === "FLIGHT" || t === "DUMMY_FLIGHT" || t === "TRAIN") {
@@ -75,8 +122,11 @@ function buildUnitCountPrefix(booking: any): string {
   if (t === "EVENTS") {
     return `${paxCount} Attendee(s)`;
   }
+  // FOREX/ESIM render as a single unit until the form captures
+  // currency/amount or SIM count/validity-days. See audit
+  // 2026-05-05 Section 1.2.
   if (t === "FOREX" || t === "ESIM") {
-    return `${paxCount} Unit(s)`;
+    return "1 Unit";
   }
   return "";
 }
