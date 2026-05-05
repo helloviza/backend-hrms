@@ -37,6 +37,8 @@ export interface ISBTHotelBooking extends Document {
   mealType: string;
   totalFare: number;
   netAmount: number;
+  recommendedSellingRate?: number | null;
+  cancellationPolicyText?: string | null;
   isPublishedFare?: boolean;
   tds?: number;
   agentCommission?: number;
@@ -141,6 +143,8 @@ const SBTHotelBookingSchema = new Schema(
     mealType: { type: String, default: "" },
     totalFare: { type: Number, default: 0 },
     netAmount: { type: Number, default: 0 },
+    recommendedSellingRate: { type: Number, default: null },
+    cancellationPolicyText: { type: String, default: null },
     isPublishedFare: { type: Boolean, default: false },
     tds: { type: Number, default: 0 },
     agentCommission: { type: Number, default: 0 },

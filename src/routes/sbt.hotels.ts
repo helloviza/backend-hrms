@@ -13,7 +13,7 @@ import { sendMail } from "../utils/mailer.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
-import { getMarginConfig, applyMargin } from "../utils/margin.js";
+import { getMarginConfig, applyMargin, applyMarginWithFloor, violatesRspFloor } from "../utils/margin.js";
 import { getTBOToken, logoutTBO } from "../services/tbo.auth.service.js";
 import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
 import { getCompanySettings } from "../utils/companySettings.js";
@@ -76,6 +76,25 @@ const MOCK_HOTEL_RESULTS = [
     cheapestFare: 2596,
   },
 ];
+
+// ─── Hotel room normalization ────────────────────────────────────────────────
+// Spec lines 1415-1432: surface RecommendedSellingRate, Supplements, CancelPolicies,
+// IsRefundable as explicit lowercase fields so downstream consumers (RSP guard,
+// supplements display, cancel-policy display) don't depend on TBO casing.
+// Raw TBO fields are preserved via spread.
+function normalizeRoom(room: any) {
+  return {
+    ...room,
+    recommendedSellingRate:
+      room?.RecommendedSellingRate != null
+        ? Number(room.RecommendedSellingRate) || null
+        : null,
+    supplements: Array.isArray(room?.Supplements) ? room.Supplements : [],
+    cancelPolicies: Array.isArray(room?.CancelPolicies) ? room.CancelPolicies : [],
+    isRefundable:
+      typeof room?.IsRefundable === "boolean" ? room.IsRefundable : null,
+  };
+}
 
 const router = express.Router();
 router.use(requireAuth);
@@ -926,7 +945,7 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
 
     // 4. Fire parallel search requests (max 5 concurrent)
     const MAX_CONCURRENT = 5;
-    const allResults: any[] = [];
+    let allResults: any[] = [];
     let apiErrorBatches = 0;
     let totalBatches = 0;
     const searchTraceId = `hotel-search-${randomUUID().slice(0, 8)}`;
@@ -966,15 +985,46 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       for (const r of results) {
         totalBatches++;
         const d = r as any;
+        const enrichRooms = (hotel: any) => {
+          if (Array.isArray(hotel?.Rooms)) {
+            hotel.Rooms = hotel.Rooms.map((rm: any) => normalizeRoom(rm));
+          }
+          return hotel;
+        };
         if (d?.HotelResult) {
-          allResults.push(...d.HotelResult);
+          for (const h of d.HotelResult) allResults.push(enrichRooms(h));
         } else if (d?.HotelSearchResult?.HotelResults) {
-          allResults.push(...d.HotelSearchResult.HotelResults);
+          for (const h of d.HotelSearchResult.HotelResults) allResults.push(enrichRooms(h));
         } else if (d == null || (d.ResponseStatus !== undefined && d.ResponseStatus !== 1)) {
           // Batch returned a TBO error (ResponseStatus≠1) or fetch failed (null)
           apiErrorBatches++;
         }
       }
+    }
+
+    // Dedupe by HotelCode after parallel batch merge (spec line 21 mandate).
+    // First occurrence wins; subsequent duplicates are discarded.
+    {
+      const seen = new Set<string>();
+      const deduped: any[] = [];
+      let duplicateCount = 0;
+      for (const hotel of allResults) {
+        const code = String(hotel?.HotelCode ?? "");
+        if (!code) continue;
+        if (seen.has(code)) {
+          duplicateCount++;
+          continue;
+        }
+        seen.add(code);
+        deduped.push(hotel);
+      }
+      if (duplicateCount > 0) {
+        console.warn(
+          `[hotel-search] Deduped ${duplicateCount} duplicate HotelCode(s) ` +
+          `across ${chunks.length} parallel batches`
+        );
+      }
+      allResults = deduped;
     }
 
     // 5. Merge metadata from HotelCodeList into search results
@@ -1039,12 +1089,21 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       Rooms: hotel.Rooms?.map((room: any) => {
         const net = room.TotalFare ?? 0;
         const markupAmount = marginPct > 0 ? applyMargin(net, marginPct) - net : 0;
+        // RSP floor (TBO cert spec lines 1415/1746/1760): clamp display to RSP if present.
+        const _rsp =
+          typeof room.recommendedSellingRate === "number"
+            ? room.recommendedSellingRate
+            : null;
+        const _displayTotalFare = applyMarginWithFloor(net, marginPct, _rsp);
+        const _rspClamped = _rsp != null && _rsp > applyMargin(net, marginPct);
         return {
           ...room,
           _netAmount: room.NetAmount ?? net,
           _markupAmount: markupAmount,
-          _displayTotalFare: net + markupAmount,
+          _displayTotalFare,
           _marginPercent: marginPct,
+          _rsp,
+          _rspClamped,
         };
       }),
     }));
@@ -1130,6 +1189,10 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
     const netAmount = room0?.NetAmount ?? room0?.TotalFare ?? 0;
     const prebookTotalFare = room0?.TotalFare ?? netAmount;
     const recommendedSellingRate = room0?.RecommendedSellingRate ?? null;
+    const supplements = Array.isArray(room0?.Supplements) ? room0.Supplements : [];
+    const cancelPolicies = Array.isArray(room0?.CancelPolicies) ? room0.CancelPolicies : [];
+    const isRefundable =
+      typeof room0?.IsRefundable === "boolean" ? room0.IsRefundable : null;
 
     // RC2: compare TBO-raw TotalFare on both sides (searchPrice is now raw TBO TotalFare from frontend)
     const PRICE_CHANGE_TOLERANCE = 1; // rupees — below this is rounding noise
@@ -1144,9 +1207,15 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
     const prebookMarginPct = prebookMargins.enabled
       ? (isPrebookDomestic ? prebookMargins.hotel.domestic : prebookMargins.hotel.international)
       : 0;
-    const displayTotalFare = prebookMarginPct > 0
-      ? applyMargin(prebookTotalFare, prebookMarginPct)
-      : prebookTotalFare;
+    // RSP floor (TBO cert spec lines 1415/1746/1760): clamp display to RSP if present.
+    const displayTotalFare = applyMarginWithFloor(
+      prebookTotalFare,
+      prebookMarginPct,
+      recommendedSellingRate,
+    );
+    const rspClamped =
+      typeof recommendedSellingRate === "number" &&
+      recommendedSellingRate > applyMargin(prebookTotalFare, prebookMarginPct);
 
     // RC3a: Published Fare TDS extraction from PriceBreakUp node
     const priceBreakup: any[] = room0?.PriceBreakUp ?? [];
@@ -1163,6 +1232,10 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       priceDiff,
       netAmount,
       recommendedSellingRate,
+      rspClamped,
+      supplements,
+      cancelPolicies,
+      isRefundable,
       displayTotalFare,
       marginPercent: prebookMarginPct,
       tds,
@@ -1232,6 +1305,45 @@ router.post("/validate-before-payment", requireSBT, requireHotelAccess, async (r
     if (errors.length > 0) {
       return res.status(400).json({ valid: false, errors });
     }
+
+    // RSP floor enforcement (TBO cert spec lines 1415/1746/1760).
+    // No server-side prebook cache exists — RSP and customerChargedAmount are forwarded
+    // by the frontend from the /prebook response. Defensive: if the field is absent,
+    // log a warning and skip — the /book gate below fails closed.
+    const rspFloor: number | null =
+      typeof req.body?.recommendedSellingRate === "number"
+        ? req.body.recommendedSellingRate
+        : null;
+    const customerChargedAmount: number = Number(
+      req.body?.customerChargedAmount ??
+      req.body?.displayAmount ??
+      req.body?.totalAmount ??
+      0,
+    );
+    if (rspFloor != null && customerChargedAmount > 0) {
+      if (violatesRspFloor(customerChargedAmount, rspFloor)) {
+        return res.status(400).json({
+          valid: false,
+          success: false,
+          code: "RSP_FLOOR_VIOLATED",
+          message:
+            "Selling price is below the supplier's recommended minimum. " +
+            "Please refresh the search and try again.",
+          details: {
+            rsp: rspFloor,
+            customerChargedAmount,
+            shortfall: Math.round((rspFloor - customerChargedAmount) * 100) / 100,
+          },
+        });
+      }
+    } else {
+      sbtLogger.warn("[validate-before-payment] RSP floor check skipped — missing fields", {
+        hasRsp: rspFloor != null,
+        hasChargedAmount: customerChargedAmount > 0,
+        BookingCode: BookingCode || "",
+      });
+    }
+
     return res.status(200).json({ valid: true });
   } catch (err: any) {
     console.error("[validate-before-payment]", err);
@@ -1340,6 +1452,13 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       PaymentId,
       bookingMode = "voucher",
     } = req.body;
+
+    // RSP snapshot from PreBook, forwarded by frontend. Persisted on CONFIRMED/HELD/FAILED
+    // for audit trail and downstream price-floor enforcement.
+    const bookingRecommendedSellingRate: number | null =
+      typeof req.body?.recommendedSellingRate === "number"
+        ? req.body.recommendedSellingRate
+        : null;
 
     // GuestNationality must equal Search-time value — never derive from per-guest field (TBO cert rule).
     const GuestNationality: string = _reqNationality || "IN";
@@ -1750,6 +1869,16 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         bookingCodeTimestamps.delete(BookingCode);
       }
 
+      // TBO textual cancellation policy from Book response (spec line 2425). Used by the
+      // Confirmed page and Bookings list to show TBO's verbatim policy text. Defensively
+      // checks both top-level and per-room locations.
+      const _bookCancellationPolicyText: string | null =
+        typeof (result as any)?.CancellationPolicy === "string"
+          ? (result as any).CancellationPolicy
+          : typeof (result as any)?.HotelRoomsDetails?.[0]?.CancellationPolicy === "string"
+          ? (result as any).HotelRoomsDetails[0].CancellationPolicy
+          : null;
+
       // GAP-01: Update pre-persist skeleton to CONFIRMED/HELD with TBO booking details.
       try {
         await SBTHotelBooking.findOneAndUpdate(
@@ -1769,6 +1898,8 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             ...(isCorporateBooking && corporatePAN ? { corporatePAN } : {}),
             ...(isHeld && holdTboReferenceNo ? { tboReferenceNo: holdTboReferenceNo, bookingDetailFetched: true, bookingDetailFetchedAt: new Date() } : {}),
             ...(isHeld && holdRoomDescription ? { roomDescription: holdRoomDescription } : {}),
+            ...(bookingRecommendedSellingRate != null ? { recommendedSellingRate: bookingRecommendedSellingRate } : {}),
+            ...(_bookCancellationPolicyText ? { cancellationPolicyText: _bookCancellationPolicyText } : {}),
           }},
         );
       } catch { /* non-fatal — booking succeeded; DB update is best-effort */ }
@@ -1887,6 +2018,64 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       }
     }
 
+    // Audit fields persisted on every FAILED write so diagnostics see what was attempted.
+    const _failedAudit: Record<string, unknown> = {
+      isCorporateBooking: !!isCorporateBooking,
+      corporatePAN: corporatePAN || "",
+      panMandatory: !!panMandatory,
+      ...(bookingRecommendedSellingRate != null
+        ? { recommendedSellingRate: bookingRecommendedSellingRate }
+        : {}),
+    };
+
+    // RSP floor enforcement (TBO cert spec lines 1415/1746/1760) — last-resort gate.
+    // Fails closed: if the customer-charged amount is below RSP, block the TBO Book call,
+    // mark the pre-persist record FAILED, and surface RSP_FLOOR_VIOLATED so the frontend
+    // can trigger a refund flow if Razorpay already charged.
+    {
+      const _chargedAmount = Number(
+        req.body?.customerChargedAmount ??
+        req.body?.displayAmount ??
+        req.body?.totalAmount ??
+        0,
+      );
+      if (
+        bookingRecommendedSellingRate != null &&
+        _chargedAmount > 0 &&
+        violatesRspFloor(_chargedAmount, bookingRecommendedSellingRate)
+      ) {
+        const _detail = `Charged ${_chargedAmount} below RSP ${bookingRecommendedSellingRate}`;
+        sbtLogger.error("Hotel /book blocked by RSP floor", {
+          userId: req.user?.id,
+          clientRef,
+          BookingCode,
+          rsp: bookingRecommendedSellingRate,
+          chargedAmount: _chargedAmount,
+        });
+        try {
+          await SBTHotelBooking.findOneAndUpdate(
+            { clientReferenceId: clientRef },
+            {
+              $set: {
+                ..._failedAudit,
+                status: "FAILED",
+                failureReason: `RSP_FLOOR_VIOLATED: ${_detail}`,
+                recommendedSellingRate: bookingRecommendedSellingRate,
+              },
+            },
+          );
+        } catch { /* best effort — booking still rejected below */ }
+        return res.status(400).json({
+          success: false,
+          code: "RSP_FLOOR_VIOLATED",
+          message:
+            "Booking blocked: selling price is below the supplier's " +
+            "recommended minimum. Refund will be processed.",
+          details: { rsp: bookingRecommendedSellingRate, chargedAmount: _chargedAmount },
+        });
+      }
+    }
+
     const t0 = Date.now();
     let data: any;
     let bookTimedOut = false;
@@ -1976,13 +2165,6 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
 
       let result = data?.BookResult || data;
-
-      // Audit fields persisted on every FAILED write so diagnostics see what was attempted.
-      const _failedAudit = {
-        isCorporateBooking: !!isCorporateBooking,
-        corporatePAN: corporatePAN || "",
-        panMandatory: !!panMandatory,
-      };
 
       // CROSS-003: explicit handling for ResponseStatus 2/3/5 in Book flow.
       const bookRS = result?.ResponseStatus;
@@ -2409,6 +2591,10 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       mealType: b.mealType || "",
       totalFare: b.totalFare,
       netAmount: b.netAmount || b.totalFare || 0,
+      recommendedSellingRate:
+        typeof b.recommendedSellingRate === "number" ? b.recommendedSellingRate : null,
+      cancellationPolicyText:
+        typeof b.cancellationPolicyText === "string" ? b.cancellationPolicyText : null,
       currency: b.currency || "INR",
       isRefundable: b.isRefundable ?? false,
       cancelPolicies: b.cancelPolicies || [],
