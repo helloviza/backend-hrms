@@ -18,6 +18,7 @@ function requireEnv(key: string, fallback?: string): string {
 export const env = {
   NODE_ENV: process.env.NODE_ENV || "development",
   PORT: Number(process.env.PORT) || 8080,
+  DEPLOYMENT_MODE: (process.env.DEPLOYMENT_MODE === "saas" ? "saas" : "plumbox") as "saas" | "plumbox",
 
   MONGO_URI: requireEnv("MONGO_URI"),
   JWT_SECRET: requireEnv("JWT_SECRET"),
