@@ -108,7 +108,7 @@ import Customer from "../models/Customer.js";
 import { generateInvoicePdf } from "../utils/invoicePdf.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { buildLineItemsForBooking } from "../utils/invoiceLineItems.js";
-import { detectGSTType, calculateGSTAmounts, type GSTType } from "../utils/gstDetection.js";
+import { detectGSTType, calculateGSTAmounts, GST_STATE_CODES, type GSTType } from "../utils/gstDetection.js";
 import { env } from "../config/env.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 
@@ -295,6 +295,101 @@ function invoiceToRow(inv: any): (string | number | undefined)[] {
   ];
 }
 
+/* ── GST Bypass helper ──────────────────────────────────────────── */
+
+// Bypass-mode UT list (per spec). Distinct from gstDetection's UNION_TERRITORIES
+// set, which uses the combined "Dadra and Nagar Haveli and Daman and Diu" entry.
+const BYPASS_UT_LIST = new Set<string>([
+  "Andaman and Nicobar Islands",
+  "Chandigarh",
+  "Dadra and Nagar Haveli",
+  "Daman and Diu",
+  "Lakshadweep",
+  "Delhi",
+  "Puducherry",
+  "Jammu and Kashmir",
+  "Ladakh",
+]);
+
+interface GstResolution {
+  ok: boolean;
+  gstType?: GSTType;
+  detection?: {
+    gstType: GSTType;
+    supplierState: string;
+    customerState: string;
+    supplierStateCode: string;
+    customerStateCode: string;
+    placeOfSupply: string;
+    canCalculate: true;
+    bypassed: boolean;
+    bypassReason?: string;
+  };
+  bypassed?: boolean;
+  reason?: string;
+  missingField?: string;
+}
+
+function resolveGstWithBypass(input: {
+  gstBypass: boolean;
+  gstBypassReason: string;
+  supplierState: string;
+  customerState: string;
+  customerCountry: string;
+}): GstResolution {
+  if (input.gstBypass) {
+    const gstType: GSTType = BYPASS_UT_LIST.has(input.supplierState)
+      ? "CGST_UTGST"
+      : "CGST_SGST";
+    const customerState = input.customerState || "";
+    const placeOfSupply = customerState.trim() ? customerState.trim() : input.supplierState;
+    return {
+      ok: true,
+      gstType,
+      detection: {
+        gstType,
+        supplierState: input.supplierState,
+        customerState,
+        supplierStateCode: GST_STATE_CODES[input.supplierState] || "",
+        customerStateCode: customerState ? GST_STATE_CODES[customerState] || "" : "",
+        placeOfSupply,
+        canCalculate: true,
+        bypassed: true,
+        bypassReason: input.gstBypassReason,
+      },
+      bypassed: true,
+    };
+  }
+
+  const detection = detectGSTType({
+    supplierState: input.supplierState,
+    customerState: input.customerState,
+    customerCountry: input.customerCountry,
+  });
+  if (!detection.canCalculate) {
+    return {
+      ok: false,
+      reason: detection.reason || "GST detection failed",
+      missingField: detection.reason?.includes("state") ? "state" : "unknown",
+    };
+  }
+  return {
+    ok: true,
+    gstType: detection.gstType,
+    detection: {
+      gstType: detection.gstType,
+      supplierState: detection.supplierState,
+      customerState: detection.customerState,
+      supplierStateCode: detection.supplierStateCode,
+      customerStateCode: detection.customerStateCode,
+      placeOfSupply: detection.placeOfSupply,
+      canCalculate: true,
+      bypassed: false,
+    },
+    bypassed: false,
+  };
+}
+
 /* ── Generate Invoice ───────────────────────────────────────────── */
 
 // POST /api/admin/invoices/generate
@@ -321,6 +416,16 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       gstTypeOverride?: GSTType;
       gstOverrideReason?: string;
     };
+
+    // GST bypass payload (separate from gstTypeOverride — distinct audit trail)
+    const gstBypass = req.body?.gstBypass === true;
+    const gstBypassReason = (req.body?.gstBypassReason || "").trim();
+    if (gstBypass && !gstBypassReason) {
+      return res.status(400).json({
+        error: "BYPASS_REASON_REQUIRED",
+        message: "gstBypassReason is required when gstBypass is true",
+      });
+    }
 
     if (!Array.isArray(bookingIds) || !bookingIds.length) {
       return res.status(400).json({ error: "bookingIds array is required" });
@@ -388,25 +493,32 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     const effectiveState   = customerStateRaw   || addrFallback.state   || "";
     const effectiveCountry = customerCountry    || addrFallback.country || "India";
 
-    // GST detection
-    const detection = detectGSTType({ supplierState: issuerState, customerState: effectiveState, customerCountry: effectiveCountry });
-    if (!detection.canCalculate) {
+    // GST resolution — bypass branch skips detection; otherwise auto-detect.
+    const resolution = resolveGstWithBypass({
+      gstBypass,
+      gstBypassReason,
+      supplierState: issuerState,
+      customerState: effectiveState,
+      customerCountry: effectiveCountry,
+    });
+    if (!resolution.ok) {
       return res.status(400).json({
         error: "GST_DETECTION_FAILED",
-        message: detection.reason,
+        message: resolution.reason,
         customerId: cust._id,
-        missingField: "state",
+        missingField: resolution.missingField,
         hint: "Update customer profile with state before generating invoice",
       });
     }
+    const detection = resolution.detection;
 
-    // Validate and apply override if provided
+    // Validate and apply manual override if provided (independent of bypass).
     const allowedOverrides: GSTType[] = ["CGST_SGST", "CGST_UTGST", "IGST", "EXPORT", "NONE"];
     const useOverride = gstTypeOverride && allowedOverrides.includes(gstTypeOverride);
     if (useOverride && !gstOverrideReason) {
       return res.status(400).json({ error: "gstOverrideReason is required when using gstTypeOverride" });
     }
-    const resolvedGstType: GSTType = useOverride ? gstTypeOverride! : detection.gstType;
+    const resolvedGstType: GSTType = useOverride ? gstTypeOverride! : resolution.gstType;
 
     const custAddrLine1 = custAddr.street  || addrFallback.line1   || "";
     const custAddrLine2 = custAddr.street2 || addrFallback.line2   || "";
@@ -506,6 +618,9 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       gstTypeOverridden: useOverride ? true : false,
       gstOverrideReason: useOverride ? gstOverrideReason : undefined,
       gstOverrideBy: useOverride ? req.user._id : undefined,
+      gstBypass,
+      gstBypassType: gstBypass ? (resolution.gstType as "CGST_SGST" | "CGST_UTGST") : null,
+      gstBypassReason: gstBypass ? gstBypassReason : "",
       placeOfSupply: detection.placeOfSupply,
       issuerState,
       clientState,
@@ -578,6 +693,16 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       return res.status(400).json({ error: "bookingIds array is required" });
     }
 
+    // GST bypass payload — applies to all invoices in the batch.
+    const gstBypass = req.body?.gstBypass === true;
+    const gstBypassReason = (req.body?.gstBypassReason || "").trim();
+    if (gstBypass && !gstBypassReason) {
+      return res.status(400).json({
+        error: "BYPASS_REASON_REQUIRED",
+        message: "gstBypassReason is required when gstBypass is true",
+      });
+    }
+
     const resolvedInvoiceDate = invoiceDate ? new Date(invoiceDate) : new Date();
     resolvedInvoiceDate.setHours(0, 0, 0, 0);
 
@@ -618,18 +743,25 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
     const cust = (customer || {}) as any;
     const { state: customerStateRaw, country: customerCountry } = resolveCustomerState(cust);
 
-    const detection = detectGSTType({ supplierState: issuerState, customerState: customerStateRaw, customerCountry });
-    if (!detection.canCalculate) {
+    const resolution = resolveGstWithBypass({
+      gstBypass,
+      gstBypassReason,
+      supplierState: issuerState,
+      customerState: customerStateRaw,
+      customerCountry,
+    });
+    if (!resolution.ok) {
       return res.status(400).json({
         error: "GST_DETECTION_FAILED",
-        message: detection.reason,
+        message: resolution.reason,
         customerId: cust._id,
-        missingField: "state",
+        missingField: resolution.missingField,
         hint: "Update customer profile with state before generating invoice",
       });
     }
+    const detection = resolution.detection;
 
-    const resolvedGstType: GSTType = detection.gstType;
+    const resolvedGstType: GSTType = resolution.gstType;
     const clientState = detection.customerState;
 
     const bulkAddrLine1 = (cust.address as any)?.street  || "";
@@ -718,6 +850,9 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
           igstAmount: gstAmounts.igst,
           gstTypeAutoDetected: detection.gstType,
           gstTypeOverridden: false,
+          gstBypass,
+          gstBypassType: gstBypass ? (resolution.gstType as "CGST_SGST" | "CGST_UTGST") : null,
+          gstBypassReason: gstBypass ? gstBypassReason : "",
           placeOfSupply: detection.placeOfSupply,
           issuerState,
           clientState,
