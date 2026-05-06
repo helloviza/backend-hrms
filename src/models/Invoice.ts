@@ -41,6 +41,9 @@ export interface IInvoice extends Document {
   gstTypeOverridden?: boolean;
   gstOverrideReason?: string;
   gstOverrideBy?: Schema.Types.ObjectId;
+  gstBypass?: boolean;
+  gstBypassType?: "CGST_SGST" | "CGST_UTGST" | null;
+  gstBypassReason?: string;
   editedAt?: Date;
   editedBy?: Schema.Types.ObjectId;
   editHistory?: IEditHistoryEntry[];
@@ -112,6 +115,13 @@ const InvoiceSchema = new Schema<IInvoice>(
     gstTypeOverridden: { type: Boolean, default: false },
     gstOverrideReason: { type: String },
     gstOverrideBy: { type: Schema.Types.ObjectId, ref: "User" },
+    gstBypass: { type: Boolean, default: false },
+    gstBypassType: {
+      type: String,
+      enum: ["CGST_SGST", "CGST_UTGST", null],
+      default: null,
+    },
+    gstBypassReason: { type: String, default: "" },
     placeOfSupply: { type: String },
     issuerState: String,
     clientState: String,
