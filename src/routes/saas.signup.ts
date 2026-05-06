@@ -80,7 +80,9 @@ r.post("/signup", async (req, res) => {
       name: adminName.trim(),
       passwordHash,
       roles: ["TENANT_ADMIN", "WORKSPACE_LEADER"],
-      accountType: "CUSTOMER",
+      hrmsAccessRole: "L0",
+      hrmsAccessLevel: "L0",
+      accountType: "STAFF",
       status: "ACTIVE",
     });
 
