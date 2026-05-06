@@ -1,6 +1,8 @@
 import express from 'express'
 import { requireAuth } from '../middleware/auth.js'
 import { requireSuperAdmin } from '../middleware/requireSuperAdmin.js'
+import { requireSuperAdminOrTenantAdmin } from '../middleware/requireSuperAdminOrTenantAdmin.js'
+import { requireWorkspace } from '../middleware/requireWorkspace.js'
 import { isSuperAdmin } from '../middleware/isSuperAdmin.js'
 import { UserPermission, PermissionTier } from '../models/UserPermission.js'
 import { LEVEL_TEMPLATES, LEVEL_METADATA } from '../config/levelTemplates.js'
@@ -181,8 +183,10 @@ router.get('/levels', requireAuth, (_req: any, res: any) => {
   return res.json(LEVEL_METADATA)
 })
 
-// ── All management routes below require SuperAdmin ───────────────────────────
-router.use(requireAuth, requireSuperAdmin)
+// ── All management routes below: SuperAdmin OR TENANT_ADMIN (workspace-scoped) ─
+// Per-endpoint handlers below MUST enforce workspaceId scoping for non-SuperAdmin
+// callers using (req as any).isPlatformSuperAdmin.
+router.use(requireAuth, requireSuperAdminOrTenantAdmin, requireWorkspace)
 
 // ── GET /api/permissions/templates/:levelCode ────────────────────────────────
 router.get('/templates/:levelCode', (req: any, res: any) => {
@@ -206,9 +210,10 @@ router.get('/list', async (req: any, res: any) => {
     // Source filter applies to everyone
     filter.source = { $in: ['onboarding', 'manual'] }
 
-    // WorkspaceId only for non-SuperAdmin
+    // WorkspaceId + STAFF universe only for non-SuperAdmin (tenant admins)
     if (!isSuperAdmin(req)) {
       filter.workspaceId = String(req.workspaceObjectId)
+      filter.universe = 'STAFF'
     }
 
     // Only show active and suspended grants (not revoked)
@@ -278,8 +283,21 @@ router.post('/grant', async (req: any, res: any) => {
       return res.status(404).json({ success: false, message: `No user found with email: ${email}` })
     }
 
+    // Tenant-admin scoping: enforce workspace boundary + STAFF universe.
+    const isSuper = (req as any).isPlatformSuperAdmin === true
+    if (!isSuper) {
+      if (String((user as any).workspaceId) !== String(req.workspaceObjectId)) {
+        return res.status(403).json({ success: false, message: 'Cannot grant access to users outside your workspace' })
+      }
+      if (universe !== 'STAFF') {
+        return res.status(403).json({ success: false, message: 'Tenant admins can only grant STAFF access' })
+      }
+    }
+
     const userId = String((user as any)._id)
-    const resolvedWorkspaceId = workspaceId || String((user as any).workspaceId || 'global')
+    const resolvedWorkspaceId = isSuper
+      ? (workspaceId || String((user as any).workspaceId || 'global'))
+      : String(req.workspaceObjectId)
 
     const levelMeta = LEVEL_METADATA.find(l => l.code === levelCode)
     const modules = moduleOverrides ? { ...template, ...moduleOverrides } : { ...template }
@@ -340,6 +358,14 @@ router.patch('/update', async (req: any, res: any) => {
     const existing = await UserPermission.findOne({ userId })
     if (!existing) {
       return res.status(404).json({ success: false, message: 'Permission doc not found' })
+    }
+
+    // Tenant-admin scoping: existing doc must be in caller's workspace.
+    {
+      const isSuper = (req as any).isPlatformSuperAdmin === true
+      if (!isSuper && String(existing.workspaceId) !== String(req.workspaceObjectId)) {
+        return res.status(403).json({ success: false, message: 'Cannot modify permissions outside your workspace' })
+      }
     }
 
     if (moduleChanges) {
@@ -407,6 +433,14 @@ router.post('/apply-template', async (req: any, res: any) => {
       return res.status(404).json({ success: false, message: 'Permission doc not found' })
     }
 
+    // Tenant-admin scoping: existing doc must be in caller's workspace.
+    {
+      const isSuper = (req as any).isPlatformSuperAdmin === true
+      if (!isSuper && String(existing.workspaceId) !== String(req.workspaceObjectId)) {
+        return res.status(403).json({ success: false, message: 'Cannot apply template outside your workspace' })
+      }
+    }
+
     const levelMeta = LEVEL_METADATA.find(l => l.code === levelCode)
 
     existing.modules = { ...template } as any
@@ -449,13 +483,21 @@ router.post('/revoke', async (req: any, res: any) => {
       return res.status(400).json({ success: false, message: 'userId is required' })
     }
 
-    const doc = await UserPermission.findOneAndDelete({ userId })
-    if (!doc) {
+    const existing = await UserPermission.findOne({ userId })
+    if (!existing) {
       return res.status(404).json({ success: false, message: 'Permission doc not found' })
     }
 
+    // Tenant-admin scoping: existing doc must be in caller's workspace.
+    const isSuper = (req as any).isPlatformSuperAdmin === true
+    if (!isSuper && String(existing.workspaceId) !== String(req.workspaceObjectId)) {
+      return res.status(403).json({ success: false, message: 'Cannot revoke access outside your workspace' })
+    }
+
+    await UserPermission.deleteOne({ _id: existing._id })
+
     const adminEmail = String(req.user?.email || req.user?._id || 'unknown')
-    logger.info(`[PERMISSION] REVOKE ${doc.email} by ${adminEmail}`)
+    logger.info(`[PERMISSION] REVOKE ${existing.email} by ${adminEmail}`)
 
     return res.json({ success: true })
   } catch (err: any) {
@@ -475,8 +517,18 @@ router.get('/search-users', async (req: any, res: any) => {
     const term = String(q).trim()
     const regex = { $regex: term, $options: 'i' }
 
+    const filter: Record<string, any> = {
+      $or: [{ email: regex }, { officialEmail: regex }, { name: regex }],
+    }
+
+    // Tenant-admin scoping: restrict User search to caller's workspace.
+    const isSuper = (req as any).isPlatformSuperAdmin === true
+    if (!isSuper) {
+      filter.workspaceId = req.workspaceObjectId
+    }
+
     const users = await User.find(
-      { $or: [{ email: regex }, { officialEmail: regex }, { name: regex }] },
+      filter,
       { _id: 1, name: 1, firstName: 1, lastName: 1, email: 1, workspaceId: 1 }
     )
       .limit(20)
@@ -520,7 +572,8 @@ router.get('/search-users', async (req: any, res: any) => {
 // ── POST /api/permissions/migrate ────────────────────────────────────────────
 // One-time migration from BillingPermission → UserPermission.
 // Does NOT delete BillingPermission docs.
-router.post('/migrate', async (req: any, res: any) => {
+// SuperAdmin-only (router-level gate allows TENANT_ADMIN; explicit re-gate here).
+router.post('/migrate', requireSuperAdmin, async (req: any, res: any) => {
   const summary = { migrated: 0, skipped: 0, errors: [] as string[] }
 
   try {

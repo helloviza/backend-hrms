@@ -139,10 +139,23 @@ function isL1Actor(u: any): boolean {
 }
 
 function isStaffPrivileged(u: any) {
+  const r = collectRoles(u);
+
+  // SaaS HRMS tenant admins carry accountType="STAFF" for HRMS internal flow
+  // (see saas.signup.ts), but they are NOT Plumtrips staff and must never
+  // pass cross-tenant gates. Hard-exclude them before any other admit check.
+  if (
+    r.includes("TENANT_ADMIN") ||
+    r.includes("TENANTADMIN") ||
+    r.includes("CLIENT_ADMIN") ||
+    r.includes("CLIENTADMIN")
+  ) {
+    return false;
+  }
+
   if (u?.staff === true) return true;
   if (u?.isStaff === true) return true;
 
-  const r = collectRoles(u);
   return (
     r.includes("STAFF") ||
     r.includes("INTERNAL") ||
@@ -1061,6 +1074,9 @@ router.get("/workspace/resolve", requireAuth, async (req: any, res) => {
  */
 router.get("/workspace/search", requireAuth, async (req: any, res) => {
   try {
+    const actor = req.user || {};
+    if (!isStaffPrivileged(actor)) return res.status(403).json({ error: "Access restricted" });
+
     const q = normStr(req.query?.q || "");
     const result = await staffSearchBusinesses(q, req.workspaceObjectId);
     return res.json({ ok: true, q, rows: result.rows });
