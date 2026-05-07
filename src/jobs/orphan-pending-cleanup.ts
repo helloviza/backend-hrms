@@ -6,6 +6,8 @@ import cron from "node-cron";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import { getTBOToken } from "../services/tbo.auth.service.js";
 import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
+import { getBookingDetail } from "../services/tbo.hotel.service.js";
+import { parseTBODate } from "../lib/tbo-date.js";
 import logger from "../utils/logger.js";
 
 async function verifyWithTBO(bookingId: number): Promise<string | null> {
@@ -67,6 +69,79 @@ export async function runOrphanPendingCleanup(): Promise<void> {
     const numericBookingId = booking.bookingId ? Number(booking.bookingId) : 0;
 
     if (numericBookingId > 0) {
+      // Spec line 1987 reconciliation — bookings created by /book's else-if branch where
+      // IsVoucherBooking=true was sent but TBO returned VoucherStatus=false with Status=1.
+      // Use GetBookingDetail (full response) to retrieve final state and persist invoice/confirmation.
+      if (booking.status === "PENDING" && booking.voucherStatus === "PENDING") {
+        try {
+          const detail = await getBookingDetail([{ mode: "bookingId", bookingId: numericBookingId }]);
+          if (!detail) {
+            logger.warn("[OrphanCleanup] PENDING reconciliation — GetBookingDetail returned empty", {
+              id, bookingId: numericBookingId,
+            });
+            skipped++;
+            continue;
+          }
+          // Detail confirms vouchered → mark as CONFIRMED + GENERATED.
+          if (detail?.VoucherStatus === true || detail?.HotelBookingStatus === "Confirmed") {
+            await SBTHotelBooking.findByIdAndUpdate(id, {
+              $set: {
+                status: "CONFIRMED",
+                isHeld: false,
+                isVouchered: true,
+                voucherStatus: "GENERATED",
+                bookingDetailRaw: detail,
+                bookingDetailFetched: true,
+                bookingDetailFetchedAt: new Date(),
+                ...(detail?.InvoiceNo ? { invoiceNumber: detail.InvoiceNo } : {}),
+                ...(detail?.ConfirmationNo ? { confirmationNo: detail.ConfirmationNo } : {}),
+                ...(detail?.TraceId ? { traceId: String(detail.TraceId) } : {}),
+                ...(detail?.LastCancellationDate ? { lastCancellationDate: parseTBODate(detail.LastCancellationDate) } : {}),
+                ...(detail?.LastVoucherDate ? { lastVoucherDate: parseTBODate(detail.LastVoucherDate) } : {}),
+              },
+            });
+            reconciled++;
+            logger.info("[OrphanCleanup] Reconciled PENDING → CONFIRMED via GetBookingDetail", {
+              id, bookingId: numericBookingId,
+            });
+            continue;
+          }
+          // Detail says BookFailed or Cancelled → mark FAILED.
+          if (detail?.HotelBookingStatus === "BookFailed" || detail?.Status === 0) {
+            await SBTHotelBooking.findByIdAndUpdate(id, {
+              $set: {
+                status: "FAILED",
+                isHeld: false,
+                isVouchered: false,
+                voucherStatus: "FAILED",
+                bookingDetailRaw: detail,
+                bookingDetailFetched: true,
+                bookingDetailFetchedAt: new Date(),
+                failureReason: "TBO returned BookFailed on PENDING reconciliation",
+              },
+            });
+            reconciled++;
+            logger.info("[OrphanCleanup] Reconciled PENDING → FAILED via GetBookingDetail", {
+              id, bookingId: numericBookingId,
+            });
+            continue;
+          }
+          // Still pending at TBO — leave as PENDING for next cron tick.
+          skipped++;
+          logger.info("[OrphanCleanup] PENDING booking still pending at TBO; will retry next cron", {
+            id, bookingId: numericBookingId,
+            tboStatus: detail?.HotelBookingStatus,
+          });
+        } catch (err: any) {
+          skipped++;
+          logger.error("[OrphanCleanup] PENDING reconciliation failed", {
+            id, bookingId: numericBookingId,
+            err: err?.message,
+          });
+        }
+        continue;
+      }
+
       // Has a BookingId — try GetBookingDetail to reconcile
       const tboStatus = await verifyWithTBO(numericBookingId);
       if (tboStatus === "confirmed" || tboStatus === "vouchered") {
@@ -78,8 +153,16 @@ export async function runOrphanPendingCleanup(): Promise<void> {
         continue;
       }
       if (tboStatus === "held") {
+        // Defect 12 fix: status: 'HELD' must always be paired with isHeld: true.
+        // Previously this cron wrote one without the other, causing the same inconsistency
+        // we're fixing in the /book route.
         await SBTHotelBooking.findByIdAndUpdate(id, {
-          $set: { status: "HELD" },
+          $set: {
+            status: "HELD",
+            isHeld: true,
+            isVouchered: false,
+            voucherStatus: null,
+          },
         });
         reconciled++;
         logger.info("[OrphanCleanup] Reconciled held booking", { id, bookingId: numericBookingId });

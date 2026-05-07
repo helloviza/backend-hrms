@@ -101,6 +101,7 @@ export interface ISBTHotelBooking extends Document {
   corporatePAN?: string;
   rebookFromBookingId?: string;
   tboReferenceNo?: string | null;
+  traceId?: string;
   roomDescription?: string | null;
   bookingDetailFetched?: boolean;
   bookingDetailFetchedAt?: Date | null;
@@ -216,6 +217,7 @@ const SBTHotelBookingSchema = new Schema(
     corporatePAN: { type: String, default: "" },
     rebookFromBookingId: { type: String, default: null },
     tboReferenceNo: { type: String, default: null, index: true },
+    traceId: { type: String, default: null, index: true },
     roomDescription: { type: String, default: null },
     bookingDetailFetched: { type: Boolean, default: false },
     bookingDetailFetchedAt: { type: Date, default: null },

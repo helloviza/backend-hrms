@@ -1,0 +1,648 @@
+{
+  "snapshotAt": "2026-05-07T08:54:28Z",
+  "tboAccount": "TBOStaticAPITest",
+  "tboEnv": "test",
+  "scope": "default",
+  "summary": {
+    "countriesQueried": 20,
+    "citiesQueried": 95,
+    "totalHotelsCounted": 188948
+  },
+  "countries": [
+    {
+      "code": "IN",
+      "name": "India",
+      "citiesQueriedCount": 15,
+      "totalHotels": 29213,
+      "cities": [
+        {
+          "code": "418069",
+          "name": "Delhi NCR",
+          "hotelCount": 4899
+        },
+        {
+          "code": "119805",
+          "name": "Goa,   Goa",
+          "hotelCount": 4350
+        },
+        {
+          "code": "130443",
+          "name": "New Delhi / Delhi,   DELHI",
+          "hotelCount": 3530
+        },
+        {
+          "code": "111124",
+          "name": "Bengaluru/Bangalore,   Karnataka",
+          "hotelCount": 2930
+        },
+        {
+          "code": "144306",
+          "name": "Mumbai/Bombay,   Maharashtra",
+          "hotelCount": 2319
+        },
+        {
+          "code": "122175",
+          "name": "Jaipur,   Rajasthan",
+          "hotelCount": 1721
+        },
+        {
+          "code": "145710",
+          "name": "Hyderabad,   Telangana",
+          "hotelCount": 1717
+        },
+        {
+          "code": "127343",
+          "name": "Chennai,   Tamil Nadu",
+          "hotelCount": 1493
+        },
+        {
+          "code": "113128",
+          "name": "Kolkata/Calcutta,   West Bengal",
+          "hotelCount": 1394
+        },
+        {
+          "code": "133133",
+          "name": "Pune,   Maharashtra",
+          "hotelCount": 1377
+        },
+        {
+          "code": "140522",
+          "name": "Udaipur,   Rajasthan",
+          "hotelCount": 1169
+        },
+        {
+          "code": "101204",
+          "name": "Kochi,   Kerala",
+          "hotelCount": 840
+        },
+        {
+          "code": "100263",
+          "name": "Ahmedabad,   Gujarat",
+          "hotelCount": 799
+        },
+        {
+          "code": "100589",
+          "name": "Agra,   Uttar Pradesh",
+          "hotelCount": 642
+        },
+        {
+          "code": "108256",
+          "name": "Goa Velha,   Goa",
+          "hotelCount": 33
+        }
+      ]
+    },
+    {
+      "code": "IT",
+      "name": "Italy",
+      "citiesQueriedCount": 5,
+      "totalHotels": 25628,
+      "cities": [
+        {
+          "code": "134622",
+          "name": "Rome",
+          "hotelCount": 11603
+        },
+        {
+          "code": "151778",
+          "name": "Florence,   Florence (Tuscany)",
+          "hotelCount": 5343
+        },
+        {
+          "code": "148463",
+          "name": "Venice",
+          "hotelCount": 4445
+        },
+        {
+          "code": "127769",
+          "name": "Milan",
+          "hotelCount": 4227
+        },
+        {
+          "code": "124908",
+          "name": "Venice Lido",
+          "hotelCount": 10
+        }
+      ]
+    },
+    {
+      "code": "ID",
+      "name": "Indonesia",
+      "citiesQueriedCount": 5,
+      "totalHotels": 25268,
+      "cities": [
+        {
+          "code": "110670",
+          "name": "Bali,   Bali",
+          "hotelCount": 14161
+        },
+        {
+          "code": "122069",
+          "name": "Jakarta,   Jakarta",
+          "hotelCount": 4940
+        },
+        {
+          "code": "140521",
+          "name": "Ubud,   Bali",
+          "hotelCount": 2561
+        },
+        {
+          "code": "142463",
+          "name": "Yogyakarta,   Special Region of Yogyakarta",
+          "hotelCount": 2221
+        },
+        {
+          "code": "116287",
+          "name": "Denpasar,   Bali",
+          "hotelCount": 1385
+        }
+      ]
+    },
+    {
+      "code": "TH",
+      "name": "Thailand",
+      "citiesQueriedCount": 5,
+      "totalHotels": 18844,
+      "cities": [
+        {
+          "code": "144092",
+          "name": "Bangkok,   Bangkok",
+          "hotelCount": 5229
+        },
+        {
+          "code": "131529",
+          "name": "Phuket,   Phuket",
+          "hotelCount": 5064
+        },
+        {
+          "code": "114978",
+          "name": "Chiang Mai,   Chiang Mai",
+          "hotelCount": 3374
+        },
+        {
+          "code": "132068",
+          "name": "Pattaya,   Pattaya",
+          "hotelCount": 3229
+        },
+        {
+          "code": "124015",
+          "name": "Krabi,   Krabi",
+          "hotelCount": 1948
+        }
+      ]
+    },
+    {
+      "code": "GB",
+      "name": "United Kingdom",
+      "citiesQueriedCount": 3,
+      "totalHotels": 16837,
+      "cities": [
+        {
+          "code": "126632",
+          "name": "London",
+          "hotelCount": 13391
+        },
+        {
+          "code": "116967",
+          "name": "Edinburgh",
+          "hotelCount": 2516
+        },
+        {
+          "code": "126798",
+          "name": "Manchester",
+          "hotelCount": 930
+        }
+      ]
+    },
+    {
+      "code": "JP",
+      "name": "Japan",
+      "citiesQueriedCount": 3,
+      "totalHotels": 12856,
+      "cities": [
+        {
+          "code": "130813",
+          "name": "Osaka",
+          "hotelCount": 4834
+        },
+        {
+          "code": "148251",
+          "name": "Tokyo",
+          "hotelCount": 4685
+        },
+        {
+          "code": "123363",
+          "name": "Kyoto",
+          "hotelCount": 3337
+        }
+      ]
+    },
+    {
+      "code": "US",
+      "name": "United States of America",
+      "citiesQueriedCount": 15,
+      "totalHotels": 11270,
+      "cities": [
+        {
+          "code": "125908",
+          "name": "Los Angeles,   California",
+          "hotelCount": 2456
+        },
+        {
+          "code": "128839",
+          "name": "Miami,   Florida",
+          "hotelCount": 2173
+        },
+        {
+          "code": "130452",
+          "name": "New York,   New York",
+          "hotelCount": 2026
+        },
+        {
+          "code": "128581",
+          "name": "Miami Beach,   Florida",
+          "hotelCount": 1918
+        },
+        {
+          "code": "293067",
+          "name": "Miami",
+          "hotelCount": 1020
+        },
+        {
+          "code": "125099",
+          "name": "Las Vegas,   Nevada",
+          "hotelCount": 661
+        },
+        {
+          "code": "136014",
+          "name": "San Francisco,   California",
+          "hotelCount": 584
+        },
+        {
+          "code": "127593",
+          "name": "Miami South Beach,   Florida",
+          "hotelCount": 259
+        },
+        {
+          "code": "161044",
+          "name": "Las Vegas Strip,   Nevada",
+          "hotelCount": 112
+        },
+        {
+          "code": "127760",
+          "name": "Miami Springs,   Florida",
+          "hotelCount": 19
+        },
+        {
+          "code": "125792",
+          "name": "Las Vegas,   New Mexico",
+          "hotelCount": 15
+        },
+        {
+          "code": "128232",
+          "name": "Miami,   Oklahoma",
+          "hotelCount": 9
+        },
+        {
+          "code": "128788",
+          "name": "New York - Long Island,   New York",
+          "hotelCount": 7
+        },
+        {
+          "code": "127628",
+          "name": "Miami,   Arizona",
+          "hotelCount": 6
+        },
+        {
+          "code": "128234",
+          "name": "Miami Lakes,   Florida",
+          "hotelCount": 5
+        }
+      ]
+    },
+    {
+      "code": "ES",
+      "name": "Spain",
+      "citiesQueriedCount": 4,
+      "totalHotels": 10410,
+      "cities": [
+        {
+          "code": "126260",
+          "name": "Madrid",
+          "hotelCount": 3776
+        },
+        {
+          "code": "110790",
+          "name": "Barcelona",
+          "hotelCount": 3758
+        },
+        {
+          "code": "137558",
+          "name": "Seville",
+          "hotelCount": 2370
+        },
+        {
+          "code": "243021",
+          "name": "Madrid Centro",
+          "hotelCount": 506
+        }
+      ]
+    },
+    {
+      "code": "FR",
+      "name": "France",
+      "citiesQueriedCount": 3,
+      "totalHotels": 7971,
+      "cities": [
+        {
+          "code": "131408",
+          "name": "Paris",
+          "hotelCount": 5753
+        },
+        {
+          "code": "151798",
+          "name": "Nice",
+          "hotelCount": 1428
+        },
+        {
+          "code": "126089",
+          "name": "Lyon",
+          "hotelCount": 790
+        }
+      ]
+    },
+    {
+      "code": "AU",
+      "name": "Australia",
+      "citiesQueriedCount": 4,
+      "totalHotels": 6118,
+      "cities": [
+        {
+          "code": "127718",
+          "name": "Melbourne,   Victoria",
+          "hotelCount": 2568
+        },
+        {
+          "code": "140258",
+          "name": "Sydney,   New South Wales",
+          "hotelCount": 2157
+        },
+        {
+          "code": "112007",
+          "name": "Brisbane,   Queensland",
+          "hotelCount": 1039
+        },
+        {
+          "code": "145381",
+          "name": "Gold Coast,   Queensland",
+          "hotelCount": 354
+        }
+      ]
+    },
+    {
+      "code": "MY",
+      "name": "Malaysia",
+      "citiesQueriedCount": 3,
+      "totalHotels": 5994,
+      "cities": [
+        {
+          "code": "123768",
+          "name": "Kuala Lumpur",
+          "hotelCount": 4311
+        },
+        {
+          "code": "132119",
+          "name": "Penang",
+          "hotelCount": 1141
+        },
+        {
+          "code": "100105",
+          "name": "Langkawi,   Kedah",
+          "hotelCount": 542
+        }
+      ]
+    },
+    {
+      "code": "AE",
+      "name": "United Arab Emirates",
+      "citiesQueriedCount": 8,
+      "totalHotels": 5668,
+      "cities": [
+        {
+          "code": "115936",
+          "name": "Dubai",
+          "hotelCount": 4894
+        },
+        {
+          "code": "100765",
+          "name": "Abu Dhabi",
+          "hotelCount": 341
+        },
+        {
+          "code": "346887",
+          "name": "Dubai Marina",
+          "hotelCount": 141
+        },
+        {
+          "code": "137741",
+          "name": "Sharjah",
+          "hotelCount": 141
+        },
+        {
+          "code": "133770",
+          "name": "Ras al Khaimah",
+          "hotelCount": 88
+        },
+        {
+          "code": "119041",
+          "name": "Fujairah",
+          "hotelCount": 56
+        },
+        {
+          "code": "407544",
+          "name": "Dubai Festival City",
+          "hotelCount": 5
+        },
+        {
+          "code": "221830",
+          "name": "Dubai Internet City",
+          "hotelCount": 2
+        }
+      ]
+    },
+    {
+      "code": "DE",
+      "name": "Germany",
+      "citiesQueriedCount": 5,
+      "totalHotels": 3848,
+      "cities": [
+        {
+          "code": "111539",
+          "name": "Berlin",
+          "hotelCount": 1408
+        },
+        {
+          "code": "146774",
+          "name": "Munich",
+          "hotelCount": 1000
+        },
+        {
+          "code": "150455",
+          "name": "Frankfurt",
+          "hotelCount": 737
+        },
+        {
+          "code": "120596",
+          "name": "Hamburg",
+          "hotelCount": 687
+        },
+        {
+          "code": "118210",
+          "name": "Frankfurt on the Oder",
+          "hotelCount": 16
+        }
+      ]
+    },
+    {
+      "code": "LK",
+      "name": "Sri Lanka",
+      "citiesQueriedCount": 4,
+      "totalHotels": 3046,
+      "cities": [
+        {
+          "code": "156025",
+          "name": "Kandy District",
+          "hotelCount": 1065
+        },
+        {
+          "code": "122254",
+          "name": "Kandy",
+          "hotelCount": 960
+        },
+        {
+          "code": "144745",
+          "name": "Colombo",
+          "hotelCount": 526
+        },
+        {
+          "code": "117988",
+          "name": "Galle",
+          "hotelCount": 495
+        }
+      ]
+    },
+    {
+      "code": "NL",
+      "name": "Netherlands",
+      "citiesQueriedCount": 2,
+      "totalHotels": 1758,
+      "cities": [
+        {
+          "code": "109558",
+          "name": "Amsterdam",
+          "hotelCount": 1370
+        },
+        {
+          "code": "134992",
+          "name": "Rotterdam",
+          "hotelCount": 388
+        }
+      ]
+    },
+    {
+      "code": "SA",
+      "name": "Saudi Arabia",
+      "citiesQueriedCount": 5,
+      "totalHotels": 1476,
+      "cities": [
+        {
+          "code": "147536",
+          "name": "Riyadh",
+          "hotelCount": 663
+        },
+        {
+          "code": "122187",
+          "name": "Jeddah",
+          "hotelCount": 332
+        },
+        {
+          "code": "127891",
+          "name": "Makkah/Mecca",
+          "hotelCount": 226
+        },
+        {
+          "code": "127340",
+          "name": "Madinah",
+          "hotelCount": 191
+        },
+        {
+          "code": "116137",
+          "name": "Dammam",
+          "hotelCount": 64
+        }
+      ]
+    },
+    {
+      "code": "MV",
+      "name": "Maldives",
+      "citiesQueriedCount": 2,
+      "totalHotels": 1235,
+      "cities": [
+        {
+          "code": "101365",
+          "name": "Maldives",
+          "hotelCount": 1149
+        },
+        {
+          "code": "127096",
+          "name": "Male",
+          "hotelCount": 86
+        }
+      ]
+    },
+    {
+      "code": "SG",
+      "name": "Singapore",
+      "citiesQueriedCount": 1,
+      "totalHotels": 832,
+      "cities": [
+        {
+          "code": "138703",
+          "name": "Singapore",
+          "hotelCount": 832
+        }
+      ]
+    },
+    {
+      "code": "OM",
+      "name": "Oman",
+      "citiesQueriedCount": 2,
+      "totalHotels": 380,
+      "cities": [
+        {
+          "code": "146788",
+          "name": "Muscat",
+          "hotelCount": 246
+        },
+        {
+          "code": "135316",
+          "name": "Salalah",
+          "hotelCount": 134
+        }
+      ]
+    },
+    {
+      "code": "QA",
+      "name": "Qatar",
+      "citiesQueriedCount": 1,
+      "totalHotels": 296,
+      "cities": [
+        {
+          "code": "116201",
+          "name": "Doha",
+          "hotelCount": 296
+        }
+      ]
+    }
+  ]
+}
