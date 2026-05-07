@@ -1706,33 +1706,24 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         ?? roomGuests.find((g: any) => Number(g.PaxType) === 1);
       const leadAdultLastName = (String(leadAdult?.LastName || "Guest").trim() || "Guest").substring(0, 25);
 
+      let childIdx = 0;
       return roomGuests.map((g: any) => {
         if (Number(g.PaxType) === 2) {
-          // Use user-supplied name (TBO spec line 2005: FirstName mandatory, no special chars).
-          // Defensive defaults if frontend somehow omits — should not happen in normal flow.
-          const childFirstName = String(g.FirstName || "").trim().substring(0, 25);
-          const childLastName = (String(g.LastName || "").trim() || leadAdultLastName).substring(0, 25);
-          const childTitle = String(g.Title || "Mstr").trim();
-
-          if (!childFirstName || childFirstName.length < 2) {
-            throw new Error("Child FirstName is required (min 2 characters per TBO spec)");
-          }
-          if (!childLastName || childLastName.length < 2) {
-            throw new Error("Child LastName is required (min 2 characters per TBO spec)");
-          }
-
+          // Auto-generate child Title/FirstName/LastName per industry standard.
+          // Names are not collected from users for child paxes; TBO accepts synthesized values.
+          // No Phoneno/Email/PassportNo keys — fields must be absent, not null (Rule 5 forbidden list).
           const childPax: Record<string, unknown> = {
-            Title: childTitle,
-            FirstName: childFirstName,
-            LastName: childLastName,
+            Title: "Mstr",
+            FirstName: `Child${++childIdx}`,
+            LastName: leadAdultLastName || "Guest",
             MiddleName: "",
             PaxType: 2,
             LeadPassenger: false,
             Age: Number(g.Age) || 8,
           };
           // International: TBO requires lead's PAN to be carried on children too.
-          // Spec line 2005 + TBO confirmation 2026-05-05: international hotels propagate lead PAN
-          // onto every passenger including children. Log the decision for cert log audits.
+          // TBO confirmation 2026-05-05: international hotels propagate lead PAN onto every
+          // passenger including children. Log the decision for cert log audits.
           if (isInternationalHotel && leadAdultPAN) {
             childPax.PAN = leadAdultPAN;
             sbtLogger.info("[BOOK] Child PAN propagated from lead adult", {
