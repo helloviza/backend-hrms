@@ -237,16 +237,16 @@ SBTHotelBookingSchema.plugin(workspaceScopePlugin);
 SBTHotelBookingSchema.index({ workspaceId: 1, userId: 1, status: 1 });
 SBTHotelBookingSchema.index({ userId: 1, createdAt: -1 });
 SBTHotelBookingSchema.index({ bookingId: 1 });
-// Partial unique index: prevents duplicate docs per real bookingId without
-// blocking TBO-failed bookings (bookingId="0") or pre-persist skeletons (no
-// bookingId yet). Must be created at schema level — partial indexes can't be
-// declared inline on the field.
+// Partial unique index on bookingId — excludes TBO-failed bookings (bookingId === "0", null, missing).
+// MongoDB partial filter expressions only support a limited operator set; $nin/$ne/$not are NOT allowed.
+// $type:"string" ensures we don't index null/missing/numeric values.
+// $gt:"0" lexicographically excludes "0" since real TBO bookingIds are 6-7 digit strings (all > "0").
 SBTHotelBookingSchema.index(
   { bookingId: 1 },
   {
     unique: true,
     partialFilterExpression: {
-      bookingId: { $exists: true, $nin: [null, "", "0"] },
+      bookingId: { $type: "string", $gt: "0" },
     },
     name: "bookingId_unique_partial",
   },
