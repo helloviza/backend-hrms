@@ -2810,6 +2810,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
               ...(detail?.ConfirmationNo ? { confirmationNo: detail.ConfirmationNo } : {}),
               // TraceId — spec line 15.
               ...(detail?.TraceId ? { traceId: String(detail.TraceId) } : {}),
+              ...(detail?.TBOReferenceNo ? { tboReferenceNo: String(detail.TBOReferenceNo) } : {}),
             },
           });
           return res.json({
@@ -2845,6 +2846,37 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
 
     // Subcase 1: success → persist derived state from the helper.
     if (classified.success && classified.derivedOnSuccess) {
+      // Belt-and-suspenders: GenerateVoucher response does not include TBOReferenceNo
+      // (per TBO Hotel Universal API spec — only GetBookingDetail returns it). To make sure the
+      // confirmed page shows the supplier reference rather than "Hotel reference pending",
+      // (a) try to read it from any bookingDetailRaw already stored at Held-time, then
+      // (b) if absent, await a fresh GetBookingDetail call (user is on the confirmation page waiting).
+      const existingBookingDetailRaw = (booking as any)?.bookingDetailRaw;
+      let resolvedTboReferenceNo: string | null =
+        existingBookingDetailRaw?.TBOReferenceNo ? String(existingBookingDetailRaw.TBOReferenceNo) : null;
+
+      let freshDetailRaw: any = null;
+      if (!resolvedTboReferenceNo && numericId) {
+        try {
+          const detail = await getBookingDetail([{ mode: "bookingId", bookingId: numericId }]);
+          if (detail) {
+            freshDetailRaw = detail;
+            if (detail.TBOReferenceNo) {
+              resolvedTboReferenceNo = String(detail.TBOReferenceNo);
+            }
+            sbtLogger.info("[VOUCHER] Post-voucher GetBookingDetail fetched for tboReferenceNo", {
+              bookingId: numericId,
+              tboReferenceNoFound: !!resolvedTboReferenceNo,
+            });
+          }
+        } catch (postVoucherDetailErr) {
+          sbtLogger.warn("[VOUCHER] Post-voucher GetBookingDetail failed; tboReferenceNo will be backfilled later", {
+            bookingId: numericId,
+            err: postVoucherDetailErr instanceof Error ? postVoucherDetailErr.message : String(postVoucherDetailErr),
+          });
+        }
+      }
+
       await SBTHotelBooking.findByIdAndUpdate(booking._id, {
         $set: {
           ...classified.derivedOnSuccess,
@@ -2852,6 +2884,12 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
           tboVoucherData: voucherRes,
           // TraceId — spec line 15. GenerateVoucher response carries the same TraceId from the session.
           ...(gvr?.TraceId ? { traceId: String(gvr.TraceId) } : {}),
+          ...(resolvedTboReferenceNo ? { tboReferenceNo: resolvedTboReferenceNo } : {}),
+          ...(freshDetailRaw ? {
+            bookingDetailRaw: freshDetailRaw,
+            bookingDetailFetched: true,
+            bookingDetailFetchedAt: new Date(),
+          } : {}),
         },
       });
       sbtLogger.info("Hotel hold booking vouchered", {
@@ -3114,7 +3152,12 @@ router.post("/bookings/check-status", requireAuth, async (req: any, res: any) =>
       const newStatus = booking.isHeld ? "HELD" : "CONFIRMED";
       await SBTHotelBooking.findOneAndUpdate(
         { clientReferenceId },
-        { $set: { status: newStatus, confirmationNo: detail.ConfirmationNo || booking.confirmationNo || "", bookingRefNo: detail.BookingRefNo || booking.bookingRefNo || "" } },
+        { $set: {
+            status: newStatus,
+            confirmationNo: detail.ConfirmationNo || booking.confirmationNo || "",
+            bookingRefNo: detail.BookingRefNo || booking.bookingRefNo || "",
+            ...(detail?.TBOReferenceNo ? { tboReferenceNo: String(detail.TBOReferenceNo) } : {}),
+          } },
       ).catch(() => {});
       return res.json({
         found: true,
