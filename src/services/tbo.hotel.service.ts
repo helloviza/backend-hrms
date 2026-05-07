@@ -44,7 +44,14 @@ export async function getBookingDetail(lookups: BookingDetailLookup[]): Promise<
             { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Basic ${creds}` }, body: JSON.stringify(payload) }
           );
           const data = await res.json();
-          logTBOCall({ method: "HotelGetBookingDetail", traceId: `gbd-${lookup.mode}`, request: payload, response: data, durationMs: Date.now() - t0 });
+          logTBOCall({
+            method: "HotelGetBookingDetail",
+            traceId: `gbd-${lookup.mode}`,
+            bookingId: lookup.mode === "bookingId" ? lookup.bookingId : undefined,
+            request: payload,
+            response: data,
+            durationMs: Date.now() - t0,
+          });
           return data;
         },
         (r: any) => {
@@ -107,6 +114,7 @@ export async function generateHotelVoucher(bookingId: number, panPayload?: Vouch
       logTBOCall({
         method: "GenerateHotelVoucher",
         traceId: `hotel-voucher-${bookingId}`,
+        bookingId,
         request: payload,
         response: data,
         durationMs: Date.now() - start,

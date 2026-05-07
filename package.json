@@ -15,7 +15,8 @@
     "deploy-check": "node scripts/deploy-check.mjs",
     "clean": "Remove-Item -Recurse -Force node_modules, pnpm-lock.yaml",
     "migrate:travel": "tsx src/scripts/migrateTravelBookings.ts",
-    "migrate:traveler-ids": "tsx src/scripts/migrateTravelerIds.ts"
+    "migrate:traveler-ids": "tsx src/scripts/migrateTravelerIds.ts",
+    "cert:inventory": "tsx src/scripts/cert-inventory-snapshot.ts"
   },
   "dependencies": {
     "@aws-sdk/client-apprunner": "^3.693.0",

@@ -11,16 +11,22 @@ import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { sendMail } from "../utils/mailer.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
+import { tboFetchFailed } from "../utils/tboFetchGuard.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { getMarginConfig, applyMargin, applyMarginWithFloor, violatesRspFloor } from "../utils/margin.js";
 import { getTBOToken, logoutTBO } from "../services/tbo.auth.service.js";
 import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
 import { getCompanySettings } from "../utils/companySettings.js";
-import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES } from "../shared/cities.js";
+import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES, type HotelCity } from "../shared/cities.js";
+import { resolveCityCode as resolveCityCodeAgainstCatalog } from "../jobs/static-data-refresh.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 import { normalizeTitle } from "../lib/normalize.js";
 import ManualDateChangeRequest from "../models/ManualDateChangeRequest.js";
+import {
+  deriveStateFromBookResponse,
+  deriveStateFromVoucherResponse,
+} from "../utils/tboBookingStateMapper.js";
 
 // ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
 const MOCK_CITIES = [
@@ -466,7 +472,8 @@ function validateBookingCriteria(p: BookingValidationPayload): ValidationError[]
   }
 
   // ── Rule 8: Hold guard — non-refundable rates cannot be held (GAP-36) ──
-  if (!p.isVoucherBooking && !p.isRefundable) {
+  // Only block when isRefundable is explicitly false; null/undefined (unknown) is allowed.
+  if (!p.isVoucherBooking && p.isRefundable === false) {
     errors.push({ field: "isRefundable", code: "NON_REFUNDABLE_HOLD_FORBIDDEN", message: "This rate cannot be held. Please complete payment to confirm booking." });
   }
 
@@ -567,12 +574,6 @@ interface HotelIndexEntry extends HotelCodeEntry {
 const hotelNameIndex: HotelIndexEntry[] = [];
 const hotelIndexedCities = new Set<string>();
 
-// Adapter: preserve the local { code, country } shape used by ensureHotelIndexed below.
-const HOTEL_INDEX_CITIES = SHARED_HOTEL_INDEX_CITIES.map((c) => ({
-  code: c.cityId,
-  country: c.countryCode,
-}));
-
 // Set of non-IN country codes from our catalog — used to prioritise CountryList searches.
 const PRIORITY_COUNTRY_CODES = new Set(
   SHARED_HOTEL_CITIES
@@ -580,15 +581,40 @@ const PRIORITY_COUNTRY_CODES = new Set(
     .map((c) => c.countryCode)
 );
 
-async function ensureHotelIndexed(cityCode: string, countryCode: string): Promise<void> {
-  if (hotelIndexedCities.has(cityCode)) return;
-  hotelIndexedCities.add(cityCode);
+async function ensureHotelIndexed(cityCode: string, countryCode: string, cityName?: string): Promise<void> {
+  // Drift-safe resolve: if cityName is known, ask TBO's current CityList for the live cityCode
+  // (mirrors the boot job's resolveCityCode flow that surfaced the Dubai 118924→115936 drift).
+  let resolvedCityCode = cityCode;
+  if (cityName) {
+    try {
+      const cities = await fetchCityList(countryCode);
+      const tboCities = cities.map((c) => ({ Code: c.CityId, Name: c.CityName }));
+      const resolved = resolveCityCodeAgainstCatalog(
+        { cityName, countryCode, cityId: cityCode } as HotelCity,
+        tboCities,
+      );
+      if (resolved && resolved !== cityCode) {
+        sbtLogger.info(
+          `[HOTEL-INDEX] Resolved ${countryCode}/${cityName} → CityCode ${resolved} (catalog had ${cityCode} — drift corrected)`
+        );
+        resolvedCityCode = resolved;
+      }
+    } catch (resolveErr) {
+      sbtLogger.warn(
+        `[HOTEL-INDEX] resolveCityCode failed for ${countryCode}/${cityName}; falling back to catalog ${cityCode}`,
+        { err: resolveErr instanceof Error ? resolveErr.message : String(resolveErr) }
+      );
+    }
+  }
+
+  if (hotelIndexedCities.has(resolvedCityCode)) return;
+  hotelIndexedCities.add(resolvedCityCode);
   try {
-    const hotels = await fetchHotelCodeList(cityCode, countryCode);
-    for (const h of hotels) hotelNameIndex.push({ ...h, CityCode: cityCode });
+    const hotels = await fetchHotelCodeList(resolvedCityCode, countryCode);
+    for (const h of hotels) hotelNameIndex.push({ ...h, CityCode: resolvedCityCode });
   } catch (err) {
-    console.error(`[HOTEL-INDEX] Failed to index city ${cityCode}:`, err instanceof Error ? err.message : String(err));
-    hotelIndexedCities.delete(cityCode);
+    console.error(`[HOTEL-INDEX] Failed to index city ${resolvedCityCode}:`, err instanceof Error ? err.message : String(err));
+    hotelIndexedCities.delete(resolvedCityCode);
   }
 }
 
@@ -697,11 +723,15 @@ async function getCachedCountryList(): Promise<{ Code: string; Name: string }[]>
   if (countryListCache.length > 0 && now - countryListCacheTime < COUNTRY_LIST_TTL) {
     return countryListCache;
   }
-  const res = await fetch("https://api.tbotechnology.in/TBOHolidays_HotelAPI/CountryList", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: hotelStaticAuthHeader() },
-    body: "{}",
+  // TBO spec: CountryList is GET-only. POST returns 405 with a plain-text body
+  // that crashes res.json(). Do not poison cache on failure — return last value
+  // (or [] on cold start) so the caller can retry on the next request.
+  const url = "https://api.tbotechnology.in/TBOHolidays_HotelAPI/CountryList";
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { Authorization: hotelStaticAuthHeader() },
   });
+  if (await tboFetchFailed("CountryList", url, res)) return countryListCache;
   const data = (await res.json()) as { CountryList?: { Code: string; Name: string }[] };
   countryListCache = data?.CountryList ?? [];
   countryListCacheTime = now;
@@ -714,9 +744,10 @@ async function getCachedCountryList(): Promise<{ Code: string; Name: string }[]>
     await fetchCityList("IN");
     sbtLogger.info("Indian city list cached on startup");
 
-    // Fixed codes for top metro cities
-    for (const { code, country } of HOTEL_INDEX_CITIES) {
-      await ensureHotelIndexed(code, country);
+    // Fixed codes for top metro cities — iterate shared catalog directly so
+    // cityName flows into ensureHotelIndexed for runtime drift correction.
+    for (const c of SHARED_HOTEL_INDEX_CITIES) {
+      await ensureHotelIndexed(c.cityId, c.countryCode, c.cityName);
     }
 
     // Dynamically resolve additional city codes from the cached TBOCityList
@@ -897,8 +928,34 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       }
       allCodes = directCodes;
     } else {
-      // City search: fetch all hotels in the city
-      const hotelList = await fetchHotelCodeList(CityCode, CountryCode);
+      // City search: fetch all hotels in the city.
+      // Drift-safe resolve: if the request supplies a CityName, ask TBO's current
+      // CityList for the live cityCode (catalog cityIds can drift — see static-data
+      // refresh job's resolveCityCode).
+      let resolvedCityCode = CityCode;
+      const requestCityName = String(req.body?.CityName || "").trim();
+      if (requestCityName) {
+        try {
+          const cities = await fetchCityList(CountryCode);
+          const tboCities = cities.map((c) => ({ Code: c.CityId, Name: c.CityName }));
+          const resolved = resolveCityCodeAgainstCatalog(
+            { cityName: requestCityName, countryCode: CountryCode, cityId: CityCode } as HotelCity,
+            tboCities,
+          );
+          if (resolved && resolved !== CityCode) {
+            sbtLogger.info(
+              `[SEARCH] Resolved ${CountryCode}/${requestCityName} → CityCode ${resolved} (request had ${CityCode} — drift corrected)`
+            );
+            resolvedCityCode = resolved;
+          }
+        } catch (resolveErr) {
+          sbtLogger.warn(
+            `[SEARCH] resolveCityCode failed for ${CountryCode}/${requestCityName}; using request CityCode ${CityCode}`,
+            { err: resolveErr instanceof Error ? resolveErr.message : String(resolveErr) }
+          );
+        }
+      }
+      const hotelList = await fetchHotelCodeList(resolvedCityCode, CountryCode);
       if (!hotelList.length) {
         return res.json({ Hotels: [], SearchId: randomUUID(), CityName });
       }
@@ -1194,6 +1251,13 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
     const isRefundable =
       typeof room0?.IsRefundable === "boolean" ? room0.IsRefundable : null;
 
+    sbtLogger.info("[PREBOOK] IsRefundable resolved", {
+      room0HasIsRefundable: typeof room0?.IsRefundable === "boolean",
+      isRefundableValue: room0?.IsRefundable,
+      resolvedIsRefundable: isRefundable,
+      bookingCode: req.body?.BookingCode,
+    });
+
     // RC2: compare TBO-raw TotalFare on both sides (searchPrice is now raw TBO TotalFare from frontend)
     const PRICE_CHANGE_TOLERANCE = 1; // rupees — below this is rounding noise
     const priceChanged = typeof searchPrice === "number" && searchPrice > 0
@@ -1481,13 +1545,30 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     }
 
     // GAP-36a: block hold for non-refundable rates (spec FAQ: "non refundable bookings can not be put on hold")
-    const isRefundable: boolean = req.body.isRefundable !== false;
-    if (bookingMode === "hold" && !isRefundable) {
+    // Refundability tri-state from frontend: true | false | null (unknown).
+    // Spec FAQ 2912: only confirmed non-refundable cannot be held. Unknown is allowed —
+    // TBO will reject the Book call if the rate truly is non-refundable, and we'll surface that error.
+    const isRefundableRaw = req.body.isRefundable;
+    const isRefundableConfirmedFalse = isRefundableRaw === false;
+
+    sbtLogger.info("[BOOK] Refundability check", {
+      bookingMode,
+      isRefundableRaw,
+      isRefundableConfirmedFalse,
+      clientReferenceId: clientRef,
+    });
+
+    if (bookingMode === "hold" && isRefundableConfirmedFalse) {
+      sbtLogger.warn("[BOOK] Hold rejected — rate is confirmed non-refundable", {
+        clientReferenceId: clientRef,
+      });
       return res.status(400).json({
         code: "NON_REFUNDABLE_HOLD_FORBIDDEN",
         error: "This rate cannot be held. Please complete payment to confirm booking.",
       });
     }
+
+    const isRefundable: boolean = !isRefundableConfirmedFalse;
 
     // Tracks whether TBO triggered a price change on the Book response (persisted for finance reporting)
     let priceChangedDuringBook = false;
@@ -1514,11 +1595,38 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     // PAN is now driven by HOTEL DESTINATION COUNTRY, not by per-property TBO flags.
     // TBO support confirmation (2026-05-05): domestic India hotels never require PAN;
     // international hotels always require lead PAN regardless of property's PanMandatory flag.
-    const destinationCountryCode = String(
-      req.body?.destinationCountryCode || req.body?.countryCode || "IN"
-    ).toUpperCase();
+    // Spec note: a silent fallback to "IN" was found to risk skipping PAN propagation on
+    // international hotels when upstream sources are missing the field. Now we require an
+    // explicit ISO code.
+    const rawDestCountry = String(
+      req.body?.destinationCountryCode ||
+      req.body?.countryCode ||
+      ""
+    ).trim().toUpperCase();
+
+    if (!rawDestCountry || !/^[A-Z]{2}$/.test(rawDestCountry)) {
+      sbtLogger.error("[BOOK] destinationCountryCode missing or invalid in request", {
+        bookingPayloadKeys: Object.keys(req.body || {}),
+        destinationCountryCode: req.body?.destinationCountryCode,
+        countryCode: req.body?.countryCode,
+        clientReferenceId: clientRef,
+      });
+      return res.status(400).json({
+        code: "DESTINATION_COUNTRY_REQUIRED",
+        error: "destinationCountryCode is required and must be a 2-letter ISO country code (e.g., 'IN', 'AE'). The booking cannot proceed without it.",
+      });
+    }
+
+    const destinationCountryCode = rawDestCountry;
     const isDomesticHotel = destinationCountryCode === "IN";
     const isInternationalHotel = !isDomesticHotel;
+
+    sbtLogger.info("[BOOK] Destination resolved", {
+      destinationCountryCode,
+      isDomesticHotel,
+      isInternationalHotel,
+      clientReferenceId: clientRef,
+    });
 
     // Corporate is gated PER RATE by TBO's ValidationInfo.CorporateBookingAllowed
     // (spec §2774). Spec table uses the typo "CorporateBokingAllowed"; live PreBook
@@ -1559,6 +1667,14 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     ) ?? _allRoomGuests.find((g: any) => Number(g?.PaxType) === 1);
     const leadAdultPAN = String(_leadAdult?.PAN || "").trim().toUpperCase();
 
+    sbtLogger.info("[BOOK] Lead adult PAN resolved", {
+      hasLeadAdult: !!_leadAdult,
+      leadAdultRoleType: _leadAdult?.PaxType,
+      leadPanProvided: !!leadAdultPAN,
+      panMasked: leadAdultPAN ? leadAdultPAN.slice(0, 5) + "XXXXX" : null,
+      clientReferenceId: clientRef,
+    });
+
     // GAP-40: Shared validation gate — collect-all errors, same logic as /validate-before-payment.
     // Defense-in-depth: /book validates independently even when frontend calls /validate-before-payment first.
     const _valErrors = validateBookingCriteria({
@@ -1590,23 +1706,47 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         ?? roomGuests.find((g: any) => Number(g.PaxType) === 1);
       const leadAdultLastName = (String(leadAdult?.LastName || "Guest").trim() || "Guest").substring(0, 25);
 
-      let childIdx = 0;
       return roomGuests.map((g: any) => {
         if (Number(g.PaxType) === 2) {
-          // Auto-generate child: Title="Miss", FirstName="Child<N>", LastName=lead adult's last name.
-          // No Phoneno/Email/Passport keys — field must be absent, not null.
+          // Use user-supplied name (TBO spec line 2005: FirstName mandatory, no special chars).
+          // Defensive defaults if frontend somehow omits — should not happen in normal flow.
+          const childFirstName = String(g.FirstName || "").trim().substring(0, 25);
+          const childLastName = (String(g.LastName || "").trim() || leadAdultLastName).substring(0, 25);
+          const childTitle = String(g.Title || "Mstr").trim();
+
+          if (!childFirstName || childFirstName.length < 2) {
+            throw new Error("Child FirstName is required (min 2 characters per TBO spec)");
+          }
+          if (!childLastName || childLastName.length < 2) {
+            throw new Error("Child LastName is required (min 2 characters per TBO spec)");
+          }
+
           const childPax: Record<string, unknown> = {
-            Title: "Miss",
-            FirstName: `Child${++childIdx}`,
-            LastName: leadAdultLastName,
+            Title: childTitle,
+            FirstName: childFirstName,
+            LastName: childLastName,
             MiddleName: "",
             PaxType: 2,
             LeadPassenger: false,
             Age: Number(g.Age) || 8,
           };
           // International: TBO requires lead's PAN to be carried on children too.
+          // Spec line 2005 + TBO confirmation 2026-05-05: international hotels propagate lead PAN
+          // onto every passenger including children. Log the decision for cert log audits.
           if (isInternationalHotel && leadAdultPAN) {
             childPax.PAN = leadAdultPAN;
+            sbtLogger.info("[BOOK] Child PAN propagated from lead adult", {
+              destinationCountryCode,
+              childFirstName: childPax.FirstName,
+              panMasked: leadAdultPAN.slice(0, 5) + "XXXXX",
+              clientReferenceId: clientRef,
+            });
+          } else if (isInternationalHotel && !leadAdultPAN) {
+            sbtLogger.warn("[BOOK] International hotel but lead PAN is empty — child has no PAN", {
+              destinationCountryCode,
+              childFirstName: childPax.FirstName,
+              clientReferenceId: clientRef,
+            });
           }
           return childPax;
         }
@@ -1639,6 +1779,13 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         // International: every adult carries the lead's PAN (lead supplies, others get a copy).
         if (isInternationalHotel && leadAdultPAN) {
           base.PAN = leadAdultPAN;
+          sbtLogger.info("[BOOK] Adult PAN propagated from lead adult", {
+            destinationCountryCode,
+            adultFirstName: base.FirstName,
+            isLead: g.LeadPassenger === true,
+            panMasked: leadAdultPAN.slice(0, 5) + "XXXXX",
+            clientReferenceId: clientRef,
+          });
         }
 
         // International + Corporate: attach CorporatePAN to the lead adult only.
@@ -1804,7 +1951,14 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             }
           );
           const detailData = (await detailRes.json()) as any;
-          logTBOCall({ method: "HotelGetBookingDetail", traceId: `hotel-book-verify-${bookingId}`, request: detailPayload, response: detailData, durationMs: Date.now() - dt0 });
+          logTBOCall({
+            method: "HotelGetBookingDetail",
+            traceId: `hotel-book-verify-${bookingId}`,
+            bookingId,
+            request: detailPayload,
+            response: detailData,
+            durationMs: Date.now() - dt0,
+          });
           return detailData;
         },
         (r: any) => {
@@ -1824,6 +1978,9 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       let holdPaxDetails: Array<{ paxId: string; firstName: string; lastName: string; paxType: number }> = [];
       let holdTboReferenceNo: string | null = null;
       let holdRoomDescription: string | null = null;
+      let holdLastVoucherDate: Date | undefined;
+      let holdLastCancellationDate: Date | undefined;
+      let holdBookingDetailRaw: any = null;
       if (isHeld && result?.BookingId) {
         try {
           const details = await verifyBookingStatus(Number(result.BookingId));
@@ -1850,6 +2007,13 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           holdRoomDescription =
             details?.HotelRoomsDetails?.[0]?.RoomDescription ||
             details?.HotelRoomsDetails?.[0]?.RoomTypeName || null;
+          // Hold deadline persistence (spec line 2496). Without these, Sprint 2A's idempotency
+          // guard at line 2447 is bypassed and TBO can auto-cancel held bookings silently.
+          const _hldVD = details?.LastVoucherDate ? parseTBODate(details.LastVoucherDate) : null;
+          holdLastVoucherDate = _hldVD ?? undefined;
+          const _hldCD = details?.LastCancellationDate ? parseTBODate(details.LastCancellationDate) : null;
+          holdLastCancellationDate = _hldCD ?? undefined;
+          holdBookingDetailRaw = details ?? null;
         } catch (detailErr) {
           console.debug('[HOLD-BOOK] GetBookingDetail failed:', detailErr instanceof Error ? detailErr.message : String(detailErr));
         }
@@ -1880,24 +2044,47 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           : null;
 
       // GAP-01: Update pre-persist skeleton to CONFIRMED/HELD with TBO booking details.
+      // State derivation: spec line 2030 — derive (status, isHeld, isVouchered, voucherStatus) atomically
+      // from TBO's (Status, VoucherStatus) pair. Replaces the prior split writes that produced the
+      // "status: 'HELD' + isHeld: false" inconsistency seen on booking 2122199.
+      const derivedState = deriveStateFromBookResponse(result, {
+        isVoucherBookingRequest: !isHeld,
+      });
       try {
         await SBTHotelBooking.findOneAndUpdate(
           { clientReferenceId: clientRef },
           { $set: {
-            status: isHeld ? "HELD" : "CONFIRMED",
+            // State flags — all four fields written together, never as a subset.
+            ...derivedState,
+            // TBO identifiers
             bookingId: String(result?.BookingId ?? ""),
             confirmationNo: String(result?.ConfirmationNo ?? ""),
             bookingRefNo: String(result?.BookingRefNo ?? ""),
-            // POST-001: store PaxIds and PAN requirement for generate-voucher-with-PAN flow.
-            ...(isHeld && holdPaxDetails.length > 0 ? { paxDetails: holdPaxDetails } : {}),
+            // TraceId — spec line 15. Persist for diagnostics and TBO support requests.
+            ...(result?.TraceId ? { traceId: String(result.TraceId) } : {}),
+            // PAN / corporate audit
             // panMandatory now persisted on every booking (was previously HELD-only).
             // Captures TBO's prebook flag for audit/diagnostics — actual PAN logic is destination-driven.
             panMandatory: !!panMandatory,
             // PAN audit (TBO conf 2026-05-05) — international + corporate flow.
             isCorporateBooking: !!isCorporateBooking,
             ...(isCorporateBooking && corporatePAN ? { corporatePAN } : {}),
-            ...(isHeld && holdTboReferenceNo ? { tboReferenceNo: holdTboReferenceNo, bookingDetailFetched: true, bookingDetailFetchedAt: new Date() } : {}),
+            // Hold-path metadata from the inline verifyBookingStatus call.
+            // Persist only when we actually have the data — never overwrite with undefined.
+            // POST-001: store PaxIds and PAN requirement for generate-voucher-with-PAN flow.
+            ...(isHeld && holdPaxDetails.length > 0 ? { paxDetails: holdPaxDetails } : {}),
+            ...(isHeld && holdTboReferenceNo ? {
+              tboReferenceNo: holdTboReferenceNo,
+              bookingDetailFetched: true,
+              bookingDetailFetchedAt: new Date(),
+            } : {}),
             ...(isHeld && holdRoomDescription ? { roomDescription: holdRoomDescription } : {}),
+            // Hold deadline — critical: spec line 2496. Without these, TBO will auto-cancel held bookings
+            // and we won't know. Sprint 2A's idempotency guard at line 2447 also depends on lastVoucherDate.
+            ...(isHeld && holdLastVoucherDate ? { lastVoucherDate: holdLastVoucherDate } : {}),
+            ...(isHeld && holdLastCancellationDate ? { lastCancellationDate: holdLastCancellationDate } : {}),
+            ...(isHeld && holdBookingDetailRaw ? { bookingDetailRaw: holdBookingDetailRaw } : {}),
+            // Selling rate / cancellation text
             ...(bookingRecommendedSellingRate != null ? { recommendedSellingRate: bookingRecommendedSellingRate } : {}),
             ...(_bookCancellationPolicyText ? { cancellationPolicyText: _bookCancellationPolicyText } : {}),
           }},
@@ -1923,35 +2110,38 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
 
       const tboBookingId = Number(result?.BookingId);
       if (tboBookingId && !isHeld) {
-        // When TBO auto-generates the voucher at Book time (IsVoucherBooking + VoucherStatus both
-        // true), the explicit GenerateVoucher call would return "already generated" (ErrorCode 2).
-        // Skip it and set voucherStatus directly from the Book response.
+        const tboStatus = Number(result?.Status ?? -1);
         const isAutoVouchered =
           result?.IsVoucherBooking === true && result?.VoucherStatus === true;
 
         if (isAutoVouchered) {
+          // Spec line 1979: when IsVoucherBooking=true is sent and TBO returns VoucherStatus=true,
+          // the booking is already vouchered. Persist the GENERATED state and invoice number.
+          // No GenerateVoucher call — that would produce ErrorCode 2 "already generated".
           SBTHotelBooking.findOneAndUpdate(
             { bookingId: String(tboBookingId) },
             { $set: { voucherStatus: "GENERATED", invoiceNumber: result?.InvoiceNumber || "" } }
           ).catch((err: any) =>
             sbtLogger.error("Failed to update voucher status after auto-voucher", { err: err?.message })
           );
-        } else {
-          generateHotelVoucher(tboBookingId)
-            .then(async (voucherRes) => {
-              try {
-                await SBTHotelBooking.findOneAndUpdate(
-                  { bookingId: String(tboBookingId) },
-                  {
-                    tboVoucherData: voucherRes,
-                    voucherStatus: voucherRes?.GenerateVoucherResult?.ResponseStatus === 1
-                      ? "GENERATED" : "FAILED",
-                  }
-                );
-              } catch { /* silent */ }
+        } else if (tboStatus === 1 && result?.VoucherStatus === false) {
+          // Spec line 1987: IsVoucherBooking=true was sent but TBO returned VoucherStatus=false with Status=1.
+          // This is the "Pending" case. Mark PENDING for the orphan-pending-cleanup cron to reconcile.
+          // Do NOT call GenerateVoucher — that is the wrong recovery path per spec.
+          SBTHotelBooking.findOneAndUpdate(
+            { bookingId: String(tboBookingId) },
+            { $set: { status: "PENDING", voucherStatus: "PENDING" } }
+          ).catch((err: any) =>
+            sbtLogger.error("Failed to mark booking PENDING for cron reconciliation", {
+              bookingId: tboBookingId,
+              err: err?.message,
             })
-            .catch(() => {});
+          );
+          sbtLogger.info("Hotel Book returned PENDING — scheduled for cron reconciliation", {
+            bookingId: tboBookingId,
+          });
         }
+        // No else: any other state (Status=0/3/6) is already handled by the failure paths upstream.
       }
 
       // Fire-and-forget: fetch GetBookingDetail to capture TBOReferenceNo + room description.
@@ -1961,17 +2151,37 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           try {
             const detail = await getBookingDetail([{ mode: "bookingId", bookingId: tboBookingId }]);
             if (detail?.TBOReferenceNo || detail?.Rooms) {
+              // Extract paxDetails from the GetBookingDetail response — Defect 6.
+              // CONFIRMED bookings previously left paxDetails: [] because no write site populated them.
+              const detailPassengers: any[] = (detail?.Rooms ?? []).flatMap(
+                (room: any) => room?.HotelPassenger ?? []
+              );
+              const detailPaxDetails = detailPassengers
+                .filter((p: any) => p?.PaxId)
+                .map((p: any) => ({
+                  paxId: String(p.PaxId),
+                  firstName: p.FirstName || "",
+                  lastName: p.LastName || "",
+                  paxType: Number(p.PaxType) || 1,
+                }));
+
               await SBTHotelBooking.findOneAndUpdate(
                 { bookingId: String(tboBookingId) },
                 {
-                  tboReferenceNo: detail.TBOReferenceNo || null,
-                  roomDescription: detail.Rooms?.[0]?.RoomDescription ||
-                                   detail.Rooms?.[0]?.RoomTypeName || null,
-                  bookingDetailFetched: true,
-                  bookingDetailFetchedAt: new Date(),
-                  bookingDetailRaw: detail,
-                  ...(detail.LastCancellationDate ? { lastCancellationDate: parseTBODate(detail.LastCancellationDate) } : {}),
-                  ...(detail.LastVoucherDate ? { lastVoucherDate: parseTBODate(detail.LastVoucherDate) } : {}),
+                  $set: {
+                    tboReferenceNo: detail.TBOReferenceNo || null,
+                    roomDescription: detail.Rooms?.[0]?.RoomDescription ||
+                                     detail.Rooms?.[0]?.RoomTypeName || null,
+                    bookingDetailFetched: true,
+                    bookingDetailFetchedAt: new Date(),
+                    bookingDetailRaw: detail,
+                    // TraceId from BookingDetail — spec line 15, Defect 7.
+                    ...(detail?.TraceId ? { traceId: String(detail.TraceId) } : {}),
+                    // paxDetails — Defect 6. Always written on CONFIRMED path now that we have it.
+                    ...(detailPaxDetails.length > 0 ? { paxDetails: detailPaxDetails } : {}),
+                    ...(detail.LastCancellationDate ? { lastCancellationDate: parseTBODate(detail.LastCancellationDate) } : {}),
+                    ...(detail.LastVoucherDate ? { lastVoucherDate: parseTBODate(detail.LastVoucherDate) } : {}),
+                  },
                 },
               );
               sbtLogger.info("GetBookingDetail persisted post-Book", { tboBookingId, tboReferenceNo: detail.TBOReferenceNo });
@@ -2134,6 +2344,8 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           logTBOCall({
             method: "HotelBook-SessionRetry",
             traceId: `hotel-book-session-retry-${clientRef}`,
+            clientReferenceId: clientRef,
+            bookingId: data?.BookResult?.BookingId,
             request: tboPayload,
             response: data,
             durationMs: Date.now() - _srT0,
@@ -2155,13 +2367,28 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       sbtLogger.warn("TBO Hotel Book call failed, verifying via GetBookingDetail", {
         userId: req.user?.id, isTimeout, error: bookErr?.message, clientRef,
       });
-      logTBOCall({ method: "HotelBook", traceId: `hotel-book-${clientRef}`, request: tboPayload, response: { error: bookErr?.message, isTimeout }, durationMs: Date.now() - t0 });
+      logTBOCall({
+        method: "HotelBook",
+        traceId: `hotel-book-${clientRef}`,
+        clientReferenceId: clientRef,
+        request: tboPayload,
+        response: { error: bookErr?.message, isTimeout },
+        durationMs: Date.now() - t0,
+      });
     }
 
     // Happy path: Book call succeeded with a response
     if (data && !bookTimedOut) {
       const bookTraceId = data?.BookResult?.TraceId || BookingCode.split("!TB!")[2] || "hotel-book";
-      logTBOCall({ method: "HotelBook", traceId: bookTraceId, request: tboPayload, response: data, durationMs: Date.now() - t0 });
+      logTBOCall({
+        method: "HotelBook",
+        traceId: bookTraceId,
+        clientReferenceId: clientRef,
+        bookingId: data?.BookResult?.BookingId,
+        request: tboPayload,
+        response: data,
+        durationMs: Date.now() - t0,
+      });
 
 
       let result = data?.BookResult || data;
@@ -2223,7 +2450,15 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
                 }
               );
               retryData = (await retryRes.json()) as any;
-              logTBOCall({ method: "HotelBook-PriceRetry", traceId: `hotel-book-retry-${clientRef}`, request: retryPayload, response: retryData, durationMs: Date.now() - retryT0 });
+              logTBOCall({
+                method: "HotelBook-PriceRetry",
+                traceId: `hotel-book-retry-${clientRef}`,
+                clientReferenceId: clientRef,
+                bookingId: retryData?.BookResult?.BookingId,
+                request: retryPayload,
+                response: retryData,
+                durationMs: Date.now() - retryT0,
+              });
             } finally {
               clearTimeout(retryTimer);
             }
@@ -2405,6 +2640,21 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
     const booking = await SBTHotelBooking.findOne({ bookingId: req.params.bookingId, userId: req.user?._id ?? req.user?.id }).lean();
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
+    // Spec line 21 (cert blocker): de-dupe is mandatory.
+    // Belt-and-braces with POST /generate-voucher — same idempotency rule.
+    if (booking.isVouchered === true || booking.voucherStatus === "GENERATED") {
+      sbtLogger.info("GET /voucher idempotency hit — booking already vouchered", {
+        bookingId: booking.bookingId,
+        voucherStatus: booking.voucherStatus,
+      });
+      return res.json({
+        ok: true,
+        voucherStatus: booking.voucherStatus || "GENERATED",
+        voucherData: booking.tboVoucherData ?? null,
+        deduplicated: true,
+      });
+    }
+
     if (booking.tboVoucherData) {
       return res.json({
         ok: true,
@@ -2442,6 +2692,22 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
       userId: req.user?._id ?? req.user?.id ?? req.user?.sub,
     });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    // Spec line 21 (cert blocker): de-dupe is mandatory.
+    // If this booking has already been vouchered, do not call TBO again — return current state.
+    if (booking.isVouchered === true || booking.voucherStatus === "GENERATED") {
+      sbtLogger.info("GenerateVoucher idempotency hit — booking already vouchered", {
+        bookingId: booking.bookingId,
+        voucherStatus: booking.voucherStatus,
+      });
+      return res.json({
+        ok: true,
+        voucherStatus: booking.voucherStatus || "GENERATED",
+        voucherData: booking.tboVoucherData ?? null,
+        deduplicated: true,
+      });
+    }
+
     if (!booking.isHeld) return res.status(400).json({ error: "Booking is not in held state" });
 
     if (booking.lastVoucherDate && new Date() > booking.lastVoucherDate) {
@@ -2494,48 +2760,120 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
     }
 
     const voucherRes = await generateHotelVoucher(numericId, voucherPanPayload);
-
-    // ── Detect ErrorCode 2 = genuine agency balance insufficient ─────
     const gvr = voucherRes?.GenerateVoucherResult;
-    const tboErrorCode = gvr?.Error?.ErrorCode;
-    const tboErrorMsg = gvr?.Error?.ErrorMessage || "";
-    const isBalanceError =
-      tboErrorCode === 2 &&
-      (tboErrorMsg.toLowerCase().includes("balance") ||
-       tboErrorMsg.toLowerCase().includes("insufficient") ||
-       tboErrorMsg.toLowerCase().includes("credit"));
 
-    if (isBalanceError) {
-      console.debug('[GEN-VOUCHER] TBO agency balance insufficient', { tboErrorCode, tboErrorMsg });
+    // Use the helper to classify the response. Three outcomes possible:
+    //   1. success === true        → voucher generated; persist CONFIRMED state.
+    //   2. isBalanceError === true → agency wallet insufficient; return 402 (existing behaviour).
+    //   3. isAlreadyGenerated      → spec line 2510: call GetBookingDetail and reconcile.
+    //   4. plain failure           → persist FAILED state, return 502.
+    const classified = deriveStateFromVoucherResponse(gvr);
+
+    // Subcase 2: agency balance insufficient — preserve existing 402 contract.
+    if (classified.isBalanceError) {
+      console.debug('[GEN-VOUCHER] TBO agency balance insufficient', {
+        tboErrorCode: classified.tboErrorCode,
+        tboErrorMsg: classified.tboErrorMessage,
+      });
       return res.status(402).json({
         requiresPayment: true,
         amount: booking.netAmount ?? booking.totalFare ?? 0,
         bookingId: booking._id,
         message: "Agency wallet balance insufficient to confirm this booking",
         code: "PAYMENT_REQUIRED",
-        tboError: tboErrorMsg,
+        tboError: classified.tboErrorMessage,
       });
     }
 
-    const success = gvr?.ResponseStatus === 1;
-
-    await SBTHotelBooking.findByIdAndUpdate(booking._id, {
-      isHeld: false,
-      voucherGeneratedAt: new Date(),
-      status: success ? "CONFIRMED" : booking.status,
-      tboVoucherData: voucherRes,
-      voucherStatus: success ? "GENERATED" : "FAILED",
-      isVouchered: success,
-    });
-
-    if (!success) {
-      const errMsg = tboErrorMsg || "Voucher generation failed at supplier";
-      console.debug('[GEN-VOUCHER] failed — TBO error:', errMsg, '| ResponseStatus:', gvr?.ResponseStatus);
-      return res.status(502).json({ error: errMsg, voucherData: voucherRes });
+    // Subcase 3: TBO says voucher already exists — reconcile via GetBookingDetail per spec line 2510.
+    // Do NOT write voucherStatus: 'FAILED' — that's the bug that corrupted booking 2122164.
+    if (classified.isAlreadyGenerated) {
+      sbtLogger.info("GenerateVoucher returned 'already generated' — reconciling via GetBookingDetail", {
+        bookingId: booking.bookingId,
+        tboErrorMsg: classified.tboErrorMessage,
+      });
+      try {
+        const detail = await getBookingDetail([{ mode: "bookingId", bookingId: numericId }]);
+        const detailVouchered = detail?.VoucherStatus === true || detail?.HotelBookingStatus === "Confirmed";
+        if (detailVouchered) {
+          // TBO confirms the voucher exists. Persist the reconciled state.
+          await SBTHotelBooking.findByIdAndUpdate(booking._id, {
+            $set: {
+              isHeld: false,
+              isVouchered: true,
+              status: "CONFIRMED",
+              voucherStatus: "GENERATED",
+              voucherGeneratedAt: new Date(),
+              tboVoucherData: voucherRes,
+              bookingDetailRaw: detail,
+              bookingDetailFetched: true,
+              bookingDetailFetchedAt: new Date(),
+              ...(detail?.InvoiceNo ? { invoiceNumber: detail.InvoiceNo } : {}),
+              ...(detail?.ConfirmationNo ? { confirmationNo: detail.ConfirmationNo } : {}),
+              // TraceId — spec line 15.
+              ...(detail?.TraceId ? { traceId: String(detail.TraceId) } : {}),
+            },
+          });
+          return res.json({
+            ok: true,
+            voucherStatus: "GENERATED",
+            reconciled: true,
+            voucherData: voucherRes,
+            bookingDetail: detail,
+          });
+        }
+        // Detail says the voucher is NOT confirmed — surface as failure but do not corrupt state.
+        sbtLogger.warn("GetBookingDetail reconciliation did not confirm voucher", {
+          bookingId: booking.bookingId,
+          detailVoucherStatus: detail?.VoucherStatus,
+          detailBookingStatus: detail?.HotelBookingStatus,
+        });
+        return res.status(502).json({
+          error: "Voucher state could not be reconciled — please retry or contact support",
+          voucherData: voucherRes,
+          bookingDetail: detail,
+        });
+      } catch (reconcileErr: any) {
+        sbtLogger.error("GetBookingDetail reconciliation failed", {
+          bookingId: booking.bookingId,
+          err: reconcileErr?.message,
+        });
+        return res.status(502).json({
+          error: "Voucher reconciliation failed — please retry",
+          voucherData: voucherRes,
+        });
+      }
     }
 
-    sbtLogger.info("Hotel hold booking vouchered", { bookingId: booking.bookingId, userId: req.user?.id });
-    res.json({ ok: true, voucherStatus: "GENERATED", voucherData: voucherRes });
+    // Subcase 1: success → persist derived state from the helper.
+    if (classified.success && classified.derivedOnSuccess) {
+      await SBTHotelBooking.findByIdAndUpdate(booking._id, {
+        $set: {
+          ...classified.derivedOnSuccess,
+          voucherGeneratedAt: new Date(),
+          tboVoucherData: voucherRes,
+          // TraceId — spec line 15. GenerateVoucher response carries the same TraceId from the session.
+          ...(gvr?.TraceId ? { traceId: String(gvr.TraceId) } : {}),
+        },
+      });
+      sbtLogger.info("Hotel hold booking vouchered", {
+        bookingId: booking.bookingId,
+        userId: req.user?.id,
+      });
+      return res.json({
+        ok: true,
+        voucherStatus: classified.derivedOnSuccess.voucherStatus,
+        voucherData: voucherRes,
+      });
+    }
+
+    // Subcase 4: plain failure — persist FAILED state.
+    const errMsg = classified.tboErrorMessage || "Voucher generation failed at supplier";
+    console.debug('[GEN-VOUCHER] failed — TBO error:', errMsg, '| ResponseStatus:', gvr?.ResponseStatus);
+    await SBTHotelBooking.findByIdAndUpdate(booking._id, {
+      $set: { voucherStatus: "FAILED", tboVoucherData: voucherRes },
+    });
+    return res.status(502).json({ error: errMsg, voucherData: voucherRes });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Voucher generation failed";
     res.status(500).json({ error: msg });
@@ -2835,7 +3173,15 @@ router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any
           }
         );
         const data = (await tboRes.json()) as any;
-        logTBOCall({ method: "HotelGetBookingDetail", traceId: `hotel-sync-${doc.bookingId}`, request: detailPayload, response: data, durationMs: Date.now() - t0 });
+        logTBOCall({
+          method: "HotelGetBookingDetail",
+          traceId: `hotel-sync-${doc.bookingId}`,
+          clientReferenceId: doc.clientReferenceId,
+          bookingId: doc.bookingId,
+          request: detailPayload,
+          response: data,
+          durationMs: Date.now() - t0,
+        });
         const result = data?.GetBookingDetailResult || data?.BookResult || data;
         const tboStatus = (result?.HotelBookingStatus || result?.BookingStatus || "").toLowerCase();
 
@@ -2899,7 +3245,15 @@ router.post("/bookings/:id/sync-status", requireAuth, async (req: any, res: any)
       }
     );
     const data = (await tboRes.json()) as any;
-    logTBOCall({ method: "HotelGetBookingDetail", traceId: `hotel-status-${doc.bookingId}`, request: detailPayload, response: data, durationMs: Date.now() - t0 });
+    logTBOCall({
+      method: "HotelGetBookingDetail",
+      traceId: `hotel-status-${doc.bookingId}`,
+      clientReferenceId: doc.clientReferenceId,
+      bookingId: doc.bookingId,
+      request: detailPayload,
+      response: data,
+      durationMs: Date.now() - t0,
+    });
     const result = data?.GetBookingDetailResult || data?.BookResult || data;
     const tboStatus = (result?.HotelBookingStatus || result?.BookingStatus || "").toLowerCase();
 
@@ -3136,7 +3490,14 @@ async function pollCancelStatusBackground(
             { method: "POST", headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() }, body: JSON.stringify(statusPayload) }
           );
           const sd = (await statusRes.json()) as any;
-          logTBOCall({ method: "HotelGetChangeRequestStatus", traceId: `hotel-cancel-bg-${tboBookingId}-${i}`, request: statusPayload, response: sd, durationMs: Date.now() - t1 });
+          logTBOCall({
+            method: "HotelGetChangeRequestStatus",
+            traceId: `hotel-cancel-bg-${tboBookingId}-${i}`,
+            bookingId: tboBookingId,
+            request: statusPayload,
+            response: sd,
+            durationMs: Date.now() - t1,
+          });
           return sd;
         },
         (r: any) => r?.HotelChangeRequestStatusResult?.ResponseStatus === 4 || r?.HotelChangeRequestStatusResult?.Error?.ErrorCode === 6,
@@ -3220,7 +3581,15 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
         let parsed: any;
         try { parsed = JSON.parse(rawText); }
         catch { throw new Error(`TBO SendChangeRequest returned non-JSON: ${rawText.substring(0, 200)}`); }
-        logTBOCall({ method: "HotelSendChangeRequest", traceId: `hotel-cancel-${doc.bookingId}`, request: changeReqPayload, response: parsed, durationMs: Date.now() - t0 });
+        logTBOCall({
+          method: "HotelSendChangeRequest",
+          traceId: `hotel-cancel-${doc.bookingId}`,
+          clientReferenceId: doc.clientReferenceId,
+          bookingId: doc.bookingId,
+          request: changeReqPayload,
+          response: parsed,
+          durationMs: Date.now() - t0,
+        });
         return parsed;
       },
       (r: any) => r?.HotelChangeRequestResult?.ResponseStatus === 4 || r?.HotelChangeRequestResult?.Error?.ErrorCode === 6,

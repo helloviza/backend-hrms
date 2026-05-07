@@ -21,6 +21,11 @@ export const HOTEL_CITIES: readonly HotelCity[] = [
   { cityId: "101204", cityName: "Kochi",      countryCode: "IN", countryName: "India", preIndexed: true },
   { cityId: "145086", cityName: "Udaipur",    countryCode: "IN", countryName: "India", preIndexed: true },
 
+  // NOTE (2026-05-07): International cityIds below are CATALOG REFERENCES ONLY — the runtime
+  // hotel index and POST /search both pass the city NAME to TBO's CityList API and resolve
+  // the live cityId. Do not rely on the cityId values here being current. See resolveCityCode()
+  // in apps/backend/src/jobs/static-data-refresh.ts.
+
   // International — original
   { cityId: "118924", cityName: "Dubai",         countryCode: "AE", countryName: "United Arab Emirates", preIndexed: true },
   { cityId: "102744", cityName: "Singapore",     countryCode: "SG", countryName: "Singapore",            preIndexed: true },
