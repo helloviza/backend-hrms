@@ -138,12 +138,13 @@ function isL1Actor(u: any): boolean {
   return access === "L1";
 }
 
+const PLUMTRIPS_WORKSPACE_ID = "69679a7628330a58d29f2254";
+
 function isStaffPrivileged(u: any) {
   const r = collectRoles(u);
 
-  // SaaS HRMS tenant admins carry accountType="STAFF" for HRMS internal flow
-  // (see saas.signup.ts), but they are NOT Plumtrips staff and must never
-  // pass cross-tenant gates. Hard-exclude them before any other admit check.
+  // Hard exclusion 1: TENANT_ADMIN/CLIENT_ADMIN are workspace-scoped
+  // tenants, never platform staff. Closes cross-tenant leak from 765838d.
   if (
     r.includes("TENANT_ADMIN") ||
     r.includes("TENANTADMIN") ||
@@ -153,9 +154,27 @@ function isStaffPrivileged(u: any) {
     return false;
   }
 
+  // Hard exclusion 2: explicit customer/vendor accountType. Defends
+  // against misclassified users sitting in HOUSE workspace (e.g. seeded
+  // demo accounts).
+  const accountType = String(u?.accountType || "").toUpperCase();
+  if (accountType === "CUSTOMER" || accountType === "VENDOR") {
+    return false;
+  }
+
+  // Admit 1: HOUSE workspace membership. Any user in the Plumtrips
+  // internal workspace (and not excluded above) is internal staff.
+  // This admits Plumtrips ops/booking employees who carry only
+  // EMPLOYEE markers.
+  if (String(u?.workspaceId || "") === PLUMTRIPS_WORKSPACE_ID) {
+    return true;
+  }
+
+  // Admit 2: explicit staff flags
   if (u?.staff === true) return true;
   if (u?.isStaff === true) return true;
 
+  // Admit 3: existing role-token admit list (preserved as fallback)
   return (
     r.includes("STAFF") ||
     r.includes("INTERNAL") ||
