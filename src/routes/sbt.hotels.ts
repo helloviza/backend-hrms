@@ -3041,9 +3041,27 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       }
     }
     if (!doc) {
-      doc = await SBTHotelBooking.create({
-        ...(b_cref ? { clientReferenceId: b_cref } : {}),
-        ..._bookingData,
+      // GAP-02: /book has historically already persisted a doc with this bookingId.
+      // Upsert by bookingId so we don't create a duplicate. Fall back to create()
+      // for TBO-failed bookings (bookingId "0" or empty) since those are
+      // legitimately separate documents.
+      const hasRealBookingId = !!_bookingData.bookingId && String(_bookingData.bookingId) !== "0";
+      if (hasRealBookingId) {
+        doc = await SBTHotelBooking.findOneAndUpdate(
+          { bookingId: String(_bookingData.bookingId) },
+          { $set: { ...(b_cref ? { clientReferenceId: b_cref } : {}), ..._bookingData } },
+          { upsert: true, new: true, setDefaultsOnInsert: true },
+        );
+      } else {
+        doc = await SBTHotelBooking.create({
+          ...(b_cref ? { clientReferenceId: b_cref } : {}),
+          ..._bookingData,
+        });
+      }
+      sbtLogger.info("[SAVE] Booking persisted via " + (hasRealBookingId ? "upsert" : "create"), {
+        bookingId: _bookingData.bookingId,
+        _id: doc._id,
+        isNew: doc.createdAt?.getTime() === doc.updatedAt?.getTime(),
       });
     }
 

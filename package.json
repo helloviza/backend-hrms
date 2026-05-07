@@ -17,7 +17,9 @@
     "migrate:travel": "tsx src/scripts/migrateTravelBookings.ts",
     "migrate:traveler-ids": "tsx src/scripts/migrateTravelerIds.ts",
     "cert:inventory": "tsx src/scripts/cert-inventory-snapshot.ts",
-    "backfill:tbo-ref-no": "tsx src/scripts/backfill-tbo-reference-no.ts"
+    "backfill:tbo-ref-no": "tsx src/scripts/backfill-tbo-reference-no.ts",
+    "dedupe:sbt-hotel-bookings": "tsx src/scripts/dedupe-sbt-hotel-bookings.ts",
+    "probe:tbo-book-minimal-child": "tsx src/scripts/probe-tbo-book-minimal-child.ts"
   },
   "dependencies": {
     "@aws-sdk/client-apprunner": "^3.693.0",
