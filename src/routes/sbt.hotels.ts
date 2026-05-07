@@ -2795,24 +2795,33 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
         const detailVouchered = detail?.VoucherStatus === true || detail?.HotelBookingStatus === "Confirmed";
         if (detailVouchered) {
           // TBO confirms the voucher exists. Persist the reconciled state.
-          await SBTHotelBooking.findByIdAndUpdate(booking._id, {
-            $set: {
-              isHeld: false,
-              isVouchered: true,
-              status: "CONFIRMED",
-              voucherStatus: "GENERATED",
-              voucherGeneratedAt: new Date(),
-              tboVoucherData: voucherRes,
-              bookingDetailRaw: detail,
-              bookingDetailFetched: true,
-              bookingDetailFetchedAt: new Date(),
-              ...(detail?.InvoiceNo ? { invoiceNumber: detail.InvoiceNo } : {}),
-              ...(detail?.ConfirmationNo ? { confirmationNo: detail.ConfirmationNo } : {}),
-              // TraceId — spec line 15.
-              ...(detail?.TraceId ? { traceId: String(detail.TraceId) } : {}),
-              ...(detail?.TBOReferenceNo ? { tboReferenceNo: String(detail.TBOReferenceNo) } : {}),
-            },
-          });
+          try {
+            await SBTHotelBooking.findByIdAndUpdate(booking._id, {
+              $set: {
+                isHeld: false,
+                isVouchered: true,
+                status: "CONFIRMED",
+                voucherStatus: "GENERATED",
+                voucherGeneratedAt: new Date(),
+                tboVoucherData: voucherRes,
+                bookingDetailRaw: detail,
+                bookingDetailFetched: true,
+                bookingDetailFetchedAt: new Date(),
+                ...(detail?.InvoiceNo ? { invoiceNumber: detail.InvoiceNo } : {}),
+                ...(detail?.ConfirmationNo ? { confirmationNo: detail.ConfirmationNo } : {}),
+                // TraceId — spec line 15.
+                ...(detail?.TraceId ? { traceId: String(detail.TraceId) } : {}),
+                ...(detail?.TBOReferenceNo ? { tboReferenceNo: String(detail.TBOReferenceNo) } : {}),
+              },
+            });
+          } catch (persistErr) {
+            sbtLogger.error("[VOUCHER] Already-generated reconciliation $set failed", {
+              bookingId: booking.bookingId,
+              err: persistErr instanceof Error ? persistErr.message : String(persistErr),
+              stack: persistErr instanceof Error ? persistErr.stack : undefined,
+            });
+            throw persistErr;
+          }
           return res.json({
             ok: true,
             voucherStatus: "GENERATED",
@@ -2877,21 +2886,38 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
         }
       }
 
-      await SBTHotelBooking.findByIdAndUpdate(booking._id, {
-        $set: {
-          ...classified.derivedOnSuccess,
-          voucherGeneratedAt: new Date(),
-          tboVoucherData: voucherRes,
-          // TraceId — spec line 15. GenerateVoucher response carries the same TraceId from the session.
-          ...(gvr?.TraceId ? { traceId: String(gvr.TraceId) } : {}),
-          ...(resolvedTboReferenceNo ? { tboReferenceNo: resolvedTboReferenceNo } : {}),
-          ...(freshDetailRaw ? {
-            bookingDetailRaw: freshDetailRaw,
-            bookingDetailFetched: true,
-            bookingDetailFetchedAt: new Date(),
-          } : {}),
-        },
-      });
+      try {
+        await SBTHotelBooking.findByIdAndUpdate(booking._id, {
+          $set: {
+            ...classified.derivedOnSuccess,
+            voucherGeneratedAt: new Date(),
+            tboVoucherData: voucherRes,
+            // TraceId — spec line 15. GenerateVoucher response carries the same TraceId from the session.
+            ...(gvr?.TraceId ? { traceId: String(gvr.TraceId) } : {}),
+            ...(gvr?.InvoiceNumber ? { invoiceNumber: String(gvr.InvoiceNumber) }
+               : freshDetailRaw?.InvoiceNo ? { invoiceNumber: String(freshDetailRaw.InvoiceNo) } : {}),
+            ...(gvr?.ConfirmationNo ? { confirmationNo: String(gvr.ConfirmationNo) } : {}),
+            ...(resolvedTboReferenceNo ? { tboReferenceNo: resolvedTboReferenceNo } : {}),
+            ...(freshDetailRaw ? {
+              bookingDetailRaw: freshDetailRaw,
+              bookingDetailFetched: true,
+              bookingDetailFetchedAt: new Date(),
+            } : {}),
+          },
+        });
+        sbtLogger.info("[VOUCHER] Post-success persistence completed", {
+          bookingId: booking.bookingId,
+          invoiceNumber: gvr?.InvoiceNumber || freshDetailRaw?.InvoiceNo || null,
+          tboReferenceNo: resolvedTboReferenceNo,
+        });
+      } catch (persistErr) {
+        sbtLogger.error("[VOUCHER] Post-success $set failed — DB write threw", {
+          bookingId: booking.bookingId,
+          err: persistErr instanceof Error ? persistErr.message : String(persistErr),
+          stack: persistErr instanceof Error ? persistErr.stack : undefined,
+        });
+        throw persistErr;
+      }
       sbtLogger.info("Hotel hold booking vouchered", {
         bookingId: booking.bookingId,
         userId: req.user?.id,
@@ -3150,15 +3176,25 @@ router.post("/bookings/check-status", requireAuth, async (req: any, res: any) =>
     if (tboStatus === "confirmed" || tboStatus === "vouchered") {
       // Backfill the DB record
       const newStatus = booking.isHeld ? "HELD" : "CONFIRMED";
-      await SBTHotelBooking.findOneAndUpdate(
-        { clientReferenceId },
-        { $set: {
-            status: newStatus,
-            confirmationNo: detail.ConfirmationNo || booking.confirmationNo || "",
-            bookingRefNo: detail.BookingRefNo || booking.bookingRefNo || "",
-            ...(detail?.TBOReferenceNo ? { tboReferenceNo: String(detail.TBOReferenceNo) } : {}),
-          } },
-      ).catch(() => {});
+      try {
+        await SBTHotelBooking.findOneAndUpdate(
+          { clientReferenceId },
+          { $set: {
+              status: newStatus,
+              confirmationNo: detail.ConfirmationNo || booking.confirmationNo || "",
+              bookingRefNo: detail.BookingRefNo || booking.bookingRefNo || "",
+              ...(detail?.TBOReferenceNo ? { tboReferenceNo: String(detail.TBOReferenceNo) } : {}),
+            } },
+        );
+      } catch (persistErr) {
+        sbtLogger.error("[CHECK-STATUS] Reconciliation $set failed", {
+          clientReferenceId,
+          bookingId: booking.bookingId,
+          err: persistErr instanceof Error ? persistErr.message : String(persistErr),
+          stack: persistErr instanceof Error ? persistErr.stack : undefined,
+        });
+        throw persistErr;
+      }
       return res.json({
         found: true,
         bookingId: booking.bookingId,
