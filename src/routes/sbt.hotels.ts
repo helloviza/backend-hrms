@@ -707,12 +707,19 @@ async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
     CityList?: { Code: string; Name: string }[];
   };
   logTBOCall({ method: "HotelCityList", traceId: `city-${countryCode}`, request: tboPayload, response: data, durationMs: Date.now() - t0 });
+  // Build country code → name map from the cached country list.
+  // Cached at startup; lookup is O(1) per city.
+  const countryList = await getCachedCountryList();
+  const countryNameByCode = new Map<string, string>(
+    (countryList || []).map((c: any) => [String(c.Code).toUpperCase(), String(c.Name)])
+  );
+
   // TBO returns { Code, Name } — normalize to our CityEntry shape
-  const cities: CityEntry[] = (data?.CityList || []).map((c) => ({
+  const cities: CityEntry[] = (data?.CityList || []).map((c: any) => ({
     CityId: c.Code,
     CityName: c.Name,
     CountryCode: countryCode,
-    CountryName: "",
+    CountryName: countryNameByCode.get(String(countryCode).toUpperCase()) ?? "",
   }));
   cityCache.set(countryCode, { data: cities, ts: Date.now() });
   return cities;
