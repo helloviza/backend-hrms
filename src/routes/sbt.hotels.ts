@@ -3601,7 +3601,7 @@ async function pollCancelStatusBackground(
       const statusResult = statusData?.HotelChangeRequestStatusResult;
       cancelStatus = statusResult?.ChangeRequestStatus ?? 0;
       cancellationCharge = statusResult?.CancellationCharge || 0;
-      refundedAmount = statusResult?.RefundedAmount || 0;
+      refundedAmount = statusResult?.RefundAmount || 0;
 
       sbtLogger.info("[CANCEL-BG] Poll", { attempt: i + 1, cancelStatus, changeRequestId });
       if (cancelStatus === 3 || cancelStatus === 4) break;
@@ -3646,8 +3646,12 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const doc = await SBTHotelBooking.findOne({ _id: req.params.id, userId });
     if (!doc) return res.status(404).json({ error: "Booking not found" });
-    if (doc.status === "CANCELLED")
-      return res.status(409).json({ error: "Booking already cancelled" });
+    if (doc.status === "CANCELLED" || doc.status === "CANCEL_PENDING") {
+      const errMsg = doc.status === "CANCEL_PENDING"
+        ? "Cancellation already in progress."
+        : "Booking is already cancelled.";
+      return res.status(409).json({ ok: false, error: errMsg, message: errMsg });
+    }
 
     const numericBookingId = Number(doc.bookingId);
     const endUserIp = process.env.TBO_EndUserIp || "1.1.1.1";
