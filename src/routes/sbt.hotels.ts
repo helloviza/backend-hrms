@@ -3601,7 +3601,9 @@ async function pollCancelStatusBackground(
       const statusResult = statusData?.HotelChangeRequestStatusResult;
       cancelStatus = statusResult?.ChangeRequestStatus ?? 0;
       cancellationCharge = statusResult?.CancellationCharge || 0;
-      refundedAmount = statusResult?.RefundAmount || 0;
+      // TBO production returns RefundedAmount (with "ed"). Some spec docs say RefundAmount.
+      // Read both, prefer the production name; fall back to spec name if production ever changes.
+      refundedAmount = Number(statusResult?.RefundedAmount ?? statusResult?.RefundAmount ?? 0);
 
       sbtLogger.info("[CANCEL-BG] Poll", { attempt: i + 1, cancelStatus, changeRequestId });
       if (cancelStatus === 3 || cancelStatus === 4) break;
