@@ -6,7 +6,8 @@
 // whatsappService.ts, which manages its own internal browser via
 // whatsapp-web.js. Sharing causes session/page conflicts.
 
-import puppeteer, { type Browser } from "puppeteer";
+import puppeteer, { type Browser } from "puppeteer-core";
+import { getChromeLaunchOptions } from "../utils/chromeResolver.js";
 import logger from "../utils/logger.js";
 
 let browserPromise: Promise<Browser> | null = null;
@@ -19,22 +20,16 @@ async function getBrowser(): Promise<Browser> {
     browserPromise = null;
   }
 
-  const launchOpts = {
-    headless: true as const,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-    ],
-  };
-
   try {
-    browserPromise = puppeteer.launch(launchOpts);
-    const browser = await browserPromise;
-    logger.info("[EOD-render] Puppeteer browser launched successfully", {
-      executablePath: (browser as any).process?.()?.spawnfile,
+    const launchOpts = await getChromeLaunchOptions();
+    logger.info("[EOD-render] Launching Puppeteer browser", {
+      executablePath: launchOpts.executablePath,
+      env: process.env.NODE_ENV || "development",
     });
+
+    browserPromise = puppeteer.launch(launchOpts) as Promise<Browser>;
+    const browser = await browserPromise;
+    logger.info("[EOD-render] Puppeteer browser launched successfully");
     browser.on("disconnected", () => {
       logger.warn("[EOD-render] Puppeteer browser disconnected");
       browserPromise = null;
@@ -47,8 +42,7 @@ async function getBrowser(): Promise<Browser> {
       stack: err?.stack,
       name: err?.name,
       cause: err?.cause,
-      executablePath: (puppeteer as any).executablePath?.(),
-      args: launchOpts.args,
+      env: process.env.NODE_ENV,
     });
     throw err;
   }
