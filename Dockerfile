@@ -1,0 +1,78 @@
+# Backend container image for AWS App Runner.
+#
+# Build context: the apps/backend subtree (this is what App Runner sees from
+# the GitHub backend-hrms repo, which is the apps/backend/ subtree split of
+# the monorepo). All COPY paths are relative to this subtree, NOT the monorepo
+# root.
+#
+# Base: Debian Bookworm slim — has glibc + apt, easy to install Chromium deps.
+# @sparticuz/chromium ships a Chromium binary but expects the host to provide
+# NSS, NSPR, fontconfig, and a small set of GTK/X11 libs. App Runner's managed
+# Node.js runtime is missing these, which is why we switch to a custom image.
+
+FROM node:20-bookworm-slim
+
+# Chromium runtime libraries required by @sparticuz/chromium.
+# Keep this list aligned with puppeteer's documented Linux deps.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnss3 \
+    libnspr4 \
+    libdbus-1-3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    libatspi2.0-0 \
+    libxshmfence1 \
+    ca-certificates \
+    fonts-liberation \
+    libfontconfig1 \
+    libfreetype6 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Match the package manager declared in apps/backend/package.json (pnpm@8.15.4).
+# Pinning to pnpm@9 would also work, but staying on the declared major avoids
+# any lockfile drift surprises if a lockfile is later added to the subtree.
+RUN npm install -g pnpm@9
+
+WORKDIR /app
+
+# Copy the manifest first so the install layer is cached when only source changes.
+COPY package.json ./
+
+# Install dependencies.
+# - NODE_ENV=production is set so the package.json postinstall script
+#   (`npx puppeteer browsers install chrome`) takes its skip branch — we don't
+#   need native puppeteer's downloaded Chrome in production; chromeResolver
+#   uses @sparticuz/chromium when NODE_ENV=production.
+# - --prod=false forces devDependencies (typescript, etc.) to install anyway so
+#   the build step has tsc available. We strip them again with `pnpm prune --prod`
+#   after the build.
+# - --no-frozen-lockfile because the backend-hrms GitHub subtree does not
+#   contain pnpm-lock.yaml (the lockfile lives at the monorepo root).
+ENV NODE_ENV=production
+RUN pnpm install --prod=false --no-frozen-lockfile
+
+# Copy source after install so dependency layer is cached.
+COPY . .
+
+# Compile TypeScript → dist/  (the build script also copies src/data → dist/data)
+RUN pnpm build
+
+# Drop devDependencies from node_modules to keep the runtime image small.
+RUN pnpm prune --prod
+
+EXPOSE 8080
+ENV PORT=8080
+
+CMD ["node", "dist/server.js"]
