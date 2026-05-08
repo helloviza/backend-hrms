@@ -25,12 +25,17 @@ export async function getChromeLaunchOptions(): Promise<LaunchOptions> {
     "--disable-gpu",
   ];
 
+  // Generous protocol timeout for Fargate cold starts — Sparticuz Chromium
+  // unpack + whatsapp-web.js Client.inject can exceed puppeteer's 30s default.
+  const PROTOCOL_TIMEOUT = 180_000;
+
   if (isProduction) {
     const chromium = (await import("@sparticuz/chromium")).default;
     return {
       headless: true,
       args: [...chromium.args, ...baseArgs],
       executablePath: await chromium.executablePath(),
+      protocolTimeout: PROTOCOL_TIMEOUT,
     };
   }
 
@@ -41,5 +46,6 @@ export async function getChromeLaunchOptions(): Promise<LaunchOptions> {
     headless: true,
     args: baseArgs,
     executablePath: puppeteer.executablePath(),
+    protocolTimeout: PROTOCOL_TIMEOUT,
   };
 }
