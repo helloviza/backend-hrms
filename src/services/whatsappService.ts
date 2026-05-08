@@ -3,7 +3,7 @@ import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const QRCode = require("qrcode");
-import puppeteer from "puppeteer";
+import { getChromeLaunchOptions } from "../utils/chromeResolver.js";
 import { EodReportConfig, type IEodRecipient } from "../models/EodReportConfig.js";
 import logger from "../utils/logger.js";
 
@@ -31,22 +31,23 @@ class WhatsAppService {
     // and is no longer passed. EodReportConfig.waSession is now unused at read time
     // (still written by the 'authenticated' handler — harmless no-op).
 
+    const chromeOpts = await getChromeLaunchOptions();
+    logger.info("[WA] Launching whatsapp-web.js puppeteer", {
+      executablePath: chromeOpts.executablePath,
+      env: process.env.NODE_ENV || "development",
+    });
+
     this.client = new Client({
       authStrategy: new LocalAuth({ clientId: "plumtrips-eod" }),
       takeoverOnConflict: true,
       takeoverTimeoutMs: 10000,
       puppeteer: {
-        executablePath: puppeteer.executablePath(),
+        executablePath: chromeOpts.executablePath,
         headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-gpu",
-          // Removed: --single-process (causes "Navigating frame was detached")
-          // Removed: --no-zygote (paired with --single-process)
-          // Removed: --disable-accelerated-2d-canvas, --no-first-run (unnecessary)
-        ],
+        args: chromeOpts.args,
+        // Removed: --single-process (causes "Navigating frame was detached")
+        // Removed: --no-zygote (paired with --single-process)
+        // Removed: --disable-accelerated-2d-canvas, --no-first-run (unnecessary)
       },
     });
 
