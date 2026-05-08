@@ -104,13 +104,18 @@ function buildEmailHtml(
   if (!clientFacing && report.unpaidInvoices.length > 0) {
     const invoiceRows = report.unpaidInvoices
       .map((inv) => {
-        const rowBg = inv.pendingDays >= 7 ? "#FFF1F2" : "#FFFBEB";
+        const isOverdue = inv.overdueDays > 0;
+        const rowBg = isOverdue ? "#FFF1F2" : "#FFFBEB";
+        const overdueCell = isOverdue
+          ? `<td style="padding:8px 10px;font-size:12px;text-align:right;font-weight:700;color:#E11D48;">${inv.overdueDays}d</td>`
+          : `<td style="padding:8px 10px;font-size:12px;text-align:right;color:#94A3B8;">Not yet due</td>`;
         return `<tr style="background:${rowBg};border-bottom:1px solid #FEE2E2;">
           <td style="padding:8px 10px;font-size:12px;font-weight:600;color:#0F172A;">${inv.invoiceNo}</td>
           <td style="padding:8px 10px;font-size:12px;color:#475569;">${inv.clientName}</td>
           <td style="padding:8px 10px;font-size:12px;text-align:right;color:#0F172A;">${fmtInr(inv.grandTotal)}</td>
           <td style="padding:8px 10px;font-size:12px;color:#64748B;">${fmtDate(inv.dueDate)}</td>
-          <td style="padding:8px 10px;font-size:12px;text-align:right;font-weight:${inv.pendingDays >= 7 ? "700" : "400"};color:${inv.pendingDays >= 7 ? "#E11D48" : "#D97706"};">${inv.pendingDays}d</td>
+          <td style="padding:8px 10px;font-size:12px;text-align:right;color:#0F172A;">${inv.issuedDaysAgo}d</td>
+          ${overdueCell}
         </tr>`;
       })
       .join("");
@@ -127,7 +132,8 @@ function buildEmailHtml(
             <th style="padding:10px;text-align:left;font-size:11px;color:#94A3B8;font-weight:600;text-transform:uppercase;">Client</th>
             <th style="padding:10px;text-align:right;font-size:11px;color:#94A3B8;font-weight:600;text-transform:uppercase;">Amount</th>
             <th style="padding:10px;text-align:left;font-size:11px;color:#94A3B8;font-weight:600;text-transform:uppercase;">Due Date</th>
-            <th style="padding:10px;text-align:right;font-size:11px;color:#94A3B8;font-weight:600;text-transform:uppercase;">Days Pending</th>
+            <th style="padding:10px;text-align:right;font-size:11px;color:#94A3B8;font-weight:600;text-transform:uppercase;">Issued Days Ago</th>
+            <th style="padding:10px;text-align:right;font-size:11px;color:#94A3B8;font-weight:600;text-transform:uppercase;">Overdue Days</th>
           </tr>
         </thead>
         <tbody>${invoiceRows}</tbody>

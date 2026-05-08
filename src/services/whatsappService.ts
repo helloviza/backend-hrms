@@ -1,9 +1,10 @@
 // apps/backend/src/services/whatsappService.ts
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const QRCode = require("qrcode");
-import { EodReportConfig } from "../models/EodReportConfig.js";
+import puppeteer from "puppeteer";
+import { EodReportConfig, type IEodRecipient } from "../models/EodReportConfig.js";
 import logger from "../utils/logger.js";
 
 type WaStatus = "disconnected" | "qr_ready" | "connecting" | "connected" | "failed";
@@ -24,25 +25,27 @@ class WhatsAppService {
     this.status = "connecting";
     this.notifyStatus("connecting");
 
-    // Load persisted session from DB so QR re-scan is not needed after restarts
-    const config = await EodReportConfig.findOne().lean();
-    const savedSession = config?.waSession
-      ? JSON.parse(config.waSession)
-      : undefined;
+    // Note: LocalAuth persists the session to disk under
+    // apps/backend/.wwebjs_auth/session-plumtrips-eod/ — no DB session injection needed.
+    // The legacy `session:` constructor field was deprecated in whatsapp-web.js 1.16+
+    // and is no longer passed. EodReportConfig.waSession is now unused at read time
+    // (still written by the 'authenticated' handler — harmless no-op).
 
     this.client = new Client({
       authStrategy: new LocalAuth({ clientId: "plumtrips-eod" }),
-      session: savedSession,
+      takeoverOnConflict: true,
+      takeoverTimeoutMs: 10000,
       puppeteer: {
+        executablePath: puppeteer.executablePath(),
+        headless: true,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
           "--disable-dev-shm-usage",
-          "--disable-accelerated-2d-canvas",
-          "--no-first-run",
-          "--no-zygote",
-          "--single-process",
           "--disable-gpu",
+          // Removed: --single-process (causes "Navigating frame was detached")
+          // Removed: --no-zygote (paired with --single-process)
+          // Removed: --disable-accelerated-2d-canvas, --no-first-run (unnecessary)
         ],
       },
     });
@@ -54,8 +57,13 @@ class WhatsAppService {
         this.status = "qr_ready";
         logger.info("[WA] QR code generated — scan to connect");
         this.qrCallbacks.forEach((cb) => cb(png));
-      } catch (err) {
-        logger.error("[WA] QR generation error", { err });
+      } catch (err: any) {
+        logger.error("[WA] QR generation error", {
+          message: err?.message,
+          stack: err?.stack,
+          name: err?.name,
+          cause: err?.cause,
+        });
       }
     });
 
@@ -67,12 +75,21 @@ class WhatsAppService {
           { waSession: JSON.stringify(session), waConnected: true },
           { upsert: true },
         );
-      } catch (err) {
-        logger.error("[WA] Failed to save session to DB", { err });
+      } catch (err: any) {
+        logger.error("[WA] Failed to save session to DB", {
+          message: err?.message,
+          stack: err?.stack,
+          name: err?.name,
+          cause: err?.cause,
+        });
       }
     });
 
     this.client.on("ready", async () => {
+      // whatsapp-web.js fires 'ready' before its internal Store finishes hydrating.
+      // A 2s settle delay avoids "Cannot read properties of undefined (reading 'getChat')"
+      // race conditions on the very first sendMessage / getNumberId call.
+      await new Promise((resolve) => setTimeout(resolve, 2000));
       this.status = "connected";
       this.qrCode = null;
       logger.info("[WA] Client ready");
@@ -82,8 +99,13 @@ class WhatsAppService {
           { waConnected: true },
           { upsert: true },
         );
-      } catch (err) {
-        logger.error("[WA] Failed to update DB on ready", { err });
+      } catch (err: any) {
+        logger.error("[WA] Failed to update DB on ready", {
+          message: err?.message,
+          stack: err?.stack,
+          name: err?.name,
+          cause: err?.cause,
+        });
       }
       this.notifyStatus("connected");
     });
@@ -98,8 +120,13 @@ class WhatsAppService {
           { waConnected: false, waSession: "" },
           { upsert: true },
         );
-      } catch (err) {
-        logger.error("[WA] Failed to clear session in DB", { err });
+      } catch (err: any) {
+        logger.error("[WA] Failed to clear session in DB", {
+          message: err?.message,
+          stack: err?.stack,
+          name: err?.name,
+          cause: err?.cause,
+        });
       }
       this.notifyStatus("disconnected");
       this.client = null;
@@ -114,10 +141,15 @@ class WhatsAppService {
 
     try {
       await this.client.initialize();
-    } catch (err) {
+    } catch (err: any) {
       this.status = "failed";
       this.client = null;
-      logger.error("[WA] Client initialize error", { err });
+      logger.error("[WA] Client initialize error", {
+        message: err?.message,
+        stack: err?.stack,
+        name: err?.name,
+        cause: err?.cause,
+      });
       throw err;
     }
   }
@@ -140,11 +172,44 @@ class WhatsAppService {
     await this.client.sendMessage(to, message);
   }
 
-  async sendToAllRecipients(
+  /**
+   * Resolve a recipient to the proper whatsapp-web.js chat ID:
+   *   - group: returns r.groupId verbatim (already in `<id>@g.us` form)
+   *   - individual: validates the number with getNumberId() and returns the
+   *     canonical `<wid>@c.us`. Returns null if the number is not registered
+   *     on WhatsApp (caller should record failure and skip).
+   */
+  private async resolveChatId(r: IEodRecipient): Promise<string | null> {
+    if (r.type === "group") return r.groupId;
+
+    const cleanNumber = String(r.number).replace(/[^0-9]/g, "");
+    if (!cleanNumber) {
+      logger.warn("[WA] Recipient has no digits in number", { name: r.name });
+      return null;
+    }
+
+    const numberId = await this.client!.getNumberId(cleanNumber);
+    if (!numberId) {
+      logger.warn("[WA] Number not registered on WhatsApp", {
+        name: r.name,
+        number: cleanNumber,
+      });
+      return null;
+    }
+    return numberId._serialized;
+  }
+
+  async sendToRecipients(
     message: string,
+    recipientsOverride?: IEodRecipient[],
   ): Promise<{ sent: number; failed: number; errors: string[] }> {
-    const config = await EodReportConfig.findOne().lean();
-    const recipients = (config?.recipients ?? []).filter((r) => r.active !== false);
+    let recipients: IEodRecipient[];
+    if (recipientsOverride) {
+      recipients = recipientsOverride.filter((r) => r.active !== false);
+    } else {
+      const config = await EodReportConfig.findOne().lean();
+      recipients = (config?.recipients ?? []).filter((r) => r.active !== false);
+    }
 
     // Auto-reconnect if client was destroyed (e.g. hot-reload, disconnected event)
     if (!this.client) {
@@ -168,22 +233,98 @@ class WhatsAppService {
 
     for (const r of recipients) {
       try {
-        let to: string;
-        if (r.type === "group") {
-          to = r.groupId;
-        } else {
-          // Normalise to E.164 digits + @c.us
-          let num = r.number.replace(/\D/g, "");
-          if (num.startsWith("0")) num = "91" + num.slice(1);
-          if (!num.startsWith("91") && num.length === 10) num = "91" + num;
-          to = num + "@c.us";
+        const to = await this.resolveChatId(r);
+        if (!to) {
+          failed++;
+          errors.push(`[${r.name}] not on WhatsApp`);
+          continue;
         }
         await this.client!.sendMessage(to, message);
         sent++;
+        logger.info("[WA] Text sent", { name: r.name, to });
       } catch (err: any) {
         failed++;
         errors.push(`[${r.name}] ${err?.message ?? "Send failed"}`);
-        logger.error("[WA] Failed to send to recipient", { name: r.name, err });
+        logger.error("[WA] Failed to send to recipient", {
+          name: r.name,
+          number: r.number,
+          message: err?.message,
+          stack: err?.stack,
+          errName: err?.name,
+          cause: err?.cause,
+        });
+      }
+    }
+
+    return { sent, failed, errors };
+  }
+
+  /** @deprecated use sendToRecipients() instead */
+  async sendToAllRecipients(
+    message: string,
+  ): Promise<{ sent: number; failed: number; errors: string[] }> {
+    return this.sendToRecipients(message);
+  }
+
+  async sendImageToRecipients(
+    imageBuffer: Buffer,
+    caption: string,
+    recipientsOverride?: IEodRecipient[],
+  ): Promise<{ sent: number; failed: number; errors: string[] }> {
+    let recipients: IEodRecipient[];
+    if (recipientsOverride) {
+      recipients = recipientsOverride.filter((r) => r.active !== false);
+    } else {
+      const config = await EodReportConfig.findOne().lean();
+      recipients = (config?.recipients ?? []).filter((r) => r.active !== false);
+    }
+
+    if (!this.client) {
+      logger.warn("[WA] Client is null, reinitializing for image send...");
+      await this.initialize();
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+
+    if (!this.client) {
+      return {
+        sent: 0,
+        failed: recipients.length,
+        errors: recipients.map((r: any) => `[${r.name}] WhatsApp client not initialized`),
+      };
+    }
+
+    const media = new MessageMedia(
+      "image/png",
+      imageBuffer.toString("base64"),
+      "plumtrips-eod.png",
+    );
+
+    let sent = 0;
+    let failed = 0;
+    const errors: string[] = [];
+
+    for (const r of recipients) {
+      try {
+        const to = await this.resolveChatId(r);
+        if (!to) {
+          failed++;
+          errors.push(`[${r.name}] not on WhatsApp`);
+          continue;
+        }
+        await this.client!.sendMessage(to, media, { caption });
+        sent++;
+        logger.info("[WA] Image sent", { name: r.name, to });
+      } catch (err: any) {
+        failed++;
+        errors.push(`[${r.name}] ${err?.message ?? "Send failed"}`);
+        logger.error("[WA] Failed to send image to recipient", {
+          name: r.name,
+          number: r.number,
+          message: err?.message,
+          stack: err?.stack,
+          errName: err?.name,
+          cause: err?.cause,
+        });
       }
     }
 
@@ -223,8 +364,13 @@ class WhatsAppService {
         { waConnected: false, waSession: "" },
         { upsert: true },
       );
-    } catch (err) {
-      logger.error("[WA] Failed to clear session on disconnect", { err });
+    } catch (err: any) {
+      logger.error("[WA] Failed to clear session on disconnect", {
+        message: err?.message,
+        stack: err?.stack,
+        name: err?.name,
+        cause: err?.cause,
+      });
     }
     this.notifyStatus("disconnected");
   }
