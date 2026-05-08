@@ -45,6 +45,7 @@ class WhatsAppService {
         executablePath: chromeOpts.executablePath,
         headless: true,
         args: chromeOpts.args,
+        protocolTimeout: chromeOpts.protocolTimeout,
         // Removed: --single-process (causes "Navigating frame was detached")
         // Removed: --no-zygote (paired with --single-process)
         // Removed: --disable-accelerated-2d-canvas, --no-first-run (unnecessary)
