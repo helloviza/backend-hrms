@@ -14,6 +14,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import Invoice from "../models/Invoice.js";
 import User from "../models/User.js";
+import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -46,11 +47,12 @@ function buildSearchFilter(query: Record<string, any>) {
   // createdBy is stored as a plain string (String(user._id))
   if (query.createdBy) filter.createdBy = String(query.createdBy);
 
-  // Bug 1+2 fix: filter bookingDate (what the UI column shows), and include full last day
+  // Filter bookingDate (what the UI column shows). YYYY-MM-DD inputs are
+  // interpreted as IST calendar days; full last day is included.
   if (query.dateFrom || query.dateTo) {
     filter.bookingDate = {};
-    if (query.dateFrom) filter.bookingDate.$gte = new Date(query.dateFrom);
-    if (query.dateTo)   filter.bookingDate.$lte = new Date(`${query.dateTo}T23:59:59.999Z`);
+    if (query.dateFrom) filter.bookingDate.$gte = parseISTStart(query.dateFrom);
+    if (query.dateTo)   filter.bookingDate.$lte = parseISTEnd(query.dateTo);
   }
 
   if (query.search) {

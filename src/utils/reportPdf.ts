@@ -342,27 +342,30 @@ export async function generateReportPdf(
       y += 12;
 
       const invCols = [
-        { x: L, w: 120 },
-        { x: L + 120, w: 160 },
-        { x: L + 280, w: 100 },
-        { x: L + 380, w: 90 },
-        { x: L + 470, w: 80 },
+        { x: L, w: 110 },
+        { x: L + 110, w: 140 },
+        { x: L + 250, w: 90 },
+        { x: L + 340, w: 80 },
+        { x: L + 420, w: 70 },
+        { x: L + 490, w: 70 },
       ];
-      const invHdrs = ["Invoice No", "Client", "Amount", "Due Date", "Days Pending"];
+      const invHdrs = ["Invoice No", "Client", "Amount", "Due Date", "Issued d", "Overdue d"];
       drawTableRow(y, invCols.map((c, i) => ({ ...c, text: invHdrs[i], align: i > 1 ? ("right" as const) : ("left" as const) })), "#FEF3C7", "#92400E", 8, true);
       y += 16;
 
       for (let i = 0; i < reportData.unpaidInvoices.length; i++) {
         const inv = reportData.unpaidInvoices[i];
-        const bg = inv.pendingDays >= 7 ? "#FFF1F2" : (i % 2 === 0 ? C_WHITE : C_BG);
+        const isOverdue = inv.overdueDays > 0;
+        const bg = isOverdue ? "#FFF1F2" : (i % 2 === 0 ? C_WHITE : C_BG);
         drawTableRow(
           y,
           [
-            { x: L, w: 120, text: inv.invoiceNo, align: "left" },
-            { x: L + 120, w: 160, text: truncStr(inv.clientName, 22), align: "left" },
-            { x: L + 280, w: 100, text: fmtInr(inv.grandTotal), align: "right" },
-            { x: L + 380, w: 90, text: fmtDate(inv.dueDate), align: "right" },
-            { x: L + 470, w: 80, text: `${inv.pendingDays}d`, align: "right" },
+            { x: L, w: 110, text: inv.invoiceNo, align: "left" },
+            { x: L + 110, w: 140, text: truncStr(inv.clientName, 22), align: "left" },
+            { x: L + 250, w: 90, text: fmtInr(inv.grandTotal), align: "right" },
+            { x: L + 340, w: 80, text: fmtDate(inv.dueDate), align: "right" },
+            { x: L + 420, w: 70, text: `${inv.issuedDaysAgo}d`, align: "right" },
+            { x: L + 490, w: 70, text: isOverdue ? `${inv.overdueDays}d` : "—", align: "right" },
           ],
           bg, C_BLACK, 8,
         );

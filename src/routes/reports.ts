@@ -9,8 +9,8 @@ import ManualBooking from "../models/ManualBooking.js";
 import Invoice from "../models/Invoice.js";
 import ReportSchedule from "../models/ReportSchedule.js";
 import User from "../models/User.js";
-import BillingPermission from "../models/BillingPermission.js";
 import { sendReportEmail } from "../utils/reportMailer.js";
+import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -90,9 +90,11 @@ export interface UnpaidInvoice {
   invoiceNo: string;
   clientName: string;
   grandTotal: number;
+  invoiceDate: Date;
   generatedAt: Date;
   dueDate: Date | null;
-  pendingDays: number;
+  issuedDaysAgo: number;
+  overdueDays: number;
 }
 
 export interface ByPartnerRow {
@@ -101,6 +103,7 @@ export interface ByPartnerRow {
   totalActual: number;
   totalQuoted: number;
   totalBaseProfit: number;
+  avgMargin: number;
 }
 
 export interface ByEmployeeRow {
@@ -132,21 +135,34 @@ export interface ReportSummary {
 export async function getReportData(filters: {
   dateFrom?: string;
   dateTo?: string;
+  createdAtFrom?: string;
+  createdAtTo?: string;
   workspaceId?: string;
   type?: string;
   status?: string;
 }): Promise<ReportSummary> {
   const match: Record<string, any> = {};
 
+  // Primary filter — when bookings were transacted (canonical business date).
+  // YYYY-MM-DD inputs are interpreted as IST calendar days.
   if (filters.dateFrom || filters.dateTo) {
-    match.createdAt = {};
-    if (filters.dateFrom) match.createdAt.$gte = new Date(filters.dateFrom);
-    if (filters.dateTo) {
-      const end = new Date(filters.dateTo);
-      end.setHours(23, 59, 59, 999);
-      match.createdAt.$lte = end;
-    }
+    match.bookingDate = {};
+    if (filters.dateFrom) match.bookingDate.$gte = parseISTStart(filters.dateFrom);
+    if (filters.dateTo)   match.bookingDate.$lte = parseISTEnd(filters.dateTo);
   }
+
+  // Optional secondary filter — when records were entered into the system.
+  // ANDed with bookingDate to surface delayed entries (e.g., bookings transacted in
+  // May but entered in June).
+  if (filters.createdAtFrom || filters.createdAtTo) {
+    match.createdAt = {};
+    if (filters.createdAtFrom) match.createdAt.$gte = parseISTStart(filters.createdAtFrom);
+    if (filters.createdAtTo)   match.createdAt.$lte = parseISTEnd(filters.createdAtTo);
+  }
+
+  // Exclude soft-deleted bookings from every aggregation.
+  match.isActive = { $ne: false };
+
   if (filters.workspaceId) {
     try {
       match.workspaceId = new mongoose.Types.ObjectId(filters.workspaceId);
@@ -233,7 +249,6 @@ export async function getReportData(filters: {
           totalDiff: { $sum: "$pricing.diff" },
           totalGST: { $sum: "$pricing.gstAmount" },
           totalBaseProfit: { $sum: "$pricing.basePrice" },
-          avgMarginPercent: { $avg: "$pricing.profitMargin" },
           pendingCount: { $sum: { $cond: [{ $eq: ["$status", "PENDING"] }, 1, 0] } },
           wipCount: { $sum: { $cond: [{ $eq: ["$status", "WIP"] }, 1, 0] } },
           confirmedCount: { $sum: { $cond: [{ $eq: ["$status", "CONFIRMED"] }, 1, 0] } },
@@ -255,7 +270,6 @@ export async function getReportData(filters: {
           totalDiff: { $sum: "$pricing.diff" },
           totalGST: { $sum: "$pricing.gstAmount" },
           totalBaseProfit: { $sum: "$pricing.basePrice" },
-          avgMargin: { $avg: "$pricing.profitMargin" },
           invoicedAmount: {
             $sum: {
               $cond: [{ $eq: ["$status", "INVOICED"] }, "$pricing.grandTotal", 0],
@@ -264,6 +278,22 @@ export async function getReportData(filters: {
           pendingAmount: {
             $sum: {
               $cond: [{ $ne: ["$status", "INVOICED"] }, "$pricing.grandTotal", 0],
+            },
+          },
+        },
+      },
+      {
+        $addFields: {
+          avgMargin: {
+            $let: {
+              vars: { netSales: { $subtract: ["$totalQuoted", "$totalGST"] } },
+              in: {
+                $cond: [
+                  { $gt: ["$$netSales", 0] },
+                  { $multiply: [{ $divide: ["$totalBaseProfit", "$$netSales"] }, 100] },
+                  0,
+                ],
+              },
             },
           },
         },
@@ -292,7 +322,7 @@ export async function getReportData(filters: {
           totalDiff: 1,
           totalGST: 1,
           totalBaseProfit: 1,
-          avgMargin: { $ifNull: ["$avgMargin", 0] },
+          avgMargin: 1,
           invoicedAmount: 1,
           pendingAmount: 1,
         },
@@ -312,7 +342,6 @@ export async function getReportData(filters: {
           totalDiff: { $sum: "$pricing.diff" },
           totalGST: { $sum: "$pricing.gstAmount" },
           totalBaseProfit: { $sum: "$pricing.basePrice" },
-          avgMargin: { $avg: "$pricing.profitMargin" },
         },
       },
       {
@@ -324,7 +353,18 @@ export async function getReportData(filters: {
           totalDiff: 1,
           totalGST: 1,
           totalBaseProfit: 1,
-          avgMargin: { $ifNull: ["$avgMargin", 0] },
+          avgMargin: {
+            $let: {
+              vars: { netSales: { $subtract: ["$totalQuoted", "$totalGST"] } },
+              in: {
+                $cond: [
+                  { $gt: ["$$netSales", 0] },
+                  { $multiply: [{ $divide: ["$totalBaseProfit", "$$netSales"] }, 100] },
+                  0,
+                ],
+              },
+            },
+          },
         },
       },
       { $sort: { totalQuoted: -1 } },
@@ -338,9 +378,9 @@ export async function getReportData(filters: {
           _id: "$bookedBy",
           bookings: { $sum: 1 },
           totalQuoted: { $sum: "$pricing.quotedPrice" },
+          totalGST: { $sum: "$pricing.gstAmount" },
           totalDiff: { $sum: "$pricing.diff" },
           totalBaseProfit: { $sum: "$pricing.basePrice" },
-          avgMargin: { $avg: "$pricing.profitMargin" },
         },
       },
       {
@@ -366,7 +406,18 @@ export async function getReportData(filters: {
           totalQuoted: 1,
           totalDiff: 1,
           totalBaseProfit: 1,
-          avgMargin: { $ifNull: ["$avgMargin", 0] },
+          avgMargin: {
+            $let: {
+              vars: { netSales: { $subtract: ["$totalQuoted", "$totalGST"] } },
+              in: {
+                $cond: [
+                  { $gt: ["$$netSales", 0] },
+                  { $multiply: [{ $divide: ["$totalBaseProfit", "$$netSales"] }, 100] },
+                  0,
+                ],
+              },
+            },
+          },
         },
       },
       { $sort: { bookings: -1 } },
@@ -404,8 +455,8 @@ export async function getReportData(filters: {
           bookings: { $sum: 1 },
           totalQuoted: { $sum: "$pricing.quotedPrice" },
           totalActual: { $sum: "$pricing.actualPrice" },
+          totalGST: { $sum: "$pricing.gstAmount" },
           totalBaseProfit: { $sum: "$pricing.basePrice" },
-          avgMargin: { $avg: "$pricing.profitMargin" },
         },
       },
       {
@@ -415,7 +466,18 @@ export async function getReportData(filters: {
           totalQuoted: 1,
           totalActual: 1,
           totalBaseProfit: 1,
-          avgMargin: { $ifNull: ["$avgMargin", 0] },
+          avgMargin: {
+            $let: {
+              vars: { netSales: { $subtract: ["$totalQuoted", "$totalGST"] } },
+              in: {
+                $cond: [
+                  { $gt: ["$$netSales", 0] },
+                  { $multiply: [{ $divide: ["$totalBaseProfit", "$$netSales"] }, 100] },
+                  0,
+                ],
+              },
+            },
+          },
         },
       },
       { $sort: { _id: -1 } },
@@ -430,6 +492,7 @@ export async function getReportData(filters: {
           bookings: { $sum: 1 },
           totalActual: { $sum: "$pricing.actualPrice" },
           totalQuoted: { $sum: "$pricing.quotedPrice" },
+          totalGST: { $sum: "$pricing.gstAmount" },
           totalBaseProfit: { $sum: "$pricing.basePrice" },
         },
       },
@@ -440,12 +503,25 @@ export async function getReportData(filters: {
           totalActual: 1,
           totalQuoted: 1,
           totalBaseProfit: 1,
+          avgMargin: {
+            $let: {
+              vars: { netSales: { $subtract: ["$totalQuoted", "$totalGST"] } },
+              in: {
+                $cond: [
+                  { $gt: ["$$netSales", 0] },
+                  { $multiply: [{ $divide: ["$totalBaseProfit", "$$netSales"] }, 100] },
+                  0,
+                ],
+              },
+            },
+          },
         },
       },
       { $sort: { totalActual: -1 } },
     ]),
 
-    // Unpaid invoices
+    // Unpaid invoices — independent of booking-date filters; sorted oldest-first
+    // by invoiceDate so the most overdue rise to the top.
     Invoice.aggregate([
       { $match: { status: { $in: ["DRAFT", "SENT"] } } },
       {
@@ -453,166 +529,131 @@ export async function getReportData(filters: {
           invoiceId: { $toString: "$_id" },
           invoiceNo: 1,
           grandTotal: 1,
+          invoiceDate: 1,
           generatedAt: 1,
           dueDate: 1,
           clientName: { $ifNull: ["$clientDetails.companyName", "Unknown"] },
-          pendingDays: {
+          issuedDaysAgo: {
             $toInt: {
               $divide: [
-                { $subtract: [new Date(), "$generatedAt"] },
+                { $subtract: [new Date(), "$invoiceDate"] },
                 1000 * 60 * 60 * 24,
               ],
             },
           },
+          overdueDays: {
+            $cond: [
+              { $ifNull: ["$dueDate", false] },
+              {
+                $max: [
+                  0,
+                  {
+                    $toInt: {
+                      $divide: [
+                        { $subtract: [new Date(), "$dueDate"] },
+                        1000 * 60 * 60 * 24,
+                      ],
+                    },
+                  },
+                ],
+              },
+              0,
+            ],
+          },
         },
       },
-      { $sort: { pendingDays: -1 } },
+      { $sort: { issuedDaysAgo: -1 } },
     ]),
   ]);
 
-  // byEmployee: SOURCE 1 — super admins always appear
-  const superAdmins = await User.find(
-    { roles: { $in: ["SUPERADMIN"] } },
-    { _id: 1, firstName: 1, lastName: 1, name: 1, email: 1 },
-  ).lean();
-
-  // byEmployee: SOURCE 2 — users explicitly granted manualBookings billing access
-  const grants = await BillingPermission.find(
-    { pages: { $in: ["manualBookings"] } },
-    { userId: 1 },
-  ).lean();
-  const grantedUserIds = grants.map((g) => g.userId).filter(Boolean);
-  const grantedUsers = grantedUserIds.length
-    ? await User.find(
-        { _id: { $in: grantedUserIds } },
-        { _id: 1, firstName: 1, lastName: 1, name: 1, email: 1 },
-      ).lean()
-    : [];
-
-  // Merge and deduplicate by _id
-  const seen = new Set<string>();
-  const staffUsers = [...superAdmins, ...grantedUsers].filter((u) => {
-    const key = String(u._id);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-
-  // Primary aggregation: group by bookedBy (ObjectId)
-  const bookingsByUser = await ManualBooking.aggregate([
+  // byEmployee — derive directly from bookings in the filtered range. Each user
+  // who actually has bookings shows up; users with 0 bookings are filtered out
+  // by the aggregation. Ordered by booking volume desc.
+  const employeeAgg = await ManualBooking.aggregate([
     { $match: match },
     {
       $group: {
         _id: "$bookedBy",
         bookings: { $sum: 1 },
         totalQuoted: { $sum: "$pricing.quotedPrice" },
+        totalGST: { $sum: "$pricing.gstAmount" },
         totalBaseProfit: { $sum: "$pricing.basePrice" },
-        avgMargin: { $avg: "$pricing.profitMargin" },
+        lastBookingDate: { $max: "$bookingDate" },
       },
     },
-  ]);
-
-  // Fallback aggregation: group by createdByEmail (for bookings where bookedBy is null/mismatched)
-  const bookingsByEmail = await ManualBooking.aggregate([
-    { $match: match },
     {
-      $group: {
-        _id: "$createdByEmail",
-        bookings: { $sum: 1 },
-        totalQuoted: { $sum: "$pricing.quotedPrice" },
-        totalBaseProfit: { $sum: "$pricing.basePrice" },
-        avgMargin: { $avg: "$pricing.profitMargin" },
+      $addFields: {
+        avgMargin: {
+          $let: {
+            vars: { netSales: { $subtract: ["$totalQuoted", "$totalGST"] } },
+            in: {
+              $cond: [
+                { $gt: ["$$netSales", 0] },
+                { $multiply: [{ $divide: ["$totalBaseProfit", "$$netSales"] }, 100] },
+                0,
+              ],
+            },
+          },
+        },
       },
     },
+    { $match: { _id: { $ne: null } } },
+    { $sort: { bookings: -1 } },
   ]);
 
-  // Tertiary aggregation: group by createdBy (string userId)
-  const bookingsByCreator = await ManualBooking.aggregate([
-    { $match: { ...match, createdBy: { $exists: true, $ne: "" } } },
-    {
-      $group: {
-        _id: "$createdBy",
-        bookings: { $sum: 1 },
-        totalQuoted: { $sum: "$pricing.quotedPrice" },
-        totalBaseProfit: { $sum: "$pricing.basePrice" },
-        avgMargin: { $avg: "$pricing.profitMargin" },
-      },
-    },
-  ]);
-
-  const bookingMap = new Map<string, (typeof bookingsByUser)[0]>(
-    bookingsByUser.map((r) => [String(r._id), r]),
-  );
-  const creatorMap = new Map<string, (typeof bookingsByCreator)[0]>(
-    bookingsByCreator.map((r) => [String(r._id), r]),
-  );
-  const emailMap = new Map<string, (typeof bookingsByEmail)[0]>(
-    bookingsByEmail.map((r) => [String(r._id).toLowerCase(), r]),
+  const userIds = employeeAgg
+    .map((r) => r._id)
+    .filter((id) => id && mongoose.Types.ObjectId.isValid(id));
+  const userDocs = userIds.length
+    ? await User.find(
+        { _id: { $in: userIds } },
+        { _id: 1, firstName: 1, lastName: 1, name: 1, email: 1 },
+      ).lean()
+    : [];
+  const userMap = new Map<string, (typeof userDocs)[number]>(
+    userDocs.map((u) => [String(u._id), u]),
   );
 
   const now = Date.now();
 
-  const byEmployee: ByEmployeeRow[] = await Promise.all(
-    staffUsers.map(async (u) => {
-      const uid = String(u._id);
-      const userEmail = ((u as any).email ?? "").toLowerCase();
-      // Prefer ObjectId match; fall back to createdBy string; fall back to email match
-      const agg = bookingMap.get(uid) ?? creatorMap.get(uid) ?? emailMap.get(userEmail);
+  const byEmployee: ByEmployeeRow[] = employeeAgg.map((row) => {
+    const uid = String(row._id);
+    const u = userMap.get(uid);
+    const staffName = u
+      ? (u as any).firstName || (u as any).lastName
+        ? `${(u as any).firstName ?? ""} ${(u as any).lastName ?? ""}`.trim()
+        : (u as any).name ?? "Unknown"
+      : "Unknown";
 
-      if ((u as any).email?.toLowerCase().includes("imran")) {
-        console.log("[DEBUG IMRAN]", {
-          uid,
-          userEmail,
-          bookingMapHas: bookingMap.has(uid),
-          emailMapHas: emailMap.has(userEmail),
-          creatorMapHas: creatorMap.has(uid),
-          bookingMapKeys: [...bookingMap.keys()].slice(0, 5),
-          emailMapKeys: [...emailMap.keys()].slice(0, 5),
-          creatorMapKeys: [...creatorMap.keys()].slice(0, 5),
-        });
-      }
+    const lastBookingDate = row.lastBookingDate ?? null;
+    const daysSince = lastBookingDate
+      ? Math.floor((now - new Date(lastBookingDate).getTime()) / 86_400_000)
+      : 999;
+    const activityStatus: "ACTIVE" | "SLOW" | "IDLE" =
+      daysSince <= 7 ? "ACTIVE" : daysSince <= 30 ? "SLOW" : "IDLE";
 
-      const lastDoc = await ManualBooking.findOne(
-        { $or: [{ bookedBy: u._id }, { createdByEmail: (u as any).email }] },
-        { createdAt: 1 },
-        { sort: { createdAt: -1 } },
-      ).lean();
-
-      const lastBookingDate = lastDoc ? lastDoc.createdAt as Date : null;
-      const daysSince = lastBookingDate
-        ? Math.floor((now - new Date(lastBookingDate).getTime()) / 86_400_000)
-        : 999;
-
-      const activityStatus: "ACTIVE" | "SLOW" | "IDLE" =
-        daysSince <= 7 ? "ACTIVE" : daysSince <= 30 ? "SLOW" : "IDLE";
-
-      const staffName =
-        (u as any).firstName || (u as any).lastName
-          ? `${(u as any).firstName ?? ""} ${(u as any).lastName ?? ""}`.trim()
-          : (u as any).name ?? "Unknown";
-
-      return {
-        userId: uid,
-        staffName,
-        staffEmail: (u as any).email ?? "",
-        bookings: agg?.bookings ?? 0,
-        totalQuoted: agg?.totalQuoted ?? 0,
-        totalBaseProfit: agg?.totalBaseProfit ?? 0,
-        avgMargin: parseFloat(((agg?.avgMargin ?? 0) as number).toFixed(2)),
-        lastBookingDate,
-        activityStatus,
-      };
-    }),
-  );
-
-  byEmployee.sort((a, b) => {
-    if (b.bookings !== a.bookings) return b.bookings - a.bookings;
-    const aDate = a.lastBookingDate ? new Date(a.lastBookingDate).getTime() : 0;
-    const bDate = b.lastBookingDate ? new Date(b.lastBookingDate).getTime() : 0;
-    return bDate - aDate;
+    return {
+      userId: uid,
+      staffName,
+      staffEmail: (u as any)?.email ?? "",
+      bookings: row.bookings,
+      totalQuoted: row.totalQuoted ?? 0,
+      totalBaseProfit: row.totalBaseProfit ?? 0,
+      avgMargin: parseFloat(((row.avgMargin ?? 0) as number).toFixed(2)),
+      lastBookingDate,
+      activityStatus,
+    };
   });
 
   const ov = overviewResult[0] || {};
+
+  // Margin on Net Sales (investor-grade): (gross profit / (revenue - GST)) × 100.
+  // Computed as a weighted ratio across all bookings, not a mean of per-booking percents.
+  const ovNetSales = (ov.totalQuoted ?? 0) - (ov.totalGST ?? 0);
+  const avgMarginPercent =
+    ovNetSales > 0
+      ? parseFloat((((ov.totalBaseProfit ?? 0) / ovNetSales) * 100).toFixed(2))
+      : 0;
 
   return {
     overview: {
@@ -622,7 +663,7 @@ export async function getReportData(filters: {
       totalDiff: ov.totalDiff ?? 0,
       totalGST: ov.totalGST ?? 0,
       totalBaseProfit: ov.totalBaseProfit ?? 0,
-      avgMarginPercent: parseFloat((ov.avgMarginPercent ?? 0).toFixed(2)),
+      avgMarginPercent,
       pendingCount: ov.pendingCount ?? 0,
       wipCount: ov.wipCount ?? 0,
       confirmedCount: ov.confirmedCount ?? 0,
@@ -644,8 +685,11 @@ export async function getReportData(filters: {
 
 router.get("/summary", requirePermission("reports", "READ"), async (req, res, next) => {
   try {
-    const { dateFrom, dateTo, workspaceId, type, status } = req.query as Record<string, string>;
-    const data = await getReportData({ dateFrom, dateTo, workspaceId, type, status });
+    const { dateFrom, dateTo, createdAtFrom, createdAtTo, workspaceId, type, status } =
+      req.query as Record<string, string>;
+    const data = await getReportData({
+      dateFrom, dateTo, createdAtFrom, createdAtTo, workspaceId, type, status,
+    });
     res.json(data);
   } catch (err) {
     next(err);
@@ -669,9 +713,12 @@ function fmtNum(n: number | null | undefined): number {
 
 router.get("/export", requirePermission("reports", "FULL"), async (req, res, next) => {
   try {
-    const { dateFrom, dateTo, workspaceId, type, status, format } = req.query as Record<string, string>;
+    const { dateFrom, dateTo, createdAtFrom, createdAtTo, workspaceId, type, status, format } =
+      req.query as Record<string, string>;
 
-    const data = await getReportData({ dateFrom, dateTo, workspaceId, type, status });
+    const data = await getReportData({
+      dateFrom, dateTo, createdAtFrom, createdAtTo, workspaceId, type, status,
+    });
 
     const fname = `plumtrips-report-${dateFrom || "all"}-${dateTo || "all"}`;
 
@@ -798,11 +845,19 @@ router.get("/export", requirePermission("reports", "FULL"), async (req, res, nex
 
     // Sheet 7 — Unpaid
     const s7 = wb.addWorksheet("Unpaid");
-    boldHeader(s7, ["Invoice No", "Client", "Grand Total", "Generated At", "Due Date", "Days Pending"]);
-    setColWidths(s7, [18, 30, 16, 16, 14, 14]);
+    boldHeader(s7, ["Invoice No", "Client", "Grand Total", "Invoice Date", "Due Date", "Issued Days Ago", "Overdue Days"]);
+    setColWidths(s7, [18, 30, 16, 14, 14, 16, 14]);
     moneyCol(s7, [3]);
     data.unpaidInvoices.forEach((r) =>
-      s7.addRow([r.invoiceNo, r.clientName, fmtNum(r.grandTotal), fmtDateDMY(r.generatedAt), r.dueDate ? fmtDateDMY(r.dueDate) : "", r.pendingDays])
+      s7.addRow([
+        r.invoiceNo,
+        r.clientName,
+        fmtNum(r.grandTotal),
+        fmtDateDMY(r.invoiceDate),
+        r.dueDate ? fmtDateDMY(r.dueDate) : "",
+        r.issuedDaysAgo,
+        r.overdueDays,
+      ]),
     );
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
@@ -822,6 +877,8 @@ router.post("/send-now", requirePermission("reports", "WRITE"), async (req, res,
       recipients,
       dateFrom,
       dateTo,
+      createdAtFrom,
+      createdAtTo,
       workspaceId,
       type,
       // includeUnpaid intentionally kept for future use but we always include
@@ -829,6 +886,8 @@ router.post("/send-now", requirePermission("reports", "WRITE"), async (req, res,
       recipients: string[];
       dateFrom?: string;
       dateTo?: string;
+      createdAtFrom?: string;
+      createdAtTo?: string;
       workspaceId?: string;
       type?: string;
       includeUnpaid?: boolean;
@@ -838,7 +897,9 @@ router.post("/send-now", requirePermission("reports", "WRITE"), async (req, res,
       return res.status(400).json({ error: "recipients is required" });
     }
 
-    const data = await getReportData({ dateFrom, dateTo, workspaceId, type });
+    const data = await getReportData({
+      dateFrom, dateTo, createdAtFrom, createdAtTo, workspaceId, type,
+    });
 
     const fromStr = dateFrom ? new Date(dateFrom).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "All time";
     const toStr = dateTo ? new Date(dateTo).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "Today";
