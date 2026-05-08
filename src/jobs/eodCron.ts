@@ -7,6 +7,13 @@ import logger from "../utils/logger.js";
 let currentCronJob: ReturnType<typeof cron.schedule> | null = null;
 
 export async function startEodCron(): Promise<void> {
+  // If running under Fargate Scheduled Task mode, EventBridge handles scheduling
+  // and the standalone runEodOnce.js script handles execution. Skip cron registration here.
+  if (process.env.EOD_CRON_DISABLED === "true") {
+    logger.info("[EOD] Cron registration disabled via EOD_CRON_DISABLED env var (Fargate mode)");
+    return;
+  }
+
   const config = await EodReportConfig.findOne().lean();
   if (!config?.enabled) {
     logger.info("[EOD] Cron disabled — skipping schedule");
