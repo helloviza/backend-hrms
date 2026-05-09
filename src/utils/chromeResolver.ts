@@ -29,6 +29,17 @@ export async function getChromeLaunchOptions(): Promise<LaunchOptions> {
   // unpack + whatsapp-web.js Client.inject can exceed puppeteer's 30s default.
   const PROTOCOL_TIMEOUT = 180_000;
 
+  // EC2 path — uses real Google Chrome installed at /usr/bin/google-chrome.
+  // Bypasses Sparticuz entirely; the system binary already has all runtime libs.
+  if (process.env.EOD_USE_SYSTEM_CHROME === "true") {
+    return {
+      headless: true,
+      args: baseArgs,
+      executablePath: "/usr/bin/google-chrome",
+      protocolTimeout: PROTOCOL_TIMEOUT,
+    };
+  }
+
   if (isProduction) {
     const chromium = (await import("@sparticuz/chromium")).default;
     return {
