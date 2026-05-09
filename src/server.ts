@@ -15,6 +15,7 @@ import { errorHandler } from "./middleware/error.js";
 import { requireWorkspace } from "./middleware/requireWorkspace.js";
 import { blockTravelForSaas } from "./middleware/blockTravelForSaas.js";
 import { requireAuth } from "./middleware/auth.js";
+import { requireFeature } from "./middleware/requireFeature.js";
 import { apiLimiter, authLimiter, flightSearchLimiter, hotelSearchLimiter, copilotLimiter } from "./middleware/rateLimit.js";
 import { env } from "./config/env.js";
 import vouchers from "./routes/vouchers.js";
@@ -254,7 +255,7 @@ app.use("/api/booking-history", noStore);
 app.use("/api/auth/refresh", noStore);
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // SHARED_API — Vouchers (will be exposed via tenant API in Phase 4)
-  app.use("/api/vouchers", vouchers);
+  app.use("/api/vouchers", requireAuth, requireWorkspace, requireFeature("vouchersEnabled"), vouchers);
 }
 
 /* ────────────────────────────────────────────────────────────────
@@ -402,7 +403,7 @@ app.use("/api/superadmin", requireAuth, requireSuperAdmin, superadminWorkspacesR
 // Copilot & Pluto
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Travel copilot (Plumtrips Travel ops)
-  app.use("/api/v1/copilot/travel", travelCopilotRoutes);
+  app.use("/api/v1/copilot/travel", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), travelCopilotRoutes);
 }
 app.use("/api/v1/pluto/video", plutoVideoRouter);
 app.use("/api/copilot", copilotRouter);
@@ -433,7 +434,7 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/sbt/requests", sbtRequestsRouter);
   app.use("/api/sbt/wallet", sbtWalletRouter);
   app.use("/api/sbt/config", sbtConfigRouter);
-  app.use("/api/travel-forms", travelFormRouter);
+  app.use("/api/travel-forms", requireAuth, requireWorkspace, requireFeature("travelFormEnabled"), travelFormRouter);
 }
 
 // SBT Admin (offer config)
@@ -445,9 +446,9 @@ import unifiedBillingRoutes from "./routes/admin.unified.billing.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Travel admin (SBT config, billing console, unified billing)
-  app.use("/api/admin/sbt", adminSBTRouter);
-  app.use("/api/admin/billing", adminBillingRouter);
-  app.use("/api/admin/unified", unifiedBillingRoutes);
+  app.use("/api/admin/sbt", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), adminSBTRouter);
+  app.use("/api/admin/billing", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), adminBillingRouter);
+  app.use("/api/admin/unified", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), unifiedBillingRoutes);
 }
 
 // Dashboards
@@ -467,7 +468,7 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Manual bookings + broad /api/admin routers (Plumtrips Travel).
   // Order matters: manualBookings must precede adminRouter/adminAnalyticsRouter
   // so the broad mounts do not intercept the manual-bookings paths.
-  app.use("/api/admin/manual-bookings", manualBookingsRouter);
+  app.use("/api/admin/manual-bookings", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), manualBookingsRouter);
   // Admin
   app.use("/api/admin", adminRouter);
   app.use("/api/admin", adminAnalyticsRouter);
@@ -506,11 +507,11 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Travel-specific admin features:
   //   ticketing, email templates, invoices, reports, company settings,
   //   billing permissions (all Plumtrips Travel admin surfaces).
-  app.use("/api/admin/tickets", ticketsAdminRouter);
-  app.use("/api/admin/tickets", ticketsConsoleRouter);
+  app.use("/api/admin/tickets", requireAuth, requireWorkspace, requireFeature("ticketsEnabled"), ticketsAdminRouter);
+  app.use("/api/admin/tickets", requireAuth, requireWorkspace, requireFeature("ticketsEnabled"), ticketsConsoleRouter);
   app.use("/api/admin/email-templates", emailTemplatesRouter);
-  app.use("/api/invoices/workspace", invoicesWorkspaceRouter);
-  app.use("/api/admin/invoices", invoicesRouter);
+  app.use("/api/invoices/workspace", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), invoicesWorkspaceRouter);
+  app.use("/api/admin/invoices", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), invoicesRouter);
   app.use("/api/admin/reports", reportsRouter);
   app.use("/api/admin/company-settings", companySettingsRouter);
   app.use("/api/billing-permissions", billingPermissionsRouter);
@@ -553,9 +554,9 @@ app.use("/api/meetings", meetingRoutes);
 // Sales CRM
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Sales CRM (Plumtrips Travel)
-  app.use("/api/leads", leadsRouter);
-  app.use("/api/crm/companies", crmCompaniesRouter);
-  app.use("/api/crm/contacts", crmContactsRouter);
+  app.use("/api/leads", requireAuth, requireWorkspace, requireFeature("crmEnabled"), leadsRouter);
+  app.use("/api/crm/companies", requireAuth, requireWorkspace, requireFeature("crmEnabled"), crmCompaniesRouter);
+  app.use("/api/crm/contacts", requireAuth, requireWorkspace, requireFeature("crmEnabled"), crmContactsRouter);
 }
 
 // Tasks / Reminders

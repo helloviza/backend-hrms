@@ -1,18 +1,45 @@
+﻿# Dependencies
 node_modules
+.pnpm-store
+
+# Build output
 dist
 logs
+*.log
+
+# Caches (CRITICAL - was missing)
+.cache
+.npm
+.pnpm
+.puppeteer
 .wwebjs_auth
 .wwebjs_cache
-.env
-.env.*
-*.log
-secrets
-cert-evidence
-tmp
-*.zip
-eod-real.html
-eod-real.png
-eod-test.png
+
+# Local user uploads (production users upload to S3/cloud, not relevant in image)
+uploads
+
+# Test artifacts
+*.png
+*.html
+*.pdf
 hotel_*.txt
 hotel_*.json
+eod-*
+
+# Local secrets / env
+.env
+.env.*
+secrets
+cert-evidence
+*.pem
+*.key
+*.crt
+
+# Misc
+tmp
+*.zip
 smtp-test.mjs
+
+# Git
+.git
+.gitignore

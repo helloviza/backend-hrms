@@ -59,6 +59,18 @@ async function main() {
       await mongoose.disconnect();
       process.exit(0);
     }
+
+    logger.info("[runEodOnce] Loaded config", {
+      enabled: config.enabled,
+      recipientCount: config.recipients?.length ?? 0,
+      recipients: (config.recipients ?? []).map((r) => ({
+        name: r.name,
+        type: r.type,
+        number: r.number ? r.number.substring(0, 4) + "***" : undefined,
+        groupId: r.groupId,
+      })),
+      testRecipientCount: config.testRecipients?.length ?? 0,
+    });
   } catch (err: any) {
     logger.error("[runEodOnce] Failed to load config", {
       message: err?.message,
