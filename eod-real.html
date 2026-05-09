@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>EOD Snapshot</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #FFFFFF; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: #1A1A1A;
+    -webkit-font-smoothing: antialiased;
+  }
+  .canvas {
+    width: 720px;
+    background: #FFFFFF;
+    padding: 24px 40px;
+  }
+  .card {
+    width: 640px;
+    margin: 0 auto;
+  }
+  .header {
+    background: #C73E1D;
+    color: #FFFFFF;
+    padding: 18px 18px 16px;
+    border-radius: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+  }
+  .header h1 {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+  }
+  .header .sub {
+    font-size: 11px;
+    margin-top: 4px;
+    opacity: 0.92;
+  }
+  .header .time {
+    font-size: 11px;
+    opacity: 0.92;
+    text-align: right;
+  }
+  .footer {
+    margin-top: 22px;
+    padding-top: 12px;
+    border-top: 1px solid #E5E0DD;
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: #6B6B6B;
+  }
+</style>
+</head>
+<body>
+  <div class="canvas">
+    <div class="card">
+      <div class="header">
+        <div>
+          <h1>Plumtrips</h1>
+          <div class="sub">Daily snapshot · Friday, 8 May 2026</div>
+        </div>
+        <div class="time">6:29 pm IST</div>
+      </div>
+
+      
+    <div style="background:#F8F4F2; border-radius:10px; padding:18px; margin-top:18px;">
+      <div style="display:flex; justify-content:space-between; align-items:baseline;">
+        <div style="font-size:11px; font-weight:700; color:#6B6B6B; letter-spacing:0.1em; text-transform:uppercase;">Total bookings</div>
+        <div style="font-size:30px; font-weight:800; color:#1A1A1A; line-height:1;">10</div>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:14px;">
+        <div style="font-size:11px; font-weight:700; color:#6B6B6B; letter-spacing:0.1em; text-transform:uppercase;">Total sales</div>
+        <div style="font-size:18px; font-weight:700; color:#1A1A1A;">₹1,15,945</div>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:8px;">
+        <div style="font-size:11px; font-weight:700; color:#6B6B6B; letter-spacing:0.1em; text-transform:uppercase;">Total profit</div>
+        <div style="font-size:16px; font-weight:700; color:#1A1A1A;">₹16,169</div>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:8px;">
+        <div style="font-size:11px; font-weight:700; color:#6B6B6B; letter-spacing:0.1em; text-transform:uppercase;">Margin %*</div>
+        <div style="font-size:18px; font-weight:800; color:#0F6E56;">14.3%</div>
+      </div>
+      <div style="font-size:10px; color:#888; font-style:italic; margin-top:6px; text-align:right;">
+        * Margin % = Profit ÷ Net Sales (Total Sales − GST)
+      </div>
+    </div>
+  
+      
+    
+    <div style="font-size:10px; font-weight:700; letter-spacing:0.12em; color:#6B6B6B; text-transform:uppercase; margin: 18px 0 10px;">
+      7-day trend · Net sales
+    </div>
+  
+    
+    <svg viewBox="0 0 600 180" width="100%" height="180" xmlns="http://www.w3.org/2000/svg" style="display:block;">
+      <line x1="0" x2="600" y1="158" y2="158" stroke="#E5E0DD" stroke-width="1" />
+      
+        <text x="53.142857142857146" y="20" font-size="10" font-weight="600" fill="#1A1A1A" text-anchor="middle">₹19k</text>
+        <rect x="27.6" y="152.7" width="51.0" height="5.3" rx="3" ry="3" fill="#D8D2CD" />
+        <text x="53.142857142857146" y="174" font-size="10" fill="#6B6B6B" font-weight="500" text-anchor="middle">Sat</text>
+      
+        <text x="135.42857142857144" y="20" font-size="10" font-weight="600" fill="#1A1A1A" text-anchor="middle">₹2.7L</text>
+        <rect x="109.9" y="81.6" width="51.0" height="76.4" rx="3" ry="3" fill="#D8D2CD" />
+        <text x="135.42857142857144" y="174" font-size="10" fill="#6B6B6B" font-weight="500" text-anchor="middle">Sun</text>
+      
+        <text x="217.71428571428572" y="20" font-size="10" font-weight="600" fill="#1A1A1A" text-anchor="middle">₹2.4L</text>
+        <rect x="192.2" y="89.0" width="51.0" height="69.0" rx="3" ry="3" fill="#D8D2CD" />
+        <text x="217.71428571428572" y="174" font-size="10" fill="#6B6B6B" font-weight="500" text-anchor="middle">Mon</text>
+      
+        <text x="300.00000000000006" y="20" font-size="10" font-weight="600" fill="#1A1A1A" text-anchor="middle">₹4.5L</text>
+        <rect x="274.5" y="28.0" width="51.0" height="130.0" rx="3" ry="3" fill="#D8D2CD" />
+        <text x="300.00000000000006" y="174" font-size="10" fill="#6B6B6B" font-weight="500" text-anchor="middle">Tue</text>
+      
+        <text x="382.28571428571433" y="20" font-size="10" font-weight="600" fill="#1A1A1A" text-anchor="middle">₹2.4L</text>
+        <rect x="356.8" y="90.1" width="51.0" height="67.9" rx="3" ry="3" fill="#D8D2CD" />
+        <text x="382.28571428571433" y="174" font-size="10" fill="#6B6B6B" font-weight="500" text-anchor="middle">Wed</text>
+      
+        <text x="464.5714285714286" y="20" font-size="10" font-weight="600" fill="#1A1A1A" text-anchor="middle">₹2.3L</text>
+        <rect x="439.1" y="91.1" width="51.0" height="66.9" rx="3" ry="3" fill="#D8D2CD" />
+        <text x="464.5714285714286" y="174" font-size="10" fill="#6B6B6B" font-weight="500" text-anchor="middle">Thu</text>
+      
+        <text x="546.8571428571429" y="20" font-size="10" font-weight="600" fill="#1A1A1A" text-anchor="middle">₹1.1L</text>
+        <rect x="521.3" y="125.6" width="51.0" height="32.4" rx="3" ry="3" fill="#C73E1D" />
+        <text x="546.8571428571429" y="174" font-size="10" fill="#C73E1D" font-weight="700" text-anchor="middle">Today</text>
+      
+    </svg>
+  
+  
+      
+    <div style="display:flex; gap:10px; margin-top:14px; background:#F8F4F2; border-radius:10px; padding:10px;">
+      
+    <div style="flex:1; min-width:0; padding:12px 14px; background:#FFFFFF; border-left:3px solid #C73E1D; border-radius:6px;">
+      <div style="font-size:10px; font-weight:700; letter-spacing:0.1em; color:#6B6B6B; text-transform:uppercase; margin-bottom:8px;">Week to date (Mon–8)</div>
+      <div style="display:grid; grid-template-columns:1fr auto; row-gap:5px; column-gap:10px;">
+        <div style="font-size:11px; color:#6B6B6B;">Bookings</div>
+        <div style="font-size:12px; font-weight:700; color:#1A1A1A; text-align:right;">70</div>
+        <div style="font-size:11px; color:#6B6B6B;">Sales</div>
+        <div style="font-size:12px; font-weight:700; color:#1A1A1A; text-align:right;">₹12,98,436</div>
+        <div style="font-size:11px; color:#6B6B6B;">Profit</div>
+        <div style="font-size:12px; font-weight:700; color:#1A1A1A; text-align:right;">₹97,775</div>
+        <div style="font-size:11px; color:#6B6B6B;">Margin</div>
+        <div style="font-size:12px; font-weight:800; color:#0F6E56; text-align:right;">7.7%</div>
+      </div>
+    </div>
+  
+      
+    <div style="flex:1; min-width:0; padding:12px 14px; background:#FFFFFF; border-left:3px solid #C73E1D; border-radius:6px;">
+      <div style="font-size:10px; font-weight:700; letter-spacing:0.1em; color:#6B6B6B; text-transform:uppercase; margin-bottom:8px;">Month to date (May 1–8)</div>
+      <div style="display:grid; grid-template-columns:1fr auto; row-gap:5px; column-gap:10px;">
+        <div style="font-size:11px; color:#6B6B6B;">Bookings</div>
+        <div style="font-size:12px; font-weight:700; color:#1A1A1A; text-align:right;">87</div>
+        <div style="font-size:11px; color:#6B6B6B;">Sales</div>
+        <div style="font-size:12px; font-weight:700; color:#1A1A1A; text-align:right;">₹16,73,688</div>
+        <div style="font-size:11px; color:#6B6B6B;">Profit</div>
+        <div style="font-size:12px; font-weight:700; color:#1A1A1A; text-align:right;">₹1,29,864</div>
+        <div style="font-size:11px; color:#6B6B6B;">Margin</div>
+        <div style="font-size:12px; font-weight:800; color:#0F6E56; text-align:right;">7.9%</div>
+      </div>
+    </div>
+  
+    </div>
+  
+      
+    
+    <div style="font-size:10px; font-weight:700; letter-spacing:0.12em; color:#6B6B6B; text-transform:uppercase; margin: 18px 0 10px;">
+      Booking type · Today
+    </div>
+  
+    
+    <div style="display:flex; width:100%; border-radius:6px; overflow:hidden;">
+      
+        <div style="flex: 70.00 1 0; min-width:0; background:#185FA5; padding:9px 12px; color:#fff; font-size:11px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+          Flights · 7 · ₹90,405
+        </div>
+        <div style="flex: 30.00 1 0; min-width:0; background:#D85A30; padding:9px 12px; color:#fff; font-size:11px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+          Hotels · 3 · ₹22,630
+        </div>
+    </div>
+  
+  
+      
+    
+    <div style="font-size:10px; font-weight:700; letter-spacing:0.12em; color:#6B6B6B; text-transform:uppercase; margin: 18px 0 10px;">
+      Top performers · Today
+    </div>
+  
+    <div>
+    <div style="display:flex; justify-content:space-between; align-items:baseline; padding:10px 0; border-top:0;">
+      <div style="font-size:12px; font-weight:600; color:#1A1A1A; max-width:55%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Chirag Kapoor</div>
+      <div style="display:flex; gap:8px; align-items:baseline;">
+        <span style="font-size:10px; color:#6B6B6B;">10 bookings</span>
+        <span style="font-size:12px; font-weight:700; color:#1A1A1A;">₹1,15,945</span>
+      </div>
+    </div>
+  </div>
+  
+      
+    
+    <div style="font-size:10px; font-weight:700; letter-spacing:0.12em; color:#6B6B6B; text-transform:uppercase; margin: 18px 0 10px;">
+      Top clients · Today
+    </div>
+  
+    <div>
+    <div style="display:flex; justify-content:space-between; align-items:baseline; padding:10px 0; border-top:0;">
+      <div style="font-size:12px; font-weight:600; color:#1A1A1A; max-width:55%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Molnlycke Health Care India Private Limited</div>
+      <div style="display:flex; gap:8px; align-items:baseline;">
+        <span style="font-size:10px; color:#6B6B6B;">6 bookings</span>
+        <span style="font-size:12px; font-weight:700; color:#1A1A1A;">₹64,138</span>
+      </div>
+    </div>
+  
+    <div style="display:flex; justify-content:space-between; align-items:baseline; padding:10px 0; border-top:1px solid #E5E0DD;">
+      <div style="font-size:12px; font-weight:600; color:#1A1A1A; max-width:55%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">CENTER FOR STUDY OF SCIENCE TECHNOLOGY AND POLICY</div>
+      <div style="display:flex; gap:8px; align-items:baseline;">
+        <span style="font-size:10px; color:#6B6B6B;">4 bookings</span>
+        <span style="font-size:12px; font-weight:700; color:#1A1A1A;">₹51,807</span>
+      </div>
+    </div>
+  </div>
+  
+      
+    
+    <div style="font-size:10px; font-weight:700; letter-spacing:0.12em; color:#6B6B6B; text-transform:uppercase; margin: 18px 0 10px;">
+      Pipeline &amp; follow-ups
+    </div>
+  
+    <div>
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:9px 12px; border-radius:6px; margin-bottom:4px; ">
+      <div style="font-size:12px; font-weight:600; color:#1A1A1A;">Awaiting payment</div>
+      <div style="display:flex; gap:8px; align-items:baseline; color:#1A1A1A;">
+        <span style="font-size:10px; color:#6B6B6B;">3 invoices</span>
+        <span style="font-size:12px; font-weight:700;">₹25,55,853</span>
+      </div>
+    </div>
+  
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:9px 12px; border-radius:6px; margin-bottom:4px; background:#FCEBEB;">
+      <div style="font-size:12px; font-weight:700; color:#791F1F;">Overdue &gt;7 days</div>
+      <div style="display:flex; gap:8px; align-items:baseline; color:#791F1F;">
+        <span style="font-size:10px; ">1 invoice</span>
+        <span style="font-size:12px; font-weight:700;">₹8,848</span>
+      </div>
+    </div>
+  
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:9px 12px; border-radius:6px; margin-bottom:4px; ">
+      <div style="font-size:12px; font-weight:600; color:#1A1A1A;">Drafts to send</div>
+      <div style="display:flex; gap:8px; align-items:baseline; color:#1A1A1A;">
+        <span style="font-size:10px; color:#6B6B6B;">31</span>
+        
+      </div>
+    </div>
+  
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:9px 12px; border-radius:6px; margin-bottom:4px; ">
+      <div style="font-size:12px; font-weight:600; color:#1A1A1A;">Approval requests pending</div>
+      <div style="display:flex; gap:8px; align-items:baseline; color:#1A1A1A;">
+        <span style="font-size:10px; color:#6B6B6B;">0</span>
+        
+      </div>
+    </div>
+  
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:9px 12px; border-radius:6px; margin-bottom:4px; ">
+      <div style="font-size:12px; font-weight:600; color:#1A1A1A;">Holds expiring in 24h</div>
+      <div style="display:flex; gap:8px; align-items:baseline; color:#1A1A1A;">
+        <span style="font-size:10px; color:#6B6B6B;">0</span>
+        
+      </div>
+    </div>
+  </div>
+  
+
+      <div class="footer">
+        <span>plumbox.plumtrips.com</span>
+        <span>Generated 6:29:42 pm</span>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

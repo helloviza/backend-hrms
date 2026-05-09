@@ -19,6 +19,13 @@ export interface WorkspaceFeatures {
   analyticsEnabled: boolean;
   expenseBandEnabled: boolean;
   travelFormEnabled?: boolean;
+
+  // Coarse-grained module flags (Phase 1 SaaS tiering)
+  hrmsEnabled?: boolean;
+  crmEnabled?: boolean;
+  vouchersEnabled?: boolean;
+  invoicesEnabled?: boolean;
+  ticketsEnabled?: boolean;
 }
 
 export type WorkspacePlan = "trial" | "starter" | "growth" | "enterprise";
@@ -236,6 +243,13 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         analyticsEnabled: { type: Boolean, default: false },
         expenseBandEnabled: { type: Boolean, default: false },
         travelFormEnabled: { type: Boolean, default: false },
+
+        // Coarse-grained module flags (Phase 1 SaaS tiering)
+        hrmsEnabled: { type: Boolean, default: true },
+        crmEnabled: { type: Boolean, default: false },
+        vouchersEnabled: { type: Boolean, default: false },
+        invoicesEnabled: { type: Boolean, default: false },
+        ticketsEnabled: { type: Boolean, default: false },
       },
     },
 
@@ -336,6 +350,7 @@ CustomerWorkspaceSchema.statics.getDefaultFeaturesForPlan = (
     approvalFlowEnabled: true,
     attendanceEnabled: true,
     leaveEnabled: true,
+    hrmsEnabled: true,
   };
   const plans: Record<string, Partial<WorkspaceFeatures>> = {
     trial: { ...base },
@@ -344,6 +359,10 @@ CustomerWorkspaceSchema.statics.getDefaultFeaturesForPlan = (
       sbtEnabled: true,
       flightBookingEnabled: true,
       hotelBookingEnabled: true,
+      crmEnabled: true,
+      vouchersEnabled: true,
+      invoicesEnabled: true,
+      ticketsEnabled: true,
     },
     growth: {
       ...base,
@@ -353,6 +372,10 @@ CustomerWorkspaceSchema.statics.getDefaultFeaturesForPlan = (
       payrollEnabled: true,
       performanceEnabled: true,
       analyticsEnabled: true,
+      crmEnabled: true,
+      vouchersEnabled: true,
+      invoicesEnabled: true,
+      ticketsEnabled: true,
     },
     enterprise: {
       ...base,
@@ -367,6 +390,10 @@ CustomerWorkspaceSchema.statics.getDefaultFeaturesForPlan = (
       forexEnabled: true,
       onboardingEnabled: true,
       esimEnabled: true,
+      crmEnabled: true,
+      vouchersEnabled: true,
+      invoicesEnabled: true,
+      ticketsEnabled: true,
     },
   };
   return plans[plan] || plans.trial;

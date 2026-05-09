@@ -198,7 +198,21 @@ class WhatsAppService {
       });
       return null;
     }
-    return numberId._serialized;
+
+    // Force @c.us — getNumberId can return @lid (Linked ID), which has
+    // delivery reliability issues. numberId.user is the validated digits.
+    const chatId = `${cleanNumber}@c.us`;
+
+    logger.info("[WA] Resolved chat ID", {
+      name: r.name,
+      inputNumber: cleanNumber,
+      forcedChatId: chatId,
+      numberIdUser: numberId.user,
+      numberIdServer: numberId.server,
+      originalSerialized: numberId._serialized,
+    });
+
+    return chatId;
   }
 
   async sendToRecipients(
