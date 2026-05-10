@@ -7,7 +7,13 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
 import User from "../models/User.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
-import { sendWorkspaceCredentials } from "../services/email.service.js";
+import { UserPermission } from "../models/UserPermission.js";
+import TenantSetupProgress from "../models/TenantSetupProgress.js";
+import { sendMail } from "../utils/mailer.js";
+import {
+  buildWelcomeEmailHtml,
+  buildWelcomeEmailText,
+} from "../utils/saasInviteEmail.js";
 import logger, { sbtLogger } from "../utils/logger.js";
 import { seedTaskAutomations } from "../services/taskAutomationSeed.js";
 import requireAuth from "../middleware/auth.js";
@@ -166,50 +172,72 @@ router.get("/workspaces", async (req: any, res) => {
 
 router.post("/workspaces", async (req: any, res) => {
   try {
-    const { companyName, industry, employeeCount, adminEmail, adminName, plan, features, notes, phone } =
-      req.body as {
-        companyName: string;
-        industry?: string;
-        employeeCount?: string;
-        adminEmail: string;
-        adminName: string;
-        plan: "trial" | "starter" | "growth" | "enterprise";
-        features?: Record<string, boolean>;
-        notes?: string;
-        phone?: string;
-      };
+    const {
+      companyName,
+      industry,
+      employeeCount,
+      adminEmail,
+      adminName,
+      plan,
+      features,
+      notes,
+      phone,
+      trainingTime,
+      trainingMethod,
+    } = req.body as {
+      companyName: string;
+      industry?: string;
+      employeeCount?: string;
+      adminEmail: string;
+      adminName: string;
+      plan: "trial" | "starter" | "growth" | "enterprise";
+      features?: Record<string, boolean>;
+      notes?: string;
+      phone?: string;
+      trainingTime?: string;
+      trainingMethod?: string;
+    };
 
     if (!companyName || !adminEmail || !adminName || !plan) {
       return res.status(400).json({ error: "companyName, adminEmail, adminName and plan are required" });
     }
 
-    // Build customerId: slug + 6 random hex chars
-    const customerId = `${slugify(companyName)}-${crypto.randomBytes(3).toString("hex")}`;
+    const normalizedEmail = adminEmail.toLowerCase().trim();
 
-    // Generate workspace slug (URL-safe, unique)
+    // Prevent collision with existing accounts (parity with /api/saas/signup)
+    const exists = await User.exists({ email: normalizedEmail });
+    if (exists) {
+      return res.status(409).json({ error: "An account with this email already exists." });
+    }
+
+    // Generate workspace slug + customerId (slug + 6-char hex, same pattern as saas.signup.ts)
     const baseSlug = generateSlug(companyName);
     const slug = await ensureUniqueSlug(baseSlug, CustomerWorkspace);
+    const customerId = `${slug}-${crypto.randomBytes(3).toString("hex")}`;
 
     // Resolve features for the plan, then apply any overrides
     const defaultFeatures = CustomerWorkspace.getDefaultFeaturesForPlan(plan);
     const mergedFeatures = { ...defaultFeatures, ...(features || {}) };
 
+    const trialEndsAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
     const workspace = await CustomerWorkspace.create({
       customerId,
+      slug,
       companyName,
       industry,
       employeeCount,
+      tenantType: "SAAS_HRMS",
       plan,
+      trialEndsAt,
       notes,
       phone: phone || "",
       source: "SUPERADMIN",
       status: "ACTIVE",
+      accessMode: "INVITE_ONLY",
+      onboardingStep: "registered",
       "config.features": mergedFeatures,
     });
-
-    // Persist slug onto the workspace document
-    workspace.slug = slug;
-    await workspace.save();
 
     // Seed default task automations for this workspace
     seedTaskAutomations(workspace._id.toString()).catch(() => {});
@@ -218,26 +246,101 @@ router.post("/workspaces", async (req: any, res) => {
     const tempPassword = generateTempPassword();
     const passwordHash = await bcrypt.hash(tempPassword, 12);
 
-    const user = await User.create({
+    const adminUser = await User.create({
       workspaceId: workspace._id,
       customerId,
-      email: adminEmail,
+      email: normalizedEmail,
       name: adminName,
       passwordHash,
-      roles: ["WORKSPACE_ADMIN"],
+      roles: ["TENANT_ADMIN", "WORKSPACE_LEADER"],
+      role: "TENANT_ADMIN",
+      hrmsAccessRole: "ADMIN",
+      hrmsAccessLevel: "ADMIN",
+      accountType: "STAFF",
+      status: "ACTIVE",
       tempPassword: true,
     });
 
-    // Send credentials email (best-effort)
-    try {
-      await sendWorkspaceCredentials(adminEmail, {
-        companyName,
-        loginUrl: `${env.FRONTEND_ORIGIN}/login`,
-        tempPassword,
-      });
-    } catch (emailErr: any) {
-      logger.warn("Failed to send workspace credentials email");
-    }
+    // Full HRMS module access — mirrors saas.signup.ts:90-127
+    const fullAccess = { access: "FULL", scope: "ALL" } as const;
+    const allModules = [
+      "dashboard", "employees", "leaves", "attendance",
+      "payroll", "onboarding", "vendors", "customers",
+      "reports", "analytics", "settings", "permissions",
+      "profile", "myBookings", "myInvoices", "sbt",
+      "billing", "access",
+    ];
+    const tenantAdminModules = {
+      myProfile: fullAccess, attendance: fullAccess, leaves: fullAccess,
+      leaveApprovals: fullAccess, holidays: fullAccess, holidayManagement: fullAccess,
+      orgChart: fullAccess, policies: fullAccess, teamProfiles: fullAccess,
+      teamPresence: fullAccess, teamCalendar: fullAccess, hrWorkspace: fullAccess,
+      onboarding: fullAccess, people: fullAccess, masterData: fullAccess,
+      payroll: fullAccess, payrollAdmin: fullAccess,
+      adminQueue: fullAccess, manualBookings: fullAccess, invoices: fullAccess,
+      reports: fullAccess, companySettings: fullAccess, adminVouchers: fullAccess,
+      voucherExtract: fullAccess,
+      analytics: fullAccess, workspaceSettings: fullAccess, accessConsole: fullAccess,
+      sbt: fullAccess, sbtSearch: fullAccess, sbtBookings: fullAccess,
+      sbtRequest: fullAccess, approvals: fullAccess, travelSpend: fullAccess,
+      vendorProfile: fullAccess,
+    };
+
+    await UserPermission.create({
+      userId: adminUser._id.toString(),
+      email: normalizedEmail,
+      workspaceId: workspace._id.toString(),
+      universe: "STAFF",
+      level: { code: "L0", name: "Workspace Admin" },
+      tier: 3,
+      roleType: "SUPERADMIN",
+      grantedModules: allModules,
+      modules: tenantAdminModules,
+      grantedBy: adminUser._id.toString(),
+      source: "system",
+      status: "active",
+    });
+
+    // Link admin user back to the workspace
+    workspace.adminUserId = adminUser._id as any;
+    await workspace.save();
+
+    // Phase 4 onboarding wizard hook — first-login redirect reads this row
+    await TenantSetupProgress.create({
+      workspaceId: workspace._id,
+      tenantType: "SAAS_HRMS",
+      currentStage: "WELCOME",
+      lastActivityAt: new Date(),
+    });
+
+    // Polished welcome email with temp credentials
+    const loginUrl = `${String(env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com")}/login`;
+    const html = buildWelcomeEmailHtml({
+      adminName,
+      companyName,
+      loginUrl,
+      loginEmail: normalizedEmail,
+      tempPassword,
+      trainingTime,
+      trainingMethod,
+    });
+    const text = buildWelcomeEmailText({
+      adminName,
+      companyName,
+      loginUrl,
+      loginEmail: normalizedEmail,
+      tempPassword,
+      trainingTime,
+      trainingMethod,
+    });
+
+    const emailResult = await sendMail({
+      kind: "WELCOME",
+      to: normalizedEmail,
+      subject: `Welcome to Plumtrips HRMS — Your ${companyName} workspace is ready`,
+      html,
+      text,
+    });
 
     // Fire-and-forget provisioning — never blocks the response
     provisionNewTenant(
@@ -248,10 +351,26 @@ router.post("/workspaces", async (req: any, res) => {
       sbtLogger.error("[TENANT PROVISION ERROR]", { err }),
     );
 
-    const userObj = user.toObject() as Record<string, any>;
-    delete userObj.passwordHash;
-
-    res.status(201).json({ workspace, user: userObj });
+    return res.status(201).json({
+      success: true,
+      workspace: {
+        _id: workspace._id,
+        companyName: workspace.companyName,
+        slug: workspace.slug,
+        customerId: workspace.customerId,
+        plan: workspace.plan,
+        status: workspace.status,
+      },
+      admin: {
+        email: normalizedEmail,
+        name: adminName,
+        tempPassword,
+      },
+      emailSent: !!emailResult.ok,
+      message: emailResult.ok
+        ? "Workspace created and welcome email sent"
+        : "Workspace created — email failed, share credentials manually",
+    });
   } catch (err: any) {
     logger.error("POST /workspaces failed");
     res.status(500).json({ error: err.message });

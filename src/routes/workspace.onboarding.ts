@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import requireAuth from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { markTenantSetupComplete } from "../utils/tenantSetupHelpers.js";
 
 const router = Router();
 
@@ -78,7 +79,14 @@ router.put(
       if (companyLogo !== undefined) workspace.companyLogo = companyLogo;
       if (gstNumber !== undefined) workspace.gstNumber = gstNumber;
       if (pan !== undefined) workspace.pan = pan;
-      if (address !== undefined) workspace.address = address;
+      if (address !== undefined) {
+        // Wizard sends a single-line string; schema expects { line1, line2, city, state, pincode, country }.
+        if (typeof address === "string") {
+          workspace.address = { line1: address };
+        } else if (address && typeof address === "object") {
+          workspace.address = address;
+        }
+      }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const ws = workspace as any;
       if (leavePolicy !== undefined) ws.leavePolicy = leavePolicy;
@@ -119,6 +127,10 @@ router.put(
       workspace.onboardingCompletedAt = new Date();
 
       await workspace.save();
+
+      // Sync System A (TenantSetupProgress) — Phase 4 reads this to decide redirects.
+      // Helper swallows its own errors so wizard completion isn't blocked.
+      await markTenantSetupComplete(workspace._id);
 
       res.json({ success: true });
     } catch (err) {
