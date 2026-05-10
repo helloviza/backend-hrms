@@ -18,6 +18,7 @@ import { sendMail } from "../utils/mailer.js";
 import { signEmailActionToken } from "../utils/emailActionToken.js";
 import { isGenericDomain } from "../utils/blockedDomains.js";
 import { generateTravelerId } from "../utils/travelerId.js";
+import { parseCsv as parseCsvRaw } from "../utils/csv.js";
 
 const router = Router();
 
@@ -1782,7 +1783,7 @@ router.post("/bulk", requireAuth, upload.single("file"), async (req: any, res) =
     if (!req.file?.buffer) return res.status(400).json({ error: "Missing file" });
 
     const csv = req.file.buffer.toString("utf8");
-    const rows = parseCsv(csv);
+    const rows = parseCsvForTravel(csv);
     if (!rows.length) return res.status(400).json({ error: "CSV is empty" });
 
     await ensureDefaultApproverFallback(ws, leaderEmail, actor);
@@ -2866,61 +2867,21 @@ async function staffSearchBusinesses(q: string, wsId?: any) {
 }
 
 /* =========================================================
- * Minimal CSV parser (supports quoted values)
+ * Travel-flavored CSV adapter — delegates raw parsing to the
+ * shared util and projects each row into the Travel column shape
+ * (email, name, role, approverEmail, password, sendInvite,
+ * setAsDefaultApprover) that the /workspace/users/bulk handler
+ * expects. Keeps the original tolerant header aliases.
  * ======================================================= */
-function parseCsv(csv: string): Array<Record<string, string>> {
-  const text = String(csv || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
-  if (!text) return [];
-
-  const lines = text.split("\n").filter((l) => l.trim().length > 0);
-  if (lines.length < 2) return [];
-
-  const headers = splitCsvLine(lines[0]).map((h) => h.trim());
-  const out: Array<Record<string, string>> = [];
-
-  for (let i = 1; i < lines.length; i++) {
-    const cols = splitCsvLine(lines[i]);
-    const row: Record<string, string> = {};
-    headers.forEach((h, idx) => (row[h] = (cols[idx] ?? "").trim()));
-
-    out.push({
-      email: row.email || row.Email || row.EMAIL || "",
-      name: row.name || row.Name || row.fullName || row.FullName || "",
-      role: row.role || row.Role || "",
-      approverEmail: row.approverEmail || row.ApproverEmail || row.managerEmail || row.ManagerEmail || "",
-      password: row.password || row.Password || "",
-      sendInvite: row.sendInvite || row.SendInvite || "",
-      setAsDefaultApprover: row.setAsDefaultApprover || row.SetAsDefaultApprover || "",
-    });
-  }
-
-  return out;
-}
-
-function splitCsvLine(line: string): string[] {
-  const s = String(line || "");
-  const out: string[] = [];
-  let cur = "";
-  let inQ = false;
-
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (ch === '"') {
-      if (inQ && s[i + 1] === '"') {
-        cur += '"';
-        i++;
-      } else {
-        inQ = !inQ;
-      }
-      continue;
-    }
-    if (ch === "," && !inQ) {
-      out.push(cur);
-      cur = "";
-      continue;
-    }
-    cur += ch;
-  }
-  out.push(cur);
-  return out;
+function parseCsvForTravel(csv: string): Array<Record<string, string>> {
+  const { rows } = parseCsvRaw(csv);
+  return rows.map((row) => ({
+    email: row.email || row.Email || row.EMAIL || "",
+    name: row.name || row.Name || row.fullName || row.FullName || "",
+    role: row.role || row.Role || "",
+    approverEmail: row.approverEmail || row.ApproverEmail || row.managerEmail || row.ManagerEmail || "",
+    password: row.password || row.Password || "",
+    sendInvite: row.sendInvite || row.SendInvite || "",
+    setAsDefaultApprover: row.setAsDefaultApprover || row.SetAsDefaultApprover || "",
+  }));
 }
