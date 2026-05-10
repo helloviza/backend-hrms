@@ -6,6 +6,7 @@ import { z } from "zod";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import TenantSetupProgress from "../models/TenantSetupProgress.js";
+import { markTenantSetupComplete } from "../utils/tenantSetupHelpers.js";
 
 const r = Router();
 
@@ -200,6 +201,17 @@ r.post("/setup/complete", requireAuth, requireWorkspace, async (req, res) => {
       return res.status(403).json({ error: "Forbidden — TENANT_ADMIN role required" });
     }
 
+    const existing = await TenantSetupProgress.findOne({
+      workspaceId: (req as any).workspaceObjectId,
+    });
+    if (!existing) {
+      return res.status(404).json({ error: "Setup progress record not found" });
+    }
+
+    const wasAlreadyComplete = !!existing.ftuxCompletedAt;
+
+    await markTenantSetupComplete((req as any).workspaceObjectId);
+
     const doc = await TenantSetupProgress.findOne({
       workspaceId: (req as any).workspaceObjectId,
     });
@@ -207,23 +219,9 @@ r.post("/setup/complete", requireAuth, requireWorkspace, async (req, res) => {
       return res.status(404).json({ error: "Setup progress record not found" });
     }
 
-    if (doc.ftuxCompletedAt) {
+    if (wasAlreadyComplete) {
       return res.status(200).json({ success: true, progress: serializeProgress(doc), alreadyComplete: true });
     }
-
-    const now = new Date();
-    // Flush any in-progress stages into stagesCompleted
-    const allStages = ["WELCOME", "INIT", "MODULES", "TEAM"];
-    for (const stage of allStages) {
-      if (!doc.stagesCompleted.includes(stage)) {
-        doc.stagesCompleted.push(stage);
-      }
-    }
-    doc.currentStage = "COMPLETE";
-    doc.ftuxCompletedAt = now;
-    doc.lastActivityAt = now;
-
-    await doc.save();
     return res.status(200).json({ success: true, progress: serializeProgress(doc) });
   } catch (err: any) {
     console.error("[saas.setup] POST /setup/complete error:", err);
