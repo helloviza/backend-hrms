@@ -38,10 +38,18 @@ function normalizeLeaveType(raw: string): string {
 
 function hasRole(req: Request, ...roles: string[]): boolean {
   const userRoles: string[] = (req as any).user?.roles || [];
-  return userRoles.some(
-    (r) =>
-      roles.includes(r.toUpperCase()) || r.toUpperCase() === "SUPERADMIN",
-  );
+  // Aliases: TENANT_ADMIN and WORKSPACE_ADMIN are workspace-scoped equivalents
+  // of ADMIN. Mirrors ROLE_ALIASES in middleware/roles.ts. Tenant isolation is
+  // preserved by the requireWorkspace gate at router level.
+  const required = new Set(roles.map((r) => r.toUpperCase()));
+  if (required.has("ADMIN")) {
+    required.add("TENANT_ADMIN");
+    required.add("WORKSPACE_ADMIN");
+  }
+  return userRoles.some((r) => {
+    const u = r.toUpperCase();
+    return required.has(u) || u === "SUPERADMIN";
+  });
 }
 
 function computeDays(from: Date, to: Date, dayLength?: string): number {
