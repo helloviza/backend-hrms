@@ -1,8 +1,10 @@
 import { Router } from "express";
 import requireAuth from "../middleware/auth.js";
 import requireRoles from "../middleware/roles.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import UserPresence from "../models/UserPresence.js";
 import Employee from "../models/Employee.js";
+import User from "../models/User.js";
 
 const r = Router();
 
@@ -24,9 +26,26 @@ function isNonStaff(u: any): boolean {
   return false;
 }
 
-r.get("/team", requireRoles("MANAGER", "ADMIN", "SUPERADMIN"), async (_req, res, next) => {
+r.get("/team", requireRoles("MANAGER", "ADMIN", "SUPERADMIN"), async (req, res, next) => {
   try {
-    const docs = await UserPresence.find()
+    const isSuper = isSuperAdmin(req);
+
+    // Defense-in-depth: scope presence to the caller's workspace.
+    // The middleware blockTravelForSaas already prevents SAAS_HRMS tenants
+    // from reaching this route, but we also constrain by workspace here so
+    // a misconfigured mount can never leak cross-tenant presence.
+    const presenceFilter: any = {};
+    if (!isSuper) {
+      const wsOid = (req as any).workspaceObjectId;
+      if (!wsOid) {
+        return res.status(403).json({ error: "Workspace scope required" });
+      }
+      const wsUsers = await User.find({ workspaceId: wsOid }).select("_id").lean();
+      const allowedUserIds = wsUsers.map((u: any) => u._id);
+      presenceFilter.userId = { $in: allowedUserIds };
+    }
+
+    const docs = await UserPresence.find(presenceFilter)
       .populate(
         "userId",
         "name email avatarKey department designation accountType userType vendorId vendor_id businessId customerId clientId companyId"
