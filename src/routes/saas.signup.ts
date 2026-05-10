@@ -10,7 +10,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { UserPermission } from "../models/UserPermission.js";
 import { sendMail } from "../utils/mailer.js";
 import { buildEmailShell, escapeHtml } from "./approvals.email.js";
-import { generateSlug, ensureUniqueSlug } from "../services/tenantProvisioning.js";
+import { generateSlug, ensureUniqueSlug, provisionNewTenant } from "../services/tenantProvisioning.js";
 import { env } from "../config/env.js";
 import TenantSetupProgress from "../models/TenantSetupProgress.js";
 
@@ -138,7 +138,23 @@ r.post("/signup", async (req, res) => {
       lastActivityAt: new Date(),
     });
 
-    // 10. Welcome email (non-blocking)
+    // 10. Fire-and-forget tenant provisioning (collections, S3 folder,
+    //     default LeavePolicy + Departments + Indian holidays).
+    //     Failure is logged but never fails the signup — admin can
+    //     re-run provisioning manually if anything is missing.
+    provisionNewTenant(
+      workspace._id.toString(),
+      workspace.customerId,
+      slug,
+    ).catch((err) =>
+      console.error(
+        "[saas.signup] provisionNewTenant failed for workspace",
+        workspace._id.toString(),
+        err,
+      ),
+    );
+
+    // 11. Welcome email (non-blocking)
     const loginUrl = String(env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com");
     const emailContent = `
       <p>Hi ${escapeHtml(adminName.trim())},</p>
@@ -169,7 +185,7 @@ r.post("/signup", async (req, res) => {
       html,
     }).catch(() => {});
 
-    // 11. Return response
+    // 12. Return response
     return res.status(201).json({
       success: true,
       workspaceId: workspace._id.toString(),

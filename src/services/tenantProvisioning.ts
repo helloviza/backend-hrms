@@ -104,6 +104,51 @@ export async function provisionTenantS3(workspaceId: string): Promise<void> {
 }
 
 /**
+ * Seed default Indian national holidays for a new tenant workspace.
+ * Idempotent via upsert on (workspaceId, date). Non-fatal per row.
+ */
+async function seedHolidays(workspaceId: string): Promise<void> {
+  const wsOid = new mongoose.Types.ObjectId(workspaceId);
+  const HolidayModel = mongoose.models["Holiday"] as
+    | mongoose.Model<any>
+    | undefined;
+  if (!HolidayModel) {
+    sbtLogger.warn("[TENANT PROVISION] Holiday model not registered — skipping");
+    return;
+  }
+
+  const holidays = [
+    { date: "2026-01-26", name: "Republic Day",          type: "NATIONAL" },
+    { date: "2026-03-14", name: "Holi",                  type: "NATIONAL" },
+    { date: "2026-04-02", name: "Eid al-Fitr",           type: "NATIONAL" },
+    { date: "2026-04-14", name: "Dr. Ambedkar Jayanti",  type: "NATIONAL" },
+    { date: "2026-05-01", name: "Labour Day",            type: "NATIONAL" },
+    { date: "2026-08-15", name: "Independence Day",      type: "NATIONAL" },
+    { date: "2026-10-02", name: "Gandhi Jayanti",        type: "NATIONAL" },
+    { date: "2026-10-20", name: "Diwali",                type: "NATIONAL" },
+    { date: "2026-12-25", name: "Christmas",             type: "NATIONAL" },
+  ];
+
+  for (const h of holidays) {
+    try {
+      await HolidayModel.updateOne(
+        { workspaceId: wsOid, date: h.date },
+        { $set: { ...h, workspaceId: wsOid } },
+        { upsert: true },
+      );
+    } catch (err) {
+      sbtLogger.warn(
+        `[TENANT PROVISION] Holiday seed failed for ${h.name} (${h.date}): ${err}`,
+      );
+    }
+  }
+
+  sbtLogger.info(
+    `[TENANT PROVISION] Seeded ${holidays.length} default holidays for ${workspaceId}`,
+  );
+}
+
+/**
  * Seed default data for a new tenant workspace.
  * - Default LeavePolicy (uses schema defaults; workspaceId required)
  * - Default departments (6 standard depts)
@@ -186,6 +231,12 @@ export async function provisionNewTenant(
   }
 
   await seedTenantDefaults(workspaceId);
+
+  try {
+    await seedHolidays(workspaceId);
+  } catch (err) {
+    sbtLogger.warn(`[TENANT PROVISION] Holiday seed step failed (non-fatal): ${err}`);
+  }
 
   sbtLogger.info(
     `[TENANT PROVISION] Complete for workspace: ${workspaceId}`,
