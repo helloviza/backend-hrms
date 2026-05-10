@@ -3,6 +3,8 @@ import express from "express";
 import ExcelJS from "exceljs";
 import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { blockTravelForSaas } from "../middleware/blockTravelForSaas.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import ManualBooking from "../models/ManualBooking.js";
@@ -14,6 +16,10 @@ import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 
 const router = express.Router();
 router.use(requireAuth);
+// Defense-in-depth: resolve the workspace and reject SaaS HRMS tenants
+// before any handler (which aggregates booking/invoice data globally) runs.
+router.use(requireWorkspace);
+router.use(blockTravelForSaas);
 
 /* ── Types ─────────────────────────────────────────────────────── */
 

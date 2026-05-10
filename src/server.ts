@@ -548,7 +548,7 @@ app.use("/api/proxy", proxyRouter);
 
 // Remote Work Presence & Video Collaboration
 app.use("/api/activity", activityRoutes);
-app.use("/api/presence", presenceRoutes);
+app.use("/api/presence", requireAuth, requireWorkspace, presenceRoutes);
 app.use("/api/meetings", meetingRoutes);
 
 // Sales CRM
