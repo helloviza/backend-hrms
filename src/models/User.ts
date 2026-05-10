@@ -144,6 +144,7 @@ const UserSchema = new Schema(
     bankName: { type: String, trim: true },
     bankAccountNumber: { type: String, trim: true },
     bankIfsc: { type: String, trim: true },
+    bankBranch: { type: String, trim: true },
 
     taxPan: { type: String, trim: true },
     tanOrTdsDetails: { type: String, trim: true },
@@ -200,6 +201,8 @@ const UserSchema = new Schema(
     /* Learning / performance / compliance (Learning tab)             */
     /* -------------------------------------------------------------- */
     educationalQualifications: { type: String, trim: true },
+    highestDegree: { type: String, trim: true },
+    institution: { type: String, trim: true },
     professionalCertifications: { type: String, trim: true },
     trainingHistory: { type: String, trim: true },
     skills: { type: String, trim: true },
