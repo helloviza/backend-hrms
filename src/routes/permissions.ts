@@ -10,6 +10,8 @@ import BillingPermission from '../models/BillingPermission.js'
 import User from '../models/User.js'
 import logger from '../utils/logger.js'
 import { MODULE_GROUP_MAP } from '../utils/moduleGroups.js'
+import CustomerWorkspace from '../models/CustomerWorkspace.js'
+import { allowedModuleKeysFor } from '../utils/featureToModules.js'
 
 const router = express.Router()
 
@@ -300,7 +302,26 @@ router.post('/grant', async (req: any, res: any) => {
       : String(req.workspaceObjectId)
 
     const levelMeta = LEVEL_METADATA.find(l => l.code === levelCode)
-    const modules = moduleOverrides ? { ...template, ...moduleOverrides } : { ...template }
+    const modules: Record<string, any> = moduleOverrides
+      ? { ...template, ...moduleOverrides }
+      : { ...template }
+
+    // Stage 3: feature-flag gate. Strip module keys whose required feature
+    // flags are not enabled on the caller's workspace. SuperAdmin bypasses;
+    // HOUSE workspace bypass is handled inside allowedModuleKeysFor.
+    if (!isSuper) {
+      const workspace = await CustomerWorkspace.findById(req.workspaceObjectId)
+      const allowed = allowedModuleKeysFor(workspace)
+      const disallowed = Object.keys(modules).filter(k => !allowed.has(k))
+      if (disallowed.length > 0) {
+        logger.warn(
+          `[permissions/grant] Stripped ${disallowed.length} disallowed module keys for tenant ${req.workspaceObjectId}: ${disallowed.join(', ')}`
+        )
+        for (const key of disallowed) {
+          delete modules[key]
+        }
+      }
+    }
 
     const adminEmail = String(req.user?.email || req.user?._id || 'unknown')
 
@@ -361,10 +382,23 @@ router.patch('/update', async (req: any, res: any) => {
     }
 
     // Tenant-admin scoping: existing doc must be in caller's workspace.
-    {
-      const isSuper = (req as any).isPlatformSuperAdmin === true
-      if (!isSuper && String(existing.workspaceId) !== String(req.workspaceObjectId)) {
-        return res.status(403).json({ success: false, message: 'Cannot modify permissions outside your workspace' })
+    const isSuper = (req as any).isPlatformSuperAdmin === true
+    if (!isSuper && String(existing.workspaceId) !== String(req.workspaceObjectId)) {
+      return res.status(403).json({ success: false, message: 'Cannot modify permissions outside your workspace' })
+    }
+
+    // Stage 3: feature-flag gate on incoming change-set only. Disallowed keys
+    // already present on the existing doc (legacy grants) are preserved as-is.
+    if (!isSuper && moduleChanges && typeof moduleChanges === 'object') {
+      const workspace = await CustomerWorkspace.findById(req.workspaceObjectId)
+      const allowed = allowedModuleKeysFor(workspace)
+      for (const key of Object.keys(moduleChanges)) {
+        if (!allowed.has(key)) {
+          logger.warn(
+            `[permissions/update] Stripped disallowed module key ${key} for tenant ${req.workspaceObjectId}`
+          )
+          delete (moduleChanges as any)[key]
+        }
       }
     }
 
@@ -434,16 +468,31 @@ router.post('/apply-template', async (req: any, res: any) => {
     }
 
     // Tenant-admin scoping: existing doc must be in caller's workspace.
-    {
-      const isSuper = (req as any).isPlatformSuperAdmin === true
-      if (!isSuper && String(existing.workspaceId) !== String(req.workspaceObjectId)) {
-        return res.status(403).json({ success: false, message: 'Cannot apply template outside your workspace' })
-      }
+    const isSuper = (req as any).isPlatformSuperAdmin === true
+    if (!isSuper && String(existing.workspaceId) !== String(req.workspaceObjectId)) {
+      return res.status(403).json({ success: false, message: 'Cannot apply template outside your workspace' })
     }
 
     const levelMeta = LEVEL_METADATA.find(l => l.code === levelCode)
 
-    existing.modules = { ...template } as any
+    // Stage 3: feature-flag gate. Filter the resolved template to only modules
+    // grantable for the caller's workspace. SuperAdmin and HOUSE bypass.
+    const modulesToApply: Record<string, any> = { ...template }
+    if (!isSuper) {
+      const workspace = await CustomerWorkspace.findById(req.workspaceObjectId)
+      const allowed = allowedModuleKeysFor(workspace)
+      const disallowed = Object.keys(modulesToApply).filter(k => !allowed.has(k))
+      if (disallowed.length > 0) {
+        logger.warn(
+          `[permissions/apply-template] Stripped ${disallowed.length} disallowed module keys for tenant ${req.workspaceObjectId}: ${disallowed.join(', ')}`
+        )
+        for (const key of disallowed) {
+          delete modulesToApply[key]
+        }
+      }
+    }
+
+    existing.modules = modulesToApply as any
     existing.level.code = levelCode
     existing.level.name = levelMeta?.name || levelCode
     existing.tier = levelToTier(levelCode)
