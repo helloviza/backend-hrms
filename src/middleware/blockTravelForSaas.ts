@@ -6,44 +6,71 @@ import User from "../models/User.js";
 
 /**
  * TRAVEL_BLOCKED_PREFIXES
- * Routes that SaaS HRMS tenants must not reach. Plumtrips and Travel
- * customer workspaces are unaffected. SUPERADMIN bypasses for ops debugging.
+ * Routes that SaaS HRMS tenants must not reach by default. Plumtrips and
+ * Travel customer workspaces are unaffected. SUPERADMIN bypasses for ops
+ * debugging.
+ *
+ * `allowFlags` (optional): if SuperAdmin has enabled at least one of the
+ * named features on the workspace's `config.features`, the block is lifted
+ * for that prefix. This is how a SAAS_HRMS tenant earns access to SBT or
+ * approval routes after SuperAdmin grants the corresponding flag.
+ *
+ * Prefixes WITHOUT `allowFlags` remain blanket-blocked for SAAS_HRMS — they
+ * are HOUSE-only operational tools (manual bookings, invoices for Travel,
+ * vouchers, vendors/customers, CRM, billing, etc.).
  */
-const TRAVEL_BLOCKED_PREFIXES = [
-  "/api/sbt",
-  "/api/v1/flights",
-  "/api/travel-forms",
-  "/api/booking-history",
-  "/api/v1/copilot/travel",
-  "/api/admin/manual-bookings",
-  "/api/admin/invoices",
-  "/api/admin/reports",
-  "/api/admin/unified",
-  "/api/admin/billing",
-  "/api/admin/sbt",
-  "/api/admin/tasks",
-  "/api/admin/tickets",
-  "/api/admin/analytics",
-  "/api/admin/email-templates",
-  "/api/admin/company-settings",
-  "/api/admin/payment-orphans",
-  "/api/admin/task-automations",
-  "/api/admin/proposals",
-  "/api/admin/account-team",
-  "/api/admin/direct-customers",
-  "/api/admin/eod-report",
-  "/api/admin/vouchers",
-  "/api/proposals",
-  "/api/preview",
-  "/api/leads",
-  "/api/crm",
-  "/api/vouchers",
-  "/api/approvals/admin",
-  "/api/eod-report",
-  "/api/presence",
+type BlockedPrefix = {
+  prefix: string;
+  allowFlags?: Array<keyof WorkspaceFeatureFlags>;
+};
+
+type WorkspaceFeatureFlags = {
+  sbtEnabled?: boolean;
+  approvalFlowEnabled?: boolean;
+  approvalDirectEnabled?: boolean;
+  [key: string]: boolean | undefined;
+};
+
+const TRAVEL_BLOCKED_PREFIXES: BlockedPrefix[] = [
+  // SBT — lifted when SuperAdmin enables sbtEnabled
+  { prefix: "/api/sbt", allowFlags: ["sbtEnabled"] },
+  { prefix: "/api/admin/sbt", allowFlags: ["sbtEnabled"] },
+
+  // Travel-approval flow — lifted when either approval feature is enabled
+  { prefix: "/api/proposals", allowFlags: ["approvalFlowEnabled", "approvalDirectEnabled"] },
+  { prefix: "/api/admin/proposals", allowFlags: ["approvalFlowEnabled", "approvalDirectEnabled"] },
+  { prefix: "/api/approvals/admin", allowFlags: ["approvalFlowEnabled", "approvalDirectEnabled"] },
+
+  // HOUSE-only — always blocked for SAAS_HRMS regardless of flags
+  { prefix: "/api/v1/flights" },
+  { prefix: "/api/travel-forms" },
+  { prefix: "/api/booking-history" },
+  { prefix: "/api/v1/copilot/travel" },
+  { prefix: "/api/admin/manual-bookings" },
+  { prefix: "/api/admin/invoices" },
+  { prefix: "/api/admin/reports" },
+  { prefix: "/api/admin/unified" },
+  { prefix: "/api/admin/billing" },
+  { prefix: "/api/admin/tasks" },
+  { prefix: "/api/admin/tickets" },
+  { prefix: "/api/admin/analytics" },
+  { prefix: "/api/admin/email-templates" },
+  { prefix: "/api/admin/company-settings" },
+  { prefix: "/api/admin/payment-orphans" },
+  { prefix: "/api/admin/task-automations" },
+  { prefix: "/api/admin/account-team" },
+  { prefix: "/api/admin/direct-customers" },
+  { prefix: "/api/admin/eod-report" },
+  { prefix: "/api/admin/vouchers" },
+  { prefix: "/api/preview" },
+  { prefix: "/api/leads" },
+  { prefix: "/api/crm" },
+  { prefix: "/api/vouchers" },
+  { prefix: "/api/eod-report" },
+  { prefix: "/api/presence" },
 ];
 
-const WS_SELECT = "_id customerId tenantType status";
+const WS_SELECT = "_id customerId tenantType status config";
 
 function getTokenFromRequest(req: Request): string | null {
   const hdr = req.headers.authorization;
@@ -137,6 +164,9 @@ async function resolveWorkspaceForUser(payload: any): Promise<any | null> {
  *  - Workspaces where tenantType is not "SAAS_HRMS" (Plumtrips + Travel customers)
  *  - Unauthenticated requests (let downstream auth return 401)
  *  - Paths that don't match any blocked prefix (fast-path)
+ *  - SAAS_HRMS workspaces where the matched prefix has `allowFlags` and
+ *    SuperAdmin has enabled at least one of them on `config.features`
+ *    (e.g. /api/sbt → sbtEnabled; /api/proposals → approval* flags)
  */
 export async function blockTravelForSaas(
   req: Request,
@@ -148,10 +178,10 @@ export async function blockTravelForSaas(
   // a per-route chain (where req.path becomes mount-relative).
   const fullPath = (req.originalUrl || req.url || "").split("?")[0];
 
-  const matchedPrefix = TRAVEL_BLOCKED_PREFIXES.find(
-    (prefix) => fullPath === prefix || fullPath.startsWith(prefix + "/"),
+  const matched = TRAVEL_BLOCKED_PREFIXES.find(
+    (entry) => fullPath === entry.prefix || fullPath.startsWith(entry.prefix + "/"),
   );
-  if (!matchedPrefix) {
+  if (!matched) {
     next();
     return;
   }
@@ -188,6 +218,18 @@ export async function blockTravelForSaas(
   if (!workspace || workspace.tenantType !== "SAAS_HRMS") {
     next();
     return;
+  }
+
+  // SAAS_HRMS tenant hitting a blocked prefix. If this prefix has allowFlags
+  // and the workspace has at least one of them enabled, lift the block.
+  if (matched.allowFlags && matched.allowFlags.length > 0) {
+    const features: WorkspaceFeatureFlags =
+      (workspace?.config?.features as WorkspaceFeatureFlags) || {};
+    const granted = matched.allowFlags.some((flag) => features[flag] === true);
+    if (granted) {
+      next();
+      return;
+    }
   }
 
   res.status(403).json({
