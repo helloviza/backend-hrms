@@ -48,6 +48,8 @@ export interface CustomerWorkspaceDocument extends Document {
   // Company identity
   companyName: string;
   companyLogo?: string;
+  companyLogoKey?: string;
+  themePreset?: "midnight" | "ivory" | "royal";
   gstNumber?: string;
   pan?: string;
   industry?: string;
@@ -176,6 +178,12 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
     // ── Company identity ──
     companyName: { type: String, trim: true, default: "" },
     companyLogo: { type: String },
+    companyLogoKey: { type: String },
+    themePreset: {
+      type: String,
+      enum: ["midnight", "ivory", "royal"],
+      required: false,
+    },
     gstNumber: { type: String, trim: true },
     pan: { type: String, trim: true },
     industry: { type: String, trim: true },

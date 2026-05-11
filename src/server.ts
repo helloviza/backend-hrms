@@ -414,8 +414,10 @@ app.use("/api/v1/workspace", expenseBandsRouter);
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";
+import workspaceBrandingRouter from "./routes/workspace.branding.js";
 app.use("/api/workspace/onboarding", onboardingRouter);
 app.use("/api/workspace/invites", inviteRouter);
+app.use("/api/workspace/branding", workspaceBrandingRouter);
 
 // SUPERADMIN provisioning
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin.js";
