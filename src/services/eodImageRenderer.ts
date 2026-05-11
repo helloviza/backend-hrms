@@ -55,7 +55,7 @@ export async function renderEodImage(html: string): Promise<Buffer> {
     // Mobile-portrait canvas at 2× device scale for crisp WhatsApp delivery.
     await page.setViewport({ width: 720, height: 1500, deviceScaleFactor: 2 });
 
-    await page.setContent(html, { waitUntil: "networkidle0", timeout: 30_000 });
+    await page.setContent(html, { waitUntil: "load", timeout: 30_000 });
 
     // Allow any CSS layout / SVG paint to settle
     await new Promise((r) => setTimeout(r, 250));
