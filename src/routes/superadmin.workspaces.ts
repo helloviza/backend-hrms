@@ -489,12 +489,79 @@ router.put("/workspaces/:workspaceId/features", async (req: any, res) => {
       changedBy: (req as any).user?._id,
     });
 
+    // Two-layer SBT access model: when SuperAdmin enables a Travel flow on a
+    // SAAS_HRMS tenant, propagate matching user-level grants to the workspace
+    // TENANT_ADMIN/WORKSPACE_LEADER so they can actually use the flow and
+    // delegate access to employees. Disabling never clears user state
+    // (Option B — preserve grants across re-enable). HOUSE tenants are
+    // untouched: their nav uses isHouseTenant bypass instead.
+    let userPropagation: {
+      applied: boolean;
+      feature: string;
+      updatedUsers: number;
+      userFields: string[];
+      skipped?: string;
+    } = {
+      applied: false,
+      feature,
+      updatedUsers: 0,
+      userFields: [],
+    };
+
+    try {
+      if (workspace.tenantType !== "SAAS_HRMS") {
+        userPropagation.skipped = "non-saas-tenant";
+      } else if (!enabled) {
+        userPropagation.skipped = "disable-preserves-user-state";
+      } else {
+        let userSet: Record<string, any> | null = null;
+        if (feature === "sbtEnabled") {
+          userSet = { sbtEnabled: true, sbtRole: "BOTH", canManageUsers: true };
+        } else if (feature === "approvalFlowEnabled" || feature === "approvalDirectEnabled") {
+          userSet = { canRaiseRequest: true, canManageUsers: true };
+        }
+
+        if (userSet) {
+          const result = await User.updateMany(
+            {
+              workspaceId: workspace._id,
+              roles: { $in: ["TENANT_ADMIN", "WORKSPACE_LEADER"] },
+            },
+            { $set: userSet },
+          );
+          userPropagation = {
+            applied: true,
+            feature,
+            updatedUsers: (result as any).modifiedCount ?? (result as any).nModified ?? 0,
+            userFields: Object.keys(userSet),
+          };
+        } else {
+          userPropagation.skipped = "feature-has-no-user-level-grants";
+        }
+      }
+    } catch (propErr: any) {
+      logger.error("User-level propagation failed (workspace toggle preserved)", {
+        workspaceId: req.params.workspaceId,
+        feature,
+        enabled,
+        err: propErr?.message,
+      });
+      userPropagation = {
+        applied: false,
+        feature,
+        updatedUsers: 0,
+        userFields: [],
+        skipped: `error: ${propErr?.message || "unknown"}`,
+      };
+    }
+
     res.json({
       success: true,
       workspace: {
         _id: workspace._id,
         config: { features: workspace.config.features },
       },
+      userPropagation,
     });
   } catch (err: any) {
     logger.error("PUT /workspaces/:workspaceId/features failed");

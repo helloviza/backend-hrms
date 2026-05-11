@@ -569,6 +569,24 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
       return res.json(mockFlightSearch);
     }
     const { JourneyType, segments, Sources, ...rest } = req.body;
+
+    // Plumtrips-only feature gate: Advance Search (JT=4) and Special Return (JT=5)
+    // are HOUSE Plumtrips operations. Reject for SaaS tenants regardless of role.
+    const jtGate = Number(JourneyType);
+    if ((jtGate === 4 || jtGate === 5) && req.workspace?.tenantType === "SAAS_HRMS") {
+      const userRoles = (req.user?.roles || []).map((r: string) =>
+        String(r).toUpperCase().replace(/[\s\-_]/g, "")
+      );
+      const isSuperAdmin = userRoles.includes("SUPERADMIN");
+      if (!isSuperAdmin) {
+        return res.status(403).json({
+          success: false,
+          error: "FEATURE_NOT_AVAILABLE",
+          message: "Advance Search and Special Return are not available on your plan.",
+        });
+      }
+    }
+
     if (JourneyType === 3 || JourneyType === "3") {
       const result: any = await searchMultiCity({ segments, adults: rest.adults, children: rest.children, infants: rest.infants });
       const mcStatus = result?.Response?.ResponseStatus ?? result?.Response?.Status;
