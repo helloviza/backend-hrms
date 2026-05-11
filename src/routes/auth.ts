@@ -21,6 +21,7 @@ import { UserPermission } from "../models/UserPermission.js";
 import { generateTravelerId } from "../utils/travelerId.js";
 import TenantSetupProgress from "../models/TenantSetupProgress.js";
 import { stripTravelFields } from "../utils/stripTravelFields.js";
+import { signLogoUrl } from "../utils/signLogoUrl.js";
 
 const r = Router();
 
@@ -1020,10 +1021,21 @@ r.get("/me", async (req, res) => {
       const wsId = (user as any).workspaceId;
       if (wsId) {
         const ws = await CustomerWorkspace.findById(wsId)
-          .select("_id customerId slug companyName companyLogo plan status source tenantType config onboardingStep trialEndsAt")
+          .select("_id customerId slug companyName companyLogo companyLogoKey plan status source tenantType config onboardingStep trialEndsAt")
           .lean();
 
         if (ws) {
+          const logoKey = (ws as any).companyLogoKey as string | undefined;
+          if (logoKey) {
+            try {
+              (ws as any).companyLogo = await signLogoUrl(logoKey);
+            } catch (signErr) {
+              console.error("[/auth/me] signLogoUrl failed:", signErr);
+              (ws as any).companyLogo = "";
+            }
+          } else {
+            (ws as any).companyLogo = "";
+          }
           workspaceData = ws;
 
           // Only fetch setupProgress for SaaS HRMS tenants

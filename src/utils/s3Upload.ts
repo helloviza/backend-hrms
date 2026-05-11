@@ -54,3 +54,28 @@ export async function uploadBufferToS3(opts: {
 
   return { bucket, key, url: buildPublicUrl(bucket, key) };
 }
+
+export async function uploadLogoToS3(opts: {
+  buffer: Buffer;
+  mime: string;
+  ext: string;
+  customerId: string;
+}): Promise<{ url: string; key: string }> {
+  const bucket = env.S3_BUCKET;
+  const ext = opts.ext.toLowerCase().replace(/[^a-z0-9]/g, "") || "bin";
+  const key = `hrms/branding/${opts.customerId}/logo-${Date.now()}.${ext}`;
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: opts.buffer,
+      ContentType: opts.mime,
+      Metadata: {
+        customerId: opts.customerId,
+      },
+    })
+  );
+
+  return { key, url: buildPublicUrl(bucket, key) };
+}
