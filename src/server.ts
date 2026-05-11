@@ -296,6 +296,28 @@ app.get("/api/_probe", (_req, res) => {
   res.status(200).send("ok");
 });
 
+// TEMPORARY DEBUG ROUTE — REMOVE AFTER TBO IP VERIFICATION (created May 2026)
+app.get("/api/debug/myip", async (_req, res) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const upstream = await fetch("https://api.ipify.org?format=json", {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    const data = await upstream.json();
+    console.log("[DEBUG_MYIP]", data);
+    return res.status(200).json(data);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.log("[DEBUG_MYIP] error", message);
+    return res.status(502).json({ ok: false, error: message });
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
 /* ────────────────────────────────────────────────────────────────
  * SAFE MOUNT (optional)
  * ──────────────────────────────────────────────────────────────── */
