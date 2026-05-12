@@ -8,6 +8,9 @@ import Policy from "../models/Policy.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
+import { uploadBufferToS3 } from "../utils/s3Upload.js";
+import { presignGetObject } from "../utils/s3Presign.js";
+import { env } from "../config/env.js";
 
 const router = express.Router();
 
@@ -52,6 +55,11 @@ function resolveUserCustomerId(user: any): string | null {
 /** Returns 'ADMIN' | 'L0' | false depending on management capability */
 function canManage(user: any): "ADMIN" | "L0" | false {
   if (isStaffAdmin(user)) return "ADMIN";
+  // SaaS HRMS workspace owners — they administer their own workspace
+  // and have no customerId/businessId, so the L0 branch (which requires
+  // those fields) cannot serve them. Promote to ADMIN tier.
+  const nr = normRoles(user);
+  if (nr.includes("TENANTADMIN") || nr.includes("WORKSPACELEADER")) return "ADMIN";
   if (isL0(user)) return "L0";
   return false;
 }
@@ -60,8 +68,20 @@ function canManage(user: any): "ADMIN" | "L0" | false {
    Policy query filter based on user role
 ----------------------------------------------------------- */
 
-function buildPolicyFilter(user: any): Record<string, any> {
-  // Staff admin sees everything
+function buildPolicyFilter(user: any, req?: any): Record<string, any> {
+  // SaaS HRMS tenants are isolated to their own workspace's policies plus
+  // any platform-wide GLOBAL announcements (created by HOUSE). They never
+  // see other tenants' WORKSPACE policies or HOUSE ORG policies.
+  if (req?.workspace?.tenantType === "SAAS_HRMS") {
+    return {
+      $or: [
+        { scope: "WORKSPACE", workspaceId: req.workspaceObjectId },
+        { scope: "GLOBAL" },
+      ],
+    };
+  }
+
+  // HOUSE staff admin sees everything
   if (isStaffAdmin(user)) return {};
 
   const custId = resolveUserCustomerId(user);
@@ -93,26 +113,13 @@ function buildPolicyFilter(user: any): Record<string, any> {
 }
 
 /* -----------------------------------------------------------
-   File upload setup for policy PDFs
+   File upload setup for policy PDFs (memory → S3, voucher pattern)
 ----------------------------------------------------------- */
 
-const POLICY_UPLOAD_DIR = path.join(process.cwd(), "uploads", "policies");
-fs.mkdirSync(POLICY_UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination(_req, _file, cb) {
-    cb(null, POLICY_UPLOAD_DIR);
-  },
-  filename(_req, file, cb) {
-    const safeName = file.originalname.replace(/[^a-zA-Z0-9.\-_\s]/g, "_");
-    cb(null, `${Date.now()}-${safeName}`);
-  },
-});
-
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: {
-    fileSize: 15 * 1024 * 1024, // 15 MB
+    fileSize: 25 * 1024 * 1024, // 25 MB
   },
   fileFilter(_req, file, cb) {
     const allowed = [
@@ -133,9 +140,9 @@ const upload = multer({
    Root list endpoint — the frontend calls api.get("/hr/policies").
    Returns policies scoped to the caller's role / org.
 ----------------------------------------------------------- */
-router.get("/", requireAuth, async (req: any, res, next) => {
+router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
-    const filter = buildPolicyFilter(req.user);
+    const filter = buildPolicyFilter(req.user, req);
     const items = await Policy.find(filter)
       .sort({ createdAt: 1 })
       .lean()
@@ -151,9 +158,9 @@ router.get("/", requireAuth, async (req: any, res, next) => {
    GET /api/hr/policies/list
    Legacy alias — same logic as GET /.
 ----------------------------------------------------------- */
-router.get("/list", requireAuth, async (req: any, res, next) => {
+router.get("/list", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
-    const filter = buildPolicyFilter(req.user);
+    const filter = buildPolicyFilter(req.user, req);
     const items = await Policy.find(filter)
       .sort({ createdAt: 1 })
       .lean()
@@ -171,7 +178,7 @@ router.get("/list", requireAuth, async (req: any, res, next) => {
    L0: create ORG-scoped policy for own org only.
    L1/L2/Employee: 403.
 ----------------------------------------------------------- */
-router.post("/", requireAuth, async (req: any, res, next) => {
+router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     const mgmt = canManage(req.user);
     if (!mgmt) {
@@ -195,7 +202,7 @@ router.post("/", requireAuth, async (req: any, res, next) => {
             .filter(Boolean)
         : [];
 
-    let finalScope = scope || "GLOBAL";
+    let finalScope = scope || "ORG";
     let finalCustomerId = customerId || null;
 
     if (mgmt === "L0") {
@@ -207,6 +214,21 @@ router.post("/", requireAuth, async (req: any, res, next) => {
           .status(403)
           .json({ error: "Cannot determine your organization" });
       }
+    }
+
+    // Defensive: silently coerce GLOBAL writes to ORG. We've stopped
+    // surfacing GLOBAL in the UI; this is the safety net for older
+    // clients still posting scope=GLOBAL.
+    if (finalScope === "GLOBAL") {
+      finalScope = "ORG";
+    }
+
+    // SaaS tenants are forced to WORKSPACE scope so policies never leak
+    // across tenants. Must run before the ORG/customerId validation below.
+    const isSaasTenant = req.workspace?.tenantType === "SAAS_HRMS";
+    if (isSaasTenant) {
+      finalScope = "WORKSPACE";
+      finalCustomerId = null;
     }
 
     if (finalScope === "ORG" && !finalCustomerId && mgmt === "ADMIN") {
@@ -223,6 +245,7 @@ router.post("/", requireAuth, async (req: any, res, next) => {
       kind: "URL",
       scope: finalScope,
       customerId: finalScope === "ORG" ? finalCustomerId : undefined,
+      workspaceId: req.workspaceObjectId,
       visibility: visibility || "ALL",
       uploadedBy: req.user?._id,
       createdBy: req.user?._id,
@@ -244,6 +267,7 @@ router.post("/", requireAuth, async (req: any, res, next) => {
 router.post(
   "/upload",
   requireAuth,
+  requireWorkspace,
   upload.single("file"),
   async (req: any, res, next) => {
     try {
@@ -253,7 +277,7 @@ router.post(
       }
 
       const file = req.file;
-      if (!file) {
+      if (!file || !file.buffer) {
         return res.status(400).json({ error: "File is required" });
       }
 
@@ -261,8 +285,6 @@ router.post(
         req.body || {};
       const effectiveTitle =
         (title && String(title).trim()) || file.originalname;
-
-      const relativePath = `/uploads/policies/${file.filename}`;
 
       const tagArray: string[] = Array.isArray(tags)
         ? tags
@@ -273,7 +295,7 @@ router.post(
               .filter(Boolean)
           : [];
 
-      let finalScope = scope || "GLOBAL";
+      let finalScope = scope || "ORG";
       let finalCustomerId = customerId || null;
 
       if (mgmt === "L0") {
@@ -286,26 +308,110 @@ router.post(
         }
       }
 
+      // Defensive: silently coerce GLOBAL writes to ORG so we stop
+      // accumulating new GLOBAL docs. Existing GLOBAL docs in Mongo are
+      // untouched and remain visible to HOUSE staff admins.
+      if (finalScope === "GLOBAL") {
+        finalScope = "ORG";
+      }
+
+      // SaaS tenants are forced to WORKSPACE scope so policies never leak
+      // across tenants. Must run before any ORG/customerId validation.
+      const isSaasTenant = req.workspace?.tenantType === "SAAS_HRMS";
+      if (isSaasTenant) {
+        finalScope = "WORKSPACE";
+        finalCustomerId = null;
+      }
+
+      const uploaderId = String(req.user?._id || req.user?.id || req.user?.sub || "");
+      const tenantBucketScope = String(req.workspaceObjectId || uploaderId || "policies");
+
+      const uploaded = await uploadBufferToS3({
+        buffer: file.buffer,
+        mime: file.mimetype,
+        originalName: file.originalname,
+        customerId: tenantBucketScope,
+        createdBy: uploaderId,
+      });
+
       const policy = await Policy.create({
         title: effectiveTitle,
-        url: relativePath,
-        fileUrl: relativePath,
-        storagePath: relativePath,
         category: category ? String(category).trim() : undefined,
         tags: tagArray,
         kind: "FILE",
         scope: finalScope,
         customerId: finalScope === "ORG" ? finalCustomerId : undefined,
+        workspaceId: req.workspaceObjectId,
         visibility: visibility || "ALL",
         fileName: file.originalname,
         mimeType: file.mimetype,
         size: file.size,
+        s3: { bucket: uploaded.bucket, key: uploaded.key },
         uploadedBy: req.user?._id,
         createdBy: req.user?._id,
         updatedBy: req.user?._id,
       });
 
       res.json(policy);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/* -----------------------------------------------------------
+   GET /api/hr/policies/:id/open
+   Returns a short-lived signed S3 URL the frontend uses for the
+   iframe / "Open in new tab" / download. Visibility is re-checked
+   against the same filter the list endpoint applies — a user can
+   only open a policy they're allowed to see.
+
+   For kind === "URL" we return the stored external link as-is.
+   Legacy disk-storage FILE policies (no `s3` sub-doc) return 410
+   with code "LEGACY_POLICY" so the UI can show a re-upload prompt.
+----------------------------------------------------------- */
+router.get(
+  "/:id/open",
+  requireAuth,
+  requireWorkspace,
+  async (req: any, res, next) => {
+    try {
+      const filter = buildPolicyFilter(req.user, req);
+      const policy: any = await Policy.findOne({
+        _id: req.params.id,
+        ...filter,
+      }).lean();
+
+      if (!policy) {
+        return res.status(404).json({ error: "Policy not found" });
+      }
+
+      if (policy.kind === "URL") {
+        const externalUrl = String(policy.url || "").trim();
+        if (!externalUrl) {
+          return res.status(404).json({ error: "Policy has no URL" });
+        }
+        return res.json({ url: externalUrl });
+      }
+
+      const bucket = policy?.s3?.bucket;
+      const key = policy?.s3?.key;
+      if (!bucket || !key) {
+        return res.status(410).json({
+          error:
+            "This policy file was uploaded under the old storage system. Please re-upload it.",
+          code: "LEGACY_POLICY",
+        });
+      }
+
+      const signedUrl = await presignGetObject({
+        bucket,
+        key,
+        filename: policy.fileName || "policy.pdf",
+        expiresInSeconds: env.PRESIGN_TTL || 900,
+      });
+
+      return res.json({ url: signedUrl });
     } catch (err) {
       next(err);
     }
