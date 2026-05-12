@@ -6,9 +6,10 @@ const PolicySchema = new Schema(
   {
     title: { type: String, required: true, trim: true },
 
-    // For both URL and uploaded file we store a URL-ish string here.
-    // For uploaded files this will be something like `/uploads/policies/1234-file.pdf`.
-    url: { type: String, required: true, trim: true },
+    // Legacy field: for URL-kind policies this holds the external link.
+    // For pre-S3 FILE uploads it held `/uploads/policies/...`. New FILE
+    // uploads leave this undefined and use the `s3` sub-doc below instead.
+    url: { type: String, trim: true },
 
     category: {
       type: String,
@@ -28,7 +29,7 @@ const PolicySchema = new Schema(
     // Tenant scoping: GLOBAL = visible to all, ORG = org-specific
     scope: {
       type: String,
-      enum: ["GLOBAL", "ORG"],
+      enum: ["GLOBAL", "ORG", "WORKSPACE"],
       default: "GLOBAL",
     },
 
@@ -44,14 +45,22 @@ const PolicySchema = new Schema(
       default: "ALL",
     },
 
-    // S3 / external file URL (when kind === 'FILE')
+    // Legacy fields kept for back-compat with pre-S3 FILE uploads. New
+    // uploads do NOT populate these — they use `s3` below.
     fileUrl: { type: String, trim: true },
+    storagePath: { type: String, trim: true },
+
+    // Canonical S3 location for new FILE uploads (voucher pattern).
+    // Both subfields optional so legacy docs (no s3) still load fine.
+    s3: {
+      bucket: { type: String, trim: true },
+      key: { type: String, trim: true },
+    },
 
     // Extra metadata when kind === "FILE"
     fileName: { type: String, trim: true },
     mimeType: { type: String, trim: true },
     size: { type: Number },
-    storagePath: { type: String, trim: true }, // usually same as `url` for FILE
 
     uploadedBy: { type: Schema.Types.ObjectId, ref: "User" },
     createdBy: { type: Schema.Types.ObjectId, ref: "User" },

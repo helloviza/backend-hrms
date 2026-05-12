@@ -45,7 +45,6 @@ export async function uploadBufferToS3(opts: {
       Body: opts.buffer,
       ContentType: opts.mime,
       Metadata: {
-        originalName: opts.originalName,
         customerId: opts.customerId,
         createdBy: opts.createdBy,
       },
