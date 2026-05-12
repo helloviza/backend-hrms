@@ -9,6 +9,10 @@ import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
 import { getBookingDetail } from "../services/tbo.hotel.service.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 import logger from "../utils/logger.js";
+import { runDeferredStatusCheckSweep } from "./deferred-status-check.js";
+
+// Prevents overlapping sweeps if a tick runs slower than the cron interval.
+let _deferredSweepRunning = false;
 
 async function verifyWithTBO(bookingId: number): Promise<string | null> {
   try {
@@ -208,4 +212,21 @@ export function startOrphanPendingCleanupCron(): void {
     }
   });
   logger.info("[OrphanCleanup] Cron scheduled — hourly at :30");
+
+  // TBO cert Item 31 — durability backstop for the in-process 120s setTimeout
+  // scheduled by /sbt/hotels/book. If the container restarts (App Runner cycle,
+  // crash, deploy) before the timer fires, this sweep picks up the pending
+  // booking via pendingStatusCheckAt index and runs GetBookingDetail.
+  cron.schedule("* * * * *", async () => {
+    if (_deferredSweepRunning) return;
+    _deferredSweepRunning = true;
+    try {
+      await runDeferredStatusCheckSweep();
+    } catch (err: any) {
+      logger.error("[DeferredStatusCheck] Sweep failed", { error: err?.message });
+    } finally {
+      _deferredSweepRunning = false;
+    }
+  });
+  logger.info("[DeferredStatusCheck] Cron scheduled — every 1 minute");
 }

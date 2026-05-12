@@ -106,6 +106,11 @@ export interface ISBTHotelBooking extends Document {
   bookingDetailFetched?: boolean;
   bookingDetailFetchedAt?: Date | null;
   bookingDetailRaw?: unknown;
+  // TBO cert Item 31 — defer GetBookingDetail by ≥120s after Book.
+  pendingStatusCheckAt?: Date | null;
+  statusCheckDone?: boolean;
+  statusCheckAttempts?: number;
+  lastStatusCheckAt?: Date | null;
   bookedAt: Date;
   cancelledAt?: Date;
   closedAt?: Date;
@@ -222,6 +227,11 @@ const SBTHotelBookingSchema = new Schema(
     bookingDetailFetched: { type: Boolean, default: false },
     bookingDetailFetchedAt: { type: Date, default: null },
     bookingDetailRaw: { type: Schema.Types.Mixed, default: null },
+    // TBO cert Item 31 — defer GetBookingDetail by ≥120s after Book.
+    pendingStatusCheckAt: { type: Date, default: null, index: true },
+    statusCheckDone: { type: Boolean, default: false, index: true },
+    statusCheckAttempts: { type: Number, default: 0 },
+    lastStatusCheckAt: { type: Date, default: null },
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
     closedAt: { type: Date },
@@ -253,6 +263,8 @@ SBTHotelBookingSchema.index(
 );
 SBTHotelBookingSchema.index({ confirmationNo: 1 });
 SBTHotelBookingSchema.index({ clientReferenceId: 1 }, { unique: true, sparse: true });
+// TBO cert Item 31 — cron sweep query: find due deferred checks fast.
+SBTHotelBookingSchema.index({ pendingStatusCheckAt: 1, statusCheckDone: 1 });
 
 /* ── Sync to TravelBooking on save ── */
 function mapStatus(s: string): "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" {

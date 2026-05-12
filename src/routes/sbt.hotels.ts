@@ -21,12 +21,16 @@ import { getCompanySettings } from "../utils/companySettings.js";
 import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES, type HotelCity } from "../shared/cities.js";
 import { resolveCityCode as resolveCityCodeAgainstCatalog } from "../jobs/static-data-refresh.js";
 import { parseTBODate } from "../lib/tbo-date.js";
-import { normalizeTitle } from "../lib/normalize.js";
 import ManualDateChangeRequest from "../models/ManualDateChangeRequest.js";
 import {
   deriveStateFromBookResponse,
   deriveStateFromVoucherResponse,
 } from "../utils/tboBookingStateMapper.js";
+import { runDeferredStatusCheck } from "../jobs/deferred-status-check.js";
+import { BLOCKED_CORPORATE_PANS } from "../config/corporate-pan-blocklist.js";
+
+// TBO cert Item 31 — TBO recommends ≥120s before calling GetBookingDetail.
+const DEFERRED_STATUS_CHECK_DELAY_MS = 120_000;
 
 // ── Mock data (TBO_ENV=mock) ─────────────────────────────────────────────
 const MOCK_CITIES = [
@@ -442,6 +446,15 @@ function validateBookingCriteria(p: BookingValidationPayload): ValidationError[]
           code: "CORPORATE_PAN_FORMAT_INVALID",
           message: "Please enter a valid Corporate PAN (format: AAAAA1234A).",
         });
+      } else if (BLOCKED_CORPORATE_PANS.has(corpPAN)) {
+        // TBO spec lines 2782–2786: agency PAN and TBO PAN are not permitted as Corporate PAN.
+        errors.push({
+          field: "corporatePAN",
+          code: "CORPORATE_PAN_BLOCKED",
+          message:
+            "This PAN cannot be used for corporate bookings. Please enter the guest " +
+            "company's PAN. Agency PAN and supplier PAN are not permitted.",
+        });
       }
     }
   }
@@ -525,6 +538,58 @@ function validateBookingCriteria(p: BookingValidationPayload): ValidationError[]
     const explicitEmail = String(leadPax?.Email || "").trim();
     if (explicitEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(explicitEmail)) {
       errors.push({ field: fp(ri, leadPi, "Email"), code: "EMAIL_INVALID", message: `Room ${ri + 1} lead guest email, if provided, must be valid.` });
+    }
+  }
+
+  // ── TBO cert items 24, 26, 7 — placeholder/hardcode rejection (defense-in-depth) ──
+  // Audit ref: infra/audit/tbo-team-fixes-verification-2026-05-12.md
+  // These rules reject the exact placeholder strings TBO flagged ("Mstr", "Child1",
+  // "Guest" cloned across all paxes) even if buildRoomPassengers were to regress.
+  const PLACEHOLDER_FN_PATTERNS: ReadonlyArray<RegExp> = [
+    /^Child\d*$/i,
+    /^Adult\d*$/i,
+    /^Pax\d*$/i,
+  ];
+  for (const { g, ri, pi } of allIndexed) {
+    const fn = String(g?.FirstName ?? "").trim();
+    if (PLACEHOLDER_FN_PATTERNS.some((re) => re.test(fn))) {
+      errors.push({ field: fp(ri, pi, "FirstName"), code: "FIRSTNAME_PLACEHOLDER", message: `Passenger ${pi + 1}: "${fn}" looks like a placeholder. Please enter the passenger's real first name.` });
+    }
+    if (fn.toLowerCase() === "test") {
+      errors.push({ field: fp(ri, pi, "FirstName"), code: "FIRSTNAME_TEST_REJECTED", message: `Passenger ${pi + 1}: FirstName cannot be "test".` });
+    }
+    if (/\d/.test(fn)) {
+      errors.push({ field: fp(ri, pi, "FirstName"), code: "FIRSTNAME_HAS_DIGITS", message: `Passenger ${pi + 1}: FirstName cannot contain digits.` });
+    }
+  }
+
+  // Child Title — TBO accepts {Mr, Mrs, Miss, Ms}; for children we narrow to {Mr, Miss}
+  // per cert remark 24 and the FE child-title dropdown.
+  const VALID_CHILD_TITLES = new Set(["Mr", "Miss"]);
+  for (const { g, ri, pi } of children) {
+    if (!VALID_CHILD_TITLES.has(g?.Title)) {
+      errors.push({ field: fp(ri, pi, "Title"), code: "CHILD_TITLE_INVALID", message: `Child passenger ${pi + 1}: Title must be Mr or Miss (received: ${g?.Title ?? "none"}).` });
+    }
+  }
+
+  // Child FirstName / LastName — presence required (no auto-synthesis allowed).
+  for (const { g, ri, pi } of children) {
+    const fn = String(g?.FirstName ?? "").trim();
+    const ln = String(g?.LastName ?? "").trim();
+    if (fn.length < 2) {
+      errors.push({ field: fp(ri, pi, "FirstName"), code: "CHILD_FIRSTNAME_REQUIRED", message: `Child passenger ${pi + 1}: First name must be at least 2 characters.` });
+    }
+    if (ln.length < 1) {
+      errors.push({ field: fp(ri, pi, "LastName"), code: "CHILD_LASTNAME_REQUIRED", message: `Child passenger ${pi + 1}: Last name is required.` });
+    }
+  }
+
+  // Cloned-"Guest" LastName detection — fires when every pax has the literal LastName
+  // "Guest", which is the legacy hardcoded fallback pattern TBO flagged on item 26.
+  if (allIndexed.length > 0) {
+    const allLn = allIndexed.map(({ g }) => String(g?.LastName ?? "").trim().toLowerCase());
+    if (allLn.every((ln) => ln === "guest")) {
+      errors.push({ field: "HotelRoomsDetails", code: "LASTNAME_PLACEHOLDER_CLONE", message: "All passengers have LastName 'Guest'. Please supply real last names." });
     }
   }
 
@@ -1702,7 +1767,10 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       return res.status(400).json({ error: _valErrors[0].message, errors: _valErrors, valid: false });
     }
 
-    // Design C: per-room passenger builder — children auto-generated, adults fully mapped.
+    // Per-room passenger builder — Title/FirstName/LastName/MiddleName flow VERBATIM from
+    // the request payload (TBO cert items 24, 26, 7; verification report 2026-05-12).
+    // The /book route's validateBookingCriteria gate runs before this builder and rejects
+    // empty/placeholder values; therefore no normalize/trim/substring/default is applied here.
     // PAN handling per TBO confirmation (2026-05-05):
     //   Domestic India hotel  → omit PAN entirely on every passenger.
     //   International hotel   → copy lead-adult's PAN onto every passenger (adults + children).
@@ -1711,22 +1779,19 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       const roomGuests: any[] = room.Guests ?? room.HotelPassenger ?? [];
       const leadAdult = roomGuests.find((g: any) => Number(g.PaxType) === 1 && g.LeadPassenger)
         ?? roomGuests.find((g: any) => Number(g.PaxType) === 1);
-      const leadAdultLastName = (String(leadAdult?.LastName || "Guest").trim() || "Guest").substring(0, 25);
 
-      let childIdx = 0;
       return roomGuests.map((g: any) => {
         if (Number(g.PaxType) === 2) {
-          // Auto-generate child Title/FirstName/LastName per industry standard.
-          // Names are not collected from users for child paxes; TBO accepts synthesized values.
+          // Child passenger — Title/FirstName/LastName supplied by the user and forwarded verbatim.
           // No Phoneno/Email/PassportNo keys — fields must be absent, not null (Rule 5 forbidden list).
           const childPax: Record<string, unknown> = {
-            Title: "Mstr",
-            FirstName: `Child${++childIdx}`,
-            LastName: leadAdultLastName || "Guest",
-            MiddleName: "",
+            Title: g.Title,
+            FirstName: g.FirstName,
+            LastName: g.LastName,
+            MiddleName: g.MiddleName ?? "",
             PaxType: 2,
             LeadPassenger: false,
-            Age: Number(g.Age) || 8,
+            Age: Number(g.Age),
           };
           // International: TBO requires lead's PAN to be carried on children too.
           // TBO confirmation 2026-05-05: international hotels propagate lead PAN onto every
@@ -1749,15 +1814,14 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
           return childPax;
         }
 
-        // Adult passenger
-        // Item 1: normalizeTitle strips trailing period (TBO spec: Mr/Mrs/Ms not Mr./Mrs./Ms.)
-        // Item 2: Phoneno/Email omitted entirely when empty (TBO rejects empty-string contact fields)
+        // Adult passenger — Title/FirstName/LastName/MiddleName forwarded verbatim.
+        // Phoneno/Email omitted entirely when empty (TBO rejects empty-string contact fields).
         const isRoomLead = g === leadAdult;
         const base: Record<string, unknown> = {
-          Title: normalizeTitle(g.Title || "Mr"),
-          FirstName: String(g.FirstName || "").trim().substring(0, 25),
-          LastName: String(g.LastName || "").trim().substring(0, 25),
-          MiddleName: "",
+          Title: g.Title,
+          FirstName: g.FirstName,
+          LastName: g.LastName,
+          MiddleName: g.MiddleName ?? "",
           Nationality: GuestNationality,
           PaxType: 1,
           LeadPassenger: isRoomLead,
@@ -1971,52 +2035,14 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     async function sendSuccessAndVoucher(result: any, data: any) {
       const isHeld = bookingMode === "hold";
 
-      // For hold bookings: Book response rarely includes LastVoucherDate.
-      // Call GetBookingDetail immediately to retrieve it and store PaxIds for PAN-at-voucher-time.
-      let holdPaxDetails: Array<{ paxId: string; firstName: string; lastName: string; paxType: number }> = [];
-      let holdTboReferenceNo: string | null = null;
-      let holdRoomDescription: string | null = null;
-      let holdLastVoucherDate: Date | undefined;
-      let holdLastCancellationDate: Date | undefined;
-      let holdBookingDetailRaw: any = null;
-      if (isHeld && result?.BookingId) {
-        try {
-          const details = await verifyBookingStatus(Number(result.BookingId));
-          const detailVoucherDate =
-            details?.LastVoucherDate ??
-            details?.HotelRoomsDetails?.[0]?.LastVoucherDate ??
-            null;
-          if (detailVoucherDate && !result.LastVoucherDate) {
-            result = { ...result, LastVoucherDate: detailVoucherDate };
-          }
-          // POST-001: Extract PaxIds for PAN-at-voucher-time (hold + PanMandatory flow).
-          const allPassengers: any[] = (details?.HotelRoomsDetails ?? []).flatMap(
-            (room: any) => room?.HotelPassenger ?? []
-          );
-          holdPaxDetails = allPassengers
-            .filter((p: any) => p?.PaxId)
-            .map((p: any) => ({
-              paxId: String(p.PaxId),
-              firstName: p.FirstName || "",
-              lastName: p.LastName || "",
-              paxType: Number(p.PaxType) || 1,
-            }));
-          holdTboReferenceNo = details?.TBOReferenceNo || null;
-          holdRoomDescription =
-            details?.HotelRoomsDetails?.[0]?.RoomDescription ||
-            details?.HotelRoomsDetails?.[0]?.RoomTypeName || null;
-          // Hold deadline persistence (spec line 2496). Without these, Sprint 2A's idempotency
-          // guard at line 2447 is bypassed and TBO can auto-cancel held bookings silently.
-          const _hldVD = details?.LastVoucherDate ? parseTBODate(details.LastVoucherDate) : null;
-          holdLastVoucherDate = _hldVD ?? undefined;
-          const _hldCD = details?.LastCancellationDate ? parseTBODate(details.LastCancellationDate) : null;
-          holdLastCancellationDate = _hldCD ?? undefined;
-          holdBookingDetailRaw = details ?? null;
-        } catch (detailErr) {
-          console.debug('[HOLD-BOOK] GetBookingDetail failed:', detailErr instanceof Error ? detailErr.message : String(detailErr));
-        }
-      }
-
+      // TBO cert Item 31 — DO NOT call GetBookingDetail synchronously here.
+      // TBO requires waiting ≥120s before calling it; the deferred-status-check
+      // scheduled below handles paxDetails, roomDescription, lastVoucherDate, etc.
+      // What we CAN do inline: read fields the Book response already gave us.
+      const bookResponseTboRefNo: string | null =
+        (result as any)?.TBOReferenceNo
+          ? String((result as any).TBOReferenceNo)
+          : null;
 
       const lastVoucherDate =
         result?.LastVoucherDate ??
@@ -2048,8 +2074,13 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       const derivedState = deriveStateFromBookResponse(result, {
         isVoucherBookingRequest: !isHeld,
       });
+      // TBO cert Item 31 — schedule GetBookingDetail 120s after Book. The cron
+      // sweep in orphan-pending-cleanup.ts also picks up this booking via the
+      // pendingStatusCheckAt index, so the check survives a server restart.
+      const _deferredCheckAt = new Date(Date.now() + DEFERRED_STATUS_CHECK_DELAY_MS);
+      let _savedBookingDocId: string | null = null;
       try {
-        await SBTHotelBooking.findOneAndUpdate(
+        const _savedDoc = await SBTHotelBooking.findOneAndUpdate(
           { clientReferenceId: clientRef },
           { $set: {
             // State flags — all four fields written together, never as a subset.
@@ -2067,26 +2098,22 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             // PAN audit (TBO conf 2026-05-05) — international + corporate flow.
             isCorporateBooking: !!isCorporateBooking,
             ...(isCorporateBooking && corporatePAN ? { corporatePAN } : {}),
-            // Hold-path metadata from the inline verifyBookingStatus call.
-            // Persist only when we actually have the data — never overwrite with undefined.
-            // POST-001: store PaxIds and PAN requirement for generate-voucher-with-PAN flow.
-            ...(isHeld && holdPaxDetails.length > 0 ? { paxDetails: holdPaxDetails } : {}),
-            ...(isHeld && holdTboReferenceNo ? {
-              tboReferenceNo: holdTboReferenceNo,
-              bookingDetailFetched: true,
-              bookingDetailFetchedAt: new Date(),
-            } : {}),
-            ...(isHeld && holdRoomDescription ? { roomDescription: holdRoomDescription } : {}),
-            // Hold deadline — critical: spec line 2496. Without these, TBO will auto-cancel held bookings
-            // and we won't know. Sprint 2A's idempotency guard at line 2447 also depends on lastVoucherDate.
-            ...(isHeld && holdLastVoucherDate ? { lastVoucherDate: holdLastVoucherDate } : {}),
-            ...(isHeld && holdLastCancellationDate ? { lastCancellationDate: holdLastCancellationDate } : {}),
-            ...(isHeld && holdBookingDetailRaw ? { bookingDetailRaw: holdBookingDetailRaw } : {}),
+            // TBO cert Item 31 — opportunistically read TBOReferenceNo from the Book
+            // response itself (no extra TBO call). TBO usually returns it only on
+            // GetBookingDetail, but on rare responses it's already present here.
+            // The deferred check at T+120s will populate it for the common case.
+            ...(bookResponseTboRefNo ? { tboReferenceNo: bookResponseTboRefNo } : {}),
             // Selling rate / cancellation text
             ...(bookingRecommendedSellingRate != null ? { recommendedSellingRate: bookingRecommendedSellingRate } : {}),
             ...(_bookCancellationPolicyText ? { cancellationPolicyText: _bookCancellationPolicyText } : {}),
+            // TBO cert Item 31 — schedule the deferred status check.
+            pendingStatusCheckAt: _deferredCheckAt,
+            statusCheckDone: false,
+            statusCheckAttempts: 0,
           }},
+          { new: true },
         );
+        _savedBookingDocId = _savedDoc?._id ? String(_savedDoc._id) : null;
       } catch { /* non-fatal — booking succeeded; DB update is best-effort */ }
 
       res.json({
@@ -2142,52 +2169,21 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         // No else: any other state (Status=0/3/6) is already handled by the failure paths upstream.
       }
 
-      // Fire-and-forget: fetch GetBookingDetail to capture TBOReferenceNo + room description.
-      // Non-blocking — user already has confirmation. Populates tboReferenceNo within seconds.
-      if (tboBookingId && !isHeld) {
-        setImmediate(async () => {
-          try {
-            const detail = await getBookingDetail([{ mode: "bookingId", bookingId: tboBookingId }]);
-            if (detail?.TBOReferenceNo || detail?.Rooms) {
-              // Extract paxDetails from the GetBookingDetail response — Defect 6.
-              // CONFIRMED bookings previously left paxDetails: [] because no write site populated them.
-              const detailPassengers: any[] = (detail?.Rooms ?? []).flatMap(
-                (room: any) => room?.HotelPassenger ?? []
-              );
-              const detailPaxDetails = detailPassengers
-                .filter((p: any) => p?.PaxId)
-                .map((p: any) => ({
-                  paxId: String(p.PaxId),
-                  firstName: p.FirstName || "",
-                  lastName: p.LastName || "",
-                  paxType: Number(p.PaxType) || 1,
-                }));
-
-              await SBTHotelBooking.findOneAndUpdate(
-                { bookingId: String(tboBookingId) },
-                {
-                  $set: {
-                    tboReferenceNo: detail.TBOReferenceNo || null,
-                    roomDescription: detail.Rooms?.[0]?.RoomDescription ||
-                                     detail.Rooms?.[0]?.RoomTypeName || null,
-                    bookingDetailFetched: true,
-                    bookingDetailFetchedAt: new Date(),
-                    bookingDetailRaw: detail,
-                    // TraceId from BookingDetail — spec line 15, Defect 7.
-                    ...(detail?.TraceId ? { traceId: String(detail.TraceId) } : {}),
-                    // paxDetails — Defect 6. Always written on CONFIRMED path now that we have it.
-                    ...(detailPaxDetails.length > 0 ? { paxDetails: detailPaxDetails } : {}),
-                    ...(detail.LastCancellationDate ? { lastCancellationDate: parseTBODate(detail.LastCancellationDate) } : {}),
-                    ...(detail.LastVoucherDate ? { lastVoucherDate: parseTBODate(detail.LastVoucherDate) } : {}),
-                  },
-                },
-              );
-              sbtLogger.info("GetBookingDetail persisted post-Book", { tboBookingId, tboReferenceNo: detail.TBOReferenceNo });
-            }
-          } catch (err: any) {
-            sbtLogger.error("GetBookingDetail post-Book failed (non-blocking)", { tboBookingId, error: err?.message });
-          }
-        });
+      // TBO cert Item 31 — schedule GetBookingDetail to run ≥120s after this Book call.
+      // The booking's pendingStatusCheckAt has already been persisted above, so if the
+      // server restarts before this timer fires, the cron sweep in
+      // orphan-pending-cleanup.ts will pick it up on the next minute.
+      if (tboBookingId && _savedBookingDocId) {
+        const _docId = _savedBookingDocId;
+        setTimeout(() => {
+          runDeferredStatusCheck(_docId).catch((err: any) => {
+            sbtLogger.error("Deferred status check failed (in-process timer)", {
+              bookingDocId: _docId,
+              tboBookingId,
+              err: err?.message || String(err),
+            });
+          });
+        }, DEFERRED_STATUS_CHECK_DELAY_MS).unref?.();
       }
 
       sbtLogger.info("Hotel booking TBO response stored", {
