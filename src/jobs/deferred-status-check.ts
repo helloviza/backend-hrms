@@ -11,9 +11,12 @@
 // statusCheckDone: false → true on findOneAndUpdate.
 
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
+import SBTRequest from "../models/SBTRequest.js";
+import User from "../models/User.js";
 import { getBookingDetail } from "../services/tbo.hotel.service.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 import logger from "../utils/logger.js";
+import { sendMail } from "../utils/mailer.js";
 
 const MAX_ATTEMPTS = 5;
 
@@ -166,6 +169,28 @@ export async function runDeferredStatusCheck(bookingDocId: string): Promise<void
     }
 
     await SBTHotelBooking.findByIdAndUpdate(bookingDocId, { $set: update });
+
+    // Confirmation email — moved here from the /save handler in sbt.hotels.ts.
+    // Only fires when (a) the booking fulfils an SBT request, (b) reconciliation
+    // ended in CONFIRMED state (we won't email about a booking TBO later cancels),
+    // (c) no prior email send was recorded. Failure to send is logged but does
+    // not unwind the reconciliation — operator can resend manually.
+    const finalStatus = update.status ?? claimed.status;
+    if (
+      finalStatus === "CONFIRMED" &&
+      claimed.sbtRequestId &&
+      !(claimed as any).confirmationEmailSentAt
+    ) {
+      try {
+        await sendSbtRequestConfirmationEmail(claimed);
+      } catch (emailErr: any) {
+        logger.warn("[DeferredStatusCheck] Confirmation email send failed", {
+          bookingDocId,
+          sbtRequestId: String(claimed.sbtRequestId),
+          err: emailErr?.message || String(emailErr),
+        });
+      }
+    }
   } catch (err: any) {
     const errMsg = err?.message || String(err);
     if (currentAttempts >= MAX_ATTEMPTS) {
@@ -192,6 +217,40 @@ export async function runDeferredStatusCheck(bookingDocId: string): Promise<void
       });
     }
   }
+}
+
+async function sendSbtRequestConfirmationEmail(booking: any): Promise<void> {
+  const sbtReq = await SBTRequest.findById(booking.sbtRequestId).select("requesterId").lean() as any;
+  if (!sbtReq?.requesterId) return;
+
+  const requester = await User.findById(sbtReq.requesterId).select("email").lean() as any;
+  if (!requester?.email) return;
+
+  const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
+  await sendMail({
+    to: requester.email,
+    subject: `Your hotel has been booked — ${booking.hotelName || "Hotel"}`,
+    kind: "CONFIRMATIONS",
+    html: `
+      <h3>Hotel Booking Confirmed</h3>
+      <p>Your hotel request has been booked successfully.</p>
+      <p><strong>Hotel:</strong> ${booking.hotelName || ""}</p>
+      <p><strong>Check-in:</strong> ${booking.checkIn || ""}</p>
+      <p><strong>Check-out:</strong> ${booking.checkOut || ""}</p>
+      ${booking.confirmationNo ? `<p><strong>Confirmation:</strong> ${booking.confirmationNo}</p>` : ""}
+      <p><a href="${frontendUrl}/sbt/my-requests">View My Requests</a></p>
+    `,
+  });
+
+  // Idempotency stamp written only after a successful send. The conditional
+  // filter (confirmationEmailSentAt: null) is a belt-and-braces guard against
+  // any future race where two reconciliation workers might claim the same
+  // booking — extremely unlikely given the statusCheckDone atomic claim above,
+  // but cheap to enforce.
+  await SBTHotelBooking.findOneAndUpdate(
+    { _id: booking._id, confirmationEmailSentAt: null },
+    { $set: { confirmationEmailSentAt: new Date() } },
+  );
 }
 
 export async function runDeferredStatusCheckSweep(): Promise<void> {
