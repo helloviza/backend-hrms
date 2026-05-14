@@ -1700,6 +1700,12 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       clientReferenceId: clientRef,
     });
 
+    // CORPORATE_NOT_ALLOWED_ON_RATE — restored 2026-05-13 PM after
+    // TBO clarification confirmed CorporateBookingAllowed is enforced
+    // server-side. The frontend at SBTHotelGuests.tsx surfaces this
+    // constraint to the user before Book is called; this backend gate
+    // is defense-in-depth in case of FE bypass.
+    //
     // Corporate is gated PER RATE by TBO's ValidationInfo.CorporateBookingAllowed
     // (spec §2774). Spec table uses the typo "CorporateBokingAllowed"; live PreBook
     // responses use the correct spelling. Honor both.
@@ -1712,7 +1718,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     if (req.body?.isCorporateBooking === true && !corporateBookingAllowed) {
       return res.status(400).json({
         code: "CORPORATE_NOT_ALLOWED_ON_RATE",
-        error: "Corporate booking is not allowed on this hotel/rate. Please switch to Personal booking.",
+        error: "Corporate booking is not allowed for this hotel. Please continue with normal booking.",
       });
     }
 
@@ -3088,25 +3094,12 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
           sbtReq.actedAt = new Date();
           await sbtReq.save();
 
-          const requester = await User.findById(sbtReq.requesterId)
-            .select("name email").lean() as any;
-          if (requester?.email) {
-            const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
-            await sendMail({
-              to: requester.email,
-              subject: `Your hotel has been booked — ${b.hotelName || "Hotel"}`,
-              kind: "CONFIRMATIONS",
-              html: `
-                <h3>Hotel Booking Confirmed</h3>
-                <p>Your hotel request has been booked successfully.</p>
-                <p><strong>Hotel:</strong> ${b.hotelName || ""}</p>
-                <p><strong>Check-in:</strong> ${b.checkIn || ""}</p>
-                <p><strong>Check-out:</strong> ${b.checkOut || ""}</p>
-                ${b.confirmationNo ? `<p><strong>Confirmation:</strong> ${b.confirmationNo}</p>` : ""}
-                <p><a href="${frontendUrl}/sbt/my-requests">View My Requests</a></p>
-              `,
-            }).catch((e: any) => sbtLogger.warn("Failed to send SBT hotel booked email", { error: e?.message }));
-          }
+          // Confirmation email moved into deferred-status-check.ts success path.
+          // TBO recommends waiting ≥120s before trusting the Book response state, so
+          // emailing the SBT requester at T+0 risks sending a "your hotel is booked"
+          // notice for a booking that TBO later flips to Failed/Cancelled. The email
+          // now fires from runDeferredStatusCheck after GetBookingDetail confirms the
+          // booking. Idempotency is enforced via SBTHotelBooking.confirmationEmailSentAt.
           sbtLogger.info("SBT request marked BOOKED via hotel booking", {
             sbtRequestId: b.sbtRequestId, bookingDocId: doc._id,
           });
@@ -3140,6 +3133,16 @@ router.post("/bookings/check-status", requireAuth, async (req: any, res: any) =>
 
     const numericId = booking.bookingId ? Number(booking.bookingId) : 0;
 
+    // Reconciliation fields surfaced for FE voucher-gating (statusCheckDone === true
+    // is the gate that flips the confirmation page from "Confirming..." to the
+    // full voucher view).
+    const reconciliation = {
+      statusCheckDone: !!(booking as any).statusCheckDone,
+      bookingDetailFetched: !!(booking as any).bookingDetailFetched,
+      statusCheckAttempts: (booking as any).statusCheckAttempts ?? 0,
+      status: booking.status,
+    };
+
     // If DB already has a confirmed/held booking, return immediately
     if (booking.status === "CONFIRMED" || booking.status === "HELD") {
       return res.json({
@@ -3151,12 +3154,13 @@ router.post("/bookings/check-status", requireAuth, async (req: any, res: any) =>
         isHeld: booking.isHeld ?? false,
         lastVoucherDate: booking.lastVoucherDate ?? null,
         tboReferenceNo: (booking as any).tboReferenceNo ?? null,
+        ...reconciliation,
       });
     }
 
     if (!numericId) {
       // PENDING with no BookingId — TBO didn't receive the request
-      return res.json({ found: false, clientReferenceId, dbStatus: booking.status });
+      return res.json({ found: false, clientReferenceId, dbStatus: booking.status, ...reconciliation });
     }
 
     // Has a BookingId but still PENDING — ask TBO
@@ -3214,13 +3218,14 @@ router.post("/bookings/check-status", requireAuth, async (req: any, res: any) =>
         bookingId: booking.bookingId,
         confirmationNo: detail.ConfirmationNo || booking.confirmationNo || "",
         bookingRefNo: detail.BookingRefNo || booking.bookingRefNo || "",
-        status: newStatus,
         isHeld: booking.isHeld ?? false,
         lastVoucherDate: detail.LastVoucherDate ?? booking.lastVoucherDate ?? null,
+        ...reconciliation,
+        status: newStatus,
       });
     }
 
-    return res.json({ found: false, clientReferenceId, tboStatus });
+    return res.json({ found: false, clientReferenceId, tboStatus, ...reconciliation });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Status check failed";
     res.status(500).json({ error: msg });
@@ -3814,6 +3819,9 @@ router.get("/bookings/:id/voucher-summary", requireAuth, async (req: any, res: a
         voucherStatus: booking.voucherStatus,
         bookedAt: booking.bookedAt,
         bookingDetailRaw: booking.bookingDetailRaw ?? null,
+        // Reconciliation gate (see voucher-premature-display audit 2026-05-13).
+        statusCheckDone: !!(booking as any).statusCheckDone,
+        bookingDetailFetched: !!(booking as any).bookingDetailFetched,
       },
       voucherSummary: summary,
     });
