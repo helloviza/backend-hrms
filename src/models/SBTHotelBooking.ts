@@ -111,6 +111,10 @@ export interface ISBTHotelBooking extends Document {
   statusCheckDone?: boolean;
   statusCheckAttempts?: number;
   lastStatusCheckAt?: Date | null;
+  // Idempotency guard for the SBT-request "your hotel has been booked" email.
+  // Email send moved from /save handler to deferred-status-check success path —
+  // see commit gating voucher on reconciliation.
+  confirmationEmailSentAt?: Date | null;
   bookedAt: Date;
   cancelledAt?: Date;
   closedAt?: Date;
@@ -232,6 +236,7 @@ const SBTHotelBookingSchema = new Schema(
     statusCheckDone: { type: Boolean, default: false, index: true },
     statusCheckAttempts: { type: Number, default: 0 },
     lastStatusCheckAt: { type: Date, default: null },
+    confirmationEmailSentAt: { type: Date, default: null },
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
     closedAt: { type: Date },
