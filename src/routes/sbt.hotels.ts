@@ -2805,6 +2805,13 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
                 status: "CONFIRMED",
                 voucherStatus: "GENERATED",
                 voucherGeneratedAt: new Date(),
+                // GenerateVoucher (idempotent reconcile path) is itself the TBO
+                // authoritative confirmation. Mark the deferred status check
+                // complete so FE gates (Confirming… pill, voucher PDF buttons,
+                // Confirmed-page mode) flip immediately and the cron sweep drains
+                // this booking.
+                statusCheckDone: true,
+                pendingStatusCheckAt: null,
                 tboVoucherData: voucherRes,
                 bookingDetailRaw: detail,
                 bookingDetailFetched: true,
@@ -2893,6 +2900,12 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
           $set: {
             ...classified.derivedOnSuccess,
             voucherGeneratedAt: new Date(),
+            // GenerateVoucher success is itself the TBO authoritative confirmation
+            // for Hold→Voucher conversions. Mark the deferred status check complete
+            // so FE gates (Confirming… pill, voucher PDF buttons, Confirmed-page
+            // mode) flip immediately and the cron sweep drains this booking.
+            statusCheckDone: true,
+            pendingStatusCheckAt: null,
             tboVoucherData: voucherRes,
             // TraceId — spec line 15. GenerateVoucher response carries the same TraceId from the session.
             ...(gvr?.TraceId ? { traceId: String(gvr.TraceId) } : {}),
