@@ -45,6 +45,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
+import { getMarginConfig, applyMargin, isDomestic } from "../utils/margin.js";
 
 // ✅ VIDEO CONTEXT ADAPTER (AUTHORITATIVE)
 import {
@@ -502,6 +503,48 @@ router.post("/flights/search", requireAuth, async (req, res) => {
           ok: false,
           error: "Flight search is temporarily unavailable. Please try again in a few minutes.",
         });
+      }
+    }
+
+    // Apply workspace margin parity with SBT (sbt.flights.ts:649-687) so
+    // the same TBO ResultIndex is quoted at the same price via concierge
+    // and via SBT. Mutates resultsArr in place so the mapping below reads
+    // margin-applied PublishedFare / OfferedFare.
+    const flightMargins = await getMarginConfig();
+    if (flightMargins.enabled) {
+      const originCountry = (req.body as any).originCountry;
+      const destCountry = (req.body as any).destCountry;
+      const isFlightDomestic = isDomestic(originCountry, destCountry);
+      const marginPct = isFlightDomestic
+        ? flightMargins.flight.domestic
+        : flightMargins.flight.international;
+
+      if (marginPct > 0) {
+        const applyToFlightArray = (arr: any[]): any[] =>
+          arr.map((flight: any) => {
+            const fare = flight?.Fare;
+            if (!fare) return flight;
+            const netPublished = fare.PublishedFare ?? 0;
+            const netOffered = fare.OfferedFare ?? 0;
+            return {
+              ...flight,
+              Fare: {
+                ...fare,
+                _netPublishedFare: netPublished,
+                _netOfferedFare: netOffered,
+                PublishedFare: applyMargin(netPublished, marginPct),
+                OfferedFare: applyMargin(netOffered, marginPct),
+                _marginPercent: marginPct,
+                _marginAmount: applyMargin(netOffered, marginPct) - netOffered,
+              },
+            };
+          });
+
+        for (let i = 0; i < resultsArr.length; i++) {
+          if (Array.isArray(resultsArr[i])) {
+            resultsArr[i] = applyToFlightArray(resultsArr[i]);
+          }
+        }
       }
     }
 
