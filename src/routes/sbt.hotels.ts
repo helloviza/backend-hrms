@@ -11,15 +11,23 @@ import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { sendMail } from "../utils/mailer.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
-import { tboFetchFailed } from "../utils/tboFetchGuard.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { getMarginConfig, applyMargin, applyMarginWithFloor, violatesRspFloor } from "../utils/margin.js";
 import { getTBOToken, logoutTBO } from "../services/tbo.auth.service.js";
 import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
 import { getCompanySettings } from "../utils/companySettings.js";
-import { HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES, HOTEL_CITIES as SHARED_HOTEL_CITIES, type HotelCity } from "../shared/cities.js";
-import { resolveCityCode as resolveCityCodeAgainstCatalog } from "../jobs/static-data-refresh.js";
+import {
+  hotelAuthHeader,
+  hotelStaticAuthHeader,
+  fetchCityList,
+  getCachedCountryList,
+  validatePaxRooms,
+  hotelNameIndex,
+  HOTEL_SESSION_TTL_MS,
+  PRIORITY_COUNTRY_CODES,
+} from "../services/tbo.hotel.shared.js";
+import { searchHotels } from "../services/tbo.hotel.search.service.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 import ManualDateChangeRequest from "../models/ManualDateChangeRequest.js";
 import {
@@ -86,25 +94,6 @@ const MOCK_HOTEL_RESULTS = [
     cheapestFare: 2596,
   },
 ];
-
-// ─── Hotel room normalization ────────────────────────────────────────────────
-// Spec lines 1415-1432: surface RecommendedSellingRate, Supplements, CancelPolicies,
-// IsRefundable as explicit lowercase fields so downstream consumers (RSP guard,
-// supplements display, cancel-policy display) don't depend on TBO casing.
-// Raw TBO fields are preserved via spread.
-function normalizeRoom(room: any) {
-  return {
-    ...room,
-    recommendedSellingRate:
-      room?.RecommendedSellingRate != null
-        ? Number(room.RecommendedSellingRate) || null
-        : null,
-    supplements: Array.isArray(room?.Supplements) ? room.Supplements : [],
-    cancelPolicies: Array.isArray(room?.CancelPolicies) ? room.CancelPolicies : [],
-    isRefundable:
-      typeof room?.IsRefundable === "boolean" ? room.IsRefundable : null,
-  };
-}
 
 const router = express.Router();
 router.use(requireAuth);
@@ -246,35 +235,9 @@ async function requireHotelAccess(req: any, res: any, next: any) {
   }
 }
 
-// ─── TBO Hotel API Auth (Basic) ──────────────────────────────────────────────
-
-function hotelAuthHeader(): string {
-  const creds = Buffer.from(
-    `${process.env.TBO_HOTEL_USERNAME}:${process.env.TBO_HOTEL_PASSWORD}`
-  ).toString("base64");
-  return `Basic ${creds}`;
-}
-
-function hotelStaticAuthHeader(): string {
-  const creds = Buffer.from(
-    `${process.env.TBO_HOTEL_STATIC_USERNAME}:${process.env.TBO_HOTEL_STATIC_PASSWORD}`
-  ).toString("base64");
-  return `Basic ${creds}`;
-}
-
 // ─── In-memory caches ────────────────────────────────────────────────────────
-
-interface CityEntry {
-  CityId: string;
-  CityName: string;
-  CountryCode: string;
-  CountryName: string;
-}
-
-const cityCache = new Map<string, { data: CityEntry[]; ts: number }>();
-const CITY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
-
-const HOTEL_SESSION_TTL_MS = 40 * 60 * 1000; // 40 minutes per TBO Op Rule 7
+// hotelAuthHeader, hotelStaticAuthHeader, cityCache, CITY_CACHE_TTL,
+// HOTEL_SESSION_TTL_MS now live in services/tbo.hotel.shared.ts.
 
 const searchCache = new Map<string, { data: unknown; ts: number }>();
 // bookingCodeTimestamps maps each TBO BookingCode → search timestamp for session-age validation
@@ -627,259 +590,9 @@ function getPrimaryLeadContact(rooms: any[]): { phone: string; email: string } {
 const hotelDetailsCache = new Map<string, { data: any; ts: number }>();
 const DETAILS_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
-let countryListCache: { Code: string; Name: string }[] = [];
-let countryListCacheTime = 0;
-const COUNTRY_LIST_TTL = 24 * 60 * 60 * 1000; // 24h
-
-// ─── Hotel name search index ──────────────────────────────────────────────────
-
-interface HotelIndexEntry extends HotelCodeEntry {
-  CityCode: string;
-}
-const hotelNameIndex: HotelIndexEntry[] = [];
-const hotelIndexedCities = new Set<string>();
-
-// Set of non-IN country codes from our catalog — used to prioritise CountryList searches.
-const PRIORITY_COUNTRY_CODES = new Set(
-  SHARED_HOTEL_CITIES
-    .filter((c) => c.countryCode !== "IN")
-    .map((c) => c.countryCode)
-);
-
-async function ensureHotelIndexed(cityCode: string, countryCode: string, cityName?: string): Promise<void> {
-  // Drift-safe resolve: if cityName is known, ask TBO's current CityList for the live cityCode
-  // (mirrors the boot job's resolveCityCode flow that surfaced the Dubai 118924→115936 drift).
-  let resolvedCityCode = cityCode;
-  if (cityName) {
-    try {
-      const cities = await fetchCityList(countryCode);
-      const tboCities = cities.map((c) => ({ Code: c.CityId, Name: c.CityName }));
-      const resolved = resolveCityCodeAgainstCatalog(
-        { cityName, countryCode, cityId: cityCode } as HotelCity,
-        tboCities,
-      );
-      if (resolved && resolved !== cityCode) {
-        sbtLogger.info(
-          `[HOTEL-INDEX] Resolved ${countryCode}/${cityName} → CityCode ${resolved} (catalog had ${cityCode} — drift corrected)`
-        );
-        resolvedCityCode = resolved;
-      }
-    } catch (resolveErr) {
-      sbtLogger.warn(
-        `[HOTEL-INDEX] resolveCityCode failed for ${countryCode}/${cityName}; falling back to catalog ${cityCode}`,
-        { err: resolveErr instanceof Error ? resolveErr.message : String(resolveErr) }
-      );
-    }
-  }
-
-  if (hotelIndexedCities.has(resolvedCityCode)) return;
-  hotelIndexedCities.add(resolvedCityCode);
-  try {
-    const hotels = await fetchHotelCodeList(resolvedCityCode, countryCode);
-    for (const h of hotels) hotelNameIndex.push({ ...h, CityCode: resolvedCityCode });
-  } catch (err) {
-    console.error(`[HOTEL-INDEX] Failed to index city ${resolvedCityCode}:`, err instanceof Error ? err.message : String(err));
-    hotelIndexedCities.delete(resolvedCityCode);
-  }
-}
-
-/** Resolve a city name → TBO CityId using the already-cached Indian city list. */
-async function resolveCityCode(cityName: string): Promise<string | null> {
-  try {
-    const cities = await fetchCityList("IN");
-    const lc = cityName.toLowerCase();
-    const match = cities.find(c => c.CityName.toLowerCase() === lc)
-      || cities.find(c => c.CityName.toLowerCase().includes(lc));
-    return match?.CityId ?? null;
-  } catch {
-    return null;
-  }
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/**
- * Validate PaxRooms against TBO-certified limits.
- * Returns a user-facing error string if invalid, or null if OK.
- * Limits:
- *  - Max 4 rooms per booking
- *  - Max 4 adults per room
- *  - Max 3 children per room
- *  - Children ages (if provided) must be between 2 and 12 inclusive
- */
-function validatePaxRooms(paxRooms: unknown): string | null {
-  if (!Array.isArray(paxRooms) || paxRooms.length === 0) {
-    return "At least one room is required.";
-  }
-  if (paxRooms.length > 4) {
-    return "Maximum 4 rooms per booking.";
-  }
-  for (let i = 0; i < paxRooms.length; i++) {
-    const r: any = paxRooms[i];
-    const adults = Number(r?.Adults ?? r?.adults ?? 0);
-    const children = Number(r?.Children ?? r?.children ?? 0);
-
-    if (!Number.isFinite(adults) || adults < 1) {
-      return `Room ${i + 1}: at least 1 adult is required.`;
-    }
-    if (adults > 4) {
-      return `Room ${i + 1}: maximum 4 adults per room.`;
-    }
-    if (!Number.isFinite(children) || children < 0) {
-      return `Room ${i + 1}: children count is invalid.`;
-    }
-    if (children > 3) {
-      return `Room ${i + 1}: maximum 3 children per room.`;
-    }
-
-    const ages = r?.ChildrenAges ?? r?.childrenAges;
-    if (ages !== null && ages !== undefined) {
-      if (!Array.isArray(ages)) {
-        return `Room ${i + 1}: children ages must be a list.`;
-      }
-      if (children > 0 && ages.length !== children) {
-        return `Room ${i + 1}: please provide an age for each child.`;
-      }
-      for (const age of ages) {
-        const n = Number(age);
-        if (!Number.isFinite(n) || n < 2 || n > 12) {
-          return `Room ${i + 1}: child age must be between 2 and 12.`;
-        }
-      }
-    }
-  }
-  return null;
-}
-
-async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
-  const cached = cityCache.get(countryCode);
-  if (cached && Date.now() - cached.ts < CITY_CACHE_TTL) return cached.data;
-
-  const tboPayload = { CountryCode: countryCode };
-  const t0 = Date.now();
-  const res = await fetch(
-    `https://api.tbotechnology.in/TBOHolidays_HotelAPI/CityList?CountryCode=${countryCode}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: hotelStaticAuthHeader(),
-      },
-      body: JSON.stringify(tboPayload),
-    }
-  );
-  const data = (await res.json()) as {
-    CityList?: { Code: string; Name: string }[];
-  };
-  logTBOCall({ method: "HotelCityList", traceId: `city-${countryCode}`, request: tboPayload, response: data, durationMs: Date.now() - t0 });
-  // Build country code → name map from the cached country list.
-  // Cached at startup; lookup is O(1) per city.
-  const countryList = await getCachedCountryList();
-  const countryNameByCode = new Map<string, string>(
-    (countryList || []).map((c: any) => [String(c.Code).toUpperCase(), String(c.Name)])
-  );
-
-  // TBO returns { Code, Name } — normalize to our CityEntry shape
-  const cities: CityEntry[] = (data?.CityList || []).map((c: any) => ({
-    CityId: c.Code,
-    CityName: c.Name,
-    CountryCode: countryCode,
-    CountryName: countryNameByCode.get(String(countryCode).toUpperCase()) ?? "",
-  }));
-  cityCache.set(countryCode, { data: cities, ts: Date.now() });
-  return cities;
-}
-
-async function getCachedCountryList(): Promise<{ Code: string; Name: string }[]> {
-  const now = Date.now();
-  if (countryListCache.length > 0 && now - countryListCacheTime < COUNTRY_LIST_TTL) {
-    return countryListCache;
-  }
-  // TBO spec: CountryList is GET-only. POST returns 405 with a plain-text body
-  // that crashes res.json(). Do not poison cache on failure — return last value
-  // (or [] on cold start) so the caller can retry on the next request.
-  const url = "https://api.tbotechnology.in/TBOHolidays_HotelAPI/CountryList";
-  const res = await fetch(url, {
-    method: "GET",
-    headers: { Authorization: hotelStaticAuthHeader() },
-  });
-  if (await tboFetchFailed("CountryList", url, res)) return countryListCache;
-  const data = (await res.json()) as { CountryList?: { Code: string; Name: string }[] };
-  countryListCache = data?.CountryList ?? [];
-  countryListCacheTime = now;
-  return countryListCache;
-}
-
-// Pre-load Indian cities and popular hotel names on startup
-(async () => {
-  try {
-    await fetchCityList("IN");
-    sbtLogger.info("Indian city list cached on startup");
-
-    // Fixed codes for top metro cities — iterate shared catalog directly so
-    // cityName flows into ensureHotelIndexed for runtime drift correction.
-    for (const c of SHARED_HOTEL_INDEX_CITIES) {
-      await ensureHotelIndexed(c.cityId, c.countryCode, c.cityName);
-    }
-
-    // Dynamically resolve additional city codes from the cached TBOCityList
-    const additionalCityNames = ["Goa", "Jaipur", "Agra", "Kolkata", "Pune", "Ahmedabad"];
-    for (const cityName of additionalCityNames) {
-      const code = await resolveCityCode(cityName);
-      if (code) {
-        await ensureHotelIndexed(code, "IN");
-      } else {
-        sbtLogger.warn(`[HOTEL-INDEX] Could not resolve CityCode for: ${cityName}`);
-      }
-    }
-
-    sbtLogger.info(`Hotel name index built: ${hotelNameIndex.length} hotels`);
-  } catch (e) {
-    sbtLogger.warn("Failed to pre-load hotel data", { error: e instanceof Error ? e.message : String(e) });
-  }
-})();
-
-interface HotelCodeEntry {
-  HotelCode: string;
-  HotelName: string;
-  Latitude: string;
-  Longitude: string;
-  HotelRating: string;
-  Address: string;
-  CityName: string;
-  CountryName: string;
-  CountryCode: string;
-}
-
-async function fetchHotelCodeList(
-  cityCode: string,
-  countryCode: string
-): Promise<HotelCodeEntry[]> {
-  const tboPayload = { CityCode: cityCode, CountryCode: countryCode };
-  const t0 = Date.now();
-  const res = await fetch(
-    "https://api.tbotechnology.in/TBOHolidays_HotelAPI/TBOHotelCodeList",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: hotelStaticAuthHeader(),
-      },
-      body: JSON.stringify(tboPayload),
-    }
-  );
-  const data = (await res.json()) as { Hotels?: HotelCodeEntry[] };
-  logTBOCall({ method: "HotelCodeList", traceId: `codes-${cityCode}`, request: tboPayload, response: { hotelCount: data?.Hotels?.length ?? 0 }, durationMs: Date.now() - t0 });
-  return data?.Hotels || [];
-}
-
-function chunk<T>(arr: T[], size: number): T[][] {
-  const result: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) {
-    result.push(arr.slice(i, i + size));
-  }
-  return result;
-}
+// Hotel city/code helpers, name index, pax validation, and the startup IIFE
+// that pre-loads the index now live in services/tbo.hotel.shared.ts. The TBO
+// search core lives in services/tbo.hotel.search.service.ts.
 
 // ─── 1. GET /cities?q=Mumbai ─────────────────────────────────────────────────
 
@@ -969,279 +682,45 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       });
     }
 
-    const {
-      CityCode,
-      CityName,
-      CheckIn,
-      CheckOut,
-      Rooms,
-      GuestNationality = "IN",
-      CountryCode = "IN",
-      HotelCodes: directHotelCodes,
-    } = req.body;
-
-    const directCodes: string[] = Array.isArray(directHotelCodes) ? directHotelCodes : [];
-
-    if (!directCodes.length && !CityCode) {
-      return res.status(400).json({ error: "CityCode or HotelCodes required" });
-    }
-    if (!CheckIn || !CheckOut) {
-      return res.status(400).json({ error: "CheckIn and CheckOut required" });
-    }
-
-    // Build hotel metadata map and collect codes to search
-    const hotelMeta = new Map<string, HotelCodeEntry>();
-    let allCodes: string[];
-
-    if (directCodes.length) {
-      // Hotel name search: use provided codes directly, pull metadata from index
-      for (const entry of hotelNameIndex) {
-        if (directCodes.includes(entry.HotelCode)) hotelMeta.set(entry.HotelCode, entry);
-      }
-      allCodes = directCodes;
-    } else {
-      // City search: fetch all hotels in the city.
-      // Drift-safe resolve: if the request supplies a CityName, ask TBO's current
-      // CityList for the live cityCode (catalog cityIds can drift — see static-data
-      // refresh job's resolveCityCode).
-      let resolvedCityCode = CityCode;
-      const requestCityName = String(req.body?.CityName || "").trim();
-      if (requestCityName) {
-        try {
-          const cities = await fetchCityList(CountryCode);
-          const tboCities = cities.map((c) => ({ Code: c.CityId, Name: c.CityName }));
-          const resolved = resolveCityCodeAgainstCatalog(
-            { cityName: requestCityName, countryCode: CountryCode, cityId: CityCode } as HotelCity,
-            tboCities,
-          );
-          if (resolved && resolved !== CityCode) {
-            sbtLogger.info(
-              `[SEARCH] Resolved ${CountryCode}/${requestCityName} → CityCode ${resolved} (request had ${CityCode} — drift corrected)`
-            );
-            resolvedCityCode = resolved;
-          }
-        } catch (resolveErr) {
-          sbtLogger.warn(
-            `[SEARCH] resolveCityCode failed for ${CountryCode}/${requestCityName}; using request CityCode ${CityCode}`,
-            { err: resolveErr instanceof Error ? resolveErr.message : String(resolveErr) }
-          );
-        }
-      }
-      const hotelList = await fetchHotelCodeList(resolvedCityCode, CountryCode);
-      if (!hotelList.length) {
-        return res.json({ Hotels: [], SearchId: randomUUID(), CityName });
-      }
-      for (const h of hotelList) hotelMeta.set(h.HotelCode, h);
-      allCodes = hotelList.map((h) => h.HotelCode);
-    }
-
-    // 2. Split hotel codes into chunks of 100
-    const chunks = chunk(allCodes, 100);
-
-    // 3. Build PaxRooms
-    const PaxRooms = (Rooms || [{ Adults: 1, Children: 0, ChildrenAges: null }]).map(
-      (r: any) => ({
-        Adults: r.Adults ?? r.adults ?? 1,
-        Children: r.Children ?? r.children ?? 0,
-        ChildrenAges: r.ChildrenAges || r.childrenAges || null,
-      })
-    );
-
-    const paxError = validatePaxRooms(PaxRooms);
-    if (paxError) {
-      return res.status(400).json({ error: paxError });
-    }
-
-    // Validate and build TBO Filters from request body
-    const ALLOWED_MEAL_TYPES = new Set([
-      "All", "Room_Only", "BreakFast", "Half_Board",
-      "Full_Board", "All_Inclusive_All_Meal",
-    ]);
-    const reqFilters = (req.body as any)?.Filters ?? {};
-    if (reqFilters.MealType && !ALLOWED_MEAL_TYPES.has(reqFilters.MealType)) {
-      return res.status(400).json({ error: "Invalid meal type filter." });
-    }
-    const filtersPayload: Record<string, unknown> = {
-      Refundable: reqFilters.Refundable === true,
-      NoOfRooms: Number.isFinite(Number(reqFilters.NoOfRooms)) ? Number(reqFilters.NoOfRooms) : 0,
-      MealType: typeof reqFilters.MealType === "string" && reqFilters.MealType.length > 0
-        ? reqFilters.MealType
-        : "All",
-    };
-    if (Number.isFinite(Number(reqFilters.StarRating))) {
-      filtersPayload.StarRating = Number(reqFilters.StarRating);
-    }
-
-    // 4. Fire parallel search requests (max 5 concurrent)
-    const MAX_CONCURRENT = 5;
-    let allResults: any[] = [];
-    let apiErrorBatches = 0;
-    let totalBatches = 0;
-    const searchTraceId = `hotel-search-${randomUUID().slice(0, 8)}`;
-
-    for (let i = 0; i < chunks.length; i += MAX_CONCURRENT) {
-      const batch = chunks.slice(i, i + MAX_CONCURRENT);
-      const promises = batch.map(async (hotelCodeChunk, batchIdx) => {
-        const tboPayload = {
-          CheckIn,
-          CheckOut,
-          HotelCodes: hotelCodeChunk.join(","),
-          GuestNationality,
-          PaxRooms,
-          ResponseTime: 23,
-          IsDetailedResponse: true,
-          Filters: filtersPayload,
-        };
-        const t0 = Date.now();
-        try {
-          const r = await fetch("https://affiliate.tektravels.com/HotelAPI/Search", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: hotelAuthHeader(),
-            },
-            body: JSON.stringify(tboPayload),
-          });
-          const data = await r.json();
-          logTBOCall({ method: `HotelSearch_batch${i + batchIdx}`, traceId: searchTraceId, request: tboPayload, response: data, durationMs: Date.now() - t0 });
-          return data;
-        } catch {
-          logTBOCall({ method: `HotelSearch_batch${i + batchIdx}`, traceId: searchTraceId, request: tboPayload, response: { error: "fetch failed" }, durationMs: Date.now() - t0 });
-          return null;
-        }
-      });
-      const results = await Promise.all(promises);
-      for (const r of results) {
-        totalBatches++;
-        const d = r as any;
-        const enrichRooms = (hotel: any) => {
-          if (Array.isArray(hotel?.Rooms)) {
-            hotel.Rooms = hotel.Rooms.map((rm: any) => normalizeRoom(rm));
-          }
-          return hotel;
-        };
-        if (d?.HotelResult) {
-          for (const h of d.HotelResult) allResults.push(enrichRooms(h));
-        } else if (d?.HotelSearchResult?.HotelResults) {
-          for (const h of d.HotelSearchResult.HotelResults) allResults.push(enrichRooms(h));
-        } else if (d == null || (d.ResponseStatus !== undefined && d.ResponseStatus !== 1)) {
-          // Batch returned a TBO error (ResponseStatus≠1) or fetch failed (null)
-          apiErrorBatches++;
-        }
-      }
-    }
-
-    // Dedupe by HotelCode after parallel batch merge (spec line 21 mandate).
-    // First occurrence wins; subsequent duplicates are discarded.
-    {
-      const seen = new Set<string>();
-      const deduped: any[] = [];
-      let duplicateCount = 0;
-      for (const hotel of allResults) {
-        const code = String(hotel?.HotelCode ?? "");
-        if (!code) continue;
-        if (seen.has(code)) {
-          duplicateCount++;
-          continue;
-        }
-        seen.add(code);
-        deduped.push(hotel);
-      }
-      if (duplicateCount > 0) {
-        console.warn(
-          `[hotel-search] Deduped ${duplicateCount} duplicate HotelCode(s) ` +
-          `across ${chunks.length} parallel batches`
-        );
-      }
-      allResults = deduped;
-    }
-
-    // 5. Merge metadata from HotelCodeList into search results
-    for (const hotel of allResults) {
-      const meta = hotelMeta.get(hotel.HotelCode);
-      if (meta) {
-        hotel.HotelName = meta.HotelName;
-        hotel.HotelRating = meta.HotelRating;
-        hotel.Address = meta.Address;
-        hotel.Latitude = meta.Latitude;
-        hotel.Longitude = meta.Longitude;
-        hotel.CityName = meta.CityName;
-        hotel.CountryName = meta.CountryName;
-      }
-    }
-
-    // 6. Sort by cheapest room TotalFare ascending
-    allResults.sort((a, b) => {
-      const fa =
-        a.Rooms?.[0]?.TotalFare ?? a.TotalFare ?? a.MinimumRate ?? Infinity;
-      const fb =
-        b.Rooms?.[0]?.TotalFare ?? b.TotalFare ?? b.MinimumRate ?? Infinity;
-      return fa - fb;
+    const result = await searchHotels({
+      CityCode: req.body?.CityCode,
+      CityName: req.body?.CityName,
+      CheckIn: req.body?.CheckIn,
+      CheckOut: req.body?.CheckOut,
+      Rooms: req.body?.Rooms,
+      GuestNationality: req.body?.GuestNationality,
+      CountryCode: req.body?.CountryCode,
+      HotelCodes: req.body?.HotelCodes,
+      Filters: req.body?.Filters,
     });
 
-    // 7. Return clean error if TBO returned no availability.
-    // Distinguish genuine zero-result (ResponseStatus=1, HotelResult=[]) from API-level failure.
-    if (allResults.length === 0) {
-      if (apiErrorBatches > 0 && totalBatches > 0 && apiErrorBatches >= totalBatches) {
-        return res.status(502).json({
-          message: "Hotel search service is temporarily unavailable. Please try again.",
-          code: "HOTEL_API_ERROR",
-        });
+    if (!result.ok) {
+      if (result.status === 400) {
+        return res.status(400).json({ error: result.error });
       }
-      return res.status(404).json({
-        message: "No hotels found for selected dates. Please try different dates or destination.",
-        code: "NO_HOTELS_FOUND",
-      });
+      if (result.status === 404) {
+        return res.status(404).json({ message: result.message, code: result.code });
+      }
+      return res.status(502).json({ message: result.message, code: result.code });
     }
 
-    const searchId = randomUUID();
-    const searchTs = Date.now();
-    searchCache.set(searchId, { data: allResults, ts: searchTs });
-    // Register every BookingCode from this search for 40-minute session-age validation
-    for (const h of allResults as any[]) {
+    // Register BookingCodes for 40-minute session-age validation used by
+    // /prebook and /book. Concierge's read-only search path does not need
+    // this — it never proceeds to prebook on its own endpoint.
+    searchCache.set(result.searchId, { data: result.hotels, ts: result.searchTs });
+    for (const h of result.hotels as any[]) {
       if (Array.isArray(h?.Rooms)) {
         for (const r of h.Rooms) {
-          if (r?.BookingCode) bookingCodeTimestamps.set(r.BookingCode, searchTs);
+          if (r?.BookingCode) bookingCodeTimestamps.set(r.BookingCode, result.searchTs);
         }
       }
     }
-
-    // RC1: TotalFare stays TBO-raw (Rule 1 compliance). Markup exposed separately
-    // via _markupAmount + _displayTotalFare so frontend can show transparent breakdown.
-    const margins = await getMarginConfig();
-    const isHotelDomestic = (CountryCode || "IN") === "IN";
-    const marginPct = margins.enabled
-      ? (isHotelDomestic ? margins.hotel.domestic : margins.hotel.international)
-      : 0;
-    const hotelsToSend: any[] = allResults.map((hotel: any) => ({
-      ...hotel,
-      Rooms: hotel.Rooms?.map((room: any) => {
-        const net = room.TotalFare ?? 0;
-        const markupAmount = marginPct > 0 ? applyMargin(net, marginPct) - net : 0;
-        // RSP floor (TBO cert spec lines 1415/1746/1760): clamp display to RSP if present.
-        const _rsp =
-          typeof room.recommendedSellingRate === "number"
-            ? room.recommendedSellingRate
-            : null;
-        const _displayTotalFare = applyMarginWithFloor(net, marginPct, _rsp);
-        const _rspClamped = _rsp != null && _rsp > applyMargin(net, marginPct);
-        return {
-          ...room,
-          _netAmount: room.NetAmount ?? net,
-          _markupAmount: markupAmount,
-          _displayTotalFare,
-          _marginPercent: marginPct,
-          _rsp,
-          _rspClamped,
-        };
-      }),
-    }));
 
     res.json({
       TraceId: "",
-      Hotels: hotelsToSend,
-      SearchId: searchId,
-      CityName: CityName || "",
+      Hotels: result.hotels,
+      SearchId: result.searchId,
+      CityName: result.cityName,
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Hotel search failed";
@@ -4059,6 +3538,14 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
 
     if (!match || !match.Rooms?.length) {
       return res.status(404).json({ error: "No rooms found for the selected hotel and dates" });
+    }
+
+    // Register BookingCodes so /prebook + /book pass the 40-min session-age
+    // gate. The /search route already does this for the city-wide flow; we
+    // mirror it here so concierge handoff (skips SBT /search) still works.
+    const roomsTs = Date.now();
+    for (const r of match.Rooms as any[]) {
+      if (r?.BookingCode) bookingCodeTimestamps.set(r.BookingCode, roomsTs);
     }
 
     res.json({ ok: true, rooms: match.Rooms });
