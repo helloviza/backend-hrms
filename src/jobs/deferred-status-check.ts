@@ -20,6 +20,133 @@ import { sendMail } from "../utils/mailer.js";
 
 const MAX_ATTEMPTS = 5;
 
+/**
+ * Derive internal booking state from a TBO GetBookingDetail response.
+ *
+ * Spec — UNIVERSAL_Hotel_API_Technical_Guide.md:
+ *   - Line 2030: TBO Status enum is { 0: BookFailed, 1: Confirmed, 3: VerifyPrice, 6: Cancelled }.
+ *     There is NO "Held" enum value. TBO returns "Confirmed" (Status=1) for BOTH held
+ *     and vouchered bookings; VoucherStatus (boolean) is the only discriminator.
+ *   - Line 1987: A booking made with IsVoucherBooking=true that returns Status=1 +
+ *     VoucherStatus=false is the "Pending" edge case — TBO has confirmed the booking
+ *     at the supplier but has not finished voucher generation. We keep it PENDING
+ *     so the voucher-poll path can finish.
+ *
+ * Because GetBookingDetail doesn't carry the original IsVoucherBooking flag, we use
+ * the booking's claimed (currently-persisted) status — set by deriveStateFromBookResponse
+ * at Book time — to disambiguate the "Confirmed + VoucherStatus=false" ambiguity.
+ *
+ * Exported for unit testing.
+ */
+export type ClaimedStatus =
+  | "CONFIRMED"
+  | "HELD"
+  | "PENDING"
+  | "FAILED"
+  | "CANCELLED"
+  | "CANCEL_PENDING"
+  | "EXPIRED"
+  | "CLOSED"
+  | "ORPHAN_CLEANED"
+  | string;
+
+export interface DerivedDetailState {
+  derivedStatus: string | null;
+  derivedIsHeld: boolean | null;
+  derivedIsVouchered: boolean | null;
+  derivedVoucherStatus: string | null;
+}
+
+export function deriveStateFromBookingDetail(
+  detail: any,
+  claimedStatus: ClaimedStatus,
+): DerivedDetailState {
+  const tboStatusStr = String(
+    detail?.HotelBookingStatus || detail?.BookingStatus || "",
+  ).toLowerCase();
+  const tboStatusNum = Number(detail?.Status ?? -1);
+  const tboVoucherStatus = detail?.VoucherStatus === true;
+
+  // VoucherStatus=true (or the rare "Vouchered" string) is the only true signal of
+  // a vouchered booking. Promote to CONFIRMED regardless of claimed state.
+  if (tboVoucherStatus || tboStatusStr === "vouchered") {
+    return {
+      derivedStatus: "CONFIRMED",
+      derivedIsHeld: false,
+      derivedIsVouchered: true,
+      derivedVoucherStatus: "GENERATED",
+    };
+  }
+
+  // TBO Status=1 / "Confirmed" without VoucherStatus → ambiguous:
+  //   - Hold flow (IsVoucherBooking=false at Book) → internal HELD.
+  //   - Voucher flow waiting for voucher (spec line 1987) → keep PENDING.
+  // The claimed status (written by deriveStateFromBookResponse at Book time) is
+  // our memory of the original IsVoucherBooking intent — trust it.
+  if (tboStatusStr === "confirmed" || tboStatusNum === 1) {
+    if (claimedStatus === "HELD") {
+      return {
+        derivedStatus: "HELD",
+        derivedIsHeld: true,
+        derivedIsVouchered: false,
+        derivedVoucherStatus: null,
+      };
+    }
+    if (claimedStatus === "PENDING") {
+      return {
+        derivedStatus: "PENDING",
+        derivedIsHeld: false,
+        derivedIsVouchered: false,
+        derivedVoucherStatus: "PENDING",
+      };
+    }
+    // Unknown claimed state — defensively mark HELD. The booking exists at TBO,
+    // is not vouchered, and (caller verifies) the hold window is still open.
+    return {
+      derivedStatus: "HELD",
+      derivedIsHeld: true,
+      derivedIsVouchered: false,
+      derivedVoucherStatus: null,
+    };
+  }
+
+  if (tboStatusStr === "cancelled" || tboStatusNum === 6) {
+    return {
+      derivedStatus: "CANCELLED",
+      derivedIsHeld: null,
+      derivedIsVouchered: null,
+      derivedVoucherStatus: null,
+    };
+  }
+
+  if (tboStatusStr === "bookfailed" || tboStatusStr === "failed" || tboStatusNum === 0) {
+    return {
+      derivedStatus: "FAILED",
+      derivedIsHeld: null,
+      derivedIsVouchered: null,
+      derivedVoucherStatus: null,
+    };
+  }
+
+  // Status=3 is VerifyPrice (price changed). Treat as FAILED so the frontend
+  // re-prebooks — aligns with deriveStateFromBookResponse() in tboBookingStateMapper.ts.
+  if (tboStatusNum === 3) {
+    return {
+      derivedStatus: "FAILED",
+      derivedIsHeld: null,
+      derivedIsVouchered: null,
+      derivedVoucherStatus: null,
+    };
+  }
+
+  return {
+    derivedStatus: null,
+    derivedIsHeld: null,
+    derivedIsVouchered: null,
+    derivedVoucherStatus: null,
+  };
+}
+
 export async function runDeferredStatusCheck(bookingDocId: string): Promise<void> {
   // Atomic claim — first caller (timer or cron) wins; the loser exits.
   const claimed = await SBTHotelBooking.findOneAndUpdate(
@@ -62,38 +189,14 @@ export async function runDeferredStatusCheck(bookingDocId: string): Promise<void
       throw new Error("GetBookingDetail returned empty");
     }
 
+    const { derivedStatus, derivedIsHeld, derivedIsVouchered, derivedVoucherStatus } =
+      deriveStateFromBookingDetail(detail, claimed.status);
+
+    // Kept for the warn-log payload below. tboStatusStr mirrors the original raw value;
+    // the actual decision lives in deriveStateFromBookingDetail.
     const tboStatusStr = String(
       detail?.HotelBookingStatus || detail?.BookingStatus || "",
     ).toLowerCase();
-    const tboStatusNum = Number(detail?.Status ?? -1);
-    const tboVoucherStatus = detail?.VoucherStatus === true;
-
-    // Derive the doc status TBO is reporting.
-    let derivedStatus: string | null = null;
-    let derivedIsHeld: boolean | null = null;
-    let derivedIsVouchered: boolean | null = null;
-    let derivedVoucherStatus: string | null = null;
-
-    if (tboStatusStr === "confirmed" || tboVoucherStatus) {
-      derivedStatus = "CONFIRMED";
-      derivedIsHeld = false;
-      derivedIsVouchered = tboVoucherStatus;
-      derivedVoucherStatus = tboVoucherStatus ? "GENERATED" : null;
-    } else if (tboStatusStr === "vouchered") {
-      derivedStatus = "CONFIRMED";
-      derivedIsHeld = false;
-      derivedIsVouchered = true;
-      derivedVoucherStatus = "GENERATED";
-    } else if (tboStatusStr === "held" || tboStatusNum === 3) {
-      derivedStatus = "HELD";
-      derivedIsHeld = true;
-      derivedIsVouchered = false;
-      derivedVoucherStatus = null;
-    } else if (tboStatusStr === "cancelled" || tboStatusNum === 2) {
-      derivedStatus = "CANCELLED";
-    } else if (tboStatusStr === "bookfailed" || tboStatusStr === "failed" || tboStatusNum === 0) {
-      derivedStatus = "FAILED";
-    }
 
     // Always opportunistically backfill metadata that the old setImmediate
     // block used to populate. PaxIds are required for PAN-at-voucher-time
