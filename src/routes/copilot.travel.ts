@@ -505,15 +505,16 @@ router.post("/flights/search", requireAuth, async (req, res) => {
       }
     }
 
-    const raw: any[] = resultsArr[0] || [];
+    const outboundRaw: any[] = Array.isArray(resultsArr[0]) ? resultsArr[0] : [];
+    const inboundRaw: any[] = Array.isArray(resultsArr[1]) ? resultsArr[1] : [];
 
-    if (!Array.isArray(raw) || raw.length === 0) {
+    if (outboundRaw.length === 0) {
       return res.json({ ok: true, results: [], traceId, message: "No flights found" });
     }
 
     const CABIN_LABELS: Record<number, string> = { 1: "All", 2: "Economy", 3: "Premium Economy", 4: "Business", 5: "Premium Business", 6: "First" };
 
-    const results = raw.slice(0, 10).map((r: any) => {
+    const mapFlight = (r: any) => {
       const segs: any[] = r.Segments?.[0] || [];
       const first = segs[0];
       const last  = segs[segs.length - 1];
@@ -565,10 +566,14 @@ router.post("/flights/search", requireAuth, async (req, res) => {
         isLCC: r.IsLCC ?? false,
         isRefundable: !(r.NonRefundable ?? true),
       };
-    }).filter(Boolean);
+    };
 
+    const results = outboundRaw.slice(0, 10).map(mapFlight).filter(Boolean);
+    const inbound = inboundRaw.slice(0, 10).map(mapFlight).filter(Boolean);
 
-    return res.json({ ok: true, results, traceId });
+    const response: any = { ok: true, results, traceId };
+    if (inbound.length > 0) response.inbound = inbound;
+    return res.json(response);
 
   } catch (err: any) {
     console.error("[FlightSearch/POST] Error:", err.message);
