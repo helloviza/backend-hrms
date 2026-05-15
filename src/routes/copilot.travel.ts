@@ -450,15 +450,64 @@ router.post("/flights/search", requireAuth, async (req, res) => {
         cabinClass,
       });
     } catch (err: any) {
-      console.error("[FlightSearch/POST] TBO error:", err.message);
-      return res.json({ ok: true, results: [], message: "No flights found" });
+      // Transport-level failure (auth retry exhausted, timeout, non-JSON response, network).
+      // Server-side log carries the detail; user sees a generic Plumtrips message.
+      console.error("[FlightSearch/POST] upstream transport error", {
+        message: err?.message,
+        origin: originIATA,
+        destination: destIATA,
+        date,
+      });
+      return res.status(502).json({
+        ok: false,
+        error: "Flight search is temporarily unavailable. Please try again in a few minutes.",
+      });
     }
 
     const traceId = tboRaw?.Response?.TraceId || "";
-    const raw: any[] = tboRaw?.Response?.Results?.[0] || [];
+    const resultsArr: any[] = Array.isArray(tboRaw?.Response?.Results)
+      ? tboRaw.Response.Results
+      : [];
+
+    // Upstream logical failure: non-success status code on the response.
+    // Mirrors the SBT search handler — if results are still present we pass them
+    // through with a warning; if not, surface as 502 with a structured server-side log.
+    const tboStatus = tboRaw?.Response?.ResponseStatus ?? tboRaw?.Response?.Status;
+    if (tboStatus !== undefined && tboStatus !== 1) {
+      const hasResults = resultsArr.length > 0
+        && Array.isArray(resultsArr[0])
+        && resultsArr[0].length > 0;
+      if (hasResults) {
+        console.warn("[FlightSearch/POST] upstream non-success status with results", {
+          tboStatus,
+          traceId,
+          origin: originIATA,
+          destination: destIATA,
+          date,
+        });
+        // fall through to normal mapping below
+      } else {
+        const errCode = tboRaw?.Response?.Error?.ErrorCode ?? "unknown";
+        const errMsg = tboRaw?.Response?.Error?.ErrorMessage || "Unknown upstream error";
+        console.error("[FlightSearch/POST] upstream search failed", {
+          errCode,
+          errMsg,
+          tboStatus,
+          traceId,
+          origin: originIATA,
+          destination: destIATA,
+          date,
+        });
+        return res.status(502).json({
+          ok: false,
+          error: "Flight search is temporarily unavailable. Please try again in a few minutes.",
+        });
+      }
+    }
+
+    const raw: any[] = resultsArr[0] || [];
 
     if (!Array.isArray(raw) || raw.length === 0) {
-
       return res.json({ ok: true, results: [], traceId, message: "No flights found" });
     }
 
