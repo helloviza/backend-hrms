@@ -1063,7 +1063,6 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       GuestNationality: _reqNationality,
       NetAmount,
       Guests,
-      UserIp = "1.1.1.1",
       PaymentId,
       bookingMode = "voucher",
     } = req.body;
@@ -1447,7 +1446,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     }
 
     const tboPayload: Record<string, unknown> = {
-      EndUserIp: UserIp,
+      EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
       BookingCode,
       ClientReferenceId: clientRef,
       GuestNationality,
