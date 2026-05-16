@@ -68,6 +68,12 @@ export type HotelSearchError =
   | { ok: false; status: 404; code: "NO_HOTELS_FOUND"; message: string }
   | { ok: false; status: 502; code: "HOTEL_API_ERROR"; message: string };
 
+export function isHotelSearchError(
+  r: HotelSearchOutput | HotelSearchError,
+): r is HotelSearchError {
+  return r.ok === false;
+}
+
 const ALLOWED_MEAL_TYPES = new Set([
   "All", "Room_Only", "BreakFast", "Half_Board",
   "Full_Board", "All_Inclusive_All_Meal",

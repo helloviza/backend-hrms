@@ -39,7 +39,7 @@ import {
 } from "../services/flightService.js";
 
 import { searchFlights as tboSearchFlights } from "../services/tbo.flight.service.js";
-import { searchHotels } from "../services/tbo.hotel.search.service.js";
+import { searchHotels, isHotelSearchError } from "../services/tbo.hotel.search.service.js";
 import SBTRequest from "../models/SBTRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
@@ -681,7 +681,7 @@ router.post("/hotels/search", requireAuth, async (req, res) => {
       Filters: req.body?.Filters,
     });
 
-    if (!result.ok) {
+    if (isHotelSearchError(result)) {
       if (result.status === 400) {
         return res.status(400).json({ ok: false, error: result.error });
       }

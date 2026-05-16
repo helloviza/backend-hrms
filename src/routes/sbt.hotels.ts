@@ -27,7 +27,7 @@ import {
   HOTEL_SESSION_TTL_MS,
   PRIORITY_COUNTRY_CODES,
 } from "../services/tbo.hotel.shared.js";
-import { searchHotels } from "../services/tbo.hotel.search.service.js";
+import { searchHotels, isHotelSearchError } from "../services/tbo.hotel.search.service.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 import ManualDateChangeRequest from "../models/ManualDateChangeRequest.js";
 import {
@@ -694,7 +694,7 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       Filters: req.body?.Filters,
     });
 
-    if (!result.ok) {
+    if (isHotelSearchError(result)) {
       if (result.status === 400) {
         return res.status(400).json({ error: result.error });
       }
