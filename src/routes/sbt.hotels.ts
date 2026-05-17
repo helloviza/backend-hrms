@@ -2670,69 +2670,30 @@ router.post("/bookings/check-status", requireAuth, async (req: any, res: any) =>
       return res.json({ found: false, clientReferenceId, dbStatus: booking.status, ...reconciliation });
     }
 
-    // Has a BookingId but still PENDING — ask TBO
-    const rawData = await withTBOSessionRetry(
-      async (tokenId) => {
-        const payload = {
-          EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
-          TokenId: tokenId,
-          BookingId: numericId,
-        };
-        const r = await fetch(
-          "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
-            body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(15_000),
-          },
-        );
-        return (await r.json()) as any;
-      },
-      (r: any) => {
-        const inner = r?.GetBookingDetailResult || r;
-        return inner?.ResponseStatus === 4 || inner?.Error?.ErrorCode === 6;
-      },
-    );
-
-    const detail = rawData?.GetBookingDetailResult || rawData;
-    const tboStatus = (detail?.HotelBookingStatus || detail?.BookingStatus || "").toLowerCase();
-
-    if (tboStatus === "confirmed" || tboStatus === "vouchered") {
-      // Backfill the DB record
-      const newStatus = booking.isHeld ? "HELD" : "CONFIRMED";
-      try {
-        await SBTHotelBooking.findOneAndUpdate(
-          { clientReferenceId },
-          { $set: {
-              status: newStatus,
-              confirmationNo: detail.ConfirmationNo || booking.confirmationNo || "",
-              bookingRefNo: detail.BookingRefNo || booking.bookingRefNo || "",
-              ...(detail?.TBOReferenceNo ? { tboReferenceNo: String(detail.TBOReferenceNo) } : {}),
-            } },
-        );
-      } catch (persistErr) {
-        sbtLogger.error("[CHECK-STATUS] Reconciliation $set failed", {
-          clientReferenceId,
-          bookingId: booking.bookingId,
-          err: persistErr instanceof Error ? persistErr.message : String(persistErr),
-          stack: persistErr instanceof Error ? persistErr.stack : undefined,
-        });
-        throw persistErr;
-      }
-      return res.json({
-        found: true,
-        bookingId: booking.bookingId,
-        confirmationNo: detail.ConfirmationNo || booking.confirmationNo || "",
-        bookingRefNo: detail.BookingRefNo || booking.bookingRefNo || "",
-        isHeld: booking.isHeld ?? false,
-        lastVoucherDate: detail.LastVoucherDate ?? booking.lastVoucherDate ?? null,
-        ...reconciliation,
-        status: newStatus,
-      });
-    }
-
-    return res.json({ found: false, clientReferenceId, tboStatus, ...reconciliation });
+    // TBO cert compliance (B1): this route is a PURE DB READ. It must never
+    // call HotelGetBookingDetail. The deferred status check
+    // (jobs/deferred-status-check.ts — fires once at T+120s after Book and is
+    // idempotent via the statusCheckDone atomic claim) is the single owner of
+    // the GetBookingDetail call and writes status/tboReferenceNo/confirmationNo/
+    // bookingRefNo/voucherStatus back to the DB. Until it runs, the frontend
+    // poll receives the initial persisted HOLD/PENDING state — which is the
+    // correct thing to show. Once the deferred check updates the DB, the
+    // booking flips to CONFIRMED/HELD and is served by the early-return above.
+    return res.json({
+      found: false,
+      clientReferenceId,
+      bookingId: booking.bookingId,
+      confirmationNo: booking.confirmationNo || "",
+      bookingRefNo: booking.bookingRefNo || "",
+      status: booking.status,
+      dbStatus: booking.status,
+      isHeld: booking.isHeld ?? false,
+      voucherStatus: booking.voucherStatus ?? null,
+      lastVoucherDate: booking.lastVoucherDate ?? null,
+      lastStatusCheckAt: (booking as any).lastStatusCheckAt ?? null,
+      tboReferenceNo: (booking as any).tboReferenceNo ?? null,
+      ...reconciliation,
+    });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Status check failed";
     res.status(500).json({ error: msg });
