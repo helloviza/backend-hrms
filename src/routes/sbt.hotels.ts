@@ -688,7 +688,7 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       CheckIn: req.body?.CheckIn,
       CheckOut: req.body?.CheckOut,
       Rooms: req.body?.Rooms,
-      GuestNationality: req.body?.GuestNationality,
+      GuestNationality: req.body?.GuestNationality || (req.user as any)?.nationality || "IN",
       CountryCode: req.body?.CountryCode,
       HotelCodes: req.body?.HotelCodes,
       Filters: req.body?.Filters,
