@@ -1582,6 +1582,10 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             // PAN audit (TBO conf 2026-05-05) — international + corporate flow.
             isCorporateBooking: !!isCorporateBooking,
             ...(isCorporateBooking && corporatePAN ? { corporatePAN } : {}),
+            // Lead-adult PAN sent to TBO at HOLD. TBO never echoes PAN back via
+            // GetBookingDetail, so this is the only durable source for
+            // backfilling paxDetails[].pan in the deferred status check.
+            ...(leadAdultPAN ? { heldLeadPAN: leadAdultPAN } : {}),
             // TBO cert Item 31 — opportunistically read TBOReferenceNo from the Book
             // response itself (no extra TBO call). TBO usually returns it only on
             // GetBookingDetail, but on rare responses it's already present here.
@@ -2222,17 +2226,29 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
     }
 
     // POST-001: Build PAN payload for HOLD+PanMandatory bookings.
-    // Pair user-supplied PAN with stored PaxIds from GetBookingDetail at Book time.
+    // Prefer the PAN persisted on paxDetails (captured at HOLD, backfilled by
+    // the deferred status check) so vouchering works silently. Fall back to the
+    // frontend modal's panData only for adults whose stored pan is missing.
     let voucherPanPayload: import("../services/tbo.hotel.service.js").VoucherPanPayload | undefined;
-    if (panData?.passengers?.length && booking.paxDetails?.length) {
-      const paxMap = new Map(booking.paxDetails.map((p: any) => [p.paxId, p]));
-      const validPairs = panData.passengers.filter(
-        (pr) => paxMap.has(pr.paxId) && pr.PAN?.trim()
+    if (booking.paxDetails?.length) {
+      const modalPanByPaxId = new Map(
+        (panData?.passengers ?? [])
+          .filter((pr) => pr.PAN?.trim())
+          .map((pr) => [pr.paxId, pr.PAN.trim().toUpperCase()]),
       );
-      if (validPairs.length > 0) {
+      const hotelPassenger = (booking.paxDetails as any[])
+        .filter((p: any) => Number(p?.paxType) === 1 && p?.paxId)
+        .map((p: any) => {
+          const storedPan = String(p?.pan ?? "").trim().toUpperCase();
+          const PAN = storedPan || modalPanByPaxId.get(String(p.paxId)) || "";
+          return { PaxId: String(p.paxId), PAN };
+        })
+        .filter((hp) => hp.PAN);
+      if (hotelPassenger.length > 0) {
         voucherPanPayload = {
-          isCorporate: panData.isCorporate === true,
-          hotelRoomsDetails: [{ hotelPassenger: validPairs.map((pr) => ({ PaxId: pr.paxId, PAN: pr.PAN.trim().toUpperCase() })) }],
+          // isCorporate is sourced only from the stored booking flag.
+          isCorporate: booking.isCorporateBooking === true,
+          hotelRoomsDetails: [{ hotelPassenger }],
         };
       }
     }

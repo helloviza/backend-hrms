@@ -204,14 +204,22 @@ export async function runDeferredStatusCheck(bookingDocId: string): Promise<void
     const allPassengers: any[] = (
       detail?.HotelRoomsDetails ?? detail?.Rooms ?? []
     ).flatMap((room: any) => room?.HotelPassenger ?? []);
+    // TBO never echoes the submitted PAN back via GetBookingDetail (always
+    // null), so pan is sourced from heldLeadPAN captured at HOLD time.
+    // Adults (PaxType 1) carry the lead PAN; children (PaxType 2) get null.
+    const heldLeadPAN = String((claimed as any).heldLeadPAN || "").trim();
     const paxDetails = allPassengers
       .filter((p: any) => p?.PaxId)
-      .map((p: any) => ({
-        paxId: String(p.PaxId),
-        firstName: p.FirstName || "",
-        lastName: p.LastName || "",
-        paxType: Number(p.PaxType) || 1,
-      }));
+      .map((p: any) => {
+        const paxType = Number(p.PaxType) || 1;
+        return {
+          paxId: String(p.PaxId),
+          firstName: p.FirstName || "",
+          lastName: p.LastName || "",
+          paxType,
+          pan: paxType === 1 ? (heldLeadPAN || null) : null,
+        };
+      });
     const roomDescription =
       (detail?.HotelRoomsDetails ?? detail?.Rooms ?? [])[0]?.RoomDescription ||
       (detail?.HotelRoomsDetails ?? detail?.Rooms ?? [])[0]?.RoomTypeName ||
@@ -236,7 +244,15 @@ export async function runDeferredStatusCheck(bookingDocId: string): Promise<void
       ...(roomDescription && !claimed.roomDescription
         ? { roomDescription }
         : {}),
-      ...(paxDetails.length > 0 && (!claimed.paxDetails || claimed.paxDetails.length === 0)
+      // Write paxDetails when missing, OR re-write to backfill pan when an
+      // existing record has adults still lacking a non-empty pan. The source
+      // (this GetBookingDetail call) is authoritative for paxId/name/type.
+      ...(paxDetails.length > 0 &&
+      (!claimed.paxDetails ||
+        claimed.paxDetails.length === 0 ||
+        (claimed.paxDetails as any[]).some(
+          (p: any) => Number(p?.paxType) === 1 && !String(p?.pan ?? "").trim(),
+        ))
         ? { paxDetails }
         : {}),
       ...(detail?.LastVoucherDate

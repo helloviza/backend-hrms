@@ -93,8 +93,12 @@ export interface ISBTHotelBooking extends Document {
     firstName: string;
     lastName: string;
     paxType: number;
+    pan?: string | null;
   }>;
   panMandatory?: boolean;
+  // Lead-adult PAN captured from the HOLD/Book request (TBO never echoes PAN
+  // back via GetBookingDetail). Source for backfilling paxDetails[].pan.
+  heldLeadPAN?: string;
   // PAN audit trail (TBO confirmation 2026-05-05). PAN is applied to international hotels only;
   // when isCorporateBooking=true, corporatePAN is the company PAN supplied at the payment page.
   isCorporateBooking?: boolean;
@@ -220,8 +224,10 @@ const SBTHotelBookingSchema = new Schema(
       firstName: { type: String },
       lastName: { type: String },
       paxType: { type: Number },
+      pan: { type: String, trim: true, default: null },
     }],
     panMandatory: { type: Boolean, default: false },
+    heldLeadPAN: { type: String, trim: true, default: "" },
     isCorporateBooking: { type: Boolean, default: false },
     corporatePAN: { type: String, default: "" },
     rebookFromBookingId: { type: String, default: null },
