@@ -46,6 +46,10 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   supportTickets:    ["ticketsEnabled"],
   tasks:             ["hrmsEnabled"],
   directCustomers:   ["crmEnabled"],
+  // SALES CRM
+  crmContacts:       ["crmEnabled"],
+  crmCompanies:      ["crmEnabled"],
+  leads:             ["crmEnabled"],
 };
 
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
