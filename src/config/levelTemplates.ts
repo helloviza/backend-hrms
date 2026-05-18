@@ -6,6 +6,7 @@ const FULL_ALL:   ModulePermission = { access: 'FULL',  scope: 'ALL'       }
 const FULL_WS:    ModulePermission = { access: 'FULL',  scope: 'WORKSPACE' }
 const FULL_TEAM:  ModulePermission = { access: 'FULL',  scope: 'TEAM'      }
 const WRITE_OWN:  ModulePermission = { access: 'WRITE', scope: 'OWN'       }
+const WRITE_ALL:  ModulePermission = { access: 'WRITE', scope: 'ALL'       }
 const WRITE_WS:   ModulePermission = { access: 'WRITE', scope: 'WORKSPACE' }
 const WRITE_TEAM: ModulePermission = { access: 'WRITE', scope: 'TEAM'      }
 const READ_OWN:   ModulePermission = { access: 'READ',  scope: 'OWN'       }
@@ -60,6 +61,10 @@ type ModulesTemplate = {
   supportTickets:    ModulePermission
   tasks:             ModulePermission
   directCustomers:   ModulePermission
+  // Sales CRM
+  crmContacts?:      ModulePermission
+  crmCompanies?:     ModulePermission
+  leads?:            ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -101,6 +106,9 @@ const L1: ModulesTemplate = {
   supportTickets:    NONE,
   tasks:             WRITE_OWN,
   directCustomers:   NONE,
+  crmContacts:       NONE,
+  crmCompanies:      NONE,
+  leads:             NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -108,6 +116,9 @@ const L2: ModulesTemplate = {
   ...L1,
   teamProfiles: READ_TEAM,
   teamCalendar: READ_TEAM,
+  crmContacts:  READ_OWN,
+  crmCompanies: READ_OWN,
+  leads:        WRITE_OWN,
 }
 
 // ── L3 — Team Leader ──────────────────────────────────────────────────────────
@@ -118,6 +129,9 @@ const L3: ModulesTemplate = {
   attendance:      READ_TEAM,
   teamPresence:    READ_TEAM,
   directCustomers: WRITE_OWN,
+  crmContacts:     WRITE_OWN,
+  crmCompanies:    READ_TEAM,
+  leads:           WRITE_OWN,
 }
 
 // ── L4 — Manager ─────────────────────────────────────────────────────────────
@@ -128,6 +142,9 @@ const L4: ModulesTemplate = {
   reports:        READ_TEAM,
   analytics:      READ_TEAM,
   tasks:          WRITE_TEAM,
+  crmContacts:    WRITE_TEAM,
+  crmCompanies:   WRITE_TEAM,
+  leads:          WRITE_TEAM,
 }
 
 // ── L5 — HR ───────────────────────────────────────────────────────────────────
@@ -146,6 +163,9 @@ const L5: ModulesTemplate = {
   workspaceSettings: READ_WS,
   tasks:             FULL_WS,
   directCustomers:   WRITE_TEAM,
+  crmContacts:       WRITE_TEAM,
+  crmCompanies:      WRITE_TEAM,
+  leads:             WRITE_TEAM,
 }
 
 // ── L6 — Admin ────────────────────────────────────────────────────────────────
@@ -165,6 +185,9 @@ const L6: ModulesTemplate = {
   accessConsole:     NONE, // Admin cannot manage access — SuperAdmin only
   tasks:             FULL_WS,
   directCustomers:   FULL_WS,
+  crmContacts:       WRITE_WS,
+  crmCompanies:      WRITE_WS,
+  leads:             WRITE_WS,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -176,6 +199,9 @@ const L7: ModulesTemplate = {
   invoices:       READ_ALL,
   adminVouchers:  READ_ALL,
   tasks:          FULL_WS,
+  crmContacts:    READ_ALL,
+  crmCompanies:   READ_ALL,
+  leads:          READ_ALL,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -217,6 +243,9 @@ const L8: ModulesTemplate = {
   supportTickets:    FULL_ALL,
   tasks:             FULL_ALL,
   directCustomers:   FULL_ALL,
+  crmContacts:       FULL_ALL,
+  crmCompanies:      FULL_ALL,
+  leads:             FULL_ALL,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -258,6 +287,9 @@ const VENDOR: ModulesTemplate = {
   supportTickets:    NONE,
   tasks:             NONE,
   directCustomers:   NONE,
+  crmContacts:       NONE,
+  crmCompanies:      NONE,
+  leads:             NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -299,6 +331,9 @@ const CUSTOMER_SBT: ModulesTemplate = {
   supportTickets:    NONE,
   tasks:             NONE,
   directCustomers:   NONE,
+  crmContacts:       NONE,
+  crmCompanies:      NONE,
+  leads:             NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -340,6 +375,9 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   supportTickets:    NONE,
   tasks:             NONE,
   directCustomers:   NONE,
+  crmContacts:       NONE,
+  crmCompanies:      NONE,
+  leads:             NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
