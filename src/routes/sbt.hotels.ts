@@ -3451,6 +3451,7 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
       childrenAges = null,
       rooms = 1,
       guestNationality = "IN",
+      countryCode = "IN",
     } = req.body;
 
     if (!hotelCode || !checkIn || !checkOut) {
@@ -3530,7 +3531,32 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
       if (r?.BookingCode) bookingCodeTimestamps.set(r.BookingCode, roomsTs);
     }
 
-    res.json({ ok: true, rooms: match.Rooms });
+    // Margin (RSP-floor aware) — mirrors tbo.hotel.search.service.ts:334-360.
+    // /rooms is the concierge-handoff path (skips SBT /search), so without
+    // this it leaks the raw TBO rate. match.Rooms is raw TBO (no
+    // normalizeRoom), hence PascalCase RecommendedSellingRate.
+    const roomMargins = await getMarginConfig();
+    const isRoomsDomestic = (countryCode || "IN") === "IN";
+    const roomsMarginPct = roomMargins.enabled
+      ? (isRoomsDomestic ? roomMargins.hotel.domestic : roomMargins.hotel.international)
+      : 0;
+    const roomsWithMargin = (match.Rooms as any[]).map((room: any) => {
+      const net = room.TotalFare ?? 0;
+      const _rsp =
+        typeof room.RecommendedSellingRate === "number"
+          ? room.RecommendedSellingRate
+          : null;
+      return {
+        ...room,
+        _netAmount: room.NetAmount ?? net,
+        _markupAmount: roomsMarginPct > 0 ? applyMargin(net, roomsMarginPct) - net : 0,
+        _displayTotalFare: applyMarginWithFloor(net, roomsMarginPct, _rsp),
+        _marginPercent: roomsMarginPct,
+        _rsp,
+      };
+    });
+
+    res.json({ ok: true, rooms: roomsWithMargin });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Room fetch failed";
     sbtLogger.error("Hotel rooms fetch failed", { error: msg });
