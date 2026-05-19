@@ -823,10 +823,16 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       ? (isPrebookDomestic ? prebookMargins.hotel.domestic : prebookMargins.hotel.international)
       : 0;
     // RSP floor (TBO cert spec lines 1415/1746/1760): clamp display to RSP if present.
-    const displayTotalFare = applyMarginWithFloor(
-      prebookTotalFare,
-      prebookMarginPct,
-      recommendedSellingRate,
+    // Math.ceil to whole rupee: the customer-facing total must equal the exact
+    // Razorpay charge (no paise drift) and stay at/above the RSP floor so it can
+    // never trip a false RSP_FLOOR_VIOLATED. Applies ONLY to the displayed total —
+    // NetAmount (line ~797, sent to TBO Book) stays bit-exact.
+    const displayTotalFare = Math.ceil(
+      applyMarginWithFloor(
+        prebookTotalFare,
+        prebookMarginPct,
+        recommendedSellingRate,
+      ),
     );
     const rspClamped =
       typeof recommendedSellingRate === "number" &&
