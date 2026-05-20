@@ -16,7 +16,32 @@ let marginCache: MarginConfig | null = null;
 let marginCacheTime = 0;
 const CACHE_TTL = 5 * 60 * 1000;
 
+// Safety guard: local/dev/staging share the production MongoDB cluster, so the
+// `margins` SBTConfig document is shared across environments. Without this
+// guard, toggling margins locally would apply markup to live production
+// pricing within the 5-min cache window. Only a process explicitly started
+// with NODE_ENV=production may read the real config — every other environment
+// gets a forced-disabled config regardless of the DB value.
+let nonProdGuardLogged = false;
+
 export async function getMarginConfig(): Promise<MarginConfig> {
+  if (process.env.NODE_ENV !== "production") {
+    if (!nonProdGuardLogged) {
+      // eslint-disable-next-line no-console
+      console.info(
+        `[MARGIN] Non-production environment (NODE_ENV=${
+          process.env.NODE_ENV ?? "<unset>"
+        }) — margins force-disabled`
+      );
+      nonProdGuardLogged = true;
+    }
+    return {
+      enabled: false,
+      flight: { domestic: 0, international: 0 },
+      hotel: { domestic: 0, international: 0 },
+    };
+  }
+
   const now = Date.now();
   if (marginCache && now - marginCacheTime < CACHE_TTL) {
     return marginCache;
