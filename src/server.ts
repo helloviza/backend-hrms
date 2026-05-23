@@ -476,7 +476,13 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Travel admin (SBT config, billing console, unified billing)
   app.use("/api/admin/sbt", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), adminSBTRouter);
   app.use("/api/admin/billing", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), adminBillingRouter);
-  app.use("/api/admin/unified", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), unifiedBillingRoutes);
+  // NO requireFeature — same reasoning as /api/my-bookings. These are READ-ONLY
+  // travel-spend aggregations over the cost-free TravelBooking mirror, and the
+  // router enforces per-caller scope itself (resolveAccessScope: GLOBAL for
+  // admins, ORG by tenantId for customer leaders/approvers, OWN otherwise). A
+  // capability flag (sbtEnabled) must not gate a customer from reading their own
+  // org's booking history, so SBT-off customers (e.g. manual-only) can load it.
+  app.use("/api/admin/unified", requireAuth, requireWorkspace, unifiedBillingRoutes);
 }
 
 // Dashboards
