@@ -8,6 +8,7 @@ import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import User from "../models/User.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
+import { toCustomerSafeFlight, toCustomerSafeHotel } from "../utils/customerSafeBooking.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -177,9 +178,16 @@ router.get("/bookings", requireAdminOrSBT, async (req: any, res: any) => {
       flights.reduce((s: number, f: any) => s + (f.totalFare || 0), 0) +
       hotels.reduce((s: number, h: any) => s + (h.totalFare || 0), 0);
 
+    // Customer / WORKSPACE_LEADER callers (sbtCustomerId is only set for them by
+    // requireAdminOrSBT — real admin roles return next() without it) must NOT see
+    // supplier cost or margin. Admins keep the full enriched doc unchanged.
+    const isCustomerCaller = !!req.sbtCustomerId;
+    const flightMapper = isCustomerCaller ? toCustomerSafeFlight : enrich;
+    const hotelMapper = isCustomerCaller ? toCustomerSafeHotel : enrich;
+
     res.json({
-      flights: flights.map(enrich),
-      hotels: hotels.map(enrich),
+      flights: flights.map(flightMapper),
+      hotels: hotels.map(hotelMapper),
       totalFlights,
       totalHotels,
       totalAmount,
