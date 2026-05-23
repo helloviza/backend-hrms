@@ -14,16 +14,24 @@ export interface ITravelBooking extends Document {
     | "HOLIDAY"
     | "MICE"
     | "GIFTING"
-    | "DECOR";
+    | "DECOR"
+    | "TRANSFER"
+    | "TRAIN"
+    | "OTHER";
   amount: number;
   userId: Schema.Types.ObjectId;
   status: "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED";
   paymentMode: "OFFICIAL" | "PERSONAL";
   source: "SBT" | "CONCIERGE";
   reference?: Schema.Types.ObjectId;
-  referenceModel?: "SBTBooking" | "SBTHotelBooking" | "ApprovalRequest";
+  referenceModel?: "SBTBooking" | "SBTHotelBooking" | "ApprovalRequest" | "ManualBooking";
   destination: string;
   origin: string;
+  // Display name/email of the actual traveller (e.g. manual-booking passenger),
+  // independent of userId (which is the booker/owner ref). Optional: SBT rows
+  // leave these unset and fall back to the populated userId on read.
+  travellerName?: string;
+  travellerEmail?: string;
   bookedAt: Date;
   travelDate?: Date;
   travelDateEnd?: Date;
@@ -43,6 +51,9 @@ const SERVICE_ENUM = [
   "MICE",
   "GIFTING",
   "DECOR",
+  "TRANSFER",
+  "TRAIN",
+  "OTHER",
 ] as const;
 
 const TravelBookingSchema = new Schema(
@@ -66,10 +77,12 @@ const TravelBookingSchema = new Schema(
     reference: { type: Schema.Types.ObjectId, refPath: "referenceModel" },
     referenceModel: {
       type: String,
-      enum: ["SBTBooking", "SBTHotelBooking", "ApprovalRequest"],
+      enum: ["SBTBooking", "SBTHotelBooking", "ApprovalRequest", "ManualBooking"],
     },
     destination: { type: String, default: "" },
     origin: { type: String, default: "" },
+    travellerName: { type: String, default: "" },
+    travellerEmail: { type: String, default: "" },
     bookedAt: { type: Date, default: Date.now },
     travelDate: { type: Date, default: null },
     travelDateEnd: { type: Date, default: null },

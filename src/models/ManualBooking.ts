@@ -1,4 +1,6 @@
 import { Schema, model, type Document } from "mongoose";
+import TravelBooking from "./TravelBooking.js";
+import CustomerWorkspace from "./CustomerWorkspace.js";
 
 export const PENDING_SUB_STATUSES = [
   "Pending for Customer Confirmation",
@@ -275,6 +277,129 @@ ManualBookingSchema.pre("save", async function (next) {
   }
 
   next();
+});
+
+/* ── Sync to TravelBooking mirror on save ──────────────────────────────
+ * Symmetric with the SBTBooking / SBTHotelBooking post-save hooks: upsert one
+ * TravelBooking keyed by { reference: doc._id }. The mirror is what the
+ * customer Bookings tab (/api/my-bookings) reads — manual bookings did not
+ * surface there until now.
+ *
+ * COST NEVER ENTERS THE MIRROR: `amount` is the customer-billed total
+ * (pricing.grandTotal / totalWithGST / quotedPrice — all customer-facing),
+ * NEVER actualPrice/supplierCost/markupAmount/profitMargin. TravelBooking has
+ * no cost field, and metadata below carries only descriptive (non-cost) data.
+ */
+
+// ManualBooking.type → TravelBooking.service (total mapping; all targets valid enum members)
+function manualTypeToService(t: string): string {
+  switch (t) {
+    case "FLIGHT":
+    case "DUMMY_FLIGHT": return "FLIGHT";
+    case "HOTEL":
+    case "DUMMY_HOTEL":  return "HOTEL";
+    case "VISA":         return "VISA";
+    case "CAB":          return "CAB";
+    case "TRANSFER":     return "TRANSFER";
+    case "FOREX":        return "FOREX";
+    case "ESIM":         return "ESIM";
+    case "HOLIDAYS":     return "HOLIDAY";
+    case "EVENTS":       return "MICE";
+    case "TRAIN":        return "TRAIN";
+    case "OTHER":        return "OTHER";
+    default:             return "OTHER";
+  }
+}
+
+// Display name for the actual traveller from passengers[]: lead passenger,
+// plus "+N" for additional passengers (e.g. "Nowshiba Malik +2"). NOT bookedBy.
+function formatTravellerName(passengers: any): string {
+  if (!Array.isArray(passengers) || passengers.length === 0) return "";
+  const leadName = String(passengers[0]?.name || "").trim();
+  const extra = passengers.length - 1;
+  return extra > 0 ? `${leadName} +${extra}` : leadName;
+}
+
+// ManualBooking.status → TravelBooking.status (INVOICED→CONFIRMED, WIP→PENDING, else 1:1)
+function manualStatusToTravel(s: string): "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" {
+  if (s === "INVOICED") return "CONFIRMED";
+  if (s === "WIP") return "PENDING";
+  if (s === "CONFIRMED") return "CONFIRMED";
+  if (s === "CANCELLED") return "CANCELLED";
+  return "PENDING"; // PENDING and any unexpected value
+}
+
+export async function syncManualBookingToMirror(doc: any): Promise<void> {
+  // Skip SBT-origin rows — those already mirror in from the SBT side (avoid double-count).
+  if (doc.source === "SBT" || doc.source === "SBT_AUTO" || doc.sourceBookingId) return;
+
+  const tenantId = String(doc.workspaceId); // = Customer._id (the canonical key)
+
+  // Resolve the CustomerWorkspace _id for this customer (required field on the mirror).
+  let workspaceId: any = undefined;
+  try {
+    const ws: any = await CustomerWorkspace.findOne({ customerId: tenantId })
+      .select("_id")
+      .lean();
+    if (ws?._id) workspaceId = ws._id;
+  } catch {
+    /* leave undefined — tenantId still scopes the customer Bookings tab */
+  }
+
+  const type = String(doc.type || "");
+  const isHotel = type === "HOTEL" || type === "DUMMY_HOTEL";
+  const origin = doc.itinerary?.origin || "";
+  const destination =
+    doc.itinerary?.destination || (isHotel ? doc.itinerary?.hotelName : "") || "";
+
+  // Customer-facing billed total only — never supplier cost / markup.
+  const amount =
+    doc.pricing?.grandTotal ?? doc.pricing?.totalWithGST ?? doc.pricing?.quotedPrice ?? 0;
+
+  const lead = Array.isArray(doc.passengers) ? doc.passengers[0] : undefined;
+
+  const update: any = {
+    tenantId,
+    service: manualTypeToService(type),
+    amount,
+    userId: doc.bookedBy, // required ref / ownership — NOT the displayed traveller
+    status: manualStatusToTravel(String(doc.status || "")),
+    paymentMode: "OFFICIAL", // agent-made on behalf of the customer
+    source: "CONCIERGE", // non-SBT source
+    reference: doc._id,
+    referenceModel: "ManualBooking",
+    destination,
+    origin,
+    // Actual traveller from passengers[] (lead + "+N"), surfaced to the customer
+    // Bookings tab — distinct from userId (the staff booker).
+    travellerName: formatTravellerName(doc.passengers),
+    travellerEmail: lead?.email || "",
+    bookedAt: doc.bookingDate || doc.createdAt,
+    travelDate: doc.travelDate ? new Date(doc.travelDate) : null,
+    travelDateEnd: doc.returnDate ? new Date(doc.returnDate) : null,
+    // descriptive only — NO pricing/cost fields
+    metadata: {
+      bookingRef: doc.bookingRef,
+      manualType: type,
+      hotelName: doc.itinerary?.hotelName || "",
+      airline: doc.itinerary?.airline || "",
+      sector: doc.sector || "",
+    },
+  };
+  if (workspaceId) update.workspaceId = workspaceId;
+
+  await TravelBooking.findOneAndUpdate({ reference: doc._id }, update, {
+    upsert: true,
+    new: true,
+  });
+}
+
+ManualBookingSchema.post("save", async function (doc: any) {
+  try {
+    await syncManualBookingToMirror(doc);
+  } catch (e) {
+    console.warn("TravelBooking sync (manual) failed:", (e as any)?.message);
+  }
 });
 
 export default model<IManualBooking>("ManualBooking", ManualBookingSchema);
