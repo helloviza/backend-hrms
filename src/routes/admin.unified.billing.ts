@@ -351,21 +351,50 @@ router.get("/top-travellers", async (req: Request, res: Response) => {
     const rows = await TravelBooking.aggregate([
       { $match: match },
       {
-        $group: {
-          _id: { userId: "$userId", service: "$service" },
-          spend: { $sum: "$amount" },
-          trips: { $sum: 1 },
+        // Manual mirror rows set userId = the staff booker and carry the real
+        // passenger only in travellerName. Group those by the passenger, not the
+        // booker. SBT rows leave travellerName unset → keep grouping by userId.
+        $addFields: {
+          _hasName: {
+            $gt: [{ $strLenCP: { $ifNull: ["$travellerName", ""] } }, 0],
+          },
+        },
+      },
+      {
+        $addFields: {
+          _travKey: {
+            $cond: [
+              "$_hasName",
+              { $concat: ["name:", { $toLower: "$travellerName" }] },
+              { $concat: ["uid:", { $toString: "$userId" }] },
+            ],
+          },
         },
       },
       {
         $group: {
-          _id: "$_id.userId",
+          _id: { key: "$_travKey", service: "$service" },
+          spend: { $sum: "$amount" },
+          trips: { $sum: 1 },
+          userId: { $first: "$userId" },
+          hasName: { $first: "$_hasName" },
+          travellerName: { $first: "$travellerName" },
+          travellerEmail: { $first: "$travellerEmail" },
+        },
+      },
+      {
+        $group: {
+          _id: "$_id.key",
           totalSpend: { $sum: "$spend" },
           tripCount: { $sum: "$trips" },
           services: { $addToSet: "$_id.service" },
           byServiceArr: {
             $push: { service: "$_id.service", spend: "$spend" },
           },
+          userId: { $first: "$userId" },
+          hasName: { $first: "$hasName" },
+          travellerName: { $first: "$travellerName" },
+          travellerEmail: { $first: "$travellerEmail" },
         },
       },
       { $sort: { totalSpend: -1 } },
@@ -373,7 +402,7 @@ router.get("/top-travellers", async (req: Request, res: Response) => {
       {
         $lookup: {
           from: "users",
-          localField: "_id",
+          localField: "userId",
           foreignField: "_id",
           as: "_user",
         },
@@ -382,7 +411,7 @@ router.get("/top-travellers", async (req: Request, res: Response) => {
       {
         $lookup: {
           from: "employees",
-          let: { uid: "$_id" },
+          let: { uid: "$userId" },
           pipeline: [
             { $match: { $expr: { $eq: ["$ownerId", "$$uid"] } } },
             { $limit: 1 },
@@ -396,17 +425,25 @@ router.get("/top-travellers", async (req: Request, res: Response) => {
     const travellers = rows.map((r) => {
       const u = r._user || {};
       const emp = r._emp || {};
-      const name =
+      const hasName = !!r.hasName;
+      const userName =
         u.name || [u.firstName, u.lastName].filter(Boolean).join(" ") || "";
       const byService: Record<string, number> = {};
       for (const s of r.byServiceArr || []) byService[s.service] = s.spend;
 
+      // Manual rows: show the passenger, never the booker — and don't attribute
+      // the booker's department/designation to the passenger.
+      const name = hasName ? r.travellerName || "" : userName;
+      const email = hasName ? r.travellerEmail || "" : u.email || "";
+      const department = hasName ? "" : emp.department || u.department || "";
+      const designation = hasName ? "" : emp.designation || u.designation || "";
+
       return {
-        userId: r._id,
+        userId: hasName ? null : r.userId,
         name,
-        email: u.email || "",
-        department: emp.department || u.department || "",
-        designation: emp.designation || u.designation || "",
+        email,
+        department,
+        designation,
         totalSpend: r.totalSpend,
         tripCount: r.tripCount,
         services: r.services,
@@ -430,6 +467,17 @@ router.get("/spend-by-department", async (req: Request, res: Response) => {
     const rows = await TravelBooking.aggregate([
       { $match: match },
       {
+        // Manual rows: userId is the staff booker, and the passenger has no
+        // employee record. Don't attribute the booker's department — bucket as
+        // "Unassigned". Distinct-traveller count uses the passenger for manual
+        // rows and the user for SBT rows.
+        $addFields: {
+          _hasName: {
+            $gt: [{ $strLenCP: { $ifNull: ["$travellerName", ""] } }, 0],
+          },
+        },
+      },
+      {
         $lookup: {
           from: "employees",
           let: { uid: "$userId" },
@@ -442,14 +490,32 @@ router.get("/spend-by-department", async (req: Request, res: Response) => {
       },
       { $unwind: { path: "$_emp", preserveNullAndEmptyArrays: true } },
       {
+        $addFields: {
+          _dept: {
+            $cond: [
+              "$_hasName",
+              "Unassigned",
+              { $ifNull: ["$_emp.department", "Unassigned"] },
+            ],
+          },
+          _travKey: {
+            $cond: [
+              "$_hasName",
+              { $concat: ["name:", { $toLower: "$travellerName" }] },
+              { $concat: ["uid:", { $toString: "$userId" }] },
+            ],
+          },
+        },
+      },
+      {
         $group: {
           _id: {
-            dept: { $ifNull: ["$_emp.department", "Unassigned"] },
+            dept: "$_dept",
             service: "$service",
           },
           spend: { $sum: "$amount" },
           trips: { $sum: 1 },
-          userIds: { $addToSet: "$userId" },
+          travKeys: { $addToSet: "$_travKey" },
         },
       },
       {
@@ -457,7 +523,7 @@ router.get("/spend-by-department", async (req: Request, res: Response) => {
           _id: "$_id.dept",
           spend: { $sum: "$spend" },
           trips: { $sum: "$trips" },
-          userIds: { $push: "$userIds" },
+          travKeys: { $push: "$travKeys" },
           byServiceArr: {
             $push: { service: "$_id.service", spend: "$spend" },
           },
@@ -467,9 +533,9 @@ router.get("/spend-by-department", async (req: Request, res: Response) => {
     ]).exec();
 
     const departments = rows.map((r) => {
-      const allIds = new Set<string>();
-      for (const arr of r.userIds || []) {
-        for (const id of arr) allIds.add(String(id));
+      const allKeys = new Set<string>();
+      for (const arr of r.travKeys || []) {
+        for (const k of arr) allKeys.add(String(k));
       }
       const byService: Record<string, number> = {};
       for (const s of r.byServiceArr || []) byService[s.service] = s.spend;
@@ -478,7 +544,7 @@ router.get("/spend-by-department", async (req: Request, res: Response) => {
         department: r._id,
         spend: r.spend,
         trips: r.trips,
-        travellers: allIds.size,
+        travellers: allKeys.size,
         byService,
       };
     });
@@ -528,10 +594,15 @@ router.get("/bookings", async (req: Request, res: Response) => {
     const rows = bookings.map((b: any) => {
       const pop = b.userId && typeof b.userId === "object" ? b.userId : null;
       const uid = pop ? String(pop._id) : String(b.userId || "");
-      const name = pop
+      const hasName = !!(b.travellerName && String(b.travellerName).trim());
+      const userName = pop
         ? pop.name || [pop.firstName, pop.lastName].filter(Boolean).join(" ") || ""
         : "";
-      const email = pop ? pop.email || "" : "";
+      // Manual rows: show the passenger (travellerName), not the staff booker,
+      // and don't attribute the booker's department to the passenger.
+      const name = hasName ? b.travellerName : userName;
+      const email = hasName ? b.travellerEmail || "" : pop ? pop.email || "" : "";
+      const department = hasName ? "" : empMap[uid] || "";
 
       return {
         _id: b._id,
@@ -545,8 +616,10 @@ router.get("/bookings", async (req: Request, res: Response) => {
         bookedAt: b.bookedAt,
         travelDate: b.travelDate,
         travelDateEnd: b.travelDateEnd,
-        traveller: { name, email, department: empMap[uid] || "" },
-        metadata: b.metadata,
+        traveller: { name, email, department },
+        // Cost-safe: never echo the raw Mixed metadata blob (it could carry
+        // supplier/cost keys). Return only the display field the UI reads.
+        metadata: { hotelName: (b.metadata && b.metadata.hotelName) || "" },
       };
     });
 
@@ -592,12 +665,19 @@ router.get("/bookings/export.csv", async (req: Request, res: Response) => {
       empMap[String(e.ownerId)] = e.department || "";
     }
 
-    // Batch-lookup travelerId by traveller email
+    // Effective traveller email per row: passenger for manual rows, booker's
+    // populated email for SBT rows. Used for both the CSV column and the
+    // travelerId lookup below.
+    const effEmail = (b: any): string => {
+      const pop = b.userId && typeof b.userId === "object" ? b.userId : null;
+      const hasName = !!(b.travellerName && String(b.travellerName).trim());
+      const e = hasName ? b.travellerEmail : pop?.email;
+      return String(e || "").toLowerCase();
+    };
+
+    // Batch-lookup travelerId by effective traveller email
     const emails = [...new Set(
-      (bookings as any[])
-        .map((b) => (b.userId && typeof b.userId === "object" ? b.userId.email : ""))
-        .filter(Boolean)
-        .map((e: string) => String(e).toLowerCase()),
+      (bookings as any[]).map(effEmail).filter(Boolean),
     )];
     const travelerMembers = await CustomerMember.find({ email: { $in: emails } })
       .select("email travelerId")
@@ -612,10 +692,15 @@ router.get("/bookings/export.csv", async (req: Request, res: Response) => {
     for (const b of bookings as any[]) {
       const pop = b.userId && typeof b.userId === "object" ? b.userId : null;
       const uid = pop ? String(pop._id) : String(b.userId || "");
-      const name = pop
+      const hasName = !!(b.travellerName && String(b.travellerName).trim());
+      const userName = pop
         ? pop.name || [pop.firstName, pop.lastName].filter(Boolean).join(" ") || ""
         : "";
-      const email = pop ? String(pop.email || "").toLowerCase() : "";
+      // Manual rows: show the passenger, not the booker; don't attribute the
+      // booker's department to the passenger.
+      const name = hasName ? b.travellerName : userName;
+      const email = effEmail(b);
+      const department = hasName ? "" : empMap[uid] || "";
 
       lines.push(
         [
@@ -624,7 +709,7 @@ router.get("/bookings/export.csv", async (req: Request, res: Response) => {
           csvEscape(name),
           csvEscape(email),
           csvEscape(travelerMap.get(email) || ""),
-          csvEscape(empMap[uid] || ""),
+          csvEscape(department),
           csvEscape(b.origin),
           csvEscape(b.destination),
           csvEscape(b.amount),
