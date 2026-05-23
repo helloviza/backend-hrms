@@ -20,6 +20,7 @@ import { sendMail } from "../utils/mailer.js";
 import { buildEmailShell, eRow, eCard, eBtn, eLabel, escapeHtml } from "./approvals.email.js";
 import { clearTBOToken, logoutTBO, getTBOTokenStatus, getAgencyBalance, getTBOToken } from "../services/tbo.auth.service.js";
 import { getMarginConfig, applyMargin, isDomestic } from "../utils/margin.js";
+import { toCustomerSafeFlight } from "../utils/customerSafeBooking.js";
 import { listTBOLogs, readTBOLog, logTBOCall } from "../utils/tboFileLogger.js";
 import {
   searchFlights,
@@ -1803,7 +1804,8 @@ router.get("/my-bookings", requireAuth, async (req: any, res: any) => {
 
     const lim = Math.min(50, Math.max(1, parseInt(limit as string, 10) || 10));
     const bookings = await SBTBooking.find(filter).sort({ createdAt: -1 }).limit(lim).lean();
-    res.json({ ok: true, bookings });
+    // Customer-facing path: strip supplier cost/margin before responding.
+    res.json({ ok: true, bookings: bookings.map(toCustomerSafeFlight) });
   } catch (err: any) {
     sbtLogger.error("my-bookings failed", { userId: req.user?.id, error: err.message });
     res.status(500).json({ error: err.message });
