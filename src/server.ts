@@ -450,6 +450,8 @@ import sbtRequestsRouter from "./routes/sbt.requests.js";
 import sbtWalletRouter from "./routes/sbt.wallet.js";
 import sbtConfigRouter from "./routes/sbt.config.js";
 import travelFormRouter from "./routes/travelForm.js";
+// Customer-facing READ-ONLY booking history (TravelBooking mirror, no feature gate)
+import myBookingsRouter from "./routes/myBookings.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // SHARED_API — SBT (Self-Booking Tool) routes (will be exposed via tenant API in Phase 4)
@@ -459,6 +461,8 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/sbt/wallet", sbtWalletRouter);
   app.use("/api/sbt/config", sbtConfigRouter);
   app.use("/api/travel-forms", requireAuth, requireWorkspace, requireFeature("travelFormEnabled"), travelFormRouter);
+  // Read-only booking history for any authenticated workspace member — NO requireFeature
+  app.use("/api/my-bookings", requireAuth, requireWorkspace, myBookingsRouter);
 }
 
 // SBT Admin (offer config)
