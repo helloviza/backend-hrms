@@ -1,7 +1,6 @@
 import express from "express";
 import mongoose from "mongoose";
 import { readFileSync } from "fs";
-import { writeFile as fsWriteFile, mkdir as fsMkdir } from "fs/promises";
 import { fileURLToPath } from "url";
 import path from "path";
 import { requireAuth } from "../middleware/auth.js";
@@ -18,7 +17,7 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { sendMail } from "../utils/mailer.js";
 import { buildEmailShell, eRow, eCard, eBtn, eLabel, escapeHtml } from "./approvals.email.js";
-import { clearTBOToken, logoutTBO, getTBOTokenStatus, getAgencyBalance, getTBOToken } from "../services/tbo.auth.service.js";
+import { clearTBOToken, logoutTBO, getTBOTokenStatus, getAgencyBalance } from "../services/tbo.auth.service.js";
 import { getMarginConfig, applyMargin, isDomestic } from "../utils/margin.js";
 import { toCustomerSafeFlight } from "../utils/customerSafeBooking.js";
 import { listTBOLogs, readTBOLog, logTBOCall } from "../utils/tboFileLogger.js";
@@ -40,6 +39,7 @@ import {
   isNDCFlight,
   reissueSearch,
   ticketReissue,
+  getCalendarFare,
 } from "../services/tbo.flight.service.js";
 import { consolidateCertificationLogs } from "../services/tbo.log.consolidator.js";
 import { getCompanySettings } from "../utils/companySettings.js";
@@ -484,59 +484,9 @@ router.post("/calendar", requireSBT, requireFlightAccess, async (req: any, res: 
       return res.status(400).json({ error: "origin, destination, and month are required" });
     }
 
-    const token = await getTBOToken();
-    const todayStr = new Date().toISOString().split("T")[0];
-    const requestedFirst = `${month}-01`;
-    const effectiveFromDate = requestedFirst < todayStr ? `${todayStr}T00:00:00` : `${requestedFirst}T00:00:00`;
-    const firstDay = effectiveFromDate;
-    const [yearStr, monthStr] = month.split("-");
-    const lastDayDate = new Date(+yearStr, +monthStr, 0); // last day of month
-    const lastDay = `${yearStr}-${monthStr}-${String(lastDayDate.getDate()).padStart(2, "0")}T00:00:00`;
-
-    const payload = {
-      EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
-      TokenId: token,
-      JourneyType: "1",
-      PreferredAirlines: null,
-      Sources: null,
-      Segments: [{
-        Origin: origin.toUpperCase(),
-        Destination: destination.toUpperCase(),
-        FlightCabinClass: cabinClass || 1,
-        PreferredDepartureTime: firstDay,
-        PreferredArrivalTime: lastDay,
-      }],
-    };
-
-    const response = await fetch(
-      "http://api.tektravels.com/BookingEngineService_Air/AirService.svc/rest/GetCalendarFare",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }
-    );
-
-    const data = await response.json();
-
-    // Log for TBO certification / debugging
-    logTBOCall({
-      method: "CalendarFare",
-      traceId: "calendar",
-      request: payload,
-      response: data,
-    });
-
-    // Persist calendar fare log for Case 9 certification consolidation
-    const calDir = path.resolve(__dirname, "../logs/tbo/calendar");
-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    fsMkdir(calDir, { recursive: true })
-      .then(() => fsWriteFile(
-        path.join(calDir, `GetCalendarFare_${ts}.json`),
-        JSON.stringify({ request: payload, response: data }, null, 2),
-        "utf-8",
-      ))
-      .catch(() => { /* fire-and-forget — never break the response */ });
+    // Routes through the shared post() wrapper in tbo.flight.service (inherits
+    // ErrorCode-6 token retry, env-based host, JSON guards, timeout, real traceId).
+    const data = await getCalendarFare({ origin, destination, month, cabinClass });
 
     // Transform SearchResults into a date-keyed map
     const body = data as { Response?: { SearchResults?: Array<{ DepartureDate?: string; Fare: number; IsLowestFareOfMonth?: boolean; AirlineCode: string; AirlineName: string }> } };
