@@ -172,7 +172,7 @@ export function mapTBOFlight(
     cabin: CABIN_LABELS[first.CabinClass] || opts.cabinLabel,
     baggage: first.Baggage || "",
     isLCC: r.IsLCC ?? false,
-    isRefundable: !(r.NonRefundable ?? true),
+    isRefundable: r.IsRefundable === true,
   };
 }
 
