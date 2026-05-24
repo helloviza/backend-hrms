@@ -349,8 +349,12 @@ export async function syncManualBookingToMirror(doc: any): Promise<void> {
   const type = String(doc.type || "");
   const isHotel = type === "HOTEL" || type === "DUMMY_HOTEL";
   const origin = doc.itinerary?.origin || "";
+  // destination is a CITY only — NEVER the hotel name (that caused the
+  // Top-Destinations contamination). For hotels the city lives in
+  // itinerary.destination or, failing that, `sector`. If neither has a city,
+  // leave destination empty. Hotel name stays available via metadata.hotelName.
   const destination =
-    doc.itinerary?.destination || (isHotel ? doc.itinerary?.hotelName : "") || "";
+    doc.itinerary?.destination || (isHotel ? doc.sector : "") || "";
 
   // Customer-facing billed total only — never supplier cost / markup.
   const amount =
