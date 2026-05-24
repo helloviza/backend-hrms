@@ -9,7 +9,7 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import VideoAnalysis from "../models/VideoAnalysis.js";
 import { invokePluto } from "../utils/plutoInvoke.js";
 
-import { assertTravelIntent } from "../utils/plutoIntentGuard.js";
+import { isOffDomainQuery, buildOffDomainRedirect } from "../utils/plutoIntentGuard.js";
 import { classifyPlutoIntent } from "../utils/plutoIntentClassifier.js";
 import { resolvePlutoState } from "../utils/plutoStateResolver.js";
 import { lockDecisions } from "../utils/plutoDecisionLocker.js";
@@ -738,9 +738,16 @@ router.post("/", requireAuth, async (req, res) => {
     // NEVER gate follow-up messages — they are refinements, not new requests.
     const isFollowUp = Boolean(context?.id || req.body?.conversationId);
 
-    // 1️⃣ Must be travel-related at all (skip for follow-ups)
-    if (!isFollowUp) {
-      assertTravelIntent(prompt);
+    // 1️⃣ Must be travel-related at all (skip for follow-ups).
+    // Off-domain (clearly HR/payroll/admin) → graceful concierge redirect
+    // in the SAME PlutoReplyV1 shape the frontend renders. Never a 500.
+    // A travel question that merely contains a flagged substring
+    // (e.g. "leave for the airport", "baggage policy") is NOT redirected.
+    if (!isFollowUp && isOffDomainQuery(prompt)) {
+      return res.json({
+        ok: true,
+        reply: buildOffDomainRedirect(),
+      });
     }
 
     /* ───────── Flight Route Search Detector ───────── */
