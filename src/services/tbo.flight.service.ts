@@ -1,5 +1,10 @@
 import { getTBOToken, getTokenAcquiredAt, clearTBOToken } from "./tbo.auth.service.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
+import { writeFile, mkdir } from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /* ── NDC airline detection ──────────────────────────────────────────────────── */
 
@@ -385,6 +390,58 @@ export async function getSSR(params: {
     TraceId: params.TraceId,
     ResultIndex: params.ResultIndex,
   });
+}
+
+export async function getCalendarFare(params: {
+  origin: string;
+  destination: string;
+  month: string; // "YYYY-MM"
+  cabinClass?: number;
+}) {
+  const token = await getTBOToken();
+
+  // Clamp the from-date to today when the requested month is in the past
+  const todayStr = new Date().toISOString().split("T")[0];
+  const requestedFirst = `${params.month}-01`;
+  const effectiveFromDate =
+    requestedFirst < todayStr ? `${todayStr}T00:00:00` : `${requestedFirst}T00:00:00`;
+  const firstDay = effectiveFromDate;
+  const [yearStr, monthStr] = params.month.split("-");
+  const lastDayDate = new Date(+yearStr, +monthStr, 0); // last day of month
+  const lastDay = `${yearStr}-${monthStr}-${String(lastDayDate.getDate()).padStart(2, "0")}T00:00:00`;
+
+  const payload = {
+    EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+    TokenId: token,
+    JourneyType: "1",
+    PreferredAirlines: null,
+    Sources: null,
+    Segments: [{
+      Origin: params.origin.toUpperCase(),
+      Destination: params.destination.toUpperCase(),
+      FlightCabinClass: params.cabinClass || 1,
+      PreferredDepartureTime: firstDay,
+      PreferredArrivalTime: lastDay,
+    }],
+  };
+
+  // Routes through the shared post() wrapper: inherits the ErrorCode-6 token
+  // clear-and-retry, env-based host, XML/non-JSON guards, timeout/abort, and a
+  // real per-request traceId — same as Search/FareQuote/SSR.
+  const data = await post("/GetCalendarFare", payload);
+
+  // Persist calendar fare log for Case 9 certification consolidation (fire-and-forget)
+  const calDir = path.resolve(__dirname, "../logs/tbo/calendar");
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  mkdir(calDir, { recursive: true })
+    .then(() => writeFile(
+      path.join(calDir, `GetCalendarFare_${ts}.json`),
+      JSON.stringify({ request: payload, response: data }, null, 2),
+      "utf-8",
+    ))
+    .catch(() => { /* fire-and-forget — never break the response */ });
+
+  return data;
 }
 
 /* ── TBO FlightNameValidation helpers ──────────────────────────────────────── */
