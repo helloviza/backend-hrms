@@ -115,6 +115,7 @@ function csvRow(values: (string | number | undefined | null)[]) {
 
 const BOOKING_COLUMNS = [
   "Sr. No",
+  "Booking Date",
   "Business Name",
   "Invoice Date",
   "Invoice Number",
@@ -145,8 +146,9 @@ const BOOKING_COLUMNS = [
   "Booking Month",
 ];
 
-// Money column indices (1-based): Quoted=15, Actual=16, Diff=17, GST=18, Base=19, Grand=20
-const MONEY_COLS = [15, 16, 17, 18, 19, 20];
+// Money column indices (1-based): Quoted=16, Actual=17, Diff=18, GST=19, Base=20, Grand=21
+// (shifted +1 by the "Booking Date" column inserted at position 2)
+const MONEY_COLS = [16, 17, 18, 19, 20, 21];
 
 function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = {}, tidMap: Record<string, string> = {}): (string | number | undefined)[] {
   const wsName =
@@ -169,6 +171,7 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
 
   return [
     srNo,
+    fmtDateDMY(b.bookingDate),
     wsName,
     invoiceDocDate,
     invNo,
@@ -272,7 +275,8 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
         { $match: filter },
         { $group: {
           _id: null,
-          grossValue:      { $sum: "$pricing.quotedPrice" },
+          grossValue:      { $sum: { $ifNull: [ "$pricing.grandTotal",
+                             { $ifNull: [ "$pricing.totalWithGST", "$pricing.quotedPrice" ] } ] } },
           totalProfit:     { $sum: "$pricing.basePrice" },
           pendingInvoices: { $sum: { $cond: [{ $ne: ["$status", "INVOICED"] }, 1, 0] } },
         }},
@@ -391,8 +395,8 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     headerRow.font = { bold: true };
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
 
-    // Column widths (29 cols: Traveler ID inserted after Pax Name)
-    const colWidths = [7, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16];
+    // Column widths (30 cols: Booking Date at position 2, Traveler ID after Pax Name)
+    const colWidths = [7, 14, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16];
     colWidths.forEach((width, i) => {
       sheet.getColumn(i + 1).width = width;
     });
