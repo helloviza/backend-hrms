@@ -132,6 +132,15 @@ const FLIGHT_BASE =
   process.env.TBO_FLIGHT_BASE_URL ||
   "http://api.tektravels.com/BookingEngineService_Air/AirService.svc/rest";
 
+// Production splits flight ops across two air hosts: a search-side host (Search,
+// FareQuote, FareRule, SSR, PriceRBD, Calendar) and a booking-side host (Book,
+// Ticket, GetBookingDetails, SendChangeRequest, GetCancellationCharges,
+// ReleasePNR, TicketReIssue). UAT serves everything from one host. When
+// TBO_FLIGHT_BOOKING_BASE_URL is unset we fall back to FLIGHT_BASE, so booking
+// ops resolve to the exact same URL as search ops — behavior is identical to
+// today (single-host UAT). The actual prod URL swap happens via env at cutover.
+const FLIGHT_BOOKING_BASE = process.env.TBO_FLIGHT_BOOKING_BASE_URL || FLIGHT_BASE;
+
 
 const TIMEOUT = Number(process.env.TBO_HTTP_TIMEOUT_MS || 300_000);
 
@@ -666,7 +675,7 @@ export async function bookFlight(params: {
     payload.CorporatePAN = params.corporatePAN;
   }
 
-  return post("/Book", payload, false, FLIGHT_BASE);
+  return post("/Book", payload, false, FLIGHT_BOOKING_BASE);
 }
 
 export async function ticketFlight(params: {
@@ -684,13 +693,13 @@ export async function ticketFlight(params: {
     BookingId: params.BookingId,
   };
   // GDS Ticket requires only these 5 fields — NO Passengers array
-  const gdsResult = await post("/Ticket", gdsPayload, false, FLIGHT_BASE) as any;
+  const gdsResult = await post("/Ticket", gdsPayload, false, FLIGHT_BOOKING_BASE) as any;
 
   // Auto-retry with IsPriceChangeAccepted if TBO signals price changed
   const gdsChanged = gdsResult?.Response?.IsPriceChanged === true
     || gdsResult?.Response?.Response?.IsPriceChanged === true;
   if (gdsChanged) {
-    return post("/Ticket", { ...gdsPayload, IsPriceChangeAccepted: true }, false, FLIGHT_BASE);
+    return post("/Ticket", { ...gdsPayload, IsPriceChangeAccepted: true }, false, FLIGHT_BOOKING_BASE);
   }
   return gdsResult;
 }
@@ -1121,7 +1130,7 @@ export async function ticketLCC(params: {
     payload.CorporatePAN = params.corporatePAN;
   }
 
-  const lccResult = await post("/Ticket", payload, false, FLIGHT_BASE) as any;
+  const lccResult = await post("/Ticket", payload, false, FLIGHT_BOOKING_BASE) as any;
 
   const respStatus = lccResult?.Response?.ResponseStatus ?? lccResult?.Response?.Response?.ResponseStatus;
   const respError = lccResult?.Response?.Error ?? lccResult?.Response?.Response?.Error;
@@ -1138,7 +1147,7 @@ export async function ticketLCC(params: {
   const lccChanged = lccResult?.Response?.IsPriceChanged === true
     || lccResult?.Response?.Response?.IsPriceChanged === true;
   if (lccChanged) {
-    return post("/Ticket", { ...payload, IsPriceChangeAccepted: true }, false, FLIGHT_BASE);
+    return post("/Ticket", { ...payload, IsPriceChangeAccepted: true }, false, FLIGHT_BOOKING_BASE);
   }
   return lccResult;
 }
@@ -1165,7 +1174,7 @@ export async function cancelFlight(params: {
   if (requestType !== 1 && params.TicketId?.length) {
     payload.TicketId = params.TicketId;
   }
-  return post("/SendChangeRequest", payload, false, FLIGHT_BASE);
+  return post("/SendChangeRequest", payload, false, FLIGHT_BOOKING_BASE);
 }
 
 export async function getCancellationCharges(params: {
@@ -1187,7 +1196,7 @@ export async function getCancellationCharges(params: {
     RequestType: params.RequestType ?? 1,
     BookingId: Number(params.BookingId),
     BookingMode: params.BookingMode ?? 5,
-  }, false, FLIGHT_BASE) as any;
+  }, false, FLIGHT_BOOKING_BASE) as any;
 
   const status = raw?.Response?.ResponseStatus;
   if (status !== 1) {
@@ -1214,7 +1223,7 @@ export async function releasePNR(params: {
     TokenId: token,
     BookingId: params.BookingId,
     PNR: params.PNR,
-  });
+  }, false, FLIGHT_BOOKING_BASE);
 }
 
 export async function getBookingDetails(params: { bookingId: string }) {
@@ -1223,7 +1232,7 @@ export async function getBookingDetails(params: { bookingId: string }) {
     EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
     TokenId: token,
     BookingId: params.bookingId,
-  }, false, FLIGHT_BASE);
+  }, false, FLIGHT_BOOKING_BASE);
 }
 
 export async function getBookingDetailsByPNR(params: {
@@ -1238,7 +1247,7 @@ export async function getBookingDetailsByPNR(params: {
     PNR: params.PNR,
     FirstName: params.FirstName,
     LastName: params.LastName || "",
-  }, false, FLIGHT_BASE);
+  }, false, FLIGHT_BOOKING_BASE);
 }
 
 export async function reissueSearch(params: {
@@ -1307,5 +1316,5 @@ export async function ticketReissue(params: {
     BookingId: Number(params.BookingId),
     IsPriceChangeAccepted: true,
     TicketData: params.TicketData ?? {},
-  }, false, FLIGHT_BASE);
+  }, false, FLIGHT_BOOKING_BASE);
 }
