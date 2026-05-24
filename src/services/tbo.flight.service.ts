@@ -106,7 +106,9 @@ export interface TBOSegment {
 export interface TBOFlightResult {
   ResultIndex: string;
   IsLCC: boolean;
-  NonRefundable: boolean;
+  // TBO sends IsRefundable on each result — there is no NonRefundable field on
+  // the wire. Refundable only when IsRefundable === true; false/absent = non-refundable.
+  IsRefundable?: boolean;
   Fare: TBOFare;
   FareBreakdown?: TBOFareBreakdown[];
   Segments: TBOSegment[][];
