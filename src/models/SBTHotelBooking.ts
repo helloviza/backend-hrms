@@ -300,6 +300,14 @@ SBTHotelBookingSchema.post("save", async function (doc: any) {
         reference: doc._id,
         referenceModel: "SBTHotelBooking",
         destination: doc.cityName || "",
+        // Cities-only Top Destinations: carry the authoritative source city +
+        // country through (previously countryCode was dropped). countryCode is
+        // already ISO-2; isInternational is null when country is unknown.
+        destinationCity: doc.cityName || null,
+        destinationCountry: (doc.countryCode || "").trim().toUpperCase() || null,
+        isInternational: (doc.countryCode || "").trim()
+          ? (doc.countryCode || "").trim().toUpperCase() !== "IN"
+          : null,
         origin: "",
         bookedAt: doc.bookedAt || doc.createdAt,
         travelDate: doc.checkIn ? new Date(doc.checkIn) : null,

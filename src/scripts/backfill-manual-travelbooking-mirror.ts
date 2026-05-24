@@ -62,7 +62,9 @@ function buildMirrorRow(doc: any, workspaceId: any) {
   const type = String(doc.type || "");
   const isHotel = type === "HOTEL" || type === "DUMMY_HOTEL";
   const origin = doc.itinerary?.origin || "";
-  const destination = doc.itinerary?.destination || (isHotel ? doc.itinerary?.hotelName : "") || "";
+  // CITY only — never the hotel name (caused Top-Destinations contamination).
+  // For hotels the city is in itinerary.destination or `sector`; else empty.
+  const destination = doc.itinerary?.destination || (isHotel ? doc.sector : "") || "";
   const amount = doc.pricing?.grandTotal ?? doc.pricing?.totalWithGST ?? doc.pricing?.quotedPrice ?? 0;
   const lead = Array.isArray(doc.passengers) ? doc.passengers[0] : undefined;
   const row: any = {

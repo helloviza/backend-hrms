@@ -27,6 +27,12 @@ export interface ITravelBooking extends Document {
   referenceModel?: "SBTBooking" | "SBTHotelBooking" | "ApprovalRequest" | "ManualBooking";
   destination: string;
   origin: string;
+  // Cities-only Top Destinations support (backfilled by
+  // scripts/backfill-destination-fields.ts). All optional/nullable so existing
+  // rows stay valid; null destinationCity = unresolved (excluded from ranking).
+  destinationCity?: string | null;
+  destinationCountry?: string | null; // ISO-2, e.g. "IN", "AE"
+  isInternational?: boolean | null; // null when country unknown
   // Display name/email of the actual traveller (e.g. manual-booking passenger),
   // independent of userId (which is the booker/owner ref). Optional: SBT rows
   // leave these unset and fall back to the populated userId on read.
@@ -81,6 +87,12 @@ const TravelBookingSchema = new Schema(
     },
     destination: { type: String, default: "" },
     origin: { type: String, default: "" },
+    // Cities-only Top Destinations fields. Nullable + default null so adding
+    // them does not rewrite existing rows; populated by the backfill migration
+    // and (going forward) by the SBT-hotel / manual mirror hooks.
+    destinationCity: { type: String, default: null },
+    destinationCountry: { type: String, default: null },
+    isInternational: { type: Boolean, default: null },
     travellerName: { type: String, default: "" },
     travellerEmail: { type: String, default: "" },
     bookedAt: { type: Date, default: Date.now },
