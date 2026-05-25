@@ -1,4 +1,9 @@
 // apps/backend/src/server.ts
+// ⚠️ MUST be the first import: back-fills process.env from the APP_SECRETS
+// bundle (and loads .env) BEFORE config/env.ts or any route reads SMTP_*/
+// GOOGLE_PLACES_API_KEY/PIXABAY_API_KEY at module-load time.
+import "./bootstrap/loadSecrets.js";
+
 import express from "express";
 import cookieParser from "cookie-parser";
 import morgan from "morgan";
