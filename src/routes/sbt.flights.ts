@@ -493,11 +493,25 @@ router.post("/calendar", requireSBT, requireFlightAccess, async (req: any, res: 
     const results = body?.Response?.SearchResults ?? [];
     const fareMap: Record<string, { fare: number; isLowest: boolean; airline: string; airlineName: string }> = {};
 
+    // Calendar fares come back NET from TBO — apply the same flight margin as
+    // /search so the date strip reflects selling price (it previously showed net).
+    // DISPLAY-ONLY: clicking a date only sets the search date; the bookable fare
+    // comes from /search + /farequote (which stash net for the TBO payload), so no
+    // net-stash is needed here. Whole-rupee ceil to match the rest of the flight UI.
+    const calMargins = await getMarginConfig();
+    let calMarginPct = 0;
+    if (calMargins.enabled) {
+      const { originCountry, destCountry } = req.body;
+      calMarginPct = isDomestic(originCountry, destCountry)
+        ? calMargins.flight.domestic
+        : calMargins.flight.international;
+    }
+
     for (const r of results) {
       const dateKey = r.DepartureDate?.slice(0, 10);
       if (dateKey) {
         fareMap[dateKey] = {
-          fare: Math.round(r.Fare),
+          fare: Math.ceil(calMarginPct > 0 ? applyMargin(r.Fare, calMarginPct) : r.Fare),
           isLowest: r.IsLowestFareOfMonth === true,
           airline: r.AirlineCode,
           airlineName: r.AirlineName,
