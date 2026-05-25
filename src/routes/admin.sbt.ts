@@ -105,6 +105,37 @@ router.put("/offer", async (req: any, res: any) => {
   }
 });
 
+// GET /api/admin/sbt/landing-config — recents/promos slot mode for SBT landing pages
+router.get("/landing-config", async (_req: any, res: any) => {
+  try {
+    const doc = await SBTConfig.findOne({ key: "landing-recents-mode" }).lean();
+    const value = (doc?.value as any) ?? {};
+    res.json({ ok: true, enabled: value.enabled ?? true, mode: value.mode ?? "hybrid" });
+  } catch (err: any) {
+    console.error("[Admin SBT Landing GET]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/admin/sbt/landing-config — upsert recents/promos slot mode
+router.put("/landing-config", async (req: any, res: any) => {
+  try {
+    const VALID_MODES = ["hybrid", "recents_only", "promos_only"];
+    const mode = VALID_MODES.includes(req.body?.mode) ? req.body.mode : "hybrid";
+    const value = { enabled: !!req.body?.enabled, mode };
+    const userId = req.user?._id ?? req.user?.id ?? req.user?.sub ?? "";
+    const doc = await SBTConfig.findOneAndUpdate(
+      { key: "landing-recents-mode" },
+      { $set: { value, updatedBy: String(userId) } },
+      { upsert: true, new: true },
+    );
+    res.json({ ok: true, ...(doc.value as any) });
+  } catch (err: any) {
+    console.error("[Admin SBT Landing PUT]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/admin/sbt/config — read TBO wallet config
 router.get("/config", async (_req: any, res: any) => {
   try {

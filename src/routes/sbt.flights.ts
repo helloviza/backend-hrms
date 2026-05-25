@@ -2941,6 +2941,24 @@ router.post("/payment/verify", requireAuth, async (req: any, res: any) => {
   }
 });
 
+// GET /api/sbt/flights/landing-config — auth-only: recents/promos slot mode + active flight promos
+// Feeds the "Recent trips" landing slot. Reads the same SBTConfig "offers" doc that the
+// admin SBTOfferManager writes (flight array), filtered to enabled offers.
+router.get("/landing-config", requireAuth, async (_req: any, res: any) => {
+  try {
+    const [modeDoc, offersDoc] = await Promise.all([
+      SBTConfig.findOne({ key: "landing-recents-mode" }).lean(),
+      SBTConfig.findOne({ key: "offers" }).lean(),
+    ]);
+    const cfg = (modeDoc?.value as any) ?? {};
+    const offers = (offersDoc?.value as any) ?? {};
+    const promos = (Array.isArray(offers.flight) ? offers.flight : []).filter((o: any) => o?.enabled);
+    res.json({ ok: true, enabled: cfg.enabled ?? true, mode: cfg.mode ?? "hybrid", promos });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/sbt/flights/offer — public-ish (auth only, no admin) offer config for tickets
 router.get("/offer", async (_req: any, res: any) => {
   try {
