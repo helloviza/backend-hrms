@@ -526,6 +526,16 @@ r.post(
       }
 
       const hashed = await bcrypt.hash(password, 10);
+
+      // HOUSE/Plumtrips internal: SBT is on by default for newly activated
+      // STAFF accounts (excluding external personas). Scoped to the HOUSE
+      // workspace only — client/tenant activations are unaffected.
+      const HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
+      const EXTERNAL_ROLES = new Set(["CUSTOMER", "VENDOR", "WORKSPACELEADER", "REQUESTER"]);
+      const normRole = String(role).trim().toUpperCase().replace(/[\s\-_]/g, "");
+      const isHouseActivation = String((req as any).workspaceObjectId) === HOUSE_WORKSPACE_ID;
+      const houseStaffDefaultSbt = isHouseActivation && !EXTERNAL_ROLES.has(normRole);
+
       const activation = {
         passwordHash: hashed,
         roles: [role.toUpperCase()],
@@ -533,6 +543,8 @@ r.post(
         activatedByAdmin: true,
         isActive: true,
         activatedAt: new Date(),
+        // sbtEnabled=true → canRaiseRequest=false (parity with permissions path)
+        ...(houseStaffDefaultSbt ? { sbtEnabled: true, canRaiseRequest: false } : {}),
       };
 
       // Path A: grant access to an existing User doc (from tempPassword flow)
