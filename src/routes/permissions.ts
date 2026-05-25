@@ -15,6 +15,11 @@ import { allowedModuleKeysFor } from '../utils/featureToModules.js'
 
 const router = express.Router()
 
+// Plumtrips/HOUSE internal workspace. The SBT module row in the Access Console
+// drives the real User.sbtEnabled flag ONLY for this workspace — client/tenant
+// grants are intentionally left untouched.
+const HOUSE_WORKSPACE_ID = '69679a7628330a58d29f2254'
+
 function levelToRole(code: string): string {
   switch (code) {
     case 'L1': return 'EMPLOYEE'
@@ -232,14 +237,17 @@ router.get('/list', async (req: any, res: any) => {
       UserPermission.countDocuments(filter),
     ])
 
-    // Populate display names from User collection
+    // Populate display names from User collection. sbtEnabled is included so the
+    // Access Console SBT row can be seeded from the REAL field (User.sbtEnabled),
+    // not the legacy UserPermission.modules.sbt — see AccessConsole openManage.
     const userIds = docs.map(d => d.userId)
     const users = await User.find(
       { _id: { $in: userIds } },
-      { _id: 1, name: 1, firstName: 1, lastName: 1, email: 1 }
+      { _id: 1, name: 1, firstName: 1, lastName: 1, email: 1, sbtEnabled: 1 }
     ).lean()
 
     const nameMap: Record<string, string> = {}
+    const sbtMap: Record<string, boolean> = {}
     for (const u of users) {
       const id = String((u as any)._id)
       const name =
@@ -248,11 +256,13 @@ router.get('/list', async (req: any, res: any) => {
         (u as any).email ||
         ''
       nameMap[id] = name
+      sbtMap[id] = (u as any).sbtEnabled === true
     }
 
     const result = docs.map(d => ({
       ...d,
       displayName: nameMap[d.userId] || d.email,
+      sbtEnabled: sbtMap[d.userId] ?? false,
     }))
 
     return res.json({ data: result, total, page: pageNum, limit: limitNum })
@@ -325,6 +335,19 @@ router.post('/grant', async (req: any, res: any) => {
 
     const adminEmail = String(req.user?.email || req.user?._id || 'unknown')
 
+    // HOUSE-scoped: the SBT module row drives the real User.sbtEnabled flag.
+    // Refuse to enable when the workspace is in approval flow (avoids a
+    // nav-shows-but-book-fails half-state). Other workspaces are untouched.
+    const isHouseGrant = String(resolvedWorkspaceId) === HOUSE_WORKSPACE_ID
+    const grantSbtAccess = (modules as any).sbt?.access as string | undefined
+    const grantEnableSbt = !!grantSbtAccess && grantSbtAccess !== 'NONE'
+    if (isHouseGrant && grantEnableSbt) {
+      const houseWs = await CustomerWorkspace.findById(HOUSE_WORKSPACE_ID).select('travelMode').lean()
+      if ((houseWs as any)?.travelMode === 'APPROVAL_FLOW') {
+        return res.status(409).json({ success: false, message: 'Cannot enable SBT. Company uses approval flow.', code: 'APPROVAL_FLOW_CONFLICT' })
+      }
+    }
+
     const saved = await UserPermission.findOneAndUpdate(
       { userId },
       {
@@ -357,6 +380,20 @@ router.post('/grant', async (req: any, res: any) => {
       )
     } catch (syncErr) {
       logger.warn('[permissions/grant] hrmsAccessRole sync failed:', syncErr)
+    }
+
+    // HOUSE-scoped: write the real SBT flag the booking/nav layer reads.
+    // canRaiseRequest is coupled inverse to sbtEnabled for parity with
+    // /workspace/permissions (a booker is not simultaneously a requestor).
+    if (isHouseGrant) {
+      try {
+        await User.findOneAndUpdate(
+          { email: normalizedEmail },
+          { $set: { sbtEnabled: grantEnableSbt, canRaiseRequest: !grantEnableSbt } }
+        )
+      } catch (sbtErr) {
+        logger.warn('[permissions/grant] HOUSE sbtEnabled sync failed:', sbtErr)
+      }
     }
 
     logger.info(`[PERMISSION] GRANT ${normalizedEmail} → ${levelCode} by ${adminEmail}`)
@@ -408,6 +445,19 @@ router.patch('/update', async (req: any, res: any) => {
       }
     }
 
+    // HOUSE-scoped: SBT module row drives the real User.sbtEnabled flag.
+    // Computed from the merged doc so an explicit NONE disables SBT. Refuse to
+    // enable under approval flow. Other workspaces are untouched.
+    const isHouseUpd = String(existing.workspaceId) === HOUSE_WORKSPACE_ID
+    const updSbtAccess = (existing.modules as any).sbt?.access as string | undefined
+    const updEnableSbt = !!updSbtAccess && updSbtAccess !== 'NONE'
+    if (isHouseUpd && updEnableSbt) {
+      const houseWs = await CustomerWorkspace.findById(HOUSE_WORKSPACE_ID).select('travelMode').lean()
+      if ((houseWs as any)?.travelMode === 'APPROVAL_FLOW') {
+        return res.status(409).json({ success: false, message: 'Cannot enable SBT. Company uses approval flow.', code: 'APPROVAL_FLOW_CONFLICT' })
+      }
+    }
+
     // Accept levelCode as a top-level field (sent by AccessConsole frontend)
     const resolvedLevelCode = levelCodeBody || levelChanges?.code
     if (resolvedLevelCode) {
@@ -438,6 +488,18 @@ router.patch('/update', async (req: any, res: any) => {
       )
     } catch (syncErr) {
       logger.warn('[permissions/update] hrmsAccessRole sync failed:', syncErr)
+    }
+
+    // HOUSE-scoped: write the real SBT flag the booking/nav layer reads.
+    if (isHouseUpd) {
+      try {
+        await User.findOneAndUpdate(
+          { email: existing.email.toLowerCase() },
+          { $set: { sbtEnabled: updEnableSbt, canRaiseRequest: !updEnableSbt } }
+        )
+      } catch (sbtErr) {
+        logger.warn('[permissions/update] HOUSE sbtEnabled sync failed:', sbtErr)
+      }
     }
 
     logger.info(`[PERMISSION] UPDATE ${existing.email} by ${adminEmail}`)
@@ -498,6 +560,19 @@ router.post('/apply-template', async (req: any, res: any) => {
     existing.tier = levelToTier(levelCode)
     // designation intentionally preserved
 
+    // HOUSE-scoped: applying a template sets the SBT module per the level,
+    // which drives the real User.sbtEnabled flag. Refuse to enable under
+    // approval flow. Other workspaces are untouched.
+    const isHouseTpl = String(existing.workspaceId) === HOUSE_WORKSPACE_ID
+    const tplSbtAccess = (modulesToApply as any).sbt?.access as string | undefined
+    const tplEnableSbt = !!tplSbtAccess && tplSbtAccess !== 'NONE'
+    if (isHouseTpl && tplEnableSbt) {
+      const houseWs = await CustomerWorkspace.findById(HOUSE_WORKSPACE_ID).select('travelMode').lean()
+      if ((houseWs as any)?.travelMode === 'APPROVAL_FLOW') {
+        return res.status(409).json({ success: false, message: 'Cannot enable SBT. Company uses approval flow.', code: 'APPROVAL_FLOW_CONFLICT' })
+      }
+    }
+
     const adminEmail = String(req.user?.email || req.user?._id || 'unknown')
     existing.source = 'manual'
     existing.updatedBy = adminEmail
@@ -514,6 +589,18 @@ router.post('/apply-template', async (req: any, res: any) => {
       )
     } catch (syncErr) {
       logger.warn('[permissions/apply-template] hrmsAccessRole sync failed:', syncErr)
+    }
+
+    // HOUSE-scoped: write the real SBT flag the booking/nav layer reads.
+    if (isHouseTpl) {
+      try {
+        await User.findOneAndUpdate(
+          { email: existing.email.toLowerCase() },
+          { $set: { sbtEnabled: tplEnableSbt, canRaiseRequest: !tplEnableSbt } }
+        )
+      } catch (sbtErr) {
+        logger.warn('[permissions/apply-template] HOUSE sbtEnabled sync failed:', sbtErr)
+      }
     }
 
     logger.info(`[PERMISSION] TEMPLATE ${existing.email} → ${levelCode} by ${adminEmail}`)
