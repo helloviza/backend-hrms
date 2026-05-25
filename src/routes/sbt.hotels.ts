@@ -6,6 +6,7 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import SBTRequest from "../models/SBTRequest.js";
+import SBTConfig from "../models/SBTConfig.js";
 import { generateHotelVoucher, getBookingDetail } from "../services/tbo.hotel.service.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
@@ -147,6 +148,25 @@ const getHotelBookingsHandler = async (req: any, res: any) => {
 
 router.get("/bookings", requireSBT, getHotelBookingsHandler);
 router.get("/my-bookings", requireSBT, getHotelBookingsHandler);
+
+// GET /api/sbt/hotels/landing-config — recents/promos slot mode + active hotel promos.
+// Feeds the "Recent stays" landing slot. Reads the same SBTConfig "offers" doc that the
+// admin SBTOfferManager writes (hotel array), filtered to enabled offers. Placed before the
+// hotelBookingEnabled feature gate so the (cosmetic) landing slot loads for any SBT user.
+router.get("/landing-config", requireSBT, async (_req: any, res: any) => {
+  try {
+    const [modeDoc, offersDoc] = await Promise.all([
+      SBTConfig.findOne({ key: "landing-recents-mode" }).lean(),
+      SBTConfig.findOne({ key: "offers" }).lean(),
+    ]);
+    const cfg = (modeDoc?.value as any) ?? {};
+    const offers = (offersDoc?.value as any) ?? {};
+    const promos = (Array.isArray(offers.hotel) ? offers.hotel : []).filter((o: any) => o?.enabled);
+    res.json({ ok: true, enabled: cfg.enabled ?? true, mode: cfg.mode ?? "hybrid", promos });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ─── BOOKING FEATURE GATE ────────────────────────────────────────────────────
 // All routes below require hotelBookingEnabled = true on the workspace.
