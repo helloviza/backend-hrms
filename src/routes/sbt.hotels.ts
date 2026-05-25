@@ -823,16 +823,27 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       ? (isPrebookDomestic ? prebookMargins.hotel.domestic : prebookMargins.hotel.international)
       : 0;
     // RSP floor (TBO cert spec lines 1415/1746/1760): clamp display to RSP if present.
-    // Math.ceil to whole rupee: the customer-facing total must equal the exact
-    // Razorpay charge (no paise drift) and stay at/above the RSP floor so it can
-    // never trip a false RSP_FLOOR_VIOLATED. Applies ONLY to the displayed total —
-    // NetAmount (line ~797, sent to TBO Book) stays bit-exact.
-    const displayTotalFare = Math.ceil(
-      applyMarginWithFloor(
-        prebookTotalFare,
-        prebookMarginPct,
-        recommendedSellingRate,
+    // Round half-up to whole rupee (568.45→568, 568.50→569): the customer-facing
+    // total must equal the exact Razorpay charge (no paise drift). Applies ONLY to
+    // the displayed total — NetAmount (line ~797, sent to TBO Book) stays bit-exact.
+    //
+    // RSP-floor clamp: a bare round can drop below a fractional RSP floor
+    // (round(568.40)=568 < 568.40) and trip a false RSP_FLOOR_VIOLATED at booking.
+    // So we floor-clamp to Math.ceil(RSP) — the smallest whole rupee that is still
+    // >= the supplier's recommended minimum — guaranteeing charged >= floor.
+    const rspFloorCeil =
+      typeof recommendedSellingRate === "number" && recommendedSellingRate > 0
+        ? Math.ceil(recommendedSellingRate)
+        : 0;
+    const displayTotalFare = Math.max(
+      Math.round(
+        applyMarginWithFloor(
+          prebookTotalFare,
+          prebookMarginPct,
+          recommendedSellingRate,
+        ),
       ),
+      rspFloorCeil,
     );
     const rspClamped =
       typeof recommendedSellingRate === "number" &&
@@ -1484,40 +1495,31 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     }
 
     // Helper: call GetBookingDetail to verify actual booking status.
-    // CROSS-002: withTBOSessionRetry handles InValidSession with single retry.
+    // Hotel REST API authenticates via Basic Auth ONLY — the certified contract
+    // sends NO body TokenId (an AIR-account TokenId is rejected as ErrorCode 6).
     async function verifyBookingStatus(bookingId: number): Promise<any> {
-      const rawData = await withTBOSessionRetry(
-        async (tokenId) => {
-          const detailPayload = {
-            EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
-            TokenId: tokenId,
-            BookingId: bookingId,
-          };
-          const dt0 = Date.now();
-          const detailRes = await fetch(
-            "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
-              body: JSON.stringify(detailPayload),
-            }
-          );
-          const detailData = (await detailRes.json()) as any;
-          logTBOCall({
-            method: "HotelGetBookingDetail",
-            traceId: `hotel-book-verify-${bookingId}`,
-            bookingId,
-            request: detailPayload,
-            response: detailData,
-            durationMs: Date.now() - dt0,
-          });
-          return detailData;
-        },
-        (r: any) => {
-          const inner = r?.GetBookingDetailResult || r?.BookResult || r;
-          return inner?.ResponseStatus === 4 || inner?.Error?.ErrorCode === 6;
-        },
+      const detailPayload = {
+        EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
+        BookingId: bookingId,
+      };
+      const dt0 = Date.now();
+      const detailRes = await fetch(
+        "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
+          body: JSON.stringify(detailPayload),
+        }
       );
+      const rawData = (await detailRes.json()) as any;
+      logTBOCall({
+        method: "HotelGetBookingDetail",
+        traceId: `hotel-book-verify-${bookingId}`,
+        bookingId,
+        request: detailPayload,
+        response: rawData,
+        durationMs: Date.now() - dt0,
+      });
       return rawData?.GetBookingDetailResult || rawData?.BookResult || rawData;
     }
 
@@ -2718,16 +2720,13 @@ router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any
       return res.json({ ok: true, synced: 0, updated: 0 });
     }
 
-    let syncToken = "";
-    try { syncToken = await getTBOToken(); } catch {}
-
     let updated = 0;
     for (const doc of pendingBookings) {
       if (!doc.bookingId) continue;
       try {
+        // Hotel REST API authenticates via Basic Auth ONLY — no body TokenId.
         const detailPayload = {
           EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
-          TokenId: syncToken,
           BookingId: Number(doc.bookingId) || 0,
         };
         const t0 = Date.now();
@@ -2795,11 +2794,9 @@ router.post("/bookings/:id/sync-status", requireAuth, async (req: any, res: any)
       return res.json({ ok: true, status: doc.status, updated: false });
     }
 
-    let statusToken = "";
-    try { statusToken = await getTBOToken(); } catch {}
+    // Hotel REST API authenticates via Basic Auth ONLY — no body TokenId.
     const detailPayload = {
       EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
-      TokenId: statusToken,
       BookingId: Number(doc.bookingId) || 0,
     };
     const t0 = Date.now();
