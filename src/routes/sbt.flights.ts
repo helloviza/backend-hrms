@@ -722,6 +722,38 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
       });
     }
     const result = await getFareQuote(req.body) as any;
+
+    // Apply margin at the authoritative FareQuote point (server-side only) so
+    // display/charge/store inherit it. Mirrors the search transform
+    // (sbt.flights.ts ~line 614). The marked-up PublishedFare/OfferedFare are
+    // for DISPLAY + customer charge; _netPublishedFare/_netOfferedFare preserve
+    // the TBO-raw net so the Book/Ticket payload sends net (never the markup) —
+    // TBO rejects on price mismatch (IsPriceChangeAccepted:false).
+    const fqMargins = await getMarginConfig();
+    if (fqMargins.enabled) {
+      const originCountry = (req.body as any).originCountry;
+      const destCountry = (req.body as any).destCountry;
+      const isFlightDomestic = isDomestic(originCountry, destCountry);
+      const marginPct = isFlightDomestic
+        ? fqMargins.flight.domestic
+        : fqMargins.flight.international;
+
+      const fqFare = result?.Response?.Results?.Fare;
+      if (marginPct > 0 && fqFare) {
+        const netPublished = fqFare.PublishedFare ?? 0;
+        const netOffered = fqFare.OfferedFare ?? 0;
+        result.Response.Results.Fare = {
+          ...fqFare,
+          _netPublishedFare: netPublished,
+          _netOfferedFare: netOffered,
+          PublishedFare: applyMargin(netPublished, marginPct),
+          OfferedFare: applyMargin(netOffered, marginPct),
+          _marginPercent: marginPct,
+          _marginAmount: applyMargin(netOffered, marginPct) - netOffered,
+        };
+      }
+    }
+
     const fareResults = result?.Response?.Results;
     const corporateBookingAllowed =
       fareResults?.CorporateBookingAllowed || false;
