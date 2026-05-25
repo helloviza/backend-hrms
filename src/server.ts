@@ -449,6 +449,7 @@ import sbtHotelsRouter from "./routes/sbt.hotels.js";
 import sbtRequestsRouter from "./routes/sbt.requests.js";
 import sbtWalletRouter from "./routes/sbt.wallet.js";
 import sbtConfigRouter from "./routes/sbt.config.js";
+import sbtCityImageRouter from "./routes/sbt.cityImage.js";
 import travelFormRouter from "./routes/travelForm.js";
 // Customer-facing READ-ONLY booking history (TravelBooking mirror, no feature gate)
 import myBookingsRouter from "./routes/myBookings.js";
@@ -460,6 +461,7 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/sbt/requests", sbtRequestsRouter);
   app.use("/api/sbt/wallet", sbtWalletRouter);
   app.use("/api/sbt/config", sbtConfigRouter);
+  app.use("/api/sbt/city-image", sbtCityImageRouter);
   app.use("/api/travel-forms", requireAuth, requireWorkspace, requireFeature("travelFormEnabled"), travelFormRouter);
   // Read-only booking history for any authenticated workspace member — NO requireFeature
   app.use("/api/my-bookings", requireAuth, requireWorkspace, myBookingsRouter);
