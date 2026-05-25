@@ -37,4 +37,7 @@ export const env = {
 
   // --- Voucher Extractor / Gemini ---
   GEMINI_API_KEY: requireEnv("GEMINI_API_KEY"),
+
+  // --- Pixabay (SBT landing city images) — optional; absent disables auto-resolution ---
+  PIXABAY_API_KEY: process.env.PIXABAY_API_KEY || "",
 } as const;
