@@ -9,6 +9,7 @@ import User from "../models/User.js";
 import Vendor from "../models/Vendor.js";
 import Customer from "../models/Customer.js";
 import Employee from "../models/Employee.js";
+import DocumentModel from "../models/Document.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
@@ -52,6 +53,133 @@ function isHrmsAdmin(currentUser: any): boolean {
 /* -------------------------------------------------------------------------- */
 /* ✅ PASTE syncEmployeeRecord RIGHT HERE                                     */
 /* -------------------------------------------------------------------------- */
+
+/** Map an onboarding document `kind` (id|address|edu|offer|other) to a
+ *  Document collection category. Falls back to OTHER for anything unknown. */
+function mapOnboardingKindToCategory(kind: any): string {
+  switch (String(kind || "").toLowerCase()) {
+    case "id":
+    case "address":
+      return "IDENTITY";
+    case "edu":
+      return "EDUCATION";
+    case "offer":
+      return "EMPLOYMENT";
+    default:
+      return "OTHER";
+  }
+}
+
+/** Per-record outcome of a document migration, used for backfill reporting. */
+export type OnboardingDocMigrationResult = {
+  skippedNoWorkspace: boolean; // true → user had no resolvable workspaceId
+  total: number; // onboarding docs with a usable key that were considered
+  migrated: number; // newly inserted (or "would insert" in dry-run)
+  duplicates: number; // already present in Document collection (dedup)
+  errors: number; // per-doc failures (logged, non-fatal)
+};
+
+/** Migrate an onboarding record's documents[] into the Document collection so
+ *  they surface in the employee's Document Vault (/profile/team → Documents).
+ *  Idempotent: dedups by { workspaceId, userId, key } so repeated promotions
+ *  (incl. the alreadyExists path) and re-running the backfill never create
+ *  duplicates. Downloads still go through the authorized presigned
+ *  /documents/:id/url endpoint — bucket stays private.
+ *
+ *  Shared by the promotion path (POST /master-data/:id/promote-employee) and
+ *  the one-shot backfill script (scripts/backfillOnboardingDocuments.ts).
+ *  `dryRun` reports what would happen without writing; `onLog` receives a
+ *  verbose per-document line. */
+export async function migrateOnboardingDocuments({
+  user,
+  onboardingDoc,
+  dryRun = false,
+  onLog,
+}: {
+  user: any;
+  onboardingDoc: any;
+  dryRun?: boolean;
+  onLog?: (msg: string) => void;
+}): Promise<OnboardingDocMigrationResult> {
+  const result: OnboardingDocMigrationResult = {
+    skippedNoWorkspace: false,
+    total: 0,
+    migrated: 0,
+    duplicates: 0,
+    errors: 0,
+  };
+
+  const workspaceId =
+    user?.workspaceId || user?.customerId || user?.businessId || null;
+  // Document.workspaceId is required + DocumentVault filters by it; without a
+  // workspace the migrated docs could never be matched, so skip safely.
+  if (!user?._id || !workspaceId) {
+    result.skippedNoWorkspace = true;
+    return result;
+  }
+
+  const docs = Array.isArray(onboardingDoc?.documents)
+    ? onboardingDoc.documents
+    : [];
+
+  for (const d of docs) {
+    const key = d?.objectKey || d?.key || d?.Key || d?.path || d?.s3Key || "";
+    if (!key) continue;
+    result.total++;
+    const name =
+      d?.name || d?.filename || d?.originalName || key.split("/").pop() || "Document";
+
+    try {
+      if (dryRun) {
+        const exists = await DocumentModel.exists({
+          workspaceId,
+          userId: user._id,
+          key,
+        });
+        if (exists) {
+          result.duplicates++;
+          onLog?.(`    [dry-run] already present: ${key}`);
+        } else {
+          result.migrated++;
+          onLog?.(`    [dry-run] would migrate: ${key} ("${name}")`);
+        }
+        continue;
+      }
+
+      const r = await DocumentModel.updateOne(
+        { workspaceId, userId: user._id, key },
+        {
+          $setOnInsert: {
+            workspaceId,
+            userId: user._id,
+            uploadedBy: user._id,
+            category: mapOnboardingKindToCategory(d?.kind),
+            name,
+            key,
+            contentType: d?.contentType || undefined,
+            fileSize: d?.fileSize || undefined,
+            verificationStatus: "PENDING",
+          },
+        },
+        { upsert: true },
+      );
+
+      if ((r as any)?.upsertedCount > 0) {
+        result.migrated++;
+        onLog?.(`    migrated: ${key} ("${name}")`);
+      } else {
+        result.duplicates++;
+        onLog?.(`    already present: ${key}`);
+      }
+    } catch (err) {
+      result.errors++;
+      console.error("[promote-employee] document migration failed:", key, err);
+      onLog?.(`    ERROR: ${key} → ${(err as any)?.message || err}`);
+    }
+  }
+
+  return result;
+}
 
 async function syncEmployeeRecord({
   user,
@@ -104,6 +232,9 @@ async function syncEmployeeRecord({
   } else {
     await Employee.create(base);
   }
+
+  // Transfer onboarding documents into the employee's Document Vault.
+  await migrateOnboardingDocuments({ user, onboardingDoc });
 }
 
 /**
