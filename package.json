@@ -28,6 +28,8 @@
     "@aws-sdk/client-s3": "^3.693.0",
     "@aws-sdk/s3-presigned-post": "^3.908.0",
     "@aws-sdk/s3-request-presigner": "^3.693.0",
+    "@fontsource/manrope": "5.2.8",
+    "@fontsource/playfair-display": "5.2.8",
     "@google-cloud/speech": "^7.2.1",
     "@google/genai": "^1.41.0",
     "@google/generative-ai": "^0.24.1",
