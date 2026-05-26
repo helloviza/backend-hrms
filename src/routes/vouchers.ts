@@ -18,6 +18,14 @@ import { env } from "../config/env.js";
 import { extractVoucherViaGemini } from "../services/voucherExtractorGemini.js";
 import { normalizePlumtripsVoucher } from "../services/voucherNormalize.js";
 import { generateTravelPDF } from "../services/pdfService.js";
+import { adaptFlight, adaptHotel } from "../services/voucherAdapter.js";
+import {
+  VOUCHER_RENDER_VIA_LAMBDA,
+  invokeRendererLambda,
+} from "../services/voucherLambdaRenderer.js";
+import { generateTicketHTML } from "@plumtrips/shared/voucher-templates/ticketGenerator";
+import { generateHotelVoucherHTML } from "@plumtrips/shared/voucher-templates/hotelVoucherGenerator";
+import logger from "../utils/logger.js";
 
 const router = Router();
 
@@ -201,25 +209,65 @@ async function repairPassViaGemini(args: {
 /* ───────────────────────── PDF rendering ───────────────────────── */
 
 /**
+ * Render the voucher via the SHARED SBT template (adapter → HTML) and the
+ * deployed html→pdf Lambda. Used only when VOUCHER_RENDER_VIA_LAMBDA is on.
+ * Throws on any adapter/template/Lambda failure so the caller can fall back.
+ */
+async function renderViaSbtLambda(record: any): Promise<Buffer> {
+  const v = record?.extractedJson;
+  if (record?.docType === "flight") {
+    const { booking, returnBooking } = adaptFlight(v);
+    // showPrintButton=false; logoUrl=undefined → template's parameterized default.
+    const html = await generateTicketHTML(booking, [], returnBooking, undefined, false);
+    return invokeRendererLambda(html);
+  }
+  const params = adaptHotel(v);
+  const html = await generateHotelVoucherHTML(params);
+  return invokeRendererLambda(html);
+}
+
+/**
  * Generate + upload rendered PDF, persist in schema-backed fields:
  * renderedS3/renderedAt/renderedBy/renderedTemplateVersion/renderedRevision
+ *
+ * Render path (both call sites go through here):
+ *   - VOUCHER_RENDER_VIA_LAMBDA on  → SBT template + Lambda, tagged "v2-sbt";
+ *     on ANY failure, fall back to pdfkit (tagged "v1-pdfkit") and log. Render
+ *     must NEVER hard-fail the caller's flow beyond what pdfkit already did.
+ *   - flag off → pdfkit exactly as before, tagged "v1-pdfkit".
  */
 async function generateAndStoreRenderedPdf(args: {
   record: any;
   customerId: string;
   actorUserId: string;
-  renderedTemplateVersion?: string; // template version like "v1"
+  renderedTemplateVersion?: string; // legacy arg; the actual path now sets the tag
 }) {
   const { record, customerId, actorUserId } = args;
-  const renderedTemplateVersion = String(
-    args.renderedTemplateVersion || record?.renderedTemplateVersion || "v1",
-  );
 
   const normalized = record?.extractedJson;
   if (!normalized) throw new Error("Missing extractedJson for render");
 
-  // Generate the PDF using the external service
-  const pdfBuffer = await generateTravelPDF(normalized);
+  // Generate the PDF — choose path and tag it so we can tell SBT from fallback.
+  let pdfBuffer: Buffer;
+  let renderedTemplateVersion: string;
+
+  if (VOUCHER_RENDER_VIA_LAMBDA) {
+    try {
+      pdfBuffer = await renderViaSbtLambda(record);
+      renderedTemplateVersion = "v2-sbt";
+    } catch (err: any) {
+      logger.warn("[voucher-render] SBT+Lambda path failed; falling back to pdfkit", {
+        recordId: String(record?._id),
+        docType: record?.docType,
+        message: err?.message,
+      });
+      pdfBuffer = await generateTravelPDF(normalized);
+      renderedTemplateVersion = "v1-pdfkit";
+    }
+  } else {
+    pdfBuffer = await generateTravelPDF(normalized);
+    renderedTemplateVersion = "v1-pdfkit";
+  }
 
   const filename =
     record?.docType === "flight"

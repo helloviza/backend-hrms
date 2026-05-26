@@ -22,6 +22,7 @@
 import puppeteer, { type Browser } from "puppeteer-core";
 import { getChromeLaunchOptions } from "../utils/chromeResolver.js";
 import logger from "../utils/logger.js";
+import { FONT_FACE_CSS, FONT_CHECK_SPECS } from "./voucherFonts.js";
 
 let browserPromise: Promise<Browser> | null = null;
 
@@ -48,6 +49,16 @@ async function getBrowser(): Promise<Browser> {
 
   try {
     const launchOpts = await getChromeLaunchOptions();
+    // Stabilize text serialization in headless Chromium (parity with the Lambda
+    // renderer) — fixed hinting stops the PDF text layer doubling/transposing
+    // glyphs; LCD subpixel text is meaningless for vector PDF output. Appended
+    // here (not in the shared chromeResolver) so only the voucher renderer is
+    // affected, leaving eodImageRenderer / whatsapp launch options untouched.
+    launchOpts.args = [
+      ...(launchOpts.args || []),
+      "--font-render-hinting=none",
+      "--disable-lcd-text",
+    ];
     logger.info("[voucher-pdf] Launching Puppeteer browser", {
       executablePath: launchOpts.executablePath,
       env: process.env.NODE_ENV || "development",
@@ -92,6 +103,12 @@ async function renderOne(html: string): Promise<Buffer> {
       timeout: PAGE_TIMEOUT_MS,
     });
 
+    // Inject the self-hosted @font-face rules LAST so the local (base64) Manrope
+    // / Playfair faces win the cascade over the template's remote @import — this
+    // removes the fonts.googleapis.com fetch + substitution race that doubles /
+    // transposes glyphs in headless Chromium (parity with the Lambda renderer).
+    await page.addStyleTag({ content: FONT_FACE_CSS });
+
     // Explicitly confirm every <img> — notably the remote S3 logo — has decoded
     // before we capture, so the PDF can never show a blank logo. `complete` is
     // also true for a failed load, so we require naturalWidth > 0 to mean
@@ -109,20 +126,45 @@ async function renderOne(html: string): Promise<Buffer> {
         /* an image asset failed/timed out — proceed; 'load' gave best effort */
       });
 
-    // Belt-and-braces: even after load, font face application can lag a frame.
-    // Wait for the font set to be ready, but don't let it hang us.
-    await page
+    // Hardened font gate (parity with the Lambda renderer): await
+    // document.fonts.ready AND explicitly load + verify every needed (weight,
+    // style) of Manrope / Playfair via fonts.check(), then a short settle so
+    // face application paints before serialization. All bounded by
+    // FONTS_READY_TIMEOUT_MS so a stuck load degrades, never hangs.
+    const fontsOk = await page
       .evaluate(
-        (ms: number) =>
-          Promise.race([
-            (globalThis as any).document?.fonts?.ready ?? Promise.resolve(),
-            new Promise((r) => setTimeout(r, ms)),
-          ]),
+        async (specs: string[], ms: number) => {
+          const doc = (globalThis as any).document;
+          const deadline = Date.now() + ms;
+          const left = () => Math.max(0, deadline - Date.now());
+          const bounded = (p: Promise<unknown>) =>
+            Promise.race([p, new Promise((r) => setTimeout(() => r("timeout"), left()))]);
+          try {
+            await bounded(doc?.fonts?.ready ?? Promise.resolve());
+            await bounded(
+              Promise.all(specs.map((s) => doc.fonts.load(s).catch(() => {}))),
+            );
+          } catch {
+            /* ignore — fall through to check + settle */
+          }
+          const ok = specs.every((s) => {
+            try {
+              return doc.fonts.check(s);
+            } catch {
+              return false;
+            }
+          });
+          await new Promise((r) => setTimeout(r, 150)); // settle one paint cycle
+          return ok;
+        },
+        FONT_CHECK_SPECS,
         FONTS_READY_TIMEOUT_MS,
       )
-      .catch(() => {
-        /* fonts.ready unsupported / timed out — proceed with system fallback */
-      });
+      .catch(() => false);
+
+    if (!fontsOk) {
+      logger.warn("[voucher-pdf] Not all self-hosted faces resolved; proceeding with fallback");
+    }
 
     // CSS page breaks (the return-leg page uses `page-break-before:always`) are
     // honored by Chromium automatically. We deliberately do NOT set
