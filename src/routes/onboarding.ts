@@ -12,7 +12,9 @@ import mongoose from "mongoose";
 import Onboarding from "../models/Onboarding.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { requireAdmin } from "../middleware/rbac.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { presignGetObject } from "../utils/s3Presign.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { env } from "../config/env.js";
 import User from "../models/User.js";
@@ -1112,36 +1114,92 @@ router.get("/view/:token", noStore, async (req, res) => {
 
 /** 📎 Generate presigned GET URL for a private S3 document
  *  MUST be registered before /:token/details to avoid route interception
+ *
+ *  🔒 Authorization (defence-in-depth — presigned URLs bypass S3 perms, so the
+ *  backend is the ONLY gate):
+ *   - requireAuth      → must be logged in
+ *   - requireWorkspace → resolves the caller's workspace (mirrors /:token/details)
+ *   - requireAdmin     → staff/admin/HR only (no arbitrary employee/vendor/customer)
+ *   - ownership check  → the requested key MUST belong to an Onboarding record in
+ *                        the caller's workspace; SUPERADMIN is exempt from scoping.
+ *  This binds the set of signable keys to records the caller is authorized to see
+ *  and prevents signing arbitrary bucket objects (vouchers, other workspaces' PII).
  */
-router.get("/document/presign", requireAuth, noStore, async (req, res, next) => {
-  try {
+router.get(
+  "/document/presign",
+  requireAuth,
+  requireWorkspace,
+  requireAdmin,
+  noStore,
+  async (req, res, next) => {
+    try {
+      const validation = presignQuerySchema.safeParse(req.query);
+      if (!validation.success)
+        return res.status(400).json({
+          error: "Validation failed",
+          fields: validation.error.flatten().fieldErrors,
+        });
 
-    const validation = presignQuerySchema.safeParse(req.query);
-    if (!validation.success)
-      return res.status(400).json({
-        error: "Validation failed",
-        fields: validation.error.flatten().fieldErrors,
+      if (!S3_BUCKET)
+        return res.status(500).json({ error: "S3_BUCKET not configured" });
+
+      const { key } = validation.data;
+
+      // 🔒 Ownership gate: the key must be referenced by an Onboarding record.
+      // Match every field the upload/details paths may have stored the key under
+      // (canonical `key`, plus legacy/alternate `objectKey`/`Key`/`path`/`s3Key`).
+      const ownershipQuery: Record<string, any> = {
+        $or: [
+          { "documents.key": key },
+          { "documents.objectKey": key },
+          { "documents.Key": key },
+          { "documents.path": key },
+          { "documents.s3Key": key },
+        ],
+      };
+
+      // Non-SUPERADMIN callers are scoped to their own workspace.
+      if (!isSuperAdmin(req)) {
+        const wsId = (req as any).workspaceObjectId;
+        if (!wsId) {
+          return res.status(403).json({ error: "Workspace context required" });
+        }
+        ownershipQuery.workspaceId = wsId;
+      }
+
+      const owner: any = await (Onboarding as any)
+        .findOne(ownershipQuery)
+        .select("_id documents")
+        .lean()
+        .exec();
+
+      if (!owner) {
+        // 404 — don't leak whether the key exists in another workspace.
+        return res
+          .status(404)
+          .json({ error: "Document not found or access denied" });
+      }
+
+      // Nice download filename from the matching document (fallback: key basename).
+      const match = (owner.documents || []).find((d: any) =>
+        [d?.key, d?.objectKey, d?.Key, d?.path, d?.s3Key].includes(key)
+      );
+      const filename =
+        match?.name || match?.filename || key.split("/").pop() || undefined;
+
+      const url = await presignGetObject({
+        bucket: S3_BUCKET,
+        key,
+        filename,
+        expiresInSeconds: 300, // 5 min TTL
       });
 
-    if (!S3_BUCKET)
-      return res.status(500).json({ error: "S3_BUCKET not configured" });
-    if (!getSignedUrl)
-      return res.status(500).json({ error: "@aws-sdk/s3-request-presigner not installed — run: npm install @aws-sdk/s3-request-presigner" });
-
-    const { key } = validation.data;
-
-    const { GetObjectCommand } = await import("@aws-sdk/client-s3");
-    const cmd = new GetObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: key,
-    });
-
-    const url = await getSignedUrl(s3, cmd, { expiresIn: 300 }); // 5 min TTL
-    res.json({ url });
-  } catch (err) {
-    next(err);
+      res.json({ url });
+    } catch (err) {
+      next(err);
+    }
   }
-});
+);
 
 /** 🧑‍💼 Admin details (authed) – also triggers sync to HRMS */
 router.get("/:token/details", requireAuth, requireWorkspace, noStore, async (req, res, next) => {
