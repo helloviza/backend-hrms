@@ -5,6 +5,13 @@ node_modules/
 dist/
 build/
 
+# EXCEPTION: the vendored @plumtrips/shared build MUST be committed — it is the
+# only copy that travels into the apps/backend subtree split (the App Runner
+# mirror has no monorepo workspace to build it from). Regenerate via
+# scripts/vendor-shared.mjs. Keep this negation below the `dist/` rule above.
+!vendor/shared/dist/
+!vendor/shared/dist/**
+
 # env
 .env
 .env.*
