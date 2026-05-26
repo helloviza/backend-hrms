@@ -28,12 +28,19 @@ const upload = multer({
 
 /* ───────────────────────── helpers ───────────────────────── */
 
+/**
+ * Legacy customerId mirror — used ONLY for the S3 storage path prefix and the
+ * legacy `customerId` mirror field on the record. This is NOT a security
+ * boundary anymore: tenancy is enforced via workspaceId (req.workspaceObjectId,
+ * set by requireWorkspace). The previously-trusted client `x-customer-id`
+ * header has been removed so a caller can no longer influence scoping.
+ */
 function getCustomerId(req: any): string {
   return String(
-    req.user?.customerId ||
+    req.workspace?.customerId ||
+      req.user?.customerId ||
       req.user?.workspaceId ||
       req.user?.workspace?.id ||
-      req.headers["x-customer-id"] ||
       "default",
   );
 }
@@ -195,16 +202,18 @@ async function repairPassViaGemini(args: {
 
 /**
  * Generate + upload rendered PDF, persist in schema-backed fields:
- * renderedS3/renderedAt/renderedBy/renderedVersion
+ * renderedS3/renderedAt/renderedBy/renderedTemplateVersion/renderedRevision
  */
 async function generateAndStoreRenderedPdf(args: {
   record: any;
   customerId: string;
   actorUserId: string;
-  renderedVersion?: string; // template version like "v1"
+  renderedTemplateVersion?: string; // template version like "v1"
 }) {
   const { record, customerId, actorUserId } = args;
-  const renderedVersion = String(args.renderedVersion || record?.renderedVersion || "v1");
+  const renderedTemplateVersion = String(
+    args.renderedTemplateVersion || record?.renderedTemplateVersion || "v1",
+  );
 
   const normalized = record?.extractedJson;
   if (!normalized) throw new Error("Missing extractedJson for render");
@@ -228,7 +237,8 @@ async function generateAndStoreRenderedPdf(args: {
   record.renderedS3 = renderedS3;
   record.renderedAt = new Date();
   record.renderedBy = new mongoose.Types.ObjectId(actorUserId);
-  record.renderedVersion = renderedVersion;
+  record.renderedTemplateVersion = renderedTemplateVersion;
+  record.renderedRevision = (record.renderedRevision || 0) + 1;
 
   await record.save();
   return renderedS3;
@@ -239,7 +249,7 @@ async function generateAndStoreRenderedPdf(args: {
 /**
  * POST /api/vouchers/extract
  */
-router.post("/extract", requireAuth, upload.single("file"), async (req: any, res) => {
+router.post("/extract", requireAuth, requireWorkspace, upload.single("file"), async (req: any, res) => {
   const correlationId =
     req.headers["x-request-id"] ||
     req.headers["x-correlation-id"] ||
@@ -268,7 +278,8 @@ router.post("/extract", requireAuth, upload.single("file"), async (req: any, res
 
     // 2) DB record (processing)
     const record: any = await VoucherExtraction.create({
-      customerId,
+      workspaceId: req.workspaceObjectId, // ← tenancy boundary (schema requires it)
+      customerId, // legacy mirror only (not the security boundary)
       createdBy: new mongoose.Types.ObjectId(createdBy),
       s3,
       file: {
@@ -400,7 +411,7 @@ router.post("/extract", requireAuth, upload.single("file"), async (req: any, res
           record,
           customerId,
           actorUserId: createdBy,
-          renderedVersion: "v1",
+          renderedTemplateVersion: "v1",
         });
 
         debug.stages.render = {
@@ -434,7 +445,8 @@ router.post("/extract", requireAuth, upload.single("file"), async (req: any, res
         s3: record.s3,
         renderedS3: record.renderedS3 || null,
         renderedAt: record.renderedAt || null,
-        renderedVersion: record.renderedVersion || "v1",
+        renderedTemplateVersion: record.renderedTemplateVersion || "v1",
+        renderedRevision: record.renderedRevision || 0,
         extractedJson: record.extractedJson,
         createdAt: record.createdAt,
         correlationId,
@@ -519,14 +531,15 @@ router.post("/:id/render", requireAuth, requireWorkspace, async (req: any, res) 
       record: row,
       customerId,
       actorUserId,
-      renderedVersion: row?.renderedVersion || "v1",
+      renderedTemplateVersion: row?.renderedTemplateVersion || "v1",
     });
 
     return res.json({
       id: row._id,
       renderedS3,
       renderedAt: row.renderedAt || null,
-      renderedVersion: row.renderedVersion || "v1",
+      renderedTemplateVersion: row.renderedTemplateVersion || "v1",
+      renderedRevision: row.renderedRevision || 0,
     });
   } catch (e: any) {
     await saveErrorDetailsIfSupported(row, {
@@ -541,11 +554,16 @@ router.post("/:id/render", requireAuth, requireWorkspace, async (req: any, res) 
 /**
  * GET /api/vouchers/my
  */
-router.get("/my", requireAuth, async (req: any, res) => {
-  const customerId = getCustomerId(req);
+router.get("/my", requireAuth, requireWorkspace, async (req: any, res) => {
   const createdBy = getRequesterId(req);
 
-  const rows = await VoucherExtraction.find({ customerId, createdBy })
+  // Explicit workspaceId filter: these routes don't set the _workspaceId query
+  // option, so the workspaceScope plugin won't auto-inject — workspaceId is the
+  // tenancy boundary and must be in the filter directly.
+  const rows = await VoucherExtraction.find({
+    workspaceId: req.workspaceObjectId,
+    createdBy,
+  })
     .sort({ createdAt: -1 })
     .limit(50)
     .lean();
@@ -556,10 +574,10 @@ router.get("/my", requireAuth, async (req: any, res) => {
 /**
  * GET /api/vouchers (admin)
  */
-router.get("/", requireAuth, requireAdmin, async (req: any, res) => {
-  const customerId = getCustomerId(req);
-
-  const rows = await VoucherExtraction.find({ customerId })
+router.get("/", requireAuth, requireAdmin, requireWorkspace, async (req: any, res) => {
+  // Explicit workspaceId filter (see note in GET /my): scope every admin listing
+  // to the caller's workspace — never to a client-supplied customerId.
+  const rows = await VoucherExtraction.find({ workspaceId: req.workspaceObjectId })
     .sort({ createdAt: -1 })
     .limit(200)
     .lean();
