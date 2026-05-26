@@ -3068,27 +3068,23 @@ async function pollCancelStatusBackground(
     await new Promise<void>((r) => setTimeout(r, 5000));
 
     try {
-      const statusData = await withTBOSessionRetry(
-        async (tokenId) => {
-          const statusPayload = { BookingMode: 5, ChangeRequestId: changeRequestId, EndUserIp: endUserIp, TokenId: tokenId };
-          const t1 = Date.now();
-          const statusRes = await fetch(
-            "https://HotelBE.tektravels.com/hotelservice.svc/rest/GetChangeRequestStatus",
-            { method: "POST", headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() }, body: JSON.stringify(statusPayload) }
-          );
-          const sd = (await statusRes.json()) as any;
-          logTBOCall({
-            method: "HotelGetChangeRequestStatus",
-            traceId: `hotel-cancel-bg-${tboBookingId}-${i}`,
-            bookingId: tboBookingId,
-            request: statusPayload,
-            response: sd,
-            durationMs: Date.now() - t1,
-          });
-          return sd;
-        },
-        (r: any) => r?.HotelChangeRequestStatusResult?.ResponseStatus === 4 || r?.HotelChangeRequestStatusResult?.Error?.ErrorCode === 6,
+      // Hotel REST API authenticates via Basic Auth ONLY — the certified contract
+      // sends NO body TokenId (an AIR-account TokenId is rejected as ErrorCode 6).
+      const statusPayload = { BookingMode: 5, ChangeRequestId: changeRequestId, EndUserIp: endUserIp };
+      const t1 = Date.now();
+      const statusRes = await fetch(
+        "https://HotelBE.tektravels.com/hotelservice.svc/rest/GetChangeRequestStatus",
+        { method: "POST", headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() }, body: JSON.stringify(statusPayload) }
       );
+      const statusData = (await statusRes.json()) as any;
+      logTBOCall({
+        method: "HotelGetChangeRequestStatus",
+        traceId: `hotel-cancel-bg-${tboBookingId}-${i}`,
+        bookingId: tboBookingId,
+        request: statusPayload,
+        response: statusData,
+        durationMs: Date.now() - t1,
+      });
 
       const statusResult = statusData?.HotelChangeRequestStatusResult;
       cancelStatus = statusResult?.ChangeRequestStatus ?? 0;
@@ -3150,43 +3146,38 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     const numericBookingId = Number(doc.bookingId);
     const endUserIp = process.env.TBO_EndUserIp || "1.1.1.1";
 
-    // ── Step 1: SendChangeRequest (CROSS-002: withTBOSessionRetry for InValidSession) ──
-    const changeData = await withTBOSessionRetry(
-      async (tokenId) => {
-        const changeReqPayload = {
-          BookingMode: 5,
-          RequestType: 4,
-          Remarks: "Cancelled by user",
-          BookingId: numericBookingId,
-          EndUserIp: endUserIp,
-          TokenId: tokenId,
-        };
-        const t0 = Date.now();
-        const changeRes = await fetch(
-          "https://HotelBE.tektravels.com/hotelservice.svc/rest/SendChangeRequest",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
-            body: JSON.stringify(changeReqPayload),
-          }
-        );
-        const rawText = await changeRes.text();
-        let parsed: any;
-        try { parsed = JSON.parse(rawText); }
-        catch { throw new Error(`TBO SendChangeRequest returned non-JSON: ${rawText.substring(0, 200)}`); }
-        logTBOCall({
-          method: "HotelSendChangeRequest",
-          traceId: `hotel-cancel-${doc.bookingId}`,
-          clientReferenceId: doc.clientReferenceId,
-          bookingId: doc.bookingId,
-          request: changeReqPayload,
-          response: parsed,
-          durationMs: Date.now() - t0,
-        });
-        return parsed;
-      },
-      (r: any) => r?.HotelChangeRequestResult?.ResponseStatus === 4 || r?.HotelChangeRequestResult?.Error?.ErrorCode === 6,
+    // ── Step 1: SendChangeRequest ──
+    // Hotel REST API authenticates via Basic Auth ONLY — the certified contract
+    // sends NO body TokenId (an AIR-account TokenId is rejected as ErrorCode 6).
+    const changeReqPayload = {
+      BookingMode: 5,
+      RequestType: 4,
+      Remarks: "Cancelled by user",
+      BookingId: numericBookingId,
+      EndUserIp: endUserIp,
+    };
+    const t0 = Date.now();
+    const changeRes = await fetch(
+      "https://HotelBE.tektravels.com/hotelservice.svc/rest/SendChangeRequest",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
+        body: JSON.stringify(changeReqPayload),
+      }
     );
+    const rawText = await changeRes.text();
+    let changeData: any;
+    try { changeData = JSON.parse(rawText); }
+    catch { throw new Error(`TBO SendChangeRequest returned non-JSON: ${rawText.substring(0, 200)}`); }
+    logTBOCall({
+      method: "HotelSendChangeRequest",
+      traceId: `hotel-cancel-${doc.bookingId}`,
+      clientReferenceId: doc.clientReferenceId,
+      bookingId: doc.bookingId,
+      request: changeReqPayload,
+      response: changeData,
+      durationMs: Date.now() - t0,
+    });
 
     const changeResult = changeData?.HotelChangeRequestResult;
     if (!changeResult || changeResult.ResponseStatus !== 1) {
