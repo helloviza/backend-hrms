@@ -298,3 +298,132 @@ export function buildLineItemsForBooking(booking: any): any[] {
     },
   ];
 }
+
+/* ─── Combined invoice format ───────────────────────────────────────────
+ * "Combined" collapses many bookings into one COST (+ one Transaction Fees)
+ * line per category, vs "Separate" which itemises every booking. The grand
+ * total is identical between formats — only the line presentation differs.
+ *
+ * Reconciliation guarantee: we build the authoritative per-booking lines via
+ * buildLineItemsForBooking() and then SUM their amount/igst into the combined
+ * lines. Because Σ(combined amounts) === Σ(separate amounts) and likewise for
+ * igst, the route's subtotal / totalGST / grandTotal math (which sums across
+ * lineItems + booking pricing) yields exactly the same totals either way.
+ */
+
+// Booking type → combined-group key. Flights + dummy flights merge; flight
+// reschedules stay their OWN group (never merged with flights); hotels + dummy
+// hotels merge; everything else (VISA, TRAIN, TRANSFER, …, TROPHY, GIFT,
+// STATIONERY) groups by its own type.
+function combinedGroupKey(type: string): string {
+  if (type === "FLIGHT" || type === "DUMMY_FLIGHT") return "FLIGHT";
+  if (type === "HOTEL" || type === "DUMMY_HOTEL") return "HOTEL";
+  return type;
+}
+
+// Combined-line cost labels. Falls back to the per-booking TYPE_COST_LABELS
+// (so service types read "Transfer Cost", "Service Cost", etc.).
+const COMBINED_COST_LABELS: Record<string, string> = {
+  FLIGHT:            "Flight Booking",
+  FLIGHT_RESCHEDULE: "Flight Rescheduling",
+  HOTEL:             "Hotel Booking",
+  TRAIN:             "Train Booking",
+  VISA:              "VISA",
+};
+function combinedCostLabel(groupKey: string): string {
+  return COMBINED_COST_LABELS[groupKey] || TYPE_COST_LABELS[groupKey] || "Service Cost";
+}
+
+// Date range spanning a group: earliest travelDate → latest returnDate (or
+// travelDate when no return). Same-year ranges drop the year ("01 May – 13 May");
+// a single date keeps it ("01 May 2026"); cross-year keeps both years.
+function combinedGroupDateRange(bookings: any[]): string {
+  let min: number | null = null;
+  let max: number | null = null;
+  for (const b of bookings) {
+    const start = b?.travelDate ? new Date(b.travelDate).getTime() : NaN;
+    const endRaw = b?.returnDate || b?.travelDate;
+    const end = endRaw ? new Date(endRaw).getTime() : NaN;
+    if (!isNaN(start)) min = min === null ? start : Math.min(min, start);
+    if (!isNaN(end))   max = max === null ? end   : Math.max(max, end);
+  }
+  if (min === null && max === null) return "";
+  const lo = new Date(min ?? (max as number));
+  const hi = new Date(max ?? (min as number));
+  const dm  = (d: Date) => d.toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
+  const dmy = (d: Date) => d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  if (lo.getTime() === hi.getTime()) return dmy(lo);
+  if (lo.getFullYear() === hi.getFullYear()) return `${dm(lo)} – ${dm(hi)}`;
+  return `${dmy(lo)} – ${dmy(hi)}`;
+}
+
+export function buildCombinedLineItems(bookings: any[]): any[] {
+  // Group bookings (preserving first-seen order), collecting each group's
+  // authoritative per-booking lines for summation.
+  const groups = new Map<string, { bookings: any[]; lines: any[] }>();
+  const order: string[] = [];
+  for (const b of bookings) {
+    const key = combinedGroupKey(String(b?.type || ""));
+    let g = groups.get(key);
+    if (!g) {
+      g = { bookings: [], lines: [] };
+      groups.set(key, g);
+      order.push(key);
+    }
+    g.bookings.push(b);
+    g.lines.push(...buildLineItemsForBooking(b));
+  }
+
+  const out: any[] = [];
+  for (const key of order) {
+    const g = groups.get(key)!;
+    const costRows = g.lines.filter((li) => li.rowType === "COST");
+    const feeRows  = g.lines.filter((li) => li.rowType === "SERVICE_FEE");
+
+    const dateRange = combinedGroupDateRange(g.bookings);
+    const refs = g.bookings.map((b) => b.bookingRef).filter(Boolean).join(", ");
+    const passengerNames = g.bookings.flatMap((b) => (b.passengers || []).map((p: any) => p.name));
+
+    // Combined COST line — Σ of the group's COST-row amounts & GST.
+    const costAmount = parseFloat(costRows.reduce((s, r) => s + (r.amount ?? 0), 0).toFixed(2));
+    const costIgst   = parseFloat(costRows.reduce((s, r) => s + (r.igst ?? 0), 0).toFixed(2));
+    // Rate = pre-GST base so the per-row contract (Amount = Rate × Qty + GST,
+    // Qty = 1) holds for both ON_MARKUP (igst 0) and ON_FULL (igst > 0) groups.
+    out.push({
+      bookingRef:     refs,
+      rowType:        "COST",
+      description:    combinedCostLabel(key),
+      subDescription: dateRange,
+      qty:            1,
+      rate:           parseFloat((costAmount - costIgst).toFixed(2)),
+      igst:           costIgst,
+      amount:         costAmount,
+      passengerNames,
+      travelDate:     g.bookings[0]?.travelDate,
+      type:           key,
+    });
+
+    // Combined Transaction Fees line — Σ of the group's SERVICE_FEE-row amounts
+    // & GST. Emitted only when the group has fee rows (all-ON_FULL groups have
+    // none, matching SEPARATE).
+    if (feeRows.length > 0) {
+      const feeAmount = parseFloat(feeRows.reduce((s, r) => s + (r.amount ?? 0), 0).toFixed(2));
+      const feeIgst   = parseFloat(feeRows.reduce((s, r) => s + (r.igst ?? 0), 0).toFixed(2));
+      out.push({
+        bookingRef:     refs,
+        rowType:        "SERVICE_FEE",
+        description:    "Transaction Fees",
+        subDescription: dateRange,
+        qty:            1,
+        rate:           parseFloat((feeAmount - feeIgst).toFixed(2)),
+        igst:           feeIgst,
+        amount:         feeAmount,
+        passengerNames,
+        travelDate:     g.bookings[0]?.travelDate,
+        type:           key,
+      });
+    }
+  }
+
+  return out;
+}

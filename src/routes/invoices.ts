@@ -107,7 +107,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
 import { generateInvoicePdf } from "../utils/invoicePdf.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
-import { buildLineItemsForBooking } from "../utils/invoiceLineItems.js";
+import { buildLineItemsForBooking, buildCombinedLineItems } from "../utils/invoiceLineItems.js";
 import { detectGSTType, calculateGSTAmounts, GST_STATE_CODES, type GSTType } from "../utils/gstDetection.js";
 import { env } from "../config/env.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
@@ -417,6 +417,12 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       gstOverrideReason?: string;
     };
 
+    // Line-item presentation: SEPARATE (default — each booking itemised) or
+    // COMBINED (one COST + Transaction Fees line per category). Totals are
+    // identical between formats; only presentation differs.
+    const invoiceFormat: "SEPARATE" | "COMBINED" =
+      req.body?.invoiceFormat === "COMBINED" ? "COMBINED" : "SEPARATE";
+
     // GST bypass payload (separate from gstTypeOverride — distinct audit trail)
     const gstBypass = req.body?.gstBypass === true;
     const gstBypassReason = (req.body?.gstBypassReason || "").trim();
@@ -560,10 +566,16 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
 
     const clientState = detection.customerState;
 
-    // Build line items per booking: 1 line (ON_FULL) or 2 lines — COST + SERVICE_FEE (ON_MARKUP)
+    // Build line items. SEPARATE: per booking 1 line (ON_FULL) or 2 lines —
+    // COST + SERVICE_FEE (ON_MARKUP). COMBINED: one COST + Transaction Fees line
+    // per category, summed from the same per-booking lines (totals reconcile).
     const invoiceLineItems: any[] = [];
-    for (const b of bookings as any[]) {
-      invoiceLineItems.push(...buildLineItemsForBooking(b));
+    if (invoiceFormat === "COMBINED") {
+      invoiceLineItems.push(...buildCombinedLineItems(bookings as any[]));
+    } else {
+      for (const b of bookings as any[]) {
+        invoiceLineItems.push(...buildLineItemsForBooking(b));
+      }
     }
 
     // Per-row Amount now = Rate × Qty + GST (customer-payable line total),
