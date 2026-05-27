@@ -29,6 +29,12 @@ export async function getChromeLaunchOptions(): Promise<LaunchOptions> {
   // unpack + whatsapp-web.js Client.inject can exceed puppeteer's 30s default.
   const PROTOCOL_TIMEOUT = 180_000;
 
+  // @deprecated ABANDONED — see infra/audit/eod-render-lambda-plan-2026-05-27.md.
+  // EC2/Fargate path that used real Google Chrome at /usr/bin/google-chrome,
+  // intended for the never-wired Fargate EOD task. EOD now renders via the
+  // voucher render Lambda; EOD_USE_SYSTEM_CHROME is not set on App Runner. Kept
+  // only for the voucher in-process pdfkit fallback's launch resolution.
+  //
   // EC2 path — uses real Google Chrome installed at /usr/bin/google-chrome.
   // Bypasses Sparticuz entirely; the system binary already has all runtime libs.
   if (process.env.EOD_USE_SYSTEM_CHROME === "true") {

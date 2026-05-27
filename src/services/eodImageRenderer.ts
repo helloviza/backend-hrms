@@ -2,92 +2,40 @@
 //
 // Renders an EOD-snapshot HTML document to a PNG buffer.
 //
-// Uses a DEDICATED puppeteer browser instance — do NOT share with
-// whatsappService.ts, which manages its own internal browser via
-// whatsapp-web.js. Sharing causes session/page conflicts.
+// As of 2026-05-27 this no longer launches Chromium in-process. App Runner's
+// managed runtime lacks the NSS/GTK libs @sparticuz/chromium needs, so every
+// in-process launch failed with `libnss3.so: cannot open shared object file`
+// and the EOD report silently fell back to text. Rendering now goes through the
+// deployed, voucher-agnostic render Lambda in PNG mode (the SAME Lambda the
+// voucher PDF path uses). This is the UNCONDITIONAL path — there is no env flag.
+// See infra/audit/eod-render-lambda-plan-2026-05-27.md.
+//
+// Resilience is unchanged: sendEodReport (eodSnapshot.ts) still wraps this in a
+// try/catch and falls back to a text WhatsApp message if the Lambda render fails.
 
-import puppeteer, { type Browser } from "puppeteer-core";
-import { getChromeLaunchOptions } from "../utils/chromeResolver.js";
+import { invokeRendererLambda } from "./voucherLambdaRenderer.js";
 import logger from "../utils/logger.js";
 
-let browserPromise: Promise<Browser> | null = null;
-
-async function getBrowser(): Promise<Browser> {
-  if (browserPromise) {
-    const b = await browserPromise;
-    if (b.connected) return b;
-    // Browser disconnected — discard and relaunch
-    browserPromise = null;
-  }
-
-  try {
-    const launchOpts = await getChromeLaunchOptions();
-    logger.info("[EOD-render] Launching Puppeteer browser", {
-      executablePath: launchOpts.executablePath,
-      env: process.env.NODE_ENV || "development",
-    });
-
-    browserPromise = puppeteer.launch(launchOpts) as Promise<Browser>;
-    const browser = await browserPromise;
-    logger.info("[EOD-render] Puppeteer browser launched successfully");
-    browser.on("disconnected", () => {
-      logger.warn("[EOD-render] Puppeteer browser disconnected");
-      browserPromise = null;
-    });
-    return browser;
-  } catch (err: any) {
-    browserPromise = null;
-    logger.error("[EOD-render] Puppeteer launch failed", {
-      message: err?.message,
-      stack: err?.stack,
-      name: err?.name,
-      cause: err?.cause,
-      env: process.env.NODE_ENV,
-    });
-    throw err;
-  }
-}
+// Mobile-portrait canvas at 2× device scale for crisp WhatsApp delivery — parity
+// with the previous in-process puppeteer viewport. fullPage:true on the Lambda
+// side lets the capture extend past this height for a long snapshot.
+const EOD_VIEWPORT = { width: 720, height: 1500, dsf: 2 };
 
 export async function renderEodImage(html: string): Promise<Buffer> {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-  try {
-    // Mobile-portrait canvas at 2× device scale for crisp WhatsApp delivery.
-    await page.setViewport({ width: 720, height: 1500, deviceScaleFactor: 2 });
-
-    await page.setContent(html, { waitUntil: "load", timeout: 30_000 });
-
-    // Allow any CSS layout / SVG paint to settle
-    await new Promise((r) => setTimeout(r, 250));
-
-    const buffer = await page.screenshot({
-      type: "png",
-      fullPage: true,
-      omitBackground: false,
-    });
-
-    return Buffer.from(buffer);
-  } finally {
-    await page.close().catch(() => {
-      /* ignore close errors */
-    });
-  }
+  logger.info("[EOD-render] Rendering snapshot via render Lambda (png)");
+  const png = await invokeRendererLambda(html, {
+    format: "png",
+    viewport: EOD_VIEWPORT,
+  });
+  logger.info("[EOD-render] Snapshot rendered", { bytes: png.length });
+  return png;
 }
 
-/** Graceful shutdown hook (call on SIGTERM). */
+/**
+ * Graceful-shutdown hook — retained as a no-op so existing callers
+ * (jobs/runEodOnce.ts, scripts/render-eod-from-db.ts) keep compiling. There is
+ * no longer an in-process browser to close; the Lambda owns its own Chromium.
+ */
 export async function closeEodRendererBrowser(): Promise<void> {
-  if (!browserPromise) return;
-  try {
-    const b = await browserPromise;
-    await b.close();
-  } catch (err: any) {
-    logger.warn("[EOD-render] Browser close error", {
-      message: err?.message,
-      stack: err?.stack,
-      name: err?.name,
-      cause: err?.cause,
-    });
-  } finally {
-    browserPromise = null;
-  }
+  /* no-op — rendering is offloaded to the render Lambda */
 }

@@ -679,6 +679,7 @@ export async function sendEodReport(opts?: {
         lastSentAt: new Date(),
         lastSentStatus: result.failed === 0 ? "success" : "partial",
         lastSentError: result.errors.join(", "),
+        lastSentMode: mode,
       },
       { upsert: true },
     );

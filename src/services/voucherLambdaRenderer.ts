@@ -62,31 +62,56 @@ const lambda = new LambdaClient({
 });
 
 /** Shape the Lambda returns (bare object, no API Gateway envelope). */
-type RendererResponse = { pdfBase64?: string; error?: string };
+type RendererResponse = { pdfBase64?: string; pngBase64?: string; error?: string };
+
+/** Options for invokeRendererLambda. */
+export interface RendererLambdaOptions {
+  /** Output format. "pdf" (default) → vouchers; "png" → EOD WhatsApp image. */
+  format?: "pdf" | "png";
+  /** Render canvas. Omit to use the Lambda's per-format default (A4 for pdf,
+   *  720×1500@2× for png). Only sent when format === "png". */
+  viewport?: { width: number; height: number; dsf: number };
+}
 
 /**
- * Render a full HTML document to a PDF Buffer by invoking the deployed
+ * Render a full HTML document to a Buffer by invoking the deployed
  * "plumtrips-voucher-pdf" Lambda.
  *
- * Pass the output of generateTicketHTML / generateHotelVoucherHTML from
- * @plumtrips/shared — the same HTML the in-process renderHtmlToPdf() takes.
+ * The Lambda is a generic html→{pdf|png} renderer. Pass:
+ *   - format "pdf" (default): the output of generateTicketHTML /
+ *     generateHotelVoucherHTML — a PDF Buffer comes back. Voucher callers send
+ *     only `html`, so the payload + result are unchanged from before.
+ *   - format "png": a full-page PNG Buffer (the EOD report image).
  *
  * Throws a clear Error if the Lambda reports a function error, returns an
- * { error } body, or returns no pdfBase64.
+ * { error } body, or returns no base64 for the requested format.
  *
  * Future option (not implemented yet): a small retry on throttling /
  * transient 5xx invoke errors. Single attempt for now.
  */
-export async function invokeRendererLambda(html: string): Promise<Buffer> {
+export async function invokeRendererLambda(
+  html: string,
+  opts: RendererLambdaOptions = {},
+): Promise<Buffer> {
   if (!html || typeof html !== "string") {
     throw new Error("invokeRendererLambda: `html` must be a non-empty string");
   }
+
+  const format = opts.format === "png" ? "png" : "pdf";
+  const resultKey = format === "png" ? "pngBase64" : "pdfBase64";
+
+  // For pdf keep the payload byte-identical to the original ({ html }) so the
+  // proven voucher path is untouched; only png adds the extra fields.
+  const payload =
+    format === "png"
+      ? { html, format: "png", ...(opts.viewport ? { viewport: opts.viewport } : {}) }
+      : { html };
 
   const startedAt = Date.now();
   const command = new InvokeCommand({
     FunctionName: VOUCHER_PDF_LAMBDA_NAME,
     InvocationType: "RequestResponse",
-    Payload: Buffer.from(JSON.stringify({ html })),
+    Payload: Buffer.from(JSON.stringify(payload)),
   });
 
   let out: InvokeCommandOutput;
@@ -140,17 +165,19 @@ export async function invokeRendererLambda(html: string): Promise<Buffer> {
     );
   }
 
-  if (!parsed?.pdfBase64) {
+  const b64 = parsed?.[resultKey];
+  if (!b64) {
     throw new Error(
-      `Lambda ${VOUCHER_PDF_LAMBDA_NAME} returned no pdfBase64 (keys: ${Object.keys(parsed || {}).join(",") || "none"})`,
+      `Lambda ${VOUCHER_PDF_LAMBDA_NAME} returned no ${resultKey} (keys: ${Object.keys(parsed || {}).join(",") || "none"})`,
     );
   }
 
-  const pdf = Buffer.from(parsed.pdfBase64, "base64");
-  logger.info("[voucher-lambda] Rendered PDF via Lambda", {
+  const buffer = Buffer.from(b64, "base64");
+  logger.info("[voucher-lambda] Rendered via Lambda", {
     function: VOUCHER_PDF_LAMBDA_NAME,
-    bytes: pdf.length,
+    format,
+    bytes: buffer.length,
     ms: Date.now() - startedAt,
   });
-  return pdf;
+  return buffer;
 }
