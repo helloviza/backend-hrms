@@ -91,6 +91,72 @@ function invoicePendingDays(b: any): number {
   );
 }
 
+/* ── Required-field validation ───────────────────────────────────────
+ * Mirrors the ManualBookingForm front-end rules so bookings created
+ * outside the form (API, imports) can't bypass them. Booking-type matrix:
+ *   - supplierName : required for every type
+ *   - givenBy      : required for every type (form + create/update API only)
+ *   - City         : required for HOTEL/DUMMY_HOTEL (sector OR itinerary.destination)
+ *   - returnDate   : required for HOTEL/DUMMY_HOTEL (check-out)
+ * Import paths (Excel /import, SBT import) carry no givenBy and SBT flights
+ * carry no return date, so imports enforce the reduced set (supplier + city).
+ */
+const HOTEL_TYPES = ["HOTEL", "DUMMY_HOTEL"];
+
+function hotelCityPresent(b: any): boolean {
+  return Boolean(
+    String(b?.sector ?? "").trim() ||
+    String(b?.itinerary?.destination ?? "").trim(),
+  );
+}
+
+// Full rule set — used by the form-driven create/update API.
+function validateBookingRequired(b: any): string[] {
+  const errors: string[] = [];
+  const type = String(b?.type ?? "").toUpperCase();
+  if (!String(b?.supplierName ?? "").trim()) errors.push("Supplier Name is required");
+  if (!String(b?.givenBy ?? "").trim()) errors.push("Given By is required");
+  if (HOTEL_TYPES.includes(type)) {
+    if (!hotelCityPresent(b)) errors.push("City is required for hotel bookings");
+    if (!b?.returnDate) errors.push("Check-out (return) date is required for hotel bookings");
+  }
+  return errors;
+}
+
+// Reduced rule set for import paths — supplier + hotel-city only.
+function validateImportRequired(b: any): string[] {
+  const errors: string[] = [];
+  const type = String(b?.type ?? "").toUpperCase();
+  if (!String(b?.supplierName ?? "").trim()) errors.push("supplierName is required");
+  if (HOTEL_TYPES.includes(type) && !hotelCityPresent(b)) errors.push("city is required for hotel bookings");
+  return errors;
+}
+
+// Update rule set (Option B) — enforce a required field ONLY if it was already
+// present in the pre-update document. This means an edit may not blank out a
+// previously-filled required field, but a legacy/incomplete booking that never
+// had the field stays editable (no forced backfill). `merged` is the document
+// after req.body is applied; `before` is a snapshot taken beforehand.
+function validateBookingRequiredForUpdate(merged: any, before: any): string[] {
+  const errors: string[] = [];
+  const type = String(merged?.type ?? "").toUpperCase();
+
+  if (String(before?.supplierName ?? "").trim() && !String(merged?.supplierName ?? "").trim())
+    errors.push("Supplier Name is required");
+
+  if (String(before?.givenBy ?? "").trim() && !String(merged?.givenBy ?? "").trim())
+    errors.push("Given By is required");
+
+  if (HOTEL_TYPES.includes(type)) {
+    if (hotelCityPresent(before) && !hotelCityPresent(merged))
+      errors.push("City is required for hotel bookings");
+    if (before?.returnDate && !merged?.returnDate)
+      errors.push("Check-out (return) date is required for hotel bookings");
+  }
+
+  return errors;
+}
+
 function fmtDateDMY(d: Date | string | null | undefined): string {
   if (!d) return "";
   const dt = new Date(d as string);
@@ -208,6 +274,11 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
 // POST /api/admin/manual-bookings
 router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, res: any) => {
   try {
+    const vErrors = validateBookingRequired(req.body);
+    if (vErrors.length) {
+      return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
+    }
+
     const booking = await ManualBooking.create({
       ...req.body,
       bookedBy: req.user._id,
@@ -913,6 +984,11 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
 
       const gstPercent = parseFloat(cell(r, "gstpercent") || "18");
 
+      // Required-field mirror (imports enforce supplier + hotel-city only).
+      if (!trimStr(cell(r, "suppliername"))) errs.push({ field: "supplierName", error: "required" });
+      if (HOTEL_TYPES.includes(type) && !cell(r, "destination").trim())
+        errs.push({ field: "destination", error: "city/destination is required for HOTEL bookings" });
+
       const clientName  = cell(r, "clientname");
       const clientGstin = cell(r, "clientgstin").toUpperCase();
       const resolvedWs  =
@@ -1100,7 +1176,17 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
       return res.status(400).json({ message: "Cannot edit an invoiced booking" });
     }
 
+    // Snapshot the pre-update document so we can tell which required fields
+    // were already present (Option B: enforce only those — don't force legacy
+    // bookings to backfill fields they never had).
+    const before = booking.toObject();
     Object.assign(booking, req.body);
+
+    const vErrors = validateBookingRequiredForUpdate(booking, before);
+    if (vErrors.length) {
+      return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
+    }
+
     await booking.save();
     res.json({ ok: true, booking });
   } catch (err: any) {
@@ -1362,6 +1448,13 @@ router.post("/import-from-sbt", requirePermission("manualBookings", "FULL"), asy
             bookedBy: req.user._id,
             notes: `Imported from SBT Hotels on ${new Date().toLocaleDateString()}`,
           };
+        }
+
+        const importErrors = validateImportRequired(data);
+        if (importErrors.length) {
+          failed++;
+          details.push({ bookingId, status: "failed", error: importErrors.join("; ") });
+          continue;
         }
 
         const doc = new ManualBooking(data);
