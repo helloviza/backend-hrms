@@ -1,4 +1,11 @@
 /**
+ * @deprecated ABANDONED — see infra/audit/eod-render-lambda-plan-2026-05-27.md.
+ * The Fargate Scheduled Task path was designed but never wired to EventBridge
+ * (no schedule/rule was ever created). The LIVE EOD path is the in-process
+ * node-cron in jobs/eodCron.ts, and EOD images now render via the voucher
+ * render Lambda (PNG mode) — not Chromium in this process. This file is retained
+ * for reference only; do not wire it without revisiting that plan.
+ *
  * Standalone EOD report execution for ECS Fargate Scheduled Task.
  *
  * Triggered by EventBridge daily at the configured time.

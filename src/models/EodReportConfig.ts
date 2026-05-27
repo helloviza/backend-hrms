@@ -41,6 +41,9 @@ export interface IEodReportConfig extends Document {
   lastSentAt: Date | null;
   lastSentStatus: string;
   lastSentError: string;
+  /** Render mode of the last send. "image" = PNG via render Lambda, "text" =
+   *  text fallback, "unknown" = legacy rows written before this field existed. */
+  lastSentMode: "image" | "text" | "unknown";
 }
 
 const RecipientSchema = new Schema<IEodRecipient>(
@@ -95,6 +98,11 @@ const EodReportConfigSchema = new Schema<IEodReportConfig>(
     lastSentAt: { type: Date, default: null },
     lastSentStatus: { type: String, default: "" },
     lastSentError: { type: String, default: "" },
+    lastSentMode: {
+      type: String,
+      enum: ["image", "text", "unknown"],
+      default: "unknown",
+    },
   },
   { timestamps: true, minimize: false },
 );

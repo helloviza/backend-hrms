@@ -1,3 +1,12 @@
+# @deprecated SUPERSEDED — see infra/audit/eod-render-lambda-plan-2026-05-27.md.
+# This was the alternative "App Runner on a custom container image" approach:
+# a Debian-slim image with libnss3 + GTK/fontconfig so in-process
+# @sparticuz/chromium could run for EOD images and voucher PDFs. It was NEVER
+# adopted — the LIVE App Runner service runs the MANAGED nodejs20 runtime
+# (infra/apprunner.yaml), and all Chromium rendering is offloaded to the
+# render Lambda (vouchers: PDF; EOD: PNG). Retained for reference only; do not
+# switch App Runner to this image without revisiting that plan.
+#
 # Backend container image for AWS App Runner.
 #
 # Build context: the apps/backend subtree (this is what App Runner sees from

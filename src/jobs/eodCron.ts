@@ -7,6 +7,12 @@ import logger from "../utils/logger.js";
 let currentCronJob: ReturnType<typeof cron.schedule> | null = null;
 
 export async function startEodCron(): Promise<void> {
+  // @deprecated ABANDONED Fargate branch — see
+  // infra/audit/eod-render-lambda-plan-2026-05-27.md. This was meant to hand
+  // scheduling to EventBridge + runEodOnce.ts when running as a Fargate task,
+  // but that task was never wired. EOD_CRON_DISABLED is NOT set in production,
+  // so this in-process node-cron is the LIVE scheduler. Retained for reference.
+  //
   // If running under Fargate Scheduled Task mode, EventBridge handles scheduling
   // and the standalone runEodOnce.js script handles execution. Skip cron registration here.
   if (process.env.EOD_CRON_DISABLED === "true") {
