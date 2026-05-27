@@ -22,37 +22,30 @@ export async function startEodCron(): Promise<void> {
 
   const [hour, minute] = (config.sendTime || "19:00").split(":").map(Number);
 
-  // Convert IST (UTC+5:30) → UTC
-  // IST HH:MM → UTC: subtract 5h30m, wrap around midnight
-  let utcHour: number;
-  let utcMinute: number;
-
-  if (minute >= 30) {
-    utcMinute = minute - 30;
-    utcHour = (hour - 5 + 24) % 24;
-  } else {
-    utcMinute = minute + 30;
-    utcHour = (hour - 6 + 24) % 24;
-  }
-
-  const cronExpr = `${utcMinute} ${utcHour} * * *`;
+  // node-cron interprets the expression in the timezone passed below
+  // (Asia/Kolkata), so the IST HH:MM is used directly — no UTC conversion.
+  const cronExpr = `${minute} ${hour} * * *`;
 
   if (currentCronJob) {
     currentCronJob.stop();
     currentCronJob = null;
   }
 
-  currentCronJob = cron.schedule(cronExpr, async () => {
-    logger.info("[EOD] Cron triggered — sending report");
-    try {
-      await sendEodReport();
-    } catch (err) {
-      logger.error("[EOD] Cron send failed", { err });
-    }
-  });
+  currentCronJob = cron.schedule(
+    cronExpr,
+    async () => {
+      logger.info("[EOD] Cron triggered — sending report");
+      try {
+        await sendEodReport();
+      } catch (err) {
+        logger.error("[EOD] Cron send failed", { err });
+      }
+    },
+    { timezone: "Asia/Kolkata" },
+  );
 
   logger.info(
-    `[EOD] Cron scheduled at ${config.sendTime} IST (UTC: ${utcHour}:${String(utcMinute).padStart(2, "0")}) — expr: "${cronExpr}"`,
+    `[EOD] Cron scheduled at ${config.sendTime} IST — expr: "${cronExpr}" (timezone: Asia/Kolkata)`,
   );
 }
 
