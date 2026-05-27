@@ -1,7 +1,8 @@
 import logger from "./logger.js";
 
 const TYPE_COST_LABELS: Record<string, string> = {
-  FLIGHT:       "Flight Cost",
+  FLIGHT:            "Flight Cost",
+  FLIGHT_RESCHEDULE: "Flight Rescheduling",
   DUMMY_FLIGHT: "Flight Cost",
   HOTEL:        "Hotel Cost",
   DUMMY_HOTEL:  "Hotel Cost",
@@ -14,6 +15,9 @@ const TYPE_COST_LABELS: Record<string, string> = {
   HOLIDAYS:     "Holiday Cost",
   EVENTS:       "Event Cost",
   OTHER:        "Service Cost",
+  TROPHY:       "Service Cost",
+  GIFT:         "Service Cost",
+  STATIONERY:   "Service Cost",
   SERVICE:      "Service Cost",
 };
 
@@ -85,7 +89,7 @@ function computeQty(booking: any): number {
     return qty;
   }
 
-  if (t === "OTHER") return 1;
+  if (t === "OTHER" || t === "TROPHY" || t === "GIFT" || t === "STATIONERY") return 1;
 
   if (t === "FOREX" || t === "ESIM") return 1;
 
@@ -110,7 +114,7 @@ function buildUnitCountPrefix(booking: any): string {
     const roomLabel = rooms === 1 ? "Room" : "Rooms";
     return `${nights} ${nightLabel} x ${rooms} ${roomLabel}`;
   }
-  if (t === "FLIGHT" || t === "DUMMY_FLIGHT" || t === "TRAIN") {
+  if (t === "FLIGHT" || t === "FLIGHT_RESCHEDULE" || t === "DUMMY_FLIGHT" || t === "TRAIN") {
     return `${paxCount} ${paxCount === 1 ? "Passenger" : "Passengers"}`;
   }
   if (t === "VISA") {
@@ -137,7 +141,7 @@ function buildSubDescription(booking: any, paxStr: string): string {
 
   let parts: (string | undefined)[];
 
-  if (t === "FLIGHT" || t === "DUMMY_FLIGHT") {
+  if (t === "FLIGHT" || t === "FLIGHT_RESCHEDULE" || t === "DUMMY_FLIGHT") {
     const origin      = booking.itinerary?.origin || "";
     const destination = booking.itinerary?.destination || "";
     const route       = origin && destination ? `${origin}-${destination}` : origin || destination || "—";

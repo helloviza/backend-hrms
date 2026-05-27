@@ -788,7 +788,7 @@ router.get("/import-template", requirePermission("manualBookings", "READ"), asyn
     const instr = wb.addWorksheet("Instructions");
     instr.addRow(["Field", "Required", "Notes"]);
     ([
-      ["type", "YES", "FLIGHT, HOTEL, VISA, TRANSFER, OTHER, CAB, FOREX, ESIM, HOLIDAYS, EVENTS, DUMMY_FLIGHT, DUMMY_HOTEL"],
+      ["type", "YES", "FLIGHT, HOTEL, VISA, TRANSFER, OTHER, CAB, FOREX, ESIM, HOLIDAYS, EVENTS, DUMMY_FLIGHT, DUMMY_HOTEL, TRAIN, FLIGHT_RESCHEDULE, TROPHY, GIFT, STATIONERY"],
       ["clientName", "YES (or clientGSTIN)", "Must match an existing client's company or legal name"],
       ["clientGSTIN", "YES (or clientName)", "Alternative client lookup by GST number"],
       ["source", "NO", "MANUAL (default), SBT, ADMIN_QUEUE"],
@@ -836,6 +836,7 @@ router.get("/import-template", requirePermission("manualBookings", "READ"), asyn
 const IMPORT_VALID_TYPES = [
   "FLIGHT", "HOTEL", "VISA", "TRANSFER", "OTHER",
   "CAB", "FOREX", "ESIM", "HOLIDAYS", "EVENTS", "DUMMY_FLIGHT", "DUMMY_HOTEL", "TRAIN",
+  "FLIGHT_RESCHEDULE", "TROPHY", "GIFT", "STATIONERY",
 ];
 const IMPORT_VALID_SOURCES = ["MANUAL", "SBT", "ADMIN_QUEUE", "SBT_AUTO"];
 const IMPORT_VALID_PAX   = ["ADULT", "CHILD", "INFANT"];
