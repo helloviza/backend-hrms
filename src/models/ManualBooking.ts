@@ -40,7 +40,8 @@ export interface IManualBooking extends Document {
   type:
     | "FLIGHT" | "HOTEL" | "VISA" | "TRANSFER" | "OTHER"
     | "CAB" | "FOREX" | "ESIM" | "HOLIDAYS" | "EVENTS"
-    | "DUMMY_FLIGHT" | "DUMMY_HOTEL" | "TRAIN";
+    | "DUMMY_FLIGHT" | "DUMMY_HOTEL" | "TRAIN"
+    | "FLIGHT_RESCHEDULE" | "TROPHY" | "GIFT" | "STATIONERY";
   status: "PENDING" | "WIP" | "CONFIRMED" | "INVOICED" | "CANCELLED";
   subStatus?: SubStatus;
   source: "MANUAL" | "SBT" | "ADMIN_QUEUE" | "SBT_AUTO";
@@ -125,6 +126,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
         "FLIGHT", "HOTEL", "VISA", "TRANSFER", "OTHER",
         "CAB", "FOREX", "ESIM", "HOLIDAYS", "EVENTS",
         "DUMMY_FLIGHT", "DUMMY_HOTEL", "TRAIN",
+        "FLIGHT_RESCHEDULE", "TROPHY", "GIFT", "STATIONERY",
       ],
       required: true,
     },
@@ -295,6 +297,7 @@ ManualBookingSchema.pre("save", async function (next) {
 function manualTypeToService(t: string): string {
   switch (t) {
     case "FLIGHT":
+    case "FLIGHT_RESCHEDULE":            // reschedule mirrors as a flight
     case "DUMMY_FLIGHT": return "FLIGHT";
     case "HOTEL":
     case "DUMMY_HOTEL":  return "HOTEL";
@@ -306,7 +309,10 @@ function manualTypeToService(t: string): string {
     case "HOLIDAYS":     return "HOLIDAY";
     case "EVENTS":       return "MICE";
     case "TRAIN":        return "TRAIN";
-    case "OTHER":        return "OTHER";
+    case "OTHER":
+    case "TROPHY":                       // gift/trophy/stationery mirror as OTHER
+    case "GIFT":
+    case "STATIONERY":   return "OTHER";
     default:             return "OTHER";
   }
 }
