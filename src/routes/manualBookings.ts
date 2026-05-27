@@ -341,20 +341,30 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
         .populate("invoiceId", "invoiceNo status")
         .lean(),
       ManualBooking.countDocuments(filter),
-      // Bug 4 fix: aggregate over the full filtered set, not just the current page
+      // Bug 4 fix: aggregate over the full filtered set, not just the current page.
+      // Six-metric financial summary — identical formulas to /admin/reports so both
+      // pages show the same numbers for the same dataset. grandTotal is always the
+      // full GST-inclusive client payment (see ManualBooking pre-save hook), so
+      // netSales = grandTotal − gstAmount = sell-ex-GST in both GST modes.
       ManualBooking.aggregate([
         { $match: filter },
         { $group: {
           _id: null,
-          grossValue:      { $sum: { $ifNull: [ "$pricing.grandTotal",
+          grossSales:      { $sum: { $ifNull: [ "$pricing.grandTotal",
                              { $ifNull: [ "$pricing.totalWithGST", "$pricing.quotedPrice" ] } ] } },
-          totalProfit:     { $sum: "$pricing.basePrice" },
+          gstPayable:      { $sum: "$pricing.gstAmount" },
+          netProfit:       { $sum: "$pricing.basePrice" },
           pendingInvoices: { $sum: { $cond: [{ $ne: ["$status", "INVOICED"] }, 1, 0] } },
         }},
       ]),
     ]);
 
-    const aggStats = statsAgg[0] ?? { grossValue: 0, totalProfit: 0, pendingInvoices: 0 };
+    const aggStats = statsAgg[0] ?? { grossSales: 0, gstPayable: 0, netProfit: 0, pendingInvoices: 0 };
+    const grossSales = aggStats.grossSales ?? 0;
+    const gstPayable = aggStats.gstPayable ?? 0;
+    const netProfit  = aggStats.netProfit  ?? 0;
+    const netSales   = grossSales - gstPayable;
+    const avgMargin  = netSales > 0 ? parseFloat(((netProfit / netSales) * 100).toFixed(2)) : 0;
 
     // Resolve client names from Customer collection
     // (ManualBooking.workspaceId stores Customer._id, not CustomerWorkspace._id)
@@ -385,9 +395,12 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
       page,
       pages: Math.ceil(total / limit),
       stats: {
-        totalBookings: total,
-        grossValue:      aggStats.grossValue,
-        totalProfit:     aggStats.totalProfit,
+        grossSales,
+        netSales,
+        gstPayable,
+        netProfit,
+        bookingCount:    total,
+        avgMargin,
         pendingInvoices: aggStats.pendingInvoices,
       },
     });

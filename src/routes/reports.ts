@@ -24,6 +24,14 @@ router.use(blockTravelForSaas);
 /* ── Types ─────────────────────────────────────────────────────── */
 
 export interface ReportOverview {
+  // Canonical six metrics (aligned with /admin/manual-bookings)
+  grossSales: number;
+  netSales: number;
+  gstPayable: number;
+  netProfit: number;
+  bookingCount: number;
+  avgMargin: number;
+  // Existing fields retained for detail tables / status breakdown
   totalBookings: number;
   totalQuoted: number;
   totalActual: number;
@@ -251,6 +259,10 @@ export async function getReportData(filters: {
           _id: null,
           totalBookings: { $sum: 1 },
           totalQuoted: { $sum: "$pricing.quotedPrice" },
+          // Gross Sales (GMV) — full GST-inclusive client payment. Identical
+          // expression to the /admin/manual-bookings summary so both pages agree.
+          totalGrandTotal: { $sum: { $ifNull: [ "$pricing.grandTotal",
+                             { $ifNull: [ "$pricing.totalWithGST", "$pricing.quotedPrice" ] } ] } },
           totalActual: { $sum: "$pricing.actualPrice" },
           totalDiff: { $sum: "$pricing.diff" },
           totalGST: { $sum: "$pricing.gstAmount" },
@@ -653,16 +665,34 @@ export async function getReportData(filters: {
 
   const ov = overviewResult[0] || {};
 
-  // Margin on Net Sales (investor-grade): (gross profit / (revenue - GST)) × 100.
-  // Computed as a weighted ratio across all bookings, not a mean of per-booking percents.
-  const ovNetSales = (ov.totalQuoted ?? 0) - (ov.totalGST ?? 0);
+  // Six-metric financial summary — identical formulas to the /admin/manual-bookings
+  // summary so both pages show the same numbers for the same dataset.
+  //   Gross Sales = Σ grandTotal (full GST-inclusive client payment)
+  //   Net Sales   = Gross Sales − GST  (= sell-ex-GST in both GST modes)
+  //   GST Payable = Σ gstAmount
+  //   Net Profit  = Σ basePrice (markup)
+  //   Avg Margin  = Net Profit / Net Sales × 100
+  // Margin on Net Sales (investor-grade), computed as a weighted ratio across all
+  // bookings, not a mean of per-booking percents.
+  const ovGrossSales = ov.totalGrandTotal ?? 0;
+  const ovGstPayable = ov.totalGST ?? 0;
+  const ovNetProfit  = ov.totalBaseProfit ?? 0;
+  const ovNetSales   = ovGrossSales - ovGstPayable;
   const avgMarginPercent =
     ovNetSales > 0
-      ? parseFloat((((ov.totalBaseProfit ?? 0) / ovNetSales) * 100).toFixed(2))
+      ? parseFloat(((ovNetProfit / ovNetSales) * 100).toFixed(2))
       : 0;
 
   return {
     overview: {
+      // Canonical six metrics (aligned with /admin/manual-bookings)
+      grossSales: ovGrossSales,
+      netSales: ovNetSales,
+      gstPayable: ovGstPayable,
+      netProfit: ovNetProfit,
+      bookingCount: ov.totalBookings ?? 0,
+      avgMargin: avgMarginPercent,
+      // Existing fields retained for the detail tables / status breakdown below
       totalBookings: ov.totalBookings ?? 0,
       totalQuoted: ov.totalQuoted ?? 0,
       totalActual: ov.totalActual ?? 0,
