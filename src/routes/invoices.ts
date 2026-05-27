@@ -1287,21 +1287,78 @@ router.post("/:id/cancel", requirePermission("invoices", "FULL"), async (req: an
 
 /* ── Edit Draft Invoice ───────────────────────────────────────────── */
 
-// PATCH /api/admin/invoices/:id
-router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+// Typed error so we can throw inside the transaction and map to a status code.
+class HttpError extends Error {
+  constructor(public httpStatus: number, message: string) {
+    super(message);
+  }
+}
+
+// Coerce a (possibly client-sent) line item to the stored shape. `amount` is a
+// legitimate line field (scope allows editing rate/amount) but is sanitised to
+// a number; the invoice TOTALS are always re-derived server-side from the lines
+// — client-sent subtotal/totalGST/grandTotal are never read.
+function sanitizeLineItem(li: any): any {
+  const qtyN = Number(li?.qty);
+  const rateN = Number(li?.rate);
+  const igstN = Number(li?.igst);
+  const qty = Number.isFinite(qtyN) ? qtyN : 1;
+  const rate = Number.isFinite(rateN) ? rateN : 0;
+  const igst = Number.isFinite(igstN) ? igstN : 0;
+  let amount = Number(li?.amount);
+  if (!Number.isFinite(amount)) amount = rate * qty + igst;
+  return {
+    bookingRef: String(li?.bookingRef ?? ""),
+    rowType: li?.rowType === "SERVICE_FEE" ? "SERVICE_FEE" : "COST",
+    description: String(li?.description ?? "").slice(0, 300),
+    subDescription: String(li?.subDescription ?? "").slice(0, 500),
+    qty: parseFloat(qty.toFixed(2)),
+    rate: parseFloat(rate.toFixed(2)),
+    igst: parseFloat(igst.toFixed(2)),
+    amount: parseFloat(amount.toFixed(2)),
+    passengerNames: Array.isArray(li?.passengerNames) ? li.passengerNames.map((s: any) => String(s)) : [],
+    travelDate: li?.travelDate ? new Date(li.travelDate) : undefined,
+    type: String(li?.type ?? ""),
+  };
+}
+
+// Compact line shape for the audit trail (avoids bloating editHistory).
+function compactLine(li: any) {
+  return { bookingRef: li.bookingRef, description: li.description, qty: li.qty, rate: li.rate, igst: li.igst, amount: li.amount };
+}
+
+// The set of Customer._id values that count as "the same client" as this
+// invoice. Invoice.workspaceId is normally a CustomerWorkspace._id (resolved at
+// generation), but falls back to the Customer._id when no workspace exists, so
+// we accept both. ManualBooking.workspaceId always stores the Customer._id.
+async function invoiceCustomerIds(invoice: any, session: any): Promise<Set<string>> {
+  const ids = new Set<string>([String(invoice.workspaceId)]);
   try {
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    const ws: any = await CustomerWorkspace.findById(invoice.workspaceId).session(session).lean();
+    if (ws?.customerId) ids.add(String(ws.customerId));
+  } catch {
+    /* invoice.workspaceId may itself be a Customer._id (fallback) — already added */
+  }
+  return ids;
+}
 
-    if (invoice.status !== "DRAFT") {
-      return res.status(400).json({ error: "Cannot edit non-draft invoice. Use cancel + reissue." });
-    }
-
-    const { dueDate, notes, supplyType, gstOverrideReason } = req.body as {
+// PATCH /api/admin/invoices/:id  — DRAFT-only edit of fields, line items, and
+// add/remove bookings. Booking state re-sync + invoice mutation run in ONE
+// transaction (no half-applied state). Totals are re-derived from the lines.
+router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  const session = await mongoose.startSession();
+  try {
+    const {
+      dueDate, notes, supplyType, gstOverrideReason,
+      lineItems, bookingsToAdd, bookingsToRemove,
+    } = req.body as {
       dueDate?: string;
       notes?: string;
       supplyType?: GSTType;
       gstOverrideReason?: string;
+      lineItems?: any[];
+      bookingsToAdd?: string[];
+      bookingsToRemove?: string[];
     };
 
     const allowedSupplyTypes: GSTType[] = ["CGST_SGST", "CGST_UTGST", "IGST", "EXPORT", "NONE"];
@@ -1309,76 +1366,276 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
       return res.status(400).json({ error: "Invalid supplyType" });
     }
 
-    const oldValues: Record<string, unknown> = {};
-    const newValues: Record<string, unknown> = {};
-    const fieldsChanged: string[] = [];
+    const addIds = Array.isArray(bookingsToAdd) ? [...new Set(bookingsToAdd.map(String).filter(Boolean))] : [];
+    const removeIds = Array.isArray(bookingsToRemove) ? [...new Set(bookingsToRemove.map(String).filter(Boolean))] : [];
+    const hasLineEdit = Array.isArray(lineItems);
+    const hasStructuralEdit = hasLineEdit || addIds.length > 0 || removeIds.length > 0;
 
-    if (dueDate !== undefined) {
-      const newDate = dueDate ? new Date(dueDate) : undefined;
-      const oldStr = invoice.dueDate ? new Date(invoice.dueDate).toISOString().slice(0, 10) : "";
-      const newStr = newDate ? newDate.toISOString().slice(0, 10) : "";
-      if (oldStr !== newStr) {
-        oldValues.dueDate = invoice.dueDate ?? null;
-        newValues.dueDate = newDate ?? null;
-        fieldsChanged.push("dueDate");
-        invoice.dueDate = newDate;
-      }
-    }
+    let responseInvoice: any = null;
 
-    if (notes !== undefined) {
-      const trimmed = notes.slice(0, 1000);
-      if (trimmed !== (invoice.notes ?? "")) {
-        oldValues.notes = invoice.notes ?? "";
-        newValues.notes = trimmed;
-        fieldsChanged.push("notes");
-        invoice.notes = trimmed;
-      }
-    }
-
-    if (supplyType && supplyType !== invoice.supplyType) {
-      const isAutoDetected = supplyType === (invoice.gstTypeAutoDetected as GSTType | undefined);
-      if (!isAutoDetected && !gstOverrideReason?.trim()) {
-        return res.status(400).json({ error: "gstOverrideReason is required when changing GST type" });
+    await session.withTransaction(async () => {
+      const invoice = await Invoice.findById(req.params.id).session(session);
+      if (!invoice) throw new HttpError(404, "Invoice not found");
+      if (invoice.status !== "DRAFT") {
+        throw new HttpError(400, "Cannot edit non-draft invoice. Use cancel + reissue.");
       }
 
-      const gstAmounts = calculateGSTAmounts(invoice.totalGST, supplyType);
-      oldValues.supplyType = invoice.supplyType;
-      newValues.supplyType = supplyType;
-      if (!isAutoDetected && gstOverrideReason?.trim()) newValues.gstOverrideReason = gstOverrideReason.trim();
-      fieldsChanged.push("supplyType");
+      const oldValues: Record<string, unknown> = {};
+      const newValues: Record<string, unknown> = {};
+      const fieldsChanged: string[] = [];
 
-      invoice.supplyType = supplyType;
-      invoice.cgstAmount = gstAmounts.cgst;
-      invoice.sgstAmount = gstAmounts.sgst;
-      invoice.utgstAmount = gstAmounts.utgst;
-      invoice.igstAmount = gstAmounts.igst;
-
-      if (isAutoDetected) {
-        invoice.gstTypeOverridden = false;
-        invoice.gstOverrideReason = undefined;
-        (invoice as any).gstOverrideBy = undefined;
-      } else {
-        invoice.gstTypeOverridden = true;
-        invoice.gstOverrideReason = gstOverrideReason!.trim();
-        invoice.gstOverrideBy = req.user._id;
+      // ── Simple fields ───────────────────────────────────────────────
+      if (dueDate !== undefined) {
+        const newDate = dueDate ? new Date(dueDate) : undefined;
+        const oldStr = invoice.dueDate ? new Date(invoice.dueDate).toISOString().slice(0, 10) : "";
+        const newStr = newDate ? newDate.toISOString().slice(0, 10) : "";
+        if (oldStr !== newStr) {
+          oldValues.dueDate = invoice.dueDate ?? null;
+          newValues.dueDate = newDate ?? null;
+          fieldsChanged.push("dueDate");
+          invoice.dueDate = newDate;
+        }
       }
-    }
 
-    if (!fieldsChanged.length) {
-      return res.json({ ok: true, invoice });
-    }
+      if (notes !== undefined) {
+        const trimmed = notes.slice(0, 1000);
+        if (trimmed !== (invoice.notes ?? "")) {
+          oldValues.notes = invoice.notes ?? "";
+          newValues.notes = trimmed;
+          fieldsChanged.push("notes");
+          invoice.notes = trimmed;
+        }
+      }
 
-    const now = new Date();
-    const iv = invoice as any;
-    iv.editedAt = now;
-    iv.editedBy = req.user._id;
-    if (!iv.editHistory) iv.editHistory = [];
-    iv.editHistory.push({ editedAt: now, editedBy: req.user._id, fieldsChanged, oldValues, newValues });
+      // ── Structural: remove/add bookings + edited line items ─────────
+      if (hasStructuralEdit) {
+        const beforeTotals = { subtotal: invoice.subtotal, totalGST: invoice.totalGST, grandTotal: invoice.grandTotal };
+        const beforeLines = (invoice.lineItems ?? []).map(compactLine);
 
-    await invoice.save();
-    res.json({ ok: true, invoice });
+        // Working line set: the client's full desired array for CURRENT bookings
+        // (edits + manual add/remove of lines), or the stored lines if none sent.
+        // Added-booking lines are NOT expected here — they're built server-side.
+        let workingLines: any[] = hasLineEdit
+          ? (lineItems as any[]).map(sanitizeLineItem)
+          : (invoice.lineItems ?? []).map((li: any) => sanitizeLineItem(li));
+
+        let bookingIds = (invoice.bookingIds ?? []).map((x: any) => String(x));
+
+        // REMOVE bookings → strip their lines, pull from bookingIds, un-invoice
+        if (removeIds.length) {
+          const onInvoice = new Set(bookingIds);
+          const notOn = removeIds.filter((id) => !onInvoice.has(id));
+          if (notOn.length) throw new HttpError(400, `Booking(s) not on this invoice: ${notOn.join(", ")}`);
+
+          const toRemove = await ManualBooking.find({
+            _id: { $in: removeIds.map((id) => new mongoose.Types.ObjectId(id)) },
+          }).session(session);
+
+          const removedRefs = (toRemove as any[]).map((b) => b.bookingRef);
+
+          // Integrity guard: a booking sharing a COMBINED (multi-ref) line can't be
+          // cleanly subtracted — un-invoicing it while its cost stays in the merged
+          // line would double-bill. Block it; the user edits that line first.
+          const mergedConflict = workingLines.find(
+            (li) =>
+              typeof li.bookingRef === "string" &&
+              li.bookingRef.includes(",") &&
+              li.bookingRef.split(",").map((r: string) => r.trim()).some((r: string) => removedRefs.includes(r)),
+          );
+          if (mergedConflict) {
+            throw new HttpError(
+              400,
+              `Cannot remove a booking that is part of a combined line item ("${mergedConflict.description}"). Edit or remove that line manually first.`,
+            );
+          }
+
+          // Safety net: strip any line whose ref exactly matches a removed booking
+          // (the client usually already removed them).
+          workingLines = workingLines.filter((li) => !removedRefs.includes(li.bookingRef));
+          bookingIds = bookingIds.filter((id) => !removeIds.includes(id));
+
+          // Revert to CONFIRMED (the canonical pre-invoice state, same as the
+          // cancel-invoice flow) so the booking is available to invoice again.
+          await ManualBooking.updateMany(
+            { _id: { $in: (toRemove as any[]).map((b) => b._id) } },
+            { $set: { status: "CONFIRMED", invoiceId: null, invoiceRaisedDate: null } },
+            { session },
+          );
+
+          fieldsChanged.push("bookingsRemoved");
+          newValues.bookingsRemoved = removedRefs;
+        }
+
+        // ADD bookings → validate eligibility, build lines, mark INVOICED
+        if (addIds.length) {
+          const toAdd = await ManualBooking.find({
+            _id: { $in: addIds.map((id) => new mongoose.Types.ObjectId(id)) },
+          }).session(session);
+
+          if (toAdd.length !== addIds.length) throw new HttpError(400, "One or more booking IDs not found");
+
+          const customerIds = await invoiceCustomerIds(invoice, session);
+          const badWs = (toAdd as any[]).filter((b) => !customerIds.has(String(b.workspaceId)));
+          if (badWs.length) {
+            throw new HttpError(400, `Booking(s) belong to a different client: ${badWs.map((b: any) => b.bookingRef).join(", ")}`);
+          }
+
+          const onInvoice = new Set(bookingIds);
+          const already = (toAdd as any[]).filter((b) => onInvoice.has(String(b._id)));
+          if (already.length) {
+            throw new HttpError(400, `Booking(s) already on this invoice: ${already.map((b: any) => b.bookingRef).join(", ")}`);
+          }
+
+          // A booking can't be on two invoices: reject INVOICED / cancelled /
+          // already-linked-elsewhere.
+          const ineligible = (toAdd as any[]).filter(
+            (b) =>
+              b.status === "INVOICED" ||
+              b.status === "CANCELLED" ||
+              b.isActive === false ||
+              (b.invoiceId && String(b.invoiceId) !== String(invoice._id)),
+          );
+          if (ineligible.length) {
+            throw new HttpError(400, `Booking(s) not eligible (already invoiced or cancelled): ${ineligible.map((b: any) => b.bookingRef).join(", ")}`);
+          }
+
+          for (const b of toAdd as any[]) {
+            workingLines.push(...buildLineItemsForBooking(b).map(sanitizeLineItem));
+          }
+          bookingIds = [...bookingIds, ...(toAdd as any[]).map((b) => String(b._id))];
+
+          await ManualBooking.updateMany(
+            { _id: { $in: (toAdd as any[]).map((b) => b._id) } },
+            { $set: { status: "INVOICED", invoiceId: invoice._id, invoiceRaisedDate: new Date() } },
+            { session },
+          );
+
+          fieldsChanged.push("bookingsAdded");
+          newValues.bookingsAdded = (toAdd as any[]).map((b) => b.bookingRef);
+        }
+
+        // Empty guard — block emptying the invoice (cancel it instead).
+        if (workingLines.length === 0 || bookingIds.length === 0) {
+          throw new HttpError(400, "An invoice must keep at least one booking and one line item. Cancel the invoice instead of emptying it.");
+        }
+
+        // Authoritative totals derived from the resulting lines.
+        const totalAmount = parseFloat(workingLines.reduce((s, li) => s + (li.amount ?? 0), 0).toFixed(2));
+        const totalGST = parseFloat(workingLines.reduce((s, li) => s + (li.igst ?? 0), 0).toFixed(2));
+        const subtotal = parseFloat((totalAmount - totalGST).toFixed(2));
+        const grandTotal = totalAmount;
+
+        invoice.lineItems = workingLines as any;
+        invoice.markModified("lineItems");
+        invoice.bookingIds = bookingIds.map((id) => new mongoose.Types.ObjectId(id)) as any;
+        invoice.subtotal = subtotal;
+        invoice.totalGST = totalGST;
+        invoice.grandTotal = grandTotal;
+
+        if (hasLineEdit) {
+          fieldsChanged.push("lineItems");
+          oldValues.lineItems = beforeLines;
+          newValues.lineItems = workingLines.map(compactLine);
+        }
+        fieldsChanged.push("totals");
+        oldValues.totals = beforeTotals;
+        newValues.totals = { subtotal, totalGST, grandTotal };
+      }
+
+      // ── supplyType change (audit + override flags) ──────────────────
+      let supplyTypeChanged = false;
+      if (supplyType && supplyType !== invoice.supplyType) {
+        const isAutoDetected = supplyType === (invoice.gstTypeAutoDetected as GSTType | undefined);
+        if (!isAutoDetected && !gstOverrideReason?.trim()) {
+          throw new HttpError(400, "gstOverrideReason is required when changing GST type");
+        }
+        oldValues.supplyType = invoice.supplyType;
+        newValues.supplyType = supplyType;
+        if (!isAutoDetected && gstOverrideReason?.trim()) newValues.gstOverrideReason = gstOverrideReason.trim();
+        fieldsChanged.push("supplyType");
+
+        invoice.supplyType = supplyType;
+        if (isAutoDetected) {
+          invoice.gstTypeOverridden = false;
+          invoice.gstOverrideReason = undefined;
+          (invoice as any).gstOverrideBy = undefined;
+        } else {
+          invoice.gstTypeOverridden = true;
+          invoice.gstOverrideReason = gstOverrideReason!.trim();
+          invoice.gstOverrideBy = req.user._id;
+        }
+        supplyTypeChanged = true;
+      }
+
+      // Recompute the GST split whenever totalGST OR supplyType changed.
+      if (hasStructuralEdit || supplyTypeChanged) {
+        const gstAmounts = calculateGSTAmounts(invoice.totalGST, invoice.supplyType as GSTType);
+        invoice.cgstAmount = gstAmounts.cgst;
+        invoice.sgstAmount = gstAmounts.sgst;
+        invoice.utgstAmount = gstAmounts.utgst;
+        invoice.igstAmount = gstAmounts.igst;
+      }
+
+      if (!fieldsChanged.length) {
+        responseInvoice = invoice.toObject();
+        return;
+      }
+
+      const now = new Date();
+      const iv = invoice as any;
+      iv.editedAt = now;
+      iv.editedBy = req.user._id;
+      if (!iv.editHistory) iv.editHistory = [];
+      iv.editHistory.push({ editedAt: now, editedBy: req.user._id, fieldsChanged, oldValues, newValues });
+
+      await invoice.save({ session });
+      responseInvoice = invoice.toObject();
+    });
+
+    res.json({ ok: true, invoice: responseInvoice });
   } catch (err: any) {
+    if (err instanceof HttpError) {
+      return res.status(err.httpStatus).json({ error: err.message });
+    }
     console.error("[Invoices PATCH]", err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+// GET /api/admin/invoices/:id/eligible-bookings
+// Bookings that can be added to / are currently on this DRAFT invoice. Resolves
+// the invoice's client (Customer) so the frontend doesn't need the
+// workspace↔customer mapping. `eligible` = CONFIRMED, active, not-yet-invoiced.
+router.get("/:id/eligible-bookings", requirePermission("invoices", "READ"), async (req: any, res: any) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id).lean();
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+
+    const customerIds = await invoiceCustomerIds(invoice, null);
+    const currentIds = ((invoice as any).bookingIds ?? []).map((x: any) => String(x));
+
+    const current = await ManualBooking.find({
+      _id: { $in: currentIds.map((id: string) => new mongoose.Types.ObjectId(id)) },
+    })
+      .sort({ travelDate: 1 })
+      .lean();
+
+    const eligible = await ManualBooking.find({
+      workspaceId: { $in: [...customerIds].map((id) => new mongoose.Types.ObjectId(id)) },
+      status: "CONFIRMED",
+      isActive: { $ne: false },
+      invoiceId: null, // matches both null and missing
+      _id: { $nin: currentIds.map((id: string) => new mongoose.Types.ObjectId(id)) },
+    })
+      .sort({ travelDate: 1 })
+      .limit(200)
+      .lean();
+
+    res.json({ ok: true, current, eligible });
+  } catch (err: any) {
+    console.error("[Invoices eligible-bookings]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
