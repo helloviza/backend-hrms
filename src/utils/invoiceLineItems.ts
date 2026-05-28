@@ -242,6 +242,39 @@ export function buildLineItemsForBooking(booking: any): any[] {
   const igst = parseFloat(((diff * gstPercent) / (100 + gstPercent)).toFixed(2));
 
   const qty      = computeQty(booking);
+
+  // Non-positive markup (actualPrice >= quotedPrice — a loss/surge booking):
+  // the markup-derived Transaction Fees line would carry a NEGATIVE amount and
+  // NEGATIVE embedded GST (igst = diff*g/(100+g) < 0), producing an invalid
+  // invoice line and dragging the footer GST negative. Suppress the fee line and
+  // bill a SINGLE cost line at quotedPrice (what the client actually owes), so the
+  // line sums to grandTotal. The loss stays internal in pricing.basePrice (already
+  // persisted on the booking) and never surfaces on the invoice. ON_FULL is
+  // unaffected — it returned above and never reaches this branch.
+  if (diff <= 0) {
+    const quotedPrice = booking.pricing?.quotedPrice ?? 0;
+    const lossRate   = parseFloat((quotedPrice / qty).toFixed(2));
+    const lossAmtRaw = parseFloat((lossRate * qty).toFixed(2));
+    const lossAmt = Math.abs(lossAmtRaw - quotedPrice) <= 1
+      ? parseFloat(quotedPrice.toFixed(2))
+      : lossAmtRaw;
+    return [
+      {
+        bookingRef:     booking.bookingRef,
+        rowType:        "COST",
+        description:    costLabel,
+        subDescription: subDesc,
+        qty,
+        rate:           lossRate,
+        igst:           0,
+        amount:         lossAmt,
+        passengerNames,
+        travelDate:     booking.travelDate,
+        type:           booking.type,
+      },
+    ];
+  }
+
   const costRate = parseFloat((supplierCost / qty).toFixed(2));
   const costAmtRaw = parseFloat((costRate * qty).toFixed(2));
 
