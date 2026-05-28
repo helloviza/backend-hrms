@@ -1,5 +1,6 @@
 import express from "express";
 import ExcelJS from "exceljs";
+import archiver from "archiver";
 import mongoose from "mongoose";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -105,7 +106,7 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
 import ManualBooking from "../models/ManualBooking.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
-import { generateInvoicePdf } from "../utils/invoicePdf.js";
+import { generateInvoicePdf, prefetchInvoiceAssets } from "../utils/invoicePdf.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { buildLineItemsForBooking, buildCombinedLineItems } from "../utils/invoiceLineItems.js";
 import { detectGSTType, calculateGSTAmounts, GST_STATE_CODES, type GSTType } from "../utils/gstDetection.js";
@@ -1007,6 +1008,91 @@ router.get("/export", requirePermission("invoices", "READ"), async (req: any, re
   } catch (err: any) {
     console.error("[Invoices EXPORT]", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Bulk PDF (zip) ───────────────────────────────────────────────── */
+
+// GET /api/admin/invoices/bulk-pdf
+// Streams a zip of FRESHLY re-rendered PDFs for every invoice matching the
+// current filter (same selection as the export handler above). Each PDF is
+// rendered in-process from current DB state — the stored pdfUrl/S3 object is
+// never read — so the zip can never ship a stale document. Hard-capped at 100
+// invoices to stay within the App Runner synchronous request window. Must be
+// registered before the GET "/:id" route so the literal path is matched.
+router.get("/bulk-pdf", requirePermission("invoices", "READ"), async (req: any, res: any) => {
+  try {
+    // Filter block — kept identical to the export handler (~956).
+    const filter: Record<string, any> = {};
+    if (req.query.workspaceId) {
+      const cws = await CustomerWorkspace
+        .findOne({ customerId: req.query.workspaceId })
+        .select("_id")
+        .lean();
+      filter.workspaceId = { $in: [req.query.workspaceId, ...(cws ? [cws._id] : [])] };
+    }
+    if (req.query.status) filter.status = req.query.status;
+    if (req.query.dateFrom || req.query.dateTo) {
+      filter.generatedAt = {};
+      if (req.query.dateFrom) filter.generatedAt.$gte = new Date(req.query.dateFrom);
+      if (req.query.dateTo) filter.generatedAt.$lte = new Date(req.query.dateTo);
+    }
+
+    const invoices = await Invoice.find(filter).sort({ generatedAt: -1 }).lean();
+
+    if (invoices.length === 0) {
+      return res.status(404).json({ error: "No invoices match the current filter" });
+    }
+    if (invoices.length > 100) {
+      return res.status(413).json({
+        error: `Too many invoices (${invoices.length}). Narrow the filter (client + date range) to 100 or fewer.`,
+      });
+    }
+
+    // Hoist the per-render network cost: company settings + logo fetched ONCE,
+    // then injected into every render so no invoice refetches them.
+    const prefetch = await prefetchInvoiceAssets();
+
+    // Filename: invoices-<clientNameOrAll>-<yyyymmdd>.zip
+    let clientLabel = "all";
+    if (req.query.workspaceId) {
+      clientLabel = "client";
+      const cust = await Customer
+        .findById(req.query.workspaceId)
+        .select("legalName companyName name")
+        .lean() as any;
+      const nm = cust?.legalName || cust?.companyName || cust?.name;
+      if (nm) {
+        const slug = String(nm).replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+        if (slug) clientLabel = slug;
+      }
+    }
+    const now = new Date();
+    const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+    const zipName = `invoices-${clientLabel}-${ymd}.zip`;
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", (err: any) => {
+      console.error("[Invoices bulk-pdf] archive error:", err.message);
+      if (!res.headersSent) res.status(500).json({ error: "Failed to build zip" });
+      else res.destroy(err);
+    });
+    archive.pipe(res);
+
+    for (const inv of invoices) {
+      const enrichedClient = await enrichClientDetails(inv);
+      const buf = await generateInvoicePdf({ ...inv, clientDetails: enrichedClient } as any, prefetch);
+      archive.append(buf, { name: `${inv.invoiceNo}.pdf` });
+    }
+
+    await archive.finalize();
+  } catch (err: any) {
+    console.error("[Invoices bulk-pdf]", err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+    else res.destroy(err);
   }
 });
 
