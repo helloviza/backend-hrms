@@ -923,7 +923,13 @@ router.get("/", requirePermission("invoices", "READ"), async (req: any, res: any
     const limit = Math.min(100, parseInt(req.query.limit) || 20);
     const filter: Record<string, any> = {};
 
-    if (req.query.workspaceId) filter.workspaceId = req.query.workspaceId;
+    if (req.query.workspaceId) {
+      const cws = await CustomerWorkspace
+        .findOne({ customerId: req.query.workspaceId })
+        .select("_id")
+        .lean();
+      filter.workspaceId = { $in: [req.query.workspaceId, ...(cws ? [cws._id] : [])] };
+    }
     if (req.query.status) filter.status = req.query.status;
 
     if (req.query.dateFrom || req.query.dateTo) {
@@ -950,7 +956,13 @@ router.get("/", requirePermission("invoices", "READ"), async (req: any, res: any
 router.get("/export", requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
     const filter: Record<string, any> = {};
-    if (req.query.workspaceId) filter.workspaceId = req.query.workspaceId;
+    if (req.query.workspaceId) {
+      const cws = await CustomerWorkspace
+        .findOne({ customerId: req.query.workspaceId })
+        .select("_id")
+        .lean();
+      filter.workspaceId = { $in: [req.query.workspaceId, ...(cws ? [cws._id] : [])] };
+    }
     if (req.query.status) filter.status = req.query.status;
     if (req.query.dateFrom || req.query.dateTo) {
       filter.generatedAt = {};
