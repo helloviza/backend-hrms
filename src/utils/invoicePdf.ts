@@ -6,7 +6,7 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import type { IInvoice } from "../models/Invoice.js";
-import { getCompanySettings } from "../models/CompanySettings.js";
+import { getCompanySettings, type ICompanySettings } from "../models/CompanySettings.js";
 import logger from "./logger.js";
 
 /* ── Font paths — resolved relative to this file ───── */
@@ -152,8 +152,27 @@ function numberToWords(amount: number): string {
   return `Indian Rupee ${result}`;
 }
 
+/* ── Prefetched render assets ───────────────────────── */
+// Company settings + logo are identical across every invoice in a batch.
+// Fetching them once and injecting avoids N network round-trips when rendering
+// many PDFs (e.g. the bulk-zip endpoint). Omit for single renders — behaviour
+// is unchanged when `prefetch` is not provided.
+export interface InvoicePdfPrefetch {
+  settings: ICompanySettings;
+  logoBuffer: Buffer | null;
+}
+
+export async function prefetchInvoiceAssets(): Promise<InvoicePdfPrefetch> {
+  const settings = await getCompanySettings();
+  const logoBuffer = settings.logoUrl ? await fetchBuffer(settings.logoUrl) : null;
+  return { settings, logoBuffer };
+}
+
 /* ── Main export ────────────────────────────────────── */
-export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
+export async function generateInvoicePdf(
+  invoice: IInvoice,
+  prefetch?: InvoicePdfPrefetch,
+): Promise<Buffer> {
   await ensureFonts();
 
   const useNoto = fs.existsSync(FONT_PATH) && fs.existsSync(FONT_BOLD_PATH);
@@ -175,8 +194,10 @@ export async function generateInvoicePdf(invoice: IInvoice): Promise<Buffer> {
     });
   }
 
-  const dbSettings = await getCompanySettings();
-  const logoBuffer = dbSettings.logoUrl ? await fetchBuffer(dbSettings.logoUrl) : null;
+  const dbSettings = prefetch?.settings ?? await getCompanySettings();
+  const logoBuffer = prefetch
+    ? prefetch.logoBuffer
+    : (dbSettings.logoUrl ? await fetchBuffer(dbSettings.logoUrl) : null);
 
   console.log('[PDF] clientDetails:', JSON.stringify((invoice as any).clientDetails));
   const issuerSnap = (invoice as any).issuerDetails ?? {};
