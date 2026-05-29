@@ -121,7 +121,7 @@ function send401ForJwtError(res: any, err: any) {
   });
 }
 
-function signAccessToken(params: {
+export function signAccessToken(params: {
   userId: string;
   email: string;
   roles: string[];
@@ -130,6 +130,9 @@ function signAccessToken(params: {
   vendorId?: string | null;
   businessId?: string | null;
   customerMemberRole?: string | null;
+  // Demo Platform claims (optional, backward-compatible — existing callers don't pass these)
+  isDemoUser?: boolean;
+  demoImpersonation?: boolean;
 }) {
   const payload: any = {
     sub: String(params.userId),
@@ -143,6 +146,9 @@ function signAccessToken(params: {
   if (params.vendorId) payload.vendorId = String(params.vendorId);
   if (params.customerMemberRole)
     payload.customerMemberRole = String(params.customerMemberRole).toUpperCase();
+
+  if (params.isDemoUser) payload.isDemoUser = true;
+  if (params.demoImpersonation) payload._demoImpersonation = true;
 
   return jwt.sign(payload, safeEnv("JWT_SECRET"), { expiresIn: ACCESS_EXPIRES_IN });
 }

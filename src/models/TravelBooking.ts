@@ -42,6 +42,8 @@ export interface ITravelBooking extends Document {
   travelDate?: Date;
   travelDateEnd?: Date;
   metadata?: Record<string, unknown>;
+  isDemo?: boolean;
+  createdByDemoUser?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -99,6 +101,9 @@ const TravelBookingSchema = new Schema(
     travelDate: { type: Date, default: null },
     travelDateEnd: { type: Date, default: null },
     metadata: { type: Schema.Types.Mixed, default: {} },
+    // Demo Platform — mirror flags so demo bookings are filterable on the customer side
+    isDemo: { type: Boolean, default: false, index: true },
+    createdByDemoUser: { type: Boolean, default: false, index: true },
   },
   { timestamps: true },
 );

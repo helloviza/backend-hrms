@@ -123,6 +123,8 @@ export interface ISBTHotelBooking extends Document {
   cancelledAt?: Date;
   closedAt?: Date;
   reminders?: Array<{ type: "24h" | "1h"; sentAt: Date }>;
+  isDemo?: boolean;
+  createdByDemoUser?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -250,6 +252,9 @@ const SBTHotelBookingSchema = new Schema(
       type: { type: String, enum: ["24h", "1h"] },
       sentAt: { type: Date, default: Date.now },
     }],
+    // Demo Platform — booking authored under impersonation / seeded for a demo workspace
+    isDemo: { type: Boolean, default: false, index: true },
+    createdByDemoUser: { type: Boolean, default: false, index: true },
   },
   { timestamps: true },
 );

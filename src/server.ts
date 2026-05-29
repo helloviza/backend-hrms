@@ -531,6 +531,10 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
 import adminSessionsRouter from "./routes/admin.sessions.js";
 app.use("/api/admin/sessions", adminSessionsRouter);
 
+// Admin — Demo Platform (impersonation endpoints, audit log)
+import adminDemoRouter from "./routes/admin.demo.js";
+app.use("/api/admin/demo", adminDemoRouter);
+
 // Ticketing — manual ingest trigger (SUPERADMIN only)
 import ticketsAdminRouter from "./routes/tickets.admin.js";
 // Ticketing — agent console (list, detail, reply, status, assign, tags)
