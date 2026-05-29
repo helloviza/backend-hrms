@@ -140,7 +140,8 @@ async function getKpisForRange(start: Date, end: Date): Promise<RangeKpis> {
       $group: {
         _id: null,
         bookings: { $sum: 1 },
-        totalQuoted: { $sum: { $ifNull: ["$pricing.quotedPrice", 0] } },
+        totalGrandTotal: { $sum: { $ifNull: [ "$pricing.grandTotal",
+                          { $ifNull: [ "$pricing.totalWithGST", "$pricing.quotedPrice" ] } ] } },
         totalGST: { $sum: { $ifNull: ["$pricing.gstAmount", 0] } },
         totalBaseProfit: { $sum: { $ifNull: ["$pricing.basePrice", 0] } },
       },
@@ -152,7 +153,7 @@ async function getKpisForRange(start: Date, end: Date): Promise<RangeKpis> {
   }
 
   const r = result[0];
-  const revenue = r.totalQuoted ?? 0;
+  const revenue = r.totalGrandTotal ?? 0;
   const gst = r.totalGST ?? 0;
   const baseProfit = r.totalBaseProfit ?? 0;
   const netSales = revenue - gst;
@@ -173,12 +174,13 @@ async function getBreakdownByType(start: Date, end: Date): Promise<TypeBreakdown
       $group: {
         _id: "$type",
         bookings: { $sum: 1 },
-        totalQuoted: { $sum: { $ifNull: ["$pricing.quotedPrice", 0] } },
+        totalGrandTotal: { $sum: { $ifNull: [ "$pricing.grandTotal",
+                          { $ifNull: [ "$pricing.totalWithGST", "$pricing.quotedPrice" ] } ] } },
         totalGST: { $sum: { $ifNull: ["$pricing.gstAmount", 0] } },
         totalBaseProfit: { $sum: { $ifNull: ["$pricing.basePrice", 0] } },
       },
     },
-    { $addFields: { netSales: { $subtract: ["$totalQuoted", "$totalGST"] } } },
+    { $addFields: { netSales: { $subtract: ["$totalGrandTotal", "$totalGST"] } } },
     {
       $addFields: {
         margin: {
@@ -215,7 +217,8 @@ async function getTopPerformers(start: Date, end: Date, limit = 3): Promise<TopP
       $group: {
         _id: "$bookedBy",
         bookings: { $sum: 1 },
-        revenue: { $sum: { $ifNull: ["$pricing.quotedPrice", 0] } },
+        revenue: { $sum: { $ifNull: [ "$pricing.grandTotal",
+                  { $ifNull: [ "$pricing.totalWithGST", "$pricing.quotedPrice" ] } ] } },
       },
     },
     { $sort: { bookings: -1, revenue: -1 } },
@@ -255,7 +258,8 @@ async function getTopClients(start: Date, end: Date, limit = 3): Promise<TopClie
       $group: {
         _id: "$workspaceId",
         bookings: { $sum: 1 },
-        revenue: { $sum: { $ifNull: ["$pricing.quotedPrice", 0] } },
+        revenue: { $sum: { $ifNull: [ "$pricing.grandTotal",
+                  { $ifNull: [ "$pricing.totalWithGST", "$pricing.quotedPrice" ] } ] } },
       },
     },
     { $sort: { revenue: -1 } },
@@ -414,7 +418,8 @@ async function getLast7DayTrend(todayStr: string): Promise<TrendPoint[]> {
             timezone: "Asia/Kolkata",
           },
         },
-        totalQuoted: { $sum: { $ifNull: ["$pricing.quotedPrice", 0] } },
+        totalGrandTotal: { $sum: { $ifNull: [ "$pricing.grandTotal",
+                          { $ifNull: [ "$pricing.totalWithGST", "$pricing.quotedPrice" ] } ] } },
         totalGST: { $sum: { $ifNull: ["$pricing.gstAmount", 0] } },
       },
     },
@@ -422,7 +427,7 @@ async function getLast7DayTrend(todayStr: string): Promise<TrendPoint[]> {
 
   const map = new Map<string, number>();
   for (const r of agg as any[]) {
-    map.set(String(r._id), (r.totalQuoted ?? 0) - (r.totalGST ?? 0));
+    map.set(String(r._id), (r.totalGrandTotal ?? 0) - (r.totalGST ?? 0));
   }
 
   return days.map((d, i) => ({
@@ -536,17 +541,17 @@ export function buildEodMessageFromSnapshot(snapshot: EodSnapshot): string {
   if (sections.todaySnapshot) {
     msg += `${RULE}\n*TODAY*\n${RULE}\n`;
     msg += `🎫 Bookings: ${formatNumber(snapshot.today.bookings)}\n`;
-    msg += `💰 Sales: ${formatINR(snapshot.today.revenue)}\n`;
+    msg += `💰 Gross Sales: ${formatINR(snapshot.today.revenue)}\n`;
     msg += `📊 GST: ${formatINR(snapshot.today.gst)}\n`;
     msg += `📈 Base Profit: ${formatINR(snapshot.today.baseProfit)}\n`;
     msg += `📐 Margin*: ${snapshot.today.margin.toFixed(1)}%\n`;
-    msg += `_* Margin % computed on Net Sales (Sales − GST)_\n\n`;
+    msg += `_* Margin % computed on Net Sales (Gross Sales − GST)_\n\n`;
   }
 
   if (snapshot.wtd) {
     msg += `${RULE}\n*WEEK TO DATE* (Mon–Today)\n${RULE}\n`;
     msg += `🎫 Bookings: ${formatNumber(snapshot.wtd.bookings)}\n`;
-    msg += `💰 Sales: ${formatINR(snapshot.wtd.revenue)}\n`;
+    msg += `💰 Gross Sales: ${formatINR(snapshot.wtd.revenue)}\n`;
     msg += `📈 Base Profit: ${formatINR(snapshot.wtd.baseProfit)}\n`;
     msg += `📐 Margin: ${snapshot.wtd.margin.toFixed(1)}%\n\n`;
   }
@@ -554,7 +559,7 @@ export function buildEodMessageFromSnapshot(snapshot: EodSnapshot): string {
   if (snapshot.mtd) {
     msg += `${RULE}\n*MONTH TO DATE* (${snapshot.monthLabel} 1–${snapshot.dayOfMonth})\n${RULE}\n`;
     msg += `🎫 Bookings: ${formatNumber(snapshot.mtd.bookings)}\n`;
-    msg += `💰 Sales: ${formatINR(snapshot.mtd.revenue)}\n`;
+    msg += `💰 Gross Sales: ${formatINR(snapshot.mtd.revenue)}\n`;
     msg += `📈 Base Profit: ${formatINR(snapshot.mtd.baseProfit)}\n`;
     msg += `📐 Margin: ${snapshot.mtd.margin.toFixed(1)}%\n\n`;
   }

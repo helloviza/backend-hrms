@@ -230,7 +230,7 @@ export function buildEodHtml(snapshot: EodSnapshot): string {
         <div style="font-size:30px; font-weight:800; color:${C.ink}; line-height:1;">${fmtNum(today.bookings)}</div>
       </div>
       <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:14px;">
-        <div style="font-size:11px; font-weight:700; color:${C.muted}; letter-spacing:0.1em; text-transform:uppercase;">Total sales</div>
+        <div style="font-size:11px; font-weight:700; color:${C.muted}; letter-spacing:0.1em; text-transform:uppercase;">Gross sales</div>
         <div style="font-size:18px; font-weight:700; color:${C.ink};">${escapeHtml(fmtINR(today.revenue))}</div>
       </div>
       <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:8px;">
@@ -242,7 +242,7 @@ export function buildEodHtml(snapshot: EodSnapshot): string {
         <div style="font-size:18px; font-weight:800; color:${C.green};">${today.margin.toFixed(1)}%</div>
       </div>
       <div style="font-size:10px; color:#888; font-style:italic; margin-top:6px; text-align:right;">
-        * Margin % = Profit ÷ Net Sales (Total Sales − GST)
+        * Margin % = Profit ÷ Net Sales (Gross Sales − GST)
       </div>
     </div>
   `
@@ -260,7 +260,7 @@ export function buildEodHtml(snapshot: EodSnapshot): string {
       <div style="display:grid; grid-template-columns:1fr auto; row-gap:5px; column-gap:10px;">
         <div style="font-size:11px; color:${C.muted};">Bookings</div>
         <div style="font-size:12px; font-weight:700; color:${C.ink}; text-align:right;">${fmtNum(k.bookings)}</div>
-        <div style="font-size:11px; color:${C.muted};">Sales</div>
+        <div style="font-size:11px; color:${C.muted};">Gross Sales</div>
         <div style="font-size:12px; font-weight:700; color:${C.ink}; text-align:right;">${escapeHtml(fmtINR(k.revenue))}</div>
         <div style="font-size:11px; color:${C.muted};">Profit</div>
         <div style="font-size:12px; font-weight:700; color:${C.ink}; text-align:right;">${escapeHtml(fmtINR(k.baseProfit))}</div>
