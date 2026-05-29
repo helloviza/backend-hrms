@@ -286,6 +286,9 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
       sourceBookingId: req.body.sourceBookingId || undefined,
       createdBy: String(req.user._id || req.user.id || req.user.sub),
       createdByEmail: req.user.email,
+      // Demo Platform — booking authored under impersonation
+      isDemo: req.user?.isDemoUser === true,
+      createdByDemoUser: req.user?.isDemoUser === true,
     });
 
     // Task automation hook for pending bookings
@@ -1085,6 +1088,9 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
           notes:        trimStr(cell(r, "notes")),
           bookedBy:     req.user._id,
           status:       "PENDING",
+          // Demo Platform — bulk-imported under impersonation
+          isDemo: req.user?.isDemoUser === true,
+          createdByDemoUser: req.user?.isDemoUser === true,
         },
       });
     }
@@ -1419,6 +1425,9 @@ router.post("/import-from-sbt", requirePermission("manualBookings", "FULL"), asy
             status: "CONFIRMED",
             bookedBy: req.user._id,
             notes: `Imported from SBT on ${new Date().toLocaleDateString()}`,
+            // Demo Platform — SBT→Manual import inherits the SBT booking's demo flag
+            isDemo: !!sbtDoc.isDemo || req.user?.isDemoUser === true,
+            createdByDemoUser: req.user?.isDemoUser === true,
           };
         } else {
           const nights = Math.max(
@@ -1461,6 +1470,9 @@ router.post("/import-from-sbt", requirePermission("manualBookings", "FULL"), asy
             status: "CONFIRMED",
             bookedBy: req.user._id,
             notes: `Imported from SBT Hotels on ${new Date().toLocaleDateString()}`,
+            // Demo Platform — SBT→Manual import inherits the SBT booking's demo flag
+            isDemo: !!sbtDoc.isDemo || req.user?.isDemoUser === true,
+            createdByDemoUser: req.user?.isDemoUser === true,
           };
         }
 

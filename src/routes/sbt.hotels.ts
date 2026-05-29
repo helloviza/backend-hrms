@@ -37,6 +37,7 @@ import {
 } from "../utils/tboBookingStateMapper.js";
 import { runDeferredStatusCheck } from "../jobs/deferred-status-check.js";
 import { BLOCKED_CORPORATE_PANS } from "../config/corporate-pan-blocklist.js";
+import { maybeRouteToDemoSimulator } from "../utils/demoSimulator.js";
 
 // TBO cert Item 31 — TBO recommends ≥120s before calling GetBookingDetail.
 const DEFERRED_STATUS_CHECK_DELAY_MS = 120_000;
@@ -753,6 +754,7 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
 
 router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "hotel-prebook")) return;
     if (process.env.TBO_ENV === "mock") {
       return res.json({
         success: true,
@@ -1095,6 +1097,7 @@ router.post("/payment/verify", requireAuth, async (req: any, res: any) => {
 router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) => {
   let clientRef = "";
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "hotel-book")) return;
     const {
       BookingCode,
       GuestNationality: _reqNationality,
@@ -2147,6 +2150,7 @@ function extractVoucherSummary(voucherData: any) {
 
 router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "hotel-voucher")) return;
     const booking = await SBTHotelBooking.findOne({ bookingId: req.params.bookingId, userId: req.user?._id ?? req.user?.id }).lean();
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
@@ -2197,6 +2201,7 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
 
 router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "hotel-generate-voucher")) return;
     const booking = await SBTHotelBooking.findOne({
       _id: req.params.id,
       userId: req.user?._id ?? req.user?.id ?? req.user?.sub,
@@ -3133,6 +3138,7 @@ async function pollCancelStatusBackground(
 
 router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "hotel-cancel")) return;
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const doc = await SBTHotelBooking.findOne({ _id: req.params.id, userId });
     if (!doc) return res.status(404).json({ error: "Booking not found" });

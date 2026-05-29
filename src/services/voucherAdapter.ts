@@ -293,6 +293,10 @@ function buildBookingFromSegment(
     // isLCC drives the "Non-Refundable" badge + policy wording in the template.
     isLCC: !!v?.policies?.is_non_refundable,
     createdAt: shared.createdAt, // Guard (e): required string
+    // Demo Platform — forwarded onto BOTH outbound + return bookings via the
+    // shared `buildBookingFromSegment` helper, so the watermark renders on every
+    // page of a multi-leg ticket. See Sprint 2 audit P5.
+    isDemo: !!v?.isDemo,
   };
 }
 
@@ -506,5 +510,8 @@ export function adaptHotel(v: PlumtripsVoucher): HotelVoucherParams {
     reconciled: true, // Guard (a): generateHotelVoucherHTML throws otherwise
     showPrintButton: false, // suppress the print FAB in the PDF
     hotelPolicies: ci || co ? { checkInTime: ci || null, checkOutTime: co || null, minimumAge: null } : null,
+    // Demo Platform — render the SAMPLE watermark + footer disclaimer when the
+    // source VoucherExtraction was captured under impersonation. See Sprint 2 audit P5.
+    isDemo: !!v?.isDemo,
   };
 }

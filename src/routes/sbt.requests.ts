@@ -13,6 +13,7 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { buildEmailShell, eCard, eRow, eLabel, eBtn, escapeHtml } from "./approvals.email.js";
 import TravelForm from "../models/TravelForm.js";
+import { maybeRouteToDemoSimulator } from "../utils/demoSimulator.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -375,6 +376,7 @@ router.get("/:id", async (req: any, res: any) => {
 
 router.post("/:id/book", async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "sbt-request-book")) return;
     const uid = userId(req);
     const user = await User.findById(uid).select("sbtRole roles customerId").lean() as any;
 

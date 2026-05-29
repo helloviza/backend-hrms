@@ -196,6 +196,10 @@ export function generateFlightSection(b, segmentLabel) {
 </div>`;
 }
 export async function generateReturnPageHTML(rb, logoUrl = DEFAULT_LOGO_URL) {
+    const rbIsDemo = !!rb.isDemo;
+    const rbDemoWatermarkHtml = rbIsDemo
+        ? `<div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) rotate(-30deg);font-size:120px;font-weight:bold;color:rgba(208,101,73,0.15);z-index:9999;pointer-events:none;white-space:nowrap;">SAMPLE — NOT A REAL RESERVATION</div>`
+        : "";
     const rbPaxRows = (rb.passengers ?? []).map((p) => {
         const pt = p?.paxType ?? "adult";
         const paxType = pt === "adult" || pt === "1" ? "Adult" : pt === "child" || pt === "2" ? "Child" : pt === "infant" || pt === "3" ? "Infant" : "Adult";
@@ -225,6 +229,7 @@ export async function generateReturnPageHTML(rb, logoUrl = DEFAULT_LOGO_URL) {
     const rbQrDataUrl = await generateQRDataUrl(rbCheckInUrl);
     return `
 <div style="page-break-before:always;">
+  ${rbDemoWatermarkHtml}
   <div style="height:3px;background:linear-gradient(to right,#C5A059,#002a58,#C5A059);"></div>
   <div style="background:#002a58;padding:20px 40px;display:flex;justify-content:space-between;align-items:center;">
     <div style="display:flex;align-items:center;">
@@ -303,6 +308,13 @@ export async function generateReturnPageHTML(rb, logoUrl = DEFAULT_LOGO_URL) {
 </div>`;
 }
 export async function generateTicketHTML(b, offers = [], returnBooking, logoUrl = DEFAULT_LOGO_URL, showPrintButton = true) {
+    const isDemo = !!b.isDemo;
+    const demoWatermarkHtml = isDemo
+        ? `<div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) rotate(-30deg);font-size:120px;font-weight:bold;color:rgba(208,101,73,0.15);z-index:9999;pointer-events:none;white-space:nowrap;">SAMPLE — NOT A REAL RESERVATION</div>`
+        : "";
+    const demoFooterDisclaimerHtml = isDemo
+        ? `<div style="text-align:center;margin:24px 40px;padding:12px 16px;background:#FFF4E5;border:1px solid #D06549;color:#7A3A1E;font-size:11px;font-style:italic;">This document is a sample generated for demonstration purposes only. No booking has been made and no service has been confirmed with any airline, hotel, or supplier.</div>`
+        : "";
     const isNonRefundable = b.isLCC;
     const destCity = b.destination.city || cityName(b.destination.code);
     const originCity = b.origin.city || cityName(b.origin.code);
@@ -402,6 +414,7 @@ export async function generateTicketHTML(b, offers = [], returnBooking, logoUrl 
 </style>
 </head>
 <body>
+${demoWatermarkHtml}
 
 <div style="height:3px;background:linear-gradient(to right,#C5A059,#002a58,#C5A059);"></div>
 
@@ -512,6 +525,8 @@ ${printButtonHtml}
   </div>
 
 </div>
+
+${demoFooterDisclaimerHtml}
 
 <div style="background:#002a58;padding:16px 40px;display:flex;justify-content:space-between;align-items:center;">
   <div style="display:flex;align-items:center;">

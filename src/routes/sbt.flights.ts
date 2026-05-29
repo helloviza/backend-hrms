@@ -43,6 +43,7 @@ import {
 } from "../services/tbo.flight.service.js";
 import { consolidateCertificationLogs } from "../services/tbo.log.consolidator.js";
 import { getCompanySettings } from "../utils/companySettings.js";
+import { maybeRouteToDemoSimulator } from "../utils/demoSimulator.js";
 
 const router = express.Router();
 
@@ -832,6 +833,7 @@ router.post("/farerule", requireAuth, requireSBT, async (req: any, res: any) => 
 // POST /api/sbt/flights/book
 router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "flight-book")) return;
     // Guard: LCC flights must use /ticket-lcc, not /book
     if (req.body?.isLCC === true) {
       return res.status(400).json({
@@ -957,6 +959,7 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
 // POST /api/sbt/flights/ticket
 router.post("/ticket", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "flight-ticket")) return;
     // Validate ticket-level PAN/passport requirements
     const ticketFareResults = req.body?.fareQuoteResults || req.body?.fareResults;
     if (ticketFareResults) {
@@ -1056,6 +1059,7 @@ router.post("/ssr", requireSBT, async (req: any, res: any) => {
 // POST /api/sbt/flights/ticket-lcc
 router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "flight-ticket-lcc")) return;
     const { isReturn, returnResultIndex, returnTraceId, returnPassengers, isSpecialReturn, isReturnGDS } = req.body;
 
     // NDC detection for ticket-lcc — primary signal is req.body.isNDC,
@@ -1568,6 +1572,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
 // Supports both JSON and text/plain (sendBeacon from browser tab close)
 router.post("/release", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "flight-release")) return;
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const result = await releasePNR(body);
     res.json(result);
@@ -1612,6 +1617,30 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
     if (b.sbtRequestId) {
       const sbtReqForUser = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceObjectId);
       if (sbtReqForUser?.requesterId) bookingUserId = sbtReqForUser.requesterId;
+    }
+
+    // Demo Platform — the simulator already persisted the SBTBooking under the
+    // synthetic PNR (see utils/demoSimulator.ts handleFlightBook / handleFlightTicketLCC).
+    // The frontend follows /book → /bookings/save with richer metadata; mirror the
+    // webhook-recovery pattern below to update the simulator-created doc in place
+    // rather than creating a duplicate.
+    if (req.user?.isDemoUser && b.pnr) {
+      const existingDemo = await SBTBooking.findOne({ pnr: b.pnr, isDemo: true, userId: bookingUserId });
+      if (existingDemo) {
+        existingDemo.bookingId = b.bookingId || existingDemo.bookingId;
+        existingDemo.ticketId = b.ticketId || existingDemo.ticketId;
+        if (b.ticketId) {
+          const tid = Number(b.ticketId);
+          if (tid > 0) (existingDemo as any).ticketIds = [tid];
+        }
+        existingDemo.passengers = b.passengers?.length ? b.passengers : existingDemo.passengers;
+        existingDemo.contactEmail = b.contactEmail || existingDemo.contactEmail;
+        existingDemo.contactPhone = b.contactPhone || existingDemo.contactPhone;
+        existingDemo.raw = b.raw ?? existingDemo.raw;
+        existingDemo.fareBreakdown = b.fareBreakdown || existingDemo.fareBreakdown;
+        await existingDemo.save();
+        return res.json({ ok: true, booking: existingDemo, demoRecovered: true });
+      }
     }
 
     // Task 7: Check if webhook already created/confirmed this booking
@@ -1677,6 +1706,9 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       fareBreakdown: b.fareBreakdown || undefined,
       ticketingStatus: b.ticketingStatus || "NOT_ATTEMPTED",
       bookedAt: new Date(),
+      // Demo Platform — defensive tagging if the simulator-created doc was lost.
+      isDemo: req.user?.isDemoUser === true,
+      createdByDemoUser: req.user?.isDemoUser === true,
       raw: (() => {
         const r = b.raw as any;
         if (!r || typeof r !== 'object') return r;
@@ -2079,6 +2111,7 @@ router.get("/bookings/:id/cancel-preview", requireAuth, requireSBT, async (req: 
 // POST /api/sbt/flights/bookings/:id/cancel — cancel a booking
 router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "flight-cancel")) return;
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const doc = await SBTBooking.findOne({ _id: req.params.id, userId });
     if (!doc) return res.status(404).json({ error: "Booking not found" });
@@ -2302,6 +2335,7 @@ router.get("/bookings/:id/reissue-charges", requireAuth, async (req: any, res: a
 // GET /api/sbt/flights/bookings/:id/reissue-search — initiate reissue search for new date
 router.get("/bookings/:id/reissue-search", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "flight-reissue-search")) return;
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
     if (!booking) return res.status(404).json({ error: "Booking not found" });
@@ -2425,6 +2459,7 @@ router.get("/bookings/:id/reissue-search", requireAuth, requireSBT, async (req: 
 // POST /api/sbt/flights/bookings/:id/manual-reissue — submit manual reschedule request via ops team
 router.post("/bookings/:id/manual-reissue", requireSBT, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "flight-manual-reissue")) return;
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const doc = await SBTBooking.findOne({ _id: req.params.id, userId });
     if (!doc) return res.status(404).json({ error: "Booking not found." });
@@ -2663,6 +2698,7 @@ router.post("/bookings/:id/reissue-order", requireAuth, requireSBT, async (req: 
 // POST /api/sbt/flights/bookings/:id/reissue — execute reissue (TicketReissue)
 router.post("/bookings/:id/reissue", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
+    if (await maybeRouteToDemoSimulator(req, res, "flight-reissue")) return;
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const workspaceId = (req as any).workspace?._id ?? (req.user as any)?.workspaceId;
     const doc = await SBTBooking.findOne({ _id: req.params.id, userId });

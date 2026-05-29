@@ -109,4 +109,9 @@ export interface PlumtripsVoucher {
   passengers?: Passenger[];
 
   policies: Policies;
+
+  // Demo Platform — VoucherExtraction.isDemo merged in at render time so the
+  // adapter can forward the watermark signal into the template props. NOT
+  // persisted into extractedJson; injected by the render route per Sprint 2 audit P5.
+  isDemo?: boolean;
 }

@@ -95,6 +95,10 @@ const VoucherExtractionSchema = new Schema(
 
     correctedBy: { type: Schema.Types.ObjectId, ref: "User", default: undefined },
     correctedAt: { type: Date, default: undefined },
+
+    // Demo Platform — captured at extraction time from req.user.isDemoUser so the
+    // voucher render path can watermark output without a downstream DB lookup.
+    isDemo: { type: Boolean, default: false, index: true },
   },
   { timestamps: true }
 );

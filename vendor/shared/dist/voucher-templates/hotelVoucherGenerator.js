@@ -140,7 +140,13 @@ export async function generateHotelVoucherHTML(params) {
         throw new Error("Cannot generate voucher: booking has not been reconciled with hotel. " +
             "Please wait for confirmation to complete.");
     }
-    const { hotelName, hotelAddress, checkIn, checkOut, roomName, bookingId, confirmationNo, bookingRefNo, invoiceNumber, tboReferenceNo, roomDescription, rateConditions, amenities, guestFirstName, leadGuestName, inclusions, cancelPolicies, displayVoucherStatus, totalFare, logoBodyBase64, offers, hotelPolicies, additionalConditions, supportEmail = "hello@plumtrips.com", showPrintButton = true, } = params;
+    const { hotelName, hotelAddress, checkIn, checkOut, roomName, bookingId, confirmationNo, bookingRefNo, invoiceNumber, tboReferenceNo, roomDescription, rateConditions, amenities, guestFirstName, leadGuestName, inclusions, cancelPolicies, displayVoucherStatus, totalFare, logoBodyBase64, offers, hotelPolicies, additionalConditions, supportEmail = "hello@plumtrips.com", showPrintButton = true, isDemo = false, } = params;
+    const demoWatermarkHtml = isDemo
+        ? `<div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) rotate(-30deg);font-size:120px;font-weight:bold;color:rgba(208,101,73,0.15);z-index:9999;pointer-events:none;white-space:nowrap;">SAMPLE — NOT A REAL RESERVATION</div>`
+        : "";
+    const demoFooterDisclaimerHtml = isDemo
+        ? `<div style="text-align:center;margin:24px 40px;padding:12px 16px;background:#FFF4E5;border:1px solid #D06549;color:#7A3A1E;font-size:11px;font-style:italic;">This document is a sample generated for demonstration purposes only. No booking has been made and no service has been confirmed with any airline, hotel, or supplier.</div>`
+        : "";
     const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent((hotelName || "") + " " + (hotelAddress || ""))}`;
     const qrDataUrl = await generateQRDataUrl(mapsUrl);
     const chips = buildCancellationChips(cancelPolicies, { checkOut });
@@ -230,6 +236,7 @@ export async function generateHotelVoucherHTML(params) {
 </style>
 </head>
 <body>
+${demoWatermarkHtml}
 
 <div style="height:3px;background:linear-gradient(to right,#C5A059,#002a58,#C5A059);"></div>
 
@@ -396,6 +403,7 @@ ${printButtonHtml}
   <p style="font-family:'Cormorant Garamond',Georgia,serif;font-size:14px;color:#0A1628;font-style:italic;text-align:center;margin:20px 0 0 0;">
     Thank you for booking with Plumtrips. We wish you a pleasant stay.
   </p>
+  ${demoFooterDisclaimerHtml}
   <div style="font-family:'DM Sans',system-ui,sans-serif;font-size:8px;color:#9ca3af;text-align:center;margin-top:16px;padding-top:12px;border-top:1px solid #e5e2db;">
     &copy; ${new Date().getFullYear()} Peachmint Trips and Planners Pvt. Ltd.
   </div>
