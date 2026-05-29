@@ -103,6 +103,8 @@ export interface IManualBooking extends Document {
   createdByEmail?: string;
   isDemo?: boolean;
   createdByDemoUser?: boolean;
+  // Free-form bag (Demo Platform uses metadata.demoRef for seed idempotency).
+  metadata?: Record<string, unknown>;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -196,6 +198,8 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     // Demo Platform — booking authored under impersonation / seeded for a demo workspace
     isDemo: { type: Boolean, default: false, index: true },
     createdByDemoUser: { type: Boolean, default: false, index: true },
+    // Free-form bag — Demo Platform uses metadata.demoRef for seed idempotency.
+    metadata: { type: Schema.Types.Mixed },
   },
   { timestamps: true },
 );
