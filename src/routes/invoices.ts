@@ -921,7 +921,7 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
 router.get("/", requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, parseInt(req.query.limit) || 20);
+    const limit = Math.min(200, parseInt(req.query.limit) || 20);
     const filter: Record<string, any> = {};
 
     if (req.query.workspaceId) {
@@ -1756,24 +1756,244 @@ router.get("/:id", requirePermission("invoices", "READ"), async (req: any, res: 
 /* ── Update Status ────────────────────────────────────────────────── */
 
 // PUT /api/admin/invoices/:id/status
+// Single-invoice forward mark (DRAFT->SENT->PAID). Lifecycle is strict:
+// DRAFT->PAID is rejected (must go via SENT). CANCELLED is immutable here.
+// sentAt/paidAt accept an explicit date (no silent auto-stamp); paymentRef is
+// recorded in the editHistory entry.
 router.put("/:id/status", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
   try {
-    const { status, paidAt } = req.body as {
+    const { status, sentAt, paidAt, paymentRef } = req.body as {
       status: "SENT" | "PAID" | "CANCELLED";
+      sentAt?: string;
       paidAt?: string;
+      paymentRef?: string;
     };
 
     const invoice = await Invoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
+    const prev = invoice.status;
+
+    if (prev === "CANCELLED") {
+      return res.status(400).json({ error: "Cancelled invoices cannot be re-marked." });
+    }
+    if (status === prev) {
+      return res.status(400).json({ error: `Already in ${status}.` });
+    }
+    if (status === "PAID" && prev === "DRAFT") {
+      return res.status(400).json({ error: "Cannot mark as PAID directly. Mark as SENT first." });
+    }
+
+    const now = new Date();
+    const oldValues: Record<string, unknown> = { status: prev };
+    const newValues: Record<string, unknown> = { status };
+
     invoice.status = status;
-    if (status === "SENT") invoice.sentAt = new Date();
-    if (status === "PAID") invoice.paidAt = paidAt ? new Date(paidAt) : new Date();
+    if (status === "SENT") {
+      invoice.sentAt = sentAt ? new Date(sentAt) : now;
+      newValues.sentAt = invoice.sentAt;
+    }
+    if (status === "PAID") {
+      invoice.paidAt = paidAt ? new Date(paidAt) : now;
+      newValues.paidAt = invoice.paidAt;
+    }
+    if (paymentRef && String(paymentRef).trim()) {
+      newValues.paymentRef = String(paymentRef).trim();
+    }
+
+    const iv = invoice as any;
+    iv.editedAt = now;
+    iv.editedBy = req.user._id;
+    if (!iv.editHistory) iv.editHistory = [];
+    iv.editHistory.push({ editedAt: now, editedBy: req.user._id, fieldsChanged: ["status"], oldValues, newValues });
 
     await invoice.save();
     res.json({ ok: true, invoice });
   } catch (err: any) {
     console.error("[Invoices PUT status]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Bulk status marking + single revert ──────────────────────────── */
+
+const BULK_MARK_CAP = 200;
+
+// POST /api/admin/invoices/bulk-mark-sent
+// Forward-marks DRAFT invoices to SENT in a best-effort batch. The frontend has
+// already filtered+selected, so we trust the explicit ids (no list-filter
+// re-derivation) but validate each invoice's lifecycle. Each save is single-doc
+// atomic; one failure does not fail the batch. Returns { updated, skipped, blocked }.
+router.post("/bulk-mark-sent", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  try {
+    const { ids, sentAt, paymentRef } = req.body as { ids?: string[]; sentAt?: string; paymentRef?: string };
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: "ids must be a non-empty array" });
+    }
+    if (ids.length > BULK_MARK_CAP) {
+      return res.status(413).json({ error: `Too many invoices (${ids.length}). Select ${BULK_MARK_CAP} or fewer.` });
+    }
+
+    const updated: string[] = [];
+    const skipped: Array<{ id: string; reason: string }> = [];
+    const blocked: Array<{ id: string; reason: string }> = [];
+
+    const invoices = await Invoice.find({ _id: { $in: ids } });
+    const found = new Set(invoices.map((i) => String(i._id)));
+    for (const id of ids) if (!found.has(String(id))) blocked.push({ id, reason: "not found" });
+
+    const ref = paymentRef && String(paymentRef).trim() ? String(paymentRef).trim() : "";
+
+    for (const invoice of invoices) {
+      const id = String(invoice._id);
+      try {
+        if (invoice.status === "CANCELLED") { skipped.push({ id, reason: "cancelled" }); continue; }
+        if (invoice.status === "SENT")      { skipped.push({ id, reason: "already sent" }); continue; }
+        if (invoice.status === "PAID")      { blocked.push({ id, reason: "already paid; cannot revert via bulk" }); continue; }
+
+        const now = new Date();
+        const prev = invoice.status;
+        invoice.status = "SENT";
+        invoice.sentAt = sentAt ? new Date(sentAt) : now;
+        const newValues: Record<string, unknown> = { status: "SENT", sentAt: invoice.sentAt };
+        if (ref) newValues.paymentRef = ref;
+        const iv = invoice as any;
+        iv.editedAt = now;
+        iv.editedBy = req.user._id;
+        if (!iv.editHistory) iv.editHistory = [];
+        iv.editHistory.push({ editedAt: now, editedBy: req.user._id, fieldsChanged: ["status"], oldValues: { status: prev }, newValues });
+        await invoice.save();
+        updated.push(id);
+      } catch (e: any) {
+        blocked.push({ id, reason: `error: ${e?.message || "save failed"}` });
+      }
+    }
+
+    res.json({ updated, skipped, blocked });
+  } catch (err: any) {
+    console.error("[Invoices bulk-mark-sent]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/invoices/bulk-mark-paid  (SENT -> PAID only; DRAFT is blocked)
+router.post("/bulk-mark-paid", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  try {
+    const { ids, paidAt, paymentRef } = req.body as { ids?: string[]; paidAt?: string; paymentRef?: string };
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: "ids must be a non-empty array" });
+    }
+    if (ids.length > BULK_MARK_CAP) {
+      return res.status(413).json({ error: `Too many invoices (${ids.length}). Select ${BULK_MARK_CAP} or fewer.` });
+    }
+    if (!paidAt || !String(paidAt).trim()) {
+      return res.status(400).json({ error: "paidAt is required" });
+    }
+
+    const updated: string[] = [];
+    const skipped: Array<{ id: string; reason: string }> = [];
+    const blocked: Array<{ id: string; reason: string }> = [];
+
+    const invoices = await Invoice.find({ _id: { $in: ids } });
+    const found = new Set(invoices.map((i) => String(i._id)));
+    for (const id of ids) if (!found.has(String(id))) blocked.push({ id, reason: "not found" });
+
+    const ref = paymentRef && String(paymentRef).trim() ? String(paymentRef).trim() : "";
+
+    for (const invoice of invoices) {
+      const id = String(invoice._id);
+      try {
+        if (invoice.status === "CANCELLED") { skipped.push({ id, reason: "cancelled" }); continue; }
+        if (invoice.status === "PAID")      { skipped.push({ id, reason: "already paid" }); continue; }
+        if (invoice.status === "DRAFT")     { blocked.push({ id, reason: "lifecycle violation: mark as SENT first" }); continue; }
+
+        const now = new Date();
+        const prev = invoice.status;
+        invoice.status = "PAID";
+        invoice.paidAt = new Date(paidAt);
+        const newValues: Record<string, unknown> = { status: "PAID", paidAt: invoice.paidAt };
+        if (ref) newValues.paymentRef = ref;
+        const iv = invoice as any;
+        iv.editedAt = now;
+        iv.editedBy = req.user._id;
+        if (!iv.editHistory) iv.editHistory = [];
+        iv.editHistory.push({ editedAt: now, editedBy: req.user._id, fieldsChanged: ["status"], oldValues: { status: prev }, newValues });
+        await invoice.save();
+        updated.push(id);
+      } catch (e: any) {
+        blocked.push({ id, reason: `error: ${e?.message || "save failed"}` });
+      }
+    }
+
+    res.json({ updated, skipped, blocked });
+  } catch (err: any) {
+    console.error("[Invoices bulk-mark-paid]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/invoices/:id/revert-to-sent  (PAID -> SENT, reason required)
+router.post("/:id/revert-to-sent", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  try {
+    const { reason } = req.body as { reason?: string };
+    if (!reason || !String(reason).trim()) {
+      return res.status(400).json({ error: "Reason is required" });
+    }
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (invoice.status !== "PAID") {
+      return res.status(400).json({ error: "Only PAID invoices can be reverted to SENT." });
+    }
+
+    const now = new Date();
+    const oldPaidAt = invoice.paidAt;
+    invoice.status = "SENT";
+    invoice.paidAt = undefined;
+    const iv = invoice as any;
+    iv.editedAt = now;
+    iv.editedBy = req.user._id;
+    if (!iv.editHistory) iv.editHistory = [];
+    iv.editHistory.push({
+      editedAt: now, editedBy: req.user._id, fieldsChanged: ["status"],
+      oldValues: { status: "PAID", paidAt: oldPaidAt }, newValues: { status: "SENT", reason: String(reason).trim() },
+    });
+    await invoice.save();
+    res.json({ ok: true, invoice });
+  } catch (err: any) {
+    console.error("[Invoices revert-to-sent]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/invoices/:id/revert-to-draft  (SENT -> DRAFT, reason required)
+router.post("/:id/revert-to-draft", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  try {
+    const { reason } = req.body as { reason?: string };
+    if (!reason || !String(reason).trim()) {
+      return res.status(400).json({ error: "Reason is required" });
+    }
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (invoice.status !== "SENT") {
+      return res.status(400).json({ error: "Only SENT invoices can be reverted to DRAFT." });
+    }
+
+    const now = new Date();
+    const oldSentAt = invoice.sentAt;
+    invoice.status = "DRAFT";
+    invoice.sentAt = undefined;
+    const iv = invoice as any;
+    iv.editedAt = now;
+    iv.editedBy = req.user._id;
+    if (!iv.editHistory) iv.editHistory = [];
+    iv.editHistory.push({
+      editedAt: now, editedBy: req.user._id, fieldsChanged: ["status"],
+      oldValues: { status: "SENT", sentAt: oldSentAt }, newValues: { status: "DRAFT", reason: String(reason).trim() },
+    });
+    await invoice.save();
+    res.json({ ok: true, invoice });
+  } catch (err: any) {
+    console.error("[Invoices revert-to-draft]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
