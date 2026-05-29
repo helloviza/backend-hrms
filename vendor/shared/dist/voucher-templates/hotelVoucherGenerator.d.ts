@@ -52,5 +52,6 @@ export interface HotelVoucherParams {
     } | null;
     reconciled: boolean;
     showPrintButton?: boolean;
+    isDemo?: boolean;
 }
 export declare function generateHotelVoucherHTML(params: HotelVoucherParams): Promise<string>;

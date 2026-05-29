@@ -44,6 +44,7 @@ export interface TicketBooking {
     isLCC: boolean;
     bookedAt?: string;
     createdAt: string;
+    isDemo?: boolean;
 }
 export declare function getWebCheckInUrl(airline: string, pnr: string): string;
 export declare function generateFlightSection(b: TicketBooking, segmentLabel: string): string;

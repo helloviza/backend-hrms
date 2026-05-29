@@ -214,7 +214,10 @@ async function repairPassViaGemini(args: {
  * Throws on any adapter/template/Lambda failure so the caller can fall back.
  */
 async function renderViaSbtLambda(record: any): Promise<Buffer> {
-  const v = record?.extractedJson;
+  // Demo Platform — merge VoucherExtraction.isDemo (DB column, set at extraction time
+  // from req.user.isDemoUser) into the adapter input so the template renders the
+  // SAMPLE watermark + disclaimer. NOT persisted back into extractedJson.
+  const v = { ...(record?.extractedJson ?? {}), isDemo: !!record?.isDemo };
   if (record?.docType === "flight") {
     const { booking, returnBooking } = adaptFlight(v);
     // showPrintButton=false; logoUrl=undefined → template's parameterized default.
@@ -337,6 +340,8 @@ router.post("/extract", requireAuth, requireWorkspace, upload.single("file"), as
       },
       docType: voucherType,
       status: "PROCESSING",
+      // Demo Platform — snapshot caller's demo flag so future renders watermark correctly.
+      isDemo: req.user?.isDemoUser === true,
     });
 
     const debug: any = {
