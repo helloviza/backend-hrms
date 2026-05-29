@@ -110,6 +110,8 @@ export interface ISBTBooking extends Document {
   }>;
   bookedAt: Date;
   cancelledAt?: Date;
+  isDemo?: boolean;
+  createdByDemoUser?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -241,6 +243,9 @@ const SBTBookingSchema = new Schema(
     }],
     bookedAt: { type: Date, default: Date.now },
     cancelledAt: { type: Date },
+    // Demo Platform — booking authored under impersonation / seeded for a demo workspace
+    isDemo: { type: Boolean, default: false, index: true },
+    createdByDemoUser: { type: Boolean, default: false, index: true },
   },
   { timestamps: true },
 );

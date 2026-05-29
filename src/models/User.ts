@@ -257,6 +257,15 @@ const UserSchema = new Schema(
     canManageUsers: { type: Boolean, default: false },
 
     /* -------------------------------------------------------------- */
+    /* Demo Platform (impersonation)                                  */
+    /* -------------------------------------------------------------- */
+    isDemoUser: { type: Boolean, default: false, index: true },
+    demoAccess: {
+      enabled:         { type: Boolean, default: false },
+      mappedSeedUsers: [{ type: Schema.Types.ObjectId, ref: "User" }],
+    },
+
+    /* -------------------------------------------------------------- */
     /* Onboarding linkage                                             */
     /* -------------------------------------------------------------- */
     onboardingId: { type: Schema.Types.ObjectId, ref: "Onboarding" },

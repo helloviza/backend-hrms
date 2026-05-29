@@ -101,6 +101,8 @@ export interface IManualBooking extends Document {
   deletionNote?: string;
   createdBy?: string;
   createdByEmail?: string;
+  isDemo?: boolean;
+  createdByDemoUser?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -191,6 +193,9 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     deletionNote: { type: String },
     createdBy: { type: String, index: true },
     createdByEmail: { type: String },
+    // Demo Platform — booking authored under impersonation / seeded for a demo workspace
+    isDemo: { type: Boolean, default: false, index: true },
+    createdByDemoUser: { type: Boolean, default: false, index: true },
   },
   { timestamps: true },
 );

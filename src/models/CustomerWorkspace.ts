@@ -151,6 +151,9 @@ export interface CustomerWorkspaceDocument extends Document {
   // Legacy orphan flag (migration)
   _isLegacyOrphan?: boolean;
 
+  // Demo Platform — workspace flagged as demo (seed data, hidden from real reports)
+  isDemo?: boolean;
+
   status: "ACTIVE" | "INACTIVE" | "DELETED";
   createdAt?: Date;
   updatedAt?: Date;
@@ -343,6 +346,9 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
 
     // ── Migration flag ──
     _isLegacyOrphan: { type: Boolean },
+
+    // ── Demo Platform ──
+    isDemo: { type: Boolean, default: false, index: true },
 
     status: { type: String, default: "ACTIVE", index: true },
   },

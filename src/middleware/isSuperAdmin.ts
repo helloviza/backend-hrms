@@ -7,6 +7,9 @@ import type { Request } from "express";
 export const isSuperAdmin = (req: Request): boolean => {
   const user = (req as any).user;
   if (!user) return false;
+  // Demo Platform — refuse SUPERADMIN bypass while impersonating a demo user.
+  // Closes the SUPERADMIN escalation hole identified in Demo Platform audit §5.
+  if (user._demoImpersonation) return false;
   const roles: string[] = Array.isArray(user.roles) ? user.roles : [];
   return (
     roles.includes("SUPERADMIN") ||
