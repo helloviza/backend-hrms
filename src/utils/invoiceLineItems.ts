@@ -349,9 +349,21 @@ export function buildLineItemsForBooking(booking: any): any[] {
 // hotels merge; everything else (VISA, TRAIN, TRANSFER, …, TROPHY, GIFT,
 // STATIONERY) groups by its own type.
 function combinedGroupKey(type: string): string {
-  if (type === "FLIGHT" || type === "DUMMY_FLIGHT") return "FLIGHT";
-  if (type === "HOTEL" || type === "DUMMY_HOTEL") return "HOTEL";
+  if (type === "DUMMY_FLIGHT" || type === "DUMMY_HOTEL") return "DUMMY";
   return type;
+}
+
+// Dynamic label for the DUMMY group — reflects which dummy types are present.
+function dummyGroupLabel(bookings: any[]): string {
+  let hasFlight = false;
+  let hasHotel = false;
+  for (const b of bookings) {
+    if (b?.type === "DUMMY_FLIGHT") hasFlight = true;
+    else if (b?.type === "DUMMY_HOTEL") hasHotel = true;
+  }
+  if (hasFlight && hasHotel) return "Dummy Hotel & Flight";
+  if (hasHotel) return "Dummy Hotel";
+  return "Dummy Flight";
 }
 
 // Combined-line cost labels. Falls back to the per-booking TYPE_COST_LABELS
@@ -425,7 +437,7 @@ export function buildCombinedLineItems(bookings: any[]): any[] {
     out.push({
       bookingRef:     refs,
       rowType:        "COST",
-      description:    combinedCostLabel(key),
+      description:    key === "DUMMY" ? dummyGroupLabel(g.bookings) : combinedCostLabel(key),
       subDescription: dateRange,
       qty:            1,
       rate:           parseFloat((costAmount - costIgst).toFixed(2)),
