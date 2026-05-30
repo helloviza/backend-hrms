@@ -1,4 +1,5 @@
 import express from 'express'
+import mongoose from 'mongoose'
 import { requireAuth } from '../middleware/auth.js'
 import { requireSuperAdmin } from '../middleware/requireSuperAdmin.js'
 import { requireSuperAdminOrTenantAdmin } from '../middleware/requireSuperAdminOrTenantAdmin.js'
@@ -8,6 +9,7 @@ import { UserPermission, PermissionTier } from '../models/UserPermission.js'
 import { LEVEL_TEMPLATES, LEVEL_METADATA } from '../config/levelTemplates.js'
 import BillingPermission from '../models/BillingPermission.js'
 import User from '../models/User.js'
+import Customer from '../models/Customer.js'
 import logger from '../utils/logger.js'
 import { MODULE_GROUP_MAP } from '../utils/moduleGroups.js'
 import CustomerWorkspace from '../models/CustomerWorkspace.js'
@@ -507,6 +509,147 @@ router.patch('/update', async (req: any, res: any) => {
   } catch (err: any) {
     logger.error('[PERMISSION] update error', { error: err.message })
     return res.status(500).json({ success: false, message: 'Error updating permission' })
+  }
+})
+
+// ── PATCH /api/permissions/demo-access ───────────────────────────────────────
+// Demo Platform — grant or revoke a STAFF user's ability to impersonate
+// mapped demo seed users. Router-level gate is requireSuperAdminOrTenantAdmin
+// (too loose for this feature), so we re-gate with requireSuperAdmin here.
+router.patch('/demo-access', requireSuperAdmin, async (req: any, res: any) => {
+  try {
+    const { userId, enabled, mappedSeedUsers } = req.body
+
+    if (!userId || !mongoose.isValidObjectId(userId)) {
+      return res.status(400).json({ error: 'userId required and must be a valid ObjectId' })
+    }
+
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be boolean' })
+    }
+
+    if (enabled && !Array.isArray(mappedSeedUsers)) {
+      return res.status(400).json({ error: 'mappedSeedUsers must be an array when enabled is true' })
+    }
+
+    // Validate target user exists and is a STAFF account
+    const targetRep: any = await User.findById(userId).lean()
+    if (!targetRep) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+    if (targetRep.accountType === 'CUSTOMER' || targetRep.userType === 'CUSTOMER') {
+      return res.status(422).json({ error: 'Demo access can only be granted to STAFF users, not customer-side users' })
+    }
+
+    // If enabled, validate every mappedSeedUsers entry is a real demo user
+    if (enabled && mappedSeedUsers.length > 0) {
+      const seedUserDocs: any[] = await User.find(
+        { _id: { $in: mappedSeedUsers.map((id: string) => new mongoose.Types.ObjectId(id)) } },
+        { _id: 1, isDemoUser: 1, email: 1 }
+      ).lean()
+
+      const invalidSeeds = seedUserDocs.filter((u: any) => !u.isDemoUser)
+      if (invalidSeeds.length > 0) {
+        return res.status(422).json({
+          error: 'Some mapped users are not configured as demo seed users',
+          invalidUserIds: invalidSeeds.map((u: any) => String(u._id)),
+        })
+      }
+
+      if (seedUserDocs.length !== mappedSeedUsers.length) {
+        return res.status(404).json({ error: 'Some mappedSeedUsers do not exist' })
+      }
+    }
+
+    // Apply the update
+    await User.updateOne(
+      { _id: userId },
+      {
+        $set: {
+          'demoAccess.enabled': enabled,
+          'demoAccess.mappedSeedUsers': enabled
+            ? mappedSeedUsers.map((id: string) => new mongoose.Types.ObjectId(id))
+            : [],
+        },
+      }
+    )
+
+    const adminEmail = String(req.user?.email || req.user?._id || 'unknown')
+    logger.info(
+      `[demo-access] Updated ${targetRep.email}: enabled=${enabled}, mappedSeedUsers count=${
+        enabled ? mappedSeedUsers.length : 0
+      }, by ${adminEmail}`
+    )
+
+    return res.json({
+      ok: true,
+      userId,
+      demoAccess: {
+        enabled,
+        mappedSeedUsers: enabled ? mappedSeedUsers : [],
+      },
+    })
+  } catch (err: any) {
+    logger.error('[demo-access] error', { error: err.message })
+    return res.status(500).json({ error: 'demo_access_update_failed', message: err.message })
+  }
+})
+
+// ── GET /api/permissions/demo-access/:userId ─────────────────────────────────
+// Demo Platform — read the current demoAccess config for a user so the
+// admin UI can pre-populate Step 4 when editing. SuperAdmin-only.
+router.get('/demo-access/:userId', requireSuperAdmin, async (req: any, res: any) => {
+  try {
+    const { userId } = req.params
+    if (!userId || !mongoose.isValidObjectId(userId)) {
+      return res.status(400).json({ error: 'invalid_user_id' })
+    }
+    const u: any = await User.findById(userId, { demoAccess: 1, isDemoUser: 1 }).lean()
+    if (!u) return res.status(404).json({ error: 'not_found' })
+    return res.json({
+      enabled: u.demoAccess?.enabled === true,
+      mappedSeedUsers: (u.demoAccess?.mappedSeedUsers || []).map((id: any) => String(id)),
+      isDemoUser: u.isDemoUser === true,
+    })
+  } catch (err: any) {
+    logger.error('[demo-access GET] error', { error: err.message })
+    return res.status(500).json({ error: 'fetch_failed' })
+  }
+})
+
+// ── GET /api/permissions/demo-seed-users ─────────────────────────────────────
+// Demo Platform — populates the admin UI checkbox list of all possible
+// demo seed users in the system. SuperAdmin-only.
+router.get('/demo-seed-users', requireSuperAdmin, async (_req: any, res: any) => {
+  try {
+    const users: any[] = await User.find(
+      { isDemoUser: true },
+      { _id: 1, email: 1, name: 1, firstName: 1, lastName: 1, customerId: 1, accountType: 1 }
+    ).lean()
+
+    const customerIds = [
+      ...new Set(users.map((u: any) => u.customerId).filter(Boolean)),
+    ]
+    const customers: any[] = await Customer.find(
+      { _id: { $in: customerIds } },
+      { _id: 1, name: 1 }
+    ).lean()
+    const customerNameMap = new Map(customers.map((c: any) => [String(c._id), c.name]))
+
+    return res.json({
+      users: users.map((u: any) => ({
+        _id: String(u._id),
+        email: u.email,
+        name:
+          u.name ||
+          `${u.firstName ?? ''} ${u.lastName ?? ''}`.trim() ||
+          u.email,
+        customerName: customerNameMap.get(String(u.customerId)) || 'Unknown',
+      })),
+    })
+  } catch (err: any) {
+    logger.error('[demo-seed-users] error', { error: err.message })
+    return res.status(500).json({ error: 'fetch_failed' })
   }
 })
 
