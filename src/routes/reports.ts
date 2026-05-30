@@ -176,6 +176,8 @@ export async function getReportData(filters: {
 
   // Exclude soft-deleted bookings from every aggregation.
   match.isActive = { $ne: false };
+  // Demo Platform — exclude demo bookings from production reports.
+  match.isDemo = { $ne: true };
 
   if (filters.workspaceId) {
     try {
@@ -541,7 +543,7 @@ export async function getReportData(filters: {
     // Unpaid invoices — independent of booking-date filters; sorted oldest-first
     // by invoiceDate so the most overdue rise to the top.
     Invoice.aggregate([
-      { $match: { status: { $in: ["DRAFT", "SENT"] } } },
+      { $match: { status: { $in: ["DRAFT", "SENT"] }, isDemo: { $ne: true } } },
       {
         $project: {
           invoiceId: { $toString: "$_id" },

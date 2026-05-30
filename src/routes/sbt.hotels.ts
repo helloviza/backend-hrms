@@ -115,11 +115,14 @@ const getHotelBookingsHandler = async (req: any, res: any) => {
       .includes('WORKSPACELEADER') ||
       req.user?.customerMemberRole === 'WORKSPACE_LEADER';
 
+    // Demo Platform — demo users see only their demo bookings; real users see real bookings.
+    const demoClause = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
+
     let bookings;
     if (isWL) {
-      bookings = await SBTHotelBooking.find({ workspaceId: req.workspaceObjectId }).sort({ createdAt: -1 }).lean();
+      bookings = await SBTHotelBooking.find({ workspaceId: req.workspaceObjectId, ...demoClause }).sort({ createdAt: -1 }).lean();
     } else {
-      bookings = await SBTHotelBooking.find({ userId: rawId }).sort({ createdAt: -1 }).lean();
+      bookings = await SBTHotelBooking.find({ userId: rawId, ...demoClause }).sort({ createdAt: -1 }).lean();
     }
 
     // GAP-36c: on-read expiry — HELD bookings past lastCancellationDate (or lastVoucherDate fallback) flip to EXPIRED
@@ -2740,7 +2743,7 @@ router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
-    const pendingBookings = await SBTHotelBooking.find({ userId, status: "PENDING" });
+    const pendingBookings = await SBTHotelBooking.find({ userId, status: "PENDING", isDemo: { $ne: true } });
     if (pendingBookings.length === 0) {
       return res.json({ ok: true, synced: 0, updated: 0 });
     }
@@ -2882,6 +2885,7 @@ router.post("/bookings/refund-orphaned", requireAdmin, async (req: any, res: any
       status: { $in: ["PENDING", "FAILED"] },
       bookingId: "",
       paymentId: { $ne: "" },
+      isDemo: { $ne: true },
     });
 
     if (orphaned.length === 0) {

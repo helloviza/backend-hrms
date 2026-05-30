@@ -119,6 +119,9 @@ function buildScopedMatch(req: any): any {
   const { matchFilter } = resolveAccessScope(req.user);
   Object.assign(match, matchFilter);
 
+  // Demo Platform — exclude demo bookings from production travel-spend views.
+  match.isDemo = { $ne: true };
+
   return match;
 }
 

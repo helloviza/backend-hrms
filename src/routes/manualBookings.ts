@@ -67,6 +67,9 @@ function buildSearchFilter(query: Record<string, any>) {
     ];
   }
 
+  // Demo Platform — exclude demo bookings from admin manual-bookings views.
+  filter.isDemo = { $ne: true };
+
   return filter;
 }
 
@@ -533,8 +536,8 @@ router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req
   try {
     // Fetch already-imported IDs (include all, flag with alreadyImported instead of excluding)
     const [importedRaw, importedHotelRaw] = await Promise.all([
-      ManualBooking.find({ source: "SBT", type: { $ne: "HOTEL" } }).distinct("sourceBookingId"),
-      ManualBooking.find({ source: "SBT", type: "HOTEL" }).distinct("sourceBookingId"),
+      ManualBooking.find({ source: "SBT", type: { $ne: "HOTEL" }, isDemo: { $ne: true } }).distinct("sourceBookingId"),
+      ManualBooking.find({ source: "SBT", type: "HOTEL", isDemo: { $ne: true } }).distinct("sourceBookingId"),
     ]);
     const importedSet = new Set(importedRaw.map((id: any) => id.toString()));
     const importedHotelSet = new Set(importedHotelRaw.map((id: any) => id.toString()));
@@ -542,6 +545,7 @@ router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req
     const [flights, hotels] = await Promise.all([
       SBTBooking.find({
         status: { $in: ["CONFIRMED", "PENDING", "CANCELLED"] },
+        isDemo: { $ne: true },
       })
         .populate("workspaceId", "name companyName customerId")
         .sort({ createdAt: -1 })
@@ -549,6 +553,7 @@ router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req
         .lean(),
       SBTHotelBooking.find({
         status: { $in: ["CONFIRMED", "PENDING", "HELD", "CANCELLED"] },
+        isDemo: { $ne: true },
       })
         .populate("workspaceId", "name companyName customerId")
         .sort({ createdAt: -1 })
@@ -674,6 +679,7 @@ router.post("/markup-analysis", requirePermission("manualBookings", "READ"), asy
           type,
           status: { $in: ["CONFIRMED", "INVOICED"] },
           "pricing.actualPrice": { $gt: 0 },
+          isDemo: { $ne: true },
         },
       },
       {
@@ -1128,7 +1134,7 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
 router.get("/creators", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
   try {
     const raw = await ManualBooking.aggregate([
-      { $match: { createdBy: { $exists: true, $nin: [null, ""] } } },
+      { $match: { createdBy: { $exists: true, $nin: [null, ""] }, isDemo: { $ne: true } } },
       { $group: { _id: "$createdBy", email: { $first: "$createdByEmail" } } },
       { $match: { _id: { $nin: [null, ""] } } },
       // Attempt to join to User for display name; createdBy is stored as String(ObjectId)

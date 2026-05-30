@@ -124,6 +124,15 @@ router.get("/", async (req: Request, res: Response) => {
 
     const limit = Math.min(200, Math.max(1, parseInt(req.query.limit as string, 10) || 100));
 
+    // Demo Platform — demo users see only demo bookings (their seeded universe);
+    // real users see only real bookings. Mirrors the conditional pattern used
+    // across user-facing SBT endpoints.
+    if ((req as any).user?.isDemoUser) {
+      match.isDemo = true;
+    } else {
+      match.isDemo = { $ne: true };
+    }
+
     const docs = await TravelBooking.find(match)
       .populate("userId", "name firstName lastName email")
       .sort({ bookedAt: -1 })

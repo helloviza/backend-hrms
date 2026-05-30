@@ -442,9 +442,12 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     const resolvedInvoiceDate = invoiceDate ? new Date(invoiceDate) : new Date();
     resolvedInvoiceDate.setHours(0, 0, 0, 0);
 
-    // Validate bookings
+    // Validate bookings — Demo Platform: demo admins invoice only demo bookings,
+    // real admins are protected from accidentally invoicing demo data.
+    const demoClauseGenerate = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
     const bookings = await ManualBooking.find({
       _id: { $in: bookingIds.map((id) => new mongoose.Types.ObjectId(id)) },
+      ...demoClauseGenerate,
     }).lean();
 
     if (bookings.length !== bookingIds.length) {
@@ -729,9 +732,12 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       year: "numeric",
     });
 
-    // Fetch all bookings upfront and validate same workspace
+    // Fetch all bookings upfront and validate same workspace.
+    // Demo Platform: demo admins invoice only demo bookings; real admins protected.
+    const demoClauseBulk = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
     const allBookings = await ManualBooking.find({
       _id: { $in: bookingIds.map((id) => new mongoose.Types.ObjectId(id)) },
+      ...demoClauseBulk,
     }).lean();
 
     if (allBookings.length !== bookingIds.length) {
@@ -1116,9 +1122,11 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
       return res.status(400).json({ error: "Cannot add bookings to a PAID or CANCELLED invoice" });
     }
 
-    // Fetch new bookings
+    // Fetch new bookings — Demo Platform: demo admins isolated to demo bookings.
+    const demoClauseAdd = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
     const newBookings = await ManualBooking.find({
       _id: { $in: bookingIds.map((id) => new mongoose.Types.ObjectId(id)) },
+      ...demoClauseAdd,
     }).lean();
 
     if (newBookings.length !== bookingIds.length) {
@@ -1525,8 +1533,11 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
           const notOn = removeIds.filter((id) => !onInvoice.has(id));
           if (notOn.length) throw new HttpError(400, `Booking(s) not on this invoice: ${notOn.join(", ")}`);
 
+          // Demo Platform — defensive: scope removal lookup to caller's demo realm.
+          const demoClausePatchRemove = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
           const toRemove = await ManualBooking.find({
             _id: { $in: removeIds.map((id) => new mongoose.Types.ObjectId(id)) },
+            ...demoClausePatchRemove,
           }).session(session);
 
           const removedRefs = (toRemove as any[]).map((b) => b.bookingRef);
@@ -1566,8 +1577,11 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
 
         // ADD bookings → validate eligibility, build lines, mark INVOICED
         if (addIds.length) {
+          // Demo Platform — demo admins add demo bookings only; real admins protected.
+          const demoClausePatchAdd = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
           const toAdd = await ManualBooking.find({
             _id: { $in: addIds.map((id) => new mongoose.Types.ObjectId(id)) },
+            ...demoClausePatchAdd,
           }).session(session);
 
           if (toAdd.length !== addIds.length) throw new HttpError(400, "One or more booking IDs not found");
@@ -1714,8 +1728,12 @@ router.get("/:id/eligible-bookings", requirePermission("invoices", "READ"), asyn
     const customerIds = await invoiceCustomerIds(invoice, null);
     const currentIds = ((invoice as any).bookingIds ?? []).map((x: any) => String(x));
 
+    // Demo Platform — eligible/current scoped to caller's demo realm.
+    const demoClauseEligible = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
+
     const current = await ManualBooking.find({
       _id: { $in: currentIds.map((id: string) => new mongoose.Types.ObjectId(id)) },
+      ...demoClauseEligible,
     })
       .sort({ travelDate: 1 })
       .lean();
@@ -1726,6 +1744,7 @@ router.get("/:id/eligible-bookings", requirePermission("invoices", "READ"), asyn
       isActive: { $ne: false },
       invoiceId: null, // matches both null and missing
       _id: { $nin: currentIds.map((id: string) => new mongoose.Types.ObjectId(id)) },
+      ...demoClauseEligible,
     })
       .sort({ travelDate: 1 })
       .limit(200)

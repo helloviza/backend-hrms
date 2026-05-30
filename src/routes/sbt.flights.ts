@@ -1830,6 +1830,13 @@ router.get("/my-bookings", requireAuth, async (req: any, res: any) => {
     const filter: any = { userId };
     if (status) filter.status = String(status).toUpperCase();
 
+    // Demo Platform — demo users see only their demo bookings; real users see real bookings.
+    if (req.user?.isDemoUser) {
+      filter.isDemo = true;
+    } else {
+      filter.isDemo = { $ne: true };
+    }
+
     const lim = Math.min(50, Math.max(1, parseInt(limit as string, 10) || 10));
     const bookings = await SBTBooking.find(filter).sort({ createdAt: -1 }).limit(lim).lean();
     // Customer-facing path: strip supplier cost/margin before responding.
@@ -1850,15 +1857,18 @@ router.get("/bookings", requireSBT, async (req: any, res: any) => {
       .includes('WORKSPACELEADER') ||
       req.user?.customerMemberRole === 'WORKSPACE_LEADER';
 
+    // Demo Platform — demo users see only their demo bookings; real users see real bookings.
+    const demoClause = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
+
     let bookings;
     if (isWL) {
       const customerId = (req as any).workspace?.customerId || req.user?.customerId;
-      bookings = await SBTBooking.find({ customerId }).sort({ createdAt: -1 }).lean();
+      bookings = await SBTBooking.find({ customerId, ...demoClause }).sort({ createdAt: -1 }).lean();
     } else {
       const userId = mongoose.Types.ObjectId.isValid(rawId)
         ? new mongoose.Types.ObjectId(rawId)
         : rawId;
-      bookings = await SBTBooking.find({ userId }).sort({ createdAt: -1 }).lean();
+      bookings = await SBTBooking.find({ userId, ...demoClause }).sort({ createdAt: -1 }).lean();
     }
 
     const bookingsWithReissue = bookings.map((booking: any) => {
@@ -1933,6 +1943,7 @@ router.get("/bookings/orphaned", requireAuth, requireAdmin, async (_req: any, re
       status: { $in: ["FAILED", "PENDING"] },
       razorpayPaymentId: { $ne: "" },
       razorpayAmount: { $gt: 0 },
+      isDemo: { $ne: true },
     }).sort({ createdAt: -1 }).lean();
     res.json({ ok: true, count: docs.length, bookings: docs });
   } catch (err: any) {
@@ -1955,6 +1966,7 @@ router.post("/bookings/refund-orphaned", requireAuth, requireAdmin, async (req: 
       status: { $in: ["FAILED", "PENDING"] },
       razorpayPaymentId: { $ne: "" },
       razorpayAmount: { $gt: 0 },
+      isDemo: { $ne: true },
     };
     if (bookingId) filter._id = bookingId;
     if (razorpayPaymentId) filter.razorpayPaymentId = razorpayPaymentId;

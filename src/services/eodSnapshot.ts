@@ -134,6 +134,7 @@ async function getKpisForRange(start: Date, end: Date): Promise<RangeKpis> {
       $match: {
         bookingDate: { $gte: start, $lte: end },
         isActive: { $ne: false },
+        isDemo: { $ne: true },
       },
     },
     {
@@ -168,6 +169,7 @@ async function getBreakdownByType(start: Date, end: Date): Promise<TypeBreakdown
       $match: {
         bookingDate: { $gte: start, $lte: end },
         isActive: { $ne: false },
+        isDemo: { $ne: true },
       },
     },
     {
@@ -211,6 +213,7 @@ async function getTopPerformers(start: Date, end: Date, limit = 3): Promise<TopP
         bookingDate: { $gte: start, $lte: end },
         isActive: { $ne: false },
         bookedBy: { $ne: null },
+        isDemo: { $ne: true },
       },
     },
     {
@@ -252,6 +255,7 @@ async function getTopClients(start: Date, end: Date, limit = 3): Promise<TopClie
         bookingDate: { $gte: start, $lte: end },
         isActive: { $ne: false },
         workspaceId: { $ne: null },
+        isDemo: { $ne: true },
       },
     },
     {
@@ -295,14 +299,14 @@ async function getPipelineMetrics(todayEnd: Date): Promise<PipelineMetrics> {
     holdsExpiring,
   ] = await Promise.all([
     Invoice.aggregate([
-      { $match: { status: "SENT" } },
+      { $match: { status: "SENT", isDemo: { $ne: true } } },
       { $group: { _id: null, count: { $sum: 1 }, total: { $sum: "$grandTotal" } } },
     ]),
     Invoice.aggregate([
-      { $match: { status: "SENT", dueDate: { $lt: sevenDaysAgo } } },
+      { $match: { status: "SENT", dueDate: { $lt: sevenDaysAgo }, isDemo: { $ne: true } } },
       { $group: { _id: null, count: { $sum: 1 }, total: { $sum: "$grandTotal" } } },
     ]),
-    Invoice.countDocuments({ status: "DRAFT" }),
+    Invoice.countDocuments({ status: "DRAFT", isDemo: { $ne: true } }),
     ApprovalRequest.countDocuments({
       status: "pending",
       adminState: { $in: ["pending", "in_progress"] },
@@ -310,6 +314,7 @@ async function getPipelineMetrics(todayEnd: Date): Promise<PipelineMetrics> {
     SBTHotelBooking.countDocuments({
       status: "HELD",
       lastVoucherDate: { $gte: todayEnd, $lte: tomorrowEnd },
+      isDemo: { $ne: true },
     }),
   ]);
 
@@ -342,6 +347,7 @@ async function getAlerts(
       bookingDate: { $gte: todayStart, $lte: todayEnd },
       status: "FAILED",
       isActive: { $ne: false },
+      isDemo: { $ne: true },
     });
     if (failedToday > 0) {
       out.push(
@@ -354,6 +360,7 @@ async function getAlerts(
     const expiringHolds = await SBTHotelBooking.find({
       status: "HELD",
       lastVoucherDate: { $gte: todayEnd, $lte: tomorrowEnd },
+      isDemo: { $ne: true },
     })
       .select("hotelName lastVoucherDate guests")
       .sort({ lastVoucherDate: 1 })
@@ -382,7 +389,7 @@ async function getAlerts(
 
   if (toggles.overdueInvoices) {
     const overdueAgg = await Invoice.aggregate([
-      { $match: { status: "SENT", dueDate: { $lt: sevenDaysAgo } } },
+      { $match: { status: "SENT", dueDate: { $lt: sevenDaysAgo }, isDemo: { $ne: true } } },
       { $group: { _id: null, count: { $sum: 1 }, total: { $sum: "$grandTotal" } } },
     ]);
     const count = overdueAgg[0]?.count ?? 0;
@@ -407,6 +414,7 @@ async function getLast7DayTrend(todayStr: string): Promise<TrendPoint[]> {
       $match: {
         bookingDate: { $gte: earliest, $lte: latest },
         isActive: { $ne: false },
+        isDemo: { $ne: true },
       },
     },
     {
