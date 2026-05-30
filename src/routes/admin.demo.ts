@@ -17,6 +17,7 @@ import { Types } from "mongoose";
 import { authenticate } from "../middleware/authenticate.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import User from "../models/User.js";
+import Customer from "../models/Customer.js";
 import DemoSession from "../models/DemoSession.js";
 import { signAccessToken } from "./auth.js";
 
@@ -229,6 +230,69 @@ router.post("/end-session", async (req: Request, res: Response) => {
       error: "internal_error",
       message: "Failed to end demo session.",
     });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /available-seeds                                               */
+/* Resolves the caller's demoAccess.mappedSeedUsers into a displayable*/
+/* list (email, name, customer name, role) for the top-bar picker.    */
+/* ------------------------------------------------------------------ */
+router.get("/available-seeds", async (req: Request, res: Response) => {
+  try {
+    const callerId = (req as any).user?.sub;
+    if (!callerId || !Types.ObjectId.isValid(String(callerId))) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+
+    const caller: any = await User.findById(callerId).lean();
+    if (!caller) return res.status(401).json({ error: "Caller not found" });
+
+    if (!caller.demoAccess?.enabled) {
+      return res.status(403).json({ error: "demo_access_not_granted" });
+    }
+
+    const mappedIds: any[] = caller.demoAccess.mappedSeedUsers || [];
+    if (mappedIds.length === 0) {
+      return res.json({ seeds: [] });
+    }
+
+    // Find demo users + their customers
+    const seedUsers: any[] = await User.find(
+      { _id: { $in: mappedIds }, isDemoUser: true },
+      { _id: 1, email: 1, name: 1, firstName: 1, lastName: 1, customerId: 1, accountType: 1, roles: 1 },
+    ).lean();
+
+    // Resolve customer names (avoid N+1 — single Customer.find)
+    const customerIds = [
+      ...new Set(seedUsers.map((u: any) => u.customerId).filter(Boolean)),
+    ];
+    const customers: any[] = await Customer.find(
+      { _id: { $in: customerIds } },
+      { _id: 1, name: 1 },
+    ).lean();
+    const customerNameMap = new Map(customers.map((c: any) => [String(c._id), c.name]));
+
+    const seeds = seedUsers.map((u: any) => ({
+      userId: String(u._id),
+      email: u.email,
+      name:
+        u.name ||
+        `${u.firstName ?? ""} ${u.lastName ?? ""}`.trim() ||
+        u.email,
+      customerId: u.customerId,
+      customerName: customerNameMap.get(String(u.customerId)) || "Unknown",
+      accountType: u.accountType,
+      role:
+        (u.roles || []).find((r: string) =>
+          ["WORKSPACE_LEADER", "APPROVER", "REQUESTER"].includes(r),
+        ) || "REQUESTER",
+    }));
+
+    return res.json({ seeds });
+  } catch (err: any) {
+    console.error("[available-seeds] error", err?.message || err);
+    return res.status(500).json({ error: "fetch_failed", message: err?.message });
   }
 });
 
