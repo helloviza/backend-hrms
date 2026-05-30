@@ -254,11 +254,25 @@ async function generateAndStoreRenderedPdf(args: {
   let pdfBuffer: Buffer;
   let renderedTemplateVersion: string;
 
-  if (VOUCHER_RENDER_VIA_LAMBDA) {
+  // Demo Platform — demo bookings MUST go through the SBT shared template path
+  // (the only one with watermark + disclaimer code). No fallback to pdfkit for
+  // demo bookings — better to fail loudly than ship a watermark-less sample PDF
+  // that could be mistaken for a real reservation.
+  const isDemo = !!record?.isDemo;
+
+  if (VOUCHER_RENDER_VIA_LAMBDA || isDemo) {
     try {
       pdfBuffer = await renderViaSbtLambda(record);
       renderedTemplateVersion = "v2-sbt";
     } catch (err: any) {
+      if (isDemo) {
+        logger.error("[voucher-render] SBT+Lambda failed for DEMO booking — refusing to fall back to pdfkit", {
+          recordId: String(record?._id),
+          docType: record?.docType,
+          message: err?.message,
+        });
+        throw err;
+      }
       logger.warn("[voucher-render] SBT+Lambda path failed; falling back to pdfkit", {
         recordId: String(record?._id),
         docType: record?.docType,
