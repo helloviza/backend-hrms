@@ -64,6 +64,7 @@ async function runHoldReminders() {
   const candidates = await SBTHotelBooking.find({
     status: "HELD",
     lastVoucherDate: { $gte: in1hFrom, $lte: in24hTo },
+    isDemo: { $ne: true },
   }).lean();
 
   for (const booking of candidates) {

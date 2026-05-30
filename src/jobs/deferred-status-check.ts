@@ -377,6 +377,7 @@ export async function runDeferredStatusCheckSweep(): Promise<void> {
   const due = await SBTHotelBooking.find({
     pendingStatusCheckAt: { $ne: null, $lte: now },
     statusCheckDone: false,
+    isDemo: { $ne: true },
   })
     .limit(50)
     .select({ _id: 1 })

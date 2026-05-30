@@ -55,6 +55,7 @@ export async function runOrphanPendingCleanup(): Promise<void> {
   const candidates = await SBTHotelBooking.find({
     status: "PENDING",
     createdAt: { $lt: cutoff },
+    isDemo: { $ne: true },
   }).lean();
 
   if (candidates.length === 0) {
