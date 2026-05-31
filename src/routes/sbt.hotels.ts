@@ -38,7 +38,6 @@ import {
 import { runDeferredStatusCheck } from "../jobs/deferred-status-check.js";
 import { BLOCKED_CORPORATE_PANS } from "../config/corporate-pan-blocklist.js";
 import { maybeRouteToDemoSimulator } from "../utils/demoSimulator.js";
-import { assertNotDemoTBO, tboBlockStatus } from "../utils/demoContext.js";
 
 // TBO cert Item 31 — TBO recommends ≥120s before calling GetBookingDetail.
 const DEFERRED_STATUS_CHECK_DELAY_MS = 120_000;
@@ -147,7 +146,7 @@ const getHotelBookingsHandler = async (req: any, res: any) => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Failed to list hotel bookings";
     sbtLogger.error("Hotel bookings list failed", { userId: req.user?.id, error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 };
 
@@ -169,7 +168,7 @@ router.get("/landing-config", requireSBT, async (_req: any, res: any) => {
     const promos = (Array.isArray(offers.hotel) ? offers.hotel : []).filter((o: any) => o?.enabled);
     res.json({ ok: true, enabled: cfg.enabled ?? true, mode: cfg.mode ?? "hybrid", promos });
   } catch (err: any) {
-    res.status(tboBlockStatus(err)).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -689,7 +688,7 @@ router.get("/cities", async (req: any, res: any) => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "City search failed";
     sbtLogger.error("Hotel city search failed", { error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -750,7 +749,7 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Hotel search failed";
     sbtLogger.error("Hotel search failed", { userId: req.user?.id, error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -785,7 +784,6 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
     const t0 = Date.now();
     const data = await withTBOSessionRetry(
       async (_tokenId) => {
-        assertNotDemoTBO("hotel:PreBook");
         const res = await fetch(
           "https://affiliate.tektravels.com/HotelAPI/PreBook",
           {
@@ -904,7 +902,7 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "PreBook failed";
     sbtLogger.error("Hotel prebook failed", { error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -1055,7 +1053,7 @@ router.post("/payment/create-order", requireAuth, async (req: any, res: any) => 
   } catch (err: unknown) {
     const msg =
       err instanceof Error ? err.message : "Payment order creation failed";
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -1093,7 +1091,7 @@ router.post("/payment/verify", requireAuth, async (req: any, res: any) => {
   } catch (err: unknown) {
     const msg =
       err instanceof Error ? err.message : "Payment verification failed";
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -1531,7 +1529,6 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         BookingId: bookingId,
       };
       const dt0 = Date.now();
-      assertNotDemoTBO("hotel:GetBookingDetail");
       const detailRes = await fetch(
         "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
         {
@@ -1814,7 +1811,6 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       const bookController = new AbortController();
       const bookTimer = setTimeout(() => bookController.abort(), 120_000);
       try {
-        assertNotDemoTBO("hotel:Book");
         const tboRes = await fetch(
           "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
           {
@@ -1851,7 +1847,6 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         const _srTimer = setTimeout(() => _srController.abort(), 120_000);
         const _srT0 = Date.now();
         try {
-          assertNotDemoTBO("hotel:Book");
           const _srRes = await fetch(
             "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
             {
@@ -1961,7 +1956,6 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             let retryData: any;
             try {
               const retryT0 = Date.now();
-              assertNotDemoTBO("hotel:Book");
               const retryRes = await fetch(
                 "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
                 {
@@ -2132,7 +2126,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         { $set: { status: "FAILED", failureReason: msg } },
       ).catch(() => {});
     }
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -2202,7 +2196,7 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
     res.json({ ok: true, voucherStatus: status, voucherData: voucherRes, voucherSummary: extractVoucherSummary(voucherRes) });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Voucher retrieval failed";
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -2489,7 +2483,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
     return res.status(502).json({ error: errMsg, voucherData: voucherRes });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Voucher generation failed";
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -2661,7 +2655,7 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
     res.json({ ok: true, booking: doc });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Failed to save hotel booking";
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -2738,7 +2732,7 @@ router.post("/bookings/check-status", requireAuth, async (req: any, res: any) =>
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Status check failed";
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -2764,7 +2758,6 @@ router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any
           BookingId: Number(doc.bookingId) || 0,
         };
         const t0 = Date.now();
-        assertNotDemoTBO("hotel:GetBookingDetail");
         const tboRes = await fetch(
           "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
           {
@@ -2807,7 +2800,7 @@ router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Sync failed";
     sbtLogger.error("Hotel sync all pending failed", { error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -2835,7 +2828,6 @@ router.post("/bookings/:id/sync-status", requireAuth, async (req: any, res: any)
       BookingId: Number(doc.bookingId) || 0,
     };
     const t0 = Date.now();
-    assertNotDemoTBO("hotel:GetBookingDetail");
     const tboRes = await fetch(
       "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
       {
@@ -2874,7 +2866,7 @@ router.post("/bookings/:id/sync-status", requireAuth, async (req: any, res: any)
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Status sync failed";
     sbtLogger.error("Hotel sync status failed", { bookingId: req.params.id, error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -2948,7 +2940,7 @@ router.post("/bookings/refund-orphaned", requireAdmin, async (req: any, res: any
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Refund operation failed";
     sbtLogger.error("Hotel refund orphaned failed", { error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -2980,7 +2972,7 @@ router.post("/bookings/:id/mark-failed", requireAdmin, async (req: any, res: any
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Mark failed operation failed";
     sbtLogger.error("Hotel mark failed error", { bookingId: req.params.id, error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -2994,7 +2986,7 @@ router.post("/admin/refresh-static-data", requireAdmin, async (_req: any, res: a
     res.json({ ok: true, ...result });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Static data refresh failed";
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -3061,7 +3053,7 @@ router.get("/bookings/:id/cancel-preview", requireSBT, async (req: any, res: any
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Preview failed";
     sbtLogger.error("Hotel cancel-preview error", { bookingId: req.params.id, error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -3089,7 +3081,6 @@ async function pollCancelStatusBackground(
       // sends NO body TokenId (an AIR-account TokenId is rejected as ErrorCode 6).
       const statusPayload = { BookingMode: 5, ChangeRequestId: changeRequestId, EndUserIp: endUserIp };
       const t1 = Date.now();
-      assertNotDemoTBO("hotel:GetChangeRequestStatus");
       const statusRes = await fetch(
         "https://HotelBE.tektravels.com/hotelservice.svc/rest/GetChangeRequestStatus",
         { method: "POST", headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() }, body: JSON.stringify(statusPayload) }
@@ -3176,7 +3167,6 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
       EndUserIp: endUserIp,
     };
     const t0 = Date.now();
-    assertNotDemoTBO("hotel:SendChangeRequest");
     const changeRes = await fetch(
       "https://HotelBE.tektravels.com/hotelservice.svc/rest/SendChangeRequest",
       {
@@ -3246,7 +3236,7 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Cancellation failed";
     sbtLogger.error("Hotel cancel failed", { bookingId: req.params.id, error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -3280,7 +3270,7 @@ router.post("/bookings/:id/close", requireSBT, async (req: any, res: any) => {
     return res.json({ ok: true });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Close failed";
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -3354,7 +3344,6 @@ router.get("/images", requireAuth, async (req: any, res: any) => {
     let data: any = {};
     try {
       const t0 = Date.now();
-      assertNotDemoTBO("hotel:HotelDetails");
       const tboRes = await fetch(
         "https://api.tbotechnology.in/TBOHolidays_HotelAPI/HotelDetails",
         {
@@ -3429,7 +3418,6 @@ router.get("/details", requireAuth, async (req: any, res: any) => {
     let data: any;
     try {
       const t0 = Date.now();
-      assertNotDemoTBO("hotel:HotelDetails");
       const tboRes = await fetch(
         "https://api.tbotechnology.in/TBOHolidays_HotelAPI/HotelDetails",
         {
@@ -3463,7 +3451,7 @@ router.get("/details", requireAuth, async (req: any, res: any) => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Hotel details failed";
     sbtLogger.error("Hotel details failed", { error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -3523,7 +3511,6 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
     let data: any;
     try {
       const t0 = Date.now();
-      assertNotDemoTBO("hotel:Search");
       const tboRes = await fetch("https://affiliate.tektravels.com/HotelAPI/Search", {
         method: "POST",
         headers: {
@@ -3591,7 +3578,7 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Room fetch failed";
     sbtLogger.error("Hotel rooms fetch failed", { error: msg });
-    res.status(tboBlockStatus(err)).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 

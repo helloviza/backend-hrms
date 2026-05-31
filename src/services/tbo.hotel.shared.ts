@@ -9,7 +9,6 @@
 import { logTBOCall } from "../utils/tboFileLogger.js";
 import { sbtLogger } from "../utils/logger.js";
 import { tboFetchFailed } from "../utils/tboFetchGuard.js";
-import { assertNotDemoTBO } from "../utils/demoContext.js";
 import {
   HOTEL_INDEX_CITIES as SHARED_HOTEL_INDEX_CITIES,
   HOTEL_CITIES as SHARED_HOTEL_CITIES,
@@ -157,8 +156,6 @@ export async function getCachedCountryList(): Promise<{ Code: string; Name: stri
   if (countryListCache.length > 0 && now - countryListCacheTime < COUNTRY_LIST_TTL) {
     return countryListCache;
   }
-  // Fail-closed for demo requests (boot/cron preloads run with no store → ok).
-  assertNotDemoTBO("hotel:CountryList");
   // TBO spec: CountryList is GET-only. POST returns 405 with plain text body
   // that crashes res.json(). Do not poison cache on failure — return last value
   // (or [] on cold start) so the caller can retry on the next request.
@@ -178,8 +175,6 @@ export async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
   const cached = cityCache.get(countryCode);
   if (cached && Date.now() - cached.ts < CITY_CACHE_TTL) return cached.data;
 
-  // Fail-closed for demo requests (boot/cron preloads run with no store → ok).
-  assertNotDemoTBO("hotel:CityList");
   const tboPayload = { CountryCode: countryCode };
   const t0 = Date.now();
   const res = await fetch(
@@ -220,8 +215,6 @@ export async function fetchHotelCodeList(
   cityCode: string,
   countryCode: string,
 ): Promise<HotelCodeEntry[]> {
-  // Fail-closed for demo requests (boot/cron preloads run with no store → ok).
-  assertNotDemoTBO("hotel:TBOHotelCodeList");
   const tboPayload = { CityCode: cityCode, CountryCode: countryCode };
   const t0 = Date.now();
   const res = await fetch(

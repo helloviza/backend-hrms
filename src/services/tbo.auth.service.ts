@@ -1,5 +1,4 @@
 import { logTBOCall } from "../utils/tboFileLogger.js";
-import { assertNotDemoTBO } from "../utils/demoContext.js";
 
 const TBO_SHARED_BASE =
   process.env.TBO_SHARED_BASE_URL ||
@@ -32,10 +31,6 @@ function getISTMidnightExpiry(): number {
 const MAX_TOKEN_AGE_MS = 20 * 60 * 1000;
 
 export async function getTBOToken(opts?: { forceRefresh?: boolean }): Promise<string> {
-  // Fail-closed: a demo request must never mint/refresh a TBO token, which would
-  // fire an outbound Authenticate call. Every flight service fn calls this first,
-  // so this also pre-empts the whole flight egress for demo users.
-  assertNotDemoTBO("tbo-auth:authenticate");
   const now = Date.now();
   const forceRefresh = opts?.forceRefresh === true;
   if (cache && cache.expiresAt > now && !forceRefresh) return cache.token;
@@ -117,8 +112,6 @@ export function clearTBOToken(): void {
 }
 
 export async function logoutTBO(): Promise<void> {
-  // Fail-closed: never fire an outbound Logout call for a demo request.
-  assertNotDemoTBO("tbo-auth:logout");
   if (!cache?.token) { cache = null; return; }
   try {
     const logoutPayload = {
@@ -160,10 +153,6 @@ export function getTBOTokenStatus(): {
 }
 
 export async function getAgencyBalance(): Promise<unknown> {
-  // Fail-closed: the wallet/agency-balance check must never hit TBO for a demo
-  // request. The wallet route also short-circuits demo upstream; this is the
-  // egress-layer backstop (getTBOToken below would already throw too).
-  assertNotDemoTBO("tbo-auth:agency-balance");
   const token = await getTBOToken();
   const balPayload = {
     ClientId: process.env.TBO_ClientId || "ApiIntegrationNew",
