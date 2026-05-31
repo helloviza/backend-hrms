@@ -31,6 +31,12 @@ async function requireSBT(req: any, res: any, next: any) {
 // GET /api/sbt/wallet/check?amount=XXXX
 router.get("/check", requireSBT, async (req: any, res: any) => {
   try {
+    console.log("[wallet-check-debug]", {
+      userKeys: Object.keys((req as any).user || {}),
+      isDemoUser: (req as any).user?.isDemoUser,
+      userId: (req as any).user?.sub || (req as any).user?._id,
+      hasJwt: !!(req as any).user,
+    });
     if ((req as any).user?.isDemoUser === true) {
       // Demo path — compute sufficiency from the workspace's own sbtOfficialBooking
       // config. Never calls TBO. Mirrors the real route's response shape exactly,
