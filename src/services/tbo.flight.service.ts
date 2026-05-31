@@ -1,6 +1,5 @@
 import { getTBOToken, getTokenAcquiredAt, clearTBOToken } from "./tbo.auth.service.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
-import { assertNotDemoTBO } from "../utils/demoContext.js";
 import { writeFile, mkdir } from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -154,12 +153,6 @@ const TIMEOUT = Number(process.env.TBO_HTTP_TIMEOUT_MS || 300_000);
 
 async function post(path: string, body: object, _retried = false, base = FLIGHT_BASE): Promise<unknown> {
   const method = path.replace(/^\//, ""); // "/FareQuote" → "FareQuote"
-  // Fail-closed: a demo request must never reach TBO. This single choke point
-  // covers every flight op (Search, FareQuote, FareRule, SSR, PriceRBD,
-  // GetCalendarFare, Book, Ticket, SendChangeRequest, GetCancellationCharges,
-  // ReleasePNRRequest, GetBookingDetails, TicketReIssue). Booking writes are
-  // already intercepted upstream by the demo simulator; this is the last line.
-  assertNotDemoTBO(`flight:${method}`);
   const traceId = (body as any)?.TraceId || undefined;
 
   const controller = new AbortController();

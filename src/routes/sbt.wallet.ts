@@ -76,12 +76,6 @@ router.get("/check", requireSBT, async (req: any, res: any) => {
       });
     }
 
-    // Demo Platform: demo/impersonation sessions must never hit TBO. Skip the agency-
-    // balance gate (live TBO call) and mirror simulateWalletDeduct: monthly-limit only.
-    if (req.user?.isDemoUser) {
-      return res.json({ sufficient: true, remaining: monthlyLimit - currentMonthSpend, demo: true });
-    }
-
     // 3. TBO agency balance check
     const balanceRes = (await getAgencyBalance()) as any;
     const cashBalance: number = balanceRes?.CashBalance ?? 0;
