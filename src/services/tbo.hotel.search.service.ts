@@ -29,6 +29,7 @@ import {
   applyMarginWithFloor,
 } from "../utils/margin.js";
 import { sbtLogger } from "../utils/logger.js";
+import { assertNotDemoTBO } from "../utils/demoContext.js";
 
 // Re-export the cityCache for backward compat if anything imports it from here.
 // Anything new should import directly from tbo.hotel.shared.
@@ -94,6 +95,11 @@ const ALLOWED_MEAL_TYPES = new Set([
 export async function searchHotels(
   input: HotelSearchInput,
 ): Promise<HotelSearchOutput | HotelSearchError> {
+  // Fail-closed: a demo request must never reach TBO hotel search. Asserted at
+  // the top so the direct-HotelCodes path (which skips the guarded helpers and
+  // goes straight to the inline /HotelAPI/Search fetch below) is also blocked.
+  // Covers both /api/sbt/hotels/search and the concierge hotel search.
+  assertNotDemoTBO("hotel:search");
   const {
     CityCode,
     CityName,

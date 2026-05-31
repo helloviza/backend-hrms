@@ -1,4 +1,5 @@
 import { logTBOCall } from "../utils/tboFileLogger.js";
+import { assertNotDemoTBO } from "../utils/demoContext.js";
 
 export interface VoucherPanPayload {
   isCorporate: boolean;
@@ -17,6 +18,8 @@ export type BookingDetailLookup =
  * Tries each mode in order and returns the first successful result.
  */
 export async function getBookingDetail(lookups: BookingDetailLookup[]): Promise<any> {
+  // Fail-closed: a demo request must never fetch live booking details from TBO.
+  assertNotDemoTBO("hotel:GetBookingDetail");
   const creds = Buffer.from(
     `${process.env.TBO_HOTEL_USERNAME}:${process.env.TBO_HOTEL_PASSWORD}`
   ).toString("base64");
@@ -65,6 +68,9 @@ export async function getBookingDetail(lookups: BookingDetailLookup[]): Promise<
 }
 
 export async function generateHotelVoucher(bookingId: number, panPayload?: VoucherPanPayload): Promise<any> {
+  // Fail-closed: never generate a live TBO voucher for a demo request (the
+  // generate-voucher route also short-circuits demo upstream).
+  assertNotDemoTBO("hotel:GenerateVoucher");
   const creds = Buffer.from(
     `${process.env.TBO_HOTEL_USERNAME}:${process.env.TBO_HOTEL_PASSWORD}`
   ).toString("base64");
