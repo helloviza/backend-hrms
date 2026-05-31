@@ -31,6 +31,57 @@ async function requireSBT(req: any, res: any, next: any) {
 // GET /api/sbt/wallet/check?amount=XXXX
 router.get("/check", requireSBT, async (req: any, res: any) => {
   try {
+    if ((req as any).user?.isDemoUser === true) {
+      // Demo path — compute sufficiency from the workspace's own sbtOfficialBooking
+      // config. Never calls TBO. Mirrors the real route's response shape exactly,
+      // except it skips the GetAgencyBalance (step 3) TBO egress.
+      const demoAmount = parseFloat(req.query.amount as string);
+      if (!demoAmount || demoAmount <= 0) {
+        return res.status(400).json({ error: "Invalid amount" });
+      }
+
+      const demoRoles = (req.user?.roles || []).map((r: string) => String(r).toUpperCase());
+      const demoIsAdminUser = demoRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR_ADMIN"].includes(r));
+
+      const demoWorkspace = await CustomerWorkspace.findById(req.workspaceObjectId).lean();
+      const demoOfficialBooking = (demoWorkspace as any)?.sbtOfficialBooking ?? {};
+
+      if (!demoIsAdminUser && !demoOfficialBooking?.enabled) {
+        return res.json({ sufficient: false, reason: "wallet_disabled" });
+      }
+
+      const demoMonthKey = new Date().toISOString().slice(0, 7); // "2026-03"
+      let demoCurrentMonthSpend = demoOfficialBooking.currentMonthSpend ?? 0;
+
+      if (demoOfficialBooking.lastResetMonth !== demoMonthKey) {
+        await CustomerWorkspace.findOneAndUpdate(
+          { _id: req.workspaceObjectId },
+          { $set: {
+            'sbtOfficialBooking.currentMonthSpend': 0,
+            'sbtOfficialBooking.lastResetMonth': demoMonthKey,
+          }},
+          { runValidators: false },
+        );
+        demoCurrentMonthSpend = 0;
+      }
+
+      const demoMonthlyLimit: number = demoOfficialBooking.monthlyLimit ?? 0;
+
+      if (demoMonthlyLimit > 0 && demoCurrentMonthSpend + demoAmount > demoMonthlyLimit) {
+        return res.json({
+          sufficient: false,
+          reason: "limit_exceeded",
+          bookingAmount: demoAmount,
+          currentSpend: demoCurrentMonthSpend,
+          limit: demoMonthlyLimit,
+          remaining: demoMonthlyLimit - demoCurrentMonthSpend,
+        });
+      }
+
+      // Demo path skips step 3 (TBO GetAgencyBalance). Treat as sufficient.
+      return res.json({ sufficient: true, bookingAmount: demoAmount, isDemo: true });
+    }
+
     const amount = parseFloat(req.query.amount as string);
     if (!amount || amount <= 0) {
       return res.status(400).json({ error: "Invalid amount" });
