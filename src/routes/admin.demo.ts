@@ -19,7 +19,12 @@ import { requireAdmin } from "../middleware/rbac.js";
 import User from "../models/User.js";
 import Customer from "../models/Customer.js";
 import DemoSession from "../models/DemoSession.js";
-import { signAccessToken } from "./auth.js";
+import {
+  signAccessToken,
+  signDemoRefresh,
+  setDemoRefreshCookie,
+  clearDemoRefreshCookie,
+} from "./auth.js";
 
 const router = Router();
 router.use(authenticate);
@@ -147,6 +152,25 @@ router.post("/start-session", async (req: Request, res: Response) => {
       demoImpersonation: true,
     });
 
+    // 11b. Demo refresh cookie — carries the same impersonation claims so a
+    //      proactive /auth/refresh re-mints a demo token instead of reverting
+    //      to the rep's real (SUPERADMIN) identity. 2h life bounds the window.
+    const demoRefreshToken = signDemoRefresh({
+      userId: String(target._id),
+      email: target.email,
+      roles: safeRoles,
+      workspaceId: isCustomer
+        ? undefined
+        : (target.workspaceId ? String(target.workspaceId) : undefined),
+      customerId: isCustomer && target.customerId ? String(target.customerId) : undefined,
+      businessId: isCustomer && target.customerId ? String(target.customerId) : undefined,
+      vendorId: undefined,
+      customerMemberRole: target.customerMemberRole
+        ? String(target.customerMemberRole)
+        : undefined,
+    });
+    setDemoRefreshCookie(res, demoRefreshToken);
+
     // 12. Write audit row
     const session = await DemoSession.create({
       callerUserId: caller._id,
@@ -213,6 +237,11 @@ router.post("/end-session", async (req: Request, res: Response) => {
     if (!ownerOk) {
       return res.status(403).json({ error: "not_session_owner" });
     }
+
+    // Demo Platform — clear the impersonation refresh cookie so subsequent
+    // /auth/refresh calls fall back to the rep's real refreshToken. Done for
+    // any legitimate owner, regardless of current session status.
+    clearDemoRefreshCookie(res);
 
     if (session.status !== "ACTIVE") {
       return res.status(400).json({ error: "already_ended" });

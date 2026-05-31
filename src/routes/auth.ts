@@ -35,6 +35,16 @@ const REFRESH_COOKIE_NAME = "refreshToken";
 // Access token cookie (read by approvals.ts extractTokenFromReq)
 const ACCESS_COOKIE_NAME = "hrms_accessToken";
 
+// Demo Platform — impersonation refresh cookie. Carries the same isDemoUser/
+// _demoImpersonation claims as the demo access token so /auth/refresh can
+// re-mint a demo token instead of reverting to the rep's real identity.
+const DEMO_REFRESH_COOKIE_NAME = "demoRefreshToken";
+
+// Demo session lifetime — bounds how long impersonation can be sustained via
+// the demoRefreshToken (cookie maxAge + JWT expiry kept in sync).
+const DEMO_REFRESH_EXPIRES_IN = "2h";
+const DEMO_REFRESH_MAXAGE_MS = 2 * 60 * 60 * 1000;
+
 const isProd = process.env.NODE_ENV === "production";
 
 /* ───────────────────────────────────────────────
@@ -159,6 +169,40 @@ function signRefresh(user: any) {
   });
 }
 
+// Demo Platform — refresh token that carries impersonation claims. Signed with
+// JWT_REFRESH_SECRET (same as the real refresh) but stores the full demo
+// identity so /auth/refresh can re-mint a demo access token WITHOUT re-running
+// buildAuthSafeUser (which would re-derive the target's real roles and could
+// re-add SUPERADMIN). 2h life bounds the impersonation window
+// (see DEMO_REFRESH_EXPIRES_IN).
+export function signDemoRefresh(claims: {
+  userId: string;
+  email: string;
+  roles: string[];
+  workspaceId?: string | null;
+  customerId?: string | null;
+  businessId?: string | null;
+  vendorId?: string | null;
+  customerMemberRole?: string | null;
+}) {
+  const payload: any = {
+    sub: String(claims.userId),
+    email: claims.email,
+    roles: Array.isArray(claims.roles) ? claims.roles : [],
+    isDemoUser: true,
+    demoImpersonation: true,
+  };
+  if (claims.workspaceId) payload.workspaceId = String(claims.workspaceId);
+  if (claims.customerId) payload.customerId = String(claims.customerId);
+  if (claims.businessId) payload.businessId = String(claims.businessId);
+  if (claims.vendorId) payload.vendorId = String(claims.vendorId);
+  if (claims.customerMemberRole)
+    payload.customerMemberRole = String(claims.customerMemberRole);
+  return jwt.sign(payload, safeEnv("JWT_REFRESH_SECRET"), {
+    expiresIn: DEMO_REFRESH_EXPIRES_IN,
+  });
+}
+
 function verifyRefresh(token: string) {
   return jwt.verify(token, safeEnv("JWT_REFRESH_SECRET"));
 }
@@ -182,6 +226,30 @@ function setRefreshCookie(res: any, refreshToken: string) {
 
 function clearRefreshCookie(res: any) {
   res.clearCookie(REFRESH_COOKIE_NAME, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
+    path: "/api/auth/refresh",
+    ...cookieDomainOption(),
+  });
+}
+
+// Demo Platform — demoRefreshToken cookie mirrors the real refresh cookie
+// (path/HttpOnly/Secure/SameSite/domain) exactly, except the name and a 2h
+// maxAge. Same path so it is sent to /api/auth/refresh and clearable elsewhere.
+export function setDemoRefreshCookie(res: any, demoRefreshToken: string) {
+  res.cookie(DEMO_REFRESH_COOKIE_NAME, demoRefreshToken, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
+    path: "/api/auth/refresh",
+    maxAge: DEMO_REFRESH_MAXAGE_MS,
+    ...cookieDomainOption(),
+  });
+}
+
+export function clearDemoRefreshCookie(res: any) {
+  res.clearCookie(DEMO_REFRESH_COOKIE_NAME, {
     httpOnly: true,
     secure: isProd,
     sameSite: isProd ? "none" : "lax",
@@ -934,6 +1002,36 @@ r.post("/login", loginLimiter, async (req, res) => {
  * ─────────────────────────────────────────────── */
 r.post("/refresh", async (req, res) => {
   try {
+    // Demo Platform — if an impersonation refresh cookie is present, re-mint a
+    // demo access token preserving the impersonation claims, so a proactive
+    // refresh never silently reverts to the rep's real (SUPERADMIN) identity.
+    // Falls through to the normal path unchanged if absent or invalid.
+    const demoRefresh =
+      (req.cookies && req.cookies[DEMO_REFRESH_COOKIE_NAME]) || null;
+    if (demoRefresh) {
+      try {
+        const dc: any = verifyRefresh(demoRefresh);
+        if (dc?.demoImpersonation === true) {
+          const demoAccessToken = signAccessToken({
+            userId: String(dc.sub),
+            email: dc.email,
+            roles: Array.isArray(dc.roles) ? dc.roles : [],
+            workspaceId: dc.workspaceId,
+            customerId: dc.customerId,
+            businessId: dc.businessId,
+            vendorId: dc.vendorId,
+            customerMemberRole: dc.customerMemberRole,
+            isDemoUser: true,
+            demoImpersonation: true,
+          });
+          setAccessCookie(res, demoAccessToken);
+          return res.json({ accessToken: demoAccessToken });
+        }
+      } catch {
+        // Invalid/expired demo refresh — fall through to the normal path.
+      }
+    }
+
     const token = (req.cookies && req.cookies[REFRESH_COOKIE_NAME]) || null;
     if (!token) return res.status(401).json({ error: "Missing refresh token" });
 
