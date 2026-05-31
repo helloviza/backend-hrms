@@ -7,6 +7,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
+import { tboBlockStatus } from "../utils/demoContext.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTRequest from "../models/SBTRequest.js";
 import SBTConfig from "../models/SBTConfig.js";
@@ -245,7 +246,7 @@ router.get("/airports", (req, res) => {
     res.json(matches.slice(0, 10));
   } catch (err: any) {
     sbtLogger.error("Airport search failed", { error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -256,7 +257,7 @@ router.get("/airlines", (_req, res) => {
     res.json(airlines);
   } catch (err: any) {
     sbtLogger.error("Airlines list failed", { error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -390,7 +391,7 @@ router.get("/logs/:traceId", requireAdmin, async (req: any, res: any) => {
     const logs = await listTBOLogs(traceId);
     res.json({ ok: true, traceId, count: logs.length, logs });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -473,7 +474,7 @@ router.post("/search-multi-city", requireSBT, requireFlightAccess, async (req: a
     res.json({ legs: legResults });
   } catch (err: any) {
     sbtLogger.error("Multi-city parallel search failed", { userId: req.user?.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -523,7 +524,7 @@ router.post("/calendar", requireSBT, requireFlightAccess, async (req: any, res: 
     res.json({ fareMap, month });
   } catch (err: any) {
     sbtLogger.error("Calendar fare fetch failed", { error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -655,7 +656,7 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
     res.json(result);
   } catch (err: any) {
     sbtLogger.error("Flight search failed", { userId: req.user?.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -708,7 +709,7 @@ router.post("/special-return-check", requireSBT, requireFlightAccess, async (req
     });
   } catch (err: any) {
     sbtLogger.error("Special return check failed", { error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -782,7 +783,7 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
       corporateBookingAllowed,
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -801,7 +802,7 @@ router.post("/price-rbd", requireAuth, requireSBT, async (req: any, res: any) =>
     res.json(result);
   } catch (err: any) {
     sbtLogger.error("[PRICE-RBD] error", { error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -826,7 +827,7 @@ router.post("/farerule", requireAuth, requireSBT, async (req: any, res: any) => 
     const result = await getFareRule(req.body);
     res.json(result);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -1023,7 +1024,7 @@ router.get("/booking/:id", requireAuth, requireSBT, async (req: any, res: any) =
     const result = await getBookingDetails({ bookingId: req.params.id });
     res.json(result);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -1052,7 +1053,7 @@ router.post("/ssr", requireSBT, async (req: any, res: any) => {
     const result = await getSSR(req.body);
     res.json(result);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -1564,7 +1565,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
       });
     }
     sbtLogger.error("[TICKET-LCC ERROR]", { error: err?.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -1577,7 +1578,7 @@ router.post("/release", requireAuth, requireSBT, async (req: any, res: any) => {
     const result = await releasePNR(body);
     res.json(result);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -1596,7 +1597,7 @@ router.get("/booking/pnr/:pnr", requireAuth, async (req: any, res: any) => {
     });
     res.json(result);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -1843,7 +1844,7 @@ router.get("/my-bookings", requireAuth, async (req: any, res: any) => {
     res.json({ ok: true, bookings: bookings.map(toCustomerSafeFlight) });
   } catch (err: any) {
     sbtLogger.error("my-bookings failed", { userId: req.user?.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -1886,7 +1887,7 @@ router.get("/bookings", requireSBT, async (req: any, res: any) => {
     res.json({ ok: true, bookings: bookingsWithReissue });
   } catch (err: any) {
     sbtLogger.error("Bookings list failed", { userId: req.user?.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -1932,7 +1933,7 @@ router.get("/bookings/fix-zero-fares", requireAuth, requireAdmin, async (req: an
 
     res.json({ ok: true, fixed, skipped, total: fixed + skipped });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -1947,7 +1948,7 @@ router.get("/bookings/orphaned", requireAuth, requireAdmin, async (_req: any, re
     }).sort({ createdAt: -1 }).lean();
     res.json({ ok: true, count: docs.length, bookings: docs });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -2027,7 +2028,7 @@ router.post("/bookings/refund-orphaned", requireAuth, requireAdmin, async (req: 
 
     res.json({ ok: true, refunded, failed, details });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -2040,7 +2041,7 @@ router.get("/bookings/:id", requireSBT, async (req: any, res: any) => {
     res.json({ ok: true, booking: doc });
   } catch (err: any) {
     sbtLogger.error("Booking detail failed", { userId: req.user?.id, bookingId: req.params.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -2116,7 +2117,7 @@ router.get("/bookings/:id/cancel-preview", requireAuth, requireSBT, async (req: 
     });
   } catch (err: any) {
     sbtLogger.error("Flight cancel-preview failed", { userId: req.user?.id, bookingId: req.params.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -2306,7 +2307,7 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     res.json({ ok: true, booking: doc });
   } catch (err: any) {
     sbtLogger.error("Booking cancel failed", { userId: req.user?.id, bookingId: req.params.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -2340,7 +2341,7 @@ router.get("/bookings/:id/reissue-charges", requireAuth, async (req: any, res: a
     });
   } catch (err: any) {
     sbtLogger.error("Reissue-charges failed", { bookingId: req.params.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -2623,7 +2624,7 @@ router.post("/bookings/:id/reissue-farequote", requireAuth, requireSBT, async (r
     return res.json({ fareQuoteResult, originalBooking: { pnr: booking.pnr, bookingId: booking.bookingId } });
   } catch (err: any) {
     sbtLogger.error("Reissue-farequote failed", { bookingId: req.params.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -2666,7 +2667,7 @@ router.get("/bookings/:id/reissue-preview", requireAuth, requireSBT, async (req:
     });
   } catch (err: any) {
     sbtLogger.error("Reissue-preview failed", { bookingId: req.params.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -2918,7 +2919,7 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, async (req: any, r
     return res.json({ ok: true, newBooking, originalBookingId: doc._id });
   } catch (err: any) {
     sbtLogger.error("Reissue failed", { bookingId: req.params.id, error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -3003,7 +3004,7 @@ router.get("/landing-config", requireAuth, async (_req: any, res: any) => {
     const promos = (Array.isArray(offers.flight) ? offers.flight : []).filter((o: any) => o?.enabled);
     res.json({ ok: true, enabled: cfg.enabled ?? true, mode: cfg.mode ?? "hybrid", promos });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 
@@ -3014,7 +3015,7 @@ router.get("/offer", async (_req: any, res: any) => {
     if (!doc) return res.json({ ok: true, enabled: false });
     res.json({ ok: true, ...((doc.value as any) ?? {}), enabled: (doc.value as any)?.enabled ?? false });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(tboBlockStatus(err)).json({ error: err.message });
   }
 });
 

@@ -1,6 +1,7 @@
 // apps/backend/src/middleware/auth.ts
 import type { Request, Response, NextFunction } from "express";
 import { verifyToken } from "../utils/jwt.js";
+import { runWithDemoContext } from "../utils/demoContext.js";
 
 function normBool(v: unknown): boolean {
   const s = String(v ?? "").trim().toLowerCase();
@@ -176,7 +177,15 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
       console.error("[SECURITY] DISABLE_AUTH=true is not allowed in production. Ignoring.");
     } else {
       attachDevUser(req);
-      return next();
+      // Establish the request-scoped demo context (dev users are never demo).
+      return runWithDemoContext(
+        {
+          isDemoUser: (req as any).user?.isDemoUser === true,
+          userId: (req as any).user?._id || (req as any).user?.sub,
+          sessionId: (req as any).user?.sessionId,
+        },
+        () => next(),
+      );
     }
   }
 
@@ -220,7 +229,17 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
     normalizeWorkspaceIds(merged);
 
     (req as any).user = merged;
-    return next();
+    // Establish the request-scoped demo context so every downstream TBO egress
+    // point (service-layer fetch many frames down) can fail-closed for demo
+    // users. No-op for real traffic.
+    return runWithDemoContext(
+      {
+        isDemoUser: merged.isDemoUser === true,
+        userId: merged._id || merged.sub,
+        sessionId: (merged as any).sessionId,
+      },
+      () => next(),
+    );
   } catch {
     return res.status(401).json({ error: "Invalid token" });
   }
