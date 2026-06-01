@@ -102,10 +102,14 @@ function fmtDate(d: Date | null | undefined): string {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ROUTE 15 — POST /website-capture  (PUBLIC — before requireAuth)
+// ROUTE 15 — POST /website-capture
+// Sits above the router-level requireHouse gate, so it carries its own
+// route-level requireHouse: this is an authenticated HOUSE-only write into
+// the global CRM leads collection. requireWorkspace (mount-level) has already
+// populated req.workspaceId by the time requireHouse runs here.
 // ═══════════════════════════════════════════════════════════════
 
-router.post("/website-capture", async (req, res) => {
+router.post("/website-capture", requireHouse, async (req, res) => {
   try {
     const ip: string = (req as any).ip || req.socket?.remoteAddress || "unknown";
     if (!checkRateLimit(ip)) {
