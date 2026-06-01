@@ -20,6 +20,10 @@ const router = express.Router();
 
 type AnyObj = Record<string, any>;
 
+// HOUSE (Plumtrips internal) workspace _id. Per-file literal — the repo has no
+// shared exported constant; this mirrors requireHouse.ts:7. NEVER write to it.
+const HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
+
 // ── Permission helpers ──────────────────────────────────────────
 
 function canWrite(access: string): boolean {
@@ -175,6 +179,81 @@ router.use(requireHouse);
 
 // ── Leads access gate (all routes below require leads module) ───
 router.use(requireLeadsAccess);
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTE 0 — GET /reps  (CRM reps for the Leads assignee filter)
+// ═══════════════════════════════════════════════════════════════
+// Returns HOUSE users who can act on leads, mirroring requireLeadsAccess
+// EXACTLY: role ∈ {ADMIN, SUPERADMIN} (implicit — they pass the gate with no
+// UserPermission row) OR a UserPermission with modules.leads.access ≠ NONE.
+// Restricted to active HOUSE employees (User.status ≠ INACTIVE).
+//
+// v1 KNOWN LIMITATION: historical assignees who have since lost CRM access are
+// NOT included — their existing leads remain in the data but won't appear as a
+// filter option. UserPermission.status (suspended/revoked) is intentionally
+// NOT special-cased in v1, matching the current gate which ignores it.
+router.get("/reps", async (_req, res) => {
+  try {
+    // Access arm. UserPermission stores workspaceId + userId as Strings, and
+    // userId === String(User._id) (the value requireLeadsAccess looks up).
+    const grants = await UserPermission.find({
+      workspaceId: HOUSE_WORKSPACE_ID,
+      universe: "STAFF",
+      // Positive, default-closed match. NOT { $ne: 'NONE' }: in MongoDB $ne
+      // matches missing fields, so absent leads.access would be pulled in —
+      // yet requireLeadsAccess coerces absent → 'NONE' → 403. This mirrors the
+      // gate: only an explicit READ/WRITE/FULL grant counts.
+      "modules.leads.access": { $in: ["READ", "WRITE", "FULL"] },
+    })
+      .select("userId")
+      .lean();
+
+    // Role arm. HOUSE ADMIN/SUPERADMIN pass the gate by role regardless of any
+    // UserPermission row, so they MUST be unioned in. User.workspaceId is an
+    // ObjectId — note the String-vs-ObjectId difference vs UserPermission.
+    const houseObjectId = new mongoose.Types.ObjectId(HOUSE_WORKSPACE_ID);
+    const roleReps = await User.find({
+      workspaceId: houseObjectId,
+      roles: { $in: ["ADMIN", "SUPERADMIN"] },
+    })
+      .select("_id")
+      .lean();
+
+    // Union of both arms (de-duped by id), then resolve against active HOUSE
+    // employees. The final User scope enforces HOUSE + status ≠ INACTIVE, so a
+    // granted-but-inactive or non-HOUSE id drops out here.
+    const union = new Map<string, mongoose.Types.ObjectId>();
+    for (const g of grants as any[]) {
+      const id = String(g.userId || "");
+      if (mongoose.isValidObjectId(id)) union.set(id, new mongoose.Types.ObjectId(id));
+    }
+    for (const u of roleReps as any[]) union.set(String(u._id), u._id);
+
+    const users = (await User.find({
+      workspaceId: houseObjectId,
+      _id: { $in: [...union.values()] },
+      status: { $ne: "INACTIVE" },
+    })
+      .select("_id name firstName lastName email")
+      .lean()) as any[];
+
+    const reps = users
+      .map((u) => ({
+        _id: String(u._id),
+        name:
+          (u.name && String(u.name).trim()) ||
+          `${u.firstName || ""} ${u.lastName || ""}`.trim() ||
+          (u.email ? String(u.email).trim() : ""),
+      }))
+      .filter((r) => r.name)
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    return res.json({ reps });
+  } catch (err) {
+    logger.error("leads GET /reps error", { err });
+    return res.status(500).json({ error: "Failed to load reps." });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════
 // ROUTE 1 — POST /  (create lead)
