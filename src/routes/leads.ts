@@ -11,6 +11,7 @@ import { UserPermission } from "../models/UserPermission.js";
 import User from "../models/User.js";
 import Task from "../models/Task.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireHouse } from "../middleware/requireHouse.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import logger from "../utils/logger.js";
@@ -161,6 +162,12 @@ router.post("/website-capture", async (req, res) => {
 
 // ── Auth gate (all routes below require authentication) ─────────
 router.use(requireAuth);
+
+// ── HOUSE gate (CRM is a Plumtrips HOUSE-only product) ──────────
+// Placed after the public /website-capture route above so that route stays
+// reachable; everything below is HOUSE-only. requireWorkspace runs at the
+// mount (server.ts) and populates req.workspaceId before this fires.
+router.use(requireHouse);
 
 // ── Leads access gate (all routes below require leads module) ───
 router.use(requireLeadsAccess);

@@ -6,6 +6,7 @@ import CRMCompany from "../models/CRMCompany.js";
 import Lead from "../models/Lead.js";
 import User from "../models/User.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireHouse } from "../middleware/requireHouse.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
@@ -30,6 +31,7 @@ function fmtDate(d: Date | null | undefined): string {
 }
 
 router.use(requireAuth);
+router.use(requireHouse); // CRM is a Plumtrips HOUSE-only product
 router.use(requireCRMAccess("crmContacts"));
 
 // ═══════════════════════════════════════════════════════════════

@@ -4,6 +4,7 @@ import ExcelJS from "exceljs";
 import CRMCompany from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireHouse } from "../middleware/requireHouse.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
 import logger from "../utils/logger.js";
 
@@ -26,6 +27,7 @@ function fmtDate(d: Date | null | undefined): string {
 }
 
 router.use(requireAuth);
+router.use(requireHouse); // CRM is a Plumtrips HOUSE-only product
 router.use(requireCRMAccess("crmCompanies"));
 
 // ═══════════════════════════════════════════════════════════════
