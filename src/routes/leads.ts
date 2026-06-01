@@ -839,6 +839,10 @@ router.put("/:id/stage", async (req, res) => {
       return res.status(400).json({ error: "nextFollowUpDate is required for follow_up stage." });
     }
 
+    if (stage === "follow_up" && (!note || !String(note).trim())) {
+      return res.status(400).json({ error: "A note is required when moving a lead to follow_up." });
+    }
+
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
 
