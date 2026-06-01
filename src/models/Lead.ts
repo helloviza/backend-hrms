@@ -61,6 +61,12 @@ export interface LeadDoc extends Document {
   convertedToContactId?: mongoose.Types.ObjectId | null;
   convertedToCompanyId?: mongoose.Types.ObjectId | null;
 
+  // Shared-company anchor. Points at the CRMCompany this lead belongs to so
+  // multiple contacts/leads at one company link to ONE record. Resolved on
+  // create/edit (and reused at win/convert). companyName stays denormalized
+  // for display/search/export. null for individuals / blank-company leads.
+  companyId?: mongoose.Types.ObjectId | null;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -113,6 +119,11 @@ const LeadSchema = new Schema<LeadDoc>(
       ref: "CRMCompany",
       default: null,
     },
+    companyId: {
+      type: Schema.Types.ObjectId,
+      ref: "CRMCompany",
+      default: null,
+    },
   },
   { timestamps: true }
 );
@@ -121,6 +132,7 @@ LeadSchema.index({ stage: 1 });
 LeadSchema.index({ assignedTo: 1 });
 LeadSchema.index({ source: 1 });
 LeadSchema.index({ createdAt: -1 });
+LeadSchema.index({ companyId: 1 });
 LeadSchema.index({ leadCode: 1 }, { unique: true, sparse: true });
 
 LeadSchema.pre("save", async function (next) {

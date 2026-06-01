@@ -5,6 +5,7 @@ import Lead, { LEAD_STAGES, LEAD_SOURCES } from "../models/Lead.js";
 import LeadActivity, { ACTIVITY_TYPES } from "../models/LeadActivity.js";
 import CRMCompany from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
+import { resolveOrCreateCompany } from "../utils/crmCompany.js";
 import type { LeadStage } from "../models/Lead.js";
 import type { ActivityType } from "../models/LeadActivity.js";
 import { UserPermission } from "../models/UserPermission.js";
@@ -152,11 +153,20 @@ router.post("/website-capture", requireHouse, async (req, res) => {
       .select("_id name")
       .lean()) as any;
 
+    // Anchor inbound leads on a shared company immediately (resolve-or-create).
+    const companyName = sanitize(company);
+    let companyId: mongoose.Types.ObjectId | null = null;
+    if (companyName) {
+      const co = await resolveOrCreateCompany({ name: companyName }, defaultRep?._id);
+      companyId = co?._id ?? null;
+    }
+
     const lead = await Lead.create({
       contactName: sanitize(name),
       contactPhone: sanitize(phone, 20),
       contactEmail: sanitize(email),
-      companyName: sanitize(company),
+      companyName,
+      companyId,
       notes: sanitize(message, 1000),
       source: (LEAD_SOURCES as readonly string[]).includes(source) ? source : "website",
       stage: "new",
@@ -298,15 +308,37 @@ router.post("/", async (req, res) => {
       (body.assignedToName && String(body.assignedToName).trim()) ||
       (await resolveUserName(String(assignedToId)));
 
+    const createdById = mongoose.isValidObjectId(userId(user))
+      ? new mongoose.Types.ObjectId(userId(user))
+      : undefined;
+
+    // Anchor on a shared company (resolve-or-create) for company-type leads with
+    // a non-blank name. companyId is set server-side, never trusted from the body.
+    const leadType = body.type === "individual" ? "individual" : "company";
+    let companyId: mongoose.Types.ObjectId | null = null;
+    if (leadType === "company" && body.companyName && String(body.companyName).trim()) {
+      const co = await resolveOrCreateCompany(
+        {
+          name: body.companyName,
+          industry: body.industry,
+          companySize: body.companySize,
+          location: body.location,
+          website: body.website,
+          gstin: body.gstin,
+        },
+        createdById
+      );
+      companyId = co?._id ?? null;
+    }
+
     const lead = await Lead.create({
       ...body,
       assignedTo: mongoose.isValidObjectId(assignedToId)
         ? new mongoose.Types.ObjectId(String(assignedToId))
         : undefined,
       assignedToName,
-      createdBy: mongoose.isValidObjectId(userId(user))
-        ? new mongoose.Types.ObjectId(userId(user))
-        : undefined,
+      companyId,
+      createdBy: createdById,
     });
 
     if (body.notes) {
@@ -796,6 +828,9 @@ router.put("/:id", async (req, res) => {
     const PROTECTED = new Set([
       "_id", "leadCode", "stage", "createdBy", "createdAt",
       "wonDate", "lostReason", "onboardingInviteSent",
+      // companyId is resolved server-side from companyName/type below — never
+      // accept it raw from the client.
+      "companyId",
     ]);
 
     const body = req.body as AnyObj;
@@ -804,6 +839,27 @@ router.put("/:id", async (req, res) => {
       if (!PROTECTED.has(key)) {
         (lead as any)[key] = body[key];
       }
+    }
+
+    // Re-anchor on the (post-edit) company. Null it when the lead is now an
+    // individual or its company name was cleared; otherwise resolve-or-create
+    // and re-point (handles a renamed company on the lead).
+    const companyName = String(lead.companyName || "").trim();
+    if (lead.type === "individual" || !companyName) {
+      lead.companyId = null;
+    } else {
+      const co = await resolveOrCreateCompany(
+        {
+          name: companyName,
+          industry: lead.industry,
+          companySize: lead.companySize,
+          location: lead.location,
+          website: lead.website,
+          gstin: lead.gstin,
+        },
+        lead.createdBy as mongoose.Types.ObjectId | undefined
+      );
+      lead.companyId = co?._id ?? null;
     }
 
     await lead.save();
@@ -1049,29 +1105,24 @@ router.post("/:id/win", async (req, res) => {
       createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
 
-    // Auto-create Company if companyName exists
+    // Resolve the anchor company: reuse the lead's existing companyId if set
+    // (never create a second company), else resolve-or-create from the name.
     let newCompany: any = null;
-    if (lead.companyName) {
-      const existingCompany = (await CRMCompany.findOne({
-        name: { $regex: new RegExp(`^${lead.companyName}$`, "i") },
-      }).lean()) as any;
-
-      if (!existingCompany) {
-        newCompany = await CRMCompany.create({
+    if (lead.companyId) {
+      newCompany = await CRMCompany.findById(lead.companyId);
+    }
+    if (!newCompany && lead.companyName && lead.companyName.trim()) {
+      newCompany = await resolveOrCreateCompany(
+        {
           name: lead.companyName,
-          industry: lead.industry || "",
-          companySize: lead.companySize || "",
-          city: lead.location || "",
-          phone: lead.contactPhone || "",
-          email: lead.contactEmail || "",
-          website: lead.website || "",
-          leadId: lead._id,
-          createdBy: createdById,
-          isPrivate: false,
-        });
-      } else {
-        newCompany = existingCompany;
-      }
+          industry: lead.industry,
+          companySize: lead.companySize,
+          location: lead.location,
+          website: lead.website,
+          gstin: lead.gstin,
+        },
+        createdById
+      );
     }
 
     // Auto-create Contact
@@ -1093,15 +1144,17 @@ router.post("/:id/win", async (req, res) => {
       status: "active",
     });
 
-    // Update lead with conversion references
+    // Update lead with conversion references. companyId and convertedToCompanyId
+    // are kept aligned on the same company.
     lead.convertedToContactId = newContact._id;
     lead.convertedToCompanyId = newCompany?._id || null;
+    if (newCompany?._id) lead.companyId = newCompany._id;
     await lead.save();
 
     await LeadActivity.create({
       leadId: lead._id,
       type: "invite_sent" as ActivityType,
-      note: `Auto-converted: Contact ${newContact.firstName} and Company ${newCompany?.name || "N/A"} created`,
+      note: `Auto-converted: Contact ${newContact.firstName} linked to Company ${newCompany?.name || "N/A"}`,
       createdBy: createdById,
       createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
@@ -1254,29 +1307,25 @@ router.post("/:id/convert", async (req, res) => {
       });
     }
 
+    // Reuse the lead's anchor company if already set (never create a second);
+    // else resolve-or-create from the chosen/lead name.
     let company: any = null;
     const targetCompanyName = String(companyName || lead.companyName || "").trim();
-    if (targetCompanyName) {
-      const escaped = targetCompanyName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const existing = (await CRMCompany.findOne({
-        name: { $regex: new RegExp(`^${escaped}$`, "i") },
-      }).lean()) as any;
-      if (existing) {
-        company = existing;
-      } else {
-        company = await CRMCompany.create({
+    if (lead.companyId) {
+      company = await CRMCompany.findById(lead.companyId);
+    }
+    if (!company && targetCompanyName) {
+      company = await resolveOrCreateCompany(
+        {
           name: targetCompanyName,
-          industry: lead.industry || "",
-          companySize: lead.companySize || "",
-          city: lead.location || "",
-          phone: lead.contactPhone || "",
-          email: lead.contactEmail || "",
-          website: lead.website || "",
-          leadId: lead._id,
-          createdBy: createdById,
-          isPrivate: false,
-        });
-      }
+          industry: lead.industry,
+          companySize: lead.companySize,
+          location: lead.location,
+          website: lead.website,
+          gstin: lead.gstin,
+        },
+        createdById
+      );
     }
 
     if (company && linkContactToCompany && !useExistingContactId) {
@@ -1287,6 +1336,7 @@ router.post("/:id/convert", async (req, res) => {
 
     lead.convertedToContactId = contact._id;
     lead.convertedToCompanyId = company?._id ?? null;
+    if (company?._id) lead.companyId = company._id;
     lead.stage = "won";
     lead.wonDate = new Date();
     await lead.save();
