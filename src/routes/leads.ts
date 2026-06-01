@@ -375,6 +375,90 @@ router.post("/", async (req, res) => {
 // ROUTE 2 — GET /  (list leads)
 // ═══════════════════════════════════════════════════════════════
 
+// ── Lead enrichment: last activity + temperature (additive, read-only) ──
+// Surfaced on the leads list so the redesigned cards can show "last activity"
+// and a hot/warm/cold dot WITHOUT a schema change. Existing response fields are
+// untouched; these are extra optional fields.
+const LATE_STAGES = new Set(["demo_scheduled", "proposal_sent", "negotiation"]);
+const ACTIVITY_LABELS: Record<string, string> = {
+  note: "Note added",
+  call: "Call logged",
+  email: "Email sent",
+  meeting: "Meeting",
+  stage_change: "Stage changed",
+  assignment: "Reassigned",
+  follow_up: "Follow-up set",
+  won: "Marked won",
+  lost: "Marked lost",
+  invite_sent: "Invite sent",
+};
+const DAY_MS = 86_400_000;
+
+// Deterministic temperature heuristic (see design.md):
+//   HOT  = overdue follow-up OR a fresh touch (≤3d) while in a late stage
+//   COLD = no touch in 14+ days (falls back to createdAt when no activity)
+//   WARM = everything else. HOT takes precedence over COLD.
+function computeTemperature(opts: {
+  stage: string;
+  nextFollowUpDate?: Date | null;
+  lastActivityAt?: Date | null;
+  createdAt: Date;
+  now: Date;
+}): "hot" | "warm" | "cold" {
+  const { stage, nextFollowUpDate, lastActivityAt, createdAt, now } = opts;
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const overdue =
+    !!nextFollowUpDate && nextFollowUpDate.getTime() < startOfToday.getTime();
+  const freshTouch =
+    !!lastActivityAt && now.getTime() - lastActivityAt.getTime() <= 3 * DAY_MS;
+  if (overdue || (freshTouch && LATE_STAGES.has(stage))) return "hot";
+  const lastTouch = lastActivityAt ?? createdAt;
+  if (now.getTime() - lastTouch.getTime() >= 14 * DAY_MS) return "cold";
+  return "warm";
+}
+
+async function enrichLeads(leads: any[]): Promise<any[]> {
+  if (!leads.length) return leads;
+  const ids = leads.map((l) => l._id);
+  // One grouped query → latest activity per lead (uses {leadId,createdAt} index).
+  const latest = await LeadActivity.aggregate([
+    { $match: { leadId: { $in: ids } } },
+    { $sort: { leadId: 1, createdAt: -1 } },
+    {
+      $group: {
+        _id: "$leadId",
+        at: { $first: "$createdAt" },
+        type: { $first: "$type" },
+        note: { $first: "$note" },
+      },
+    },
+  ]);
+  const byLead = new Map<string, any>(latest.map((a: any) => [String(a._id), a]));
+  const now = new Date();
+  return leads.map((l) => {
+    const a = byLead.get(String(l._id));
+    const lastActivityAt: Date | null = a?.at ?? null;
+    const lastActivityLabel = a
+      ? a.type === "note" && a.note
+        ? `Note: ${String(a.note).slice(0, 40)}`
+        : ACTIVITY_LABELS[a.type] || "Activity"
+      : null;
+    return {
+      ...l,
+      lastActivityAt,
+      lastActivityLabel,
+      temperature: computeTemperature({
+        stage: l.stage,
+        nextFollowUpDate: l.nextFollowUpDate ?? null,
+        lastActivityAt,
+        createdAt: l.createdAt,
+        now,
+      }),
+    };
+  });
+}
+
 router.get("/", async (req, res) => {
   try {
     const user = (req as any).user as AnyObj;
@@ -424,7 +508,9 @@ router.get("/", async (req, res) => {
       Lead.countDocuments(filter),
     ]);
 
-    return res.json({ leads, total, page, pages: Math.ceil(total / limit) });
+    const enriched = await enrichLeads(leads);
+
+    return res.json({ leads: enriched, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
     logger.error("leads GET / error", { err });
     return res.status(500).json({ error: "Failed to list leads." });
@@ -778,6 +864,125 @@ router.get("/counts-by-stage", async (_req, res) => {
   } catch (err) {
     logger.error("leads GET /counts-by-stage error", { err });
     return res.status(500).json({ error: "Failed to load stage counts." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTE 6d — GET /pipeline-summary  (read-only)
+// ═══════════════════════════════════════════════════════════════
+// Powers the pipeline KPI strip and rich kanban column headers. Per-stage
+// rollups { count, sumValue, followupsDue } plus board-level KPIs. HOUSE-gated
+// by the router-level requireHouse above. MUST stay ABOVE GET /:id, or Express
+// captures the literal path with the :id param route.
+//
+// NOTE: sumValue / openPipelineValue sum dealValue across mixed currencies
+// (INR/USD/AED) without conversion — this mirrors GET /reports/summary, which
+// the existing reports already do. The frontend renders these as INR-dominant.
+router.get("/pipeline-summary", async (_req, res) => {
+  try {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const weekAgo = new Date(now.getTime() - 7 * DAY_MS);
+    const CLOSED = ["won", "lost"];
+
+    const [
+      stageAgg,
+      dueAgg,
+      openAgg,
+      wonMonthAgg,
+      overdueFollowups,
+      // ── Trend inputs (real timestamps only — no fabrication) ──
+      activeAddedThisWeek, // leads created in the last 7 days, still open
+      wonThisMonthCount, // won/lost terminal events sourced from LeadActivity
+      lostThisMonthCount,
+      wonLastMonthCount,
+      lostLastMonthCount,
+    ] = await Promise.all([
+        // per-stage lead count + summed deal value
+        Lead.aggregate([
+          { $group: { _id: "$stage", count: { $sum: 1 }, sumValue: { $sum: "$dealValue" } } },
+        ]),
+        // per-stage follow-ups due (date set and not in the future)
+        Lead.aggregate([
+          { $match: { nextFollowUpDate: { $ne: null, $lte: now } } },
+          { $group: { _id: "$stage", due: { $sum: 1 } } },
+        ]),
+        // open pipeline: summed value + active count (everything except won/lost)
+        Lead.aggregate([
+          { $match: { stage: { $nin: CLOSED } } },
+          { $group: { _id: null, value: { $sum: "$dealValue" }, count: { $sum: 1 } } },
+        ]),
+        // won value this calendar month (by wonDate)
+        Lead.aggregate([
+          { $match: { stage: "won", wonDate: { $gte: startOfMonth } } },
+          { $group: { _id: null, value: { $sum: "$dealValue" } } },
+        ]),
+        // overdue follow-ups across open stages (strictly past due)
+        Lead.countDocuments({ stage: { $nin: CLOSED }, nextFollowUpDate: { $lt: now } }),
+        // trend inputs
+        Lead.countDocuments({ stage: { $nin: CLOSED }, createdAt: { $gte: weekAgo } }),
+        LeadActivity.countDocuments({ type: "won", createdAt: { $gte: startOfMonth } }),
+        LeadActivity.countDocuments({ type: "lost", createdAt: { $gte: startOfMonth } }),
+        LeadActivity.countDocuments({ type: "won", createdAt: { $gte: startOfLastMonth, $lt: startOfMonth } }),
+        LeadActivity.countDocuments({ type: "lost", createdAt: { $gte: startOfLastMonth, $lt: startOfMonth } }),
+      ]);
+
+    const byStage = Object.fromEntries((stageAgg as any[]).map((s) => [s._id, s]));
+    const dueByStage = Object.fromEntries((dueAgg as any[]).map((s) => [s._id, s.due]));
+
+    const perStage: Record<
+      string,
+      { count: number; sumValue: number; followupsDue: number }
+    > = {};
+    for (const stage of LEAD_STAGES) {
+      perStage[stage] = {
+        count: byStage[stage]?.count ?? 0,
+        sumValue: byStage[stage]?.sumValue ?? 0,
+        followupsDue: dueByStage[stage] ?? 0,
+      };
+    }
+
+    // All-time win rate (headline) from current stage distribution.
+    const wonAll = byStage.won?.count ?? 0;
+    const lostAll = byStage.lost?.count ?? 0;
+    const winRatePctCurrent =
+      wonAll + lostAll > 0 ? Math.round((wonAll / (wonAll + lostAll)) * 1000) / 10 : 0;
+
+    // Win-rate trend: this month vs last month, from terminal LeadActivity
+    // events. Null (→ no delta shown) when a month had no closes.
+    const wrThis =
+      wonThisMonthCount + lostThisMonthCount > 0
+        ? (wonThisMonthCount / (wonThisMonthCount + lostThisMonthCount)) * 100
+        : null;
+    const wrLast =
+      wonLastMonthCount + lostLastMonthCount > 0
+        ? (wonLastMonthCount / (wonLastMonthCount + lostLastMonthCount)) * 100
+        : null;
+    const winRateTrendPp =
+      wrThis !== null && wrLast !== null
+        ? Math.round((wrThis - wrLast) * 10) / 10
+        : null;
+
+    return res.json({
+      perStage,
+      kpis: {
+        openPipelineValue: openAgg[0]?.value ?? 0,
+        activeCount: openAgg[0]?.count ?? 0,
+        wonThisMonthValue: wonMonthAgg[0]?.value ?? 0,
+        overdueFollowups,
+      },
+      trends: {
+        winRatePctCurrent,
+        winRateTrendPp, // percentage points, this month vs last; null if undetermined
+        activeAddedThisWeek, // open leads created in the last 7 days
+        wonThisMonthCount,
+        wonLastMonthCount,
+      },
+    });
+  } catch (err) {
+    logger.error("leads GET /pipeline-summary error", { err });
+    return res.status(500).json({ error: "Failed to load pipeline summary." });
   }
 });
 
