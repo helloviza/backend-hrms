@@ -166,7 +166,24 @@ router.get("/", async (req, res) => {
       CRMCompany.countDocuments(filter),
     ]);
 
-    return res.json({ companies, total, page, pages: Math.ceil(total / limit) });
+    // contactCount computed-on-read for this page only — one grouped aggregation
+    // over the listed company ids; the stored field is never trusted.
+    const companyIds = companies.map((c: any) => c._id);
+    const countAgg = companyIds.length
+      ? await CRMContact.aggregate([
+          { $match: { companyId: { $in: companyIds } } },
+          { $group: { _id: "$companyId", count: { $sum: 1 } } },
+        ])
+      : [];
+    const countMap = new Map<string, number>(
+      countAgg.map((r: any) => [String(r._id), r.count])
+    );
+    const withCounts = companies.map((c: any) => ({
+      ...c,
+      contactCount: countMap.get(String(c._id)) || 0,
+    }));
+
+    return res.json({ companies: withCounts, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
     logger.error("crm.companies GET / error", { err });
     return res.status(500).json({ error: "Failed to list companies." });
@@ -190,7 +207,10 @@ router.get("/:id", async (req, res) => {
       .select("firstName lastName jobTitle phone email")
       .lean();
 
-    return res.json({ company, contacts });
+    // contactCount is computed-on-read — the stored field is never trusted.
+    const contactCount = await CRMContact.countDocuments({ companyId: company._id });
+
+    return res.json({ company: { ...company, contactCount }, contacts });
   } catch (err) {
     logger.error("crm.companies GET /:id error", { err });
     return res.status(500).json({ error: "Failed to get company." });
