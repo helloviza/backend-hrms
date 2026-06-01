@@ -567,6 +567,12 @@ router.get("/", async (req, res) => {
     }
     if (q.source) filter.source = q.source;
 
+    // Additive read filter — used by the lead form's CompanyPicker to count how
+    // many leads already exist for a picked canonical company (dedup context).
+    if (q.companyId && mongoose.isValidObjectId(String(q.companyId))) {
+      filter.companyId = new mongoose.Types.ObjectId(String(q.companyId));
+    }
+
     if (q.dateFrom || q.dateTo) {
       filter.createdAt = {};
       if (q.dateFrom) filter.createdAt.$gte = new Date(String(q.dateFrom));
