@@ -123,6 +123,90 @@ function fmtDate(d: Date | null | undefined): string {
   return `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
 }
 
+// ── Shared export filter resolver ───────────────────────────────
+// Lets the XLSX exports match the Owner-Status report's on-screen slice.
+// ADDITIVE + backward-compatible:
+//   • assignedTo / stage / source / type — optional multi-value lead filters
+//     (absent ⇒ no effect; existing callers pass none).
+//   • dateFrom / dateTo — when dateBasis="last_activity" the range is applied to
+//     last_activity_date = max(latest LeadActivity.createdAt, Lead.createdAt),
+//     matching the report. Otherwise (default) it stays on createdAt — the
+//     legacy behavior CRMDashboard's export relies on.
+//   • OWN scope is preserved and overrides any assignedTo param.
+// Read-only; no schema change.
+async function resolveExportLeads(
+  req: express.Request,
+  opts: { ignoreDateFilter?: boolean } = {}
+): Promise<any[]> {
+  const q = req.query as AnyObj;
+  const user = (req as any).user as AnyObj;
+  const leadsScope = (req as any).leadsScope as string;
+
+  const toArr = (v: unknown): string[] => {
+    if (v == null) return [];
+    const raw = Array.isArray(v) ? v : String(v).split(",");
+    return raw.map((s) => String(s).trim()).filter(Boolean);
+  };
+
+  const assignedToF = toArr(q.assignedTo).filter((s) => mongoose.isValidObjectId(s));
+  const stageF = toArr(q.stage).filter((s) => (LEAD_STAGES as readonly string[]).includes(s));
+  const sourceF = toArr(q.source);
+  const typeF = toArr(q.type).filter((s) => s === "company" || s === "individual");
+
+  const dateFrom = q.dateFrom ? new Date(String(q.dateFrom)) : null;
+  const dateTo = q.dateTo ? new Date(String(q.dateTo)) : null;
+  if (dateFrom && !isNaN(dateFrom.getTime())) dateFrom.setHours(0, 0, 0, 0);
+  if (dateTo && !isNaN(dateTo.getTime())) dateTo.setHours(23, 59, 59, 999);
+  const fromMs = dateFrom && !isNaN(dateFrom.getTime()) ? dateFrom.getTime() : null;
+  const toMs = dateTo && !isNaN(dateTo.getTime()) ? dateTo.getTime() : null;
+  const byActivity = String(q.dateBasis || "") === "last_activity";
+
+  const leadMatch: AnyObj = {};
+  // OWN scope wins over any assignedTo param.
+  if (leadsScope === "OWN") {
+    const uid = userId(user);
+    if (mongoose.isValidObjectId(uid)) leadMatch.assignedTo = new mongoose.Types.ObjectId(uid);
+  } else if (assignedToF.length) {
+    leadMatch.assignedTo = { $in: assignedToF.map((s) => new mongoose.Types.ObjectId(s)) };
+  }
+  if (stageF.length) leadMatch.stage = { $in: stageF };
+  if (sourceF.length) leadMatch.source = { $in: sourceF };
+  if (typeF.length) leadMatch.type = { $in: typeF };
+
+  // Legacy date basis (createdAt) — unchanged for existing callers.
+  // ignoreDateFilter ⇒ owner/status/source/type + OWN scope only (the activities
+  // export applies its date range to the activity's own createdAt instead).
+  if (!opts.ignoreDateFilter && !byActivity && (fromMs != null || toMs != null)) {
+    leadMatch.createdAt = {};
+    if (fromMs != null) leadMatch.createdAt.$gte = new Date(fromMs);
+    if (toMs != null) leadMatch.createdAt.$lte = new Date(toMs);
+  }
+
+  const leads = (await Lead.find(leadMatch).sort({ createdAt: -1 }).lean()) as any[];
+
+  // last_activity_date basis — compute + filter in memory (matches the report).
+  if (!opts.ignoreDateFilter && byActivity && (fromMs != null || toMs != null)) {
+    const ids = leads.map((l) => l._id);
+    const acts = ids.length
+      ? ((await LeadActivity.find({ leadId: { $in: ids } }).select("leadId createdAt").lean()) as any[])
+      : [];
+    const maxByLead = new Map<string, number>();
+    for (const a of acts) {
+      const k = String(a.leadId);
+      const t = new Date(a.createdAt).getTime();
+      if (t > (maxByLead.get(k) || 0)) maxByLead.set(k, t);
+    }
+    return leads.filter((l) => {
+      const last = Math.max(new Date(l.createdAt).getTime(), maxByLead.get(String(l._id)) || 0);
+      if (fromMs != null && last < fromMs) return false;
+      if (toMs != null && last > toMs) return false;
+      return true;
+    });
+  }
+
+  return leads;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // ROUTE 15 — POST /website-capture
 // Sits above the router-level requireHouse gate, so it carries its own
@@ -665,30 +749,297 @@ router.get("/reports/monthly", async (_req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// ROUTE 5b — GET /reports/owner-status  (Owner Wise Lead Status Report)
+// ═══════════════════════════════════════════════════════════════
+// Read-only. The snapshot is keyed on last_activity_date =
+//   max(latest LeadActivity.createdAt, Lead.createdAt)
+// which is computed per lead FIRST, then the date-range filter is applied to it
+// (the other filters are plain lead fields, matched in Mongo up front).
+// Optional multi-value params (comma-separated or repeated): dateFrom, dateTo
+// (on last_activity_date), assignedTo, stage, source, type.
+// Sits beside /reports/* so it inherits requireAuth + requireHouse + leads access.
+router.get("/reports/owner-status", async (req, res) => {
+  try {
+    const q = req.query as AnyObj;
+
+    const toArr = (v: unknown): string[] => {
+      if (v == null) return [];
+      const raw = Array.isArray(v) ? v : String(v).split(",");
+      return raw.map((s) => String(s).trim()).filter(Boolean);
+    };
+
+    const assignedToF = toArr(q.assignedTo).filter((s) => mongoose.isValidObjectId(s));
+    const stageF = toArr(q.stage).filter((s) => (LEAD_STAGES as readonly string[]).includes(s));
+    const sourceF = toArr(q.source);
+    const typeF = toArr(q.type).filter((s) => s === "company" || s === "individual");
+
+    const dateFrom = q.dateFrom ? new Date(String(q.dateFrom)) : null;
+    const dateTo = q.dateTo ? new Date(String(q.dateTo)) : null;
+    if (dateFrom && !isNaN(dateFrom.getTime())) dateFrom.setHours(0, 0, 0, 0);
+    if (dateTo && !isNaN(dateTo.getTime())) dateTo.setHours(23, 59, 59, 999);
+    const fromMs = dateFrom && !isNaN(dateFrom.getTime()) ? dateFrom.getTime() : null;
+    const toMs = dateTo && !isNaN(dateTo.getTime()) ? dateTo.getTime() : null;
+
+    // Lead-level filters (cheap, in Mongo). The date filter depends on activities
+    // and is therefore applied after last_activity_date is computed below.
+    const leadMatch: AnyObj = {};
+    if (assignedToF.length)
+      leadMatch.assignedTo = { $in: assignedToF.map((s) => new mongoose.Types.ObjectId(s)) };
+    if (stageF.length) leadMatch.stage = { $in: stageF };
+    if (sourceF.length) leadMatch.source = { $in: sourceF };
+    if (typeF.length) leadMatch.type = { $in: typeF };
+
+    const leads = (await Lead.find(leadMatch)
+      .select("_id assignedTo assignedToName stage source type dealValue currency createdAt")
+      .lean()) as any[];
+
+    const leadIds = leads.map((l) => l._id);
+    const activities = leadIds.length
+      ? ((await LeadActivity.find({ leadId: { $in: leadIds } })
+          .select("leadId type createdAt")
+          .lean()) as any[])
+      : [];
+
+    const actByLead = new Map<string, any[]>();
+    for (const a of activities) {
+      const k = String(a.leadId);
+      if (!actByLead.has(k)) actByLead.set(k, []);
+      actByLead.get(k)!.push(a);
+    }
+
+    const now = Date.now();
+    const DAY = 86400000;
+
+    // last_activity_date + lead age, then date-range filter on last_activity_date.
+    const scoped = leads
+      .map((l) => {
+        const acts = actByLead.get(String(l._id)) || [];
+        let lastAct = 0;
+        for (const a of acts) {
+          const t = new Date(a.createdAt).getTime();
+          if (t > lastAct) lastAct = t;
+        }
+        const created = new Date(l.createdAt).getTime();
+        return { ...l, _acts: acts, _lastActivity: Math.max(created, lastAct), _created: created };
+      })
+      .filter((l) => {
+        if (fromMs != null && l._lastActivity < fromMs) return false;
+        if (toMs != null && l._lastActivity > toMs) return false;
+        return true;
+      });
+
+    // ── Identity + constants ──
+    const ownerKey = (l: any) => (l.assignedTo ? String(l.assignedTo) : "unassigned");
+    const ownerLabel = (l: any) =>
+      (l.assignedToName && String(l.assignedToName).trim()) ||
+      (l.assignedTo ? "Unknown" : "Unassigned");
+    const STAGES = LEAD_STAGES as readonly string[];
+    const STAGE_LABEL: Record<string, string> = {
+      new: "New", contacted: "Contacted", demo_scheduled: "Demo Scheduled",
+      proposal_sent: "Proposal Sent", negotiation: "Negotiation", follow_up: "Follow Up",
+      won: "Won", lost: "Lost",
+    };
+    const isClosed = (s: string) => s === "won" || s === "lost";
+    const r1 = (n: number) => Math.round(n * 10) / 10;
+    const total = scoped.length;
+
+    // ── S1 — status snapshot ──
+    const statusCount: Record<string, number> = {};
+    for (const s of STAGES) statusCount[s] = 0;
+    for (const l of scoped) statusCount[l.stage] = (statusCount[l.stage] || 0) + 1;
+    const statusSnapshot = STAGES.map((s) => ({
+      stage: s, label: STAGE_LABEL[s], count: statusCount[s],
+      pct: total ? r1((statusCount[s] / total) * 100) : 0,
+    }));
+
+    // ── Owner buckets ──
+    const ownerMap = new Map<string, { ownerId: string; ownerName: string; leads: any[] }>();
+    for (const l of scoped) {
+      const k = ownerKey(l);
+      if (!ownerMap.has(k)) ownerMap.set(k, { ownerId: k, ownerName: ownerLabel(l), leads: [] });
+      ownerMap.get(k)!.leads.push(l);
+    }
+    const owners = [...ownerMap.values()].sort((a, b) => b.leads.length - a.leads.length);
+
+    // ── S2 — owner × status matrix ──
+    const ownerMatrix = {
+      stages: STAGES.map((s) => ({ key: s, label: STAGE_LABEL[s] })),
+      owners: owners.map((o) => {
+        const byStatus: Record<string, number> = {};
+        for (const s of STAGES) byStatus[s] = 0;
+        for (const l of o.leads) byStatus[l.stage]++;
+        return { ownerId: o.ownerId, ownerName: o.ownerName, total: o.leads.length, byStatus };
+      }),
+    };
+
+    // ── S3 — performance (conversion%, win% null-safe, avgAgeDays) ──
+    const performance = owners.map((o) => {
+      const t = o.leads.length;
+      const won = o.leads.filter((l) => l.stage === "won").length;
+      const lost = o.leads.filter((l) => l.stage === "lost").length;
+      const closed = won + lost;
+      const ageSum = o.leads.reduce((s, l) => s + Math.max(0, Math.floor((now - l._created) / DAY)), 0);
+      return {
+        ownerId: o.ownerId, ownerName: o.ownerName, total: t, won, lost, closed,
+        conversionPct: t ? r1((won / t) * 100) : 0,
+        winPct: closed ? r1((won / closed) * 100) : null, // null-safe: no closed deals yet
+        avgAgeDays: t ? Math.round(ageSum / t) : 0,
+      };
+    });
+
+    // ── S5 — ageing (OPEN leads, by days since last activity) ──
+    const BUCKETS = [
+      { key: "0-7", label: "0–7 days", min: 0, max: 7 },
+      { key: "8-14", label: "8–14 days", min: 8, max: 14 },
+      { key: "15-30", label: "15–30 days", min: 15, max: 30 },
+      { key: "31-60", label: "31–60 days", min: 31, max: 60 },
+      { key: "60+", label: "60+ days", min: 61, max: Infinity },
+    ];
+    const daysSinceAct = (l: any) => Math.max(0, Math.floor((now - l._lastActivity) / DAY));
+    const bucketOf = (d: number) => BUCKETS.find((b) => d >= b.min && d <= b.max)!.key;
+    const openLeads = scoped.filter((l) => !isClosed(l.stage));
+    const openTotal = openLeads.length;
+    const ageingCount: Record<string, number> = {};
+    for (const b of BUCKETS) ageingCount[b.key] = 0;
+    for (const l of openLeads) ageingCount[bucketOf(daysSinceAct(l))]++;
+    const ageing = {
+      openTotal,
+      buckets: BUCKETS.map((b) => ({
+        key: b.key, label: b.label, count: ageingCount[b.key],
+        pct: openTotal ? r1((ageingCount[b.key] / openTotal) * 100) : 0,
+      })),
+      byOwner: owners.map((o) => {
+        const open = o.leads.filter((l) => !isClosed(l.stage));
+        const bc: Record<string, number> = {};
+        for (const b of BUCKETS) bc[b.key] = 0;
+        for (const l of open) bc[bucketOf(daysSinceAct(l))]++;
+        const ot = open.length;
+        const bp: Record<string, number> = {};
+        for (const b of BUCKETS) bp[b.key] = ot ? r1((bc[b.key] / ot) * 100) : 0;
+        return { ownerId: o.ownerId, ownerName: o.ownerName, total: ot, buckets: bc, bucketPct: bp };
+      }),
+    };
+
+    // ── S6 — stale (OPEN, days since last activity ≥ 14; critical ≥ 30) ──
+    const STALE_DAYS = 14;
+    const CRIT_DAYS = 30;
+    let totalStale = 0;
+    let totalPotential = 0;
+    const staleByOwner = owners
+      .map((o) => {
+        const staleLeads = o.leads.filter((l) => !isClosed(l.stage) && daysSinceAct(l) >= STALE_DAYS);
+        const potentialValue = staleLeads.reduce((s, l) => s + (Number(l.dealValue) || 0), 0);
+        const criticalCount = staleLeads.filter((l) => daysSinceAct(l) >= CRIT_DAYS).length;
+        totalStale += staleLeads.length;
+        totalPotential += potentialValue;
+        return {
+          ownerId: o.ownerId, ownerName: o.ownerName, count: staleLeads.length,
+          potentialValue, criticalCount, critical: criticalCount > 0,
+        };
+      })
+      .filter((o) => o.count > 0)
+      .sort((a, b) => b.count - a.count);
+    const stale = {
+      thresholdDays: STALE_DAYS, criticalDays: CRIT_DAYS,
+      totalStale, totalPotentialValue: totalPotential, byOwner: staleByOwner,
+    };
+
+    // ── S7 — pipeline value by owner (OPEN leads) ──
+    let totalPipeline = 0;
+    let anyValue = false;
+    const pipelineByOwner = owners
+      .map((o) => {
+        const open = o.leads.filter((l) => !isClosed(l.stage));
+        const pipelineValue = open.reduce((s, l) => s + (Number(l.dealValue) || 0), 0);
+        const valuedLeads = open.filter((l) => (Number(l.dealValue) || 0) > 0).length;
+        if (pipelineValue > 0) anyValue = true;
+        totalPipeline += pipelineValue;
+        return {
+          ownerId: o.ownerId, ownerName: o.ownerName,
+          openLeads: open.length, pipelineValue, valuedLeads,
+        };
+      })
+      .sort((a, b) => b.pipelineValue - a.pipelineValue);
+    const pipeline = { totalPipelineValue: totalPipeline, hasAnyValue: anyValue, byOwner: pipelineByOwner };
+
+    // ── S8 — activity effectiveness (attributed to the lead's owner) ──
+    // Counts activities DONE IN THE PERIOD: each activity is included only when
+    // its own createdAt falls in [dateFrom, dateTo] (when a range is set), scoped
+    // to the report's leads. Not "all activities of snapshot leads".
+    const INTERACTION_TYPES = ["call", "email", "meeting", "note", "follow_up"];
+    const TYPE_LABEL: Record<string, string> = {
+      call: "Calls", email: "Emails", meeting: "Meetings", note: "Notes", follow_up: "Follow-ups",
+    };
+    const typeTotals: Record<string, number> = {};
+    for (const t of INTERACTION_TYPES) typeTotals[t] = 0;
+    const actByOwner = new Map<string, Record<string, number>>();
+    for (const o of owners) {
+      const m: Record<string, number> = {};
+      for (const t of INTERACTION_TYPES) m[t] = 0;
+      actByOwner.set(o.ownerId, m);
+    }
+    for (const l of scoped) {
+      const m = actByOwner.get(ownerKey(l));
+      for (const a of l._acts) {
+        const at = new Date(a.createdAt).getTime();
+        if (fromMs != null && at < fromMs) continue;
+        if (toMs != null && at > toMs) continue;
+        if (INTERACTION_TYPES.includes(a.type)) {
+          typeTotals[a.type]++;
+          if (m) m[a.type]++;
+        }
+      }
+    }
+    const activityEffectiveness = {
+      types: INTERACTION_TYPES.map((t) => ({ key: t, label: TYPE_LABEL[t] })),
+      presentTypes: INTERACTION_TYPES.filter((t) => typeTotals[t] > 0).map((t) => ({
+        key: t, label: TYPE_LABEL[t], count: typeTotals[t],
+      })),
+      absentTypes: INTERACTION_TYPES.filter((t) => typeTotals[t] === 0).map((t) => ({
+        key: t, label: TYPE_LABEL[t],
+      })),
+      byOwner: owners.map((o) => {
+        const counts = actByOwner.get(o.ownerId)!;
+        const won = o.leads.filter((l) => l.stage === "won").length;
+        return {
+          ownerId: o.ownerId, ownerName: o.ownerName, activityCounts: counts,
+          totalActivities: INTERACTION_TYPES.reduce((s, k) => s + counts[k], 0),
+          conversionPct: o.leads.length ? r1((won / o.leads.length) * 100) : 0,
+        };
+      }),
+    };
+
+    return res.json({
+      generatedAt: new Date().toISOString(),
+      filters: {
+        dateFrom: fromMs != null ? new Date(fromMs).toISOString() : null,
+        dateTo: toMs != null ? new Date(toMs).toISOString() : null,
+        assignedTo: assignedToF, stage: stageF, source: sourceF, type: typeF,
+      },
+      totals: { totalLeads: total, byStatus: statusCount },
+      statusSnapshot,
+      ownerMatrix,
+      performance,
+      ageing,
+      stale,
+      pipeline,
+      activityEffectiveness,
+    });
+  } catch (err) {
+    logger.error("leads GET /reports/owner-status error", { err });
+    return res.status(500).json({ error: "Failed to load owner-status report." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // ROUTE 6 — GET /export  (XLSX)
 // ═══════════════════════════════════════════════════════════════
 
 router.get("/export", async (req, res) => {
   try {
-    const user = (req as any).user as AnyObj;
-    const leadsScope = (req as any).leadsScope as string;
-    const q = req.query as AnyObj;
-    const filter: AnyObj = {};
-
-    if (leadsScope === "OWN") {
-      const uid = userId(user);
-      if (mongoose.isValidObjectId(uid)) {
-        filter.assignedTo = new mongoose.Types.ObjectId(uid);
-      }
-    }
-
-    if (q.dateFrom || q.dateTo) {
-      filter.createdAt = {};
-      if (q.dateFrom) filter.createdAt.$gte = new Date(String(q.dateFrom));
-      if (q.dateTo) filter.createdAt.$lte = new Date(String(q.dateTo));
-    }
-
-    const leads = await Lead.find(filter).sort({ createdAt: -1 }).limit(5000).lean();
+    // Shared resolver: OWN scope + optional assignedTo/stage/source/type and a
+    // createdAt (default) or last_activity_date (dateBasis=last_activity) range.
+    const leads = (await resolveExportLeads(req)).slice(0, 5000);
 
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet("Leads");
@@ -751,11 +1102,40 @@ router.get("/export", async (req, res) => {
 // ROUTE 6b — GET /export/activities  (XLSX — all activities)
 // ═══════════════════════════════════════════════════════════════
 
-router.get("/export/activities", async (_req, res) => {
+router.get("/export/activities", async (req, res) => {
   try {
-    const activities = await LeadActivity.find({})
-      .sort({ createdAt: -1 })
-      .lean();
+    // When any report filter is present, return activities whose OWN createdAt is
+    // in the date range, scoped to leads matching owner/status/source/type (the
+    // lead's last_activity is NOT used to gate activities here). With NO params it
+    // stays "all activities" — unchanged behavior for existing callers.
+    const q = req.query as AnyObj;
+    const hasFilter = !!(q.assignedTo || q.stage || q.source || q.type || q.dateFrom || q.dateTo);
+
+    let activities: any[];
+    if (hasFilter) {
+      // Lead scope: owner/status/source/type + OWN only — no date gating on leads.
+      const scopedLeads = await resolveExportLeads(req, { ignoreDateFilter: true });
+      const scopedIds = scopedLeads.map((l) => l._id);
+
+      // Date range applied to each activity's own createdAt.
+      const aFrom = q.dateFrom ? new Date(String(q.dateFrom)) : null;
+      const aTo = q.dateTo ? new Date(String(q.dateTo)) : null;
+      if (aFrom && !isNaN(aFrom.getTime())) aFrom.setHours(0, 0, 0, 0);
+      if (aTo && !isNaN(aTo.getTime())) aTo.setHours(23, 59, 59, 999);
+
+      const actFilter: AnyObj = { leadId: { $in: scopedIds } };
+      if ((aFrom && !isNaN(aFrom.getTime())) || (aTo && !isNaN(aTo.getTime()))) {
+        actFilter.createdAt = {};
+        if (aFrom && !isNaN(aFrom.getTime())) actFilter.createdAt.$gte = aFrom;
+        if (aTo && !isNaN(aTo.getTime())) actFilter.createdAt.$lte = aTo;
+      }
+
+      activities = scopedIds.length
+        ? ((await LeadActivity.find(actFilter).sort({ createdAt: -1 }).lean()) as any[])
+        : [];
+    } else {
+      activities = (await LeadActivity.find({}).sort({ createdAt: -1 }).lean()) as any[];
+    }
 
     const leadIds = [...new Set(activities.map((a: any) => a.leadId?.toString()).filter(Boolean))];
 
