@@ -34,6 +34,23 @@ function userId(user: AnyObj): string {
   return String(user.id || user.sub || "");
 }
 
+/** Resolve a user's display name for `assignedToName` via DB lookup, with the
+ *  same fallback chain used by the assign route. Returns "" when the id is
+ *  invalid or the user is missing — callers keep the id regardless.
+ *  IMPORTANT: assignedToName must be resolved from the DB, NOT from the JWT
+ *  payload's `user.name`. The token carries no name, so trusting it stored an
+ *  empty owner label on every self-created lead (the bug this fixes). */
+async function resolveUserName(uid: string): Promise<string> {
+  if (!mongoose.isValidObjectId(uid)) return "";
+  const u = (await User.findById(uid).select("name firstName lastName email").lean()) as any;
+  if (!u) return "";
+  return (
+    (u.name && String(u.name).trim()) ||
+    `${u.firstName || ""} ${u.lastName || ""}`.trim() ||
+    (u.email ? String(u.email).trim() : "")
+  );
+}
+
 // ── requireLeadsAccess ──────────────────────────────────────────
 
 async function requireLeadsAccess(
@@ -273,12 +290,13 @@ router.post("/", async (req, res) => {
     }
 
     const assignedToId = body.assignedTo || userId(user);
-    let assignedToName = body.assignedToName || user.name || "";
-
-    if (body.assignedTo && body.assignedTo !== userId(user)) {
-      const rep = (await User.findById(body.assignedTo).select("name").lean()) as any;
-      if (rep) assignedToName = rep.name || "";
-    }
+    // Resolve the owner label from the assignee id via DB lookup — one path for
+    // both the self-assign default and an explicitly-passed rep. A caller-
+    // supplied assignedToName is honored as-is; otherwise we resolve from the
+    // DB (never from user.name — see resolveUserName).
+    const assignedToName =
+      (body.assignedToName && String(body.assignedToName).trim()) ||
+      (await resolveUserName(String(assignedToId)));
 
     const lead = await Lead.create({
       ...body,
