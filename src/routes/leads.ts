@@ -581,7 +581,7 @@ router.get("/export", async (req, res) => {
       "Location", "Contact Name", "Contact Phone", "Contact Email",
       "Designation", "Source", "Stage", "Budget", "Deal Value", "Currency",
       "Assigned To", "Next Follow Up", "Lost Reason", "Won Date",
-      "Invite Sent", "Created At", "Notes",
+      "Created At", "Notes",
     ];
 
     const headerRow = sheet.addRow(columns);
@@ -589,7 +589,7 @@ router.get("/export", async (req, res) => {
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF00477F" } };
     headerRow.alignment = { vertical: "middle" };
 
-    const colWidths = [14, 10, 22, 18, 12, 16, 20, 16, 24, 16, 12, 14, 12, 12, 10, 18, 16, 20, 14, 12, 18, 30];
+    const colWidths = [14, 10, 22, 18, 12, 16, 20, 16, 24, 16, 12, 14, 12, 12, 10, 18, 16, 20, 14, 18, 30];
     colWidths.forEach((w, i) => { sheet.getColumn(i + 1).width = w; });
 
     for (const l of leads as any[]) {
@@ -613,7 +613,6 @@ router.get("/export", async (req, res) => {
         fmtDate(l.nextFollowUpDate),
         l.lostReason || "",
         fmtDate(l.wonDate),
-        l.onboardingInviteSent ? "Yes" : "No",
         fmtDate(l.createdAt),
         l.notes || "",
       ]);
@@ -1031,24 +1030,10 @@ router.post("/:id/win", async (req, res) => {
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
 
-    const { sendInvite = false, contactEmail } = req.body as AnyObj;
-    const inviteEmail: string = contactEmail || lead.contactEmail || "";
-
-    if (sendInvite && !inviteEmail) {
-      return res.status(400).json({ error: "Email required to send invite." });
-    }
-
     const user = (req as any).user as AnyObj;
 
     lead.stage = "won";
     lead.wonDate = new Date();
-
-    if (sendInvite && inviteEmail) {
-      const existing = lead.notes || "";
-      lead.notes = existing.length > 0
-        ? `${existing}\n[INVITE PENDING: ${inviteEmail}]`
-        : `[INVITE PENDING: ${inviteEmail}]`;
-    }
 
     await lead.save();
 
@@ -1063,16 +1048,6 @@ router.post("/:id/win", async (req, res) => {
       createdBy: createdById,
       createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
-
-    if (sendInvite && inviteEmail) {
-      await LeadActivity.create({
-        leadId: lead._id,
-        type: "invite_sent" as ActivityType,
-        note: `Onboarding invite pending for ${inviteEmail}. SuperAdmin can send from Onboarding module.`,
-        createdBy: createdById,
-        createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
-      });
-    }
 
     // Auto-create Company if companyName exists
     let newCompany: any = null;
