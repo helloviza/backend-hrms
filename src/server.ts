@@ -543,6 +543,7 @@ import ticketsConsoleRouter from "./routes/tickets.console.js";
 import emailTemplatesRouter from "./routes/emailTemplates.js";
 // Invoices, Reports, Company Settings (admin-only via router-level requireAdmin)
 import invoicesRouter, { workspaceRouter as invoicesWorkspaceRouter } from "./routes/invoices.js";
+import creditNotesAdminRouter, { workspaceRouter as creditNotesWorkspaceRouter } from "./routes/creditNotes.js";
 import reportsRouter from "./routes/reports.js";
 import companySettingsRouter from "./routes/companySettings.js";
 // Billing Permissions (Super Admin grant/revoke + my-access for all users)
@@ -557,6 +558,9 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/admin/email-templates", emailTemplatesRouter);
   app.use("/api/invoices/workspace", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), invoicesWorkspaceRouter);
   app.use("/api/admin/invoices", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), invoicesRouter);
+  // Credit Notes — child of the invoice surface; reuse the invoicesEnabled feature flag.
+  app.use("/api/credit-notes/workspace", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), creditNotesWorkspaceRouter);
+  app.use("/api/admin/credit-notes", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), creditNotesAdminRouter);
   app.use("/api/admin/reports", reportsRouter);
   app.use("/api/admin/company-settings", companySettingsRouter);
   app.use("/api/billing-permissions", billingPermissionsRouter);
