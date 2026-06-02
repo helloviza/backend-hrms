@@ -1,5 +1,6 @@
 // apps/backend/src/utils/s3Upload.ts
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import crypto from "crypto";
 import { env } from "../config/env.js";
 
@@ -77,4 +78,35 @@ export async function uploadLogoToS3(opts: {
   );
 
   return { key, url: buildPublicUrl(bucket, key) };
+}
+
+/**
+ * Upload a PDF buffer to S3 and return a presigned, inline-disposition URL.
+ * Generic helper extracted from the inline copies in invoices.ts / creditNotes.ts.
+ * Defaults to a 1-hour TTL; override via options.expiresIn (seconds).
+ */
+export async function uploadAndPresign(
+  key: string,
+  body: Buffer,
+  filename: string,
+  options?: { expiresIn?: number },
+): Promise<string> {
+  const expiresIn = options?.expiresIn ?? 3600;
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: env.S3_BUCKET,
+      Key: key,
+      Body: body,
+      ContentType: "application/pdf",
+    }),
+  );
+  return getSignedUrl(
+    s3,
+    new GetObjectCommand({
+      Bucket: env.S3_BUCKET,
+      Key: key,
+      ResponseContentDisposition: `inline; filename="${filename}"`,
+    }),
+    { expiresIn },
+  );
 }

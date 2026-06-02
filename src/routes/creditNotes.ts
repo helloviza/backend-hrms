@@ -1,8 +1,6 @@
 import express from "express";
 import ExcelJS from "exceljs";
 import mongoose from "mongoose";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import { requirePermission } from "../middleware/requirePermission.js";
@@ -13,7 +11,8 @@ import Invoice from "../models/Invoice.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { calculateGSTAmounts, type GSTType } from "../utils/gstDetection.js";
-import { env } from "../config/env.js";
+import { uploadAndPresign } from "../utils/s3Upload.js";
+import { generateCreditNotePdf } from "../utils/creditNotePdf.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 
 /* ── Shared helpers ──────────────────────────────────────────────── */
@@ -37,37 +36,30 @@ const GST_REASON_TEXT: Record<string, string> = {
   "07": "Others",
 };
 
-// Render + upload a PDF to S3 and return a presigned inline URL (1h). Mirrors the
-// inline S3 mechanism in invoices.ts POST /:id/pdf — no shared util exists.
-async function uploadAndPresign(key: string, body: Buffer, filename: string): Promise<string> {
-  const s3 = new S3Client({
-    region: env.AWS_REGION,
-    credentials:
-      env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY
-        ? { accessKeyId: env.AWS_ACCESS_KEY_ID, secretAccessKey: env.AWS_SECRET_ACCESS_KEY }
-        : undefined,
-  });
-  await s3.send(new PutObjectCommand({ Bucket: env.S3_BUCKET, Key: key, Body: body, ContentType: "application/pdf" }));
-  return getSignedUrl(
-    s3,
-    new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: key, ResponseContentDisposition: `inline; filename="${filename}"` }),
-    { expiresIn: 3600 },
-  );
-}
-
-// Phase 3 will replace this with the real generateCreditNotePdf(creditNote).
-// For now it throws a typed error so the route plumbing is fully wired without
-// shipping a bogus document: issue/pdf handlers catch it and degrade gracefully
-// (issue still transitions + persists; pdfUrl is populated when Phase 3 lands).
-class PdfPendingError extends Error {
-  constructor() {
-    super("Credit note PDF generation ships in Phase 3");
-    this.name = "PdfPendingError";
+// Render + upload the credit-note PDF, returning a presigned inline URL. Retries
+// transient failures (S3 hiccups, render glitches) with linear backoff before
+// giving up. Used only by POST /:id/issue, where a final failure rolls back the
+// issue; the read-only GET pdf endpoints call the renderer directly and let the
+// caller retry by re-hitting the endpoint.
+async function attemptPdfWithRetry(creditNote: any, maxRetries = 2): Promise<{ pdfUrl: string }> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const buffer = await generateCreditNotePdf(creditNote);
+      const pdfUrl = await uploadAndPresign(
+        `credit-notes/${creditNote.creditNoteNo}.pdf`,
+        buffer,
+        `${creditNote.creditNoteNo}.pdf`,
+      );
+      return { pdfUrl };
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries - 1) {
+        await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      }
+    }
   }
-}
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-async function placeholderRenderPdf(_creditNote: any): Promise<Buffer> {
-  throw new PdfPendingError();
+  throw lastError;
 }
 
 /**
@@ -409,17 +401,10 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
     }).lean();
     if (!cn) return res.status(404).json({ error: "Credit note not found" });
 
-    try {
-      const buf = await placeholderRenderPdf(cn);
-      const url = await uploadAndPresign(`credit-notes/${cn.creditNoteNo}.pdf`, buf, `${cn.creditNoteNo}.pdf`);
-      await CreditNote.collection.updateOne({ _id: cn._id }, { $set: { pdfUrl: url } });
-      return res.json({ url, expiresIn: 3600 });
-    } catch (e) {
-      if (e instanceof PdfPendingError) {
-        return res.status(503).json({ error: "PDF_PENDING_PHASE_3", message: e.message });
-      }
-      throw e;
-    }
+    const buf = await generateCreditNotePdf(cn as any);
+    const url = await uploadAndPresign(`credit-notes/${cn.creditNoteNo}.pdf`, buf, `${cn.creditNoteNo}.pdf`);
+    await CreditNote.collection.updateOne({ _id: cn._id }, { $set: { pdfUrl: url } });
+    return res.json({ url, expiresIn: 3600 });
   } catch (err: any) {
     console.error("[CreditNotes workspace/pdf]", err.message);
     res.status(500).json({ error: err.message });
@@ -831,17 +816,45 @@ router.post("/:id/issue", requirePermission("creditnotes", "FULL"), async (req: 
       { $inc: { creditedAmount: cn.grandTotal ?? 0 } },
     );
 
-    // Generate + upload the PDF. Phase 3 supplies the real renderer; until then
-    // the placeholder throws PdfPendingError and we leave pdfUrl unset — the
-    // issue transition itself is already persisted above.
-    let pdfUrl: string | null = null;
+    // Generate + upload the PDF (with retry). A credit note must never remain
+    // ISSUED without a rendered document, so if both attempts fail we roll back
+    // the entire issue: revert status to DRAFT, clear the issued stamp, and undo
+    // the invoice counter increment. The DRAFT→ISSUED edit-history entry is kept
+    // and a SECOND entry recording the rollback is appended — the trail stays
+    // immutable and shows the full story (attempted issue → rolled back), which
+    // matters for forensics and GST audit. editHistory oldValues/newValues are
+    // Mixed-typed, so the failure reason rides along in newValues.rollbackReason.
+    let pdfUrl: string;
     try {
-      const buf = await placeholderRenderPdf(cn.toObject());
-      pdfUrl = await uploadAndPresign(`credit-notes/${cn.creditNoteNo}.pdf`, buf, `${cn.creditNoteNo}.pdf`);
+      ({ pdfUrl } = await attemptPdfWithRetry(cn.toObject()));
       await CreditNote.collection.updateOne({ _id: cn._id }, { $set: { pdfUrl } });
-    } catch (e) {
-      if (!(e instanceof PdfPendingError)) throw e;
-      // PDF pending Phase 3 — issue succeeds without a document.
+    } catch (err: any) {
+      const rollbackEntry = {
+        editedAt: new Date(),
+        editedBy: req.user._id,
+        fieldsChanged: ["status", "issuedAt", "issuedBy"],
+        oldValues: { status: "ISSUED", issuedAt: now, issuedBy: req.user._id },
+        newValues: {
+          status: "DRAFT",
+          issuedAt: null,
+          issuedBy: null,
+          rollbackReason: `PDF generation failed after retries: ${err?.message}`,
+        },
+      };
+      await CreditNote.collection.updateOne(
+        { _id: cn._id },
+        { $set: { status: "DRAFT", issuedAt: null, issuedBy: null }, $push: { editHistory: rollbackEntry } } as any,
+      );
+      await Invoice.collection.updateOne(
+        { _id: new mongoose.Types.ObjectId(String(cn.originalInvoiceId)) },
+        { $inc: { creditedAmount: -(cn.grandTotal ?? 0) } },
+      );
+      console.error("[CreditNotes issue] PDF generation failed, rolled back to DRAFT:", err?.message);
+      return res.status(500).json({
+        error: "CREDIT_NOTE_ISSUE_PDF_FAILED",
+        message: "Credit note PDF generation failed; the credit note was reverted to DRAFT. Please try issuing again.",
+        details: err?.message,
+      });
     }
 
     triggerTaskAutomation("creditnote.issued", {
@@ -1090,17 +1103,10 @@ router.get("/:id/pdf", requirePermission("creditnotes", "READ"), async (req: any
     const cn = await CreditNote.findById(req.params.id).lean();
     if (!cn) return res.status(404).json({ error: "Credit note not found" });
 
-    try {
-      const buf = await placeholderRenderPdf(cn);
-      const url = await uploadAndPresign(`credit-notes/${cn.creditNoteNo}.pdf`, buf, `${cn.creditNoteNo}.pdf`);
-      await CreditNote.collection.updateOne({ _id: cn._id }, { $set: { pdfUrl: url } });
-      return res.json({ url, expiresIn: 3600 });
-    } catch (e) {
-      if (e instanceof PdfPendingError) {
-        return res.status(503).json({ error: "PDF_PENDING_PHASE_3", message: e.message });
-      }
-      throw e;
-    }
+    const buf = await generateCreditNotePdf(cn as any);
+    const url = await uploadAndPresign(`credit-notes/${cn.creditNoteNo}.pdf`, buf, `${cn.creditNoteNo}.pdf`);
+    await CreditNote.collection.updateOne({ _id: cn._id }, { $set: { pdfUrl: url } });
+    return res.json({ url, expiresIn: 3600 });
   } catch (err: any) {
     console.error("[CreditNotes PDF]", err.message);
     res.status(500).json({ error: err.message });
