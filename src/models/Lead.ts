@@ -1,7 +1,7 @@
 import mongoose, { Document, Schema } from "mongoose";
 
 export const LEAD_STAGES = [
-  "new", "contacted", "demo_scheduled", "proposal_sent",
+  "new", "email_sent", "contacted", "demo_scheduled", "proposal_sent",
   "negotiation", "follow_up", "won", "lost",
 ] as const;
 export type LeadStage = typeof LEAD_STAGES[number];

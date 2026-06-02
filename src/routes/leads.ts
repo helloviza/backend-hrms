@@ -841,7 +841,7 @@ router.get("/reports/owner-status", async (req, res) => {
       (l.assignedTo ? "Unknown" : "Unassigned");
     const STAGES = LEAD_STAGES as readonly string[];
     const STAGE_LABEL: Record<string, string> = {
-      new: "New", contacted: "Contacted", demo_scheduled: "Demo Scheduled",
+      new: "New", email_sent: "Email Sent", contacted: "Contacted", demo_scheduled: "Demo Scheduled",
       proposal_sent: "Proposal Sent", negotiation: "Negotiation", follow_up: "Follow Up",
       won: "Won", lost: "Lost",
     };
