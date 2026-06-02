@@ -1,11 +1,17 @@
-// apps/backend/src/utils/invoicePdf.ts
+// apps/backend/src/utils/creditNotePdf.ts
+//
+// Credit-note PDF renderer. Mirrors the "Architect Ledger" layout of
+// invoicePdf.ts (same fonts, geometry, palette and line-item table) but is
+// adapted for credit notes: "CREDIT NOTE" title, an "AGAINST INVOICE" stat box,
+// a reason-for-credit block, and an original-invoice reference card in place of
+// the bank-details card (a credit note requests no payment).
 import PDFDocument from "pdfkit";
 import https from "https";
 import http from "http";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import type { IInvoice } from "../models/Invoice.js";
+import type { ICreditNote } from "../models/CreditNote.js";
 import { getCompanySettings, type ICompanySettings } from "../models/CompanySettings.js";
 import { numberToWords } from "./numberToWords.js";
 import logger from "./logger.js";
@@ -17,21 +23,20 @@ const __dirname  = path.dirname(__filename);
 const FONT_PATH      = path.join(__dirname, "..", "fonts", "NotoSans-Regular.ttf");
 const FONT_BOLD_PATH = path.join(__dirname, "..", "fonts", "NotoSans-Bold.ttf");
 
-// Fonts are bundled in src/fonts/ — just verify they exist at startup
 async function ensureFonts() {
   if (!fs.existsSync(FONT_PATH)) {
-    console.warn("[PDF] NotoSans-Regular.ttf not found at:", FONT_PATH);
-    console.warn("[PDF] ₹ symbol will render as fallback — place font in src/fonts/");
+    console.warn("[CN PDF] NotoSans-Regular.ttf not found at:", FONT_PATH);
+    console.warn("[CN PDF] ₹ symbol will render as fallback — place font in src/fonts/");
   }
   if (!fs.existsSync(FONT_BOLD_PATH)) {
-    console.warn("[PDF] NotoSans-Bold.ttf not found at:", FONT_BOLD_PATH);
+    console.warn("[CN PDF] NotoSans-Bold.ttf not found at:", FONT_BOLD_PATH);
   }
 }
 
 /* ── Page geometry ──────────────────────────────────── */
 const PG_W = 595.28;
 const PG_H = 841.89;
-const M = 34.02; // 12mm in points (was 15mm / 42.52)
+const M = 34.02; // 12mm in points
 const CW = PG_W - 2 * M; // content width ~527
 const L = M;
 const R = PG_W - M;
@@ -40,19 +45,11 @@ const R = PG_W - M;
 const C_PRIMARY   = "#131b2e";   // headings, bold labels
 const C_BODY      = "#191c1e";   // body text
 const C_MID       = "#505f76";   // secondary / metadata
-const C_SURF_LOW  = "#f4f5f6";   // table header, bank card
+const C_SURF_LOW  = "#f4f5f6";   // table header, reference card
 const C_SURF_MID  = "#e8eaec";   // dividers, box borders
-const C_EMERALD   = "#4edea3";   // grand total
 const C_TINY      = "#d8dadc";   // powered-by footer
 
 /* ── Helpers ────────────────────────────────────────── */
-function fmtInr(n: number): string {
-  return "₹" + n.toLocaleString("en-IN", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
 function fmtDate(d: Date | string | undefined): string {
   if (!d) return "";
   const dt = new Date(d);
@@ -107,25 +104,23 @@ const STATE_CODES: Record<string, string> = {
 };
 
 /* ── Prefetched render assets ───────────────────────── */
-// Company settings + logo are identical across every invoice in a batch.
-// Fetching them once and injecting avoids N network round-trips when rendering
-// many PDFs (e.g. the bulk-zip endpoint). Omit for single renders — behaviour
-// is unchanged when `prefetch` is not provided.
-export interface InvoicePdfPrefetch {
+// Company settings + logo are identical across every credit note in a batch
+// (e.g. the backfill script). Fetch once and inject to avoid N round-trips.
+export interface CreditNotePdfPrefetch {
   settings: ICompanySettings;
   logoBuffer: Buffer | null;
 }
 
-export async function prefetchInvoiceAssets(): Promise<InvoicePdfPrefetch> {
+export async function prefetchCreditNoteAssets(): Promise<CreditNotePdfPrefetch> {
   const settings = await getCompanySettings();
   const logoBuffer = settings.logoUrl ? await fetchBuffer(settings.logoUrl) : null;
   return { settings, logoBuffer };
 }
 
 /* ── Main export ────────────────────────────────────── */
-export async function generateInvoicePdf(
-  invoice: IInvoice,
-  prefetch?: InvoicePdfPrefetch,
+export async function generateCreditNotePdf(
+  creditNote: ICreditNote,
+  prefetch?: CreditNotePdfPrefetch,
 ): Promise<Buffer> {
   await ensureFonts();
 
@@ -133,13 +128,7 @@ export async function generateInvoicePdf(
   const FONT_NORMAL = useNoto ? "NotoSans" : "Helvetica";
   const FONT_BOLD   = useNoto ? "NotoSans-Bold" : "Helvetica-Bold";
 
-  console.log('[PDF] FONT_PATH exists:', fs.existsSync(FONT_PATH));
-  console.log('[PDF] FONT_BOLD_PATH exists:', fs.existsSync(FONT_BOLD_PATH));
-  console.log('[PDF] useNoto:', useNoto);
-  console.log('[PDF] FONT_PATH:', FONT_PATH);
-
-  // Font-aware currency formatter — use Rs. prefix when NotoSans is unavailable
-  // (Helvetica cannot render the ₹ glyph; it renders as ¹ or a box)
+  // Font-aware currency formatter — Helvetica cannot render the ₹ glyph.
   function fmtCur(n: number): string {
     const prefix = useNoto ? "₹" : "Rs.";
     return prefix + n.toLocaleString("en-IN", {
@@ -153,8 +142,8 @@ export async function generateInvoicePdf(
     ? prefetch.logoBuffer
     : (dbSettings.logoUrl ? await fetchBuffer(dbSettings.logoUrl) : null);
 
-  console.log('[PDF] clientDetails:', JSON.stringify((invoice as any).clientDetails));
-  const issuerSnap = (invoice as any).issuerDetails ?? {};
+  const cn = creditNote as any;
+  const issuerSnap = cn.issuerDetails ?? {};
   const issuer = {
     companyName:  issuerSnap.companyName  || dbSettings.companyName  || "",
     address:      issuerSnap.address      || dbSettings.address      || "",
@@ -168,22 +157,23 @@ export async function generateInvoicePdf(
     email:        issuerSnap.email        || dbSettings.email         || "",
     website:      issuerSnap.website      || dbSettings.website       || "",
   };
-  const client = (invoice as any).clientDetails ?? {};
+  const client = cn.clientDetails ?? {};
+
   let isIgst: boolean;
   let gstLabel2 = "SGST"; // second GST column label for split tax
-  if (invoice.supplyType === "IGST" || invoice.supplyType === "EXPORT") {
+  if (cn.supplyType === "IGST" || cn.supplyType === "EXPORT") {
     isIgst = true;
-  } else if (invoice.supplyType === "CGST_SGST") {
+  } else if (cn.supplyType === "CGST_SGST") {
     isIgst = false;
     gstLabel2 = "SGST";
-  } else if (invoice.supplyType === "CGST_UTGST") {
+  } else if (cn.supplyType === "CGST_UTGST") {
     isIgst = false;
     gstLabel2 = "UTGST";
   } else {
-    logger.warn(`[PDF] Unexpected supplyType: "${invoice.supplyType ?? "(undefined)"}" — defaulting to IGST`);
+    logger.warn(`[CN PDF] Unexpected supplyType: "${cn.supplyType ?? "(undefined)"}" — defaulting to IGST`);
     isIgst = true;
   }
-  const lineItems = invoice.lineItems ?? [];
+  const lineItems = cn.lineItems ?? [];
 
   // index of last SERVICE_FEE row (for disclaimer)
   let lastSvcIdx = -1;
@@ -195,7 +185,7 @@ export async function generateInvoicePdf(
     const doc = new PDFDocument({
       size: "A4",
       margins: { top: M, bottom: M, left: M, right: M },
-      info: { Title: `Tax Invoice ${invoice.invoiceNo}` },
+      info: { Title: `Credit Note ${cn.creditNoteNo}` },
     });
 
     if (useNoto) {
@@ -210,8 +200,6 @@ export async function generateInvoicePdf(
     doc.on("error", reject);
 
     // ── Table column widths & x positions ──
-    // IGST (5 cols): DESC 50 | QTY 6 | RATE 13 | IGST 13 | AMT 18
-    // Split (6 cols): DESC 41 | QTY 5 | RATE 12 | CGST 12 | SGST 12 | AMT 18
     const COL_W = isIgst
       ? [CW * 0.50, CW * 0.06, CW * 0.13, CW * 0.13, CW * 0.18]
       : [CW * 0.41, CW * 0.05, CW * 0.12, CW * 0.12, CW * 0.12, CW * 0.18];
@@ -219,17 +207,17 @@ export async function generateInvoicePdf(
     for (let i = 0; i < COL_W.length - 1; i++) COL_X.push(COL_X[i] + COL_W[i]);
     const HDR_H = 20;
     const HDRS = isIgst
-      ? ["DESCRIPTION", "QTY", "RATE", "IGST (18%)", "AMOUNT"]
-      : ["DESCRIPTION", "QTY", "RATE", "CGST (9%)", `${gstLabel2} (9%)`, "AMOUNT"];
+      ? ["DESCRIPTION", "QTY", "RATE", "IGST (18%)", "CREDIT"]
+      : ["DESCRIPTION", "QTY", "RATE", "CGST (9%)", `${gstLabel2} (9%)`, "CREDIT"];
     const ALIGNS: Array<"center" | "left" | "right"> = isIgst
       ? ["left", "center", "right", "right", "right"]
       : ["left", "center", "right", "right", "right", "right"];
 
-    function drawTableHeader(y: number) {
-      doc.rect(L, y, CW, HDR_H).fill(C_SURF_LOW);
+    function drawTableHeader(yPos: number) {
+      doc.rect(L, yPos, CW, HDR_H).fill(C_SURF_LOW);
       doc.fillColor(C_MID).fontSize(8).font(FONT_BOLD);
       for (let i = 0; i < HDRS.length; i++) {
-        doc.text(HDRS[i], COL_X[i] + 4, y + 6, {
+        doc.text(HDRS[i], COL_X[i] + 4, yPos + 6, {
           width: COL_W[i] - 8,
           align: ALIGNS[i],
           lineBreak: false,
@@ -254,54 +242,55 @@ export async function generateInvoicePdf(
         logoBottomY = y;
       }
     } else {
-      // dark navy square placeholder
       doc.rect(L, y, 44, 44).fill(C_PRIMARY);
       logoBottomY = y + 50;
     }
 
-    // "TAX INVOICE" + invoice number + invoice date below logo
+    // "CREDIT NOTE" + number + date below logo
     doc.fillColor(C_PRIMARY).fontSize(26).font(FONT_BOLD)
-      .text("TAX INVOICE", L, logoBottomY + 6, { width: LEFT_COL_W, lineBreak: false });
+      .text("CREDIT NOTE", L, logoBottomY + 6, { width: LEFT_COL_W, lineBreak: false });
     doc.fontSize(12).font(FONT_NORMAL).fillColor(C_MID)
-      .text(`# ${invoice.invoiceNo}`, L, logoBottomY + 36, { width: LEFT_COL_W, lineBreak: false });
-    const invoiceDateDisplay = fmtDate((invoice as any).invoiceDate || invoice.generatedAt);
+      .text(`# ${cn.creditNoteNo}`, L, logoBottomY + 36, { width: LEFT_COL_W, lineBreak: false });
+    const cnDateDisplay = fmtDate(cn.creditNoteDate || cn.generatedAt);
     doc.fontSize(10).font(FONT_NORMAL).fillColor(C_MID)
-      .text(`Date: ${invoiceDateDisplay}`, L, logoBottomY + 52, { width: LEFT_COL_W, lineBreak: false });
+      .text(`Date: ${cnDateDisplay}`, L, logoBottomY + 52, { width: LEFT_COL_W, lineBreak: false });
 
     const leftTitleBottomY = logoBottomY + 68;
 
     // Right — two stat boxes side by side
-    const BOX_W = 120; // was 100 — wider to accommodate large amounts without clipping
+    const BOX_W = 120;
     const BOX_H = 58;
     const BOX_GAP = 8;
     const BOX2_X = R - BOX_W;
     const BOX1_X = BOX2_X - BOX_W - BOX_GAP;
     const BOX_Y = M;
 
-    // Box 1: BALANCE DUE
+    // Box 1: TOTAL CREDIT
     doc.rect(BOX1_X, BOX_Y, BOX_W, BOX_H).fill(C_PRIMARY);
     doc.fillColor("#aab4c4").fontSize(9).font(FONT_NORMAL)
-      .text("BALANCE DUE", BOX1_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
+      .text("TOTAL CREDIT", BOX1_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
     doc.fillColor("#ffffff").fontSize(14).font(FONT_BOLD)
-      .text(fmtCur(invoice.grandTotal ?? 0), BOX1_X + 8, BOX_Y + 24, { width: BOX_W - 16, lineBreak: false });
+      .text(fmtCur(cn.grandTotal ?? 0), BOX1_X + 8, BOX_Y + 24, { width: BOX_W - 16, lineBreak: false });
 
-    // Box 2: DUE DATE
+    // Box 2: AGAINST INVOICE
     doc.rect(BOX2_X, BOX_Y, BOX_W, BOX_H).fill(C_SURF_LOW);
     doc.fillColor(C_MID).fontSize(9).font(FONT_NORMAL)
-      .text("DUE DATE", BOX2_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
-    const dueDateStr = invoice.dueDate ? fmtDate(invoice.dueDate) : "On Receipt";
+      .text("AGAINST INVOICE", BOX2_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
     doc.fillColor(C_PRIMARY).fontSize(11).font(FONT_BOLD)
-      .text(dueDateStr, BOX2_X + 8, BOX_Y + 26, { width: BOX_W - 16, lineBreak: false });
+      .text(cn.originalInvoiceNo || "—", BOX2_X + 8, BOX_Y + 23, { width: BOX_W - 16, lineBreak: false });
+    if (cn.originalInvoiceDate) {
+      doc.fillColor(C_MID).fontSize(8).font(FONT_NORMAL)
+        .text(fmtDate(cn.originalInvoiceDate), BOX2_X + 8, BOX_Y + 40, { width: BOX_W - 16, lineBreak: false });
+    }
 
     y = Math.max(leftTitleBottomY, BOX_Y + BOX_H) + 24;
 
     /* ═══════════════════════════════════════════════
        FROM + BILL TO — two columns
     ═══════════════════════════════════════════════ */
-    const HALF = CW / 2;
     const fromBillY = y;
 
-    // FROM (left) — ~44% of content width, scales with margins
+    // FROM (left)
     const leftColW = Math.floor(CW * 0.44);
     doc.fillColor(C_MID).fontSize(8).font(FONT_NORMAL)
       .text("FROM", L, y, { width: leftColW, lineBreak: false });
@@ -354,7 +343,7 @@ export async function generateInvoicePdf(
       y += doc.heightOfString(issuer.website, { width: leftColW }) + 2;
     }
 
-    // BILL TO (right) — mirror of leftColW, starts just past center
+    // BILL TO (right)
     const rightColW = Math.floor(CW * 0.44);
     const billToX = L + Math.floor(CW / 2) + 12;
     let billY = fromBillY;
@@ -363,31 +352,31 @@ export async function generateInvoicePdf(
       .text("BILL TO", billToX, billY, { width: rightColW, lineBreak: false });
     billY += 14;
 
-    const clientName = client.companyName || (client as any).name || (client as any).contactPerson || "";
-    const clientAddress = client.billingAddress || (client as any).address || "";
+    const clientName = client.companyName || client.name || client.contactPerson || "";
+    const clientAddress = client.billingAddress || client.address || "";
 
     if (clientName) {
       doc.fillColor(C_PRIMARY).fontSize(12).font(FONT_BOLD)
         .text(clientName, billToX, billY, { width: rightColW });
       billY += doc.heightOfString(clientName, { width: rightColW, fontSize: 12 }) + 4;
       doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID);
-      const hasStructuredClient = !!((client as any).addressLine1 || (client as any).city);
+      const hasStructuredClient = !!(client.addressLine1 || client.city);
       if (hasStructuredClient) {
-        if ((client as any).addressLine1) {
-          doc.text((client as any).addressLine1, billToX, billY, { width: rightColW });
-          billY += doc.heightOfString((client as any).addressLine1, { width: rightColW }) + 3;
+        if (client.addressLine1) {
+          doc.text(client.addressLine1, billToX, billY, { width: rightColW });
+          billY += doc.heightOfString(client.addressLine1, { width: rightColW }) + 3;
         }
-        if ((client as any).addressLine2) {
-          doc.text((client as any).addressLine2, billToX, billY, { width: rightColW });
-          billY += doc.heightOfString((client as any).addressLine2, { width: rightColW }) + 3;
+        if (client.addressLine2) {
+          doc.text(client.addressLine2, billToX, billY, { width: rightColW });
+          billY += doc.heightOfString(client.addressLine2, { width: rightColW }) + 3;
         }
-        const clientCityLine = [(client as any).city, (client as any).state, (client as any).pincode].filter(Boolean).join(", ");
+        const clientCityLine = [client.city, client.state, client.pincode].filter(Boolean).join(", ");
         if (clientCityLine) {
           doc.text(clientCityLine, billToX, billY, { width: rightColW });
           billY += 13;
         }
-        if ((client as any).country) {
-          doc.text((client as any).country, billToX, billY, { width: rightColW });
+        if (client.country) {
+          doc.text(client.country, billToX, billY, { width: rightColW });
           billY += 13;
         }
       } else {
@@ -400,13 +389,13 @@ export async function generateInvoicePdf(
           doc.text(addressText, billToX, billY, { width: rightColW });
           billY += doc.heightOfString(addressText, { width: rightColW, fontSize: 9 }) + 4;
         }
-        if ((client as any).state) {
-          doc.text((client as any).state, billToX, billY, { width: rightColW });
+        if (client.state) {
+          doc.text(client.state, billToX, billY, { width: rightColW });
           billY += 13;
         }
       }
-      if ((client as any).gstin) {
-        doc.text(`GSTIN: ${(client as any).gstin}`, billToX, billY, { width: rightColW });
+      if (client.gstin) {
+        doc.text(`GSTIN: ${client.gstin}`, billToX, billY, { width: rightColW });
         billY += 13;
       }
     } else {
@@ -418,13 +407,44 @@ export async function generateInvoicePdf(
     y = Math.max(y, billY) + 20;
 
     // Place of Supply
-    const clientState = invoice.clientState || (client as any).state || "";
+    const clientState = cn.clientState || client.state || "";
     if (clientState) {
       const stateCode = STATE_CODES[clientState.toLowerCase().trim()] || "";
       const placeOfSupply = stateCode ? `${clientState} (${stateCode})` : clientState;
       doc.fontSize(8).font(FONT_NORMAL).fillColor(C_MID)
         .text(`Place Of Supply: ${placeOfSupply}`, L, y);
       y += 14;
+    }
+
+    /* ═══════════════════════════════════════════════
+       REASON FOR CREDIT
+    ═══════════════════════════════════════════════ */
+    {
+      const reasonText = cn.reasonText || "";
+      const gstReasonLine = cn.gstReasonCode
+        ? `GST Reason ${cn.gstReasonCode}${cn.gstReasonText ? ` — ${cn.gstReasonText}` : ""}`
+        : "";
+      if (reasonText || gstReasonLine || cn.reasonNote) {
+        doc.fontSize(8).font(FONT_BOLD).fillColor(C_MID)
+          .text("REASON FOR CREDIT", L, y, { width: CW, lineBreak: false });
+        y += 12;
+        if (reasonText) {
+          doc.fontSize(9).font(FONT_NORMAL).fillColor(C_BODY)
+            .text(reasonText, L, y, { width: CW });
+          y += doc.heightOfString(reasonText, { width: CW, fontSize: 9 }) + 2;
+        }
+        if (gstReasonLine) {
+          doc.fontSize(8).font(FONT_NORMAL).fillColor(C_MID)
+            .text(gstReasonLine, L, y, { width: CW });
+          y += doc.heightOfString(gstReasonLine, { width: CW, fontSize: 8 }) + 2;
+        }
+        if (cn.reasonNote) {
+          doc.fontSize(8).font(FONT_NORMAL).fillColor(C_MID)
+            .text(cn.reasonNote, L, y, { width: CW });
+          y += doc.heightOfString(cn.reasonNote, { width: CW, fontSize: 8 }) + 2;
+        }
+        y += 6;
+      }
     }
 
     /* ═══════════════════════════════════════════════
@@ -438,14 +458,6 @@ export async function generateInvoicePdf(
       "All quoted prices are fully inclusive of applicable taxes and transaction fees; " +
       "no additional charges shall be levied on the end user.";
 
-    // Track booking pair index for alternating row bg
-    const bookingPairIdx: number[] = [];
-    let pairCount = -1;
-    for (const li of lineItems) {
-      if ((li as any).rowType === "COST") pairCount++;
-      bookingPairIdx.push(pairCount);
-    }
-
     for (let idx = 0; idx < lineItems.length; idx++) {
       const li = lineItems[idx] as any;
 
@@ -453,7 +465,7 @@ export async function generateInvoicePdf(
       const descLine1 = li.description || "";
 
       let descLine2 = (li.subDescription || "")
-        .split(" || ").filter(p => p !== "?").join(" || ")
+        .split(" || ").filter((p: string) => p !== "?").join(" || ")
         .replace(/→/g, "->");
       if (!useNoto) {
         descLine2 = descLine2
@@ -475,7 +487,7 @@ export async function generateInvoicePdf(
         doc.font(FONT_NORMAL).fontSize(subFontSize);
         estH += 3 + doc.heightOfString(descLine2, { width: COL_W[0] - 8 });
       }
-      if (isLastSvc && (invoice as any).showInclusiveTaxNote) {
+      if (isLastSvc && cn.showInclusiveTaxNote) {
         doc.font(FONT_NORMAL).fontSize(discFontSize);
         estH += 3 + doc.heightOfString(DISCLAIMER, { width: COL_W[0] - 8 });
       }
@@ -488,9 +500,6 @@ export async function generateInvoicePdf(
         drawTableHeader(y);
         y += HDR_H;
       }
-
-      // Alternating row bg — every other booking pair
-      // no alternating background — all rows white
 
       // Description
       let dY = y + 6;
@@ -507,7 +516,7 @@ export async function generateInvoicePdf(
         dY += doc.heightOfString(descLine2, { width: descW, fontSize: subFontSize }) + 3;
       }
 
-      if (isLastSvc && (invoice as any).showInclusiveTaxNote) {
+      if (isLastSvc && cn.showInclusiveTaxNote) {
         doc.fontSize(discFontSize).font(FONT_NORMAL).fillColor(C_MID)
           .text(DISCLAIMER, descX, dY, { width: descW });
       }
@@ -536,7 +545,7 @@ export async function generateInvoicePdf(
             align: "right",
             lineBreak: false,
           });
-        // AMOUNT
+        // CREDIT amount
         doc.fillColor(C_BODY)
           .text(fmtCur(li.amount ?? 0), COL_X[4] + 2, y + 7, {
             width: COL_W[4] - 4,
@@ -558,7 +567,7 @@ export async function generateInvoicePdf(
             align: "right",
             lineBreak: false,
           });
-        // AMOUNT
+        // CREDIT amount
         doc.fillColor(C_BODY)
           .text(fmtCur(li.amount ?? 0), COL_X[5] + 2, y + 7, {
             width: COL_W[5] - 4,
@@ -571,51 +580,38 @@ export async function generateInvoicePdf(
     }
 
     /* ═══════════════════════════════════════════════
-       BOTTOM SECTION — bank details left, totals right
+       BOTTOM SECTION — original-invoice reference left, totals right
     ═══════════════════════════════════════════════ */
     y += 20;
 
-    // Check if bottom section fits
     const bottomH = 120;
     if (y + bottomH > PG_H - M - 60) {
       doc.addPage();
       y = M;
     }
 
-    const BANK_W = CW * 0.40;
-    const BANK_X = L;
-    const BANK_CARD_H = 110;
+    const REF_W = CW * 0.40;
+    const REF_X = L;
+    const REF_CARD_H = 110;
 
-    // Bank Details card — filled rect
-    doc.rect(BANK_X, y, BANK_W, BANK_CARD_H).fill(C_SURF_LOW);
-    let bankY = y + 10;
+    // Reference card — filled rect
+    doc.rect(REF_X, y, REF_W, REF_CARD_H).fill(C_SURF_LOW);
+    let refY = y + 10;
     doc.fillColor(C_PRIMARY).fontSize(11).font(FONT_BOLD)
-      .text("Bank Details", BANK_X + 10, bankY, { lineBreak: false });
-    bankY += 18;
+      .text("Original Invoice", REF_X + 10, refY, { lineBreak: false });
+    refY += 20;
 
-    // Account Holder — full width
-    const holderVal = dbSettings.bankAccountHolder || issuer.companyName || "—";
-    doc.fontSize(7).font(FONT_NORMAL).fillColor(C_MID)
-      .text("ACCOUNT HOLDER", BANK_X + 12, bankY, { lineBreak: false });
-    doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
-      .text(holderVal, BANK_X + 12, bankY + 10, { width: BANK_W - 24 });
-    const holderLines = Math.ceil(holderVal.length / 35);
-    bankY += 10 + (holderLines * 12) + 10;
+    function refRow(label: string, value: string) {
+      doc.fontSize(7).font(FONT_NORMAL).fillColor(C_MID)
+        .text(label, REF_X + 12, refY, { width: REF_W - 24, lineBreak: false });
+      doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
+        .text(value, REF_X + 12, refY + 10, { width: REF_W - 24, lineBreak: false });
+      refY += 28;
+    }
 
-    // Account Number + IFSC — two columns
-    const col1X = BANK_X + 12;
-    const col2X = BANK_X + (BANK_W / 2) + 4;
-    const colW = (BANK_W / 2) - 16;
-
-    doc.fontSize(7).font(FONT_NORMAL).fillColor(C_MID)
-      .text("ACCOUNT NUMBER", col1X, bankY, { width: colW, lineBreak: false });
-    doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
-      .text(dbSettings.bankAccountNumber || "—", col1X, bankY + 10, { width: colW, lineBreak: false });
-
-    doc.fontSize(7).font(FONT_NORMAL).fillColor(C_MID)
-      .text("IFSC CODE", col2X, bankY, { width: colW, lineBreak: false });
-    doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
-      .text(dbSettings.bankIfsc || "—", col2X, bankY + 10, { width: colW, lineBreak: false });
+    refRow("INVOICE NUMBER", cn.originalInvoiceNo || "—");
+    refRow("INVOICE DATE", cn.originalInvoiceDate ? fmtDate(cn.originalInvoiceDate) : "—");
+    refRow("INVOICE AMOUNT", fmtCur(cn.originalInvoiceAmount ?? 0));
 
     // Totals block — right column
     const TOT_W = CW * 0.55;
@@ -636,14 +632,14 @@ export async function generateInvoicePdf(
       totY += sz + 7;
     }
 
-    totRow("Sub Total", fmtCur(invoice.subtotal ?? 0));
+    totRow("Sub Total", fmtCur(cn.subtotal ?? 0));
     if (isIgst) {
-      totRow("IGST (18%)", fmtCur((invoice as any).igstAmount ?? invoice.totalGST ?? 0));
+      totRow("IGST (18%)", fmtCur(cn.igstAmount ?? cn.totalGST ?? 0));
     } else {
-      const cgst = (invoice as any).cgstAmount ?? (invoice.totalGST ?? 0) / 2;
-      const sgstOrUtgst = (invoice as any).utgstAmount > 0
-        ? (invoice as any).utgstAmount
-        : (invoice as any).sgstAmount ?? (invoice.totalGST ?? 0) / 2;
+      const cgst = cn.cgstAmount ?? (cn.totalGST ?? 0) / 2;
+      const sgstOrUtgst = cn.utgstAmount > 0
+        ? cn.utgstAmount
+        : cn.sgstAmount ?? (cn.totalGST ?? 0) / 2;
       totRow("CGST (9%)", fmtCur(cgst));
       totRow(`${gstLabel2} (9%)`, fmtCur(sgstOrUtgst));
     }
@@ -653,29 +649,26 @@ export async function generateInvoicePdf(
       .moveTo(TOT_X, totY).lineTo(R, totY).stroke();
     totY += 8;
 
-    // "Total" label
+    // "Total Credit" label + value
     doc.fontSize(13).font(FONT_BOLD).fillColor(C_PRIMARY)
-      .text("Total", TOT_X, totY, { width: TOT_LW, align: "right", lineBreak: false });
-    // Grand total in deep blue — reduced from 20→16 to prevent overflow in value column
+      .text("Total Credit", TOT_X, totY, { width: TOT_LW, align: "right", lineBreak: false });
     doc.fontSize(16).font(FONT_BOLD).fillColor("#00477f")
-      .text(fmtCur(invoice.grandTotal ?? 0), TOT_VX, totY - 2, { width: TOT_VW, align: "right", lineBreak: false });
+      .text(fmtCur(cn.grandTotal ?? 0), TOT_VX, totY - 2, { width: TOT_VW, align: "right", lineBreak: false });
     totY += 22;
 
     // Total in words
-    const words = numberToWords(invoice.grandTotal ?? 0);
+    const words = numberToWords(cn.grandTotal ?? 0);
     doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID)
       .text(words, TOT_X, totY, { width: TOT_W, align: "right" });
     totY += doc.heightOfString(words, { width: TOT_W, fontSize: 9 }) + 4;
 
     // "Verified by Plumtrips" badge
-    const badgeText = "Verified by Plumtrips";
     const badgeW = 130;
     const badgeH = 18;
     const badgeX = R - badgeW;
     const badgeY = totY + 6;
     doc.roundedRect(badgeX, badgeY, badgeW, badgeH, 9).fill("#e0f0ff");
 
-    // Filled circle + white tick (solid style, crisp at small sizes)
     const circleX = badgeX + 14;
     const circleY = badgeY + 9;
     const circleR = 5;
@@ -693,7 +686,7 @@ export async function generateInvoicePdf(
     doc.fillColor(C_BODY).strokeColor("#000000");
     totY = badgeY + badgeH;
 
-    y = Math.max(y + BANK_CARD_H, totY) + 20;
+    y = Math.max(y + REF_CARD_H, totY) + 20;
 
     /* ═══════════════════════════════════════════════
        FOOTER
@@ -708,7 +701,7 @@ export async function generateInvoicePdf(
     y += 10;
 
     doc.fontSize(9).font(FONT_NORMAL).fillColor(C_MID)
-      .text("Thank you for your business. Please reach out for any billing inquiries.", L, y, { align: "center", width: CW });
+      .text("This credit note adjusts the referenced invoice. Please reach out for any billing inquiries.", L, y, { align: "center", width: CW });
     y += 14;
 
     const footerY = y;
