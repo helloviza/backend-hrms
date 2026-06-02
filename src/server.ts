@@ -592,6 +592,14 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/eod-report", eodReportRouter);
 }
 
+// CRM Sales Pulse Report (email, multi-time IST). Auth is enforced inside the
+// router (requireAuth + requireSuperAdmin).
+import crmSalesPulseRouter from "./routes/crmSalesPulse.js";
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — Sales Pulse report (Plumtrips Travel CRM)
+  app.use("/api/crm/sales-pulse", crmSalesPulseRouter);
+}
+
 // Image proxy
 app.use("/api/proxy", proxyRouter);
 
@@ -675,6 +683,10 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       // ✅ START EOD WHATSAPP CRON
       const { startEodCron } = await import("./jobs/eodCron.js");
       startEodCron().catch((e: unknown) => logger.error("[EOD] Cron start failed", { e }));
+
+      // ✅ START CRM SALES PULSE CRON (no-op while config.enabled=false, the default)
+      const { startSalesPulseCron } = await import("./jobs/crmSalesPulseCron.js");
+      startSalesPulseCron().catch((e: unknown) => logger.error("[SalesPulse] Cron start failed", { e }));
 
       // PLUMBOX-005: Hold-booking voucher deadline reminders (24h + 1h)
       const { startHoldBookingReminderCron } = await import("./jobs/hold-booking-reminder.js");
