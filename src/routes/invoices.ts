@@ -106,6 +106,7 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
 import ManualBooking from "../models/ManualBooking.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
+import CreditNote from "../models/CreditNote.js";
 import { generateInvoicePdf, prefetchInvoiceAssets } from "../utils/invoicePdf.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { buildLineItemsForBooking, buildCombinedLineItems } from "../utils/invoiceLineItems.js";
@@ -1753,6 +1754,27 @@ router.get("/:id/eligible-bookings", requirePermission("invoices", "READ"), asyn
     res.json({ ok: true, current, eligible });
   } catch (err: any) {
     console.error("[Invoices eligible-bookings]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Credit Notes against this invoice ────────────────────────────── */
+
+// GET /api/admin/invoices/:id/credit-notes
+// Powers the "Credit Notes against this invoice" panel in InvoicePreview.tsx.
+// Basic info only, newest first, no pagination (an invoice has few CNs).
+router.get("/:id/credit-notes", requirePermission("invoices", "READ"), async (req: any, res: any) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid invoice id" });
+    }
+    const creditNotes = await CreditNote.find({ originalInvoiceId: req.params.id })
+      .select("creditNoteNo status grandTotal reasonText issuedAt createdAt isDemo")
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({ ok: true, creditNotes });
+  } catch (err: any) {
+    console.error("[Invoices credit-notes]", err.message);
     res.status(500).json({ error: err.message });
   }
 });

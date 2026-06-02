@@ -70,6 +70,7 @@ export interface UserPermissionDoc extends Document {
     adminQueue: ModulePermission
     manualBookings: ModulePermission
     invoices: ModulePermission
+    creditnotes: ModulePermission
     reports: ModulePermission
     companySettings: ModulePermission
     adminVouchers: ModulePermission
@@ -135,6 +136,7 @@ const modulesSchema = new Schema(
     adminQueue: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     manualBookings: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     invoices: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    creditnotes: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     reports: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     companySettings: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     adminVouchers: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
