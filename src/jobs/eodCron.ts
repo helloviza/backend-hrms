@@ -7,14 +7,15 @@ import logger from "../utils/logger.js";
 let currentCronJob: ReturnType<typeof cron.schedule> | null = null;
 
 export async function startEodCron(): Promise<void> {
-  // @deprecated ABANDONED Fargate branch — see
-  // infra/audit/eod-render-lambda-plan-2026-05-27.md. This was meant to hand
-  // scheduling to EventBridge + runEodOnce.ts when running as a Fargate task,
-  // but that task was never wired. EOD_CRON_DISABLED is NOT set in production,
-  // so this in-process node-cron is the LIVE scheduler. Retained for reference.
+  // LIVE EOD scheduler. This in-process node-cron is the production scheduler,
+  // running on the always-on Fargate WhatsApp host (WA_HOST=true). EOD_CRON_DISABLED
+  // is NOT set in production, so this path is the one that actually fires the report.
   //
-  // If running under Fargate Scheduled Task mode, EventBridge handles scheduling
-  // and the standalone runEodOnce.js script handles execution. Skip cron registration here.
+  // ABANDONED ALTERNATIVE (never wired) — see
+  // infra/audit/eod-render-lambda-plan-2026-05-27.md: an EventBridge + runEodOnce.ts
+  // Fargate Scheduled Task was planned to move scheduling out-of-process, but was
+  // never built. If EOD_CRON_DISABLED were ever set, this cron skips and that
+  // external scheduler would own execution.
   if (process.env.EOD_CRON_DISABLED === "true") {
     logger.info("[EOD] Cron registration disabled via EOD_CRON_DISABLED env var (Fargate mode)");
     return;

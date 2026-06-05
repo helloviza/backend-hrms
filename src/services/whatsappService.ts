@@ -3,9 +3,19 @@ import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const QRCode = require("qrcode");
-import { getChromeLaunchOptions } from "../utils/chromeResolver.js";
+import path from "path";
+import { getChromeLaunchOptions, cleanStaleChromeLocks } from "../utils/chromeResolver.js";
 import { EodReportConfig, type IEodRecipient } from "../models/EodReportConfig.js";
 import logger from "../utils/logger.js";
+
+// LocalAuth({ clientId: "plumtrips-eod" }) with the default dataPath persists the
+// Chromium user-data-dir here. In Fargate this is the EFS-mounted /app/.wwebjs_auth.
+const WA_SESSION_DIR = path.join(process.cwd(), ".wwebjs_auth", "session-plumtrips-eod");
+
+// Hard ceiling for the whatsapp-web.js launch handshake. A hung Chrome (stale
+// SingletonLock, detached frame, Store-injection timeout) must not become a
+// silent forever-hang — on timeout we exit so ECS restarts with a clean lock.
+const WA_INIT_TIMEOUT_MS = 90_000;
 
 type WaStatus = "disconnected" | "qr_ready" | "connecting" | "connected" | "failed";
 
@@ -17,6 +27,14 @@ class WhatsAppService {
   private statusCallbacks: Set<(s: string) => void> = new Set();
 
   async initialize(): Promise<void> {
+    // Only the dedicated WA host (WA_HOST=true) may own the single
+    // whatsapp-web.js client. Anywhere else (e.g. App Runner) this is a no-op,
+    // so no competing client can register against clientId "plumtrips-eod".
+    if (process.env.WA_HOST !== "true") {
+      logger.warn("[WA] initialize() skipped — not the WA host (WA_HOST !== 'true')");
+      return;
+    }
+
     if (this.client) {
       logger.info("[WA] Client already initialized, skipping");
       return;
@@ -30,6 +48,24 @@ class WhatsAppService {
     // The legacy `session:` constructor field was deprecated in whatsapp-web.js 1.16+
     // and is no longer passed. EodReportConfig.waSession is now unused at read time
     // (still written by the 'authenticated' handler — harmless no-op).
+
+    // Stale-lock pre-clean: a previous Chrome that died without cleanup leaves
+    // SingletonLock/DevToolsActivePort/.nfs* behind, which make this launch hang
+    // or throw EBUSY/ENOTEMPTY. Remove ONLY those lock artifacts — never the auth
+    // credentials, never the session dir itself (that would force a re-QR).
+    try {
+      const removedLocks = cleanStaleChromeLocks(WA_SESSION_DIR);
+      if (removedLocks.length) {
+        logger.warn("[WA] Cleared stale Chromium lock artifacts before launch", {
+          sessionDir: WA_SESSION_DIR,
+          removedLocks,
+        });
+      }
+    } catch (err: any) {
+      logger.warn("[WA] Stale-lock pre-clean failed (continuing to launch)", {
+        message: err?.message,
+      });
+    }
 
     const chromeOpts = await getChromeLaunchOptions();
     logger.info("[WA] Launching whatsapp-web.js puppeteer", {
@@ -50,6 +86,14 @@ class WhatsAppService {
         // Removed: --no-zygote (paired with --single-process)
         // Removed: --disable-accelerated-2d-canvas, --no-first-run (unnecessary)
       },
+    });
+
+    this.client.on("loading_screen", (percent: number, message: string) => {
+      logger.info("[WA] Loading screen", { percent, message });
+    });
+
+    this.client.on("change_state", (state: string) => {
+      logger.info("[WA] Connection state changed", { state });
     });
 
     this.client.on("qr", async (qr: string) => {
@@ -130,29 +174,98 @@ class WhatsAppService {
           cause: err?.cause,
         });
       }
-      this.notifyStatus("disconnected");
+      // Tear down the dead client BEFORE nulling so a hung destroy() can't leave
+      // an orphaned Chrome holding the SingletonLock. Bounded so destroy() itself
+      // can't become a new silent hang.
+      await this.destroyClientWithTimeout();
       this.client = null;
+      this.notifyStatus("disconnected");
     });
 
-    this.client.on("auth_failure", (msg: string) => {
+    this.client.on("auth_failure", async (msg: string) => {
       this.status = "failed";
       logger.error("[WA] Auth failure", { msg });
-      this.notifyStatus("failed");
+      await this.destroyClientWithTimeout();
       this.client = null;
+      this.notifyStatus("failed");
+    });
+
+    // Race the launch handshake against a hard timeout. The timer is captured so
+    // it can be cleared on success — otherwise the losing promise would reject
+    // after the race settled and surface as an unhandledRejection.
+    let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        reject(
+          new Error(
+            `whatsapp-web.js initialize() timed out after ${WA_INIT_TIMEOUT_MS}ms`,
+          ),
+        );
+      }, WA_INIT_TIMEOUT_MS);
     });
 
     try {
-      await this.client.initialize();
+      await Promise.race([this.client.initialize(), timeoutPromise]);
+      logger.info("[WA] whatsapp-web.js launch succeeded", {
+        executablePath: chromeOpts.executablePath,
+        outcome: "initialized",
+      });
     } catch (err: any) {
-      this.status = "failed";
-      this.client = null;
       logger.error("[WA] Client initialize error", {
         message: err?.message,
         stack: err?.stack,
         name: err?.name,
         cause: err?.cause,
+        executablePath: chromeOpts.executablePath,
+        timedOut,
       });
+      if (timedOut) {
+        // A hung launch never recovers on its own. Exit so ECS restarts the task;
+        // the boot/initialize() stale-lock pre-clean clears the lock on next start.
+        logger.error(
+          "[WA] launch hung — exiting(1) for a clean ECS restart (boot pre-clean will clear the lock)",
+        );
+        process.exit(1);
+      }
+      // Non-timeout launch failure: keep prior behavior — mark failed, tear down,
+      // and rethrow so the caller (e.g. sendToRecipients) can report it.
+      this.status = "failed";
+      await this.destroyClientWithTimeout();
+      this.client = null;
       throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Destroy the current client with a bounded timeout so a hung destroy() (which
+   * itself shells out to Chrome) can never become a new silent hang. Best-effort:
+   * swallows + logs any error/timeout. Does NOT null this.client — the caller
+   * owns that so the null assignment stays adjacent to its own state changes.
+   */
+  private async destroyClientWithTimeout(timeoutMs = 8_000): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        client.destroy(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`client.destroy() timed out after ${timeoutMs}ms`)),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } catch (err: any) {
+      logger.warn("[WA] client.destroy() failed or timed out (continuing)", {
+        message: err?.message,
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -365,11 +478,7 @@ class WhatsAppService {
 
   async disconnect(): Promise<void> {
     if (this.client) {
-      try {
-        await this.client.destroy();
-      } catch {
-        // ignore destroy errors
-      }
+      await this.destroyClientWithTimeout();
       this.client = null;
     }
     this.status = "disconnected";

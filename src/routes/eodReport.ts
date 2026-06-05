@@ -19,6 +19,21 @@ const router = express.Router();
 
 router.use(requireAuth, requireSuperAdmin);
 
+/* ── WA host gate ───────────────────────────────────────────────────
+ * The /wa/* control endpoints (status, qr, disconnect, groups) only function
+ * on the dedicated WA host (WA_HOST=true) that owns the single plumtrips-eod
+ * client. Everywhere else they return 409 so no second host can initialize a
+ * competing client or hand out a conflicting QR. */
+router.use("/wa", (_req, res, next) => {
+  if (process.env.WA_HOST !== "true") {
+    return res.status(409).json({
+      ok: false,
+      error: "WhatsApp endpoints are served only by the dedicated WA host",
+    });
+  }
+  next();
+});
+
 /* ── GET /config ────────────────────────────────────────────────── */
 router.get("/config", async (_req, res) => {
   try {
