@@ -671,16 +671,76 @@ export default app;
 if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
   (async () => {
     try {
+      // ─────────────────────────────────────────────────────────────
+      // GLOBAL PROCESS GUARDS
+      // whatsapp-web.js / puppeteer can emit late EBUSY/ENOTEMPTY/ENOENT against
+      // the EFS-mounted .wwebjs_auth session dir AFTER the awaited call already
+      // returned — these surface as unhandledRejection/uncaughtException with no
+      // catch site. Swallow ONLY that narrow class (matched on BOTH error code
+      // AND a path/message referencing .wwebjs_auth) to keep the WA host alive.
+      // Everything else keeps normal semantics: a real uncaughtException still
+      // exits(1) so ECS restarts cleanly (a dropped Mongo connection etc. must
+      // NOT be eaten).
+      const isWwebjsLockError = (err: unknown): boolean => {
+        const e = err as any;
+        const code = e?.code;
+        if (code !== "EBUSY" && code !== "ENOTEMPTY" && code !== "ENOENT") return false;
+        const haystack = `${e?.path ?? ""} ${e?.message ?? ""} ${e?.stack ?? ""}`;
+        return haystack.includes(".wwebjs_auth");
+      };
+
+      process.on("unhandledRejection", (reason: unknown) => {
+        if (isWwebjsLockError(reason)) {
+          const e = reason as any;
+          logger.warn("[WA] Swallowed .wwebjs_auth lock unhandledRejection — process kept alive", {
+            code: e?.code,
+            path: e?.path,
+            message: e?.message,
+          });
+          return;
+        }
+        // Non-matching: log loudly, keep current behavior (do not force-exit on
+        // unhandled rejections).
+        const e = reason as any;
+        logger.error("Unhandled promise rejection", {
+          message: e?.message ?? String(reason),
+          stack: e?.stack,
+          name: e?.name,
+        });
+      });
+
+      process.on("uncaughtException", (err: Error) => {
+        if (isWwebjsLockError(err)) {
+          const e = err as any;
+          logger.warn("[WA] Swallowed .wwebjs_auth lock uncaughtException — process kept alive", {
+            code: e?.code,
+            path: e?.path,
+            message: err?.message,
+          });
+          return;
+        }
+        // Non-matching: log loudly and exit so ECS restarts cleanly. Do NOT
+        // silently continue — a corrupted process state (dropped Mongo
+        // connection, etc.) must not be eaten.
+        logger.error("Uncaught exception — exiting(1) for a clean ECS restart", {
+          message: err?.message,
+          stack: err?.stack,
+          name: err?.name,
+        });
+        process.exit(1);
+      });
+
       await connectDb();
 
-      // 🔥 START BACKGROUND WORKERS (ADDED – SAFE)
-      startBackgroundWorkers();
+      // WA_HOST=true designates the dedicated WhatsApp host — the always-on
+      // Fargate service that owns the single whatsapp-web.js client
+      // (clientId "plumtrips-eod"). That host runs ONLY the EOD + Sales Pulse
+      // WhatsApp crons; every other cron/worker runs on the primary backend
+      // instead, so they never double-fire (duplicate emails, Gmail ingestion,
+      // static-data refreshes) across the two always-on hosts.
+      const IS_WA_HOST = process.env.WA_HOST === "true";
 
-      // ✅ START REPORT SCHEDULER
-      const { startReportScheduler } = await import("./jobs/reportScheduler.js");
-      startReportScheduler();
-
-      // ✅ START EOD WHATSAPP CRON
+      // ✅ START EOD WHATSAPP CRON (also self-gated by EOD_CRON_DISABLED)
       const { startEodCron } = await import("./jobs/eodCron.js");
       startEodCron().catch((e: unknown) => logger.error("[EOD] Cron start failed", { e }));
 
@@ -688,30 +748,41 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       const { startSalesPulseCron } = await import("./jobs/crmSalesPulseCron.js");
       startSalesPulseCron().catch((e: unknown) => logger.error("[SalesPulse] Cron start failed", { e }));
 
-      // PLUMBOX-005: Hold-booking voucher deadline reminders (24h + 1h)
-      const { startHoldBookingReminderCron } = await import("./jobs/hold-booking-reminder.js");
-      startHoldBookingReminderCron();
+      if (!IS_WA_HOST) {
+        // 🔥 START BACKGROUND WORKERS (ADDED – SAFE)
+        startBackgroundWorkers();
 
-      // BUCKET-C-1: TBO static data refresh (15-day spec rule)
-      const { startStaticDataRefreshCron, seedStaticDataIfEmpty } = await import("./jobs/static-data-refresh.js");
-      startStaticDataRefreshCron();
-      seedStaticDataIfEmpty().catch((e: unknown) => logger.warn("[StaticRefresh] Seed failed", { e }));
+        // ✅ START REPORT SCHEDULER
+        const { startReportScheduler } = await import("./jobs/reportScheduler.js");
+        startReportScheduler();
 
-      // BUCKET-C-3: Orphaned PENDING booking cleanup (hourly)
-      const { startOrphanPendingCleanupCron } = await import("./jobs/orphan-pending-cleanup.js");
-      startOrphanPendingCleanupCron();
+        // PLUMBOX-005: Hold-booking voucher deadline reminders (24h + 1h)
+        const { startHoldBookingReminderCron } = await import("./jobs/hold-booking-reminder.js");
+        startHoldBookingReminderCron();
 
-      // TICKETING: Auto-ingest Gmail → tickets (every 60s)
-      const { startTicketIngestionCron } = await import("./jobs/ticketIngestionCron.js");
-      startTicketIngestionCron();
+        // BUCKET-C-1: TBO static data refresh (15-day spec rule)
+        const { startStaticDataRefreshCron, seedStaticDataIfEmpty } = await import("./jobs/static-data-refresh.js");
+        startStaticDataRefreshCron();
+        seedStaticDataIfEmpty().catch((e: unknown) => logger.warn("[StaticRefresh] Seed failed", { e }));
 
-      // TASKS: Email reminders (due-soon / due-now / overdue) — every 5 min
-      const { startTaskReminderCron } = await import("./jobs/taskReminderCron.js");
-      startTaskReminderCron();
+        // BUCKET-C-3: Orphaned PENDING booking cleanup (hourly)
+        const { startOrphanPendingCleanupCron } = await import("./jobs/orphan-pending-cleanup.js");
+        startOrphanPendingCleanupCron();
 
-      // TASKS: Daily digest at 10:00 AM IST
-      const { startTaskDigestCron } = await import("./jobs/taskDigestCron.js");
-      startTaskDigestCron();
+        // TICKETING: Auto-ingest Gmail → tickets (every 60s)
+        const { startTicketIngestionCron } = await import("./jobs/ticketIngestionCron.js");
+        startTicketIngestionCron();
+
+        // TASKS: Email reminders (due-soon / due-now / overdue) — every 5 min
+        const { startTaskReminderCron } = await import("./jobs/taskReminderCron.js");
+        startTaskReminderCron();
+
+        // TASKS: Daily digest at 10:00 AM IST
+        const { startTaskDigestCron } = await import("./jobs/taskDigestCron.js");
+        startTaskDigestCron();
+      } else {
+        logger.info("[WA-HOST] WA_HOST=true — running EOD + Sales Pulse crons only; all other crons/workers skipped on this host");
+      }
 
       const server = app.listen(env.PORT, () => {
         logger.info("API running", { port: env.PORT });

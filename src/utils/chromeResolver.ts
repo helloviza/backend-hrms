@@ -14,6 +14,61 @@
 // NODE_ENV=production for sparticuz to be used.
 
 import type { LaunchOptions } from "puppeteer-core";
+import fs from "fs";
+import path from "path";
+
+/**
+ * Remove ONLY the Chromium singleton-lock artifacts left behind when a previous
+ * Chrome process died without cleanup (e.g. an ECS task killed mid-run, or an
+ * EBUSY/ENOTEMPTY churn under the EFS-mounted session dir). These stale locks
+ * make a fresh puppeteer launch hang or throw EBUSY/ENOTEMPTY when whatsapp-web.js
+ * reuses the LocalAuth user-data-dir.
+ *
+ * SAFETY: this NEVER touches the auth credential files written by LocalAuth
+ * (IndexedDB / Local Storage / Cookies), and NEVER wipes the session dir — so it
+ * does not force a re-QR on boot. It only deletes the known Chromium lock files
+ * (SingletonLock, SingletonSocket, SingletonCookie, DevToolsActivePort) and any
+ * `.nfs*` siblings (orphaned NFS/EFS delete-on-close stubs), scanning both the
+ * session root and its `Default/` profile dir.
+ *
+ * Returns the list of paths actually removed so the caller can log them.
+ */
+export function cleanStaleChromeLocks(sessionDir: string): string[] {
+  const LOCK_NAMES = new Set([
+    "SingletonLock",
+    "SingletonSocket",
+    "SingletonCookie",
+    "DevToolsActivePort",
+  ]);
+
+  const removed: string[] = [];
+  // Chromium writes singleton locks at the user-data-dir root; some land under
+  // the Default profile. Scan both, skip whatever doesn't exist yet.
+  const dirsToScan = [sessionDir, path.join(sessionDir, "Default")];
+
+  for (const dir of dirsToScan) {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      continue; // dir absent (first boot / not yet created) — nothing to clean
+    }
+    for (const entry of entries) {
+      const isLock = LOCK_NAMES.has(entry) || entry.startsWith(".nfs");
+      if (!isLock) continue;
+      const target = path.join(dir, entry);
+      try {
+        fs.rmSync(target, { recursive: true, force: true });
+        removed.push(target);
+      } catch {
+        // best-effort: a still-held lock will surface as a launch error, which
+        // the initialize() timeout + ECS restart path handles.
+      }
+    }
+  }
+
+  return removed;
+}
 
 export async function getChromeLaunchOptions(): Promise<LaunchOptions> {
   const isProduction = process.env.NODE_ENV === "production";
@@ -29,19 +84,18 @@ export async function getChromeLaunchOptions(): Promise<LaunchOptions> {
   // unpack + whatsapp-web.js Client.inject can exceed puppeteer's 30s default.
   const PROTOCOL_TIMEOUT = 180_000;
 
-  // @deprecated ABANDONED — see infra/audit/eod-render-lambda-plan-2026-05-27.md.
-  // EC2/Fargate path that used real Google Chrome at /usr/bin/google-chrome,
-  // intended for the never-wired Fargate EOD task. EOD now renders via the
-  // voucher render Lambda; EOD_USE_SYSTEM_CHROME is not set on App Runner. Kept
-  // only for the voucher in-process pdfkit fallback's launch resolution.
-  //
-  // EC2 path — uses real Google Chrome installed at /usr/bin/google-chrome.
-  // Bypasses Sparticuz entirely; the system binary already has all runtime libs.
+  // System-Chromium path — ACTIVE on the dedicated WhatsApp host (ECS Fargate
+  // `plumtrips-eod-wa`), which sets EOD_USE_SYSTEM_CHROME=true. whatsapp-web.js
+  // hangs on @sparticuz/chromium's headless-shell (Runtime.callFunctionOn
+  // timeouts during Store injection), so the WA-host image (apps/backend/
+  // Dockerfile) installs a real Chromium at /usr/bin/chromium and we point
+  // puppeteer-core straight at it — the same approach that worked on the old EC2
+  // host. CHROME_PATH overrides the default for other environments.
   if (process.env.EOD_USE_SYSTEM_CHROME === "true") {
     return {
       headless: true,
       args: baseArgs,
-      executablePath: "/usr/bin/google-chrome",
+      executablePath: process.env.CHROME_PATH || "/usr/bin/chromium",
       protocolTimeout: PROTOCOL_TIMEOUT,
     };
   }

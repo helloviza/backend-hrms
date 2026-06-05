@@ -1,13 +1,18 @@
-# @deprecated SUPERSEDED — see infra/audit/eod-render-lambda-plan-2026-05-27.md.
-# This was the alternative "App Runner on a custom container image" approach:
-# a Debian-slim image with libnss3 + GTK/fontconfig so in-process
-# @sparticuz/chromium could run for EOD images and voucher PDFs. It was NEVER
-# adopted — the LIVE App Runner service runs the MANAGED nodejs20 runtime
-# (infra/apprunner.yaml), and all Chromium rendering is offloaded to the
-# render Lambda (vouchers: PDF; EOD: PNG). Retained for reference only; do not
-# switch App Runner to this image without revisiting that plan.
+# ACTIVE — this is the `plumtrips-hrms-eod` image for the dedicated WhatsApp
+# host (ECS Fargate service `plumtrips-eod-wa`, task-def `plumtrips-eod`,
+# WA_HOST=true). whatsapp-web.js drives a real Chromium via puppeteer, which the
+# App Runner managed nodejs runtime cannot provide — hence this custom image.
 #
-# Backend container image for AWS App Runner.
+# NOTE (still true): do NOT switch the main App Runner backend service to this
+# image. App Runner runs the MANAGED nodejs runtime (infra/apprunner.yaml) and
+# offloads voucher/EOD rendering to the render Lambda. This image is ONLY for
+# the WA host. See infra/audit/eod-render-lambda-plan-2026-05-27.md.
+#
+# Chromium choice: the WA host sets EOD_USE_SYSTEM_CHROME=true so chromeResolver
+# uses the real system Chromium installed below (/usr/bin/chromium). This mirrors
+# the proven EC2 setup; @sparticuz/chromium's headless-shell hung whatsapp-web.js.
+#
+# Backend container image (Debian slim + system Chromium).
 #
 # Build context: the apps/backend subtree (this is what App Runner sees from
 # the GitHub backend-hrms repo, which is the apps/backend/ subtree split of
@@ -47,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfontconfig1 \
     libfreetype6 \
     curl \
+    chromium \
     && rm -rf /var/lib/apt/lists/*
 
 # Match the package manager declared in apps/backend/package.json (pnpm@8.15.4).
