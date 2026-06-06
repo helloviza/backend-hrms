@@ -3,7 +3,7 @@ runtime: nodejs20
 build:
   commands:
     pre-build:
-      - npm install -g pnpm
+      - npm install -g pnpm@9.0.0
     build:
       - pnpm install --filter "@plumtrips/hrms-backend..." --frozen-lockfile
       - pnpm --filter "@plumtrips/hrms-backend" build
