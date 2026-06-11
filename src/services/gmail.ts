@@ -1,5 +1,5 @@
 import { google, type gmail_v1 } from "googleapis";
-import { JWT, type OAuth2Client } from "google-auth-library";
+import { JWT } from "google-auth-library";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
@@ -51,7 +51,8 @@ export function initGmailClient(): gmail_v1.Gmail {
     subject: inboxEmail,
   });
 
-  _client = google.gmail({ version: "v1", auth: auth as OAuth2Client });
+  // as any: App Runner's lockfile-less build can resolve two google-auth-library copies (10.7.0 + 10.5.0 via googleapis-common) whose OAuth2Client types are nominally incompatible; runtime is unaffected.
+  _client = google.gmail({ version: "v1", auth: auth as any });
   logger.info("[Gmail] Client initialized", { impersonating: inboxEmail });
   return _client;
 }
