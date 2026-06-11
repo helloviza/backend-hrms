@@ -1,5 +1,5 @@
 import { google, type gmail_v1 } from "googleapis";
-import { JWT } from "google-auth-library";
+import { JWT, type OAuth2Client } from "google-auth-library";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
@@ -51,7 +51,7 @@ export function initGmailClient(): gmail_v1.Gmail {
     subject: inboxEmail,
   });
 
-  _client = google.gmail({ version: "v1", auth });
+  _client = google.gmail({ version: "v1", auth: auth as OAuth2Client });
   logger.info("[Gmail] Client initialized", { impersonating: inboxEmail });
   return _client;
 }
