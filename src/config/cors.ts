@@ -4,6 +4,7 @@ import { env } from "./env.js";
 
 const ALLOWED_ORIGINS = [
   "https://plumbox.plumtrips.com",
+  "https://www.plumbox.plumtrips.com",
   "https://app.plumbox.in",
   "http://localhost:5173",
   "http://localhost:3000",
@@ -22,7 +23,7 @@ export const corsMiddleware = cors({
       return callback(null, true);
     }
     console.warn(`[CORS BLOCKED] Origin: ${origin}`);
-    return callback(new Error(`Origin ${origin} not allowed`), false);
+    return callback(null, false);
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
