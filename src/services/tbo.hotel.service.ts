@@ -1,4 +1,5 @@
 import { logTBOCall } from "../utils/tboFileLogger.js";
+import { TBO_URLS } from "../config/tboUrls.js";
 
 export interface VoucherPanPayload {
   isCorporate: boolean;
@@ -40,7 +41,7 @@ export async function getBookingDetail(lookups: BookingDetailLookup[]): Promise<
 
       const t0 = Date.now();
       const res = await fetch(
-        "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+        TBO_URLS.GET_BOOKING_DETAIL,
         { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Basic ${creds}` }, body: JSON.stringify(payload) }
       );
       const result = (await res.json()) as any;
@@ -89,7 +90,7 @@ export async function generateHotelVoucher(bookingId: number, panPayload?: Vouch
 
   const start = Date.now();
   const response = await fetch(
-    "https://hotelbe.tektravels.com/hotelservice.svc/rest/GenerateVoucher/",
+    TBO_URLS.GENERATE_VOUCHER,
     {
       method: "POST",
       headers: {

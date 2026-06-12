@@ -15,6 +15,7 @@ import {
   type HotelCity,
 } from "../shared/cities.js";
 import { resolveCityCode as resolveCityCodeAgainstCatalog } from "../jobs/static-data-refresh.js";
+import { TBO_URLS } from "../config/tboUrls.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -159,7 +160,7 @@ export async function getCachedCountryList(): Promise<{ Code: string; Name: stri
   // TBO spec: CountryList is GET-only. POST returns 405 with plain text body
   // that crashes res.json(). Do not poison cache on failure — return last value
   // (or [] on cold start) so the caller can retry on the next request.
-  const url = "https://api.tbotechnology.in/TBOHolidays_HotelAPI/CountryList";
+  const url = TBO_URLS.COUNTRY_LIST;
   const res = await fetch(url, {
     method: "GET",
     headers: { Authorization: hotelStaticAuthHeader() },
@@ -178,7 +179,7 @@ export async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
   const tboPayload = { CountryCode: countryCode };
   const t0 = Date.now();
   const res = await fetch(
-    `https://api.tbotechnology.in/TBOHolidays_HotelAPI/CityList?CountryCode=${countryCode}`,
+    `${TBO_URLS.CITY_LIST}?CountryCode=${countryCode}`,
     {
       method: "POST",
       headers: {
@@ -218,7 +219,7 @@ export async function fetchHotelCodeList(
   const tboPayload = { CityCode: cityCode, CountryCode: countryCode };
   const t0 = Date.now();
   const res = await fetch(
-    "https://api.tbotechnology.in/TBOHolidays_HotelAPI/TBOHotelCodeList",
+    TBO_URLS.TBO_HOTEL_CODE_LIST,
     {
       method: "POST",
       headers: {

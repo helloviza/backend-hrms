@@ -29,6 +29,7 @@ import {
   applyMarginWithFloor,
 } from "../utils/margin.js";
 import { sbtLogger } from "../utils/logger.js";
+import { TBO_URLS } from "../config/tboUrls.js";
 
 // Re-export the cityCache for backward compat if anything imports it from here.
 // Anything new should import directly from tbo.hotel.shared.
@@ -221,7 +222,7 @@ export async function searchHotels(
       };
       const t0 = Date.now();
       try {
-        const r = await fetch("https://affiliate.tektravels.com/HotelAPI/Search", {
+        const r = await fetch(TBO_URLS.SEARCH, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",

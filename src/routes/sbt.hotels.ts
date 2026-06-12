@@ -38,6 +38,7 @@ import {
 import { runDeferredStatusCheck } from "../jobs/deferred-status-check.js";
 import { BLOCKED_CORPORATE_PANS } from "../config/corporate-pan-blocklist.js";
 import { maybeRouteToDemoSimulator } from "../utils/demoSimulator.js";
+import { TBO_URLS } from "../config/tboUrls.js";
 
 // TBO cert Item 31 — TBO recommends ≥120s before calling GetBookingDetail.
 const DEFERRED_STATUS_CHECK_DELAY_MS = 120_000;
@@ -785,7 +786,7 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
     const data = await withTBOSessionRetry(
       async (_tokenId) => {
         const res = await fetch(
-          "https://affiliate.tektravels.com/HotelAPI/PreBook",
+          TBO_URLS.PREBOOK,
           {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
@@ -1530,7 +1531,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       };
       const dt0 = Date.now();
       const detailRes = await fetch(
-        "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+        TBO_URLS.GET_BOOKING_DETAIL,
         {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
@@ -1812,7 +1813,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       const bookTimer = setTimeout(() => bookController.abort(), 120_000);
       try {
         const tboRes = await fetch(
-          "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
+          TBO_URLS.BOOK,
           {
             method: "POST",
             headers: {
@@ -1848,7 +1849,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
         const _srT0 = Date.now();
         try {
           const _srRes = await fetch(
-            "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
+            TBO_URLS.BOOK,
             {
               method: "POST",
               headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
@@ -1957,7 +1958,7 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
             try {
               const retryT0 = Date.now();
               const retryRes = await fetch(
-                "https://hotelbe.tektravels.com/hotelservice.svc/rest/book/",
+                TBO_URLS.BOOK,
                 {
                   method: "POST",
                   headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
@@ -2759,7 +2760,7 @@ router.post("/bookings/sync-all-pending", requireAuth, async (req: any, res: any
         };
         const t0 = Date.now();
         const tboRes = await fetch(
-          "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+          TBO_URLS.GET_BOOKING_DETAIL,
           {
             method: "POST",
             headers: {
@@ -2829,7 +2830,7 @@ router.post("/bookings/:id/sync-status", requireAuth, async (req: any, res: any)
     };
     const t0 = Date.now();
     const tboRes = await fetch(
-      "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+      TBO_URLS.GET_BOOKING_DETAIL,
       {
         method: "POST",
         headers: {
@@ -3082,7 +3083,7 @@ async function pollCancelStatusBackground(
       const statusPayload = { BookingMode: 5, ChangeRequestId: changeRequestId, EndUserIp: endUserIp };
       const t1 = Date.now();
       const statusRes = await fetch(
-        "https://HotelBE.tektravels.com/hotelservice.svc/rest/GetChangeRequestStatus",
+        TBO_URLS.GET_CHANGE_REQUEST_STATUS,
         { method: "POST", headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() }, body: JSON.stringify(statusPayload) }
       );
       const statusData = (await statusRes.json()) as any;
@@ -3168,7 +3169,7 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
     };
     const t0 = Date.now();
     const changeRes = await fetch(
-      "https://HotelBE.tektravels.com/hotelservice.svc/rest/SendChangeRequest",
+      TBO_URLS.SEND_CHANGE_REQUEST,
       {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: hotelAuthHeader() },
@@ -3345,7 +3346,7 @@ router.get("/images", requireAuth, async (req: any, res: any) => {
     try {
       const t0 = Date.now();
       const tboRes = await fetch(
-        "https://api.tbotechnology.in/TBOHolidays_HotelAPI/HotelDetails",
+        TBO_URLS.HOTEL_DETAILS,
         {
           method: "POST",
           headers: {
@@ -3419,7 +3420,7 @@ router.get("/details", requireAuth, async (req: any, res: any) => {
     try {
       const t0 = Date.now();
       const tboRes = await fetch(
-        "https://api.tbotechnology.in/TBOHolidays_HotelAPI/HotelDetails",
+        TBO_URLS.HOTEL_DETAILS,
         {
           method: "POST",
           headers: {
@@ -3511,7 +3512,7 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
     let data: any;
     try {
       const t0 = Date.now();
-      const tboRes = await fetch("https://affiliate.tektravels.com/HotelAPI/Search", {
+      const tboRes = await fetch(TBO_URLS.SEARCH, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
