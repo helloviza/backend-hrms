@@ -10,6 +10,7 @@ import { getBookingDetail } from "../services/tbo.hotel.service.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 import logger from "../utils/logger.js";
 import { runDeferredStatusCheckSweep } from "./deferred-status-check.js";
+import { TBO_URLS } from "../config/tboUrls.js";
 
 // Prevents overlapping sweeps if a tick runs slower than the cron interval.
 let _deferredSweepRunning = false;
@@ -19,7 +20,7 @@ async function verifyWithTBO(bookingId: number): Promise<string | null> {
     const rawData = await withTBOSessionRetry(
       async (tokenId) => {
         const res = await fetch(
-          "https://hotelbe.tektravels.com/hotelservice.svc/rest/GetBookingDetail/",
+          TBO_URLS.GET_BOOKING_DETAIL,
           {
             method: "POST",
             headers: {

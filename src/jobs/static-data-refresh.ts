@@ -6,6 +6,7 @@ import mongoose, { Schema, model } from "mongoose";
 import logger from "../utils/logger.js";
 import { tboFetchFailed } from "../utils/tboFetchGuard.js";
 import { HOTEL_INDEX_CITIES, type HotelCity } from "../shared/cities.js";
+import { TBO_URLS } from "../config/tboUrls.js";
 
 // ── Inline model for refresh log (avoids separate model file) ──────────────
 
@@ -74,7 +75,7 @@ function staticAuthHeader(): string {
 async function fetchCountryList(): Promise<{ Code: string; Name: string }[]> {
   // TBO spec (UNIVERSAL_Hotel_API_Technical_Guide §FAQ): CountryList is GET.
   // POST returns 405 "Method Not Allowed" as plain text, which crashes res.json().
-  const url = "https://api.tbotechnology.in/TBOHolidays_HotelAPI/CountryList";
+  const url = TBO_URLS.COUNTRY_LIST;
   const res = await fetch(url, {
     method: "GET",
     headers: { Authorization: staticAuthHeader() },
@@ -88,7 +89,7 @@ async function fetchCountryList(): Promise<{ Code: string; Name: string }[]> {
 async function fetchCityList(
   countryCode: string,
 ): Promise<{ Code: string; Name: string }[]> {
-  const url = `https://api.tbotechnology.in/TBOHolidays_HotelAPI/CityList?CountryCode=${countryCode}`;
+  const url = `${TBO_URLS.CITY_LIST}?CountryCode=${countryCode}`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -109,7 +110,7 @@ async function fetchHotelCodes(
   cityCode: string,
   countryCode: string,
 ): Promise<{ HotelCode: string; HotelName: string; Latitude: string; Longitude: string; HotelRating: string; Address: string }[]> {
-  const url = "https://api.tbotechnology.in/TBOHolidays_HotelAPI/TBOHotelCodeList";
+  const url = TBO_URLS.TBO_HOTEL_CODE_LIST;
   const res = await fetch(url, {
     method: "POST",
     headers: {
