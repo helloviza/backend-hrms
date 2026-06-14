@@ -1024,7 +1024,7 @@ router.get("/export", requirePermission("invoices", "READ"), async (req: any, re
 // Streams a zip of FRESHLY re-rendered PDFs for every invoice matching the
 // current filter (same selection as the export handler above). Each PDF is
 // rendered in-process from current DB state — the stored pdfUrl/S3 object is
-// never read — so the zip can never ship a stale document. Hard-capped at 100
+// never read — so the zip can never ship a stale document. Hard-capped at 250
 // invoices to stay within the App Runner synchronous request window. Must be
 // registered before the GET "/:id" route so the literal path is matched.
 router.get("/bulk-pdf", requirePermission("invoices", "READ"), async (req: any, res: any) => {
@@ -1050,9 +1050,9 @@ router.get("/bulk-pdf", requirePermission("invoices", "READ"), async (req: any, 
     if (invoices.length === 0) {
       return res.status(404).json({ error: "No invoices match the current filter" });
     }
-    if (invoices.length > 100) {
+    if (invoices.length > 250) {
       return res.status(413).json({
-        error: `Too many invoices (${invoices.length}). Narrow the filter (client + date range) to 100 or fewer.`,
+        error: `Too many invoices (${invoices.length}). Narrow the filter (client + date range) to 250 or fewer.`,
       });
     }
 
