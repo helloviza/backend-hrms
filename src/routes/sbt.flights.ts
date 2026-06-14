@@ -1734,6 +1734,57 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       chargedTotal: typeof b.totalFare === "number" ? b.totalFare : undefined,
     });
 
+    // Keystone: normalize the supplier net + margin onto the booking at save so the
+    // flight Margin / NET-cost report columns have a DURABLE source. Today raw is a
+    // Mixed blob (needs parsing) and the SBTQuote snapshot self-expires at 60 min —
+    // neither is queryable at report time. Additive and fail-soft: a parse miss must
+    // never block or fail the save (the TBO booking is already confirmed).
+    //
+    // ANCILLARY CAVEAT: the raw FlightItinerary.Fare net is air-fare-only (base+taxes),
+    // while totalFare includes SSR seat/meal/baggage extras. When ancillaries are
+    // present, marginAmount below absorbs them and OVERSTATES true margin — this is
+    // flagged for review, NOT silently adjusted here.
+    let normNetAmount = 0;
+    try {
+      const rawForFare = b.raw as any;
+      // GDS Ticket double-nests (Response.Response.FlightItinerary); LCC TicketLCC
+      // single-nests (Response.FlightItinerary). Mirror the fix-zero-fares reader below.
+      const tboFare =
+        rawForFare?.Response?.Response?.FlightItinerary?.Fare ??
+        rawForFare?.Response?.FlightItinerary?.Fare ??
+        rawForFare?.FlightItinerary?.Fare ??
+        rawForFare?.Fare ??
+        null;
+      // OfferedFare is the net we actually pay TBO (Published − commission); prefer it.
+      const rawNet = Number(tboFare?.OfferedFare || tboFare?.PublishedFare || tboFare?.TotalFare || 0);
+      if (Number.isFinite(rawNet) && rawNet > 0) {
+        normNetAmount = rawNet;
+      } else if (b.traceId && reconResultIndex) {
+        // Fallback: the SBTQuote snapshot persisted at FareQuote, by the exact key the
+        // price-recon checks use. Still fresh at save time (TTL 60 min).
+        const snap = await SBTQuote.findOne({
+          product: "FLIGHT",
+          sourceRef: `${b.traceId}:${reconResultIndex}`,
+        })
+          .sort({ createdAt: -1 })
+          .lean();
+        const snapNet = Number((snap as any)?.serverNetFare);
+        if (Number.isFinite(snapNet) && snapNet > 0) normNetAmount = snapNet;
+      }
+    } catch (normErr: any) {
+      // Fail-soft: never block the save on a normalization miss.
+      sbtLogger.warn("[booking-save] supplier-net normalize failed", {
+        traceId: b.traceId,
+        err: normErr?.message,
+      });
+    }
+    const normTotalFare = Number(b.totalFare) || 0;
+    // Guard: only compute margin when net resolved (>0). If unresolved, leave 0 rather
+    // than write a wrong margin from a missing net.
+    const normMarginAmount = normNetAmount > 0 ? normTotalFare - normNetAmount : 0;
+    const normMarginPercent =
+      normNetAmount > 0 ? Math.round((normMarginAmount / normNetAmount) * 100 * 100) / 100 : 0;
+
     const doc = await SBTBooking.create({
       userId: bookingUserId,
       customerId: (req.user as any)?.customerId ?? undefined,
@@ -1760,6 +1811,11 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       taxes: b.taxes ?? 0,
       extras: b.extras ?? 0,
       totalFare: b.totalFare,
+      // Keystone normalize (see block above): durable supplier net + margin.
+      netAmount: normNetAmount,
+      displayAmount: normTotalFare,
+      marginAmount: normMarginAmount,
+      marginPercent: normMarginPercent,
       currency: b.currency ?? "INR",
       isLCC: b.isLCC ?? false,
       razorpayPaymentId: b.razorpayPaymentId ?? "",
