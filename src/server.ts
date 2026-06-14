@@ -520,6 +520,11 @@ app.use("/api/admin", users);
 import adminDataExportRouter from "./routes/admin.dataExport.js";
 app.use("/api/admin", adminDataExportRouter);
 
+// Admin — SBT Booking Register (Super-Admin + @plumtrips.com only; exposes
+// cross-company supplier cost/margin — guards live inside the router).
+import sbtBookingRegisterRouter from "./routes/sbt.bookingRegister.js";
+app.use("/api/admin/sbt/booking-register", sbtBookingRegisterRouter);
+
 // Admin — Payment orphans (Razorpay webhook mismatches)
 import adminPaymentOrphansRouter from "./routes/admin.paymentOrphans.js";
 if (env.DEPLOYMENT_MODE === "plumbox") {
