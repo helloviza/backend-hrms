@@ -189,7 +189,17 @@ export async function fetchCityList(countryCode: string): Promise<CityEntry[]> {
       body: JSON.stringify(tboPayload),
     },
   );
-  const data = (await res.json()) as { CityList?: { Code: string; Name: string }[] };
+  // TEMP DIAG (revert after) — surface raw static-catalog response in CloudWatch.
+  const bodyText = await res.text();
+  sbtLogger.error("TBO_STATIC_DIAG", {
+    call: "CityList",
+    url: `${TBO_URLS.CITY_LIST}?CountryCode=${countryCode}`,
+    status: res.status,
+    statusText: res.statusText,
+    ok: res.ok,
+    body: bodyText.slice(0, 500),
+  });
+  const data = JSON.parse(bodyText) as { CityList?: { Code: string; Name: string }[] };
   logTBOCall({
     method: "HotelCityList",
     traceId: `city-${countryCode}`,
@@ -229,7 +239,17 @@ export async function fetchHotelCodeList(
       body: JSON.stringify(tboPayload),
     },
   );
-  const data = (await res.json()) as { Hotels?: HotelCodeEntry[] };
+  // TEMP DIAG (revert after) — surface raw static-catalog response in CloudWatch.
+  const bodyText = await res.text();
+  sbtLogger.error("TBO_STATIC_DIAG", {
+    call: "TBOHotelCodeList",
+    url: TBO_URLS.TBO_HOTEL_CODE_LIST,
+    status: res.status,
+    statusText: res.statusText,
+    ok: res.ok,
+    body: bodyText.slice(0, 500),
+  });
+  const data = JSON.parse(bodyText) as { Hotels?: HotelCodeEntry[] };
   logTBOCall({
     method: "HotelCodeList",
     traceId: `codes-${cityCode}`,
