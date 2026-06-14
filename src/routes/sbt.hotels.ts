@@ -6,6 +6,7 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import SBTQuote from "../models/SBTQuote.js";
+import { reconcileQuoteShadow } from "../utils/priceRecon.js";
 import SBTRequest from "../models/SBTRequest.js";
 import SBTConfig from "../models/SBTConfig.js";
 import { generateHotelVoucher, getBookingDetail } from "../services/tbo.hotel.service.js";
@@ -1160,6 +1161,21 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
       return res.status(410).json({
         code: "SESSION_EXPIRED_RESEARCH_REQUIRED",
         message: "Your search session has expired. Please search again to continue.",
+      });
+    }
+
+    // Price-recon step 2: SHADOW both the customer-charged total and the net we're
+    // about to send TBO against the server's stored PreBook quote. Both are present
+    // here: NetAmount (TBO-net) and customerChargedAmount (display), keyed by
+    // BookingCode. Log-only; never blocks the booking.
+    {
+      const reconCharged = Number(req.body?.customerChargedAmount);
+      const reconNet = Number(NetAmount);
+      await reconcileQuoteShadow({
+        product: "HOTEL",
+        sourceRef: BookingCode,
+        chargedTotal: Number.isFinite(reconCharged) && reconCharged > 0 ? reconCharged : undefined,
+        tboNet: Number.isFinite(reconNet) && reconNet > 0 ? reconNet : undefined,
       });
     }
 

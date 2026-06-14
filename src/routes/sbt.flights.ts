@@ -10,6 +10,7 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTQuote from "../models/SBTQuote.js";
+import { reconcileQuoteShadow } from "../utils/priceRecon.js";
 import SBTRequest from "../models/SBTRequest.js";
 import SBTConfig from "../models/SBTConfig.js";
 import User from "../models/User.js";
@@ -922,6 +923,21 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
     }
     const bookIsCorporate = req.body.corporateBookingAllowed === true && !!bookCorporatePAN;
 
+    // Price-recon step 2: SHADOW the net we're about to send TBO against the
+    // server's stored FareQuote. Each pax Fare carries the itinerary-level net
+    // (buildPerPaxFareMap, not divided), so the lead pax OfferedFare == serverNetFare.
+    // Log-only; never blocks. The charged display total is not available here — its
+    // check lives in /bookings/save (totalFare, incl. ancillaries).
+    {
+      const reconFare = bookPassengers?.[0]?.Fare;
+      const reconNet = Number(reconFare?.OfferedFare ?? reconFare?.PublishedFare);
+      await reconcileQuoteShadow({
+        product: "FLIGHT",
+        sourceRef: `${req.body?.TraceId ?? ""}:${req.body?.ResultIndex ?? ""}`,
+        tboNet: Number.isFinite(reconNet) && reconNet > 0 ? reconNet : undefined,
+      });
+    }
+
     const data = await bookFlight({ ...req.body, isNDC: bookIsNDC, airlineCode: bookAirlineCode, destinationCode: req.body?.destinationCode, isCorporate: bookIsCorporate, corporatePAN: bookCorporatePAN }) as any;
 
     // Check for TBO-level failure
@@ -1703,6 +1719,20 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
     if (!b.pnr || !b.bookingId) {
       return res.status(400).json({ error: "Missing PNR or BookingId — booking not saved" });
     }
+
+    // Price-recon step 2: SHADOW the customer-charged total against the server's
+    // stored FareQuote. The save body now carries resultIndex alongside traceId, so
+    // we match the exact quote sourceRef `${traceId}:${resultIndex}` — the same key
+    // the /book net check uses — instead of a traceId-only prefix that could grab a
+    // sibling ResultIndex's quote. A positive displayDelta is EXPECTED — totalFare
+    // includes SSR/seat/meal ancillaries that the base-only serverDisplayFare
+    // excludes. Log-only; never blocks the save.
+    const reconResultIndex = b.resultIndex ?? b.ResultIndex ?? "";
+    await reconcileQuoteShadow({
+      product: "FLIGHT",
+      sourceRef: `${b.traceId ?? ""}:${reconResultIndex}`,
+      chargedTotal: typeof b.totalFare === "number" ? b.totalFare : undefined,
+    });
 
     const doc = await SBTBooking.create({
       userId: bookingUserId,
