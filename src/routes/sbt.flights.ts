@@ -1,5 +1,6 @@
 import express from "express";
 import mongoose from "mongoose";
+import { randomUUID } from "crypto";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import path from "path";
@@ -8,6 +9,7 @@ import { requireAdmin } from "../middleware/rbac.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTBooking from "../models/SBTBooking.js";
+import SBTQuote from "../models/SBTQuote.js";
 import SBTRequest from "../models/SBTRequest.js";
 import SBTConfig from "../models/SBTConfig.js";
 import User from "../models/User.js";
@@ -772,6 +774,38 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
     const fareResults = result?.Response?.Results;
     const corporateBookingAllowed =
       fareResults?.CorporateBookingAllowed || false;
+
+    // Price-recon step 1: persist the server-quoted fares unconditionally so a
+    // later step can compare what the client sends at create-order/book against
+    // what the server actually quoted. Additive — does not alter the response
+    // shape below beyond the additive quoteId field. When margin is off/zero the
+    // raw OfferedFare is also the customer-facing total, so net == display.
+    const fqQuoteFare = fareResults?.Fare;
+    let fqQuoteId: string | undefined;
+    if (fqQuoteFare) {
+      fqQuoteId = randomUUID();
+      const fqDisplayFare = fqQuoteFare.OfferedFare ?? 0;
+      const fqNetFare = fqQuoteFare._netOfferedFare ?? fqDisplayFare;
+      const fqSourceRef = `${req.body?.TraceId ?? ""}:${req.body?.ResultIndex ?? ""}`;
+      try {
+        await SBTQuote.create({
+          quoteId: fqQuoteId,
+          product: "FLIGHT",
+          serverDisplayFare: fqDisplayFare,
+          serverNetFare: fqNetFare,
+          sourceRef: fqSourceRef,
+        });
+      } catch (qErr: any) {
+        // Quote persistence is best-effort scaffolding; never block FareQuote.
+        sbtLogger.error("[price-recon] quote persist failed", {
+          product: "FLIGHT",
+          sourceRef: fqSourceRef,
+          err: qErr?.message,
+        });
+        fqQuoteId = undefined;
+      }
+    }
+
     res.json({
       ...result,
       isPriceChanged: fareResults?.IsPriceChanged || false,
@@ -780,6 +814,7 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
       isseatmandatory: fareResults?.isseatmandatory || false,
       ismealmandatory: fareResults?.ismealmandatory || false,
       corporateBookingAllowed,
+      quoteId: fqQuoteId,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
