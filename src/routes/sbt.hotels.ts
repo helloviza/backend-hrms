@@ -5,6 +5,7 @@ import { requireAdmin } from "../middleware/rbac.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
+import SBTQuote from "../models/SBTQuote.js";
 import SBTRequest from "../models/SBTRequest.js";
 import SBTConfig from "../models/SBTConfig.js";
 import { generateHotelVoucher, getBookingDetail } from "../services/tbo.hotel.service.js";
@@ -884,6 +885,29 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       ? Math.round(agentCommission * 0.02 * 100) / 100 : 0;
     const isPublishedFare: boolean = agentCommission > 0 && netAmount > prebookTotalFare + 0.5;
 
+    // Price-recon step 1: persist the server-quoted fares unconditionally so a
+    // later step can compare what the client sends at create-order/book against
+    // what the server actually quoted. Additive — only adds quoteId to the
+    // response below; no existing field changes.
+    let prebookQuoteId: string | undefined = randomUUID();
+    try {
+      await SBTQuote.create({
+        quoteId: prebookQuoteId,
+        product: "HOTEL",
+        serverDisplayFare: displayTotalFare,
+        serverNetFare: netAmount,
+        sourceRef: BookingCode,
+      });
+    } catch (qErr: any) {
+      // Quote persistence is best-effort scaffolding; never block PreBook.
+      sbtLogger.error("[price-recon] quote persist failed", {
+        product: "HOTEL",
+        sourceRef: BookingCode,
+        err: qErr?.message,
+      });
+      prebookQuoteId = undefined;
+    }
+
     res.json({
       ...data,
       priceChanged,
@@ -899,6 +923,7 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       tds,
       agentCommission,
       isPublishedFare,
+      quoteId: prebookQuoteId,
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "PreBook failed";
