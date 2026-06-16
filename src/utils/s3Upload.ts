@@ -80,6 +80,50 @@ export async function uploadLogoToS3(opts: {
   return { key, url: buildPublicUrl(bucket, key) };
 }
 
+const RECEIPT_EXT_BY_MIME: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/heic": "heic",
+  "application/pdf": "pdf",
+};
+
+/**
+ * Upload an inbound expense-receipt buffer (WhatsApp capture) to S3 under a
+ * workspace-scoped key. Mirrors the tenant-prefix convention used by the other
+ * helpers in this file: hrms/<domain>/<tenant>/<owner>/...
+ */
+export async function uploadExpenseReceiptToS3(opts: {
+  buffer: Buffer;
+  mime: string;
+  workspaceId: string;
+  employeeId: string;
+  messageId: string;
+}): Promise<{ bucket: string; key: string }> {
+  const bucket = env.S3_BUCKET;
+  const ext = RECEIPT_EXT_BY_MIME[opts.mime.toLowerCase()] || "bin";
+  const rand = crypto.randomBytes(8).toString("hex");
+  const key = `hrms/expenses/${opts.workspaceId}/${opts.employeeId}/${Date.now()}-${rand}.${ext}`;
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: opts.buffer,
+      ContentType: opts.mime,
+      Metadata: {
+        workspaceId: opts.workspaceId,
+        employeeId: opts.employeeId,
+        messageId: opts.messageId,
+        sourceChannel: "whatsapp",
+      },
+    }),
+  );
+
+  return { bucket, key };
+}
+
 /**
  * Upload a PDF buffer to S3 and return a presigned, inline-disposition URL.
  * Generic helper extracted from the inline copies in invoices.ts / creditNotes.ts.

@@ -71,3 +71,4 @@ export const authLogger = logger.child({ module: "auth" });
 export const sbtLogger = logger.child({ module: "sbt" });
 export const paymentLogger = logger.child({ module: "payment" });
 export const webhookLogger = logger.child({ module: "webhook" });
+export const whatsappLogger = logger.child({ module: "whatsapp-cloud" });

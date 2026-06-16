@@ -49,6 +49,24 @@ const UserSchema = new Schema(
     phone: { type: String, trim: true },
     personalContact: { type: String, trim: true }, // personal mobile
 
+    /**
+     * WhatsApp sender id for Cloud-API inbound capture (Expense Management).
+     * Stored digits-only (country code + number, no "+"), e.g. "919876543210",
+     * matching Meta's `from` / `wa_id`. Indexed + sparse so unset users are not
+     * matched. Set by an admin or backfill; used to map a WhatsApp sender to a
+     * User/workspace. Empty input is coerced to undefined to keep the index sparse.
+     */
+    waId: {
+      type: String,
+      trim: true,
+      index: true,
+      sparse: true,
+      set: (v: unknown) => {
+        const digits = String(v ?? "").replace(/[^0-9]/g, "");
+        return digits || undefined;
+      },
+    },
+
     passwordHash: { type: String, required: true },
 
     resetTokenHash:   { type: String },

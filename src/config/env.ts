@@ -40,4 +40,14 @@ export const env = {
 
   // --- Pixabay (SBT landing city images) — optional; absent disables auto-resolution ---
   PIXABAY_API_KEY: process.env.PIXABAY_API_KEY || "",
+
+  // --- WhatsApp Cloud API (Expense Management inbound receipt capture) ---------
+  // All optional: when WA_APP_SECRET / WA_ACCESS_TOKEN / WA_PHONE_NUMBER_ID are
+  // unset the webhook still boots but the capture worker stays idle. This is the
+  // Meta Graph / Cloud API path and is independent of the whatsapp-web.js EOD flow.
+  WA_VERIFY_TOKEN: process.env.WA_VERIFY_TOKEN || "",       // GET handshake token
+  WA_APP_SECRET: process.env.WA_APP_SECRET || "",          // X-Hub-Signature-256 key
+  WA_ACCESS_TOKEN: process.env.WA_ACCESS_TOKEN || "",       // Graph API bearer token
+  WA_PHONE_NUMBER_ID: process.env.WA_PHONE_NUMBER_ID || "", // business number id (send replies)
+  WA_GRAPH_VERSION: process.env.WA_GRAPH_VERSION || "v21.0",
 } as const;

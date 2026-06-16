@@ -182,6 +182,13 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/webhooks", express.raw({ type: "application/json" }), razorpayWebhookRouter);
 }
 
+// WhatsApp Cloud API webhook (Expense Management inbound capture).
+// MUST be before express.json() so POST /webhook receives the raw body for
+// X-Hub-Signature-256 verification. Also mounted before the rate limiter so the
+// 5s Meta ack window is never throttled.
+import whatsappWebhookRouter from "./routes/whatsapp.webhook.js";
+app.use("/api/whatsapp", express.raw({ type: "application/json" }), whatsappWebhookRouter);
+
 // JSON parser
 app.use(
   express.json({
@@ -221,7 +228,7 @@ app.use("/api/copilot", copilotLimiter);
  * Skips when req.user is absent (public/webhook routes).
  * Exempts: /api/auth, /api/health, /api/_probe, /api/webhooks
  * ──────────────────────────────────────────────────────────────── */
-const WORKSPACE_EXEMPT = new Set(["/api/auth", "/api/health", "/api/_probe", "/api/webhooks", "/api/stubs"]);
+const WORKSPACE_EXEMPT = new Set(["/api/auth", "/api/health", "/api/_probe", "/api/webhooks", "/api/whatsapp", "/api/stubs"]);
 app.use("/api", (req: any, res, next) => {
   // Skip public routes
   const basePath = "/api" + (req.path.split("/").slice(0, 2).join("/") || "");
