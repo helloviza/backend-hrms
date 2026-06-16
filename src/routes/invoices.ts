@@ -146,7 +146,7 @@ function buildAddressStr(o: {
 // Snapshot wins for any non-empty field (preserves audit trail).
 // Live data fills gaps — handles old invoices where some fields were not
 // snapshotted, and the Molnlycke-pattern where address only exists on CWS.
-async function enrichClientDetails(invoice: any): Promise<any> {
+export async function enrichClientDetails(invoice: any): Promise<any> {
   const snap = invoice.clientDetails ?? {};
   const wsIdStr = invoice.workspaceId?.toString();
 

@@ -210,11 +210,14 @@ export async function generateInvoicePdf(
     doc.on("error", reject);
 
     // ── Table column widths & x positions ──
-    // IGST (5 cols): DESC 50 | QTY 6 | RATE 13 | IGST 13 | AMT 18
-    // Split (6 cols): DESC 41 | QTY 5 | RATE 12 | CGST 12 | SGST 12 | AMT 18
+    // RATE widened (and DESC shrunk by the same amount) so crore-sized 8-digit
+    // INR values don't overflow; DESC+QTY+RATE sum is unchanged, so the
+    // GST/AMOUNT columns keep their exact x-positions.
+    // IGST (5 cols): DESC 48 | QTY 6 | RATE 15 | IGST 13 | AMT 18
+    // Split (6 cols): DESC 39 | QTY 5 | RATE 14 | CGST 12 | SGST 12 | AMT 18
     const COL_W = isIgst
-      ? [CW * 0.50, CW * 0.06, CW * 0.13, CW * 0.13, CW * 0.18]
-      : [CW * 0.41, CW * 0.05, CW * 0.12, CW * 0.12, CW * 0.12, CW * 0.18];
+      ? [CW * 0.48, CW * 0.06, CW * 0.15, CW * 0.13, CW * 0.18]
+      : [CW * 0.39, CW * 0.05, CW * 0.14, CW * 0.12, CW * 0.12, CW * 0.18];
     const COL_X: number[] = [L];
     for (let i = 0; i < COL_W.length - 1; i++) COL_X.push(COL_X[i] + COL_W[i]);
     const HDR_H = 20;
@@ -457,7 +460,8 @@ export async function generateInvoicePdf(
         .replace(/→/g, "->");
       if (!useNoto) {
         descLine2 = descLine2
-          .replace(/—/g, "-")
+          .replace(/–/g, "-")   // en-dash (U+2013) — date-range separator
+          .replace(/—/g, "-")   // em-dash (U+2014)
           .replace(/₹/g, "Rs.")
           .replace(/[^\x00-\x7F]/g, "?");
       }
