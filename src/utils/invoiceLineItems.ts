@@ -379,30 +379,74 @@ function combinedCostLabel(groupKey: string): string {
   return COMBINED_COST_LABELS[groupKey] || TYPE_COST_LABELS[groupKey] || "Service Cost";
 }
 
-// Date range spanning a group: earliest travelDate → latest returnDate (or
-// travelDate when no return). Same-year ranges drop the year ("01 May – 13 May");
-// a single date keeps it ("01 May 2026"); cross-year keeps both years.
-function combinedGroupDateRange(bookings: any[]): string {
+// Resolve a booking's BUSINESS booking date (ms). Fallback chain:
+// bookingDate → reqDate → createdAt. bookingDate is the user-entered business
+// day (stored date-only, UTC midnight) and is preferred over createdAt because
+// createdAt is the system insert instant, which can cross IST midnight for
+// late-evening entries and read a day late. Returns NaN if none are valid.
+function bookingCreationMs(b: any): number {
+  for (const v of [b?.bookingDate, b?.reqDate, b?.createdAt]) {
+    if (!v) continue;
+    const t = new Date(v as string | Date).getTime();
+    if (!isNaN(t)) return t;
+  }
+  return NaN;
+}
+
+// A SINGLE set-wide span derived from booking BUSINESS dates (earliest →
+// latest across ALL selected bookings — NOT per-group), using bookingDate →
+// reqDate → createdAt (see bookingCreationMs). True min/max via comparison,
+// independent of array order (the $in fetch is unsorted). Dates are formatted
+// in IST (Asia/Kolkata); bookingDate is date-only (UTC midnight) so IST
+// rendering (00:00Z → 05:30 IST) keeps it on the same calendar day with no
+// rollover. Same IST day → a single date; same year → drops the year; else
+// both years. Returns "" when no booking yields a valid date.
+// (Name kept for backward-compat: imported by the route + backfill script.)
+export function combinedCreationDateRange(bookings: any[]): string {
   let min: number | null = null;
   let max: number | null = null;
   for (const b of bookings) {
-    const start = b?.travelDate ? new Date(b.travelDate).getTime() : NaN;
-    const endRaw = b?.returnDate || b?.travelDate;
-    const end = endRaw ? new Date(endRaw).getTime() : NaN;
-    if (!isNaN(start)) min = min === null ? start : Math.min(min, start);
-    if (!isNaN(end))   max = max === null ? end   : Math.max(max, end);
+    const t = bookingCreationMs(b);
+    if (isNaN(t)) continue;
+    min = min === null ? t : Math.min(min, t);
+    max = max === null ? t : Math.max(max, t);
   }
-  if (min === null && max === null) return "";
-  const lo = new Date(min ?? (max as number));
-  const hi = new Date(max ?? (min as number));
-  const dm  = (d: Date) => d.toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
-  const dmy = (d: Date) => d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
-  if (lo.getTime() === hi.getTime()) return dmy(lo);
-  if (lo.getFullYear() === hi.getFullYear()) return `${dm(lo)} – ${dm(hi)}`;
-  return `${dmy(lo)} – ${dmy(hi)}`;
+  if (min === null) return "";
+  const lo = new Date(min);
+  const hi = new Date(max as number);
+  const TZ = "Asia/Kolkata";
+  const dm   = (d: Date) => d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", timeZone: TZ });
+  const dmy  = (d: Date) => d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric", timeZone: TZ });
+  const yr   = (d: Date) => d.toLocaleDateString("en-IN", { year: "numeric", timeZone: TZ });
+  const loStr = dmy(lo);
+  const hiStr = dmy(hi);
+  // Same IST calendar day (even at different times) collapses to one date.
+  if (loStr === hiStr) return loStr;
+  if (yr(lo) === yr(hi)) return `${dm(lo)} – ${dm(hi)}`;
+  return `${loStr} – ${hiStr}`;
+}
+
+// Set-wide OLDEST booking date (same bookingDate → reqDate → createdAt chain).
+// Used as the deterministic stored `travelDate` on combined lines so it never
+// depends on the unsorted fetch order. Returns undefined when no valid date.
+// (Name kept for backward-compat: imported by the route + backfill script.)
+export function oldestCreationDate(bookings: any[]): Date | undefined {
+  let min: number | null = null;
+  for (const b of bookings) {
+    const t = bookingCreationMs(b);
+    if (isNaN(t)) continue;
+    min = min === null ? t : Math.min(min, t);
+  }
+  return min === null ? undefined : new Date(min);
 }
 
 export function buildCombinedLineItems(bookings: any[]): any[] {
+  // ONE set-wide creation-date span + oldest-creation date, computed across
+  // ALL selected bookings and stamped identically on every combined line
+  // (all groups, cost AND transaction-fee rows). Not per-group.
+  const dateRange = combinedCreationDateRange(bookings);
+  const oldestCreated = oldestCreationDate(bookings);
+
   // Group bookings (preserving first-seen order), collecting each group's
   // authoritative per-booking lines for summation.
   const groups = new Map<string, { bookings: any[]; lines: any[] }>();
@@ -425,7 +469,6 @@ export function buildCombinedLineItems(bookings: any[]): any[] {
     const costRows = g.lines.filter((li) => li.rowType === "COST");
     const feeRows  = g.lines.filter((li) => li.rowType === "SERVICE_FEE");
 
-    const dateRange = combinedGroupDateRange(g.bookings);
     const refs = g.bookings.map((b) => b.bookingRef).filter(Boolean).join(", ");
     const passengerNames = g.bookings.flatMap((b) => (b.passengers || []).map((p: any) => p.name));
 
@@ -444,7 +487,7 @@ export function buildCombinedLineItems(bookings: any[]): any[] {
       igst:           costIgst,
       amount:         costAmount,
       passengerNames,
-      travelDate:     g.bookings[0]?.travelDate,
+      travelDate:     oldestCreated,
       type:           key,
     });
 
@@ -464,7 +507,7 @@ export function buildCombinedLineItems(bookings: any[]): any[] {
         igst:           feeIgst,
         amount:         feeAmount,
         passengerNames,
-        travelDate:     g.bookings[0]?.travelDate,
+        travelDate:     oldestCreated,
         type:           key,
       });
     }

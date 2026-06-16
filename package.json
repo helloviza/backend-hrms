@@ -8,7 +8,7 @@
     "dev": "tsx watch src/server.ts",
     "dev:test": "node --env-file=.env.test --import tsx src/server.ts",
     "postinstall": "node -e \"if (process.env.NODE_ENV !== 'production') { try { require('child_process').execSync('npx puppeteer browsers install chrome', { stdio: 'inherit' }); } catch (e) { console.warn('[postinstall] puppeteer chrome download skipped:', e?.message); } }\"",
-    "build": "NODE_OPTIONS=--max-old-space-size=4096 tsc -p tsconfig.json && cp -r src/data dist/",
+    "build": "NODE_OPTIONS=--max-old-space-size=4096 tsc -p tsconfig.json && cp -r src/data src/fonts dist/",
     "start": "node dist/server.js",
     "seed": "tsx src/seed/seed.ts",
     "test": "vitest",
