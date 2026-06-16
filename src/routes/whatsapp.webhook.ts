@@ -1,0 +1,132 @@
+// apps/backend/src/routes/whatsapp.webhook.ts
+import { Router, type Request, type Response } from "express";
+import ExpenseCapture from "../models/ExpenseCapture.js";
+import { verifyMetaSignature } from "../services/whatsappCloud.service.js";
+import { env } from "../config/env.js";
+import { whatsappLogger } from "../utils/logger.js";
+
+/**
+ * WhatsApp Cloud API webhook (Expense Management — inbound receipt capture).
+ *
+ * Mounted at /api/whatsapp with express.raw() BEFORE express.json(), so on POST
+ * `req.body` is the raw Buffer needed for X-Hub-Signature-256 verification.
+ * The handler only ENQUEUES (persists a queued ExpenseCapture) and acks within
+ * 5s — media download happens in the background worker.
+ */
+
+const router = Router();
+
+const MEDIA_TYPES = new Set(["image", "document"]);
+
+// GET /webhook — Meta verification handshake
+router.get("/webhook", (req: Request, res: Response) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && env.WA_VERIFY_TOKEN && token === env.WA_VERIFY_TOKEN) {
+    whatsappLogger.info("Webhook verified");
+    return res.status(200).send(String(challenge ?? ""));
+  }
+
+  whatsappLogger.warn("Webhook verification failed", { mode, tokenMatch: token === env.WA_VERIFY_TOKEN });
+  return res.sendStatus(403);
+});
+
+// POST /webhook — inbound message notifications
+router.post("/webhook", async (req: Request, res: Response) => {
+  // ── 1. Signature verification (HMAC-SHA256 of the RAW body) ──────────────
+  const signature = req.headers["x-hub-signature-256"] as string | undefined;
+  const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body ?? "");
+
+  if (!env.WA_APP_SECRET) {
+    if (env.NODE_ENV === "production") {
+      whatsappLogger.error("WA_APP_SECRET not set in production — rejecting webhook");
+      return res.sendStatus(500);
+    }
+    whatsappLogger.warn("WA_APP_SECRET not set — skipping signature verification (dev)");
+  } else if (!verifyMetaSignature(rawBody, signature)) {
+    whatsappLogger.warn("Invalid X-Hub-Signature-256 — rejecting");
+    return res.sendStatus(401);
+  }
+
+  // ── 2. Parse + enqueue. Always ack 200 so Meta does not redeliver. ───────
+  try {
+    const payload = JSON.parse(rawBody.toString("utf8"));
+    const entries = Array.isArray(payload?.entry) ? payload.entry : [];
+
+    for (const entry of entries) {
+      const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+      for (const change of changes) {
+        const value = change?.value ?? {};
+        const phoneNumberId: string = value?.metadata?.phone_number_id ?? "";
+        const messages = Array.isArray(value?.messages) ? value.messages : [];
+
+        // Iterate ALL messages (never just [0]).
+        for (const message of messages) {
+          try {
+            const type: string = message?.type ?? "";
+            if (!MEDIA_TYPES.has(type)) continue;
+
+            const media = message[type] ?? {};
+            const mediaId: string = media?.id ?? "";
+            const mime: string = media?.mime_type ?? "";
+            const messageId: string = message?.id ?? "";
+            const waId: string = message?.from ?? "";
+
+            if (!messageId || !mediaId || !waId) {
+              whatsappLogger.warn("Skipping media message with missing fields", { messageId, mediaId, hasWaId: Boolean(waId) });
+              continue;
+            }
+
+            // Idempotent enqueue: insert once per WhatsApp messageId.
+            const result = await ExpenseCapture.updateOne(
+              { messageId },
+              {
+                $setOnInsert: {
+                  messageId,
+                  mediaId,
+                  mime,
+                  mediaType: type,
+                  filename: media?.filename,
+                  caption: media?.caption,
+                  waId,
+                  phoneNumberId,
+                  sourceChannel: "whatsapp",
+                  status: "queued",
+                },
+              },
+              { upsert: true },
+            );
+
+            if (result.upsertedCount > 0) {
+              whatsappLogger.info("Receipt queued", { messageId, mediaType: type, waId });
+            } else {
+              whatsappLogger.info("Duplicate webhook — already processed", { messageId });
+            }
+          } catch (err: any) {
+            // Duplicate key from a concurrent delivery is expected — ignore it.
+            if (err?.code === 11000) {
+              whatsappLogger.info("Duplicate webhook (race) — already processed", { messageId: message?.id });
+              continue;
+            }
+            whatsappLogger.error("Failed to enqueue message", {
+              messageId: message?.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    // Even on parse failure we ack — a 200 prevents Meta retry storms; the error
+    // is logged for investigation.
+    whatsappLogger.error("Failed to process webhook payload", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  return res.sendStatus(200);
+});
+
+export default router;
