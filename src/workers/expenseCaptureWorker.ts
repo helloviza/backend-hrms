@@ -1,5 +1,7 @@
 // apps/backend/src/workers/expenseCaptureWorker.ts
 import ExpenseCapture from "../models/ExpenseCapture.js";
+import ExpenseReply from "../models/ExpenseReply.js";
+import Expense from "../models/Expense.js";
 import User from "../models/User.js";
 import {
   isWhatsAppCloudConfigured,
@@ -8,16 +10,26 @@ import {
   sendTextMessage,
 } from "../services/whatsappCloud.service.js";
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
+import { extractReceipt } from "../services/receiptExtractorGemini.js";
 import { whatsappLogger } from "../utils/logger.js";
 
 /**
  * Expense Capture Worker
  * ----------------------
- * Drains queued inbound WhatsApp receipts (ExpenseCapture, status:"queued"):
- *   1. resolve waId -> User (+ workspace)         [no match -> reply + stop]
- *   2. GET media URL (Graph) -> download bytes    [URL ~5 min, re-fetched per attempt]
- *   3. upload to S3 under a workspace-scoped key
- *   4. mark the capture "captured" (Expense draft)
+ * Drains three queues each tick:
+ *
+ *  1. CAPTURE     ExpenseCapture(status:"queued")
+ *       resolve waId -> User, download media, upload to S3, mark "captured".
+ *       (Sprint 1 path — UNCHANGED; "captured" is the post-capture hook point.)
+ *
+ *  2. EXTRACT     ExpenseCapture(status:"captured")
+ *       re-read the image from S3, run Gemini extraction, send the parsed
+ *       summary + one-tap confirm, mark "awaiting_confirmation". On failure we
+ *       KEEP the image and drop to "awaiting_correction" (never lose a receipt).
+ *
+ *  3. REPLY       ExpenseReply(status:"queued")
+ *       match an inbound text to the pending capture by waId and apply
+ *       confirm / correct / cancel.
  *
  * In-process polling worker (same shape as videoProcessingWorker): a single
  * atomic findOneAndUpdate claims each row, so it is safe to run one instance.
@@ -27,13 +39,20 @@ import { whatsappLogger } from "../utils/logger.js";
 const POLL_INTERVAL_MS = 10_000; // 10 seconds
 const BATCH_PER_TICK = 10;
 const MAX_ATTEMPTS = 3;
+const MAX_EXTRACTION_ATTEMPTS = 3;
 const NOT_REGISTERED_MSG = "You're not registered — please contact your admin";
+const CORRECTION_HINT =
+  "Reply 1 to confirm, send a number to set the amount, or use:\n" +
+  "amount: 450  |  merchant: Name  |  date: 2026-06-15\n" +
+  "Reply cancel to discard.";
 
 let isRunning = false;
 
 function normalizeWaId(waId: string): string {
   return String(waId ?? "").replace(/[^0-9]/g, "");
 }
+
+/* ───────────────────────── stage 1: capture (UNCHANGED) ───────────────────── */
 
 async function processOne(): Promise<boolean> {
   // Atomically claim the oldest queued capture.
@@ -103,6 +122,304 @@ async function processOne(): Promise<boolean> {
   }
 }
 
+/* ───────────────────────── stage 2: extraction ────────────────────────────── */
+
+/** Human-readable money, omitting decimals when whole. */
+function fmtMoney(amount: number | null | undefined, currency: string | null | undefined): string {
+  if (amount == null) return "—";
+  const c = currency || "INR";
+  const n = Number.isInteger(amount) ? String(amount) : amount.toFixed(2);
+  return `${c} ${n}`;
+}
+
+/** Build the confirm/correct summary from the capture's pending extraction. */
+function buildSummary(capture: any): string {
+  const e = capture.extraction || {};
+  const lines = ["🧾 Receipt read:"];
+  if (e.merchant) lines.push(`Merchant: ${e.merchant}`);
+  if (e.date) lines.push(`Date: ${e.date}`);
+  lines.push(`Amount: ${fmtMoney(e.amount, e.currency)}`);
+  if (e.taxAmount != null) lines.push(`Tax: ${fmtMoney(e.taxAmount, e.currency)}`);
+  if (e.gstin) lines.push(`GSTIN: ${e.gstin}`);
+  if (e.suggestedCategory) lines.push(`Category: ${e.suggestedCategory}`);
+  lines.push("");
+  lines.push("Reply 1 to confirm, or send the correct amount.");
+  lines.push("You can also send:  amount: 450  |  merchant: Name  |  date: 2026-06-15");
+  lines.push("Reply cancel to discard.");
+  return lines.join("\n");
+}
+
+async function processOneExtraction(): Promise<boolean> {
+  // Claim the oldest captured-but-not-yet-extracted receipt.
+  const capture = await ExpenseCapture.findOneAndUpdate(
+    { status: "captured" },
+    { status: "extracting", $inc: { extractionAttempts: 1 } },
+    { sort: { createdAt: 1 }, new: true },
+  );
+  if (!capture) return false;
+
+  try {
+    if (!capture.imageKey) throw new Error("captured row has no imageKey");
+
+    const { fields, raw } = await extractReceipt({
+      imageKey: capture.imageKey,
+      mime: capture.mime,
+    });
+
+    capture.extraction = {
+      merchant: fields.merchant,
+      date: fields.date,
+      amount: fields.amount,
+      currency: fields.currency,
+      taxAmount: fields.taxAmount,
+      gstin: fields.gstin,
+      suggestedCategory: fields.suggestedCategory,
+      perFieldConfidence: fields.perFieldConfidence,
+    } as any;
+    capture.extractionRaw = raw as any;
+    capture.extractionModel = raw.model;
+    capture.errorMessage = undefined;
+    capture.status = "awaiting_confirmation";
+    capture.markModified("extraction");
+    await capture.save();
+
+    await sendTextMessage(capture.waId, buildSummary(capture));
+    whatsappLogger.info("Receipt extracted", {
+      messageId: capture.messageId,
+      amount: fields.amount,
+      currency: fields.currency,
+    });
+    return true;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (capture.extractionAttempts >= MAX_EXTRACTION_ATTEMPTS) {
+      // Give up on auto-extraction but KEEP the image — let the sender type it.
+      capture.status = "awaiting_correction";
+      capture.errorMessage = message;
+      await capture.save();
+      await sendTextMessage(
+        capture.waId,
+        "I couldn't read that receipt automatically. Please reply with the amount " +
+          "(e.g. 450), or use:  amount: 450  |  merchant: Name  |  date: 2026-06-15.",
+      );
+      whatsappLogger.warn("Extraction failed — awaiting manual correction", {
+        messageId: capture.messageId,
+        error: message,
+      });
+    } else {
+      // Transient: back to "captured" for another extraction attempt.
+      capture.status = "captured";
+      capture.errorMessage = message;
+      await capture.save();
+      whatsappLogger.error("Extraction error — will retry", {
+        messageId: capture.messageId,
+        attempts: capture.extractionAttempts,
+        error: message,
+      });
+    }
+    return true;
+  }
+}
+
+/* ───────────────────────── stage 3: text replies ──────────────────────────── */
+
+const CONFIRM_WORDS = new Set(["1", "yes", "y", "confirm", "ok", "okay", "confirmed"]);
+const CANCEL_WORDS = new Set(["cancel", "stop"]);
+
+/** Parse a bare amount like "450", "₹1,200.50", "Rs 90" -> number, else null. */
+function parseAmount(text: string): number | null {
+  if (!/\d/.test(text)) return null;
+  const cleaned = text.replace(/[^0-9.]/g, "");
+  if (cleaned === "") return null;
+  const n = Number(cleaned);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** ISO yyyy-mm-dd, or dd/mm/yyyy (day-first) -> ISO, else null. */
+function parseDateToIso(text: string): string | null {
+  const s = text.trim();
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (iso) return s;
+  const dmy = /^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/.exec(s);
+  if (dmy) {
+    let [, d, m, y] = dmy;
+    if (y.length === 2) y = `20${y}`;
+    const dd = d.padStart(2, "0");
+    const mm = m.padStart(2, "0");
+    if (Number(mm) >= 1 && Number(mm) <= 12 && Number(dd) >= 1 && Number(dd) <= 31)
+      return `${y}-${mm}-${dd}`;
+  }
+  return null;
+}
+
+type ReplyIntent =
+  | { kind: "confirm" }
+  | { kind: "cancel" }
+  | { kind: "correct"; field: "amount" | "merchant" | "date"; value: any }
+  | { kind: "unparseable" };
+
+function parseReply(rawText: string): ReplyIntent {
+  const text = String(rawText ?? "").trim();
+  const lower = text.toLowerCase();
+
+  if (CONFIRM_WORDS.has(lower)) return { kind: "confirm" };
+  if (CANCEL_WORDS.has(lower)) return { kind: "cancel" };
+
+  // field: value  (deterministic — amount / merchant / date only)
+  const kv = /^(amount|merchant|date)\s*[:=]\s*(.+)$/i.exec(text);
+  if (kv) {
+    const field = kv[1].toLowerCase() as "amount" | "merchant" | "date";
+    const value = kv[2].trim();
+    if (field === "amount") {
+      const n = parseAmount(value);
+      return n != null ? { kind: "correct", field, value: n } : { kind: "unparseable" };
+    }
+    if (field === "date") {
+      const iso = parseDateToIso(value);
+      return iso ? { kind: "correct", field, value: iso } : { kind: "unparseable" };
+    }
+    // merchant
+    return value ? { kind: "correct", field, value } : { kind: "unparseable" };
+  }
+
+  // bare number -> amount
+  const bare = parseAmount(text);
+  if (bare != null) return { kind: "correct", field: "amount", value: bare };
+
+  return { kind: "unparseable" };
+}
+
+/** Persist the confirmed Expense (idempotent on expenseCaptureId) + ack. */
+async function confirmCapture(capture: any): Promise<void> {
+  // Already persisted (duplicate confirm) — re-ack, do not double-insert.
+  if (capture.expenseId) {
+    const existing = await Expense.findById(capture.expenseId).lean();
+    if (existing) {
+      await sendTextMessage(
+        capture.waId,
+        `✅ Already saved: ${existing.merchant || "receipt"} — ${fmtMoney(existing.amount, existing.currency)}\nReference: ${existing.ref}`,
+      );
+      return;
+    }
+  }
+
+  const e = capture.extraction || {};
+  const expense = new Expense({
+    workspaceId: capture.workspaceId,
+    employeeId: capture.employeeId,
+    expenseCaptureId: capture._id,
+    sourceChannel: "whatsapp",
+    imageKey: capture.imageKey,
+    s3Bucket: capture.s3Bucket,
+    merchant: e.merchant ?? null,
+    date: e.date ? new Date(e.date) : null,
+    amount: e.amount,
+    currency: e.currency || "INR",
+    taxAmount: e.taxAmount ?? null,
+    gstin: e.gstin ?? null,
+    suggestedCategory: e.suggestedCategory ?? null,
+    status: "submitted",
+    rawExtraction: capture.extractionRaw,
+    perFieldConfidence: e.perFieldConfidence,
+    extractionModel: capture.extractionModel,
+  });
+  expense.ref = `EXP-${String(expense._id).slice(-6).toUpperCase()}`;
+  await expense.save();
+
+  capture.status = "confirmed";
+  capture.expenseId = expense._id as any;
+  await capture.save();
+
+  await sendTextMessage(
+    capture.waId,
+    `✅ Saved: ${expense.merchant || "receipt"} — ${fmtMoney(expense.amount, expense.currency)}\nReference: ${expense.ref}`,
+  );
+  whatsappLogger.info("Expense confirmed", {
+    messageId: capture.messageId,
+    expenseId: String(expense._id),
+    ref: expense.ref,
+  });
+}
+
+async function processOneReply(): Promise<boolean> {
+  const reply = await ExpenseReply.findOneAndUpdate(
+    { status: "queued" },
+    { status: "processing", $inc: { attempts: 1 } },
+    { sort: { createdAt: 1 }, new: true },
+  );
+  if (!reply) return false;
+
+  try {
+    // Match to the pending capture for this sender (most recent first).
+    const capture = await ExpenseCapture.findOne({
+      waId: reply.waId,
+      status: { $in: ["awaiting_confirmation", "awaiting_correction"] },
+    }).sort({ updatedAt: -1 });
+
+    if (!capture) {
+      await sendTextMessage(
+        reply.waId,
+        "No receipt is awaiting confirmation. Send a photo of a receipt to get started.",
+      );
+      reply.status = "done";
+      await reply.save();
+      return true;
+    }
+
+    const intent = parseReply(reply.text);
+
+    if (intent.kind === "cancel") {
+      capture.status = "cancelled";
+      await capture.save();
+      await sendTextMessage(reply.waId, "Discarded. Send a new receipt photo whenever you're ready.");
+    } else if (intent.kind === "confirm") {
+      if (capture.extraction?.amount == null) {
+        // Nothing to confirm yet (e.g. extraction failed) — ask for the amount.
+        await sendTextMessage(reply.waId, "I still need the amount. " + CORRECTION_HINT);
+      } else {
+        await confirmCapture(capture);
+      }
+    } else if (intent.kind === "correct") {
+      const ext: any = capture.extraction || {};
+      ext[intent.field] = intent.value;
+      capture.extraction = ext;
+      capture.status = "awaiting_confirmation";
+      capture.markModified("extraction");
+      await capture.save();
+      await sendTextMessage(reply.waId, buildSummary(capture));
+    } else {
+      // unparseable
+      await sendTextMessage(reply.waId, "Sorry, I didn't get that.\n" + CORRECTION_HINT);
+    }
+
+    reply.status = "done";
+    reply.errorMessage = undefined;
+    await reply.save();
+    return true;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    reply.status = reply.attempts >= MAX_ATTEMPTS ? "failed" : "queued";
+    reply.errorMessage = message;
+    await reply.save();
+    whatsappLogger.error("Reply processing error", {
+      messageId: reply.messageId,
+      attempts: reply.attempts,
+      status: reply.status,
+      error: message,
+    });
+    return true;
+  }
+}
+
+/* ───────────────────────── tick / bootstrap ───────────────────────────────── */
+
+async function drain(fn: () => Promise<boolean>): Promise<void> {
+  for (let i = 0; i < BATCH_PER_TICK; i++) {
+    const processed = await fn();
+    if (!processed) break; // queue drained
+  }
+}
+
 export function startExpenseCaptureWorker() {
   if (isRunning) return;
   isRunning = true;
@@ -113,10 +430,9 @@ export function startExpenseCaptureWorker() {
     try {
       if (!isWhatsAppCloudConfigured()) return; // idle until configured
 
-      for (let i = 0; i < BATCH_PER_TICK; i++) {
-        const processed = await processOne();
-        if (!processed) break; // queue drained
-      }
+      await drain(processOne); // 1. capture
+      await drain(processOneExtraction); // 2. extract
+      await drain(processOneReply); // 3. replies
     } catch (err) {
       whatsappLogger.error("Expense capture worker tick failed", {
         error: err instanceof Error ? err.message : String(err),
