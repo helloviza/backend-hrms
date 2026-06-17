@@ -17,7 +17,7 @@ import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 export interface IExpense extends Document {
   workspaceId: mongoose.Types.ObjectId;
   employeeId: mongoose.Types.ObjectId;
-  expenseCaptureId: mongoose.Types.ObjectId;
+  expenseCaptureId?: mongoose.Types.ObjectId;
   ref: string;
   sourceChannel: string;
 
@@ -47,7 +47,9 @@ const ExpenseSchema = new Schema<IExpense>(
   {
     workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
     employeeId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
-    expenseCaptureId: { type: Schema.Types.ObjectId, ref: "ExpenseCapture", required: true, unique: true },
+    // Optional: WhatsApp captures set it (idempotency); web expenses omit it
+    // entirely. unique + sparse → uniqueness enforced only for docs that HAVE it.
+    expenseCaptureId: { type: Schema.Types.ObjectId, ref: "ExpenseCapture", required: false, unique: true, sparse: true },
     ref: { type: String, required: true, index: true },
     sourceChannel: { type: String, default: "whatsapp" },
 

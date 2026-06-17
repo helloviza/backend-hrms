@@ -19,14 +19,48 @@
 import express from "express";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
+import multer from "multer";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { csvRow } from "../utils/exportHelpers.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
+import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
+import { extractReceipt } from "../services/receiptExtractorGemini.js";
+import { createExpense } from "../services/expenses.service.js";
 import { env } from "../config/env.js";
 import Expense from "../models/Expense.js";
 
 const router = express.Router();
+
+/* ── Receipt upload (multipart) — memory storage, 10MB, image + PDF ──── */
+const RECEIPT_MIMES = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "image/heic",
+  "application/pdf",
+]);
+
+const uploadReceipt = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (RECEIPT_MIMES.has(file.mimetype)) return cb(null, true);
+    cb(new Error("Unsupported file type. Allowed: JPEG, PNG, WEBP, HEIC, PDF."));
+  },
+});
+
+// Wrap multer so file errors return clean JSON (mirrors workspace.branding).
+function receiptUploadMw(req: any, res: any, next: any) {
+  uploadReceipt.single("file")(req, res, (err: any) => {
+    if (!err) return next();
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ error: "File too large. Maximum size is 10MB." });
+    }
+    return res.status(400).json({ error: err?.message || "Upload failed" });
+  });
+}
 
 /* ── Role gate: who sees all workspace expenses ──────────────────────
  * Mirrors the requireAdmin role set in middleware/rbac.ts, but as a boolean
@@ -274,6 +308,134 @@ router.get("/:id/receipt-url", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[Expenses receipt-url]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to presign receipt" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /api/expenses/upload  (multipart, field "file")
+ * Store the bill to S3, run extractReceipt synchronously, return a DRAFT for
+ * review. Does NOT persist an Expense. Mirrors the /vouchers/extract flow.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/upload", receiptUploadMw, async (req: any, res: any) => {
+  try {
+    const file = req.file as Express.Multer.File | undefined;
+    if (!file?.buffer?.length) {
+      return res.status(400).json({ error: "file is required" });
+    }
+
+    const workspaceId = String(req.workspaceId || "");
+    const employeeId = ownEmployeeId(req);
+    if (!workspaceId || !employeeId) {
+      return res.status(400).json({ error: "Missing workspace or user context" });
+    }
+
+    // Store first so the receipt is retained even if extraction is unusable.
+    const { bucket, key } = await uploadExpenseReceiptToS3({
+      buffer: file.buffer,
+      mime: file.mimetype,
+      workspaceId,
+      employeeId,
+      sourceChannel: "web",
+    });
+
+    // Extraction is best-effort: on failure (e.g. no amount found) we still
+    // return the stored imageKey so the user can fill the draft manually.
+    let draft: Record<string, any> = {
+      merchant: null,
+      date: null,
+      amount: null,
+      currency: "INR",
+      taxAmount: null,
+      gstin: null,
+      suggestedCategory: null,
+    };
+    let perFieldConfidence: any = {};
+    let extractionModel: string | undefined;
+    let rawExtraction: any = undefined;
+    let extractionError: string | undefined;
+
+    try {
+      const result = await extractReceipt({ buffer: file.buffer, mime: file.mimetype });
+      const { perFieldConfidence: pfc, ...fields } = result.fields;
+      draft = fields;
+      perFieldConfidence = pfc;
+      extractionModel = result.raw.model;
+      rawExtraction = result.raw.raw_candidate;
+    } catch (exErr: any) {
+      extractionError = exErr?.message || "Extraction failed";
+      console.warn("[Expenses upload] extraction failed", extractionError);
+    }
+
+    res.json({
+      ok: true,
+      draft,
+      perFieldConfidence,
+      extractionModel,
+      rawExtraction,
+      imageKey: key,
+      s3Bucket: bucket,
+      ...(extractionError ? { extractionError } : {}),
+    });
+  } catch (err: any) {
+    console.error("[Expenses upload]", err?.message);
+    res.status(500).json({ error: err?.message || "Upload failed" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /api/expenses  (JSON)
+ * Persist a reviewed draft via the shared createExpense(). sourceChannel "web",
+ * employeeId forced to the caller. Idempotent on (workspaceId, imageKey).
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/", async (req: any, res: any) => {
+  try {
+    const workspaceObjectId = req.workspaceObjectId;
+    const workspaceId = String(req.workspaceId || "");
+    const employeeId = ownEmployeeId(req);
+    if (!workspaceObjectId || !employeeId) {
+      return res.status(400).json({ error: "Missing workspace or user context" });
+    }
+
+    const b = req.body || {};
+    if (b.amount == null || Number.isNaN(Number(b.amount))) {
+      return res.status(400).json({ error: "amount is required" });
+    }
+
+    const imageKey = b.imageKey ? String(b.imageKey) : undefined;
+    if (imageKey) {
+      // Defensive: the key must belong to THIS user in THIS workspace.
+      const expectedPrefix = `hrms/expenses/${workspaceId}/${employeeId}/`;
+      if (!imageKey.startsWith(expectedPrefix)) {
+        return res.status(403).json({ error: "imageKey does not belong to this user/workspace" });
+      }
+      // Idempotency: a re-submitted draft (same upload) returns the existing
+      // expense instead of inserting a duplicate. Explicit workspaceId scope.
+      const existing = await Expense.findOne({ workspaceId: workspaceObjectId, imageKey }).lean();
+      if (existing) return res.json({ ok: true, expense: existing, deduped: true });
+    }
+
+    const expense = await createExpense({
+      workspaceId: workspaceObjectId,
+      employeeId,
+      sourceChannel: "web",
+      merchant: b.merchant ?? null,
+      date: b.date ?? null,
+      amount: Number(b.amount),
+      currency: b.currency,
+      taxAmount: b.taxAmount ?? null,
+      gstin: b.gstin ?? null,
+      suggestedCategory: b.suggestedCategory ?? null,
+      imageKey,
+      s3Bucket: b.s3Bucket,
+      rawExtraction: b.rawExtraction,
+      perFieldConfidence: b.perFieldConfidence,
+      extractionModel: b.extractionModel,
+    });
+
+    res.status(201).json({ ok: true, expense });
+  } catch (err: any) {
+    console.error("[Expenses create]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to create expense" });
   }
 });
 
