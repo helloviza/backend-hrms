@@ -289,7 +289,9 @@ async function main() {
           $push: {
             editHistory: {
               editedAt: new Date(),
-              editedBy: "system:backfill",
+              // editedBy omitted: it is an optional ObjectId (ref User); a string
+              // like "system:backfill" fails Mongoose ObjectId casting on later edits.
+              // A missing actor renders as system in the edit-history UI.
               fieldsChanged: ["lineItems"],
               oldValues,
               newValues,
