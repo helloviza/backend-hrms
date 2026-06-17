@@ -11,6 +11,7 @@ import {
 } from "../services/whatsappCloud.service.js";
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
 import { extractReceipt } from "../services/receiptExtractorGemini.js";
+import { createExpense } from "../services/expenses.service.js";
 import { whatsappLogger } from "../utils/logger.js";
 
 /**
@@ -304,27 +305,24 @@ async function confirmCapture(capture: any): Promise<void> {
   }
 
   const e = capture.extraction || {};
-  const expense = new Expense({
+  const expense = await createExpense({
     workspaceId: capture.workspaceId,
     employeeId: capture.employeeId,
     expenseCaptureId: capture._id,
     sourceChannel: "whatsapp",
     imageKey: capture.imageKey,
     s3Bucket: capture.s3Bucket,
-    merchant: e.merchant ?? null,
-    date: e.date ? new Date(e.date) : null,
+    merchant: e.merchant,
+    date: e.date,
     amount: e.amount,
-    currency: e.currency || "INR",
-    taxAmount: e.taxAmount ?? null,
-    gstin: e.gstin ?? null,
-    suggestedCategory: e.suggestedCategory ?? null,
-    status: "submitted",
+    currency: e.currency,
+    taxAmount: e.taxAmount,
+    gstin: e.gstin,
+    suggestedCategory: e.suggestedCategory,
     rawExtraction: capture.extractionRaw,
     perFieldConfidence: e.perFieldConfidence,
     extractionModel: capture.extractionModel,
   });
-  expense.ref = `EXP-${String(expense._id).slice(-6).toUpperCase()}`;
-  await expense.save();
 
   capture.status = "confirmed";
   capture.expenseId = expense._id as any;

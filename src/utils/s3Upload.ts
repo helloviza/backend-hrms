@@ -99,12 +99,20 @@ export async function uploadExpenseReceiptToS3(opts: {
   mime: string;
   workspaceId: string;
   employeeId: string;
-  messageId: string;
+  messageId?: string; // WhatsApp captures supply this; web uploads omit it
+  sourceChannel?: string; // defaults to "whatsapp" for backward compatibility
 }): Promise<{ bucket: string; key: string }> {
   const bucket = env.S3_BUCKET;
   const ext = RECEIPT_EXT_BY_MIME[opts.mime.toLowerCase()] || "bin";
   const rand = crypto.randomBytes(8).toString("hex");
   const key = `hrms/expenses/${opts.workspaceId}/${opts.employeeId}/${Date.now()}-${rand}.${ext}`;
+
+  const metadata: Record<string, string> = {
+    workspaceId: opts.workspaceId,
+    employeeId: opts.employeeId,
+    sourceChannel: opts.sourceChannel || "whatsapp",
+  };
+  if (opts.messageId) metadata.messageId = opts.messageId;
 
   await s3.send(
     new PutObjectCommand({
@@ -112,12 +120,7 @@ export async function uploadExpenseReceiptToS3(opts: {
       Key: key,
       Body: opts.buffer,
       ContentType: opts.mime,
-      Metadata: {
-        workspaceId: opts.workspaceId,
-        employeeId: opts.employeeId,
-        messageId: opts.messageId,
-        sourceChannel: "whatsapp",
-      },
+      Metadata: metadata,
     }),
   );
 
