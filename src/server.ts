@@ -423,6 +423,11 @@ app.use("/api/v1/workspace", workspaceRouter);
 import expenseBandsRouter from "./routes/expenseBands.js";
 app.use("/api/v1/workspace", expenseBandsRouter);
 
+// Expense Management — read API + export (Sprint 3a). Tenant-scoped; role-gated
+// in-handler (Finance/Admin see all workspace expenses, others see own).
+import expensesRouter from "./routes/expenses.js";
+app.use("/api/expenses", requireAuth, requireWorkspace, expensesRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";
