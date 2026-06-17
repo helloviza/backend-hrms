@@ -1,6 +1,7 @@
 // apps/backend/src/routes/whatsapp.webhook.ts
 import { Router, type Request, type Response } from "express";
 import ExpenseCapture from "../models/ExpenseCapture.js";
+import ExpenseReply from "../models/ExpenseReply.js";
 import { verifyMetaSignature } from "../services/whatsappCloud.service.js";
 import { env } from "../config/env.js";
 import { whatsappLogger } from "../utils/logger.js";
@@ -66,6 +67,42 @@ router.post("/webhook", async (req: Request, res: Response) => {
         for (const message of messages) {
           try {
             const type: string = message?.type ?? "";
+
+            // ── TEXT replies (confirm / correct / cancel) ───────────────────
+            // Enqueue idempotently; the worker matches them to the pending
+            // capture by waId. We never handle replies synchronously here so
+            // the webhook keeps acking within Meta's 5s window.
+            if (type === "text") {
+              const messageId: string = message?.id ?? "";
+              const waId: string = message?.from ?? "";
+              const text: string = message?.text?.body ?? "";
+              if (!messageId || !waId) {
+                whatsappLogger.warn("Skipping text message with missing fields", { hasId: Boolean(messageId), hasWaId: Boolean(waId) });
+                continue;
+              }
+
+              const replyResult = await ExpenseReply.updateOne(
+                { messageId },
+                {
+                  $setOnInsert: {
+                    messageId,
+                    waId,
+                    phoneNumberId,
+                    text,
+                    status: "queued",
+                  },
+                },
+                { upsert: true },
+              );
+
+              if (replyResult.upsertedCount > 0) {
+                whatsappLogger.info("Text reply queued", { messageId, waId });
+              } else {
+                whatsappLogger.info("Duplicate text webhook — already queued", { messageId });
+              }
+              continue;
+            }
+
             if (!MEDIA_TYPES.has(type)) continue;
 
             const media = message[type] ?? {};

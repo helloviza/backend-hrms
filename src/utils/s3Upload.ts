@@ -125,6 +125,19 @@ export async function uploadExpenseReceiptToS3(opts: {
 }
 
 /**
+ * Read an S3 object back into a Buffer. Used by the expense extraction stage to
+ * re-fetch a captured receipt by its imageKey (the capture worker discards the
+ * in-memory bytes after upload), so extraction can be retried independently.
+ */
+export async function getObjectBuffer(key: string): Promise<Buffer> {
+  const res = await s3.send(
+    new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: key }),
+  );
+  const bytes = await (res.Body as any).transformToByteArray();
+  return Buffer.from(bytes);
+}
+
+/**
  * Upload a PDF buffer to S3 and return a presigned, inline-disposition URL.
  * Generic helper extracted from the inline copies in invoices.ts / creditNotes.ts.
  * Defaults to a 1-hour TTL; override via options.expiresIn (seconds).
