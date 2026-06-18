@@ -1,19 +1,27 @@
 // apps/backend/src/workers/expenseCaptureWorker.ts
 import ExpenseCapture from "../models/ExpenseCapture.js";
 import ExpenseReply from "../models/ExpenseReply.js";
+import ExpenseWaSession from "../models/ExpenseWaSession.js";
 import Expense from "../models/Expense.js";
+import Report from "../models/Report.js";
 import User from "../models/User.js";
 import {
   isWhatsAppCloudConfigured,
   getMediaUrl,
   downloadMedia,
   sendTextMessage,
+  sendButtonMessage,
 } from "../services/whatsappCloud.service.js";
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
 import { extractReceipt } from "../services/receiptExtractorGemini.js";
 import { createExpense } from "../services/expenses.service.js";
 import { resolveCategoryId } from "../services/expenseCategories.service.js";
-import { quickSubmitExpense } from "../services/reports.service.js";
+import {
+  quickSubmitExpense,
+  createReport,
+  linkExpensesToReport,
+  submitReport,
+} from "../services/reports.service.js";
 import { whatsappLogger } from "../utils/logger.js";
 
 /**
@@ -31,8 +39,12 @@ import { whatsappLogger } from "../utils/logger.js";
  *       KEEP the image and drop to "awaiting_correction" (never lose a receipt).
  *
  *  3. REPLY       ExpenseReply(status:"queued")
- *       match an inbound text to the pending capture by waId and apply
- *       confirm / correct / cancel.
+ *       an inbound text OR tapped interactive button (the webhook enqueues the
+ *       button id as the reply text). Routed by waId: a receipt awaiting
+ *       confirmation → confirm/fix/cancel; otherwise the post-confirm /
+ *       open-claim conversation in ExpenseWaSession (submit, bundle multiple
+ *       bills into one claim, submit the claim). Buttons drive it; the typed
+ *       keywords ("1"/"submit"/"cancel"/"yes"/"no") still work as fallbacks.
  *
  * In-process polling worker (same shape as videoProcessingWorker): a single
  * atomic findOneAndUpdate claims each row, so it is safe to run one instance.
@@ -146,10 +158,104 @@ function buildSummary(capture: any): string {
   if (e.gstin) lines.push(`GSTIN: ${e.gstin}`);
   if (e.suggestedCategory) lines.push(`Category: ${e.suggestedCategory}`);
   lines.push("");
-  lines.push("Reply 1 to confirm, or send the correct amount.");
-  lines.push("You can also send:  amount: 450  |  merchant: Name  |  date: 2026-06-15");
-  lines.push("Reply cancel to discard.");
+  lines.push("Tap an option below — or reply: 1 (confirm) · amount: 450 · cancel.");
   return lines.join("\n");
+}
+
+/* ── Interactive button ids. Each id doubles as a typed keyword, so a button tap
+ * (webhook enqueues the id as the reply text) and the typed word are handled
+ * identically. Text fallbacks stay available everywhere. ─────────────────── */
+const BTN = {
+  CONFIRM: "confirm",
+  FIX: "fix_amount",
+  CANCEL: "cancel",
+  SUBMIT: "submit",
+  ADD_TO_CLAIM: "add_to_claim",
+  LATER: "later",
+  ADD_MORE: "add_more",
+  YES: "yes",
+  NO: "no",
+} as const;
+
+async function sendConfirmButtons(waId: string, body: string): Promise<void> {
+  await sendButtonMessage(waId, body, [
+    { id: BTN.CONFIRM, title: "Confirm" },
+    { id: BTN.FIX, title: "Fix amount" },
+    { id: BTN.CANCEL, title: "Cancel" },
+  ]);
+}
+
+/** Post-confirm choices. With an open claim the only loose-expense options are
+ *  Submit / Later (Add-to-claim is offered via the Yes/No add decision). */
+async function sendPostConfirmButtons(waId: string, body: string, hasOpenClaim: boolean): Promise<void> {
+  const buttons = hasOpenClaim
+    ? [
+        { id: BTN.SUBMIT, title: "Submit" },
+        { id: BTN.LATER, title: "Later" },
+      ]
+    : [
+        { id: BTN.SUBMIT, title: "Submit" },
+        { id: BTN.ADD_TO_CLAIM, title: "Add to claim" },
+        { id: BTN.LATER, title: "Later" },
+      ];
+  await sendButtonMessage(waId, body, buttons);
+}
+
+async function sendOpenClaimButtons(waId: string, body: string): Promise<void> {
+  await sendButtonMessage(waId, body, [
+    { id: BTN.ADD_MORE, title: "Add more" },
+    { id: BTN.SUBMIT, title: "Submit" },
+  ]);
+}
+
+async function sendYesNoButtons(waId: string, body: string): Promise<void> {
+  await sendButtonMessage(waId, body, [
+    { id: BTN.YES, title: "Yes" },
+    { id: BTN.NO, title: "No" },
+  ]);
+}
+
+/* ── Per-waId session helpers ─────────────────────────────────────────── */
+async function getSession(waId: string) {
+  return ExpenseWaSession.findOne({ waId });
+}
+
+async function upsertSession(waId: string, fields: Record<string, any>) {
+  return ExpenseWaSession.findOneAndUpdate(
+    { waId },
+    { $set: fields, $setOnInsert: { waId } },
+    { upsert: true, new: true },
+  );
+}
+
+/** Reset the conversation; the open claim (if any) remains a DRAFT in the portal. */
+async function clearSession(waId: string) {
+  await ExpenseWaSession.updateOne(
+    { waId },
+    { $set: { state: "idle", openClaimId: null, openClaimName: null, pendingExpenseId: null } },
+  );
+}
+
+/** The session's open claim IF it still exists, is the caller's, and is still a
+ *  draft/clarification (editable). Returns null otherwise — covers a claim
+ *  submitted/closed out-of-band via the portal. */
+async function loadEditableOpenClaim(session: any) {
+  if (!session?.openClaimId) return null;
+  const report: any = await Report.findById(session.openClaimId);
+  if (!report) return null;
+  if (String(report.employeeId) !== String(session.employeeId)) return null;
+  if (report.status !== "draft" && report.status !== "clarification_required") return null;
+  return report;
+}
+
+function defaultClaimName(): string {
+  const d = new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
+  return `WhatsApp claim · ${d}`;
+}
+
+function savedLine(expense: any): string {
+  const amt = `₹${Number(expense.amount || 0).toLocaleString("en-IN")}`;
+  return `✅ Saved ${expense.ref} · ${expense.merchant || "receipt"} · ${amt}.`;
 }
 
 async function processOneExtraction(): Promise<boolean> {
@@ -186,7 +292,7 @@ async function processOneExtraction(): Promise<boolean> {
     capture.markModified("extraction");
     await capture.save();
 
-    await sendTextMessage(capture.waId, buildSummary(capture));
+    await sendConfirmButtons(capture.waId, buildSummary(capture));
     whatsappLogger.info("Receipt extracted", {
       messageId: capture.messageId,
       amount: fields.amount,
@@ -342,24 +448,230 @@ async function confirmCapture(capture: any): Promise<void> {
     extractionModel: capture.extractionModel,
   });
 
-  // Park the session in awaiting_submit and offer conversational quick-submit.
-  // The expense is already saved (loose, pending_to_submit); the next inbound
-  // reply either submits it or leaves it in the pending list.
-  capture.status = "awaiting_submit";
+  // The capture's own job is done; the expense is saved loose (pending_to_submit).
+  // Everything after this — submit / bundle into a claim — is per-waId session
+  // state, so the conversation can span multiple receipts.
+  capture.status = "confirmed";
   capture.expenseId = expense._id as any;
   await capture.save();
 
-  const amt = `₹${Number(expense.amount || 0).toLocaleString("en-IN")}`;
-  await sendTextMessage(
-    capture.waId,
-    `✅ Saved ${expense.ref} · ${expense.merchant || "receipt"} · ${amt}.\n` +
-      `Reply *submit* to send it for approval now, or it'll wait in your pending list.`,
-  );
+  const session = await getSession(capture.waId);
+  const openClaim = await loadEditableOpenClaim(session);
+
+  if (openClaim) {
+    // A claim is already open — don't silently bundle; ask.
+    await upsertSession(capture.waId, {
+      workspaceId: capture.workspaceId,
+      employeeId: capture.employeeId,
+      state: "await_add_decision",
+      pendingExpenseId: expense._id,
+      openClaimId: openClaim._id,
+      openClaimName: openClaim.name,
+    });
+    await sendYesNoButtons(capture.waId, `${savedLine(expense)}\nAdd to claim “${openClaim.name}”?`);
+  } else {
+    await upsertSession(capture.waId, {
+      workspaceId: capture.workspaceId,
+      employeeId: capture.employeeId,
+      state: "post_confirm",
+      pendingExpenseId: expense._id,
+      openClaimId: null,
+      openClaimName: null,
+    });
+    await sendPostConfirmButtons(capture.waId, `${savedLine(expense)}\nSubmit it for approval now?`, false);
+  }
+
   whatsappLogger.info("Expense confirmed", {
     messageId: capture.messageId,
     expenseId: String(expense._id),
     ref: expense.ref,
   });
+}
+
+/**
+ * Capture-level reply: a receipt is awaiting confirm / fix / cancel.
+ * Buttons: [Confirm] [Fix amount] [Cancel]; text "1"/amount/"cancel" also work.
+ */
+async function handleCaptureReply(capture: any, waId: string, text: string): Promise<void> {
+  const t = text.trim().toLowerCase();
+
+  if (t === BTN.FIX) {
+    await sendTextMessage(
+      waId,
+      "Send the correct amount (e.g. 450), or:\n" +
+        "amount: 450  |  merchant: Name  |  date: 2026-06-15",
+    );
+    return;
+  }
+
+  const intent = parseReply(text);
+  if (intent.kind === "cancel") {
+    capture.status = "cancelled";
+    await capture.save();
+    await sendTextMessage(waId, "Discarded. Send a new receipt photo whenever you're ready.");
+  } else if (intent.kind === "confirm") {
+    if (capture.extraction?.amount == null) {
+      await sendTextMessage(waId, "I still need the amount. " + CORRECTION_HINT);
+    } else {
+      await confirmCapture(capture);
+    }
+  } else if (intent.kind === "correct") {
+    const ext: any = capture.extraction || {};
+    ext[intent.field] = intent.value;
+    capture.extraction = ext;
+    capture.status = "awaiting_confirmation";
+    capture.markModified("extraction");
+    await capture.save();
+    await sendConfirmButtons(waId, buildSummary(capture));
+  } else {
+    await sendTextMessage(waId, "Sorry, I didn't get that.\n" + CORRECTION_HINT);
+  }
+}
+
+/** After a SOLO decision (Submit/Later on a loose expense): if a claim is still
+ *  open, return to it; otherwise the conversation is done. */
+async function afterSoloDecision(waId: string, session: any): Promise<void> {
+  const openClaim = await loadEditableOpenClaim(session);
+  if (openClaim) {
+    await upsertSession(waId, { state: "open_claim", pendingExpenseId: null });
+    await sendOpenClaimButtons(waId, `Claim “${openClaim.name}” is still open. Add more, or submit.`);
+  } else {
+    await clearSession(waId);
+  }
+}
+
+/** Submit the whole open claim via the shared submitReport state machine. */
+async function submitOpenClaim(waId: string, session: any): Promise<void> {
+  const result = await submitReport(session.workspaceId, session.employeeId, session.openClaimId);
+  if (!result.ok) {
+    if (result.reason === "blocking") {
+      const list = (result.blocking || []).join("\n• ");
+      await sendOpenClaimButtons(
+        waId,
+        `⚠️ Can't submit “${session.openClaimName}” yet:\n• ${list}\nFix from the portal, then tap Submit.`,
+      );
+    } else {
+      // not_found / not_editable — closed out-of-band; stop tracking it.
+      await clearSession(waId);
+      await sendTextMessage(waId, "That claim can no longer be submitted from here — check the portal.");
+    }
+    return;
+  }
+  const n = result.expenseCount ?? 0;
+  let msg = `📤 Submitted ${result.claimRef} (${n} expense${n === 1 ? "" : "s"}) to ${
+    result.approverName || "your approver"
+  } for approval.`;
+  if (result.warnings && result.warnings.length) msg += `\nNote: ${result.warnings.join("; ")}`;
+  await sendTextMessage(waId, msg);
+  await clearSession(waId);
+}
+
+/**
+ * Session-level reply: the post-confirm / open-claim conversation (spans
+ * multiple receipts). Buttons drive it; the equivalent typed keywords work too.
+ */
+async function handleSessionReply(session: any, waId: string, text: string): Promise<void> {
+  const t = text.trim().toLowerCase();
+  const ws = session.workspaceId;
+  const emp = session.employeeId;
+
+  switch (session.state) {
+    case "post_confirm": {
+      const hasOpenClaim = Boolean(session.openClaimId);
+      const isSubmit = t === BTN.SUBMIT || t === "1" || t === "yes" || t === "y";
+      const isLater = t === BTN.LATER || t === "no" || t === "skip";
+      const isAddToClaim = t === BTN.ADD_TO_CLAIM || t === "add" || t === "add to claim";
+
+      if (isSubmit) {
+        const result = await quickSubmitExpense(ws, emp, session.pendingExpenseId);
+        await sendTextMessage(
+          waId,
+          result.ok
+            ? `📤 Submitted ${result.claimRef} to ${result.approverName} for approval.`
+            : `⚠️ Couldn't submit — ${result.reason}. It's in your pending list; fix & submit from the portal.`,
+        );
+        await afterSoloDecision(waId, session);
+      } else if (isAddToClaim && !hasOpenClaim) {
+        await upsertSession(waId, { state: "await_claim_name" });
+        await sendTextMessage(waId, "What should we name this claim? (e.g. “Mumbai trip”)");
+      } else if (isLater) {
+        await sendTextMessage(waId, "👍 Saved to your pending list.");
+        await afterSoloDecision(waId, session);
+      } else {
+        await sendPostConfirmButtons(waId, "Tap an option:", hasOpenClaim);
+      }
+      break;
+    }
+
+    case "await_claim_name": {
+      const name = text.trim() || defaultClaimName();
+      const claim = await createReport(ws, emp, name);
+      await linkExpensesToReport(ws, emp, claim, [session.pendingExpenseId]);
+      await upsertSession(waId, {
+        state: "open_claim",
+        openClaimId: claim._id,
+        openClaimName: name,
+        pendingExpenseId: null,
+      });
+      await sendOpenClaimButtons(
+        waId,
+        `📋 Claim “${name}” started — 1 expense added.\nSend the next receipt, or tap Submit.`,
+      );
+      break;
+    }
+
+    case "await_add_decision": {
+      const isYes = t === BTN.YES || t === "y" || t === "1" || t === BTN.ADD_TO_CLAIM || t === "add";
+      const isNo = t === BTN.NO || t === "n" || t === BTN.LATER || t === "skip";
+      const openClaim = await loadEditableOpenClaim(session);
+
+      if (isYes) {
+        if (!openClaim) {
+          // Claim closed out-of-band — fall back to a solo decision.
+          await upsertSession(waId, { state: "post_confirm", openClaimId: null, openClaimName: null });
+          await sendPostConfirmButtons(waId, "That claim is no longer open. Submit this expense on its own?", false);
+          break;
+        }
+        await linkExpensesToReport(ws, emp, openClaim, [session.pendingExpenseId]);
+        const count = await Expense.countDocuments({ reportId: openClaim._id });
+        await upsertSession(waId, { state: "open_claim", pendingExpenseId: null });
+        await sendOpenClaimButtons(
+          waId,
+          `✅ Added to “${openClaim.name}” (${count} expense${count === 1 ? "" : "s"}).\nSend the next receipt, or tap Submit.`,
+        );
+      } else if (isNo) {
+        // Leave the bill loose; the open claim stays. Offer to submit it solo.
+        await upsertSession(waId, { state: "post_confirm" }); // openClaimId stays set
+        await sendPostConfirmButtons(
+          waId,
+          "👍 Left it loose (pending to submit). Submit it on its own, or leave it for later?",
+          true,
+        );
+      } else {
+        await sendYesNoButtons(waId, `Add to claim “${session.openClaimName}”?`);
+      }
+      break;
+    }
+
+    case "open_claim": {
+      const isAddMore = t === BTN.ADD_MORE || t === "add more" || t === "more";
+      const isSubmit = t === BTN.SUBMIT || t === "1" || t === "submit";
+      if (isAddMore) {
+        await sendTextMessage(waId, "📸 Send the next receipt.");
+      } else if (isSubmit) {
+        await submitOpenClaim(waId, session);
+      } else {
+        await sendOpenClaimButtons(
+          waId,
+          `Claim “${session.openClaimName}” is open. Add more receipts, or submit.`,
+        );
+      }
+      break;
+    }
+
+    default:
+      await sendTextMessage(waId, "Send a photo of a receipt to get started.");
+  }
 }
 
 async function processOneReply(): Promise<boolean> {
@@ -371,75 +683,29 @@ async function processOneReply(): Promise<boolean> {
   if (!reply) return false;
 
   try {
-    // Match to the pending capture for this sender (most recent first).
+    const waId = reply.waId;
+    const text = String(reply.text || "");
+
+    // 1) A receipt awaiting confirmation always takes precedence — it's the most
+    //    immediate prompt ([Confirm]/[Fix amount]/[Cancel]).
     const capture = await ExpenseCapture.findOne({
-      waId: reply.waId,
-      status: { $in: ["awaiting_confirmation", "awaiting_correction", "awaiting_submit"] },
+      waId,
+      status: { $in: ["awaiting_confirmation", "awaiting_correction"] },
     }).sort({ updatedAt: -1 });
 
-    if (!capture) {
-      await sendTextMessage(
-        reply.waId,
-        "No receipt is awaiting confirmation. Send a photo of a receipt to get started.",
-      );
-      reply.status = "done";
-      await reply.save();
-      return true;
-    }
-
-    // Conversational quick-submit: the just-saved expense is awaiting "submit".
-    // Single just-captured expense only — no chat bundling.
-    if (capture.status === "awaiting_submit") {
-      const t = String(reply.text || "").trim().toLowerCase();
-      const wantsSubmit = t === "submit" || t === "yes" || t === "1";
-      if (wantsSubmit) {
-        const result = await quickSubmitExpense(
-          capture.workspaceId as any,
-          capture.employeeId as any,
-          capture.expenseId as any,
-        );
-        await sendTextMessage(
-          reply.waId,
-          result.ok
-            ? `📤 Submitted ${result.claimRef} to ${result.approverName} for approval.`
-            : `⚠️ Couldn't submit — ${result.reason}. It's in your pending list; fix & submit from the portal.`,
-        );
-      } else {
-        // Don't trap them — anything else just leaves it in the pending list.
-        await sendTextMessage(reply.waId, "👍 Saved to your pending list.");
-      }
-      capture.status = "confirmed"; // close the session either way
-      await capture.save();
-      reply.status = "done";
-      reply.errorMessage = undefined;
-      await reply.save();
-      return true;
-    }
-
-    const intent = parseReply(reply.text);
-
-    if (intent.kind === "cancel") {
-      capture.status = "cancelled";
-      await capture.save();
-      await sendTextMessage(reply.waId, "Discarded. Send a new receipt photo whenever you're ready.");
-    } else if (intent.kind === "confirm") {
-      if (capture.extraction?.amount == null) {
-        // Nothing to confirm yet (e.g. extraction failed) — ask for the amount.
-        await sendTextMessage(reply.waId, "I still need the amount. " + CORRECTION_HINT);
-      } else {
-        await confirmCapture(capture);
-      }
-    } else if (intent.kind === "correct") {
-      const ext: any = capture.extraction || {};
-      ext[intent.field] = intent.value;
-      capture.extraction = ext;
-      capture.status = "awaiting_confirmation";
-      capture.markModified("extraction");
-      await capture.save();
-      await sendTextMessage(reply.waId, buildSummary(capture));
+    if (capture) {
+      await handleCaptureReply(capture, waId, text);
     } else {
-      // unparseable
-      await sendTextMessage(reply.waId, "Sorry, I didn't get that.\n" + CORRECTION_HINT);
+      // 2) Otherwise it's the post-confirm / open-claim conversation.
+      const session = await getSession(waId);
+      if (session && session.state && session.state !== "idle") {
+        await handleSessionReply(session, waId, text);
+      } else {
+        await sendTextMessage(
+          waId,
+          "No receipt is awaiting confirmation. Send a photo of a receipt to get started.",
+        );
+      }
     }
 
     reply.status = "done";

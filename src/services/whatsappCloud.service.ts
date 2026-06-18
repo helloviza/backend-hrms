@@ -108,3 +108,63 @@ export async function sendTextMessage(to: string, body: string): Promise<void> {
     });
   }
 }
+
+export type ReplyButton = { id: string; title: string };
+
+/**
+ * Send an interactive reply-button message via the Cloud API.
+ * POST /<phoneNumberId>/messages with type "interactive" / "button".
+ *
+ * WhatsApp caps this at 3 reply buttons; titles are truncated to 20 chars and
+ * the body to 1024. If the interactive send fails (or there are no buttons) we
+ * fall back to a plain-text send of the same body, so the conversation never
+ * stalls just because a button couldn't be rendered.
+ */
+export async function sendButtonMessage(
+  to: string,
+  body: string,
+  buttons: ReplyButton[],
+): Promise<void> {
+  if (!isWhatsAppCloudConfigured()) {
+    whatsappLogger.warn("sendButtonMessage skipped — Cloud API not configured", { to });
+    return;
+  }
+  const replyButtons = (buttons || []).slice(0, 3).map((b) => ({
+    type: "reply",
+    reply: { id: b.id, title: String(b.title).slice(0, 20) },
+  }));
+  if (replyButtons.length === 0) {
+    await sendTextMessage(to, body);
+    return;
+  }
+  try {
+    await axios.post(
+      `${GRAPH_BASE}/${env.WA_GRAPH_VERSION}/${env.WA_PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "interactive",
+        interactive: {
+          type: "button",
+          body: { text: String(body).slice(0, 1024) },
+          action: { buttons: replyButtons },
+        },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${env.WA_ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 30_000,
+      },
+    );
+  } catch (err) {
+    whatsappLogger.error("sendButtonMessage failed — falling back to text", {
+      to,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    // Text fallback keeps the flow working (the typed keywords still apply).
+    await sendTextMessage(to, body);
+  }
+}

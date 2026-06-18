@@ -103,6 +103,39 @@ router.post("/webhook", async (req: Request, res: Response) => {
               continue;
             }
 
+            // ── INTERACTIVE replies (tapped reply buttons) ──────────────────
+            // A button tap arrives as type "interactive". We enqueue it as an
+            // ExpenseReply whose `text` is the button id, so the worker handles a
+            // tap and the equivalent typed keyword ("submit", "yes", …) the same
+            // way — text fallbacks keep working everywhere.
+            if (type === "interactive") {
+              const messageId: string = message?.id ?? "";
+              const waId: string = message?.from ?? "";
+              const inter = message?.interactive ?? {};
+              const btnId: string = inter?.button_reply?.id ?? inter?.list_reply?.id ?? "";
+              if (!messageId || !waId || !btnId) {
+                whatsappLogger.warn("Skipping interactive message with missing fields", {
+                  hasId: Boolean(messageId),
+                  hasWaId: Boolean(waId),
+                  hasBtn: Boolean(btnId),
+                });
+                continue;
+              }
+
+              const interResult = await ExpenseReply.updateOne(
+                { messageId },
+                { $setOnInsert: { messageId, waId, phoneNumberId, text: btnId, status: "queued" } },
+                { upsert: true },
+              );
+
+              if (interResult.upsertedCount > 0) {
+                whatsappLogger.info("Button reply queued", { messageId, waId, btnId });
+              } else {
+                whatsappLogger.info("Duplicate interactive webhook — already queued", { messageId });
+              }
+              continue;
+            }
+
             if (!MEDIA_TYPES.has(type)) continue;
 
             const media = message[type] ?? {};
