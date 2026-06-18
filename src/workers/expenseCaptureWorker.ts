@@ -17,7 +17,9 @@ import { extractReceipt } from "../services/receiptExtractorGemini.js";
 import { createExpense } from "../services/expenses.service.js";
 import { resolveCategoryId } from "../services/expenseCategories.service.js";
 import {
-  quickSubmitExpense,
+  // quickSubmitExpense intentionally NOT used here — WhatsApp submission always
+  // goes through a NAMED claim (the open-claim [Submit] stage). The service fn
+  // stays in reports.service.ts for possible web use.
   createReport,
   linkExpensesToReport,
   submitReport,
@@ -185,20 +187,14 @@ async function sendConfirmButtons(waId: string, body: string): Promise<void> {
   ]);
 }
 
-/** Post-confirm choices. With an open claim the only loose-expense options are
- *  Submit / Later (Add-to-claim is offered via the Yes/No add decision). */
-async function sendPostConfirmButtons(waId: string, body: string, hasOpenClaim: boolean): Promise<void> {
-  const buttons = hasOpenClaim
-    ? [
-        { id: BTN.SUBMIT, title: "Submit" },
-        { id: BTN.LATER, title: "Later" },
-      ]
-    : [
-        { id: BTN.SUBMIT, title: "Submit" },
-        { id: BTN.ADD_TO_CLAIM, title: "Add to claim" },
-        { id: BTN.LATER, title: "Later" },
-      ];
-  await sendButtonMessage(waId, body, buttons);
+/** Post-confirm choices (no named claim yet): a bill can only be added to a
+ *  claim or left in the pending list. There is NO solo Submit — submission
+ *  always goes through a named claim (the open-claim [Submit] stage). */
+async function sendPostConfirmButtons(waId: string, body: string): Promise<void> {
+  await sendButtonMessage(waId, body, [
+    { id: BTN.ADD_TO_CLAIM, title: "Add to claim" },
+    { id: BTN.LATER, title: "Later" },
+  ]);
 }
 
 async function sendOpenClaimButtons(waId: string, body: string): Promise<void> {
@@ -478,7 +474,10 @@ async function confirmCapture(capture: any): Promise<void> {
       openClaimId: null,
       openClaimName: null,
     });
-    await sendPostConfirmButtons(capture.waId, `${savedLine(expense)}\nSubmit it for approval now?`, false);
+    await sendPostConfirmButtons(
+      capture.waId,
+      `${savedLine(expense)}\nAdd it to a claim to submit for approval, or keep it in your pending list.`,
+    );
   }
 
   whatsappLogger.info("Expense confirmed", {
@@ -577,28 +576,22 @@ async function handleSessionReply(session: any, waId: string, text: string): Pro
 
   switch (session.state) {
     case "post_confirm": {
-      const hasOpenClaim = Boolean(session.openClaimId);
-      const isSubmit = t === BTN.SUBMIT || t === "1" || t === "yes" || t === "y";
+      // No named claim yet → only Add to claim / Later. No solo Submit, and
+      // "submit" is intentionally NOT a keyword here.
       const isLater = t === BTN.LATER || t === "no" || t === "skip";
       const isAddToClaim = t === BTN.ADD_TO_CLAIM || t === "add" || t === "add to claim";
 
-      if (isSubmit) {
-        const result = await quickSubmitExpense(ws, emp, session.pendingExpenseId);
-        await sendTextMessage(
-          waId,
-          result.ok
-            ? `📤 Submitted ${result.claimRef} to ${result.approverName} for approval.`
-            : `⚠️ Couldn't submit — ${result.reason}. It's in your pending list; fix & submit from the portal.`,
-        );
-        await afterSoloDecision(waId, session);
-      } else if (isAddToClaim && !hasOpenClaim) {
+      if (isAddToClaim) {
         await upsertSession(waId, { state: "await_claim_name" });
         await sendTextMessage(waId, "What should we name this claim? (e.g. “Mumbai trip”)");
       } else if (isLater) {
         await sendTextMessage(waId, "👍 Saved to your pending list.");
         await afterSoloDecision(waId, session);
       } else {
-        await sendPostConfirmButtons(waId, "Tap an option:", hasOpenClaim);
+        await sendPostConfirmButtons(
+          waId,
+          "Add it to a claim to submit for approval, or keep it in your pending list.",
+        );
       }
       break;
     }
@@ -627,9 +620,12 @@ async function handleSessionReply(session: any, waId: string, text: string): Pro
 
       if (isYes) {
         if (!openClaim) {
-          // Claim closed out-of-band — fall back to a solo decision.
+          // Claim closed out-of-band — the bill is loose with no claim.
           await upsertSession(waId, { state: "post_confirm", openClaimId: null, openClaimName: null });
-          await sendPostConfirmButtons(waId, "That claim is no longer open. Submit this expense on its own?", false);
+          await sendPostConfirmButtons(
+            waId,
+            "That claim is no longer open. Add this expense to a claim, or keep it in your pending list.",
+          );
           break;
         }
         await linkExpensesToReport(ws, emp, openClaim, [session.pendingExpenseId]);
@@ -640,13 +636,11 @@ async function handleSessionReply(session: any, waId: string, text: string): Pro
           `✅ Added to “${openClaim.name}” (${count} expense${count === 1 ? "" : "s"}).\nSend the next receipt, or tap Submit.`,
         );
       } else if (isNo) {
-        // Leave the bill loose; the open claim stays. Offer to submit it solo.
-        await upsertSession(waId, { state: "post_confirm" }); // openClaimId stays set
-        await sendPostConfirmButtons(
-          waId,
-          "👍 Left it loose (pending to submit). Submit it on its own, or leave it for later?",
-          true,
-        );
+        // Leave the bill loose; the named claim stays open. No solo submit —
+        // return to the claim so it's submitted there (or via the portal).
+        await sendTextMessage(waId, "👍 Left it loose (pending to submit).");
+        await upsertSession(waId, { pendingExpenseId: null });
+        await afterSoloDecision(waId, session);
       } else {
         await sendYesNoButtons(waId, `Add to claim “${session.openClaimName}”?`);
       }
