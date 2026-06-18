@@ -1,0 +1,859 @@
+[
+  {
+    "_id": "69fb8c66391df86de249ccb9",
+    "invoiceNo": "INV-20260072",
+    "status": "SENT",
+    "editHistory": [
+      {
+        "editedAt": "2026-06-16T22:14:33.362Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "clientDetails.gstin"
+        ],
+        "oldValues": {
+          "clientDetails.gstin": "06AAKCB4816A1Z3"
+        },
+        "newValues": {
+          "clientDetails.gstin": "06AAKCB4816A2Z2"
+        },
+        "reason": "BUNDLEOJOY GSTIN corrected old->new"
+      }
+    ]
+  },
+  {
+    "_id": "6a02391987385fc700aebb99",
+    "invoiceNo": "INV-20260075",
+    "status": "SENT",
+    "editHistory": [
+      {
+        "editedAt": "2026-06-16T22:14:33.958Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "clientDetails.gstin"
+        ],
+        "oldValues": {
+          "clientDetails.gstin": "06AAKCB4816A1Z3"
+        },
+        "newValues": {
+          "clientDetails.gstin": "06AAKCB4816A2Z2"
+        },
+        "reason": "BUNDLEOJOY GSTIN corrected old->new"
+      }
+    ]
+  },
+  {
+    "_id": "6a0d8523729699da0969db30",
+    "invoiceNo": "INV-20260118",
+    "status": "DRAFT",
+    "editHistory": [
+      {
+        "editedAt": "2026-06-16T22:14:34.344Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "clientDetails.gstin"
+        ],
+        "oldValues": {
+          "clientDetails.gstin": "06AAKCB4816A1Z3"
+        },
+        "newValues": {
+          "clientDetails.gstin": "06AAKCB4816A2Z2"
+        },
+        "reason": "BUNDLEOJOY GSTIN corrected old->new"
+      }
+    ]
+  },
+  {
+    "_id": "6a1c12e105bde40eaaef2d3a",
+    "invoiceNo": "INV-20260077",
+    "status": "PAID",
+    "editHistory": [
+      {
+        "editedAt": "2026-05-31T11:02:49.327Z",
+        "editedBy": "69f38ed13dbdc9d63fcf4edd",
+        "fieldsChanged": [
+          "status"
+        ],
+        "oldValues": {
+          "status": "DRAFT"
+        },
+        "newValues": {
+          "status": "SENT",
+          "sentAt": "2026-05-31T00:00:00.000Z"
+        },
+        "_id": "6a1c155905bde40eaaef380d"
+      },
+      {
+        "editedAt": "2026-05-31T11:02:57.402Z",
+        "editedBy": "69f38ed13dbdc9d63fcf4edd",
+        "fieldsChanged": [
+          "status"
+        ],
+        "oldValues": {
+          "status": "SENT"
+        },
+        "newValues": {
+          "status": "PAID",
+          "paidAt": "2026-05-15T00:00:00.000Z"
+        },
+        "_id": "6a1c156105bde40eaaef3817"
+      },
+      {
+        "editedAt": "2026-06-16T21:13:01.181Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "lineItems"
+        ],
+        "oldValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "04 May – 12 Jun",
+              "travelDate": "2026-05-18T00:00:00.000Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "04 May – 12 Jun",
+              "travelDate": "2026-05-18T00:00:00.000Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "06 May – 12 Jun",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "06 May – 12 Jun",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "05 May 2026",
+              "travelDate": "2026-05-05T00:00:00.000Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "20 May – 08 Jul",
+              "travelDate": "2026-05-20T00:00:00.000Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "20 May – 08 Jul",
+              "travelDate": "2026-05-20T00:00:00.000Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "20 May – 25 Jun",
+              "travelDate": "2026-05-20T00:00:00.000Z"
+            }
+          ]
+        },
+        "newValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            }
+          ]
+        },
+        "reason": "Combined-invoice date label corrected to booking-creation span (backfill)"
+      },
+      {
+        "editedAt": "2026-06-16T21:54:29.690Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "lineItems"
+        ],
+        "oldValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "01 May – 14 May",
+              "travelDate": "2026-05-01T08:28:09.988Z"
+            }
+          ]
+        },
+        "newValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "01 May – 13 May",
+              "travelDate": "2026-05-01T00:00:00.000Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "01 May – 13 May",
+              "travelDate": "2026-05-01T00:00:00.000Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "01 May – 13 May",
+              "travelDate": "2026-05-01T00:00:00.000Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "01 May – 13 May",
+              "travelDate": "2026-05-01T00:00:00.000Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "01 May – 13 May",
+              "travelDate": "2026-05-01T00:00:00.000Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "01 May – 13 May",
+              "travelDate": "2026-05-01T00:00:00.000Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "01 May – 13 May",
+              "travelDate": "2026-05-01T00:00:00.000Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "01 May – 13 May",
+              "travelDate": "2026-05-01T00:00:00.000Z"
+            }
+          ]
+        },
+        "reason": "Combined-invoice date label corrected to booking-creation span (backfill)"
+      }
+    ]
+  },
+  {
+    "_id": "6a1d5571008b185334f85d44",
+    "invoiceNo": "INV-20260164",
+    "status": "PAID",
+    "editHistory": [
+      {
+        "editedAt": "2026-06-02T09:33:38.780Z",
+        "editedBy": "69f38ed13dbdc9d63fcf4edd",
+        "fieldsChanged": [
+          "status"
+        ],
+        "oldValues": {
+          "status": "DRAFT"
+        },
+        "newValues": {
+          "status": "SENT",
+          "sentAt": "2026-06-02T00:00:00.000Z"
+        },
+        "_id": "6a1ea37293c044e2905e424b"
+      },
+      {
+        "editedAt": "2026-06-12T11:44:11.842Z",
+        "editedBy": "69f38ed13dbdc9d63fcf4edd",
+        "fieldsChanged": [
+          "status"
+        ],
+        "oldValues": {
+          "status": "SENT"
+        },
+        "newValues": {
+          "status": "PAID",
+          "paidAt": "2026-06-05T00:00:00.000Z"
+        },
+        "_id": "6a2bf10bf57a4b689e11d2bf"
+      },
+      {
+        "editedAt": "2026-06-16T21:13:01.874Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "lineItems"
+        ],
+        "oldValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "15 May – 11 Jul",
+              "travelDate": "2026-05-15T00:00:00.000Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "15 May – 11 Jul",
+              "travelDate": "2026-05-15T00:00:00.000Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "26 May – 11 Jul",
+              "travelDate": "2026-06-06T00:00:00.000Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "26 May – 11 Jul",
+              "travelDate": "2026-06-06T00:00:00.000Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "11 May – 15 May",
+              "travelDate": "2026-05-11T00:00:00.000Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "06 Jun – 13 Jun",
+              "travelDate": "2026-06-06T00:00:00.000Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "06 Jun – 13 Jun",
+              "travelDate": "2026-06-06T00:00:00.000Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "01 Jun – 30 Jun",
+              "travelDate": "2026-06-16T00:00:00.000Z"
+            },
+            {
+              "index": 8,
+              "subDescription": "01 Jun – 30 Jun",
+              "travelDate": "2026-06-16T00:00:00.000Z"
+            }
+          ]
+        },
+        "newValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 8,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            }
+          ]
+        },
+        "reason": "Combined-invoice date label corrected to booking-creation span (backfill)"
+      },
+      {
+        "editedAt": "2026-06-16T21:54:30.322Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "lineItems"
+        ],
+        "oldValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            },
+            {
+              "index": 8,
+              "subDescription": "14 May – 31 May",
+              "travelDate": "2026-05-14T12:54:41.054Z"
+            }
+          ]
+        },
+        "newValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "10 May – 30 May",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "10 May – 30 May",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "10 May – 30 May",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "10 May – 30 May",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "10 May – 30 May",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "10 May – 30 May",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "10 May – 30 May",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "10 May – 30 May",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            },
+            {
+              "index": 8,
+              "subDescription": "10 May – 30 May",
+              "travelDate": "2026-05-10T00:00:00.000Z"
+            }
+          ]
+        },
+        "reason": "Combined-invoice date label corrected to booking-creation span (backfill)"
+      }
+    ]
+  },
+  {
+    "_id": "6a1e91dd93c044e2905df468",
+    "invoiceNo": "INV-20260171",
+    "status": "DRAFT",
+    "editHistory": [
+      {
+        "editedAt": "2026-06-16T22:14:34.765Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "clientDetails.gstin"
+        ],
+        "oldValues": {
+          "clientDetails.gstin": "06AAKCB4816A1Z3"
+        },
+        "newValues": {
+          "clientDetails.gstin": "06AAKCB4816A2Z2"
+        },
+        "reason": "BUNDLEOJOY GSTIN corrected old->new"
+      }
+    ]
+  },
+  {
+    "_id": "6a27a28704a47b3f91be0048",
+    "invoiceNo": "INV-20260179",
+    "status": "DRAFT",
+    "editHistory": [
+      {
+        "editedAt": "2026-06-16T22:14:35.143Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "clientDetails.gstin"
+        ],
+        "oldValues": {
+          "clientDetails.gstin": "06AAKCB4816A1Z3"
+        },
+        "newValues": {
+          "clientDetails.gstin": "06AAKCB4816A2Z2"
+        },
+        "reason": "BUNDLEOJOY GSTIN corrected old->new"
+      }
+    ]
+  },
+  {
+    "_id": "6a31a20b8e147d4c34a695e5",
+    "invoiceNo": "INV-20260205",
+    "status": "SENT",
+    "editHistory": [
+      {
+        "editedAt": "2026-06-16T19:31:49.991Z",
+        "editedBy": "69f38ed13dbdc9d63fcf4edd",
+        "fieldsChanged": [
+          "status"
+        ],
+        "oldValues": {
+          "status": "DRAFT"
+        },
+        "newValues": {
+          "status": "SENT",
+          "sentAt": "2026-06-16T00:00:00.000Z"
+        },
+        "_id": "6a31a4a58e147d4c34a6a09f"
+      },
+      {
+        "editedAt": "2026-06-16T21:13:02.330Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "lineItems"
+        ],
+        "oldValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "02 Jun – 26 Jun",
+              "travelDate": "2026-06-04T00:00:00.000Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "02 Jun – 26 Jun",
+              "travelDate": "2026-06-04T00:00:00.000Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "30 Sept – 03 Oct",
+              "travelDate": "2026-09-30T00:00:00.000Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "30 Sept – 03 Oct",
+              "travelDate": "2026-09-30T00:00:00.000Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "03 Jun – 03 Jul",
+              "travelDate": "2026-06-07T00:00:00.000Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "03 Jun – 03 Jul",
+              "travelDate": "2026-06-07T00:00:00.000Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "21 Jun – 12 Jul",
+              "travelDate": "2026-06-21T00:00:00.000Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "06 Jun – 23 Jun",
+              "travelDate": "2026-06-13T00:00:00.000Z"
+            },
+            {
+              "index": 8,
+              "subDescription": "06 Jun – 23 Jun",
+              "travelDate": "2026-06-13T00:00:00.000Z"
+            },
+            {
+              "index": 9,
+              "subDescription": "21 Jun – 30 Jun",
+              "travelDate": "2026-06-21T00:00:00.000Z"
+            },
+            {
+              "index": 10,
+              "subDescription": "21 Jun – 30 Jun",
+              "travelDate": "2026-06-21T00:00:00.000Z"
+            }
+          ]
+        },
+        "newValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 8,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 9,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 10,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            }
+          ]
+        },
+        "reason": "Combined-invoice date label corrected to booking-creation span (backfill)"
+      },
+      {
+        "editedAt": "2026-06-16T21:54:30.706Z",
+        "editedBy": "system:backfill",
+        "fieldsChanged": [
+          "lineItems"
+        ],
+        "oldValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 8,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 9,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            },
+            {
+              "index": 10,
+              "subDescription": "01 Jun – 17 Jun",
+              "travelDate": "2026-06-01T11:11:19.230Z"
+            }
+          ]
+        },
+        "newValues": {
+          "lineItems": [
+            {
+              "index": 0,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            },
+            {
+              "index": 1,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            },
+            {
+              "index": 2,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            },
+            {
+              "index": 3,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            },
+            {
+              "index": 4,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            },
+            {
+              "index": 5,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            },
+            {
+              "index": 6,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            },
+            {
+              "index": 7,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            },
+            {
+              "index": 8,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            },
+            {
+              "index": 9,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            },
+            {
+              "index": 10,
+              "subDescription": "01 Jun – 16 Jun",
+              "travelDate": "2026-06-01T00:00:00.000Z"
+            }
+          ]
+        },
+        "reason": "Combined-invoice date label corrected to booking-creation span (backfill)"
+      }
+    ]
+  }
+]

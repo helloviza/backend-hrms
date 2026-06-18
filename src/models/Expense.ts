@@ -31,7 +31,28 @@ export interface IExpense extends Document {
   taxAmount?: number | null;
   gstin?: string | null;
   suggestedCategory?: string | null;
+  // Managed category (Layer 1). suggestedCategory is kept as the AI hint;
+  // categoryId is the authoritative classification once selected.
+  categoryId?: mongoose.Types.ObjectId | null;
 
+  // Report linkage (Layer 2). An expense belongs to at most ONE report.
+  reportId?: mongoose.Types.ObjectId | null;
+  // Denormalized workflow state, the ONLY user-facing "status". Written solely
+  // by propagateLifecycle() whenever report linkage or report.status changes.
+  // Taxonomy: pending_to_submit → awaiting_approval →
+  //   (approved · declined · clarification_required) → reimbursed.
+  // "pending_to_submit" covers BOTH an unlinked expense (reportId null) and one
+  // sitting in a DRAFT/clarification report — the two are told apart by reportId.
+  lifecycleStatus:
+    | "pending_to_submit"
+    | "awaiting_approval"
+    | "approved"
+    | "declined"
+    | "clarification_required"
+    | "reimbursed";
+
+  // Internal record-state (capture confirmed). NOT user-facing; always
+  // "submitted" today. Kept separate from lifecycleStatus on purpose.
   status: "submitted";
 
   // Audit of what the model produced + its confidences (immutable record).
@@ -63,6 +84,22 @@ const ExpenseSchema = new Schema<IExpense>(
     taxAmount: { type: Number, default: null },
     gstin: { type: String, trim: true, default: null },
     suggestedCategory: { type: String, trim: true, default: null },
+    categoryId: { type: Schema.Types.ObjectId, ref: "ExpenseCategory", default: null, index: true },
+
+    reportId: { type: Schema.Types.ObjectId, ref: "Report", default: null, index: true, sparse: true },
+    lifecycleStatus: {
+      type: String,
+      enum: [
+        "pending_to_submit",
+        "awaiting_approval",
+        "approved",
+        "declined",
+        "clarification_required",
+        "reimbursed",
+      ],
+      default: "pending_to_submit",
+      index: true,
+    },
 
     status: { type: String, enum: ["submitted"], default: "submitted", index: true },
 

@@ -428,6 +428,14 @@ app.use("/api/v1/workspace", expenseBandsRouter);
 import expensesRouter from "./routes/expenses.js";
 app.use("/api/expenses", requireAuth, requireWorkspace, expensesRouter);
 
+// Expense categories (Layer 1) — tenant-scoped managed category list.
+import expenseCategoriesRouter from "./routes/expenseCategories.js";
+app.use("/api/expense-categories", requireAuth, requireWorkspace, expenseCategoriesRouter);
+
+// Expense reports (Layer 2) — tenant-scoped; owner-only mutations, admin-all reads.
+import expenseReportsRouter from "./routes/expenseReports.js";
+app.use("/api/reports", requireAuth, requireWorkspace, expenseReportsRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";

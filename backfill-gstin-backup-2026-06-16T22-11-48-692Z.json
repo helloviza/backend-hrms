@@ -1,0 +1,97 @@
+[
+  {
+    "_id": "69fb8c66391df86de249ccb9",
+    "invoiceNo": "INV-20260072",
+    "status": "SENT",
+    "pdfUrl": "https://plumtrips-hrms-prod.s3.ap-south-1.amazonaws.com/invoices/INV-20260072.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=AKIA5VYKZ43M4QWT4M25%2F20260613%2Fap-south-1%2Fs3%2Faws4_request&X-Amz-Date=20260613T121803Z&X-Amz-Expires=3600&X-Amz-Signature=f2fc3738053d034a40d765804ac880ca0840ad22a2331f1cc7e7704fe5d5957c&X-Amz-SignedHeaders=host&response-content-disposition=inline%3B%20filename%3D%22INV-20260072.pdf%22&x-amz-checksum-mode=ENABLED&x-id=GetObject",
+    "clientDetails": {
+      "companyName": "BUNDLEOJOY PRIVATE LIMITED",
+      "gstin": "06AAKCB4816A1Z3",
+      "billingAddress": "Floor no. 2\nTower A,\nUnitech Business Zone,\nGolf Ext Road\nNirvana Country,\nSector 50,\nGurugram,\nHaryana 122018",
+      "addressLine1": "Floor no. 2\nTower A, Unitech Business Zone",
+      "addressLine2": "Golf Ext Road\nNirvana Country, Sector 50",
+      "city": "Gurugram",
+      "country": "India",
+      "pincode": "",
+      "contactPerson": "",
+      "email": "akriti@loopie.in",
+      "state": ""
+    }
+  },
+  {
+    "_id": "6a02391987385fc700aebb99",
+    "invoiceNo": "INV-20260075",
+    "status": "SENT",
+    "pdfUrl": "https://plumtrips-hrms-prod.s3.ap-south-1.amazonaws.com/invoices/INV-20260075.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=AKIA5VYKZ43M4QWT4M25%2F20260613%2Fap-south-1%2Fs3%2Faws4_request&X-Amz-Date=20260613T122213Z&X-Amz-Expires=3600&X-Amz-Signature=8ef9f5fc95c54222ecd3c832af64a13db72a856b62ec5c170cbaafca5086086f&X-Amz-SignedHeaders=host&response-content-disposition=inline%3B%20filename%3D%22INV-20260075.pdf%22&x-amz-checksum-mode=ENABLED&x-id=GetObject",
+    "clientDetails": {
+      "companyName": "BUNDLEOJOY PRIVATE LIMITED",
+      "gstin": "06AAKCB4816A1Z3",
+      "billingAddress": "Floor no. 2\nTower A,\nUnitech Business Zone,\nGolf Ext Road\nNirvana Country,\nSector 50,\nGurugram,\nHaryana 122018",
+      "addressLine1": "Floor no. 2\nTower A, Unitech Business Zone",
+      "addressLine2": "Golf Ext Road\nNirvana Country, Sector 50",
+      "city": "Gurugram",
+      "country": "India",
+      "pincode": "",
+      "contactPerson": "",
+      "email": "akriti@loopie.in",
+      "state": ""
+    }
+  },
+  {
+    "_id": "6a0d8523729699da0969db30",
+    "invoiceNo": "INV-20260118",
+    "status": "DRAFT",
+    "pdfUrl": "https://plumtrips-hrms-prod.s3.ap-south-1.amazonaws.com/invoices/INV-20260118.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=AKIA5VYKZ43M4QWT4M25%2F20260520%2Fap-south-1%2Fs3%2Faws4_request&X-Amz-Date=20260520T095554Z&X-Amz-Expires=3600&X-Amz-Signature=43bec946d0b0f1c6c66ef0827e3192e43c7401050dcd59ae4a70c90d14ef4e8e&X-Amz-SignedHeaders=host&response-content-disposition=inline%3B%20filename%3D%22INV-20260118.pdf%22&x-amz-checksum-mode=ENABLED&x-id=GetObject",
+    "clientDetails": {
+      "companyName": "BUNDLEOJOY PRIVATE LIMITED",
+      "gstin": "06AAKCB4816A1Z3",
+      "billingAddress": "Floor no. 2\nTower A,\nUnitech Business Zone,\nGolf Ext Road\nNirvana Country,\nSector 50,\nGurugram,\nHaryana 122018",
+      "addressLine1": "Floor no. 2\nTower A, Unitech Business Zone",
+      "addressLine2": "Golf Ext Road\nNirvana Country, Sector 50",
+      "city": "Gurugram",
+      "country": "India",
+      "pincode": "",
+      "contactPerson": "",
+      "email": "akriti@loopie.in",
+      "state": ""
+    }
+  },
+  {
+    "_id": "6a1e91dd93c044e2905df468",
+    "invoiceNo": "INV-20260171",
+    "status": "DRAFT",
+    "pdfUrl": "https://plumtrips-hrms-prod.s3.ap-south-1.amazonaws.com/invoices/INV-20260171.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=AKIA5VYKZ43M4QWT4M25%2F20260602%2Fap-south-1%2Fs3%2Faws4_request&X-Amz-Date=20260602T082954Z&X-Amz-Expires=3600&X-Amz-Signature=eb8520700d88f79f557e76efa4f2488dbeeb6912f4894ecc4aaa3050685399ab&X-Amz-SignedHeaders=host&response-content-disposition=inline%3B%20filename%3D%22INV-20260171.pdf%22&x-amz-checksum-mode=ENABLED&x-id=GetObject",
+    "clientDetails": {
+      "companyName": "BUNDLEOJOY PRIVATE LIMITED",
+      "gstin": "06AAKCB4816A1Z3",
+      "billingAddress": "Floor no. 2\nTower A,\nUnitech Business Zone,\nGolf Ext Road\nNirvana Country,\nSector 50,\nGurugram,\nHaryana 122018",
+      "addressLine1": "Floor no. 2\nTower A, Unitech Business Zone",
+      "addressLine2": "Golf Ext Road\nNirvana Country, Sector 50",
+      "city": "Gurugram",
+      "country": "India",
+      "pincode": "",
+      "contactPerson": "",
+      "email": "akriti@loopie.in",
+      "state": ""
+    }
+  },
+  {
+    "_id": "6a27a28704a47b3f91be0048",
+    "invoiceNo": "INV-20260179",
+    "status": "DRAFT",
+    "pdfUrl": "https://plumtrips-hrms-prod.s3.ap-south-1.amazonaws.com/invoices/INV-20260179.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=AKIA5VYKZ43M4QWT4M25%2F20260609%2Fap-south-1%2Fs3%2Faws4_request&X-Amz-Date=20260609T052042Z&X-Amz-Expires=3600&X-Amz-Signature=40a5ff4702341b45b2ab3866df5b8ff24411be7dd517d228001a804d9e8ca6fa&X-Amz-SignedHeaders=host&response-content-disposition=inline%3B%20filename%3D%22INV-20260179.pdf%22&x-amz-checksum-mode=ENABLED&x-id=GetObject",
+    "clientDetails": {
+      "companyName": "BUNDLEOJOY PRIVATE LIMITED",
+      "gstin": "06AAKCB4816A1Z3",
+      "billingAddress": "Second Floor,  A201-A212, Unitech Business Zone, Golf Ext Road Nirvana Country, Sector 50, Gurugram, Haryana, India",
+      "addressLine1": "Second Floor,  A201-A212, Unitech Business Zone",
+      "addressLine2": "Golf Ext Road Nirvana Country, Sector 50",
+      "city": "Gurugram",
+      "country": "India",
+      "pincode": "",
+      "contactPerson": "",
+      "email": "akriti@loopie.in",
+      "state": "Haryana"
+    }
+  }
+]
