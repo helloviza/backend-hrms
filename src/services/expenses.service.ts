@@ -19,7 +19,11 @@ export type CreateExpenseInput = {
   currency?: string | null;
   taxAmount?: number | null;
   gstin?: string | null;
-  suggestedCategory?: string | null;
+  suggestedCategory?: string | null; // AI hint
+  categoryId?: mongoose.Types.ObjectId | string | null; // managed category (Layer 1)
+  // Optional report linkage at creation (Layer 2). When set, the caller is
+  // responsible for propagateReportLifecycle() — this writes reportId only.
+  reportId?: mongoose.Types.ObjectId | string | null;
 
   imageKey?: string;
   s3Bucket?: string;
@@ -48,6 +52,8 @@ export async function createExpense(input: CreateExpenseInput): Promise<IExpense
     taxAmount: input.taxAmount ?? null,
     gstin: input.gstin ?? null,
     suggestedCategory: input.suggestedCategory ?? null,
+    categoryId: input.categoryId ?? null,
+    reportId: input.reportId ?? null,
     status: "submitted",
     rawExtraction: input.rawExtraction,
     perFieldConfidence: input.perFieldConfidence,

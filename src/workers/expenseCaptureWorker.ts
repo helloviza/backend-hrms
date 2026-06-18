@@ -12,6 +12,8 @@ import {
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
 import { extractReceipt } from "../services/receiptExtractorGemini.js";
 import { createExpense } from "../services/expenses.service.js";
+import { resolveCategoryId } from "../services/expenseCategories.service.js";
+import { quickSubmitExpense } from "../services/reports.service.js";
 import { whatsappLogger } from "../utils/logger.js";
 
 /**
@@ -305,6 +307,21 @@ async function confirmCapture(capture: any): Promise<void> {
   }
 
   const e = capture.extraction || {};
+
+  // Auto-classify on capture: fuzzy-match the AI's free-text suggestion to a
+  // managed category (same logic as the web reviewer) so WhatsApp expenses land
+  // already categorized. suggestedCategory is still stored as the fallback. A
+  // failed lookup is non-fatal — never block confirming a receipt on it.
+  let categoryId: string | null = null;
+  try {
+    categoryId = await resolveCategoryId(capture.workspaceId, e.suggestedCategory);
+  } catch (clsErr) {
+    whatsappLogger.warn("Auto-classify failed — leaving uncategorized", {
+      messageId: capture.messageId,
+      error: clsErr instanceof Error ? clsErr.message : String(clsErr),
+    });
+  }
+
   const expense = await createExpense({
     workspaceId: capture.workspaceId,
     employeeId: capture.employeeId,
@@ -319,18 +336,24 @@ async function confirmCapture(capture: any): Promise<void> {
     taxAmount: e.taxAmount,
     gstin: e.gstin,
     suggestedCategory: e.suggestedCategory,
+    categoryId,
     rawExtraction: capture.extractionRaw,
     perFieldConfidence: e.perFieldConfidence,
     extractionModel: capture.extractionModel,
   });
 
-  capture.status = "confirmed";
+  // Park the session in awaiting_submit and offer conversational quick-submit.
+  // The expense is already saved (loose, pending_to_submit); the next inbound
+  // reply either submits it or leaves it in the pending list.
+  capture.status = "awaiting_submit";
   capture.expenseId = expense._id as any;
   await capture.save();
 
+  const amt = `₹${Number(expense.amount || 0).toLocaleString("en-IN")}`;
   await sendTextMessage(
     capture.waId,
-    `✅ Saved: ${expense.merchant || "receipt"} — ${fmtMoney(expense.amount, expense.currency)}\nReference: ${expense.ref}`,
+    `✅ Saved ${expense.ref} · ${expense.merchant || "receipt"} · ${amt}.\n` +
+      `Reply *submit* to send it for approval now, or it'll wait in your pending list.`,
   );
   whatsappLogger.info("Expense confirmed", {
     messageId: capture.messageId,
@@ -351,7 +374,7 @@ async function processOneReply(): Promise<boolean> {
     // Match to the pending capture for this sender (most recent first).
     const capture = await ExpenseCapture.findOne({
       waId: reply.waId,
-      status: { $in: ["awaiting_confirmation", "awaiting_correction"] },
+      status: { $in: ["awaiting_confirmation", "awaiting_correction", "awaiting_submit"] },
     }).sort({ updatedAt: -1 });
 
     if (!capture) {
@@ -360,6 +383,35 @@ async function processOneReply(): Promise<boolean> {
         "No receipt is awaiting confirmation. Send a photo of a receipt to get started.",
       );
       reply.status = "done";
+      await reply.save();
+      return true;
+    }
+
+    // Conversational quick-submit: the just-saved expense is awaiting "submit".
+    // Single just-captured expense only — no chat bundling.
+    if (capture.status === "awaiting_submit") {
+      const t = String(reply.text || "").trim().toLowerCase();
+      const wantsSubmit = t === "submit" || t === "yes" || t === "1";
+      if (wantsSubmit) {
+        const result = await quickSubmitExpense(
+          capture.workspaceId as any,
+          capture.employeeId as any,
+          capture.expenseId as any,
+        );
+        await sendTextMessage(
+          reply.waId,
+          result.ok
+            ? `📤 Submitted ${result.claimRef} to ${result.approverName} for approval.`
+            : `⚠️ Couldn't submit — ${result.reason}. It's in your pending list; fix & submit from the portal.`,
+        );
+      } else {
+        // Don't trap them — anything else just leaves it in the pending list.
+        await sendTextMessage(reply.waId, "👍 Saved to your pending list.");
+      }
+      capture.status = "confirmed"; // close the session either way
+      await capture.save();
+      reply.status = "done";
+      reply.errorMessage = undefined;
       await reply.save();
       return true;
     }

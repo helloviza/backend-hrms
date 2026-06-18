@@ -27,8 +27,11 @@ import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
 import { extractReceipt } from "../services/receiptExtractorGemini.js";
 import { createExpense } from "../services/expenses.service.js";
+import { propagateReportLifecycle } from "../services/reports.service.js";
 import { env } from "../config/env.js";
 import Expense from "../models/Expense.js";
+import ExpenseCategory from "../models/ExpenseCategory.js";
+import Report from "../models/Report.js";
 
 const router = express.Router();
 
@@ -116,10 +119,47 @@ function buildExpenseFilter(req: any): Record<string, any> {
     }
   }
 
-  if (req.query.status) filter.status = String(req.query.status);
+  // User-facing "status" is the report lifecycle (Layer 2), not the internal
+  // record-state (Expense.status, always "submitted").
+  if (req.query.status) {
+    const s = String(req.query.status);
+    if (s === "pending_to_submit") {
+      // LOOSE pending only: pending (incl. legacy/WhatsApp rows that predate the
+      // field, so missing/null counts too) AND not yet in any claim. An expense
+      // sitting in a draft claim is still lifecycleStatus=pending_to_submit but
+      // is surfaced as the derived "in_claim" bucket below, not here.
+      // { reportId: null } matches both an explicit null and a missing field.
+      filter.$and = [
+        ...(filter.$and || []),
+        { $or: [{ lifecycleStatus: "pending_to_submit" }, { lifecycleStatus: { $exists: false } }, { lifecycleStatus: null }] },
+        { reportId: null },
+      ];
+    } else if (s === "in_claim") {
+      // DERIVED bucket (no stored value): pending_to_submit linked to a
+      // draft/clarification claim. Distinguished purely by reportId.
+      filter.lifecycleStatus = "pending_to_submit";
+      filter.reportId = { $ne: null };
+    } else {
+      filter.lifecycleStatus = s;
+    }
+  }
+
+  // Add-to-report picker scope: only expenses not yet linked to ANY report.
+  // Gated on reportId (NOT the status label) because both a loose expense and one
+  // already sitting in a draft/clarification report now read "pending_to_submit".
+  // { reportId: null } matches both an explicit null and a missing field.
+  if (req.query.unlinked === "1" || req.query.unlinked === "true") {
+    filter.reportId = null;
+  }
 
   if (req.query.category) {
-    filter.suggestedCategory = { $regex: String(req.query.category), $options: "i" };
+    // Layer 1: category filter is by managed categoryId (exact), not free text.
+    const c = String(req.query.category);
+    if (mongoose.Types.ObjectId.isValid(c)) {
+      filter.categoryId = new mongoose.Types.ObjectId(c);
+    } else {
+      filter._id = { $in: [] }; // unknown category → empty result, never a leak
+    }
   }
 
   if (req.query.dateFrom || req.query.dateTo) {
@@ -164,17 +204,31 @@ function fmtDate(d: any): string {
   return d ? new Date(d).toLocaleDateString("en-IN") : "";
 }
 
+function categoryNameOf(d: any): string {
+  // Prefer the managed category name; fall back to the AI hint for legacy rows
+  // (created before Layer 1) that have no categoryId.
+  const cat = d.categoryId;
+  if (cat && typeof cat === "object" && cat.name) return String(cat.name);
+  return d.suggestedCategory || "";
+}
+
+function humanizeLifecycle(s: any): string {
+  // Legacy/missing rows read as the entry state. "Pending to submit", etc.
+  const v = String(s || "pending_to_submit").replace(/_/g, " ");
+  return v.charAt(0).toUpperCase() + v.slice(1);
+}
+
 function expenseToExportRow(d: any): Record<string, any> {
   return {
     date: fmtDate(d.date),
     employee: employeeNameOf(d.employeeId),
     merchant: d.merchant || "",
-    category: d.suggestedCategory || "",
+    category: categoryNameOf(d),
     amount: d.amount ?? 0,
     tax: d.taxAmount ?? 0,
     currency: d.currency || "",
     gstin: d.gstin || "",
-    status: d.status || "",
+    status: humanizeLifecycle(d.lifecycleStatus), // user-facing lifecycle, not record-state
     ref: d.ref || "",
     created: fmtDate(d.createdAt),
     receipt: d.imageKey ? "Yes" : "No",
@@ -196,6 +250,7 @@ router.get("/", async (req: any, res: any) => {
       Expense.find(filter)
         .select("-rawExtraction -perFieldConfidence")
         .populate("employeeId", "firstName lastName email name")
+        .populate("categoryId", "name")
         .sort({ date: -1, createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
@@ -205,10 +260,13 @@ router.get("/", async (req: any, res: any) => {
 
     const enriched = docs.map((d: any) => {
       const emp = d.employeeId;
+      const cat = d.categoryId;
       return {
         ...d,
         employeeId: emp && typeof emp === "object" ? emp._id : emp,
         employeeName: employeeNameOf(emp),
+        categoryId: cat && typeof cat === "object" ? cat._id : cat,
+        categoryName: categoryNameOf(d), // managed name ?? AI hint (legacy)
         hasReceipt: !!d.imageKey,
       };
     });
@@ -233,6 +291,7 @@ router.get("/export", async (req: any, res: any) => {
     const docs = await Expense.find(filter)
       .select("-rawExtraction -perFieldConfidence")
       .populate("employeeId", "firstName lastName email name")
+      .populate("categoryId", "name")
       .sort({ date: -1, createdAt: -1 })
       .lean();
 
@@ -273,6 +332,99 @@ router.get("/export", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
+ * GET /api/expenses/summary
+ * Aggregate counts + amounts for the dashboard. MUST be declared before the
+ * GET /:id param route, or ":id" would capture "summary".
+ *
+ * Tenant + own/admin scope comes from buildExpenseFilter (workspaceId always
+ * stamped). The employee module passes ?employeeId=<self> to force own-only
+ * even for admins; non-admins are forced own regardless.
+ *
+ * Note: aggregate() does NOT cast like find(), so we coerce id fields on the
+ * match to ObjectId explicitly — otherwise a string employeeId never matches.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/summary", async (req: any, res: any) => {
+  try {
+    const filter = buildExpenseFilter(req);
+
+    const match: Record<string, any> = { ...filter };
+    if (match.workspaceId && !(match.workspaceId instanceof mongoose.Types.ObjectId)) {
+      match.workspaceId = new mongoose.Types.ObjectId(String(match.workspaceId));
+    }
+    if (
+      match.employeeId &&
+      !(match.employeeId instanceof mongoose.Types.ObjectId) &&
+      mongoose.Types.ObjectId.isValid(String(match.employeeId))
+    ) {
+      match.employeeId = new mongoose.Types.ObjectId(String(match.employeeId));
+    }
+
+    // Current IST calendar-month start (inclusive). Server clock may be UTC, so
+    // shift into IST before deriving the YYYY-MM-01 boundary.
+    const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+    const monthStartStr = `${nowIst.getUTCFullYear()}-${String(nowIst.getUTCMonth() + 1).padStart(2, "0")}-01`;
+    const monthStart = parseISTStart(monthStartStr);
+
+    const sumAmount = { $sum: { $ifNull: ["$amount", 0] } };
+    const [agg] = await Expense.aggregate([
+      { $match: match },
+      {
+        $facet: {
+          totals: [{ $group: { _id: null, count: { $sum: 1 }, amount: sumAmount } }],
+          byStatus: [
+            {
+              $group: {
+                // Split pending_to_submit into LOOSE (reportId null/missing) vs the
+                // derived "in_claim" (reportId set). Legacy missing lifecycleStatus
+                // folds into pending_to_submit. Stored values are never changed.
+                _id: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $eq: [{ $ifNull: ["$lifecycleStatus", "pending_to_submit"] }, "pending_to_submit"] },
+                        { $ne: ["$reportId", null] },
+                      ],
+                    },
+                    "in_claim",
+                    { $ifNull: ["$lifecycleStatus", "pending_to_submit"] },
+                  ],
+                },
+                count: { $sum: 1 },
+                amount: sumAmount,
+              },
+            },
+          ],
+          thisMonth: [
+            { $match: { date: { $gte: monthStart } } },
+            { $group: { _id: null, count: { $sum: 1 }, amount: sumAmount } },
+          ],
+        },
+      },
+    ]);
+
+    const totals = agg?.totals?.[0] || { count: 0, amount: 0 };
+    const month = agg?.thisMonth?.[0] || { count: 0, amount: 0 };
+    const byStatus = (agg?.byStatus || []).map((s: any) => ({
+      status: s._id || "unknown",
+      count: s.count || 0,
+      amount: s.amount || 0,
+    }));
+
+    res.json({
+      ok: true,
+      summary: {
+        total: { count: totals.count || 0, amount: totals.amount || 0 },
+        month: { count: month.count || 0, amount: month.amount || 0, since: monthStartStr },
+        byStatus,
+      },
+    });
+  } catch (err: any) {
+    console.error("[Expenses summary]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load summary" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * GET /api/expenses/:id/receipt-url
  * Fresh presigned GET URL for one expense's receipt. Same workspace + own/admin
  * gate as the list — an employee can only presign their own receipt.
@@ -308,6 +460,118 @@ router.get("/:id/receipt-url", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[Expenses receipt-url]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to presign receipt" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /api/expenses/:id
+ * Single expense for the detail page. Declared AFTER /summary, /export and
+ * /:id/receipt-url so those literal/longer paths win.
+ *
+ * Tenant + own/admin scope via buildExpenseFilter (workspaceId always stamped);
+ * the module passes ?employeeId=<self> to force own-only.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/:id", async (req: any, res: any) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(404).json({ error: "Expense not found" });
+    }
+
+    const filter = buildExpenseFilter(req); // stamps workspaceId + own/admin scope
+    filter._id = new mongoose.Types.ObjectId(id);
+
+    const doc: any = await Expense.findOne(filter)
+      .select("-rawExtraction -perFieldConfidence")
+      .populate("employeeId", "firstName lastName email name")
+      .populate("categoryId", "name")
+      .lean();
+
+    if (!doc) return res.status(404).json({ error: "Expense not found" });
+
+    const emp = doc.employeeId;
+    const cat = doc.categoryId;
+    res.json({
+      ok: true,
+      expense: {
+        ...doc,
+        employeeId: emp && typeof emp === "object" ? emp._id : emp,
+        employeeName: employeeNameOf(emp),
+        categoryId: cat && typeof cat === "object" ? cat._id : cat,
+        categoryName: categoryNameOf(doc),
+        hasReceipt: !!doc.imageKey,
+      },
+    });
+  } catch (err: any) {
+    console.error("[Expenses GET one]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load expense" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * PATCH /api/expenses/:id  (categoryId only, Layer 1)
+ * Lets the detail screen reclassify an expense. Tenant + own/admin scope via
+ * buildExpenseFilter (the module passes ?employeeId=<self>). categoryId must
+ * belong to THIS workspace; null clears it. Other fields are NOT editable here.
+ * ───────────────────────────────────────────────────────────────────── */
+router.patch("/:id", async (req: any, res: any) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(404).json({ error: "Expense not found" });
+    }
+
+    const b = req.body || {};
+    if (!("categoryId" in b)) {
+      return res.status(400).json({ error: "categoryId is required" });
+    }
+
+    let categoryId: mongoose.Types.ObjectId | null = null;
+    if (b.categoryId) {
+      const c = String(b.categoryId);
+      if (!mongoose.Types.ObjectId.isValid(c)) {
+        return res.status(400).json({ error: "Invalid categoryId" });
+      }
+      // The category must exist in THIS workspace — never accept a cross-tenant id.
+      const cat = await ExpenseCategory.findOne({
+        _id: new mongoose.Types.ObjectId(c),
+        workspaceId: req.workspaceObjectId,
+      }).lean();
+      if (!cat) return res.status(400).json({ error: "Unknown category for this workspace" });
+      categoryId = cat._id as mongoose.Types.ObjectId;
+    }
+
+    const filter = buildExpenseFilter(req); // stamps workspaceId + own/admin scope
+    filter._id = new mongoose.Types.ObjectId(id);
+
+    const updated: any = await Expense.findOneAndUpdate(
+      filter,
+      { $set: { categoryId } },
+      { new: true },
+    )
+      .select("-rawExtraction -perFieldConfidence")
+      .populate("employeeId", "firstName lastName email name")
+      .populate("categoryId", "name")
+      .lean();
+
+    if (!updated) return res.status(404).json({ error: "Expense not found" });
+
+    const emp = updated.employeeId;
+    const cat = updated.categoryId;
+    res.json({
+      ok: true,
+      expense: {
+        ...updated,
+        employeeId: emp && typeof emp === "object" ? emp._id : emp,
+        employeeName: employeeNameOf(emp),
+        categoryId: cat && typeof cat === "object" ? cat._id : cat,
+        categoryName: categoryNameOf(updated),
+        hasReceipt: !!updated.imageKey,
+      },
+    });
+  } catch (err: any) {
+    console.error("[Expenses PATCH]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to update expense" });
   }
 });
 
@@ -414,6 +678,43 @@ router.post("/", async (req: any, res: any) => {
       if (existing) return res.json({ ok: true, expense: existing, deduped: true });
     }
 
+    // Managed category (Layer 1): accept only an id that belongs to THIS workspace.
+    let categoryId: mongoose.Types.ObjectId | null = null;
+    if (b.categoryId) {
+      const c = String(b.categoryId);
+      if (!mongoose.Types.ObjectId.isValid(c)) {
+        return res.status(400).json({ error: "Invalid categoryId" });
+      }
+      const cat = await ExpenseCategory.findOne({
+        _id: new mongoose.Types.ObjectId(c),
+        workspaceId: workspaceObjectId,
+      }).lean();
+      if (!cat) return res.status(400).json({ error: "Unknown category for this workspace" });
+      categoryId = cat._id as mongoose.Types.ObjectId;
+    }
+
+    // Optional report linkage at creation (Layer 2). The report must be the
+    // caller's OWN, DRAFT report in this workspace — same owner-only + draft gate
+    // as POST /api/reports/:id/expenses. A bad/foreign/non-draft id is a 400,
+    // never a silent unreported fallback.
+    let reportId: mongoose.Types.ObjectId | null = null;
+    if (b.reportId) {
+      const r = String(b.reportId);
+      if (!mongoose.Types.ObjectId.isValid(r)) {
+        return res.status(400).json({ error: "Invalid reportId" });
+      }
+      const report = await Report.findOne({
+        _id: new mongoose.Types.ObjectId(r),
+        workspaceId: workspaceObjectId,
+        employeeId: new mongoose.Types.ObjectId(employeeId),
+        status: "draft",
+      }).lean();
+      if (!report) {
+        return res.status(400).json({ error: "Report must be your own draft report" });
+      }
+      reportId = report._id as mongoose.Types.ObjectId;
+    }
+
     const expense = await createExpense({
       workspaceId: workspaceObjectId,
       employeeId,
@@ -425,12 +726,22 @@ router.post("/", async (req: any, res: any) => {
       taxAmount: b.taxAmount ?? null,
       gstin: b.gstin ?? null,
       suggestedCategory: b.suggestedCategory ?? null,
+      categoryId,
+      reportId,
       imageKey,
       s3Bucket: b.s3Bucket,
       rawExtraction: b.rawExtraction,
       perFieldConfidence: b.perFieldConfidence,
       extractionModel: b.extractionModel,
     });
+
+    // reports.service is the single writer of lifecycleStatus — funnel the new
+    // expense's state through it rather than setting it inline. The report was
+    // validated to be a DRAFT, so its expenses are pending_to_submit.
+    if (reportId) {
+      await propagateReportLifecycle(workspaceObjectId, reportId, "draft");
+      (expense as any).lifecycleStatus = "pending_to_submit"; // reflect in the response
+    }
 
     res.status(201).json({ ok: true, expense });
   } catch (err: any) {

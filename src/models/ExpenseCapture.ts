@@ -17,6 +17,8 @@ import { Schema, model } from "mongoose";
  *   extracting            — claimed by the extraction stage (Gemini vision)
  *   awaiting_confirmation — parsed fields sent to the sender; awaiting "1"/confirm
  *   awaiting_correction   — sender (or a failed extraction) must supply a value
+ *   awaiting_submit       — Expense persisted; offered conversational quick-submit
+ *                           (reply "submit" to send the claim for approval)
  *   confirmed             — sender confirmed; an Expense record was persisted
  *   cancelled             — sender replied "cancel"
  *   unregistered          — sender's waId did not map to any User (reply sent)
@@ -34,6 +36,7 @@ export type ExpenseCaptureStatus =
   | "extracting"
   | "awaiting_confirmation"
   | "awaiting_correction"
+  | "awaiting_submit"
   | "confirmed"
   | "cancelled"
   | "unregistered"
@@ -64,6 +67,7 @@ const ExpenseCaptureSchema = new Schema(
         "extracting",
         "awaiting_confirmation",
         "awaiting_correction",
+        "awaiting_submit",
         "confirmed",
         "cancelled",
         "unregistered",
