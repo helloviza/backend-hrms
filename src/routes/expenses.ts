@@ -195,7 +195,9 @@ const EXPORT_COLUMNS: Col[] = [
   { key: "currency", label: "Currency" },
   { key: "gstin", label: "GSTIN" },
   { key: "status", label: "Status" },
+  { key: "reimbursedOn", label: "Reimbursed On" },
   { key: "ref", label: "Ref" },
+  { key: "claim", label: "Claim" },
   { key: "created", label: "Created" },
   { key: "receipt", label: "Receipt" },
 ];
@@ -218,7 +220,11 @@ function humanizeLifecycle(s: any): string {
   return v.charAt(0).toUpperCase() + v.slice(1);
 }
 
-function expenseToExportRow(d: any): Record<string, any> {
+function expenseToExportRow(
+  d: any,
+  claimsById: Map<string, { ref?: string; reimbursedAt?: any }>,
+): Record<string, any> {
+  const claim = d.reportId ? claimsById.get(String(d.reportId)) : null;
   return {
     date: fmtDate(d.date),
     employee: employeeNameOf(d.employeeId),
@@ -229,7 +235,13 @@ function expenseToExportRow(d: any): Record<string, any> {
     currency: d.currency || "",
     gstin: d.gstin || "",
     status: humanizeLifecycle(d.lifecycleStatus), // user-facing lifecycle, not record-state
+    // reimbursedAt of the claim this expense sits in; blank unless reimbursed.
+    reimbursedOn: claim?.reimbursedAt ? fmtDate(claim.reimbursedAt) : "",
     ref: d.ref || "",
+    // Claim ref: the authoritative report.ref when resolved, else derived from
+    // the id (CLM-XXXXXX = last 6 of the ObjectId, upper-cased — matches
+    // refFromId). Blank for a loose expense (no claim).
+    claim: claim?.ref || (d.reportId ? `CLM-${String(d.reportId).slice(-6).toUpperCase()}` : ""),
     created: fmtDate(d.createdAt),
     receipt: d.imageKey ? "Yes" : "No",
   };
@@ -295,7 +307,25 @@ router.get("/export", async (req: any, res: any) => {
       .sort({ date: -1, createdAt: -1 })
       .lean();
 
-    const rows = docs.map(expenseToExportRow);
+    // Resolve the claim each expense sits in (for the Claim + Reimbursed On
+    // columns) in ONE workspace-scoped query. Loose expenses have no reportId.
+    const reportIds = [
+      ...new Set(docs.map((d: any) => d.reportId).filter(Boolean).map(String)),
+    ];
+    const claimsById = new Map<string, { ref?: string; reimbursedAt?: any }>();
+    if (reportIds.length) {
+      const reports = await Report.find({
+        workspaceId: req.workspaceObjectId,
+        _id: { $in: reportIds.map((rid) => new mongoose.Types.ObjectId(rid)) },
+      })
+        .select("ref reimbursedAt")
+        .lean();
+      reports.forEach((r: any) =>
+        claimsById.set(String(r._id), { ref: r.ref, reimbursedAt: r.reimbursedAt }),
+      );
+    }
+
+    const rows = docs.map((d: any) => expenseToExportRow(d, claimsById));
     const header = EXPORT_COLUMNS.map((c) => c.label);
 
     if (format === "csv") {
