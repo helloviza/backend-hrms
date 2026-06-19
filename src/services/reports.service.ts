@@ -9,8 +9,62 @@ import mongoose from "mongoose";
 import Expense from "../models/Expense.js";
 import Report, { type IReport, type ReportStatus } from "../models/Report.js";
 import User from "../models/User.js";
+import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseActivity.js";
 import { refFromId } from "../utils/refFromId.js";
 import { sendClaimSubmittedEmail } from "../utils/claimEmails.js";
+
+/* ──────────────────────────────────────────────────────────────────────
+ * Activity / audit log.
+ *
+ * One append-only writer for the claim timeline (model: ExpenseActivity).
+ * Co-located with the lifecycle writer: service transitions call it directly;
+ * the route-resident transitions (approve / decline / clarification / reimburse
+ * / single-expense removal) import and call it at their own save points.
+ *
+ * EVERY write stamps workspaceId. EVERY call is non-fatal — a logging failure
+ * is swallowed (logged to console) so it can never block a lifecycle action.
+ * ────────────────────────────────────────────────────────────────────── */
+export async function logActivity(params: {
+  workspaceId: mongoose.Types.ObjectId | string;
+  reportId: mongoose.Types.ObjectId | string;
+  event: ExpenseActivityEvent;
+  actorName: string;
+  actorId?: mongoose.Types.ObjectId | string | null;
+  expenseId?: mongoose.Types.ObjectId | string | null;
+  note?: string | null;
+}): Promise<void> {
+  try {
+    const actorId =
+      params.actorId && mongoose.Types.ObjectId.isValid(String(params.actorId))
+        ? new mongoose.Types.ObjectId(String(params.actorId))
+        : null;
+    const expenseId =
+      params.expenseId && mongoose.Types.ObjectId.isValid(String(params.expenseId))
+        ? new mongoose.Types.ObjectId(String(params.expenseId))
+        : null;
+    await ExpenseActivity.create({
+      workspaceId: new mongoose.Types.ObjectId(String(params.workspaceId)),
+      reportId: new mongoose.Types.ObjectId(String(params.reportId)),
+      expenseId,
+      event: params.event,
+      actorId,
+      actorName: params.actorName || "System",
+      note: params.note ?? null,
+    });
+  } catch (err: any) {
+    console.error("[expense activity log]", params.event, err?.message || err);
+  }
+}
+
+/** Resolve a display name for an actor by id (best-effort; "" when unknown). */
+async function actorNameById(userId: mongoose.Types.ObjectId | string): Promise<string> {
+  try {
+    const u: any = await User.findById(userId).select("firstName lastName name email").lean();
+    return employeeNameOf(u);
+  } catch {
+    return "";
+  }
+}
 
 // Owner-editable claim states — a draft, or one bounced back for clarification.
 // Mirrors EDITABLE_STATUSES in routes/expenseReports.ts (the route gates the
@@ -201,6 +255,15 @@ export async function createReport(
   });
   report.ref = refFromId("CLM", report._id as mongoose.Types.ObjectId);
   await report.save();
+
+  await logActivity({
+    workspaceId,
+    reportId: report._id as mongoose.Types.ObjectId,
+    event: "created",
+    actorId: employeeId,
+    actorName: (await actorNameById(employeeId)) || "System",
+  });
+
   return report;
 }
 
@@ -230,6 +293,18 @@ export async function linkExpensesToReport(
     { $set: { reportId: report._id, lifecycleStatus: expenseLifecycleForReport(report.status) } },
   );
   const added = result.modifiedCount ?? 0;
+
+  if (added > 0) {
+    await logActivity({
+      workspaceId,
+      reportId: report._id as mongoose.Types.ObjectId,
+      event: "expense_added",
+      actorId: employeeId,
+      actorName: (await actorNameById(employeeId)) || "System",
+      note: `Added ${added} expense${added === 1 ? "" : "s"} to the claim`,
+    });
+  }
+
   return { added, skipped: ids.length - added };
 }
 
@@ -293,6 +368,9 @@ export async function submitReport(
   if (!report) return { ok: false, reason: "not_found" };
   if (!EDITABLE_STATUSES.has(report.status)) return { ok: false, reason: "not_editable" };
 
+  // A submit coming out of clarification_required is a RE-submission.
+  const wasClarification = report.status === "clarification_required";
+
   const { blocking, warnings } = await validateReportForSubmit(ws, rid);
   if (blocking.length > 0) return { ok: false, reason: "blocking", blocking, warnings };
 
@@ -313,6 +391,26 @@ export async function submitReport(
   await report.save();
 
   await propagateReportLifecycle(ws, rid, "submitted");
+
+  // Audit: the submission itself, then one Policy Bot entry per non-blocking
+  // warning surfaced by validateReportForSubmit (receipts, categories, dupes).
+  const submitterName = (await actorNameById(emp)) || "System";
+  await logActivity({
+    workspaceId: ws,
+    reportId: rid,
+    event: wasClarification ? "resubmitted" : "submitted",
+    actorId: emp,
+    actorName: submitterName,
+  });
+  for (const w of warnings) {
+    await logActivity({
+      workspaceId: ws,
+      reportId: rid,
+      event: "policy_check",
+      actorName: "Policy Bot",
+      note: w,
+    });
+  }
 
   const approverName = employeeNameOf(approver);
 

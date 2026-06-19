@@ -18,8 +18,10 @@ import {
   createReport,
   linkExpensesToReport,
   submitReport,
+  logActivity,
 } from "../services/reports.service.js";
 import Report from "../models/Report.js";
+import ExpenseActivity from "../models/ExpenseActivity.js";
 
 // Owner-editable report states: a draft, or one bounced back for clarification.
 // add / remove / rename / submit / delete all gate on this set.
@@ -74,6 +76,11 @@ function employeeNameOf(u: any): string {
   if (!u || typeof u !== "object") return "";
   const full = [u.firstName, u.lastName].filter(Boolean).join(" ").trim();
   return full || u.name || u.email || "";
+}
+
+/** Acting user's display name for the activity log (falls back to "System"). */
+function actorNameOf(req: any): string {
+  return employeeNameOf(req.user) || "System";
 }
 
 /** Load a report by id within the tenant, WITHOUT an owner restriction —
@@ -285,7 +292,25 @@ router.get("/:id", async (req: any, res: any) => {
       canReimburse: report.status === "approved" && isFinance(req),
     };
 
-    res.json({ ok: true, report: out, expenses: enriched });
+    // Activity timeline (oldest → newest). Tenant-scoped: workspaceId is stamped
+    // explicitly so it can never read another workspace's claim history.
+    const activityDocs = await ExpenseActivity.find({
+      workspaceId: req.workspaceObjectId,
+      reportId: report._id,
+    })
+      .sort({ createdAt: 1 })
+      .lean();
+    const activity = activityDocs.map((a: any) => ({
+      _id: String(a._id),
+      event: a.event,
+      actorName: a.actorName,
+      actorId: a.actorId ? String(a.actorId) : null,
+      expenseId: a.expenseId ? String(a.expenseId) : null,
+      note: a.note ?? null,
+      createdAt: a.createdAt,
+    }));
+
+    res.json({ ok: true, report: out, expenses: enriched, activity });
   } catch (err: any) {
     console.error("[Reports GET one]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load report" });
@@ -375,6 +400,15 @@ router.delete("/:id/expenses/:eid", async (req: any, res: any) => {
     );
     if (!result.matchedCount) return res.status(404).json({ error: "Expense not in this report" });
 
+    await logActivity({
+      workspaceId: req.workspaceObjectId,
+      reportId: report._id as mongoose.Types.ObjectId,
+      event: "expense_removed",
+      actorId: ownEmployeeId(req),
+      actorName: actorNameOf(req),
+      expenseId: eid,
+    });
+
     res.json({ ok: true });
   } catch (err: any) {
     console.error("[Reports remove expense]", err?.message);
@@ -453,6 +487,15 @@ router.post("/:id/approve", async (req: any, res: any) => {
 
     await propagateReportLifecycle(req.workspaceObjectId, report._id as mongoose.Types.ObjectId, "approved");
 
+    await logActivity({
+      workspaceId: req.workspaceObjectId,
+      reportId: report._id as mongoose.Types.ObjectId,
+      event: "approved",
+      actorId: me,
+      actorName: actorNameOf(req),
+      note: isSelf ? "Self-approved by admin" : null,
+    });
+
     res.json({ ok: true, report: report.toObject() });
   } catch (err: any) {
     console.error("[Reports approve]", err?.message);
@@ -486,6 +529,15 @@ router.post("/:id/decline", async (req: any, res: any) => {
     await report.save();
 
     await propagateReportLifecycle(req.workspaceObjectId, report._id as mongoose.Types.ObjectId, "declined");
+
+    await logActivity({
+      workspaceId: req.workspaceObjectId,
+      reportId: report._id as mongoose.Types.ObjectId,
+      event: "declined",
+      actorId: me,
+      actorName: actorNameOf(req),
+      note,
+    });
 
     res.json({ ok: true, report: report.toObject() });
   } catch (err: any) {
@@ -526,6 +578,15 @@ router.post("/:id/request-clarification", async (req: any, res: any) => {
       "clarification_required",
     );
 
+    await logActivity({
+      workspaceId: req.workspaceObjectId,
+      reportId: report._id as mongoose.Types.ObjectId,
+      event: "clarification_requested",
+      actorId: me,
+      actorName: actorNameOf(req),
+      note,
+    });
+
     res.json({ ok: true, report: report.toObject() });
   } catch (err: any) {
     console.error("[Reports request-clarification]", err?.message);
@@ -552,6 +613,14 @@ router.post("/:id/reimburse", async (req: any, res: any) => {
     await report.save();
 
     await propagateReportLifecycle(req.workspaceObjectId, report._id as mongoose.Types.ObjectId, "reimbursed");
+
+    await logActivity({
+      workspaceId: req.workspaceObjectId,
+      reportId: report._id as mongoose.Types.ObjectId,
+      event: "reimbursed",
+      actorId: ownEmployeeId(req),
+      actorName: actorNameOf(req),
+    });
 
     res.json({ ok: true, report: report.toObject() });
   } catch (err: any) {
