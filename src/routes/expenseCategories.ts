@@ -10,9 +10,9 @@
 
 import express from "express";
 import mongoose from "mongoose";
-import { requireAdmin } from "../middleware/rbac.js";
 import ExpenseCategory from "../models/ExpenseCategory.js";
 import { seedDefaultCategories } from "../services/expenseCategories.service.js";
+import { isAdmin } from "../services/expense.access.js";
 
 const router = express.Router();
 
@@ -20,24 +20,20 @@ const router = express.Router();
 // seed now live in services/expenseCategories.service.ts so the WhatsApp worker
 // shares them — see seedDefaultCategories.
 
-/* ── Admin predicate (mirrors requireAdmin role set, as a boolean) ───── */
-function norm(v: any) {
-  return String(v ?? "").trim().toUpperCase().replace(/[\s\-_]/g, "");
-}
-const ADMIN_ROLES = [
-  "ADMIN", "SUPERADMIN", "SUPER_ADMIN", "HR", "HR_ADMIN",
-  "OPS", "OPS_ADMIN", "TENANT_ADMIN", "WORKSPACE_ADMIN",
-].map(norm);
-function isAdminReq(req: any): boolean {
-  const u = req.user || {};
-  const signals: any[] = [];
-  if (Array.isArray(u.roles)) signals.push(...u.roles);
-  if (u.role) signals.push(u.role);
-  if (u.userType) signals.push(u.userType);
-  if (u.accountType) signals.push(u.accountType);
-  if (u.hrmsAccessRole) signals.push(u.hrmsAccessRole);
-  if (u.hrmsAccessLevel) signals.push(u.hrmsAccessLevel);
-  return signals.map(norm).some((r) => ADMIN_ROLES.includes(r));
+/* ── Expense-admin gate ───────────────────────────────────────────────────
+ * Category management is gated by the EXPENSE-LOCAL isAdmin() (expense.access.ts)
+ * — the SAME predicate the Team/policy surface (expenseAdmin.ts) uses — NOT the
+ * platform-wide requireAdmin (middleware/rbac.ts). Deliberate: it keeps category
+ * management in lock-step with the rest of the expense module (so WORKSPACE_LEADER,
+ * now a full expense-admin for THEIR OWN workspace, can manage categories) WITHOUT
+ * elevating workspace leaders on any platform requireAdmin surface. Tenant scoping
+ * (req.workspaceObjectId on every query) confines that authority to own workspace.
+ * The previous local ADMIN_ROLES copy is gone — isAdmin() is the single source. */
+function requireExpenseAdmin(req: any, res: any, next: any) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: "Admin access required" });
+  }
+  return next();
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -54,7 +50,7 @@ router.get("/", async (req: any, res: any) => {
     if (count === 0) await seedDefaultCategories(workspaceId);
 
     const filter: Record<string, any> = { workspaceId }; // explicit tenant scope
-    const includeInactive = String(req.query.all || "") === "1" && isAdminReq(req);
+    const includeInactive = String(req.query.all || "") === "1" && isAdmin(req.user);
     if (!includeInactive) filter.active = true;
 
     const categories = await ExpenseCategory.find(filter)
@@ -71,7 +67,7 @@ router.get("/", async (req: any, res: any) => {
 /* ─────────────────────────────────────────────────────────────────────
  * POST /api/expense-categories  (admin)
  * ───────────────────────────────────────────────────────────────────── */
-router.post("/", requireAdmin, async (req: any, res: any) => {
+router.post("/", requireExpenseAdmin, async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
     if (!workspaceId) return res.status(400).json({ error: "Missing workspace context" });
@@ -107,7 +103,7 @@ router.post("/", requireAdmin, async (req: any, res: any) => {
  * PATCH /api/expense-categories/:id  (admin)
  * Rename / glCode / sortOrder / active toggle. NO hard delete (soft via active).
  * ───────────────────────────────────────────────────────────────────── */
-router.patch("/:id", requireAdmin, async (req: any, res: any) => {
+router.patch("/:id", requireExpenseAdmin, async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
     if (!workspaceId) return res.status(400).json({ error: "Missing workspace context" });

@@ -328,12 +328,15 @@ const APPROVER_USER_FIELDS =
  *   3. else { id: null } — and the caller MUST refuse the submit (the claim is
  *      never stamped with approverId=null).
  *
- * Role strings are stored uppercase but keep their separators ("TENANT_ADMIN"),
- * whereas ADMIN_ROLES (expense.access) is separator-stripped — so eligibility is
- * decided by isAdmin() (same normalization on both sides), NOT an exact-match
- * $in that would silently miss tenant-/workspace-admin rows. The coarse regex
- * pre-filter only keeps the scan off pure EMPLOYEE/MANAGER rows; isAdmin() is
- * the authority. Self-approval guard: the submitter is excluded at both the DB
+ * Role strings are stored uppercase but keep their separators ("TENANT_ADMIN",
+ * "WORKSPACE_LEADER"), whereas ADMIN_ROLES (expense.access) is separator-stripped
+ * — so eligibility is decided by isAdmin() (same normalization on both sides),
+ * NOT an exact-match $in that would silently miss tenant-/workspace-admin or
+ * workspace-leader rows. The coarse regex pre-filter (/ADMIN/i, /LEADER/i, HR,
+ * OPS) only keeps the scan off pure EMPLOYEE/MANAGER rows; isAdmin() is the
+ * authority — and it MUST agree with the prefilter, hence /LEADER/i is required
+ * now that WORKSPACE_LEADER is an expense admin. Self-approval guard: the
+ * submitter is excluded at both the DB
  * ($ne) and isAdmin layers, so an admin filing their own claim falls through to
  * another workspace admin (and, if there is none, to the §3 refusal).
  */
@@ -358,7 +361,7 @@ async function resolveL1Approver(
   const candidates: any[] = await User.find({
     workspaceId,
     _id: { $ne: submitterId },
-    roles: { $in: [/ADMIN/i, /^HR$/i, /^OPS$/i] },
+    roles: { $in: [/ADMIN/i, /LEADER/i, /^HR$/i, /^OPS$/i] },
   })
     .select(APPROVER_USER_FIELDS)
     .lean();
@@ -415,7 +418,7 @@ async function resolveL2Approver(
   const candidates: any[] = await User.find({
     workspaceId,
     _id: { $nin: excludeObjIds },
-    roles: { $in: [/ADMIN/i, /^HR$/i, /^OPS$/i] },
+    roles: { $in: [/ADMIN/i, /LEADER/i, /^HR$/i, /^OPS$/i] },
   })
     .select(APPROVER_USER_FIELDS)
     .lean();
