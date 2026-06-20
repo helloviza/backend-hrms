@@ -18,6 +18,7 @@ export interface WorkspaceFeatures {
   onboardingEnabled: boolean;
   analyticsEnabled: boolean;
   expenseBandEnabled: boolean;
+  expensesEnabled?: boolean;
   travelFormEnabled?: boolean;
 
   // Coarse-grained module flags (Phase 1 SaaS tiering)
@@ -264,6 +265,11 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         onboardingEnabled: { type: Boolean, default: false },
         analyticsEnabled: { type: Boolean, default: false },
         expenseBandEnabled: { type: Boolean, default: false },
+        // Expenses module master switch. SCHEMA DEFAULT false — new workspaces
+        // are gated off until granted by plan default or superadmin toggle. A
+        // backfill sets this true on every pre-existing workspace before the
+        // route gate ships (see scripts/backfill-expenses-feature.ts).
+        expensesEnabled: { type: Boolean, default: false },
         travelFormEnabled: { type: Boolean, default: false },
 
         // Coarse-grained module flags (Phase 1 SaaS tiering)
@@ -397,6 +403,7 @@ CustomerWorkspaceSchema.statics.getDefaultFeaturesForPlan = (
       payrollEnabled: true,
       performanceEnabled: true,
       analyticsEnabled: true,
+      expensesEnabled: true,
       crmEnabled: true,
       vouchersEnabled: true,
       invoicesEnabled: true,
@@ -410,6 +417,7 @@ CustomerWorkspaceSchema.statics.getDefaultFeaturesForPlan = (
       payrollEnabled: true,
       performanceEnabled: true,
       analyticsEnabled: true,
+      expensesEnabled: true,
       visaEnabled: true,
       miceEnabled: true,
       forexEnabled: true,
