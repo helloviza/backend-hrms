@@ -218,3 +218,30 @@ export function canDisburse(user: any, advance: any): boolean {
   if (advance.approverId) approverIds.add(String(advance.approverId)); // legacy fallback
   return !approverIds.has(me); // finance SoD across every level the user approved
 }
+
+/**
+ * Manual-recovery authority on a single advance (Phase 2 / D2). Same finance +
+ * whole-chain SoD + admin-bypass shape as canDisburse, but it applies to an
+ * already-disbursed advance with an outstanding balance (disbursed /
+ * partially_settled), NOT an approved-pending-disbursement one. A finance user
+ * may not recover an advance they approved at any level; an admin may.
+ */
+export function canRecover(user: any, advance: any): boolean {
+  if (!advance) return false;
+  const recoverable =
+    advance.status === "disbursed" || advance.status === "partially_settled";
+  if (!recoverable) return false;
+  if (Number(advance.outstandingBalance) <= 0) return false;
+  if (isAdmin(user)) return true; // admin bypasses SoD
+  if (!isFinance(user)) return false;
+
+  const me = userIdOf(user);
+  const approverIds = new Set<string>();
+  if (Array.isArray(advance.approvalChain)) {
+    for (const lvl of advance.approvalChain) {
+      if (lvl?.approverId) approverIds.add(String(lvl.approverId));
+    }
+  }
+  if (advance.approverId) approverIds.add(String(advance.approverId)); // legacy fallback
+  return !approverIds.has(me); // finance SoD across every level the user approved
+}

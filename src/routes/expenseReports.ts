@@ -30,6 +30,13 @@ import {
 import Report from "../models/Report.js";
 import ExpenseActivity from "../models/ExpenseActivity.js";
 import { sendClaimSubmittedEmail } from "../utils/claimEmails.js";
+import {
+  earmarkedTotalForClaim,
+  settleEarmarksForClaim,
+  releaseEarmarksForClaim,
+  listAppliedAdvancesForClaim,
+  round2,
+} from "../services/advanceSettlement.service.js";
 
 // Owner-editable report states: a draft, or one bounced back for clarification.
 // add / remove / rename / submit / delete all gate on this set.
@@ -293,6 +300,17 @@ router.get("/:id", async (req: any, res: any) => {
       note: l.note ?? null,
     }));
 
+    // Advances (Phase 2) applied to this claim — earmarked or settled — plus the
+    // running applied total and the net the claim would pay out at reimburse.
+    const appliedAdvances = await listAppliedAdvancesForClaim(req.workspaceObjectId, report._id);
+    const earmarkedApplied = appliedAdvances
+      .filter((a) => a.status === "earmarked")
+      .reduce((s, a) => s + a.amountApplied, 0);
+    const settledApplied = appliedAdvances
+      .filter((a) => a.status === "settled")
+      .reduce((s, a) => s + a.settledAmount, 0);
+    const appliedTotal = round2(earmarkedApplied + settledApplied);
+
     const decision = canDecide(req, report);
     const out = {
       ...report.toObject(),
@@ -301,6 +319,19 @@ router.get("/:id", async (req: any, res: any) => {
       approvalChain, // override the raw chain with the name-enriched one
       expenseCount: enriched.length,
       totalAmount,
+      // ── Advance application (additive; empty/0 for a no-advance claim) ──
+      appliedAdvances,
+      advanceAppliedTotal: appliedTotal,
+      // Net the claim pays out: a reimbursed claim shows its recorded net, or —
+      // for a no-advance / pre-P2 reimbursed claim where reimbursedAmount is null
+      // — the FULL claim total (never 0/blank). In-flight claims preview the net
+      // from current earmarks (appliedTotal already treats a missing total as 0).
+      netPayout:
+        report.status === "reimbursed"
+          ? (report as any).reimbursedAmount != null
+            ? (report as any).reimbursedAmount
+            : totalAmount
+          : round2(totalAmount - appliedTotal),
       // UI affordances (server is still the source of truth on every action).
       viewerIsOwner: isOwner,
       canApprove: report.status === "submitted" && decision.ok,
@@ -630,6 +661,28 @@ router.post("/:id/decline", async (req: any, res: any) => {
 
     await propagateReportLifecycle(req.workspaceObjectId, report._id as mongoose.Types.ObjectId, "declined");
 
+    // Earmark release: a declined claim is terminal → drop any earmarked advance
+    // applications. No balance moves (an earmark never reduced outstanding), so
+    // the advances are left FULLY OUTSTANDING. Best-effort; never blocks decline.
+    try {
+      const { releasedCount } = await releaseEarmarksForClaim(
+        req.workspaceObjectId,
+        report._id as mongoose.Types.ObjectId,
+      );
+      if (releasedCount > 0) {
+        await logActivity({
+          workspaceId: req.workspaceObjectId,
+          reportId: report._id as mongoose.Types.ObjectId,
+          event: "advance_detached",
+          actorId: me,
+          actorName: actorNameOf(req),
+          note: `Released ${releasedCount} earmarked advance${releasedCount === 1 ? "" : "s"} (claim declined)`,
+        });
+      }
+    } catch (e: any) {
+      console.error("[Reports decline release earmarks]", e?.message || e);
+    }
+
     await logActivity({
       workspaceId: req.workspaceObjectId,
       reportId: report._id as mongoose.Types.ObjectId,
@@ -722,7 +775,7 @@ router.post("/:id/reimburse", async (req: any, res: any) => {
       return res.status(409).json({ error: "Only approved reports can be reimbursed" });
     }
     // Finance-only + same-claim SoD: a finance user may not reimburse a claim
-    // they themselves approved; an admin may (owner-operator override).
+    // they themselves approved; an admin may (owner-operator override). UNCHANGED.
     if (!canReimburseUser(req.user, report)) {
       if (!isFinance(req)) return res.status(403).json({ error: "Finance access required" });
       return res.status(403).json({
@@ -730,21 +783,67 @@ router.post("/:id/reimburse", async (req: any, res: any) => {
       });
     }
 
-    report.status = "reimbursed";
-    report.reimbursedAt = new Date();
-    await report.save();
+    const ws = req.workspaceObjectId;
+    const rid = report._id as mongoose.Types.ObjectId;
 
-    await propagateReportLifecycle(req.workspaceObjectId, report._id as mongoose.Types.ObjectId, "reimbursed");
+    // Atomic gate (idempotency): flip approved → reimbursed exactly ONCE. A retry
+    // or a concurrent reimburse loses the race (status is no longer "approved")
+    // and gets a 409, so the settlement step below can never double-draw an
+    // advance. Replaces the previous load+save; the resulting document state is
+    // identical for a no-advance claim (status + reimbursedAt).
+    const flipped = await Report.findOneAndUpdate(
+      { _id: rid, workspaceId: ws, status: "approved" },
+      { $set: { status: "reimbursed", reimbursedAt: new Date() } },
+      { new: true },
+    );
+    if (!flipped) {
+      return res.status(409).json({ error: "Only approved reports can be reimbursed" });
+    }
+
+    // ── Advance settlement (NET reimburse) ──
+    // The claim is now frozen as reimbursed, so its earmarks can't change under
+    // us. A claim with NO applied advances skips ALL of this — appliedTotal === 0
+    // → no settle, no net calc, no extra log note — and reimburses exactly as
+    // before (THE regression line).
+    const appliedTotal = await earmarkedTotalForClaim(ws, rid);
+    let reimburseNote: string | null = null;
+    if (appliedTotal > 0) {
+      const { settledTotal, claimTotal: total, perAdvance } = await settleEarmarksForClaim(ws, rid);
+      const net = Math.max(0, round2(total - settledTotal));
+      flipped.advanceAppliedTotal = settledTotal;
+      flipped.reimbursedAmount = net; // net cash actually paid out
+      await flipped.save();
+      reimburseNote = `Net payout ${net} (claim total ${total} − advances applied ${settledTotal})`;
+
+      // Audit each advance drawdown on the ADVANCE timeline (best-effort).
+      for (const pa of perAdvance) {
+        try {
+          await ExpenseActivity.create({
+            workspaceId: ws,
+            advanceId: new mongoose.Types.ObjectId(pa.advanceId),
+            event: "settled",
+            actorId: new mongoose.Types.ObjectId(ownEmployeeId(req)),
+            actorName: actorNameOf(req),
+            note: `Settled ${pa.settledAmount} against ${report.ref} (→ ${pa.newStatus})`,
+          });
+        } catch (e: any) {
+          console.error("[advance settle log]", e?.message || e);
+        }
+      }
+    }
+
+    await propagateReportLifecycle(ws, rid, "reimbursed");
 
     await logActivity({
-      workspaceId: req.workspaceObjectId,
-      reportId: report._id as mongoose.Types.ObjectId,
+      workspaceId: ws,
+      reportId: rid,
       event: "reimbursed",
       actorId: ownEmployeeId(req),
       actorName: actorNameOf(req),
+      note: reimburseNote,
     });
 
-    res.json({ ok: true, report: report.toObject() });
+    res.json({ ok: true, report: flipped.toObject() });
   } catch (err: any) {
     console.error("[Reports reimburse]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to reimburse report" });

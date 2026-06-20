@@ -23,9 +23,15 @@ export type ExpenseActivityEvent =
   | "expense_added"
   | "expense_removed"
   | "policy_check"
-  // ── Advance (System B) events — additive; never written against a claim ──
+  // ── Advance (System B) events — additive ──
   | "requested"
-  | "disbursed";
+  | "disbursed"
+  // Settlement engine (Phase 2): apply/detach are logged on the CLAIM timeline;
+  // settled/recovered on the ADVANCE timeline.
+  | "advance_applied"
+  | "advance_detached"
+  | "settled"
+  | "recovered";
 
 export const EXPENSE_ACTIVITY_EVENTS: ExpenseActivityEvent[] = [
   "created",
@@ -40,6 +46,10 @@ export const EXPENSE_ACTIVITY_EVENTS: ExpenseActivityEvent[] = [
   "policy_check",
   "requested",
   "disbursed",
+  "advance_applied",
+  "advance_detached",
+  "settled",
+  "recovered",
 ];
 
 export interface IExpenseActivity extends Document {

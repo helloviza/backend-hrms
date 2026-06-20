@@ -24,10 +24,17 @@ import {
   isAdmin as isAdminUser,
   canDecideAdvance as canDecideAdvanceUser,
   canDisburse as canDisburseUser,
+  canRecover as canRecoverUser,
   userIdOf,
 } from "../services/expense.access.js";
 import { resolveAdvanceApprovalChain } from "../services/reports.service.js";
+import {
+  applyAdvanceToClaim,
+  detachAdvanceFromClaim,
+  recordRecovery,
+} from "../services/advanceSettlement.service.js";
 import ExpenseAdvance from "../models/ExpenseAdvance.js";
+import Report from "../models/Report.js";
 import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseActivity.js";
 import User from "../models/User.js";
 import { refFromId } from "../utils/refFromId.js";
@@ -338,15 +345,44 @@ router.get("/:id", async (req: any, res: any) => {
       note: l.note ?? null,
     }));
 
+    // Resolve claim refs for the settlement rows (so the UI can name each claim
+    // the advance is applied to / settled against).
+    const settlements: any[] = Array.isArray((advance as any).settlements)
+      ? (advance as any).settlements
+      : [];
+    const claimRefById = new Map<string, string>();
+    const settlementReportIds = settlements.map((s) => s.reportId).filter(Boolean);
+    if (settlementReportIds.length) {
+      const claims = await Report.find({
+        workspaceId: req.workspaceObjectId,
+        _id: { $in: settlementReportIds },
+      })
+        .select("ref name")
+        .lean();
+      claims.forEach((c: any) => claimRefById.set(String(c._id), c.ref || c.name || ""));
+    }
+    const appliedToClaims = settlements.map((s: any) => ({
+      settlementId: String(s._id),
+      reportId: String(s.reportId),
+      claimRef: claimRefById.get(String(s.reportId)) || "",
+      amountApplied: s.amountApplied,
+      settledAmount: s.settledAmount,
+      status: s.status,
+      appliedAt: s.appliedAt ?? null,
+      settledAt: s.settledAt ?? null,
+    }));
+
     const decision = canDecideAdvanceUser(req.user, advance);
     const out = {
       ...advance.toObject(),
       requesterName: employeeNameOf(requester),
       approverName: employeeNameOf(approver),
       approvalChain,
+      appliedToClaims,
       viewerIsOwner: isOwner,
       canApprove: advance.status === "awaiting_approval" && decision.ok,
       canDisburse: canDisburseUser(req.user, advance),
+      canRecover: canRecoverUser(req.user, advance),
     };
 
     // Activity timeline (oldest → newest), tenant-scoped + keyed by advanceId.
@@ -717,6 +753,132 @@ router.post("/:id/disburse", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[Advances disburse]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to disburse advance" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /api/expense-advances/:id/apply  { reportId, amountApplied }
+ * EMPLOYEE — earmark this (own, disbursed) advance against an own claim. Records
+ * an EARMARKED settlement; the balance is untouched until the claim reimburses
+ * (settle-at-reimburse). Validation lives in the settlement engine.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/:id/apply", async (req: any, res: any) => {
+  try {
+    const reportId = String(req.body?.reportId || "");
+    const result = await applyAdvanceToClaim({
+      workspaceId: req.workspaceObjectId,
+      requesterId: ownRequesterId(req),
+      advanceId: req.params.id,
+      reportId,
+      amountApplied: Number(req.body?.amountApplied),
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+
+    // Log on the CLAIM timeline — the employee is on the claim when applying.
+    try {
+      await ExpenseActivity.create({
+        workspaceId: req.workspaceObjectId,
+        reportId: new mongoose.Types.ObjectId(reportId),
+        event: "advance_applied",
+        actorId: new mongoose.Types.ObjectId(ownRequesterId(req)),
+        actorName: actorNameOf(req),
+        note: `Applied ${result.advance.ref} — ${result.amountApplied}`,
+      });
+    } catch (e: any) {
+      console.error("[advance apply log]", e?.message || e);
+    }
+
+    res.json({ ok: true, advance: result.advance.toObject() });
+  } catch (err: any) {
+    console.error("[Advances apply]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to apply advance" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /api/expense-advances/:id/detach  { reportId }
+ * EMPLOYEE — remove an EARMARKED application of this advance from a claim (only
+ * before the claim reimburses). No balance change — none was ever made.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/:id/detach", async (req: any, res: any) => {
+  try {
+    const reportId = String(req.body?.reportId || "");
+    const result = await detachAdvanceFromClaim({
+      workspaceId: req.workspaceObjectId,
+      requesterId: ownRequesterId(req),
+      advanceId: req.params.id,
+      reportId,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+
+    try {
+      await ExpenseActivity.create({
+        workspaceId: req.workspaceObjectId,
+        reportId: new mongoose.Types.ObjectId(reportId),
+        event: "advance_detached",
+        actorId: new mongoose.Types.ObjectId(ownRequesterId(req)),
+        actorName: actorNameOf(req),
+        note: `Detached ${result.advance.ref} (${result.amountReleased})`,
+      });
+    } catch (e: any) {
+      console.error("[advance detach log]", e?.message || e);
+    }
+
+    res.json({ ok: true, advance: result.advance.toObject() });
+  } catch (err: any) {
+    console.error("[Advances detach]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to detach advance" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /api/expense-advances/:id/recover  { amount, note? }
+ * FINANCE/ADMIN (canRecover SoD gate) — manually recover outstanding cash on a
+ * disbursed/partially_settled advance. Reduces outstandingBalance directly
+ * (capped at outstanding); status → settled at 0.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/:id/recover", async (req: any, res: any) => {
+  try {
+    const advance = await loadAdvanceAny(req, req.params.id);
+    if (!advance) return res.status(404).json({ error: "Advance not found" });
+
+    if (advance.status !== "disbursed" && advance.status !== "partially_settled") {
+      return res.status(409).json({ error: "Only a disbursed advance with an outstanding balance can be recovered" });
+    }
+    if (Number(advance.outstandingBalance) <= 0) {
+      return res.status(409).json({ error: "Nothing outstanding to recover" });
+    }
+    // Finance/admin + whole-chain SoD (mirrors disburse): a finance user may not
+    // recover an advance they approved; an admin may (owner-operator override).
+    if (!canRecoverUser(req.user, advance)) {
+      if (!isFinance(req)) return res.status(403).json({ error: "Finance access required" });
+      return res.status(403).json({
+        error: "You approved this advance — a different finance user must recover it.",
+      });
+    }
+
+    const note = String(req.body?.note || "").trim() || null;
+    const result = await recordRecovery({
+      advance,
+      amount: Number(req.body?.amount),
+      note,
+      recoveredBy: ownRequesterId(req),
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+
+    await logAdvanceActivity({
+      workspaceId: req.workspaceObjectId,
+      advanceId: advance._id as mongoose.Types.ObjectId,
+      event: "recovered",
+      actorId: ownRequesterId(req),
+      actorName: actorNameOf(req),
+      note: `Recovered ${result.amountRecovered} → ${result.newStatus} (outstanding ${result.newOutstanding})${note ? `: ${note}` : ""}`,
+    });
+
+    res.json({ ok: true, advance: result.advance.toObject() });
+  } catch (err: any) {
+    console.error("[Advances recover]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to recover advance" });
   }
 });
 

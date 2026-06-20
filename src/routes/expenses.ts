@@ -213,6 +213,10 @@ const EXPORT_COLUMNS: Col[] = [
   { key: "claim", label: "Claim" },
   { key: "created", label: "Created" },
   { key: "receipt", label: "Receipt" },
+  // ── Advances (Phase 2) — claim-level figures, appended after the existing
+  // columns (order preserved). Blank for loose expenses / no-advance claims. ──
+  { key: "advanceApplied", label: "Advance Applied", money: true },
+  { key: "netReimbursed", label: "Net Reimbursed", money: true },
 ];
 
 function fmtDate(d: any): string {
@@ -235,7 +239,16 @@ function humanizeLifecycle(s: any): string {
 
 function expenseToExportRow(
   d: any,
-  claimsById: Map<string, { ref?: string; reimbursedAt?: any }>,
+  claimsById: Map<
+    string,
+    {
+      ref?: string;
+      reimbursedAt?: any;
+      advanceAppliedTotal?: number;
+      reimbursedAmount?: number | null;
+      claimTotal?: number;
+    }
+  >,
 ): Record<string, any> {
   const claim = d.reportId ? claimsById.get(String(d.reportId)) : null;
   return {
@@ -257,6 +270,17 @@ function expenseToExportRow(
     claim: claim?.ref || (d.reportId ? `CLM-${String(d.reportId).slice(-6).toUpperCase()}` : ""),
     created: fmtDate(d.createdAt),
     receipt: d.imageKey ? "Yes" : "No",
+    // Advance figures of the CLAIM this expense sits in (claim-level, repeated
+    // across the claim's rows). advanceApplied blank when 0/none (reads clean).
+    advanceApplied: claim?.advanceAppliedTotal ? claim.advanceAppliedTotal : "",
+    // Net cash paid out, for REIMBURSED claims only. The recorded reimbursedAmount
+    // when present, else (no-advance / pre-P2 reimbursed claim where it is null)
+    // the full claim total — never 0/blank for a reimbursed claim.
+    netReimbursed: claim?.reimbursedAt
+      ? claim.reimbursedAmount != null
+        ? claim.reimbursedAmount
+        : claim.claimTotal ?? ""
+      : "",
   };
 }
 
@@ -325,16 +349,43 @@ router.get("/export", async (req: any, res: any) => {
     const reportIds = [
       ...new Set(docs.map((d: any) => d.reportId).filter(Boolean).map(String)),
     ];
-    const claimsById = new Map<string, { ref?: string; reimbursedAt?: any }>();
+    const claimsById = new Map<
+      string,
+      {
+        ref?: string;
+        reimbursedAt?: any;
+        advanceAppliedTotal?: number;
+        reimbursedAmount?: number | null;
+        claimTotal?: number;
+      }
+    >();
     if (reportIds.length) {
-      const reports = await Report.find({
-        workspaceId: req.workspaceObjectId,
-        _id: { $in: reportIds.map((rid) => new mongoose.Types.ObjectId(rid)) },
-      })
-        .select("ref reimbursedAt")
-        .lean();
+      const reportObjIds = reportIds.map((rid) => new mongoose.Types.ObjectId(rid));
+      const [reports, totals] = await Promise.all([
+        Report.find({
+          workspaceId: req.workspaceObjectId,
+          _id: { $in: reportObjIds },
+        })
+          .select("ref reimbursedAt advanceAppliedTotal reimbursedAmount")
+          .lean(),
+        // True claim total per claim (Σ ALL its expenses, not just the filtered
+        // export rows) — the Net Reimbursed fallback for reimbursed claims whose
+        // reimbursedAmount is null (no-advance / pre-P2).
+        Expense.aggregate([
+          { $match: { workspaceId: req.workspaceObjectId, reportId: { $in: reportObjIds } } },
+          { $group: { _id: "$reportId", total: { $sum: { $ifNull: ["$amount", 0] } } } },
+        ]),
+      ]);
+      const totalByReport = new Map<string, number>();
+      totals.forEach((t: any) => totalByReport.set(String(t._id), t.total || 0));
       reports.forEach((r: any) =>
-        claimsById.set(String(r._id), { ref: r.ref, reimbursedAt: r.reimbursedAt }),
+        claimsById.set(String(r._id), {
+          ref: r.ref,
+          reimbursedAt: r.reimbursedAt,
+          advanceAppliedTotal: r.advanceAppliedTotal,
+          reimbursedAmount: r.reimbursedAmount,
+          claimTotal: totalByReport.get(String(r._id)) ?? 0,
+        }),
       );
     }
 
