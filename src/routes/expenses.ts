@@ -20,7 +20,7 @@ import express from "express";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
 import multer from "multer";
-import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { seesAll, userIdOf } from "../services/expense.access.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { csvRow } from "../utils/exportHelpers.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
@@ -65,51 +65,62 @@ function receiptUploadMw(req: any, res: any, next: any) {
   });
 }
 
-/* ── Role gate: who sees all workspace expenses ──────────────────────
- * Mirrors the requireAdmin role set in middleware/rbac.ts, but as a boolean
- * predicate (the middleware itself only short-circuits with 403). */
-function norm(v: any) {
-  return String(v ?? "").trim().toUpperCase().replace(/[\s\-_]/g, "");
-}
-const FINANCE_ADMIN_ROLES = [
-  "ADMIN",
-  "SUPERADMIN",
-  "SUPER_ADMIN",
-  "HR",
-  "HR_ADMIN",
-  "OPS",
-  "OPS_ADMIN",
-  "TENANT_ADMIN",
-  "WORKSPACE_ADMIN",
-].map(norm);
-
+/* ── Access predicates: delegated to the single source of truth ──────
+ * services/expense.access.ts owns the role sets + the seesAll/finance/admin
+ * logic. These thin adapters just feed it req.user (the divergent inline
+ * FINANCE_ADMIN_ROLES set that used to live here is gone). */
 function seesAllExpenses(req: any): boolean {
-  if (isSuperAdmin(req)) return true;
-  const user = req.user || {};
-  const signals: any[] = [];
-  if (Array.isArray(user.roles)) signals.push(...user.roles);
-  if (user.role) signals.push(user.role);
-  if (user.userType) signals.push(user.userType);
-  if (user.accountType) signals.push(user.accountType);
-  if (user.hrmsAccessRole) signals.push(user.hrmsAccessRole);
-  if (user.hrmsAccessLevel) signals.push(user.hrmsAccessLevel);
-  return signals.map(norm).some((r) => FINANCE_ADMIN_ROLES.includes(r));
+  return seesAll(req.user);
 }
 
 function ownEmployeeId(req: any): string {
-  return String(req.user?.id || req.user?._id || req.user?.sub || "");
+  return userIdOf(req.user);
 }
 
-/* ── Shared filter builder — the single guarantee of tenant + own scoping ── */
-function buildExpenseFilter(req: any): Record<string, any> {
+/** Claims routed to `me` as their snapshotted approver — the line expenses of
+ *  these must be visible to the approver even though they aren't their own rows
+ *  (the "approver can't open the receipts" fix). Status-agnostic: a routed claim
+ *  is theirs to see before AND after they decide it. */
+async function routedClaimIdsFor(req: any, me: string): Promise<mongoose.Types.ObjectId[]> {
+  if (!me || !mongoose.Types.ObjectId.isValid(me)) return [];
+  const reports = await Report.find({
+    workspaceId: req.workspaceObjectId,
+    approverId: new mongoose.Types.ObjectId(me),
+  })
+    .select("_id")
+    .lean();
+  return reports.map((r: any) => r._id as mongoose.Types.ObjectId);
+}
+
+/* ── Shared filter builder — the single guarantee of tenant + own scoping ──
+ * `includeRoutedClaims` adds claim-aware visibility (own rows OR the expenses
+ * of claims routed to me): ON for read/list/export/detail, OFF for personal
+ * aggregates (summary) and own-only mutations (category PATCH). */
+async function buildExpenseFilter(
+  req: any,
+  opts: { includeRoutedClaims?: boolean } = {},
+): Promise<Record<string, any>> {
+  const includeRoutedClaims = opts.includeRoutedClaims !== false;
   const filter: Record<string, any> = {
     workspaceId: req.workspaceObjectId, // NON-NEGOTIABLE explicit tenant scope
   };
 
-  const seesAll = seesAllExpenses(req);
-  if (!seesAll) {
-    // Employees are forced to their own records; ?employeeId is ignored.
-    filter.employeeId = ownEmployeeId(req);
+  const all = seesAllExpenses(req);
+  if (!all) {
+    const me = ownEmployeeId(req);
+    if (includeRoutedClaims) {
+      // Own rows PLUS the line expenses of any claim routed to me as approver.
+      // Pushed into $and so it composes with the search $or / status blocks
+      // below instead of clobbering them.
+      const routedIds = await routedClaimIdsFor(req, me);
+      filter.$and = [
+        ...(filter.$and || []),
+        { $or: [{ employeeId: me }, { reportId: { $in: routedIds } }] },
+      ];
+    } else {
+      // Employees are forced to their own records; ?employeeId is ignored.
+      filter.employeeId = me;
+    }
   } else if (req.query.employeeId) {
     // Finance/Admin may narrow to one employee.
     try {
@@ -256,7 +267,7 @@ router.get("/", async (req: any, res: any) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(200, parseInt(req.query.limit) || 25);
-    const filter = buildExpenseFilter(req);
+    const filter = await buildExpenseFilter(req);
 
     const [docs, total] = await Promise.all([
       Expense.find(filter)
@@ -298,7 +309,7 @@ router.get("/", async (req: any, res: any) => {
 router.get("/export", async (req: any, res: any) => {
   try {
     const format = req.query.format === "xlsx" ? "xlsx" : "csv";
-    const filter = buildExpenseFilter(req);
+    const filter = await buildExpenseFilter(req);
 
     const docs = await Expense.find(filter)
       .select("-rawExtraction -perFieldConfidence")
@@ -375,7 +386,9 @@ router.get("/export", async (req: any, res: any) => {
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/summary", async (req: any, res: any) => {
   try {
-    const filter = buildExpenseFilter(req);
+    // Personal aggregate: own-scoped only (routed claims must not pollute the
+    // employee's own totals, and aggregate() can't carry the routed $or cleanly).
+    const filter = await buildExpenseFilter(req, { includeRoutedClaims: false });
 
     const match: Record<string, any> = { ...filter };
     if (match.workspaceId && !(match.workspaceId instanceof mongoose.Types.ObjectId)) {
@@ -471,7 +484,10 @@ router.get("/:id/receipt-url", async (req: any, res: any) => {
       workspaceId: req.workspaceObjectId, // NON-NEGOTIABLE explicit tenant scope
     };
     if (!seesAllExpenses(req)) {
-      filter.employeeId = ownEmployeeId(req);
+      // Own receipt OR a receipt in a claim routed to me (claim-aware visibility).
+      const me = ownEmployeeId(req);
+      const routedIds = await routedClaimIdsFor(req, me);
+      filter.$or = [{ employeeId: me }, { reportId: { $in: routedIds } }];
     }
 
     const expense: any = await Expense.findOne(filter)
@@ -508,7 +524,7 @@ router.get("/:id", async (req: any, res: any) => {
       return res.status(404).json({ error: "Expense not found" });
     }
 
-    const filter = buildExpenseFilter(req); // stamps workspaceId + own/admin scope
+    const filter = await buildExpenseFilter(req); // workspace + own/routed/admin scope
     filter._id = new mongoose.Types.ObjectId(id);
 
     const doc: any = await Expense.findOne(filter)
@@ -571,7 +587,8 @@ router.patch("/:id", async (req: any, res: any) => {
       categoryId = cat._id as mongoose.Types.ObjectId;
     }
 
-    const filter = buildExpenseFilter(req); // stamps workspaceId + own/admin scope
+    // Reclassify is an own-only mutation — never via routed-claim visibility.
+    const filter = await buildExpenseFilter(req, { includeRoutedClaims: false });
     filter._id = new mongoose.Types.ObjectId(id);
 
     const updated: any = await Expense.findOneAndUpdate(

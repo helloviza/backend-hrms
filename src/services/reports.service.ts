@@ -12,6 +12,7 @@ import User from "../models/User.js";
 import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseActivity.js";
 import { refFromId } from "../utils/refFromId.js";
 import { sendClaimSubmittedEmail } from "../utils/claimEmails.js";
+import { isAdmin, userIdOf } from "./expense.access.js";
 
 /* ──────────────────────────────────────────────────────────────────────
  * Activity / audit log.
@@ -76,10 +77,6 @@ function employeeNameOf(u: any): string {
   const full = [u.firstName, u.lastName].filter(Boolean).join(" ").trim();
   return full || u.name || u.email || "";
 }
-
-// Admin/HR/Ops role tokens used for the no-manager approver fallback (stored
-// uppercase on User.roles).
-const APPROVER_FALLBACK_ROLES = ["ADMIN", "SUPERADMIN", "SUPER_ADMIN", "HR", "HR_ADMIN", "OPS", "OPS_ADMIN"];
 
 export type ExpenseLifecycle =
   | "pending_to_submit"
@@ -308,27 +305,61 @@ export async function linkExpensesToReport(
   return { added, skipped: ids.length - added };
 }
 
-/** Resolve the approver to snapshot: the submitter's manager, else any
- *  admin/HR/Ops in the workspace (not the submitter), else none. */
+// Fields the snapshot needs (name/email) PLUS every role signal isAdmin() reads,
+// so the admin-fallback filter below can decide eligibility off the lean doc.
+const APPROVER_USER_FIELDS =
+  "firstName lastName name email roles role userType accountType hrmsAccessRole hrmsAccessLevel isSuperAdmin managerId";
+
+/**
+ * Resolve the L1 approver to snapshot — workspace-scoped; every lookup stamps
+ * workspaceId. Order:
+ *   1. the submitter's own manager (must be in this workspace, and never the
+ *      submitter themselves);
+ *   2. else any OTHER user in the SAME workspace with an ADMIN_ROLES role
+ *      (admin / superadmin / tenant-admin / workspace-admin / HR / OPS …) —
+ *      this is what closes the gap where a tenant-admin-led workspace had no
+ *      eligible fallback;
+ *   3. else { id: null } — and the caller MUST refuse the submit (the claim is
+ *      never stamped with approverId=null).
+ *
+ * Role strings are stored uppercase but keep their separators ("TENANT_ADMIN"),
+ * whereas ADMIN_ROLES (expense.access) is separator-stripped — so eligibility is
+ * decided by isAdmin() (same normalization on both sides), NOT an exact-match
+ * $in that would silently miss tenant-/workspace-admin rows. The coarse regex
+ * pre-filter only keeps the scan off pure EMPLOYEE/MANAGER rows; isAdmin() is
+ * the authority. Self-approval guard: the submitter is excluded at both the DB
+ * ($ne) and isAdmin layers, so an admin filing their own claim falls through to
+ * another workspace admin (and, if there is none, to the §3 refusal).
+ */
 async function resolveApprover(
   workspaceId: mongoose.Types.ObjectId,
   submitterId: mongoose.Types.ObjectId,
 ): Promise<{ id: mongoose.Types.ObjectId | null; user: any | null }> {
-  const submitter: any = await User.findById(submitterId).select("managerId").lean();
-  if (submitter?.managerId) {
-    const mgr: any = await User.findById(submitter.managerId)
-      .select("firstName lastName name email")
+  const meId = String(submitterId);
+
+  // 1) submitter's manager — same workspace, and not the submitter themselves.
+  const submitter: any = await User.findOne({ _id: submitterId, workspaceId })
+    .select("managerId")
+    .lean();
+  if (submitter?.managerId && String(submitter.managerId) !== meId) {
+    const mgr: any = await User.findOne({ _id: submitter.managerId, workspaceId })
+      .select(APPROVER_USER_FIELDS)
       .lean();
-    if (mgr) return { id: submitter.managerId as mongoose.Types.ObjectId, user: mgr };
+    if (mgr) return { id: mgr._id as mongoose.Types.ObjectId, user: mgr };
   }
-  const admin: any = await User.findOne({
+
+  // 2) any OTHER workspace admin (separator-safe: isAdmin() is the authority).
+  const candidates: any[] = await User.find({
     workspaceId,
     _id: { $ne: submitterId },
-    roles: { $in: APPROVER_FALLBACK_ROLES },
+    roles: { $in: [/ADMIN/i, /^HR$/i, /^OPS$/i] },
   })
-    .select("firstName lastName name email")
+    .select(APPROVER_USER_FIELDS)
     .lean();
+  const admin = candidates.find((u) => userIdOf(u) !== meId && isAdmin(u));
   if (admin) return { id: admin._id as mongoose.Types.ObjectId, user: admin };
+
+  // 3) nobody eligible — caller refuses; no null approver is ever submitted.
   return { id: null, user: null };
 }
 
@@ -382,7 +413,21 @@ export async function submitReport(
   const totalAmount = agg?.total ?? 0;
   const expenseCount = agg?.count ?? 0;
 
+  // L1 routing guard — a submitted claim must NEVER land with approverId=null.
+  // No manager AND no eligible workspace admin → refuse like a blocking
+  // validation failure (the claim stays a draft instead of stranding in
+  // awaiting_approval with nobody able to act). Returns BEFORE any mutation.
   const { id: approverId, user: approver } = await resolveApprover(ws, emp);
+  if (!approverId) {
+    return {
+      ok: false,
+      reason: "blocking",
+      blocking: [
+        "No approver available — set a manager for this employee, or add an admin to the workspace.",
+      ],
+      warnings,
+    };
+  }
   report.approverId = approverId;
   report.status = "submitted";
   report.submittedAt = new Date();
