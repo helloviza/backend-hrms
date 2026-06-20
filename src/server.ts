@@ -436,6 +436,11 @@ app.use("/api/expense-categories", requireAuth, requireWorkspace, expenseCategor
 import expenseReportsRouter from "./routes/expenseReports.js";
 app.use("/api/reports", requireAuth, requireWorkspace, expenseReportsRouter);
 
+// Expense administration — the assignment surface (capabilities + manager).
+// Tenant-scoped; expense-Admin-gated in-router (isAdmin from expense.access).
+import expenseAdminRouter from "./routes/expenseAdmin.js";
+app.use("/api/expense-admin", requireAuth, requireWorkspace, expenseAdminRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";

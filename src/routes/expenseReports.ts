@@ -11,7 +11,13 @@
 
 import express from "express";
 import mongoose from "mongoose";
-import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import {
+  seesAll,
+  isFinance as isFinanceUser,
+  canDecide as canDecideUser,
+  canReimburse as canReimburseUser,
+  userIdOf,
+} from "../services/expense.access.js";
 import {
   propagateReportLifecycle,
   unlinkAllExpenses,
@@ -31,45 +37,20 @@ import User from "../models/User.js";
 
 const router = express.Router();
 
-/* ── Role gate: who sees ALL workspace reports (mirrors expenses.ts) ──── */
-function norm(v: any) {
-  return String(v ?? "").trim().toUpperCase().replace(/[\s\-_]/g, "");
-}
-const FINANCE_ADMIN_ROLES = [
-  "ADMIN", "SUPERADMIN", "SUPER_ADMIN", "HR", "HR_ADMIN",
-  "OPS", "OPS_ADMIN", "TENANT_ADMIN", "WORKSPACE_ADMIN",
-].map(norm);
-
+/* ── Access predicates: delegated to the single source of truth ──────
+ * services/expense.access.ts owns the role sets + seesAll/finance/admin/decide
+ * logic. These thin req-shaped adapters feed it req.user; the divergent inline
+ * FINANCE_ADMIN_ROLES / FINANCE_ROLES sets that used to live here are gone. */
 function seesAllReports(req: any): boolean {
-  if (isSuperAdmin(req)) return true;
-  const u = req.user || {};
-  const signals: any[] = [];
-  if (Array.isArray(u.roles)) signals.push(...u.roles);
-  if (u.role) signals.push(u.role);
-  if (u.userType) signals.push(u.userType);
-  if (u.accountType) signals.push(u.accountType);
-  if (u.hrmsAccessRole) signals.push(u.hrmsAccessRole);
-  if (u.hrmsAccessLevel) signals.push(u.hrmsAccessLevel);
-  return signals.map(norm).some((r) => FINANCE_ADMIN_ROLES.includes(r));
+  return seesAll(req.user);
 }
 
 function ownEmployeeId(req: any): string {
-  return String(req.user?.id || req.user?._id || req.user?.sub || "");
+  return userIdOf(req.user);
 }
 
-/** Finance actor — a DISTINCT predicate (so reimburse can tighten later). */
-const FINANCE_ROLES = ["ADMIN", "SUPERADMIN", "SUPER_ADMIN", "HR", "HR_ADMIN", "OPS", "OPS_ADMIN"].map(norm);
 function isFinance(req: any): boolean {
-  if (isSuperAdmin(req)) return true;
-  const u = req.user || {};
-  const signals: any[] = [];
-  if (Array.isArray(u.roles)) signals.push(...u.roles);
-  if (u.role) signals.push(u.role);
-  if (u.userType) signals.push(u.userType);
-  if (u.accountType) signals.push(u.accountType);
-  if (u.hrmsAccessRole) signals.push(u.hrmsAccessRole);
-  if (u.hrmsAccessLevel) signals.push(u.hrmsAccessLevel);
-  return signals.map(norm).some((r) => FINANCE_ROLES.includes(r));
+  return isFinanceUser(req.user);
 }
 
 function employeeNameOf(u: any): string {
@@ -289,7 +270,7 @@ router.get("/:id", async (req: any, res: any) => {
       // UI affordances (server is still the source of truth on every action).
       viewerIsOwner: isOwner,
       canApprove: report.status === "submitted" && decision.ok,
-      canReimburse: report.status === "approved" && isFinance(req),
+      canReimburse: canReimburseUser(req.user, report),
     };
 
     // Activity timeline (oldest → newest). Tenant-scoped: workspaceId is stamped
@@ -452,16 +433,12 @@ router.post("/:id/submit", async (req: any, res: any) => {
 });
 
 /* ── Authorization helper for approve/reject ─────────────────────────
- * The actor must be the routed approver OR an admin (seesAll). A NON-admin
- * cannot decide their OWN report (segregation of duties); an ADMIN may
- * (owner-operator override) — recorded via selfApproved. */
+ * The actor must be the routed approver OR an admin. A NON-admin cannot decide
+ * their OWN report (segregation of duties); an ADMIN may (owner-operator
+ * override) — recorded via selfApproved. Delegates to expense.access.canDecide
+ * (single source of truth); this req-shaped wrapper keeps the call sites stable. */
 function canDecide(req: any, report: any): { ok: boolean; admin: boolean; isSelf: boolean } {
-  const me = ownEmployeeId(req);
-  const admin = seesAllReports(req);
-  const isApprover = report.approverId && String(report.approverId) === me;
-  const isSelf = String(report.employeeId) === me;
-  const ok = (isApprover || admin) && (!isSelf || admin);
-  return { ok, admin, isSelf };
+  return canDecideUser(req.user, report);
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -600,12 +577,18 @@ router.post("/:id/request-clarification", async (req: any, res: any) => {
  * ───────────────────────────────────────────────────────────────────── */
 router.post("/:id/reimburse", async (req: any, res: any) => {
   try {
-    if (!isFinance(req)) return res.status(403).json({ error: "Finance access required" });
-
     const report = await loadReportAny(req, req.params.id);
     if (!report) return res.status(404).json({ error: "Report not found" });
     if (report.status !== "approved") {
       return res.status(409).json({ error: "Only approved reports can be reimbursed" });
+    }
+    // Finance-only + same-claim SoD: a finance user may not reimburse a claim
+    // they themselves approved; an admin may (owner-operator override).
+    if (!canReimburseUser(req.user, report)) {
+      if (!isFinance(req)) return res.status(403).json({ error: "Finance access required" });
+      return res.status(403).json({
+        error: "You approved this claim — a different finance user must reimburse it.",
+      });
     }
 
     report.status = "reimbursed";

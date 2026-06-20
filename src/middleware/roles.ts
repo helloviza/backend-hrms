@@ -10,6 +10,9 @@ const ROLE_ALIASES: Record<string, string[]> = {
   HR: ["HR", "HR_MANAGER"],
   MANAGER: ["MANAGER"],
   EMPLOYEE: ["EMPLOYEE"],
+  // Dedicated finance capability role (Expense Management). Recognized here so
+  // requireRoles("FINANCE") is first-class; assignment UI lands in a later step.
+  FINANCE: ["FINANCE"],
 };
 
 export function requireRoles(...roles: string[]) {
