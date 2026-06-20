@@ -167,3 +167,54 @@ export function canReimburse(user: any, report: any): boolean {
   if (report.approverId) approverIds.add(String(report.approverId)); // legacy fallback
   return !approverIds.has(me); // finance SoD across every level the user approved
 }
+
+/* ──────────────────────────────────────────────────────────────────────
+ * Cash advances (System B). These peers of canDecide/canReimburse use the
+ * advance's OWN owner field (requesterId, not employeeId) but are otherwise the
+ * SAME normalization and SoD logic — the claim predicates above are untouched.
+ * ────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Approve / decline authority on a single advance — mirrors canDecide, but the
+ * self-check reads `advance.requesterId` (an advance has no employeeId).
+ *   ok    — the snapshotted approver OR an admin …
+ *   SoD   — … but a NON-admin may never decide their OWN advance. An admin may
+ *           (owner-operator override), recorded via selfApproved.
+ */
+export function canDecideAdvance(
+  user: any,
+  advance: any,
+): { ok: boolean; admin: boolean; isSelf: boolean } {
+  const me = userIdOf(user);
+  const admin = isAdmin(user);
+  const isApprover = !!(advance?.approverId && String(advance.approverId) === me);
+  const isSelf = String(advance?.requesterId) === me;
+  const ok = (isApprover || admin) && (!isSelf || admin);
+  return { ok, admin, isSelf };
+}
+
+/**
+ * Disburse authority on a single advance — mirrors canReimburse:
+ *   • the advance must be APPROVED,
+ *   • the actor must be Finance,
+ *   • whole-chain SoD: a finance user may NOT disburse an advance where they
+ *     were ANY approver — at any level of the chain. Falls back to the denorm
+ *     approverId for advances with no chain.
+ *   • Admin override: an admin bypasses the SoD check (owner-operator) — the
+ *     route logs the override.
+ */
+export function canDisburse(user: any, advance: any): boolean {
+  if (!advance || advance.status !== "approved") return false;
+  if (isAdmin(user)) return true; // admin bypasses SoD
+  if (!isFinance(user)) return false;
+
+  const me = userIdOf(user);
+  const approverIds = new Set<string>();
+  if (Array.isArray(advance.approvalChain)) {
+    for (const lvl of advance.approvalChain) {
+      if (lvl?.approverId) approverIds.add(String(lvl.approverId));
+    }
+  }
+  if (advance.approverId) approverIds.add(String(advance.approverId)); // legacy fallback
+  return !approverIds.has(me); // finance SoD across every level the user approved
+}

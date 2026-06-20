@@ -471,6 +471,59 @@ async function resolveApprovalChain(
 }
 
 /**
+ * Build the approval chain to snapshot when an ExpenseAdvance is requested.
+ *
+ * ADDITIVE PEER of resolveApprovalChain (the claim builder above) — it REUSES
+ * the exact same private resolvers (resolveL1Approver / resolveL2Approver), so
+ * the never-null manager → admin fallback and the L2 mgr's-mgr → seniorApprover
+ * → admin walk behave identically to a claim. The ONLY difference is the
+ * escalation gate: this reads config.advanceEscalationThreshold (NOT
+ * expenseEscalationThreshold) and gates L2 on the ADVANCE amount. seniorApproverId
+ * is shared with claims (there is one configured senior approver per workspace).
+ *
+ *   • L1 — never null; when resolveL1Approver returns null the CALLER MUST refuse
+ *     the request (no advance is ever stamped with approverId=null).
+ *   • L2 — appended ONLY when advanceEscalationThreshold is set AND amount exceeds
+ *     it; best-effort (chain stays length 1 if no distinct L2 exists). Threshold
+ *     OFF (null) ⇒ single-level chain.
+ */
+export async function resolveAdvanceApprovalChain(
+  workspaceId: mongoose.Types.ObjectId | string,
+  requesterId: mongoose.Types.ObjectId | string,
+  amount: number,
+): Promise<{
+  chain: IApprovalChainLevel[];
+  approverId: mongoose.Types.ObjectId | null;
+  approver: any | null;
+}> {
+  const ws = new mongoose.Types.ObjectId(String(workspaceId));
+  const reqId = new mongoose.Types.ObjectId(String(requesterId));
+
+  const l1 = await resolveL1Approver(ws, reqId);
+  if (!l1.id) return { chain: [], approverId: null, approver: null };
+
+  const chain: IApprovalChainLevel[] = [
+    { level: 1, approverId: l1.id, status: "pending", decidedAt: null, note: null },
+  ];
+
+  const cfg: any = await CustomerWorkspace.findById(ws)
+    .select("config.advanceEscalationThreshold config.seniorApproverId")
+    .lean();
+  const threshold = cfg?.config?.advanceEscalationThreshold;
+  if (threshold != null && Number(amount) > Number(threshold)) {
+    const l2 = await resolveL2Approver(ws, l1.user, cfg?.config?.seniorApproverId, [
+      String(reqId),
+      String(l1.id),
+    ]);
+    if (l2) {
+      chain.push({ level: 2, approverId: l2._id, status: "pending", decidedAt: null, note: null });
+    }
+  }
+
+  return { chain, approverId: l1.id, approver: l1.user };
+}
+
+/**
  * report.status → the per-level disposition to stamp when lazy-initialising a
  * length-1 chain for a legacy in-flight claim (one that predates the chain
  * field). Mirrors the claim's own decision so the synthesized L1 step is

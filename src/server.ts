@@ -441,6 +441,13 @@ app.use("/api/reports", requireAuth, requireWorkspace, requireFeature("expensesE
 import expenseAdminRouter from "./routes/expenseAdmin.js";
 app.use("/api/expense-admin", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseAdminRouter);
 
+// Expense advances (System B) — cash advances, a peer of claims. Gated behind
+// BOTH expensesEnabled AND advancesEnabled (requireExpenseAdvancesFeature runs
+// the expenses check first, then the advances opt-in).
+import expenseAdvancesRouter from "./routes/expenseAdvances.js";
+import { requireExpenseAdvancesFeature } from "./middleware/requireFeature.js";
+app.use("/api/expense-advances", requireAuth, requireWorkspace, requireExpenseAdvancesFeature, expenseAdvancesRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";

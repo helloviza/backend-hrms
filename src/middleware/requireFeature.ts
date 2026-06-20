@@ -57,3 +57,16 @@ export const requireFeature = (featureKey: keyof WorkspaceFeatures) =>
       next(err);
     }
   };
+
+/**
+ * requireExpenseAdvancesFeature — cash advances (System B) sit INSIDE the expense
+ * module, so they are gated by BOTH flags: the expenses master switch first, then
+ * the advances opt-in. Ordered as a middleware chain so the expenses check runs
+ * AFTER requireWorkspace and BEFORE the advances check (Express flattens the
+ * array). Both inherit the SUPERADMIN / HOUSE / tbocert bypasses from
+ * requireFeature.
+ */
+export const requireExpenseAdvancesFeature = [
+  requireFeature("expensesEnabled"),
+  requireFeature("advancesEnabled"),
+];
