@@ -66,6 +66,12 @@ export interface IReport extends Document {
   approvalChain?: IApprovalChainLevel[];
   currentLevel?: number; // 1-based; which chain step is currently pending
 
+  // ── Phase 2 (advances): net-reimburse record. PURELY ADDITIVE — only written
+  // when the claim has applied advances. A claim with NO applied advances
+  // reimburses exactly as before and these stay null/0 (regression line). ──
+  reimbursedAmount?: number | null; // net cash actually paid = claimTotal − advanceAppliedTotal
+  advanceAppliedTotal?: number; // Σ settled settlements applied to this claim at reimburse
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -113,6 +119,11 @@ const ReportSchema = new Schema<IReport>(
     // ── Phase 2: approval chain (resolved at submit; length 1 = today) ──
     approvalChain: { type: [ApprovalChainLevelSchema], default: [] },
     currentLevel: { type: Number, default: 1 },
+
+    // ── Phase 2 (advances): net-reimburse record (additive; null until a
+    // reimburse with applied advances writes them). ──
+    reimbursedAmount: { type: Number, default: null },
+    advanceAppliedTotal: { type: Number, default: 0 },
   },
   { timestamps: true },
 );
