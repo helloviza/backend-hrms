@@ -426,20 +426,20 @@ app.use("/api/v1/workspace", expenseBandsRouter);
 // Expense Management — read API + export (Sprint 3a). Tenant-scoped; role-gated
 // in-handler (Finance/Admin see all workspace expenses, others see own).
 import expensesRouter from "./routes/expenses.js";
-app.use("/api/expenses", requireAuth, requireWorkspace, expensesRouter);
+app.use("/api/expenses", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expensesRouter);
 
 // Expense categories (Layer 1) — tenant-scoped managed category list.
 import expenseCategoriesRouter from "./routes/expenseCategories.js";
-app.use("/api/expense-categories", requireAuth, requireWorkspace, expenseCategoriesRouter);
+app.use("/api/expense-categories", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseCategoriesRouter);
 
 // Expense reports (Layer 2) — tenant-scoped; owner-only mutations, admin-all reads.
 import expenseReportsRouter from "./routes/expenseReports.js";
-app.use("/api/reports", requireAuth, requireWorkspace, expenseReportsRouter);
+app.use("/api/reports", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseReportsRouter);
 
 // Expense administration — the assignment surface (capabilities + manager).
 // Tenant-scoped; expense-Admin-gated in-router (isAdmin from expense.access).
 import expenseAdminRouter from "./routes/expenseAdmin.js";
-app.use("/api/expense-admin", requireAuth, requireWorkspace, expenseAdminRouter);
+app.use("/api/expense-admin", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseAdminRouter);
 
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
