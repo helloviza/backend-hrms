@@ -88,6 +88,14 @@ export interface CustomerWorkspaceDocument extends Document {
     };
     tokenExpiryHours: number;
     features: WorkspaceFeatures;
+
+    // Expense approval escalation (Phase 2). null = OFF: claims route to a single
+    // approver exactly as before. When set, a claim whose total EXCEEDS this
+    // amount gets a second approval level appended at submit.
+    expenseEscalationThreshold?: number | null;
+    // Preferred L2 approver when escalating, before the manager's-manager / admin
+    // fallback. Optional.
+    seniorApproverId?: Schema.Types.ObjectId | null;
   };
 
   // Subscription / billing
@@ -236,6 +244,9 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         requireProposal: { type: Boolean, default: true },
       },
       tokenExpiryHours: { type: Number, default: 12 },
+      // Expense escalation threshold — null = OFF (single-approver, unchanged).
+      expenseEscalationThreshold: { type: Number, default: null },
+      seniorApproverId: { type: Schema.Types.ObjectId, ref: "User", default: null },
       features: {
         sbtEnabled: { type: Boolean, default: false },
         approvalFlowEnabled: { type: Boolean, default: true },

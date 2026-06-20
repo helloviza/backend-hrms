@@ -25,9 +25,11 @@ import {
   linkExpensesToReport,
   submitReport,
   logActivity,
+  ensureApprovalChain,
 } from "../services/reports.service.js";
 import Report from "../models/Report.js";
 import ExpenseActivity from "../models/ExpenseActivity.js";
+import { sendClaimSubmittedEmail } from "../utils/claimEmails.js";
 
 // Owner-editable report states: a draft, or one bounced back for clarification.
 // add / remove / rename / submit / delete all gate on this set.
@@ -231,6 +233,11 @@ router.get("/:id", async (req: any, res: any) => {
       return res.status(404).json({ error: "Report not found" });
     }
 
+    // Lazy-init a length-1 chain for legacy in-flight claims (approverId, no
+    // chain). No-op once a chain exists; never changes status/approverId, so
+    // approve/decline are unaffected.
+    await ensureApprovalChain(report);
+
     const expenses = await Expense.find({
       workspaceId: req.workspaceObjectId,
       reportId: report._id,
@@ -260,11 +267,38 @@ router.get("/:id", async (req: any, res: any) => {
         : Promise.resolve(null),
     ]);
 
+    // Chain-progress stepper: enrich each level with its approver display name
+    // (one workspace-scoped lookup over the level approverIds). currentLevel +
+    // the raw chain are already on report.toObject(); this only adds the names.
+    const rawChain: any[] = Array.isArray((report as any).approvalChain)
+      ? (report as any).approvalChain
+      : [];
+    const chainNameById = new Map<string, string>();
+    const chainApproverIds = rawChain.map((l) => l.approverId).filter(Boolean);
+    if (chainApproverIds.length) {
+      const chainUsers = await User.find({
+        workspaceId: req.workspaceObjectId,
+        _id: { $in: chainApproverIds },
+      })
+        .select("firstName lastName email name")
+        .lean();
+      chainUsers.forEach((u: any) => chainNameById.set(String(u._id), employeeNameOf(u)));
+    }
+    const approvalChain = rawChain.map((l: any) => ({
+      level: l.level,
+      approverId: l.approverId ? String(l.approverId) : null,
+      approverName: l.approverId ? chainNameById.get(String(l.approverId)) || "" : "",
+      status: l.status,
+      decidedAt: l.decidedAt ?? null,
+      note: l.note ?? null,
+    }));
+
     const decision = canDecide(req, report);
     const out = {
       ...report.toObject(),
       employeeName: employeeNameOf(submitter),
       approverName: employeeNameOf(approver),
+      approvalChain, // override the raw chain with the name-enriched one
       expenseCount: enriched.length,
       totalAmount,
       // UI affordances (server is still the source of truth on every action).
@@ -451,10 +485,80 @@ router.post("/:id/approve", async (req: any, res: any) => {
     if (report.status !== "submitted") {
       return res.status(409).json({ error: "Only submitted reports can be approved" });
     }
+    // Lazy-init a length-1 chain for legacy claims so approval can advance it
+    // (no-op when a chain is already present; never changes status/approverId).
+    await ensureApprovalChain(report);
+
     const { ok, isSelf } = canDecide(req, report);
     if (!ok) return res.status(403).json({ error: "You are not authorized to approve this report" });
 
     const me = ownEmployeeId(req);
+    const note = String(req.body?.decisionNote || "").trim() || null;
+
+    // Locate the current step inside the chain (clamped for safety).
+    const chain: any[] = Array.isArray(report.approvalChain) ? report.approvalChain : [];
+    const totalLevels = chain.length || 1;
+    const idx = Math.min(Math.max((report.currentLevel || 1) - 1, 0), Math.max(chain.length - 1, 0));
+    const levelNo = idx + 1;
+
+    // Stamp THIS level approved + who actually decided it.
+    if (chain[idx]) {
+      chain[idx].status = "approved";
+      chain[idx].decidedAt = new Date();
+      chain[idx].approverId = new mongoose.Types.ObjectId(me);
+      if (note) chain[idx].note = note;
+    }
+    report.markModified("approvalChain");
+
+    const hasNext = idx < chain.length - 1;
+
+    if (hasNext) {
+      // ── Advance: not the last level → move to the next approver. The claim
+      // stays `submitted` (expenses stay awaiting_approval — no re-propagation);
+      // "awaiting L2" is derived from currentLevel. approverId is repointed to the
+      // next approver so the queue + pending-count + canDecide all follow along.
+      const next = chain[idx + 1];
+      report.currentLevel = levelNo + 1;
+      report.approverId = next.approverId; // denorm pointer → next pending approver
+      report.selfApproved = isSelf;
+      await report.save();
+
+      await logActivity({
+        workspaceId: req.workspaceObjectId,
+        reportId: report._id as mongoose.Types.ObjectId,
+        event: "approved",
+        actorId: me,
+        actorName: actorNameOf(req),
+        note: `Approved (L${levelNo}) → awaiting L${levelNo + 1}`,
+      });
+
+      // Notify the next approver (best-effort — mirrors the submit notification).
+      if (next?.approverId) {
+        try {
+          const [nextApprover, submitter, counts] = await Promise.all([
+            User.findById(next.approverId).select("firstName lastName name email").lean(),
+            User.findById(report.employeeId).select("firstName lastName name email").lean(),
+            countsForReports(req.workspaceObjectId, [report._id as mongoose.Types.ObjectId]),
+          ]);
+          if ((nextApprover as any)?.email) {
+            await sendClaimSubmittedEmail({
+              to: (nextApprover as any).email,
+              approverName: employeeNameOf(nextApprover),
+              employeeName: employeeNameOf(submitter) || "An employee",
+              claimRef: report.ref,
+              claimId: String(report._id),
+              totalAmount: counts[String(report._id)]?.amount ?? 0,
+            });
+          }
+        } catch (mailErr: any) {
+          console.error("[claim advance email]", mailErr?.message || mailErr);
+        }
+      }
+
+      return res.json({ ok: true, report: report.toObject() });
+    }
+
+    // ── Final level → finalize exactly as today.
     report.status = "approved";
     report.approvedAt = new Date();
     report.approverId = new mongoose.Types.ObjectId(me); // actual decider
@@ -470,7 +574,11 @@ router.post("/:id/approve", async (req: any, res: any) => {
       event: "approved",
       actorId: me,
       actorName: actorNameOf(req),
-      note: isSelf ? "Self-approved by admin" : null,
+      note: totalLevels > 1
+        ? `Approved (final, L${levelNo})`
+        : isSelf
+          ? "Self-approved by admin"
+          : null,
     });
 
     res.json({ ok: true, report: report.toObject() });
@@ -492,6 +600,8 @@ router.post("/:id/decline", async (req: any, res: any) => {
     if (report.status !== "submitted") {
       return res.status(409).json({ error: "Only submitted reports can be declined" });
     }
+    await ensureApprovalChain(report);
+
     const { ok, isSelf } = canDecide(req, report);
     if (!ok) return res.status(403).json({ error: "You are not authorized to decline this report" });
 
@@ -499,6 +609,19 @@ router.post("/:id/decline", async (req: any, res: any) => {
     if (!note) return res.status(400).json({ error: "A reason is required to decline." });
 
     const me = ownEmployeeId(req);
+
+    // Stamp the current chain level declined; the claim itself is terminal.
+    const chain: any[] = Array.isArray(report.approvalChain) ? report.approvalChain : [];
+    const idx = Math.min(Math.max((report.currentLevel || 1) - 1, 0), Math.max(chain.length - 1, 0));
+    const levelNo = idx + 1;
+    if (chain[idx]) {
+      chain[idx].status = "declined";
+      chain[idx].decidedAt = new Date();
+      chain[idx].approverId = new mongoose.Types.ObjectId(me);
+      chain[idx].note = note;
+    }
+    report.markModified("approvalChain");
+
     report.status = "declined";
     report.approverId = new mongoose.Types.ObjectId(me);
     report.decisionNote = note;
@@ -513,7 +636,7 @@ router.post("/:id/decline", async (req: any, res: any) => {
       event: "declined",
       actorId: me,
       actorName: actorNameOf(req),
-      note,
+      note: (chain.length || 1) > 1 ? `Declined (L${levelNo}): ${note}` : note,
     });
 
     res.json({ ok: true, report: report.toObject() });
@@ -535,6 +658,8 @@ router.post("/:id/request-clarification", async (req: any, res: any) => {
     if (report.status !== "submitted") {
       return res.status(409).json({ error: "Only submitted reports can be sent back for clarification" });
     }
+    await ensureApprovalChain(report);
+
     const { ok, isSelf } = canDecide(req, report);
     if (!ok) return res.status(403).json({ error: "You are not authorized to action this report" });
 
@@ -542,6 +667,20 @@ router.post("/:id/request-clarification", async (req: any, res: any) => {
     if (!note) return res.status(400).json({ error: "A note is required to request clarification." });
 
     const me = ownEmployeeId(req);
+
+    // Stamp the current chain level as needing clarification; returns to owner.
+    // On resubmit the chain re-resolves fresh (submitReport rebuilds it).
+    const chain: any[] = Array.isArray(report.approvalChain) ? report.approvalChain : [];
+    const idx = Math.min(Math.max((report.currentLevel || 1) - 1, 0), Math.max(chain.length - 1, 0));
+    const levelNo = idx + 1;
+    if (chain[idx]) {
+      chain[idx].status = "clarification_required";
+      chain[idx].decidedAt = new Date();
+      chain[idx].approverId = new mongoose.Types.ObjectId(me);
+      chain[idx].note = note;
+    }
+    report.markModified("approvalChain");
+
     report.status = "clarification_required";
     report.approverId = new mongoose.Types.ObjectId(me);
     report.decisionNote = note;
@@ -561,7 +700,7 @@ router.post("/:id/request-clarification", async (req: any, res: any) => {
       event: "clarification_requested",
       actorId: me,
       actorName: actorNameOf(req),
-      note,
+      note: (chain.length || 1) > 1 ? `Clarification (L${levelNo}): ${note}` : note,
     });
 
     res.json({ ok: true, report: report.toObject() });

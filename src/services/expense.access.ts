@@ -137,13 +137,23 @@ export function canDecide(
  * Reimburse authority on a single claim.
  *   • the claim must be APPROVED,
  *   • the actor must be Finance,
- *   • same-claim SoD: a finance user may NOT reimburse a claim they themselves
- *     approved (user._id !== report.approverId),
+ *   • whole-chain SoD: a finance user may NOT reimburse a claim where they were
+ *     ANY approver — at any level of the approval chain (Phase 2). Falls back to
+ *     the denorm approverId for legacy claims that have no chain.
  *   • Admin override: an admin bypasses the SoD check (owner-operator).
  */
 export function canReimburse(user: any, report: any): boolean {
   if (!report || report.status !== "approved") return false;
   if (isAdmin(user)) return true; // admin bypasses SoD
   if (!isFinance(user)) return false;
-  return userIdOf(user) !== String(report.approverId); // finance SoD
+
+  const me = userIdOf(user);
+  const approverIds = new Set<string>();
+  if (Array.isArray(report.approvalChain)) {
+    for (const lvl of report.approvalChain) {
+      if (lvl?.approverId) approverIds.add(String(lvl.approverId));
+    }
+  }
+  if (report.approverId) approverIds.add(String(report.approverId)); // legacy fallback
+  return !approverIds.has(me); // finance SoD across every level the user approved
 }
