@@ -7,8 +7,14 @@
 
 import mongoose from "mongoose";
 import Expense from "../models/Expense.js";
-import Report, { type IReport, type ReportStatus } from "../models/Report.js";
+import Report, {
+  type IReport,
+  type ReportStatus,
+  type IApprovalChainLevel,
+  type ChainLevelStatus,
+} from "../models/Report.js";
 import User from "../models/User.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseActivity.js";
 import { refFromId } from "../utils/refFromId.js";
 import { sendClaimSubmittedEmail } from "../utils/claimEmails.js";
@@ -331,7 +337,7 @@ const APPROVER_USER_FIELDS =
  * ($ne) and isAdmin layers, so an admin filing their own claim falls through to
  * another workspace admin (and, if there is none, to the §3 refusal).
  */
-async function resolveApprover(
+async function resolveL1Approver(
   workspaceId: mongoose.Types.ObjectId,
   submitterId: mongoose.Types.ObjectId,
 ): Promise<{ id: mongoose.Types.ObjectId | null; user: any | null }> {
@@ -361,6 +367,155 @@ async function resolveApprover(
 
   // 3) nobody eligible — caller refuses; no null approver is ever submitted.
   return { id: null, user: null };
+}
+
+/**
+ * Resolve the L2 (escalation) approver — only consulted when a workspace
+ * threshold is set and the claim exceeds it. Walks, in order:
+ *   a) the L1 approver's OWN manager (manager's-manager chain walk);
+ *   b) the workspace's configured seniorApproverId;
+ *   c) any OTHER workspace admin (separator-safe: isAdmin() is the authority).
+ * Every candidate must be in this workspace and NOT in `excludeIds` (the
+ * submitter and L1 — skip-self and no double-listing the same approver).
+ *
+ * Returns null when no DISTINCT L2 can be found. The caller treats that as "no
+ * second level" (chain stays length 1) rather than stamping a null approver —
+ * the claim still has a valid L1, so it is never stranded.
+ */
+async function resolveL2Approver(
+  workspaceId: mongoose.Types.ObjectId,
+  l1User: any,
+  seniorApproverId: any,
+  excludeIds: string[],
+): Promise<any | null> {
+  const excluded = new Set(excludeIds.map(String));
+  const ok = (u: any) => u && !excluded.has(String(u._id));
+
+  // a) manager's-manager — APPROVER_USER_FIELDS already carries L1's managerId.
+  const l1MgrId = l1User?.managerId;
+  if (l1MgrId && !excluded.has(String(l1MgrId))) {
+    const mgr: any = await User.findOne({ _id: l1MgrId, workspaceId })
+      .select(APPROVER_USER_FIELDS)
+      .lean();
+    if (ok(mgr)) return mgr;
+  }
+
+  // b) configured senior approver.
+  if (seniorApproverId && !excluded.has(String(seniorApproverId))) {
+    const senior: any = await User.findOne({ _id: seniorApproverId, workspaceId })
+      .select(APPROVER_USER_FIELDS)
+      .lean();
+    if (ok(senior)) return senior;
+  }
+
+  // c) any OTHER workspace admin.
+  const excludeObjIds = excludeIds
+    .filter((x) => mongoose.Types.ObjectId.isValid(x))
+    .map((x) => new mongoose.Types.ObjectId(x));
+  const candidates: any[] = await User.find({
+    workspaceId,
+    _id: { $nin: excludeObjIds },
+    roles: { $in: [/ADMIN/i, /^HR$/i, /^OPS$/i] },
+  })
+    .select(APPROVER_USER_FIELDS)
+    .lean();
+  const admin = candidates.find((u) => ok(u) && isAdmin(u));
+  return admin || null;
+}
+
+/**
+ * Build the approval chain to snapshot at submit.
+ *   • L1 — the existing never-null manager → admin fallback (resolveL1Approver).
+ *     When that returns null the caller MUST refuse the submit (unchanged).
+ *   • L2 — appended ONLY when config.expenseEscalationThreshold is set AND the
+ *     claim total exceeds it. Best-effort: omitted (chain stays length 1) if no
+ *     distinct L2 exists. Threshold OFF (null) ⇒ chain length 1 ⇒ submit behaves
+ *     EXACTLY as before this change.
+ * approverId returned is L1 (the current pending approver; currentLevel=1).
+ */
+async function resolveApprovalChain(
+  workspaceId: mongoose.Types.ObjectId,
+  submitterId: mongoose.Types.ObjectId,
+  totalAmount: number,
+): Promise<{
+  chain: IApprovalChainLevel[];
+  approverId: mongoose.Types.ObjectId | null;
+  approver: any | null;
+}> {
+  const l1 = await resolveL1Approver(workspaceId, submitterId);
+  if (!l1.id) return { chain: [], approverId: null, approver: null };
+
+  const chain: IApprovalChainLevel[] = [
+    { level: 1, approverId: l1.id, status: "pending", decidedAt: null, note: null },
+  ];
+
+  // L2 escalation — gated on a configured threshold the claim total exceeds.
+  const ws: any = await CustomerWorkspace.findById(workspaceId)
+    .select("config.expenseEscalationThreshold config.seniorApproverId")
+    .lean();
+  const threshold = ws?.config?.expenseEscalationThreshold;
+  if (threshold != null && Number(totalAmount) > Number(threshold)) {
+    const l2 = await resolveL2Approver(workspaceId, l1.user, ws?.config?.seniorApproverId, [
+      String(submitterId),
+      String(l1.id),
+    ]);
+    if (l2) {
+      chain.push({ level: 2, approverId: l2._id, status: "pending", decidedAt: null, note: null });
+    }
+  }
+
+  return { chain, approverId: l1.id, approver: l1.user };
+}
+
+/**
+ * report.status → the per-level disposition to stamp when lazy-initialising a
+ * length-1 chain for a legacy in-flight claim (one that predates the chain
+ * field). Mirrors the claim's own decision so the synthesized L1 step is
+ * consistent with where the claim already sits.
+ */
+function chainLevelStatusForReport(status: ReportStatus | null): ChainLevelStatus {
+  switch (status) {
+    case "approved":
+    case "reimbursed":
+      return "approved";
+    case "declined":
+      return "declined";
+    case "clarification_required":
+      return "clarification_required";
+    default:
+      return "pending"; // submitted / draft
+  }
+}
+
+/**
+ * Lazy-init a length-1 approval chain for a legacy claim that has an approverId
+ * but no chain yet (predates Phase 2). Idempotent: a no-op once a chain exists
+ * or when there is nothing to backfill (a draft with no approver). Persists
+ * best-effort — a save failure is swallowed so it can never break a read. Does
+ * NOT change report.status or approverId, so approve/decline behave unchanged.
+ */
+export async function ensureApprovalChain(report: IReport): Promise<IReport> {
+  if (!report) return report;
+  if (Array.isArray(report.approvalChain) && report.approvalChain.length > 0) return report;
+  if (!report.approverId) return report; // draft / never submitted — nothing to backfill
+
+  report.approvalChain = [
+    {
+      level: 1,
+      approverId: report.approverId,
+      status: chainLevelStatusForReport(report.status),
+      decidedAt: report.status === "submitted" ? null : report.approvedAt ?? report.updatedAt ?? null,
+      note: report.decisionNote ?? null,
+    },
+  ];
+  report.currentLevel = 1;
+
+  try {
+    await report.save();
+  } catch (err: any) {
+    console.error("[ensureApprovalChain]", err?.message || err);
+  }
+  return report;
 }
 
 // Flat shape (optional fields) rather than a discriminated union: this package
@@ -417,7 +572,12 @@ export async function submitReport(
   // No manager AND no eligible workspace admin → refuse like a blocking
   // validation failure (the claim stays a draft instead of stranding in
   // awaiting_approval with nobody able to act). Returns BEFORE any mutation.
-  const { id: approverId, user: approver } = await resolveApprover(ws, emp);
+  //
+  // resolveApprovalChain also appends an L2 level when the workspace escalation
+  // threshold is set and this claim's total exceeds it; with the threshold OFF
+  // the chain is length 1 and this stamps exactly as before. approverId is the
+  // L1 (current pending) approver — the denorm pointer the queues already read.
+  const { chain, approverId, approver } = await resolveApprovalChain(ws, emp, totalAmount);
   if (!approverId) {
     return {
       ok: false,
@@ -428,6 +588,8 @@ export async function submitReport(
       warnings,
     };
   }
+  report.approvalChain = chain;
+  report.currentLevel = 1;
   report.approverId = approverId;
   report.status = "submitted";
   report.submittedAt = new Date();

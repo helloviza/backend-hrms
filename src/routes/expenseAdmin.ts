@@ -25,6 +25,7 @@ import express from "express";
 import mongoose from "mongoose";
 import { isAdmin, isFinance, userIdOf } from "../services/expense.access.js";
 import User from "../models/User.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 
 const router = express.Router();
 
@@ -242,6 +243,103 @@ router.patch("/users/:id/manager", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[ExpenseAdmin manager]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to update manager" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /api/expense-admin/policy
+ * The workspace's expense approval-escalation policy (Phase 2). null threshold
+ * = OFF (single-approver). Workspace-scoped; isAdmin gate (router-level).
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/policy", async (req: any, res: any) => {
+  try {
+    const ws: any = await CustomerWorkspace.findById(req.workspaceObjectId)
+      .select("config.expenseEscalationThreshold config.seniorApproverId")
+      .lean();
+    res.json({
+      ok: true,
+      policy: {
+        expenseEscalationThreshold: ws?.config?.expenseEscalationThreshold ?? null,
+        seniorApproverId: ws?.config?.seniorApproverId ? String(ws.config.seniorApproverId) : null,
+      },
+    });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin policy GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load policy" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * PATCH /api/expense-admin/policy  { expenseEscalationThreshold?, seniorApproverId? }
+ * Only the keys present are touched. Threshold: a non-negative number, or
+ * null/"" to turn escalation OFF. seniorApproverId: a user in THIS workspace,
+ * or null/"" to clear. Workspace-scoped; isAdmin gate (router-level).
+ * ───────────────────────────────────────────────────────────────────── */
+router.patch("/policy", async (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const update: Record<string, any> = {};
+
+    if ("expenseEscalationThreshold" in b) {
+      const raw = b.expenseEscalationThreshold;
+      if (raw === null || raw === undefined || String(raw).trim() === "") {
+        update["config.expenseEscalationThreshold"] = null; // OFF
+      } else {
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n < 0) {
+          return res
+            .status(400)
+            .json({ error: "expenseEscalationThreshold must be a non-negative number, or null to disable." });
+        }
+        update["config.expenseEscalationThreshold"] = n;
+      }
+    }
+
+    if ("seniorApproverId" in b) {
+      const raw = b.seniorApproverId;
+      if (raw === null || raw === undefined || String(raw).trim() === "") {
+        update["config.seniorApproverId"] = null;
+      } else {
+        if (!mongoose.Types.ObjectId.isValid(String(raw))) {
+          return res.status(400).json({ error: "Invalid seniorApproverId" });
+        }
+        // Must be a user in THIS workspace (never cross-workspace).
+        const u: any = await User.findOne({
+          _id: new mongoose.Types.ObjectId(String(raw)),
+          workspaceId: req.workspaceObjectId,
+        })
+          .select("_id")
+          .lean();
+        if (!u) return res.status(400).json({ error: "Senior approver must be a user in this workspace." });
+        update["config.seniorApproverId"] = u._id;
+      }
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res
+        .status(400)
+        .json({ error: "Nothing to change (pass expenseEscalationThreshold and/or seniorApproverId)." });
+    }
+
+    const ws: any = await CustomerWorkspace.findOneAndUpdate(
+      { _id: req.workspaceObjectId },
+      { $set: update },
+      { new: true },
+    )
+      .select("config.expenseEscalationThreshold config.seniorApproverId")
+      .lean();
+    if (!ws) return res.status(404).json({ error: "Workspace not found" });
+
+    res.json({
+      ok: true,
+      policy: {
+        expenseEscalationThreshold: ws?.config?.expenseEscalationThreshold ?? null,
+        seniorApproverId: ws?.config?.seniorApproverId ? String(ws.config.seniorApproverId) : null,
+      },
+    });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin policy PATCH]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to update policy" });
   }
 });
 
