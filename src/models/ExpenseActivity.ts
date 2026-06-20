@@ -68,6 +68,9 @@ const ExpenseActivitySchema = new Schema<IExpenseActivity>(
 ExpenseActivitySchema.index({ reportId: 1, createdAt: 1 });
 // Tenant scope.
 ExpenseActivitySchema.index({ workspaceId: 1 });
+// Analytics scan: cycle-time + policy-flag aggregation matches by workspace and
+// filters to a small set of lifecycle events (GET /api/expenses/analytics).
+ExpenseActivitySchema.index({ workspaceId: 1, event: 1 });
 
 ExpenseActivitySchema.plugin(workspaceScopePlugin);
 
