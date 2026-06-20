@@ -27,12 +27,22 @@ function norm(v: any): string {
 /**
  * Broad staff-admin set — preserves the legacy "see all + act" behavior that the
  * old FINANCE_ADMIN_ROLES / requireAdmin sets granted.
+ *
+ * WORKSPACE_LEADER is included as a deliberate policy: a customer workspace
+ * leader is the full expense-admin for THEIR OWN workspace (Team / Categories /
+ * Analytics + reimburse + approval override + configure). Tenant scoping
+ * (req.workspaceObjectId on every query) already confines that authority to
+ * their own workspace. This set is EXPENSE-LOCAL — it is only consulted by the
+ * expense module (expenses / expenseReports / expenseAdmin / expenseCategories /
+ * reports.service), NOT by the platform-wide requireAdmin (middleware/rbac.ts),
+ * so this does not elevate workspace leaders anywhere outside expenses.
  */
 export const ADMIN_ROLES = [
   "ADMIN",
   "SUPERADMIN",
   "TENANT_ADMIN",
   "WORKSPACE_ADMIN",
+  "WORKSPACE_LEADER",
   "HR",
   "HR_ADMIN",
   "OPS",
