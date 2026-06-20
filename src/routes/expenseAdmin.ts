@@ -254,13 +254,14 @@ router.patch("/users/:id/manager", async (req: any, res: any) => {
 router.get("/policy", async (req: any, res: any) => {
   try {
     const ws: any = await CustomerWorkspace.findById(req.workspaceObjectId)
-      .select("config.expenseEscalationThreshold config.seniorApproverId")
+      .select("config.expenseEscalationThreshold config.seniorApproverId config.advanceEscalationThreshold")
       .lean();
     res.json({
       ok: true,
       policy: {
         expenseEscalationThreshold: ws?.config?.expenseEscalationThreshold ?? null,
         seniorApproverId: ws?.config?.seniorApproverId ? String(ws.config.seniorApproverId) : null,
+        advanceEscalationThreshold: ws?.config?.advanceEscalationThreshold ?? null,
       },
     });
   } catch (err: any) {
@@ -295,6 +296,21 @@ router.patch("/policy", async (req: any, res: any) => {
       }
     }
 
+    if ("advanceEscalationThreshold" in b) {
+      const raw = b.advanceEscalationThreshold;
+      if (raw === null || raw === undefined || String(raw).trim() === "") {
+        update["config.advanceEscalationThreshold"] = null; // OFF
+      } else {
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n < 0) {
+          return res
+            .status(400)
+            .json({ error: "advanceEscalationThreshold must be a non-negative number, or null to disable." });
+        }
+        update["config.advanceEscalationThreshold"] = n;
+      }
+    }
+
     if ("seniorApproverId" in b) {
       const raw = b.seniorApproverId;
       if (raw === null || raw === undefined || String(raw).trim() === "") {
@@ -318,7 +334,10 @@ router.patch("/policy", async (req: any, res: any) => {
     if (Object.keys(update).length === 0) {
       return res
         .status(400)
-        .json({ error: "Nothing to change (pass expenseEscalationThreshold and/or seniorApproverId)." });
+        .json({
+          error:
+            "Nothing to change (pass expenseEscalationThreshold, advanceEscalationThreshold and/or seniorApproverId).",
+        });
     }
 
     const ws: any = await CustomerWorkspace.findOneAndUpdate(
@@ -326,7 +345,7 @@ router.patch("/policy", async (req: any, res: any) => {
       { $set: update },
       { new: true },
     )
-      .select("config.expenseEscalationThreshold config.seniorApproverId")
+      .select("config.expenseEscalationThreshold config.seniorApproverId config.advanceEscalationThreshold")
       .lean();
     if (!ws) return res.status(404).json({ error: "Workspace not found" });
 
@@ -335,6 +354,7 @@ router.patch("/policy", async (req: any, res: any) => {
       policy: {
         expenseEscalationThreshold: ws?.config?.expenseEscalationThreshold ?? null,
         seniorApproverId: ws?.config?.seniorApproverId ? String(ws.config.seniorApproverId) : null,
+        advanceEscalationThreshold: ws?.config?.advanceEscalationThreshold ?? null,
       },
     });
   } catch (err: any) {

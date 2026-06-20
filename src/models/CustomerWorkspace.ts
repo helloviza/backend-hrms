@@ -19,6 +19,9 @@ export interface WorkspaceFeatures {
   analyticsEnabled: boolean;
   expenseBandEnabled: boolean;
   expensesEnabled?: boolean;
+  // Cash advances (System B). Opt-in per workspace; REQUIRES expensesEnabled.
+  // Schema default false; NOT auto-seeded by getDefaultFeaturesForPlan.
+  advancesEnabled?: boolean;
   travelFormEnabled?: boolean;
 
   // Coarse-grained module flags (Phase 1 SaaS tiering)
@@ -95,8 +98,14 @@ export interface CustomerWorkspaceDocument extends Document {
     // amount gets a second approval level appended at submit.
     expenseEscalationThreshold?: number | null;
     // Preferred L2 approver when escalating, before the manager's-manager / admin
-    // fallback. Optional.
+    // fallback. Optional. Shared by claims AND advances.
     seniorApproverId?: Schema.Types.ObjectId | null;
+
+    // Advance approval escalation (System B). null = OFF: advances route to a
+    // single approver. When set, an advance whose AMOUNT exceeds this gets a
+    // second approval level appended at request. Independent of the claim
+    // (expense) escalation threshold above.
+    advanceEscalationThreshold?: number | null;
   };
 
   // Subscription / billing
@@ -248,6 +257,9 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
       // Expense escalation threshold — null = OFF (single-approver, unchanged).
       expenseEscalationThreshold: { type: Number, default: null },
       seniorApproverId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+      // Advance escalation threshold — null = OFF (single-approver). Independent
+      // of the claim threshold above; gates the L2 step on the advance amount.
+      advanceEscalationThreshold: { type: Number, default: null },
       features: {
         sbtEnabled: { type: Boolean, default: false },
         approvalFlowEnabled: { type: Boolean, default: true },
@@ -270,6 +282,10 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         // backfill sets this true on every pre-existing workspace before the
         // route gate ships (see scripts/backfill-expenses-feature.ts).
         expensesEnabled: { type: Boolean, default: false },
+        // Cash advances (System B). Opt-in per workspace, gated BEHIND
+        // expensesEnabled by the route mount. SCHEMA DEFAULT false and NOT seeded
+        // by getDefaultFeaturesForPlan — granted only by superadmin toggle.
+        advancesEnabled: { type: Boolean, default: false },
         travelFormEnabled: { type: Boolean, default: false },
 
         // Coarse-grained module flags (Phase 1 SaaS tiering)
