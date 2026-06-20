@@ -32,6 +32,8 @@ import { env } from "../config/env.js";
 import Expense from "../models/Expense.js";
 import ExpenseCategory from "../models/ExpenseCategory.js";
 import Report from "../models/Report.js";
+import ExpenseActivity from "../models/ExpenseActivity.js";
+import User from "../models/User.js";
 
 const router = express.Router();
 
@@ -464,6 +466,363 @@ router.get("/summary", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[Expenses summary]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load summary" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /api/expenses/analytics?dateFrom=&dateTo=
+ * Workspace-wide expense analytics for finance/admin (seesAll). Returns
+ * KPI + chart + table blocks via Mongo aggregation. ALL blocks are explicitly
+ * tenant-scoped (workspaceId stamped — the workspaceScope plugin does NOT hook
+ * .aggregate()) and respect the date range.
+ *
+ * Range semantics:
+ *   • Spend / category / status / channel / merchant / spender blocks → on
+ *     Expense.date (matches buildExpenseFilter + /summary).
+ *   • Awaiting-reimbursement → approved claims whose approvedAt is in range.
+ *   • Approval / reimburse cycle times + policy-flag rate → ExpenseActivity
+ *     event timestamps (submit→approve, approve→reimburse, policy_check).
+ *
+ * Declared BEFORE GET /:id so ":id" never captures "analytics".
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/analytics", async (req: any, res: any) => {
+  try {
+    // Workspace-wide view is finance/admin only — never leak teammates' spend.
+    if (!seesAllExpenses(req)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const workspaceId = req.workspaceObjectId as mongoose.Types.ObjectId;
+    if (!workspaceId) {
+      return res.status(400).json({ error: "Missing workspace context" });
+    }
+
+    const pad = (n: number) => String(n).padStart(2, "0");
+
+    // Default range = last 12 IST calendar months (inclusive) when unspecified,
+    // so the charts always have a meaningful window.
+    const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+    const iy = nowIst.getUTCFullYear();
+    const im = nowIst.getUTCMonth(); // 0-based
+    const defFrom = new Date(Date.UTC(iy, im - 11, 1));
+    const dateFromStr = req.query.dateFrom
+      ? String(req.query.dateFrom)
+      : `${defFrom.getUTCFullYear()}-${pad(defFrom.getUTCMonth() + 1)}-01`;
+    const dateToStr = req.query.dateTo
+      ? String(req.query.dateTo)
+      : `${iy}-${pad(im + 1)}-${pad(nowIst.getUTCDate())}`;
+
+    const rangeStart = parseISTStart(dateFromStr);
+    const rangeEnd = parseISTEnd(dateToStr);
+
+    const sumAmount = { $sum: { $ifNull: ["$amount", 0] } };
+    const expMatch = {
+      workspaceId,
+      date: { $gte: rangeStart, $lte: rangeEnd },
+    };
+
+    // lifecycleStatus bucket expression — mirrors /summary (LOOSE pending vs the
+    // derived "in_claim" when a pending expense sits in a draft/clarif claim).
+    const statusBucket = {
+      $cond: [
+        {
+          $and: [
+            { $eq: [{ $ifNull: ["$lifecycleStatus", "pending_to_submit"] }, "pending_to_submit"] },
+            { $ne: ["$reportId", null] },
+          ],
+        },
+        "in_claim",
+        { $ifNull: ["$lifecycleStatus", "pending_to_submit"] },
+      ],
+    };
+
+    /* ── Block 1: expense-based aggregation (single pass, faceted) ──────── */
+    const [expAgg] = await Expense.aggregate([
+      { $match: expMatch },
+      // Resolve a display category label: managed name → AI hint → Uncategorized.
+      {
+        $lookup: {
+          from: ExpenseCategory.collection.name,
+          localField: "categoryId",
+          foreignField: "_id",
+          as: "_cat",
+        },
+      },
+      {
+        $addFields: {
+          categoryLabel: {
+            $ifNull: [
+              { $arrayElemAt: ["$_cat.name", 0] },
+              { $ifNull: ["$suggestedCategory", "Uncategorized"] },
+            ],
+          },
+        },
+      },
+      {
+        $facet: {
+          totals: [{ $group: { _id: null, amount: sumAmount, count: { $sum: 1 } } }],
+          byMonthCat: [
+            {
+              $group: {
+                _id: {
+                  month: {
+                    $dateToString: {
+                      format: "%Y-%m",
+                      date: { $ifNull: ["$date", "$createdAt"] },
+                      timezone: "Asia/Kolkata",
+                    },
+                  },
+                  category: "$categoryLabel",
+                },
+                amount: sumAmount,
+              },
+            },
+          ],
+          byCategory: [
+            { $group: { _id: "$categoryLabel", amount: sumAmount, count: { $sum: 1 } } },
+            { $sort: { amount: -1 } },
+          ],
+          byStatus: [
+            { $group: { _id: statusBucket, amount: sumAmount, count: { $sum: 1 } } },
+          ],
+          byChannel: [
+            {
+              $group: {
+                _id: { $ifNull: ["$sourceChannel", "whatsapp"] },
+                amount: sumAmount,
+                count: { $sum: 1 },
+              },
+            },
+          ],
+          topSpenders: [
+            {
+              $group: {
+                _id: "$employeeId",
+                amount: sumAmount,
+                reportIds: { $addToSet: "$reportId" },
+              },
+            },
+            {
+              $project: {
+                amount: 1,
+                claims: {
+                  $size: {
+                    $filter: { input: "$reportIds", cond: { $ne: ["$$this", null] } },
+                  },
+                },
+              },
+            },
+            { $sort: { amount: -1 } },
+            { $limit: 10 },
+          ],
+          topMerchants: [
+            { $match: { merchant: { $nin: [null, ""] } } },
+            { $group: { _id: "$merchant", amount: sumAmount, expenses: { $sum: 1 } } },
+            { $sort: { amount: -1 } },
+            { $limit: 10 },
+          ],
+        },
+      },
+    ]);
+
+    const totals = expAgg?.totals?.[0] || { amount: 0, count: 0 };
+
+    // Spend over time — fill every month in range so the area chart has no gaps.
+    const months: string[] = [];
+    {
+      const [fy, fm] = dateFromStr.split("-").map(Number);
+      const [ty, tm] = dateToStr.split("-").map(Number);
+      let y = fy;
+      let m = fm;
+      while (y < ty || (y === ty && m <= tm)) {
+        months.push(`${y}-${pad(m)}`);
+        m++;
+        if (m > 12) {
+          m = 1;
+          y++;
+        }
+      }
+    }
+    const monthIdx = new Map<string, { month: string; total: number; categories: Record<string, number> }>();
+    months.forEach((mo) => monthIdx.set(mo, { month: mo, total: 0, categories: {} }));
+    (expAgg?.byMonthCat || []).forEach((r: any) => {
+      const mo = r._id?.month;
+      const bucket = monthIdx.get(mo);
+      if (!bucket) return; // outside range (null/odd dates) — ignore
+      const cat = r._id?.category || "Uncategorized";
+      const amt = r.amount || 0;
+      bucket.total += amt;
+      bucket.categories[cat] = (bucket.categories[cat] || 0) + amt;
+    });
+    const spendOverTime = months.map((mo) => monthIdx.get(mo)!);
+
+    const categories = (expAgg?.byCategory || []).map((c: any) => ({
+      name: c._id || "Uncategorized",
+      amount: c.amount || 0,
+      count: c.count || 0,
+    }));
+    const byStatus = (expAgg?.byStatus || []).map((s: any) => ({
+      status: s._id || "unknown",
+      amount: s.amount || 0,
+      count: s.count || 0,
+    }));
+    const channels = (expAgg?.byChannel || []).map((c: any) => ({
+      channel: c._id || "whatsapp",
+      amount: c.amount || 0,
+      count: c.count || 0,
+    }));
+
+    /* ── Block 2: resolve names for top spenders ──────────────────────── */
+    const topSpenderRaw = expAgg?.topSpenders || [];
+    const spenderIds = topSpenderRaw
+      .map((s: any) => s._id)
+      .filter((id: any) => id && mongoose.Types.ObjectId.isValid(String(id)));
+    const userMap = new Map<string, any>();
+    if (spenderIds.length) {
+      const users = await User.find({ _id: { $in: spenderIds } })
+        .select("firstName lastName name email")
+        .lean();
+      users.forEach((u: any) => userMap.set(String(u._id), u));
+    }
+    const topSpenders = topSpenderRaw.map((s: any) => ({
+      employeeId: String(s._id || ""),
+      name: employeeNameOf(userMap.get(String(s._id))) || "Unknown",
+      amount: s.amount || 0,
+      claims: s.claims || 0,
+    }));
+    const topMerchants = (expAgg?.topMerchants || []).map((m: any) => ({
+      merchant: m._id || "—",
+      amount: m.amount || 0,
+      expenses: m.expenses || 0,
+    }));
+
+    /* ── Block 3: awaiting reimbursement (approved, not yet reimbursed) ──
+     * LIVE snapshot — "what's owed right now". Deliberately IGNORES the date
+     * range (unlike every other block): finance needs the full current
+     * outstanding liability, not just claims approved within the window. The
+     * card is labelled "as of now" on the frontend to make this explicit. */
+    const [awaitAgg] = await Report.aggregate([
+      {
+        $match: {
+          workspaceId,
+          status: "approved",
+        },
+      },
+      {
+        $lookup: {
+          from: Expense.collection.name,
+          localField: "_id",
+          foreignField: "reportId",
+          as: "_exp",
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          count: { $sum: 1 },
+          amount: { $sum: { $sum: "$_exp.amount" } },
+        },
+      },
+    ]);
+    const awaitingReimbursement = {
+      amount: awaitAgg?.amount || 0,
+      count: awaitAgg?.count || 0,
+    };
+
+    /* ── Block 4: cycle times + policy-flag rate (ExpenseActivity) ─────── */
+    // Per-claim terminal event timestamps. $max picks the latest of each event
+    // (handles resubmit → uses the final submit before approval). aggregate() is
+    // NOT scoped by the plugin, so workspaceId is matched explicitly.
+    const actAgg = await ExpenseActivity.aggregate([
+      {
+        $match: {
+          workspaceId,
+          event: { $in: ["submitted", "resubmitted", "approved", "reimbursed", "policy_check"] },
+        },
+      },
+      {
+        $group: {
+          _id: "$reportId",
+          submittedAt: {
+            $max: {
+              $cond: [{ $in: ["$event", ["submitted", "resubmitted"]] }, "$createdAt", null],
+            },
+          },
+          approvedAt: {
+            $max: { $cond: [{ $eq: ["$event", "approved"] }, "$createdAt", null] },
+          },
+          reimbursedAt: {
+            $max: { $cond: [{ $eq: ["$event", "reimbursed"] }, "$createdAt", null] },
+          },
+          hasPolicyFlag: {
+            $max: { $cond: [{ $eq: ["$event", "policy_check"] }, 1, 0] },
+          },
+        },
+      },
+    ]);
+
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const inRange = (d: any) => d && d >= rangeStart && d <= rangeEnd;
+
+    let approvalSum = 0;
+    let approvalN = 0;
+    let reimburseSum = 0;
+    let reimburseN = 0;
+    let submittedN = 0;
+    let flaggedN = 0;
+    for (const r of actAgg) {
+      const sub = r.submittedAt ? new Date(r.submittedAt) : null;
+      const app = r.approvedAt ? new Date(r.approvedAt) : null;
+      const rei = r.reimbursedAt ? new Date(r.reimbursedAt) : null;
+
+      // Policy-flag rate: among claims SUBMITTED in range.
+      if (inRange(sub)) {
+        submittedN++;
+        if (r.hasPolicyFlag) flaggedN++;
+      }
+      // Submit → approve: claims APPROVED in range with a prior submit.
+      if (inRange(app) && sub && app! >= sub) {
+        approvalSum += app!.getTime() - sub.getTime();
+        approvalN++;
+      }
+      // Approve → reimburse: claims REIMBURSED in range with a prior approve.
+      if (inRange(rei) && app && rei! >= app) {
+        reimburseSum += rei!.getTime() - app.getTime();
+        reimburseN++;
+      }
+    }
+
+    const round1 = (n: number) => Math.round(n * 10) / 10;
+    const avgApprovalDays = approvalN > 0 ? round1(approvalSum / approvalN / DAY_MS) : null;
+    const avgReimburseDays = reimburseN > 0 ? round1(reimburseSum / reimburseN / DAY_MS) : null;
+    const policyFlagRate = submittedN > 0 ? flaggedN / submittedN : null;
+
+    res.json({
+      ok: true,
+      range: { dateFrom: dateFromStr, dateTo: dateToStr },
+      kpis: {
+        totalSpend: totals.amount || 0,
+        totalCount: totals.count || 0,
+        awaitingReimbursement,
+        avgApprovalDays,
+        policyFlagRate,
+      },
+      spendOverTime,
+      categories,
+      byStatus,
+      channels,
+      topSpenders,
+      topMerchants,
+      cycleTimes: {
+        submitToApproveDays: avgApprovalDays,
+        approveToReimburseDays: avgReimburseDays,
+        approvalSampleSize: approvalN,
+        reimburseSampleSize: reimburseN,
+      },
+    });
+  } catch (err: any) {
+    console.error("[Expenses analytics]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load analytics" });
   }
 });
 
