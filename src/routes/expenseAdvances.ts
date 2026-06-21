@@ -38,6 +38,7 @@ import Report from "../models/Report.js";
 import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseActivity.js";
 import User from "../models/User.js";
 import { refFromId } from "../utils/refFromId.js";
+import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { sendAdvanceSubmittedEmail } from "../utils/advanceEmails.js";
 
 const router = express.Router();
@@ -230,6 +231,252 @@ router.get("/pending-count", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[Advances pending-count]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load count" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /api/expense-advances/analytics?dateFrom=&dateTo=
+ * Workspace-wide ADVANCES reporting for finance/admin (seesAll). Returns the
+ * cash-advance liability picture: a point-in-time liability snapshot, a "to
+ * whom" by-employee outstanding table, aging buckets, a date-ranged settlement
+ * cycle, and recovery totals.
+ *
+ * Tenant isolation (NON-NEGOTIABLE): the workspaceScope plugin does NOT hook
+ * .aggregate(), so EVERY aggregation pipeline matches workspaceId explicitly.
+ *
+ * Range semantics (mirrors /api/expenses/analytics):
+ *   • Liability snapshot + by-employee + aging → POINT-IN-TIME (ignore range):
+ *     finance needs the FULL current outstanding liability, not a windowed slice.
+ *   • Cycle (disbursed/settled in period, avgSettleDays) + recovery → date-ranged
+ *     on disbursedAt / derived settledAt / recoveredAt.
+ *
+ * Declared BEFORE GET /:id so ":id" never captures "analytics".
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/analytics", async (req: any, res: any) => {
+  try {
+    // Workspace-wide view is finance/admin only — never leak who owes what.
+    if (!seesAllAdvances(req)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const workspaceId = req.workspaceObjectId as mongoose.Types.ObjectId;
+    if (!workspaceId) {
+      return res.status(400).json({ error: "Missing workspace context" });
+    }
+
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const round2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+    const round1 = (n: number) => Math.round((Number(n) || 0) * 10) / 10;
+
+    // Default range = last 12 IST calendar months (inclusive) when unspecified.
+    const nowMs = Date.now();
+    const nowIst = new Date(nowMs + 5.5 * 60 * 60 * 1000);
+    const iy = nowIst.getUTCFullYear();
+    const im = nowIst.getUTCMonth(); // 0-based
+    const defFrom = new Date(Date.UTC(iy, im - 11, 1));
+    const dateFromStr = req.query.dateFrom
+      ? String(req.query.dateFrom)
+      : `${defFrom.getUTCFullYear()}-${pad(defFrom.getUTCMonth() + 1)}-01`;
+    const dateToStr = req.query.dateTo
+      ? String(req.query.dateTo)
+      : `${iy}-${pad(im + 1)}-${pad(nowIst.getUTCDate())}`;
+    const rangeStart = parseISTStart(dateFromStr);
+    const rangeEnd = parseISTEnd(dateToStr);
+
+    // Statuses that have reached disbursement (amountDisbursed/outstanding are
+    // only meaningful once an advance is disbursed).
+    const DISBURSED_PLUS = ["disbursed", "partially_settled", "settled"];
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    /* ── Block 1: LIABILITY SNAPSHOT (point-in-time, ignores range) ────── */
+    const [snapAgg] = await ExpenseAdvance.aggregate([
+      { $match: { workspaceId, status: { $in: DISBURSED_PLUS } } },
+      {
+        $facet: {
+          totals: [
+            {
+              $group: {
+                _id: null,
+                totalDisbursed: { $sum: { $ifNull: ["$amountDisbursed", 0] } },
+                totalOutstanding: { $sum: { $ifNull: ["$outstandingBalance", 0] } },
+                countOutstanding: {
+                  $sum: { $cond: [{ $gt: [{ $ifNull: ["$outstandingBalance", 0] }, 0] }, 1, 0] },
+                },
+              },
+            },
+          ],
+          settled: [
+            { $unwind: "$settlements" },
+            { $match: { "settlements.status": "settled" } },
+            {
+              $group: {
+                _id: null,
+                totalSettled: { $sum: { $ifNull: ["$settlements.settledAmount", 0] } },
+              },
+            },
+          ],
+          recovered: [
+            { $unwind: "$recoveries" },
+            {
+              $group: {
+                _id: null,
+                totalRecovered: { $sum: { $ifNull: ["$recoveries.amount", 0] } },
+              },
+            },
+          ],
+        },
+      },
+    ]);
+    const snapTotals = snapAgg?.totals?.[0] || {};
+    const liability = {
+      totalDisbursed: round2(snapTotals.totalDisbursed || 0),
+      totalOutstanding: round2(snapTotals.totalOutstanding || 0),
+      totalSettled: round2(snapAgg?.settled?.[0]?.totalSettled || 0),
+      totalRecovered: round2(snapAgg?.recovered?.[0]?.totalRecovered || 0),
+      countOutstanding: snapTotals.countOutstanding || 0,
+    };
+
+    /* ── Block 2: BY-EMPLOYEE OUTSTANDING ("to whom") ──────────────────── */
+    const byEmpRaw = await ExpenseAdvance.aggregate([
+      { $match: { workspaceId, status: { $in: DISBURSED_PLUS }, outstandingBalance: { $gt: 0 } } },
+      {
+        $group: {
+          _id: "$requesterId",
+          count: { $sum: 1 },
+          outstanding: { $sum: { $ifNull: ["$outstandingBalance", 0] } },
+          oldestDisbursedAt: { $min: "$disbursedAt" },
+        },
+      },
+      { $sort: { outstanding: -1 } },
+    ]);
+    const empIds = byEmpRaw
+      .map((r: any) => r._id)
+      .filter((id: any) => id && mongoose.Types.ObjectId.isValid(String(id)));
+    const empMap = new Map<string, any>();
+    if (empIds.length) {
+      const users = await User.find({ _id: { $in: empIds } })
+        .select("firstName lastName name email")
+        .lean();
+      users.forEach((u: any) => empMap.set(String(u._id), u));
+    }
+    const byEmployee = byEmpRaw.map((r: any) => {
+      const u = empMap.get(String(r._id));
+      return {
+        employeeId: String(r._id || ""),
+        employeeName: employeeNameOf(u) || "Unknown",
+        employeeEmail: (u && u.email) || "",
+        count: r.count || 0,
+        outstanding: round2(r.outstanding || 0),
+        oldestDisbursedAt: r.oldestDisbursedAt || null,
+      };
+    });
+
+    /* ── Block 3: AGING BUCKETS (point-in-time, days since disbursedAt) ── */
+    const outstandingDocs = await ExpenseAdvance.find({
+      workspaceId,
+      status: { $in: DISBURSED_PLUS },
+      outstandingBalance: { $gt: 0 },
+    })
+      .select("disbursedAt outstandingBalance")
+      .lean();
+    const aging = {
+      "0-7": { count: 0, outstanding: 0 },
+      "8-30": { count: 0, outstanding: 0 },
+      "30+": { count: 0, outstanding: 0 },
+    };
+    for (const a of outstandingDocs) {
+      const disbursedAt = (a as any).disbursedAt ? new Date((a as any).disbursedAt) : null;
+      const days = disbursedAt ? (nowMs - disbursedAt.getTime()) / DAY_MS : Infinity;
+      const bucket = days <= 7 ? "0-7" : days <= 30 ? "8-30" : "30+";
+      aging[bucket].count += 1;
+      aging[bucket].outstanding += Number((a as any).outstandingBalance) || 0;
+    }
+    aging["0-7"].outstanding = round2(aging["0-7"].outstanding);
+    aging["8-30"].outstanding = round2(aging["8-30"].outstanding);
+    aging["30+"].outstanding = round2(aging["30+"].outstanding);
+
+    /* ── Block 4: CYCLE (date-ranged) ──────────────────────────────────── */
+    // Disbursed in period — Σ amountDisbursed + count where disbursedAt in range.
+    const [disbAgg] = await ExpenseAdvance.aggregate([
+      {
+        $match: {
+          workspaceId,
+          status: { $in: DISBURSED_PLUS },
+          disbursedAt: { $gte: rangeStart, $lte: rangeEnd },
+        },
+      },
+      { $group: { _id: null, amount: { $sum: { $ifNull: ["$amountDisbursed", 0] } }, count: { $sum: 1 } } },
+    ]);
+    const disbursedInPeriod = {
+      amount: round2(disbAgg?.amount || 0),
+      count: disbAgg?.count || 0,
+    };
+
+    // Settled in period + avg settle days. The advance has no settledAt field, so
+    // we DERIVE the moment outstanding hit 0 = the latest settling event (a
+    // settled settlement's settledAt or a recovery's recoveredAt).
+    const settledDocs = await ExpenseAdvance.find({ workspaceId, status: "settled" })
+      .select("disbursedAt settlements recoveries")
+      .lean();
+    let settledInPeriod = 0;
+    let settleDaysSum = 0;
+    let settleDaysN = 0;
+    for (const a of settledDocs) {
+      let settledMs = 0;
+      for (const s of ((a as any).settlements || [])) {
+        if (s?.status === "settled" && s?.settledAt) {
+          settledMs = Math.max(settledMs, new Date(s.settledAt).getTime());
+        }
+      }
+      for (const r of ((a as any).recoveries || [])) {
+        if (r?.recoveredAt) settledMs = Math.max(settledMs, new Date(r.recoveredAt).getTime());
+      }
+      if (!settledMs) continue; // can't place it in time — skip
+      const settledAt = new Date(settledMs);
+      if (settledAt < rangeStart || settledAt > rangeEnd) continue;
+      settledInPeriod += 1;
+      const disbursedAt = (a as any).disbursedAt ? new Date((a as any).disbursedAt) : null;
+      if (disbursedAt && settledMs >= disbursedAt.getTime()) {
+        settleDaysSum += (settledMs - disbursedAt.getTime()) / DAY_MS;
+        settleDaysN += 1;
+      }
+    }
+    const avgSettleDays = settleDaysN > 0 ? round1(settleDaysSum / settleDaysN) : null;
+
+    /* ── Block 5: RECOVERY (date-ranged) ───────────────────────────────── */
+    const [recAgg] = await ExpenseAdvance.aggregate([
+      { $match: { workspaceId } },
+      { $unwind: "$recoveries" },
+      { $match: { "recoveries.recoveredAt": { $gte: rangeStart, $lte: rangeEnd } } },
+      {
+        $group: {
+          _id: null,
+          totalRecovered: { $sum: { $ifNull: ["$recoveries.amount", 0] } },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+    const recovery = {
+      totalRecovered: round2(recAgg?.totalRecovered || 0),
+      count: recAgg?.count || 0,
+    };
+
+    res.json({
+      ok: true,
+      range: { dateFrom: dateFromStr, dateTo: dateToStr },
+      liability,
+      byEmployee,
+      aging,
+      cycle: {
+        disbursedInPeriod,
+        settledInPeriod,
+        avgSettleDays,
+      },
+      recovery,
+    });
+  } catch (err: any) {
+    console.error("[Advances analytics]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load advances analytics" });
   }
 });
 
