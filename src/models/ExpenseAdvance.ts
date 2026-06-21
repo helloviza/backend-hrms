@@ -220,6 +220,12 @@ const ExpenseAdvanceSchema = new Schema<IExpenseAdvance>(
   { timestamps: true },
 );
 
+// Compound index for the finance reporting aggregations (GET /analytics):
+// the liability snapshot + by-employee outstanding + disbursed-in-period blocks
+// all match {workspaceId, status} and group/sort by requesterId. The
+// workspaceId+status prefix also covers the queue/pending-count filters.
+ExpenseAdvanceSchema.index({ workspaceId: 1, status: 1, requesterId: 1 });
+
 ExpenseAdvanceSchema.plugin(workspaceScopePlugin);
 
 const ExpenseAdvance =
