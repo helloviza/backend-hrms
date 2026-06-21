@@ -625,12 +625,17 @@ router.get("/export", async (req: any, res: any) => {
       // "CLM-06FF28 (₹5,000, earmarked); CLM-… (₹…, settled)" — one entry per
       // settlement (claim this advance is applied to): the applied/earmark amount
       // + the settlement state (earmarked until the claim reimburses, then settled).
+      // A reportId that DIDN'T resolve in this workspace is flagged "unresolved"
+      // (the derived ref is byte-identical to a real one, so a cross-workspace
+      // settlement must never read as a verified claim).
       const appliedToClaims = settlements
         .filter((s: any) => s?.reportId)
         .map((s: any) => {
-          const ref = claimRefById.get(String(s.reportId)) || derivedClaimRef(s.reportId);
+          const resolvedRef = claimRefById.get(String(s.reportId));
+          const ref = resolvedRef || derivedClaimRef(s.reportId);
           const state = s?.status === "settled" ? "settled" : "earmarked";
-          return `${ref} (${fmtINR(s.amountApplied)}, ${state})`;
+          const suffix = resolvedRef ? "" : ", unresolved";
+          return `${ref} (${fmtINR(s.amountApplied)}, ${state}${suffix})`;
         })
         .join("; ");
       return {
