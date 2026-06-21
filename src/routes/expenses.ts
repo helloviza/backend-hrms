@@ -33,6 +33,7 @@ import Expense from "../models/Expense.js";
 import ExpenseCategory from "../models/ExpenseCategory.js";
 import Report from "../models/Report.js";
 import ExpenseActivity from "../models/ExpenseActivity.js";
+import ExpenseAdvance from "../models/ExpenseAdvance.js";
 import User from "../models/User.js";
 
 const router = express.Router();
@@ -217,10 +218,23 @@ const EXPORT_COLUMNS: Col[] = [
   // columns (order preserved). Blank for loose expenses / no-advance claims. ──
   { key: "advanceApplied", label: "Advance Applied", money: true },
   { key: "netReimbursed", label: "Net Reimbursed", money: true },
+  // Advance cross-reference — the advance ref(s) + settled amount applied to this
+  // expense's parent claim (so finance can trace which advance settled which
+  // claim from the expenses file). Text, "; "-joined; blank when none.
+  { key: "advancesApplied", label: "Advances Applied" },
 ];
 
 function fmtDate(d: any): string {
   return d ? new Date(d).toLocaleDateString("en-IN") : "";
+}
+
+/** Inline money for the advance cross-reference cell, e.g. 5000 → "₹5,000". */
+function fmtINR(n: any): string {
+  const v = Math.round((Number(n) || 0) * 100) / 100;
+  return `₹${new Intl.NumberFormat("en-IN", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(v)}`;
 }
 
 function categoryNameOf(d: any): string {
@@ -249,6 +263,8 @@ function expenseToExportRow(
       claimTotal?: number;
     }
   >,
+  // reportId → "ADV-… (₹…); …" — advances applied to that claim (preformatted).
+  advancesByReport: Map<string, string>,
 ): Record<string, any> {
   const claim = d.reportId ? claimsById.get(String(d.reportId)) : null;
   return {
@@ -281,6 +297,10 @@ function expenseToExportRow(
         ? claim.reimbursedAmount
         : claim.claimTotal ?? ""
       : "",
+    // Advance ref(s) + settled amount applied to this expense's parent claim
+    // (claim-level, repeated across the claim's rows). Blank for loose expenses /
+    // claims with no advance applied.
+    advancesApplied: d.reportId ? advancesByReport.get(String(d.reportId)) || "" : "",
   };
 }
 
@@ -389,7 +409,38 @@ router.get("/export", async (req: any, res: any) => {
       );
     }
 
-    const rows = docs.map((d: any) => expenseToExportRow(d, claimsById));
+    // Advance cross-reference: in ONE batched query, find every advance whose
+    // settlements reference any of the export's claims, then build a
+    // reportId → "ADV-… (₹…); …" map (the advance ref + settled drawdown applied
+    // to that claim). Lets each expense row name the advance(s) on its claim.
+    const advancesByReport = new Map<string, string>();
+    if (reportIds.length) {
+      const reportObjIds = reportIds.map((rid) => new mongoose.Types.ObjectId(rid));
+      const reportIdSet = new Set(reportIds);
+      const advances = await ExpenseAdvance.find({
+        workspaceId: req.workspaceObjectId,
+        "settlements.reportId": { $in: reportObjIds },
+      })
+        .select("ref settlements")
+        .lean();
+      const partsByReport = new Map<string, string[]>();
+      advances.forEach((a: any) => {
+        const advRef = a.ref || `ADV-${String(a._id).slice(-6).toUpperCase()}`;
+        (Array.isArray(a.settlements) ? a.settlements : []).forEach((s: any) => {
+          const rid = s?.reportId ? String(s.reportId) : "";
+          if (!rid || !reportIdSet.has(rid)) return;
+          // Applied/earmark amount + settlement state (earmarked → settled).
+          const state = s?.status === "settled" ? "settled" : "earmarked";
+          const part = `${advRef} (${fmtINR(s.amountApplied)}, ${state})`;
+          const arr = partsByReport.get(rid);
+          if (arr) arr.push(part);
+          else partsByReport.set(rid, [part]);
+        });
+      });
+      partsByReport.forEach((parts, rid) => advancesByReport.set(rid, parts.join("; ")));
+    }
+
+    const rows = docs.map((d: any) => expenseToExportRow(d, claimsById, advancesByReport));
     const header = EXPORT_COLUMNS.map((c) => c.label);
 
     if (format === "csv") {

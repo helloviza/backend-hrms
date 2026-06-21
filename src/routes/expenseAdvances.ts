@@ -100,6 +100,22 @@ function round2(n: any): number {
   return Math.round((Number(n) || 0) * 100) / 100;
 }
 
+/** Inline money for the cross-reference cells, e.g. 5000 → "₹5,000" (en-IN
+ *  grouping, up to 2 dp, trailing zeros trimmed). */
+function fmtINR(n: any): string {
+  const v = round2(n);
+  return `₹${new Intl.NumberFormat("en-IN", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(v)}`;
+}
+
+/** Derived claim ref for a report id (matches refFromId / the expenses export):
+ *  CLM-XXXXXX = last 6 of the ObjectId, upper-cased. */
+function derivedClaimRef(reportId: any): string {
+  return `CLM-${String(reportId).slice(-6).toUpperCase()}`;
+}
+
 /** "partially_settled" → "Partially settled" (mirrors humanizeLifecycle). */
 function humanizeStatus(s: any): string {
   const v = String(s || "").replace(/_/g, " ");
@@ -574,6 +590,29 @@ router.get("/export", async (req: any, res: any) => {
       users.forEach((u: any) => userMap.set(String(u._id), u));
     }
 
+    // Resolve every claim (report) referenced by any advance's settlements[] to
+    // its CLM ref in ONE batched lookup (reportId → ref), so the "Applied To
+    // Claims" cell can name each claim this advance settled against.
+    const claimRefById = new Map<string, string>();
+    const settlementReportIds = [
+      ...new Set(
+        docs
+          .flatMap((a: any) => (Array.isArray(a.settlements) ? a.settlements : []))
+          .map((s: any) => s?.reportId)
+          .filter((id: any) => id && mongoose.Types.ObjectId.isValid(String(id)))
+          .map(String),
+      ),
+    ];
+    if (settlementReportIds.length) {
+      const claims = await Report.find({
+        workspaceId: req.workspaceObjectId,
+        _id: { $in: settlementReportIds.map((id) => new mongoose.Types.ObjectId(id)) },
+      })
+        .select("ref")
+        .lean();
+      claims.forEach((c: any) => claimRefById.set(String(c._id), c.ref || derivedClaimRef(c._id)));
+    }
+
     const rows = docs.map((a: any) => {
       const u = userMap.get(String(a.requesterId));
       const settlements = Array.isArray(a.settlements) ? a.settlements : [];
@@ -583,6 +622,17 @@ router.get("/export", async (req: any, res: any) => {
         0,
       );
       const recovered = recoveries.reduce((s: number, x: any) => s + (Number(x.amount) || 0), 0);
+      // "CLM-06FF28 (₹5,000, earmarked); CLM-… (₹…, settled)" — one entry per
+      // settlement (claim this advance is applied to): the applied/earmark amount
+      // + the settlement state (earmarked until the claim reimburses, then settled).
+      const appliedToClaims = settlements
+        .filter((s: any) => s?.reportId)
+        .map((s: any) => {
+          const ref = claimRefById.get(String(s.reportId)) || derivedClaimRef(s.reportId);
+          const state = s?.status === "settled" ? "settled" : "earmarked";
+          return `${ref} (${fmtINR(s.amountApplied)}, ${state})`;
+        })
+        .join("; ");
       return {
         ref: a.ref || "",
         requester: employeeNameOf(u) || "",
@@ -596,7 +646,7 @@ router.get("/export", async (req: any, res: any) => {
         settled: round2(settled),
         recovered: round2(recovered),
         outstanding: round2(a.outstandingBalance),
-        appliedToClaims: settlements.length,
+        appliedToClaims,
         requestedOn: fmtDate(a.createdAt),
         approvedOn: fmtDate(a.approvedAt),
       } as Record<string, any>;
