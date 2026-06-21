@@ -18,6 +18,7 @@
 
 import express from "express";
 import mongoose from "mongoose";
+import ExcelJS from "exceljs";
 import {
   seesAll,
   isFinance as isFinanceUser,
@@ -39,6 +40,7 @@ import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseAct
 import User from "../models/User.js";
 import { refFromId } from "../utils/refFromId.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
+import { csvRow } from "../utils/exportHelpers.js";
 import { sendAdvanceSubmittedEmail } from "../utils/advanceEmails.js";
 
 const router = express.Router();
@@ -66,6 +68,42 @@ function employeeNameOf(u: any): string {
 /** Acting user's display name for the activity log (falls back to "System"). */
 function actorNameOf(req: any): string {
   return employeeNameOf(req.user) || "System";
+}
+
+/* ── Export columns (single source of truth for CSV + XLSX) — one row per
+ * advance, mirroring the expenses export's Col shape + money flagging. ───── */
+type AdvCol = { key: string; label: string; money?: boolean };
+const ADV_EXPORT_COLUMNS: AdvCol[] = [
+  { key: "ref", label: "Ref" },
+  { key: "requester", label: "Requester" },
+  { key: "email", label: "Email" },
+  { key: "purpose", label: "Purpose" },
+  { key: "currency", label: "Currency" },
+  { key: "amount", label: "Amount", money: true },
+  { key: "status", label: "Status" },
+  { key: "disbursedAmount", label: "Disbursed Amount", money: true },
+  { key: "disbursedOn", label: "Disbursed On" },
+  { key: "settled", label: "Settled", money: true },
+  { key: "recovered", label: "Recovered", money: true },
+  { key: "outstanding", label: "Outstanding", money: true },
+  { key: "appliedToClaims", label: "Applied To Claims" },
+  { key: "requestedOn", label: "Requested On" },
+  { key: "approvedOn", label: "Approved On" },
+];
+
+/** IST-formatted date — matches the expenses export (toLocaleDateString en-IN). */
+function fmtDate(d: any): string {
+  return d ? new Date(d).toLocaleDateString("en-IN") : "";
+}
+
+function round2(n: any): number {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+/** "partially_settled" → "Partially settled" (mirrors humanizeLifecycle). */
+function humanizeStatus(s: any): string {
+  const v = String(s || "").replace(/_/g, " ");
+  return v ? v.charAt(0).toUpperCase() + v.slice(1) : "";
 }
 
 /* ── Activity / audit log for advances ───────────────────────────────
@@ -477,6 +515,125 @@ router.get("/analytics", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[Advances analytics]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load advances analytics" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /api/expense-advances/export?format=csv|xlsx
+ * Advances liability export — ONE row per advance. Mirrors the expenses export
+ * (GET /api/expenses/export): same format param, same CSV (text/csv) + XLSX
+ * (ExcelJS) handling, same content-type/content-disposition shape.
+ *
+ * Scoping (mirrors the list + expenses export): finance/admin (seesAll) get the
+ * whole workspace, optionally narrowed by ?scope=mine or ?requesterId=; a
+ * non-admin is FORCE-scoped to their own advances (any ?requesterId/scope=all is
+ * ignored). workspaceId is ALWAYS stamped. Honors ?status and ?dateFrom/?dateTo
+ * (on createdAt — when the advance was requested).
+ *
+ * Declared BEFORE GET /:id so ":id" never captures "export".
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/export", async (req: any, res: any) => {
+  try {
+    const format = req.query.format === "xlsx" ? "xlsx" : "csv";
+
+    // Build the same filter the list applies, with export-time date support.
+    const filter: Record<string, any> = { workspaceId: req.workspaceObjectId };
+    if (!seesAllAdvances(req)) {
+      // Non-admin: own advances only — ignore any requesterId/scope override.
+      filter.requesterId = new mongoose.Types.ObjectId(ownRequesterId(req));
+    } else {
+      const scope = String(req.query.scope || "");
+      if (scope === "mine") {
+        filter.requesterId = new mongoose.Types.ObjectId(ownRequesterId(req));
+      } else if (
+        req.query.requesterId &&
+        mongoose.Types.ObjectId.isValid(String(req.query.requesterId))
+      ) {
+        filter.requesterId = new mongoose.Types.ObjectId(String(req.query.requesterId));
+      }
+    }
+    if (req.query.status) filter.status = String(req.query.status);
+    if (req.query.dateFrom || req.query.dateTo) {
+      filter.createdAt = {};
+      if (req.query.dateFrom) filter.createdAt.$gte = parseISTStart(String(req.query.dateFrom));
+      if (req.query.dateTo) filter.createdAt.$lte = parseISTEnd(String(req.query.dateTo));
+    }
+
+    const docs = await ExpenseAdvance.find(filter).sort({ createdAt: -1 }).lean();
+
+    // Resolve requester display names + emails (same lookup the analytics endpoint
+    // uses) in ONE query.
+    const requesterIds = docs
+      .map((d: any) => d.requesterId)
+      .filter((id: any) => id && mongoose.Types.ObjectId.isValid(String(id)));
+    const userMap = new Map<string, any>();
+    if (requesterIds.length) {
+      const users = await User.find({ _id: { $in: requesterIds } })
+        .select("firstName lastName name email")
+        .lean();
+      users.forEach((u: any) => userMap.set(String(u._id), u));
+    }
+
+    const rows = docs.map((a: any) => {
+      const u = userMap.get(String(a.requesterId));
+      const settlements = Array.isArray(a.settlements) ? a.settlements : [];
+      const recoveries = Array.isArray(a.recoveries) ? a.recoveries : [];
+      const settled = settlements.reduce(
+        (s: number, x: any) => (x?.status === "settled" ? s + (Number(x.settledAmount) || 0) : s),
+        0,
+      );
+      const recovered = recoveries.reduce((s: number, x: any) => s + (Number(x.amount) || 0), 0);
+      return {
+        ref: a.ref || "",
+        requester: employeeNameOf(u) || "",
+        email: (u && u.email) || "",
+        purpose: a.purpose || "",
+        currency: a.currency || "",
+        amount: round2(a.amount),
+        status: humanizeStatus(a.status),
+        disbursedAmount: round2(a.amountDisbursed),
+        disbursedOn: fmtDate(a.disbursedAt),
+        settled: round2(settled),
+        recovered: round2(recovered),
+        outstanding: round2(a.outstandingBalance),
+        appliedToClaims: settlements.length,
+        requestedOn: fmtDate(a.createdAt),
+        approvedOn: fmtDate(a.approvedAt),
+      } as Record<string, any>;
+    });
+
+    const header = ADV_EXPORT_COLUMNS.map((c) => c.label);
+
+    if (format === "csv") {
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", 'attachment; filename="advances-export.csv"');
+      res.write(csvRow(header));
+      rows.forEach((r) => res.write(csvRow(ADV_EXPORT_COLUMNS.map((c) => r[c.key]))));
+      return res.end();
+    }
+
+    // XLSX — mirror the expenses export ExcelJS pattern.
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Advances");
+    sheet.views = [{ state: "frozen", ySplit: 1 }];
+    const headerRow = sheet.addRow(header);
+    headerRow.font = { bold: true };
+    headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
+    ADV_EXPORT_COLUMNS.forEach((c, i) => {
+      if (c.money) sheet.getColumn(i + 1).numFmt = "#,##0.00";
+    });
+    rows.forEach((r) => sheet.addRow(ADV_EXPORT_COLUMNS.map((c) => r[c.key])));
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader("Content-Disposition", 'attachment; filename="advances-export.xlsx"');
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (err: any) {
+    console.error("[Advances export]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to export advances" });
   }
 });
 
