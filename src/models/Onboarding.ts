@@ -56,6 +56,15 @@ const OnboardingSchema = new Schema(
       index: true,
     },
 
+    // Distinguishes an emailed onboarding invite from a manually-created master
+    // record. Intentionally NOT required and with NO default, so pre-existing
+    // docs (which have neither) remain valid — no migration needed.
+    source: {
+      type: String,
+      enum: ["invite", "manual"],
+      index: true,
+    },
+
     startedAt: { type: Date },
     submittedAt: { type: Date },
     verifiedAt: { type: Date },

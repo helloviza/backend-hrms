@@ -483,29 +483,16 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       paymentTerms,
     };
 
-    // Duplicate check — same email + type + workspaceId
-    if (email) {
-      const existing = await Onboarding.findOne({
-        email,
-        type,
-        workspaceId,
-      }).lean();
-      if (existing) {
-        return res.status(409).json({
-          error: "A record with this email already exists",
-          existingId: existing._id,
-          token: (existing as any).token,
-        });
-      }
-    }
-
-    const onboarding = await Onboarding.create({
+    // Field-set a manual master record writes. Shared by both the fresh-create
+    // path and the dead-invite take-over path so they persist identically.
+    const now = Date.now();
+    const TEN_YEARS_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+    const manualFields: any = {
       type,
-      workspaceId,
       status: "approved",
       isActive,
-      token: randomBytes(20).toString("hex"),
-      expiresAt: new Date(Date.now() + 10 * 365 * 24 * 60 * 60 * 1000),
+      source: "manual",
+      expiresAt: new Date(now + TEN_YEARS_MS),
       name: companyName,
       companyName,
       businessName: companyName,
@@ -522,6 +509,70 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       creditLimit,
       paymentTerms,
       formPayload: payload,
+    };
+
+    // Duplicate / dead-invite decision tree — same email + type + workspaceId.
+    if (email) {
+      const existing: any = await Onboarding.findOne({
+        email,
+        type,
+        workspaceId,
+      }).exec();
+
+      if (existing) {
+        const expiresMs = existing.expiresAt
+          ? new Date(existing.expiresAt).getTime()
+          : 0;
+        const isDeadInvite =
+          existing.status === "expired" ||
+          (existing.status === "started" && expiresMs < now);
+        // A manual record, or a completed/approved onboarding, is a genuine
+        // existing business. (Legacy docs predate `source`, so this also keys
+        // off status — a missing source never falsely qualifies as "real".)
+        const isRealOrComplete =
+          existing.source === "manual" ||
+          ["submitted", "verified", "approved"].includes(existing.status);
+
+        if (isRealOrComplete) {
+          return res.status(409).json({
+            error: "A business with this email already exists.",
+            existingId: existing._id,
+            token: existing.token,
+          });
+        }
+
+        if (isDeadInvite) {
+          // Take over the dead invite in place — no second row. Keeps the
+          // existing _id, token, workspaceId; flips it into an approved manual
+          // master record so it leaves the Pipeline's Expired column.
+          Object.assign(existing, manualFields);
+          existing.markModified("formPayload");
+          const saved = await existing.save();
+          return res.json({
+            ok: true,
+            id: String(saved._id),
+            type: saved.type,
+          });
+        }
+
+        // An active, not-yet-expired invite — don't clobber a live invitation.
+        // Phrasing deliberately avoids "already exists": BusinessProfiles.tsx
+        // branches on /already exists/i and would otherwise swallow this message
+        // behind its hardcoded "search for the existing record" alert. Without
+        // that phrase it falls through to alert(err.message) and shows this text.
+        return res.status(409).json({
+          error:
+            "An active invite is pending for this email — manage it from the Pipeline.",
+          existingId: existing._id,
+          token: existing.token,
+        });
+      }
+    }
+
+    const onboarding = await Onboarding.create({
+      ...manualFields,
+      workspaceId,
+      token: randomBytes(20).toString("hex"),
     });
 
     return res.json({

@@ -516,6 +516,7 @@ name: safeName,
   createdAt: now,
   updatedAt: now,
   status: "started",
+  source: "invite",
 });
 
 
