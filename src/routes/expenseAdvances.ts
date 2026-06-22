@@ -70,22 +70,26 @@ function actorNameOf(req: any): string {
   return employeeNameOf(req.user) || "System";
 }
 
-/* ── Export columns (single source of truth for CSV + XLSX) — one row per
- * advance, mirroring the expenses export's Col shape + money flagging. ───── */
-type AdvCol = { key: string; label: string; money?: boolean };
+/* ── Export columns (single source of truth for CSV + XLSX + JSON contract) —
+ * one row per advance, mirroring the expenses export's Col shape. `money: true`
+ * drives the XLSX number format; `type` is the shared-contract column metadata
+ * the Reports-hub runner uses for on-screen formatting (JSON returns RAW
+ * numbers). ───── */
+type ReportColumnType = "money" | "number" | "date" | "text";
+type AdvCol = { key: string; label: string; money?: boolean; type?: ReportColumnType };
 const ADV_EXPORT_COLUMNS: AdvCol[] = [
   { key: "ref", label: "Ref" },
   { key: "requester", label: "Requester" },
   { key: "email", label: "Email" },
   { key: "purpose", label: "Purpose" },
   { key: "currency", label: "Currency" },
-  { key: "amount", label: "Amount", money: true },
+  { key: "amount", label: "Amount", money: true, type: "money" },
   { key: "status", label: "Status" },
-  { key: "disbursedAmount", label: "Disbursed Amount", money: true },
+  { key: "disbursedAmount", label: "Disbursed Amount", money: true, type: "money" },
   { key: "disbursedOn", label: "Disbursed On" },
-  { key: "settled", label: "Settled", money: true },
-  { key: "recovered", label: "Recovered", money: true },
-  { key: "outstanding", label: "Outstanding", money: true },
+  { key: "settled", label: "Settled", money: true, type: "money" },
+  { key: "recovered", label: "Recovered", money: true, type: "money" },
+  { key: "outstanding", label: "Outstanding", money: true, type: "money" },
   { key: "appliedToClaims", label: "Applied To Claims" },
   { key: "requestedOn", label: "Requested On" },
   { key: "approvedOn", label: "Approved On" },
@@ -535,22 +539,35 @@ router.get("/analytics", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
- * GET /api/expense-advances/export?format=csv|xlsx
- * Advances liability export — ONE row per advance. Mirrors the expenses export
- * (GET /api/expenses/export): same format param, same CSV (text/csv) + XLSX
- * (ExcelJS) handling, same content-type/content-disposition shape.
+ * GET /api/expense-advances/export?format=csv|xlsx|json&page=&limit=
+ * Advances liability export / "Advances Liability" report — ONE row per advance.
+ * Mirrors the expenses export (GET /api/expenses/export): same format param,
+ * same CSV (text/csv) + XLSX (ExcelJS) handling, same content-type/disposition.
+ *
+ * Retrofitted to the SHARED report contract so the Reports-hub runner can render
+ * it. ADV_EXPORT_COLUMNS + the per-row builder are the SINGLE source for every
+ * output:
+ *   • format absent / format=json → { columns, rows, total, range }, PAGINATED
+ *     via page/limit (newest first).
+ *   • format=csv|xlsx → the file (FULL filtered set) — unchanged.
+ *
+ * LIABILITY SNAPSHOT: this is a point-in-time picture, NOT a date-ranged report.
+ * The Reports-hub descriptor is dateRanged:false, so the runner sends NO
+ * dateFrom/dateTo — finance then gets the WHOLE workspace (scope=all is the
+ * seesAll default when no scope/requesterId is passed).
  *
  * Scoping (mirrors the list + expenses export): finance/admin (seesAll) get the
  * whole workspace, optionally narrowed by ?scope=mine or ?requesterId=; a
  * non-admin is FORCE-scoped to their own advances (any ?requesterId/scope=all is
  * ignored). workspaceId is ALWAYS stamped. Honors ?status and ?dateFrom/?dateTo
- * (on createdAt — when the advance was requested).
+ * (on createdAt) when passed — the CSV/XLSX download still supports them.
  *
  * Declared BEFORE GET /:id so ":id" never captures "export".
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/export", async (req: any, res: any) => {
   try {
-    const format = req.query.format === "xlsx" ? "xlsx" : "csv";
+    const format =
+      req.query.format === "xlsx" ? "xlsx" : req.query.format === "csv" ? "csv" : "json";
 
     // Build the same filter the list applies, with export-time date support.
     const filter: Record<string, any> = { workspaceId: req.workspaceObjectId };
@@ -575,7 +592,22 @@ router.get("/export", async (req: any, res: any) => {
       if (req.query.dateTo) filter.createdAt.$lte = parseISTEnd(String(req.query.dateTo));
     }
 
-    const docs = await ExpenseAdvance.find(filter).sort({ createdAt: -1 }).lean();
+    // JSON is paged; file exports carry the FULL filtered set (unchanged).
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
+
+    const baseQuery = ExpenseAdvance.find(filter).sort({ createdAt: -1 });
+    let docs: any[];
+    let total: number;
+    if (format === "json") {
+      [docs, total] = await Promise.all([
+        baseQuery.skip((page - 1) * limit).limit(limit).lean(),
+        ExpenseAdvance.countDocuments(filter),
+      ]);
+    } else {
+      docs = await baseQuery.lean();
+      total = docs.length;
+    }
 
     // Resolve requester display names + emails (same lookup the analytics endpoint
     // uses) in ONE query.
@@ -656,6 +688,19 @@ router.get("/export", async (req: any, res: any) => {
         approvedOn: fmtDate(a.approvedAt),
       } as Record<string, any>;
     });
+
+    // JSON (shared report contract) — same columns + rows, paginated.
+    if (format === "json") {
+      return res.json({
+        columns: ADV_EXPORT_COLUMNS.map((c) => ({ key: c.key, label: c.label, type: c.type })),
+        rows,
+        total,
+        range: {
+          dateFrom: req.query.dateFrom ? String(req.query.dateFrom) : "",
+          dateTo: req.query.dateTo ? String(req.query.dateTo) : "",
+        },
+      });
+    }
 
     const header = ADV_EXPORT_COLUMNS.map((c) => c.label);
 

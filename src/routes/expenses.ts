@@ -197,15 +197,19 @@ function employeeNameOf(emp: any): string {
   return full || emp.name || emp.email || "";
 }
 
-/* ── Export columns (single source of truth for CSV + XLSX) ─────────── */
-type Col = { key: string; label: string; money?: boolean };
+/* ── Export columns (single source of truth for CSV + XLSX + JSON contract) ──
+ * `money: true` drives the XLSX number format; `type` is the shared-contract
+ * column metadata the Reports-hub runner uses for on-screen formatting (JSON
+ * still returns RAW numbers). */
+type ReportColumnType = "money" | "number" | "date" | "text";
+type Col = { key: string; label: string; money?: boolean; type?: ReportColumnType };
 const EXPORT_COLUMNS: Col[] = [
   { key: "date", label: "Date" },
   { key: "employee", label: "Employee" },
   { key: "merchant", label: "Merchant" },
   { key: "category", label: "Category" },
-  { key: "amount", label: "Amount", money: true },
-  { key: "tax", label: "Tax", money: true },
+  { key: "amount", label: "Amount", money: true, type: "money" },
+  { key: "tax", label: "Tax", money: true, type: "money" },
   { key: "currency", label: "Currency" },
   { key: "gstin", label: "GSTIN" },
   { key: "status", label: "Status" },
@@ -216,8 +220,8 @@ const EXPORT_COLUMNS: Col[] = [
   { key: "receipt", label: "Receipt" },
   // ── Advances (Phase 2) — claim-level figures, appended after the existing
   // columns (order preserved). Blank for loose expenses / no-advance claims. ──
-  { key: "advanceApplied", label: "Advance Applied", money: true },
-  { key: "netReimbursed", label: "Net Reimbursed", money: true },
+  { key: "advanceApplied", label: "Advance Applied", money: true, type: "money" },
+  { key: "netReimbursed", label: "Net Reimbursed", money: true, type: "money" },
   // Advance cross-reference — the advance ref(s) + settled amount applied to this
   // expense's parent claim (so finance can trace which advance settled which
   // claim from the expenses file). Text, "; "-joined; blank when none.
@@ -348,21 +352,44 @@ router.get("/", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
- * GET /api/expenses/export?format=csv|xlsx
- * Same filter + scoping as the list; NO pagination (full filtered set).
+ * GET /api/expenses/export?format=csv|xlsx&dateFrom=&dateTo=&page=&limit=
+ * The "Expense Details" report — same filter + scoping as the list.
+ *
+ * Retrofitted to the SHARED report contract so the Reports-hub runner can
+ * render it. The 17-column EXPORT_COLUMNS definition + expenseToExportRow are
+ * the SINGLE source for every output:
+ *   • format absent / format=json → { columns, rows, total, range }, PAGINATED
+ *     via page/limit (newest first), built from those same columns/rows.
+ *   • format=csv|xlsx → the file (FULL filtered set, no pagination) — unchanged.
  * Receipt is a has-receipt flag, never a presigned URL.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/export", async (req: any, res: any) => {
   try {
-    const format = req.query.format === "xlsx" ? "xlsx" : "csv";
+    const format =
+      req.query.format === "xlsx" ? "xlsx" : req.query.format === "csv" ? "csv" : "json";
     const filter = await buildExpenseFilter(req);
 
-    const docs = await Expense.find(filter)
+    // JSON is paged; file exports carry the FULL filtered set (unchanged).
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
+
+    const baseQuery = Expense.find(filter)
       .select("-rawExtraction -perFieldConfidence")
       .populate("employeeId", "firstName lastName email name")
       .populate("categoryId", "name")
-      .sort({ date: -1, createdAt: -1 })
-      .lean();
+      .sort({ date: -1, createdAt: -1 });
+
+    let docs: any[];
+    let total: number;
+    if (format === "json") {
+      [docs, total] = await Promise.all([
+        baseQuery.skip((page - 1) * limit).limit(limit).lean(),
+        Expense.countDocuments(filter),
+      ]);
+    } else {
+      docs = await baseQuery.lean();
+      total = docs.length;
+    }
 
     // Resolve the claim each expense sits in (for the Claim + Reimbursed On
     // columns) in ONE workspace-scoped query. Loose expenses have no reportId.
@@ -441,6 +468,20 @@ router.get("/export", async (req: any, res: any) => {
     }
 
     const rows = docs.map((d: any) => expenseToExportRow(d, claimsById, advancesByReport));
+
+    // JSON (shared report contract) — same columns + rows, paginated.
+    if (format === "json") {
+      return res.json({
+        columns: EXPORT_COLUMNS.map((c) => ({ key: c.key, label: c.label, type: c.type })),
+        rows,
+        total,
+        range: {
+          dateFrom: req.query.dateFrom ? String(req.query.dateFrom) : "",
+          dateTo: req.query.dateTo ? String(req.query.dateTo) : "",
+        },
+      });
+    }
+
     const header = EXPORT_COLUMNS.map((c) => c.label);
 
     if (format === "csv") {

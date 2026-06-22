@@ -139,6 +139,12 @@ router.get("/", async (req: any, res: any) => {
       if (dateTo) filter.createdAt.$lte = parseISTEnd(dateTo);
     }
 
+    // Optional entity split — claim entries carry reportId, advance entries carry
+    // advanceId (exactly one is set per row). Omitted/empty = both (unchanged).
+    const entity = String(req.query.entity || "");
+    if (entity === "claim") filter.advanceId = null;
+    else if (entity === "advance") filter.advanceId = { $ne: null };
+
     // Pagination — JSON is paged; file exports carry the full filtered set.
     const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
     const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
