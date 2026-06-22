@@ -128,6 +128,10 @@ const ReportSchema = new Schema<IReport>(
   { timestamps: true },
 );
 
+// Reports hub — Claim Report: workspace-scoped, date-ranged, newest-first scan
+// over the claim's createdAt (GET /api/reports/export).
+ReportSchema.index({ workspaceId: 1, createdAt: -1 });
+
 ReportSchema.plugin(workspaceScopePlugin);
 
 const Report =

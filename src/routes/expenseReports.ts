@@ -11,6 +11,7 @@
 
 import express from "express";
 import mongoose from "mongoose";
+import ExcelJS from "exceljs";
 import {
   seesAll,
   isFinance as isFinanceUser,
@@ -18,6 +19,10 @@ import {
   canReimburse as canReimburseUser,
   userIdOf,
 } from "../services/expense.access.js";
+import ExpenseAdvance from "../models/ExpenseAdvance.js";
+import { csvRow } from "../utils/exportHelpers.js";
+import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
+import { refFromId } from "../utils/refFromId.js";
 import {
   propagateReportLifecycle,
   unlinkAllExpenses,
@@ -228,6 +233,251 @@ async function loadReport(req: any, id: string, opts: { ownerOnly: boolean }) {
  * queued report). Includes submitter + approver names + canApprove/canReimburse
  * hints for the UI.
  * ───────────────────────────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /api/reports/export?format=csv|xlsx|json&dateFrom=&dateTo=&page=&limit=
+ * The "Claim Report" — ONE row per claim, on the SHARED report contract so the
+ * Reports-hub runner can render it. CLAIM_REPORT_COLUMNS + the per-row builder
+ * are the SINGLE source for every output:
+ *   • format absent / format=json → { columns, rows, total, range }, PAGINATED
+ *     via page/limit (newest first).
+ *   • format=csv|xlsx → the file (FULL filtered set) — CSV + XLSX (ExcelJS),
+ *     mirroring the expenses / advances exports.
+ *
+ * seesAll-gated (finance/admin). Tenant-scoped (workspaceId stamped). Date-ranged
+ * on the claim's createdAt when ?dateFrom/?dateTo are passed; no params = all.
+ * ALL enrichment is batched — employee names, approver names, and the advance
+ * cross-ref — so there are NO per-row queries.
+ *
+ * Declared BEFORE GET /:id so ":id" never captures "export".
+ * ───────────────────────────────────────────────────────────────────── */
+type ReportColumnType = "money" | "number" | "date" | "text";
+type ClaimCol = { key: string; label: string; money?: boolean; type?: ReportColumnType };
+const CLAIM_REPORT_COLUMNS: ClaimCol[] = [
+  { key: "ref", label: "Ref" },
+  { key: "title", label: "Title" },
+  { key: "employee", label: "Employee" },
+  { key: "email", label: "Email" },
+  { key: "status", label: "Status" },
+  { key: "expenses", label: "Expenses", type: "number" },
+  { key: "total", label: "Total", money: true, type: "money" },
+  { key: "advanceApplied", label: "Advance Applied", money: true, type: "money" },
+  { key: "netPayout", label: "Net Payout", money: true, type: "money" },
+  { key: "advances", label: "Advances" },
+  { key: "approval", label: "Approval" },
+  { key: "submittedOn", label: "Submitted On", type: "date" },
+  { key: "approvedOn", label: "Approved On", type: "date" },
+  { key: "reimbursedOn", label: "Reimbursed On", type: "date" },
+  { key: "createdOn", label: "Created On", type: "date" },
+];
+
+/** IST-formatted date — matches the expenses / advances exports. */
+function fmtClaimDate(d: any): string {
+  return d ? new Date(d).toLocaleDateString("en-IN") : "";
+}
+
+/** Inline money for the advance cross-ref cell, e.g. 5000 → "₹5,000". */
+function fmtClaimINR(n: any): string {
+  const v = round2(n);
+  return `₹${new Intl.NumberFormat("en-IN", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(v)}`;
+}
+
+/** "clarification_required" → "Clarification required" (claim status display). */
+function humanizeClaimStatus(s: any): string {
+  const v = String(s || "").replace(/_/g, " ");
+  return v ? v.charAt(0).toUpperCase() + v.slice(1) : "";
+}
+
+router.get("/export", async (req: any, res: any) => {
+  try {
+    if (!seesAllReports(req)) {
+      return res.status(403).json({ error: "Finance or admin access required" });
+    }
+
+    const format =
+      req.query.format === "xlsx" ? "xlsx" : req.query.format === "csv" ? "csv" : "json";
+
+    // Tenant-scoped; date-ranged on the claim's createdAt when passed.
+    const filter: Record<string, any> = { workspaceId: req.workspaceObjectId };
+    const dateFrom = req.query.dateFrom ? String(req.query.dateFrom) : "";
+    const dateTo = req.query.dateTo ? String(req.query.dateTo) : "";
+    if (dateFrom || dateTo) {
+      filter.createdAt = {};
+      if (dateFrom) filter.createdAt.$gte = parseISTStart(dateFrom);
+      if (dateTo) filter.createdAt.$lte = parseISTEnd(dateTo);
+    }
+
+    // JSON is paged; file exports carry the FULL filtered set.
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
+
+    const baseQuery = Report.find(filter).sort({ createdAt: -1 });
+    let docs: any[];
+    let total: number;
+    if (format === "json") {
+      [docs, total] = await Promise.all([
+        baseQuery.skip((page - 1) * limit).limit(limit).lean(),
+        Report.countDocuments(filter),
+      ]);
+    } else {
+      docs = await baseQuery.lean();
+      total = docs.length;
+    }
+
+    const reportObjIds = docs.map((r: any) => r._id);
+    const reportIdSet = new Set(reportObjIds.map(String));
+
+    // ── Batched: per-claim counts + totals (one aggregation) ──
+    const counts = await countsForReports(req.workspaceObjectId, reportObjIds);
+
+    // ── Batched: employee names + emails (one lookup) ──
+    const employeeIds = [
+      ...new Set(docs.map((r: any) => r.employeeId).filter(Boolean).map(String)),
+    ];
+    const employeeById = new Map<string, any>();
+    if (employeeIds.length) {
+      const users = await User.find({
+        _id: { $in: employeeIds.map((id) => new mongoose.Types.ObjectId(id)) },
+      })
+        .select("firstName lastName name email")
+        .lean();
+      users.forEach((u: any) => employeeById.set(String(u._id), u));
+    }
+
+    // ── Batched: chain approver names across every claim's approvalChain (one lookup) ──
+    const chainApproverIds = [
+      ...new Set(
+        docs
+          .flatMap((r: any) => (Array.isArray(r.approvalChain) ? r.approvalChain : []))
+          .map((l: any) => l?.approverId)
+          .filter((id: any) => id && mongoose.Types.ObjectId.isValid(String(id)))
+          .map(String),
+      ),
+    ];
+    const chainNameById = new Map<string, string>();
+    if (chainApproverIds.length) {
+      const chainUsers = await User.find({
+        _id: { $in: chainApproverIds.map((id) => new mongoose.Types.ObjectId(id)) },
+      })
+        .select("firstName lastName name email")
+        .lean();
+      chainUsers.forEach((u: any) => chainNameById.set(String(u._id), employeeNameOf(u)));
+    }
+
+    // ── Batched: advance cross-ref — every advance whose settlements reference any
+    // of these claims, in ONE query (reuses the expenses export's pattern). Builds
+    // BOTH the "ADV-… (₹…, state); …" cell AND the Σ-applied-per-claim total. ──
+    const advancesByReport = new Map<string, string>();
+    const appliedByReport = new Map<string, number>();
+    if (reportObjIds.length) {
+      const advances = await ExpenseAdvance.find({
+        workspaceId: req.workspaceObjectId,
+        "settlements.reportId": { $in: reportObjIds },
+      })
+        .select("ref settlements")
+        .lean();
+      const partsByReport = new Map<string, string[]>();
+      advances.forEach((a: any) => {
+        const advRef = a.ref || refFromId("ADV", a._id);
+        (Array.isArray(a.settlements) ? a.settlements : []).forEach((s: any) => {
+          const rid = s?.reportId ? String(s.reportId) : "";
+          if (!rid || !reportIdSet.has(rid)) return;
+          // Earmarked until the claim reimburses, then settled.
+          const state = s?.status === "settled" ? "settled" : "earmarked";
+          const part = `${advRef} (${fmtClaimINR(s.amountApplied)}, ${state})`;
+          const arr = partsByReport.get(rid);
+          if (arr) arr.push(part);
+          else partsByReport.set(rid, [part]);
+          // Σ applied — settled uses settledAmount, earmarked uses amountApplied
+          // (mirrors GET /:id's earmarked-applied + settled-applied total).
+          const applied =
+            s?.status === "settled" ? Number(s.settledAmount) || 0 : Number(s.amountApplied) || 0;
+          appliedByReport.set(rid, (appliedByReport.get(rid) || 0) + applied);
+        });
+      });
+      partsByReport.forEach((parts, rid) => advancesByReport.set(rid, parts.join("; ")));
+    }
+
+    const rows = docs.map((r: any) => {
+      const id = String(r._id);
+      const c = counts[id] || { count: 0, amount: 0 };
+      const emp = employeeById.get(String(r.employeeId));
+      const totalAmount = round2(c.amount);
+      const appliedTotal = round2(appliedByReport.get(id) || 0);
+      const approval = (Array.isArray(r.approvalChain) ? r.approvalChain : [])
+        .map((l: any) => {
+          const nm = l?.approverId ? chainNameById.get(String(l.approverId)) || "" : "";
+          const st = String(l?.status || "").replace(/_/g, " ");
+          return nm ? `${nm} (${st})` : `(${st})`;
+        })
+        .join("; ");
+      return {
+        ref: r.ref || refFromId("CLM", r._id),
+        title: r.name || "",
+        employee: employeeNameOf(emp),
+        email: (emp && emp.email) || "",
+        status: humanizeClaimStatus(r.status),
+        expenses: c.count,
+        total: totalAmount,
+        // Blank when no advance applied (reads clean; mirrors the expenses export).
+        advanceApplied: appliedTotal ? appliedTotal : "",
+        netPayout: round2(totalAmount - appliedTotal),
+        advances: advancesByReport.get(id) || "",
+        approval,
+        submittedOn: fmtClaimDate(r.submittedAt),
+        approvedOn: fmtClaimDate(r.approvedAt),
+        reimbursedOn: fmtClaimDate(r.reimbursedAt),
+        createdOn: fmtClaimDate(r.createdAt),
+      } as Record<string, any>;
+    });
+
+    // JSON (shared report contract) — same columns + rows, paginated.
+    if (format === "json") {
+      return res.json({
+        columns: CLAIM_REPORT_COLUMNS.map((c) => ({ key: c.key, label: c.label, type: c.type })),
+        rows,
+        total,
+        range: { dateFrom, dateTo },
+      });
+    }
+
+    const header = CLAIM_REPORT_COLUMNS.map((c) => c.label);
+
+    if (format === "csv") {
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", 'attachment; filename="claims-export.csv"');
+      res.write(csvRow(header));
+      rows.forEach((row) => res.write(csvRow(CLAIM_REPORT_COLUMNS.map((c) => row[c.key]))));
+      return res.end();
+    }
+
+    // XLSX — mirror the expenses / advances export ExcelJS pattern.
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Claims");
+    sheet.views = [{ state: "frozen", ySplit: 1 }];
+    const headerRow = sheet.addRow(header);
+    headerRow.font = { bold: true };
+    headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
+    CLAIM_REPORT_COLUMNS.forEach((c, i) => {
+      if (c.money) sheet.getColumn(i + 1).numFmt = "#,##0.00";
+    });
+    rows.forEach((row) => sheet.addRow(CLAIM_REPORT_COLUMNS.map((c) => row[c.key])));
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader("Content-Disposition", 'attachment; filename="claims-export.xlsx"');
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (err: any) {
+    console.error("[Claims export]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to export claims" });
+  }
+});
+
 router.get("/:id", async (req: any, res: any) => {
   try {
     const report = await loadReportAny(req, req.params.id);
