@@ -101,6 +101,9 @@ ExpenseActivitySchema.index({ workspaceId: 1 });
 // Analytics scan: cycle-time + policy-flag aggregation matches by workspace and
 // filters to a small set of lifecycle events (GET /api/expenses/analytics).
 ExpenseActivitySchema.index({ workspaceId: 1, event: 1 });
+// Reports hub — Activity Logs report: workspace-scoped, date-ranged, newest-first
+// scan across BOTH claim and advance entries (GET /api/expense-activity).
+ExpenseActivitySchema.index({ workspaceId: 1, createdAt: -1 });
 
 ExpenseActivitySchema.plugin(workspaceScopePlugin);
 
