@@ -1306,6 +1306,47 @@ router.post("/:id/extend-expiry", requireAuth, requireWorkspace, noStore, async 
   }
 });
 
+/**
+ * 🚫 Cancel an active invite — flips status to "expired" (no new status added).
+ * Reuses the existing dead-invite machinery: once "expired", the record is
+ * isDeadInvite=true so "+ New Business" converts it in place (masterData.ts),
+ * and it lands in the Pipeline's Expired column where Extend-30-days can revive
+ * a mis-cancel. No email is sent.
+ */
+router.post("/:id/cancel", requireAuth, requireWorkspace, noStore, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const doc: any = await (Onboarding as any).findOne({ _id: id, workspaceId: (req as any).workspaceObjectId }).exec();
+    if (!doc) return res.status(404).json({ error: "Onboarding record not found" });
+
+    // Onboarding status enum: sent | started | submitted | verified | rejected | approved | expired
+    const status = String(doc.status || "").toLowerCase();
+    const source = String(doc.source || "").toLowerCase();
+    const ACTIVE = ["sent", "started"];
+    const COMPLETED = ["submitted", "verified", "approved"];
+
+    // Only cancel a genuinely active invite.
+    if (source === "manual") {
+      return res.status(409).json({ error: "This is a manually-created record, not an invite — there is nothing to cancel." });
+    }
+    if (COMPLETED.includes(status)) {
+      return res.status(409).json({ error: `Cannot cancel a ${status} onboarding — it is already completed.` });
+    }
+    if (!ACTIVE.includes(status)) {
+      return res.status(409).json({ error: `Only an active invite (sent/started) can be cancelled; this invite is "${doc.status}".` });
+    }
+
+    // Flip only the status — leave token/_id/workspaceId/formPayload untouched.
+    doc.status = "expired";
+    doc.updatedAt = new Date();
+    await doc.save();
+
+    res.json({ ok: true, id: String(doc._id), status: doc.status });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /** 🧑‍💼 Admin decision – also sync on approval */
 router.post("/:token/decision", requireAuth, noStore, async (req, res, next) => {
   try {
