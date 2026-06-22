@@ -337,6 +337,145 @@ async function resolveWorkspaceId(req: Request): Promise<mongoose.Types.ObjectId
   return null;
 }
 
+/**
+ * Canonical business `formPayload` builder — single source of truth shared by the
+ * create, dead-invite take-over, and edit paths so the three can never drift again.
+ *
+ * Emits the exact shape the BusinessProfiles detail panel reads (the fp() accessors)
+ * and that invite-completed records already store: flat address keys, gstNumber/panNumber
+ * as the canonical tax keys (plus gstin/pan back-compat aliases so older readers keep
+ * working), the phone under contacts.primaryPhone + keyContacts[0].mobile, and nested
+ * keyContacts / signatory / bank objects.
+ *
+ * Merge semantics: when `existing` is supplied the result is a NON-DESTRUCTIVE MERGE — it
+ * starts from existing.formPayload and overlays only meaningful incoming values. By default
+ * an empty string ("") is treated as "leave blank" and never overwrites a populated key, so
+ * create + take-over can't wipe data the new submission didn't include.
+ *
+ * `opts.overwriteWithEmpty` (default FALSE) flips that for the EDIT path: a value that was
+ * SENT but cleared ("") then overwrites, so emptying a field in the edit form persists empty.
+ * A key the form did NOT send at all (undefined / null) is STILL preserved regardless of the
+ * flag — only an explicit "" can clear, never a not-sent field.
+ */
+function buildBusinessFormPayload(
+  body: any,
+  existing?: any,
+  opts?: { overwriteWithEmpty?: boolean },
+): Record<string, any> {
+  const b = body || {};
+  const prev = (existing && existing.formPayload) || {};
+  const out: Record<string, any> = { ...prev };
+  const overwriteWithEmpty = !!opts?.overwriteWithEmpty;
+
+  // Whether an incoming value should be written. undefined/null (not sent) never writes —
+  // it preserves whatever exists. "" (sent but cleared) writes only under overwriteWithEmpty.
+  const isMeaningful = (val: any) => {
+    if (val === undefined || val === null) return false;
+    if (typeof val === "string" && val.trim() === "") return overwriteWithEmpty;
+    return true;
+  };
+
+  const set = (key: string, val: any) => {
+    if (isMeaningful(val)) out[key] = val;
+  };
+
+  const companyName = b.companyName || b.name;
+  const officialEmail = b.officialEmail || b.email;
+  const mobile = b.contactMobile || b.phone;
+
+  // ----- identity / tax -----
+  set("legalName", b.legalName || b.companyName || b.name);
+  set("companyName", companyName);
+  set("officialEmail", officialEmail);
+  set("gstNumber", b.gstNumber || b.gstin);
+  set("gstin", b.gstin || b.gstNumber); // back-compat alias
+  set("panNumber", b.panNumber || b.pan);
+  set("pan", b.pan || b.panNumber); // back-compat alias
+  set("cin", b.cin);
+  set("gstRegisteredState", b.gstRegisteredState);
+  set("entityType", b.entityType);
+  set("industry", b.industry || b.segment);
+  set("website", b.website);
+  set("employeesCount", b.employeesCount);
+  set("incorporationDate", b.incorporationDate);
+  set("description", b.description);
+
+  // ----- address (flat keys the panel reads, with structured address{} fallback) -----
+  set("addressLine1", b.addressLine1 ?? b.address?.street);
+  set("addressLine2", b.addressLine2 ?? b.address?.street2);
+  set("city", b.city ?? b.address?.city);
+  set("country", b.country ?? b.address?.country);
+  set("pincode", b.pincode ?? b.address?.pincode);
+  set("registeredAddress", b.registeredAddress);
+  set("operationalAddress", b.operationalAddress);
+
+  // ----- commercial -----
+  set("creditLimit", b.creditLimit);
+  set("paymentTerms", b.paymentTerms);
+
+  // ----- nested: contacts.primaryPhone -----
+  if (isMeaningful(mobile)) {
+    out.contacts = { ...(out.contacts || {}), primaryPhone: mobile };
+  }
+
+  // ----- nested: keyContacts[0] (merge index 0, preserve existing designation etc.) -----
+  const kcName = b.contactName;
+  const kcEmail = b.contactEmail;
+  const kcDesignation = b.contactDesignation;
+  if (
+    isMeaningful(kcName) ||
+    isMeaningful(kcEmail) ||
+    isMeaningful(mobile) ||
+    isMeaningful(kcDesignation)
+  ) {
+    const existingKc = Array.isArray(out.keyContacts) ? out.keyContacts : [];
+    const first = existingKc[0] || {};
+    out.keyContacts = [
+      {
+        ...first,
+        ...(isMeaningful(kcName) ? { name: kcName } : {}),
+        ...(isMeaningful(kcDesignation) ? { designation: kcDesignation } : {}),
+        ...(isMeaningful(kcEmail) ? { email: kcEmail } : {}),
+        ...(isMeaningful(mobile) ? { mobile } : {}),
+      },
+      ...existingKc.slice(1),
+    ];
+  }
+
+  // ----- nested: signatory (only when the form sends it; preserved otherwise) -----
+  const sigName = b.signatoryName;
+  const sigDesignation = b.signatoryDesignation;
+  if (isMeaningful(sigName) || isMeaningful(sigDesignation)) {
+    out.signatory = {
+      ...(out.signatory || {}),
+      ...(isMeaningful(sigName) ? { name: sigName } : {}),
+      ...(isMeaningful(sigDesignation) ? { designation: sigDesignation } : {}),
+    };
+  }
+
+  // ----- nested: bank (merge, non-destructive) -----
+  const bankName = b.bankName;
+  const bankAccount = b.bankAccountNumber || b.bankAccount;
+  const bankIfsc = b.bankIfsc;
+  const bankBranch = b.bankBranch;
+  if (
+    isMeaningful(bankName) ||
+    isMeaningful(bankAccount) ||
+    isMeaningful(bankIfsc) ||
+    isMeaningful(bankBranch)
+  ) {
+    out.bank = {
+      ...(out.bank || {}),
+      ...(isMeaningful(bankName) ? { bankName } : {}),
+      ...(isMeaningful(bankAccount) ? { accountNumber: bankAccount } : {}),
+      ...(isMeaningful(bankIfsc) ? { ifsc: bankIfsc } : {}),
+      ...(isMeaningful(bankBranch) ? { branch: bankBranch } : {}),
+    };
+  }
+
+  return out;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Routes – Master list                                                       */
 /* -------------------------------------------------------------------------- */
@@ -487,6 +626,10 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
     // path and the dead-invite take-over path so they persist identically.
     const now = Date.now();
     const TEN_YEARS_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+    const isBusinessType = type === "business" || type === "customer";
+    // `formPayload` is intentionally NOT part of manualFields: the take-over path
+    // must MERGE it (never wipe a richer existing formPayload), so it is assigned
+    // separately below in both the fresh-create and take-over branches.
     const manualFields: any = {
       type,
       status: "approved",
@@ -508,7 +651,6 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       billingAddress,
       creditLimit,
       paymentTerms,
-      formPayload: payload,
     };
 
     // Duplicate / dead-invite decision tree — same email + type + workspaceId.
@@ -546,6 +688,12 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
           // existing _id, token, workspaceId; flips it into an approved manual
           // master record so it leaves the Pipeline's Expired column.
           Object.assign(existing, manualFields);
+          // MERGE formPayload (never wholesale-replace) so converting a record
+          // that already holds a richer formPayload keeps every field the new
+          // submission didn't include. (Previously this clobbered it entirely.)
+          existing.formPayload = isBusinessType
+            ? buildBusinessFormPayload(body, existing)
+            : { ...((existing.formPayload as any) || {}), ...payload };
           existing.markModified("formPayload");
           const saved = await existing.save();
           return res.json({
@@ -571,6 +719,10 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
 
     const onboarding = await Onboarding.create({
       ...manualFields,
+      // Fresh create has no prior doc → build the full canonical formPayload from
+      // the submission so every field the form sends is persisted in the shape the
+      // detail panel reads. Vendor keeps its existing generic payload shape.
+      formPayload: isBusinessType ? buildBusinessFormPayload(body) : payload,
       workspaceId,
       token: randomBytes(20).toString("hex"),
     });
@@ -775,40 +927,53 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
     onboardingDoc.payload = payload;
 
     // ----- also sync to formPayload (used by detail panel display) -----
-    if (!onboardingDoc.formPayload) {
-      onboardingDoc.formPayload = {};
-    }
-
-    const syncToFormPayload: Record<string, any> = {
-      legalName: body.legalName || body.companyName || body.name,
-      companyName: body.companyName || body.name,
-      gstNumber: body.gstNumber || body.gstin,
-      panNumber: body.panNumber || body.pan,
-      entityType: body.entityType,
-      registeredAddress: body.registeredAddress,
-      addressLine1: body.addressLine1,
-      addressLine2: body.addressLine2,
-      city: body.city,
-      country: body.country,
-      pincode: body.pincode,
-      website: body.website,
-      industry: body.industry,
-      employeesCount: body.employeesCount,
-      incorporationDate: body.incorporationDate,
-      description: body.description,
-      officialEmail: body.officialEmail || body.email,
-      cin: body.cin,
-      gstRegisteredState: body.gstRegisteredState,
-    };
-
-    Object.entries(syncToFormPayload).forEach(([key, val]) => {
-      if (val !== undefined && val !== null) {
-        onboardingDoc.formPayload[key] = val;
+    // Business/customer edits go through the unified canonical builder shared with
+    // the create + take-over paths (non-destructive merge). Vendor edits keep their
+    // exact existing behaviour — guarded so this change cannot regress them.
+    if (originalType === "business" || originalType === "customer") {
+      // EDIT owns the full form, so a cleared field ("") must persist empty —
+      // overwriteWithEmpty:true. Fields the form never sends (undefined) are still
+      // preserved. Create/take-over keep the default (false) non-destructive merge.
+      onboardingDoc.formPayload = buildBusinessFormPayload(body, onboardingDoc, {
+        overwriteWithEmpty: true,
+      });
+      onboardingDoc.markModified("formPayload");
+    } else {
+      if (!onboardingDoc.formPayload) {
+        onboardingDoc.formPayload = {};
       }
-    });
 
-    // Mark formPayload as modified (Mongoose won't detect nested changes)
-    onboardingDoc.markModified('formPayload');
+      const syncToFormPayload: Record<string, any> = {
+        legalName: body.legalName || body.companyName || body.name,
+        companyName: body.companyName || body.name,
+        gstNumber: body.gstNumber || body.gstin,
+        panNumber: body.panNumber || body.pan,
+        entityType: body.entityType,
+        registeredAddress: body.registeredAddress,
+        addressLine1: body.addressLine1,
+        addressLine2: body.addressLine2,
+        city: body.city,
+        country: body.country,
+        pincode: body.pincode,
+        website: body.website,
+        industry: body.industry,
+        employeesCount: body.employeesCount,
+        incorporationDate: body.incorporationDate,
+        description: body.description,
+        officialEmail: body.officialEmail || body.email,
+        cin: body.cin,
+        gstRegisteredState: body.gstRegisteredState,
+      };
+
+      Object.entries(syncToFormPayload).forEach(([key, val]) => {
+        if (val !== undefined && val !== null) {
+          onboardingDoc.formPayload[key] = val;
+        }
+      });
+
+      // Mark formPayload as modified (Mongoose won't detect nested changes)
+      onboardingDoc.markModified('formPayload');
+    }
 
     const saved = await onboardingDoc.save();
 
