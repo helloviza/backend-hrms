@@ -433,7 +433,7 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
 
     const body = req.body || {};
     const rawType = String(body.type || "Vendor");
-    const type = rawType[0].toUpperCase() + rawType.slice(1).toLowerCase();
+    const type = rawType.trim().toLowerCase();
 
     const companyName =
       body.companyName ||
@@ -521,7 +521,7 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       billingAddress,
       creditLimit,
       paymentTerms,
-      payload,
+      formPayload: payload,
     });
 
     return res.json({
