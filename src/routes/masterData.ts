@@ -1460,6 +1460,12 @@ router.post(
         });
       }
 
+      // Invite-less / DIRECT provisioning: pass sendEmail:false to skip all email
+      // dispatch — User/Customer/UserPermission/CustomerMember are still created and
+      // the generated tempPassword is returned below for out-of-band handover.
+      const sendEmail = req.body?.sendEmail !== false;
+      let generatedTempPassword: string | undefined;
+
       const phone =
         onboardingDoc.phone ||
         form.contactMobile ||
@@ -1609,16 +1615,20 @@ router.post(
       (onboardingDoc as any).customerCode = customerCode;
 (onboardingDoc as any).linkedCustomerId = customer._id;
 
-// 🔒 Send welcome email only once
-if (!(onboardingDoc as any).welcomeEmailSent) {
-  await sendOnboardingWelcomeEmail({
-    to: email,
-    counterpartyName: name,
-    effectiveDate: new Date().toISOString().slice(0, 10),
-    relationshipType: "Customer",
-  });
-
-  (onboardingDoc as any).welcomeEmailSent = true;
+// 🔒 Send welcome email only once — crash-safe: a mailer failure must never
+// abort promotion (the User/Customer login below is the real deliverable).
+if (sendEmail && !(onboardingDoc as any).welcomeEmailSent) {
+  try {
+    await sendOnboardingWelcomeEmail({
+      to: email,
+      counterpartyName: name,
+      effectiveDate: new Date().toISOString().slice(0, 10),
+      relationshipType: "Customer",
+    });
+    (onboardingDoc as any).welcomeEmailSent = true;
+  } catch (welcomeEmailErr) {
+    console.warn('[promote-customer] Welcome email failed:', welcomeEmailErr);
+  }
 }
 
 await onboardingDoc.save();
@@ -1663,6 +1673,7 @@ if (email) {
   } else {
     const tempPassword =
       'PLMX-' + Math.random().toString(36).slice(2, 10).toUpperCase()
+    generatedTempPassword = tempPassword
     const passwordHash = await bcrypt.hash(tempPassword, 10)
 
     clientUser = await User.create({
@@ -1679,15 +1690,17 @@ if (email) {
       tempPassword:       true,
     })
 
-    try {
-      await sendClientWelcomeEmail({
-        to:        email,
-        name:      (clientUser as any).name,
-        tempPassword,
-        loginUrl:  'https://plumbox.plumtrips.com',
-      })
-    } catch (emailErr) {
-      console.warn('[promote-customer] Welcome email failed:', emailErr)
+    if (sendEmail) {
+      try {
+        await sendClientWelcomeEmail({
+          to:        email,
+          name:      (clientUser as any).name,
+          tempPassword,
+          loginUrl:  'https://plumbox.plumtrips.com',
+        })
+      } catch (emailErr) {
+        console.warn('[promote-customer] Welcome email failed:', emailErr)
+      }
     }
 
     // Create/update CustomerMember for new user
@@ -1772,6 +1785,10 @@ return res.json({
   alreadyExists: !!existingCustomer,
   customerCode,
   customer,
+  // Invite-less provisioning: hand credentials over out-of-band when email skipped.
+  ...(sendEmail === false && generatedTempPassword
+    ? { tempPassword: generatedTempPassword }
+    : {}),
 });
     } catch (err) {
       next(err);
