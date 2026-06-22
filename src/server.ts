@@ -448,6 +448,11 @@ import expenseAdvancesRouter from "./routes/expenseAdvances.js";
 import { requireExpenseAdvancesFeature } from "./middleware/requireFeature.js";
 app.use("/api/expense-advances", requireAuth, requireWorkspace, requireExpenseAdvancesFeature, expenseAdvancesRouter);
 
+// Reports hub (Activity Logs report) — fused claim+advance audit stream on the
+// shared report contract. Tenant-scoped; seesAll (finance/admin) gated in-router.
+import expenseActivityRouter from "./routes/expenseActivity.js";
+app.use("/api/expense-activity", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseActivityRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";
