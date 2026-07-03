@@ -6,13 +6,33 @@ export type PlutoMetricEventType =
   | "CONVERSATION_STARTED"
   | "STATE_TRANSITION"
   | "HANDOFF_TRIGGERED"
-  | "CONVERSATION_DROPPED";
+  | "CONVERSATION_DROPPED"
+  // Failure / degradation events (Phase 1 — visibility)
+  | "pluto.search.error"
+  | "pluto.ai.fallback"
+  | "pluto.ai.error"
+  | "pluto.ai.fallback_invalid"
+  | "pluto.multicity.downgraded";
+
+// Severity drives sink routing: "error"/"warn" events always surface (console
+// error/warn) regardless of the PLUTO_METRICS analytics flag; "info" events
+// stay gated behind it. Absent severity is treated as "info".
+export type PlutoMetricSeverity = "info" | "warn" | "error";
 
 export interface PlutoMetricEvent {
   type: PlutoMetricEventType;
   timestamp: string;
 
-  conversationId: string;
+  // Optional — failure events may fire before a conversation context exists
+  // (e.g. a chat flight search that fails during the pre-context guard).
+  conversationId?: string;
+
+  severity?: PlutoMetricSeverity;
+
+  // Tenant + correlation
+  workspaceId?: string;
+  requestId?: string;
+  reason?: string;
 
   // Optional dimensions
   state?: PlutoConversationState;

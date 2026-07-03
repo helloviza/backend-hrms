@@ -3,6 +3,65 @@
 import type { PlutoMetricEvent } from "../types/plutoMetrics.js";
 import type { PlutoConversationState } from "../types/plutoConversationState.js";
 
+/* ────────────────────────────────────────────────────────────
+ * Failure / degradation event builders (Phase 1 — visibility)
+ *
+ * These carry { workspaceId, requestId, reason } and a severity so the sink
+ * always surfaces them (error/warn) even when PLUTO_METRICS analytics is off.
+ * ──────────────────────────────────────────────────────────── */
+
+interface FailureArgs {
+  workspaceId?: string;
+  requestId?: string;
+  reason?: string;
+  conversationId?: string;
+}
+
+export function searchError(args: FailureArgs): PlutoMetricEvent {
+  return {
+    type: "pluto.search.error",
+    severity: "error",
+    timestamp: new Date().toISOString(),
+    ...args,
+  };
+}
+
+export function aiFallback(args: FailureArgs): PlutoMetricEvent {
+  return {
+    type: "pluto.ai.fallback",
+    severity: "warn",
+    timestamp: new Date().toISOString(),
+    ...args,
+  };
+}
+
+export function aiError(args: FailureArgs): PlutoMetricEvent {
+  return {
+    type: "pluto.ai.error",
+    severity: "error",
+    timestamp: new Date().toISOString(),
+    ...args,
+  };
+}
+
+export function aiFallbackInvalid(args: FailureArgs): PlutoMetricEvent {
+  return {
+    type: "pluto.ai.fallback_invalid",
+    severity: "error",
+    timestamp: new Date().toISOString(),
+    ...args,
+  };
+}
+
+export function multicityDowngraded(args: FailureArgs): PlutoMetricEvent {
+  return {
+    type: "pluto.multicity.downgraded",
+    severity: "warn",
+    timestamp: new Date().toISOString(),
+    ...args,
+  };
+}
+
 export function conversationStarted(
   conversationId: string
 ): PlutoMetricEvent {
