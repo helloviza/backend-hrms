@@ -89,6 +89,24 @@ const ALLOWED_MEAL_TYPES = new Set([
 // NOTE: hotels ranked below SEARCH_TOP_N do NOT appear until pagination lands.
 const SEARCH_TOP_N = 400;
 
+// Phase 4 perf lever 1: how many TBO /Search pricing calls run in parallel.
+// Each pricing call is TBO-server-bound (p50 ~1.5s, p90 ~11s), NOT network-bound,
+// so overlapping more of them shrinks wall-clock. 400 codes / 100 per batch = 4
+// batches, so anything >=4 prices Dubai in a single wave. Kept env-tunable so we
+// can dial it up/down WITHOUT a redeploy if TBO rate-limits (watch logs for 429 /
+// throttle). Start moderate (16); do not max out blindly.
+const SEARCH_MAX_CONCURRENT = (() => {
+  const n = Number(process.env.SBT_SEARCH_MAX_CONCURRENT);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 16;
+})();
+
+// Guardrail: retry a pricing batch that TBO throttles (HTTP 429/503) instead of
+// silently dropping those ~100 hotels. Small exponential backoff with jitter.
+const SEARCH_BATCH_MAX_RETRIES = (() => {
+  const n = Number(process.env.SBT_SEARCH_BATCH_MAX_RETRIES);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 2;
+})();
+
 // TBO stores star rating as an enum string ("FiveStar".."OneStar", "All" =
 // unrated) in the static catalog, but some rows/sources carry a bare integer.
 // Normalize both to 0–5 (unknown → 0, sorts last) for top-N ranking.
@@ -267,11 +285,12 @@ export async function searchHotels(
     filtersPayload.StarRating = Number(reqFilters.StarRating);
   }
 
-  // 5. Fan-out TBO Search calls (max 5 concurrent)
-  const MAX_CONCURRENT = 5;
+  // 5. Fan-out TBO Search calls (SEARCH_MAX_CONCURRENT in parallel per wave)
+  const MAX_CONCURRENT = SEARCH_MAX_CONCURRENT;
   let allResults: any[] = [];
   let apiErrorBatches = 0;
   let totalBatches = 0;
+  let throttledRetries = 0;
   const searchTraceId = `hotel-search-${randomUUID().slice(0, 8)}`;
 
   for (let i = 0; i < chunks.length; i += MAX_CONCURRENT) {
@@ -288,33 +307,51 @@ export async function searchHotels(
         Filters: filtersPayload,
       };
       const t0 = Date.now();
-      try {
-        const r = await fetch(TBO_URLS.SEARCH, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: hotelAuthHeader(),
-          },
-          body: JSON.stringify(tboPayload),
-        });
-        const data = await r.json();
-        logTBOCall({
-          method: `HotelSearch_batch${i + batchIdx}`,
-          traceId: searchTraceId,
-          request: tboPayload,
-          response: data,
-          durationMs: Date.now() - t0,
-        });
-        return data;
-      } catch {
-        logTBOCall({
-          method: `HotelSearch_batch${i + batchIdx}`,
-          traceId: searchTraceId,
-          request: tboPayload,
-          response: { error: "fetch failed" },
-          durationMs: Date.now() - t0,
-        });
-        return null;
+      let attempt = 0;
+      for (;;) {
+        try {
+          const r = await fetch(TBO_URLS.SEARCH, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: hotelAuthHeader(),
+            },
+            body: JSON.stringify(tboPayload),
+          });
+          // Guardrail: TBO throttle → retry with backoff rather than dropping
+          // these ~100 hotels into apiErrorBatches. Honor Retry-After if sent.
+          if ((r.status === 429 || r.status === 503) && attempt < SEARCH_BATCH_MAX_RETRIES) {
+            const retryAfterMs = Number(r.headers.get("retry-after")) * 1000;
+            const backoff = Number.isFinite(retryAfterMs) && retryAfterMs > 0
+              ? retryAfterMs
+              : 400 * 2 ** attempt + Math.floor(Math.random() * 200);
+            console.warn(
+              `[hotel-search] TBO throttle (HTTP ${r.status}) on batch ${i + batchIdx}, attempt ${attempt + 1}/${SEARCH_BATCH_MAX_RETRIES} — retrying in ${backoff}ms`,
+            );
+            throttledRetries++;
+            attempt++;
+            await new Promise((res) => setTimeout(res, backoff));
+            continue;
+          }
+          const data = await r.json();
+          logTBOCall({
+            method: `HotelSearch_batch${i + batchIdx}`,
+            traceId: searchTraceId,
+            request: tboPayload,
+            response: r.ok ? data : { httpStatus: r.status, body: data },
+            durationMs: Date.now() - t0,
+          });
+          return data;
+        } catch {
+          logTBOCall({
+            method: `HotelSearch_batch${i + batchIdx}`,
+            traceId: searchTraceId,
+            request: tboPayload,
+            response: { error: "fetch failed" },
+            durationMs: Date.now() - t0,
+          });
+          return null;
+        }
       }
     });
     const results = await Promise.all(promises);
@@ -336,6 +373,12 @@ export async function searchHotels(
       }
     }
   }
+
+  console.info(
+    `[hotel-search] Fan-out done: ${totalBatches} batch(es), concurrency=${MAX_CONCURRENT}, ` +
+      `waves=${Math.ceil(chunks.length / MAX_CONCURRENT)}, throttledRetries=${throttledRetries}, ` +
+      `apiErrorBatches=${apiErrorBatches}`,
+  );
 
   // 6. Dedupe by HotelCode (spec line 21)
   {
