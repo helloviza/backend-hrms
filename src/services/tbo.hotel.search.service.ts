@@ -10,7 +10,10 @@ import { logTBOCall } from "../utils/tboFileLogger.js";
 import {
   type HotelCity,
 } from "../shared/cities.js";
-import { resolveCityCode as resolveCityCodeAgainstCatalog } from "../jobs/static-data-refresh.js";
+import {
+  resolveCityCode as resolveCityCodeAgainstCatalog,
+  TBOHotelMaster,
+} from "../jobs/static-data-refresh.js";
 import {
   type HotelCodeEntry,
   cityCache,
@@ -79,6 +82,27 @@ const ALLOWED_MEAL_TYPES = new Set([
   "All", "Room_Only", "BreakFast", "Half_Board",
   "Full_Board", "All_Inclusive_All_Meal",
 ]);
+
+// Phase 4 perf fix: price only the top-N best hotels (by star rating) read from
+// the local catalog, instead of the full live city code list (3.5k–13k codes →
+// ~49–134 serial batches). 400 codes → ~4 batches → ~1 wave. Tunable.
+// NOTE: hotels ranked below SEARCH_TOP_N do NOT appear until pagination lands.
+const SEARCH_TOP_N = 400;
+
+// TBO stores star rating as an enum string ("FiveStar".."OneStar", "All" =
+// unrated) in the static catalog, but some rows/sources carry a bare integer.
+// Normalize both to 0–5 (unknown → 0, sorts last) for top-N ranking.
+const RATING_WORD: Record<string, number> = {
+  fivestar: 5, fourstar: 4, threestar: 3, twostar: 2, onestar: 1,
+};
+function ratingToInt(r: unknown): number {
+  if (typeof r === "number" && Number.isFinite(r)) return r;
+  const s = String(r ?? "").trim().toLowerCase();
+  if (!s) return 0;
+  const n = Number(s);
+  if (Number.isFinite(n) && n > 0) return n;
+  return RATING_WORD[s] ?? 0;
+}
 
 /**
  * Run a TBO hotel search end-to-end:
@@ -149,22 +173,65 @@ export async function searchHotels(
         );
       }
     }
-    const hotelList = await fetchHotelCodeList(resolvedCityCode, CountryCode);
-    if (!hotelList.length) {
-      return {
-        ok: true,
-        hotels: [],
-        searchId: randomUUID(),
-        searchTs: Date.now(),
-        cityName: CityName || "",
-        countryCode: CountryCode,
-        apiErrorBatches: 0,
-        totalBatches: 0,
-        marginPct: 0,
-      };
+    // PRIMARY (Phase 4): read the city's hotel codes from the local catalog
+    // (tbohotelmasters), rank by star rating desc, and price only the TOP-N.
+    // Step-1 verification confirmed the resolved cityCode equals the cityCode
+    // under which the catalog holds each city's hotels.
+    let catalogHotels: any[] = [];
+    try {
+      catalogHotels = await (TBOHotelMaster as any)
+        .find({ cityCode: resolvedCityCode })
+        .select("hotelCode hotelName rating address latitude longitude countryCode")
+        .lean();
+    } catch (dbErr) {
+      sbtLogger.warn("[SEARCH] tbohotelmasters read failed — using live fallback", {
+        cityCode: resolvedCityCode,
+        err: dbErr instanceof Error ? dbErr.message : String(dbErr),
+      });
     }
-    for (const h of hotelList) hotelMeta.set(h.HotelCode, h);
-    allCodes = hotelList.map((h) => h.HotelCode);
+
+    if (catalogHotels.length > 0) {
+      catalogHotels.sort((a, b) => ratingToInt(b.rating) - ratingToInt(a.rating));
+      const top = catalogHotels.slice(0, SEARCH_TOP_N);
+      for (const h of top) {
+        hotelMeta.set(String(h.hotelCode), {
+          HotelCode: String(h.hotelCode),
+          HotelName: h.hotelName || "",
+          HotelRating: String(h.rating ?? ""),
+          Address: h.address || "",
+          Latitude: String(h.latitude ?? ""),
+          Longitude: String(h.longitude ?? ""),
+          CityName: CityName || "",
+          CountryName: "",
+          CountryCode: h.countryCode || CountryCode,
+        });
+      }
+      allCodes = top.map((h) => String(h.hotelCode));
+      sbtLogger.info(
+        `[SEARCH] Catalog top-N: city ${resolvedCityCode} has ${catalogHotels.length} hotels — pricing top ${allCodes.length} (cap ${SEARCH_TOP_N})`,
+      );
+    } else {
+      // FALLBACK: catalog miss (unrefreshed city) → existing live code list.
+      sbtLogger.info(
+        `[SEARCH] tbohotelmasters returned 0 codes for city ${resolvedCityCode}/${CountryCode} — falling back to live fetchHotelCodeList`,
+      );
+      const hotelList = await fetchHotelCodeList(resolvedCityCode, CountryCode);
+      if (!hotelList.length) {
+        return {
+          ok: true,
+          hotels: [],
+          searchId: randomUUID(),
+          searchTs: Date.now(),
+          cityName: CityName || "",
+          countryCode: CountryCode,
+          apiErrorBatches: 0,
+          totalBatches: 0,
+          marginPct: 0,
+        };
+      }
+      for (const h of hotelList) hotelMeta.set(h.HotelCode, h);
+      allCodes = hotelList.map((h) => h.HotelCode);
+    }
   }
 
   // 2. Chunk codes

@@ -31,6 +31,12 @@ import {
   PRIORITY_COUNTRY_CODES,
 } from "../services/tbo.hotel.shared.js";
 import { searchHotels, isHotelSearchError } from "../services/tbo.hotel.search.service.js";
+import {
+  TBOCity,
+  TBOHotelMaster,
+  TBOCountry,
+  normalizeSearch,
+} from "../jobs/static-data-refresh.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 import ManualDateChangeRequest from "../models/ManualDateChangeRequest.js";
 import {
@@ -617,11 +623,141 @@ function getPrimaryLeadContact(rooms: any[]): { phone: string; email: string } {
 const hotelDetailsCache = new Map<string, { data: any; ts: number }>();
 const DETAILS_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
+// Per-hotel-code image cache (keyed by single hotel code, NOT the batch string).
+// Only successful non-empty image URLs are cached — empties/timeouts are never
+// stored, so a transient failure can't pin a hotel to "no image" for hours.
+const hotelImageCache = new Map<string, { url: string; ts: number }>();
+const IMAGE_CACHE_TTL = 12 * 60 * 60 * 1000; // 12 hours
+
 // Hotel city/code helpers, name index, pax validation, and the startup IIFE
 // that pre-loads the index now live in services/tbo.hotel.shared.ts. The TBO
 // search core lives in services/tbo.hotel.search.service.ts.
 
 // ─── 1. GET /cities?q=Mumbai ─────────────────────────────────────────────────
+
+// Phase 2: local Mongo catalog (tbocities + tbohotelmasters) read-path.
+//
+// Hybrid match: prefix-range query on the searchName_1 index (catches "del" →
+// "delhi") + a $text query on the searchName text index (catches mid-string
+// words like "marina" in "dubai marina"). Results are merged, deduped, and
+// ranked deterministically: exact → prefix → contains, then a soft-priority
+// boost for the requested country, then shorter/alphabetical. countryCode is
+// NEVER used to filter — only to break ranking ties.
+
+const MAX_PREFIX_CHAR = "￿"; // searchName is normalized to [a-z0-9 ], so this caps any prefix range
+
+function rankByMatch<T extends { searchName?: string; countryCode?: string }>(
+  docs: T[],
+  nq: string,
+  priorityCode: string,
+  keyOf: (d: T) => string,
+): T[] {
+  const seen = new Set<string>();
+  const deduped: T[] = [];
+  for (const d of docs) {
+    const k = keyOf(d);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    deduped.push(d);
+  }
+  const tier = (sn: string) => (sn === nq ? 0 : sn.startsWith(nq) ? 1 : 2);
+  return deduped.sort((a, b) => {
+    const sa = a.searchName ?? "";
+    const sb = b.searchName ?? "";
+    const ta = tier(sa);
+    const tb = tier(sb);
+    if (ta !== tb) return ta - tb; // exact, then prefix, then contains
+    const pa = (a.countryCode ?? "").toUpperCase() === priorityCode ? 0 : 1;
+    const pb = (b.countryCode ?? "").toUpperCase() === priorityCode ? 0 : 1;
+    if (pa !== pb) return pa - pb; // soft-priority boost within the same tier
+    if (sa.length !== sb.length) return sa.length - sb.length; // shorter name first
+    return sa.localeCompare(sb);
+  });
+}
+
+async function searchLocalCatalog(q: string, priorityCode: string): Promise<any[]> {
+  const nq = normalizeSearch(q);
+  if (!nq) return [];
+
+  const CITY_CAP = 10;
+  const HOTEL_CAP = 8;
+  const POOL = 60; // over-fetch per source, then rank and cap
+  const upper = nq + MAX_PREFIX_CHAR;
+
+  // Cities — prefix-range (indexed) + text (indexed), in parallel.
+  const [cityPrefix, cityText] = await Promise.all([
+    (TBOCity as any).find({ searchName: { $gte: nq, $lt: upper } }).limit(POOL).lean(),
+    (TBOCity as any)
+      .find({ $text: { $search: nq } })
+      .limit(POOL)
+      .lean()
+      .catch(() => [] as any[]),
+  ]);
+  const rankedCities = rankByMatch(
+    [...cityPrefix, ...cityText],
+    nq,
+    priorityCode,
+    (d: any) => d.code,
+  ).slice(0, CITY_CAP);
+
+  // Hotels — same hybrid, separate cap so a hotel-name query still surfaces.
+  const [hotelPrefix, hotelText] = await Promise.all([
+    (TBOHotelMaster as any).find({ searchName: { $gte: nq, $lt: upper } }).limit(POOL).lean(),
+    (TBOHotelMaster as any)
+      .find({ $text: { $search: nq } })
+      .limit(POOL)
+      .lean()
+      .catch(() => [] as any[]),
+  ]);
+  const rankedHotels = rankByMatch(
+    [...hotelPrefix, ...hotelText],
+    nq,
+    priorityCode,
+    (d: any) => d.hotelCode,
+  ).slice(0, HOTEL_CAP);
+
+  if (!rankedCities.length && !rankedHotels.length) return [];
+
+  // Resolve display labels: CountryName for both, CityName for hotels (the hotel
+  // master stores cityCode but not cityName).
+  const countryCodes = new Set<string>();
+  for (const c of rankedCities) countryCodes.add(c.countryCode);
+  for (const h of rankedHotels) countryCodes.add(h.countryCode);
+  const hotelCityCodes = [...new Set(rankedHotels.map((h: any) => h.cityCode).filter(Boolean))];
+
+  const [countries, hotelCities] = await Promise.all([
+    (TBOCountry as any).find({ code: { $in: [...countryCodes] } }).lean(),
+    hotelCityCodes.length
+      ? (TBOCity as any).find({ code: { $in: hotelCityCodes } }).lean()
+      : Promise.resolve([] as any[]),
+  ]);
+  const countryNameByCode = new Map<string, string>(
+    (countries as any[]).map((c) => [c.code, c.name]),
+  );
+  const cityNameByCode = new Map<string, string>(
+    (hotelCities as any[]).map((c) => [c.code, c.name]),
+  );
+
+  const cityResults = rankedCities.map((c: any) => ({
+    type: "city" as const,
+    CityId: c.code,
+    CityName: c.name,
+    CountryCode: c.countryCode,
+    CountryName: countryNameByCode.get(c.countryCode) ?? "",
+  }));
+
+  const hotelResults = rankedHotels.map((h: any) => ({
+    type: "hotel" as const,
+    HotelCode: h.hotelCode,
+    HotelName: h.hotelName,
+    CityName: cityNameByCode.get(h.cityCode) ?? "",
+    CityCode: h.cityCode,
+    CountryCode: h.countryCode || "IN",
+    CountryName: countryNameByCode.get(h.countryCode) ?? "",
+  }));
+
+  return [...cityResults, ...hotelResults];
+}
 
 router.get("/cities", async (req: any, res: any) => {
   try {
@@ -637,29 +773,61 @@ router.get("/cities", async (req: any, res: any) => {
     const q = ((req.query.q as string) || "").toLowerCase().trim();
     if (!q || q.length < 2) return res.json([]);
 
-    // ── City search (TBO) — failures must not block hotel name results ──────────
+    // Soft-priority country hint: orders the search, never scopes/excludes.
+    // Defaults to "IN" so "search India first" comes from this param, not a
+    // hardcoded country. Applied to the DB path and the legacy fallback alike.
+    const priorityCode = String(req.query.countryCode || "IN").toUpperCase();
+
+    // ── PRIMARY (Phase 2): local Mongo catalog (tbocities + tbohotelmasters) ──
+    try {
+      const dbResults = await searchLocalCatalog(q, priorityCode);
+      if (dbResults.length > 0) return res.json(dbResults);
+      // Zero DB hits → fall through to the legacy live path for this release.
+      sbtLogger.info("[HOTEL-SEARCH] Local catalog returned 0 results — using live fallback", { q });
+    } catch (dbErr) {
+      sbtLogger.info("[HOTEL-SEARCH] Local catalog query failed — using live fallback", {
+        q,
+        error: dbErr instanceof Error ? dbErr.message : String(dbErr),
+      });
+    }
+
+    // ── FALLBACK (Phase 3 will delete): live TBO calls + in-memory sweep ────────
+    // City search (TBO) — failures must not block hotel name results.
     type CityResult = { type: "city"; CityId: string; CityName: string; CountryCode: string; CountryName: string };
     let cityResults: CityResult[] = [];
     try {
-      // Search Indian cities first (uses 24h in-memory cache)
-      const cities = await fetchCityList("IN");
+      // Search the priority country's cities first (uses 24h in-memory cache)
+      const cities = await fetchCityList(priorityCode);
       let matches = cities.filter((c) => c.CityName.toLowerCase().includes(q));
 
-      // If no Indian results, search known international countries first, then any remaining
       if (!matches.length && q.length > 2) {
         const allCountries = await getCachedCountryList();
-        // Priority: countries in our catalog (guaranteed to have hotels); then the rest
-        const prioritised = [
-          ...allCountries.filter((c) => c.Code !== "IN" && PRIORITY_COUNTRY_CODES.has(c.Code)),
-          ...allCountries.filter((c) => c.Code !== "IN" && !PRIORITY_COUNTRY_CODES.has(c.Code)),
-        ];
-        for (const country of prioritised) {
-          const intlCities = await fetchCityList(country.Code);
-          const intlMatches = intlCities.filter((c) =>
-            c.CityName.toLowerCase().includes(q)
+
+        // (1) Country-name match: if q names a country, return that country's
+        // cities directly — no all-countries sweep. e.g. "turkey" → TR cities.
+        // Deterministic pick: exact name, then startsWith, then first includes.
+        const byName = allCountries.filter((c) => c.Name.toLowerCase().includes(q));
+        const countryMatch =
+          byName.find((c) => c.Name.toLowerCase() === q) ||
+          byName.find((c) => c.Name.toLowerCase().startsWith(q)) ||
+          byName[0];
+
+        if (countryMatch) {
+          matches =
+            countryMatch.Code.toUpperCase() === priorityCode
+              ? cities
+              : await fetchCityList(countryMatch.Code);
+        } else {
+          // (3) Bounded fallback sweep: priority countries only (drop the
+          // "then all the rest" tier that caused the ~50s cold-cache tail).
+          const prioritised = allCountries.filter(
+            (c) => c.Code.toUpperCase() !== priorityCode && PRIORITY_COUNTRY_CODES.has(c.Code),
           );
-          matches.push(...intlMatches);
-          if (matches.length >= 10) break;
+          for (const country of prioritised) {
+            const intlCities = await fetchCityList(country.Code);
+            matches.push(...intlCities.filter((c) => c.CityName.toLowerCase().includes(q)));
+            if (matches.length >= 10) break;
+          }
         }
       }
 
@@ -3374,53 +3542,72 @@ router.get("/images", requireAuth, async (req: any, res: any) => {
     // Split, dedupe, limit to 20 codes
     const codes = [...new Set(hotelCodes.split(",").map((c: string) => c.trim()).filter(Boolean))].slice(0, 20);
 
-    const tboPayload = {
-      Hotelcodes: codes.join(","),
-      Language: "en",
-      IsRoomDetailRequired: false,
-    };
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
-
-    let data: any = {};
-    try {
-      const t0 = Date.now();
-      const tboRes = await fetch(
-        TBO_URLS.HOTEL_DETAILS,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: hotelStaticAuthHeader(),
-          },
-          body: JSON.stringify(tboPayload),
-          signal: controller.signal,
-        }
-      );
-      data = await tboRes.json();
-      logTBOCall({
-        method: "HotelImages",
-        traceId: `hotel-images-${codes[0]}`,
-        request: tboPayload,
-        response: { hotelCount: data?.HotelDetails?.length ?? 0 },
-        durationMs: Date.now() - t0,
-      });
-    } finally {
-      clearTimeout(timeout);
+    // Serve fresh per-code cache hits immediately; only fetch the misses.
+    const imageMap: Record<string, string> = {};
+    const now = Date.now();
+    const missCodes: string[] = [];
+    for (const code of codes) {
+      const hit = hotelImageCache.get(code);
+      if (hit && now - hit.ts < IMAGE_CACHE_TTL) {
+        imageMap[code] = hit.url;
+      } else {
+        missCodes.push(code);
+      }
     }
 
-    // Build { HotelCode: imageUrl } map
-    const hotels: any[] = data?.HotelDetails || data?.Hotels || [];
-    const imageMap: Record<string, string> = {};
-    for (const h of hotels) {
-      const code = h.HotelCode || h.TBOHotelCode || "";
-      const imgs = h.Images || [];
-      const imageUrls = imgs.map((img: any) =>
-        typeof img === "string" ? img : (img.Url || img.url || "")
-      ).filter(Boolean);
-      if (code && imageUrls.length > 0) {
-        imageMap[code] = imageUrls[0];
+    if (missCodes.length) {
+      const tboPayload = {
+        Hotelcodes: missCodes.join(","),
+        Language: "en",
+        IsRoomDetailRequired: false,
+      };
+
+      // Fetch HotelDetails with ONE retry on timeout/throw, so a single
+      // transient failure doesn't blank a whole batch of hotels.
+      const fetchOnce = async (): Promise<any[] | null> => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 12000);
+        try {
+          const t0 = Date.now();
+          const tboRes = await fetch(TBO_URLS.HOTEL_DETAILS, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: hotelStaticAuthHeader(),
+            },
+            body: JSON.stringify(tboPayload),
+            signal: controller.signal,
+          });
+          const data: any = await tboRes.json();
+          logTBOCall({
+            method: "HotelImages",
+            traceId: `hotel-images-${missCodes[0]}`,
+            request: tboPayload,
+            response: { hotelCount: data?.HotelDetails?.length ?? 0 },
+            durationMs: Date.now() - t0,
+          });
+          return data?.HotelDetails || data?.Hotels || [];
+        } catch {
+          return null;
+        } finally {
+          clearTimeout(timeout);
+        }
+      };
+
+      let hotels = await fetchOnce();
+      if (hotels === null) hotels = await fetchOnce(); // single retry
+
+      // Build map from the response and cache only successful non-empty results.
+      for (const h of hotels || []) {
+        const code = h.HotelCode || h.TBOHotelCode || "";
+        const imgs = h.Images || [];
+        const imageUrls = imgs.map((img: any) =>
+          typeof img === "string" ? img : (img.Url || img.url || "")
+        ).filter(Boolean);
+        if (code && imageUrls.length > 0) {
+          imageMap[code] = imageUrls[0];
+          hotelImageCache.set(code, { url: imageUrls[0], ts: Date.now() });
+        }
       }
     }
 
