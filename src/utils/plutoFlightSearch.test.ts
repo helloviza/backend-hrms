@@ -116,4 +116,48 @@ describe("searchFlightsForChat — discriminated result", () => {
     expect(result.reason).toBeNull();
     expect(result.flights).toEqual([]);
   });
+
+  it("round-trip (journeyType:2): sends JourneyType 2 + returnDate and maps the inbound leg", async () => {
+    // Results[0] = outbound options, Results[1] = inbound options.
+    const inboundLeg = rawFlight({
+      ResultIndex: "IB1",
+      Segments: [
+        [
+          {
+            CabinClass: 2,
+            Duration: 130,
+            Airline: { AirlineCode: "6E", AirlineName: "IndiGo", FlightNumber: "2999" },
+            Origin: {
+              DepTime: "2026-05-27T18:00:00",
+              Airport: { AirportCode: "BOM", CityName: "Mumbai", Terminal: "2" },
+            },
+            Destination: {
+              ArrTime: "2026-05-27T20:10:00",
+              Airport: { AirportCode: "DEL", CityName: "Delhi", Terminal: "3" },
+            },
+          },
+        ],
+      ],
+    });
+    mockedSearch.mockResolvedValue({
+      Response: { TraceId: "RT", ResponseStatus: 1, Results: [[rawFlight()], [inboundLeg]] },
+    });
+
+    const result = await searchFlightsForChat({
+      ...baseParams,
+      returnDate: "2026-05-27",
+      journeyType: 2,
+    });
+
+    // Request shape: JourneyType 2 with the returnDate threaded through.
+    expect(mockedSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ JourneyType: 2, returnDate: "2026-05-27" }),
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.flights).toHaveLength(1);
+    expect(result.flights[0].flightNo).toBe("6E-2582");
+    expect(result.inbound).toHaveLength(1);
+    expect(result.inbound[0].flightNo).toBe("6E-2999");
+  });
 });

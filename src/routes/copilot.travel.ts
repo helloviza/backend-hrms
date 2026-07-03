@@ -47,6 +47,7 @@ import {
   searchFlightsForChat,
 } from "../utils/plutoFlightSearch.js";
 import { parseDateToISO } from "../utils/plutoDate.js";
+import { isMultiCityIntent, resolveRoundTripIntent } from "../utils/plutoTripIntent.js";
 import SBTRequest from "../models/SBTRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
@@ -63,6 +64,7 @@ import {
   conversationStarted,
   stateTransition,
   handoffTriggered,
+  multicityDowngraded,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 
@@ -671,7 +673,47 @@ router.post("/", requireAuth, async (req, res) => {
       // logs; Step 4 hoists a per-request id to the top of the main handler).
       const requestId = crypto.randomUUID();
 
+      const workspaceId = String((req as any).workspaceObjectId || "");
+
+      // ── Multi-city: NOT supported in chat yet → loud downgrade to first leg ──
+      // The single-leg extraction above already yields the first leg (first
+      // "from"/"to"), so we search that and tell the user plainly, rather than
+      // silently pretending the whole multi-city trip was searched.
+      const isMultiCity = isMultiCityIntent(prompt);
+      if (isMultiCity) {
+        await emitMetric(
+          multicityDowngraded({ workspaceId, requestId, reason: "chat_first_leg_only" })
+        );
+      }
+
+      // ── Round-trip: search both legs (JourneyType 2) when a return date is
+      // known. Multi-city takes precedence (first-leg one-way). ──
+      const { wantsRoundTrip, returnDateRaw } = isMultiCity
+        ? { wantsRoundTrip: false, returnDateRaw: null }
+        : resolveRoundTripIntent(prompt, context?.locked?.dates?.end || null);
+      const isoReturnDate = returnDateRaw ? parseDateToISO(returnDateRaw) : "";
+      const journeyType: 1 | 2 = wantsRoundTrip && isoReturnDate ? 2 : 1;
+
+      // Round-trip intent but no usable return date → ASK for it. Never fall
+      // through to a silent one-way search (the prior behaviour).
+      if (wantsRoundTrip && isoDate && !isoReturnDate) {
+        return res.json({
+          ok: true,
+          reply: {
+            title: `Round trip: ${origin} → ${destination}`,
+            context: `You mentioned a round trip. What's your return date? Once I have it I'll search both the outbound and return legs.`,
+            nextSteps: [
+              `Tell me your return date (e.g. "20 May 2026")`,
+              `Or say "one way" and I'll search just the outbound`,
+            ],
+            handoff: false,
+          },
+          context: context || {},
+        });
+      }
+
       let chatFlights: any[] = [];
+      let chatInbound: any[] = [];
       let chatTraceId = "";
       // Distinguishes a genuine upstream outage (searchUnavailable = true) from
       // a genuine zero-results route (searchUnavailable = false, flights empty).
@@ -682,6 +724,8 @@ router.post("/", requireAuth, async (req, res) => {
           origin: originIATA,
           destination: destIATA,
           departDate: isoDate,
+          returnDate: journeyType === 2 ? isoReturnDate : undefined,
+          journeyType,
           adults: extractedAdults,
           cabinClass: extractedCabinClass,
           cabinLabel: extractedCabin,
@@ -689,6 +733,7 @@ router.post("/", requireAuth, async (req, res) => {
         });
         if (chatResult.ok) {
           chatFlights = chatResult.flights;
+          chatInbound = chatResult.inbound;
           chatTraceId = chatResult.traceId;
         } else {
           searchUnavailable = true;
@@ -718,39 +763,55 @@ router.post("/", requireAuth, async (req, res) => {
 
       const hasLiveFlights = chatFlights.length > 0;
 
+      // Loud multi-city downgrade note, prepended to the reply copy so the user
+      // knows only the first leg was searched.
+      const multiCityNote = isMultiCity
+        ? `Multi-city trips aren't supported in chat yet — I've searched just the first leg (${originIATA} → ${destIATA}). To book the full multi-city itinerary, tap "Raise a request" and our team will arrange it. `
+        : "";
+      const roundTripNote = journeyType === 2 && chatInbound.length > 0
+        ? ` Return-leg options for ${destIATA} → ${originIATA} are included below.`
+        : "";
+
+      const baseNextSteps = searchUnavailable ? [
+        "Retry the search in a few minutes",
+        "Or use the flight search panel above for full results",
+      ] : hasLiveFlights ? [
+        "Click Book on a flight to continue in our booking flow",
+        "I'll pre-fill the search and take you straight to passenger details",
+      ] : [
+        "Try a slightly different date or route",
+        "Or use the flight search panel above for full results",
+      ];
+      const nextSteps = isMultiCity
+        ? ["Raise a request for the full multi-city trip", ...baseNextSteps]
+        : baseNextSteps;
+
       return res.json({
         ok: true,
         reply: {
           title: `Flights: ${origin} → ${destination}${travelDate ? "  ·  " + travelDate : ""}`,
           context: searchUnavailable
-            ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
+            ? multiCityNote + `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
             : hasLiveFlights
-              ? `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.`
+              ? multiCityNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + roundTripNote
               : !isoDate
                 ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
-                : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`,
+                : multiCityNote + `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`,
           flightSearch: {
             origin:      { city: origin,      iata: originIATA },
             destination: { city: destination, iata: destIATA   },
             date:        travelDate,
             isoDate,
+            journeyType,
             flights:     chatFlights,
+            inbound:     chatInbound,
             cheapest:    chatCheapest,
             fastest:     chatFastest,
             traceId:     chatTraceId,
             source:      searchUnavailable ? "unavailable" : hasLiveFlights ? "tbo" : "none",
             tipLines:    buildFlightTipLines(originIATA, destIATA, travelDate),
           },
-          nextSteps: searchUnavailable ? [
-            "Retry the search in a few minutes",
-            "Or use the flight search panel above for full results",
-          ] : hasLiveFlights ? [
-            "Click Book on a flight to continue in our booking flow",
-            "I'll pre-fill the search and take you straight to passenger details",
-          ] : [
-            "Try a slightly different date or route",
-            "Or use the flight search panel above for full results",
-          ],
+          nextSteps,
           handoff: false,
         },
         context: context || {},
