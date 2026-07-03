@@ -247,8 +247,19 @@ export async function searchHotels(
           marginPct: 0,
         };
       }
-      for (const h of hotelList) hotelMeta.set(h.HotelCode, h);
-      allCodes = hotelList.map((h) => h.HotelCode);
+      // Safety net: the live list is uncapped (dense cities return thousands of
+      // codes → many waves → 30s+). Rank by rating desc and price only the
+      // top-N, exactly like the catalog path above, so no search ever prices
+      // more than SEARCH_TOP_N hotels regardless of catalog coverage.
+      const rankedList = [...hotelList].sort(
+        (a, b) => ratingToInt(b.HotelRating) - ratingToInt(a.HotelRating),
+      );
+      const topList = rankedList.slice(0, SEARCH_TOP_N);
+      for (const h of topList) hotelMeta.set(h.HotelCode, h);
+      allCodes = topList.map((h) => h.HotelCode);
+      sbtLogger.info(
+        `[SEARCH] Fallback top-N: city ${resolvedCityCode}/${CountryCode} live list has ${hotelList.length} hotels — pricing top ${allCodes.length} (cap ${SEARCH_TOP_N})`,
+      );
     }
   }
 
