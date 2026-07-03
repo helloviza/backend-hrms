@@ -46,6 +46,7 @@ import {
   mapTBOFlight,
   searchFlightsForChat,
 } from "../utils/plutoFlightSearch.js";
+import { parseDateToISO } from "../utils/plutoDate.js";
 import SBTRequest from "../models/SBTRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
@@ -662,44 +663,8 @@ router.post("/", requireAuth, async (req, res) => {
       const destIATA   = toIATA(destination);
 
 
-      // Parse any date format to YYYY-MM-DD for SerpAPI
-      const parseDateToISO = (raw: string | null): string => {
-        if (!raw) return "";
-
-        // Already ISO format YYYY-MM-DD — return as-is
-        if (/^\d{4}-\d{2}-\d{2}$/.test(raw.trim())) return raw.trim();
-
-        const months: Record<string, string> = {
-          jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",
-          jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12",
-        };
-
-        // "12th June 2026" / "June 12 2026" / "12 Jun 26"
-        const m = raw.match(/(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3})[a-z]*(?:\s+(\d{2,4}))?/i)
-                || raw.match(/([a-z]{3})[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{2,4}))?/i);
-        if (m) {
-          // Determine which capture group is day vs month
-          const isWordFirst = /^[a-z]/i.test(raw.trim());
-          const day   = isWordFirst ? m[2].padStart(2,"0") : m[1].padStart(2,"0");
-          const mon   = isWordFirst ? m[1] : m[2];
-          const month = months[mon.toLowerCase().slice(0,3)] || "01";
-          const rawY  = isWordFirst ? m[3] : m[3];
-          const year  = !rawY ? "2026" : rawY.length === 2 ? "20" + rawY : rawY;
-          return `${year}-${month}-${day}`;
-        }
-
-        // DD/MM/YYYY or DD-MM-YYYY (Indian standard) — only if first segment ≤ 31
-        const p = raw.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
-        if (p && parseInt(p[1]) <= 31 && parseInt(p[2]) <= 12) {
-          const day   = p[1].padStart(2, "0");
-          const month = p[2].padStart(2, "0");
-          const year  = p[3].length === 2 ? "20" + p[3] : p[3];
-          return `${year}-${month}-${day}`;
-        }
-
-        return "";
-      };
-
+      // Parse any date format to YYYY-MM-DD. Missing-year dates resolve to the
+      // nearest future occurrence (see utils/plutoDate.ts) — no hardcoded year.
       const isoDate = parseDateToISO(travelDate);
 
       // Correlation id for this chat flight-search (threaded into structured
