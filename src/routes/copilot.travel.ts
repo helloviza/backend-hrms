@@ -40,6 +40,12 @@ import {
 
 import { searchFlights as tboSearchFlights } from "../services/tbo.flight.service.js";
 import { searchHotels, isHotelSearchError } from "../services/tbo.hotel.search.service.js";
+import {
+  CABIN_LABELS,
+  dedupeRawTBOFlights,
+  mapTBOFlight,
+  searchFlightsForChat,
+} from "../utils/plutoFlightSearch.js";
 import SBTRequest from "../models/SBTRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
@@ -59,190 +65,9 @@ import {
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 
-// CABIN_LABELS — shared between the chat path and the structured /flights/search
-// path so both produce identical `cabin` strings.
-const CABIN_LABELS: Record<number, string> = {
-  1: "All", 2: "Economy", 3: "Premium Economy",
-  4: "Business", 5: "Premium Business", 6: "First",
-};
-
-// Group raw TBO Result rows by SBT's dedup key — airlineCode + flightNumber +
-// DepTime + ArrTime (mirrors SBTFlightSearch.groupByFlight, lines 753-772).
-// Returns the cheapest fare-class per physical routing, sorted ascending by
-// fare. Drops duplicate fare classes that would otherwise render as multiple
-// identical-looking cards.
-function dedupeRawTBOFlights(rawResults: any[]): any[] {
-  const map = new Map<string, any>();
-  for (const r of rawResults) {
-    const segs: any[] = r?.Segments?.[0] || [];
-    const first = segs[0];
-    const last = segs[segs.length - 1];
-    if (!first) continue;
-    const key = [
-      first.Airline?.AirlineCode ?? "",
-      first.Airline?.FlightNumber ?? "",
-      first.Origin?.DepTime ?? "",
-      last?.Destination?.ArrTime ?? "",
-    ].join("|");
-    const fare = r?.Fare?.OfferedFare ?? r?.Fare?.PublishedFare ?? r?.Fare?.TotalFare ?? 0;
-    const prev = map.get(key);
-    if (!prev || fare < (prev._fareKey ?? Infinity)) {
-      (r as any)._fareKey = fare;
-      map.set(key, r);
-    }
-  }
-  return Array.from(map.values()).sort(
-    (a, b) => (a._fareKey ?? 0) - (b._fareKey ?? 0),
-  );
-}
-
-// Single source of truth: maps one TBO Result row → SBT-aligned flight object
-// that the concierge UI's `toSBTFlight` mapper can consume.
-// Used by BOTH the structured /flights/search endpoint AND the chat NLP
-// endpoint, so the panel renders identically regardless of trigger.
-//
-// `time` is emitted in 24-hour HH:mm:ss (NOT "07:20 am") so the frontend's
-// `toSBTFlight` mapper can concatenate `${date}T${time}` into a valid ISO
-// datetime. FlightResultCard's formatTime then re-formats for display.
-export function mapTBOFlight(
-  r: any,
-  opts: { traceId: string; originIATA: string; destIATA: string; cabinLabel: string },
-): any | null {
-  const segs: any[] = r?.Segments?.[0] || [];
-  const first = segs[0];
-  const last = segs[segs.length - 1];
-  if (!first || !r?.Fare) return null;
-
-  const airlineCode = first.Airline?.AirlineCode || "";
-  const depRawIso = first.Origin?.DepTime || "";
-  const arrRawIso = last.Destination?.ArrTime || "";
-  const depDt = new Date(depRawIso);
-  const arrDt = new Date(arrRawIso);
-  const totalMin = segs.reduce((s: number, seg: any) => s + (seg.Duration || 0), 0);
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-
-  const isoTimeOf = (raw: string, d: Date): string => {
-    if (!isNaN(d.getTime())) {
-      // Use the raw TBO ISO time portion (HH:mm:ss) so we don't introduce a
-      // timezone shift. TBO timestamps are local-with-no-offset; new Date()
-      // interprets them as local, toLocaleTimeString would reformat which
-      // round-trips fine but the raw string is the cleanest source.
-      const m = raw.match(/T(\d{2}:\d{2}(?::\d{2})?)/);
-      if (m) return m[1].length === 5 ? `${m[1]}:00` : m[1];
-      return d.toTimeString().slice(0, 8);
-    }
-    return "";
-  };
-
-  return {
-    ResultIndex: r.ResultIndex,
-    TraceId: opts.traceId,
-    airline: {
-      name: first.Airline?.AirlineName || airlineCode,
-      code: airlineCode,
-      logo: airlineCode ? `https://pics.avs.io/60/60/${airlineCode}.png` : "",
-    },
-    flightNo: `${airlineCode}-${first.Airline?.FlightNumber || ""}`,
-    origin: {
-      code: first.Origin?.Airport?.AirportCode || opts.originIATA,
-      city: first.Origin?.Airport?.CityName || "",
-      terminal: first.Origin?.Airport?.Terminal || "",
-    },
-    destination: {
-      code: last.Destination?.Airport?.AirportCode || opts.destIATA,
-      city: last.Destination?.Airport?.CityName || "",
-      terminal: last.Destination?.Airport?.Terminal || "",
-    },
-    departure: {
-      time: isoTimeOf(depRawIso, depDt),
-      date: isNaN(depDt.getTime()) ? "" : depDt.toISOString().slice(0, 10),
-    },
-    arrival: {
-      time: isoTimeOf(arrRawIso, arrDt),
-      date: isNaN(arrDt.getTime()) ? "" : arrDt.toISOString().slice(0, 10),
-    },
-    duration: `${h}h ${m}m`,
-    stops: segs.length - 1,
-    fare: {
-      published: r.Fare?.PublishedFare || r.Fare?.TotalFare || r.FareBreakdown?.[0]?.BaseFare || 0,
-      offered: r.Fare?.OfferedFare || r.Fare?.PublishedFare || r.Fare?.TotalFare || 0,
-      currency: r.Fare?.Currency || "INR",
-    },
-    cabin: CABIN_LABELS[first.CabinClass] || opts.cabinLabel,
-    baggage: first.Baggage || "",
-    isLCC: r.IsLCC ?? false,
-    isRefundable: r.IsRefundable === true,
-  };
-}
-
-// TBO-only flight search for the concierge chat endpoint. Errors and empty
-// results both yield an empty array; the chat reply renders accordingly.
-// Output rows match the shape produced by POST /flights/search so the
-// frontend's `toSBTFlight` mapper renders chat results and Search-button
-// results identically.
-async function searchFlightsForChat(params: {
-  origin: string;
-  destination: string;
-  departDate: string;
-  adults?: number;
-  children?: number;
-  infants?: number;
-  cabinClass?: number;
-  cabinLabel?: string;
-}): Promise<{ flights: any[]; traceId: string }> {
-  const {
-    origin, destination, departDate,
-    adults = 1, children = 0, infants = 0,
-    cabinClass = 2,
-    cabinLabel = CABIN_LABELS[cabinClass] || "Economy",
-  } = params;
-
-  try {
-    const tboResult: any = await tboSearchFlights({
-      origin,
-      destination,
-      departDate,
-      adults,
-      children,
-      infants,
-      cabinClass,
-    });
-
-    const traceId = tboResult?.Response?.TraceId || "";
-    const status = tboResult?.Response?.ResponseStatus ?? tboResult?.Response?.Status;
-    const results = tboResult?.Response?.Results?.[0] || [];
-
-    if (status !== undefined && status !== 1) {
-      console.error("[ConciergeFlights] TBO non-success", {
-        status,
-        errCode: tboResult?.Response?.Error?.ErrorCode,
-        errMsg: tboResult?.Response?.Error?.ErrorMessage,
-        traceId,
-      });
-      return { flights: [], traceId };
-    }
-
-    if (Array.isArray(results) && results.length > 0) {
-      const opts = { traceId, originIATA: origin, destIATA: destination, cabinLabel };
-      // Dedupe by SBT's exact key (airline + flightNo + DepTime + ArrTime),
-      // cheapest fare-class wins. Then cap. Without dedupe a busy route like
-      // CCU→DEL returns 100+ rows with massive fare-class duplication that
-      // would crowd the chat panel with identical-looking cards and bias the
-      // top-by-fare slice toward a single low-cost airline.
-      const flights = dedupeRawTBOFlights(results)
-        .slice(0, 30)
-        .map((r: any) => mapTBOFlight(r, opts))
-        .filter(Boolean);
-      return { flights, traceId };
-    }
-
-    return { flights: [], traceId };
-  } catch (err: any) {
-    console.error("[ConciergeFlights] TBO search failed", { message: err?.message });
-    return { flights: [], traceId: "" };
-  }
-}
+// CABIN_LABELS, dedupeRawTBOFlights, mapTBOFlight and searchFlightsForChat now
+// live in ../utils/plutoFlightSearch.ts (extracted for unit-testability). The
+// hardened /flights/search path imports the first three; behaviour unchanged.
 
 const router = Router();
 
@@ -877,8 +702,15 @@ router.post("/", requireAuth, async (req, res) => {
 
       const isoDate = parseDateToISO(travelDate);
 
+      // Correlation id for this chat flight-search (threaded into structured
+      // logs; Step 4 hoists a per-request id to the top of the main handler).
+      const requestId = crypto.randomUUID();
+
       let chatFlights: any[] = [];
       let chatTraceId = "";
+      // Distinguishes a genuine upstream outage (searchUnavailable = true) from
+      // a genuine zero-results route (searchUnavailable = false, flights empty).
+      let searchUnavailable = false;
 
       if (isoDate) {
         const chatResult = await searchFlightsForChat({
@@ -888,11 +720,23 @@ router.post("/", requireAuth, async (req, res) => {
           adults: extractedAdults,
           cabinClass: extractedCabinClass,
           cabinLabel: extractedCabin,
+          requestId,
         });
-        chatFlights = chatResult.flights;
-        chatTraceId = chatResult.traceId;
+        if (chatResult.ok) {
+          chatFlights = chatResult.flights;
+          chatTraceId = chatResult.traceId;
+        } else {
+          searchUnavailable = true;
+          console.error("[FlightSearch] chat search unavailable", {
+            requestId,
+            reason: chatResult.reason,
+            origin: originIATA,
+            destination: destIATA,
+            date: isoDate,
+          });
+        }
       } else {
-        console.warn("[FlightSearch] No parseable date — skipping live search");
+        console.warn("[FlightSearch] No parseable date — skipping live search", { requestId });
       }
 
       // Use the SBT-aligned shape (fare.offered, duration "Xh Ym") for sort.
@@ -913,11 +757,13 @@ router.post("/", requireAuth, async (req, res) => {
         ok: true,
         reply: {
           title: `Flights: ${origin} → ${destination}${travelDate ? "  ·  " + travelDate : ""}`,
-          context: hasLiveFlights
-            ? `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.`
-            : !isoDate
-              ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
-              : `Live fares for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""} are temporarily unavailable. Please try again in a few minutes.`,
+          context: searchUnavailable
+            ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
+            : hasLiveFlights
+              ? `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.`
+              : !isoDate
+                ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
+                : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`,
           flightSearch: {
             origin:      { city: origin,      iata: originIATA },
             destination: { city: destination, iata: destIATA   },
@@ -927,10 +773,13 @@ router.post("/", requireAuth, async (req, res) => {
             cheapest:    chatCheapest,
             fastest:     chatFastest,
             traceId:     chatTraceId,
-            source:      hasLiveFlights ? "tbo" : "none",
+            source:      searchUnavailable ? "unavailable" : hasLiveFlights ? "tbo" : "none",
             tipLines:    buildFlightTipLines(originIATA, destIATA, travelDate),
           },
-          nextSteps: hasLiveFlights ? [
+          nextSteps: searchUnavailable ? [
+            "Retry the search in a few minutes",
+            "Or use the flight search panel above for full results",
+          ] : hasLiveFlights ? [
             "Click Book on a flight to continue in our booking flow",
             "I'll pre-fill the search and take you straight to passenger details",
           ] : [
