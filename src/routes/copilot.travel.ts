@@ -30,7 +30,7 @@ import {
   getConversationContext,
   saveConversationContext,
 } from "../utils/plutoMemory.js";
-import { invokePlutoGemini } from "../utils/plutoGeminiInvoke.js";
+import { invokePlutoGemini, GEMINI_FALLBACK_INVALID } from "../utils/plutoGeminiInvoke.js";
 import {
   PLUTO_AI_SYSTEM_PROMPT as PLUTO_SYSTEM_PROMPT,
 } from "../prompts/plutoSystemPrompt.js";
@@ -68,6 +68,7 @@ import {
   searchError,
   aiFallback,
   aiError,
+  aiFallbackInvalid,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 
@@ -1335,15 +1336,18 @@ ${prompt}
       try {
         deltaReply = await invokePlutoGemini(effectivePrompt);
       } catch (geminiErr: any) {
+        // Distinguish a schema-invalid fallback (after its own retry) from a
+        // transport/parse failure, so the metric is actionable.
+        const invalidSchema = geminiErr?.message === GEMINI_FALLBACK_INVALID;
         await emitMetric(
-          aiError({
+          (invalidSchema ? aiFallbackInvalid : aiError)({
             workspaceId,
             requestId,
             conversationId: conversationContext.id,
             reason: geminiErr?.message || "both_engines_failed",
           })
         );
-        throw geminiErr; // outer catch → loud 500
+        throw geminiErr; // outer catch → loud 500 (no malformed JSON downstream)
       }
     }
 
