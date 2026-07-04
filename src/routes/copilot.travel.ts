@@ -4,7 +4,9 @@ import { Router } from "express";
 import { Types } from "mongoose";
 import crypto from "crypto";
 import { optionalAuth } from "../middleware/optionalAuth.js";
-import { requireAuth } from "../middleware/auth.js";
+// requireAuth is applied at the mount (server.ts) for the whole router, so no
+// route in this file re-declares it. requireWorkspace is likewise mount-applied;
+// it is kept on /raise-request only as a defensive local guard.
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import VideoAnalysis from "../models/VideoAnalysis.js";
 import { invokePluto } from "../utils/plutoInvoke.js";
@@ -48,6 +50,7 @@ import {
 } from "../utils/plutoFlightSearch.js";
 import { parseDateToISO } from "../utils/plutoDate.js";
 import { isMultiCityIntent, resolveRoundTripIntent } from "../utils/plutoTripIntent.js";
+import { resolveIATA } from "../utils/plutoIata.js";
 import SBTRequest from "../models/SBTRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
@@ -79,9 +82,10 @@ import { emitMetric } from "../utils/plutoMetricsSink.js";
 const router = Router();
 
 // ✅ PHASE 4 — VIDEO CONSENT ROUTE (TOP-LEVEL, AUTHORITATIVE)
+// Auth + workspace are enforced at the mount (server.ts) — see requireAuth,
+// requireWorkspace, requireFeature("sbtEnabled") on /api/v1/copilot/travel.
 router.post(
   "/video/:videoId/consent",
-  requireAuth,
   async (req, res) => {
     try {
       const { videoId } = req.params;
@@ -206,40 +210,9 @@ router.post(
 
 /* ─────────────────────────────────────────────
  * Flight Utilities — shared by route search and TBO API phase
+ * IATA resolution lives in ../utils/plutoIata.ts (resolveIATA), which returns
+ * null for unknown cities instead of guessing a code.
  * ───────────────────────────────────────────── */
-
-/** IATA map — extended city/country list for Indian travellers */
-const IATA_MAP: Record<string, string> = {
-  // India
-  "delhi": "DEL", "new delhi": "DEL", "mumbai": "BOM", "bombay": "BOM",
-  "bangalore": "BLR", "bengaluru": "BLR", "chennai": "MAA", "madras": "MAA",
-  "hyderabad": "HYD", "kolkata": "CCU", "calcutta": "CCU",
-  "pune": "PNQ", "ahmedabad": "AMD", "goa": "GOI", "kochi": "COK",
-  "jaipur": "JAI", "lucknow": "LKO", "amritsar": "ATQ", "varanasi": "VNS",
-  "srinagar": "SXR", "chandigarh": "IXC", "indore": "IDR", "bhopal": "BHO",
-  // Japan
-  "tokyo": "NRT", "osaka": "KIX", "kyoto": "KIX", "nagoya": "NGO",
-  "sapporo": "CTS", "fukuoka": "FUK", "okinawa": "OKA", "hiroshima": "HIJ",
-  "japan": "NRT",
-  // SE Asia
-  "singapore": "SIN", "bangkok": "BKK", "phuket": "HKT", "bali": "DPS",
-  "kuala lumpur": "KUL", "jakarta": "CGK", "ho chi minh": "SGN", "hanoi": "HAN",
-  "manila": "MNL", "colombo": "CMB", "kathmandu": "KTM", "dhaka": "DAC",
-  // Middle East
-  "dubai": "DXB", "abu dhabi": "AUH", "doha": "DOH", "muscat": "MCT",
-  "riyadh": "RUH", "jeddah": "JED", "kuwait": "KWI",
-  // Europe
-  "london": "LHR", "paris": "CDG", "amsterdam": "AMS", "frankfurt": "FRA",
-  "rome": "FCO", "milan": "MXP", "madrid": "MAD", "barcelona": "BCN",
-  "zurich": "ZRH", "vienna": "VIE", "istanbul": "IST", "athens": "ATH",
-  // Americas / Oceania
-  "new york": "JFK", "los angeles": "LAX", "chicago": "ORD", "toronto": "YYZ",
-  "vancouver": "YVR", "sydney": "SYD", "melbourne": "MEL", "auckland": "AKL",
-};
-
-/** Convert any city/country name to IATA code */
-export const toIATA = (city: string): string =>
-  IATA_MAP[city.toLowerCase().trim()] || city.trim().toUpperCase().slice(0, 3);
 
 /** Generate contextual, route-aware tip lines — no hardcoded Japan text */
 function buildFlightTipLines(originIATA: string, destIATA: string, date: string | null): string[] {
@@ -295,7 +268,7 @@ function buildFlightTipLines(originIATA: string, destIATA: string, date: string 
  * Dedicated structured flight search — called by FlightSearchPanel
  * Accepts IATA codes + ISO date directly, no NLP parsing needed
  */
-router.post("/flights/search", requireAuth, async (req, res) => {
+router.post("/flights/search", async (req, res) => {
   try {
     const {
       origin,
@@ -499,7 +472,7 @@ router.post("/flights/search", requireAuth, async (req, res) => {
  * Response shape mirrors /api/sbt/hotels/search so frontend code that consumes
  * SBT hotel results can render concierge results unchanged.
  */
-router.post("/hotels/search", requireAuth, async (req, res) => {
+router.post("/hotels/search", async (req, res) => {
   try {
     const result = await searchHotels({
       CityCode: req.body?.CityCode,
@@ -543,7 +516,7 @@ router.post("/hotels/search", requireAuth, async (req, res) => {
  * POST /api/v1/copilot/travel
  * Public / semi-auth AI concierge
  */
-router.post("/", requireAuth, async (req, res) => {
+router.post("/", async (req, res) => {
   // Per-request correlation id + tenant, threaded into every log line, metric
   // event and error response for this concierge turn.
   const requestId = crypto.randomUUID();
@@ -557,15 +530,6 @@ router.post("/", requireAuth, async (req, res) => {
         message: "Prompt is required",
       });
     }
-
-    /**
-     * PHASE 4 — VIDEO CONSENT GATE
-     * ---------------------------
-     * Explicit user consent before planning from video
-     *
-     * POST /api/v1/copilot/video/:videoId/consent
-     * body: { consent: "yes" | "no" }
-     */
 
     /* ───────── Domain + Planning Intent Guard (AUTHORITATIVE) ───────── */
 
@@ -669,9 +633,35 @@ router.post("/", requireAuth, async (req, res) => {
       const origin      = resolveCity(rawOrigin,      false);
       const destination = resolveCity(rawDestination, true);
 
-      const originIATA = toIATA(origin);
-      const destIATA   = toIATA(destination);
+      // resolveIATA returns null for anything it can't map (and never guesses a
+      // 3-letter code). If a city the user actually named can't be resolved, ask
+      // them to clarify instead of searching a fabricated airport.
+      const originIATA = resolveIATA(origin);
+      const destIATA   = resolveIATA(destination);
 
+      const unresolvedCities = [
+        rawOrigin && !originIATA ? origin : null,
+        rawDestination && !destIATA ? destination : null,
+      ].filter(Boolean);
+
+      if (!originIATA || !destIATA) {
+        const askWhich = unresolvedCities.length > 0
+          ? `I couldn't match ${unresolvedCities.join(" and ")} to an airport.`
+          : `I need both a departure and destination city to search flights.`;
+        return res.json({
+          ok: true,
+          reply: {
+            title: "Which airport should I search?",
+            context: `${askWhich} Could you give me the city name or its 3-letter airport code (e.g. "Delhi" or "DEL")?`,
+            nextSteps: [
+              "Tell me the departure city or airport code",
+              "Tell me the destination city or airport code",
+            ],
+            handoff: false,
+          },
+          context: context || {},
+        });
+      }
 
       // Parse any date format to YYYY-MM-DD. Missing-year dates resolve to the
       // nearest future occurrence (see utils/plutoDate.ts) — no hardcoded year.
@@ -1430,7 +1420,7 @@ ${prompt}
 /* ────────────────────────────────────────────────────────────────
  * POST /raise-request — Concierge → SBT request pipeline
  * ──────────────────────────────────────────────────────────────── */
-router.post("/raise-request", requireAuth, requireWorkspace, async (req: any, res: any) => {
+router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
   try {
     const user = req.user;
     if (!user?._id) return res.status(401).json({ error: "Unauthorized" });

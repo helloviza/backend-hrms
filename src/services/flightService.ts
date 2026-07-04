@@ -291,6 +291,11 @@ function buildFallbackLinks(flightCode: string) {
 
 /* ─────────────────────────────────────────────────────────────
  * FLIGHT ROUTE SEARCH — SerpAPI Google Flights Engine
+ *
+ * UNUSED-BY-CONCIERGE: searchFlightRoutes() below has no callers on the
+ * concierge (Pluto) path — chat flight search uses TBO via
+ * utils/plutoFlightSearch.searchFlightsForChat. Left intact pending a separate
+ * decision on whether to keep the SerpAPI engine at all.
  * ──────────────────────────────────────────────────────────── */
 
 export interface FlightResult {
