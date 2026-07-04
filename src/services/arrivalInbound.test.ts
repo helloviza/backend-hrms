@@ -7,7 +7,10 @@ const H = vi.hoisted(() => ({
   sendText: vi.fn(),
   sendButtons: vi.fn(),
   emitMetric: vi.fn(),
+  escalate: vi.fn(),
 }));
+
+vi.mock("./arrivalEscalation.js", () => ({ escalateToBooker: H.escalate }));
 
 vi.mock("../models/ArrivalSession.js", () => ({
   default: { findOne: H.findOne, findOneAndUpdate: H.findOneAndUpdate },
@@ -57,6 +60,15 @@ describe("dispatchArrivalInbound", () => {
     await dispatchArrivalInbound({ waId: "919876543210", messageId: "s", text: "STOP" });
     expect(doc.status).toBe("OPTED_OUT");
     expect(H.sendText).toHaveBeenCalledWith("919876543210", expect.stringContaining("unsubscribed"));
+  });
+
+  it("HELP → delegates to escalateToBooker and sends its reply", async () => {
+    H.findOne.mockReturnValue(sortResolves({ _id: "s1" }));
+    H.findOneAndUpdate.mockResolvedValue(makeDoc({ _id: "s1", workspaceId: "ws", phone: "+919876543210", rateWindowCount: 0 }));
+    H.escalate.mockResolvedValue("Your booker Asha has been alerted and will call you within 15 minutes.");
+    await dispatchArrivalInbound({ waId: "919876543210", messageId: "h", buttonId: "arr_help" });
+    expect(H.escalate).toHaveBeenCalledTimes(1);
+    expect(H.sendText).toHaveBeenCalledWith("919876543210", expect.stringContaining("15 minutes"));
   });
 
   it("unknown command caps the menu after 3/day, then points to HELP", async () => {
