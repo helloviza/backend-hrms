@@ -82,6 +82,7 @@
     "@types/qrcode": "^1.5.6",
     "@types/supertest": "^6.0.2",
     "@types/xlsx": "^0.0.36",
+    "mongodb-memory-server": "^11.2.0",
     "puppeteer": "^24.40.0",
     "supertest": "^7.0.0",
     "tsx": "^4.16.2",
