@@ -793,7 +793,7 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
       // ── Round-trip: search both legs (JourneyType 2) when a return date is
       // known. (Multi-city was already handled + returned at the top.) ──
       const { wantsRoundTrip, returnDateRaw } =
-        resolveRoundTripIntent(prompt, context?.locked?.dates?.end || null);
+        resolveRoundTripIntent(prompt, context?.locked?.dates?.end || null, isoDate);
       const isoReturnDate = returnDateRaw ? parseDateToISO(returnDateRaw) : "";
       const journeyType: 1 | 2 = wantsRoundTrip && isoReturnDate ? 2 : 1;
 
@@ -958,6 +958,7 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
             destination: { city: destination, iata: destIATA   },
             date:        travelDate,
             isoDate,
+            isoReturnDate: journeyType === 2 ? isoReturnDate : undefined,
             journeyType,
             flights:     chatFlights,
             inbound:     chatInbound,
