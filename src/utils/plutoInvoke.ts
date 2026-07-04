@@ -6,9 +6,22 @@ import { PLUTO_AI_SYSTEM_PROMPT } from "../prompts/plutoSystemPrompt.js";
 import type { PlutoDeltaReply } from "../types/plutoDelta.js";
 
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY!,
-});
+// Lazy OpenAI client — constructing it eagerly at import throws when
+// OPENAI_API_KEY is unset (the SDK rejects an empty key), which would crash boot.
+// Deferring construction lets the server BOOT without the primary key (the boot
+// check warns) and DEGRADE to the Gemini fallback: invokePluto then rejects at
+// call time and the concierge handler's catch switches to Gemini.
+let _client: OpenAI | null = null;
+function getClient(): OpenAI {
+  if (!_client) {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      throw new Error("OPENAI_API_KEY is not configured — Pluto primary (OpenAI) tier unavailable");
+    }
+    _client = new OpenAI({ apiKey });
+  }
+  return _client;
+}
 
 /**
  * Extract first JSON object from LLM output safely
@@ -59,7 +72,7 @@ Rules:
     }
 
     try {
-      const res = await client.chat.completions.create({
+      const res = await getClient().chat.completions.create({
         model: "gpt-4.1-mini",
         temperature: 0.25,
         max_tokens: 1200,
