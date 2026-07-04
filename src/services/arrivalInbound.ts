@@ -15,6 +15,7 @@ import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { arriveMetric } from "../utils/plutoMetricsBuilder.js";
 import { ARRIVAL_BUTTONS } from "./arrivalSession.js";
 import { resolveCommand } from "./arrivalConcierge.js";
+import { escalateToBooker } from "./arrivalEscalation.js";
 
 const RATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 const RATE_MAX = 20; // max processed inbound / session / hour
@@ -129,8 +130,8 @@ async function executeArrivalCommand(session: any, input: ArrivalInboundInput): 
   }
 
   if (result.action === "ESCALATE") {
-    // Step 4 replaces this with real booker escalation (SBTRequest + email).
-    await sendTextMessageResult(to, "Your booker has been alerted and will call you within 15 minutes.");
+    const reply = await escalateToBooker(session);
+    await sendTextMessageResult(to, reply);
     return;
   }
 
