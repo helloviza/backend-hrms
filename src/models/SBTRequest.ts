@@ -31,6 +31,19 @@ export interface ISBTRequest extends Document {
     phone?: string;
   };
   bookerNotes?: string;
+  // Origin channel. Absent on legacy records (which carry searchParams.source).
+  source?: string; // "CONCIERGE" | "CONCIERGE_AI" | ...
+  conversationId?: string;
+  // Richer concierge handoff (Phase 2). NEW subdocument — never repurpose
+  // searchParams, which is load-bearing in sbt.requests.ts.
+  tripBundle?: {
+    outboundFlight?: Record<string, any>;
+    inboundFlight?: Record<string, any>;
+    hotel?: Record<string, any>;
+    policyStatus?: string;
+    conversationSummary?: string;
+    lockedDecisions?: Record<string, any>;
+  };
   requestedAt: Date;
   actedAt?: Date;
   cancelledAt?: Date;
@@ -76,6 +89,19 @@ const SBTRequestSchema = new Schema({
     phone: { type: String },
   },
   bookerNotes: { type: String, default: null },
+
+  source: { type: String, default: null, index: true },
+  conversationId: { type: String, default: null, index: true },
+  // NEW subdocument for the richer concierge handoff. Optional; existing
+  // single-flight raise-request calls simply omit it.
+  tripBundle: {
+    outboundFlight: { type: Object, default: null },
+    inboundFlight: { type: Object, default: null },
+    hotel: { type: Object, default: null },
+    policyStatus: { type: String, default: null },
+    conversationSummary: { type: String, default: null },
+    lockedDecisions: { type: Object, default: null },
+  },
 
   requestedAt: { type: Date, default: Date.now },
   actedAt: { type: Date, default: null },

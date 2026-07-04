@@ -14,7 +14,10 @@ export type PlutoMetricEventType =
   | "pluto.ai.fallback_invalid"
   | "pluto.multicity.downgraded"
   // Policy evaluation (Phase 2)
-  | "pluto.policy.evaluated";
+  | "pluto.policy.evaluated"
+  // Richer handoff delivery (Phase 2)
+  | "pluto.handoff.delivered"
+  | "pluto.handoff.failed";
 
 // Severity drives sink routing: "error"/"warn" events always surface (console
 // error/warn) regardless of the PLUTO_METRICS analytics flag; "info" events

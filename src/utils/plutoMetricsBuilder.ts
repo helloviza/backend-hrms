@@ -62,6 +62,24 @@ export function multicityDowngraded(args: FailureArgs): PlutoMetricEvent {
   };
 }
 
+export function handoffDelivered(args: FailureArgs): PlutoMetricEvent {
+  return {
+    type: "pluto.handoff.delivered",
+    severity: "info",
+    timestamp: new Date().toISOString(),
+    ...args,
+  };
+}
+
+export function handoffFailed(args: FailureArgs): PlutoMetricEvent {
+  return {
+    type: "pluto.handoff.failed",
+    severity: "error",
+    timestamp: new Date().toISOString(),
+    ...args,
+  };
+}
+
 export function policyEvaluated(args: {
   workspaceId?: string;
   requestId?: string;

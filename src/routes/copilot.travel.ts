@@ -52,6 +52,7 @@ import { parseDateToISO } from "../utils/plutoDate.js";
 import { isMultiCityIntent, resolveRoundTripIntent } from "../utils/plutoTripIntent.js";
 import { resolveIATA } from "../utils/plutoIata.js";
 import { loadWorkspacePolicyRules } from "../services/policyService.js";
+import { renderTripSummaryHtml } from "../services/conciergeHandoff.js";
 import {
   evaluateFlightPolicy,
   evaluateHotelPolicy,
@@ -102,6 +103,8 @@ import {
   aiError,
   aiFallbackInvalid,
   policyEvaluated,
+  handoffDelivered,
+  handoffFailed,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 
@@ -1456,13 +1459,50 @@ ${prompt}
         handoffTriggered(conversationContext.id, conversationContext.turn)
       );
 
-      const payload = buildHandoffPayload(
-        fullReply,
-        conversationContext.state,
-        conversationContext.locked
-      );
+      // Idempotency: deliver AT MOST ONCE per conversation. The guard flag lives
+      // on the conversation context (round-tripped to the client), NOT in
+      // plutoMemory.ts. Repeated handoff-ready turns do not create duplicates.
+      if (!conversationContext.handoffDelivered) {
+        const payload = buildHandoffPayload(
+          fullReply,
+          conversationContext.state,
+          conversationContext.locked
+        );
 
-      await sendHandoffPayload(payload);
+        const reqUser = (req as any).user || {};
+        const result = await sendHandoffPayload(payload, {
+          workspaceObjectId: (req as any).workspaceObjectId,
+          requesterId: reqUser._id,
+          requesterEmail: reqUser.email,
+          requesterName: reqUser.name,
+          conversationId: conversationContext.id,
+        });
+
+        if (result.delivered) {
+          conversationContext.handoffDelivered = true;
+          conversationContext.handoffRequestId = result.requestId;
+          await emitMetric(
+            handoffDelivered({
+              workspaceId,
+              requestId,
+              conversationId: conversationContext.id,
+              reason: result.requestId,
+            })
+          );
+        } else {
+          // Never silent: emit an error metric AND surface to the user.
+          await emitMetric(
+            handoffFailed({
+              workspaceId,
+              requestId,
+              conversationId: conversationContext.id,
+              reason: result.error,
+            })
+          );
+          (fullReply as any).handoffError =
+            "I couldn't reach our travel desk automatically — please tap \"Raise a request\" and we'll pick it up.";
+        }
+      }
     }
 
     /* ───────── Save to Memory ───────── */
@@ -1505,7 +1545,7 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
     const user = req.user;
     if (!user?._id) return res.status(401).json({ error: "Unauthorized" });
 
-    const { flightData, passengers, notes } = req.body;
+    const { flightData, passengers, notes, tripBundle, conversationId } = req.body;
 
     if (!flightData || !flightData.ResultIndex || !flightData.TraceId) {
       return res.status(400).json({
@@ -1565,11 +1605,15 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
       requesterId: user._id,
       assignedBookerId,
       type: "flight",
+      source: "CONCIERGE",
+      conversationId: conversationId || null,
       searchParams,
       selectedOption: flightData,
       requesterNotes: notes || null,
       passengerDetails: passengers || [],
       contactDetails: { email: user.email },
+      // Additive: optional richer bundle. Omitted by existing single-flight calls.
+      tripBundle: tripBundle || undefined,
       status: "PENDING",
     });
 
@@ -1594,6 +1638,7 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
           ${date ? `<p><strong>Date:</strong> ${date}</p>` : ""}
           <p><strong>Fare:</strong> ₹${(flightData.fare?.offered || flightData.fare?.published || 0).toLocaleString("en-IN")}</p>
           ${notes ? `<p><strong>Notes:</strong> ${notes}</p>` : ""}
+          ${tripBundle ? renderTripSummaryHtml(tripBundle) : ""}
           <p><a href="${frontendUrl}/sbt/inbox">View in Booking Inbox</a></p>
         `,
       }).catch((e: any) => console.warn("[Concierge] Failed to send request email:", e?.message));
