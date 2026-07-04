@@ -801,6 +801,34 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
       const isoReturnDate = returnDateRaw ? parseDateToISO(returnDateRaw) : "";
       const journeyType: 1 | 2 = wantsRoundTrip && isoReturnDate ? 2 : 1;
 
+      // ── Amendment T — accumulate the route + dates the user just stated into
+      // conversationContext.locked (set-if-absent) BEFORE returning. The flight
+      // branch runs before the AI-path extractor, so without this the origin /
+      // dates the user typed here would never reach locked: later turns would
+      // lose them and the duration-consistency check (Step 4) would have nothing
+      // to compare. Persisted best-effort (a miss/no-DB is a graceful no-op).
+      const priorLocked =
+        context && typeof context === "object" && context.locked && typeof context.locked === "object"
+          ? { ...context.locked }
+          : {};
+      const mergedLocked: any = { ...priorLocked };
+      if (!mergedLocked.origin && rawOrigin && originIATA) {
+        mergedLocked.origin = { city: origin, iata: originIATA, source: "user" };
+      }
+      if (!mergedLocked.destination && rawDestination && destIATA) {
+        mergedLocked.destination = { name: destination, iata: destIATA, source: "user" };
+      }
+      if (!mergedLocked.dates && isoDate) {
+        mergedLocked.dates = { start: isoDate, ...(isoReturnDate ? { end: isoReturnDate } : {}), source: "user" };
+      }
+      const lockedReturnContext = { ...(context && typeof context === "object" ? context : {}), id: conversationId, locked: mergedLocked };
+      void saveConversationContext({
+        workspaceObjectId: (req as any).workspaceObjectId,
+        userId: (req as any).user?._id,
+        conversationId,
+        context: lockedReturnContext,
+      });
+
       // Round-trip intent but no usable return date → ASK for it. Never fall
       // through to a silent one-way search (the prior behaviour).
       if (wantsRoundTrip && isoDate && !isoReturnDate) {
@@ -815,7 +843,7 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
             ],
             handoff: false,
           },
-          context: context || {},
+          context: lockedReturnContext,
         });
       }
 
@@ -985,7 +1013,7 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
           nextSteps,
           handoff: false,
         },
-        context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
+        context: lockedReturnContext,
       });
     }
 

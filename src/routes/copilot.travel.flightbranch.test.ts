@@ -62,3 +62,20 @@ describe("Amendment S — cabin detection is flight-adjacent, never off a hotel 
     expect(body.reply.context).toMatch(/Cheapest fare found: ₹/);
   });
 });
+
+describe("Amendment T — the flight branch writes route/dates into locked", () => {
+  it("locks origin + dates (start/end) after a flight search", async () => {
+    const body = await chat("flights from Delhi to Mumbai on 20 May 2026 returning 24 May 2026");
+    expect(body.context.locked.origin.city).toBe("Delhi");
+    expect(body.context.locked.dates.start).toBe("2026-05-20");
+    expect(body.context.locked.dates.end).toBe("2026-05-24");
+  });
+
+  it("keeps a previously-locked destination (set-if-absent) while adding origin/dates", async () => {
+    const seeded = { id: "c1", locked: { destination: { name: "Mumbai", iata: "BOM", source: "user" }, duration: { days: 3 } } };
+    const body = await chat("find flights from Delhi on 20 May 2026, back on 24 May", seeded);
+    expect(body.context.locked.destination.name).toBe("Mumbai"); // retained
+    expect(body.context.locked.origin.city).toBe("Delhi");       // added
+    expect(body.context.locked.dates.start).toBe("2026-05-20");
+  });
+});
