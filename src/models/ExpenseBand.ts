@@ -1,4 +1,10 @@
 // apps/backend/src/models/ExpenseBand.ts
+//
+// OVERLAP NOTE (deferred): maxFlightFarePerPerson / maxHotelFarePerNight here
+// are per-employee-band caps owned by the expense module. They overlap
+// conceptually with TravelPolicy.maxFlightPriceINR / maxHotelPricePerNightINR
+// (per-workspace travel policy). Composing band caps into the travel
+// PolicyRules is DEFERRED to a later phase; neither model reads the other yet.
 import mongoose, { Schema, type Document } from "mongoose";
 
 export interface IExpenseBand extends Document {
