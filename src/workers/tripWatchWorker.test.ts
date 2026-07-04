@@ -18,6 +18,7 @@ function baseDeps(over: Partial<WatchCycleDeps> = {}): WatchCycleDeps {
     createAndNotifyAlert: vi.fn().mockResolvedValue(undefined),
     isBookingCancelled: vi.fn().mockResolvedValue(false),
     cancelWatch: vi.fn().mockResolvedValue(undefined),
+    handleArrival: vi.fn().mockResolvedValue(undefined),
     ...over,
   };
 }

@@ -88,6 +88,25 @@ export function watchMetric(
   return { type, severity, timestamp: new Date().toISOString(), ...args };
 }
 
+// Arrival concierge (Phase 4). One helper for the whole pluto.arrive.* family;
+// severity defaults to info unless overridden (greeting/escalation failures pass
+// "error"; rate-limit passes "warn").
+export function arriveMetric(
+  type:
+    | "pluto.arrive.session_opened"
+    | "pluto.arrive.expired"
+    | "pluto.arrive.message_handled"
+    | "pluto.arrive.escalated"
+    | "pluto.arrive.unknown_sender"
+    | "pluto.arrive.greeting_failed"
+    | "pluto.arrive.escalation_failed"
+    | "pluto.arrive.rate_limited",
+  args: FailureArgs = {},
+  severity: "info" | "warn" | "error" = "info",
+): PlutoMetricEvent {
+  return { type, severity, timestamp: new Date().toISOString(), ...args };
+}
+
 export function handoffDelivered(args: FailureArgs): PlutoMetricEvent {
   return {
     type: "pluto.handoff.delivered",

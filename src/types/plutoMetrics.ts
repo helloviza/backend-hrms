@@ -27,7 +27,16 @@ export type PlutoMetricEventType =
   | "pluto.watch.create_failed"
   | "pluto.notify.sent"
   | "pluto.notify.failed"
-  | "pluto.weather.failed";
+  | "pluto.weather.failed"
+  // Arrival concierge (Phase 4 — Arrive)
+  | "pluto.arrive.session_opened"
+  | "pluto.arrive.expired"
+  | "pluto.arrive.message_handled"
+  | "pluto.arrive.escalated"
+  | "pluto.arrive.unknown_sender"
+  | "pluto.arrive.greeting_failed"
+  | "pluto.arrive.escalation_failed"
+  | "pluto.arrive.rate_limited";
 
 // Severity drives sink routing: "error"/"warn" events always surface (console
 // error/warn) regardless of the PLUTO_METRICS analytics flag; "info" events
