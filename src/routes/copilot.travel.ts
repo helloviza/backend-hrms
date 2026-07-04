@@ -88,6 +88,8 @@ function buildZeroInPolicyNote(rules: PolicyRules): string {
 import SBTRequest from "../models/SBTRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
+import Itinerary from "../models/Itinerary.js";
+import { assembleItinerary, type ItineraryItemInput } from "../services/itineraryAssembly.js";
 import { sendMail } from "../utils/mailer.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { getMarginConfig, applyMargin, isDomestic } from "../utils/margin.js";
@@ -1726,6 +1728,81 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[Concierge/RaiseRequest] Error:", err.message);
     return res.status(500).json({ error: "Failed to raise request" });
+  }
+});
+
+/**
+ * POST /itinerary — create or update the DRAFT itinerary for a conversation.
+ * Idempotent per (workspace, conversationId): the same conversationId updates the
+ * existing DRAFT (same-kind selections replace) rather than creating a duplicate.
+ * Auth + workspace are enforced at the mount.
+ */
+router.post("/itinerary", requireWorkspace, async (req: any, res: any) => {
+  try {
+    const user = req.user;
+    if (!user?._id) return res.status(401).json({ error: "Unauthorized" });
+    const workspaceObjectId = (req as any).workspaceObjectId;
+
+    const { conversationId, title, destinationCity, destinationIata, dates, items } = req.body || {};
+    const incoming: ItineraryItemInput[] = Array.isArray(items) ? items : [];
+
+    // Reuse the existing DRAFT for this conversation when present (idempotent).
+    let doc: any = conversationId
+      ? await Itinerary.findOne({ workspaceId: workspaceObjectId, conversationId, status: "DRAFT" })
+      : null;
+
+    const existing = doc ? doc.items : [];
+    const assembled = assembleItinerary(existing, incoming); // pure; throws on bad kind → 400 below
+
+    if (!doc) {
+      doc = await Itinerary.create({
+        workspaceId: workspaceObjectId,
+        conversationId: conversationId || null,
+        createdByUserId: user._id,
+        title: title || "Trip",
+        destinationCity: destinationCity || null,
+        destinationIata: destinationIata || null,
+        dates: { start: dates?.start || null, end: dates?.end || null },
+        items: assembled.items,
+        totalPriceINR: assembled.totalPriceINR,
+        policySummary: assembled.policySummary,
+        status: "DRAFT",
+      });
+    } else {
+      doc.items = assembled.items;
+      doc.totalPriceINR = assembled.totalPriceINR;
+      doc.policySummary = assembled.policySummary;
+      if (title) doc.title = title;
+      if (destinationCity) doc.destinationCity = destinationCity;
+      if (destinationIata) doc.destinationIata = destinationIata;
+      if (dates?.start) doc.dates.start = dates.start;
+      if (dates?.end) doc.dates.end = dates.end;
+      await doc.save();
+    }
+
+    return res.status(200).json({ ok: true, itinerary: doc });
+  } catch (err: any) {
+    if (/Invalid itinerary item kind/.test(err?.message || "")) {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error("[Concierge/Itinerary] Error:", err?.message);
+    return res.status(500).json({ error: "Failed to assemble itinerary" });
+  }
+});
+
+/**
+ * GET /itinerary/:id — workspace-scoped read. A wrong-workspace id → 404 (never
+ * leaks another tenant's itinerary).
+ */
+router.get("/itinerary/:id", requireWorkspace, async (req: any, res: any) => {
+  try {
+    const workspaceObjectId = (req as any).workspaceObjectId;
+    const doc = await Itinerary.findOne({ _id: req.params.id, workspaceId: workspaceObjectId });
+    if (!doc) return res.status(404).json({ error: "Itinerary not found" });
+    return res.status(200).json({ ok: true, itinerary: doc });
+  } catch (err: any) {
+    // A malformed ObjectId is a not-found from the caller's perspective.
+    return res.status(404).json({ error: "Itinerary not found" });
   }
 });
 
