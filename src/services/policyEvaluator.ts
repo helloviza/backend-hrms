@@ -118,6 +118,51 @@ export function evaluateHotelPolicy(
   return combine(hard, soft);
 }
 
+/* ── Pure adapters: raw TBO shapes → normalised policy inputs ─────────── */
+
+// Fare-type of a TBO result. CORPORATE when the corporate flags indicate it
+// (per sbt.flights.ts corporate path), else RETAIL. Best-effort per-row: the
+// corporate signal is usually search-level, so most rows resolve to RETAIL.
+export function deriveFareType(rawRow: any): FareType {
+  if (rawRow?.IsCorporateFare === true || rawRow?.CorporateBookingAllowed === true) {
+    return "CORPORATE";
+  }
+  return "RETAIL";
+}
+
+export function flightForPolicyFromTBO(rawRow: any): FlightForPolicy {
+  const seg = rawRow?.Segments?.[0]?.[0];
+  const priceINR =
+    rawRow?.Fare?.OfferedFare ??
+    rawRow?.Fare?.PublishedFare ??
+    rawRow?.Fare?.TotalFare ??
+    0;
+  return {
+    priceINR,
+    cabinClass: seg?.CabinClass ?? null,
+    fareType: deriveFareType(rawRow),
+    isLCC: rawRow?.IsLCC === true,
+    isRefundable: rawRow?.IsRefundable === true,
+  };
+}
+
+// Hotel adapter. pricePerNightINR is the cheapest room's display fare divided
+// by the stay length; pass nights from the search request. When nights is
+// unknown (<=0) the per-night price is left null so price rules don't fire on
+// unreliable data — the star cap still applies.
+export function hotelForPolicyFromResult(hotel: any, nights?: number): HotelForPolicy {
+  const rooms: any[] = Array.isArray(hotel?.Rooms) ? hotel.Rooms : [];
+  const fares = rooms
+    .map((r) => (typeof r?._displayTotalFare === "number" ? r._displayTotalFare : r?.TotalFare))
+    .filter((n) => typeof n === "number" && n > 0) as number[];
+  const cheapestTotal = fares.length ? Math.min(...fares) : null;
+  const n = typeof nights === "number" && nights > 0 ? nights : 0;
+  return {
+    starRating: typeof hotel?.StarRating === "number" ? hotel.StarRating : null,
+    pricePerNightINR: cheapestTotal != null && n > 0 ? Math.round(cheapestTotal / n) : null,
+  };
+}
+
 // Derive a plain PolicyRules from a TravelPolicy document (or lean object).
 // Returns null when no doc — callers then get the "no_policy_configured" path.
 export function policyRulesFromDoc(doc: any): PolicyRules | null {

@@ -10,6 +10,25 @@
 // byte-for-byte the same as before extraction. Do NOT change it.
 
 import { searchFlights as tboSearchFlights } from "../services/tbo.flight.service.js";
+import {
+  evaluateFlightPolicy,
+  flightForPolicyFromTBO,
+  type PolicyRules,
+} from "../services/policyEvaluator.js";
+
+// In-policy first, then needs-approval, then out-of-policy. Stable, so the
+// within-rank fare ordering from dedupeRawTBOFlights is preserved.
+const POLICY_RANK: Record<string, number> = { IN_POLICY: 0, NEEDS_APPROVAL: 1, OUT_OF_POLICY: 2 };
+function sortInPolicyFirst(flights: any[]): any[] {
+  return flights
+    .map((f, i) => ({ f, i }))
+    .sort((a, b) => {
+      const ra = POLICY_RANK[a.f?.policy?.status] ?? 0;
+      const rb = POLICY_RANK[b.f?.policy?.status] ?? 0;
+      return ra - rb || a.i - b.i;
+    })
+    .map((x) => x.f);
+}
 
 // CABIN_LABELS — shared between the chat path and the structured /flights/search
 // path so both produce identical `cabin` strings.
@@ -178,6 +197,7 @@ export async function searchFlightsForChat(params: {
   cabinClass?: number;
   cabinLabel?: string;
   requestId?: string;
+  policyRules?: PolicyRules | null;
 }): Promise<ChatFlightSearchResult> {
   const {
     origin, destination, departDate, returnDate,
@@ -186,6 +206,7 @@ export async function searchFlightsForChat(params: {
     cabinClass = 2,
     cabinLabel = CABIN_LABELS[cabinClass] || "Economy",
     requestId = "",
+    policyRules = null,
   } = params;
 
   try {
@@ -230,15 +251,22 @@ export async function searchFlightsForChat(params: {
     // CCU→DEL returns 100+ rows with massive fare-class duplication that
     // would crowd the chat panel with identical-looking cards and bias the
     // top-by-fare slice toward a single low-cost airline.
-    const flights = dedupeRawTBOFlights(outboundRaw)
-      .slice(0, 30)
-      .map((r: any) => mapTBOFlight(r, opts))
-      .filter(Boolean);
+    // Each mapped flight is ANNOTATED with an additive `policy` field
+    // (never filtered), then chat results are sorted in-policy first.
+    const mapAnnotate = (rows: any[]): any[] =>
+      rows
+        .map((r: any) => {
+          const f = mapTBOFlight(r, opts);
+          if (f) f.policy = evaluateFlightPolicy(flightForPolicyFromTBO(r), policyRules);
+          return f;
+        })
+        .filter(Boolean);
+
+    const flights = sortInPolicyFirst(
+      mapAnnotate(dedupeRawTBOFlights(outboundRaw).slice(0, 30)),
+    );
     const inbound = journeyType === 2
-      ? dedupeRawTBOFlights(inboundRaw)
-          .slice(0, 30)
-          .map((r: any) => mapTBOFlight(r, opts))
-          .filter(Boolean)
+      ? sortInPolicyFirst(mapAnnotate(dedupeRawTBOFlights(inboundRaw).slice(0, 30)))
       : [];
 
     return { ok: true, reason: null, flights, inbound, traceId };

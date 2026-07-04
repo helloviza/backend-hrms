@@ -15,6 +15,10 @@ vi.mock("../services/tbo.flight.service.js", () => ({ searchFlights: searchFligh
 const { emitMetricMock } = vi.hoisted(() => ({ emitMetricMock: vi.fn() }));
 vi.mock("../utils/plutoMetricsSink.js", () => ({ emitMetric: emitMetricMock }));
 
+// Policy loader mocked so no Mongo is needed; defaults to no policy.
+const { policyRulesMock } = vi.hoisted(() => ({ policyRulesMock: vi.fn() }));
+vi.mock("../services/policyService.js", () => ({ loadWorkspacePolicyRules: policyRulesMock }));
+
 import express from "express";
 import request from "supertest";
 import router from "./copilot.travel.js";
@@ -48,6 +52,8 @@ const chat = (prompt: string) => request(app).post("/").send({ prompt }).then(r 
 beforeEach(() => {
   searchFlightsMock.mockReset();
   emitMetricMock.mockReset();
+  policyRulesMock.mockReset();
+  policyRulesMock.mockResolvedValue(null); // default: no policy
 });
 
 describe("concierge chat — Phase 1 reply states", () => {
@@ -97,5 +103,25 @@ describe("concierge chat — Phase 1 reply states", () => {
     expect(types).toContain("pluto.multicity.downgraded");
     // Loud downgrade must NOT run a search with a mis-parsed "Mumbai to Goa".
     expect(searchFlightsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("concierge chat — Phase 2 policy annotation", () => {
+  it("zero in-policy → 'clear why' cap message + pluto.policy.evaluated metric", async () => {
+    // Strict cap makes the ₹4,800 flight out-of-policy → 0 in policy.
+    policyRulesMock.mockResolvedValue({ active: true, maxFlightPriceINR: 1000 });
+    searchFlightsMock.mockResolvedValue({ Response: { TraceId: "P", ResponseStatus: 1, Results: [[rawFlight()]] } });
+
+    const body = await chat("find flights from Delhi to Mumbai on 20 May 2026");
+
+    // Results are annotated + still shown (never filtered).
+    expect(body.reply.flightSearch.flights).toHaveLength(1);
+    expect(body.reply.flightSearch.flights[0].policy.status).toBe("OUT_OF_POLICY");
+    // Plain-language "why" naming the cap.
+    expect(body.reply.context).toMatch(/exceed your company's ₹1,000 flight cap/i);
+
+    const policyEvents = emitMetricMock.mock.calls.map(c => c[0]).filter(e => e?.type === "pluto.policy.evaluated");
+    expect(policyEvents).toHaveLength(1);
+    expect(policyEvents[0].metadata).toEqual({ inPolicyCount: 0, totalCount: 1 });
   });
 });

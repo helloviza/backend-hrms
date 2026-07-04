@@ -51,6 +51,35 @@ import {
 import { parseDateToISO } from "../utils/plutoDate.js";
 import { isMultiCityIntent, resolveRoundTripIntent } from "../utils/plutoTripIntent.js";
 import { resolveIATA } from "../utils/plutoIata.js";
+import { loadWorkspacePolicyRules } from "../services/policyService.js";
+import {
+  evaluateFlightPolicy,
+  evaluateHotelPolicy,
+  flightForPolicyFromTBO,
+  hotelForPolicyFromResult,
+  type PolicyRules,
+} from "../services/policyEvaluator.js";
+
+// Whole nights between two ISO dates; 0 when unparseable (per-night price then
+// left null so hotel price rules don't fire on bad data).
+function hotelNights(checkIn?: string, checkOut?: string): number {
+  if (!checkIn || !checkOut) return 0;
+  const a = new Date(checkIn).getTime();
+  const b = new Date(checkOut).getTime();
+  if (isNaN(a) || isNaN(b) || b <= a) return 0;
+  return Math.round((b - a) / 86400000);
+}
+
+// Plain-language "clear why" copy when zero live flights are in policy.
+function buildZeroInPolicyNote(rules: PolicyRules): string {
+  if (rules.maxFlightPriceINR != null) {
+    return `All options exceed your company's ₹${rules.maxFlightPriceINR.toLocaleString("en-IN")} flight cap — showing them anyway; approval will be required.`;
+  }
+  if (rules.approvalAbovePriceINR != null) {
+    return `All options are above your company's ₹${rules.approvalAbovePriceINR.toLocaleString("en-IN")} approval threshold — showing them anyway; approval will be required.`;
+  }
+  return "None of these options are within your company travel policy — showing them anyway; approval may be required.";
+}
 import SBTRequest from "../models/SBTRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
@@ -72,6 +101,7 @@ import {
   aiFallback,
   aiError,
   aiFallbackInvalid,
+  policyEvaluated,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 
@@ -269,6 +299,8 @@ function buildFlightTipLines(originIATA: string, destIATA: string, date: string 
  * Accepts IATA codes + ISO date directly, no NLP parsing needed
  */
 router.post("/flights/search", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const workspaceId = String((req as any).workspaceObjectId || "");
   try {
     const {
       origin,
@@ -441,17 +473,29 @@ router.post("/flights/search", async (req, res) => {
       destIATA,
       cabinLabel: typeof cabin === "string" ? cabin : (CABIN_LABELS[cabinClass] || "Economy"),
     };
+    // Load the workspace policy (tenant-scoped, fail-safe → null).
+    const policyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
+    // Annotate each result with an ADDITIVE `policy` field. Order is preserved
+    // (unlike the chat path) to keep the FlightSearchPanel contract stable.
+    const annotate = (rows: any[]): any[] =>
+      rows
+        .map((r: any) => {
+          const f = mapTBOFlight(r, mapperOpts);
+          if (f) f.policy = evaluateFlightPolicy(flightForPolicyFromTBO(r), policyRules);
+          return f;
+        })
+        .filter(Boolean);
+
     // Dedupe + cap mirrors searchFlightsForChat; both endpoints must produce
     // the same set so the FlightSearchPanel renders identically regardless of
     // trigger (chat NLP vs explicit Search button).
-    const results = dedupeRawTBOFlights(outboundRaw)
-      .slice(0, 30)
-      .map((r: any) => mapTBOFlight(r, mapperOpts))
-      .filter(Boolean);
-    const inbound = dedupeRawTBOFlights(inboundRaw)
-      .slice(0, 30)
-      .map((r: any) => mapTBOFlight(r, mapperOpts))
-      .filter(Boolean);
+    const results = annotate(dedupeRawTBOFlights(outboundRaw).slice(0, 30));
+    const inbound = annotate(dedupeRawTBOFlights(inboundRaw).slice(0, 30));
+
+    const inPolicyCount = results.filter((f: any) => f?.policy?.status === "IN_POLICY").length;
+    await emitMetric(
+      policyEvaluated({ workspaceId, requestId, inPolicyCount, totalCount: results.length })
+    );
 
     const response: any = { ok: true, results, traceId };
     if (inbound.length > 0) response.inbound = inbound;
@@ -473,6 +517,8 @@ router.post("/flights/search", async (req, res) => {
  * SBT hotel results can render concierge results unchanged.
  */
 router.post("/hotels/search", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const workspaceId = String((req as any).workspaceObjectId || "");
   try {
     const result = await searchHotels({
       CityCode: req.body?.CityCode,
@@ -496,10 +542,23 @@ router.post("/hotels/search", async (req, res) => {
       return res.status(502).json({ ok: false, message: result.message, code: result.code });
     }
 
+    // Additive policy annotation on each hotel (never filtered). Per-night price
+    // is estimated from stay length; star cap always applies.
+    const nights = hotelNights(req.body?.CheckIn, req.body?.CheckOut);
+    const hotelPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
+    const annotatedHotels = (result.hotels || []).map((h: any) => ({
+      ...h,
+      policy: evaluateHotelPolicy(hotelForPolicyFromResult(h, nights), hotelPolicyRules),
+    }));
+    const inPolicyCount = annotatedHotels.filter((h: any) => h?.policy?.status === "IN_POLICY").length;
+    await emitMetric(
+      policyEvaluated({ workspaceId, requestId, inPolicyCount, totalCount: annotatedHotels.length })
+    );
+
     return res.json({
       ok: true,
       TraceId: "",
-      Hotels: result.hotels,
+      Hotels: annotatedHotels,
       SearchId: result.searchId,
       CityName: result.cityName,
     });
@@ -723,6 +782,10 @@ router.post("/", async (req, res) => {
       // a genuine zero-results route (searchUnavailable = false, flights empty).
       let searchUnavailable = false;
 
+      // Load the workspace travel policy once for this request (tenant-scoped,
+      // fail-safe → null when absent). Flights are annotated, never filtered.
+      const chatPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
+
       if (isoDate) {
         const chatResult = await searchFlightsForChat({
           origin: originIATA,
@@ -734,6 +797,7 @@ router.post("/", async (req, res) => {
           cabinClass: extractedCabinClass,
           cabinLabel: extractedCabin,
           requestId,
+          policyRules: chatPolicyRules,
         });
         if (chatResult.ok) {
           chatFlights = chatResult.flights;
@@ -770,6 +834,18 @@ router.post("/", async (req, res) => {
 
       const hasLiveFlights = chatFlights.length > 0;
 
+      // Policy telemetry + "clear why" copy when nothing is in policy.
+      const inPolicyCount = chatFlights.filter((f: any) => f?.policy?.status === "IN_POLICY").length;
+      if (hasLiveFlights) {
+        await emitMetric(
+          policyEvaluated({ workspaceId, requestId, inPolicyCount, totalCount: chatFlights.length })
+        );
+      }
+      const zeroInPolicyNote =
+        hasLiveFlights && chatPolicyRules && inPolicyCount === 0
+          ? buildZeroInPolicyNote(chatPolicyRules) + " "
+          : "";
+
       const roundTripNote = journeyType === 2 && chatInbound.length > 0
         ? ` Return-leg options for ${destIATA} → ${originIATA} are included below.`
         : "";
@@ -792,7 +868,7 @@ router.post("/", async (req, res) => {
           context: searchUnavailable
             ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
             : hasLiveFlights
-              ? `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + roundTripNote
+              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + roundTripNote
               : !isoDate
                 ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
                 : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`,

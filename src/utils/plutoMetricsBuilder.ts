@@ -62,6 +62,22 @@ export function multicityDowngraded(args: FailureArgs): PlutoMetricEvent {
   };
 }
 
+export function policyEvaluated(args: {
+  workspaceId?: string;
+  requestId?: string;
+  inPolicyCount: number;
+  totalCount: number;
+}): PlutoMetricEvent {
+  return {
+    type: "pluto.policy.evaluated",
+    severity: "info",
+    timestamp: new Date().toISOString(),
+    workspaceId: args.workspaceId,
+    requestId: args.requestId,
+    metadata: { inPolicyCount: args.inPolicyCount, totalCount: args.totalCount },
+  };
+}
+
 export function conversationStarted(
   conversationId: string
 ): PlutoMetricEvent {

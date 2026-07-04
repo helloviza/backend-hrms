@@ -7,7 +7,7 @@ vi.mock("../services/tbo.flight.service.js", () => ({
 }));
 
 import { searchFlights as tboSearchFlights } from "../services/tbo.flight.service.js";
-import { searchFlightsForChat } from "./plutoFlightSearch.js";
+import { searchFlightsForChat, mapTBOFlight } from "./plutoFlightSearch.js";
 
 const mockedSearch = tboSearchFlights as unknown as ReturnType<typeof vi.fn>;
 
@@ -159,5 +159,55 @@ describe("searchFlightsForChat — discriminated result", () => {
     expect(result.flights[0].flightNo).toBe("6E-2582");
     expect(result.inbound).toHaveLength(1);
     expect(result.inbound[0].flightNo).toBe("6E-2999");
+  });
+});
+
+describe("searchFlightsForChat — policy annotation", () => {
+  const lcc = rawFlight({
+    ResultIndex: "A", IsLCC: true,
+    Fare: { PublishedFare: 4000, OfferedFare: 4000, Currency: "INR" },
+    Segments: [[{
+      CabinClass: 2, Duration: 130,
+      Airline: { AirlineCode: "6E", AirlineName: "IndiGo", FlightNumber: "1000" },
+      Origin: { DepTime: "2026-05-20T06:00:00", Airport: { AirportCode: "DEL" } },
+      Destination: { ArrTime: "2026-05-20T08:10:00", Airport: { AirportCode: "BOM" } },
+    }]],
+  });
+  const fullService = rawFlight({
+    ResultIndex: "B", IsLCC: false,
+    Fare: { PublishedFare: 8000, OfferedFare: 8000, Currency: "INR" },
+    Segments: [[{
+      CabinClass: 2, Duration: 130,
+      Airline: { AirlineCode: "AI", AirlineName: "Air India", FlightNumber: "500" },
+      Origin: { DepTime: "2026-05-20T09:00:00", Airport: { AirportCode: "DEL" } },
+      Destination: { ArrTime: "2026-05-20T11:10:00", Airport: { AirportCode: "BOM" } },
+    }]],
+  });
+
+  it("annotates every flight with a policy field", async () => {
+    mockedSearch.mockResolvedValue({ Response: { TraceId: "P", ResponseStatus: 1, Results: [[lcc]] } });
+    const result = await searchFlightsForChat({ ...baseParams, policyRules: { active: true, allowLCC: false } });
+    expect(result.ok).toBe(true);
+    expect(result.flights[0].policy).toEqual({ status: "OUT_OF_POLICY", reasons: ["lcc_not_allowed"] });
+  });
+
+  it("sorts in-policy first even when the out-of-policy flight is cheaper", async () => {
+    // allowLCC:false → cheap LCC is out-of-policy; pricier full-service is in-policy.
+    mockedSearch.mockResolvedValue({ Response: { TraceId: "P", ResponseStatus: 1, Results: [[lcc, fullService]] } });
+    const result = await searchFlightsForChat({ ...baseParams, policyRules: { active: true, allowLCC: false } });
+    expect(result.flights.map((f: any) => f.flightNo)).toEqual(["AI-500", "6E-1000"]);
+    expect(result.flights[0].policy.status).toBe("IN_POLICY");
+    expect(result.flights[1].policy.status).toBe("OUT_OF_POLICY");
+  });
+
+  it("additive-only: a policy-less annotation adds ONLY the `policy` key", async () => {
+    mockedSearch.mockResolvedValue({ Response: { TraceId: "P", ResponseStatus: 1, Results: [[lcc]] } });
+    const result = await searchFlightsForChat({ ...baseParams, policyRules: null });
+    const annotated = { ...result.flights[0] };
+    expect(annotated.policy).toEqual({ status: "IN_POLICY", reasons: ["no_policy_configured"] });
+    delete annotated.policy;
+    // Everything except `policy` matches the bare mapper output for the same raw row.
+    const bare = mapTBOFlight(lcc, { traceId: "P", originIATA: "DEL", destIATA: "BOM", cabinLabel: "Economy" });
+    expect(annotated).toEqual(bare);
   });
 });
