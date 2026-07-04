@@ -1,6 +1,7 @@
 import express from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { maybeCreateTripWatch } from "../services/tripWatchCreate.js";
 import { sbtLogger } from "../utils/logger.js";
 import { sendMail } from "../utils/mailer.js";
 import SBTRequest from "../models/SBTRequest.js";
@@ -674,6 +675,13 @@ router.post("/:id/book", async (req: any, res: any) => {
     request.bookerNotes = bookerNotes || null;
     request.actedAt = new Date();
     await request.save();
+
+    // Phase 3: opt-in disruption watch for concierge-sourced flight bookings.
+    // Guarded internally (concierge source + explicit consent) and fully
+    // swallowed — a TripWatch failure must NEVER fail the booking transition.
+    try {
+      await maybeCreateTripWatch(request, booking);
+    } catch { /* metric emitted inside; booking already saved */ }
 
     // Send email to L1
     const requester = await User.findById(request.requesterId)

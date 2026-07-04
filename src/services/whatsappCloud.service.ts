@@ -109,6 +109,64 @@ export async function sendTextMessage(to: string, body: string): Promise<void> {
   }
 }
 
+/**
+ * Outcome-returning variants for the trip notifier (Phase 3). Unlike the
+ * expense-facing sendTextMessage above (which SWALLOWS failures), these RETURN
+ * true/false so the notifier can record the real delivery outcome and fall back
+ * to email. The existing swallow behaviour for expense callers is unchanged.
+ *
+ * PRODUCTION NOTE: unsolicited outbound WhatsApp requires an approved Meta
+ * message TEMPLATE (set WA_DISRUPTION_TEMPLATE). Free-form text only works
+ * inside an open 24-hour customer-service window (dev / replies). Template
+ * registration is a business action outside this repo.
+ */
+export async function sendTextMessageResult(to: string, body: string): Promise<boolean> {
+  if (!isWhatsAppCloudConfigured()) return false;
+  try {
+    await axios.post(
+      `${GRAPH_BASE}/${env.WA_GRAPH_VERSION}/${env.WA_PHONE_NUMBER_ID}/messages`,
+      { messaging_product: "whatsapp", recipient_type: "individual", to, type: "text", text: { preview_url: false, body } },
+      { headers: { Authorization: `Bearer ${env.WA_ACCESS_TOKEN}`, "Content-Type": "application/json" }, timeout: 30_000 },
+    );
+    return true;
+  } catch (err) {
+    whatsappLogger.error("sendTextMessageResult failed", { to, error: err instanceof Error ? err.message : String(err) });
+    return false;
+  }
+}
+
+export async function sendTemplateMessage(
+  to: string,
+  templateName: string,
+  bodyParams: string[],
+  languageCode = "en",
+): Promise<boolean> {
+  if (!isWhatsAppCloudConfigured()) return false;
+  try {
+    await axios.post(
+      `${GRAPH_BASE}/${env.WA_GRAPH_VERSION}/${env.WA_PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "template",
+        template: {
+          name: templateName,
+          language: { code: languageCode },
+          components: [
+            { type: "body", parameters: (bodyParams || []).map((t) => ({ type: "text", text: String(t) })) },
+          ],
+        },
+      },
+      { headers: { Authorization: `Bearer ${env.WA_ACCESS_TOKEN}`, "Content-Type": "application/json" }, timeout: 30_000 },
+    );
+    return true;
+  } catch (err) {
+    whatsappLogger.error("sendTemplateMessage failed", { to, error: err instanceof Error ? err.message : String(err) });
+    return false;
+  }
+}
+
 export type ReplyButton = { id: string; title: string };
 
 /**

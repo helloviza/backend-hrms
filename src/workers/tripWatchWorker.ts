@@ -19,6 +19,7 @@ import {
 } from "../services/tripWatchDiff.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { watchMetric } from "../utils/plutoMetricsBuilder.js";
+import { deliverTripAlert, MAX_ATTEMPTS } from "../services/tripNotifier.js";
 
 const POLL_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const MIN_RECHECK_MS = 15 * 60 * 1000; // don't re-check a watch within 15 min
@@ -136,14 +137,25 @@ function buildRealDeps(now: Date): WatchCycleDeps {
       );
     },
     createAndNotifyAlert: async (watch, change) => {
-      await TripAlert.create({
+      const alert = (await TripAlert.create({
         workspaceId: watch.workspaceId,
         tripWatchId: watch._id,
         kind: change.kind,
         detail: change.detail || "",
         deliveryStatus: "PENDING",
-      });
-      // Delivery is wired to tripNotifier in Step 4; alert stays PENDING until then.
+      })) as any;
+      const outcome = await deliverTripAlert(alert, watch);
+      await TripAlert.updateOne(
+        { _id: alert._id },
+        {
+          $set: {
+            deliveryStatus: outcome.deliveryStatus,
+            channelUsed: outcome.channelUsed,
+            attempts: outcome.attempts,
+            deliveredAt: outcome.delivered ? new Date() : null,
+          },
+        },
+      );
     },
     isBookingCancelled: async (watch) => {
       if (!watch.bookingId) return false;
@@ -159,6 +171,38 @@ function buildRealDeps(now: Date): WatchCycleDeps {
   };
 }
 
+// Retry PENDING alerts once next cycle; deliverTripAlert marks FAILED at
+// MAX_ATTEMPTS so we never infinite-retry.
+async function retryPendingAlerts(): Promise<void> {
+  const pending = (await TripAlert.find({
+    deliveryStatus: "PENDING",
+    attempts: { $lt: MAX_ATTEMPTS },
+  })
+    .limit(100)
+    .lean()) as any[];
+
+  for (const alert of pending) {
+    try {
+      const watch = (await TripWatch.findById(alert.tripWatchId).lean()) as any;
+      if (!watch) continue;
+      const outcome = await deliverTripAlert(alert, watch);
+      await TripAlert.updateOne(
+        { _id: alert._id },
+        {
+          $set: {
+            deliveryStatus: outcome.deliveryStatus,
+            channelUsed: outcome.channelUsed,
+            attempts: outcome.attempts,
+            deliveredAt: outcome.delivered ? new Date() : null,
+          },
+        },
+      );
+    } catch (e: any) {
+      console.error("[tripWatchWorker] retry failed", { alertId: String(alert?._id), message: e?.message });
+    }
+  }
+}
+
 let isRunning = false;
 
 export function startTripWatchWorker(): void {
@@ -170,6 +214,7 @@ export function startTripWatchWorker(): void {
     const now = new Date();
     try {
       await runWatchCycle(buildRealDeps(now));
+      await retryPendingAlerts();
       // Terminal cleanup in the same cycle (Amendment I): COMPLETE watches whose
       // departure was > 24h ago.
       await TripWatch.updateMany(

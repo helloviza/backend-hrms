@@ -19,6 +19,7 @@ export interface ITripWatch extends Document {
   travelerUserId?: mongoose.Types.ObjectId;
   notifyChannel: "WHATSAPP" | "EMAIL";
   notifyTarget: string;
+  fallbackEmail?: string | null;
   optInAt: Date;
   status: "ACTIVE" | "COMPLETED" | "CANCELLED";
   lastCheckedAt?: Date | null;
@@ -42,6 +43,7 @@ const TripWatchSchema = new Schema<ITripWatch>(
     travelerUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
     notifyChannel: { type: String, enum: ["WHATSAPP", "EMAIL"], required: true },
     notifyTarget: { type: String, required: true },
+    fallbackEmail: { type: String, default: null },
     optInAt: { type: Date, default: Date.now },
     status: { type: String, enum: ["ACTIVE", "COMPLETED", "CANCELLED"], default: "ACTIVE", index: true },
     lastCheckedAt: { type: Date, default: null },
