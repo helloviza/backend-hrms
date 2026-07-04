@@ -71,6 +71,23 @@ export function fareObsWriteFailed(args: FailureArgs): PlutoMetricEvent {
   };
 }
 
+// Watcher + notifier + weather (Phase 3). type is passed so a single helper
+// covers the family; severity defaults to info unless overridden.
+export function watchMetric(
+  type:
+    | "pluto.watch.checked"
+    | "pluto.watch.alerted"
+    | "pluto.watch.check_failed"
+    | "pluto.watch.create_failed"
+    | "pluto.notify.sent"
+    | "pluto.notify.failed"
+    | "pluto.weather.failed",
+  args: FailureArgs = {},
+  severity: "info" | "warn" | "error" = "info",
+): PlutoMetricEvent {
+  return { type, severity, timestamp: new Date().toISOString(), ...args };
+}
+
 export function handoffDelivered(args: FailureArgs): PlutoMetricEvent {
   return {
     type: "pluto.handoff.delivered",
