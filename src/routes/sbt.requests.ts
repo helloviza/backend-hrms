@@ -8,6 +8,7 @@ import SBTRequest from "../models/SBTRequest.js";
 import User from "../models/User.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
+import { propagateItineraryBooked } from "../services/itineraryStatus.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { getFareQuote, bookFlight } from "../services/tbo.flight.service.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
@@ -675,6 +676,14 @@ router.post("/:id/book", async (req: any, res: any) => {
     request.bookerNotes = bookerNotes || null;
     request.actedAt = new Date();
     await request.save();
+
+    // Phase 5: propagate a linked itinerary to BOOKED. Swallowed — an itinerary
+    // update must NEVER fail the booking transition.
+    try {
+      await propagateItineraryBooked(request);
+    } catch (e: any) {
+      sbtLogger.warn("[SBT] itinerary BOOKED propagation failed", { message: e?.message });
+    }
 
     // Phase 3: opt-in disruption watch for concierge-sourced flight bookings.
     // Guarded internally (concierge source + explicit consent) and fully

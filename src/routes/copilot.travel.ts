@@ -1604,12 +1604,29 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
     const user = req.user;
     if (!user?._id) return res.status(401).json({ error: "Unauthorized" });
 
-    const { flightData, passengers, notes, tripBundle, conversationId, watchOptIn, whatsappNumber } = req.body;
+    const { flightData, passengers, notes, tripBundle, conversationId, watchOptIn, whatsappNumber, itineraryId } = req.body;
 
-    if (!flightData || !flightData.ResultIndex || !flightData.TraceId) {
-      return res.status(400).json({
-        error: "flightData with ResultIndex and TraceId is required",
-      });
+    // Phase 5: full-context itinerary submit. When itineraryId is present the
+    // (workspace-scoped) itinerary is the source of truth; otherwise this is the
+    // legacy single-flight path with its strict flightData validation intact.
+    let itinerary: any = null;
+    if (itineraryId) {
+      itinerary = await Itinerary.findOne({ _id: itineraryId, workspaceId: (req as any).workspaceObjectId });
+      if (!itinerary) return res.status(404).json({ error: "Itinerary not found" });
+    }
+    const outboundItem = itinerary ? itinerary.items.find((i: any) => i.kind === "FLIGHT_OUTBOUND") : null;
+    const hotelItem = itinerary ? itinerary.items.find((i: any) => i.kind === "HOTEL") : null;
+    const effectiveFlightData = flightData || outboundItem?.payload || null;
+
+    if (!itineraryId) {
+      // Legacy single-flight path — strict guard unchanged (backward compatible).
+      if (!flightData || !flightData.ResultIndex || !flightData.TraceId) {
+        return res.status(400).json({
+          error: "flightData with ResultIndex and TraceId is required",
+        });
+      }
+    } else if (!outboundItem && !hotelItem) {
+      return res.status(400).json({ error: "Itinerary has no flight or hotel to submit" });
     }
 
     // Disruption-watch opt-in (Phase 3). A WhatsApp number, if given, MUST be
@@ -1663,57 +1680,106 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
       });
     }
 
-    // Build searchParams from flightData for SBTRequest compatibility
-    const searchParams = {
-      origin: flightData.origin?.code || "",
-      destination: flightData.destination?.code || "",
-      departDate: flightData.departure?.date || "",
-      cabin: flightData.cabin || "Economy",
+    // Build searchParams for SBTRequest compatibility (from the primary flight,
+    // or destination-only for a hotel-only itinerary).
+    const searchParams = effectiveFlightData ? {
+      origin: effectiveFlightData.origin?.code || "",
+      destination: effectiveFlightData.destination?.code || "",
+      departDate: effectiveFlightData.departure?.date || "",
+      cabin: effectiveFlightData.cabin || "Economy",
+      source: "CONCIERGE",
+    } : {
+      destination: itinerary?.destinationCity || itinerary?.destinationIata || "",
       source: "CONCIERGE",
     };
+    const reqType: "flight" | "hotel" = effectiveFlightData ? "flight" : "hotel";
+    const selectedOption = effectiveFlightData || hotelItem?.payload || {};
+
+    // Extend the trip bundle with the full itinerary (items + rollup + total).
+    const itineraryBundle = itinerary ? {
+      itineraryId: String(itinerary._id),
+      items: itinerary.items,
+      policySummary: itinerary.policySummary,
+      totalPriceINR: itinerary.totalPriceINR,
+    } : {};
+    const mergedBundle = (tripBundle || itinerary || watchConsent)
+      ? { ...(tripBundle || {}), ...itineraryBundle, ...(watchConsent ? { consent: watchConsent } : {}) }
+      : undefined;
+
+    // Idempotency: re-submitting the same DRAFT updates the existing PENDING
+    // request's bundle rather than creating a duplicate. A prior request that is
+    // no longer PENDING does not match → a fresh request is created.
+    if (itineraryId) {
+      const existingReq = await SBTRequest.findOne({
+        workspaceId: (req as any).workspaceObjectId,
+        "tripBundle.itineraryId": String(itinerary._id),
+        status: "PENDING",
+      });
+      if (existingReq) {
+        existingReq.tripBundle = mergedBundle as any;
+        existingReq.selectedOption = selectedOption;
+        existingReq.searchParams = searchParams;
+        await existingReq.save();
+        itinerary.status = "SUBMITTED";
+        itinerary.sbtRequestId = existingReq._id;
+        await itinerary.save();
+        return res.status(200).json({ success: true, requestId: existingReq._id, updated: true });
+      }
+    }
 
     const request = await SBTRequest.create({
+      workspaceId: (req as any).workspaceObjectId,
       customerId: workspace._id,
       requesterId: user._id,
       assignedBookerId,
-      type: "flight",
+      type: reqType,
       source: "CONCIERGE",
       conversationId: conversationId || null,
       searchParams,
-      selectedOption: flightData,
+      selectedOption,
       requesterNotes: notes || null,
       passengerDetails: passengers || [],
       contactDetails: { email: user.email },
       // Additive: optional richer bundle + watch consent. Omitted by existing
       // single-flight calls; consent read at the BOOKED transition.
-      tripBundle: (tripBundle || watchConsent)
-        ? { ...(tripBundle || {}), ...(watchConsent ? { consent: watchConsent } : {}) }
-        : undefined,
+      tripBundle: mergedBundle,
       status: "PENDING",
     });
+
+    // Link the itinerary to the raised request (SUBMITTED).
+    if (itinerary) {
+      itinerary.status = "SUBMITTED";
+      itinerary.sbtRequestId = request._id;
+      await itinerary.save();
+    }
 
     // Send email to assigned booker
     const booker = await User.findOne({ _id: assignedBookerId, workspaceId: (req as any).workspaceObjectId })
       .select("name email").lean() as any;
 
     if (booker?.email) {
-      const route = `${flightData.origin?.code || "?"} → ${flightData.destination?.code || "?"}`;
-      const date = flightData.departure?.date || "";
+      const route = effectiveFlightData
+        ? `${effectiveFlightData.origin?.code || "?"} → ${effectiveFlightData.destination?.code || "?"}`
+        : (itinerary?.destinationCity || itinerary?.destinationIata || "Trip");
+      const date = effectiveFlightData?.departure?.date || "";
       const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
+      const subject = itineraryId
+        ? `New Concierge Trip Request from ${user.name || user.email} — ${route}`
+        : `New Concierge Flight Request from ${user.name || user.email} — ${route}`;
 
       await sendMail({
         to: booker.email,
-        subject: `New Concierge Flight Request from ${user.name || user.email} — ${route}`,
+        subject,
         kind: "REQUESTS",
         html: `
-          <h3>New Flight Request (via Concierge)</h3>
+          <h3>New ${itineraryId ? "Trip" : "Flight"} Request (via Concierge)</h3>
           <p><strong>From:</strong> ${user.name || user.email}</p>
-          <p><strong>Flight:</strong> ${flightData.airline?.name || ""} ${flightData.flightNo || ""}</p>
+          ${effectiveFlightData ? `<p><strong>Flight:</strong> ${effectiveFlightData.airline?.name || ""} ${effectiveFlightData.flightNo || ""}</p>` : ""}
           <p><strong>Route:</strong> ${route}</p>
           ${date ? `<p><strong>Date:</strong> ${date}</p>` : ""}
-          <p><strong>Fare:</strong> ₹${(flightData.fare?.offered || flightData.fare?.published || 0).toLocaleString("en-IN")}</p>
+          ${effectiveFlightData ? `<p><strong>Fare:</strong> ₹${(effectiveFlightData.fare?.offered || effectiveFlightData.fare?.published || 0).toLocaleString("en-IN")}</p>` : ""}
           ${notes ? `<p><strong>Notes:</strong> ${notes}</p>` : ""}
-          ${tripBundle ? renderTripSummaryHtml(tripBundle) : ""}
+          ${mergedBundle ? renderTripSummaryHtml(mergedBundle) : ""}
           <p><a href="${frontendUrl}/sbt/inbox">View in Booking Inbox</a></p>
         `,
       }).catch((e: any) => console.warn("[Concierge] Failed to send request email:", e?.message));
