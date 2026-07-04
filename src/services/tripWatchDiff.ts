@@ -10,6 +10,9 @@ export interface WatchFlightState {
   depActual?: string | null;
   depGate?: string | null;
   depTerminal?: string | null;
+  // Arrival-side landing signal (Phase 4). There is NO arrival.actual in the
+  // FlightAware shape, so "landed" is inferred from flight_status / progress.
+  progressPercent?: number | null;
 }
 
 export type MaterialChangeKind = "CANCELLED" | "DELAY" | "GATE_CHANGE" | "TERMINAL_CHANGE";
@@ -30,7 +33,20 @@ export function normalizeWatchState(info: any): WatchFlightState {
     depActual: info?.departure?.actual ?? null,
     depGate: info?.departure?.gate ?? null,
     depTerminal: info?.departure?.terminal ?? null,
+    progressPercent: info?.progress_percent ?? null,
   };
+}
+
+/**
+ * isLanded — PURE arrival detection (Phase 4). A watch has arrived when the
+ * normalized flight_status is "Landed" (normalizeStatus maps any "land*" here)
+ * OR progress is 100%. Idempotency across cycles is enforced by the unique
+ * ArrivalSession-per-watch index, NOT by diffing — so this stays a simple test.
+ */
+export function isLanded(state: WatchFlightState | null | undefined): boolean {
+  if (!state) return false;
+  if (state.status === "Landed") return true;
+  return state.progressPercent === 100;
 }
 
 function minutesBetween(a?: string | null, b?: string | null): number | null {

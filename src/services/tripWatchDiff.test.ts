@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { detectMaterialChange, normalizeWatchState } from "./tripWatchDiff.js";
+import { detectMaterialChange, normalizeWatchState, isLanded } from "./tripWatchDiff.js";
 
 const S = (over: Partial<ReturnType<typeof normalizeWatchState>> = {}) => ({
   status: "Scheduled", depScheduled: "2026-08-12T10:00:00Z", depActual: null, depGate: null, depTerminal: null,
@@ -45,7 +45,27 @@ describe("detectMaterialChange", () => {
   });
 
   it("normalizeWatchState maps FlightAware shape", () => {
-    const s = normalizeWatchState({ flight_status: "Delayed", departure: { scheduled: "x", actual: "y", gate: "G", terminal: "T" } });
-    expect(s).toEqual({ status: "Delayed", depScheduled: "x", depActual: "y", depGate: "G", depTerminal: "T" });
+    const s = normalizeWatchState({ flight_status: "Delayed", departure: { scheduled: "x", actual: "y", gate: "G", terminal: "T" }, progress_percent: 40 });
+    expect(s).toEqual({ status: "Delayed", depScheduled: "x", depActual: "y", depGate: "G", depTerminal: "T", progressPercent: 40 });
+  });
+});
+
+describe("isLanded (Phase 4 arrival detection)", () => {
+  it("Landed status → true", () => {
+    expect(isLanded(normalizeWatchState({ flight_status: "Landed" }))).toBe(true);
+  });
+
+  it("progress 100 → true even if status is not yet Landed", () => {
+    expect(isLanded(normalizeWatchState({ flight_status: "Departed", progress_percent: 100 }))).toBe(true);
+  });
+
+  it("neither → false", () => {
+    expect(isLanded(normalizeWatchState({ flight_status: "Departed", progress_percent: 60 }))).toBe(false);
+    expect(isLanded(normalizeWatchState({ flight_status: "Scheduled" }))).toBe(false);
+  });
+
+  it("null/undefined state → false", () => {
+    expect(isLanded(null)).toBe(false);
+    expect(isLanded(undefined)).toBe(false);
   });
 });

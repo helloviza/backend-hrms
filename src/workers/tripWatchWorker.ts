@@ -14,9 +14,11 @@ import { getDelightfulFlightStatus } from "../services/flightService.js";
 import {
   detectMaterialChange,
   normalizeWatchState,
+  isLanded,
   type MaterialChange,
   type WatchFlightState,
 } from "../services/tripWatchDiff.js";
+import { openArrivalSession } from "../services/arrivalSession.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { watchMetric } from "../utils/plutoMetricsBuilder.js";
 import { deliverTripAlert, MAX_ATTEMPTS } from "../services/tripNotifier.js";
@@ -45,6 +47,8 @@ export interface WatchCycleDeps {
   createAndNotifyAlert: (watch: any, change: MaterialChange) => Promise<void>;
   isBookingCancelled: (watch: any) => Promise<boolean>;
   cancelWatch: (watch: any) => Promise<void>;
+  /** On LANDED for a WHATSAPP watch: open the arrival concierge session (Phase 4). */
+  handleArrival: (watch: any, info: any) => Promise<void>;
 }
 
 /**
@@ -86,6 +90,13 @@ export async function runWatchCycle(
         await deps.createAndNotifyAlert(watch, change);
         deps.metric(watchMetric("pluto.watch.alerted", { workspaceId: String(watch.workspaceId) }));
         alerted++;
+      }
+
+      // Phase 4 (Arrive): open the WhatsApp concierge session once landed. The
+      // unique ArrivalSession-per-watch index makes this idempotent across the
+      // repeated cycles a landed flight produces.
+      if (watch.notifyChannel === "WHATSAPP" && isLanded(curr)) {
+        await deps.handleArrival(watch, info);
       }
     } catch (e: any) {
       deps.metric(
@@ -169,6 +180,7 @@ function buildRealDeps(now: Date): WatchCycleDeps {
         { $set: { status: "CANCELLED", claimedBy: null, claimedAt: null } },
       );
     },
+    handleArrival: (watch, info) => openArrivalSession(watch, info, now),
   };
 }
 
