@@ -31,6 +31,9 @@ export type PlutoMetricEventType =
   // Conversation memory migration (Capstone)
   | "pluto.memory.read_failed"
   | "pluto.memory.write_failed"
+  // Reply substance enforcement (Step 3) — a thin reply accepted after a
+  // corrective retry (never fails the turn; visible so we can tune the prompt)
+  | "pluto.reply.thin_accepted"
   // Arrival concierge (Phase 4 — Arrive)
   | "pluto.arrive.session_opened"
   | "pluto.arrive.expired"

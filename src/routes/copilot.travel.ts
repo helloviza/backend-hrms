@@ -114,6 +114,7 @@ import {
   routeInsightsServed,
   handoffDelivered,
   handoffFailed,
+  replyThinAccepted,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 
@@ -1167,16 +1168,26 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
       // form is handled by the range normaliser above), e.g. "16th Aug … 20th
       // Aug". First token = start, second (if any) = end; derive duration.
       if (!L.dates) {
-        const tokens = prompt.match(/\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?/gi) || [];
-        if (tokens.length >= 1) {
-          const start = parseLooseDate(tokens[0]);
-          const end = tokens[1] ? parseLooseDate(tokens[1]) : null;
-          if (start) {
-            L.dates = { start, ...(end ? { end } : {}), source: "user" };
-            if (end && !L.duration) {
-              const diff = Math.round((Date.parse(end) - Date.parse(start)) / 86400000) + 1;
-              if (diff > 0) L.duration = { days: diff, source: "derived" };
-            }
+        // Compact range sharing one month first: "12-15 Sep", "12 to 15 September".
+        const compact = prompt.match(/\b(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+(\d{4}))?/i);
+        let start: string | null = null;
+        let end: string | null = null;
+        if (compact) {
+          const yr = compact[4] ? ` ${compact[4]}` : "";
+          start = parseLooseDate(`${compact[1]} ${compact[3]}${yr}`);
+          end = parseLooseDate(`${compact[2]} ${compact[3]}${yr}`);
+        } else {
+          const tokens = prompt.match(/\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?/gi) || [];
+          if (tokens.length >= 1) {
+            start = parseLooseDate(tokens[0]);
+            end = tokens[1] ? parseLooseDate(tokens[1]) : null;
+          }
+        }
+        if (start) {
+          L.dates = { start, ...(end ? { end } : {}), source: "user" };
+          if (end && !L.duration) {
+            const diff = Math.round((Date.parse(end) - Date.parse(start)) / 86400000) + 1;
+            if (diff > 0) L.duration = { days: diff, source: "derived" };
           }
         }
       }
@@ -1303,6 +1314,23 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
       intent
     );
 
+    // Coherence: once destination AND duration are known, DISCOVERY graduates to
+    // PLANNING so the PLANNING / ALWAYS-GIVE-VALUE rules (draft skeleton) apply
+    // instead of DISCOVERY's "destination unknown" behaviour.
+    {
+      const destKnownNow = Boolean(
+        conversationContext.locked?.destination?.name ||
+        conversationContext.assumed?.destination?.name
+      );
+      const durationKnownNow = Boolean(
+        conversationContext.locked?.duration?.days ||
+        (conversationContext.locked?.dates?.start && conversationContext.locked?.dates?.end)
+      );
+      if (conversationContext.state === "DISCOVERY" && destKnownNow && durationKnownNow) {
+        conversationContext.state = "PLANNING";
+      }
+    }
+
     if (stateBefore !== conversationContext.state) {
       await emitMetric(
         stateTransition(
@@ -1403,35 +1431,34 @@ Source: ${conversationContext.assumed.destination.source}
 Confidence: ${conversationContext.assumed.destination.confidence}\n`
         : "";
 
-    /* ───────── AUTHORITATIVE REQUIRED-FIELDS CHECK ───────── */
-
-    const missingFields: string[] = [];
-
+    /* ───────── QUESTION PRIORITY LADDER (AUTHORITATIVE) ─────────
+     * The AI used to be told only whether destination/duration were missing and
+     * then free-picked low-value questions (hotel style, airport transfers) while
+     * the trip-defining facts (dates, origin) went unasked. Compute the missing
+     * rungs IN PRIORITY ORDER — destination → dates → origin — and hand the AI an
+     * ordered, authoritative list. Every rung here is one the extractor can lock,
+     * so the ladder descends turn over turn (no re-asking, no stalling).
+     */
     const hasLockedDestination = Boolean(
       conversationContext.locked?.destination?.name
     );
-
     // ✅ FIX BUG #3: Also treat assumed destination as sufficient to proceed
     const hasAssumedDestination = Boolean(
       conversationContext.assumed?.destination?.name
     );
-
     const hasLockedDuration =
       Boolean(conversationContext.locked?.duration?.days) ||
       Boolean(
         conversationContext.locked?.dates?.start &&
         conversationContext.locked?.dates?.end
       );
+    const hasLockedDates = Boolean(conversationContext.locked?.dates?.start);
+    const hasLockedOrigin = Boolean(conversationContext.locked?.origin?.city);
 
-    // ❌ Only ask for destination if BOTH locked AND assumed are missing
-    if (!hasLockedDestination && !hasAssumedDestination) {
-      missingFields.push("destination");
-    }
-
-    // ❌ Ask for duration ONLY if missing
-    if (!hasLockedDuration) {
-      missingFields.push("duration");
-    }
+    const missingFields: string[] = [];
+    if (!hasLockedDestination && !hasAssumedDestination) missingFields.push("destination");
+    if (!hasLockedDates) missingFields.push("dates");
+    if (!hasLockedOrigin) missingFields.push("origin");
 
     // Persist explicitly so AI cannot guess
     if (missingFields.length > 0) {
@@ -1440,13 +1467,20 @@ Confidence: ${conversationContext.assumed.destination.confidence}\n`
       delete conversationContext.missingFields;
     }
 
-    // 🆕 EXPLICIT MISSING FIELDS INJECTION (AUTHORITATIVE)
+    // 🆕 EXPLICIT MISSING FIELDS INJECTION (AUTHORITATIVE, PRIORITY-ORDERED)
     const missingFieldsString = conversationContext.missingFields
-      ? `\nMISSING_FIELDS (ask ONLY these, do NOT ask for anything else):\n${JSON.stringify(
+      ? `\nMISSING_FIELDS (already in priority order — ask ONLY the top 1-2 as direct nextSteps questions, nothing else):\n${JSON.stringify(
           conversationContext.missingFields,
           null,
           2
         )}\n`
+      : "";
+
+    // Plan-readiness signal — reinforces the ALWAYS-GIVE-VALUE rule per turn and
+    // gates the substance enforce-retry below.
+    const canPlan = (hasLockedDestination || hasAssumedDestination) && hasLockedDuration;
+    const planReadinessString = canPlan
+      ? `\nPLAN_READINESS: destination and duration are KNOWN — you MUST include a draft day-by-day "itinerary" skeleton (clearly marked as a draft to refine) and a "context" of at least 2-3 substantive sentences. Do not merely echo the destination.\n`
       : "";
 
     /* ───────── Detect if last reply was a flight search (suppress redundant follow-ups) ───────── */
@@ -1468,6 +1502,7 @@ Your nextSteps should ONLY be about completing the trip plan (itinerary refineme
       `CRITICAL: When flight data is provided, your "context" field must ONLY reflect the cities and airports in that data. Do not use your own memory for routes.\n` +
       `CURRENT CONVERSATION STATE: ${conversationContext.state}\n` +
       `${flightSearchSuppression}\n` +
+      `${planReadinessString}\n` +
       `${missingFieldsString}\n` +
       `${lockedContext}\n` +
       `${assumedContext}\n` +
@@ -1508,8 +1543,26 @@ ${prompt}
     /* ───────── Invoke AI (OpenAI with Gemini Fallback) ───────── */
     let deltaReply: PlutoDeltaReply;
 
+    // Step 3 — substance enforcement: only when the trip is already plannable
+    // (destination + duration known). A thin reply then earns ONE corrective
+    // retry inside invokePluto; if still thin it is ACCEPTED (never an error)
+    // and this metric fires so we can tune the prompt.
+    const substanceOpts = {
+      requireSubstance: canPlan,
+      onThinAccepted: () => {
+        void emitMetric(
+          replyThinAccepted({
+            workspaceId,
+            requestId,
+            conversationId: conversationContext.id,
+            reason: "post_retry",
+          })
+        );
+      },
+    };
+
     try {
-      deltaReply = await invokePluto(effectivePrompt);
+      deltaReply = await invokePluto(effectivePrompt, substanceOpts);
     } catch (openaiErr: any) {
       await emitMetric(
         aiFallback({
@@ -1521,7 +1574,7 @@ ${prompt}
       );
       console.warn("[Pluto] OpenAI failed, switching to Gemini backup", { requestId });
       try {
-        deltaReply = await invokePlutoGemini(effectivePrompt);
+        deltaReply = await invokePlutoGemini(effectivePrompt, substanceOpts);
       } catch (geminiErr: any) {
         // Distinguish a schema-invalid fallback (after its own retry) from a
         // transport/parse failure, so the metric is actionable.

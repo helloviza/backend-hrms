@@ -62,6 +62,17 @@ export function multicityDowngraded(args: FailureArgs): PlutoMetricEvent {
   };
 }
 
+// A reply was still thin AFTER the corrective substance retry and was accepted
+// rather than failed (Step 3). warn so it always surfaces for prompt tuning.
+export function replyThinAccepted(args: FailureArgs): PlutoMetricEvent {
+  return {
+    type: "pluto.reply.thin_accepted",
+    severity: "warn",
+    timestamp: new Date().toISOString(),
+    ...args,
+  };
+}
+
 // Conversation memory (Capstone) — a DB blip must not kill the turn; these
 // surface the degradation. severity error so the sink always logs them.
 export function memoryReadFailed(args: FailureArgs): PlutoMetricEvent {
