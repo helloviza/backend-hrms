@@ -1642,11 +1642,13 @@ router.post("/stream", async (req: any, res: any) => {
   };
 
   // Heartbeat comment every 15s while a stage runs (proxy keep-alive), flushed.
+  // Interval is overridable (CONCIERGE_SSE_HEARTBEAT_MS) purely for tests.
+  const heartbeatMs = Number(process.env.CONCIERGE_SSE_HEARTBEAT_MS) || 15_000;
   const heartbeat = setInterval(() => {
     if (res.writableEnded) { clearInterval(heartbeat); return; }
     res.write(`: keep-alive\n\n`);
     if (typeof (res as any).flush === "function") (res as any).flush();
-  }, 15_000);
+  }, heartbeatMs);
 
   // Capture the turn's res.json/status without any real socket write.
   const captured: { statusCode: number; body: any } = { statusCode: 200, body: undefined };
