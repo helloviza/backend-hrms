@@ -19,6 +19,14 @@ vi.mock("../utils/plutoMetricsSink.js", () => ({ emitMetric: emitMetricMock }));
 const { policyRulesMock } = vi.hoisted(() => ({ policyRulesMock: vi.fn() }));
 vi.mock("../services/policyService.js", () => ({ loadWorkspacePolicyRules: policyRulesMock }));
 
+// Route-insights read is AWAITED in the handler → mock the provider (no Mongo).
+const { routeInsightsMock } = vi.hoisted(() => ({ routeInsightsMock: vi.fn() }));
+vi.mock("../services/routeIntel.provider.js", () => ({
+  getRouteIntelProvider: () => ({ name: "mock", getRouteInsights: routeInsightsMock }),
+}));
+// Fare logging is fire-and-forget; stub to a no-op so no Mongo buffering occurs.
+vi.mock("../services/fareObservations.js", () => ({ recordFareObservations: () => {} }));
+
 import express from "express";
 import request from "supertest";
 import router from "./copilot.travel.js";
@@ -49,11 +57,15 @@ function rawFlight(over: Record<string, any> = {}) {
 
 const chat = (prompt: string) => request(app).post("/").send({ prompt }).then(r => r.body);
 
+const INSUFFICIENT = { typicalFareRange: null, cheapestAirlineRecent: null, observationCount: 3, dataWindowDays: 90, sufficient: false };
+
 beforeEach(() => {
   searchFlightsMock.mockReset();
   emitMetricMock.mockReset();
   policyRulesMock.mockReset();
   policyRulesMock.mockResolvedValue(null); // default: no policy
+  routeInsightsMock.mockReset();
+  routeInsightsMock.mockResolvedValue(INSUFFICIENT); // default: thin data
 });
 
 describe("concierge chat — Phase 1 reply states", () => {
@@ -123,5 +135,27 @@ describe("concierge chat — Phase 2 policy annotation", () => {
     const policyEvents = emitMetricMock.mock.calls.map(c => c[0]).filter(e => e?.type === "pluto.policy.evaluated");
     expect(policyEvents).toHaveLength(1);
     expect(policyEvents[0].metadata).toEqual({ inPolicyCount: 0, totalCount: 1 });
+  });
+});
+
+describe("concierge chat — Phase 3 route insights", () => {
+  it("thin data → routeInsights attached (sufficient:false), no fare sentence, metric served", async () => {
+    searchFlightsMock.mockResolvedValue({ Response: { TraceId: "P", ResponseStatus: 1, Results: [[rawFlight()]] } });
+    const body = await chat("find flights from Delhi to Mumbai on 20 May 2026");
+    expect(body.reply.routeInsights).toMatchObject({ sufficient: false });
+    expect(body.reply.context).not.toMatch(/typically been/i);
+    const types = emitMetricMock.mock.calls.map(c => c[0]?.type);
+    expect(types).toContain("pluto.routeinsights.served");
+  });
+
+  it("sufficient data → one grounded fare sentence in context", async () => {
+    routeInsightsMock.mockResolvedValue({
+      typicalFareRange: { p25: 4200, p75: 8700 }, cheapestAirlineRecent: "6E",
+      observationCount: 42, dataWindowDays: 90, sufficient: true,
+    });
+    searchFlightsMock.mockResolvedValue({ Response: { TraceId: "P", ResponseStatus: 1, Results: [[rawFlight()]] } });
+    const body = await chat("find flights from Delhi to Mumbai on 20 May 2026");
+    expect(body.reply.context).toMatch(/typically been ₹4,200–₹8,700 recently/);
+    expect(body.reply.routeInsights.sufficient).toBe(true);
   });
 });
