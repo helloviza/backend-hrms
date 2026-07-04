@@ -50,4 +50,38 @@ describe("resolveRoundTripIntent", () => {
     expect(r.wantsRoundTrip).toBe(true);
     expect(r.returnDateRaw).toBe("2026-05-20");
   });
+
+  it("the exact observed turn-2 phrasing → round trip + the second date", () => {
+    const r = resolveRoundTripIntent(
+      "so i am flying from Delhi on 20th September 2026 and returning back by 24th September. Can you suggest few good business hotel and cheapest flight for me.",
+      null,
+      "2026-09-20",
+    );
+    expect(r.wantsRoundTrip).toBe(true);
+    expect(r.returnDateRaw).toBe("24th September");
+  });
+
+  it("bare-day return ('back on the 24th') inherits month+year from the outbound date", () => {
+    const r = resolveRoundTripIntent("Delhi to Tokyo on 20th September, back on the 24th", null, "2026-09-20");
+    expect(r.wantsRoundTrip).toBe(true);
+    expect(r.returnDateRaw).toBe("2026-09-24");
+  });
+
+  it("'coming back' with a bare day is still a round trip", () => {
+    const r = resolveRoundTripIntent("fly out 20th September, coming back on the 25th", null, "2026-09-20");
+    expect(r.wantsRoundTrip).toBe(true);
+    expect(r.returnDateRaw).toBe("2026-09-25");
+  });
+
+  it("return date given in an earlier turn, then 'find flights' → uses the locked return date", () => {
+    const r = resolveRoundTripIntent("find flights", "2026-09-24", "2026-09-20");
+    expect(r.wantsRoundTrip).toBe(true);
+    expect(r.returnDateRaw).toBe("2026-09-24");
+  });
+
+  it("explicit one-way with a single date stays one-way", () => {
+    const r = resolveRoundTripIntent("one way from Delhi to Tokyo on 20th September", null, "2026-09-20");
+    expect(r.wantsRoundTrip).toBe(false);
+    expect(r.returnDateRaw).toBeNull();
+  });
 });

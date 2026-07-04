@@ -39,10 +39,33 @@ export interface RoundTripResolution {
 export function resolveRoundTripIntent(
   prompt: string,
   contextReturnDate?: string | null,
+  outboundISO?: string | null,
 ): RoundTripResolution {
-  const wantsKeyword = /\bround[\s-]?trip\b/i.test(prompt) || /\breturn(ing)?\b/i.test(prompt);
+  // Keyword set widened beyond "return/round trip" to the common paraphrases
+  // "coming back" and "back on|by|home" (the diagnosis found "back on the 24th"
+  // was read as a one-way).
+  const wantsKeyword =
+    /\bround[\s-]?trip\b/i.test(prompt) ||
+    /\breturn(ing)?\b/i.test(prompt) ||
+    /\bcoming\s+back\b/i.test(prompt) ||
+    /\bback\s+(?:on|by|home)\b/i.test(prompt);
+
   const dates = prompt.match(DATE_RX) || [];
-  const secondDate = dates.length >= 2 ? dates[1] : null;
+  let secondDate: string | null = dates.length >= 2 ? dates[1] : null;
+
+  // Bare-day return ("back on the 24th", "returning by the 3rd") — a day with no
+  // month. Inherit the month + year from the parsed OUTBOUND date so it still
+  // produces a JourneyType 2 search instead of silently collapsing to one-way.
+  if (!secondDate && outboundISO && /^\d{4}-\d{2}-\d{2}$/.test(outboundISO)) {
+    const bare = prompt.match(
+      /\b(?:return(?:ing)?|coming\s+back|back)\b[^.]{0,20}?\b(?:on|by)\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?\b/i,
+    );
+    if (bare) {
+      const [y, m] = outboundISO.split("-");
+      secondDate = `${y}-${m}-${String(bare[1]).padStart(2, "0")}`; // ISO — parseDateToISO returns as-is
+    }
+  }
+
   const returnDateRaw = secondDate || contextReturnDate || null;
   return {
     wantsRoundTrip: wantsKeyword || Boolean(returnDateRaw),
