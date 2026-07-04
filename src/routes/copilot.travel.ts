@@ -596,13 +596,19 @@ router.post("/hotels/search", async (req, res) => {
  * POST /api/v1/copilot/travel
  * Public / semi-auth AI concierge
  */
-router.post("/", async (req, res) => {
+// The concierge turn as a reusable function. POST / calls it with no stage
+// listener (behaviour byte-identical); POST /stream passes an onStage emitter.
+// It still calls res.json / res.status().json exactly as before — /stream drives
+// it through a capture-res shim, so no response call site changed (Amendment N:
+// the getConversationContext/saveConversationContext call sites are untouched).
+async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) => void) {
   // Per-request correlation id + tenant, threaded into every log line, metric
   // event and error response for this concierge turn.
   const requestId = crypto.randomUUID();
   const workspaceId = String((req as any).workspaceObjectId || "");
   try {
     const { prompt, context, lastReply, videoAnalysisId } = req.body;
+    onStage?.("understanding");
 
     if (!prompt || typeof prompt !== "string") {
       return res.status(400).json({
@@ -807,6 +813,7 @@ router.post("/", async (req, res) => {
       // fail-safe → null when absent). Flights are annotated, never filtered.
       const chatPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
 
+      onStage?.("searching_flights");
       if (isoDate) {
         const chatResult = await searchFlightsForChat({
           origin: originIATA,
@@ -859,9 +866,9 @@ router.post("/", async (req, res) => {
       // Policy telemetry + "clear why" copy when nothing is in policy.
       const inPolicyCount = chatFlights.filter((f: any) => f?.policy?.status === "IN_POLICY").length;
       if (hasLiveFlights) {
-        await emitMetric(
-          policyEvaluated({ workspaceId, requestId, inPolicyCount, totalCount: chatFlights.length })
-        );
+        void Promise.resolve(
+          emitMetric(policyEvaluated({ workspaceId, requestId, inPolicyCount, totalCount: chatFlights.length }))
+        ).catch((e: any) => console.error("[metric] policyEvaluated failed", e?.message));
       }
       const zeroInPolicyNote =
         hasLiveFlights && chatPolicyRules && inPolicyCount === 0
@@ -874,37 +881,43 @@ router.post("/", async (req, res) => {
 
       // Route insights (Know) — tenant-scoped FareObservation history. Grounded:
       // one sentence only when we have enough data; never invents fares.
+      // Route insights (Know) + weather awareness. These two post-search reads
+      // are provably independent (neither consumes the other), so they run
+      // concurrently (Amendment L) — one RTT instead of two. The metric is
+      // fire-and-forget (the sink is reject-safe). Weather silent-skips on
+      // failure and never blocks.
       let routeInsights: any = null;
       let routeInsightsNote = "";
+      let weatherNote = "";
       if (hasLiveFlights) {
-        routeInsights = await getRouteIntelProvider().getRouteInsights({
-          origin: originIATA,
-          destination: destIATA,
-          departDate: isoDate,
-          workspaceObjectId: (req as any).workspaceObjectId,
-        });
-        await emitMetric(
-          routeInsightsServed({
+        onStage?.("checking_weather");
+        const [insightsRes, weatherRes] = await Promise.all([
+          getRouteIntelProvider().getRouteInsights({
+            origin: originIATA,
+            destination: destIATA,
+            departDate: isoDate,
+            workspaceObjectId: (req as any).workspaceObjectId,
+          }),
+          isoDate ? getDestinationWeather(destIATA, isoDate) : Promise.resolve(null),
+        ]);
+        routeInsights = insightsRes;
+        void Promise.resolve(
+          emitMetric(routeInsightsServed({
             workspaceId,
             requestId,
             observationCount: routeInsights.observationCount,
             sufficient: routeInsights.sufficient,
-          })
-        );
+          }))
+        ).catch((e: any) => console.error("[metric] routeInsightsServed failed", e?.message));
         if (routeInsights.sufficient && routeInsights.typicalFareRange) {
           routeInsightsNote = ` Fares on this route have typically been ₹${routeInsights.typicalFareRange.p25.toLocaleString("en-IN")}–₹${routeInsights.typicalFareRange.p75.toLocaleString("en-IN")} recently.`;
         }
-      }
-
-      // Weather awareness (additive, silent-skip on failure — never blocks).
-      let weatherNote = "";
-      if (hasLiveFlights && isoDate) {
-        const w = await getDestinationWeather(destIATA, isoDate);
-        if (w) {
-          weatherNote = ` Weather in ${w.city} around then: ~${Math.round(w.tempMaxC)}°C, ${w.summary}.`;
+        if (weatherRes) {
+          weatherNote = ` Weather in ${weatherRes.city} around then: ~${Math.round(weatherRes.tempMaxC)}°C, ${weatherRes.summary}.`;
         }
       }
 
+      onStage?.("assembling");
       const nextSteps = searchUnavailable ? [
         "Retry the search in a few minutes",
         "Or use the flight search panel above for full results",
@@ -1445,6 +1458,7 @@ ${prompt}
 `;
     }
 
+    onStage?.("consulting_ai");
     /* ───────── Invoke AI (OpenAI with Gemini Fallback) ───────── */
     let deltaReply: PlutoDeltaReply;
 
@@ -1581,6 +1595,7 @@ ${prompt}
       handoff: fullReply.handoff,
     });
 
+    onStage?.("assembling");
     return res.json({
       ok: true,
       reply: responseDelta,
@@ -1593,6 +1608,69 @@ ${prompt}
       message: err?.message || "Failed to generate travel response",
       requestId,
     });
+  }
+}
+
+// POST / — delegates to runConciergeTurn with NO stage listener. Byte-identical
+// to the previous handler (onStage is undefined → every onStage?.() is a no-op).
+router.post("/", async (req, res) => runConciergeTurn(req, res));
+
+/**
+ * POST /stream — same request body as POST /, streamed as SSE progress events:
+ *   event:status {stage} … → event:final {<same reply JSON POST / returns>}
+ *   → event:done. On failure → event:error {message, requestId}. Never drops the
+ *   connection without an error event.
+ *
+ * Flush discipline mirrors chat.ts (Amendment M): the global compression() makes
+ * any un-flushed frame a silent stall, so every write is followed by res.flush().
+ */
+router.post("/stream", async (req: any, res: any) => {
+  const streamId = crypto.randomUUID();
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+  const socket = (res as any).socket;
+  if (socket) { socket.setNoDelay(true); socket.setTimeout(0); }
+
+  const write = (event: string, data: any) => {
+    if (res.writableEnded) return;
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data ?? {})}\n\n`);
+    if (typeof (res as any).flush === "function") (res as any).flush();
+  };
+
+  // Heartbeat comment every 15s while a stage runs (proxy keep-alive), flushed.
+  const heartbeat = setInterval(() => {
+    if (res.writableEnded) { clearInterval(heartbeat); return; }
+    res.write(`: keep-alive\n\n`);
+    if (typeof (res as any).flush === "function") (res as any).flush();
+  }, 15_000);
+
+  // Capture the turn's res.json/status without any real socket write.
+  const captured: { statusCode: number; body: any } = { statusCode: 200, body: undefined };
+  const captureRes: any = {
+    status(code: number) { captured.statusCode = code; return captureRes; },
+    json(body: any) { captured.body = body; return captureRes; },
+  };
+
+  try {
+    await runConciergeTurn(req, captureRes, (stage: string) => write("status", { stage }));
+    if (captured.statusCode >= 400) {
+      write("error", {
+        message: captured.body?.message || "Failed to generate travel response",
+        requestId: captured.body?.requestId || streamId,
+      });
+    } else {
+      write("final", captured.body);
+      write("done", {});
+    }
+  } catch (err: any) {
+    write("error", { message: err?.message || "Failed to generate travel response", requestId: streamId });
+  } finally {
+    clearInterval(heartbeat);
+    if (!res.writableEnded) res.end();
   }
 });
 
