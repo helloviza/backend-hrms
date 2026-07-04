@@ -106,6 +106,22 @@ export function isValidPlutoReply(obj: unknown): obj is Partial<PlutoReplyV1> {
 }
 
 /**
+ * SUBSTANCE check (not schema). A reply is "thin" when the trip is already
+ * plannable (destination + duration known — the CALLER decides that and only
+ * then applies this) yet the model returned no draft itinerary OR a context that
+ * is not real prose (a bare place name / single fragment instead of 2–3
+ * sentences). Used by the invoke loop to trigger ONE corrective retry.
+ */
+export function isThinReply(reply: Partial<PlutoReplyV1>): boolean {
+  const hasItinerary = Array.isArray(reply.itinerary) && reply.itinerary.length > 0;
+  const ctx = typeof reply.context === "string" ? reply.context.trim() : "";
+  // Count sentence terminators as a cheap proxy for "2–3 sentences".
+  const sentences = (ctx.match(/[.!?](\s|$)/g) || []).length;
+  const substantiveContext = ctx.length >= 40 && sentences >= 2;
+  return !hasItinerary || !substantiveContext;
+}
+
+/**
  * State-aware validator
  *
  * Enforces conversation discipline WITHOUT schema rigidity.
