@@ -26,13 +26,16 @@ vi.mock("../utils/plutoStateResolver.js", () => ({ resolvePlutoState: H.resolveS
 vi.mock("../utils/plutoDecisionLocker.js", () => ({ lockDecisions: H.lockDecisionsMock }));
 vi.mock("../utils/plutoIntentClassifier.js", () => ({ classifyPlutoIntent: H.classifyIntentMock }));
 vi.mock("../services/tbo.flight.service.js", () => ({ searchFlights: vi.fn() }));
-// Isolate the idempotency guard to the CLIENT-supplied context (round-tripped),
-// simulating a per-instance Map miss (restart / other App Runner instance) so
-// the context flag is the sole state carrier. Not modifying plutoMemory source —
-// this is a test double.
+// Memory is mocked so the REAL sink runs against fake models. The handoff dedup
+// is now SERVER-SIDE (claimHandoffDelivery): a stateful double simulates the
+// atomic Mongo claim — the first turn wins the claim (delivers), every later
+// claim (even across a simulated instance / a stripped client flag) loses.
+const claim = vi.hoisted(() => ({ count: 0 }));
 vi.mock("../utils/plutoMemory.js", () => ({
   getConversationContext: async () => null,
   saveConversationContext: async () => {},
+  claimHandoffDelivery: async () => (claim.count++ === 0),
+  releaseHandoffDelivery: async () => {},
 }));
 
 // Models + mailer → the real sink + real persistent metrics sink run against these.
@@ -80,6 +83,7 @@ async function turn(context: any) {
 
 beforeEach(() => {
   Object.values(H).forEach((m: any) => m.mockReset());
+  claim.count = 0; // reset the server-side dedup claim between tests
   // AI returns a valid reply; handler overwrites reply.handoff via isHandoffReady.
   H.invokePlutoMock.mockResolvedValue({
     handoff: false,
@@ -148,10 +152,12 @@ describe("AI handoff end-to-end", () => {
     expect(H.sbtCreateMock).toHaveBeenCalledTimes(1); // still ONE
   });
 
-  it("e) client DROPS handoffDelivered from context → duplicate is created (known gap)", async () => {
+  it("e) client STRIPS handoffDelivered → still NO duplicate (server-side dedup)", async () => {
     const body1 = await turn(readyContext());
     expect(H.sbtCreateMock).toHaveBeenCalledTimes(1);
 
+    // Tamper: drop the client echo entirely. Pre-migration this created a
+    // duplicate; now the authoritative DB claim (already delivered) blocks it.
     const tampered = { ...body1.context };
     delete tampered.handoffDelivered;
 
@@ -160,8 +166,6 @@ describe("AI handoff end-to-end", () => {
       .mockReturnValueOnce(chain({ email: "booker@x.com" }));
 
     await turn(tampered);
-    // Context-flag dedup is client-trusted, so a dropped flag yields a duplicate.
-    // Server-side dedup moves to the Mongo conversation store post-migration.
-    expect(H.sbtCreateMock).toHaveBeenCalledTimes(2);
+    expect(H.sbtCreateMock).toHaveBeenCalledTimes(1); // server-side claim → no duplicate
   });
 });
