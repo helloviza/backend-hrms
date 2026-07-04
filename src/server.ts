@@ -787,6 +787,12 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
 
       await connectDb();
 
+      // Deterministically build the Pluto correctness-critical indexes (the
+      // handoff-dedup + tenant-scope guards depend on them) before serving
+      // traffic. Log-and-continue — never crashes boot.
+      const { ensurePlutoIndexes } = await import("./bootstrap/ensurePlutoIndexes.js");
+      await ensurePlutoIndexes().catch((e: unknown) => logger.warn("[PLUTO INDEXES] ensure failed", { e }));
+
       // WA_HOST=true designates the dedicated WhatsApp host — the always-on
       // Fargate service that owns the single whatsapp-web.js client
       // (clientId "plumtrips-eod"). That host runs ONLY the EOD + Sales Pulse
