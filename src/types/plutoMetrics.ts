@@ -28,6 +28,9 @@ export type PlutoMetricEventType =
   | "pluto.notify.sent"
   | "pluto.notify.failed"
   | "pluto.weather.failed"
+  // Conversation memory migration (Capstone)
+  | "pluto.memory.read_failed"
+  | "pluto.memory.write_failed"
   // Arrival concierge (Phase 4 — Arrive)
   | "pluto.arrive.session_opened"
   | "pluto.arrive.expired"

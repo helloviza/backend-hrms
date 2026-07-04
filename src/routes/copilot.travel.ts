@@ -1031,7 +1031,14 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
     const existingId = context?.id || req.body?.conversationId;
 
     if (existingId) {
-      const saved = await getConversationContext(existingId);
+      // Tenant-scoped read: identity from req (never the client body). A
+      // wrong-workspace or malformed conversationId returns null, exactly like a
+      // miss, and falls back to the client-supplied context.
+      const saved = await getConversationContext({
+        workspaceObjectId: (req as any).workspaceObjectId,
+        userId: (req as any).user?._id,
+        conversationId: existingId,
+      });
       conversationContext =
         saved ||
         (context && typeof context === "object" ? context : { summary: "" });
@@ -1578,8 +1585,13 @@ ${prompt}
       }
     }
 
-    /* ───────── Save to Memory ───────── */
-    await saveConversationContext(conversationContext.id, conversationContext);
+    /* ───────── Save to Memory (tenant-scoped upsert) ───────── */
+    await saveConversationContext({
+      workspaceObjectId: (req as any).workspaceObjectId,
+      userId: (req as any).user?._id,
+      conversationId: conversationContext.id,
+      context: conversationContext,
+    });
 
     /* ───────── Delta API response ───────── */
     const responseDelta = reduceToDelta(fullReply, lastReply);
