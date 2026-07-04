@@ -3,6 +3,7 @@ import { Router, type Request, type Response } from "express";
 import ExpenseCapture from "../models/ExpenseCapture.js";
 import ExpenseReply from "../models/ExpenseReply.js";
 import { verifyMetaSignature } from "../services/whatsappCloud.service.js";
+import { dispatchArrivalInbound, hasActiveArrivalSession } from "../services/arrivalInbound.js";
 import { env } from "../config/env.js";
 import { whatsappLogger } from "../utils/logger.js";
 
@@ -67,6 +68,35 @@ router.post("/webhook", async (req: Request, res: Response) => {
         for (const message of messages) {
           try {
             const type: string = message?.type ?? "";
+
+            // ── Phase 4 (Arrive) routing — BEFORE the expense enqueue ───────
+            // Route to the arrival concierge when the tap is an arr_* button OR
+            // the sender has an ACTIVE ArrivalSession. Fire-and-forget so the
+            // webhook still acks within Meta's 5s window. Non-arrival messages
+            // fall through to the UNCHANGED expense path below. Media (receipts)
+            // never enter this branch.
+            if (type === "text" || type === "interactive") {
+              const arrWaId: string = message?.from ?? "";
+              const arrMsgId: string = message?.id ?? "";
+              const arrInter = message?.interactive ?? {};
+              const arrBtnId: string =
+                type === "interactive" ? (arrInter?.button_reply?.id ?? arrInter?.list_reply?.id ?? "") : "";
+              const arrText: string = type === "text" ? (message?.text?.body ?? "") : "";
+              if (arrWaId && arrMsgId) {
+                const routeToArrival =
+                  arrBtnId.startsWith("arr_") || (await hasActiveArrivalSession(arrWaId));
+                if (routeToArrival) {
+                  void dispatchArrivalInbound({
+                    waId: arrWaId,
+                    messageId: arrMsgId,
+                    buttonId: arrBtnId,
+                    text: arrText,
+                    phoneNumberId,
+                  });
+                  continue;
+                }
+              }
+            }
 
             // ── TEXT replies (confirm / correct / cancel) ───────────────────
             // Enqueue idempotently; the worker matches them to the pending
