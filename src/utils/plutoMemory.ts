@@ -80,15 +80,29 @@ export async function saveConversationContext(args: MemorySaveArgs): Promise<voi
     args || ({} as MemorySaveArgs);
   if (!workspaceObjectId || !isValidConversationId(conversationId)) return;
   if (!connected()) return;
+  const filter = { workspaceId: workspaceObjectId, conversationId };
+  const set: any = { context, lastTurnAt: new Date() };
+  if (handoffDelivered !== undefined) set.handoffDelivered = handoffDelivered;
   try {
-    const set: any = { context, lastTurnAt: new Date() };
-    if (handoffDelivered !== undefined) set.handoffDelivered = handoffDelivered;
     await PlutoConversation.updateOne(
-      { workspaceId: workspaceObjectId, conversationId },
+      filter,
       { $set: set, $setOnInsert: { userId: userId ?? null, createdAt: new Date() } },
       { upsert: true },
     );
   } catch (e: any) {
+    // Concurrent-upsert race: two writers hit a cold doc, one inserts, the other
+    // collides on the unique {workspaceId, conversationId} index (E11000). Retry
+    // ONCE as a plain update (the doc now exists) so this writer's context still
+    // lands — never surface a duplicate-key error to the caller.
+    if (e?.code === 11000) {
+      try {
+        await PlutoConversation.updateOne(filter, { $set: set });
+        return;
+      } catch (e2: any) {
+        void emitMetric(memoryWriteFailed({ workspaceId: String(workspaceObjectId), reason: e2?.message }));
+        return;
+      }
+    }
     void emitMetric(memoryWriteFailed({ workspaceId: String(workspaceObjectId), reason: e?.message }));
     // turn still succeeds
   }
