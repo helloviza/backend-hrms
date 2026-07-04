@@ -626,15 +626,25 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
     // NEVER gate follow-up messages — they are refinements, not new requests.
     const isFollowUp = Boolean(context?.id || req.body?.conversationId);
 
+    // Establish a stable conversation id up front so EVERY reply — including the
+    // pre-AI gather-phase gate below — carries it. Without this, a details-
+    // gathering conversation never gets an identity: the client round-trips an
+    // id-less context, the next turn's isFollowUp stays false, and the whole
+    // conversation resets. Reusing an existing id is a no-op for follow-ups.
+    const conversationId =
+      context?.id || req.body?.conversationId || crypto.randomUUID();
+
     // 1️⃣ Must be travel-related at all (skip for follow-ups).
     // Off-domain (clearly HR/payroll/admin) → graceful concierge redirect
     // in the SAME PlutoReplyV1 shape the frontend renders. Never a 500.
     // A travel question that merely contains a flagged substring
     // (e.g. "leave for the airport", "baggage policy") is NOT redirected.
     if (!isFollowUp && isOffDomainQuery(prompt)) {
+      // Carry the stable id even on the redirect so no reply is ever id-less.
       return res.json({
         ok: true,
         reply: buildOffDomainRedirect(),
+        context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
       });
     }
 
@@ -672,7 +682,7 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
             ],
             handoff: false,
           },
-          context: context || {},
+          context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
         });
       }
 
@@ -961,71 +971,23 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
           nextSteps,
           handoff: false,
         },
-        context: context || {},
+        context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
       });
     }
 
 
-    // 2️⃣ Planning intent gate — ONLY for brand new conversations
-    if (!isFollowUp) {
-      // ── Flight status queries bypass the planning gate ──
-      const isFlightStatusQuery = Boolean(
-        prompt.match(/\b(\d?[A-Z]{1,2})[-\s]?(\d{2,4})\b/gi) &&
-        /(status|flight|where|landed|delayed|on time|arrival|departure|tell me|what is)/i.test(prompt)
-      );
-
-      const hasExplicitPlanningIntent = [
-        /plan/i, /itinerary/i, /schedule/i, /create/i, /suggest/i, /recommend/i, /book/i,
-        /\d+[\s-]day/i, /\d+[nN]/i,
-        /trip to/i, /travel to/i, /visit/i, /fly to/i, /flight to/i,
-        /holiday/i, /vacation/i, /getaway/i, /offsite/i, /retreat/i,
-        /business trip/i, /work trip/i, /conference/i, /family trip/i,
-        /stay in/i, /stay at/i,
-        /hotel/i, /accommodation/i, /where to stay/i,
-        /what to do/i, /things to do/i, /explore/i,
-        /weekend/i, /honeymoon/i, /anniversary/i,
-        /nights/i, /days/i,
-      ].some(rx => rx.test(prompt));
-
-      const hasDestination = /to ([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)/i.test(prompt);
-      const hasDuration = /\d+[\s-]day/i.test(prompt) || /\d+[nN]/i.test(prompt);
-      const hasOrigin = /(from|departing|flying from|origin)[\s:]+([A-Z][a-z]+)/i.test(prompt);
-      const hasDates = /(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}[\/\-]\d{1,2}|next week|this week|tomorrow)/i.test(prompt);
-
-      // New conversation with destination but missing origin/dates → ask for details
-      if (hasExplicitPlanningIntent && hasDestination && !hasOrigin && !hasDates) {
-        const destinationMatch = prompt.match(/to ([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)/i);
-        const destination = destinationMatch?.[1] || "your destination";
-        return res.json({
-          ok: true,
-          reply: {
-            title: `Let's plan your trip to ${destination}`,
-            context: `I have a good picture of where you want to go — ${destination}${hasDuration ? " for " + (prompt.match(/\d+[\s-]day/i)?.[0] || prompt.match(/\d+[nN]/i)?.[0] || "") : ""}. To build you the perfect itinerary, I just need a couple more details.`,
-            nextSteps: [
-              `Where will you be flying from?`,
-              `What are your travel dates?`,
-              `What's the purpose — business, leisure, or a mix?`,
-            ],
-            handoff: false,
-          },
-          context: context || {},
-        });
-      }
-
-      // No planning intent at all on a fresh message
-      if (!hasExplicitPlanningIntent && !isFlightStatusQuery) {
-        return res.json({
-          ok: true,
-          reply: {
-            title: "Ready when you are",
-            context: "Ask me to plan a trip, create an itinerary, or check a flight status.",
-            nextSteps: ["Plan a trip", "Create an itinerary"],
-            handoff: false,
-          },
-          context: context || {},
-        });
-      }
-    }
+    // 2️⃣ Gather phase is owned by the AI, not a regex gate.
+    //
+    // The old planning-intent gate (removed here) short-circuited brand-new,
+    // on-domain messages into two hardcoded replies ("…a couple more details"
+    // and "Ready when you are"). It was brittle — it couldn't recognise a
+    // natural continuation like "flying from Delhi on 16th Aug" as planning
+    // intent, so it reset the conversation. Now these messages flow straight to
+    // the AI path (classifyPlutoIntent → resolvePlutoState → invokePluto), which
+    // already implements DISCOVERY clarifying-question behaviour and persists +
+    // returns a stable id. The off-domain guard above still protects cost/scope,
+    // and the flight-search / flight-status branches still run before the AI.
+    // NOTE: gather turns now reach OpenAI (an intended increase in AI calls).
 
     /* ───────── Normalize context (Memory Check) ───────── */
     let conversationContext: any;
@@ -1050,7 +1012,9 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
     }
 
     if (!conversationContext.id) {
-      conversationContext.id = existingId || crypto.randomUUID();
+      // Reuse the id established up front (existing id, or the new uuid) so the
+      // AI-path reply carries the SAME id every early gate already returns.
+      conversationContext.id = conversationId;
     }
 
     if (!conversationContext.locked) {
@@ -1149,6 +1113,79 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
           days: diffDays,
           source: "derived",
         };
+      }
+    }
+
+    /* ───────── LOCK USER-STATED FACTS (PRE-AI, ACCUMULATIVE) ─────────
+     * lockDecisions() runs on the AI REPLY and has no home for facts the USER
+     * states in prose (destination / origin / dates / duration / purpose).
+     * Capture them from the prompt here so the AI sees them as LOCKED (and does
+     * not re-ask), and so they PERSIST and ACCUMULATE across turns via memory /
+     * the round-tripped context. Set-if-absent: a later turn ADDS new facts
+     * without dropping earlier ones (turn 2's Delhi + dates never clobber turn
+     * 1's Tokyo). A video-locked destination is never overridden.
+     */
+    {
+      const L = conversationContext.locked;
+      const MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+      const parseLooseDate = (token: string): string | null => {
+        const m = token.match(/(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{4}))?/i);
+        if (!m) return null;
+        const day = parseInt(m[1], 10);
+        const monthIdx = MONTHS.indexOf(m[2].slice(0, 3).toLowerCase());
+        if (monthIdx < 0) return null;
+        const year = m[3] ? parseInt(m[3], 10) : new Date().getFullYear();
+        const d = new Date(Date.UTC(year, monthIdx, day));
+        return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+      };
+
+      // Destination — "trip to Tokyo", "flying to Tokyo", "to Tokyo".
+      // Require a capitalised token (proper-noun heuristic) to avoid capturing
+      // verbs like "to go". Never override a video-locked destination.
+      if (!L.destination) {
+        const destM =
+          prompt.match(/\b(?:trip|travel|traveling|travelling|fly|flying|go|going|head|heading|visit|visiting)\s+to\s+([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?)/) ||
+          prompt.match(/\bto\s+([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?)\b/);
+        if (destM) L.destination = { name: destM[1], source: "user" };
+      }
+
+      // Origin — "from Delhi", "flying from Delhi", "departing Delhi".
+      if (!L.origin) {
+        const origM = prompt.match(/\b(?:from|departing|departing from|flying from|leaving|leaving from)\s+([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?)/);
+        if (origM) L.origin = { city: origM[1], source: "user" };
+      }
+
+      // Duration — "3-day", "3 day", "3 days", "3 nights", "5N".
+      if (!L.duration) {
+        const durM =
+          prompt.match(/\b(\d+)\s*[-\s]?\s*(?:day|days|night|nights)\b/i) ||
+          prompt.match(/\b(\d+)\s*N\b/);
+        if (durM) L.duration = { days: parseInt(durM[1], 10), source: "user" };
+      }
+
+      // Dates — one or two natural-language dates NOT joined by "to"/"-" (that
+      // form is handled by the range normaliser above), e.g. "16th Aug … 20th
+      // Aug". First token = start, second (if any) = end; derive duration.
+      if (!L.dates) {
+        const tokens = prompt.match(/\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?/gi) || [];
+        if (tokens.length >= 1) {
+          const start = parseLooseDate(tokens[0]);
+          const end = tokens[1] ? parseLooseDate(tokens[1]) : null;
+          if (start) {
+            L.dates = { start, ...(end ? { end } : {}), source: "user" };
+            if (end && !L.duration) {
+              const diff = Math.round((Date.parse(end) - Date.parse(start)) / 86400000) + 1;
+              if (diff > 0) L.duration = { days: diff, source: "derived" };
+            }
+          }
+        }
+      }
+
+      // Trip purpose / type — only if not already committed.
+      if (!L.tripType) {
+        if (/\bbusiness\b|\bwork trip\b|\bconference\b/i.test(prompt)) L.tripType = "business";
+        else if (/\bholiday\b|\bleisure\b|\bvacation\b|\bhoneymoon\b|\bgetaway\b|\banniversary\b/i.test(prompt)) L.tripType = "holiday";
+        else if (/\boffsite\b|\bretreat\b|\bmice\b|\bteam\s+trip\b/i.test(prompt)) L.tripType = "mice";
       }
     }
 
