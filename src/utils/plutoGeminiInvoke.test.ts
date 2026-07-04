@@ -58,3 +58,38 @@ describe("invokePlutoGemini — fallback validation", () => {
     );
   });
 });
+
+const RICH = {
+  handoff: false,
+  context: "Tokyo is an excellent base for a focused three-day business trip. Here is a draft skeleton to refine. We can tune the pace once dates are set.",
+  itinerary: [{ day: 1, heading: "Arrival & settle in", details: ["Check in near Marunouchi"] }],
+};
+
+describe("invokePlutoGemini — substance enforce-retry (mirrors OpenAI)", () => {
+  it("requireSubstance + thin → one corrective retry → returns the rich reply", async () => {
+    generateContentMock
+      .mockResolvedValueOnce(geminiText({ handoff: false, context: "Tokyo, Japan" }))
+      .mockResolvedValueOnce(geminiText(RICH));
+    const reply = await invokePlutoGemini("plan Tokyo", { requireSubstance: true });
+    expect(reply.itinerary).toHaveLength(1);
+    expect(generateContentMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("requireSubstance + thin twice → ACCEPTED (no throw) + onThinAccepted fired", async () => {
+    generateContentMock
+      .mockResolvedValueOnce(geminiText({ handoff: false, context: "Tokyo, Japan" }))
+      .mockResolvedValueOnce(geminiText({ handoff: false, context: "Tokyo, Japan" }));
+    const onThinAccepted = vi.fn();
+    const reply = await invokePlutoGemini("plan Tokyo", { requireSubstance: true, onThinAccepted });
+    expect(reply.context).toBe("Tokyo, Japan");
+    expect(onThinAccepted).toHaveBeenCalledTimes(1);
+    expect(generateContentMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("requireSubstance=false + thin → no substance retry", async () => {
+    generateContentMock.mockResolvedValueOnce(geminiText({ handoff: false, context: "Tokyo, Japan" }));
+    const reply = await invokePlutoGemini("plan Tokyo");
+    expect(reply.context).toBe("Tokyo, Japan");
+    expect(generateContentMock).toHaveBeenCalledTimes(1);
+  });
+});
