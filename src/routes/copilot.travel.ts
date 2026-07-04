@@ -31,6 +31,8 @@ import type { PlutoConversationState } from "../types/plutoConversationState.js"
 import {
   getConversationContext,
   saveConversationContext,
+  claimHandoffDelivery,
+  releaseHandoffDelivery,
 } from "../utils/plutoMemory.js";
 import { invokePlutoGemini, GEMINI_FALLBACK_INVALID } from "../utils/plutoGeminiInvoke.js";
 import {
@@ -1534,15 +1536,17 @@ ${prompt}
         handoffTriggered(conversationContext.id, conversationContext.turn)
       );
 
-      // Idempotency: deliver AT MOST ONCE per conversation. The guard flag lives
-      // on the conversation context (round-tripped to the client), NOT in
-      // plutoMemory.ts. Repeated handoff-ready turns do not create duplicates.
-      // KNOWN GAP: this flag is client-trusted — if the client drops
-      // handoffDelivered from the returned context, a duplicate CONCIERGE_AI
-      // request is created. Server-side dedup (a unique index / lookup on the
-      // Mongo conversation store) moves here once the plutoMemory → Mongo
-      // migration lands; until then the context flag is the specified guard.
-      if (!conversationContext.handoffDelivered) {
+      // Idempotency: deliver AT MOST ONCE per conversation. The guard is now
+      // SERVER-SIDE and cross-instance — an atomic claim on the Mongo conversation
+      // store (handoffDelivered false→true). A stripped client flag or a second
+      // App Runner instance cannot cause a duplicate; the DB flag is
+      // authoritative. The context flag is kept only as a secondary UI echo.
+      const claimed = await claimHandoffDelivery({
+        workspaceObjectId: (req as any).workspaceObjectId,
+        userId: (req as any).user?._id,
+        conversationId: conversationContext.id,
+      });
+      if (claimed) {
         const payload = buildHandoffPayload(
           fullReply,
           conversationContext.state,
@@ -1559,7 +1563,7 @@ ${prompt}
         });
 
         if (result.delivered) {
-          conversationContext.handoffDelivered = true;
+          conversationContext.handoffDelivered = true; // secondary UI echo
           conversationContext.handoffRequestId = result.requestId;
           await emitMetric(
             handoffDelivered({
@@ -1570,6 +1574,12 @@ ${prompt}
             })
           );
         } else {
+          // Delivery failed after claiming → release the claim so a later turn
+          // can retry (never lock on failure).
+          await releaseHandoffDelivery({
+            workspaceObjectId: (req as any).workspaceObjectId,
+            conversationId: conversationContext.id,
+          });
           // Never silent: emit an error metric AND surface to the user.
           await emitMetric(
             handoffFailed({

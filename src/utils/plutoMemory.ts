@@ -93,3 +93,60 @@ export async function saveConversationContext(args: MemorySaveArgs): Promise<voi
     // turn still succeeds
   }
 }
+
+export interface HandoffGuardArgs {
+  workspaceObjectId: any;
+  userId?: any;
+  conversationId: unknown;
+}
+
+/**
+ * Server-side, cross-instance handoff dedup (Step 3). Atomically CLAIM the right
+ * to deliver on the Mongo conversation store: flip handoffDelivered false→true.
+ * Returns true iff THIS caller won the claim (should deliver); false means it was
+ * already delivered (by an earlier turn or a concurrent instance) → skip.
+ *
+ * The upsert + unique {workspaceId, conversationId} index makes it race-safe: the
+ * filter {handoffDelivered:false} matches only an undelivered doc; when a
+ * delivered doc already exists the filter misses, the upsert insert collides on
+ * the unique index (E11000), and we return false.
+ */
+export async function claimHandoffDelivery(args: HandoffGuardArgs): Promise<boolean> {
+  const { workspaceObjectId, userId, conversationId } = args || ({} as HandoffGuardArgs);
+  if (!workspaceObjectId || !isValidConversationId(conversationId)) return false;
+  // No live store → cannot dedup; deliver (best-effort, matches pre-migration).
+  if (!connected()) return true;
+  try {
+    await PlutoConversation.findOneAndUpdate(
+      { workspaceId: workspaceObjectId, conversationId, handoffDelivered: false },
+      {
+        $set: { handoffDelivered: true, lastTurnAt: new Date() },
+        $setOnInsert: { userId: userId ?? null, createdAt: new Date(), context: {} },
+      },
+      { upsert: true, new: true },
+    );
+    return true; // won the claim → deliver
+  } catch (e: any) {
+    if (e?.code === 11000) return false; // already delivered → skip (idempotent)
+    void emitMetric(memoryWriteFailed({ workspaceId: String(workspaceObjectId), reason: e?.message }));
+    return true; // unexpected error → prefer delivering over silently dropping a handoff
+  }
+}
+
+/**
+ * Release a claim when delivery FAILS after claiming, so a later turn can retry
+ * (preserves the pre-migration "never lock on failure" behaviour). Best-effort.
+ */
+export async function releaseHandoffDelivery(args: { workspaceObjectId: any; conversationId: unknown }): Promise<void> {
+  const { workspaceObjectId, conversationId } = args || ({} as any);
+  if (!workspaceObjectId || !isValidConversationId(conversationId)) return;
+  if (!connected()) return;
+  try {
+    await PlutoConversation.updateOne(
+      { workspaceId: workspaceObjectId, conversationId },
+      { $set: { handoffDelivered: false } },
+    );
+  } catch {
+    /* best-effort — a failed release just means no retry */
+  }
+}
