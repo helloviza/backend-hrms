@@ -7,8 +7,9 @@ const H = vi.hoisted(() => ({
   aCreate: vi.fn(), aUpdateOne: vi.fn(), aFind: vi.fn(), aFindOne: vi.fn(),
   bFindById: vi.fn(),
   flightStatus: vi.fn(),
-  sendTemplate: vi.fn(), sendText: vi.fn(), sendMail: vi.fn(),
+  sendTemplate: vi.fn(), sendText: vi.fn(), sendButtons: vi.fn(), sendMail: vi.fn(),
   emitMetric: vi.fn(), getWeather: vi.fn(),
+  arrFind: vi.fn(), arrFindOne: vi.fn(),
 }));
 
 vi.mock("../models/TripWatch.js", () => ({ default: {
@@ -19,7 +20,8 @@ vi.mock("../models/TripAlert.js", () => ({ default: {
 } }));
 vi.mock("../models/SBTBooking.js", () => ({ default: { findById: H.bFindById } }));
 vi.mock("../services/flightService.js", () => ({ getDelightfulFlightStatus: H.flightStatus }));
-vi.mock("../services/whatsappCloud.service.js", () => ({ sendTemplateMessage: H.sendTemplate, sendTextMessageResult: H.sendText }));
+vi.mock("../services/whatsappCloud.service.js", () => ({ sendTemplateMessage: H.sendTemplate, sendTextMessageResult: H.sendText, sendButtonMessage: H.sendButtons }));
+vi.mock("../models/ArrivalSession.js", () => ({ default: { find: H.arrFind, findOne: H.arrFindOne, create: vi.fn(), findOneAndUpdate: vi.fn() } }));
 vi.mock("../utils/mailer.js", () => ({ sendMail: H.sendMail }));
 vi.mock("../services/weatherService.js", () => ({ getDestinationWeather: H.getWeather }));
 vi.mock("../utils/plutoMetricsSink.js", () => ({ emitMetric: H.emitMetric }));
@@ -50,6 +52,7 @@ beforeEach(() => {
   H.aCreate.mockImplementation(async (doc: any) => ({ _id: "al1", attempts: 0, ...doc }));
   H.getWeather.mockResolvedValue(null);
   H.bFindById.mockReturnValue(leanSel(null));
+  H.arrFind.mockReturnValue({ limit: () => Promise.resolve([]) }); // no arrival sessions to expire
   process.env.WA_DISRUPTION_TEMPLATE = "flight_disruption";
 });
 

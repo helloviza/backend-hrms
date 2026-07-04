@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const H = vi.hoisted(() => ({
   asFindOne: vi.fn(),
   asCreate: vi.fn(),
+  asFind: vi.fn(),
   reqFindById: vi.fn(),
   hbFindOne: vi.fn(),
   userFindById: vi.fn(),
@@ -13,7 +14,7 @@ const H = vi.hoisted(() => ({
   emitMetric: vi.fn(),
 }));
 
-vi.mock("../models/ArrivalSession.js", () => ({ default: { findOne: H.asFindOne, create: H.asCreate } }));
+vi.mock("../models/ArrivalSession.js", () => ({ default: { findOne: H.asFindOne, create: H.asCreate, find: H.asFind } }));
 vi.mock("../models/SBTRequest.js", () => ({ default: { findById: H.reqFindById } }));
 vi.mock("../models/SBTHotelBooking.js", () => ({ default: { findOne: H.hbFindOne } }));
 vi.mock("../models/User.js", () => ({ default: { findById: H.userFindById } }));
@@ -24,7 +25,7 @@ vi.mock("./whatsappCloud.service.js", () => ({
 }));
 vi.mock("../utils/plutoMetricsSink.js", () => ({ emitMetric: H.emitMetric }));
 
-import { openArrivalSession, computeExpiry, resolveArrivalContext } from "./arrivalSession.js";
+import { openArrivalSession, computeExpiry, resolveArrivalContext, expireArrivalSessions } from "./arrivalSession.js";
 
 const leanSel = (v: any) => ({ select: () => ({ lean: () => Promise.resolve(v) }) });
 
@@ -134,6 +135,34 @@ describe("openArrivalSession", () => {
     H.asCreate.mockRejectedValue({ code: 11000 });
     await expect(openArrivalSession(watch(), info())).resolves.toBeUndefined();
     expect(H.sendText).not.toHaveBeenCalled();
+  });
+});
+
+describe("expireArrivalSessions (Step 5 lifecycle)", () => {
+  it("expires due sessions; goodbye ONLY if the traveler engaged; emits .expired each", async () => {
+    const engaged = makeDoc({ _id: "e1", workspaceId: "507f1f77bcf86cd799439011", phone: "+919111111111", status: "ACTIVE", lastInboundAt: new Date() });
+    const silent = makeDoc({ _id: "s2", workspaceId: "507f1f77bcf86cd799439011", phone: "+919222222222", status: "ACTIVE", lastInboundAt: null });
+    H.asFind.mockReturnValue({ limit: () => Promise.resolve([engaged, silent]) });
+    H.sendText.mockResolvedValue(true);
+
+    await expireArrivalSessions(new Date());
+
+    expect(engaged.status).toBe("EXPIRED");
+    expect(silent.status).toBe("EXPIRED");
+    expect(engaged.save).toHaveBeenCalled();
+    expect(silent.save).toHaveBeenCalled();
+    // Goodbye only to the engaged traveler.
+    expect(H.sendText).toHaveBeenCalledTimes(1);
+    expect(H.sendText).toHaveBeenCalledWith("919111111111", expect.stringContaining("closing"));
+    const expired = H.emitMetric.mock.calls.filter((c: any) => c[0].type === "pluto.arrive.expired");
+    expect(expired.length).toBe(2);
+  });
+
+  it("no due sessions → no sends, no metrics", async () => {
+    H.asFind.mockReturnValue({ limit: () => Promise.resolve([]) });
+    await expireArrivalSessions(new Date());
+    expect(H.sendText).not.toHaveBeenCalled();
+    expect(H.emitMetric).not.toHaveBeenCalled();
   });
 });
 
