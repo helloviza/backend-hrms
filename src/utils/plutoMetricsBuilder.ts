@@ -105,6 +105,22 @@ export function policyEvaluated(args: {
   };
 }
 
+export function routeInsightsServed(args: {
+  workspaceId?: string;
+  requestId?: string;
+  observationCount: number;
+  sufficient: boolean;
+}): PlutoMetricEvent {
+  return {
+    type: "pluto.routeinsights.served",
+    severity: "info",
+    timestamp: new Date().toISOString(),
+    workspaceId: args.workspaceId,
+    requestId: args.requestId,
+    metadata: { observationCount: args.observationCount, sufficient: args.sufficient },
+  };
+}
+
 export function conversationStarted(
   conversationId: string
 ): PlutoMetricEvent {

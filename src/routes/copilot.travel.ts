@@ -54,6 +54,7 @@ import { resolveIATA } from "../utils/plutoIata.js";
 import { loadWorkspacePolicyRules } from "../services/policyService.js";
 import { renderTripSummaryHtml } from "../services/conciergeHandoff.js";
 import { recordFareObservations } from "../services/fareObservations.js";
+import { getRouteIntelProvider } from "../services/routeIntel.provider.js";
 import {
   evaluateFlightPolicy,
   evaluateHotelPolicy,
@@ -104,6 +105,7 @@ import {
   aiError,
   aiFallbackInvalid,
   policyEvaluated,
+  routeInsightsServed,
   handoffDelivered,
   handoffFailed,
 } from "../utils/plutoMetricsBuilder.js";
@@ -866,6 +868,30 @@ router.post("/", async (req, res) => {
         ? ` Return-leg options for ${destIATA} → ${originIATA} are included below.`
         : "";
 
+      // Route insights (Know) — tenant-scoped FareObservation history. Grounded:
+      // one sentence only when we have enough data; never invents fares.
+      let routeInsights: any = null;
+      let routeInsightsNote = "";
+      if (hasLiveFlights) {
+        routeInsights = await getRouteIntelProvider().getRouteInsights({
+          origin: originIATA,
+          destination: destIATA,
+          departDate: isoDate,
+          workspaceObjectId: (req as any).workspaceObjectId,
+        });
+        await emitMetric(
+          routeInsightsServed({
+            workspaceId,
+            requestId,
+            observationCount: routeInsights.observationCount,
+            sufficient: routeInsights.sufficient,
+          })
+        );
+        if (routeInsights.sufficient && routeInsights.typicalFareRange) {
+          routeInsightsNote = ` Fares on this route have typically been ₹${routeInsights.typicalFareRange.p25.toLocaleString("en-IN")}–₹${routeInsights.typicalFareRange.p75.toLocaleString("en-IN")} recently.`;
+        }
+      }
+
       const nextSteps = searchUnavailable ? [
         "Retry the search in a few minutes",
         "Or use the flight search panel above for full results",
@@ -884,7 +910,7 @@ router.post("/", async (req, res) => {
           context: searchUnavailable
             ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
             : hasLiveFlights
-              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + roundTripNote
+              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + roundTripNote + routeInsightsNote
               : !isoDate
                 ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
                 : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`,
@@ -902,6 +928,8 @@ router.post("/", async (req, res) => {
             source:      searchUnavailable ? "unavailable" : hasLiveFlights ? "tbo" : "none",
             tipLines:    buildFlightTipLines(originIATA, destIATA, travelDate),
           },
+          // Additive: tenant-scoped route history (null when thin data).
+          routeInsights,
           nextSteps,
           handoff: false,
         },
