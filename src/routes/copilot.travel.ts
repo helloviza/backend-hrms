@@ -1462,6 +1462,11 @@ ${prompt}
       // Idempotency: deliver AT MOST ONCE per conversation. The guard flag lives
       // on the conversation context (round-tripped to the client), NOT in
       // plutoMemory.ts. Repeated handoff-ready turns do not create duplicates.
+      // KNOWN GAP: this flag is client-trusted — if the client drops
+      // handoffDelivered from the returned context, a duplicate CONCIERGE_AI
+      // request is created. Server-side dedup (a unique index / lookup on the
+      // Mongo conversation store) moves here once the plutoMemory → Mongo
+      // migration lands; until then the context flag is the specified guard.
       if (!conversationContext.handoffDelivered) {
         const payload = buildHandoffPayload(
           fullReply,
