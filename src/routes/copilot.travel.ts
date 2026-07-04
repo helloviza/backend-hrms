@@ -710,15 +710,19 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
       );
       const extractedAdults = paxMatch ? Math.min(parseInt(paxMatch[1]), 9) : 1;
 
-      // Extract cabin class
-      const cabinMatch = prompt.match(
-        /\b(business|first\s*class|premium\s*economy|economy)\b/i
-      );
-      const extractedCabin = cabinMatch
-        ? cabinMatch[1].toLowerCase().includes("business") ? "Business"
-        : cabinMatch[1].toLowerCase().includes("first") ? "First"
-        : cabinMatch[1].toLowerCase().includes("premium") ? "Premium Economy"
-        : "Economy"
+      // Extract cabin class — FLIGHT-ADJACENT ONLY. A bare "business" must never
+      // upgrade the search: "business hotel and cheapest flight" used to match
+      // "business" and silently search Business class (₹1.7L+ fares for a
+      // "cheapest" ask). Require "<cabin> class" or a flight verb before the
+      // word, and never treat a cabin word glued to a lodging noun as a cabin.
+      const extractedCabin: "Economy" | "Premium Economy" | "Business" | "First" =
+        /\bpremium\s+economy\b/i.test(prompt) ? "Premium Economy"
+        : /\bfirst\s+class\b/i.test(prompt) ? "First"
+        : (
+            (/\bbusiness\s+class\b/i.test(prompt) ||
+             /\b(?:in|fly|flying|book|travel|travell?ing)\s+business\b/i.test(prompt)) &&
+            !/\bbusiness\s+(?:hotel|stay|accommodation|accomodation|property|resort)\b/i.test(prompt)
+          ) ? "Business"
         : "Economy";
 
       const cabinClassMap_chat: Record<string, number> = {
@@ -892,6 +896,14 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
         ? ` Return-leg options for ${destIATA} → ${originIATA} are included below.`
         : "";
 
+      // State the cabin searched (Amendment S) and, when the user asked for the
+      // cheapest, name the lowest fare found (Step 3 qualifier passthrough).
+      const wantsCheapest = /\bcheapest\b|\blowest\s+fare\b|\bbudget\b/i.test(prompt);
+      const cabinNote = extractedCabin !== "Economy" ? ` Cabin searched: ${extractedCabin}.` : " Cabin: Economy.";
+      const cheapestNote = wantsCheapest && chatCheapest
+        ? ` Cheapest fare found: ₹${(chatCheapest.fare?.offered ?? chatCheapest.fare?.published ?? 0).toLocaleString("en-IN")}.`
+        : "";
+
       // Route insights (Know) — tenant-scoped FareObservation history. Grounded:
       // one sentence only when we have enough data; never invents fares.
       // Route insights (Know) + weather awareness. These two post-search reads
@@ -949,7 +961,7 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
           context: searchUnavailable
             ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
             : hasLiveFlights
-              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + roundTripNote + routeInsightsNote + weatherNote
+              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + cabinNote + cheapestNote + roundTripNote + routeInsightsNote + weatherNote
               : !isoDate
                 ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
                 : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`,
