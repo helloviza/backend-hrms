@@ -22,5 +22,13 @@ export async function sendHandoffPayload(payload: PlutoHandoffPayload) {
   // For your development, we'll keep the full JSON log below it
   // console.log(JSON.stringify(payload, null, 2));
 
-  return true;
+  // STUB: this sink does NOT deliver the handoff anywhere yet (no email, Slack,
+  // or DB row). Warn loudly so a "handoff ready" turn is never silently dropped.
+  // Real delivery lands with the richer handoff in Phase 2.
+  console.warn(
+    "[PLUTO HANDOFF][STUB] handoff was NOT delivered — sink is a no-op",
+    { destination: payload.destination, priority: payload.priority, state: payload.state }
+  );
+
+  return false;
 }

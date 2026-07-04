@@ -65,6 +65,9 @@ import {
   stateTransition,
   handoffTriggered,
   multicityDowngraded,
+  searchError,
+  aiFallback,
+  aiError,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 
@@ -540,6 +543,10 @@ router.post("/hotels/search", requireAuth, async (req, res) => {
  * Public / semi-auth AI concierge
  */
 router.post("/", requireAuth, async (req, res) => {
+  // Per-request correlation id + tenant, threaded into every log line, metric
+  // event and error response for this concierge turn.
+  const requestId = crypto.randomUUID();
+  const workspaceId = String((req as any).workspaceObjectId || "");
   try {
     const { prompt, context, lastReply, videoAnalysisId } = req.body;
 
@@ -669,12 +676,6 @@ router.post("/", requireAuth, async (req, res) => {
       // nearest future occurrence (see utils/plutoDate.ts) — no hardcoded year.
       const isoDate = parseDateToISO(travelDate);
 
-      // Correlation id for this chat flight-search (threaded into structured
-      // logs; Step 4 hoists a per-request id to the top of the main handler).
-      const requestId = crypto.randomUUID();
-
-      const workspaceId = String((req as any).workspaceObjectId || "");
-
       // ── Multi-city: NOT supported in chat yet → loud downgrade to first leg ──
       // The single-leg extraction above already yields the first leg (first
       // "from"/"to"), so we search that and tell the user plainly, rather than
@@ -737,6 +738,9 @@ router.post("/", requireAuth, async (req, res) => {
           chatTraceId = chatResult.traceId;
         } else {
           searchUnavailable = true;
+          await emitMetric(
+            searchError({ workspaceId, requestId, reason: chatResult.reason || "unknown" })
+          );
           console.error("[FlightSearch] chat search unavailable", {
             requestId,
             reason: chatResult.reason,
@@ -1318,9 +1322,29 @@ ${prompt}
 
     try {
       deltaReply = await invokePluto(effectivePrompt);
-    } catch {
-      console.warn("OpenAI failed, switching to Gemini backup...");
-      deltaReply = await invokePlutoGemini(effectivePrompt);
+    } catch (openaiErr: any) {
+      await emitMetric(
+        aiFallback({
+          workspaceId,
+          requestId,
+          conversationId: conversationContext.id,
+          reason: openaiErr?.message || "openai_error",
+        })
+      );
+      console.warn("[Pluto] OpenAI failed, switching to Gemini backup", { requestId });
+      try {
+        deltaReply = await invokePlutoGemini(effectivePrompt);
+      } catch (geminiErr: any) {
+        await emitMetric(
+          aiError({
+            workspaceId,
+            requestId,
+            conversationId: conversationContext.id,
+            reason: geminiErr?.message || "both_engines_failed",
+          })
+        );
+        throw geminiErr; // outer catch → loud 500
+      }
     }
 
     /* 🔒 Promote ONCE to full reply */
@@ -1390,10 +1414,11 @@ ${prompt}
       context: conversationContext,
     });
   } catch (err: any) {
-    console.error("Pluto travel error:", err);
+    console.error("Pluto travel error:", { requestId, message: err?.message, stack: err?.stack });
     return res.status(500).json({
       ok: false,
       message: err?.message || "Failed to generate travel response",
+      requestId,
     });
   }
 });
