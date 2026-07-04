@@ -57,6 +57,8 @@ import employeesRouter from "./routes/employees.js";
 import assistantRouter from "./routes/assistant.js";
 import assistantHrRouter from "./routes/assistantHr.js";
 import travelCopilotRoutes from "./routes/copilot.travel.js";
+import { runPlutoBootCheck } from "./services/plutoBootCheck.js";
+import { invokePlutoGemini } from "./utils/plutoGeminiInvoke.js";
 import plutoVideoRouter from "./routes/pluto.video.js";
 import copilotVideoConsent from "./routes/copilot.videoConsent.js";
 import adminVideoRouter from "./routes/admin.video.js";
@@ -470,6 +472,13 @@ app.use("/api/superadmin", requireAuth, requireSuperAdmin, superadminWorkspacesR
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Travel copilot (Plumtrips Travel ops)
   app.use("/api/v1/copilot/travel", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), travelCopilotRoutes);
+
+  // Pluto AI provider boot check (loud warning if a tier's key is missing;
+  // optional Gemini ping behind PLUTO_BOOT_PING). Fire-and-forget — never
+  // crashes boot for a missing fallback.
+  void runPlutoBootCheck({
+    pingGemini: (p) => invokePlutoGemini(p),
+  });
 }
 app.use("/api/v1/pluto/video", plutoVideoRouter);
 app.use("/api/copilot", copilotRouter);
@@ -590,6 +599,8 @@ import reportsRouter from "./routes/reports.js";
 import companySettingsRouter from "./routes/companySettings.js";
 // Billing Permissions (Super Admin grant/revoke + my-access for all users)
 import billingPermissionsRouter from "./routes/billingPermissions.js";
+// Per-client auto-invoice billing profiles (Client Scheduler admin page)
+import billingProfilesRouter from "./routes/billingProfiles.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Travel-specific admin features:
@@ -606,6 +617,8 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/admin/reports", reportsRouter);
   app.use("/api/admin/company-settings", companySettingsRouter);
   app.use("/api/billing-permissions", billingPermissionsRouter);
+  // Staff-only (requireAuth + isStaffPrivileged applied inside the router).
+  app.use("/api/admin/billing-profiles", billingProfilesRouter);
 }
 
 // Unified Permissions (UserPermission model — replaces BillingPermission long-term)
