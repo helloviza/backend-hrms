@@ -55,6 +55,7 @@ import { loadWorkspacePolicyRules } from "../services/policyService.js";
 import { renderTripSummaryHtml } from "../services/conciergeHandoff.js";
 import { recordFareObservations } from "../services/fareObservations.js";
 import { getRouteIntelProvider } from "../services/routeIntel.provider.js";
+import { isValidWhatsAppNumber } from "../utils/waNumber.js";
 import {
   evaluateFlightPolicy,
   evaluateHotelPolicy,
@@ -1591,13 +1592,26 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
     const user = req.user;
     if (!user?._id) return res.status(401).json({ error: "Unauthorized" });
 
-    const { flightData, passengers, notes, tripBundle, conversationId } = req.body;
+    const { flightData, passengers, notes, tripBundle, conversationId, watchOptIn, whatsappNumber } = req.body;
 
     if (!flightData || !flightData.ResultIndex || !flightData.TraceId) {
       return res.status(400).json({
         error: "flightData with ResultIndex and TraceId is required",
       });
     }
+
+    // Disruption-watch opt-in (Phase 3). A WhatsApp number, if given, MUST be
+    // E.164-ish — reject a malformed number with a clear field error rather than
+    // silently dropping the opt-in.
+    if (watchOptIn && whatsappNumber && !isValidWhatsAppNumber(whatsappNumber)) {
+      return res.status(400).json({
+        error: "whatsappNumber must be in international format, e.g. +919876543210",
+        field: "whatsappNumber",
+      });
+    }
+    const watchConsent = watchOptIn
+      ? { watchOptIn: true, whatsappNumber: whatsappNumber || null }
+      : undefined;
 
     // Resolve workspace
     const workspace = user.customerId
@@ -1658,8 +1672,11 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
       requesterNotes: notes || null,
       passengerDetails: passengers || [],
       contactDetails: { email: user.email },
-      // Additive: optional richer bundle. Omitted by existing single-flight calls.
-      tripBundle: tripBundle || undefined,
+      // Additive: optional richer bundle + watch consent. Omitted by existing
+      // single-flight calls; consent read at the BOOKED transition.
+      tripBundle: (tripBundle || watchConsent)
+        ? { ...(tripBundle || {}), ...(watchConsent ? { consent: watchConsent } : {}) }
+        : undefined,
       status: "PENDING",
     });
 

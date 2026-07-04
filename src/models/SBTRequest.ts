@@ -43,6 +43,7 @@ export interface ISBTRequest extends Document {
     policyStatus?: string;
     conversationSummary?: string;
     lockedDecisions?: Record<string, any>;
+    consent?: { watchOptIn?: boolean; whatsappNumber?: string | null };
   };
   requestedAt: Date;
   actedAt?: Date;
@@ -101,6 +102,11 @@ const SBTRequestSchema = new Schema({
     policyStatus: { type: String, default: null },
     conversationSummary: { type: String, default: null },
     lockedDecisions: { type: Object, default: null },
+    // Disruption-watch opt-in captured at raise-request time (Phase 3).
+    consent: {
+      watchOptIn: { type: Boolean, default: false },
+      whatsappNumber: { type: String, default: null },
+    },
   },
 
   requestedAt: { type: Date, default: Date.now },
