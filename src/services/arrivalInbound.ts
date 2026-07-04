@@ -14,6 +14,7 @@ import { toWaRecipient } from "../utils/waNumber.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { arriveMetric } from "../utils/plutoMetricsBuilder.js";
 import { ARRIVAL_BUTTONS } from "./arrivalSession.js";
+import { resolveCommand } from "./arrivalConcierge.js";
 
 const RATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 const RATE_MAX = 20; // max processed inbound / session / hour
@@ -109,11 +110,47 @@ export async function dispatchArrivalInbound(input: ArrivalInboundInput): Promis
   }
 }
 
+const MENU_WINDOW_MS = 24 * 60 * 60 * 1000; // 1 day
+const MENU_MAX = 3; // max unknown-command menus / session / day
+
 /**
- * Command execution seam. Step 2 ships the routed skeleton (re-send the menu);
- * Step 3 replaces this with the constrained command set (hotel / booker /
- * emergency / help / stop) and Step 4 wires HELP escalation.
+ * Execute the constrained command set (Step 3). resolveCommand is a pure
+ * directive; here we apply the stateful bits: the daily menu cap, the opt-out
+ * status change, and HELP escalation (Step 4 wires the real escalation).
  */
-async function executeArrivalCommand(session: any, _input: ArrivalInboundInput): Promise<void> {
-  await sendButtonMessage(toWaRecipient(session.phone), "How can I help?", ARRIVAL_BUTTONS);
+async function executeArrivalCommand(session: any, input: ArrivalInboundInput): Promise<void> {
+  const to = toWaRecipient(session.phone);
+  const result = resolveCommand(session, input.buttonId, input.text);
+
+  if (result.action === "OPT_OUT") {
+    session.status = "OPTED_OUT";
+    if (result.text) await sendTextMessageResult(to, result.text);
+    return;
+  }
+
+  if (result.action === "ESCALATE") {
+    // Step 4 replaces this with real booker escalation (SBTRequest + email).
+    await sendTextMessageResult(to, "Your booker has been alerted and will call you within 15 minutes.");
+    return;
+  }
+
+  if (result.action === "MENU") {
+    // Cap the unknown-command menu so we never loop endlessly.
+    const now = new Date();
+    const winStart = session.menuWindowStart ? new Date(session.menuWindowStart) : null;
+    if (!winStart || now.getTime() - winStart.getTime() > MENU_WINDOW_MS) {
+      session.menuWindowStart = now;
+      session.menuCount = 0;
+    }
+    if ((session.menuCount || 0) >= MENU_MAX) {
+      await sendTextMessageResult(to, "Reply HELP to reach a person.");
+      return;
+    }
+    session.menuCount = (session.menuCount || 0) + 1;
+    await sendButtonMessage(to, result.text || "How can I help?", result.buttons || ARRIVAL_BUTTONS);
+    return;
+  }
+
+  // REPLY
+  await sendTextMessageResult(to, result.text || "");
 }
