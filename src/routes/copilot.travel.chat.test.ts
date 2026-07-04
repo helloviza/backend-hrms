@@ -26,6 +26,8 @@ vi.mock("../services/routeIntel.provider.js", () => ({
 }));
 // Fare logging is fire-and-forget; stub to a no-op so no Mongo buffering occurs.
 vi.mock("../services/fareObservations.js", () => ({ recordFareObservations: () => {} }));
+// Weather is awaited in the reply; stub to null (no network).
+vi.mock("../services/weatherService.js", () => ({ getDestinationWeather: () => Promise.resolve(null) }));
 
 import express from "express";
 import request from "supertest";

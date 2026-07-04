@@ -20,6 +20,7 @@ import {
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { watchMetric } from "../utils/plutoMetricsBuilder.js";
 import { deliverTripAlert, MAX_ATTEMPTS } from "../services/tripNotifier.js";
+import { getDestinationWeather } from "../services/weatherService.js";
 
 const POLL_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const MIN_RECHECK_MS = 15 * 60 * 1000; // don't re-check a watch within 15 min
@@ -203,6 +204,46 @@ async function retryPendingAlerts(): Promise<void> {
   }
 }
 
+// Severe-weather pass: for ACTIVE watches within 24h of departure, raise a
+// one-off WEATHER alert (deduped per watch) through the same notifier path.
+async function checkWeatherForDueWatches(now: Date): Promise<void> {
+  const soon = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  const due = (await TripWatch.find({ status: "ACTIVE", departDate: { $gte: now, $lte: soon } })
+    .limit(100)
+    .lean()) as any[];
+
+  for (const watch of due) {
+    try {
+      const dateISO = new Date(watch.departDate).toISOString().slice(0, 10);
+      const w = await getDestinationWeather(watch.destination, dateISO);
+      if (!w || !w.severe) continue;
+      const existing = await TripAlert.findOne({ tripWatchId: watch._id, kind: "WEATHER" }).lean();
+      if (existing) continue; // one weather alert per watch
+      const alert = (await TripAlert.create({
+        workspaceId: watch.workspaceId,
+        tripWatchId: watch._id,
+        kind: "WEATHER",
+        detail: `Severe weather (${w.summary}) expected in ${w.city}`,
+        deliveryStatus: "PENDING",
+      })) as any;
+      const outcome = await deliverTripAlert(alert, watch);
+      await TripAlert.updateOne(
+        { _id: alert._id },
+        {
+          $set: {
+            deliveryStatus: outcome.deliveryStatus,
+            channelUsed: outcome.channelUsed,
+            attempts: outcome.attempts,
+            deliveredAt: outcome.delivered ? new Date() : null,
+          },
+        },
+      );
+    } catch (e: any) {
+      console.error("[tripWatchWorker] weather pass failed", { watchId: String(watch?._id), message: e?.message });
+    }
+  }
+}
+
 let isRunning = false;
 
 export function startTripWatchWorker(): void {
@@ -214,6 +255,7 @@ export function startTripWatchWorker(): void {
     const now = new Date();
     try {
       await runWatchCycle(buildRealDeps(now));
+      await checkWeatherForDueWatches(now);
       await retryPendingAlerts();
       // Terminal cleanup in the same cycle (Amendment I): COMPLETE watches whose
       // departure was > 24h ago.

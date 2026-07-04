@@ -56,6 +56,7 @@ import { renderTripSummaryHtml } from "../services/conciergeHandoff.js";
 import { recordFareObservations } from "../services/fareObservations.js";
 import { getRouteIntelProvider } from "../services/routeIntel.provider.js";
 import { isValidWhatsAppNumber } from "../utils/waNumber.js";
+import { getDestinationWeather } from "../services/weatherService.js";
 import {
   evaluateFlightPolicy,
   evaluateHotelPolicy,
@@ -893,6 +894,15 @@ router.post("/", async (req, res) => {
         }
       }
 
+      // Weather awareness (additive, silent-skip on failure — never blocks).
+      let weatherNote = "";
+      if (hasLiveFlights && isoDate) {
+        const w = await getDestinationWeather(destIATA, isoDate);
+        if (w) {
+          weatherNote = ` Weather in ${w.city} around then: ~${Math.round(w.tempMaxC)}°C, ${w.summary}.`;
+        }
+      }
+
       const nextSteps = searchUnavailable ? [
         "Retry the search in a few minutes",
         "Or use the flight search panel above for full results",
@@ -911,7 +921,7 @@ router.post("/", async (req, res) => {
           context: searchUnavailable
             ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
             : hasLiveFlights
-              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + roundTripNote + routeInsightsNote
+              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + roundTripNote + routeInsightsNote + weatherNote
               : !isoDate
                 ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
                 : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`,
