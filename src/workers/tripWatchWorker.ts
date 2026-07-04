@@ -18,7 +18,7 @@ import {
   type MaterialChange,
   type WatchFlightState,
 } from "../services/tripWatchDiff.js";
-import { openArrivalSession } from "../services/arrivalSession.js";
+import { openArrivalSession, expireArrivalSessions } from "../services/arrivalSession.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { watchMetric } from "../utils/plutoMetricsBuilder.js";
 import { deliverTripAlert, MAX_ATTEMPTS } from "../services/tripNotifier.js";
@@ -262,6 +262,8 @@ export async function runRealCycle(now: Date = new Date()): Promise<void> {
   await runWatchCycle(buildRealDeps(now));
   await checkWeatherForDueWatches(now);
   await retryPendingAlerts();
+  // Phase 4 (Arrive): expire arrival concierge sessions past their window.
+  await expireArrivalSessions(now);
   // Terminal cleanup in the same cycle (Amendment I): COMPLETE watches whose
   // departure was > 24h ago.
   await TripWatch.updateMany(

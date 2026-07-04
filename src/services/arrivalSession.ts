@@ -212,3 +212,33 @@ export async function openArrivalSession(watch: any, info: any, now: Date = new 
     );
   }
 }
+
+/**
+ * Lifecycle sweep (Step 5) — run inside the existing tripWatchWorker cycle (no
+ * new worker). EXPIRE PENDING/ACTIVE sessions past their expiresAt. A polite
+ * goodbye is sent ONLY when the traveler actually engaged (lastInboundAt set);
+ * otherwise we expire silently. One bad session never breaks the sweep.
+ */
+export async function expireArrivalSessions(now: Date = new Date()): Promise<void> {
+  const due: any[] = await ArrivalSession.find({
+    status: { $in: ["PENDING", "ACTIVE"] },
+    expiresAt: { $lt: now },
+  }).limit(200);
+
+  for (const session of due) {
+    try {
+      session.status = "EXPIRED";
+      await session.save();
+      if (session.lastInboundAt) {
+        await sendTextMessageResult(
+          toWaRecipient(session.phone),
+          "Your Plumtrips arrival concierge is now closing. Safe travels — your travel desk is always here if you need anything.",
+        );
+      }
+      void emitMetric(arriveMetric("pluto.arrive.expired", { workspaceId: String(session.workspaceId) }));
+    } catch (e: any) {
+      // swallow — one session must not stop the sweep
+      console.error("[arrivalSession] expire failed", { id: String(session?._id), message: e?.message });
+    }
+  }
+}
