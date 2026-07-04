@@ -17,7 +17,17 @@ export type PlutoMetricEventType =
   | "pluto.policy.evaluated"
   // Richer handoff delivery (Phase 2)
   | "pluto.handoff.delivered"
-  | "pluto.handoff.failed";
+  | "pluto.handoff.failed"
+  // Route intelligence + watchers (Phase 3)
+  | "pluto.fareobs.write_failed"
+  | "pluto.routeinsights.served"
+  | "pluto.watch.checked"
+  | "pluto.watch.alerted"
+  | "pluto.watch.check_failed"
+  | "pluto.watch.create_failed"
+  | "pluto.notify.sent"
+  | "pluto.notify.failed"
+  | "pluto.weather.failed";
 
 // Severity drives sink routing: "error"/"warn" events always surface (console
 // error/warn) regardless of the PLUTO_METRICS analytics flag; "info" events

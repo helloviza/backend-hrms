@@ -15,6 +15,7 @@ import {
   flightForPolicyFromTBO,
   type PolicyRules,
 } from "../services/policyEvaluator.js";
+import { recordFareObservations } from "../services/fareObservations.js";
 
 // In-policy first, then needs-approval, then out-of-policy. Stable, so the
 // within-rank fare ordering from dedupeRawTBOFlights is preserved.
@@ -198,6 +199,7 @@ export async function searchFlightsForChat(params: {
   cabinLabel?: string;
   requestId?: string;
   policyRules?: PolicyRules | null;
+  workspaceObjectId?: any;
 }): Promise<ChatFlightSearchResult> {
   const {
     origin, destination, departDate, returnDate,
@@ -207,6 +209,7 @@ export async function searchFlightsForChat(params: {
     cabinLabel = CABIN_LABELS[cabinClass] || "Economy",
     requestId = "",
     policyRules = null,
+    workspaceObjectId = null,
   } = params;
 
   try {
@@ -262,9 +265,18 @@ export async function searchFlightsForChat(params: {
         })
         .filter(Boolean);
 
-    const flights = sortInPolicyFirst(
-      mapAnnotate(dedupeRawTBOFlights(outboundRaw).slice(0, 30)),
-    );
+    const outboundTop = dedupeRawTBOFlights(outboundRaw).slice(0, 30);
+    const flights = sortInPolicyFirst(mapAnnotate(outboundTop));
+
+    // Passive fare logging (fire-and-forget; never affects this search).
+    recordFareObservations({
+      workspaceObjectId,
+      origin,
+      destination,
+      departDate,
+      requestId,
+      rawRows: outboundTop,
+    });
     const inbound = journeyType === 2
       ? sortInPolicyFirst(mapAnnotate(dedupeRawTBOFlights(inboundRaw).slice(0, 30)))
       : [];

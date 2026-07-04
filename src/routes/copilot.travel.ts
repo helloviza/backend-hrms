@@ -53,6 +53,7 @@ import { isMultiCityIntent, resolveRoundTripIntent } from "../utils/plutoTripInt
 import { resolveIATA } from "../utils/plutoIata.js";
 import { loadWorkspacePolicyRules } from "../services/policyService.js";
 import { renderTripSummaryHtml } from "../services/conciergeHandoff.js";
+import { recordFareObservations } from "../services/fareObservations.js";
 import {
   evaluateFlightPolicy,
   evaluateHotelPolicy,
@@ -492,8 +493,19 @@ router.post("/flights/search", async (req, res) => {
     // Dedupe + cap mirrors searchFlightsForChat; both endpoints must produce
     // the same set so the FlightSearchPanel renders identically regardless of
     // trigger (chat NLP vs explicit Search button).
-    const results = annotate(dedupeRawTBOFlights(outboundRaw).slice(0, 30));
+    const outboundTop = dedupeRawTBOFlights(outboundRaw).slice(0, 30);
+    const results = annotate(outboundTop);
     const inbound = annotate(dedupeRawTBOFlights(inboundRaw).slice(0, 30));
+
+    // Passive fare logging (fire-and-forget; never affects the response).
+    recordFareObservations({
+      workspaceObjectId: (req as any).workspaceObjectId,
+      origin: originIATA,
+      destination: destIATA,
+      departDate: date,
+      requestId,
+      rawRows: outboundTop,
+    });
 
     const inPolicyCount = results.filter((f: any) => f?.policy?.status === "IN_POLICY").length;
     await emitMetric(
@@ -801,6 +813,7 @@ router.post("/", async (req, res) => {
           cabinLabel: extractedCabin,
           requestId,
           policyRules: chatPolicyRules,
+          workspaceObjectId: (req as any).workspaceObjectId,
         });
         if (chatResult.ok) {
           chatFlights = chatResult.flights;

@@ -62,6 +62,15 @@ export function multicityDowngraded(args: FailureArgs): PlutoMetricEvent {
   };
 }
 
+export function fareObsWriteFailed(args: FailureArgs): PlutoMetricEvent {
+  return {
+    type: "pluto.fareobs.write_failed",
+    severity: "error",
+    timestamp: new Date().toISOString(),
+    ...args,
+  };
+}
+
 export function handoffDelivered(args: FailureArgs): PlutoMetricEvent {
   return {
     type: "pluto.handoff.delivered",
