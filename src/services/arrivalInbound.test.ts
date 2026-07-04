@@ -39,15 +39,33 @@ describe("dispatchArrivalInbound", () => {
     expect(metricTypes()).toContain("pluto.arrive.unknown_sender");
   });
 
-  it("known sender, fresh messageId → handled (menu sent) + message_handled", async () => {
+  it("known sender, arr_hotel with no hotel on file → text reply + message_handled", async () => {
     const found = { _id: "s1" };
     H.findOne.mockReturnValue(sortResolves(found));
     H.findOneAndUpdate.mockResolvedValue(makeDoc({ _id: "s1", workspaceId: "ws", phone: "+919876543210", rateWindowCount: 0, messageCount: 0 }));
 
     await dispatchArrivalInbound({ waId: "919876543210", messageId: "m2", buttonId: "arr_hotel" });
 
-    expect(H.sendButtons).toHaveBeenCalledTimes(1);
+    expect(H.sendText).toHaveBeenCalledWith("919876543210", expect.stringContaining("hotel on file"));
     expect(metricTypes()).toContain("pluto.arrive.message_handled");
+  });
+
+  it("STOP → session OPTED_OUT + one confirmation", async () => {
+    H.findOne.mockReturnValue(sortResolves({ _id: "s1" }));
+    const doc = makeDoc({ _id: "s1", workspaceId: "ws", phone: "+919876543210", rateWindowCount: 0, status: "ACTIVE" });
+    H.findOneAndUpdate.mockResolvedValue(doc);
+    await dispatchArrivalInbound({ waId: "919876543210", messageId: "s", text: "STOP" });
+    expect(doc.status).toBe("OPTED_OUT");
+    expect(H.sendText).toHaveBeenCalledWith("919876543210", expect.stringContaining("unsubscribed"));
+  });
+
+  it("unknown command caps the menu after 3/day, then points to HELP", async () => {
+    const doc = makeDoc({ _id: "s1", workspaceId: "ws", phone: "+919876543210", rateWindowCount: 0, menuCount: 3, menuWindowStart: new Date() });
+    H.findOne.mockReturnValue(sortResolves({ _id: "s1" }));
+    H.findOneAndUpdate.mockResolvedValue(doc);
+    await dispatchArrivalInbound({ waId: "919876543210", messageId: "u", text: "blah blah" });
+    expect(H.sendButtons).not.toHaveBeenCalled();
+    expect(H.sendText).toHaveBeenCalledWith("919876543210", expect.stringContaining("HELP"));
   });
 
   it("duplicate messageId (claim returns null) → no-op, no reply", async () => {
