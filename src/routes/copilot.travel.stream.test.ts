@@ -80,12 +80,22 @@ describe("POST /stream", () => {
     expect(final.data.reply.flightSearch.flights).toHaveLength(1);
   });
 
-  it("final payload deep-equals the POST / reply for identical mocked inputs", async () => {
+  it("final payload deep-equals the POST / reply for identical mocked inputs (modulo the per-request conversation id)", async () => {
     searchFlightsMock.mockResolvedValue(flightsResponse);
     const plain = await request(app).post("/").send({ prompt: PROMPT });
     const streamRes = await request(app).post("/stream").send({ prompt: PROMPT });
     const final = parseSSE(streamRes.text).find((f) => f.event === "final")!;
-    expect(final.data).toEqual(plain.body);
+    // The computed reply + ok flag are byte-identical between the two paths.
+    expect(final.data.ok).toEqual(plain.body.ok);
+    expect(final.data.reply).toEqual(plain.body.reply);
+    // Both now carry a conversation id so no reply is ever id-less; it is a
+    // per-request nonce (crypto.randomUUID) so the two ids legitimately differ.
+    // Everything ELSE in the context must still match exactly.
+    expect(typeof final.data.context.id).toBe("string");
+    expect(typeof plain.body.context.id).toBe("string");
+    const { id: _s, ...ctxStream } = final.data.context;
+    const { id: _p, ...ctxPlain } = plain.body.context;
+    expect(ctxStream).toEqual(ctxPlain);
   });
 
   it("turn failure → error event with message + requestId (never a silent drop)", async () => {
