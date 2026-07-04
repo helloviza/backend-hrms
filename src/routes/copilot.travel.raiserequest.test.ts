@@ -89,4 +89,23 @@ describe("/raise-request tripBundle", () => {
     expect(createMock.mock.calls[0][0].tripBundle).toBeUndefined();
     expect(String(sendMailMock.mock.calls[0][0].html)).not.toContain("Trip summary");
   });
+
+  it("valid opt-in → consent stored on tripBundle.consent (read at BOOKED)", async () => {
+    const res = await request(app).post("/raise-request").send({
+      flightData, watchOptIn: true, whatsappNumber: "+919876543210",
+    });
+    expect(res.status).toBe(201);
+    expect(createMock.mock.calls[0][0].tripBundle.consent).toEqual({
+      watchOptIn: true, whatsappNumber: "+919876543210",
+    });
+  });
+
+  it("1c: malformed whatsappNumber → 400 field error, request NOT created", async () => {
+    const res = await request(app).post("/raise-request").send({
+      flightData, watchOptIn: true, whatsappNumber: "98765",
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.field).toBe("whatsappNumber");
+    expect(createMock).not.toHaveBeenCalled(); // no half-created request
+  });
 });

@@ -244,6 +244,20 @@ async function checkWeatherForDueWatches(now: Date): Promise<void> {
   }
 }
 
+/** One full worker cycle against the REAL deps (models + FlightAware). Exported
+ *  so integration tests can drive it end-to-end with the edges mocked. */
+export async function runRealCycle(now: Date = new Date()): Promise<void> {
+  await runWatchCycle(buildRealDeps(now));
+  await checkWeatherForDueWatches(now);
+  await retryPendingAlerts();
+  // Terminal cleanup in the same cycle (Amendment I): COMPLETE watches whose
+  // departure was > 24h ago.
+  await TripWatch.updateMany(
+    { status: "ACTIVE", departDate: { $lt: new Date(now.getTime() - 24 * 60 * 60 * 1000) } },
+    { $set: { status: "COMPLETED", claimedBy: null, claimedAt: null } },
+  );
+}
+
 let isRunning = false;
 
 export function startTripWatchWorker(): void {
@@ -252,17 +266,8 @@ export function startTripWatchWorker(): void {
   console.log("🛫 Trip watch worker started");
 
   setInterval(async () => {
-    const now = new Date();
     try {
-      await runWatchCycle(buildRealDeps(now));
-      await checkWeatherForDueWatches(now);
-      await retryPendingAlerts();
-      // Terminal cleanup in the same cycle (Amendment I): COMPLETE watches whose
-      // departure was > 24h ago.
-      await TripWatch.updateMany(
-        { status: "ACTIVE", departDate: { $lt: new Date(now.getTime() - 24 * 60 * 60 * 1000) } },
-        { $set: { status: "COMPLETED", claimedBy: null, claimedAt: null } },
-      );
+      await runRealCycle(new Date());
     } catch (err) {
       console.error("❌ Trip watch worker error:", err);
     }
