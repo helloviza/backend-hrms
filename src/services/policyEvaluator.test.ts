@@ -3,6 +3,9 @@ import {
   evaluateFlightPolicy,
   evaluateHotelPolicy,
   policyRulesFromDoc,
+  deriveFareType,
+  flightForPolicyFromTBO,
+  hotelForPolicyFromResult,
   type PolicyRules,
 } from "./policyEvaluator.js";
 
@@ -106,6 +109,41 @@ describe("evaluateHotelPolicy", () => {
   it("price above cap → OUT_OF_POLICY; above approval only → NEEDS_APPROVAL", () => {
     expect(evaluateHotelPolicy({ pricePerNightINR: 9000 }, { active: true, maxHotelPricePerNightINR: 8000 }).status).toBe("OUT_OF_POLICY");
     expect(evaluateHotelPolicy({ pricePerNightINR: 9000 }, { active: true, approvalAbovePriceINR: 8000 }).status).toBe("NEEDS_APPROVAL");
+  });
+});
+
+describe("TBO adapters", () => {
+  const rawFlight = {
+    IsLCC: true,
+    IsRefundable: true,
+    Fare: { OfferedFare: 4800, PublishedFare: 5000, Currency: "INR" },
+    Segments: [[{ CabinClass: 4, Airline: { AirlineCode: "6E" } }]],
+  };
+
+  it("deriveFareType → CORPORATE on corporate flags, else RETAIL", () => {
+    expect(deriveFareType({ CorporateBookingAllowed: true })).toBe("CORPORATE");
+    expect(deriveFareType({ IsCorporateFare: true })).toBe("CORPORATE");
+    expect(deriveFareType(rawFlight)).toBe("RETAIL");
+  });
+
+  it("flightForPolicyFromTBO extracts price/cabin/lcc/refundable", () => {
+    expect(flightForPolicyFromTBO(rawFlight)).toEqual({
+      priceINR: 4800,
+      cabinClass: 4,
+      fareType: "RETAIL",
+      isLCC: true,
+      isRefundable: true,
+    });
+  });
+
+  it("hotelForPolicyFromResult: star + per-night estimate (total / nights)", () => {
+    const hotel = { StarRating: 5, Rooms: [{ _displayTotalFare: 12000 }, { TotalFare: 20000 }] };
+    expect(hotelForPolicyFromResult(hotel, 3)).toEqual({ starRating: 5, pricePerNightINR: 4000 });
+  });
+
+  it("hotelForPolicyFromResult: nights<=0 → per-night null (star still set)", () => {
+    const hotel = { StarRating: 4, Rooms: [{ _displayTotalFare: 9000 }] };
+    expect(hotelForPolicyFromResult(hotel, 0)).toEqual({ starRating: 4, pricePerNightINR: null });
   });
 });
 
