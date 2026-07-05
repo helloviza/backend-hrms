@@ -193,7 +193,11 @@ export async function enrichClientDetails(invoice: any): Promise<any> {
 // GET /api/admin/invoices/gst-preview?customerId=X
 router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
-    const { customerId, sellerGstin } = req.query as { customerId?: string; sellerGstin?: string };
+    const { customerId, sellerGstin, customerStateOverride } = req.query as {
+      customerId?: string;
+      sellerGstin?: string;
+      customerStateOverride?: string;
+    };
     if (!customerId) return res.status(400).json({ error: "customerId is required" });
 
     const [customer, companySettings] = await Promise.all([
@@ -218,7 +222,8 @@ router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ
     }
 
     const supplierState = sellerProfile.state;
-    const { state: customerState, country: customerCountry } = resolveCustomerState(customer);
+    const { state: customerStateAuto, country: customerCountry } = resolveCustomerState(customer);
+    const customerState = (customerStateOverride && customerStateOverride.trim()) || customerStateAuto;
 
     const detection = detectGSTType({ supplierState, customerState, customerCountry });
 
@@ -319,6 +324,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       gstTypeOverride,
       gstOverrideReason,
       sellerGstin,
+      customerStateOverride,
     } = req.body as {
       bookingIds: string[];
       billingPeriod?: string;
@@ -330,6 +336,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       gstTypeOverride?: GSTType;
       gstOverrideReason?: string;
       sellerGstin?: string;
+      customerStateOverride?: string;
     };
 
     // Line-item presentation: SEPARATE (default — each booking itemised) or
@@ -372,6 +379,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       gstBypass,
       gstBypassReason,
       sellerGstin: sellerGstin || undefined,
+      customerStateOverride: customerStateOverride || undefined,
       createdBy: req.user._id,
       isDemoUser: req.user?.isDemoUser === true,
       workspaceScope: req.workspaceObjectId ?? null,
@@ -400,6 +408,7 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       gstTypeOverride,
       gstOverrideReason,
       sellerGstin,
+      customerStateOverride,
     } = req.body as {
       bookingIds: string[];
       invoiceDate?: string;
@@ -409,6 +418,7 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       gstTypeOverride?: GSTType;
       gstOverrideReason?: string;
       sellerGstin?: string;
+      customerStateOverride?: string;
     };
 
     if (!Array.isArray(bookingIds) || !bookingIds.length) {
@@ -453,6 +463,7 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       gstBypass,
       gstBypassReason,
       sellerGstin: sellerGstin || undefined,
+      customerStateOverride: customerStateOverride || undefined,
       createdBy: req.user._id,
       isDemoUser,
       workspaceScope: req.workspaceObjectId ?? null,

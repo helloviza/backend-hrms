@@ -164,6 +164,10 @@ export interface CreateInvoiceOpts {
   // Selection order: this override → per-client default (later step) → the
   // global isDefault profile → flat-field synthesis (registry not seeded).
   sellerGstin?: string;
+  // Per-invoice place-of-supply override — the operator's chosen client GST
+  // state at the generation popup. Absent = auto-resolve via
+  // Customer.gstRegisteredState fallback chain (today's behaviour, unchanged).
+  customerStateOverride?: string;
   createdBy: string;
   isDemoUser?: boolean;
   // Explicit tenant scope for non-HTTP callers (e.g. the auto-invoice
@@ -207,6 +211,10 @@ function buildInvoiceContext(
   const effectiveState = customerStateRaw || addrFallback.state || "";
   const effectiveCountry = customerCountry || addrFallback.country || "India";
 
+  // Place-of-supply override from the generation popup — when absent, this is
+  // exactly effectiveState (today's auto-resolved behaviour, unchanged).
+  const resolvedCustomerState = (opts.customerStateOverride || "").trim() || effectiveState;
+
   // Multi-GST: resolve which of Peachmint's registrations this invoice is
   // issued under. override → customer default → global default →
   // flat-field synthesis. The chosen profile's state feeds detectGSTType
@@ -234,7 +242,7 @@ function buildInvoiceContext(
     gstBypass: opts.gstBypass === true,
     gstBypassReason: (opts.gstBypassReason || "").trim(),
     supplierState: issuerState,
-    customerState: effectiveState,
+    customerState: resolvedCustomerState,
     customerCountry: effectiveCountry,
   });
   if (!resolution.ok) {
