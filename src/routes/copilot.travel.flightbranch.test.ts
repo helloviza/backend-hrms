@@ -79,3 +79,23 @@ describe("Amendment T — the flight branch writes route/dates into locked", () 
     expect(body.context.locked.dates.start).toBe("2026-05-20");
   });
 });
+
+describe("Step 3 — compound flight + hotel is never silently dropped", () => {
+  it("compound message → flight search runs AND the hotel ask is acknowledged with a trigger", async () => {
+    const body = await chat("find flights from Delhi to Mumbai on 20 May 2026 and suggest a business hotel");
+    expect(searchFlightsMock).toHaveBeenCalledTimes(1); // flight still runs
+    expect(body.reply.context).toMatch(/business hotel in Mumbai/i);
+    expect(body.reply.nextSteps[0]).toBe("Show me business hotels in Mumbai");
+  });
+
+  it("flight-only message → no hotel trigger", async () => {
+    const body = await chat("find flights from Delhi to Mumbai on 20 May 2026");
+    expect(body.reply.nextSteps.some((s: string) => /hotels in/i.test(s))).toBe(false);
+    expect(body.reply.context).not.toMatch(/noted you want/i);
+  });
+
+  it("qualifier passthrough — '5-star hotel' → '5-star hotels' trigger", async () => {
+    const body = await chat("flights from Delhi to Mumbai on 20 May 2026, also a 5-star hotel please");
+    expect(body.reply.nextSteps[0]).toBe("Show me 5-star hotels in Mumbai");
+  });
+});

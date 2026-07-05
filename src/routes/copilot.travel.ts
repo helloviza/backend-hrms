@@ -970,8 +970,27 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
         }
       }
 
+      // ── Step 3 — COMPOUND INTENT (flight + hotel in one message) ──
+      // The flight branch owns the turn (first-match-wins), which silently
+      // dropped a hotel ask riding along ("...business hotel and cheapest
+      // flight"). Never drop it: acknowledge the hotel request and carry a
+      // qualifier-aware nextSteps trigger that routes to the hotel path. (A live
+      // inline TBO hotel search is intentionally NOT wired here — there is no
+      // chat-hotel helper and TBO hotel creds are environment-gated — so the
+      // honest move is to acknowledge + hand off, never fake or drop it.)
+      const hotelAsk = /\b(hotels?|stay|accommodations?|accomodations?|property|resort|lodging)\b/i.test(prompt);
+      const hotelQualMatch = prompt.match(/\b(business|luxury|budget|boutique|premium|five[\s-]?star|5[\s-]?star|four[\s-]?star|4[\s-]?star)\s+(?:hotels?|stay|accommodations?|property|resort)/i);
+      const hotelQual = hotelQualMatch ? hotelQualMatch[1].toLowerCase().replace(/[\s-]/g, "") : "";
+      const hotelQualLabel = (hotelQual === "5star" || hotelQual === "fivestar") ? "5-star "
+        : (hotelQual === "4star" || hotelQual === "fourstar") ? "4-star "
+        : hotelQual ? `${hotelQual} ` : "";
+      const hotelTrigger = hotelAsk ? `Show me ${hotelQualLabel}hotels in ${destination}` : null;
+      const hotelNote = hotelAsk
+        ? ` I've also noted you want a ${hotelQualLabel}hotel in ${destination} — tap "${hotelTrigger}" and I'll pull options.`
+        : "";
+
       onStage?.("assembling");
-      const nextSteps = searchUnavailable ? [
+      const baseNextSteps = searchUnavailable ? [
         "Retry the search in a few minutes",
         "Or use the flight search panel above for full results",
       ] : hasLiveFlights ? [
@@ -981,18 +1000,19 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
         "Try a slightly different date or route",
         "Or use the flight search panel above for full results",
       ];
+      const nextSteps = hotelTrigger ? [hotelTrigger, ...baseNextSteps] : baseNextSteps;
 
       return res.json({
         ok: true,
         reply: {
           title: `Flights: ${origin} → ${destination}${travelDate ? "  ·  " + travelDate : ""}`,
-          context: searchUnavailable
+          context: (searchUnavailable
             ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
             : hasLiveFlights
               ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + cabinNote + cheapestNote + roundTripNote + routeInsightsNote + weatherNote
               : !isoDate
                 ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
-                : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`,
+                : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`) + hotelNote,
           flightSearch: {
             origin:      { city: origin,      iata: originIATA },
             destination: { city: destination, iata: destIATA   },
