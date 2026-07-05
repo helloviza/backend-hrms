@@ -71,3 +71,50 @@ describe("invokePluto — substance enforce-retry", () => {
     expect(reply.itinerary).toHaveLength(3);
   });
 });
+
+const REASK = {
+  handoff: false,
+  context: "I need to know your travel destination first.",
+  nextSteps: ["Where would you like to go?", "What are your travel dates?"],
+};
+const HOTELS_OK = {
+  handoff: false,
+  context: "Here are strong Pattaya options within your budget for your Oct 20–22 stay. Each is walkable to the beach. We can refine once you pick a vibe.",
+  hotels: [{ name: "Beachfront Suites", area: "Beach Road", approxPrice: "$450", whyGood: "Central, sea view" }],
+};
+const LOCKED = { destination: "Pattaya", dates: "2026-10-20 to 2026-10-22" };
+
+describe("invokePluto — reasked-locked enforce-retry (v2)", () => {
+  it("lockedFacts + a reply re-asking destination → ONE retry naming the facts, returns the fixed reply", async () => {
+    createMock.mockResolvedValueOnce(aiJson(REASK)).mockResolvedValueOnce(aiJson(HOTELS_OK));
+    const reply = await invokePluto("show me few hotel beyond USD 500", { lockedFacts: LOCKED });
+    expect(createMock).toHaveBeenCalledTimes(2);
+    expect(reply.hotels).toHaveLength(1);
+    const secondMsgs = createMock.mock.calls[1][0].messages.map((m: any) => m.content).join("\n");
+    expect(secondMsgs).toMatch(/ALREADY KNOWN/i);
+    expect(secondMsgs).toMatch(/Pattaya/);
+  });
+
+  it("lockedFacts + a reply that does NOT re-ask → no retry", async () => {
+    createMock.mockResolvedValueOnce(aiJson(HOTELS_OK));
+    const reply = await invokePluto("hotels beyond USD 500", { lockedFacts: LOCKED });
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(reply.hotels).toHaveLength(1);
+  });
+
+  it("lockedFacts + re-asks twice → ACCEPTED (no throw) + onReaskedLockedAccepted fired", async () => {
+    createMock.mockResolvedValueOnce(aiJson(REASK)).mockResolvedValueOnce(aiJson(REASK));
+    const onReaskedLockedAccepted = vi.fn();
+    const reply = await invokePluto("hotels", { lockedFacts: LOCKED, onReaskedLockedAccepted });
+    expect(createMock).toHaveBeenCalledTimes(2);
+    expect(onReaskedLockedAccepted).toHaveBeenCalledTimes(1);
+    expect(reply.context).toMatch(/need to know/i); // accepted, not an error
+  });
+
+  it("no lockedFacts → a re-ask reply is NOT corrected (gather phase unchanged)", async () => {
+    createMock.mockResolvedValueOnce(aiJson(REASK));
+    const reply = await invokePluto("plan a trip");
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(reply.context).toMatch(/need to know/i);
+  });
+});

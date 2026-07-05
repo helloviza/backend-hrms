@@ -1,7 +1,7 @@
 // apps/backend/src/utils/plutoGeminiInvoke.ts
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { isValidPlutoReply, isThinReply } from "./plutoValidator.js";
-import type { PlutoInvokeOptions } from "./plutoInvoke.js";
+import { isValidPlutoReply, isThinReply, isReaskedLockedReply } from "./plutoValidator.js";
+import { reaskRetryInstruction, type PlutoInvokeOptions } from "./plutoInvoke.js";
 
 // Distinct marker thrown when Gemini returns a schema-invalid reply even after
 // a corrective retry. The caller uses it to emit pluto.ai.fallback_invalid
@@ -90,7 +90,18 @@ export async function invokePlutoGemini(
       break;
     }
 
-    // Shape-valid. Enforce SUBSTANCE only when the caller asked for it.
+    // Shape-valid. Enforce: NEVER re-ask a locked fact (before substance).
+    if (opts.lockedFacts && isReaskedLockedReply(normalized, opts.lockedFacts)) {
+      if (attempt === 1) {
+        console.warn("[Pluto] Gemini fallback re-asked a locked fact — retrying once");
+        currentPrompt = `${prompt}\n\n${reaskRetryInstruction(opts.lockedFacts)}`;
+        continue;
+      }
+      opts.onReaskedLockedAccepted?.();
+      return normalized;
+    }
+
+    // Enforce SUBSTANCE only when the caller asked for it.
     if (requireSubstance && isThinReply(normalized)) {
       if (attempt === 1) {
         console.warn("[Pluto] Gemini fallback returned a thin reply — retrying once");

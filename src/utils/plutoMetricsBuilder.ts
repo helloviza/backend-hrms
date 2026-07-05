@@ -73,6 +73,17 @@ export function replyThinAccepted(args: FailureArgs): PlutoMetricEvent {
   };
 }
 
+// A reply that re-asked an already-locked fact and was accepted after one
+// corrective retry (v2). warn so it always surfaces for prompt tuning.
+export function replyReaskedLocked(args: FailureArgs): PlutoMetricEvent {
+  return {
+    type: "pluto.reply.reasked_locked",
+    severity: "warn",
+    timestamp: new Date().toISOString(),
+    ...args,
+  };
+}
+
 // Conversation memory (Capstone) — a DB blip must not kill the turn; these
 // surface the degradation. severity error so the sink always logs them.
 export function memoryReadFailed(args: FailureArgs): PlutoMetricEvent {

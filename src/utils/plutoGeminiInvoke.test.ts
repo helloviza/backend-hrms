@@ -93,3 +93,27 @@ describe("invokePlutoGemini — substance enforce-retry (mirrors OpenAI)", () =>
     expect(generateContentMock).toHaveBeenCalledTimes(1);
   });
 });
+
+const REASK = { handoff: false, context: "I need to know your travel destination first." };
+const OK = { handoff: false, context: "Here are Pattaya hotels within budget.", hotels: [{ name: "H", area: "Beach", approxPrice: "$450", whyGood: "central" }] };
+
+describe("invokePlutoGemini — reasked-locked enforce-retry (mirrors OpenAI)", () => {
+  it("lockedFacts + re-ask → one retry naming the facts → returns the fixed reply", async () => {
+    generateContentMock.mockResolvedValueOnce(geminiText(REASK)).mockResolvedValueOnce(geminiText(OK));
+    const reply = await invokePlutoGemini("hotels beyond USD 500", { lockedFacts: { destination: "Pattaya" } });
+    expect(reply.hotels).toHaveLength(1);
+    expect(generateContentMock).toHaveBeenCalledTimes(2);
+    const secondPrompt = generateContentMock.mock.calls[1][0] as string;
+    expect(secondPrompt).toMatch(/ALREADY KNOWN/i);
+    expect(secondPrompt).toMatch(/Pattaya/);
+  });
+
+  it("lockedFacts + re-asks twice → ACCEPTED + onReaskedLockedAccepted fired", async () => {
+    generateContentMock.mockResolvedValueOnce(geminiText(REASK)).mockResolvedValueOnce(geminiText(REASK));
+    const onReaskedLockedAccepted = vi.fn();
+    const reply = await invokePlutoGemini("hotels", { lockedFacts: { destination: "Pattaya" }, onReaskedLockedAccepted });
+    expect(reply.context).toMatch(/need to know/i);
+    expect(onReaskedLockedAccepted).toHaveBeenCalledTimes(1);
+    expect(generateContentMock).toHaveBeenCalledTimes(2);
+  });
+});

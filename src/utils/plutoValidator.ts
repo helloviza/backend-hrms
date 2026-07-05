@@ -121,6 +121,49 @@ export function isThinReply(reply: Partial<PlutoReplyV1>): boolean {
   return !hasItinerary || !substantiveContext;
 }
 
+// Locked facts (with their values) that a reply must NOT re-ask. Defined here
+// (not in plutoInvoke) so both the invoke loop and this validator can share it
+// without an import cycle.
+export interface LockedFactsForReask {
+  destination?: string;
+  dates?: string;
+  origin?: string;
+  duration?: string;
+}
+
+// Per-fact "you're re-asking me" patterns — cover both interrogatives and the
+// observed "I need to know your travel destination first" phrasing. Kept fairly
+// tight; a false positive only costs ONE corrective retry (never an error).
+const REASK_PATTERNS: Record<keyof LockedFactsForReask, RegExp> = {
+  destination: /need to know your (?:travel )?destination|your (?:travel )?destination\b|where (?:are|would|do) you (?:going|travel(?:l)?ing|head)|which (?:city|destination)\b|where would you like to (?:go|stay|travel)/i,
+  dates: /need to know your (?:travel )?dates|your travel dates|what (?:are your|dates)|which dates|when (?:are|would|do|will) you (?:travel|go|arrive|check)|when would you like/i,
+  origin: /where are you (?:flying|departing|travel(?:l)?ing|coming) from|which city are you (?:flying|departing) from|your (?:departure|origin) (?:city|airport)/i,
+  duration: /how (?:long|many nights|many days)|trip (?:length|duration)|how many (?:nights|days)/i,
+};
+
+/**
+ * Detects when a reply asks the user for a fact that is ALREADY locked. Only
+ * facts present in `locked` are checked (against the reply's context +
+ * nextSteps). Used by the invoke loop to trigger ONE corrective retry.
+ */
+export function isReaskedLockedReply(
+  reply: Partial<PlutoReplyV1>,
+  locked: LockedFactsForReask | null | undefined
+): boolean {
+  if (!locked) return false;
+  const parts: string[] = [];
+  if (typeof reply.context === "string") parts.push(reply.context);
+  if (Array.isArray(reply.nextSteps)) {
+    for (const s of reply.nextSteps) if (typeof s === "string") parts.push(s);
+  }
+  const blob = parts.join(" \n ");
+  if (!blob.trim()) return false;
+  for (const fact of ["destination", "dates", "origin", "duration"] as const) {
+    if (locked[fact] && REASK_PATTERNS[fact].test(blob)) return true;
+  }
+  return false;
+}
+
 /**
  * State-aware validator
  *
