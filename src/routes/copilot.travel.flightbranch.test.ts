@@ -99,3 +99,18 @@ describe("Step 3 — compound flight + hotel is never silently dropped", () => {
     expect(body.reply.nextSteps[0]).toBe("Show me 5-star hotels in Mumbai");
   });
 });
+
+describe("Step 4 — duration consistency flag", () => {
+  it("locked 3-day plan + dates spanning 5 days → flagged AND locked.duration updated to 5 (dates win)", async () => {
+    const seeded = { id: "c1", locked: { destination: { name: "Mumbai", iata: "BOM", source: "user" }, duration: { days: 3, source: "user" } } };
+    const body = await chat("find flights from Delhi to Mumbai on 20 May 2026 returning 24 May 2026", seeded);
+    expect(body.reply.context).toMatch(/spans 5 days.*differs from your original 3-day plan/i);
+    expect(body.context.locked.duration).toMatchObject({ days: 5, source: "dates" });
+  });
+
+  it("dates consistent with locked duration → no flag", async () => {
+    const seeded = { id: "c1", locked: { destination: { name: "Mumbai", iata: "BOM", source: "user" }, duration: { days: 5, source: "user" } } };
+    const body = await chat("find flights from Delhi to Mumbai on 20 May 2026 returning 24 May 2026", seeded);
+    expect(body.reply.context).not.toMatch(/differs from your original/i);
+  });
+});
