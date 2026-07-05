@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+// Run under a non-UTC timezone (Amendment W): proves the date derives from the
+// raw TBO string, not new Date().toISOString() (which would roll the calendar
+// date under IST). Set before the module loads.
+vi.hoisted(() => { process.env.TZ = "Asia/Kolkata"; });
+
 // Mock the TBO service so no token/network is required. The factory is hoisted
 // by vitest, so it must not reference outer variables.
 vi.mock("../services/tbo.flight.service.js", () => ({
@@ -209,5 +214,35 @@ describe("searchFlightsForChat — policy annotation", () => {
     // Everything except `policy` matches the bare mapper output for the same raw row.
     const bare = mapTBOFlight(lcc, { traceId: "P", originIATA: "DEL", destIATA: "BOM", cabinLabel: "Economy" });
     expect(annotated).toEqual(bare);
+  });
+});
+
+describe("mapTBOFlight — dates derive from the raw TBO string, never UTC (Amendment W)", () => {
+  const opts = { traceId: "T", originIATA: "DEL", destIATA: "NRT", cabinLabel: "Economy" };
+  const withTimes = (dep: string, arr: string) => ({
+    ResultIndex: "OB1",
+    IsLCC: false,
+    IsRefundable: true,
+    Fare: { PublishedFare: 5000, OfferedFare: 4800, Currency: "INR" },
+    Segments: [[{
+      CabinClass: 2, Duration: 360,
+      Airline: { AirlineCode: "AI", AirlineName: "Air India", FlightNumber: "301" },
+      Origin: { DepTime: dep, Airport: { AirportCode: "DEL", CityName: "Delhi", Terminal: "3" } },
+      Destination: { ArrTime: arr, Airport: { AirportCode: "NRT", CityName: "Tokyo", Terminal: "1" } },
+    }]],
+  });
+
+  it("early-morning departure keeps its calendar date (would roll back to the 19th via toISOString under IST)", () => {
+    const f = mapTBOFlight(withTimes("2026-09-20T03:30:00", "2026-09-20T13:30:00"), opts)!;
+    expect(f.departure.date).toBe("2026-09-20");
+    expect(f.departure.time).toBe("03:30:00");
+    expect(f.arrival.date).toBe("2026-09-20");
+  });
+
+  it("late-evening departure keeps its date (no forward roll)", () => {
+    const f = mapTBOFlight(withTimes("2026-09-20T21:15:00", "2026-09-21T12:45:00"), opts)!;
+    expect(f.departure.date).toBe("2026-09-20");
+    expect(f.departure.time).toBe("21:15:00");
+    expect(f.arrival.date).toBe("2026-09-21"); // next-day arrival preserved from the raw string
   });
 });

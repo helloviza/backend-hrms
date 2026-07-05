@@ -107,6 +107,18 @@ export function mapTBOFlight(
     return "";
   };
 
+  // Mirror isoTimeOf for the DATE (Amendment W). TBO timestamps are
+  // local-with-no-offset, so new Date(raw).toISOString() converts to UTC and can
+  // shift the calendar date by a day (an early-morning IST departure rolls back;
+  // a late-evening departure on a behind-UTC server rolls forward). Read the raw
+  // YYYY-MM-DD portion — the same source the time uses — so the booked/displayed
+  // date is stable regardless of the server timezone.
+  const isoDateOf = (raw: string, d: Date): string => {
+    const m = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (m) return m[1];
+    return isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
+  };
+
   return {
     ResultIndex: r.ResultIndex,
     TraceId: opts.traceId,
@@ -128,11 +140,11 @@ export function mapTBOFlight(
     },
     departure: {
       time: isoTimeOf(depRawIso, depDt),
-      date: isNaN(depDt.getTime()) ? "" : depDt.toISOString().slice(0, 10),
+      date: isoDateOf(depRawIso, depDt),
     },
     arrival: {
       time: isoTimeOf(arrRawIso, arrDt),
-      date: isNaN(arrDt.getTime()) ? "" : arrDt.toISOString().slice(0, 10),
+      date: isoDateOf(arrRawIso, arrDt),
     },
     duration: `${h}h ${m}m`,
     stops: segs.length - 1,
