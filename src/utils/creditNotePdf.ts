@@ -143,19 +143,25 @@ export async function generateCreditNotePdf(
     : (dbSettings.logoUrl ? await fetchBuffer(dbSettings.logoUrl) : null);
 
   const cn = creditNote as any;
+  // Seller/issuer block renders ONLY from the credit note's own snapshot
+  // (inherited from its parent invoice at creation time) — never from live
+  // CompanySettings. Once multiple company GSTINs exist, falling back to
+  // "whatever's the default today" here would silently substitute the wrong
+  // seller identity on an older credit note. dbSettings is still used below
+  // for the logo image only, which is not GSTIN/registration-specific.
   const issuerSnap = cn.issuerDetails ?? {};
   const issuer = {
-    companyName:  issuerSnap.companyName  || dbSettings.companyName  || "",
-    address:      issuerSnap.address      || dbSettings.address      || "",
-    addressLine1: issuerSnap.addressLine1 || (dbSettings as any).addressLine1 || "",
-    addressLine2: issuerSnap.addressLine2 || (dbSettings as any).addressLine2 || "",
-    city:         issuerSnap.city         || (dbSettings as any).city         || "",
-    country:      issuerSnap.country      || (dbSettings as any).country      || "India",
-    pincode:      issuerSnap.pincode      || (dbSettings as any).pincode       || "",
-    state:        issuerSnap.state        || dbSettings.supplierState || dbSettings.state || "",
-    gstin:        issuerSnap.gstin        || dbSettings.gstin         || "",
-    email:        issuerSnap.email        || dbSettings.email         || "",
-    website:      issuerSnap.website      || dbSettings.website       || "",
+    companyName:  issuerSnap.companyName  || "",
+    address:      issuerSnap.address      || "",
+    addressLine1: issuerSnap.addressLine1 || "",
+    addressLine2: issuerSnap.addressLine2 || "",
+    city:         issuerSnap.city         || "",
+    country:      issuerSnap.country      || "India",
+    pincode:      issuerSnap.pincode      || "",
+    state:        issuerSnap.state        || "",
+    gstin:        issuerSnap.gstin        || "",
+    email:        issuerSnap.email        || "",
+    website:      issuerSnap.website      || "",
   };
   const client = cn.clientDetails ?? {};
 

@@ -9,7 +9,6 @@ import CreditNote from "../models/CreditNote.js";
 import CreditNoteReason from "../models/CreditNoteReason.js";
 import Invoice from "../models/Invoice.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
-import { getCompanySettings } from "../models/CompanySettings.js";
 import { calculateGSTAmounts, type GSTType } from "../utils/gstDetection.js";
 import { uploadAndPresign } from "../utils/s3Upload.js";
 import { generateCreditNotePdf } from "../utils/creditNotePdf.js";
@@ -258,23 +257,14 @@ async function validateAndBuild(req: any, body: any): Promise<{ payload: Partial
 
   const gstAmounts = calculateGSTAmounts(totalGST, supplyType);
 
-  // Issuer snapshot (live company settings) + client snapshot (from the invoice)
-  const companySettings = await getCompanySettings();
-  const issuerState = companySettings.supplierState || companySettings.state || process.env.COMPANY_STATE || "Karnataka";
-  const issuerDetails = {
-    companyName: companySettings.companyName || process.env.COMPANY_NAME,
-    gstin: companySettings.gstin || process.env.COMPANY_GSTIN,
-    address: companySettings.address || process.env.COMPANY_ADDRESS,
-    addressLine1: (companySettings as any).addressLine1 || "",
-    addressLine2: (companySettings as any).addressLine2 || "",
-    city: (companySettings as any).city || "",
-    country: (companySettings as any).country || "India",
-    pincode: (companySettings as any).pincode || "",
-    email: companySettings.email || process.env.COMPANY_EMAIL,
-    phone: companySettings.phone || process.env.COMPANY_PHONE,
-    website: companySettings.website || process.env.COMPANY_WEBSITE,
-    state: issuerState,
-  };
+  // Issuer snapshot — inherited verbatim from the parent invoice, never
+  // re-resolved from live CompanySettings. A credit note must reference the
+  // same supplier GSTIN/registration as the invoice it credits; re-resolving
+  // here would let a later company-settings change (e.g. a different state's
+  // GSTIN) leak into a credit note whose parent invoice was issued under a
+  // different registration.
+  const issuerDetails = invoice.issuerDetails || {};
+  const issuerState = invoice.issuerState || (issuerDetails as any).state || "";
 
   const payload: Partial<any> = {
     workspaceId: invoice.workspaceId,
