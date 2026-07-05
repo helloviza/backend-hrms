@@ -27,7 +27,7 @@ import Customer from "../models/Customer.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { buildLineItemsForBooking, buildCombinedLineItems } from "../utils/invoiceLineItems.js";
 import { resolveCustomerState, buildAddressStr } from "../utils/invoiceClient.js";
-import { detectGSTType, calculateGSTAmounts, GST_STATE_CODES, type GSTType } from "../utils/gstDetection.js";
+import { detectGSTType, calculateGSTAmounts, GST_STATE_CODES, UNION_TERRITORIES, type GSTType } from "../utils/gstDetection.js";
 import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
 import { triggerTaskAutomation } from "./taskAutomation.js";
 
@@ -59,22 +59,6 @@ export async function resolveInvoiceWorkspace(
   return { invoiceWorkspaceId: (workspace as any)?._id ?? customerId, workspace: workspace ?? null };
 }
 
-/* ── GST bypass resolution (moved verbatim from routes/invoices.ts) ─────────
- * Bypass-mode UT list (per spec). Distinct from gstDetection's UNION_TERRITORIES
- * set, which uses the combined "Dadra and Nagar Haveli and Daman and Diu" entry.
- */
-const BYPASS_UT_LIST = new Set<string>([
-  "Andaman and Nicobar Islands",
-  "Chandigarh",
-  "Dadra and Nagar Haveli",
-  "Daman and Diu",
-  "Lakshadweep",
-  "Delhi",
-  "Puducherry",
-  "Jammu and Kashmir",
-  "Ladakh",
-]);
-
 export interface GstResolution {
   ok: boolean;
   gstType?: GSTType;
@@ -102,7 +86,10 @@ export function resolveGstWithBypass(input: {
   customerCountry: string;
 }): GstResolution {
   if (input.gstBypass) {
-    const gstType: GSTType = BYPASS_UT_LIST.has(input.supplierState)
+    // Reuses gstDetection's UNION_TERRITORIES — UTs without their own
+    // legislature only (Delhi/Puducherry/J&K levy SGST, not UTGST; see
+    // gstDetection.ts). One source of truth for this classification.
+    const gstType: GSTType = UNION_TERRITORIES.has(input.supplierState)
       ? "CGST_UTGST"
       : "CGST_SGST";
     const customerState = input.customerState || "";
