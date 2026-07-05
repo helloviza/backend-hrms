@@ -109,10 +109,12 @@ import Customer from "../models/Customer.js";
 import CreditNote from "../models/CreditNote.js";
 import { generateInvoicePdf, prefetchInvoiceAssets } from "../utils/invoicePdf.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
-import { buildLineItemsForBooking, buildCombinedLineItems } from "../utils/invoiceLineItems.js";
-import { detectGSTType, calculateGSTAmounts, GST_STATE_CODES, type GSTType } from "../utils/gstDetection.js";
+import { buildLineItemsForBooking } from "../utils/invoiceLineItems.js";
+import { detectGSTType, calculateGSTAmounts, type GSTType } from "../utils/gstDetection.js";
 import { env } from "../config/env.js";
-import { triggerTaskAutomation } from "../services/taskAutomation.js";
+import { resolveCustomerState, buildAddressStr } from "../utils/invoiceClient.js";
+import { createInvoiceFromBookings, InvoiceGenerationError } from "../services/invoiceGeneration.service.js";
+import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
 
 const router = express.Router();
 
@@ -120,27 +122,8 @@ router.use(requireAuth);
 router.use(requireAdmin);
 
 /* ── GST helpers ─────────────────────────────────────────────────── */
-
-function resolveCustomerState(cust: any): { state: string; country: string } {
-  const state =
-    cust?.gstRegisteredState ||
-    cust?.address?.state ||
-    cust?.shippingAddress?.state ||
-    "";
-  const country =
-    cust?.address?.country ||
-    cust?.shippingAddress?.country ||
-    "India";
-  return { state, country };
-}
-
-function buildAddressStr(o: {
-  addressLine1?: string; addressLine2?: string;
-  city?: string; state?: string; country?: string; pincode?: string;
-}): string {
-  return [o.addressLine1, o.addressLine2, o.city, o.state, o.country, o.pincode]
-    .filter(Boolean).join(", ");
-}
+// resolveCustomerState + buildAddressStr now live in utils/invoiceClient.ts
+// (shared with the invoice-generation service). Imported above.
 
 // Merges stored clientDetails snapshot with live Customer/Workspace data.
 // Snapshot wins for any non-empty field (preserves audit trail).
@@ -210,7 +193,7 @@ export async function enrichClientDetails(invoice: any): Promise<any> {
 // GET /api/admin/invoices/gst-preview?customerId=X
 router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
-    const { customerId } = req.query as { customerId?: string };
+    const { customerId, sellerGstin } = req.query as { customerId?: string; sellerGstin?: string };
     if (!customerId) return res.status(400).json({ error: "customerId is required" });
 
     const [customer, companySettings] = await Promise.all([
@@ -220,14 +203,33 @@ router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ
 
     if (!customer) return res.status(404).json({ error: "Customer not found" });
 
-    const supplierState = companySettings.supplierState || companySettings.state || "Karnataka";
+    let sellerProfile;
+    try {
+      sellerProfile = resolveSellerGstProfile({
+        overrideGstin: sellerGstin || undefined,
+        customerDefaultGstin: undefined, // step 4: per-customer default GSTIN
+        companySettings,
+      });
+    } catch (err: any) {
+      if (err instanceof SellerGstinNotFoundError) {
+        return res.status(400).json({ error: "SELLER_GSTIN_NOT_FOUND", message: err.message });
+      }
+      throw err;
+    }
+
+    const supplierState = sellerProfile.state;
     const { state: customerState, country: customerCountry } = resolveCustomerState(customer);
 
     const detection = detectGSTType({ supplierState, customerState, customerCountry });
 
+    const activeGstProfiles = ((companySettings.gstProfiles || []) as any[])
+      .filter((p) => p.active)
+      .map((p) => ({ gstin: p.gstin, state: p.state, stateCode: p.stateCode, legalName: p.legalName, isDefault: p.isDefault }));
+
     res.json({
       ok: true,
       supplierState,
+      supplierGstin: sellerProfile.gstin,
       customerState: detection.customerState,
       placeOfSupply: detection.placeOfSupply,
       detectedGstType: detection.gstType,
@@ -235,6 +237,7 @@ router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ
       customerStateCode: detection.customerStateCode,
       canCalculate: detection.canCalculate,
       reason: detection.reason ?? null,
+      activeGstProfiles,
     });
   } catch (err: any) {
     console.error("[Invoices gst-preview]", err.message);
@@ -297,100 +300,8 @@ function invoiceToRow(inv: any): (string | number | undefined)[] {
   ];
 }
 
-/* ── GST Bypass helper ──────────────────────────────────────────── */
-
-// Bypass-mode UT list (per spec). Distinct from gstDetection's UNION_TERRITORIES
-// set, which uses the combined "Dadra and Nagar Haveli and Daman and Diu" entry.
-const BYPASS_UT_LIST = new Set<string>([
-  "Andaman and Nicobar Islands",
-  "Chandigarh",
-  "Dadra and Nagar Haveli",
-  "Daman and Diu",
-  "Lakshadweep",
-  "Delhi",
-  "Puducherry",
-  "Jammu and Kashmir",
-  "Ladakh",
-]);
-
-interface GstResolution {
-  ok: boolean;
-  gstType?: GSTType;
-  detection?: {
-    gstType: GSTType;
-    supplierState: string;
-    customerState: string;
-    supplierStateCode: string;
-    customerStateCode: string;
-    placeOfSupply: string;
-    canCalculate: true;
-    bypassed: boolean;
-    bypassReason?: string;
-  };
-  bypassed?: boolean;
-  reason?: string;
-  missingField?: string;
-}
-
-function resolveGstWithBypass(input: {
-  gstBypass: boolean;
-  gstBypassReason: string;
-  supplierState: string;
-  customerState: string;
-  customerCountry: string;
-}): GstResolution {
-  if (input.gstBypass) {
-    const gstType: GSTType = BYPASS_UT_LIST.has(input.supplierState)
-      ? "CGST_UTGST"
-      : "CGST_SGST";
-    const customerState = input.customerState || "";
-    const placeOfSupply = customerState.trim() ? customerState.trim() : input.supplierState;
-    return {
-      ok: true,
-      gstType,
-      detection: {
-        gstType,
-        supplierState: input.supplierState,
-        customerState,
-        supplierStateCode: GST_STATE_CODES[input.supplierState] || "",
-        customerStateCode: customerState ? GST_STATE_CODES[customerState] || "" : "",
-        placeOfSupply,
-        canCalculate: true,
-        bypassed: true,
-        bypassReason: input.gstBypassReason,
-      },
-      bypassed: true,
-    };
-  }
-
-  const detection = detectGSTType({
-    supplierState: input.supplierState,
-    customerState: input.customerState,
-    customerCountry: input.customerCountry,
-  });
-  if (!detection.canCalculate) {
-    return {
-      ok: false,
-      reason: detection.reason || "GST detection failed",
-      missingField: detection.reason?.includes("state") ? "state" : "unknown",
-    };
-  }
-  return {
-    ok: true,
-    gstType: detection.gstType,
-    detection: {
-      gstType: detection.gstType,
-      supplierState: detection.supplierState,
-      customerState: detection.customerState,
-      supplierStateCode: detection.supplierStateCode,
-      customerStateCode: detection.customerStateCode,
-      placeOfSupply: detection.placeOfSupply,
-      canCalculate: true,
-      bypassed: false,
-    },
-    bypassed: false,
-  };
-}
+// GST bypass resolution (BYPASS_UT_LIST / resolveGstWithBypass) now lives in
+// services/invoiceGeneration.service.ts alongside the generation logic.
 
 /* ── Generate Invoice ───────────────────────────────────────────── */
 
@@ -407,6 +318,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       invoiceDate,
       gstTypeOverride,
       gstOverrideReason,
+      sellerGstin,
     } = req.body as {
       bookingIds: string[];
       billingPeriod?: string;
@@ -417,12 +329,15 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       invoiceDate?: string;
       gstTypeOverride?: GSTType;
       gstOverrideReason?: string;
+      sellerGstin?: string;
     };
 
     // Line-item presentation: SEPARATE (default — each booking itemised) or
     // COMBINED (one COST + Transaction Fees line per category). Totals are
-    // identical between formats; only presentation differs.
-    const invoiceFormat: "SEPARATE" | "COMBINED" =
+    // identical between formats; only presentation differs. This is a SINGLE
+    // invoice either way (service format 'COMBINED'); `lineItemStyle` carries
+    // the presentation choice.
+    const lineItemStyle: "SEPARATE" | "COMBINED" =
       req.body?.invoiceFormat === "COMBINED" ? "COMBINED" : "SEPARATE";
 
     // GST bypass payload (separate from gstTypeOverride — distinct audit trail)
@@ -443,246 +358,30 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     const resolvedInvoiceDate = invoiceDate ? new Date(invoiceDate) : new Date();
     resolvedInvoiceDate.setHours(0, 0, 0, 0);
 
-    // Validate bookings — Demo Platform: demo admins invoice only demo bookings,
-    // real admins are protected from accidentally invoicing demo data.
-    const demoClauseGenerate = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
-    const bookings = await ManualBooking.find({
-      _id: { $in: bookingIds.map((id) => new mongoose.Types.ObjectId(id)) },
-      ...demoClauseGenerate,
-    }).lean();
-
-    if (bookings.length !== bookingIds.length) {
-      return res.status(400).json({ error: "One or more booking IDs not found" });
-    }
-
-    // All must belong to same workspace
-    const wsIds = [...new Set(bookings.map((b: any) => b.workspaceId.toString()))];
-    if (wsIds.length > 1) {
-      return res.status(400).json({ error: "All bookings must belong to the same workspace" });
-    }
-
-    // None already invoiced
-    const alreadyInvoiced = bookings.filter((b: any) => b.status === "INVOICED");
-    if (alreadyInvoiced.length) {
-      return res.status(400).json({
-        error: `${alreadyInvoiced.length} booking(s) are already invoiced`,
-        refs: alreadyInvoiced.map((b: any) => b.bookingRef),
-      });
-    }
-
-    const wsId = wsIds[0].toString()
-
-    // Look up Customer directly — this is where billing data lives
-    const customer = await Customer
-      .findById(wsId).lean()
-
-    console.log('[Invoice generate] customer found:',
-      customer ? (customer as any).legalName
-                 || (customer as any).name
-               : 'NOT FOUND')
-    console.log('[Invoice generate] wsId used:', wsId)
-
-    // Resolve the CustomerWorkspace._id for this customer so workspaceId
-    // on the invoice matches what requireWorkspace sets on req.workspaceObjectId.
-    // bookings store Customer._id in workspaceId, so we must look up the workspace.
-    const resolvedWorkspace = await CustomerWorkspace
-      .findOne({ customerId: wsId })
-      .lean()
-    const invoiceWorkspaceId = resolvedWorkspace?._id ?? wsId
-
-    const companySettings = await getCompanySettings();
-    const issuerState = companySettings.supplierState || companySettings.state || process.env.COMPANY_STATE || "Karnataka";
-
-    const cust = (customer || {}) as any;
-    const custAddr: any = cust.address ?? {};
-    // Workspace address fallback for customers with no structured address (Molnlycke-pattern)
-    const addrFallback: any = (!custAddr.street && !custAddr.city)
-      ? ((resolvedWorkspace as any)?.address ?? {})
-      : {};
-
-    const { state: customerStateRaw, country: customerCountry } = resolveCustomerState(cust);
-    const effectiveState   = customerStateRaw   || addrFallback.state   || "";
-    const effectiveCountry = customerCountry    || addrFallback.country || "India";
-
-    // GST resolution — bypass branch skips detection; otherwise auto-detect.
-    const resolution = resolveGstWithBypass({
-      gstBypass,
-      gstBypassReason,
-      supplierState: issuerState,
-      customerState: effectiveState,
-      customerCountry: effectiveCountry,
-    });
-    if (!resolution.ok) {
-      return res.status(400).json({
-        error: "GST_DETECTION_FAILED",
-        message: resolution.reason,
-        customerId: cust._id,
-        missingField: resolution.missingField,
-        hint: "Update customer profile with state before generating invoice",
-      });
-    }
-    const detection = resolution.detection;
-
-    // Validate and apply manual override if provided (independent of bypass).
-    const allowedOverrides: GSTType[] = ["CGST_SGST", "CGST_UTGST", "IGST", "EXPORT", "NONE"];
-    const useOverride = gstTypeOverride && allowedOverrides.includes(gstTypeOverride);
-    if (useOverride && !gstOverrideReason) {
-      return res.status(400).json({ error: "gstOverrideReason is required when using gstTypeOverride" });
-    }
-    const resolvedGstType: GSTType = useOverride ? gstTypeOverride! : resolution.gstType;
-
-    const custAddrLine1 = custAddr.street  || addrFallback.line1   || "";
-    const custAddrLine2 = custAddr.street2 || addrFallback.line2   || "";
-    const custCity      = custAddr.city    || addrFallback.city    || "";
-    const custCountry   = custAddr.country || addrFallback.country || "India";
-    const custPincode   = custAddr.pincode  || addrFallback.pincode || "";
-
-    let clientDetails = {
-      companyName:    cust.legalName || cust.companyName || cust.name || '',
-      gstin:          cust.gstNumber || cust.gstin || '',
-      billingAddress: cust.registeredAddress || cust.billingAddress ||
-        buildAddressStr({ addressLine1: custAddrLine1, addressLine2: custAddrLine2, city: custCity, state: detection.customerState, country: custCountry, pincode: custPincode }),
-      addressLine1:   custAddrLine1,
-      addressLine2:   custAddrLine2,
-      city:           custCity,
-      country:        custCountry,
-      pincode:        custPincode,
-      contactPerson:  cust.contacts?.primaryContact || cust.contacts?.keyContacts?.[0]?.name || '',
-      email:          cust.contacts?.officialEmail || cust.email || '',
-      state:          detection.customerState,
-    };
-
-    console.log('[Invoice generate] clientDetails built:', JSON.stringify(clientDetails));
-
-    const issuerDetails = {
-      companyName:  companySettings.companyName || process.env.COMPANY_NAME,
-      gstin:        companySettings.gstin       || process.env.COMPANY_GSTIN,
-      address:      companySettings.address     || process.env.COMPANY_ADDRESS,
-      addressLine1: (companySettings as any).addressLine1 || "",
-      addressLine2: (companySettings as any).addressLine2 || "",
-      city:         (companySettings as any).city         || "",
-      country:      (companySettings as any).country      || "India",
-      pincode:      (companySettings as any).pincode       || "",
-      email:        companySettings.email       || process.env.COMPANY_EMAIL,
-      phone:        companySettings.phone       || process.env.COMPANY_PHONE,
-      website:      companySettings.website     || process.env.COMPANY_WEBSITE,
-      state:        issuerState,
-    };
-
-    const clientState = detection.customerState;
-
-    // Build line items. SEPARATE: per booking 1 line (ON_FULL) or 2 lines —
-    // COST + SERVICE_FEE (ON_MARKUP). COMBINED: one COST + Transaction Fees line
-    // per category, summed from the same per-booking lines (totals reconcile).
-    const invoiceLineItems: any[] = [];
-    if (invoiceFormat === "COMBINED") {
-      invoiceLineItems.push(...buildCombinedLineItems(bookings as any[]));
-    } else {
-      for (const b of bookings as any[]) {
-        invoiceLineItems.push(...buildLineItemsForBooking(b));
-      }
-    }
-
-    // Per-row Amount now = Rate × Qty + GST (customer-payable line total),
-    // so Σ amount across all rows equals grandTotal. Subtotal is back-extracted
-    // as (Σ amount − Σ GST). pricing-based grandTotal below remains the source
-    // of truth and serves as a defensive cross-check.
-    const totalAmount = invoiceLineItems.reduce((s, li) => s + (li.amount ?? 0), 0);
-    const totalGST   = invoiceLineItems.reduce((s, li) => s + (li.igst ?? 0), 0);
-    const subtotal   = parseFloat((totalAmount - totalGST).toFixed(2));
-    let grandTotal = 0;
-    for (const b of bookings as any[]) {
-      const gstMode = b.pricing?.gstMode || "ON_MARKUP";
-      if (gstMode === "ON_MARKUP") {
-        grandTotal += b.pricing?.quotedPrice ?? 0;
-      } else {
-        grandTotal += b.pricing?.grandTotal ?? ((b.pricing?.quotedPrice ?? 0) + (b.pricing?.gstAmount ?? 0));
-      }
-    }
-    grandTotal = parseFloat(grandTotal.toFixed(2));
-
-    // Sanity: Σ amount should equal pricing.grandTotal under the new contract.
-    const reconciledFromAmounts = parseFloat(totalAmount.toFixed(2));
-    if (Math.abs(reconciledFromAmounts - grandTotal) > 1) {
-      const bookingRefs = (bookings as any[]).map((b: any) => b.bookingRef).join(",");
-      console.warn(
-        `[invoice ${bookingRefs}] reconciliation drift: ` +
-        `Σ amount=${reconciledFromAmounts} vs pricing.grandTotal=${grandTotal}`
-      );
-    }
-
-    const rawTotalGST = parseFloat(totalGST.toFixed(2));
-    const gstAmounts = calculateGSTAmounts(rawTotalGST, resolvedGstType);
-
-    // DEBUG: confirm invoiceLineItems is still a plain array of objects here
-    console.log('lineItems type:', typeof invoiceLineItems, 'isArray:', Array.isArray(invoiceLineItems));
-    console.log('lineItems[0] type:', invoiceLineItems[0] ? typeof invoiceLineItems[0] : 'empty');
-    console.log('lineItems sample:', JSON.stringify(invoiceLineItems[0]));
-
-    const invoice = await Invoice.create({
-      workspaceId: invoiceWorkspaceId,
+    const created = await createInvoiceFromBookings(bookingIds, {
+      format: "COMBINED",
+      lineItemStyle,
       billingPeriod,
-      bookingIds: bookings.map((b: any) => b._id),
-      subtotal: parseFloat(subtotal.toFixed(2)),
-      totalGST: rawTotalGST,
-      grandTotal,
-      supplyType: resolvedGstType,
-      cgstAmount: gstAmounts.cgst,
-      sgstAmount: gstAmounts.sgst,
-      utgstAmount: gstAmounts.utgst,
-      igstAmount: gstAmounts.igst,
-      gstTypeAutoDetected: detection.gstType,
-      gstTypeOverridden: useOverride ? true : false,
-      gstOverrideReason: useOverride ? gstOverrideReason : undefined,
-      gstOverrideBy: useOverride ? req.user._id : undefined,
-      gstBypass,
-      gstBypassType: gstBypass ? (resolution.gstType as "CGST_SGST" | "CGST_UTGST") : null,
-      gstBypassReason: gstBypass ? gstBypassReason : "",
-      placeOfSupply: detection.placeOfSupply,
-      issuerState,
-      clientState,
-      issuerDetails,
-      clientDetails,
-      terms,
-      notes,
-      showInclusiveTaxNote: showInclusiveTaxNote === true,
       invoiceDate: resolvedInvoiceDate,
       dueDate: dueDate ? new Date(dueDate) : undefined,
+      notes,
+      terms,
+      showInclusiveTaxNote,
+      gstTypeOverride,
+      gstOverrideReason,
+      gstBypass,
+      gstBypassReason,
+      sellerGstin: sellerGstin || undefined,
       createdBy: req.user._id,
+      isDemoUser: req.user?.isDemoUser === true,
+      workspaceScope: req.workspaceObjectId ?? null,
     });
 
-    console.log('[After rename] invoiceLineItems type:', typeof invoiceLineItems);
-    console.log('[After rename] isArray:', Array.isArray(invoiceLineItems));
-
-    await Invoice.collection.updateOne(
-      { _id: invoice._id },
-      { $set: { lineItems: invoiceLineItems } },
-    );
-
-    const completeInvoice = await Invoice.collection.findOne({ _id: invoice._id });
-
-    // Mark bookings as INVOICED and record invoice raised date
-    const now = new Date();
-    await ManualBooking.updateMany(
-      { _id: { $in: bookings.map((b: any) => b._id) } },
-      { $set: { status: "INVOICED", invoiceId: invoice._id, invoiceRaisedDate: now } },
-    );
-
-    // Task automation hook
-    triggerTaskAutomation("invoice.created", {
-      workspaceId: String(invoiceWorkspaceId),
-      entityType: "INVOICE",
-      entityId: invoice._id,
-      entityRef: invoice.invoiceNo,
-      ownerId: req.user._id,
-      variables: {
-        invoiceNo: invoice.invoiceNo,
-        customerName: clientDetails.companyName || "",
-      },
-    }).catch(() => {});
-
-    res.status(201).json({ ok: true, invoice: completeInvoice });
+    res.status(201).json({ ok: true, invoice: created[0] });
   } catch (err: any) {
+    if (err instanceof InvoiceGenerationError) {
+      return res.status(err.httpStatus).json(err.body);
+    }
     console.error("[Invoices generate]", err.message);
     res.status(500).json({ error: err.message });
   }
@@ -698,12 +397,18 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       invoiceDate,
       dueDate,
       notes,
+      gstTypeOverride,
+      gstOverrideReason,
+      sellerGstin,
     } = req.body as {
       bookingIds: string[];
       invoiceDate?: string;
       dueDate?: string;
       notes?: string;
       gstApplied?: boolean;
+      gstTypeOverride?: GSTType;
+      gstOverrideReason?: string;
+      sellerGstin?: string;
     };
 
     if (!Array.isArray(bookingIds) || !bookingIds.length) {
@@ -733,190 +438,67 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       year: "numeric",
     });
 
-    // Fetch all bookings upfront and validate same workspace.
-    // Demo Platform: demo admins invoice only demo bookings; real admins protected.
-    const demoClauseBulk = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
-    const allBookings = await ManualBooking.find({
-      _id: { $in: bookingIds.map((id) => new mongoose.Types.ObjectId(id)) },
-      ...demoClauseBulk,
-    }).lean();
+    const isDemoUser = req.user?.isDemoUser === true;
 
-    if (allBookings.length !== bookingIds.length) {
-      return res.status(400).json({ error: "One or more booking IDs not found" });
-    }
-
-    const wsIds = [...new Set(allBookings.map((b: any) => b.workspaceId.toString()))];
-    if (wsIds.length > 1) {
-      return res.status(400).json({ error: "All bookings must belong to the same workspace" });
-    }
-
-    const wsId = wsIds[0];
-
-    // Resolve billing details once for the whole batch
-    const customer = await Customer.findById(wsId).lean() as any;
-    const resolvedWorkspace = await CustomerWorkspace.findOne({ customerId: wsId }).lean();
-    const invoiceWorkspaceId = resolvedWorkspace?._id ?? wsId;
-
-    const companySettings = await getCompanySettings();
-    const issuerState = companySettings.supplierState || companySettings.state || process.env.COMPANY_STATE || "Karnataka";
-
-    const cust = (customer || {}) as any;
-    const { state: customerStateRaw, country: customerCountry } = resolveCustomerState(cust);
-
-    const resolution = resolveGstWithBypass({
+    // SEPARATE → one invoice per booking. The service skips ineligible bookings
+    // (already invoiced / cancelled) and returns the created invoices.
+    const created = await createInvoiceFromBookings(bookingIds, {
+      format: "SEPARATE",
+      billingPeriod,
+      invoiceDate: resolvedInvoiceDate,
+      dueDate: resolvedDueDate,
+      notes: notes || undefined,
+      gstTypeOverride,
+      gstOverrideReason,
       gstBypass,
       gstBypassReason,
-      supplierState: issuerState,
-      customerState: customerStateRaw,
-      customerCountry,
+      sellerGstin: sellerGstin || undefined,
+      createdBy: req.user._id,
+      isDemoUser,
+      workspaceScope: req.workspaceObjectId ?? null,
     });
-    if (!resolution.ok) {
-      return res.status(400).json({
-        error: "GST_DETECTION_FAILED",
-        message: resolution.reason,
-        customerId: cust._id,
-        missingField: resolution.missingField,
-        hint: "Update customer profile with state before generating invoice",
+
+    const generated = created.map((inv: any) => ({
+      bookingId: String(inv.bookingIds?.[0]),
+      invoiceId: String(inv._id),
+      invoiceNo: inv.invoiceNo,
+    }));
+
+    // Derive the per-booking failure breakdown (preserving the existing response
+    // shape) from the bookings that did NOT produce an invoice.
+    const generatedBookingIds = new Set(
+      created.flatMap((inv: any) => (inv.bookingIds || []).map((id: any) => String(id))),
+    );
+    const remainingIds = bookingIds.filter((id) => !generatedBookingIds.has(String(id)));
+
+    let failed: { bookingId: string; bookingRef: string; error: string }[] = [];
+    if (remainingIds.length) {
+      const demoClause = isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
+      const skipped = await ManualBooking.find({
+        _id: { $in: remainingIds.map((id) => new mongoose.Types.ObjectId(id)) },
+        ...demoClause,
+      }).select("_id bookingRef status invoiceId").lean();
+      const byId = new Map(skipped.map((b: any) => [String(b._id), b]));
+      failed = remainingIds.map((id) => {
+        const b: any = byId.get(String(id));
+        const error = !b
+          ? "Booking not found"
+          : b.invoiceId
+          ? "Already invoiced"
+          : b.status === "INVOICED"
+          ? "Status is already INVOICED"
+          : b.status === "CANCELLED"
+          ? "Booking is CANCELLED"
+          : "Generation skipped";
+        return { bookingId: String(id), bookingRef: b?.bookingRef ?? "", error };
       });
-    }
-    const detection = resolution.detection;
-
-    const resolvedGstType: GSTType = resolution.gstType;
-    const clientState = detection.customerState;
-
-    const bulkAddrLine1 = (cust.address as any)?.street  || "";
-    const bulkAddrLine2 = (cust.address as any)?.street2 || "";
-    const bulkCity      = (cust.address as any)?.city    || "";
-    const bulkCountry   = (cust.address as any)?.country || "India";
-    const bulkPincode   = (cust.address as any)?.pincode  || "";
-
-    const clientDetails = {
-      companyName:    cust.legalName || cust.companyName || cust.name || "",
-      gstin:          cust.gstNumber || cust.gstin || "",
-      billingAddress: cust.registeredAddress || cust.billingAddress ||
-        buildAddressStr({ addressLine1: bulkAddrLine1, addressLine2: bulkAddrLine2, city: bulkCity, state: clientState, country: bulkCountry, pincode: bulkPincode }),
-      addressLine1:   bulkAddrLine1,
-      addressLine2:   bulkAddrLine2,
-      city:           bulkCity,
-      country:        bulkCountry,
-      pincode:        bulkPincode,
-      contactPerson:  cust.contacts?.primaryContact || cust.contacts?.keyContacts?.[0]?.name || "",
-      email:          cust.contacts?.officialEmail || cust.email || "",
-      state:          clientState,
-    };
-
-    const issuerDetails = {
-      companyName:  companySettings.companyName || process.env.COMPANY_NAME,
-      gstin:        companySettings.gstin       || process.env.COMPANY_GSTIN,
-      address:      companySettings.address     || process.env.COMPANY_ADDRESS,
-      addressLine1: (companySettings as any).addressLine1 || "",
-      addressLine2: (companySettings as any).addressLine2 || "",
-      city:         (companySettings as any).city         || "",
-      country:      (companySettings as any).country      || "India",
-      pincode:      (companySettings as any).pincode       || "",
-      email:        companySettings.email       || process.env.COMPANY_EMAIL,
-      phone:        companySettings.phone       || process.env.COMPANY_PHONE,
-      website:      companySettings.website     || process.env.COMPANY_WEBSITE,
-      state:        issuerState,
-    };
-
-    const generated: { bookingId: string; invoiceId: string; invoiceNo: string }[] = [];
-    const failed: { bookingId: string; bookingRef: string; error: string }[] = [];
-
-    // Process bookings SEQUENTIALLY to maintain invoice number order
-    for (const booking of allBookings as any[]) {
-      const bookingId = booking._id.toString();
-
-      // Per-booking validation
-      if (booking.invoiceId) {
-        failed.push({ bookingId, bookingRef: booking.bookingRef, error: "Already invoiced" });
-        continue;
-      }
-      if (booking.status === "INVOICED") {
-        failed.push({ bookingId, bookingRef: booking.bookingRef, error: "Status is already INVOICED" });
-        continue;
-      }
-      if (booking.status === "CANCELLED") {
-        failed.push({ bookingId, bookingRef: booking.bookingRef, error: "Booking is CANCELLED" });
-        continue;
-      }
-
-      try {
-        const lineItems = buildLineItemsForBooking(booking);
-
-        const subtotal = lineItems.reduce((s: number, li: any) => s + (li.amount ?? 0), 0);
-        const rawTotalGST = parseFloat(lineItems.reduce((s: number, li: any) => s + (li.igst ?? 0), 0).toFixed(2));
-        const gstAmounts = calculateGSTAmounts(rawTotalGST, resolvedGstType);
-
-        const gstMode = booking.pricing?.gstMode || "ON_MARKUP";
-        const grandTotal = parseFloat(
-          (gstMode === "ON_MARKUP"
-            ? (booking.pricing?.quotedPrice ?? 0)
-            : (booking.pricing?.grandTotal ?? ((booking.pricing?.quotedPrice ?? 0) + (booking.pricing?.gstAmount ?? 0)))
-          ).toFixed(2),
-        );
-
-        const invoice = await Invoice.create({
-          workspaceId: invoiceWorkspaceId,
-          billingPeriod,
-          bookingIds: [booking._id],
-          subtotal: parseFloat(subtotal.toFixed(2)),
-          totalGST: rawTotalGST,
-          grandTotal,
-          supplyType: resolvedGstType,
-          cgstAmount: gstAmounts.cgst,
-          sgstAmount: gstAmounts.sgst,
-          utgstAmount: gstAmounts.utgst,
-          igstAmount: gstAmounts.igst,
-          gstTypeAutoDetected: detection.gstType,
-          gstTypeOverridden: false,
-          gstBypass,
-          gstBypassType: gstBypass ? (resolution.gstType as "CGST_SGST" | "CGST_UTGST") : null,
-          gstBypassReason: gstBypass ? gstBypassReason : "",
-          placeOfSupply: detection.placeOfSupply,
-          issuerState,
-          clientState,
-          issuerDetails,
-          clientDetails,
-          notes: notes || undefined,
-          invoiceDate: resolvedInvoiceDate,
-          dueDate: resolvedDueDate,
-          createdBy: req.user._id,
-        });
-
-        // Store lineItems bypassing mongoose validation (same pattern as /generate)
-        await Invoice.collection.updateOne(
-          { _id: invoice._id },
-          { $set: { lineItems } },
-        );
-
-        await ManualBooking.updateOne(
-          { _id: booking._id },
-          { $set: { status: "INVOICED", invoiceId: invoice._id, invoiceRaisedDate: new Date() } },
-        );
-
-        // Task automation hook per invoice
-        triggerTaskAutomation("invoice.created", {
-          workspaceId: String(invoiceWorkspaceId),
-          entityType: "INVOICE",
-          entityId: invoice._id,
-          entityRef: invoice.invoiceNo,
-          ownerId: req.user._id,
-          variables: {
-            invoiceNo: invoice.invoiceNo,
-            customerName: clientDetails.companyName || "",
-          },
-        }).catch(() => {});
-
-        generated.push({ bookingId, invoiceId: invoice._id.toString(), invoiceNo: invoice.invoiceNo });
-      } catch (err: any) {
-        console.error(`[Invoices bulk-generate] booking ${booking.bookingRef}:`, err.message);
-        failed.push({ bookingId, bookingRef: booking.bookingRef, error: err.message });
-      }
     }
 
     res.status(201).json({ ok: true, generated, failed });
   } catch (err: any) {
+    if (err instanceof InvoiceGenerationError) {
+      return res.status(err.httpStatus).json(err.body);
+    }
     console.error("[Invoices bulk-generate]", err.message);
     res.status(500).json({ error: err.message });
   }
