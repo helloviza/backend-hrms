@@ -821,6 +821,24 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
       if (!mergedLocked.dates && isoDate) {
         mergedLocked.dates = { start: isoDate, ...(isoReturnDate ? { end: isoReturnDate } : {}), source: "user" };
       }
+
+      // ── Step 4 — DURATION CONSISTENCY. When the stated dates span a different
+      // number of days than a locked duration word, the DATES win (they are more
+      // authoritative): update locked.duration to the span and flag it in one
+      // sentence so the itinerary skeleton is regenerated for the new span on the
+      // next planning turn.
+      let durationFlagNote = "";
+      if (isoDate && isoReturnDate) {
+        const spanDays = Math.round((Date.parse(isoReturnDate) - Date.parse(isoDate)) / 86400000) + 1;
+        const lockedDays = priorLocked?.duration?.days;
+        if (spanDays > 0 && lockedDays && lockedDays !== spanDays) {
+          durationFlagNote = ` Note: ${travelDate} to ${returnDateRaw} spans ${spanDays} days, which differs from your original ${lockedDays}-day plan — I've updated the plan to ${spanDays} days (your dates take priority).`;
+          mergedLocked.duration = { days: spanDays, source: "dates" };
+        } else if (spanDays > 0 && !lockedDays) {
+          mergedLocked.duration = { days: spanDays, source: "dates" };
+        }
+      }
+
       const lockedReturnContext = { ...(context && typeof context === "object" ? context : {}), id: conversationId, locked: mergedLocked };
       void saveConversationContext({
         workspaceObjectId: (req as any).workspaceObjectId,
@@ -1012,7 +1030,7 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
               ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + cabinNote + cheapestNote + roundTripNote + routeInsightsNote + weatherNote
               : !isoDate
                 ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
-                : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`) + hotelNote,
+                : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`) + durationFlagNote + hotelNote,
           flightSearch: {
             origin:      { city: origin,      iata: originIATA },
             destination: { city: destination, iata: destIATA   },
