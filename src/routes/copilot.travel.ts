@@ -35,6 +35,7 @@ import {
   releaseHandoffDelivery,
 } from "../utils/plutoMemory.js";
 import { invokePlutoGemini, GEMINI_FALLBACK_INVALID } from "../utils/plutoGeminiInvoke.js";
+import { parseBudget, describeBudget } from "../utils/plutoBudget.js";
 import {
   PLUTO_AI_SYSTEM_PROMPT as PLUTO_SYSTEM_PROMPT,
 } from "../prompts/plutoSystemPrompt.js";
@@ -115,6 +116,7 @@ import {
   handoffDelivered,
   handoffFailed,
   replyThinAccepted,
+  replyReaskedLocked,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 
@@ -1280,6 +1282,13 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
         else if (/\bholiday\b|\bleisure\b|\bvacation\b|\bhoneymoon\b|\bgetaway\b|\banniversary\b/i.test(prompt)) L.tripType = "holiday";
         else if (/\boffsite\b|\bretreat\b|\bmice\b|\bteam\s+trip\b/i.test(prompt)) L.tripType = "mice";
       }
+
+      // Budget — "under USD 200", "beyond USD 500", "between ₹5k and ₹8k",
+      // "under 15k", "around $300", + relative "cheaper"/"more premium". Unlike
+      // the facts above this UPDATES on restatement (and relative terms adjust
+      // off the current budget), so it is NOT set-if-absent.
+      const parsedBudget = parseBudget(prompt, L.budget);
+      if (parsedBudget) L.budget = parsedBudget;
     }
 
     /* ───────── VIDEO RELEVANCE GATE (ABSOLUTE TRUTH) ───────── */
@@ -1430,10 +1439,14 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
       : "";
 
     /* ───────── Hotel-only refinement ───────── */
+    // A prior HOTEL shortlist (lastReply.hotels[]) counts as much as an
+    // itinerary[] — otherwise a hotel→hotel follow-up (e.g. "show me hotels
+    // beyond USD 500") drops out of this guarded branch into the generic path
+    // and the model reverts to re-asking locked facts.
     const isHotelOnlyFollowup =
       /hotel|stay|accommodation/i.test(prompt) &&
       typeof lastReply === "object" &&
-      Array.isArray(lastReply?.itinerary);
+      (Array.isArray(lastReply?.itinerary) || Array.isArray(lastReply?.hotels));
 
     const lockedContext =
       Object.keys(conversationContext.locked).length > 0
@@ -1565,6 +1578,27 @@ Confidence: ${conversationContext.assumed.destination.confidence}\n`
       ? `\nPLAN_READINESS: destination and duration are KNOWN — you MUST include a draft day-by-day "itinerary" skeleton (clearly marked as a draft to refine) and a "context" of at least 2-3 substantive sentences. Do not merely echo the destination.\n`
       : "";
 
+    // Budget steer — respect the locked budget in hotel suggestions, and (since
+    // this is an INR platform) state the conversion basis when the budget is USD.
+    const lockedBudget = conversationContext.locked?.budget;
+    const budgetGuidanceString = lockedBudget
+      ? `\nBUDGET: the user's hotel budget is ${describeBudget(lockedBudget)} (also in LOCKED DECISIONS). Keep hotel suggestions' approxPrice within this range. ${lockedBudget.currency === "USD" ? "The budget is in USD on this INR platform — state the indicative INR conversion you used (or present both USD and INR)." : ""}\n`
+      : "";
+
+    // Locked facts are ground truth — bound to EVERY turn that already has a
+    // destination (fork b), not just hotel turns. A reply re-asking any locked
+    // fact is invalid. Fresh gather-phase turns (no locked destination) get an
+    // empty string, so the gather / spillproof behaviour is unchanged.
+    const lockedGroundTruthList = [
+      hasLockedDestination && "destination",
+      hasLockedDates && "travel dates",
+      hasLockedOrigin && "origin city",
+      hasLockedDuration && "trip duration",
+    ].filter(Boolean);
+    const lockedGroundTruthString = hasLockedDestination
+      ? `\nLOCKED FACTS ARE GROUND TRUTH: the ${lockedGroundTruthList.join(", ")} in LOCKED DECISIONS are CONFIRMED. A reply that asks the user for ANY of these is INVALID — never re-ask them; use them directly to answer the request.\n`
+      : "";
+
     /* ───────── Detect if last reply was a flight search (suppress redundant follow-ups) ───────── */
     const lastReplyWasFlightSearch = lastReply && typeof lastReply === "object" && Boolean(lastReply.flightSearch);
 
@@ -1585,6 +1619,8 @@ Your nextSteps should ONLY be about completing the trip plan (itinerary refineme
       `CURRENT CONVERSATION STATE: ${conversationContext.state}\n` +
       `${flightSearchSuppression}\n` +
       `${planReadinessString}\n` +
+      `${budgetGuidanceString}\n` +
+      `${lockedGroundTruthString}\n` +
       `${missingFieldsString}\n` +
       `${lockedContext}\n` +
       `${assumedContext}\n` +
@@ -1625,11 +1661,25 @@ ${prompt}
     /* ───────── Invoke AI (OpenAI with Gemini Fallback) ───────── */
     let deltaReply: PlutoDeltaReply;
 
-    // Step 3 — substance enforcement: only when the trip is already plannable
-    // (destination + duration known). A thin reply then earns ONE corrective
-    // retry inside invokePluto; if still thin it is ACCEPTED (never an error)
-    // and this metric fires so we can tune the prompt.
-    const substanceOpts = {
+    // Locked facts (with values) the reply must not re-ask (v2 enforcement).
+    // Only populated fields are passed, so the invoke loop only guards facts
+    // that are actually locked.
+    const L = conversationContext.locked || {};
+    const lockedFacts = {
+      ...(L.destination?.name ? { destination: L.destination.name } : {}),
+      ...(L.dates?.start
+        ? { dates: L.dates.end ? `${L.dates.start} to ${L.dates.end}` : L.dates.start }
+        : {}),
+      ...(L.origin?.city ? { origin: L.origin.city } : {}),
+      ...(L.duration?.days ? { duration: `${L.duration.days} days` } : {}),
+    };
+    const hasLockedFacts = Object.keys(lockedFacts).length > 0;
+
+    // Step 3 — substance enforcement (only when the trip is already plannable) +
+    // v2 locked-fact enforcement (only when facts are locked). A thin OR
+    // reask-locked reply earns ONE corrective retry inside invoke*; if it still
+    // fails it is ACCEPTED (never an error) and the matching metric fires.
+    const invokeOpts = {
       requireSubstance: canPlan,
       onThinAccepted: () => {
         void emitMetric(
@@ -1641,10 +1691,21 @@ ${prompt}
           })
         );
       },
+      lockedFacts: hasLockedFacts ? lockedFacts : null,
+      onReaskedLockedAccepted: () => {
+        void emitMetric(
+          replyReaskedLocked({
+            workspaceId,
+            requestId,
+            conversationId: conversationContext.id,
+            reason: "post_retry",
+          })
+        );
+      },
     };
 
     try {
-      deltaReply = await invokePluto(effectivePrompt, substanceOpts);
+      deltaReply = await invokePluto(effectivePrompt, invokeOpts);
     } catch (openaiErr: any) {
       await emitMetric(
         aiFallback({
@@ -1656,7 +1717,7 @@ ${prompt}
       );
       console.warn("[Pluto] OpenAI failed, switching to Gemini backup", { requestId });
       try {
-        deltaReply = await invokePlutoGemini(effectivePrompt, substanceOpts);
+        deltaReply = await invokePlutoGemini(effectivePrompt, invokeOpts);
       } catch (geminiErr: any) {
         // Distinguish a schema-invalid fallback (after its own retry) from a
         // transport/parse failure, so the metric is actionable.
@@ -2144,6 +2205,22 @@ router.get("/itinerary/:id", requireWorkspace, async (req: any, res: any) => {
     // A malformed ObjectId is a not-found from the caller's perspective.
     return res.status(404).json({ error: "Itinerary not found" });
   }
+});
+
+// ───────── Rehydrate a conversation's durable context (v2 — refresh/resume) ─────────
+// Returns the workspace-scoped PlutoConversation context bag (incl. locked facts)
+// so the frontend can restore state after a refresh or a sidebar-session click.
+// getConversationContext returns null for a genuine miss, a TTL-expired doc, a
+// wrong-workspace id, or a malformed id — all indistinguishable → a plain 404,
+// which the client treats as "start a clean conversation".
+router.get("/conversation/:id", requireWorkspace, async (req: any, res: any) => {
+  const context = await getConversationContext({
+    workspaceObjectId: (req as any).workspaceObjectId,
+    userId: (req as any).user?._id,
+    conversationId: req.params.id,
+  });
+  if (!context) return res.status(404).json({ ok: false, error: "Conversation not found" });
+  return res.status(200).json({ ok: true, context });
 });
 
 export default router;
