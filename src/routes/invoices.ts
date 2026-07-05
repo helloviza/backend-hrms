@@ -201,12 +201,20 @@ router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ
     if (!customerId) return res.status(400).json({ error: "customerId is required" });
 
     const [customer, companySettings] = await Promise.all([
+      // Workspace-scoped by design (tenant isolation — see
+      // infra/audit/admin-bookings-invoices-audit.md). NOT broadened here:
+      // HOUSE-scoped manual-booking customers can legitimately miss this
+      // filter for some staff callers, and that's handled below by degrading
+      // gracefully rather than changing the filter.
       Customer.findOne({ _id: customerId, workspaceId: req.workspaceObjectId }).lean(),
       getCompanySettings(),
     ]);
 
-    if (!customer) return res.status(404).json({ error: "Customer not found" });
-
+    // Seller-side resolution + activeGstProfiles derive ONLY from
+    // CompanySettings, never from the customer — so they're computed (and
+    // returned) unconditionally, whether or not the customer lookup above
+    // found anything. Only the customer-dependent fields (place of supply,
+    // GST-type detection) degrade to null on a miss.
     let sellerProfile;
     try {
       sellerProfile = resolveSellerGstProfile({
@@ -221,18 +229,37 @@ router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ
       throw err;
     }
 
+    const activeGstProfiles = ((companySettings.gstProfiles || []) as any[])
+      .filter((p) => p.active)
+      .map((p) => ({ gstin: p.gstin, state: p.state, stateCode: p.stateCode, legalName: p.legalName, isDefault: p.isDefault }));
+
     const supplierState = sellerProfile.state;
+
+    if (!customer) {
+      return res.json({
+        ok: true,
+        customerFound: false,
+        supplierState,
+        supplierGstin: sellerProfile.gstin,
+        supplierStateCode: sellerProfile.stateCode,
+        activeGstProfiles,
+        customerState: null,
+        placeOfSupply: null,
+        detectedGstType: null,
+        customerStateCode: null,
+        canCalculate: false,
+        reason: "Customer not found in this workspace scope",
+      });
+    }
+
     const { state: customerStateAuto, country: customerCountry } = resolveCustomerState(customer);
     const customerState = (customerStateOverride && customerStateOverride.trim()) || customerStateAuto;
 
     const detection = detectGSTType({ supplierState, customerState, customerCountry });
 
-    const activeGstProfiles = ((companySettings.gstProfiles || []) as any[])
-      .filter((p) => p.active)
-      .map((p) => ({ gstin: p.gstin, state: p.state, stateCode: p.stateCode, legalName: p.legalName, isDefault: p.isDefault }));
-
     res.json({
       ok: true,
+      customerFound: true,
       supplierState,
       supplierGstin: sellerProfile.gstin,
       customerState: detection.customerState,
