@@ -208,15 +208,15 @@ function buildInvoiceContext(
   const effectiveCountry = customerCountry || addrFallback.country || "India";
 
   // Multi-GST: resolve which of Peachmint's registrations this invoice is
-  // issued under. override → customer default (later step) → global default
-  // → flat-field synthesis. The chosen profile's state feeds detectGSTType
+  // issued under. override → customer default → global default →
+  // flat-field synthesis. The chosen profile's state feeds detectGSTType
   // below in place of the flat supplierState — detectGSTType itself is
   // untouched.
   let sellerProfile;
   try {
     sellerProfile = resolveSellerGstProfile({
       overrideGstin: opts.sellerGstin,
-      customerDefaultGstin: undefined, // step 4: per-customer default GSTIN
+      customerDefaultGstin: cust.defaultSellerGstin,
       companySettings,
     });
   } catch (err) {
