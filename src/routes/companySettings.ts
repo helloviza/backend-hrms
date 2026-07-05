@@ -5,7 +5,7 @@ import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import { requirePermission } from "../middleware/requirePermission.js";
-import CompanySettings, { getCompanySettings } from "../models/CompanySettings.js";
+import CompanySettings, { getCompanySettings, validateGstProfiles } from "../models/CompanySettings.js";
 import Counter from "../models/Counter.js";
 import { invalidateCompanySettingsCache } from "../utils/companySettings.js";
 import { s3 } from "../config/aws.js";
@@ -33,6 +33,28 @@ router.get("/", requirePermission("companySettings", "READ"), async (_req: any, 
 router.put("/", requirePermission("companySettings", "WRITE"), async (req: any, res: any) => {
   try {
     const { _id, __v, createdAt, updatedAt, ...body } = req.body;
+
+    if (body.gstProfiles !== undefined) {
+      const validationError = validateGstProfiles(body.gstProfiles);
+      if (validationError) {
+        return res.status(400).json({ error: validationError });
+      }
+
+      // Mirror the default profile into the flat fields so every existing
+      // reader (invoice generation, PDF, credit notes) keeps working
+      // unchanged — those callers only ever read the flat fields, never
+      // gstProfiles, in this step.
+      const defaultProfile = (body.gstProfiles as any[]).find((p) => p.isDefault);
+      if (defaultProfile) {
+        body.gstin = defaultProfile.gstin;
+        body.supplierState = defaultProfile.state;
+        body.supplierStateCode = defaultProfile.stateCode;
+        body.addressLine1 = defaultProfile.addressLine1 || "";
+        body.addressLine2 = defaultProfile.addressLine2 || "";
+        body.city = defaultProfile.city || "";
+        body.pincode = defaultProfile.pincode || "";
+      }
+    }
 
     const settings = await CompanySettings.findOneAndUpdate(
       {},
