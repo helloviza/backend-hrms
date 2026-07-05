@@ -268,6 +268,16 @@ const CustomerSchema = new Schema(
     gstRegisteredStateCode: { type: String, trim: true },
 
     /* ============================================================
+       MULTI-GST: PER-CLIENT DEFAULT SELLER REGISTRATION
+       ============================================================ */
+    // Which of Peachmint's company gstProfiles bills this client, absent a
+    // per-invoice override. Undefined = use the global isDefault profile.
+    // Validated against ACTIVE company profiles at save time (routes/customers.ts);
+    // intentionally NOT re-validated here if a profile is later deactivated —
+    // resolveSellerGstProfile falls through safely for that case.
+    defaultSellerGstin: { type: String, trim: true },
+
+    /* ============================================================
        TAX
        ============================================================ */
     taxable: { type: Boolean },

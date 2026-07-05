@@ -11,6 +11,7 @@ import User from "../models/User.js";
 import Employee from "../models/Employee.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { validateObjectId } from "../middleware/validateObjectId.js";
+import { getCompanySettings } from "../models/CompanySettings.js";
 
 const router = Router();
 
@@ -289,6 +290,27 @@ router.patch(
     try {
       const { id } = req.params;
       const wsId = String(req.workspaceObjectId);
+
+      // Multi-GST: defaultSellerGstin, if provided, must match an ACTIVE
+      // company gstProfile. Empty/absent is valid (means global default).
+      // Not re-validated against later deactivation — resolveSellerGstProfile
+      // falls through safely for a stale value.
+      if (typeof req.body.defaultSellerGstin === "string" && req.body.defaultSellerGstin.trim() !== "") {
+        const gstin = req.body.defaultSellerGstin.trim().toUpperCase();
+        const companySettings = await getCompanySettings();
+        const activeGstins = new Set(
+          ((companySettings.gstProfiles || []) as any[])
+            .filter((p) => p.active)
+            .map((p) => String(p.gstin).toUpperCase()),
+        );
+        if (!activeGstins.has(gstin)) {
+          return res.status(400).json({
+            error: "DEFAULT_SELLER_GSTIN_NOT_FOUND",
+            message: `defaultSellerGstin "${req.body.defaultSellerGstin}" does not match any active company GST registration`,
+          });
+        }
+        req.body.defaultSellerGstin = gstin;
+      }
 
       const updated = await Customer.findOneAndUpdate(
         { _id: id, workspaceId: wsId },
