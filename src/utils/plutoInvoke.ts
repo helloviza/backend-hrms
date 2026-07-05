@@ -1,7 +1,12 @@
 // apps/backend/src/utils/plutoInvoke.ts
 
 import OpenAI from "openai";
-import { isValidPlutoReply, isThinReply } from "./plutoValidator.js";
+import {
+  isValidPlutoReply,
+  isThinReply,
+  isReaskedLockedReply,
+  type LockedFactsForReask,
+} from "./plutoValidator.js";
 import { PLUTO_AI_SYSTEM_PROMPT } from "../prompts/plutoSystemPrompt.js";
 import type { PlutoDeltaReply } from "../types/plutoDelta.js";
 
@@ -14,6 +19,27 @@ import type { PlutoDeltaReply } from "../types/plutoDelta.js";
 export interface PlutoInvokeOptions {
   requireSubstance?: boolean;
   onThinAccepted?: () => void;
+  // Enforcement (v2 — locked-context loss). When lockedFacts is set and a
+  // shape-valid reply re-asks one of them, the reply earns ONE corrective retry
+  // that names the known facts; if it STILL re-asks after the retry we ACCEPT
+  // (never a user-facing error) and call onReaskedLockedAccepted.
+  lockedFacts?: LockedFactsForReask | null;
+  onReaskedLockedAccepted?: () => void;
+}
+
+// Corrective instruction naming the locked facts the model wrongly re-asked.
+export function reaskRetryInstruction(f: LockedFactsForReask): string {
+  const known: string[] = [];
+  if (f.destination) known.push(`destination = ${f.destination}`);
+  if (f.dates) known.push(`travel dates = ${f.dates}`);
+  if (f.origin) known.push(`origin = ${f.origin}`);
+  if (f.duration) known.push(`trip duration = ${f.duration}`);
+  return `
+Your previous reply asked the user for information that is ALREADY KNOWN and confirmed (${known.join("; ")}).
+These are LOCKED facts — do NOT ask for any of them again. Use them directly to
+answer the user's request (e.g. suggest hotels for the known destination within
+any stated budget). Return ONLY the JSON object.
+`;
 }
 
 // Corrective instruction when a reply failed SCHEMA validation.
@@ -78,7 +104,7 @@ export async function invokePluto(
   const requireSubstance = opts.requireSubstance === true;
   let lastError: unknown = null;
   // Which corrective instruction (if any) to prepend on the 2nd attempt.
-  let corrective: "schema" | "substance" | null = null;
+  let corrective: "schema" | "substance" | "reask" | null = null;
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     const messages = [
@@ -91,6 +117,9 @@ export async function invokePluto(
     }
     if (attempt === 2 && corrective === "substance") {
       messages.push({ role: "system" as const, content: SUBSTANCE_RETRY_INSTRUCTION });
+    }
+    if (attempt === 2 && corrective === "reask" && opts.lockedFacts) {
+      messages.push({ role: "system" as const, content: reaskRetryInstruction(opts.lockedFacts) });
     }
 
     try {
@@ -133,7 +162,20 @@ export async function invokePluto(
         continue; // retry with schema instruction
       }
 
-      // Shape-valid. Enforce SUBSTANCE only when the caller asked for it.
+      // Shape-valid. Enforce: NEVER re-ask a locked fact (checked before
+      // substance — re-asking known facts is the worse failure).
+      if (opts.lockedFacts && isReaskedLockedReply(normalized, opts.lockedFacts)) {
+        if (attempt === 1) {
+          lastError = "Reasked a locked fact";
+          corrective = "reask";
+          continue; // ONE corrective retry
+        }
+        // Still re-asking after the retry → ACCEPT (never a user-facing error).
+        opts.onReaskedLockedAccepted?.();
+        return normalized;
+      }
+
+      // Enforce SUBSTANCE only when the caller asked for it.
       if (requireSubstance && isThinReply(normalized)) {
         if (attempt === 1) {
           lastError = "Thin reply";

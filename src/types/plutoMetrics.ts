@@ -34,6 +34,9 @@ export type PlutoMetricEventType =
   // Reply substance enforcement (Step 3) — a thin reply accepted after a
   // corrective retry (never fails the turn; visible so we can tune the prompt)
   | "pluto.reply.thin_accepted"
+  // Locked-fact enforcement (v2) — a reply that re-asked an already-locked fact,
+  // accepted after one corrective retry (visible so we can tune the prompt).
+  | "pluto.reply.reasked_locked"
   // Arrival concierge (Phase 4 — Arrive)
   | "pluto.arrive.session_opened"
   | "pluto.arrive.expired"
