@@ -786,7 +786,10 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
             ],
             handoff: false,
           },
-          context: context || {},
+          // Carry the stable id so this clarify turn is not an id-less context
+          // (which the sidebar can't dedup → a churned row). Every branch returns
+          // the id now.
+          context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
         });
       }
 
