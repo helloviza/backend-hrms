@@ -37,15 +37,17 @@ export const GST_STATE_CODES: Record<string, string> = {
   "Puducherry": "34",
 };
 
+// UTGST applies only to Union Territories WITHOUT their own legislature.
+// Delhi (NCT), Puducherry, and Jammu & Kashmir have legislatures and levy
+// SGST like a state, so intra-state supply there is CGST+SGST — they are
+// deliberately excluded from this set even though GST_STATE_CODES lists them
+// alongside the genuine UTGST territories.
 export const UNION_TERRITORIES = new Set([
   "Andaman and Nicobar Islands",
   "Chandigarh",
   "Dadra and Nagar Haveli and Daman and Diu",
-  "Delhi",
-  "Jammu and Kashmir",
   "Ladakh",
   "Lakshadweep",
-  "Puducherry",
 ]);
 
 export const INDIA_STATES_AND_UTS = Object.keys(GST_STATE_CODES);
