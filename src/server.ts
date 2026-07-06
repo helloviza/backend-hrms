@@ -599,8 +599,6 @@ import reportsRouter from "./routes/reports.js";
 import companySettingsRouter from "./routes/companySettings.js";
 // Billing Permissions (Super Admin grant/revoke + my-access for all users)
 import billingPermissionsRouter from "./routes/billingPermissions.js";
-// Per-client auto-invoice billing profiles (Client Scheduler admin page)
-import billingProfilesRouter from "./routes/billingProfiles.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Travel-specific admin features:
@@ -617,8 +615,6 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/admin/reports", reportsRouter);
   app.use("/api/admin/company-settings", companySettingsRouter);
   app.use("/api/billing-permissions", billingPermissionsRouter);
-  // Staff-only (requireAuth + isStaffPrivileged applied inside the router).
-  app.use("/api/admin/billing-profiles", billingProfilesRouter);
 }
 
 // Unified Permissions (UserPermission model — replaces BillingPermission long-term)
