@@ -545,6 +545,12 @@ app.use("/api/dashboard", dashboardRouter);
 app.use("/api/hr/policies", hrPoliciesRouter);
 app.use("/api/hr", hrOrgChartRouter);
 
+// Admin — Demo Platform (impersonation endpoints, audit log) — mounted before
+// broad /api/admin routers so that adminAnalyticsRouter's router.use(requireAdmin)
+// does not intercept these paths before admin.demo's own demoAccess-based gate.
+import adminDemoRouter from "./routes/admin.demo.js";
+app.use("/api/admin/demo", adminDemoRouter);
+
 // Manual Bookings — mounted before broad /api/admin routers so that
 // adminAnalyticsRouter's router.use(requireAdmin) does not intercept
 // these paths before manualBookingsRouter (which uses billing-access
@@ -581,10 +587,6 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
 // Admin — Session logs (Winston logging + session tracking)
 import adminSessionsRouter from "./routes/admin.sessions.js";
 app.use("/api/admin/sessions", adminSessionsRouter);
-
-// Admin — Demo Platform (impersonation endpoints, audit log)
-import adminDemoRouter from "./routes/admin.demo.js";
-app.use("/api/admin/demo", adminDemoRouter);
 
 // Ticketing — manual ingest trigger (SUPERADMIN only)
 import ticketsAdminRouter from "./routes/tickets.admin.js";
