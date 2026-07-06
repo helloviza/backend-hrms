@@ -14,7 +14,7 @@ import logger from '../utils/logger.js'
 import { MODULE_GROUP_MAP } from '../utils/moduleGroups.js'
 import CustomerWorkspace from '../models/CustomerWorkspace.js'
 import { allowedModuleKeysFor } from '../utils/featureToModules.js'
-import { CUSTOMER_DEMO_SEED_EMAILS, CUSTOMER_DEMO_CROSS_UNIVERSE_GRANTERS } from '../config/demoSeedAllowlist.js'
+import { CUSTOMER_DEMO_SEED_EMAILS } from '../config/demoSeedAllowlist.js'
 
 const router = express.Router()
 
@@ -568,30 +568,6 @@ router.patch('/demo-access', requireSuperAdmin, async (req: any, res: any) => {
 
       if (seedUserDocs.length !== mappedSeedUsers.length) {
         return res.status(404).json({ error: 'Some mappedSeedUsers do not exist' })
-      }
-
-      // Universe-match assertion: a STAFF granter's seeds must themselves be
-      // STAFF-universe demo users, and a CUSTOMER granter's seeds must be
-      // CUSTOMER-universe — EXCEPT the explicit sales-demo exception, where a
-      // granter in CUSTOMER_DEMO_CROSS_UNIVERSE_GRANTERS (today: just
-      // imran.ali@plumtrips.com) may hold the CUSTOMER_DEMO_SEED_EMAILS seeds
-      // despite being STAFF. Deliberate, not a gap.
-      const granterHasCrossUniverseException =
-        (CUSTOMER_DEMO_CROSS_UNIVERSE_GRANTERS as readonly string[]).includes(targetRepEmailLower)
-      const universeMismatches = seedUserDocs.filter((u: any) => {
-        const seedIsCustomer = u.accountType === 'CUSTOMER' || u.userType === 'CUSTOMER'
-        const matchesGranterUniverse = targetRepIsCustomer ? seedIsCustomer : !seedIsCustomer
-        if (matchesGranterUniverse) return false
-        const seedEmailLower = String(u.email || '').toLowerCase()
-        const allowedException =
-          granterHasCrossUniverseException && (CUSTOMER_DEMO_SEED_EMAILS as readonly string[]).includes(seedEmailLower)
-        return !allowedException
-      })
-      if (universeMismatches.length > 0) {
-        return res.status(422).json({
-          error: 'Some mapped users are in a different universe than the granter and are not covered by an explicit exception',
-          invalidUserIds: universeMismatches.map((u: any) => String(u._id)),
-        })
       }
     }
 
