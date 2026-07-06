@@ -972,6 +972,7 @@ r.post("/login", loginLimiter, async (req, res) => {
       businessId: built.staff ? undefined : built.customerId || undefined,
       vendorId: built.staff ? undefined : built.vendorId || undefined,
       customerMemberRole: built.staff ? undefined : built.customerMemberRole || undefined,
+      isDemoUser: user.isDemoUser === true,
     });
 
     const refreshToken = signRefresh(user);
@@ -1071,6 +1072,7 @@ r.post("/refresh", async (req, res) => {
       businessId: built.staff ? undefined : built.customerId || undefined,
       vendorId: built.staff ? undefined : built.vendorId || undefined,
       customerMemberRole: built.staff ? undefined : built.customerMemberRole || undefined,
+      isDemoUser: user.isDemoUser === true,
     });
 
     const newRefreshToken = signRefresh(user);
