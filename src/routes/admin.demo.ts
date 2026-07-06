@@ -21,7 +21,6 @@ import { requireAdmin } from "../middleware/rbac.js";
 import User from "../models/User.js";
 import Customer from "../models/Customer.js";
 import DemoSession from "../models/DemoSession.js";
-import { CUSTOMER_DEMO_SEED_EMAILS } from "../config/demoSeedAllowlist.js";
 import {
   signAccessToken,
   signDemoRefresh,
@@ -107,24 +106,6 @@ router.post("/start-session", async (req: Request, res: Response) => {
       return res.status(403).json({
         error: "target_not_demo_user",
         message: "The specified user is not configured as a demo seed user.",
-      });
-    }
-
-    // 5b. SECOND, INDEPENDENT check for plumtrips.com-domain CUSTOMER targets
-    //     (the demo1/2/3@plumtrips.com pattern): even if isDemoUser is
-    //     (mis)configured true on some other internal-domain customer record,
-    //     it still can't be impersonated unless it's a literal allowlist
-    //     member. External-domain demo customers (e.g. the Inteletek AI seed)
-    //     are unaffected — they never carried this internal-domain ambiguity.
-    const targetEmailLower = String(target.email || "").toLowerCase();
-    if (
-      target.accountType === "CUSTOMER" &&
-      targetEmailLower.endsWith("@plumtrips.com") &&
-      !(CUSTOMER_DEMO_SEED_EMAILS as readonly string[]).includes(targetEmailLower)
-    ) {
-      return res.status(403).json({
-        error: "target_not_in_customer_demo_allowlist",
-        message: "This plumtrips.com customer account is not an allowlisted demo seed.",
       });
     }
 

@@ -14,7 +14,6 @@ import logger from '../utils/logger.js'
 import { MODULE_GROUP_MAP } from '../utils/moduleGroups.js'
 import CustomerWorkspace from '../models/CustomerWorkspace.js'
 import { allowedModuleKeysFor } from '../utils/featureToModules.js'
-import { CUSTOMER_DEMO_SEED_EMAILS } from '../config/demoSeedAllowlist.js'
 
 const router = express.Router()
 
@@ -535,18 +534,16 @@ router.patch('/demo-access', requireSuperAdmin, async (req: any, res: any) => {
 
     // Validate target user exists and is a STAFF account.
     // Carve-out: a CUSTOMER-universe account may still receive demoAccess IFF
-    // its own email is a literal CUSTOMER_DEMO_SEED_EMAILS member (e.g. a demo
-    // seed sub-impersonating other demo seeds). This is dormant today — no
-    // customer-side granter exists yet — but keeps the door narrow and
-    // explicit rather than reopening it wide later.
+    // it is itself flagged isDemoUser===true (e.g. a demo seed sub-impersonating
+    // other demo seeds). Console/data-driven — no hardcoded email list — so a
+    // new customer-side granter needs only isDemoUser:true, not a code change.
     const targetRep: any = await User.findById(userId).lean()
     if (!targetRep) {
       return res.status(404).json({ error: 'User not found' })
     }
-    const targetRepEmailLower = String(targetRep.email || '').toLowerCase()
     const targetRepIsCustomer = targetRep.accountType === 'CUSTOMER' || targetRep.userType === 'CUSTOMER'
     const targetRepIsAllowlistedCustomerSeed =
-      targetRepIsCustomer && (CUSTOMER_DEMO_SEED_EMAILS as readonly string[]).includes(targetRepEmailLower)
+      targetRepIsCustomer && targetRep.isDemoUser === true
     if (targetRepIsCustomer && !targetRepIsAllowlistedCustomerSeed) {
       return res.status(422).json({ error: 'Demo access can only be granted to STAFF users, not customer-side users' })
     }
