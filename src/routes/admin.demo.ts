@@ -1,8 +1,10 @@
 // apps/backend/src/routes/admin.demo.ts
 //
-// Demo Platform — JWT impersonation endpoints. SuperAdmin-protected (router
-// uses requireAdmin), gated further by a per-user demoAccess.enabled flag
-// re-read from the DB on every request (NOT from the JWT — audit §4).
+// Demo Platform — JWT impersonation endpoints. /start-session and
+// /available-seeds are gated on the caller's demoAccess.enabled flag, re-read
+// from the DB on every request (NOT from the JWT — audit §4) — any role
+// (including EMPLOYEE) with a demo grant may use them. /end-session remains
+// requireAdmin-gated (unchanged).
 //
 // POST /start-session  — mint an impersonation JWT for a mapped seed user
 // POST /end-session    — close out an ACTIVE DemoSession record
@@ -33,7 +35,6 @@ const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
 
 const router = Router();
 router.use(authenticate);
-router.use(requireAdmin);
 
 function isValidObjectId(id: any): boolean {
   return typeof id === "string" && Types.ObjectId.isValid(id);
@@ -248,7 +249,7 @@ router.post("/start-session", async (req: Request, res: Response) => {
 /* ------------------------------------------------------------------ */
 /* POST /end-session                                                  */
 /* ------------------------------------------------------------------ */
-router.post("/end-session", async (req: Request, res: Response) => {
+router.post("/end-session", requireAdmin, async (req: Request, res: Response) => {
   try {
     const { sessionId } = (req.body || {}) as { sessionId?: string };
     if (!sessionId || !isValidObjectId(sessionId)) {
