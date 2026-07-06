@@ -14,6 +14,7 @@ import logger from '../utils/logger.js'
 import { MODULE_GROUP_MAP } from '../utils/moduleGroups.js'
 import CustomerWorkspace from '../models/CustomerWorkspace.js'
 import { allowedModuleKeysFor } from '../utils/featureToModules.js'
+import { CUSTOMER_DEMO_SEED_EMAILS, CUSTOMER_DEMO_CROSS_UNIVERSE_GRANTERS } from '../config/demoSeedAllowlist.js'
 
 const router = express.Router()
 
@@ -532,12 +533,21 @@ router.patch('/demo-access', requireSuperAdmin, async (req: any, res: any) => {
       return res.status(400).json({ error: 'mappedSeedUsers must be an array when enabled is true' })
     }
 
-    // Validate target user exists and is a STAFF account
+    // Validate target user exists and is a STAFF account.
+    // Carve-out: a CUSTOMER-universe account may still receive demoAccess IFF
+    // its own email is a literal CUSTOMER_DEMO_SEED_EMAILS member (e.g. a demo
+    // seed sub-impersonating other demo seeds). This is dormant today — no
+    // customer-side granter exists yet — but keeps the door narrow and
+    // explicit rather than reopening it wide later.
     const targetRep: any = await User.findById(userId).lean()
     if (!targetRep) {
       return res.status(404).json({ error: 'User not found' })
     }
-    if (targetRep.accountType === 'CUSTOMER' || targetRep.userType === 'CUSTOMER') {
+    const targetRepEmailLower = String(targetRep.email || '').toLowerCase()
+    const targetRepIsCustomer = targetRep.accountType === 'CUSTOMER' || targetRep.userType === 'CUSTOMER'
+    const targetRepIsAllowlistedCustomerSeed =
+      targetRepIsCustomer && (CUSTOMER_DEMO_SEED_EMAILS as readonly string[]).includes(targetRepEmailLower)
+    if (targetRepIsCustomer && !targetRepIsAllowlistedCustomerSeed) {
       return res.status(422).json({ error: 'Demo access can only be granted to STAFF users, not customer-side users' })
     }
 
@@ -545,7 +555,7 @@ router.patch('/demo-access', requireSuperAdmin, async (req: any, res: any) => {
     if (enabled && mappedSeedUsers.length > 0) {
       const seedUserDocs: any[] = await User.find(
         { _id: { $in: mappedSeedUsers.map((id: string) => new mongoose.Types.ObjectId(id)) } },
-        { _id: 1, isDemoUser: 1, email: 1 }
+        { _id: 1, isDemoUser: 1, email: 1, accountType: 1, userType: 1 }
       ).lean()
 
       const invalidSeeds = seedUserDocs.filter((u: any) => !u.isDemoUser)
@@ -558,6 +568,30 @@ router.patch('/demo-access', requireSuperAdmin, async (req: any, res: any) => {
 
       if (seedUserDocs.length !== mappedSeedUsers.length) {
         return res.status(404).json({ error: 'Some mappedSeedUsers do not exist' })
+      }
+
+      // Universe-match assertion: a STAFF granter's seeds must themselves be
+      // STAFF-universe demo users, and a CUSTOMER granter's seeds must be
+      // CUSTOMER-universe — EXCEPT the explicit sales-demo exception, where a
+      // granter in CUSTOMER_DEMO_CROSS_UNIVERSE_GRANTERS (today: just
+      // imran.ali@plumtrips.com) may hold the CUSTOMER_DEMO_SEED_EMAILS seeds
+      // despite being STAFF. Deliberate, not a gap.
+      const granterHasCrossUniverseException =
+        (CUSTOMER_DEMO_CROSS_UNIVERSE_GRANTERS as readonly string[]).includes(targetRepEmailLower)
+      const universeMismatches = seedUserDocs.filter((u: any) => {
+        const seedIsCustomer = u.accountType === 'CUSTOMER' || u.userType === 'CUSTOMER'
+        const matchesGranterUniverse = targetRepIsCustomer ? seedIsCustomer : !seedIsCustomer
+        if (matchesGranterUniverse) return false
+        const seedEmailLower = String(u.email || '').toLowerCase()
+        const allowedException =
+          granterHasCrossUniverseException && (CUSTOMER_DEMO_SEED_EMAILS as readonly string[]).includes(seedEmailLower)
+        return !allowedException
+      })
+      if (universeMismatches.length > 0) {
+        return res.status(422).json({
+          error: 'Some mapped users are in a different universe than the granter and are not covered by an explicit exception',
+          invalidUserIds: universeMismatches.map((u: any) => String(u._id)),
+        })
       }
     }
 

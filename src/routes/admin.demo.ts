@@ -19,12 +19,17 @@ import { requireAdmin } from "../middleware/rbac.js";
 import User from "../models/User.js";
 import Customer from "../models/Customer.js";
 import DemoSession from "../models/DemoSession.js";
+import { CUSTOMER_DEMO_SEED_EMAILS } from "../config/demoSeedAllowlist.js";
 import {
   signAccessToken,
   signDemoRefresh,
   setDemoRefreshCookie,
   clearDemoRefreshCookie,
 } from "./auth.js";
+
+// Repo convention is a per-file literal for the HOUSE workspace id (see
+// requireHouse.ts, requireFeature.ts). NEVER a valid impersonation target.
+const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
 
 const router = Router();
 router.use(authenticate);
@@ -82,11 +87,43 @@ router.post("/start-session", async (req: Request, res: Response) => {
       });
     }
 
+    // 4b. HARD-FAIL: HOUSE is never a valid impersonation target, regardless
+    //     of isDemoUser/mappedSeedUsers state. Checked before those flags so
+    //     a misconfigured record (isDemoUser flipped on a HOUSE-homed
+    //     account) can never mint a HOUSE-scoped session.
+    if (String(target.workspaceId || "") === PLUMTRIPS_HOUSE_WORKSPACE_ID) {
+      console.warn(
+        `[demo] refused HOUSE-workspace target: userId=${target._id} email=${target.email}`,
+      );
+      return res.status(422).json({
+        error: "target_is_house_workspace",
+        message: "Impersonation targets may never belong to the HOUSE workspace.",
+      });
+    }
+
     // 5. Target must be flagged isDemoUser
     if (target.isDemoUser !== true) {
       return res.status(403).json({
         error: "target_not_demo_user",
         message: "The specified user is not configured as a demo seed user.",
+      });
+    }
+
+    // 5b. SECOND, INDEPENDENT check for plumtrips.com-domain CUSTOMER targets
+    //     (the demo1/2/3@plumtrips.com pattern): even if isDemoUser is
+    //     (mis)configured true on some other internal-domain customer record,
+    //     it still can't be impersonated unless it's a literal allowlist
+    //     member. External-domain demo customers (e.g. the Inteletek AI seed)
+    //     are unaffected — they never carried this internal-domain ambiguity.
+    const targetEmailLower = String(target.email || "").toLowerCase();
+    if (
+      target.accountType === "CUSTOMER" &&
+      targetEmailLower.endsWith("@plumtrips.com") &&
+      !(CUSTOMER_DEMO_SEED_EMAILS as readonly string[]).includes(targetEmailLower)
+    ) {
+      return res.status(403).json({
+        error: "target_not_in_customer_demo_allowlist",
+        message: "This plumtrips.com customer account is not an allowlisted demo seed.",
       });
     }
 
