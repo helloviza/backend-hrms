@@ -1,5 +1,6 @@
 import mongoose, { Schema, model, type Document } from "mongoose";
 import Counter from "./Counter.js";
+import CompanySettings from "./CompanySettings.js";
 
 export interface IInvoiceLineItem {
   bookingRef: string;
@@ -194,27 +195,70 @@ InvoiceSchema.pre("save", async function (next) {
     const month = now.getMonth() + 1;
     const year = now.getFullYear();
     const fyStartYear = month >= 4 ? year : year - 1;
-    const fyKey = `invoice:FY${fyStartYear}`;
 
-    // Atomically claim the next sequence number
+    // Resolve which GST profile issued this invoice, purely to decide which
+    // numbering series it belongs to — branches on "is this the default
+    // profile" (empty invoiceSeriesPrefix), never on which state. Any
+    // invoice whose issuer GSTIN doesn't match a registry entry (registry
+    // not seeded yet, or a pre-registry invoice) falls back to the exact
+    // legacy bare path below — this is what makes the default series
+    // untouched and backfill-free.
+    const gstin = ((this.issuerDetails as any)?.gstin || "").toUpperCase().trim();
+    let prefix = "";
+    let cadence: "annual" | "monthly" = "annual";
+    if (gstin) {
+      const companySettings = await CompanySettings.findOne().lean();
+      const profile = (companySettings?.gstProfiles || []).find(
+        (p: any) => (p.gstin || "").toUpperCase().trim() === gstin,
+      );
+      prefix = (profile?.invoiceSeriesPrefix || "").trim().toUpperCase();
+      cadence = (companySettings as any)?.invoiceSeriesCadence === "monthly" ? "monthly" : "annual";
+    }
+    const isDefaultSeries = !prefix;
+
+    let counterKey: string;
+    let period: string;
+    if (isDefaultSeries) {
+      // DEFAULT PROFILE (or no registry match) — unchanged, forever. Same
+      // Counter key, same bare format, zero backfill.
+      period = String(fyStartYear);
+      counterKey = `invoice:FY${fyStartYear}`;
+    } else if (cadence === "monthly") {
+      period = `${year}${String(month).padStart(2, "0")}`;
+      counterKey = `invoice:${period}:${gstin}`;
+    } else {
+      period = String(fyStartYear);
+      counterKey = `invoice:FY${fyStartYear}:${gstin}`;
+    }
+
+    // Pure atomic $inc, upsert — one MongoDB operation, fully serialized by
+    // the storage engine. Never pair this with a second, separate adjustment
+    // step that reassigns the local seq (see
+    // infra/audit/invoice-numbering-per-gstin-audit.md §2 — that pattern is
+    // exactly what let the old FY2026 catch-up hand two concurrent requests
+    // the same computed number).
     let counter = await Counter.findByIdAndUpdate(
-      fyKey,
+      counterKey,
       { $inc: { seq: 1 } },
       { new: true, upsert: true },
     );
     let nextSeq = counter!.seq;
 
-    // FY 2026-27 minimum: if counter hasn't been seeded yet, catch up to 40
-    if (fyStartYear === 2026 && nextSeq < 40) {
+    // FY 2026-27 minimum: legacy default-series catch-up only. Scoped to
+    // isDefaultSeries so it can never run against a per-GSTIN counter — new
+    // series always start clean from 0.
+    if (isDefaultSeries && fyStartYear === 2026 && nextSeq < 40) {
       const adjusted = await Counter.findByIdAndUpdate(
-        fyKey,
+        counterKey,
         { $max: { seq: 40 } },
         { new: true },
       );
       nextSeq = adjusted!.seq;
     }
 
-    this.invoiceNo = `INV-${fyStartYear}${String(nextSeq).padStart(4, "0")}`;
+    this.invoiceNo = isDefaultSeries
+      ? `INV-${period}${String(nextSeq).padStart(4, "0")}`
+      : `INV-${prefix}${period}${String(nextSeq).padStart(4, "0")}`;
     next();
   } catch (err) {
     next(err as Error);

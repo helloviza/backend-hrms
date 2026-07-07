@@ -1,5 +1,6 @@
 import mongoose, { Schema, model, type Document } from "mongoose";
 import Counter from "./Counter.js";
+import CompanySettings from "./CompanySettings.js";
 
 export interface ICreditNoteLineItem {
   bookingRef: string;
@@ -268,16 +269,49 @@ CreditNoteSchema.pre("save", async function (next) {
     const month = now.getMonth() + 1;
     const year = now.getFullYear();
     const fyStartYear = month >= 4 ? year : year - 1;
-    const fyKey = `creditnote:FY${fyStartYear}`;
+
+    // Mirrors Invoice.ts's numbering branch exactly, keyed off the SAME
+    // issuer GSTIN the credit note already inherited (verbatim, never
+    // re-resolved) from its parent invoice — see routes/creditNotes.ts. A
+    // credit note against a default-series invoice lands on the bare
+    // credit-note series; a credit note against a per-GSTIN-series invoice
+    // lands on that same GSTIN's own credit-note series.
+    const gstin = ((this.issuerDetails as any)?.gstin || "").toUpperCase().trim();
+    let prefix = "";
+    let cadence: "annual" | "monthly" = "annual";
+    if (gstin) {
+      const companySettings = await CompanySettings.findOne().lean();
+      const profile = (companySettings?.gstProfiles || []).find(
+        (p: any) => (p.gstin || "").toUpperCase().trim() === gstin,
+      );
+      prefix = (profile?.invoiceSeriesPrefix || "").trim().toUpperCase();
+      cadence = (companySettings as any)?.invoiceSeriesCadence === "monthly" ? "monthly" : "annual";
+    }
+    const isDefaultSeries = !prefix;
+
+    let counterKey: string;
+    let period: string;
+    if (isDefaultSeries) {
+      period = String(fyStartYear);
+      counterKey = `creditnote:FY${fyStartYear}`;
+    } else if (cadence === "monthly") {
+      period = `${year}${String(month).padStart(2, "0")}`;
+      counterKey = `creditnote:${period}:${gstin}`;
+    } else {
+      period = String(fyStartYear);
+      counterKey = `creditnote:FY${fyStartYear}:${gstin}`;
+    }
 
     const counter = await Counter.findByIdAndUpdate(
-      fyKey,
+      counterKey,
       { $inc: { seq: 1 } },
       { new: true, upsert: true },
     );
     const nextSeq = counter!.seq;
 
-    this.creditNoteNo = `CN-${fyStartYear}${String(nextSeq).padStart(4, "0")}`;
+    this.creditNoteNo = isDefaultSeries
+      ? `CN-${period}${String(nextSeq).padStart(4, "0")}`
+      : `CN-${prefix}${period}${String(nextSeq).padStart(4, "0")}`;
     next();
   } catch (err) {
     next(err as Error);
