@@ -18,6 +18,13 @@ export interface IGstProfile {
   pincode: string;
   isDefault: boolean;
   active: boolean;
+  // Per-GSTIN invoice/credit-note numbering series. Empty/absent = the bare
+  // legacy series (INV-${period}${seq}) — reserved for the default profile.
+  // Every other profile gets its own series: INV-${prefix}${period}${seq}.
+  invoiceSeriesPrefix?: string;
+  // Per-profile "Invoice Start Number" — mirrors the flat invoiceStartNumber
+  // below, but scoped to this profile's own Counter series.
+  invoiceStartNumber?: number;
 }
 
 export interface ICompanySettings extends Document {
@@ -56,6 +63,10 @@ export interface ICompanySettings extends Document {
   accountManagerEmail?: string;
   // Invoice Numbering
   invoiceStartNumber: number;
+  // Cadence for every NON-default GST profile's own invoice/credit-note
+  // series (period component of the number). The default profile's series
+  // stays annual/bare regardless of this setting.
+  invoiceSeriesCadence: "annual" | "monthly";
   // Ticket Numbering
   ticketPrefix: string;
   ticketSeqWidth: number;
@@ -103,6 +114,8 @@ const CompanySettingsSchema = new Schema<ICompanySettings>(
         pincode:       { type: String, default: "" },
         isDefault:     { type: Boolean, default: false },
         active:        { type: Boolean, default: true },
+        invoiceSeriesPrefix: { type: String, default: "", trim: true, uppercase: true },
+        invoiceStartNumber:  { type: Number, default: 1, min: 1 },
       }],
       default: [],
     },
@@ -118,6 +131,7 @@ const CompanySettingsSchema = new Schema<ICompanySettings>(
     opsEmail:            { type: String, default: "neelb@plumtrips.com", trim: true },
     accountManagerEmail: { type: String, default: "", trim: true },
     invoiceStartNumber:  { type: Number, default: 1 },
+    invoiceSeriesCadence: { type: String, enum: ["annual", "monthly"], default: "annual" },
     ticketPrefix: {
       type: String,
       default: "PT",
@@ -168,6 +182,32 @@ export function validateGstProfiles(
       return `GST profile "${p.state}" GSTIN "${gstin}" prefix does not match its state code ("${expectedCode}")`;
     }
   }
+
+  // Invoice-numbering series: exactly one ACTIVE profile may have an empty
+  // invoiceSeriesPrefix (the bare/legacy series), and it must be the default
+  // profile — this is what guarantees the default's series never moves.
+  // Every other active profile needs its own non-empty, unique prefix.
+  const activeProfiles = profiles.filter((p) => p.active);
+  const emptyPrefixProfiles = activeProfiles.filter((p) => !(p.invoiceSeriesPrefix || "").trim());
+  if (emptyPrefixProfiles.length !== 1) {
+    return `Exactly one active GST profile may have an empty Invoice Series Prefix, reserved for the default series (found ${emptyPrefixProfiles.length})`;
+  }
+  if (!emptyPrefixProfiles[0].isDefault) {
+    return `The GST profile with an empty Invoice Series Prefix must be the Default profile ("${emptyPrefixProfiles[0].state}" is not marked default)`;
+  }
+  const seenPrefixes = new Set<string>();
+  for (const p of activeProfiles) {
+    const prefix = (p.invoiceSeriesPrefix || "").trim().toUpperCase();
+    if (!prefix) continue;
+    if (!/^[A-Z0-9]{1,10}$/.test(prefix)) {
+      return `GST profile "${p.state}" has an invalid Invoice Series Prefix "${prefix}" — must be 1-10 uppercase letters/digits`;
+    }
+    if (seenPrefixes.has(prefix)) {
+      return `Invoice Series Prefix "${prefix}" is used by more than one active GST profile — prefixes must be unique`;
+    }
+    seenPrefixes.add(prefix);
+  }
+
   return null;
 }
 

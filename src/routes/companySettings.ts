@@ -78,6 +78,37 @@ router.put("/", requirePermission("companySettings", "WRITE"), async (req: any, 
       );
     }
 
+    // Wire per-profile invoiceStartNumber (every NON-default GST profile) to
+    // its own atomic Counter — same safe forward-only $max pattern as the
+    // flat invoiceStartNumber above, just keyed per-GSTIN/per-cadence. The
+    // default profile's start number is the flat field above; it is skipped
+    // here.
+    if (Array.isArray(body.gstProfiles)) {
+      const cadence = settings.invoiceSeriesCadence === "monthly" ? "monthly" : "annual";
+      const now2 = new Date();
+      const fyStartYear2 = now2.getMonth() >= 3 ? now2.getFullYear() : now2.getFullYear() - 1;
+      const monthPeriod2 = `${now2.getFullYear()}${String(now2.getMonth() + 1).padStart(2, "0")}`;
+
+      for (const p of body.gstProfiles as any[]) {
+        if (p.isDefault) continue;
+        const prefix = (p.invoiceSeriesPrefix || "").trim().toUpperCase();
+        if (!prefix) continue;
+        if (typeof p.invoiceStartNumber !== "number" || p.invoiceStartNumber <= 0) continue;
+        const gstin = (p.gstin || "").toUpperCase().trim();
+        if (!gstin) continue;
+
+        const counterKey = cadence === "monthly"
+          ? `invoice:${monthPeriod2}:${gstin}`
+          : `invoice:FY${fyStartYear2}:${gstin}`;
+        const targetFloor = p.invoiceStartNumber - 1;
+        await Counter.findByIdAndUpdate(
+          counterKey,
+          { $max: { seq: targetFloor } },
+          { upsert: true, new: true },
+        );
+      }
+    }
+
     // Wire ticketStartNumber to the atomic Counter so it takes effect on next ticket
     if (typeof body.ticketStartNumber === "number" && body.ticketStartNumber > 0) {
       const now = new Date();
