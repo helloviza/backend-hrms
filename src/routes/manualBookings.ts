@@ -19,6 +19,12 @@ import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
+// PlumTrips House Customer._id — see scripts/seed-intake-system-identities.ts
+// and routes/intake.travel.ts. Intake-created bookings carry this workspaceId
+// and createdBy=SYSTEM_INTAKE_USER_ID, so the createdBy-scoped filter below
+// would otherwise hide them from every non-ALL-scope triage staffer.
+const HOUSE_CUSTOMER_ID = "6a4e0d2ea90c293c9e129f48";
+
 router.use(requireAuth);
 
 /* ── Helpers ────────────────────────────────────────────────────── */
@@ -343,10 +349,28 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     const limit = Math.min(200, parseInt(req.query.limit) || 25);
     const filter = buildSearchFilter(req.query);
 
-    // Scope non-ALL users to their own bookings only
+    // Scope non-ALL users to their own bookings only — with a bypass for
+    // HOUSE intake rows still awaiting triage (see HOUSE_CUSTOMER_ID above),
+    // since those are createdBy=SYSTEM_INTAKE_USER_ID, never the viewing staffer.
     const isAllScope = req.permissionScope === "ALL";
     if (!isAllScope) {
-      filter.createdBy = String(req.user._id || req.user.id || req.user.sub);
+      const selfId = String(req.user._id || req.user.id || req.user.sub);
+      const scopeOr = [
+        { createdBy: selfId },
+        { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignmentStatus: "PENDING_TO_ASSIGN" },
+        // Once a HOUSE intake row is ASSIGNED, assignmentStatus no longer
+        // matches the clause above and createdBy is still the System Intake
+        // User (never the assignee) — without this, the assignee loses their
+        // own assigned booking from the list the moment it's assigned to them.
+        { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignPerson: new mongoose.Types.ObjectId(selfId) },
+      ];
+      if (filter.$or) {
+        // buildSearchFilter may already own $or (free-text search) — AND the two.
+        filter.$and = [...(filter.$and || []), { $or: filter.$or }, { $or: scopeOr }];
+        delete filter.$or;
+      } else {
+        filter.$or = scopeOr;
+      }
     }
 
     // Soft delete filter — hide deleted rows unless SuperAdmin requests them
@@ -1205,7 +1229,16 @@ router.get("/:id", requirePermission("manualBookings", "READ"), async (req: any,
     const isAllScope = req.permissionScope === "ALL";
     if (!isAllScope) {
       const callerId = String(req.user._id || req.user.id || req.user.sub);
-      if (booking.createdBy && booking.createdBy !== callerId) {
+      // Bypass for HOUSE intake rows still awaiting triage — same rationale as
+      // the GET / list scoping above (createdBy=SYSTEM_INTAKE_USER_ID there too).
+      const isHouseBookingWorkspace = String(booking.workspaceId?._id ?? booking.workspaceId ?? "") === HOUSE_CUSTOMER_ID;
+      const isHouseUnassignedIntake = isHouseBookingWorkspace && booking.assignmentStatus === "PENDING_TO_ASSIGN";
+      // Once a HOUSE intake row is ASSIGNED, the clause above no longer
+      // matches and createdBy is still the System Intake User (never the
+      // assignee) — mirrors the GET / list fix so the assignee can still
+      // open their own assigned booking, not just see it in the list.
+      const isHouseAssignedToSelf = isHouseBookingWorkspace && String(booking.assignPerson ?? "") === callerId;
+      if (booking.createdBy && booking.createdBy !== callerId && !isHouseUnassignedIntake && !isHouseAssignedToSelf) {
         return res.status(403).json({ success: false, message: "Not found" });
       }
     }
