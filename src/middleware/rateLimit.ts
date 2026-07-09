@@ -53,3 +53,14 @@ export const copilotLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, message: 'Too many AI requests, please slow down.' },
 });
+
+// Public travel-request form — unauthenticated write endpoint; a real
+// applicant submits once per visit, so this stays tight (bot/spam surface).
+export const travelRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests, please try again later.' },
+});

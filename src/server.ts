@@ -191,6 +191,17 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
 import whatsappWebhookRouter from "./routes/whatsapp.webhook.js";
 app.use("/api/whatsapp", express.raw({ type: "application/json" }), whatsappWebhookRouter);
 
+// Travel-intake webhook (public "PlumTrips International Travel Information
+// Form" → Apps Script → here). HMAC-signed, unauthenticated, creates
+// HOUSE-tenant ManualBooking rows. MUST be before express.json() for the raw
+// body HMAC check, same shape as the Razorpay webhook above.
+import travelIntakeRouter from "./routes/intake.travel.js";
+import publicTravelRequestRouter from "./routes/public.travelRequest.js";
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  // KEEP_IN_PLUMBOX — manual bookings (and this intake feed) are Plumtrips Travel only.
+  app.use("/api/intake", express.raw({ type: "application/json" }), travelIntakeRouter);
+}
+
 // JSON parser
 app.use(
   express.json({
@@ -230,7 +241,7 @@ app.use("/api/copilot", copilotLimiter);
  * Skips when req.user is absent (public/webhook routes).
  * Exempts: /api/auth, /api/health, /api/_probe, /api/webhooks
  * ──────────────────────────────────────────────────────────────── */
-const WORKSPACE_EXEMPT = new Set(["/api/auth", "/api/health", "/api/_probe", "/api/webhooks", "/api/whatsapp", "/api/stubs"]);
+const WORKSPACE_EXEMPT = new Set(["/api/auth", "/api/health", "/api/_probe", "/api/webhooks", "/api/whatsapp", "/api/stubs", "/api/intake", "/api/public"]);
 app.use("/api", (req: any, res, next) => {
   // Skip public routes
   const basePath = "/api" + (req.path.split("/").slice(0, 2).join("/") || "");
@@ -270,6 +281,14 @@ app.use("/api/auth/refresh", noStore);
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // SHARED_API — Vouchers (will be exposed via tenant API in Phase 4)
   app.use("/api/vouchers", requireAuth, requireWorkspace, requireFeature("vouchersEnabled"), vouchers);
+}
+
+// Native public travel-request form — unauthenticated, browser-facing.
+// KEEP_IN_PLUMBOX — manual bookings (and this intake path) are Plumtrips
+// Travel only, same convention as /api/intake above. Own per-route rate
+// limiter is applied inside public.travelRequest.ts itself.
+if (env.DEPLOYMENT_MODE === "plumbox") {
+  app.use("/api/public", publicTravelRequestRouter);
 }
 
 /* ────────────────────────────────────────────────────────────────

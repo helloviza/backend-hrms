@@ -103,8 +103,15 @@ export interface IManualBooking extends Document {
   createdByEmail?: string;
   isDemo?: boolean;
   createdByDemoUser?: boolean;
-  // Free-form bag (Demo Platform uses metadata.demoRef for seed idempotency).
+  // Free-form bag (Demo Platform uses metadata.demoRef for seed idempotency;
+  // travel-intake uses metadata.intakeRef for dedup — see routes/intake.travel.ts).
   metadata?: Record<string, unknown>;
+  // Assignment — orthogonal to `status` (booking lifecycle). Introduced for the
+  // travel-intake pipeline: intake rows land PENDING_TO_ASSIGN until a staffer
+  // is assigned. See the pre-save linkage rule below.
+  assignmentStatus: "PENDING_TO_ASSIGN" | "ASSIGNED";
+  assignPerson?: Schema.Types.ObjectId;
+  assignPersonName?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -198,8 +205,18 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     // Demo Platform — booking authored under impersonation / seeded for a demo workspace
     isDemo: { type: Boolean, default: false, index: true },
     createdByDemoUser: { type: Boolean, default: false, index: true },
-    // Free-form bag — Demo Platform uses metadata.demoRef for seed idempotency.
+    // Free-form bag — Demo Platform uses metadata.demoRef for seed idempotency;
+    // travel-intake uses metadata.intakeRef for dedup.
     metadata: { type: Schema.Types.Mixed },
+    // Assignment — see IManualBooking comment above. Independent of `status`.
+    assignmentStatus: {
+      type: String,
+      enum: ["PENDING_TO_ASSIGN", "ASSIGNED"],
+      default: "PENDING_TO_ASSIGN",
+      index: true,
+    },
+    assignPerson: { type: Schema.Types.ObjectId, ref: "User", index: true },
+    assignPersonName: { type: String, trim: true },
   },
   { timestamps: true },
 );
@@ -287,6 +304,22 @@ ManualBookingSchema.pre("save", async function (next) {
     this.requestProcessTAT = Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
   }
 
+  next();
+});
+
+/* ── Assignment linkage (independent of `status`) ──────────────────────
+ * assignPerson set + still PENDING_TO_ASSIGN → ASSIGNED.
+ * assignPerson cleared → revert to PENDING_TO_ASSIGN, regardless of prior value.
+ * Deliberately does not read/write `status` — the two fields stay orthogonal.
+ */
+ManualBookingSchema.pre("save", function (next) {
+  if (this.assignPerson) {
+    if (this.assignmentStatus === "PENDING_TO_ASSIGN") {
+      this.assignmentStatus = "ASSIGNED";
+    }
+  } else {
+    this.assignmentStatus = "PENDING_TO_ASSIGN";
+  }
   next();
 });
 
