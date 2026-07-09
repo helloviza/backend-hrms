@@ -214,6 +214,18 @@ const BOOKING_COLUMNS = [
   "Invoice Pending Days",
   "Booking Week",
   "Booking Month",
+  // Per-type detail columns (appended — see infra/audit/manual-bookings-export-fields-audit.md).
+  // Sourced from the uniform ManualBooking.itinerary sub-schema + top-level supplierPNR.
+  // Blank when not applicable to the row's booking type.
+  "Flight / Train No",
+  "Airline",
+  "Train Class",
+  "Hotel Name",
+  "Room Type",
+  "Nights",
+  "Rooms",
+  "Service Description",
+  "Supplier PNR / Booking ID",
 ];
 
 // Money column indices (1-based): Quoted=17, Actual=18, Diff=19, GST=20, Base=21, Grand=22
@@ -271,6 +283,15 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
     invoicePendingDays(b),
     b.bookingWeek ? `Week ${b.bookingWeek}` : "",
     b.bookingMonth ?? "",
+    b.itinerary?.flightNo ?? "",
+    b.itinerary?.airline ?? "",
+    b.itinerary?.trainClass ?? "",
+    b.itinerary?.hotelName ?? "",
+    b.itinerary?.roomType ?? "",
+    b.itinerary?.nights ?? "",
+    b.itinerary?.roomCount ?? "",
+    b.itinerary?.description ?? "",
+    b.supplierPNR ?? "",
   ];
 }
 
@@ -487,8 +508,9 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     headerRow.font = { bold: true };
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
 
-    // Column widths (31 cols: Booking Date at pos 2, Ref No. at pos 3, Traveler ID after Pax Name)
-    const colWidths = [7, 14, 16, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16];
+    // Column widths (40 cols: Booking Date at pos 2, Ref No. at pos 3, Traveler ID after Pax Name;
+    // cols 32-40 are the appended per-type detail columns)
+    const colWidths = [7, 14, 16, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16, 16, 16, 12, 24, 18, 9, 8, 30, 22];
     colWidths.forEach((width, i) => {
       sheet.getColumn(i + 1).width = width;
     });
