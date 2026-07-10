@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import ExcelJS from "exceljs";
 import multer from "multer";
 import XLSX from "xlsx";
+import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
@@ -17,9 +18,26 @@ import User from "../models/User.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { canAccessBooking, isHouseCallerContext } from "../utils/bookingAccess.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { uploadBufferToS3 } from "../utils/s3Upload.js";
+import { presignGetObject } from "../utils/s3Presign.js";
+import { s3 } from "../config/aws.js";
+import { env } from "../config/env.js";
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+// Ticket/voucher attachment uploads — see infra/audit/
+// manual-bookings-voucher-upload-audit.md. Same memoryStorage-then-S3 pattern
+// as xlsxUpload above and HR Policies/Vouchers elsewhere in the codebase.
+const ATTACHMENT_ALLOWED_MIME = ["application/pdf", "image/png", "image/jpeg", "image/webp"];
+const attachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (ATTACHMENT_ALLOWED_MIME.includes(file.mimetype)) return cb(null, true);
+    cb(new Error("Only PDF, PNG, JPEG, or WEBP files are allowed."));
+  },
+});
 
 // PlumTrips House Customer._id — see scripts/seed-intake-system-identities.ts
 // and routes/intake.travel.ts. Intake-created bookings carry this workspaceId
@@ -1441,6 +1459,161 @@ router.post("/:id/restore", requirePermission("manualBookings", "FULL"), async (
     res.status(500).json({ error: err.message });
   }
 });
+
+/* ── Attachments (ticket/voucher/other) ─────────────────────────────
+ * infra/audit/manual-bookings-voucher-upload-audit.md. Every route below
+ * uses the SAME two-tier gate: requirePermission() as the coarse module
+ * check (matches whatever level view/upload/delete needs), then
+ * canAccessBooking() as the per-record check — not the raw requirePermission-
+ * only gate the old (pre-fix) PUT /:id used. 403 on deny, same as GET/PUT/:id.
+ * ──────────────────────────────────────────────────────────────────── */
+
+// POST /api/admin/manual-bookings/:id/attachments
+router.post(
+  "/:id/attachments",
+  requirePermission("manualBookings", "READ"),
+  attachmentUpload.single("file"),
+  async (req: any, res: any) => {
+    try {
+      const booking: any = await ManualBooking.findById(req.params.id);
+      if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "READ")) {
+        return res.status(403).json({ success: false, message: "Not found" });
+      }
+
+      const file = req.file;
+      if (!file || !file.buffer) {
+        return res.status(400).json({ error: "File is required" });
+      }
+
+      const type = String(req.body?.type || "").toLowerCase();
+      if (!["ticket", "voucher", "other"].includes(type)) {
+        return res.status(400).json({ error: "type must be one of: ticket, voucher, other" });
+      }
+
+      const uploaderId = String(req.user._id || req.user.id || req.user.sub);
+      const uploaded = await uploadBufferToS3({
+        buffer: file.buffer,
+        mime: file.mimetype,
+        originalName: file.originalname,
+        customerId: String(booking.workspaceId),
+        createdBy: uploaderId,
+        keyPrefix: `bookings/attachments/${booking._id}`,
+      });
+
+      booking.attachments.push({
+        type,
+        originalFilename: file.originalname,
+        s3Key: uploaded.key,
+        size: file.size,
+        mimeType: file.mimetype,
+        uploadedBy: req.user._id,
+        uploadedAt: new Date(),
+      });
+      await booking.save();
+
+      const created = booking.attachments[booking.attachments.length - 1];
+      res.status(201).json({ ok: true, attachment: created });
+    } catch (err: any) {
+      console.error("[ManualBookings ATTACHMENTS upload]", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// GET /api/admin/manual-bookings/:id/attachments
+router.get(
+  "/:id/attachments",
+  requirePermission("manualBookings", "READ"),
+  async (req: any, res: any) => {
+    try {
+      const booking: any = await ManualBooking.findById(req.params.id)
+        .select("workspaceId createdBy assignPerson assignmentStatus attachments")
+        .lean();
+      if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "READ")) {
+        return res.status(403).json({ success: false, message: "Not found" });
+      }
+
+      res.json({ ok: true, attachments: booking.attachments || [] });
+    } catch (err: any) {
+      console.error("[ManualBookings ATTACHMENTS list]", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// GET /api/admin/manual-bookings/:id/attachments/:attId/url
+router.get(
+  "/:id/attachments/:attId/url",
+  requirePermission("manualBookings", "READ"),
+  async (req: any, res: any) => {
+    try {
+      const booking: any = await ManualBooking.findById(req.params.id)
+        .select("workspaceId createdBy assignPerson assignmentStatus attachments")
+        .lean();
+      if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "READ")) {
+        return res.status(403).json({ success: false, message: "Not found" });
+      }
+
+      const attachment = (booking.attachments || []).find(
+        (a: any) => String(a._id) === req.params.attId,
+      );
+      if (!attachment) return res.status(404).json({ error: "Attachment not found" });
+
+      const url = await presignGetObject({
+        bucket: env.S3_BUCKET,
+        key: attachment.s3Key,
+        filename: attachment.originalFilename,
+        expiresInSeconds: env.PRESIGN_TTL,
+      });
+
+      res.json({ ok: true, url, expiresIn: env.PRESIGN_TTL });
+    } catch (err: any) {
+      console.error("[ManualBookings ATTACHMENTS url]", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// DELETE /api/admin/manual-bookings/:id/attachments/:attId
+router.delete(
+  "/:id/attachments/:attId",
+  requirePermission("manualBookings", "WRITE"),
+  async (req: any, res: any) => {
+    try {
+      const booking: any = await ManualBooking.findById(req.params.id);
+      if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+        return res.status(403).json({ success: false, message: "Not found" });
+      }
+
+      const attachment = booking.attachments.id(req.params.attId);
+      if (!attachment) return res.status(404).json({ error: "Attachment not found" });
+
+      // No shared delete helper exists in utils/s3Upload.ts — inline
+      // DeleteObjectCommand, same pattern as workspace.branding.ts / users.ts.
+      try {
+        await s3.send(new DeleteObjectCommand({ Bucket: env.S3_BUCKET, Key: attachment.s3Key }));
+      } catch (s3Err: any) {
+        console.warn("[ManualBookings ATTACHMENTS delete] S3 object delete failed (continuing)", s3Err?.message);
+      }
+
+      attachment.deleteOne();
+      await booking.save();
+
+      res.json({ ok: true });
+    } catch (err: any) {
+      console.error("[ManualBookings ATTACHMENTS delete]", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 /* ── Import from SBT ─────────────────────────────────────────────── */
 

@@ -20,6 +20,10 @@ import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import TravelBooking from "../models/TravelBooking.js";
+import ManualBooking from "../models/ManualBooking.js";
+import { canCustomerAccessBookingAttachments } from "../utils/bookingCustomerAccess.js";
+import { presignGetObject } from "../utils/s3Presign.js";
+import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 
 const router = Router();
@@ -69,6 +73,27 @@ function resolveScopeFilter(req: Request): { filter: Record<string, any>; scope:
   return { filter: { userId }, scope: "OWN" };
 }
 
+/* ── ORG-scope detection, reused by the attachment routes below ───────
+ * Same leader/approver/staff-admin signals as resolveScopeFilter above,
+ * factored out because the attachment access check (bookingCustomerAccess.ts)
+ * needs a plain boolean rather than a query filter. */
+function isOrgScopeUser(user: any): boolean {
+  const roles: string[] = (Array.isArray(user?.roles) ? user.roles : []).map(norm);
+  const accessRole = norm(user?.hrmsAccessRole);
+  const memberRole = norm(user?.customerMemberRole);
+
+  const isLeader = roles.includes("WORKSPACELEADER") || memberRole === "WORKSPACELEADER";
+  const isApprover =
+    roles.includes("CUSTOMERAPPROVER") ||
+    roles.includes("CUSTOMERADMIN") ||
+    accessRole === "L0" ||
+    accessRole === "L2";
+  const isStaffAdmin =
+    roles.includes("ADMIN") || roles.includes("SUPERADMIN") || roles.includes("HR");
+
+  return isLeader || isApprover || isStaffAdmin;
+}
+
 /* ── Customer-safe allowlist projection ──────────────────────────────
  * Explicit pick — never spread the document. Drops tenantId, workspaceId,
  * source, reference*, and the Mixed `metadata` blob (which could hold cost).
@@ -93,6 +118,11 @@ function toSafeRow(doc: any) {
     travelDate: doc.travelDate,
     travelDateEnd: doc.travelDateEnd,
     bookedAt: doc.bookedAt,
+    // Plucked deliberately (not a metadata spread) — the ManualBooking
+    // reference string, non-sensitive, needed by the client to call
+    // GET /api/my-bookings/:bookingRef/attachments*. Unset for SBT-sourced
+    // rows (no ManualBooking backs them, so there's nothing to attach).
+    bookingRef: (doc.metadata as any)?.bookingRef || null,
     _user: { name, email },
   };
 }
@@ -147,6 +177,104 @@ router.get("/", async (req: Request, res: Response) => {
       error: err?.message,
     });
     res.status(500).json({ ok: false, error: "Failed to load bookings" });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * Customer-facing booking attachments (view/download only).
+ *
+ * Reads ManualBooking directly (NOT the TravelBooking mirror, which has no
+ * attachments field and deliberately strips `metadata`) — see
+ * infra/audit/booking-attachments-customer-access-audit.md, sections B2/C2.
+ * Access is governed by canCustomerAccessBookingAttachments(), a NEW
+ * customer-specific predicate — NOT canAccessBooking() (staff RBAC/creator/
+ * HOUSE semantics that don't model a customer at all) and NOT
+ * requirePermission() (customers have no UserPermission record). Both routes
+ * 404 uniformly for "booking not found" and "access denied" so a customer
+ * can't distinguish a real booking they don't own from a nonexistent one.
+ * ═════════════════════════════════════════════════════════════════════ */
+
+interface AttachmentAccessResult {
+  booking: any;
+  denied: boolean;
+}
+
+async function loadBookingForCustomer(req: Request, bookingRef: string): Promise<AttachmentAccessResult | null> {
+  const booking: any = await ManualBooking.findOne({ bookingRef })
+    .select("workspaceId passengers attachments")
+    .lean();
+  if (!booking) return null;
+
+  const user: any = (req as any).user;
+  const ctx = {
+    customerId: (req as any).workspace?.customerId ?? null,
+    isOrgScope: isOrgScopeUser(user),
+    email: user?.email ?? null,
+  };
+  const denied = !canCustomerAccessBookingAttachments(ctx, booking);
+  return { booking, denied };
+}
+
+// GET /api/my-bookings/:bookingRef/attachments — list metadata (no s3Key/uploadedBy leak).
+router.get("/:bookingRef/attachments", async (req: Request, res: Response) => {
+  try {
+    const bookingRef = String(req.params.bookingRef || "").trim();
+    if (!bookingRef) return res.status(400).json({ ok: false, error: "bookingRef required" });
+
+    const result = await loadBookingForCustomer(req, bookingRef);
+    if (!result || result.denied) {
+      return res.status(404).json({ ok: false, error: "Booking not found" });
+    }
+
+    const attachments = (result.booking.attachments || []).map((a: any) => ({
+      _id: String(a._id),
+      type: a.type,
+      originalFilename: a.originalFilename,
+      size: a.size,
+      mimeType: a.mimeType,
+      uploadedAt: a.uploadedAt,
+    }));
+
+    res.json({ ok: true, attachments });
+  } catch (err: any) {
+    logger.error("my-bookings attachments list failed", {
+      userId: (req as any).user?.sub || (req as any).user?._id,
+      error: err?.message,
+    });
+    res.status(500).json({ ok: false, error: "Failed to load attachments" });
+  }
+});
+
+// GET /api/my-bookings/:bookingRef/attachments/:attId/url — presigned GET.
+router.get("/:bookingRef/attachments/:attId/url", async (req: Request, res: Response) => {
+  try {
+    const bookingRef = String(req.params.bookingRef || "").trim();
+    if (!bookingRef) return res.status(400).json({ ok: false, error: "bookingRef required" });
+
+    const result = await loadBookingForCustomer(req, bookingRef);
+    if (!result || result.denied) {
+      return res.status(404).json({ ok: false, error: "Booking not found" });
+    }
+
+    const attachment = (result.booking.attachments || []).find(
+      (a: any) => String(a._id) === req.params.attId,
+    );
+    if (!attachment) return res.status(404).json({ ok: false, error: "Attachment not found" });
+
+    const url = await presignGetObject({
+      bucket: env.S3_BUCKET,
+      key: attachment.s3Key,
+      filename: attachment.originalFilename,
+      expiresInSeconds: env.PRESIGN_TTL,
+    });
+
+    res.json({ ok: true, url, expiresIn: env.PRESIGN_TTL });
+  } catch (err: any) {
+    logger.error("my-bookings attachment url failed", {
+      userId: (req as any).user?.sub || (req as any).user?._id,
+      error: err?.message,
+    });
+    res.status(500).json({ ok: false, error: "Failed to get download url" });
   }
 });
 
