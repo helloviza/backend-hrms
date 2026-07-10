@@ -67,6 +67,18 @@ export interface IManualBooking extends Document {
     passportNo?: string;
     type: "ADULT" | "CHILD" | "INFANT";
   }[];
+  // Uploaded ticket/voucher/other files — see infra/audit/
+  // manual-bookings-voucher-upload-audit.md. Metadata only; bytes live in S3
+  // under bookings/attachments/<bookingId>/... (utils/s3Upload.ts).
+  attachments: {
+    type: "ticket" | "voucher" | "other";
+    originalFilename: string;
+    s3Key: string;
+    size: number;
+    mimeType: string;
+    uploadedBy: Schema.Types.ObjectId;
+    uploadedAt: Date;
+  }[];
   pricing: {
     // primary fields
     actualPrice: number;
@@ -166,6 +178,17 @@ const ManualBookingSchema = new Schema<IManualBooking>(
         panNo: String,
         passportNo: String,
         type: { type: String, enum: ["ADULT", "CHILD", "INFANT"], default: "ADULT" },
+      },
+    ],
+    attachments: [
+      {
+        type: { type: String, enum: ["ticket", "voucher", "other"], required: true },
+        originalFilename: { type: String, required: true },
+        s3Key: { type: String, required: true },
+        size: { type: Number, required: true },
+        mimeType: { type: String, required: true },
+        uploadedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
+        uploadedAt: { type: Date, default: Date.now },
       },
     ],
     pricing: {

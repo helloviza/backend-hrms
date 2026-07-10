@@ -32,12 +32,19 @@ export async function uploadBufferToS3(opts: {
   originalName: string;
   customerId: string;
   createdBy: string;
+  /**
+   * Overrides the default "hrms/vouchers/<customerId>/<createdBy>" prefix.
+   * Omit to keep existing callers (HR Policies, Vouchers) on their current,
+   * unchanged key layout — this param is additive/backward-compatible only.
+   */
+  keyPrefix?: string;
 }): Promise<UploadResult> {
   const bucket = env.S3_BUCKET;
 
   const ext = (opts.originalName.split(".").pop() || "bin").toLowerCase();
   const rand = crypto.randomBytes(12).toString("hex");
-  const key = `hrms/vouchers/${opts.customerId}/${opts.createdBy}/${Date.now()}-${rand}.${ext}`;
+  const prefix = opts.keyPrefix ?? `hrms/vouchers/${opts.customerId}/${opts.createdBy}`;
+  const key = `${prefix}/${Date.now()}-${rand}.${ext}`;
 
   await s3.send(
     new PutObjectCommand({
