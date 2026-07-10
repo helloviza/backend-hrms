@@ -15,6 +15,8 @@ import CustomerMember from "../models/CustomerMember.js";
 import Invoice from "../models/Invoice.js";
 import User from "../models/User.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
+import { canAccessBooking, isHouseCallerContext } from "../utils/bookingAccess.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -28,6 +30,19 @@ const HOUSE_CUSTOMER_ID = "6a4e0d2ea90c293c9e129f48";
 router.use(requireAuth);
 
 /* ── Helpers ────────────────────────────────────────────────────── */
+
+// Builds the caller-side context canAccessBooking() checks a record against —
+// see utils/bookingAccess.ts for the predicate and infra/audit/
+// manual-bookings-access-verification.md for why each field is needed.
+function bookingAccessContextFromReq(req: any) {
+  return {
+    callerId: String(req.user._id || req.user.id || req.user.sub),
+    customerId: req.workspace?.customerId ?? null,
+    workspaceObjectId: req.workspaceObjectId,
+    permissionScope: req.permissionScope,
+    isSuperAdmin: isSuperAdmin(req),
+  };
+}
 
 function buildSearchFilter(query: Record<string, any>) {
   const filter: Record<string, any> = {};
@@ -352,9 +367,37 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     // Scope non-ALL users to their own bookings only — with a bypass for
     // HOUSE intake rows still awaiting triage (see HOUSE_CUSTOMER_ID above),
     // since those are createdBy=SYSTEM_INTAKE_USER_ID, never the viewing staffer.
+    const accessCtx = bookingAccessContextFromReq(req);
     const isAllScope = req.permissionScope === "ALL";
+    const selfId = accessCtx.callerId;
+
+    const andClauses: any[] = [];
+    if (filter.$or) {
+      // buildSearchFilter may already own $or (free-text search) — AND it in
+      // alongside whatever gets added below instead of clobbering it.
+      andClauses.push({ $or: filter.$or });
+      delete filter.$or;
+    }
+
+    // Tenant gate (infra/audit/manual-bookings-access-verification.md) — HOUSE
+    // staff and SuperAdmin manage all tenants and are exempt. Everyone else,
+    // including ALL-scope holders, is restricted to their own tenant, checked
+    // in both id-spaces (ManualBooking.workspaceId is a Customer._id;
+    // req.workspaceObjectId is a CustomerWorkspace._id — see bookingAccess.ts).
+    if (!accessCtx.isSuperAdmin && !isHouseCallerContext(accessCtx)) {
+      const tenantOr: any[] = [];
+      if (accessCtx.customerId && mongoose.Types.ObjectId.isValid(accessCtx.customerId)) {
+        tenantOr.push({ workspaceId: new mongoose.Types.ObjectId(accessCtx.customerId) });
+      }
+      if (accessCtx.workspaceObjectId) {
+        tenantOr.push({ workspaceId: accessCtx.workspaceObjectId });
+      }
+      // No resolvable tenant identity for a non-HOUSE caller — fail closed
+      // rather than skip the gate.
+      andClauses.push(tenantOr.length ? { $or: tenantOr } : { _id: { $in: [] } });
+    }
+
     if (!isAllScope) {
-      const selfId = String(req.user._id || req.user.id || req.user.sub);
       const scopeOr = [
         { createdBy: selfId },
         { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignmentStatus: "PENDING_TO_ASSIGN" },
@@ -364,13 +407,11 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
         // own assigned booking from the list the moment it's assigned to them.
         { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignPerson: new mongoose.Types.ObjectId(selfId) },
       ];
-      if (filter.$or) {
-        // buildSearchFilter may already own $or (free-text search) — AND the two.
-        filter.$and = [...(filter.$and || []), { $or: filter.$or }, { $or: scopeOr }];
-        delete filter.$or;
-      } else {
-        filter.$or = scopeOr;
-      }
+      andClauses.push({ $or: scopeOr });
+    }
+
+    if (andClauses.length) {
+      filter.$and = [...(filter.$and || []), ...andClauses];
     }
 
     // Soft delete filter — hide deleted rows unless SuperAdmin requests them
@@ -1226,21 +1267,8 @@ router.get("/:id", requirePermission("manualBookings", "READ"), async (req: any,
       .lean();
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-    const isAllScope = req.permissionScope === "ALL";
-    if (!isAllScope) {
-      const callerId = String(req.user._id || req.user.id || req.user.sub);
-      // Bypass for HOUSE intake rows still awaiting triage — same rationale as
-      // the GET / list scoping above (createdBy=SYSTEM_INTAKE_USER_ID there too).
-      const isHouseBookingWorkspace = String(booking.workspaceId?._id ?? booking.workspaceId ?? "") === HOUSE_CUSTOMER_ID;
-      const isHouseUnassignedIntake = isHouseBookingWorkspace && booking.assignmentStatus === "PENDING_TO_ASSIGN";
-      // Once a HOUSE intake row is ASSIGNED, the clause above no longer
-      // matches and createdBy is still the System Intake User (never the
-      // assignee) — mirrors the GET / list fix so the assignee can still
-      // open their own assigned booking, not just see it in the list.
-      const isHouseAssignedToSelf = isHouseBookingWorkspace && String(booking.assignPerson ?? "") === callerId;
-      if (booking.createdBy && booking.createdBy !== callerId && !isHouseUnassignedIntake && !isHouseAssignedToSelf) {
-        return res.status(403).json({ success: false, message: "Not found" });
-      }
+    if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "READ")) {
+      return res.status(403).json({ success: false, message: "Not found" });
     }
 
     res.json({ ok: true, booking: { ...booking, invoicePendingDays: invoicePendingDays(booking) } });
@@ -1255,6 +1283,11 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
   try {
     const booking = await ManualBooking.findById(req.params.id);
     if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+      return res.status(403).json({ success: false, message: "Not found" });
+    }
+
     if (booking.status === "INVOICED") {
       return res.status(400).json({ message: "Cannot edit an invoiced booking" });
     }
@@ -1293,6 +1326,11 @@ router.post("/:id/cancel", requirePermission("manualBookings", "FULL"), async (r
 
     const booking: any = await ManualBooking.findById(req.params.id);
     if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+      return res.status(403).json({ success: false, message: "Not found" });
+    }
+
     if (booking.status === "CANCELLED") return res.status(400).json({ error: "Already cancelled" });
     if (booking.isActive === false) return res.status(400).json({ error: "Cannot cancel a deleted booking" });
 
@@ -1342,6 +1380,15 @@ router.delete("/:id", requirePermission("manualBookings", "FULL"), async (req: a
 
     const booking: any = await ManualBooking.findById(req.params.id);
     if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    // Defense-in-depth — isSuperAdmin already gates entry above, so this is
+    // always a no-op today (canAccessBooking short-circuits true for
+    // ctx.isSuperAdmin), but keeps this route consistent with the others if
+    // the SuperAdmin-only requirement above is ever relaxed.
+    if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+      return res.status(403).json({ success: false, message: "Not found" });
+    }
+
     if (booking.isActive === false) return res.status(400).json({ error: "Already deleted" });
 
     const invoiceCount = await Invoice.countDocuments({
