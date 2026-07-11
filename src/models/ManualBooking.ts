@@ -41,7 +41,8 @@ export interface IManualBooking extends Document {
     | "FLIGHT" | "HOTEL" | "VISA" | "TRANSFER" | "OTHER"
     | "CAB" | "FOREX" | "ESIM" | "HOLIDAYS" | "EVENTS"
     | "DUMMY_FLIGHT" | "DUMMY_HOTEL" | "TRAIN"
-    | "FLIGHT_RESCHEDULE" | "TROPHY" | "GIFT" | "STATIONERY";
+    | "FLIGHT_RESCHEDULE" | "TROPHY" | "GIFT" | "STATIONERY"
+    | "INSURANCE" | "GROUP_BOOKING";
   status: "PENDING" | "WIP" | "CONFIRMED" | "INVOICED" | "CANCELLED";
   subStatus?: SubStatus;
   source: "MANUAL" | "SBT" | "ADMIN_QUEUE" | "SBT_AUTO";
@@ -58,6 +59,13 @@ export interface IManualBooking extends Document {
     roomCount?: number;
     description?: string;
     trainClass?: string;
+    // Transportation group — Transfer/Cab only.
+    pickupLocation?: string;
+    dropLocation?: string;
+    vehicleType?: string;
+    // Visa Service group only.
+    visaCountry?: string;
+    visaType?: string;
   };
   passengers: {
     name: string;
@@ -78,6 +86,21 @@ export interface IManualBooking extends Document {
     mimeType: string;
     uploadedBy: Schema.Types.ObjectId;
     uploadedAt: Date;
+  }[];
+  // Repeatable invoice-line-item table — Group Booking (Holidays/Events/Group
+  // Booking) only, for now. See infra/audit/events-line-items-audit.md. When
+  // non-empty, the pre-save hook below derives pricing.quotedPrice/grandTotal
+  // from Σ amount instead of the ON_MARKUP/ON_FULL markup-diff math, and
+  // buildLineItemsForBooking() (utils/invoiceLineItems.ts) emits one invoice
+  // row per entry instead of the usual 1-2 synthesized rows.
+  lineItems: {
+    sNo: number;
+    itemDescription: string;
+    quantity: number;
+    rate: number;
+    gstPct: number;
+    gstAmount: number;
+    amount: number;
   }[];
   pricing: {
     // primary fields
@@ -150,6 +173,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
         "CAB", "FOREX", "ESIM", "HOLIDAYS", "EVENTS",
         "DUMMY_FLIGHT", "DUMMY_HOTEL", "TRAIN",
         "FLIGHT_RESCHEDULE", "TROPHY", "GIFT", "STATIONERY",
+        "INSURANCE", "GROUP_BOOKING",
       ],
       required: true,
     },
@@ -169,6 +193,11 @@ const ManualBookingSchema = new Schema<IManualBooking>(
       roomCount: { type: Number, default: 1, min: 1 },
       description: String,
       trainClass: String,
+      pickupLocation: String,
+      dropLocation: String,
+      vehicleType: String,
+      visaCountry: String,
+      visaType: String,
     },
     passengers: [
       {
@@ -189,6 +218,20 @@ const ManualBookingSchema = new Schema<IManualBooking>(
         mimeType: { type: String, required: true },
         uploadedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
         uploadedAt: { type: Date, default: Date.now },
+      },
+    ],
+    lineItems: [
+      {
+        sNo: { type: Number, required: true },
+        itemDescription: { type: String, required: true },
+        quantity: { type: Number, required: true, default: 1 },
+        rate: { type: Number, required: true, default: 0 },
+        gstPct: { type: Number, required: true, default: 0 },
+        // gstAmount/amount are server-recomputed every save (pre-save hook
+        // below) from quantity×rate×gstPct — never trusted as submitted, same
+        // convention as the top-level pricing.* derived fields.
+        gstAmount: { type: Number, default: 0 },
+        amount: { type: Number, default: 0 },
       },
     ],
     pricing: {
@@ -265,7 +308,55 @@ ManualBookingSchema.pre("save", async function (next) {
 
   // Recalculate pricing fields every save
   const p = this.pricing;
-  if (p) {
+  const hasLineItems = Array.isArray((this as any).lineItems) && (this as any).lineItems.length > 0;
+
+  if (p && hasLineItems) {
+    // Group Booking with an explicit line-item table (infra/audit/
+    // events-line-items-audit.md, section B2): pricing.quotedPrice/grandTotal
+    // are DERIVED from Σ line amounts here, instead of the ON_MARKUP/ON_FULL
+    // markup-diff math below — so the invoice total always matches the rows,
+    // by construction (no separate re-derivation to drift against). Each
+    // row's gstAmount/amount is itself server-recomputed from
+    // quantity×rate×gstPct — never trusted as submitted, same convention as
+    // every other pricing.* derived field. actualPrice is left exactly as
+    // typed — Group Booking still tracks margin against a single Actual
+    // Inventory Price; only the client-facing total is line-item-driven.
+    let lineSubtotal = 0;
+    let lineGstTotal = 0;
+    let lineGrandTotal = 0;
+
+    (this as any).lineItems.forEach((li: any, idx: number) => {
+      const quantity = Number(li.quantity) || 0;
+      const rate = Number(li.rate) || 0;
+      const gstPct = Number(li.gstPct) || 0;
+      const base = quantity * rate;
+      const gstAmount = parseFloat(((base * gstPct) / 100).toFixed(2));
+      const amount = parseFloat((base + gstAmount).toFixed(2));
+
+      li.sNo = li.sNo != null ? li.sNo : idx + 1;
+      li.gstAmount = gstAmount;
+      li.amount = amount;
+
+      lineSubtotal += base;
+      lineGstTotal += gstAmount;
+      lineGrandTotal += amount;
+    });
+
+    const actualPrice = p.actualPrice || p.supplierCost || 0;
+    p.actualPrice  = actualPrice;
+    p.supplierCost = actualPrice;
+    p.quotedPrice  = parseFloat(lineSubtotal.toFixed(2));
+    p.sellingPrice = p.quotedPrice;
+    p.gstAmount    = parseFloat(lineGstTotal.toFixed(2));
+    p.grandTotal   = parseFloat(lineGrandTotal.toFixed(2));
+    p.totalWithGST = p.grandTotal;
+    p.diff         = parseFloat((p.quotedPrice - actualPrice).toFixed(2));
+    p.markupAmount = p.diff;
+    p.basePrice    = p.diff; // ON_FULL semantics: net profit before GST
+    p.profitMargin = actualPrice > 0
+      ? parseFloat(((p.basePrice / actualPrice) * 100).toFixed(2))
+      : 0;
+  } else if (p) {
     // Resolve actual/quoted from either field name (backward compat)
     const actualPrice = p.actualPrice || p.supplierCost || 0;
     const quotedPrice = p.quotedPrice || p.sellingPrice || 0;
@@ -375,9 +466,11 @@ function manualTypeToService(t: string): string {
     case "EVENTS":       return "MICE";
     case "TRAIN":        return "TRAIN";
     case "OTHER":
-    case "TROPHY":                       // gift/trophy/stationery mirror as OTHER
+    case "TROPHY":                       // gift/trophy/stationery/insurance/group-booking mirror as OTHER
     case "GIFT":
-    case "STATIONERY":   return "OTHER";
+    case "STATIONERY":
+    case "INSURANCE":
+    case "GROUP_BOOKING":  return "OTHER"; // for now — revisit once the line-item builder lands
     default:             return "OTHER";
   }
 }

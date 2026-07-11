@@ -784,6 +784,14 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
     const newTotalGST = newLineItems.reduce((s, li) => s + (li.igst ?? 0), 0);
     let newGrandTotal = 0;
     for (const b of newBookings as any[]) {
+      // Group Booking with lineItems[]: pricing.grandTotal is always the
+      // authoritative Σ line-amount total regardless of gstMode — see
+      // services/invoiceGeneration.service.ts's identical guard and
+      // infra/audit/events-line-items-audit.md.
+      if (Array.isArray(b.lineItems) && b.lineItems.length > 0) {
+        newGrandTotal += b.pricing?.grandTotal ?? 0;
+        continue;
+      }
       const gstMode = b.pricing?.gstMode || "ON_MARKUP";
       if (gstMode === "ON_MARKUP") {
         newGrandTotal += b.pricing?.quotedPrice ?? 0;
