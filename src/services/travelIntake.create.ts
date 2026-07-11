@@ -13,7 +13,7 @@
  * "public:<uuid>") — this module trusts `intakeRef` is already the full,
  * namespaced dedup key.
  */
-import ManualBooking from "../models/ManualBooking.js";
+import ManualBooking, { type ManualBookingType } from "../models/ManualBooking.js";
 
 // PlumTrips House Customer._id — created idempotently by
 // scripts/seed-intake-system-identities.ts (run 2026-07-08). NOT the
@@ -28,23 +28,61 @@ export const HOUSE_CUSTOMER_ID = "6a4e0d2ea90c293c9e129f48";
 export const SYSTEM_INTAKE_USER_ID = "6a4e0d2ec678b97e06f9ac3d";
 export const SYSTEM_INTAKE_EMAIL = "system-intake@plumtrips.com";
 
-// Form service label -> ManualBooking.type (per audit's field-mapping table).
-// Any label with no entry here is filtered out by recognizedServicesOf();
-// callers that want an "OTHER" catch-all for unmapped-but-present labels
-// handle that themselves (see intake.travel.ts's fan-out branch).
-export const SERVICE_TYPE_MAP: Record<string, string> = {
+// Form service label -> ManualBooking.type. Any label with no entry here is
+// filtered out by recognizedServicesOf(); callers that want an "OTHER"
+// catch-all for unmapped-but-present labels handle that themselves (see
+// intake.travel.ts's fan-out branch).
+//
+// The canonical labels (first block) MUST match
+// apps/frontend/src/constants/serviceTaxonomy.ts's SERVICE_TAXONOMY exactly —
+// there's no shared package between the two apps, so this map is hand-kept
+// in lockstep with that file. If a type/label is added/renamed there, mirror
+// it here too.
+const CANONICAL_SERVICE_TYPE_MAP: Record<string, ManualBookingType> = {
+  "Flight": "FLIGHT",
+  "Flight Reschedule": "FLIGHT_RESCHEDULE",
+  "Dummy Flight": "DUMMY_FLIGHT",
+  "Hotel": "HOTEL",
+  "Dummy Hotel": "DUMMY_HOTEL",
+  "Train": "TRAIN",
+  "Transfer": "TRANSFER",
+  "Cab": "CAB",
+  "Visa": "VISA",
+  "Holidays": "HOLIDAYS",
+  "Events": "EVENTS",
+  "Group Booking": "GROUP_BOOKING",
+  "Forex": "FOREX",
+  "eSIM": "ESIM",
+  "Insurance": "INSURANCE",
+  "Trophy": "TROPHY",
+  "Gift": "GIFT",
+  "Stationery": "STATIONERY",
+  "Other": "OTHER",
+};
+
+// Legacy aliases — pre-taxonomy public-form labels (superseded 2026-07-11)
+// plus the dormant Google-Form/HMAC channel's vocabulary (intake.travel.ts).
+// Kept so already-submitted/in-flight/queued payloads using these exact
+// strings still resolve; never surfaced as a UI option anymore.
+const LEGACY_SERVICE_ALIASES: Record<string, ManualBookingType> = {
   "Tourist Visa": "VISA",
   "Business Visa": "VISA",
   "Study Visa": "VISA",
-  "Flight": "FLIGHT",
   "Flight Booking": "FLIGHT",
-  "Hotel": "HOTEL",
   "Hotel Booking": "HOTEL",
   "Airport Transfer": "TRANSFER",
-  "Cab": "CAB",
   "Cab Services": "CAB",
   "Holiday Package": "HOLIDAYS",
+  // Pre-taxonomy public label — mapped to OTHER historically, NOT the new
+  // INSURANCE type. Deliberately left as-is so this alias's behavior for
+  // already-queued/in-flight payloads doesn't silently change; new
+  // submissions use the canonical "Insurance" label -> INSURANCE above.
   "Travel Insurance": "OTHER",
+};
+
+export const SERVICE_TYPE_MAP: Record<string, ManualBookingType> = {
+  ...LEGACY_SERVICE_ALIASES,
+  ...CANONICAL_SERVICE_TYPE_MAP,
 };
 
 export function parseIntakeDate(v: unknown): Date | null {

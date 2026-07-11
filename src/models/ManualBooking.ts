@@ -23,6 +23,21 @@ export const ALL_SUB_STATUSES = [
 
 export type SubStatus = (typeof ALL_SUB_STATUSES)[number] | "";
 
+// Canonical list of every ManualBooking.type value — single source of truth
+// for the Mongoose enum below AND for ManualBookingType (used by
+// constants/serviceTaxonomy.ts on both frontend and backend so the intake
+// forms' service options can never drift from what this schema actually
+// accepts). Order is cosmetic; membership is what matters.
+export const MANUAL_BOOKING_TYPES = [
+  "FLIGHT", "HOTEL", "VISA", "TRANSFER", "OTHER",
+  "CAB", "FOREX", "ESIM", "HOLIDAYS", "EVENTS",
+  "DUMMY_FLIGHT", "DUMMY_HOTEL", "TRAIN",
+  "FLIGHT_RESCHEDULE", "TROPHY", "GIFT", "STATIONERY",
+  "INSURANCE", "GROUP_BOOKING",
+] as const;
+
+export type ManualBookingType = (typeof MANUAL_BOOKING_TYPES)[number];
+
 export interface IManualBooking extends Document {
   workspaceId: Schema.Types.ObjectId;
   bookingRef: string;
@@ -37,12 +52,7 @@ export interface IManualBooking extends Document {
   bookingMonth?: string;
   requestProcessTAT?: number;
   invoiceRaisedDate?: Date;
-  type:
-    | "FLIGHT" | "HOTEL" | "VISA" | "TRANSFER" | "OTHER"
-    | "CAB" | "FOREX" | "ESIM" | "HOLIDAYS" | "EVENTS"
-    | "DUMMY_FLIGHT" | "DUMMY_HOTEL" | "TRAIN"
-    | "FLIGHT_RESCHEDULE" | "TROPHY" | "GIFT" | "STATIONERY"
-    | "INSURANCE" | "GROUP_BOOKING";
+  type: ManualBookingType;
   status: "PENDING" | "WIP" | "CONFIRMED" | "INVOICED" | "CANCELLED";
   subStatus?: SubStatus;
   source: "MANUAL" | "SBT" | "ADMIN_QUEUE" | "SBT_AUTO";
@@ -168,13 +178,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     invoiceRaisedDate: { type: Date },
     type: {
       type: String,
-      enum: [
-        "FLIGHT", "HOTEL", "VISA", "TRANSFER", "OTHER",
-        "CAB", "FOREX", "ESIM", "HOLIDAYS", "EVENTS",
-        "DUMMY_FLIGHT", "DUMMY_HOTEL", "TRAIN",
-        "FLIGHT_RESCHEDULE", "TROPHY", "GIFT", "STATIONERY",
-        "INSURANCE", "GROUP_BOOKING",
-      ],
+      enum: MANUAL_BOOKING_TYPES,
       required: true,
     },
     status: { type: String, enum: ["PENDING", "WIP", "CONFIRMED", "INVOICED", "CANCELLED"], default: "PENDING" },
