@@ -271,6 +271,14 @@ const BOOKING_COLUMNS = [
   // per-row-is-one-booking totals below all stay correct; blank for every
   // other type. Format: "1. Item — Qty N x Rate R (GST G%) = Amount".
   "Line Items",
+  // Transfer/Cab and Visa detail columns — appended at the end (not inserted
+  // among the cols above) to keep every existing column position stable for
+  // anyone's downstream sheets. Blank when not applicable to the row's type.
+  "Pickup Location",
+  "Drop Location",
+  "Vehicle Type",
+  "Visa Country",
+  "Visa Type",
 ];
 
 // Money column indices (1-based): Quoted=17, Actual=18, Diff=19, GST=20, Base=21, Grand=22
@@ -347,6 +355,11 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
     b.itinerary?.description ?? "",
     b.supplierPNR ?? "",
     formatLineItems(b),
+    b.itinerary?.pickupLocation ?? "",
+    b.itinerary?.dropLocation ?? "",
+    b.itinerary?.vehicleType ?? "",
+    b.itinerary?.visaCountry ?? "",
+    b.itinerary?.visaType ?? "",
   ];
 }
 
@@ -607,9 +620,10 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     headerRow.font = { bold: true };
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
 
-    // Column widths (41 cols: Booking Date at pos 2, Ref No. at pos 3, Traveler ID after Pax Name;
-    // cols 32-40 are the appended per-type detail columns; col 41 is Line Items)
-    const colWidths = [7, 14, 16, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16, 16, 16, 12, 24, 18, 9, 8, 30, 22, 40];
+    // Column widths (46 cols: Booking Date at pos 2, Ref No. at pos 3, Traveler ID after Pax Name;
+    // cols 32-40 are the appended per-type detail columns; col 41 is Line Items;
+    // cols 42-46 are the Transfer/Cab + Visa detail columns appended after that)
+    const colWidths = [7, 14, 16, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16, 16, 16, 12, 24, 18, 9, 8, 30, 22, 40, 20, 20, 16, 16, 16];
     colWidths.forEach((width, i) => {
       sheet.getColumn(i + 1).width = width;
     });
