@@ -265,11 +265,26 @@ const BOOKING_COLUMNS = [
   "Rooms",
   "Service Description",
   "Supplier PNR / Booking ID",
+  // Group Booking (Holidays/Events/Group Booking) line-item table — see
+  // infra/audit/events-line-items-audit.md. Flattened into ONE cell (not
+  // exploded into extra rows) so Sr. No / Traveler ID / the MONEY_COLS
+  // per-row-is-one-booking totals below all stay correct; blank for every
+  // other type. Format: "1. Item — Qty N x Rate R (GST G%) = Amount".
+  "Line Items",
 ];
 
 // Money column indices (1-based): Quoted=17, Actual=18, Diff=19, GST=20, Base=21, Grand=22
 // (shifted +2 by the "Booking Date" (pos 2) and "Ref No." (pos 3) columns)
 const MONEY_COLS = [17, 18, 19, 20, 21, 22];
+
+// One flat cell per booking — see the "Line Items" column comment above.
+function formatLineItems(b: any): string {
+  const items: any[] = Array.isArray(b.lineItems) ? b.lineItems : [];
+  if (!items.length) return "";
+  return items
+    .map((li) => `${li.sNo}. ${li.itemDescription} — Qty ${li.quantity} x ₹${li.rate} (GST ${li.gstPct}%) = ₹${li.amount}`)
+    .join(" | ");
+}
 
 function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = {}, tidMap: Record<string, string> = {}): (string | number | undefined)[] {
   const wsName =
@@ -331,6 +346,7 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
     b.itinerary?.roomCount ?? "",
     b.itinerary?.description ?? "",
     b.supplierPNR ?? "",
+    formatLineItems(b),
   ];
 }
 
@@ -591,9 +607,9 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     headerRow.font = { bold: true };
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
 
-    // Column widths (40 cols: Booking Date at pos 2, Ref No. at pos 3, Traveler ID after Pax Name;
-    // cols 32-40 are the appended per-type detail columns)
-    const colWidths = [7, 14, 16, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16, 16, 16, 12, 24, 18, 9, 8, 30, 22];
+    // Column widths (41 cols: Booking Date at pos 2, Ref No. at pos 3, Traveler ID after Pax Name;
+    // cols 32-40 are the appended per-type detail columns; col 41 is Line Items)
+    const colWidths = [7, 14, 16, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16, 16, 16, 12, 24, 18, 9, 8, 30, 22, 40];
     colWidths.forEach((width, i) => {
       sheet.getColumn(i + 1).width = width;
     });

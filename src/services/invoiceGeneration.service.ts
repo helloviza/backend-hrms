@@ -337,6 +337,16 @@ async function createOneInvoice(
   const subtotal = parseFloat((totalAmount - totalGST).toFixed(2));
   let grandTotal = 0;
   for (const b of bookingsForInvoice as any[]) {
+    // Group Booking with an explicit lineItems[] table: pricing.grandTotal is
+    // ALWAYS the authoritative Σ line-amount total (ManualBooking.ts pre-save
+    // hook) regardless of gstMode — gstMode is a stale/irrelevant leftover
+    // field for these bookings, not the "quotedPrice already includes GST"
+    // signal the branch below assumes. See infra/audit/
+    // events-line-items-audit.md.
+    if (Array.isArray(b.lineItems) && b.lineItems.length > 0) {
+      grandTotal += b.pricing?.grandTotal ?? 0;
+      continue;
+    }
     const gstMode = b.pricing?.gstMode || "ON_MARKUP";
     if (gstMode === "ON_MARKUP") {
       grandTotal += b.pricing?.quotedPrice ?? 0;

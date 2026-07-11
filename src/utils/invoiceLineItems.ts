@@ -18,6 +18,8 @@ const TYPE_COST_LABELS: Record<string, string> = {
   TROPHY:       "Service Cost",
   GIFT:         "Service Cost",
   STATIONERY:   "Service Cost",
+  INSURANCE:    "Insurance Cost",
+  GROUP_BOOKING: "Service Cost",
   SERVICE:      "Service Cost",
 };
 
@@ -153,7 +155,12 @@ function buildSubDescription(booking: any, paxStr: string): string {
   } else if (t === "TRAIN") {
     const origin      = booking.itinerary?.origin || "";
     const destination = booking.itinerary?.destination || "";
-    const route       = origin && destination ? `${origin}-${destination}` : origin || destination || "—";
+    // Fall back to Sector/Description (the generic Service Details fields) —
+    // Train now saves through that form section, which never populates
+    // origin/destination, so a booking without them would otherwise show "—".
+    const route       = origin && destination
+      ? `${origin}-${destination}`
+      : origin || destination || booking.itinerary?.description || booking.sector || "—";
     const trainClass  = booking.itinerary?.trainClass || "";
     const trainNo     = booking.itinerary?.flightNo || "";
     const carrier     = [trainClass, trainNo].filter(Boolean).join(" ");
@@ -196,6 +203,29 @@ function buildSubDescription(booking: any, paxStr: string): string {
 export function buildLineItemsForBooking(booking: any): any[] {
   const passengerNames: string[] = (booking.passengers || []).map((p: any) => p.name);
   const paxStr = passengerNames.join(", ") || "—";
+
+  // Events/Group Booking with an explicit lineItems[] table — one invoice row
+  // per line item, no COST/SERVICE_FEE split (no per-row markup concept; see
+  // infra/audit/events-line-items-audit.md, C1 / Open Questions 4 & 6). The
+  // booking's pricing.grandTotal is already Σ these amounts (derived in the
+  // ManualBooking pre-save hook), so there is no reconciliation drift to
+  // absorb here — amounts are read straight off the stored rows.
+  if (Array.isArray(booking.lineItems) && booking.lineItems.length > 0) {
+    return booking.lineItems.map((li: any) => ({
+      bookingRef:     booking.bookingRef,
+      rowType:        "COST",
+      description:    li.itemDescription,
+      subDescription: `Qty ${li.quantity} × Rate ${li.rate}`,
+      qty:            li.quantity,
+      rate:           li.rate,
+      igst:           li.gstAmount,
+      amount:         li.amount,
+      passengerNames,
+      travelDate:     booking.travelDate,
+      type:           booking.type,
+      sNo:            li.sNo,
+    }));
+  }
 
   const supplierCost = booking.pricing?.supplierCost ?? booking.pricing?.actualPrice ?? 0;
   const markupAmount = booking.pricing?.markupAmount ?? booking.pricing?.diff ?? 0;
