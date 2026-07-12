@@ -1595,11 +1595,16 @@ router.get(
       );
       if (!attachment) return res.status(404).json({ error: "Attachment not found" });
 
+      // ?view=1 — same route, same access check, same short TTL as Download;
+      // only the presign call differs (see s3Presign.ts).
+      const view = req.query.view === "1" || req.query.view === "true";
       const url = await presignGetObject({
         bucket: env.S3_BUCKET,
         key: attachment.s3Key,
         filename: attachment.originalFilename,
         expiresInSeconds: env.PRESIGN_TTL,
+        view,
+        contentType: attachment.mimeType,
       });
 
       res.json({ ok: true, url, expiresIn: env.PRESIGN_TTL });
