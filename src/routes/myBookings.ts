@@ -17,6 +17,7 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
 import mongoose from "mongoose";
+import ExcelJS from "exceljs";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import TravelBooking from "../models/TravelBooking.js";
@@ -261,11 +262,16 @@ router.get("/:bookingRef/attachments/:attId/url", async (req: Request, res: Resp
     );
     if (!attachment) return res.status(404).json({ ok: false, error: "Attachment not found" });
 
+    // ?view=1 — same route, same access check, same short TTL as Download;
+    // only the presign call differs (see s3Presign.ts).
+    const view = req.query.view === "1" || req.query.view === "true";
     const url = await presignGetObject({
       bucket: env.S3_BUCKET,
       key: attachment.s3Key,
       filename: attachment.originalFilename,
       expiresInSeconds: env.PRESIGN_TTL,
+      view,
+      contentType: attachment.mimeType,
     });
 
     res.json({ ok: true, url, expiresIn: env.PRESIGN_TTL });
@@ -275,6 +281,236 @@ router.get("/:bookingRef/attachments/:attId/url", async (req: Request, res: Resp
       error: err?.message,
     });
     res.status(500).json({ ok: false, error: "Failed to get download url" });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * Customer-facing Manual (concierge) bookings table + export.
+ *
+ * Reads ManualBooking DIRECTLY (NOT the TravelBooking mirror — see
+ * infra/audit/customer-bookings-export-audit.md, sections A/B: the mirror is
+ * lossy/missing 8 of these 12 columns: Invoice Date/Number, Req Date, Given
+ * By, exact Type, and Sector never reach it or its API allowlist at all).
+ * SBT-sourced bookings have no ManualBooking row, so this view is inherently
+ * concierge/manual-only, by construction — not a filter applied on top.
+ *
+ * ACCESS: same predicate as the attachment routes above,
+ * canCustomerAccessBookingAttachments() — UNCHANGED, not the list endpoint's
+ * (GET /) userId-based OWN-scope filter, which the audit found matches
+ * ManualBooking.bookedBy (the staff creator), not the customer (see
+ * ManualBooking.ts:537's own comment: "NOT the displayed traveller"). Every
+ * candidate row is re-checked against the predicate in-process after a
+ * tenant-scoped fetch — never trusted from the Mongo filter alone (audit,
+ * section D: defense-in-depth against the documented wrong-id-space class of
+ * bug in ManualBooking.workspaceId).
+ * ═════════════════════════════════════════════════════════════════════ */
+
+function fmtDateDMY(d: Date | string | null | undefined): string {
+  if (!d) return "";
+  const dt = new Date(d as string);
+  if (isNaN(dt.getTime())) return "";
+  const dd = String(dt.getDate()).padStart(2, "0");
+  const mm = String(dt.getMonth() + 1).padStart(2, "0");
+  return `${dd}/${mm}/${dt.getFullYear()}`;
+}
+
+function csvRow(values: (string | number | undefined | null)[]) {
+  return (
+    values
+      .map((v) => {
+        const s = v == null ? "" : String(v);
+        return s.includes(",") || s.includes('"') || s.includes("\n")
+          ? `"${s.replace(/"/g, '""')}"`
+          : s;
+      })
+      .join(",") + "\n"
+  );
+}
+
+/**
+ * Generalizes loadBookingForCustomer() (above) from "one booking by ref" to
+ * "every ManualBooking this caller may see for their own tenant" — same
+ * access predicate, same id-space (Customer._id), same fail-closed-on-no-
+ * customerId behavior.
+ *
+ * Field projection is EXPLICIT and narrow (audit, section D's implementation
+ * trap): `passengers.name passengers.email` only — never a bare
+ * `"passengers"`, which would pull the whole subdocument (panNo/passportNo
+ * included) since Mongoose projects entire array subdocuments unless told
+ * otherwise. No pricing field beyond the three Grand-Total fallbacks (all
+ * customer-facing sell price, matching the mirror-sync's own formula at
+ * ManualBooking.ts:528-529) — never actualPrice/supplierCost/markupAmount/
+ * profitMargin. No supplierName/supplierPNR/notes.
+ */
+async function loadManualBookingsForCustomer(
+  req: Request,
+  opts: { from?: string; to?: string; limit?: number } = {},
+): Promise<any[]> {
+  const user: any = (req as any).user;
+  const customerId = (req as any).workspace?.customerId ?? null;
+  if (!customerId || !mongoose.isValidObjectId(customerId)) return [];
+
+  const ctx = {
+    customerId,
+    isOrgScope: isOrgScopeUser(user),
+    email: user?.email ?? null,
+  };
+
+  const filter: Record<string, any> = {
+    workspaceId: customerId,
+    isActive: { $ne: false },
+  };
+  if (opts.from || opts.to) {
+    filter.bookingDate = {};
+    if (opts.from) filter.bookingDate.$gte = new Date(opts.from);
+    if (opts.to) filter.bookingDate.$lte = new Date(`${opts.to}T23:59:59.999Z`);
+  }
+  // Demo Platform — same isDemo scoping convention as GET / above.
+  filter.isDemo = user?.isDemoUser ? true : { $ne: true };
+
+  const docs: any[] = await ManualBooking.find(filter)
+    .select(
+      "workspaceId bookingDate reqDate givenBy sector type travelDate returnDate " +
+        "pricing.grandTotal pricing.totalWithGST pricing.quotedPrice " +
+        "passengers.name passengers.email " +
+        "itinerary.origin itinerary.destination itinerary.hotelName invoiceId",
+    )
+    .populate("invoiceId", "invoiceNo invoiceDate")
+    .sort({ bookingDate: -1 })
+    .limit(Math.min(2000, Math.max(1, opts.limit ?? 2000)))
+    .lean();
+
+  // Re-run the access predicate per record — the tenant clause in `filter`
+  // above is a coarse pre-filter, not the authority (see doc comment above).
+  return docs.filter((b) => canCustomerAccessBookingAttachments(ctx, b));
+}
+
+const CUSTOMER_BOOKING_COLUMNS = [
+  "S. No",
+  "Booking Date",
+  "Invoice Date",
+  "Invoice Number",
+  "Req Date",
+  "Pax Name",
+  "Given By",
+  "Type",
+  "Sector",
+  "Travel Date",
+  "Arrival Date",
+  "Grand Total",
+];
+
+/** The 12 customer-safe fields, keyed — shared by the JSON list and the export row builder. */
+function customerBookingFields(b: any) {
+  const paxName = (b.passengers || [])
+    .map((p: any) => String(p?.name ?? "").trim())
+    .filter(Boolean)
+    .join(" | ");
+  const sector =
+    b.sector ||
+    (b.itinerary?.origin && b.itinerary?.destination
+      ? `${b.itinerary.origin}-${b.itinerary.destination}`
+      : b.itinerary?.hotelName || "");
+
+  return {
+    bookingDate: fmtDateDMY(b.bookingDate),
+    invoiceDate: fmtDateDMY(b.invoiceId?.invoiceDate),
+    invoiceNumber: b.invoiceId?.invoiceNo ?? "",
+    reqDate: fmtDateDMY(b.reqDate),
+    paxName,
+    givenBy: b.givenBy ?? "",
+    type: b.type ?? "",
+    sector,
+    travelDate: fmtDateDMY(b.travelDate),
+    arrivalDate: fmtDateDMY(b.returnDate),
+    // Customer-facing sell price only — same fallback chain the mirror sync
+    // itself uses (ManualBooking.ts:528-529) — never cost/margin.
+    grandTotal: b.pricing?.grandTotal ?? b.pricing?.totalWithGST ?? b.pricing?.quotedPrice ?? 0,
+  };
+}
+
+function customerBookingRow(b: any, srNo: number): (string | number)[] {
+  const f = customerBookingFields(b);
+  return [
+    srNo,
+    f.bookingDate,
+    f.invoiceDate,
+    f.invoiceNumber,
+    f.reqDate,
+    f.paxName,
+    f.givenBy,
+    f.type,
+    f.sector,
+    f.travelDate,
+    f.arrivalDate,
+    f.grandTotal,
+  ];
+}
+
+// GET /api/my-bookings/manual — the 12-column table, JSON.
+router.get("/manual", async (req: Request, res: Response) => {
+  try {
+    const docs = await loadManualBookingsForCustomer(req, {
+      from: req.query.from as string | undefined,
+      to: req.query.to as string | undefined,
+      limit: Math.min(200, Math.max(1, parseInt(req.query.limit as string, 10) || 100)),
+    });
+    const bookings = docs.map((b, idx) => ({ sNo: idx + 1, ...customerBookingFields(b) }));
+    res.json({ ok: true, bookings });
+  } catch (err: any) {
+    logger.error("my-bookings manual list failed", {
+      userId: (req as any).user?.sub || (req as any).user?._id,
+      error: err?.message,
+    });
+    res.status(500).json({ ok: false, error: "Failed to load bookings" });
+  }
+});
+
+// GET /api/my-bookings/manual/export?format=xlsx|csv — same 12 columns, full history (no limit).
+router.get("/manual/export", async (req: Request, res: Response) => {
+  try {
+    const docs = await loadManualBookingsForCustomer(req, {
+      from: req.query.from as string | undefined,
+      to: req.query.to as string | undefined,
+    });
+    const format = req.query.format === "xlsx" ? "xlsx" : "csv";
+
+    if (format === "csv") {
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader("Content-Disposition", 'attachment; filename="my-bookings.csv"');
+      res.write(csvRow(CUSTOMER_BOOKING_COLUMNS));
+      docs.forEach((b, idx) => res.write(csvRow(customerBookingRow(b, idx + 1))));
+      res.end();
+      return;
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("My Bookings");
+    sheet.views = [{ state: "frozen", ySplit: 1 }];
+
+    const headerRow = sheet.addRow(CUSTOMER_BOOKING_COLUMNS);
+    headerRow.font = { bold: true };
+    headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
+
+    const colWidths = [7, 14, 14, 18, 12, 28, 18, 14, 22, 14, 14, 16];
+    colWidths.forEach((width, i) => { sheet.getColumn(i + 1).width = width; });
+    sheet.getColumn(12).numFmt = "#,##0.00";
+
+    docs.forEach((b, idx) => sheet.addRow(customerBookingRow(b, idx + 1)));
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader("Content-Disposition", 'attachment; filename="my-bookings.xlsx"');
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err: any) {
+    logger.error("my-bookings manual export failed", {
+      userId: (req as any).user?.sub || (req as any).user?._id,
+      error: err?.message,
+    });
+    res.status(500).json({ ok: false, error: "Failed to export bookings" });
   }
 });
 
