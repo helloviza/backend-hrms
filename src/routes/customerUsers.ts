@@ -141,7 +141,7 @@ function isL1Actor(u: any): boolean {
 
 const PLUMTRIPS_WORKSPACE_ID = "69679a7628330a58d29f2254";
 
-function isStaffPrivileged(u: any) {
+export function isStaffPrivileged(u: any) {
   const r = collectRoles(u);
 
   // Hard exclusion 1: TENANT_ADMIN/CLIENT_ADMIN are workspace-scoped
@@ -781,9 +781,48 @@ async function ensureAuthUserForCustomer(params: {
   const finalPassword = passwordPlain || crypto.randomBytes(8).toString("hex");
   const passwordHash = await bcrypt.hash(finalPassword, 12);
 
+  // Scoped-first: check the TARGET workspace by customerId before ever
+  // looking globally. The User model has a field-level unique index on
+  // email from its original scaffold AND a later compound
+  // {workspaceId,email} unique index from the multi-tenancy refactor,
+  // and both still exist in the schema — so it isn't certain which one is
+  // actually enforced live. If email can legitimately repeat across
+  // workspaces, a bare global $or match is non-deterministic (Mongo
+  // returns whichever same-email doc it finds first) and could pick a
+  // DIFFERENT workspace's user than the one this workspace actually owns.
+  // Checking the target workspace first makes the legitimate "this person
+  // already has an account here" case correct regardless of which index
+  // interpretation is live.
   let user: any = await User.findOne({
     $or: [{ email }, { officialEmail: email }, { personalEmail: email }],
+    customerId: params.customerId,
   }).exec();
+
+  if (!user) {
+    // No match owned by the target workspace — fall back to a global check
+    // purely to detect a genuine cross-workspace conflict (or to adopt an
+    // orphaned account with no customerId yet). This is where the original
+    // fix lived; kept, but now only reached once the scoped match has
+    // already come up empty.
+    const globalMatch: any = await User.findOne({
+      $or: [{ email }, { officialEmail: email }, { personalEmail: email }],
+    }).exec();
+
+    // SECURITY: an EXISTING match belonging to a different workspace must
+    // never be silently absorbed and have its password/roles overwritten
+    // just because a workspace leader elsewhere typed the same email. That
+    // was a real cross-tenant password-set hole — a WORKSPACE_LEADER in
+    // workspace A supplying `password` for an email that happens to
+    // already be a real user in workspace B would reset B's user's
+    // password here. Refuse instead of merging identities.
+    if (globalMatch && globalMatch.customerId && String(globalMatch.customerId) !== String(params.customerId)) {
+      return { user: null, created: false, tempPassword: null, conflict: true as const };
+    }
+
+    // Either no match anywhere, or a match with no customerId yet
+    // (orphaned/staff-created account) — safe to adopt/create against.
+    user = globalMatch;
+  }
 
   if (!user) {
     user = await User.create({
@@ -2119,7 +2158,7 @@ router.post("/", requireAuth, async (req: any, res) => {
     }
 
     const passwordPlain = req.body?.password ? String(req.body.password) : null;
-    const { user, created, tempPassword } = await ensureAuthUserForCustomer({
+    const ensured = await ensureAuthUserForCustomer({
       email,
       name,
       customerId,
@@ -2128,6 +2167,15 @@ router.post("/", requireAuth, async (req: any, res) => {
       passwordPlain,
       managerUser,
     });
+
+    if ((ensured as any).conflict) {
+      return res.status(409).json({
+        error: "A user with this email already exists in a different workspace.",
+        code: "CROSS_WORKSPACE_EMAIL_CONFLICT",
+      });
+    }
+
+    const { user, created, tempPassword } = ensured;
 
     // Apply SBT fields if provided
     if (sbtRole && user) {

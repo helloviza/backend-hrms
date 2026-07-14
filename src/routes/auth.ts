@@ -279,27 +279,6 @@ function clearAccessCookie(res: any) {
   });
 }
 
-function generateRandomPassword(length = 12): string {
-  const chars =
-    "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*";
-  let out = "";
-  for (let i = 0; i < length; i += 1)
-    out += chars.charAt(Math.floor(Math.random() * chars.length));
-  return out;
-}
-
-function isHrOrAdmin(user: any | null | undefined): boolean {
-  if (!user) return false;
-  const roles = normalizeRoles(user.roles || []);
-  return (
-    roles.includes("HR") ||
-    roles.includes("ADMIN") ||
-    roles.includes("HR_ADMIN") ||
-    roles.includes("SUPERADMIN") ||
-    roles.includes("STAFF")
-  );
-}
-
 /**
  * ✅ STAFF detector (prevents customer auto-link + customer role pollution)
  * Treat as STAFF if:
@@ -706,45 +685,6 @@ async function findCustomerMemberByEmail(email: string) {
 async function findWorkspaceByCustomerId(customerId: string) {
   if (!customerId) return null;
   return CustomerWorkspace.findOne({ customerId }).lean().exec();
-}
-
-async function ensureUserFromWorkspaceMember(email: string, passwordHash: string) {
-  const member: any = await findCustomerMemberByEmail(email);
-  if (!member) return { user: null, createdFromWorkspace: false };
-
-  const roles = normalizeRoles(["CUSTOMER", member.role || "REQUESTER"]);
-  const name = String(member.name || "").trim();
-  const firstName = name || "Workspace User";
-
-  const ws = await findWorkspaceByCustomerId(String(member.customerId || ""));
-
-  const user: any = await User.create({
-    email,
-    officialEmail: email,
-    personalEmail: email,
-    firstName,
-    lastName: "",
-    roles,
-    passwordHash,
-    customerId: member.customerId,
-    businessId: member.customerId,
-    workspaceId: ws?._id || member.customerId,
-    role: "CUSTOMER",
-    accountType: "CUSTOMER",
-    userType: "CUSTOMER",
-    hrmsAccessRole: "CUSTOMER",
-    hrmsAccessLevel: "CUSTOMER",
-  });
-
-  return {
-    user,
-    createdFromWorkspace: true,
-    workspaceInfo: {
-      customerId: String(member.customerId || ""),
-      memberRole: String(member.role || ""),
-      hasWorkspace: Boolean(ws),
-    },
-  };
 }
 
 /* ───────────────────────────────────────────────
@@ -1229,162 +1169,19 @@ r.post("/change-password", async (req, res) => {
 });
 
 /* ───────────────────────────────────────────────
- * ADMIN RESET PASSWORD (HR/Admin only)
+ * ADMIN RESET PASSWORD — REMOVED (2026-07).
+ * Was POST /admin/reset-password: looked up the target user by email with
+ * NO workspace/tenant filter, gated only by isHrOrAdmin (which admitted
+ * plain STAFF), never checked the caller's own password, returned the
+ * plaintext new password in the response body, and auto-created a User
+ * with a guessed workspaceId on a miss. Any HR/Admin/Staff in any
+ * workspace could take over any account in any other workspace. Deleted
+ * outright, not patched — see docs/audits (password-reset tenant-scoping
+ * fix) for the full writeup. Every caller now uses
+ * POST /api/password/admin-set (routes/password.ts), which is workspace-
+ * scoped server-side from the caller's token, gated to ADMIN/SUPERADMIN/
+ * HR_ADMIN only, and never echoes the password back.
  * ─────────────────────────────────────────────── */
-r.post("/admin/reset-password", async (req, res) => {
-  try {
-    const token = extractAccessToken(req);
-    if (!token) return res.status(401).json({ error: "Missing token" });
-
-    let payload: any;
-    try {
-      payload = verifyAccessTokenOrThrow(token);
-    } catch (err: any) {
-      return send401ForJwtError(res, err);
-    }
-
-    // NOTE: pre-auth lookup, workspace not yet available
-    const actor: any = await User.findById(payload.sub);
-    if (!actor) return res.status(404).json({ error: "Actor not found" });
-    if (!isHrOrAdmin(actor)) return res.status(403).json({ error: "HR/Admin access required" });
-
-    const { email, newPassword } = req.body || {};
-    if (!email || typeof email !== "string") {
-      return res.status(400).json({ error: "Email is required to reset password" });
-    }
-
-    const normalizedEmail = normalizeEmail(email);
-
-    const finalPassword =
-      typeof newPassword === "string" && newPassword.length >= 8
-        ? newPassword
-        : generateRandomPassword(12);
-
-    const finalHash = await bcrypt.hash(finalPassword, 12);
-
-    let user: any = await User.findOne({
-      $or: [
-        { email: normalizedEmail },
-        { officialEmail: normalizedEmail },
-        { personalEmail: normalizedEmail },
-      ],
-    });
-
-    let created = false;
-    let createdFromWorkspace = false;
-    let workspaceInfo: any = null;
-
-    const customer = await Customer.findOne({
-      $or: [
-        { email: normalizedEmail },
-        { officialEmail: normalizedEmail },
-        { official_email: normalizedEmail },
-      ],
-    });
-
-    const vendor = await Vendor.findOne({
-      $or: [
-        { email: normalizedEmail },
-        { officialEmail: normalizedEmail },
-        { official_email: normalizedEmail },
-      ],
-    });
-
-    if (!user) {
-      const ensured = await ensureUserFromWorkspaceMember(normalizedEmail, finalHash);
-      if (ensured.user) {
-        user = ensured.user;
-        created = true;
-        createdFromWorkspace = true;
-        workspaceInfo = ensured.workspaceInfo || null;
-      }
-    }
-
-    if (!user) {
-      if (!customer && !vendor) {
-        return res.status(404).json({
-          error: "No user, customer or vendor found with this email",
-          hint: "If created via Customer Workspace users, ensure it exists in CustomerMember.",
-        });
-      }
-
-      const roles: string[] = [];
-      if (vendor) roles.push("VENDOR");
-      if (customer) roles.push("CUSTOMER");
-
-      const baseDoc: any = customer || vendor;
-
-      const firstName =
-        baseDoc?.contactPerson ||
-        baseDoc?.contactName ||
-        baseDoc?.inviteeName ||
-        baseDoc?.name ||
-        baseDoc?.companyName ||
-        "";
-
-      // Resolve workspaceId from customer/vendor → workspace, or actor's workspace
-      const customerId = String((customer as any)?._id || (vendor as any)?.customerId || "");
-      let wsId = customerId ? (await findWorkspaceByCustomerId(customerId))?._id : null;
-      if (!wsId) {
-        // Fallback: use the actor's (admin's) workspace
-        wsId = actor.workspaceId || null;
-      }
-      if (!wsId) {
-        const ws = await CustomerWorkspace.findOne({ status: "ACTIVE" }).select("_id").lean();
-        wsId = ws?._id || null;
-      }
-
-      user = await User.create({
-        email: normalizedEmail,
-        officialEmail: normalizedEmail,
-        personalEmail: normalizedEmail,
-        firstName,
-        lastName: "",
-        roles: normalizeRoles(roles.length ? roles : ["EMPLOYEE"]),
-        passwordHash: finalHash,
-        workspaceId: wsId,
-      });
-
-      created = true;
-    } else {
-      user.passwordHash = finalHash;
-
-      const set = new Set<string>(normalizeRoles(user.roles || []));
-      if (vendor) set.add("VENDOR");
-      if (customer) set.add("CUSTOMER");
-      if (createdFromWorkspace) set.add("CUSTOMER");
-      if (set.size === 0) set.add("EMPLOYEE");
-
-      user.roles = Array.from(set);
-      await user.save();
-    }
-
-    if (customer && !(customer as any).ownerId) {
-      (customer as any).ownerId = user._id;
-      await (customer as any).save();
-    }
-
-    if (vendor && !(vendor as any).ownerId) {
-      (vendor as any).ownerId = user._id;
-      await (vendor as any).save();
-    }
-
-    const { safe } = await buildAuthSafeUser(user);
-
-    res.json({
-      ok: true,
-      user: safe,
-      email: safe.email,
-      tempPassword: finalPassword,
-      created,
-      createdFromWorkspace,
-      workspaceInfo,
-    });
-  } catch (err: any) {
-    authLogger.error("Admin reset password error", { error: err?.message, stack: err?.stack });
-    res.status(500).json({ error: "Failed to reset password", detail: err?.message });
-  }
-});
 
 /* ───────────────────────────────────────────────
  * FORGOT PASSWORD
