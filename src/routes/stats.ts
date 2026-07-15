@@ -1,8 +1,10 @@
 // apps/backend/src/routes/stats.ts
 import { Router, Request, Response, NextFunction } from "express";
 import requireAuth from "../middleware/auth.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import Attendance from "../models/Attendance.js";
 import LeaveRequest from "../models/LeaveRequest.js";
+import DocumentModel from "../models/Document.js";
 import dayjs from "dayjs";
 
 const router = Router();
@@ -22,12 +24,21 @@ export type DashboardStats = {
   leavesTaken: string;
   pendingApprovals: string;
   docsUploaded: string;
+  // Whether the user has ANY Attendance record ever (not just in the 30-day
+  // window above) — lets callers distinguish "never expected to punch in"
+  // from "punched in before, just not recently" without hardcoding a role list.
+  hasAttendanceHistory: boolean;
   attendance: AttendancePoint[];
   leaveMix: LeaveSlice[];
 };
 
 // 🔒 always ensure req.user.sub exists
 router.use(requireAuth as any);
+// Workspace context for the real per-user document count below (SUPERADMIN
+// bypass in requireWorkspace leaves workspaceObjectId unset when no explicit
+// workspace is supplied, which is fine — the count below falls back to a
+// userId-only match in that case).
+router.use(requireWorkspace as any);
 
 // ───────────────── helpers ─────────────────
 
@@ -80,6 +91,7 @@ router.get(
       leavesTaken: "0",
       pendingApprovals: "0",
       docsUploaded: "0",
+      hasAttendanceHistory: false,
       attendance: [],
       leaveMix: [],
     };
@@ -151,6 +163,18 @@ router.get(
           ? `${Math.min(100, Math.round((presentDays / workingDays) * 100))}%`
           : "—";
 
+      // Has this user EVER punched in, in any period — distinct from the
+      // 30-day window above. Lets the UI tell "not expected to track
+      // attendance" (no history at all) apart from "tracked before, just
+      // not in the last 30 days" without maintaining a role list.
+      const attendanceHistoryFilter: Record<string, any> = { userId };
+      if ((req as any).workspaceObjectId) {
+        attendanceHistoryFilter.workspaceId = (req as any).workspaceObjectId;
+      }
+      const hasAttendanceHistory = await Attendance.exists(
+        attendanceHistoryFilter,
+      ).then((doc) => !!doc);
+
       // ───────── Leaves (all time – new LeaveRequest model) ─────────
       const leavesDocs: any[] = await LeaveRequest.find({ userId }).lean();
 
@@ -189,13 +213,18 @@ router.get(
         ([type, value]) => ({ type, value })
       );
 
-      const docsUploaded = "0"; // placeholder for now
+      // ───────── Documents (real per-user count, workspace-scoped when known) ─────────
+      const docFilter: Record<string, any> = { userId };
+      const wsObjectId = (req as any).workspaceObjectId;
+      if (wsObjectId) docFilter.workspaceId = wsObjectId;
+      const docsUploaded = String(await DocumentModel.countDocuments(docFilter));
 
       const payload: DashboardStats = {
         attendancePercent,
         leavesTaken: String(leavesTakenDays),
         pendingApprovals: String(pendingApprovals),
         docsUploaded,
+        hasAttendanceHistory,
         attendance,
         leaveMix,
       };
