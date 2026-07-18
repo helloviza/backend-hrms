@@ -9,6 +9,7 @@ import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
 import { requireAuth } from "../middleware/auth.js";
+import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import { sendWelcomeEmail, sendEmailVerification } from "../services/email.service.js";
 import { seedTaskAutomations } from "../services/taskAutomationSeed.js";
 
@@ -253,7 +254,15 @@ r.post("/resend-verification", requireAuth, async (req: any, res) => {
       return res.status(404).json({ error: "User not found." });
     }
 
-    const workspace = await CustomerWorkspace.findById(user.workspaceId);
+    // Same hand-rolled findById(user.workspaceId) drift that caused the
+    // /auth/me bug — resolve the correct _id via the shared customer-first
+    // resolver, then re-fetch a mutable (non-lean) document for the .save()
+    // below (the shared resolver always returns .lean() plain objects).
+    const resolvedWs: any = await resolveWorkspaceForUser(user, "_id");
+    if (!resolvedWs) {
+      return res.status(404).json({ error: "Workspace not found." });
+    }
+    const workspace = await CustomerWorkspace.findById(resolvedWs._id);
     if (!workspace) {
       return res.status(404).json({ error: "Workspace not found." });
     }

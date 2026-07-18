@@ -38,7 +38,7 @@ const STAFF_OVERRIDE_ROLES = new Set([
   "OWNER",      // internal role key (Role.ts)
 ]);
 
-function isCustomerUser(user: any): boolean {
+export function isCustomerUser(user: any): boolean {
   const roles: string[] = Array.isArray(user?.roles)
     ? user.roles.map((r: string) => String(r).toUpperCase())
     : [];
@@ -53,13 +53,13 @@ const WS_SELECT = "_id customerId status config travelMode tenantType";
  * resolveWorkspaceById — resolves by workspace _id, then falls back to customerId.
  * Used for staff users whose JWT carries a reliable workspaceId.
  */
-async function resolveWorkspaceById(raw: string) {
+async function resolveWorkspaceById(raw: string, select: string) {
   let workspace = await CustomerWorkspace.findById(raw)
-    .select(WS_SELECT)
+    .select(select)
     .lean();
   if (!workspace) {
     workspace = await CustomerWorkspace.findOne({ customerId: raw })
-      .select(WS_SELECT)
+      .select(select)
       .lean();
   }
   return workspace;
@@ -69,10 +69,68 @@ async function resolveWorkspaceById(raw: string) {
  * resolveWorkspaceByCustomerId — resolves directly via customerId field.
  * Used for customer-type users where workspaceId in JWT may be stale/wrong.
  */
-async function resolveWorkspaceByCustomerId(customerId: string) {
+async function resolveWorkspaceByCustomerId(customerId: string, select: string) {
   return CustomerWorkspace.findOne({ customerId })
-    .select(WS_SELECT)
+    .select(select)
     .lean();
+}
+
+/**
+ * resolveWorkspaceForUser — THE single source of truth for "which
+ * CustomerWorkspace does this user belong to." Customer-type users (per
+ * isCustomerUser) resolve via customerId — their JWT/DB workspaceId may be
+ * stale or point at the wrong workspace (the exact defect that let a
+ * customer's /auth/me response return the Plumtrips HOUSE workspace object).
+ * Staff users resolve via workspaceId first (reliable for them), falling
+ * back to customerId.
+ *
+ * Every caller that needs "the current user's own workspace" — requireWorkspace
+ * below AND GET /auth/me — MUST go through this function rather than
+ * hand-rolling their own findById(user.workspaceId). That drift (auth.ts had
+ * its own unconditional findById) is exactly what caused the bug; keeping
+ * one resolver is what prevents it recurring.
+ *
+ * `select` lets each caller request only the fields it needs in a single
+ * query (requireWorkspace's lightweight WS_SELECT vs /auth/me's richer
+ * company-profile fields) without duplicating the resolution algorithm.
+ */
+export async function resolveWorkspaceForUser(
+  user: any,
+  select: string = WS_SELECT,
+): Promise<any | null> {
+  const customerRaw = user?.customerId ?? user?.businessId ?? null;
+  const staffRaw = user?.workspaceId ?? user?.customerId ?? user?.businessId ?? null;
+
+  let raw: string | null = isCustomerUser(user) ? customerRaw : staffRaw;
+
+  if (!raw) {
+    // JWT/DB record predates workspace fields — DB fallback for existing sessions
+    try {
+      const userId = user?.sub || user?.id || user?._id;
+      if (userId) {
+        const userDoc: any = await User.findById(userId)
+          .select("workspaceId email")
+          .lean();
+        if (userDoc?.workspaceId) {
+          raw = String(userDoc.workspaceId);
+        } else if (userDoc?.email) {
+          const domain = String(userDoc.email).split("@")[1]?.toLowerCase();
+          const INTERNAL_DOMAINS = new Set(["plumtrips.com", "helloviza.com"]);
+          if (domain && INTERNAL_DOMAINS.has(domain)) {
+            raw = "69679a7628330a58d29f2254";
+          }
+        }
+      }
+    } catch (dbErr) {
+      console.error("[resolveWorkspaceForUser] DB fallback failed", dbErr);
+    }
+  }
+
+  if (!raw) return null;
+
+  return isCustomerUser(user)
+    ? resolveWorkspaceByCustomerId(String(raw), select)
+    : resolveWorkspaceById(String(raw), select);
 }
 
 /**
@@ -134,49 +192,9 @@ export const requireWorkspace = async (
     return next();
   }
 
-  // ── Normal users ──
-  // Customer-type users: always resolve via customerId — their JWT workspaceId
-  // may be stale or point to the wrong workspace. customerId is the stable key.
-  // Staff users: keep existing findById-first logic (their workspaceId is reliable).
-  const customerRaw =
-    user.customerId ?? user.businessId ?? null;
-  const staffRaw =
-    user.workspaceId ?? user.customerId ?? user.businessId ?? null;
-
-  let raw: string | null = isCustomerUser(user) ? customerRaw : staffRaw;
-
-  if (!raw) {
-    // JWT was minted before workspace fix — DB fallback for existing sessions
-    try {
-      const userId = user?.sub || user?.id;
-      if (userId) {
-        const userDoc: any = await User.findById(userId)
-          .select("workspaceId email")
-          .lean();
-        if (userDoc?.workspaceId) {
-          raw = String(userDoc.workspaceId);
-        } else if (userDoc?.email) {
-          const domain = String(userDoc.email).split("@")[1]?.toLowerCase();
-          const INTERNAL_DOMAINS = new Set(["plumtrips.com", "helloviza.com"]);
-          if (domain && INTERNAL_DOMAINS.has(domain)) {
-            raw = "69679a7628330a58d29f2254";
-          }
-        }
-      }
-    } catch (dbErr) {
-      console.error("[requireWorkspace] DB fallback failed", dbErr);
-    }
-
-    if (!raw) {
-      res.status(403).json({ success: false, error: "Workspace context required" });
-      return;
-    }
-  }
-
+  // ── Normal users — shared resolver, see resolveWorkspaceForUser above ──
   try {
-    const workspace = isCustomerUser(user)
-      ? await resolveWorkspaceByCustomerId(String(raw))
-      : await resolveWorkspaceById(String(raw));
+    const workspace = await resolveWorkspaceForUser(user, WS_SELECT);
 
     if (!workspace) {
       res.status(403).json({ success: false, error: "Workspace context required" });

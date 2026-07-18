@@ -16,6 +16,7 @@ import Vendor from "../models/Vendor.js";
 
 import CustomerMember from "../models/CustomerMember.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import MasterData from "../models/MasterData.js";
 import { UserPermission } from "../models/UserPermission.js";
 import { generateTravelerId } from "../utils/travelerId.js";
@@ -1064,39 +1065,43 @@ r.get("/me", async (req, res) => {
     let setupProgressData = null;
 
     try {
-      const wsId = (user as any).workspaceId;
-      if (wsId) {
-        const ws = await CustomerWorkspace.findById(wsId)
-          .select("_id customerId slug companyName companyLogo companyLogoKey plan status source tenantType config onboardingStep trialEndsAt")
-          .lean();
+      // Shared resolver (middleware/requireWorkspace.ts) — same customer-first
+      // branching requireWorkspace uses for every other authenticated request.
+      // Previously this did a bare findById(user.workspaceId), which returns
+      // the WRONG workspace for any customer whose User.workspaceId is stale
+      // (still pointing at HOUSE from the promote-customer flow) instead of
+      // resolving via their customerId like everywhere else does.
+      const ws: any = await resolveWorkspaceForUser(
+        user,
+        "_id customerId slug companyName companyLogo companyLogoKey plan status source tenantType config onboardingStep trialEndsAt",
+      );
 
-        if (ws) {
-          const logoKey = (ws as any).companyLogoKey as string | undefined;
-          if (logoKey) {
-            try {
-              (ws as any).companyLogo = await signLogoUrl(logoKey);
-            } catch (signErr) {
-              console.error("[/auth/me] signLogoUrl failed:", signErr);
-              (ws as any).companyLogo = "";
-            }
-          } else {
+      if (ws) {
+        const logoKey = (ws as any).companyLogoKey as string | undefined;
+        if (logoKey) {
+          try {
+            (ws as any).companyLogo = await signLogoUrl(logoKey);
+          } catch (signErr) {
+            console.error("[/auth/me] signLogoUrl failed:", signErr);
             (ws as any).companyLogo = "";
           }
-          workspaceData = ws;
+        } else {
+          (ws as any).companyLogo = "";
+        }
+        workspaceData = ws;
 
-          // Only fetch setupProgress for SaaS HRMS tenants
-          if ((ws as any).tenantType === "SAAS_HRMS") {
-            const progress = await TenantSetupProgress.findOne({ workspaceId: ws._id }).lean();
-            if (progress) {
-              // Convert moduleProgress Map to plain object for JSON serialization
-              const moduleProgressObj = (progress as any).moduleProgress instanceof Map
-                ? Object.fromEntries((progress as any).moduleProgress)
-                : (progress as any).moduleProgress || {};
-              setupProgressData = {
-                ...progress,
-                moduleProgress: moduleProgressObj,
-              };
-            }
+        // Only fetch setupProgress for SaaS HRMS tenants
+        if ((ws as any).tenantType === "SAAS_HRMS") {
+          const progress = await TenantSetupProgress.findOne({ workspaceId: ws._id }).lean();
+          if (progress) {
+            // Convert moduleProgress Map to plain object for JSON serialization
+            const moduleProgressObj = (progress as any).moduleProgress instanceof Map
+              ? Object.fromEntries((progress as any).moduleProgress)
+              : (progress as any).moduleProgress || {};
+            setupProgressData = {
+              ...progress,
+              moduleProgress: moduleProgressObj,
+            };
           }
         }
       }
