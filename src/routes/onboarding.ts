@@ -921,8 +921,14 @@ router.get("/pipeline", requireAuth, requireWorkspace, noStore, async (req, res,
   }
 });
 
-/** 📤 S3 upload presign */
-router.post("/upload/presign", requireAuth, noStore, async (req, res, next) => {
+/** 📤 S3 upload presign
+ *  🔒 requireWorkspace: no frontend caller currently hits this route directly
+ *  (only /upload/presign-public is live, from the pre-auth onboarding wizard) —
+ *  this was requireAuth-only with no workspace scoping at all, letting any
+ *  authenticated user of any workspace mint upload URLs. Key is now prefixed
+ *  with the caller's own workspace id for defense-in-depth.
+ */
+router.post("/upload/presign", requireAuth, requireWorkspace, noStore, async (req, res, next) => {
   try {
     if (!S3_BUCKET)
       return res.status(500).json({ message: "S3_BUCKET not configured" });
@@ -933,8 +939,11 @@ router.post("/upload/presign", requireAuth, noStore, async (req, res, next) => {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
+    const wsSegment = (req as any).workspaceObjectId
+      ? String((req as any).workspaceObjectId)
+      : "unscoped";
     const clean = String(filename).replace(/[^a-zA-Z0-9._-]/g, "_");
-    const objectKey = `onboarding/${String(type)
+    const objectKey = `onboarding/${wsSegment}/${String(type)
       .toLowerCase()}/${kind}/${Date.now()}-${crypto
       .randomBytes(8)
       .toString("hex")}-${clean}`;
@@ -1207,16 +1216,31 @@ router.get("/:token/details", requireAuth, requireWorkspace, noStore, async (req
   try {
     const { token } = req.params;
 
+    // 🔒 Tenant scope — same defence as /document/presign above: every
+    // non-SUPERADMIN caller is confined to their own workspace on BOTH the
+    // _id branch and the token-string branch. Previously the token-string
+    // fallback below carried no workspace filter at all, so any authenticated
+    // user could read another workspace's onboarding record (GST/PAN/bank/docs)
+    // by passing its invite token instead of its _id.
+    const scopeQuery: Record<string, any> = {};
+    if (!isSuperAdmin(req)) {
+      const wsId = (req as any).workspaceObjectId;
+      if (!wsId) {
+        return res.status(403).json({ error: "Workspace context required" });
+      }
+      scopeQuery.workspaceId = wsId;
+    }
+
     // Support lookup by MongoDB _id (24-char hex) OR by token string
     const isObjectId = /^[0-9a-f]{24}$/i.test(token);
     let doc: OnboardingDoc | null = null;
     if (isObjectId) {
       // findById correctly casts string → ObjectId
-      doc = (await (Onboarding as any).findOne({ _id: token, workspaceId: (req as any).workspaceObjectId }).lean().exec()) as OnboardingDoc | null;
+      doc = (await (Onboarding as any).findOne({ _id: token, ...scopeQuery }).lean().exec()) as OnboardingDoc | null;
     }
-    // If not found by _id (or not an ObjectId), try token string
+    // If not found by _id (or not an ObjectId), try token string — still scoped for non-SUPERADMIN.
     if (!doc) {
-      doc = (await (Onboarding as any).findOne({ token }).lean().exec()) as OnboardingDoc | null;
+      doc = (await (Onboarding as any).findOne({ token, ...scopeQuery }).lean().exec()) as OnboardingDoc | null;
     }
     if (!doc) return res.status(404).json({ error: "Not found" });
 
@@ -1348,7 +1372,7 @@ router.post("/:id/cancel", requireAuth, requireWorkspace, noStore, async (req, r
 });
 
 /** 🧑‍💼 Admin decision – also sync on approval */
-router.post("/:token/decision", requireAuth, noStore, async (req, res, next) => {
+router.post("/:token/decision", requireAuth, requireWorkspace, requireAdmin, noStore, async (req, res, next) => {
   try {
     const validation = decisionSchema.safeParse(req.body);
     if (!validation.success)
@@ -1360,10 +1384,18 @@ router.post("/:token/decision", requireAuth, noStore, async (req, res, next) => 
     const { token } = req.params;
     const { action, remarks } = validation.data;
 
-    // Workspace-scope the lookup for non-SUPERADMIN
+    // 🔒 Tenant scope — same defence as /:token/details above. requireWorkspace
+    // now runs on this route, so req.workspaceObjectId is reliably populated for
+    // every non-SUPERADMIN caller (previously it was never set here, silently
+    // disabling this scoping check and letting any authenticated user decide on
+    // another workspace's onboarding record by token).
     const decisionQuery: any = { token };
-    if (!isSuperAdmin(req) && (req as any).workspaceObjectId) {
-      decisionQuery.workspaceId = (req as any).workspaceObjectId;
+    if (!isSuperAdmin(req)) {
+      const wsId = (req as any).workspaceObjectId;
+      if (!wsId) {
+        return res.status(403).json({ error: "Workspace context required" });
+      }
+      decisionQuery.workspaceId = wsId;
     }
     const doc: any = await (Onboarding as any).findOne(decisionQuery).exec();
     if (!doc) return res.status(404).json({ error: "Not found" });

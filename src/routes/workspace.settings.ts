@@ -167,6 +167,7 @@ r.put(
 /* ─── PATCH /pan — Update workspace Company PAN and GST number ─── */
 r.patch(
   "/pan",
+  requireRoles("WORKSPACE_ADMIN", "ADMIN"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const workspaceId = req.workspaceId;
