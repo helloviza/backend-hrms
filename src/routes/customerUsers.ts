@@ -12,6 +12,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import User from "../models/User.js";
 import Onboarding from "../models/Onboarding.js";
+import { ensureCustomerWorkspace } from "../services/customerWorkspace.service.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 
 import { sendMail } from "../utils/mailer.js";
@@ -440,44 +441,14 @@ function pickBusinessView(found: any | null) {
 
 async function ensureWorkspace(customerId: string) {
   const cid = normStr(customerId);
-  let ws: any = await CustomerWorkspace.findOne({ customerId: cid }).exec();
+  // Shared with auth.ts's ensureWorkspaceAndLeader — see
+  // services/customerWorkspace.service.ts. Creates the doc (with companyName
+  // set from Customer.legalName) if it doesn't exist, or fetches it and
+  // fills companyName once if it's still empty from before this fix.
+  const ws: any = await ensureCustomerWorkspace(cid);
 
-  if (!ws) {
-    ws = await CustomerWorkspace.findOneAndUpdate(
-      { customerId: cid },
-      {
-        $setOnInsert: {
-          customerId: cid,
-
-          // legacy allowlist (kept for back-compat)
-          allowedDomains: [],
-          allowedEmails: [],
-
-          // approvals
-          defaultApproverEmails: [],
-          canApproverCreateUsers: true,
-
-          // gate switch
-          userCreationEnabled: false,
-
-          // access mode
-          accessMode: "INVITE_ONLY",
-
-          // new allowlist (preferred)
-          userCreationAllowlistEmails: [],
-          userCreationAllowlistDomains: [],
-          userCreationAllowlistUpdatedBy: "",
-          userCreationAllowlistUpdatedAt: null,
-
-          status: "ACTIVE",
-        },
-      },
-      { upsert: true, new: true }
-    );
-    return ws;
-  }
-
-  // heal types (legacy + new)
+  // heal types (legacy + new) — runs even right after a fresh insert, but
+  // is a harmless no-op there since the defaults are already normalized.
   const fixedDefaultApprovers = normalizeEmailList((ws as any).defaultApproverEmails);
 
   const fixedLegacyDomains = Array.isArray((ws as any).allowedDomains)

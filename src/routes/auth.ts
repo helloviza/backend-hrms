@@ -17,6 +17,7 @@ import Vendor from "../models/Vendor.js";
 import CustomerMember from "../models/CustomerMember.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
+import { ensureCustomerWorkspace } from "../services/customerWorkspace.service.js";
 import MasterData from "../models/MasterData.js";
 import { UserPermission } from "../models/UserPermission.js";
 import { generateTravelerId } from "../utils/travelerId.js";
@@ -389,23 +390,15 @@ async function ensureWorkspaceAndLeader(params: {
   const email = normalizeEmail(params.email);
   if (!isValidObjectId(customerId) || !email) return;
 
-  await CustomerWorkspace.updateOne(
-    { customerId },
-    {
-      $setOnInsert: {
-        customerId,
-        allowedDomains: [],
-        allowedEmails: [],
-        defaultApproverEmails: [],
-        canApproverCreateUsers: true,
-        userCreationEnabled: false, // default safety
-        status: "ACTIVE",
-        createdAt: new Date(),
-      },
-      $set: { updatedAt: new Date() },
-    },
-    { upsert: true }
-  ).exec();
+  // Shared with customerUsers.ts's ensureWorkspace — see
+  // services/customerWorkspace.service.ts for why these were unified.
+  // NOTE: this drops the old unconditional `$set: { updatedAt: new Date() }`
+  // that ran on every login regardless of whether anything changed — that
+  // looked like an incidental side effect of the original inline update
+  // rather than a deliberate "last login" signal (nothing else reads
+  // CustomerWorkspace.updatedAt that way), so it wasn't carried forward.
+  // Flag if you want it back.
+  await ensureCustomerWorkspace(customerId);
 
   // Derive member role from explicit DB roles — don't hardcode WORKSPACE_LEADER
   const dbRoles = (params.userRoles || []).map((r) => r.toUpperCase());
@@ -1073,7 +1066,10 @@ r.get("/me", async (req, res) => {
       // resolving via their customerId like everywhere else does.
       const ws: any = await resolveWorkspaceForUser(
         user,
-        "_id customerId slug companyName companyLogo companyLogoKey plan status source tenantType config onboardingStep trialEndsAt",
+        // allowedDomains added so the frontend has a real (non-email, non-
+        // generic) fallback to display when companyName is empty — see
+        // resolveDisplayName in MyProfileCustomer.tsx.
+        "_id customerId slug companyName companyLogo companyLogoKey plan status source tenantType config onboardingStep trialEndsAt allowedDomains",
       );
 
       if (ws) {
