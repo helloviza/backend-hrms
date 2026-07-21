@@ -454,10 +454,13 @@ function buildBusinessFormPayload(
   }
 
   // ----- nested: bank (merge, non-destructive) -----
-  const bankName = b.bankName;
-  const bankAccount = b.bankAccountNumber || b.bankAccount;
-  const bankIfsc = b.bankIfsc;
-  const bankBranch = b.bankBranch;
+  // Prefer the nested b.bank.* shape (what saveBusiness() sends today, matching
+  // Customer.bank / formPayload.bank) with a flat-key fallback for any other
+  // caller still on the old shape.
+  const bankName = b.bank?.bankName ?? b.bankName;
+  const bankAccount = b.bank?.accountNumber ?? (b.bankAccountNumber || b.bankAccount);
+  const bankIfsc = b.bank?.ifsc ?? b.bankIfsc;
+  const bankBranch = b.bank?.branch ?? b.bankBranch;
   if (
     isMeaningful(bankName) ||
     isMeaningful(bankAccount) ||
