@@ -24,7 +24,7 @@ import Customer from "../models/Customer.js";
 export async function ensureCustomerWorkspace(customerId: string): Promise<CustomerWorkspaceDocument> {
   const cid = String(customerId || "").trim();
 
-  const customer: any = await Customer.findById(cid).select("legalName name companyName").lean();
+  const customer: any = await Customer.findById(cid).select("legalName name companyName workspaceId").lean();
   const realCompanyName = String(customer?.legalName || customer?.name || customer?.companyName || "").trim();
 
   let ws: any = await CustomerWorkspace.findOneAndUpdate(
@@ -55,6 +55,19 @@ export async function ensureCustomerWorkspace(customerId: string): Promise<Custo
       { $set: { companyName: realCompanyName } },
       { new: true },
     ).exec()) || ws;
+  }
+
+  // Self-healing: Customer.workspaceId must always equal its own
+  // CustomerWorkspace._id — nothing else in this codebase gives it a
+  // different meaning. This function is the one chokepoint every customer
+  // session passes through (called on login via auth.ts/customerUsers.ts),
+  // so reconciling here closes the loop on any writer — past, present, or a
+  // future one nobody's found yet — that creates/updates a Customer with the
+  // wrong or missing workspaceId. Compares rather than only filling in blank,
+  // since the actual bug this fixes is a WRONG stamped value (the internal
+  // HOUSE workspace), not just a missing one.
+  if (customer && String(customer.workspaceId || "") !== String(ws._id)) {
+    await Customer.findByIdAndUpdate(cid, { $set: { workspaceId: ws._id } });
   }
 
   return ws;

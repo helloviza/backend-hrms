@@ -11,6 +11,7 @@ import Customer from "../models/Customer.js";
 import Employee from "../models/Employee.js";
 import DocumentModel from "../models/Document.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { ensureCustomerWorkspace } from "../services/customerWorkspace.service.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
@@ -1831,6 +1832,21 @@ router.post(
         customer = await Customer.create(base);
       }
 
+      // The new tenant's own CustomerWorkspace does not exist yet at this point —
+      // previously it was only ever created lazily on the client's first login
+      // (ensureCustomerWorkspace, via auth.ts), leaving Customer.workspaceId
+      // stamped with the PROMOTING ADMIN's own workspace (HOUSE) until then —
+      // and forever, for any promoted customer who never logs in. Resolve/create
+      // it here, eagerly, and stamp its _id onto the Customer we just created or
+      // updated. ensureCustomerWorkspace is idempotent (upsert keyed by
+      // customerId), so this is also safe — and self-healing — on re-promotion
+      // of an existing customer.
+      const tenantWorkspace = await ensureCustomerWorkspace(String(customer._id));
+      if (String(customer.workspaceId || "") !== String(tenantWorkspace._id)) {
+        customer.workspaceId = tenantWorkspace._id;
+        await customer.save();
+      }
+
       (onboardingDoc as any).customerCode = customerCode;
 (onboardingDoc as any).linkedCustomerId = customer._id;
 
@@ -1889,6 +1905,19 @@ if (email) {
         { new: true },
       )
     }
+
+    // Self-healing: same class of bug as Customer.workspaceId above — reconcile
+    // an existing client contact's User.workspaceId to the real tenant
+    // workspace on every re-promotion, not just at first creation (blast-radius
+    // checked: nothing reads a customer-role User.workspaceId as an identity
+    // source — resolveWorkspaceForUser always resolves customer users via
+    // customerId instead — and empirically only 2 real accounts across 2
+    // tenants were ever affected, neither with any overlapping staff population).
+    if (String((clientUser as any).workspaceId || "") !== String(tenantWorkspace._id)) {
+      await User.findByIdAndUpdate((clientUser as any)._id, {
+        $set: { workspaceId: tenantWorkspace._id },
+      })
+    }
   } else {
     const tempPassword =
       'PLMX-' + Math.random().toString(36).slice(2, 10).toUpperCase()
@@ -1905,7 +1934,7 @@ if (email) {
       hrmsAccessRole:     customerRole,
       customerMemberRole: customerMemberRole,
       status:             'ACTIVE',
-      workspaceId:        workspaceId || req.workspaceObjectId,
+      workspaceId:        tenantWorkspace._id,
       tempPassword:       true,
     })
 
@@ -1927,6 +1956,12 @@ if (email) {
     const promoteTravelerId = await generateTravelerId(String(customer._id), promoteCompanyName);
     const promoteSetOnInsert: any = { travelerId: promoteTravelerId };
     try {
+      // NOTE: CustomerMember has no workspaceId schema field at all — writing
+      // it here was always a silent no-op, on this line before this change and
+      // after it (see docs — blast-radius check confirmed nothing reads it;
+      // customerId, required + uniquely indexed, is this model's real and
+      // already-correct tenant scope). Removed rather than "fixed" since
+      // there's no value to correct, only a write to a field that isn't real.
       await CustomerMember.findOneAndUpdate(
         { email: emailRaw, customerId: String(customer._id) },
         {
@@ -1935,7 +1970,6 @@ if (email) {
             customerId:  String(customer._id),
             email:       emailRaw,
             userId:      String((clientUser as any)._id),
-            workspaceId: workspaceId || String(req.workspaceObjectId),
           },
           $setOnInsert: promoteSetOnInsert,
         },
@@ -1952,7 +1986,6 @@ if (email) {
               customerId:  String(customer._id),
               email:       emailRaw,
               userId:      String((clientUser as any)._id),
-              workspaceId: workspaceId || String(req.workspaceObjectId),
             },
             $setOnInsert: promoteSetOnInsert,
           },
@@ -1971,7 +2004,7 @@ if (email) {
         $setOnInsert: {
           userId:     String((clientUser as any)._id),
           email:      email.toLowerCase(),
-          workspaceId: String(workspaceId || req.workspaceObjectId),
+          workspaceId: String(tenantWorkspace._id),
           universe:   'CUSTOMER' as const,
           level: {
             code:        'CUSTOMER_APPROVAL',
