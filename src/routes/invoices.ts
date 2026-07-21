@@ -1,4 +1,5 @@
 import express from "express";
+import type { Request, Response, NextFunction } from "express";
 import ExcelJS from "exceljs";
 import archiver from "archiver";
 import mongoose from "mongoose";
@@ -10,6 +11,7 @@ import { requireAdmin } from "../middleware/rbac.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import Invoice from "../models/Invoice.js";
+import User from "../models/User.js";
 
 /* ── Workspace router (no requireAdmin — separate mount) ──────────── */
 // Mounted at: /api/invoices/workspace
@@ -19,6 +21,57 @@ export const workspaceRouter = express.Router();
 
 workspaceRouter.use(requireAuth);
 workspaceRouter.use(requireWorkspace);
+
+/* Same shape as admin.billing.ts's requireAdminOrSBT (role detection +
+ * workspace-ownership check + canViewBilling gate) — this is the invoice
+ * domain's version of that same rule, not a new pattern: admin bypasses,
+ * WORKSPACE_LEADER bypasses (matches admin.billing.ts's "WL bypasses
+ * canViewBilling" comment), everyone else needs User.canViewBilling===true.
+ * Deliberately does NOT check sbtEnabled — that flag is about SBT flight/
+ * hotel booking capability, unrelated to invoice/billing visibility.
+ *
+ * This is the actual access boundary. The frontend hiding the Invoices tab
+ * (MyProfileCustomer.tsx / Sidebar.tsx) is convenience UI on top of this,
+ * not a substitute for it — before this change, /mine had no check beyond
+ * "authenticated workspace member", so any REQUESTER-role member with
+ * canViewBilling never granted could call the API directly and read every
+ * invoice for the tenant. */
+async function requireInvoiceAccess(req: Request, res: Response, next: NextFunction) {
+  const user: any = (req as any).user;
+  const roles: string[] = [
+    ...(Array.isArray(user?.roles) ? user.roles : []),
+    ...(user?.role ? [user.role] : []),
+  ].map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""));
+
+  const adminRoles = ["ADMIN", "SUPERADMIN", "HR", "HRADMIN", "OPS"];
+  if (roles.some((r) => adminRoles.includes(r))) return next();
+
+  const isWL =
+    roles.includes("WORKSPACELEADER") ||
+    String(user?.customerMemberRole || "").toUpperCase().replace(/[\s_-]/g, "") === "WORKSPACELEADER";
+  if (isWL) return next();
+
+  const sub = String(user?.sub || user?._id || user?.id || "");
+  if (!sub) return res.status(403).json({ error: "Access denied" });
+
+  const dbUser: any = await User.findById(sub).select("customerId canViewBilling").lean();
+
+  // Verify this user belongs to the current workspace before trusting their
+  // own canViewBilling flag against it.
+  const wsCustomerId = (req as any).workspace?.customerId;
+  if (dbUser?.customerId && wsCustomerId && String(dbUser.customerId) !== String(wsCustomerId)) {
+    return res.status(403).json({ error: "Access denied" });
+  }
+
+  if (dbUser?.canViewBilling === true) return next();
+
+  return res.status(403).json({
+    error: "Billing access not enabled for your account.",
+    code: "BILLING_ACCESS_DENIED",
+  });
+}
+
+workspaceRouter.use(requireInvoiceAccess);
 
 // GET /api/invoices/workspace/mine
 workspaceRouter.get("/mine", async (req: any, res: any) => {
@@ -99,6 +152,59 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
     res.json({ ok: true, pdfUrl });
   } catch (err: any) {
     console.error("[Invoices workspace/pdf]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/invoices/workspace/:id/declare-payment
+// Customer-only transition: SENT -> PAYMENT_DECLARED, nothing else. This is
+// a CLAIM ("I've paid"), not a receipt — finance still confirms it into PAID
+// via the existing staff PUT /admin/invoices/:id/status route (unchanged;
+// its only guards are "no re-marking CANCELLED" and "no DRAFT->PAID", so
+// PAYMENT_DECLARED->PAID already works there with zero code change).
+// Workspace-scoped (invoice must belong to req.workspaceObjectId, same as
+// the /pdf route above) and gated by requireInvoiceAccess (applied to the
+// whole workspaceRouter above) — canViewBilling or WorkspaceLeader, same as
+// viewing the list. A customer can never set DRAFT/CANCELLED/PAID directly,
+// and can never move a DRAFT, PAYMENT_DECLARED, PAID, or CANCELLED invoice
+// through this route — only a SENT one.
+workspaceRouter.put("/:id/declare-payment", async (req: any, res: any) => {
+  try {
+    const invoice: any = await Invoice.findOne({
+      _id: req.params.id,
+      workspaceId: req.workspaceObjectId,
+    });
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+
+    if (invoice.status !== "SENT") {
+      return res.status(400).json({
+        error: `Only a SENT invoice can be marked as paid (current status: ${invoice.status}).`,
+      });
+    }
+
+    const now = new Date();
+    const oldValues = { status: "SENT" };
+    const newValues: Record<string, unknown> = { status: "PAYMENT_DECLARED", paymentDeclaredAt: now };
+
+    invoice.status = "PAYMENT_DECLARED";
+    invoice.paymentDeclaredAt = now;
+    invoice.paymentDeclaredBy = req.user._id;
+    invoice.editedAt = now;
+    invoice.editedBy = req.user._id;
+    if (!invoice.editHistory) invoice.editHistory = [];
+    invoice.editHistory.push({
+      editedAt: now,
+      editedBy: req.user._id,
+      fieldsChanged: ["status"],
+      oldValues,
+      newValues,
+      source: "customer_portal",
+    });
+
+    await invoice.save();
+    res.json({ ok: true, invoice });
+  } catch (err: any) {
+    console.error("[Invoices workspace/declare-payment]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -739,8 +845,8 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
     });
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
-    if (invoice.status === "PAID" || invoice.status === "CANCELLED") {
-      return res.status(400).json({ error: "Cannot add bookings to a PAID or CANCELLED invoice" });
+    if (invoice.status === "PAID" || invoice.status === "CANCELLED" || invoice.status === "PAYMENT_DECLARED") {
+      return res.status(400).json({ error: "Cannot add bookings to a PAID, PAYMENT_DECLARED, or CANCELLED invoice" });
     }
 
     // Fetch new bookings — Demo Platform: demo admins isolated to demo bookings.
@@ -874,6 +980,12 @@ router.get("/activity", requirePermission("invoices", "READ"), async (_req: any,
       if (inv.paidAt) {
         action = "paid";
         label  = `Invoice #${inv.invoiceNo} paid`;
+      } else if (inv.paymentDeclaredAt) {
+        // Checked before sentAt — a PAYMENT_DECLARED invoice still has an
+        // (older) sentAt from when it was first sent, which would otherwise
+        // stale-label it as just "sent".
+        action = "payment_declared";
+        label  = `Invoice #${inv.invoiceNo} marked paid by customer, awaiting confirmation`;
       } else if (inv.sentAt) {
         action = "sent";
         label  = `Invoice #${inv.invoiceNo} sent`;
@@ -932,8 +1044,13 @@ router.get("/insight", requirePermission("invoices", "READ"), async (_req: any, 
             ],
           },
         }),
+        // PAYMENT_DECLARED is still outstanding — it's a customer claim, not
+        // finance-confirmed receipt (see Invoice.ts's status doc comment).
+        // Omitting it here would make this figure silently shrink the
+        // moment invoices start entering that state, before any money is
+        // actually confirmed received.
         Invoice.aggregate([
-          { $match: { status: { $in: ["DRAFT", "SENT"] } } },
+          { $match: { status: { $in: ["DRAFT", "SENT", "PAYMENT_DECLARED"] } } },
           { $group: { _id: null, total: { $sum: "$grandTotal" } } },
         ]),
       ]);
@@ -1429,10 +1546,18 @@ router.get("/:id", requirePermission("invoices", "READ"), async (req: any, res: 
 // DRAFT->PAID is rejected (must go via SENT). CANCELLED is immutable here.
 // sentAt/paidAt accept an explicit date (no silent auto-stamp); paymentRef is
 // recorded in the editHistory entry.
+//
+// PAYMENT_DECLARED->PAID (finance confirming a customer's portal claim) goes
+// through this SAME route with zero logic changes — the only guards above
+// are "no re-marking CANCELLED" and "no DRAFT->PAID", neither of which
+// blocks this transition. Staff can also set PAYMENT_DECLARED directly here
+// (e.g. recording a phone-reported payment on the customer's behalf) since
+// this route has staff's normal "invoices:WRITE" permission, not the
+// customer-only SENT-only guard the portal's own declare-payment route has.
 router.put("/:id/status", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
   try {
     const { status, sentAt, paidAt, paymentRef } = req.body as {
-      status: "SENT" | "PAID" | "CANCELLED";
+      status: "SENT" | "PAYMENT_DECLARED" | "PAID" | "CANCELLED";
       sentAt?: string;
       paidAt?: string;
       paymentRef?: string;
@@ -1601,30 +1726,48 @@ router.post("/bulk-mark-paid", requirePermission("invoices", "WRITE"), async (re
   }
 });
 
-// POST /api/admin/invoices/:id/revert-to-sent  (PAID -> SENT, reason required)
+// POST /api/admin/invoices/:id/revert-to-sent  (PAID -> SENT, or
+// PAYMENT_DECLARED -> SENT — staff rejecting a customer's payment claim
+// that never arrived — reason required either way)
 router.post("/:id/revert-to-sent", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
   try {
     const { reason } = req.body as { reason?: string };
     if (!reason || !String(reason).trim()) {
       return res.status(400).json({ error: "Reason is required" });
     }
-    const invoice = await Invoice.findById(req.params.id);
+    const invoice: any = await Invoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
-    if (invoice.status !== "PAID") {
-      return res.status(400).json({ error: "Only PAID invoices can be reverted to SENT." });
+    if (invoice.status !== "PAID" && invoice.status !== "PAYMENT_DECLARED") {
+      return res.status(400).json({ error: "Only PAID or PAYMENT_DECLARED invoices can be reverted to SENT." });
     }
 
     const now = new Date();
-    const oldPaidAt = invoice.paidAt;
+    const prevStatus = invoice.status;
+    const oldValues: Record<string, unknown> = { status: prevStatus };
+
+    if (prevStatus === "PAID") {
+      oldValues.paidAt = invoice.paidAt;
+      invoice.paidAt = undefined;
+    } else {
+      // PAYMENT_DECLARED -> SENT: this is a REJECTION of the customer's
+      // claim (it never arrived), not a cancellation of the invoice itself
+      // — the invoice goes back to awaiting payment, same as any other SENT
+      // invoice. Clear both declaration fields so the invoice doesn't carry
+      // a stale "customer once claimed this" marker.
+      oldValues.paymentDeclaredAt = invoice.paymentDeclaredAt;
+      oldValues.paymentDeclaredBy = invoice.paymentDeclaredBy;
+      invoice.paymentDeclaredAt = undefined;
+      invoice.paymentDeclaredBy = undefined;
+    }
+
     invoice.status = "SENT";
-    invoice.paidAt = undefined;
     const iv = invoice as any;
     iv.editedAt = now;
     iv.editedBy = req.user._id;
     if (!iv.editHistory) iv.editHistory = [];
     iv.editHistory.push({
       editedAt: now, editedBy: req.user._id, fieldsChanged: ["status"],
-      oldValues: { status: "PAID", paidAt: oldPaidAt }, newValues: { status: "SENT", reason: String(reason).trim() },
+      oldValues, newValues: { status: "SENT", reason: String(reason).trim() },
     });
     await invoice.save();
     res.json({ ok: true, invoice });

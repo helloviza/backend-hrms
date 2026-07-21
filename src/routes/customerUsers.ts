@@ -18,6 +18,7 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 import { sendMail } from "../utils/mailer.js";
 import { signEmailActionToken } from "../utils/emailActionToken.js";
 import { isGenericDomain } from "../utils/blockedDomains.js";
+import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMemberRoles.js";
 import { generateTravelerId } from "../utils/travelerId.js";
 import { parseCsv as parseCsvRaw } from "../utils/csv.js";
 
@@ -2493,15 +2494,14 @@ router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => 
       .select("name email roles role status sbtEnabled sbtRole sbtAssignedBookerId canRaiseRequest canViewBilling canManageUsers")
       .lean();
 
-    const memberRoles = await CustomerMember.find({ customerId }).select("email role").lean();
-    const memberRoleMap = new Map(memberRoles.map((m: any) => [m.email, m.role]));
+    const memberRoleMap = await getCustomerMemberRoleMap(customerId);
 
     const rows = users.map((u: any) => {
       return {
         _id: u._id,
         name: u.name || "",
         email: u.email || "",
-        role: memberRoleMap.get(u.email) || (Array.isArray(u.roles) && u.roles[0]) || u.role || "CUSTOMER",
+        role: resolveMemberRole(memberRoleMap, u.email, u.roles, u.role),
         isActive: (u.status || "ACTIVE").toUpperCase() === "ACTIVE",
         sbtEnabled: u.sbtEnabled ?? false,
         sbtRole: u.sbtRole || null,

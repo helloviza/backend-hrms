@@ -43,41 +43,16 @@ function norm(v: unknown): string {
   return String(v ?? "").toUpperCase().replace(/[\s_-]+/g, "");
 }
 
-function resolveScopeFilter(req: Request): { filter: Record<string, any>; scope: "ORG" | "OWN" } {
-  const user: any = (req as any).user;
-  const roles: string[] = (Array.isArray(user?.roles) ? user.roles : []).map(norm);
-  const accessRole = norm(user?.hrmsAccessRole);
-  const memberRole = norm(user?.customerMemberRole);
-
-  const isLeader = roles.includes("WORKSPACELEADER") || memberRole === "WORKSPACELEADER";
-  const isApprover =
-    roles.includes("CUSTOMERAPPROVER") ||
-    roles.includes("CUSTOMERADMIN") ||
-    accessRole === "L0" ||
-    accessRole === "L2";
-  const isStaffAdmin =
-    roles.includes("ADMIN") || roles.includes("SUPERADMIN") || roles.includes("HR");
-
-  // tenantId on TravelBooking is the customer id string; the workspace was
-  // resolved via the same customerId, so prefer it as a stable fallback.
-  const tenantId: string | null =
-    user?.customerId || user?.businessId || (req as any).workspace?.customerId || null;
-
-  if ((isLeader || isApprover || isStaffAdmin) && tenantId) {
-    return { filter: { tenantId: String(tenantId) }, scope: "ORG" };
-  }
-
-  // OWN — userId on TravelBooking is an ObjectId; cast the JWT string id.
-  const uid = user?._id || user?.id || user?.sub;
-  const userId =
-    uid && mongoose.isValidObjectId(uid) ? new mongoose.Types.ObjectId(String(uid)) : uid;
-  return { filter: { userId }, scope: "OWN" };
-}
-
-/* ── ORG-scope detection, reused by the attachment routes below ───────
- * Same leader/approver/staff-admin signals as resolveScopeFilter above,
- * factored out because the attachment access check (bookingCustomerAccess.ts)
- * needs a plain boolean rather than a query filter. */
+/* ── THE single source of truth for "is this caller ORG-scope" ────────
+ * WORKSPACE_LEADER / approver / staff-admin see the whole tenant; everyone
+ * else is OWN-scope (their own bookings only). Every scope decision in this
+ * router — the TravelBooking-mirror list below, the ManualBooking-based
+ * /manual list + export, /stats, and the attachment access checks — MUST
+ * call this one function rather than re-deriving the role checks locally.
+ * Two copies of this logic (one here, one in resolveScopeFilter) is exactly
+ * how /manual and /stats were able to silently drift apart before; keeping
+ * one function is what prevents that recurring — same rationale as
+ * resolveWorkspaceForUser in requireWorkspace.ts. */
 function isOrgScopeUser(user: any): boolean {
   const roles: string[] = (Array.isArray(user?.roles) ? user.roles : []).map(norm);
   const accessRole = norm(user?.hrmsAccessRole);
@@ -93,6 +68,25 @@ function isOrgScopeUser(user: any): boolean {
     roles.includes("ADMIN") || roles.includes("SUPERADMIN") || roles.includes("HR");
 
   return isLeader || isApprover || isStaffAdmin;
+}
+
+function resolveScopeFilter(req: Request): { filter: Record<string, any>; scope: "ORG" | "OWN" } {
+  const user: any = (req as any).user;
+
+  // tenantId on TravelBooking is the customer id string; the workspace was
+  // resolved via the same customerId, so prefer it as a stable fallback.
+  const tenantId: string | null =
+    user?.customerId || user?.businessId || (req as any).workspace?.customerId || null;
+
+  if (isOrgScopeUser(user) && tenantId) {
+    return { filter: { tenantId: String(tenantId) }, scope: "ORG" };
+  }
+
+  // OWN — userId on TravelBooking is an ObjectId; cast the JWT string id.
+  const uid = user?._id || user?.id || user?.sub;
+  const userId =
+    uid && mongoose.isValidObjectId(uid) ? new mongoose.Types.ObjectId(String(uid)) : uid;
+  return { filter: { userId }, scope: "OWN" };
 }
 
 /* ── Customer-safe allowlist projection ──────────────────────────────
@@ -511,6 +505,288 @@ router.get("/manual/export", async (req: Request, res: Response) => {
       error: err?.message,
     });
     res.status(500).json({ ok: false, error: "Failed to export bookings" });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * GET /api/my-bookings/stats — Overview stat cards, UNCAPPED aggregates.
+ *
+ * Root cause this replaces: the old Overview computed totalTrips as
+ * bookings.length off a 200-row-capped GET / fetch, so any customer with
+ * >200 bookings saw exactly 200 — a symptom of deriving "how many exist"
+ * from "how many we fetched". This endpoint counts server-side via
+ * aggregation ($group/$count) and returns scalars only; it never streams
+ * booking rows to the browser and has no .limit() on the result set.
+ *
+ * SOURCE: ManualBooking directly (NOT the TravelBooking mirror). The mirror
+ * skips source==="SBT"/"SBT_AUTO"/sourceBookingId rows (ManualBooking.ts:502)
+ * and only updates on post-save, so it is a structurally incomplete copy —
+ * see infra/audit/customer-bookings-export-audit.md. ManualBooking is the
+ * source of truth the customer's own export already reads
+ * (loadManualBookingsForCustomer above).
+ *
+ * COST SAFETY: the very first pipeline stage after the tenant/access $match
+ * is an explicit $project allowlisting exactly six fields — type,
+ * pricing.grandTotal, pricing.totalWithGST, pricing.quotedPrice,
+ * passengers.name, passengers.email, bookingDate. Every later stage can only
+ * ever see those six fields. actualPrice/supplierCost/markupAmount/
+ * profitMargin/basePrice/diff, notes, supplierName/supplierPNR, and
+ * passengers.panNo/passportNo are structurally unreachable past that stage —
+ * not "not selected", but not present in the pipeline at all past stage 1.
+ *
+ * ACCESS: same ORG/OWN split as loadManualBookingsForCustomer/
+ * canCustomerAccessBookingAttachments (bookingCustomerAccess.ts) — tenant
+ * gate on workspaceId (a Customer._id), then ORG-scope (leader/approver/
+ * staff-admin) sees the whole tenant or OWN-scope is restricted to bookings
+ * where the caller's own email matches a passenger. This re-implements that
+ * predicate as an aggregation $expr (case-insensitive email-in-passengers)
+ * rather than calling the shared function, because aggregation can't invoke
+ * arbitrary JS — if bookingCustomerAccess.ts's ORG/OWN rule ever changes,
+ * this $expr must change with it.
+ * ═════════════════════════════════════════════════════════════════════ */
+
+const STATS_SERVICE_BUCKETS = ["FLIGHT", "HOTEL", "VISA", "CAB", "FOREX", "MICE", "OTHER"] as const;
+
+// Mirrors ManualBooking.ts:457-480's manualTypeToService grouping, collapsed
+// to the 7 buckets the Overview breaks out (TRANSFER/ESIM/HOLIDAYS/TRAIN and
+// the OTHER-collapsed types all fall into OTHER here — a display
+// simplification, not a change to what manualTypeToService itself does for
+// the mirror). Keep this switch in sync with that function if either changes.
+const SERVICE_BUCKET_EXPR = {
+  $switch: {
+    branches: [
+      { case: { $in: ["$type", ["FLIGHT", "FLIGHT_RESCHEDULE", "DUMMY_FLIGHT"]] }, then: "FLIGHT" },
+      { case: { $in: ["$type", ["HOTEL", "DUMMY_HOTEL"]] }, then: "HOTEL" },
+      { case: { $eq: ["$type", "VISA"] }, then: "VISA" },
+      { case: { $eq: ["$type", "CAB"] }, then: "CAB" },
+      { case: { $eq: ["$type", "FOREX"] }, then: "FOREX" },
+      { case: { $eq: ["$type", "EVENTS"] }, then: "MICE" },
+    ],
+    default: "OTHER",
+  },
+};
+
+// Customer-facing sell price only — identical fallback chain to the mirror
+// sync (ManualBooking.ts:528-529) and the /manual export (myBookings.ts:428).
+const STATS_AMOUNT_EXPR = {
+  $ifNull: [
+    "$pricing.grandTotal",
+    { $ifNull: ["$pricing.totalWithGST", { $ifNull: ["$pricing.quotedPrice", 0] }] },
+  ],
+};
+
+// DISTINCT PASSENGER identity, not passengers[0] — fixes "Active Travellers"
+// counting the staff booker. Keys on normalized name (trim + lowercase) since
+// that's the field ops staff actually fill in; falls back to email only when
+// name is blank. A passenger with neither is excluded (has no usable identity).
+const TRAVELLER_KEY_EXPR = {
+  $let: {
+    vars: {
+      nm: { $trim: { input: { $toLower: { $ifNull: ["$passengers.name", ""] } } } },
+      em: { $trim: { input: { $toLower: { $ifNull: ["$passengers.email", ""] } } } },
+    },
+    in: {
+      $cond: [
+        { $ne: ["$$nm", ""] },
+        { $concat: ["name:", "$$nm"] },
+        { $cond: [{ $ne: ["$$em", ""] }, { $concat: ["email:", "$$em"] }, null] },
+      ],
+    },
+  },
+};
+
+// MongoDB rejects a $facet stage nested inside another $facet stage ("$facet
+// is not allowed to be used within a $facet stage") — this ALWAYS threw for
+// every caller/period/scope, which is why /stats returned a 500 that the
+// frontend's useBookingStats hook swallowed (stats stayed null, so every
+// card silently defaulted to 0 via `?? 0` — see bookingKpis in
+// MyProfileCustomer.tsx). The three sub-aggregations (totals/byService/
+// travellers) below used to live inside a $facet nested one level under the
+// primary/compare $facet in the /stats handler; they're now three SIBLING
+// branches at that same outer level (see the "Totals" / "ByService" /
+// "Travellers" suffixes built in the route handler), each a complete,
+// independent pipeline starting from the same $project'd/tenant-matched
+// documents. shapeFacetResult() is unchanged — the caller reassembles the
+// three flat branches back into the {totals, byService, travellers} shape it
+// already expects.
+function periodTotalsBranch(from: Date, to: Date) {
+  return [
+    { $match: { bookingDate: { $gte: from, $lte: to } } },
+    { $addFields: { _amount: STATS_AMOUNT_EXPR } },
+    { $group: { _id: null, totalTrips: { $sum: 1 }, totalSpend: { $sum: "$_amount" } } },
+  ];
+}
+
+function periodByServiceBranch(from: Date, to: Date) {
+  return [
+    { $match: { bookingDate: { $gte: from, $lte: to } } },
+    { $addFields: { _amount: STATS_AMOUNT_EXPR, _bucket: SERVICE_BUCKET_EXPR } },
+    { $group: { _id: "$_bucket", count: { $sum: 1 }, spend: { $sum: "$_amount" } } },
+  ];
+}
+
+function periodTravellersBranch(from: Date, to: Date) {
+  return [
+    { $match: { bookingDate: { $gte: from, $lte: to } } },
+    { $unwind: "$passengers" },
+    { $addFields: { _travellerKey: TRAVELLER_KEY_EXPR } },
+    { $match: { _travellerKey: { $ne: null } } },
+    { $group: { _id: "$_travellerKey" } },
+    { $count: "n" },
+  ];
+}
+
+function parseDayStart(v: unknown): Date | null {
+  if (!v) return null;
+  const d = new Date(String(v));
+  return isNaN(d.getTime()) ? null : d;
+}
+function parseDayEnd(v: unknown): Date | null {
+  if (!v) return null;
+  const d = new Date(`${String(v)}T23:59:59.999Z`);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function shapeFacetResult(raw: any): {
+  totalTrips: number;
+  totalSpend: number;
+  flightCount: number;
+  hotelCount: number;
+  travellerCount: number;
+  breakdown: { service: string; count: number; spend: number }[];
+} {
+  const totals = raw?.totals?.[0] || { totalTrips: 0, totalSpend: 0 };
+  const byService: any[] = raw?.byService || [];
+  const breakdown = STATS_SERVICE_BUCKETS.map((service) => {
+    const row = byService.find((r) => r._id === service);
+    return { service, count: row?.count || 0, spend: row?.spend || 0 };
+  });
+  const flightCount = breakdown.find((b) => b.service === "FLIGHT")?.count || 0;
+  const hotelCount = breakdown.find((b) => b.service === "HOTEL")?.count || 0;
+  const travellerCount = raw?.travellers?.[0]?.n || 0;
+  return {
+    totalTrips: totals.totalTrips || 0,
+    totalSpend: totals.totalSpend || 0,
+    flightCount,
+    hotelCount,
+    travellerCount,
+    breakdown,
+  };
+}
+
+router.get("/stats", async (req: Request, res: Response) => {
+  try {
+    const user: any = (req as any).user;
+    const customerId = (req as any).workspace?.customerId ?? null;
+    if (!customerId || !mongoose.isValidObjectId(customerId)) {
+      return res.json({ ok: true, primary: shapeFacetResult(null), compare: null });
+    }
+
+    const now = new Date();
+    const defaultFrom = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const from = parseDayStart(req.query.from) || defaultFrom;
+    const to = parseDayEnd(req.query.to) || now;
+    const compareFrom = parseDayStart(req.query.compareFrom);
+    const compareTo = parseDayEnd(req.query.compareTo);
+    const hasCompare = Boolean(compareFrom && compareTo);
+
+    const match: Record<string, any> = {
+      workspaceId: new mongoose.Types.ObjectId(customerId),
+      isActive: { $ne: false },
+      isDemo: user?.isDemoUser ? true : { $ne: true },
+    };
+
+    // OWN-scope (plain member, non-leader/approver/staff-admin): restrict to
+    // bookings where the caller's own login email matches a passenger —
+    // mirrors canCustomerAccessBookingAttachments's OWN branch exactly
+    // (case-insensitive email-in-passengers[]), NOT the userId/bookedBy
+    // pattern GET / uses (that matches the staff booker, not the customer).
+    if (!isOrgScopeUser(user)) {
+      const email = String(user?.email || "").trim().toLowerCase();
+      if (!email) {
+        return res.json({ ok: true, primary: shapeFacetResult(null), compare: null });
+      }
+      match.$expr = {
+        $in: [
+          email,
+          {
+            $map: {
+              input: { $ifNull: ["$passengers", []] },
+              as: "p",
+              in: { $toLower: { $ifNull: ["$$p.email", ""] } },
+            },
+          },
+        ],
+      };
+    }
+
+    // Flat sibling branches, NOT primary/compare each nesting their own
+    // $facet — see periodTotalsBranch's doc comment for why (Mongo rejects
+    // $facet-within-$facet outright).
+    const facet: Record<string, any[]> = {
+      primaryTotals: periodTotalsBranch(from, to),
+      primaryByService: periodByServiceBranch(from, to),
+      primaryTravellers: periodTravellersBranch(from, to),
+    };
+    if (hasCompare) {
+      facet.compareTotals = periodTotalsBranch(compareFrom as Date, compareTo as Date);
+      facet.compareByService = periodByServiceBranch(compareFrom as Date, compareTo as Date);
+      facet.compareTravellers = periodTravellersBranch(compareFrom as Date, compareTo as Date);
+    }
+
+    const pipeline = [
+      { $match: match },
+      // Explicit allowlist — see doc comment above. No cost/margin/PII field
+      // exists past this stage for any later $group/$sum to touch.
+      {
+        $project: {
+          type: 1,
+          "pricing.grandTotal": 1,
+          "pricing.totalWithGST": 1,
+          "pricing.quotedPrice": 1,
+          "passengers.name": 1,
+          "passengers.email": 1,
+          bookingDate: 1,
+        },
+      },
+      { $facet: facet },
+    ];
+
+    const [result] = await ManualBooking.aggregate(pipeline as any);
+
+    // Reassemble the flat primaryTotals/primaryByService/primaryTravellers
+    // (and compare* siblings) back into the {totals, byService, travellers}
+    // shape shapeFacetResult expects — unchanged from before the flattening.
+    const primaryRaw = {
+      totals: result?.primaryTotals,
+      byService: result?.primaryByService,
+      travellers: result?.primaryTravellers,
+    };
+    const compareRaw = hasCompare
+      ? {
+          totals: result?.compareTotals,
+          byService: result?.compareByService,
+          travellers: result?.compareTravellers,
+        }
+      : null;
+
+    res.json({
+      ok: true,
+      primary: { from: from.toISOString(), to: to.toISOString(), ...shapeFacetResult(primaryRaw) },
+      compare: hasCompare
+        ? {
+            from: (compareFrom as Date).toISOString(),
+            to: (compareTo as Date).toISOString(),
+            ...shapeFacetResult(compareRaw),
+          }
+        : null,
+    });
+  } catch (err: any) {
+    logger.error("my-bookings stats failed", {
+      userId: (req as any).user?.sub || (req as any).user?._id,
+      error: err?.message,
+    });
+    res.status(500).json({ ok: false, error: "Failed to load booking stats" });
   }
 });
 

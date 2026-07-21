@@ -12,6 +12,7 @@ import Employee from "../models/Employee.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { validateObjectId } from "../middleware/validateObjectId.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
+import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMemberRoles.js";
 
 const router = Router();
 
@@ -144,8 +145,14 @@ router.get("/workspace-members", requireAuth, async (req: any, res) => {
 
     const members = await User.find(
       { customerId: user.customerId, isActive: { $ne: false } },
-      "name firstName lastName email roles customerMemberRole bandNumber",
+      "name firstName lastName email roles role bandNumber",
     ).lean();
+
+    // CustomerMember.role, not the nonexistent User.customerMemberRole —
+    // see utils/customerMemberRoles.ts for why. Same helper Workspace
+    // Permissions uses, so the two screens can't show different roles for
+    // the same member again.
+    const roleMap = await getCustomerMemberRoleMap(String(user.customerId));
 
     const mapped = (members as any[]).map((m) => ({
       userId: String(m._id),
@@ -154,7 +161,7 @@ router.get("/workspace-members", requireAuth, async (req: any, res) => {
         `${m.firstName || ""} ${m.lastName || ""}`.trim() ||
         m.email,
       email: m.email,
-      role: m.customerMemberRole || m.roles?.[0] || "Member",
+      role: resolveMemberRole(roleMap, m.email, m.roles, m.role),
       bandNumber: m.bandNumber ?? null,
     }));
 

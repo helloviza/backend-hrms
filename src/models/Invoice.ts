@@ -22,6 +22,11 @@ export interface IEditHistoryEntry {
   fieldsChanged: string[];
   oldValues: Record<string, unknown>;
   newValues: Record<string, unknown>;
+  // Present only on entries written by the customer portal (currently just
+  // the SENT->PAYMENT_DECLARED transition) — its ABSENCE means a staff/admin
+  // action, its PRESENCE means the customer's own claim, so finance can tell
+  // the two apart without cross-referencing editedBy's role.
+  source?: "customer_portal";
 }
 
 export interface IInvoice extends Document {
@@ -78,7 +83,15 @@ export interface IInvoice extends Document {
     email?: string;
     state?: string;
   };
-  status: "DRAFT" | "SENT" | "PAID" | "CANCELLED";
+  // PAYMENT_DECLARED: the customer has claimed payment via the portal
+  // (SENT -> PAYMENT_DECLARED, customer-only transition) — NOT the same as
+  // PAID, which keeps its exact original meaning: finance has confirmed
+  // receipt. Nothing that already keys off status==="PAID" (e.g.
+  // manualBookings.ts's aging/pending-days short-circuit) needs to change —
+  // PAYMENT_DECLARED is a genuinely new, distinct value, not an alias.
+  status: "DRAFT" | "SENT" | "PAYMENT_DECLARED" | "PAID" | "CANCELLED";
+  paymentDeclaredAt?: Date;
+  paymentDeclaredBy?: Schema.Types.ObjectId;
   cancelledAt?: Date;
   cancelledBy?: Schema.Types.ObjectId;
   cancellationReason?: string;
@@ -154,7 +167,9 @@ const InvoiceSchema = new Schema<IInvoice>(
       email: String,
       state: String,
     },
-    status: { type: String, enum: ["DRAFT", "SENT", "PAID", "CANCELLED"], default: "DRAFT" },
+    status: { type: String, enum: ["DRAFT", "SENT", "PAYMENT_DECLARED", "PAID", "CANCELLED"], default: "DRAFT" },
+    paymentDeclaredAt: Date,
+    paymentDeclaredBy: { type: Schema.Types.ObjectId, ref: "User" },
     cancelledAt: Date,
     cancelledBy: { type: Schema.Types.ObjectId, ref: "User" },
     cancellationReason: String,
@@ -179,6 +194,7 @@ const InvoiceSchema = new Schema<IInvoice>(
       fieldsChanged: [String],
       oldValues: { type: Schema.Types.Mixed },
       newValues: { type: Schema.Types.Mixed },
+      source: { type: String, enum: ["customer_portal"] },
     }],
   },
   { timestamps: true },
