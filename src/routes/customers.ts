@@ -2,7 +2,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
-import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { requireWorkspace, isCustomerUser } from "../middleware/requireWorkspace.js";
 import { requireRoles } from "../middleware/roles.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import Customer from "../models/Customer.js";
@@ -15,6 +15,24 @@ import { getCompanySettings } from "../models/CompanySettings.js";
 import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMemberRoles.js";
 
 const router = Router();
+
+/**
+ * Top-level Customer schema path names (e.g. "address.street" → "address"),
+ * computed once. Used to reject any PATCH body key that doesn't map to
+ * anything the schema knows about — Mongoose's default strict mode silently
+ * deletes such keys during $set casting (verified against
+ * node_modules/mongoose/lib/helpers/query/castUpdate.js), which is exactly
+ * how CIN, the four flat bank fields, and several aliases were discarded on
+ * save while the endpoint still reported success. See
+ * docs/audits/business-form-persistence-audit.md.
+ */
+const CUSTOMER_TOP_LEVEL_SCHEMA_KEYS = new Set(
+  Object.keys(Customer.schema.paths).map((p) => p.split(".")[0]),
+);
+
+function findUnrecognizedCustomerFields(body: Record<string, any>): string[] {
+  return Object.keys(body || {}).filter((k) => !CUSTOMER_TOP_LEVEL_SCHEMA_KEYS.has(k));
+}
 
 router.get("/", requireAuth, requireWorkspace, requireAdmin, async (_req: any, res, next) => {
   try {
@@ -173,14 +191,33 @@ router.get("/workspace-members", requireAuth, async (req: any, res) => {
 
 /**
  * GET /api/customers/:id
- * Returns the full Customer document by _id, scoped to the workspace.
+ * Returns the full Customer document by _id.
  * No role check — a CUSTOMER user needs to read their own record.
- * Workspace scope is sufficient isolation.
+ *
+ * Scope is resolved the same way resolveWorkspaceForUser does it (see
+ * requireWorkspace.ts): staff/admin/SUPERADMIN may load ANY customer record
+ * (they already effectively could, since every staff caller happened to
+ * resolve to the same internal workspace as most Customer.workspaceId values —
+ * this just makes that explicit instead of accidental). A customer-portal
+ * user may load ONLY their own record, resolved from their JWT customerId —
+ * NOT by comparing against the target document's Customer.workspaceId field,
+ * which is unreliable (see docs/audits/company-data-mismatch-audit.md) and
+ * is exactly what caused this to silently 404 for real customers while
+ * looking fine to staff.
  */
 router.get("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
-    const wsId = String(req.workspaceObjectId);
-    const customer = await Customer.findOne({ _id: req.params.id, workspaceId: wsId }).lean().exec();
+    const { id } = req.params;
+    const user = req.user;
+
+    if (!isSuperAdmin(req) && isCustomerUser(user)) {
+      const ownCustomerId = String(user?.customerId ?? user?.businessId ?? "");
+      if (!ownCustomerId || ownCustomerId !== String(id)) {
+        return res.status(404).json({ error: "Customer not found" });
+      }
+    }
+
+    const customer = await Customer.findOne({ _id: id }).lean().exec();
     if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
     }
@@ -287,6 +324,12 @@ router.patch(
 
 // ── PATCH /api/customers/:id ─────────────────────────────────────────────────
 // Generic field update for Zoho-imported business records (no onboarding doc).
+// requireRoles below already restricts this handler to staff (ADMIN/SUPERADMIN/HR) —
+// no CUSTOMER-portal caller can ever reach it. Staff may edit ANY customer record
+// (same "staff = platform-wide" scope as GET /:id above), so the update is no
+// longer additionally scoped by the target document's (unreliable) workspaceId
+// field — see docs/audits/company-data-mismatch-audit.md for why that equality
+// check only ever "worked" by accident.
 router.patch(
   "/:id",
   validateObjectId("id"),
@@ -296,7 +339,21 @@ router.patch(
   async (req: any, res, next) => {
     try {
       const { id } = req.params;
-      const wsId = String(req.workspaceObjectId);
+
+      // A save that didn't persist must never report success. Reject up
+      // front — before any write — rather than silently letting Mongoose's
+      // strict-mode cast drop the offending keys and returning {ok:true}
+      // regardless (see docs/audits/business-form-persistence-audit.md).
+      const unrecognized = findUnrecognizedCustomerFields(req.body || {});
+      if (unrecognized.length > 0) {
+        return res.status(400).json({
+          error: "UNRECOGNIZED_FIELDS",
+          message:
+            `These submitted fields don't match any Customer schema path and would be ` +
+            `silently discarded rather than saved: ${unrecognized.join(", ")}`,
+          unrecognizedFields: unrecognized,
+        });
+      }
 
       // Multi-GST: defaultSellerGstin, if provided, must match an ACTIVE
       // company gstProfile. Empty/absent is valid (means global default).
@@ -320,7 +377,7 @@ router.patch(
       }
 
       const updated = await Customer.findOneAndUpdate(
-        { _id: id, workspaceId: wsId },
+        { _id: id },
         { $set: { ...req.body, updatedAt: new Date() } },
         { new: true },
       ).lean();
@@ -339,31 +396,37 @@ router.patch(
             syncFields["formPayload.legalName"] = req.body.companyName || req.body.name;
           }
 
-          // GST — sent as gstin
-          if (req.body.gstin !== undefined) {
-            syncFields["formPayload.gstNumber"] = req.body.gstin;
+          // GST — canonical field is gstNumber; gstin kept as a fallback for
+          // any caller still on the old alias.
+          const gstIn = req.body.gstNumber ?? req.body.gstin;
+          if (gstIn !== undefined) {
+            syncFields["formPayload.gstNumber"] = gstIn;
           }
 
-          // PAN — sent as pan
-          if (req.body.pan !== undefined) {
-            syncFields["formPayload.panNumber"] = req.body.pan;
+          // PAN — canonical field is panNumber; pan kept as a fallback.
+          const panIn = req.body.panNumber ?? req.body.pan;
+          if (panIn !== undefined) {
+            syncFields["formPayload.panNumber"] = panIn;
           }
 
-          // Direct field mappings (same name)
+          // Official email — canonical field is email; officialEmail kept as
+          // a fallback for any caller still on the old alias.
+          const officialEmailIn = req.body.email ?? req.body.officialEmail;
+          if (officialEmailIn !== undefined) {
+            syncFields["formPayload.officialEmail"] = officialEmailIn;
+          }
+
+          // Direct field mappings (same name), with a nested req.body.address.*
+          // fallback for the address fields now that the flat top-level
+          // addressLine1/city/country/pincode keys are no longer sent.
           const directFields = [
             "registeredAddress",
-            "addressLine1",
-            "addressLine2",
-            "city",
-            "country",
-            "pincode",
             "entityType",
             "industry",
             "website",
             "employeesCount",
             "incorporationDate",
             "description",
-            "officialEmail",
           ];
           directFields.forEach((f) => {
             if (req.body[f] !== undefined) {
@@ -371,18 +434,38 @@ router.patch(
             }
           });
 
-          // Bank — sent as flat fields
-          if (req.body.bankName !== undefined) {
-            syncFields["formPayload.bank.bankName"] = req.body.bankName;
+          const addressFieldMap: Record<string, string> = {
+            addressLine1: "street",
+            addressLine2: "street2",
+            city: "city",
+            country: "country",
+            pincode: "pincode",
+          };
+          Object.entries(addressFieldMap).forEach(([formPayloadKey, addressKey]) => {
+            const val = req.body.address?.[addressKey] ?? req.body[formPayloadKey];
+            if (val !== undefined) {
+              syncFields[`formPayload.${formPayloadKey}`] = val;
+            }
+          });
+
+          // Bank — sent nested today (req.body.bank.*), flat keys kept as a
+          // fallback for any other caller still on the old shape.
+          const bodyBank = req.body.bank || {};
+          const bankNameIn = bodyBank.bankName ?? req.body.bankName;
+          const bankAccountIn = bodyBank.accountNumber ?? req.body.bankAccountNumber;
+          const bankIfscIn = bodyBank.ifsc ?? req.body.bankIfsc;
+          const bankBranchIn = bodyBank.branch ?? req.body.bankBranch;
+          if (bankNameIn !== undefined) {
+            syncFields["formPayload.bank.bankName"] = bankNameIn;
           }
-          if (req.body.bankAccountNumber !== undefined) {
-            syncFields["formPayload.bank.accountNumber"] = req.body.bankAccountNumber;
+          if (bankAccountIn !== undefined) {
+            syncFields["formPayload.bank.accountNumber"] = bankAccountIn;
           }
-          if (req.body.bankIfsc !== undefined) {
-            syncFields["formPayload.bank.ifsc"] = req.body.bankIfsc;
+          if (bankIfscIn !== undefined) {
+            syncFields["formPayload.bank.ifsc"] = bankIfscIn;
           }
-          if (req.body.bankBranch !== undefined) {
-            syncFields["formPayload.bank.branch"] = req.body.bankBranch;
+          if (bankBranchIn !== undefined) {
+            syncFields["formPayload.bank.branch"] = bankBranchIn;
           }
 
           if (Object.keys(syncFields).length > 0) {

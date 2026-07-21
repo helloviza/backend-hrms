@@ -53,6 +53,8 @@ const CustomerSchema = new Schema(
 
     panNumber: { type: String, trim: true },
 
+    cin: { type: String, trim: true },
+
     entityType: { type: String, trim: true },
 
     incorporationDate: { type: Date },
