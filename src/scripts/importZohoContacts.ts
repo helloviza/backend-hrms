@@ -250,9 +250,52 @@ function buildCustomerData(row: ZohoRow, isBusinessType: boolean) {
         ]
       : [],
 
-    workspaceId: "69679a7628330a58d29f2254",
+    // workspaceId is deliberately NOT set here. It used to be hardcoded to the
+    // Plumtrips internal (HOUSE) workspace for every imported row — including
+    // on every re-run's blind $set of this whole object onto an EXISTING
+    // customer, silently re-stamping HOUSE back over a since-corrected value.
+    // BUSINESS rows get their real tenant CustomerWorkspace._id stamped
+    // explicitly in main() below, after that workspace is created/ensured.
+    // INDIVIDUAL rows have no CustomerWorkspace concept at all, so they're
+    // left unset rather than given a workspace they don't belong to.
   };
 }
+
+// Shared defaults for a newly-created CustomerWorkspace, used both when a
+// BUSINESS row creates its workspace for the first time and when an update
+// upserts one that turned out to be missing (a customer imported before this
+// fix, never logged in, so ensureCustomerWorkspace/lazy-create never ran).
+const NEW_CUSTOMER_WORKSPACE_DEFAULTS = {
+  plan: "trial",
+  travelMode: "APPROVAL_FLOW",
+  config: {
+    travelFlow: "APPROVAL_FLOW",
+    approval: {
+      requireL2: true,
+      requireL0: false,
+      requireProposal: true,
+    },
+    tokenExpiryHours: 12,
+    features: {
+      sbtEnabled: false,
+      approvalFlowEnabled: false,
+      approvalDirectEnabled: false,
+      flightBookingEnabled: false,
+      hotelBookingEnabled: false,
+      visaEnabled: false,
+      miceEnabled: false,
+      forexEnabled: false,
+      esimEnabled: false,
+      payrollEnabled: false,
+      performanceEnabled: false,
+      attendanceEnabled: false,
+      leaveEnabled: false,
+      onboardingEnabled: false,
+      analyticsEnabled: false,
+    },
+  },
+  status: "ACTIVE",
+};
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -305,40 +348,8 @@ async function main() {
           ? await Customer.findOne({ $or: orClauses }).lean()
           : null;
 
-        if (exists) {
-          await Customer.findByIdAndUpdate(exists._id, { $set: data });
-          console.log(`🔄 UPDATED  [BUSINESS] ${displayLabel}`);
-          stats.business.updated++;
-
-          // Also update CustomerWorkspace
-          await CustomerWorkspace.findOneAndUpdate(
-            { customerId: exists._id.toString() },
-            {
-              $set: {
-                companyName: companyName || name || undefined,
-                gstNumber,
-                website: opt(row["Website"]),
-                phone: opt(row["Phone"]),
-                email,
-                address: {
-                  line1: opt(row["Billing Address"]),
-                  line2: opt(row["Billing Street2"]),
-                  city: opt(row["Billing City"]),
-                  state: opt(row["Billing State"]),
-                  country: opt(row["Billing Country"]),
-                  pincode: opt(row["Billing Code"]),
-                },
-              },
-            }
-          );
-          continue;
-        }
-
-        const customer = await Customer.create(data);
-
-        await CustomerWorkspace.create({
-          customerId: customer._id.toString(),
-          companyName: companyName || name,
+        const workspaceEnrichment = {
+          companyName: companyName || name || undefined,
           gstNumber,
           website: opt(row["Website"]),
           phone: opt(row["Phone"]),
@@ -351,35 +362,45 @@ async function main() {
             country: opt(row["Billing Country"]),
             pincode: opt(row["Billing Code"]),
           },
-          plan: "trial",
-          travelMode: "APPROVAL_FLOW",
-          config: {
-            travelFlow: "APPROVAL_FLOW",
-            approval: {
-              requireL2: true,
-              requireL0: false,
-              requireProposal: true,
+        };
+
+        if (exists) {
+          await Customer.findByIdAndUpdate(exists._id, { $set: data });
+
+          // Ensure (create if missing) this customer's own CustomerWorkspace,
+          // and stamp Customer.workspaceId to match it — self-healing on every
+          // re-run instead of the previous behavior (data.workspaceId blindly
+          // re-stamping the HOUSE id over a since-corrected value).
+          const workspace = await CustomerWorkspace.findOneAndUpdate(
+            { customerId: exists._id.toString() },
+            {
+              $set: workspaceEnrichment,
+              $setOnInsert: NEW_CUSTOMER_WORKSPACE_DEFAULTS,
             },
-            tokenExpiryHours: 12,
-            features: {
-              sbtEnabled: false,
-              approvalFlowEnabled: false,
-              approvalDirectEnabled: false,
-              flightBookingEnabled: false,
-              hotelBookingEnabled: false,
-              visaEnabled: false,
-              miceEnabled: false,
-              forexEnabled: false,
-              esimEnabled: false,
-              payrollEnabled: false,
-              performanceEnabled: false,
-              attendanceEnabled: false,
-              leaveEnabled: false,
-              onboardingEnabled: false,
-              analyticsEnabled: false,
-            },
-          },
-          status: "ACTIVE",
+            { upsert: true, new: true },
+          );
+          await Customer.findByIdAndUpdate(exists._id, {
+            $set: { workspaceId: workspace._id },
+          });
+
+          console.log(`🔄 UPDATED  [BUSINESS] ${displayLabel}`);
+          stats.business.updated++;
+          continue;
+        }
+
+        const customer = await Customer.create(data);
+
+        const workspace = await CustomerWorkspace.create({
+          customerId: customer._id.toString(),
+          ...workspaceEnrichment,
+          ...NEW_CUSTOMER_WORKSPACE_DEFAULTS,
+        });
+
+        // Stamp the real tenant workspace's _id back onto the Customer we just
+        // created — previously this never happened, so Customer.workspaceId
+        // stayed at whatever buildCustomerData() set (the hardcoded HOUSE id).
+        await Customer.findByIdAndUpdate(customer._id, {
+          $set: { workspaceId: workspace._id },
         });
 
         console.log(`✅ CREATED  [BUSINESS] ${displayLabel}`);
@@ -414,12 +435,12 @@ async function main() {
     }
   }
 
-  // Backfill workspaceId on all Zoho-imported docs that were created before this fix
-  const backfill = await Customer.updateMany(
-    { source: "zoho_import", workspaceId: { $exists: false } },
-    { $set: { workspaceId: "69679a7628330a58d29f2254" } }
-  );
-  console.log(`✅ Backfilled workspaceId on ${backfill.modifiedCount} imported records`);
+  // NOTE: the old end-of-run step here unconditionally re-stamped the HOUSE
+  // workspace id onto every Zoho-imported Customer missing a workspaceId —
+  // the exact same bug as the per-row hardcode above, just applied in bulk on
+  // every single run. Removed; per-row logic above now sets the real tenant
+  // CustomerWorkspace._id (BUSINESS) or leaves it unset (INDIVIDUAL, no
+  // workspace concept) — there is nothing left to blanket-backfill here.
 
   console.log(`
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
