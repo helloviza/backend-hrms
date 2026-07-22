@@ -134,7 +134,7 @@ r.put(
 /* ─── PUT /official-booking — Toggle SBT Official Booking ─── */
 r.put(
   "/official-booking",
-  requireRoles("WORKSPACE_ADMIN", "ADMIN"),
+  requireRoles("WORKSPACE_ADMIN", "ADMIN", "WORKSPACE_LEADER"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const workspaceId = req.workspaceId;
@@ -167,7 +167,7 @@ r.put(
 /* ─── PATCH /pan — Update workspace Company PAN and GST number ─── */
 r.patch(
   "/pan",
-  requireRoles("WORKSPACE_ADMIN", "ADMIN"),
+  requireRoles("WORKSPACE_ADMIN", "ADMIN", "WORKSPACE_LEADER"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const workspaceId = req.workspaceId;
