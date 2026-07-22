@@ -74,6 +74,7 @@ export interface CustomerWorkspaceDocument extends Document {
 
   defaultApproverEmails: string[];
   canApproverCreateUsers: boolean;
+  canApproverManageTravellers: boolean;
   userCreationEnabled: boolean;
 
   userCreationAllowlistEmails: string[];
@@ -229,6 +230,10 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
 
     defaultApproverEmails: { type: [String], default: [] },
     canApproverCreateUsers: { type: Boolean, default: true },
+    // Default ON — travellers are lower-risk than user/role management, and
+    // the point of Traveller Profiles is removing booking friction for
+    // whoever actually books (see docs/prd/traveller-profiles.md §2.2).
+    canApproverManageTravellers: { type: Boolean, default: true },
     userCreationEnabled: { type: Boolean, default: false, index: true },
 
     userCreationAllowlistEmails: { type: [String], default: [] },

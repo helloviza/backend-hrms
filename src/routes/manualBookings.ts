@@ -22,6 +22,7 @@ import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
+import { maskTailId } from "../utils/piiMask.js";
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -285,6 +286,20 @@ const BOOKING_COLUMNS = [
 // (shifted +2 by the "Booking Date" (pos 2) and "Ref No." (pos 3) columns)
 const MONEY_COLS = [17, 18, 19, 20, 21, 22];
 
+// Mask passport/PAN to last-4 for the admin list view — full plaintext stays
+// available on the single-booking detail read (staff need it to service the
+// booking) and to SUPERADMIN, but the list/export surface should never hand
+// out full numbers to every manualBookings:READ holder. maskTailId itself
+// lives in utils/piiMask.ts, shared with TravellerProfile's export route.
+function maskPassengerPII(passengers: any[] | undefined): any[] | undefined {
+  if (!Array.isArray(passengers)) return passengers;
+  return passengers.map((p: any) => ({
+    ...p,
+    panNo: maskTailId(p?.panNo),
+    passportNo: maskTailId(p?.passportNo),
+  }));
+}
+
 // One flat cell per booking — see the "Line Items" column comment above.
 function formatLineItems(b: any): string {
   const items: any[] = Array.isArray(b.lineItems) ? b.lineItems : [];
@@ -526,6 +541,11 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
       ...b,
       clientName: clientNameMap[b.workspaceId?.toString()] || "",
       invoicePendingDays: invoicePendingDays(b),
+      // panNo/passportNo masked to last-4 unless the caller is SUPERADMIN —
+      // this list is reachable by any manualBookings:READ holder, not just
+      // the staff actually servicing the booking (see docs/audits/
+      // traveller-profiles-scoping.md §4.2).
+      passengers: accessCtx.isSuperAdmin ? b.passengers : maskPassengerPII(b.passengers),
     }));
 
     console.log('[manualBookings GET] enriched[0].clientName:', enriched?.[0]?.clientName);
@@ -1319,6 +1339,10 @@ router.get("/:id", requirePermission("manualBookings", "READ"), async (req: any,
       return res.status(403).json({ success: false, message: "Not found" });
     }
 
+    // NOT masked here, unlike the list view — ManualBookingForm.tsx prefills
+    // its edit form straight from this response (line ~433) and PUTs the
+    // passengers array back unchanged for untouched fields; masking would
+    // silently overwrite real passport/PAN numbers with "****1234" on save.
     res.json({ ok: true, booking: { ...booking, invoicePendingDays: invoicePendingDays(booking) } });
   } catch (err: any) {
     console.error("[ManualBookings GET one]", err.message);

@@ -74,6 +74,7 @@ router.put("/settings", requireAuth, async (req: any, res, next) => {
     if ("allowedEmails" in (req.body || {})) patch.allowedEmails = normalizeList(req.body.allowedEmails).map(normEmail);
     if ("defaultApproverEmails" in (req.body || {})) patch.defaultApproverEmails = normalizeList(req.body.defaultApproverEmails).map(normEmail);
     if ("canApproverCreateUsers" in (req.body || {})) patch.canApproverCreateUsers = Boolean(req.body.canApproverCreateUsers);
+    if ("canApproverManageTravellers" in (req.body || {})) patch.canApproverManageTravellers = Boolean(req.body.canApproverManageTravellers);
     if ("status" in (req.body || {})) patch.status = String(req.body.status || "ACTIVE").toUpperCase();
 
     const ws = await CustomerWorkspace.findOneAndUpdate(
