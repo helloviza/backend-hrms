@@ -1,12 +1,18 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import requireAuth from "../middleware/auth.js";
-import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { requireWorkspace, isCustomerUser } from "../middleware/requireWorkspace.js";
 import { requireRoles } from "../middleware/roles.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import Customer from "../models/Customer.js";
 
 const r = Router();
 
 r.use(requireAuth, requireWorkspace);
+
+// Plumtrips internal HOUSE workspace _id — mirrors the per-file literal
+// convention used in requireHouse.ts / requireFeature.ts / requireWorkspace.ts
+// (no shared exported constant). NEVER write to it.
+const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
 
 /* ─── PUT /payroll-enable — Enable/disable payroll feature flag ─── */
 r.put(
@@ -208,15 +214,46 @@ r.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const workspaceId = req.workspaceId;
-      const ws = await CustomerWorkspace.findById(workspaceId)
-        .select("payrollConfig attendanceConfig pan gstNumber")
-        .lean();
+      const user = (req as any).user;
+
+      const ws = workspaceId
+        ? await CustomerWorkspace.findById(workspaceId)
+            .select("payrollConfig attendanceConfig pan gstNumber companyName address customerId")
+            .lean()
+        : null;
+
+      // Guard: a customer session must never resolve to the Plumtrips HOUSE
+      // workspace — that would put Plumtrips' own PAN/GST/contact details on
+      // a customer's GST invoice, invisibly to them (same class of bug as the
+      // /auth/me HOUSE leak requireWorkspace.ts guards against). Blank the
+      // company-info fields rather than error: this endpoint also serves
+      // payrollConfig/attendanceConfig, which should still resolve normally.
+      const isHouseForCustomer =
+        isCustomerUser(user) && String(workspaceId || "") === PLUMTRIPS_HOUSE_WORKSPACE_ID;
+
+      let companyEmail = "";
+      let companyPhone = "";
+      if (ws && !isHouseForCustomer && (ws as any).customerId) {
+        const cust = await Customer.findOne({ _id: (ws as any).customerId })
+          .select("email phone billingPhone")
+          .lean();
+        // billingPhone is the dedicated accounts/billing contact number
+        // (populated from onboarding + Zoho "Billing Phone" import); phone
+        // is the general primary contact. No equivalent billingEmail field
+        // exists on Customer today, so email falls back to the general one.
+        companyEmail = (cust as any)?.email || "";
+        companyPhone = (cust as any)?.billingPhone || (cust as any)?.phone || "";
+      }
 
       return res.json({
         payrollConfig: (ws as any)?.payrollConfig || {},
         attendanceConfig: (ws as any)?.attendanceConfig || {},
-        pan: (ws as any)?.pan || "",
-        gstNumber: (ws as any)?.gstNumber || "",
+        pan: isHouseForCustomer ? "" : (ws as any)?.pan || "",
+        gstNumber: isHouseForCustomer ? "" : (ws as any)?.gstNumber || "",
+        companyName: isHouseForCustomer ? "" : (ws as any)?.companyName || "",
+        address: isHouseForCustomer ? null : (ws as any)?.address || null,
+        companyEmail,
+        companyPhone,
       });
     } catch (err) {
       return next(err);

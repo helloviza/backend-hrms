@@ -139,6 +139,27 @@ async function requireActiveMember(req: any, res: any): Promise<{ member: any | 
 }
 
 /**
+ * requireWorkspace's SUPERADMIN bypass only attaches req.workspaceObjectId
+ * when an explicit workspaceId is present in body/query/params/header or the
+ * JWT — a SUPERADMIN session with none of those (e.g. hitting this router
+ * from a page that never sends one, like the SBT passenger typeahead) sails
+ * through requireActiveMember (which no-ops for SUPERADMIN) with
+ * req.workspaceObjectId left undefined. Every query below scopes by
+ * workspaceId, and an undefined value there doesn't broaden the search —
+ * it makes every route silently behave as "no travellers" instead of
+ * failing loudly. Call this right after the access gate on every handler
+ * that touches TravellerProfile so that failure mode is a clear 400
+ * instead of a quiet empty result indistinguishable from "no matches".
+ */
+function requireWorkspaceContext(req: any, res: any): boolean {
+  if (req.workspaceObjectId) return true;
+  res.status(400).json({
+    error: "No workspace context. SUPERADMIN: pass workspaceId in body, query, or x-workspace-id header.",
+  });
+  return false;
+}
+
+/**
  * Reuses the linked CustomerMember's existing travelerId when one is being
  * assigned at create time, so the same person doesn't end up with two IDs
  * across CustomerMember and TravellerProfile. Otherwise mints a new one
@@ -172,6 +193,7 @@ router.get("/", async (req: any, res: any) => {
   try {
     const gate = await requireActiveMember(req, res);
     if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
     const { member } = gate;
 
     const workspaceId = req.workspaceObjectId;
@@ -232,6 +254,7 @@ router.get("/:id", async (req: any, res: any) => {
   try {
     const gate = await requireActiveMember(req, res);
     if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
     const { member } = gate;
 
     const workspaceId = req.workspaceObjectId;
@@ -260,6 +283,7 @@ router.post("/", async (req: any, res: any) => {
   try {
     const gate = await requireActiveMember(req, res);
     if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
     const { member } = gate;
 
     const uid = actorUserId(req);
@@ -337,6 +361,7 @@ router.put("/:id", async (req: any, res: any) => {
   try {
     const gate = await requireActiveMember(req, res);
     if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
     const { member } = gate;
 
     const workspaceId = req.workspaceObjectId;
@@ -376,6 +401,7 @@ router.delete("/:id", async (req: any, res: any) => {
   try {
     const gate = await requireActiveMember(req, res);
     if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
     const { member } = gate;
 
     const workspaceId = req.workspaceObjectId;
@@ -737,6 +763,7 @@ router.post("/bulk/preview", bulkUpload.single("file"), async (req: any, res: an
   try {
     const gate = await requireBulkAccess(req, res);
     if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
 
     if (!req.file?.buffer) return res.status(400).json({ error: "Missing file" });
     const rawRows = await parseUploadedRows(req.file);
@@ -763,6 +790,7 @@ router.post("/bulk/commit", bulkUpload.single("file"), async (req: any, res: any
   try {
     const gate = await requireBulkAccess(req, res);
     if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
 
     if (!req.file?.buffer) return res.status(400).json({ error: "Missing file" });
     const rawRows = await parseUploadedRows(req.file);
@@ -793,6 +821,7 @@ router.get("/export/download", async (req: any, res: any) => {
   try {
     const gate = await requireActiveMember(req, res);
     if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
 
     const workspaceId = req.workspaceObjectId;
     const docs = await TravellerProfile.find({ workspaceId, isActive: true })
