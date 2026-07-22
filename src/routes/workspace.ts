@@ -4,15 +4,15 @@ import multer from "multer";
 import mongoose from "mongoose";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
+import logger from "../utils/logger.js";
 
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
-import WorkspaceBranding from "../models/WorkspaceBranding.js";
 
 const router = express.Router();
 
@@ -395,17 +395,20 @@ router.get("/me", async (req: AnyObj, res) => {
 
   const scope = await resolveWorkspaceScope(user, req);
 
-  const branding = (await WorkspaceBranding.findOne({
-    subjectType: scope.scopeType,
-    subjectId: scope.scopeId,
-  }).lean()) as null | { logoKey?: string; logoUrl?: string };
-
-  let logoUrl = branding?.logoUrl || "";
-  if (branding?.logoKey) {
-    try {
-      logoUrl = await signLogoUrl(branding.logoKey);
-    } catch {
-      // S3 sign failure is non-fatal — return without logo
+  // Canonical logo field — same one workspace.branding.ts and /auth/me read,
+  // so Header/Sidebar pick up whatever gets uploaded here.
+  let logoUrl = "";
+  if (scope.scopeType === "CUSTOMER") {
+    const ws = await CustomerWorkspace.findOne({ customerId: scope.customerId || scope.scopeId })
+      .select("companyLogoKey")
+      .lean();
+    const logoKey = (ws as any)?.companyLogoKey as string | undefined;
+    if (logoKey) {
+      try {
+        logoUrl = await signLogoUrl(logoKey);
+      } catch {
+        // S3 sign failure is non-fatal — return without logo
+      }
     }
   }
 
@@ -480,12 +483,16 @@ router.post("/logo", logoMimeGuard, upload.single("logo"), async (req: AnyObj, r
   }
 
   const scope = await resolveWorkspaceScope(user, req);
+  if (scope.scopeType !== "CUSTOMER") {
+    return res.status(400).json({ ok: false, error: "Logo upload is only supported for customer workspaces." });
+  }
+  const customerId = scope.customerId || scope.scopeId;
 
   const ext =
     safeExtFromMimetype(req.file.mimetype) ||
     ("." + (req.file.originalname.split(".").pop() || "png"));
   const rand = crypto.randomBytes(10).toString("hex");
-  const key = `workspace-logos/${scope.scopeId}/${Date.now()}-${rand}${ext}`;
+  const key = `workspace-logos/${customerId}/${Date.now()}-${rand}${ext}`;
 
   await s3.send(
     new PutObjectCommand({
@@ -496,11 +503,25 @@ router.post("/logo", logoMimeGuard, upload.single("logo"), async (req: AnyObj, r
     })
   );
 
-  await WorkspaceBranding.findOneAndUpdate(
-    { subjectType: scope.scopeType, subjectId: scope.scopeId },
-    { $set: { logoKey: key, logoUrl: "" } },
-    { upsert: true, new: true }
-  );
+  // Canonical field — same one workspace.branding.ts writes, so Header/Sidebar/
+  // /auth/me pick this up immediately. Upsert (branding.ts's route sits behind
+  // requireWorkspace, which guarantees the CustomerWorkspace row exists first;
+  // this router's own resolveWorkspaceScope can resolve a valid CUSTOMER scope
+  // before that row has been created).
+  const previous = await CustomerWorkspace.findOneAndUpdate(
+    { customerId },
+    { $set: { companyLogoKey: key, companyLogo: "" } },
+    { upsert: true, new: false, setDefaultsOnInsert: true }
+  ).select("companyLogoKey").lean();
+
+  const oldKey = (previous as any)?.companyLogoKey as string | undefined;
+  if (oldKey && oldKey !== key) {
+    try {
+      await s3.send(new DeleteObjectCommand({ Bucket: env.S3_BUCKET, Key: oldKey }));
+    } catch (delErr: any) {
+      logger.warn("[workspace.ts /logo] old logo delete failed", { oldKey, error: delErr?.message });
+    }
+  }
 
   const logoUrl = await signLogoUrl(key);
 
