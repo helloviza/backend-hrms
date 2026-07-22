@@ -197,6 +197,7 @@ app.use("/api/whatsapp", express.raw({ type: "application/json" }), whatsappWebh
 // body HMAC check, same shape as the Razorpay webhook above.
 import travelIntakeRouter from "./routes/intake.travel.js";
 import publicTravelRequestRouter from "./routes/public.travelRequest.js";
+import publicSupportContactRouter from "./routes/publicSupportContact.js";
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — manual bookings (and this intake feed) are Plumtrips Travel only.
   app.use("/api/intake", express.raw({ type: "application/json" }), travelIntakeRouter);
@@ -290,6 +291,11 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
 if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/public", publicTravelRequestRouter);
 }
+
+// Support-contact lookup — unauthenticated, used by useSupportEmail() across
+// customer/vendor/pre-auth surfaces. Not gated to plumbox: works in every
+// deployment mode, falling back to the CompanySettings schema default.
+app.use("/api/public", publicSupportContactRouter);
 
 /* ────────────────────────────────────────────────────────────────
  * STATIC UPLOADS

@@ -20,7 +20,8 @@
     "backfill:tbo-ref-no": "tsx src/scripts/backfill-tbo-reference-no.ts",
     "dedupe:sbt-hotel-bookings": "tsx src/scripts/dedupe-sbt-hotel-bookings.ts",
     "probe:tbo-book-minimal-child": "tsx src/scripts/probe-tbo-book-minimal-child.ts",
-    "render:eod-real": "tsx src/scripts/render-eod-from-db.ts"
+    "render:eod-real": "tsx src/scripts/render-eod-from-db.ts",
+    "verify:travel-request": "tsx src/scripts/verify-travel-request.ts"
   },
   "dependencies": {
     "@aws-sdk/client-apprunner": "^3.693.0",
@@ -34,6 +35,7 @@
     "@google/genai": "^1.41.0",
     "@google/generative-ai": "^0.24.1",
     "@plumtrips/shared": "file:vendor/shared",
+    "@smithy/node-http-handler": "^4.9.9",
     "@sparticuz/chromium": "^131.0.1",
     "archiver": "^7.0.1",
     "axios": "^1.7.9",
