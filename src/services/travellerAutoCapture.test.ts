@@ -166,4 +166,57 @@ describe("autoCaptureTravellersFromBooking", () => {
     expect(findMatchingTravellerMock).not.toHaveBeenCalled();
     expect(tpCreateMock).not.toHaveBeenCalled();
   });
+
+  /* ── SaveToTravellers opt-out ─────────────────────────────────────── */
+
+  it("SaveToTravellers: false skips creation entirely — no match lookup, no create", async () => {
+    await autoCaptureTravellersFromBooking({
+      workspaceId: WS, customerId: CUSTOMER, createdBy: UID,
+      passengers: [passenger({ SaveToTravellers: false })],
+    });
+    expect(findMatchingTravellerMock).not.toHaveBeenCalled();
+    expect(tpCreateMock).not.toHaveBeenCalled();
+  });
+
+  it("SaveToTravellers: false also skips updating an existing match — not just creation", async () => {
+    const doc = fakeDoc({ firstName: "Priya", lastName: "Sharma", passportExpiry: "2025-01-01" });
+    findMatchingTravellerMock.mockResolvedValue({ profile: doc, tier: 1 });
+
+    await autoCaptureTravellersFromBooking({
+      workspaceId: WS, customerId: CUSTOMER, createdBy: UID,
+      passengers: [passenger({ SaveToTravellers: false })], // fresh expiry 2030-01-01 would otherwise update it
+    });
+
+    expect(findMatchingTravellerMock).not.toHaveBeenCalled();
+    expect(doc.save).not.toHaveBeenCalled();
+  });
+
+  it("SaveToTravellers: true captures normally (explicit opt-in, same as default)", async () => {
+    await autoCaptureTravellersFromBooking({
+      workspaceId: WS, customerId: CUSTOMER, createdBy: UID,
+      passengers: [passenger({ SaveToTravellers: true })],
+    });
+    expect(tpCreateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("missing SaveToTravellers (old cached frontend bundle) still captures — fails open, not silently closed", async () => {
+    const p = passenger();
+    delete (p as any).SaveToTravellers;
+    await autoCaptureTravellersFromBooking({
+      workspaceId: WS, customerId: CUSTOMER, createdBy: UID, passengers: [p],
+    });
+    expect(tpCreateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("opt-out on one passenger does not affect capture of the others in the same booking", async () => {
+    await autoCaptureTravellersFromBooking({
+      workspaceId: WS, customerId: CUSTOMER, createdBy: UID,
+      passengers: [
+        passenger({ SaveToTravellers: false, Email: "skip@acme.com" }),
+        passenger({ FirstName: "Amit", LastName: "Verma", Email: "amit@acme.com" }),
+      ],
+    });
+    expect(tpCreateMock).toHaveBeenCalledTimes(1);
+    expect(tpCreateMock).toHaveBeenCalledWith(expect.objectContaining({ firstName: "Amit" }));
+  });
 });

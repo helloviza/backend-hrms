@@ -47,6 +47,15 @@ export interface BookingPassengerForCapture {
   PassportIssueDate?: string;
   ContactNo?: string;
   Email?: string;
+  // Per-passenger consent, set by SBTPassengers.tsx's checkbox (hidden once
+  // linked to a saved traveller — that sync stays unconditional). Only ever
+  // explicitly false for a fresh, unchecked passenger; absent/true covers
+  // both a checked fresh passenger and every linked one, so a single flag
+  // correctly gates create-vs-skip without needing to know "was this
+  // passenger linked" here. Explicit `=== false` (not falsy) so an absent
+  // field from an old cached frontend bundle still captures — the
+  // pre-checkbox behavior — rather than silently going quiet.
+  SaveToTravellers?: boolean;
 }
 
 // TBO dates arrive as "YYYY-MM-DDT00:00:00" — keep only the date part, per
@@ -89,6 +98,12 @@ export async function autoCaptureTravellersFromBooking(params: {
 
   for (const raw of passengers) {
     try {
+      // Explicit opt-out — checked once, before any lookup, so an unchecked
+      // passenger is never matched against (and never silently updates) an
+      // existing profile either. Only ever false for a fresh, unlinked
+      // passenger — see BookingPassengerForCapture.SaveToTravellers.
+      if (raw.SaveToTravellers === false) continue;
+
       const candidate = toCandidate(raw);
       if (!candidate._firstName || !candidate._lastName) continue; // shouldn't happen — form requires these
 
