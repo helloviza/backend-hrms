@@ -636,6 +636,26 @@ function periodTravellersBranch(from: Date, to: Date) {
   ];
 }
 
+// AVG BOOKED IN ADVANCE — bookingDate -> travelDate, days. Rows where
+// travelDate is missing are excluded (nothing to compute). Rows where
+// travelDate falls BEFORE bookingDate are also excluded — that's not a valid
+// "days in advance" value, it's bad data (a backdated correction or entry
+// error), and letting it through would drag the average down/negative for a
+// reason a customer can't see. Zero-day (same-day booking) rows ARE counted
+// — that's a real, legitimate advance value.
+function periodAvgAdvanceBranch(from: Date, to: Date) {
+  return [
+    { $match: { bookingDate: { $gte: from, $lte: to }, travelDate: { $ne: null } } },
+    {
+      $addFields: {
+        _advanceDays: { $divide: [{ $subtract: ["$travelDate", "$bookingDate"] }, 1000 * 60 * 60 * 24] },
+      },
+    },
+    { $match: { _advanceDays: { $gte: 0 } } },
+    { $group: { _id: null, avgDays: { $avg: "$_advanceDays" }, n: { $sum: 1 } } },
+  ];
+}
+
 function parseDayStart(v: unknown): Date | null {
   if (!v) return null;
   const d = new Date(String(v));
@@ -654,6 +674,7 @@ function shapeFacetResult(raw: any): {
   hotelCount: number;
   travellerCount: number;
   breakdown: { service: string; count: number; spend: number }[];
+  avgDaysAdvance: number | null;
 } {
   const totals = raw?.totals?.[0] || { totalTrips: 0, totalSpend: 0 };
   const byService: any[] = raw?.byService || [];
@@ -664,6 +685,10 @@ function shapeFacetResult(raw: any): {
   const flightCount = breakdown.find((b) => b.service === "FLIGHT")?.count || 0;
   const hotelCount = breakdown.find((b) => b.service === "HOTEL")?.count || 0;
   const travellerCount = raw?.travellers?.[0]?.n || 0;
+  // No usable rows this period → null, never 0 (0 reads as "booked same-day
+  // on average", which is a different claim than "no data").
+  const avgAdvanceRow = raw?.avgAdvance?.[0];
+  const avgDaysAdvance = avgAdvanceRow?.n ? Math.round(avgAdvanceRow.avgDays) : null;
   return {
     totalTrips: totals.totalTrips || 0,
     totalSpend: totals.totalSpend || 0,
@@ -671,6 +696,7 @@ function shapeFacetResult(raw: any): {
     hotelCount,
     travellerCount,
     breakdown,
+    avgDaysAdvance,
   };
 }
 
@@ -727,17 +753,21 @@ router.get("/stats", async (req: Request, res: Response) => {
       primaryTotals: periodTotalsBranch(from, to),
       primaryByService: periodByServiceBranch(from, to),
       primaryTravellers: periodTravellersBranch(from, to),
+      primaryAvgAdvance: periodAvgAdvanceBranch(from, to),
     };
     if (hasCompare) {
       facet.compareTotals = periodTotalsBranch(compareFrom as Date, compareTo as Date);
       facet.compareByService = periodByServiceBranch(compareFrom as Date, compareTo as Date);
       facet.compareTravellers = periodTravellersBranch(compareFrom as Date, compareTo as Date);
+      facet.compareAvgAdvance = periodAvgAdvanceBranch(compareFrom as Date, compareTo as Date);
     }
 
     const pipeline = [
       { $match: match },
       // Explicit allowlist — see doc comment above. No cost/margin/PII field
-      // exists past this stage for any later $group/$sum to touch.
+      // exists past this stage for any later $group/$sum to touch. travelDate
+      // is the only addition beyond bookingDate — needed for the AVG BOOKED
+      // IN ADVANCE branch, itself just a scheduling date (no cost/PII).
       {
         $project: {
           type: 1,
@@ -747,6 +777,7 @@ router.get("/stats", async (req: Request, res: Response) => {
           "passengers.name": 1,
           "passengers.email": 1,
           bookingDate: 1,
+          travelDate: 1,
         },
       },
       { $facet: facet },
@@ -761,12 +792,14 @@ router.get("/stats", async (req: Request, res: Response) => {
       totals: result?.primaryTotals,
       byService: result?.primaryByService,
       travellers: result?.primaryTravellers,
+      avgAdvance: result?.primaryAvgAdvance,
     };
     const compareRaw = hasCompare
       ? {
           totals: result?.compareTotals,
           byService: result?.compareByService,
           travellers: result?.compareTravellers,
+          avgAdvance: result?.compareAvgAdvance,
         }
       : null;
 
