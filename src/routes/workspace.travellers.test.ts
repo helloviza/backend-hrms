@@ -88,6 +88,11 @@ vi.mock("../models/Customer.js", () => ({
   },
 }));
 
+const autoCaptureMock = vi.fn();
+vi.mock("../services/travellerAutoCapture.js", () => ({
+  autoCaptureTravellersFromBooking: (...args: any[]) => autoCaptureMock(...args),
+}));
+
 import express from "express";
 import request from "supertest";
 import travellerRouter, { ensureTravellerWriteAccess } from "./workspace.travellers.js";
@@ -115,6 +120,7 @@ beforeEach(() => {
   cmFindOneMock.mockReset().mockReturnValue(null);
   cwFindByIdMock.mockReset().mockReturnValue({});
   custFindByIdMock.mockReset().mockReturnValue({ legalName: "Acme Pvt Ltd" });
+  autoCaptureMock.mockReset().mockResolvedValue(undefined);
 });
 
 /* ── ensureTravellerWriteAccess — the RBAC matrix, tested directly ───── */
@@ -701,5 +707,53 @@ describe("GET /export/download", () => {
 
     expect(res.status).toBe(200);
     expect(res.text).toContain("M1234567");
+  });
+});
+
+/* ── POST /auto-capture — passenger-step submit, no RBAC beyond auth ──── */
+
+describe("POST /auto-capture", () => {
+  it("any authenticated member (no manage-travellers role needed) gets 200 accepted:true", async () => {
+    const app = makeApp({ sub: "u1", email: "requester@acme.com", roles: ["REQUESTER"] });
+    const res = await request(app).post("/auto-capture").send({ passengers: [{ FirstName: "Amit", LastName: "Verma" }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ accepted: true });
+  });
+
+  it("forwards workspaceId/customerId/createdBy/passengers from req context, not the request body", async () => {
+    const app = makeApp({ sub: "u1", email: "requester@acme.com", roles: ["REQUESTER"] });
+    await request(app).post("/auto-capture").send({
+      passengers: [{ FirstName: "Amit", LastName: "Verma", SaveToTravellers: true }],
+      workspaceId: "someone-elses-workspace", // must be ignored — ownership never trusted from the body
+    });
+
+    expect(autoCaptureMock).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: WORKSPACE_ID,
+      createdBy: "u1",
+      passengers: [{ FirstName: "Amit", LastName: "Verma", SaveToTravellers: true }],
+    }));
+  });
+
+  it("responds immediately without awaiting autoCaptureTravellersFromBooking (fire-and-forget)", async () => {
+    let resolveCapture: () => void = () => {};
+    autoCaptureMock.mockReturnValue(new Promise<void>(resolve => { resolveCapture = resolve; }));
+
+    const app = makeApp({ sub: "u1", email: "requester@acme.com", roles: ["REQUESTER"] });
+    const res = await request(app).post("/auto-capture").send({ passengers: [{ FirstName: "Amit", LastName: "Verma" }] });
+
+    // The route already responded even though the capture promise above is
+    // still unresolved — proves the request doesn't wait on it.
+    expect(res.status).toBe(200);
+    resolveCapture();
+  });
+
+  it("a rejected capture promise never surfaces as a 500 — response already sent", async () => {
+    autoCaptureMock.mockRejectedValue(new Error("boom"));
+    const app = makeApp({ sub: "u1", email: "requester@acme.com", roles: ["REQUESTER"] });
+    const res = await request(app).post("/auto-capture").send({ passengers: [{ FirstName: "Amit", LastName: "Verma" }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ accepted: true });
   });
 });

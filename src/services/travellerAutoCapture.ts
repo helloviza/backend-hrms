@@ -1,9 +1,14 @@
 // apps/backend/src/services/travellerAutoCapture.ts
 //
-// Phase 4 of Traveller Profiles — flights only. Called after a flight
-// ticket has actually been issued (never on hold/book, never on a failed
-// or abandoned attempt — see call sites in routes/sbt.flights.ts). Runs
-// each booked passenger through the SAME dedup rule bulk import uses
+// Phase 4 of Traveller Profiles — flights only. Called from
+// POST /workspace/travellers/auto-capture at passenger-step submit (see
+// routes/workspace.travellers.ts), NOT after ticketing — a completed ticket
+// is no longer required. The checkbox that gates this promises "save for
+// next time," not "save if this booking completes," and the SBT session's
+// ~13min TTL makes losing entered data (not a stray profile) the worse
+// failure mode. Accepted trade-off: a passenger from an abandoned booking
+// can persist — it's editable/deletable in Travellers. Runs each submitted
+// passenger through the SAME dedup rule bulk import uses
 // (utils/travellerMatch.ts) — no second implementation of "does this match
 // an existing profile":
 //   - Tier 1 (email) or Tier 2 (name + DOB, past the conflict guard) →
@@ -24,11 +29,10 @@
 // match a stored profile exactly: same outcome, no write, no special case
 // needed for "was it selected."
 //
-// Never lets a capture failure affect the booking: this is only ever
-// called after the ticket response has already been sent to the client
-// (see the res.json wrapper pattern at each sbt.flights.ts call site), and
-// every passenger is captured inside its own try/catch so one bad row
-// can't stop the rest.
+// Never lets a capture failure affect passenger-step navigation: the route
+// handler fires this without awaiting it (see workspace.travellers.ts), and
+// every passenger is captured inside its own try/catch so one bad row can't
+// stop the rest.
 import TravellerProfile from "../models/TravellerProfile.js";
 import { findMatchingTraveller, applyTravellerFields, type TravellerFieldCandidate } from "../utils/travellerMatch.js";
 import { mintTravellerProfileId } from "../utils/travelerId.js";
@@ -47,14 +51,20 @@ export interface BookingPassengerForCapture {
   PassportIssueDate?: string;
   ContactNo?: string;
   Email?: string;
-  // Per-passenger consent, set by SBTPassengers.tsx's checkbox (hidden once
-  // linked to a saved traveller — that sync stays unconditional). Only ever
-  // explicitly false for a fresh, unchecked passenger; absent/true covers
-  // both a checked fresh passenger and every linked one, so a single flag
-  // correctly gates create-vs-skip without needing to know "was this
-  // passenger linked" here. Explicit `=== false` (not falsy) so an absent
-  // field from an old cached frontend bundle still captures — the
-  // pre-checkbox behavior — rather than silently going quiet.
+  // Explicit opt-IN, set by SBTPassengers.tsx's checkbox — default OFF, the
+  // user must actively tick it. Explicit `!== true` (not falsy-check-the-
+  // other-way) so an absent field — an old cached frontend bundle that
+  // predates the checkbox, or any other caller that doesn't send it — fails
+  // CLOSED: no capture, rather than assuming consent that was never given.
+  // This is the inverse of the field's original design (used to default
+  // capture ON, skip only on explicit false) — flipped because capture no
+  // longer requires a completed ticket as evidence the person really
+  // travelled; without that evidence, defaulting on would leave a profile
+  // behind for every abandoned booking. Linked passengers (selected via the
+  // typeahead) are exempt from this gate entirely — SBTPassengers.tsx sets
+  // this true automatically when linking, since that sync is a different,
+  // still-unconditional feature (see the linked-edit note in
+  // SBTPassengers.tsx), not the one this flag is opting into.
   SaveToTravellers?: boolean;
 }
 
@@ -98,11 +108,11 @@ export async function autoCaptureTravellersFromBooking(params: {
 
   for (const raw of passengers) {
     try {
-      // Explicit opt-out — checked once, before any lookup, so an unchecked
-      // passenger is never matched against (and never silently updates) an
-      // existing profile either. Only ever false for a fresh, unlinked
-      // passenger — see BookingPassengerForCapture.SaveToTravellers.
-      if (raw.SaveToTravellers === false) continue;
+      // Explicit opt-in — checked once, before any lookup, so a passenger
+      // who never ticked the box is never matched against (and never
+      // silently updates) an existing profile either. See
+      // BookingPassengerForCapture.SaveToTravellers.
+      if (raw.SaveToTravellers !== true) continue;
 
       const candidate = toCandidate(raw);
       if (!candidate._firstName || !candidate._lastName) continue; // shouldn't happen — form requires these

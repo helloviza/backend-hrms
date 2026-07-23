@@ -27,6 +27,7 @@ import { mintTravellerProfileId } from "../utils/travelerId.js";
 import { maskTailId } from "../utils/piiMask.js";
 import { normalizeEmail, normalizeName, findMatchingTraveller, applyTravellerFields } from "../utils/travellerMatch.js";
 import { parseCsv } from "../utils/csv.js";
+import { autoCaptureTravellersFromBooking } from "../services/travellerAutoCapture.js";
 
 const router = Router();
 router.use(requireAuth, requireWorkspace);
@@ -461,6 +462,40 @@ router.post("/:id/claim", async (req: any, res: any) => {
     console.error("[workspace.travellers CLAIM]", err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+/* ── POST /auto-capture — passenger-step submit, not post-ticket ──────
+ *
+ * Fired by SBTPassengers.tsx when the user clicks Continue (Passengers ->
+ * Seats), NOT after ticketing — the checkbox says "save for next time," not
+ * "save if this booking completes," and the SBT session's ~13min TTL makes
+ * re-entering lost passport details a worse failure mode than an occasional
+ * stray profile from an abandoned booking (editable/deletable in
+ * Travellers). Replaces the five post-ticket hooks that used to live in
+ * sbt.flights.ts — this is the only capture entry point now.
+ *
+ * Same "system side effect, not a manage-travellers action" RBAC posture as
+ * before: no requireRoles beyond the router-wide requireAuth/requireWorkspace
+ * — any authenticated member can trigger capture for passengers on their own
+ * in-progress booking.
+ *
+ * Fire-and-forget, same principle as the post-ticket hooks it replaces:
+ * autoCaptureTravellersFromBooking is NOT awaited, so the write can never
+ * delay the client's navigation to Seats. The frontend doesn't await this
+ * endpoint's response either — see SBTPassengers.tsx.
+ */
+router.post("/auto-capture", (req: any, res: any) => {
+  try {
+    autoCaptureTravellersFromBooking({
+      workspaceId: req.workspaceObjectId,
+      customerId: req.workspace?.customerId,
+      createdBy: actorUserId(req),
+      passengers: req.body?.passengers,
+    }).catch((err: any) => console.error("[auto-capture]", err?.message));
+  } catch (err: any) {
+    console.error("[auto-capture] failed synchronously", err?.message);
+  }
+  res.json({ accepted: true });
 });
 
 /* ── Bulk import — template / preview / commit / export ───────────────

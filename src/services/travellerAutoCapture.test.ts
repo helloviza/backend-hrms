@@ -57,6 +57,10 @@ function fakeDoc(initial: Record<string, any>) {
   return doc;
 }
 
+// SaveToTravellers defaults true in this fixture so the tests below that
+// aren't about the opt-in gate itself (dedup, gender conversion, whitespace,
+// failure isolation) keep exercising the capture path unchanged — only the
+// dedicated "SaveToTravellers opt-in" tests below override it.
 function passenger(over: Partial<BookingPassengerForCapture> = {}): BookingPassengerForCapture {
   return {
     Title: "Mr", FirstName: "Priya", LastName: "Sharma",
@@ -64,6 +68,7 @@ function passenger(over: Partial<BookingPassengerForCapture> = {}): BookingPasse
     PassportNo: "M1234567", PassportExpiry: "2030-01-01T00:00:00",
     PassportIssueCountryCode: "IN", PassportIssueDate: "2020-01-01T00:00:00",
     ContactNo: "9999999999", Email: "priya@acme.com",
+    SaveToTravellers: true,
     ...over,
   };
 }
@@ -167,7 +172,15 @@ describe("autoCaptureTravellersFromBooking", () => {
     expect(tpCreateMock).not.toHaveBeenCalled();
   });
 
-  /* ── SaveToTravellers opt-out ─────────────────────────────────────── */
+  /* ── SaveToTravellers opt-in (flipped from opt-out — default OFF now) ── */
+
+  it("SaveToTravellers: true captures normally (explicit opt-in)", async () => {
+    await autoCaptureTravellersFromBooking({
+      workspaceId: WS, customerId: CUSTOMER, createdBy: UID,
+      passengers: [passenger({ SaveToTravellers: true })],
+    });
+    expect(tpCreateMock).toHaveBeenCalledTimes(1);
+  });
 
   it("SaveToTravellers: false skips creation entirely — no match lookup, no create", async () => {
     await autoCaptureTravellersFromBooking({
@@ -191,29 +204,22 @@ describe("autoCaptureTravellersFromBooking", () => {
     expect(doc.save).not.toHaveBeenCalled();
   });
 
-  it("SaveToTravellers: true captures normally (explicit opt-in, same as default)", async () => {
-    await autoCaptureTravellersFromBooking({
-      workspaceId: WS, customerId: CUSTOMER, createdBy: UID,
-      passengers: [passenger({ SaveToTravellers: true })],
-    });
-    expect(tpCreateMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("missing SaveToTravellers (old cached frontend bundle) still captures — fails open, not silently closed", async () => {
+  it("missing SaveToTravellers (old cached frontend bundle, or any caller that omits it) fails CLOSED — no capture", async () => {
     const p = passenger();
     delete (p as any).SaveToTravellers;
     await autoCaptureTravellersFromBooking({
       workspaceId: WS, customerId: CUSTOMER, createdBy: UID, passengers: [p],
     });
-    expect(tpCreateMock).toHaveBeenCalledTimes(1);
+    expect(findMatchingTravellerMock).not.toHaveBeenCalled();
+    expect(tpCreateMock).not.toHaveBeenCalled();
   });
 
-  it("opt-out on one passenger does not affect capture of the others in the same booking", async () => {
+  it("a non-opted-in passenger does not affect capture of an opted-in sibling in the same booking", async () => {
     await autoCaptureTravellersFromBooking({
       workspaceId: WS, customerId: CUSTOMER, createdBy: UID,
       passengers: [
         passenger({ SaveToTravellers: false, Email: "skip@acme.com" }),
-        passenger({ FirstName: "Amit", LastName: "Verma", Email: "amit@acme.com" }),
+        passenger({ SaveToTravellers: true, FirstName: "Amit", LastName: "Verma", Email: "amit@acme.com" }),
       ],
     });
     expect(tpCreateMock).toHaveBeenCalledTimes(1);

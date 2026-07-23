@@ -16,7 +16,6 @@ import SBTConfig from "../models/SBTConfig.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
-import { autoCaptureTravellersFromBooking } from "../services/travellerAutoCapture.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { sendMail } from "../utils/mailer.js";
@@ -1008,26 +1007,6 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
   }
 });
 
-// Traveller Profiles auto-capture — fires ONLY after a ticket has actually
-// been issued for the given passenger set (never on hold/book, never on a
-// failed/abandoned attempt — see each call site below, all gated on the
-// same ResponseStatus===1 check already used for GetBookingDetails).
-// Deliberately NOT awaited and independently try/caught: this must never
-// affect the ticket response in any way, including latency. See
-// services/travellerAutoCapture.ts for the dedup/update rule itself.
-function captureTravellersAfterTicket(req: any, passengers: any[] | undefined) {
-  try {
-    autoCaptureTravellersFromBooking({
-      workspaceId: req.workspaceObjectId,
-      customerId: req.workspace?.customerId,
-      createdBy: String(req.user?._id || req.user?.id || req.user?.sub || ""),
-      passengers,
-    }).catch((err: any) => sbtLogger.warn("[auto-capture] failed", { error: err?.message }));
-  } catch (err: any) {
-    sbtLogger.warn("[auto-capture] failed synchronously", { error: err?.message });
-  }
-}
-
 // POST /api/sbt/flights/ticket
 router.post("/ticket", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
@@ -1047,7 +1026,6 @@ router.post("/ticket", requireAuth, requireSBT, async (req: any, res: any) => {
     const bookingId = result?.Response?.Response?.BookingId
       ?? result?.Response?.Response?.FlightItinerary?.BookingId;
     if (ticketStatus === 1 && bookingId) {
-      captureTravellersAfterTicket(req, req.body?.Passengers);
       const pnr = result?.Response?.Response?.PNR
         ?? result?.Response?.Response?.FlightItinerary?.PNR ?? "";
       const gdsCaseLabel = req.body?.caseLabel || "Case1_GDS_OneWay";
@@ -1287,7 +1265,6 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
         ?? result?.Response?.Response?.FlightItinerary?.PNR ?? "";
 
       if (ticketStatus === 1 && bookingId) {
-        captureTravellersAfterTicket(req, obPassengers);
         let bookingDetails = null;
         try {
           const start = Date.now();
@@ -1373,7 +1350,6 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
         return res.json(obResult);
       }
       sbtLogger.info('[TICKET-LCC] OB leg success');
-      captureTravellersAfterTicket(req, obPassengers);
 
       // 2. Ticket IB leg
       const ibTraceId = returnTraceId || req.body.TraceId;
@@ -1484,10 +1460,6 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
       }
 
       const ibStatus = ibResult?.Response?.ResponseStatus;
-      if (ibStatus === 1 && ibBookingId) {
-        captureTravellersAfterTicket(req, ibPassengers);
-      }
-
       sbtLogger.info('[TICKET-LCC] IB leg result', {
         ibStatus, isReturnGDS: !!isReturnGDS,
       });
@@ -1606,7 +1578,6 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
     const bookingId = result?.Response?.Response?.BookingId
       ?? result?.Response?.Response?.FlightItinerary?.BookingId;
     if (ticketStatus === 1 && bookingId) {
-      captureTravellersAfterTicket(req, obPassengers);
       const pnr = result?.Response?.Response?.PNR
         ?? result?.Response?.Response?.FlightItinerary?.PNR ?? "";
       let bookingDetails = null;
