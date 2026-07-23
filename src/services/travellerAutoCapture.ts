@@ -1,8 +1,9 @@
 // apps/backend/src/services/travellerAutoCapture.ts
 //
-// Phase 4 of Traveller Profiles — flights only. Called from
-// POST /workspace/travellers/auto-capture at passenger-step submit (see
-// routes/workspace.travellers.ts), NOT after ticketing — a completed ticket
+// Phase 4 of Traveller Profiles. Called from
+// POST /workspace/travellers/auto-capture at passenger/guest-step submit (see
+// routes/workspace.travellers.ts) for both flights (SBTPassengers.tsx) and
+// hotels (SBTHotelGuests.tsx), NOT after ticketing/booking — a completed trip
 // is no longer required. The checkbox that gates this promises "save for
 // next time," not "save if this booking completes," and the SBT session's
 // ~13min TTL makes losing entered data (not a stray profile) the worse
@@ -41,6 +42,7 @@ import { sbtLogger } from "../utils/logger.js";
 export interface BookingPassengerForCapture {
   Title?: string;
   FirstName?: string;
+  MiddleName?: string;
   LastName?: string;
   DateOfBirth?: string; // TBO ISO, e.g. "1990-01-01T00:00:00"
   Gender?: number; // 1 male, 2 female (SBTPassengers.tsx / SBTReview.tsx convention)
@@ -84,6 +86,7 @@ function toCandidate(p: BookingPassengerForCapture): TravellerFieldCandidate & {
     _lastName: String(p.LastName || "").trim(),
     title: p.Title,
     firstName: p.FirstName,
+    middleName: p.MiddleName,
     lastName: p.LastName,
     gender: p.Gender === 2 ? "Female" : p.Gender === 1 ? "Male" : undefined,
     dob: tboDateOnly(p.DateOfBirth),
@@ -144,6 +147,7 @@ export async function autoCaptureTravellersFromBooking(params: {
         travelerId,
         title: candidate.title || undefined,
         firstName: candidate._firstName,
+        middleName: candidate.middleName || undefined,
         lastName: candidate._lastName,
         gender: candidate.gender || undefined,
         dob: candidate.dob || undefined,
