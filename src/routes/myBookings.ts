@@ -22,10 +22,13 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import TravelBooking from "../models/TravelBooking.js";
 import ManualBooking from "../models/ManualBooking.js";
+import Customer from "../models/Customer.js";
+import CustomerMember from "../models/CustomerMember.js";
 import { canCustomerAccessBookingAttachments } from "../utils/bookingCustomerAccess.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
+import { formatLineItems, invoicePendingDays } from "./manualBookings.js";
 
 const router = Router();
 
@@ -364,37 +367,107 @@ async function loadManualBookingsForCustomer(
 
   const docs: any[] = await ManualBooking.find(filter)
     .select(
-      "workspaceId bookingDate reqDate givenBy sector type travelDate returnDate " +
+      "workspaceId bookingDate bookingRef reqDate sector type travelDate returnDate " +
+        "status subStatus priceBenefits invoiceRaisedDate bookingWeek bookingMonth supplierPNR " +
         "pricing.grandTotal pricing.totalWithGST pricing.quotedPrice " +
         "passengers.name passengers.email " +
-        "itinerary.origin itinerary.destination itinerary.hotelName invoiceId",
+        "itinerary.origin itinerary.destination itinerary.hotelName itinerary.flightNo itinerary.airline " +
+        "itinerary.trainClass itinerary.roomType itinerary.nights itinerary.roomCount itinerary.description " +
+        "itinerary.pickupLocation itinerary.dropLocation itinerary.vehicleType itinerary.visaCountry itinerary.visaType " +
+        "lineItems invoiceId",
     )
-    .populate("invoiceId", "invoiceNo invoiceDate")
+    .populate("invoiceId", "invoiceNo invoiceDate status")
     .sort({ bookingDate: -1 })
     .limit(Math.min(2000, Math.max(1, opts.limit ?? 2000)))
     .lean();
 
   // Re-run the access predicate per record — the tenant clause in `filter`
   // above is a coarse pre-filter, not the authority (see doc comment above).
-  return docs.filter((b) => canCustomerAccessBookingAttachments(ctx, b));
+  const filtered = docs.filter((b) => canCustomerAccessBookingAttachments(ctx, b));
+
+  // Business Name — same value for every row (the caller's own tenant), no
+  // cross-tenant lookup: Customer.findById(customerId), the id this whole
+  // query is already scoped to. Column is redundant on a customer's own
+  // export but harmless — kept for parity with the reference/admin layout.
+  const customer = await Customer.findById(customerId).select("legalName companyName name").lean().catch(() => null);
+  const wsName = (customer as any)?.legalName || (customer as any)?.companyName || (customer as any)?.name || "";
+
+  // Traveler ID — same "customerId:email" lookup the admin export uses
+  // (manualBookings.ts bookingToRow's tidMap), narrowed to this one tenant.
+  const emails = [
+    ...new Set(
+      filtered
+        .map((b) => String(b.passengers?.[0]?.email || "").toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
+  const tidMap: Record<string, string> = {};
+  if (emails.length > 0) {
+    const members = await CustomerMember.find({ customerId, email: { $in: emails } })
+      .select("email travelerId")
+      .lean();
+    members.forEach((m: any) => {
+      tidMap[String(m.email).toLowerCase()] = String(m.travelerId || "");
+    });
+  }
+
+  return filtered.map((b) => ({
+    ...b,
+    _wsName: wsName,
+    _travelerId: tidMap[String(b.passengers?.[0]?.email || "").toLowerCase()] || "",
+  }));
 }
 
 const CUSTOMER_BOOKING_COLUMNS = [
+  // Original 11 (Given By removed 2026-07-24 — see decision note below) —
+  // positions stable for anyone's saved template.
   "S. No",
   "Booking Date",
   "Invoice Date",
   "Invoice Number",
   "Req Date",
   "Pax Name",
-  "Given By",
   "Type",
   "Sector",
   "Travel Date",
   "Arrival Date",
   "Grand Total",
+  // Appended (infra/audit/manual-bookings-export-fields-audit.md +
+  // 2026-07-24 customer-export scoping decision) — Booked By excluded
+  // (internal staff identity), Given By removed (same date — free-text field
+  // found to carry internal staff names on a non-trivial share of rows, not
+  // reliably the customer's own requester); everything else here is
+  // customer-safe, sourced from the same fields the 46-col admin export uses
+  // minus Partner/Quoted/Actual/Diff/GST/Base Price/Request Process TAT.
+  "Ref No.",
+  "Business Name",
+  "Traveler ID",
+  "Status",
+  "Sub Status",
+  "Price Benefits",
+  "Invoice Raised Date",
+  "Invoice Status",
+  "Invoice Pending Days",
+  "Booking Week",
+  "Booking Month",
+  "Flight / Train No",
+  "Airline",
+  "Train Class",
+  "Hotel Name",
+  "Room Type",
+  "Nights",
+  "Rooms",
+  "Service Description",
+  "Supplier PNR / Booking ID",
+  "Line Items",
+  "Pickup Location",
+  "Drop Location",
+  "Vehicle Type",
+  "Visa Country",
+  "Visa Type",
 ];
 
-/** The 12 customer-safe fields, keyed — shared by the JSON list and the export row builder. */
+/** The 37 customer-safe fields, keyed — shared by the JSON list and the export row builder. */
 function customerBookingFields(b: any) {
   const paxName = (b.passengers || [])
     .map((p: any) => String(p?.name ?? "").trim())
@@ -412,7 +485,6 @@ function customerBookingFields(b: any) {
     invoiceNumber: b.invoiceId?.invoiceNo ?? "",
     reqDate: fmtDateDMY(b.reqDate),
     paxName,
-    givenBy: b.givenBy ?? "",
     type: b.type ?? "",
     sector,
     travelDate: fmtDateDMY(b.travelDate),
@@ -420,6 +492,32 @@ function customerBookingFields(b: any) {
     // Customer-facing sell price only — same fallback chain the mirror sync
     // itself uses (ManualBooking.ts:528-529) — never cost/margin.
     grandTotal: b.pricing?.grandTotal ?? b.pricing?.totalWithGST ?? b.pricing?.quotedPrice ?? 0,
+    refNo: b.bookingRef ?? "",
+    businessName: b._wsName ?? "",
+    travelerId: b._travelerId ?? "",
+    status: b.status ?? "",
+    subStatus: b.subStatus ?? "",
+    priceBenefits: b.priceBenefits ?? "",
+    invoiceRaisedDate: fmtDateDMY(b.invoiceRaisedDate),
+    invoiceStatus: b.invoiceId?.status ?? "",
+    invoicePendingDays: invoicePendingDays(b),
+    bookingWeek: b.bookingWeek ? `Week ${b.bookingWeek}` : "",
+    bookingMonth: b.bookingMonth ?? "",
+    flightTrainNo: b.itinerary?.flightNo ?? "",
+    airline: b.itinerary?.airline ?? "",
+    trainClass: b.itinerary?.trainClass ?? "",
+    hotelName: b.itinerary?.hotelName ?? "",
+    roomType: b.itinerary?.roomType ?? "",
+    nights: b.itinerary?.nights ?? "",
+    rooms: b.itinerary?.roomCount ?? "",
+    serviceDescription: b.itinerary?.description ?? "",
+    supplierPNR: b.supplierPNR ?? "",
+    lineItems: formatLineItems(b),
+    pickupLocation: b.itinerary?.pickupLocation ?? "",
+    dropLocation: b.itinerary?.dropLocation ?? "",
+    vehicleType: b.itinerary?.vehicleType ?? "",
+    visaCountry: b.itinerary?.visaCountry ?? "",
+    visaType: b.itinerary?.visaType ?? "",
   };
 }
 
@@ -432,16 +530,41 @@ function customerBookingRow(b: any, srNo: number): (string | number)[] {
     f.invoiceNumber,
     f.reqDate,
     f.paxName,
-    f.givenBy,
     f.type,
     f.sector,
     f.travelDate,
     f.arrivalDate,
     f.grandTotal,
+    f.refNo,
+    f.businessName,
+    f.travelerId,
+    f.status,
+    f.subStatus,
+    f.priceBenefits,
+    f.invoiceRaisedDate,
+    f.invoiceStatus,
+    f.invoicePendingDays,
+    f.bookingWeek,
+    f.bookingMonth,
+    f.flightTrainNo,
+    f.airline,
+    f.trainClass,
+    f.hotelName,
+    f.roomType,
+    f.nights,
+    f.rooms,
+    f.serviceDescription,
+    f.supplierPNR,
+    f.lineItems,
+    f.pickupLocation,
+    f.dropLocation,
+    f.vehicleType,
+    f.visaCountry,
+    f.visaType,
   ];
 }
 
-// GET /api/my-bookings/manual — the 12-column table, JSON.
+// GET /api/my-bookings/manual — the 37-column table, JSON.
 router.get("/manual", async (req: Request, res: Response) => {
   try {
     const docs = await loadManualBookingsForCustomer(req, {
@@ -460,7 +583,7 @@ router.get("/manual", async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/my-bookings/manual/export?format=xlsx|csv — same 12 columns, full history (no limit).
+// GET /api/my-bookings/manual/export?format=xlsx|csv — same 37 columns, full history (no limit).
 router.get("/manual/export", async (req: Request, res: Response) => {
   try {
     const docs = await loadManualBookingsForCustomer(req, {
@@ -486,9 +609,14 @@ router.get("/manual/export", async (req: Request, res: Response) => {
     headerRow.font = { bold: true };
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
 
-    const colWidths = [7, 14, 14, 18, 12, 28, 18, 14, 22, 14, 14, 16];
+    const colWidths = [
+      7, 14, 14, 18, 12, 28, 14, 22, 14, 14, 16, // original 11 (Given By removed)
+      16, 22, 14, 14, 28, 28, 16, 14, 18, 12, 22, // Ref No...Booking Month
+      16, 16, 12, 22, 14, 8, 8, 30, 22, 40, 20, 20, 16, 16, 16, // detail block
+    ];
     colWidths.forEach((width, i) => { sheet.getColumn(i + 1).width = width; });
-    sheet.getColumn(12).numFmt = "#,##0.00";
+    sheet.getColumn(11).numFmt = "#,##0.00"; // Grand Total
+    sheet.getColumn(20).numFmt = "0"; // Invoice Pending Days
 
     docs.forEach((b, idx) => sheet.addRow(customerBookingRow(b, idx + 1)));
 

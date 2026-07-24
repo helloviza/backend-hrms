@@ -126,7 +126,7 @@ async function applyInvoiceFilter(filter: Record<string, any>, invoiceNo: string
   }
 }
 
-function invoicePendingDays(b: any): number {
+export function invoicePendingDays(b: any): number {
   if (!b.invoiceRaisedDate) return 0;
   if (b.status === "PAID" || b.status === "CANCELLED") return 0;
   return Math.floor(
@@ -301,7 +301,7 @@ function maskPassengerPII(passengers: any[] | undefined): any[] | undefined {
 }
 
 // One flat cell per booking — see the "Line Items" column comment above.
-function formatLineItems(b: any): string {
+export function formatLineItems(b: any): string {
   const items: any[] = Array.isArray(b.lineItems) ? b.lineItems : [];
   if (!items.length) return "";
   return items
