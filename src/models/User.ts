@@ -46,6 +46,15 @@ const UserSchema = new Schema(
 
     personalEmail: { type: String, trim: true },
 
+    /**
+     * Per-user UI theme preference (currently: the /dashboard/travel-spend
+     * palette picker). "default" = the app's standard ws-* look. Any other
+     * value is a page-defined preset key — this field is intentionally a
+     * free string, not an enum, so individual pages can add presets without
+     * a schema migration.
+     */
+    uiThemePreset: { type: String, trim: true, default: "default" },
+
     phone: { type: String, trim: true },
     personalContact: { type: String, trim: true }, // personal mobile
 
