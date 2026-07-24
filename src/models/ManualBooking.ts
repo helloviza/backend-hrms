@@ -546,6 +546,10 @@ export async function syncManualBookingToMirror(doc: any): Promise<void> {
     // Bookings tab — distinct from userId (the staff booker).
     travellerName: formatTravellerName(doc.passengers),
     travellerEmail: lead?.email || "",
+    // Soft-delete/restore parity with the source — see TravelBooking.ts's
+    // isActive field. Fires both ways since delete/restore both call
+    // booking.save(), which triggers this sync via the post("save") hook.
+    isActive: doc.isActive !== false,
     bookedAt: doc.bookingDate || doc.createdAt,
     travelDate: doc.travelDate ? new Date(doc.travelDate) : null,
     travelDateEnd: doc.returnDate ? new Date(doc.returnDate) : null,

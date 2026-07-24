@@ -1,8 +1,10 @@
 // apps/backend/src/routes/admin.unified.billing.ts
 import { Router } from "express";
-import type { Request, Response } from "express";
+import type { Request, Response, NextFunction } from "express";
 import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import TravelBooking from "../models/TravelBooking.js";
 import User from "../models/User.js";
 import Employee from "../models/Employee.js";
@@ -10,6 +12,32 @@ import CustomerMember from "../models/CustomerMember.js";
 
 const router = Router();
 router.use(requireAuth);
+
+/**
+ * Local defense-in-depth: this router serves company-wide, cross-workspace
+ * (GLOBAL-scope) cost-free travel-spend data. Its only protection against
+ * SAAS_HRMS-tenant access was blockTravelForSaas's prefix-string list in
+ * server.ts — correct today, but a single external list this router has no
+ * visibility into. This re-checks the same tenantType rule locally so the
+ * protection doesn't depend solely on that list staying in sync.
+ *
+ * Reuses req.workspace — already resolved by requireWorkspace, mounted ahead
+ * of this router (server.ts). Only falls back to resolving it again if that's
+ * somehow absent (e.g. this router mounted elsewhere without requireWorkspace
+ * ahead of it), so the normal request path never resolves the workspace twice.
+ */
+router.use(async (req: Request, res: Response, next: NextFunction) => {
+  if (isSuperAdmin(req)) return next();
+  const workspace = (req as any).workspace || (await resolveWorkspaceForUser((req as any).user));
+  if (workspace?.tenantType === "SAAS_HRMS") {
+    res.status(403).json({
+      error: "TRAVEL_MODULE_BLOCKED",
+      message: "This module is not available on SaaS HRMS plans.",
+    });
+    return;
+  }
+  next();
+});
 
 /* ─────────────────────────────────────────────────────────────
  * Helpers
@@ -121,6 +149,13 @@ function buildScopedMatch(req: any): any {
 
   // Demo Platform — exclude demo bookings from production travel-spend views.
   match.isDemo = { $ne: true };
+
+  // A soft-deleted source ManualBooking must not keep counting here, in any
+  // status bucket (CONFIRMED, CANCELLED, or PENDING) — applied once here so
+  // every endpoint built on this match (summary, spend-trend, top-destinations,
+  // top-travellers, spend-by-department, bookings, export, heatmap, quarterly)
+  // gets it uniformly, including the heatmap's all-statuses "activity" view.
+  match.isActive = { $ne: false };
 
   return match;
 }
@@ -352,7 +387,29 @@ router.get("/summary", async (req: Request, res: Response) => {
           ],
           uniqueTravellers: [
             { $match: { status: "CONFIRMED" } },
-            { $group: { _id: "$userId" } },
+            // Same passenger-identity key as /top-travellers: manual mirror
+            // rows set userId to the staff booker and carry the real
+            // passenger only in travellerName, so dedup on that when present;
+            // SBT rows leave travellerName unset and dedup on userId.
+            {
+              $addFields: {
+                _hasName: {
+                  $gt: [{ $strLenCP: { $ifNull: ["$travellerName", ""] } }, 0],
+                },
+              },
+            },
+            {
+              $addFields: {
+                _travKey: {
+                  $cond: [
+                    "$_hasName",
+                    { $concat: ["name:", { $toLower: "$travellerName" }] },
+                    { $concat: ["uid:", { $toString: "$userId" }] },
+                  ],
+                },
+              },
+            },
+            { $group: { _id: "$_travKey" } },
             { $count: "count" },
           ],
           byService: [
