@@ -1764,8 +1764,53 @@ router.patch("/workspace/access-mode", requireAuth, async (req: any, res) => {
 });
 
 /**
+ * GET /api/customer/users/template/download
+ *
+ * UserCreation.tsx's "CSV Template" / "Excel Template" buttons called this
+ * route while it didn't exist (404). Headers below are exactly the keys
+ * mapRawRowsForBulk() reads off an uploaded row, so a template filled in
+ * as-is round-trips through /bulk (which accepts both CSV and XLSX) without
+ * any header guessing.
+ */
+const USER_TEMPLATE_COLUMNS = [
+  "email", "name", "role", "approverEmail", "password", "sendInvite", "setAsDefaultApprover",
+];
+
+function csvEscape(v: any): string {
+  const s = String(v ?? "");
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+router.get("/template/download", requireAuth, async (req: any, res) => {
+  try {
+    const format = req.query.format === "xlsx" ? "xlsx" : "csv";
+
+    if (format === "csv") {
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader("Content-Disposition", 'attachment; filename="customer_users_template.csv"');
+      return res.send(USER_TEMPLATE_COLUMNS.map(csvEscape).join(",") + "\n");
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Users");
+    sheet.columns = USER_TEMPLATE_COLUMNS.map((h) => ({ header: h, width: 22 }));
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF00477F" } };
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", 'attachment; filename="customer_users_template.xlsx"');
+    res.send(buffer);
+  } catch (err: any) {
+    console.error("[customerUsers:template/download]", err.message);
+    res.status(500).json({ error: "Failed to build template", detail: err?.message });
+  }
+});
+
+/**
  * POST /api/customer/users/bulk
- * (CSV-only parsing here; XLSX can be added later)
+ * Accepts CSV or XLSX (same ExcelJS-based sheet reader as the traveller
+ * bulk import in workspace.travellers.ts).
  */
 router.post("/bulk", requireAuth, upload.single("file"), async (req: any, res) => {
   try {
@@ -1793,9 +1838,9 @@ router.post("/bulk", requireAuth, upload.single("file"), async (req: any, res) =
 
     if (!req.file?.buffer) return res.status(400).json({ error: "Missing file" });
 
-    const csv = req.file.buffer.toString("utf8");
-    const rows = parseCsvForTravel(csv);
-    if (!rows.length) return res.status(400).json({ error: "CSV is empty" });
+    const rawRows = await parseUploadedRowsForBulk(req.file);
+    const rows = mapRawRowsForBulk(rawRows);
+    if (!rows.length) return res.status(400).json({ error: "File is empty" });
 
     await ensureDefaultApproverFallback(ws, leaderEmail, actor);
 
@@ -2892,9 +2937,10 @@ async function staffSearchBusinesses(q: string, wsId?: any) {
  * setAsDefaultApprover) that the /workspace/users/bulk handler
  * expects. Keeps the original tolerant header aliases.
  * ======================================================= */
-function parseCsvForTravel(csv: string): Array<Record<string, string>> {
-  const { rows } = parseCsvRaw(csv);
-  return rows.map((row) => ({
+// Raw rows -> the field shape /bulk works with, regardless of whether they
+// came from a CSV or an XLSX sheet (see parseUploadedRowsForBulk below).
+function mapRawRowsForBulk(rawRows: Array<Record<string, any>>): Array<Record<string, string>> {
+  return rawRows.map((row) => ({
     email: row.email || row.Email || row.EMAIL || "",
     name: row.name || row.Name || row.fullName || row.FullName || "",
     role: row.role || row.Role || "",
@@ -2903,4 +2949,44 @@ function parseCsvForTravel(csv: string): Array<Record<string, string>> {
     sendInvite: row.sendInvite || row.SendInvite || "",
     setAsDefaultApprover: row.setAsDefaultApprover || row.SetAsDefaultApprover || "",
   }));
+}
+
+// Same CSV-vs-XLSX sniffing + sheet-to-rows reading as
+// workspace.travellers.ts's parseUploadedRows.
+async function parseUploadedRowsForBulk(file: any): Promise<Record<string, any>[]> {
+  const name = String(file?.originalname || "").toLowerCase();
+  const looksCsv = name.endsWith(".csv") || file?.mimetype === "text/csv";
+  if (looksCsv) {
+    const { rows } = parseCsvRaw(file.buffer.toString("utf8"));
+    return rows;
+  }
+
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(file.buffer);
+  const sheet = workbook.worksheets[0];
+  if (!sheet) return [];
+
+  const headers: string[] = [];
+  sheet.getRow(1).eachCell({ includeEmpty: false }, (cell: any, colNumber: number) => {
+    headers[colNumber - 1] = String(cell.value ?? "").trim();
+  });
+
+  const rows: Record<string, any>[] = [];
+  for (let r = 2; r <= sheet.rowCount; r++) {
+    const row = sheet.getRow(r);
+    if (row.cellCount === 0) continue;
+    const obj: Record<string, any> = {};
+    let hasValue = false;
+    headers.forEach((h, idx) => {
+      if (!h) return;
+      const raw = row.getCell(idx + 1).value;
+      const v = raw === null || raw === undefined
+        ? ""
+        : String((raw as any)?.text ?? (raw as any)?.result ?? raw).trim();
+      if (v) hasValue = true;
+      obj[h] = v;
+    });
+    if (hasValue) rows.push(obj);
+  }
+  return rows;
 }

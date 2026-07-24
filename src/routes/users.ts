@@ -303,13 +303,13 @@ r.post(
       const userId = (req as any).user?.sub;
       if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-      const { name, phone, department, location, avatarKey } = req.body || {};
+      const { name, phone, department, jobLocation, avatarKey } = req.body || {};
 
       const $set: any = {};
       if (name !== undefined) $set.name = name;
       if (phone !== undefined) $set.phone = phone;
       if (department !== undefined) $set.department = department;
-      if (location !== undefined) $set.location = location;
+      if (jobLocation !== undefined) $set.jobLocation = jobLocation;
 
       // Optional: allow avatarKey update via this endpoint too
       if (avatarKey) {
