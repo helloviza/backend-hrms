@@ -213,6 +213,36 @@ export function lookupDestination(raw: unknown): DestinationEntry | null {
 }
 
 /**
+ * Canonicalize a STRUCTURED city field (SBT flight/hotel `destination.city` /
+ * `cityName` — Tiers 1/2, an authoritative source field, not free text): if
+ * the lookup table knows a canonical spelling, use it; otherwise trust the
+ * source value as-is rather than discarding it. Shared by the live SBT
+ * flight mirror-sync and the historical backfill script so both resolve a
+ * given city the same way.
+ */
+export function canonicalCity(name: unknown): string | null {
+  const s = String(name ?? "").trim();
+  if (!s) return null;
+  const hit = lookupDestination(s);
+  if (hit?.city) return hit.city;
+  return s;
+}
+
+/**
+ * First candidate (in order) whose lookup entry carries a known country —
+ * e.g. `countryFor(destination.code, destination.city)` tries the IATA code
+ * first, falls back to the city name. Shared by the live SBT flight
+ * mirror-sync and the historical backfill script.
+ */
+export function countryFor(...candidates: unknown[]): string | null {
+  for (const c of candidates) {
+    const hit = lookupDestination(c);
+    if (hit?.country) return hit.country;
+  }
+  return null;
+}
+
+/**
  * Fuzzy lookup for messy sector strings (Tier-4 only): exact first, then
  * whole-word containment of a known city key (e.g. "jodhpur, rajasthan" →
  * Jodhpur, "tarabai park 416003 kolhapur" → Kolhapur, "patel nagar new
