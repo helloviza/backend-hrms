@@ -92,6 +92,9 @@ export interface UserPermissionDoc extends Document {
     // Vendor universe
     vendorProfile: ModulePermission
 
+    // Vendors module (staff managing vendor onboarding/pipeline/master data)
+    vendorManagement: ModulePermission
+
     // Operations
     supportTickets: ModulePermission
     tasks: ModulePermission
@@ -157,6 +160,9 @@ const modulesSchema = new Schema(
 
     // Vendor universe
     vendorProfile: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+
+    // Vendors module (staff managing vendor onboarding/pipeline/master data)
+    vendorManagement: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
 
     // Operations
     supportTickets: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },

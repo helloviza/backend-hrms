@@ -57,6 +57,7 @@ type ModulesTemplate = {
   travelSpend:       ModulePermission
   // Vendor universe
   vendorProfile:     ModulePermission
+  vendorManagement?: ModulePermission
   // Operations
   supportTickets:    ModulePermission
   tasks:             ModulePermission
