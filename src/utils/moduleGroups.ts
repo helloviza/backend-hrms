@@ -17,6 +17,6 @@ export const MODULE_GROUP_MAP: Record<string, string[]> = {
   access: ['accessConsole'],
   analytics: ['analytics'],
   crm: ['leads', 'crmContacts', 'crmCompanies'],
-  vendor: ['vendorProfile'],
+  vendor: ['vendorProfile', 'vendorManagement'],
   operations: ['supportTickets', 'tasks', 'directCustomers'],
 }
