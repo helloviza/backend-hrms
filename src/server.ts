@@ -497,6 +497,15 @@ app.use("/api/visa", requireAuth, requireWorkspace, requireFeature("visaEnabled"
 import adminVisaRouter from "./routes/admin.visa.js";
 app.use("/api/admin/visa", adminVisaRouter);
 
+// Visa module (Phase 7a) — fee and rule management API. Same mount prefix
+// as adminVisaRouter above (a second router at the same path — Express
+// tries them in registration order), separated into its own file because
+// it's a different concern: the fee/rule master data every quote is built
+// from, not the application queue. Gated purely on visaApplication FULL —
+// see routes/admin.visa.rules.ts's file header.
+import adminVisaRulesRouter from "./routes/admin.visa.rules.js";
+app.use("/api/admin/visa", adminVisaRulesRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";

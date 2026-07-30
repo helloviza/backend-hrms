@@ -87,6 +87,14 @@ export interface VisaRuleDocument extends Document {
 
   // ── lifecycle ─────────────────────────────────────────────────────────
   status: VisaRuleStatus;
+  // The business date these terms (fees, ETA, doc requirements) take
+  // effect — distinct from updatedAt (the technical write timestamp).
+  // Defaults to "now" on create; every PATCH /rules/:id and POST
+  // /rules/bulk in routes/admin.visa.rules.ts REQUIRES the caller to
+  // supply this explicitly, so a pricing edit always carries a deliberate
+  // effective date rather than a silently-stamped one. Never touched by
+  // publish/retire — those are lifecycle transitions, not term changes.
+  effectiveFrom: Date;
   lastReviewedAt?: Date;
   reviewedBy?: mongoose.Types.ObjectId; // ref User
 
@@ -145,6 +153,7 @@ const VisaRuleSchema = new Schema<VisaRuleDocument>(
     priceNote: { type: String, trim: true },
 
     status: { type: String, enum: VISA_RULE_STATUSES, default: "DRAFT", index: true },
+    effectiveFrom: { type: Date, required: true, default: Date.now },
     lastReviewedAt: { type: Date },
     reviewedBy: { type: Schema.Types.ObjectId, ref: "User" },
 
