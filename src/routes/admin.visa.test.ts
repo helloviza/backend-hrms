@@ -34,6 +34,7 @@ const {
   clearActionRequiredMock,
   createVisaDocumentUploadMock,
   presignGetObjectMock,
+  syncVisaApplicationBillingMock,
 } = vi.hoisted(() => {
   function matchValue(val: any, cond: any): boolean {
     if (cond && typeof cond === "object" && !(cond instanceof Date) && cond.constructor?.name !== "ObjectId") {
@@ -137,6 +138,12 @@ const {
     clearActionRequiredMock: vi.fn(),
     createVisaDocumentUploadMock: vi.fn(),
     presignGetObjectMock: vi.fn().mockResolvedValue("https://example.com/presigned-url"),
+    // Phase 8 — this file tests the outcome route's own state-machine/upload
+    // behavior, not the billing sync (that's services/visaBillingSync.test.ts's
+    // job). Stubbed to a resolved no-op so the route's real
+    // syncVisaApplicationBilling call never reaches the real, unmocked
+    // ManualBooking/VisaRequest/TravellerProfile/CustomerWorkspace models.
+    syncVisaApplicationBillingMock: vi.fn().mockResolvedValue({ action: "created", manualBookingId: "stub-booking-id" }),
   };
 });
 
@@ -238,6 +245,10 @@ vi.mock("./visa.js", () => ({
   createVisaDocumentUpload: (...args: any[]) => createVisaDocumentUploadMock(...args),
 }));
 
+vi.mock("../services/visaBillingSync.js", () => ({
+  syncVisaApplicationBilling: (...args: any[]) => syncVisaApplicationBillingMock(...args),
+}));
+
 vi.mock("../middleware/auth.js", () => ({
   requireAuth: (_req: any, _res: any, next: any) => next(),
   default: (_req: any, _res: any, next: any) => next(),
@@ -317,6 +328,8 @@ beforeEach(() => {
   createVisaDocumentUploadMock.mockReset();
   presignGetObjectMock.mockClear();
   presignGetObjectMock.mockResolvedValue("https://example.com/presigned-url");
+  syncVisaApplicationBillingMock.mockClear();
+  syncVisaApplicationBillingMock.mockResolvedValue({ action: "created", manualBookingId: "stub-booking-id" });
   seq = 0;
   setAccess("FULL");
 });

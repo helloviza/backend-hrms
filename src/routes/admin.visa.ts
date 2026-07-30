@@ -43,6 +43,7 @@ import TravellerProfile from "../models/TravellerProfile.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { visaDocumentUploadMw, createVisaDocumentUpload } from "./visa.js";
 import { presignGetObject } from "../utils/s3Presign.js";
+import { syncVisaApplicationBilling } from "../services/visaBillingSync.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 
@@ -711,10 +712,28 @@ router.patch(
 
       await recomputeRequestStatus(application.requestId);
 
+      // Phase 8 billing handoff — best-effort side effect. The outcome
+      // itself is already recorded and saved above; a billing-sync failure
+      // (a transient DB error, an unresolvable workspace) must not fail
+      // this response or leave the outcome half-recorded. Logged either
+      // way (services/visaBillingSync.ts logs its own outcome); surfaced
+      // here too so the immediate caller/UI can see it without grepping logs.
+      let billing: { action: string; manualBookingId: string | null } | { error: string } = { action: "not_attempted", manualBookingId: null };
+      try {
+        billing = await syncVisaApplicationBilling(application, actorId(req));
+      } catch (billingErr: any) {
+        adminVisaLogger.error("visa billing sync failed", {
+          applicationId: String(application._id),
+          error: billingErr?.message,
+        });
+        billing = { error: billingErr?.message || "Billing sync failed" };
+      }
+
       res.json({
         ok: true,
         application: mapAdminApplicationSummary(application.toObject()),
         document: attachedDocument,
+        billing,
       });
     } catch (err: any) {
       console.error("[admin visa application outcome PATCH]", err?.message);
