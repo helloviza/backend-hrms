@@ -130,6 +130,15 @@ vi.mock("../services/visaPassportExtraction.js", () => ({
   PASSPORT_DOC_CODE: "DOC-01",
 }));
 
+// Upload and the extracted-fields confirmation both log a VisaActivityLog
+// row — mocked to a no-op so tests never touch the real (unconnected, in
+// this test environment) VisaActivityLog collection.
+vi.mock("../models/VisaActivityLog.js", () => ({
+  logVisaActivity: vi.fn().mockResolvedValue(undefined),
+  VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES: new Set(),
+  default: { find: () => ({ sort: () => ({ limit: () => ({ lean: () => Promise.resolve([]) }) }) }), countDocuments: async () => 0 },
+}));
+
 import express from "express";
 import request from "supertest";
 import router from "./visa.js";

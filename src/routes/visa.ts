@@ -82,6 +82,11 @@ import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import { runVisaPassportExtraction, PASSPORT_DOC_CODE } from "../services/visaPassportExtraction.js";
 import { resolveMrzDate } from "../utils/mrz.js";
+import VisaActivityLog, {
+  logVisaActivity,
+  VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES,
+  type VisaActivityActorType,
+} from "../models/VisaActivityLog.js";
 
 const visaLogger = logger.child({ module: "visa" });
 
@@ -667,6 +672,26 @@ router.post("/requests", async (req: any, res: any) => {
     // doc comment (models/VisaRequest.ts) for the rollup rule.
     await recomputeRequestStatus(visaRequest._id);
 
+    await logVisaActivity({
+      requestId: visaRequest._id,
+      workspaceId,
+      eventType: "REQUEST_CREATED",
+      actorUserId: raisedByUserId,
+      actorType: "CUSTOMER",
+      detail: { destinationIso2: rule.destinationIso2, purpose: rule.purpose, travellerCount: insertedApplications.length },
+    });
+    for (const app of insertedApplications as any[]) {
+      await logVisaActivity({
+        applicationId: app._id,
+        requestId: visaRequest._id,
+        workspaceId,
+        eventType: "APPLICATION_CREATED",
+        actorUserId: raisedByUserId,
+        actorType: "CUSTOMER",
+        detail: { destinationName: ruleSnapshot.destinationName, purpose: ruleSnapshot.purpose, serviceTier: ruleSnapshot.serviceTier },
+      });
+    }
+
     const finalRequest = await VisaRequest.findById(visaRequest._id).lean();
     const finalApplications = await VisaApplication.find({ requestId: visaRequest._id }).lean();
     const hydrated = await hydrateApplicationsWithTravellers(finalApplications, workspaceId);
@@ -741,7 +766,29 @@ router.get("/requests/:id", async (req: any, res: any) => {
       includeTimelineFields: true,
     });
 
-    res.json({ ok: true, request: visaRequest, applications: hydrated });
+    // Trimmed, customer-safe activity feed — lifecycle and document events
+    // only (VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES); assignment/cost/
+    // billing/extraction rows never reach this surface. Capped rather than
+    // paginated — no route has asked for paging through a single request's
+    // history yet, and a request's lifetime activity is bounded.
+    const activityRows = await VisaActivityLog.find({
+      requestId: visaRequest._id,
+      workspaceId,
+      eventType: { $in: [...VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES] },
+    })
+      .sort({ at: -1 })
+      .limit(200)
+      .lean();
+    const activity = activityRows.map((e: any) => ({
+      id: String(e._id),
+      applicationId: e.applicationId ? String(e.applicationId) : null,
+      eventType: e.eventType,
+      actorType: e.actorType,
+      at: e.at,
+      detail: e.detail || {},
+    }));
+
+    res.json({ ok: true, request: visaRequest, applications: hydrated, activity });
   } catch (err: any) {
     console.error("[visa requests GET detail]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load visa request" });
@@ -808,10 +855,25 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
     // as a FACT; VisaRequest.status itself is never assigned directly —
     // recomputeRequestStatus derives it below, same rule as every other
     // write path in this file.
+    const draftApplications = await VisaApplication.find({ requestId, workspaceId, status: "draft" })
+      .select("_id")
+      .lean();
+
     await VisaApplication.updateMany(
       { requestId, workspaceId, status: "draft" },
       { $set: { status: "submitted", submittedAt: new Date() } },
     );
+
+    for (const app of draftApplications as any[]) {
+      await logVisaActivity({
+        applicationId: app._id,
+        requestId,
+        workspaceId,
+        eventType: "SUBMITTED",
+        actorUserId: actorId(req),
+        actorType: "CUSTOMER",
+      });
+    }
 
     await recomputeRequestStatus(requestId);
 
@@ -880,6 +942,14 @@ router.post("/requests/:id/cancel", async (req: any, res: any) => {
     }
 
     await recomputeRequestStatus(requestId);
+
+    await logVisaActivity({
+      requestId,
+      workspaceId,
+      eventType: "REQUEST_CANCELLED",
+      actorUserId: actorId(req),
+      actorType: "CUSTOMER",
+    });
 
     const finalRequest = await VisaRequest.findById(requestId).lean();
     res.json({ ok: true, request: finalRequest });
@@ -996,11 +1066,13 @@ function mapDocumentSummary(d: any) {
 export async function createVisaDocumentUpload(opts: {
   workspaceId: any;
   applicationId: any;
+  requestId: any;
   docCode: string;
   file: { buffer: Buffer; mimetype: string; originalname: string; size: number };
   uploaderId: any;
+  actorType: VisaActivityActorType;
 }) {
-  const { workspaceId, applicationId, docCode, file, uploaderId } = opts;
+  const { workspaceId, applicationId, requestId, docCode, file, uploaderId, actorType } = opts;
 
   const latest = await VisaDocument.findOne({ applicationId, docCode })
     .sort({ version: -1 })
@@ -1043,6 +1115,16 @@ export async function createVisaDocumentUpload(opts: {
     // reviewStatus/reviewedBy/reviewedAt are never copied forward here,
     // ever (task brief: "close the document-mutation hole").
     reviewStatus: "PENDING",
+  });
+
+  await logVisaActivity({
+    applicationId,
+    requestId,
+    workspaceId,
+    eventType: version === 1 ? "DOCUMENT_UPLOADED" : "DOCUMENT_REPLACED",
+    actorUserId: uploaderId,
+    actorType,
+    detail: { documentId: String(doc._id), docCode, version },
   });
 
   // Fire-and-forget — the upload response must never wait on extraction.
@@ -1113,9 +1195,11 @@ router.post(
       const doc = await createVisaDocumentUpload({
         workspaceId,
         applicationId: application._id,
+        requestId: (application as any).requestId,
         docCode,
         file,
         uploaderId,
+        actorType: "CUSTOMER",
       });
 
       res.status(201).json({ ok: true, document: mapDocumentSummary(doc) });
@@ -1253,6 +1337,16 @@ router.delete("/documents/:documentId", async (req: any, res: any) => {
       { new: true },
     );
     if (!updated) return res.status(404).json({ error: "Document not found" });
+
+    await logVisaActivity({
+      applicationId: application._id,
+      requestId: (application as any).requestId,
+      workspaceId,
+      eventType: "DOCUMENT_DELETED",
+      actorUserId: deletedBy,
+      actorType: "CUSTOMER",
+      detail: { documentId: String(doc._id), docCode: doc.docCode, version: doc.version },
+    });
 
     res.json({ ok: true });
   } catch (err: any) {
@@ -1410,6 +1504,20 @@ router.patch("/documents/:documentId/extracted-fields", async (req: any, res: an
       confirmedBy: confirmedBy ? String(confirmedBy) : null,
       confirmedAt: new Date().toISOString(),
       changed,
+    });
+
+    // detail carries the field KEYS that were confirmed, never the values
+    // themselves (those are passport data — see VisaActivityLog.ts's
+    // no-PII rule) — `changed` above is fine for the structured log line,
+    // but must never reach the activity trail.
+    await logVisaActivity({
+      applicationId: (application as any)._id,
+      requestId: (application as any).requestId,
+      workspaceId,
+      eventType: "FIELDS_CONFIRMED",
+      actorUserId: confirmedBy,
+      actorType: "CUSTOMER",
+      detail: { documentId: String(doc._id), fields: Object.keys(profilePatch) },
     });
 
     res.json({ ok: true, traveller: { id: String(traveller._id), ...profilePatch } });

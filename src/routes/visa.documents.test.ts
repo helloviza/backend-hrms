@@ -220,6 +220,15 @@ vi.mock("../models/TravellerProfile.js", () => ({
   },
 }));
 
+// Upload/replace/delete all log a VisaActivityLog row — mocked to a no-op
+// so tests never touch the real (unconnected, in this test environment)
+// VisaActivityLog collection.
+vi.mock("../models/VisaActivityLog.js", () => ({
+  logVisaActivity: vi.fn().mockResolvedValue(undefined),
+  VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES: new Set(),
+  default: { find: () => chainable(() => []), countDocuments: async () => 0 },
+}));
+
 vi.mock("../models/TravelBooking.js", () => ({
   default: {
     find: (filter: any) => chainable(() => travelBookings.query(filter)),

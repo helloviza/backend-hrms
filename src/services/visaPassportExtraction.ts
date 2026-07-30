@@ -65,6 +65,7 @@ import { getObjectBuffer } from "../utils/s3Upload.js";
 import { parseTD3MrzWithRepair, maskMrzLine, deriveConfidence, type MrzCheckField } from "../utils/mrz.js";
 import { crossCheckPassportFields, crossCheckPassportIdentity } from "../utils/passportCrossCheck.js";
 import logger from "../utils/logger.js";
+import { logVisaActivity } from "../models/VisaActivityLog.js";
 
 const extractionLogger = logger.child({ module: "visa-extraction" });
 
@@ -101,7 +102,12 @@ export type VisaExtractionFailureCategory = "UNREADABLE_DOCUMENT" | "MALFORMED_M
 // (candidate repairs verified by check digits, replacing the old blind
 // line-1 pad).
 
-async function markFailed(documentId: string, category: VisaExtractionFailureCategory, message: string) {
+async function markFailed(
+  documentId: string,
+  category: VisaExtractionFailureCategory,
+  message: string,
+  ctx: { applicationId: any; requestId: any; workspaceId: any },
+) {
   try {
     await VisaDocument.findByIdAndUpdate(documentId, {
       $set: {
@@ -118,6 +124,20 @@ async function markFailed(documentId: string, category: VisaExtractionFailureCat
     extractionLogger.error("failed to persist FAILED extraction status", {
       documentId,
       error: err?.message,
+    });
+  }
+
+  // detail is deliberately just the failure category, never the raw
+  // message — see VisaActivityLog.ts's no-PII rule for `detail`.
+  if (ctx.requestId && ctx.workspaceId) {
+    await logVisaActivity({
+      applicationId: ctx.applicationId,
+      requestId: ctx.requestId,
+      workspaceId: ctx.workspaceId,
+      eventType: "EXTRACTION_FAILED",
+      actorUserId: null,
+      actorType: "SYSTEM",
+      detail: { documentId, failureCategory: category },
     });
   }
 }
@@ -137,8 +157,30 @@ export async function runVisaPassportExtraction(documentId: string): Promise<voi
   // on its own too.
   if (doc.docCode !== PASSPORT_DOC_CODE) return;
 
+  // Fetched once, up front — feeds the activity-log calls below (STARTED/
+  // COMPLETED/FAILED all need requestId) and is reused later for the
+  // identity cross-check, rather than fetched a second time there.
+  const application = await VisaApplication.findById(doc.applicationId)
+    .select("requestId workspaceId travellerProfileId")
+    .lean();
+  const activityCtx = {
+    applicationId: doc.applicationId,
+    requestId: (application as any)?.requestId,
+    workspaceId: (application as any)?.workspaceId,
+  };
+
   doc.extractionStatus = "PROCESSING";
   await doc.save();
+
+  await logVisaActivity({
+    applicationId: activityCtx.applicationId,
+    requestId: activityCtx.requestId,
+    workspaceId: activityCtx.workspaceId,
+    eventType: "EXTRACTION_STARTED",
+    actorUserId: null,
+    actorType: "SYSTEM",
+    detail: { documentId: String(doc._id) },
+  });
 
   try {
     const buffer = await getObjectBuffer(doc.s3Key);
@@ -150,7 +192,7 @@ export async function runVisaPassportExtraction(documentId: string): Promise<voi
         model: mrz.model,
         rawTextPreview: mrz.rawText?.slice(0, 300),
       });
-      await markFailed(String(doc._id), "UNREADABLE_DOCUMENT", "No MRZ found on this document.");
+      await markFailed(String(doc._id), "UNREADABLE_DOCUMENT", "No MRZ found on this document.", activityCtx);
       return;
     }
 
@@ -229,6 +271,7 @@ export async function runVisaPassportExtraction(documentId: string): Promise<voi
           String(doc._id),
           "MALFORMED_MRZ",
           `MRZ could not be parsed after retry: ${parseResult.error.message}`,
+          activityCtx,
         );
         return;
       }
@@ -330,9 +373,6 @@ export async function runVisaPassportExtraction(documentId: string): Promise<voi
     // blocks confirmation either way (utils/passportCrossCheck.ts's own
     // header) — this only ever adds informational fields.
     try {
-      const application = await VisaApplication.findById(doc.applicationId)
-        .select("travellerProfileId workspaceId")
-        .lean();
       if (application) {
         const traveller = await TravellerProfile.findOne({
           _id: (application as any).travellerProfileId,
@@ -371,11 +411,21 @@ export async function runVisaPassportExtraction(documentId: string): Promise<voi
     doc.extractionConfidence = confidence;
     doc.extractedFields = fieldEntries;
     await doc.save();
+
+    await logVisaActivity({
+      applicationId: activityCtx.applicationId,
+      requestId: activityCtx.requestId,
+      workspaceId: activityCtx.workspaceId,
+      eventType: "EXTRACTION_COMPLETED",
+      actorUserId: null,
+      actorType: "SYSTEM",
+      detail: { documentId: String(doc._id), extractionStatus: doc.extractionStatus, confidence },
+    });
   } catch (err: any) {
     extractionLogger.error("visa passport extraction failed", {
       documentId: String(doc._id),
       error: err?.message,
     });
-    await markFailed(String(doc._id), "SERVICE_ERROR", err?.message || "Passport extraction failed.");
+    await markFailed(String(doc._id), "SERVICE_ERROR", err?.message || "Passport extraction failed.", activityCtx);
   }
 }

@@ -179,6 +179,14 @@ vi.mock("../models/TravelBooking.js", () => ({
   },
 }));
 
+// A created/updated booking logs a VisaActivityLog row — mocked to a no-op
+// so tests never touch the real (unconnected, in this test environment)
+// collection. This file's own coverage is the pricing/idempotency logic,
+// not the activity trail.
+vi.mock("../models/VisaActivityLog.js", () => ({
+  logVisaActivity: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { syncVisaApplicationBilling } from "./visaBillingSync.js";
 import { syncManualBookingToMirror } from "../models/ManualBooking.js";
 

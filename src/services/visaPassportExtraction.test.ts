@@ -94,6 +94,16 @@ vi.mock("../utils/s3Upload.js", () => ({
   getObjectBuffer: (...args: any[]) => getObjectBufferMock(...args),
 }));
 
+// STARTED/COMPLETED/FAILED are all logged via logVisaActivity — mocked to a
+// no-op so tests never touch the real (unconnected, in this test
+// environment) VisaActivityLog collection. Without this, tests happen to
+// pass anyway (most fixtures leave application.requestId unset, so the real
+// model's own schema validation rejects the row locally, before any network
+// call) — mocked explicitly so that stays true by design, not by accident.
+vi.mock("../models/VisaActivityLog.js", () => ({
+  logVisaActivity: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../utils/logger.js", () => ({
   default: {
     child: () => ({

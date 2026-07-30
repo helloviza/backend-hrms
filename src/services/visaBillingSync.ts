@@ -44,6 +44,7 @@ import VisaRequest from "../models/VisaRequest.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import logger from "../utils/logger.js";
+import { logVisaActivity } from "../models/VisaActivityLog.js";
 
 const visaBillingLogger = logger.child({ module: "visaBillingSync" });
 
@@ -197,6 +198,18 @@ export async function syncVisaApplicationBilling(
       bookingRef: (created as any).bookingRef,
       quotedPrice,
     });
+    // actorType SYSTEM — this is a billing-sync side effect of recording an
+    // outcome, not a direct staff edit to ManualBooking itself (task brief:
+    // "extraction and billing sync SYSTEM").
+    await logVisaActivity({
+      applicationId,
+      requestId: request._id,
+      workspaceId: application.workspaceId,
+      eventType: "MANUAL_BOOKING_CREATED",
+      actorUserId: null,
+      actorType: "SYSTEM",
+      detail: { manualBookingId: String(created._id) },
+    });
     return { action: "created", manualBookingId: String(created._id) };
   }
 
@@ -211,6 +224,15 @@ export async function syncVisaApplicationBilling(
     manualBookingId: String(existing._id),
     bookingRef: existing.bookingRef,
     quotedPrice,
+  });
+  await logVisaActivity({
+    applicationId,
+    requestId: request._id,
+    workspaceId: application.workspaceId,
+    eventType: "MANUAL_BOOKING_UPDATED",
+    actorUserId: null,
+    actorType: "SYSTEM",
+    detail: { manualBookingId: String(existing._id) },
   });
   return { action: "updated", manualBookingId: String(existing._id) };
 }

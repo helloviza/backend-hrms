@@ -135,6 +135,16 @@ vi.mock("../models/User.js", () => ({
   },
 }));
 
+// POST /requests logs REQUEST_CREATED/APPLICATION_CREATED, and GET
+// /requests/:id reads back a trimmed activity feed — both mocked to a
+// no-op/empty-list so tests never touch the real (unconnected, in this
+// test environment) VisaActivityLog collection.
+vi.mock("../models/VisaActivityLog.js", () => ({
+  logVisaActivity: vi.fn().mockResolvedValue(undefined),
+  VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES: new Set(),
+  default: { find: () => chainable(() => []), countDocuments: async () => 0 },
+}));
+
 import express from "express";
 import request from "supertest";
 import router from "./visa.js";

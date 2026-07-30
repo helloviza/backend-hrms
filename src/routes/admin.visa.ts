@@ -53,6 +53,7 @@ import { presignGetObject } from "../utils/s3Presign.js";
 import { syncVisaApplicationBilling } from "../services/visaBillingSync.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
+import VisaActivityLog, { logVisaActivity, type VisaActivityEventType } from "../models/VisaActivityLog.js";
 
 const router = Router();
 const adminVisaLogger = logger.child({ module: "admin.visa" });
@@ -65,6 +66,13 @@ function actorId(req: any): any {
 
 function travellerDisplayName(t: any): string {
   return [t?.firstName, t?.middleName, t?.lastName].filter(Boolean).join(" ");
+}
+
+// Same shape as admin.visa.rules.ts's own resolveUserName — `name` wins,
+// falls back to a firstName+lastName join, then email, never a blank string.
+function resolveUserName(u: any): string {
+  if (!u) return "Unknown";
+  return u.name || [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.email || "Unknown";
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -465,6 +473,17 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
         return res.status(400).json({ error: "reason is required to set action_required" });
       }
       await setActionRequired(id, reason, actorId(req));
+      // reason IS logged — it's the concierge's own message, not extracted
+      // applicant data (VisaActivityLog.ts's no-PII rule explicitly allows it).
+      await logVisaActivity({
+        applicationId: id,
+        requestId: application.requestId,
+        workspaceId: application.workspaceId,
+        eventType: "ACTION_REQUIRED_SET",
+        actorUserId: actorId(req),
+        actorType: "STAFF",
+        detail: { reason, interruptedStatus: current },
+      });
     } else if (current === "action_required") {
       // target is validated (must be a legal pre-decision status — i.e. the
       // caller is confirming "yes, clear it") but is no longer what gets
@@ -476,7 +495,16 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
       if (!PRE_DECISION_STATUSES.includes(target as VisaApplicationStatus)) {
         return res.status(400).json({ error: `Cannot clear action_required into '${target}'`, current, target });
       }
-      await clearActionRequired(id);
+      const resumed = await clearActionRequired(id);
+      await logVisaActivity({
+        applicationId: id,
+        requestId: application.requestId,
+        workspaceId: application.workspaceId,
+        eventType: "ACTION_REQUIRED_CLEARED",
+        actorUserId: actorId(req),
+        actorType: "STAFF",
+        detail: { resumedStatus: resumed?.status ?? null },
+      });
     } else {
       const allowed = STATUS_FORWARD_TRANSITIONS[current] || [];
       if (!allowed.includes(target as VisaApplicationStatus)) {
@@ -507,6 +535,15 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
       if (!updated) {
         return res.status(409).json({ error: "This application's status changed concurrently — please retry." });
       }
+      await logVisaActivity({
+        applicationId: id,
+        requestId: application.requestId,
+        workspaceId: application.workspaceId,
+        eventType: "STATUS_CHANGED",
+        actorUserId: actorId(req),
+        actorType: "STAFF",
+        detail: { from: current, to: target },
+      });
     }
 
     // status is DERIVED on VisaRequest — never assigned directly. Same rule
@@ -559,6 +596,32 @@ router.patch("/documents/:id/review", requirePermission("visaApplication", "WRIT
 
     const doc = await VisaDocument.findOneAndUpdate({ _id: id, deletedAt: null }, update, { new: true });
     if (!doc) return res.status(404).json({ error: "Document not found" });
+
+    // requestId isn't on VisaDocument itself — resolved via one extra
+    // lookup, wrapped so a failure here can never fail the review that
+    // already succeeded above.
+    try {
+      const owningApplication = await VisaApplication.findById(doc.applicationId).select("requestId").lean();
+      if (owningApplication) {
+        await logVisaActivity({
+          applicationId: doc.applicationId,
+          requestId: (owningApplication as any).requestId,
+          workspaceId: doc.workspaceId,
+          eventType: reviewStatus === "VERIFIED" ? "DOCUMENT_ACCEPTED" : "DOCUMENT_REJECTED",
+          actorUserId: actorId(req),
+          actorType: "STAFF",
+          detail:
+            reviewStatus === "REJECTED"
+              ? { documentId: String(doc._id), docCode: doc.docCode, reason: rejectionReason }
+              : { documentId: String(doc._id), docCode: doc.docCode },
+        });
+      }
+    } catch (logErr: any) {
+      adminVisaLogger.error("failed to resolve requestId for visa activity log", {
+        documentId: String(doc._id),
+        error: logErr?.message,
+      });
+    }
 
     res.json({ ok: true, document: mapAdminDocumentSummary(doc) });
   } catch (err: any) {
@@ -701,6 +764,27 @@ router.patch("/applications/:id/costs", requirePermission("visaApplication", "FU
       });
     }
 
+    // Logged unconditionally — the old logger.info above only ever fired
+    // above-threshold, leaving every in-threshold cost update with no
+    // persisted trail at all. This is the gap the activity log closes.
+    await logVisaActivity({
+      applicationId: application._id,
+      requestId: application.requestId,
+      workspaceId: application.workspaceId,
+      eventType: "COSTS_RECORDED",
+      actorUserId: actorId(req),
+      actorType: "STAFF",
+      detail: {
+        actualEmbassyFeeInr,
+        actualVfsFeeInr,
+        actualPlumtripsServiceFeeInr,
+        actualTotalInr,
+        varianceInr,
+        reasonRequired,
+        reason: reasonRequired ? String(reason).trim() : null,
+      },
+    });
+
     res.json({
       ok: true,
       application: mapAdminApplicationSummary(application.toObject()),
@@ -791,15 +875,27 @@ router.patch(
 
       await application.save();
 
+      await logVisaActivity({
+        applicationId: application._id,
+        requestId: application.requestId,
+        workspaceId: application.workspaceId,
+        eventType: "OUTCOME_RECORDED",
+        actorUserId: actorId(req),
+        actorType: "STAFF",
+        detail: { outcome },
+      });
+
       let attachedDocument: any = null;
       if (req.file?.buffer) {
         try {
           const doc = await createVisaDocumentUpload({
             workspaceId: application.workspaceId,
             applicationId: application._id,
+            requestId: application.requestId,
             docCode: VISA_SCAN_DOC_CODE,
             file: req.file,
             uploaderId: actorId(req),
+            actorType: "STAFF",
           });
           attachedDocument = mapAdminDocumentSummary(doc);
         } catch (uploadErr: any) {
@@ -939,6 +1035,38 @@ async function buildAssignmentUpdate(
   return { set };
 }
 
+// Diffs the assignment role fields a $set actually touches against the
+// application's PRE-write values, so the assignment routes can log exactly
+// what changed — never a no-op "re-affirmed the same assignee" event (that
+// would just be timestamp/assignedBy churn on an unchanged relationship).
+// Shared by PATCH /applications/:id/assignment and POST
+// /applications/bulk-assign, which otherwise duplicate this exact diff.
+function diffAssignmentRoles(
+  before: Record<string, unknown>,
+  set: Record<string, unknown>,
+): Array<{ role: "CONCIERGE" | "SCREENING_OFFICER"; fromUserId: string | null; toUserId: string | null }> {
+  const changes: Array<{ role: "CONCIERGE" | "SCREENING_OFFICER"; fromUserId: string | null; toUserId: string | null }> = [];
+  for (const key of ASSIGNMENT_ROLE_KEYS) {
+    const fields = ASSIGNMENT_ROLES[key];
+    if (!(fields.idField in set)) continue;
+    const fromUserId = before[fields.idField] ? String(before[fields.idField]) : null;
+    const toUserId = set[fields.idField] ? String(set[fields.idField]) : null;
+    if (fromUserId === toUserId) continue;
+    changes.push({ role: key === "assignedConciergeUserId" ? "CONCIERGE" : "SCREENING_OFFICER", fromUserId, toUserId });
+  }
+  return changes;
+}
+
+function assignmentEventType(
+  role: "CONCIERGE" | "SCREENING_OFFICER",
+  fromUserId: string | null,
+  toUserId: string | null,
+): VisaActivityEventType {
+  if (fromUserId == null) return `${role}_ASSIGNED` as VisaActivityEventType;
+  if (toUserId == null) return `${role}_CLEARED` as VisaActivityEventType;
+  return `${role}_CHANGED` as VisaActivityEventType;
+}
+
 /* ─────────────────────────────────────────────────────────────────────
  * PATCH /applications/:id/assignment — set or clear either role on ONE
  * application. Body: { assignedConciergeUserId?: string|null,
@@ -960,7 +1088,22 @@ router.patch("/applications/:id/assignment", requirePermission("visaApplication"
       return res.status(result.status).json({ error: result.error });
     }
 
+    const changes = diffAssignmentRoles(exists as any, result.set);
+
     const updated = await VisaApplication.findByIdAndUpdate(id, { $set: result.set }, { new: true }).lean();
+
+    for (const change of changes) {
+      await logVisaActivity({
+        applicationId: id,
+        requestId: (updated as any).requestId,
+        workspaceId: (updated as any).workspaceId,
+        eventType: assignmentEventType(change.role, change.fromUserId, change.toUserId),
+        actorUserId: actorId(req),
+        actorType: "STAFF",
+        detail: change,
+      });
+    }
+
     res.json({ ok: true, application: mapAdminApplicationSummary(updated) });
   } catch (err: any) {
     console.error("[admin visa application assignment PATCH]", err?.message);
@@ -997,7 +1140,9 @@ router.post("/applications/bulk-assign", requirePermission("visaApplication", "W
       return res.status(result.status).json({ error: result.error });
     }
 
-    const existing = await VisaApplication.find({ _id: { $in: ids } }).select("_id").lean();
+    const existing = await VisaApplication.find({ _id: { $in: ids } })
+      .select("_id requestId workspaceId assignedConciergeUserId assignedScreeningOfficerId")
+      .lean();
     if (existing.length !== ids.length) {
       const foundIds = new Set(existing.map((a: any) => String(a._id)));
       const missing = ids.filter((id) => !foundIds.has(id));
@@ -1005,6 +1150,21 @@ router.post("/applications/bulk-assign", requirePermission("visaApplication", "W
     }
 
     await VisaApplication.updateMany({ _id: { $in: ids } }, { $set: result.set });
+
+    for (const app of existing as any[]) {
+      const changes = diffAssignmentRoles(app, result.set);
+      for (const change of changes) {
+        await logVisaActivity({
+          applicationId: app._id,
+          requestId: app.requestId,
+          workspaceId: app.workspaceId,
+          eventType: assignmentEventType(change.role, change.fromUserId, change.toUserId),
+          actorUserId: actorId(req),
+          actorType: "STAFF",
+          detail: change,
+        });
+      }
+    }
 
     res.json({ ok: true, updated: ids.length, applicationIds: ids });
   } catch (err: any) {
@@ -1071,5 +1231,60 @@ router.get("/assignable-users", requirePermission("visaApplication", "READ"), as
     res.status(500).json({ error: err?.message || "Failed to load assignable users" });
   }
 });
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /applications/:id/activity — Phase 9c. Paginated, newest first, one
+ * row per event across this application's whole lifecycle (see
+ * models/VisaActivityLog.ts). Actor names resolved for the page being
+ * returned, same posture as admin.visa.rules.ts's GET /rules/:id/audit.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get(
+  "/applications/:id/activity",
+  requirePermission("visaApplication", "READ"),
+  async (req: any, res: any) => {
+    try {
+      const id = req.params.id;
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(404).json({ error: "Visa application not found" });
+      }
+      const exists = await VisaApplication.findById(id).select("_id").lean();
+      if (!exists) return res.status(404).json({ error: "Visa application not found" });
+
+      const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+
+      const total = await VisaActivityLog.countDocuments({ applicationId: id });
+      const entries = await VisaActivityLog.find({ applicationId: id })
+        .sort({ at: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean();
+
+      const userIds = [...new Set(entries.map((e: any) => (e.actorUserId ? String(e.actorUserId) : null)).filter(Boolean))];
+      const users = userIds.length
+        ? await User.find({ _id: { $in: userIds } }).select("firstName lastName name email").lean()
+        : [];
+      const userById = new Map(users.map((u: any) => [String(u._id), u]));
+
+      const shaped = entries.map((e: any) => ({
+        id: String(e._id),
+        eventType: e.eventType,
+        actorType: e.actorType,
+        actor: e.actorUserId ? { id: String(e.actorUserId), name: resolveUserName(userById.get(String(e.actorUserId))) } : null,
+        at: e.at,
+        detail: e.detail || {},
+      }));
+
+      res.json({
+        ok: true,
+        activity: shaped,
+        pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      });
+    } catch (err: any) {
+      console.error("[admin visa application activity GET]", err?.message);
+      res.status(500).json({ error: err?.message || "Failed to load activity" });
+    }
+  },
+);
 
 export default router;

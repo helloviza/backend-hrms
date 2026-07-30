@@ -178,6 +178,15 @@ vi.mock("../models/TravelBooking.js", () => ({
   },
 }));
 
+// GET /requests/:id now reads back a trimmed activity feed — mocked to an
+// empty list so tests never touch the real (unconnected, in this test
+// environment) VisaActivityLog collection.
+vi.mock("../models/VisaActivityLog.js", () => ({
+  logVisaActivity: vi.fn().mockResolvedValue(undefined),
+  VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES: new Set(),
+  default: { find: () => ({ sort: () => ({ limit: () => ({ lean: () => Promise.resolve([]) }) }) }), countDocuments: async () => 0 },
+}));
+
 vi.mock("../utils/s3Upload.js", () => ({ uploadBufferToS3: vi.fn() }));
 vi.mock("../utils/s3Presign.js", () => ({ presignGetObject: vi.fn() }));
 vi.mock("../utils/logger.js", () => ({

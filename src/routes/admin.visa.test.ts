@@ -281,6 +281,21 @@ vi.mock("../models/VisaDocument.js", () => ({
   },
 }));
 
+// Every mutating route in this file now logs a VisaActivityLog row —
+// mocked to a no-op create plus an empty paginated read, so tests never
+// touch the real (unconnected, in this test environment) collection. This
+// file's own coverage is the state machine/permission gate, not the
+// activity trail — see routes/visa.activity.test.ts for that.
+vi.mock("../models/VisaActivityLog.js", () => ({
+  logVisaActivity: vi.fn().mockResolvedValue(undefined),
+  default: {
+    find: () => ({
+      sort: () => ({ skip: () => ({ limit: () => ({ lean: () => Promise.resolve([]) }) }) }),
+    }),
+    countDocuments: async () => 0,
+  },
+}));
+
 // Same fake as visa.documents.test.ts's own presignGetObject mock — no real
 // AWS SDK call, just proof this route calls it with the right key/filename.
 vi.mock("../utils/s3Presign.js", () => ({
