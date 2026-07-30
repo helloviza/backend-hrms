@@ -24,14 +24,11 @@
 // a permission/role gate, nothing tenancy-related at mount time).
 //
 // Phase 6b built the console UI (apps/frontend/src/pages/admin/
-// VisaConciergeConsole.tsx). Phase 9a (this revision) moves case assignment
-// off VisaRequest onto VisaApplication (see models/VisaApplication.ts) and
-// replaces the old PATCH /requests/:id/concierge with PATCH
-// /applications/:id/assignment, POST /applications/bulk-assign, and GET
-// /assignable-users — VisaConciergeConsole.tsx still calls the OLD route
-// and reads the OLD per-request assignedConcierge shape; it has NOT been
-// rewired onto these new routes yet (backend-only phase — flagged as a
-// known follow-up, not done here).
+// VisaConciergeConsole.tsx). Phase 9a moved case assignment off VisaRequest
+// onto VisaApplication (see models/VisaApplication.ts), replacing the old
+// PATCH /requests/:id/concierge with PATCH /applications/:id/assignment,
+// POST /applications/bulk-assign, and GET /assignable-users. Phase 9b wired
+// the console UI onto these routes.
 
 import { Router } from "express";
 import mongoose from "mongoose";
