@@ -392,12 +392,17 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
       }
       await setActionRequired(id, reason, actorId(req));
     } else if (current === "action_required") {
-      // Clearing back — legal into any of the normal resumption points.
+      // target is validated (must be a legal pre-decision status — i.e. the
+      // caller is confirming "yes, clear it") but is no longer what gets
+      // WRITTEN: clearActionRequired() restores the real interrupted status
+      // from statusBeforeActionRequired, captured when this application was
+      // originally flagged (models/VisaApplication.ts) — that's the whole
+      // point of capturing it. A stale/wrong guess from the caller can
+      // never overwrite it; there is no separate write here anymore.
       if (!PRE_DECISION_STATUSES.includes(target as VisaApplicationStatus)) {
         return res.status(400).json({ error: `Cannot clear action_required into '${target}'`, current, target });
       }
       await clearActionRequired(id);
-      await VisaApplication.updateOne({ _id: id }, { $set: { status: target } });
     } else {
       const allowed = STATUS_FORWARD_TRANSITIONS[current] || [];
       if (!allowed.includes(target as VisaApplicationStatus)) {

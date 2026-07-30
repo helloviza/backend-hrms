@@ -22,6 +22,9 @@ import {
   type VisaCategory, type VisaEtaBasis, type VisaRuleDisplayMode,
   type VisaDocumentRequirement,
 } from "./VisaRule.js";
+import logger from "../utils/logger.js";
+
+const visaApplicationLogger = logger.child({ module: "VisaApplication" });
 
 export const VISA_APPLICATION_STATUSES = [
   "draft", "submitted", "docs_under_review", "action_required",
@@ -130,15 +133,27 @@ export interface VisaApplicationDocument extends Document {
   // stamp" or "attend your appointment on the 12th", not a fixed set of
   // codes. Nothing writes these yet — the concierge console sets them when
   // it moves an application INTO action_required (phase 6, not built here).
-  // All three are set together and cleared together: whatever route
-  // eventually clears action_required (moving the application to any other
-  // status) MUST null out all three at the same time, never just the
+  // All FOUR of these (including statusBeforeActionRequired below) are set
+  // together and cleared together: whatever route eventually clears
+  // action_required MUST null out all four at the same time, never just the
   // status — a stale reason left behind would describe a problem that no
   // longer gates anything, and would misrepresent a NEW action_required
   // episode as a continuation of the old one.
   actionRequiredReason: string | null;
   actionRequiredSetAt: Date | null;
   actionRequiredSetByUserId: mongoose.Types.ObjectId | null; // ref User
+
+  // The status this application was actually IN the moment it was flagged
+  // action_required — captured by setActionRequired() so clearActionRequired()
+  // can restore it later. Without this, action_required overwrites `status`
+  // directly with no record of what it interrupted, and clearing it has no
+  // way to know where the application really was (the tracking timeline,
+  // track/timelineStages.ts, used to compensate by under-claiming progress
+  // from lodgedAt alone). Re-affirming action_required while ALREADY
+  // action_required (a fresh reason, same interruption) must NEVER
+  // re-capture "action_required" itself over whatever real status is
+  // already sitting here — see setActionRequired's own guard.
+  statusBeforeActionRequired: VisaApplicationStatus | null;
 
   // Set the moment this application transitions draft -> submitted (POST
   // /requests/:id/submit, routes/visa.ts) — never on creation, and never
@@ -253,6 +268,7 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     actionRequiredReason: { type: String, trim: true, default: null },
     actionRequiredSetAt: { type: Date, default: null },
     actionRequiredSetByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    statusBeforeActionRequired: { type: String, enum: VISA_APPLICATION_STATUSES, default: null },
 
     submittedAt: { type: Date },
     lodgedAt: { type: Date },
@@ -289,18 +305,24 @@ export default VisaApplication;
 
 /**
  * Paired helpers — the ONLY sanctioned way to touch actionRequiredReason/
- * actionRequiredSetAt/actionRequiredSetByUserId (see the doc comment on
- * those fields above). No route should ever $set any one of the three
- * directly; going through these keeps them moving together by
- * construction rather than by every call site remembering to.
+ * actionRequiredSetAt/actionRequiredSetByUserId/statusBeforeActionRequired
+ * (see the doc comment on those fields above). No route should ever $set
+ * any one of the four directly; going through these keeps them moving
+ * together by construction rather than by every call site remembering to.
  *
  * setActionRequired ALSO sets status — flagging action_required IS the
- * status transition, there's no separate "set the reason" step.
- * clearActionRequired deliberately does NOT touch status — it only nulls
- * the three fields. Clearing back to a resuming status is the caller's
- * (routes/admin.visa.ts's PATCH /applications/:id/status) job, as its own
- * separate update — that route decides which status is legal to resume
- * into, which isn't this model's concern.
+ * status transition, there's no separate "set the reason" step. It captures
+ * the CURRENT status into statusBeforeActionRequired before overwriting it —
+ * except when the application is ALREADY action_required (re-affirming with
+ * a fresh reason): in that case `status` reads "action_required" itself,
+ * and capturing THAT would permanently corrupt the one record of where the
+ * application really was. The already-captured value is kept as-is instead.
+ *
+ * clearActionRequired now RESTORES status from statusBeforeActionRequired
+ * (previously this was the caller's job, as its own separate update — see
+ * routes/admin.visa.ts's PATCH /applications/:id/status) — that's the whole
+ * point of capturing it. Falls back to "submitted" (logged) if it's
+ * somehow absent, rather than guessing a later stage no evidence supports.
  */
 export async function setActionRequired(
   applicationId: mongoose.Types.ObjectId | string,
@@ -309,6 +331,20 @@ export async function setActionRequired(
 ): Promise<VisaApplicationDocument | null> {
   const trimmed = reason?.trim();
   if (!trimmed) throw new Error("setActionRequired requires a non-empty reason");
+
+  const current = await VisaApplication.findById(applicationId)
+    .select("status statusBeforeActionRequired")
+    .lean();
+  if (!current) return null;
+
+  // Guard against corrupting the capture: re-affirming action_required
+  // while already action_required must never overwrite the real interrupted
+  // status with the literal string "action_required".
+  const statusBeforeActionRequired: VisaApplicationStatus | null =
+    (current as any).status === "action_required"
+      ? ((current as any).statusBeforeActionRequired ?? null)
+      : ((current as any).status as VisaApplicationStatus);
+
   return VisaApplication.findByIdAndUpdate(
     applicationId,
     {
@@ -317,6 +353,7 @@ export async function setActionRequired(
         actionRequiredReason: trimmed,
         actionRequiredSetAt: new Date(),
         actionRequiredSetByUserId: userId,
+        statusBeforeActionRequired,
       },
     },
     { new: true },
@@ -326,13 +363,29 @@ export async function setActionRequired(
 export async function clearActionRequired(
   applicationId: mongoose.Types.ObjectId | string,
 ): Promise<VisaApplicationDocument | null> {
+  const current = await VisaApplication.findById(applicationId).select("statusBeforeActionRequired").lean();
+  if (!current) return null;
+
+  let restoredStatus = (current as any).statusBeforeActionRequired as VisaApplicationStatus | null;
+  if (!restoredStatus) {
+    // Never silently pick a later stage — "submitted" is the earliest
+    // legal resume point, so this can only under-claim progress, never
+    // fabricate a stage nothing confirms was actually reached.
+    restoredStatus = "submitted";
+    visaApplicationLogger.warn("clearActionRequired: statusBeforeActionRequired missing, falling back to 'submitted'", {
+      applicationId: String(applicationId),
+    });
+  }
+
   return VisaApplication.findByIdAndUpdate(
     applicationId,
     {
       $set: {
+        status: restoredStatus,
         actionRequiredReason: null,
         actionRequiredSetAt: null,
         actionRequiredSetByUserId: null,
+        statusBeforeActionRequired: null,
       },
     },
     { new: true },

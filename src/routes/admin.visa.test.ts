@@ -170,16 +170,24 @@ vi.mock("../models/VisaApplication.js", async () => {
         return { acknowledged: true, matchedCount: rec ? 1 : 0 };
       },
     },
+    // Mirrors the real models/VisaApplication.ts behavior (unit-tested
+    // directly in models/VisaApplication.test.ts) closely enough for this
+    // file's route-level tests to exercise the full round trip: capture on
+    // set (never re-capturing "action_required" itself over an existing
+    // capture), restore + null all four fields on clear.
     setActionRequired: async (id: any, reason: string, userId: any) => {
       setActionRequiredMock(id, reason, userId);
       const rec = _applications.get(id);
       if (!rec) return null;
       if (!reason?.trim()) throw new Error("setActionRequired requires a non-empty reason");
+      const statusBeforeActionRequired =
+        rec.status === "action_required" ? (rec.statusBeforeActionRequired ?? null) : rec.status;
       Object.assign(rec, {
         status: "action_required",
         actionRequiredReason: reason.trim(),
         actionRequiredSetAt: new Date(),
         actionRequiredSetByUserId: userId,
+        statusBeforeActionRequired,
       });
       return { ...rec };
     },
@@ -187,10 +195,13 @@ vi.mock("../models/VisaApplication.js", async () => {
       clearActionRequiredMock(id);
       const rec = _applications.get(id);
       if (!rec) return null;
+      const restoredStatus = rec.statusBeforeActionRequired || "submitted";
       Object.assign(rec, {
+        status: restoredStatus,
         actionRequiredReason: null,
         actionRequiredSetAt: null,
         actionRequiredSetByUserId: null,
+        statusBeforeActionRequired: null,
       });
       return { ...rec };
     },
@@ -548,6 +559,27 @@ describe("PATCH /applications/:id/status — state machine", () => {
     expect(stored.actionRequiredReason).toBeNull();
     expect(stored.actionRequiredSetAt).toBeNull();
     expect(stored.actionRequiredSetByUserId).toBeNull();
+    expect(stored.statusBeforeActionRequired).toBeNull();
+  });
+
+  it("clearing restores the CAPTURED status, not whatever target the caller sends — set from cost_confirmed, clear to cost_confirmed even when a different target is requested", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "cost_confirmed" });
+
+    await request(app)
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "action_required", reason: "Awaiting appointment" });
+    expect(_applications.get(a._id).statusBeforeActionRequired).toBe("cost_confirmed");
+
+    // Requests a DIFFERENT (but still legal) resumption target — the
+    // captured status must win regardless, since target is no longer what
+    // gets written (routes/admin.visa.ts's PATCH /applications/:id/status).
+    const clearRes = await request(app)
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "submitted" });
+    expect(clearRes.status).toBe(200);
+    expect(_applications.get(a._id).status).toBe("cost_confirmed");
+    expect(clearRes.body.application.status).toBe("cost_confirmed");
   });
 
   it("rejects clearing action_required into a non-resumption target", async () => {
