@@ -392,6 +392,69 @@ describe("POST /applications/:applicationId/documents", () => {
     },
   );
 
+  it("replacing a reviewed document starts the new version at PENDING, never inheriting the old verdict", async () => {
+    const app = applicationDoc(WORKSPACE_A, { status: "action_required" });
+    documents.insert({
+      workspaceId: WORKSPACE_A,
+      applicationId: app._id,
+      docCode: "DOC-01",
+      version: 1,
+      s3Key: "k",
+      originalFilename: "a.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 10,
+      uploadedByUserId: USER_A,
+      extractionStatus: "PENDING",
+      reviewStatus: "REJECTED",
+      reviewedBy: USER_A,
+      reviewedAt: new Date(),
+      rejectionReason: "Blurry scan",
+      deletedAt: null,
+    });
+
+    const res = await request(makeApp(WORKSPACE_A))
+      .post(`/applications/${app._id}/documents`)
+      .field("docCode", "DOC-01")
+      .attach("file", Buffer.from("%PDF-1.4 fake"), { filename: "passport-v2.pdf", contentType: "application/pdf" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.document.version).toBe(2);
+    expect(res.body.document.reviewStatus).toBe("PENDING");
+
+    const stored = documents.get(res.body.document.id);
+    expect(stored.reviewStatus).toBe("PENDING");
+    expect(stored.reviewedBy).toBeUndefined();
+    expect(stored.reviewedAt).toBeUndefined();
+    expect(stored.rejectionReason).toBeUndefined();
+  });
+
+  it("replace (same-docCode upload) 409s once status is docs_under_review, same as a first-time upload", async () => {
+    const app = applicationDoc(WORKSPACE_A, { status: "docs_under_review" });
+    documents.insert({
+      workspaceId: WORKSPACE_A,
+      applicationId: app._id,
+      docCode: "DOC-01",
+      version: 1,
+      s3Key: "k",
+      originalFilename: "a.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 10,
+      uploadedByUserId: USER_A,
+      extractionStatus: "PENDING",
+      reviewStatus: "PENDING",
+      deletedAt: null,
+    });
+
+    const res = await request(makeApp(WORKSPACE_A))
+      .post(`/applications/${app._id}/documents`)
+      .field("docCode", "DOC-01")
+      .attach("file", Buffer.from("%PDF-1.4 fake"), { filename: "passport-v2.pdf", contentType: "application/pdf" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/concierge/i);
+    expect(documents.query({ applicationId: app._id, docCode: "DOC-01" })).toHaveLength(1);
+  });
+
   it("re-uploading the same docCode versions rather than overwrites — both rows survive", async () => {
     const app = applicationDoc(WORKSPACE_A);
     const upload = () =>
@@ -602,6 +665,80 @@ describe("DELETE /documents/:documentId", () => {
 
     const res = await request(makeApp(WORKSPACE_A)).get(`/applications/${app._id}/documents`);
     expect(res.body.documents).toHaveLength(0);
+  });
+
+  it("409s once the application is docs_under_review — same message as the upload gate, never deletes", async () => {
+    const app = applicationDoc(WORKSPACE_A, { status: "docs_under_review" });
+    const doc = documents.insert({
+      workspaceId: WORKSPACE_A,
+      applicationId: app._id,
+      docCode: "DOC-01",
+      version: 1,
+      s3Key: "k",
+      originalFilename: "a.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 10,
+      uploadedByUserId: USER_A,
+      extractionStatus: "PENDING",
+      reviewStatus: "PENDING",
+      deletedAt: null,
+    });
+
+    const res = await request(makeApp(WORKSPACE_A)).delete(`/documents/${doc._id}`);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/concierge/i);
+    expect(documents.get(doc._id).deletedAt).toBeNull();
+  });
+
+  it("409s for a VERIFIED document even while the application is still submitted — points at replace instead", async () => {
+    const app = applicationDoc(WORKSPACE_A, { status: "submitted" });
+    const doc = documents.insert({
+      workspaceId: WORKSPACE_A,
+      applicationId: app._id,
+      docCode: "DOC-01",
+      version: 1,
+      s3Key: "k",
+      originalFilename: "a.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 10,
+      uploadedByUserId: USER_A,
+      extractionStatus: "PENDING",
+      reviewStatus: "VERIFIED",
+      reviewedBy: USER_A,
+      reviewedAt: new Date(),
+      deletedAt: null,
+    });
+
+    const res = await request(makeApp(WORKSPACE_A)).delete(`/documents/${doc._id}`);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/replace/i);
+    expect(documents.get(doc._id).deletedAt).toBeNull();
+  });
+
+  it("409s for a REJECTED document even in draft — a verdict, once recorded, is never erased by deletion", async () => {
+    const app = applicationDoc(WORKSPACE_A, { status: "draft" });
+    const doc = documents.insert({
+      workspaceId: WORKSPACE_A,
+      applicationId: app._id,
+      docCode: "DOC-01",
+      version: 1,
+      s3Key: "k",
+      originalFilename: "a.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 10,
+      uploadedByUserId: USER_A,
+      extractionStatus: "PENDING",
+      reviewStatus: "REJECTED",
+      reviewedBy: USER_A,
+      reviewedAt: new Date(),
+      rejectionReason: "Wrong document type",
+      deletedAt: null,
+    });
+
+    const res = await request(makeApp(WORKSPACE_A)).delete(`/documents/${doc._id}`);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/replace/i);
+    expect(documents.get(doc._id).deletedAt).toBeNull();
   });
 });
 

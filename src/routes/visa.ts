@@ -1017,6 +1017,13 @@ export async function createVisaDocumentUpload(opts: {
     // anything for non-passport docCodes; see the OCR investigation in
     // that phase's build report.
     extractionStatus: "PENDING",
+    // Also explicit, for the same reason: this call is EVERY upload,
+    // including a replace of a version an agent already reviewed
+    // (VERIFIED/REJECTED). A new version is a document nobody has looked
+    // at yet — it must never inherit the prior version's verdict, so
+    // reviewStatus/reviewedBy/reviewedAt are never copied forward here,
+    // ever (task brief: "close the document-mutation hole").
+    reviewStatus: "PENDING",
   });
 
   // Fire-and-forget — the upload response must never wait on extraction.
@@ -1034,18 +1041,30 @@ export async function createVisaDocumentUpload(opts: {
   return doc;
 }
 
-// Uploads are allowed through draft/submitted/action_required — the three
-// statuses where the applicant is still the one expected to be adding
-// documents. From docs_under_review onward an agent has started working the
-// file (routes/admin.visa.ts's PATCH /applications/:id/status is what moves
-// an application into docs_under_review), so a self-serve upload landing
+// Upload, delete, and replace (replace is just a same-docCode upload — see
+// createVisaDocumentUpload) all share this gate: allowed through
+// draft/submitted/action_required — the three statuses where the applicant
+// is still the one expected to be adding or changing documents. From
+// docs_under_review onward an agent has started working the file
+// (routes/admin.visa.ts's PATCH /applications/:id/status is what moves an
+// application into docs_under_review), so a self-serve mutation landing
 // mid-review could silently invalidate what the agent is already looking
 // at — the applicant's route back in at that point is their concierge, not
 // this endpoint. Draft is included even though screen 4's normal flow only
 // reaches here pre-submission — there's no reason to block it, and PATCH
 // /requests/:id/cancel already covers "the applicant wants out" separately.
+const DOCUMENT_MUTATION_ALLOWED_STATUSES = ["draft", "submitted", "action_required"];
 const DOCUMENT_UPLOAD_BLOCKED_MESSAGE =
   "Your concierge is already reviewing this application — reply to your concierge if you need to add or change a document.";
+
+// Independent of application status — a reviewed document (VERIFIED or
+// REJECTED) stays undeletable even in an otherwise-mutable status, because
+// an agent has already looked at it and recorded a verdict. Deleting it
+// would erase that work with nothing left in its place; replacing it (the
+// normal upload path, same docCode) keeps the old version's verdict on the
+// audit trail while giving the agent a fresh PENDING one to review instead.
+const DOCUMENT_DELETE_REVIEWED_MESSAGE =
+  "This document has already been reviewed by your concierge — replace it instead of deleting so the review stays on record.";
 
 router.post(
   "/applications/:applicationId/documents",
@@ -1056,7 +1075,7 @@ router.post(
       const application = await findOwnedApplication(req.params.applicationId, workspaceId);
       if (!application) return res.status(404).json({ error: "Visa application not found" });
 
-      if (!["draft", "submitted", "action_required"].includes(application.status)) {
+      if (!DOCUMENT_MUTATION_ALLOWED_STATUSES.includes(application.status)) {
         return res.status(409).json({ error: DOCUMENT_UPLOAD_BLOCKED_MESSAGE });
       }
 
@@ -1181,6 +1200,11 @@ router.get("/documents/:documentId/url", async (req: any, res: any) => {
  * DELETE /documents/:documentId — soft delete only. The S3 object is
  * NEVER removed — a deleted document may still be needed for audit. See
  * models/VisaDocument.ts file header.
+ *
+ * Gated the same way as upload/replace (DOCUMENT_MUTATION_ALLOWED_STATUSES),
+ * PLUS one more rule that upload doesn't need: a document an agent has
+ * already reviewed (VERIFIED/REJECTED) can never be deleted, regardless of
+ * the application's current status — see DOCUMENT_DELETE_REVIEWED_MESSAGE.
  * ───────────────────────────────────────────────────────────────────── */
 router.delete("/documents/:documentId", async (req: any, res: any) => {
   try {
@@ -1190,13 +1214,26 @@ router.delete("/documents/:documentId", async (req: any, res: any) => {
       return res.status(404).json({ error: "Document not found" });
     }
 
+    const doc = await VisaDocument.findOne({ _id: documentId, workspaceId, deletedAt: null }).lean();
+    if (!doc) return res.status(404).json({ error: "Document not found" });
+
+    if (doc.reviewStatus === "VERIFIED" || doc.reviewStatus === "REJECTED") {
+      return res.status(409).json({ error: DOCUMENT_DELETE_REVIEWED_MESSAGE });
+    }
+
+    const application = await findOwnedApplication(String(doc.applicationId), workspaceId);
+    if (!application) return res.status(404).json({ error: "Visa application not found" });
+    if (!DOCUMENT_MUTATION_ALLOWED_STATUSES.includes(application.status)) {
+      return res.status(409).json({ error: DOCUMENT_UPLOAD_BLOCKED_MESSAGE });
+    }
+
     const deletedBy = actorId(req);
-    const doc = await VisaDocument.findOneAndUpdate(
+    const updated = await VisaDocument.findOneAndUpdate(
       { _id: documentId, workspaceId, deletedAt: null },
       { $set: { deletedAt: new Date(), deletedBy } },
       { new: true },
     );
-    if (!doc) return res.status(404).json({ error: "Document not found" });
+    if (!updated) return res.status(404).json({ error: "Document not found" });
 
     res.json({ ok: true });
   } catch (err: any) {
