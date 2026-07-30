@@ -50,6 +50,10 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   crmContacts:       ["crmEnabled"],
   crmCompanies:      ["crmEnabled"],
   leads:             ["crmEnabled"],
+  // VISA APPLICATION (concierge console) — not yet consumed by any route
+  // (see routes/visa.ts, gated on visaEnabled directly); wired for
+  // grantability ahead of the concierge console phase.
+  visaApplication:   ["visaEnabled"],
 };
 
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
