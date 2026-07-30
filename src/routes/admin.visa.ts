@@ -119,6 +119,12 @@ function mapAdminApplicationSummary(a: any) {
     actionRequiredReason: a.actionRequiredReason ?? null,
     actionRequiredSetAt: a.actionRequiredSetAt ?? null,
     actionRequiredSetByUserId: a.actionRequiredSetByUserId ? String(a.actionRequiredSetByUserId) : null,
+    // Read-only — the console's "Clear action required" control names its
+    // real resume target from this (clearActionRequired always restores
+    // THIS value, ignoring whatever status the caller sends); never
+    // written to directly by any route (models/VisaApplication.ts's own
+    // doc comment).
+    statusBeforeActionRequired: a.statusBeforeActionRequired ?? null,
     customerRespondedAt: a.customerRespondedAt ?? null,
     nationality: a.nationality ?? null,
     nationalityUnresolved: a.nationalityUnresolved,
