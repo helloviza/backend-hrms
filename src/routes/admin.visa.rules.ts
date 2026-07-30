@@ -51,6 +51,7 @@ import VisaRule, {
 } from "../models/VisaRule.js";
 import VisaDestinationContent from "../models/VisaDestinationContent.js";
 import VisaRuleAudit, { type VisaRuleFieldChange, type VisaRuleAuditAction } from "../models/VisaRuleAudit.js";
+import User from "../models/User.js";
 import { VISA_DOCUMENT_CODE_SET } from "../config/visaDocumentCodes.js";
 import logger from "../utils/logger.js";
 
@@ -61,6 +62,11 @@ router.use(requireAuth);
 
 function actorId(req: any): any {
   return req.user?._id ?? req.user?.id ?? req.user?.sub;
+}
+
+function resolveUserName(u: any): string {
+  if (!u) return "Unknown";
+  return u.name || [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.email || "Unknown";
 }
 
 function isNonNegativeNumber(v: unknown): v is number {
@@ -292,6 +298,10 @@ function mapContentSummary(c: any) {
     entrySnapshot: c.entrySnapshot,
     heroImageUrl: c.heroImageUrl ?? null,
     lastReviewedAt: c.lastReviewedAt ?? null,
+    // Provenance marker (models/VisaDestinationContent.ts) — set only on
+    // rows scripts/seed-visa-rules.ts wrote. The UI uses this to flag
+    // unreviewed, LLM-authored placeholder copy before anyone publishes it.
+    seedSource: c.seedSource ?? null,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -384,6 +394,58 @@ router.get("/rules/:id", requirePermission("visaApplication", "FULL"), async (re
   } catch (err: any) {
     console.error("[admin visa rule detail GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load visa rule" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /rules/:id/audit — this rule's change history, newest first. The
+ * one thing Phase 7a's route list was missing (no way to read back what
+ * writeRuleAudit() has been recording since then) — a revenue audit trail
+ * nobody can read via API is not much of an audit trail. Resolves each
+ * entry's performedByUserId to a display name so the UI never has to.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/rules/:id/audit", requirePermission("visaApplication", "FULL"), async (req: any, res: any) => {
+  try {
+    const id = req.params.id;
+    if (!mongoose.isValidObjectId(id)) return res.status(404).json({ error: "Visa rule not found" });
+
+    const rule = await VisaRule.findById(id).select("_id").lean();
+    if (!rule) return res.status(404).json({ error: "Visa rule not found" });
+
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+
+    const total = await VisaRuleAudit.countDocuments({ ruleId: id });
+    const entries = await VisaRuleAudit.find({ ruleId: id })
+      .sort({ performedAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
+
+    const userIds = [...new Set(entries.map((e: any) => String(e.performedByUserId)).filter(Boolean))];
+    const users = await User.find({ _id: { $in: userIds } }).select("firstName lastName name email").lean();
+    const userById = new Map(users.map((u: any) => [String(u._id), u]));
+
+    const shaped = entries.map((e: any) => ({
+      id: String(e._id),
+      action: e.action,
+      changes: e.changes || [],
+      clonedFromRuleId: e.clonedFromRuleId ? String(e.clonedFromRuleId) : null,
+      performedAt: e.performedAt,
+      performedBy: {
+        id: e.performedByUserId ? String(e.performedByUserId) : null,
+        name: resolveUserName(userById.get(String(e.performedByUserId))),
+      },
+    }));
+
+    res.json({
+      ok: true,
+      entries: shaped,
+      pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+    });
+  } catch (err: any) {
+    console.error("[admin visa rule audit GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load audit history" });
   }
 });
 

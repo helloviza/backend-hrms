@@ -16,8 +16,10 @@ const {
   _rules,
   _content,
   _ruleAudits,
+  _users,
   chainableArray,
   chainableRuleArray,
+  chainableSortedPage,
   findByIdRule,
   findOneContentDoc,
   deriveDisplayMode,
@@ -100,6 +102,7 @@ const {
     const rec = _rules.get(id);
     const p: any = Promise.resolve(wrapRuleDoc(rec));
     p.lean = () => Promise.resolve(rec ? { ...rec } : null);
+    p.select = () => p;
     return p;
   }
 
@@ -126,12 +129,48 @@ const {
     return obj;
   }
 
+  // find(filter).sort({field:-1}).skip(n).limit(n).lean() — real sort/
+  // skip/limit (not no-ops), used by GET /rules/:id/audit's actual
+  // pagination so the newest-first ordering and page boundaries are
+  // genuinely exercised, not just asserted against an unsliced array.
+  function chainableSortedPage(getRecords: () => any[]) {
+    let sortField: string | null = null;
+    let sortDir = 1;
+    let skipN = 0;
+    let limitN: number | null = null;
+    const obj: any = {
+      sort: (spec: Record<string, number>) => {
+        const [field, dir] = Object.entries(spec)[0] || [];
+        sortField = field ?? null;
+        sortDir = (dir as number) ?? 1;
+        return obj;
+      },
+      skip: (n: number) => { skipN = n; return obj; },
+      limit: (n: number) => { limitN = n; return obj; },
+      lean: () => {
+        let recs = getRecords().map((r) => ({ ...r }));
+        if (sortField) {
+          recs.sort((a, b) => {
+            const av = new Date(a[sortField as string]).getTime();
+            const bv = new Date(b[sortField as string]).getTime();
+            return (av - bv) * sortDir;
+          });
+        }
+        recs = recs.slice(skipN, limitN != null ? skipN + limitN : undefined);
+        return Promise.resolve(recs);
+      },
+    };
+    return obj;
+  }
+
   return {
     _rules: makeCollection(),
     _content: makeCollection(),
     _ruleAudits: makeCollection(),
+    _users: makeCollection(),
     chainableArray,
     chainableRuleArray,
+    chainableSortedPage,
     findByIdRule,
     findOneContentDoc,
     deriveDisplayMode,
@@ -207,6 +246,14 @@ vi.mock("../models/VisaRuleAudit.js", () => ({
       const arr = Array.isArray(docs) ? docs : [docs];
       return arr.map((d: any) => _ruleAudits.insert({ performedAt: new Date(), ...d }));
     },
+    find: (filter: any) => chainableSortedPage(() => _ruleAudits.query(filter)),
+    countDocuments: async (filter: any) => _ruleAudits.query(filter).length,
+  },
+}));
+
+vi.mock("../models/User.js", () => ({
+  default: {
+    find: (filter: any) => chainableArray(() => _users.query(filter)),
   },
 }));
 
@@ -294,6 +341,7 @@ beforeEach(() => {
   _rules.clear();
   _content.clear();
   _ruleAudits.clear();
+  _users.clear();
   setAccess("FULL");
 
   // Real mongoose.startSession() talks to a live server — not available in
@@ -317,6 +365,7 @@ describe("permission gate — every route requires FULL", () => {
   const ROUTES: Array<{ method: "get" | "post" | "patch"; path: () => string; body?: any }> = [
     { method: "get", path: () => "/rules" },
     { method: "get", path: () => `/rules/${new mongoose.Types.ObjectId()}` },
+    { method: "get", path: () => `/rules/${new mongoose.Types.ObjectId()}/audit` },
     { method: "post", path: () => "/rules", body: {} },
     { method: "patch", path: () => `/rules/${new mongoose.Types.ObjectId()}`, body: {} },
     { method: "post", path: () => `/rules/${new mongoose.Types.ObjectId()}/clone`, body: {} },
@@ -765,6 +814,64 @@ describe("POST /rules/bulk", () => {
   });
 });
 
+describe("GET /rules/:id/audit", () => {
+  it("returns entries newest-first with the performing user resolved to a name", async () => {
+    const r = ruleDoc();
+    const alice = _users.insert({ firstName: "Alice", lastName: "Wong", email: "alice@plumtrips.com" });
+    const bob = _users.insert({ name: "Bob Admin", email: "bob@plumtrips.com" });
+
+    _ruleAudits.insert({ ruleId: r._id, action: "CREATE", changes: [], performedByUserId: bob._id, performedAt: new Date("2026-01-01") });
+    _ruleAudits.insert({ ruleId: r._id, action: "UPDATE", changes: [{ field: "vfsFeeInr", from: 1000, to: 1200 }], performedByUserId: alice._id, performedAt: new Date("2026-02-01") });
+    _ruleAudits.insert({ ruleId: r._id, action: "PUBLISH", changes: [{ field: "status", from: "DRAFT", to: "PUBLISHED" }], performedByUserId: alice._id, performedAt: new Date("2026-03-01") });
+
+    const app = makeApp();
+    const res = await request(app).get(`/rules/${r._id}/audit`);
+    expect(res.status).toBe(200);
+    expect(res.body.entries).toHaveLength(3);
+    expect(res.body.entries.map((e: any) => e.action)).toEqual(["PUBLISH", "UPDATE", "CREATE"]); // newest first
+    expect(res.body.entries[0].performedBy.name).toBe("Alice Wong");
+    expect(res.body.entries[2].performedBy.name).toBe("Bob Admin");
+    expect(res.body.entries[1].changes).toEqual([{ field: "vfsFeeInr", from: 1000, to: 1200 }]);
+  });
+
+  it("falls back to email, then Unknown, when a name isn't available", async () => {
+    const r = ruleDoc();
+    const emailOnly = _users.insert({ email: "noname@plumtrips.com" });
+    _ruleAudits.insert({ ruleId: r._id, action: "CREATE", changes: [], performedByUserId: emailOnly._id, performedAt: new Date() });
+    _ruleAudits.insert({ ruleId: r._id, action: "RETIRE", changes: [], performedByUserId: new mongoose.Types.ObjectId(), performedAt: new Date() });
+
+    const app = makeApp();
+    const res = await request(app).get(`/rules/${r._id}/audit`);
+    const byAction = Object.fromEntries(res.body.entries.map((e: any) => [e.action, e.performedBy.name]));
+    expect(byAction.CREATE).toBe("noname@plumtrips.com");
+    expect(byAction.RETIRE).toBe("Unknown");
+  });
+
+  it("paginates", async () => {
+    const r = ruleDoc();
+    const user = _users.insert({ name: "Alice" });
+    for (let i = 0; i < 5; i++) {
+      _ruleAudits.insert({ ruleId: r._id, action: "UPDATE", changes: [], performedByUserId: user._id, performedAt: new Date(2026, 0, i + 1) });
+    }
+    const app = makeApp();
+    const page1 = await request(app).get(`/rules/${r._id}/audit?page=1&limit=2`);
+    expect(page1.body.entries).toHaveLength(2);
+    expect(page1.body.pagination).toEqual({ page: 1, limit: 2, total: 5, totalPages: 3 });
+    // Newest-first: day 5 then day 4.
+    expect(new Date(page1.body.entries[0].performedAt).getDate()).toBe(5);
+    expect(new Date(page1.body.entries[1].performedAt).getDate()).toBe(4);
+
+    const page2 = await request(app).get(`/rules/${r._id}/audit?page=2&limit=2`);
+    expect(new Date(page2.body.entries[0].performedAt).getDate()).toBe(3);
+  });
+
+  it("404s for a nonexistent rule", async () => {
+    const app = makeApp();
+    const res = await request(app).get(`/rules/${new mongoose.Types.ObjectId()}/audit`);
+    expect(res.status).toBe(404);
+  });
+});
+
 describe("VisaDestinationContent — GET / PATCH / publish", () => {
   it("PATCH upserts — first write creates the row as DRAFT", async () => {
     const app = makeApp();
@@ -781,6 +888,33 @@ describe("VisaDestinationContent — GET / PATCH / publish", () => {
     const app = makeApp();
     const res = await request(app).patch("/destination-content/at").send({ status: "PUBLISHED" });
     expect(res.status).toBe(400);
+  });
+
+  it("exposes seedSource so the UI can flag unreviewed, LLM-authored placeholder rows", async () => {
+    _content.insert({
+      destinationIso2: "KH",
+      status: "DRAFT",
+      businessBlock: { highlights: [] },
+      tourismBlock: { highlights: [] },
+      entrySnapshot: { visaRequired: true, headline: "", summary: "" },
+      seedSource: "seed-visa-rules@2026-07",
+    });
+    _content.insert({
+      destinationIso2: "AT",
+      status: "DRAFT",
+      businessBlock: { highlights: [] },
+      tourismBlock: { highlights: [] },
+      entrySnapshot: { visaRequired: true, headline: "", summary: "" },
+    });
+    const app = makeApp();
+
+    const list = await request(app).get("/destination-content");
+    const byIso2 = Object.fromEntries(list.body.content.map((c: any) => [c.destinationIso2, c.seedSource]));
+    expect(byIso2.KH).toBe("seed-visa-rules@2026-07");
+    expect(byIso2.AT).toBeNull();
+
+    const detail = await request(app).get("/destination-content/kh");
+    expect(detail.body.content.seedSource).toBe("seed-visa-rules@2026-07");
   });
 
   it("rejects publishing without a headline, summary, or any highlight", async () => {
