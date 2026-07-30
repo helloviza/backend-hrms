@@ -128,6 +128,7 @@ vi.mock("../models/VisaApplication.js", async () => {
   const actual: any = await vi.importActual("../models/VisaApplication.js");
   return {
     VISA_APPLICATION_STATUSES: actual.VISA_APPLICATION_STATUSES,
+    VISA_APPLICATION_OUTCOMES: actual.VISA_APPLICATION_OUTCOMES,
     default: {
       countDocuments: async (filter: any) => _applications.query(filter).length,
       find: (filter: any) => chainableArray(() => _applications.query(filter)),
@@ -521,6 +522,65 @@ describe("GET /reports/activity", () => {
     const rows = parseCsv(res.text);
     expect(rows).toHaveLength(2);
     expect(rows[1][3]).toBe("COSTS_RECORDED");
+  });
+
+  it("Phase 9f: ?statusTo narrows STATUS_CHANGED rows to a specific target status (dashboard throughput drilldown)", async () => {
+    const { app1, req1 } = seedFixtures();
+    _activityRows.push({
+      _id: new mongoose.Types.ObjectId(),
+      applicationId: app1._id,
+      requestId: req1._id,
+      workspaceId: WORKSPACE_A,
+      eventType: "STATUS_CHANGED",
+      actorUserId: null,
+      actorType: "STAFF",
+      at: new Date(),
+      detail: { from: "cost_confirmed", to: "lodged" },
+    });
+
+    const res = await request(makeApp()).get("/reports/activity").query({ format: "csv", eventType: "STATUS_CHANGED", statusTo: "lodged" });
+    const rows = parseCsv(res.text);
+    expect(rows).toHaveLength(2); // header + only the lodged transition, not the seeded submitted->docs_under_review one
+    expect(rows[1][6]).toBe("cost_confirmed -> lodged");
+  });
+
+  it("Phase 9f: ?outcome narrows OUTCOME_RECORDED rows to a specific outcome (dashboard outcomes drilldown)", async () => {
+    const { app1, req1 } = seedFixtures();
+    _activityRows.push(
+      {
+        _id: new mongoose.Types.ObjectId(),
+        applicationId: app1._id,
+        requestId: req1._id,
+        workspaceId: WORKSPACE_A,
+        eventType: "OUTCOME_RECORDED",
+        actorUserId: null,
+        actorType: "STAFF",
+        at: new Date(),
+        detail: { outcome: "APPROVED" },
+      },
+      {
+        _id: new mongoose.Types.ObjectId(),
+        applicationId: app1._id,
+        requestId: req1._id,
+        workspaceId: WORKSPACE_A,
+        eventType: "OUTCOME_RECORDED",
+        actorUserId: null,
+        actorType: "STAFF",
+        at: new Date(),
+        detail: { outcome: "REJECTED" },
+      },
+    );
+
+    const res = await request(makeApp()).get("/reports/activity").query({ format: "csv", eventType: "OUTCOME_RECORDED", outcome: "APPROVED" });
+    const rows = parseCsv(res.text);
+    expect(rows).toHaveLength(2); // header + only the APPROVED row
+    expect(rows[1][6]).toBe("Outcome: APPROVED");
+  });
+
+  it("Phase 9f: rejects an invalid ?outcome value", async () => {
+    seedFixtures();
+    const res = await request(makeApp()).get("/reports/activity").query({ format: "csv", outcome: "MAYBE" });
+    expect(res.status).toBe(400);
   });
 
   it("filters by actorUserId server-side", async () => {

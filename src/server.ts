@@ -519,6 +519,14 @@ app.use("/api/admin/visa", adminVisaRulesRouter);
 import adminVisaReportsRouter from "./routes/admin.visa.reports.js";
 app.use("/api/admin/visa", adminVisaReportsRouter);
 
+// Visa module (Phase 9f) — the ops dashboard (queue health, at-risk,
+// workload, throughput, outcomes, value). Same mount prefix again — a
+// fourth router alongside the three above. Gated purely on
+// visaApplication READ, workspace-agnostic by design — see routes/
+// admin.visa.dashboard.ts's file header.
+import adminVisaDashboardRouter from "./routes/admin.visa.dashboard.js";
+app.use("/api/admin/visa", adminVisaDashboardRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";

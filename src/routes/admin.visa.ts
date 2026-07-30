@@ -54,6 +54,7 @@ import { syncVisaApplicationBilling, createVisaWorkStartBooking } from "../servi
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import VisaActivityLog, { logVisaActivity, type VisaActivityEventType } from "../models/VisaActivityLog.js";
+import { assessProcessingRisk } from "../utils/visaEta.js";
 
 const router = Router();
 const adminVisaLogger = logger.child({ module: "admin.visa" });
@@ -264,10 +265,22 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
     const requestById = new Map(requests.map((r: any) => [String(r._id), r]));
 
     const destinationFilter = req.query.destination ? String(req.query.destination).trim().toUpperCase() : null;
+    // Phase 9f — same in-memory-after-join posture as destinationFilter
+    // above: travelDateFrom only exists on the joined VisaRequest, not on
+    // VisaApplication itself, so this can't be a DB-level $match either.
+    // Applied over the already-DB-filtered row set (every OTHER filter
+    // above already ran in the query), never over the whole collection.
+    const atRiskOnly = req.query.atRisk === "true";
 
     let rows = applications
       .map((a: any) => ({ application: a, request: requestById.get(String(a.requestId)) || null }))
-      .filter(({ request }) => !destinationFilter || request?.destinationIso2 === destinationFilter);
+      .filter(({ request }) => !destinationFilter || request?.destinationIso2 === destinationFilter)
+      .filter(({ application: a, request: r }) => {
+        if (!atRiskOnly) return true;
+        if (a.outcome || a.status === "closed" || a.status === "draft") return false; // nothing left to risk
+        const risk = assessProcessingRisk(r?.travelDateFrom, a.ruleSnapshot?.etaMaxDays, a.ruleSnapshot?.etaBasis);
+        return risk?.atRisk === true;
+      });
 
     const workspaceIds = [...new Set(rows.map((r) => String(r.application.workspaceId)))];
     const workspaces = await CustomerWorkspace.find({ _id: { $in: workspaceIds } })

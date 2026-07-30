@@ -58,3 +58,71 @@ export function computeEstimatedDecisionWindow(
     maxDate: addDays(start, etaMaxDays).toISOString(),
   };
 }
+
+function countCalendarDaysBetween(from: Date, to: Date): number {
+  return Math.round((to.getTime() - from.getTime()) / 86400000);
+}
+
+// The inverse of addBusinessDays above: counts Mon–Fri days strictly
+// between `from` and `to`. Symmetric for a `to` before `from` (returns a
+// negative count) — used by assessProcessingRisk below for a travel date
+// already in the past, which must rank as the worst case, not throw or
+// loop forever.
+function countBusinessDaysBetween(from: Date, to: Date): number {
+  const forward = to.getTime() >= from.getTime();
+  const start = forward ? from : to;
+  const end = forward ? to : from;
+  let count = 0;
+  const cur = new Date(start);
+  while (cur.getTime() < end.getTime()) {
+    cur.setDate(cur.getDate() + 1);
+    const day = cur.getDay();
+    if (day !== 0 && day !== 6) count += 1;
+  }
+  return forward ? count : -count;
+}
+
+export interface ProcessingRiskAssessment {
+  atRisk: boolean;
+  availableDays: number; // calendar or business days between `now` and travel, per etaBasis
+  etaMaxDays: number;
+  marginDays: number; // availableDays - etaMaxDays; negative = short by that many days, the worse the more negative
+}
+
+// "AT RISK" (ops dashboard, Phase 9f) — is there still enough runway before
+// travel to plausibly finish processing? Deliberately measured from `now`,
+// not from lodgedAt/submittedAt — this is "how much runway is left right
+// now", not "will the eventual decision window fit" (that's
+// computeEstimatedDecisionWindow's job above, and only answerable once an
+// application has actually been lodged). Applies at any pre-decision
+// stage, lodged or not.
+//
+// Reuses this module's own calendar/business convention (etaBasis ===
+// "BUSINESS" counts Mon-Fri only; anything else, including absent, is
+// CALENDAR — same fallback direction as computeEstimatedDecisionWindow
+// above). Note: apps/frontend/src/pages/visa/apply/warnings.ts's own
+// pre-lodging runway check defaults the OTHER way (missing basis ->
+// BUSINESS) — a pre-existing discrepancy between that module and this one,
+// not resolved here since that file covers a different lifecycle stage
+// (pre-submission, client-side) with its own already-shipped behavior.
+//
+// Returns null when there's nothing to assess (no travel date, or the rule
+// snapshot carries no etaMaxDays) — never a guessed verdict. `now` is an
+// explicit parameter (defaulting to the real current time) so callers —
+// and tests — can pin it rather than depending on wall-clock time.
+export function assessProcessingRisk(
+  travelDateFrom: Date | string | null | undefined,
+  etaMaxDays: number | null | undefined,
+  etaBasis: VisaEtaBasis | string | null | undefined,
+  now: Date = new Date(),
+): ProcessingRiskAssessment | null {
+  if (!travelDateFrom || etaMaxDays == null) return null;
+  const travel = new Date(travelDateFrom);
+  if (Number.isNaN(travel.getTime())) return null;
+
+  const countDays = etaBasis === "BUSINESS" ? countBusinessDaysBetween : countCalendarDaysBetween;
+  const availableDays = countDays(now, travel);
+  const marginDays = availableDays - etaMaxDays;
+
+  return { atRisk: marginDays < 0, availableDays, etaMaxDays, marginDays };
+}

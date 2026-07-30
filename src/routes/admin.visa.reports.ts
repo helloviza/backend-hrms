@@ -38,6 +38,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import VisaApplication, {
   VISA_APPLICATION_STATUSES,
+  VISA_APPLICATION_OUTCOMES,
   type VisaApplicationStatus,
 } from "../models/VisaApplication.js";
 import VisaRequest from "../models/VisaRequest.js";
@@ -454,6 +455,23 @@ router.get("/reports/activity", requirePermission("visaApplication", "READ"), as
         return res.status(400).json({ error: `eventType must be one of ${VISA_ACTIVITY_EVENT_TYPES.join(", ")}` });
       }
       activityFilter.eventType = eventType;
+    }
+    // Phase 9f dashboard drilldowns — narrows a STATUS_CHANGED filter to a
+    // specific target status (e.g. ?eventType=STATUS_CHANGED&statusTo=lodged
+    // for "how many cases were lodged this window") and an OUTCOME_RECORDED
+    // filter to a specific outcome (?eventType=OUTCOME_RECORDED&outcome=
+    // APPROVED). Both just narrow whatever eventType filter is already in
+    // place; neither requires eventType to be set, but only means something
+    // paired with the matching one.
+    if (req.query.statusTo != null) {
+      activityFilter["detail.to"] = String(req.query.statusTo).trim();
+    }
+    if (req.query.outcome != null) {
+      const outcome = String(req.query.outcome).trim().toUpperCase();
+      if (!VISA_APPLICATION_OUTCOMES.includes(outcome as any)) {
+        return res.status(400).json({ error: `outcome must be one of ${VISA_APPLICATION_OUTCOMES.join(", ")}` });
+      }
+      activityFilter["detail.outcome"] = outcome;
     }
 
     // destination/status/assignee aren't fields on VisaActivityLog itself

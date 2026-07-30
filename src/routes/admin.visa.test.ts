@@ -1034,6 +1034,40 @@ describe("GET /queue — cross-workspace", () => {
       expect(res.body.applications[0].id).toBe(String(respondedLodged._id));
     });
   });
+
+  describe("Phase 9f — ?atRisk filter (dashboard drilldown)", () => {
+    it("narrows to only applications whose runway no longer fits etaMaxDays", async () => {
+      const app = makeApp();
+      const soon = new Date(Date.now() + 1 * 86400000);
+      const safe = new Date(Date.now() + 400 * 86400000);
+      const atRisk = applicationDoc(WORKSPACE_A, {
+        status: "lodged",
+        requestId: _requests.insert({ workspaceId: WORKSPACE_A, travelDateFrom: soon })._id,
+        ruleSnapshot: { destinationName: "Germany", etaMaxDays: 15, etaBasis: "CALENDAR" },
+      });
+      applicationDoc(WORKSPACE_B, {
+        status: "docs_under_review",
+        requestId: _requests.insert({ workspaceId: WORKSPACE_B, travelDateFrom: safe })._id,
+        ruleSnapshot: { destinationName: "UAE", etaMaxDays: 5, etaBasis: "CALENDAR" },
+      });
+
+      const res = await request(app).get("/queue").query({ atRisk: "true" });
+      expect(res.body.applications).toHaveLength(1);
+      expect(res.body.applications[0].id).toBe(String(atRisk._id));
+    });
+
+    it("excludes decided, closed, and draft applications even if their dates would otherwise flag at-risk", async () => {
+      const app = makeApp();
+      const soon = new Date(Date.now() + 1 * 86400000);
+      const reqId = _requests.insert({ workspaceId: WORKSPACE_A, travelDateFrom: soon })._id;
+      applicationDoc(WORKSPACE_A, { status: "decision_received", outcome: "APPROVED", requestId: reqId, ruleSnapshot: { etaMaxDays: 15, etaBasis: "CALENDAR" } });
+      applicationDoc(WORKSPACE_A, { status: "closed", requestId: reqId, ruleSnapshot: { etaMaxDays: 15, etaBasis: "CALENDAR" } });
+      applicationDoc(WORKSPACE_A, { status: "draft", requestId: reqId, ruleSnapshot: { etaMaxDays: 15, etaBasis: "CALENDAR" } });
+
+      const res = await request(app).get("/queue").query({ atRisk: "true" });
+      expect(res.body.applications).toHaveLength(0);
+    });
+  });
 });
 
 describe("PATCH /applications/:id/assignment", () => {
