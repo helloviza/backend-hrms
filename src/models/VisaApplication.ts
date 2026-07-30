@@ -148,6 +148,15 @@ export interface VisaApplicationDocument extends Document {
   // path could in principle submit a subset.
   submittedAt?: Date;
 
+  // Set the moment this application's status transitions cost_confirmed ->
+  // lodged (PATCH /applications/:id/status, routes/admin.visa.ts) — never
+  // on creation, never touched again after, and never overwritten by the
+  // action_required side-branch resuming back into "lodged" (that's the
+  // SAME lodging, not a new one). The one timestamp the tracking timeline
+  // (screen 6) can lean on to compute an estimated decision window and to
+  // date the "Submitted to the mission" stage — see utils/visaEta.ts.
+  lodgedAt?: Date;
+
   visaNumber?: string;
   visaIssuedAt?: Date;
   visaExpiresAt?: Date;
@@ -246,6 +255,7 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     actionRequiredSetByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
 
     submittedAt: { type: Date },
+    lodgedAt: { type: Date },
 
     visaNumber: { type: String, trim: true },
     visaIssuedAt: { type: Date },

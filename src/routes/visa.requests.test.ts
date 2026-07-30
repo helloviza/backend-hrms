@@ -15,7 +15,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 
-const { rules, travellers, requests, applications, recomputeRequestStatusMock, resetStores } = vi.hoisted(() => {
+const { rules, travellers, requests, applications, users, recomputeRequestStatusMock, resetStores } = vi.hoisted(() => {
   type Doc = Record<string, any>;
 
   function matches(rec: Doc, filter: Doc): boolean {
@@ -61,18 +61,21 @@ const { rules, travellers, requests, applications, recomputeRequestStatusMock, r
   const travellers = makeCollection();
   const requests = makeCollection();
   const applications = makeCollection();
+  const users = makeCollection();
 
   return {
     rules,
     travellers,
     requests,
     applications,
+    users,
     recomputeRequestStatusMock: vi.fn().mockResolvedValue("draft"),
     resetStores() {
       rules.clear();
       travellers.clear();
       requests.clear();
       applications.clear();
+      users.clear();
     },
   };
 });
@@ -122,6 +125,12 @@ vi.mock("../models/VisaApplication.js", () => ({
   default: {
     insertMany: async (docs: any[]) => docs.map((d) => applications.insert(d)),
     find: (filter: any) => chainable(() => applications.query(filter)),
+  },
+}));
+
+vi.mock("../models/User.js", () => ({
+  default: {
+    findById: (id: any) => chainable(() => users.get(id)),
   },
 }));
 
@@ -393,6 +402,58 @@ describe("GET /requests and GET /requests/:id — workspace scoping", () => {
   it("detail 404s on a well-formed but nonexistent id, not a 500", async () => {
     const res = await request(makeApp(WORKSPACE_A)).get(`/requests/${new mongoose.Types.ObjectId()}`);
     expect(res.status).toBe(404);
+  });
+
+  it("detail's lodgedAt/estimatedDecision/assignedConciergeName are null until lodged/assigned — never guessed", async () => {
+    const created = await createOne(WORKSPACE_A);
+    const requestId = created.request._id;
+
+    const res = await request(makeApp(WORKSPACE_A)).get(`/requests/${requestId}`);
+    expect(res.status).toBe(200);
+    expect(res.body.applications[0].lodgedAt).toBeNull();
+    expect(res.body.applications[0].estimatedDecision).toBeNull();
+    expect(res.body.applications[0].assignedConciergeName).toBeNull();
+  });
+
+  it("detail resolves lodgedAt into an estimatedDecision window (rule snapshot's eta*), and the assigned concierge's name", async () => {
+    const created = await createOne(WORKSPACE_A);
+    const requestId = created.request._id;
+    const appId = created.applications[0]._id;
+
+    // ruleDoc() (the rule this request was created from) carries
+    // etaMinDays: 5, etaMaxDays: 10, etaBasis: "BUSINESS" — copied into
+    // ruleSnapshot at creation time (buildRuleSnapshot, routes/visa.ts).
+    const lodgedAt = new Date("2026-08-03T00:00:00.000Z"); // Monday
+    applications.update(appId, { status: "lodged", lodgedAt });
+    const concierge = users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    requests.update(requestId, { assignedConciergeUserId: concierge._id });
+
+    const res = await request(makeApp(WORKSPACE_A)).get(`/requests/${requestId}`);
+    expect(res.status).toBe(200);
+    const app = res.body.applications[0];
+    expect(new Date(app.lodgedAt).toISOString()).toBe(lodgedAt.toISOString());
+    expect(app.estimatedDecision).toEqual({
+      minDate: new Date("2026-08-10T00:00:00.000Z").toISOString(),
+      maxDate: new Date("2026-08-17T00:00:00.000Z").toISOString(),
+    });
+    expect(app.assignedConciergeName).toBe("Asha Rao");
+  });
+
+  it("GET /requests (list) does NOT compute the derived timeline fields — scoped to the detail route only", async () => {
+    const created = await createOne(WORKSPACE_A);
+    applications.update(created.applications[0]._id, { status: "lodged", lodgedAt: new Date() });
+
+    const res = await request(makeApp(WORKSPACE_A)).get("/requests");
+    expect(res.status).toBe(200);
+    // estimatedDecision/assignedConciergeName require extra derivation (an
+    // ETA computation, a User lookup) — those stay gated behind
+    // hydrateApplicationsWithTravellers' timelineOpts, which only GET
+    // /requests/:id passes. lodgedAt itself is a plain stored field on the
+    // application document, so it passes through either route's `...a`
+    // spread same as any other raw field (submittedAt, status, ...) — never
+    // deliberately gated, nothing to assert against here.
+    expect(res.body.requests[0].applications[0].estimatedDecision).toBeUndefined();
+    expect(res.body.requests[0].applications[0].assignedConciergeName).toBeUndefined();
   });
 });
 

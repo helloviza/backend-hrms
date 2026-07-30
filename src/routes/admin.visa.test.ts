@@ -22,6 +22,7 @@ import mongoose from "mongoose";
 // makeCollection/matches setup, just with five collections instead of two.
 const {
   _applications,
+  _users,
   _requests,
   _travellers,
   _workspaces,
@@ -94,6 +95,7 @@ const {
   }
 
   const _applications = makeCollection();
+  const _users = makeCollection();
 
   // Wraps an application record with .save()/.toObject() — used only for
   // VisaApplication.findById, the one model this router mutates in place.
@@ -126,6 +128,7 @@ const {
 
   return {
     _applications,
+    _users,
     _requests: makeCollection(),
     _travellers: makeCollection(),
     _workspaces: makeCollection(),
@@ -198,8 +201,21 @@ vi.mock("../models/VisaRequest.js", () => ({
   default: {
     find: (filter: any) => chainableArray(() => _requests.query(filter)),
     findById: (id: any) => chainableOne(() => _requests.get(id)),
+    findByIdAndUpdate: async (id: any, update: any) => {
+      const rec = _requests.get(id);
+      if (!rec) return null;
+      Object.assign(rec, update.$set || {});
+      return { ...rec };
+    },
   },
   recomputeRequestStatus: (...args: any[]) => recomputeRequestStatusMock(...args),
+}));
+
+vi.mock("../models/User.js", () => ({
+  default: {
+    findOne: (filter: any) => chainableOne(() => _users.query(filter)[0] ?? null),
+    findById: (id: any) => chainableOne(() => _users.get(id)),
+  },
 }));
 
 vi.mock("../models/TravellerProfile.js", () => ({
@@ -322,6 +338,7 @@ beforeEach(() => {
   _travellers.clear();
   _workspaces.clear();
   _documents.clear();
+  _users.clear();
   recomputeRequestStatusMock.mockClear();
   setActionRequiredMock.mockClear();
   clearActionRequiredMock.mockClear();
@@ -343,6 +360,7 @@ describe("permission gate", () => {
     { method: "patch", path: () => `/documents/${new mongoose.Types.ObjectId()}/review`, body: { reviewStatus: "VERIFIED" } },
     { method: "patch", path: () => `/applications/${new mongoose.Types.ObjectId()}/costs`, body: {} },
     { method: "patch", path: () => `/applications/${new mongoose.Types.ObjectId()}/outcome`, body: {} },
+    { method: "patch", path: () => `/requests/${new mongoose.Types.ObjectId()}/concierge`, body: { email: null } },
   ];
 
   it("403s on every route when the caller has no visaApplication permission record at all", async () => {
@@ -374,6 +392,9 @@ describe("permission gate", () => {
     expect((await request(app).patch(`/applications/${a._id}/status`).send({ status: "docs_under_review" })).status).toBe(403);
     expect((await request(app).patch(`/applications/${a._id}/costs`).send({})).status).toBe(403);
     expect((await request(app).patch(`/applications/${a._id}/outcome`).send({})).status).toBe(403);
+
+    const req = _requests.insert({ workspaceId: WORKSPACE_A });
+    expect((await request(app).patch(`/requests/${req._id}/concierge`).send({ email: null })).status).toBe(403);
   });
 
   it("WRITE can work applications (status/action_required) but cannot set costs or outcome", async () => {
@@ -400,6 +421,28 @@ describe("permission gate", () => {
 
     const outcomeRes = await request(app).patch(`/applications/${a._id}/outcome`).send({ outcome: "WITHDRAWN" });
     expect(outcomeRes.status).toBe(200);
+  });
+});
+
+describe("GET /applications/:id — detail", () => {
+  it("assignedConcierge is null when the parent request has no assignedConciergeUserId", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A);
+
+    const res = await request(app).get(`/applications/${a._id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.assignedConcierge).toBeNull();
+  });
+
+  it("resolves the assigned concierge's name/email from the parent request", async () => {
+    const app = makeApp();
+    const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    const requestId = _requests.insert({ workspaceId: WORKSPACE_A, assignedConciergeUserId: concierge._id })._id;
+    const a = applicationDoc(WORKSPACE_A, { requestId });
+
+    const res = await request(app).get(`/applications/${a._id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.assignedConcierge).toEqual({ name: "Asha Rao", email: "asha@plumtrips.com" });
   });
 });
 
@@ -438,6 +481,33 @@ describe("PATCH /applications/:id/status — state machine", () => {
     expect(_applications.get(a._id).status).toBe("cost_confirmed");
     expect(recomputeRequestStatusMock).toHaveBeenCalledTimes(1);
     expect(String(recomputeRequestStatusMock.mock.calls[0][0])).toBe(String(a.requestId));
+  });
+
+  it("stamps lodgedAt on the cost_confirmed -> lodged transition, and never earlier", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "cost_confirmed" });
+    expect(_applications.get(a._id).lodgedAt).toBeUndefined();
+
+    const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: "lodged" });
+    expect(res.status).toBe(200);
+    expect(_applications.get(a._id).lodgedAt).toBeInstanceOf(Date);
+    expect(res.body.application.lodgedAt).toBeTruthy();
+  });
+
+  it("does not re-stamp lodgedAt when action_required is cleared back to lodged", async () => {
+    const app = makeApp();
+    const originalLodgedAt = new Date("2026-08-01T00:00:00.000Z");
+    const a = applicationDoc(WORKSPACE_A, {
+      status: "action_required",
+      lodgedAt: originalLodgedAt,
+      actionRequiredReason: "Missing bank stamp",
+      actionRequiredSetAt: new Date(),
+      actionRequiredSetByUserId: USER_ID,
+    });
+
+    const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: "lodged" });
+    expect(res.status).toBe(200);
+    expect(_applications.get(a._id).lodgedAt).toEqual(originalLodgedAt);
   });
 
   it("rejects setting action_required with no reason, and touches nothing", async () => {
@@ -743,5 +813,55 @@ describe("GET /queue — cross-workspace", () => {
     applicationDoc(WORKSPACE_A, { status: "draft" });
     const res = await request(app).get("/queue");
     expect(res.body.applications).toHaveLength(0);
+  });
+});
+
+describe("PATCH /requests/:id/concierge", () => {
+  beforeEach(() => setAccess("WRITE"));
+
+  it("404s on a well-formed but nonexistent request id", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .patch(`/requests/${new mongoose.Types.ObjectId()}/concierge`)
+      .send({ email: "concierge@plumtrips.com" });
+    expect(res.status).toBe(404);
+  });
+
+  it("404s with a clear message on an unrecognised email, and assigns nothing", async () => {
+    const app = makeApp();
+    const req = _requests.insert({ workspaceId: WORKSPACE_A });
+    const res = await request(app)
+      .patch(`/requests/${req._id}/concierge`)
+      .send({ email: "nobody@plumtrips.com" });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/no staff user found/i);
+    expect(_requests.get(req._id).assignedConciergeUserId).toBeUndefined();
+  });
+
+  it("assigns by email, resolving and returning the concierge's name", async () => {
+    const app = makeApp();
+    const req = _requests.insert({ workspaceId: WORKSPACE_A });
+    const concierge = _users.insert({ email: "asha@plumtrips.com", name: "Asha Rao" });
+
+    const res = await request(app)
+      .patch(`/requests/${req._id}/concierge`)
+      .send({ email: "asha@plumtrips.com" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.assignedConciergeName).toBe("Asha Rao");
+    expect(String(res.body.assignedConciergeUserId)).toBe(String(concierge._id));
+    expect(String(_requests.get(req._id).assignedConciergeUserId)).toBe(String(concierge._id));
+  });
+
+  it("unassigns when email is null — degrades cleanly, no dangling reference", async () => {
+    const app = makeApp();
+    const concierge = _users.insert({ email: "asha@plumtrips.com", name: "Asha Rao" });
+    const req = _requests.insert({ workspaceId: WORKSPACE_A, assignedConciergeUserId: concierge._id });
+
+    const res = await request(app).patch(`/requests/${req._id}/concierge`).send({ email: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.assignedConciergeName).toBeNull();
+    expect(_requests.get(req._id).assignedConciergeUserId).toBeNull();
   });
 });

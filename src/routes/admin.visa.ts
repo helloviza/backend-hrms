@@ -41,6 +41,7 @@ import VisaRequest, { recomputeRequestStatus } from "../models/VisaRequest.js";
 import VisaDocument from "../models/VisaDocument.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import User from "../models/User.js";
 import { visaDocumentUploadMw, createVisaDocumentUpload } from "./visa.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { syncVisaApplicationBilling } from "../services/visaBillingSync.js";
@@ -113,6 +114,7 @@ function mapAdminApplicationSummary(a: any) {
     actualPlumtripsServiceFeeInr: a.actualPlumtripsServiceFeeInr ?? null,
     actualTotalInr: a.actualTotalInr ?? null,
     submittedAt: a.submittedAt ?? null,
+    lodgedAt: a.lodgedAt ?? null,
     visaNumber: a.visaNumber ?? null,
     visaIssuedAt: a.visaIssuedAt ?? null,
     visaExpiresAt: a.visaExpiresAt ?? null,
@@ -280,6 +282,16 @@ router.get("/applications/:id", requirePermission("visaApplication", "READ"), as
         .lean(),
     ]);
 
+    let assignedConcierge: { name: string | null; email: string | null } | null = null;
+    if ((visaRequest as any)?.assignedConciergeUserId) {
+      const concierge = await User.findById((visaRequest as any).assignedConciergeUserId)
+        .select("name email")
+        .lean();
+      if (concierge) {
+        assignedConcierge = { name: (concierge as any).name ?? null, email: (concierge as any).email ?? null };
+      }
+    }
+
     const requestedBy = actorId(req);
     adminVisaLogger.info("visa application detail accessed (unmasked passport)", {
       userId: requestedBy ? String(requestedBy) : null,
@@ -308,6 +320,7 @@ router.get("/applications/:id", requirePermission("visaApplication", "READ"), as
           }
         : null,
       request: visaRequest || null,
+      assignedConcierge,
       workspace: workspace
         ? { id: String((workspace as any)._id), name: (workspace as any).companyName, customerId: (workspace as any).customerId }
         : null,
@@ -399,9 +412,17 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
       // between the read above and this write loses the race cleanly
       // (409), rather than silently clobbering whatever the other caller
       // just set.
+      //
+      // lodgedAt is stamped ONLY on this specific cost_confirmed -> lodged
+      // transition — the state machine above guarantees that's the only way
+      // to reach "lodged" from here (the action_required side-branch above
+      // resumes back into an EXISTING lodging, never through this table, so
+      // it can never re-stamp it).
+      const update: Record<string, unknown> = { status: target };
+      if (target === "lodged") update.lodgedAt = new Date();
       const updated = await VisaApplication.findOneAndUpdate(
         { _id: id, status: current },
-        { $set: { status: target } },
+        { $set: update },
         { new: true },
       );
       if (!updated) {
@@ -741,5 +762,50 @@ router.patch(
     }
   },
 );
+
+/* ─────────────────────────────────────────────────────────────────────
+ * PATCH /requests/:id/concierge — assign (or clear) the one concierge
+ * point-of-contact for a request. Body: { email: string | null }. Optional
+ * by design (models/VisaRequest.ts's doc comment) — every consumer must
+ * already degrade to a generic "your concierge team" when this is unset;
+ * this route is just what sets/clears it.
+ *
+ * Resolves by email rather than accepting a raw userId directly — there is
+ * no staff-directory picker in this console yet (out of scope here), and an
+ * email is what an agent actually has on hand for a colleague. 404s with a
+ * clear message on an unrecognised email rather than silently assigning a
+ * bad reference. { email: null } (or an empty string) unassigns.
+ * ───────────────────────────────────────────────────────────────────── */
+router.patch("/requests/:id/concierge", requirePermission("visaApplication", "WRITE"), async (req: any, res: any) => {
+  try {
+    const id = req.params.id;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(404).json({ error: "Visa request not found" });
+    }
+
+    const visaRequest = await VisaRequest.findById(id).lean();
+    if (!visaRequest) return res.status(404).json({ error: "Visa request not found" });
+
+    const email = String(req.body?.email || "").trim();
+    let assignedConciergeUserId: any = null;
+    let assignedConciergeName: string | null = null;
+
+    if (email) {
+      const user = await User.findOne({ email: email.toLowerCase() }).select("name email").lean();
+      if (!user) {
+        return res.status(404).json({ error: `No staff user found with email '${email}'` });
+      }
+      assignedConciergeUserId = (user as any)._id;
+      assignedConciergeName = (user as any).name || (user as any).email || null;
+    }
+
+    await VisaRequest.findByIdAndUpdate(id, { $set: { assignedConciergeUserId } });
+
+    res.json({ ok: true, assignedConciergeUserId: assignedConciergeUserId ? String(assignedConciergeUserId) : null, assignedConciergeName });
+  } catch (err: any) {
+    console.error("[admin visa request concierge PATCH]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to assign concierge" });
+  }
+});
 
 export default router;

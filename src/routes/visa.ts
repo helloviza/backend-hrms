@@ -69,10 +69,12 @@ import VisaApplication, {
 import VisaDocument from "../models/VisaDocument.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import TravelBooking from "../models/TravelBooking.js";
+import User from "../models/User.js";
 import { getCountryByIso2, normaliseToIso2 } from "../utils/countryCodes.js";
 import { getVisaDocumentCodeDef, VISA_DOCUMENT_CODE_SET } from "../config/visaDocumentCodes.js";
 import { CURRENT_VISA_CONSENT_VERSION } from "../config/visaConsent.js";
 import { computeVisaFeeBlock } from "../utils/visaFee.js";
+import { computeEstimatedDecisionWindow } from "../utils/visaEta.js";
 import { maskTailId } from "../utils/piiMask.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
@@ -465,7 +467,17 @@ function travellerDisplayName(t: any): string {
 // strings would. (Screen 4, apps/frontend/src/pages/visa/documents, used to
 // carry its own frontend copy of that catalogue to work around this
 // endpoint not hydrating — deleted once this hydration landed.)
-async function hydrateApplicationsWithTravellers(applications: any[], workspaceId: any) {
+// timeline opts are only ever populated by GET /requests/:id — the task
+// brief scopes the timeline fields to that route specifically, not the
+// GET /requests list (screen 7 already answers "where is everything"
+// without them; adding them there would mean resolving a User lookup and
+// re-computing an ETA window for every application in the workspace on
+// every list load, for data screen 7 never renders).
+async function hydrateApplicationsWithTravellers(
+  applications: any[],
+  workspaceId: any,
+  timelineOpts?: { assignedConciergeName: string | null },
+) {
   const travellerIds = applications.map((a) => a.travellerProfileId);
   const travellers = await TravellerProfile.find({ _id: { $in: travellerIds }, workspaceId })
     .select("firstName middleName lastName dob email nationality passportNo passportExpiry")
@@ -476,7 +488,7 @@ async function hydrateApplicationsWithTravellers(applications: any[], workspaceI
     const traveller = travellerById.get(String(a.travellerProfileId)) || null;
     const linkedBookings = a.linkedBookings || [];
     const linkedServices = new Set<string>(linkedBookings.map((lb: any) => lb.service));
-    return {
+    const base = {
       ...a,
       linkedBookings,
       ruleSnapshot: {
@@ -494,6 +506,25 @@ async function hydrateApplicationsWithTravellers(applications: any[], workspaceI
             passportExpiry: traveller.passportExpiry ?? null,
           }
         : null,
+    };
+
+    if (!timelineOpts) return base;
+
+    return {
+      ...base,
+      lodgedAt: a.lodgedAt ?? null,
+      assignedConciergeName: timelineOpts.assignedConciergeName,
+      // Per-application, not per-request — each traveller's own passport
+      // lodges (and is decided) independently, even though they share one
+      // VisaRequest. Null until THIS application has actually been lodged
+      // (computeEstimatedDecisionWindow's own null-propagation) — never a
+      // guessed window (task brief).
+      estimatedDecision: computeEstimatedDecisionWindow(
+        a.lodgedAt,
+        a.ruleSnapshot?.etaMinDays,
+        a.ruleSnapshot?.etaMaxDays,
+        a.ruleSnapshot?.etaBasis,
+      ),
     };
   });
 }
@@ -660,6 +691,13 @@ router.get("/requests", async (req: any, res: any) => {
 /* ─────────────────────────────────────────────────────────────────────
  * GET /requests/:id — workspace-scoped detail, with applications and
  * their travellers.
+ *
+ * Screen 6 (tracking detail) additions — each application in the response
+ * also carries lodgedAt, assignedConciergeName (resolved from the parent
+ * VisaRequest's assignedConciergeUserId, shared by every traveller on this
+ * request), and estimatedDecision. assignedConciergeName is null — never
+ * omitted, never a placeholder string — when unset; the frontend is what
+ * degrades that to "your concierge team" (task brief).
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/requests/:id", async (req: any, res: any) => {
   try {
@@ -673,8 +711,16 @@ router.get("/requests/:id", async (req: any, res: any) => {
       return res.status(404).json({ error: "Visa request not found" });
     }
 
+    let assignedConciergeName: string | null = null;
+    if ((visaRequest as any).assignedConciergeUserId) {
+      const concierge = await User.findById((visaRequest as any).assignedConciergeUserId)
+        .select("name email")
+        .lean();
+      assignedConciergeName = (concierge as any)?.name || (concierge as any)?.email || null;
+    }
+
     const applications = await VisaApplication.find({ requestId: visaRequest._id, workspaceId }).lean();
-    const hydrated = await hydrateApplicationsWithTravellers(applications, workspaceId);
+    const hydrated = await hydrateApplicationsWithTravellers(applications, workspaceId, { assignedConciergeName });
 
     res.json({ ok: true, request: visaRequest, applications: hydrated });
   } catch (err: any) {

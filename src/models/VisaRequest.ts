@@ -42,6 +42,15 @@ export interface VisaRequestDocument extends Document {
   cancelledAt?: Date;
   cancelledByUserId?: mongoose.Types.ObjectId; // ref User
 
+  // Optional by design (task brief) — set from the concierge console via
+  // PATCH /api/admin/visa/requests/:id/concierge (routes/admin.visa.ts,
+  // WRITE-gated), never by the applicant. One concierge per REQUEST, not
+  // per application — every traveller on the same trip shares one point of
+  // contact. Every consumer (the tracking timeline, GET /requests/:id) must
+  // degrade to a generic "your concierge team" when this is unset; nothing
+  // should ever assume it's populated.
+  assignedConciergeUserId?: mongoose.Types.ObjectId; // ref User
+
   // Screen 5 (review & submit) consent — set ONCE, atomically, by POST
   // /requests/:id/submit (routes/visa.ts), which also uses
   // consentAcceptedAt's null-ness as the idempotency boundary: a request
@@ -69,6 +78,7 @@ const VisaRequestSchema = new Schema<VisaRequestDocument>(
     applicationIds: { type: [Schema.Types.ObjectId], ref: "VisaApplication", default: [] },
     cancelledAt: { type: Date },
     cancelledByUserId: { type: Schema.Types.ObjectId, ref: "User" },
+    assignedConciergeUserId: { type: Schema.Types.ObjectId, ref: "User" },
     // default: null (not undefined) — POST /requests/:id/submit's atomic
     // claim filters on { consentAcceptedAt: null }, and an explicit null
     // keeps that filter's semantics obvious rather than leaning on Mongo's
