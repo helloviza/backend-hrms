@@ -42,6 +42,13 @@ const {
       if ("$ne" in cond) return String(val) !== String(cond.$ne);
       if ("$in" in cond) return (cond.$in as any[]).map(String).includes(String(val));
     }
+    // Real Mongo semantics: querying a field against literal null matches
+    // BOTH an explicit null and a missing/undefined field — not just a
+    // literal stored null. Needed for the assignment "unassigned" queue
+    // filter, which queries assignedConciergeUserId/assignedScreeningOfficerId
+    // against null and must also match applications that never had the
+    // field set at all.
+    if (cond === null) return val === null || val === undefined;
     return String(val) === String(cond);
   }
 
@@ -164,10 +171,26 @@ vi.mock("../models/VisaApplication.js", async () => {
         Object.assign(rec, update.$set || {});
         return { ...rec };
       },
+      findByIdAndUpdate: (id: any, update: any) =>
+        chainableOne(() => {
+          const rec = _applications.get(id);
+          if (!rec) return null;
+          if (update.$set) Object.assign(rec, update.$set);
+          if (update.$unset) for (const key of Object.keys(update.$unset)) delete rec[key];
+          return { ...rec };
+        }),
       updateOne: async (filter: any, update: any) => {
         const rec = _applications.query(filter)[0];
         if (rec) Object.assign(rec, update.$set || {});
         return { acknowledged: true, matchedCount: rec ? 1 : 0 };
+      },
+      updateMany: async (filter: any, update: any) => {
+        const recs = _applications.query(filter);
+        for (const rec of recs) {
+          if (update.$set) Object.assign(rec, update.$set);
+          if (update.$unset) for (const key of Object.keys(update.$unset)) delete rec[key];
+        }
+        return { acknowledged: true, matchedCount: recs.length, modifiedCount: recs.length };
       },
     },
     // Mirrors the real models/VisaApplication.ts behavior (unit-tested
@@ -226,6 +249,7 @@ vi.mock("../models/User.js", () => ({
   default: {
     findOne: (filter: any) => chainableOne(() => _users.query(filter)[0] ?? null),
     findById: (id: any) => chainableOne(() => _users.get(id)),
+    find: (filter: any) => chainableArray(() => _users.query(filter)),
   },
 }));
 
@@ -281,10 +305,47 @@ vi.mock("../middleware/auth.js", () => ({
   default: (_req: any, _res: any, next: any) => next(),
 }));
 
+// permissionRecord: the CALLING user's own permission — what requirePermission
+// itself checks (via setAccess(), keyed implicitly to USER_ID/makeApp()).
+// _userPermissions: a small fake collection of OTHER users' grants — what
+// admin.visa.ts's own assignment-validation code and GET /assignable-users
+// look up for a TARGET user (grantVisaPermission()). Two different concerns
+// sharing one mocked model, distinguished below by whether filter.userId is
+// the caller's own id.
 let permissionRecord: any = null;
+const _userPermissions: any[] = [];
+
+function permPath(obj: any, path: string): any {
+  return path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+function matchesPermFilter(rec: any, filter: any): boolean {
+  return Object.entries(filter).every(([key, cond]) => {
+    const val = permPath(rec, key);
+    if (cond && typeof cond === "object" && cond !== null) {
+      if ("$in" in cond) return (cond.$in as any[]).map(String).includes(String(val));
+      if ("$ne" in cond) return String(val) !== String(cond.$ne);
+    }
+    return String(val) === String(cond);
+  });
+}
+function grantVisaPermission(userId: any, access: "READ" | "WRITE" | "FULL", opts: { level?: string; status?: string } = {}) {
+  _userPermissions.push({
+    userId: String(userId),
+    modules: { visaApplication: { access, scope: "ALL" } },
+    level: { code: opts.level ?? "L4" },
+    status: opts.status ?? "active",
+  });
+}
+
 vi.mock("../models/UserPermission.js", () => ({
   UserPermission: {
-    findOne: (_filter: any) => ({ lean: () => Promise.resolve(permissionRecord) }),
+    findOne: (filter: any) =>
+      chainableOne(() => {
+        const uid = String(filter?.userId ?? "");
+        if (uid === String(USER_ID)) return permissionRecord;
+        return _userPermissions.find((r) => matchesPermFilter(r, filter)) ?? null;
+      }),
+    find: (filter: any) => chainableArray(() => _userPermissions.filter((r) => matchesPermFilter(r, filter))),
   },
   hasAccess: (actual: string, required: string) => {
     const order = ["NONE", "READ", "WRITE", "FULL"];
@@ -350,6 +411,7 @@ beforeEach(() => {
   _workspaces.clear();
   _documents.clear();
   _users.clear();
+  _userPermissions.length = 0;
   recomputeRequestStatusMock.mockClear();
   setActionRequiredMock.mockClear();
   clearActionRequiredMock.mockClear();
@@ -363,7 +425,7 @@ beforeEach(() => {
 });
 
 describe("permission gate", () => {
-  const ROUTES: Array<{ method: "get" | "patch"; path: () => string; body?: any }> = [
+  const ROUTES: Array<{ method: "get" | "patch" | "post"; path: () => string; body?: any }> = [
     { method: "get", path: () => "/queue" },
     { method: "get", path: () => `/applications/${new mongoose.Types.ObjectId()}` },
     { method: "get", path: () => `/documents/${new mongoose.Types.ObjectId()}/url` },
@@ -371,7 +433,9 @@ describe("permission gate", () => {
     { method: "patch", path: () => `/documents/${new mongoose.Types.ObjectId()}/review`, body: { reviewStatus: "VERIFIED" } },
     { method: "patch", path: () => `/applications/${new mongoose.Types.ObjectId()}/costs`, body: {} },
     { method: "patch", path: () => `/applications/${new mongoose.Types.ObjectId()}/outcome`, body: {} },
-    { method: "patch", path: () => `/requests/${new mongoose.Types.ObjectId()}/concierge`, body: { email: null } },
+    { method: "patch", path: () => `/applications/${new mongoose.Types.ObjectId()}/assignment`, body: {} },
+    { method: "post", path: () => "/applications/bulk-assign", body: {} },
+    { method: "get", path: () => "/assignable-users" },
   ];
 
   it("403s on every route when the caller has no visaApplication permission record at all", async () => {
@@ -403,9 +467,8 @@ describe("permission gate", () => {
     expect((await request(app).patch(`/applications/${a._id}/status`).send({ status: "docs_under_review" })).status).toBe(403);
     expect((await request(app).patch(`/applications/${a._id}/costs`).send({})).status).toBe(403);
     expect((await request(app).patch(`/applications/${a._id}/outcome`).send({})).status).toBe(403);
-
-    const req = _requests.insert({ workspaceId: WORKSPACE_A });
-    expect((await request(app).patch(`/requests/${req._id}/concierge`).send({ email: null })).status).toBe(403);
+    expect((await request(app).patch(`/applications/${a._id}/assignment`).send({ assignedConciergeUserId: null })).status).toBe(403);
+    expect((await request(app).post("/applications/bulk-assign").send({ applicationIds: [String(a._id)] })).status).toBe(403);
   });
 
   it("WRITE can work applications (status/action_required) but cannot set costs or outcome", async () => {
@@ -436,24 +499,29 @@ describe("permission gate", () => {
 });
 
 describe("GET /applications/:id — detail", () => {
-  it("assignedConcierge is null when the parent request has no assignedConciergeUserId", async () => {
+  it("assignedConcierge/assignedScreeningOfficer are null when the application has neither assigned", async () => {
     const app = makeApp();
     const a = applicationDoc(WORKSPACE_A);
 
     const res = await request(app).get(`/applications/${a._id}`);
     expect(res.status).toBe(200);
     expect(res.body.assignedConcierge).toBeNull();
+    expect(res.body.assignedScreeningOfficer).toBeNull();
   });
 
-  it("resolves the assigned concierge's name/email from the parent request", async () => {
+  it("resolves both assignees' names/emails from the application's own assignment fields", async () => {
     const app = makeApp();
     const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
-    const requestId = _requests.insert({ workspaceId: WORKSPACE_A, assignedConciergeUserId: concierge._id })._id;
-    const a = applicationDoc(WORKSPACE_A, { requestId });
+    const officer = _users.insert({ name: "Ravi Kumar", email: "ravi@plumtrips.com" });
+    const a = applicationDoc(WORKSPACE_A, {
+      assignedConciergeUserId: concierge._id,
+      assignedScreeningOfficerId: officer._id,
+    });
 
     const res = await request(app).get(`/applications/${a._id}`);
     expect(res.status).toBe(200);
-    expect(res.body.assignedConcierge).toEqual({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    expect(res.body.assignedConcierge).toEqual({ id: String(concierge._id), name: "Asha Rao", email: "asha@plumtrips.com" });
+    expect(res.body.assignedScreeningOfficer).toEqual({ id: String(officer._id), name: "Ravi Kumar", email: "ravi@plumtrips.com" });
   });
 });
 
@@ -848,52 +916,306 @@ describe("GET /queue — cross-workspace", () => {
   });
 });
 
-describe("PATCH /requests/:id/concierge", () => {
+describe("PATCH /applications/:id/assignment", () => {
   beforeEach(() => setAccess("WRITE"));
 
-  it("404s on a well-formed but nonexistent request id", async () => {
+  it("404s on a well-formed but nonexistent application id", async () => {
     const app = makeApp();
     const res = await request(app)
-      .patch(`/requests/${new mongoose.Types.ObjectId()}/concierge`)
-      .send({ email: "concierge@plumtrips.com" });
+      .patch(`/applications/${new mongoose.Types.ObjectId()}/assignment`)
+      .send({ assignedConciergeUserId: null });
     expect(res.status).toBe(404);
   });
 
-  it("404s with a clear message on an unrecognised email, and assigns nothing", async () => {
+  it("400s when neither role key is present in the body", async () => {
     const app = makeApp();
-    const req = _requests.insert({ workspaceId: WORKSPACE_A });
+    const a = applicationDoc(WORKSPACE_A);
+    const res = await request(app).patch(`/applications/${a._id}/assignment`).send({});
+    expect(res.status).toBe(400);
+  });
+
+  it("assigns both roles in one call, stamping assignedAt/assignedByUserId for each independently", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A);
+    const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    const officer = _users.insert({ name: "Ravi Kumar", email: "ravi@plumtrips.com" });
+    grantVisaPermission(concierge._id, "WRITE");
+    grantVisaPermission(officer._id, "FULL");
+
+    const res = await request(app).patch(`/applications/${a._id}/assignment`).send({
+      assignedConciergeUserId: String(concierge._id),
+      assignedScreeningOfficerId: String(officer._id),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.application.assignedConciergeUserId).toBe(String(concierge._id));
+    expect(res.body.application.assignedScreeningOfficerId).toBe(String(officer._id));
+
+    const stored = _applications.get(a._id);
+    expect(String(stored.assignedConciergeUserId)).toBe(String(concierge._id));
+    expect(stored.assignedConciergeAssignedAt).toBeInstanceOf(Date);
+    expect(String(stored.assignedConciergeAssignedByUserId)).toBe(String(USER_ID));
+    expect(String(stored.assignedScreeningOfficerId)).toBe(String(officer._id));
+    expect(stored.assignedScreeningOfficerAssignedAt).toBeInstanceOf(Date);
+  });
+
+  it("rejects assigning a user who does not hold visaApplication WRITE — nothing is applied", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A);
+    const noAccess = _users.insert({ name: "Priya", email: "priya@plumtrips.com" });
+    grantVisaPermission(noAccess._id, "READ"); // READ is not enough to be assigned a case
+
     const res = await request(app)
-      .patch(`/requests/${req._id}/concierge`)
-      .send({ email: "nobody@plumtrips.com" });
+      .patch(`/applications/${a._id}/assignment`)
+      .send({ assignedConciergeUserId: String(noAccess._id) });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/does not have visaApplication write access/i);
+    expect(_applications.get(a._id).assignedConciergeUserId).toBeUndefined();
+  });
+
+  it("rejects assigning a user with no visaApplication grant at all", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A);
+    const stranger = _users.insert({ name: "Nobody", email: "nobody@plumtrips.com" });
+
+    const res = await request(app)
+      .patch(`/applications/${a._id}/assignment`)
+      .send({ assignedScreeningOfficerId: String(stranger._id) });
+
+    expect(res.status).toBe(400);
+    expect(_applications.get(a._id).assignedScreeningOfficerId).toBeUndefined();
+  });
+
+  it("allows assigning a SUPERADMIN even with no explicit UserPermission grant — they bypass the gate by role", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A);
+    const admin = _users.insert({ name: "Sam Boss", email: "sam@plumtrips.com", roles: ["SUPERADMIN"] });
+
+    const res = await request(app)
+      .patch(`/applications/${a._id}/assignment`)
+      .send({ assignedConciergeUserId: String(admin._id) });
+
+    expect(res.status).toBe(200);
+    expect(String(_applications.get(a._id).assignedConciergeUserId)).toBe(String(admin._id));
+  });
+
+  it("404s when the assignee id doesn't resolve to any user", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A);
+    const res = await request(app)
+      .patch(`/applications/${a._id}/assignment`)
+      .send({ assignedConciergeUserId: String(new mongoose.Types.ObjectId()) });
     expect(res.status).toBe(404);
-    expect(res.body.error).toMatch(/no staff user found/i);
-    expect(_requests.get(req._id).assignedConciergeUserId).toBeUndefined();
   });
 
-  it("assigns by email, resolving and returning the concierge's name", async () => {
+  it("400s on a malformed assignee id", async () => {
     const app = makeApp();
-    const req = _requests.insert({ workspaceId: WORKSPACE_A });
-    const concierge = _users.insert({ email: "asha@plumtrips.com", name: "Asha Rao" });
+    const a = applicationDoc(WORKSPACE_A);
+    const res = await request(app).patch(`/applications/${a._id}/assignment`).send({ assignedConciergeUserId: "not-an-id" });
+    expect(res.status).toBe(400);
+  });
+
+  it("clearing one role leaves the other intact", async () => {
+    const app = makeApp();
+    const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    const officer = _users.insert({ name: "Ravi Kumar", email: "ravi@plumtrips.com" });
+    grantVisaPermission(concierge._id, "WRITE");
+    grantVisaPermission(officer._id, "WRITE");
+    const a = applicationDoc(WORKSPACE_A, {
+      assignedConciergeUserId: concierge._id,
+      assignedConciergeAssignedAt: new Date("2026-01-01"),
+      assignedConciergeAssignedByUserId: USER_ID,
+      assignedScreeningOfficerId: officer._id,
+      assignedScreeningOfficerAssignedAt: new Date("2026-01-01"),
+      assignedScreeningOfficerAssignedByUserId: USER_ID,
+    });
 
     const res = await request(app)
-      .patch(`/requests/${req._id}/concierge`)
-      .send({ email: "asha@plumtrips.com" });
+      .patch(`/applications/${a._id}/assignment`)
+      .send({ assignedConciergeUserId: null });
 
     expect(res.status).toBe(200);
-    expect(res.body.assignedConciergeName).toBe("Asha Rao");
-    expect(String(res.body.assignedConciergeUserId)).toBe(String(concierge._id));
-    expect(String(_requests.get(req._id).assignedConciergeUserId)).toBe(String(concierge._id));
+    const stored = _applications.get(a._id);
+    expect(stored.assignedConciergeUserId).toBeNull();
+    expect(stored.assignedConciergeAssignedAt).toBeNull();
+    expect(stored.assignedConciergeAssignedByUserId).toBeNull();
+    // Untouched — the screening officer role was never in this request's body.
+    expect(String(stored.assignedScreeningOfficerId)).toBe(String(officer._id));
+    expect(stored.assignedScreeningOfficerAssignedAt).toEqual(new Date("2026-01-01"));
+  });
+});
+
+describe("POST /applications/bulk-assign", () => {
+  beforeEach(() => setAccess("WRITE"));
+
+  it("400s on an empty applicationIds array", async () => {
+    const app = makeApp();
+    const res = await request(app).post("/applications/bulk-assign").send({ applicationIds: [] });
+    expect(res.status).toBe(400);
   });
 
-  it("unassigns when email is null — degrades cleanly, no dangling reference", async () => {
+  it("assigns the same concierge to every application in the batch in one call", async () => {
     const app = makeApp();
-    const concierge = _users.insert({ email: "asha@plumtrips.com", name: "Asha Rao" });
-    const req = _requests.insert({ workspaceId: WORKSPACE_A, assignedConciergeUserId: concierge._id });
+    const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    grantVisaPermission(concierge._id, "WRITE");
+    const a1 = applicationDoc(WORKSPACE_A);
+    const a2 = applicationDoc(WORKSPACE_A);
+    const a3 = applicationDoc(WORKSPACE_A);
 
-    const res = await request(app).patch(`/requests/${req._id}/concierge`).send({ email: null });
+    const res = await request(app).post("/applications/bulk-assign").send({
+      applicationIds: [String(a1._id), String(a2._id), String(a3._id)],
+      assignedConciergeUserId: String(concierge._id),
+    });
 
     expect(res.status).toBe(200);
-    expect(res.body.assignedConciergeName).toBeNull();
-    expect(_requests.get(req._id).assignedConciergeUserId).toBeNull();
+    expect(res.body.updated).toBe(3);
+    for (const a of [a1, a2, a3]) {
+      expect(String(_applications.get(a._id).assignedConciergeUserId)).toBe(String(concierge._id));
+    }
+  });
+
+  it("is atomic — one nonexistent applicationId means NONE of the batch is touched", async () => {
+    const app = makeApp();
+    const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    grantVisaPermission(concierge._id, "WRITE");
+    const a1 = applicationDoc(WORKSPACE_A);
+    const a2 = applicationDoc(WORKSPACE_A);
+    const missingId = new mongoose.Types.ObjectId();
+
+    const res = await request(app).post("/applications/bulk-assign").send({
+      applicationIds: [String(a1._id), String(a2._id), String(missingId)],
+      assignedConciergeUserId: String(concierge._id),
+    });
+
+    expect(res.status).toBe(404);
+    expect(_applications.get(a1._id).assignedConciergeUserId).toBeUndefined();
+    expect(_applications.get(a2._id).assignedConciergeUserId).toBeUndefined();
+  });
+
+  it("is atomic — an assignee without permission means NONE of the batch is touched", async () => {
+    const app = makeApp();
+    const noAccess = _users.insert({ name: "Priya", email: "priya@plumtrips.com" });
+    const a1 = applicationDoc(WORKSPACE_A);
+    const a2 = applicationDoc(WORKSPACE_A);
+
+    const res = await request(app).post("/applications/bulk-assign").send({
+      applicationIds: [String(a1._id), String(a2._id)],
+      assignedScreeningOfficerId: String(noAccess._id),
+    });
+
+    expect(res.status).toBe(400);
+    expect(_applications.get(a1._id).assignedScreeningOfficerId).toBeUndefined();
+    expect(_applications.get(a2._id).assignedScreeningOfficerId).toBeUndefined();
+  });
+
+  it("clearing a role in bulk leaves the other role intact on every application", async () => {
+    const app = makeApp();
+    const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    const officer = _users.insert({ name: "Ravi Kumar", email: "ravi@plumtrips.com" });
+    const a1 = applicationDoc(WORKSPACE_A, { assignedConciergeUserId: concierge._id, assignedScreeningOfficerId: officer._id });
+    const a2 = applicationDoc(WORKSPACE_A, { assignedConciergeUserId: concierge._id, assignedScreeningOfficerId: officer._id });
+
+    const res = await request(app).post("/applications/bulk-assign").send({
+      applicationIds: [String(a1._id), String(a2._id)],
+      assignedConciergeUserId: null,
+    });
+
+    expect(res.status).toBe(200);
+    for (const a of [a1, a2]) {
+      const stored = _applications.get(a._id);
+      expect(stored.assignedConciergeUserId).toBeNull();
+      expect(String(stored.assignedScreeningOfficerId)).toBe(String(officer._id));
+    }
+  });
+});
+
+describe("GET /queue — assignment filters", () => {
+  beforeEach(() => setAccess("READ"));
+
+  it("?assignedConciergeUserId returns only applications assigned to that concierge", async () => {
+    const app = makeApp();
+    const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    const other = _users.insert({ name: "Someone Else", email: "else@plumtrips.com" });
+    const mine = applicationDoc(WORKSPACE_A, { assignedConciergeUserId: concierge._id });
+    applicationDoc(WORKSPACE_A, { assignedConciergeUserId: other._id });
+    applicationDoc(WORKSPACE_A);
+
+    const res = await request(app).get(`/queue?assignedConciergeUserId=${concierge._id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.applications).toHaveLength(1);
+    expect(res.body.applications[0].id).toBe(String(mine._id));
+    expect(res.body.applications[0].assignedConcierge).toEqual({ id: String(concierge._id), name: "Asha Rao" });
+  });
+
+  it("?assignedScreeningOfficerId returns only applications assigned to that officer", async () => {
+    const app = makeApp();
+    const officer = _users.insert({ name: "Ravi Kumar", email: "ravi@plumtrips.com" });
+    const mine = applicationDoc(WORKSPACE_A, { assignedScreeningOfficerId: officer._id });
+    applicationDoc(WORKSPACE_A);
+
+    const res = await request(app).get(`/queue?assignedScreeningOfficerId=${officer._id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.applications).toHaveLength(1);
+    expect(res.body.applications[0].id).toBe(String(mine._id));
+    expect(res.body.applications[0].assignedScreeningOfficer).toEqual({ id: String(officer._id), name: "Ravi Kumar" });
+  });
+
+  it("?unassigned=true returns only applications with neither role set", async () => {
+    const app = makeApp();
+    const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    const unassigned = applicationDoc(WORKSPACE_A);
+    applicationDoc(WORKSPACE_A, { assignedConciergeUserId: concierge._id });
+
+    const res = await request(app).get("/queue?unassigned=true");
+    expect(res.status).toBe(200);
+    expect(res.body.applications).toHaveLength(1);
+    expect(res.body.applications[0].id).toBe(String(unassigned._id));
+  });
+});
+
+describe("GET /assignable-users", () => {
+  beforeEach(() => setAccess("READ"));
+
+  it("returns users with a WRITE or FULL visaApplication grant, with their access level", async () => {
+    const app = makeApp();
+    const writer = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    const lead = _users.insert({ name: "Ravi Kumar", email: "ravi@plumtrips.com" });
+    const readOnly = _users.insert({ name: "Priya", email: "priya@plumtrips.com" });
+    grantVisaPermission(writer._id, "WRITE", { level: "L3" });
+    grantVisaPermission(lead._id, "FULL", { level: "L5" });
+    grantVisaPermission(readOnly._id, "READ", { level: "L1" });
+
+    const res = await request(app).get("/assignable-users");
+    expect(res.status).toBe(200);
+    const ids = res.body.users.map((u: any) => u.id);
+    expect(ids).toContain(String(writer._id));
+    expect(ids).toContain(String(lead._id));
+    expect(ids).not.toContain(String(readOnly._id));
+
+    const writerRow = res.body.users.find((u: any) => u.id === String(writer._id));
+    expect(writerRow.access).toBe("WRITE");
+    expect(writerRow.level).toBe("L3");
+  });
+
+  it("includes SUPERADMINs even without an explicit grant", async () => {
+    const app = makeApp();
+    const admin = _users.insert({ name: "Sam Boss", email: "sam@plumtrips.com", roles: ["SUPERADMIN"] });
+
+    const res = await request(app).get("/assignable-users");
+    expect(res.status).toBe(200);
+    const row = res.body.users.find((u: any) => u.id === String(admin._id));
+    expect(row).toBeTruthy();
+    expect(row.access).toBe("FULL");
+  });
+
+  it("excludes a suspended/revoked grant", async () => {
+    const app = makeApp();
+    const suspended = _users.insert({ name: "Suspended Sam", email: "suspended@plumtrips.com" });
+    grantVisaPermission(suspended._id, "WRITE", { status: "suspended" });
+
+    const res = await request(app).get("/assignable-users");
+    expect(res.status).toBe(200);
+    expect(res.body.users.map((u: any) => u.id)).not.toContain(String(suspended._id));
   });
 });

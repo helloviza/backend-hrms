@@ -131,6 +131,7 @@ vi.mock("../models/VisaApplication.js", () => ({
 vi.mock("../models/User.js", () => ({
   default: {
     findById: (id: any) => chainable(() => users.get(id)),
+    find: (filter: any) => chainable(() => users.query(filter)),
   },
 }));
 
@@ -424,9 +425,10 @@ describe("GET /requests and GET /requests/:id — workspace scoping", () => {
     // etaMinDays: 5, etaMaxDays: 10, etaBasis: "BUSINESS" — copied into
     // ruleSnapshot at creation time (buildRuleSnapshot, routes/visa.ts).
     const lodgedAt = new Date("2026-08-03T00:00:00.000Z"); // Monday
-    applications.update(appId, { status: "lodged", lodgedAt });
     const concierge = users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
-    requests.update(requestId, { assignedConciergeUserId: concierge._id });
+    // Phase 9a — assignment lives on the APPLICATION itself, not the parent
+    // request (models/VisaApplication.ts's assignedConciergeUserId).
+    applications.update(appId, { status: "lodged", lodgedAt, assignedConciergeUserId: concierge._id });
 
     const res = await request(makeApp(WORKSPACE_A)).get(`/requests/${requestId}`);
     expect(res.status).toBe(200);

@@ -12,8 +12,9 @@
 // Gating is purely the visaApplication permission key (wired in phase 2a —
 // UserPermission.ts / levelTemplates.ts / featureToModules.ts /
 // AccessConsole.tsx — but never enforced by any route until now):
-//   READ  -> GET /queue, GET /applications/:id
-//   WRITE -> PATCH .../status, PATCH /documents/:id/review
+//   READ  -> GET /queue, GET /applications/:id, GET /assignable-users
+//   WRITE -> PATCH .../status, PATCH /documents/:id/review,
+//            PATCH .../assignment, POST .../bulk-assign
 //   FULL  -> PATCH .../costs, PATCH .../outcome
 // requirePermission() already gives SUPERADMIN a bypass; no separate role
 // check is layered on top here.
@@ -22,8 +23,15 @@
 // requireFeature — same shape as routes/admin.sessions.ts (requireAuth +
 // a permission/role gate, nothing tenancy-related at mount time).
 //
-// No frontend, no console UI yet — this is the API the concierge console
-// will call in a later phase.
+// Phase 6b built the console UI (apps/frontend/src/pages/admin/
+// VisaConciergeConsole.tsx). Phase 9a (this revision) moves case assignment
+// off VisaRequest onto VisaApplication (see models/VisaApplication.ts) and
+// replaces the old PATCH /requests/:id/concierge with PATCH
+// /applications/:id/assignment, POST /applications/bulk-assign, and GET
+// /assignable-users — VisaConciergeConsole.tsx still calls the OLD route
+// and reads the OLD per-request assignedConcierge shape; it has NOT been
+// rewired onto these new routes yet (backend-only phase — flagged as a
+// known follow-up, not done here).
 
 import { Router } from "express";
 import mongoose from "mongoose";
@@ -42,6 +50,7 @@ import VisaDocument from "../models/VisaDocument.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
+import { UserPermission, hasAccess } from "../models/UserPermission.js";
 import { visaDocumentUploadMw, createVisaDocumentUpload } from "./visa.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { syncVisaApplicationBilling } from "../services/visaBillingSync.js";
@@ -119,6 +128,16 @@ function mapAdminApplicationSummary(a: any) {
     visaIssuedAt: a.visaIssuedAt ?? null,
     visaExpiresAt: a.visaExpiresAt ?? null,
     linkedBookings: a.linkedBookings || [],
+    assignedConciergeUserId: a.assignedConciergeUserId ? String(a.assignedConciergeUserId) : null,
+    assignedConciergeAssignedAt: a.assignedConciergeAssignedAt ?? null,
+    assignedConciergeAssignedByUserId: a.assignedConciergeAssignedByUserId
+      ? String(a.assignedConciergeAssignedByUserId)
+      : null,
+    assignedScreeningOfficerId: a.assignedScreeningOfficerId ? String(a.assignedScreeningOfficerId) : null,
+    assignedScreeningOfficerAssignedAt: a.assignedScreeningOfficerAssignedAt ?? null,
+    assignedScreeningOfficerAssignedByUserId: a.assignedScreeningOfficerAssignedByUserId
+      ? String(a.assignedScreeningOfficerAssignedByUserId)
+      : null,
   };
 }
 
@@ -176,6 +195,32 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       filter.workspaceId = new mongoose.Types.ObjectId(req.query.workspaceId);
     }
 
+    // Assignment filters (Phase 9a). ?unassigned=true means neither role is
+    // set on the application at all — the true "unclaimed" queue a batch-
+    // assign action would work from — and takes priority over the two
+    // specific-assignee filters below (asking for both at once is a
+    // contradiction; unassigned wins rather than silently ANDing to zero
+    // results).
+    if (req.query.unassigned === "true") {
+      filter.assignedConciergeUserId = null;
+      filter.assignedScreeningOfficerId = null;
+    } else {
+      if (req.query.assignedConciergeUserId != null) {
+        const v = String(req.query.assignedConciergeUserId).trim();
+        if (!mongoose.isValidObjectId(v)) {
+          return res.status(400).json({ error: "assignedConciergeUserId is not a valid id" });
+        }
+        filter.assignedConciergeUserId = new mongoose.Types.ObjectId(v);
+      }
+      if (req.query.assignedScreeningOfficerId != null) {
+        const v = String(req.query.assignedScreeningOfficerId).trim();
+        if (!mongoose.isValidObjectId(v)) {
+          return res.status(400).json({ error: "assignedScreeningOfficerId is not a valid id" });
+        }
+        filter.assignedScreeningOfficerId = new mongoose.Types.ObjectId(v);
+      }
+    }
+
     const applications = await VisaApplication.find(filter).lean();
 
     const requestIds = [...new Set(applications.map((a: any) => String(a.requestId)))];
@@ -220,6 +265,25 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
     const start = (page - 1) * limit;
     const pageRows = rows.slice(start, start + limit);
 
+    // Assignee names, resolved only for the PAGE being returned (unlike
+    // workspace/traveller above, which resolve against the full pre-
+    // pagination `rows` — there's no reason to look up every assignee
+    // across every page just to shape the one page actually being sent).
+    const assigneeIds = new Set<string>();
+    for (const { application: a } of pageRows) {
+      if (a.assignedConciergeUserId) assigneeIds.add(String(a.assignedConciergeUserId));
+      if (a.assignedScreeningOfficerId) assigneeIds.add(String(a.assignedScreeningOfficerId));
+    }
+    const assignees = assigneeIds.size
+      ? await User.find({ _id: { $in: [...assigneeIds] } }).select("name email").lean()
+      : [];
+    const assigneeById = new Map(assignees.map((u: any) => [String(u._id), u]));
+    function assigneeSummary(userId: any): { id: string; name: string | null } | null {
+      if (!userId) return null;
+      const u = assigneeById.get(String(userId));
+      return { id: String(userId), name: (u?.name || u?.email) ?? null };
+    }
+
     const shaped = pageRows.map(({ application: a, request: r }) => {
       const workspace = workspaceById.get(String(a.workspaceId)) || null;
       const traveller = travellerById.get(String(a.travellerProfileId)) || null;
@@ -243,6 +307,8 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
             }
           : null,
         traveller: traveller ? { id: String(traveller._id), name: travellerDisplayName(traveller) } : null,
+        assignedConcierge: assigneeSummary(a.assignedConciergeUserId),
+        assignedScreeningOfficer: assigneeSummary(a.assignedScreeningOfficerId),
       };
     });
 
@@ -282,15 +348,25 @@ router.get("/applications/:id", requirePermission("visaApplication", "READ"), as
         .lean(),
     ]);
 
-    let assignedConcierge: { name: string | null; email: string | null } | null = null;
-    if ((visaRequest as any)?.assignedConciergeUserId) {
-      const concierge = await User.findById((visaRequest as any).assignedConciergeUserId)
-        .select("name email")
-        .lean();
-      if (concierge) {
-        assignedConcierge = { name: (concierge as any).name ?? null, email: (concierge as any).email ?? null };
-      }
+    // Case assignment lives on the APPLICATION itself now (Phase 9a — see
+    // models/VisaApplication.ts), not the parent request.
+    const assigneeIds = [
+      (application as any).assignedConciergeUserId,
+      (application as any).assignedScreeningOfficerId,
+    ].filter(Boolean);
+    const assigneeUsers = assigneeIds.length
+      ? await User.find({ _id: { $in: assigneeIds } }).select("name email").lean()
+      : [];
+    const assigneeById = new Map(assigneeUsers.map((u: any) => [String(u._id), u]));
+
+    function assigneeSummary(userId: any): { id: string; name: string | null; email: string | null } | null {
+      if (!userId) return null;
+      const u = assigneeById.get(String(userId));
+      return { id: String(userId), name: u?.name ?? null, email: u?.email ?? null };
     }
+
+    const assignedConcierge = assigneeSummary((application as any).assignedConciergeUserId);
+    const assignedScreeningOfficer = assigneeSummary((application as any).assignedScreeningOfficerId);
 
     const requestedBy = actorId(req);
     adminVisaLogger.info("visa application detail accessed (unmasked passport)", {
@@ -321,6 +397,7 @@ router.get("/applications/:id", requirePermission("visaApplication", "READ"), as
         : null,
       request: visaRequest || null,
       assignedConcierge,
+      assignedScreeningOfficer,
       workspace: workspace
         ? { id: String((workspace as any)._id), name: (workspace as any).companyName, customerId: (workspace as any).customerId }
         : null,
@@ -769,47 +846,232 @@ router.patch(
 );
 
 /* ─────────────────────────────────────────────────────────────────────
- * PATCH /requests/:id/concierge — assign (or clear) the one concierge
- * point-of-contact for a request. Body: { email: string | null }. Optional
- * by design (models/VisaRequest.ts's doc comment) — every consumer must
- * already degrade to a generic "your concierge team" when this is unset;
- * this route is just what sets/clears it.
+ * Case assignment (Phase 9a) — PATCH /applications/:id/assignment, POST
+ * /applications/bulk-assign, GET /assignable-users.
  *
- * Resolves by email rather than accepting a raw userId directly — there is
- * no staff-directory picker in this console yet (out of scope here), and an
- * email is what an agent actually has on hand for a colleague. 404s with a
- * clear message on an unrecognised email rather than silently assigning a
- * bad reference. { email: null } (or an empty string) unassigns.
+ * Replaces the old PATCH /requests/:id/concierge (removed) — assignment now
+ * lives per APPLICATION, not per request (models/VisaApplication.ts), with
+ * two independent roles: assignedConciergeUserId (owns the customer
+ * relationship) and assignedScreeningOfficerId (checks documents against
+ * the checklist). See migrations/2026-07-30-migrate-visa-concierge-
+ * assignment.ts for the one-time move of pre-existing VisaRequest-level
+ * assignments down onto their applications.
  * ───────────────────────────────────────────────────────────────────── */
-router.patch("/requests/:id/concierge", requirePermission("visaApplication", "WRITE"), async (req: any, res: any) => {
+
+const ASSIGNMENT_ROLES = {
+  assignedConciergeUserId: {
+    idField: "assignedConciergeUserId",
+    atField: "assignedConciergeAssignedAt",
+    byField: "assignedConciergeAssignedByUserId",
+  },
+  assignedScreeningOfficerId: {
+    idField: "assignedScreeningOfficerId",
+    atField: "assignedScreeningOfficerAssignedAt",
+    byField: "assignedScreeningOfficerAssignedByUserId",
+  },
+} as const;
+
+type AssignmentRoleKey = keyof typeof ASSIGNMENT_ROLES;
+const ASSIGNMENT_ROLE_KEYS = Object.keys(ASSIGNMENT_ROLES) as AssignmentRoleKey[];
+
+// True for a SUPERADMIN (who bypasses the visaApplication gate entirely —
+// same posture as requirePermission/isSuperAdmin) or an active, non-
+// suspended/revoked UserPermission grant of visaApplication at WRITE or
+// FULL. Mirrors requirePermission's own gate exactly — never allow
+// assigning a case to someone who could not open it themselves.
+async function userCanBeAssignedVisaCases(userId: any): Promise<boolean> {
+  const user = await User.findById(userId).select("roles status").lean();
+  if (!user || (user as any).status === "INACTIVE") return false;
+  if (Array.isArray((user as any).roles) && (user as any).roles.includes("SUPERADMIN")) return true;
+
+  const perm = await UserPermission.findOne({ userId: String(userId), status: "active" })
+    .select("modules.visaApplication")
+    .lean();
+  const access = (perm as any)?.modules?.visaApplication?.access || "NONE";
+  return hasAccess(access, "WRITE");
+}
+
+// Validates every assignment-role key PRESENT in the body (a role absent
+// from the body is simply left untouched — clearing one role must never
+// touch the other) and builds the combined $set for a single atomic write.
+// Returns {error,status} on the FIRST invalid role so nothing is applied
+// when only one of two roles in the same request is bad — never a partial
+// write for a single application either.
+async function buildAssignmentUpdate(
+  body: any,
+  actorUserId: any,
+): Promise<{ set: Record<string, unknown> } | { error: string; status: number }> {
+  const set: Record<string, unknown> = {};
+  let touched = false;
+
+  for (const key of ASSIGNMENT_ROLE_KEYS) {
+    if (!(key in body)) continue;
+    touched = true;
+    const fields = ASSIGNMENT_ROLES[key];
+    const raw = body[key];
+
+    if (raw == null || raw === "") {
+      set[fields.idField] = null;
+      set[fields.atField] = null;
+      set[fields.byField] = null;
+      continue;
+    }
+
+    const userId = String(raw);
+    if (!mongoose.isValidObjectId(userId)) {
+      return { error: `${key} is not a valid user id`, status: 400 };
+    }
+    const user = await User.findById(userId).select("_id status").lean();
+    if (!user || (user as any).status === "INACTIVE") {
+      return { error: `${key}: no such staff user`, status: 404 };
+    }
+    if (!(await userCanBeAssignedVisaCases(userId))) {
+      return {
+        error: `${key}: this user does not have visaApplication WRITE access and cannot be assigned a case`,
+        status: 400,
+      };
+    }
+    set[fields.idField] = (user as any)._id;
+    set[fields.atField] = new Date();
+    set[fields.byField] = actorUserId;
+  }
+
+  if (!touched) {
+    return { error: "Provide assignedConciergeUserId and/or assignedScreeningOfficerId", status: 400 };
+  }
+  return { set };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * PATCH /applications/:id/assignment — set or clear either role on ONE
+ * application. Body: { assignedConciergeUserId?: string|null,
+ * assignedScreeningOfficerId?: string|null } — a key omitted entirely is
+ * left untouched; present with null (or "") clears that role; present with
+ * a userId assigns it (validated via userCanBeAssignedVisaCases above).
+ * ───────────────────────────────────────────────────────────────────── */
+router.patch("/applications/:id/assignment", requirePermission("visaApplication", "WRITE"), async (req: any, res: any) => {
   try {
     const id = req.params.id;
     if (!mongoose.isValidObjectId(id)) {
-      return res.status(404).json({ error: "Visa request not found" });
+      return res.status(404).json({ error: "Visa application not found" });
+    }
+    const exists = await VisaApplication.findById(id).lean();
+    if (!exists) return res.status(404).json({ error: "Visa application not found" });
+
+    const result = await buildAssignmentUpdate(req.body || {}, actorId(req));
+    if ("error" in result) {
+      return res.status(result.status).json({ error: result.error });
     }
 
-    const visaRequest = await VisaRequest.findById(id).lean();
-    if (!visaRequest) return res.status(404).json({ error: "Visa request not found" });
-
-    const email = String(req.body?.email || "").trim();
-    let assignedConciergeUserId: any = null;
-    let assignedConciergeName: string | null = null;
-
-    if (email) {
-      const user = await User.findOne({ email: email.toLowerCase() }).select("name email").lean();
-      if (!user) {
-        return res.status(404).json({ error: `No staff user found with email '${email}'` });
-      }
-      assignedConciergeUserId = (user as any)._id;
-      assignedConciergeName = (user as any).name || (user as any).email || null;
-    }
-
-    await VisaRequest.findByIdAndUpdate(id, { $set: { assignedConciergeUserId } });
-
-    res.json({ ok: true, assignedConciergeUserId: assignedConciergeUserId ? String(assignedConciergeUserId) : null, assignedConciergeName });
+    const updated = await VisaApplication.findByIdAndUpdate(id, { $set: result.set }, { new: true }).lean();
+    res.json({ ok: true, application: mapAdminApplicationSummary(updated) });
   } catch (err: any) {
-    console.error("[admin visa request concierge PATCH]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to assign concierge" });
+    console.error("[admin visa application assignment PATCH]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to update assignment" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /applications/bulk-assign — the same assignment, applied to several
+ * applications at once (task brief: "working a queue means claiming a
+ * batch, not clicking twenty times"). Body: { applicationIds: string[],
+ * assignedConciergeUserId?: string|null, assignedScreeningOfficerId?:
+ * string|null }.
+ *
+ * Atomic: every applicationId must resolve to a real application, and every
+ * assignee must be valid, BEFORE anything is written — a batch that's
+ * half-bad applies to NONE of it, never some. The write itself is then one
+ * single updateMany, not a loop of per-document writes.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/applications/bulk-assign", requirePermission("visaApplication", "WRITE"), async (req: any, res: any) => {
+  try {
+    const rawIds: any[] = Array.isArray(req.body?.applicationIds) ? req.body.applicationIds : [];
+    const idSet = new Set<string>(rawIds.map((v: any) => String(v)));
+    const ids: string[] = Array.from(idSet);
+    if (ids.length === 0) {
+      return res.status(400).json({ error: "applicationIds must be a non-empty array" });
+    }
+    if (ids.some((id) => !mongoose.isValidObjectId(id))) {
+      return res.status(400).json({ error: "applicationIds must all be valid ids" });
+    }
+
+    const result = await buildAssignmentUpdate(req.body || {}, actorId(req));
+    if ("error" in result) {
+      return res.status(result.status).json({ error: result.error });
+    }
+
+    const existing = await VisaApplication.find({ _id: { $in: ids } }).select("_id").lean();
+    if (existing.length !== ids.length) {
+      const foundIds = new Set(existing.map((a: any) => String(a._id)));
+      const missing = ids.filter((id) => !foundIds.has(id));
+      return res.status(404).json({ error: "Some applications were not found — nothing was assigned", missing });
+    }
+
+    await VisaApplication.updateMany({ _id: { $in: ids } }, { $set: result.set });
+
+    res.json({ ok: true, updated: ids.length, applicationIds: ids });
+  } catch (err: any) {
+    console.error("[admin visa applications bulk-assign POST]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to bulk-assign" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /assignable-users — every staff user who could actually be assigned a
+ * case: an active, non-suspended/revoked visaApplication WRITE or FULL
+ * grant, unioned with SUPERADMINs (who bypass the gate by role — see
+ * userCanBeAssignedVisaCases above, same posture as requirePermission
+ * itself). Feeds the assign control in the console.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/assignable-users", requirePermission("visaApplication", "READ"), async (_req: any, res: any) => {
+  try {
+    const grants = await UserPermission.find({
+      "modules.visaApplication.access": { $in: ["WRITE", "FULL"] },
+      status: "active",
+    })
+      .select("userId modules.visaApplication level")
+      .lean();
+
+    const accessByUserId = new Map<string, { access: "WRITE" | "FULL"; level: string }>();
+    for (const g of grants as any[]) {
+      const uid = String(g.userId || "");
+      if (!mongoose.isValidObjectId(uid)) continue;
+      accessByUserId.set(uid, {
+        access: g.modules?.visaApplication?.access,
+        level: g.level?.code || "",
+      });
+    }
+
+    const superAdmins = await User.find({ roles: "SUPERADMIN", status: { $ne: "INACTIVE" } })
+      .select("_id")
+      .lean();
+    for (const u of superAdmins as any[]) {
+      const uid = String(u._id);
+      if (!accessByUserId.has(uid)) accessByUserId.set(uid, { access: "FULL", level: "SUPERADMIN" });
+    }
+
+    const ids = [...accessByUserId.keys()];
+    const users = ids.length
+      ? await User.find({ _id: { $in: ids }, status: { $ne: "INACTIVE" } }).select("_id name email").lean()
+      : [];
+
+    const shaped = users
+      .map((u: any) => {
+        const grant = accessByUserId.get(String(u._id))!;
+        return {
+          id: String(u._id),
+          name: u.name || u.email || "Unnamed",
+          email: u.email || null,
+          access: grant.access,
+          level: grant.level,
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    res.json({ ok: true, users: shaped });
+  } catch (err: any) {
+    console.error("[admin visa assignable-users GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load assignable users" });
   }
 });
 

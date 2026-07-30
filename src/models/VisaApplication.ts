@@ -176,6 +176,27 @@ export interface VisaApplicationDocument extends Document {
   visaIssuedAt?: Date;
   visaExpiresAt?: Date;
 
+  // Case assignment (Phase 9a) — PER APPLICATION, not per request: a
+  // five-traveller request can split across officers, and status already
+  // lives at this same grain (actionRequiredReason etc., above). Two
+  // independent roles, each optional and independently settable/clearable
+  // via PATCH /admin/visa/applications/:id/assignment (routes/admin.visa.ts):
+  //   - assignedConcierge*        owns the customer relationship
+  //   - assignedScreeningOfficer* checks documents against the checklist
+  // Formerly VisaRequest.assignedConciergeUserId (one concierge shared by
+  // every traveller on a request) — migrated down to here by migrations/
+  // 2026-07-30-migrate-visa-concierge-assignment.ts, then removed from
+  // VisaRequest entirely. assignedAt/assignedByUserId are set together with
+  // their id field on every assignment (never independently), and all three
+  // are cleared together when a role is unassigned.
+  assignedConciergeUserId?: mongoose.Types.ObjectId | null; // ref User
+  assignedConciergeAssignedAt?: Date | null;
+  assignedConciergeAssignedByUserId?: mongoose.Types.ObjectId | null; // ref User
+
+  assignedScreeningOfficerId?: mongoose.Types.ObjectId | null; // ref User
+  assignedScreeningOfficerAssignedAt?: Date | null;
+  assignedScreeningOfficerAssignedByUserId?: mongoose.Types.ObjectId | null; // ref User
+
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -276,6 +297,14 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     visaNumber: { type: String, trim: true },
     visaIssuedAt: { type: Date },
     visaExpiresAt: { type: Date },
+
+    assignedConciergeUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    assignedConciergeAssignedAt: { type: Date, default: null },
+    assignedConciergeAssignedByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+
+    assignedScreeningOfficerId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    assignedScreeningOfficerAssignedAt: { type: Date, default: null },
+    assignedScreeningOfficerAssignedByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
   },
   { timestamps: true },
 );
@@ -289,6 +318,10 @@ VisaApplicationSchema.index({ workspaceId: 1, status: 1 });
 // A traveller's application history across requests.
 VisaApplicationSchema.index({ workspaceId: 1, travellerProfileId: 1 });
 VisaApplicationSchema.index({ workspaceId: 1, createdAt: -1 });
+// Concierge console queue filters (routes/admin.visa.ts's GET /queue) —
+// cross-workspace, same posture as the {status:1} note below.
+VisaApplicationSchema.index({ assignedConciergeUserId: 1 });
+VisaApplicationSchema.index({ assignedScreeningOfficerId: 1 });
 // NOTE: the concierge console queue (routes/admin.visa.ts) queries by
 // status ACROSS every workspace — {workspaceId,status} above doesn't serve
 // a workspace-less status filter, since workspaceId is its leading field.

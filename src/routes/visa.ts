@@ -473,16 +473,37 @@ function travellerDisplayName(t: any): string {
 // without them; adding them there would mean resolving a User lookup and
 // re-computing an ETA window for every application in the workspace on
 // every list load, for data screen 7 never renders).
+//
+// assignedConciergeName is resolved PER APPLICATION here (Phase 9a — case
+// assignment moved from VisaRequest.assignedConciergeUserId, one concierge
+// shared by every traveller on a request, to VisaApplication.
+// assignedConciergeUserId, independently settable per traveller — see
+// models/VisaApplication.ts). A single User.find({$in:...}) covers every
+// distinct concierge across the whole applications array, not one query
+// per application.
 async function hydrateApplicationsWithTravellers(
   applications: any[],
   workspaceId: any,
-  timelineOpts?: { assignedConciergeName: string | null },
+  timelineOpts?: { includeTimelineFields: true },
 ) {
   const travellerIds = applications.map((a) => a.travellerProfileId);
   const travellers = await TravellerProfile.find({ _id: { $in: travellerIds }, workspaceId })
     .select("firstName middleName lastName dob email nationality passportNo passportExpiry")
     .lean();
   const travellerById = new Map(travellers.map((t: any) => [String(t._id), t]));
+
+  let conciergeNameByUserId = new Map<string, string | null>();
+  if (timelineOpts) {
+    const conciergeIds = [
+      ...new Set(applications.map((a) => a.assignedConciergeUserId).filter(Boolean).map((id) => String(id))),
+    ];
+    if (conciergeIds.length) {
+      const concierges = await User.find({ _id: { $in: conciergeIds } }).select("name email").lean();
+      conciergeNameByUserId = new Map(
+        concierges.map((u: any) => [String(u._id), u.name || u.email || null]),
+      );
+    }
+  }
 
   return applications.map((a) => {
     const traveller = travellerById.get(String(a.travellerProfileId)) || null;
@@ -513,7 +534,9 @@ async function hydrateApplicationsWithTravellers(
     return {
       ...base,
       lodgedAt: a.lodgedAt ?? null,
-      assignedConciergeName: timelineOpts.assignedConciergeName,
+      assignedConciergeName: a.assignedConciergeUserId
+        ? conciergeNameByUserId.get(String(a.assignedConciergeUserId)) ?? null
+        : null,
       // Per-application, not per-request — each traveller's own passport
       // lodges (and is decided) independently, even though they share one
       // VisaRequest. Null until THIS application has actually been lodged
@@ -693,9 +716,11 @@ router.get("/requests", async (req: any, res: any) => {
  * their travellers.
  *
  * Screen 6 (tracking detail) additions — each application in the response
- * also carries lodgedAt, assignedConciergeName (resolved from the parent
- * VisaRequest's assignedConciergeUserId, shared by every traveller on this
- * request), and estimatedDecision. assignedConciergeName is null — never
+ * also carries lodgedAt, assignedConciergeName (resolved from THIS
+ * application's own assignedConciergeUserId — Phase 9a moved case
+ * assignment off VisaRequest onto VisaApplication, see models/
+ * VisaApplication.ts — so a five-traveller request can show five different
+ * concierges), and estimatedDecision. assignedConciergeName is null — never
  * omitted, never a placeholder string — when unset; the frontend is what
  * degrades that to "your concierge team" (task brief).
  * ───────────────────────────────────────────────────────────────────── */
@@ -711,16 +736,10 @@ router.get("/requests/:id", async (req: any, res: any) => {
       return res.status(404).json({ error: "Visa request not found" });
     }
 
-    let assignedConciergeName: string | null = null;
-    if ((visaRequest as any).assignedConciergeUserId) {
-      const concierge = await User.findById((visaRequest as any).assignedConciergeUserId)
-        .select("name email")
-        .lean();
-      assignedConciergeName = (concierge as any)?.name || (concierge as any)?.email || null;
-    }
-
     const applications = await VisaApplication.find({ requestId: visaRequest._id, workspaceId }).lean();
-    const hydrated = await hydrateApplicationsWithTravellers(applications, workspaceId, { assignedConciergeName });
+    const hydrated = await hydrateApplicationsWithTravellers(applications, workspaceId, {
+      includeTimelineFields: true,
+    });
 
     res.json({ ok: true, request: visaRequest, applications: hydrated });
   } catch (err: any) {
