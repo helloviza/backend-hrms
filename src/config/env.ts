@@ -54,16 +54,21 @@ export const env = {
 
 /**
  * Guardrail: local dev, Claude Code sessions, and diagnostic scripts must
- * never be able to silently run against the production Atlas cluster again
- * (see scripts/seed-dev.ts's header comment for the full incident this
- * closes). A non-production boot with MONGO_URI pointed at the prod
- * hostname gets a loud, impossible-to-miss warning — this does not block
- * boot (some legitimate one-off scripts, e.g. grant-access-console.ts,
- * intentionally connect to prod on purpose), but nobody should be able to
- * do it BY ACCIDENT without seeing this first.
+ * never be able to silently run against the production Atlas cluster
+ * without the reader noticing. A non-production boot with MONGO_URI pointed
+ * at the prod hostname gets a loud, impossible-to-miss warning — this does
+ * not block boot (Atlas production is the intentional dev setup on this
+ * branch, and some one-off scripts, e.g. grant-access-console.ts,
+ * legitimately connect to prod on purpose), but nobody should be able to do
+ * it UNKNOWINGLY without seeing this first. Set ALLOW_PROD_DB=true once
+ * you've acknowledged the choice to silence it.
  */
 const PROD_MONGO_HOST_FRAGMENT = "main-prod-cluster";
-if (env.NODE_ENV !== "production" && env.MONGO_URI.includes(PROD_MONGO_HOST_FRAGMENT)) {
+if (
+  env.NODE_ENV !== "production" &&
+  env.MONGO_URI.includes(PROD_MONGO_HOST_FRAGMENT) &&
+  process.env.ALLOW_PROD_DB !== "true"
+) {
   const line = "!".repeat(78);
   console.warn(
     [
@@ -78,10 +83,8 @@ if (env.NODE_ENV !== "production" && env.MONGO_URI.includes(PROD_MONGO_HOST_FRAG
       "!!   PRODUCTION DATA — including any seed/test/diagnostic script",
       "!!   you run against it.",
       "!!",
-      "!!   Point MONGO_URI at a local database instead, e.g.:",
-      "!!     MONGO_URI=mongodb://localhost:27017/plumbox_dev",
-      "!!   then seed it with:",
-      "!!     pnpm -C apps/backend tsx src/scripts/seed-dev.ts",
+      "!!   If this is intentional, set ALLOW_PROD_DB=true to silence this",
+      "!!   warning.",
       "!!",
       line,
       line,

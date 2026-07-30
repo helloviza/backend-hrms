@@ -480,6 +480,23 @@ app.use("/api/expense-advances", requireAuth, requireWorkspace, requireExpenseAd
 import expenseActivityRouter from "./routes/expenseActivity.js";
 app.use("/api/expense-activity", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseActivityRouter);
 
+// Visa module (Phase 2a) — read-only destination/rule/content API behind
+// the destination picker. VisaRule/VisaDestinationContent are global
+// reference data, not workspace-scoped, but the module is still gated by
+// workspace context + the visaEnabled feature flag.
+import visaRouter from "./routes/visa.js";
+app.use("/api/visa", requireAuth, requireWorkspace, requireFeature("visaEnabled"), visaRouter);
+
+// Visa module (Phase 6a) — the concierge console API. STAFF routes,
+// deliberately mounted WITHOUT requireWorkspace/requireFeature: an agent
+// works applications across every customer workspace, not just their own
+// (docs/audits/visa-module-recon.md §3, §9). Gated purely on the
+// visaApplication permission key, per-route inside admin.visa.ts — same
+// shape as routes/admin.sessions.ts (requireAuth + a permission gate,
+// nothing tenancy-related at mount time).
+import adminVisaRouter from "./routes/admin.visa.js";
+app.use("/api/admin/visa", adminVisaRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";
