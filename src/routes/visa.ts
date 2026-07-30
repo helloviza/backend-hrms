@@ -762,6 +762,69 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
+ * POST /requests/:id/cancel — abandon a draft. Draft-only: a request that
+ * has already been submitted (consentAcceptedAt set, applications moved
+ * past draft — reflected in the derived status no longer being "draft")
+ * must never be cancelled through this route; the applicant's way out of a
+ * SUBMITTED application is talking to their concierge, not a self-serve
+ * cancel.
+ *
+ * cancelledAt/cancelledByUserId are AUTHORED facts (models/VisaRequest.ts's
+ * doc comment) — this route sets them directly, then calls
+ * recomputeRequestStatus, which short-circuits straight to "cancelled"
+ * whenever cancelledAt is set, regardless of child application state. That
+ * short-circuit is exactly what makes a request abandoned before any
+ * application was ever submitted reachable as "cancelled" at all — nothing
+ * else in the rollup rule can get there from an all-draft state.
+ *
+ * Idempotency mirrors POST /requests/:id/submit: the atomic claim filters
+ * on { status: "draft", cancelledAt: null }, so a double-click (or retry)
+ * racing the same filter finds it already claimed on the second attempt
+ * and gets a clean 409 — never a second write. Existence + tenancy is
+ * checked separately, up front, so a bad/cross-workspace id always 404s.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/requests/:id/cancel", async (req: any, res: any) => {
+  try {
+    const workspaceId = req.workspaceObjectId;
+    const requestId = req.params.id;
+    if (!mongoose.isValidObjectId(requestId)) {
+      return res.status(404).json({ error: "Visa request not found" });
+    }
+
+    const owned = await VisaRequest.findOne({ _id: requestId, workspaceId }).select("_id status").lean();
+    if (!owned) {
+      return res.status(404).json({ error: "Visa request not found" });
+    }
+    if (owned.status !== "draft") {
+      return res.status(409).json({ error: "This visa request has already been submitted and can no longer be cancelled." });
+    }
+
+    const claimed = await VisaRequest.findOneAndUpdate(
+      { _id: requestId, workspaceId, status: "draft", cancelledAt: null },
+      {
+        $set: {
+          cancelledAt: new Date(),
+          cancelledByUserId: actorId(req),
+        },
+      },
+      { new: true },
+    );
+
+    if (!claimed) {
+      return res.status(409).json({ error: "This visa request has already been submitted and can no longer be cancelled." });
+    }
+
+    await recomputeRequestStatus(requestId);
+
+    const finalRequest = await VisaRequest.findById(requestId).lean();
+    res.json({ ok: true, request: finalRequest });
+  } catch (err: any) {
+    console.error("[visa requests cancel POST]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to cancel visa request" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * Phase 4a — document upload and the booking lookup behind screen 4.
  * ───────────────────────────────────────────────────────────────────── */
 
