@@ -85,13 +85,13 @@ beforeEach(() => {
   applications.clear();
   _activityRows = [];
 
-  vi.spyOn(VisaActivityLog, "find").mockImplementation((filter: any) => {
+  vi.spyOn(VisaActivityLog, "find").mockImplementation(((filter: any) => {
     const eventTypes: string[] = filter.eventType?.$in ?? [];
     const rows = _activityRows.filter(
       (r) => String(r.requestId) === String(filter.requestId) && eventTypes.includes(r.eventType),
     );
-    return chainable(() => [...rows].sort((a, b) => b.at.getTime() - a.at.getTime())) as any;
-  });
+    return chainable(() => [...rows].sort((a, b) => b.at.getTime() - a.at.getTime()));
+  }) as any);
 });
 
 function seedActivity(requestId: any, eventType: string, at: Date, extra: Record<string, any> = {}) {

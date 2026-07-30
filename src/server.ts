@@ -480,6 +480,11 @@ app.use("/api/expense-advances", requireAuth, requireWorkspace, requireExpenseAd
 import expenseActivityRouter from "./routes/expenseActivity.js";
 app.use("/api/expense-activity", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseActivityRouter);
 
+// CSTEP Travel & Claim Portal (Phase 3) — pre-trip travel request form.
+// Tenant-scoped via req.workspaceObjectId in-router; owner-only mutations.
+import cstepRouter from "./routes/cstep.js";
+app.use("/api/cstep", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepRouter);
+
 // Visa module (Phase 2a) — read-only destination/rule/content API behind
 // the destination picker. VisaRule/VisaDestinationContent are global
 // reference data, not workspace-scoped, but the module is still gated by
@@ -506,13 +511,23 @@ app.use("/api/admin/visa", adminVisaRouter);
 import adminVisaRulesRouter from "./routes/admin.visa.rules.js";
 app.use("/api/admin/visa", adminVisaRulesRouter);
 
+// Visa module (Phase 9d) — CSV/XLSX report exports (case log, activity,
+// status, progress). Same mount prefix again — a third router alongside
+// adminVisaRouter/adminVisaRulesRouter above. Gated purely on
+// visaApplication READ (reports never mutate) — see routes/
+// admin.visa.reports.ts's file header.
+import adminVisaReportsRouter from "./routes/admin.visa.reports.js";
+app.use("/api/admin/visa", adminVisaReportsRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";
 import workspaceBrandingRouter from "./routes/workspace.branding.js";
+import travellerProfilesRouter from "./routes/workspace.travellers.js";
 app.use("/api/workspace/onboarding", onboardingRouter);
 app.use("/api/workspace/invites", inviteRouter);
 app.use("/api/workspace/branding", workspaceBrandingRouter);
+app.use("/api/workspace/travellers", travellerProfilesRouter);
 
 // SUPERADMIN provisioning
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin.js";

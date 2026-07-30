@@ -241,10 +241,10 @@ beforeEach(() => {
     return created as any;
   });
   vi.spyOn(VisaActivityLog, "find").mockImplementation(
-    (filter: any) => activityChain(_activityRows.filter((r) => String(r.applicationId) === String(filter.applicationId))) as any,
+    ((filter: any) => activityChain(_activityRows.filter((r) => String(r.applicationId) === String(filter.applicationId)))) as any,
   );
   vi.spyOn(VisaActivityLog, "countDocuments").mockImplementation(
-    async (filter: any) => _activityRows.filter((r) => String(r.applicationId) === String(filter.applicationId)).length as any,
+    (async (filter: any) => _activityRows.filter((r) => String(r.applicationId) === String(filter.applicationId)).length) as any,
   );
 });
 
@@ -316,8 +316,8 @@ describe("GET /applications/:id/activity — paginated read", () => {
 
   it("returns rows newest-first, paginated, with actor names resolved", async () => {
     const app = makeApp();
-    const a = applicationDoc({ status: "submitted" });
-    const officer = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    const a: any = applicationDoc({ status: "submitted" });
+    const officer: any = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
 
     await logVisaActivity({ applicationId: a._id, requestId: a.requestId, workspaceId: WORKSPACE_A, eventType: "STATUS_CHANGED", actorUserId: officer._id, actorType: "STAFF", detail: { from: "submitted", to: "docs_under_review" } });
     await logVisaActivity({ applicationId: a._id, requestId: a.requestId, workspaceId: WORKSPACE_A, eventType: "ACTION_REQUIRED_SET", actorUserId: officer._id, actorType: "STAFF", detail: { reason: "Missing bank stamp" } });
