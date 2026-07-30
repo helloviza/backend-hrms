@@ -362,6 +362,36 @@ describe("POST /applications/:applicationId/documents", () => {
     expect(callArgs[0].keyPrefix).toBe(`visa-applications/${WORKSPACE_A}/${app._id}`);
   });
 
+  it.each(["draft", "submitted", "action_required"])(
+    "allows upload while status is %s",
+    async (status) => {
+      const app = applicationDoc(WORKSPACE_A, { status });
+      const res = await request(makeApp(WORKSPACE_A))
+        .post(`/applications/${app._id}/documents`)
+        .field("docCode", "DOC-01")
+        .attach("file", Buffer.from("%PDF-1.4 fake"), { filename: "passport.pdf", contentType: "application/pdf" });
+
+      expect(res.status).toBe(201);
+      expect(uploadBufferToS3Mock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["docs_under_review", "cost_confirmed", "lodged", "decision_received", "closed"])(
+    "409s once status is %s — an agent is already working the file",
+    async (status) => {
+      const app = applicationDoc(WORKSPACE_A, { status });
+      const res = await request(makeApp(WORKSPACE_A))
+        .post(`/applications/${app._id}/documents`)
+        .field("docCode", "DOC-01")
+        .attach("file", Buffer.from("%PDF-1.4 fake"), { filename: "passport.pdf", contentType: "application/pdf" });
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/concierge/i);
+      expect(uploadBufferToS3Mock).not.toHaveBeenCalled();
+      expect(documents.store.size).toBe(0);
+    },
+  );
+
   it("re-uploading the same docCode versions rather than overwrites — both rows survive", async () => {
     const app = applicationDoc(WORKSPACE_A);
     const upload = () =>

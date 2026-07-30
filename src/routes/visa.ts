@@ -988,6 +988,19 @@ export async function createVisaDocumentUpload(opts: {
   return doc;
 }
 
+// Uploads are allowed through draft/submitted/action_required — the three
+// statuses where the applicant is still the one expected to be adding
+// documents. From docs_under_review onward an agent has started working the
+// file (routes/admin.visa.ts's PATCH /applications/:id/status is what moves
+// an application into docs_under_review), so a self-serve upload landing
+// mid-review could silently invalidate what the agent is already looking
+// at — the applicant's route back in at that point is their concierge, not
+// this endpoint. Draft is included even though screen 4's normal flow only
+// reaches here pre-submission — there's no reason to block it, and PATCH
+// /requests/:id/cancel already covers "the applicant wants out" separately.
+const DOCUMENT_UPLOAD_BLOCKED_MESSAGE =
+  "Your concierge is already reviewing this application — reply to your concierge if you need to add or change a document.";
+
 router.post(
   "/applications/:applicationId/documents",
   visaDocumentUploadMw,
@@ -996,6 +1009,10 @@ router.post(
       const workspaceId = req.workspaceObjectId;
       const application = await findOwnedApplication(req.params.applicationId, workspaceId);
       if (!application) return res.status(404).json({ error: "Visa application not found" });
+
+      if (!["draft", "submitted", "action_required"].includes(application.status)) {
+        return res.status(409).json({ error: DOCUMENT_UPLOAD_BLOCKED_MESSAGE });
+      }
 
       const file = req.file;
       if (!file || !file.buffer) {
