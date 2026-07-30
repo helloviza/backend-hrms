@@ -119,6 +119,7 @@ function mapAdminApplicationSummary(a: any) {
     actionRequiredReason: a.actionRequiredReason ?? null,
     actionRequiredSetAt: a.actionRequiredSetAt ?? null,
     actionRequiredSetByUserId: a.actionRequiredSetByUserId ? String(a.actionRequiredSetByUserId) : null,
+    customerRespondedAt: a.customerRespondedAt ?? null,
     nationality: a.nationality ?? null,
     nationalityUnresolved: a.nationalityUnresolved,
     ruleSnapshot: a.ruleSnapshot,
@@ -193,6 +194,28 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       delete filter.status;
     }
 
+    // Phase 9f — "has the customer responded since we last asked", an
+    // independent filter alongside actionRequired above (a case can be
+    // ?customerResponded=true&actionRequired=true for exactly the
+    // "responded but still blocked" rows this phase is about, or used on
+    // its own). Same "fold into whatever shape filter.status/$and already
+    // took" idiom as the actionRequired=false branch, generalised one
+    // level so this never clobbers either.
+    if (req.query.customerResponded === "true" || req.query.customerResponded === "false") {
+      const condition =
+        req.query.customerResponded === "true"
+          ? { customerRespondedAt: { $ne: null } }
+          : { customerRespondedAt: null };
+      if (filter.$and) {
+        filter.$and.push(condition);
+      } else if (filter.status !== undefined) {
+        filter.$and = [{ status: filter.status }, condition];
+        delete filter.status;
+      } else {
+        Object.assign(filter, condition);
+      }
+    }
+
     if (req.query.workspaceId != null) {
       if (!mongoose.isValidObjectId(req.query.workspaceId)) {
         return res.status(400).json({ error: "workspaceId is not a valid id" });
@@ -252,14 +275,22 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       .lean();
     const travellerById = new Map(travellers.map((t: any) => [String(t._id), t]));
 
-    // Urgency first (action_required surfaces above everything), then
-    // soonest travel date. Array#sort is stable in Node, so rows with an
-    // identical rank+date keep their original (createdAt-independent, but
-    // deterministic-per-query) relative order rather than reshuffling
-    // across requests.
+    // Urgency first, then soonest travel date. Three urgency tiers, not
+    // two (Phase 9f): a responded-but-still-blocked action_required row
+    // needs an agent MORE urgently than one nobody has touched yet — the
+    // customer already did their part, the agent is now the only thing
+    // outstanding — so it outranks even an untouched action_required row,
+    // not just the non-action_required rest of the queue. Array#sort is
+    // stable in Node, so rows with an identical rank+date keep their
+    // original (createdAt-independent, but deterministic-per-query)
+    // relative order rather than reshuffling across requests.
+    function urgencyRank(a: any): number {
+      if (a.status !== "action_required") return 2;
+      return a.customerRespondedAt ? 0 : 1;
+    }
     rows.sort((x, y) => {
-      const rankX = x.application.status === "action_required" ? 0 : 1;
-      const rankY = y.application.status === "action_required" ? 0 : 1;
+      const rankX = urgencyRank(x.application);
+      const rankY = urgencyRank(y.application);
       if (rankX !== rankY) return rankX - rankY;
       const dateX = x.request?.travelDateFrom ? new Date(x.request.travelDateFrom).getTime() : FAR_FUTURE_SENTINEL.getTime();
       const dateY = y.request?.travelDateFrom ? new Date(y.request.travelDateFrom).getTime() : FAR_FUTURE_SENTINEL.getTime();
@@ -296,6 +327,7 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         id: String(a._id),
         status: a.status,
         actionRequiredReason: a.actionRequiredReason ?? null,
+        customerRespondedAt: a.customerRespondedAt ?? null,
         submittedAt: a.submittedAt ?? null,
         destinationName: a.ruleSnapshot?.destinationName ?? null,
         purpose: a.ruleSnapshot?.purpose ?? null,

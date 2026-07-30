@@ -73,6 +73,18 @@ describe("setActionRequired / clearActionRequired", () => {
       expect(store!.statusBeforeActionRequired).toBe("cost_confirmed");
       expect(store!.actionRequiredReason).toBe("second reason");
     });
+
+    // Phase 9f — a fresh ask starts unanswered, even if a PRIOR episode on
+    // this same application was responded to (a stale stamp would
+    // misrepresent this new ask as already answered).
+    it("nulls customerRespondedAt — a fresh ask starts unanswered, even if a prior episode had a stamp", async () => {
+      store!.status = "cost_confirmed";
+      store!.customerRespondedAt = new Date("2026-01-01T00:00:00Z"); // left over from a prior, already-cleared episode
+
+      await setActionRequired(appId, "reason", userId);
+
+      expect(store!.customerRespondedAt).toBeNull();
+    });
   });
 
   describe("clearActionRequired", () => {
@@ -118,6 +130,20 @@ describe("setActionRequired / clearActionRequired", () => {
       const result = await clearActionRequired(appId);
       expect(result).toBeNull();
       expect(findByIdAndUpdateSpy).not.toHaveBeenCalled();
+    });
+
+    // Phase 9f — customerRespondedAt is evidence of what happened in the
+    // episode that just ended; clearActionRequired (manual or the Phase 9f
+    // auto-clear, which reuses this same helper) must leave it exactly as
+    // it was. Only the NEXT setActionRequired call resets it.
+    it("does not touch customerRespondedAt — that's setActionRequired's job, not this one's", async () => {
+      store!.status = "cost_confirmed";
+      await setActionRequired(appId, "reason", userId);
+      store!.customerRespondedAt = new Date("2026-02-01T00:00:00Z");
+
+      await clearActionRequired(appId);
+
+      expect(store!.customerRespondedAt).toEqual(new Date("2026-02-01T00:00:00Z"));
     });
   });
 });

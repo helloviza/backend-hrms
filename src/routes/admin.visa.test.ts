@@ -971,6 +971,69 @@ describe("GET /queue — cross-workspace", () => {
     const res = await request(app).get("/queue");
     expect(res.body.applications).toHaveLength(0);
   });
+
+  describe("Phase 9f — customer-responded visibility", () => {
+    it("returns customerRespondedAt on each row", async () => {
+      const app = makeApp();
+      const respondedAt = new Date("2026-08-15T10:00:00Z");
+      const a = applicationDoc(WORKSPACE_A, { status: "action_required", customerRespondedAt: respondedAt });
+      const res = await request(app).get("/queue");
+      const row = res.body.applications.find((r: any) => r.id === String(a._id));
+      expect(new Date(row.customerRespondedAt).toISOString()).toBe(respondedAt.toISOString());
+    });
+
+    it("sorts a responded-but-still-action_required row above an untouched action_required row", async () => {
+      const app = makeApp();
+      const untouched = applicationDoc(WORKSPACE_A, { status: "action_required", customerRespondedAt: null });
+      const responded = applicationDoc(WORKSPACE_B, {
+        status: "action_required",
+        customerRespondedAt: new Date(),
+      });
+
+      const res = await request(app).get("/queue");
+      const ids = res.body.applications.map((r: any) => r.id);
+      expect(ids.indexOf(String(responded._id))).toBeLessThan(ids.indexOf(String(untouched._id)));
+    });
+
+    it("a responded action_required row still sorts above a non-action_required row", async () => {
+      const app = makeApp();
+      applicationDoc(WORKSPACE_A, { status: "docs_under_review" });
+      const responded = applicationDoc(WORKSPACE_B, { status: "action_required", customerRespondedAt: new Date() });
+
+      const res = await request(app).get("/queue");
+      expect(res.body.applications[0].id).toBe(String(responded._id));
+    });
+
+    it("?customerResponded=true narrows to only responded rows", async () => {
+      const app = makeApp();
+      applicationDoc(WORKSPACE_A, { status: "action_required", customerRespondedAt: null });
+      const responded = applicationDoc(WORKSPACE_B, { status: "action_required", customerRespondedAt: new Date() });
+
+      const res = await request(app).get("/queue").query({ customerResponded: "true" });
+      expect(res.body.applications).toHaveLength(1);
+      expect(res.body.applications[0].id).toBe(String(responded._id));
+    });
+
+    it("?customerResponded=false narrows to only un-responded rows", async () => {
+      const app = makeApp();
+      const untouched = applicationDoc(WORKSPACE_A, { status: "action_required", customerRespondedAt: null });
+      applicationDoc(WORKSPACE_B, { status: "action_required", customerRespondedAt: new Date() });
+
+      const res = await request(app).get("/queue").query({ customerResponded: "false" });
+      expect(res.body.applications).toHaveLength(1);
+      expect(res.body.applications[0].id).toBe(String(untouched._id));
+    });
+
+    it("?customerResponded=true composes with an explicit status filter rather than clobbering it", async () => {
+      const app = makeApp();
+      const respondedLodged = applicationDoc(WORKSPACE_A, { status: "lodged", customerRespondedAt: new Date() });
+      applicationDoc(WORKSPACE_B, { status: "action_required", customerRespondedAt: new Date() });
+
+      const res = await request(app).get("/queue").query({ status: "lodged", customerResponded: "true" });
+      expect(res.body.applications).toHaveLength(1);
+      expect(res.body.applications[0].id).toBe(String(respondedLodged._id));
+    });
+  });
 });
 
 describe("PATCH /applications/:id/assignment", () => {

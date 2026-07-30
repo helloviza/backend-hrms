@@ -155,6 +155,17 @@ export interface VisaApplicationDocument extends Document {
   // already sitting here — see setActionRequired's own guard.
   statusBeforeActionRequired: VisaApplicationStatus | null;
 
+  // Phase 9f — "responded since we last asked", not "ever responded". Set
+  // by routes/visa.ts's document upload route on every customer upload
+  // while status is action_required (whether or not that upload completes
+  // the checklist — a partial response still stamps this). Nulled out by
+  // setActionRequired() below the MOMENT a concierge flags action_required
+  // again — a stale stamp from a PRIOR episode would misrepresent a fresh
+  // ask as already answered. Deliberately NOT cleared by
+  // clearActionRequired() (manual or auto): it stays as evidence of what
+  // happened in the episode that just ended, until the next one starts.
+  customerRespondedAt: Date | null;
+
   // Set the moment this application transitions draft -> submitted (POST
   // /requests/:id/submit, routes/visa.ts) — never on creation, and never
   // touched again after. Distinct from the request-level consent timestamp
@@ -290,6 +301,7 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     actionRequiredSetAt: { type: Date, default: null },
     actionRequiredSetByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
     statusBeforeActionRequired: { type: String, enum: VISA_APPLICATION_STATUSES, default: null },
+    customerRespondedAt: { type: Date, default: null },
 
     submittedAt: { type: Date },
     lodgedAt: { type: Date },
@@ -387,6 +399,11 @@ export async function setActionRequired(
         actionRequiredSetAt: new Date(),
         actionRequiredSetByUserId: userId,
         statusBeforeActionRequired,
+        // Phase 9f — a fresh ask starts unanswered, even if a PRIOR
+        // action_required episode on this same application was responded
+        // to (and cleared) before. Nulled here, not in clearActionRequired
+        // below — see customerRespondedAt's own doc comment above.
+        customerRespondedAt: null,
       },
     },
     { new: true },

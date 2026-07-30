@@ -63,6 +63,7 @@ import VisaRule, {
 import VisaDestinationContent from "../models/VisaDestinationContent.js";
 import VisaRequest, { recomputeRequestStatus } from "../models/VisaRequest.js";
 import VisaApplication, {
+  clearActionRequired,
   type VisaRuleSnapshot,
   type VisaIndicativeCostSnapshot,
 } from "../models/VisaApplication.js";
@@ -150,6 +151,37 @@ function hydrateDocumentRequirements(reqs: VisaDocumentRequirement[], linkedServ
       satisfiedByBooking: !!(service && linkedServices?.has(service)),
     };
   });
+}
+
+// Phase 9f — "is there anything still missing" for the auto-clear check
+// after a customer upload during action_required. Deliberately CONDITIONAL
+// requirements are never counted here: `condition` is freeform text (e.g.
+// "if travelling for business") with no established way anywhere in this
+// codebase to evaluate it as true/false, so treating it as always-required
+// would be wrong far more often than not — same posture the checklist
+// display (hydrateDocumentRequirements above) already takes by never
+// gating on it either. A REQUIRED docCode counts as satisfied by ANY
+// non-deleted uploaded version regardless of reviewStatus (PENDING
+// included) — this checks whether the CUSTOMER has done their part, not
+// whether a concierge has reviewed it yet — or by a linked booking
+// (DOC-07/DOC-08), same as the checklist display.
+export function computeOutstandingRequiredDocCodes(
+  application: { ruleSnapshot?: { documentRequirements?: VisaDocumentRequirement[] } | null; linkedBookings?: Array<{ service: string }> | null },
+  documents: Array<{ docCode: string }>,
+): string[] {
+  const requirements = application.ruleSnapshot?.documentRequirements || [];
+  const uploadedCodes = new Set(documents.map((d) => d.docCode));
+  const linkedServices = new Set((application.linkedBookings || []).map((lb) => lb.service));
+
+  return requirements
+    .filter((r) => r.requirement === "REQUIRED")
+    .map((r) => r.docCode)
+    .filter((docCode) => {
+      if (uploadedCodes.has(docCode)) return false;
+      const service = LINKABLE_DOC_CODE_SERVICE[docCode];
+      if (service && linkedServices.has(service)) return false;
+      return true;
+    });
 }
 
 // Shared by GET /rules (one entry per matching variant) and GET /rules/:id
@@ -1142,6 +1174,67 @@ export async function createVisaDocumentUpload(opts: {
   return doc;
 }
 
+// Phase 9f — an application left sitting in action_required after the
+// customer has actually uploaded reads as "blocked" on the queue when it
+// isn't; the team only discovers the response by opening the case. Called
+// by the customer upload route (never the admin/staff one) whenever a
+// document lands while status is STILL action_required (checked by the
+// caller, using the status read BEFORE this upload).
+//
+// Always stamps customerRespondedAt, complete or not — "responded since
+// we last asked", not "resolved the ask". Only auto-clears via the
+// existing clearActionRequired() helper (restoring
+// statusBeforeActionRequired) when every REQUIRED document is now
+// satisfied; a partial response leaves the application exactly where it
+// was, action_required, with the stamp as the only change. The auto-clear
+// activity event logs actorType SYSTEM — the system inferred completion,
+// no concierge looked at it.
+async function recordCustomerResponseDuringActionRequired(opts: {
+  application: { _id: any; workspaceId: any; requestId: any };
+  uploaderId: any;
+  uploadedDocumentId: string;
+  uploadedDocCode: string;
+}): Promise<void> {
+  const { application, uploaderId, uploadedDocumentId, uploadedDocCode } = opts;
+  const applicationId = application._id;
+  const workspaceId = application.workspaceId;
+
+  await VisaApplication.findByIdAndUpdate(applicationId, { $set: { customerRespondedAt: new Date() } });
+  await logVisaActivity({
+    applicationId,
+    requestId: application.requestId,
+    workspaceId,
+    eventType: "CUSTOMER_RESPONDED",
+    actorUserId: uploaderId,
+    actorType: "CUSTOMER",
+    detail: { documentId: uploadedDocumentId, docCode: uploadedDocCode },
+  });
+
+  // Re-fetch the FULL application (ruleSnapshot/linkedBookings) and the
+  // current document set — the caller's `application` is a pre-upload
+  // snapshot, and the outstanding check must see the document that was
+  // just created.
+  const [fresh, documents] = await Promise.all([
+    VisaApplication.findById(applicationId).lean(),
+    VisaDocument.find({ applicationId, workspaceId, deletedAt: null }).select("docCode").lean(),
+  ]);
+  if (!fresh) return;
+
+  const outstanding = computeOutstandingRequiredDocCodes(fresh as any, documents as any);
+  if (outstanding.length > 0) return; // partial response — stays action_required
+
+  const resumed = await clearActionRequired(applicationId);
+  await logVisaActivity({
+    applicationId,
+    requestId: application.requestId,
+    workspaceId,
+    eventType: "ACTION_REQUIRED_AUTO_CLEARED",
+    actorUserId: null,
+    actorType: "SYSTEM",
+    detail: { resumedStatus: resumed?.status ?? null },
+  });
+}
+
 // Upload, delete, and replace (replace is just a same-docCode upload — see
 // createVisaDocumentUpload) all share this gate: allowed through
 // draft/submitted/action_required — the three statuses where the applicant
@@ -1201,6 +1294,26 @@ router.post(
         uploaderId,
         actorType: "CUSTOMER",
       });
+
+      // Phase 9f — track the response and auto-clear action_required when
+      // the checklist is complete. Best-effort: the upload itself already
+      // succeeded above, so a failure here must never fail this response.
+      if (application.status === "action_required") {
+        try {
+          await recordCustomerResponseDuringActionRequired({
+            application,
+            uploaderId,
+            uploadedDocumentId: String(doc._id),
+            uploadedDocCode: docCode,
+          });
+        } catch (respondErr: any) {
+          visaLogger.error("visa customer-response tracking failed", {
+            applicationId: String(application._id),
+            documentId: String(doc._id),
+            error: respondErr?.message,
+          });
+        }
+      }
 
       res.status(201).json({ ok: true, document: mapDocumentSummary(doc) });
     } catch (err: any) {

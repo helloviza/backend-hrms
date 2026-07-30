@@ -209,6 +209,10 @@ export function summarizeActivityDetail(eventType: string, detail: Record<string
       return d.reason ? `Reason: ${d.reason}` : "";
     case "ACTION_REQUIRED_CLEARED":
       return d.resumedStatus ? `Resumed: ${d.resumedStatus}` : "";
+    case "CUSTOMER_RESPONDED":
+      return [d.docCode, d.version != null ? `v${d.version}` : ""].filter(Boolean).join(" ") || "Customer uploaded a document";
+    case "ACTION_REQUIRED_AUTO_CLEARED":
+      return d.resumedStatus ? `Resumed: ${d.resumedStatus} (auto-cleared — checklist complete)` : "Auto-cleared — checklist complete";
     case "OUTCOME_RECORDED":
       return d.outcome ? `Outcome: ${d.outcome}` : "";
     case "REQUEST_CANCELLED":
