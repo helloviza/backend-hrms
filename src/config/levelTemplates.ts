@@ -66,6 +66,8 @@ type ModulesTemplate = {
   crmContacts?:      ModulePermission
   crmCompanies?:     ModulePermission
   leads?:            ModulePermission
+  // Visa Application (concierge console)
+  visaApplication:   ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -110,6 +112,7 @@ const L1: ModulesTemplate = {
   crmContacts:       NONE,
   crmCompanies:      NONE,
   leads:             NONE,
+  visaApplication:   NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -189,20 +192,22 @@ const L6: ModulesTemplate = {
   crmContacts:       WRITE_WS,
   crmCompanies:      WRITE_WS,
   leads:             WRITE_WS,
+  visaApplication:   FULL_WS,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
 const L7: ModulesTemplate = {
   ...L1,
-  reports:        FULL_ALL,
-  analytics:      READ_ALL,
-  manualBookings: READ_ALL,
-  invoices:       READ_ALL,
-  adminVouchers:  READ_ALL,
-  tasks:          FULL_WS,
-  crmContacts:    READ_ALL,
-  crmCompanies:   READ_ALL,
-  leads:          READ_ALL,
+  reports:         FULL_ALL,
+  analytics:       READ_ALL,
+  manualBookings:  READ_ALL,
+  invoices:        READ_ALL,
+  adminVouchers:   READ_ALL,
+  tasks:           FULL_WS,
+  crmContacts:     READ_ALL,
+  crmCompanies:    READ_ALL,
+  leads:           READ_ALL,
+  visaApplication: READ_ALL,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -247,6 +252,7 @@ const L8: ModulesTemplate = {
   crmContacts:       FULL_ALL,
   crmCompanies:      FULL_ALL,
   leads:             FULL_ALL,
+  visaApplication:   FULL_ALL,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -291,6 +297,7 @@ const VENDOR: ModulesTemplate = {
   crmContacts:       NONE,
   crmCompanies:      NONE,
   leads:             NONE,
+  visaApplication:   NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -335,6 +342,7 @@ const CUSTOMER_SBT: ModulesTemplate = {
   crmContacts:       NONE,
   crmCompanies:      NONE,
   leads:             NONE,
+  visaApplication:   NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -379,6 +387,7 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   crmContacts:       NONE,
   crmCompanies:      NONE,
   leads:             NONE,
+  visaApplication:   NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

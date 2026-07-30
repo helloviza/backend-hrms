@@ -104,6 +104,13 @@ export interface UserPermissionDoc extends Document {
     leads?: ModulePermission
     crmContacts?: ModulePermission
     crmCompanies?: ModulePermission
+
+    // Visa Application (concierge console) — READ = view applications,
+    // WRITE = work applications (concierge agent), FULL = manage fees and
+    // rules (concierge lead). Not yet used by any route (see routes/visa.ts,
+    // which gates on requireWorkspace + visaEnabled instead) — wired now so
+    // it's grantable ahead of the concierge console phase.
+    visaApplication: ModulePermission
   }
 
   grantedBy: string
@@ -173,6 +180,9 @@ const modulesSchema = new Schema(
     leads: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     crmContacts: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     crmCompanies: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+
+    // Visa Application (concierge console)
+    visaApplication: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
   },
   { _id: false }
 )
