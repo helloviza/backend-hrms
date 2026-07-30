@@ -1344,17 +1344,20 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
             throw new HttpError(400, `Booking(s) already on this invoice: ${already.map((b: any) => b.bookingRef).join(", ")}`);
           }
 
-          // A booking can't be on two invoices: reject INVOICED / cancelled /
-          // already-linked-elsewhere.
+          // Must be CONFIRMED, exactly matching GET /:id/eligible-bookings'
+          // own filter — not just "reject INVOICED/CANCELLED", which used
+          // to leave WIP/PENDING bookings addable here even though the
+          // picker UI would never offer them. That gap became live once
+          // visa work-start bookings started existing in WIP for weeks
+          // before their outcome (services/visaBillingSync.ts, Phase 9e).
           const ineligible = (toAdd as any[]).filter(
             (b) =>
-              b.status === "INVOICED" ||
-              b.status === "CANCELLED" ||
+              b.status !== "CONFIRMED" ||
               b.isActive === false ||
               (b.invoiceId && String(b.invoiceId) !== String(invoice._id)),
           );
           if (ineligible.length) {
-            throw new HttpError(400, `Booking(s) not eligible (already invoiced or cancelled): ${ineligible.map((b: any) => b.bookingRef).join(", ")}`);
+            throw new HttpError(400, `Booking(s) not eligible (must be CONFIRMED, not yet invoiced): ${ineligible.map((b: any) => b.bookingRef).join(", ")}`);
           }
 
           for (const b of toAdd as any[]) {

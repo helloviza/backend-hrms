@@ -50,7 +50,7 @@ import User from "../models/User.js";
 import { UserPermission, hasAccess } from "../models/UserPermission.js";
 import { visaDocumentUploadMw, createVisaDocumentUpload } from "./visa.js";
 import { presignGetObject } from "../utils/s3Presign.js";
-import { syncVisaApplicationBilling } from "../services/visaBillingSync.js";
+import { syncVisaApplicationBilling, createVisaWorkStartBooking } from "../services/visaBillingSync.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import VisaActivityLog, { logVisaActivity, type VisaActivityEventType } from "../models/VisaActivityLog.js";
@@ -464,6 +464,12 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
     if (!application) return res.status(404).json({ error: "Visa application not found" });
     const current = application.status;
 
+    // Phase 9e — the work-start billing side effect, populated only on the
+    // submitted -> docs_under_review transition below. Surfaced in the
+    // response (same transparency posture as the outcome route's own
+    // `billing` field) but never allowed to fail the status change itself.
+    let workStartBilling: { action: string; manualBookingId: string | null } | { error: string } | undefined;
+
     if (target === "action_required") {
       if (!ACTION_REQUIRED_ELIGIBLE.has(current)) {
         return res.status(400).json({ error: `Cannot set action_required from '${current}'`, current, target });
@@ -544,6 +550,23 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
         actorType: "STAFF",
         detail: { from: current, to: target },
       });
+
+      // Work-start billing (Phase 9e) — a concierge picking up the case is
+      // the trigger; the ManualBooking must exist from THIS moment, not
+      // wait for the outcome. Best-effort, same posture as the outcome
+      // route's own billing call below: a failure here must never fail
+      // the status transition that already succeeded.
+      if (target === "docs_under_review") {
+        try {
+          workStartBilling = await createVisaWorkStartBooking(updated, actorId(req));
+        } catch (billingErr: any) {
+          adminVisaLogger.error("visa work-start billing sync failed", {
+            applicationId: id,
+            error: billingErr?.message,
+          });
+          workStartBilling = { error: billingErr?.message || "Work-start billing sync failed" };
+        }
+      }
     }
 
     // status is DERIVED on VisaRequest — never assigned directly. Same rule
@@ -551,7 +574,11 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
     await recomputeRequestStatus(application.requestId);
 
     const fresh = await VisaApplication.findById(id).lean();
-    res.json({ ok: true, application: mapAdminApplicationSummary(fresh) });
+    res.json({
+      ok: true,
+      application: mapAdminApplicationSummary(fresh),
+      ...(workStartBilling ? { billing: workStartBilling } : {}),
+    });
   } catch (err: any) {
     console.error("[admin visa application status PATCH]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to update application status" });

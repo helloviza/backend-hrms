@@ -187,7 +187,7 @@ vi.mock("../models/VisaActivityLog.js", () => ({
   logVisaActivity: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { syncVisaApplicationBilling } from "./visaBillingSync.js";
+import { syncVisaApplicationBilling, createVisaWorkStartBooking } from "./visaBillingSync.js";
 import { syncManualBookingToMirror } from "../models/ManualBooking.js";
 
 function visaRequestFixture(overrides: Record<string, any> = {}) {
@@ -236,6 +236,17 @@ function applicationFixture(opts: {
     actualPlumtripsServiceFeeInr: 1000,
     actualTotalInr: 7500,
     submittedAt: new Date("2026-08-01"),
+    // Embassy 5000 + VFS 1500 + service 1000 + 18% GST on the service fee
+    // (180) = 7680 — computeVisaFeeBlock's own ITEMISED formula
+    // (utils/visaFee.ts), the SAME function createVisaWorkStartBooking
+    // reuses to reconstruct this from components.
+    indicativeCostSnapshot: {
+      embassyFeeInr: 5000,
+      vfsFeeInr: 1500,
+      plumtripsServiceFeeInr: 1000,
+      totalInr: 7680,
+      displayMode: "ITEMISED",
+    },
     ...opts,
   };
 }
@@ -403,6 +414,178 @@ describe("syncVisaApplicationBilling — idempotency and updates", () => {
     const unchanged = _manualBookings.get(first.manualBookingId!);
     expect(unchanged.pricing.quotedPrice).toBe(7500); // untouched
     expect(unchanged.status).toBe("INVOICED");
+  });
+});
+
+describe("createVisaWorkStartBooking — Phase 9e", () => {
+  it("creates a WIP booking priced from indicative COMPONENTS, never the total", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined });
+    const actorId = new mongoose.Types.ObjectId();
+
+    const result = await createVisaWorkStartBooking(application, actorId);
+
+    expect(result.action).toBe("created");
+    const booking = _manualBookings.get(result.manualBookingId!);
+    expect(booking.status).toBe("WIP");
+    expect(booking.bookedBy).toEqual(actorId);
+    expect(booking.type).toBe("VISA");
+    // actualPrice = indicative embassy + indicative VFS only.
+    expect(booking.pricing.actualPrice).toBe(6500);
+    // quotedPrice reconstructs embassy + vfs + service + GST-on-service —
+    // NOT read from indicativeCostSnapshot.totalInr directly.
+    expect(booking.pricing.quotedPrice).toBe(7680);
+    expect(booking.metadata.visaApplicationId).toBe(String(application._id));
+  });
+
+  it("totalWithGST on the created booking equals the indicative GST-inclusive total", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+    const booking = _manualBookings.get(result.manualBookingId!);
+
+    expect(booking.pricing.totalWithGST).toBe(application.indicativeCostSnapshot.totalInr);
+    expect(booking.pricing.grandTotal).toBe(application.indicativeCostSnapshot.totalInr);
+  });
+
+  it("is idempotent — a second call for the same application never creates a duplicate", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined });
+
+    const first = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+    const second = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    expect(second.action).toBe("skipped_already_exists");
+    expect(second.manualBookingId).toBe(first.manualBookingId);
+    expect(_manualBookings.query({})).toHaveLength(1);
+  });
+
+  it("a rule quoted in INDICATIVE display mode (no component breakdown) yields zero pricing, not a crash", async () => {
+    const { application } = fullFixtureSet({
+      status: "docs_under_review",
+      outcome: undefined,
+      indicativeCostSnapshot: { indicativeVisaCostInr: 4000, totalInr: 4000, displayMode: "INDICATIVE" },
+    });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+    const booking = _manualBookings.get(result.manualBookingId!);
+    expect(booking.pricing.actualPrice).toBe(0);
+    expect(booking.pricing.quotedPrice).toBe(0);
+  });
+});
+
+describe("syncVisaApplicationBilling — WIP flips to CONFIRMED at outcome (Phase 9e)", () => {
+  it("a work-start WIP booking becomes CONFIRMED with the actual (not indicative) pricing", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined });
+    const workStart = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+    expect(_manualBookings.get(workStart.manualBookingId!).status).toBe("WIP");
+
+    // Outcome recorded — application now carries actual costs.
+    const decided = { ...application, status: "decision_received", outcome: "APPROVED" };
+    const result = await syncVisaApplicationBilling(decided, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("updated");
+    expect(result.manualBookingId).toBe(workStart.manualBookingId);
+
+    const booking = _manualBookings.get(workStart.manualBookingId!);
+    expect(booking.status).toBe("CONFIRMED");
+    // Actual pricing (embassy 5000 + vfs 1500 + service 1000 = 7500,
+    // GST-exclusive per the outcome-time convention) — NOT the indicative
+    // 7680 the work-start booking carried.
+    expect(booking.pricing.quotedPrice).toBe(7500);
+  });
+});
+
+describe("syncVisaApplicationBilling — INVOICED and CANCELLED are never mutated (Phase 9e)", () => {
+  it("never mutates an already-CANCELLED booking", async () => {
+    const { application } = fullFixtureSet();
+    const first = await syncVisaApplicationBilling(application, new mongoose.Types.ObjectId());
+    const booking = _manualBookings.get(first.manualBookingId!);
+    booking.status = "CANCELLED"; // simulate a staff-initiated cancel, or an earlier zero-cost auto-cancel
+
+    const revised = { ...application, actualPlumtripsServiceFeeInr: 99999, actualTotalInr: 106499 };
+    const second = await syncVisaApplicationBilling(revised, new mongoose.Types.ObjectId());
+
+    expect(second.action).toBe("skipped_cancelled");
+    expect(second.manualBookingId).toBe(first.manualBookingId);
+
+    const unchanged = _manualBookings.get(first.manualBookingId!);
+    expect(unchanged.pricing.quotedPrice).toBe(7500); // untouched
+    expect(unchanged.status).toBe("CANCELLED");
+  });
+
+  it("leaves an unexpected status (e.g. a staff member manually reset it to PENDING) untouched, just logs it", async () => {
+    const { application } = fullFixtureSet();
+    const first = await syncVisaApplicationBilling(application, new mongoose.Types.ObjectId());
+    const booking = _manualBookings.get(first.manualBookingId!);
+    booking.status = "PENDING";
+
+    const second = await syncVisaApplicationBilling(application, new mongoose.Types.ObjectId());
+
+    expect(second.action).toBe("skipped_unexpected_status");
+    const unchanged = _manualBookings.get(first.manualBookingId!);
+    expect(unchanged.status).toBe("PENDING");
+    expect(unchanged.pricing.quotedPrice).toBe(7500); // untouched
+  });
+});
+
+describe("syncVisaApplicationBilling — zero cost at outcome cancels (Phase 9e)", () => {
+  it("cancels a pre-existing WIP booking when the outcome's computed cost is zero — WITHDRAWN case", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined });
+    const workStart = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+    expect(_manualBookings.get(workStart.manualBookingId!).status).toBe("WIP");
+
+    const withdrawnNoCost = {
+      ...application,
+      status: "decision_received",
+      outcome: "WITHDRAWN",
+      actualEmbassyFeeInr: 0,
+      actualVfsFeeInr: 0,
+      actualPlumtripsServiceFeeInr: 0,
+      actualTotalInr: 0,
+    };
+    const result = await syncVisaApplicationBilling(withdrawnNoCost, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("cancelled_zero_cost");
+    expect(_manualBookings.get(workStart.manualBookingId!).status).toBe("CANCELLED");
+  });
+
+  it("cancels by COST, not by outcome value — an APPROVED case totalling zero also cancels", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined });
+    const workStart = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    const approvedNoCost = {
+      ...application,
+      status: "decision_received",
+      outcome: "APPROVED",
+      actualEmbassyFeeInr: 0,
+      actualVfsFeeInr: 0,
+      actualPlumtripsServiceFeeInr: 0,
+      actualTotalInr: 0,
+    };
+    const result = await syncVisaApplicationBilling(approvedNoCost, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("cancelled_zero_cost");
+    expect(_manualBookings.get(workStart.manualBookingId!).status).toBe("CANCELLED");
+  });
+
+  it("a WITHDRAWN case with REAL incurred costs still confirms normally, not cancelled", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined });
+    const workStart = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    const withdrawnWithCosts = {
+      ...application,
+      status: "decision_received",
+      outcome: "WITHDRAWN",
+      actualEmbassyFeeInr: 5000,
+      actualVfsFeeInr: 1500,
+      actualPlumtripsServiceFeeInr: 0,
+      actualTotalInr: 6500,
+    };
+    const result = await syncVisaApplicationBilling(withdrawnWithCosts, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("updated");
+    const booking = _manualBookings.get(workStart.manualBookingId!);
+    expect(booking.status).toBe("CONFIRMED");
+    expect(booking.pricing.quotedPrice).toBe(6500);
   });
 });
 

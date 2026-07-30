@@ -246,6 +246,8 @@ export function summarizeActivityDetail(eventType: string, detail: Record<string
     case "MANUAL_BOOKING_CREATED":
     case "MANUAL_BOOKING_UPDATED":
       return d.manualBookingId ? `Booking ${d.manualBookingId}` : "";
+    case "MANUAL_BOOKING_CANCELLED":
+      return d.manualBookingId ? `Booking ${d.manualBookingId} cancelled${d.reason ? ` (${d.reason})` : ""}` : "Booking cancelled";
     default:
       return "";
   }

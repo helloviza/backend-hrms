@@ -36,6 +36,7 @@ const {
   createVisaDocumentUploadMock,
   presignGetObjectMock,
   syncVisaApplicationBillingMock,
+  createVisaWorkStartBookingMock,
 } = vi.hoisted(() => {
   function matchValue(val: any, cond: any): boolean {
     if (cond && typeof cond === "object" && !(cond instanceof Date) && cond.constructor?.name !== "ObjectId") {
@@ -154,6 +155,10 @@ const {
     // syncVisaApplicationBilling call never reaches the real, unmocked
     // ManualBooking/VisaRequest/TravellerProfile/CustomerWorkspace models.
     syncVisaApplicationBillingMock: vi.fn().mockResolvedValue({ action: "created", manualBookingId: "stub-booking-id" }),
+    // Phase 9e — same reasoning: this file tests the status-transition
+    // route's own state machine, not work-start billing (that's services/
+    // visaBillingSync.test.ts's job again).
+    createVisaWorkStartBookingMock: vi.fn().mockResolvedValue({ action: "created", manualBookingId: "stub-work-start-booking-id" }),
   };
 });
 
@@ -313,6 +318,7 @@ vi.mock("./visa.js", () => ({
 
 vi.mock("../services/visaBillingSync.js", () => ({
   syncVisaApplicationBilling: (...args: any[]) => syncVisaApplicationBillingMock(...args),
+  createVisaWorkStartBooking: (...args: any[]) => createVisaWorkStartBookingMock(...args),
 }));
 
 vi.mock("../middleware/auth.js", () => ({
@@ -435,6 +441,8 @@ beforeEach(() => {
   presignGetObjectMock.mockResolvedValue("https://example.com/presigned-url");
   syncVisaApplicationBillingMock.mockClear();
   syncVisaApplicationBillingMock.mockResolvedValue({ action: "created", manualBookingId: "stub-booking-id" });
+  createVisaWorkStartBookingMock.mockClear();
+  createVisaWorkStartBookingMock.mockResolvedValue({ action: "created", manualBookingId: "stub-work-start-booking-id" });
   seq = 0;
   setAccess("FULL");
 });
@@ -575,6 +583,40 @@ describe("PATCH /applications/:id/status — state machine", () => {
     expect(_applications.get(a._id).status).toBe("cost_confirmed");
     expect(recomputeRequestStatusMock).toHaveBeenCalledTimes(1);
     expect(String(recomputeRequestStatusMock.mock.calls[0][0])).toBe(String(a.requestId));
+  });
+
+  it("Phase 9e: triggers work-start billing on submitted -> docs_under_review, and surfaces it in the response", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "submitted" });
+    const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: "docs_under_review" });
+
+    expect(res.status).toBe(200);
+    expect(createVisaWorkStartBookingMock).toHaveBeenCalledTimes(1);
+    const [calledApplication, calledActorId] = createVisaWorkStartBookingMock.mock.calls[0];
+    expect(String(calledApplication._id)).toBe(String(a._id));
+    expect(String(calledActorId)).toBe(String(USER_ID));
+    expect(res.body.billing).toEqual({ action: "created", manualBookingId: "stub-work-start-booking-id" });
+  });
+
+  it("Phase 9e: never triggers work-start billing on any OTHER transition", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "cost_confirmed" });
+    const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: "lodged" });
+
+    expect(res.status).toBe(200);
+    expect(createVisaWorkStartBookingMock).not.toHaveBeenCalled();
+    expect(res.body.billing).toBeUndefined();
+  });
+
+  it("Phase 9e: a work-start billing failure never fails the status transition itself", async () => {
+    createVisaWorkStartBookingMock.mockRejectedValueOnce(new Error("mongo write failed"));
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "submitted" });
+    const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: "docs_under_review" });
+
+    expect(res.status).toBe(200);
+    expect(_applications.get(a._id).status).toBe("docs_under_review");
+    expect(res.body.billing).toEqual({ error: "mongo write failed" });
   });
 
   it("stamps lodgedAt on the cost_confirmed -> lodged transition, and never earlier", async () => {

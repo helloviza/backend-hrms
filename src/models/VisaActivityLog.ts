@@ -71,6 +71,7 @@ export const VISA_ACTIVITY_EVENT_TYPES = [
   // Billing
   "MANUAL_BOOKING_CREATED",
   "MANUAL_BOOKING_UPDATED",
+  "MANUAL_BOOKING_CANCELLED",
 ] as const;
 export type VisaActivityEventType = (typeof VISA_ACTIVITY_EVENT_TYPES)[number];
 
