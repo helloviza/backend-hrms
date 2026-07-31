@@ -1430,6 +1430,121 @@ describe("GET /queue — cross-workspace", () => {
     });
   });
 
+  describe("Phase 9i — at-risk marker on the row (task brief, 2026-08-01)", () => {
+    it("returns the full risk assessment on an at-risk row, not just a boolean", async () => {
+      const app = makeApp();
+      const soon = new Date(Date.now() + 1 * 86400000); // travel tomorrow
+      const a = applicationDoc(WORKSPACE_A, {
+        status: "lodged",
+        requestId: _requests.insert({ workspaceId: WORKSPACE_A, travelDateFrom: soon })._id,
+        ruleSnapshot: { destinationName: "Germany", etaMaxDays: 15, etaBasis: "CALENDAR" },
+      });
+
+      const res = await request(app).get("/queue");
+      const row = res.body.applications.find((r: any) => r.id === String(a._id));
+
+      expect(row.risk).toBeTruthy();
+      expect(row.risk.atRisk).toBe(true);
+      expect(row.risk.etaMaxDays).toBe(15);
+      // ~1 day of runway against a 15-day requirement — short by ~14 days,
+      // not just "short". Carrying marginDays (not just the boolean) is
+      // what lets the console tell a narrowly-tight case apart from one
+      // that plainly won't make it.
+      expect(row.risk.marginDays).toBeLessThan(-10);
+      expect(typeof row.risk.availableDays).toBe("number");
+    });
+
+    it("risk is a real (non-null) assessment with atRisk:false for a safe case — not the same null used for 'nothing left to risk'", async () => {
+      const app = makeApp();
+      const safe = new Date(Date.now() + 400 * 86400000);
+      const a = applicationDoc(WORKSPACE_A, {
+        status: "docs_under_review",
+        requestId: _requests.insert({ workspaceId: WORKSPACE_A, travelDateFrom: safe })._id,
+        ruleSnapshot: { etaMaxDays: 5, etaBasis: "CALENDAR" },
+      });
+
+      const res = await request(app).get("/queue");
+      const row = res.body.applications.find((r: any) => r.id === String(a._id));
+
+      expect(row.risk).not.toBeNull();
+      expect(row.risk.atRisk).toBe(false);
+    });
+
+    it("risk is null once a decision exists or the case is closed — nothing left to risk, mirroring the ?atRisk=true filter's own exclusion", async () => {
+      const app = makeApp();
+      const soon = new Date(Date.now() + 1 * 86400000);
+      const reqId = _requests.insert({ workspaceId: WORKSPACE_A, travelDateFrom: soon })._id;
+      const decided = applicationDoc(WORKSPACE_A, {
+        status: "decision_received",
+        outcome: "APPROVED",
+        requestId: reqId,
+        ruleSnapshot: { etaMaxDays: 15, etaBasis: "CALENDAR" },
+      });
+      const closed = applicationDoc(WORKSPACE_A, {
+        status: "closed",
+        requestId: reqId,
+        ruleSnapshot: { etaMaxDays: 15, etaBasis: "CALENDAR" },
+      });
+
+      const res = await request(app).get("/queue");
+      const decidedRow = res.body.applications.find((r: any) => r.id === String(decided._id));
+      const closedRow = res.body.applications.find((r: any) => r.id === String(closed._id));
+
+      expect(decidedRow.risk).toBeNull();
+      expect(closedRow.risk).toBeNull();
+    });
+
+    it("risk is null when the helper itself has nothing to assess (no travel date)", async () => {
+      const app = makeApp();
+      const a = applicationDoc(WORKSPACE_A, {
+        status: "lodged",
+        requestId: _requests.insert({ workspaceId: WORKSPACE_A, travelDateFrom: null })._id,
+        ruleSnapshot: { etaMaxDays: 15, etaBasis: "CALENDAR" },
+      });
+
+      const res = await request(app).get("/queue");
+      const row = res.body.applications.find((r: any) => r.id === String(a._id));
+
+      expect(row.risk).toBeNull();
+    });
+
+    it("agrees with ?atRisk=true both ways: every row.risk.atRisk===true row appears under the filter, and only those rows do", async () => {
+      const app = makeApp();
+      const soon = new Date(Date.now() + 1 * 86400000);
+      const safe = new Date(Date.now() + 400 * 86400000);
+      const atRisk = applicationDoc(WORKSPACE_A, {
+        status: "lodged",
+        requestId: _requests.insert({ workspaceId: WORKSPACE_A, travelDateFrom: soon })._id,
+        ruleSnapshot: { etaMaxDays: 15, etaBasis: "CALENDAR" },
+      });
+      const safeApp = applicationDoc(WORKSPACE_B, {
+        status: "docs_under_review",
+        requestId: _requests.insert({ workspaceId: WORKSPACE_B, travelDateFrom: safe })._id,
+        ruleSnapshot: { etaMaxDays: 5, etaBasis: "CALENDAR" },
+      });
+      const decided = applicationDoc(WORKSPACE_A, {
+        status: "decision_received",
+        outcome: "WITHDRAWN",
+        requestId: _requests.insert({ workspaceId: WORKSPACE_A, travelDateFrom: soon })._id,
+        ruleSnapshot: { etaMaxDays: 15, etaBasis: "CALENDAR" },
+      });
+      void safeApp;
+      void decided;
+
+      const unfiltered = await request(app).get("/queue");
+      const flaggedInList = unfiltered.body.applications
+        .filter((r: any) => r.risk?.atRisk === true)
+        .map((r: any) => r.id)
+        .sort();
+
+      const filtered = await request(app).get("/queue").query({ atRisk: "true" });
+      const flaggedByFilter = filtered.body.applications.map((r: any) => r.id).sort();
+
+      expect(flaggedInList).toEqual([String(atRisk._id)]);
+      expect(flaggedByFilter).toEqual(flaggedInList);
+    });
+  });
+
   describe("Phase 9h — service partner visibility & filter", () => {
     it("returns servicePartnerName on each row", async () => {
       const app = makeApp();

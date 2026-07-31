@@ -351,15 +351,28 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
     // above already ran in the query), never over the whole collection.
     const atRiskOnly = req.query.atRisk === "true";
 
+    // Computed ONCE per row here, reused by both the ?atRisk=true filter
+    // below AND the row payload's own `risk` field (task brief, 2026-08-01:
+    // "confirm it agrees with the ?atRisk=true filter") — a single call to
+    // assessProcessingRisk per row, never recomputed differently for the
+    // filter vs. the marker, so the two can never disagree with each other.
+    // null (not just atRisk:false) once a decision exists or the case is
+    // closed/draft — "nothing left to risk" — mirrors the filter's own
+    // exclusion exactly, and doubles as the row's own signal that no
+    // at-risk marker applies here at all (as opposed to a real, computed
+    // "not at risk").
+    function computeRowRisk(a: any, r: any): ReturnType<typeof assessProcessingRisk> {
+      if (a.outcome || a.status === "closed" || a.status === "draft") return null;
+      return assessProcessingRisk(r?.travelDateFrom, a.ruleSnapshot?.etaMaxDays, a.ruleSnapshot?.etaBasis);
+    }
+
     let rows = applications
-      .map((a: any) => ({ application: a, request: requestById.get(String(a.requestId)) || null }))
+      .map((a: any) => {
+        const request = requestById.get(String(a.requestId)) || null;
+        return { application: a, request, risk: computeRowRisk(a, request) };
+      })
       .filter(({ request }) => !destinationFilter || request?.destinationIso2 === destinationFilter)
-      .filter(({ application: a, request: r }) => {
-        if (!atRiskOnly) return true;
-        if (a.outcome || a.status === "closed" || a.status === "draft") return false; // nothing left to risk
-        const risk = assessProcessingRisk(r?.travelDateFrom, a.ruleSnapshot?.etaMaxDays, a.ruleSnapshot?.etaBasis);
-        return risk?.atRisk === true;
-      });
+      .filter(({ risk }) => !atRiskOnly || risk?.atRisk === true);
 
     const workspaceIds = [...new Set(rows.map((r) => String(r.application.workspaceId)))];
     const workspaces = await CustomerWorkspace.find({ _id: { $in: workspaceIds } })
@@ -418,13 +431,26 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       return { id: String(userId), name: (u?.name || u?.email) ?? null };
     }
 
-    const shaped = pageRows.map(({ application: a, request: r }) => {
+    const shaped = pageRows.map(({ application: a, request: r, risk }) => {
       const workspace = workspaceById.get(String(a.workspaceId)) || null;
       const traveller = travellerById.get(String(a.travellerProfileId)) || null;
       return {
         id: String(a._id),
         status: a.status,
         actionRequiredReason: a.actionRequiredReason ?? null,
+        // The at-risk marker (task brief, 2026-08-01) — "is there still
+        // enough runway before travel to plausibly finish processing,"
+        // computed by utils/visaEta.ts's assessProcessingRisk and reused
+        // verbatim from the SAME call the ?atRisk=true filter above made
+        // for this row (see computeRowRisk) — never recomputed
+        // differently here. null once a decision exists or the case is
+        // closed/draft (nothing left to risk), or whenever the helper
+        // itself has nothing to assess (no travel date, or the rule
+        // snapshot carries no etaMaxDays) — never a guessed verdict.
+        // Carries the full assessment, not just the boolean, so the
+        // console's marker can distinguish a narrowly-tight case from one
+        // that will not make it (marginDays) rather than a flat yes/no.
+        risk,
         // Present only once a traveller erasure has run — so an agent who
         // reaches this row via ?includeErased=true sees why the controls
         // are gone rather than assuming a bug (task brief).
