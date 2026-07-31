@@ -167,6 +167,8 @@ vi.mock("../models/VisaApplication.js", async () => {
   return {
     VISA_APPLICATION_STATUSES: actual.VISA_APPLICATION_STATUSES,
     VISA_APPLICATION_OUTCOMES: actual.VISA_APPLICATION_OUTCOMES,
+    isTravellerErased: actual.isTravellerErased,
+    VISA_APPLICATION_ERASED_MESSAGE: actual.VISA_APPLICATION_ERASED_MESSAGE,
     default: {
       find: (filter: any) => chainableArray(() => _applications.query(filter)),
       findById: (id: any) => findByIdApplication(id),
@@ -546,6 +548,18 @@ describe("GET /applications/:id — detail", () => {
     expect(res.body.assignedConcierge).toEqual({ id: String(concierge._id), name: "Asha Rao", email: "asha@plumtrips.com" });
     expect(res.body.assignedScreeningOfficer).toEqual({ id: String(officer._id), name: "Ravi Kumar", email: "ravi@plumtrips.com" });
   });
+
+  it("READ path still works on an erased application — the case skeleton stays visible for audit", async () => {
+    const app = makeApp();
+    const erasedAt = new Date("2026-08-01T00:00:00Z");
+    const a = applicationDoc(WORKSPACE_A, { travellerProfileId: null, travellerErasedAt: erasedAt });
+
+    const res = await request(app).get(`/applications/${a._id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.application.travellerProfileId).toBeNull();
+    expect(new Date(res.body.application.travellerErasedAt).toISOString()).toBe(erasedAt.toISOString());
+    expect(res.body.traveller).toBeNull();
+  });
 });
 
 describe("PATCH /applications/:id/status — state machine", () => {
@@ -719,6 +733,43 @@ describe("PATCH /applications/:id/status — state machine", () => {
     expect(res.status).toBe(400);
     expect(_applications.get(a._id).status).toBe("action_required");
   });
+
+  describe("traveller erasure guard", () => {
+    it("rejects a legal forward transition once travellerErasedAt is set, and touches nothing", async () => {
+      const app = makeApp();
+      const a = applicationDoc(WORKSPACE_A, { status: "docs_under_review", travellerErasedAt: new Date() });
+      const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: "cost_confirmed" });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/erased/i);
+      expect(_applications.get(a._id).status).toBe("docs_under_review");
+      expect(recomputeRequestStatusMock).not.toHaveBeenCalled();
+      expect(createVisaWorkStartBookingMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects setting action_required once erased", async () => {
+      const app = makeApp();
+      const a = applicationDoc(WORKSPACE_A, { status: "cost_confirmed", travellerErasedAt: new Date() });
+      const res = await request(app)
+        .patch(`/applications/${a._id}/status`)
+        .send({ status: "action_required", reason: "Awaiting appointment" });
+      expect(res.status).toBe(409);
+      expect(_applications.get(a._id).status).toBe("cost_confirmed");
+      expect(setActionRequiredMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects clearing action_required once erased", async () => {
+      const app = makeApp();
+      const a = applicationDoc(WORKSPACE_A, {
+        status: "action_required",
+        actionRequiredReason: "Awaiting appointment",
+        travellerErasedAt: new Date(),
+      });
+      const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: "submitted" });
+      expect(res.status).toBe(409);
+      expect(_applications.get(a._id).status).toBe("action_required");
+      expect(clearActionRequiredMock).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("PATCH /documents/:id/review", () => {
@@ -748,6 +799,20 @@ describe("PATCH /documents/:id/review", () => {
     expect(stored.reviewedAt).toBeInstanceOf(Date);
     // Never deleted — the applicant still needs to see what was rejected.
     expect(_documents.get(doc._id)).not.toBeNull();
+  });
+
+  it("rejects review once the owning application's traveller has been erased, before any write", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { travellerErasedAt: new Date() });
+    const doc = _documents.insert({ applicationId: a._id, docCode: "DOC-03", reviewStatus: "PENDING", deletedAt: null });
+    const res = await request(app)
+      .patch(`/documents/${doc._id}/review`)
+      .send({ reviewStatus: "REJECTED", rejectionReason: "Statement is only 3 months, needs 6" });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/erased/i);
+    const stored = _documents.get(doc._id);
+    expect(stored.reviewStatus).toBe("PENDING");
+    expect(stored.reviewedBy).toBeUndefined();
   });
 });
 
@@ -877,6 +942,20 @@ describe("PATCH /applications/:id/costs", () => {
     expect(withReason.status).toBe(200);
     expect(_applications.get(a._id).actualTotalInr).toBe(29689);
   });
+
+  it("rejects recording costs once travellerErasedAt is set, and touches nothing", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, {
+      indicativeCostSnapshot: { displayMode: "ITEMISED", totalInr: 5000 },
+      travellerErasedAt: new Date(),
+    });
+    const res = await request(app)
+      .patch(`/applications/${a._id}/costs`)
+      .send({ actualEmbassyFeeInr: 2000, actualVfsFeeInr: 2000, actualPlumtripsServiceFeeInr: 500 });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/erased/i);
+    expect(_applications.get(a._id).actualTotalInr).toBeUndefined();
+  });
 });
 
 describe("PATCH /applications/:id/outcome", () => {
@@ -933,6 +1012,19 @@ describe("PATCH /applications/:id/outcome", () => {
     expect(createVisaDocumentUploadMock.mock.calls[0][0]).toMatchObject({ docCode: "DOC-10" });
     expect(res.body.document).toBeTruthy();
   });
+
+  it("rejects recording an outcome once travellerErasedAt is set, and touches nothing", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "lodged", travellerErasedAt: new Date() });
+    const res = await request(app)
+      .patch(`/applications/${a._id}/outcome`)
+      .send({ outcome: "APPROVED", visaNumber: "V1", visaIssuedAt: "2026-01-01", visaExpiresAt: "2027-01-01" });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/erased/i);
+    expect(_applications.get(a._id).status).toBe("lodged");
+    expect(_applications.get(a._id).outcome).toBeUndefined();
+    expect(createVisaDocumentUploadMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("GET /queue — cross-workspace", () => {
@@ -970,6 +1062,23 @@ describe("GET /queue — cross-workspace", () => {
     applicationDoc(WORKSPACE_A, { status: "draft" });
     const res = await request(app).get("/queue");
     expect(res.body.applications).toHaveLength(0);
+  });
+
+  it("excludes an erased-traveller application by default — nothing for an agent to work", async () => {
+    const app = makeApp();
+    applicationDoc(WORKSPACE_A, { status: "docs_under_review", travellerErasedAt: new Date() });
+    const res = await request(app).get("/queue");
+    expect(res.body.applications).toHaveLength(0);
+  });
+
+  it("?includeErased=true surfaces it, with travellerErasedAt marked on the row", async () => {
+    const app = makeApp();
+    const erasedAt = new Date("2026-08-01T00:00:00Z");
+    const a = applicationDoc(WORKSPACE_A, { status: "docs_under_review", travellerErasedAt: erasedAt });
+    const res = await request(app).get("/queue?includeErased=true");
+    expect(res.body.applications).toHaveLength(1);
+    expect(res.body.applications[0].id).toBe(String(a._id));
+    expect(new Date(res.body.applications[0].travellerErasedAt).toISOString()).toBe(erasedAt.toISOString());
   });
 
   describe("Phase 9f — customer-responded visibility", () => {
@@ -1198,6 +1307,21 @@ describe("PATCH /applications/:id/assignment", () => {
     expect(String(stored.assignedScreeningOfficerId)).toBe(String(officer._id));
     expect(stored.assignedScreeningOfficerAssignedAt).toEqual(new Date("2026-01-01"));
   });
+
+  it("rejects assignment once travellerErasedAt is set, and touches nothing", async () => {
+    const app = makeApp();
+    const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    grantVisaPermission(concierge._id, "WRITE");
+    const a = applicationDoc(WORKSPACE_A, { travellerErasedAt: new Date() });
+
+    const res = await request(app)
+      .patch(`/applications/${a._id}/assignment`)
+      .send({ assignedConciergeUserId: String(concierge._id) });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/erased/i);
+    expect(_applications.get(a._id).assignedConciergeUserId).toBeUndefined();
+  });
 });
 
 describe("POST /applications/bulk-assign", () => {
@@ -1281,6 +1405,25 @@ describe("POST /applications/bulk-assign", () => {
       expect(stored.assignedConciergeUserId).toBeNull();
       expect(String(stored.assignedScreeningOfficerId)).toBe(String(officer._id));
     }
+  });
+
+  it("is atomic — one erased traveller in the batch means NONE of it is assigned", async () => {
+    const app = makeApp();
+    const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
+    grantVisaPermission(concierge._id, "WRITE");
+    const a1 = applicationDoc(WORKSPACE_A);
+    const a2 = applicationDoc(WORKSPACE_A, { travellerErasedAt: new Date() });
+
+    const res = await request(app).post("/applications/bulk-assign").send({
+      applicationIds: [String(a1._id), String(a2._id)],
+      assignedConciergeUserId: String(concierge._id),
+    });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/erased/i);
+    expect(res.body.erasedApplicationIds).toEqual([String(a2._id)]);
+    expect(_applications.get(a1._id).assignedConciergeUserId).toBeUndefined();
+    expect(_applications.get(a2._id).assignedConciergeUserId).toBeUndefined();
   });
 });
 

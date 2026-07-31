@@ -140,6 +140,9 @@ vi.mock("../models/VisaApplication.js", () => ({
     countDocuments: async (filter: any) => _applications.query(filter).length,
     aggregate: async (pipeline: any[]) => runAggregate(Array.from(_applications.store.values()), pipeline),
   },
+  isTravellerErased: (application: any) => !!application?.travellerErasedAt,
+  VISA_APPLICATION_ERASED_MESSAGE:
+    "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.",
 }));
 
 vi.mock("../models/VisaRequest.js", () => ({

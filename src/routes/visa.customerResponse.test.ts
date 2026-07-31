@@ -89,6 +89,9 @@ vi.mock("../models/VisaApplication.js", () => ({
     findById: (id: any) => chainable(() => applications.get(id)),
     findByIdAndUpdate: async (id: any, update: any) => applications.update(id, update?.$set || {}),
   },
+  isTravellerErased: (application: any) => !!application?.travellerErasedAt,
+  VISA_APPLICATION_ERASED_MESSAGE:
+    "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.",
   // Faithful-enough replica of the real clearActionRequired (models/
   // VisaApplication.ts) for this route's purposes: restores status from
   // statusBeforeActionRequired, nulls the action_required quartet.

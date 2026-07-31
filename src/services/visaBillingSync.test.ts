@@ -415,6 +415,13 @@ describe("syncVisaApplicationBilling — idempotency and updates", () => {
     expect(unchanged.pricing.quotedPrice).toBe(7500); // untouched
     expect(unchanged.status).toBe("INVOICED");
   });
+
+  it("skips a traveller-erased application — never creates or touches a ManualBooking", async () => {
+    const { application } = fullFixtureSet({ travellerErasedAt: new Date() });
+    const result = await syncVisaApplicationBilling(application, new mongoose.Types.ObjectId());
+    expect(result).toEqual({ action: "skipped_traveller_erased", manualBookingId: null });
+    expect(_manualBookings.query({})).toHaveLength(0);
+  });
 });
 
 describe("createVisaWorkStartBooking — Phase 9e", () => {
@@ -469,6 +476,13 @@ describe("createVisaWorkStartBooking — Phase 9e", () => {
     const booking = _manualBookings.get(result.manualBookingId!);
     expect(booking.pricing.actualPrice).toBe(0);
     expect(booking.pricing.quotedPrice).toBe(0);
+  });
+
+  it("skips a traveller-erased application — never creates a work-start booking, even though the route-level guard should already have blocked reaching here", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined, travellerErasedAt: new Date() });
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+    expect(result).toEqual({ action: "skipped_traveller_erased", manualBookingId: null });
+    expect(_manualBookings.query({})).toHaveLength(0);
   });
 });
 

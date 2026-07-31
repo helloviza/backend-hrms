@@ -51,6 +51,9 @@ vi.mock("../models/VisaRequest.js", () => ({
 
 vi.mock("../models/VisaApplication.js", () => ({
   default: { find: (filter: any) => chainable(() => applications.query(filter)) },
+  isTravellerErased: (application: any) => !!application?.travellerErasedAt,
+  VISA_APPLICATION_ERASED_MESSAGE:
+    "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.",
 }));
 
 vi.mock("../models/TravellerProfile.js", () => ({ default: { find: () => chainable(() => []) } }));

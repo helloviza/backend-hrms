@@ -188,6 +188,9 @@ vi.mock("../models/VisaApplication.js", () => ({
     find: (filter: any) => chainable(() => applications.query(filter)),
     insertMany: async (docs: any[]) => docs.map((d) => applications.insert(d)),
   },
+  isTravellerErased: (application: any) => !!application?.travellerErasedAt,
+  VISA_APPLICATION_ERASED_MESSAGE:
+    "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.",
 }));
 
 vi.mock("../models/VisaRequest.js", () => ({
@@ -400,6 +403,19 @@ describe("POST /applications/:applicationId/documents", () => {
       expect(documents.store.size).toBe(0);
     },
   );
+
+  it("rejects upload once travellerErasedAt is set, even in an otherwise-uploadable status, and writes nothing", async () => {
+    const app = applicationDoc(WORKSPACE_A, { status: "action_required", travellerErasedAt: new Date() });
+    const res = await request(makeApp(WORKSPACE_A))
+      .post(`/applications/${app._id}/documents`)
+      .field("docCode", "DOC-01")
+      .attach("file", Buffer.from("%PDF-1.4 fake"), { filename: "passport.pdf", contentType: "application/pdf" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/erased/i);
+    expect(uploadBufferToS3Mock).not.toHaveBeenCalled();
+    expect(documents.store.size).toBe(0);
+  });
 
   it("replacing a reviewed document starts the new version at PENDING, never inheriting the old verdict", async () => {
     const app = applicationDoc(WORKSPACE_A, { status: "action_required" });

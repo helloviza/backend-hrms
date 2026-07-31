@@ -39,6 +39,8 @@ import VisaApplication, {
   VISA_APPLICATION_OUTCOMES,
   setActionRequired,
   clearActionRequired,
+  isTravellerErased,
+  VISA_APPLICATION_ERASED_MESSAGE,
   type VisaApplicationStatus,
   type VisaApplicationOutcome,
 } from "../models/VisaApplication.js";
@@ -114,7 +116,14 @@ function mapAdminApplicationSummary(a: any) {
     id: String(a._id),
     requestId: String(a.requestId),
     workspaceId: String(a.workspaceId),
-    travellerProfileId: String(a.travellerProfileId),
+    // null after scripts/erase-traveller-profile.ts has run (models/
+    // VisaApplication.ts) — String(null) would otherwise render the literal
+    // string "null", which reads as a real (broken) id rather than "erased".
+    travellerProfileId: a.travellerProfileId ? String(a.travellerProfileId) : null,
+    // Present only once a traveller erasure has run — the console's marker
+    // for "this case is terminal, the controls are gone on purpose" (task
+    // brief), never rewritten or cleared by anything else.
+    travellerErasedAt: a.travellerErasedAt ?? null,
     status: a.status,
     outcome: a.outcome ?? null,
     actionRequiredReason: a.actionRequiredReason ?? null,
@@ -256,6 +265,25 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       }
     }
 
+    // Excluded from the default queue by default — an erased-traveller
+    // application is terminal, nothing for an agent to work (task brief).
+    // Still reachable with an explicit ?includeErased=true, and GET
+    // /applications/:id never applies this filter at all — the case
+    // skeleton stays visible for audit either way. Same "fold into whatever
+    // shape filter.status/$and already took" idiom as customerResponded
+    // above.
+    if (req.query.includeErased !== "true") {
+      const condition = { travellerErasedAt: null };
+      if (filter.$and) {
+        filter.$and.push(condition);
+      } else if (filter.status !== undefined) {
+        filter.$and = [{ status: filter.status }, condition];
+        delete filter.status;
+      } else {
+        Object.assign(filter, condition);
+      }
+    }
+
     const applications = await VisaApplication.find(filter).lean();
 
     const requestIds = [...new Set(applications.map((a: any) => String(a.requestId)))];
@@ -346,6 +374,10 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         id: String(a._id),
         status: a.status,
         actionRequiredReason: a.actionRequiredReason ?? null,
+        // Present only once a traveller erasure has run — so an agent who
+        // reaches this row via ?includeErased=true sees why the controls
+        // are gone rather than assuming a bug (task brief).
+        travellerErasedAt: a.travellerErasedAt ?? null,
         customerRespondedAt: a.customerRespondedAt ?? null,
         submittedAt: a.submittedAt ?? null,
         destinationName: a.ruleSnapshot?.destinationName ?? null,
@@ -513,6 +545,11 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
 
     const application = await VisaApplication.findById(id);
     if (!application) return res.status(404).json({ error: "Visa application not found" });
+
+    if (isTravellerErased(application)) {
+      return res.status(409).json({ error: VISA_APPLICATION_ERASED_MESSAGE });
+    }
+
     const current = application.status;
 
     // Phase 9e — the work-start billing side effect, populated only on the
@@ -661,6 +698,17 @@ router.patch("/documents/:id/review", requirePermission("visaApplication", "WRIT
       }
     }
 
+    // Resolved BEFORE the write below (moved out of the post-write,
+    // best-effort lookup this used to only need for the activity log) so
+    // the erasure guard can run before anything is written, not after.
+    const existingDoc = await VisaDocument.findOne({ _id: id, deletedAt: null }).lean();
+    if (!existingDoc) return res.status(404).json({ error: "Document not found" });
+
+    const owningApplication = await VisaApplication.findById((existingDoc as any).applicationId).lean();
+    if (isTravellerErased(owningApplication)) {
+      return res.status(409).json({ error: VISA_APPLICATION_ERASED_MESSAGE });
+    }
+
     const update: any = {
       $set: { reviewStatus, reviewedBy: actorId(req), reviewedAt: new Date() },
     };
@@ -675,11 +723,9 @@ router.patch("/documents/:id/review", requirePermission("visaApplication", "WRIT
     const doc = await VisaDocument.findOneAndUpdate({ _id: id, deletedAt: null }, update, { new: true });
     if (!doc) return res.status(404).json({ error: "Document not found" });
 
-    // requestId isn't on VisaDocument itself — resolved via one extra
-    // lookup, wrapped so a failure here can never fail the review that
-    // already succeeded above.
+    // Activity logging wrapped so a failure here can never fail the review
+    // that already succeeded above.
     try {
-      const owningApplication = await VisaApplication.findById(doc.applicationId).select("requestId").lean();
       if (owningApplication) {
         await logVisaActivity({
           applicationId: doc.applicationId,
@@ -792,6 +838,10 @@ router.patch("/applications/:id/costs", requirePermission("visaApplication", "FU
 
     const application = await VisaApplication.findById(id);
     if (!application) return res.status(404).json({ error: "Visa application not found" });
+
+    if (isTravellerErased(application)) {
+      return res.status(409).json({ error: VISA_APPLICATION_ERASED_MESSAGE });
+    }
 
     const actualTotalInr =
       (actualEmbassyFeeInr as number) + (actualVfsFeeInr as number) + (actualPlumtripsServiceFeeInr as number);
@@ -914,6 +964,11 @@ router.patch(
 
       const application = await VisaApplication.findById(id);
       if (!application) return res.status(404).json({ error: "Visa application not found" });
+
+      if (isTravellerErased(application)) {
+        return res.status(409).json({ error: VISA_APPLICATION_ERASED_MESSAGE });
+      }
+
       const current = application.status;
 
       if (outcome === "WITHDRAWN") {
@@ -1161,6 +1216,10 @@ router.patch("/applications/:id/assignment", requirePermission("visaApplication"
     const exists = await VisaApplication.findById(id).lean();
     if (!exists) return res.status(404).json({ error: "Visa application not found" });
 
+    if (isTravellerErased(exists)) {
+      return res.status(409).json({ error: VISA_APPLICATION_ERASED_MESSAGE });
+    }
+
     const result = await buildAssignmentUpdate(req.body || {}, actorId(req));
     if ("error" in result) {
       return res.status(result.status).json({ error: result.error });
@@ -1219,12 +1278,20 @@ router.post("/applications/bulk-assign", requirePermission("visaApplication", "W
     }
 
     const existing = await VisaApplication.find({ _id: { $in: ids } })
-      .select("_id requestId workspaceId assignedConciergeUserId assignedScreeningOfficerId")
+      .select("_id requestId workspaceId assignedConciergeUserId assignedScreeningOfficerId travellerErasedAt")
       .lean();
     if (existing.length !== ids.length) {
       const foundIds = new Set(existing.map((a: any) => String(a._id)));
       const missing = ids.filter((id) => !foundIds.has(id));
       return res.status(404).json({ error: "Some applications were not found — nothing was assigned", missing });
+    }
+
+    // Same atomicity posture as the missing-ids check above — one erased
+    // application in the batch means NONE of it is assigned, not "assign
+    // the rest and skip that one silently."
+    const erasedIds = (existing as any[]).filter((a) => isTravellerErased(a)).map((a) => String(a._id));
+    if (erasedIds.length > 0) {
+      return res.status(409).json({ error: VISA_APPLICATION_ERASED_MESSAGE, erasedApplicationIds: erasedIds });
     }
 
     await VisaApplication.updateMany({ _id: { $in: ids } }, { $set: result.set });

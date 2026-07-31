@@ -13,7 +13,7 @@ vi.mock("../utils/logger.js", () => ({
   default: { child: () => ({ warn: vi.fn(), info: vi.fn(), error: vi.fn() }) },
 }));
 
-import VisaApplication, { setActionRequired, clearActionRequired } from "./VisaApplication.js";
+import VisaApplication, { setActionRequired, clearActionRequired, isTravellerErased } from "./VisaApplication.js";
 
 function chainWithLean(value: any) {
   return { select: () => ({ lean: () => Promise.resolve(value) }) };
@@ -145,5 +145,21 @@ describe("setActionRequired / clearActionRequired", () => {
 
       expect(store!.customerRespondedAt).toEqual(new Date("2026-02-01T00:00:00Z"));
     });
+  });
+});
+
+describe("isTravellerErased", () => {
+  it("is false for an application whose traveller was never erased", () => {
+    expect(isTravellerErased({ travellerErasedAt: null })).toBe(false);
+    expect(isTravellerErased({})).toBe(false);
+  });
+
+  it("is true once travellerErasedAt is set", () => {
+    expect(isTravellerErased({ travellerErasedAt: new Date() })).toBe(true);
+  });
+
+  it("is false for a null/undefined application — never throws on a not-found lookup", () => {
+    expect(isTravellerErased(null)).toBe(false);
+    expect(isTravellerErased(undefined)).toBe(false);
   });
 });

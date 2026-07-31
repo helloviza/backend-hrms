@@ -476,3 +476,29 @@ export async function clearActionRequired(
     { new: true },
   );
 }
+
+/**
+ * Erasure follow-up (2026-08-01) — the guard every mutation that advances
+ * or adds to a case must call BEFORE writing anything, once
+ * travellerErasedAt is set (scripts/erase-traveller-profile.ts). The real
+ * rule isn't "don't create an empty ManualBooking" (that was just how the
+ * gap first surfaced, in visaBillingSync.ts) — it's that continuing to
+ * process a case for someone who exercised their erasure right is the
+ * problem, everywhere: status transitions (including the action_required
+ * side-branch), document upload/review, cost capture, outcome capture,
+ * assignment, and the billing sync all call this first and reject with
+ * VISA_APPLICATION_ERASED_MESSAGE if it returns true. Status is NEVER
+ * rewritten by this guard or by anything reacting to it — the application
+ * stays exactly where erasure found it (task brief: rewriting history to
+ * tidy up the UI is the wrong trade). READ paths (GET /queue, GET
+ * /applications/:id) never call this — the case skeleton stays visible for
+ * audit either way.
+ */
+export const VISA_APPLICATION_ERASED_MESSAGE =
+  "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.";
+
+export function isTravellerErased(
+  application: { travellerErasedAt?: Date | null } | null | undefined,
+): boolean {
+  return !!application?.travellerErasedAt;
+}

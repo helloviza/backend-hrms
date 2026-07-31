@@ -95,6 +95,9 @@ vi.mock("../models/VisaApplication.js", () => ({
   default: {
     find: () => chainable(() => []),
   },
+  isTravellerErased: (application: any) => !!application?.travellerErasedAt,
+  VISA_APPLICATION_ERASED_MESSAGE:
+    "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.",
 }));
 
 // This route logs REQUEST_CANCELLED via logVisaActivity — mocked to a no-op

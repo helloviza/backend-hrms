@@ -64,6 +64,8 @@ import VisaDestinationContent from "../models/VisaDestinationContent.js";
 import VisaRequest, { recomputeRequestStatus } from "../models/VisaRequest.js";
 import VisaApplication, {
   clearActionRequired,
+  isTravellerErased,
+  VISA_APPLICATION_ERASED_MESSAGE,
   type VisaRuleSnapshot,
   type VisaIndicativeCostSnapshot,
 } from "../models/VisaApplication.js";
@@ -1268,6 +1270,10 @@ router.post(
       const workspaceId = req.workspaceObjectId;
       const application = await findOwnedApplication(req.params.applicationId, workspaceId);
       if (!application) return res.status(404).json({ error: "Visa application not found" });
+
+      if (isTravellerErased(application)) {
+        return res.status(409).json({ error: VISA_APPLICATION_ERASED_MESSAGE });
+      }
 
       if (!DOCUMENT_MUTATION_ALLOWED_STATUSES.includes(application.status)) {
         return res.status(409).json({ error: DOCUMENT_UPLOAD_BLOCKED_MESSAGE });

@@ -129,6 +129,8 @@ vi.mock("../models/VisaApplication.js", async () => {
   return {
     VISA_APPLICATION_STATUSES: actual.VISA_APPLICATION_STATUSES,
     VISA_APPLICATION_OUTCOMES: actual.VISA_APPLICATION_OUTCOMES,
+    isTravellerErased: actual.isTravellerErased,
+    VISA_APPLICATION_ERASED_MESSAGE: actual.VISA_APPLICATION_ERASED_MESSAGE,
     default: {
       countDocuments: async (filter: any) => _applications.query(filter).length,
       find: (filter: any) => chainableArray(() => _applications.query(filter)),

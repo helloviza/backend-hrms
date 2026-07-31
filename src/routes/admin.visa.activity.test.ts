@@ -95,6 +95,8 @@ vi.mock("../models/VisaApplication.js", async () => {
   return {
     VISA_APPLICATION_STATUSES: actual.VISA_APPLICATION_STATUSES,
     VISA_APPLICATION_OUTCOMES: actual.VISA_APPLICATION_OUTCOMES,
+    isTravellerErased: actual.isTravellerErased,
+    VISA_APPLICATION_ERASED_MESSAGE: actual.VISA_APPLICATION_ERASED_MESSAGE,
     default: {
       findById: (id: any) => findByIdApplication(id),
       findOneAndUpdate: async (filter: any, update: any) => {
@@ -139,6 +141,7 @@ vi.mock("../models/CustomerWorkspace.js", () => ({ default: { find: () => chaina
 
 vi.mock("../models/VisaDocument.js", () => ({
   default: {
+    findOne: (filter: any) => ({ lean: () => Promise.resolve(_documents.query(filter)[0] ?? null) }),
     findOneAndUpdate: async (filter: any, update: any) => {
       const rec = _documents.query(filter)[0];
       if (!rec) return null;

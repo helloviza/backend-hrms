@@ -92,6 +92,9 @@ vi.mock("../models/VisaApplication.js", () => ({
     findOne: (filter: any) => applications.findOne(filter),
     find: (filter: any) => ({ lean: () => Promise.resolve(applications.query(filter)) }),
   },
+  isTravellerErased: (application: any) => !!application?.travellerErasedAt,
+  VISA_APPLICATION_ERASED_MESSAGE:
+    "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.",
 }));
 
 vi.mock("../models/VisaDocument.js", () => ({

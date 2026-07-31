@@ -126,6 +126,9 @@ vi.mock("../models/VisaApplication.js", () => ({
     insertMany: async (docs: any[]) => docs.map((d) => applications.insert(d)),
     find: (filter: any) => chainable(() => applications.query(filter)),
   },
+  isTravellerErased: (application: any) => !!application?.travellerErasedAt,
+  VISA_APPLICATION_ERASED_MESSAGE:
+    "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.",
 }));
 
 vi.mock("../models/User.js", () => ({

@@ -114,6 +114,9 @@ vi.mock("../models/VisaApplication.js", () => ({
     find: (filter: any) => chainable(() => applications.query(filter)),
     updateMany: async (filter: any, update: any) => applications.updateMany(filter, update),
   },
+  isTravellerErased: (application: any) => !!application?.travellerErasedAt,
+  VISA_APPLICATION_ERASED_MESSAGE:
+    "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.",
 }));
 
 // This route logs SUBMITTED (one row per newly-submitted application) via

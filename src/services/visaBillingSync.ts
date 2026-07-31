@@ -88,7 +88,8 @@ export type VisaBillingSyncAction =
   | "skipped_cancelled"
   | "skipped_unexpected_status"
   | "skipped_already_exists"
-  | "skipped_no_request";
+  | "skipped_no_request"
+  | "skipped_traveller_erased";
 
 export interface VisaBillingSyncResult {
   action: VisaBillingSyncAction;
@@ -200,6 +201,19 @@ export async function createVisaWorkStartBooking(
 ): Promise<VisaBillingSyncResult> {
   const applicationId = String(application._id);
 
+  // Defense-in-depth — the only route that calls this
+  // (admin.visa.ts's PATCH /applications/:id/status) already rejects a
+  // status transition on an erased application before reaching here, so
+  // this should never actually fire in practice. Checked anyway: continuing
+  // to bill/process someone who exercised their erasure right is the
+  // problem this guard exists for, not just "don't create an empty
+  // ManualBooking" — this function must never create one for an erased
+  // application even if a future caller forgets the route-level check.
+  if (application.travellerErasedAt) {
+    visaBillingLogger.warn("skipped work-start booking — traveller erased", { applicationId });
+    return { action: "skipped_traveller_erased", manualBookingId: null };
+  }
+
   const existing = await ManualBooking.findOne({ "metadata.visaApplicationId": applicationId });
   if (existing) {
     visaBillingLogger.warn("work-start booking already exists — not recreated", {
@@ -296,6 +310,13 @@ export async function syncVisaApplicationBilling(
   actorUserId: any,
 ): Promise<VisaBillingSyncResult> {
   const applicationId = String(application._id);
+
+  // Defense-in-depth — see createVisaWorkStartBooking's identical guard
+  // above for why this is checked here too, not just at the calling route.
+  if (application.travellerErasedAt) {
+    visaBillingLogger.warn("skipped outcome billing sync — traveller erased", { applicationId });
+    return { action: "skipped_traveller_erased", manualBookingId: null };
+  }
 
   const actualPrice = (application.actualEmbassyFeeInr || 0) + (application.actualVfsFeeInr || 0);
   const serviceFee = application.actualPlumtripsServiceFeeInr || 0;
