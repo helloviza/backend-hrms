@@ -97,7 +97,13 @@ export interface VisaIndicativeCostSnapshot {
 export interface VisaApplicationDocument extends Document {
   workspaceId: mongoose.Types.ObjectId; // CustomerWorkspace._id, via workspaceScopePlugin
   requestId: mongoose.Types.ObjectId; // ref VisaRequest
-  travellerProfileId: mongoose.Types.ObjectId; // ref TravellerProfile — applicant identity, not duplicated here
+  // ref TravellerProfile — applicant identity, not duplicated here. NULL only
+  // after scripts/erase-traveller-profile.ts has run (see travellerErasedAt
+  // below) — every OTHER code path that creates or reads an application must
+  // keep treating this as populated; routes/visa.ts's POST /requests is what
+  // actually guarantees it's set at creation (not a schema-level `required`
+  // any more — see the schema field's own comment for why).
+  travellerProfileId: mongoose.Types.ObjectId | null;
   // ISO2, resolved at creation from TravellerProfile.nationality via
   // normaliseToIso2() (routes/visa.ts). TravellerProfile.nationality is a
   // free-text field (OCR/manual entry), so resolution can fail — e.g. a
@@ -165,6 +171,18 @@ export interface VisaApplicationDocument extends Document {
   // clearActionRequired() (manual or auto): it stays as evidence of what
   // happened in the episode that just ended, until the next one starts.
   customerRespondedAt: Date | null;
+
+  // Erasure follow-up (2026-08-01, scripts/erase-traveller-profile.ts) — set
+  // together with travellerProfileId:null, never independently. The case
+  // skeleton (status, dates, ruleSnapshot, assignment, costs) survives a
+  // traveller erasure deliberately (task brief: "separate from application
+  // deletion"), but the applicant reference itself is gone; this timestamp
+  // is what tells a reader "travellerProfileId is null because the traveller
+  // was erased" instead of "travellerProfileId is null because something is
+  // broken" — a dangling/missing reference with no explanation reads as a
+  // bug, an explicit null plus this timestamp reads as a deliberate erasure.
+  // Null on every application that has never had its traveller erased.
+  travellerErasedAt: Date | null;
 
   // Set the moment this application transitions draft -> submitted (POST
   // /requests/:id/submit, routes/visa.ts) — never on creation, and never
@@ -275,10 +293,17 @@ const VisaLinkedBookingSchema = new Schema<VisaLinkedBooking>(
 const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
   {
     requestId: { type: Schema.Types.ObjectId, ref: "VisaRequest", required: true, index: true },
+    // NOT `required: true` — deliberately loosened for scripts/
+    // erase-traveller-profile.ts, which sets this to null (see
+    // travellerErasedAt below). Every application is still created WITH one:
+    // routes/visa.ts's POST /requests resolves and validates every
+    // travellerProfileId before building applicationInputs, so schema-level
+    // `required` was only ever a redundant backstop over that, never the
+    // only thing enforcing it.
     travellerProfileId: {
       type: Schema.Types.ObjectId,
       ref: "TravellerProfile",
-      required: true,
+      default: null,
       index: true,
     },
     nationality: { type: String, uppercase: true, trim: true, default: null },
@@ -302,6 +327,7 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     actionRequiredSetByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
     statusBeforeActionRequired: { type: String, enum: VISA_APPLICATION_STATUSES, default: null },
     customerRespondedAt: { type: Date, default: null },
+    travellerErasedAt: { type: Date, default: null },
 
     submittedAt: { type: Date },
     lodgedAt: { type: Date },
@@ -324,7 +350,16 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
 VisaApplicationSchema.plugin(workspaceScopePlugin);
 
 // One application per traveller PER REQUEST (see file-header note on scope).
-VisaApplicationSchema.index({ requestId: 1, travellerProfileId: 1 }, { unique: true });
+// partialFilterExpression excludes travellerProfileId:null from the
+// uniqueness constraint — without it, a SECOND traveller erasure on the same
+// request (two applications both nulled out) would collide on a duplicate
+// {requestId, null} key and throw. Once erased, "one per traveller" no
+// longer means anything for that row; the constraint should only ever apply
+// while travellerProfileId is a real reference.
+VisaApplicationSchema.index(
+  { requestId: 1, travellerProfileId: 1 },
+  { unique: true, partialFilterExpression: { travellerProfileId: { $type: "objectId" } } },
+);
 // Console/admin queue filtering (own-workspace angle).
 VisaApplicationSchema.index({ workspaceId: 1, status: 1 });
 // A traveller's application history across requests.

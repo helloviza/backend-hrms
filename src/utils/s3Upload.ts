@@ -1,5 +1,5 @@
 // apps/backend/src/utils/s3Upload.ts
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import crypto from "crypto";
 import { env } from "../config/env.js";
@@ -145,6 +145,18 @@ export async function getObjectBuffer(key: string): Promise<Buffer> {
   );
   const bytes = await (res.Body as any).transformToByteArray();
   return Buffer.from(bytes);
+}
+
+/**
+ * Delete a single S3 object by key. S3 DeleteObject is idempotent — deleting
+ * a key that doesn't exist (already gone, or never existed) succeeds rather
+ * than throwing, so callers never need to check existence first. Used by
+ * the visa erasure cascade (scripts/lib/visaErasureCascade.ts) to remove a
+ * passport image once its VisaDocument row is being deleted — the only
+ * caller of this today, but generic enough for future hard-delete paths.
+ */
+export async function deleteObject(key: string): Promise<void> {
+  await s3.send(new DeleteObjectCommand({ Bucket: env.S3_BUCKET, Key: key }));
 }
 
 /**

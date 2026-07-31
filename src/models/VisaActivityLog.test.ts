@@ -8,6 +8,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 import VisaActivityLog, {
   logVisaActivity,
+  redactVisaActivityForApplications,
+  redactVisaActivityForRequest,
   VISA_ACTIVITY_EVENT_TYPES,
   VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES,
   VISA_ACTIVITY_ACTOR_TYPES,
@@ -155,5 +157,45 @@ describe("logVisaActivity", () => {
     const secondRow = createSpy.mock.calls[1][0][0];
     expect(firstRow.detail).toEqual({ from: "submitted", to: "docs_under_review" });
     expect(secondRow.detail).toEqual({ from: "docs_under_review", to: "cost_confirmed" });
+  });
+});
+
+describe("redactVisaActivityForApplications / redactVisaActivityForRequest — activity rows survive but scrubbed", () => {
+  const applicationId = new mongoose.Types.ObjectId();
+  const requestId = new mongoose.Types.ObjectId();
+
+  it("wipes detail and stamps redactedAt, scoped to the given applicationIds, never re-touching already-redacted rows", async () => {
+    const updateManySpy = vi.spyOn(VisaActivityLog, "updateMany").mockResolvedValue({ modifiedCount: 3 } as any);
+
+    const count = await redactVisaActivityForApplications([applicationId]);
+
+    expect(updateManySpy).toHaveBeenCalledWith(
+      { applicationId: { $in: [applicationId] }, redactedAt: null },
+      { $set: { detail: {}, redactedAt: expect.any(Date) } },
+    );
+    expect(count).toBe(3);
+  });
+
+  it("no-ops with no application ids — never calls updateMany at all", async () => {
+    const updateManySpy = vi.spyOn(VisaActivityLog, "updateMany");
+    expect(await redactVisaActivityForApplications([])).toBe(0);
+    expect(updateManySpy).not.toHaveBeenCalled();
+  });
+
+  it("redactVisaActivityForRequest scopes by requestId instead — covers the two request-level-only event types with no applicationId", async () => {
+    const updateManySpy = vi.spyOn(VisaActivityLog, "updateMany").mockResolvedValue({ modifiedCount: 5 } as any);
+
+    const count = await redactVisaActivityForRequest(requestId);
+
+    expect(updateManySpy).toHaveBeenCalledWith(
+      { requestId, redactedAt: null },
+      { $set: { detail: {}, redactedAt: expect.any(Date) } },
+    );
+    expect(count).toBe(5);
+  });
+
+  it("returns 0 when nothing matched, never throws", async () => {
+    vi.spyOn(VisaActivityLog, "updateMany").mockResolvedValue({ modifiedCount: 0 } as any);
+    expect(await redactVisaActivityForRequest(requestId)).toBe(0);
   });
 });

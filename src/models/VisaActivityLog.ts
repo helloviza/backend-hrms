@@ -114,6 +114,18 @@ export interface VisaActivityLogDocument extends Document {
   actorType: VisaActivityActorType;
   at: Date;
   detail: Record<string, unknown>; // event-specific — NEVER PII, see file header
+
+  // Erasure follow-up (2026-07-31) — set ONLY by
+  // redactVisaActivityForApplications/redactVisaActivityForRequest below,
+  // as part of scripts/erase-visa-request.ts or
+  // scripts/erase-traveller-profile.ts. The row itself (eventType, at,
+  // requestId/applicationId, actorType) survives an erasure — "a case
+  // existed and was worked" is an audit record — but `detail` is wiped
+  // wholesale rather than picked over field-by-field: a concierge's free-text
+  // reason (actionRequiredReason, a rejection reason) can name the applicant,
+  // and that text isn't enumerable as a fixed set of "safe" keys. Never unset
+  // once set — redaction is one-way.
+  redactedAt?: Date | null;
 }
 
 const VisaActivityLogSchema = new Schema<VisaActivityLogDocument>({
@@ -125,6 +137,7 @@ const VisaActivityLogSchema = new Schema<VisaActivityLogDocument>({
   actorType: { type: String, enum: VISA_ACTIVITY_ACTOR_TYPES, required: true },
   at: { type: Date, required: true, default: Date.now },
   detail: { type: Schema.Types.Mixed, default: {} },
+  redactedAt: { type: Date, default: null },
 });
 
 // Per-case history (concierge console's activity tab), newest first.
@@ -181,4 +194,48 @@ export async function logVisaActivity(entry: LogVisaActivityInput): Promise<void
       error: err?.message,
     });
   }
+}
+
+/**
+ * Erasure follow-up — redacts every NOT-YET-redacted row for a set of
+ * applicationIds: `detail` is replaced wholesale with {}, `redactedAt` is
+ * stamped. The row itself (eventType, at, requestId, applicationId,
+ * actorType) is left alone — see the redactedAt field's own doc comment for
+ * why the row survives while detail doesn't.
+ *
+ * Scoped by applicationId (not requestId) — used by
+ * scripts/erase-traveller-profile.ts, where a request can hold OTHER
+ * travellers' applications whose activity history must not be touched by
+ * one traveller's erasure.
+ *
+ * Unlike logVisaActivity, this DOES throw on failure — a script driving an
+ * erasure needs to know if the redaction step didn't complete, not have it
+ * silently swallowed.
+ */
+export async function redactVisaActivityForApplications(
+  applicationIds: Array<mongoose.Types.ObjectId | string>,
+): Promise<number> {
+  if (applicationIds.length === 0) return 0;
+  const result = await VisaActivityLog.updateMany(
+    { applicationId: { $in: applicationIds }, redactedAt: null },
+    { $set: { detail: {}, redactedAt: new Date() } },
+  );
+  return result.modifiedCount ?? 0;
+}
+
+/**
+ * Same redaction, scoped by requestId instead — used by
+ * scripts/erase-visa-request.ts, where the WHOLE request (every
+ * application's rows, plus the two request-level-only event types that
+ * carry no applicationId at all — REQUEST_CREATED/REQUEST_CANCELLED) is
+ * being erased, so there is no "other traveller's history" to protect.
+ */
+export async function redactVisaActivityForRequest(
+  requestId: mongoose.Types.ObjectId | string,
+): Promise<number> {
+  const result = await VisaActivityLog.updateMany(
+    { requestId, redactedAt: null },
+    { $set: { detail: {}, redactedAt: new Date() } },
+  );
+  return result.modifiedCount ?? 0;
 }

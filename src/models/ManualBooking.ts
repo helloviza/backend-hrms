@@ -1,6 +1,7 @@
 import { Schema, model, type Document } from "mongoose";
 import TravelBooking from "./TravelBooking.js";
 import CustomerWorkspace from "./CustomerWorkspace.js";
+import { lookupDestination, lookupDestinationFuzzy } from "../data/destinationLookup.js";
 
 export const PENDING_SUB_STATUSES = [
   "Pending for Customer Confirmation",
@@ -144,6 +145,14 @@ export interface IManualBooking extends Document {
   deletedBy?: Schema.Types.ObjectId;
   deletionReason?: string;
   deletionNote?: string;
+  // Erasure follow-up (2026-07-31, scripts/lib/visaErasureCascade.ts) — set
+  // when a visa erasure strips passengers[].passportNo/email/phone off a
+  // booking found via metadata.visaApplicationId (NOT deleted — this is a
+  // GST invoicing record with its own statutory retention obligations;
+  // passengers[].name and every pricing field are deliberately left alone).
+  // Independent of deletedAt/deletionReason above, which describe the
+  // BOOKING's own soft-delete, a separate and unrelated lifecycle.
+  piiRedactedAt?: Date;
   createdBy?: string;
   createdByEmail?: string;
   isDemo?: boolean;
@@ -270,6 +279,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     deletedBy: { type: Schema.Types.ObjectId, ref: 'User' },
     deletionReason: { type: String },
     deletionNote: { type: String },
+    piiRedactedAt: { type: Date },
     createdBy: { type: String, index: true },
     createdByEmail: { type: String },
     // Demo Platform — booking authored under impersonation / seeded for a demo workspace
@@ -524,6 +534,34 @@ export async function syncManualBookingToMirror(doc: any): Promise<void> {
   const destination =
     doc.itinerary?.destination || (isHotel ? doc.sector : "") || "";
 
+  // Cities-only Top Destinations ranking fields — same T3/T4 tiers as the
+  // one-time backfill (backfill-destination-fields.ts's `resolve()`), so a
+  // booking written live and one repaired by a later backfill run land on
+  // the identical city/country/international. T3: run the free-text
+  // `destination` above through the lookup table. T4 (ManualBooking only):
+  // if T3 found neither a city nor a country (e.g. `destination` held a
+  // hotel name), fuzzy-match itinerary.destination then sector — recovers
+  // the hotel-name-not-city case the backfill's audit flagged.
+  let destinationCity: string | null = null;
+  let destinationCountry: string | null = null;
+  let isInternational: boolean | null = null;
+  const t3 = lookupDestination(destination);
+  if (t3 && (t3.city || t3.country)) {
+    destinationCity = t3.city;
+    destinationCountry = t3.country;
+    isInternational = t3.international;
+  } else {
+    for (const cand of [doc.itinerary?.destination, doc.sector]) {
+      const hit = lookupDestinationFuzzy(cand);
+      if (hit?.city) {
+        destinationCity = hit.city;
+        destinationCountry = hit.country;
+        isInternational = hit.international;
+        break;
+      }
+    }
+  }
+
   // Customer-facing billed total only — never supplier cost / markup.
   const amount =
     doc.pricing?.grandTotal ?? doc.pricing?.totalWithGST ?? doc.pricing?.quotedPrice ?? 0;
@@ -541,11 +579,18 @@ export async function syncManualBookingToMirror(doc: any): Promise<void> {
     reference: doc._id,
     referenceModel: "ManualBooking",
     destination,
+    destinationCity,
+    destinationCountry,
+    isInternational,
     origin,
     // Actual traveller from passengers[] (lead + "+N"), surfaced to the customer
     // Bookings tab — distinct from userId (the staff booker).
     travellerName: formatTravellerName(doc.passengers),
     travellerEmail: lead?.email || "",
+    // Soft-delete/restore parity with the source — see TravelBooking.ts's
+    // isActive field. Fires both ways since delete/restore both call
+    // booking.save(), which triggers this sync via the post("save") hook.
+    isActive: doc.isActive !== false,
     bookedAt: doc.bookingDate || doc.createdAt,
     travelDate: doc.travelDate ? new Date(doc.travelDate) : null,
     travelDateEnd: doc.returnDate ? new Date(doc.returnDate) : null,
