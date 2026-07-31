@@ -225,6 +225,22 @@ export interface VisaApplicationDocument extends Document {
   visaIssuedAt?: Date;
   visaExpiresAt?: Date;
 
+  // Which VFS/BLS centre or embassy actually handled this case (task brief,
+  // 2026-08-01) — nothing recorded it before, despite the consent text
+  // naming both providers and indicativeCostSnapshot carrying a VFS fee
+  // line, so a VFS invoice couldn't be reconciled against cases at all.
+  // Free text, NOT an enum — centres open and close, and there's no
+  // established vocabulary yet to constrain it to; revisit once there's
+  // real data to look at. Natural point to set it is at lodging, but never
+  // forced — a concierge may know earlier (a fixed-centre destination) or
+  // only later. All three set together, never independently. Fed into
+  // services/visaBillingSync.ts as the ManualBooking's supplierName on
+  // both create and update — the field that made a VFS invoice
+  // unreconcilable in the first place.
+  servicePartnerName: string | null;
+  servicePartnerSetAt: Date | null;
+  servicePartnerSetByUserId: mongoose.Types.ObjectId | null; // ref User
+
   // Case assignment (Phase 9a) — PER APPLICATION, not per request: a
   // five-traveller request can split across officers, and status already
   // lives at this same grain (actionRequiredReason etc., above). Two
@@ -360,6 +376,10 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     visaIssuedAt: { type: Date },
     visaExpiresAt: { type: Date },
 
+    servicePartnerName: { type: String, trim: true, default: null },
+    servicePartnerSetAt: { type: Date, default: null },
+    servicePartnerSetByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+
     assignedConciergeUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
     assignedConciergeAssignedAt: { type: Date, default: null },
     assignedConciergeAssignedByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
@@ -393,6 +413,10 @@ VisaApplicationSchema.index({ workspaceId: 1, createdAt: -1 });
 // cross-workspace, same posture as the {status:1} note below.
 VisaApplicationSchema.index({ assignedConciergeUserId: 1 });
 VisaApplicationSchema.index({ assignedScreeningOfficerId: 1 });
+// Reconciling a partner invoice against cases (routes/admin.visa.ts's GET
+// /queue ?servicePartnerName filter) — same cross-workspace posture as the
+// two indexes above.
+VisaApplicationSchema.index({ servicePartnerName: 1 });
 // NOTE: the concierge console queue (routes/admin.visa.ts) queries by
 // status ACROSS every workspace — {workspaceId,status} above doesn't serve
 // a workspace-less status filter, since workspaceId is its leading field.

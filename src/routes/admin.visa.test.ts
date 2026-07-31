@@ -807,6 +807,95 @@ describe("PATCH /applications/:id/status — state machine", () => {
   });
 });
 
+describe("PATCH /applications/:id/service-partner", () => {
+  beforeEach(() => setAccess("WRITE"));
+
+  it("sets servicePartnerName, stamps servicePartnerSetAt/SetByUserId, and logs SERVICE_PARTNER_SET", async () => {
+    const { logVisaActivity } = await import("../models/VisaActivityLog.js");
+    (logVisaActivity as any).mockClear();
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "submitted", servicePartnerName: null });
+
+    const res = await request(app).patch(`/applications/${a._id}/service-partner`).send({ servicePartnerName: "VFS Bengaluru" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.application.servicePartnerName).toBe("VFS Bengaluru");
+    expect(res.body.application.servicePartnerSetByUserId).toBe(String(USER_ID));
+    expect(res.body.application.servicePartnerSetAt).toBeTruthy();
+
+    const stored = _applications.get(a._id);
+    expect(stored.servicePartnerName).toBe("VFS Bengaluru");
+    expect(String(stored.servicePartnerSetByUserId)).toBe(String(USER_ID));
+    expect(stored.servicePartnerSetAt).toBeTruthy();
+
+    expect(logVisaActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "SERVICE_PARTNER_SET",
+        detail: { from: null, to: "VFS Bengaluru" },
+      }),
+    );
+  });
+
+  it("is settable independent of status — never tied to a status transition", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "closed", servicePartnerName: null });
+
+    const res = await request(app).patch(`/applications/${a._id}/service-partner`).send({ servicePartnerName: "Embassy of Germany" });
+
+    expect(res.status).toBe(200);
+    expect(_applications.get(a._id).status).toBe("closed"); // untouched
+    expect(_applications.get(a._id).servicePartnerName).toBe("Embassy of Germany");
+  });
+
+  it("an empty/whitespace string clears it, same as explicit null", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { servicePartnerName: "VFS Bengaluru" });
+
+    const res = await request(app).patch(`/applications/${a._id}/service-partner`).send({ servicePartnerName: "   " });
+
+    expect(res.status).toBe(200);
+    expect(res.body.application.servicePartnerName).toBeNull();
+    expect(_applications.get(a._id).servicePartnerName).toBeNull();
+  });
+
+  it("a no-op write (same value) does not re-stamp servicePartnerSetAt or log an activity row", async () => {
+    const { logVisaActivity } = await import("../models/VisaActivityLog.js");
+    const app = makeApp();
+    const firstSetAt = new Date("2026-08-01T00:00:00Z");
+    const a = applicationDoc(WORKSPACE_A, {
+      servicePartnerName: "VFS Bengaluru",
+      servicePartnerSetAt: firstSetAt,
+      servicePartnerSetByUserId: new mongoose.Types.ObjectId(),
+    });
+    (logVisaActivity as any).mockClear();
+
+    const res = await request(app).patch(`/applications/${a._id}/service-partner`).send({ servicePartnerName: "VFS Bengaluru" });
+
+    expect(res.status).toBe(200);
+    expect(new Date(res.body.application.servicePartnerSetAt).toISOString()).toBe(firstSetAt.toISOString());
+    expect(logVisaActivity).not.toHaveBeenCalled();
+  });
+
+  it("rejects once travellerErasedAt is set, and touches nothing", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { travellerErasedAt: new Date(), servicePartnerName: null });
+
+    const res = await request(app).patch(`/applications/${a._id}/service-partner`).send({ servicePartnerName: "VFS Bengaluru" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/erased/i);
+    expect(_applications.get(a._id).servicePartnerName).toBeNull();
+  });
+
+  it("403s without WRITE access", async () => {
+    setAccess("READ");
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A);
+    const res = await request(app).patch(`/applications/${a._id}/service-partner`).send({ servicePartnerName: "VFS Bengaluru" });
+    expect(res.status).toBe(403);
+  });
+});
+
 describe("PATCH /documents/:id/review", () => {
   beforeEach(() => setAccess("WRITE"));
 
@@ -1338,6 +1427,37 @@ describe("GET /queue — cross-workspace", () => {
 
       const res = await request(app).get("/queue").query({ atRisk: "true" });
       expect(res.body.applications).toHaveLength(0);
+    });
+  });
+
+  describe("Phase 9h — service partner visibility & filter", () => {
+    it("returns servicePartnerName on each row", async () => {
+      const app = makeApp();
+      const a = applicationDoc(WORKSPACE_A, { status: "lodged", servicePartnerName: "VFS Bengaluru" });
+      const res = await request(app).get("/queue");
+      const row = res.body.applications.find((r: any) => r.id === String(a._id));
+      expect(row.servicePartnerName).toBe("VFS Bengaluru");
+    });
+
+    it("?servicePartnerName= narrows to an exact match — reconciling a partner invoice against cases", async () => {
+      const app = makeApp();
+      const match = applicationDoc(WORKSPACE_A, { status: "lodged", servicePartnerName: "VFS Bengaluru" });
+      applicationDoc(WORKSPACE_B, { status: "lodged", servicePartnerName: "BLS Chennai" });
+      applicationDoc(WORKSPACE_A, { status: "lodged", servicePartnerName: null });
+
+      const res = await request(app).get("/queue").query({ servicePartnerName: "VFS Bengaluru" });
+      expect(res.body.applications).toHaveLength(1);
+      expect(res.body.applications[0].id).toBe(String(match._id));
+    });
+
+    it("?servicePartnerName= composes with an explicit status filter rather than clobbering it", async () => {
+      const app = makeApp();
+      const match = applicationDoc(WORKSPACE_A, { status: "lodged", servicePartnerName: "VFS Bengaluru" });
+      applicationDoc(WORKSPACE_B, { status: "docs_under_review", servicePartnerName: "VFS Bengaluru" });
+
+      const res = await request(app).get("/queue").query({ status: "lodged", servicePartnerName: "VFS Bengaluru" });
+      expect(res.body.applications).toHaveLength(1);
+      expect(res.body.applications[0].id).toBe(String(match._id));
     });
   });
 });

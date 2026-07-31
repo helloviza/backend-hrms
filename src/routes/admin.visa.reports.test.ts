@@ -301,6 +301,7 @@ function seedFixtures() {
     actualTotalInr: 5200,
     assignedConciergeUserId: officer._id,
     assignedScreeningOfficerId: null,
+    servicePartnerName: "VFS Bengaluru",
   });
 
   const app2 = _applications.insert({
@@ -384,6 +385,7 @@ describe("GET /reports/case-log", () => {
       "Assigned Concierge", "Assigned Screening Officer",
       "Travel Date From", "Travel Date To", "Days Until Travel",
       "Indicative Cost (INR)", "Actual Cost (INR)", "Variance (INR)",
+      "Service Partner",
     ]);
     // Newest-submitted first: app2 (submitted -1 day) sorts before app1 (-3 days).
     expect(rows[1][0]).toBe("HV26-000002");
@@ -397,6 +399,9 @@ describe("GET /reports/case-log", () => {
     expect(app1Row[17]).toBe("5000"); // indicative
     expect(app1Row[18]).toBe("5200"); // actual
     expect(app1Row[19]).toBe("200"); // variance
+    expect(app1Row[20]).toBe("VFS Bengaluru"); // service partner
+    const app2Row = rows.find((r) => r[0] === "HV26-000002")!;
+    expect(app2Row[20]).toBe(""); // never set — blank, not a placeholder
     void app1;
     void app2;
   });

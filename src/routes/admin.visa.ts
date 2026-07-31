@@ -136,6 +136,12 @@ function mapAdminApplicationSummary(a: any) {
     billingSyncSkippedAt: a.billingSyncSkippedAt ?? null,
     billingSyncSkipReason: a.billingSyncSkipReason ?? null,
     billingSyncSkipDetail: a.billingSyncSkipDetail ?? null,
+    // Which VFS/BLS centre or embassy actually handled this case (task
+    // brief, 2026-08-01) — settable any time via PATCH
+    // /applications/:id/service-partner, not tied to a status transition.
+    servicePartnerName: a.servicePartnerName ?? null,
+    servicePartnerSetAt: a.servicePartnerSetAt ?? null,
+    servicePartnerSetByUserId: a.servicePartnerSetByUserId ? String(a.servicePartnerSetByUserId) : null,
     status: a.status,
     outcome: a.outcome ?? null,
     actionRequiredReason: a.actionRequiredReason ?? null,
@@ -272,6 +278,16 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         return res.status(400).json({ error: "workspaceId is not a valid id" });
       }
       filter.workspaceId = new mongoose.Types.ObjectId(req.query.workspaceId);
+    }
+
+    // Reconciling a partner invoice against cases starts with being able to
+    // find every case a given centre worked (task brief) — exact match on
+    // the free-text value a concierge typed in, same posture as
+    // workspaceId above: an independent field, never sharing a key with
+    // status/$and, so no fold-into-whatever-shape idiom is needed here.
+    if (req.query.servicePartnerName != null) {
+      const v = String(req.query.servicePartnerName).trim();
+      if (v) filter.servicePartnerName = v;
     }
 
     // Assignment filters (Phase 9a). ?unassigned=true means neither role is
@@ -419,6 +435,9 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         // view filters on via ?billingSyncSkipped=true.
         billingSyncSkippedAt: a.billingSyncSkippedAt ?? null,
         billingSyncSkipReason: a.billingSyncSkipReason ?? null,
+        // Task brief (2026-08-01): "that starts with being able to filter
+        // by it" — this is what ?servicePartnerName= narrows on above.
+        servicePartnerName: a.servicePartnerName ?? null,
         customerRespondedAt: a.customerRespondedAt ?? null,
         submittedAt: a.submittedAt ?? null,
         destinationName: a.ruleSnapshot?.destinationName ?? null,
@@ -725,6 +744,69 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
     res.status(500).json({ error: err?.message || "Failed to update application status" });
   }
 });
+
+/* ─────────────────────────────────────────────────────────────────────
+ * PATCH /applications/:id/service-partner — which VFS/BLS centre or
+ * embassy actually handled the case (task brief, 2026-08-01). Free text,
+ * on the same detail panel as status but NOT part of its state machine —
+ * settable any time, in either direction, independent of status. Body:
+ * { servicePartnerName: string | null }; an empty/whitespace-only string
+ * clears it, same as explicit null.
+ * ───────────────────────────────────────────────────────────────────── */
+router.patch(
+  "/applications/:id/service-partner",
+  requirePermission("visaApplication", "WRITE"),
+  async (req: any, res: any) => {
+    try {
+      const id = req.params.id;
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(404).json({ error: "Visa application not found" });
+      }
+
+      const application = await VisaApplication.findById(id);
+      if (!application) return res.status(404).json({ error: "Visa application not found" });
+
+      if (isTravellerErased(application)) {
+        return res.status(409).json({ error: VISA_APPLICATION_ERASED_MESSAGE });
+      }
+
+      const raw = req.body?.servicePartnerName;
+      const trimmed = typeof raw === "string" ? raw.trim() : "";
+      const next = trimmed || null;
+      const previous = (application as any).servicePartnerName ?? null;
+
+      if (previous === next) {
+        // No-op — nothing changed, so nothing to timestamp or log.
+        return res.json({ ok: true, application: mapAdminApplicationSummary(application.toObject()) });
+      }
+
+      (application as any).servicePartnerName = next;
+      (application as any).servicePartnerSetAt = new Date();
+      (application as any).servicePartnerSetByUserId = actorId(req);
+      await application.save();
+
+      // Not PII — a centre/embassy name, not applicant data (same posture
+      // as an action_required reason: the file header's "no PII" rule is
+      // about the traveller, not the operational fact of who handled the
+      // case), so it's fine in `detail` unlike MANUAL_BOOKING_SKIPPED's
+      // reason-code-only convention.
+      await logVisaActivity({
+        applicationId: id,
+        requestId: application.requestId,
+        workspaceId: application.workspaceId,
+        eventType: "SERVICE_PARTNER_SET",
+        actorUserId: actorId(req),
+        actorType: "STAFF",
+        detail: { from: previous, to: next },
+      });
+
+      res.json({ ok: true, application: mapAdminApplicationSummary(application.toObject()) });
+    } catch (err: any) {
+      console.error("[admin visa application service-partner PATCH]", err?.message);
+      res.status(500).json({ error: err?.message || "Failed to update service partner" });
+    }
+  },
+);
 
 /* ─────────────────────────────────────────────────────────────────────
  * PATCH /documents/:id/review — accept or reject one document.

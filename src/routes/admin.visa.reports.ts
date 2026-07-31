@@ -378,6 +378,9 @@ router.get("/reports/case-log", requirePermission("visaApplication", "READ"), as
       "Assigned Concierge", "Assigned Screening Officer",
       "Travel Date From", "Travel Date To", "Days Until Travel",
       "Indicative Cost (INR)", "Actual Cost (INR)", "Variance (INR)",
+      // Appended, not interleaved — keeps every existing column index
+      // stable for anyone already parsing this report by position.
+      "Service Partner",
     ];
 
     const rows = applications.map((a: any) => {
@@ -413,6 +416,7 @@ router.get("/reports/case-log", requirePermission("visaApplication", "READ"), as
         indicative ?? "",
         actual ?? "",
         variance ?? "",
+        a.servicePartnerName ?? "",
       ];
     });
 

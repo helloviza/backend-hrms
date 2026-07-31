@@ -550,6 +550,53 @@ describe("syncVisaApplicationBilling — WIP flips to CONFIRMED at outcome (Phas
   });
 });
 
+describe("service partner feeds ManualBooking.supplierName (task brief, 2026-08-01)", () => {
+  it("a work-start booking created before servicePartnerName is set has a blank supplier", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined, servicePartnerName: null });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    const booking = _manualBookings.get(result.manualBookingId!);
+    expect(booking.supplierName).toBeUndefined();
+  });
+
+  it("a work-start booking created WITH servicePartnerName already set carries it as the supplier", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined, servicePartnerName: "VFS Bengaluru" });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    const booking = _manualBookings.get(result.manualBookingId!);
+    expect(booking.supplierName).toBe("VFS Bengaluru");
+  });
+
+  it("setting the partner AFTER work-start, then re-syncing at outcome, populates the previously-blank supplier", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined, servicePartnerName: null });
+    const workStart = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+    expect(_manualBookings.get(workStart.manualBookingId!).supplierName).toBeUndefined();
+
+    // The concierge learns which centre handled it only later, and the
+    // outcome is recorded after — same application object, now carrying
+    // both the actual costs AND the partner name a console PATCH would
+    // have set on VisaApplication in between.
+    const decided = { ...application, status: "decision_received", outcome: "APPROVED", servicePartnerName: "VFS Bengaluru" };
+    const result = await syncVisaApplicationBilling(decided, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("updated");
+    const booking = _manualBookings.get(workStart.manualBookingId!);
+    expect(booking.supplierName).toBe("VFS Bengaluru");
+  });
+
+  it("syncVisaApplicationBilling's own create path (no prior work-start booking) also carries the supplier when set", async () => {
+    const { application } = fullFixtureSet({ servicePartnerName: "BLS Chennai" }); // decision_received/APPROVED by default, no existing booking
+
+    const result = await syncVisaApplicationBilling(application, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("created");
+    const booking = _manualBookings.get(result.manualBookingId!);
+    expect(booking.supplierName).toBe("BLS Chennai");
+  });
+});
+
 describe("syncVisaApplicationBilling — INVOICED and CANCELLED are never mutated (Phase 9e)", () => {
   it("never mutates an already-CANCELLED booking", async () => {
     const { application } = fullFixtureSet();

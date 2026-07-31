@@ -70,6 +70,11 @@ export const VISA_ACTIVITY_EVENT_TYPES = [
   // Costs
   "COSTS_RECORDED",
 
+  // Service partner (task brief, 2026-08-01) — which VFS/BLS centre or
+  // embassy actually handled the case, set or changed via PATCH
+  // /applications/:id/service-partner (routes/admin.visa.ts).
+  "SERVICE_PARTNER_SET",
+
   // Billing
   "MANUAL_BOOKING_CREATED",
   "MANUAL_BOOKING_UPDATED",

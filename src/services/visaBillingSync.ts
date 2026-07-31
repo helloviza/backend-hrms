@@ -392,6 +392,13 @@ export async function createVisaWorkStartBooking(
       visaRequestReferenceNumber: request.referenceNumber,
       visaOutcome: application.outcome,
     },
+    // Which VFS/BLS centre or embassy is handling this case
+    // (VisaApplication.servicePartnerName, task brief 2026-08-01) — usually
+    // still unset at work-start (the natural point to set it is at lodging,
+    // later than this), in which case this is left blank rather than
+    // inventing a placeholder; syncVisaApplicationBilling's own update path
+    // below re-reads it and fills it in once it's known.
+    supplierName: application.servicePartnerName || undefined,
     workspaceId: customer.customerObjectId,
     status: "WIP",
     source: "MANUAL",
@@ -543,6 +550,11 @@ export async function syncVisaApplicationBilling(
       visaRequestReferenceNumber: request.referenceNumber,
       visaOutcome: application.outcome,
     },
+    // Same field as createVisaWorkStartBooking's own supplierName above —
+    // read fresh here too, so a partner set AFTER the work-start booking
+    // was created (still blank at that point) gets filled in the moment
+    // this runs at outcome, without needing its own separate resync path.
+    supplierName: application.servicePartnerName || undefined,
   };
 
   if (!existing) {
