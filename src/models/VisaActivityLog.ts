@@ -74,6 +74,11 @@ export const VISA_ACTIVITY_EVENT_TYPES = [
   "MANUAL_BOOKING_CREATED",
   "MANUAL_BOOKING_UPDATED",
   "MANUAL_BOOKING_CANCELLED",
+  // Billing sync (services/visaBillingSync.ts) refused to create a
+  // ManualBooking because the billing customer couldn't be resolved
+  // unambiguously (an ambiguous shared-tenant workspace, or a broken
+  // Customer link) — never a wrong booking, but never silent either.
+  "MANUAL_BOOKING_SKIPPED",
 ] as const;
 export type VisaActivityEventType = (typeof VISA_ACTIVITY_EVENT_TYPES)[number];
 

@@ -184,6 +184,26 @@ export interface VisaApplicationDocument extends Document {
   // Null on every application that has never had its traveller erased.
   travellerErasedAt: Date | null;
 
+  // Billing-sync skip marker (services/visaBillingSync.ts) — set together,
+  // never independently, when createVisaWorkStartBooking/
+  // syncVisaApplicationBilling could NOT unambiguously resolve a billing
+  // customer (an ambiguous shared-tenant workspace, e.g. HOUSE — confirmed
+  // 2026-08 as the only tenant where more than one Customer shares a
+  // CustomerWorkspace — or a broken Customer link) and therefore refused
+  // to create a ManualBooking at all: a missing booking someone notices
+  // beats a wrong booking someone invoices. This is how that gets surfaced
+  // for a concierge to attach the real booking by hand via the existing
+  // manual-bookings form — see admin.visa.ts's GET /queue
+  // ?billingSyncSkipped filter. Never auto-cleared by this codebase today:
+  // once a concierge creates the real ManualBooking manually, these fields
+  // are stale history, not re-checked or re-cleared by anything.
+  billingSyncSkippedAt: Date | null;
+  // Mirrors services/visaBillingSync.ts's own VisaBillingCustomerSkipReason
+  // exactly — duplicated here rather than imported, since a model
+  // importing from a service is the wrong dependency direction.
+  billingSyncSkipReason: "AMBIGUOUS_CUSTOMER" | "BROKEN_CUSTOMER_LINK" | null;
+  billingSyncSkipDetail: string | null;
+
   // Set the moment this application transitions draft -> submitted (POST
   // /requests/:id/submit, routes/visa.ts) — never on creation, and never
   // touched again after. Distinct from the request-level consent timestamp
@@ -328,6 +348,10 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     statusBeforeActionRequired: { type: String, enum: VISA_APPLICATION_STATUSES, default: null },
     customerRespondedAt: { type: Date, default: null },
     travellerErasedAt: { type: Date, default: null },
+
+    billingSyncSkippedAt: { type: Date, default: null },
+    billingSyncSkipReason: { type: String, enum: ["AMBIGUOUS_CUSTOMER", "BROKEN_CUSTOMER_LINK"], default: null },
+    billingSyncSkipDetail: { type: String, trim: true, default: null },
 
     submittedAt: { type: Date },
     lodgedAt: { type: Date },

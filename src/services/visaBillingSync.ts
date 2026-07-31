@@ -73,6 +73,9 @@ import ManualBooking from "../models/ManualBooking.js";
 import VisaRequest from "../models/VisaRequest.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import Customer from "../models/Customer.js";
+import User from "../models/User.js";
+import { isCustomerUser } from "../middleware/requireWorkspace.js";
 import logger from "../utils/logger.js";
 import { logVisaActivity } from "../models/VisaActivityLog.js";
 import { computeVisaFeeBlock } from "../utils/visaFee.js";
@@ -89,11 +92,24 @@ export type VisaBillingSyncAction =
   | "skipped_unexpected_status"
   | "skipped_already_exists"
   | "skipped_no_request"
-  | "skipped_traveller_erased";
+  | "skipped_traveller_erased"
+  | "skipped_billing_customer_unresolved";
+
+// See resolveBillingCustomer's own doc comment for what each reason means.
+// Exported so callers (routes/admin.visa.ts) can persist the same reason
+// code onto VisaApplication.billingSyncSkipReason without redeclaring it.
+export const VISA_BILLING_CUSTOMER_SKIP_REASONS = ["AMBIGUOUS_CUSTOMER", "BROKEN_CUSTOMER_LINK"] as const;
+export type VisaBillingCustomerSkipReason = (typeof VISA_BILLING_CUSTOMER_SKIP_REASONS)[number];
 
 export interface VisaBillingSyncResult {
   action: VisaBillingSyncAction;
   manualBookingId: string | null;
+  // Only set when action is "skipped_billing_customer_unresolved" — the
+  // caller (routes/admin.visa.ts) persists these onto the VisaApplication
+  // itself, since this service deliberately never writes back to it (see
+  // syncVisaApplicationBilling's own doc comment).
+  skipReason?: VisaBillingCustomerSkipReason;
+  skipDetail?: string;
 }
 
 function travellerDisplayName(t: any): string {
@@ -127,11 +143,125 @@ function computeIndicativeMarkupPricing(indicative: any): { actualPrice: number;
   return { actualPrice, quotedPrice: actualPrice + serviceFeeInclGst };
 }
 
+export type CustomerResolution =
+  | { ok: true; customerObjectId: mongoose.Types.ObjectId }
+  | { ok: false; reason: VisaBillingCustomerSkipReason; detail: string };
+
 interface BillingContext {
   request: any;
   passengers: Array<{ name: string; email?: string; phone?: string; passportNo?: string; type: "ADULT" }>;
   itinerary: { destination?: string; visaCountry?: string; visaType?: string };
-  customerObjectId: mongoose.Types.ObjectId | null;
+  customer: CustomerResolution;
+}
+
+/**
+ * Resolves the billing customer for a visa application — two tiers, in
+ * order, never falling back silently past a genuinely ambiguous case:
+ *
+ *   1. The user who RAISED the request (VisaRequest.raisedByUserId), if
+ *      they're a customer-type account (isCustomerUser — the SAME
+ *      classifier middleware/requireWorkspace.ts's resolveWorkspaceForUser
+ *      uses as the authoritative source for "which Customer does this user
+ *      belong to," reused here rather than inventing a second one) and
+ *      their own User.customerId (or its businessId alias) resolves to a
+ *      real, still-existing Customer. This names one specific person and
+ *      is unambiguous by construction — it never depends on how many other
+ *      Customers happen to share the same workspace.
+ *
+ *   2. CustomerWorkspace.customerId, but ONLY when that workspace is
+ *      genuinely 1:1 — exactly one Customer has workspaceId pointing at
+ *      it. HOUSE (confirmed 2026-08: the only many-to-one tenant in
+ *      production, 62 Customers sharing it) is exactly the case this
+ *      guards against: CustomerWorkspace.customerId there resolves to a
+ *      real Customer ("Rehan"/Inteletek AI), but that Customer has nothing
+ *      to do with most applications raised under HOUSE — accepting it
+ *      anyway is how a Plumtrips-staff-raised test visa application ended
+ *      up billed to an unrelated Zoho-imported client (MB-2607-0489).
+ *
+ * Anything else — no usable user link AND the workspace's own pointer is
+ * either missing/broken or ambiguous — returns ok:false. Callers MUST NOT
+ * create a ManualBooking in that case; see the two entry points below and
+ * their shared logBillingCustomerSkip helper. A missing booking someone
+ * notices beats a wrong booking someone invoices.
+ */
+async function resolveBillingCustomer(application: any, request: any): Promise<CustomerResolution> {
+  const raisingUser = request?.raisedByUserId
+    ? await User.findById(request.raisedByUserId).select("customerId businessId roles").lean()
+    : null;
+
+  if (raisingUser && isCustomerUser(raisingUser)) {
+    const candidateId = (raisingUser as any).customerId || (raisingUser as any).businessId;
+    if (candidateId && mongoose.isValidObjectId(candidateId)) {
+      const customer = await Customer.findById(candidateId).select("_id").lean();
+      if (customer) {
+        return { ok: true, customerObjectId: new mongoose.Types.ObjectId(candidateId) };
+      }
+    }
+  }
+
+  const workspace = await CustomerWorkspace.findById(application.workspaceId).select("customerId").lean();
+  const workspaceCustomerId = (workspace as any)?.customerId;
+  if (!workspaceCustomerId || !mongoose.isValidObjectId(workspaceCustomerId)) {
+    return {
+      ok: false,
+      reason: "BROKEN_CUSTOMER_LINK",
+      detail: `CustomerWorkspace ${application.workspaceId} has no valid customerId set, and the raising user has no usable customer link`,
+    };
+  }
+
+  // Ambiguity check — the actual fix: a single forward pointer can't speak
+  // for a workspace more than one Customer legitimately shares.
+  const sharedCount = await Customer.countDocuments({ workspaceId: application.workspaceId });
+  if (sharedCount > 1) {
+    return {
+      ok: false,
+      reason: "AMBIGUOUS_CUSTOMER",
+      detail: `${sharedCount} Customer records share workspace ${application.workspaceId} and the raising user has no customer link — cannot pick one unambiguously`,
+    };
+  }
+
+  const customer = await Customer.findById(workspaceCustomerId).select("_id").lean();
+  if (!customer) {
+    return {
+      ok: false,
+      reason: "BROKEN_CUSTOMER_LINK",
+      detail: `CustomerWorkspace ${application.workspaceId}'s customerId (${workspaceCustomerId}) does not resolve to any Customer`,
+    };
+  }
+
+  return { ok: true, customerObjectId: new mongoose.Types.ObjectId(workspaceCustomerId) };
+}
+
+// Logs (structured logger + an internal-only VisaActivityLog row) a skipped
+// billing sync. Deliberately does NOT write to VisaApplication — this file
+// never writes back to it (see syncVisaApplicationBilling's own doc
+// comment) — the caller persists billingSyncSkippedAt/Reason/Detail using
+// the reason/detail this returns via VisaBillingSyncResult.
+async function logBillingCustomerSkip(
+  application: any,
+  request: any,
+  resolution: Extract<CustomerResolution, { ok: false }>,
+): Promise<void> {
+  const applicationId = String(application._id);
+  visaBillingLogger.error("skipped billing sync — could not unambiguously resolve a billing customer", {
+    applicationId,
+    requestId: String(application.requestId),
+    referenceNumber: request?.referenceNumber,
+    reason: resolution.reason,
+    detail: resolution.detail,
+  });
+  // reason code only — the free-text detail sentence stays in the logger
+  // and on VisaApplication.billingSyncSkipDetail (both internal/ops-facing),
+  // never in VisaActivityLog (this file's own "no PII, no prose" rule).
+  await logVisaActivity({
+    applicationId,
+    requestId: request?._id ?? application.requestId,
+    workspaceId: application.workspaceId,
+    eventType: "MANUAL_BOOKING_SKIPPED",
+    actorUserId: null,
+    actorType: "SYSTEM",
+    detail: { reason: resolution.reason },
+  });
 }
 
 // Shared lookups both entry points below need — the parent VisaRequest
@@ -144,15 +274,10 @@ async function resolveBillingContext(application: any): Promise<BillingContext |
   const request = await VisaRequest.findById(application.requestId).lean();
   if (!request) return null;
 
-  const [traveller, workspace] = await Promise.all([
+  const [traveller, customer] = await Promise.all([
     TravellerProfile.findById(application.travellerProfileId).lean(),
-    CustomerWorkspace.findById(application.workspaceId).select("customerId").lean(),
+    resolveBillingCustomer(application, request),
   ]);
-
-  const customerObjectId =
-    (workspace as any)?.customerId && mongoose.isValidObjectId((workspace as any).customerId)
-      ? new mongoose.Types.ObjectId((workspace as any).customerId)
-      : null;
 
   const passengers: BillingContext["passengers"] = [
     {
@@ -174,7 +299,7 @@ async function resolveBillingContext(application: any): Promise<BillingContext |
     visaType: application.ruleSnapshot?.purpose || undefined,
   };
 
-  return { request, passengers, itinerary, customerObjectId };
+  return { request, passengers, itinerary, customer };
 }
 
 /**
@@ -233,12 +358,21 @@ export async function createVisaWorkStartBooking(
     });
     return { action: "skipped_no_request", manualBookingId: null };
   }
-  const { request, passengers, itinerary, customerObjectId } = context;
+  const { request, passengers, itinerary, customer } = context;
 
-  if (!customerObjectId) {
-    throw new Error(
-      `visa billing sync: could not resolve Customer._id for workspace ${application.workspaceId} — refusing to create a ManualBooking with no tenant`,
-    );
+  // Narrowed via "reason" in customer, not !customer.ok — this repo's
+  // tsconfig runs with strictNullChecks:false, under which TS fails to
+  // narrow a boolean-literal ("ok: true" | "ok: false") discriminated union
+  // into its false branch (same issue/fix as visaPassportExtraction.ts's
+  // parseResult). "in" narrowing works both ways under strictNullChecks:false.
+  if ("reason" in customer) {
+    await logBillingCustomerSkip(application, request, customer);
+    return {
+      action: "skipped_billing_customer_unresolved",
+      manualBookingId: null,
+      skipReason: customer.reason,
+      skipDetail: customer.detail,
+    };
   }
 
   const { actualPrice, quotedPrice } = computeIndicativeMarkupPricing(application.indicativeCostSnapshot);
@@ -258,7 +392,7 @@ export async function createVisaWorkStartBooking(
       visaRequestReferenceNumber: request.referenceNumber,
       visaOutcome: application.outcome,
     },
-    workspaceId: customerObjectId,
+    workspaceId: customer.customerObjectId,
     status: "WIP",
     source: "MANUAL",
     bookedBy: actorUserId,
@@ -382,7 +516,7 @@ export async function syncVisaApplicationBilling(
     });
     return { action: "skipped_no_request", manualBookingId: null };
   }
-  const { request, passengers, itinerary, customerObjectId } = context;
+  const { request, passengers, itinerary, customer } = context;
 
   const commonFields: Record<string, any> = {
     type: "VISA",
@@ -412,14 +546,20 @@ export async function syncVisaApplicationBilling(
   };
 
   if (!existing) {
-    if (!customerObjectId) {
-      throw new Error(
-        `visa billing sync: could not resolve Customer._id for workspace ${application.workspaceId} — refusing to create a ManualBooking with no tenant`,
-      );
+    // See createVisaWorkStartBooking's identical comment on why this is
+    // "reason" in customer, not !customer.ok.
+    if ("reason" in customer) {
+      await logBillingCustomerSkip(application, request, customer);
+      return {
+        action: "skipped_billing_customer_unresolved",
+        manualBookingId: null,
+        skipReason: customer.reason,
+        skipDetail: customer.detail,
+      };
     }
     const created = await ManualBooking.create({
       ...commonFields,
-      workspaceId: customerObjectId,
+      workspaceId: customer.customerObjectId,
       status: "CONFIRMED",
       source: "MANUAL",
       bookedBy: actorUserId,

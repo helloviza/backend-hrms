@@ -734,6 +734,41 @@ describe("PATCH /applications/:id/status — state machine", () => {
     expect(_applications.get(a._id).status).toBe("action_required");
   });
 
+  describe("Phase 9g — work-start billing skip marker", () => {
+    it("persists the skip marker on the transition into docs_under_review when the billing customer can't be resolved", async () => {
+      createVisaWorkStartBookingMock.mockResolvedValueOnce({
+        action: "skipped_billing_customer_unresolved",
+        manualBookingId: null,
+        skipReason: "BROKEN_CUSTOMER_LINK",
+        skipDetail: "CustomerWorkspace ... has no valid customerId set, and the raising user has no usable customer link",
+      });
+      const app = makeApp();
+      const a = applicationDoc(WORKSPACE_A, { status: "submitted" });
+
+      const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: "docs_under_review" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.billing.action).toBe("skipped_billing_customer_unresolved");
+      expect(res.body.application.billingSyncSkipReason).toBe("BROKEN_CUSTOMER_LINK");
+      expect(res.body.application.billingSyncSkippedAt).toBeTruthy();
+      const stored = _applications.get(a._id);
+      expect(stored.billingSyncSkipReason).toBe("BROKEN_CUSTOMER_LINK");
+      expect(stored.billingSyncSkippedAt).toBeTruthy();
+    });
+
+    it("leaves the skip marker unset when the work-start booking is created normally", async () => {
+      const app = makeApp();
+      const a = applicationDoc(WORKSPACE_A, { status: "submitted" });
+
+      const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: "docs_under_review" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.billing.action).toBe("created");
+      expect(res.body.application.billingSyncSkippedAt).toBeNull();
+      expect(_applications.get(a._id).billingSyncSkippedAt ?? null).toBeNull();
+    });
+  });
+
   describe("traveller erasure guard", () => {
     it("rejects a legal forward transition once travellerErasedAt is set, and touches nothing", async () => {
       const app = makeApp();
@@ -1025,6 +1060,42 @@ describe("PATCH /applications/:id/outcome", () => {
     expect(_applications.get(a._id).outcome).toBeUndefined();
     expect(createVisaDocumentUploadMock).not.toHaveBeenCalled();
   });
+
+  it("persists the billing-sync skip marker and reflects it in the response when the billing customer can't be resolved", async () => {
+    syncVisaApplicationBillingMock.mockResolvedValueOnce({
+      action: "skipped_billing_customer_unresolved",
+      manualBookingId: null,
+      skipReason: "AMBIGUOUS_CUSTOMER",
+      skipDetail: "3 Customer records share workspace ... and the raising user has no customer link",
+    });
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "lodged" });
+
+    const res = await request(app).patch(`/applications/${a._id}/outcome`).send({ outcome: "WITHDRAWN" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.billing.action).toBe("skipped_billing_customer_unresolved");
+    // Reflected immediately in this same response, not just the next GET.
+    expect(res.body.application.billingSyncSkipReason).toBe("AMBIGUOUS_CUSTOMER");
+    expect(res.body.application.billingSyncSkippedAt).toBeTruthy();
+    // And actually persisted, not just patched onto the in-memory response object.
+    const stored = _applications.get(a._id);
+    expect(stored.billingSyncSkipReason).toBe("AMBIGUOUS_CUSTOMER");
+    expect(stored.billingSyncSkipDetail).toMatch(/3 Customer records share workspace/);
+    expect(stored.billingSyncSkippedAt).toBeTruthy();
+  });
+
+  it("does not set any billing-sync skip marker when billing sync succeeds normally", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "lodged" });
+
+    const res = await request(app).patch(`/applications/${a._id}/outcome`).send({ outcome: "WITHDRAWN" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.billing.action).toBe("created");
+    expect(res.body.application.billingSyncSkippedAt).toBeNull();
+    expect(_applications.get(a._id).billingSyncSkippedAt ?? null).toBeNull();
+  });
 });
 
 describe("GET /queue — cross-workspace", () => {
@@ -1141,6 +1212,98 @@ describe("GET /queue — cross-workspace", () => {
       const res = await request(app).get("/queue").query({ status: "lodged", customerResponded: "true" });
       expect(res.body.applications).toHaveLength(1);
       expect(res.body.applications[0].id).toBe(String(respondedLodged._id));
+    });
+  });
+
+  describe("Phase 9g — billing-sync-skipped visibility", () => {
+    it("returns billingSyncSkippedAt/billingSyncSkipReason on each row", async () => {
+      const app = makeApp();
+      const skippedAt = new Date("2026-08-15T10:00:00Z");
+      const a = applicationDoc(WORKSPACE_A, {
+        status: "docs_under_review",
+        billingSyncSkippedAt: skippedAt,
+        billingSyncSkipReason: "AMBIGUOUS_CUSTOMER",
+      });
+      const res = await request(app).get("/queue");
+      const row = res.body.applications.find((r: any) => r.id === String(a._id));
+      expect(new Date(row.billingSyncSkippedAt).toISOString()).toBe(skippedAt.toISOString());
+      expect(row.billingSyncSkipReason).toBe("AMBIGUOUS_CUSTOMER");
+    });
+
+    it("stays in the default queue — unlike an erased traveller, a skipped booking is still a live, working case", async () => {
+      const app = makeApp();
+      const a = applicationDoc(WORKSPACE_A, {
+        status: "docs_under_review",
+        billingSyncSkippedAt: new Date(),
+        billingSyncSkipReason: "BROKEN_CUSTOMER_LINK",
+      });
+      const res = await request(app).get("/queue");
+      expect(res.body.applications.map((r: any) => r.id)).toContain(String(a._id));
+    });
+
+    it("?billingSyncSkipped=true narrows to only skipped rows", async () => {
+      const app = makeApp();
+      applicationDoc(WORKSPACE_A, { status: "docs_under_review", billingSyncSkippedAt: null });
+      const skipped = applicationDoc(WORKSPACE_B, {
+        status: "docs_under_review",
+        billingSyncSkippedAt: new Date(),
+        billingSyncSkipReason: "AMBIGUOUS_CUSTOMER",
+      });
+
+      const res = await request(app).get("/queue").query({ billingSyncSkipped: "true" });
+      expect(res.body.applications).toHaveLength(1);
+      expect(res.body.applications[0].id).toBe(String(skipped._id));
+    });
+
+    it("?billingSyncSkipped=false narrows to only unskipped rows", async () => {
+      const app = makeApp();
+      const untouched = applicationDoc(WORKSPACE_A, { status: "docs_under_review", billingSyncSkippedAt: null });
+      applicationDoc(WORKSPACE_B, {
+        status: "docs_under_review",
+        billingSyncSkippedAt: new Date(),
+        billingSyncSkipReason: "AMBIGUOUS_CUSTOMER",
+      });
+
+      const res = await request(app).get("/queue").query({ billingSyncSkipped: "false" });
+      expect(res.body.applications).toHaveLength(1);
+      expect(res.body.applications[0].id).toBe(String(untouched._id));
+    });
+
+    it("?billingSyncSkipped=true composes with an explicit status filter rather than clobbering it", async () => {
+      const app = makeApp();
+      const skippedLodged = applicationDoc(WORKSPACE_A, {
+        status: "lodged",
+        billingSyncSkippedAt: new Date(),
+        billingSyncSkipReason: "AMBIGUOUS_CUSTOMER",
+      });
+      applicationDoc(WORKSPACE_B, {
+        status: "docs_under_review",
+        billingSyncSkippedAt: new Date(),
+        billingSyncSkipReason: "AMBIGUOUS_CUSTOMER",
+      });
+
+      const res = await request(app).get("/queue").query({ status: "lodged", billingSyncSkipped: "true" });
+      expect(res.body.applications).toHaveLength(1);
+      expect(res.body.applications[0].id).toBe(String(skippedLodged._id));
+    });
+
+    it("?billingSyncSkipped=true composes with ?customerResponded=true — both fold into the same $and without clobbering each other", async () => {
+      const app = makeApp();
+      const both = applicationDoc(WORKSPACE_A, {
+        status: "action_required",
+        customerRespondedAt: new Date(),
+        billingSyncSkippedAt: new Date(),
+        billingSyncSkipReason: "AMBIGUOUS_CUSTOMER",
+      });
+      applicationDoc(WORKSPACE_B, {
+        status: "action_required",
+        customerRespondedAt: new Date(),
+        billingSyncSkippedAt: null,
+      });
+
+      const res = await request(app).get("/queue").query({ customerResponded: "true", billingSyncSkipped: "true" });
+      expect(res.body.applications).toHaveLength(1);
+      expect(res.body.applications[0].id).toBe(String(both._id));
     });
   });
 

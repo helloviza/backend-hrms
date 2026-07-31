@@ -19,6 +19,8 @@ const {
   _travellers,
   _workspaces,
   _travelBookings,
+  _users,
+  _customers,
   deriveOnMarkupPricing,
   findOneManualBookingDoc,
 } = vi.hoisted(() => {
@@ -118,6 +120,8 @@ const {
     _travellers: makeCollection(),
     _workspaces: makeCollection(),
     _travelBookings: makeCollection(),
+    _users: makeCollection(),
+    _customers: makeCollection(),
     deriveOnMarkupPricing,
     findOneManualBookingDoc,
   };
@@ -162,6 +166,23 @@ vi.mock("../models/CustomerWorkspace.js", () => ({
   default: {
     findById: (id: any) => ({ select: () => ({ lean: () => Promise.resolve(_workspaces.get(id)) }) }),
     findOne: (filter: any) => ({ select: () => ({ lean: () => Promise.resolve(_workspaces.query(filter)[0] ?? null) }) }),
+  },
+}));
+
+// User/Customer back resolveBillingCustomer's two-tier resolution
+// (services/visaBillingSync.ts). middleware/requireWorkspace.js's
+// isCustomerUser is left REAL — it's a pure function over `roles`, no DB
+// access, so mocking it would just be re-implementing it.
+vi.mock("../models/User.js", () => ({
+  default: {
+    findById: (id: any) => ({ select: () => ({ lean: () => Promise.resolve(_users.get(id)) }) }),
+  },
+}));
+
+vi.mock("../models/Customer.js", () => ({
+  default: {
+    findById: (id: any) => ({ select: () => ({ lean: () => Promise.resolve(_customers.get(id)) }) }),
+    countDocuments: (filter: any) => Promise.resolve(_customers.query(filter).length),
   },
 }));
 
@@ -212,12 +233,33 @@ function travellerFixture(overrides: Record<string, any> = {}) {
   });
 }
 
-function workspaceFixture(overrides: Record<string, any> = {}) {
+// Healthy, unambiguous 1:1 workspace by default — a matching Customer is
+// created alongside it, with its OWN workspaceId pointing back at this
+// workspace, so resolveBillingCustomer's fallback tier (CustomerWorkspace.
+// customerId, only accepted when exactly one Customer shares the
+// workspace) succeeds exactly the way it did before this file's own
+// ambiguous/broken-link describe block existed. Pass
+// { skipCustomerRecord: true } to omit the Customer (a broken link), or
+// insert additional Customers with the same workspaceId yourself to
+// exercise ambiguity.
+function workspaceFixture(overrides: Record<string, any> & { skipCustomerRecord?: boolean } = {}) {
+  const { skipCustomerRecord, ...workspaceOverrides } = overrides;
   const customerId = new mongoose.Types.ObjectId();
-  return _workspaces.insert({
+  const workspace = _workspaces.insert({
     customerId: String(customerId),
-    ...overrides,
+    ...workspaceOverrides,
   });
+  if (!skipCustomerRecord) {
+    _customers.insert({ _id: customerId, workspaceId: workspace._id });
+  }
+  return workspace;
+}
+
+// Staff by default (isCustomerUser reads roles) — no customerId, so
+// resolveBillingCustomer's user-tier never fires unless a test explicitly
+// gives roles a customer role AND a customerId.
+function userFixture(overrides: Record<string, any> = {}) {
+  return _users.insert({ roles: ["EMPLOYEE"], ...overrides });
 }
 
 function applicationFixture(opts: {
@@ -625,5 +667,177 @@ describe("syncVisaApplicationBilling — TravelBooking mirror", () => {
     expect(mirrored.amount).toBe(booking.pricing.grandTotal);
     expect(mirrored.travellerName).toBe("Asha Rao");
     expect(mirrored.isActive).toBe(true);
+  });
+});
+
+describe("resolveBillingCustomer (via createVisaWorkStartBooking) — customer resolution", () => {
+  it("resolves via the raising user's own customerId when it's a customer-type account, even on an otherwise-ambiguous workspace", async () => {
+    const workspace = workspaceFixture();
+    // Make the workspace genuinely ambiguous — a SECOND Customer also
+    // shares it — to prove the user-tier is checked FIRST and wins outright,
+    // never even reaching the ambiguity check.
+    _customers.insert({ workspaceId: workspace._id });
+
+    const realCustomer = _customers.insert({ workspaceId: new mongoose.Types.ObjectId() });
+    const raisingUser = userFixture({ roles: ["CUSTOMER", "REQUESTER"], customerId: String(realCustomer._id) });
+    const request = visaRequestFixture({ raisedByUserId: raisingUser._id });
+    const traveller = travellerFixture();
+    const application = applicationFixture({
+      requestId: request._id,
+      travellerProfileId: traveller._id,
+      workspaceId: workspace._id,
+      status: "docs_under_review",
+      outcome: undefined,
+    });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("created");
+    const booking = _manualBookings.get(result.manualBookingId!);
+    expect(String(booking.workspaceId)).toBe(String(realCustomer._id));
+  });
+
+  it("falls back to CustomerWorkspace.customerId when the raising user has no customer link — the healthy 1:1 case", async () => {
+    const { application } = fullFixtureSet({ status: "docs_under_review", outcome: undefined });
+    const workspace = _workspaces.get(application.workspaceId);
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("created");
+    const booking = _manualBookings.get(result.manualBookingId!);
+    expect(String(booking.workspaceId)).toBe(String(workspace.customerId));
+  });
+
+  it("also falls back to CustomerWorkspace.customerId when the raising user is STAFF (not a customer account)", async () => {
+    const staffUser = userFixture({ roles: ["EMPLOYEE"] }); // no customerId at all
+    const request = visaRequestFixture({ raisedByUserId: staffUser._id });
+    const traveller = travellerFixture();
+    const workspace = workspaceFixture();
+    const application = applicationFixture({
+      requestId: request._id,
+      travellerProfileId: traveller._id,
+      workspaceId: workspace._id,
+      status: "docs_under_review",
+      outcome: undefined,
+    });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("created");
+    const booking = _manualBookings.get(result.manualBookingId!);
+    expect(String(booking.workspaceId)).toBe(String(workspace.customerId));
+  });
+
+  it("skips — AMBIGUOUS_CUSTOMER — when more than one Customer shares the workspace and the raising user has no link (the HOUSE case)", async () => {
+    const workspace = workspaceFixture(); // already has one Customer via the fixture
+    _customers.insert({ workspaceId: workspace._id }); // a second one — now ambiguous
+    _customers.insert({ workspaceId: workspace._id }); // a third, for good measure
+
+    const request = visaRequestFixture(); // no raisedByUserId at all
+    const traveller = travellerFixture();
+    const application = applicationFixture({
+      requestId: request._id,
+      travellerProfileId: traveller._id,
+      workspaceId: workspace._id,
+      status: "docs_under_review",
+      outcome: undefined,
+    });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    expect(result).toEqual({
+      action: "skipped_billing_customer_unresolved",
+      manualBookingId: null,
+      skipReason: "AMBIGUOUS_CUSTOMER",
+      skipDetail: expect.stringContaining("3 Customer records share workspace"),
+    });
+    // Never created — a missing booking someone notices beats a wrong one
+    // someone invoices.
+    expect(_manualBookings.query({ "metadata.visaApplicationId": String(application._id) })).toHaveLength(0);
+  });
+
+  it("skips — BROKEN_CUSTOMER_LINK — when the workspace has no customerId at all", async () => {
+    const workspace = workspaceFixture({ skipCustomerRecord: true }, );
+    // Blank out customerId entirely (workspaceFixture always sets one).
+    _workspaces.get(workspace._id).customerId = undefined;
+
+    const request = visaRequestFixture();
+    const traveller = travellerFixture();
+    const application = applicationFixture({
+      requestId: request._id,
+      travellerProfileId: traveller._id,
+      workspaceId: workspace._id,
+      status: "docs_under_review",
+      outcome: undefined,
+    });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("skipped_billing_customer_unresolved");
+    expect(result.skipReason).toBe("BROKEN_CUSTOMER_LINK");
+    expect(_manualBookings.query({ "metadata.visaApplicationId": String(application._id) })).toHaveLength(0);
+  });
+
+  it("skips — BROKEN_CUSTOMER_LINK — when CustomerWorkspace.customerId points at a Customer that doesn't exist", async () => {
+    const workspace = workspaceFixture({ skipCustomerRecord: true }); // customerId set, but no matching Customer row
+    const request = visaRequestFixture();
+    const traveller = travellerFixture();
+    const application = applicationFixture({
+      requestId: request._id,
+      travellerProfileId: traveller._id,
+      workspaceId: workspace._id,
+      status: "docs_under_review",
+      outcome: undefined,
+    });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("skipped_billing_customer_unresolved");
+    expect(result.skipReason).toBe("BROKEN_CUSTOMER_LINK");
+    expect(_manualBookings.query({ "metadata.visaApplicationId": String(application._id) })).toHaveLength(0);
+  });
+
+  it("logs the skip as an internal VisaActivityLog row carrying only the reason code, never the free-text detail", async () => {
+    const { logVisaActivity } = await import("../models/VisaActivityLog.js");
+    (logVisaActivity as any).mockClear();
+
+    const workspace = workspaceFixture();
+    _customers.insert({ workspaceId: workspace._id }); // ambiguous
+    const request = visaRequestFixture();
+    const traveller = travellerFixture();
+    const application = applicationFixture({
+      requestId: request._id,
+      travellerProfileId: traveller._id,
+      workspaceId: workspace._id,
+      status: "docs_under_review",
+      outcome: undefined,
+    });
+
+    await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    expect(logVisaActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "MANUAL_BOOKING_SKIPPED",
+        detail: { reason: "AMBIGUOUS_CUSTOMER" },
+      }),
+    );
+  });
+
+  it("also skips via syncVisaApplicationBilling's own create-at-outcome path when no work-start booking exists", async () => {
+    const workspace = workspaceFixture();
+    _customers.insert({ workspaceId: workspace._id }); // ambiguous
+    const request = visaRequestFixture();
+    const traveller = travellerFixture();
+    const application = applicationFixture({
+      requestId: request._id,
+      travellerProfileId: traveller._id,
+      workspaceId: workspace._id,
+    }); // decision_received/APPROVED by default — quotedPrice > 0, no existing booking
+
+    const result = await syncVisaApplicationBilling(application, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("skipped_billing_customer_unresolved");
+    expect(result.skipReason).toBe("AMBIGUOUS_CUSTOMER");
+    expect(_manualBookings.query({ "metadata.visaApplicationId": String(application._id) })).toHaveLength(0);
   });
 });

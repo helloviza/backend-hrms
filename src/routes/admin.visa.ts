@@ -52,7 +52,11 @@ import User from "../models/User.js";
 import { UserPermission, hasAccess } from "../models/UserPermission.js";
 import { visaDocumentUploadMw, createVisaDocumentUpload } from "./visa.js";
 import { presignGetObject } from "../utils/s3Presign.js";
-import { syncVisaApplicationBilling, createVisaWorkStartBooking } from "../services/visaBillingSync.js";
+import {
+  syncVisaApplicationBilling,
+  createVisaWorkStartBooking,
+  type VisaBillingSyncResult,
+} from "../services/visaBillingSync.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import VisaActivityLog, { logVisaActivity, type VisaActivityEventType } from "../models/VisaActivityLog.js";
@@ -124,6 +128,14 @@ function mapAdminApplicationSummary(a: any) {
     // for "this case is terminal, the controls are gone on purpose" (task
     // brief), never rewritten or cleared by anything else.
     travellerErasedAt: a.travellerErasedAt ?? null,
+    // Present only once services/visaBillingSync.ts has refused to create a
+    // ManualBooking because the billing customer couldn't be resolved
+    // unambiguously — the console's marker for "this case has no invoice
+    // register entry, attach one by hand" rather than a silently-missing
+    // booking. Never auto-cleared — see VisaApplication.ts's own comment.
+    billingSyncSkippedAt: a.billingSyncSkippedAt ?? null,
+    billingSyncSkipReason: a.billingSyncSkipReason ?? null,
+    billingSyncSkipDetail: a.billingSyncSkipDetail ?? null,
     status: a.status,
     outcome: a.outcome ?? null,
     actionRequiredReason: a.actionRequiredReason ?? null,
@@ -222,6 +234,29 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         req.query.customerResponded === "true"
           ? { customerRespondedAt: { $ne: null } }
           : { customerRespondedAt: null };
+      if (filter.$and) {
+        filter.$and.push(condition);
+      } else if (filter.status !== undefined) {
+        filter.$and = [{ status: filter.status }, condition];
+        delete filter.status;
+      } else {
+        Object.assign(filter, condition);
+      }
+    }
+
+    // "Findable rather than silently absent" (task brief) — an OPTIONAL
+    // filter, never applied by default: unlike an erased-traveller
+    // application (terminal, excluded from the default queue below), a
+    // billing-sync-skipped application is still a live, working case that
+    // just has no ManualBooking yet. It stays in the default queue either
+    // way; this just lets a triage view isolate the ones needing one
+    // attached by hand. Same "fold into whatever shape filter.status/$and
+    // already took" idiom as customerResponded above.
+    if (req.query.billingSyncSkipped === "true" || req.query.billingSyncSkipped === "false") {
+      const condition =
+        req.query.billingSyncSkipped === "true"
+          ? { billingSyncSkippedAt: { $ne: null } }
+          : { billingSyncSkippedAt: null };
       if (filter.$and) {
         filter.$and.push(condition);
       } else if (filter.status !== undefined) {
@@ -378,6 +413,12 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         // reaches this row via ?includeErased=true sees why the controls
         // are gone rather than assuming a bug (task brief).
         travellerErasedAt: a.travellerErasedAt ?? null,
+        // Present only once billing sync refused to create a ManualBooking
+        // (task brief: "findable rather than silently absent") — the row
+        // stays in the default queue either way; this is what a triage
+        // view filters on via ?billingSyncSkipped=true.
+        billingSyncSkippedAt: a.billingSyncSkippedAt ?? null,
+        billingSyncSkipReason: a.billingSyncSkipReason ?? null,
         customerRespondedAt: a.customerRespondedAt ?? null,
         submittedAt: a.submittedAt ?? null,
         destinationName: a.ruleSnapshot?.destinationName ?? null,
@@ -556,7 +597,7 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
     // submitted -> docs_under_review transition below. Surfaced in the
     // response (same transparency posture as the outcome route's own
     // `billing` field) but never allowed to fail the status change itself.
-    let workStartBilling: { action: string; manualBookingId: string | null } | { error: string } | undefined;
+    let workStartBilling: VisaBillingSyncResult | { error: string } | undefined;
 
     if (target === "action_required") {
       if (!ACTION_REQUIRED_ELIGIBLE.has(current)) {
@@ -647,6 +688,18 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
       if (target === "docs_under_review") {
         try {
           workStartBilling = await createVisaWorkStartBooking(updated, actorId(req));
+          if (workStartBilling.action === "skipped_billing_customer_unresolved") {
+            await VisaApplication.updateOne(
+              { _id: id },
+              {
+                $set: {
+                  billingSyncSkippedAt: new Date(),
+                  billingSyncSkipReason: workStartBilling.skipReason,
+                  billingSyncSkipDetail: workStartBilling.skipDetail,
+                },
+              },
+            );
+          }
         } catch (billingErr: any) {
           adminVisaLogger.error("visa work-start billing sync failed", {
             applicationId: id,
@@ -1047,9 +1100,31 @@ router.patch(
       // this response or leave the outcome half-recorded. Logged either
       // way (services/visaBillingSync.ts logs its own outcome); surfaced
       // here too so the immediate caller/UI can see it without grepping logs.
-      let billing: { action: string; manualBookingId: string | null } | { error: string } = { action: "not_attempted", manualBookingId: null };
+      let billing: VisaBillingSyncResult | { error: string } | { action: "not_attempted"; manualBookingId: null } = {
+        action: "not_attempted",
+        manualBookingId: null,
+      };
       try {
         billing = await syncVisaApplicationBilling(application, actorId(req));
+        if (billing.action === "skipped_billing_customer_unresolved") {
+          const skippedAt = new Date();
+          await VisaApplication.updateOne(
+            { _id: application._id },
+            {
+              $set: {
+                billingSyncSkippedAt: skippedAt,
+                billingSyncSkipReason: billing.skipReason,
+                billingSyncSkipDetail: billing.skipDetail,
+              },
+            },
+          );
+          // Reflected in THIS response too, not just on the next GET — same
+          // posture as every other field this route already mutates on
+          // `application` before building the response below.
+          (application as any).billingSyncSkippedAt = skippedAt;
+          (application as any).billingSyncSkipReason = billing.skipReason;
+          (application as any).billingSyncSkipDetail = billing.skipDetail;
+        }
       } catch (billingErr: any) {
         adminVisaLogger.error("visa billing sync failed", {
           applicationId: String(application._id),
