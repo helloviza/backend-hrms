@@ -40,7 +40,10 @@ function okResponse(overrides: Record<string, any> = {}) {
   return {
     text: JSON.stringify({
       mrz_found: true,
-      line1: "P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<",
+      // Content only, no trailing filler — the real prompt no longer asks
+      // for a filler count; extractPassportMrzViaGemini right-pads this to
+      // 44 chars, reproducing the same full line as before this change.
+      line1_content: "P<UTOERIKSSON<<ANNA<MARIA",
       line2: "L898902C36UTO7408122F1204159ZE184226B<<<<<10",
       viz_found: false,
       viz: null,

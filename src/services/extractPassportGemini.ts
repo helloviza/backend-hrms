@@ -38,8 +38,38 @@
 // even be true, and the caller (services/visaPassportExtraction.ts) needs
 // this to surface as SERVICE_ERROR, not get silently absorbed into another
 // retry cycle.
+//
+// Stop-asking-for-filler-counts follow-up (2026-07-31): a 10-run measurement
+// against this same call, on a perfect synthetic fixture, showed 8/10 reads
+// needed utils/mrz.ts's candidate-repair layer to recover — 6x on line 1,
+// 2x on line 2 — and every one of those was a miscounted "<" filler run, never
+// a wrong data character. Gemini reads the content correctly and is bad at
+// counting long runs of a repeated filler glyph; asking it to report a count
+// it's bad at was the bug. The request now asks for what it CAN read
+// reliably and lets deterministic code do the counting:
+//   - line 1: content only, up to and including the last non-"<" character.
+//     Line 1's structure (2 doc-type + 3 issuing-state + 39-char name field)
+//     is fixed, so right-padding that content to 44 is deterministic — no
+//     model-reported count involved at all.
+//   - line 2: verbatim, as before, PLUS a separate yes/no read on whether the
+//     14-character optional-data field is entirely filler. When yes, those 14
+//     characters are reconstructed as "<" rather than trusting the
+//     transcribed count; when no (some issuers print a real value there),
+//     the verbatim transcription is used unchanged.
+// The repair layer in utils/mrz.ts is UNCHANGED — this only reduces how often
+// it has to fire, it is not a replacement for it; check digits remain the
+// only thing that decides whether a read is accepted.
 import { GoogleGenAI, Type, ApiError } from "@google/genai";
 import { withGeminiTransientRetry } from "../utils/geminiRetry.js";
+
+// TD3 line lengths — see utils/mrz.ts's field-layout comment for the full
+// breakdown. LINE2_FIXED_PREFIX_LENGTH (28) = document number(9) + its check
+// digit(1) + nationality(3) + date of birth(6) + its check digit(1) + sex(1)
+// + date of expiry(6) + its check digit(1); the optional-data field and its
+// own two trailing check chars follow immediately after.
+const LINE1_LENGTH = 44;
+const LINE2_FIXED_PREFIX_LENGTH = 28;
+const LINE2_OPTIONAL_DATA_LENGTH = 14;
 
 let _ai: GoogleGenAI | null = null;
 
@@ -65,8 +95,9 @@ const mrzVizSchema = {
   type: Type.OBJECT,
   properties: {
     mrz_found: { type: Type.BOOLEAN },
-    line1: { type: Type.STRING, nullable: true },
+    line1_content: { type: Type.STRING, nullable: true },
     line2: { type: Type.STRING, nullable: true },
+    line2_optional_data_all_filler: { type: Type.BOOLEAN, nullable: true },
     viz_found: { type: Type.BOOLEAN },
     viz: {
       type: Type.OBJECT,
@@ -103,8 +134,9 @@ type RawVizFields = {
 
 type RawMrzResponse = {
   mrz_found: boolean;
-  line1?: string | null;
+  line1_content?: string | null;
   line2?: string | null;
+  line2_optional_data_all_filler?: boolean | null;
   viz_found?: boolean;
   viz?: RawVizFields | null;
 };
@@ -125,13 +157,37 @@ other, report each exactly as it is printed in its own zone.
 Return ONLY valid JSON matching the provided response schema.
 
 MRZ rules:
-- Transcribe the two MRZ lines EXACTLY as printed, character for character.
-- Do NOT interpret, split, translate, or reformat the lines.
-- Do NOT expand abbreviations. Do NOT convert "<" fillers to spaces.
-- Each line, once transcribed, should read as a string of only capital
-  letters A-Z, digits 0-9, and the "<" filler character.
+- Both MRZ lines are 44 characters wide on the document, but you are NOT
+  asked to count either line's trailing filler — miscounting long runs of
+  the repeated "<" filler character is the single biggest source of
+  transcription error, so report only what you can actually read.
+
+- line1_content: transcribe MRZ line 1 (document type, issuing state, then
+  the name) ONLY up to and including the LAST character that is not "<".
+  Stop there — do not append any trailing "<" filler after the name. The
+  "<<" between surname and given names, and any single "<" between given
+  names, ARE real content and must be included; only the filler run that
+  pads the rest of the line out to 44 characters is omitted.
+
+- line2: transcribe MRZ line 2 EXACTLY as printed, character for character,
+  start to finish — document number, its check digit, nationality, date of
+  birth, its check digit, sex, date of expiry, its check digit, the
+  14-character optional-data field, its check digit, and the final
+  composite check digit.
+
+- line2_optional_data_all_filler: line 2's optional-data field is the
+  14-character run between the date-of-expiry check digit and the final two
+  check digits (it holds a personal/national ID number on passports that
+  print one). Set this to true ONLY if you can see that entire 14-character
+  field is nothing but the "<" filler character. Set it to false if it
+  contains any digit or letter. Do NOT assume it's empty by default — many
+  passports do print a real value there; look before answering.
+
+- Do NOT interpret, split, translate, or reformat any MRZ content. Do NOT
+  expand abbreviations. Do NOT convert "<" fillers to spaces. Every
+  character reported should be a capital letter A-Z, a digit 0-9, or "<".
 - If the MRZ is not visible, unreadable, or this is not a passport photo
-  page, set mrz_found to false and leave line1/line2 null.
+  page, set mrz_found to false and leave line1_content/line2 null.
 
 VIZ rules:
 - Read every VIZ field directly from its own printed label — never copy or
@@ -271,8 +327,28 @@ export async function extractPassportMrzViaGemini(opts: {
     rawText = r2.rawText;
   }
 
-  const line1 = typeof raw.line1 === "string" && raw.line1.trim() ? raw.line1.trim() : null;
-  const line2 = typeof raw.line2 === "string" && raw.line2.trim() ? raw.line2.trim() : null;
+  // Line 1 — the model reports content only (see SYSTEM_PROMPT); the
+  // trailing "<" filler is never model-reported, it's reconstructed here
+  // deterministically. A no-op via padEnd if the content already happens to
+  // be 44 chars, and a harmless no-op if it somehow came back over-length
+  // (the repair layer below still covers that case, unchanged).
+  const line1Content =
+    typeof raw.line1_content === "string" && raw.line1_content.trim() ? raw.line1_content.trim() : null;
+  const line1 = line1Content ? line1Content.padEnd(LINE1_LENGTH, "<") : null;
+
+  // Line 2 — transcribed verbatim as before. Only reconstructed when the
+  // model explicitly confirmed the optional-data field is all filler; never
+  // assumed, since some issuers print a real value there (see SYSTEM_PROMPT).
+  // "no" or "unsure" (anything other than a literal true) leaves the verbatim
+  // transcription untouched, same as before this change.
+  const rawLine2 = typeof raw.line2 === "string" && raw.line2.trim() ? raw.line2.trim() : null;
+  let line2 = rawLine2;
+  if (rawLine2 && raw.line2_optional_data_all_filler === true && rawLine2.length >= LINE2_FIXED_PREFIX_LENGTH + 2) {
+    const prefix = rawLine2.slice(0, LINE2_FIXED_PREFIX_LENGTH);
+    const trailingChecks = rawLine2.slice(-2);
+    line2 = prefix + "<".repeat(LINE2_OPTIONAL_DATA_LENGTH) + trailingChecks;
+  }
+
   const found = raw.mrz_found === true && !!line1 && !!line2;
 
   const vizRaw = raw.viz && typeof raw.viz === "object" ? raw.viz : null;
