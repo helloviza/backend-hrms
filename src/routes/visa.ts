@@ -75,7 +75,7 @@ import TravelBooking from "../models/TravelBooking.js";
 import User from "../models/User.js";
 import { getCountryByIso2, normaliseToIso2 } from "../utils/countryCodes.js";
 import { getVisaDocumentCodeDef, VISA_DOCUMENT_CODE_SET } from "../config/visaDocumentCodes.js";
-import { CURRENT_VISA_CONSENT_VERSION } from "../config/visaConsent.js";
+import { CURRENT_VISA_CONSENT_VERSION, VISA_CONSENT_CLAUSE_IDS } from "../config/visaConsent.js";
 import { computeVisaFeeBlock } from "../utils/visaFee.js";
 import { computeEstimatedDecisionWindow } from "../utils/visaEta.js";
 import { maskTailId } from "../utils/piiMask.js";
@@ -135,6 +135,17 @@ const LINKABLE_DOC_CODE_SERVICE: Record<string, "FLIGHT" | "HOTEL"> = {
   "DOC-07": "HOTEL",
 };
 
+// Document types the concierge team can genuinely arrange on the
+// applicant's behalf: the same two codes above (DOC-07/DOC-08), PLUS DOC-09
+// (Travel Insurance). Deliberately a separate constant from
+// LINKABLE_DOC_CODE_SERVICE, not a superset check derived from it — Flight/
+// Hotel check the booking register FIRST and only offer the concierge once
+// that lookup finds nothing (satisfiedByBooking false); Insurance has no
+// booking register to check at all, so for DOC-09 this is the offer alone,
+// not a fallback after a failed lookup. Never fabricate a lookup for
+// insurance just to reuse the flight/hotel UI shape.
+const CONCIERGE_ARRANGEABLE_DOC_CODES = new Set(["DOC-07", "DOC-08", "DOC-09"]);
+
 // linkedServices is only ever passed by hydrateApplicationsWithTravellers,
 // which has a real application (and thus real linkedBookings) to check
 // against — GET /rules and GET /rules/:id call this before an application
@@ -151,6 +162,7 @@ function hydrateDocumentRequirements(reqs: VisaDocumentRequirement[], linkedServ
       requirement: d.requirement,
       condition: d.condition,
       satisfiedByBooking: !!(service && linkedServices?.has(service)),
+      conciergeArrangeable: CONCIERGE_ARRANGEABLE_DOC_CODES.has(d.docCode),
     };
   });
 }
@@ -831,20 +843,26 @@ router.get("/requests/:id", async (req: any, res: any) => {
 
 /* ─────────────────────────────────────────────────────────────────────
  * POST /requests/:id/submit — screen 5 (review & submit). Body:
- * { consentAccepted: true }.
+ * { acceptedClauseIds: string[] } — every one of
+ * config/visaConsent.ts's VISA_CONSENT_CLAUSE_IDS must be present;
+ * anything missing is a hard block, and the error names exactly which
+ * clause(s) are missing rather than a generic "consent required" message.
  *
  * Consent is validated FIRST and is a hard block — no consent, no write,
  * regardless of application state (task brief). The checklist is
  * deliberately NOT checked here: concierge chases whatever's missing after
  * submission, so an incomplete checklist must never block this route.
  *
- * Idempotency: VisaRequest.consentAcceptedAt is the atomic claim. The
- * findOneAndUpdate filter only matches while it's still null, so a
- * double-click (or a retried request) racing the same filter finds it
- * already set on the second attempt and gets a clean 409 — never a second
- * write, never a second status transition. Cheaper and safer than a
+ * Idempotency: VisaRequest.consents being empty is the atomic claim. The
+ * findOneAndUpdate filter only matches while "consents.0" doesn't exist, so
+ * a double-click (or a retried request) racing the same filter finds it
+ * already populated on the second attempt and gets a clean 409 — never a
+ * second write, never a second status transition. Cheaper and safer than a
  * read-then-write existence check, which has a race window between the
- * read and the write.
+ * read and the write. All three clause entries are pushed in the SAME
+ * atomic update, never one at a time — a request is either fully consented
+ * or not consented at all, no partially-populated consents array is ever
+ * observable.
  * ───────────────────────────────────────────────────────────────────── */
 router.post("/requests/:id/submit", async (req: any, res: any) => {
   try {
@@ -854,8 +872,15 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
       return res.status(404).json({ error: "Visa request not found" });
     }
 
-    if (req.body?.consentAccepted !== true) {
-      return res.status(400).json({ error: "Consent is required to submit this application." });
+    const acceptedClauseIds = new Set(
+      Array.isArray(req.body?.acceptedClauseIds) ? req.body.acceptedClauseIds.map(String) : [],
+    );
+    const missingClauseIds = VISA_CONSENT_CLAUSE_IDS.filter((id) => !acceptedClauseIds.has(id));
+    if (missingClauseIds.length > 0) {
+      return res.status(400).json({
+        error: `Consent is required for: ${missingClauseIds.join(", ")}`,
+        missingClauseIds,
+      });
     }
 
     // Existence + tenancy check up front, separate from the atomic claim
@@ -868,13 +893,25 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
       return res.status(404).json({ error: "Visa request not found" });
     }
 
+    const acceptedAt = new Date();
+    const acceptedByUserId = actorId(req);
+    // Constructed from the canonical VISA_CONSENT_CLAUSE_IDS list, never
+    // from the client's raw acceptedClauseIds array — the validation above
+    // only checked SET MEMBERSHIP, a client could in principle send extra
+    // garbage ids alongside the three real ones, and findOneAndUpdate's
+    // $push doesn't run schema validators to catch that for us.
     const claimed = await VisaRequest.findOneAndUpdate(
-      { _id: requestId, workspaceId, consentAcceptedAt: null },
+      { _id: requestId, workspaceId, "consents.0": { $exists: false } },
       {
-        $set: {
-          consentAcceptedAt: new Date(),
-          consentAcceptedByUserId: actorId(req),
-          consentVersion: CURRENT_VISA_CONSENT_VERSION,
+        $push: {
+          consents: {
+            $each: VISA_CONSENT_CLAUSE_IDS.map((clauseId) => ({
+              clauseId,
+              version: CURRENT_VISA_CONSENT_VERSION,
+              acceptedAt,
+              acceptedByUserId,
+            })),
+          },
         },
       },
       { new: true },
@@ -924,7 +961,7 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
 
 /* ─────────────────────────────────────────────────────────────────────
  * POST /requests/:id/cancel — abandon a draft. Draft-only: a request that
- * has already been submitted (consentAcceptedAt set, applications moved
+ * has already been submitted (consents populated, applications moved
  * past draft — reflected in the derived status no longer being "draft")
  * must never be cancelled through this route; the applicant's way out of a
  * SUBMITTED application is talking to their concierge, not a self-serve

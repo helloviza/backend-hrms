@@ -138,7 +138,7 @@ function requestDoc(workspaceId: mongoose.Types.ObjectId, overrides: Record<stri
     referenceNumber: "HV26-000001",
     status: "draft",
     cancelledAt: null,
-    consentAcceptedAt: null,
+    consents: [],
     ...overrides,
   });
 }
@@ -177,7 +177,7 @@ describe("POST /requests/:id/cancel", () => {
   });
 
   it("rejects cancelling a SUBMITTED request (status no longer draft) with a 409, and touches nothing", async () => {
-    const req = requestDoc(WORKSPACE_A, { status: "active", consentAcceptedAt: new Date() });
+    const req = requestDoc(WORKSPACE_A, { status: "active", consents: [{ clauseId: "REPRESENTATION", version: "v2", acceptedAt: new Date(), acceptedByUserId: new mongoose.Types.ObjectId() }] });
 
     const res = await request(makeApp(WORKSPACE_A)).post(`/requests/${req._id}/cancel`);
 
@@ -187,7 +187,7 @@ describe("POST /requests/:id/cancel", () => {
   });
 
   it("rejects cancelling a COMPLETED request the same way", async () => {
-    const req = requestDoc(WORKSPACE_A, { status: "completed", consentAcceptedAt: new Date() });
+    const req = requestDoc(WORKSPACE_A, { status: "completed", consents: [{ clauseId: "REPRESENTATION", version: "v2", acceptedAt: new Date(), acceptedByUserId: new mongoose.Types.ObjectId() }] });
 
     const res = await request(makeApp(WORKSPACE_A)).post(`/requests/${req._id}/cancel`);
 

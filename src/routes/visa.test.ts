@@ -241,9 +241,36 @@ describe("GET /rules", () => {
     const res = await request(makeApp()).get("/rules?destination=DE&purpose=TOURIST");
     const docs = res.body.variants[0].documents;
     expect(docs).toEqual([
-      { docCode: "DOC-01", name: "Passport", category: "IDENTITY", notes: expect.any(String), requirement: "REQUIRED", condition: undefined, satisfiedByBooking: false },
-      { docCode: "DOC-03", name: "Bank Statement", category: "FINANCIAL", notes: expect.any(String), requirement: "CONDITIONAL", condition: "If self-employed", satisfiedByBooking: false },
+      { docCode: "DOC-01", name: "Passport", category: "IDENTITY", notes: expect.any(String), requirement: "REQUIRED", condition: undefined, satisfiedByBooking: false, conciergeArrangeable: false },
+      { docCode: "DOC-03", name: "Bank Statement", category: "FINANCIAL", notes: expect.any(String), requirement: "CONDITIONAL", condition: "If self-employed", satisfiedByBooking: false, conciergeArrangeable: false },
     ]);
+  });
+
+  it("marks DOC-07/DOC-08/DOC-09 conciergeArrangeable, and nothing else — DOC-09 gets no fake booking lookup", async () => {
+    visaRuleFindMock.mockReturnValue(
+      findChain([
+        ruleDoc({
+          documentRequirements: [
+            { docCode: "DOC-01", requirement: "REQUIRED" },
+            { docCode: "DOC-07", requirement: "REQUIRED" },
+            { docCode: "DOC-08", requirement: "REQUIRED" },
+            { docCode: "DOC-09", requirement: "REQUIRED" },
+          ],
+        }),
+      ]),
+    );
+    const res = await request(makeApp()).get("/rules?destination=DE&purpose=TOURIST");
+    const docs = res.body.variants[0].documents;
+    const byCode = Object.fromEntries(docs.map((d: any) => [d.docCode, d]));
+
+    expect(byCode["DOC-01"].conciergeArrangeable).toBe(false);
+    expect(byCode["DOC-07"].conciergeArrangeable).toBe(true);
+    expect(byCode["DOC-08"].conciergeArrangeable).toBe(true);
+    expect(byCode["DOC-09"].conciergeArrangeable).toBe(true);
+
+    // DOC-09 has no booking register to check — satisfiedByBooking is
+    // always false for it, never derived from a lookup that doesn't exist.
+    expect(byCode["DOC-09"].satisfiedByBooking).toBe(false);
   });
 
   it("hydrates gracefully (no throw) for a docCode not yet defined in VISA_DOCUMENT_CODES", async () => {

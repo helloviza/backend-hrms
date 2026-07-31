@@ -8,6 +8,7 @@ import mongoose, { Schema, type Document, type Model } from "mongoose";
 import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import Counter from "./Counter.js";
 import { VISA_PURPOSES, type VisaPurpose } from "./VisaRule.js";
+import { VISA_CONSENT_CLAUSE_IDS, type VisaConsentClauseId } from "../config/visaConsent.js";
 
 // Not specified by the source brief — this is a reasonable container-level
 // lifecycle: draft (still adding travellers) / active (>=1 application in
@@ -16,6 +17,20 @@ import { VISA_PURPOSES, type VisaPurpose } from "./VisaRule.js";
 // build report — narrower/renamed values are a schema-only change later.
 export const VISA_REQUEST_STATUSES = ["draft", "active", "completed", "cancelled"] as const;
 export type VisaRequestStatus = (typeof VISA_REQUEST_STATUSES)[number];
+
+// One row per clause accepted — a single consentAcceptedAt could no longer
+// prove WHICH clause was given once consent split into three independent
+// checkboxes (config/visaConsent.ts's VISA_CONSENT_CLAUSES). Each entry
+// carries its own version, so a later clause-text change is provable
+// per-clause: a request accepted before a wording bump keeps its OLD
+// version stamped on it, permanently, regardless of what
+// CURRENT_VISA_CONSENT_VERSION becomes afterwards.
+export interface VisaConsentRecord {
+  clauseId: VisaConsentClauseId;
+  version: string;
+  acceptedAt: Date;
+  acceptedByUserId: mongoose.Types.ObjectId;
+}
 
 export interface VisaRequestDocument extends Document {
   workspaceId: mongoose.Types.ObjectId; // CustomerWorkspace._id, via workspaceScopePlugin
@@ -42,20 +57,28 @@ export interface VisaRequestDocument extends Document {
   cancelledAt?: Date;
   cancelledByUserId?: mongoose.Types.ObjectId; // ref User
 
-  // Screen 5 (review & submit) consent — set ONCE, atomically, by POST
-  // /requests/:id/submit (routes/visa.ts), which also uses
-  // consentAcceptedAt's null-ness as the idempotency boundary: a request
-  // can only be claimed for submission while this is still null. consentVersion
-  // records WHICH text (config/visaConsent.ts's VISA_CONSENT_TEXT) was
-  // accepted — the wording will change over time, and "they agreed to
-  // something at some point" is not an audit record without knowing what.
-  consentAcceptedAt?: Date;
-  consentAcceptedByUserId?: mongoose.Types.ObjectId; // ref User
-  consentVersion?: string;
+  // Screen 5 (review & submit) consent — all three clause entries pushed in
+  // ONE atomic write by POST /requests/:id/submit (routes/visa.ts), which
+  // also uses the array being empty ("consents.0" not existing) as the
+  // idempotency boundary: a request can only be claimed for submission
+  // while it's still empty. Never partially populated — submit rejects
+  // before writing anything unless all three clauses were accepted (see
+  // that route's own validation).
+  consents: VisaConsentRecord[];
 
   createdAt?: Date;
   updatedAt?: Date;
 }
+
+const VisaConsentRecordSchema = new Schema<VisaConsentRecord>(
+  {
+    clauseId: { type: String, enum: VISA_CONSENT_CLAUSE_IDS, required: true },
+    version: { type: String, required: true },
+    acceptedAt: { type: Date, required: true },
+    acceptedByUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+  },
+  { _id: false },
+);
 
 const VisaRequestSchema = new Schema<VisaRequestDocument>(
   {
@@ -69,13 +92,10 @@ const VisaRequestSchema = new Schema<VisaRequestDocument>(
     applicationIds: { type: [Schema.Types.ObjectId], ref: "VisaApplication", default: [] },
     cancelledAt: { type: Date },
     cancelledByUserId: { type: Schema.Types.ObjectId, ref: "User" },
-    // default: null (not undefined) — POST /requests/:id/submit's atomic
-    // claim filters on { consentAcceptedAt: null }, and an explicit null
-    // keeps that filter's semantics obvious rather than leaning on Mongo's
-    // "missing field also matches null" behaviour.
-    consentAcceptedAt: { type: Date, default: null },
-    consentAcceptedByUserId: { type: Schema.Types.ObjectId, ref: "User" },
-    consentVersion: { type: String },
+    // default: [] — POST /requests/:id/submit's atomic claim filters on
+    // { "consents.0": { $exists: false } }, so an explicit empty array (not
+    // just "field absent") keeps that filter's semantics obvious.
+    consents: { type: [VisaConsentRecordSchema], default: [] },
   },
   { timestamps: true },
 );
