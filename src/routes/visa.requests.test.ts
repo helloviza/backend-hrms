@@ -736,6 +736,182 @@ describe("GET /requests — customer-side scoping (2026-08-01)", () => {
   });
 });
 
+describe("GET /summary — customer dashboard aggregate (2026-08-01)", () => {
+  function asCustomer(customerId: string, email: string, role: "WORKSPACE_LEADER" | "REQUESTER" | "APPROVER") {
+    return { email, customerId, businessId: customerId, roles: ["CUSTOMER", role] };
+  }
+
+  async function createRequestAs(
+    workspaceId: mongoose.Types.ObjectId,
+    userId: mongoose.Types.ObjectId,
+    userFields: Record<string, any>,
+    body: Record<string, any> = {},
+    travellerOverrides: Record<string, any> = {},
+  ) {
+    const rule = ruleDoc();
+    const t = travellerDoc(workspaceId, travellerOverrides);
+    const res = await request(makeApp(workspaceId, userId, userFields))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(t._id)], ...body });
+    return { body: res.body, traveller: t };
+  }
+
+  function daysFromNow(n: number): string {
+    return new Date(Date.now() + n * 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  it("a WORKSPACE_LEADER and a REQUESTER in the same customer see different counts — org scope vs own scope", async () => {
+    const customerId = "cust-sum";
+    const leader = customerUser(customerId, "leader-sum@x.com", { roles: ["CUSTOMER", "WORKSPACE_LEADER"] });
+    memberDoc(customerId, "leader-sum@x.com", "WORKSPACE_LEADER");
+    const requester = customerUser(customerId, "req-sum@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "req-sum@x.com", "REQUESTER");
+
+    await createRequestAs(WORKSPACE_A, leader._id, asCustomer(customerId, "leader-sum@x.com", "WORKSPACE_LEADER"));
+    await createRequestAs(WORKSPACE_A, requester._id, asCustomer(customerId, "req-sum@x.com", "REQUESTER"));
+
+    const leaderRes = await request(makeApp(WORKSPACE_A, leader._id, asCustomer(customerId, "leader-sum@x.com", "WORKSPACE_LEADER"))).get("/summary");
+    expect(leaderRes.status).toBe(200);
+    expect(leaderRes.body.scope).toBe("ORG");
+    expect(leaderRes.body.totalApplications).toBe(2);
+
+    const requesterRes = await request(makeApp(WORKSPACE_A, requester._id, asCustomer(customerId, "req-sum@x.com", "REQUESTER"))).get("/summary");
+    expect(requesterRes.status).toBe(200);
+    expect(requesterRes.body.scope).toBe("OWN");
+    expect(requesterRes.body.totalApplications).toBe(1);
+  });
+
+  it("a user with no applications gets an all-empty summary (totalApplications: 0, every section empty)", async () => {
+    const customerId = "cust-sum-empty";
+    const requester = customerUser(customerId, "empty@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "empty@x.com", "REQUESTER");
+
+    const res = await request(makeApp(WORKSPACE_A, requester._id, asCustomer(customerId, "empty@x.com", "REQUESTER"))).get("/summary");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true,
+      scope: "OWN",
+      totalApplications: 0,
+      stageCounts: [],
+      needsAction: [],
+      upcomingTravel: [],
+      atRisk: [],
+    });
+  });
+
+  it("needsAction surfaces action_required applications named by traveller, with the concierge's reason", async () => {
+    const customerId = "cust-sum-needs";
+    const requester = customerUser(customerId, "needs@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "needs@x.com", "REQUESTER");
+
+    const created = await createRequestAs(WORKSPACE_A, requester._id, asCustomer(customerId, "needs@x.com", "REQUESTER"), {}, { firstName: "Asha", lastName: "Rao" });
+    const appId = created.body.applications[0]._id;
+    applications.update(appId, { status: "action_required", actionRequiredReason: "Upload a clearer passport scan" });
+
+    const res = await request(makeApp(WORKSPACE_A, requester._id, asCustomer(customerId, "needs@x.com", "REQUESTER"))).get("/summary");
+    expect(res.status).toBe(200);
+    expect(res.body.needsAction).toEqual([
+      {
+        requestId: String(created.body.request._id),
+        applicationId: String(appId),
+        travellerName: "Asha Rao",
+        reason: "Upload a clearer passport scan",
+        destinationName: "Germany",
+      },
+    ]);
+    // action_required must never double-count into the in-progress stage breakdown.
+    expect(res.body.stageCounts).toEqual([]);
+  });
+
+  it("stageCounts buckets non-draft, non-action_required applications by stage — excludes draft and action_required", async () => {
+    const customerId = "cust-sum-stages";
+    const leader = customerUser(customerId, "stages@x.com", { roles: ["CUSTOMER", "WORKSPACE_LEADER"] });
+    memberDoc(customerId, "stages@x.com", "WORKSPACE_LEADER");
+    const fields = asCustomer(customerId, "stages@x.com", "WORKSPACE_LEADER");
+
+    const draft = await createRequestAs(WORKSPACE_A, leader._id, fields); // stays draft
+    const submitted = await createRequestAs(WORKSPACE_A, leader._id, fields);
+    applications.update(submitted.body.applications[0]._id, { status: "submitted" });
+    const lodged = await createRequestAs(WORKSPACE_A, leader._id, fields);
+    applications.update(lodged.body.applications[0]._id, { status: "lodged" });
+    const lodged2 = await createRequestAs(WORKSPACE_A, leader._id, fields);
+    applications.update(lodged2.body.applications[0]._id, { status: "lodged" });
+    const actionReq = await createRequestAs(WORKSPACE_A, leader._id, fields);
+    applications.update(actionReq.body.applications[0]._id, { status: "action_required", actionRequiredReason: "x" });
+    void draft;
+
+    const res = await request(makeApp(WORKSPACE_A, leader._id, fields)).get("/summary");
+    expect(res.status).toBe(200);
+    expect(res.body.stageCounts).toEqual([
+      { status: "submitted", count: 1 },
+      { status: "lodged", count: 2 },
+    ]);
+  });
+
+  it("upcomingTravel includes applications with travel within 60 days, marks decided from outcome, and excludes travel further out", async () => {
+    const customerId = "cust-sum-travel";
+    const requester = customerUser(customerId, "travel@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "travel@x.com", "REQUESTER");
+    const fields = asCustomer(customerId, "travel@x.com", "REQUESTER");
+
+    const soonUndecided = await createRequestAs(WORKSPACE_A, requester._id, fields, { travelDateFrom: daysFromNow(10) }, { firstName: "Undecided", lastName: "Traveller" });
+    applications.update(soonUndecided.body.applications[0]._id, { status: "lodged" });
+
+    const soonDecided = await createRequestAs(WORKSPACE_A, requester._id, fields, { travelDateFrom: daysFromNow(5) }, { firstName: "Decided", lastName: "Traveller" });
+    applications.update(soonDecided.body.applications[0]._id, { status: "closed", outcome: "APPROVED" });
+
+    const farOut = await createRequestAs(WORKSPACE_A, requester._id, fields, { travelDateFrom: daysFromNow(90) });
+    applications.update(farOut.body.applications[0]._id, { status: "submitted" });
+
+    const stillDraft = await createRequestAs(WORKSPACE_A, requester._id, fields, { travelDateFrom: daysFromNow(3) }); // left as draft
+
+    const res = await request(makeApp(WORKSPACE_A, requester._id, fields)).get("/summary");
+    expect(res.status).toBe(200);
+    const ids = res.body.upcomingTravel.map((u: any) => u.requestId);
+    expect(ids).toEqual([String(soonDecided.body.request._id), String(soonUndecided.body.request._id)]);
+    expect(ids).not.toContain(String(farOut.body.request._id));
+    expect(ids).not.toContain(String(stillDraft.body.request._id));
+
+    const decidedEntry = res.body.upcomingTravel.find((u: any) => u.requestId === String(soonDecided.body.request._id));
+    expect(decidedEntry.decided).toBe(true);
+    expect(decidedEntry.outcome).toBe("APPROVED");
+    expect(decidedEntry.travellerName).toBe("Decided Traveller");
+
+    const undecidedEntry = res.body.upcomingTravel.find((u: any) => u.requestId === String(soonUndecided.body.request._id));
+    expect(undecidedEntry.decided).toBe(false);
+    expect(undecidedEntry.outcome).toBeNull();
+  });
+
+  it("atRisk reuses assessProcessingRisk (short on time relative to the rule's etaMaxDays) and excludes decided/closed/draft cases", async () => {
+    const customerId = "cust-sum-risk";
+    const requester = customerUser(customerId, "risk@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "risk@x.com", "REQUESTER");
+    const fields = asCustomer(customerId, "risk@x.com", "REQUESTER");
+
+    // ruleDoc() defaults: etaMaxDays 10, etaBasis BUSINESS — 2 days out is
+    // nowhere near enough lead time, so this must come back at-risk.
+    const atRiskCase = await createRequestAs(WORKSPACE_A, requester._id, fields, { travelDateFrom: daysFromNow(2) }, { firstName: "AtRisk", lastName: "Traveller" });
+    applications.update(atRiskCase.body.applications[0]._id, { status: "submitted" });
+
+    // Plenty of lead time — not at risk, must not appear.
+    const safeCase = await createRequestAs(WORKSPACE_A, requester._id, fields, { travelDateFrom: daysFromNow(120) });
+    applications.update(safeCase.body.applications[0]._id, { status: "submitted" });
+
+    // Short on time, but already decided — nothing left to risk.
+    const decidedCase = await createRequestAs(WORKSPACE_A, requester._id, fields, { travelDateFrom: daysFromNow(2) });
+    applications.update(decidedCase.body.applications[0]._id, { status: "closed", outcome: "REJECTED" });
+
+    const res = await request(makeApp(WORKSPACE_A, requester._id, fields)).get("/summary");
+    expect(res.status).toBe(200);
+    const ids = res.body.atRisk.map((r: any) => r.requestId);
+    expect(ids).toEqual([String(atRiskCase.body.request._id)]);
+    expect(ids).not.toContain(String(safeCase.body.request._id));
+    expect(ids).not.toContain(String(decidedCase.body.request._id));
+    expect(res.body.atRisk[0].travellerName).toBe("AtRisk Traveller");
+    expect(res.body.atRisk[0].marginDays).toBeLessThan(0);
+  });
+});
+
 describe("GET /travellers — visa picker data", () => {
   it("returns masked passportNo (same tail-mask as workspace.travellers GET /), unmasked passportExpiry, workspace-scoped, with disambiguating fields", async () => {
     travellerDoc(WORKSPACE_A, { firstName: "Asha", passportNo: "M1234567", passportExpiry: "2030-05-01", dob: "1990-01-01" });

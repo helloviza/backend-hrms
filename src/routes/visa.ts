@@ -78,7 +78,7 @@ import { getCountryByIso2, normaliseToIso2 } from "../utils/countryCodes.js";
 import { getVisaDocumentCodeDef, VISA_DOCUMENT_CODE_SET } from "../config/visaDocumentCodes.js";
 import { CURRENT_VISA_CONSENT_VERSION, VISA_CONSENT_CLAUSE_IDS } from "../config/visaConsent.js";
 import { computeVisaFeeBlock } from "../utils/visaFee.js";
-import { computeEstimatedDecisionWindow } from "../utils/visaEta.js";
+import { computeEstimatedDecisionWindow, assessProcessingRisk } from "../utils/visaEta.js";
 import { maskTailId } from "../utils/piiMask.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
@@ -802,7 +802,19 @@ function normRole(v: unknown): string {
  * logging is so the gap gets FIXED elsewhere, not because own-scope is
  * unsafe.
  */
-async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<Record<string, any>> {
+interface VisaRequestsScopedFilter {
+  filter: Record<string, any>;
+  // ORG = this user may see their whole customer's cases (WORKSPACE_LEADER);
+  // OWN = requests they raised, or requests where they're the claimed
+  // traveller, only. Surfaced alongside the filter (rather than recomputed
+  // by callers) so GET /summary (2026-08-01) can label its dashboard "your
+  // team's applications" vs "your applications" from the SAME determination
+  // GET /requests already makes — never a second, potentially-diverging
+  // WORKSPACE_LEADER check.
+  scope: "ORG" | "OWN";
+}
+
+async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<VisaRequestsScopedFilter> {
   const user = req.user;
   const userId = actorId(req);
   const rolesNorm = (Array.isArray(user?.roles) ? user.roles : []).map(normRole);
@@ -828,7 +840,7 @@ async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<Re
     // The direct, indexed path — what this whole change exists to add.
     const hasLegacyRows = await VisaRequest.exists({ workspaceId, customerId: null });
     if (!hasLegacyRows) {
-      return { workspaceId, customerId: String(customerId) };
+      return { filter: { workspaceId, customerId: String(customerId) }, scope: "ORG" };
     }
 
     // Fallback for pre-field rows ONLY — same indirect join this route
@@ -843,11 +855,14 @@ async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<Re
       .select("_id")
       .lean();
     return {
-      workspaceId,
-      $or: [
-        { customerId: String(customerId) },
-        { customerId: null, raisedByUserId: { $in: teamUserIds.map((u: any) => u._id) } },
-      ],
+      filter: {
+        workspaceId,
+        $or: [
+          { customerId: String(customerId) },
+          { customerId: null, raisedByUserId: { $in: teamUserIds.map((u: any) => u._id) } },
+        ],
+      },
+      scope: "ORG",
     };
   }
 
@@ -861,8 +876,11 @@ async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<Re
   const requestIdsAsTraveller = await VisaApplication.find({ workspaceId, travellerProfileId: { $in: claimedTravellerIds } }).distinct("requestId");
 
   return {
-    workspaceId,
-    $or: [{ raisedByUserId: userId }, { _id: { $in: requestIdsAsTraveller } }],
+    filter: {
+      workspaceId,
+      $or: [{ raisedByUserId: userId }, { _id: { $in: requestIdsAsTraveller } }],
+    },
+    scope: "OWN",
   };
 }
 
@@ -876,7 +894,7 @@ async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<Re
 router.get("/requests", async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
-    const filter = await resolveVisaRequestsFilter(req, workspaceId);
+    const { filter } = await resolveVisaRequestsFilter(req, workspaceId);
     const requests = await VisaRequest.find(filter).sort({ createdAt: -1 }).lean();
 
     const requestIds = requests.map((r: any) => r._id);
@@ -899,6 +917,130 @@ router.get("/requests", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[visa requests GET list]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load visa requests" });
+  }
+});
+
+// Stages counted in the dashboard's IN PROGRESS breakdown — every non-
+// terminal, non-interrupt stage. "draft" is excluded (not yet a real case
+// worth showing on a dashboard) and "action_required" is excluded (it has
+// its own top-priority NEEDS YOU section below and must never be double-
+// counted here) — same STAGE_ORDER vocabulary as the frontend's
+// pages/visa/track/status.ts, minus draft.
+const DASHBOARD_IN_PROGRESS_STAGES = ["submitted", "docs_under_review", "cost_confirmed", "lodged", "decision_received"];
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /summary — the one aggregate the customer-facing /visa dashboard
+ * calls (2026-08-01). Same resolveVisaRequestsFilter as GET /requests
+ * above — org scope for a WORKSPACE_LEADER, own scope otherwise — never
+ * re-derived here. Read-only: every item carries just enough (requestId,
+ * applicationId, traveller name) to link straight to its case; nothing
+ * here is itself actionable.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/summary", async (req: any, res: any) => {
+  try {
+    const workspaceId = req.workspaceObjectId;
+    const { filter, scope } = await resolveVisaRequestsFilter(req, workspaceId);
+    const requests = await VisaRequest.find(filter)
+      .select("_id destinationIso2 purpose travelDateFrom travelDateTo status")
+      .lean();
+
+    if (requests.length === 0) {
+      return res.json({
+        ok: true,
+        scope,
+        totalApplications: 0,
+        stageCounts: [],
+        needsAction: [],
+        upcomingTravel: [],
+        atRisk: [],
+      });
+    }
+
+    const requestById = new Map(requests.map((r: any) => [String(r._id), r]));
+    const requestIds = requests.map((r: any) => r._id);
+    const applications = await VisaApplication.find({ workspaceId, requestId: { $in: requestIds } }).lean();
+
+    if (applications.length === 0) {
+      return res.json({
+        ok: true,
+        scope,
+        totalApplications: 0,
+        stageCounts: [],
+        needsAction: [],
+        upcomingTravel: [],
+        atRisk: [],
+      });
+    }
+
+    const hydrated = await hydrateApplicationsWithTravellers(applications, workspaceId);
+
+    const stageCounts = DASHBOARD_IN_PROGRESS_STAGES
+      .map((status) => ({ status, count: hydrated.filter((a: any) => a.status === status).length }))
+      .filter((s) => s.count > 0);
+
+    const needsAction = hydrated
+      .filter((a: any) => a.status === "action_required")
+      .map((a: any) => ({
+        requestId: String(a.requestId),
+        applicationId: String(a._id),
+        travellerName: a.traveller?.name || "Traveller",
+        reason: a.actionRequiredReason || null,
+        destinationName: a.ruleSnapshot?.destinationName || null,
+      }));
+
+    const now = new Date();
+    const horizon = new Date(now.getTime() + 60 * 24 * 60 * 60 * 1000);
+    const upcomingTravel = hydrated
+      .map((a: any) => ({ a, request: requestById.get(String(a.requestId)) }))
+      .filter(({ a, request }: any) => {
+        if (a.status === "draft") return false;
+        const from = request?.travelDateFrom ? new Date(request.travelDateFrom) : null;
+        return Boolean(from && from >= now && from <= horizon);
+      })
+      .map(({ a, request }: any) => ({
+        requestId: String(a.requestId),
+        applicationId: String(a._id),
+        travellerName: a.traveller?.name || "Traveller",
+        destinationName: a.ruleSnapshot?.destinationName || null,
+        travelDateFrom: request.travelDateFrom,
+        decided: Boolean(a.outcome),
+        outcome: a.outcome || null,
+      }))
+      .sort((a: any, b: any) => new Date(a.travelDateFrom).getTime() - new Date(b.travelDateFrom).getTime());
+
+    // Mirrors admin.visa.ts's computeRowRisk exactly — same "nothing left
+    // to risk" exclusion (outcome set, or status closed/draft) and the same
+    // single call to assessProcessingRisk, reused rather than recomputed.
+    const atRisk = hydrated
+      .map((a: any) => {
+        const request = requestById.get(String(a.requestId));
+        if (a.outcome || a.status === "closed" || a.status === "draft") return null;
+        const risk = assessProcessingRisk(request?.travelDateFrom, a.ruleSnapshot?.etaMaxDays, a.ruleSnapshot?.etaBasis);
+        if (!risk?.atRisk) return null;
+        return {
+          requestId: String(a.requestId),
+          applicationId: String(a._id),
+          travellerName: a.traveller?.name || "Traveller",
+          destinationName: a.ruleSnapshot?.destinationName || null,
+          travelDateFrom: request?.travelDateFrom || null,
+          marginDays: risk.marginDays,
+        };
+      })
+      .filter(Boolean)
+      .sort((a: any, b: any) => a.marginDays - b.marginDays);
+
+    res.json({
+      ok: true,
+      scope,
+      totalApplications: applications.length,
+      stageCounts,
+      needsAction,
+      upcomingTravel,
+      atRisk,
+    });
+  } catch (err: any) {
+    console.error("[visa summary GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load visa summary" });
   }
 });
 
