@@ -7,6 +7,7 @@ import { describe, it, expect } from "vitest";
 import {
   resolveVisaChecklistItems,
   getReferencedApplicantAttributeFields,
+  resolveVisaChecklistWithExclusions,
 } from "./visaChecklistResolver.js";
 
 describe("resolveVisaChecklistItems — legacy vs group-based equivalence", () => {
@@ -167,5 +168,70 @@ describe("getReferencedApplicantAttributeFields", () => {
   it("returns an empty array when no group has an appliesWhen at all", () => {
     const source = { documentGroups: [{ key: "A", label: "A", requirement: "REQUIRED" as const, docTypeCodes: ["A"] }] };
     expect(getReferencedApplicantAttributeFields(source)).toEqual([]);
+  });
+});
+
+describe("resolveVisaChecklistWithExclusions — console checklist gap", () => {
+  const source = {
+    documentGroups: [
+      { key: "PASSPORT", label: "Passport", requirement: "REQUIRED" as const, docTypeCodes: ["PASSPORT_ORIGINAL"] },
+      {
+        key: "ITR",
+        label: "Income Tax Return",
+        requirement: "CONDITIONAL" as const,
+        appliesWhen: [{ field: "employmentStatus" as const, in: ["SELF_EMPLOYED"] }],
+        docTypeCodes: ["INCOME_TAX_RETURN"],
+      },
+    ],
+  };
+
+  it("matches resolveVisaChecklistItems' included set exactly for the same profile", () => {
+    const profile = { employmentStatus: "EMPLOYED" as const };
+    const { included } = resolveVisaChecklistWithExclusions(source, profile);
+    expect(included).toEqual(resolveVisaChecklistItems(source, profile));
+  });
+
+  it("returns the excluded group with the attribute and actual value that excluded it", () => {
+    const { excluded } = resolveVisaChecklistWithExclusions(source, { employmentStatus: "EMPLOYED" });
+    expect(excluded).toHaveLength(1);
+    expect(excluded[0]).toMatchObject({
+      key: "ITR",
+      label: "Income Tax Return",
+      docTypeCodes: ["INCOME_TAX_RETURN"],
+      excludedBy: [{ field: "employmentStatus", actualValue: "EMPLOYED", expected: "one of SELF_EMPLOYED" }],
+    });
+    expect(excluded[0].reason).toBe("traveller's employment status is EMPLOYED, not one of SELF_EMPLOYED");
+  });
+
+  it("includes the ITR requirement (and excludes nothing) for a self-employed traveller", () => {
+    const { included, excluded } = resolveVisaChecklistWithExclusions(source, { employmentStatus: "SELF_EMPLOYED" });
+    expect(included.map((i) => i.key)).toEqual(["PASSPORT", "ITR"]);
+    expect(excluded).toEqual([]);
+  });
+
+  it("reports 'not answered' when the profile never set the relevant field", () => {
+    const { excluded } = resolveVisaChecklistWithExclusions(source, {});
+    expect(excluded[0].excludedBy[0].actualValue).toBeNull();
+    expect(excluded[0].reason).toContain("not answered");
+  });
+
+  it("returns no exclusions in preview mode (no applicant known yet)", () => {
+    const { included, excluded } = resolveVisaChecklistWithExclusions(source, undefined);
+    expect(included).toHaveLength(2); // full, unfiltered preview
+    expect(excluded).toEqual([]);
+  });
+
+  it("returns no exclusions for a legacy-only source — nothing structural to exclude on", () => {
+    const legacySource = { documentRequirements: [{ docCode: "DOC-01", requirement: "REQUIRED" as const }] };
+    const { included, excluded } = resolveVisaChecklistWithExclusions(legacySource, { employmentStatus: "EMPLOYED" });
+    expect(included).toHaveLength(1);
+    expect(excluded).toEqual([]);
+  });
+
+  it("an old-shape ruleSnapshot (no documentGroups) still renders via the exclusions path", () => {
+    const oldSnapshot = { documentRequirements: [{ docCode: "DOC-01", requirement: "REQUIRED" as const }] };
+    const { included, excluded } = resolveVisaChecklistWithExclusions(oldSnapshot, { employmentStatus: "SELF_EMPLOYED" });
+    expect(included).toEqual([{ key: "DOC-01", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["DOC-01"] }]);
+    expect(excluded).toEqual([]);
   });
 });

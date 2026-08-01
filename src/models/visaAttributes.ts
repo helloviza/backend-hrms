@@ -110,12 +110,24 @@ export function evaluateApplicantPredicate(
 ): boolean {
   if (!predicate || predicate.length === 0) return true;
   const p = profile || {};
-  return predicate.every((cond) => {
-    const value = (p as any)[cond.field];
-    if (cond.in !== undefined) return cond.in.includes(value);
-    if (cond.equals !== undefined) return value === cond.equals;
-    return false;
-  });
+  return predicate.every((cond) => evaluateApplicantCondition(cond, p));
+}
+
+/**
+ * Evaluates a SINGLE condition — the building block evaluateApplicantPredicate
+ * ANDs together. Exported on its own so a caller that needs to know WHICH
+ * condition(s) failed (not just the overall true/false) — e.g. the
+ * concierge console explaining why a requirement was excluded — can re-run
+ * just the failing ones without duplicating the equals/in matching logic.
+ */
+export function evaluateApplicantCondition(
+  cond: VisaApplicantPredicateCondition,
+  profile: Partial<VisaApplicantProfile> | null | undefined,
+): boolean {
+  const value = (profile as any)?.[cond.field];
+  if (cond.in !== undefined) return cond.in.includes(value as any);
+  if (cond.equals !== undefined) return value === cond.equals;
+  return false;
 }
 
 /**

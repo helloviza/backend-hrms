@@ -22,8 +22,10 @@
 // needed — "old-shape snapshot" and "legacy-only rule" are the same case.
 import {
   evaluateApplicantPredicate,
+  evaluateApplicantCondition,
   type VisaApplicantAttributeField,
   type VisaApplicantPredicate,
+  type VisaApplicantPredicateCondition,
   type VisaApplicantProfile,
 } from "../models/visaAttributes.js";
 import { getVisaDocumentCodeDef } from "../config/visaDocumentCodes.js";
@@ -91,6 +93,31 @@ export interface ResolvedChecklistItem {
  *    for them too, by construction — there's nothing to filter without
  *    structured `appliesWhen` data to filter against.
  */
+function groupToItem(g: VisaChecklistSourceDocumentGroup): ResolvedChecklistItem {
+  const item: ResolvedChecklistItem = {
+    key: g.key,
+    label: g.label,
+    requirement: g.requirement,
+    docTypeCodes: [...g.docTypeCodes],
+  };
+  if (g.appliesWhen && g.appliesWhen.length > 0) item.appliesWhen = g.appliesWhen;
+  if (g.legacyConditionNote) item.condition = g.legacyConditionNote;
+  if (g.specification) item.specification = g.specification;
+  if (g.templateCode) item.templateCode = g.templateCode;
+  return item;
+}
+
+function legacyRequirementToItem(r: VisaChecklistSourceDocumentRequirement): ResolvedChecklistItem {
+  const item: ResolvedChecklistItem = {
+    key: r.docCode,
+    label: getVisaDocumentCodeDef(r.docCode)?.name ?? r.docCode,
+    requirement: r.requirement,
+    docTypeCodes: [r.docCode],
+  };
+  if (r.condition) item.condition = r.condition;
+  return item;
+}
+
 export function resolveVisaChecklistItems(
   source: VisaChecklistSource,
   applicantProfile?: Partial<VisaApplicantProfile> | null,
@@ -101,31 +128,10 @@ export function resolveVisaChecklistItems(
   if (Array.isArray(groups) && groups.length > 0) {
     return groups
       .filter((g) => bypassFiltering || evaluateApplicantPredicate(g.appliesWhen, applicantProfile))
-      .map((g) => {
-        const item: ResolvedChecklistItem = {
-          key: g.key,
-          label: g.label,
-          requirement: g.requirement,
-          docTypeCodes: [...g.docTypeCodes],
-        };
-        if (g.appliesWhen && g.appliesWhen.length > 0) item.appliesWhen = g.appliesWhen;
-        if (g.legacyConditionNote) item.condition = g.legacyConditionNote;
-        if (g.specification) item.specification = g.specification;
-        if (g.templateCode) item.templateCode = g.templateCode;
-        return item;
-      });
+      .map(groupToItem);
   }
 
-  return (source.documentRequirements || []).map((r) => {
-    const item: ResolvedChecklistItem = {
-      key: r.docCode,
-      label: getVisaDocumentCodeDef(r.docCode)?.name ?? r.docCode,
-      requirement: r.requirement,
-      docTypeCodes: [r.docCode],
-    };
-    if (r.condition) item.condition = r.condition;
-    return item;
-  });
+  return (source.documentRequirements || []).map(legacyRequirementToItem);
 }
 
 /**
@@ -163,4 +169,96 @@ export function getReferencedApplicantAttributeFields(
     for (const cond of g.appliesWhen || []) fields.add(cond.field);
   }
   return [...fields];
+}
+
+/**
+ * Phase 10c (console checklist gap) — a requirement the resolver left OUT
+ * of resolveVisaChecklistItems() because its `appliesWhen` didn't match
+ * this applicant, plus WHY: the specific attribute(s) that excluded it and
+ * this applicant's actual value for each. An agent working the console
+ * needs to know a requirement was deliberately skipped rather than
+ * missing/forgotten — this is the data behind that distinction.
+ */
+export interface ExcludedChecklistItem {
+  key: string;
+  label: string;
+  docTypeCodes: string[];
+  excludedBy: { field: VisaApplicantAttributeField; actualValue: unknown; expected: string }[];
+  // Human-readable, e.g. "traveller's employment status is EMPLOYED, not
+  // SELF_EMPLOYED" — assembled from excludedBy, never hand-written per case.
+  reason: string;
+}
+
+const APPLICANT_FIELD_LABELS: Record<VisaApplicantAttributeField, string> = {
+  employmentStatus: "employment status",
+  isMinor: "age",
+  isSponsored: "sponsorship",
+  sponsorType: "sponsor type",
+  invitationSource: "invitation source",
+  maritalStatus: "marital status",
+  holdsUsVisa: "US visa status",
+  holdsSchengenVisa: "Schengen visa status",
+};
+
+function describeExpected(cond: VisaApplicantPredicateCondition): string {
+  if (cond.in !== undefined) return `one of ${cond.in.join(", ")}`;
+  return String(cond.equals);
+}
+
+function describeActual(value: unknown): string {
+  if (value === undefined || value === null) return "not answered";
+  return String(value);
+}
+
+function buildExclusionReason(
+  failingConditions: VisaApplicantPredicateCondition[],
+  profile: Partial<VisaApplicantProfile> | null | undefined,
+): { excludedBy: ExcludedChecklistItem["excludedBy"]; reason: string } {
+  const excludedBy = failingConditions.map((cond) => ({
+    field: cond.field,
+    actualValue: (profile as any)?.[cond.field] ?? null,
+    expected: describeExpected(cond),
+  }));
+  const reason = excludedBy
+    .map(
+      (e) =>
+        `traveller's ${APPLICANT_FIELD_LABELS[e.field]} is ${describeActual(e.actualValue)}, not ${e.expected}`,
+    )
+    .join(" and ");
+  return { excludedBy, reason };
+}
+
+/**
+ * Same resolution as resolveVisaChecklistItems, but ALSO returns the groups
+ * that were excluded (appliesWhen didn't match this applicant) with a
+ * reason each — never computed when applicantProfile is undefined/null (the
+ * "no applicant known yet" preview mode has nothing to exclude by
+ * definition — see resolveVisaChecklistItems), and never anything for a
+ * legacy-only source (no structured appliesWhen exists to exclude on).
+ */
+export function resolveVisaChecklistWithExclusions(
+  source: VisaChecklistSource,
+  applicantProfile: Partial<VisaApplicantProfile> | null | undefined,
+): { included: ResolvedChecklistItem[]; excluded: ExcludedChecklistItem[] } {
+  const groups = source.documentGroups;
+  const bypassFiltering = applicantProfile === undefined || applicantProfile === null;
+
+  if (!Array.isArray(groups) || groups.length === 0 || bypassFiltering) {
+    return { included: resolveVisaChecklistItems(source, applicantProfile), excluded: [] };
+  }
+
+  const included: ResolvedChecklistItem[] = [];
+  const excluded: ExcludedChecklistItem[] = [];
+
+  for (const g of groups) {
+    const failing = (g.appliesWhen || []).filter((cond) => !evaluateApplicantCondition(cond, applicantProfile));
+    if (failing.length === 0) {
+      included.push(groupToItem(g));
+    } else {
+      const { excludedBy, reason } = buildExclusionReason(failing, applicantProfile);
+      excluded.push({ key: g.key, label: g.label, docTypeCodes: [...g.docTypeCodes], excludedBy, reason });
+    }
+  }
+
+  return { included, excluded };
 }

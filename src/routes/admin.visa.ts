@@ -61,6 +61,8 @@ import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import VisaActivityLog, { logVisaActivity, type VisaActivityEventType } from "../models/VisaActivityLog.js";
 import { assessProcessingRisk } from "../utils/visaEta.js";
+import { hydrateVisaChecklist, computeOutstandingRequirements } from "../utils/visaChecklistHydration.js";
+import { resolveVisaChecklistWithExclusions } from "../utils/visaChecklistResolver.js";
 
 const router = Router();
 const adminVisaLogger = logger.child({ module: "admin.visa" });
@@ -115,6 +117,59 @@ function mapAdminDocumentSummary(d: any) {
   };
 }
 
+// Phase 10c (console checklist gap) — the SAME resolver the customer
+// routes use (utils/visaChecklistResolver.ts / visaChecklistHydration.ts),
+// against this application's OWN applicantProfile — never the raw,
+// unfiltered rule. Without this an agent would see the full ~22-item
+// checklist while the customer sees the ~10 that actually apply to them,
+// and would chase documents the applicant was never asked for.
+//
+// Unlike the customer view, the console ALSO gets the excluded
+// requirements (task brief §2) — a group whose appliesWhen didn't match
+// this traveller, with the attribute (and this traveller's actual value)
+// that excluded it, e.g. "traveller's employment status is EMPLOYED, not
+// one of SELF_EMPLOYED" — so an agent can tell "deliberately skipped" from
+// "missing" at a glance instead of having to open the live VisaRule to
+// compare.
+function hydrateAdminRuleSnapshot(a: any) {
+  const linkedServices = new Set<string>((a.linkedBookings || []).map((lb: any) => lb.service));
+  const applicantProfile = a.applicantProfile || {};
+  const checklist = hydrateVisaChecklist(a.ruleSnapshot || {}, { applicantProfile, linkedServices });
+  const { excluded } = resolveVisaChecklistWithExclusions(a.ruleSnapshot || {}, applicantProfile);
+  return {
+    ...a.ruleSnapshot,
+    documentRequirements: checklist.documents,
+    documentGroups: checklist.documentGroups,
+    excludedRequirements: excluded,
+  };
+}
+
+// Task brief §3 — "confirm the completeness counts in the console match
+// what the customer sees." Same two functions the customer routes/frontend
+// use (utils/visaChecklistHydration.ts's computeOutstandingRequirements,
+// and documentGroups' own countsTowardCompleteness) — never a second,
+// console-specific counting rule that could quietly drift from the
+// customer's.
+function computeAdminCompletenessCounts(
+  a: any,
+  documents: Array<{ docCode: string }>,
+): { requiredCount: number; uploadedRequiredCount: number } {
+  const linkedServices = new Set<string>((a.linkedBookings || []).map((lb: any) => lb.service));
+  const applicantProfile = a.applicantProfile || {};
+  const ruleSnapshot = a.ruleSnapshot || {};
+
+  const requiredCount = hydrateVisaChecklist(ruleSnapshot, { applicantProfile, linkedServices }).documentGroups.filter(
+    (g) => g.countsTowardCompleteness,
+  ).length;
+
+  const outstanding = computeOutstandingRequirements(ruleSnapshot, applicantProfile, {
+    uploadedDocCodes: new Set(documents.map((d) => d.docCode)),
+    linkedServices,
+  });
+
+  return { requiredCount, uploadedRequiredCount: requiredCount - outstanding.length };
+}
+
 function mapAdminApplicationSummary(a: any) {
   return {
     id: String(a._id),
@@ -156,7 +211,7 @@ function mapAdminApplicationSummary(a: any) {
     customerRespondedAt: a.customerRespondedAt ?? null,
     nationality: a.nationality ?? null,
     nationalityUnresolved: a.nationalityUnresolved,
-    ruleSnapshot: a.ruleSnapshot,
+    ruleSnapshot: hydrateAdminRuleSnapshot(a),
     indicativeCostSnapshot: a.indicativeCostSnapshot,
     actualEmbassyFeeInr: a.actualEmbassyFeeInr ?? null,
     actualVfsFeeInr: a.actualVfsFeeInr ?? null,
@@ -431,6 +486,25 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       return { id: String(userId), name: (u?.name || u?.email) ?? null };
     }
 
+    // Task brief §1/§3 — resolved (not raw) checklist completeness, only
+    // for the PAGE being returned (same "page only" posture as assignees
+    // above). Without this an agent scanning the queue would see the
+    // "22 pending" count the raw rule implies rather than what the
+    // customer's own applicantProfile actually narrows it to.
+    const pageApplicationIds = pageRows.map(({ application: a }) => a._id);
+    const pageDocuments = pageApplicationIds.length
+      ? await VisaDocument.find({ applicationId: { $in: pageApplicationIds }, deletedAt: null })
+          .select("applicationId docCode")
+          .lean()
+      : [];
+    const documentsByApplicationId = new Map<string, Array<{ docCode: string }>>();
+    for (const d of pageDocuments as any[]) {
+      const key = String(d.applicationId);
+      const list = documentsByApplicationId.get(key) || [];
+      list.push({ docCode: d.docCode });
+      documentsByApplicationId.set(key, list);
+    }
+
     const shaped = pageRows.map(({ application: a, request: r, risk }) => {
       const workspace = workspaceById.get(String(a.workspaceId)) || null;
       const traveller = travellerById.get(String(a.travellerProfileId)) || null;
@@ -469,6 +543,10 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         destinationName: a.ruleSnapshot?.destinationName ?? null,
         purpose: a.ruleSnapshot?.purpose ?? null,
         serviceTier: a.ruleSnapshot?.serviceTier ?? null,
+        // Resolved against THIS application's own applicantProfile — see
+        // computeAdminCompletenessCounts. Matches what the customer sees
+        // for the same application (task brief §3).
+        completeness: computeAdminCompletenessCounts(a, documentsByApplicationId.get(String(a._id)) || []),
         workspace: { id: String(a.workspaceId), name: workspace?.companyName ?? null },
         request: r
           ? {
@@ -553,6 +631,12 @@ router.get("/applications/:id", requirePermission("visaApplication", "READ"), as
     res.json({
       ok: true,
       application: mapAdminApplicationSummary(application),
+      // Task brief §3 — computed from the SAME resolved checklist +
+      // completeness rule the customer side uses, over this route's own
+      // already-fetched `documents` — never a second implementation that
+      // could show a different number than what the customer sees for the
+      // same application.
+      completeness: computeAdminCompletenessCounts(application, documents as any[]),
       traveller: traveller
         ? {
             id: String((traveller as any)._id),

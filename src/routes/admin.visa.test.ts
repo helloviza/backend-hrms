@@ -379,6 +379,8 @@ vi.mock("../models/UserPermission.js", () => ({
 import express from "express";
 import request from "supertest";
 import router from "./admin.visa.js";
+import { hydrateVisaChecklist } from "../utils/visaChecklistHydration.js";
+import { resolveVisaChecklistWithExclusions } from "../utils/visaChecklistResolver.js";
 
 const WORKSPACE_A = new mongoose.Types.ObjectId();
 const WORKSPACE_B = new mongoose.Types.ObjectId();
@@ -559,6 +561,144 @@ describe("GET /applications/:id — detail", () => {
     expect(res.body.application.travellerProfileId).toBeNull();
     expect(new Date(res.body.application.travellerErasedAt).toISOString()).toBe(erasedAt.toISOString());
     expect(res.body.traveller).toBeNull();
+  });
+});
+
+// Phase 10c — the console checklist gap. Same resolver/hydration functions
+// the customer routes (routes/visa.ts) use, against THIS application's own
+// applicantProfile — never a raw, unfiltered ruleSnapshot, never a parallel
+// counting rule.
+describe("GET /applications/:id — resolved checklist (console checklist gap)", () => {
+  const GROUP_BASED_RULE_SNAPSHOT = {
+    destinationName: "USA",
+    purpose: "BUSINESS",
+    serviceTier: "STANDARD",
+    documentRequirements: [
+      { docCode: "DOC-01", requirement: "REQUIRED" },
+      { docCode: "DOC-04", requirement: "CONDITIONAL", condition: "If self-employed or a business owner" },
+    ],
+    documentGroups: [
+      { key: "PASSPORT", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["DOC-01"] },
+      {
+        key: "ITR",
+        label: "Income Tax Return",
+        requirement: "CONDITIONAL",
+        appliesWhen: [{ field: "employmentStatus", in: ["SELF_EMPLOYED"] }],
+        docTypeCodes: ["DOC-04"],
+      },
+    ],
+  };
+
+  it("narrows the checklist to what applies to THIS traveller — an EMPLOYED traveller never sees the ITR requirement", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, {
+      ruleSnapshot: GROUP_BASED_RULE_SNAPSHOT,
+      applicantProfile: { employmentStatus: "EMPLOYED" },
+    });
+
+    const res = await request(app).get(`/applications/${a._id}`);
+    expect(res.status).toBe(200);
+    const groups = res.body.application.ruleSnapshot.documentGroups;
+    expect(groups.map((g: any) => g.key)).toEqual(["PASSPORT"]);
+    expect(res.body.application.ruleSnapshot.documentRequirements.map((d: any) => d.docCode)).toEqual(["DOC-01"]);
+  });
+
+  it("matches resolveVisaChecklistWithExclusions/hydrateVisaChecklist exactly — same function, not a parallel implementation", async () => {
+    const app = makeApp();
+    const applicantProfile = { employmentStatus: "EMPLOYED" };
+    const a = applicationDoc(WORKSPACE_A, { ruleSnapshot: GROUP_BASED_RULE_SNAPSHOT, applicantProfile });
+
+    const res = await request(app).get(`/applications/${a._id}`);
+
+    const linkedServices = new Set<string>();
+    const expectedChecklist = hydrateVisaChecklist(GROUP_BASED_RULE_SNAPSHOT, { applicantProfile, linkedServices });
+    const expectedExclusions = resolveVisaChecklistWithExclusions(GROUP_BASED_RULE_SNAPSHOT, applicantProfile);
+
+    expect(res.body.application.ruleSnapshot.documentGroups).toEqual(expectedChecklist.documentGroups);
+    expect(res.body.application.ruleSnapshot.documentRequirements).toEqual(expectedChecklist.documents);
+    expect(res.body.application.ruleSnapshot.excludedRequirements).toEqual(expectedExclusions.excluded);
+  });
+
+  it("returns the excluded ITR requirement with the attribute and actual value that excluded it", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, {
+      ruleSnapshot: GROUP_BASED_RULE_SNAPSHOT,
+      applicantProfile: { employmentStatus: "EMPLOYED" },
+    });
+
+    const res = await request(app).get(`/applications/${a._id}`);
+    const excluded = res.body.application.ruleSnapshot.excludedRequirements;
+    expect(excluded).toHaveLength(1);
+    expect(excluded[0]).toMatchObject({
+      key: "ITR",
+      label: "Income Tax Return",
+      docTypeCodes: ["DOC-04"],
+      excludedBy: [{ field: "employmentStatus", actualValue: "EMPLOYED", expected: "one of SELF_EMPLOYED" }],
+    });
+    expect(excluded[0].reason).toBe("traveller's employment status is EMPLOYED, not one of SELF_EMPLOYED");
+  });
+
+  it("includes the ITR requirement (nothing excluded) for a self-employed traveller", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, {
+      ruleSnapshot: GROUP_BASED_RULE_SNAPSHOT,
+      applicantProfile: { employmentStatus: "SELF_EMPLOYED" },
+    });
+
+    const res = await request(app).get(`/applications/${a._id}`);
+    expect(res.body.application.ruleSnapshot.documentGroups.map((g: any) => g.key)).toEqual(["PASSPORT", "ITR"]);
+    expect(res.body.application.ruleSnapshot.excludedRequirements).toEqual([]);
+  });
+
+  it("an old-shape ruleSnapshot (no documentGroups) still renders in full, exactly as before this phase", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, {
+      ruleSnapshot: {
+        destinationName: "Germany",
+        purpose: "TOURIST",
+        serviceTier: "STANDARD",
+        documentRequirements: [{ docCode: "DOC-01", requirement: "REQUIRED" }],
+      },
+      applicantProfile: { employmentStatus: "EMPLOYED" },
+    });
+
+    const res = await request(app).get(`/applications/${a._id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.application.ruleSnapshot.documentRequirements).toHaveLength(1);
+    expect(res.body.application.ruleSnapshot.documentRequirements[0]).toMatchObject({ docCode: "DOC-01", name: "Passport" });
+    expect(res.body.application.ruleSnapshot.excludedRequirements).toEqual([]);
+  });
+
+  it("completeness counts a 4-document group as ONE requirement, matching how the customer side counts it", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, {
+      ruleSnapshot: {
+        destinationName: "France",
+        purpose: "BUSINESS",
+        serviceTier: "STANDARD",
+        documentRequirements: [],
+        documentGroups: [
+          {
+            key: "PROOF_OF_OCCUPATION",
+            label: "Proof of occupation",
+            requirement: "REQUIRED",
+            docTypeCodes: ["SALARY_SLIPS", "EMPLOYMENT_CONTRACT", "EMPLOYER_NOC", "FORM_16"],
+          },
+          { key: "PASSPORT", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["PASSPORT_ORIGINAL"] },
+        ],
+      },
+      applicantProfile: {},
+    });
+    _documents.insert({ applicationId: a._id, docCode: "SALARY_SLIPS", deletedAt: null });
+    _documents.insert({ applicationId: a._id, docCode: "EMPLOYMENT_CONTRACT", deletedAt: null });
+    _documents.insert({ applicationId: a._id, docCode: "EMPLOYER_NOC", deletedAt: null });
+    _documents.insert({ applicationId: a._id, docCode: "PASSPORT_ORIGINAL", deletedAt: null });
+
+    const res = await request(app).get(`/applications/${a._id}`);
+    expect(res.status).toBe(200);
+    // requiredCount is 2 (groups), never 5 (documents); the 4-doc group is
+    // still incomplete (FORM_16 missing) so only PASSPORT is "uploaded".
+    expect(res.body.completeness).toEqual({ requiredCount: 2, uploadedRequiredCount: 1 });
   });
 });
 
@@ -1222,6 +1362,67 @@ describe("GET /queue — cross-workspace", () => {
     applicationDoc(WORKSPACE_A, { status: "draft" });
     const res = await request(app).get("/queue");
     expect(res.body.applications).toHaveLength(0);
+  });
+
+  // Phase 10c — task brief §3: "confirm the completeness counts in the
+  // console match what the customer sees." Same resolver/counting rule,
+  // exercised here through the queue row rather than the detail response.
+  it("resolves each row's completeness against ITS OWN applicantProfile, narrowing what's required", async () => {
+    const app = makeApp();
+    const ruleSnapshot = {
+      destinationName: "USA",
+      purpose: "BUSINESS",
+      serviceTier: "STANDARD",
+      documentRequirements: [],
+      documentGroups: [
+        { key: "PASSPORT", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["DOC-01"] },
+        {
+          key: "ITR",
+          label: "Income Tax Return",
+          requirement: "CONDITIONAL",
+          appliesWhen: [{ field: "employmentStatus", in: ["SELF_EMPLOYED"] }],
+          docTypeCodes: ["DOC-04"],
+        },
+      ],
+    };
+    const employed = applicationDoc(WORKSPACE_A, {
+      status: "submitted",
+      ruleSnapshot,
+      applicantProfile: { employmentStatus: "EMPLOYED" },
+    });
+    const selfEmployed = applicationDoc(WORKSPACE_A, {
+      status: "submitted",
+      ruleSnapshot,
+      applicantProfile: { employmentStatus: "SELF_EMPLOYED" },
+    });
+
+    const res = await request(app).get("/queue");
+    expect(res.status).toBe(200);
+    const byId = Object.fromEntries(res.body.applications.map((row: any) => [row.id, row]));
+    // EMPLOYED: only PASSPORT is required (ITR excluded for them).
+    expect(byId[String(employed._id)].completeness).toEqual({ requiredCount: 1, uploadedRequiredCount: 0 });
+    // SELF_EMPLOYED: both PASSPORT and ITR apply.
+    expect(byId[String(selfEmployed._id)].completeness).toEqual({ requiredCount: 2, uploadedRequiredCount: 0 });
+  });
+
+  it("counts an uploaded document toward completeness on the queue row", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, {
+      status: "submitted",
+      ruleSnapshot: {
+        destinationName: "Germany",
+        purpose: "TOURIST",
+        serviceTier: "STANDARD",
+        documentRequirements: [],
+        documentGroups: [{ key: "PASSPORT", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["DOC-01"] }],
+      },
+      applicantProfile: {},
+    });
+    _documents.insert({ applicationId: a._id, docCode: "DOC-01", deletedAt: null });
+
+    const res = await request(app).get("/queue");
+    const row = res.body.applications.find((r: any) => r.id === String(a._id));
+    expect(row.completeness).toEqual({ requiredCount: 1, uploadedRequiredCount: 1 });
   });
 
   it("excludes an erased-traveller application by default — nothing for an agent to work", async () => {
