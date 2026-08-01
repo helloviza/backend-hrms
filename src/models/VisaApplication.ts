@@ -96,6 +96,15 @@ export interface VisaIndicativeCostSnapshot {
 
 export interface VisaApplicationDocument extends Document {
   workspaceId: mongoose.Types.ObjectId; // CustomerWorkspace._id, via workspaceScopePlugin
+  // Copied verbatim from the parent VisaRequest.customerId at creation
+  // (routes/visa.ts's POST /requests) — same field, same convention
+  // (TravelBooking.tenantId: a loose String, not an ObjectId ref), added
+  // here too (2026-08-01) so the concierge console queue and reports can
+  // filter by customer without joining back through VisaRequest. null
+  // under the exact same conditions the parent request's own customerId
+  // is null (staff-raised, no customerId to copy) — never independently
+  // derived or backfilled from anything else.
+  customerId: string | null;
   requestId: mongoose.Types.ObjectId; // ref VisaRequest
   // ref TravellerProfile — applicant identity, not duplicated here. NULL only
   // after scripts/erase-traveller-profile.ts has run (see travellerErasedAt
@@ -329,6 +338,9 @@ const VisaLinkedBookingSchema = new Schema<VisaLinkedBooking>(
 const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
   {
     requestId: { type: Schema.Types.ObjectId, ref: "VisaRequest", required: true, index: true },
+    // Mirrors the parent VisaRequest's own customerId — see the interface
+    // field's doc comment above.
+    customerId: { type: String, default: null, index: true },
     // NOT `required: true` — deliberately loosened for scripts/
     // erase-traveller-profile.ts, which sets this to null (see
     // travellerErasedAt below). Every application is still created WITH one:
@@ -417,6 +429,9 @@ VisaApplicationSchema.index({ assignedScreeningOfficerId: 1 });
 // /queue ?servicePartnerName filter) — same cross-workspace posture as the
 // two indexes above.
 VisaApplicationSchema.index({ servicePartnerName: 1 });
+// Filtering the console queue/reports by customer without joining back
+// through VisaRequest (task brief, 2026-08-01).
+VisaApplicationSchema.index({ workspaceId: 1, customerId: 1 });
 // NOTE: the concierge console queue (routes/admin.visa.ts) queries by
 // status ACROSS every workspace — {workspaceId,status} above doesn't serve
 // a workspace-less status filter, since workspaceId is its leading field.

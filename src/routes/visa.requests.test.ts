@@ -143,6 +143,8 @@ vi.mock("../models/VisaRequest.js", () => ({
     findById: (id: any) => chainable(() => requests.get(id)),
     findOne: (filter: any) => chainable(() => requests.query(filter)[0] ?? null),
     find: (filter: any) => chainable(() => requests.query(filter)),
+    // resolveVisaRequestsFilter's own legacy-fallback check (routes/visa.ts).
+    exists: async (filter: any) => (requests.query(filter).length > 0 ? { _id: requests.query(filter)[0]._id } : null),
     findByIdAndUpdate: async (id: any, update: any) => requests.update(id, update?.$set || {}),
   },
   recomputeRequestStatus: (...args: any[]) => recomputeRequestStatusMock(...args),
@@ -661,6 +663,75 @@ describe("GET /requests — customer-side scoping (2026-08-01)", () => {
     expect(visaLoggerWarnMock).toHaveBeenCalledWith(
       expect.stringContaining("no CustomerMember record"),
       expect.objectContaining({ userId: String(orphan._id), customerId }),
+    );
+  });
+
+  it("creation sets VisaRequest.customerId (and copies it onto every application) from the raiser's own customerId", async () => {
+    const customerId = "cust-f";
+    const leader = customerUser(customerId, "leader-f@x.com", { roles: ["CUSTOMER", "WORKSPACE_LEADER"] });
+
+    const { body } = await createRequestAs(WORKSPACE_A, leader._id, asCustomer(customerId, "leader-f@x.com", "WORKSPACE_LEADER"));
+
+    expect(body.request.customerId).toBe(customerId);
+    expect(body.applications).toHaveLength(1);
+    expect(applications.get(body.applications[0]._id).customerId).toBe(customerId);
+  });
+
+  it("a staff-raised request (raiser has no customerId/businessId) leaves customerId null — never guessed from workspaceId", async () => {
+    const staffUser = { _id: new mongoose.Types.ObjectId(), email: "admin@plumtrips.com", roles: ["EMPLOYEE"] }; // no customerId/businessId
+
+    const { body } = await createRequestAs(WORKSPACE_A, staffUser._id, staffUser);
+
+    expect(body.request.customerId).toBeNull();
+    expect(applications.get(body.applications[0]._id).customerId).toBeNull();
+  });
+
+  it("org scope uses the stored field directly — survives the raiser's OWN customerId later changing, unlike the old customerId->users->raisedByUserId join", async () => {
+    const customerId = "cust-g";
+    const leader = customerUser(customerId, "leader-g@x.com", { roles: ["CUSTOMER", "WORKSPACE_LEADER"] });
+    const raiser = customerUser(customerId, "raiser-g@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "leader-g@x.com", "WORKSPACE_LEADER");
+
+    const created = await createRequestAs(WORKSPACE_A, raiser._id, asCustomer(customerId, "raiser-g@x.com", "REQUESTER"));
+    expect(created.body.request.customerId).toBe(customerId);
+
+    // The raiser's account is later moved off this customer entirely — the
+    // exact silent-breakage this field exists to stop (task brief: "a
+    // request raised by someone whose customerId is later cleared falls
+    // out of their own company's scope"). Re-deriving via the indirect
+    // join would now fail; the stored field must not care.
+    users.update(raiser._id, { customerId: "cust-somewhere-else", businessId: "cust-somewhere-else" });
+
+    const res = await request(makeApp(WORKSPACE_A, leader._id, asCustomer(customerId, "leader-g@x.com", "WORKSPACE_LEADER"))).get("/requests");
+    expect(res.status).toBe(200);
+    expect(res.body.requests.map((r: any) => r._id)).toEqual([created.body.request._id]);
+  });
+
+  it("falls back to the indirect join for a legacy null-customerId record, and logs that the fallback fired", async () => {
+    const customerId = "cust-h";
+    const leader = customerUser(customerId, "leader-h@x.com", { roles: ["CUSTOMER", "WORKSPACE_LEADER"] });
+    const legacyRaiser = customerUser(customerId, "legacy-raiser-h@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "leader-h@x.com", "WORKSPACE_LEADER");
+
+    // Inserted directly, bypassing POST /requests — simulates a row written
+    // before this field existed: workspaceId set, customerId explicitly
+    // null, raisedByUserId pointing at a real member of this customer.
+    const legacyRequest = requests.insert({
+      workspaceId: WORKSPACE_A,
+      raisedByUserId: legacyRaiser._id,
+      customerId: null,
+      destinationIso2: "DE",
+      purpose: "TOURIST",
+      applicationIds: [],
+    });
+
+    const res = await request(makeApp(WORKSPACE_A, leader._id, asCustomer(customerId, "leader-h@x.com", "WORKSPACE_LEADER"))).get("/requests");
+    expect(res.status).toBe(200);
+    expect(res.body.requests.map((r: any) => r._id)).toEqual([String(legacyRequest._id)]);
+
+    expect(visaLoggerWarnMock).toHaveBeenCalledWith(
+      expect.stringContaining("falling back to the indirect raisedByUserId join"),
+      expect.objectContaining({ workspaceId: String(WORKSPACE_A), customerId }),
     );
   });
 });

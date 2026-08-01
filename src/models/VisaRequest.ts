@@ -35,6 +35,22 @@ export interface VisaConsentRecord {
 export interface VisaRequestDocument extends Document {
   workspaceId: mongoose.Types.ObjectId; // CustomerWorkspace._id, via workspaceScopePlugin
   raisedByUserId: mongoose.Types.ObjectId; // ref User — who raised this request
+  // Which Customer this request belongs to (2026-08-01) — a stored, indexed
+  // fact, not a derived one. Follows TravelBooking.tenantId's own
+  // convention exactly: a loose String (matching User.customerId/
+  // businessId's own type — Customer._id is technically an ObjectId, but
+  // nothing in this codebase's customer-id fields stores it as one), set
+  // ONCE at creation from the raising user's customerId/businessId
+  // (routes/visa.ts's POST /requests) and never re-derived afterward — a
+  // request's tenancy must not depend on whatever that user's account
+  // looks like later (the exact silent-breakage routes/visa.ts's GET
+  // /requests used to be exposed to: a raiser's customerId cleared after
+  // the fact used to drop their own request out of their own company's
+  // scope). null when the raiser has no customerId at all (staff-raised
+  // test data, e.g. HOUSE's existing rows) — never guessed from
+  // workspaceId, which is exactly the many-Customers-one-workspace
+  // ambiguity this field exists to stop depending on.
+  customerId: string | null;
   destinationIso2: string;
   purpose: VisaPurpose;
   travelDateFrom?: Date;
@@ -83,6 +99,10 @@ const VisaConsentRecordSchema = new Schema<VisaConsentRecord>(
 const VisaRequestSchema = new Schema<VisaRequestDocument>(
   {
     raisedByUserId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    // TravelBooking.tenantId's convention — String, indexed, alongside
+    // workspaceId. null (not "default") when unresolvable — see the
+    // interface field's own doc comment above for why.
+    customerId: { type: String, default: null, index: true },
     destinationIso2: { type: String, required: true, uppercase: true, trim: true },
     purpose: { type: String, enum: VISA_PURPOSES, required: true },
     travelDateFrom: { type: Date },
@@ -105,6 +125,9 @@ VisaRequestSchema.plugin(workspaceScopePlugin);
 VisaRequestSchema.index({ workspaceId: 1, raisedByUserId: 1 });
 VisaRequestSchema.index({ workspaceId: 1, status: 1 });
 VisaRequestSchema.index({ workspaceId: 1, createdAt: -1 });
+// GET /requests's own org-scope filter (routes/visa.ts) — the primary
+// consumer of this field.
+VisaRequestSchema.index({ workspaceId: 1, customerId: 1 });
 
 // Sequential-per-year, collision-safe reference number (Counter is an atomic
 // $inc, unlike a countDocuments-based scheme) — matches the design brief's

@@ -668,6 +668,14 @@ router.post("/requests", async (req: any, res: any) => {
     const travellerById = new Map(travellers.map((t: any) => [String(t._id), t]));
 
     const raisedByUserId = req.user?._id ?? req.user?.id ?? req.user?.sub;
+    // Set ONCE, here, from the raiser's OWN customerId/businessId — never
+    // re-derived later, and never guessed from workspaceId (models/
+    // VisaRequest.ts's own doc comment on this field explains why: that's
+    // exactly the many-Customers-one-workspace ambiguity this field exists
+    // to stop depending on). null for a staff-raised request (no
+    // customerId on the account at all — the existing HOUSE test data
+    // shape) rather than a guess.
+    const customerId = req.user?.customerId || req.user?.businessId || null;
 
     // Reference number is minted ONCE here, by VisaRequest's own pre-save
     // hook (see models/VisaRequest.ts, mintVisaRequestReferenceNumber) —
@@ -678,6 +686,7 @@ router.post("/requests", async (req: any, res: any) => {
     const visaRequest = await VisaRequest.create({
       workspaceId,
       raisedByUserId,
+      customerId,
       destinationIso2: rule.destinationIso2,
       purpose: rule.purpose,
       travelDateFrom: parsedFrom,
@@ -700,6 +709,9 @@ router.post("/requests", async (req: any, res: any) => {
       return {
         workspaceId,
         requestId: visaRequest._id,
+        // Copied from the parent request, not re-derived (task brief,
+        // 2026-08-01) — see models/VisaApplication.ts's own doc comment.
+        customerId,
         travellerProfileId: traveller!._id,
         nationality: nationalityIso2, // null when it doesn't resolve — see model comment
         nationalityUnresolved: nationalityIso2 == null,
@@ -764,18 +776,21 @@ function normRole(v: unknown): string {
  * either their whole CUSTOMER's requests (WORKSPACE_LEADER — "someone who
  * can raise for others") or only their own (everyone else).
  *
- * Deliberately CUSTOMER-scoped, not workspace-scoped: VisaRequest carries
- * no customerId of its own (only workspaceId, via workspaceScopePlugin —
- * confirmed by reading the schema, not assumed), and HOUSE has 62
- * Customers sharing one CustomerWorkspace. A raw { workspaceId } org filter
- * would hand a HOUSE WORKSPACE_LEADER every one of those 62 companies'
- * requests — the same class of cross-tenant leak already fixed once this
- * session for billing (services/visaBillingSync.ts's resolveBillingCustomer).
- * With no customerId to filter on directly, org scope is resolved
- * indirectly: every User tied to the caller's own customerId/businessId
- * (regardless of that User's own workspaceId, which can be stale — see
- * requireWorkspace.ts's own comment on exactly that), then every
- * VisaRequest raisedByUserId among them.
+ * Deliberately CUSTOMER-scoped, not workspace-scoped: HOUSE has 62
+ * Customers sharing one CustomerWorkspace, and a raw { workspaceId } org
+ * filter would hand a HOUSE WORKSPACE_LEADER every one of those 62
+ * companies' requests — the same class of cross-tenant leak already fixed
+ * once this session for billing (services/visaBillingSync.ts's
+ * resolveBillingCustomer). Org scope now filters VisaRequest.customerId
+ * DIRECTLY (a stored, indexed fact set once at creation from the raiser's
+ * own customerId — see models/VisaRequest.ts and this file's own POST
+ * /requests) rather than re-deriving it every read through a
+ * customerId->users->raisedByUserId join. That join is kept ONLY as a
+ * fallback for records that predate the field (customerId: null), and only
+ * even queried when such a row exists in this workspace at all — so a
+ * fully-backfilled workspace never pays for it, and one that isn't gets a
+ * log line naming the gap (see migrations/2026-08-01-backfill-visa-request-
+ * customer-id.ts for the one-time bulk fix).
  *
  * The WORKSPACE_LEADER check itself is looked up FRESH from CustomerMember
  * here (not read off req.user.customerMemberRole, the JWT claim stamped at
@@ -810,10 +825,30 @@ async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<Re
   const isOrgScope = rolesNorm.includes("WORKSPACELEADER") || memberRole === "WORKSPACE_LEADER";
 
   if (isOrgScope && customerId) {
+    // The direct, indexed path — what this whole change exists to add.
+    const hasLegacyRows = await VisaRequest.exists({ workspaceId, customerId: null });
+    if (!hasLegacyRows) {
+      return { workspaceId, customerId: String(customerId) };
+    }
+
+    // Fallback for pre-field rows ONLY — same indirect join this route
+    // used exclusively before customerId existed. Logged every time it's
+    // exercised so the backfill gap stays visible rather than quietly
+    // permanent.
+    visaLogger.warn("GET /requests: workspace has VisaRequest rows with no customerId — falling back to the indirect raisedByUserId join for org scope", {
+      workspaceId: String(workspaceId),
+      customerId: String(customerId),
+    });
     const teamUserIds = await User.find({ $or: [{ customerId: String(customerId) }, { businessId: String(customerId) }] })
       .select("_id")
       .lean();
-    return { workspaceId, raisedByUserId: { $in: teamUserIds.map((u: any) => u._id) } };
+    return {
+      workspaceId,
+      $or: [
+        { customerId: String(customerId) },
+        { customerId: null, raisedByUserId: { $in: teamUserIds.map((u: any) => u._id) } },
+      ],
+    };
   }
 
   // OWN scope — requests they raised, OR requests where they are the
