@@ -1,0 +1,288 @@
+// apps/backend/src/config/visaDocumentTypeCatalogue.ts
+//
+// Phase 10a — the canonical, semantic-code document-type catalogue that
+// replaces the numbered DOC-01..DOC-25 scheme (config/visaDocumentCodes.ts's
+// original design). This file is the SINGLE source of truth for the
+// catalogue's content; two things are derived from it, never maintained
+// independently:
+//   1. models/VisaDocumentType.ts's seed data, written by the migration
+//      (migrations/2026-08-02-visa-checklist-model-v2.ts) into the new
+//      VisaDocumentType collection.
+//   2. config/visaDocumentCodes.ts's legacy VISA_DOCUMENT_CODES/
+//      VISA_DOCUMENT_CODE_SET, which routes/admin.visa.rules.ts and
+//      routes/visa.ts still import synchronously for validation. Those
+//      routes are OUT OF SCOPE for this phase (schema/migration only) and
+//      several call sites hardcode the OLD "DOC-01".."DOC-10" literals
+//      directly (LINKABLE_DOC_CODE_SERVICE, CONCIERGE_ARRANGEABLE_DOC_CODES,
+//      PASSPORT_DOC_CODE, VISA_SCAN_DOC_CODE — see services/
+//      visaPassportExtraction.ts and routes/admin.visa.ts). Rewriting
+//      already-stored VisaDocument.docCode / VisaRule.documentRequirements
+//      values from old to new would silently break those comparisons. So:
+//      the OLD codes stay valid and unchanged in storage and in every
+//      existing route; the NEW semantic codes are additive, and
+//      OLD_TO_NEW_DOC_CODE_MAP below is the resolvable bridge between them
+//      (used by VisaDocumentType's resolver, never by mutating old rows).
+//
+// Not every real-world document type is populated here — this is a
+// representative catalogue covering the nine legacy codes' equivalents plus
+// the additional types the seven analysed checklists (USA, UK, Canada,
+// France, China, UAE, Laos) require to express document GROUPS and
+// attribute-conditional requirements (see VisaRule.ts's documentGroups).
+// Adding a new type later is additive — no numeric range to run out of,
+// unlike the old DOC-NN scheme.
+
+export type VisaDocumentTypeCategory =
+  | "IDENTITY"
+  | "FINANCIAL"
+  | "EMPLOYMENT"
+  | "BUSINESS"
+  | "TRAVEL"
+  | "SPONSORSHIP"
+  | "CIVIL_STATUS"
+  | "VISA_HISTORY";
+
+export interface VisaDocumentTypeSeed {
+  code: string; // semantic, e.g. "PASSPORT_ORIGINAL" — stable, never renumbered
+  name: string;
+  category: VisaDocumentTypeCategory;
+  defaultDescription: string;
+  // Source-label aliases — the SAME document is asked for under different
+  // names by different missions (task brief's own example: Employer NOC is
+  // "Leave Approval Letter" in Canada, "Leave Letter From Company" in China).
+  aliases: string[];
+  ocrExtractable: boolean;
+  // Set only for the nine codes migrated from config/visaDocumentCodes.ts's
+  // original DOC-NN scheme — see OLD_TO_NEW_DOC_CODE_MAP below, which is
+  // mechanically derived from this field so the two can never drift apart.
+  legacyCode?: string;
+}
+
+export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
+  // ── Migrated from the original nine DOC-01..DOC-09 codes, plus DOC-10 ──
+  {
+    code: "PASSPORT_ORIGINAL",
+    name: "Passport",
+    category: "IDENTITY",
+    defaultDescription: "Bio-data page; minimum 6 months' validity from travel date",
+    aliases: ["Passport Copy", "Passport Bio-Data Page"],
+    ocrExtractable: true,
+    legacyCode: "DOC-01",
+  },
+  {
+    code: "PHOTOGRAPH",
+    name: "Photograph",
+    category: "IDENTITY",
+    defaultDescription: "Recent passport-size photograph per mission specification",
+    aliases: ["Passport Photo", "ID Photo"],
+    ocrExtractable: false,
+    legacyCode: "DOC-02",
+  },
+  {
+    code: "APPLICANT_BANK_STATEMENT",
+    name: "Bank Statement",
+    category: "FINANCIAL",
+    defaultDescription: "Last 6 months, showing salary credits / closing balance",
+    aliases: ["Personal Bank Statement", "Savings Account Statement"],
+    ocrExtractable: false,
+    legacyCode: "DOC-03",
+  },
+  {
+    code: "INCOME_TAX_RETURN",
+    name: "Income Tax Return",
+    category: "FINANCIAL",
+    defaultDescription: "ITR, last 2 assessment years",
+    aliases: ["ITR", "Tax Return Acknowledgement"],
+    ocrExtractable: false,
+    legacyCode: "DOC-04",
+  },
+  {
+    code: "EMPLOYER_NOC",
+    name: "Employer NOC",
+    category: "EMPLOYMENT",
+    defaultDescription: "Confirms designation, salary and sanctioned leave, on company letterhead",
+    aliases: [
+      "Employment Letter",
+      "Leave Approval Letter",
+      "Leave Letter From Company",
+      "No Objection Certificate (NOC)",
+    ],
+    ocrExtractable: false,
+    legacyCode: "DOC-05",
+  },
+  {
+    code: "INVITATION_LETTER",
+    name: "Invitation Letter",
+    category: "BUSINESS",
+    defaultDescription: "From the host company, on letterhead, with dates and purpose",
+    aliases: ["Business Invitation", "Host Company Letter"],
+    ocrExtractable: false,
+    legacyCode: "DOC-06",
+  },
+  {
+    code: "HOTEL_BOOKING",
+    name: "Hotel Booking",
+    category: "TRAVEL",
+    defaultDescription: "Confirmed accommodation covering the full stay",
+    aliases: ["Accommodation Proof", "Hotel Confirmation"],
+    ocrExtractable: false,
+    legacyCode: "DOC-07",
+  },
+  {
+    code: "FLIGHT_ITINERARY",
+    name: "Flight Itinerary",
+    category: "TRAVEL",
+    defaultDescription: "Confirmed or refundable-hold return itinerary",
+    aliases: ["Return Ticket", "Flight Reservation"],
+    ocrExtractable: false,
+    legacyCode: "DOC-08",
+  },
+  {
+    code: "TRAVEL_INSURANCE",
+    name: "Travel Insurance",
+    category: "TRAVEL",
+    defaultDescription: "Required by Schengen and several other missions",
+    aliases: ["Medical Travel Insurance"],
+    ocrExtractable: false,
+    legacyCode: "DOC-09",
+  },
+  {
+    code: "ISSUED_VISA_SCAN",
+    name: "Issued Visa",
+    category: "IDENTITY",
+    defaultDescription: "Scanned copy of the issued visa, attached by the concierge on approval",
+    aliases: [],
+    ocrExtractable: false,
+    legacyCode: "DOC-10",
+  },
+
+  // ── New semantic-only types — needed to express document GROUPS and
+  // attribute-conditional requirements seen across the seven checklists ──
+  {
+    code: "SALARY_SLIPS",
+    name: "Salary Slips",
+    category: "EMPLOYMENT",
+    defaultDescription: "Most recent 3 months' salary slips",
+    aliases: ["Payslips"],
+    ocrExtractable: false,
+  },
+  {
+    code: "EMPLOYMENT_CONTRACT",
+    name: "Employment Contract",
+    category: "EMPLOYMENT",
+    defaultDescription: "Signed contract or appointment letter confirming current employment",
+    aliases: ["Appointment Letter"],
+    ocrExtractable: false,
+  },
+  {
+    code: "FORM_16",
+    name: "Form 16",
+    category: "FINANCIAL",
+    defaultDescription: "Annual tax-withholding certificate issued by the employer",
+    aliases: [],
+    ocrExtractable: false,
+  },
+  {
+    code: "SPONSOR_BANK_STATEMENT",
+    name: "Sponsor's Bank Statement",
+    category: "FINANCIAL",
+    defaultDescription: "Last 6 months' bank statement of the person funding the trip",
+    aliases: ["Financial Sponsor's Bank Statement"],
+    ocrExtractable: false,
+  },
+  {
+    code: "SPONSORSHIP_LETTER",
+    name: "Sponsorship Letter",
+    category: "SPONSORSHIP",
+    defaultDescription: "Letter from the sponsor confirming financial support for the trip",
+    aliases: ["Affidavit of Support", "Letter of Financial Sponsorship"],
+    ocrExtractable: false,
+  },
+  {
+    code: "MARRIAGE_CERTIFICATE",
+    name: "Marriage Certificate",
+    category: "CIVIL_STATUS",
+    defaultDescription: "Proof of marriage, required when travelling with or sponsored by a spouse",
+    aliases: [],
+    ocrExtractable: false,
+  },
+  {
+    code: "BIRTH_CERTIFICATE",
+    name: "Birth Certificate",
+    category: "CIVIL_STATUS",
+    defaultDescription: "Proof of parentage/age for a minor applicant",
+    aliases: [],
+    ocrExtractable: false,
+  },
+  {
+    code: "PARENTAL_CONSENT_LETTER",
+    name: "Parental Consent Letter",
+    category: "CIVIL_STATUS",
+    defaultDescription: "Notarised consent from both parents/guardians for a minor travelling without them",
+    aliases: ["Minor Consent Letter"],
+    ocrExtractable: false,
+  },
+  {
+    code: "PRIOR_VISA_COPY",
+    name: "Prior Visa Copy",
+    category: "VISA_HISTORY",
+    defaultDescription: "Copy of a previously issued visa relevant to this application's eligibility",
+    aliases: ["Copy of Valid US Visa", "Copy of Valid Schengen Visa"],
+    ocrExtractable: false,
+  },
+  {
+    code: "BUSINESS_REGISTRATION",
+    name: "Business Registration",
+    category: "BUSINESS",
+    defaultDescription: "Proof of business ownership/registration for a self-employed applicant",
+    aliases: ["Company Registration Certificate"],
+    ocrExtractable: false,
+  },
+  {
+    code: "PENSION_OR_RETIREMENT_PROOF",
+    name: "Pension / Retirement Proof",
+    category: "FINANCIAL",
+    defaultDescription: "Pension statement or retirement order for a retired applicant",
+    aliases: ["Retirement Order"],
+    ocrExtractable: false,
+  },
+  {
+    code: "STUDENT_ENROLLMENT_LETTER",
+    name: "Student Enrollment Letter",
+    category: "EMPLOYMENT",
+    defaultDescription: "Institution letter confirming current enrollment, for a student applicant",
+    aliases: ["Bonafide Certificate"],
+    ocrExtractable: false,
+  },
+  {
+    code: "COVER_LETTER",
+    name: "Cover Letter",
+    category: "TRAVEL",
+    defaultDescription: "Applicant's own letter explaining the purpose and itinerary of the trip",
+    aliases: ["Purpose of Visit Letter"],
+    ocrExtractable: false,
+  },
+] as const;
+
+// Mechanically derived from legacyCode above — the "old to new" mapping
+// this phase's task brief asks to be reported. Never hand-maintained
+// separately from the catalogue entries themselves.
+export const OLD_TO_NEW_DOC_CODE_MAP: Readonly<Record<string, string>> = Object.freeze(
+  Object.fromEntries(
+    VISA_DOCUMENT_TYPE_CATALOGUE.filter((d) => d.legacyCode).map((d) => [d.legacyCode as string, d.code]),
+  ),
+);
+
+/**
+ * Given EITHER an old DOC-NN code or a new semantic code, returns the
+ * canonical (new) semantic code. Codes with no legacy mapping (already
+ * semantic, or unknown) pass through unchanged — this never throws, since
+ * callers use it to normalise a value for lookup/reporting, not to validate.
+ */
+export function canonicalizeVisaDocumentCode(code: string): string {
+  return OLD_TO_NEW_DOC_CODE_MAP[code] ?? code;
+}
+
+export function getVisaDocumentTypeSeed(code: string): VisaDocumentTypeSeed | undefined {
+  const canonical = canonicalizeVisaDocumentCode(code);
+  return VISA_DOCUMENT_TYPE_CATALOGUE.find((d) => d.code === canonical);
+}

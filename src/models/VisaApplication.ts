@@ -22,6 +22,7 @@ import {
   type VisaCategory, type VisaEtaBasis, type VisaRuleDisplayMode,
   type VisaDocumentRequirement,
 } from "./VisaRule.js";
+import { VisaApplicantProfileSchema, type VisaApplicantProfile } from "./visaAttributes.js";
 import logger from "../utils/logger.js";
 
 const visaApplicationLogger = logger.child({ module: "VisaApplication" });
@@ -94,6 +95,15 @@ export interface VisaIndicativeCostSnapshot {
   priceNote?: string;
 }
 
+// One answer to a shared-bank or rule-specific question (VisaRule.ts's
+// VisaRuleQuestionRef / VisaRuleInlineQuestion, VisaQuestion.ts). `answer`
+// is Mixed since its real type depends on the question's own answerType.
+export interface VisaQuestionnaireAnswer {
+  questionCode: string;
+  answer: unknown;
+  answeredAt: Date;
+}
+
 export interface VisaApplicationDocument extends Document {
   workspaceId: mongoose.Types.ObjectId; // CustomerWorkspace._id, via workspaceScopePlugin
   // Copied verbatim from the parent VisaRequest.customerId at creation
@@ -123,6 +133,23 @@ export interface VisaApplicationDocument extends Document {
   // hand. Never null with nationalityUnresolved false, or vice versa.
   nationality: string | null;
   nationalityUnresolved: boolean;
+
+  // Phase 10a (task brief §2) — structured applicant facts (employment,
+  // sponsorship, marital status, prior-visa history — models/
+  // visaAttributes.ts), used to pick a VisaRule variant (VisaRule.ts's
+  // `applicability`) and to filter which document-requirement groups within
+  // the matched rule actually apply (`appliesWhen`). Every field is
+  // optional/undefined until either inferred (see
+  // deriveCorporateApplicantProfileDefaults below) or answered — this is
+  // NOT a place to fabricate a value nothing actually confirmed.
+  applicantProfile: VisaApplicantProfile;
+
+  // Phase 10a (task brief §7) — answers to the matched rule's questionnaire
+  // (VisaRule.questions[]/additionalQuestions[], resolved against the
+  // shared VisaQuestion bank). Schema only in this phase — nothing writes
+  // to this yet; no submission route exists. `answer` is Mixed since the
+  // type varies with the question's own answerType (boolean/string/Date).
+  questionnaireAnswers: VisaQuestionnaireAnswer[];
 
   ruleSnapshot: VisaRuleSnapshot;
   indicativeCostSnapshot: VisaIndicativeCostSnapshot;
@@ -335,6 +362,15 @@ const VisaLinkedBookingSchema = new Schema<VisaLinkedBooking>(
   { _id: false },
 );
 
+const VisaQuestionnaireAnswerSchema = new Schema<VisaQuestionnaireAnswer>(
+  {
+    questionCode: { type: String, required: true, trim: true, uppercase: true },
+    answer: { type: Schema.Types.Mixed, required: true },
+    answeredAt: { type: Date, required: true, default: Date.now },
+  },
+  { _id: false },
+);
+
 const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
   {
     requestId: { type: Schema.Types.ObjectId, ref: "VisaRequest", required: true, index: true },
@@ -356,6 +392,9 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     },
     nationality: { type: String, uppercase: true, trim: true, default: null },
     nationalityUnresolved: { type: Boolean, required: true, default: false },
+
+    applicantProfile: { type: VisaApplicantProfileSchema, default: () => ({}) },
+    questionnaireAnswers: { type: [VisaQuestionnaireAnswerSchema], default: [] },
 
     ruleSnapshot: { type: VisaRuleSnapshotSchema, required: true },
     indicativeCostSnapshot: { type: VisaIndicativeCostSnapshotSchema, required: true },
