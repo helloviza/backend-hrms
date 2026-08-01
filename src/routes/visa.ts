@@ -75,16 +75,28 @@ import TravelBooking from "../models/TravelBooking.js";
 import User from "../models/User.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { getCountryByIso2, normaliseToIso2 } from "../utils/countryCodes.js";
-import { getVisaDocumentCodeDef, VISA_DOCUMENT_CODE_SET } from "../config/visaDocumentCodes.js";
-import { CURRENT_VISA_CONSENT_VERSION, VISA_CONSENT_CLAUSE_IDS } from "../config/visaConsent.js";
+import {
+  getVisaDocumentCodeDef,
+  VISA_DOCUMENT_CODE_SET,
+} from "../config/visaDocumentCodes.js";
+import {
+  CURRENT_VISA_CONSENT_VERSION,
+  VISA_CONSENT_CLAUSE_IDS,
+} from "../config/visaConsent.js";
 import { computeVisaFeeBlock } from "../utils/visaFee.js";
-import { computeEstimatedDecisionWindow, assessProcessingRisk } from "../utils/visaEta.js";
+import {
+  computeEstimatedDecisionWindow,
+  assessProcessingRisk,
+} from "../utils/visaEta.js";
 import { maskTailId } from "../utils/piiMask.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
-import { runVisaPassportExtraction, PASSPORT_DOC_CODE } from "../services/visaPassportExtraction.js";
+import {
+  runVisaPassportExtraction,
+  PASSPORT_DOC_CODE,
+} from "../services/visaPassportExtraction.js";
 import { resolveMrzDate } from "../utils/mrz.js";
 import VisaActivityLog, {
   logVisaActivity,
@@ -151,7 +163,10 @@ const CONCIERGE_ARRANGEABLE_DOC_CODES = new Set(["DOC-07", "DOC-08", "DOC-09"]);
 // which has a real application (and thus real linkedBookings) to check
 // against — GET /rules and GET /rules/:id call this before an application
 // exists, so satisfiedByBooking is always false there.
-function hydrateDocumentRequirements(reqs: VisaDocumentRequirement[], linkedServices?: ReadonlySet<string>) {
+function hydrateDocumentRequirements(
+  reqs: VisaDocumentRequirement[],
+  linkedServices?: ReadonlySet<string>,
+) {
   return reqs.map((d) => {
     const def = getVisaDocumentCodeDef(d.docCode);
     const service = LINKABLE_DOC_CODE_SERVICE[d.docCode];
@@ -181,12 +196,17 @@ function hydrateDocumentRequirements(reqs: VisaDocumentRequirement[], linkedServ
 // whether a concierge has reviewed it yet — or by a linked booking
 // (DOC-07/DOC-08), same as the checklist display.
 export function computeOutstandingRequiredDocCodes(
-  application: { ruleSnapshot?: { documentRequirements?: VisaDocumentRequirement[] } | null; linkedBookings?: Array<{ service: string }> | null },
+  application: {
+    ruleSnapshot?: { documentRequirements?: VisaDocumentRequirement[] } | null;
+    linkedBookings?: Array<{ service: string }> | null;
+  },
   documents: Array<{ docCode: string }>,
 ): string[] {
   const requirements = application.ruleSnapshot?.documentRequirements || [];
   const uploadedCodes = new Set(documents.map((d) => d.docCode));
-  const linkedServices = new Set((application.linkedBookings || []).map((lb) => lb.service));
+  const linkedServices = new Set(
+    (application.linkedBookings || []).map((lb) => lb.service),
+  );
 
   return requirements
     .filter((r) => r.requirement === "REQUIRED")
@@ -238,7 +258,10 @@ router.get("/destinations", async (_req: any, res: any) => {
       .select("destinationIso2 destinationName visaCategory")
       .lean();
 
-    const byIso2 = new Map<string, { destinationName: string; categories: Set<VisaCategory> }>();
+    const byIso2 = new Map<
+      string,
+      { destinationName: string; categories: Set<VisaCategory> }
+    >();
     for (const r of rules) {
       const existing = byIso2.get(r.destinationIso2);
       if (existing) {
@@ -268,7 +291,9 @@ router.get("/destinations", async (_req: any, res: any) => {
     res.json({ ok: true, destinations });
   } catch (err: any) {
     console.error("[visa destinations GET]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to load visa destinations" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to load visa destinations" });
   }
 });
 
@@ -287,8 +312,12 @@ router.get("/destinations", async (_req: any, res: any) => {
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/rules", async (req: any, res: any) => {
   try {
-    const destination = String(req.query?.destination || "").trim().toUpperCase();
-    const purpose = String(req.query?.purpose || "").trim().toUpperCase() as VisaPurpose;
+    const destination = String(req.query?.destination || "")
+      .trim()
+      .toUpperCase();
+    const purpose = String(req.query?.purpose || "")
+      .trim()
+      .toUpperCase() as VisaPurpose;
     const nationalityRaw = req.query?.nationality;
     const nationality = nationalityRaw
       ? normaliseToIso2(String(nationalityRaw))
@@ -298,10 +327,16 @@ router.get("/rules", async (req: any, res: any) => {
       return res.status(400).json({ error: "destination is required" });
     }
     if (!VISA_PURPOSES.includes(purpose)) {
-      return res.status(400).json({ error: `purpose must be one of ${VISA_PURPOSES.join(", ")}` });
+      return res
+        .status(400)
+        .json({ error: `purpose must be one of ${VISA_PURPOSES.join(", ")}` });
     }
     if (!nationality) {
-      return res.status(400).json({ error: `nationality '${nationalityRaw}' is not a recognised country` });
+      return res
+        .status(400)
+        .json({
+          error: `nationality '${nationalityRaw}' is not a recognised country`,
+        });
     }
 
     const rules = await VisaRule.find({
@@ -318,7 +353,9 @@ router.get("/rules", async (req: any, res: any) => {
     // express an arbitrary enum order, so this is a stable in-memory
     // resort. Stable means entries that tie on tier rank keep the
     // entryType order the query already applied.
-    rules.sort((a, b) => serviceTierRank(a.serviceTier) - serviceTierRank(b.serviceTier));
+    rules.sort(
+      (a, b) => serviceTierRank(a.serviceTier) - serviceTierRank(b.serviceTier),
+    );
 
     const variants = rules.map(mapRuleToVariant);
 
@@ -329,10 +366,18 @@ router.get("/rules", async (req: any, res: any) => {
       demonym: nationalityCountry?.demonym ?? nationality,
     };
 
-    res.json({ ok: true, destination, purpose, nationality: nationalityInfo, variants });
+    res.json({
+      ok: true,
+      destination,
+      purpose,
+      nationality: nationalityInfo,
+      variants,
+    });
   } catch (err: any) {
     console.error("[visa rules GET]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to load visa rules" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to load visa rules" });
   }
 });
 
@@ -356,7 +401,10 @@ router.get("/rules/:id", async (req: any, res: any) => {
       return res.status(404).json({ error: "Visa rule not found" });
     }
 
-    const rule = await VisaRule.findOne({ _id: id, status: "PUBLISHED" }).lean();
+    const rule = await VisaRule.findOne({
+      _id: id,
+      status: "PUBLISHED",
+    }).lean();
     if (!rule) {
       return res.status(404).json({ error: "Visa rule not found" });
     }
@@ -382,8 +430,11 @@ router.get("/rules/:id", async (req: any, res: any) => {
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/content/:iso2", async (req: any, res: any) => {
   try {
-    const iso2 = String(req.params.iso2 || "").trim().toUpperCase();
-    if (!iso2) return res.status(404).json({ error: "Destination content not found" });
+    const iso2 = String(req.params.iso2 || "")
+      .trim()
+      .toUpperCase();
+    if (!iso2)
+      return res.status(404).json({ error: "Destination content not found" });
 
     const content = await VisaDestinationContent.findOne({
       destinationIso2: iso2,
@@ -407,7 +458,9 @@ router.get("/content/:iso2", async (req: any, res: any) => {
     });
   } catch (err: any) {
     console.error("[visa content GET]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to load destination content" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to load destination content" });
   }
 });
 
@@ -431,7 +484,9 @@ router.get("/travellers", async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
     const docs = await TravellerProfile.find({ workspaceId, isActive: true })
-      .select("firstName middleName lastName dob email nationality passportNo passportExpiry")
+      .select(
+        "firstName middleName lastName dob email nationality passportNo passportExpiry",
+      )
       .sort({ firstName: 1, lastName: 1 })
       .lean();
 
@@ -450,7 +505,9 @@ router.get("/travellers", async (req: any, res: any) => {
     res.json({ ok: true, travellers });
   } catch (err: any) {
     console.error("[visa travellers GET]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to load travellers" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to load travellers" });
   }
 });
 
@@ -481,7 +538,9 @@ function buildRuleSnapshot(rule: any): VisaRuleSnapshot {
     // POINT-IN-TIME copy (see VisaApplication.ts file header); the source
     // VisaRule must be free to change later without that ever being
     // visible through an application already created from it.
-    documentRequirements: (rule.documentRequirements || []).map((d: any) => ({ ...d })),
+    documentRequirements: (rule.documentRequirements || []).map((d: any) => ({
+      ...d,
+    })),
   };
 }
 
@@ -539,18 +598,30 @@ async function hydrateApplicationsWithTravellers(
   timelineOpts?: { includeTimelineFields: true },
 ) {
   const travellerIds = applications.map((a) => a.travellerProfileId);
-  const travellers = await TravellerProfile.find({ _id: { $in: travellerIds }, workspaceId })
-    .select("firstName middleName lastName dob email nationality passportNo passportExpiry")
+  const travellers = await TravellerProfile.find({
+    _id: { $in: travellerIds },
+    workspaceId,
+  })
+    .select(
+      "firstName middleName lastName dob email nationality passportNo passportExpiry",
+    )
     .lean();
   const travellerById = new Map(travellers.map((t: any) => [String(t._id), t]));
 
   let conciergeNameByUserId = new Map<string, string | null>();
   if (timelineOpts) {
     const conciergeIds = [
-      ...new Set(applications.map((a) => a.assignedConciergeUserId).filter(Boolean).map((id) => String(id))),
+      ...new Set(
+        applications
+          .map((a) => a.assignedConciergeUserId)
+          .filter(Boolean)
+          .map((id) => String(id)),
+      ),
     ];
     if (conciergeIds.length) {
-      const concierges = await User.find({ _id: { $in: conciergeIds } }).select("name email").lean();
+      const concierges = await User.find({ _id: { $in: conciergeIds } })
+        .select("name email")
+        .lean();
       conciergeNameByUserId = new Map(
         concierges.map((u: any) => [String(u._id), u.name || u.email || null]),
       );
@@ -560,13 +631,18 @@ async function hydrateApplicationsWithTravellers(
   return applications.map((a) => {
     const traveller = travellerById.get(String(a.travellerProfileId)) || null;
     const linkedBookings = a.linkedBookings || [];
-    const linkedServices = new Set<string>(linkedBookings.map((lb: any) => lb.service));
+    const linkedServices = new Set<string>(
+      linkedBookings.map((lb: any) => lb.service),
+    );
     const base = {
       ...a,
       linkedBookings,
       ruleSnapshot: {
         ...a.ruleSnapshot,
-        documentRequirements: hydrateDocumentRequirements(a.ruleSnapshot?.documentRequirements || [], linkedServices),
+        documentRequirements: hydrateDocumentRequirements(
+          a.ruleSnapshot?.documentRequirements || [],
+          linkedServices,
+        ),
       },
       traveller: traveller
         ? {
@@ -587,7 +663,7 @@ async function hydrateApplicationsWithTravellers(
       ...base,
       lodgedAt: a.lodgedAt ?? null,
       assignedConciergeName: a.assignedConciergeUserId
-        ? conciergeNameByUserId.get(String(a.assignedConciergeUserId)) ?? null
+        ? (conciergeNameByUserId.get(String(a.assignedConciergeUserId)) ?? null)
         : null,
       // Per-application, not per-request — each traveller's own passport
       // lodges (and is decided) independently, even though they share one
@@ -619,17 +695,27 @@ async function hydrateApplicationsWithTravellers(
 router.post("/requests", async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
-    const { ruleId, travellerProfileIds, travelDateFrom, travelDateTo } = req.body || {};
+    const { ruleId, travellerProfileIds, travelDateFrom, travelDateTo } =
+      req.body || {};
 
     if (!ruleId || !mongoose.isValidObjectId(ruleId)) {
       return res.status(404).json({ error: "Visa rule not found" });
     }
-    if (!Array.isArray(travellerProfileIds) || travellerProfileIds.length === 0) {
-      return res.status(400).json({ error: "travellerProfileIds must be a non-empty array" });
+    if (
+      !Array.isArray(travellerProfileIds) ||
+      travellerProfileIds.length === 0
+    ) {
+      return res
+        .status(400)
+        .json({ error: "travellerProfileIds must be a non-empty array" });
     }
-    const invalidId = travellerProfileIds.find((id: any) => !mongoose.isValidObjectId(id));
+    const invalidId = travellerProfileIds.find(
+      (id: any) => !mongoose.isValidObjectId(id),
+    );
     if (invalidId != null) {
-      return res.status(400).json({ error: `'${invalidId}' is not a valid traveller id` });
+      return res
+        .status(400)
+        .json({ error: `'${invalidId}' is not a valid traveller id` });
     }
 
     let parsedFrom: Date | undefined;
@@ -637,13 +723,17 @@ router.post("/requests", async (req: any, res: any) => {
     if (travelDateFrom != null) {
       parsedFrom = new Date(travelDateFrom);
       if (Number.isNaN(parsedFrom.getTime())) {
-        return res.status(400).json({ error: "travelDateFrom is not a valid date" });
+        return res
+          .status(400)
+          .json({ error: "travelDateFrom is not a valid date" });
       }
     }
     if (travelDateTo != null) {
       parsedTo = new Date(travelDateTo);
       if (Number.isNaN(parsedTo.getTime())) {
-        return res.status(400).json({ error: "travelDateTo is not a valid date" });
+        return res
+          .status(400)
+          .json({ error: "travelDateTo is not a valid date" });
       }
     }
 
@@ -663,9 +753,15 @@ router.post("/requests", async (req: any, res: any) => {
       workspaceId,
     }).lean();
     if (travellers.length !== travellerProfileIds.length) {
-      return res.status(400).json({ error: "One or more travellers do not belong to this workspace" });
+      return res
+        .status(400)
+        .json({
+          error: "One or more travellers do not belong to this workspace",
+        });
     }
-    const travellerById = new Map(travellers.map((t: any) => [String(t._id), t]));
+    const travellerById = new Map(
+      travellers.map((t: any) => [String(t._id), t]),
+    );
 
     const raisedByUserId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     // Set ONCE, here, from the raiser's OWN customerId/businessId — never
@@ -676,6 +772,72 @@ router.post("/requests", async (req: any, res: any) => {
     // customerId on the account at all — the existing HOUSE test data
     // shape) rather than a guess.
     const customerId = req.user?.customerId || req.user?.businessId || null;
+
+    // Duplicate-application warning (2026-08-02) — checked BEFORE creating,
+    // but never blocks it: a genuine second application for the same trip
+    // is possible (a rejected first attempt, a changed service tier), and
+    // rejecting it would be worse than the duplicate (task brief). A match
+    // is an existing application for one of THESE travellers, same
+    // destination, an overlapping travel window, and a non-terminal,
+    // non-draft status: decision_received/closed are done, a cancelled
+    // REQUEST never progressed past draft in the first place (POST
+    // /requests/:id/cancel only allows cancelling a draft, so excluding
+    // cancelled requests is belt-and-braces alongside the draft-status
+    // exclusion below, not load-bearing on its own), and a draft is the
+    // traveller's own in-progress attempt — warning them about their own
+    // unfinished work is noise, never included here.
+    let duplicateWarnings: Array<{
+      travellerProfileId: string;
+      travellerName: string;
+      existingRequestId: string;
+      existingReferenceNumber: string;
+      existingApplicationId: string;
+      existingStatus: string;
+      destinationName: string;
+    }> = [];
+
+    if (parsedFrom && parsedTo) {
+      const candidateRequests = await VisaRequest.find({
+        workspaceId,
+        destinationIso2: rule.destinationIso2,
+        status: { $ne: "cancelled" },
+        travelDateFrom: { $lte: parsedTo },
+        travelDateTo: { $gte: parsedFrom },
+      })
+        .select("_id referenceNumber")
+        .lean();
+
+      if (candidateRequests.length > 0) {
+        const candidateRequestById = new Map(
+          candidateRequests.map((r: any) => [String(r._id), r]),
+        );
+        const candidateApplications = await VisaApplication.find({
+          workspaceId,
+          requestId: { $in: candidateRequests.map((r: any) => r._id) },
+          travellerProfileId: { $in: travellerProfileIds },
+          status: { $nin: ["draft", "decision_received", "closed"] },
+        })
+          .select(
+            "_id requestId travellerProfileId status ruleSnapshot.destinationName",
+          )
+          .lean();
+
+        duplicateWarnings = candidateApplications.map((a: any) => {
+          const existingRequest = candidateRequestById.get(String(a.requestId));
+          const traveller = travellerById.get(String(a.travellerProfileId));
+          return {
+            travellerProfileId: String(a.travellerProfileId),
+            travellerName: travellerDisplayName(traveller),
+            existingRequestId: String(a.requestId),
+            existingReferenceNumber: existingRequest?.referenceNumber || "",
+            existingApplicationId: String(a._id),
+            existingStatus: a.status,
+            destinationName:
+              a.ruleSnapshot?.destinationName || rule.destinationName,
+          };
+        });
+      }
+    }
 
     // Reference number is minted ONCE here, by VisaRequest's own pre-save
     // hook (see models/VisaRequest.ts, mintVisaRequestReferenceNumber) —
@@ -721,7 +883,8 @@ router.post("/requests", async (req: any, res: any) => {
       };
     });
 
-    const insertedApplications = await VisaApplication.insertMany(applicationInputs);
+    const insertedApplications =
+      await VisaApplication.insertMany(applicationInputs);
 
     await VisaRequest.findByIdAndUpdate(visaRequest._id, {
       $set: { applicationIds: insertedApplications.map((a: any) => a._id) },
@@ -737,7 +900,11 @@ router.post("/requests", async (req: any, res: any) => {
       eventType: "REQUEST_CREATED",
       actorUserId: raisedByUserId,
       actorType: "CUSTOMER",
-      detail: { destinationIso2: rule.destinationIso2, purpose: rule.purpose, travellerCount: insertedApplications.length },
+      detail: {
+        destinationIso2: rule.destinationIso2,
+        purpose: rule.purpose,
+        travellerCount: insertedApplications.length,
+      },
     });
     for (const app of insertedApplications as any[]) {
       await logVisaActivity({
@@ -747,18 +914,36 @@ router.post("/requests", async (req: any, res: any) => {
         eventType: "APPLICATION_CREATED",
         actorUserId: raisedByUserId,
         actorType: "CUSTOMER",
-        detail: { destinationName: ruleSnapshot.destinationName, purpose: ruleSnapshot.purpose, serviceTier: ruleSnapshot.serviceTier },
+        detail: {
+          destinationName: ruleSnapshot.destinationName,
+          purpose: ruleSnapshot.purpose,
+          serviceTier: ruleSnapshot.serviceTier,
+        },
       });
     }
 
     const finalRequest = await VisaRequest.findById(visaRequest._id).lean();
-    const finalApplications = await VisaApplication.find({ requestId: visaRequest._id }).lean();
-    const hydrated = await hydrateApplicationsWithTravellers(finalApplications, workspaceId);
+    const finalApplications = await VisaApplication.find({
+      requestId: visaRequest._id,
+    }).lean();
+    const hydrated = await hydrateApplicationsWithTravellers(
+      finalApplications,
+      workspaceId,
+    );
 
-    res.status(201).json({ ok: true, request: finalRequest, applications: hydrated });
+    res
+      .status(201)
+      .json({
+        ok: true,
+        request: finalRequest,
+        applications: hydrated,
+        warnings: duplicateWarnings,
+      });
   } catch (err: any) {
     console.error("[visa requests POST]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to create visa request" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to create visa request" });
   }
 });
 
@@ -768,7 +953,9 @@ router.post("/requests", async (req: any, res: any) => {
 // rather than importing one of theirs, since none of those files export
 // this specific helper, but the algorithm itself must stay identical.
 function normRole(v: unknown): string {
-  return String(v ?? "").toUpperCase().replace(/[\s_-]+/g, "");
+  return String(v ?? "")
+    .toUpperCase()
+    .replace(/[\s_-]+/g, "");
 }
 
 /**
@@ -814,44 +1001,70 @@ interface VisaRequestsScopedFilter {
   scope: "ORG" | "OWN";
 }
 
-async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<VisaRequestsScopedFilter> {
+async function resolveVisaRequestsFilter(
+  req: any,
+  workspaceId: any,
+): Promise<VisaRequestsScopedFilter> {
   const user = req.user;
   const userId = actorId(req);
-  const rolesNorm = (Array.isArray(user?.roles) ? user.roles : []).map(normRole);
+  const rolesNorm = (Array.isArray(user?.roles) ? user.roles : []).map(
+    normRole,
+  );
   const customerId = user?.customerId || user?.businessId || null;
 
   let memberRole: string | null = null;
   if (customerId && user?.email) {
-    const member = await CustomerMember.findOne({ customerId: String(customerId), email: String(user.email).toLowerCase() })
+    const member = await CustomerMember.findOne({
+      customerId: String(customerId),
+      email: String(user.email).toLowerCase(),
+    })
       .select("role")
       .lean();
     memberRole = (member as any)?.role ?? null;
     if (!member) {
-      visaLogger.warn("GET /requests: no CustomerMember record for this customer-side user — defaulting to REQUESTER-tier (own-scope only)", {
-        userId: String(userId || ""),
-        customerId: String(customerId),
-      });
+      visaLogger.warn(
+        "GET /requests: no CustomerMember record for this customer-side user — defaulting to REQUESTER-tier (own-scope only)",
+        {
+          userId: String(userId || ""),
+          customerId: String(customerId),
+        },
+      );
     }
   }
 
-  const isOrgScope = rolesNorm.includes("WORKSPACELEADER") || memberRole === "WORKSPACE_LEADER";
+  const isOrgScope =
+    rolesNorm.includes("WORKSPACELEADER") || memberRole === "WORKSPACE_LEADER";
 
   if (isOrgScope && customerId) {
     // The direct, indexed path — what this whole change exists to add.
-    const hasLegacyRows = await VisaRequest.exists({ workspaceId, customerId: null });
+    const hasLegacyRows = await VisaRequest.exists({
+      workspaceId,
+      customerId: null,
+    });
     if (!hasLegacyRows) {
-      return { filter: { workspaceId, customerId: String(customerId) }, scope: "ORG" };
+      return {
+        filter: { workspaceId, customerId: String(customerId) },
+        scope: "ORG",
+      };
     }
 
     // Fallback for pre-field rows ONLY — same indirect join this route
     // used exclusively before customerId existed. Logged every time it's
     // exercised so the backfill gap stays visible rather than quietly
     // permanent.
-    visaLogger.warn("GET /requests: workspace has VisaRequest rows with no customerId — falling back to the indirect raisedByUserId join for org scope", {
-      workspaceId: String(workspaceId),
-      customerId: String(customerId),
-    });
-    const teamUserIds = await User.find({ $or: [{ customerId: String(customerId) }, { businessId: String(customerId) }] })
+    visaLogger.warn(
+      "GET /requests: workspace has VisaRequest rows with no customerId — falling back to the indirect raisedByUserId join for org scope",
+      {
+        workspaceId: String(workspaceId),
+        customerId: String(customerId),
+      },
+    );
+    const teamUserIds = await User.find({
+      $or: [
+        { customerId: String(customerId) },
+        { businessId: String(customerId) },
+      ],
+    })
       .select("_id")
       .lean();
     return {
@@ -859,7 +1072,10 @@ async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<Vi
         workspaceId,
         $or: [
           { customerId: String(customerId) },
-          { customerId: null, raisedByUserId: { $in: teamUserIds.map((u: any) => u._id) } },
+          {
+            customerId: null,
+            raisedByUserId: { $in: teamUserIds.map((u: any) => u._id) },
+          },
         ],
       },
       scope: "ORG",
@@ -872,13 +1088,22 @@ async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<Vi
   // (see that field's own doc comment, and models/TravellerProfile.ts's
   // header) — so an unclaimed traveller (no login, or never claimed) gets
   // no extra visibility here, same as today.
-  const claimedTravellerIds = await TravellerProfile.find({ workspaceId, claimedBy: userId }).distinct("_id");
-  const requestIdsAsTraveller = await VisaApplication.find({ workspaceId, travellerProfileId: { $in: claimedTravellerIds } }).distinct("requestId");
+  const claimedTravellerIds = await TravellerProfile.find({
+    workspaceId,
+    claimedBy: userId,
+  }).distinct("_id");
+  const requestIdsAsTraveller = await VisaApplication.find({
+    workspaceId,
+    travellerProfileId: { $in: claimedTravellerIds },
+  }).distinct("requestId");
 
   return {
     filter: {
       workspaceId,
-      $or: [{ raisedByUserId: userId }, { _id: { $in: requestIdsAsTraveller } }],
+      $or: [
+        { raisedByUserId: userId },
+        { _id: { $in: requestIdsAsTraveller } },
+      ],
     },
     scope: "OWN",
   };
@@ -895,11 +1120,19 @@ router.get("/requests", async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
     const { filter } = await resolveVisaRequestsFilter(req, workspaceId);
-    const requests = await VisaRequest.find(filter).sort({ createdAt: -1 }).lean();
+    const requests = await VisaRequest.find(filter)
+      .sort({ createdAt: -1 })
+      .lean();
 
     const requestIds = requests.map((r: any) => r._id);
-    const applications = await VisaApplication.find({ workspaceId, requestId: { $in: requestIds } }).lean();
-    const hydrated = await hydrateApplicationsWithTravellers(applications, workspaceId);
+    const applications = await VisaApplication.find({
+      workspaceId,
+      requestId: { $in: requestIds },
+    }).lean();
+    const hydrated = await hydrateApplicationsWithTravellers(
+      applications,
+      workspaceId,
+    );
 
     const applicationsByRequest = new Map<string, any[]>();
     for (const app of hydrated) {
@@ -916,7 +1149,9 @@ router.get("/requests", async (req: any, res: any) => {
     res.json({ ok: true, requests: result });
   } catch (err: any) {
     console.error("[visa requests GET list]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to load visa requests" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to load visa requests" });
   }
 });
 
@@ -926,7 +1161,13 @@ router.get("/requests", async (req: any, res: any) => {
 // its own top-priority NEEDS YOU section below and must never be double-
 // counted here) — same STAGE_ORDER vocabulary as the frontend's
 // pages/visa/track/status.ts, minus draft.
-const DASHBOARD_IN_PROGRESS_STAGES = ["submitted", "docs_under_review", "cost_confirmed", "lodged", "decision_received"];
+const DASHBOARD_IN_PROGRESS_STAGES = [
+  "submitted",
+  "docs_under_review",
+  "cost_confirmed",
+  "lodged",
+  "decision_received",
+];
 
 /* ─────────────────────────────────────────────────────────────────────
  * GET /summary — the one aggregate the customer-facing /visa dashboard
@@ -958,7 +1199,10 @@ router.get("/summary", async (req: any, res: any) => {
 
     const requestById = new Map(requests.map((r: any) => [String(r._id), r]));
     const requestIds = requests.map((r: any) => r._id);
-    const applications = await VisaApplication.find({ workspaceId, requestId: { $in: requestIds } }).lean();
+    const applications = await VisaApplication.find({
+      workspaceId,
+      requestId: { $in: requestIds },
+    }).lean();
 
     if (applications.length === 0) {
       return res.json({
@@ -972,11 +1216,15 @@ router.get("/summary", async (req: any, res: any) => {
       });
     }
 
-    const hydrated = await hydrateApplicationsWithTravellers(applications, workspaceId);
+    const hydrated = await hydrateApplicationsWithTravellers(
+      applications,
+      workspaceId,
+    );
 
-    const stageCounts = DASHBOARD_IN_PROGRESS_STAGES
-      .map((status) => ({ status, count: hydrated.filter((a: any) => a.status === status).length }))
-      .filter((s) => s.count > 0);
+    const stageCounts = DASHBOARD_IN_PROGRESS_STAGES.map((status) => ({
+      status,
+      count: hydrated.filter((a: any) => a.status === status).length,
+    })).filter((s) => s.count > 0);
 
     const needsAction = hydrated
       .filter((a: any) => a.status === "action_required")
@@ -994,7 +1242,9 @@ router.get("/summary", async (req: any, res: any) => {
       .map((a: any) => ({ a, request: requestById.get(String(a.requestId)) }))
       .filter(({ a, request }: any) => {
         if (a.status === "draft") return false;
-        const from = request?.travelDateFrom ? new Date(request.travelDateFrom) : null;
+        const from = request?.travelDateFrom
+          ? new Date(request.travelDateFrom)
+          : null;
         return Boolean(from && from >= now && from <= horizon);
       })
       .map(({ a, request }: any) => ({
@@ -1006,7 +1256,11 @@ router.get("/summary", async (req: any, res: any) => {
         decided: Boolean(a.outcome),
         outcome: a.outcome || null,
       }))
-      .sort((a: any, b: any) => new Date(a.travelDateFrom).getTime() - new Date(b.travelDateFrom).getTime());
+      .sort(
+        (a: any, b: any) =>
+          new Date(a.travelDateFrom).getTime() -
+          new Date(b.travelDateFrom).getTime(),
+      );
 
     // Mirrors admin.visa.ts's computeRowRisk exactly — same "nothing left
     // to risk" exclusion (outcome set, or status closed/draft) and the same
@@ -1014,8 +1268,13 @@ router.get("/summary", async (req: any, res: any) => {
     const atRisk = hydrated
       .map((a: any) => {
         const request = requestById.get(String(a.requestId));
-        if (a.outcome || a.status === "closed" || a.status === "draft") return null;
-        const risk = assessProcessingRisk(request?.travelDateFrom, a.ruleSnapshot?.etaMaxDays, a.ruleSnapshot?.etaBasis);
+        if (a.outcome || a.status === "closed" || a.status === "draft")
+          return null;
+        const risk = assessProcessingRisk(
+          request?.travelDateFrom,
+          a.ruleSnapshot?.etaMaxDays,
+          a.ruleSnapshot?.etaBasis,
+        );
         if (!risk?.atRisk) return null;
         return {
           requestId: String(a.requestId),
@@ -1040,7 +1299,9 @@ router.get("/summary", async (req: any, res: any) => {
     });
   } catch (err: any) {
     console.error("[visa summary GET]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to load visa summary" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to load visa summary" });
   }
 });
 
@@ -1064,15 +1325,25 @@ router.get("/requests/:id", async (req: any, res: any) => {
       return res.status(404).json({ error: "Visa request not found" });
     }
 
-    const visaRequest = await VisaRequest.findOne({ _id: req.params.id, workspaceId }).lean();
+    const visaRequest = await VisaRequest.findOne({
+      _id: req.params.id,
+      workspaceId,
+    }).lean();
     if (!visaRequest) {
       return res.status(404).json({ error: "Visa request not found" });
     }
 
-    const applications = await VisaApplication.find({ requestId: visaRequest._id, workspaceId }).lean();
-    const hydrated = await hydrateApplicationsWithTravellers(applications, workspaceId, {
-      includeTimelineFields: true,
-    });
+    const applications = await VisaApplication.find({
+      requestId: visaRequest._id,
+      workspaceId,
+    }).lean();
+    const hydrated = await hydrateApplicationsWithTravellers(
+      applications,
+      workspaceId,
+      {
+        includeTimelineFields: true,
+      },
+    );
 
     // Trimmed, customer-safe activity feed — lifecycle and document events
     // only (VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES); assignment/cost/
@@ -1096,10 +1367,17 @@ router.get("/requests/:id", async (req: any, res: any) => {
       detail: e.detail || {},
     }));
 
-    res.json({ ok: true, request: visaRequest, applications: hydrated, activity });
+    res.json({
+      ok: true,
+      request: visaRequest,
+      applications: hydrated,
+      activity,
+    });
   } catch (err: any) {
     console.error("[visa requests GET detail]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to load visa request" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to load visa request" });
   }
 });
 
@@ -1135,9 +1413,13 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
     }
 
     const acceptedClauseIds = new Set(
-      Array.isArray(req.body?.acceptedClauseIds) ? req.body.acceptedClauseIds.map(String) : [],
+      Array.isArray(req.body?.acceptedClauseIds)
+        ? req.body.acceptedClauseIds.map(String)
+        : [],
     );
-    const missingClauseIds = VISA_CONSENT_CLAUSE_IDS.filter((id) => !acceptedClauseIds.has(id));
+    const missingClauseIds = VISA_CONSENT_CLAUSE_IDS.filter(
+      (id) => !acceptedClauseIds.has(id),
+    );
     if (missingClauseIds.length > 0) {
       return res.status(400).json({
         error: `Consent is required for: ${missingClauseIds.join(", ")}`,
@@ -1150,7 +1432,9 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
     // would otherwise be indistinguishable from "not found" to the caller
     // but wrong: 409 should mean "found, already submitted", not "not
     // found at all").
-    const owned = await VisaRequest.findOne({ _id: requestId, workspaceId }).select("_id").lean();
+    const owned = await VisaRequest.findOne({ _id: requestId, workspaceId })
+      .select("_id")
+      .lean();
     if (!owned) {
       return res.status(404).json({ error: "Visa request not found" });
     }
@@ -1180,7 +1464,9 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
     );
 
     if (!claimed) {
-      return res.status(409).json({ error: "This visa request has already been submitted." });
+      return res
+        .status(409)
+        .json({ error: "This visa request has already been submitted." });
     }
 
     // Only applications still in "draft" transition — never re-touches one
@@ -1188,7 +1474,11 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
     // as a FACT; VisaRequest.status itself is never assigned directly —
     // recomputeRequestStatus derives it below, same rule as every other
     // write path in this file.
-    const draftApplications = await VisaApplication.find({ requestId, workspaceId, status: "draft" })
+    const draftApplications = await VisaApplication.find({
+      requestId,
+      workspaceId,
+      status: "draft",
+    })
       .select("_id")
       .lean();
 
@@ -1211,13 +1501,21 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
     await recomputeRequestStatus(requestId);
 
     const finalRequest = await VisaRequest.findById(requestId).lean();
-    const applications = await VisaApplication.find({ requestId, workspaceId }).lean();
-    const hydrated = await hydrateApplicationsWithTravellers(applications, workspaceId);
+    const applications = await VisaApplication.find({
+      requestId,
+      workspaceId,
+    }).lean();
+    const hydrated = await hydrateApplicationsWithTravellers(
+      applications,
+      workspaceId,
+    );
 
     res.json({ ok: true, request: finalRequest, applications: hydrated });
   } catch (err: any) {
     console.error("[visa requests submit POST]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to submit visa request" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to submit visa request" });
   }
 });
 
@@ -1251,12 +1549,19 @@ router.post("/requests/:id/cancel", async (req: any, res: any) => {
       return res.status(404).json({ error: "Visa request not found" });
     }
 
-    const owned = await VisaRequest.findOne({ _id: requestId, workspaceId }).select("_id status").lean();
+    const owned = await VisaRequest.findOne({ _id: requestId, workspaceId })
+      .select("_id status")
+      .lean();
     if (!owned) {
       return res.status(404).json({ error: "Visa request not found" });
     }
     if (owned.status !== "draft") {
-      return res.status(409).json({ error: "This visa request has already been submitted and can no longer be cancelled." });
+      return res
+        .status(409)
+        .json({
+          error:
+            "This visa request has already been submitted and can no longer be cancelled.",
+        });
     }
 
     const claimed = await VisaRequest.findOneAndUpdate(
@@ -1271,7 +1576,12 @@ router.post("/requests/:id/cancel", async (req: any, res: any) => {
     );
 
     if (!claimed) {
-      return res.status(409).json({ error: "This visa request has already been submitted and can no longer be cancelled." });
+      return res
+        .status(409)
+        .json({
+          error:
+            "This visa request has already been submitted and can no longer be cancelled.",
+        });
     }
 
     await recomputeRequestStatus(requestId);
@@ -1288,7 +1598,9 @@ router.post("/requests/:id/cancel", async (req: any, res: any) => {
     res.json({ ok: true, request: finalRequest });
   } catch (err: any) {
     console.error("[visa requests cancel POST]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to cancel visa request" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to cancel visa request" });
   }
 });
 
@@ -1307,13 +1619,19 @@ router.post("/requests/:id/cancel", async (req: any, res: any) => {
 // Exported — routes/admin.visa.ts's outcome-capture route (attaching a
 // scanned issued visa) reuses this SAME multer config/mw, not a second
 // upload path with its own limits.
-export const VISA_DOCUMENT_ALLOWED_MIME = ["application/pdf", "image/png", "image/jpeg", "image/webp"];
+export const VISA_DOCUMENT_ALLOWED_MIME = [
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+];
 export const VISA_DOCUMENT_MAX_BYTES = 15 * 1024 * 1024;
 const visaDocumentUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: VISA_DOCUMENT_MAX_BYTES },
   fileFilter: (_req, file, cb) => {
-    if (VISA_DOCUMENT_ALLOWED_MIME.includes(file.mimetype)) return cb(null, true);
+    if (VISA_DOCUMENT_ALLOWED_MIME.includes(file.mimetype))
+      return cb(null, true);
     cb(new Error("Only PDF, PNG, JPEG, or WEBP files are allowed."));
   },
 });
@@ -1401,11 +1719,24 @@ export async function createVisaDocumentUpload(opts: {
   applicationId: any;
   requestId: any;
   docCode: string;
-  file: { buffer: Buffer; mimetype: string; originalname: string; size: number };
+  file: {
+    buffer: Buffer;
+    mimetype: string;
+    originalname: string;
+    size: number;
+  };
   uploaderId: any;
   actorType: VisaActivityActorType;
 }) {
-  const { workspaceId, applicationId, requestId, docCode, file, uploaderId, actorType } = opts;
+  const {
+    workspaceId,
+    applicationId,
+    requestId,
+    docCode,
+    file,
+    uploaderId,
+    actorType,
+  } = opts;
 
   const latest = await VisaDocument.findOne({ applicationId, docCode })
     .sort({ version: -1 })
@@ -1500,7 +1831,9 @@ async function recordCustomerResponseDuringActionRequired(opts: {
   const applicationId = application._id;
   const workspaceId = application.workspaceId;
 
-  await VisaApplication.findByIdAndUpdate(applicationId, { $set: { customerRespondedAt: new Date() } });
+  await VisaApplication.findByIdAndUpdate(applicationId, {
+    $set: { customerRespondedAt: new Date() },
+  });
   await logVisaActivity({
     applicationId,
     requestId: application.requestId,
@@ -1517,11 +1850,16 @@ async function recordCustomerResponseDuringActionRequired(opts: {
   // just created.
   const [fresh, documents] = await Promise.all([
     VisaApplication.findById(applicationId).lean(),
-    VisaDocument.find({ applicationId, workspaceId, deletedAt: null }).select("docCode").lean(),
+    VisaDocument.find({ applicationId, workspaceId, deletedAt: null })
+      .select("docCode")
+      .lean(),
   ]);
   if (!fresh) return;
 
-  const outstanding = computeOutstandingRequiredDocCodes(fresh as any, documents as any);
+  const outstanding = computeOutstandingRequiredDocCodes(
+    fresh as any,
+    documents as any,
+  );
   if (outstanding.length > 0) return; // partial response — stays action_required
 
   const resumed = await clearActionRequired(applicationId);
@@ -1548,7 +1886,11 @@ async function recordCustomerResponseDuringActionRequired(opts: {
 // this endpoint. Draft is included even though screen 4's normal flow only
 // reaches here pre-submission — there's no reason to block it, and PATCH
 // /requests/:id/cancel already covers "the applicant wants out" separately.
-const DOCUMENT_MUTATION_ALLOWED_STATUSES = ["draft", "submitted", "action_required"];
+const DOCUMENT_MUTATION_ALLOWED_STATUSES = [
+  "draft",
+  "submitted",
+  "action_required",
+];
 const DOCUMENT_UPLOAD_BLOCKED_MESSAGE =
   "Your concierge is already reviewing this application — reply to your concierge if you need to add or change a document.";
 
@@ -1567,8 +1909,12 @@ router.post(
   async (req: any, res: any) => {
     try {
       const workspaceId = req.workspaceObjectId;
-      const application = await findOwnedApplication(req.params.applicationId, workspaceId);
-      if (!application) return res.status(404).json({ error: "Visa application not found" });
+      const application = await findOwnedApplication(
+        req.params.applicationId,
+        workspaceId,
+      );
+      if (!application)
+        return res.status(404).json({ error: "Visa application not found" });
 
       if (isTravellerErased(application)) {
         return res.status(409).json({ error: VISA_APPLICATION_ERASED_MESSAGE });
@@ -1583,9 +1929,15 @@ router.post(
         return res.status(400).json({ error: "File is required" });
       }
 
-      const docCode = String(req.body?.docCode || "").trim().toUpperCase();
+      const docCode = String(req.body?.docCode || "")
+        .trim()
+        .toUpperCase();
       if (!VISA_DOCUMENT_CODE_SET.has(docCode)) {
-        return res.status(400).json({ error: "docCode must be one of the recognised visa document codes" });
+        return res
+          .status(400)
+          .json({
+            error: "docCode must be one of the recognised visa document codes",
+          });
       }
 
       const uploaderId = actorId(req);
@@ -1626,10 +1978,16 @@ router.post(
       // "latest version" above and race on the unique index — surfaced as
       // a conflict to retry, not a generic 500.
       if (err?.code === 11000) {
-        return res.status(409).json({ error: "This document was uploaded concurrently — please retry." });
+        return res
+          .status(409)
+          .json({
+            error: "This document was uploaded concurrently — please retry.",
+          });
       }
       console.error("[visa application documents POST]", err?.message);
-      res.status(500).json({ error: err?.message || "Failed to upload document" });
+      res
+        .status(500)
+        .json({ error: err?.message || "Failed to upload document" });
     }
   },
 );
@@ -1639,38 +1997,53 @@ router.post(
  * by default; ?includeVersions=true returns every non-deleted version.
  * Never includes a presigned URL — see GET /documents/:documentId/url.
  * ───────────────────────────────────────────────────────────────────── */
-router.get("/applications/:applicationId/documents", async (req: any, res: any) => {
-  try {
-    const workspaceId = req.workspaceObjectId;
-    const application = await findOwnedApplication(req.params.applicationId, workspaceId);
-    if (!application) return res.status(404).json({ error: "Visa application not found" });
+router.get(
+  "/applications/:applicationId/documents",
+  async (req: any, res: any) => {
+    try {
+      const workspaceId = req.workspaceObjectId;
+      const application = await findOwnedApplication(
+        req.params.applicationId,
+        workspaceId,
+      );
+      if (!application)
+        return res.status(404).json({ error: "Visa application not found" });
 
-    const includeVersions = req.query.includeVersions === "true" || req.query.includeVersions === "1";
+      const includeVersions =
+        req.query.includeVersions === "true" ||
+        req.query.includeVersions === "1";
 
-    const docs = await VisaDocument.find({ applicationId: application._id, workspaceId, deletedAt: null })
-      .sort({ docCode: 1, version: -1 })
-      .lean();
+      const docs = await VisaDocument.find({
+        applicationId: application._id,
+        workspaceId,
+        deletedAt: null,
+      })
+        .sort({ docCode: 1, version: -1 })
+        .lean();
 
-    const shaped = docs.map(mapDocumentSummary);
+      const shaped = docs.map(mapDocumentSummary);
 
-    if (includeVersions) {
-      return res.json({ ok: true, documents: shaped });
+      if (includeVersions) {
+        return res.json({ ok: true, documents: shaped });
+      }
+
+      // Latest version per docCode — first-seen wins because of the
+      // {docCode: 1, version: -1} sort above.
+      const seen = new Set<string>();
+      const latestOnly = shaped.filter((d) => {
+        if (seen.has(d.docCode)) return false;
+        seen.add(d.docCode);
+        return true;
+      });
+      res.json({ ok: true, documents: latestOnly });
+    } catch (err: any) {
+      console.error("[visa application documents GET]", err?.message);
+      res
+        .status(500)
+        .json({ error: err?.message || "Failed to load documents" });
     }
-
-    // Latest version per docCode — first-seen wins because of the
-    // {docCode: 1, version: -1} sort above.
-    const seen = new Set<string>();
-    const latestOnly = shaped.filter((d) => {
-      if (seen.has(d.docCode)) return false;
-      seen.add(d.docCode);
-      return true;
-    });
-    res.json({ ok: true, documents: latestOnly });
-  } catch (err: any) {
-    console.error("[visa application documents GET]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to load documents" });
-  }
-});
+  },
+);
 
 /* ─────────────────────────────────────────────────────────────────────
  * GET /documents/:documentId/url — short-TTL presigned GET.
@@ -1689,7 +2062,11 @@ router.get("/documents/:documentId/url", async (req: any, res: any) => {
       return res.status(404).json({ error: "Document not found" });
     }
 
-    const doc = await VisaDocument.findOne({ _id: documentId, workspaceId, deletedAt: null }).lean();
+    const doc = await VisaDocument.findOne({
+      _id: documentId,
+      workspaceId,
+      deletedAt: null,
+    }).lean();
     if (!doc) return res.status(404).json({ error: "Document not found" });
 
     const url = await presignGetObject({
@@ -1713,7 +2090,9 @@ router.get("/documents/:documentId/url", async (req: any, res: any) => {
     res.json({ ok: true, url, expiresIn: env.PRESIGN_TTL });
   } catch (err: any) {
     console.error("[visa document url GET]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to generate document URL" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to generate document URL" });
   }
 });
 
@@ -1735,15 +2114,23 @@ router.delete("/documents/:documentId", async (req: any, res: any) => {
       return res.status(404).json({ error: "Document not found" });
     }
 
-    const doc = await VisaDocument.findOne({ _id: documentId, workspaceId, deletedAt: null }).lean();
+    const doc = await VisaDocument.findOne({
+      _id: documentId,
+      workspaceId,
+      deletedAt: null,
+    }).lean();
     if (!doc) return res.status(404).json({ error: "Document not found" });
 
     if (doc.reviewStatus === "VERIFIED" || doc.reviewStatus === "REJECTED") {
       return res.status(409).json({ error: DOCUMENT_DELETE_REVIEWED_MESSAGE });
     }
 
-    const application = await findOwnedApplication(String(doc.applicationId), workspaceId);
-    if (!application) return res.status(404).json({ error: "Visa application not found" });
+    const application = await findOwnedApplication(
+      String(doc.applicationId),
+      workspaceId,
+    );
+    if (!application)
+      return res.status(404).json({ error: "Visa application not found" });
     if (!DOCUMENT_MUTATION_ALLOWED_STATUSES.includes(application.status)) {
       return res.status(409).json({ error: DOCUMENT_UPLOAD_BLOCKED_MESSAGE });
     }
@@ -1763,13 +2150,19 @@ router.delete("/documents/:documentId", async (req: any, res: any) => {
       eventType: "DOCUMENT_DELETED",
       actorUserId: deletedBy,
       actorType: "CUSTOMER",
-      detail: { documentId: String(doc._id), docCode: doc.docCode, version: doc.version },
+      detail: {
+        documentId: String(doc._id),
+        docCode: doc.docCode,
+        version: doc.version,
+      },
     });
 
     res.json({ ok: true });
   } catch (err: any) {
     console.error("[visa document DELETE]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to delete document" });
+    res
+      .status(500)
+      .json({ error: err?.message || "Failed to delete document" });
   }
 });
 
@@ -1796,37 +2189,51 @@ router.delete("/documents/:documentId", async (req: any, res: any) => {
 // write of only the fields that happened to convert cleanly.
 type FieldConverter = (value: string) => { value: string } | { error: string };
 
-const PASSPORT_FIELD_CONVERTERS: Record<string, { profileKey: string; convert: FieldConverter }> = {
+const PASSPORT_FIELD_CONVERTERS: Record<
+  string,
+  { profileKey: string; convert: FieldConverter }
+> = {
   documentNumber: {
     profileKey: "passportNo",
-    convert: (v) => (v.trim() ? { value: v.trim() } : { error: "documentNumber must not be empty" }),
+    convert: (v) =>
+      v.trim()
+        ? { value: v.trim() }
+        : { error: "documentNumber must not be empty" },
   },
   dateOfExpiry: {
     profileKey: "passportExpiry",
     convert: (v) => {
       const resolved = resolveMrzDate(v, "expiry");
-      return resolved ? { value: resolved } : { error: `dateOfExpiry '${v}' is not a valid MRZ date` };
+      return resolved
+        ? { value: resolved }
+        : { error: `dateOfExpiry '${v}' is not a valid MRZ date` };
     },
   },
   dateOfBirth: {
     profileKey: "dob",
     convert: (v) => {
       const resolved = resolveMrzDate(v, "dob");
-      return resolved ? { value: resolved } : { error: `dateOfBirth '${v}' is not a valid MRZ date` };
+      return resolved
+        ? { value: resolved }
+        : { error: `dateOfBirth '${v}' is not a valid MRZ date` };
     },
   },
   issuingState: {
     profileKey: "passportIssueCountry",
     convert: (v) => {
       const iso2 = normaliseToIso2(v);
-      return iso2 ? { value: iso2 } : { error: `issuingState '${v}' is not a recognised country` };
+      return iso2
+        ? { value: iso2 }
+        : { error: `issuingState '${v}' is not a recognised country` };
     },
   },
   nationality: {
     profileKey: "nationality",
     convert: (v) => {
       const iso2 = normaliseToIso2(v);
-      return iso2 ? { value: iso2 } : { error: `nationality '${v}' is not a recognised country` };
+      return iso2
+        ? { value: iso2 }
+        : { error: `nationality '${v}' is not a recognised country` };
     },
   },
   // MRZ TD3 does not encode an issue date at all — only accepted here when
@@ -1835,15 +2242,22 @@ const PASSPORT_FIELD_CONVERTERS: Record<string, { profileKey: string; convert: F
   passportIssueDate: {
     profileKey: "passportIssueDate",
     convert: (v) =>
-      /^\d{4}-\d{2}-\d{2}$/.test(v) ? { value: v } : { error: `passportIssueDate '${v}' must be "YYYY-MM-DD"` },
+      /^\d{4}-\d{2}-\d{2}$/.test(v)
+        ? { value: v }
+        : { error: `passportIssueDate '${v}' must be "YYYY-MM-DD"` },
   },
 };
 
 // Overwrites matching keys in the document's stored extractedFields with
 // the confirmed values so the record reflects what was actually written,
 // while leaving every check_* entry (and any unrelated key) untouched.
-function mergeConfirmedFields(existing: { key: string; value: string }[], confirmed: Record<string, string>) {
-  const merged = existing.map((f) => (f.key in confirmed ? { key: f.key, value: confirmed[f.key] } : f));
+function mergeConfirmedFields(
+  existing: { key: string; value: string }[],
+  confirmed: Record<string, string>,
+) {
+  const merged = existing.map((f) =>
+    f.key in confirmed ? { key: f.key, value: confirmed[f.key] } : f,
+  );
   const seenKeys = new Set(merged.map((f) => f.key));
   for (const [key, value] of Object.entries(confirmed)) {
     if (!seenKeys.has(key)) merged.push({ key, value });
@@ -1851,99 +2265,143 @@ function mergeConfirmedFields(existing: { key: string; value: string }[], confir
   return merged;
 }
 
-router.patch("/documents/:documentId/extracted-fields", async (req: any, res: any) => {
-  try {
-    const workspaceId = req.workspaceObjectId;
-    const documentId = req.params.documentId;
-    if (!documentId || !mongoose.isValidObjectId(documentId)) {
-      return res.status(404).json({ error: "Document not found" });
-    }
-
-    const doc = await VisaDocument.findOne({ _id: documentId, workspaceId, deletedAt: null });
-    if (!doc) return res.status(404).json({ error: "Document not found" });
-
-    if (req.body?.confirmed !== true) {
-      return res.status(400).json({ error: "confirmed must be true — write-back requires explicit user confirmation" });
-    }
-    if (doc.docCode !== PASSPORT_DOC_CODE) {
-      return res.status(400).json({ error: "Only passport fields can be confirmed and written back" });
-    }
-
-    const fields = req.body?.fields;
-    if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
-      return res.status(400).json({ error: "fields must be an object of recognised passport field keys" });
-    }
-
-    const application = await VisaApplication.findOne({ _id: doc.applicationId, workspaceId });
-    if (!application) return res.status(404).json({ error: "Visa application not found" });
-
-    const traveller = await TravellerProfile.findOne({ _id: (application as any).travellerProfileId, workspaceId });
-    if (!traveller) return res.status(404).json({ error: "Traveller profile not found" });
-
-    const profilePatch: Record<string, string> = {};
-    const confirmedFields: Record<string, string> = {};
-    for (const [key, rawValue] of Object.entries(fields)) {
-      const converter = PASSPORT_FIELD_CONVERTERS[key];
-      if (!converter) continue; // unrecognised keys are ignored, not errors
-      if (typeof rawValue !== "string") {
-        return res.status(400).json({ error: `${key} must be a string` });
+router.patch(
+  "/documents/:documentId/extracted-fields",
+  async (req: any, res: any) => {
+    try {
+      const workspaceId = req.workspaceObjectId;
+      const documentId = req.params.documentId;
+      if (!documentId || !mongoose.isValidObjectId(documentId)) {
+        return res.status(404).json({ error: "Document not found" });
       }
-      const outcome = converter.convert(rawValue);
-      if ("error" in outcome) {
-        return res.status(400).json({ error: outcome.error });
+
+      const doc = await VisaDocument.findOne({
+        _id: documentId,
+        workspaceId,
+        deletedAt: null,
+      });
+      if (!doc) return res.status(404).json({ error: "Document not found" });
+
+      if (req.body?.confirmed !== true) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "confirmed must be true — write-back requires explicit user confirmation",
+          });
       }
-      profilePatch[converter.profileKey] = outcome.value;
-      confirmedFields[key] = outcome.value;
+      if (doc.docCode !== PASSPORT_DOC_CODE) {
+        return res
+          .status(400)
+          .json({
+            error: "Only passport fields can be confirmed and written back",
+          });
+      }
+
+      const fields = req.body?.fields;
+      if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+        return res
+          .status(400)
+          .json({
+            error: "fields must be an object of recognised passport field keys",
+          });
+      }
+
+      const application = await VisaApplication.findOne({
+        _id: doc.applicationId,
+        workspaceId,
+      });
+      if (!application)
+        return res.status(404).json({ error: "Visa application not found" });
+
+      const traveller = await TravellerProfile.findOne({
+        _id: (application as any).travellerProfileId,
+        workspaceId,
+      });
+      if (!traveller)
+        return res.status(404).json({ error: "Traveller profile not found" });
+
+      const profilePatch: Record<string, string> = {};
+      const confirmedFields: Record<string, string> = {};
+      for (const [key, rawValue] of Object.entries(fields)) {
+        const converter = PASSPORT_FIELD_CONVERTERS[key];
+        if (!converter) continue; // unrecognised keys are ignored, not errors
+        if (typeof rawValue !== "string") {
+          return res.status(400).json({ error: `${key} must be a string` });
+        }
+        const outcome = converter.convert(rawValue);
+        if ("error" in outcome) {
+          return res.status(400).json({ error: outcome.error });
+        }
+        profilePatch[converter.profileKey] = outcome.value;
+        confirmedFields[key] = outcome.value;
+      }
+
+      if (Object.keys(profilePatch).length === 0) {
+        return res
+          .status(400)
+          .json({ error: "No recognised passport fields were provided" });
+      }
+
+      const confirmedBy = actorId(req);
+      const changed = Object.entries(profilePatch).map(([field, to]) => ({
+        field,
+        from: (traveller as any)[field] ?? null,
+        to,
+      }));
+
+      Object.assign(traveller, profilePatch);
+      await traveller.save();
+
+      doc.extractedFields = mergeConfirmedFields(
+        doc.extractedFields,
+        confirmedFields,
+      );
+      doc.reviewStatus = "VERIFIED";
+      doc.reviewedBy = confirmedBy;
+      await doc.save();
+
+      visaLogger.info(
+        "visa passport fields confirmed and written back to traveller profile",
+        {
+          documentId: String(doc._id),
+          travellerProfileId: String(traveller._id),
+          workspaceId: String(workspaceId),
+          confirmedBy: confirmedBy ? String(confirmedBy) : null,
+          confirmedAt: new Date().toISOString(),
+          changed,
+        },
+      );
+
+      // detail carries the field KEYS that were confirmed, never the values
+      // themselves (those are passport data — see VisaActivityLog.ts's
+      // no-PII rule) — `changed` above is fine for the structured log line,
+      // but must never reach the activity trail.
+      await logVisaActivity({
+        applicationId: (application as any)._id,
+        requestId: (application as any).requestId,
+        workspaceId,
+        eventType: "FIELDS_CONFIRMED",
+        actorUserId: confirmedBy,
+        actorType: "CUSTOMER",
+        detail: {
+          documentId: String(doc._id),
+          fields: Object.keys(profilePatch),
+        },
+      });
+
+      res.json({
+        ok: true,
+        traveller: { id: String(traveller._id), ...profilePatch },
+      });
+    } catch (err: any) {
+      console.error("[visa documents extracted-fields PATCH]", err?.message);
+      res
+        .status(500)
+        .json({ error: err?.message || "Failed to confirm extracted fields" });
     }
-
-    if (Object.keys(profilePatch).length === 0) {
-      return res.status(400).json({ error: "No recognised passport fields were provided" });
-    }
-
-    const confirmedBy = actorId(req);
-    const changed = Object.entries(profilePatch).map(([field, to]) => ({
-      field,
-      from: (traveller as any)[field] ?? null,
-      to,
-    }));
-
-    Object.assign(traveller, profilePatch);
-    await traveller.save();
-
-    doc.extractedFields = mergeConfirmedFields(doc.extractedFields, confirmedFields);
-    doc.reviewStatus = "VERIFIED";
-    doc.reviewedBy = confirmedBy;
-    await doc.save();
-
-    visaLogger.info("visa passport fields confirmed and written back to traveller profile", {
-      documentId: String(doc._id),
-      travellerProfileId: String(traveller._id),
-      workspaceId: String(workspaceId),
-      confirmedBy: confirmedBy ? String(confirmedBy) : null,
-      confirmedAt: new Date().toISOString(),
-      changed,
-    });
-
-    // detail carries the field KEYS that were confirmed, never the values
-    // themselves (those are passport data — see VisaActivityLog.ts's
-    // no-PII rule) — `changed` above is fine for the structured log line,
-    // but must never reach the activity trail.
-    await logVisaActivity({
-      applicationId: (application as any)._id,
-      requestId: (application as any).requestId,
-      workspaceId,
-      eventType: "FIELDS_CONFIRMED",
-      actorUserId: confirmedBy,
-      actorType: "CUSTOMER",
-      detail: { documentId: String(doc._id), fields: Object.keys(profilePatch) },
-    });
-
-    res.json({ ok: true, traveller: { id: String(traveller._id), ...profilePatch } });
-  } catch (err: any) {
-    console.error("[visa documents extracted-fields PATCH]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to confirm extracted fields" });
-  }
-});
+  },
+);
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1958,12 +2416,18 @@ function escapeRegex(s: string): string {
 // the parent VisaRequest's travel date range. Returns raw lean TravelBooking
 // docs; callers shape the response themselves (see mapTravelBooking).
 async function findMatchingTravelBookings(application: any, workspaceId: any) {
-  const traveller = await TravellerProfile.findOne({ _id: application.travellerProfileId, workspaceId })
+  const traveller = await TravellerProfile.findOne({
+    _id: application.travellerProfileId,
+    workspaceId,
+  })
     .select("email")
     .lean();
   if (!(traveller as any)?.email) return [];
 
-  const visaRequest = await VisaRequest.findOne({ _id: application.requestId, workspaceId })
+  const visaRequest = await VisaRequest.findOne({
+    _id: application.requestId,
+    workspaceId,
+  })
     .select("travelDateFrom travelDateTo")
     .lean();
 
@@ -1971,7 +2435,9 @@ async function findMatchingTravelBookings(application: any, workspaceId: any) {
     workspaceId,
     isActive: true,
     service: { $in: ["FLIGHT", "HOTEL"] },
-    travellerEmail: { $regex: new RegExp(`^${escapeRegex((traveller as any).email)}$`, "i") },
+    travellerEmail: {
+      $regex: new RegExp(`^${escapeRegex((traveller as any).email)}$`, "i"),
+    },
   };
 
   const from = (visaRequest as any)?.travelDateFrom;
@@ -1987,7 +2453,9 @@ async function findMatchingTravelBookings(application: any, workspaceId: any) {
   }
 
   return TravelBooking.find(filter)
-    .select("service destination origin travelDate travelDateEnd status bookedAt referenceModel")
+    .select(
+      "service destination origin travelDate travelDateEnd status bookedAt referenceModel",
+    )
     .sort({ travelDate: 1 })
     .lean();
 }
@@ -2012,19 +2480,31 @@ function mapTravelBooking(b: any) {
  * Empty is a normal result, not an error — screen 4 offers upload or a
  * concierge handoff either way.
  * ───────────────────────────────────────────────────────────────────── */
-router.get("/applications/:applicationId/travel-bookings", async (req: any, res: any) => {
-  try {
-    const workspaceId = req.workspaceObjectId;
-    const application = await findOwnedApplication(req.params.applicationId, workspaceId);
-    if (!application) return res.status(404).json({ error: "Visa application not found" });
+router.get(
+  "/applications/:applicationId/travel-bookings",
+  async (req: any, res: any) => {
+    try {
+      const workspaceId = req.workspaceObjectId;
+      const application = await findOwnedApplication(
+        req.params.applicationId,
+        workspaceId,
+      );
+      if (!application)
+        return res.status(404).json({ error: "Visa application not found" });
 
-    const bookings = await findMatchingTravelBookings(application, workspaceId);
-    res.json({ ok: true, bookings: bookings.map(mapTravelBooking) });
-  } catch (err: any) {
-    console.error("[visa application travel-bookings GET]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to load travel bookings" });
-  }
-});
+      const bookings = await findMatchingTravelBookings(
+        application,
+        workspaceId,
+      );
+      res.json({ ok: true, bookings: bookings.map(mapTravelBooking) });
+    } catch (err: any) {
+      console.error("[visa application travel-bookings GET]", err?.message);
+      res
+        .status(500)
+        .json({ error: err?.message || "Failed to load travel bookings" });
+    }
+  },
+);
 
 /* ─────────────────────────────────────────────────────────────────────
  * PATCH /applications/:applicationId/linked-bookings
@@ -2044,69 +2524,96 @@ router.get("/applications/:applicationId/travel-bookings", async (req: any, res:
  *
  * Body: { bookings: [{ bookingId, service }] }
  * ───────────────────────────────────────────────────────────────────── */
-router.patch("/applications/:applicationId/linked-bookings", async (req: any, res: any) => {
-  try {
-    const workspaceId = req.workspaceObjectId;
-    const applicationId = req.params.applicationId;
-    if (!applicationId || !mongoose.isValidObjectId(applicationId)) {
-      return res.status(404).json({ error: "Visa application not found" });
-    }
-
-    // Fetched as a live document (no .lean()) — mutated and saved below,
-    // same pattern as PATCH /documents/:documentId/extracted-fields.
-    const application = await VisaApplication.findOne({ _id: applicationId, workspaceId });
-    if (!application) return res.status(404).json({ error: "Visa application not found" });
-
-    const incoming = req.body?.bookings;
-    if (!Array.isArray(incoming) || incoming.length === 0) {
-      return res.status(400).json({ error: "bookings must be a non-empty array" });
-    }
-    for (const entry of incoming) {
-      if (!entry || !mongoose.isValidObjectId(entry.bookingId)) {
-        return res.status(400).json({ error: "Each booking must have a valid bookingId" });
+router.patch(
+  "/applications/:applicationId/linked-bookings",
+  async (req: any, res: any) => {
+    try {
+      const workspaceId = req.workspaceObjectId;
+      const applicationId = req.params.applicationId;
+      if (!applicationId || !mongoose.isValidObjectId(applicationId)) {
+        return res.status(404).json({ error: "Visa application not found" });
       }
-      if (entry.service !== "FLIGHT" && entry.service !== "HOTEL") {
-        return res.status(400).json({ error: "service must be FLIGHT or HOTEL" });
+
+      // Fetched as a live document (no .lean()) — mutated and saved below,
+      // same pattern as PATCH /documents/:documentId/extracted-fields.
+      const application = await VisaApplication.findOne({
+        _id: applicationId,
+        workspaceId,
+      });
+      if (!application)
+        return res.status(404).json({ error: "Visa application not found" });
+
+      const incoming = req.body?.bookings;
+      if (!Array.isArray(incoming) || incoming.length === 0) {
+        return res
+          .status(400)
+          .json({ error: "bookings must be a non-empty array" });
       }
+      for (const entry of incoming) {
+        if (!entry || !mongoose.isValidObjectId(entry.bookingId)) {
+          return res
+            .status(400)
+            .json({ error: "Each booking must have a valid bookingId" });
+        }
+        if (entry.service !== "FLIGHT" && entry.service !== "HOTEL") {
+          return res
+            .status(400)
+            .json({ error: "service must be FLIGHT or HOTEL" });
+        }
+      }
+
+      const matching = await findMatchingTravelBookings(
+        application,
+        workspaceId,
+      );
+      const matchingById = new Map(
+        matching.map((b: any) => [String(b._id), b]),
+      );
+
+      const invalid = incoming.find((entry: any) => {
+        const match = matchingById.get(String(entry.bookingId));
+        return !match || match.service !== entry.service;
+      });
+      if (invalid) {
+        return res
+          .status(400)
+          .json({
+            error: `Booking '${invalid.bookingId}' is not linkable to this application`,
+          });
+      }
+
+      const linkedByUserId = actorId(req);
+      const linkedAt = new Date();
+      const existing: any[] = (application as any).linkedBookings || [];
+      const existingIds = new Set(
+        existing.map((lb: any) => String(lb.bookingId)),
+      );
+
+      const additions = incoming
+        .filter((entry: any) => !existingIds.has(String(entry.bookingId)))
+        .map((entry: any) => ({
+          bookingId: entry.bookingId,
+          service: entry.service,
+          linkedAt,
+          linkedByUserId,
+        }));
+
+      if (additions.length > 0) {
+        (application as any).linkedBookings = [...existing, ...additions];
+        await (application as any).save();
+      }
+
+      res.json({
+        ok: true,
+        linkedBookings: (application as any).linkedBookings || [],
+      });
+    } catch (err: any) {
+      console.error("[visa application linked-bookings PATCH]", err?.message);
+      res
+        .status(500)
+        .json({ error: err?.message || "Failed to link bookings" });
     }
-
-    const matching = await findMatchingTravelBookings(application, workspaceId);
-    const matchingById = new Map(matching.map((b: any) => [String(b._id), b]));
-
-    const invalid = incoming.find((entry: any) => {
-      const match = matchingById.get(String(entry.bookingId));
-      return !match || match.service !== entry.service;
-    });
-    if (invalid) {
-      return res
-        .status(400)
-        .json({ error: `Booking '${invalid.bookingId}' is not linkable to this application` });
-    }
-
-    const linkedByUserId = actorId(req);
-    const linkedAt = new Date();
-    const existing: any[] = (application as any).linkedBookings || [];
-    const existingIds = new Set(existing.map((lb: any) => String(lb.bookingId)));
-
-    const additions = incoming
-      .filter((entry: any) => !existingIds.has(String(entry.bookingId)))
-      .map((entry: any) => ({
-        bookingId: entry.bookingId,
-        service: entry.service,
-        linkedAt,
-        linkedByUserId,
-      }));
-
-    if (additions.length > 0) {
-      (application as any).linkedBookings = [...existing, ...additions];
-      await (application as any).save();
-    }
-
-    res.json({ ok: true, linkedBookings: (application as any).linkedBookings || [] });
-  } catch (err: any) {
-    console.error("[visa application linked-bookings PATCH]", err?.message);
-    res.status(500).json({ error: err?.message || "Failed to link bookings" });
-  }
-});
+  },
+);
 
 export default router;
