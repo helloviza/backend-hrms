@@ -15,11 +15,17 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 
-const { rules, travellers, requests, applications, users, recomputeRequestStatusMock, resetStores } = vi.hoisted(() => {
+const { rules, travellers, requests, applications, users, members, recomputeRequestStatusMock, visaLoggerWarnMock, resetStores } = vi.hoisted(() => {
   type Doc = Record<string, any>;
 
   function matches(rec: Doc, filter: Doc): boolean {
     return Object.entries(filter).every(([key, cond]) => {
+      // $or — needed by GET /requests's 2026-08-01 scoping filter (own
+      // requests OR own-as-traveller requests; team-user lookup via
+      // customerId OR businessId).
+      if (key === "$or") {
+        return (cond as Doc[]).some((sub) => matches(rec, sub));
+      }
       const val = rec[key];
       if (cond && typeof cond === "object" && "$in" in cond) {
         const set = new Set((cond.$in as any[]).map((v) => String(v)));
@@ -62,6 +68,7 @@ const { rules, travellers, requests, applications, users, recomputeRequestStatus
   const requests = makeCollection();
   const applications = makeCollection();
   const users = makeCollection();
+  const members = makeCollection();
 
   return {
     rules,
@@ -69,13 +76,16 @@ const { rules, travellers, requests, applications, users, recomputeRequestStatus
     requests,
     applications,
     users,
+    members,
     recomputeRequestStatusMock: vi.fn().mockResolvedValue("draft"),
+    visaLoggerWarnMock: vi.fn(),
     resetStores() {
       rules.clear();
       travellers.clear();
       requests.clear();
       applications.clear();
       users.clear();
+      members.clear();
     },
   };
 });
@@ -86,6 +96,23 @@ function chainable(getResult: () => any) {
     sort: () => obj,
     limit: () => obj,
     lean: () => Promise.resolve(getResult()),
+    // .distinct(field) — resolveVisaRequestsFilter (routes/visa.ts) chains
+    // this straight off .find(filter), mirroring real Mongoose's Query#distinct.
+    distinct: (field: string) => {
+      const docs = getResult();
+      const seen = new Set<string>();
+      const out: any[] = [];
+      for (const d of Array.isArray(docs) ? docs : []) {
+        const v = d?.[field];
+        if (v == null) continue;
+        const k = String(v);
+        if (!seen.has(k)) {
+          seen.add(k);
+          out.push(v);
+        }
+      }
+      return Promise.resolve(out);
+    },
   };
   return obj;
 }
@@ -138,6 +165,20 @@ vi.mock("../models/User.js", () => ({
   },
 }));
 
+vi.mock("../models/CustomerMember.js", () => ({
+  default: {
+    findOne: (filter: any) => chainable(() => members.query(filter)[0] ?? null),
+  },
+}));
+
+// resolveVisaRequestsFilter (routes/visa.ts) logs via visaLogger.warn when a
+// customer-side user has no CustomerMember record at all (task brief,
+// 2026-08-01: "LOG when it fires with the user id") — spied here so that's
+// actually asserted, not just trusted.
+vi.mock("../utils/logger.js", () => ({
+  default: { child: () => ({ info: vi.fn(), warn: visaLoggerWarnMock, error: vi.fn() }) },
+}));
+
 // POST /requests logs REQUEST_CREATED/APPLICATION_CREATED, and GET
 // /requests/:id reads back a trimmed activity feed — both mocked to a
 // no-op/empty-list so tests never touch the real (unconnected, in this
@@ -156,11 +197,20 @@ const WORKSPACE_A = new mongoose.Types.ObjectId();
 const WORKSPACE_B = new mongoose.Types.ObjectId();
 const USER_A = new mongoose.Types.ObjectId();
 
-function makeApp(workspaceId: mongoose.Types.ObjectId = WORKSPACE_A, userId: mongoose.Types.ObjectId = USER_A) {
+// makeApp's third param carries the scoping-relevant identity fields
+// (2026-08-01) — roles/email/customerId/businessId — on top of the
+// existing userId/workspaceId params, defaulting to the pre-existing
+// staff-flavoured fixture so every test written before this pass keeps
+// working unchanged.
+function makeApp(
+  workspaceId: mongoose.Types.ObjectId = WORKSPACE_A,
+  userId: mongoose.Types.ObjectId = USER_A,
+  userOverrides: Record<string, any> = {},
+) {
   const app = express();
   app.use(express.json());
   app.use((req: any, _res, next) => {
-    req.user = { _id: String(userId), roles: ["EMPLOYEE"], email: "agent@plumtrips.com" };
+    req.user = { _id: String(userId), roles: ["EMPLOYEE"], email: "agent@plumtrips.com", ...userOverrides };
     req.workspaceId = String(workspaceId);
     req.workspaceObjectId = workspaceId;
     req.workspace = { _id: workspaceId, status: "ACTIVE" };
@@ -216,9 +266,35 @@ function travellerDoc(workspaceId: mongoose.Types.ObjectId, overrides: Record<st
   });
 }
 
+// 2026-08-01 scoping fixtures — a "customer" here is just a shared string
+// id linking a set of Users + CustomerMember rows, same shape
+// resolveVisaRequestsFilter (routes/visa.ts) reads: User.customerId/
+// businessId and CustomerMember.customerId+email.
+function customerUser(customerId: string, email: string, overrides: Record<string, any> = {}) {
+  return users.insert({
+    _id: new mongoose.Types.ObjectId(),
+    email,
+    customerId,
+    businessId: customerId,
+    roles: ["CUSTOMER"],
+    ...overrides,
+  });
+}
+
+function memberDoc(customerId: string, email: string, role: "WORKSPACE_LEADER" | "APPROVER" | "REQUESTER") {
+  return members.insert({
+    _id: new mongoose.Types.ObjectId(),
+    customerId,
+    email,
+    role,
+    isActive: true,
+  });
+}
+
 beforeEach(() => {
   resetStores();
   recomputeRequestStatusMock.mockClear();
+  visaLoggerWarnMock.mockClear();
   refSeq = 0;
 });
 
@@ -469,6 +545,123 @@ describe("GET /requests and GET /requests/:id — workspace scoping", () => {
     // deliberately gated, nothing to assert against here.
     expect(res.body.requests[0].applications[0].estimatedDecision).toBeUndefined();
     expect(res.body.requests[0].applications[0].assignedConciergeName).toBeUndefined();
+  });
+});
+
+describe("GET /requests — customer-side scoping (2026-08-01)", () => {
+  function asCustomer(customerId: string, email: string, role: "WORKSPACE_LEADER" | "REQUESTER" | "APPROVER") {
+    return { email, customerId, businessId: customerId, roles: ["CUSTOMER", role] };
+  }
+
+  async function createRequestAs(
+    workspaceId: mongoose.Types.ObjectId,
+    userId: mongoose.Types.ObjectId,
+    userFields: Record<string, any>,
+    travellerOverrides: Record<string, any> = {},
+  ) {
+    const rule = ruleDoc();
+    const t = travellerDoc(workspaceId, travellerOverrides);
+    const res = await request(makeApp(workspaceId, userId, userFields))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(t._id)] });
+    return { body: res.body, traveller: t };
+  }
+
+  it("a WORKSPACE_LEADER sees their own customer's requests, and NOT another customer's sharing the same workspace", async () => {
+    // Mirrors HOUSE exactly: two different customerIds, one shared
+    // workspaceId — expressible today because resolveWorkspaceForUser
+    // (middleware/requireWorkspace.ts) already resolves every one of a
+    // shared workspace's many Customers' users onto the SAME
+    // CustomerWorkspace, one request/session at a time; this test just
+    // exercises two of them back to back rather than needing 62 real
+    // Customer documents to prove the shape.
+    const customerA = "cust-a";
+    const customerB = "cust-b";
+    const leaderA = customerUser(customerA, "leader-a@x.com", { roles: ["CUSTOMER", "WORKSPACE_LEADER"] });
+    memberDoc(customerA, "leader-a@x.com", "WORKSPACE_LEADER");
+    const requesterA = customerUser(customerA, "requester-a@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerA, "requester-a@x.com", "REQUESTER");
+    const leaderB = customerUser(customerB, "leader-b@x.com", { roles: ["CUSTOMER", "WORKSPACE_LEADER"] });
+    memberDoc(customerB, "leader-b@x.com", "WORKSPACE_LEADER");
+
+    const reqA1 = await createRequestAs(WORKSPACE_A, leaderA._id, asCustomer(customerA, "leader-a@x.com", "WORKSPACE_LEADER"));
+    const reqA2 = await createRequestAs(WORKSPACE_A, requesterA._id, asCustomer(customerA, "requester-a@x.com", "REQUESTER"));
+    const reqB1 = await createRequestAs(WORKSPACE_A, leaderB._id, asCustomer(customerB, "leader-b@x.com", "WORKSPACE_LEADER"));
+
+    const res = await request(makeApp(WORKSPACE_A, leaderA._id, asCustomer(customerA, "leader-a@x.com", "WORKSPACE_LEADER"))).get("/requests");
+
+    expect(res.status).toBe(200);
+    const ids = res.body.requests.map((r: any) => r._id).sort();
+    expect(ids).toEqual([reqA1.body.request._id, reqA2.body.request._id].sort());
+    expect(ids).not.toContain(reqB1.body.request._id);
+  });
+
+  it("a REQUESTER sees requests they raised, plus requests where they're the claimed traveller — nothing else", async () => {
+    const customerId = "cust-c";
+    const req1 = customerUser(customerId, "req1@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "req1@x.com", "REQUESTER");
+    const req2 = customerUser(customerId, "req2@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "req2@x.com", "REQUESTER");
+    const fields1 = asCustomer(customerId, "req1@x.com", "REQUESTER");
+    const fields2 = asCustomer(customerId, "req2@x.com", "REQUESTER");
+
+    // A: raised by req1 themself.
+    const reqA = await createRequestAs(WORKSPACE_A, req1._id, fields1);
+
+    // B: raised by req2, but FOR a traveller profile req1 has claimed —
+    // req1 must see this one even though they didn't raise it.
+    const claimedTraveller = travellerDoc(WORKSPACE_A, { claimedBy: req1._id });
+    const ruleB = ruleDoc();
+    const resB = await request(makeApp(WORKSPACE_A, req2._id, fields2))
+      .post("/requests")
+      .send({ ruleId: String(ruleB._id), travellerProfileIds: [String(claimedTraveller._id)] });
+
+    // C: raised by req2, for an unrelated traveller — req1 must never see this.
+    const reqC = await createRequestAs(WORKSPACE_A, req2._id, fields2);
+
+    const res = await request(makeApp(WORKSPACE_A, req1._id, fields1)).get("/requests");
+    const ids = res.body.requests.map((r: any) => r._id).sort();
+    expect(ids).toEqual([reqA.body.request._id, resB.body.request._id].sort());
+    expect(ids).not.toContain(reqC.body.request._id);
+  });
+
+  it("an unclaimed traveller (no claimedBy at all) gets no extra visibility from being the subject of a colleague's request", async () => {
+    const customerId = "cust-d";
+    const bystander = customerUser(customerId, "bystander@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "bystander@x.com", "REQUESTER");
+    const raiser = customerUser(customerId, "raiser@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    memberDoc(customerId, "raiser@x.com", "REQUESTER");
+
+    // Traveller profile has no claimedBy — never inferred from email, per
+    // TravellerProfile.ts's own rule, even if this traveller's email were
+    // to coincidentally match the bystander (not set here either way).
+    await createRequestAs(WORKSPACE_A, raiser._id, asCustomer(customerId, "raiser@x.com", "REQUESTER"));
+
+    const res = await request(makeApp(WORKSPACE_A, bystander._id, asCustomer(customerId, "bystander@x.com", "REQUESTER"))).get("/requests");
+    expect(res.status).toBe(200);
+    expect(res.body.requests).toHaveLength(0);
+  });
+
+  it("a customerId-bearing user with NO CustomerMember record defaults to REQUESTER-tier (own-scope only) and logs it", async () => {
+    const customerId = "cust-e";
+    // Deliberately NO memberDoc() call for this one — the real, observed
+    // data gap (2026-08-01 audit: some customer-side Users have customerId
+    // set with no CustomerMember row at all).
+    const orphan = customerUser(customerId, "orphan@x.com", { roles: ["CUSTOMER", "REQUESTER"] });
+    const leader = customerUser(customerId, "leader@x.com", { roles: ["CUSTOMER", "WORKSPACE_LEADER"] });
+    memberDoc(customerId, "leader@x.com", "WORKSPACE_LEADER");
+
+    // A colleague raises a request the orphan neither raised nor is the traveller on.
+    await createRequestAs(WORKSPACE_A, leader._id, asCustomer(customerId, "leader@x.com", "WORKSPACE_LEADER"));
+
+    const res = await request(makeApp(WORKSPACE_A, orphan._id, asCustomer(customerId, "orphan@x.com", "REQUESTER"))).get("/requests");
+    expect(res.status).toBe(200);
+    expect(res.body.requests).toHaveLength(0);
+
+    expect(visaLoggerWarnMock).toHaveBeenCalledWith(
+      expect.stringContaining("no CustomerMember record"),
+      expect.objectContaining({ userId: String(orphan._id), customerId }),
+    );
   });
 });
 

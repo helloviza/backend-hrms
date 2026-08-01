@@ -73,6 +73,7 @@ import VisaDocument from "../models/VisaDocument.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import TravelBooking from "../models/TravelBooking.js";
 import User from "../models/User.js";
+import CustomerMember from "../models/CustomerMember.js";
 import { getCountryByIso2, normaliseToIso2 } from "../utils/countryCodes.js";
 import { getVisaDocumentCodeDef, VISA_DOCUMENT_CODE_SET } from "../config/visaDocumentCodes.js";
 import { CURRENT_VISA_CONSENT_VERSION, VISA_CONSENT_CLAUSE_IDS } from "../config/visaConsent.js";
@@ -749,15 +750,99 @@ router.post("/requests", async (req: any, res: any) => {
   }
 });
 
+// Normalises a role token the same way every other WORKSPACE_LEADER check
+// in this codebase does (myBookings.ts, utils/cstepAccess.ts,
+// travelForm.ts, sbt.*.ts, invoices.ts, admin*.billing.ts) — kept local
+// rather than importing one of theirs, since none of those files export
+// this specific helper, but the algorithm itself must stay identical.
+function normRole(v: unknown): string {
+  return String(v ?? "").toUpperCase().replace(/[\s_-]+/g, "");
+}
+
+/**
+ * GET /requests's own access scope (2026-08-01) — a customer-side user sees
+ * either their whole CUSTOMER's requests (WORKSPACE_LEADER — "someone who
+ * can raise for others") or only their own (everyone else).
+ *
+ * Deliberately CUSTOMER-scoped, not workspace-scoped: VisaRequest carries
+ * no customerId of its own (only workspaceId, via workspaceScopePlugin —
+ * confirmed by reading the schema, not assumed), and HOUSE has 62
+ * Customers sharing one CustomerWorkspace. A raw { workspaceId } org filter
+ * would hand a HOUSE WORKSPACE_LEADER every one of those 62 companies'
+ * requests — the same class of cross-tenant leak already fixed once this
+ * session for billing (services/visaBillingSync.ts's resolveBillingCustomer).
+ * With no customerId to filter on directly, org scope is resolved
+ * indirectly: every User tied to the caller's own customerId/businessId
+ * (regardless of that User's own workspaceId, which can be stale — see
+ * requireWorkspace.ts's own comment on exactly that), then every
+ * VisaRequest raisedByUserId among them.
+ *
+ * The WORKSPACE_LEADER check itself is looked up FRESH from CustomerMember
+ * here (not read off req.user.customerMemberRole, the JWT claim stamped at
+ * login) so a user with NO CustomerMember record at all can be detected and
+ * logged, not just silently defaulted — a real, observed data gap (some
+ * customer-side Users have customerId set with no CustomerMember row at
+ * all), not something this filter should absorb without a trace. Missing a
+ * record still safely falls through to REQUESTER-tier (own-scope only) —
+ * logging is so the gap gets FIXED elsewhere, not because own-scope is
+ * unsafe.
+ */
+async function resolveVisaRequestsFilter(req: any, workspaceId: any): Promise<Record<string, any>> {
+  const user = req.user;
+  const userId = actorId(req);
+  const rolesNorm = (Array.isArray(user?.roles) ? user.roles : []).map(normRole);
+  const customerId = user?.customerId || user?.businessId || null;
+
+  let memberRole: string | null = null;
+  if (customerId && user?.email) {
+    const member = await CustomerMember.findOne({ customerId: String(customerId), email: String(user.email).toLowerCase() })
+      .select("role")
+      .lean();
+    memberRole = (member as any)?.role ?? null;
+    if (!member) {
+      visaLogger.warn("GET /requests: no CustomerMember record for this customer-side user — defaulting to REQUESTER-tier (own-scope only)", {
+        userId: String(userId || ""),
+        customerId: String(customerId),
+      });
+    }
+  }
+
+  const isOrgScope = rolesNorm.includes("WORKSPACELEADER") || memberRole === "WORKSPACE_LEADER";
+
+  if (isOrgScope && customerId) {
+    const teamUserIds = await User.find({ $or: [{ customerId: String(customerId) }, { businessId: String(customerId) }] })
+      .select("_id")
+      .lean();
+    return { workspaceId, raisedByUserId: { $in: teamUserIds.map((u: any) => u._id) } };
+  }
+
+  // OWN scope — requests they raised, OR requests where they are the
+  // traveller (task brief, 2026-08-01). The traveller link is
+  // TravellerProfile.claimedBy ONLY — never inferred from an email match
+  // (see that field's own doc comment, and models/TravellerProfile.ts's
+  // header) — so an unclaimed traveller (no login, or never claimed) gets
+  // no extra visibility here, same as today.
+  const claimedTravellerIds = await TravellerProfile.find({ workspaceId, claimedBy: userId }).distinct("_id");
+  const requestIdsAsTraveller = await VisaApplication.find({ workspaceId, travellerProfileId: { $in: claimedTravellerIds } }).distinct("requestId");
+
+  return {
+    workspaceId,
+    $or: [{ raisedByUserId: userId }, { _id: { $in: requestIdsAsTraveller } }],
+  };
+}
+
 /* ─────────────────────────────────────────────────────────────────────
- * GET /requests — workspace-scoped list, for the tracking screen and for
+ * GET /requests — scoped list (2026-08-01: customer-scoped for
+ * WORKSPACE_LEADER, own-requests-or-own-traveller for everyone else — see
+ * resolveVisaRequestsFilter above), for the tracking screen and for
  * resuming a draft. Includes each request's applications and their
  * travellers.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/requests", async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
-    const requests = await VisaRequest.find({ workspaceId }).sort({ createdAt: -1 }).lean();
+    const filter = await resolveVisaRequestsFilter(req, workspaceId);
+    const requests = await VisaRequest.find(filter).sort({ createdAt: -1 }).lean();
 
     const requestIds = requests.map((r: any) => r._id);
     const applications = await VisaApplication.find({ workspaceId, requestId: { $in: requestIds } }).lean();
