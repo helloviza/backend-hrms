@@ -17,11 +17,12 @@ import mongoose, { Schema, type Document, type Model } from "mongoose";
 import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import {
   VISA_PURPOSES, VISA_ENTRY_TYPES, VISA_SERVICE_TIERS, VISA_PRODUCT_CLASSES,
-  VISA_CATEGORIES, VISA_ETA_BASES, VISA_RULE_DISPLAY_MODES,
+  VISA_CATEGORIES, VISA_ETA_BASES, VISA_RULE_DISPLAY_MODES, VISA_DOC_REQUIREMENT_LEVELS,
   type VisaPurpose, type VisaEntryType, type VisaServiceTier, type VisaProductClass,
   type VisaCategory, type VisaEtaBasis, type VisaRuleDisplayMode,
-  type VisaDocumentRequirement,
+  type VisaDocumentRequirement, type VisaDocumentRequirementGroup,
 } from "./VisaRule.js";
+import { VisaApplicantPredicateConditionSchema } from "./visaAttributes.js";
 import { VisaApplicantProfileSchema, type VisaApplicantProfile } from "./visaAttributes.js";
 import logger from "../utils/logger.js";
 
@@ -80,6 +81,16 @@ export interface VisaRuleSnapshot {
   appointmentRequired: boolean;
   biometricsRequired: boolean;
   documentRequirements: VisaDocumentRequirement[];
+  // Phase 10b — captured going forward (see buildRuleSnapshot,
+  // routes/visa.ts) from VisaRule.documentGroups at the same point-in-time
+  // as documentRequirements above, so a NEW application preserves full
+  // appliesWhen/specification/template fidelity instead of permanently
+  // downgrading to the flat legacy shape. Optional/absent on every
+  // application created BEFORE this phase — ruleSnapshot is immutable
+  // history (file header) and those rows are never rewritten; utils/
+  // visaChecklistResolver.ts treats an absent documentGroups exactly like a
+  // rule that was never migrated, falling back to documentRequirements.
+  documentGroups?: VisaDocumentRequirementGroup[];
 }
 
 // What the applicant was quoted at request time — captured separately from
@@ -334,6 +345,25 @@ const VisaRuleSnapshotSchema = new Schema<VisaRuleSnapshot>(
         },
       ],
       default: [],
+    },
+    // Phase 10b — see the interface field's own doc comment above. Not
+    // `required`/no default array forced — absent (undefined) is the
+    // meaningful "old-shape snapshot" state, distinct from an empty array
+    // (a new-shape snapshot from a rule that genuinely has zero groups).
+    documentGroups: {
+      type: [
+        {
+          key: { type: String, required: true },
+          label: { type: String, required: true },
+          requirement: { type: String, enum: VISA_DOC_REQUIREMENT_LEVELS, required: true },
+          appliesWhen: { type: [VisaApplicantPredicateConditionSchema], default: undefined },
+          docTypeCodes: { type: [String], required: true, default: [] },
+          specification: { type: String, trim: true },
+          templateCode: { type: String, trim: true },
+          legacyConditionNote: { type: String, trim: true },
+        },
+      ],
+      default: undefined,
     },
   },
   { _id: false },

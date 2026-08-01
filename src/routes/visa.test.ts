@@ -38,6 +38,9 @@ vi.mock("../models/VisaRule.js", () => ({
   VISA_CATEGORIES: ["STICKER", "STAMP", "E_VISA", "VOA", "VISA_FREE"],
   VISA_ETA_BASES: ["BUSINESS", "CALENDAR"],
   VISA_RULE_DISPLAY_MODES: ["ITEMISED", "INDICATIVE"],
+  // Phase 10b — VisaApplication.ts's schema now also imports this (the
+  // documentGroups[].requirement enum), at the same module-load time.
+  VISA_DOC_REQUIREMENT_LEVELS: ["REQUIRED", "CONDITIONAL"],
 }));
 
 const visaContentFindOneMock = vi.fn();

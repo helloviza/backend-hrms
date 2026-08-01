@@ -80,6 +80,19 @@ import {
   VISA_DOCUMENT_CODE_SET,
 } from "../config/visaDocumentCodes.js";
 import {
+  hydrateVisaChecklist,
+  computeOutstandingRequirements,
+} from "../utils/visaChecklistHydration.js";
+import { getReferencedApplicantAttributeFields } from "../utils/visaChecklistResolver.js";
+import {
+  deriveCorporateApplicantProfileDefaults,
+  VISA_EMPLOYMENT_STATUSES,
+  VISA_SPONSOR_TYPES,
+  VISA_INVITATION_SOURCES,
+  VISA_MARITAL_STATUSES,
+  type VisaApplicantProfile,
+} from "../models/visaAttributes.js";
+import {
   CURRENT_VISA_CONSENT_VERSION,
   VISA_CONSENT_CLAUSE_IDS,
 } from "../config/visaConsent.js";
@@ -135,96 +148,27 @@ function serviceTierRank(tier: string): number {
   return SERVICE_TIER_RANK.get(tier) ?? VISA_SERVICE_TIERS.length;
 }
 
-// The two checklist rows a linked TravelBooking can satisfy without an
-// upload — DOC-07 is Hotel Booking, DOC-08 is Flight Itinerary
-// (config/visaDocumentCodes.ts; both already seeded on live VisaRules, see
-// scripts/seed-visa-rules.ts). Note: task briefs referring to this feature
-// have used "DOC-16"/"DOC-17" — those codes don't exist anywhere in the
-// registry or any seeded rule (DOC-10..DOC-25 is an unpopulated reserved
-// range); DOC-07/DOC-08 are the real, live codes for these two document
-// types, so linking is keyed off them instead.
-const LINKABLE_DOC_CODE_SERVICE: Record<string, "FLIGHT" | "HOTEL"> = {
-  "DOC-08": "FLIGHT",
-  "DOC-07": "HOTEL",
-};
-
-// Document types the concierge team can genuinely arrange on the
-// applicant's behalf: the same two codes above (DOC-07/DOC-08), PLUS DOC-09
-// (Travel Insurance). Deliberately a separate constant from
-// LINKABLE_DOC_CODE_SERVICE, not a superset check derived from it — Flight/
-// Hotel check the booking register FIRST and only offer the concierge once
-// that lookup finds nothing (satisfiedByBooking false); Insurance has no
-// booking register to check at all, so for DOC-09 this is the offer alone,
-// not a fallback after a failed lookup. Never fabricate a lookup for
-// insurance just to reuse the flight/hotel UI shape.
-const CONCIERGE_ARRANGEABLE_DOC_CODES = new Set(["DOC-07", "DOC-08", "DOC-09"]);
-
-// linkedServices is only ever passed by hydrateApplicationsWithTravellers,
-// which has a real application (and thus real linkedBookings) to check
-// against — GET /rules and GET /rules/:id call this before an application
-// exists, so satisfiedByBooking is always false there.
-function hydrateDocumentRequirements(
-  reqs: VisaDocumentRequirement[],
-  linkedServices?: ReadonlySet<string>,
-) {
-  return reqs.map((d) => {
-    const def = getVisaDocumentCodeDef(d.docCode);
-    const service = LINKABLE_DOC_CODE_SERVICE[d.docCode];
-    return {
-      docCode: d.docCode,
-      name: def?.name ?? null,
-      category: def?.category ?? null,
-      notes: def?.notes ?? null,
-      requirement: d.requirement,
-      condition: d.condition,
-      satisfiedByBooking: !!(service && linkedServices?.has(service)),
-      conciergeArrangeable: CONCIERGE_ARRANGEABLE_DOC_CODES.has(d.docCode),
-    };
-  });
-}
-
-// Phase 9f — "is there anything still missing" for the auto-clear check
-// after a customer upload during action_required. Deliberately CONDITIONAL
-// requirements are never counted here: `condition` is freeform text (e.g.
-// "if travelling for business") with no established way anywhere in this
-// codebase to evaluate it as true/false, so treating it as always-required
-// would be wrong far more often than not — same posture the checklist
-// display (hydrateDocumentRequirements above) already takes by never
-// gating on it either. A REQUIRED docCode counts as satisfied by ANY
-// non-deleted uploaded version regardless of reviewStatus (PENDING
-// included) — this checks whether the CUSTOMER has done their part, not
-// whether a concierge has reviewed it yet — or by a linked booking
-// (DOC-07/DOC-08), same as the checklist display.
-export function computeOutstandingRequiredDocCodes(
-  application: {
-    ruleSnapshot?: { documentRequirements?: VisaDocumentRequirement[] } | null;
-    linkedBookings?: Array<{ service: string }> | null;
-  },
-  documents: Array<{ docCode: string }>,
-): string[] {
-  const requirements = application.ruleSnapshot?.documentRequirements || [];
-  const uploadedCodes = new Set(documents.map((d) => d.docCode));
-  const linkedServices = new Set(
-    (application.linkedBookings || []).map((lb) => lb.service),
-  );
-
-  return requirements
-    .filter((r) => r.requirement === "REQUIRED")
-    .map((r) => r.docCode)
-    .filter((docCode) => {
-      if (uploadedCodes.has(docCode)) return false;
-      const service = LINKABLE_DOC_CODE_SERVICE[docCode];
-      if (service && linkedServices.has(service)) return false;
-      return true;
-    });
-}
+// Phase 10b — checklist resolution/hydration/completeness all now live in
+// utils/visaChecklistResolver.ts + utils/visaChecklistHydration.ts (one
+// resolver, wired into every read path below: GET /rules, GET /rules/:id,
+// hydrateApplicationsWithTravellers, and the completeness check). See those
+// files for LINKABLE_DOC_CODE_SERVICE/CONCIERGE_ARRANGEABLE_DOC_CODES
+// (still keyed on the legacy DOC-07/DOC-08/DOC-09 codes — task brief §4 —
+// plus their new semantic equivalents, additively) and
+// computeOutstandingRequirements (replaces the old, docCode-counting
+// computeOutstandingRequiredDocCodes — see recordCustomerResponseDuringActionRequired
+// below for its call site).
 
 // Shared by GET /rules (one entry per matching variant) and GET /rules/:id
 // (this shape plus destination/purpose, since a by-id caller doesn't
 // already know those the way a by-destination-and-purpose caller does).
 // Document checklist hydration and fee computation happen here, once, so
-// neither route can drift from the other.
+// neither route can drift from the other. No applicantProfile is passed —
+// nobody has selected a traveller yet at this stage of the flow, so the
+// resolver's "no applicant known yet" mode returns every requirement
+// unfiltered (see utils/visaChecklistResolver.ts's own doc comment).
 function mapRuleToVariant(r: any) {
+  const checklist = hydrateVisaChecklist(r);
   return {
     ruleId: String(r._id),
     entryType: r.entryType,
@@ -239,7 +183,13 @@ function mapRuleToVariant(r: any) {
     isExtension: r.isExtension,
     appointmentRequired: r.appointmentRequired,
     biometricsRequired: r.biometricsRequired,
-    documents: hydrateDocumentRequirements(r.documentRequirements),
+    documents: checklist.documents,
+    documentGroups: checklist.documentGroups,
+    // Screen 3 (ApplyPage) reads this off GET /rules/:id to know which
+    // applicant-profile questions the SELECTED rule actually depends on —
+    // task brief §3: "ask the rest only when some requirement in the
+    // selected rule actually depends on it".
+    applicantAttributeFieldsReferenced: getReferencedApplicantAttributeFields(r),
     fee: computeVisaFeeBlock(r),
   };
 }
@@ -485,7 +435,7 @@ router.get("/travellers", async (req: any, res: any) => {
     const workspaceId = req.workspaceObjectId;
     const docs = await TravellerProfile.find({ workspaceId, isActive: true })
       .select(
-        "firstName middleName lastName dob email nationality passportNo passportExpiry",
+        "firstName middleName lastName dob email nationality passportNo passportExpiry linkedMemberId",
       )
       .sort({ firstName: 1, lastName: 1 })
       .lean();
@@ -500,6 +450,11 @@ router.get("/travellers", async (req: any, res: any) => {
       nationality: d.nationality ?? null,
       passportMasked: maskTailId(d.passportNo) ?? null,
       passportExpiry: d.passportExpiry ?? null,
+      // Phase 10b (task brief §3) — lets screen 3 skip asking
+      // employmentStatus/sponsorType for a traveller who'll get them
+      // corporate-defaulted anyway at POST /requests (see
+      // buildApplicantProfileForTraveller) — never the raw linkedMemberId.
+      isWorkspaceMember: !!d.linkedMemberId,
     }));
 
     res.json({ ok: true, travellers });
@@ -541,6 +496,20 @@ function buildRuleSnapshot(rule: any): VisaRuleSnapshot {
     documentRequirements: (rule.documentRequirements || []).map((d: any) => ({
       ...d,
     })),
+    // Phase 10b — captured alongside documentRequirements above so a NEW
+    // application preserves group/appliesWhen fidelity going forward
+    // (existing applications' snapshots are immutable history and never
+    // gain this retroactively — see VisaRuleSnapshot's own doc comment).
+    // undefined (not []) when the rule itself has no groups, so "old-shape"
+    // and "legacy-only rule" both resolve identically downstream.
+    documentGroups:
+      rule.documentGroups && rule.documentGroups.length > 0
+        ? rule.documentGroups.map((g: any) => ({
+            ...g,
+            docTypeCodes: [...(g.docTypeCodes || [])],
+            appliesWhen: g.appliesWhen ? g.appliesWhen.map((c: any) => ({ ...c })) : undefined,
+          }))
+        : undefined,
   };
 }
 
@@ -561,6 +530,75 @@ function buildIndicativeCostSnapshot(rule: any): VisaIndicativeCostSnapshot {
 
 function travellerDisplayName(t: any): string {
   return [t?.firstName, t?.middleName, t?.lastName].filter(Boolean).join(" ");
+}
+
+// Phase 10b (task brief §3) — the applicant-profile fields screen 3 may
+// actually submit an answer for. Whitelist + enum-validated so a malformed
+// client payload 400s instead of silently writing garbage into
+// VisaApplication.applicantProfile. employmentStatus/sponsorType/isMinor
+// ARE included here (not corporate-defaults-only) — a NON-workspace-member
+// traveller (e.g. a family member on the same trip) gets no default for
+// them, so if the selected rule actually depends on one, screen 3 must
+// still be able to ask and submit it. See buildApplicantProfileForTraveller
+// below for how an answer and a corporate default combine.
+function validateApplicantProfileAnswer(
+  input: unknown,
+): { ok: true; value: Partial<VisaApplicantProfile> } | { ok: false; error: string } {
+  if (input == null) return { ok: true, value: {} };
+  if (typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, error: "applicantProfileAnswers entry must be an object" };
+  }
+  const b = input as Record<string, unknown>;
+  const value: Partial<VisaApplicantProfile> = {};
+
+  if (b.employmentStatus !== undefined) {
+    if (!VISA_EMPLOYMENT_STATUSES.includes(b.employmentStatus as any)) {
+      return { ok: false, error: `employmentStatus must be one of ${VISA_EMPLOYMENT_STATUSES.join(", ")}` };
+    }
+    value.employmentStatus = b.employmentStatus as any;
+  }
+  if (b.sponsorType !== undefined) {
+    if (!VISA_SPONSOR_TYPES.includes(b.sponsorType as any)) {
+      return { ok: false, error: `sponsorType must be one of ${VISA_SPONSOR_TYPES.join(", ")}` };
+    }
+    value.sponsorType = b.sponsorType as any;
+  }
+  if (b.invitationSource !== undefined) {
+    if (!VISA_INVITATION_SOURCES.includes(b.invitationSource as any)) {
+      return { ok: false, error: `invitationSource must be one of ${VISA_INVITATION_SOURCES.join(", ")}` };
+    }
+    value.invitationSource = b.invitationSource as any;
+  }
+  if (b.maritalStatus !== undefined) {
+    if (!VISA_MARITAL_STATUSES.includes(b.maritalStatus as any)) {
+      return { ok: false, error: `maritalStatus must be one of ${VISA_MARITAL_STATUSES.join(", ")}` };
+    }
+    value.maritalStatus = b.maritalStatus as any;
+  }
+  for (const key of ["isMinor", "isSponsored", "holdsUsVisa", "holdsSchengenVisa"] as const) {
+    if (b[key] !== undefined) {
+      if (typeof b[key] !== "boolean") return { ok: false, error: `${key} must be a boolean` };
+      value[key] = b[key] as boolean;
+    }
+  }
+  return { ok: true, value };
+}
+
+// Corporate defaults first (workspace-member => EMPLOYED/EMPLOYER, isMinor
+// from dob — task brief §3), then whatever screen 3 actually asked and the
+// traveller answered on top. A traveller who ISN'T a workspace member (e.g.
+// a family member on the same trip) gets no employmentStatus/sponsorType
+// default at all — if the selected rule depends on one for them, the
+// answer (not a fabricated default) is what fills it in.
+function buildApplicantProfileForTraveller(
+  traveller: { linkedMemberId?: unknown; dob?: string | null },
+  answer: Partial<VisaApplicantProfile>,
+): VisaApplicantProfile {
+  const defaults = deriveCorporateApplicantProfileDefaults({
+    isWorkspaceMember: !!traveller.linkedMemberId,
+    dob: traveller.dob,
+  });
+  return { ...defaults, ...answer };
 }
 
 // Attaches a lightweight traveller summary to each application — GET
@@ -634,15 +672,22 @@ async function hydrateApplicationsWithTravellers(
     const linkedServices = new Set<string>(
       linkedBookings.map((lb: any) => lb.service),
     );
+    // Real per-traveller applicantProfile (schema default {} — see
+    // models/VisaApplication.ts) — this is what narrows the rule's ~22
+    // requirements down to the ~10 that apply to THIS traveller (task brief
+    // §1/§3). An old-shape ruleSnapshot (no documentGroups at all) simply
+    // has nothing structured to filter by, so it renders in full either way.
+    const checklist = hydrateVisaChecklist(a.ruleSnapshot || {}, {
+      applicantProfile: a.applicantProfile || {},
+      linkedServices,
+    });
     const base = {
       ...a,
       linkedBookings,
       ruleSnapshot: {
         ...a.ruleSnapshot,
-        documentRequirements: hydrateDocumentRequirements(
-          a.ruleSnapshot?.documentRequirements || [],
-          linkedServices,
-        ),
+        documentRequirements: checklist.documents,
+        documentGroups: checklist.documentGroups,
       },
       traveller: traveller
         ? {
@@ -695,8 +740,13 @@ async function hydrateApplicationsWithTravellers(
 router.post("/requests", async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
-    const { ruleId, travellerProfileIds, travelDateFrom, travelDateTo } =
-      req.body || {};
+    const {
+      ruleId,
+      travellerProfileIds,
+      travelDateFrom,
+      travelDateTo,
+      applicantProfileAnswers,
+    } = req.body || {};
 
     if (!ruleId || !mongoose.isValidObjectId(ruleId)) {
       return res.status(404).json({ error: "Visa rule not found" });
@@ -716,6 +766,24 @@ router.post("/requests", async (req: any, res: any) => {
       return res
         .status(400)
         .json({ error: `'${invalidId}' is not a valid traveller id` });
+    }
+
+    // Phase 10b (task brief §3) — optional, keyed by travellerProfileId:
+    // { [travellerProfileId]: Partial<VisaApplicantProfile> }. Validated
+    // whole (every entry) before anything is written, same "all or nothing"
+    // posture as the rest of this route.
+    const applicantProfileAnswerById = new Map<string, Partial<VisaApplicantProfile>>();
+    if (applicantProfileAnswers != null) {
+      if (typeof applicantProfileAnswers !== "object" || Array.isArray(applicantProfileAnswers)) {
+        return res.status(400).json({ error: "applicantProfileAnswers must be an object keyed by travellerProfileId" });
+      }
+      for (const [travellerId, answer] of Object.entries(applicantProfileAnswers)) {
+        const validated = validateApplicantProfileAnswer(answer);
+        if (validated.ok === false) {
+          return res.status(400).json({ error: `applicantProfileAnswers['${travellerId}']: ${validated.error}` });
+        }
+        applicantProfileAnswerById.set(travellerId, validated.value);
+      }
     }
 
     let parsedFrom: Date | undefined;
@@ -868,6 +936,7 @@ router.post("/requests", async (req: any, res: any) => {
     const applicationInputs = travellerProfileIds.map((id: string) => {
       const traveller = travellerById.get(String(id));
       const nationalityIso2 = normaliseToIso2(traveller?.nationality);
+      const answer = applicantProfileAnswerById.get(String(id)) || {};
       return {
         workspaceId,
         requestId: visaRequest._id,
@@ -877,6 +946,12 @@ router.post("/requests", async (req: any, res: any) => {
         travellerProfileId: traveller!._id,
         nationality: nationalityIso2, // null when it doesn't resolve — see model comment
         nationalityUnresolved: nationalityIso2 == null,
+        // Phase 10b (task brief §3) — corporate defaults (workspace member
+        // => EMPLOYED/EMPLOYER, isMinor from dob) merged with whatever
+        // screen 3 actually asked and this traveller answered. This is what
+        // lets the resolver narrow the rule's checklist down per traveller
+        // from GET /requests/:id onward.
+        applicantProfile: buildApplicantProfileForTraveller(traveller!, answer),
         ruleSnapshot,
         indicativeCostSnapshot,
         status: "draft",
@@ -1856,9 +1931,15 @@ async function recordCustomerResponseDuringActionRequired(opts: {
   ]);
   if (!fresh) return;
 
-  const outstanding = computeOutstandingRequiredDocCodes(
-    fresh as any,
-    documents as any,
+  const outstanding = computeOutstandingRequirements(
+    fresh?.ruleSnapshot || {},
+    fresh?.applicantProfile,
+    {
+      uploadedDocCodes: new Set((documents as any[]).map((d) => d.docCode)),
+      linkedServices: new Set(
+        ((fresh as any)?.linkedBookings || []).map((lb: any) => lb.service),
+      ),
+    },
   );
   if (outstanding.length > 0) return; // partial response — stays action_required
 

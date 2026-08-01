@@ -451,6 +451,85 @@ describe("POST /requests", () => {
     expect(stored.ruleSnapshot.documentRequirements).toHaveLength(1);
   });
 
+  // Phase 10b (task brief §3) — applicantProfile corporate defaults +
+  // client-submitted answers.
+  it("defaults employmentStatus=EMPLOYED and sponsorType=EMPLOYER for a workspace member (linkedMemberId set)", async () => {
+    const rule = ruleDoc();
+    const t1 = travellerDoc(WORKSPACE_A, { linkedMemberId: new mongoose.Types.ObjectId() });
+
+    const res = await request(makeApp(WORKSPACE_A))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(t1._id)] });
+
+    expect(res.status).toBe(201);
+    const stored = applications.get(res.body.applications[0]._id);
+    expect(stored.applicantProfile).toMatchObject({ employmentStatus: "EMPLOYED", sponsorType: "EMPLOYER" });
+  });
+
+  it("does not default employmentStatus/sponsorType for a non-member traveller (e.g. a family member)", async () => {
+    const rule = ruleDoc();
+    const t1 = travellerDoc(WORKSPACE_A); // no linkedMemberId
+
+    const res = await request(makeApp(WORKSPACE_A))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(t1._id)] });
+
+    expect(res.status).toBe(201);
+    const stored = applications.get(res.body.applications[0]._id);
+    expect(stored.applicantProfile.employmentStatus).toBeUndefined();
+    expect(stored.applicantProfile.sponsorType).toBeUndefined();
+  });
+
+  it("derives isMinor from the traveller's dob", async () => {
+    const rule = ruleDoc();
+    const minor = travellerDoc(WORKSPACE_A, { dob: "2015-01-01" });
+
+    const res = await request(makeApp(WORKSPACE_A))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(minor._id)] });
+
+    expect(res.status).toBe(201);
+    expect(applications.get(res.body.applications[0]._id).applicantProfile.isMinor).toBe(true);
+  });
+
+  it("merges a client-submitted applicantProfileAnswers entry on top of the corporate defaults", async () => {
+    const rule = ruleDoc();
+    const t1 = travellerDoc(WORKSPACE_A, { linkedMemberId: new mongoose.Types.ObjectId() });
+
+    const res = await request(makeApp(WORKSPACE_A))
+      .post("/requests")
+      .send({
+        ruleId: String(rule._id),
+        travellerProfileIds: [String(t1._id)],
+        applicantProfileAnswers: { [String(t1._id)]: { maritalStatus: "MARRIED", holdsUsVisa: true } },
+      });
+
+    expect(res.status).toBe(201);
+    const stored = applications.get(res.body.applications[0]._id);
+    expect(stored.applicantProfile).toMatchObject({
+      employmentStatus: "EMPLOYED", // still defaulted
+      sponsorType: "EMPLOYER",
+      maritalStatus: "MARRIED", // from the answer
+      holdsUsVisa: true,
+    });
+  });
+
+  it("rejects an invalid enum value in applicantProfileAnswers — nothing is created", async () => {
+    const rule = ruleDoc();
+    const t1 = travellerDoc(WORKSPACE_A);
+
+    const res = await request(makeApp(WORKSPACE_A))
+      .post("/requests")
+      .send({
+        ruleId: String(rule._id),
+        travellerProfileIds: [String(t1._id)],
+        applicantProfileAnswers: { [String(t1._id)]: { maritalStatus: "NOT_A_REAL_STATUS" } },
+      });
+
+    expect(res.status).toBe(400);
+    expect(applications.store.size).toBe(0);
+  });
+
   it("generates the reference number once, on the request, HV-prefixed", async () => {
     const rule = ruleDoc();
     const t1 = travellerDoc(WORKSPACE_A);
@@ -885,6 +964,37 @@ describe("GET /requests and GET /requests/:id — workspace scoping", () => {
     expect(own.status).toBe(200);
     expect(own.body.applications).toHaveLength(1);
     expect(own.body.applications[0].traveller.passportNo).toBe("M1234567");
+  });
+
+  // Phase 10b — end-to-end: POST /requests captures documentGroups into the
+  // snapshot (buildRuleSnapshot) and applies the corporate-defaulted
+  // applicantProfile; GET /requests/:id then narrows the checklist via the
+  // resolver (hydrateApplicationsWithTravellers) using that same profile.
+  it("GET /requests/:id narrows a group-based rule's checklist to what applies to this (workspace-member) traveller", async () => {
+    const rule = ruleDoc({
+      documentGroups: [
+        { key: "PASSPORT", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["DOC-01"] },
+        {
+          key: "ITR",
+          label: "Income Tax Return",
+          requirement: "CONDITIONAL",
+          appliesWhen: [{ field: "employmentStatus", in: ["SELF_EMPLOYED"] }],
+          docTypeCodes: ["DOC-04"],
+        },
+      ],
+    });
+    const t = travellerDoc(WORKSPACE_A, { linkedMemberId: new mongoose.Types.ObjectId() }); // -> EMPLOYED default
+
+    const created = await request(makeApp(WORKSPACE_A))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(t._id)] });
+    expect(created.status).toBe(201);
+
+    const detail = await request(makeApp(WORKSPACE_A)).get(`/requests/${created.body.request._id}`);
+    expect(detail.status).toBe(200);
+    const groups = detail.body.applications[0].ruleSnapshot.documentGroups;
+    expect(groups.map((g: any) => g.key)).toEqual(["PASSPORT"]); // ITR excluded — this traveller is EMPLOYED, not SELF_EMPLOYED
+    expect(detail.body.applications[0].ruleSnapshot.documentRequirements.map((d: any) => d.docCode)).toEqual(["DOC-01"]);
   });
 
   it("detail 404s on a well-formed but nonexistent id, not a 500", async () => {
@@ -1606,5 +1716,20 @@ describe("GET /travellers — visa picker data", () => {
     expect(res.status).toBe(200);
     expect(res.body.travellers[0].passportNo).toBeUndefined();
     expect(JSON.stringify(res.body)).not.toContain("M1234567");
+  });
+
+  // Phase 10b (task brief §3) — screen 3 uses this to skip asking
+  // employmentStatus/sponsorType for a traveller who'll get them
+  // corporate-defaulted anyway (see POST /requests' buildApplicantProfileForTraveller).
+  it("flags isWorkspaceMember true only for a traveller with a linkedMemberId, never the raw id itself", async () => {
+    travellerDoc(WORKSPACE_A, { firstName: "Member", linkedMemberId: new mongoose.Types.ObjectId() });
+    travellerDoc(WORKSPACE_A, { firstName: "NonMember" });
+
+    const res = await request(makeApp(WORKSPACE_A)).get("/travellers");
+    const member = res.body.travellers.find((t: any) => t.name.startsWith("Member"));
+    const nonMember = res.body.travellers.find((t: any) => t.name.startsWith("NonMember"));
+    expect(member.isWorkspaceMember).toBe(true);
+    expect(nonMember.isWorkspaceMember).toBe(false);
+    expect(JSON.stringify(res.body)).not.toContain("linkedMemberId");
   });
 });
