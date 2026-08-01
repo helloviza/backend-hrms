@@ -33,7 +33,13 @@ export const corsMiddleware = cors({
     "X-Request-ID",
     "X-Requested-With",
   ],
-  exposedHeaders: ["X-Request-ID"],
+  // X-Report-* (routes/admin.visa.reports.ts's sendReport) — the visa
+  // reports page reads these off a completed download to know whether it
+  // was truncated. Without an explicit exposedHeaders entry, the browser
+  // drops any custom response header on a cross-origin fetch even though
+  // it's present on the wire — this allow-list is what makes it visible to
+  // JS, not just the request succeeding.
+  exposedHeaders: ["X-Request-ID", "X-Report-Row-Count", "X-Report-Total-Matched", "X-Report-Truncated"],
   maxAge: 86400,
   preflightContinue: false,
   optionsSuccessStatus: 204,
