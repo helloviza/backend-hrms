@@ -24,9 +24,21 @@
 // index step) and reports "no change" rather than re-writing identical
 // data. Dry-run by default; --apply writes.
 //
+// Ledger (Phase 10d) — this migration ran on production BEFORE the ledger
+// existed (discovered un-run only when an unrelated import failed on the
+// stale index it was supposed to have widened — see MigrationRun's own file
+// header). That historical run is backfilled into MigrationRun by
+// migrations/backfill-ledger-2026-08-02-audit.ts, NOT by this file. Every
+// run of THIS script from now on (dry-run, apply, or a thrown failure) is
+// recorded via lib/migrationRunner.ts. Once a successful --apply run is
+// recorded (the backfilled one counts), running --apply again is refused
+// unless --force is also passed. Check current status with migrations/
+// status.ts.
+//
 // Usage:
 //   pnpm -C apps/backend tsx src/migrations/2026-08-02-visa-checklist-model-v2.ts           # dry-run
 //   pnpm -C apps/backend tsx src/migrations/2026-08-02-visa-checklist-model-v2.ts --apply    # write
+//   pnpm -C apps/backend tsx src/migrations/2026-08-02-visa-checklist-model-v2.ts --apply --force  # re-apply despite a recorded success
 import "dotenv/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,6 +53,7 @@ import {
   canonicalizeVisaDocumentCode,
 } from "../config/visaDocumentTypeCatalogue.js";
 import { VISA_QUESTION_BANK_SEED } from "../config/visaQuestionBankSeed.js";
+import { runMigration } from "./lib/migrationRunner.js";
 import type { VisaApplicantPredicate } from "../models/visaAttributes.js";
 
 const SEED_SOURCE = "visa-checklist-model-v2@2026-08";
@@ -295,6 +308,7 @@ export async function migrateRuleKeyIndex(dryRun: boolean): Promise<string> {
  * ───────────────────────────────────────────────────────────────────── */
 async function main() {
   const dryRun = !process.argv.includes("--apply");
+  const force = process.argv.includes("--force");
   console.log("=== Visa checklist model v2 migration (Phase 10a) ===");
   console.log(`Mode: ${dryRun ? "DRY RUN" : "APPLY"}`);
   console.log("");
@@ -304,34 +318,41 @@ async function main() {
   console.log("");
 
   try {
-    const docTypeSummary = await seedVisaDocumentTypes(dryRun);
-    console.log(
-      `VisaDocumentType catalogue: ${docTypeSummary.toCreate} to create, ${docTypeSummary.toUpdate} to update, ${docTypeSummary.unchanged} unchanged`,
-    );
+    await runMigration({
+      migrationName: "2026-08-02-visa-checklist-model-v2",
+      mode: dryRun ? "DRY_RUN" : "APPLY",
+      force,
+      run: async () => {
+        const docTypeSummary = await seedVisaDocumentTypes(dryRun);
+        const docTypeLine = `VisaDocumentType catalogue: ${docTypeSummary.toCreate} to create, ${docTypeSummary.toUpdate} to update, ${docTypeSummary.unchanged} unchanged`;
+        console.log(docTypeLine);
 
-    const questionSummary = await seedVisaQuestionBank(dryRun);
-    console.log(
-      `VisaQuestion bank: ${questionSummary.toCreate} to create, ${questionSummary.toUpdate} to update, ${questionSummary.unchanged} unchanged`,
-    );
+        const questionSummary = await seedVisaQuestionBank(dryRun);
+        const questionLine = `VisaQuestion bank: ${questionSummary.toCreate} to create, ${questionSummary.toUpdate} to update, ${questionSummary.unchanged} unchanged`;
+        console.log(questionLine);
 
-    const ruleSummary = await migrateVisaRulesToV2(dryRun);
-    console.log(
-      `VisaRule rows: ${ruleSummary.rulesScanned} scanned, ${ruleSummary.rulesUpdated} to update (variantKey/documentGroups), ${ruleSummary.rulesAlreadyMigrated} already migrated`,
-    );
+        const ruleSummary = await migrateVisaRulesToV2(dryRun);
+        const ruleLine = `VisaRule rows: ${ruleSummary.rulesScanned} scanned, ${ruleSummary.rulesUpdated} to update (variantKey/documentGroups), ${ruleSummary.rulesAlreadyMigrated} already migrated`;
+        console.log(ruleLine);
 
-    const indexResult = await migrateRuleKeyIndex(dryRun);
-    console.log(`Rule-key unique index: ${indexResult}`);
+        const indexResult = await migrateRuleKeyIndex(dryRun);
+        const indexLine = `Rule-key unique index: ${indexResult}`;
+        console.log(indexLine);
 
-    console.log("");
-    console.log("Old-code -> new-code mapping applied by this catalogue (DOC-NN codes are NOT rewritten in storage — see file header):");
-    for (const seed of VISA_DOCUMENT_TYPE_CATALOGUE) {
-      if (seed.legacyCode) console.log(`  ${seed.legacyCode}  ->  ${seed.code}`);
-    }
+        console.log("");
+        console.log("Old-code -> new-code mapping applied by this catalogue (DOC-NN codes are NOT rewritten in storage — see file header):");
+        for (const seed of VISA_DOCUMENT_TYPE_CATALOGUE) {
+          if (seed.legacyCode) console.log(`  ${seed.legacyCode}  ->  ${seed.code}`);
+        }
 
-    if (dryRun) {
-      console.log("");
-      console.log("Re-run with --apply to write these changes.");
-    }
+        if (dryRun) {
+          console.log("");
+          console.log("Re-run with --apply to write these changes.");
+        }
+
+        return { outcome: "SUCCESS", summary: [docTypeLine, questionLine, ruleLine, indexLine].join(" | ") };
+      },
+    });
   } finally {
     await mongoose.connection.close();
   }

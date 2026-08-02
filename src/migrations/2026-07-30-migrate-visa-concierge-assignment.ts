@@ -26,9 +26,18 @@
 // approximation ("assigned no later than this"); assignedByUserId is left
 // null (unknown provenance) rather than guessed.
 //
+// Ledger (Phase 10d) — every run of THIS script (dry-run, apply, or a
+// thrown failure) is recorded in MigrationRun via lib/migrationRunner.ts.
+// Once a successful --apply run is recorded, running --apply again is
+// refused unless --force is also passed. Check current status with
+// migrations/status.ts. This does NOT apply to migrateVisaConciergeAssignments
+// itself (still exported, still directly unit-testable, still idempotent
+// regardless of the ledger) — only main()'s re-run gate is new.
+//
 // Usage:
 //   pnpm -C apps/backend tsx src/migrations/2026-07-30-migrate-visa-concierge-assignment.ts              # dry-run
 //   pnpm -C apps/backend tsx src/migrations/2026-07-30-migrate-visa-concierge-assignment.ts --apply       # write
+//   pnpm -C apps/backend tsx src/migrations/2026-07-30-migrate-visa-concierge-assignment.ts --apply --force  # re-apply despite a recorded success
 import "dotenv/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +45,7 @@ import mongoose from "mongoose";
 import { env } from "../config/env.js";
 import VisaRequest from "../models/VisaRequest.js";
 import VisaApplication from "../models/VisaApplication.js";
+import { runMigration } from "./lib/migrationRunner.js";
 
 export interface MigrationSummary {
   requestsScanned: number;
@@ -108,6 +118,7 @@ export async function migrateVisaConciergeAssignments(dryRun: boolean): Promise<
 
 async function main() {
   const dryRun = !process.argv.includes("--apply");
+  const force = process.argv.includes("--force");
   console.log("=== Migrate VisaRequest.assignedConciergeUserId -> VisaApplication ===");
   console.log(`Mode: ${dryRun ? "DRY RUN" : "APPLY"}`);
   console.log("");
@@ -117,16 +128,24 @@ async function main() {
   console.log("");
 
   try {
-    const summary = await migrateVisaConciergeAssignments(dryRun);
-    console.log(
-      `requestsScanned=${summary.requestsScanned} applicationsAssigned=${summary.applicationsAssigned} ` +
-        `applicationsAlreadyAssignedSkipped=${summary.applicationsAlreadyAssignedSkipped} ` +
-        `requestsCleared=${summary.requestsCleared}`,
-    );
-    if (dryRun) {
-      console.log("");
-      console.log("Re-run with --apply to write these changes.");
-    }
+    await runMigration({
+      migrationName: "2026-07-30-migrate-visa-concierge-assignment",
+      mode: dryRun ? "DRY_RUN" : "APPLY",
+      force,
+      run: async () => {
+        const summary = await migrateVisaConciergeAssignments(dryRun);
+        const summaryLine =
+          `requestsScanned=${summary.requestsScanned} applicationsAssigned=${summary.applicationsAssigned} ` +
+          `applicationsAlreadyAssignedSkipped=${summary.applicationsAlreadyAssignedSkipped} ` +
+          `requestsCleared=${summary.requestsCleared}`;
+        console.log(summaryLine);
+        if (dryRun) {
+          console.log("");
+          console.log("Re-run with --apply to write these changes.");
+        }
+        return { outcome: "SUCCESS", summary: summaryLine };
+      },
+    });
   } finally {
     await mongoose.connection.close();
   }

@@ -27,9 +27,16 @@
 //     at the read above — a concurrent write landing in between must win,
 //     never be silently clobbered by this migration.
 //
+// Ledger (Phase 10d) — every run of THIS script (dry-run, apply, or a
+// thrown failure) is recorded in MigrationRun via lib/migrationRunner.ts.
+// Once a successful --apply run is recorded, running --apply again is
+// refused unless --force is also passed. Check current status with
+// migrations/status.ts.
+//
 // Usage:
 //   pnpm -C apps/backend tsx src/migrations/2026-08-01-backfill-visa-request-customer-id.ts              # dry-run
 //   pnpm -C apps/backend tsx src/migrations/2026-08-01-backfill-visa-request-customer-id.ts --apply       # write
+//   pnpm -C apps/backend tsx src/migrations/2026-08-01-backfill-visa-request-customer-id.ts --apply --force  # re-apply despite a recorded success
 import "dotenv/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +45,7 @@ import { env } from "../config/env.js";
 import VisaRequest from "../models/VisaRequest.js";
 import VisaApplication from "../models/VisaApplication.js";
 import User from "../models/User.js";
+import { runMigration } from "./lib/migrationRunner.js";
 
 export interface MigrationSummary {
   requestsScanned: number;
@@ -105,6 +113,7 @@ export async function backfillVisaRequestCustomerId(dryRun: boolean): Promise<Mi
 
 async function main() {
   const dryRun = !process.argv.includes("--apply");
+  const force = process.argv.includes("--force");
   console.log("=== Backfill VisaRequest/VisaApplication.customerId ===");
   console.log(`Mode: ${dryRun ? "DRY RUN" : "APPLY"}`);
   console.log("");
@@ -114,21 +123,29 @@ async function main() {
   console.log("");
 
   try {
-    const summary = await backfillVisaRequestCustomerId(dryRun);
-    console.log(
-      `requestsScanned=${summary.requestsScanned} requestsResolved=${summary.requestsResolved} ` +
-        `requestsUnresolved=${summary.requestsUnresolved} applicationsUpdated=${summary.applicationsUpdated}`,
-    );
-    if (summary.requestsUnresolved > 0) {
-      console.log("");
-      console.log(
-        `${summary.requestsUnresolved} request(s) left with customerId: null — the raiser has no customerId/businessId today (staff-raised, or the account no longer carries one). Not guessed from workspaceId; this is expected for those rows, not a failure.`,
-      );
-    }
-    if (dryRun) {
-      console.log("");
-      console.log("Re-run with --apply to write these changes.");
-    }
+    await runMigration({
+      migrationName: "2026-08-01-backfill-visa-request-customer-id",
+      mode: dryRun ? "DRY_RUN" : "APPLY",
+      force,
+      run: async () => {
+        const summary = await backfillVisaRequestCustomerId(dryRun);
+        const summaryLine =
+          `requestsScanned=${summary.requestsScanned} requestsResolved=${summary.requestsResolved} ` +
+          `requestsUnresolved=${summary.requestsUnresolved} applicationsUpdated=${summary.applicationsUpdated}`;
+        console.log(summaryLine);
+        if (summary.requestsUnresolved > 0) {
+          console.log("");
+          console.log(
+            `${summary.requestsUnresolved} request(s) left with customerId: null — the raiser has no customerId/businessId today (staff-raised, or the account no longer carries one). Not guessed from workspaceId; this is expected for those rows, not a failure.`,
+          );
+        }
+        if (dryRun) {
+          console.log("");
+          console.log("Re-run with --apply to write these changes.");
+        }
+        return { outcome: "SUCCESS", summary: summaryLine };
+      },
+    });
   } finally {
     await mongoose.connection.close();
   }

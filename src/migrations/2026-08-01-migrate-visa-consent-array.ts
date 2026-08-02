@@ -32,15 +32,23 @@
 // $push, so a request this migration already touched no longer matches the
 // { consentAcceptedAt: { $exists: true, $ne: null } } filter on a re-run.
 //
+// Ledger (Phase 10d) — every run of THIS script (dry-run, apply, or a
+// thrown failure) is recorded in MigrationRun via lib/migrationRunner.ts.
+// Once a successful --apply run is recorded, running --apply again is
+// refused unless --force is also passed. Check current status with
+// migrations/status.ts.
+//
 // Usage:
 //   pnpm -C apps/backend tsx src/migrations/2026-08-01-migrate-visa-consent-array.ts              # dry-run
 //   pnpm -C apps/backend tsx src/migrations/2026-08-01-migrate-visa-consent-array.ts --apply       # write
+//   pnpm -C apps/backend tsx src/migrations/2026-08-01-migrate-visa-consent-array.ts --apply --force  # re-apply despite a recorded success
 import "dotenv/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import mongoose from "mongoose";
 import { env } from "../config/env.js";
 import VisaRequest from "../models/VisaRequest.js";
+import { runMigration } from "./lib/migrationRunner.js";
 
 export interface ConsentMigrationSummary {
   requestsScanned: number;
@@ -102,6 +110,7 @@ export async function migrateVisaConsentArray(dryRun: boolean): Promise<ConsentM
 
 async function main() {
   const dryRun = !process.argv.includes("--apply");
+  const force = process.argv.includes("--force");
   console.log("=== Migrate VisaRequest consent fields -> consents[] ===");
   console.log(`Mode: ${dryRun ? "DRY RUN" : "APPLY"}`);
   console.log("");
@@ -111,15 +120,23 @@ async function main() {
   console.log("");
 
   try {
-    const summary = await migrateVisaConsentArray(dryRun);
-    console.log(
-      `requestsScanned=${summary.requestsScanned} requestsMigrated=${summary.requestsMigrated} ` +
-        `requestsSkippedMissingActor=${summary.requestsSkippedMissingActor}`,
-    );
-    if (dryRun) {
-      console.log("");
-      console.log("Re-run with --apply to write these changes.");
-    }
+    await runMigration({
+      migrationName: "2026-08-01-migrate-visa-consent-array",
+      mode: dryRun ? "DRY_RUN" : "APPLY",
+      force,
+      run: async () => {
+        const summary = await migrateVisaConsentArray(dryRun);
+        const summaryLine =
+          `requestsScanned=${summary.requestsScanned} requestsMigrated=${summary.requestsMigrated} ` +
+          `requestsSkippedMissingActor=${summary.requestsSkippedMissingActor}`;
+        console.log(summaryLine);
+        if (dryRun) {
+          console.log("");
+          console.log("Re-run with --apply to write these changes.");
+        }
+        return { outcome: "SUCCESS", summary: summaryLine };
+      },
+    });
   } finally {
     await mongoose.connection.close();
   }
