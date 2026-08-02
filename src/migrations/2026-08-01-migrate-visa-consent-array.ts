@@ -36,6 +36,8 @@
 //   pnpm -C apps/backend tsx src/migrations/2026-08-01-migrate-visa-consent-array.ts              # dry-run
 //   pnpm -C apps/backend tsx src/migrations/2026-08-01-migrate-visa-consent-array.ts --apply       # write
 import "dotenv/config";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import mongoose from "mongoose";
 import { env } from "../config/env.js";
 import VisaRequest from "../models/VisaRequest.js";
@@ -123,10 +125,15 @@ async function main() {
   }
 }
 
-// Never auto-run under the test runner — importing this module (for
-// migrateVisaConsentArray's own test) must not open a real Mongo connection.
-// Same guard server.ts already uses for its own startup code.
-if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
+// Auto-run ONLY when this file is the actual process entry point — an
+// env-var guard alone (NODE_ENV/VITEST) protects against the test runner but
+// NOT against another module importing this file for its exports, which
+// would silently trigger main() as an import side effect (this exact shape
+// once caused an accidental dry-run against production — see
+// migrations/2026-08-02-visa-checklist-model-v2.ts's history). Comparing
+// process.argv[1] against this file's own path closes that gap.
+const isDirectRun = !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirectRun) {
   main().catch(async (err) => {
     console.error("Migration failed:", err);
     try {

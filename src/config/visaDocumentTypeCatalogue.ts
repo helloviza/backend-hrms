@@ -169,8 +169,26 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     code: "EMPLOYMENT_CONTRACT",
     name: "Employment Contract",
     category: "EMPLOYMENT",
-    defaultDescription: "Signed contract or appointment letter confirming current employment",
-    aliases: ["Appointment Letter"],
+    // "Appointment Letter" was REMOVED from this list (Phase 10c follow-up)
+    // — it collided with the unrelated VISA_APPOINTMENT_CONFIRMATION type
+    // below. USA/UK/France checklists all use "Appointment letter"/
+    // "Appointment slip" to mean the VISA appointment confirmation, not a
+    // job appointment letter; the string matcher (utils/
+    // visaChecklistCatalogueMatcher.ts) mis-mapped France's "Appointment
+    // letter" row to this code via that alias during the 27-PDF pilot,
+    // while the LLM correctly declined because it read the surrounding
+    // checklist context. See VISA_APPOINTMENT_CONFIRMATION for where that
+    // phrase now resolves instead.
+    defaultDescription: "Signed contract confirming current employment",
+    aliases: [],
+    ocrExtractable: false,
+  },
+  {
+    code: "VISA_APPOINTMENT_CONFIRMATION",
+    name: "Visa Appointment Confirmation",
+    category: "TRAVEL",
+    defaultDescription: "Confirmation of the visa application appointment slot, carried on the day of the appointment",
+    aliases: ["Appointment Letter", "Appointment Slip", "Visa Appointment Slip"],
     ocrExtractable: false,
   },
   {

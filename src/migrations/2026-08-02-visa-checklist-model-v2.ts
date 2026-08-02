@@ -28,6 +28,8 @@
 //   pnpm -C apps/backend tsx src/migrations/2026-08-02-visa-checklist-model-v2.ts           # dry-run
 //   pnpm -C apps/backend tsx src/migrations/2026-08-02-visa-checklist-model-v2.ts --apply    # write
 import "dotenv/config";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import mongoose from "mongoose";
 import { isDeepStrictEqual } from "node:util";
 import { env } from "../config/env.js";
@@ -335,9 +337,16 @@ async function main() {
   }
 }
 
-// Never auto-run under the test runner — same guard as every other
-// migration in this directory.
-if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
+// Auto-run ONLY when this file is the actual process entry point — an
+// env-var guard alone (NODE_ENV/VITEST) protects against the test runner but
+// NOT against another module importing this file for its exports, which
+// silently triggered main() as an import side effect (a real accidental
+// dry-run against production, via VISA_QUESTION_BANK_SEED being imported
+// from here — that seed now lives in its own side-effect-free
+// config/visaQuestionBankSeed.ts). Comparing process.argv[1] against this
+// file's own path closes that gap for good.
+const isDirectRun = !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirectRun) {
   main().catch(async (err) => {
     console.error("Migration failed:", err);
     try {
