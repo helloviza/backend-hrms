@@ -48,7 +48,7 @@ vi.mock("../models/VisaRule.js", () => ({
   VISA_CATEGORIES: ["STICKER", "STAMP", "E_VISA", "VOA", "VISA_FREE"],
 }));
 
-import { buildRuleCandidate, importVisaChecklistRules, SEED_SOURCE } from "./import-visa-checklist-rules.js";
+import { buildRuleCandidate, importVisaChecklistRules, mergeSharedBaseChecklists, SEED_SOURCE } from "./import-visa-checklist-rules.js";
 import type { ExtractedVisaChecklistFile } from "./extract-visa-checklists.js";
 
 beforeEach(() => {
@@ -109,8 +109,18 @@ function laosFile(overrides: Partial<ExtractedVisaChecklistFile> = {}): Extracte
 }
 
 describe("buildRuleCandidate", () => {
-  it("skips a checklist with no visaCategory set — the PDF never states it, and this pass never guesses it", () => {
+  it("builds a candidate with visaCategory left unset when the PDF never states it — this pass never guesses it, ops sets it later via the fee/rule UI", () => {
     const file = laosFile();
+    const result = buildRuleCandidate(file, file.checklists[0]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.candidate.visaCategory).toBeUndefined();
+    }
+  });
+
+  it("skips a checklist whose visaCategory is set but not a real VisaCategory value — a real data error, not an absence", () => {
+    const file = laosFile();
+    file.checklists[0].visaCategory = "NOT_A_REAL_CATEGORY" as any;
     const result = buildRuleCandidate(file, file.checklists[0]);
     expect(result.ok).toBe(false);
     if (result.ok === false) expect(result.reason).toMatch(/visaCategory/);
@@ -242,10 +252,179 @@ describe("importVisaChecklistRules", () => {
     expect(rec.documentGroups[0].key).toBe("MANUALLY_EDITED"); // untouched
   });
 
-  it("reports (and never creates) a checklist still missing visaCategory", async () => {
-    const summary = await importVisaChecklistRules([laosFile()], true);
-    expect(summary.skipped).toHaveLength(1);
-    expect(summary.skipped[0].reason).toMatch(/visaCategory/);
+  it("creates a DRAFT rule with visaCategory left unset when the PDF never states it", async () => {
+    const summary = await importVisaChecklistRules([laosFile()], false);
+    expect(summary.toCreate).toBe(1);
+    expect(summary.skipped).toHaveLength(0);
+    const created = [...ruleStore.store.values()][0];
+    expect(created.status).toBe("DRAFT");
+    expect(created.visaCategory).toBeUndefined();
+  });
+
+  it("never clears an ops-set visaCategory on re-run just because the extraction still doesn't know it", async () => {
+    await importVisaChecklistRules([laosFile()], false);
+    const rec = [...ruleStore.store.values()][0];
+    rec.visaCategory = "E_VISA"; // ops set this via the fee/rule UI after the first import
+
+    const summary = await importVisaChecklistRules([laosFile()], false);
+    expect(summary.unchanged).toBe(1);
+    expect(rec.visaCategory).toBe("E_VISA"); // untouched
+  });
+
+  it("skips (and reports) BOTH entries when two checklists resolve to the identical natural key within one run", async () => {
+    const file = readyFile();
+    const second = { ...file.checklists[0], purposeLabel: "Tourist (duplicate variant)" };
+    file.checklists = [file.checklists[0], second];
+
+    const summary = await importVisaChecklistRules([file], true);
     expect(summary.toCreate).toBe(0);
+    expect(summary.duplicateKeyCollisions).toHaveLength(1);
+    expect(summary.duplicateKeyCollisions[0].entries).toHaveLength(2);
+    expect(summary.duplicateKeyCollisions[0].entries.map((e) => e.purposeLabel)).toEqual([
+      "Tourist",
+      "Tourist (duplicate variant)",
+    ]);
+  });
+
+  it("tallies rules per country and reports zero duplicate collisions/merges when there are none", async () => {
+    const summary = await importVisaChecklistRules([readyFile()], true);
+    expect(summary.perCountry.LA).toMatchObject({ toCreate: 1, toUpdate: 0, unchanged: 0, skippedNotDraft: 0 });
+    expect(summary.duplicateKeyCollisions).toHaveLength(0);
+    expect(summary.merges).toHaveLength(0);
+  });
+});
+
+describe("mergeSharedBaseChecklists", () => {
+  function southAfricaShapedFile(): ExtractedVisaChecklistFile {
+    return {
+      sourceFile: "South Africa-document-checklist.pdf",
+      duplicateOfSourceFiles: [],
+      destinationName: "South Africa",
+      destinationIso2: "ZA",
+      nationality: "IN",
+      extractedAt: "2026-08-02T00:00:00Z",
+      model: "gemini-2.5-flash",
+      checklists: [
+        {
+          purposeLabel: "General Requirements",
+          purpose: null,
+          variantLabel: null,
+          variantKey: "DEFAULT",
+          applicability: null,
+          visaCategory: null,
+          productClass: "VISA",
+          entryType: "UNSPECIFIED",
+          serviceTier: "STANDARD",
+          requirementGroups: [
+            {
+              key: "PASSPORT",
+              label: "Valid passport",
+              requirement: "REQUIRED",
+              conditionText: null,
+              appliesWhen: null,
+              specification: null,
+              templateReference: null,
+              matchedTemplateCode: null,
+              documents: [{ sourceName: "Passport", sourceDescription: null, matchedCode: "PASSPORT_ORIGINAL", suggestions: [] }],
+              allDocumentsMatched: true,
+            },
+            {
+              key: "PHOTOGRAPH",
+              label: "Photograph",
+              requirement: "REQUIRED",
+              conditionText: null,
+              appliesWhen: null,
+              specification: null,
+              templateReference: null,
+              matchedTemplateCode: null,
+              documents: [{ sourceName: "Photo", sourceDescription: null, matchedCode: "PHOTOGRAPH", suggestions: [] }],
+              allDocumentsMatched: true,
+            },
+          ],
+          questions: [],
+        },
+        {
+          purposeLabel: "BUSINESS VISITOR",
+          purpose: "BUSINESS",
+          variantLabel: null,
+          variantKey: "DEFAULT",
+          applicability: null,
+          visaCategory: null,
+          productClass: "VISA",
+          entryType: "UNSPECIFIED",
+          serviceTier: "STANDARD",
+          requirementGroups: [
+            {
+              key: "PASSPORT",
+              label: "Valid passport",
+              requirement: "REQUIRED",
+              conditionText: null,
+              appliesWhen: null,
+              specification: null,
+              templateReference: null,
+              matchedTemplateCode: null,
+              documents: [{ sourceName: "Passport", sourceDescription: null, matchedCode: "PASSPORT_ORIGINAL", suggestions: [] }],
+              allDocumentsMatched: true,
+            },
+            {
+              key: "INVITATION_LETTER",
+              label: "Invitation letter",
+              requirement: "REQUIRED",
+              conditionText: null,
+              appliesWhen: null,
+              specification: null,
+              templateReference: null,
+              matchedTemplateCode: null,
+              documents: [{ sourceName: "Invitation letter", sourceDescription: null, matchedCode: "INVITATION_LETTER", suggestions: [] }],
+              allDocumentsMatched: true,
+            },
+          ],
+          questions: [],
+        },
+      ],
+    } as ExtractedVisaChecklistFile;
+  }
+
+  it("merges the shared-base checklist's groups into every sibling and drops the standalone entry", () => {
+    const { file, report } = mergeSharedBaseChecklists(southAfricaShapedFile());
+
+    expect(file.checklists).toHaveLength(1);
+    expect(file.checklists[0].purposeLabel).toBe("BUSINESS VISITOR");
+    expect(report).not.toBeNull();
+    expect(report!.sharedBaseLabels).toEqual(["General Requirements"]);
+  });
+
+  it("deduplicates a shared-base group whose matched document the sibling already lists", () => {
+    const { file, report } = mergeSharedBaseChecklists(southAfricaShapedFile());
+
+    // BUSINESS VISITOR already lists PASSPORT_ORIGINAL itself — the shared
+    // base's own "Valid passport" group must NOT be duplicated in.
+    const passportGroups = file.checklists[0].requirementGroups.filter((g) =>
+      g.documents.some((d) => d.matchedCode === "PASSPORT_ORIGINAL"),
+    );
+    expect(passportGroups).toHaveLength(1);
+
+    // PHOTOGRAPH is new to BUSINESS VISITOR — it must merge in.
+    expect(file.checklists[0].requirementGroups.some((g) => g.key === "PHOTOGRAPH")).toBe(true);
+
+    expect(report!.targets).toEqual([{ purposeLabel: "BUSINESS VISITOR", groupsMergedIn: 1, groupsDeduped: 1 }]);
+  });
+
+  it("leaves a singleton checklist alone even if its label matches the shared-base pattern — nothing to merge it into", () => {
+    const file: ExtractedVisaChecklistFile = laosFile();
+    file.checklists[0].purposeLabel = "General";
+    file.checklists[0].purpose = null;
+
+    const result = mergeSharedBaseChecklists(file);
+    expect(result.report).toBeNull();
+    expect(result.file.checklists).toHaveLength(1);
+  });
+
+  it("does nothing when no checklist in the file matches the shared-base label pattern", () => {
+    const file = southAfricaShapedFile();
+    file.checklists[0].purposeLabel = "Something Else Entirely";
+    const result = mergeSharedBaseChecklists(file);
+    expect(result.report).toBeNull();
+    expect(result.file.checklists).toHaveLength(2);
   });
 });

@@ -42,15 +42,17 @@ import {
 } from "../services/extractVisaChecklistGemini.js";
 import {
   resolveDocumentTypeMapping,
+  resolvePurposeMapping,
   matchQuestion,
   suggestQuestions,
   matchTemplate,
   structureChecklistCondition,
   slugifyChecklistLabel,
   type CatalogueSuggestion,
+  type PurposeMappingResult,
 } from "../utils/visaChecklistCatalogueMatcher.js";
 import { normaliseToIso2 } from "../utils/countryCodes.js";
-import { VISA_PURPOSES, type VisaPurpose } from "../models/VisaRule.js";
+import type { VisaPurpose } from "../models/VisaRule.js";
 import type { VisaApplicantPredicate } from "../models/visaAttributes.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -65,25 +67,6 @@ const OUTPUT_DIR = path.join(CHECKLISTS_DIR, "extracted");
 // Fixed, not extracted from the PDF — there is no other nationality any of
 // this content could plausibly be for.
 const NATIONALITY = "IN";
-
-const PURPOSE_LABEL_MAP: Record<string, VisaPurpose> = {
-  tourist: "TOURIST",
-  visitor: "TOURIST",
-  business: "BUSINESS",
-  transit: "TRANSIT",
-};
-
-function mapPurposeLabel(label: string): VisaPurpose | null {
-  const norm = label.trim().toLowerCase();
-  if (PURPOSE_LABEL_MAP[norm]) return PURPOSE_LABEL_MAP[norm];
-  // A handful of PDFs may phrase it as e.g. "Tourist Visa" — try each known
-  // word as a whole-word match rather than a blind substring (so
-  // "Transitional" never accidentally maps to TRANSIT).
-  for (const word of norm.split(/\s+/)) {
-    if (PURPOSE_LABEL_MAP[word]) return PURPOSE_LABEL_MAP[word];
-  }
-  return null;
-}
 
 /* ─────────────────────────────────────────────────────────────────────
  * Reviewable JSON shape — what ops actually edits before step 2.
@@ -132,7 +115,17 @@ interface ExtractedQuestionEntry {
 
 interface ExtractedChecklistEntry {
   purposeLabel: string;
-  purpose: VisaPurpose | null; // null means ops must set this before import
+  purpose: VisaPurpose | null; // PRIMARY — null means ops must set this before import
+  purposeReasoning: string | null; // the model's own one-line explanation for `purpose`
+  // The deterministic, title-only cross-check (utils/
+  // visaChecklistCatalogueMatcher.ts's matchPurposeLabel) — independent of
+  // the model's own classification. purposeMatchesAgree false is a
+  // reviewer signal ("the two disagree, look closer"), never itself a
+  // reason to distrust `purpose` (see resolvePurposeMapping's own
+  // comment for why purpose still falls back to this when the model
+  // declines, unlike document-type matching).
+  purposeLabelMatch: VisaPurpose | null;
+  purposeMatchesAgree: boolean;
   variantLabel: string | null;
   variantKey: string; // "DEFAULT" or a slug derived from variantLabel
   applicability: VisaApplicantPredicate | null;
@@ -152,6 +145,13 @@ interface ExtractedChecklistEntry {
   serviceTier: "STANDARD";
   requirementGroups: ExtractedRequirementGroupEntry[];
   questions: ExtractedQuestionEntry[];
+  // Free-text ops annotation carried onto the imported rule's own
+  // opsNotes field (models/VisaRule.ts) — always null out of THIS
+  // extraction pass (Gemini never authors it); ops hand-edits it into the
+  // reviewed JSON here for a case a rigid field can't capture, e.g.
+  // South Africa's "OFFICIAL VISITOR" checklist mapped to purpose
+  // BUSINESS purely for lack of a closer enum fit.
+  opsNotes: string | null;
 }
 
 export interface ExtractedVisaChecklistFile {
@@ -224,9 +224,17 @@ export function buildExtractedFile(
 
   const checklists: ExtractedChecklistEntry[] = extraction.raw.checklists.map((c: any) => {
     const variantLabel: string | null = c.variantLabel ?? null;
+    const purposeMapping: PurposeMappingResult = resolvePurposeMapping({
+      purposeLabel: c.purposeLabel,
+      llmPurpose: c.purposeGuess ?? null,
+      llmReasoning: c.purposeReasoning ?? null,
+    });
     return {
       purposeLabel: c.purposeLabel,
-      purpose: mapPurposeLabel(c.purposeLabel),
+      purpose: purposeMapping.purpose,
+      purposeReasoning: purposeMapping.reasoning,
+      purposeLabelMatch: purposeMapping.labelMatch,
+      purposeMatchesAgree: purposeMapping.matchesAgree,
       variantLabel,
       variantKey: variantLabel ? slugifyChecklistLabel(variantLabel) : "DEFAULT",
       applicability: variantLabel ? structureChecklistCondition(variantLabel) : null,
@@ -236,6 +244,9 @@ export function buildExtractedFile(
       serviceTier: "STANDARD",
       requirementGroups: (c.requirementGroups || []).map(resolveRequirementGroup),
       questions: (c.questions || []).map(resolveQuestion),
+      // Never authored by this extraction pass — see the field's own
+      // comment on ExtractedChecklistEntry.
+      opsNotes: null,
     };
   });
 
@@ -321,6 +332,11 @@ function printFileSummary(file: ExtractedVisaChecklistFile): void {
     for (const d of disagreements) {
       console.log(
         `      disagreement: "${d.sourceName}" — LLM: ${d.matchedCode ?? "null"} (${d.matchConfidence ?? "n/a"}), string matcher: ${d.stringMatchCode ?? "null"}`,
+      );
+    }
+    if (!c.purposeMatchesAgree) {
+      console.log(
+        `      purpose disagreement: model: ${c.purpose ?? "null"}, title-only match: ${c.purposeLabelMatch ?? "null"}`,
       );
     }
   }

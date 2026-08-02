@@ -142,7 +142,13 @@ export interface VisaRuleDocument extends Document {
   destinationName: string;
   isSchengen: boolean;
   productClass: VisaProductClass;
-  visaCategory: VisaCategory;
+  // Optional at the schema level ONLY so a checklist-extraction DRAFT
+  // (scripts/import-visa-checklist-rules.ts) can be created before ops
+  // sets it — no checklist PDF ever states this. routes/admin.visa.rules.ts
+  // still requires it on the admin create-rule path, and its own
+  // POST /rules/:id/publish independently refuses to publish a rule
+  // that's missing it, so a PUBLISHED row is never left without one.
+  visaCategory?: VisaCategory;
 
   // ── validity / stay ──────────────────────────────────────────────────
   validityDays?: number;
@@ -189,6 +195,13 @@ export interface VisaRuleDocument extends Document {
   indicativeVisaCostInr?: number;
   displayMode?: VisaRuleDisplayMode;
   priceNote?: string;
+
+  // Free-text, ops-facing annotation — for a case a rigid field can't
+  // capture, e.g. South Africa's "OFFICIAL VISITOR" checklist mapped to
+  // purpose BUSINESS purely for lack of a closer enum fit even though it's
+  // official/diplomatic travel, not commercial business. Never read by any
+  // matching/selection logic — display-only, for whoever reviews the rule.
+  opsNotes?: string;
 
   // ── lifecycle ─────────────────────────────────────────────────────────
   status: VisaRuleStatus;
@@ -268,7 +281,8 @@ const VisaRuleSchema = new Schema<VisaRuleDocument>(
     destinationName: { type: String, required: true, trim: true },
     isSchengen: { type: Boolean, default: false },
     productClass: { type: String, enum: VISA_PRODUCT_CLASSES, required: true },
-    visaCategory: { type: String, enum: VISA_CATEGORIES, required: true },
+    // NOT required — see VisaRuleDocument.visaCategory above.
+    visaCategory: { type: String, enum: VISA_CATEGORIES },
 
     validityDays: { type: Number },
     maxStayDays: { type: Number },
@@ -292,6 +306,7 @@ const VisaRuleSchema = new Schema<VisaRuleDocument>(
     indicativeVisaCostInr: { type: Number, min: 0 },
     displayMode: { type: String, enum: VISA_RULE_DISPLAY_MODES },
     priceNote: { type: String, trim: true },
+    opsNotes: { type: String, trim: true },
 
     status: { type: String, enum: VISA_RULE_STATUSES, default: "DRAFT", index: true },
     effectiveFrom: { type: Date, required: true, default: Date.now },

@@ -36,6 +36,7 @@ import { VISA_DOCUMENT_TYPE_CATALOGUE, type VisaDocumentTypeSeed } from "../conf
 import { VISA_QUESTION_BANK_SEED, type VisaQuestionSeed } from "../config/visaQuestionBankSeed.js";
 import type { VisaApplicantPredicate } from "../models/visaAttributes.js";
 import type { VisaChecklistMatchConfidence } from "../services/extractVisaChecklistGemini.js";
+import { VISA_PURPOSES, type VisaPurpose } from "../models/VisaRule.js";
 
 /* ─────────────────────────────────────────────────────────────────────
  * Normalisation + scoring — shared by every catalogue below.
@@ -206,6 +207,77 @@ export function matchTemplate(reference: string): KnownVisaTemplate | null {
   const norm = normalizeChecklistText(reference);
   if (!norm) return null;
   return KNOWN_VISA_TEMPLATES.find((t) => normalizeChecklistText(t.name) === norm || normalizeChecklistText(t.code) === norm) ?? null;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Purpose — LLM-primary, same as documents (Phase 10d follow-up).
+ * services/extractVisaChecklistGemini.ts's prompt now asks Gemini to
+ * classify a checklist's travel purpose from its FULL title AND content,
+ * not a keyword scan of the title alone — that's the PRIMARY result.
+ *
+ * matchPurposeLabel below is the deterministic, title-only counterpart —
+ * word-boundary regex, not the old whitespace-only word split that missed
+ * "(Dubai)Tourist" (a real bug found reviewing UAE/USA: regex \b matches
+ * at any word/non-word transition, so it finds "tourist" inside
+ * "(dubai)tourist" even with zero surrounding whitespace, where a
+ * `.split(/\s+/)` + exact-word lookup could not).
+ *
+ * UNLIKE resolveDocumentTypeMapping (where the string matcher is purely
+ * informational and never fills in for a null LLM result — a wrong
+ * catalogue pick would misrepresent a specific required document),
+ * resolvePurposeMapping DOES fall back to matchPurposeLabel when the
+ * model declines: there are only 4 possible values here, every pattern
+ * above is an exact, unambiguous keyword ("tourist"/"visitor" can only
+ * mean TOURIST; "B1/B2" is a named, real category), and this fallback is
+ * exactly what makes "UAE (Dubai)Tourist Visa Checklist" and "United
+ * States B1/B2 Visa Checklist" resolve deterministically even if a future
+ * model call ever declines to classify them.
+ * ───────────────────────────────────────────────────────────────────── */
+const PURPOSE_LABEL_PATTERNS: { regex: RegExp; purpose: VisaPurpose }[] = [
+  // Checked FIRST: "B1/B2" is the US combined visitor-visa category
+  // (business AND tourism, by definition) — a real, named category, not a
+  // vague "not sure" fallback, so it must win over the singular
+  // tourist/business patterns below when it's present.
+  { regex: /\bb-?1\s*\/\s*b-?2\b/i, purpose: "TOURIST_OR_BUSINESS" },
+  { regex: /\btourist\b|\bvisitor\b/i, purpose: "TOURIST" },
+  { regex: /\bbusiness\b/i, purpose: "BUSINESS" },
+  { regex: /\btransit\b/i, purpose: "TRANSIT" },
+];
+
+/** Deterministic, title-only cross-check — never the primary signal once the model has an opinion. */
+export function matchPurposeLabel(label: string): VisaPurpose | null {
+  for (const { regex, purpose } of PURPOSE_LABEL_PATTERNS) {
+    if (regex.test(label)) return purpose;
+  }
+  return null;
+}
+
+export interface PurposeMappingResult {
+  purpose: VisaPurpose | null; // PRIMARY — the model's own classification, validated against the real enum
+  reasoning: string | null; // the model's own one-line explanation, kept regardless of outcome
+  labelMatch: VisaPurpose | null; // the deterministic title-only cross-check's independent result
+  matchesAgree: boolean; // purpose === labelMatch (true when both are null too)
+}
+
+export function resolvePurposeMapping(input: {
+  purposeLabel: string;
+  llmPurpose: string | null | undefined;
+  llmReasoning: string | null | undefined;
+}): PurposeMappingResult {
+  // Same defensive-validation posture as resolveDocumentTypeMapping — the
+  // Gemini schema constrains this to a real VisaPurpose enum value, but
+  // this never trusts that blindly.
+  const llmPurposeIsReal = !!input.llmPurpose && VISA_PURPOSES.includes(input.llmPurpose as VisaPurpose);
+  const purpose = llmPurposeIsReal ? (input.llmPurpose as VisaPurpose) : null;
+
+  const labelMatch = matchPurposeLabel(input.purposeLabel);
+
+  return {
+    purpose: purpose ?? labelMatch,
+    reasoning: input.llmReasoning ?? null,
+    labelMatch,
+    matchesAgree: purpose === labelMatch,
+  };
 }
 
 /* ─────────────────────────────────────────────────────────────────────

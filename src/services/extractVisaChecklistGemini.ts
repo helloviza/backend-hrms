@@ -38,6 +38,7 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { withGeminiTransientRetry } from "../utils/geminiRetry.js";
 import { VISA_DOCUMENT_TYPE_CATALOGUE } from "../config/visaDocumentTypeCatalogue.js";
+import { VISA_PURPOSES } from "../models/VisaRule.js";
 
 let _ai: GoogleGenAI | null = null;
 
@@ -100,6 +101,15 @@ export interface RawExtractedQuestion {
 
 export interface RawExtractedChecklist {
   purposeLabel: string; // verbatim, e.g. "Tourist", "Business", "Visitor"
+  // The model's own classification of this SAME checklist's travel
+  // purpose — grounded in the full title AND content, not a keyword scan
+  // of the title alone (utils/visaChecklistCatalogueMatcher.ts's
+  // matchPurposeLabel does that, as an independent cross-check/fallback).
+  // Schema-constrained to a real VisaPurpose or null — the model can
+  // decline (a title like "Document Checklist" that states nothing), but
+  // it can never emit a value that isn't a real purpose.
+  purposeGuess: string | null;
+  purposeReasoning: string | null; // one line, always filled in — why this purpose, or why none
   variantLabel: string | null; // verbatim, e.g. "For USA visa holder" — null for the primary/standard checklist of this purpose
   requirementGroups: RawExtractedRequirementGroup[];
   questions: RawExtractedQuestion[]; // [] when the PDF has no questionnaire section at all
@@ -154,6 +164,8 @@ const checklistSchema = {
   type: Type.OBJECT,
   properties: {
     purposeLabel: { type: Type.STRING },
+    purposeGuess: { type: Type.STRING, enum: [...VISA_PURPOSES], nullable: true },
+    purposeReasoning: { type: Type.STRING, nullable: true },
     variantLabel: { type: Type.STRING, nullable: true },
     requirementGroups: { type: Type.ARRAY, items: requirementGroupSchema },
     questions: { type: Type.ARRAY, items: questionSchema },
@@ -222,6 +234,30 @@ STRUCTURE:
   becomes its own entry in checklists[].
 - purposeLabel is that table's own heading/purpose (e.g. "Tourist",
   "Business", "Visitor"), verbatim.
+- purposeGuess classifies that SAME checklist's travel purpose into one of
+  TOURIST, BUSINESS, TOURIST_OR_BUSINESS, TRANSIT, or null. Base this on
+  the checklist's heading AND its content (row labels/descriptions), not
+  the heading alone:
+  - TOURIST: leisure, holiday, sightseeing, or general "visitor" travel.
+  - BUSINESS: commercial/business travel (meetings, conferences, trade).
+  - TOURIST_OR_BUSINESS: ONLY when the checklist is explicitly for a
+    single COMBINED visa category naming both at once — e.g. a US "B1/B2"
+    visitor visa, which by definition covers business (B1) and tourism
+    (B2) together. This is not a vague "not sure" fallback — use it only
+    when the checklist itself names a combined category like that.
+  - TRANSIT: airport/onward-travel transit only.
+  - null: the heading and content genuinely state or imply none of the
+    above (e.g. a generic "Document Checklist" with no purpose-specific
+    language anywhere in the table) — do not guess.
+  Worked examples: "UAE (Dubai)Tourist Visa Checklist" is TOURIST even
+  though the heading has no space before "Tourist" — read the whole word,
+  not a tokenised split. "United States B1/B2 Visa Checklist" is
+  TOURIST_OR_BUSINESS because B1/B2 is literally the US combined
+  business/tourist visitor-visa category, not an unresolved guess.
+- purposeReasoning: ONE short line explaining the purposeGuess call,
+  ALWAYS filled in (e.g. "heading says Tourist" / "B1/B2 is the US
+  combined business/tourist visitor visa" / "no purpose stated anywhere in
+  this document").
 - variantLabel is null for the primary/standard checklist of a purpose.
   Set it (verbatim) ONLY when the table itself is explicitly a variant of
   an already-covered purpose for a specific kind of applicant — e.g. a

@@ -280,6 +280,10 @@ function mapRuleSummary(r: any) {
     indicativeVisaCostInr: r.indicativeVisaCostInr ?? null,
     displayMode: r.displayMode ?? null,
     priceNote: r.priceNote ?? null,
+    // Display-only annotation (models/VisaRule.ts) — not in EDITABLE_FIELDS,
+    // same provenance-not-editable treatment mapContentSummary gives
+    // seedSource; visible here so ops actually sees it when reviewing a rule.
+    opsNotes: r.opsNotes ?? null,
     status: r.status,
     effectiveFrom: r.effectiveFrom,
     lastReviewedAt: r.lastReviewedAt ?? null,
