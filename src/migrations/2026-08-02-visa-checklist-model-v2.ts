@@ -38,6 +38,7 @@ import {
   VISA_DOCUMENT_TYPE_CATALOGUE,
   canonicalizeVisaDocumentCode,
 } from "../config/visaDocumentTypeCatalogue.js";
+import { VISA_QUESTION_BANK_SEED } from "../config/visaQuestionBankSeed.js";
 import type { VisaApplicantPredicate } from "../models/visaAttributes.js";
 
 const SEED_SOURCE = "visa-checklist-model-v2@2026-08";
@@ -106,89 +107,11 @@ export async function seedVisaDocumentTypes(dryRun: boolean): Promise<CatalogueS
  * 2. VisaQuestion shared bank seed — task brief §7's own list of repeated
  * questions: marital status, employment history, prior refusals (+ its
  * conditional country/date/reason follow-ups), who is funding the trip,
- * countries visited, parents' details.
+ * countries visited, parents' details. Seed data itself now lives in
+ * config/visaQuestionBankSeed.ts (Phase 10c — see that file's header for
+ * why); re-exported here for this module's own test file.
  * ───────────────────────────────────────────────────────────────────── */
-interface QuestionSeed {
-  code: string;
-  prompt: string;
-  answerType: VisaQuestionAnswerType;
-  options?: string[];
-  category: string;
-  followUps: VisaQuestionFollowUp[];
-}
-
-export const VISA_QUESTION_BANK_SEED: readonly QuestionSeed[] = [
-  {
-    code: "MARITAL_STATUS",
-    prompt: "What is your marital status?",
-    answerType: "SELECT",
-    options: ["SINGLE", "MARRIED", "DIVORCED", "WIDOWED"],
-    category: "PERSONAL",
-    followUps: [],
-  },
-  {
-    code: "EMPLOYMENT_HISTORY",
-    prompt: "Describe your employment history for the last 5 years.",
-    answerType: "TEXT",
-    category: "EMPLOYMENT",
-    followUps: [],
-  },
-  {
-    code: "PRIOR_VISA_REFUSAL",
-    prompt: "Have you ever been refused a visa by any country?",
-    answerType: "BOOLEAN",
-    category: "TRAVEL_HISTORY",
-    followUps: [
-      {
-        whenAnswerEquals: true,
-        questionCodes: ["PRIOR_VISA_REFUSAL_COUNTRY", "PRIOR_VISA_REFUSAL_DATE", "PRIOR_VISA_REFUSAL_REASON"],
-      },
-    ],
-  },
-  {
-    code: "PRIOR_VISA_REFUSAL_COUNTRY",
-    prompt: "Which country refused your visa?",
-    answerType: "COUNTRY",
-    category: "TRAVEL_HISTORY",
-    followUps: [],
-  },
-  {
-    code: "PRIOR_VISA_REFUSAL_DATE",
-    prompt: "On what date were you refused?",
-    answerType: "DATE",
-    category: "TRAVEL_HISTORY",
-    followUps: [],
-  },
-  {
-    code: "PRIOR_VISA_REFUSAL_REASON",
-    prompt: "What reason was given for the refusal?",
-    answerType: "TEXT",
-    category: "TRAVEL_HISTORY",
-    followUps: [],
-  },
-  {
-    code: "TRIP_FUNDED_BY",
-    prompt: "Who is funding this trip?",
-    answerType: "SELECT",
-    options: ["SELF", "EMPLOYER", "SPONSOR", "OTHER"],
-    category: "FINANCIAL",
-    followUps: [],
-  },
-  {
-    code: "COUNTRIES_VISITED_LAST_5_YEARS",
-    prompt: "List the countries you have visited in the last 5 years.",
-    answerType: "TEXT",
-    category: "TRAVEL_HISTORY",
-    followUps: [],
-  },
-  {
-    code: "PARENTS_DETAILS",
-    prompt: "Provide your parents' full names and dates of birth.",
-    answerType: "TEXT",
-    category: "PERSONAL",
-    followUps: [],
-  },
-] as const;
+export { VISA_QUESTION_BANK_SEED };
 
 function questionComparable(v: {
   prompt: string;

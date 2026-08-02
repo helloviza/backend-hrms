@@ -574,16 +574,16 @@ describe("GET /applications/:id — resolved checklist (console checklist gap)",
     purpose: "BUSINESS",
     serviceTier: "STANDARD",
     documentRequirements: [
-      { docCode: "DOC-01", requirement: "REQUIRED" },
-      { docCode: "DOC-04", requirement: "CONDITIONAL", condition: "If self-employed or a business owner" },
+      { docCode: "DOC-01", requirement: "REQUIRED" as const },
+      { docCode: "DOC-04", requirement: "CONDITIONAL" as const, condition: "If self-employed or a business owner" },
     ],
     documentGroups: [
-      { key: "PASSPORT", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["DOC-01"] },
+      { key: "PASSPORT", label: "Passport", requirement: "REQUIRED" as const, docTypeCodes: ["DOC-01"] },
       {
         key: "ITR",
         label: "Income Tax Return",
-        requirement: "CONDITIONAL",
-        appliesWhen: [{ field: "employmentStatus", in: ["SELF_EMPLOYED"] }],
+        requirement: "CONDITIONAL" as const,
+        appliesWhen: [{ field: "employmentStatus" as const, in: ["SELF_EMPLOYED"] }],
         docTypeCodes: ["DOC-04"],
       },
     ],
@@ -605,7 +605,7 @@ describe("GET /applications/:id — resolved checklist (console checklist gap)",
 
   it("matches resolveVisaChecklistWithExclusions/hydrateVisaChecklist exactly — same function, not a parallel implementation", async () => {
     const app = makeApp();
-    const applicantProfile = { employmentStatus: "EMPLOYED" };
+    const applicantProfile = { employmentStatus: "EMPLOYED" as const };
     const a = applicationDoc(WORKSPACE_A, { ruleSnapshot: GROUP_BASED_RULE_SNAPSHOT, applicantProfile });
 
     const res = await request(app).get(`/applications/${a._id}`);
