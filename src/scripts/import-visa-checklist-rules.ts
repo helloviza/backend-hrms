@@ -219,6 +219,53 @@ export interface SkippedChecklist {
 }
 
 /**
+ * Turns ONE extracted requirement-group entry into the VisaRule shape,
+ * whether or not any of its documents matched a catalogue code. Shared by
+ * buildRuleCandidate (first import) and migrations/
+ * 2026-08-03-recover-dropped-requirement-groups.ts (re-deriving the exact
+ * same group shape for a group that was dropped the first time around) —
+ * one implementation, so the two can never drift on what a "recovered"
+ * group looks like versus a freshly-imported one.
+ *
+ * 2026-08-03 — a group with NOTHING matched used to be skipped entirely
+ * here ("vacuously satisfied" looked worse than missing — see this
+ * migration's own header for the full history). That silently dropped a
+ * real requirement rather than surfacing it: six such groups were only
+ * discovered by accident, via the template-relink migration's own
+ * group-not-found report. Now every group is imported — a zero-match one
+ * just carries needsCatalogueMapping + the original unmatched document
+ * names instead of docTypeCodes, so ops sees a flagged row instead of a
+ * missing one.
+ */
+export function buildDocumentGroupFromExtracted(
+  g: ExtractedRequirementGroup,
+): { group: VisaDocumentRequirementGroup; droppedDocumentCount: number } {
+  const docTypeCodes = g.documents.map((d) => d.matchedCode).filter((c): c is string => c !== null);
+  const droppedDocumentCount = g.documents.length - docTypeCodes.length;
+
+  const group: VisaDocumentRequirementGroup = {
+    key: g.key,
+    label: g.label,
+    requirement: g.requirement,
+    docTypeCodes,
+  };
+  if (g.appliesWhen) group.appliesWhen = g.appliesWhen;
+  if (g.specification) group.specification = g.specification;
+  if (g.matchedTemplateCode) group.templateCode = g.matchedTemplateCode;
+  // Preserve the unstructured condition text ONLY when there's no
+  // structured appliesWhen — mirrors migrations/
+  // 2026-08-02-visa-checklist-model-v2.ts's own posture for the same field.
+  if (g.conditionText && !g.appliesWhen) group.legacyConditionNote = g.conditionText;
+
+  if (docTypeCodes.length === 0) {
+    group.needsCatalogueMapping = true;
+    group.unmatchedDocumentNames = g.documents.map((d) => d.sourceName);
+  }
+
+  return { group, droppedDocumentCount };
+}
+
+/**
  * Builds the DRAFT-rule candidate for one extracted checklist entry, or a
  * skip reason when a required field the PDF never states (destinationIso2,
  * purpose) is still unresolved, or when visaCategory is present but not a
@@ -250,32 +297,8 @@ export function buildRuleCandidate(
   let droppedDocumentCount = 0;
   const documentGroups: VisaDocumentRequirementGroup[] = [];
   for (const g of checklist.requirementGroups) {
-    const docTypeCodes = g.documents.map((d) => d.matchedCode).filter((c): c is string => c !== null);
-    const dropped = g.documents.length - docTypeCodes.length;
-    droppedDocumentCount += dropped;
-
-    // A group with NOTHING matched would import as an empty-docTypeCodes
-    // requirement — vacuously "satisfied" by having nothing to upload,
-    // which is worse than not importing it at all (task brief §3: never
-    // invent, and an empty group silently misrepresents a real
-    // requirement as already complete). Skip it; the unmatched documents
-    // are still fully visible in the source JSON for ops to resolve, then
-    // re-run.
-    if (docTypeCodes.length === 0) continue;
-
-    const group: VisaDocumentRequirementGroup = {
-      key: g.key,
-      label: g.label,
-      requirement: g.requirement,
-      docTypeCodes,
-    };
-    if (g.appliesWhen) group.appliesWhen = g.appliesWhen;
-    if (g.specification) group.specification = g.specification;
-    if (g.matchedTemplateCode) group.templateCode = g.matchedTemplateCode;
-    // Preserve the unstructured condition text ONLY when there's no
-    // structured appliesWhen — mirrors migrations/
-    // 2026-08-02-visa-checklist-model-v2.ts's own posture for the same field.
-    if (g.conditionText && !g.appliesWhen) group.legacyConditionNote = g.conditionText;
+    const { group, droppedDocumentCount: d } = buildDocumentGroupFromExtracted(g);
+    droppedDocumentCount += d;
     documentGroups.push(group);
   }
 

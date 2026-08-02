@@ -11,8 +11,13 @@ import {
   appliesWhenOut,
   docCodesIn,
   docCodesOut,
+  boolIn,
+  boolOut,
+  namesIn,
+  namesOut,
   resolveRuleRow,
   resolveRequirementRow,
+  serializeRequirementRow,
   mapSheetRow,
   RULES_HEADER_FIELD_MAP,
 } from "./admin.visa.rules.importExportShared.js";
@@ -73,9 +78,28 @@ describe("cell primitives", () => {
     expect(docCodesIn(cell).value).toEqual(codes);
   });
 
-  it("docCodesIn rejects an empty list and an unknown code", () => {
-    expect(docCodesIn("").error).toMatch(/at least one document code/);
+  it("docCodesIn: blank -> empty list (no longer an error on its own — see resolveRequirementRow's needsCatalogueMapping gate), unknown code still rejected", () => {
+    expect(docCodesIn("")).toEqual({ value: [] });
     expect(docCodesIn("NOT_A_REAL_CODE").error).toMatch(/not a known document type code/);
+  });
+
+  it("boolIn/Out round-trip a flag", () => {
+    expect(boolIn("")).toBe(false);
+    expect(boolIn("false")).toBe(false);
+    expect(boolIn("TRUE")).toBe(true);
+    expect(boolIn("yes")).toBe(true);
+    expect(boolIn("Y")).toBe(true);
+    expect(boolOut(true)).toBe("TRUE");
+    expect(boolOut(false)).toBe("");
+    expect(boolOut(undefined)).toBe("");
+  });
+
+  it("namesIn/Out round-trip a comma-separated name list", () => {
+    const names = ["Authorisation Letter", "Sponsor Letter"];
+    const cell = namesOut(names);
+    expect(cell).toBe("Authorisation Letter, Sponsor Letter");
+    expect(namesIn(cell)).toEqual(names);
+    expect(namesIn("")).toBeUndefined();
   });
 });
 
@@ -155,10 +179,58 @@ describe("resolveRequirementRow", () => {
     expect(badLevel.ok).toBe(false);
   });
 
-  it("requires at least one valid document code", () => {
+  it("requires at least one valid document code, unless Needs Catalogue Mapping is set", () => {
     const result = resolveRequirementRow({ ruleId: validId, groupLabel: "Passport", requirement: "REQUIRED" }, 2);
     expect(result.ok).toBe(false);
     if (result.ok === false) expect(result.reason).toMatch(/document code/);
+
+    const flagged = resolveRequirementRow(
+      { ruleId: validId, groupLabel: "Authorisation Letter", requirement: "REQUIRED", needsCatalogueMapping: "TRUE" },
+      2,
+    );
+    expect(flagged.ok).toBe(true);
+    if (flagged.ok) {
+      expect(flagged.group.docTypeCodes).toEqual([]);
+      expect(flagged.group.needsCatalogueMapping).toBe(true);
+    }
+  });
+
+  it("round-trips Needs Catalogue Mapping and Unmatched Document Names", () => {
+    const result = resolveRequirementRow(
+      {
+        ruleId: validId,
+        groupLabel: "Authorisation Letter",
+        requirement: "REQUIRED",
+        needsCatalogueMapping: "TRUE",
+        unmatchedDocumentNames: "Authorisation Letter, Sponsor Note",
+      },
+      2,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.group.needsCatalogueMapping).toBe(true);
+      expect(result.group.unmatchedDocumentNames).toEqual(["Authorisation Letter", "Sponsor Note"]);
+    }
+
+    const serialized = serializeRequirementRow(validId, {
+      key: result.ok ? result.group.key : "",
+      label: "Authorisation Letter",
+      requirement: "REQUIRED",
+      docTypeCodes: [],
+      needsCatalogueMapping: true,
+      unmatchedDocumentNames: ["Authorisation Letter", "Sponsor Note"],
+    });
+    expect(serialized).toContain("TRUE");
+    expect(serialized).toContain("Authorisation Letter, Sponsor Note");
+  });
+
+  it("does not flag needsCatalogueMapping when the cell is blank and real document codes are present", () => {
+    const result = resolveRequirementRow(
+      { ruleId: validId, groupLabel: "Passport", requirement: "REQUIRED", documentCodes: "PASSPORT_ORIGINAL" },
+      2,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.group.needsCatalogueMapping).toBeUndefined();
   });
 
   it("auto-generates a group key from the label when blank", () => {

@@ -90,6 +90,19 @@ export interface VisaDocumentRequirementGroup {
   specification?: string;
   templateCode?: string; // optional ref VisaTemplate.code
   legacyConditionNote?: string; // free text carried over where `condition` couldn't be structured into appliesWhen
+  // True only for a group whose source checklist listed it but NONE of its
+  // documents matched a real VisaDocumentType at extraction time. Imported
+  // anyway (2026-08-03 — previously silently dropped entirely, see
+  // migrations/2026-08-03-recover-dropped-requirement-groups.ts's own
+  // header for why that was worse than importing it flagged) so ops can see
+  // there's a real requirement here rather than a missing row — docTypeCodes
+  // stays empty until ops maps it into the catalogue and clears this.
+  needsCatalogueMapping?: boolean;
+  // The original, verbatim source-document names that failed to match —
+  // only ever set alongside needsCatalogueMapping — so ops doesn't have to
+  // re-open the source checklist PDF to see what this group actually asked
+  // for.
+  unmatchedDocumentNames?: string[];
 }
 
 // A rule-scoped reference into the shared VisaQuestion bank (models/
@@ -248,6 +261,8 @@ const VisaDocumentRequirementGroupSchema = new Schema<VisaDocumentRequirementGro
     specification: { type: String, trim: true },
     templateCode: { type: String, trim: true, uppercase: true },
     legacyConditionNote: { type: String, trim: true },
+    needsCatalogueMapping: { type: Boolean, default: false },
+    unmatchedDocumentNames: { type: [String], default: undefined },
   },
   { _id: false },
 );

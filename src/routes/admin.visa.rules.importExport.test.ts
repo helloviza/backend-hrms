@@ -352,6 +352,50 @@ describe("round trip is lossless", () => {
     expect(previewRes.body.hasRequirementsSheet).toBe(false);
     expect(previewRes.body.changedCount).toBe(0);
   });
+
+  it("export -> reimport unchanged (XLSX) with a needsCatalogueMapping group -> the flag and unmatched names survive, zero changes", async () => {
+    const rule = fullRule({
+      documentGroups: [
+        {
+          key: "AUTHORISATION_LETTER",
+          label: "Authorisation letter",
+          requirement: "REQUIRED",
+          docTypeCodes: [],
+          needsCatalogueMapping: true,
+          unmatchedDocumentNames: ["Authorisation Letter"],
+        },
+      ],
+    });
+
+    const exportRes = await request(makeApp()).get("/rules/export?format=xlsx").buffer(true).parse((r, cb) => {
+      const chunks: Buffer[] = [];
+      r.on("data", (c: Buffer) => chunks.push(c));
+      r.on("end", () => cb(null, Buffer.concat(chunks)));
+    });
+
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(exportRes.body);
+    const sheet = workbook.getWorksheet("REQUIREMENTS")!;
+    expect(sheet.getRow(1).getCell(10).value).toBe("Needs Catalogue Mapping");
+    expect(sheet.getRow(1).getCell(11).value).toBe("Unmatched Document Names");
+    expect(sheet.getRow(2).getCell(10).value).toBe("TRUE");
+    expect(sheet.getRow(2).getCell(11).value).toBe("Authorisation Letter");
+
+    const previewRes = await request(makeApp())
+      .post("/rules/import/preview")
+      .attach("file", exportRes.body, "visa-rules.xlsx");
+    expect(previewRes.status).toBe(200);
+    expect(previewRes.body.changedCount).toBe(0);
+    expect(previewRes.body.invalidRequirementRows).toEqual([]);
+
+    const commitRes = await request(makeApp()).post("/rules/import/commit").attach("file", exportRes.body, "visa-rules.xlsx");
+    expect(commitRes.status).toBe(200);
+    expect(commitRes.body.changedCount).toBe(0);
+    const stored = _rules.query({ _id: rule._id })[0];
+    expect(stored.documentGroups).toHaveLength(1);
+    expect(stored.documentGroups[0].needsCatalogueMapping).toBe(true);
+    expect(stored.documentGroups[0].unmatchedDocumentNames).toEqual(["Authorisation Letter"]);
+  });
 });
 
 describe("editing through the import", () => {
@@ -427,7 +471,7 @@ describe("editing through the import", () => {
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.load(exportRes.body);
     const reqSheet = workbook.getWorksheet("REQUIREMENTS")!;
-    reqSheet.addRow([fakeId, "SOME_KEY", "Some group", "REQUIRED", "", "PASSPORT_ORIGINAL", "", "", ""]);
+    reqSheet.addRow([fakeId, "SOME_KEY", "Some group", "REQUIRED", "", "PASSPORT_ORIGINAL", "", "", "", "", ""]);
     const editedBuffer = Buffer.from(await workbook.xlsx.writeBuffer());
 
     const res = await request(makeApp()).post("/rules/import/preview").attach("file", editedBuffer, "edited.xlsx");

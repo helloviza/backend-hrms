@@ -439,6 +439,33 @@ describe("GET /rules — filtering", () => {
     expect((await request(app).get("/rules?purpose=NOT_REAL")).status).toBe(400);
     expect((await request(app).get("/rules?status=NOT_REAL")).status).toBe(400);
   });
+
+  it("includes documentGroups, flags included, on both the list and detail routes", async () => {
+    const rule = ruleDoc({
+      documentGroups: [
+        { key: "PASSPORT", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["PASSPORT_ORIGINAL"] },
+        {
+          key: "AUTHORISATION_LETTER",
+          label: "Authorisation letter",
+          requirement: "REQUIRED",
+          docTypeCodes: [],
+          needsCatalogueMapping: true,
+          unmatchedDocumentNames: ["Authorisation Letter"],
+        },
+      ],
+    });
+    const app = makeApp();
+
+    const list = await request(app).get("/rules");
+    const listed = list.body.rules.find((r: any) => r.id === String(rule._id));
+    expect(listed.documentGroups).toHaveLength(2);
+    expect(listed.documentGroups[1].needsCatalogueMapping).toBe(true);
+    expect(listed.documentGroups[1].unmatchedDocumentNames).toEqual(["Authorisation Letter"]);
+
+    const detail = await request(app).get(`/rules/${rule._id}`);
+    expect(detail.body.rule.documentGroups).toHaveLength(2);
+    expect(detail.body.rule.documentGroups[1].needsCatalogueMapping).toBe(true);
+  });
 });
 
 describe("POST /rules — create", () => {

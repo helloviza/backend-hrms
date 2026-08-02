@@ -126,11 +126,38 @@ export function docCodesIn(raw: string): DocCodesResult {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  if (parts.length === 0) return { error: "at least one document code is required" };
+  // Blank is no longer an error here on its own — a group flagged Needs
+  // Catalogue Mapping legitimately has none yet (2026-08-03). The
+  // "at least one, unless flagged" rule lives in resolveRequirementRow,
+  // which is the one place that knows about the flag.
+  if (parts.length === 0) return { value: [] };
   for (const c of parts) {
     if (!DOC_TYPE_CODE_SET.has(c)) return { error: `"${c}" is not a known document type code` };
   }
   return { value: parts };
+}
+
+/** Blank/"FALSE"/anything else -> false; "TRUE"/"YES"/"Y"/"1" (any case) -> true. */
+export function boolIn(raw: string): boolean {
+  const s = (raw ?? "").trim().toLowerCase();
+  return s === "true" || s === "yes" || s === "y" || s === "1";
+}
+
+export function boolOut(v: boolean | null | undefined): string {
+  return v ? "TRUE" : "";
+}
+
+/** Blank cell -> absent (no names recorded). Non-blank -> a trimmed, comma-split list, order preserved. */
+export function namesIn(raw: string): string[] | undefined {
+  const parts = (raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return parts.length === 0 ? undefined : parts;
+}
+
+export function namesOut(names: string[] | null | undefined): string {
+  return (names || []).join(", ");
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -310,6 +337,8 @@ export const REQUIREMENTS_COLUMNS = [
   "Specification",
   "Template Code",
   "Legacy Condition Note",
+  "Needs Catalogue Mapping",
+  "Unmatched Document Names",
 ] as const;
 
 export const REQUIREMENTS_HEADER_FIELD_MAP: Record<string, string> = {
@@ -322,6 +351,8 @@ export const REQUIREMENTS_HEADER_FIELD_MAP: Record<string, string> = {
   specification: "specification",
   templatecode: "templateCode",
   legacyconditionnote: "legacyConditionNote",
+  needscataloguemapping: "needsCatalogueMapping",
+  unmatcheddocumentnames: "unmatchedDocumentNames",
 };
 
 export function serializeRequirementRow(ruleId: string, g: any): (string | number)[] {
@@ -335,6 +366,8 @@ export function serializeRequirementRow(ruleId: string, g: any): (string | numbe
     stringOut(g.specification),
     stringOut(g.templateCode),
     stringOut(g.legacyConditionNote),
+    boolOut(g.needsCatalogueMapping),
+    namesOut(g.unmatchedDocumentNames),
   ];
 }
 
@@ -347,6 +380,8 @@ export interface ResolvedRequirementGroup {
   specification?: string;
   templateCode?: string;
   legacyConditionNote?: string;
+  needsCatalogueMapping?: boolean;
+  unmatchedDocumentNames?: string[];
 }
 
 export function resolveRequirementRow(
@@ -371,6 +406,14 @@ export function resolveRequirementRow(
   const docCodes = docCodesIn(mapped.documentCodes);
   if (docCodes.error) return { ok: false, reason: docCodes.error };
 
+  // A blank Document Codes cell is only valid when this row is explicitly
+  // flagged Needs Catalogue Mapping (2026-08-03) — otherwise it's the same
+  // "forgot to fill this in" error this column has always guarded against.
+  const needsCatalogueMapping = boolIn(mapped.needsCatalogueMapping);
+  if ((docCodes.value?.length ?? 0) === 0 && !needsCatalogueMapping) {
+    return { ok: false, reason: "at least one document code is required (or set Needs Catalogue Mapping to TRUE for a requirement with none mapped yet)" };
+  }
+
   const keyRaw = stringIn(mapped.groupKey);
   const key = keyRaw ? keyRaw.toUpperCase() : slugifyChecklistLabel(label);
 
@@ -387,6 +430,9 @@ export function resolveRequirementRow(
   if (templateCode !== undefined) group.templateCode = templateCode.toUpperCase();
   const legacyConditionNote = stringIn(mapped.legacyConditionNote);
   if (legacyConditionNote !== undefined) group.legacyConditionNote = legacyConditionNote;
+  if (needsCatalogueMapping) group.needsCatalogueMapping = true;
+  const unmatchedDocumentNames = namesIn(mapped.unmatchedDocumentNames);
+  if (unmatchedDocumentNames !== undefined) group.unmatchedDocumentNames = unmatchedDocumentNames;
 
   return { ok: true, ruleId, group };
 }

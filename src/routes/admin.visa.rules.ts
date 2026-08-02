@@ -279,6 +279,14 @@ export function mapRuleSummary(r: any) {
     appointmentRequired: r.appointmentRequired,
     biometricsRequired: r.biometricsRequired,
     documentRequirements: r.documentRequirements || [],
+    // Phase 10a group-based checklist structure (models/VisaRule.ts) — read
+    // here for the first time (2026-08-03); previously this route never
+    // returned it at all, so the admin console had no way to see a
+    // checklist-imported rule's requirements, including one flagged
+    // needsCatalogueMapping. Read-only here — documentGroups is edited via
+    // the bulk REQUIREMENTS-sheet import (routes/admin.visa.rules.
+    // importExport.ts), not this per-rule route.
+    documentGroups: r.documentGroups || [],
     embassyFeeInr: r.embassyFeeInr ?? null,
     vfsFeeInr: r.vfsFeeInr ?? null,
     plumtripsServiceFeeInr: r.plumtripsServiceFeeInr ?? null,

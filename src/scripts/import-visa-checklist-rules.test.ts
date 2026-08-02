@@ -138,14 +138,21 @@ describe("buildRuleCandidate", () => {
     }
   });
 
-  it("drops a group with ZERO matched documents entirely — never imports a vacuously-satisfied requirement", () => {
+  it("imports a group with ZERO matched documents anyway, flagged needsCatalogueMapping with the original document names preserved", () => {
     const file = laosFile();
     file.checklists[0].visaCategory = "E_VISA" as any;
     const result = buildRuleCandidate(file, file.checklists[0]);
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.candidate.documentGroups).toHaveLength(1);
-      expect(result.candidate.documentGroups[0].key).toBe("PHOTOGRAPH");
+      expect(result.candidate.documentGroups).toHaveLength(2);
+      const matched = result.candidate.documentGroups.find((g) => g.key === "PHOTOGRAPH")!;
+      expect(matched.needsCatalogueMapping).toBeUndefined();
+      expect(matched.unmatchedDocumentNames).toBeUndefined();
+
+      const unmapped = result.candidate.documentGroups.find((g) => g.key === "PASSPORT_FRONT_PAGE")!;
+      expect(unmapped.docTypeCodes).toEqual([]);
+      expect(unmapped.needsCatalogueMapping).toBe(true);
+      expect(unmapped.unmatchedDocumentNames).toEqual(["Passport Front Page"]);
       expect(result.droppedDocumentCount).toBe(1); // the unmatched Passport Front Page document
     }
   });
