@@ -224,6 +224,35 @@ describe("resolveRequirementRow", () => {
     expect(serialized).toContain("Authorisation Letter, Sponsor Note");
   });
 
+  it("round-trips Unmatched Template Reference (F5)", () => {
+    const result = resolveRequirementRow(
+      {
+        ruleId: validId,
+        groupLabel: "Cover Letter",
+        requirement: "REQUIRED",
+        documentCodes: "COVER_LETTER",
+        needsCatalogueMapping: "TRUE",
+        unmatchedTemplateReference: "Cover Letter Template",
+      },
+      2,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.group.unmatchedTemplateReference).toBe("Cover Letter Template");
+      expect(result.group.docTypeCodes).toEqual(["COVER_LETTER"]); // documents are fine — this is a template-only gap
+    }
+
+    const serialized = serializeRequirementRow(validId, {
+      key: result.ok ? result.group.key : "",
+      label: "Cover Letter",
+      requirement: "REQUIRED",
+      docTypeCodes: ["COVER_LETTER"],
+      needsCatalogueMapping: true,
+      unmatchedTemplateReference: "Cover Letter Template",
+    });
+    expect(serialized).toContain("Cover Letter Template");
+  });
+
   it("does not flag needsCatalogueMapping when the cell is blank and real document codes are present", () => {
     const result = resolveRequirementRow(
       { ruleId: validId, groupLabel: "Passport", requirement: "REQUIRED", documentCodes: "PASSPORT_ORIGINAL" },

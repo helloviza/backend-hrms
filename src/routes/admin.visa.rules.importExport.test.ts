@@ -364,6 +364,14 @@ describe("round trip is lossless", () => {
           needsCatalogueMapping: true,
           unmatchedDocumentNames: ["Authorisation Letter"],
         },
+        {
+          key: "COVER_LETTER",
+          label: "Cover letter",
+          requirement: "REQUIRED",
+          docTypeCodes: ["COVER_LETTER"],
+          needsCatalogueMapping: true,
+          unmatchedTemplateReference: "Cover Letter Template",
+        },
       ],
     });
 
@@ -378,8 +386,10 @@ describe("round trip is lossless", () => {
     const sheet = workbook.getWorksheet("REQUIREMENTS")!;
     expect(sheet.getRow(1).getCell(10).value).toBe("Needs Catalogue Mapping");
     expect(sheet.getRow(1).getCell(11).value).toBe("Unmatched Document Names");
+    expect(sheet.getRow(1).getCell(12).value).toBe("Unmatched Template Reference");
     expect(sheet.getRow(2).getCell(10).value).toBe("TRUE");
     expect(sheet.getRow(2).getCell(11).value).toBe("Authorisation Letter");
+    expect(sheet.getRow(3).getCell(12).value).toBe("Cover Letter Template");
 
     const previewRes = await request(makeApp())
       .post("/rules/import/preview")
@@ -392,9 +402,10 @@ describe("round trip is lossless", () => {
     expect(commitRes.status).toBe(200);
     expect(commitRes.body.changedCount).toBe(0);
     const stored = _rules.query({ _id: rule._id })[0];
-    expect(stored.documentGroups).toHaveLength(1);
+    expect(stored.documentGroups).toHaveLength(2);
     expect(stored.documentGroups[0].needsCatalogueMapping).toBe(true);
     expect(stored.documentGroups[0].unmatchedDocumentNames).toEqual(["Authorisation Letter"]);
+    expect(stored.documentGroups[1].unmatchedTemplateReference).toBe("Cover Letter Template");
   });
 });
 
@@ -471,7 +482,7 @@ describe("editing through the import", () => {
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.load(exportRes.body);
     const reqSheet = workbook.getWorksheet("REQUIREMENTS")!;
-    reqSheet.addRow([fakeId, "SOME_KEY", "Some group", "REQUIRED", "", "PASSPORT_ORIGINAL", "", "", "", "", ""]);
+    reqSheet.addRow([fakeId, "SOME_KEY", "Some group", "REQUIRED", "", "PASSPORT_ORIGINAL", "", "", "", "", "", ""]);
     const editedBuffer = Buffer.from(await workbook.xlsx.writeBuffer());
 
     const res = await request(makeApp()).post("/rules/import/preview").attach("file", editedBuffer, "edited.xlsx");

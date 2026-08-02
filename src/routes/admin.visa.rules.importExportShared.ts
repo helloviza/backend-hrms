@@ -339,6 +339,7 @@ export const REQUIREMENTS_COLUMNS = [
   "Legacy Condition Note",
   "Needs Catalogue Mapping",
   "Unmatched Document Names",
+  "Unmatched Template Reference",
 ] as const;
 
 export const REQUIREMENTS_HEADER_FIELD_MAP: Record<string, string> = {
@@ -353,6 +354,7 @@ export const REQUIREMENTS_HEADER_FIELD_MAP: Record<string, string> = {
   legacyconditionnote: "legacyConditionNote",
   needscataloguemapping: "needsCatalogueMapping",
   unmatcheddocumentnames: "unmatchedDocumentNames",
+  unmatchedtemplatereference: "unmatchedTemplateReference",
 };
 
 export function serializeRequirementRow(ruleId: string, g: any): (string | number)[] {
@@ -368,6 +370,7 @@ export function serializeRequirementRow(ruleId: string, g: any): (string | numbe
     stringOut(g.legacyConditionNote),
     boolOut(g.needsCatalogueMapping),
     namesOut(g.unmatchedDocumentNames),
+    stringOut(g.unmatchedTemplateReference),
   ];
 }
 
@@ -382,6 +385,7 @@ export interface ResolvedRequirementGroup {
   legacyConditionNote?: string;
   needsCatalogueMapping?: boolean;
   unmatchedDocumentNames?: string[];
+  unmatchedTemplateReference?: string;
 }
 
 export function resolveRequirementRow(
@@ -433,6 +437,8 @@ export function resolveRequirementRow(
   if (needsCatalogueMapping) group.needsCatalogueMapping = true;
   const unmatchedDocumentNames = namesIn(mapped.unmatchedDocumentNames);
   if (unmatchedDocumentNames !== undefined) group.unmatchedDocumentNames = unmatchedDocumentNames;
+  const unmatchedTemplateReference = stringIn(mapped.unmatchedTemplateReference);
+  if (unmatchedTemplateReference !== undefined) group.unmatchedTemplateReference = unmatchedTemplateReference;
 
   return { ok: true, ruleId, group };
 }
