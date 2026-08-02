@@ -32,6 +32,7 @@
 // it silently. Questions and templates are unaffected — the pilot's
 // unmatched rate there wasn't a string-matching problem the model could
 // meaningfully improve on the same way.
+import { createHash } from "node:crypto";
 import { VISA_DOCUMENT_TYPE_CATALOGUE, type VisaDocumentTypeSeed } from "../config/visaDocumentTypeCatalogue.js";
 import { VISA_QUESTION_BANK_SEED, type VisaQuestionSeed } from "../config/visaQuestionBankSeed.js";
 import type { VisaApplicantPredicate } from "../models/visaAttributes.js";
@@ -356,7 +357,28 @@ export function structureChecklistCondition(conditionText: string | null | undef
  * Group-key slugging — stable, deterministic, derived from the label the
  * PDF actually printed (never invented) so re-extracting the same PDF
  * produces the same key (idempotency for the import step downstream).
+ *
+ * 2026-08-03 (audit finding F3) — plainly truncating to 64 chars could
+ * silently collapse two DISTINCT labels that only differ after char 64
+ * onto the IDENTICAL key, merging two unrelated requirements under one
+ * slot. Checked against all 28 extractions: no collision has actually
+ * happened (65 labels/prompts exceed 64 normalized chars — mostly South
+ * Africa's own long-form group labels and a handful of long UK/Canada/US
+ * question prompts — but none share their first 64 characters with
+ * another entry in the same scope). Fixed anyway, structurally, rather
+ * than leaving it to chance: a label over the limit gets a short
+ * deterministic hash of its FULL (untruncated) text appended, so two
+ * different labels can never produce the same key regardless of where
+ * they first diverge — no need to track "which keys are already used"
+ * anywhere this function is called. A label at or under 64 chars — the
+ * overwhelming majority — is completely unaffected, byte-for-byte the
+ * same output as before.
  * ───────────────────────────────────────────────────────────────────── */
 export function slugifyChecklistLabel(label: string): string {
-  return normalizeChecklistText(label).replace(/\s+/g, "_").toUpperCase().slice(0, 64) || "REQUIREMENT";
+  const normalized = normalizeChecklistText(label).replace(/\s+/g, "_").toUpperCase();
+  if (!normalized) return "REQUIREMENT";
+  if (normalized.length <= 64) return normalized;
+
+  const hash = createHash("sha1").update(normalized).digest("hex").slice(0, 8).toUpperCase();
+  return `${normalized.slice(0, 55)}_${hash}`;
 }

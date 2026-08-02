@@ -4,7 +4,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 
-const { ruleStore } = vi.hoisted(() => {
+const { ruleStore, auditStore, userStore } = vi.hoisted(() => {
   type Doc = Record<string, any>;
   function makeCollection() {
     const store = new Map<string, Doc>();
@@ -27,7 +27,7 @@ const { ruleStore } = vi.hoisted(() => {
       },
     };
   }
-  return { ruleStore: makeCollection() };
+  return { ruleStore: makeCollection(), auditStore: makeCollection(), userStore: makeCollection() };
 });
 
 function chainableLeanOne(getResult: () => any) {
@@ -48,11 +48,36 @@ vi.mock("../models/VisaRule.js", () => ({
   VISA_CATEGORIES: ["STICKER", "STAMP", "E_VISA", "VOA", "VISA_FREE"],
 }));
 
-import { buildRuleCandidate, importVisaChecklistRules, mergeSharedBaseChecklists, SEED_SOURCE } from "./import-visa-checklist-rules.js";
+vi.mock("../models/VisaRuleAudit.js", () => ({
+  default: {
+    create: async (doc: any) => auditStore.insert(doc),
+  },
+}));
+
+vi.mock("../models/User.js", () => ({
+  default: {
+    findOne: (filter: any) => ({
+      select: () => chainableLeanOne(() => userStore.findOneRaw(filter)),
+    }),
+    create: async (doc: any) => userStore.insert(doc),
+  },
+}));
+
+import {
+  buildRuleCandidate,
+  importVisaChecklistRules,
+  mergeSharedBaseChecklists,
+  resolveSystemImportActorId,
+  SEED_SOURCE,
+} from "./import-visa-checklist-rules.js";
 import type { ExtractedVisaChecklistFile } from "./extract-visa-checklists.js";
+
+const TEST_ACTOR_ID = new mongoose.Types.ObjectId().toString();
 
 beforeEach(() => {
   ruleStore.clear();
+  auditStore.clear();
+  userStore.clear();
 });
 
 function laosFile(overrides: Partial<ExtractedVisaChecklistFile> = {}): ExtractedVisaChecklistFile {
@@ -154,6 +179,35 @@ describe("buildRuleCandidate", () => {
       expect(unmapped.needsCatalogueMapping).toBe(true);
       expect(unmapped.unmatchedDocumentNames).toEqual(["Passport Front Page"]);
       expect(result.droppedDocumentCount).toBe(1); // the unmatched Passport Front Page document
+    }
+  });
+
+  it("flags an unresolved templateReference (F5) — group otherwise fully matched, template text preserved", () => {
+    const file = laosFile();
+    file.checklists[0].visaCategory = "E_VISA" as any;
+    file.checklists[0].requirementGroups[0].templateReference = "Cover Letter Template";
+    const result = buildRuleCandidate(file, file.checklists[0]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const group = result.candidate.documentGroups.find((g) => g.key === "PHOTOGRAPH")!;
+      expect(group.docTypeCodes).toEqual(["PHOTOGRAPH"]); // documents are fine — this is a template-only gap
+      expect(group.templateCode).toBeUndefined();
+      expect(group.needsCatalogueMapping).toBe(true);
+      expect(group.unmatchedTemplateReference).toBe("Cover Letter Template");
+    }
+  });
+
+  it("does not flag a templateReference that already resolved to matchedTemplateCode", () => {
+    const file = laosFile();
+    file.checklists[0].visaCategory = "E_VISA" as any;
+    file.checklists[0].requirementGroups[0].templateReference = "Cover Letter Template";
+    file.checklists[0].requirementGroups[0].matchedTemplateCode = "COVER_LETTER_TEMPLATE";
+    const result = buildRuleCandidate(file, file.checklists[0]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const group = result.candidate.documentGroups.find((g) => g.key === "PHOTOGRAPH")!;
+      expect(group.templateCode).toBe("COVER_LETTER_TEMPLATE");
+      expect(group.unmatchedTemplateReference).toBeUndefined();
     }
   });
 
@@ -295,7 +349,7 @@ describe("importVisaChecklistRules", () => {
   });
 
   it("apply creates a DRAFT rule, never PUBLISHED", async () => {
-    const summary = await importVisaChecklistRules([readyFile()], false);
+    const summary = await importVisaChecklistRules([readyFile()], false, TEST_ACTOR_ID);
     expect(summary.toCreate).toBe(1);
     expect(ruleStore.store.size).toBe(1);
     const created = [...ruleStore.store.values()][0];
@@ -306,25 +360,25 @@ describe("importVisaChecklistRules", () => {
   });
 
   it("is idempotent — a second apply run over the same data reports unchanged, not a duplicate create", async () => {
-    await importVisaChecklistRules([readyFile()], false);
-    const second = await importVisaChecklistRules([readyFile()], false);
+    await importVisaChecklistRules([readyFile()], false, TEST_ACTOR_ID);
+    const second = await importVisaChecklistRules([readyFile()], false, TEST_ACTOR_ID);
     expect(second).toMatchObject({ toCreate: 0, toUpdate: 0, unchanged: 1 });
     expect(ruleStore.store.size).toBe(1);
   });
 
   it("skips (never overwrites) a rule that has since been promoted to PUBLISHED", async () => {
-    await importVisaChecklistRules([readyFile()], false);
+    await importVisaChecklistRules([readyFile()], false, TEST_ACTOR_ID);
     const rec = [...ruleStore.store.values()][0];
     rec.status = "PUBLISHED";
     rec.documentGroups = [{ key: "MANUALLY_EDITED", label: "Manually edited by ops", requirement: "REQUIRED", docTypeCodes: ["PHOTOGRAPH"] }];
 
-    const summary = await importVisaChecklistRules([readyFile()], false);
+    const summary = await importVisaChecklistRules([readyFile()], false, TEST_ACTOR_ID);
     expect(summary.skippedNotDraft).toHaveLength(1);
     expect(rec.documentGroups[0].key).toBe("MANUALLY_EDITED"); // untouched
   });
 
   it("creates a DRAFT rule with visaCategory left unset when the PDF never states it", async () => {
-    const summary = await importVisaChecklistRules([laosFile()], false);
+    const summary = await importVisaChecklistRules([laosFile()], false, TEST_ACTOR_ID);
     expect(summary.toCreate).toBe(1);
     expect(summary.skipped).toHaveLength(0);
     const created = [...ruleStore.store.values()][0];
@@ -333,11 +387,11 @@ describe("importVisaChecklistRules", () => {
   });
 
   it("never clears an ops-set visaCategory on re-run just because the extraction still doesn't know it", async () => {
-    await importVisaChecklistRules([laosFile()], false);
+    await importVisaChecklistRules([laosFile()], false, TEST_ACTOR_ID);
     const rec = [...ruleStore.store.values()][0];
     rec.visaCategory = "E_VISA"; // ops set this via the fee/rule UI after the first import
 
-    const summary = await importVisaChecklistRules([laosFile()], false);
+    const summary = await importVisaChecklistRules([laosFile()], false, TEST_ACTOR_ID);
     expect(summary.unchanged).toBe(1);
     expect(rec.visaCategory).toBe("E_VISA"); // untouched
   });
@@ -362,6 +416,75 @@ describe("importVisaChecklistRules", () => {
     expect(summary.perCountry.LA).toMatchObject({ toCreate: 1, toUpdate: 0, unchanged: 0, skippedNotDraft: 0 });
     expect(summary.duplicateKeyCollisions).toHaveLength(0);
     expect(summary.merges).toHaveLength(0);
+  });
+
+  describe("F8/F9 (2026-08-03) — change detection derived from the write set, one audit entry per create/update", () => {
+    it("writes an IMPORT audit entry on create, every written field logged from: null", async () => {
+      await importVisaChecklistRules([readyFile()], false, TEST_ACTOR_ID);
+      expect(auditStore.store.size).toBe(1);
+      const audit = [...auditStore.store.values()][0];
+      expect(audit.action).toBe("IMPORT");
+      expect(audit.performedByUserId).toBe(TEST_ACTOR_ID);
+      const byField = Object.fromEntries(audit.changes.map((c: any) => [c.field, c]));
+      expect(byField.status).toEqual({ field: "status", from: null, to: "DRAFT" });
+      expect(byField.seedSource).toEqual({ field: "seedSource", from: null, to: SEED_SOURCE });
+    });
+
+    it("writes no audit entry when a re-run reports unchanged", async () => {
+      await importVisaChecklistRules([readyFile()], false, TEST_ACTOR_ID);
+      await importVisaChecklistRules([readyFile()], false, TEST_ACTOR_ID);
+      expect(auditStore.store.size).toBe(1); // only the original create, no second entry
+    });
+
+    it("writes no audit entry on a dry run, even when it would create", async () => {
+      await importVisaChecklistRules([readyFile()], true);
+      expect(auditStore.store.size).toBe(0);
+    });
+
+    it("detects and logs a change to opsNotes, variantLabel, or applicability on re-import — the exact drift F8 found (these were silently never compared before)", async () => {
+      const file = readyFile();
+      file.checklists[0].opsNotes = "Mapped to BUSINESS purely for lack of a closer fit — official/diplomatic travel.";
+      await importVisaChecklistRules([file], false, TEST_ACTOR_ID);
+      expect(auditStore.store.size).toBe(1);
+
+      const changedFile = readyFile();
+      changedFile.checklists[0].opsNotes = "Updated note: reclassified after a second review.";
+      const summary = await importVisaChecklistRules([changedFile], false, TEST_ACTOR_ID);
+      expect(summary.toUpdate).toBe(1);
+      expect(summary.unchanged).toBe(0);
+      expect(auditStore.store.size).toBe(2);
+      const secondAudit = [...auditStore.store.values()][1];
+      const byField = Object.fromEntries(secondAudit.changes.map((c: any) => [c.field, c]));
+      expect(byField.opsNotes).toEqual({
+        field: "opsNotes",
+        from: "Mapped to BUSINESS purely for lack of a closer fit — official/diplomatic travel.",
+        to: "Updated note: reclassified after a second review.",
+      });
+    });
+
+    it("a genuinely no-op re-import (identical opsNotes) still reports unchanged and writes no second audit entry", async () => {
+      const file = readyFile();
+      file.checklists[0].opsNotes = "Same note both times.";
+      await importVisaChecklistRules([file], false, TEST_ACTOR_ID);
+      const summary = await importVisaChecklistRules([file], false, TEST_ACTOR_ID);
+      expect(summary.unchanged).toBe(1);
+      expect(auditStore.store.size).toBe(1);
+    });
+  });
+});
+
+describe("resolveSystemImportActorId", () => {
+  it("creates the System Import user once, idempotently, and reuses it on subsequent calls", async () => {
+    const first = await resolveSystemImportActorId();
+    expect(userStore.store.size).toBe(1);
+    const created = [...userStore.store.values()][0];
+    expect(created.email).toBe("system-import@plumtrips.com");
+    expect(created.roles).toEqual(["SYSTEM_IMPORT"]);
+    expect(created.passwordHash).toBeTruthy();
+
+    const second = await resolveSystemImportActorId();
+    expect(String(second)).toBe(String(first));
+    expect(userStore.store.size).toBe(1); // never created twice
   });
 });
 

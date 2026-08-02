@@ -158,6 +158,24 @@ describe("slugifyChecklistLabel", () => {
   it("never returns an empty key", () => {
     expect(slugifyChecklistLabel("")).toBe("REQUIREMENT");
   });
+
+  it("leaves a label at or under 64 normalized chars completely unaffected", () => {
+    const exactly64 = "a".repeat(64);
+    expect(slugifyChecklistLabel(exactly64)).toBe("A".repeat(64));
+  });
+
+  it("stays within 64 chars and stays deterministic for a label over the limit", () => {
+    const longLabel = "a".repeat(100);
+    const key = slugifyChecklistLabel(longLabel);
+    expect(key.length).toBeLessThanOrEqual(64);
+    expect(key).toBe(slugifyChecklistLabel(longLabel));
+  });
+
+  it("two distinct labels that only diverge after char 64 never collapse onto the same key", () => {
+    const a = "a".repeat(70) + " variant one";
+    const b = "a".repeat(70) + " variant two";
+    expect(slugifyChecklistLabel(a)).not.toBe(slugifyChecklistLabel(b));
+  });
 });
 
 describe("resolveDocumentTypeMapping — LLM primary, string matcher as cross-check", () => {

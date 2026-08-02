@@ -57,7 +57,10 @@
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
+import crypto from "node:crypto";
 import mongoose from "mongoose";
+import bcrypt from "bcryptjs";
 import { env } from "../config/env.js";
 import VisaRule, {
   VISA_CATEGORIES,
@@ -66,6 +69,8 @@ import VisaRule, {
   type VisaRuleQuestionRef,
   type VisaRuleInlineQuestion,
 } from "../models/VisaRule.js";
+import VisaRuleAudit, { type VisaRuleFieldChange } from "../models/VisaRuleAudit.js";
+import User from "../models/User.js";
 import { getCountryByIso2 } from "../utils/countryCodes.js";
 import { slugifyChecklistLabel } from "../utils/visaChecklistCatalogueMatcher.js";
 import type { ExtractedVisaChecklistFile } from "./extract-visa-checklists.js";
@@ -231,7 +236,7 @@ export interface SkippedChecklist {
  * one implementation, so none of these can ever drift on what a
  * "recovered" group looks like versus a freshly-imported one.
  *
- * 2026-08-03 — two silent-drop bugs, same root cause, fixed together:
+ * 2026-08-03 — three silent-drop bugs, same root cause, fixed together:
  *   1. A group with NOTHING matched used to be skipped entirely
  *      ("vacuously satisfied" looked worse than missing) — six were only
  *      discovered by accident, via the template-relink migration's own
@@ -245,6 +250,20 @@ export interface SkippedChecklist {
  *      there's at least one, whether the group is wholly or partially
  *      unmapped — `docTypeCodes.length` distinguishes the two cases for
  *      anything that needs to (the console, the export).
+ *   3. (audit finding F5) A group's raw templateReference text had no
+ *      schema field to land in at all when it never resolved to a real
+ *      VisaTemplate.code — utils/visaChecklistCatalogueMatcher.ts's
+ *      KNOWN_VISA_TEMPLATES is empty today, so g.matchedTemplateCode is
+ *      always null at extraction time; every templateReference-bearing
+ *      group built HERE is flagged unmatchedTemplateReference. That's
+ *      correct for a brand-new candidate — there's no DB state yet to
+ *      compare against. It is NOT correct to treat as "still unmatched"
+ *      for an EXISTING rule whose group already has templateCode set via
+ *      migrations/2026-08-02-recover-template-references.ts's own
+ *      curated relink (a separate, DB-side resolution step this function
+ *      has no visibility into) — see migrations/2026-08-03-recover-
+ *      unmatched-template-references.ts's own header for how the recovery
+ *      migration reconciles the two instead of trusting this blindly.
  */
 export function buildDocumentGroupFromExtracted(
   g: ExtractedRequirementGroup,
@@ -270,6 +289,10 @@ export function buildDocumentGroupFromExtracted(
   if (unmatchedDocumentNames.length > 0) {
     group.needsCatalogueMapping = true;
     group.unmatchedDocumentNames = unmatchedDocumentNames;
+  }
+  if (g.templateReference && !group.templateCode) {
+    group.needsCatalogueMapping = true;
+    group.unmatchedTemplateReference = g.templateReference;
   }
 
   return { group, droppedDocumentCount };
@@ -408,6 +431,67 @@ export interface ImportSummary {
   perCountry: Record<string, { toCreate: number; toUpdate: number; unchanged: number; skippedNotDraft: number }>;
 }
 
+// 2026-08-03 (audit finding F9) — every route-driven VisaRule edit writes a
+// VisaRuleAudit entry (routes/admin.visa.rules.ts, routes/admin.visa.rules.
+// importExport.ts); this script wrote none at all — a bulk import of dozens
+// of rules left no trail whatsoever on a collection that controls pricing.
+// VisaRuleAudit.performedByUserId is a required ref User, and there is no
+// authenticated req.user for a CLI script to attribute an entry to — so,
+// same precedent as scripts/seed-intake-system-identities.ts's own "System
+// Intake" identity (created for the identical reason: a machine-driven
+// pipeline still needs a real User row to satisfy a required ref
+// elsewhere), this resolves — or creates, once — a dedicated "System
+// Import" user and attributes every import-driven audit entry to it. Not a
+// login-capable account in practice: the password is random and never
+// disclosed anywhere.
+const SYSTEM_IMPORT_EMAIL = "system-import@plumtrips.com";
+// The same internal Plumtrips CustomerWorkspace scripts/seed-intake-system-
+// identities.ts's own System Intake user already attaches to — User.
+// workspaceId is a required ref, and there's nothing checklist-import-
+// specific about which internal workspace a machine identity belongs to,
+// so this reuses that one rather than inventing a second.
+const SYSTEM_IMPORT_WORKSPACE_ID = "69679a7628330a58d29f2254";
+
+export async function resolveSystemImportActorId(): Promise<mongoose.Types.ObjectId> {
+  const existing = await User.findOne({ email: SYSTEM_IMPORT_EMAIL }).select("_id").lean();
+  if (existing) return (existing as any)._id;
+
+  const randomPassword = crypto.randomBytes(32).toString("hex"); // never disclosed; login not a supported path for this identity
+  const passwordHash = await bcrypt.hash(randomPassword, 12);
+  const created = await User.create({
+    email: SYSTEM_IMPORT_EMAIL,
+    officialEmail: SYSTEM_IMPORT_EMAIL,
+    workspaceId: SYSTEM_IMPORT_WORKSPACE_ID,
+    name: "System Import (visa checklist pipeline)",
+    passwordHash,
+    roles: ["SYSTEM_IMPORT"],
+    status: "ACTIVE",
+  });
+  return created._id as mongoose.Types.ObjectId;
+}
+
+// 2026-08-03 (audit finding F8) — the field-by-field comparison used to be
+// a hand-maintained boolean expression that had already drifted from what
+// candidateFields() actually writes: variantLabel, applicability, and
+// opsNotes were computed and would be $set on an update, but were never
+// compared, so an edit to any of them (Turkey's variants, South Africa's
+// OFFICIAL_DIPLOMATIC opsNotes) was silently classified "unchanged" and
+// never written. Deriving the comparison set from Object.keys(after) — the
+// SAME object that gets passed to $set — makes that drift structurally
+// impossible: whatever candidateFields() decides to write IS what gets
+// compared, always, with nothing to keep in sync by hand.
+export function diffCandidateFields(before: Record<string, any>, after: Record<string, any>): VisaRuleFieldChange[] {
+  const changes: VisaRuleFieldChange[] = [];
+  for (const field of Object.keys(after)) {
+    const fromVal = before[field] ?? null;
+    const toVal = after[field] ?? null;
+    if (!isDeepStrictEqual(fromVal, toVal)) {
+      changes.push({ field, from: fromVal, to: toVal });
+    }
+  }
+  return changes;
+}
+
 function candidateKey(c: RuleCandidate) {
   return {
     nationality: c.nationality,
@@ -444,6 +528,10 @@ function candidateFields(c: RuleCandidate): Record<string, any> {
 export async function importVisaChecklistRules(
   files: ExtractedVisaChecklistFile[],
   dryRun: boolean,
+  // Required whenever dryRun is false — a dry run never writes, so it never
+  // needs an actor to attribute a VisaRuleAudit entry to. See
+  // resolveSystemImportActorId() for where main() gets this from.
+  performedByUserId?: mongoose.Types.ObjectId | string,
 ): Promise<ImportSummary> {
   const summary: ImportSummary = {
     checklistsScanned: 0,
@@ -524,12 +612,16 @@ export async function importVisaChecklistRules(
   // Pass 3 — resolve each surviving candidate against the database.
   for (const candidate of toProcess) {
     const existing = await VisaRule.findOne(candidateKey(candidate)).lean();
+    const fields = candidateFields(candidate);
 
     if (!existing) {
       summary.toCreate += 1;
       countryTally(candidate.destinationIso2).toCreate += 1;
       if (!dryRun) {
-        await VisaRule.create({ ...candidateKey(candidate), ...candidateFields(candidate), status: "DRAFT" });
+        const after = { ...candidateKey(candidate), ...fields, status: "DRAFT" };
+        const created = await VisaRule.create(after);
+        const changes = diffCandidateFields({}, after);
+        await VisaRuleAudit.create({ ruleId: created._id, action: "IMPORT", changes, performedByUserId, performedAt: new Date() });
       }
       continue;
     }
@@ -545,21 +637,14 @@ export async function importVisaChecklistRules(
       continue;
     }
 
-    const fields = candidateFields(candidate);
-    const changed =
-      JSON.stringify((existing as any).documentGroups || []) !== JSON.stringify(fields.documentGroups) ||
-      JSON.stringify((existing as any).questions || []) !== JSON.stringify(fields.questions) ||
-      JSON.stringify((existing as any).additionalQuestions || []) !== JSON.stringify(fields.additionalQuestions) ||
-      (existing as any).destinationName !== fields.destinationName ||
-      // Only flags a change when THIS pass actually has an opinion on
-      // visaCategory (fields.visaCategory !== undefined) — never fires
-      // just because the extraction still doesn't know it while ops has
-      // since set one (candidateFields() already excludes it from
-      // `fields` in that case, so this check is the mirror of that).
-      (fields.visaCategory !== undefined && (existing as any).visaCategory !== fields.visaCategory) ||
-      (existing as any).productClass !== fields.productClass;
+    // Derived from the SAME `fields` object that gets $set below — see
+    // diffCandidateFields's own header for why this replaced a hand-listed
+    // boolean expression that had already drifted (F8).
+    const before: Record<string, any> = {};
+    for (const key of Object.keys(fields)) before[key] = (existing as any)[key];
+    const changes = diffCandidateFields(before, fields);
 
-    if (!changed) {
+    if (changes.length === 0) {
       summary.unchanged += 1;
       countryTally(candidate.destinationIso2).unchanged += 1;
       continue;
@@ -569,6 +654,7 @@ export async function importVisaChecklistRules(
     countryTally(candidate.destinationIso2).toUpdate += 1;
     if (!dryRun) {
       await VisaRule.updateOne({ _id: (existing as any)._id }, { $set: fields });
+      await VisaRuleAudit.create({ ruleId: (existing as any)._id, action: "IMPORT", changes, performedByUserId, performedAt: new Date() });
     }
   }
 
@@ -641,7 +727,10 @@ async function main() {
   console.log("Connected to:", env.MONGO_URI?.split("@").pop()?.split("?")[0]);
 
   try {
-    const summary = await importVisaChecklistRules(files, dryRun);
+    // Never resolved/created on a dry run — nothing gets written, so there's
+    // no audit entry to attribute and no reason to touch the User collection.
+    const performedByUserId = dryRun ? undefined : await resolveSystemImportActorId();
+    const summary = await importVisaChecklistRules(files, dryRun, performedByUserId);
     console.log("");
     console.log(
       `checklistsScanned=${summary.checklistsScanned} toCreate=${summary.toCreate} toUpdate=${summary.toUpdate} ` +

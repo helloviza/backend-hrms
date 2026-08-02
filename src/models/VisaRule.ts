@@ -103,6 +103,15 @@ export interface VisaDocumentRequirementGroup {
   // re-open the source checklist PDF to see what this group actually asked
   // for.
   unmatchedDocumentNames?: string[];
+  // The original, verbatim template reference text (e.g. "Cover Letter
+  // Template") when it never resolved to a real VisaTemplate.code —
+  // 2026-08-03 (audit finding F5), same class as unmatchedDocumentNames:
+  // previously this text had no schema field to land in at all when
+  // unmatched, so it was silently lost the moment the extraction JSON was
+  // archived. Set alongside needsCatalogueMapping; cleared (along with the
+  // flag, if nothing else on the group still needs attention) once ops
+  // maps it via templateCode.
+  unmatchedTemplateReference?: string;
 }
 
 // A rule-scoped reference into the shared VisaQuestion bank (models/
@@ -279,6 +288,7 @@ const VisaDocumentRequirementGroupSchema = new Schema<VisaDocumentRequirementGro
     legacyConditionNote: { type: String, trim: true },
     needsCatalogueMapping: { type: Boolean, default: false },
     unmatchedDocumentNames: { type: [String], default: undefined },
+    unmatchedTemplateReference: { type: String, trim: true },
   },
   { _id: false },
 );
