@@ -150,6 +150,26 @@ describe("buildRuleCandidate", () => {
     }
   });
 
+  it("resolves destinationName from countryCodes.ts rather than the source document's own text — same ISO2 must never diverge across files", () => {
+    const file = laosFile({ destinationName: "Lao People's Democratic Republic" }); // whatever this PDF's title said
+    file.checklists[0].visaCategory = "E_VISA" as any;
+    const result = buildRuleCandidate(file, file.checklists[0]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.candidate.destinationName).toBe("Laos"); // countryCodes.ts's own canonical name for LA
+    }
+  });
+
+  it("falls back to the source document's destinationName when countryCodes.ts doesn't recognise the ISO2", () => {
+    const file = laosFile({ destinationIso2: "ZZ", destinationName: "Nowhereland" });
+    file.checklists[0].visaCategory = "E_VISA" as any;
+    const result = buildRuleCandidate(file, file.checklists[0]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.candidate.destinationName).toBe("Nowhereland");
+    }
+  });
+
   it("skips when destinationIso2 is unresolved", () => {
     const file = laosFile({ destinationIso2: null });
     file.checklists[0].visaCategory = "E_VISA" as any;

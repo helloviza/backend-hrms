@@ -65,6 +65,7 @@ import VisaRule, {
   type VisaDocumentRequirementGroup,
   type VisaRuleQuestionRef,
 } from "../models/VisaRule.js";
+import { getCountryByIso2 } from "../utils/countryCodes.js";
 import type { ExtractedVisaChecklistFile } from "./extract-visa-checklists.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -285,10 +286,23 @@ export function buildRuleCandidate(
     .filter((q) => q.matchedQuestionCode)
     .map((q) => ({ questionCode: q.matchedQuestionCode as string }));
 
+  // Resolved from countryCodes.ts's own canonical name for this ISO2 —
+  // NEVER the PDF/Gemini's own destinationName text. Two PDFs for the
+  // same country can (and did — "United States" vs "United States of
+  // America") word their own title differently; destinationName is a
+  // denormalised display copy of what destinationIso2 already identifies,
+  // so it must always agree with the one canonical source, not whatever
+  // this particular source document happened to say. destinationIso2
+  // already resolved successfully above (via normaliseToIso2, same
+  // lookup), so getCountryByIso2 is guaranteed to find it — the fallback
+  // to file.destinationName is unreachable in practice, kept only so a
+  // lookup that somehow fails still produces SOME name rather than none.
+  const destinationName = getCountryByIso2(file.destinationIso2)?.name ?? file.destinationName;
+
   const candidate: RuleCandidate = {
     nationality: file.nationality,
     destinationIso2: file.destinationIso2,
-    destinationName: file.destinationName,
+    destinationName,
     purpose: checklist.purpose,
     entryType: checklist.entryType,
     serviceTier: checklist.serviceTier,
