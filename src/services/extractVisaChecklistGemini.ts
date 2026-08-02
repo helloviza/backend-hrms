@@ -7,15 +7,27 @@
 // utils/geminiRetry.ts transient-retry wrapper, same "retry once more on
 // invalid JSON" fallback. No new dependency.
 //
-// This is the RAW extraction stage only — it transcribes what the PDF
-// literally says (document names, row descriptions, conditions, template
-// references, questionnaire rows) and nothing else. It NEVER maps a
-// document name to a VisaDocumentType code, never structures a condition
-// into an appliesWhen predicate, and never resolves a template reference
-// against VisaTemplate — that is utils/visaChecklistCatalogueMatcher.ts's
-// job, a separate, deterministic (non-LLM) step, exactly so a taxonomy
-// decision ("is this the same document as X, under a different name?")
-// is never made by a model that could be wrong in a way nobody reviews.
+// This is the RAW extraction stage — it transcribes what the PDF literally
+// says (document names, row descriptions, conditions, template
+// references, questionnaire rows) — PLUS, since this follow-up pass (the
+// pilot showed the string matcher alone leaves most real documents
+// unmatched — "Employement contract" (source typo), "NOC from the
+// employer" (word order), "National ID" (means Aadhaar) — none of which a
+// string comparison can bridge), the model's own best guess at which
+// VisaDocumentType catalogue entry each document matches. The FULL
+// catalogue (codes, names, categories, aliases) is included in the prompt
+// below, and documentTypeCode is schema-constrained to that exact code
+// list or null — the model can decline to match, but it can never emit a
+// code that isn't real. documentTypeConfidence/documentTypeReasoning make
+// that judgement call reviewable rather than an opaque decision (task
+// brief §3).
+//
+// This is still NOT the final say: utils/visaChecklistCatalogueMatcher.ts's
+// deterministic string matcher runs independently as a CROSS-CHECK on the
+// same source name — where the two disagree, both are reported, never
+// silently reconciled (task brief §4). This file never structures a
+// condition into an appliesWhen predicate and never resolves a template
+// reference against VisaTemplate — those stay the matcher's job.
 //
 // One PDF can hold several checklists (task brief §2): France/UK/China
 // print separate Tourist and Business tables in one document; Canada
@@ -25,6 +37,7 @@
 // job too, working off `variantLabel`.
 import { GoogleGenAI, Type } from "@google/genai";
 import { withGeminiTransientRetry } from "../utils/geminiRetry.js";
+import { VISA_DOCUMENT_TYPE_CATALOGUE } from "../config/visaDocumentTypeCatalogue.js";
 
 let _ai: GoogleGenAI | null = null;
 
@@ -46,9 +59,26 @@ const DEFAULT_MODEL = "gemini-2.5-flash";
 
 /* ───────────────────────── RAW contract ───────────────────────── */
 
+export const VISA_CHECKLIST_MATCH_CONFIDENCE_LEVELS = ["HIGH", "MEDIUM", "LOW"] as const;
+export type VisaChecklistMatchConfidence = (typeof VISA_CHECKLIST_MATCH_CONFIDENCE_LEVELS)[number];
+
+// The full set of codes the model is allowed to emit — anything else is a
+// schema violation, not just a discouraged answer. Computed once from the
+// same catalogue utils/visaChecklistCatalogueMatcher.ts matches against,
+// so the two can never drift onto different code lists.
+const DOCUMENT_TYPE_CODES = VISA_DOCUMENT_TYPE_CATALOGUE.map((d) => d.code);
+
 export interface RawExtractedDocument {
   name: string;
   description: string | null;
+  // The model's own best match against the VisaDocumentType catalogue
+  // embedded in the prompt below — one of DOCUMENT_TYPE_CODES, or null when
+  // it isn't confident enough that any entry is the same real document.
+  // Schema-constrained (enum + nullable) so a fabricated code is not just
+  // discouraged, it's impossible — see file header.
+  documentTypeCode: string | null;
+  documentTypeConfidence: VisaChecklistMatchConfidence | null; // null iff documentTypeCode is null
+  documentTypeReasoning: string | null; // one line, always filled in — why this code, or why none
 }
 
 export const VISA_CHECKLIST_REQUIREMENT_LEVELS = ["REQUIRED", "CONDITIONAL"] as const;
@@ -87,6 +117,13 @@ const documentSchema = {
   properties: {
     name: { type: Type.STRING },
     description: { type: Type.STRING, nullable: true },
+    // Constrained to the REAL catalogue code list (+ null) — the model
+    // cannot emit anything else, so a "fabricated code" is a schema
+    // violation the SDK itself would reject, not just an instruction it
+    // could ignore (task brief §2).
+    documentTypeCode: { type: Type.STRING, enum: DOCUMENT_TYPE_CODES, nullable: true },
+    documentTypeConfidence: { type: Type.STRING, enum: [...VISA_CHECKLIST_MATCH_CONFIDENCE_LEVELS], nullable: true },
+    documentTypeReasoning: { type: Type.STRING, nullable: true },
   },
   required: ["name"],
 } as const;
@@ -133,11 +170,49 @@ const visaChecklistDocumentSchema = {
   required: ["destinationName", "checklists"],
 } as const;
 
+function buildCatalogueListing(): string {
+  return VISA_DOCUMENT_TYPE_CATALOGUE.map((d) => {
+    const aliasText = d.aliases.length ? ` | also known as: ${d.aliases.join(", ")}` : "";
+    return `- ${d.code} — ${d.name} (${d.category}): ${d.defaultDescription}${aliasText}`;
+  }).join("\n");
+}
+
 const SYSTEM_PROMPT = `
 You are transcribing a country's visa document checklist PDF. Return ONLY
 valid JSON matching the provided response schema. Never invent a value you
 cannot actually see in the document — every string you output must be
 something the PDF actually says, or null if it isn't there.
+
+DOCUMENT TYPE MAPPING — the platform's existing document-type catalogue is
+below. For EVERY document you extract, also decide whether it is the SAME
+real-world document as one of these catalogue entries, even when the
+wording differs:
+- a source typo or word-order difference ("Employement contract" / "NOC
+  from the employer") still counts as the same document as "Employment
+  Contract" / "Employer NOC" if you're confident that's what it means.
+- a locally-known name for the same real thing counts too — e.g. "National
+  ID" on an Indian applicant's checklist means the Aadhaar card, which is
+  the same underlying document concept as a national identity proof, if a
+  catalogue entry for that exists; if it doesn't, say so (null) rather than
+  picking the closest-sounding but substantively different entry.
+- pick documentTypeCode ONLY when you are genuinely confident it is the
+  same document — a related-but-different document (e.g. a bank statement
+  belonging to a SPONSOR vs. the applicant's own) is NOT a match just
+  because both are "a bank statement". When in doubt, use null.
+- documentTypeCode must be one of the codes listed below, or null — never a
+  code you make up, never a code that isn't in this list.
+- documentTypeConfidence: "HIGH" for an unambiguous alias/synonym match or
+  an unmistakable real-world equivalence (e.g. Aadhaar = national ID);
+  "MEDIUM" when you believe it's the same document but the wording leaves
+  some real doubt; "LOW" when you are only guessing. Always null when
+  documentTypeCode is null.
+- documentTypeReasoning: ONE short line explaining your call, ALWAYS
+  filled in — both when you matched something ("alias match" / "Aadhaar is
+  India's national ID") and when you didn't ("no catalogue entry covers a
+  previous/expired passport copy").
+
+Catalogue (code — name (category): description | aliases):
+${buildCatalogueListing()}
 
 STRUCTURE:
 - One PDF can contain SEVERAL distinct checklists — for example a separate

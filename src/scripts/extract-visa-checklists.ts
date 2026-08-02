@@ -36,12 +36,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   extractVisaChecklistViaGemini,
+  type RawExtractedDocument,
   type RawExtractedRequirementGroup,
   type RawExtractedQuestion,
 } from "../services/extractVisaChecklistGemini.js";
 import {
-  matchDocumentType,
-  suggestDocumentTypes,
+  resolveDocumentTypeMapping,
   matchQuestion,
   suggestQuestions,
   matchTemplate,
@@ -91,7 +91,18 @@ function mapPurposeLabel(label: string): VisaPurpose | null {
 interface ExtractedDocumentEntry {
   sourceName: string;
   sourceDescription: string | null;
-  matchedCode: string | null; // VisaDocumentType.code — only when EXACTLY matched
+  // PRIMARY — the model's own catalogue mapping (services/
+  // extractVisaChecklistGemini.ts), schema-constrained to a real
+  // VisaDocumentType.code or null, then re-validated here
+  // (resolveDocumentTypeMapping) before being trusted at all.
+  matchedCode: string | null;
+  matchConfidence: string | null; // "HIGH" | "MEDIUM" | "LOW", null iff matchedCode is null
+  matchReasoning: string | null; // the model's own one-line explanation, kept regardless of outcome
+  // Cross-check only (task brief §4) — the ORIGINAL deterministic exact/
+  // alias string matcher, run independently. Never overrides matchedCode;
+  // a difference is surfaced via matchesAgree, never silently reconciled.
+  stringMatchCode: string | null;
+  matchesAgree: boolean;
   suggestions: CatalogueSuggestion[]; // informational only, never auto-applied
 }
 
@@ -157,13 +168,22 @@ export interface ExtractedVisaChecklistFile {
 /* ─────────────────────────────────────────────────────────────────────
  * Matching pass — RAW extraction in, reviewable entries out.
  * ───────────────────────────────────────────────────────────────────── */
-function resolveDocument(raw: { name: string; description: string | null }): ExtractedDocumentEntry {
-  const matched = matchDocumentType(raw.name);
+function resolveDocument(raw: RawExtractedDocument): ExtractedDocumentEntry {
+  const mapping = resolveDocumentTypeMapping({
+    sourceName: raw.name,
+    llmCode: raw.documentTypeCode,
+    llmConfidence: raw.documentTypeConfidence,
+    llmReasoning: raw.documentTypeReasoning,
+  });
   return {
     sourceName: raw.name,
     sourceDescription: raw.description ?? null,
-    matchedCode: matched?.code ?? null,
-    suggestions: matched ? [] : suggestDocumentTypes(raw.name),
+    matchedCode: mapping.matchedCode,
+    matchConfidence: mapping.confidence,
+    matchReasoning: mapping.reasoning,
+    stringMatchCode: mapping.stringMatchCode,
+    matchesAgree: mapping.matchesAgree,
+    suggestions: mapping.suggestions,
   };
 }
 
@@ -282,19 +302,27 @@ function printFileSummary(file: ExtractedVisaChecklistFile): void {
 
   for (const c of file.checklists) {
     const groupCount = c.requirementGroups.length;
-    const unmatchedDocs = c.requirementGroups.flatMap((g) => g.documents.filter((d) => !d.matchedCode));
+    const allDocs = c.requirementGroups.flatMap((g) => g.documents);
+    const unmatchedDocs = allDocs.filter((d) => !d.matchedCode);
+    const disagreements = allDocs.filter((d) => !d.matchesAgree);
     const unstructuredConditions = c.requirementGroups.filter((g) => g.conditionText && !g.appliesWhen);
     const unmatchedTemplates = c.requirementGroups.filter((g) => g.templateReference && !g.matchedTemplateCode);
     const unmatchedQuestions = c.questions.filter((q) => !q.matchedQuestionCode);
 
     const label = c.variantLabel ? `${c.purposeLabel} [variant: ${c.variantLabel}]` : c.purposeLabel;
     console.log(
-      `  - ${label}: ${groupCount} requirement group(s), ${unmatchedDocs.length} unmatched document(s), ` +
+      `  - ${label}: ${groupCount} requirement group(s), ${allDocs.length} document(s), ` +
+        `${unmatchedDocs.length} unmatched, ${disagreements.length} LLM/string-matcher disagreement(s), ` +
         `${unstructuredConditions.length} unstructured condition(s), ${unmatchedTemplates.length} unmatched template(s), ` +
         `${c.questions.length} question(s) (${unmatchedQuestions.length} unmatched)` +
         (c.purpose ? "" : " — purpose NOT resolved, ops must set it") +
         " — visaCategory not in the PDF, ops must set it before import",
     );
+    for (const d of disagreements) {
+      console.log(
+        `      disagreement: "${d.sourceName}" — LLM: ${d.matchedCode ?? "null"} (${d.matchConfidence ?? "n/a"}), string matcher: ${d.stringMatchCode ?? "null"}`,
+      );
+    }
   }
 }
 
@@ -341,7 +369,16 @@ async function main() {
   console.log(`\n=== Done: ${files.length} PDF(s) -> ${totalRules} draft rule(s) total (nothing written to the database) ===`);
 }
 
-if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
+// Guards against exactly the bug this same phase found in
+// migrations/2026-08-02-visa-checklist-model-v2.ts: a NODE_ENV/VITEST-only
+// guard protects against the test runner but not against another module
+// importing this file for one of its exported functions/types — that
+// import silently ran main() (a real Gemini extraction, here; a DB dry-run
+// there) as a side effect. This checks whether THIS file is the actual
+// process entry point instead — true only when run directly (tsx/node),
+// never true for an import, regardless of NODE_ENV/VITEST.
+const isDirectRun = !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirectRun) {
   main().catch((err) => {
     console.error("Extraction failed:", err);
     process.exit(1);

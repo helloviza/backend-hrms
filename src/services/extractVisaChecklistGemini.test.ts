@@ -50,7 +50,15 @@ function okResponse(overrides: Record<string, any> = {}) {
               conditionText: null,
               specificationText: "Clear picture of passport front page",
               templateReference: null,
-              documents: [{ name: "Passport Front Page", description: null }],
+              documents: [
+                {
+                  name: "Passport Front Page",
+                  description: null,
+                  documentTypeCode: "PASSPORT_ORIGINAL",
+                  documentTypeConfidence: "MEDIUM",
+                  documentTypeReasoning: "The front page is the bio-data page for most passports",
+                },
+              ],
             },
           ],
           questions: [],
@@ -169,5 +177,52 @@ describe("extractVisaChecklistViaGemini", () => {
 
     expect(result.raw.checklists).toHaveLength(2);
     expect(result.raw.checklists[1].variantLabel).toBe("For USA visa holder");
+  });
+
+  it("carries the model's own catalogue mapping (code/confidence/reasoning) through on each document", async () => {
+    generateContentMock.mockResolvedValueOnce(okResponse());
+
+    const result = await extractVisaChecklistViaGemini({
+      buffer: Buffer.from("fake-pdf"),
+      mimeType: "application/pdf",
+      sourceFile: "Laos-document-checklist.pdf",
+    });
+
+    const doc = result.raw.checklists[0].requirementGroups[0].documents[0];
+    expect(doc.documentTypeCode).toBe("PASSPORT_ORIGINAL");
+    expect(doc.documentTypeConfidence).toBe("MEDIUM");
+    expect(doc.documentTypeReasoning).toMatch(/bio-data page/);
+  });
+
+  it("constrains documentTypeCode's schema enum to the real catalogue's codes — never an open string", async () => {
+    generateContentMock.mockResolvedValueOnce(okResponse());
+
+    await extractVisaChecklistViaGemini({
+      buffer: Buffer.from("fake-pdf"),
+      mimeType: "application/pdf",
+      sourceFile: "Laos-document-checklist.pdf",
+    });
+
+    const callArgs = generateContentMock.mock.calls[0][0];
+    const documentSchema = callArgs.config.responseSchema.properties.checklists.items.properties.requirementGroups.items
+      .properties.documents.items;
+    expect(documentSchema.properties.documentTypeCode.enum).toEqual(
+      expect.arrayContaining(["PASSPORT_ORIGINAL", "PHOTOGRAPH", "EMPLOYER_NOC"]),
+    );
+    expect(documentSchema.properties.documentTypeCode.nullable).toBe(true);
+  });
+
+  it("embeds the full catalogue (codes, names, aliases) in the system prompt", async () => {
+    generateContentMock.mockResolvedValueOnce(okResponse());
+
+    await extractVisaChecklistViaGemini({
+      buffer: Buffer.from("fake-pdf"),
+      mimeType: "application/pdf",
+      sourceFile: "Laos-document-checklist.pdf",
+    });
+
+    const systemInstruction = generateContentMock.mock.calls[0][0].config.systemInstruction;
+    expect(systemInstruction).toContain("EMPLOYER_NOC");
+    expect(systemInstruction).toContain("Leave Approval Letter"); // an alias, proving aliases are included too
   });
 });

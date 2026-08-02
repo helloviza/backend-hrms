@@ -10,6 +10,7 @@ import {
   matchTemplate,
   structureChecklistCondition,
   slugifyChecklistLabel,
+  resolveDocumentTypeMapping,
 } from "./visaChecklistCatalogueMatcher.js";
 
 describe("matchDocumentType — exact/alias only, never a guess", () => {
@@ -156,5 +157,96 @@ describe("slugifyChecklistLabel", () => {
 
   it("never returns an empty key", () => {
     expect(slugifyChecklistLabel("")).toBe("REQUIREMENT");
+  });
+});
+
+describe("resolveDocumentTypeMapping — LLM primary, string matcher as cross-check", () => {
+  it("bridges a source typo the string matcher alone cannot ('Employement contract')", () => {
+    const result = resolveDocumentTypeMapping({
+      sourceName: "Employement contract",
+      llmCode: "EMPLOYMENT_CONTRACT",
+      llmConfidence: "HIGH",
+      llmReasoning: "Source typo for 'Employment' — same document as Employment Contract",
+    });
+    expect(result.matchedCode).toBe("EMPLOYMENT_CONTRACT");
+    expect(result.confidence).toBe("HIGH");
+    expect(matchDocumentType("Employement contract")).toBeNull(); // confirms the string matcher alone really can't
+    expect(result.stringMatchCode).toBeNull();
+    expect(result.matchesAgree).toBe(false); // LLM found something the string matcher didn't — a real disagreement, still reported
+  });
+
+  it("bridges word order ('NOC from the employer' -> EMPLOYER_NOC)", () => {
+    const result = resolveDocumentTypeMapping({
+      sourceName: "NOC from the employer",
+      llmCode: "EMPLOYER_NOC",
+      llmConfidence: "HIGH",
+      llmReasoning: "Same document as Employer NOC, different word order",
+    });
+    expect(result.matchedCode).toBe("EMPLOYER_NOC");
+    expect(result.matchesAgree).toBe(false); // string matcher alone doesn't find this either (see visaChecklistCatalogueMatcher.test.ts's own matchDocumentType coverage)
+  });
+
+  it("bridges a locally-known name ('National ID' -> Aadhaar, when a real catalogue code exists)", () => {
+    // No catalogue entry actually covers this today (confirmed unmatched by
+    // matchDocumentType elsewhere in this file) — this fixture demonstrates
+    // the RESOLVER'S behaviour if/once one did; a null llmCode is exercised
+    // in the next test for the actual current-catalogue case.
+    const result = resolveDocumentTypeMapping({
+      sourceName: "National ID",
+      llmCode: "PASSPORT_ORIGINAL", // hypothetical — not a real claim, just exercising the mapping path
+      llmConfidence: "LOW",
+      llmReasoning: "Aadhaar is India's national ID — uncertain this is the intended catalogue match",
+    });
+    expect(result.matchedCode).toBe("PASSPORT_ORIGINAL");
+    expect(result.confidence).toBe("LOW");
+  });
+
+  it("agrees when both the LLM and the string matcher independently land on the same code", () => {
+    const result = resolveDocumentTypeMapping({
+      sourceName: "Photograph",
+      llmCode: "PHOTOGRAPH",
+      llmConfidence: "HIGH",
+      llmReasoning: "Exact name match",
+    });
+    expect(result.matchedCode).toBe("PHOTOGRAPH");
+    expect(result.stringMatchCode).toBe("PHOTOGRAPH");
+    expect(result.matchesAgree).toBe(true);
+  });
+
+  it("never accepts a code that isn't a real catalogue entry — treats it exactly like null", () => {
+    const result = resolveDocumentTypeMapping({
+      sourceName: "Something unusual",
+      llmCode: "MADE_UP_CODE_THAT_DOES_NOT_EXIST",
+      llmConfidence: "HIGH",
+      llmReasoning: "the model claimed this, but it isn't real",
+    });
+    expect(result.matchedCode).toBeNull();
+    expect(result.confidence).toBeNull(); // discarded along with the invalid code
+    expect(result.reasoning).toBe("the model claimed this, but it isn't real"); // kept as evidence regardless
+  });
+
+  it("both null — reports agreement, with suggestions from the string matcher as a residual aid", () => {
+    const result = resolveDocumentTypeMapping({
+      sourceName: "Old passport copy",
+      llmCode: null,
+      llmConfidence: null,
+      llmReasoning: "No catalogue entry covers a previous/expired passport copy",
+    });
+    expect(result.matchedCode).toBeNull();
+    expect(result.stringMatchCode).toBeNull();
+    expect(result.matchesAgree).toBe(true); // both correctly found nothing
+    expect(result.suggestions).toEqual(suggestDocumentTypes("Old passport copy"));
+  });
+
+  it("flags a genuine disagreement when the string matcher found something but the LLM said null", () => {
+    const result = resolveDocumentTypeMapping({
+      sourceName: "Cover letter",
+      llmCode: null,
+      llmConfidence: null,
+      llmReasoning: "Uncertain whether this is a generic cover letter or something more specific",
+    });
+    expect(result.matchedCode).toBeNull();
+    expect(result.stringMatchCode).toBe("COVER_LETTER"); // the string matcher DOES find this one
+    expect(result.matchesAgree).toBe(false);
   });
 });

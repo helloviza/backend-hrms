@@ -20,7 +20,15 @@ describe("buildExtractedFile — Laos (single checklist, no questionnaire)", () 
               conditionText: null,
               specificationText: "Clear picture of passport front page",
               templateReference: null,
-              documents: [{ name: "Passport Front Page", description: null }],
+              documents: [
+                {
+                  name: "Passport Front Page",
+                  description: null,
+                  documentTypeCode: null,
+                  documentTypeConfidence: null,
+                  documentTypeReasoning: "Ambiguous whether this is the bio-data page or a different page",
+                },
+              ],
             },
             {
               label: "Photograph",
@@ -28,7 +36,15 @@ describe("buildExtractedFile — Laos (single checklist, no questionnaire)", () 
               conditionText: null,
               specificationText: "Clear scanned copy of your photograph",
               templateReference: null,
-              documents: [{ name: "Photograph", description: null }],
+              documents: [
+                {
+                  name: "Photograph",
+                  description: null,
+                  documentTypeCode: "PHOTOGRAPH",
+                  documentTypeConfidence: "HIGH",
+                  documentTypeReasoning: "Exact name match",
+                },
+              ],
             },
           ],
           questions: [],
@@ -76,7 +92,15 @@ describe("buildExtractedFile — Canada (standard + US-visa-holder variant + que
               conditionText: null,
               specificationText: null,
               templateReference: "Employer NOC Template",
-              documents: [{ name: "Leave Approval Letter", description: null }],
+              documents: [
+                {
+                  name: "Leave Approval Letter",
+                  description: null,
+                  documentTypeCode: "EMPLOYER_NOC",
+                  documentTypeConfidence: "HIGH",
+                  documentTypeReasoning: "Leave Approval Letter is a known alias of Employer NOC",
+                },
+              ],
             },
           ],
           questions: [
@@ -170,14 +194,66 @@ describe("buildExtractedFile — France (conditional group with a structured con
     const file = buildExtractedFile("France-document-checklist.pdf", ["France-document-checklist (1).pdf"], extraction, "2026-08-02T00:00:00Z");
     const group = file.checklists[0].requirementGroups[0];
     expect(group.appliesWhen).toEqual([{ field: "employmentStatus", equals: "SELF_EMPLOYED" }]);
-    // None of these four match an existing catalogue entry exactly — a real
-    // gap this pass reports rather than papers over (GST certificate,
-    // "Company registration proof" vs. BUSINESS_REGISTRATION's "Company
-    // Registration Certificate" alias, etc. — all near-misses, not matches).
+    // This fixture simulates the model ALSO declining to map any of these
+    // four (no documentTypeCode set) — a genuine "nothing matched" result,
+    // still correctly surfacing string-matcher suggestions as a residual
+    // aid (GST certificate, "Company registration proof" vs.
+    // BUSINESS_REGISTRATION's "Company Registration Certificate" alias).
+    // See the next test for the case this phase actually improves: the
+    // model DOES map something the string matcher alone never could.
     expect(group.documents.map((d) => d.matchedCode)).toEqual([null, null, null, null]);
     expect(group.documents[1].suggestions.some((s) => s.code === "BUSINESS_REGISTRATION")).toBe(true);
     expect(group.allDocumentsMatched).toBe(false);
     expect(file.duplicateOfSourceFiles).toEqual(["France-document-checklist (1).pdf"]);
+  });
+
+  it("bridges what the string matcher alone cannot — a source typo, via the model's own catalogue mapping", () => {
+    const extraction = {
+      raw: {
+        destinationName: "France",
+        checklists: [
+          {
+            purposeLabel: "Tourist",
+            variantLabel: null,
+            requirementGroups: [
+              {
+                label: "Proof of occupation (If employed)",
+                requirement: "CONDITIONAL",
+                conditionText: "If employed",
+                specificationText: null,
+                templateReference: "Employer NOC Template",
+                documents: [
+                  {
+                    name: "Employement contract", // verbatim source typo, real PDF text
+                    description: null,
+                    documentTypeCode: "EMPLOYMENT_CONTRACT",
+                    documentTypeConfidence: "HIGH",
+                    documentTypeReasoning: "Source typo for 'Employment' — same document as Employment Contract",
+                  },
+                  {
+                    name: "NOC from the employer", // verbatim source wording, real PDF text
+                    description: null,
+                    documentTypeCode: "EMPLOYER_NOC",
+                    documentTypeConfidence: "HIGH",
+                    documentTypeReasoning: "Same document as Employer NOC, different word order",
+                  },
+                ],
+              },
+            ],
+            questions: [],
+          },
+        ],
+      },
+      model: "gemini-2.5-flash",
+    };
+
+    const file = buildExtractedFile("France-document-checklist.pdf", [], extraction, "2026-08-02T00:00:00Z");
+    const group = file.checklists[0].requirementGroups[0];
+    expect(group.documents.map((d) => d.matchedCode)).toEqual(["EMPLOYMENT_CONTRACT", "EMPLOYER_NOC"]);
+    expect(group.allDocumentsMatched).toBe(true);
+    // The string matcher alone finds neither — confirming these are real
+    // disagreements the LLM resolved, not cases it merely agreed on.
+    expect(group.documents.every((d) => !d.matchesAgree)).toBe(true);
   });
 });
 

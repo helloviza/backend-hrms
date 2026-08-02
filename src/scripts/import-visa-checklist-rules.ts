@@ -316,7 +316,14 @@ async function main() {
   }
 }
 
-if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
+// See extract-visa-checklists.ts's identical guard for why this checks the
+// real process entry point rather than NODE_ENV/VITEST — this file already
+// exports RuleCandidate/buildRuleCandidate/importVisaChecklistRules for
+// reuse, and this connects to the live database in main(), so an
+// accidental import-triggered run here would be worse than the read-only
+// migration import that prompted this fix.
+const isDirectRun = !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirectRun) {
   main().catch(async (err) => {
     console.error("Import failed:", err);
     try {

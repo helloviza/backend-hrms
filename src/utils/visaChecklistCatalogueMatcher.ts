@@ -15,14 +15,27 @@
 // importable array, exactly like config/visaDocumentTypeCatalogue.ts
 // already is for the document-type catalogue:
 //   - documents -> config/visaDocumentTypeCatalogue.ts's VISA_DOCUMENT_TYPE_CATALOGUE
-//   - questions -> migrations/2026-08-02-visa-checklist-model-v2.ts's VISA_QUESTION_BANK_SEED
+//   - questions -> config/visaQuestionBankSeed.ts's VISA_QUESTION_BANK_SEED
 //   - templates -> KNOWN_VISA_TEMPLATES below, currently empty (VisaTemplate
 //     has never been seeded — see that model's own file header) — every
 //     template reference will legitimately report as unmatched until ops
 //     seeds real templates and this list (or a real DB-backed pass) grows.
+//
+// Document-type matching follow-up: matchDocumentType/suggestDocumentTypes
+// below are the original deterministic string matcher — kept, but no
+// longer the primary signal for documents. resolveDocumentTypeMapping is
+// now the actual entry point scripts/extract-visa-checklists.ts calls: it
+// treats the model's OWN catalogue mapping (from
+// services/extractVisaChecklistGemini.ts, schema-constrained to a real
+// code or null) as primary, and runs this string matcher only as an
+// independent cross-check, surfacing a disagreement rather than resolving
+// it silently. Questions and templates are unaffected — the pilot's
+// unmatched rate there wasn't a string-matching problem the model could
+// meaningfully improve on the same way.
 import { VISA_DOCUMENT_TYPE_CATALOGUE, type VisaDocumentTypeSeed } from "../config/visaDocumentTypeCatalogue.js";
 import { VISA_QUESTION_BANK_SEED, type VisaQuestionSeed } from "../config/visaQuestionBankSeed.js";
 import type { VisaApplicantPredicate } from "../models/visaAttributes.js";
+import type { VisaChecklistMatchConfidence } from "../services/extractVisaChecklistGemini.js";
 
 /* ─────────────────────────────────────────────────────────────────────
  * Normalisation + scoring — shared by every catalogue below.
@@ -94,6 +107,56 @@ export function suggestDocumentTypes(sourceName: string, limit = 2): CatalogueSu
     .filter((s) => s.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
+}
+
+/**
+ * Follow-up (task brief §1/§4) — the pilot showed the string matcher above
+ * leaves most real documents unmatched (a source typo, word order, or a
+ * locally-known name for the same document all defeat string comparison).
+ * services/extractVisaChecklistGemini.ts now asks the model itself for a
+ * catalogue code per document, schema-constrained to a real code or null —
+ * that becomes the PRIMARY result here. The string matcher still runs, but
+ * only as an independent CROSS-CHECK: when the two disagree, both are
+ * reported (never silently reconciled) so a reviewer can tell "the model
+ * found something the string matcher couldn't" from "the model's mapping
+ * doesn't even match under a lenient string comparison — look closer".
+ */
+export interface DocumentTypeMappingResult {
+  matchedCode: string | null; // PRIMARY — the model's own mapping, validated against the real catalogue
+  confidence: VisaChecklistMatchConfidence | null; // null whenever matchedCode is null
+  reasoning: string | null; // the model's own one-line explanation, kept regardless of the outcome
+  stringMatchCode: string | null; // the deterministic exact/alias matcher's independent result
+  matchesAgree: boolean; // matchedCode === stringMatchCode (true when both are null too)
+  suggestions: CatalogueSuggestion[]; // informational near-misses — only populated when matchedCode is null
+}
+
+export function resolveDocumentTypeMapping(input: {
+  sourceName: string;
+  llmCode: string | null | undefined;
+  llmConfidence: string | null | undefined;
+  llmReasoning: string | null | undefined;
+}): DocumentTypeMappingResult {
+  // Defensive validation — the Gemini response schema constrains
+  // documentTypeCode to an enum of real codes, but this never trusts that
+  // blindly: a schema-violating or unrecognised code is treated exactly
+  // like null rather than silently accepted as a fabricated catalogue
+  // entry (task brief §2 — "a fabricated code is worse than an unmatched
+  // one"). The model's own reasoning text is still kept either way, since
+  // it's useful evidence of what went wrong.
+  const llmCodeIsReal = !!input.llmCode && VISA_DOCUMENT_TYPE_CATALOGUE.some((d) => d.code === input.llmCode);
+  const matchedCode = llmCodeIsReal ? (input.llmCode as string) : null;
+
+  const stringMatch = matchDocumentType(input.sourceName);
+  const stringMatchCode = stringMatch?.code ?? null;
+
+  return {
+    matchedCode,
+    confidence: matchedCode ? ((input.llmConfidence as VisaChecklistMatchConfidence) ?? null) : null,
+    reasoning: input.llmReasoning ?? null,
+    stringMatchCode,
+    matchesAgree: matchedCode === stringMatchCode,
+    suggestions: matchedCode ? [] : suggestDocumentTypes(input.sourceName),
+  };
 }
 
 /* ─────────────────────────────────────────────────────────────────────
