@@ -130,6 +130,7 @@ vi.mock("../models/UserPermission.js", () => ({
 import express from "express";
 import request from "supertest";
 import router from "./admin.visa.rules.importExport.js";
+import rulesRouter from "./admin.visa.rules.js";
 
 const USER_ID = new mongoose.Types.ObjectId();
 
@@ -144,6 +145,24 @@ function makeApp() {
     req.user = { _id: String(USER_ID), roles: ["OPS"], email: "concierge@plumtrips.com" };
     next();
   });
+  app.use("/", router);
+  return app;
+}
+
+// Mounts BOTH routers at the same prefix, in the EXACT relative order
+// server.ts uses (admin.visa.rules.ts's router first, this one second) —
+// a route-ordering bug is invisible to a test that mounts this router
+// alone (makeApp() above), since /rules/:id doesn't even exist in that
+// world. This is what actually caught GET /rules/export being swallowed
+// by GET /rules/:id.
+function makeCombinedApp() {
+  const app = express();
+  app.use(express.json());
+  app.use((req: any, _res, next) => {
+    req.user = { _id: String(USER_ID), roles: ["OPS"], email: "concierge@plumtrips.com" };
+    next();
+  });
+  app.use("/", rulesRouter);
   app.use("/", router);
   return app;
 }
@@ -208,6 +227,36 @@ describe("permission gating", () => {
     setAccess("READ");
     const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from("a,b\n1,2"), "x.csv");
     expect(res.status).toBe(403);
+  });
+});
+
+describe("GET /rules/export — route ordering (regression)", () => {
+  it("is reachable through the real, combined router stack — not swallowed by GET /rules/:id", async () => {
+    fullRule();
+    // Deliberately goes through makeCombinedApp(), mounting admin.visa.
+    // rules.ts's router first and this one second, exactly like server.ts
+    // does. A test that only mounts THIS router (makeApp()) would pass
+    // even with the bug present, since /rules/:id doesn't exist in that
+    // world at all — the ordering bug is only observable when both
+    // routers share the same mount prefix.
+    const res = await request(makeCombinedApp()).get("/rules/export?format=csv");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/text\/csv/);
+    expect(res.body?.error).toBeUndefined();
+    expect(res.text).not.toBe("Visa rule not found");
+  });
+
+  it("GET /rules/:id still 404s on a genuinely invalid id (falls through both routers, no route left to match)", async () => {
+    // This test app only mounts the two visa routers, not server.ts's own
+    // final catch-all (line ~794: res.status(404).json({ ok: false,
+    // message: "API route not found" })) — so here it's Express's bare
+    // 404, not that JSON one. In the real app, a malformed id still gets a
+    // clean JSON 404, just with that generic message instead of this
+    // route's own "Visa rule not found" — an accepted, honest trade-off
+    // of falling through: the exact wording for "not a route at all" is
+    // the app's catch-all's job, not this handler's.
+    const res = await request(makeCombinedApp()).get("/rules/not-a-real-id");
+    expect(res.status).toBe(404);
   });
 });
 

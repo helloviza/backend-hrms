@@ -390,11 +390,23 @@ router.get("/rules", requirePermission("visaApplication", "FULL"), async (req: a
 
 /* ─────────────────────────────────────────────────────────────────────
  * GET /rules/:id — detail.
+ *
+ * A non-ObjectId-shaped :id calls next() rather than 404ing directly —
+ * this path segment could just as easily be a literal route registered
+ * in a LATER-mounted router at the same /api/admin/visa prefix (e.g.
+ * GET /rules/export in routes/admin.visa.rules.importExport.ts), and
+ * Express tries routers in mount order, not specificity order. Returning
+ * 404 here unconditionally would silently swallow every such request
+ * before it ever reached the router that actually owns it — exactly what
+ * happened to /rules/export (see that bug's own history). Falling through
+ * means "genuinely not a rule id" still ends up 404 (nothing else matches
+ * either), but "a literal path I don't recognise" gets a real chance to
+ * match something else first.
  * ───────────────────────────────────────────────────────────────────── */
-router.get("/rules/:id", requirePermission("visaApplication", "FULL"), async (req: any, res: any) => {
+router.get("/rules/:id", requirePermission("visaApplication", "FULL"), async (req: any, res: any, next: any) => {
   try {
     const id = req.params.id;
-    if (!mongoose.isValidObjectId(id)) return res.status(404).json({ error: "Visa rule not found" });
+    if (!mongoose.isValidObjectId(id)) return next();
 
     const rule = await VisaRule.findById(id).lean();
     if (!rule) return res.status(404).json({ error: "Visa rule not found" });
