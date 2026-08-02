@@ -39,8 +39,8 @@ describe("matchDocumentType — exact/alias only, never a guess", () => {
     expect(matchDocumentType("Passport Front Page")).toBeNull();
   });
 
-  it("does NOT match 'Old passport copy' (Canada) — no catalogue entry for a previous/expired passport", () => {
-    expect(matchDocumentType("Old passport copy")).toBeNull();
+  it("matches 'Old passport copy' (Canada) — OLD_PASSPORT_COPY, added after the 27-PDF bulk run found it in 9 countries", () => {
+    expect(matchDocumentType("Old passport copy")?.code).toBe("OLD_PASSPORT_COPY");
   });
 
   it("does NOT match 'National ID' / 'Flight tickets' even though a related code exists — never a fuzzy auto-match", () => {
@@ -79,8 +79,8 @@ describe("matchQuestion — exact prompt match against the shared VisaQuestion b
     ).toBeNull();
   });
 
-  it("does NOT match France's 'What is your employment status?' — a different question shape from EMPLOYMENT_HISTORY", () => {
-    expect(matchQuestion("What is your employment status?")).toBeNull();
+  it("matches 'What is your employment status?' — EMPLOYMENT_STATUS, a different shape from EMPLOYMENT_HISTORY, added after it recurred in 12 of the 28 checklists", () => {
+    expect(matchQuestion("What is your employment status?")?.code).toBe("EMPLOYMENT_STATUS");
   });
 });
 
@@ -227,15 +227,15 @@ describe("resolveDocumentTypeMapping — LLM primary, string matcher as cross-ch
 
   it("both null — reports agreement, with suggestions from the string matcher as a residual aid", () => {
     const result = resolveDocumentTypeMapping({
-      sourceName: "Old passport copy",
+      sourceName: "National ID",
       llmCode: null,
       llmConfidence: null,
-      llmReasoning: "No catalogue entry covers a previous/expired passport copy",
+      llmReasoning: "No catalogue entry covers a national ID card",
     });
     expect(result.matchedCode).toBeNull();
     expect(result.stringMatchCode).toBeNull();
     expect(result.matchesAgree).toBe(true); // both correctly found nothing
-    expect(result.suggestions).toEqual(suggestDocumentTypes("Old passport copy"));
+    expect(result.suggestions).toEqual(suggestDocumentTypes("National ID"));
   });
 
   it("flags a genuine disagreement when the string matcher found something but the LLM said null", () => {

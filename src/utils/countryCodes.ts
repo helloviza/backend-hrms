@@ -186,11 +186,15 @@ export const COUNTRY_CODES: readonly CountryCodeEntry[] = [
   { iso2: "ZW", iso3: "ZWE", region: "AFRICA", name: "Zimbabwe", demonym: "Zimbabwean" },
 ] as const;
 
-// Case-insensitive, whitespace-tolerant key: trims, collapses internal
-// whitespace runs, and strips periods (so "U.A.E." / "U.S.A." normalise the
-// same as "UAE" / "USA").
+// Case-insensitive, whitespace-tolerant key: strips parenthetical
+// qualifiers (so "United Arab Emirates(Dubai)" resolves the same as "United
+// Arab Emirates" — checklist PDFs often suffix a destination name with the
+// specific emirate/city the consulate covers), strips periods (so "U.A.E."
+// / "U.S.A." normalise the same as "UAE" / "USA"), then trims and collapses
+// internal whitespace runs.
 function normaliseKey(input: string): string {
   return input
+    .replace(/\s*\([^)]*\)/g, "")
     .replace(/\./g, "")
     .trim()
     .replace(/\s+/g, " ")

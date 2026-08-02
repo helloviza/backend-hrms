@@ -57,6 +57,12 @@ describe("normaliseToIso2", () => {
     expect(normaliseToIso2("U.S.A.")).toBe("US");
   });
 
+  it("strips a parenthetical qualifier before lookup (checklist PDFs suffix the covering emirate/city)", () => {
+    expect(normaliseToIso2("United Arab Emirates(Dubai)")).toBe("AE");
+    expect(normaliseToIso2("United Arab Emirates (Dubai)")).toBe("AE");
+    expect(normaliseToIso2("United Kingdom (London)")).toBe("GB");
+  });
+
   it("returns null for unrecognised or empty input, never throws", () => {
     expect(normaliseToIso2("Narnia")).toBeNull();
     expect(normaliseToIso2("")).toBeNull();

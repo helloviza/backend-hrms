@@ -98,4 +98,78 @@ export const VISA_QUESTION_BANK_SEED: readonly VisaQuestionSeed[] = [
     category: "PERSONAL",
     followUps: [],
   },
+
+  // ── Added post-27-PDF bulk run (Phase 10c follow-up) — questions that
+  // recurred across 9-12 of the 28 checklists under exact wording distinct
+  // from any question already above (matchQuestion is exact-prompt match,
+  // with no alias mechanism — see models/VisaQuestion.ts). Left out: the UK's
+  // ~15-question employment/financial sub-flow (genuinely UK-specific, one
+  // country) and Father's/Mother's name/DOB (3 and 2 countries respectively —
+  // below the 4-country bar this batch used to decide what's shared vs a
+  // one-off).
+  {
+    code: "EMPLOYMENT_STATUS",
+    prompt: "What is your employment status?",
+    answerType: "SELECT",
+    options: ["EMPLOYED", "SELF_EMPLOYED", "UNEMPLOYED", "RETIRED", "OTHER"],
+    category: "EMPLOYMENT",
+    followUps: [],
+  },
+  // Two real, distinct exact phrasings for the same underlying "is a third
+  // party paying" concept — kept as separate entries (not merged into one)
+  // because VisaQuestion has no alias field; each independently recurs
+  // across several checklists in its own exact wording.
+  {
+    code: "TRIP_COST_SPONSORED_BY_SOMEONE_ELSE",
+    prompt: "Will someone else will be paying towards the cost of your trip?",
+    answerType: "BOOLEAN",
+    category: "FINANCIAL",
+    followUps: [{ whenAnswerEquals: true, questionCodes: ["TRIP_FUNDED_BY"] }],
+  },
+  {
+    code: "TRIP_COST_SPONSORED_BY_ANYONE",
+    prompt: "Will anyone be paying towards the cost of your visit?",
+    answerType: "BOOLEAN",
+    category: "FINANCIAL",
+    followUps: [{ whenAnswerEquals: true, questionCodes: ["TRIP_FUNDED_BY"] }],
+  },
+  // The five standard Schengen uniform-application-form questions — always
+  // seen together, across the same 6 Schengen checklists (Czech Republic,
+  // Denmark, Finland, Germany, Spain, Sweden). One shared set, not per-country
+  // copies.
+  {
+    code: "SCHENGEN_OTHER_COUNTRIES_VISIT",
+    prompt: "Are you visiting any other Schengen countries during your stay?",
+    answerType: "BOOLEAN",
+    category: "SCHENGEN",
+    followUps: [],
+  },
+  {
+    code: "SCHENGEN_FIRST_ENTRY_COUNTRY",
+    prompt: "What is your first country of entry?",
+    answerType: "COUNTRY",
+    category: "SCHENGEN",
+    followUps: [],
+  },
+  {
+    code: "SCHENGEN_PRIOR_VISA_5YRS",
+    prompt: "Have you been issued Schengen visa in the past 5 years?",
+    answerType: "BOOLEAN",
+    category: "SCHENGEN",
+    followUps: [],
+  },
+  {
+    code: "SCHENGEN_FINGERPRINTS_TAKEN",
+    prompt: "Have your digital fingerprints previously been taken in connection with a previous application for a Schengen visa?",
+    answerType: "BOOLEAN",
+    category: "SCHENGEN",
+    followUps: [],
+  },
+  {
+    code: "SCHENGEN_STAY_DURATION",
+    prompt: "How long are you planning to stay in Schengen area?",
+    answerType: "TEXT",
+    category: "SCHENGEN",
+    followUps: [],
+  },
 ] as const;
