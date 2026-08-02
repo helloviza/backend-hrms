@@ -118,11 +118,27 @@ export interface VisaRuleQuestionRef {
 // shape than VisaQuestion itself: no followUps here — a rule-specific,
 // one-off question hasn't shown a need for conditional branching yet; add
 // it if a real case demands it rather than speculatively.
+//
+// answerType is optional ONLY to accommodate the other use of this shape
+// (2026-08-03): a checklist question the extraction pipeline couldn't match
+// to the shared VisaQuestion bank (scripts/import-visa-checklist-rules.ts's
+// buildRuleCandidate) is imported here too, flagged needsCatalogueMapping —
+// but the source PDF never states an answerType, so this pass has nothing
+// to put there until ops reviews it and either maps it into the bank or
+// finishes authoring it as a real rule-specific question. Nothing reads
+// additionalQuestions yet (models/VisaApplication.ts's own comment: "schema
+// only... no submission route exists"), so relaxing this is safe today.
 export interface VisaRuleInlineQuestion {
   code: string; // rule-scoped, e.g. "US_DS160_CONFIRMATION_NUMBER"
   prompt: string;
-  answerType: "BOOLEAN" | "TEXT" | "DATE" | "SELECT" | "COUNTRY";
+  answerType?: "BOOLEAN" | "TEXT" | "DATE" | "SELECT" | "COUNTRY";
   options?: string[]; // only meaningful when answerType === "SELECT"
+  // True only for a question extracted from a checklist source that never
+  // matched the shared VisaQuestion bank — imported anyway (rather than
+  // silently dropped) so ops can see there was a real question here and
+  // either map it into the bank or dismiss it. Same posture as
+  // VisaDocumentRequirementGroup.needsCatalogueMapping above.
+  needsCatalogueMapping?: boolean;
 }
 
 export interface VisaRuleDocument extends Document {
@@ -276,8 +292,9 @@ const VisaRuleInlineQuestionSchema = new Schema<VisaRuleInlineQuestion>(
   {
     code: { type: String, required: true, trim: true, uppercase: true },
     prompt: { type: String, required: true, trim: true },
-    answerType: { type: String, enum: ["BOOLEAN", "TEXT", "DATE", "SELECT", "COUNTRY"], required: true },
+    answerType: { type: String, enum: ["BOOLEAN", "TEXT", "DATE", "SELECT", "COUNTRY"] },
     options: { type: [String], default: [] },
+    needsCatalogueMapping: { type: Boolean, default: false },
   },
   { _id: false },
 );

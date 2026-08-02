@@ -287,6 +287,11 @@ export function mapRuleSummary(r: any) {
     // the bulk REQUIREMENTS-sheet import (routes/admin.visa.rules.
     // importExport.ts), not this per-rule route.
     documentGroups: r.documentGroups || [],
+    // Same read-only-here posture as documentGroups above — an unmatched
+    // checklist question (2026-08-03) lands here flagged
+    // needsCatalogueMapping, with no answerType yet, for ops to map into
+    // the shared VisaQuestion bank or dismiss.
+    additionalQuestions: r.additionalQuestions || [],
     embassyFeeInr: r.embassyFeeInr ?? null,
     vfsFeeInr: r.vfsFeeInr ?? null,
     plumtripsServiceFeeInr: r.plumtripsServiceFeeInr ?? null,

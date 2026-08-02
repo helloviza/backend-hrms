@@ -440,7 +440,7 @@ describe("GET /rules — filtering", () => {
     expect((await request(app).get("/rules?status=NOT_REAL")).status).toBe(400);
   });
 
-  it("includes documentGroups, flags included, on both the list and detail routes", async () => {
+  it("includes documentGroups and additionalQuestions, flags included, on both the list and detail routes", async () => {
     const rule = ruleDoc({
       documentGroups: [
         { key: "PASSPORT", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["PASSPORT_ORIGINAL"] },
@@ -453,6 +453,9 @@ describe("GET /rules — filtering", () => {
           unmatchedDocumentNames: ["Authorisation Letter"],
         },
       ],
+      additionalQuestions: [
+        { code: "HAVE_YOU_BEEN_REFUSED_A_VISA", prompt: "Have you been refused a visa before?", needsCatalogueMapping: true },
+      ],
     });
     const app = makeApp();
 
@@ -461,10 +464,14 @@ describe("GET /rules — filtering", () => {
     expect(listed.documentGroups).toHaveLength(2);
     expect(listed.documentGroups[1].needsCatalogueMapping).toBe(true);
     expect(listed.documentGroups[1].unmatchedDocumentNames).toEqual(["Authorisation Letter"]);
+    expect(listed.additionalQuestions).toEqual([
+      { code: "HAVE_YOU_BEEN_REFUSED_A_VISA", prompt: "Have you been refused a visa before?", needsCatalogueMapping: true },
+    ]);
 
     const detail = await request(app).get(`/rules/${rule._id}`);
     expect(detail.body.rule.documentGroups).toHaveLength(2);
     expect(detail.body.rule.documentGroups[1].needsCatalogueMapping).toBe(true);
+    expect(detail.body.rule.additionalQuestions).toHaveLength(1);
   });
 });
 

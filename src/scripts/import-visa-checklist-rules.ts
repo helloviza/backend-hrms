@@ -64,8 +64,10 @@ import VisaRule, {
   type VisaCategory,
   type VisaDocumentRequirementGroup,
   type VisaRuleQuestionRef,
+  type VisaRuleInlineQuestion,
 } from "../models/VisaRule.js";
 import { getCountryByIso2 } from "../utils/countryCodes.js";
+import { slugifyChecklistLabel } from "../utils/visaChecklistCatalogueMatcher.js";
 import type { ExtractedVisaChecklistFile } from "./extract-visa-checklists.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -205,6 +207,7 @@ export interface RuleCandidate {
   visaCategory?: VisaCategory;
   documentGroups: VisaDocumentRequirementGroup[];
   questions: VisaRuleQuestionRef[];
+  additionalQuestions: VisaRuleInlineQuestion[];
   seedSource: string;
   // Ops-authored free text carried onto VisaRule.opsNotes — see
   // ExtractedChecklistEntry.opsNotes's own comment.
@@ -220,28 +223,35 @@ export interface SkippedChecklist {
 
 /**
  * Turns ONE extracted requirement-group entry into the VisaRule shape,
- * whether or not any of its documents matched a catalogue code. Shared by
- * buildRuleCandidate (first import) and migrations/
- * 2026-08-03-recover-dropped-requirement-groups.ts (re-deriving the exact
- * same group shape for a group that was dropped the first time around) —
- * one implementation, so the two can never drift on what a "recovered"
- * group looks like versus a freshly-imported one.
+ * whether or not any (or all) of its documents matched a catalogue code.
+ * Shared by buildRuleCandidate (first import) and migrations/
+ * 2026-08-03-recover-dropped-requirement-groups.ts /
+ * 2026-08-03-recover-unmatched-documents.ts (re-deriving the exact same
+ * group shape for a group whose flag needed recovering after the fact) —
+ * one implementation, so none of these can ever drift on what a
+ * "recovered" group looks like versus a freshly-imported one.
  *
- * 2026-08-03 — a group with NOTHING matched used to be skipped entirely
- * here ("vacuously satisfied" looked worse than missing — see this
- * migration's own header for the full history). That silently dropped a
- * real requirement rather than surfacing it: six such groups were only
- * discovered by accident, via the template-relink migration's own
- * group-not-found report. Now every group is imported — a zero-match one
- * just carries needsCatalogueMapping + the original unmatched document
- * names instead of docTypeCodes, so ops sees a flagged row instead of a
- * missing one.
+ * 2026-08-03 — two silent-drop bugs, same root cause, fixed together:
+ *   1. A group with NOTHING matched used to be skipped entirely
+ *      ("vacuously satisfied" looked worse than missing) — six were only
+ *      discovered by accident, via the template-relink migration's own
+ *      group-not-found report. Fixed: imported anyway, flagged.
+ *   2. A group with SOME documents matched and some not (docTypeCodes
+ *      non-empty) imported "successfully" but silently threw away the
+ *      unmatched ones' names — a group listing four documents that only
+ *      matched three looked complete when it wasn't, with nothing for ops
+ *      to see. Fixed the same way: needsCatalogueMapping is set and
+ *      unmatchedDocumentNames carries every unmatched name whenever
+ *      there's at least one, whether the group is wholly or partially
+ *      unmapped — `docTypeCodes.length` distinguishes the two cases for
+ *      anything that needs to (the console, the export).
  */
 export function buildDocumentGroupFromExtracted(
   g: ExtractedRequirementGroup,
 ): { group: VisaDocumentRequirementGroup; droppedDocumentCount: number } {
   const docTypeCodes = g.documents.map((d) => d.matchedCode).filter((c): c is string => c !== null);
-  const droppedDocumentCount = g.documents.length - docTypeCodes.length;
+  const unmatchedDocumentNames = g.documents.filter((d) => d.matchedCode === null).map((d) => d.sourceName);
+  const droppedDocumentCount = unmatchedDocumentNames.length;
 
   const group: VisaDocumentRequirementGroup = {
     key: g.key,
@@ -257,12 +267,35 @@ export function buildDocumentGroupFromExtracted(
   // 2026-08-02-visa-checklist-model-v2.ts's own posture for the same field.
   if (g.conditionText && !g.appliesWhen) group.legacyConditionNote = g.conditionText;
 
-  if (docTypeCodes.length === 0) {
+  if (unmatchedDocumentNames.length > 0) {
     group.needsCatalogueMapping = true;
-    group.unmatchedDocumentNames = g.documents.map((d) => d.sourceName);
+    group.unmatchedDocumentNames = unmatchedDocumentNames;
   }
 
   return { group, droppedDocumentCount };
+}
+
+/**
+ * Turns the UNMATCHED entries of an extracted checklist's questions[] into
+ * rule-specific VisaRuleInlineQuestion rows — flagged needsCatalogueMapping,
+ * original prompt text preserved verbatim. A matched question is handled
+ * separately (buildRuleCandidate turns it into a VisaRuleQuestionRef instead
+ * — a reference into the shared bank, not a copy).
+ *
+ * 2026-08-03 — an unmatched question used to be dropped entirely here, with
+ * no flag and no preserved prompt (task brief §5's "shared-bank gap for ops
+ * to fill" was true in spirit but false in practice: nothing ever recorded
+ * that the gap existed once the source PDF was gone). Same fix shape as
+ * buildDocumentGroupFromExtracted's needsCatalogueMapping.
+ */
+export function buildUnmatchedInlineQuestions(questions: ExtractedChecklist["questions"]): VisaRuleInlineQuestion[] {
+  return questions
+    .filter((q) => !q.matchedQuestionCode)
+    .map((q) => ({
+      code: slugifyChecklistLabel(q.sourcePrompt),
+      prompt: q.sourcePrompt,
+      needsCatalogueMapping: true,
+    }));
 }
 
 /**
@@ -302,12 +335,15 @@ export function buildRuleCandidate(
     documentGroups.push(group);
   }
 
-  // Only MATCHED questions become real questionCode refs — an unmatched
-  // question is a shared-bank gap for ops to fill (task brief §5), never
-  // silently smuggled in as a rule-specific inline question.
+  // Only MATCHED questions become real questionCode refs into the shared
+  // bank; an unmatched one is kept too, but as a flagged inline question
+  // (buildUnmatchedInlineQuestions) rather than a questionCode ref — it
+  // isn't a confirmed shared-bank question, so it must never be smuggled in
+  // as if it were one.
   const questions: VisaRuleQuestionRef[] = checklist.questions
     .filter((q) => q.matchedQuestionCode)
     .map((q) => ({ questionCode: q.matchedQuestionCode as string }));
+  const additionalQuestions: VisaRuleInlineQuestion[] = buildUnmatchedInlineQuestions(checklist.questions);
 
   // Resolved from countryCodes.ts's own canonical name for this ISO2 —
   // NEVER the PDF/Gemini's own destinationName text. Two PDFs for the
@@ -333,6 +369,7 @@ export function buildRuleCandidate(
     productClass: checklist.productClass,
     documentGroups,
     questions,
+    additionalQuestions,
     seedSource: SEED_SOURCE,
   };
   if (checklist.visaCategory != null) candidate.visaCategory = checklist.visaCategory as VisaCategory;
@@ -392,6 +429,7 @@ function candidateFields(c: RuleCandidate): Record<string, any> {
     applicability: c.applicability,
     documentGroups: c.documentGroups,
     questions: c.questions,
+    additionalQuestions: c.additionalQuestions,
     seedSource: c.seedSource,
   };
   // Only ever SETS visaCategory, never clears it — if ops has since set it
@@ -511,6 +549,7 @@ export async function importVisaChecklistRules(
     const changed =
       JSON.stringify((existing as any).documentGroups || []) !== JSON.stringify(fields.documentGroups) ||
       JSON.stringify((existing as any).questions || []) !== JSON.stringify(fields.questions) ||
+      JSON.stringify((existing as any).additionalQuestions || []) !== JSON.stringify(fields.additionalQuestions) ||
       (existing as any).destinationName !== fields.destinationName ||
       // Only flags a change when THIS pass actually has an opinion on
       // visaCategory (fields.visaCategory !== undefined) — never fires

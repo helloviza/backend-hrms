@@ -157,6 +157,30 @@ describe("buildRuleCandidate", () => {
     }
   });
 
+  it("flags a PARTIALLY matched group too — some documents matched, some not — without losing the group's real docTypeCodes", () => {
+    const file = laosFile();
+    file.checklists[0].visaCategory = "E_VISA" as any;
+    file.checklists[0].requirementGroups[0].documents.push({
+      sourceName: "Cover Letter",
+      sourceDescription: null,
+      matchedCode: null,
+      matchConfidence: null,
+      matchReasoning: null,
+      stringMatchCode: null,
+      matchesAgree: false,
+      suggestions: [],
+    });
+    const result = buildRuleCandidate(file, file.checklists[0]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const partial = result.candidate.documentGroups.find((g) => g.key === "PHOTOGRAPH")!;
+      expect(partial.docTypeCodes).toEqual(["PHOTOGRAPH"]); // the real match is untouched
+      expect(partial.needsCatalogueMapping).toBe(true);
+      expect(partial.unmatchedDocumentNames).toEqual(["Cover Letter"]);
+      expect(result.droppedDocumentCount).toBe(2); // Cover Letter here + Passport Front Page's own group
+    }
+  });
+
   it("resolves destinationName from countryCodes.ts rather than the source document's own text — same ISO2 must never diverge across files", () => {
     const file = laosFile({ destinationName: "Lao People's Democratic Republic" }); // whatever this PDF's title said
     file.checklists[0].visaCategory = "E_VISA" as any;
@@ -194,7 +218,7 @@ describe("buildRuleCandidate", () => {
     if (result.ok === false) expect(result.reason).toMatch(/purpose/);
   });
 
-  it("only wires MATCHED questions into questions[] — an unmatched question is never smuggled in as inline", () => {
+  it("wires MATCHED questions into questions[]; an unmatched question lands in additionalQuestions instead, flagged and never as a bare questionCode ref", () => {
     const file = laosFile();
     file.checklists[0].visaCategory = "E_VISA" as any;
     file.checklists[0].questions = [
@@ -205,6 +229,26 @@ describe("buildRuleCandidate", () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.candidate.questions).toEqual([{ questionCode: "MARITAL_STATUS" }]);
+      expect(result.candidate.additionalQuestions).toEqual([
+        { code: "SOME_GENUINELY_NEW_QUESTION", prompt: "Some genuinely new question?", needsCatalogueMapping: true },
+      ]);
+    }
+  });
+
+  it("2026-08-03 — an unmatched question is no longer dropped entirely: prompt text and a needsCatalogueMapping flag survive", () => {
+    const file = laosFile();
+    file.checklists[0].visaCategory = "E_VISA" as any;
+    file.checklists[0].questions = [
+      { sourcePrompt: "Have you previously been refused a visa?", detailsText: null, matchedQuestionCode: null, suggestions: [] },
+    ];
+    const result = buildRuleCandidate(file, file.checklists[0]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.candidate.questions).toEqual([]);
+      expect(result.candidate.additionalQuestions).toHaveLength(1);
+      expect(result.candidate.additionalQuestions[0].prompt).toBe("Have you previously been refused a visa?");
+      expect(result.candidate.additionalQuestions[0].needsCatalogueMapping).toBe(true);
+      expect(result.candidate.additionalQuestions[0].answerType).toBeUndefined();
     }
   });
 
