@@ -136,6 +136,27 @@ function purposeMatchValues(purpose: VisaPurpose): VisaPurpose[] {
   return PURPOSE_QUERY_EXPANSIONS[purpose] ?? [purpose];
 }
 
+// The purposes a customer actually picks from — TOURIST_OR_BUSINESS is never
+// one of them, it's a single RULE that covers two of them at once (see
+// PURPOSE_QUERY_EXPANSIONS above). VISA_PURPOSES' own declared order
+// (TOURIST, BUSINESS, TRANSIT once TOURIST_OR_BUSINESS is dropped) doubles
+// as the canonical card order GET /destinations reports in.
+const CUSTOMER_FACING_PURPOSES: VisaPurpose[] = VISA_PURPOSES.filter(
+  (p) => p !== "TOURIST_OR_BUSINESS",
+);
+
+// The inverse of purposeMatchValues(): given a rule's OWN stored purpose,
+// which customer-facing purpose(s) should it surface as? A TOURIST_OR_
+// BUSINESS rule answers to both a TOURIST and a BUSINESS query, so it must
+// surface as BOTH cards, not a third one nobody would recognise — same
+// widening GET /rules already applies, read in the other direction so the
+// two can never drift apart.
+function customerPurposesForRule(rulePurpose: VisaPurpose): VisaPurpose[] {
+  return CUSTOMER_FACING_PURPOSES.filter((p) =>
+    purposeMatchValues(p).includes(rulePurpose),
+  );
+}
+
 // Cheapest/most-common tier first, not alphabetical — an alphabetical sort
 // on serviceTier put EXPRESS before STANDARD (E < S) and defaulted the UI to
 // a tier above the cheapest available, over-quoting the customer. Unknown
@@ -201,42 +222,71 @@ function mapRuleToVariant(r: any) {
  * distinct visaCategory found; `category` is populated as a convenience
  * only when there's exactly one, so the client isn't forced to branch on
  * array length for the common single-category case.
+ *
+ * purposes is the distinct set of CUSTOMER-facing purposes this
+ * destination's rules actually cover (customerPurposesForRule() above) —
+ * screen 1's purpose picker (task brief, 2026-08-03: "derive the purpose
+ * options from real rules") renders exactly these, in VISA_PURPOSES'
+ * canonical order, instead of always offering all three regardless of
+ * what's actually published. A destination whose rules are ALL e.g.
+ * TRANSIT-only reports purposes: ["TRANSIT"], not the full hardcoded set.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/destinations", async (_req: any, res: any) => {
   try {
     const rules = await VisaRule.find({ status: "PUBLISHED" })
-      .select("destinationIso2 destinationName visaCategory")
+      .select("destinationIso2 destinationName visaCategory purpose")
       .lean();
 
     const byIso2 = new Map<
       string,
-      { destinationName: string; categories: Set<VisaCategory> }
+      { destinationName: string; categories: Set<VisaCategory>; purposes: Set<VisaPurpose> }
     >();
     for (const r of rules) {
       const existing = byIso2.get(r.destinationIso2);
+      const rulePurposes = customerPurposesForRule(r.purpose);
       if (existing) {
         existing.categories.add(r.visaCategory);
+        for (const p of rulePurposes) existing.purposes.add(p);
       } else {
         byIso2.set(r.destinationIso2, {
           destinationName: r.destinationName,
           categories: new Set([r.visaCategory]),
+          purposes: new Set(rulePurposes),
         });
       }
     }
 
+    // Every PUBLISHED rule's purpose maps to at least one customer-facing
+    // purpose (customerPurposesForRule never returns empty for a real
+    // VisaPurpose value) — so a destination reporting zero here would mean
+    // a real data problem (a rule whose `purpose` somehow isn't one
+    // customerPurposesForRule recognises), not an expected case. Reported,
+    // never silently hidden from the picker as an unselectable destination.
+    const destinationsWithNoPurposes: string[] = [];
+
     const destinations = Array.from(byIso2.entries()).map(([iso2, entry]) => {
       const country = getCountryByIso2(iso2);
       const categories = Array.from(entry.categories);
+      const purposes = CUSTOMER_FACING_PURPOSES.filter((p) => entry.purposes.has(p));
+      if (purposes.length === 0) destinationsWithNoPurposes.push(iso2);
       return {
         iso2,
         name: country?.name ?? entry.destinationName,
         region: country?.region ?? null,
         categories,
         category: categories.length === 1 ? categories[0] : undefined,
+        purposes,
       };
     });
 
     destinations.sort((a, b) => a.name.localeCompare(b.name));
+
+    if (destinationsWithNoPurposes.length > 0) {
+      console.error(
+        "[visa destinations GET] destination(s) with a PUBLISHED rule but zero customer-facing purposes:",
+        destinationsWithNoPurposes.join(", "),
+      );
+    }
 
     res.json({ ok: true, destinations });
   } catch (err: any) {

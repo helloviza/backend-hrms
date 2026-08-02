@@ -147,6 +147,51 @@ describe("GET /destinations", () => {
     expect(dest.category).toBeUndefined();
     expect(dest.categories.sort()).toEqual(["E_VISA", "VOA"]);
   });
+
+  describe("purposes (2026-08-03 — derived from real rules, not hardcoded)", () => {
+    it("reports only the one purpose a single-purpose destination actually has", async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([ruleDoc({ destinationIso2: "AE", destinationName: "United Arab Emirates", purpose: "TOURIST" })]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "AE");
+      expect(dest.purposes).toEqual(["TOURIST"]);
+    });
+
+    it("surfaces a TOURIST_OR_BUSINESS rule as BOTH Tourist and Business, never as its own option", async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([ruleDoc({ destinationIso2: "CA", destinationName: "Canada", purpose: "TOURIST_OR_BUSINESS" })]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "CA");
+      expect(dest.purposes).toEqual(["TOURIST", "BUSINESS"]);
+    });
+
+    it("unions purposes across multiple rules for the same destination, in canonical order", async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([
+          ruleDoc({ destinationIso2: "ZA", destinationName: "South Africa", purpose: "TRANSIT" }),
+          ruleDoc({ destinationIso2: "ZA", destinationName: "South Africa", purpose: "TOURIST" }),
+          ruleDoc({ destinationIso2: "ZA", destinationName: "South Africa", purpose: "BUSINESS" }),
+        ]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "ZA");
+      expect(dest.purposes).toEqual(["TOURIST", "BUSINESS", "TRANSIT"]);
+    });
+
+    it("does not duplicate a purpose already covered by another rule on the same destination", async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([
+          ruleDoc({ destinationIso2: "CA", destinationName: "Canada", purpose: "TOURIST_OR_BUSINESS" }),
+          ruleDoc({ destinationIso2: "CA", destinationName: "Canada", purpose: "TOURIST", entryType: "MULTIPLE" }),
+        ]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "CA");
+      expect(dest.purposes).toEqual(["TOURIST", "BUSINESS"]);
+    });
+  });
 });
 
 describe("GET /rules", () => {
