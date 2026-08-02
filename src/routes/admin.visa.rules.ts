@@ -127,7 +127,12 @@ const EDITABLE_FIELDS = [
 // the two fields that move outside EDITABLE_FIELDS (effectiveFrom is
 // caller-supplied but handled separately per route; status and
 // displayMode are server-derived/transition-only).
-const AUDITABLE_FIELDS = [...IDENTITY_FIELDS, ...EDITABLE_FIELDS, "effectiveFrom", "status", "displayMode"] as const;
+// Exported for routes/admin.visa.rules.importExport.ts's own diff/audit —
+// that route edits a DIFFERENT field set (documentGroups, opsNotes; see its
+// own file header for why), but reuses diffFields/writeRuleAudit/
+// mapRuleSummary verbatim rather than re-implementing the same comparison
+// and audit-write logic a second time.
+export const AUDITABLE_FIELDS = [...IDENTITY_FIELDS, ...EDITABLE_FIELDS, "effectiveFrom", "status", "displayMode"] as const;
 
 interface ValidationResult {
   ok: boolean;
@@ -253,7 +258,7 @@ function validateRuleFields(body: any, opts: { requireIdentity: boolean }): Vali
 /* ─────────────────────────────────────────────────────────────────────
  * Shaping + diff helpers.
  * ───────────────────────────────────────────────────────────────────── */
-function mapRuleSummary(r: any) {
+export function mapRuleSummary(r: any) {
   return {
     id: String(r._id),
     nationality: r.nationality,
@@ -317,7 +322,7 @@ function mapContentSummary(c: any) {
 // documentRequirements array rebuilt with the same items in the same
 // order — but constructed via a different code path — never registers as
 // a false-positive change; only a REAL value difference is recorded.
-function diffFields(before: Record<string, any>, after: Record<string, any>, fields: readonly string[]): VisaRuleFieldChange[] {
+export function diffFields(before: Record<string, any>, after: Record<string, any>, fields: readonly string[]): VisaRuleFieldChange[] {
   const changes: VisaRuleFieldChange[] = [];
   for (const field of fields) {
     const fromVal = before[field] ?? null;
@@ -329,7 +334,7 @@ function diffFields(before: Record<string, any>, after: Record<string, any>, fie
   return changes;
 }
 
-async function writeRuleAudit(
+export async function writeRuleAudit(
   ruleId: any,
   action: VisaRuleAuditAction,
   changes: VisaRuleFieldChange[],

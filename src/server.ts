@@ -527,6 +527,15 @@ app.use("/api/admin/visa", adminVisaReportsRouter);
 import adminVisaDashboardRouter from "./routes/admin.visa.dashboard.js";
 app.use("/api/admin/visa", adminVisaDashboardRouter);
 
+// Visa module (Phase 10d) — bulk XLSX/CSV export+import for the fee/rule
+// master, so ops can review and edit many checklist-imported DRAFT rules
+// (pricing, ETA, visaCategory) in one pass instead of one at a time in the
+// console's modal. Same mount prefix again — a fifth router alongside the
+// four above. FULL-gated, update-only, never publishes — see routes/
+// admin.visa.rules.importExport.ts's file header.
+import adminVisaRulesImportExportRouter from "./routes/admin.visa.rules.importExport.js";
+app.use("/api/admin/visa", adminVisaRulesImportExportRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";

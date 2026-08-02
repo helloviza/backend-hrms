@@ -13,7 +13,12 @@
 // data, so its audit trail is too.
 import mongoose, { Schema, type Document, type Model } from "mongoose";
 
-export const VISA_RULE_AUDIT_ACTIONS = ["CREATE", "UPDATE", "PUBLISH", "RETIRE", "CLONE"] as const;
+// IMPORT is distinct from UPDATE: same field-change shape, but this is the
+// signal routes/admin.visa.rules.importExport.ts's bulk spreadsheet import
+// writes instead of UPDATE — "marked as a bulk import" per that feature's
+// own brief, so a reviewer can tell a spreadsheet-driven change from a
+// hand-edit in the console without reading prose.
+export const VISA_RULE_AUDIT_ACTIONS = ["CREATE", "UPDATE", "PUBLISH", "RETIRE", "CLONE", "IMPORT"] as const;
 export type VisaRuleAuditAction = (typeof VISA_RULE_AUDIT_ACTIONS)[number];
 
 // One changed field. `from`/`to` are Mixed — a rule field can be a number,
