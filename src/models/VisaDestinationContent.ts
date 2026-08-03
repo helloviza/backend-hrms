@@ -64,6 +64,23 @@ export type VisaDestinationContentStatus = (typeof VISA_DESTINATION_CONTENT_STAT
 // pairs — highlights mirrors that. `body` is additive: an optional longer-
 // form paragraph for destinations that get real editorial copy beyond a
 // highlight list, so a richer write doesn't need a schema change later.
+// highlights stay plain strings deliberately (scannable list items on a
+// decision page, not prose) — `body` is the one field that carries
+// formatting.
+//
+// `body` markdown (2026-08-04): a CONSTRAINED subset only — bold, italic,
+// links, unordered lists. No headings, images, tables, or raw HTML; nothing
+// here enforces that at write time (still just `String, trim: true` below —
+// see routes/admin.visa.rules.ts's validateContentBlock, which only checks
+// it's a string). The subset is enforced entirely on the READ side —
+// frontend/src/components/RestrictedMarkdown.tsx, via react-markdown's
+// `allowedElements` — because this is ops-authored content shown to
+// customers and has to be treated as untrusted at the point it's rendered,
+// not trusted because whoever saved it was staff. Any other consumer that
+// ever renders this field (a PDF export, an email digest, anything not
+// already going through RestrictedMarkdown) needs its own sanitised
+// markdown render, not a raw string interpolation — the string may contain
+// `**`/`*`/`[]()`/`- ` syntax, not literal prose.
 export interface VisaDestinationBlock {
   highlights: string[];
   body?: string;

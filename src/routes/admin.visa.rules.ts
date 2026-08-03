@@ -892,6 +892,16 @@ router.get("/destination-content/:iso2", requirePermission("visaApplication", "F
   }
 });
 
+// `body` is allowed to carry a constrained markdown subset (bold, italic,
+// links, unordered lists — see models/VisaDestinationContent.ts's comment
+// on VisaDestinationBlock) but that is NOT enforced here — this only checks
+// it's a string. The subset is enforced entirely on render (frontend/src/
+// components/RestrictedMarkdown.tsx's allowedElements), deliberately: ops
+// is trusted to write reasonable input, but the customer-facing render
+// treats it as untrusted regardless of who saved it. Do not add markdown-
+// syntax validation here without also updating that render-side contract —
+// rejecting valid syntax at save time doesn't make the render side any
+// safer, it just adds a second, easy-to-drift definition of "allowed."
 function validateContentBlock(value: unknown, label: string): string | null {
   if (value == null) return null;
   if (typeof value !== "object") return `${label} must be an object`;
