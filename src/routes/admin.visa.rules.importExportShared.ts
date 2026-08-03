@@ -26,10 +26,14 @@
 // change (see diffFields()'s own `?? null` normalisation in
 // routes/admin.visa.rules.ts, reused here).
 import mongoose from "mongoose";
-import { VISA_CATEGORIES, VISA_ETA_BASES, VISA_DOC_REQUIREMENT_LEVELS, type VisaCategory, type VisaEtaBasis } from "../models/VisaRule.js";
+import {
+  VISA_CATEGORIES, VISA_ETA_BASES, VISA_DOC_REQUIREMENT_LEVELS, VISA_PURPOSES, VISA_ENTRY_TYPES, VISA_SERVICE_TIERS,
+  type VisaCategory, type VisaEtaBasis, type VisaPurpose, type VisaEntryType, type VisaServiceTier,
+} from "../models/VisaRule.js";
 import { VISA_APPLICANT_ATTRIBUTE_FIELDS, type VisaApplicantPredicate } from "../models/visaAttributes.js";
 import { VISA_DOCUMENT_TYPE_CATALOGUE } from "../config/visaDocumentTypeCatalogue.js";
 import { slugifyChecklistLabel } from "../utils/visaChecklistCatalogueMatcher.js";
+import { normaliseToIso2, getCountryByIso2 } from "../utils/countryCodes.js";
 
 export const DOC_TYPE_CODE_SET: ReadonlySet<string> = new Set(VISA_DOCUMENT_TYPE_CATALOGUE.map((d) => d.code));
 
@@ -188,12 +192,19 @@ export const RULES_COLUMNS = [
   "Last Reviewed At",
 ] as const;
 
-// Context columns are exported for readability/review but NEVER read back
-// on import — destination/purpose/entryType/serviceTier/variantKey are the
-// rule's identity (immutable via ANY route except clone, see
-// routes/admin.visa.rules.ts's own IDENTITY_FIELDS comment); status is
-// read-only here by design (task brief §2); lastReviewedAt isn't in this
-// feature's editable-field list either. Matching is on ruleId alone.
+// Context columns are exported for readability/review and, for an UPDATE
+// row (non-blank Rule Id), NEVER read back on import — destination/purpose/
+// entryType/serviceTier/variantKey are the rule's identity (immutable via
+// ANY route except clone, see routes/admin.visa.rules.ts's own
+// IDENTITY_FIELDS comment); status is read-only here by design (task brief
+// §2); lastReviewedAt isn't in this feature's editable-field list either.
+// Matching an UPDATE row is on ruleId alone.
+//
+// A CREATE row (blank Rule Id, 2026-08-04) is the one exception:
+// destinationiso2/destinationname/purpose/entrytype/servicetier DO get read
+// — resolveCreateRuleRow() below — since there is no existing rule to carry
+// an identity forward from. status is still never read, even for a create —
+// see resolveCreateRuleRow's own comment.
 export const RULES_CONTEXT_FIELDS = new Set([
   "ruleid", "destinationiso2", "destinationname", "purpose", "entrytype",
   "servicetier", "variantkey", "status", "lastreviewedat",
@@ -317,6 +328,147 @@ export function resolveRuleRow(
   };
 
   return { ok: true, edit };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * CREATE path (2026-08-04) — a RULES row with a BLANK Rule Id. Ops works in
+ * Excel and adds new country rows the same way they edit existing ones; a
+ * blank id used to mean "reported as invalid, nothing happens" (Rule Id is
+ * required). Now it means "create a new DRAFT rule", with its own,
+ * deliberately SMALLER validation surface than resolveRuleRow above:
+ *   - Destination and Purpose are the only hard requirements — reject
+ *     otherwise, naming exactly what's missing (caller attaches the row
+ *     number). Destination accepts a name, ISO2, or ISO3 via countryCodes.ts's
+ *     normaliseToIso2() — same acceptance rule scripts/
+ *     import-visa-checklist-rules.ts already established for destination
+ *     text pulled from a source that isn't guaranteed to be a clean ISO2.
+ *   - Entry Type defaults to UNSPECIFIED, Service Tier to STANDARD, when
+ *     blank — matching scripts/extract-visa-checklists.ts's own defaults
+ *     for the same two fields (that script feeds scripts/
+ *     import-visa-checklist-rules.ts's own create path).
+ *   - visaCategory/ETA/fees/notes are validated the SAME WAY resolveRuleRow
+ *     validates them (deliberately duplicated below rather than factored
+ *     out — resolveRuleRow already has passing tests and an update path in
+ *     production use; this keeps that function, and its behaviour,
+ *     completely untouched), but none of them are REQUIRED here — those are
+ *     publish-time requirements (routes/admin.visa.rules.ts's POST
+ *     /rules/:id/publish), not create-time ones.
+ *   - status is never read here either, same as resolveRuleRow — the
+ *     caller (processImport) hardcodes every created rule to DRAFT,
+ *     unconditionally, regardless of anything in the file.
+ * Natural-key collision detection (does this destination/purpose/entryType/
+ * serviceTier already exist as a rule?) needs a DB round-trip and is
+ * deliberately NOT done here — this function only does structural,
+ * no-database validation, same contract as resolveRuleRow. processImport
+ * does the collision check once, batched, after resolving every row.
+ * ───────────────────────────────────────────────────────────────────── */
+export interface ResolvedRuleCreate {
+  destinationIso2: string;
+  destinationName: string;
+  purpose: VisaPurpose;
+  entryType: VisaEntryType;
+  serviceTier: VisaServiceTier;
+  visaCategory?: VisaCategory;
+  etaMinDays?: number;
+  etaMaxDays?: number;
+  etaBasis?: VisaEtaBasis;
+  embassyFeeInr?: number;
+  vfsFeeInr?: number;
+  plumtripsServiceFeeInr?: number;
+  indicativeVisaCostInr?: number;
+  priceNote?: string;
+  opsNotes?: string;
+}
+
+export function resolveCreateRuleRow(
+  mapped: Record<string, string>,
+  rowNumber: number,
+): { ok: true; create: ResolvedRuleCreate } | { ok: false; reason: string } {
+  const missing: string[] = [];
+  const destRaw = stringIn(mapped.destinationIso2) ?? stringIn(mapped.destinationName);
+  if (!destRaw) missing.push("Destination (ISO2, ISO3, or name)");
+  const purposeRaw = stringIn(mapped.purpose);
+  if (!purposeRaw) missing.push("Purpose");
+  if (missing.length > 0) {
+    return { ok: false, reason: `a blank Rule Id creates a new rule, which needs ${missing.join(" and ")}` };
+  }
+
+  const iso2 = normaliseToIso2(destRaw!);
+  if (!iso2) {
+    return { ok: false, reason: `"${destRaw}" is not a recognised destination (accepts a country name, ISO2, or ISO3 code)` };
+  }
+  // Canonical name from countryCodes.ts, same posture as scripts/
+  // import-visa-checklist-rules.ts's own destinationName resolution — NEVER
+  // whatever text ops happened to type into the sheet.
+  const destinationName = getCountryByIso2(iso2)?.name ?? destRaw!;
+
+  const purpose = purposeRaw!.toUpperCase();
+  if (!(VISA_PURPOSES as readonly string[]).includes(purpose)) {
+    return { ok: false, reason: `Purpose "${mapped.purpose}" must be one of ${VISA_PURPOSES.join(", ")}` };
+  }
+
+  const entryType = (stringIn(mapped.entryType) ?? "UNSPECIFIED").toUpperCase();
+  if (!(VISA_ENTRY_TYPES as readonly string[]).includes(entryType)) {
+    return { ok: false, reason: `Entry Type "${mapped.entryType}" must be one of ${VISA_ENTRY_TYPES.join(", ")}` };
+  }
+
+  const serviceTier = (stringIn(mapped.serviceTier) ?? "STANDARD").toUpperCase();
+  if (!(VISA_SERVICE_TIERS as readonly string[]).includes(serviceTier)) {
+    return { ok: false, reason: `Service Tier "${mapped.serviceTier}" must be one of ${VISA_SERVICE_TIERS.join(", ")}` };
+  }
+
+  // visaCategory/ETA/fees/notes — same validation as resolveRuleRow, none
+  // of it required (see file header above).
+  const visaCategoryRaw = stringIn(mapped.visaCategory);
+  if (visaCategoryRaw !== undefined && !(VISA_CATEGORIES as readonly string[]).includes(visaCategoryRaw)) {
+    return { ok: false, reason: `Visa Category "${visaCategoryRaw}" must be one of ${VISA_CATEGORIES.join(", ")}` };
+  }
+
+  const etaMin = numberIn(mapped.etaMinDays, "ETA Min Days");
+  if (etaMin.error) return { ok: false, reason: etaMin.error };
+  const etaMax = numberIn(mapped.etaMaxDays, "ETA Max Days");
+  if (etaMax.error) return { ok: false, reason: etaMax.error };
+  if ((etaMin.value === undefined) !== (etaMax.value === undefined)) {
+    return { ok: false, reason: "ETA Min Days and ETA Max Days must both be present or both be blank" };
+  }
+  if (etaMin.value !== undefined && etaMax.value !== undefined && etaMin.value > etaMax.value) {
+    return { ok: false, reason: `ETA Min Days (${etaMin.value}) is greater than ETA Max Days (${etaMax.value})` };
+  }
+
+  const etaBasisRaw = stringIn(mapped.etaBasis);
+  if (etaBasisRaw !== undefined && !(VISA_ETA_BASES as readonly string[]).includes(etaBasisRaw)) {
+    return { ok: false, reason: `ETA Basis "${etaBasisRaw}" must be one of ${VISA_ETA_BASES.join(", ")}` };
+  }
+
+  const embassyFee = numberIn(mapped.embassyFeeInr, "Embassy Fee INR");
+  if (embassyFee.error) return { ok: false, reason: embassyFee.error };
+  const vfsFee = numberIn(mapped.vfsFeeInr, "VFS Fee INR");
+  if (vfsFee.error) return { ok: false, reason: vfsFee.error };
+  const serviceFee = numberIn(mapped.plumtripsServiceFeeInr, "Plumtrips Service Fee INR");
+  if (serviceFee.error) return { ok: false, reason: serviceFee.error };
+  const indicativeCost = numberIn(mapped.indicativeVisaCostInr, "Indicative Visa Cost INR");
+  if (indicativeCost.error) return { ok: false, reason: indicativeCost.error };
+
+  return {
+    ok: true,
+    create: {
+      destinationIso2: iso2,
+      destinationName,
+      purpose: purpose as VisaPurpose,
+      entryType: entryType as VisaEntryType,
+      serviceTier: serviceTier as VisaServiceTier,
+      visaCategory: visaCategoryRaw as VisaCategory | undefined,
+      etaMinDays: etaMin.value,
+      etaMaxDays: etaMax.value,
+      etaBasis: etaBasisRaw as VisaEtaBasis | undefined,
+      embassyFeeInr: embassyFee.value,
+      vfsFeeInr: vfsFee.value,
+      plumtripsServiceFeeInr: serviceFee.value,
+      indicativeVisaCostInr: indicativeCost.value,
+      priceNote: stringIn(mapped.priceNote),
+      opsNotes: stringIn(mapped.opsNotes),
+    },
+  };
 }
 
 /* ─────────────────────────────────────────────────────────────────────

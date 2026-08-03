@@ -18,14 +18,34 @@
 // worse than not offering CSV at all (task brief §1). The frontend says so
 // next to the CSV option; nothing here pretends otherwise either.
 //
-// IMPORT — update-only, never create, never publish:
-//   - Matches on Rule Id alone. A row whose id doesn't resolve to a real
-//     VisaRule is reported, never used to create one — a spreadsheet typo
-//     must never become a new catalogue entry.
-//   - status is never read from the file at all (see RULES_CONTEXT_FIELDS
-//     in the shared module) — publishing stays POST /rules/:id/publish's
-//     job. assertNeverSetsPublishedStatus() below backs that with a
-//     structural, self-scanning guard (same convention scripts/
+// IMPORT — update on a matched Rule Id, create on a blank one, never publish:
+//   - A non-blank Rule Id matches on that id alone. A row whose id doesn't
+//     resolve to a real VisaRule is reported, never used to create one — a
+//     spreadsheet typo must never become a new catalogue entry.
+//   - A BLANK Rule Id (2026-08-04) creates a new DRAFT rule instead of being
+//     rejected outright — ops works in Excel and the catalogue is heading
+//     past 110 countries, so adding new rows the same way existing ones are
+//     edited is the right workflow, with validation instead of a ban. Only
+//     Destination (name/ISO2/ISO3, via countryCodes.ts) and Purpose are
+//     required; Entry Type/Service Tier default to UNSPECIFIED/STANDARD
+//     when blank (scripts/extract-visa-checklists.ts's own defaults).
+//     visaCategory/ETA/cost are NOT required at create — those are
+//     publish-time requirements (POST /rules/:id/publish), same as every
+//     other DRAFT-creating path in this codebase. A row whose natural key
+//     (destination/purpose/entryType/serviceTier) already exists as a real
+//     rule is rejected, not silently turned into an update — see
+//     resolveCreateRuleRow/processImport's own comments. Every created rule
+//     is seedSource-stamped (scripts/purge-visa-seed.ts's marker) so it's
+//     distinguishable and purgeable, and starts with NO document checklist
+//     (a REQUIREMENTS row can never reference an id that doesn't exist yet)
+//     — reported explicitly per created rule, not discovered by a customer
+//     later.
+//   - status is never read from the file at all, for either an update OR a
+//     create row (see RULES_CONTEXT_FIELDS in the shared module) —
+//     publishing stays POST /rules/:id/publish's job, and every created row
+//     is hardcoded to DRAFT regardless of anything in the file.
+//     assertNeverSetsPublishedStatus() below backs that with a structural,
+//     self-scanning guard (same convention scripts/
 //     import-visa-checklist-rules.ts's assertNeverPublishesLiteral() and
 //     migrations/2026-08-02-merge-visa-price-list.ts's
 //     assertNeverSetsCategory() already use), not just this comment.
@@ -80,10 +100,12 @@ import {
   serializeRuleRow,
   serializeRequirementRow,
   resolveRuleRow,
+  resolveCreateRuleRow,
   resolveRequirementRow,
   mapSheetRow,
   cellToString,
   type ResolvedRuleEdit,
+  type ResolvedRuleCreate,
   type ResolvedRequirementGroup,
 } from "./admin.visa.rules.importExportShared.js";
 
@@ -140,6 +162,43 @@ const IMPORT_EXPORT_FIELDS = [
   "opsNotes",
   "documentGroups",
 ] as const;
+
+/* ─────────────────────────────────────────────────────────────────────
+ * CREATE path constants (2026-08-04) — a blank-Rule-Id row.
+ * ───────────────────────────────────────────────────────────────────── */
+// nationality is low-cardinality today, always "IN" (VisaRule.ts's own
+// natural-key comment) — there is no Nationality column on the RULES sheet
+// at all, so every created rule gets this fixed value, same as it would if
+// created by hand through the ordinary admin form.
+const CREATE_NATIONALITY = "IN";
+// variantKey isn't read from the sheet for a create either (no column, and
+// not asked for) — every created rule gets the schema's own default by
+// simply never setting the field, same as ordinary admin-form creates.
+const CREATE_VARIANT_KEY = "DEFAULT";
+// productClass is schema-required with no column on the RULES sheet at all
+// — defaulted the same way scripts/extract-visa-checklists.ts defaults it
+// for its own downstream create path.
+const CREATE_PRODUCT_CLASS = "VISA";
+// scripts/purge-visa-seed.ts's own marker convention (`<source>@<year-month>`)
+// — matches SEED_SOURCE in scripts/import-visa-checklist-rules.ts and
+// scripts/seed-visa-rules.ts, but its own distinct value so a reviewer (or
+// that purge script's own report) can tell "created via the spreadsheet
+// rules-import" apart from "created via the checklist-PDF import."
+const CREATE_SEED_SOURCE = "visa-rules-spreadsheet-import@2026-08";
+// Audited on create — the identity fields a create actually sets, plus the
+// same editable set IMPORT_EXPORT_FIELDS already covers (NOT admin.visa.
+// rules.ts's own AUDITABLE_FIELDS — that list excludes opsNotes/
+// documentGroups, which this surface DOES carry; see that file's own
+// comment on why its field set is deliberately independent).
+const CREATE_AUDIT_FIELDS = [
+  "nationality", "destinationIso2", "destinationName", "purpose", "entryType", "serviceTier",
+  "productClass", "status",
+  ...IMPORT_EXPORT_FIELDS,
+] as const;
+
+function ruleNaturalKey(destinationIso2: string, purpose: string, entryType: string, serviceTier: string): string {
+  return [CREATE_NATIONALITY, destinationIso2, purpose, entryType, serviceTier, CREATE_VARIANT_KEY].join("|");
+}
 
 /* ═════════════════════════════════════════════════════════════════════
  * EXPORT
@@ -286,12 +345,32 @@ interface RuleChangeEntry {
   changes: { field: string; from: unknown; to: unknown }[];
 }
 
+// One entry per row that created a new rule. ruleId is only present after
+// an actual commit — a dry-run preview creates nothing, so there is no id
+// yet to report. hasChecklist is always false: a REQUIREMENTS row can never
+// reference an id that doesn't exist at upload time, so a newly created
+// rule can never arrive with document requirements already attached — see
+// this file's own header comment. Surfaced explicitly here (task brief:
+// "visible now rather than discovered by a customer later"), not left
+// implicit.
+interface RuleCreateEntry {
+  destinationIso2: string;
+  destinationName: string;
+  purpose: string;
+  entryType: string;
+  serviceTier: string;
+  hasChecklist: false;
+  ruleId?: string;
+}
+
 interface ImportProcessResult {
   totalRuleRowsInFile: number;
   matchedCount: number;
   changedCount: number;
   unchangedCount: number;
   ruleChanges: RuleChangeEntry[];
+  createdCount: number;
+  ruleCreates: RuleCreateEntry[];
   invalidRuleRows: { rowNumber: number; ruleId: string; reason: string }[];
   unmatchedRuleRows: { rowNumber: number; ruleId: string }[];
   duplicateRuleRows: { ruleId: string; rowNumbers: number[] }[];
@@ -314,6 +393,8 @@ async function processImport(
     changedCount: 0,
     unchangedCount: 0,
     ruleChanges: [],
+    createdCount: 0,
+    ruleCreates: [],
     invalidRuleRows: [],
     unmatchedRuleRows: [],
     duplicateRuleRows: [],
@@ -324,18 +405,34 @@ async function processImport(
     unrecognizedRequirementColumns: [],
   };
 
-  // ── Pass 1 — resolve every RULES row (structural validation only; no DB yet). ──
+  // ── Pass 1 — resolve every RULES row (structural validation only; no DB
+  // yet). A blank Rule Id is a CREATE candidate, resolved via
+  // resolveCreateRuleRow (its own, smaller validation surface — see that
+  // function's header); a non-blank one is an UPDATE candidate, resolved
+  // via resolveRuleRow exactly as before this row ever existed. ──
   const unrecognizedRuleColSet = new Set<string>();
   const resolvedRuleEdits: { rowNumber: number; edit: ResolvedRuleEdit }[] = [];
+  const resolvedRuleCreates: { rowNumber: number; create: ResolvedRuleCreate }[] = [];
 
   ruleRows.forEach((raw, i) => {
     const rowNumber = i + 2; // header is row 1
     const { mapped, unrecognized } = mapSheetRow(raw, RULES_HEADER_FIELD_MAP);
     unrecognized.forEach((u) => unrecognizedRuleColSet.add(u));
 
+    const ruleIdRaw = (mapped.ruleId || "").trim();
+    if (!ruleIdRaw) {
+      const built = resolveCreateRuleRow(mapped, rowNumber);
+      if (built.ok === false) {
+        result.invalidRuleRows.push({ rowNumber, ruleId: "", reason: built.reason });
+        return;
+      }
+      resolvedRuleCreates.push({ rowNumber, create: built.create });
+      return;
+    }
+
     const built = resolveRuleRow(mapped, rowNumber);
     if (built.ok === false) {
-      result.invalidRuleRows.push({ rowNumber, ruleId: (mapped.ruleId || "").trim(), reason: built.reason });
+      result.invalidRuleRows.push({ rowNumber, ruleId: ruleIdRaw, reason: built.reason });
       return;
     }
     resolvedRuleEdits.push({ rowNumber, edit: built.edit });
@@ -360,6 +457,75 @@ async function processImport(
       continue;
     }
     result.duplicateRuleRows.push({ ruleId: list[0].edit.ruleId, rowNumbers: list.map((e) => e.rowNumber) });
+  }
+
+  // ── Pass 2b — same collision problem as Pass 2, but for CREATE rows:
+  // two blank-Rule-Id rows resolving to the same destination/purpose/
+  // entryType/serviceTier can't both create — the second would just hit
+  // the DB's own unique index (VisaRule.ts's 6-field compound index).
+  // Reject ALL of them here, before any write is attempted, rather than
+  // let the second fail with a raw duplicate-key error on commit. ──
+  const createsByKey = new Map<string, { rowNumber: number; create: ResolvedRuleCreate }[]>();
+  for (const c of resolvedRuleCreates) {
+    const key = ruleNaturalKey(c.create.destinationIso2, c.create.purpose, c.create.entryType, c.create.serviceTier);
+    const list = createsByKey.get(key) || [];
+    list.push(c);
+    createsByKey.set(key, list);
+  }
+  const uniqueRuleCreates: { rowNumber: number; create: ResolvedRuleCreate }[] = [];
+  for (const list of createsByKey.values()) {
+    if (list.length === 1) {
+      uniqueRuleCreates.push(list[0]);
+      continue;
+    }
+    for (const c of list) {
+      result.invalidRuleRows.push({
+        rowNumber: c.rowNumber,
+        ruleId: "",
+        reason:
+          `rows ${list.map((x) => x.rowNumber).join(", ")} all create the same destination/purpose/entry type/` +
+          `service tier — fix the duplicate and re-upload`,
+      });
+    }
+  }
+
+  // ── Pass 2c — reject a create whose natural key already exists as a real
+  // rule: that's an update the ops team got wrong (forgot to fill in the
+  // Rule Id), not a genuine new corridor — never silently create a
+  // duplicate, and never silently treat it as an edit of the existing rule
+  // either (a create row carries none of that rule's current values, so
+  // "helpfully" applying it as an edit would blow away whatever's there).
+  // Named after the existing rule's own Rule Id, so ops can just paste that
+  // in and re-upload as an update instead. Batched into one query, same
+  // convention as Pass 4's own batch-fetch below. ──
+  const collisionFilters = uniqueRuleCreates.map(({ create }) => ({
+    nationality: CREATE_NATIONALITY,
+    destinationIso2: create.destinationIso2,
+    purpose: create.purpose,
+    entryType: create.entryType,
+    serviceTier: create.serviceTier,
+    variantKey: CREATE_VARIANT_KEY,
+  }));
+  const collidingRules = collisionFilters.length ? await VisaRule.find({ $or: collisionFilters }).lean() : [];
+  const collidingByKey = new Map(
+    collidingRules.map((r: any) => [ruleNaturalKey(r.destinationIso2, r.purpose, r.entryType, r.serviceTier), r]),
+  );
+
+  const finalRuleCreates: { rowNumber: number; create: ResolvedRuleCreate }[] = [];
+  for (const c of uniqueRuleCreates) {
+    const key = ruleNaturalKey(c.create.destinationIso2, c.create.purpose, c.create.entryType, c.create.serviceTier);
+    const existing = collidingByKey.get(key);
+    if (existing) {
+      result.invalidRuleRows.push({
+        rowNumber: c.rowNumber,
+        ruleId: "",
+        reason:
+          `a rule already exists for this destination/purpose/entry type/service tier (Rule Id ${existing._id}) ` +
+          `— that's an update, not a create; fill in its Rule Id and re-upload instead`,
+      });
+      continue;
+    }
+    finalRuleCreates.push(c);
   }
 
   // ── Pass 3 — resolve every REQUIREMENTS row, grouped by rule id, only
@@ -508,6 +674,61 @@ async function processImport(
         await writeRuleAudit(rule._id, "IMPORT", changes, performedByUserId);
       }
     }
+  }
+
+  // ── Pass 7 — create every row that survived Pass 1/2b/2c. ALWAYS DRAFT,
+  // regardless of anything in the file (status is never read for a create
+  // row — see this file's own header), ALWAYS seedSource-stamped so it's
+  // distinguishable and purgeable (scripts/purge-visa-seed.ts), and NEVER
+  // published — assertNeverSetsPublishedStatus() at the top of this file
+  // would refuse to even boot this module if a PUBLISHED literal ever
+  // showed up in its source, so "DRAFT" here isn't just convention, it's
+  // structurally the only status this code is allowed to write. No
+  // documentGroups: a REQUIREMENTS row can never reference an id that
+  // doesn't exist yet, so every created rule starts with an empty
+  // checklist — reported via hasChecklist, not left implicit. ──
+  for (const { create } of finalRuleCreates) {
+    result.createdCount += 1;
+    const entry: RuleCreateEntry = {
+      destinationIso2: create.destinationIso2,
+      destinationName: create.destinationName,
+      purpose: create.purpose,
+      entryType: create.entryType,
+      serviceTier: create.serviceTier,
+      hasChecklist: false,
+    };
+
+    if (!dryRun) {
+      const rule = await VisaRule.create({
+        nationality: CREATE_NATIONALITY,
+        destinationIso2: create.destinationIso2,
+        destinationName: create.destinationName,
+        purpose: create.purpose,
+        entryType: create.entryType,
+        serviceTier: create.serviceTier,
+        variantKey: CREATE_VARIANT_KEY,
+        productClass: CREATE_PRODUCT_CLASS,
+        visaCategory: create.visaCategory,
+        etaMinDays: create.etaMinDays,
+        etaMaxDays: create.etaMaxDays,
+        etaBasis: create.etaBasis,
+        embassyFeeInr: create.embassyFeeInr,
+        vfsFeeInr: create.vfsFeeInr,
+        plumtripsServiceFeeInr: create.plumtripsServiceFeeInr,
+        indicativeVisaCostInr: create.indicativeVisaCostInr,
+        priceNote: create.priceNote,
+        opsNotes: create.opsNotes,
+        status: "DRAFT",
+        seedSource: CREATE_SEED_SOURCE,
+      });
+      entry.ruleId = String(rule._id);
+
+      const after = rule.toObject();
+      const changes = diffFields({}, after, CREATE_AUDIT_FIELDS);
+      await writeRuleAudit(rule._id, "IMPORT", changes, performedByUserId);
+    }
+
+    result.ruleCreates.push(entry);
   }
 
   return result;

@@ -16,6 +16,9 @@ import ExcelJS from "exceljs";
 const { _rules, _ruleAudits, chainableRuleArray, wrapRuleDoc } = vi.hoisted(() => {
   function matches(rec: Record<string, any>, filter: Record<string, any>): boolean {
     return Object.entries(filter || {}).every(([key, cond]) => {
+      if (key === "$or" && Array.isArray(cond)) {
+        return cond.some((sub: Record<string, any>) => matches(rec, sub));
+      }
       if (key === "_id" && cond && typeof cond === "object" && "$in" in cond) {
         return (cond.$in as any[]).map(String).includes(String(rec._id));
       }
@@ -52,6 +55,10 @@ const { _rules, _ruleAudits, chainableRuleArray, wrapRuleDoc } = vi.hoisted(() =
         return doc;
       },
     });
+    Object.defineProperty(doc, "toObject", {
+      enumerable: false,
+      value: () => ({ ...rec }),
+    });
     return doc;
   }
 
@@ -86,6 +93,10 @@ vi.mock("../models/VisaRule.js", async () => {
     VISA_RULE_STATUSES: actual.VISA_RULE_STATUSES,
     default: {
       find: (filter: any) => chainableRuleArray(() => _rules.query(filter)),
+      create: async (doc: any) => {
+        const rec = _rules.insert(doc);
+        return wrapRuleDoc(rec);
+      },
     },
   };
 });
@@ -522,5 +533,145 @@ describe("editing through the import", () => {
     expect(res.body.duplicateRuleRows).toHaveLength(1);
     expect(res.body.duplicateRuleRows[0].rowNumbers).toEqual([2, 3]);
     expect(res.body.changedCount).toBe(0);
+  });
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * CREATE path (2026-08-04) — a RULES row with a blank Rule Id. FR/DE are
+ * both real entries in utils/countryCodes.ts's COUNTRY_CODES, so
+ * destination resolution is exercised against the real table, not a mock.
+ * ───────────────────────────────────────────────────────────────────── */
+const RULES_CSV_HEADER =
+  "Rule Id,Destination ISO2,Destination Name,Purpose,Entry Type,Service Tier,Variant Key,Status,Visa Category,ETA Min Days,ETA Max Days,ETA Basis,Embassy Fee INR,VFS Fee INR,Plumtrips Service Fee INR,Indicative Visa Cost INR,Price Note,Ops Notes,Last Reviewed At\n";
+
+const RULES_CSV_COLUMN_ORDER = [
+  "ruleId", "destinationIso2", "destinationName", "purpose", "entryType", "serviceTier", "variantKey", "status",
+  "visaCategory", "etaMinDays", "etaMaxDays", "etaBasis", "embassyFeeInr", "vfsFeeInr", "plumtripsServiceFeeInr",
+  "indicativeVisaCostInr", "priceNote", "opsNotes", "lastReviewedAt",
+] as const;
+
+function ruleCsvRow(cells: Partial<Record<(typeof RULES_CSV_COLUMN_ORDER)[number], string>>): string {
+  return RULES_CSV_COLUMN_ORDER.map((k) => cells[k] ?? "").join(",") + "\n";
+}
+
+describe("creating a rule via a blank Rule Id", () => {
+  it("a blank Rule Id creates a new DRAFT rule, seedSource-stamped", async () => {
+    const csv = RULES_CSV_HEADER + ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST" });
+    const res = await request(makeApp()).post("/rules/import/commit").attach("file", Buffer.from(csv), "create.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(1);
+    expect(res.body.ruleCreates).toHaveLength(1);
+    const created = res.body.ruleCreates[0];
+    expect(created.destinationIso2).toBe("FR");
+    expect(created.destinationName).toBe("France");
+    expect(created.purpose).toBe("TOURIST");
+    expect(created.entryType).toBe("UNSPECIFIED"); // defaulted, blank in the file
+    expect(created.serviceTier).toBe("STANDARD"); // defaulted, blank in the file
+    expect(created.hasChecklist).toBe(false);
+    expect(created.ruleId).toBeTruthy();
+
+    expect(_rules.query({}).length).toBe(1);
+    const stored = _rules.query({})[0];
+    expect(stored.status).toBe("DRAFT");
+    expect(stored.seedSource).toBe("visa-rules-spreadsheet-import@2026-08");
+    expect(stored.nationality).toBe("IN");
+    expect(stored.variantKey).toBe("DEFAULT");
+    expect(stored.productClass).toBe("VISA");
+
+    const audits = _ruleAudits.query({ ruleId: stored._id });
+    expect(audits).toHaveLength(1);
+    expect(audits[0].action).toBe("IMPORT");
+  });
+
+  it("rejects a blank-Rule-Id row missing Destination, naming the row and what's missing", async () => {
+    const csv = RULES_CSV_HEADER + ruleCsvRow({ purpose: "TOURIST" });
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(0);
+    expect(res.body.invalidRuleRows).toHaveLength(1);
+    expect(res.body.invalidRuleRows[0].rowNumber).toBe(2);
+    expect(res.body.invalidRuleRows[0].reason).toMatch(/Destination/);
+    expect(_rules.query({}).length).toBe(0);
+  });
+
+  it("rejects a blank-Rule-Id row missing Purpose, naming the row and what's missing", async () => {
+    const csv = RULES_CSV_HEADER + ruleCsvRow({ destinationIso2: "FR" });
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.invalidRuleRows).toHaveLength(1);
+    expect(res.body.invalidRuleRows[0].rowNumber).toBe(2);
+    expect(res.body.invalidRuleRows[0].reason).toMatch(/Purpose/);
+  });
+
+  it("rejects a blank-Rule-Id row whose destination name doesn't resolve", async () => {
+    const csv = RULES_CSV_HEADER + ruleCsvRow({ destinationName: "Narnia", purpose: "TOURIST" });
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(0);
+    expect(res.body.invalidRuleRows).toHaveLength(1);
+    expect(res.body.invalidRuleRows[0].reason).toMatch(/not a recognised destination/);
+  });
+
+  it("rejects a create whose natural key collides with an existing rule, naming its Rule Id", async () => {
+    const rule = fullRule({ destinationIso2: "DE", purpose: "TOURIST", entryType: "MULTIPLE", serviceTier: "STANDARD" });
+    const csv =
+      RULES_CSV_HEADER +
+      ruleCsvRow({ destinationIso2: "DE", purpose: "TOURIST", entryType: "MULTIPLE", serviceTier: "STANDARD" });
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(0);
+    expect(res.body.invalidRuleRows).toHaveLength(1);
+    expect(res.body.invalidRuleRows[0].reason).toContain(String(rule._id));
+    expect(res.body.invalidRuleRows[0].reason).toMatch(/that's an update, not a create/);
+  });
+
+  it("rejects both rows when two blank-Rule-Id rows would create the same destination/purpose/entry type/service tier", async () => {
+    const dupRow = ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST", entryType: "SINGLE", serviceTier: "EXPRESS" });
+    const csv = RULES_CSV_HEADER + dupRow + dupRow;
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(0);
+    expect(res.body.invalidRuleRows).toHaveLength(2);
+    expect(res.body.invalidRuleRows.map((r: any) => r.rowNumber)).toEqual([2, 3]);
+  });
+
+  it("never publishes a created rule, even if the file smuggles a PUBLISHED-looking status cell", async () => {
+    const csv = RULES_CSV_HEADER + ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST", status: "PUBLISHED" });
+    const res = await request(makeApp()).post("/rules/import/commit").attach("file", Buffer.from(csv), "smuggle.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(1);
+    expect(_rules.query({})[0].status).toBe("DRAFT");
+  });
+
+  it("a create row appears in the preview's ruleCreates section, never in ruleChanges — and preview writes nothing", async () => {
+    const csv = RULES_CSV_HEADER + ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST" });
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(1);
+    expect(res.body.ruleCreates).toHaveLength(1);
+    expect(res.body.ruleCreates[0].ruleId).toBeUndefined(); // dry run — nothing actually created yet
+    expect(res.body.ruleChanges).toEqual([]);
+    expect(res.body.changedCount).toBe(0);
+    expect(_rules.query({}).length).toBe(0);
+  });
+
+  it("accepts destination by ISO3 or by name, resolving both to the canonical ISO2/name", async () => {
+    const byIso3 = RULES_CSV_HEADER + ruleCsvRow({ destinationIso2: "DEU", purpose: "TOURIST", entryType: "SINGLE" });
+    const res1 = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(byIso3), "iso3.csv");
+    expect(res1.body.ruleCreates[0].destinationIso2).toBe("DE");
+    expect(res1.body.ruleCreates[0].destinationName).toBe("Germany");
+
+    const byName = RULES_CSV_HEADER + ruleCsvRow({ destinationName: "germany", purpose: "TOURIST", entryType: "DOUBLE" });
+    const res2 = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(byName), "name.csv");
+    expect(res2.body.ruleCreates[0].destinationIso2).toBe("DE");
+    expect(res2.body.ruleCreates[0].destinationName).toBe("Germany");
   });
 });
