@@ -1,4 +1,12 @@
 // apps/backend/src/controllers/flightController.ts
+//
+// DEAD as of 0.3 — no in-repo caller; verify no external hits before removing.
+// The only caller was the concierge frontend, which now reads flight status from
+// the turn reply (one AeroAPI call per status query instead of two). Left in
+// place because monitors / mobile / gateway callers would not show up in a grep.
+// getDelightfulFlightStatus still delegates to the corrected occurrence
+// selection, so an unknown external caller gets the right flight, not the old
+// +2-day window head.
 import { Request, Response } from 'express';
 // Explicit .js extension is required for 'nodenext' resolution
 // Change line 4 to this:

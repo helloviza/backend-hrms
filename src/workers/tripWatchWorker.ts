@@ -10,7 +10,7 @@ import crypto from "crypto";
 import TripWatch from "../models/TripWatch.js";
 import TripAlert from "../models/TripAlert.js";
 import SBTBooking from "../models/SBTBooking.js";
-import { getDelightfulFlightStatus } from "../services/flightService.js";
+import { getFlightOccurrenceForDate } from "../services/flightService.js";
 import {
   detectMaterialChange,
   normalizeWatchState,
@@ -41,7 +41,14 @@ export interface WatchCycleDeps {
   metric: (m: any) => void;
   /** Atomically claim the next due, unclaimed ACTIVE watch (or null). */
   claimNext: () => Promise<any | null>;
-  checkStatus: (flightNo: string) => Promise<any>;
+  /**
+   * Status for the SPECIFIC occurrence this watch is watching. departDate is
+   * required: without it the lookup falls back to "next upcoming", which for a
+   * daily flight is a DIFFERENT occurrence than the booked one — the watcher
+   * would then diff the booked flight's last state against another day's flight
+   * and could alert on a delay that isn't the traveller's.
+   */
+  checkStatus: (flightNo: string, departDate: Date | string) => Promise<any>;
   /** Persist lastCheckedAt + lastKnownState and release the claim. */
   persistCheck: (watch: any, curr: WatchFlightState | null) => Promise<void>;
   createAndNotifyAlert: (watch: any, change: MaterialChange) => Promise<void>;
@@ -73,7 +80,8 @@ export async function runWatchCycle(
         continue;
       }
 
-      const info = await deps.checkStatus(watch.flightNo); // 1 call per watch per cycle
+      // 1 call per watch per cycle, bounded to the watched departure date.
+      const info = await deps.checkStatus(watch.flightNo, watch.departDate);
       deps.metric(watchMetric("pluto.watch.checked", { workspaceId: String(watch.workspaceId) }));
       checked++;
 
@@ -134,7 +142,7 @@ function buildRealDeps(now: Date): WatchCycleDeps {
         { $set: { claimedBy: INSTANCE_ID, claimedAt: now } },
         { new: true, sort: { lastCheckedAt: 1 } },
       ),
-    checkStatus: (flightNo) => getDelightfulFlightStatus(flightNo),
+    checkStatus: (flightNo, departDate) => getFlightOccurrenceForDate(flightNo, departDate),
     persistCheck: async (watch, curr) => {
       await TripWatch.updateOne(
         { _id: watch._id },

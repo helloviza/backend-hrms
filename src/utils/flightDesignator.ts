@@ -49,3 +49,23 @@ export function extractFlightDesignator(prompt: string): string | null {
   if (!m) return null;
   return `${m[1]}${m[2]}`.toUpperCase();
 }
+
+/**
+ * Date TOKEN in a flight-status prompt ("… AI-4305 on 5 Aug" → "5 Aug"), or
+ * null. Deliberately only finds the token — parsing it to ISO is
+ * plutoDate.parseDateToISO's job, and there must be exactly one date parser.
+ * The token pattern is the same one the flight-search branch uses.
+ *
+ * The designator is stripped FIRST: a carrier code whose second character is a
+ * digit (I5, S5) would otherwise let "I5-754" match the numeric d/m pattern as
+ * "5-75" and invent a date out of the flight number.
+ */
+const DATE_TOKEN =
+  /(\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)/i;
+
+export function extractStatusDate(prompt: string): string | null {
+  if (!prompt) return null;
+  const withoutDesignator = prompt.replace(FLIGHT_DESIGNATOR, " ");
+  const m = withoutDesignator.match(DATE_TOKEN);
+  return m ? m[0].trim() : null;
+}

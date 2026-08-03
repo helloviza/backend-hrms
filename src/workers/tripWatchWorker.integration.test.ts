@@ -19,7 +19,14 @@ vi.mock("../models/TripAlert.js", () => ({ default: {
   create: H.aCreate, updateOne: H.aUpdateOne, find: H.aFind, findOne: H.aFindOne,
 } }));
 vi.mock("../models/SBTBooking.js", () => ({ default: { findById: H.bFindById } }));
-vi.mock("../services/flightService.js", () => ({ getDelightfulFlightStatus: H.flightStatus }));
+// 0.3: the worker now asks for the occurrence matching the WATCHED departDate
+// (getFlightOccurrenceForDate) instead of taking the head of an unbounded
+// newest-first response. The spy plays the same role, one arg richer.
+vi.mock("../services/flightService.js", () => ({
+  getFlightOccurrenceForDate: H.flightStatus,
+  getFlightOccurrences: H.flightStatus,
+  isFlightLookupError: (r: any) => Boolean(r && r.error),
+}));
 vi.mock("../services/whatsappCloud.service.js", () => ({ sendTemplateMessage: H.sendTemplate, sendTextMessageResult: H.sendText, sendButtonMessage: H.sendButtons }));
 vi.mock("../models/ArrivalSession.js", () => ({ default: { find: H.arrFind, findOne: H.arrFindOne, create: vi.fn(), findOneAndUpdate: vi.fn() } }));
 vi.mock("../utils/mailer.js", () => ({ sendMail: H.sendMail }));

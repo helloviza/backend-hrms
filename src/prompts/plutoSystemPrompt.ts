@@ -216,14 +216,10 @@ RESPONSE FORMAT (STRICT JSON)
   "title": string,
   "context": string,
   "tripType": "business" | "holiday" | "mice" | "event",
-  "flightStatus"?: {
-    "airline": string,
-    "status": string,
-    "gate": string,
-    "terminal": string,
-    "arrival": string,
-    "tip": string
-  },
+  // NOTE: there is deliberately no "flightStatus" key. Live flight status is
+  // served by a dedicated code path (routes/copilot.travel.ts) that never calls
+  // the model, so a model-authored flightStatus object could only ever be an
+  // invented one competing with real AeroAPI data. Do not re-add it.
   "itinerary"?: [
     { "day": number, "heading": string, "details": string[] }
   ],
