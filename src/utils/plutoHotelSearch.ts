@@ -33,6 +33,21 @@ export interface HotelListing {
   /** Kept in the TBO shape so buildHotelItem / the SBT detail page read it directly. */
   HotelRating: string;
   StarRating: number | null;
+  /**
+   * The property's OWN coordinate, when TBO metadata carried one (step 7 of
+   * tbo.hotel.search.service merges HotelCodeEntry.Latitude/Longitude onto every
+   * HotelResult). Passing it through is what upgrades a map pin from a city
+   * centroid to the real address — no geocoding call, no cost.
+   *
+   * TBO casing on purpose: coordForHotel reads `Latitude`/`Longitude`, and the
+   * rest of this row already keeps TBO field names so buildHotelItem and the SBT
+   * detail handoff consume it unchanged.
+   *
+   * null when absent or unparseable — never a fabricated coordinate, and the map
+   * then falls back to the city centroid and labels the pin approximate.
+   */
+  Latitude: number | null;
+  Longitude: number | null;
   Rooms: Array<{
     RoomTypeName: string;
     TotalFare: number;
@@ -97,6 +112,12 @@ export function extractHotelCity(prompt: string): string | null {
  * buildHotelItem and the SBT detail handoff consume it with no adaptation, and
  * drops the IsDetailedResponse bulk that would bloat a chat reply.
  */
+/** TBO sends coordinates as strings. null for anything unparseable. */
+function parseCoord(v: unknown): number | null {
+  const n = typeof v === "number" ? v : Number.parseFloat(String(v ?? ""));
+  return Number.isFinite(n) ? n : null;
+}
+
 export function mapHotelForChat(h: any, nights: number): HotelListing {
   const rooms: any[] = Array.isArray(h?.Rooms) ? h.Rooms : [];
   const cheapest = rooms
@@ -129,6 +150,8 @@ export function mapHotelForChat(h: any, nights: number): HotelListing {
     CityName: String(h?.CityName ?? ""),
     HotelRating: String(h?.HotelRating ?? ""),
     StarRating: numericStar,
+    Latitude: parseCoord(h?.Latitude),
+    Longitude: parseCoord(h?.Longitude),
     Rooms: cheapest
       ? [
           {

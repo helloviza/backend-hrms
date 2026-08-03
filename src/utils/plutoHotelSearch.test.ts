@@ -155,6 +155,36 @@ describe("mapHotelForChat — real fields only", () => {
     expect(mapHotelForChat(tboHotel({ HotelRating: "N/A" }), 2).rating).toBeNull();
   });
 
+  it("passes the property's OWN coordinate through, as numbers", () => {
+    // Step 7 of tbo.hotel.search.service merges these onto every HotelResult;
+    // dropping them was what forced hotel pins to be city centroids.
+    const m = mapHotelForChat(tboHotel({ Latitude: "25.2285", Longitude: "55.3273" }), 2);
+    expect(m.Latitude).toBeCloseTo(25.2285, 4);
+    expect(m.Longitude).toBeCloseTo(55.3273, 4);
+  });
+
+  it("accepts coordinates already given as numbers", () => {
+    const m = mapHotelForChat(tboHotel({ Latitude: 25.2285, Longitude: 55.3273 }), 2);
+    expect(m.Latitude).toBeCloseTo(25.2285, 4);
+  });
+
+  it("yields NULL coordinates rather than junk when the metadata has none", () => {
+    // A HotelResult whose HotelCode had no entry in hotelMeta never gets the
+    // step-7 merge, so it reaches us with no Latitude/Longitude at all.
+    const unmerged: any = tboHotel();
+    delete unmerged.Latitude;
+    delete unmerged.Longitude;
+    const noMeta = mapHotelForChat(unmerged, 2);
+    expect(noMeta.Latitude).toBeNull();
+    expect(noMeta.Longitude).toBeNull();
+
+    for (const bad of ["", "N/A", null, undefined, "abc"]) {
+      const m = mapHotelForChat(tboHotel({ Latitude: bad, Longitude: bad }), 2);
+      expect(m.Latitude).toBeNull();
+      expect(m.Longitude).toBeNull();
+    }
+  });
+
   it("leaves price null rather than inventing one when there is no fare", () => {
     const m = mapHotelForChat(tboHotel({ Rooms: [] }), 2);
     expect(m.totalINR).toBeNull();
