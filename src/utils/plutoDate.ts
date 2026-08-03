@@ -73,3 +73,74 @@ export function parseDateToISO(raw: string | null, now: Date = new Date()): stri
 
   return "";
 }
+
+/* ───────── Prompt date-range extraction (the "locked facts" parser) ─────────
+ *
+ * Lifted VERBATIM out of copilot.travel.ts's locked-facts block so the hotel
+ * ownership gate and the locker read dates through ONE parser. They used to
+ * disagree by construction: the gate ran ~240 lines before the locker, so a
+ * first-turn "hotels in Dubai 25th Sept … 26th Sept 2026" was invisible to the
+ * gate and the live lane could not fire until the user repeated themselves.
+ *
+ * Behaviour is deliberately unchanged, including the missing-year rule below —
+ * this extraction is not the place to alter what already ships.
+ */
+
+const LOOSE_MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+
+/**
+ * "25th Sept" / "26th Sept 2026" → YYYY-MM-DD, else null.
+ *
+ * NOTE (pre-existing, intentionally preserved): a MISSING year resolves to the
+ * CURRENT year, not the nearest future one like parseDateToISO does. Changing it
+ * here would silently move every already-locked conversation, so it stays as-is;
+ * the divergence is tracked separately.
+ */
+export function parseLooseDate(token: string, now: Date = new Date()): string | null {
+  const m = token.match(/(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{4}))?/i);
+  if (!m) return null;
+  const day = parseInt(m[1], 10);
+  const monthIdx = LOOSE_MONTHS.indexOf(m[2].slice(0, 3).toLowerCase());
+  if (monthIdx < 0) return null;
+  const year = m[3] ? parseInt(m[3], 10) : now.getFullYear();
+  const d = new Date(Date.UTC(year, monthIdx, day));
+  return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+}
+
+/**
+ * One or two natural-language dates in a free-text prompt.
+ *
+ * Handles both shapes the locker handled:
+ *   - compact, sharing one month: "12-15 Sep", "12 to 15 September"
+ *   - two separate tokens:        "25th Sept Check-in and 26th Sept 2026 Checkout"
+ *
+ * Returns null when no date is found; `end` is null when only one was given.
+ * The surrounding words ("Check-in", "Checkout", "and") are irrelevant — tokens
+ * are scanned, not parsed as a sentence.
+ */
+export function extractPromptDateRange(
+  prompt: string,
+  now: Date = new Date(),
+): { start: string; end: string | null } | null {
+  if (!prompt) return null;
+
+  const compact = prompt.match(
+    /\b(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+(\d{4}))?/i,
+  );
+  if (compact) {
+    const yr = compact[4] ? ` ${compact[4]}` : "";
+    const start = parseLooseDate(`${compact[1]} ${compact[3]}${yr}`, now);
+    const end = parseLooseDate(`${compact[2]} ${compact[3]}${yr}`, now);
+    return start ? { start, end } : null;
+  }
+
+  const tokens =
+    prompt.match(
+      /\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?/gi,
+    ) || [];
+  if (tokens.length === 0) return null;
+
+  const start = parseLooseDate(tokens[0], now);
+  if (!start) return null;
+  return { start, end: tokens[1] ? parseLooseDate(tokens[1], now) : null };
+}
