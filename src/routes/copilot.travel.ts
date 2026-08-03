@@ -103,6 +103,8 @@ function buildZeroInPolicyNote(rules: PolicyRules): string {
   return "None of these options are within your company travel policy — showing them anyway; approval may be required.";
 }
 import SBTRequest from "../models/SBTRequest.js";
+import TripWatch from "../models/TripWatch.js";
+import TripAlert from "../models/TripAlert.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
 import Itinerary from "../models/Itinerary.js";
@@ -2455,6 +2457,82 @@ router.get("/conversation/:id", requireWorkspace, async (req: any, res: any) => 
   });
   if (!context) return res.status(404).json({ ok: false, error: "Conversation not found" });
   return res.status(200).json({ ok: true, context });
+});
+
+/* ────────────────────────────────────────────────────────────────
+ * GET /trips/watches — Phase 3 tracker surface (READ-ONLY)
+ *
+ * The disruption watcher has been live for a while (workers/tripWatchWorker)
+ * writing TripWatch + TripAlert and notifying by WhatsApp/email — but nothing
+ * in /concierge ever showed any of it, so a traveller could only learn about a
+ * delay from the notification itself.
+ *
+ * This is a pure CONSUMER. It performs no writes and does not touch the
+ * worker's poll / claim / notify path in any way, so it cannot destabilise a
+ * worker that is already running in production.
+ *
+ * Workspace-scoped by construction: the filter always carries workspaceId from
+ * the request (never the client body), so one workspace can never read
+ * another's watches.
+ * ──────────────────────────────────────────────────────────────── */
+router.get("/trips/watches", requireWorkspace, async (req: any, res: any) => {
+  try {
+    const workspaceObjectId = (req as any).workspaceObjectId;
+
+    const watches: any[] = await TripWatch.find({ workspaceId: workspaceObjectId })
+      .sort({ departDate: 1 })
+      .limit(50)
+      .lean();
+
+    if (watches.length === 0) {
+      return res.status(200).json({ ok: true, watches: [] });
+    }
+
+    // Alerts are fetched workspace-scoped AND restricted to the watches we just
+    // read, so a tripWatchId from another tenant can never pull an alert in.
+    const watchIds = watches.map((w) => w._id);
+    const alerts: any[] = await TripAlert.find({
+      workspaceId: workspaceObjectId,
+      tripWatchId: { $in: watchIds },
+    })
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean();
+
+    const byWatch = new Map<string, any[]>();
+    for (const a of alerts) {
+      const k = String(a.tripWatchId);
+      if (!byWatch.has(k)) byWatch.set(k, []);
+      byWatch.get(k)!.push({
+        kind: a.kind,
+        detail: a.detail,
+        createdAt: a.createdAt,
+        deliveryStatus: a.deliveryStatus,
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      watches: watches.map((w) => ({
+        _id: String(w._id),
+        flightNo: w.flightNo,
+        carrier: w.carrier,
+        origin: w.origin,
+        destination: w.destination,
+        departDate: w.departDate,
+        status: w.status,
+        notifyChannel: w.notifyChannel,
+        lastCheckedAt: w.lastCheckedAt ?? null,
+        // The worker's own last snapshot. Rendered as-is — the tracker never
+        // invents a status, and shows "not checked yet" when this is null.
+        lastKnownState: w.lastKnownState ?? null,
+        alerts: byWatch.get(String(w._id)) ?? [],
+      })),
+    });
+  } catch (err: any) {
+    console.error("[Concierge/TripWatches] Error:", err?.message);
+    return res.status(500).json({ ok: false, error: "Failed to load tracked flights" });
+  }
 });
 
 export default router;
