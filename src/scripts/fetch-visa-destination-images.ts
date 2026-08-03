@@ -39,18 +39,22 @@
 // "fetch once, store forever" (task brief §1) means downloading
 // candidates up front, not just the one that ends up selected.
 //
-// Contrast (2026-08-04 follow-up): ops reviewing a raw, untreated
-// thumbnail was judging a photo against text they can't see — the 50%
-// overlay / 80% saturation the requirements hero applies (see
-// RequirementsPage.tsx) doesn't guarantee 4.5:1 against every photo, so
-// every candidate's full-size image is run through
-// utils/heroImageContrast.ts here, at fetch time, against the REAL
-// treatment. A candidate below 4.5:1 is still stored (audit trail, not
-// silently dropped) but flagged contrastStatus: "FAIL" — the admin picker
-// disables it, and POST .../select-image refuses it server-side even if
-// someone bypasses the UI. This runs in dry-run mode too (a read-only
-// fetch, not a write) so `--iso2=XX` without `--commit` is still a fast
-// way to see whether a destination has any passing candidates at all.
+// Contrast (2026-08-04 follow-up, gradient-scrim + per-theme revision same
+// day): ops reviewing a raw, untreated thumbnail was judging a photo
+// against text they can't see — the gradient scrim / 80% saturation the
+// requirements hero applies (see RequirementsPage.tsx) doesn't guarantee
+// 4.5:1 against every photo on its own, so every candidate's full-size
+// image is run through utils/heroImageContrast.ts here, at fetch time,
+// against the REAL treatment — gated against the worst of the thirteen
+// retintable palettes (Ivory), not just the Midnight production default,
+// since VisaThemePicker lets staff switch theme at runtime and a
+// candidate must stay safe under any of them. A candidate below 4.5:1 is
+// still stored (audit trail, not silently dropped) but flagged
+// contrastStatus: "FAIL" — the admin picker disables it, and POST
+// .../select-image refuses it server-side even if someone bypasses the
+// UI. This runs in dry-run mode too (a read-only fetch, not a write) so
+// `--iso2=XX` without `--commit` is still a fast way to see whether a
+// destination has any passing candidates at all.
 //
 // Run:
 //   DRY RUN (default) — queries Pixabay for real (so you can see candidate

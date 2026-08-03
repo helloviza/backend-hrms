@@ -37,16 +37,42 @@ import sharp from "sharp";
 // Flat at OVERLAY_ALPHA_PLATEAU from the left edge through
 // OVERLAY_PLATEAU_END_FRACTION of the band's width (covers TEXT_REGIONS'
 // full extent below, with margin), then linearly eases down to
-// OVERLAY_ALPHA_FAR_EDGE by the right edge. See RequirementsPage.tsx's
-// heroBackgroundStyle comment for how the plateau alpha was derived
-// (breakeven for a worst-case #ffffff pixel is 0.572; 0.60 is that plus
-// headroom).
-const OVERLAY_ALPHA_PLATEAU = 0.6;
+// OVERLAY_ALPHA_FAR_EDGE by the right edge.
+//
+// THEME-AWARE, GATED ON THE WORST PALETTE (2026-08-04 follow-up). The
+// frontend's plateau alpha is per-theme (VISA_THEME.scrimPlateauAlpha,
+// components/visa/ui/tokens.ts) because --s1's lightness varies enough
+// across the thirteen palettes (colordesign.md §2) that a single alpha
+// under-protects the lighter ones. But a candidate is scored ONCE, at
+// fetch time, independent of which theme happens to be active when it's
+// later rendered — and VisaThemePicker lets staff switch theme at
+// runtime. So this gate cannot use Midnight's (the production default's)
+// alpha: a candidate that clears 4.5:1 under Midnight but not under
+// Ivory would still be selectable, then fail contrast the moment a staff
+// session (or a future production default) switches to Ivory. Gate
+// against the WORST case across all thirteen instead — if it clears the
+// hardest palette to protect against, it clears all of them.
+//
+// Breakeven (contrast lands at exactly 4.50) for a worst-case #ffffff
+// pixel, per palette, then ceil'd up to the nearest whole percent after
+// adding ~3pp headroom — same derivation as tokens.ts's
+// scrimPlateauAlpha, and this table MUST stay in lockstep with that one
+// (regenerate both together if any --s1 changes):
+//   ivory 64.05% -> 68%   (worst — this is OVERLAY_ALPHA_PLATEAU below)
+//   olive/lagoon/saffron/peacock/cedar ~59.7-61.0% -> 64%
+//   graphite/terracotta ~59.2-59.7% -> 63%
+//   sapphire/orchid/amethyst ~58.2-58.9% -> 62%
+//   midnight 57.18% -> 61%
+//   crimson 56.96% -> 60%   (easiest)
+const OVERLAY_ALPHA_PLATEAU = 0.68;
 const OVERLAY_PLATEAU_END_FRACTION = 0.58;
 const OVERLAY_ALPHA_FAR_EDGE = 0.15;
 const SATURATION = 0.8;
-// VISA_THEME.midnight.s1 (components/visa/ui/tokens.ts) — the active theme.
-const S1 = { r: 6, g: 18, b: 32 };
+// Ivory's --s1 (components/visa/ui/tokens.ts) — the worst-case palette
+// this gate protects against, NOT the active production theme (Midnight).
+// A candidate passing here is guaranteed 4.5:1 under every one of the
+// thirteen palettes, not just whichever is live right now.
+const S1 = { r: 44, g: 42, b: 38 };
 
 // Overlay alpha at a given horizontal fraction (0 = left edge, 1 = right
 // edge) of the hero band — the flat-then-fade shape of the CSS gradient.
