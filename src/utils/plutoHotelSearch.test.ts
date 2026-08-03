@@ -69,6 +69,67 @@ describe("intent + extraction", () => {
     expect(extractHotelCity("show me hotels")).toBeNull();
   });
 
+  /* ── The phrasings that fell through to the model ────────────────────────
+   * Two shape patterns only: the connector had to be in|at|near|around, and
+   * the "in <City>" fallback was anchored to end-of-string. A city introduced
+   * by "for", or followed by dates, extracted as null — the turn then fell
+   * back to an empty locked destination and the AI invented hotels.
+   */
+  it("REGRESSION: 'for' connector + city mid-sentence, dates trailing", () => {
+    expect(
+      extractHotelCity("Hotel Options for Dubai Stay on 25-26 September 2026"),
+    ).toBe("Dubai");
+  });
+
+  it("REGRESSION: 'hotels for <City>' — 'for' was not a connector", () => {
+    expect(extractHotelCity("hotels for Dubai")).toBe("Dubai");
+  });
+
+  it("does NOT regress the phrasings that already worked", () => {
+    // Pattern 1, adjacent connector.
+    expect(extractHotelCity("Show me 5-star hotels in Dubai")).toBe("Dubai");
+    // The prompt the CityCode fix (65ec4d4) was verified against.
+    expect(
+      extractHotelCity("Give me some hotels in Dubai for 25 Sept to 26 Sept 2026"),
+    ).toBe("Dubai");
+  });
+
+  it("catalog fallback: a known city with NO connector at all", () => {
+    expect(extractHotelCity("Dubai hotel options, 25-26 Sept")).toBe("Dubai");
+    expect(extractHotelCity("2 nights somewhere nice — Dubai — under 20k")).toBe("Dubai");
+  });
+
+  it("canonicalises rather than passing raw text to TBO", () => {
+    expect(extractHotelCity("hotels in Bombay")).toBe("Mumbai");
+  });
+
+  it("a hotel-led prompt with NO city stays null — the honest handoff", () => {
+    for (const p of [
+      "show me hotels",
+      "I need a hotel",
+      "where to stay",
+      "hotel options for the best rates",
+      "resort with a spa and a pool",
+      "Hotel Options for Stay on 25-26 September 2026",
+    ]) {
+      expect(extractHotelCity(p)).toBeNull();
+    }
+  });
+
+  it("unanchoring pattern 2 does not turn a month into a city", () => {
+    // Bare /\bin\s+([A-Z]…)/ would happily return "September" — every candidate
+    // is validated against the destination table, which is what makes the
+    // unanchored form safe.
+    expect(extractHotelCity("hotels booked in September for a team offsite")).toBeNull();
+    expect(extractHotelCity("staying in September, flexible on the city")).toBeNull();
+  });
+
+  it("a region/country entry is not treated as a city", () => {
+    // DESTINATION_LOOKUP carries { city: null, country: "VN" } for Vietnam —
+    // a country is known but no honest city can be assigned.
+    expect(extractHotelCity("hotels in Vietnam")).toBeNull();
+  });
+
   it("maps star qualifiers to a real filter", () => {
     expect(extractStarFilter("5-star hotels")).toBe(5);
     expect(extractStarFilter("four star hotel")).toBe(4);
