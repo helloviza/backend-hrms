@@ -6,7 +6,44 @@
 // type/service tier) the applicant ends up matching. Purpose-specific
 // copy selection (business vs tourism block) happens in the UI layer, not
 // here — this model just holds both blocks.
+//
+// Country imagery (2026-08-03) — heroImageUrl existed from the original
+// schema and had never been used until now; thumbnailUrl is new alongside
+// it (task brief: "a second field for the picker thumbnail" — the
+// requirements-page hero and the /visa destination-tile thumbnail are
+// deliberately different crops/sizes, not one image reused twice).
+//
+// Ops review, never auto-accept: scripts/fetch-visa-destination-images.ts
+// fetches SEVERAL Pixabay candidates per destination and downloads BOTH a
+// preview- and full-size copy of each to OUR S3 (never hotlinked — see
+// that script's own header for why), writing them to imageCandidates
+// below with status PENDING. Nothing here ever sets heroImageUrl/
+// thumbnailUrl itself — only a human, via the admin destination-content
+// picker (routes/admin.visa.rules.ts's POST .../select-image or
+// .../image-upload), moves a candidate's (or an uploaded file's) URL into
+// the live fields. An auto-selected top search result would eventually
+// put a beer festival on a business visa page (task brief) — this model
+// has no code path that could do that.
 import mongoose, { Schema, type Document, type Model } from "mongoose";
+
+export const VISA_IMAGE_CANDIDATE_STATUSES = ["PENDING", "SELECTED", "REJECTED"] as const;
+export type VisaImageCandidateStatus = (typeof VISA_IMAGE_CANDIDATE_STATUSES)[number];
+
+// One Pixabay search hit, already downloaded to OUR S3 (both sizes) by the
+// fetch script — never a live Pixabay URL. `sourceId` is Pixabay's own hit
+// id (dedupe across re-runs, and the provenance trail if a takedown or a
+// licence question ever comes up); `pageUrl`/`tags` are read-only context
+// for whoever is reviewing, not rendered to customers.
+export interface VisaImageCandidate {
+  source: "pixabay";
+  sourceId: string;
+  previewUrl: string; // our S3 copy of Pixabay's previewURL — thumbnail-sized, for the picker grid
+  fullUrl: string; // our S3 copy of Pixabay's webformatURL/largeImageURL — hero-sized
+  pixabayPageUrl?: string;
+  tags?: string;
+  status: VisaImageCandidateStatus;
+  fetchedAt: Date;
+}
 
 export const VISA_DESTINATION_CONTENT_STATUSES = ["DRAFT", "PUBLISHED"] as const;
 export type VisaDestinationContentStatus = (typeof VISA_DESTINATION_CONTENT_STATUSES)[number];
@@ -37,7 +74,18 @@ export interface VisaDestinationContentDocument extends Document {
   businessBlock: VisaDestinationBlock;
   tourismBlock: VisaDestinationBlock;
   entrySnapshot: VisaEntrySnapshot;
-  heroImageUrl?: string;
+  heroImageUrl?: string; // requirements-page hero background (VerdictBand's dark band)
+  thumbnailUrl?: string; // /visa destination-picker tile — deliberately a separate field/crop, not heroImageUrl reused
+  // Provenance for whichever image is live — set alongside heroImageUrl/
+  // thumbnailUrl by the admin picker (never by the fetch script directly).
+  // Kept even for an "upload" source so a future licence question about a
+  // PUBLISHED image has an answer beyond "someone pasted a URL."
+  imageSource?: { provider: "pixabay" | "upload"; sourceId?: string; pixabayPageUrl?: string };
+  // Pending-review candidates from scripts/fetch-visa-destination-images.ts
+  // — see that script and VisaImageCandidate above. Replaced wholesale on
+  // each script run for a destination (not appended), so this never grows
+  // unbounded across re-runs.
+  imageCandidates: VisaImageCandidate[];
   lastReviewedAt?: Date;
 
   // Provenance marker, e.g. "seed-visa-rules@2026-07" — set only on rows
@@ -64,6 +112,20 @@ const VisaEntrySnapshotSchema = new Schema<VisaEntrySnapshot>(
   { _id: false },
 );
 
+const VisaImageCandidateSchema = new Schema<VisaImageCandidate>(
+  {
+    source: { type: String, enum: ["pixabay"], required: true },
+    sourceId: { type: String, required: true, trim: true },
+    previewUrl: { type: String, required: true, trim: true },
+    fullUrl: { type: String, required: true, trim: true },
+    pixabayPageUrl: { type: String, trim: true },
+    tags: { type: String, trim: true },
+    status: { type: String, enum: VISA_IMAGE_CANDIDATE_STATUSES, default: "PENDING" },
+    fetchedAt: { type: Date, required: true },
+  },
+  { _id: false },
+);
+
 const VisaDestinationContentSchema = new Schema<VisaDestinationContentDocument>(
   {
     destinationIso2: { type: String, required: true, uppercase: true, trim: true },
@@ -75,6 +137,19 @@ const VisaDestinationContentSchema = new Schema<VisaDestinationContentDocument>(
       default: () => ({ visaRequired: true, headline: "", summary: "" }),
     },
     heroImageUrl: { type: String, trim: true },
+    thumbnailUrl: { type: String, trim: true },
+    imageSource: {
+      type: new Schema(
+        {
+          provider: { type: String, enum: ["pixabay", "upload"], required: true },
+          sourceId: { type: String, trim: true },
+          pixabayPageUrl: { type: String, trim: true },
+        },
+        { _id: false },
+      ),
+      required: false,
+    },
+    imageCandidates: { type: [VisaImageCandidateSchema], default: [] },
     lastReviewedAt: { type: Date },
 
     // Provenance only — see VisaDestinationContentDocument.seedSource above.

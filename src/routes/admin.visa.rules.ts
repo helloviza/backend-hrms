@@ -30,9 +30,13 @@
 
 import { Router } from "express";
 import mongoose from "mongoose";
+import multer from "multer";
 import { isDeepStrictEqual } from "node:util";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
+import { s3 } from "../config/aws.js";
+import { env } from "../config/env.js";
 import VisaRule, {
   VISA_PURPOSES,
   VISA_ENTRY_TYPES,
@@ -319,6 +323,15 @@ function mapContentSummary(c: any) {
     tourismBlock: c.tourismBlock,
     entrySnapshot: c.entrySnapshot,
     heroImageUrl: c.heroImageUrl ?? null,
+    thumbnailUrl: c.thumbnailUrl ?? null,
+    imageSource: c.imageSource ?? null,
+    // Pending-review candidates (scripts/fetch-visa-destination-images.ts)
+    // — the admin picker's own data, never shown to a customer. Only ever
+    // PENDING in practice today (nothing in this file sets a candidate's
+    // own status to SELECTED/REJECTED, see POST .../select-image below,
+    // which reads a candidate but writes the PARENT doc's heroImageUrl/
+    // thumbnailUrl/imageSource instead — see that route's own comment).
+    imageCandidates: Array.isArray(c.imageCandidates) ? c.imageCandidates : [],
     lastReviewedAt: c.lastReviewedAt ?? null,
     // Provenance marker (models/VisaDestinationContent.ts) — set only on
     // rows scripts/seed-visa-rules.ts wrote. The UI uses this to flag
@@ -940,6 +953,110 @@ router.patch("/destination-content/:iso2", requirePermission("visaApplication", 
     res.status(500).json({ error: err?.message || "Failed to update destination content" });
   }
 });
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /destination-content/:iso2/select-image — ops picks ONE of the
+ * pending imageCandidates (scripts/fetch-visa-destination-images.ts) as
+ * the live image. Body: { sourceId: string } — matches a candidate's own
+ * sourceId (Pixabay's hit id), not a Mongo _id (candidates are
+ * `_id: false` subdocuments). This is the ONLY route that can turn a
+ * fetched candidate into a live heroImageUrl/thumbnailUrl — the fetch
+ * script itself never writes those two fields (see that script's header
+ * and VisaDestinationContent.ts's), so nothing reaches a customer without
+ * a human clicking something here first.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/destination-content/:iso2/select-image", requirePermission("visaApplication", "FULL"), async (req: any, res: any) => {
+  try {
+    const iso2 = String(req.params.iso2 || "").trim().toUpperCase();
+    if (!isIso2(iso2)) return res.status(400).json({ error: "iso2 must be a 2-letter ISO country code" });
+
+    const sourceId = String(req.body?.sourceId || "").trim();
+    if (!sourceId) return res.status(400).json({ error: "sourceId is required" });
+
+    const existing = await VisaDestinationContent.findOne({ destinationIso2: iso2 });
+    if (!existing) return res.status(404).json({ error: "Destination content not found" });
+
+    const candidate = (existing.imageCandidates || []).find((c: any) => c.sourceId === sourceId);
+    if (!candidate) return res.status(404).json({ error: "That candidate is no longer available — try re-fetching." });
+
+    existing.heroImageUrl = candidate.fullUrl;
+    existing.thumbnailUrl = candidate.previewUrl;
+    existing.imageSource = { provider: "pixabay", sourceId: candidate.sourceId, pixabayPageUrl: candidate.pixabayPageUrl };
+    await existing.save();
+
+    res.json({ ok: true, content: mapContentSummary(existing.toObject()) });
+  } catch (err: any) {
+    console.error("[admin visa destination-content select-image]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to select image" });
+  }
+});
+
+// Image-only, small size cap (destination photos, not documents) — a
+// separate multer instance from routes/visa.ts's visaDocumentUpload
+// (PDF-inclusive, 15MB) since this is never a document.
+const DESTINATION_IMAGE_ALLOWED_MIME = ["image/png", "image/jpeg", "image/webp"];
+const DESTINATION_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+const destinationImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: DESTINATION_IMAGE_MAX_BYTES },
+  fileFilter: (_req, file, cb) => {
+    if (DESTINATION_IMAGE_ALLOWED_MIME.includes(file.mimetype)) return cb(null, true);
+    cb(new Error("Only PNG, JPEG, or WEBP images are allowed."));
+  },
+});
+function destinationImageUploadMw(req: any, res: any, next: any) {
+  destinationImageUpload.single("file")(req, res, (err: any) => {
+    if (!err) return next();
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ error: `Image too large. Maximum size is ${DESTINATION_IMAGE_MAX_BYTES / (1024 * 1024)}MB.` });
+    }
+    return res.status(400).json({ error: err?.message || "Upload failed" });
+  });
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /destination-content/:iso2/image-upload — ops uploads their own
+ * file instead of picking a Pixabay candidate (task brief §2: "ops
+ * chooses one, or uploads their own"). Multipart, field name "file".
+ * Stored under the SAME public visa-destination-images/ prefix the fetch
+ * script uses (services/cityImage.service.ts's own city-images/ prefix on
+ * this same bucket is the precedent for a plain public S3 URL, no
+ * presigning — destination photos are non-sensitive and rendered
+ * unauthenticated). Sets heroImageUrl AND thumbnailUrl to the same
+ * uploaded file (no server-side resize here) — an uploaded photo has no
+ * separate candidate sizes the way a Pixabay hit does.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post(
+  "/destination-content/:iso2/image-upload",
+  requirePermission("visaApplication", "FULL"),
+  destinationImageUploadMw,
+  async (req: any, res: any) => {
+    try {
+      const iso2 = String(req.params.iso2 || "").trim().toUpperCase();
+      if (!isIso2(iso2)) return res.status(400).json({ error: "iso2 must be a 2-letter ISO country code" });
+      if (!req.file) return res.status(400).json({ error: "file is required" });
+
+      const ext = req.file.mimetype === "image/png" ? "png" : req.file.mimetype === "image/webp" ? "webp" : "jpg";
+      const key = `visa-destination-images/uploads/${iso2}-${Date.now()}.${ext}`;
+      await s3.send(new PutObjectCommand({ Bucket: env.S3_BUCKET, Key: key, Body: req.file.buffer, ContentType: req.file.mimetype }));
+      const url = `https://${env.S3_BUCKET}.s3.${env.AWS_REGION}.amazonaws.com/${key}`;
+
+      const content = await VisaDestinationContent.findOneAndUpdate(
+        { destinationIso2: iso2 },
+        {
+          $set: { heroImageUrl: url, thumbnailUrl: url, imageSource: { provider: "upload" } },
+          $setOnInsert: { destinationIso2: iso2, status: "DRAFT" },
+        },
+        { new: true, upsert: true, setDefaultsOnInsert: true },
+      );
+
+      res.json({ ok: true, content: mapContentSummary(content.toObject ? content.toObject() : content) });
+    } catch (err: any) {
+      console.error("[admin visa destination-content image-upload]", err?.message);
+      res.status(500).json({ error: err?.message || "Failed to upload image" });
+    }
+  },
+);
 
 /* ─────────────────────────────────────────────────────────────────────
  * POST /destination-content/:iso2/publish — DRAFT -> PUBLISHED. Requires

@@ -264,6 +264,20 @@ router.get("/destinations", async (_req: any, res: any) => {
     // never silently hidden from the picker as an unselectable destination.
     const destinationsWithNoPurposes: string[] = [];
 
+    // Thumbnail join — country imagery (2026-08-03). Same PUBLISHED-only
+    // gate as GET /content/:iso2: a destination whose content row is still
+    // DRAFT (ops picked an image but hasn't published the rest of the
+    // copy yet) reports thumbnailUrl: null here, same as if no image had
+    // ever been fetched — "nothing publishes unreviewed" holds for the
+    // picker grid too, not just the requirements-page hero.
+    const thumbnailRows = await VisaDestinationContent.find({
+      destinationIso2: { $in: Array.from(byIso2.keys()) },
+      status: "PUBLISHED",
+    })
+      .select("destinationIso2 thumbnailUrl")
+      .lean();
+    const thumbnailByIso2 = new Map(thumbnailRows.map((r) => [r.destinationIso2, r.thumbnailUrl ?? null]));
+
     const destinations = Array.from(byIso2.entries()).map(([iso2, entry]) => {
       const country = getCountryByIso2(iso2);
       const categories = Array.from(entry.categories);
@@ -276,6 +290,7 @@ router.get("/destinations", async (_req: any, res: any) => {
         categories,
         category: categories.length === 1 ? categories[0] : undefined,
         purposes,
+        thumbnailUrl: thumbnailByIso2.get(iso2) ?? null,
       };
     });
 
@@ -453,6 +468,7 @@ router.get("/content/:iso2", async (req: any, res: any) => {
         tourismBlock: content.tourismBlock,
         entrySnapshot: content.entrySnapshot,
         heroImageUrl: content.heroImageUrl,
+        thumbnailUrl: content.thumbnailUrl,
         lastReviewedAt: content.lastReviewedAt,
       },
     });
