@@ -52,6 +52,7 @@ import {
   searchFlightsForChat,
 } from "../utils/plutoFlightSearch.js";
 import { parseDateToISO } from "../utils/plutoDate.js";
+import { extractFlightDesignator } from "../utils/flightDesignator.js";
 import { isMultiCityIntent, resolveRoundTripIntent } from "../utils/plutoTripIntent.js";
 import { resolveIATA } from "../utils/plutoIata.js";
 import { loadWorkspacePolicyRules } from "../services/policyService.js";
@@ -606,7 +607,14 @@ router.post("/hotels/search", async (req, res) => {
 // It still calls res.json / res.status().json exactly as before — /stream drives
 // it through a capture-res shim, so no response call site changed (Amendment N:
 // the getConversationContext/saveConversationContext call sites are untouched).
-async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) => void) {
+async function runConciergeTurn(
+  req: any,
+  res: any,
+  // `detail` carries grounded context for the stage label (e.g. the route being
+  // searched) so the client can render "Searching live fares BLR → DXB…" without
+  // guessing. Optional and additive: POST / still passes no listener at all.
+  onStage?: (stage: string, detail?: Record<string, unknown>) => void,
+) {
   // Per-request correlation id + tenant, threaded into every log line, metric
   // event and error response for this concierge turn.
   const requestId = crypto.randomUUID();
@@ -879,9 +887,13 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
 
       // Load the workspace travel policy once for this request (tenant-scoped,
       // fail-safe → null when absent). Flights are annotated, never filtered.
+      // This await is the honest anchor for the "checking your travel policy"
+      // stage — the rules are fetched here and applied inside the search below,
+      // so there is no separate post-search policy step to narrate.
+      onStage?.("checking_policy");
       const chatPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
 
-      onStage?.("searching_flights");
+      onStage?.("searching_flights", { origin: originIATA, dest: destIATA });
       if (isoDate) {
         const chatResult = await searchFlightsForChat({
           origin: originIATA,
@@ -1460,9 +1472,11 @@ async function runConciergeTurn(req: any, res: any, onStage?: (stage: string) =>
     /* ───────── Real-Time Data Injection (CRITICAL) ───────── */
     let liveFlightData: any = null;
 
-    // ✅ FIX: Improved flight number regex — handles "6E-2582", "6E 2582", "6E2582"
-    const flightMatch = prompt.match(/\b(\d?[A-Z]{1,2})[-\s]?(\d{2,4})\b/gi);
-    const detectedFlightNumber = flightMatch?.[0]?.replace(/[-\s]/g, "").toUpperCase() || null;
+    // Handles "6E-2582", "6E 2582", "6E2582" — and, unlike the case-insensitive
+    // pattern this replaced, NOT "trip in 2026" (which used to read as carrier
+    // "IN" flight 2026 and inject the NO-HALLUCINATE block below into an
+    // ordinary planning prompt). See ../utils/flightDesignator.
+    const detectedFlightNumber = extractFlightDesignator(prompt);
 
     if (detectedFlightNumber) {
       try {
@@ -1913,7 +1927,9 @@ router.post("/stream", async (req: any, res: any) => {
   };
 
   try {
-    await runConciergeTurn(req, captureRes, (stage: string) => write("status", { stage }));
+    await runConciergeTurn(req, captureRes, (stage: string, detail?: Record<string, unknown>) =>
+      write("status", { stage, ...(detail || {}) }),
+    );
     if (captured.statusCode >= 400) {
       write("error", {
         message: captured.body?.message || "Failed to generate travel response",
