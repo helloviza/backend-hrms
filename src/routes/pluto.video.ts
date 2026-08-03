@@ -22,11 +22,18 @@ const s3 = new S3Client({
 });
 
 /**
- * Resolve tenant ID the same way uploads.ts does
+ * The workspace this request belongs to. requireWorkspace (applied at the mount)
+ * resolves it, so it is always present here.
+ *
+ * This REPLACES the previous resolveTenantId(), which returned the literal
+ * string "staff" for every internal user — so every staff member shared one
+ * tenant key and /status + /context were, in practice, unscoped between them.
+ * Worse, the writer scoped on `tenantId` while the consumer
+ * (copilot.travel.ts) queries VideoAnalysis by `workspaceId`: the two halves
+ * of the feature disagreed about what a tenant was.
  */
-function resolveTenantId(req: any) {
-  const u = req.user || {};
-  return String(u.customerId || u.businessId || u.vendorId || "staff");
+function workspaceIdOf(req: any) {
+  return req.workspaceObjectId;
 }
 
 /**
@@ -97,11 +104,14 @@ router.post("/register", requireAuth, async (req, res) => {
       });
     }
 
-    const tenantId = resolveTenantId(req);
+    const workspaceId = workspaceIdOf(req);
     const userId = (req as any).user.sub;
 
+    // workspaceId is REQUIRED on the schema. Omitting it (the previous
+    // behaviour) made every registration fail Mongoose validation and return
+    // 500 "Failed to register video" — the whole video feature was dark.
     const record = await VideoAnalysis.create({
-      tenantId,
+      workspaceId,
       userId,
       conversationId: conversationId || null,
       s3Key,
@@ -139,11 +149,14 @@ router.post("/register", requireAuth, async (req, res) => {
 router.get("/:id/status", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const tenantId = resolveTenantId(req);
+    const workspaceId = workspaceIdOf(req);
 
+    // Scoped on workspaceId — the SAME key the consumer in copilot.travel.ts
+    // uses. Another workspace's video is indistinguishable from a missing one
+    // (404) and can never be read.
     const record = await VideoAnalysis.findOne({
       _id: id,
-      tenantId,
+      workspaceId,
     }).lean();
 
     if (!record) {
@@ -197,11 +210,14 @@ router.get("/:id/status", requireAuth, async (req, res) => {
 router.get("/:id/context", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const tenantId = resolveTenantId(req);
+    const workspaceId = workspaceIdOf(req);
 
+    // Scoped on workspaceId — the SAME key the consumer in copilot.travel.ts
+    // uses. Another workspace's video is indistinguishable from a missing one
+    // (404) and can never be read.
     const record = await VideoAnalysis.findOne({
       _id: id,
-      tenantId,
+      workspaceId,
     }).lean();
 
     if (!record) {

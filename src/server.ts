@@ -507,7 +507,10 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
     pingGemini: (p) => invokePlutoGemini(p),
   });
 }
-app.use("/api/v1/pluto/video", plutoVideoRouter);
+// requireWorkspace added with the 0.3/Phase-3 video scoping fix: these routes
+// now key on workspaceId (matching the consumer in copilot.travel.ts) instead
+// of the legacy tenantId, which collapsed every internal user to "staff".
+app.use("/api/v1/pluto/video", requireAuth, requireWorkspace, plutoVideoRouter);
 app.use("/api/copilot", copilotRouter);
 app.use("/api/v1/copilot/manager", copilotRouter);
 app.use("/api/assistant", assistantRouter);
