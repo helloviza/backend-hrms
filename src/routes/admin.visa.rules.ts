@@ -687,10 +687,27 @@ router.post("/rules/:id/clone", requirePermission("visaApplication", "FULL"), as
 });
 
 /* ─────────────────────────────────────────────────────────────────────
- * POST /rules/:id/publish — DRAFT -> PUBLISHED only. Rejects a rule
- * missing visaCategory, ETA (both min and max), or any cost information
- * at all (itemised or indicative) — an incomplete rule going live would
- * quote an applicant against a gap, not a real term.
+ * Publish-readiness check — a rule missing visaCategory, ETA (both min
+ * and max), or any cost information at all (itemised or indicative) must
+ * never go live: an incomplete rule going live would quote an applicant
+ * against a gap, not a real term. Factored out so POST /rules/:id/publish
+ * and POST /rules/bulk-publish run the EXACT same check — bulk-publish
+ * must reject a rule for the same reason the single-rule route would,
+ * never a second, independently-drifting copy of "what's required."
+ * ───────────────────────────────────────────────────────────────────── */
+function publishReadinessGaps(rule: any): string[] {
+  const missing: string[] = [];
+  if (!rule.visaCategory) missing.push("visaCategory");
+  if (rule.etaMinDays == null || rule.etaMaxDays == null) missing.push("ETA (etaMinDays and etaMaxDays)");
+  const hasCost =
+    rule.indicativeVisaCostInr != null || rule.embassyFeeInr != null || rule.vfsFeeInr != null || rule.plumtripsServiceFeeInr != null;
+  if (!hasCost) missing.push("at least an indicative cost (indicativeVisaCostInr, or an itemised fee)");
+  return missing;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /rules/:id/publish — DRAFT -> PUBLISHED only. See
+ * publishReadinessGaps() above for what's required.
  * ───────────────────────────────────────────────────────────────────── */
 router.post("/rules/:id/publish", requirePermission("visaApplication", "FULL"), async (req: any, res: any) => {
   try {
@@ -704,13 +721,7 @@ router.post("/rules/:id/publish", requirePermission("visaApplication", "FULL"), 
       return res.status(400).json({ error: `Only a DRAFT rule can be published (currently '${rule.status}')` });
     }
 
-    const missing: string[] = [];
-    if (!rule.visaCategory) missing.push("visaCategory");
-    if (rule.etaMinDays == null || rule.etaMaxDays == null) missing.push("ETA (etaMinDays and etaMaxDays)");
-    const hasCost =
-      rule.indicativeVisaCostInr != null || rule.embassyFeeInr != null || rule.vfsFeeInr != null || rule.plumtripsServiceFeeInr != null;
-    if (!hasCost) missing.push("at least an indicative cost (indicativeVisaCostInr, or an itemised fee)");
-
+    const missing = publishReadinessGaps(rule);
     if (missing.length > 0) {
       return res.status(400).json({ error: `Cannot publish — missing: ${missing.join(", ")}`, missing });
     }
@@ -849,6 +860,168 @@ router.post("/rules/bulk", requirePermission("visaApplication", "FULL"), async (
     session.endSession();
   }
 });
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /rules/bulk-publish[/preview] — publish every rule in ruleIds that
+ * is DRAFT and passes publishReadinessGaps() (the exact same check POST
+ * /rules/:id/publish uses — see that function's own comment). PER-RULE
+ * OUTCOME, deliberately NOT atomic like POST /rules/bulk's own
+ * transaction: that route's atomicity exists because its own use case
+ * (the 18 Schengen states moving together) needs every row to land
+ * together or not at all. Publishing 20 rules where 3 are incomplete is
+ * the opposite case — publish the 17 good ones and report the 3, rolling
+ * all 20 back because of 3 bad rows is the wrong trade. Each rule that
+ * actually publishes gets its own PUBLISH audit entry, same as the
+ * single-rule route.
+ *
+ * /preview runs the identical resolution and validation, writes nothing,
+ * and reports the same per-rule outcome — the confirmation step before a
+ * real commit, same preview/commit split routes/admin.visa.rules.
+ * importExport.ts's import feature already established in this codebase.
+ * The commit route re-resolves against LIVE data itself rather than
+ * trusting a client-cached preview, same discipline as that feature too.
+ * ───────────────────────────────────────────────────────────────────── */
+interface BulkTransitionOutcome {
+  ruleId: string;
+  status: "PUBLISHED" | "RETIRED" | "REJECTED";
+  reason?: string;
+}
+
+async function handleBulkPublish(req: any, res: any, dryRun: boolean) {
+  try {
+    const ruleIds = req.body?.ruleIds;
+    if (!Array.isArray(ruleIds) || ruleIds.length === 0) {
+      return res.status(400).json({ error: "ruleIds must be a non-empty array" });
+    }
+    if (ruleIds.length > MAX_BULK_RULE_IDS) {
+      return res.status(400).json({ error: `ruleIds cannot exceed ${MAX_BULK_RULE_IDS} at once` });
+    }
+    for (const id of ruleIds) {
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(400).json({ error: `${id} is not a valid rule id` });
+      }
+    }
+
+    const existing = await VisaRule.find({ _id: { $in: ruleIds } });
+    const byId = new Map(existing.map((r: any) => [String(r._id), r]));
+
+    const results: BulkTransitionOutcome[] = [];
+    let publishedCount = 0;
+
+    for (const id of ruleIds) {
+      const ruleId = String(id);
+      const rule = byId.get(ruleId);
+      if (!rule) {
+        results.push({ ruleId, status: "REJECTED", reason: "Visa rule not found" });
+        continue;
+      }
+      if (rule.status !== "DRAFT") {
+        results.push({ ruleId, status: "REJECTED", reason: `Only a DRAFT rule can be published (currently '${rule.status}')` });
+        continue;
+      }
+      const missing = publishReadinessGaps(rule);
+      if (missing.length > 0) {
+        results.push({ ruleId, status: "REJECTED", reason: `Cannot publish — missing: ${missing.join(", ")}` });
+        continue;
+      }
+
+      publishedCount += 1;
+      results.push({ ruleId, status: "PUBLISHED" });
+
+      if (!dryRun) {
+        const before = { status: rule.status };
+        rule.status = "PUBLISHED";
+        await rule.save();
+        await writeRuleAudit(rule._id, "PUBLISH", [{ field: "status", from: before.status, to: "PUBLISHED" }], actorId(req));
+      }
+    }
+
+    if (!dryRun) {
+      rulesLogger.info("visa rules bulk published", {
+        ruleIds: ruleIds.map(String),
+        publishedCount,
+        rejectedCount: results.length - publishedCount,
+        userId: actorId(req) ? String(actorId(req)) : null,
+      });
+    }
+
+    res.json({ ok: true, dryRun, publishedCount, rejectedCount: results.length - publishedCount, results });
+  } catch (err: any) {
+    console.error(`[admin visa rules bulk-publish ${dryRun ? "preview" : "POST"}]`, err?.message);
+    res.status(500).json({ error: err?.message || "Failed to bulk-publish visa rules" });
+  }
+}
+
+router.post("/rules/bulk-publish/preview", requirePermission("visaApplication", "FULL"), (req: any, res: any) => handleBulkPublish(req, res, true));
+router.post("/rules/bulk-publish", requirePermission("visaApplication", "FULL"), (req: any, res: any) => handleBulkPublish(req, res, false));
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /rules/bulk-retire[/preview] — same shape as bulk-publish above,
+ * for the inverse transition. No publishReadinessGaps() equivalent here —
+ * retiring has only ever had the one requirement (PUBLISHED -> RETIRED),
+ * same as POST /rules/:id/retire.
+ * ───────────────────────────────────────────────────────────────────── */
+async function handleBulkRetire(req: any, res: any, dryRun: boolean) {
+  try {
+    const ruleIds = req.body?.ruleIds;
+    if (!Array.isArray(ruleIds) || ruleIds.length === 0) {
+      return res.status(400).json({ error: "ruleIds must be a non-empty array" });
+    }
+    if (ruleIds.length > MAX_BULK_RULE_IDS) {
+      return res.status(400).json({ error: `ruleIds cannot exceed ${MAX_BULK_RULE_IDS} at once` });
+    }
+    for (const id of ruleIds) {
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(400).json({ error: `${id} is not a valid rule id` });
+      }
+    }
+
+    const existing = await VisaRule.find({ _id: { $in: ruleIds } });
+    const byId = new Map(existing.map((r: any) => [String(r._id), r]));
+
+    const results: BulkTransitionOutcome[] = [];
+    let retiredCount = 0;
+
+    for (const id of ruleIds) {
+      const ruleId = String(id);
+      const rule = byId.get(ruleId);
+      if (!rule) {
+        results.push({ ruleId, status: "REJECTED", reason: "Visa rule not found" });
+        continue;
+      }
+      if (rule.status !== "PUBLISHED") {
+        results.push({ ruleId, status: "REJECTED", reason: `Only a PUBLISHED rule can be retired (currently '${rule.status}')` });
+        continue;
+      }
+
+      retiredCount += 1;
+      results.push({ ruleId, status: "RETIRED" });
+
+      if (!dryRun) {
+        rule.status = "RETIRED";
+        await rule.save();
+        await writeRuleAudit(rule._id, "RETIRE", [{ field: "status", from: "PUBLISHED", to: "RETIRED" }], actorId(req));
+      }
+    }
+
+    if (!dryRun) {
+      rulesLogger.info("visa rules bulk retired", {
+        ruleIds: ruleIds.map(String),
+        retiredCount,
+        rejectedCount: results.length - retiredCount,
+        userId: actorId(req) ? String(actorId(req)) : null,
+      });
+    }
+
+    res.json({ ok: true, dryRun, retiredCount, rejectedCount: results.length - retiredCount, results });
+  } catch (err: any) {
+    console.error(`[admin visa rules bulk-retire ${dryRun ? "preview" : "POST"}]`, err?.message);
+    res.status(500).json({ error: err?.message || "Failed to bulk-retire visa rules" });
+  }
+}
+
+router.post("/rules/bulk-retire/preview", requirePermission("visaApplication", "FULL"), (req: any, res: any) => handleBulkRetire(req, res, true));
+router.post("/rules/bulk-retire", requirePermission("visaApplication", "FULL"), (req: any, res: any) => handleBulkRetire(req, res, false));
 
 /* ─────────────────────────────────────────────────────────────────────
  * VisaDestinationContent — GET / PATCH / publish. Nothing can write this

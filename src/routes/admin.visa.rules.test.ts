@@ -372,6 +372,10 @@ describe("permission gate — every route requires FULL", () => {
     { method: "post", path: () => `/rules/${new mongoose.Types.ObjectId()}/publish` },
     { method: "post", path: () => `/rules/${new mongoose.Types.ObjectId()}/retire` },
     { method: "post", path: () => "/rules/bulk", body: {} },
+    { method: "post", path: () => "/rules/bulk-publish", body: {} },
+    { method: "post", path: () => "/rules/bulk-publish/preview", body: {} },
+    { method: "post", path: () => "/rules/bulk-retire", body: {} },
+    { method: "post", path: () => "/rules/bulk-retire/preview", body: {} },
     { method: "get", path: () => "/destination-content" },
     { method: "get", path: () => "/destination-content/DE" },
     { method: "patch", path: () => "/destination-content/DE", body: {} },
@@ -845,6 +849,158 @@ describe("POST /rules/bulk", () => {
     expect((await request(app).post("/rules/bulk").send({ ruleIds: [], effectiveFrom: "2026-09-01", changes: { vfsFeeInr: 1 } })).status).toBe(400);
     const tooMany = Array.from({ length: 51 }, () => String(new mongoose.Types.ObjectId()));
     expect((await request(app).post("/rules/bulk").send({ ruleIds: tooMany, effectiveFrom: "2026-09-01", changes: { vfsFeeInr: 1 } })).status).toBe(400);
+  });
+});
+
+describe("POST /rules/bulk-publish", () => {
+  it("publishes the valid rules in a mixed batch and reports the rest, per rule — never all-or-nothing", async () => {
+    const good1 = completeDraft({ destinationIso2: "AT" });
+    const good2 = completeDraft({ destinationIso2: "BE" });
+    const incomplete = ruleDoc({
+      destinationIso2: "FR",
+      etaMinDays: undefined,
+      etaMaxDays: undefined,
+      embassyFeeInr: undefined,
+      vfsFeeInr: undefined,
+      plumtripsServiceFeeInr: undefined,
+      indicativeVisaCostInr: undefined,
+    });
+    const app = makeApp();
+
+    const res = await request(app)
+      .post("/rules/bulk-publish")
+      .send({ ruleIds: [String(good1._id), String(good2._id), String(incomplete._id)] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.publishedCount).toBe(2);
+    expect(res.body.rejectedCount).toBe(1);
+    expect(res.body.results).toHaveLength(3);
+
+    const byId = Object.fromEntries(res.body.results.map((r: any) => [r.ruleId, r]));
+    expect(byId[String(good1._id)]).toEqual({ ruleId: String(good1._id), status: "PUBLISHED" });
+    expect(byId[String(good2._id)]).toEqual({ ruleId: String(good2._id), status: "PUBLISHED" });
+    expect(byId[String(incomplete._id)].status).toBe("REJECTED");
+    expect(byId[String(incomplete._id)].reason).toMatch(/ETA/);
+    expect(byId[String(incomplete._id)].reason).toMatch(/cost/);
+
+    // The two good ones actually published; the bad one was never rolled back onto.
+    expect(_rules.get(good1._id).status).toBe("PUBLISHED");
+    expect(_rules.get(good2._id).status).toBe("PUBLISHED");
+    expect(_rules.get(incomplete._id).status).toBe("DRAFT");
+  });
+
+  it("never publishes an incomplete rule, even as the only row in the batch", async () => {
+    const incomplete = ruleDoc({ visaCategory: undefined });
+    const app = makeApp();
+    const res = await request(app).post("/rules/bulk-publish").send({ ruleIds: [String(incomplete._id)] });
+    expect(res.status).toBe(200);
+    expect(res.body.publishedCount).toBe(0);
+    expect(res.body.results[0].status).toBe("REJECTED");
+    expect(_rules.get(incomplete._id).status).toBe("DRAFT");
+  });
+
+  it("rejects a rule that isn't DRAFT (already published/retired), same as the single-rule route", async () => {
+    const published = completeDraft({ status: "PUBLISHED" });
+    const app = makeApp();
+    const res = await request(app).post("/rules/bulk-publish").send({ ruleIds: [String(published._id)] });
+    expect(res.status).toBe(200);
+    expect(res.body.publishedCount).toBe(0);
+    expect(res.body.results[0].reason).toMatch(/Only a DRAFT rule can be published/);
+  });
+
+  it("writes one PUBLISH audit entry per rule actually published, none for a rejected one", async () => {
+    const good1 = completeDraft({ destinationIso2: "AT" });
+    const good2 = completeDraft({ destinationIso2: "BE" });
+    const incomplete = ruleDoc({ destinationIso2: "FR", visaCategory: undefined });
+    const app = makeApp();
+
+    await request(app)
+      .post("/rules/bulk-publish")
+      .send({ ruleIds: [String(good1._id), String(good2._id), String(incomplete._id)] });
+
+    expect(_ruleAudits.query({ ruleId: String(good1._id) })).toHaveLength(1);
+    expect(_ruleAudits.query({ ruleId: String(good1._id) })[0].action).toBe("PUBLISH");
+    expect(_ruleAudits.query({ ruleId: String(good1._id) })[0].changes).toEqual([{ field: "status", from: "DRAFT", to: "PUBLISHED" }]);
+    expect(_ruleAudits.query({ ruleId: String(good2._id) })).toHaveLength(1);
+    expect(_ruleAudits.query({ ruleId: String(incomplete._id) })).toHaveLength(0);
+  });
+
+  it("preview reports the same outcome as commit but writes nothing — the confirm-before-applying step", async () => {
+    const good = completeDraft();
+    const incomplete = ruleDoc({ visaCategory: undefined });
+    const app = makeApp();
+
+    const res = await request(app)
+      .post("/rules/bulk-publish/preview")
+      .send({ ruleIds: [String(good._id), String(incomplete._id)] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.dryRun).toBe(true);
+    expect(res.body.publishedCount).toBe(1);
+    expect(res.body.rejectedCount).toBe(1);
+    expect(_rules.get(good._id).status).toBe("DRAFT"); // preview never writes
+    expect(_ruleAudits.query({})).toHaveLength(0);
+  });
+
+  it("reports (never crashes on) a ruleId that doesn't exist", async () => {
+    const good = completeDraft();
+    const missing = new mongoose.Types.ObjectId();
+    const app = makeApp();
+    const res = await request(app).post("/rules/bulk-publish").send({ ruleIds: [String(good._id), String(missing)] });
+    expect(res.status).toBe(200);
+    expect(res.body.publishedCount).toBe(1);
+    const byId = Object.fromEntries(res.body.results.map((r: any) => [r.ruleId, r]));
+    expect(byId[String(missing)]).toEqual({ ruleId: String(missing), status: "REJECTED", reason: "Visa rule not found" });
+  });
+
+  it("rejects an empty or oversized ruleIds array", async () => {
+    const app = makeApp();
+    expect((await request(app).post("/rules/bulk-publish").send({ ruleIds: [] })).status).toBe(400);
+    const tooMany = Array.from({ length: 51 }, () => String(new mongoose.Types.ObjectId()));
+    expect((await request(app).post("/rules/bulk-publish").send({ ruleIds: tooMany })).status).toBe(400);
+  });
+});
+
+describe("POST /rules/bulk-retire", () => {
+  it("retires the valid rules in a mixed batch and reports the rest", async () => {
+    const published1 = completeDraft({ destinationIso2: "AT", status: "PUBLISHED" });
+    const published2 = completeDraft({ destinationIso2: "BE", status: "PUBLISHED" });
+    const draft = completeDraft({ destinationIso2: "FR", status: "DRAFT" });
+    const app = makeApp();
+
+    const res = await request(app)
+      .post("/rules/bulk-retire")
+      .send({ ruleIds: [String(published1._id), String(published2._id), String(draft._id)] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.retiredCount).toBe(2);
+    expect(res.body.rejectedCount).toBe(1);
+    expect(_rules.get(published1._id).status).toBe("RETIRED");
+    expect(_rules.get(published2._id).status).toBe("RETIRED");
+    expect(_rules.get(draft._id).status).toBe("DRAFT"); // untouched, not rolled back onto
+  });
+
+  it("writes one RETIRE audit entry per rule actually retired", async () => {
+    const published = completeDraft({ status: "PUBLISHED" });
+    const draft = completeDraft({ destinationIso2: "FR", status: "DRAFT" });
+    const app = makeApp();
+
+    await request(app).post("/rules/bulk-retire").send({ ruleIds: [String(published._id), String(draft._id)] });
+
+    expect(_ruleAudits.query({ ruleId: String(published._id) })).toHaveLength(1);
+    expect(_ruleAudits.query({ ruleId: String(published._id) })[0].action).toBe("RETIRE");
+    expect(_ruleAudits.query({ ruleId: String(draft._id) })).toHaveLength(0);
+  });
+
+  it("preview writes nothing", async () => {
+    const published = completeDraft({ status: "PUBLISHED" });
+    const app = makeApp();
+    const res = await request(app).post("/rules/bulk-retire/preview").send({ ruleIds: [String(published._id)] });
+    expect(res.status).toBe(200);
+    expect(res.body.dryRun).toBe(true);
+    expect(res.body.retiredCount).toBe(1);
+    expect(_rules.get(published._id).status).toBe("PUBLISHED");
+    expect(_ruleAudits.query({})).toHaveLength(0);
   });
 });
 
