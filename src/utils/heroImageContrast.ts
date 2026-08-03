@@ -6,8 +6,10 @@
 // follow-up). Replicates the EXACT treatment RequirementsPage.tsx applies
 // to a live heroImageUrl:
 //   1. background-size:cover onto the hero band (sharp's fit:"cover").
-//   2. the --s1-at-50% overlay, painted OVER the photo (background-image
-//      layers composite bottom-up before any filter runs).
+//   2. the left-weighted --s1 gradient scrim (2026-08-04 — flat 60% from
+//      the left edge through 58% of the band's width, easing to 15% at
+//      the right edge), painted OVER the photo (background-image layers
+//      composite bottom-up before any filter runs).
 //   3. filter: saturate(80%), applied to that ALREADY-composited result —
 //      CSS filter is a post-process over the whole painted box, not the
 //      raw photo alone, so it must run after step 2, not before (getting
@@ -25,16 +27,34 @@
 // worst-case pair, not an average across the hero.
 //
 // Keep every literal below in lockstep with RequirementsPage.tsx's
-// heroBackgroundStyle — if that overlay %, saturation %, or the active
-// theme's --s1 ever changes, this drifts out of sync silently.
+// heroBackgroundStyle — if that gradient's stops, saturation %, or the
+// active theme's --s1 ever changes, this drifts out of sync silently.
 
 import sharp from "sharp";
 
-// Matches RequirementsPage.tsx's heroBackgroundStyle exactly.
-const OVERLAY_ALPHA = 0.5;
+// Matches RequirementsPage.tsx's heroBackgroundStyle exactly: a
+// left-weighted horizontal gradient scrim (2026-08-04), not a flat tint.
+// Flat at OVERLAY_ALPHA_PLATEAU from the left edge through
+// OVERLAY_PLATEAU_END_FRACTION of the band's width (covers TEXT_REGIONS'
+// full extent below, with margin), then linearly eases down to
+// OVERLAY_ALPHA_FAR_EDGE by the right edge. See RequirementsPage.tsx's
+// heroBackgroundStyle comment for how the plateau alpha was derived
+// (breakeven for a worst-case #ffffff pixel is 0.572; 0.60 is that plus
+// headroom).
+const OVERLAY_ALPHA_PLATEAU = 0.6;
+const OVERLAY_PLATEAU_END_FRACTION = 0.58;
+const OVERLAY_ALPHA_FAR_EDGE = 0.15;
 const SATURATION = 0.8;
 // VISA_THEME.midnight.s1 (components/visa/ui/tokens.ts) — the active theme.
 const S1 = { r: 6, g: 18, b: 32 };
+
+// Overlay alpha at a given horizontal fraction (0 = left edge, 1 = right
+// edge) of the hero band — the flat-then-fade shape of the CSS gradient.
+function overlayAlphaAt(xFraction: number): number {
+  if (xFraction <= OVERLAY_PLATEAU_END_FRACTION) return OVERLAY_ALPHA_PLATEAU;
+  const t = (xFraction - OVERLAY_PLATEAU_END_FRACTION) / (1 - OVERLAY_PLATEAU_END_FRACTION);
+  return OVERLAY_ALPHA_PLATEAU + t * (OVERLAY_ALPHA_FAR_EDGE - OVERLAY_ALPHA_PLATEAU);
+}
 
 // The hero band's own rendered box at a 1280px-wide desktop viewport
 // (RequirementsPage.tsx's .bg-visa-hero-dark div, measured live). Text
@@ -107,10 +127,13 @@ export async function computeWorstCaseHeroContrast(imageBuffer: Buffer): Promise
         const g = data[idx + 1];
         const b = data[idx + 2];
 
-        // Step 1: the --s1-at-50% overlay, painted over the photo.
-        const cr = r * (1 - OVERLAY_ALPHA) + S1.r * OVERLAY_ALPHA;
-        const cg = g * (1 - OVERLAY_ALPHA) + S1.g * OVERLAY_ALPHA;
-        const cb = b * (1 - OVERLAY_ALPHA) + S1.b * OVERLAY_ALPHA;
+        // Step 1: the gradient scrim, painted over the photo. Alpha varies
+        // with this pixel's horizontal position in the band, not a flat
+        // constant — see overlayAlphaAt.
+        const alpha = overlayAlphaAt(x / width);
+        const cr = r * (1 - alpha) + S1.r * alpha;
+        const cg = g * (1 - alpha) + S1.g * alpha;
+        const cb = b * (1 - alpha) + S1.b * alpha;
 
         // Step 2: filter: saturate(80%), applied to that composite.
         const [fr, fg, fb] = applySaturateFilter(cr, cg, cb, SATURATION);
