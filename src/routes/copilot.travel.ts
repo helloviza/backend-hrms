@@ -54,6 +54,14 @@ import {
 } from "../utils/plutoFlightSearch.js";
 import { parseDateToISO } from "../utils/plutoDate.js";
 import {
+  isHotelRequest,
+  extractHotelCity,
+  extractStarFilter,
+  searchHotelsForChat,
+  nightsBetween,
+} from "../utils/plutoHotelSearch.js";
+import { countryFor } from "../data/destinationLookup.js";
+import {
   extractFlightDesignator,
   extractStatusDate,
   isFlightStatusQuery,
@@ -1191,6 +1199,134 @@ async function runConciergeTurn(
       });
     }
 
+    /* ───────── LIVE Hotel Lane (Phase 2) ─────────
+     *
+     * Runs AFTER the flight branch, so a compound "flight + hotel" turn still
+     * belongs to flights exactly as before (that branch acknowledges the hotel
+     * ask and offers a chip which lands here as a pure hotel turn).
+     *
+     * This replaces the model-invented reply.hotels on hotel turns with REAL,
+     * BOOKABLE rows from the same searchHotels service SBT uses, annotated with
+     * the same policy evaluator flights use. If the search can't run or returns
+     * nothing we fall back to the HONEST acknowledge-and-handoff that was here
+     * before — never to fabricated hotels.
+     */
+    const hotelCtx = context && typeof context === "object" ? context : {};
+    const hotelLocked = (hotelCtx as any).locked || {};
+    const hotelCity = isHotelRequest(prompt)
+      ? extractHotelCity(prompt) || hotelLocked?.destination?.name || null
+      : null;
+    const hotelCountry = hotelCity ? countryFor(hotelCity) : null;
+    const checkIn = hotelLocked?.dates?.start || null;
+    const checkOut = hotelLocked?.dates?.end || null;
+
+    // OWNERSHIP RULE: this branch takes the turn ONLY when a real search can
+    // actually run — hotel-led prompt, a city we can resolve to a country, and
+    // both dates already locked.
+    //
+    // Anything less FALLS THROUGH to the AI path on purpose. Returning a
+    // clarify from here would answer before the locked-facts extractor below
+    // has run, so the destination/dates the user just typed would never be
+    // locked and the next turn would re-ask them. It also stopped this branch
+    // hijacking a compound planning turn: "Flying to Singapore from Delhi 12-15
+    // Sep, hotel near Marina Bay" mentions a hotel but is a planning turn, and
+    // must reach the extractor that locks all four facts in one go.
+    const hotelLed =
+      Boolean(hotelCity) &&
+      !/\b(fly|flying|flight|flights)\b/i.test(prompt);
+
+    if (hotelLed && hotelCountry && checkIn && checkOut) {
+      const hotelReturnContext = { ...hotelCtx, id: conversationId };
+
+      onStage?.("checking_policy");
+      const hotelPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
+
+      // Occupancy is the one thing we assume (TBO requires PaxRooms). It is
+      // DISCLOSED in the reply so the user can correct it, never silently applied.
+      const hotelAdults = 2;
+      const hotelRooms = 1;
+
+      onStage?.("searching_hotels", { city: hotelCity });
+      const hotelResult = await searchHotelsForChat({
+        cityName: hotelCity,
+        countryCode: hotelCountry,
+        checkIn,
+        checkOut,
+        adults: hotelAdults,
+        rooms: hotelRooms,
+        starRating: extractStarFilter(prompt),
+        guestNationality: (req as any).user?.nationality || "IN",
+        policyRules: hotelPolicyRules,
+      });
+
+      const nights = nightsBetween(checkIn, checkOut);
+
+      // ── Honest gap: no fabrication, no model fallback. ──
+      if (!hotelResult.ok) {
+        const why =
+          hotelResult.reason === "NO_AVAILABILITY"
+            ? `I couldn't find live availability in ${hotelCity} for ${checkIn} → ${checkOut}.`
+            : `I couldn't pull live hotel availability for ${hotelCity} right now.`;
+        await emitMetric(
+          searchError({ workspaceId, requestId, reason: hotelResult.reason || "hotel_unknown" }),
+        );
+        return res.json({
+          ok: true,
+          reply: {
+            title: `Hotels in ${hotelCity}`,
+            context: `${why} Rather than guess at options, I'd rather hand this to our team — they can source and hold rooms directly.`,
+            nextSteps: [
+              "Raise a request and our team will source options",
+              "Try different dates",
+            ],
+            handoff: false,
+          },
+          context: hotelReturnContext,
+        });
+      }
+
+      const inPolicyHotels = hotelResult.hotels.filter(
+        (h: any) => h?.policy?.status === "IN_POLICY",
+      ).length;
+      await emitMetric(
+        policyEvaluated({
+          workspaceId,
+          requestId,
+          inPolicyCount: inPolicyHotels,
+          totalCount: hotelResult.hotels.length,
+        }),
+      );
+
+      onStage?.("assembling");
+      return res.json({
+        ok: true,
+        reply: {
+          title: `Hotels in ${hotelResult.cityName || hotelCity}`,
+          context:
+            `Found ${hotelResult.hotels.length} available ${hotelResult.hotels.length === 1 ? "property" : "properties"} in ${hotelResult.cityName || hotelCity} for ${checkIn} → ${checkOut} (${nights} ${nights === 1 ? "night" : "nights"}). ` +
+            `Prices are live, in INR, for ${hotelAdults} guests in ${hotelRooms} room — tell me if that's not right and I'll re-search.`,
+          hotelSearch: {
+            city: hotelResult.cityName || hotelCity,
+            countryCode: hotelCountry,
+            checkIn,
+            checkOut,
+            nights,
+            adults: hotelAdults,
+            rooms: hotelRooms,
+            assumedOccupancy: true,
+            hotels: hotelResult.hotels,
+            searchId: hotelResult.searchId,
+            source: "tbo",
+          },
+          nextSteps: [
+            "Tap a hotel to continue to booking",
+            "Add one to your trip",
+          ],
+          handoff: false,
+        },
+        context: hotelReturnContext,
+      });
+    }
 
     // 2️⃣ Gather phase is owned by the AI, not a regex gate.
     //
