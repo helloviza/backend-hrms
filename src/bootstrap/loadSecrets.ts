@@ -13,8 +13,22 @@
 // vars are removed from App Runner.
 //
 // IMPORTANT — execution order: this MUST run before config/env.ts (or anything)
-// reads those keys. It is imported as the FIRST line of server.ts (the entry
-// point). It loads .env first (so individual vars take precedence) and only
+// reads those keys. Two importers, deliberately:
+//   1. config/env.ts imports this as ITS first line (2026-08-04) — this is
+//      the one that matters for standalone scripts (src/scripts/*, run via
+//      `tsx path/to/script.ts`, never through server.ts): anything that
+//      reads a bundle-only secret via `env.X` now gets the unpack for free,
+//      with no per-script import needed. Before this, only server.ts
+//      triggered the unpack, so every standalone script silently saw ""
+//      for a bundle-only secret (see fetch-visa-destination-images.ts,
+//      first one to hit it — 2026-08-04).
+//   2. server.ts ALSO imports this directly, as its own literal first
+//      line — kept for the handful of places that read a secret straight
+//      off `process.env` instead of through `env` (routes/places.ts,
+//      utils/mailer.ts, a few others — a separate, known inconsistency).
+// ES modules cache by resolved path, so importing this from both places in
+// the same process runs its body exactly once, not twice.
+// It loads .env first (so individual vars take precedence) and only
 // back-fills keys that are not already set — the individual env var always wins,
 // which keeps local dev working unchanged.
 

@@ -1,7 +1,12 @@
 // apps/backend/src/server.ts
 // ⚠️ MUST be the first import: back-fills process.env from the APP_SECRETS
 // bundle (and loads .env) BEFORE config/env.ts or any route reads SMTP_*/
-// GOOGLE_PLACES_API_KEY/PIXABAY_API_KEY at module-load time.
+// GOOGLE_PLACES_API_KEY/PIXABAY_API_KEY at module-load time. Redundant with
+// config/env.ts now also importing this as ITS first line (2026-08-04) —
+// kept here anyway for the handful of places that read a secret straight
+// off `process.env` instead of through `env` (routes/places.ts, utils/
+// mailer.ts, etc.). ES modules cache by resolved path, so this doesn't
+// double-run the unpack. See bootstrap/loadSecrets.ts's header.
 import "./bootstrap/loadSecrets.js";
 
 import express from "express";

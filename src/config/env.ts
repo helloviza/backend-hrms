@@ -1,5 +1,28 @@
 // apps/backend/src/config/env.ts
+//
+// ⚠️ MUST be the first import: back-fills process.env from the APP_SECRETS
+// bundle (and loads .env) BEFORE anything below reads process.env — see
+// bootstrap/loadSecrets.ts's header. This is what makes standalone scripts
+// under src/scripts/* (run via `tsx path/to/script.ts`, never through
+// server.ts) see bundle-only secrets (PIXABAY_API_KEY, GOOGLE_PLACES_API_KEY,
+// SMTP_*, EXCHANGERATE_API_KEY, ...): every script that reads a secret via
+// `env.X` from this module gets the unpack for free just by importing here,
+// with no per-script wiring. server.ts ALSO imports loadSecrets.ts directly,
+// as its own literal first line — that's not a leftover to clean up, it's
+// intentional belt-and-suspenders for the couple of places that still read a
+// secret straight off `process.env` instead of through `env` (routes/
+// places.ts's GOOGLE_PLACES_API_KEY, utils/mailer.ts's SMTP_USER/SMTP_PASS,
+// a few Gemini/Razorpay/TBO reads — a separate, deliberately-untouched
+// inconsistency, not fixed here). ES modules cache by resolved path, so
+// importing the same side-effecting module twice (once here, once from
+// server.ts) runs its body exactly once, not twice — this is not a
+// duplicate unpack.
+import "../bootstrap/loadSecrets.js";
+
 import dotenv from "dotenv";
+// Harmless no-op here — loadSecrets.ts above already called dotenv.config()
+// (and dotenv never overrides an already-set key), kept only so this file
+// still works standalone if that import is ever removed.
 dotenv.config();
 
 /**
@@ -40,6 +63,14 @@ export const env = {
 
   // --- Pixabay (SBT landing city images) — optional; absent disables auto-resolution ---
   PIXABAY_API_KEY: process.env.PIXABAY_API_KEY || "",
+
+  // --- ExchangeRate-API (CSTEP arrangement live FX pre-fill) — optional;
+  // absent disables live-rate pre-fill and the UI just falls back to manual
+  // entry (utils/exchangeRate.ts). Same secrets-bundle pattern as
+  // GEMINI_API_KEY/PIXABAY_API_KEY above — never hardcoded, back-filled into
+  // process.env by bootstrap/loadSecrets.ts from the single AWS Secrets
+  // Manager secret (plumtrips/backend/secrets) bundled into APP_SECRETS.
+  EXCHANGERATE_API_KEY: process.env.EXCHANGERATE_API_KEY || "",
 
   // --- WhatsApp Cloud API (Expense Management inbound receipt capture) ---------
   // All optional: when WA_APP_SECRET / WA_ACCESS_TOKEN / WA_PHONE_NUMBER_ID are
