@@ -1,0 +1,129 @@
+// apps/backend/src/utils/heroImageContrast.ts
+//
+// Deterministic contrast check for scripts/fetch-visa-destination-images.ts
+// — computed once per candidate at fetch time, not left to ops eyeballing a
+// raw thumbnail against text they can't see (task brief, 2026-08-04
+// follow-up). Replicates the EXACT treatment RequirementsPage.tsx applies
+// to a live heroImageUrl:
+//   1. background-size:cover onto the hero band (sharp's fit:"cover").
+//   2. the --s1-at-50% overlay, painted OVER the photo (background-image
+//      layers composite bottom-up before any filter runs).
+//   3. filter: saturate(80%), applied to that ALREADY-composited result —
+//      CSS filter is a post-process over the whole painted box, not the
+//      raw photo alone, so it must run after step 2, not before (getting
+//      this order backwards changes the numbers: saturating a photo then
+//      alpha-blending it against a non-grey colour like --s1 does not
+//      commute with doing it the other way round).
+// Then samples the exact regions where VerdictBand's heading and body text
+// sit (measured live via browser devtools against the AE/TOURIST
+// requirements page, 2026-08-04, at the desktop width RequirementsPage.tsx
+// is primarily reviewed at) and reports the WORST per-pixel WCAG contrast
+// ratio against #ffffff found in either region. These two elements sit
+// directly on the raw treated photo with no card tint behind them —
+// EntrySnapshotCard's own bg-visa-black-alpha-20 gives its fact rows extra
+// protection this doesn't model, so heading/body is already the binding,
+// worst-case pair, not an average across the hero.
+//
+// Keep every literal below in lockstep with RequirementsPage.tsx's
+// heroBackgroundStyle — if that overlay %, saturation %, or the active
+// theme's --s1 ever changes, this drifts out of sync silently.
+
+import sharp from "sharp";
+
+// Matches RequirementsPage.tsx's heroBackgroundStyle exactly.
+const OVERLAY_ALPHA = 0.5;
+const SATURATION = 0.8;
+// VISA_THEME.midnight.s1 (components/visa/ui/tokens.ts) — the active theme.
+const S1 = { r: 6, g: 18, b: 32 };
+
+// The hero band's own rendered box at a 1280px-wide desktop viewport
+// (RequirementsPage.tsx's .bg-visa-hero-dark div, measured live). Text
+// position drifts a little at other widths, but this is the primary
+// desktop width ops reviews from, and the sampled regions below have
+// margin built in (full bounding boxes, not single points).
+const REFERENCE_HERO = { width: 1280, height: 483 };
+
+// Fractional bounding boxes (relative to REFERENCE_HERO) of VerdictBand's
+// headline (h1) and summary paragraph — the two pieces of white text that
+// sit directly on the raw photo, unprotected by any card tint. Measured
+// live via browser devtools against the AE/TOURIST requirements page,
+// 2026-08-04.
+const TEXT_REGIONS: Array<{ name: string; left: number; top: number; right: number; bottom: number }> = [
+  { name: "heading", left: 0.0375, top: 0.2681, right: 0.5375, bottom: 0.3435 },
+  { name: "body", left: 0.0375, top: 0.3766, right: 0.5375, bottom: 0.4698 },
+];
+
+export const MIN_HERO_CONTRAST = 4.5;
+
+function srgbChannelToLinear(c: number): number {
+  const v = c / 255;
+  return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+}
+
+function relativeLuminance(r: number, g: number, b: number): number {
+  return 0.2126 * srgbChannelToLinear(r) + 0.7152 * srgbChannelToLinear(g) + 0.0722 * srgbChannelToLinear(b);
+}
+
+function contrastVsWhite(r: number, g: number, b: number): number {
+  return 1.05 / (relativeLuminance(r, g, b) + 0.05);
+}
+
+// CSS Filter Effects spec's saturate() colour matrix, applied to the
+// ALREADY-composited (photo + overlay) pixel — matches real paint order.
+function applySaturateFilter(r: number, g: number, b: number, s: number): [number, number, number] {
+  const r2 = (0.213 + 0.787 * s) * r + (0.715 - 0.715 * s) * g + (0.072 - 0.072 * s) * b;
+  const g2 = (0.213 - 0.213 * s) * r + (0.715 + 0.285 * s) * g + (0.072 - 0.072 * s) * b;
+  const b2 = (0.213 - 0.213 * s) * r + (0.715 - 0.715 * s) * g + (0.072 + 0.928 * s) * b;
+  return [r2, g2, b2];
+}
+
+/**
+ * Worst-case WCAG contrast ratio (vs #ffffff) for the given candidate
+ * image, after applying the exact hero treatment, sampled at the exact
+ * regions the heading/body text occupy. Lower is worse; 21 is the
+ * theoretical max (pure black background). Returns 0 (fail-closed) if
+ * decoding produced no sampleable pixels, rather than defaulting to a
+ * passing value nothing actually verified.
+ */
+export async function computeWorstCaseHeroContrast(imageBuffer: Buffer): Promise<number> {
+  const { data, info } = await sharp(imageBuffer)
+    .resize(REFERENCE_HERO.width, REFERENCE_HERO.height, { fit: "cover", position: "centre" })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { width, height, channels } = info;
+  let worst = Infinity;
+
+  for (const region of TEXT_REGIONS) {
+    const x0 = Math.max(0, Math.floor(region.left * width));
+    const x1 = Math.min(width, Math.ceil(region.right * width));
+    const y0 = Math.max(0, Math.floor(region.top * height));
+    const y1 = Math.min(height, Math.ceil(region.bottom * height));
+
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const idx = (y * width + x) * channels;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+
+        // Step 1: the --s1-at-50% overlay, painted over the photo.
+        const cr = r * (1 - OVERLAY_ALPHA) + S1.r * OVERLAY_ALPHA;
+        const cg = g * (1 - OVERLAY_ALPHA) + S1.g * OVERLAY_ALPHA;
+        const cb = b * (1 - OVERLAY_ALPHA) + S1.b * OVERLAY_ALPHA;
+
+        // Step 2: filter: saturate(80%), applied to that composite.
+        const [fr, fg, fb] = applySaturateFilter(cr, cg, cb, SATURATION);
+
+        const contrast = contrastVsWhite(
+          Math.min(255, Math.max(0, fr)),
+          Math.min(255, Math.max(0, fg)),
+          Math.min(255, Math.max(0, fb)),
+        );
+        if (contrast < worst) worst = contrast;
+      }
+    }
+  }
+
+  return worst === Infinity ? 0 : worst;
+}

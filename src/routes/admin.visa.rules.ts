@@ -37,6 +37,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
+import { MIN_HERO_CONTRAST } from "../utils/heroImageContrast.js";
 import VisaRule, {
   VISA_PURPOSES,
   VISA_ENTRY_TYPES,
@@ -978,6 +979,19 @@ router.post("/destination-content/:iso2/select-image", requirePermission("visaAp
 
     const candidate = (existing.imageCandidates || []).find((c: any) => c.sourceId === sourceId);
     if (!candidate) return res.status(404).json({ error: "That candidate is no longer available — try re-fetching." });
+
+    // Deterministic gate (2026-08-04 follow-up) — contrastStatus was
+    // computed once at fetch time (scripts/fetch-visa-destination-
+    // images.ts, utils/heroImageContrast.ts) against the real hero
+    // treatment. The admin picker already disables a FAIL candidate's
+    // button, but that's a client-side courtesy, not the enforcement — a
+    // direct API call must be refused here too, or the whole point of
+    // "deterministic, not eyeballed" is just cosmetic.
+    if (candidate.contrastStatus === "FAIL") {
+      return res.status(400).json({
+        error: `That candidate fails the minimum contrast requirement (${candidate.contrastRatio.toFixed(2)}:1, needs ${MIN_HERO_CONTRAST}:1) and can't be published. Pick another candidate or upload your own image.`,
+      });
+    }
 
     existing.heroImageUrl = candidate.fullUrl;
     existing.thumbnailUrl = candidate.previewUrl;

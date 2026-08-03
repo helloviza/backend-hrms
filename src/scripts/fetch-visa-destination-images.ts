@@ -39,6 +39,19 @@
 // "fetch once, store forever" (task brief §1) means downloading
 // candidates up front, not just the one that ends up selected.
 //
+// Contrast (2026-08-04 follow-up): ops reviewing a raw, untreated
+// thumbnail was judging a photo against text they can't see — the 50%
+// overlay / 80% saturation the requirements hero applies (see
+// RequirementsPage.tsx) doesn't guarantee 4.5:1 against every photo, so
+// every candidate's full-size image is run through
+// utils/heroImageContrast.ts here, at fetch time, against the REAL
+// treatment. A candidate below 4.5:1 is still stored (audit trail, not
+// silently dropped) but flagged contrastStatus: "FAIL" — the admin picker
+// disables it, and POST .../select-image refuses it server-side even if
+// someone bypasses the UI. This runs in dry-run mode too (a read-only
+// fetch, not a write) so `--iso2=XX` without `--commit` is still a fast
+// way to see whether a destination has any passing candidates at all.
+//
 // Run:
 //   DRY RUN (default) — queries Pixabay for real (so you can see candidate
 //   counts) but uploads nothing and writes nothing:
@@ -64,6 +77,7 @@ import { s3 } from "../config/aws.js";
 import VisaRule from "../models/VisaRule.js";
 import VisaDestinationContent, { type VisaImageCandidate } from "../models/VisaDestinationContent.js";
 import { getCountryByIso2 } from "../utils/countryCodes.js";
+import { computeWorstCaseHeroContrast, MIN_HERO_CONTRAST } from "../utils/heroImageContrast.js";
 
 const COMMIT = process.argv.includes("--commit");
 const FORCE = process.argv.includes("--force");
@@ -80,19 +94,22 @@ function extFromContentType(ct: string | null): { ext: string; ct: string } {
   return { ext: "jpg", ct: "image/jpeg" };
 }
 
-async function downloadAndStore(srcUrl: string, key: string): Promise<string | null> {
+async function fetchBytes(srcUrl: string): Promise<{ buffer: Buffer; contentType: string | null } | null> {
   try {
     const resp = await fetch(srcUrl);
     if (!resp.ok) return null;
-    const buffer = Buffer.from(await resp.arrayBuffer());
-    const { ext, ct } = extFromContentType(resp.headers.get("content-type"));
-    const fullKey = `${key}.${ext}`;
-    await s3.send(new PutObjectCommand({ Bucket: env.S3_BUCKET, Key: fullKey, Body: buffer, ContentType: ct }));
-    return `https://${env.S3_BUCKET}.s3.${env.AWS_REGION}.amazonaws.com/${fullKey}`;
+    return { buffer: Buffer.from(await resp.arrayBuffer()), contentType: resp.headers.get("content-type") };
   } catch (err: any) {
-    console.warn(`    download/store failed for ${srcUrl}: ${err?.message}`);
+    console.warn(`    fetch failed for ${srcUrl}: ${err?.message}`);
     return null;
   }
+}
+
+async function storeBuffer(buffer: Buffer, contentType: string | null, key: string): Promise<string> {
+  const { ext, ct } = extFromContentType(contentType);
+  const fullKey = `${key}.${ext}`;
+  await s3.send(new PutObjectCommand({ Bucket: env.S3_BUCKET, Key: fullKey, Body: buffer, ContentType: ct }));
+  return `https://${env.S3_BUCKET}.s3.${env.AWS_REGION}.amazonaws.com/${fullKey}`;
 }
 
 async function fetchCandidates(iso2: string, countryName: string): Promise<VisaImageCandidate[]> {
@@ -115,6 +132,19 @@ async function fetchCandidates(iso2: string, countryName: string): Promise<VisaI
     const fullSrc: string | undefined = hit.largeImageURL || hit.webformatURL;
     if (!previewSrc || !fullSrc) continue;
 
+    // Contrast is computed against real pixels regardless of dry-run —
+    // this is a read-only fetch (no S3 write, no DB write), so it doesn't
+    // break dry-run's "writes nothing" contract, and it's the whole point
+    // of being able to preview a destination without --commit.
+    const fullBytes = await fetchBytes(fullSrc);
+    if (!fullBytes) {
+      console.warn(`    hit ${hit.id} — couldn't download full image to check contrast, skipping`);
+      continue;
+    }
+    const contrastRatio = await computeWorstCaseHeroContrast(fullBytes.buffer);
+    const contrastStatus: "PASS" | "FAIL" = contrastRatio >= MIN_HERO_CONTRAST ? "PASS" : "FAIL";
+    console.log(`    hit ${hit.id}: contrast ${contrastRatio.toFixed(2)}:1 (need ${MIN_HERO_CONTRAST}:1) — ${contrastStatus}`);
+
     if (!COMMIT) {
       // Dry run — report what a commit WOULD store, but these are still
       // live Pixabay URLs (webformatURL expires in 24h) and are never
@@ -128,16 +158,20 @@ async function fetchCandidates(iso2: string, countryName: string): Promise<VisaI
         tags: hit.tags,
         status: "PENDING",
         fetchedAt: new Date(),
+        contrastRatio,
+        contrastStatus,
       });
       continue;
     }
 
+    const previewBytes = await fetchBytes(previewSrc);
+    if (!previewBytes) continue;
+
     const keyBase = `visa-destination-images/candidates/${iso2}/${hit.id}`;
     const [preview, full] = await Promise.all([
-      downloadAndStore(previewSrc, `${keyBase}-preview`),
-      downloadAndStore(fullSrc, `${keyBase}-full`),
+      storeBuffer(previewBytes.buffer, previewBytes.contentType, `${keyBase}-preview`),
+      storeBuffer(fullBytes.buffer, fullBytes.contentType, `${keyBase}-full`),
     ]);
-    if (!preview || !full) continue;
 
     candidates.push({
       source: "pixabay",
@@ -148,6 +182,8 @@ async function fetchCandidates(iso2: string, countryName: string): Promise<VisaI
       tags: hit.tags,
       status: "PENDING",
       fetchedAt: new Date(),
+      contrastRatio,
+      contrastStatus,
     });
   }
   return candidates;
@@ -191,7 +227,10 @@ async function main() {
 
     console.log(`${iso2} (${countryName}) — querying Pixabay...`);
     const candidates = await fetchCandidates(iso2, countryName);
-    console.log(`  ${candidates.length} candidate(s)${candidates.length === 0 ? " — nothing to review yet" : ""}.`);
+    const passCount = candidates.filter((c) => c.contrastStatus === "PASS").length;
+    console.log(
+      `  ${candidates.length} candidate(s)${candidates.length === 0 ? " — nothing to review yet" : ` — ${passCount} pass contrast, ${candidates.length - passCount} fail`}.`,
+    );
 
     if (!COMMIT || candidates.length === 0) continue;
 

@@ -34,6 +34,15 @@ export type VisaImageCandidateStatus = (typeof VISA_IMAGE_CANDIDATE_STATUSES)[nu
 // id (dedupe across re-runs, and the provenance trail if a takedown or a
 // licence question ever comes up); `pageUrl`/`tags` are read-only context
 // for whoever is reviewing, not rendered to customers.
+//
+// contrastRatio/contrastStatus (2026-08-04) — computed once at fetch time
+// by utils/heroImageContrast.ts against the EXACT requirements-hero
+// treatment (RequirementsPage.tsx's heroBackgroundStyle), not left to ops
+// judging a raw, untreated thumbnail against text they can't see. A
+// candidate below the 4.5:1 WCAG minimum is still stored (audit trail,
+// task brief: "surfaced separately as failing", not silently dropped) but
+// routes/admin.visa.rules.ts's POST .../select-image refuses to publish
+// it — the gate is enforced server-side, not just a disabled button.
 export interface VisaImageCandidate {
   source: "pixabay";
   sourceId: string;
@@ -43,6 +52,8 @@ export interface VisaImageCandidate {
   tags?: string;
   status: VisaImageCandidateStatus;
   fetchedAt: Date;
+  contrastRatio: number; // worst-case WCAG ratio vs #ffffff over the hero heading/body regions
+  contrastStatus: "PASS" | "FAIL"; // ratio >= 4.5 ? "PASS" : "FAIL"
 }
 
 export const VISA_DESTINATION_CONTENT_STATUSES = ["DRAFT", "PUBLISHED"] as const;
@@ -122,6 +133,8 @@ const VisaImageCandidateSchema = new Schema<VisaImageCandidate>(
     tags: { type: String, trim: true },
     status: { type: String, enum: VISA_IMAGE_CANDIDATE_STATUSES, default: "PENDING" },
     fetchedAt: { type: Date, required: true },
+    contrastRatio: { type: Number, required: true },
+    contrastStatus: { type: String, enum: ["PASS", "FAIL"], required: true },
   },
   { _id: false },
 );
