@@ -157,7 +157,12 @@ vi.mock("../services/whatsappCloud.service.js", async (orig) => {
     isWhatsAppCloudConfigured: () => true,
   };
 });
-vi.mock("../services/flightService.js", () => ({ getDelightfulFlightStatus: H.spies.flightStatus }));
+// 0.3: worker calls getFlightOccurrenceForDate(flightNo, departDate) now.
+vi.mock("../services/flightService.js", () => ({
+  getFlightOccurrenceForDate: H.spies.flightStatus,
+  getFlightOccurrences: H.spies.flightStatus,
+  isFlightLookupError: (r: any) => Boolean(r && r.error),
+}));
 vi.mock("../utils/mailer.js", () => ({ sendMail: H.spies.sendMail }));
 vi.mock("../services/weatherService.js", () => ({ getDestinationWeather: H.spies.getWeather }));
 vi.mock("../utils/plutoMetricsSink.js", () => ({ emitMetric: H.spies.emitMetric }));

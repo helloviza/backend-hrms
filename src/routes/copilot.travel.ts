@@ -40,7 +40,8 @@ import {
   PLUTO_AI_SYSTEM_PROMPT as PLUTO_SYSTEM_PROMPT,
 } from "../prompts/plutoSystemPrompt.js";
 import {
-  getDelightfulFlightStatus as fetchFlightFromApi,
+  getFlightOccurrences,
+  isFlightLookupError,
 } from "../services/flightService.js";
 
 import { searchFlights as tboSearchFlights } from "../services/tbo.flight.service.js";
@@ -52,7 +53,11 @@ import {
   searchFlightsForChat,
 } from "../utils/plutoFlightSearch.js";
 import { parseDateToISO } from "../utils/plutoDate.js";
-import { extractFlightDesignator } from "../utils/flightDesignator.js";
+import {
+  extractFlightDesignator,
+  extractStatusDate,
+  isFlightStatusQuery,
+} from "../utils/flightDesignator.js";
 import { isMultiCityIntent, resolveRoundTripIntent } from "../utils/plutoTripIntent.js";
 import { resolveIATA } from "../utils/plutoIata.js";
 import { loadWorkspacePolicyRules } from "../services/policyService.js";
@@ -655,6 +660,120 @@ async function runConciergeTurn(
       return res.json({
         ok: true,
         reply: buildOffDomainRedirect(),
+        context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
+      });
+    }
+
+    /* ───────── Flight STATUS Detector (must precede route search) ─────────
+     *
+     * Two phrasings used to fail differently. "Check flight 6E-2582" matched the
+     * route-search detector below (verb + "flight"), failed to resolve an
+     * origin/destination and answered "Which airport should I search?".
+     * "tell me the flight status of AI-4305" matched nothing, fell through to
+     * the AI path, and had live status laundered through the model as prose.
+     * Both land here now.
+     *
+     * The reply is composed in CODE from the AeroAPI response — no invokePluto
+     * on this path — so the model can neither invent nor reword flight facts.
+     *
+     * A real route search wins the tie: "find flights from DEL to BOM like
+     * AI 2024" carries a from…to pair and must still search, not report status.
+     */
+    const looksLikeRouteSearch = /\bfrom\b[\s\S]{1,40}\bto\b/i.test(prompt);
+    if (isFlightStatusQuery(prompt) && !looksLikeRouteSearch) {
+      const ident = extractFlightDesignator(prompt) as string;
+      // Reuse the existing date parser rather than writing a second one; null
+      // when the user named no date, which means "next upcoming".
+      const askedDateRaw = extractStatusDate(prompt);
+      const askedDate = askedDateRaw ? parseDateToISO(askedDateRaw) : null;
+
+      onStage?.("checking_flight_status", { ident });
+
+      let lookup: any;
+      try {
+        lookup = await getFlightOccurrences(ident, { date: askedDate, limit: 3 });
+      } catch (err: any) {
+        console.error("[FlightStatus] lookup failed", { requestId, ident, message: err?.message });
+        return res.json({
+          ok: true,
+          reply: {
+            title: `Flight ${ident}`,
+            context: `I couldn't reach the flight-tracking service just now. You can check ${ident} directly on FlightAware or with the airline.`,
+            nextSteps: ["Try again in a few minutes"],
+            handoff: false,
+          },
+          context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
+        });
+      }
+
+      // Hard miss (unknown ident / 404) — the card renders its own error state.
+      if (isFlightLookupError(lookup)) {
+        return res.json({
+          ok: true,
+          reply: {
+            title: `Flight ${ident}`,
+            context: lookup.message,
+            flightStatus: lookup,
+            nextSteps: ["Check the airline's app for the latest status"],
+            handoff: false,
+          },
+          context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
+        });
+      }
+
+      const occ = lookup.occurrences;
+      const first = occ[0];
+
+      // Asked for a date we have no occurrence for → say so; never silently
+      // serve a different day (the whole bug this branch exists to kill).
+      if (askedDate && occ.length === 0) {
+        return res.json({
+          ok: true,
+          reply: {
+            title: `Flight ${ident}`,
+            context: `I couldn't find an ${ident} departure on ${askedDate}. It may not operate that day.`,
+            flightStatus: {
+              ident,
+              requestedDate: askedDate,
+              occurrences: [],
+              tip: "Try a nearby date, or check the airline's schedule.",
+            },
+            nextSteps: [`Check ${ident} on a nearby date`],
+            handoff: false,
+          },
+          context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
+        });
+      }
+
+      const route = first ? `${first.departure.iata} → ${first.arrival.iata}` : "";
+      const whenNote = first?.isPast
+        ? `This flight has already operated — showing its most recent departure (${first.servedDate}).`
+        : occ.length > 1
+          ? `Showing the next ${occ.length} departures. Times are local to each airport.`
+          : `Showing the ${askedDate ? "requested" : "next"} departure (${first?.servedDate}). Times are local to each airport.`;
+
+      return res.json({
+        ok: true,
+        reply: {
+          title: `${ident} · ${route}`.trim(),
+          context: `${ident}${route ? ` ${route}` : ""} — ${first?.flight_status || "status unavailable"}. ${whenNote}`,
+          // Real data, composed in code. `tip`/`airline` are populated here
+          // because the model no longer emits a flightStatus object at all.
+          flightStatus: {
+            ident,
+            requestedDate: lookup.requestedDate,
+            occurrences: occ,
+            airline: first?.airline?.name || "",
+            tip: first?.isPast
+              ? "Ask again closer to your travel date for live status."
+              : "Gate and terminal can change close to departure — re-check on the day.",
+          },
+          nextSteps: [
+            `Track ${ident} again later`,
+            "Plan a trip on this route",
+          ],
+          handoff: false,
+        },
         context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
       });
     }
@@ -1469,54 +1588,18 @@ async function runConciergeTurn(
           )}\n`
         : "";
 
-    /* ───────── Real-Time Data Injection (CRITICAL) ───────── */
-    let liveFlightData: any = null;
-
-    // Handles "6E-2582", "6E 2582", "6E2582" — and, unlike the case-insensitive
-    // pattern this replaced, NOT "trip in 2026" (which used to read as carrier
-    // "IN" flight 2026 and inject the NO-HALLUCINATE block below into an
-    // ordinary planning prompt). See ../utils/flightDesignator.
-    const detectedFlightNumber = extractFlightDesignator(prompt);
-
-    if (detectedFlightNumber) {
-      try {
-        // ✅ Diagnostic log — confirms API key + flight number being used
-
-        liveFlightData = await fetchFlightFromApi(detectedFlightNumber);
-
-        // ✅ If API returned an error object (not a throw), treat as failure
-        if (liveFlightData?.error) {
-          console.error("[FlightService] API returned error:", liveFlightData.error);
-          liveFlightData = null;
-        } else {
-
-        }
-      } catch (err: any) {
-        console.error("[FlightService] Flight fetch failed:", err?.message || err);
-        liveFlightData = null;
-      }
-    }
-
-    // ✅ FIX: When flight data is unavailable, explicitly instruct AI NOT to hallucinate
-    // Old code: passed empty string → AI invented fake status, gate, terminal, arrival time
-    // New code: passes explicit NO-HALLUCINATE instruction when real data is missing
-    const flightDataString = liveFlightData
-      ? `\n[VERIFIED LIVE FLIGHT DATA - USE THIS AS ABSOLUTE TRUTH]:\n${JSON.stringify(
-          liveFlightData,
-          null,
-          2
-        )}\n`
-      : detectedFlightNumber
-      ? `\n[FLIGHT DATA UNAVAILABLE FOR ${detectedFlightNumber}]:
-CRITICAL INSTRUCTION: You were unable to fetch live flight data for this flight.
-DO NOT invent, estimate, or assume ANY flight details (status, gate, terminal, time, airline).
-DO NOT say the flight is "On Time" or provide any gate/terminal/arrival information.
-Instead, tell the user clearly:
-- Live flight data could not be retrieved at this moment
-- They should check the IndiGo app, DGCA website, or FlightAware.com for real-time status
-- Provide the direct link: https://www.goindigo.in/flight-status.html (if IndiGo) or https://www.flightaware.com
-\n`
-      : "";
+    /* ───────── Real-Time Flight Data — REMOVED (0.3) ─────────
+     * A live-status fetch used to happen HERE and was injected into the model
+     * prompt as "[VERIFIED LIVE FLIGHT DATA — USE THIS AS ABSOLUTE TRUTH]",
+     * with a NO-HALLUCINATE fallback block when the fetch failed. That laundered
+     * real flight facts through the model, and doubled the paid AeroAPI calls
+     * (the frontend fetched the same status independently).
+     *
+     * Flight status is now owned by the dedicated branch at the top of this
+     * function: one bounded AeroAPI call, correct occurrence, reply composed in
+     * code, and the model is never in the loop. The prompt no longer carries any
+     * flight-status block, and plutoSystemPrompt no longer asks for one.
+     */
 
     /* ───────── VIDEO CONTEXT INJECTION (AUTHORITATIVE) ───────── */
     const videoContextString =
@@ -1638,7 +1721,6 @@ Your nextSteps should ONLY be about completing the trip plan (itinerary refineme
       `${missingFieldsString}\n` +
       `${lockedContext}\n` +
       `${assumedContext}\n` +
-      `${flightDataString}\n` +
       `${videoContextString}\n` +
       `${rmHint}`;
 
