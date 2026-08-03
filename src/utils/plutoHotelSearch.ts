@@ -23,6 +23,7 @@
 import { searchHotels, isHotelSearchError } from "../services/tbo.hotel.search.service.js";
 import { evaluateHotelPolicy, hotelForPolicyFromResult, type PolicyRules } from "../services/policyEvaluator.js";
 import { extractPromptDateRange } from "./plutoDate.js";
+import { lookupDestination, lookupDestinationFuzzy } from "../data/destinationLookup.js";
 
 /** Compact, bookable hotel row carried on the reply. */
 export interface HotelListing {
@@ -199,13 +200,65 @@ export function extractStarFilter(prompt: string): number | null {
   return null;
 }
 
-/** "hotels in Dubai", "stay in Tokyo" → the city the user named, else null. */
+/**
+ * The city a hotel-led turn is about, else null.
+ *
+ * Three passes, strongest signal first. The first two are shape-based and the
+ * third recognises a known destination anywhere in the sentence:
+ *
+ *   1. "<hotel word> <connector> <City>" — an explicit, adjacent naming.
+ *   2. "… in <City>" anywhere in the prompt.
+ *   3. CATALOG FALLBACK — a known city appearing anywhere, whole-word.
+ *
+ * WHY 3 EXISTS. The two shape patterns alone read only a narrow slice of how
+ * people actually write. "Hotel Options for Dubai Stay on 25-26 September 2026"
+ * missed BOTH — the connector was "for" (not in the old in|at|near|around list)
+ * AND pattern 2 was anchored to end-of-string, so a city followed by dates could
+ * never match. The turn returned null, fell back to an empty locked destination,
+ * and the whole live lane silently handed the answer to the model, which then
+ * invented hotels. Shape-matching free text will always have another hole in it;
+ * recognising a KNOWN city does not.
+ *
+ * EVERY candidate is validated against the destination table, and that is what
+ * makes pass 2 safe to unanchor: bare `in <Capitalised>` would otherwise happily
+ * return "September". It costs nothing in reach — the ownership gate already
+ * requires countryFor() to resolve the city, so a name this table does not know
+ * could never have run a search anyway. Validation also canonicalises spelling
+ * ("bombay" → "Mumbai") instead of passing raw text to TBO.
+ *
+ * lookupDestinationFuzzy is reused rather than reimplemented: it is already
+ * whole-word, longest-key-wins, and — the property that matters here — it never
+ * invents a city that is not in the table. Verified silent on "show me hotels",
+ * "hotel options for the best rates", "resort with a spa and a pool".
+ *
+ * COVERAGE, stated plainly: the table is curated (~280 entries built from real
+ * booking destinations). Dubai, Singapore and New York resolve; Tokyo, London,
+ * Bangkok and Paris are NOT in it and so resolve to null here — exactly as they
+ * already failed at the countryFor() gate. Widening that table is its own task.
+ */
 export function extractHotelCity(prompt: string): string | null {
-  const m =
-    prompt.match(
-      /\b(?:hotels?|stay|stays|accommodations?|resort|lodging)\s+(?:in|at|near|around)\s+([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?)/,
-    ) || prompt.match(/\bin\s+([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?)\s*$/);
-  return m ? m[1].trim() : null;
+  if (!prompt) return null;
+
+  // 1. Adjacent naming. "for"/"to" join the connector list — "hotels for Dubai"
+  //    is as explicit as "hotels in Dubai" and used to resolve to nothing.
+  const adjacent = prompt.match(
+    /\b(?:hotels?|stay|stays|accommodations?|resort|lodging)\s+(?:in|at|near|around|for|to)\s+([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?)/,
+  );
+  // 2. "… in <City>" — no longer anchored to the end of the prompt.
+  const loose = prompt.match(/\bin\s+([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?)/);
+
+  for (const m of [adjacent, loose]) {
+    const candidate = m?.[1]?.trim();
+    if (!candidate) continue;
+    // A country/region entry (city:null, e.g. "Vietnam") is NOT a city — skip it
+    // rather than sending a region name to TBO as though it were one.
+    const known = lookupDestination(candidate);
+    if (known?.city) return known.city;
+  }
+
+  // 3. Known city anywhere in the sentence. Null when there is none — the
+  //    caller then hands off honestly instead of guessing a destination.
+  return lookupDestinationFuzzy(prompt)?.city ?? null;
 }
 
 /**
