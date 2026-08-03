@@ -14,7 +14,11 @@ import {
   HOTEL_CITIES as SHARED_HOTEL_CITIES,
   type HotelCity,
 } from "../shared/cities.js";
-import { resolveCityCode as resolveCityCodeAgainstCatalog } from "../jobs/static-data-refresh.js";
+import {
+  resolveCityCode as resolveCityCodeAgainstCatalog,
+  normalizeSearch,
+  TBOCity,
+} from "../jobs/static-data-refresh.js";
 import { TBO_URLS } from "../config/tboUrls.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -303,6 +307,83 @@ export async function resolveCityCode(cityName: string): Promise<string | null> 
   } catch {
     return null;
   }
+}
+
+/**
+ * COUNTRY-AWARE city → TBO CityCode. The resolver `resolveCityCode` above is
+ * hardcoded to India (`fetchCityList("IN")`), so it can never resolve Dubai —
+ * which is exactly why the concierge hotel lane had no CityCode to pass and
+ * searchHotels rejected every chat search before reaching the network.
+ *
+ * Two sources, cheapest first, and NEITHER invents a code:
+ *   1. the local `tbocities` catalog (global; the same collection SBT's
+ *      autocomplete searches) — no network, exact `searchName` then prefix
+ *   2. the live CityList for that country + the catalog resolver the boot job
+ *      and searchHotels already use for drift correction
+ *
+ * Returns null when the city is genuinely unknown; the caller must then hand
+ * off honestly rather than search with a guessed code.
+ */
+export async function resolveCityCodeForCountry(
+  cityName: string,
+  countryCode: string,
+): Promise<string | null> {
+  const name = String(cityName || "").trim();
+  const country = String(countryCode || "").trim().toUpperCase();
+  if (!name || !country) return null;
+
+  // 1. Local catalog — indexed on searchName, so this is a point lookup.
+  const key = normalizeSearch(name);
+  if (key) {
+    try {
+      const exact = await (TBOCity as any)
+        .findOne({ searchName: key, countryCode: country })
+        .select("code")
+        .lean();
+      if (exact?.code) return String(exact.code);
+
+      // Prefix, e.g. "Dubai" → "Dubai Marina" when the exact row is absent.
+      // Shortest name wins so the city itself beats a longer sub-locality.
+      const prefixed = await (TBOCity as any)
+        .find({ searchName: { $gte: key, $lt: key + "￿" }, countryCode: country })
+        .select("code searchName")
+        .limit(20)
+        .lean();
+      if (Array.isArray(prefixed) && prefixed.length > 0) {
+        const best = prefixed
+          .slice()
+          .sort((a: any, b: any) =>
+            String(a.searchName ?? "").length - String(b.searchName ?? "").length,
+          )[0];
+        if (best?.code) return String(best.code);
+      }
+    } catch (dbErr) {
+      sbtLogger.warn("[CITY-RESOLVE] tbocities read failed — trying live CityList", {
+        cityName: name,
+        countryCode: country,
+        err: dbErr instanceof Error ? dbErr.message : String(dbErr),
+      });
+    }
+  }
+
+  // 2. Live CityList (24h in-memory cached) + the shared catalog resolver.
+  try {
+    const cities = await fetchCityList(country);
+    const tboCities = cities.map((c) => ({ Code: c.CityId, Name: c.CityName }));
+    const resolved = resolveCityCodeAgainstCatalog(
+      { cityName: name, countryCode: country } as HotelCity,
+      tboCities,
+    );
+    if (resolved) return resolved;
+  } catch (liveErr) {
+    sbtLogger.warn("[CITY-RESOLVE] live CityList failed", {
+      cityName: name,
+      countryCode: country,
+      err: liveErr instanceof Error ? liveErr.message : String(liveErr),
+    });
+  }
+
+  return null;
 }
 
 // ─── Startup preload (runs once when this module is first imported) ──────────

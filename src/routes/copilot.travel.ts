@@ -52,14 +52,16 @@ import {
   mapTBOFlight,
   searchFlightsForChat,
 } from "../utils/plutoFlightSearch.js";
-import { parseDateToISO } from "../utils/plutoDate.js";
+import { parseDateToISO, extractPromptDateRange } from "../utils/plutoDate.js";
 import {
   isHotelRequest,
   extractHotelCity,
   extractStarFilter,
   searchHotelsForChat,
   nightsBetween,
+  resolveHotelSearchWindow,
 } from "../utils/plutoHotelSearch.js";
+import { resolveCityCodeForCountry } from "../services/tbo.hotel.shared.js";
 import { countryFor } from "../data/destinationLookup.js";
 import {
   extractFlightDesignator,
@@ -1219,8 +1221,16 @@ async function runConciergeTurn(
       ? extractHotelCity(prompt) || hotelLocked?.destination?.name || null
       : null;
     const hotelCountry = hotelCity ? countryFor(hotelCity) : null;
-    const checkIn = hotelLocked?.dates?.start || null;
-    const checkOut = hotelLocked?.dates?.end || null;
+
+    // The stay window. A locked pair wins; otherwise the dates typed THIS turn
+    // count. Reading only the locked bag is what made a first-turn dated hotel
+    // prompt fall through to the AI path — the locker runs ~240 lines below, so
+    // on turn 1 the bag is always empty and the user had to repeat themselves.
+    // Both readers now share ONE parser (resolveHotelSearchWindow), so they
+    // cannot drift apart again.
+    const hotelWindow = resolveHotelSearchWindow(prompt, hotelLocked);
+    const checkIn = hotelWindow?.start || null;
+    const checkOut = hotelWindow?.end || null;
 
     // OWNERSHIP RULE: this branch takes the turn ONLY when a real search can
     // actually run — hotel-led prompt, a city we can resolve to a country, and
@@ -1238,7 +1248,23 @@ async function runConciergeTurn(
       !/\b(fly|flying|flight|flights)\b/i.test(prompt);
 
     if (hotelLed && hotelCountry && checkIn && checkOut) {
-      const hotelReturnContext = { ...hotelCtx, id: conversationId };
+      // When the gate fired on dates/city read from THIS prompt, they must be
+      // locked here too. The branch returns before the locked-facts block below
+      // ever runs, so without this the very thing the ownership comment protects
+      // would break: the next turn would re-ask for what the user just typed.
+      const hotelLockedOut: any = { ...(hotelLocked || {}) };
+      if (hotelWindow?.source === "prompt" && !hotelLockedOut.dates) {
+        hotelLockedOut.dates = { start: checkIn, end: checkOut, source: "user" };
+        if (!hotelLockedOut.duration) {
+          const spanDays =
+            Math.round((Date.parse(checkOut) - Date.parse(checkIn)) / 86400000) + 1;
+          if (spanDays > 0) hotelLockedOut.duration = { days: spanDays, source: "derived" };
+        }
+      }
+      if (!hotelLockedOut.destination) {
+        hotelLockedOut.destination = { name: hotelCity, source: "user" };
+      }
+      const hotelReturnContext = { ...hotelCtx, id: conversationId, locked: hotelLockedOut };
 
       onStage?.("checking_policy");
       const hotelPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
@@ -1248,18 +1274,33 @@ async function runConciergeTurn(
       const hotelAdults = 2;
       const hotelRooms = 1;
 
+      // TBO prices by CityCode, never by city NAME: searchHotels rejects with a
+      // 400 before any network call when it is missing, which is how this lane
+      // silently never reached TBO at all. Resolve against the same catalog SBT
+      // uses; a city we cannot resolve hands off honestly rather than guessing.
       onStage?.("searching_hotels", { city: hotelCity });
-      const hotelResult = await searchHotelsForChat({
-        cityName: hotelCity,
-        countryCode: hotelCountry,
-        checkIn,
-        checkOut,
-        adults: hotelAdults,
-        rooms: hotelRooms,
-        starRating: extractStarFilter(prompt),
-        guestNationality: (req as any).user?.nationality || "IN",
-        policyRules: hotelPolicyRules,
-      });
+      const hotelCityCode = await resolveCityCodeForCountry(hotelCity, hotelCountry);
+
+      const hotelResult = hotelCityCode
+        ? await searchHotelsForChat({
+            cityName: hotelCity,
+            cityCode: hotelCityCode,
+            countryCode: hotelCountry,
+            checkIn,
+            checkOut,
+            adults: hotelAdults,
+            rooms: hotelRooms,
+            starRating: extractStarFilter(prompt),
+            guestNationality: (req as any).user?.nationality || "IN",
+            policyRules: hotelPolicyRules,
+          })
+        : {
+            ok: false as const,
+            reason: "CITY_UNRESOLVED" as const,
+            hotels: [],
+            cityName: hotelCity,
+            searchId: "",
+          };
 
       const nights = nightsBetween(checkIn, checkOut);
 
@@ -1268,7 +1309,9 @@ async function runConciergeTurn(
         const why =
           hotelResult.reason === "NO_AVAILABILITY"
             ? `I couldn't find live availability in ${hotelCity} for ${checkIn} → ${checkOut}.`
-            : `I couldn't pull live hotel availability for ${hotelCity} right now.`;
+            : hotelResult.reason === "CITY_UNRESOLVED"
+              ? `I couldn't match ${hotelCity} to a bookable destination in our hotel inventory.`
+              : `I couldn't pull live hotel availability for ${hotelCity} right now.`;
         await emitMetric(
           searchError({ workspaceId, requestId, reason: hotelResult.reason || "hotel_unknown" }),
         );
@@ -1481,17 +1524,6 @@ async function runConciergeTurn(
      */
     {
       const L = conversationContext.locked;
-      const MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
-      const parseLooseDate = (token: string): string | null => {
-        const m = token.match(/(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{4}))?/i);
-        if (!m) return null;
-        const day = parseInt(m[1], 10);
-        const monthIdx = MONTHS.indexOf(m[2].slice(0, 3).toLowerCase());
-        if (monthIdx < 0) return null;
-        const year = m[3] ? parseInt(m[3], 10) : new Date().getFullYear();
-        const d = new Date(Date.UTC(year, monthIdx, day));
-        return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
-      };
 
       // Destination — "trip to Tokyo", "flying to Tokyo", "to Tokyo".
       // Require a capitalised token (proper-noun heuristic) to avoid capturing
@@ -1521,21 +1553,14 @@ async function runConciergeTurn(
       // form is handled by the range normaliser above), e.g. "16th Aug … 20th
       // Aug". First token = start, second (if any) = end; derive duration.
       if (!L.dates) {
-        // Compact range sharing one month first: "12-15 Sep", "12 to 15 September".
-        const compact = prompt.match(/\b(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+(\d{4}))?/i);
-        let start: string | null = null;
-        let end: string | null = null;
-        if (compact) {
-          const yr = compact[4] ? ` ${compact[4]}` : "";
-          start = parseLooseDate(`${compact[1]} ${compact[3]}${yr}`);
-          end = parseLooseDate(`${compact[2]} ${compact[3]}${yr}`);
-        } else {
-          const tokens = prompt.match(/\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?/gi) || [];
-          if (tokens.length >= 1) {
-            start = parseLooseDate(tokens[0]);
-            end = tokens[1] ? parseLooseDate(tokens[1]) : null;
-          }
-        }
+        // ONE parser, shared with the hotel ownership gate above
+        // (resolveHotelSearchWindow → extractPromptDateRange). They used to be
+        // two copies running ~240 lines apart, which is what made a first-turn
+        // dated hotel prompt invisible to the gate. Same patterns, same
+        // missing-year rule — behaviour here is unchanged.
+        const parsed = extractPromptDateRange(prompt);
+        const start = parsed?.start ?? null;
+        const end = parsed?.end ?? null;
         if (start) {
           L.dates = { start, ...(end ? { end } : {}), source: "user" };
           if (end && !L.duration) {

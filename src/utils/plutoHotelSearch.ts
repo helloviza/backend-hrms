@@ -22,6 +22,7 @@
 
 import { searchHotels, isHotelSearchError } from "../services/tbo.hotel.search.service.js";
 import { evaluateHotelPolicy, hotelForPolicyFromResult, type PolicyRules } from "../services/policyEvaluator.js";
+import { extractPromptDateRange } from "./plutoDate.js";
 
 /** Compact, bookable hotel row carried on the reply. */
 export interface HotelListing {
@@ -65,7 +66,13 @@ export interface HotelListing {
 export interface ChatHotelSearchResult {
   ok: boolean;
   /** Why the search could not run / returned nothing. Null on success. */
-  reason: "NO_AVAILABILITY" | "UPSTREAM_ERROR" | "BAD_REQUEST" | null;
+  reason:
+    | "NO_AVAILABILITY"
+    | "UPSTREAM_ERROR"
+    | "BAD_REQUEST"
+    /** The city never resolved to a TBO CityCode — we will not guess one. */
+    | "CITY_UNRESOLVED"
+    | null;
   hotels: HotelListing[];
   cityName: string;
   searchId: string;
@@ -78,6 +85,101 @@ export function nightsBetween(checkIn?: string, checkOut?: string): number {
   const b = Date.parse(checkOut);
   if (isNaN(a) || isNaN(b) || b <= a) return 0;
   return Math.round((b - a) / 86400000);
+}
+
+/**
+ * How many priced properties reach the chat reply — and therefore the tiers,
+ * "See all N results" and the reply payload.
+ *
+ * 12 is the shipped default, kept deliberately: the change here is WHICH twelve
+ * (the top of a real ranking, not TBO's first twelve). Raising it widens choice
+ * at the cost of reply size; buildHotelTiers surfaces Best + up to 3
+ * Alternatives + Not-ideal from whatever it is handed, and the remainder stays
+ * reachable behind "See all", so the reconciliation invariant holds at any cap.
+ */
+export const CHAT_HOTEL_RESULT_CAP = 12;
+
+const POLICY_RANK: Record<string, number> = {
+  IN_POLICY: 0,
+  NEEDS_APPROVAL: 1,
+  OUT_OF_POLICY: 2,
+};
+
+/** Cheapest per-night from an ANNOTATED raw TBO row; null when it has no fare. */
+function perNightOfRaw(h: any, nights: number): number | null {
+  const rooms: any[] = Array.isArray(h?.Rooms) ? h.Rooms : [];
+  const fares = rooms
+    .map((r) => (typeof r?._displayTotalFare === "number" ? r._displayTotalFare : r?.TotalFare))
+    .filter((n) => typeof n === "number" && n > 0) as number[];
+  if (fares.length === 0 || nights <= 0) return null;
+  return Math.round(Math.min(...fares) / nights);
+}
+
+/** Star rating from either the numeric or the string TBO field; null when absent. */
+function starOfRaw(h: any): number | null {
+  const n = typeof h?.StarRating === "number" ? h.StarRating : Number.parseFloat(String(h?.HotelRating ?? ""));
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * Pre-rank the priced pool before it is capped.
+ *
+ * Order: policy fit first (in-policy → needs-approval → out-of-policy), then
+ * cheapest per night, then higher star, then name for a stable sort. Rows with
+ * no fare sort last rather than being dropped — the honesty rule is unchanged,
+ * a property with no price still reaches the cards and simply renders no price.
+ *
+ * PURE: no filtering, no mutation, no invented fields.
+ */
+export function rankHotelsForChat<T extends Record<string, any>>(rows: T[], nights: number): T[] {
+  return (Array.isArray(rows) ? rows.slice() : []).sort((a, b) => {
+    const pa = POLICY_RANK[String(a?.policy?.status ?? "IN_POLICY")] ?? 1;
+    const pb = POLICY_RANK[String(b?.policy?.status ?? "IN_POLICY")] ?? 1;
+    if (pa !== pb) return pa - pb;
+
+    const na = perNightOfRaw(a, nights);
+    const nb = perNightOfRaw(b, nights);
+    if (na !== nb) {
+      if (na == null) return 1; // no fare → last
+      if (nb == null) return -1;
+      return na - nb;
+    }
+
+    const sa = starOfRaw(a);
+    const sb = starOfRaw(b);
+    if ((sa ?? 0) !== (sb ?? 0)) return (sb ?? 0) - (sa ?? 0);
+
+    return String(a?.HotelName ?? "").localeCompare(String(b?.HotelName ?? ""));
+  });
+}
+
+/**
+ * The check-in/check-out pair the hotel ownership gate must decide on.
+ *
+ * A locked pair wins (set-if-absent semantics: a genuine re-statement does not
+ * clobber what the conversation already committed to). Otherwise the dates the
+ * user typed THIS turn count — which is the whole first-turn fix: the gate used
+ * to read only the locked bag, and the locker runs ~240 lines later, so a
+ * first-turn "hotels in Dubai, 25th Sept … 26th Sept 2026" fell through to the
+ * AI path and the user had to repeat themselves before the live lane could fire.
+ *
+ * A single date is NOT enough — a stay needs both ends, and guessing the second
+ * would be inventing a fact.
+ */
+export function resolveHotelSearchWindow(
+  prompt: string,
+  locked: any,
+  now: Date = new Date(),
+): { start: string; end: string; source: "locked" | "prompt" } | null {
+  const ls = locked?.dates?.start;
+  const le = locked?.dates?.end;
+  if (ls && le) return { start: String(ls), end: String(le), source: "locked" };
+
+  const fromPrompt = extractPromptDateRange(prompt, now);
+  if (fromPrompt?.start && fromPrompt?.end) {
+    return { start: fromPrompt.start, end: fromPrompt.end, source: "prompt" };
+  }
+  return null;
 }
 
 /** Does this turn ask about somewhere to stay? */
@@ -173,6 +275,14 @@ export function mapHotelForChat(h: any, nights: number): HotelListing {
 
 export interface ChatHotelSearchArgs {
   cityName: string;
+  /**
+   * TBO CityCode. REQUIRED — searchHotels rejects with HTTP 400 ("CityCode or
+   * HotelCodes required") before any network call when it is absent, which is
+   * precisely how this lane silently never reached TBO. Resolve it with
+   * resolveCityCodeForCountry() and hand off honestly when that returns null,
+   * rather than searching with a guessed code.
+   */
+  cityCode: string;
   countryCode: string;
   checkIn: string;
   checkOut: string;
@@ -201,9 +311,14 @@ export async function searchHotelsForChat(
     searchId: "",
   });
 
+  // No CityCode → searchHotels would return its 400 guard anyway. Fail here so
+  // the caller renders the honest handoff instead of burning a TBO round-trip.
+  if (!String(args.cityCode || "").trim()) return empty("BAD_REQUEST");
+
   let result: any;
   try {
     result = await searchHotels({
+      CityCode: args.cityCode,
       CityName: args.cityName,
       CountryCode: args.countryCode,
       CheckIn: args.checkIn,
@@ -241,10 +356,19 @@ export async function searchHotelsForChat(
     policy: evaluateHotelPolicy(hotelForPolicyFromResult(h, nights), args.policyRules ?? null),
   }));
 
+  // RANK, then cap. searchHotels prices up to SEARCH_TOP_N (400) codes per city,
+  // so the previous unranked `.slice(0, 12)` shipped an ARBITRARY twelve — TBO's
+  // batch order — and the tiers below could only re-present that accident.
+  // Ranking is OURS to do (TBO returns inventory; deciding what is "best" is the
+  // concierge's job, exactly as the flight lane tiers fares TBO merely returned).
+  const ranked = rankHotelsForChat(annotated, nights);
+
   return {
     ok: true,
     reason: null,
-    hotels: annotated.slice(0, args.limit ?? 12).map((h) => mapHotelForChat(h, nights)),
+    hotels: ranked
+      .slice(0, args.limit ?? CHAT_HOTEL_RESULT_CAP)
+      .map((h) => mapHotelForChat(h, nights)),
     cityName: result.cityName || args.cityName,
     searchId: result.searchId || "",
   };
