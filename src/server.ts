@@ -98,6 +98,7 @@ import workspaceRouter from "./routes/workspace.js";
 
 // ✅ Google Places (Hotels)
 import placesRouter from "./routes/places.js";
+import placesPhotoPublicRouter from "./routes/places.photo.public.js";
 
 // ✅ NEW WORKFLOW: proposals
 import proposalsRouter from "./routes/proposals.js";
@@ -381,6 +382,12 @@ async function safeMount(prefix: string, modulePath: string) {
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // SHARED_API — Google Places (Hotels) (will be exposed via tenant API in Phase 4)
+  //
+  // ORDER MATTERS. The public hotel-photo route is mounted FIRST so it answers
+  // before placesRouter's blanket requireAuth can reject it. It exposes exactly
+  // one GET (an image, by HotelCode, from our own cache — see the file header);
+  // everything else under /api/places falls through to the authed router below.
+  app.use("/api/places", placesPhotoPublicRouter);
   app.use("/api/places", placesRouter);
 
   // KEEP_IN_PLUMBOX — Proposals (Plumtrips Travel workflow)
