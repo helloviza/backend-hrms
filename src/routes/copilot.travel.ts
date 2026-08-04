@@ -61,7 +61,10 @@ import {
   nightsBetween,
   resolveHotelSearchWindow,
 } from "../utils/plutoHotelSearch.js";
-import { resolveCityCodeForCountry } from "../services/tbo.hotel.shared.js";
+import {
+  resolveHotelDestination,
+  type HotelDestination,
+} from "../utils/plutoHotelDestination.js";
 import { countryFor } from "../data/destinationLookup.js";
 import {
   extractFlightDesignator,
@@ -1217,10 +1220,20 @@ async function runConciergeTurn(
      */
     const hotelCtx = context && typeof context === "object" ? context : {};
     const hotelLocked = (hotelCtx as any).locked || {};
-    const hotelCity = isHotelRequest(prompt)
-      ? extractHotelCity(prompt) || hotelLocked?.destination?.name || null
-      : null;
-    const hotelCountry = hotelCity ? countryFor(hotelCity) : null;
+
+    // Hotel-led is now decided WITHOUT a resolved city, because "the user named
+    // somewhere we can't serve" has to reach this branch to be answered
+    // honestly. It used to require a city, so an unresolvable one fell to the AI
+    // path and got answered with a question about dates that were already
+    // locked — a dead end no answer could clear.
+    const hotelIntent =
+      isHotelRequest(prompt) && !/\b(fly|flying|flight|flights)\b/i.test(prompt);
+
+    const hotelDest: HotelDestination = hotelIntent
+      ? await resolveHotelDestination(prompt, hotelLocked)
+      : { status: "NO_CITY" };
+    const hotelCity = hotelDest.status === "RESOLVED" ? hotelDest.cityName : null;
+    const hotelCountry = hotelDest.status === "RESOLVED" ? hotelDest.countryCode : null;
 
     // The stay window. A locked pair wins; otherwise the dates typed THIS turn
     // count. Reading only the locked bag is what made a first-turn dated hotel
@@ -1243,9 +1256,37 @@ async function runConciergeTurn(
     // hijacking a compound planning turn: "Flying to Singapore from Delhi 12-15
     // Sep, hotel near Marina Bay" mentions a hotel but is a planning turn, and
     // must reach the extractor that locks all four facts in one go.
-    const hotelLed =
-      Boolean(hotelCity) &&
-      !/\b(fly|flying|flight|flights)\b/i.test(prompt);
+    const hotelLed = Boolean(hotelCity) && hotelIntent;
+
+    /* ── UNSUPPORTED CITY — answered here, and deliberately BEFORE the dates
+     * check. The user named a destination that resolves in neither the curated
+     * table nor the 54k-row TBO catalog, so no date, occupancy or budget they
+     * could supply would make the search runnable. Asking for one more detail
+     * would be a question we already know the answer to: it still fails.
+     *
+     * Say it plainly, echo the name THEY used, and offer the desk. No
+     * "Suggested Stays", no model fallback — an invented list of hotels for a
+     * city we cannot book is the exact failure this lane exists to prevent. */
+    if (hotelIntent && hotelDest.status === "UNSUPPORTED") {
+      await emitMetric(
+        searchError({ workspaceId, requestId, reason: "hotel_city_unsupported" }),
+      );
+      return res.json({
+        ok: true,
+        reply: {
+          title: `Hotels in ${hotelDest.cityName}`,
+          context:
+            `I can't pull live hotel availability for ${hotelDest.cityName} yet — it isn't in the inventory I can search directly. ` +
+            `Rather than show you options I can't actually book, I'd rather hand this to our travel desk: they can source and hold rooms there.`,
+          nextSteps: [
+            "Raise a request and our team will source options",
+            "Search hotels in a different city",
+          ],
+          handoff: false,
+        },
+        context: { ...hotelCtx, id: conversationId },
+      });
+    }
 
     if (hotelLed && hotelCountry && checkIn && checkOut) {
       // When the gate fired on dates/city read from THIS prompt, they must be
@@ -1276,31 +1317,22 @@ async function runConciergeTurn(
 
       // TBO prices by CityCode, never by city NAME: searchHotels rejects with a
       // 400 before any network call when it is missing, which is how this lane
-      // silently never reached TBO at all. Resolve against the same catalog SBT
-      // uses; a city we cannot resolve hands off honestly rather than guessing.
+      // silently never reached TBO at all. The code is already resolved — a
+      // RESOLVED destination carries it, so there is no second lookup here and
+      // no way for the gate and the search to disagree about which city ran.
       onStage?.("searching_hotels", { city: hotelCity });
-      const hotelCityCode = await resolveCityCodeForCountry(hotelCity, hotelCountry);
-
-      const hotelResult = hotelCityCode
-        ? await searchHotelsForChat({
-            cityName: hotelCity,
-            cityCode: hotelCityCode,
-            countryCode: hotelCountry,
-            checkIn,
-            checkOut,
-            adults: hotelAdults,
-            rooms: hotelRooms,
-            starRating: extractStarFilter(prompt),
-            guestNationality: (req as any).user?.nationality || "IN",
-            policyRules: hotelPolicyRules,
-          })
-        : {
-            ok: false as const,
-            reason: "CITY_UNRESOLVED" as const,
-            hotels: [],
-            cityName: hotelCity,
-            searchId: "",
-          };
+      const hotelResult = await searchHotelsForChat({
+        cityName: hotelCity,
+        cityCode: (hotelDest as Extract<HotelDestination, { status: "RESOLVED" }>).cityCode,
+        countryCode: hotelCountry,
+        checkIn,
+        checkOut,
+        adults: hotelAdults,
+        rooms: hotelRooms,
+        starRating: extractStarFilter(prompt),
+        guestNationality: (req as any).user?.nationality || "IN",
+        policyRules: hotelPolicyRules,
+      });
 
       const nights = nightsBetween(checkIn, checkOut);
 
