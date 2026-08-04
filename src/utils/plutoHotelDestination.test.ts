@@ -123,8 +123,13 @@ describe("classifyHotelDestination", () => {
     ).toEqual({ status: "NO_CITY" });
   });
 
-  it("(c) an unknown LOWER-CASE word is not called a city", () => {
-    // Too weak a signal to name back at the user as an unsupported destination.
+  it("an unknown LOWER-CASE place is UNSUPPORTED, not NO_CITY", () => {
+    // CHANGED DELIBERATELY. This used to return NO_CITY on the grounds that a
+    // lower-case word is a weak signal — but NO_CITY hands the turn to the
+    // model, which reads locked.destination and answers about THAT city. With a
+    // locked Dubai, "hotels in qatar" came back as Dubai hotels plus an
+    // itinerary. Naming an unknown place back at the user is mildly awkward;
+    // confidently answering about the wrong city is a defect.
     expect(
       classifyHotelDestination({
         tableCity: null,
@@ -132,7 +137,62 @@ describe("classifyHotelDestination", () => {
         catalog: null,
         tableCountry: null, tableCityCode: null, lockedName: null,
       }),
-    ).toEqual({ status: "NO_CITY" });
+    ).toEqual({ status: "UNSUPPORTED", cityName: "somewhere warm" });
+  });
+
+  it("REGRESSION: a named place never resolves to the LOCKED city", () => {
+    // The Qatar failure, at the unit level: something was named, so the locked
+    // Dubai must not be the answer under any status.
+    const r = classifyHotelDestination({
+      tableCity: null,
+      named: { raw: "qatar", capitalised: false },
+      catalog: null,
+      tableCountry: null, tableCityCode: null,
+      lockedName: "Dubai",
+    });
+    expect(JSON.stringify(r)).not.toContain("Dubai");
+  });
+
+  it("a COUNTRY resolves to its main city and FLAGS the substitution", () => {
+    expect(
+      classifyHotelDestination({
+        tableCity: null,
+        named: { raw: "qatar", capitalised: false },
+        catalog: null,
+        tableCountry: null, tableCityCode: null, lockedName: "Dubai",
+        country: { code: "QA", name: "Qatar" },
+        countryPrimaryCity: { code: "115682", name: "Doha", countryCode: "QA" },
+      }),
+    ).toEqual({
+      status: "RESOLVED", cityName: "Doha", countryCode: "QA",
+      cityCode: "115682", viaCountry: "Qatar",
+    });
+  });
+
+  it("a country we carry NO hotels for is UNSUPPORTED, named honestly", () => {
+    expect(
+      classifyHotelDestination({
+        tableCity: null,
+        named: { raw: "Nauru", capitalised: true },
+        catalog: null,
+        tableCountry: null, tableCityCode: null, lockedName: "Dubai",
+        country: { code: "NR", name: "Nauru" },
+        countryPrimaryCity: null,
+      }),
+    ).toEqual({ status: "UNSUPPORTED", cityName: "Nauru" });
+  });
+
+  it("a CITY match still beats the country branch", () => {
+    // "hotels in Dubai" must never be re-read as "the UAE, so search Dubai".
+    const r = classifyHotelDestination({
+      ...DUBAI,
+      country: { code: "AE", name: "United Arab Emirates" },
+      countryPrimaryCity: { code: "115936", name: "Dubai", countryCode: "AE" },
+    });
+    expect(r).toEqual({
+      status: "RESOLVED", cityName: "Dubai", countryCode: "AE", cityCode: "115936",
+    });
+    expect((r as any).viaCountry).toBeUndefined();
   });
 
   it("a curated city whose CODE will not resolve is UNSUPPORTED, not a search", () => {
@@ -196,5 +256,35 @@ describe("the reported turns, end to end through the pure layer", () => {
 
   it("'hotels' with no city → NO_CITY (unchanged ask)", () => {
     expect(run("show me hotels", null)).toEqual({ status: "NO_CITY" });
+  });
+
+  it("THE REPORTED TURN: 'hotels in qatar' with Dubai locked → Doha, never Dubai", () => {
+    const prompt = "for the same duration, can you confirm the hotels in qatar";
+    expect(extractHotelCity(prompt)).toBeNull();            // Qatar is not a city
+    expect(extractNamedPlaceCandidate(prompt)?.raw).toBe("qatar");
+
+    const r = classifyHotelDestination({
+      tableCity: null,
+      named: extractNamedPlaceCandidate(prompt),
+      catalog: null,
+      tableCountry: null, tableCityCode: null,
+      lockedName: "Dubai",                                   // the earlier turn
+      country: { code: "QA", name: "Qatar" },
+      countryPrimaryCity: { code: "115682", name: "Doha", countryCode: "QA" },
+    });
+    expect(r).toMatchObject({ status: "RESOLVED", cityName: "Doha", viaCountry: "Qatar" });
+    expect(JSON.stringify(r)).not.toContain("Dubai");
+  });
+
+  it("a country with an obvious main city resolves there, not to the locked city", () => {
+    const r = classifyHotelDestination({
+      tableCity: null,
+      named: { raw: "Thailand", capitalised: true },
+      catalog: null,
+      tableCountry: null, tableCityCode: null, lockedName: "Dubai",
+      country: { code: "TH", name: "Thailand" },
+      countryPrimaryCity: { code: "144092", name: "Bangkok", countryCode: "TH" },
+    });
+    expect(r).toMatchObject({ status: "RESOLVED", cityName: "Bangkok", viaCountry: "Thailand" });
   });
 });
