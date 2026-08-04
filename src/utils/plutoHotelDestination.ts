@@ -31,12 +31,29 @@
 // in EITHER source, which is where it is a true statement.
 
 import mongoose from "mongoose";
-import { TBOCity, normalizeSearch } from "../jobs/static-data-refresh.js";
+import {
+  TBOCity,
+  TBOCountry,
+  TBOHotelMaster,
+  normalizeSearch,
+} from "../jobs/static-data-refresh.js";
 import { countryFor } from "../data/destinationLookup.js";
 import { extractHotelCity, extractNamedPlaceCandidate } from "./plutoHotelSearch.js";
 
 export type HotelDestination =
-  | { status: "RESOLVED"; cityName: string; countryCode: string; cityCode: string }
+  | {
+      status: "RESOLVED";
+      cityName: string;
+      countryCode: string;
+      cityCode: string;
+      /**
+       * Set when the user named a COUNTRY and we picked its main city for them.
+       * The reply MUST disclose it — silently turning "hotels in Qatar" into a
+       * Doha result is the same class of answer-for-the-wrong-place this module
+       * exists to stop, just a smaller version of it.
+       */
+      viaCountry?: string;
+    }
   | { status: "UNSUPPORTED"; cityName: string }
   | { status: "NO_CITY" };
 
@@ -110,8 +127,77 @@ export async function findCatalogCity(name: string): Promise<CatalogCity | null>
   return null;
 }
 
+/* Country lookups are static reference data refreshed by a daily job, so both
+ * are memoised for the process. A country-only turn is rare; the aggregate
+ * behind findPrimaryCityForCountry should not run twice for it. */
+const countryCache = new Map<string, { code: string; name: string } | null>();
+const primaryCityCache = new Map<string, CatalogCity | null>();
+
+/** "Qatar" → { code: "QA" }. Name only — no ISO guessing, no abbreviations. */
+export async function findCountryByName(
+  name: string,
+): Promise<{ code: string; name: string } | null> {
+  const key = normalizeSearch(name);
+  if (!key) return null;
+  if (countryCache.has(key)) return countryCache.get(key) ?? null;
+  if (mongoose.connection?.readyState !== 1) return null;
+  try {
+    const row = await (TBOCountry as any)
+      .findOne({ searchName: key })
+      .select("code name")
+      .lean();
+    const hit = row?.code ? { code: String(row.code), name: String(row.name) } : null;
+    countryCache.set(key, hit);
+    return hit;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * The decision, with every lookup already done. PURE, so the three-way split is
+ * A country's main city, ranked by HOW MANY BOOKABLE HOTELS the catalog holds
+ * there.
+ *
+ * Deliberately not "the capital": capital-ness is not in this data and would
+ * have to come from a new dependency, and it is the wrong question anyway — we
+ * are choosing where a hotel search will actually find inventory. The signal is
+ * emphatic where it matters (QA: Doha 296 and nothing else; TH: Bangkok 5,232
+ * vs 2; AE: Dubai 4,905 vs Abu Dhabi 341), so this is a ranking, not a guess.
+ * Null when the country has no cities carrying hotels, and then the caller
+ * hands off honestly rather than inventing a destination.
+ */
+export async function findPrimaryCityForCountry(
+  countryCode: string,
+): Promise<CatalogCity | null> {
+  const cc = String(countryCode || "").trim().toUpperCase();
+  if (!cc) return null;
+  if (primaryCityCache.has(cc)) return primaryCityCache.get(cc) ?? null;
+  if (mongoose.connection?.readyState !== 1) return null;
+  try {
+    const top = await (TBOHotelMaster as any).aggregate([
+      { $match: { countryCode: cc } },
+      { $group: { _id: "$cityCode", n: { $sum: 1 } } },
+      { $sort: { n: -1 } },
+      { $limit: 1 },
+    ]);
+    const cityCode = top?.[0]?._id ? String(top[0]._id) : null;
+    if (!cityCode) {
+      primaryCityCache.set(cc, null);
+      return null;
+    }
+    const city = await (TBOCity as any).findOne({ code: cityCode }).select("code name").lean();
+    const hit = city?.code
+      ? { code: String(city.code), name: tidyCatalogCityName(String(city.name)), countryCode: cc }
+      : null;
+    primaryCityCache.set(cc, hit);
+    return hit;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The decision, with every lookup already done. PURE, so the split is
  * testable without a database.
  *
  * `named` is what the user actually typed (null when they named nothing), and
@@ -133,6 +219,10 @@ export function classifyHotelDestination(input: {
   tableCityCode: string | null;
   /** locked.destination.name carried in from earlier turns. */
   lockedName: string | null;
+  /** The country the user named, when they named one rather than a city. */
+  country?: { code: string; name: string } | null;
+  /** That country's main city by hotel inventory. */
+  countryPrimaryCity?: CatalogCity | null;
 }): HotelDestination {
   // 1. The curated table knows this city and it prices — the Dubai path.
   if (input.tableCity && input.tableCountry && input.tableCityCode) {
@@ -154,16 +244,33 @@ export function classifyHotelDestination(input: {
     };
   }
 
-  // 3. Named, but in neither source.
+  // 3. A COUNTRY was named, not a city. Resolve it to where the inventory
+  //    actually is and make the caller disclose the substitution.
+  if (input.country && input.countryPrimaryCity) {
+    return {
+      status: "RESOLVED",
+      cityName: input.countryPrimaryCity.name,
+      countryCode: input.countryPrimaryCity.countryCode || input.country.code,
+      cityCode: input.countryPrimaryCity.code,
+      viaCountry: input.country.name,
+    };
+  }
+  // A country we carry no hotels for is a dead end, named honestly.
+  if (input.country) {
+    return { status: "UNSUPPORTED", cityName: input.country.name };
+  }
+
+  // 4. Named, but in NO source — not a city, not a country.
+  //
+  // UNSUPPORTED regardless of capitalisation. This used to fall through to
+  // NO_CITY for a lower-case word, and NO_CITY sends the turn to the model,
+  // which reads locked.destination and answers about THAT city — "can you
+  // confirm the hotels in qatar" came back as a page of Dubai hotels, an
+  // itinerary included. A confidently wrong place is the worst output this lane
+  // can produce, so once a place has been named, the turn is answered here and
+  // never handed to a model holding a stale destination.
   if (input.named) {
-    // Capitalised → a proper noun we simply do not carry (Bangkok, a typo, an
-    // invented place): name it back and hand off. Lower-case and unknown is too
-    // weak to call a place ("hotels for two nights"), so it reads as NO_CITY and
-    // gets the ordinary "which city?" — never a fabricated answer either way.
-    if (input.named.capitalised) {
-      return { status: "UNSUPPORTED", cityName: input.named.raw };
-    }
-    return { status: "NO_CITY" };
+    return { status: "UNSUPPORTED", cityName: input.named.raw };
   }
 
   // 4. Nothing named this turn. A destination locked earlier still counts, but
@@ -193,8 +300,21 @@ export async function resolveHotelDestination(
   // that go on to fall through to the AI anyway. `tbocities` already holds
   // 53,943 rows; when a name is not in there, a live call would almost never
   // rescue it, and the honest handoff is the right answer regardless.
+  // A place named THIS turn is looked up on its own. lockedName is consulted
+  // ONLY when nothing was named — otherwise a request for somewhere new would
+  // be answered with the city the conversation happens to be holding.
   const lookupName = tableCity || named?.raw || lockedName;
   const catalog = lookupName ? await findCatalogCity(lookupName) : null;
+
+  // Nothing matched as a city — is the named place a COUNTRY? ("hotels in
+  // qatar": Qatar is not a city anywhere in the catalog, so every city lookup
+  // above misses and the turn used to end up at the model.)
+  let country: { code: string; name: string } | null = null;
+  let countryPrimaryCity: CatalogCity | null = null;
+  if (!catalog && named?.raw) {
+    country = await findCountryByName(named.raw);
+    if (country) countryPrimaryCity = await findPrimaryCityForCountry(country.code);
+  }
 
   // The curated table stays authoritative for spelling and country when it
   // knows the city; the catalog supplies the code that makes it searchable.
@@ -210,5 +330,7 @@ export async function resolveHotelDestination(
     tableCountry,
     tableCityCode,
     lockedName,
+    country,
+    countryPrimaryCity,
   });
 }

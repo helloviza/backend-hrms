@@ -1288,6 +1288,38 @@ async function runConciergeTurn(
       });
     }
 
+    /* ── COUNTRY NAMED, NO DATES. We know where to search (the country's main
+     * city by inventory) but not when. Answered HERE rather than falling
+     * through, because the AI path reads locked.destination — and on exactly
+     * this turn shape that produced a page of Dubai hotels, complete with an
+     * itinerary, in reply to a question about Qatar. Disclose the city we chose,
+     * ask only for what is genuinely missing, and lock the destination so the
+     * next turn does not re-ask it. */
+    if (hotelLed && hotelDest.status === "RESOLVED" && hotelDest.viaCountry && !(checkIn && checkOut)) {
+      return res.json({
+        ok: true,
+        reply: {
+          title: `Hotels in ${hotelDest.viaCountry}`,
+          context:
+            `${hotelDest.viaCountry} — I'd search ${hotelCity}, where we have the most properties. ` +
+            `Tell me another city if you meant somewhere else. Which dates are you travelling?`,
+          nextSteps: [
+            `Give me your check-in and check-out dates for ${hotelCity}`,
+            `Name a different city in ${hotelDest.viaCountry}`,
+          ],
+          handoff: false,
+        },
+        context: {
+          ...hotelCtx,
+          id: conversationId,
+          locked: {
+            ...(hotelLocked || {}),
+            destination: { name: hotelCity, source: "user" },
+          },
+        },
+      });
+    }
+
     if (hotelLed && hotelCountry && checkIn && checkOut) {
       // When the gate fired on dates/city read from THIS prompt, they must be
       // locked here too. The branch returns before the locked-facts block below
@@ -1380,6 +1412,11 @@ async function runConciergeTurn(
         reply: {
           title: `Hotels in ${hotelResult.cityName || hotelCity}`,
           context:
+            // Disclose a country→city substitution BEFORE the results, so the
+            // user is never left to infer that "Qatar" silently became "Doha".
+            (hotelDest.status === "RESOLVED" && hotelDest.viaCountry
+              ? `You asked about ${hotelDest.viaCountry}, so I searched ${hotelResult.cityName || hotelCity} — the city we have the most properties in. Tell me another city if you meant somewhere else. `
+              : "") +
             `Found ${hotelResult.hotels.length} available ${hotelResult.hotels.length === 1 ? "property" : "properties"} in ${hotelResult.cityName || hotelCity} for ${checkIn} → ${checkOut} (${nights} ${nights === 1 ? "night" : "nights"}). ` +
             `Prices are live, in INR, for ${hotelAdults} guests in ${hotelRooms} room — tell me if that's not right and I'll re-search.`,
           hotelSearch: {
