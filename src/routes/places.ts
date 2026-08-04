@@ -1,7 +1,16 @@
 // apps/backend/src/routes/places.ts
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
+import {
+  getHotelPhotoName,
+  isValidPlacesPhotoName,
+  clampPhotoWidth,
+} from "../services/hotelPhotoService.js";
 
+// EVERY ROUTE IN THIS FILE IS AUTHENTICATED. The one public Places endpoint —
+// the hotel photo an <img> loads — lives in routes/places.photo.public.ts,
+// deliberately separated so this router can keep the billable searchText and
+// Details proxies behind requireAuth. Do not add a public route here.
 const router = Router();
 router.use(requireAuth);
 
@@ -188,6 +197,70 @@ router.get("/hotels/details", async (req, res) => {
 });
 
 /**
+ * GET /api/places/hotels/photo-for
+ *   ?hotelCode=1234567&name=Canal%20Central%20Hotel&city=Dubai&lat=25.18&lon=55.26
+ *
+ * Resolves ONE TBO hotel row to a usable photo URL, for the /concierge cards.
+ *
+ * Why a resolver instead of reusing /hotels/search: that route answers "what
+ * hotels are in this city", which is a different question and would re-rank the
+ * concierge's own TBO results against Google's. This one starts from a property
+ * we have ALREADY chosen and only asks Google for its picture — and refuses to
+ * answer unless it can verify the two are the same building (see
+ * utils/hotelPhotoMatch).
+ *
+ * Always 200 with `photoUrl: null` on a miss. A missing photo is a normal,
+ * expected outcome, not an error the card should have to handle as one.
+ */
+router.get("/hotels/photo-for", async (req, res) => {
+  try {
+    const hotelCode = strOrEmpty(req.query.hotelCode).trim();
+    const name = strOrEmpty(req.query.name).trim();
+    if (!hotelCode || !name) {
+      return res.json({ ok: true, photoUrl: null, reason: "bad_request" });
+    }
+
+    const toNum = (v: unknown): number | null => {
+      const n = Number.parseFloat(strOrEmpty(v));
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const result = await getHotelPhotoName({
+      hotelCode,
+      hotelName: name,
+      city: strOrEmpty(req.query.city).trim() || null,
+      lat: toNum(req.query.lat),
+      lon: toNum(req.query.lon),
+    });
+
+    // The URL handed back is the PUBLIC by-code image endpoint, never a photo
+    // reference. Two reasons, and the second is the security one:
+    //   · an <img> cannot authenticate cross-origin, so the image URL must be
+    //     public or every photo 401s in production
+    //   · handing the browser a photo REFERENCE would mean the public endpoint
+    //     had to accept one back, which is an open proxy. The reference stays
+    //     server-side; the browser only ever quotes a HotelCode we already
+    //     resolved and verified.
+    // This endpoint itself stays authed — it is the one that can spend a Places
+    // Text Search, so resolution remains behind login.
+    const photoUrl = result.photoName
+      ? `${String(req.baseUrl || "")}/hotels/photo-by-code?hotelCode=${safeEncode(hotelCode)}&w=640`
+      : null;
+
+    // Short on purpose. The durable cache is Mongo's (30 days) and the IMAGE
+    // itself is cached for 24h by the public endpoint — this response is just a
+    // pointer, and caching a pointer for a day means any change to the URL
+    // shape stays wrong in every browser that saw the old one for a day. Ten
+    // minutes keeps the within-session win without that.
+    res.setHeader("Cache-Control", "private, max-age=600");
+    return res.json({ ok: true, photoUrl, reason: result.reason, source: result.source });
+  } catch (e: any) {
+    // Never fail the card: a photo is an enhancement, never a gate.
+    return res.json({ ok: true, photoUrl: null, reason: e?.message || "error" });
+  }
+});
+
+/**
  * GET /api/places/hotels/photo?name=places/.../photos/...&maxWidth=800
  * Proxy for Places Photo (New)
  *
@@ -198,12 +271,20 @@ router.get("/hotels/photo", async (req, res) => {
     if (!API_KEY) return res.status(500).send("Places key not configured");
 
     const name = requireString(req.query.name, "name");
-    const maxWidth = typeof req.query.maxWidth === "string" ? req.query.maxWidth : "800";
+
+    // The caller-supplied `name` is interpolated into a googleapis URL below,
+    // so it MUST be shape-checked: without this, `../../` walks the path and
+    // reaches other Google endpoints with our API key attached. Authenticated
+    // is not the same as trusted.
+    if (!isValidPlacesPhotoName(name)) {
+      return res.status(400).send("Invalid photo name");
+    }
+    const maxWidth = clampPhotoWidth(req.query.maxWidth ?? 800);
 
     // New photo media endpoint:
     // GET https://places.googleapis.com/v1/{name=places/*/photos/*/media}?maxWidthPx=...
     const url = new URL(`https://places.googleapis.com/v1/${name}/media`);
-    url.searchParams.set("maxWidthPx", String(Number(maxWidth) || 800));
+    url.searchParams.set("maxWidthPx", String(maxWidth));
 
     const r = await fetch(url.toString(), {
       method: "GET",

@@ -54,6 +54,28 @@ export const copilotLimiter = rateLimit({
   message: { success: false, message: 'Too many AI requests, please slow down.' },
 });
 
+// Public hotel-photo image endpoint — UNAUTHENTICATED and billable.
+//
+// This is the real guard now that the endpoint is public: auth used to be what
+// stood between the internet and a Google Places Photo call, and auth was the
+// wrong tool (it also broke every <img> in production, which cannot send a
+// cookie cross-origin). A per-IP limit is the right tool.
+//
+// Sized against genuine use, not worst case: a hotel answer shows at most 12
+// photos, the response is browser-cached for 24h, and a resolved photo is
+// served from our own cache — so a real user costs ~12 requests once a day.
+// 120/min leaves an office behind one NAT plenty of room while capping a
+// scripted hammer at two orders of magnitude below anything that would matter
+// on the bill.
+export const hotelPhotoLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.HOTEL_PHOTO_RATE_LIMIT) || 120,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many photo requests, please slow down.' },
+});
+
 // Public travel-request form — unauthenticated write endpoint; a real
 // applicant submits once per visit, so this stays tight (bot/spam surface).
 export const travelRequestLimiter = rateLimit({
