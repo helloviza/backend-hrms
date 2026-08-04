@@ -261,6 +261,68 @@ export function extractHotelCity(prompt: string): string | null {
   return lookupDestinationFuzzy(prompt)?.city ?? null;
 }
 
+/* Words that follow a connector but are never a place. Trailing ones are
+ * trimmed ("london for" → "london"); a candidate STARTING with one is not a
+ * place at all ("hotels for same duration" → no place was named). */
+const NOT_A_PLACE = new Set([
+  "for", "on", "from", "to", "with", "and", "the", "a", "an", "in", "at",
+  "near", "around", "between", "under", "over", "about", "same", "next",
+  "this", "that", "these", "those", "my", "our", "us", "me", "you", "your",
+  "please", "some", "any", "all", "more", "less", "cheap", "cheaper",
+  "budget", "luxury", "nice", "good", "best", "night", "nights", "day",
+  "days", "week", "weekend", "month", "people", "guests", "adults",
+  "children", "rooms", "room", "star", "stars", "duration", "dates", "date",
+  "there", "here", "somewhere", "anywhere", "options", "option",
+  // Counts — "hotels for two nights" trims to "two", which is not a place.
+  "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+  "ten", "couple", "few", "several", "both",
+]);
+
+/**
+ * The place the user NAMED, whether or not we can serve it — raw text, not a
+ * resolved city.
+ *
+ * extractHotelCity above answers "which city do we search?" and returns null
+ * both when the user named nothing AND when they named somewhere we don't
+ * know. Those two need different answers: one asks which city, the other says
+ * we can't serve that city. This separates them by reporting what was said.
+ *
+ * Case-INSENSITIVE on purpose. extractHotelCity requires a capital because it
+ * uses capitalisation as a proper-noun heuristic, which means a perfectly clear
+ * "show me some hotels in london" produced no candidate at all — the exact
+ * phrasing that fell through to the model and got answered with a question
+ * about dates. `capitalised` is reported separately so the caller can still use
+ * that signal where it helps, rather than losing the match outright.
+ */
+export function extractNamedPlaceCandidate(
+  prompt: string,
+): { raw: string; capitalised: boolean } | null {
+  if (!prompt) return null;
+
+  const patterns = [
+    /\b(?:hotels?|stay|stays|accommodations?|accomodations?|resort|lodging)\s+(?:in|at|near|around|for|to)\s+([A-Za-z][A-Za-z]*(?:\s+[A-Za-z][A-Za-z]*)?)/i,
+    /\bin\s+([A-Za-z][A-Za-z]*(?:\s+[A-Za-z][A-Za-z]*)?)/i,
+  ];
+
+  for (const re of patterns) {
+    const m = prompt.match(re);
+    const captured = m?.[1]?.trim();
+    if (!captured) continue;
+
+    // "london for" → "london";  "same duration" → nothing was named.
+    const words = captured.split(/\s+/);
+    while (words.length > 0 && NOT_A_PLACE.has(words[words.length - 1].toLowerCase())) {
+      words.pop();
+    }
+    if (words.length === 0) continue;
+    if (NOT_A_PLACE.has(words[0].toLowerCase())) continue;
+
+    const raw = words.join(" ");
+    return { raw, capitalised: /^[A-Z]/.test(raw) };
+  }
+  return null;
+}
+
 /**
  * Trim a raw TBO HotelResult to the compact bookable row above. Keeps the TBO
  * field NAMES (HotelCode/HotelName/HotelRating/Address/Rooms[]) so the existing
