@@ -2069,6 +2069,111 @@ ${prompt}
       fullReply.itinerary = lastReply.itinerary;
     }
 
+    /* ───────── Itinerary hotel section — live lane supersedes fabrication ─────────
+     * PLAN_READINESS above tells the model to draft a day-by-day itinerary
+     * and, per plutoSystemPrompt.ts's schema, an optional "hotels" array —
+     * which the model fills with INVENTED names/prices ("3-day business
+     * trip to Tokyo" rendered a fabricated Peninsula/Park Hyatt/Mandarin
+     * list even though Tokyo resolves live, 6fedd53). Same precedent
+     * plutoSystemPrompt.ts already documents for flightStatus: once a
+     * dedicated live path can answer a domain, the model's own answer for
+     * it must never reach the user — it can only ever compete with real
+     * data, never usefully supplement it.
+     *
+     * Hotels don't have a separate early-return branch to lean on here the
+     * way flightStatus does: the deterministic hotelLed branch far above
+     * only fires for a hotel-WORDED prompt ("hotels in Tokyo"), and "3-day
+     * business trip to Tokyo" is a planning prompt — hotelIntent is false,
+     * so hotelLed never runs and this turn falls all the way through to
+     * the model. destination/dates are still available independently of
+     * that, though: the PRE-AI "LOCK USER-STATED FACTS" block (~line 1594)
+     * extracts them from prose generally, not just hotel-worded prompts —
+     * conversationContext.locked.destination/.dates already reflect
+     * whatever this conversation knows by this point, itinerary or not.
+     *
+     * Three outcomes, in order of preference — never fabrication:
+     *   1. City resolves live AND we have real dates (this turn's or an
+     *      earlier turn's, from ANY prompt shape) → run the exact same
+     *      live search the hotel-led branch runs, and set hotelSearch so
+     *      the SAME LiveHotelTiers renderer used everywhere else in this
+     *      UI takes over — ConciergePage.tsx already prefers hotelSearch
+     *      over hotels whenever both are present.
+     *   2. City resolves live but no dates yet → suppress the fabricated
+     *      list entirely (no partial trust) and ask for dates via
+     *      nextSteps — the SAME "ask, don't guess" posture the "COUNTRY
+     *      NAMED, NO DATES" branch above already uses for a different
+     *      shape of this exact problem. A guessed date window would show
+     *      real prices/availability for a stay nobody confirmed, which is
+     *      its own kind of misleading — worse than asking. Once the user
+     *      replies with dates (any wording — the LOCK block above reads
+     *      prose generally), this same block reruns as outcome 1 on the
+     *      very next turn.
+     *   3. City doesn't resolve at all (UNSUPPORTED) → honest handoff,
+     *      still no fabrication — mirrors the standalone hotel lane's own
+     *      UNSUPPORTED branch above.
+     * NO_CITY is not handled separately: canPlan (which gates the model
+     * ever drafting an itinerary at all) already requires a locked or
+     * assumed destination, so resolveHotelDestination always has at least
+     * a name to classify as RESOLVED or UNSUPPORTED by the time this runs.
+     *
+     * Scope: hotels only. The itinerary skeleton (fullReply.itinerary) and
+     * flight section are untouched by this block.
+     * ───────────────────────────────────────────────────────────────────── */
+    if (Array.isArray(fullReply.hotels) && fullReply.hotels.length > 0) {
+      const itineraryDest = await resolveHotelDestination(prompt, conversationContext.locked);
+      const itineraryDates = conversationContext.locked?.dates;
+      const itineraryCheckIn: string | null = itineraryDates?.start || null;
+      const itineraryCheckOut: string | null = itineraryDates?.end || null;
+
+      if (itineraryDest.status === "RESOLVED" && itineraryCheckIn && itineraryCheckOut) {
+        const itineraryPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
+        const itineraryHotelResult = await searchHotelsForChat({
+          cityName: itineraryDest.cityName,
+          cityCode: itineraryDest.cityCode,
+          countryCode: itineraryDest.countryCode,
+          checkIn: itineraryCheckIn,
+          checkOut: itineraryCheckOut,
+          adults: 2,
+          rooms: 1,
+          starRating: extractStarFilter(prompt),
+          guestNationality: (req as any).user?.nationality || "IN",
+          policyRules: itineraryPolicyRules,
+        });
+
+        // Cleared unconditionally the moment a live search actually ran —
+        // never rendered alongside, or as a fallback under, a real result
+        // (including a real "found nothing").
+        fullReply.hotels = undefined;
+
+        if (itineraryHotelResult.ok && itineraryHotelResult.hotels.length > 0) {
+          fullReply.hotelSearch = {
+            city: itineraryHotelResult.cityName || itineraryDest.cityName,
+            countryCode: itineraryDest.countryCode,
+            checkIn: itineraryCheckIn,
+            checkOut: itineraryCheckOut,
+            nights: nightsBetween(itineraryCheckIn, itineraryCheckOut),
+            adults: 2,
+            rooms: 1,
+            assumedOccupancy: true,
+            hotels: itineraryHotelResult.hotels,
+            searchId: itineraryHotelResult.searchId,
+            source: "tbo",
+          };
+        }
+        // else: live search ran and found nothing / failed — honest gap.
+        // fullReply.hotels is already cleared above; nothing further to add.
+      } else if (itineraryDest.status === "RESOLVED") {
+        fullReply.hotels = undefined;
+        // Structured, not a nextSteps string: ConciergePage.tsx renders this
+        // INLINE as the "01 · Stays" section's own dates-ask (with its own
+        // chip), instead of a generic bottom-row question indistinguishable
+        // from the flight questions next to it.
+        fullReply.hotelsAwaitingDates = { city: itineraryDest.cityName };
+      } else if (itineraryDest.status === "UNSUPPORTED") {
+        fullReply.hotels = undefined;
+      }
+    }
+
     /* ───────── Context Evolution ───────── */
     if (fullReply.context) {
       conversationContext.summary = fullReply.context;
