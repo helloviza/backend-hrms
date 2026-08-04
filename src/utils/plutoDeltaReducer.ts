@@ -52,6 +52,37 @@ export function reduceToDelta(
     }
   }
 
+  // hotelSearch (deep compare) — same treatment as hotels above, added
+  // alongside routes/copilot.travel.ts's new "Itinerary hotel section"
+  // block, which sets this field on fullReply AFTER the model call (the
+  // model never produces it itself). Not currently reachable as a live bug
+  // — the frontend (ConciergePage.tsx) never sends `lastReply` in its
+  // request body, so `prev` here is always undefined in production today
+  // and every reply takes the `if (!prev) return next` branch above,
+  // unfiltered. But this function's whole design is an explicit field
+  // list — anything not named here would silently vanish the moment any
+  // caller (a future frontend change, a different client) DOES start
+  // passing `lastReply`, the same latent gap `handoffError` already has a
+  // few lines up. Named explicitly so hotelSearch doesn't join it.
+  if (
+    JSON.stringify(next.hotelSearch) !==
+    JSON.stringify(prev.hotelSearch)
+  ) {
+    if (next.hotelSearch) {
+      delta.hotelSearch = next.hotelSearch;
+    }
+  }
+
+  // hotelsAwaitingDates — same additive-field treatment as hotelSearch above.
+  if (
+    JSON.stringify(next.hotelsAwaitingDates) !==
+    JSON.stringify(prev.hotelsAwaitingDates)
+  ) {
+    if (next.hotelsAwaitingDates) {
+      delta.hotelsAwaitingDates = next.hotelsAwaitingDates;
+    }
+  }
+
   // nextSteps (usually evolve)
   if (
     JSON.stringify(next.nextSteps) !==
