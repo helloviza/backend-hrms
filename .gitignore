@@ -34,6 +34,9 @@ Thumbs.db
 # uploads & runtime files
 uploads/
 
+# provisioned binaries (downloaded at build time — see ytDlpProvision.ts)
+bin/
+
 # puppeteer / playwright cache
 .cache/
 
