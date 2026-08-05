@@ -145,9 +145,16 @@ describe("getFlightOccurrences — date given", () => {
   });
 
   it("returns EMPTY rather than a different day when that date has no departure", async () => {
-    const res: any = await getFlightOccurrences("AI4305", { now: NOW, date: "2026-08-09" });
+    // 2026-08-04 is inside AeroAPI's 2-day forward horizon from NOW, so the
+    // request is genuinely made and the window simply holds no departure on
+    // that date. (This case used to ask for 08-09, six days out — a window
+    // AeroAPI answers with HTTP 400, so the assertion only ever held against
+    // the mock. A date past the horizon is now its own case, covered in
+    // flightService.aeroBounds.test.ts.)
+    H.get.mockResolvedValue({ data: { flights: [aiRow("2026-08-05"), aiRow("2026-08-03")] } });
+    const res: any = await getFlightOccurrences("AI4305", { now: NOW, date: "2026-08-04" });
     expect(res.occurrences).toEqual([]);
-    expect(res.requestedDate).toBe("2026-08-09");
+    expect(res.requestedDate).toBe("2026-08-04");
   });
 
   it("derives servedDate in the ORIGIN zone, not UTC", async () => {
