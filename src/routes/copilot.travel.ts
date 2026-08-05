@@ -1267,6 +1267,42 @@ async function runConciergeTurn(
      * Say it plainly, echo the name THEY used, and offer the desk. No
      * "Suggested Stays", no model fallback — an invented list of hotels for a
      * city we cannot book is the exact failure this lane exists to prevent. */
+    /* ── SEVERAL REAL CITIES — ask which, never pick.
+     *
+     * "hotels in Springfield" matches fifteen bookable Springfields; "Santa
+     * Maria" matches six rows that are byte-identical apart from the country.
+     * The old code took whichever had the shortest name and never admitted a
+     * choice had been made, which is a confidently wrong destination — the one
+     * output this lane exists to prevent.
+     *
+     * Answered BEFORE the dates check, like UNSUPPORTED: no date the user could
+     * supply resolves which city they meant. The destination is deliberately
+     * NOT locked here — locking a guess is the same bug wearing a hat. */
+    if (hotelIntent && hotelDest.status === "AMBIGUOUS") {
+      await emitMetric(
+        searchError({ workspaceId, requestId, reason: "hotel_city_ambiguous" }),
+      );
+      const options = hotelDest.candidates
+        .map((c) => (c.region ? `${c.cityName}, ${c.region}` : `${c.cityName} (${c.countryCode})`));
+      return res.json({
+        ok: true,
+        reply: {
+          title: `Which ${hotelDest.query || "city"}?`,
+          context:
+            `There are ${hotelDest.candidates.length} places called ${hotelDest.query} I can book — ` +
+            `${options.slice(0, 3).join(", ")}${options.length > 3 ? " and more" : ""}. ` +
+            `Tell me which one and I'll pull live availability.`,
+          hotelsAwaitingCity: {
+            query: hotelDest.query,
+            candidates: hotelDest.candidates,
+          },
+          nextSteps: [],
+          handoff: false,
+        },
+        context: { ...hotelCtx, id: conversationId },
+      });
+    }
+
     if (hotelIntent && hotelDest.status === "UNSUPPORTED") {
       await emitMetric(
         searchError({ workspaceId, requestId, reason: "hotel_city_unsupported" }),
@@ -2169,6 +2205,15 @@ ${prompt}
         // chip), instead of a generic bottom-row question indistinguishable
         // from the flight questions next to it.
         fullReply.hotelsAwaitingDates = { city: itineraryDest.cityName };
+      } else if (itineraryDest.status === "AMBIGUOUS") {
+        // Same rule as the standalone lane: several real cities, so the
+        // fabricated list goes and the itinerary asks which one rather than
+        // pricing a guess into a plan the user will act on.
+        fullReply.hotels = undefined;
+        fullReply.hotelsAwaitingCity = {
+          query: itineraryDest.query,
+          candidates: itineraryDest.candidates,
+        };
       } else if (itineraryDest.status === "UNSUPPORTED") {
         fullReply.hotels = undefined;
       }

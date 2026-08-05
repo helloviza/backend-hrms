@@ -193,6 +193,36 @@ describe("itinerary hotel section — live lane supersedes fabrication", () => {
     expect(body.reply.hotelsAwaitingDates).toBeUndefined();
   });
 
+  it("city matches SEVERAL real cities (AMBIGUOUS) → asks which, still no fabrication", async () => {
+    H.invokePlutoMock.mockResolvedValue(itineraryAiReply({ title: "Trip to Springfield" }));
+    H.resolveHotelDestinationMock.mockResolvedValue({
+      status: "AMBIGUOUS",
+      query: "Springfield",
+      candidates: [
+        { cityName: "Springfield", countryCode: "US", cityCode: "500001", region: "Illinois" },
+        { cityName: "Springfield", countryCode: "US", cityCode: "500002", region: "Missouri" },
+      ],
+    });
+
+    const context = { locked: { destination: { name: "Springfield", source: "user" } } };
+    const body = await turn(context);
+
+    // The fabricated list goes, exactly as it does for every other outcome.
+    expect(body.reply.hotels).toBeUndefined();
+    expect(body.reply.hotelSearch).toBeUndefined();
+    // Never price a guess: the search must not run against either candidate.
+    expect(H.searchHotelsForChatMock).not.toHaveBeenCalled();
+    // Structured signal → the frontend renders one pickable chip per candidate.
+    expect(body.reply.hotelsAwaitingCity).toEqual({
+      query: "Springfield",
+      candidates: [
+        { cityName: "Springfield", countryCode: "US", cityCode: "500001", region: "Illinois" },
+        { cityName: "Springfield", countryCode: "US", cityCode: "500002", region: "Missouri" },
+      ],
+    });
+    expect(body.reply.hotelsAwaitingDates).toBeUndefined();
+  });
+
   it("city does not resolve live (UNSUPPORTED) → no fabrication either", async () => {
     H.invokePlutoMock.mockResolvedValue(itineraryAiReply({ title: "Trip to Nowhereville" }));
     H.resolveHotelDestinationMock.mockResolvedValue({ status: "UNSUPPORTED", cityName: "Nowhereville" });
@@ -203,6 +233,7 @@ describe("itinerary hotel section — live lane supersedes fabrication", () => {
     expect(body.reply.hotels).toBeUndefined();
     expect(body.reply.hotelSearch).toBeUndefined();
     expect(body.reply.hotelsAwaitingDates).toBeUndefined();
+    expect(body.reply.hotelsAwaitingCity).toBeUndefined();
     expect(H.searchHotelsForChatMock).not.toHaveBeenCalled();
   });
 

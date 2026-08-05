@@ -83,6 +83,16 @@ export function reduceToDelta(
     }
   }
 
+  // hotelsAwaitingCity — same additive-field treatment.
+  if (
+    JSON.stringify(next.hotelsAwaitingCity) !==
+    JSON.stringify(prev.hotelsAwaitingCity)
+  ) {
+    if (next.hotelsAwaitingCity) {
+      delta.hotelsAwaitingCity = next.hotelsAwaitingCity;
+    }
+  }
+
   // nextSteps (usually evolve)
   if (
     JSON.stringify(next.nextSteps) !==
