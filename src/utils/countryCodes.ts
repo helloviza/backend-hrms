@@ -105,7 +105,7 @@ export const COUNTRY_CODES: readonly CountryCodeEntry[] = [
   { iso2: "FR", iso3: "FRA", region: "SCHENGEN", name: "France", demonym: "French" },
   { iso2: "IT", iso3: "ITA", region: "SCHENGEN", name: "Italy", demonym: "Italian" },
   { iso2: "ES", iso3: "ESP", region: "SCHENGEN", name: "Spain", demonym: "Spanish" },
-  { iso2: "NL", iso3: "NLD", region: "SCHENGEN", name: "Netherlands", demonym: "Dutch" },
+  { iso2: "NL", iso3: "NLD", region: "SCHENGEN", name: "Netherlands", demonym: "Dutch", aliases: ["Holland"] },
   { iso2: "CH", iso3: "CHE", region: "SCHENGEN", name: "Switzerland", demonym: "Swiss" },
   { iso2: "AT", iso3: "AUT", region: "SCHENGEN", name: "Austria", demonym: "Austrian" },
   { iso2: "BE", iso3: "BEL", region: "SCHENGEN", name: "Belgium", demonym: "Belgian" },

@@ -96,6 +96,7 @@ import {
   CURRENT_VISA_CONSENT_VERSION,
   VISA_CONSENT_CLAUSE_IDS,
 } from "../config/visaConsent.js";
+import { VISA_FEATURED_DESTINATIONS } from "../config/visaFeaturedDestinations.js";
 import { computeVisaFeeBlock } from "../utils/visaFee.js";
 import {
   computeEstimatedDecisionWindow,
@@ -230,6 +231,17 @@ function mapRuleToVariant(r: any) {
  * canonical order, instead of always offering all three regardless of
  * what's actually published. A destination whose rules are ALL e.g.
  * TRANSIT-only reports purposes: ["TRANSIT"], not the full hardcoded set.
+ *
+ * featured (2026-08-05) — VISA_FEATURED_DESTINATIONS filtered down to
+ * codes actually present in `destinations`, order preserved. The picker
+ * grid (task brief: "redesign for scale") shows this shortlist ahead of
+ * the full catalogue instead of rendering all of it at once.
+ *
+ * searchTerms (2026-08-05) — every string search should match for this
+ * destination: name, iso2, iso3, demonym and any aliases from
+ * countryCodes.ts (so "UAE", "Dubai", "Holland", "Turkiye" all resolve),
+ * not just a substring of `name`. Computed here rather than duplicating
+ * COUNTRY_CODES on the frontend.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/destinations", async (_req: any, res: any) => {
   try {
@@ -283,14 +295,23 @@ router.get("/destinations", async (_req: any, res: any) => {
       const categories = Array.from(entry.categories);
       const purposes = CUSTOMER_FACING_PURPOSES.filter((p) => entry.purposes.has(p));
       if (purposes.length === 0) destinationsWithNoPurposes.push(iso2);
+      const name = country?.name ?? entry.destinationName;
+      const searchTerms = Array.from(
+        new Set(
+          [iso2, name, country?.iso3, country?.demonym, ...(country?.aliases ?? [])].filter(
+            (t): t is string => Boolean(t),
+          ),
+        ),
+      );
       return {
         iso2,
-        name: country?.name ?? entry.destinationName,
+        name,
         region: country?.region ?? null,
         categories,
         category: categories.length === 1 ? categories[0] : undefined,
         purposes,
         thumbnailUrl: thumbnailByIso2.get(iso2) ?? null,
+        searchTerms,
       };
     });
 
@@ -303,7 +324,9 @@ router.get("/destinations", async (_req: any, res: any) => {
       );
     }
 
-    res.json({ ok: true, destinations });
+    const featured = VISA_FEATURED_DESTINATIONS.filter((iso2) => byIso2.has(iso2));
+
+    res.json({ ok: true, destinations, featured });
   } catch (err: any) {
     console.error("[visa destinations GET]", err?.message);
     res
