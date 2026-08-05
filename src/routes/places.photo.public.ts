@@ -34,6 +34,7 @@ import {
   fetchPlacesPhoto,
   clampPhotoWidth,
 } from "../services/hotelPhotoService.js";
+import { getCachedAttractionPhotoName } from "../services/placeAttractions.service.js";
 
 const router = Router();
 
@@ -63,6 +64,46 @@ router.get("/hotels/photo-by-code", hotelPhotoLimiter, async (req, res) => {
 
     // A hotel photo is stable; let the browser and any CDN keep it for a day so
     // the common case never reaches Google at all.
+    res.setHeader("Cache-Control", "public, max-age=86400");
+
+    if (photo.redirectTo) return res.redirect(photo.redirectTo);
+    res.setHeader("Content-Type", photo.contentType || "image/jpeg");
+    return res.send(photo.body);
+  } catch {
+    // Never leak an internal error through a public endpoint.
+    return res.status(404).json({ ok: false, message: "No photo" });
+  }
+});
+
+/**
+ * GET /api/places/attractions/photo?placeId=ChIJ...&w=640
+ *
+ * Same shape and same safety argument as /hotels/photo-by-code above: takes a
+ * Places placeId — NOT a photo reference — resolves it from OUR OWN cache
+ * (placeAttractions.service's flat photo index) and refuses anything not
+ * already there. An unauthenticated caller can reach a photo for an
+ * attraction we already looked up via resolveCityAttractions; they can never
+ * trigger a new Places search or fetch an arbitrary photo reference.
+ */
+router.get("/attractions/photo", hotelPhotoLimiter, async (req, res) => {
+  try {
+    const placeId = String(req.query.placeId ?? "").trim();
+
+    // Google Place IDs are alphanumeric + "_-", generously bounded here —
+    // anything else is not a lookup we perform.
+    if (!placeId || !/^[A-Za-z0-9_-]{10,255}$/.test(placeId)) {
+      return res.status(400).json({ ok: false, message: "Invalid placeId" });
+    }
+
+    // CACHE ONLY. No Places Text Search can be reached from this route.
+    const photoName = await getCachedAttractionPhotoName(placeId);
+    if (!photoName) return res.status(404).json({ ok: false, message: "No photo" });
+
+    const photo = await fetchPlacesPhoto(photoName, clampPhotoWidth(req.query.w));
+    if (!photo) return res.status(404).json({ ok: false, message: "No photo" });
+
+    // An attraction's photo is stable; let the browser and any CDN keep it for
+    // a day so the common case never reaches Google at all.
     res.setHeader("Cache-Control", "public, max-age=86400");
 
     if (photo.redirectTo) return res.redirect(photo.redirectTo);

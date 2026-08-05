@@ -65,6 +65,7 @@ import travelCopilotRoutes from "./routes/copilot.travel.js";
 import { runPlutoBootCheck } from "./services/plutoBootCheck.js";
 import { invokePlutoGemini } from "./utils/plutoGeminiInvoke.js";
 import plutoVideoRouter from "./routes/pluto.video.js";
+import plutoPanelRouter from "./routes/plutoPanel.js";
 import copilotVideoConsent from "./routes/copilot.videoConsent.js";
 import adminVideoRouter from "./routes/admin.video.js";
 
@@ -579,6 +580,7 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
 // now key on workspaceId (matching the consumer in copilot.travel.ts) instead
 // of the legacy tenantId, which collapsed every internal user to "staff".
 app.use("/api/v1/pluto/video", requireAuth, requireWorkspace, plutoVideoRouter);
+app.use("/api/v1/pluto/panel", plutoPanelRouter);
 app.use("/api/copilot", copilotRouter);
 app.use("/api/v1/copilot/manager", copilotRouter);
 app.use("/api/assistant", assistantRouter);

@@ -6,6 +6,7 @@ import {
   isValidPlacesPhotoName,
   clampPhotoWidth,
 } from "../services/hotelPhotoService.js";
+import { resolveCityAttractions, type AttractionItem } from "../services/placeAttractions.service.js";
 
 // EVERY ROUTE IN THIS FILE IS AUTHENTICATED. The one public Places endpoint —
 // the hotel photo an <img> loads — lives in routes/places.photo.public.ts,
@@ -306,6 +307,56 @@ router.get("/hotels/photo", async (req, res) => {
     return res.send(buf);
   } catch (e: any) {
     return res.status(400).send(e?.message || "Bad request");
+  }
+});
+
+/**
+ * GET /api/places/attractions?city=<name>
+ *
+ * Top-10 "for you" + top-10 "get inspired" attraction cards for a city, for
+ * Pluto's right panel. Server-cached per city (see placeAttractions.service,
+ * 7-day TTL) — a panel render never spends a fresh Places call unless the
+ * cache is empty or stale.
+ *
+ * Photos: searchText already returns a photo RESOURCE NAME per place (no
+ * separate Places call needed to learn it exists), but the actual image
+ * bytes still require a second request. That request has to go to the PUBLIC
+ * /attractions/photo route (places.photo.public.ts), not this router — this
+ * endpoint is behind requireAuth, and a plain <img src> cannot send an
+ * Authorization header (same reason hotel photos moved to a public route;
+ * see that file's own note). The photoUrl below points there, keyed by
+ * placeId, never by the raw photo name.
+ */
+router.get("/attractions", async (req, res) => {
+  try {
+    const city = strOrEmpty(req.query.city).trim();
+    if (!city) return res.json({ ok: true, city: null, forYou: [], inspired: [] });
+
+    const data = await resolveCityAttractions(city);
+    if (!data) return res.json({ ok: true, city, forYou: [], inspired: [] });
+
+    const toCard = (item: AttractionItem) => ({
+      id: item.id,
+      name: item.name,
+      category: item.category,
+      rating: item.rating,
+      photoUrl: item.photoName
+        ? `${String(req.baseUrl || "")}/attractions/photo?placeId=${safeEncode(item.id)}&w=640`
+        : null,
+    });
+
+    // Short — this is a pointer response (photo URLs point at the proxy, which
+    // has its own 24h cache), not the underlying data. Mirrors hotels/photo-for.
+    res.setHeader("Cache-Control", "private, max-age=600");
+    return res.json({
+      ok: true,
+      city,
+      forYou: data.forYou.map(toCard),
+      inspired: data.inspired.map(toCard),
+    });
+  } catch (e: any) {
+    // Never fail the panel: attractions are an enhancement, never a gate.
+    return res.json({ ok: true, city: null, forYou: [], inspired: [], error: e?.message });
   }
 });
 
