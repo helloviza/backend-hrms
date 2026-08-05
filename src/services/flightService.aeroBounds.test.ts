@@ -99,6 +99,40 @@ describe("AeroAPI forward-window cap", () => {
   });
 });
 
+describe("IATA → ICAO mapping", () => {
+  /** The ident is the last path segment of the AeroAPI URL. */
+  function sentIdent() {
+    return String(H.get.mock.calls[0][0]).split("/").pop();
+  }
+
+  it("maps IX to AXB (Air India Express), not IAD", async () => {
+    // IAD is AirAsia India's code and had been copied onto IX, so every IX
+    // status lookup queried the wrong carrier and came back empty. Confirmed
+    // live: AXB613 returns an occurrence, IAD613 returns none.
+    await getFlightOccurrences("IX177", { now: NOW });
+    expect(sentIdent()).toBe("AXB177");
+  });
+
+  /**
+   * KNOWN GAP, pinned deliberately rather than fixed here (out of scope for the
+   * bound/window fix): toAeroApiIdent's regex is /^(\d?[A-Z]{1,2})(\d{2,4})$/,
+   * which captures a LEADING digit ("6E") but not a TRAILING one ("I5", "S5").
+   * So the IATA_TO_ICAO entries for I5 (AirAsia India) and S5 (Star Air) are
+   * unreachable and those idents go to AeroAPI unmapped. Left as-is so this
+   * change stays reviewable; raised separately.
+   */
+  it("does NOT yet map trailing-digit carrier codes — I5/S5 pass through unmapped", async () => {
+    await getFlightOccurrences("I5754", { now: NOW });
+    expect(sentIdent()).toBe("I5754");
+    expect(sentIdent()).not.toBe("IAD754");
+  });
+
+  it("maps 6E to IGO", async () => {
+    await getFlightOccurrences("6E5001", { now: NOW });
+    expect(sentIdent()).toBe("IGO5001");
+  });
+});
+
 describe("400 handling", () => {
   it("surfaces AeroAPI's own detail instead of reporting a false outage", async () => {
     H.get.mockRejectedValue({

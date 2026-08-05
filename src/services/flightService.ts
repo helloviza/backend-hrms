@@ -54,7 +54,11 @@ const IATA_TO_ICAO: Record<string, string> = {
   "SG": "SEJ",   // SpiceJet
   "QP": "AKJ",   // Akasa Air
   "UK": "VTI",   // Vistara
-  "IX": "IAD",   // Air India Express
+  "IX": "AXB",   // Air India Express — NOT IAD. Verified against AeroAPI on
+                 // 2026-08-06 with a same-number comparison: AXB613 returns a
+                 // live occurrence where IAD613 returns none. IAD belongs to
+                 // AirAsia India (I5) below, and was copied onto IX by mistake;
+                 // every IX status lookup had been querying the wrong carrier.
   "G8": "GOW",   // GoFirst
   "I5": "IAD",   // Air Asia India
   "S5": "LKD",   // Star Air
