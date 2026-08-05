@@ -1,9 +1,19 @@
 // apps/backend/src/routes/pluto.video.ts
 import { Router } from "express";
 import crypto from "crypto";
+import fs from "fs";
 import requireAuth from "../middleware/auth.js";
 import VideoAnalysis from "../models/VideoAnalysis.js";
 import { startVideoAnalysis } from "../services/video/startVideoAnalysis.js";
+import { createVideoAnalysisRecord } from "../services/video/createVideoAnalysisRecord.js";
+import {
+  isSupportedYoutubeUrl,
+  probeYoutubeVideo,
+  downloadYoutubeVideo,
+  VideoUrlFetchError,
+  MAX_DURATION_SEC,
+  MAX_FILESIZE_BYTES,
+} from "../services/video/videoUrlIngest.service.js";
 
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -110,18 +120,19 @@ router.post("/register", requireAuth, async (req, res) => {
     // workspaceId is REQUIRED on the schema. Omitting it (the previous
     // behaviour) made every registration fail Mongoose validation and return
     // 500 "Failed to register video" — the whole video feature was dark.
-    const record = await VideoAnalysis.create({
+    //
+    // Row creation is factored into createVideoAnalysisRecord() — the
+    // from-url route below calls the SAME helper, so the two front doors
+    // can never independently drift on which fields get set (the exact
+    // failure mode 8443d86 fixed for workspaceId).
+    const record = await createVideoAnalysisRecord({
       workspaceId,
       userId,
-      conversationId: conversationId || null,
+      conversationId,
       s3Key,
       originalFileName,
-      contentType: contentType || "video/mp4",
-      durationSec: durationSec || null,
-
-      // 🔒 Production truth
-      status: "processing",
-      progress: 0,
+      contentType,
+      durationSec,
     });
 
     // 🔥 Start analysis async
@@ -252,5 +263,168 @@ router.get("/:id/context", requireAuth, async (req, res) => {
     });
   }
 });
+
+/**
+ * POST /api/v1/pluto/video/from-url
+ * ---------------------------------
+ * URL front door — YouTube ONLY. Instagram/TikTok were proven infeasible
+ * without cookie-auth (both failed consistently across multiple real URLs
+ * during recon) and are deliberately out of scope here.
+ *
+ * Creates the SAME kind of row /register does (via the shared
+ * createVideoAnalysisRecord helper) and responds immediately, exactly like
+ * /register — the actual fetch happens in an async job below, never inside
+ * the request handler, so a slow/stalled download can't hold the HTTP
+ * response open.
+ */
+router.post("/from-url", requireAuth, async (req, res) => {
+  try {
+    const { url, conversationId } = req.body || {};
+
+    if (!url || typeof url !== "string") {
+      return res.status(400).json({ ok: false, message: "url is required" });
+    }
+
+    // Also the SSRF allowlist: only ever spawn yt-dlp against a URL whose
+    // host is a known YouTube domain.
+    if (!isSupportedYoutubeUrl(url)) {
+      return res.status(400).json({
+        ok: false,
+        message: "Only YouTube links are supported right now, or upload a file.",
+      });
+    }
+
+    const workspaceId = workspaceIdOf(req);
+    const userId = (req as any).user.sub;
+
+    // Reserved up front (schema requires + uniquely indexes s3Key) — the
+    // actual S3 object is written once the download succeeds, below.
+    const s3Key = `videos/${crypto.randomUUID()}-youtube-url.mp4`;
+
+    const record = await createVideoAnalysisRecord({
+      workspaceId,
+      userId,
+      conversationId,
+      s3Key,
+      contentType: "video/mp4",
+      sourceUrl: url,
+    });
+
+    res.json({
+      ok: true,
+      videoId: record._id,
+      status: record.status,
+    });
+
+    setImmediate(() => runVideoUrlIngestJob(record._id.toString(), url));
+  } catch (err: any) {
+    console.error("Video from-url failed:", err);
+    return res.status(500).json({
+      ok: false,
+      message: err?.message || "Failed to start video fetch",
+    });
+  }
+});
+
+/**
+ * Async job for /from-url: probe → cap-check → download (hard timeout) →
+ * upload to S3 → hand off to the EXISTING, unmodified startVideoAnalysis.
+ *
+ * HONESTY RULE: any failure here (unsupported/private video, over the
+ * duration/size cap, download timeout, S3 write failure) sets
+ * status: "failed" with a SPECIFIC message and returns — it must never fall
+ * through to status: "analyzed" with an empty transcript, which would look
+ * like "we watched it and found nothing" rather than "we never actually
+ * fetched it."
+ */
+async function runVideoUrlIngestJob(videoId: string, url: string) {
+  const failWith = async (message: string) => {
+    await VideoAnalysis.updateOne(
+      { _id: videoId },
+      { status: "failed", error: message, progress: 0 },
+    );
+  };
+
+  try {
+    const record = await VideoAnalysis.findOne({ _id: videoId });
+    if (!record) return;
+
+    /* ───────── PHASE 0: probe only — reject BEFORE downloading anything ───────── */
+    let probe;
+    try {
+      probe = await probeYoutubeVideo(url);
+    } catch (err: any) {
+      await failWith(
+        err instanceof VideoUrlFetchError
+          ? err.message
+          : "Couldn't fetch that link — try uploading the video file instead.",
+      );
+      return;
+    }
+
+    if (probe.durationSec != null && probe.durationSec > MAX_DURATION_SEC) {
+      await failWith(
+        `This video is longer than ${Math.round(MAX_DURATION_SEC / 60)} minutes — please upload a trimmed clip or the file directly.`,
+      );
+      return;
+    }
+
+    if (probe.filesizeBytes != null && probe.filesizeBytes > MAX_FILESIZE_BYTES) {
+      await failWith(
+        `This video is too large (max ${Math.round(MAX_FILESIZE_BYTES / (1024 * 1024))}MB) — please upload a smaller file.`,
+      );
+      return;
+    }
+
+    if (probe.title) {
+      await VideoAnalysis.updateOne(
+        { _id: videoId },
+        { originalFileName: probe.title, durationSec: probe.durationSec ?? null },
+      );
+    }
+
+    /* ───────── PHASE 1: download (hard child-process timeout inside) ───────── */
+    let filePath = "";
+    let cleanup = () => {};
+    try {
+      const dl = await downloadYoutubeVideo(url);
+      filePath = dl.filePath;
+      cleanup = dl.cleanup;
+    } catch (err: any) {
+      await failWith(
+        err instanceof VideoUrlFetchError
+          ? err.message
+          : "Couldn't fetch that link — try uploading the video file instead.",
+      );
+      return;
+    }
+
+    try {
+      /* ───────── PHASE 2: upload to S3 under the SAME key convention register uses ───────── */
+      const fileBuffer = fs.readFileSync(filePath);
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: process.env.S3_BUCKET!,
+          Key: record.s3Key,
+          Body: fileBuffer,
+          ContentType: "video/mp4",
+          ContentLength: fileBuffer.length,
+        }),
+      );
+    } catch (err: any) {
+      console.error("Video from-url S3 upload failed:", err);
+      await failWith("Couldn't save that video — please try again or upload the file instead.");
+      return;
+    } finally {
+      cleanup();
+    }
+
+    /* ───────── HANDOFF: existing, unmodified pipeline ───────── */
+    startVideoAnalysis(videoId);
+  } catch (err: any) {
+    console.error("Video from-url job failed:", err);
+    await failWith("Couldn't fetch that link — try uploading the video file instead.");
+  }
+}
 
 export default router;

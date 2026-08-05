@@ -46,6 +46,11 @@ const VideoAnalysisSchema = new Schema(
       type: String,
     },
 
+    sourceUrl: {
+      type: String,
+      comment: "Set when this video was fetched from a pasted URL (e.g. YouTube) rather than uploaded as a file.",
+    },
+
     contentType: {
       type: String,
       default: "video/mp4",
