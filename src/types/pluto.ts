@@ -61,6 +61,21 @@ export interface PlutoReplyV1 {
   // from any hotel context).
   hotelsAwaitingDates?: { city: string };
 
+  // Set when the named city matched SEVERAL real, bookable cities and nothing
+  // in the catalog separated them (six "Santa Maria"s, fifteen
+  // "Springfield"s). The frontend renders one pickable chip per candidate, the
+  // same inline shape hotelsAwaitingDates uses — the alternative was picking
+  // one and presenting a coin flip as an answer.
+  hotelsAwaitingCity?: {
+    query: string;
+    candidates: Array<{
+      cityName: string;
+      countryCode: string;
+      cityCode: string;
+      region?: string;
+    }>;
+  };
+
   nextSteps: string[];
 
   handoff: boolean;             // 🔑 Auto-handoff signal (Fix #4)
