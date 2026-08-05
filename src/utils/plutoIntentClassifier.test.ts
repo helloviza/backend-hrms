@@ -46,8 +46,54 @@ describe("classifyPlutoIntent — PLANNING word-boundary (2026-08 audit)", () =>
     expect(classifyPlutoIntent("Send me the itinerary")).toBe("PLANNING");
   });
 
-  it("REFINEMENT and PIVOT are untouched by the word-boundary fix", () => {
+  it("REFINEMENT and PIVOT still fire on their real keywords", () => {
     expect(classifyPlutoIntent("Add another hotel night")).toBe("REFINEMENT");
     expect(classifyPlutoIntent("Actually, let's go to Dubai instead")).toBe("PIVOT");
+  });
+});
+
+describe("classifyPlutoIntent — REFINEMENT/PIVOT word-boundary (2026-08 audit, pass 2)", () => {
+  it("\"address\" is not REFINEMENT — the urgent collision (constant in travel copy)", () => {
+    expect(classifyPlutoIntent("what's the address of the hotel")).toBe("DISCOVERY");
+  });
+
+  it("\"additional\" is not REFINEMENT", () => {
+    expect(classifyPlutoIntent("any additional fees")).toBe("DISCOVERY");
+  });
+
+  it("bare \"add\" still classifies as REFINEMENT", () => {
+    expect(classifyPlutoIntent("add a day in Rome")).toBe("REFINEMENT");
+  });
+
+  it("add/adds/adding/added all still match as whole words", () => {
+    expect(classifyPlutoIntent("adds a stop in Kyoto")).toBe("REFINEMENT");
+    expect(classifyPlutoIntent("adding a connecting flight")).toBe("REFINEMENT");
+    expect(classifyPlutoIntent("added a hotel night")).toBe("REFINEMENT");
+  });
+
+  it("\"exchange to\" does not PIVOT — the \"change to\" collision", () => {
+    expect(classifyPlutoIntent("exchange to USD")).toBe("DISCOVERY");
+  });
+
+  it("bare \"change to\" still classifies as PIVOT", () => {
+    expect(classifyPlutoIntent("change to a window seat instead")).toBe("PIVOT");
+  });
+
+  it("\"unforgettable\" does not PIVOT — the \"forget\" collision", () => {
+    expect(classifyPlutoIntent("an unforgettable trip")).toBe("DISCOVERY");
+  });
+
+  it("bare \"forget\"/\"forgetting\" still classify as PIVOT", () => {
+    expect(classifyPlutoIntent("forget the beach, let's do mountains")).toBe("PIVOT");
+    expect(classifyPlutoIntent("forgetting the passport would be bad")).toBe("PIVOT");
+  });
+
+  it("update/updates/updated/updating all still match as whole words", () => {
+    expect(classifyPlutoIntent("update my dates")).toBe("REFINEMENT");
+    expect(classifyPlutoIntent("updated the flight")).toBe("REFINEMENT");
+  });
+
+  it("instead/actually/nevermind still match as whole words", () => {
+    expect(classifyPlutoIntent("nevermind, keep the old plan")).toBe("PIVOT");
   });
 });

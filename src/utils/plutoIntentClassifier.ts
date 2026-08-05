@@ -17,24 +17,38 @@ export type PlutoIntent = "DISCOVERY" | "PLANNING" | "REFINEMENT" | "PIVOT";
  * prompt with those two words drafted a full itinerary on the very first
  * turn; the same prompt with "recommend"/"visit" instead stayed DISCOVERY.
  *
- * The "plan" check is WORD-BOUNDED (\b...\b), not a raw substring match —
- * text.includes("plan") used to fire on "Hotels in Plano, Texas" and on any
- * mention of a "plane"/"airplane"/"planet", none of which are planning
- * intent. "itinerary" is bounded too for the same reason, though no real
- * collision is known for it. The OTHER keywords below (pivotKeywords,
- * "add"/"update") are still plain substring matches and were NOT audited/
- * fixed here — see the 2026-08 intent-gate audit for known collisions on
- * those ("add" ⊂ "address"/"additional", "change to" ⊂ "exchange to",
- * "forget" ⊂ "unforgettable") that a future pass should word-bound too.
+ * EVERY keyword below is WORD-BOUNDED (\b...\b), not a raw substring match —
+ * plain .includes() used to fire on any word that happens to CONTAIN a
+ * keyword, not just the keyword itself. Confirmed real collisions (2026-08
+ * audit), all fixed here:
+ *   - "plan"      ⊂ "Plano", "plane"/"airplane", "planet"
+ *   - "add"       ⊂ "address", "additional"       — the urgent one: both are
+ *                   constant in travel copy ("what's the hotel's address?"),
+ *                   so this was misclassifying REFINEMENT on ordinary
+ *                   questions.
+ *   - "change to" ⊂ "exchange to"
+ *   - "forget"    ⊂ "unforgettable"
+ * "itinerary", "update", "instead", "actually", "nevermind" have no known
+ * real-world collision but are bounded too, for the same reason and at the
+ * same cost: cheap insurance against a future false positive, not a fix for
+ * anything currently broken.
+ *
+ * Each bound keyword still matches its ordinary inflected forms — "add"
+ * matches add/adds/adding/added, "plan" matches plan/plans/planning/
+ * planned, "forget" matches forget/forgetting — so this narrows FALSE
+ * positives (a keyword embedded in an unrelated longer word) without
+ * narrowing genuine matches the old substring check already caught.
  */
 export function classifyPlutoIntent(prompt: string): PlutoIntent {
   const text = prompt.toLowerCase();
 
-  const pivotKeywords = ["instead", "actually", "change to", "forget", "nevermind"];
-  if (pivotKeywords.some(k => text.includes(k))) return "PIVOT";
+  const PIVOT_RE = /\binstead\b|\bactually\b|\bchange to\b|\bforget(?:ting)?\b|\bnevermind\b/;
+  if (PIVOT_RE.test(text)) return "PIVOT";
 
   if (/\bitinerary\b|\bplan(?:s|ning|ned)?\b/.test(text)) return "PLANNING";
-  if (text.includes("add") || text.includes("update")) return "REFINEMENT";
+
+  const REFINEMENT_RE = /\badd(?:s|ing|ed)?\b|\bupdate(?:s|d|ing)?\b/;
+  if (REFINEMENT_RE.test(text)) return "REFINEMENT";
 
   return "DISCOVERY";
 }
