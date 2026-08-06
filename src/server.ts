@@ -120,6 +120,9 @@ import leadsRouter from "./routes/leads.js";
 import crmCompaniesRouter from "./routes/crm.companies.js";
 import crmContactsRouter from "./routes/crm.contacts.js";
 
+// ✅ Shared location service — boot-time assertion of the trust-proxy assumption
+import { logProxyTrustAssumption } from "./services/location.service.js";
+
 const app = express();
 
 /* ────────────────────────────────────────────────────────────────
@@ -127,6 +130,13 @@ const app = express();
  * ──────────────────────────────────────────────────────────────── */
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
+// Stated out loud at boot because the line above is load-bearing for every
+// resolved client location: `1` is correct only while exactly one proxy hop
+// (ALB → app, direct CNAME) sits in front. Put a CDN/WAF there and req.ip
+// silently becomes the edge address — nothing errors, every user just
+// resolves to one city. Logged HERE, next to the assumption it describes, so
+// whoever changes the 1 sees why it matters. See services/location.service.ts.
+logProxyTrustAssumption();
 
 // Prevent 304 with empty body on APIs
 app.set("etag", false);

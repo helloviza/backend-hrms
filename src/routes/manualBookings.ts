@@ -22,6 +22,7 @@ import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
+import { resolveActorFromRequest } from "../services/location.service.js";
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -363,6 +364,67 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
   ];
 }
 
+/* ── Where the booking was authored from ─────────────────────────── */
+
+// PHASE 2 PILOT — this is the FIRST and, for now, the ONLY consumer of the
+// location service (Phase 1 shipped dark). Kept local to this route rather
+// than promoted into the service: one consumer does not make a shared helper,
+// and the timeout below is a decision about BOOKINGS specifically. When a
+// second consumer arrives, that is the moment to move it.
+//
+// A geo lookup must never cost us a booking. Two ways that could happen and
+// the two guards for each:
+//   throwing  → the whole thing is wrapped; any error degrades to a stamp.
+//   hanging   → resolveActorFromRequest awaits a database open, which on a
+//               cold start can mean provisioning a 70 MB download. Bounded
+//               here so the worst case is a booking with an honest
+//               "resolver_timeout" stamp, not a request sat waiting on geo.
+const LOCATION_RESOLVE_TIMEOUT_MS = 1500;
+
+async function resolveBookedFromCity(req: any) {
+  // Every failure lands as data with a distinct reason — "the resolver broke"
+  // must stay distinguishable from "we looked and the database had nothing"
+  // (geo_db_unavailable / ip_not_in_db), because they need different fixes.
+  const degraded = (reason: string) => ({
+    city: null,
+    rawCity: null,
+    source: "unresolved" as const,
+    confidence: 0,
+    reason,
+    resolvedAt: new Date(),
+  });
+
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    // resolveActorFromRequest also upserts the actor's ActorLocation row —
+    // one call, one resolution, both records.
+    const outcome = await Promise.race([
+      resolveActorFromRequest(req),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), LOCATION_RESOLVE_TIMEOUT_MS);
+      }),
+    ]);
+    if (!outcome) return degraded("resolver_timeout");
+
+    const loc = outcome.location;
+    return {
+      city: loc.city,
+      rawCity: loc.rawCity,
+      source: loc.source,
+      confidence: loc.confidence,
+      reason: loc.reason,
+      resolvedAt: new Date(),
+    };
+  } catch (err: any) {
+    // The service contract says this can't happen. If it ever does, the
+    // booking still goes through and the row says so.
+    console.warn("[ManualBookings] location resolve failed (booking proceeds):", err?.message);
+    return degraded("resolver_error");
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /* ── CRUD ────────────────────────────────────────────────────────── */
 
 // POST /api/admin/manual-bookings
@@ -372,6 +434,8 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
+
+    const bookedFromCity = await resolveBookedFromCity(req);
 
     const booking = await ManualBooking.create({
       ...req.body,
@@ -383,6 +447,9 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
       // Demo Platform — booking authored under impersonation
       isDemo: req.user?.isDemoUser === true,
       createdByDemoUser: req.user?.isDemoUser === true,
+      // AFTER the spread on purpose: this is derived from the connection, and
+      // a client-supplied bookedFromCity must never be able to win.
+      bookedFromCity,
     });
 
     // Task automation hook for pending bookings
