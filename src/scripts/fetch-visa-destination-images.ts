@@ -220,12 +220,26 @@ async function main() {
     console.log("(dry run — queries Pixabay for real counts, but uploads/writes nothing; pass --commit to store)\n");
   }
 
+  // Batch summary (2026-08-06) — the per-destination console lines above
+  // always existed, but nothing rolled them up across a whole run. Ops
+  // needs one number to decide "does this look right, safe to --commit?"
+  // rather than reading N individual lines — and, separately, a named list
+  // of destinations that came back with zero PASSING candidates, since
+  // those are the ones no bulk picker click can resolve — they need a
+  // manual upload, not a re-run.
+  const skipped: string[] = [];
+  const zeroPassDestinations: string[] = [];
+  let totalCandidates = 0;
+  let totalPass = 0;
+  let totalFail = 0;
+
   for (const iso2 of targets) {
     const countryName = getCountryByIso2(iso2)?.name ?? iso2;
 
     const existing = await VisaDestinationContent.findOne({ destinationIso2: iso2 }).lean();
     if (existing?.heroImageUrl && !FORCE) {
       console.log(`${iso2} (${countryName}) — already has a live hero image, skipping (--force to re-fetch anyway)`);
+      skipped.push(`${iso2} (${countryName})`);
       continue;
     }
 
@@ -236,6 +250,11 @@ async function main() {
       `  ${candidates.length} candidate(s)${candidates.length === 0 ? " — nothing to review yet" : ` — ${passCount} pass contrast, ${candidates.length - passCount} fail`}.`,
     );
 
+    totalCandidates += candidates.length;
+    totalPass += passCount;
+    totalFail += candidates.length - passCount;
+    if (passCount === 0) zeroPassDestinations.push(`${iso2} (${countryName})`);
+
     if (!COMMIT || candidates.length === 0) continue;
 
     await VisaDestinationContent.findOneAndUpdate(
@@ -245,6 +264,19 @@ async function main() {
     );
     console.log(`  Stored ${candidates.length} candidate(s) in S3 and wrote them for ops review.`);
   }
+
+  const processed = targets.length - skipped.length;
+  console.log(`\n${"─".repeat(60)}`);
+  console.log(`SUMMARY — ${COMMIT ? "COMMIT" : "DRY RUN"}`);
+  console.log(`  ${targets.length} destination(s) targeted, ${skipped.length} already had a live image (skipped), ${processed} processed.`);
+  console.log(`  ${totalCandidates} candidate(s) fetched across ${processed} destination(s) — ${totalPass} pass contrast, ${totalFail} fail.`);
+  if (zeroPassDestinations.length > 0) {
+    console.log(`  ${zeroPassDestinations.length} destination(s) with ZERO passing candidates — need a manual upload:`);
+    for (const d of zeroPassDestinations) console.log(`    - ${d}`);
+  } else if (processed > 0) {
+    console.log("  Every processed destination has at least one passing candidate.");
+  }
+  console.log(`${"─".repeat(60)}`);
 
   await mongoose.disconnect();
 }

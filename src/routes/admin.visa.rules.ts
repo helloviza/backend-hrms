@@ -38,6 +38,7 @@ import { requirePermission } from "../middleware/requirePermission.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 import { MIN_HERO_CONTRAST } from "../utils/heroImageContrast.js";
+import { getCountryByIso2 } from "../utils/countryCodes.js";
 import VisaRule, {
   VISA_PURPOSES,
   VISA_ENTRY_TYPES,
@@ -1047,6 +1048,73 @@ router.get("/destination-content", requirePermission("visaApplication", "FULL"),
   } catch (err: any) {
     console.error("[admin visa destination-content GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load destination content" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /destination-images/missing — the bulk image-picker screen's data
+ * source (2026-08-07). GET /destination-content above only ever returns
+ * rows that already EXIST in VisaDestinationContent, so it can't answer
+ * "which published destinations still have no image" — a destination
+ * fetch-visa-destination-images.ts has never touched (no content row at
+ * all) is invisible to it. This route does the join that script's own
+ * targets list already does (VisaRule.distinct("destinationIso2",
+ * {status:"PUBLISHED"})) against VisaDestinationContent, and returns only
+ * the destinations still missing a live heroImageUrl — one row per
+ * destination, its own candidates inline, no per-destination fetch.
+ *
+ * canPublish mirrors POST .../publish's own validation exactly (headline +
+ * summary + at least one highlight) so the bulk screen can show, before
+ * anyone clicks Publish, which destinations will actually go live once an
+ * image is picked and which still need editorial copy first — the two are
+ * independent (see that route's own header), and a destination can be
+ * missing either or both.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/destination-images/missing", requirePermission("visaApplication", "FULL"), async (_req: any, res: any) => {
+  try {
+    const rules = await VisaRule.find({ status: "PUBLISHED" }).select("destinationIso2 destinationName").lean();
+    const nameByIso2 = new Map<string, string>();
+    for (const r of rules) {
+      if (nameByIso2.has(r.destinationIso2)) continue;
+      const country = getCountryByIso2(r.destinationIso2);
+      nameByIso2.set(r.destinationIso2, country?.name ?? r.destinationName);
+    }
+    const iso2List = Array.from(nameByIso2.keys());
+
+    const contentRows = await VisaDestinationContent.find({ destinationIso2: { $in: iso2List } }).lean();
+    const contentByIso2 = new Map(contentRows.map((r) => [r.destinationIso2, r]));
+
+    const destinations = iso2List
+      .map((iso2) => {
+        const content = contentByIso2.get(iso2) || null;
+        const candidates = Array.isArray(content?.imageCandidates) ? content!.imageCandidates : [];
+        const passingCandidateCount = candidates.filter((c: any) => c.contrastStatus === "PASS").length;
+        const hasHeadline = Boolean(content?.entrySnapshot?.headline?.trim());
+        const hasSummary = Boolean(content?.entrySnapshot?.summary?.trim());
+        const hasHighlight =
+          (content?.businessBlock?.highlights?.length ?? 0) > 0 || (content?.tourismBlock?.highlights?.length ?? 0) > 0;
+        return {
+          iso2,
+          name: nameByIso2.get(iso2)!,
+          contentStatus: content?.status ?? null,
+          heroImageUrl: content?.heroImageUrl ?? null,
+          imageCandidates: candidates,
+          passingCandidateCount,
+          canPublish: hasHeadline && hasSummary && hasHighlight,
+        };
+      })
+      .filter((d) => !d.heroImageUrl)
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    res.json({
+      ok: true,
+      destinations,
+      totalPublishedDestinations: iso2List.length,
+      missingImageCount: destinations.length,
+    });
+  } catch (err: any) {
+    console.error("[admin visa destination-images missing GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load destination image queue" });
   }
 });
 
