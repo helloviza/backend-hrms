@@ -34,8 +34,12 @@ Thumbs.db
 # uploads & runtime files
 uploads/
 
-# provisioned binaries (downloaded at build time — see ytDlpProvision.ts)
+# provisioned artefacts (downloaded at build time — see ytDlpProvision.ts and
+# geoipProvision.ts). bin/ already covers both; *.mmdb is belt-and-braces
+# because the GeoLite2 database is ~70 MB AND non-redistributable under
+# MaxMind's licence, so it must never be committable from anywhere.
 bin/
+*.mmdb
 
 # puppeteer / playwright cache
 .cache/
