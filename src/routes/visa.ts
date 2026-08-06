@@ -216,6 +216,54 @@ function mapRuleToVariant(r: any) {
   };
 }
 
+// A destination-level boolean field (biometricsRequired, appointmentRequired)
+// reduced across every PUBLISHED rule for that destination — regardless of
+// purpose, entryType or serviceTier. Corridor-card rebuild (2026-08-06):
+// the picker used to never surface these at all; now that it does, a
+// destination whose rules genuinely disagree (e.g. biometrics required for
+// BUSINESS but not TOURIST) must say so explicitly rather than the response
+// silently reporting whichever rule happened to be aggregated last. "VARIES"
+// is the honest third state — the frontend renders it as "Varies by
+// purpose/tier" rather than a flat yes/no.
+type TriState = boolean | "VARIES";
+function reduceTriState(values: Set<boolean>): TriState {
+  if (values.size === 1) return values.has(true);
+  return "VARIES";
+}
+
+interface DestinationCheapestFee {
+  amountInr: number;
+  gstApplicable: boolean;
+  displayMode: VisaRuleDisplayModeLike;
+}
+type VisaRuleDisplayModeLike = "ITEMISED" | "INDICATIVE";
+
+// One row per distinct serviceTier found among a destination's PUBLISHED
+// rules, aggregated across every purpose/entryType that tier appears under.
+// etaMinDays/etaMaxDays are the WIDEST honest range across every matching
+// rule (never one rule's number picked silently) — a tier whose ETA is
+// identical everywhere it appears just collapses to min===max, same as a
+// single rule would report. entryTypes lists every distinct entry type this
+// tier has been published with; cost/gstApplicable/displayMode reflect
+// whichever matching rule is cheapest (starting-cost semantics — a
+// legitimate "from ₹X", not a disagreement that needs hiding).
+interface DestinationTierAgg {
+  etaMinDays: number | null;
+  etaMaxDays: number | null;
+  etaBasis: Set<VisaEtaBasisLike>;
+  entryTypes: Set<string>;
+  cheapest: DestinationCheapestFee | null;
+}
+type VisaEtaBasisLike = "BUSINESS" | "CALENDAR";
+
+function updateCheapest(
+  current: DestinationCheapestFee | null,
+  candidate: DestinationCheapestFee,
+): DestinationCheapestFee {
+  if (!current || candidate.amountInr < current.amountInr) return candidate;
+  return current;
+}
+
 /* ─────────────────────────────────────────────────────────────────────
  * GET /destinations — distinct destinations carrying at least one
  * PUBLISHED VisaRule (any nationality is irrelevant here — a destination
@@ -242,30 +290,99 @@ function mapRuleToVariant(r: any) {
  * countryCodes.ts (so "UAE", "Dubai", "Holland", "Turkiye" all resolve),
  * not just a substring of `name`. Computed here rather than duplicating
  * COUNTRY_CODES on the frontend.
+ *
+ * Corridor-card rebuild (2026-08-06) — the destination picker moved from a
+ * small tile (name + tiny thumbnail + category badge) to a photo-led card
+ * that needs to show, without a second request, everything a customer
+ * would otherwise only learn on screen 2:
+ *   - serviceTiers: every distinct serviceTier published for this
+ *     destination (any purpose/entryType), each with its aggregated
+ *     processing-time range, entry type(s), and starting cost — see
+ *     DestinationTierAgg above for exactly how disagreement is handled.
+ *   - biometricsRequired / appointmentRequired: boolean, OR "VARIES" when
+ *     this destination's rules don't all agree (see reduceTriState above)
+ *     — never silently collapsed to one rule's value.
+ *   - startingCost: the single cheapest total across every published rule
+ *     for this destination, any purpose/tier — legitimate "from ₹X"
+ *     e-commerce semantics, not a disagreement. gstApplicable reflects
+ *     whether GST (already baked into totalInr by computeVisaFeeBlock) was
+ *     part of that specific winning rule's total, so the card can caption
+ *     "from ₹X (incl. GST)" only when true.
+ *   - iso3 / demonym: card overlay text ("United Arab Emirates · Emirati ·
+ *     ARE") — iso3/demonym already existed in COUNTRY_CODES and were only
+ *     ever folded into searchTerms before; now returned as their own
+ *     fields too.
+ *   - heroImageUrl alongside thumbnailUrl: same PUBLISHED-only join as the
+ *     existing thumbnail. The card prefers thumbnailUrl (the crop actually
+ *     sized for a picker tile) and falls back to heroImageUrl when only
+ *     the requirements-page hero has been published for a destination —
+ *     see DestinationCard.tsx on the frontend for where that fallback is
+ *     applied.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/destinations", async (_req: any, res: any) => {
   try {
     const rules = await VisaRule.find({ status: "PUBLISHED" })
-      .select("destinationIso2 destinationName visaCategory purpose")
+      .select(
+        "destinationIso2 destinationName visaCategory purpose serviceTier entryType " +
+          "etaMinDays etaMaxDays etaBasis appointmentRequired biometricsRequired " +
+          "embassyFeeInr vfsFeeInr plumtripsServiceFeeInr indicativeVisaCostInr",
+      )
       .lean();
 
     const byIso2 = new Map<
       string,
-      { destinationName: string; categories: Set<VisaCategory>; purposes: Set<VisaPurpose> }
+      {
+        destinationName: string;
+        categories: Set<VisaCategory>;
+        purposes: Set<VisaPurpose>;
+        biometricsValues: Set<boolean>;
+        appointmentValues: Set<boolean>;
+        tiers: Map<string, DestinationTierAgg>;
+        cheapest: DestinationCheapestFee | null;
+      }
     >();
     for (const r of rules) {
-      const existing = byIso2.get(r.destinationIso2);
-      const rulePurposes = customerPurposesForRule(r.purpose);
-      if (existing) {
-        existing.categories.add(r.visaCategory);
-        for (const p of rulePurposes) existing.purposes.add(p);
-      } else {
-        byIso2.set(r.destinationIso2, {
+      let entry = byIso2.get(r.destinationIso2);
+      if (!entry) {
+        entry = {
           destinationName: r.destinationName,
-          categories: new Set([r.visaCategory]),
-          purposes: new Set(rulePurposes),
-        });
+          categories: new Set(),
+          purposes: new Set(),
+          biometricsValues: new Set(),
+          appointmentValues: new Set(),
+          tiers: new Map(),
+          cheapest: null,
+        };
+        byIso2.set(r.destinationIso2, entry);
       }
+
+      entry.categories.add(r.visaCategory);
+      for (const p of customerPurposesForRule(r.purpose)) entry.purposes.add(p);
+      entry.biometricsValues.add(Boolean(r.biometricsRequired));
+      entry.appointmentValues.add(Boolean(r.appointmentRequired));
+
+      const fee = computeVisaFeeBlock(r);
+      const cheapestCandidate: DestinationCheapestFee = {
+        amountInr: fee.totalInr,
+        gstApplicable: fee.displayMode === "ITEMISED" && r.plumtripsServiceFeeInr != null,
+        displayMode: fee.displayMode,
+      };
+      entry.cheapest = updateCheapest(entry.cheapest, cheapestCandidate);
+
+      let tier = entry.tiers.get(r.serviceTier);
+      if (!tier) {
+        tier = { etaMinDays: null, etaMaxDays: null, etaBasis: new Set(), entryTypes: new Set(), cheapest: null };
+        entry.tiers.set(r.serviceTier, tier);
+      }
+      if (r.etaMinDays != null) {
+        tier.etaMinDays = tier.etaMinDays == null ? r.etaMinDays : Math.min(tier.etaMinDays, r.etaMinDays);
+      }
+      if (r.etaMaxDays != null) {
+        tier.etaMaxDays = tier.etaMaxDays == null ? r.etaMaxDays : Math.max(tier.etaMaxDays, r.etaMaxDays);
+      }
+      if (r.etaBasis) tier.etaBasis.add(r.etaBasis);
+      tier.entryTypes.add(r.entryType);
+      tier.cheapest = updateCheapest(tier.cheapest, cheapestCandidate);
     }
 
     // Every PUBLISHED rule's purpose maps to at least one customer-facing
@@ -276,19 +393,22 @@ router.get("/destinations", async (_req: any, res: any) => {
     // never silently hidden from the picker as an unselectable destination.
     const destinationsWithNoPurposes: string[] = [];
 
-    // Thumbnail join — country imagery (2026-08-03). Same PUBLISHED-only
-    // gate as GET /content/:iso2: a destination whose content row is still
-    // DRAFT (ops picked an image but hasn't published the rest of the
-    // copy yet) reports thumbnailUrl: null here, same as if no image had
-    // ever been fetched — "nothing publishes unreviewed" holds for the
-    // picker grid too, not just the requirements-page hero.
-    const thumbnailRows = await VisaDestinationContent.find({
+    // Thumbnail + hero join — country imagery (2026-08-03, widened
+    // 2026-08-06). Same PUBLISHED-only gate as GET /content/:iso2: a
+    // destination whose content row is still DRAFT (ops picked an image
+    // but hasn't published the rest of the copy yet) reports both URLs
+    // null here, same as if no image had ever been fetched — "nothing
+    // publishes unreviewed" holds for the picker grid too, not just the
+    // requirements-page hero.
+    const imageRows = await VisaDestinationContent.find({
       destinationIso2: { $in: Array.from(byIso2.keys()) },
       status: "PUBLISHED",
     })
-      .select("destinationIso2 thumbnailUrl")
+      .select("destinationIso2 thumbnailUrl heroImageUrl")
       .lean();
-    const thumbnailByIso2 = new Map(thumbnailRows.map((r) => [r.destinationIso2, r.thumbnailUrl ?? null]));
+    const imageByIso2 = new Map(
+      imageRows.map((r) => [r.destinationIso2, { thumbnailUrl: r.thumbnailUrl ?? null, heroImageUrl: r.heroImageUrl ?? null }]),
+    );
 
     const destinations = Array.from(byIso2.entries()).map(([iso2, entry]) => {
       const country = getCountryByIso2(iso2);
@@ -303,14 +423,43 @@ router.get("/destinations", async (_req: any, res: any) => {
           ),
         ),
       );
+
+      const serviceTiers = Array.from(entry.tiers.entries())
+        .sort(([a], [b]) => serviceTierRank(a) - serviceTierRank(b))
+        .map(([tier, agg]) => ({
+          tier,
+          etaMinDays: agg.etaMinDays,
+          etaMaxDays: agg.etaMaxDays,
+          etaBasis: agg.etaBasis.size === 1 ? Array.from(agg.etaBasis)[0] : "VARIES",
+          entryTypes: Array.from(agg.entryTypes),
+          startingFromInr: agg.cheapest?.amountInr ?? null,
+          gstApplicable: agg.cheapest?.gstApplicable ?? false,
+          displayMode: agg.cheapest?.displayMode ?? null,
+        }));
+
+      const image = imageByIso2.get(iso2);
+
       return {
         iso2,
+        iso3: country?.iso3 ?? null,
         name,
+        demonym: country?.demonym ?? null,
         region: country?.region ?? null,
         categories,
         category: categories.length === 1 ? categories[0] : undefined,
         purposes,
-        thumbnailUrl: thumbnailByIso2.get(iso2) ?? null,
+        serviceTiers,
+        biometricsRequired: reduceTriState(entry.biometricsValues),
+        appointmentRequired: reduceTriState(entry.appointmentValues),
+        startingCost: entry.cheapest
+          ? {
+              amountInr: entry.cheapest.amountInr,
+              gstApplicable: entry.cheapest.gstApplicable,
+              displayMode: entry.cheapest.displayMode,
+            }
+          : null,
+        thumbnailUrl: image?.thumbnailUrl ?? null,
+        heroImageUrl: image?.heroImageUrl ?? null,
         searchTerms,
       };
     });

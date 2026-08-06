@@ -44,8 +44,16 @@ vi.mock("../models/VisaRule.js", () => ({
 }));
 
 const visaContentFindOneMock = vi.fn();
+// GET /destinations' thumbnail join (2026-08-03) added a .find(...).select().lean()
+// call alongside the pre-existing .findOne(...).lean() used by GET /content/:iso2 —
+// both chains must be mocked, reusing the same select/sort/lean chain shape as
+// visaRuleFindMock's findChain() below.
+const visaContentFindMock = vi.fn();
 vi.mock("../models/VisaDestinationContent.js", () => ({
-  default: { findOne: (...args: any[]) => ({ lean: () => visaContentFindOneMock(...args) }) },
+  default: {
+    findOne: (...args: any[]) => ({ lean: () => visaContentFindOneMock(...args) }),
+    find: (...args: any[]) => visaContentFindMock(...args),
+  },
 }));
 
 import express from "express";
@@ -106,6 +114,11 @@ beforeEach(() => {
   visaRuleFindMock.mockReset();
   visaRuleFindOneMock.mockReset();
   visaContentFindOneMock.mockReset();
+  visaContentFindMock.mockReset();
+  // Default: no thumbnail rows, so every pre-existing /destinations test
+  // (none of which assert on thumbnailUrl) doesn't need to know this
+  // query exists — it just resolves thumbnailUrl: null for everyone.
+  visaContentFindMock.mockReturnValue(findChain([]));
 });
 
 describe("GET /destinations", () => {
@@ -190,6 +203,148 @@ describe("GET /destinations", () => {
       const res = await request(makeApp()).get("/destinations");
       const dest = res.body.destinations.find((d: any) => d.iso2 === "CA");
       expect(dest.purposes).toEqual(["TOURIST", "BUSINESS"]);
+    });
+  });
+
+  describe("corridor-card fields (2026-08-06 — photo-led picker rebuild)", () => {
+    it("reports iso3/demonym alongside iso2, for the card overlay", async () => {
+      visaRuleFindMock.mockReturnValue(findChain([ruleDoc({ destinationIso2: "AE" })]));
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "AE");
+      expect(dest.iso3).toBe("ARE");
+      expect(dest.demonym).toBe("Emirati");
+    });
+
+    it("aggregates one serviceTiers entry per distinct tier, ranked cheapest/most-common first (not alphabetically)", async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([
+          ruleDoc({ serviceTier: "EXPRESS", etaMinDays: 3, etaMaxDays: 3 }),
+          ruleDoc({ serviceTier: "STANDARD", etaMinDays: 10, etaMaxDays: 10 }),
+        ]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "DE");
+      expect(dest.serviceTiers.map((t: any) => t.tier)).toEqual(["STANDARD", "EXPRESS"]);
+    });
+
+    it("widens etaMinDays/etaMaxDays to the honest range across every rule sharing a tier, rather than picking one", async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([
+          ruleDoc({ serviceTier: "STANDARD", purpose: "TOURIST", etaMinDays: 5, etaMaxDays: 8 }),
+          ruleDoc({ serviceTier: "STANDARD", purpose: "BUSINESS", etaMinDays: 10, etaMaxDays: 15 }),
+        ]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "DE");
+      const standard = dest.serviceTiers.find((t: any) => t.tier === "STANDARD");
+      expect(standard.etaMinDays).toBe(5);
+      expect(standard.etaMaxDays).toBe(15);
+    });
+
+    it("lists every distinct entryType a tier has been published with", async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([
+          ruleDoc({ serviceTier: "STANDARD", purpose: "TOURIST", entryType: "SINGLE" }),
+          ruleDoc({ serviceTier: "STANDARD", purpose: "BUSINESS", entryType: "MULTIPLE" }),
+        ]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "DE");
+      const standard = dest.serviceTiers.find((t: any) => t.tier === "STANDARD");
+      expect(standard.entryTypes.sort()).toEqual(["MULTIPLE", "SINGLE"]);
+    });
+
+    it("reports a plain boolean for biometricsRequired/appointmentRequired when every rule agrees", async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([
+          ruleDoc({ purpose: "TOURIST", biometricsRequired: true, appointmentRequired: false }),
+          ruleDoc({ purpose: "BUSINESS", biometricsRequired: true, appointmentRequired: false }),
+        ]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "DE");
+      expect(dest.biometricsRequired).toBe(true);
+      expect(dest.appointmentRequired).toBe(false);
+    });
+
+    it('reports "VARIES" (never silently picking one rule) when biometrics/appointment disagree across purposes', async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([
+          ruleDoc({ purpose: "TOURIST", biometricsRequired: false, appointmentRequired: false }),
+          ruleDoc({ purpose: "BUSINESS", biometricsRequired: true, appointmentRequired: true }),
+        ]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "DE");
+      expect(dest.biometricsRequired).toBe("VARIES");
+      expect(dest.appointmentRequired).toBe("VARIES");
+    });
+
+    it("startingCost is the single cheapest total across every published rule, with gstApplicable true only for an itemised winner with a service fee", async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([
+          ruleDoc({
+            serviceTier: "STANDARD",
+            embassyFeeInr: 5000,
+            vfsFeeInr: 1500,
+            plumtripsServiceFeeInr: 2000,
+          }),
+          ruleDoc({
+            serviceTier: "SUPER_PRIORITY",
+            purpose: "BUSINESS",
+            embassyFeeInr: 5000,
+            vfsFeeInr: 1500,
+            plumtripsServiceFeeInr: 6000,
+          }),
+        ]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "DE");
+      // STANDARD: 5000 + 1500 + 2000 + 18% GST on 2000 (360) = 8860
+      expect(dest.startingCost.amountInr).toBe(8860);
+      expect(dest.startingCost.gstApplicable).toBe(true);
+      expect(dest.startingCost.displayMode).toBe("ITEMISED");
+
+      const standardTier = dest.serviceTiers.find((t: any) => t.tier === "STANDARD");
+      expect(standardTier.startingFromInr).toBe(8860);
+      expect(standardTier.gstApplicable).toBe(true);
+    });
+
+    it("startingCost has gstApplicable false for an INDICATIVE winner (no itemised fee components)", async () => {
+      visaRuleFindMock.mockReturnValue(
+        findChain([
+          ruleDoc({
+            embassyFeeInr: undefined,
+            vfsFeeInr: undefined,
+            plumtripsServiceFeeInr: undefined,
+            indicativeVisaCostInr: 1200,
+          }),
+        ]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "DE");
+      expect(dest.startingCost.amountInr).toBe(1200);
+      expect(dest.startingCost.gstApplicable).toBe(false);
+      expect(dest.startingCost.displayMode).toBe("INDICATIVE");
+    });
+
+    it("joins heroImageUrl alongside thumbnailUrl from the same PUBLISHED-only VisaDestinationContent row", async () => {
+      visaRuleFindMock.mockReturnValue(findChain([ruleDoc({ destinationIso2: "AE" })]));
+      visaContentFindMock.mockReturnValue(
+        findChain([{ destinationIso2: "AE", thumbnailUrl: "https://s3/ae-thumb.jpg", heroImageUrl: "https://s3/ae-hero.jpg" }]),
+      );
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "AE");
+      expect(dest.thumbnailUrl).toBe("https://s3/ae-thumb.jpg");
+      expect(dest.heroImageUrl).toBe("https://s3/ae-hero.jpg");
+    });
+
+    it("reports both image URLs as null when no PUBLISHED content row exists", async () => {
+      visaRuleFindMock.mockReturnValue(findChain([ruleDoc({ destinationIso2: "AE" })]));
+      const res = await request(makeApp()).get("/destinations");
+      const dest = res.body.destinations.find((d: any) => d.iso2 === "AE");
+      expect(dest.thumbnailUrl).toBeNull();
+      expect(dest.heroImageUrl).toBeNull();
     });
   });
 });
