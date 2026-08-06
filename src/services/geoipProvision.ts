@@ -76,9 +76,9 @@ const EDITION_ID = "GeoLite2-City";
  * ──────────────────────────────────────────────────────────────────────── */
 
 /** MaxMind build date, `YYYYMMDD`. Empty = latest (UNPINNED — see above). */
-const PINNED_BUILD_DATE = "";
+const PINNED_BUILD_DATE = "20260804";
 /** Lowercase hex SHA-256 of the .tar.gz. Empty = unpinned (see above). */
-const PINNED_SHA256 = "";
+const PINNED_SHA256 = "83bc1378c56dc56b5c6b0728707f8e7d70b1383a7ec4b92b4a994cd41b2986ff";
 
 const BUILD_DATE = (process.env.GEOIP_DB_DATE || PINNED_BUILD_DATE).trim();
 const EXPECTED_SHA256 = (process.env.GEOIP_DB_SHA256 || PINNED_SHA256).trim().toLowerCase();
