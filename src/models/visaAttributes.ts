@@ -125,8 +125,20 @@ export function evaluateApplicantCondition(
   profile: Partial<VisaApplicantProfile> | null | undefined,
 ): boolean {
   const value = (profile as any)?.[cond.field];
-  if (cond.in !== undefined) return cond.in.includes(value as any);
+  // `equals` checked first, deliberately: a condition persisted through
+  // Mongoose (VisaApplicantPredicateConditionSchema's `in` is an array-type
+  // path) comes back with `in: []` even when only `equals` was ever set on
+  // it — an empty array, not undefined. Checking `cond.in !== undefined`
+  // first (as this used to) treats that Mongoose-defaulted `[]` as a real
+  // "must be one of these values" condition, which `[].includes(value)`
+  // can never satisfy — silently failing every `equals`-only condition that
+  // had been saved to the DB, even though the exact same object literal
+  // evaluates correctly in memory (see visaAttributes.test.ts, which never
+  // caught this because its predicates are plain object literals, never
+  // round-tripped through the schema). `equals` has no array default, so
+  // `!== undefined` on it is reliable regardless of persistence.
   if (cond.equals !== undefined) return value === cond.equals;
+  if (cond.in !== undefined && cond.in.length > 0) return cond.in.includes(value as any);
   return false;
 }
 

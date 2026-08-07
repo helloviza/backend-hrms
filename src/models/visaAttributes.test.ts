@@ -42,6 +42,19 @@ describe("evaluateApplicantPredicate", () => {
     const predicate = [{ field: "holdsUsVisa" as const }];
     expect(evaluateApplicantPredicate(predicate, { holdsUsVisa: true })).toBe(false);
   });
+
+  it("still matches an `equals` condition once Mongoose has round-tripped it (in: [] present, not undefined)", () => {
+    // Reproduces the real shape read back from the DB: the schema's `in`
+    // path is an array type, so Mongoose defaults it to [] on every
+    // condition even when only `equals` was ever authored — an `equals`
+    // condition arrives with BOTH fields set, not just `equals`. Found live
+    // via /visa/requirements browser verification (2026-08-07): every
+    // `equals`-only appliesWhen condition in the DB was permanently
+    // unsatisfiable before this fix, regardless of applicant profile.
+    const predicate = [{ field: "maritalStatus" as const, equals: "MARRIED", in: [] }];
+    expect(evaluateApplicantPredicate(predicate, { maritalStatus: "MARRIED" })).toBe(true);
+    expect(evaluateApplicantPredicate(predicate, { maritalStatus: "SINGLE" })).toBe(false);
+  });
 });
 
 describe("selectMostSpecificRule — the Canada case (task brief §5)", () => {

@@ -74,6 +74,13 @@ export interface HydratedChecklistGroupSummary {
   label: string;
   requirement: "REQUIRED" | "CONDITIONAL";
   docCodes: string[];
+  // Corridor-desk restructure (2026-08-07) — human-readable names parallel
+  // to docCodes (same index), so a group-based checklist UI (one row per
+  // logical requirement, per requirements/DocumentChecklist.tsx) can list
+  // "Bank statement, Employment letter" without a second lookup. Falls back
+  // to the raw code when a docCode isn't in the catalogue (same fallback
+  // hydrateDocumentRow already uses for the flat `documents` list below).
+  docNames: string[];
   condition?: string;
   specification?: string;
   templateCode?: string;
@@ -138,6 +145,7 @@ export function hydrateVisaChecklist(
       label: item.label,
       requirement: item.requirement,
       docCodes: [...item.docTypeCodes],
+      docNames: item.docTypeCodes.map((code) => getVisaDocumentCodeDef(code)?.name ?? code),
       countsTowardCompleteness: itemCountsTowardCompleteness(item),
     };
     if (item.condition) group.condition = item.condition;

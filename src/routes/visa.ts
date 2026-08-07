@@ -105,6 +105,7 @@ import {
 import { maskTailId } from "../utils/piiMask.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
+import VisaTemplate from "../models/VisaTemplate.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import {
@@ -185,12 +186,22 @@ function serviceTierRank(tier: string): number {
 // (this shape plus destination/purpose, since a by-id caller doesn't
 // already know those the way a by-destination-and-purpose caller does).
 // Document checklist hydration and fee computation happen here, once, so
-// neither route can drift from the other. No applicantProfile is passed —
-// nobody has selected a traveller yet at this stage of the flow, so the
-// resolver's "no applicant known yet" mode returns every requirement
-// unfiltered (see utils/visaChecklistResolver.ts's own doc comment).
-function mapRuleToVariant(r: any) {
-  const checklist = hydrateVisaChecklist(r);
+// neither route can drift from the other.
+//
+// applicantProfile (corridor-desk restructure, 2026-08-07) — optional,
+// forwarded to hydrateVisaChecklist verbatim. GET /rules (the variant-
+// comparison list, screen 2 step 2) never passes one — nobody's answered
+// any attribute question yet at that point, so every variant's checklist
+// stays the full unfiltered preview, same as always. GET /rules/:id now
+// accepts one (see that route below) so the requirements page can filter
+// the SELECTED variant's checklist live as attribute answers change.
+// totalRequirementCount is a SECOND, always-unfiltered hydration — cheap
+// (pure in-memory re-resolve of data already fetched, no extra DB call) —
+// so "N requirements — filtered from M" always has both numbers, whether
+// or not a profile was supplied for this call.
+function mapRuleToVariant(r: any, opts: { applicantProfile?: Partial<VisaApplicantProfile> | null } = {}) {
+  const checklist = hydrateVisaChecklist(r, { applicantProfile: opts.applicantProfile });
+  const totalRequirementCount = hydrateVisaChecklist(r).documentGroups.length;
   return {
     ruleId: String(r._id),
     entryType: r.entryType,
@@ -207,6 +218,7 @@ function mapRuleToVariant(r: any) {
     biometricsRequired: r.biometricsRequired,
     documents: checklist.documents,
     documentGroups: checklist.documentGroups,
+    totalRequirementCount,
     // Screen 3 (ApplyPage) reads this off GET /rules/:id to know which
     // applicant-profile questions the SELECTED rule actually depends on —
     // task brief §3: "ask the rest only when some requirement in the
@@ -214,6 +226,46 @@ function mapRuleToVariant(r: any) {
     applicantAttributeFieldsReferenced: getReferencedApplicantAttributeFields(r),
     fee: computeVisaFeeBlock(r),
   };
+}
+
+// Query-string -> Partial<VisaApplicantProfile>, for GET /rules/:id's
+// optional live-filtering params. Returns undefined (not {}) when NONE of
+// the recognised params are present at all — that's the signal
+// mapRuleToVariant/hydrateVisaChecklist treat as "no applicant known yet"
+// (bypass filtering entirely), preserving every existing caller's exact
+// current behaviour (ApplyPage's own GET /rules/:id call never sends these).
+// Reuses the exact enum/boolean validation POST /requests' own
+// validateApplicantProfileAnswer applies to a JSON body — same whitelist,
+// different transport (query strings, so booleans arrive as "true"/"false").
+function parseApplicantProfileFromQuery(query: any): Partial<VisaApplicantProfile> | undefined {
+  const profile: Partial<VisaApplicantProfile> = {};
+  let any = false;
+
+  if (query.employmentStatus != null && VISA_EMPLOYMENT_STATUSES.includes(query.employmentStatus)) {
+    profile.employmentStatus = query.employmentStatus;
+    any = true;
+  }
+  if (query.sponsorType != null && VISA_SPONSOR_TYPES.includes(query.sponsorType)) {
+    profile.sponsorType = query.sponsorType;
+    any = true;
+  }
+  if (query.invitationSource != null && VISA_INVITATION_SOURCES.includes(query.invitationSource)) {
+    profile.invitationSource = query.invitationSource;
+    any = true;
+  }
+  if (query.maritalStatus != null && VISA_MARITAL_STATUSES.includes(query.maritalStatus)) {
+    profile.maritalStatus = query.maritalStatus;
+    any = true;
+  }
+  for (const key of ["isMinor", "isSponsored", "holdsUsVisa", "holdsSchengenVisa"] as const) {
+    const raw = query[key];
+    if (raw === "true" || raw === "false") {
+      profile[key] = raw === "true";
+      any = true;
+    }
+  }
+
+  return any ? profile : undefined;
 }
 
 // A destination-level boolean field (biometricsRequired, appointmentRequired)
@@ -319,9 +371,20 @@ function updateCheapest(
  *     see DestinationCard.tsx on the frontend for where that fallback is
  *     applied.
  * ───────────────────────────────────────────────────────────────────── */
-router.get("/destinations", async (_req: any, res: any) => {
+router.get("/destinations", async (req: any, res: any) => {
   try {
-    const rules = await VisaRule.find({ status: "PUBLISHED" })
+    // Corridor-desk restructure (2026-08-07) — optional ?iso2= filter, added
+    // so RequirementsPage.tsx's step-1 purpose picker can fetch a SINGLE
+    // destination's summary (name/purposes/photo/etc.) without pulling all
+    // ~35 published destinations just to read one. Filters the SAME initial
+    // VisaRule query the full-list path already runs — everything below
+    // this line is completely unchanged, so a single-destination response
+    // is byte-for-byte the same shape as one entry of the full array.
+    const iso2Filter = String(req.query?.iso2 || "").trim().toUpperCase();
+    const ruleFilter: Record<string, unknown> = { status: "PUBLISHED" };
+    if (iso2Filter) ruleFilter.destinationIso2 = iso2Filter;
+
+    const rules = await VisaRule.find(ruleFilter)
       .select(
         "destinationIso2 destinationName visaCategory purpose serviceTier entryType " +
           "etaMinDays etaMaxDays etaBasis appointmentRequired biometricsRequired " +
@@ -544,7 +607,7 @@ router.get("/rules", async (req: any, res: any) => {
       (a, b) => serviceTierRank(a.serviceTier) - serviceTierRank(b.serviceTier),
     );
 
-    const variants = rules.map(mapRuleToVariant);
+    const variants = rules.map((r) => mapRuleToVariant(r));
 
     const nationalityCountry = getCountryByIso2(nationality);
     const nationalityInfo = {
@@ -580,6 +643,16 @@ router.get("/rules", async (req: any, res: any) => {
  * array (mapRuleToVariant, including the computed fee block) plus
  * destination/purpose at the top level, since a by-destination-and-purpose
  * caller already knows those but a by-id caller doesn't.
+ *
+ * Applicant-attribute query params (corridor-desk restructure, 2026-08-07)
+ * — optional: employmentStatus, sponsorType, invitationSource,
+ * maritalStatus, isMinor, isSponsored, holdsUsVisa, holdsSchengenVisa (see
+ * parseApplicantProfileFromQuery). When any are present, `documents/
+ * documentGroups` in the response are FILTERED against them (the
+ * requirements page's live "N requirements — filtered from M" panel);
+ * `totalRequirementCount` is always the unfiltered baseline regardless.
+ * When none are present, behaviour is byte-for-byte what it always was —
+ * ApplyPage's own call site never sends these, so it's unaffected.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/rules/:id", async (req: any, res: any) => {
   try {
@@ -596,17 +669,87 @@ router.get("/rules/:id", async (req: any, res: any) => {
       return res.status(404).json({ error: "Visa rule not found" });
     }
 
+    const applicantProfile = parseApplicantProfileFromQuery(req.query || {});
+
     res.json({
       ok: true,
       rule: {
         destination: rule.destinationIso2,
         purpose: rule.purpose,
-        ...mapRuleToVariant(rule),
+        ...mapRuleToVariant(rule, { applicantProfile }),
       },
     });
   } catch (err: any) {
     console.error("[visa rules/:id GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load visa rule" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /templates?codes=A,B,C — bulk existence check, not the file itself.
+ * Corridor-desk restructure (2026-08-07) — "requirement rows referencing a
+ * VisaTemplate should offer it... render the link only when an s3Key
+ * exists, and say nothing when it doesn't". A checklist can reference
+ * several templateCodes at once (one per documentGroup); this answers
+ * "which of these actually have a file" in one round trip instead of N,
+ * without ever exposing the raw s3Key to the client — that's only ever
+ * resolved into a short-TTL presigned URL, on demand, by
+ * GET /templates/:code/url below.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/templates", async (req: any, res: any) => {
+  try {
+    const codes = String(req.query?.codes || "")
+      .split(",")
+      .map((c) => c.trim().toUpperCase())
+      .filter(Boolean);
+    if (codes.length === 0) return res.json({ ok: true, templates: [] });
+
+    const rows = await VisaTemplate.find({ code: { $in: codes } })
+      .select("code name s3Key")
+      .lean();
+
+    res.json({
+      ok: true,
+      templates: rows.map((t) => ({ code: t.code, name: t.name, hasFile: Boolean(t.s3Key) })),
+    });
+  } catch (err: any) {
+    console.error("[visa templates GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load templates" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /templates/:code/url — short-TTL presigned GET, forceDownload (a
+ * form template should save, not render inline — same distinction
+ * PutObjectCommand's own `view` vs `forceDownload` option draws for the
+ * CSTEP Tour Proposal PDF's explicit Download button). 404s both for an
+ * unknown code and for a real template row with no file yet — s3Key is
+ * nullable by design (VisaTemplate.ts's own header: "12 templates are
+ * seeded with no files"), and this route never distinguishes the two
+ * cases to the client, same posture as every other 404 in this router.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/templates/:code/url", async (req: any, res: any) => {
+  try {
+    const code = String(req.params.code || "").trim().toUpperCase();
+    if (!code) return res.status(404).json({ error: "Template not found" });
+
+    const template = await VisaTemplate.findOne({ code }).lean();
+    if (!template || !template.s3Key) {
+      return res.status(404).json({ error: "Template not found" });
+    }
+
+    const url = await presignGetObject({
+      bucket: env.S3_BUCKET,
+      key: template.s3Key,
+      filename: `${template.name || code}.pdf`,
+      expiresInSeconds: env.PRESIGN_TTL,
+      forceDownload: true,
+    });
+
+    res.json({ ok: true, url, expiresIn: env.PRESIGN_TTL });
+  } catch (err: any) {
+    console.error("[visa templates/:code/url GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to generate template URL" });
   }
 });
 
