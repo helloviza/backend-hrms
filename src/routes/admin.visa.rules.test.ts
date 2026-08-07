@@ -1,10 +1,14 @@
 // Route-level coverage for routes/admin.visa.rules.ts — the fee/rule
 // management API. Same in-memory-collection mocking approach as
-// admin.visa.test.ts (mongodb-memory-server can't start in this
-// environment): every model this router touches is backed by a small
+// admin.visa.test.ts: every model this router touches is backed by a small
 // generic store with real find/findById/findOne/create semantics, so the
 // duplicate-key guard, the publish-completeness gate, and the audit trail
 // are actually exercised, not just asserted against a hand-picked fixture.
+//
+// NOTE: that approach is a convention, not a constraint — mongodb-memory-
+// server does start here (see utils/visaPredicatePersistence.test.ts), so
+// real persistence is available if this test ever needs schema defaults or
+// casting to be real.
 //
 // requirePermission itself is NOT mocked — same reasoning as
 // admin.visa.test.ts: these tests exist specifically to prove every route

@@ -1,10 +1,12 @@
 // Unit coverage for backfillVisaRequestCustomerId — the exported, testable
 // core of the VisaRequest/VisaApplication.customerId backfill. VisaRequest,
 // VisaApplication and User are backed by small in-memory collections (same
-// convention as this directory's other migration tests — mongodb-memory-
-// server can't start in this environment), so the idempotency, "unresolved
-// raiser" and dry-run-vs-apply behaviour are actually exercised, not just
-// asserted against a hand-picked fixture.
+// convention as this directory's other migration tests), so the idempotency,
+// "unresolved raiser" and dry-run-vs-apply behaviour are actually exercised,
+// not just asserted against a hand-picked fixture. NOTE: the mocks are a
+// convention, not a constraint — mongodb-memory-server does start here (see
+// utils/visaPredicatePersistence.test.ts), so real persistence is available
+// if this test ever needs schema defaults or casting to be real.
 //
 // main()/mongoose.connect are never invoked here — the module guards its
 // auto-run behind `process.env.VITEST !== "true"` (set automatically by the

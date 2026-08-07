@@ -1,13 +1,17 @@
 // Route-level coverage for Phase 4a: POST/GET .../documents, GET
 // /documents/:id/url, DELETE /documents/:id, GET .../travel-bookings.
-// Same approach as visa.requests.test.ts — mongodb-memory-server can't
-// start in this sandbox (confirmed pre-existing, unrelated), so
+// Same approach as visa.requests.test.ts:
 // VisaApplication/VisaDocument/TravellerProfile/VisaRequest/TravelBooking
 // are backed by small in-memory collections (equality + $in matching)
 // rather than canned per-call responses, so tenancy/versioning/date-range
 // behaviour is actually exercised. uploadBufferToS3/presignGetObject/
 // logger are mocked — no real AWS calls, and the presign audit log is
 // directly assertable.
+//
+// NOTE: those collections are a convention, not a constraint — mongodb-
+// memory-server does start here (see utils/visaPredicatePersistence.test.ts),
+// so real persistence is available if this test ever needs schema defaults
+// or casting to be real.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 

@@ -1,8 +1,11 @@
 // Unit coverage for the Phase 10a visa-checklist-model-v2 migration —
 // mocked in-memory collections, same convention as this directory's other
-// migration tests (mongodb-memory-server can't start in this environment).
-// main()/mongoose.connect are never invoked — the module guards its
-// auto-run behind process.env.VITEST !== "true".
+// migration tests. main()/mongoose.connect are never invoked — the module
+// guards its auto-run behind process.env.VITEST !== "true".
+// NOTE: the mocks are a convention, not a constraint — mongodb-memory-server
+// does start here (see utils/visaPredicatePersistence.test.ts), so real
+// persistence is available if this test ever needs schema defaults or
+// casting to be real.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 

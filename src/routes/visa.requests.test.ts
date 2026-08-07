@@ -1,17 +1,20 @@
 // Route-level coverage for POST/GET /api/visa/requests and GET
-// /api/visa/travellers. mongodb-memory-server (the real-mongod pattern
-// used by utils/plutoConversation.realmongo.integration.test.ts) can't
-// start in this environment — confirmed by that pre-existing test failing
-// identically, not something this change caused. Instead: VisaRule,
-// TravellerProfile, VisaRequest and VisaApplication are backed by a small
-// generic in-memory collection (equality + $in matching, the only filter
-// shapes this router issues) rather than per-call canned responses, so
-// relational/tenancy behaviour (traveller-count mismatches, cross-workspace
-// leakage, N travellers -> N applications) is actually exercised, not just
-// asserted against a hand-picked fixture. recomputeRequestStatus is a
-// spy — its own rollup logic has dedicated coverage in
-// models/VisaRequest.test.ts; here we only confirm the route calls it
-// (and never assigns VisaRequest.status directly).
+// /api/visa/travellers. VisaRule, TravellerProfile, VisaRequest and
+// VisaApplication are backed by a small generic in-memory collection
+// (equality + $in matching, the only filter shapes this router issues)
+// rather than per-call canned responses, so relational/tenancy behaviour
+// (traveller-count mismatches, cross-workspace leakage, N travellers ->
+// N applications) is actually exercised, not just asserted against a
+// hand-picked fixture. recomputeRequestStatus is a spy — its own rollup
+// logic has dedicated coverage in models/VisaRequest.test.ts; here we only
+// confirm the route calls it (and never assigns VisaRequest.status
+// directly).
+//
+// NOTE: that collection is a convention, not a constraint — mongodb-memory-
+// server does start here (see utils/visaPredicatePersistence.test.ts and
+// utils/plutoConversation.realmongo.integration.test.ts), so real
+// persistence is available if this test ever needs schema defaults or
+// casting to be real.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 

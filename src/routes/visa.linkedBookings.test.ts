@@ -2,12 +2,16 @@
 // linked-bookings, and the satisfiedByBooking checklist hydration it feeds
 // (routes/visa.ts's hydrateDocumentRequirements via GET /requests/:id).
 // Same in-memory collection approach as visa.documents.test.ts/
-// visa.passportExtraction.test.ts — mongodb-memory-server can't start in
-// this sandbox (confirmed pre-existing, unrelated). VisaApplication.findOne
+// visa.passportExtraction.test.ts. VisaApplication.findOne
 // here uses the dual-mode "live doc with .save(), or .lean() copy" result
 // from visa.passportExtraction.test.ts, since the PATCH route (like PATCH
 // /documents/:id/extracted-fields) fetches a live document and saves it —
 // every other collection only ever needs the .lean() path.
+//
+// NOTE: that approach is a convention, not a constraint — mongodb-memory-
+// server does start here (see utils/visaPredicatePersistence.test.ts), so
+// real persistence is available if this test ever needs schema defaults or
+// casting to be real.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 

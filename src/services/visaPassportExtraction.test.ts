@@ -1,10 +1,12 @@
 // Coverage for the Phase 4b orchestration service: Stage 1 (Gemini, mocked
 // here) -> Stage 2 (the REAL utils/mrz.ts parser, not mocked — this is what
 // proves the two stages wire together correctly) -> persisted onto the
-// VisaDocument. No network: extractPassportGemini and s3Upload are mocked;
-// mongodb-memory-server can't start in this sandbox (confirmed pre-existing,
-// unrelated), so VisaDocument is backed by a tiny in-memory store, same
-// convention as routes/visa.documents.test.ts.
+// VisaDocument. No network: extractPassportGemini and s3Upload are mocked,
+// and VisaDocument is backed by a tiny in-memory store, same convention as
+// routes/visa.documents.test.ts. NOTE: that store is a convention, not a
+// constraint — mongodb-memory-server does start here (see
+// utils/visaPredicatePersistence.test.ts), so real persistence is available
+// if this test ever needs schema defaults or casting to be real.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 import { ApiError } from "@google/genai";

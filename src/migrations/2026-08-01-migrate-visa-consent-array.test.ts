@@ -1,9 +1,12 @@
 // Unit coverage for migrateVisaConsentArray — the exported, testable core of
 // the v1->v2 consent migration. VisaRequest is backed by a small in-memory
 // collection (same convention as every other migration/route test in this
-// module — mongodb-memory-server can't start in this environment), so the
-// idempotency and missing-actor skip logic are actually exercised, not just
-// asserted against a hand-picked fixture.
+// module), so the idempotency and missing-actor skip logic are actually
+// exercised, not just asserted against a hand-picked fixture. NOTE: the
+// mocks are a convention, not a constraint — mongodb-memory-server does
+// start here (see utils/visaPredicatePersistence.test.ts), so real
+// persistence is available if this test ever needs schema defaults or
+// casting to be real.
 //
 // main()/mongoose.connect are never invoked here — the module guards its
 // auto-run behind `process.env.VITEST !== "true"` (set automatically by the

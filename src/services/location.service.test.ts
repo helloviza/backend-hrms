@@ -6,8 +6,11 @@
 // increments, and the hash value itself), not against a spy on an internal.
 //
 // ActorLocation is backed by a small in-memory collection with real upsert
-// semantics — the house convention (see routes/visa.cancel.test.ts;
-// mongodb-memory-server can't start in this environment).
+// semantics — the house convention (see routes/visa.cancel.test.ts). NOTE:
+// that convention is a choice, not a constraint — mongodb-memory-server does
+// start here (see utils/visaPredicatePersistence.test.ts), so real
+// persistence is available if this test ever needs schema defaults or
+// casting to be real.
 //
 // The geo database is a 70 MB non-redistributable download, so the tests that
 // need one are gated on it actually being provisioned. Everything that can be

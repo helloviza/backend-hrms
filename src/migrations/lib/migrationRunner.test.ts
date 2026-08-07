@@ -2,8 +2,10 @@
 // retrofitted migration's main() goes through so the ledger (models/
 // MigrationRun.ts) is a byproduct of running, not a separate step. Backed
 // by a small in-memory collection (same convention as scripts/
-// import-visa-checklist-rules.test.ts — mongodb-memory-server can't start
-// in this environment).
+// import-visa-checklist-rules.test.ts). NOTE: the mock is a convention, not
+// a constraint — mongodb-memory-server does start here (see
+// utils/visaPredicatePersistence.test.ts), so real persistence is available
+// if this test ever needs schema defaults or casting to be real.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import mongoose from "mongoose";
 

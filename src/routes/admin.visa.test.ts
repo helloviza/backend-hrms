@@ -1,11 +1,15 @@
 // Route-level coverage for routes/admin.visa.ts — the concierge console
 // API. Same in-memory-collection mocking approach as
-// visa.submit.test.ts/visa.requests.test.ts (mongodb-memory-server can't
-// start in this environment): every model this router touches is backed by
-// a small generic store with real find/findById/findOneAndUpdate semantics,
-// so the state machine, the paired action_required fields, and the cost
-// variance gate are actually exercised, not just asserted against a
-// hand-picked fixture.
+// visa.submit.test.ts/visa.requests.test.ts: every model this router touches
+// is backed by a small generic store with real find/findById/
+// findOneAndUpdate semantics, so the state machine, the paired
+// action_required fields, and the cost variance gate are actually exercised,
+// not just asserted against a hand-picked fixture.
+//
+// NOTE: that approach is a convention, not a constraint — mongodb-memory-
+// server does start here (see utils/visaPredicatePersistence.test.ts), so
+// real persistence is available if this test ever needs schema defaults or
+// casting to be real.
 //
 // requirePermission itself is NOT mocked — these tests exist specifically
 // to prove the READ/WRITE/FULL gate is real, so the actual middleware runs

@@ -1,11 +1,15 @@
 // Route-level coverage for routes/admin.visa.rules.importExport.ts. Same
 // express+supertest+in-memory-collection convention as routes/
-// admin.visa.rules.test.ts (mongodb-memory-server can't start in this
-// environment) — every model this router touches is backed by a small
-// generic store with real find/save semantics, and the exports/imports go
+// admin.visa.rules.test.ts — every model this router touches is backed by a
+// small generic store with real find/save semantics, and the exports/imports go
 // through the ACTUAL multer+ExcelJS pipeline (real xlsx buffers, real
 // multipart uploads), not a hand-picked in-memory fixture, so the
 // round-trip-losslessness property is genuinely exercised end to end.
+//
+// NOTE: that convention is a choice, not a constraint — mongodb-memory-server
+// does start here (see utils/visaPredicatePersistence.test.ts), so real
+// persistence is available if this test ever needs schema defaults or
+// casting to be real.
 //
 // requirePermission itself is NOT mocked — same reasoning as
 // admin.visa.rules.test.ts: proves every route here is gated at FULL.

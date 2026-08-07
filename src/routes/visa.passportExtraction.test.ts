@@ -5,8 +5,12 @@
 // tests ROUTE behaviour (gating, confirmation, ownership, field mapping),
 // not the extraction pipeline itself (see services/visaPassportExtraction.
 // test.ts for that, and utils/mrz.test.ts for the parser). Same in-memory
-// collection approach as routes/visa.documents.test.ts; mongodb-memory-
-// server can't start in this sandbox (confirmed pre-existing, unrelated).
+// collection approach as routes/visa.documents.test.ts.
+//
+// NOTE: that approach is a convention, not a constraint — mongodb-memory-
+// server does start here (see utils/visaPredicatePersistence.test.ts), so
+// real persistence is available if this test ever needs schema defaults or
+// casting to be real.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 

@@ -3,10 +3,14 @@
 // when it isn't — this file covers the auto-response-tracking/auto-clear
 // side effect on POST /applications/:applicationId/documents (routes/
 // visa.ts's recordCustomerResponseDuringActionRequired). Same in-memory-
-// collection approach as visa.documents.test.ts (mongodb-memory-server
-// can't start in this environment), with VisaApplication's mock extended to
-// cover findById/findByIdAndUpdate/clearActionRequired, which that sibling
-// file's own mock doesn't need.
+// collection approach as visa.documents.test.ts, with VisaApplication's mock
+// extended to cover findById/findByIdAndUpdate/clearActionRequired, which
+// that sibling file's own mock doesn't need.
+//
+// NOTE: that approach is a convention, not a constraint — mongodb-memory-
+// server does start here (see utils/visaPredicatePersistence.test.ts), so
+// real persistence is available if this test ever needs schema defaults or
+// casting to be real.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 

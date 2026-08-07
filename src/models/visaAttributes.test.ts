@@ -1,7 +1,12 @@
 // Unit coverage for visaAttributes.ts's predicate evaluator, most-specific
 // rule selection, DOB->age derivation, and the corporate-defaults deriver.
-// All pure functions — no DB, no mongoose connection needed.
-import { describe, it, expect } from "vitest";
+// Nearly all pure functions — no DB needed. The one exception is the
+// round-trip block at the bottom, which stands up a real mongod because the
+// thing it pins is a shape Mongoose produces, not one we can author.
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import mongoose from "mongoose";
+import { MongoMemoryServer } from "mongodb-memory-server";
+import VisaRule from "./VisaRule.js";
 import {
   evaluateApplicantPredicate,
   selectMostSpecificRule,
@@ -43,15 +48,62 @@ describe("evaluateApplicantPredicate", () => {
     expect(evaluateApplicantPredicate(predicate, { holdsUsVisa: true })).toBe(false);
   });
 
-  it("still matches an `equals` condition once Mongoose has round-tripped it (in: [] present, not undefined)", () => {
-    // Reproduces the real shape read back from the DB: the schema's `in`
-    // path is an array type, so Mongoose defaults it to [] on every
-    // condition even when only `equals` was ever authored — an `equals`
-    // condition arrives with BOTH fields set, not just `equals`. Found live
-    // via /visa/requirements browser verification (2026-08-07): every
-    // `equals`-only appliesWhen condition in the DB was permanently
-    // unsatisfiable before this fix, regardless of applicant profile.
-    const predicate = [{ field: "maritalStatus" as const, equals: "MARRIED", in: [] }];
+});
+
+// The regression above (found live via /visa/requirements browser
+// verification, 2026-08-07: every `equals`-only appliesWhen condition in the
+// DB was permanently unsatisfiable) is about a shape Mongoose PRODUCES, not a
+// shape we author. Writing that shape as a literal here would assert our
+// belief about Mongoose rather than Mongoose's actual behaviour — and would
+// keep passing unchanged if the defaulting ever went away, leaving a test
+// that guards nothing. So this block persists a real VisaRule and evaluates
+// whatever comes back out of the database.
+//
+// utils/visaPredicatePersistence.test.ts covers the same hazard across the
+// resolver and the full production read paths; this is the evaluator's own
+// round-trip, kept next to its unit tests.
+describe("evaluateApplicantPredicate — against a predicate Mongoose round-tripped", () => {
+  let mongod: MongoMemoryServer;
+
+  beforeAll(async () => {
+    mongod = await MongoMemoryServer.create();
+    await mongoose.connect(mongod.getUri());
+  }, 120_000);
+
+  afterAll(async () => {
+    await mongoose.disconnect();
+    await mongod.stop();
+  });
+
+  it("still matches an `equals` condition that was saved and read back", async () => {
+    const created = await VisaRule.create({
+      nationality: "IN",
+      destinationIso2: "DE",
+      purpose: "TOURIST",
+      entryType: "SINGLE",
+      serviceTier: "STANDARD",
+      variantKey: "EQUALS_ROUNDTRIP",
+      destinationName: "Germany",
+      productClass: "VISA",
+      effectiveFrom: new Date("2026-01-01"),
+      // Authored with `equals` ONLY — no `in` anywhere in this payload.
+      applicability: [{ field: "maritalStatus", equals: "MARRIED" }],
+      documentGroups: [
+        { key: "PASSPORT", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["PASSPORT_ORIGINAL"] },
+      ],
+    });
+    const readBack: any = await VisaRule.findById(created._id).lean();
+    const predicate = readBack.applicability;
+
+    // The hazard, asserted from the database rather than assumed: Mongoose
+    // gives the array-typed `in` path an implicit [] on a condition that was
+    // never written with one. If this assertion ever fails, the defaulting
+    // behaviour changed — the evaluator is probably still fine, but the
+    // regression below no longer reproduces and this whole block needs
+    // re-deriving rather than deleting.
+    expect(predicate[0].equals).toBe("MARRIED");
+    expect(predicate[0].in).toEqual([]);
+
     expect(evaluateApplicantPredicate(predicate, { maritalStatus: "MARRIED" })).toBe(true);
     expect(evaluateApplicantPredicate(predicate, { maritalStatus: "SINGLE" })).toBe(false);
   });

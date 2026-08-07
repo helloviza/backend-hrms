@@ -1,8 +1,10 @@
 // Coverage for services/visaBillingSync.ts — the Phase 8 billing handoff.
 // Same in-memory-collection mocking approach as the rest of the visa test
-// suite (mongodb-memory-server can't start in this environment): every
-// model this service touches is backed by a small generic store with real
-// find/create/save semantics.
+// suite: every model this service touches is backed by a small generic
+// store with real find/create/save semantics. NOTE: that approach is a
+// convention, not a constraint — mongodb-memory-server does start here (see
+// utils/visaPredicatePersistence.test.ts), so real persistence is available
+// if this test ever needs schema defaults or casting to be real.
 //
 // models/ManualBooking.ts is mocked for its `default` (the Model — find/
 // create/save need to be fakeable) but its named export

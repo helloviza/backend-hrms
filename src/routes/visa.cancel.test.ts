@@ -1,12 +1,16 @@
 // Route-level coverage for POST /api/visa/requests/:id/cancel (the "Abandon"
 // action on screen 7 — track). Same in-memory-collection mocking approach as
-// visa.submit.test.ts (mongodb-memory-server can't start in this
-// environment) — VisaRequest is backed by a small generic store with real
-// find/findOneAndUpdate semantics, so the draft-only guard and the atomic
-// idempotency claim are actually exercised, not just asserted against a
-// hand-picked fixture. recomputeRequestStatus is a spy — its own rollup
+// visa.submit.test.ts — VisaRequest is backed by a small generic store with
+// real find/findOneAndUpdate semantics, so the draft-only guard and the
+// atomic idempotency claim are actually exercised, not just asserted against
+// a hand-picked fixture. recomputeRequestStatus is a spy — its own rollup
 // logic has dedicated coverage in models/VisaRequest.test.ts; here we only
 // confirm the route calls it.
+//
+// NOTE: that approach is a convention, not a constraint — mongodb-memory-
+// server does start here (see utils/visaPredicatePersistence.test.ts), so
+// real persistence is available if this test ever needs schema defaults or
+// casting to be real.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import mongoose from "mongoose";
 

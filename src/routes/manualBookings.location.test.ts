@@ -13,8 +13,11 @@
 //
 // ManualBooking / ActorLocation are backed by small in-memory stores with real
 // semantics — the house convention for this feature area (see
-// location.service.test.ts; mongodb-memory-server can't start in this
-// environment). The location service itself is NOT mocked away: tests 1 and 2
+// location.service.test.ts). That convention is a choice, not a constraint:
+// mongodb-memory-server does start here (see
+// utils/visaPredicatePersistence.test.ts), so real persistence is available
+// if this test ever needs schema defaults or casting to be real.
+// The location service itself is NOT mocked away: tests 1 and 2
 // run the real resolver end to end. Only test 3 swaps in a throw, because the
 // service's contract is that it never throws, so the route's last-resort catch
 // has no other way to be exercised.

@@ -1,9 +1,12 @@
 // Unit coverage for migrateVisaConciergeAssignments — the exported, testable
 // core of the Phase 9a assignment migration. VisaRequest/VisaApplication are
 // backed by small in-memory collections (same convention as every other
-// route/model test in this module — mongodb-memory-server can't start in
-// this environment), so the idempotency and per-application skip logic are
-// actually exercised, not just asserted against a hand-picked fixture.
+// route/model test in this module), so the idempotency and per-application
+// skip logic are actually exercised, not just asserted against a
+// hand-picked fixture. NOTE: the mocks are a convention, not a constraint —
+// mongodb-memory-server does start here (see
+// utils/visaPredicatePersistence.test.ts), so real persistence is available
+// if this test ever needs schema defaults or casting to be real.
 //
 // main()/mongoose.connect are never invoked here — the module guards its
 // auto-run behind `process.env.VITEST !== "true"` (set automatically by the

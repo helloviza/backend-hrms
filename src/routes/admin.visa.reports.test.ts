@@ -1,10 +1,13 @@
 // Route-level coverage for Phase 9d — routes/admin.visa.reports.ts (case
 // log, activity, status, progress exports). Same in-memory-collection
-// approach as the rest of the visa test suite (mongodb-memory-server can't
-// start in this environment): every model this router touches is backed
-// by a small generic store with real find/aggregate/sort/limit semantics,
-// so filter-narrowing, the row cap, and the risk sort are all genuinely
-// exercised, not just asserted against a hand-picked fixture.
+// approach as the rest of the visa test suite: every model this router
+// touches is backed by a small generic store with real
+// find/aggregate/sort/limit semantics, so filter-narrowing, the row cap, and
+// the risk sort are all genuinely exercised, not just asserted against a
+// hand-picked fixture. NOTE: that approach is a convention, not a constraint
+// — mongodb-memory-server does start here (see
+// utils/visaPredicatePersistence.test.ts), so real persistence is available
+// if this test ever needs schema defaults or casting to be real.
 //
 // requirePermission itself is NOT mocked — this file's own coverage
 // includes proving READ is sufficient and nothing higher is silently

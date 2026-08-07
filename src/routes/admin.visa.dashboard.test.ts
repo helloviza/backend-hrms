@@ -1,9 +1,11 @@
 // Route-level coverage for Phase 9f — routes/admin.visa.dashboard.ts (the
 // ops dashboard). Same in-memory-collection approach as the rest of the
-// visa test suite (mongodb-memory-server can't start in this environment),
-// with a small purpose-built $match/$group aggregation emulator — just
-// enough to run the exact pipelines this route issues, not a general Mongo
-// emulator.
+// visa test suite, with a small purpose-built $match/$group aggregation
+// emulator — just enough to run the exact pipelines this route issues, not
+// a general Mongo emulator. NOTE: that approach is a convention, not a
+// constraint — mongodb-memory-server does start here (see
+// utils/visaPredicatePersistence.test.ts), so real persistence is available
+// if this test ever needs schema defaults or casting to be real.
 //
 // requirePermission itself is NOT mocked — this file's own coverage
 // includes proving READ is sufficient (task brief).
