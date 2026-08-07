@@ -32,6 +32,11 @@ describe("computeVisaFeeBlock", () => {
 
     const gstLine = block.lineItems.find((l) => l.code === "GST");
     expect(gstLine?.amountInr).toBe(360); // 18% of 2000, not of 6500 or 7500
+    // The caption is interpolated from VISA_GST_RATE rather than written
+    // out (2026-08-08). Pinned verbatim here because it is customer-facing
+    // and because the whole point of interpolating it is that it can never
+    // disagree with the amount on the same line.
+    expect(gstLine?.label).toBe("GST (18% on service fee)");
 
     const embassyLine = block.lineItems.find((l) => l.code === "EMBASSY_FEE");
     const vfsLine = block.lineItems.find((l) => l.code === "VFS_FEE");

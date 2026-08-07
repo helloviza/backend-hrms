@@ -25,6 +25,7 @@ const {
   chainableRuleArray,
   chainableSortedPage,
   findByIdRule,
+  findOneRule,
   findOneContentDoc,
   deriveDisplayMode,
 } = vi.hoisted(() => {
@@ -32,6 +33,12 @@ const {
     return Object.entries(filter || {}).every(([key, cond]) => {
       if (key === "_id" && cond && typeof cond === "object" && "$in" in cond) {
         return (cond.$in as any[]).map(String).includes(String(rec._id));
+      }
+      // $ne — needed by publishReadinessGaps' duplicate-corridor query,
+      // which excludes the rule being published from its own conflict
+      // search.
+      if (cond && typeof cond === "object" && "$ne" in cond) {
+        return String(rec[key]) !== String((cond as any).$ne);
       }
       return String(rec[key]) === String(cond);
     });
@@ -110,6 +117,16 @@ const {
     return p;
   }
 
+  // findOne(filter).select(...).lean() over the rule store — the shape
+  // publishReadinessGaps' duplicate-corridor check uses.
+  function findOneRule(filter: Record<string, any>) {
+    const rec = _rules.query(filter)[0] ?? null;
+    const p: any = Promise.resolve(wrapRuleDoc(rec));
+    p.select = () => p;
+    p.lean = () => Promise.resolve(rec ? { ...rec } : null);
+    return p;
+  }
+
   function findOneContentDoc(filter: Record<string, any>) {
     const rec = _content.query(filter)[0] ?? null;
     const p: any = Promise.resolve(wrapDoc(rec));
@@ -176,6 +193,7 @@ const {
     chainableRuleArray,
     chainableSortedPage,
     findByIdRule,
+    findOneRule,
     findOneContentDoc,
     deriveDisplayMode,
   };
@@ -196,6 +214,7 @@ vi.mock("../models/VisaRule.js", async () => {
     default: {
       find: (filter: any) => chainableRuleArray(() => _rules.query(filter)),
       findById: (id: any) => findByIdRule(id),
+      findOne: (filter: any) => findOneRule(filter),
       create: async (doc: Record<string, any>) => {
         const dupe = _rules.query({
           nationality: doc.nationality,
@@ -745,6 +764,48 @@ describe("POST /rules/:id/publish", () => {
     expect(entries[0].action).toBe("PUBLISH");
     expect(entries[0].changes).toEqual([{ field: "status", from: "DRAFT", to: "PUBLISHED" }]);
   });
+
+  // ── Duplicate-corridor guard ───────────────────────────────────────
+  // Two PUBLISHED rules on one corridor key is what puts two "Standard"
+  // tier cards on /visa/requirements. The model's unique index does not
+  // prevent it, because that index includes entryType and this key does
+  // not — see publishReadinessGaps' own comment.
+
+  it("refuses to publish when a PUBLISHED rule already holds the same corridor key", async () => {
+    completeDraft({ status: "PUBLISHED" });
+    const twin = completeDraft();
+    const app = makeApp();
+    const res = await request(app).post(`/rules/${twin._id}/publish`);
+    expect(res.status).toBe(409);
+    expect(res.body.conflict).toMatch(/already covers DE TOURIST\/STANDARD/);
+    expect(_rules.get(twin._id).status).toBe("DRAFT");
+  });
+
+  it("still publishes a rule whose variantKey differs — Turkey's e-visa and sticker variants are both legitimate", async () => {
+    completeDraft({ status: "PUBLISHED", destinationIso2: "TR", variantKey: "E_VISA" });
+    const sticker = completeDraft({ destinationIso2: "TR", variantKey: "STICKER" });
+    const app = makeApp();
+    const res = await request(app).post(`/rules/${sticker._id}/publish`);
+    expect(res.status).toBe(200);
+    expect(_rules.get(sticker._id).status).toBe("PUBLISHED");
+  });
+
+  it("refuses when only entryType differs — UNSPECIFIED is a missing value, not a second product", async () => {
+    completeDraft({ status: "PUBLISHED", entryType: "MULTIPLE" });
+    const unspecified = completeDraft({ entryType: "UNSPECIFIED" });
+    const app = makeApp();
+    const res = await request(app).post(`/rules/${unspecified._id}/publish`);
+    expect(res.status).toBe(409);
+    expect(_rules.get(unspecified._id).status).toBe("DRAFT");
+  });
+
+  it("only PUBLISHED rules block — a DRAFT or RETIRED twin on the same key does not", async () => {
+    completeDraft({ status: "DRAFT" });
+    completeDraft({ status: "RETIRED" });
+    const r = completeDraft();
+    const app = makeApp();
+    expect((await request(app).post(`/rules/${r._id}/publish`)).status).toBe(200);
+  });
 });
 
 describe("POST /rules/:id/retire", () => {
@@ -944,6 +1005,50 @@ describe("POST /rules/bulk-publish", () => {
     expect(res.body.rejectedCount).toBe(1);
     expect(_rules.get(good._id).status).toBe("DRAFT"); // preview never writes
     expect(_ruleAudits.query({})).toHaveLength(0);
+  });
+
+  // The database check alone cannot catch this: at the moment each rule is
+  // examined, neither is PUBLISHED yet. Without the in-batch reservation
+  // both would publish, in one request, onto one corridor key.
+  it("rejects the second of two rules in the SAME batch that share a corridor key", async () => {
+    const first = completeDraft();
+    const second = completeDraft({ entryType: "UNSPECIFIED" });
+    const app = makeApp();
+
+    const res = await request(app)
+      .post("/rules/bulk-publish")
+      .send({ ruleIds: [String(first._id), String(second._id)] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.publishedCount).toBe(1);
+    expect(_rules.get(first._id).status).toBe("PUBLISHED");
+    expect(_rules.get(second._id).status).toBe("DRAFT");
+    const byId = Object.fromEntries(res.body.results.map((r: any) => [r.ruleId, r]));
+    expect(byId[String(second._id)].reason).toMatch(/same batch/);
+  });
+
+  it("preview reports an in-batch corridor collision too — a preview that missed it would understate the commit", async () => {
+    const first = completeDraft();
+    const second = completeDraft({ entryType: "UNSPECIFIED" });
+    const app = makeApp();
+
+    const res = await request(app)
+      .post("/rules/bulk-publish/preview")
+      .send({ ruleIds: [String(first._id), String(second._id)] });
+
+    expect(res.body.publishedCount).toBe(1);
+    expect(res.body.rejectedCount).toBe(1);
+    expect(_rules.get(first._id).status).toBe("DRAFT"); // preview never writes
+  });
+
+  it("a batch of distinct variantKeys on one corridor all publish", async () => {
+    const a = completeDraft({ destinationIso2: "TR", variantKey: "E_VISA" });
+    const b = completeDraft({ destinationIso2: "TR", variantKey: "STICKER" });
+    const app = makeApp();
+
+    const res = await request(app).post("/rules/bulk-publish").send({ ruleIds: [String(a._id), String(b._id)] });
+    expect(res.body.publishedCount).toBe(2);
+    expect(res.body.rejectedCount).toBe(0);
   });
 
   it("reports (never crashes on) a ruleId that doesn't exist", async () => {

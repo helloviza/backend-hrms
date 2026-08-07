@@ -12,7 +12,31 @@
 
 import type { VisaCategory, VisaRuleDisplayMode } from "../models/VisaRule.js";
 
-const GST_RATE = 0.18;
+// THE GST rate for this module — one definition, four consumers. It was
+// written out five times before 2026-08-08: as this constant, as the digits
+// inside the fee line's own label string, twice as `gstPercent: 18` in
+// services/visaBillingSync.ts, and once in customer-facing legal copy
+// (frontend VisaFooterBand.tsx, deliberately NOT wired to this — see below).
+// The label was the dangerous one: changing the rate here alone produced a
+// correct amount under a caption that still said 18%.
+//
+// Exported in two shapes because the two consumers genuinely need two:
+// the multiplier for the arithmetic below, and the whole-number percent
+// ManualBooking.pricing.gstPercent stores. PERCENT is derived, never a
+// second literal, so they cannot disagree.
+//
+// NOT wired to this constant, on purpose:
+//   - apps/frontend/src/components/visa/VisaFooterBand.tsx's footer
+//     sentence. It is legal copy on a shared band, not a computed figure,
+//     and it is a build artefact away from this module — a rate change
+//     needs a human to re-read that sentence, not a template to silently
+//     rewrite it.
+//   - models/ManualBooking.ts's own `gstPercent` schema default and its
+//     `?? 18` fallback. Those belong to the manual-booking module and apply
+//     to every booking type, not just VISA; folding them into a visa
+//     constant would invert the dependency.
+export const VISA_GST_RATE = 0.18;
+export const VISA_GST_PERCENT = Math.round(VISA_GST_RATE * 100);
 
 export const VISA_FEE_DISCLAIMER =
   "Embassy and VFS charges are recovered at actual and invoiced on completion — the final billed amount may differ from this estimate.";
@@ -83,8 +107,14 @@ function computeItemised(rule: VisaFeeInput): VisaFeeBlock {
 
     // GST base is the service fee ONLY — embassy/VFS are pass-through at
     // actual and must never enter it.
-    const gstInr = Math.round(rule.plumtripsServiceFeeInr * GST_RATE);
-    lineItems.push({ code: "GST", label: "GST (18% on service fee)", amountInr: gstInr });
+    const gstInr = Math.round(rule.plumtripsServiceFeeInr * VISA_GST_RATE);
+    lineItems.push({
+      code: "GST",
+      // Interpolated, not written out: the caption cannot drift from the
+      // multiplier applied on the line above it.
+      label: `GST (${VISA_GST_PERCENT}% on service fee)`,
+      amountInr: gstInr,
+    });
     totalInr += gstInr;
   }
 

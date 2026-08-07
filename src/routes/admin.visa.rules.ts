@@ -694,22 +694,133 @@ router.post("/rules/:id/clone", requirePermission("visaApplication", "FULL"), as
 });
 
 /* ─────────────────────────────────────────────────────────────────────
- * Publish-readiness check — a rule missing visaCategory, ETA (both min
- * and max), or any cost information at all (itemised or indicative) must
- * never go live: an incomplete rule going live would quote an applicant
- * against a gap, not a real term. Factored out so POST /rules/:id/publish
- * and POST /rules/bulk-publish run the EXACT same check — bulk-publish
- * must reject a rule for the same reason the single-rule route would,
- * never a second, independently-drifting copy of "what's required."
+ * Publish-readiness check — TWO independent reasons a rule must not go
+ * live, returned separately because they are different failures with
+ * different fixes.
+ *
+ *   missing[]  — the rule is incomplete: no visaCategory, no ETA (both min
+ *                and max), or no cost information at all (itemised or
+ *                indicative). Publishing it would quote an applicant
+ *                against a gap, not a real term. Fix: edit the rule.
+ *   conflict   — another PUBLISHED rule already occupies this corridor
+ *                key. Fix: retire that one, or give this one a distinct
+ *                variantKey.
+ *
+ * Factored out so POST /rules/:id/publish and POST /rules/bulk-publish run
+ * the EXACT same check — bulk-publish must reject a rule for the same
+ * reason the single-rule route would, never a second, independently-
+ * drifting copy of "what's required."
+ *
+ * `missing` stays a bare string[] with its existing wording because the
+ * admin console renders it verbatim under a "Cannot publish yet — missing:"
+ * heading (VisaRulesConsole.tsx). A collision is not a missing FIELD, so it
+ * never joins that array — it would render as "missing: another PUBLISHED
+ * rule already occupies…".
+ *
+ * ── WHY THE KEY HERE IS FIVE FIELDS, NOT THE MODEL'S SIX ───────────────
+ *
+ * VisaRule's own unique index is SIX fields — nationality, destinationIso2,
+ * purpose, entryType, serviceTier, variantKey — and it is unique across ALL
+ * statuses, not just PUBLISHED. So a duplicate on the FULL index key cannot
+ * be created in the first place, in any status, and a publish-time guard on
+ * that key would be unreachable code. Verified against production
+ * 2026-08-08: zero PUBLISHED collisions on the six-field key.
+ *
+ * The key that is NOT protected is this one — the same key minus
+ * entryType. Two rules for one corridor+purpose+tier+variant, one carrying
+ * entryType MULTIPLE and the other UNSPECIFIED, satisfy the unique index
+ * and both publish happily. Production had exactly two such pairs (AE and
+ * DE TOURIST/STANDARD, in both cases an old seeded row alongside its
+ * checklist-extraction replacement), and they are why /visa/requirements
+ * renders two identical "Standard" tier cards for those corridors.
+ *
+ * variantKey IS part of the key, so the legitimate multi-variant corridors
+ * still publish: Turkey E_VISA vs STICKER, Canada DEFAULT vs
+ * FOR_USA_VISA_HOLDER, Sweden DEFAULT vs GROUP_20, South Africa DEFAULT vs
+ * OFFICIAL_DIPLOMATIC. All four were checked against this guard's key and
+ * none collide.
+ *
+ * The cost of excluding entryType: two rules differing ONLY by SINGLE vs
+ * MULTIPLE entry can no longer both be published. That is a real product
+ * distinction in principle, and there is no such pair in the catalogue
+ * today (the only entryType-separated pairs are the two UNSPECIFIED ones
+ * above, where UNSPECIFIED means "not stated", not "a different product").
+ * If one is ever needed, it belongs on variantKey, which is the field this
+ * codebase already uses to mean "same corridor, genuinely different rule".
  * ───────────────────────────────────────────────────────────────────── */
-function publishReadinessGaps(rule: any): string[] {
+export interface PublishBlockers {
+  missing: string[];
+  conflict: string | null;
+}
+
+// The corridor slot a PUBLISHED rule occupies exclusively. Deliberately
+// NOT VisaRule's six-field index key — see the block comment above.
+function publishedCorridorKey(rule: any) {
+  return {
+    nationality: rule.nationality,
+    destinationIso2: rule.destinationIso2,
+    purpose: rule.purpose,
+    serviceTier: rule.serviceTier,
+    variantKey: rule.variantKey,
+  };
+}
+
+// Stable string form of the same key, for the in-batch reservation
+// bulk-publish needs (see handleBulkPublish).
+function publishedCorridorKeyString(rule: any): string {
+  const k = publishedCorridorKey(rule);
+  return [k.nationality, k.destinationIso2, k.purpose, k.serviceTier, k.variantKey].join("|");
+}
+
+async function publishReadinessGaps(
+  rule: any,
+  // Keys already claimed by earlier rules in the SAME bulk-publish batch.
+  // Without this, two DRAFT rules sharing a key in one ruleIds array each
+  // see a clean database and both publish — the guard would be bypassed by
+  // the exact operation it exists to constrain. Absent for single publish,
+  // which has no batch.
+  claimedInBatch?: Set<string>,
+): Promise<PublishBlockers> {
   const missing: string[] = [];
   if (!rule.visaCategory) missing.push("visaCategory");
   if (rule.etaMinDays == null || rule.etaMaxDays == null) missing.push("ETA (etaMinDays and etaMaxDays)");
   const hasCost =
     rule.indicativeVisaCostInr != null || rule.embassyFeeInr != null || rule.vfsFeeInr != null || rule.plumtripsServiceFeeInr != null;
   if (!hasCost) missing.push("at least an indicative cost (indicativeVisaCostInr, or an itemised fee)");
-  return missing;
+
+  const key = publishedCorridorKey(rule);
+  const describeKey =
+    `${key.destinationIso2} ${key.purpose}/${key.serviceTier}` +
+    (key.variantKey && key.variantKey !== "DEFAULT" ? ` (variant ${key.variantKey})` : "");
+
+  if (claimedInBatch?.has(publishedCorridorKeyString(rule))) {
+    return {
+      missing,
+      conflict: `Another rule in this same batch already publishes ${describeKey} — publish one of them, or give this one a distinct variantKey`,
+    };
+  }
+
+  // `_id: { $ne: rule._id }` is belt-and-braces rather than load-bearing: a
+  // rule cannot be its own conflict here, because both callers reject
+  // anything that is not DRAFT before reaching this function, and this
+  // query only looks at PUBLISHED rows. It stays because that ordering is
+  // the caller's invariant, not this function's, and a future caller that
+  // re-publishes an already-live rule must not have it block itself.
+  //
+  // Editing never routes through here at all: PATCH /rules/:id and the
+  // bulk-edit route both reject `status` outright, so a rule being edited
+  // keeps whatever status it had and is never re-published as a side
+  // effect of an edit.
+  const clash = await VisaRule.findOne({ ...key, status: "PUBLISHED", _id: { $ne: rule._id } })
+    .select("_id")
+    .lean();
+
+  return {
+    missing,
+    conflict: clash
+      ? `Another PUBLISHED rule (${String((clash as any)._id)}) already covers ${describeKey} — retire it first, or give this one a distinct variantKey`
+      : null,
+  };
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -728,9 +839,15 @@ router.post("/rules/:id/publish", requirePermission("visaApplication", "FULL"), 
       return res.status(400).json({ error: `Only a DRAFT rule can be published (currently '${rule.status}')` });
     }
 
-    const missing = publishReadinessGaps(rule);
+    const { missing, conflict } = await publishReadinessGaps(rule);
     if (missing.length > 0) {
       return res.status(400).json({ error: `Cannot publish — missing: ${missing.join(", ")}`, missing });
+    }
+    // 409, not 400: the rule itself is complete and valid — the catalogue
+    // already has that slot filled. Same status the identity-collision
+    // path on PATCH /rules/:id returns for the same class of problem.
+    if (conflict) {
+      return res.status(409).json({ error: `Cannot publish — ${conflict}`, conflict });
     }
 
     const before = { status: rule.status };
@@ -930,6 +1047,10 @@ async function handleBulkPublish(req: any, res: any, dryRun: boolean) {
     // not five. A Map (not a Set) so the destinationName is still on hand
     // when firing the trigger after the loop.
     const newlyPublishedDestinations = new Map<string, string>();
+    // Corridor keys claimed by rules earlier in THIS batch — see
+    // publishReadinessGaps' `claimedInBatch` parameter for why the database
+    // check alone is not enough here.
+    const claimedKeys = new Set<string>();
 
     for (const id of ruleIds) {
       const ruleId = String(id);
@@ -942,11 +1063,20 @@ async function handleBulkPublish(req: any, res: any, dryRun: boolean) {
         results.push({ ruleId, status: "REJECTED", reason: `Only a DRAFT rule can be published (currently '${rule.status}')` });
         continue;
       }
-      const missing = publishReadinessGaps(rule);
+      const { missing, conflict } = await publishReadinessGaps(rule, claimedKeys);
       if (missing.length > 0) {
         results.push({ ruleId, status: "REJECTED", reason: `Cannot publish — missing: ${missing.join(", ")}` });
         continue;
       }
+      if (conflict) {
+        results.push({ ruleId, status: "REJECTED", reason: `Cannot publish — ${conflict}` });
+        continue;
+      }
+
+      // Claimed whether or not this is a dry run: /preview must report the
+      // same in-batch collision the commit route would hit, or the preview
+      // is lying about what the commit will do.
+      claimedKeys.add(publishedCorridorKeyString(rule));
 
       publishedCount += 1;
       results.push({ ruleId, status: "PUBLISHED" });

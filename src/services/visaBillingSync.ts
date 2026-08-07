@@ -78,7 +78,7 @@ import User from "../models/User.js";
 import { isCustomerUser } from "../middleware/requireWorkspace.js";
 import logger from "../utils/logger.js";
 import { logVisaActivity } from "../models/VisaActivityLog.js";
-import { computeVisaFeeBlock } from "../utils/visaFee.js";
+import { computeVisaFeeBlock, VISA_GST_PERCENT } from "../utils/visaFee.js";
 
 const visaBillingLogger = logger.child({ module: "visaBillingSync" });
 
@@ -383,7 +383,7 @@ export async function createVisaWorkStartBooking(
     returnDate: request.travelDateTo || undefined,
     itinerary,
     passengers,
-    pricing: { actualPrice, quotedPrice, gstMode: "ON_MARKUP", gstPercent: 18 },
+    pricing: { actualPrice, quotedPrice, gstMode: "ON_MARKUP", gstPercent: VISA_GST_PERCENT },
     notes: `Visa application — ${passengers[0].name} — ${request.referenceNumber}`,
     sourceBookingRef: request.referenceNumber,
     metadata: {
@@ -535,7 +535,7 @@ export async function syncVisaApplicationBilling(
       actualPrice,
       quotedPrice,
       gstMode: "ON_MARKUP",
-      gstPercent: 18,
+      gstPercent: VISA_GST_PERCENT,
     },
     notes: `Visa application — ${passengers[0].name} — ${request.referenceNumber}`,
     // Traceability: a string field (unlike sourceBookingId, which is
