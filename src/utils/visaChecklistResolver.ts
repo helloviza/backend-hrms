@@ -201,8 +201,24 @@ const APPLICANT_FIELD_LABELS: Record<VisaApplicantAttributeField, string> = {
 };
 
 function describeExpected(cond: VisaApplicantPredicateCondition): string {
-  if (cond.in !== undefined) return `one of ${cond.in.join(", ")}`;
-  return String(cond.equals);
+  // `equals` checked first, and `in` guarded on length — same ordering, and
+  // for the same reason, as evaluateApplicantCondition (models/visaAttributes.ts,
+  // which carries the full explanation): a condition read back through
+  // Mongoose has `in: []` even when only `equals` was ever set, because
+  // VisaApplicantPredicateConditionSchema's `in` is an array-type path and
+  // array paths default to []. Testing `cond.in !== undefined` first (as this
+  // used to) matched that empty default and rendered the exclusion reason as
+  // "Expected: one of " with nothing after it — the concierge console's
+  // explanation of WHY a requirement was excluded, reduced to a dangling
+  // phrase, for every equals-gated rule loaded from the DB. Display-only, so
+  // it never affected which documents were resolved, but an agent reading it
+  // could not tell what the rule actually wanted.
+  if (cond.equals !== undefined) return String(cond.equals);
+  if (cond.in !== undefined && cond.in.length > 0) return `one of ${cond.in.join(", ")}`;
+  // Neither set (or `in` only as an empty default with no `equals`) — the same
+  // condition evaluateApplicantCondition returns false for. Say so rather than
+  // emitting "undefined".
+  return "(no expected value set)";
 }
 
 function describeActual(value: unknown): string {
