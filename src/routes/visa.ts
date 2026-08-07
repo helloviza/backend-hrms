@@ -206,6 +206,22 @@ function mapRuleToVariant(r: any, opts: { applicantProfile?: Partial<VisaApplica
     ruleId: String(r._id),
     entryType: r.entryType,
     serviceTier: r.serviceTier,
+    // Phase 10a's variant fields, exposed to the customer payload
+    // 2026-08-08. A corridor can publish several rules at the SAME
+    // serviceTier that differ only by variantKey (Türkiye's e-visa at
+    // ₹5,589 beside its sticker visa at ₹21,829; Canada's US-visa-holder
+    // variant; Sweden's group-of-20; South Africa's official/diplomatic).
+    // Without these two fields the requirements page had nothing to tell
+    // them apart and rendered two identical "Standard" cards at different
+    // prices — see frontend requirements/TierComparisonCards.tsx.
+    //
+    // variantLabel is the ops-authored human description (VisaRule.ts) and
+    // is what the UI shows; variantKey travels with it because it is the
+    // stable identifier, and because "is this the DEFAULT variant" is a
+    // question the client answers without having to infer it from a label
+    // that may be absent.
+    variantKey: r.variantKey,
+    variantLabel: r.variantLabel,
     category: r.visaCategory,
     productClass: r.productClass,
     destinationName: r.destinationName,
