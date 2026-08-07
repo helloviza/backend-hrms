@@ -457,15 +457,26 @@ router.get("/destinations", async (req: any, res: any) => {
     const destinationsWithNoPurposes: string[] = [];
 
     // Thumbnail + hero join — country imagery (2026-08-03, widened
-    // 2026-08-06). Same PUBLISHED-only gate as GET /content/:iso2: a
-    // destination whose content row is still DRAFT (ops picked an image
-    // but hasn't published the rest of the copy yet) reports both URLs
-    // null here, same as if no image had ever been fetched — "nothing
-    // publishes unreviewed" holds for the picker grid too, not just the
-    // requirements-page hero.
+    // 2026-08-06). "Corridor card never imageless" (2026-08-07) —
+    // DELIBERATELY not gated on content.status === "PUBLISHED" the way
+    // GET /content/:iso2's editorial copy still is. The image and the
+    // editorial copy are two independent concerns: heroImageUrl/
+    // thumbnailUrl are only ever set once a candidate has already cleared
+    // the deterministic contrast gate (utils/heroImageContrast.ts, gated
+    // against the worst of thirteen palettes) — via a human pick, the bulk
+    // auto-select backfill, or the publish-time auto-fetch trigger (see
+    // services/visaDestinationImageService.ts) — so a photo is safe to
+    // show regardless of whether anyone has reviewed/published the
+    // business/tourism highlight blocks for that destination yet. Keeping
+    // the old PUBLISHED-only gate here would have meant an auto-selected
+    // image sits fully vetted in the database and the corridor card still
+    // shows the watermark plate — exactly the "imageless" outcome this
+    // phase exists to close. GET /content/:iso2 (the requirements-page
+    // hero + editorial highlights) is unchanged and still PUBLISHED-only —
+    // that copy genuinely does need a human's sign-off before a customer
+    // reads it, unlike a contrast-gated photo.
     const imageRows = await VisaDestinationContent.find({
       destinationIso2: { $in: Array.from(byIso2.keys()) },
-      status: "PUBLISHED",
     })
       .select("destinationIso2 thumbnailUrl heroImageUrl")
       .lean();
