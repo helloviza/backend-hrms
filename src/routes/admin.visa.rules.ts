@@ -39,6 +39,7 @@ import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 import { MIN_HERO_CONTRAST } from "../utils/heroImageContrast.js";
 import { getCountryByIso2 } from "../utils/countryCodes.js";
+import { triggerAutoFetchForDestination } from "../services/visaDestinationImageService.js";
 import VisaRule, {
   VISA_PURPOSES,
   VISA_ENTRY_TYPES,
@@ -327,6 +328,11 @@ function mapContentSummary(c: any) {
     heroImageUrl: c.heroImageUrl ?? null,
     thumbnailUrl: c.thumbnailUrl ?? null,
     imageSource: c.imageSource ?? null,
+    // "Corridor card never imageless" (2026-08-07) — true only when the
+    // live image was picked by code (bulk auto-select backfill or the
+    // publish-time auto-fetch trigger), never by a human. Same amber
+    // "unreviewed" treatment as seedSource below, distinct signal.
+    heroImageAutoSelected: c.heroImageAutoSelected ?? false,
     // Pending-review candidates (scripts/fetch-visa-destination-images.ts)
     // — the admin picker's own data, never shown to a customer. Only ever
     // PENDING in practice today (nothing in this file sets a candidate's
@@ -731,6 +737,15 @@ router.post("/rules/:id/publish", requirePermission("visaApplication", "FULL"), 
     rule.status = "PUBLISHED";
     await rule.save();
 
+    // "Corridor card never imageless" (2026-08-07) — fire-and-forget, NOT
+    // awaited: triggerAutoFetchForDestination does its own quick "does
+    // this destination already have candidates" check before touching
+    // Pixabay, and never throws, but the point of not awaiting it here is
+    // that even a slow/down Pixabay must never delay this response. A
+    // destination that already has a live image or existing candidates is
+    // a fast no-op inside that function.
+    void triggerAutoFetchForDestination(rule.destinationIso2, rule.destinationName);
+
     await writeRuleAudit(rule._id, "PUBLISH", [{ field: "status", from: before.status, to: "PUBLISHED" }], actorId(req));
 
     rulesLogger.info("visa rule published", { ruleId: String(rule._id), userId: actorId(req) ? String(actorId(req)) : null });
@@ -908,6 +923,13 @@ async function handleBulkPublish(req: any, res: any, dryRun: boolean) {
 
     const results: BulkTransitionOutcome[] = [];
     let publishedCount = 0;
+    // "Corridor card never imageless" (2026-08-07) — one rule per
+    // destination is the common case, but ruleIds can span several
+    // destinations in one bulk call; dedupe by destinationIso2 so a batch
+    // of e.g. 5 rules for the same country only fires ONE fetch trigger,
+    // not five. A Map (not a Set) so the destinationName is still on hand
+    // when firing the trigger after the loop.
+    const newlyPublishedDestinations = new Map<string, string>();
 
     for (const id of ruleIds) {
       const ruleId = String(id);
@@ -934,7 +956,15 @@ async function handleBulkPublish(req: any, res: any, dryRun: boolean) {
         rule.status = "PUBLISHED";
         await rule.save();
         await writeRuleAudit(rule._id, "PUBLISH", [{ field: "status", from: before.status, to: "PUBLISHED" }], actorId(req));
+        newlyPublishedDestinations.set(rule.destinationIso2, rule.destinationName);
       }
+    }
+
+    // Fire-and-forget, once per distinct destination — never awaited, so a
+    // slow/down Pixabay can never delay this response (same posture as the
+    // single-rule publish route above).
+    for (const [iso2, destinationName] of newlyPublishedDestinations) {
+      void triggerAutoFetchForDestination(iso2, destinationName);
     }
 
     if (!dryRun) {
@@ -1098,6 +1128,7 @@ router.get("/destination-images/missing", requirePermission("visaApplication", "
           name: nameByIso2.get(iso2)!,
           contentStatus: content?.status ?? null,
           heroImageUrl: content?.heroImageUrl ?? null,
+          heroImageAutoSelected: content?.heroImageAutoSelected ?? false,
           imageCandidates: candidates,
           passingCandidateCount,
           canPublish: hasHeadline && hasSummary && hasHighlight,
@@ -1247,6 +1278,11 @@ router.post("/destination-content/:iso2/select-image", requirePermission("visaAp
     existing.heroImageUrl = candidate.fullUrl;
     existing.thumbnailUrl = candidate.previewUrl;
     existing.imageSource = { provider: "pixabay", sourceId: candidate.sourceId, pixabayPageUrl: candidate.pixabayPageUrl };
+    // A human pick always wins and always counts as reviewed — clears
+    // whatever an earlier auto-select (bulk backfill or publish-time
+    // trigger) had flagged, even if this happens to be the exact same
+    // candidate a machine would have picked.
+    existing.heroImageAutoSelected = false;
     await existing.save();
 
     res.json({ ok: true, content: mapContentSummary(existing.toObject()) });
@@ -1309,7 +1345,7 @@ router.post(
       const content = await VisaDestinationContent.findOneAndUpdate(
         { destinationIso2: iso2 },
         {
-          $set: { heroImageUrl: url, thumbnailUrl: url, imageSource: { provider: "upload" } },
+          $set: { heroImageUrl: url, thumbnailUrl: url, imageSource: { provider: "upload" }, heroImageAutoSelected: false },
           $setOnInsert: { destinationIso2: iso2, status: "DRAFT" },
         },
         { new: true, upsert: true, setDefaultsOnInsert: true },

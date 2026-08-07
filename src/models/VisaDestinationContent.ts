@@ -109,6 +109,17 @@ export interface VisaDestinationContentDocument extends Document {
   // Kept even for an "upload" source so a future licence question about a
   // PUBLISHED image has an answer beyond "someone pasted a URL."
   imageSource?: { provider: "pixabay" | "upload"; sourceId?: string; pixabayPageUrl?: string };
+  // "Corridor card never imageless" (2026-08-07) — true only when
+  // heroImageUrl/thumbnailUrl were picked by code (the highest-contrast
+  // PASS candidate), not a human: the bulk auto-select backfill, or the
+  // publish-time auto-fetch trigger (services/visaDestinationImageService.ts).
+  // A DISTINCT field from imageSource deliberately — imageSource.provider
+  // stays "pixabay" either way (that's still the true source), this is the
+  // orthogonal "did a person confirm it" signal ops needs to see flagged.
+  // Cleared (set false) the moment a human picks any candidate or uploads
+  // their own via POST .../select-image or .../image-upload — a manual
+  // pick always wins and always counts as reviewed.
+  heroImageAutoSelected?: boolean;
   // Pending-review candidates from scripts/fetch-visa-destination-images.ts
   // — see that script and VisaImageCandidate above. Replaced wholesale on
   // each script run for a destination (not appended), so this never grows
@@ -168,6 +179,7 @@ const VisaDestinationContentSchema = new Schema<VisaDestinationContentDocument>(
     },
     heroImageUrl: { type: String, trim: true },
     thumbnailUrl: { type: String, trim: true },
+    heroImageAutoSelected: { type: Boolean, default: false },
     imageSource: {
       type: new Schema(
         {

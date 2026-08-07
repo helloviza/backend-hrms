@@ -74,121 +74,30 @@
 
 import "dotenv/config";
 import mongoose from "mongoose";
-import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { connectDb } from "../config/db.js";
 import { env } from "../config/env.js";
-import { s3 } from "../config/aws.js";
 import VisaRule from "../models/VisaRule.js";
-import VisaDestinationContent, { type VisaImageCandidate } from "../models/VisaDestinationContent.js";
+import VisaDestinationContent from "../models/VisaDestinationContent.js";
 import { getCountryByIso2 } from "../utils/countryCodes.js";
-import { computeWorstCaseHeroContrast, MIN_HERO_CONTRAST } from "../utils/heroImageContrast.js";
+import { fetchCandidatesForDestination, storeCandidatesForDestination } from "../services/visaDestinationImageService.js";
 
 const COMMIT = process.argv.includes("--commit");
 const FORCE = process.argv.includes("--force");
-const CANDIDATES_PER_DESTINATION = 6;
 
 function argValue(flag: string): string | null {
   const arg = process.argv.find((a) => a.startsWith(`--${flag}=`));
   return arg ? arg.slice(flag.length + 3) : null;
 }
 
-function extFromContentType(ct: string | null): { ext: string; ct: string } {
-  if (ct?.includes("png")) return { ext: "png", ct: "image/png" };
-  if (ct?.includes("webp")) return { ext: "webp", ct: "image/webp" };
-  return { ext: "jpg", ct: "image/jpeg" };
-}
-
-async function fetchBytes(srcUrl: string): Promise<{ buffer: Buffer; contentType: string | null } | null> {
-  try {
-    const resp = await fetch(srcUrl);
-    if (!resp.ok) return null;
-    return { buffer: Buffer.from(await resp.arrayBuffer()), contentType: resp.headers.get("content-type") };
-  } catch (err: any) {
-    console.warn(`    fetch failed for ${srcUrl}: ${err?.message}`);
-    return null;
-  }
-}
-
-async function storeBuffer(buffer: Buffer, contentType: string | null, key: string): Promise<string> {
-  const { ext, ct } = extFromContentType(contentType);
-  const fullKey = `${key}.${ext}`;
-  await s3.send(new PutObjectCommand({ Bucket: env.S3_BUCKET, Key: fullKey, Body: buffer, ContentType: ct }));
-  return `https://${env.S3_BUCKET}.s3.${env.AWS_REGION}.amazonaws.com/${fullKey}`;
-}
-
-async function fetchCandidates(iso2: string, countryName: string): Promise<VisaImageCandidate[]> {
-  const q = encodeURIComponent(`${countryName} landmark`);
-  const url =
-    `https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&q=${q}` +
-    `&image_type=photo&orientation=horizontal&category=places&safesearch=true&per_page=${CANDIDATES_PER_DESTINATION}`;
-
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    console.warn(`  Pixabay query failed: HTTP ${resp.status}`);
-    return [];
-  }
-  const data: any = await resp.json();
-  const hits: any[] = Array.isArray(data?.hits) ? data.hits : [];
-
-  const candidates: VisaImageCandidate[] = [];
-  for (const hit of hits) {
-    const previewSrc: string | undefined = hit.previewURL;
-    const fullSrc: string | undefined = hit.largeImageURL || hit.webformatURL;
-    if (!previewSrc || !fullSrc) continue;
-
-    // Contrast is computed against real pixels regardless of dry-run —
-    // this is a read-only fetch (no S3 write, no DB write), so it doesn't
-    // break dry-run's "writes nothing" contract, and it's the whole point
-    // of being able to preview a destination without --commit.
-    const fullBytes = await fetchBytes(fullSrc);
-    if (!fullBytes) {
-      console.warn(`    hit ${hit.id} — couldn't download full image to check contrast, skipping`);
-      continue;
-    }
-    const contrastRatio = await computeWorstCaseHeroContrast(fullBytes.buffer);
-    const contrastStatus: "PASS" | "FAIL" = contrastRatio >= MIN_HERO_CONTRAST ? "PASS" : "FAIL";
-    console.log(`    hit ${hit.id}: contrast ${contrastRatio.toFixed(2)}:1 (need ${MIN_HERO_CONTRAST}:1) — ${contrastStatus}`);
-
-    if (!COMMIT) {
-      // Dry run — report what a commit WOULD store, but these are still
-      // live Pixabay URLs (webformatURL expires in 24h) and are never
-      // written to the database in this branch.
-      candidates.push({
-        source: "pixabay",
-        sourceId: String(hit.id),
-        previewUrl: previewSrc,
-        fullUrl: fullSrc,
-        pixabayPageUrl: hit.pageURL,
-        tags: hit.tags,
-        status: "PENDING",
-        fetchedAt: new Date(),
-        contrastRatio,
-        contrastStatus,
-      });
-      continue;
-    }
-
-    const previewBytes = await fetchBytes(previewSrc);
-    if (!previewBytes) continue;
-
-    const keyBase = `visa-destination-images/candidates/${iso2}/${hit.id}`;
-    const [preview, full] = await Promise.all([
-      storeBuffer(previewBytes.buffer, previewBytes.contentType, `${keyBase}-preview`),
-      storeBuffer(fullBytes.buffer, fullBytes.contentType, `${keyBase}-full`),
-    ]);
-
-    candidates.push({
-      source: "pixabay",
-      sourceId: String(hit.id),
-      previewUrl: preview,
-      fullUrl: full,
-      pixabayPageUrl: hit.pageURL,
-      tags: hit.tags,
-      status: "PENDING",
-      fetchedAt: new Date(),
-      contrastRatio,
-      contrastStatus,
-    });
+// Thin CLI wrapper — the fetch/store logic itself now lives in
+// services/visaDestinationImageService.ts (2026-08-07), shared with the
+// server-side publish-time auto-fetch trigger. This script also logs a
+// per-hit contrast line as candidates come back, which the shared service
+// doesn't do on its own (it's a library, not a CLI).
+async function fetchCandidates(iso2: string, countryName: string) {
+  const candidates = await fetchCandidatesForDestination(iso2, countryName, { commit: COMMIT });
+  for (const c of candidates) {
+    console.log(`    hit ${c.sourceId}: contrast ${c.contrastRatio.toFixed(2)}:1 — ${c.contrastStatus}`);
   }
   return candidates;
 }
@@ -257,11 +166,7 @@ async function main() {
 
     if (!COMMIT || candidates.length === 0) continue;
 
-    await VisaDestinationContent.findOneAndUpdate(
-      { destinationIso2: iso2 },
-      { $set: { imageCandidates: candidates }, $setOnInsert: { destinationIso2: iso2, status: "DRAFT" } },
-      { upsert: true, setDefaultsOnInsert: true },
-    );
+    await storeCandidatesForDestination(iso2, candidates);
     console.log(`  Stored ${candidates.length} candidate(s) in S3 and wrote them for ops review.`);
   }
 
