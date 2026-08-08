@@ -1128,7 +1128,14 @@ function buildApplicantProfileForTraveller(
 async function hydrateApplicationsWithTravellers(
   applications: any[],
   workspaceId: any,
-  timelineOpts?: { includeTimelineFields: true },
+  // includeConciergeName is separable from includeTimelineFields ON PURPOSE.
+  // The header of screen 7 needs the assigned concierge's NAME, which is one
+  // batched User lookup — but NOT estimatedDecision, whose per-application
+  // ETA recomputation is exactly what this function's own header says was
+  // scoped out of the list route for cost. Asking for the cheap half without
+  // the expensive half keeps that reasoning intact instead of overturning it
+  // for a name.
+  timelineOpts?: { includeTimelineFields?: true; includeConciergeName?: true },
 ) {
   const travellerIds = applications.map((a) => a.travellerProfileId);
   const travellers = await TravellerProfile.find({
@@ -1149,7 +1156,7 @@ async function hydrateApplicationsWithTravellers(
   const travellerById = new Map(travellers.map((t: any) => [String(t._id), t]));
 
   let conciergeNameByUserId = new Map<string, string | null>();
-  if (timelineOpts) {
+  if (timelineOpts?.includeTimelineFields || timelineOpts?.includeConciergeName) {
     const conciergeIds = [
       ...new Set(
         applications
@@ -1208,12 +1215,20 @@ async function hydrateApplicationsWithTravellers(
 
     if (!timelineOpts) return base;
 
+    // Name only — no lodgedAt, no estimatedDecision. null (never a
+    // placeholder string) when unassigned, which is every application today:
+    // assignment lands with the concierge console, which isn't built. The
+    // frontend omits its chip entirely rather than rendering an em dash.
+    const assignedConciergeName = a.assignedConciergeUserId
+      ? (conciergeNameByUserId.get(String(a.assignedConciergeUserId)) ?? null)
+      : null;
+
+    if (!timelineOpts.includeTimelineFields) return { ...base, assignedConciergeName };
+
     return {
       ...base,
       lodgedAt: a.lodgedAt ?? null,
-      assignedConciergeName: a.assignedConciergeUserId
-        ? (conciergeNameByUserId.get(String(a.assignedConciergeUserId)) ?? null)
-        : null,
+      assignedConciergeName,
       // Per-application, not per-request — each traveller's own passport
       // lodges (and is decided) independently, even though they share one
       // VisaRequest. Null until THIS application has actually been lodged
@@ -1711,6 +1726,12 @@ router.get("/requests", async (req: any, res: any) => {
     const hydrated = await hydrateApplicationsWithTravellers(
       applications,
       workspaceId,
+      // Name only — screen 7's header names the assigned concierge. NOT
+      // includeTimelineFields: the ETA recomputation that carries is what
+      // this route deliberately doesn't pay for on every list load. The
+      // lookup is one batched User.find and is skipped entirely when no
+      // application in the workspace has an assignment.
+      { includeConciergeName: true },
     );
 
     const applicationsByRequest = new Map<string, any[]>();

@@ -1091,7 +1091,7 @@ describe("GET /requests and GET /requests/:id — workspace scoping", () => {
     expect(app.assignedConciergeName).toBe("Asha Rao");
   });
 
-  it("GET /requests (list) does NOT compute the derived timeline fields — scoped to the detail route only", async () => {
+  it("GET /requests (list) does NOT compute the EXPENSIVE derived field — the ETA stays detail-only", async () => {
     const created = await createOne(WORKSPACE_A);
     applications.update(created.applications[0]._id, {
       status: "lodged",
@@ -1100,19 +1100,36 @@ describe("GET /requests and GET /requests/:id — workspace scoping", () => {
 
     const res = await request(makeApp(WORKSPACE_A)).get("/requests");
     expect(res.status).toBe(200);
-    // estimatedDecision/assignedConciergeName require extra derivation (an
-    // ETA computation, a User lookup) — those stay gated behind
-    // hydrateApplicationsWithTravellers' timelineOpts, which only GET
-    // /requests/:id passes. lodgedAt itself is a plain stored field on the
-    // application document, so it passes through either route's `...a`
-    // spread same as any other raw field (submittedAt, status, ...) — never
-    // deliberately gated, nothing to assert against here.
+    // estimatedDecision is the expensive half — a per-application ETA
+    // recomputation — and stays gated behind includeTimelineFields, which
+    // only GET /requests/:id passes. That is what this test protects.
+    //
+    // assignedConciergeName was ALSO gated here until 2026-08-09, when
+    // screen 7's header needed to name the assigned concierge. It is one
+    // batched User.find, skipped entirely when nothing in the workspace is
+    // assigned, so it moved behind its own includeConciergeName flag rather
+    // than dragging the ETA onto the list with it. null, never undefined:
+    // the field is now always present on the list and simply carries no
+    // name when unassigned.
     expect(
       res.body.requests[0].applications[0].estimatedDecision,
     ).toBeUndefined();
     expect(
       res.body.requests[0].applications[0].assignedConciergeName,
-    ).toBeUndefined();
+    ).toBeNull();
+  });
+
+  it("GET /requests (list) resolves assignedConciergeName when one IS assigned", async () => {
+    const created = await createOne(WORKSPACE_A);
+    const concierge = users.insert({ _id: new mongoose.Types.ObjectId(), name: "Meera Iyer", email: "meera@plumtrips.com" });
+    applications.update(created.applications[0]._id, { assignedConciergeUserId: concierge._id });
+
+    const res = await request(makeApp(WORKSPACE_A)).get("/requests");
+    expect(res.status).toBe(200);
+    expect(res.body.requests[0].applications[0].assignedConciergeName).toBe("Meera Iyer");
+    // Still no ETA — the cheap half arriving must not drag the expensive
+    // half along with it.
+    expect(res.body.requests[0].applications[0].estimatedDecision).toBeUndefined();
   });
 });
 
