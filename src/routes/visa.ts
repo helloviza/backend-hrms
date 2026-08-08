@@ -1135,8 +1135,15 @@ async function hydrateApplicationsWithTravellers(
     _id: { $in: travellerIds },
     workspaceId,
   })
+    // gender / passportIssueCountry added for screen 5's review summary
+    // (2026-08-09). Both are ALREADY CAPTURED — gender by the traveller form
+    // and by the passport confirm's fill-if-blank, passportIssueCountry by
+    // the passport confirm's write-back — they were simply never projected,
+    // so the review page had no way to show what it already held. No new
+    // capture, no new field on the model: a select list that was narrower
+    // than the screen downstream needed.
     .select(
-      "firstName middleName lastName dob email nationality passportNo passportExpiry",
+      "firstName middleName lastName dob email nationality gender passportNo passportExpiry passportIssueCountry",
     )
     .lean();
   const travellerById = new Map(travellers.map((t: any) => [String(t._id), t]));
@@ -1191,8 +1198,10 @@ async function hydrateApplicationsWithTravellers(
             dob: traveller.dob ?? null,
             email: traveller.email ?? null,
             nationality: traveller.nationality ?? null,
+            gender: traveller.gender ?? null,
             passportNo: traveller.passportNo ?? null,
             passportExpiry: traveller.passportExpiry ?? null,
+            passportIssueCountry: traveller.passportIssueCountry ?? null,
           }
         : null,
     };
