@@ -27,6 +27,7 @@ const {
   members,
   recomputeRequestStatusMock,
   visaLoggerWarnMock,
+  travellerFindSpy,
   resetStores,
 } = vi.hoisted(() => {
   type Doc = Record<string, any>;
@@ -118,6 +119,11 @@ const {
     members,
     recomputeRequestStatusMock: vi.fn().mockResolvedValue("draft"),
     visaLoggerWarnMock: vi.fn(),
+    // Records every TravellerProfile.find() the router issues. GET
+    // /travellers' no-workspace-context test asserts this stays at zero —
+    // proving the guard short-circuits BEFORE the query, which is the whole
+    // point of it (see that test's own comment).
+    travellerFindSpy: vi.fn(),
     resetStores() {
       rules.clear();
       travellers.clear();
@@ -171,7 +177,12 @@ vi.mock("../models/VisaRule.js", () => ({
 }));
 
 vi.mock("../models/TravellerProfile.js", () => ({
-  default: { find: (filter: any) => chainable(() => travellers.query(filter)) },
+  default: {
+    find: (filter: any) => {
+      travellerFindSpy(filter);
+      return chainable(() => travellers.query(filter));
+    },
+  },
 }));
 
 vi.mock("../models/VisaRequest.js", () => ({
@@ -261,6 +272,20 @@ function makeApp(
   workspaceId: mongoose.Types.ObjectId = WORKSPACE_A,
   userId: mongoose.Types.ObjectId = USER_A,
   userOverrides: Record<string, any> = {},
+  // appOverrides.omitWorkspaceContext reproduces the real gap this suite's
+  // no-workspace-context test covers: requireWorkspace's SUPERADMIN bypass
+  // runs but attaches NO req.workspaceObjectId, because no explicit
+  // workspaceId reached it via body/query/params/header or the JWT.
+  // req.workspace/req.workspaceId still resolve — it is specifically the
+  // ObjectId every TravellerProfile query scopes on that goes missing.
+  // appOverrides.workspaceCustomerId sets req.workspace.customerId, the id
+  // GET /travellers' capabilities.canCreate resolves a CustomerMember
+  // against (routes/visa.ts's resolveTravellerCanCreate — deliberately the
+  // WORKSPACE's customerId, not req.user.customerId).
+  appOverrides: {
+    omitWorkspaceContext?: boolean;
+    workspaceCustomerId?: string;
+  } = {},
 ) {
   const app = express();
   app.use(express.json());
@@ -272,8 +297,14 @@ function makeApp(
       ...userOverrides,
     };
     req.workspaceId = String(workspaceId);
-    req.workspaceObjectId = workspaceId;
-    req.workspace = { _id: workspaceId, status: "ACTIVE" };
+    if (!appOverrides.omitWorkspaceContext) req.workspaceObjectId = workspaceId;
+    req.workspace = {
+      _id: workspaceId,
+      status: "ACTIVE",
+      ...(appOverrides.workspaceCustomerId
+        ? { customerId: appOverrides.workspaceCustomerId }
+        : {}),
+    };
     next();
   });
   app.use("/", router);
@@ -352,6 +383,10 @@ function memberDoc(
   customerId: string,
   email: string,
   role: "WORKSPACE_LEADER" | "APPROVER" | "REQUESTER",
+  // isActive:false / an off-union role are both reachable in real data
+  // (CustomerMember's Mongoose field carries no enum — see the model), so
+  // GET /travellers' canCreate tests need to be able to build them.
+  overrides: Record<string, any> = {},
 ) {
   return members.insert({
     _id: new mongoose.Types.ObjectId(),
@@ -359,6 +394,7 @@ function memberDoc(
     email,
     role,
     isActive: true,
+    ...overrides,
   });
 }
 
@@ -366,6 +402,7 @@ beforeEach(() => {
   resetStores();
   recomputeRequestStatusMock.mockClear();
   visaLoggerWarnMock.mockClear();
+  travellerFindSpy.mockClear();
   refSeq = 0;
 });
 
@@ -1734,5 +1771,114 @@ describe("GET /travellers — visa picker data", () => {
     expect(member.isWorkspaceMember).toBe(true);
     expect(nonMember.isWorkspaceMember).toBe(false);
     expect(JSON.stringify(res.body)).not.toContain("linkedMemberId");
+  });
+});
+
+describe("GET /travellers — workspace-context guard", () => {
+  // The leak this guards: with req.workspaceObjectId undefined the route used
+  // to issue TravellerProfile.find({ workspaceId: undefined, isActive: true }),
+  // and Mongoose STRIPS an undefined value out of a filter rather than
+  // matching on it — leaving { isActive: true }, i.e. every active traveller
+  // in every workspace. The in-memory collection backing this suite does NOT
+  // reproduce that strip (its matcher compares String(undefined) and so finds
+  // nothing), which is exactly why the assertion that matters here is
+  // travellerFindSpy: the guard must short-circuit BEFORE any query is built,
+  // so the route's safety never depends on what the driver does with an
+  // undefined filter value.
+  it("400s instead of querying when no workspace context resolved", async () => {
+    travellerDoc(WORKSPACE_A, { firstName: "Asha" });
+    travellerDoc(WORKSPACE_B, { firstName: "Other" });
+
+    const res = await request(
+      makeApp(WORKSPACE_A, USER_A, { roles: ["SUPERADMIN"] }, { omitWorkspaceContext: true }),
+    ).get("/travellers");
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/No workspace context/i);
+    expect(travellerFindSpy).not.toHaveBeenCalled();
+    expect(res.body.travellers).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain("Asha");
+    expect(JSON.stringify(res.body)).not.toContain("Other");
+  });
+
+  it("still serves a SUPERADMIN who DOES carry a workspace context, scoped to it", async () => {
+    travellerDoc(WORKSPACE_A, { firstName: "Asha" });
+    travellerDoc(WORKSPACE_B, { firstName: "Other" });
+
+    const res = await request(
+      makeApp(WORKSPACE_A, USER_A, { roles: ["SUPERADMIN"] }),
+    ).get("/travellers");
+
+    expect(res.status).toBe(200);
+    expect(res.body.travellers.map((t: any) => t.name)).toEqual(["Asha Rao"]);
+  });
+});
+
+describe("GET /travellers — capabilities.canCreate", () => {
+  // Mirrors POST /api/workspace/travellers' own gate (requireActiveMember +
+  // ensureTravellerWriteAccess "create"), so the picker's Add control can be
+  // withheld from a caller that endpoint would 403 rather than failing them
+  // on submit.
+  const CUSTOMER = "cust-visa-1";
+  const EMAIL = "member@acme.com";
+
+  function app(userOverrides: Record<string, any> = {}) {
+    return makeApp(
+      WORKSPACE_A,
+      USER_A,
+      { email: EMAIL, roles: ["CUSTOMER"], ...userOverrides },
+      { workspaceCustomerId: CUSTOMER },
+    );
+  }
+
+  it("true for an active member of this workspace's customer", async () => {
+    memberDoc(CUSTOMER, EMAIL, "REQUESTER");
+
+    const res = await request(app()).get("/travellers");
+    expect(res.status).toBe(200);
+    expect(res.body.capabilities).toEqual({ canCreate: true });
+  });
+
+  it("false for a staff/HOUSE user with no CustomerMember row — the 403-on-submit case", async () => {
+    travellerDoc(WORKSPACE_A, { firstName: "Asha" });
+
+    const res = await request(
+      makeApp(WORKSPACE_A, USER_A, { email: "agent@plumtrips.com", roles: ["EMPLOYEE"] }, { workspaceCustomerId: CUSTOMER }),
+    ).get("/travellers");
+
+    expect(res.status).toBe(200);
+    expect(res.body.capabilities.canCreate).toBe(false);
+    // Read access is unaffected — canCreate withholds a button, never a row.
+    expect(res.body.travellers).toHaveLength(1);
+  });
+
+  it("false for a deactivated member", async () => {
+    memberDoc(CUSTOMER, EMAIL, "WORKSPACE_LEADER", { isActive: false });
+
+    const res = await request(app()).get("/travellers");
+    expect(res.body.capabilities.canCreate).toBe(false);
+  });
+
+  it("false for a member whose role is not one of CustomerMember's three values", async () => {
+    // Reachable in real data: CustomerMember.role has no Mongoose enum, and
+    // masterData.ts has historically written other spellings.
+    memberDoc(CUSTOMER, EMAIL, "REQUESTER", { role: "CUSTOMER_L1" });
+
+    const res = await request(app()).get("/travellers");
+    expect(res.body.capabilities.canCreate).toBe(false);
+  });
+
+  it("true for a SUPERADMIN with a workspace context, without any CustomerMember row", async () => {
+    const res = await request(app({ roles: ["SUPERADMIN"] })).get("/travellers");
+    expect(res.body.capabilities.canCreate).toBe(true);
+  });
+
+  it("matches the member on the WORKSPACE's customerId, not the user's own", async () => {
+    // A member row under a DIFFERENT customer must not grant create here,
+    // even though the user carries that customerId on their token.
+    memberDoc("some-other-customer", EMAIL, "WORKSPACE_LEADER");
+
+    const res = await request(app({ customerId: "some-other-customer" })).get("/travellers");
+    expect(res.body.capabilities.canCreate).toBe(false);
   });
 });

@@ -74,6 +74,7 @@ import TravellerProfile from "../models/TravellerProfile.js";
 import TravelBooking from "../models/TravelBooking.js";
 import User from "../models/User.js";
 import CustomerMember from "../models/CustomerMember.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { getCountryByIso2, normaliseToIso2 } from "../utils/countryCodes.js";
 import {
   getVisaDocumentCodeDef,
@@ -822,6 +823,70 @@ router.get("/content/:iso2", async (req: any, res: any) => {
   }
 });
 
+// CustomerMember.role's three values (models/CustomerMember.ts) — the set
+// requireActiveMember + ensureTravellerWriteAccess between them accept for a
+// create. Compared against a plain trim+uppercase, NOT this file's own
+// normRole(): that one also strips underscores (WORKSPACE_LEADER ->
+// WORKSPACELEADER) because it exists to fold User.roles[] spellings, and
+// CustomerMember.role stores the underscored literal.
+//
+// Note the model declares these only as a TS union — the Mongoose field
+// carries no enum — so an unrecognised role IS reachable from the DB and
+// must resolve to false here rather than be assumed away.
+const VISA_TRAVELLER_CREATE_ROLES = new Set([
+  "WORKSPACE_LEADER",
+  "APPROVER",
+  "REQUESTER",
+]);
+
+/**
+ * capabilities.canCreate for GET /travellers — a PREDICTION of what POST
+ * /api/workspace/travellers (the endpoint AddTravellerModal actually posts
+ * to, see its file header) will decide, so the picker can withhold an Add
+ * control that would otherwise only fail on submit.
+ *
+ * That route gates on requireActiveMember and THEN
+ * ensureTravellerWriteAccess(..., "create") — and for the "create" action
+ * the second of those adds nothing beyond a recognised role, so the whole
+ * decision reduces to requireActiveMember's own test, restated here:
+ * SUPERADMIN passes outright; everyone else needs an active CustomerMember
+ * row for THIS workspace's customer (req.workspace.customerId, the same id
+ * requireActiveMember reads — not req.user.customerId) whose role is one of
+ * CustomerMember's three values. A staff/HOUSE account browsing /visa/apply
+ * has no such row, which is precisely the 403 this flag exists to predict.
+ *
+ * Deliberately restated rather than imported from workspace.travellers.ts:
+ * that module is a Router whose import chain pulls in customerUsers.ts,
+ * multer and exceljs, none of which this read has any business loading.
+ * Kept narrow enough (membership, not the write matrix) that it has no
+ * branch of its own to drift.
+ *
+ * Advisory only — it is NOT a gate on this read, and must never become one.
+ * Any authenticated workspace user may still SEE the roster; that
+ * read-vs-write split is workspace.travellers.ts's documented design
+ * (its file header §"Read-vs-write RBAC split"). false here removes a
+ * button, never a traveller.
+ */
+async function resolveTravellerCanCreate(req: any): Promise<boolean> {
+  if (isSuperAdmin(req)) return true;
+
+  const customerId = req.workspace?.customerId;
+  const email = req.user?.email;
+  if (!customerId || !email) return false;
+
+  const member: any = await CustomerMember.findOne({
+    customerId: String(customerId),
+    email: String(email).toLowerCase(),
+  })
+    .select("role isActive")
+    .lean();
+
+  if (!member || member.isActive === false) return false;
+  return VISA_TRAVELLER_CREATE_ROLES.has(
+    String(member.role ?? "").trim().toUpperCase(),
+  );
+}
+
 /* ─────────────────────────────────────────────────────────────────────
  * GET /travellers — picker data for screen 3 (traveller selection).
  *
@@ -840,6 +905,24 @@ router.get("/content/:iso2", async (req: any, res: any) => {
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/travellers", async (req: any, res: any) => {
   try {
+    // Cross-tenant guard — the same one workspace.travellers.ts applies to
+    // every one of its own TravellerProfile handlers (requireWorkspaceContext,
+    // see its doc comment for the full failure mode). requireWorkspace's
+    // SUPERADMIN bypass only attaches req.workspaceObjectId when an explicit
+    // workspaceId reached it via body/query/params/header or the JWT; a
+    // SUPERADMIN session with none of those leaves it undefined. Here that is
+    // worse than the quiet-empty-result it causes there: Mongoose STRIPS an
+    // undefined value out of the filter rather than matching on it, so
+    // { workspaceId: undefined, isActive: true } degrades to { isActive: true }
+    // — every active TravellerProfile in every workspace, masked passports and
+    // all. Fail loudly before the query instead.
+    if (!req.workspaceObjectId) {
+      return res.status(400).json({
+        error:
+          "No workspace context. SUPERADMIN: pass workspaceId in body, query, or x-workspace-id header.",
+      });
+    }
+
     const workspaceId = req.workspaceObjectId;
     const docs = await TravellerProfile.find({ workspaceId, isActive: true })
       .select(
@@ -865,7 +948,11 @@ router.get("/travellers", async (req: any, res: any) => {
       isWorkspaceMember: !!d.linkedMemberId,
     }));
 
-    res.json({ ok: true, travellers });
+    res.json({
+      ok: true,
+      travellers,
+      capabilities: { canCreate: await resolveTravellerCanCreate(req) },
+    });
   } catch (err: any) {
     console.error("[visa travellers GET]", err?.message);
     res
