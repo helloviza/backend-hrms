@@ -400,3 +400,33 @@ export function getVisaDocumentTypeSeed(code: string): VisaDocumentTypeSeed | un
   const canonical = canonicalizeVisaDocumentCode(code);
   return VISA_DOCUMENT_TYPE_CATALOGUE.find((d) => d.code === canonical);
 }
+
+/** The passport's canonical code. Its legacy twin ("DOC-01") resolves here. */
+export const PASSPORT_CANONICAL_DOC_CODE = "PASSPORT_ORIGINAL";
+
+/**
+ * The ONLY passport-identity test in the system. Every consumer — the OCR
+ * trigger, the confirm/write-back gate, the checklist row's isPassport flag,
+ * the document summary's — goes through this, so "DOC-01" and
+ * "PASSPORT_ORIGINAL" are one thing everywhere and a third alias added to the
+ * catalogue later is picked up by all of them at once.
+ *
+ * WHY THIS EXISTS (2026-08-08): the OCR trigger, the confirm gate and the
+ * frontend's own mirrored copy of the code all compared raw-equal to the
+ * LEGACY "DOC-01". Applications built from documentGroups carry the catalogue
+ * code, so every passport uploaded from 2026-08-03 onward silently skipped
+ * extraction (5 documents stuck PENDING with no fields) AND read as
+ * "no passport uploaded" at the review gate. Note this file's own
+ * OLD_TO_NEW_DOC_CODE_MAP and visaChecklistHydration.ts's withCanonicalAliases
+ * had already solved exactly this hazard for DOC-07/08/09 — the passport was
+ * simply never given the same treatment.
+ *
+ * Deliberately NOT driven off the catalogue's `ocrExtractable` flag, even
+ * though that is true for this one entry and nothing else today: extraction
+ * runs a TD3-passport-specific MRZ parser (utils/mrz.ts), so a future
+ * OCR-able non-passport type must not start firing it by inheriting a flag.
+ */
+export function isPassportDocCode(code: string | null | undefined): boolean {
+  if (!code) return false;
+  return canonicalizeVisaDocumentCode(String(code)) === PASSPORT_CANONICAL_DOC_CODE;
+}

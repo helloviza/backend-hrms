@@ -444,8 +444,8 @@ describe("GET /rules", () => {
     const res = await request(makeApp()).get("/rules?destination=DE&purpose=TOURIST");
     const docs = res.body.variants[0].documents;
     expect(docs).toEqual([
-      { docCode: "DOC-01", name: "Passport", category: "IDENTITY", notes: expect.any(String), requirement: "REQUIRED", condition: undefined, satisfiedByBooking: false, conciergeArrangeable: false },
-      { docCode: "DOC-03", name: "Bank Statement", category: "FINANCIAL", notes: expect.any(String), requirement: "CONDITIONAL", condition: "If self-employed", satisfiedByBooking: false, conciergeArrangeable: false },
+      { docCode: "DOC-01", name: "Passport", category: "IDENTITY", notes: expect.any(String), requirement: "REQUIRED", condition: undefined, satisfiedByBooking: false, conciergeArrangeable: false, isPassport: true },
+      { docCode: "DOC-03", name: "Bank Statement", category: "FINANCIAL", notes: expect.any(String), requirement: "CONDITIONAL", condition: "If self-employed", satisfiedByBooking: false, conciergeArrangeable: false, isPassport: false },
     ]);
   });
 

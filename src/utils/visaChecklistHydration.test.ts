@@ -17,8 +17,29 @@ describe("hydrateVisaChecklist — documents (flat, per physical document)", () 
         requirement: "REQUIRED",
         satisfiedByBooking: false,
         conciergeArrangeable: false,
+        // Legacy code still resolves as the passport (2026-08-08) — the fix
+        // for PASSPORT_ORIGINAL must not cost the DOC-01 path.
+        isPassport: true,
       },
     ]);
+  });
+
+  // 2026-08-08 — the row now tells the client WHAT it is, because the client
+  // can't resolve the passport's two codes itself. Both forms must set it.
+  it("sets isPassport for both the legacy and catalogue passport codes, and nothing else", () => {
+    const legacy = hydrateVisaChecklist({
+      documentRequirements: [{ docCode: "DOC-01", requirement: "REQUIRED" as const }],
+    });
+    const catalogue = hydrateVisaChecklist({
+      documentRequirements: [{ docCode: "PASSPORT_ORIGINAL", requirement: "REQUIRED" as const }],
+    });
+    const other = hydrateVisaChecklist({
+      documentRequirements: [{ docCode: "DOC-03", requirement: "REQUIRED" as const }],
+    });
+
+    expect(legacy.documents[0].isPassport).toBe(true);
+    expect(catalogue.documents[0].isPassport).toBe(true);
+    expect(other.documents[0].isPassport).toBe(false);
   });
 
   it("flattens a multi-document group into one row per physical document, all sharing the group's requirement/condition", () => {

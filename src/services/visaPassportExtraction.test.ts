@@ -177,6 +177,27 @@ describe("runVisaPassportExtraction", () => {
     expect(PASSPORT_DOC_CODE).toBe("DOC-01");
   });
 
+  // 2026-08-08 regression. The guard used to be `doc.docCode !==
+  // PASSPORT_DOC_CODE`, so a document carrying the CATALOGUE passport code
+  // (which every documentGroups application uses) returned early and never
+  // ran — 5 real documents sat PENDING with no extractedFields. Both codes
+  // must reach Gemini identically.
+  it("runs for the catalogue passport code PASSPORT_ORIGINAL, not just legacy DOC-01", async () => {
+    const doc = makeDoc({ docCode: "PASSPORT_ORIGINAL" });
+    await runVisaPassportExtraction(String(doc._id));
+
+    expect(getObjectBufferMock).toHaveBeenCalled();
+    expect(extractMock).toHaveBeenCalled();
+  });
+
+  it("still runs for the legacy DOC-01 (no regression on the old path)", async () => {
+    const doc = makeDoc({ docCode: "DOC-01" });
+    await runVisaPassportExtraction(String(doc._id));
+
+    expect(getObjectBufferMock).toHaveBeenCalled();
+    expect(extractMock).toHaveBeenCalled();
+  });
+
   it("never calls Gemini for a non-passport docCode (defense in depth)", async () => {
     const doc = makeDoc({ docCode: "DOC-07" });
     await runVisaPassportExtraction(String(doc._id));

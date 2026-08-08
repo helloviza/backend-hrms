@@ -18,7 +18,9 @@
 //
 // Phase 4b (added below) — passport MRZ extraction. The upload route now
 // fires services/visaPassportExtraction.ts asynchronously (never awaited)
-// for docCode === PASSPORT_DOC_CODE only; every other docCode still stays
+// for the passport document type only (isPassportDocCode, which resolves
+// BOTH the legacy DOC-01 and the catalogue PASSPORT_ORIGINAL); every other
+// docCode still stays
 // PENDING with no extraction. PATCH /documents/:id/extracted-fields is the
 // ONLY path that ever writes extracted passport data onto a
 // TravellerProfile, and only after explicit user confirmation — extraction
@@ -109,10 +111,8 @@ import { presignGetObject } from "../utils/s3Presign.js";
 import VisaTemplate from "../models/VisaTemplate.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
-import {
-  runVisaPassportExtraction,
-  PASSPORT_DOC_CODE,
-} from "../services/visaPassportExtraction.js";
+import { runVisaPassportExtraction } from "../services/visaPassportExtraction.js";
+import { isPassportDocCode } from "../config/visaDocumentTypeCatalogue.js";
 import { resolveMrzDate } from "../utils/mrz.js";
 import VisaActivityLog, {
   logVisaActivity,
@@ -2248,6 +2248,11 @@ function mapDocumentSummary(d: any) {
     id: String(d._id),
     applicationId: String(d.applicationId),
     docCode: d.docCode,
+    // Server-derived, for the same reason the checklist row carries it (see
+    // HydratedChecklistDocumentRow.isPassport): consumers ask "is this the
+    // passport", and the answer depends on an alias map only the server
+    // holds. hasPassportUploaded / the poll trigger read THIS, never docCode.
+    isPassport: isPassportDocCode(d.docCode),
     version: d.version,
     originalFilename: d.originalFilename,
     mimeType: d.mimeType,
@@ -2362,9 +2367,13 @@ export async function createVisaDocumentUpload(opts: {
   });
 
   // Fire-and-forget — the upload response must never wait on extraction.
-  // Only the passport docCode ever triggers it; every other document type
-  // stays PENDING with no extraction, per the PRD.
-  if (docCode === PASSPORT_DOC_CODE) {
+  // Only the passport ever triggers it; every other document type stays
+  // PENDING with no extraction, per the PRD.
+  //
+  // isPassportDocCode, not `=== PASSPORT_DOC_CODE`: an application built from
+  // documentGroups sends the catalogue code (PASSPORT_ORIGINAL), and the raw
+  // equality this used to be silently skipped every one of them.
+  if (isPassportDocCode(docCode)) {
     runVisaPassportExtraction(String(doc._id)).catch((err: any) => {
       visaLogger.error("visa passport extraction trigger failed", {
         documentId: String(doc._id),
@@ -2866,7 +2875,7 @@ router.patch(
               "confirmed must be true — write-back requires explicit user confirmation",
           });
       }
-      if (doc.docCode !== PASSPORT_DOC_CODE) {
+      if (!isPassportDocCode(doc.docCode)) {
         return res
           .status(400)
           .json({

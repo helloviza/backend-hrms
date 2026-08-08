@@ -28,7 +28,7 @@ import {
   type VisaChecklistSource,
 } from "./visaChecklistResolver.js";
 import { getVisaDocumentCodeDef } from "../config/visaDocumentCodes.js";
-import { OLD_TO_NEW_DOC_CODE_MAP } from "../config/visaDocumentTypeCatalogue.js";
+import { OLD_TO_NEW_DOC_CODE_MAP, isPassportDocCode } from "../config/visaDocumentTypeCatalogue.js";
 import type { VisaApplicantProfile } from "../models/visaAttributes.js";
 
 const LINKABLE_DOC_CODE_SERVICE_BASE: Record<string, "FLIGHT" | "HOTEL"> = {
@@ -67,6 +67,12 @@ export interface HydratedChecklistDocumentRow {
   condition?: string;
   satisfiedByBooking: boolean;
   conciergeArrangeable: boolean;
+  // Server-derived passport identity, same pattern as the two booleans above:
+  // the client is told WHAT this row is, never left to re-derive it from the
+  // code. The frontend used to hold its own PASSPORT_DOC_CODE = "DOC-01" and
+  // silently mis-answered for every documentGroups application — see
+  // isPassportDocCode (config/visaDocumentTypeCatalogue.ts).
+  isPassport: boolean;
 }
 
 export interface HydratedChecklistGroupSummary {
@@ -115,6 +121,7 @@ function hydrateDocumentRow(
     requirement: item.requirement,
     satisfiedByBooking: !!(service && linkedServices?.has(service)),
     conciergeArrangeable: CONCIERGE_ARRANGEABLE_DOC_CODES.has(docCode),
+    isPassport: isPassportDocCode(docCode),
   };
   if (item.condition) row.condition = item.condition;
   return row;

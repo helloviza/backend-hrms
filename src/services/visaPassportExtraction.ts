@@ -64,14 +64,25 @@ import { extractPassportMrzViaGemini } from "./extractPassportGemini.js";
 import { getObjectBuffer } from "../utils/s3Upload.js";
 import { parseTD3MrzWithRepair, maskMrzLine, deriveConfidence, type MrzCheckField } from "../utils/mrz.js";
 import { crossCheckPassportFields, crossCheckPassportIdentity } from "../utils/passportCrossCheck.js";
+import { isPassportDocCode } from "../config/visaDocumentTypeCatalogue.js";
 import logger from "../utils/logger.js";
 import { logVisaActivity } from "../models/VisaActivityLog.js";
 
 const extractionLogger = logger.child({ module: "visa-extraction" });
 
-// The only docCode extraction ever runs for — see config/visaDocumentCodes.ts.
-// Every other document type stays PENDING with no extraction, per the PRD:
-// we validate those rather than pretending to read them.
+// The only document type extraction ever runs for. Every other type stays
+// PENDING with no extraction, per the PRD: we validate those rather than
+// pretending to read them.
+//
+// Identity is decided by isPassportDocCode (config/visaDocumentTypeCatalogue.ts),
+// NEVER by comparing against the literal below — the passport has two live
+// codes (legacy "DOC-01" and catalogue "PASSPORT_ORIGINAL") and a raw equality
+// against either one silently skips the other. That was the 2026-08-08 bug;
+// see isPassportDocCode's own comment.
+//
+// PASSPORT_DOC_CODE stays exported as the legacy literal purely so existing
+// callers/tests that need A code (rather than a test) keep resolving. It is
+// not the definition of "is this a passport".
 export const PASSPORT_DOC_CODE = "DOC-01";
 
 // The three UI-facing failure buckets (routes/visa.ts's mapDocumentSummary
@@ -154,8 +165,9 @@ export async function runVisaPassportExtraction(documentId: string): Promise<voi
 
   // Defense in depth — the caller (routes/visa.ts) already gates on
   // docCode before invoking this, but this function must be safe to call
-  // on its own too.
-  if (doc.docCode !== PASSPORT_DOC_CODE) return;
+  // on its own too. Canonical test, so a PASSPORT_ORIGINAL document isn't
+  // silently dropped here after the caller correctly let it through.
+  if (!isPassportDocCode(doc.docCode)) return;
 
   // Fetched once, up front — feeds the activity-log calls below (STARTED/
   // COMPLETED/FAILED all need requestId) and is reused later for the
