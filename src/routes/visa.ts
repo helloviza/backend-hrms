@@ -2243,6 +2243,33 @@ function actorId(req: any): any {
 // renders and lets the user edit these values, so the list endpoint this
 // screen polls (GET /applications/:applicationId/documents) must carry them,
 // not just extractionStatus. Still never s3Key or a signed URL.
+// Country-ish MRZ fields, projected to ISO-2 alongside the raw value.
+//
+// The stored value changes shape across the document's life: the MRZ gives
+// ISO-3 ("IND"), and after confirmation mergeConfirmedFields rewrites the
+// same key to the ISO-2 the converter produced ("IN"). Neither is what a
+// client can render as a country NAME, and the ISO-3 -> ISO-2 table lives
+// only in utils/countryCodes.ts — server-side.
+//
+// So the server projects it once, here, rather than every consumer carrying
+// a mapping. That is the same call as isPassport above and for the same
+// reason: the frontend's own copy of a code table is exactly what drifted in
+// the DOC-01/PASSPORT_ORIGINAL bug. normaliseToIso2 accepts ISO-2, ISO-3,
+// names and demonyms, so it handles both lifecycle states idempotently and
+// simply omits anything it can't resolve (the client then falls back to
+// showing the raw value).
+const ISO2_PROJECTED_FIELDS = ["issuingState", "nationality"] as const;
+
+function projectExtractedIso2(extractedFields: any[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of ISO2_PROJECTED_FIELDS) {
+    const raw = extractedFields.find((f: any) => f?.key === key)?.value;
+    const iso2 = raw ? normaliseToIso2(String(raw)) : null;
+    if (iso2) out[key] = iso2;
+  }
+  return out;
+}
+
 function mapDocumentSummary(d: any) {
   return {
     id: String(d._id),
@@ -2261,6 +2288,11 @@ function mapDocumentSummary(d: any) {
     uploadedAt: d.createdAt,
     extractionStatus: d.extractionStatus,
     extractedFields: d.extractedFields || [],
+    // Derived at READ time — deliberately a sibling, not merged into
+    // extractedFields, so that array stays a faithful mirror of what
+    // extraction actually stored and can never be mistaken for a confirmed
+    // value by mergeConfirmedFields.
+    extractedIso2: projectExtractedIso2(d.extractedFields || []),
     extractionConfidence: d.extractionConfidence ?? null,
     reviewStatus: d.reviewStatus,
   };
@@ -2833,6 +2865,14 @@ const PASSPORT_FIELD_CONVERTERS: Record<
   },
 };
 
+// MRZ sex character -> TravellerProfile.gender. "<" ("not stated") is
+// deliberately absent, so it maps to undefined and is skipped — see the
+// fill-if-blank block in the PATCH route below.
+const MRZ_SEX_TO_PROFILE_GENDER: Record<string, string> = {
+  M: "Male",
+  F: "Female",
+};
+
 // Overwrites matching keys in the document's stored extractedFields with
 // the confirmed values so the record reflects what was actually written,
 // while leaving every check_* entry (and any unrelated key) untouched.
@@ -2926,6 +2966,38 @@ router.patch(
         return res
           .status(400)
           .json({ error: "No recognised passport fields were provided" });
+      }
+
+      // ── MRZ sex -> profile gender, FILL-IF-BLANK ONLY ──────────────────
+      // Mirrors the names refusal (surname/givenNames are never written over
+      // a human-entered name) but resolves the opposite case: /visa/apply's
+      // compact add-traveller form doesn't ask for gender at all, so these
+      // profiles routinely have none, and the passport states it
+      // authoritatively. Filling an EMPTY field takes nothing away; changing
+      // a set one would overrule the person about their own record, which
+      // this must never do.
+      //
+      // Read off the DOCUMENT's own stored extraction, never the request
+      // body: sex is not in PASSPORT_FIELD_CONVERTERS and is not editable in
+      // the UI, so a client can neither ask for this nor forge the value.
+      //
+      // "<" (MRZ for "not stated") is skipped entirely rather than mapped to
+      // "Other" — the document declining to state a sex is not the same
+      // claim as the person selecting Other, and inventing that distinction
+      // would be worse than leaving the field blank.
+      //
+      // TravellerProfile.gender has no schema enum; "Male"/"Female" is the
+      // de-facto vocabulary shared with the traveller form's own select and
+      // SBTRequest's real enum.
+      const existingGender = String((traveller as any).gender ?? "").trim();
+      if (!existingGender) {
+        const mrzSex = String(
+          (doc.extractedFields || []).find((f: any) => f?.key === "sex")?.value ?? "",
+        )
+          .trim()
+          .toUpperCase();
+        const mappedGender = MRZ_SEX_TO_PROFILE_GENDER[mrzSex];
+        if (mappedGender) profilePatch.gender = mappedGender;
       }
 
       const confirmedBy = actorId(req);

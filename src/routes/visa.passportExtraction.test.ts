@@ -313,6 +313,88 @@ describe("PATCH /documents/:documentId/extracted-fields", () => {
     expect(doc.reviewStatus).toBe("PENDING");
   });
 
+  // ── MRZ sex -> profile gender, fill-if-blank (2026-08-08) ────────────
+  // Sex is not user-editable and is not in PASSPORT_FIELD_CONVERTERS, so it
+  // is applied from the DOCUMENT's own stored extraction. The rule mirrors
+  // the names refusal in the opposite direction: fill what's empty, never
+  // overrule what a person set.
+  describe("MRZ sex -> profile gender", () => {
+    it("fills gender from MRZ sex when the profile's gender is blank", async () => {
+      const app = applicationDoc(WORKSPACE_A);
+      const traveller = travellerDoc(WORKSPACE_A, { _id: app.travellerProfileId, gender: "" });
+      const doc = documentDoc(WORKSPACE_A, app._id, {
+        extractedFields: [
+          { key: "documentNumber", value: "L898902C3" },
+          { key: "sex", value: "F" },
+        ],
+      });
+
+      const res = await request(makeApp(WORKSPACE_A))
+        .patch(`/documents/${doc._id}/extracted-fields`)
+        .send({ confirmed: true, fields: { documentNumber: "L898902C3" } });
+
+      expect(res.status).toBe(200);
+      expect(traveller.gender).toBe("Female");
+    });
+
+    it("maps M to Male", async () => {
+      const app = applicationDoc(WORKSPACE_A);
+      const traveller = travellerDoc(WORKSPACE_A, { _id: app.travellerProfileId, gender: "" });
+      const doc = documentDoc(WORKSPACE_A, app._id, {
+        extractedFields: [{ key: "documentNumber", value: "L898902C3" }, { key: "sex", value: "M" }],
+      });
+
+      await request(makeApp(WORKSPACE_A))
+        .patch(`/documents/${doc._id}/extracted-fields`)
+        .send({ confirmed: true, fields: { documentNumber: "L898902C3" } });
+
+      expect(traveller.gender).toBe("Male");
+    });
+
+    it("NEVER overwrites a gender the traveller already has", async () => {
+      const app = applicationDoc(WORKSPACE_A);
+      const traveller = travellerDoc(WORKSPACE_A, { _id: app.travellerProfileId, gender: "Other" });
+      const doc = documentDoc(WORKSPACE_A, app._id, {
+        extractedFields: [{ key: "documentNumber", value: "L898902C3" }, { key: "sex", value: "F" }],
+      });
+
+      await request(makeApp(WORKSPACE_A))
+        .patch(`/documents/${doc._id}/extracted-fields`)
+        .send({ confirmed: true, fields: { documentNumber: "L898902C3" } });
+
+      expect(traveller.gender).toBe("Other");
+    });
+
+    it('skips "<" (not stated) rather than inventing "Other"', async () => {
+      const app = applicationDoc(WORKSPACE_A);
+      const traveller = travellerDoc(WORKSPACE_A, { _id: app.travellerProfileId, gender: "" });
+      const doc = documentDoc(WORKSPACE_A, app._id, {
+        extractedFields: [{ key: "documentNumber", value: "L898902C3" }, { key: "sex", value: "<" }],
+      });
+
+      await request(makeApp(WORKSPACE_A))
+        .patch(`/documents/${doc._id}/extracted-fields`)
+        .send({ confirmed: true, fields: { documentNumber: "L898902C3" } });
+
+      expect(traveller.gender).toBe("");
+    });
+
+    it("a client cannot set gender by sending it in the request body", async () => {
+      const app = applicationDoc(WORKSPACE_A);
+      const traveller = travellerDoc(WORKSPACE_A, { _id: app.travellerProfileId, gender: "" });
+      const doc = documentDoc(WORKSPACE_A, app._id, {
+        extractedFields: [{ key: "documentNumber", value: "L898902C3" }],
+      });
+
+      await request(makeApp(WORKSPACE_A))
+        .patch(`/documents/${doc._id}/extracted-fields`)
+        .send({ confirmed: true, fields: { documentNumber: "L898902C3", sex: "M", gender: "Male" } });
+
+      // No sex on the document, and the body is not a source for it.
+      expect(traveller.gender).toBe("");
+    });
+  });
+
   it("400s for a non-passport document — only passport fields are ever written back", async () => {
     const app = applicationDoc(WORKSPACE_A);
     travellerDoc(WORKSPACE_A, { _id: app.travellerProfileId });

@@ -771,6 +771,80 @@ describe("DELETE /documents/:documentId", () => {
   });
 });
 
+// ── ISO-2 projection for the country-ish MRZ fields (2026-08-08) ────────
+// The client renders these through CountryPicker, which is ISO-2 keyed, and
+// the ISO-3 -> ISO-2 table is backend-only. The stored value is ISO-3 before
+// confirmation and ISO-2 after (mergeConfirmedFields writes the converter's
+// output), so the projection has to normalise BOTH without the client ever
+// knowing which state it's looking at.
+function insertPassportDoc(applicationId: any, extractedFields: { key: string; value: string }[]) {
+  return documents.insert({
+    workspaceId: WORKSPACE_A,
+    applicationId,
+    docCode: "PASSPORT_ORIGINAL",
+    version: 1,
+    originalFilename: "passport.jpg",
+    mimeType: "image/jpeg",
+    sizeBytes: 10,
+    uploadedByUserId: USER_A,
+    extractionStatus: "COMPLETED",
+    extractionConfidence: "high",
+    reviewStatus: "PENDING",
+    extractedFields,
+    deletedAt: null,
+  });
+}
+
+describe("mapDocumentSummary — extractedIso2", () => {
+  it("projects the MRZ's ISO-3 to ISO-2 alongside the untouched raw value", async () => {
+    const app = applicationDoc(WORKSPACE_A);
+    insertPassportDoc(app._id, [
+      { key: "issuingState", value: "IND" },
+      { key: "nationality", value: "IND" },
+    ]);
+
+    const res = await request(makeApp(WORKSPACE_A)).get(`/applications/${app._id}/documents`);
+    expect(res.status).toBe(200);
+    const d = res.body.documents[0];
+    expect(d.extractedIso2).toEqual({ issuingState: "IN", nationality: "IN" });
+    // The raw array is untouched — it must stay a mirror of what extraction
+    // stored, never rewritten by a read-time projection.
+    expect(d.extractedFields.find((f: any) => f.key === "issuingState").value).toBe("IND");
+  });
+
+  it("is idempotent for an already-confirmed ISO-2 value", async () => {
+    const app = applicationDoc(WORKSPACE_A);
+    insertPassportDoc(app._id, [
+      { key: "issuingState", value: "IN" },
+      { key: "nationality", value: "IN" },
+    ]);
+
+    const res = await request(makeApp(WORKSPACE_A)).get(`/applications/${app._id}/documents`);
+    expect(res.body.documents[0].extractedIso2).toEqual({ issuingState: "IN", nationality: "IN" });
+  });
+
+  it("omits a key it cannot resolve rather than emitting a bad code", async () => {
+    const app = applicationDoc(WORKSPACE_A);
+    insertPassportDoc(app._id, [
+      { key: "issuingState", value: "ZZZ" },
+      { key: "nationality", value: "IND" },
+    ]);
+
+    const res = await request(makeApp(WORKSPACE_A)).get(`/applications/${app._id}/documents`);
+    const iso2 = res.body.documents[0].extractedIso2;
+    expect("issuingState" in iso2).toBe(false);
+    expect(iso2.nationality).toBe("IN");
+  });
+
+  it("is an empty object when the document has no country fields at all", async () => {
+    const app = applicationDoc(WORKSPACE_A);
+    insertPassportDoc(app._id, [{ key: "documentNumber", value: "L898902C3" }]);
+
+    const res = await request(makeApp(WORKSPACE_A)).get(`/applications/${app._id}/documents`);
+    expect(res.body.documents[0].extractedIso2).toEqual({});
+  });
+});
+
 describe("GET /applications/:applicationId/travel-bookings", () => {
   it("404s for an application belonging to another workspace", async () => {
     const app = applicationDoc(WORKSPACE_B);
