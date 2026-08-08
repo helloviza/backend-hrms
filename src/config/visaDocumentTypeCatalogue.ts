@@ -427,6 +427,30 @@ export const PASSPORT_CANONICAL_DOC_CODE = "PASSPORT_ORIGINAL";
  * OCR-able non-passport type must not start firing it by inheriting a flag.
  */
 export function isPassportDocCode(code: string | null | undefined): boolean {
+  return matchesCanonicalDocCode(code, PASSPORT_CANONICAL_DOC_CODE);
+}
+
+/** The photograph's canonical code. Its legacy twin ("DOC-02") resolves here. */
+export const PHOTOGRAPH_CANONICAL_DOC_CODE = "PHOTOGRAPH";
+
+/**
+ * Same contract as isPassportDocCode, for the applicant photograph — used by
+ * the review screen to find the photo to display. Routed through the alias
+ * map for the same reason: a rule built from documentGroups carries
+ * "PHOTOGRAPH" while a legacy one carries "DOC-02", and a raw equality
+ * against either silently misses the other. That was the 2026-08-08 passport
+ * bug; it is not repeated here.
+ */
+export function isPhotographDocCode(code: string | null | undefined): boolean {
+  return matchesCanonicalDocCode(code, PHOTOGRAPH_CANONICAL_DOC_CODE);
+}
+
+/**
+ * Shared body for the per-type predicates above. Extracted at the second one
+ * rather than the third: two hand-copied canonicalise-and-compare bodies is
+ * exactly how the first alias bug got missed on one of its call sites.
+ */
+function matchesCanonicalDocCode(code: string | null | undefined, canonical: string): boolean {
   if (!code) return false;
-  return canonicalizeVisaDocumentCode(String(code)) === PASSPORT_CANONICAL_DOC_CODE;
+  return canonicalizeVisaDocumentCode(String(code)) === canonical;
 }

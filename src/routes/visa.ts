@@ -112,7 +112,7 @@ import VisaTemplate from "../models/VisaTemplate.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import { runVisaPassportExtraction } from "../services/visaPassportExtraction.js";
-import { isPassportDocCode } from "../config/visaDocumentTypeCatalogue.js";
+import { isPassportDocCode, isPhotographDocCode } from "../config/visaDocumentTypeCatalogue.js";
 import { resolveMrzDate } from "../utils/mrz.js";
 import VisaActivityLog, {
   logVisaActivity,
@@ -2289,6 +2289,11 @@ function mapDocumentSummary(d: any) {
     // passport", and the answer depends on an alias map only the server
     // holds. hasPassportUploaded / the poll trigger read THIS, never docCode.
     isPassport: isPassportDocCode(d.docCode),
+    // Server-derived for the same reason as isPassport: the review screen
+    // renders the applicant's photograph and has to FIND it, and which
+    // docCode that is depends on an alias map only the server holds
+    // (legacy "DOC-02" vs catalogue "PHOTOGRAPH"). Never compared client-side.
+    isPhotograph: isPhotographDocCode(d.docCode),
     version: d.version,
     originalFilename: d.originalFilename,
     mimeType: d.mimeType,
