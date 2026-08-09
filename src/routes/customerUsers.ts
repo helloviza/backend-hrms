@@ -693,7 +693,7 @@ function pickSendInviteFlag(body: any, fallback = true): boolean {
   return fallback;
 }
 
-async function trySendInviteEmailSafe(params: { to: string; customerId: string; inviterEmail: string; inviteeName?: string }) {
+export async function trySendInviteEmailSafe(params: { to: string; customerId: string; inviterEmail: string; inviteeName?: string }) {
   if (emailsDisabled()) {
     return { inviteEmailSent: false, inviteEmailSkipped: true as const, inviteEmailError: "DISABLE_EMAILS enabled" };
   }
@@ -736,7 +736,13 @@ async function sendInviteEmail(params: { to: string; customerId: string; inviter
 
 type MemberRole = "WORKSPACE_LEADER" | "APPROVER" | "REQUESTER";
 
-async function ensureAuthUserForCustomer(params: {
+// Exported (alongside trySendInviteEmailSafe below) so routes/workspace.
+// travellers.ts can reuse this exact account-creation machinery when a
+// CSTEP traveller is added, instead of hand-rolling a parallel login-
+// creation path — same idempotent lookup, same temp-password issuance,
+// same invite email. Mirrors the existing cross-file reuse of
+// isStaffPrivileged (see routes/billingProfiles.ts).
+export async function ensureAuthUserForCustomer(params: {
   email: string;
   name?: string;
   customerId: string;
