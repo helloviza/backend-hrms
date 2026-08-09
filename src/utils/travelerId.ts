@@ -1,6 +1,7 @@
 // apps/backend/src/utils/travelerId.ts
 import Customer from "../models/Customer.js";
 import CustomerMember from "../models/CustomerMember.js";
+import TravellerProfile from "../models/TravellerProfile.js";
 
 const STOP_WORDS = new Set([
   "for", "of", "and", "the", "a", "an", "in", "to", "by", "at", "or",
@@ -58,6 +59,41 @@ export async function generateTravelerId(
     if (!isNaN(num) && num > maxNum) maxNum = num;
   }
 
+  const next = maxNum + 1;
+  const padded = next < 1000 ? String(next).padStart(3, "0") : String(next);
+  return `${prefix}${padded}`;
+}
+
+/**
+ * Same "<CODE>-NNN" scheme as generateTravelerId, but scoped to
+ * TravellerProfile.workspaceId (CustomerWorkspace._id) instead of
+ * CustomerMember.customerId (Customer._id) — the two collections use
+ * different id-spaces (see docs/prd/traveller-profiles.md §1.1). Shared by
+ * workspace.travellers.ts (Add/bulk import) and travellerAutoCapture.ts
+ * (booking auto-capture) so travelerId minting has exactly one
+ * implementation regardless of caller.
+ */
+export async function mintTravellerProfileId(workspaceId: string | any, customerId: string | any): Promise<string> {
+  const customer = await Customer.findById(customerId)
+    .select("legalName name workspaceCode")
+    .lean();
+  const resolvedName = (customer as any)?.legalName || (customer as any)?.name || "Traveller";
+  const code = deriveWorkspaceCode(resolvedName, (customer as any)?.workspaceCode);
+  const prefix = `${code}-`;
+
+  const existing = await TravellerProfile.find({
+    workspaceId,
+    travelerId: { $regex: `^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}` },
+  })
+    .select("travelerId")
+    .lean();
+
+  let maxNum = 0;
+  for (const t of existing as any[]) {
+    const parts = String(t.travelerId || "").split("-");
+    const num = parseInt(parts[parts.length - 1] || "0", 10);
+    if (!isNaN(num) && num > maxNum) maxNum = num;
+  }
   const next = maxNum + 1;
   const padded = next < 1000 ? String(next).padStart(3, "0") : String(next);
   return `${prefix}${padded}`;

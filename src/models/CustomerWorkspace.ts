@@ -30,6 +30,11 @@ export interface WorkspaceFeatures {
   vouchersEnabled?: boolean;
   invoicesEnabled?: boolean;
   ticketsEnabled?: boolean;
+
+  // CSTEP Travel & Claim Portal module master switch. SCHEMA DEFAULT false —
+  // new module, not part of any tenant plan preset yet; granted only by
+  // superadmin toggle.
+  cstepEnabled?: boolean;
 }
 
 export type WorkspacePlan = "trial" | "starter" | "growth" | "enterprise";
@@ -74,6 +79,7 @@ export interface CustomerWorkspaceDocument extends Document {
 
   defaultApproverEmails: string[];
   canApproverCreateUsers: boolean;
+  canApproverManageTravellers: boolean;
   userCreationEnabled: boolean;
 
   userCreationAllowlistEmails: string[];
@@ -229,6 +235,10 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
 
     defaultApproverEmails: { type: [String], default: [] },
     canApproverCreateUsers: { type: Boolean, default: true },
+    // Default ON — travellers are lower-risk than user/role management, and
+    // the point of Traveller Profiles is removing booking friction for
+    // whoever actually books (see docs/prd/traveller-profiles.md §2.2).
+    canApproverManageTravellers: { type: Boolean, default: true },
     userCreationEnabled: { type: Boolean, default: false, index: true },
 
     userCreationAllowlistEmails: { type: [String], default: [] },
@@ -294,6 +304,10 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         vouchersEnabled: { type: Boolean, default: false },
         invoicesEnabled: { type: Boolean, default: false },
         ticketsEnabled: { type: Boolean, default: false },
+        // CSTEP Travel & Claim Portal master switch. SCHEMA DEFAULT false —
+        // gated off until granted by superadmin toggle. Not enabled in any
+        // tenant plan preset (see getDefaultFeaturesForPlan below).
+        cstepEnabled: { type: Boolean, default: false },
       },
     },
 
