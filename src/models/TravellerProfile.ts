@@ -32,6 +32,29 @@ export interface TravellerProfileDocument extends Document {
   claimedBy?: mongoose.Types.ObjectId; // ref User — who performed the claim
   claimedAt?: Date;
 
+  // Optional org department (2026-08-09). A REFERENCE to the existing
+  // workspace-scoped Department collection, never free text and never
+  // auto-created: an unknown name is an error to fix at the source, not a
+  // new row to mint, or the list degrades into the misspelt-duplicate mess
+  // free text always becomes.
+  //
+  // Department is scoped by workspaceId -> CustomerWorkspace, the SAME key
+  // this model uses, so "the traveller's workspace" and "the department's
+  // workspace" are the same field compared directly — there is no
+  // customerId/workspaceId translation step to get wrong.
+  //
+  // Optional by design: a traveller with no department is valid and always
+  // will be. Two of the four workspaces holding travellers in production
+  // have no Department rows at all, so requiring it would make those
+  // rosters unfillable. Unset reads as "No department" on the dashboard,
+  // never as an error.
+  //
+  // NOTE this is the first departmentId REFERENCE in the codebase — the
+  // HRMS side (User.department, and masterData.departments.ts's headcount
+  // aggregate) still joins Department by NAME STRING. Deliberately not
+  // copied: that pattern is why a rename silently orphans headcounts.
+  departmentId?: mongoose.Types.ObjectId | null;
+
   title?: string;
   firstName: string;
   middleName?: string;
@@ -48,6 +71,28 @@ export interface TravellerProfileDocument extends Document {
 
   mobile?: string;
   email?: string; // single fact: the traveller's own contact address — also the dedup/claim match key
+
+  // CSTEP Travel & Claim Portal (Phase 5) — this traveller's fixed Tour
+  // Approver, deliberately SEPARATE from any Expense reporting-manager
+  // (User.managerId). Optional: an unset value means the traveller's
+  // submitted proposals fall back to CSTEP Admin routing — see
+  // routes/cstep.ts. Set only via workspace.travellers.ts's dedicated
+  // PATCH /:id/tour-approver route, CSTEP-Admin-only.
+  tourApproverId?: mongoose.Types.ObjectId; // ref User
+
+  // CSTEP three-person mapping (Traveller → Approver → Official user →
+  // Finance user) — additive siblings of tourApproverId above, same rules:
+  // ANY workspace user may go in either slot (no role restriction), unset
+  // means that pipeline stage has nobody routed to it yet, and both are set
+  // only via the same CSTEP-Admin-only PATCH /:id/tour-approver route
+  // (extended to accept these two alongside tourApproverId — see
+  // routes/workspace.travellers.ts). officialUserId is who processes an
+  // APPROVED request; financeUserId is who handles it at the finance stage.
+  // Neither is read by approve/return/audit/status logic — routes/cstep.ts's
+  // GET /official-queue and GET /finance-queue are pure additional read
+  // filters on top of the unchanged CstepTravelRequest lifecycle.
+  officialUserId?: mongoose.Types.ObjectId; // ref User
+  financeUserId?: mongoose.Types.ObjectId; // ref User
 
   frequentFlyer: FrequentFlyerEntry[];
 
@@ -73,6 +118,8 @@ const TravellerProfileSchema = new Schema<TravellerProfileDocument>(
     claimedBy: { type: Schema.Types.ObjectId, ref: "User" },
     claimedAt: { type: Date },
 
+    departmentId: { type: Schema.Types.ObjectId, ref: "Department", default: null },
+
     title: { type: String, trim: true },
     firstName: { type: String, required: true, trim: true },
     middleName: { type: String, trim: true },
@@ -90,6 +137,10 @@ const TravellerProfileSchema = new Schema<TravellerProfileDocument>(
     mobile: { type: String, trim: true },
     email: { type: String, lowercase: true, trim: true },
 
+    tourApproverId: { type: Schema.Types.ObjectId, ref: "User", index: true },
+    officialUserId: { type: Schema.Types.ObjectId, ref: "User", index: true },
+    financeUserId: { type: Schema.Types.ObjectId, ref: "User", index: true },
+
     frequentFlyer: { type: [FrequentFlyerSchema], default: [] },
 
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
@@ -106,6 +157,8 @@ TravellerProfileSchema.index({ workspaceId: 1, travelerId: 1 }, { unique: true }
 TravellerProfileSchema.index({ workspaceId: 1, email: 1 });
 TravellerProfileSchema.index({ workspaceId: 1, firstName: 1, lastName: 1, dob: 1 }); // tier-2 dedup lookup
 TravellerProfileSchema.index({ workspaceId: 1, isActive: 1 });
+// Department grouping on /visa/workspace reads exactly this pair.
+TravellerProfileSchema.index({ workspaceId: 1, departmentId: 1 });
 
 const TravellerProfile: Model<TravellerProfileDocument> =
   mongoose.models.TravellerProfile ||

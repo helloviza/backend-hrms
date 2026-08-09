@@ -73,6 +73,7 @@ import VisaApplication, {
 } from "../models/VisaApplication.js";
 import VisaDocument from "../models/VisaDocument.js";
 import TravellerProfile from "../models/TravellerProfile.js";
+import Department from "../models/Department.js";
 import TravelBooking from "../models/TravelBooking.js";
 import User from "../models/User.js";
 import CustomerMember from "../models/CustomerMember.js";
@@ -926,10 +927,23 @@ router.get("/travellers", async (req: any, res: any) => {
     const workspaceId = req.workspaceObjectId;
     const docs = await TravellerProfile.find({ workspaceId, isActive: true })
       .select(
-        "firstName middleName lastName dob email nationality passportNo passportExpiry linkedMemberId",
+        "firstName middleName lastName dob email nationality passportNo passportExpiry linkedMemberId departmentId",
       )
       .sort({ firstName: 1, lastName: 1 })
       .lean();
+
+    // Department names for the /visa/workspace roster's grouping (2026-08-09).
+    // Resolved by id AND workspaceId in one query: a departmentId that
+    // somehow points outside this workspace yields no name rather than
+    // reading another tenant's Department row.
+    const deptIds = [...new Set((docs as any[]).map((d) => d.departmentId).filter(Boolean).map(String))];
+    const deptNameById = new Map<string, string>();
+    if (deptIds.length) {
+      const depts = await Department.find({ _id: { $in: deptIds }, workspaceId })
+        .select("_id name")
+        .lean();
+      for (const d of depts as any[]) deptNameById.set(String(d._id), d.name);
+    }
 
     const travellers = docs.map((d: any) => ({
       id: String(d._id),
@@ -941,6 +955,8 @@ router.get("/travellers", async (req: any, res: any) => {
       nationality: d.nationality ?? null,
       passportMasked: maskTailId(d.passportNo) ?? null,
       passportExpiry: d.passportExpiry ?? null,
+      departmentId: d.departmentId ? String(d.departmentId) : null,
+      departmentName: d.departmentId ? deptNameById.get(String(d.departmentId)) ?? null : null,
       // Phase 10b (task brief §3) — lets screen 3 skip asking
       // employmentStatus/sponsorType for a traveller who'll get them
       // corporate-defaulted anyway at POST /requests (see
