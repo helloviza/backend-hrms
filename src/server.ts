@@ -550,6 +550,18 @@ app.use("/api/admin/visa", adminVisaReportsRouter);
 import adminVisaDashboardRouter from "./routes/admin.visa.dashboard.js";
 app.use("/api/admin/visa", adminVisaDashboardRouter);
 
+// Visa module (2026-08-09) — the cross-workspace ROSTER: every customer
+// workspace with its real KPIs, and a drill-in to any one workspace's
+// full traveller roster. A fifth router at the same prefix, gated on the
+// same visaApplication READ.
+//
+// This one INVERTS the customer dashboard's scoping: the caller names an
+// arbitrary workspaceId instead of resolving to their own, so its gate is
+// the entire protection — registered router-level, before any handler.
+// See routes/admin.visa.roster.ts's file header for the full reasoning.
+import adminVisaRosterRouter from "./routes/admin.visa.roster.js";
+app.use("/api/admin/visa", adminVisaRosterRouter);
+
 // Visa module (Phase 10d) — bulk XLSX/CSV export+import for the fee/rule
 // master, so ops can review and edit many checklist-imported DRAFT rules
 // (pricing, ETA, visaCategory) in one pass instead of one at a time in the
