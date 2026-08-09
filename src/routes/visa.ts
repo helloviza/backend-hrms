@@ -1922,6 +1922,168 @@ router.get("/summary", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
+ * PLATFORM CAPABILITIES — build state, not workspace toggles.
+ *
+ * These say whether the PLATFORM can answer a question at all. They are
+ * deliberately NOT CustomerWorkspace feature flags: a per-tenant toggle
+ * would imply the capability exists and is merely switched off, which
+ * would be a lie for both of these today.
+ *
+ * Each is the SINGLE place to flip when the corresponding feature ships,
+ * and /visa/workspace reads them to decide between showing a real value
+ * and showing "not yet available". Nothing on that page hardcodes either
+ * state — flip one of these and the dashboard fills on its own.
+ * ───────────────────────────────────────────────────────────────────── */
+const VISA_PLATFORM_CAPABILITIES = {
+  /**
+   * Visa readiness scoring (the "AURA" engine in the design references).
+   * FALSE — the engine does not exist and there is no calculator route
+   * anywhere in the codebase. While false, the dashboard renders the
+   * scoring section and its launch control in a disabled/unavailable
+   * state and shows "—" in the per-traveller score column. It must never
+   * render a mean or a per-person score: that would be a false approval
+   * prediction about a real person's visa.
+   */
+  visaScoreEngine: false,
+
+  /**
+   * MRZ encryption-at-rest. FALSE — passport MRZ is stored unencrypted;
+   * encryption-at-rest was split out of the traveller-profiles work as
+   * its own unscheduled proposal and has not been built.
+   *
+   * This is what the dashboard's compliance slot keys off. While false it
+   * shows an honest in-progress state; it must NOT render the design
+   * reference's "100% DPDP 2023 Compliant / Zero unencrypted MRZ storage"
+   * claim, because that claim would be false and it is exactly the
+   * assurance a customer would rely on when deciding whether to upload
+   * passports. Flipping this to true is necessary but NOT sufficient for
+   * the DPDP wording — "we encrypt at rest" and "we are DPDP compliant"
+   * are different statements and the second needs its own sign-off.
+   */
+  mrzEncryptionAtRest: false,
+} as const;
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /workspace/metrics — the figures /visa/workspace shows that cannot
+ * be derived from the roster + request lists it already loads.
+ *
+ * Scoped by workspaceId, matching GET /travellers (the roster this page
+ * renders) rather than the customerId ORG scope GET /requests uses, so
+ * every number here describes exactly the same population as the table
+ * beneath it.
+ *
+ * THE CONTRACT THIS ENDPOINT EXISTS TO HONOUR: a real zero and "no source
+ * yet" are different answers and must never render the same. Every block
+ * below therefore returns a `tracked`/`available` boolean ALONGSIDE its
+ * value, so the client can say "none issued yet" where it means zero and
+ * "not yet tracked" where it means nothing has ever been captured. A
+ * bare 0 for spend would read as "this cost us nothing", which is false.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/workspace/metrics", async (req: any, res: any) => {
+  try {
+    if (!req.workspaceObjectId) {
+      return res.status(400).json({
+        error:
+          "No workspace context. SUPERADMIN: pass workspaceId in body, query, or x-workspace-id header.",
+      });
+    }
+    const workspaceId = req.workspaceObjectId;
+
+    const requests: any[] = await VisaRequest.find({ workspaceId })
+      .select("_id status")
+      .lean();
+    const liveRequestIds = requests.filter((r) => r.status !== "cancelled").map((r) => r._id);
+
+    const applications: any[] = liveRequestIds.length
+      ? await VisaApplication.find({ requestId: { $in: liveRequestIds } })
+          .select(
+            "_id travellerProfileId outcome visaExpiresAt actualEmbassyFeeInr actualVfsFeeInr actualPlumtripsServiceFeeInr",
+          )
+          .lean()
+      : [];
+
+    // Department for each traveller, so the per-department rows below
+    // describe the same buckets the roster groups by.
+    const travellers: any[] = await TravellerProfile.find({ workspaceId, isActive: true })
+      .select("_id departmentId")
+      .lean();
+    const deptByTraveller = new Map(
+      travellers.map((t) => [String(t._id), t.departmentId ? String(t.departmentId) : null]),
+    );
+
+    // ── ACTIVE VISAS HELD ─────────────────────────────────────────────
+    // A REAL count: applications whose outcome is APPROVED (the only
+    // approving value in VISA_APPLICATION_OUTCOMES — the enum is
+    // APPROVED/REJECTED/WITHDRAWN). Zero today, and zero is the truthful
+    // answer, not a missing source: the outcome field is captured by the
+    // concierge console, it simply has not been set on any application
+    // yet. The client labels it so 0 reads as "none issued yet".
+    //
+    // NOT filtered on visaExpiresAt: that would silently turn "issued but
+    // we never recorded an expiry" into "not held", under-reporting. When
+    // an expiry IS recorded the count of still-valid ones is reported
+    // separately so neither number has to lie.
+    const approved = applications.filter((a) => a.outcome === "APPROVED");
+    const now = Date.now();
+    const approvedWithExpiry = approved.filter((a) => a.visaExpiresAt);
+    const stillValid = approvedWithExpiry.filter((a) => new Date(a.visaExpiresAt).getTime() >= now);
+
+    // ── SPEND ─────────────────────────────────────────────────────────
+    // Sum of the ACTUAL charged fees (never indicativeCostSnapshot, which
+    // is an estimate and is not spend). `tracked` is false when NO
+    // application carries any actual fee at all — the difference between
+    // "this cost nothing" and "nobody has recorded what it cost", which
+    // is the whole reason this endpoint returns a flag beside the number.
+    const feeOf = (a: any) =>
+      (a.actualEmbassyFeeInr ?? 0) + (a.actualVfsFeeInr ?? 0) + (a.actualPlumtripsServiceFeeInr ?? 0);
+    const hasAnyFee = (a: any) =>
+      a.actualEmbassyFeeInr != null || a.actualVfsFeeInr != null || a.actualPlumtripsServiceFeeInr != null;
+    const costed = applications.filter(hasAnyFee);
+    const spendTracked = costed.length > 0;
+    const spendTotalInr = costed.reduce((s, a) => s + feeOf(a), 0);
+
+    // ── PER DEPARTMENT ────────────────────────────────────────────────
+    const perDepartment: Record<string, { activeVisas: number; spendInr: number; costedApplications: number }> = {};
+    const bucket = (key: string) =>
+      (perDepartment[key] ||= { activeVisas: 0, spendInr: 0, costedApplications: 0 });
+    for (const a of applications) {
+      const deptId = a.travellerProfileId ? deptByTraveller.get(String(a.travellerProfileId)) : null;
+      const key = deptId || "__none__";
+      const b = bucket(key);
+      if (a.outcome === "APPROVED") b.activeVisas += 1;
+      if (hasAnyFee(a)) {
+        b.costedApplications += 1;
+        b.spendInr += feeOf(a);
+      }
+    }
+
+    res.json({
+      ok: true,
+      activeVisasHeld: {
+        // Real count. 0 means none approved yet, not a missing source.
+        value: approved.length,
+        counted: true,
+        withRecordedExpiry: approvedWithExpiry.length,
+        stillValid: stillValid.length,
+      },
+      spend: {
+        // tracked:false => render "Not yet tracked", never ₹0.
+        tracked: spendTracked,
+        totalInr: spendTracked ? spendTotalInr : null,
+        currency: "INR",
+        costedApplications: costed.length,
+        totalApplications: applications.length,
+      },
+      perDepartment,
+      capabilities: VISA_PLATFORM_CAPABILITIES,
+    });
+  } catch (err: any) {
+    console.error("[visa workspace metrics]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load workspace metrics" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * GET /requests/:id — workspace-scoped detail, with applications and
  * their travellers.
  *
