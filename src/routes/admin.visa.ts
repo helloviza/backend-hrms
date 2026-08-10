@@ -37,6 +37,7 @@ import { requirePermission } from "../middleware/requirePermission.js";
 import VisaApplication, {
   VISA_APPLICATION_STATUSES,
   VISA_APPLICATION_OUTCOMES,
+  VISA_OPS_HIDDEN_STATUSES,
   setActionRequired,
   clearActionRequired,
   isTravellerErased,
@@ -265,12 +266,26 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       if (!VISA_APPLICATION_STATUSES.includes(status as VisaApplicationStatus)) {
         return res.status(400).json({ error: `status must be one of ${VISA_APPLICATION_STATUSES.join(", ")}` });
       }
+      // THE GATE, second half. ?status=draft stays reachable — that is a
+      // deliberate existing affordance and a draft is merely uninteresting.
+      // "pending_approval" is different in KIND: it is held at the
+      // customer's own approval gate, Plumtrips has not been given it, and
+      // it must not be retrievable by naming it. Without this, the default
+      // filter below would be exactly one query parameter deep.
+      if (status === "pending_approval") {
+        return res.status(400).json({
+          error: "status must be one of " +
+            VISA_APPLICATION_STATUSES.filter((s) => s !== "pending_approval").join(", "),
+        });
+      }
       filter.status = status;
     } else {
-      // Nothing for ops to do with a draft application — the customer
-      // hasn't even submitted it yet. Excluded by default; still
-      // reachable with an explicit ?status=draft if ever needed.
-      filter.status = { $ne: "draft" };
+      // THE GATE, first half. Nothing for ops to do with a draft (the
+      // customer hasn't submitted it) or with a pending_approval
+      // application (submitted, but their own approver hasn't released it
+      // to us). VISA_OPS_HIDDEN_STATUSES is the single shared constant
+      // behind every Plumtrips-facing status filter.
+      filter.status = { $nin: VISA_OPS_HIDDEN_STATUSES };
     }
 
     if (req.query.actionRequired === "true") {
@@ -591,6 +606,24 @@ router.get("/applications/:id", requirePermission("visaApplication", "READ"), as
     const application = await VisaApplication.findById(id).lean();
     if (!application) return res.status(404).json({ error: "Visa application not found" });
 
+    // THE GATE, by-id half. A pending_approval application is held at the
+    // customer's own approval gate and Plumtrips has not been given it — so
+    // it 404s here exactly as if it did not exist, rather than exposing the
+    // unmasked passport detail this route is otherwise allowed to return.
+    //
+    // No list can hand an agent this id (every ops-side read excludes the
+    // status), so this is defence in depth — but the alternative is a gate
+    // that holds only for as long as nobody guesses or retains an id.
+    //
+    // Checked against "pending_approval" ALONE, not the whole
+    // VISA_OPS_HIDDEN_STATUSES set: a DRAFT application has always been
+    // fetchable by id here (only the LIST excludes it), that is existing
+    // behaviour this change has no business altering, and a draft is merely
+    // uninteresting to ops rather than withheld from them.
+    if ((application as any).status === "pending_approval") {
+      return res.status(404).json({ error: "Visa application not found" });
+    }
+
     const [visaRequest, traveller, workspace, documents] = await Promise.all([
       VisaRequest.findById((application as any).requestId).lean(),
       TravellerProfile.findById((application as any).travellerProfileId).lean(),
@@ -692,6 +725,12 @@ const ACTION_REQUIRED_ELIGIBLE = new Set<string>([...PRE_DECISION_STATUSES, "act
 
 const STATUS_FORWARD_TRANSITIONS: Record<string, VisaApplicationStatus[]> = {
   draft: [],
+  // THE GATE, mutation half. Empty like draft: ops may not move a case out
+  // of the customer's own approval gate — only the customer's approver can,
+  // via POST /api/visa/requests/:id/approve. Listed EXPLICITLY rather than
+  // left to fall off the end of this table, so the lookup below yields a
+  // clean "cannot transition" 400 instead of reading undefined.
+  pending_approval: [],
   submitted: ["docs_under_review"],
   docs_under_review: ["cost_confirmed"],
   cost_confirmed: ["lodged"],

@@ -28,11 +28,32 @@ import logger from "../utils/logger.js";
 
 const visaApplicationLogger = logger.child({ module: "VisaApplication" });
 
+// "pending_approval" sits BETWEEN draft and submitted: the requestor has
+// committed the request, but their own workspace admin has not released it
+// to Plumtrips yet. Only reachable when the workspace opted into
+// config.visaApprovalRequired (default false) — see
+// services/visaApproval.service.ts and infra/design/visa-approval-flow-2026-08-10.md.
 export const VISA_APPLICATION_STATUSES = [
-  "draft", "submitted", "docs_under_review", "action_required",
+  "draft", "pending_approval", "submitted", "docs_under_review", "action_required",
   "cost_confirmed", "lodged", "decision_received", "closed",
 ] as const;
 export type VisaApplicationStatus = (typeof VISA_APPLICATION_STATUSES)[number];
+
+/**
+ * THE GATE. Application statuses that no ops/concierge surface may ever
+ * show — the single constant behind every Plumtrips-facing status filter
+ * (queue, dashboard, roster, report exports, fetch-by-id).
+ *
+ *  • "draft"            — the customer hasn't submitted it; nothing to work.
+ *  • "pending_approval" — submitted, but held at the customer's OWN approval
+ *                         gate. Plumtrips has not received it and must not
+ *                         see it, count it, or be able to action it.
+ *
+ * Exported as ONE constant on purpose: these filters live in four different
+ * route files, and a gate that has to be remembered in four places is a gate
+ * that leaks the first time a fifth read is added.
+ */
+export const VISA_OPS_HIDDEN_STATUSES: VisaApplicationStatus[] = ["draft", "pending_approval"];
 
 export const VISA_APPLICATION_OUTCOMES = ["APPROVED", "REJECTED", "WITHDRAWN"] as const;
 export type VisaApplicationOutcome = (typeof VISA_APPLICATION_OUTCOMES)[number];

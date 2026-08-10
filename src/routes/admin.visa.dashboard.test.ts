@@ -136,16 +136,24 @@ function chainable(getResult: () => any) {
   return obj;
 }
 
-vi.mock("../models/VisaApplication.js", () => ({
-  default: {
-    find: (filter: any) => chainable(() => _applications.query(filter)),
-    countDocuments: async (filter: any) => _applications.query(filter).length,
-    aggregate: async (pipeline: any[]) => runAggregate(Array.from(_applications.store.values()), pipeline),
-  },
-  isTravellerErased: (application: any) => !!application?.travellerErasedAt,
-  VISA_APPLICATION_ERASED_MESSAGE:
-    "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.",
-}));
+// VISA_OPS_HIDDEN_STATUSES comes from the REAL module (importActual), never
+// a literal copy: it is the constant behind this dashboard's gate, and a
+// hand-copied duplicate here would let the test keep passing after the real
+// one changed — the exact failure the shared constant exists to prevent.
+vi.mock("../models/VisaApplication.js", async () => {
+  const actual: any = await vi.importActual("../models/VisaApplication.js");
+  return {
+    default: {
+      find: (filter: any) => chainable(() => _applications.query(filter)),
+      countDocuments: async (filter: any) => _applications.query(filter).length,
+      aggregate: async (pipeline: any[]) => runAggregate(Array.from(_applications.store.values()), pipeline),
+    },
+    VISA_OPS_HIDDEN_STATUSES: actual.VISA_OPS_HIDDEN_STATUSES,
+    isTravellerErased: (application: any) => !!application?.travellerErasedAt,
+    VISA_APPLICATION_ERASED_MESSAGE:
+      "This traveller's data has been erased under a data-erasure request — this application can no longer be progressed.",
+  };
+});
 
 vi.mock("../models/VisaRequest.js", () => ({
   default: { find: (filter: any) => chainable(() => _requests.query(filter)) },
@@ -283,6 +291,26 @@ describe("GET /dashboard — queueHealth", () => {
     const byKey = Object.fromEntries(res.body.queueHealth.rows.map((r: any) => [r.key, r]));
     expect(byKey.submitted.count).toBe(2);
   });
+
+  // THE APPROVAL GATE (2026-08-10). A case held at the customer's own
+  // approval gate has not reached Plumtrips, so it must not appear in any
+  // ops health count — not even as an unrendered bucket that a later
+  // QUEUE_HEALTH_STATUS_ORDER edit would surface.
+  it("GATE: never counts pending_approval applications in queue health", async () => {
+    applicationFixture({ status: "pending_approval" });
+    applicationFixture({ status: "pending_approval" });
+    applicationFixture({ status: "submitted" });
+
+    const res = await request(makeApp()).get("/dashboard");
+    expect(res.status).toBe(200);
+
+    const rows = res.body.queueHealth.rows;
+    const byKey = Object.fromEntries(rows.map((r: any) => [r.key, r]));
+    expect(byKey.submitted.count).toBe(1);
+    expect(rows.some((r: any) => r.status === "pending_approval")).toBe(false);
+    const total = rows.reduce((s: number, r: any) => s + r.count, 0);
+    expect(total).toBe(1); // the two held cases contribute nothing at all
+  });
 });
 
 describe("GET /dashboard — atRisk", () => {
@@ -308,6 +336,23 @@ describe("GET /dashboard — atRisk", () => {
     expect(res.body.atRisk.topApplications).toHaveLength(1);
     expect(res.body.atRisk.topApplications[0].id).toBe(String(atRiskApp._id));
     expect(res.body.atRisk.topApplications[0].referenceNumber).toBe("HV26-SOON");
+  });
+
+  // THE APPROVAL GATE. AT RISK names travellers and destinations on the ops
+  // dashboard — the single most visible ops surface — so a case Plumtrips
+  // has not been given must never reach it, however urgent its travel date.
+  it("GATE: an urgent pending_approval case is never flagged at risk", async () => {
+    const urgent = _requests.insert({ referenceNumber: "HV26-HELD", travelDateFrom: daysFromNow(1) });
+    applicationFixture({
+      status: "pending_approval",
+      requestId: urgent._id,
+      ruleSnapshot: { destinationName: "Germany", etaMaxDays: 15, etaBasis: "CALENDAR" },
+    });
+
+    const res = await request(makeApp()).get("/dashboard");
+    expect(res.status).toBe(200);
+    expect(res.body.atRisk.count).toBe(0);
+    expect(res.body.atRisk.topApplications).toHaveLength(0);
   });
 
   it("respects etaBasis — the same travel date can be safe under CALENDAR but at risk under BUSINESS", async () => {
@@ -399,6 +444,22 @@ describe("GET /dashboard — workload", () => {
 
     const res = await request(makeApp()).get("/dashboard");
     expect(res.body.workload.unassigned.count).toBe(0);
+  });
+
+  // THE APPROVAL GATE. A held case is on nobody's plate — it isn't work
+  // Plumtrips has been given yet — so it must not inflate the unassigned
+  // bucket that a batch-assign action would work from.
+  it("GATE: a pending_approval case is not open work — excluded from workload and unassigned", async () => {
+    applicationFixture({
+      status: "pending_approval",
+      assignedConciergeUserId: null,
+      assignedScreeningOfficerId: null,
+    });
+
+    const res = await request(makeApp()).get("/dashboard");
+    expect(res.status).toBe(200);
+    expect(res.body.workload.unassigned.count).toBe(0);
+    expect(res.body.workload.concierges).toHaveLength(0);
   });
 });
 

@@ -46,6 +46,10 @@ const {
     if (cond && typeof cond === "object" && !(cond instanceof Date) && cond.constructor?.name !== "ObjectId") {
       if ("$ne" in cond) return String(val) !== String(cond.$ne);
       if ("$in" in cond) return (cond.$in as any[]).map(String).includes(String(val));
+      // GET /queue's default status filter is a $nin over
+      // VISA_OPS_HIDDEN_STATUSES (draft + pending_approval) — the approval
+      // gate. Without this the fake silently matched nothing.
+      if ("$nin" in cond) return !(cond.$nin as any[]).map(String).includes(String(val));
     }
     // Real Mongo semantics: querying a field against literal null matches
     // BOTH an explicit null and a missing/undefined field — not just a
@@ -171,6 +175,9 @@ vi.mock("../models/VisaApplication.js", async () => {
   return {
     VISA_APPLICATION_STATUSES: actual.VISA_APPLICATION_STATUSES,
     VISA_APPLICATION_OUTCOMES: actual.VISA_APPLICATION_OUTCOMES,
+    // The real constant, not a copy — this is what GET /queue's default
+    // filter is built from.
+    VISA_OPS_HIDDEN_STATUSES: actual.VISA_OPS_HIDDEN_STATUSES,
     isTravellerErased: actual.isTravellerErased,
     VISA_APPLICATION_ERASED_MESSAGE: actual.VISA_APPLICATION_ERASED_MESSAGE,
     default: {
@@ -566,6 +573,23 @@ describe("GET /applications/:id — detail", () => {
     expect(new Date(res.body.application.travellerErasedAt).toISOString()).toBe(erasedAt.toISOString());
     expect(res.body.traveller).toBeNull();
   });
+
+  it("GATE: 404s a pending_approval application even by direct id — this route may return an UNMASKED passport", async () => {
+    const app = makeApp();
+    const held = applicationDoc(WORKSPACE_A, { status: "pending_approval" });
+
+    const res = await request(app).get(`/applications/${held._id}`);
+    expect(res.status).toBe(404);
+    expect(res.body.traveller).toBeUndefined();
+  });
+
+  it("GATE: a DRAFT application is still fetchable by id — unchanged, only the LIST ever excluded it", async () => {
+    const app = makeApp();
+    const draft = applicationDoc(WORKSPACE_A, { status: "draft" });
+
+    const res = await request(app).get(`/applications/${draft._id}`);
+    expect(res.status).toBe(200);
+  });
 });
 
 // Phase 10c — the console checklist gap. Same resolver/hydration functions
@@ -724,6 +748,17 @@ describe("PATCH /applications/:id/status — state machine", () => {
     const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: "docs_under_review" });
     expect(res.status).toBe(400);
     expect(_applications.get(a._id).status).toBe("draft");
+  });
+
+  it("GATE: rejects pending_approval -> anything — only the customer's own approver may open the gate", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "pending_approval" });
+
+    for (const target of ["submitted", "docs_under_review", "action_required"]) {
+      const res = await request(app).patch(`/applications/${a._id}/status`).send({ status: target, reason: "x" });
+      expect(res.status, target).toBe(400);
+      expect(_applications.get(a._id).status).toBe("pending_approval");
+    }
   });
 
   it("rejects lodged -> decision_received via this route (only PATCH /outcome may set it)", async () => {
@@ -1366,6 +1401,65 @@ describe("GET /queue — cross-workspace", () => {
     applicationDoc(WORKSPACE_A, { status: "draft" });
     const res = await request(app).get("/queue");
     expect(res.body.applications).toHaveLength(0);
+  });
+
+  /* ── THE APPROVAL GATE (2026-08-10) ──────────────────────────────────
+   * A pending_approval application is held at the CUSTOMER'S own approval
+   * gate: they submitted it, but their workspace admin hasn't released it,
+   * so Plumtrips has not been given it and must not see it anywhere.
+   * These are the tests that make the gate real rather than aspirational.
+   * ─────────────────────────────────────────────────────────────────── */
+  it("GATE: excludes pending_approval applications from the default queue", async () => {
+    const app = makeApp();
+    applicationDoc(WORKSPACE_A, { status: "pending_approval" });
+    applicationDoc(WORKSPACE_B, { status: "submitted" });
+
+    const res = await request(app).get("/queue");
+    expect(res.status).toBe(200);
+    expect(res.body.applications).toHaveLength(1);
+    expect(res.body.applications[0].status).toBe("submitted");
+  });
+
+  it("GATE: refuses ?status=pending_approval — the gate is not one query param deep", async () => {
+    const app = makeApp();
+    applicationDoc(WORKSPACE_A, { status: "pending_approval" });
+
+    const res = await request(app).get("/queue?status=pending_approval");
+    expect(res.status).toBe(400);
+    expect(res.body.error).not.toContain("pending_approval");
+  });
+
+  it("GATE: ?status=draft still works — drafts are merely uninteresting, not withheld", async () => {
+    const app = makeApp();
+    const draft = applicationDoc(WORKSPACE_A, { status: "draft" });
+
+    const res = await request(app).get("/queue?status=draft");
+    expect(res.status).toBe(200);
+    expect(res.body.applications).toHaveLength(1);
+    expect(res.body.applications[0].id).toBe(String(draft._id));
+  });
+
+  it("GATE: keeps pending_approval out of every other queue filter combination", async () => {
+    const app = makeApp();
+    applicationDoc(WORKSPACE_A, {
+      status: "pending_approval",
+      assignedConciergeUserId: null,
+      assignedScreeningOfficerId: null,
+      customerRespondedAt: null,
+      travellerErasedAt: null,
+    });
+
+    for (const qs of [
+      "/queue?unassigned=true",
+      "/queue?actionRequired=false",
+      "/queue?customerResponded=false",
+      "/queue?includeErased=true",
+      `/queue?workspaceId=${WORKSPACE_A}`,
+    ]) {
+      const res = await request(app).get(qs);
+      expect(res.status, qs).toBe(200);
+      expect(res.body.applications, qs).toHaveLength(0);
+    }
   });
 
   // Phase 10c — task brief §3: "confirm the completeness counts in the

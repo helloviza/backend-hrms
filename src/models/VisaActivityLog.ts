@@ -46,6 +46,16 @@ export const VISA_ACTIVITY_EVENT_TYPES = [
   "OUTCOME_RECORDED",
   "REQUEST_CANCELLED",
 
+  // Customer-side approval gate (2026-08-10). These describe the CUSTOMER'S
+  // OWN internal approval of a request, before Plumtrips ever sees it — not
+  // anything a concierge did. Only ever written when the workspace opted
+  // into config.visaApprovalRequired. See
+  // infra/design/visa-approval-flow-2026-08-10.md.
+  "APPROVAL_REQUESTED",
+  "APPROVED",
+  "DECLINED",
+  "CLARIFICATION_REQUESTED",
+
   // Documents
   "DOCUMENT_UPLOADED",
   "DOCUMENT_REPLACED",
@@ -102,6 +112,14 @@ export const VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES = new Set<VisaActivityEv
   "ACTION_REQUIRED_AUTO_CLEARED",
   "OUTCOME_RECORDED",
   "REQUEST_CANCELLED",
+  // The approval gate is the CUSTOMER'S own process — the requestor must be
+  // able to see their own request's approval history (who was asked, who
+  // decided, and the note they left). Withholding it would hide the reason
+  // their own request is sitting still.
+  "APPROVAL_REQUESTED",
+  "APPROVED",
+  "DECLINED",
+  "CLARIFICATION_REQUESTED",
   "DOCUMENT_UPLOADED",
   "DOCUMENT_REPLACED",
   "DOCUMENT_DELETED",

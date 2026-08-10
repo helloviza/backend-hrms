@@ -144,6 +144,18 @@ vi.mock("../models/VisaActivityLog.js", () => ({
   default: { find: () => chainable(() => []), countDocuments: async () => 0 },
 }));
 
+// The approval gate (2026-08-10) reads config.visaApprovalRequired off the
+// workspace before deciding where a submit goes. Mocked to return NOTHING —
+// no workspace document at all — because that is the harshest version of
+// "flag off": isVisaApprovalRequired must default to false when the config,
+// or the whole workspace, is unreadable. Every assertion in this file
+// therefore describes the GATE-OFF path, which is the regression line: with
+// the flag off, submit behaves exactly as it did before the gate existed.
+// The gate-ON path has its own file (visa.approval.test.ts).
+vi.mock("../models/CustomerWorkspace.js", () => ({
+  default: { findById: () => chainable(() => null) },
+}));
+
 import express from "express";
 import request from "supertest";
 import router from "./visa.js";

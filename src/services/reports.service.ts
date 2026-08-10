@@ -340,7 +340,14 @@ const APPROVER_USER_FIELDS =
  * ($ne) and isAdmin layers, so an admin filing their own claim falls through to
  * another workspace admin (and, if there is none, to the §3 refusal).
  */
-async function resolveL1Approver(
+// EXPORTED (2026-08-10) so services/visaApproval.service.ts can reuse it as
+// a THIRD caller, after claims and cash advances. `export` is the only edit
+// this function has taken — the resolution order, the workspace scoping and
+// the self-exclusion are untouched, deliberately, so all three modules keep
+// answering "who approves this?" identically. A visa request whose submitter
+// has no distinct approver is handled by the CALLER (visa self-routes rather
+// than refusing, unlike claims) — not by changing anything here.
+export async function resolveL1Approver(
   workspaceId: mongoose.Types.ObjectId,
   submitterId: mongoose.Types.ObjectId,
 ): Promise<{ id: mongoose.Types.ObjectId | null; user: any | null }> {
@@ -385,7 +392,12 @@ async function resolveL1Approver(
  * second level" (chain stays length 1) rather than stamping a null approver —
  * the claim still has a valid L1, so it is never stranded.
  */
-async function resolveL2Approver(
+// EXPORTED alongside resolveL1Approver above, for the same reason and with
+// the same "logic untouched" guarantee. Visa v1 does NOT call this (chain
+// length 1, no escalation threshold) — it is exported so that adding a visa
+// L2 later is a change in the visa service, never a second implementation
+// of the manager's-manager walk.
+export async function resolveL2Approver(
   workspaceId: mongoose.Types.ObjectId,
   l1User: any,
   seniorApproverId: any,

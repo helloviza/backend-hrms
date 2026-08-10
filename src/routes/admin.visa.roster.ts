@@ -73,6 +73,9 @@ router.use(requirePermission("visaApplication", "READ"));
 // Mirrors pages/visa/workspace/rosterModel.ts's IN_FLIGHT_STATUSES exactly
 // — the admin overview's "in flight" must mean what the customer's own
 // dashboard means, or the same workspace reads differently on two screens.
+// THE GATE, by construction: this is an allow-list, so "pending_approval"
+// is excluded simply by not appearing — a case held at the customer's own
+// approval gate is not in flight with Plumtrips. Do NOT add it here.
 const IN_FLIGHT_STATUSES = [
   "submitted",
   "docs_under_review",
@@ -271,8 +274,21 @@ router.get("/workspaces/:workspaceId/roster", async (req: any, res: any) => {
       .sort({ createdAt: -1 })
       .lean();
 
+    // THE GATE. This is the one roster read with no status filter at all —
+    // it shapes EVERY application of every request in the workspace onto the
+    // admin roster view, so without this a pending_approval filing would be
+    // listed against its traveller by name.
+    //
+    // Excludes "pending_approval" ONLY, not the whole
+    // VISA_OPS_HIDDEN_STATUSES set: this view deliberately shows drafts
+    // (the customer's own in-progress filings are part of what an admin
+    // reads a roster for), and the IN_FLIGHT_STATUSES count above is what
+    // separates real activity from them.
     const apps: any[] = requests.length
-      ? await VisaApplication.find({ requestId: { $in: requests.map((r) => r._id) } })
+      ? await VisaApplication.find({
+          requestId: { $in: requests.map((r) => r._id) },
+          status: { $ne: "pending_approval" },
+        })
           .select("_id requestId status outcome travellerProfileId ruleSnapshot.destinationName")
           .lean()
       : [];

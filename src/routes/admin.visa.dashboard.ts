@@ -20,7 +20,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
-import VisaApplication from "../models/VisaApplication.js";
+import VisaApplication, { VISA_OPS_HIDDEN_STATUSES } from "../models/VisaApplication.js";
 import VisaRequest from "../models/VisaRequest.js";
 import VisaActivityLog from "../models/VisaActivityLog.js";
 import ManualBooking from "../models/ManualBooking.js";
@@ -41,7 +41,15 @@ const AT_RISK_TOP_N = 15;
 // without needing to name it explicitly). Shared by AT RISK (what could
 // still miss its travel date) and WORKLOAD (what's actually on someone's
 // plate) — both mean the same thing by "still active".
-const OPEN_APPLICATION_FILTER = { status: { $nin: ["draft", "closed"] }, outcome: null };
+// THE GATE. "pending_approval" joins "draft" here: a case held at the
+// customer's OWN approval gate has not reached Plumtrips, so it is not at
+// risk, not on anybody's plate, and must not be counted as either.
+// VISA_OPS_HIDDEN_STATUSES is the shared constant; "closed" is this
+// dashboard's own additional exclusion (terminal, nothing left to work).
+const OPEN_APPLICATION_FILTER = {
+  status: { $nin: [...VISA_OPS_HIDDEN_STATUSES, "closed"] },
+  outcome: null,
+};
 
 function travellerDisplayName(t: any): string {
   return [t?.firstName, t?.middleName, t?.lastName].filter(Boolean).join(" ").trim();
@@ -83,6 +91,12 @@ const QUEUE_HEALTH_STATUS_ORDER = [
 
 async function buildQueueHealth() {
   const grouped = await VisaApplication.aggregate([
+    // THE GATE. This aggregate previously grouped over EVERY application and
+    // relied on QUEUE_HEALTH_STATUS_ORDER below to decide which buckets got
+    // rendered — which silently means an unrendered status is still read and
+    // counted. A $match makes the exclusion explicit and survives someone
+    // later adding "pending_approval" to that render order.
+    { $match: { status: { $nin: VISA_OPS_HIDDEN_STATUSES } } },
     {
       $group: {
         _id: { status: "$status", responded: { $cond: [{ $ne: ["$customerRespondedAt", null] }, true, false] } },

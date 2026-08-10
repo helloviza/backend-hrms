@@ -38,6 +38,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import VisaApplication, {
   VISA_APPLICATION_STATUSES,
+  VISA_OPS_HIDDEN_STATUSES,
   VISA_APPLICATION_OUTCOMES,
   type VisaApplicationStatus,
 } from "../models/VisaApplication.js";
@@ -142,6 +143,15 @@ function parseCommonFilters(query: any): { filters: CommonFilters } | { error: s
     if (!VISA_APPLICATION_STATUSES.includes(status as VisaApplicationStatus)) {
       return { error: `status must be one of ${VISA_APPLICATION_STATUSES.join(", ")}` };
     }
+    // THE GATE. An export is as much an ops surface as the queue is — more
+    // so, since it leaves the building as a file. A case held at the
+    // customer's own approval gate must not be nameable here either.
+    if (status === "pending_approval") {
+      return {
+        error: "status must be one of " +
+          VISA_APPLICATION_STATUSES.filter((s) => s !== "pending_approval").join(", "),
+      };
+    }
     filters.status = status;
   }
   if (query.assigneeUserId != null) {
@@ -171,7 +181,17 @@ async function resolveRequestIdsForDestination(destinationIso2: string): Promise
 async function buildApplicationMatchFilter(filters: CommonFilters): Promise<any> {
   const filter: any = {};
   if (filters.workspaceId) filter.workspaceId = filters.workspaceId;
+  // THE GATE. With no explicit ?status this matches EVERY application, so
+  // the exclusion has to be added here rather than assumed from a narrower
+  // base query.
+  //
+  // Excludes "pending_approval" ONLY — deliberately NOT the whole
+  // VISA_OPS_HIDDEN_STATUSES set. Draft applications have always been
+  // included in these reports by default, and quietly dropping them would
+  // change every existing export's row count under a change that is
+  // supposed to be about the approval gate and nothing else.
   if (filters.status) filter.status = filters.status;
+  else filter.status = { $ne: "pending_approval" };
   if (filters.assigneeUserId) {
     filter.$or = [
       { assignedConciergeUserId: filters.assigneeUserId },
@@ -618,7 +638,13 @@ router.get("/reports/progress", requirePermission("visaApplication", "READ"), as
     // "Time in status"/"age since submission" don't apply pre-submission —
     // excluded by default. An explicit ?status=draft still wins (respects
     // a deliberate ask over this default).
-    if (!filter.status) filter.status = { $ne: "draft" };
+    //
+    // Keyed on filters.status (was the CALLER's explicit ask?) rather than
+    // on filter.status (did anything get set?) — buildApplicationMatchFilter
+    // now always sets a status clause for the approval gate, so the old
+    // "nothing set it yet" test would never fire again and this report would
+    // silently start including drafts.
+    if (!filters.status) filter.status = { $nin: VISA_OPS_HIDDEN_STATUSES };
 
     const totalBeforeCeiling = await VisaApplication.countDocuments(filter);
     if (totalBeforeCeiling > PROGRESS_REPORT_FETCH_CEILING) {

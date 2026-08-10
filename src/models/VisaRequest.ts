@@ -9,6 +9,15 @@ import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import Counter from "./Counter.js";
 import { VISA_PURPOSES, type VisaPurpose } from "./VisaRule.js";
 import { VISA_CONSENT_CLAUSE_IDS, type VisaConsentClauseId } from "../config/visaConsent.js";
+// TYPE-ONLY import (erased at compile time — no runtime coupling to the
+// expense module, and no import cycle). The visa approval chain reuses the
+// expenses claim chain's subdocument shape VERBATIM rather than declaring a
+// near-identical twin that can silently drift: routes/visa.ts's approve
+// route walks it with the same (currentLevel, chain[]) idiom
+// routes/expenseReports.ts does, so the two must stay structurally
+// identical. The Mongoose schema itself is declared locally below —
+// models/Report.ts does not export its subdocument schema.
+import type { IApprovalChainLevel } from "./Report.js";
 
 // Not specified by the source brief — this is a reasonable container-level
 // lifecycle: draft (still adding travellers) / active (>=1 application in
@@ -17,6 +26,23 @@ import { VISA_CONSENT_CLAUSE_IDS, type VisaConsentClauseId } from "../config/vis
 // build report — narrower/renamed values are a schema-only change later.
 export const VISA_REQUEST_STATUSES = ["draft", "active", "completed", "cancelled"] as const;
 export type VisaRequestStatus = (typeof VISA_REQUEST_STATUSES)[number];
+
+/**
+ * The customer-side approval gate (2026-08-10) — a SEPARATE, AUTHORED axis
+ * from `status` above, which stays derived. See
+ * infra/design/visa-approval-flow-2026-08-10.md.
+ *
+ * null (the default, and the steady state for every workspace that has not
+ * set config.visaApprovalRequired) means "no gate applies" — submit goes
+ * straight to Plumtrips exactly as it always has.
+ */
+export const VISA_APPROVAL_STATUSES = [
+  "pending_approval",
+  "approved",
+  "declined",
+  "clarification_required",
+] as const;
+export type VisaApprovalStatus = (typeof VISA_APPROVAL_STATUSES)[number];
 
 // One row per clause accepted — a single consentAcceptedAt could no longer
 // prove WHICH clause was given once consent split into three independent
@@ -82,6 +108,33 @@ export interface VisaRequestDocument extends Document {
   // that route's own validation).
   consents: VisaConsentRecord[];
 
+  // ── Customer-side approval gate (2026-08-10) ──────────────────────────
+  // AUTHORED, like cancelledAt above — routes write these directly. They are
+  // deliberately NOT folded into `status`: that field is a rollup of child
+  // application states with recomputeRequestStatus() as its sole writer, and
+  // approval is a fact somebody asserted, not a rollup of anything. Keeping
+  // the two axes separate is what lets that invariant survive this feature.
+  //
+  // EVERY field here stays null/empty/false for a workspace that has not set
+  // config.visaApprovalRequired — that is the regression line: with the flag
+  // off, submit never touches any of them.
+
+  // null = no gate applies (flag off, or the request predates this feature).
+  approvalStatus?: VisaApprovalStatus | null;
+  // Denorm pointer to the CURRENT pending approver — chain[currentLevel-1].
+  // Snapshotted at submit and never re-derived: an approver who loses their
+  // admin role mid-flight still owns the decision they were handed.
+  approverId?: mongoose.Types.ObjectId | null;
+  // Resolved at submit. v1 is always length 1 (no L2, no escalation
+  // threshold) — the array and currentLevel exist so adding a second level
+  // later is a resolver change, not a route change.
+  approvalChain?: IApprovalChainLevel[];
+  currentLevel?: number; // 1-based; which chain step is currently pending
+  decisionNote?: string | null; // REQUIRED on decline and on request-clarification
+  selfApproved?: boolean; // audit marker: approver === requestor
+  submittedAt?: Date | null;
+  approvedAt?: Date | null;
+
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -92,6 +145,26 @@ const VisaConsentRecordSchema = new Schema<VisaConsentRecord>(
     version: { type: String, required: true },
     acceptedAt: { type: Date, required: true },
     acceptedByUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+  },
+  { _id: false },
+);
+
+/**
+ * Approval-chain level subdocument. Mirrors models/Report.ts's
+ * ApprovalChainLevelSchema field-for-field, including `_id: false` — these
+ * are positional steps addressed by `level`, not standalone documents.
+ */
+const VisaApprovalChainLevelSchema = new Schema<IApprovalChainLevel>(
+  {
+    level: { type: Number, required: true },
+    approverId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    status: {
+      type: String,
+      enum: ["pending", "approved", "declined", "clarification_required"],
+      default: "pending",
+    },
+    decidedAt: { type: Date, default: null },
+    note: { type: String, trim: true, default: null },
   },
   { _id: false },
 );
@@ -116,6 +189,18 @@ const VisaRequestSchema = new Schema<VisaRequestDocument>(
     // { "consents.0": { $exists: false } }, so an explicit empty array (not
     // just "field absent") keeps that filter's semantics obvious.
     consents: { type: [VisaConsentRecordSchema], default: [] },
+
+    // ── Customer-side approval gate. default null/[]/false throughout, so a
+    // workspace with the flag off carries exactly the document it always
+    // did. ──
+    approvalStatus: { type: String, enum: VISA_APPROVAL_STATUSES, default: null, index: true },
+    approverId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    approvalChain: { type: [VisaApprovalChainLevelSchema], default: [] },
+    currentLevel: { type: Number, default: 1 },
+    decisionNote: { type: String, trim: true, default: null },
+    selfApproved: { type: Boolean, default: false },
+    submittedAt: { type: Date, default: null },
+    approvedAt: { type: Date, default: null },
   },
   { timestamps: true },
 );
@@ -128,6 +213,11 @@ VisaRequestSchema.index({ workspaceId: 1, createdAt: -1 });
 // GET /requests's own org-scope filter (routes/visa.ts) — the primary
 // consumer of this field.
 VisaRequestSchema.index({ workspaceId: 1, customerId: 1 });
+// The approvals queue + its sidebar badge (GET /requests?queue=approvals and
+// GET /requests/pending-count, routes/visa.ts): "what is pending, routed to
+// me". approverId trails approvalStatus because a seesAll caller queries on
+// approvalStatus ALONE — an index led by approverId could not serve that.
+VisaRequestSchema.index({ workspaceId: 1, approvalStatus: 1, approverId: 1 });
 
 // Sequential-per-year, collision-safe reference number (Counter is an atomic
 // $inc, unlike a countDocuments-based scheme) — matches the design brief's
@@ -211,7 +301,17 @@ export async function recomputeRequestStatus(
       .select("status outcome")
       .lean();
 
-    if (applications.length === 0 || applications.every((a) => a.status === "draft")) {
+    // "pending_approval" counts as not-yet-a-real-case, exactly like "draft".
+    // A request held at the customer's OWN approval gate has not reached
+    // Plumtrips, so rolling it up to "active" would tell the roster and the
+    // customer dashboard that work is in flight on something we have not
+    // even received. Folding it in here (rather than skipping the recompute
+    // call at the approval branch) is what keeps this function safe to call
+    // after ANY child status change — the contract stated above.
+    if (
+      applications.length === 0 ||
+      applications.every((a) => a.status === "draft" || a.status === "pending_approval")
+    ) {
       status = "draft";
     } else if (applications.every((a) => a.status === "closed")) {
       status = applications.every((a) => a.outcome === "WITHDRAWN") ? "cancelled" : "completed";

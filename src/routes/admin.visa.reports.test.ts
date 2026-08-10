@@ -34,6 +34,9 @@ const {
     if (cond && typeof cond === "object" && !(cond instanceof Date) && !Array.isArray(cond)) {
       if ("$in" in cond) return (cond.$in as any[]).map(String).includes(String(val));
       if ("$ne" in cond) return String(val) !== String((cond as any).$ne);
+      // The approval gate's default status exclusion (draft +
+      // pending_approval) is a $nin — without this the fake matched nothing.
+      if ("$nin" in cond) return !(cond.$nin as any[]).map(String).includes(String(val));
       if ("$gte" in cond || "$lte" in cond) {
         if (val == null) return false;
         const t = new Date(val).getTime();
@@ -132,6 +135,8 @@ vi.mock("../models/VisaApplication.js", async () => {
   return {
     VISA_APPLICATION_STATUSES: actual.VISA_APPLICATION_STATUSES,
     VISA_APPLICATION_OUTCOMES: actual.VISA_APPLICATION_OUTCOMES,
+    // Real constant, not a copy — the approval gate's exclusion list.
+    VISA_OPS_HIDDEN_STATUSES: actual.VISA_OPS_HIDDEN_STATUSES,
     isTravellerErased: actual.isTravellerErased,
     VISA_APPLICATION_ERASED_MESSAGE: actual.VISA_APPLICATION_ERASED_MESSAGE,
     default: {
@@ -407,6 +412,70 @@ describe("GET /reports/case-log", () => {
     expect(app2Row[20]).toBe(""); // never set — blank, not a placeholder
     void app1;
     void app2;
+  });
+
+  /* ── THE APPROVAL GATE (2026-08-10) ──────────────────────────────────
+   * An export is as much an ops surface as the console is — more so, since
+   * it leaves the building as a file carrying traveller names. A case held
+   * at the customer's own approval gate must never appear in one.
+   * ─────────────────────────────────────────────────────────────────── */
+  it("GATE: excludes pending_approval cases from the case log", async () => {
+    seedFixtures();
+    const heldRequest = _requests.insert({
+      _id: new mongoose.Types.ObjectId(),
+      workspaceId: WORKSPACE_A,
+      referenceNumber: "HV26-HELD",
+      destinationIso2: "AE",
+    });
+    _applications.insert({
+      _id: new mongoose.Types.ObjectId(),
+      workspaceId: WORKSPACE_A,
+      requestId: heldRequest._id,
+      travellerProfileId: _travellers.insert({ firstName: "Held", lastName: "Traveller" })._id,
+      status: "pending_approval",
+      submittedAt: daysFromNow(-1),
+      ruleSnapshot: { destinationName: "UAE", purpose: "TOURIST", serviceTier: "STANDARD" },
+    });
+
+    const res = await request(makeApp()).get("/reports/case-log").query({ format: "csv" });
+
+    expect(res.status).toBe(200);
+    expect(res.text).not.toContain("HV26-HELD");
+    expect(res.text).not.toContain("Held Traveller");
+  });
+
+  it("GATE: refuses an explicit ?status=pending_approval rather than exporting it", async () => {
+    seedFixtures();
+    const res = await request(makeApp())
+      .get("/reports/case-log")
+      .query({ format: "csv", status: "pending_approval" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).not.toContain("pending_approval");
+  });
+
+  it("GATE: an explicit ?status=draft still exports — drafts were never withheld", async () => {
+    const draftRequest = _requests.insert({
+      _id: new mongoose.Types.ObjectId(),
+      workspaceId: WORKSPACE_A,
+      referenceNumber: "HV26-DRAFT",
+      destinationIso2: "AE",
+    });
+    _applications.insert({
+      _id: new mongoose.Types.ObjectId(),
+      workspaceId: WORKSPACE_A,
+      requestId: draftRequest._id,
+      travellerProfileId: _travellers.insert({ firstName: "Draft", lastName: "Traveller" })._id,
+      status: "draft",
+      ruleSnapshot: { destinationName: "UAE", purpose: "TOURIST", serviceTier: "STANDARD" },
+    });
+
+    const res = await request(makeApp())
+      .get("/reports/case-log")
+      .query({ format: "csv", status: "draft" });
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("HV26-DRAFT");
   });
 
   it("masks passport numbers — never the raw value", async () => {

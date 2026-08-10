@@ -120,6 +120,17 @@ import VisaActivityLog, {
   VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES,
   type VisaActivityActorType,
 } from "../models/VisaActivityLog.js";
+// Customer-side approval gate (2026-08-10). See
+// infra/design/visa-approval-flow-2026-08-10.md.
+import {
+  isVisaApprovalRequired,
+  resolveVisaApprovalChain,
+  canDecideVisaRequest,
+  visaSeesAll,
+  visaUserIdOf,
+  visaUserNameOf,
+} from "../services/visaApproval.service.js";
+import { sendVisaSubmittedEmail } from "../utils/visaEmails.js";
 
 const visaLogger = logger.child({ module: "visa" });
 
@@ -1726,10 +1737,34 @@ async function resolveVisaRequestsFilter(
  * resuming a draft. Includes each request's applications and their
  * travellers.
  * ───────────────────────────────────────────────────────────────────── */
+/**
+ * The approvals queue filter — "what is awaiting a decision from me".
+ *
+ * DELIBERATELY NOT resolveVisaRequestsFilter: that resolves OWNERSHIP (whose
+ * requests are these), and this queue is about APPROVERSHIP (who has to act
+ * on them). A workspace admin approving a colleague's request does not own
+ * it and would not see it under the ownership filter.
+ *
+ * An admin sees every pending request in the workspace, not just the ones
+ * routed to them — the same seesAll affordance the expenses approvals queue
+ * grants, and what covers a request whose snapshotted approver has since
+ * left. A plain approver sees only their own.
+ */
+function visaApprovalsQueueFilter(req: any, workspaceId: any): Record<string, any> {
+  const filter: Record<string, any> = { workspaceId, approvalStatus: "pending_approval" };
+  if (!visaSeesAll(req.user)) {
+    filter.approverId = new mongoose.Types.ObjectId(visaUserIdOf(req.user));
+  }
+  return filter;
+}
+
 router.get("/requests", async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
-    const { filter } = await resolveVisaRequestsFilter(req, workspaceId);
+    const { filter } =
+      String(req.query.queue || "") === "approvals"
+        ? { filter: visaApprovalsQueueFilter(req, workspaceId) }
+        : await resolveVisaRequestsFilter(req, workspaceId);
     const requests = await VisaRequest.find(filter)
       .sort({ createdAt: -1 })
       .lean();
@@ -1768,6 +1803,26 @@ router.get("/requests", async (req: any, res: any) => {
     res
       .status(500)
       .json({ error: err?.message || "Failed to load visa requests" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /requests/pending-count — the sidebar badge. Same filter as
+ * ?queue=approvals above, counted rather than listed.
+ *
+ * Declared BEFORE GET /requests/:id so ":id" can never capture
+ * "pending-count" — the same ordering rule (and the same reason) as
+ * routes/expenseReports.ts's own pending-count.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/requests/pending-count", async (req: any, res: any) => {
+  try {
+    const approvals = await VisaRequest.countDocuments(
+      visaApprovalsQueueFilter(req, req.workspaceObjectId),
+    );
+    res.json({ ok: true, approvals });
+  } catch (err: any) {
+    console.error("[visa requests pending-count]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load count" });
   }
 });
 
@@ -2182,6 +2237,64 @@ router.get("/requests/:id", async (req: any, res: any) => {
  * or not consented at all, no partially-populated consents array is ever
  * observable.
  * ───────────────────────────────────────────────────────────────────── */
+/**
+ * Release a request's applications to the Plumtrips concierge desk.
+ *
+ * THE MOMENT OPS SEES A CASE. Extracted verbatim from the tail of POST
+ * /requests/:id/submit so the two paths that reach it cannot drift:
+ *   • approval gate OFF -> submit calls it directly (from "draft"), which is
+ *     byte-for-byte today's behaviour;
+ *   • approval gate ON  -> the FINAL approve calls it (from "pending_approval").
+ *
+ * `submittedAt` on the APPLICATION is stamped here, not at request-submit
+ * time, and that is deliberate: it means "when Plumtrips received this",
+ * which is what every ops-side SLA and ETA calculation reads it as.
+ * VisaRequest.submittedAt is the different, requestor-facing fact — when the
+ * employee sent it for approval.
+ *
+ * status is set here as a FACT; VisaRequest.status is never assigned
+ * directly — recomputeRequestStatus derives it, same rule as every other
+ * write path in this file.
+ */
+async function releaseApplicationsToOps(params: {
+  requestId: any;
+  workspaceId: any;
+  actorUserId: any;
+  fromStatus: "draft" | "pending_approval";
+}): Promise<number> {
+  const { requestId, workspaceId, actorUserId, fromStatus } = params;
+
+  // Only applications still in `fromStatus` transition — never re-touches
+  // one that (in principle) already progressed further.
+  const pending = await VisaApplication.find({
+    requestId,
+    workspaceId,
+    status: fromStatus,
+  })
+    .select("_id")
+    .lean();
+
+  await VisaApplication.updateMany(
+    { requestId, workspaceId, status: fromStatus },
+    { $set: { status: "submitted", submittedAt: new Date() } },
+  );
+
+  for (const app of pending as any[]) {
+    await logVisaActivity({
+      applicationId: app._id,
+      requestId,
+      workspaceId,
+      eventType: "SUBMITTED",
+      actorUserId,
+      actorType: "CUSTOMER",
+    });
+  }
+
+  await recomputeRequestStatus(requestId);
+
+  return pending.length;
+}
+
 router.post("/requests/:id/submit", async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
@@ -2210,11 +2323,22 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
     // would otherwise be indistinguishable from "not found" to the caller
     // but wrong: 409 should mean "found, already submitted", not "not
     // found at all").
-    const owned = await VisaRequest.findOne({ _id: requestId, workspaceId })
-      .select("_id")
+    const owned: any = await VisaRequest.findOne({ _id: requestId, workspaceId })
+      .select("_id raisedByUserId destinationIso2 referenceNumber approvalStatus")
       .lean();
     if (!owned) {
       return res.status(404).json({ error: "Visa request not found" });
+    }
+
+    // DECLINED is TERMINAL. The consents array alone would already block a
+    // resubmit (a declined request keeps its consents, so the atomic claim
+    // below can never match again), but relying on that would make
+    // terminality an accident of the idempotency filter rather than a rule.
+    // This says it outright, and returns the message the requestor needs.
+    if (owned.approvalStatus === "declined") {
+      return res.status(409).json({
+        error: "This visa request was declined by your approver and can't be resubmitted.",
+      });
     }
 
     const acceptedAt = new Date();
@@ -2247,36 +2371,117 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
         .json({ error: "This visa request has already been submitted." });
     }
 
-    // Only applications still in "draft" transition — never re-touches one
-    // that (in principle) already progressed further. status is set here
-    // as a FACT; VisaRequest.status itself is never assigned directly —
-    // recomputeRequestStatus derives it below, same rule as every other
-    // write path in this file.
-    const draftApplications = await VisaApplication.find({
-      requestId,
-      workspaceId,
-      status: "draft",
-    })
-      .select("_id")
-      .lean();
+    // ── THE GATE BRANCH ────────────────────────────────────────────────
+    // Read AFTER the atomic consent claim, so a workspace toggling the flag
+    // mid-request can't produce a half-claimed request. Defaults to false on
+    // every unclear path (see the service) — off is what every live
+    // workspace does today, and this branch is the regression line: with the
+    // gate off NOTHING below the `if` runs, no approval field is written,
+    // and the request goes straight to ops exactly as it always has.
+    const approvalRequired = await isVisaApprovalRequired(workspaceId);
 
-    await VisaApplication.updateMany(
-      { requestId, workspaceId, status: "draft" },
-      { $set: { status: "submitted", submittedAt: new Date() } },
-    );
+    if (approvalRequired) {
+      // v1 chain is always length 1. This NEVER comes back empty: when no
+      // distinct approver exists the request self-routes to its own
+      // requestor (DECISION 1 in the design doc) rather than being refused
+      // the way an expense claim would be — a small company's owner filing
+      // their own visa is the normal case here, not an edge case.
+      const { chain, approverId, approver, selfRouted } = await resolveVisaApprovalChain(
+        workspaceId,
+        owned.raisedByUserId,
+      );
 
-    for (const app of draftApplications as any[]) {
-      await logVisaActivity({
-        applicationId: app._id,
+      await VisaRequest.findByIdAndUpdate(requestId, {
+        $set: {
+          approvalStatus: "pending_approval",
+          approvalChain: chain,
+          currentLevel: 1,
+          approverId,
+          // A self-routed request is marked from the moment it is raised,
+          // not only once it is approved — the fact being recorded is that
+          // requestor and approver are the same person, which is already
+          // true here.
+          selfApproved: selfRouted,
+          decisionNote: null,
+          submittedAt: new Date(),
+          approvedAt: null,
+        },
+      });
+
+      // draft -> pending_approval. NOT submitted: until an approver releases
+      // it, this request does not exist as far as the Plumtrips desk is
+      // concerned (models/VisaApplication.ts's VISA_OPS_HIDDEN_STATUSES).
+      const heldApplications = await VisaApplication.find({
         requestId,
         workspaceId,
-        eventType: "SUBMITTED",
+        status: "draft",
+      })
+        .select("_id")
+        .lean();
+
+      await VisaApplication.updateMany(
+        { requestId, workspaceId, status: "draft" },
+        { $set: { status: "pending_approval" } },
+      );
+
+      // Request-level row (applicationId null) — the approval gate applies
+      // to the whole request, not to one traveller. GET /requests/:id's
+      // timeline queries by requestId, so this is visible to the requestor.
+      await logVisaActivity({
+        requestId,
+        workspaceId,
+        eventType: "APPROVAL_REQUESTED",
         actorUserId: actorId(req),
         actorType: "CUSTOMER",
+        detail: {
+          approverId: String(approverId),
+          selfRouted,
+          travellerCount: heldApplications.length,
+        },
+      });
+
+      // The applications changed status, so the derived rollup is
+      // recomputed — the contract stated on recomputeRequestStatus. It
+      // resolves to "draft" (pending_approval counts as not-yet-a-real-case
+      // alongside draft), which is what keeps a request held at the
+      // customer's own gate from claiming to be in flight.
+      await recomputeRequestStatus(requestId);
+
+      // Approver notification — non-fatal, exactly like the expenses claim
+      // email. When there's no address (or SMTP is off) the in-app approvals
+      // badge remains the notice.
+      if (approver?.email) {
+        try {
+          const requester: any = await User.findById(owned.raisedByUserId)
+            .select("firstName lastName name email")
+            .lean();
+          await sendVisaSubmittedEmail({
+            to: approver.email,
+            approverName: visaUserNameOf(approver),
+            requesterName: visaUserNameOf(requester) || "A colleague",
+            referenceNumber: owned.referenceNumber,
+            requestId: String(requestId),
+            destinationName:
+              getCountryByIso2(owned.destinationIso2)?.name || owned.destinationIso2,
+            travellerCount: heldApplications.length,
+            selfRouted,
+          });
+        } catch (mailErr: any) {
+          visaLogger.error("visa approval request email failed — submit was NOT rolled back", {
+            requestId: String(requestId),
+            error: mailErr?.message,
+          });
+        }
+      }
+    } else {
+      // Gate off — today's behaviour, byte for byte.
+      await releaseApplicationsToOps({
+        requestId,
+        workspaceId,
+        actorUserId: actorId(req),
+        fromStatus: "draft",
       });
     }
-
-    await recomputeRequestStatus(requestId);
 
     const finalRequest = await VisaRequest.findById(requestId).lean();
     const applications = await VisaApplication.find({
@@ -2294,6 +2499,311 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
     res
       .status(500)
       .json({ error: err?.message || "Failed to submit visa request" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * THE DECISION ROUTES — approve / decline / request-clarification.
+ *
+ * Mirrors routes/expenseReports.ts's three Layer-3 transitions: same guard
+ * order, same canDecide authority, same required-note rule on the two
+ * negative outcomes, same chain-level stamping.
+ *
+ * Loaded WITHOUT an owner restriction — for an approval action the actor is
+ * the approver, not the requestor (loadReportAny's own reasoning). Tenancy
+ * is still stamped: a cross-workspace id 404s.
+ * ───────────────────────────────────────────────────────────────────── */
+
+/**
+ * Shared guard for the three decision routes. Resolves the request, proves
+ * it is actually awaiting a decision, and proves this caller may make it.
+ * Returns null once it has already answered on `res`.
+ */
+async function loadRequestForDecision(req: any, res: any): Promise<any | null> {
+  const workspaceId = req.workspaceObjectId;
+  const requestId = req.params.id;
+  if (!mongoose.isValidObjectId(requestId)) {
+    res.status(404).json({ error: "Visa request not found" });
+    return null;
+  }
+
+  const request: any = await VisaRequest.findOne({ _id: requestId, workspaceId }).lean();
+  if (!request) {
+    res.status(404).json({ error: "Visa request not found" });
+    return null;
+  }
+
+  if (request.approvalStatus !== "pending_approval") {
+    res.status(409).json({ error: "This visa request is not awaiting approval." });
+    return null;
+  }
+
+  const { ok, isSelf } = canDecideVisaRequest(req.user, request);
+  if (!ok) {
+    // Same message for "not the approver" and "your own request, and you're
+    // not an admin" — the caller already knows which of the two they are,
+    // and distinguishing them tells an unauthorised caller who the approver
+    // is.
+    res.status(403).json({ error: "You are not authorized to action this visa request" });
+    return null;
+  }
+
+  return { request, isSelf };
+}
+
+/**
+ * Stamp the CURRENT chain level with a decision, returning a NEW chain array
+ * (never mutating the lean doc's own). Mirrors the clamped index arithmetic
+ * routes/expenseReports.ts uses on approve/decline/clarify.
+ */
+function stampChainLevel(
+  request: any,
+  disposition: "approved" | "declined" | "clarification_required",
+  deciderId: string,
+  note: string | null,
+): { chain: any[]; idx: number; levelNo: number } {
+  const chain: any[] = Array.isArray(request.approvalChain)
+    ? request.approvalChain.map((l: any) => ({ ...l }))
+    : [];
+  const idx = Math.min(
+    Math.max((request.currentLevel || 1) - 1, 0),
+    Math.max(chain.length - 1, 0),
+  );
+  if (chain[idx]) {
+    chain[idx].status = disposition;
+    chain[idx].decidedAt = new Date();
+    chain[idx].approverId = new mongoose.Types.ObjectId(deciderId);
+    if (note) chain[idx].note = note;
+  }
+  return { chain, idx, levelNo: idx + 1 };
+}
+
+/**
+ * selfApproved is a STICKY audit marker, never a live recomputation.
+ *
+ * A request that self-routed at submit (no distinct approver in the
+ * workspace) is already marked; if an admin later overrides and decides it,
+ * `isSelf` for THAT actor is false, and a plain assignment would erase the
+ * fact that it had been self-routed in the first place. OR-ing preserves
+ * both truths.
+ */
+function stickySelfApproved(request: any, isSelf: boolean): boolean {
+  return isSelf || request.selfApproved === true;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /requests/:id/approve — pending_approval -> approved.
+ *
+ * Not the last level: advance to the next approver; the request STAYS
+ * pending (the "awaiting L2" state is derived from currentLevel + the
+ * chain, never a new approvalStatus value — the same choice expenses made).
+ * v1 always resolves a length-1 chain, so this branch is unreachable today
+ * and exists so that adding an L2 is a resolver change, not a route change.
+ *
+ * LAST level: this is THE MOMENT OPS SEES THE CASE. approvalStatus flips to
+ * approved and then releaseApplicationsToOps runs the exact tail the
+ * gate-off submit path runs.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/requests/:id/approve", async (req: any, res: any) => {
+  try {
+    const loaded = await loadRequestForDecision(req, res);
+    if (!loaded) return;
+    const { request, isSelf } = loaded;
+
+    const workspaceId = req.workspaceObjectId;
+    const requestId = request._id;
+    const me = visaUserIdOf(req.user);
+    const note = String(req.body?.decisionNote || "").trim() || null;
+
+    const { chain, idx, levelNo } = stampChainLevel(request, "approved", me, note);
+    const hasNext = idx < chain.length - 1;
+
+    if (hasNext) {
+      const next = chain[idx + 1];
+      await VisaRequest.findByIdAndUpdate(requestId, {
+        $set: {
+          approvalChain: chain,
+          currentLevel: levelNo + 1,
+          approverId: next.approverId, // denorm pointer -> next pending approver
+          selfApproved: stickySelfApproved(request, isSelf),
+        },
+      });
+
+      await logVisaActivity({
+        requestId,
+        workspaceId,
+        eventType: "APPROVED",
+        actorUserId: actorId(req),
+        actorType: "CUSTOMER",
+        detail: { level: levelNo, awaitingLevel: levelNo + 1, note },
+      });
+
+      const advanced = await VisaRequest.findById(requestId).lean();
+      return res.json({ ok: true, request: advanced });
+    }
+
+    // ── Final level ──
+    await VisaRequest.findByIdAndUpdate(requestId, {
+      $set: {
+        approvalChain: chain,
+        approvalStatus: "approved",
+        approvedAt: new Date(),
+        approverId: new mongoose.Types.ObjectId(me), // the actual decider
+        selfApproved: stickySelfApproved(request, isSelf),
+        decisionNote: note,
+      },
+    });
+
+    const released = await releaseApplicationsToOps({
+      requestId,
+      workspaceId,
+      actorUserId: actorId(req),
+      fromStatus: "pending_approval",
+    });
+
+    await logVisaActivity({
+      requestId,
+      workspaceId,
+      eventType: "APPROVED",
+      actorUserId: actorId(req),
+      actorType: "CUSTOMER",
+      detail: { level: levelNo, final: true, releasedApplications: released, note },
+    });
+
+    const finalRequest = await VisaRequest.findById(requestId).lean();
+    res.json({ ok: true, request: finalRequest });
+  } catch (err: any) {
+    console.error("[visa requests approve POST]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to approve visa request" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /requests/:id/decline — pending_approval -> declined. TERMINAL.
+ * decisionNote (the reason) is REQUIRED, and is shown to the requestor.
+ *
+ * The applications go back to "draft", not to a "declined" status:
+ * VisaApplication.status is the OPS pipeline vocabulary, and a request the
+ * employer refused never entered that pipeline, so it has no position in
+ * it. The terminal fact lives on the request's approvalStatus — which is
+ * exactly what a separate authored field is for.
+ *
+ * Consents are deliberately KEPT (unlike request-clarification below), so
+ * the submit route's atomic claim can never match again; POST /submit also
+ * refuses an approvalStatus="declined" request outright.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/requests/:id/decline", async (req: any, res: any) => {
+  try {
+    const loaded = await loadRequestForDecision(req, res);
+    if (!loaded) return;
+    const { request, isSelf } = loaded;
+
+    const note = String(req.body?.decisionNote || "").trim();
+    if (!note) {
+      return res.status(400).json({ error: "A reason is required to decline." });
+    }
+
+    const workspaceId = req.workspaceObjectId;
+    const requestId = request._id;
+    const me = visaUserIdOf(req.user);
+    const { chain, levelNo } = stampChainLevel(request, "declined", me, note);
+
+    await VisaRequest.findByIdAndUpdate(requestId, {
+      $set: {
+        approvalChain: chain,
+        approvalStatus: "declined",
+        decisionNote: note,
+        approverId: new mongoose.Types.ObjectId(me),
+        selfApproved: stickySelfApproved(request, isSelf),
+        approvedAt: null,
+      },
+    });
+
+    await VisaApplication.updateMany(
+      { requestId, workspaceId, status: "pending_approval" },
+      { $set: { status: "draft" } },
+    );
+    await recomputeRequestStatus(requestId);
+
+    await logVisaActivity({
+      requestId,
+      workspaceId,
+      eventType: "DECLINED",
+      actorUserId: actorId(req),
+      actorType: "CUSTOMER",
+      detail: { level: levelNo, note },
+    });
+
+    const finalRequest = await VisaRequest.findById(requestId).lean();
+    res.json({ ok: true, request: finalRequest });
+  } catch (err: any) {
+    console.error("[visa requests decline POST]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to decline visa request" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /requests/:id/request-clarification — pending_approval ->
+ * clarification_required. Returns the request to the REQUESTOR, editable,
+ * with the approver's question attached. decisionNote is REQUIRED.
+ *
+ * CONSENTS ARE CLEARED. That is what makes the request resubmittable: POST
+ * /requests/:id/submit's idempotency boundary is `"consents.0": { $exists:
+ * false }`, so leaving them populated would bounce the request back to the
+ * requestor and then refuse every attempt to resend it. Clearing them also
+ * means the resubmit re-collects consent against the CURRENT clause
+ * version, and re-runs resolveVisaApprovalChain — so the chain is REBUILT
+ * FRESH rather than reusing a stale approver, mirroring what expenses does
+ * on a resubmit out of clarification_required.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/requests/:id/request-clarification", async (req: any, res: any) => {
+  try {
+    const loaded = await loadRequestForDecision(req, res);
+    if (!loaded) return;
+    const { request, isSelf } = loaded;
+
+    const note = String(req.body?.decisionNote || "").trim();
+    if (!note) {
+      return res.status(400).json({ error: "A note is required to request clarification." });
+    }
+
+    const workspaceId = req.workspaceObjectId;
+    const requestId = request._id;
+    const me = visaUserIdOf(req.user);
+    const { chain, levelNo } = stampChainLevel(request, "clarification_required", me, note);
+
+    await VisaRequest.findByIdAndUpdate(requestId, {
+      $set: {
+        approvalChain: chain,
+        approvalStatus: "clarification_required",
+        decisionNote: note,
+        approverId: new mongoose.Types.ObjectId(me),
+        selfApproved: stickySelfApproved(request, isSelf),
+        approvedAt: null,
+        consents: [], // see the route note — this is what reopens submit
+      },
+    });
+
+    await VisaApplication.updateMany(
+      { requestId, workspaceId, status: "pending_approval" },
+      { $set: { status: "draft" } },
+    );
+    await recomputeRequestStatus(requestId);
+
+    await logVisaActivity({
+      requestId,
+      workspaceId,
+      eventType: "CLARIFICATION_REQUESTED",
+      actorUserId: actorId(req),
+      actorType: "CUSTOMER",
+      detail: { level: levelNo, note },
+    });
+
+    const finalRequest = await VisaRequest.findById(requestId).lean();
+    res.json({ ok: true, request: finalRequest });
+  } catch (err: any) {
+    console.error("[visa requests request-clarification POST]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to request clarification" });
   }
 });
 
