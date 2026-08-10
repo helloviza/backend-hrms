@@ -1930,10 +1930,74 @@ router.get("/requests", async (req: any, res: any) => {
       applicationsByRequest.get(key)!.push(app);
     }
 
-    const result = requests.map((r: any) => ({
-      ...r,
-      applications: applicationsByRequest.get(String(r._id)) || [],
-    }));
+    // ── Approvals-queue enrichment (2026-08-10) ────────────────────────
+    // Three things the raw request doc cannot give the approvals UI, all
+    // resolved in ONE batched lookup and ONLY for the approvals queue — the
+    // ordinary tracking list pays nothing for them.
+    //
+    //   requestorName  — the doc carries raisedByUserId, an id. The queue's
+    //                    first column is a person. Mirrors how
+    //                    expenseReports.ts batches employeeName.
+    //   approvalChain[].approverName — same problem, for the multi-level
+    //                    "awaiting L2" display.
+    //   canApprove     — SERVER-COMPUTED authority. The UI must never infer
+    //                    who may decide: canDecideVisaRequest holds the
+    //                    segregation-of-duties rule (a non-admin may never
+    //                    decide their own request; an admin may, and is
+    //                    marked selfApproved), and re-deriving that in the
+    //                    client would be a second copy of the rule that can
+    //                    disagree with the routes that enforce it.
+    const isApprovalsQueue = String(req.query.queue || "") === "approvals";
+    let nameByUserId = new Map<string, string>();
+    if (isApprovalsQueue) {
+      const userIds = [
+        ...new Set(
+          requests
+            .flatMap((r: any) => [
+              r.raisedByUserId,
+              ...(Array.isArray(r.approvalChain) ? r.approvalChain.map((l: any) => l?.approverId) : []),
+            ])
+            .filter((id: any) => id && mongoose.isValidObjectId(String(id)))
+            .map(String),
+        ),
+      ];
+      if (userIds.length) {
+        const users = await User.find({ _id: { $in: userIds } })
+          .select("firstName lastName name email")
+          .lean();
+        nameByUserId = new Map(
+          users.map((u: any) => [
+            String(u._id),
+            [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.name || u.email || "",
+          ]),
+        );
+      }
+    }
+
+    const result = requests.map((r: any) => {
+      const base = {
+        ...r,
+        applications: applicationsByRequest.get(String(r._id)) || [],
+      };
+      if (!isApprovalsQueue) return base;
+
+      const decision = canDecideVisaRequest(req.user, r);
+      return {
+        ...base,
+        requestorName: nameByUserId.get(String(r.raisedByUserId)) || "",
+        approvalChain: (Array.isArray(r.approvalChain) ? r.approvalChain : []).map((l: any) => ({
+          ...l,
+          approverName: l?.approverId ? nameByUserId.get(String(l.approverId)) || "" : "",
+        })),
+        // The affordance hint. The routes re-derive their own authority on
+        // every action regardless — this only decides whether a button is
+        // offered, never whether it is honoured.
+        canApprove: r.approvalStatus === "pending_approval" && decision.ok,
+        // Surfaced so the UI can say WHY a row it can see is not actionable
+        // ("your own request") rather than showing a dead button.
+        isOwnRequest: decision.isSelf,
+      };
+    });
 
     res.json({ ok: true, requests: result });
   } catch (err: any) {
