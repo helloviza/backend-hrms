@@ -601,6 +601,11 @@ export async function bookFlight(params: {
     throw new Error("bookFlight: Passengers array is missing or empty");
   }
 
+  // STALE GUARD — reads GSTCompanyInfo, which the frontend no longer sends (F2a:
+  // GST moved onto the lead passenger). Currently inert because IsGSTMandatory is
+  // never forwarded either. When the F2 track starts forwarding IsGSTMandatory this
+  // WILL false-reject every GST booking — re-point it at the lead pax's GSTNumber
+  // in that commit, not this one.
   if (params.IsGSTMandatory === true && !params.GSTCompanyInfo) {
     throw new Error("GST company details are mandatory for this fare. Please provide your company GSTIN.");
   }
@@ -728,7 +733,9 @@ export async function bookFlight(params: {
     Passengers: sanitizedPassengers,
     IsPriceChangeAccepted: false,
   };
-  if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
+  // No top-level GSTCompanyInfo — TBO's Book schema has no such node (Book.aspx:
+  // GST is 5.7-5.11, inside Passengers[]). The five GST fields are read off each
+  // passenger in the sanitizer above and are set on the lead pax by the frontend.
   if (params.isCorporate && params.corporatePAN) {
     payload.IsCorporate = true;
     payload.CorporatePAN = params.corporatePAN;
@@ -947,6 +954,11 @@ export async function ticketLCC(params: {
   isCorporate?: boolean;
   corporatePAN?: string;
 }) {
+  // STALE GUARD — reads GSTCompanyInfo, which the frontend no longer sends (F2a:
+  // GST moved onto the lead passenger). Currently inert because IsGSTMandatory is
+  // never forwarded either. When the F2 track starts forwarding IsGSTMandatory this
+  // WILL false-reject every GST booking — re-point it at the lead pax's GSTNumber
+  // in that commit, not this one.
   if (params.IsGSTMandatory === true && !params.GSTCompanyInfo) {
     throw new Error("GST company details are mandatory for this fare. Please provide your company GSTIN.");
   }
@@ -1183,7 +1195,9 @@ export async function ticketLCC(params: {
     Passengers: sanitizedPassengers,
     IsPriceChangeAccepted: false,
   };
-  if (params.GSTCompanyInfo) payload.GSTCompanyInfo = params.GSTCompanyInfo;
+  // No top-level GSTCompanyInfo — TBO's Ticket schema has no such node (Ticket.aspx:
+  // GST is 5.19-5.23, inside Passengers[]). The five GST fields are read off each
+  // passenger in the sanitizer above and are set on the lead pax by the frontend.
   if (params.isCorporate && params.corporatePAN) {
     payload.IsCorporate = true;
     payload.CorporatePAN = params.corporatePAN;
