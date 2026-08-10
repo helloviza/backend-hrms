@@ -77,6 +77,8 @@ import Department from "../models/Department.js";
 import TravelBooking from "../models/TravelBooking.js";
 import User from "../models/User.js";
 import CustomerMember from "../models/CustomerMember.js";
+// Workspace visa policy (GET/PATCH /policy) — config.visaApprovalRequired.
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { getCountryByIso2, normaliseToIso2 } from "../utils/countryCodes.js";
 import {
@@ -124,6 +126,7 @@ import VisaActivityLog, {
 // infra/design/visa-approval-flow-2026-08-10.md.
 import {
   isVisaApprovalRequired,
+  isVisaAdmin,
   resolveVisaApprovalChain,
   canDecideVisaRequest,
   visaSeesAll,
@@ -2009,6 +2012,103 @@ router.get("/requests", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
+ * WORKSPACE VISA POLICY (2026-08-10) — GET / PATCH /policy.
+ *
+ * The one setting behind the customer-side approval gate:
+ * config.visaApprovalRequired. Until now it was data-only — nothing in the
+ * product could read or set it, so opting a workspace in meant editing the
+ * document by hand.
+ *
+ * Modelled on routes/expenseAdmin.ts's GET/PATCH /policy, which owns the
+ * SIBLING keys in the very same config block (expenseEscalationThreshold,
+ * advanceEscalationThreshold, seniorApproverId): same shape, same
+ * only-touch-the-keys-present rule, same workspace scoping.
+ *
+ * GATE — isVisaAdmin, i.e. the WORKSPACE LEADER for their OWN workspace,
+ * matching what expenseAdmin does with isAdmin. Whether a customer's team
+ * needs an internal approval step before Plumtrips sees a visa request is a
+ * customer policy decision, and it is the same authority that already sets
+ * their expense escalation threshold. It is NOT Plumtrips staff: nothing
+ * here is an ops concern.
+ *
+ * Workspace-scoped by the router mount (requireWorkspace), so a leader can
+ * only ever read or write their own workspace's value — the id is never
+ * taken from the body.
+ * ───────────────────────────────────────────────────────────────────── */
+function requireVisaPolicyAdmin(req: any, res: any): boolean {
+  if (!req.workspaceObjectId) {
+    res.status(400).json({
+      error:
+        "No workspace context. SUPERADMIN: pass workspaceId in body, query, or x-workspace-id header.",
+    });
+    return false;
+  }
+  if (!isVisaAdmin(req.user)) {
+    res.status(403).json({ error: "Only a workspace leader can change this setting" });
+    return false;
+  }
+  return true;
+}
+
+router.get("/policy", async (req: any, res: any) => {
+  try {
+    if (!requireVisaPolicyAdmin(req, res)) return;
+    const ws: any = await CustomerWorkspace.findById(req.workspaceObjectId)
+      .select("config.visaApprovalRequired")
+      .lean();
+    res.json({
+      ok: true,
+      // Strict ===true, the SAME reading isVisaApprovalRequired applies, so
+      // the screen can never show "on" for a value the gate treats as off.
+      policy: { visaApprovalRequired: ws?.config?.visaApprovalRequired === true },
+    });
+  } catch (err: any) {
+    console.error("[visa policy GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load visa policy" });
+  }
+});
+
+router.patch("/policy", async (req: any, res: any) => {
+  try {
+    if (!requireVisaPolicyAdmin(req, res)) return;
+
+    const b = req.body || {};
+    // Only the keys PRESENT are touched — expenseAdmin's own rule, so a
+    // future second setting can be added without this route rewriting it.
+    if (!("visaApprovalRequired" in b)) {
+      return res.status(400).json({ error: "Nothing to change (pass visaApprovalRequired)." });
+    }
+    if (typeof b.visaApprovalRequired !== "boolean") {
+      return res.status(400).json({ error: "visaApprovalRequired must be true or false." });
+    }
+
+    await CustomerWorkspace.findByIdAndUpdate(req.workspaceObjectId, {
+      $set: { "config.visaApprovalRequired": b.visaApprovalRequired },
+    });
+
+    // Re-read rather than echoing the input: the response is what the gate
+    // will actually see on the next submit, not what was asked for.
+    const ws: any = await CustomerWorkspace.findById(req.workspaceObjectId)
+      .select("config.visaApprovalRequired")
+      .lean();
+
+    visaLogger.info("visa.policy.approval_required.changed", {
+      workspaceId: String(req.workspaceObjectId),
+      actorUserId: visaUserIdOf(req.user),
+      value: ws?.config?.visaApprovalRequired === true,
+    });
+
+    res.json({
+      ok: true,
+      policy: { visaApprovalRequired: ws?.config?.visaApprovalRequired === true },
+    });
+  } catch (err: any) {
+    console.error("[visa policy PATCH]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to update visa policy" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * GET /requests/pending-count — the sidebar badge. Same filter as
  * ?queue=approvals above, counted rather than listed.
  *
@@ -2018,10 +2118,45 @@ router.get("/requests", async (req: any, res: any) => {
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/requests/pending-count", async (req: any, res: any) => {
   try {
+    const workspaceId = req.workspaceObjectId;
     const approvals = await VisaRequest.countDocuments(
-      visaApprovalsQueueFilter(req, req.workspaceObjectId),
+      visaApprovalsQueueFilter(req, workspaceId),
     );
-    res.json({ ok: true, approvals });
+
+    // ── canSeeQueue (2026-08-10) — whether the Approvals nav item should
+    // exist AT ALL, as opposed to what number is on it.
+    //
+    // The count alone was the wrong predicate: it conflated "approval is off
+    // for this workspace" (correctly hidden) with "approval is on, your queue
+    // just happens to be empty" (wrongly hidden). That made the item vanish
+    // the moment an approver cleared their queue — so they could not get back
+    // to confirm they were caught up — and left an admin who had just
+    // switched the feature ON seeing no change until somebody submitted.
+    //
+    // Both halves are server-only facts, which is why they are computed here
+    // rather than guessed in the client:
+    //   • approvalRequired — config.visaApprovalRequired for this workspace;
+    //   • seesAll          — the visa-local admin predicate;
+    //   • ever an approver — has ANY request here ever been routed to me,
+    //     regardless of its current status, so a routed approver keeps the
+    //     item after clearing their queue.
+    const approvalRequired = await isVisaApprovalRequired(workspaceId);
+    let canSeeQueue = false;
+    if (approvalRequired) {
+      if (visaSeesAll(req.user)) {
+        canSeeQueue = true;
+      } else {
+        const meId = visaUserIdOf(req.user);
+        canSeeQueue = meId
+          ? !!(await VisaRequest.exists({
+              workspaceId,
+              approverId: new mongoose.Types.ObjectId(meId),
+            }))
+          : false;
+      }
+    }
+
+    res.json({ ok: true, approvals, approvalRequired, canSeeQueue });
   } catch (err: any) {
     console.error("[visa requests pending-count]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load count" });
