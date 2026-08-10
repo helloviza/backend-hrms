@@ -113,6 +113,10 @@ import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import VisaTemplate from "../models/VisaTemplate.js";
 import { env } from "../config/env.js";
+// Build-state flags (visaScoreEngine / mrzEncryptionAtRest) — lifted out of
+// this file so workspace.travellers.ts can read the SAME flag without
+// importing this Router. See the note where it used to be declared.
+import { VISA_PLATFORM_CAPABILITIES } from "../config/platformCapabilities.js";
 import logger from "../utils/logger.js";
 import { runVisaPassportExtraction } from "../services/visaPassportExtraction.js";
 import { isPassportDocCode, isPhotographDocCode } from "../config/visaDocumentTypeCatalogue.js";
@@ -911,6 +915,72 @@ async function resolveTravellerCanCreate(req: any): Promise<boolean> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * ACT-FOR SCOPE (2026-08-11) — who may file a visa for WHOM.
+ *
+ * Deliberately a different question from who may EDIT a traveller record.
+ * ensureTravellerWriteAccess (workspace.travellers.ts) answers the edit
+ * question and is untouched; this answers the filing question and lives at
+ * the filing route, which is where it belongs.
+ *
+ * VISA ONLY. SBT is not affected and must not be: booking on behalf of
+ * colleagues is a supported role there (sbtRole / sbtAssignedBookerId), and
+ * applying this rule to it would break a working feature. No sbt.* file is
+ * touched by this work. See infra/design/universal-traveller-profile-2026-08-11.md §3.
+ * ───────────────────────────────────────────────────────────────────── */
+
+/**
+ * A REQUESTER is a plain employee: they file for themselves. A
+ * WORKSPACE_LEADER or APPROVER is a travel admin raising for the org, which
+ * is the case the multi-traveller picker was built for.
+ */
+const VISA_FILE_FOR_OTHERS_ROLES = new Set(["WORKSPACE_LEADER", "APPROVER"]);
+
+/**
+ * The actor's CustomerMember role for THIS workspace's customer, or null for
+ * SUPERADMIN / a non-member (a staff account browsing the visa surface).
+ * Same lookup shape resolveTravellerCanCreate uses above — the same
+ * customerId (req.workspace.customerId, not req.user.customerId) and the
+ * same plain trim+uppercase, since CustomerMember.role stores the
+ * underscored literal.
+ */
+async function resolveActorMemberRole(req: any): Promise<string | null> {
+  const customerId = req.workspace?.customerId;
+  const email = req.user?.email;
+  if (!customerId || !email) return null;
+
+  const member: any = await CustomerMember.findOne({
+    customerId: String(customerId),
+    email: String(email).toLowerCase(),
+  })
+    .select("role isActive")
+    .lean();
+
+  if (!member || member.isActive === false) return null;
+  return String(member.role ?? "").trim().toUpperCase();
+}
+
+/**
+ * capabilities.canFileForOthers for GET /travellers — the flag ApplyPage
+ * uses to decide between the multi-traveller picker and the collapsed
+ * "confirm your details" screen.
+ *
+ * A SERVER capability, never re-derived from roles client-side — the same
+ * rule the existing canCreate already follows. And, like canCreate, this is
+ * advisory for the UI: the real boundary is the check inside POST /requests
+ * below, which runs whether or not the client asked this first.
+ */
+async function resolveCanFileForOthers(req: any): Promise<boolean> {
+  if (isSuperAdmin(req)) return true;
+  const role = await resolveActorMemberRole(req);
+  // A non-member (staff/HOUSE browsing the visa surface) gets true: they are
+  // not a REQUESTER, the self-scope rule has no meaning for them, and
+  // collapsing their screen onto a "self" profile they do not have would
+  // strand them. POST /requests' own check is likewise REQUESTER-only.
+  if (!role) return true;
+  return VISA_FILE_FOR_OTHERS_ROLES.has(role);
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * GET /travellers — picker data for screen 3 (traveller selection).
  *
  * routes/workspace.travellers.ts's GET / already exists and is workspace-
@@ -989,7 +1059,16 @@ router.get("/travellers", async (req: any, res: any) => {
     res.json({
       ok: true,
       travellers,
-      capabilities: { canCreate: await resolveTravellerCanCreate(req) },
+      capabilities: {
+        canCreate: await resolveTravellerCanCreate(req),
+        // 2026-08-11 — drives whether ApplyPage renders the multi-traveller
+        // picker at all. NOTE this list itself is still unscoped: it returns
+        // every active traveller in the workspace to any member, so hiding
+        // the picker removes a control, not an exposure. Filing is gated
+        // (POST /requests); reading is not. Recorded as a known remaining
+        // gap in the design doc §3 rather than left to be discovered.
+        canFileForOthers: await resolveCanFileForOthers(req),
+      },
     });
   } catch (err: any) {
     console.error("[visa travellers GET]", err?.message);
@@ -1514,6 +1593,56 @@ router.post("/requests", async (req: any, res: any) => {
           error: "One or more travellers do not belong to this workspace",
         });
     }
+
+    // ── ACT-FOR CONTROL 1 (2026-08-11) ────────────────────────────────
+    //
+    // Belonging to this workspace was the ONLY check here. It answers "is
+    // this one of our people" and says nothing about "may YOU file for
+    // them" — so any member could raise a visa for any colleague whose id
+    // they had, and GET /travellers hands every id to every member.
+    //
+    // For a REQUESTER (a plain employee), every traveller must be one they
+    // have CLAIMED — resolveMyTravellerProfiles, strictly claimedBy ===
+    // caller, the same resolver GET /travellers/me and the portal's own
+    // /workspace/travellers/me use, so "who you are" has one answer across
+    // the product.
+    //
+    // Rejected WHOLE, matching the workspace check directly above and the
+    // route's stated all-or-nothing posture — never a partial create with
+    // the disallowed traveller quietly dropped, which would file a real
+    // application for a subset the caller never reviewed.
+    //
+    // WORKSPACE_LEADER / APPROVER / SUPERADMIN / non-member are unaffected.
+    const actorRole = await resolveActorMemberRole(req);
+    if (actorRole === "REQUESTER") {
+      const actorUid = actorId(req);
+      // FAIL CLOSED. resolveMyTravellerProfiles filters on `claimedBy:
+      // userId`, and Mongoose STRIPS an undefined value out of a filter
+      // rather than matching on it — so an unresolvable user id would
+      // return every claimed profile in the workspace and this gate would
+      // pass for everyone. Refuse before the query instead.
+      if (!actorUid) {
+        return res.status(403).json({
+          error: "You can only apply for yourself, and we could not confirm who you are.",
+        });
+      }
+      const mine = await resolveMyTravellerProfiles(workspaceId, actorUid);
+      const ownIds = new Set(
+        mine.resolved
+          ? [String((mine as any).traveller.id)]
+          : (mine as any).travellers.map((t: any) => String(t.id)),
+      );
+      const outOfScope = travellerProfileIds.filter(
+        (id: any) => !ownIds.has(String(id)),
+      );
+      if (outOfScope.length) {
+        return res.status(403).json({
+          error:
+            "You can only apply for yourself. Ask a workspace leader to file for someone else.",
+        });
+      }
+    }
+
     const travellerById = new Map(
       travellers.map((t: any) => [String(t._id), t]),
     );
@@ -2316,44 +2445,13 @@ router.get("/summary", async (req: any, res: any) => {
 /* ─────────────────────────────────────────────────────────────────────
  * PLATFORM CAPABILITIES — build state, not workspace toggles.
  *
- * These say whether the PLATFORM can answer a question at all. They are
- * deliberately NOT CustomerWorkspace feature flags: a per-tenant toggle
- * would imply the capability exists and is merely switched off, which
- * would be a lie for both of these today.
- *
- * Each is the SINGLE place to flip when the corresponding feature ships,
- * and /visa/workspace reads them to decide between showing a real value
- * and showing "not yet available". Nothing on that page hardcodes either
- * state — flip one of these and the dashboard fills on its own.
+ * MOVED (2026-08-11) to config/platformCapabilities.ts, unchanged in value
+ * or meaning. It gained a second consumer — routes/workspace.travellers.ts
+ * gates PAN/Aadhaar capture on mrzEncryptionAtRest — and that file cannot
+ * import a Router just to read a boolean. There is still exactly ONE flag
+ * and one place to flip it; what this page renders off it is untouched.
+ * See infra/design/universal-traveller-profile-2026-08-11.md §4.
  * ───────────────────────────────────────────────────────────────────── */
-const VISA_PLATFORM_CAPABILITIES = {
-  /**
-   * Visa readiness scoring (the "AURA" engine in the design references).
-   * FALSE — the engine does not exist and there is no calculator route
-   * anywhere in the codebase. While false, the dashboard renders the
-   * scoring section and its launch control in a disabled/unavailable
-   * state and shows "—" in the per-traveller score column. It must never
-   * render a mean or a per-person score: that would be a false approval
-   * prediction about a real person's visa.
-   */
-  visaScoreEngine: false,
-
-  /**
-   * MRZ encryption-at-rest. FALSE — passport MRZ is stored unencrypted;
-   * encryption-at-rest was split out of the traveller-profiles work as
-   * its own unscheduled proposal and has not been built.
-   *
-   * This is what the dashboard's compliance slot keys off. While false it
-   * shows an honest in-progress state; it must NOT render the design
-   * reference's "100% DPDP 2023 Compliant / Zero unencrypted MRZ storage"
-   * claim, because that claim would be false and it is exactly the
-   * assurance a customer would rely on when deciding whether to upload
-   * passports. Flipping this to true is necessary but NOT sufficient for
-   * the DPDP wording — "we encrypt at rest" and "we are DPDP compliant"
-   * are different statements and the second needs its own sign-off.
-   */
-  mrzEncryptionAtRest: false,
-} as const;
 
 /* ─────────────────────────────────────────────────────────────────────
  * GET /workspace/metrics — the figures /visa/workspace shows that cannot

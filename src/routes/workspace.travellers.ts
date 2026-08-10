@@ -32,8 +32,27 @@ import { normalizeEmail, normalizeName, findMatchingTraveller, applyTravellerFie
 // GET /api/visa/travellers/me/candidates — the tier that offers the button and
 // the action behind it must never disagree.
 // See infra/design/visa-self-service-identity-2026-08-10.md.
-import { evaluateNameUniqueSelfConfirm } from "../services/travellerIdentity.service.js";
+import {
+  evaluateNameUniqueSelfConfirm,
+  resolveMyTravellerProfiles,
+} from "../services/travellerIdentity.service.js";
 import { UserPermission, hasAccess } from "../models/UserPermission.js";
+// PAN / Aadhaar capture is gated on the SAME build-state flag the visa
+// compliance badge reads — one flag, one place to flip, so the field gate
+// and the badge can never disagree about whether anything is encrypted.
+// See infra/design/universal-traveller-profile-2026-08-11.md §4.
+import {
+  isIdentityNumberCaptureEnabled,
+  IDENTITY_CAPTURE_DISABLED_MESSAGE,
+} from "../config/platformCapabilities.js";
+import TravellerDocument, {
+  TRAVELLER_DOCUMENT_KINDS,
+  GATED_TRAVELLER_DOCUMENT_KINDS,
+  type TravellerDocumentKind,
+} from "../models/TravellerDocument.js";
+import { uploadBufferToS3 } from "../utils/s3Upload.js";
+import { presignGetObject } from "../utils/s3Presign.js";
+import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import { parseCsv } from "../utils/csv.js";
 import { autoCaptureTravellersFromBooking } from "../services/travellerAutoCapture.js";
@@ -114,6 +133,12 @@ export function ensureTravellerWriteAccess(
     return { ok: false, status: 403, error: "Only workspace leaders and approvers can bulk-import travellers" };
   }
 
+  // CREATE stays row-gate-open here — a REQUESTER may still create, but
+  // only THEMSELVES. That "only themselves" check needs a database read
+  // (does this person already hold a claimed profile?) which this pure
+  // function deliberately cannot do, so it lives in POST / as
+  // ensureRequesterMayCreateSelf. This function keeps answering the
+  // question it always answered.
   if (action === "create") return { ok: true };
 
   if (!traveller) return { ok: false, status: 404, error: "Traveller not found" };
@@ -127,13 +152,209 @@ export function ensureTravellerWriteAccess(
     return { ok: true };
   }
 
-  // REQUESTER — only records they created, or are the linked subject of
-  // (linked only ever via the explicit claim action, never inferred).
+  // REQUESTER — only records they created, or are the subject of.
+  //
+  // "Subject" is established two ways, and BOTH count (2026-08-11):
+  //
+  //   - linkedMemberId === their member row — the original test, set by the
+  //     explicit claim/link actions, never inferred;
+  //   - claimedBy === them — the key resolveMyTravellerProfiles resolves on,
+  //     and therefore the key the self-profile surface is bound to.
+  //
+  // Adding claimedBy fixes a gap that made My Profile read-only for the
+  // COMMON case rather than an edge one. POST / sets claimedBy (from
+  // ensureCstepTravellerLogin) whenever an admin adds a traveller WITH an
+  // email, and never sets linkedMemberId on that path — so every
+  // admin-added colleague resolved as "your profile" on the self surface
+  // and then refused every single edit, including their own mobile number.
+  //
+  // It is not a loosening of the identity model: claimedBy is only ever
+  // written by the explicit claim flow, the nine-condition self-confirm,
+  // the admin link, or the login provisioning that already proved the
+  // email — the same standard of evidence as linkedMemberId. And it is
+  // safe in a way it would not have been before this pass, because the
+  // FIELD allowlist now decides what a subject may actually change: being
+  // the subject no longer implies being able to rename yourself.
   const isOwner = String(traveller.createdBy) === userId;
-  const isSubject = traveller.linkedMemberId && String(traveller.linkedMemberId) === String(member._id);
-  if (isOwner || isSubject) return { ok: true };
+  const isLinkedSubject =
+    traveller.linkedMemberId && String(traveller.linkedMemberId) === String(member._id);
+  const isClaimant = traveller.claimedBy && String(traveller.claimedBy) === userId;
+  if (isOwner || isLinkedSubject || isClaimant) return { ok: true };
 
   return { ok: false, status: 403, error: "You can only edit travellers you created or are linked to" };
+}
+
+/* ── FIELD-LEVEL EDIT GATING (2026-08-11) ────────────────────────────
+ *
+ * Two gates now run in sequence on every edit, answering DIFFERENT
+ * questions. Keeping them separate is the point:
+ *
+ *   1. ensureTravellerWriteAccess (above, unchanged) — may this actor
+ *      write this ROW at all?
+ *   2. editableFieldsForRole (here) — which KEYS on that row may they set?
+ *
+ * The server is the control. The client's presetFieldKeys() is UX: it stops
+ * a locked field being typed into, and this stops a locked field being
+ * saved. Both halves already existed in matching shapes (see the audit §3);
+ * this adds the per-role allowlist that was missing, it does not invent a
+ * new mechanism.
+ *
+ * A key outside the allowlist is REJECTED with a 403 naming the field —
+ * never silently dropped. A silent drop shows someone a save that looked
+ * like it worked and didn't.
+ *
+ * See infra/design/universal-traveller-profile-2026-08-11.md §2.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/**
+ * What the claimed subject (and any REQUESTER who can reach the row at all)
+ * may set: their own contactable/biographic facts and their own travel
+ * documents. These are things the person themselves is the authority on.
+ */
+const SELF_EDITABLE_FIELDS = [
+  "gender", "dob", "nationality",
+  "passportNo", "passportExpiry", "passportIssueCountry", "passportIssueDate",
+  "mobile", "mobileCountryCode",
+  "mealPreference", "frequentFlyer",
+  "panNumber", "aadhaarNumber",
+] as const;
+
+/**
+ * What only an ADMIN / WORKSPACE_LEADER (or an APPROVER in a workspace that
+ * allows it) may set, ON TOP of everything above. These are assertions the
+ * ORG makes about a person — their legal name as the company records it,
+ * which department they sit in, who they report to, what number payroll
+ * knows them by. A person editing their own record must not be able to
+ * restate any of them about themselves.
+ */
+const ADMIN_ONLY_FIELDS = [
+  "title", "firstName", "middleName", "lastName",
+  "departmentId", "reportingManagerId", "employeeId",
+] as const;
+
+/**
+ * The name block is admin-only to EDIT and free to SET AT CREATE, and the
+ * distinction is not a loophole — it is the actual rule. "An employee
+ * cannot rename themselves" is about a record that already exists and that
+ * the org has already asserted a name on. At create there is nothing to
+ * restate: the person is typing their own name for the first time, and
+ * firstName/lastName are REQUIRED, so treating them as admin-only here
+ * would make a REQUESTER's self-create impossible.
+ *
+ * The genuinely org-owned facts — department, reporting line, employee
+ * number — stay admin-only at create too, or "set it while creating" would
+ * be the obvious way around the matrix.
+ */
+const CREATE_ONLY_SELF_SETTABLE = ["title", "firstName", "middleName", "lastName"] as const;
+
+/**
+ * `email` appears in NEITHER list and is not accepted by PUT /:id at all —
+ * for every role, SUPERADMIN included. It is the login key: writing it at
+ * CREATE runs ensureCstepTravellerLogin, which provisions a real account
+ * and fires a live invite. That is correct when someone deliberately adds a
+ * colleague and a trap as a side effect of fixing a profile. Every invite
+ * path still works (create, bulk import, the Team tab's own add-member
+ * routes, link-member) — see the design doc §2.1, which also records the
+ * one thing this costs: there is no route to correct a typo'd address.
+ */
+export type EditableTravellerField =
+  | (typeof SELF_EDITABLE_FIELDS)[number]
+  | (typeof ADMIN_ONLY_FIELDS)[number];
+
+/**
+ * The allowlist for this actor, keyed on ROLE rather than on relationship.
+ *
+ * Deliberately not "the subject gets the self set, a creator gets more":
+ * the rule the product states is "an employee cannot rename themselves",
+ * and a REQUESTER who created a row for somebody else has no better claim
+ * to that person's legal name than to their own. One list per role is also
+ * the thing a client can be handed and render against.
+ *
+ * `member === null` is the SUPERADMIN bypass path, already verified by the
+ * caller — same convention as ensureTravellerWriteAccess.
+ */
+export function editableFieldsForRole(
+  member: any | null,
+  approverCanManage: boolean,
+): EditableTravellerField[] {
+  const self = [...SELF_EDITABLE_FIELDS];
+  if (!member) return [...self, ...ADMIN_ONLY_FIELDS]; // SUPERADMIN
+
+  const role = normalizeRole(member.role);
+  if (role === "WORKSPACE_LEADER") return [...self, ...ADMIN_ONLY_FIELDS];
+  if (role === "APPROVER") {
+    // An APPROVER who cannot manage travellers never reaches the field gate
+    // (the row gate rejects first); this branch is the flag being ON.
+    return approverCanManage ? [...self, ...ADMIN_ONLY_FIELDS] : self;
+  }
+  return self; // REQUESTER — and any unrecognised role, which the row gate already refused
+}
+
+/**
+ * Which keys in this body the actor is not allowed to set. Uses `"key" in
+ * body` semantics, matching PUT /:id's existing "an absent key means leave
+ * alone" contract — so a preset that never emits a field can never trip
+ * this, which is exactly why the compact /visa/apply payload stays valid.
+ */
+function disallowedFieldsInBody(
+  body: Record<string, any>,
+  allowed: EditableTravellerField[],
+): string[] {
+  const allowedSet = new Set<string>(allowed);
+  const candidates = [...SELF_EDITABLE_FIELDS, ...ADMIN_ONLY_FIELDS] as readonly string[];
+  return candidates.filter((k) => k in body && !allowedSet.has(k));
+}
+
+/* ── ACT-FOR CONTROL 2: a REQUESTER may only create THEMSELVES ────────
+ *
+ * Before this, `action: "create"` returned ok unconditionally for any
+ * active member, so a plain employee could mint profiles for arbitrary
+ * other people — names, DOBs and passport numbers of colleagues who never
+ * asked. That is the hole the audit §6 item 5 flagged.
+ *
+ * The rule: a REQUESTER gets ONE profile, their own. If they already hold
+ * a claimed profile there is nothing left for them to create and the right
+ * answer is "edit the one you have", not a second row.
+ *
+ * The created record is then AUTO-CLAIMED by the caller (see POST /), which
+ * also closes the audit's §5 prerequisite gap in the same stroke: self-add
+ * goes through the compact preset, which omits email, so
+ * ensureCstepTravellerLogin never runs, so claimedBy was never set, so
+ * GET /travellers/me could not resolve the record and My Profile would be
+ * blank for exactly the people who most need it. Claiming it directly needs
+ * no email and fires no invite.
+ *
+ * VISA-SCOPED THINKING, WORKSPACE-WIDE ROUTE — worth being explicit. This
+ * is the create route both the visa flow and the client portal post to, so
+ * the restriction lands on both. It does NOT touch SBT: booking on behalf
+ * of colleagues is a supported role there (sbtRole / sbtAssignedBookerId),
+ * SBT's auto-capture writes through POST /auto-capture (its own route, its
+ * own gate, unchanged), and no sbt.* file is modified by this work.
+ * ─────────────────────────────────────────────────────────────────────── */
+async function ensureRequesterMayCreateSelf(
+  workspaceId: any,
+  member: any | null,
+  userId: string,
+): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+  if (!member) return { ok: true }; // SUPERADMIN
+  if (normalizeRole(member.role) !== "REQUESTER") return { ok: true };
+
+  const existing = await TravellerProfile.findOne({
+    workspaceId,
+    isActive: true,
+    claimedBy: userId,
+  })
+    .select("_id")
+    .lean();
+
+  if (existing) {
+    return {
+      ok: false,
+      status: 409,
+      error: "You already have a traveller profile — edit it instead of adding another.",
+    };
+  }
+  return { ok: true };
 }
 
 /**
@@ -301,10 +522,141 @@ export async function ensureCstepTravellerLogin(params: {
   return { userId: String(user._id), created };
 }
 
+// Plain string assignments. Everything with structure (email, departmentId,
+// reportingManagerId, frequentFlyer, mealPreference, pan/aadhaar) is handled
+// individually below. mobileCountryCode and employeeId joined the list in
+// 2026-08-11 — both are plain strings and neither needs special handling;
+// WHO may set them is the field allowlist's job, not this list's.
 const EDITABLE_STRING_FIELDS = [
   "title", "firstName", "middleName", "lastName", "gender", "dob", "nationality",
   "passportNo", "passportExpiry", "passportIssueCountry", "passportIssueDate", "mobile",
+  "mobileCountryCode", "employeeId",
 ] as const;
+
+/**
+ * Resolve a reportingManagerId from the body: an id must be a User in THIS
+ * workspace. Same tenant-safety shape as resolveDepartmentId below — the
+ * workspace is IN the query, so a caller cannot pass another tenant's
+ * User._id and have it stick.
+ *
+ * null = explicitly cleared; undefined = not supplied; string = error.
+ */
+async function resolveReportingManagerId(
+  workspaceId: any,
+  raw: any,
+): Promise<{ value?: mongoose.Types.ObjectId | null; error?: string }> {
+  if (raw === undefined) return {};
+  if (raw === null || String(raw).trim() === "") return { value: null };
+
+  const id = String(raw).trim();
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return { error: "reportingManagerId is not a valid id" };
+  }
+  const user: any = await User.findOne({ _id: id, workspaceId }).select("_id").lean();
+  if (!user) return { error: "That reporting manager is not a user in this workspace" };
+  return { value: user._id };
+}
+
+/**
+ * PAN / Aadhaar write, GATED. Accepts the FLAT wire keys (`panNumber`,
+ * `aadhaarNumber`) the form model uses and maps them onto the nested schema
+ * paths — one translation, here, rather than a nested form model that only
+ * these two fields would ever need.
+ *
+ * Refused for EVERY role while encryption at rest is unbuilt, SUPERADMIN
+ * included: this is a platform build-state gate, not a permission. 422
+ * (not 403) says "the server understood and will not do it", which is the
+ * accurate shape — nobody's rights would change the answer.
+ *
+ * Returns an error string to send, or null when there was nothing to do.
+ * See infra/design/universal-traveller-profile-2026-08-11.md §4.
+ */
+function applyIdentityNumbers(traveller: any, body: Record<string, any>): string | null {
+  const wants = "panNumber" in body || "aadhaarNumber" in body;
+  if (!wants) return null;
+
+  if (!isIdentityNumberCaptureEnabled()) return IDENTITY_CAPTURE_DISABLED_MESSAGE;
+
+  // Reached only once the flag flips. Written through the nested path so
+  // any docId already attached to the card image survives the number being
+  // corrected.
+  if ("panNumber" in body) {
+    traveller.pan = { ...(traveller.pan?.toObject?.() ?? traveller.pan ?? {}), number: normStr(body.panNumber) || undefined };
+  }
+  if ("aadhaarNumber" in body) {
+    traveller.aadhaar = { ...(traveller.aadhaar?.toObject?.() ?? traveller.aadhaar ?? {}), number: normStr(body.aadhaarNumber) || undefined };
+  }
+  return null;
+}
+
+/**
+ * "Last edited by X at Y", resolved for display.
+ *
+ * updatedBy is only written from 2026-08-11 onward, so every row edited
+ * before that has an updatedAt with nobody attached. That returns `null`
+ * for the name rather than guessing at createdBy — the record genuinely
+ * does not know who made the last change, and naming the original creator
+ * would assert something false about an edit they may not have made.
+ */
+async function describeLastEditor(
+  traveller: any,
+): Promise<{ name: string | null; at: Date | null }> {
+  const at = traveller?.updatedAt ?? null;
+  if (!traveller?.updatedBy) return { name: null, at };
+
+  const u: any = await User.findById(traveller.updatedBy)
+    .select("firstName lastName name email")
+    .lean();
+  if (!u) return { name: null, at };
+
+  const name =
+    u.name ||
+    [u.firstName, u.lastName].filter(Boolean).join(" ").trim() ||
+    u.email ||
+    null;
+  return { name, at };
+}
+
+/**
+ * The reporting manager's display name.
+ *
+ * Sent alongside the raw id because the picker that would otherwise supply
+ * the label is Admin-only: an employee viewing their own profile cannot
+ * fetch the candidate list (the route 403s them, correctly), so a locked
+ * <select> with no options rendered its placeholder — "No reporting
+ * manager" — over a manager that IS set. That is a false statement about
+ * the person's own record, which is exactly what this feature must not do.
+ *
+ * Looked up by id AND workspaceId: a stale pointer outside this workspace
+ * resolves to no name rather than reading another tenant's user.
+ */
+async function describeReportingManager(traveller: any, workspaceId: any): Promise<string | null> {
+  if (!traveller?.reportingManagerId) return null;
+  const u: any = await User.findOne({ _id: traveller.reportingManagerId, workspaceId })
+    .select("firstName lastName name email")
+    .lean();
+  if (!u) return null;
+  return (
+    u.name ||
+    [u.firstName, u.lastName].filter(Boolean).join(" ").trim() ||
+    u.email ||
+    null
+  );
+}
+
+/**
+ * What the client must render for PAN / Aadhaar. Sent as state rather than
+ * left to the client to infer, so the UI cannot show a "stored encrypted"
+ * reassurance the server would not stand behind. While `enabled` is false
+ * the client disables capture and shows `message` verbatim.
+ */
+function identityCaptureState() {
+  const enabled = isIdentityNumberCaptureEnabled();
+  return {
+    enabled,
+    message: enabled ? null : IDENTITY_CAPTURE_DISABLED_MESSAGE,
+  };
+}
 
 /* ── GET / — search / list (allowlisted, masked passport) ──────────── */
 
@@ -416,6 +768,147 @@ router.get("/tour-approver-candidates", async (req: any, res: any) => {
     res.json({ ok: true, candidates });
   } catch (err: any) {
     console.error("[workspace.travellers GET tour-approver-candidates]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /me — the caller's OWN profile. The self-profile surface's binding.
+ *
+ * Bound to resolveMyTravellerProfiles — the SAME strict claimedBy === caller
+ * resolve GET /api/visa/travellers/me already uses, imported rather than
+ * restated, so "who the visa flow thinks you are" and "whose profile the
+ * portal edits" can never disagree. That resolver deliberately refuses to
+ * guess when a caller has claimed more than one profile (the same person
+ * legitimately can, via a bulk import plus a self-add) and hands both back
+ * for them to choose between — picking one silently would edit the wrong
+ * passport.
+ *
+ * Registered AHEAD of GET /:id: same method, same single path segment, so
+ * Express would otherwise match "me" as a traveller id.
+ *
+ * Returns the FULL document, not the thin shape visa's /me returns — this
+ * is an edit surface, and the "never mask a read that feeds a form" rule
+ * applies. It is the caller's own record either way.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/me", async (req: any, res: any) => {
+  try {
+    const gate = await requireActiveMember(req, res);
+    if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
+    const { member } = gate;
+
+    const workspaceId = req.workspaceObjectId;
+    const uid = actorUserId(req);
+    if (!uid) {
+      // No resolvable User id means claimedBy can never match — say so
+      // cleanly rather than running a query keyed on undefined.
+      return res.json({ ok: true, resolved: false, reason: "none", travellers: [] });
+    }
+
+    const role = normalizeRole(member?.role);
+    const approverCanManage = role === "APPROVER" ? await getApproverCanManage(workspaceId) : true;
+
+    // canCreateSelf drives the "Set up your profile" branch. A REQUESTER
+    // with no claimed profile is exactly who that branch exists for; asking
+    // the same gate POST / will apply means the button never appears where
+    // the create would be refused.
+    const selfCreateGate = await ensureRequesterMayCreateSelf(workspaceId, member, uid);
+    const capabilities = {
+      canCreateSelf:
+        selfCreateGate.ok &&
+        ensureTravellerWriteAccess(uid, member, approverCanManage, null, "create").ok,
+    };
+
+    const result = await resolveMyTravellerProfiles(workspaceId, uid);
+    if (!result.resolved) {
+      return res.json({ ok: true, ...result, capabilities, identityCapture: identityCaptureState() });
+    }
+
+    // resolveMyTravellerProfiles returns the identity-shaped projection.
+    // Re-read the full document for the form — same "the caller's own
+    // record, unmasked, complete" posture, and the only place the new
+    // fields (employeeId, reportingManagerId, pan/aadhaar) can come from.
+    const traveller: any = await TravellerProfile.findOne({
+      _id: (result as any).traveller.id,
+      workspaceId,
+    }).lean();
+    if (!traveller) {
+      return res.json({ ok: true, resolved: false, reason: "none", travellers: [], capabilities, identityCapture: identityCaptureState() });
+    }
+
+    const canManage = ensureTravellerWriteAccess(uid, member, approverCanManage, traveller, "edit").ok;
+
+    res.json({
+      ok: true,
+      resolved: true,
+      traveller,
+      canManage,
+      editableFields: canManage ? editableFieldsForRole(member, approverCanManage) : [],
+      lastEditedBy: await describeLastEditor(traveller),
+      reportingManagerName: await describeReportingManager(traveller, workspaceId),
+      capabilities,
+      identityCapture: identityCaptureState(),
+      // MANDATORY-ON-SELF-SURFACE (design doc §2.2). Computed server-side so
+      // the prompt and the matrix agree, but deliberately NOT enforced as a
+      // 400: every other create path legitimately produces a profile
+      // without these (SBT auto-capture has no gender for hotels, a bulk
+      // row can leave the cell blank, the compact visa modal asks for six
+      // fields). A prompt on the surface that asks the person who knows the
+      // answer is the right place for this; a server rejection would just
+      // break three unrelated flows.
+      missingMandatory: [
+        ...(normStr(traveller.mobile) ? [] : ["mobile"]),
+        ...(normStr(traveller.gender) ? [] : ["gender"]),
+      ],
+    });
+  } catch (err: any) {
+    console.error("[workspace.travellers GET me]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /reporting-manager-candidates — workspace users, for the Admin-only
+ * reporting-manager picker.
+ *
+ * Deliberately NOT /tour-approver-candidates, which looks like the same
+ * list: that one is isCstepAdmin-gated (SUPERADMIN/ADMIN/HR) because it
+ * feeds the CSTEP routing slots, a different authority from traveller
+ * management. This one is gated on the field allowlist itself — if you
+ * cannot set reportingManagerId you have no use for its candidate list —
+ * so the picker and the write it feeds can never come apart.
+ *
+ * Registered ahead of GET /:id for the same reason as /me.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/reporting-manager-candidates", async (req: any, res: any) => {
+  try {
+    const gate = await requireActiveMember(req, res);
+    if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
+    const { member } = gate;
+
+    const workspaceId = req.workspaceObjectId;
+    const role = normalizeRole(member?.role);
+    const approverCanManage = role === "APPROVER" ? await getApproverCanManage(workspaceId) : true;
+    if (!editableFieldsForRole(member, approverCanManage).includes("reportingManagerId")) {
+      return res.status(403).json({ error: "Only a workspace leader can set a reporting manager" });
+    }
+
+    const users = await User.find({ workspaceId })
+      .select("firstName lastName name email")
+      .sort({ firstName: 1, lastName: 1 })
+      .lean();
+
+    const candidates = (users as any[]).map((u) => ({
+      _id: String(u._id),
+      name: u.name || [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.email || "Unnamed",
+      email: u.email,
+    }));
+
+    res.json({ ok: true, candidates });
+  } catch (err: any) {
+    console.error("[workspace.travellers GET reporting-manager-candidates]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -852,12 +1345,22 @@ router.get("/:id", async (req: any, res: any) => {
     const role = normalizeRole(member?.role);
     const approverCanManage = role === "APPROVER" ? await getApproverCanManage(workspaceId) : true;
     const uid = actorUserId(req);
+    const canManage = ensureTravellerWriteAccess(uid, member, approverCanManage, traveller, "edit").ok;
 
     res.json({
       ok: true,
       traveller,
-      canManage: ensureTravellerWriteAccess(uid, member, approverCanManage, traveller, "edit").ok,
+      canManage,
       isClaimable: canClaimTraveller(req.user?.email, member?._id, traveller),
+      // The server's OWN allowlist, handed to the client so the form locks
+      // exactly the fields the server would refuse — one source of truth for
+      // the matrix instead of a client copy that drifts. Empty when the row
+      // gate already said no, so a read-only viewer never renders an
+      // editable field it could not save.
+      editableFields: canManage ? editableFieldsForRole(member, approverCanManage) : [],
+      lastEditedBy: await describeLastEditor(traveller),
+      reportingManagerName: await describeReportingManager(traveller, workspaceId),
+      identityCapture: identityCaptureState(),
     });
   } catch (err: any) {
     console.error("[workspace.travellers GET one]", err.message);
@@ -878,6 +1381,19 @@ router.post("/", async (req: any, res: any) => {
     const writeGate = ensureTravellerWriteAccess(uid, member, true, null, "create");
     if (!writeGate.ok) return res.status((writeGate as any).status).json({ error: (writeGate as any).error });
 
+    const workspaceId = req.workspaceObjectId;
+    const customerId = req.workspace?.customerId;
+    const role = normalizeRole(member?.role);
+
+    // ACT-FOR CONTROL 2 — a REQUESTER may only create themselves, and only
+    // once. Checked before any validation or the travelerId mint, so a
+    // refused create consumes nothing.
+    const selfGate = await ensureRequesterMayCreateSelf(workspaceId, member, uid);
+    if (!selfGate.ok) {
+      return res.status((selfGate as any).status).json({ error: (selfGate as any).error });
+    }
+    const isRequesterSelfCreate = !!member && role === "REQUESTER";
+
     const body = req.body || {};
     const firstName = normStr(body.firstName);
     const lastName = normStr(body.lastName);
@@ -885,9 +1401,21 @@ router.post("/", async (req: any, res: any) => {
       return res.status(400).json({ error: "firstName and lastName are required" });
     }
 
-    const workspaceId = req.workspaceObjectId;
-    const customerId = req.workspace?.customerId;
-    const role = normalizeRole(member?.role);
+    // The ADMIN-only fields are refused at CREATE for the same reason they
+    // are refused at EDIT — a REQUESTER stating their own employee number
+    // or reporting line is the thing the matrix exists to prevent, and
+    // "set it while creating" would be an obvious way around it.
+    const allowedAtCreate = [
+      ...editableFieldsForRole(member, true),
+      ...CREATE_ONLY_SELF_SETTABLE, // see that constant's note — naming yourself once is not renaming
+    ] as EditableTravellerField[];
+    const disallowedAtCreate = disallowedFieldsInBody(body, allowedAtCreate);
+    if (disallowedAtCreate.length) {
+      return res.status(403).json({
+        error: `You cannot set ${disallowedAtCreate.join(", ")} on a profile. Ask a workspace leader.`,
+        fields: disallowedAtCreate,
+      });
+    }
 
     // Linking a NEW profile to a CustomerMember at creation is only allowed
     // when self-linking (always safe — you're identifying your own new
@@ -908,9 +1436,18 @@ router.post("/", async (req: any, res: any) => {
 
     // Resolved BEFORE the travelerId is minted: issueTravelerId consumes a
     // counter, so a department that turns out to be unknown must fail the
-    // request before that side effect, not after it.
+    // request before that side effect, not after it. reportingManagerId is
+    // resolved alongside it for the same reason.
     const department = await resolveDepartmentId(workspaceId, body.departmentId);
     if (department.error) return res.status(400).json({ error: department.error });
+    const manager = await resolveReportingManagerId(workspaceId, body.reportingManagerId);
+    if (manager.error) return res.status(400).json({ error: manager.error });
+
+    // PAN/Aadhaar at create is refused by the same build-state gate as at
+    // edit — checked here, before the counter, so the refusal costs nothing.
+    if (("panNumber" in body || "aadhaarNumber" in body) && !isIdentityNumberCaptureEnabled()) {
+      return res.status(422).json({ error: IDENTITY_CAPTURE_DISABLED_MESSAGE });
+    }
 
     const travelerId = await issueTravelerId(workspaceId, customerId, linkedMemberId);
 
@@ -936,11 +1473,39 @@ router.post("/", async (req: any, res: any) => {
       passportIssueCountry: normStr(body.passportIssueCountry) || undefined,
       passportIssueDate: normStr(body.passportIssueDate) || undefined,
       mobile: normStr(body.mobile) || undefined,
+      mobileCountryCode: normStr(body.mobileCountryCode) || undefined,
+      employeeId: normStr(body.employeeId) || undefined,
+      reportingManagerId: manager.value ?? undefined,
+      // email is STILL written at create — this is the deliberate act that
+      // provisions a login and invites a colleague. Only EDITING it is
+      // closed off (PUT /:id). See the design doc §2.1.
       email: normalizeEmail(body.email) || undefined,
       frequentFlyer: applyFrequentFlyer(body.frequentFlyer),
       createdBy: uid,
+      updatedBy: uid,
       source: "MANUAL",
     });
+
+    // ACT-FOR CONTROL 2, second half — AUTO-CLAIM a REQUESTER's own record.
+    //
+    // The self-add path (compact preset) omits email by design, so the
+    // login-provisioning block below never runs for it and claimedBy would
+    // stay unset — leaving GET /travellers/me unable to resolve the profile
+    // on the next visit, which is the audit §5 gap that would have made My
+    // Profile blank for exactly these users. Setting it here needs no email
+    // and fires no invite.
+    //
+    // Safe without any matching heuristic: the create gate above has just
+    // established this REQUESTER holds no claimed profile, and this is the
+    // record they themselves are creating. linkedMemberId is set to their
+    // own member row for the same reason the existing self-link branch
+    // allows it — asserting a profile is your own is always safe.
+    if (isRequesterSelfCreate) {
+      traveller.claimedBy = uid as any;
+      traveller.claimedAt = new Date();
+      if (!traveller.linkedMemberId) traveller.linkedMemberId = member._id;
+      await traveller.save();
+    }
 
     // Login auto-provisioning (additive) — a brand-new profile never has an
     // existing claimedBy, so linking here is always safe (no ambiguity
@@ -993,10 +1558,32 @@ router.put("/:id", async (req: any, res: any) => {
     if (!writeGate.ok) return res.status((writeGate as any).status).json({ error: (writeGate as any).error });
 
     const body = req.body || {};
+
+    // FIELD-LEVEL GATE (2026-08-11). The row gate above said this actor may
+    // write this record; this says which keys. Runs BEFORE anything is
+    // assigned, so a payload carrying one disallowed field changes nothing
+    // at all — never a partial save with the locked key quietly ignored.
+    const allowedFields = editableFieldsForRole(member, approverCanManage);
+    const disallowed = disallowedFieldsInBody(body, allowedFields);
+    if (disallowed.length) {
+      return res.status(403).json({
+        error: `You cannot change ${disallowed.join(", ")} on this profile. Ask a workspace leader.`,
+        fields: disallowed,
+      });
+    }
+
+    // EMAIL IS NOT ACCEPTED HERE, for anyone. Not an allowlist omission —
+    // the assignment is gone. See the SELF_EDITABLE_FIELDS block's note and
+    // the design doc §2.1: writing this key provisions a login and fires a
+    // live invite, which must stay a deliberate act (create / bulk import /
+    // the Team tab), never a side effect of editing a profile. A body that
+    // still carries `email` is ignored rather than rejected — the "full"
+    // preset sends the field it renders read-only, and 403-ing an
+    // unchanged value would break saving everything else on the form.
+
     for (const key of EDITABLE_STRING_FIELDS) {
       if (key in body) traveller[key] = normStr(body[key]) || undefined;
     }
-    if ("email" in body) traveller.email = normalizeEmail(body.email) || undefined;
     // Only touched when the key is present, so a payload that never carries
     // departmentId (the "compact" /visa/apply preset) can never clear one.
     if ("departmentId" in body) {
@@ -1004,15 +1591,26 @@ router.put("/:id", async (req: any, res: any) => {
       if (department.error) return res.status(400).json({ error: department.error });
       traveller.departmentId = department.value ?? null;
     }
+    if ("reportingManagerId" in body) {
+      const manager = await resolveReportingManagerId(workspaceId, body.reportingManagerId);
+      if (manager.error) return res.status(400).json({ error: manager.error });
+      traveller.reportingManagerId = manager.value ?? undefined;
+    }
     if ("frequentFlyer" in body) traveller.frequentFlyer = applyFrequentFlyer(body.frequentFlyer);
     if ("mealPreference" in body) {
       traveller.mealPreference = MEAL_PREFERENCE_CODES.includes(body.mealPreference)
         ? body.mealPreference
         : undefined;
     }
+    const identityError = applyIdentityNumbers(traveller, body);
+    if (identityError) return res.status(422).json({ error: identityError });
+
+    // "Last edited by X at Y" — updatedAt is already maintained by
+    // timestamps; this is the half that was missing everywhere.
+    traveller.updatedBy = uid;
 
     await traveller.save();
-    res.json({ ok: true, traveller });
+    res.json({ ok: true, traveller, editableFields: allowedFields });
   } catch (err: any) {
     console.error("[workspace.travellers PUT]", err.message);
     res.status(500).json({ error: err.message });
@@ -1040,11 +1638,300 @@ router.delete("/:id", async (req: any, res: any) => {
     if (!writeGate.ok) return res.status((writeGate as any).status).json({ error: (writeGate as any).error });
 
     traveller.isActive = false;
+    traveller.updatedBy = uid;
     await traveller.save();
 
     res.json({ ok: true });
   } catch (err: any) {
     console.error("[workspace.travellers DELETE]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * PROFILE DOCUMENTS — passport front/back, and (gated) PAN/Aadhaar cards.
+ *
+ * Metadata in TravellerDocument, bytes in S3, versioned on re-upload,
+ * soft-delete only. See models/TravellerDocument.ts for why this is not
+ * VisaDocument (that model's applicationId is required, and a profile-level
+ * document has no application).
+ *
+ * ACCESS IS THE WRITE GATE, NOT THE READ GATE — the deliberate divergence
+ * this router otherwise does not make. Any active member may read any
+ * colleague's traveller FIELDS unmasked, because booking their saved
+ * traveller needs the real passport number. A passport SCAN carries the
+ * photo page and the signature, and no booking flow needs it — so listing,
+ * presigning, uploading and deleting all require what
+ * ensureTravellerWriteAccess(…, "edit") grants: the subject themselves, or
+ * WORKSPACE_LEADER/APPROVER.
+ *
+ * See infra/design/universal-traveller-profile-2026-08-11.md §1.3.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+// Same limits and mime set as the visa document upload (routes/visa.ts's
+// VISA_DOCUMENT_ALLOWED_MIME / VISA_DOCUMENT_MAX_BYTES). Restated rather
+// than imported for the reason visa.ts itself gives about crossing between
+// these two routers: importing a Router module to reach two constants pulls
+// in every route it mounts. If they ever need to differ, they can.
+const TRAVELLER_DOC_ALLOWED_MIME = ["application/pdf", "image/png", "image/jpeg", "image/webp"];
+const TRAVELLER_DOC_MAX_BYTES = 15 * 1024 * 1024;
+
+const travellerDocUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: TRAVELLER_DOC_MAX_BYTES },
+  fileFilter: (_req, file, cb) => {
+    if (TRAVELLER_DOC_ALLOWED_MIME.includes(file.mimetype)) return cb(null, true);
+    cb(new Error("Only PDF, PNG, JPEG, or WEBP files are allowed."));
+  },
+});
+
+// Wraps multer so a rejected mime type or an oversized file returns clean
+// JSON (413/400) instead of falling through to Express's default error
+// handler — same treatment visa.ts / expenses.ts / workspace.branding.ts
+// already give their own uploads.
+function travellerDocUploadMw(req: any, res: any, next: any) {
+  travellerDocUpload.single("file")(req, res, (err: any) => {
+    if (!err) return next();
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        error: `File too large. Maximum size is ${TRAVELLER_DOC_MAX_BYTES / (1024 * 1024)}MB.`,
+      });
+    }
+    return res.status(400).json({ error: err?.message || "Upload failed" });
+  });
+}
+
+/**
+ * The gate every document route runs: load the profile in this workspace,
+ * then apply the edit-level write check. Returns null having already sent
+ * the response when the caller may not proceed.
+ */
+async function requireTravellerDocumentAccess(
+  req: any,
+  res: any,
+): Promise<{ traveller: any; uid: string } | null> {
+  const gate = await requireActiveMember(req, res);
+  if (!gate) return null;
+  if (!requireWorkspaceContext(req, res)) return null;
+  const { member } = gate;
+
+  const workspaceId = req.workspaceObjectId;
+  const traveller: any = await TravellerProfile.findOne({ _id: req.params.id, workspaceId });
+  if (!traveller) {
+    res.status(404).json({ error: "Traveller not found" });
+    return null;
+  }
+
+  const role = normalizeRole(member?.role);
+  const approverCanManage = role === "APPROVER" ? await getApproverCanManage(workspaceId) : true;
+  const uid = actorUserId(req);
+  const writeGate = ensureTravellerWriteAccess(uid, member, approverCanManage, traveller, "edit");
+  if (!writeGate.ok) {
+    res.status((writeGate as any).status).json({ error: (writeGate as any).error });
+    return null;
+  }
+  return { traveller, uid };
+}
+
+/** Never includes s3Key — the internal storage path is not the client's. */
+function mapTravellerDocument(d: any) {
+  return {
+    _id: String(d._id),
+    docKind: d.docKind,
+    originalFilename: d.originalFilename,
+    mimeType: d.mimeType,
+    sizeBytes: d.sizeBytes,
+    version: d.version,
+    uploadedAt: d.createdAt ?? null,
+  };
+}
+
+/* ── GET /:id/documents — latest non-deleted version per kind ───────── */
+
+router.get("/:id/documents", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerDocumentAccess(req, res);
+    if (!ctx) return;
+
+    const docs = await TravellerDocument.find({
+      workspaceId: req.workspaceObjectId,
+      travellerProfileId: ctx.traveller._id,
+      deletedAt: null,
+    })
+      .sort({ docKind: 1, version: -1 })
+      .lean();
+
+    // First row per kind wins — the sort above put the highest version of
+    // each kind first, same shape visa.ts's document listing uses.
+    const latestByKind = new Map<string, any>();
+    for (const d of docs as any[]) {
+      if (!latestByKind.has(d.docKind)) latestByKind.set(d.docKind, d);
+    }
+
+    res.json({
+      ok: true,
+      documents: [...latestByKind.values()].map(mapTravellerDocument),
+      // Which kinds may be uploaded RIGHT NOW. Sent rather than left to the
+      // client to work out, so a disabled control and a refused upload can
+      // never disagree about why.
+      capabilities: {
+        uploadableKinds: TRAVELLER_DOCUMENT_KINDS.filter(
+          (k) => !GATED_TRAVELLER_DOCUMENT_KINDS.has(k) || isIdentityNumberCaptureEnabled(),
+        ),
+      },
+      identityCapture: identityCaptureState(),
+    });
+  } catch (err: any) {
+    console.error("[workspace.travellers GET documents]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── POST /:id/documents — upload (multipart "file" + docKind) ──────── */
+
+router.post("/:id/documents", travellerDocUploadMw, async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerDocumentAccess(req, res);
+    if (!ctx) return;
+
+    const file = req.file;
+    if (!file || !file.buffer) return res.status(400).json({ error: "File is required" });
+
+    const docKind = String(req.body?.docKind || "").trim().toUpperCase() as TravellerDocumentKind;
+    if (!TRAVELLER_DOCUMENT_KINDS.includes(docKind)) {
+      return res.status(400).json({ error: "docKind must be one of the recognised profile document kinds" });
+    }
+
+    // THE GATE. PAN and Aadhaar card images wait on encryption at rest,
+    // exactly as their numbers do — the same flag, refused for every role
+    // including SUPERADMIN because this is build state, not permission.
+    // Passport pages are NOT gated: a passport scan is not a regulated
+    // national ID, and this collection already stores passport data
+    // unencrypted with the compliance badge saying so.
+    if (GATED_TRAVELLER_DOCUMENT_KINDS.has(docKind) && !isIdentityNumberCaptureEnabled()) {
+      return res.status(422).json({ error: IDENTITY_CAPTURE_DISABLED_MESSAGE });
+    }
+
+    const workspaceId = req.workspaceObjectId;
+    const latest: any = await TravellerDocument.findOne({
+      travellerProfileId: ctx.traveller._id,
+      docKind,
+    })
+      .sort({ version: -1 })
+      .select("version")
+      .lean();
+    const version = (latest?.version ?? 0) + 1;
+
+    // workspaceId IN the S3 key path (not only in the workspaceId field) —
+    // same convention as VisaDocument, so a key can never be reused across
+    // tenants even by accident.
+    const uploaded = await uploadBufferToS3({
+      buffer: file.buffer,
+      mime: file.mimetype,
+      originalName: file.originalname,
+      customerId: String(workspaceId),
+      createdBy: String(ctx.uid),
+      keyPrefix: `traveller-profiles/${workspaceId}/${ctx.traveller._id}`,
+    });
+
+    const doc = await TravellerDocument.create({
+      workspaceId,
+      travellerProfileId: ctx.traveller._id,
+      docKind,
+      version,
+      s3Key: uploaded.key,
+      originalFilename: file.originalname,
+      mimeType: file.mimetype,
+      sizeBytes: file.size,
+      uploadedByUserId: ctx.uid,
+    });
+
+    // Uploading a card image is an edit of the profile, so it moves the
+    // "last edited by" line — the person looking at that line cares that
+    // their document changed, not which collection the row landed in.
+    ctx.traveller.updatedBy = ctx.uid;
+    // The nested docId pointer is only meaningful once capture is enabled;
+    // while gated, neither branch is reachable (the 422 above returned).
+    if (docKind === "PAN_CARD") {
+      ctx.traveller.pan = { ...(ctx.traveller.pan?.toObject?.() ?? ctx.traveller.pan ?? {}), docId: doc._id };
+    } else if (docKind === "AADHAAR_FRONT") {
+      ctx.traveller.aadhaar = { ...(ctx.traveller.aadhaar?.toObject?.() ?? ctx.traveller.aadhaar ?? {}), docId: doc._id };
+    }
+    await ctx.traveller.save();
+
+    res.status(201).json({ ok: true, document: mapTravellerDocument(doc) });
+  } catch (err: any) {
+    // Two concurrent uploads of the SAME docKind can both read the same
+    // "latest version" above and race on the unique index — surfaced as a
+    // conflict to retry, not a generic 500.
+    if (err?.code === 11000) {
+      return res.status(409).json({ error: "This document was uploaded concurrently — please retry." });
+    }
+    console.error("[workspace.travellers POST documents]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── GET /:id/documents/:documentId/url — short-TTL presigned GET ───── */
+
+router.get("/:id/documents/:documentId/url", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerDocumentAccess(req, res);
+    if (!ctx) return;
+
+    // travellerProfileId is IN the filter, not checked afterwards: a
+    // documentId belonging to another profile resolves to nothing rather
+    // than to somebody else's passport scan.
+    const doc: any = await TravellerDocument.findOne({
+      _id: req.params.documentId,
+      workspaceId: req.workspaceObjectId,
+      travellerProfileId: ctx.traveller._id,
+      deletedAt: null,
+    }).lean();
+    if (!doc) return res.status(404).json({ error: "Document not found" });
+
+    const url = await presignGetObject({
+      bucket: env.S3_BUCKET,
+      key: doc.s3Key,
+      filename: doc.originalFilename,
+      view: true,
+      contentType: doc.mimeType,
+    });
+
+    res.json({ ok: true, url });
+  } catch (err: any) {
+    console.error("[workspace.travellers GET document url]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── DELETE /:id/documents/:documentId — soft delete ────────────────── */
+
+router.delete("/:id/documents/:documentId", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerDocumentAccess(req, res);
+    if (!ctx) return;
+
+    const doc: any = await TravellerDocument.findOne({
+      _id: req.params.documentId,
+      workspaceId: req.workspaceObjectId,
+      travellerProfileId: ctx.traveller._id,
+      deletedAt: null,
+    });
+    if (!doc) return res.status(404).json({ error: "Document not found" });
+
+    // Soft delete ONLY — the S3 object is never removed here. Both fields
+    // together, never one without the other.
+    doc.deletedAt = new Date();
+    doc.deletedBy = ctx.uid as any;
+    await doc.save();
+
+    ctx.traveller.updatedBy = ctx.uid;
+    await ctx.traveller.save();
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[workspace.travellers DELETE document]", err.message);
     res.status(500).json({ error: err.message });
   }
 });

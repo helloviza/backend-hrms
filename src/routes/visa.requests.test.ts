@@ -406,6 +406,191 @@ beforeEach(() => {
   refSeq = 0;
 });
 
+/* ─────────────────────────────────────────────────────────────────────
+ * ACT-FOR CONTROL 1 (2026-08-11) — who a REQUESTER may file for.
+ *
+ * Before this, belonging to the workspace was the ONLY check, and GET
+ * /travellers hands every id in the workspace to every member — so any
+ * employee could raise a real visa application against a colleague's
+ * passport. See infra/design/universal-traveller-profile-2026-08-11.md §3.
+ * ───────────────────────────────────────────────────────────────────── */
+describe("POST /requests — REQUESTER may only file for themselves", () => {
+  const CUSTOMER = "cust-actfor";
+  const EMAIL = "employee@acme.com";
+
+  function app(role: "WORKSPACE_LEADER" | "APPROVER" | "REQUESTER" | null) {
+    if (role) memberDoc(CUSTOMER, EMAIL, role);
+    return makeApp(
+      WORKSPACE_A,
+      USER_A,
+      { email: EMAIL, roles: ["CUSTOMER"] },
+      { workspaceCustomerId: CUSTOMER },
+    );
+  }
+
+  it("403s and creates nothing when a REQUESTER files for a colleague", async () => {
+    const rule = ruleDoc();
+    const mine = travellerDoc(WORKSPACE_A, { claimedBy: USER_A });
+    const colleague = travellerDoc(WORKSPACE_A, { firstName: "Colleague" });
+
+    const res = await request(app("REQUESTER"))
+      .post("/requests")
+      .send({
+        ruleId: String(rule._id),
+        travellerProfileIds: [String(mine._id), String(colleague._id)],
+      });
+
+    expect(res.status).toBe(403);
+    // WHOLE-request rejection, matching the workspace check's own posture —
+    // never a partial create that silently drops the colleague and files
+    // for a subset the caller never reviewed.
+    expect(requests.store.size).toBe(0);
+    expect(applications.store.size).toBe(0);
+  });
+
+  it("allows a REQUESTER to file for their OWN claimed profile", async () => {
+    const rule = ruleDoc();
+    const mine = travellerDoc(WORKSPACE_A, { claimedBy: USER_A });
+
+    const res = await request(app("REQUESTER"))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(mine._id)] });
+
+    expect(res.status).toBe(201);
+    expect(applications.store.size).toBe(1);
+  });
+
+  it("403s a REQUESTER who has claimed NOTHING, rather than letting an empty own-set pass", async () => {
+    const rule = ruleDoc();
+    const someone = travellerDoc(WORKSPACE_A);
+
+    const res = await request(app("REQUESTER"))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(someone._id)] });
+
+    expect(res.status).toBe(403);
+    expect(requests.store.size).toBe(0);
+  });
+
+  it("leaves WORKSPACE_LEADER filing for colleagues untouched", async () => {
+    const rule = ruleDoc();
+    const a = travellerDoc(WORKSPACE_A, { firstName: "One" });
+    const b = travellerDoc(WORKSPACE_A, { firstName: "Two" });
+
+    const res = await request(app("WORKSPACE_LEADER"))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(a._id), String(b._id)] });
+
+    expect(res.status).toBe(201);
+    expect(applications.store.size).toBe(2);
+  });
+
+  it("leaves APPROVER filing for colleagues untouched", async () => {
+    const rule = ruleDoc();
+    const a = travellerDoc(WORKSPACE_A, { firstName: "One" });
+
+    const res = await request(app("APPROVER"))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(a._id)] });
+
+    expect(res.status).toBe(201);
+  });
+
+  it("leaves a non-member (staff/HOUSE) untouched — the rule is REQUESTER-only", async () => {
+    const rule = ruleDoc();
+    const a = travellerDoc(WORKSPACE_A, { firstName: "One" });
+
+    const res = await request(app(null))
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(a._id)] });
+
+    expect(res.status).toBe(201);
+  });
+
+  it("FAILS CLOSED when the actor's user id cannot be resolved", async () => {
+    // The gate resolves own-profiles with `claimedBy: userId`. Mongoose
+    // STRIPS an undefined value out of a filter rather than matching on it,
+    // so without the explicit guard this would return every claimed profile
+    // in the workspace and the check would pass for everyone. This is that
+    // guard.
+    const rule = ruleDoc();
+    const colleague = travellerDoc(WORKSPACE_A, { firstName: "Colleague" });
+    memberDoc(CUSTOMER, EMAIL, "REQUESTER");
+
+    const noId = express();
+    noId.use(express.json());
+    noId.use((req: any, _res, next) => {
+      req.user = { email: EMAIL, roles: ["CUSTOMER"] }; // no _id / id / sub
+      req.workspaceId = String(WORKSPACE_A);
+      req.workspaceObjectId = WORKSPACE_A;
+      req.workspace = { _id: WORKSPACE_A, status: "ACTIVE", customerId: CUSTOMER };
+      next();
+    });
+    noId.use("/", router);
+
+    const res = await request(noId)
+      .post("/requests")
+      .send({ ruleId: String(rule._id), travellerProfileIds: [String(colleague._id)] });
+
+    expect(res.status).toBe(403);
+    expect(requests.store.size).toBe(0);
+  });
+});
+
+describe("GET /travellers — capabilities.canFileForOthers", () => {
+  const CUSTOMER = "cust-filescope";
+  const EMAIL = "member@acme.com";
+
+  function app() {
+    return makeApp(
+      WORKSPACE_A,
+      USER_A,
+      { email: EMAIL, roles: ["CUSTOMER"] },
+      { workspaceCustomerId: CUSTOMER },
+    );
+  }
+
+  it("false for a REQUESTER — the multi-traveller picker is not offered", async () => {
+    memberDoc(CUSTOMER, EMAIL, "REQUESTER");
+    const res = await request(app()).get("/travellers");
+    expect(res.body.capabilities.canFileForOthers).toBe(false);
+  });
+
+  it("true for a WORKSPACE_LEADER and an APPROVER — the travel-admin case", async () => {
+    memberDoc(CUSTOMER, EMAIL, "WORKSPACE_LEADER");
+    expect((await request(app()).get("/travellers")).body.capabilities.canFileForOthers).toBe(true);
+
+    members.clear();
+    memberDoc(CUSTOMER, EMAIL, "APPROVER");
+    expect((await request(app()).get("/travellers")).body.capabilities.canFileForOthers).toBe(true);
+  });
+
+  it("true for a SUPERADMIN and for a non-member staff account", async () => {
+    // Opposite default from canCreate, deliberately: collapsing a staff
+    // account onto a "self" profile it does not have would strand it, and
+    // POST /requests' own check is REQUESTER-only so nothing is exposed.
+    const superRes = await request(
+      makeApp(WORKSPACE_A, USER_A, { roles: ["SUPERADMIN"], email: EMAIL }, { workspaceCustomerId: CUSTOMER }),
+    ).get("/travellers");
+    expect(superRes.body.capabilities.canFileForOthers).toBe(true);
+
+    const staffRes = await request(app()).get("/travellers"); // no member row
+    expect(staffRes.body.capabilities.canFileForOthers).toBe(true);
+  });
+
+  it("does not narrow the roster itself — reading stays open, filing is what's gated", async () => {
+    // The known remaining gap, asserted so it is a DECISION rather than an
+    // assumption: a REQUESTER still sees every traveller in the workspace.
+    // Hiding the picker removes a control, not an exposure. Design doc §3.
+    memberDoc(CUSTOMER, EMAIL, "REQUESTER");
+    travellerDoc(WORKSPACE_A, { firstName: "Colleague" });
+
+    const res = await request(app()).get("/travellers");
+    expect(res.body.capabilities.canFileForOthers).toBe(false);
+    expect(res.body.travellers).toHaveLength(1);
+  });
+});
+
 describe("POST /requests", () => {
   it("rejects the whole request when one traveller belongs to another workspace — nothing is created", async () => {
     const rule = ruleDoc();
@@ -1853,7 +2038,10 @@ describe("GET /travellers — capabilities.canCreate", () => {
 
     const res = await request(app()).get("/travellers");
     expect(res.status).toBe(200);
-    expect(res.body.capabilities).toEqual({ canCreate: true });
+    // canFileForOthers joined the block on 2026-08-11 — false here because
+    // this fixture's member is a REQUESTER, who files only for themselves.
+    // See the canFileForOthers describe below.
+    expect(res.body.capabilities).toEqual({ canCreate: true, canFileForOthers: false });
   });
 
   it("false for a staff/HOUSE user with no CustomerMember row — the 403-on-submit case", async () => {
