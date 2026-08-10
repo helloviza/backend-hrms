@@ -21,10 +21,19 @@ import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
-import TravellerProfile, { MEAL_PREFERENCE_CODES } from "../models/TravellerProfile.js";
+import TravellerProfile, {
+  MEAL_PREFERENCE_CODES,
+  LOYALTY_PROGRAMME_TYPES,
+  HOTEL_PREFERENCES,
+  SEAT_PREFERENCES,
+} from "../models/TravellerProfile.js";
 import CustomerMember from "../models/CustomerMember.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Department from "../models/Department.js";
+// Dossier Tab 1's job title. The EXISTING workspace-scoped collection —
+// this router adds a customer-facing door to it, not a second model. See
+// the DESIGNATIONS block below for why master-data's own routes don't serve.
+import Designation from "../models/Designation.js";
 import { mintTravellerProfileId } from "../utils/travelerId.js";
 import { maskTailId } from "../utils/piiMask.js";
 import { normalizeEmail, normalizeName, findMatchingTraveller, applyTravellerFields } from "../utils/travellerMatch.js";
@@ -217,6 +226,14 @@ const SELF_EDITABLE_FIELDS = [
   "mobile", "mobileCountryCode",
   "mealPreference", "frequentFlyer",
   "panNumber", "aadhaarNumber",
+  // Dossier Tab 1 (2026-08-11) — the person's OWN contact and demographic
+  // facts. personalEmail is safe here precisely because it is inert: unlike
+  // `email` it never reaches ensureCstepTravellerLogin, so an employee
+  // editing it cannot provision an account or fire an invite.
+  "personalEmail", "taxResidency", "emergencyContacts",
+  // Dossier Tab 4 — preferences and loyalty are the traveller's own by
+  // definition; an admin has no better claim to someone's seat preference.
+  "seatPreference", "homeAirport", "hotelPreferences", "loyaltyProgrammes",
 ] as const;
 
 /**
@@ -230,6 +247,11 @@ const SELF_EDITABLE_FIELDS = [
 const ADMIN_ONLY_FIELDS = [
   "title", "firstName", "middleName", "lastName",
   "departmentId", "reportingManagerId", "employeeId",
+  // Dossier Tab 1 (2026-08-11). All three are assertions the COMPANY makes
+  // about where a person sits — job title, which cost centre carries their
+  // travel, which office they are based at. Same class as department and
+  // employee number, so the same side of the matrix.
+  "designationId", "costCenterId", "workLocation",
 ] as const;
 
 /**
@@ -422,11 +444,81 @@ async function issueTravelerId(workspaceId: any, customerId: any, linkedMemberId
   return mintTravellerProfileId(workspaceId, customerId);
 }
 
-function applyFrequentFlyer(input: any): { airline?: string; number?: string }[] {
+function applyFrequentFlyer(input: any): { airline?: string; number?: string; tier?: string }[] {
   if (!Array.isArray(input)) return [];
   return input
-    .map((f: any) => ({ airline: normStr(f?.airline), number: normStr(f?.number) }))
+    .map((f: any) => ({
+      airline: normStr(f?.airline),
+      number: normStr(f?.number),
+      // tier joined the entry on 2026-08-11 (Tab 4). A row that carries
+      // ONLY a tier is still dropped by the filter below — "Gold" with no
+      // airline and no number identifies nothing.
+      tier: normStr(f?.tier),
+    }))
     .filter((f) => f.airline || f.number);
+}
+
+/**
+ * Non-airline loyalty rows (Tab 4). Same shape of rule as frequentFlyer: a
+ * row that identifies no membership is dropped rather than stored blank,
+ * and an unrecognised programmeType is dropped to undefined rather than
+ * rejecting the whole save — the type is a convenience label, and refusing
+ * a save over it would lose the number the user actually cares about.
+ */
+function applyLoyaltyProgrammes(input: any): {
+  programmeType?: string;
+  programmeName?: string;
+  membershipNumber?: string;
+  tier?: string;
+}[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((p: any) => {
+      const rawType = String(p?.programmeType ?? "").trim().toUpperCase();
+      return {
+        programmeType: (LOYALTY_PROGRAMME_TYPES as readonly string[]).includes(rawType)
+          ? rawType
+          : undefined,
+        programmeName: normStr(p?.programmeName),
+        membershipNumber: normStr(p?.membershipNumber),
+        tier: normStr(p?.tier),
+      };
+    })
+    .filter((p) => p.programmeName || p.membershipNumber);
+}
+
+/**
+ * Emergency contacts (Tab 1). Order is meaningful — index 0 renders as
+ * Primary and index 1 as Secondary — so blank rows are dropped but the
+ * surviving order is preserved exactly as sent. A contact with a name and
+ * no phone is kept: a half-filled emergency contact is still information,
+ * and silently discarding it would lose what someone typed.
+ */
+function applyEmergencyContacts(input: any): {
+  name?: string;
+  relationship?: string;
+  phone?: string;
+  countryCode?: string;
+}[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((c: any) => ({
+      name: normStr(c?.name),
+      relationship: normStr(c?.relationship),
+      phone: normStr(c?.phone),
+      countryCode: normStr(c?.countryCode),
+    }))
+    .filter((c) => c.name || c.phone);
+}
+
+/** Multi-select, allowlisted against the fixed vocabulary; unknowns dropped. */
+function applyHotelPreferences(input: any): string[] {
+  if (!Array.isArray(input)) return [];
+  const allowed = new Set<string>(HOTEL_PREFERENCES as readonly string[]);
+  const seen = new Set<string>();
+  return input
+    .map((v: any) => String(v ?? "").trim().toUpperCase())
+    .filter((v) => allowed.has(v) && !seen.has(v) && (seen.add(v), true));
 }
 
 /**
@@ -531,6 +623,13 @@ const EDITABLE_STRING_FIELDS = [
   "title", "firstName", "middleName", "lastName", "gender", "dob", "nationality",
   "passportNo", "passportExpiry", "passportIssueCountry", "passportIssueDate", "mobile",
   "mobileCountryCode", "employeeId",
+  // Dossier Tabs 1 + 4 (2026-08-11). Plain strings, no special handling —
+  // WHO may set each one is the field allowlist's job, not this list's.
+  // homeAirport is NOT here: it is case-normalised, and doing that in the
+  // route rather than leaning on the schema's `uppercase: true` setter is
+  // what keeps PUT and POST agreeing (a caught bug — PUT stored "blr"
+  // while POST stored "BLR").
+  "costCenterId", "workLocation", "taxResidency",
 ] as const;
 
 /**
@@ -642,6 +741,123 @@ async function describeReportingManager(traveller: any, workspaceId: any): Promi
     u.email ||
     null
   );
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+ * DOSSIER HEADER (2026-08-11) — every figure real, every absence honest.
+ *
+ * The design reference's header carries four things. Only two of them have
+ * a source, and this block is where that is decided ONCE rather than per
+ * surface. See infra/design/traveller-profile-tabs-2026-08-11.md §7.5.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * The fields Dossier Health measures. A DECLARED list, not "every key on
+ * the schema": the denominator has to be defensible, so it is the set a
+ * complete dossier genuinely needs for booking and visa work.
+ *
+ * PAN / Aadhaar are deliberately ABSENT from it. They are gated — nobody is
+ * allowed to fill them — so counting them would score every profile in
+ * every workspace down for a field the platform itself refuses to accept.
+ * When capture is enabled they should join this list, and not before.
+ *
+ * Tab 2/3/5 fields (booklet size, visas, trips) are absent for the same
+ * reason: they do not exist yet, and a health score that can never reach
+ * 100% is a broken gauge rather than an honest one.
+ */
+const DOSSIER_HEALTH_FIELDS = [
+  // Identity — what a ticket and a visa form both need
+  "firstName", "lastName", "dob", "gender", "nationality",
+  // Contact
+  "mobile", "email",
+  // Passport
+  "passportNo", "passportExpiry", "passportIssueCountry", "passportIssueDate",
+  // Org placement
+  "departmentId", "designationId", "employeeId", "reportingManagerId",
+] as const;
+
+/**
+ * A real completeness calculation over fields we actually hold — the one
+ * header figure that is honest by construction, because it measures OUR
+ * record and claims nothing about the outside world.
+ *
+ * Returns the breakdown, not just the percentage: a bare "62%" invites the
+ * question "of what?", and the answer has to be inspectable or the number
+ * is just decoration.
+ */
+function computeDossierHealth(traveller: any): {
+  percent: number;
+  filled: number;
+  total: number;
+  missing: string[];
+} {
+  const missing: string[] = [];
+  for (const key of DOSSIER_HEALTH_FIELDS) {
+    const v = traveller?.[key];
+    const isFilled = v !== null && v !== undefined && String(v).trim() !== "";
+    if (!isFilled) missing.push(key);
+  }
+  const total = DOSSIER_HEALTH_FIELDS.length;
+  const filled = total - missing.length;
+  return { percent: Math.round((filled / total) * 100), filled, total, missing };
+}
+
+/**
+ * The header facts that are NOT derivable, stated as explicit nulls rather
+ * than omitted — so the client renders an honest empty instead of guessing,
+ * and so the reason travels with the data.
+ *
+ * Every one of these is a real claim about a person, and inventing any of
+ * them is worse than leaving the slot blank:
+ *
+ *   - activeVisas — needs the VisaHolding model (Tab 3, not built). Counting
+ *     visa APPLICATIONS here would be wrong: an application is not a visa,
+ *     and per the audit none has ever reached an issued outcome. `null`
+ *     means "we don't know", which is different from 0 ("holds no visa").
+ *   - hrStatusVerified — no HR-verification event exists for a traveller
+ *     profile anywhere. The client shows the real linkage state instead of
+ *     a "Verified" badge over nothing.
+ *   - consularReady — a readiness VERDICT about a real person's visa.
+ *     visaScoreEngine is false; the engine does not exist. Never synthesise
+ *     it from "passport valid + fields filled".
+ *   - forexLimit — no per-traveller forex limit exists in ANY model. Spend
+ *     alone does exist (CstepForexAdvance) but is claim-scoped and
+ *     CSTEP-only, so it is not shown here as though it were total travel
+ *     spend. A bar needs a denominator; there isn't one.
+ */
+function dossierHeaderUnavailable() {
+  return {
+    activeVisas: null as number | null,
+    activeVisasReason: "Visa holdings are not recorded yet",
+    hrStatusVerified: false,
+    consularReady: null as boolean | null,
+    forexLimitInr: null as number | null,
+    forexReason: "No travel forex limit is configured",
+  };
+}
+
+/**
+ * The designation's display name (and level).
+ *
+ * Sent for the SAME reason as reportingManagerName above: an employee's own
+ * designation field is locked, and a locked <select> with no options
+ * renders its placeholder — which would print "No designation" over a job
+ * title that IS set. `level` rides along because the dossier header shows
+ * it and it belongs to the Designation row, not to the traveller.
+ *
+ * Looked up by id AND workspaceId: a stale pointer outside this workspace
+ * resolves to no name rather than reading another tenant's row.
+ */
+async function describeDesignation(
+  traveller: any,
+  workspaceId: any,
+): Promise<{ name: string | null; level: number | null }> {
+  if (!traveller?.designationId) return { name: null, level: null };
+  const d: any = await Designation.findOne({ _id: traveller.designationId, workspaceId })
+    .select("name level")
+    .lean();
+  if (!d) return { name: null, level: null };
+  return { name: d.name ?? null, level: d.level ?? null };
 }
 
 /**
@@ -847,6 +1063,9 @@ router.get("/me", async (req: any, res: any) => {
       editableFields: canManage ? editableFieldsForRole(member, approverCanManage) : [],
       lastEditedBy: await describeLastEditor(traveller),
       reportingManagerName: await describeReportingManager(traveller, workspaceId),
+      designation: await describeDesignation(traveller, workspaceId),
+      dossierHealth: computeDossierHealth(traveller),
+      header: dossierHeaderUnavailable(),
       capabilities,
       identityCapture: identityCaptureState(),
       // MANDATORY-ON-SELF-SURFACE (design doc §2.2). Computed server-side so
@@ -909,6 +1128,164 @@ router.get("/reporting-manager-candidates", async (req: any, res: any) => {
     res.json({ ok: true, candidates });
   } catch (err: any) {
     console.error("[workspace.travellers GET reporting-manager-candidates]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * DESIGNATIONS (2026-08-11, dossier Tab 1)
+ *
+ * A CUSTOMER-FACING pair over the EXISTING workspace-scoped Designation
+ * collection — not a new model, and not a second source of truth.
+ *
+ * Why these exist at all: master-data's own GET/POST /designations are
+ * gated on isHrAdmin (SUPERADMIN/ADMIN/HR), which no customer
+ * WORKSPACE_LEADER holds, and nothing on that path creates rows for a
+ * customer workspace. Referencing Designation without these routes would
+ * have given every customer leader a permanently empty, unfillable picker.
+ * Decision recorded 2026-08-11; see infra/design/traveller-profile-tabs-2026-08-11.md §9.
+ *
+ * Deliberately NOT a widening of the master-data route's RBAC: that router
+ * serves the HRMS staff population and changing its gate would hand
+ * customer leaders an HRMS surface. Same collection, second door, each with
+ * the gate its own population needs.
+ *
+ * Shaped exactly like the departments pair below it — same leader-only
+ * gate, same case-insensitive dedupe, same reactivate-don't-duplicate
+ * behaviour, same note-explaining-what-happened response. A second pattern
+ * for the same job is how the two drift.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+async function findDesignationsByName(workspaceId: any, name: string) {
+  const rows = await Designation.find({
+    workspaceId,
+    name: { $regex: `^${escapeRegex(name.trim())}$`, $options: "i" },
+  })
+    .select("_id name isActive")
+    .lean();
+  return (rows as any[]).sort((a, b) => {
+    const activeA = a.isActive === false ? 1 : 0;
+    const activeB = b.isActive === false ? 1 : 0;
+    if (activeA !== activeB) return activeA - activeB;
+    return String(a.name).localeCompare(String(b.name));
+  });
+}
+
+/**
+ * null = explicitly cleared; undefined = not supplied; string = error.
+ * Same tenant-safety shape as resolveDepartmentId below: the workspace is
+ * IN the query, so another tenant's Designation._id cannot stick.
+ */
+async function resolveDesignationId(
+  workspaceId: any,
+  raw: any,
+): Promise<{ value?: mongoose.Types.ObjectId | null; error?: string }> {
+  if (raw === undefined) return {};
+  if (raw === null || String(raw).trim() === "") return { value: null };
+
+  const id = String(raw).trim();
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return { error: "designationId is not a valid id" };
+  }
+  const found: any = await Designation.findOne({ _id: id, workspaceId }).select("_id").lean();
+  if (!found) return { error: "That designation does not belong to this workspace" };
+  return { value: found._id };
+}
+
+/* ── GET /designations — picker data ─────────────────────────────────── */
+
+router.get("/designations", async (req: any, res: any) => {
+  try {
+    const gate = await requireActiveMember(req, res);
+    if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
+
+    const designations = await Designation.find({
+      workspaceId: req.workspaceObjectId,
+      isActive: true,
+    })
+      .select("_id name level")
+      .sort({ level: 1, name: 1 })
+      .lean();
+
+    res.json({
+      ok: true,
+      designations: (designations as any[]).map((d) => ({
+        id: String(d._id),
+        name: d.name,
+        level: d.level ?? null,
+      })),
+      // Advisory only, same as canManageDepartments — the write route
+      // re-derives its own decision and never trusts this.
+      capabilities: { canManageDesignations: isWorkspaceLeaderActor(req, gate.member) },
+    });
+  } catch (err: any) {
+    console.error("[workspace.travellers GET designations]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── POST /designations — create (dedupes, reactivates) ──────────────── */
+
+router.post("/designations", async (req: any, res: any) => {
+  try {
+    const gate = await requireActiveMember(req, res);
+    if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
+    if (!isWorkspaceLeaderActor(req, gate.member)) {
+      return res.status(403).json({ error: "Only a workspace leader can manage designations" });
+    }
+    const workspaceId = req.workspaceObjectId;
+
+    const name = normStr(req.body?.name);
+    if (!name) return res.status(400).json({ error: "Designation name is required" });
+    if (name.length > 80) {
+      return res.status(400).json({ error: "Designation name is too long (max 80 characters)" });
+    }
+
+    const matches = await findDesignationsByName(workspaceId, name);
+    const active = matches.find((m) => m.isActive !== false);
+    if (active) {
+      return res.json({
+        ok: true,
+        created: false,
+        reactivated: false,
+        note: `“${active.name}” already exists — selected it for you.`,
+        designation: { id: String(active._id), name: active.name },
+      });
+    }
+
+    const inactive = matches[0];
+    if (inactive) {
+      await Designation.updateOne({ _id: inactive._id, workspaceId }, { $set: { isActive: true } });
+      return res.json({
+        ok: true,
+        created: false,
+        reactivated: true,
+        note: `“${inactive.name}” existed but was deactivated — reactivated it.`,
+        designation: { id: String(inactive._id), name: inactive.name },
+      });
+    }
+
+    const created: any = await Designation.create({
+      workspaceId,
+      name,
+      isActive: true,
+      createdBy: actorUserId(req) || undefined,
+    });
+    res.status(201).json({
+      ok: true,
+      created: true,
+      reactivated: false,
+      designation: { id: String(created._id), name: created.name },
+    });
+  } catch (err: any) {
+    // The model's unique {workspaceId, name} index is the last line of
+    // defence if two leaders add the same name at once.
+    if (err?.code === 11000) {
+      return res.status(409).json({ error: "That designation was just created by someone else. Refresh and pick it." });
+    }
+    console.error("[workspace.travellers POST designations]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1360,6 +1737,9 @@ router.get("/:id", async (req: any, res: any) => {
       editableFields: canManage ? editableFieldsForRole(member, approverCanManage) : [],
       lastEditedBy: await describeLastEditor(traveller),
       reportingManagerName: await describeReportingManager(traveller, workspaceId),
+      designation: await describeDesignation(traveller, workspaceId),
+      dossierHealth: computeDossierHealth(traveller),
+      header: dossierHeaderUnavailable(),
       identityCapture: identityCaptureState(),
     });
   } catch (err: any) {
@@ -1442,6 +1822,8 @@ router.post("/", async (req: any, res: any) => {
     if (department.error) return res.status(400).json({ error: department.error });
     const manager = await resolveReportingManagerId(workspaceId, body.reportingManagerId);
     if (manager.error) return res.status(400).json({ error: manager.error });
+    const designation = await resolveDesignationId(workspaceId, body.designationId);
+    if (designation.error) return res.status(400).json({ error: designation.error });
 
     // PAN/Aadhaar at create is refused by the same build-state gate as at
     // edit — checked here, before the counter, so the refusal costs nothing.
@@ -1476,6 +1858,21 @@ router.post("/", async (req: any, res: any) => {
       mobileCountryCode: normStr(body.mobileCountryCode) || undefined,
       employeeId: normStr(body.employeeId) || undefined,
       reportingManagerId: manager.value ?? undefined,
+      designationId: designation.value ?? null,
+      costCenterId: normStr(body.costCenterId) || undefined,
+      workLocation: normStr(body.workLocation) || undefined,
+      taxResidency: normStr(body.taxResidency) || undefined,
+      homeAirport: normStr(body.homeAirport).toUpperCase() || undefined,
+      // Inert — see the PUT handler's note. Never reaches the login path.
+      personalEmail: normalizeEmail(body.personalEmail) || undefined,
+      emergencyContacts: applyEmergencyContacts(body.emergencyContacts),
+      seatPreference: (SEAT_PREFERENCES as readonly string[]).includes(
+        String(body.seatPreference ?? "").trim().toUpperCase(),
+      )
+        ? (String(body.seatPreference).trim().toUpperCase() as any)
+        : undefined,
+      hotelPreferences: applyHotelPreferences(body.hotelPreferences),
+      loyaltyProgrammes: applyLoyaltyProgrammes(body.loyaltyProgrammes),
       // email is STILL written at create — this is the deliberate act that
       // provisions a login and invites a colleague. Only EDITING it is
       // closed off (PUT /:id). See the design doc §2.1.
@@ -1591,10 +1988,43 @@ router.put("/:id", async (req: any, res: any) => {
       if (department.error) return res.status(400).json({ error: department.error });
       traveller.departmentId = department.value ?? null;
     }
+    if ("designationId" in body) {
+      const designation = await resolveDesignationId(workspaceId, body.designationId);
+      if (designation.error) return res.status(400).json({ error: designation.error });
+      traveller.designationId = designation.value ?? null;
+    }
     if ("reportingManagerId" in body) {
       const manager = await resolveReportingManagerId(workspaceId, body.reportingManagerId);
       if (manager.error) return res.status(400).json({ error: manager.error });
       traveller.reportingManagerId = manager.value ?? undefined;
+    }
+    // Inert contact data — normalised like `email` so the two compare
+    // cleanly, but deliberately NOT passed to ensureCstepTravellerLogin
+    // anywhere in this file. Editing it provisions nothing and invites
+    // nobody; that is what makes it safe to be self-editable while `email`
+    // is not editable at all.
+    if ("personalEmail" in body) {
+      traveller.personalEmail = normalizeEmail(body.personalEmail) || undefined;
+    }
+    if ("emergencyContacts" in body) {
+      traveller.emergencyContacts = applyEmergencyContacts(body.emergencyContacts) as any;
+    }
+    // Uppercased HERE, not by the schema setter, so PUT and POST produce
+    // the same stored value regardless of which path wrote it.
+    if ("homeAirport" in body) {
+      traveller.homeAirport = normStr(body.homeAirport).toUpperCase() || undefined;
+    }
+    if ("seatPreference" in body) {
+      const seat = String(body.seatPreference ?? "").trim().toUpperCase();
+      traveller.seatPreference = (SEAT_PREFERENCES as readonly string[]).includes(seat)
+        ? (seat as any)
+        : undefined;
+    }
+    if ("hotelPreferences" in body) {
+      traveller.hotelPreferences = applyHotelPreferences(body.hotelPreferences) as any;
+    }
+    if ("loyaltyProgrammes" in body) {
+      traveller.loyaltyProgrammes = applyLoyaltyProgrammes(body.loyaltyProgrammes) as any;
     }
     if ("frequentFlyer" in body) traveller.frequentFlyer = applyFrequentFlyer(body.frequentFlyer);
     if ("mealPreference" in body) {

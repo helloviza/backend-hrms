@@ -19,7 +19,89 @@ export type TravellerProfileSource = "MANUAL" | "BULK_IMPORT" | "BOOKING_AUTOCAP
 export interface FrequentFlyerEntry {
   airline?: string;
   number?: string;
+  /**
+   * Loyalty status, e.g. "Gold", "Platinum" (2026-08-11, Tab 4). Free text
+   * on purpose: every programme names its tiers differently and an enum
+   * would reject correct values. Purely informational — see the Loyalty
+   * Vault note below on what this is and is not used for.
+   */
+  tier?: string;
 }
+
+/**
+ * NON-AIRLINE loyalty programmes — hotel, car, rail (2026-08-11, Tab 4).
+ *
+ * Deliberately a SIBLING of frequentFlyer rather than a generalisation of
+ * it. frequentFlyer is airline-shaped by name (`airline`) and by use: the
+ * bulk-import template, the CSV export and the existing form all read that
+ * exact key, so widening it to hold hotel chains would either break those
+ * three or leave `airline: "Marriott"` in the data. The design doc's rule
+ * was "do not overload frequentFlyer.airline"; two arrays honour it with no
+ * migration.
+ *
+ * The UI presents them as one "Loyalty Vault" in two labelled sections —
+ * Airline programmes (frequentFlyer) and Hotel & car programmes (here) —
+ * so the split is a storage detail, not something the user has to reason
+ * about.
+ */
+export const LOYALTY_PROGRAMME_TYPES = ["HOTEL", "CAR", "RAIL", "OTHER"] as const;
+export type LoyaltyProgrammeType = (typeof LOYALTY_PROGRAMME_TYPES)[number];
+
+export interface LoyaltyProgrammeEntry {
+  programmeType?: LoyaltyProgrammeType;
+  programmeName?: string;
+  membershipNumber?: string;
+  tier?: string;
+}
+
+/**
+ * Emergency contact (2026-08-11, Tab 1). An ARRAY, not two fixed slots:
+ * the design shows a primary and a secondary, but capping the schema at two
+ * would be an arbitrary limit to migrate away from later. The UI renders
+ * the first as Primary and the second as Secondary.
+ *
+ * Deliberately NOT User.emergencyContactName/Number/Relation — that is the
+ * HRMS staff model, a different population from workspace travellers, and
+ * it is a single flat contact where this needs two.
+ */
+export interface EmergencyContactEntry {
+  name?: string;
+  relationship?: string;
+  phone?: string;
+  countryCode?: string;
+}
+
+/**
+ * Standing seat preference (2026-08-11, Tab 4).
+ *
+ * STORED, NOT SUBMITTED — the same honest caveat mealPreference carries
+ * below. Nothing in the SBT booking flow reads this today (verified: the
+ * passenger form fills title/name/dob/gender/nationality/passport/email/
+ * mobile from the profile and nothing else), so the UI labels it "saved",
+ * never "applied" or "synced with the travel engine". Promising a window
+ * seat that never reaches the airline is worse than not offering the field.
+ */
+export const SEAT_PREFERENCES = ["WINDOW", "AISLE", "MIDDLE", "NO_PREFERENCE"] as const;
+export type SeatPreference = (typeof SEAT_PREFERENCES)[number];
+
+/**
+ * Hotel preferences, multi-select (2026-08-11, Tab 4). A fixed vocabulary
+ * rather than free text so the values stay aggregatable; same
+ * stored-not-submitted caveat as seat and meal.
+ */
+export const HOTEL_PREFERENCES = [
+  "NON_SMOKING",
+  "HIGH_FLOOR",
+  "LOW_FLOOR",
+  "KING_BED",
+  "TWIN_BEDS",
+  "QUIET_ROOM",
+  "AWAY_FROM_LIFT",
+  "ACCESSIBLE_ROOM",
+  "EARLY_CHECK_IN",
+  "LATE_CHECK_OUT",
+] as const;
+export type HotelPreference = (typeof HOTEL_PREFERENCES)[number];
 
 /**
  * A regulated national ID — the number plus a pointer to the scan of the
@@ -89,6 +171,41 @@ export interface TravellerProfileDocument extends Document {
    * is no check that they are actually a manager, and no cycle check
    * (A -> B -> A is storable). A directory pointer, not an org hierarchy.
    */
+  /**
+   * Job title, ADMIN/WORKSPACE_LEADER-set (2026-08-11, Tab 1). A REFERENCE
+   * to the existing workspace-scoped Designation collection — the same
+   * decision departmentId made above, and for the same reason: free text
+   * degrades into the misspelt-duplicate mess ("Sr. Manager" / "Senior
+   * Manager" / "Sr Manager") that a rename can never fix.
+   *
+   * Designation is scoped by workspaceId -> CustomerWorkspace, the SAME key
+   * this model uses, so no translation step.
+   *
+   * NOTE the routes: master-data's own GET/POST /designations are
+   * isHrAdmin-gated (SUPERADMIN/ADMIN/HR) and nothing there creates rows for
+   * a CUSTOMER workspace, so a ref alone would have given customer leaders a
+   * permanently empty picker. This model therefore ships alongside
+   * customer-facing list/create routes on THIS router, gated on the
+   * traveller write-RBAC — mirroring what departments already do, including
+   * the inline "+ Add" for leaders. Decision recorded 2026-08-11.
+   *
+   * Optional by design, exactly like departmentId: a traveller with no
+   * designation is valid and always will be.
+   */
+  designationId?: mongoose.Types.ObjectId | null; // ref Designation
+
+  /**
+   * The org's cost centre for this person (2026-08-11, Tab 1),
+   * ADMIN/WORKSPACE_LEADER-set. A free STRING, deliberately unlike
+   * designation above: there is no cost-centre collection anywhere in the
+   * codebase to reference, and inventing one to hold a code the finance
+   * system owns would be a second source of truth for somebody else's data.
+   */
+  costCenterId?: string;
+
+  /** Office/base location, ADMIN/WORKSPACE_LEADER-set (2026-08-11, Tab 1). */
+  workLocation?: string;
+
   reportingManagerId?: mongoose.Types.ObjectId; // ref User
 
   /**
@@ -145,8 +262,37 @@ export interface TravellerProfileDocument extends Document {
    * The fields exist; writes are refused while encryption at rest is
    * unbuilt. Nothing is stored here today.
    */
+  /**
+   * The traveller's own personal address (2026-08-11, Tab 1).
+   *
+   * INERT BY CONSTRUCTION, and that is the whole reason it can exist while
+   * `email` above stays read-only. Nothing in any write path passes this to
+   * ensureCstepTravellerLogin: it never upserts a CustomerMember, never
+   * provisions a User, never fires an invite. It is contact data and
+   * nothing else. `email` remains the single login/dedup/claim key.
+   */
+  personalEmail?: string;
+
+  /**
+   * Country of tax residency (2026-08-11, Tab 1). Sits in the Tax
+   * Identification block on the dossier but is deliberately NOT
+   * encryption-gated: a residency country is an ordinary demographic fact,
+   * not a regulated national ID number. Only pan/aadhaar below are gated.
+   */
+  taxResidency?: string;
+
   pan?: TravellerIdentityNumber;
   aadhaar?: TravellerIdentityNumber;
+
+  /** Tab 1. Array, not two fixed slots — see EmergencyContactEntry. */
+  emergencyContacts: EmergencyContactEntry[];
+
+  /** Tab 4 — all four STORED, NOT SUBMITTED. See SeatPreference. */
+  seatPreference?: SeatPreference;
+  /** IATA code of the airport this person usually departs from. */
+  homeAirport?: string;
+  hotelPreferences: HotelPreference[];
+  loyaltyProgrammes: LoyaltyProgrammeEntry[];
 
   // CSTEP Travel & Claim Portal (Phase 5) — this traveller's fixed Tour
   // Approver, deliberately SEPARATE from any Expense reporting-manager
@@ -195,7 +341,31 @@ export interface TravellerProfileDocument extends Document {
 }
 
 const FrequentFlyerSchema = new Schema<FrequentFlyerEntry>(
-  { airline: { type: String, trim: true }, number: { type: String, trim: true } },
+  {
+    airline: { type: String, trim: true },
+    number: { type: String, trim: true },
+    tier: { type: String, trim: true },
+  },
+  { _id: false },
+);
+
+const LoyaltyProgrammeSchema = new Schema<LoyaltyProgrammeEntry>(
+  {
+    programmeType: { type: String, enum: LOYALTY_PROGRAMME_TYPES },
+    programmeName: { type: String, trim: true },
+    membershipNumber: { type: String, trim: true },
+    tier: { type: String, trim: true },
+  },
+  { _id: false },
+);
+
+const EmergencyContactSchema = new Schema<EmergencyContactEntry>(
+  {
+    name: { type: String, trim: true },
+    relationship: { type: String, trim: true },
+    phone: { type: String, trim: true },
+    countryCode: { type: String, trim: true },
+  },
   { _id: false },
 );
 
@@ -220,6 +390,9 @@ const TravellerProfileSchema = new Schema<TravellerProfileDocument>(
 
     departmentId: { type: Schema.Types.ObjectId, ref: "Department", default: null },
 
+    designationId: { type: Schema.Types.ObjectId, ref: "Designation", default: null },
+    costCenterId: { type: String, trim: true },
+    workLocation: { type: String, trim: true },
     reportingManagerId: { type: Schema.Types.ObjectId, ref: "User" },
     employeeId: { type: String, trim: true },
 
@@ -241,8 +414,21 @@ const TravellerProfileSchema = new Schema<TravellerProfileDocument>(
     mobileCountryCode: { type: String, trim: true },
     email: { type: String, lowercase: true, trim: true },
 
+    // Lowercased/trimmed like `email`, so the two compare cleanly — but it
+    // is NOT indexed and NOT a match key: nothing dedupes, claims or
+    // provisions a login on this field. See the interface note.
+    personalEmail: { type: String, lowercase: true, trim: true },
+    taxResidency: { type: String, trim: true },
+
     pan: { type: IdentityNumberSchema },
     aadhaar: { type: IdentityNumberSchema },
+
+    emergencyContacts: { type: [EmergencyContactSchema], default: [] },
+
+    seatPreference: { type: String, enum: SEAT_PREFERENCES },
+    homeAirport: { type: String, trim: true, uppercase: true },
+    hotelPreferences: { type: [String], enum: HOTEL_PREFERENCES, default: [] },
+    loyaltyProgrammes: { type: [LoyaltyProgrammeSchema], default: [] },
 
     tourApproverId: { type: Schema.Types.ObjectId, ref: "User", index: true },
     officialUserId: { type: Schema.Types.ObjectId, ref: "User", index: true },

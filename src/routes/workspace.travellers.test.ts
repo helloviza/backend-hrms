@@ -57,6 +57,27 @@ vi.mock("../models/TravellerProfile.js", () => ({
     "VGML", "VJML", "AVML", "HNML", "MOML", "GFML", "KSML",
     "DBML", "CHML", "BLML", "RVML", "LSML", "LFML", "NLML", "SFML", "FPML", "LCML",
   ],
+  // Slice 1 vocabularies — mirrored from the model so the route's
+  // allowlisting is exercised against the same values production uses.
+  LOYALTY_PROGRAMME_TYPES: ["HOTEL", "CAR", "RAIL", "OTHER"],
+  SEAT_PREFERENCES: ["WINDOW", "AISLE", "MIDDLE", "NO_PREFERENCE"],
+  HOTEL_PREFERENCES: [
+    "NON_SMOKING", "HIGH_FLOOR", "LOW_FLOOR", "KING_BED", "TWIN_BEDS",
+    "QUIET_ROOM", "AWAY_FROM_LIFT", "ACCESSIBLE_ROOM", "EARLY_CHECK_IN", "LATE_CHECK_OUT",
+  ],
+}));
+
+// Designation joined the router in slice 1 (dossier Tab 1). Mocked like the
+// other models so resolveDesignationId's tenant check can be exercised
+// without a database.
+const desigFindOneMock = vi.fn();
+vi.mock("../models/Designation.js", () => ({
+  default: {
+    findOne: (...args: any[]) => findOneResult(desigFindOneMock(...args)),
+    find: (...args: any[]) => chainable([]),
+    create: vi.fn(),
+    updateOne: vi.fn(),
+  },
 }));
 
 const cmFindOneMock = vi.fn();
@@ -136,6 +157,7 @@ beforeEach(() => {
   cwFindByIdMock.mockReset().mockReturnValue({});
   custFindByIdMock.mockReset().mockReturnValue({ legalName: "Acme Pvt Ltd" });
   autoCaptureMock.mockReset().mockResolvedValue(undefined);
+  desigFindOneMock.mockReset().mockReturnValue(null);
 });
 
 /* ── ensureTravellerWriteAccess — the RBAC matrix, tested directly ───── */
@@ -521,6 +543,146 @@ describe("PUT /:id", () => {
     expect(res.status).toBe(200);
     expect(doc.email).toBe("old@acme.com"); // untouched
     expect(doc.mobile).toBe("9111111111"); // the rest of the form still saves
+  });
+
+  /* ── SLICE 1 — dossier Tabs 1 and 4 (2026-08-11) ──────────────────── */
+
+  it("EMPLOYEE can edit their own preferences, loyalty, personal email and emergency contacts", async () => {
+    cmFindOneMock.mockReturnValue({ _id: "member1", role: "REQUESTER", isActive: true });
+    const doc: any = { _id: "t1", claimedBy: "u1", save: vi.fn().mockResolvedValue(undefined) };
+    tpFindOneMock.mockReturnValue(doc);
+
+    const app = makeApp({ sub: "u1", email: "requester@acme.com" });
+    const res = await request(app).put("/t1").send({
+      seatPreference: "window",
+      homeAirport: "blr",
+      mealPreference: "VJML",
+      hotelPreferences: ["NON_SMOKING", "HIGH_FLOOR"],
+      loyaltyProgrammes: [{ programmeType: "hotel", programmeName: "Marriott Bonvoy", membershipNumber: "MB-1", tier: "Gold" }],
+      personalEmail: "Arjun.Personal@Gmail.com",
+      taxResidency: "IN",
+      emergencyContacts: [{ name: "Priya Nair", relationship: "Spouse", phone: "9990001111" }],
+    });
+
+    expect(res.status).toBe(200);
+    // Case-normalised where the schema says so.
+    expect(doc.seatPreference).toBe("WINDOW");
+    expect(doc.homeAirport).toBe("BLR");
+    expect(doc.mealPreference).toBe("VJML");
+    expect(doc.hotelPreferences).toEqual(["NON_SMOKING", "HIGH_FLOOR"]);
+    expect(doc.loyaltyProgrammes[0]).toMatchObject({ programmeType: "HOTEL", membershipNumber: "MB-1", tier: "Gold" });
+    expect(doc.personalEmail).toBe("arjun.personal@gmail.com");
+    expect(doc.emergencyContacts[0]).toMatchObject({ name: "Priya Nair", relationship: "Spouse" });
+  });
+
+  it("EMPLOYEE cannot set the new ORG fields — designation, cost centre, work location", async () => {
+    cmFindOneMock.mockReturnValue({ _id: "member1", role: "REQUESTER", isActive: true });
+    const doc: any = { _id: "t1", claimedBy: "u1", save: vi.fn().mockResolvedValue(undefined) };
+    tpFindOneMock.mockReturnValue(doc);
+
+    const app = makeApp({ sub: "u1", email: "requester@acme.com" });
+    const res = await request(app).put("/t1").send({
+      designationId: "6a0000000000000000000009",
+      costCenterId: "CC-1",
+      workLocation: "Bengaluru",
+      seatPreference: "AISLE", // allowed, but must NOT land either
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body.fields.sort()).toEqual(["costCenterId", "designationId", "workLocation"]);
+    expect(doc.seatPreference).toBeUndefined();
+    expect(doc.save).not.toHaveBeenCalled();
+  });
+
+  it("WORKSPACE_LEADER can set the org fields, and a designation is tenant-checked", async () => {
+    cmFindOneMock.mockReturnValue({ _id: "leader1", role: "WORKSPACE_LEADER", isActive: true });
+    const doc: any = { _id: "t1", save: vi.fn().mockResolvedValue(undefined) };
+    tpFindOneMock.mockReturnValue(doc);
+    desigFindOneMock.mockReturnValue({ _id: "6a0000000000000000000009" });
+
+    const app = makeApp({ sub: "leader-uid", email: "leader@acme.com" });
+    const res = await request(app).put("/t1").send({
+      designationId: "6a0000000000000000000009",
+      costCenterId: "CC-4412",
+      workLocation: "Bengaluru — HQ",
+    });
+
+    expect(res.status).toBe(200);
+    expect(doc.costCenterId).toBe("CC-4412");
+    expect(doc.workLocation).toBe("Bengaluru — HQ");
+    // Resolved through a filter carrying BOTH the id and the workspace.
+    expect(desigFindOneMock).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: "6a0000000000000000000009", workspaceId: expect.anything() }),
+    );
+  });
+
+  it("rejects a designation that does not belong to this workspace", async () => {
+    cmFindOneMock.mockReturnValue({ _id: "leader1", role: "WORKSPACE_LEADER", isActive: true });
+    const doc: any = { _id: "t1", save: vi.fn().mockResolvedValue(undefined) };
+    tpFindOneMock.mockReturnValue(doc);
+    desigFindOneMock.mockReturnValue(null); // another tenant's row
+
+    const app = makeApp({ sub: "leader-uid", email: "leader@acme.com" });
+    const res = await request(app).put("/t1").send({ designationId: "6a0000000000000000000009" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/does not belong to this workspace/i);
+    expect(doc.save).not.toHaveBeenCalled();
+  });
+
+  it("drops blank and unrecognised values from the structured fields", async () => {
+    cmFindOneMock.mockReturnValue({ _id: "member1", role: "REQUESTER", isActive: true });
+    const doc: any = { _id: "t1", claimedBy: "u1", save: vi.fn().mockResolvedValue(undefined) };
+    tpFindOneMock.mockReturnValue(doc);
+
+    const app = makeApp({ sub: "u1", email: "requester@acme.com" });
+    const res = await request(app).put("/t1").send({
+      seatPreference: "TELEPORT",                       // not in the vocabulary
+      hotelPreferences: ["NON_SMOKING", "HELIPAD", "NON_SMOKING"], // unknown + duplicate
+      emergencyContacts: [
+        { name: "Priya Nair", phone: "999" },
+        { name: "", relationship: "", phone: "" },      // wholly blank
+      ],
+      loyaltyProgrammes: [
+        { programmeType: "SUBMARINE", programmeName: "Hertz", membershipNumber: "H-9" },
+        { programmeName: "", membershipNumber: "" },    // identifies nothing
+      ],
+    });
+
+    expect(res.status).toBe(200);
+    expect(doc.seatPreference).toBeUndefined();
+    expect(doc.hotelPreferences).toEqual(["NON_SMOKING"]);
+    expect(doc.emergencyContacts).toHaveLength(1);
+    // An unknown programmeType drops to undefined but KEEPS the row — the
+    // membership number is what the user cares about.
+    expect(doc.loyaltyProgrammes).toHaveLength(1);
+    expect(doc.loyaltyProgrammes[0].programmeType).toBeUndefined();
+    expect(doc.loyaltyProgrammes[0].programmeName).toBe("Hertz");
+  });
+
+  /* ── WORK EMAIL IS NOT A SECOND LOGIN WRITE-PATH ──────────────────── */
+
+  it("personalEmail never touches `email`, so it cannot reach the login path", async () => {
+    // The login provisioning in POST / is guarded on `traveller.email`.
+    // personalEmail is a different key that no code path copies into it, so
+    // writing it can never upsert a member, provision a User or fire an
+    // invite. This asserts the separation directly.
+    cmFindOneMock.mockReturnValue({ _id: "member1", role: "REQUESTER", isActive: true });
+    const doc: any = {
+      _id: "t1", claimedBy: "u1", email: "work@acme.com",
+      save: vi.fn().mockResolvedValue(undefined),
+    };
+    tpFindOneMock.mockReturnValue(doc);
+
+    const app = makeApp({ sub: "u1", email: "requester@acme.com" });
+    const res = await request(app).put("/t1").send({
+      personalEmail: "arjun@gmail.com",
+      email: "hijack@evil.com", // ignored — the work email is read-only
+    });
+
+    expect(res.status).toBe(200);
+    expect(doc.personalEmail).toBe("arjun@gmail.com");
+    expect(doc.email).toBe("work@acme.com"); // untouched
   });
 
   it("PAN/Aadhaar are refused for EVERYONE while encryption at rest is unbuilt", async () => {
