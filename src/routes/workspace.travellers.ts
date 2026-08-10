@@ -28,6 +28,13 @@ import Department from "../models/Department.js";
 import { mintTravellerProfileId } from "../utils/travelerId.js";
 import { maskTailId } from "../utils/piiMask.js";
 import { normalizeEmail, normalizeName, findMatchingTraveller, applyTravellerFields } from "../utils/travellerMatch.js";
+// Self-service identity (2026-08-10). The nine-condition guard is SHARED with
+// GET /api/visa/travellers/me/candidates — the tier that offers the button and
+// the action behind it must never disagree.
+// See infra/design/visa-self-service-identity-2026-08-10.md.
+import { evaluateNameUniqueSelfConfirm } from "../services/travellerIdentity.service.js";
+import { UserPermission, hasAccess } from "../models/UserPermission.js";
+import logger from "../utils/logger.js";
 import { parseCsv } from "../utils/csv.js";
 import { autoCaptureTravellersFromBooking } from "../services/travellerAutoCapture.js";
 import User from "../models/User.js";
@@ -39,6 +46,16 @@ import { ensureAuthUserForCustomer, trySendInviteEmailSafe } from "./customerUse
 
 const router = Router();
 router.use(requireAuth, requireWorkspace);
+
+/**
+ * Structured audit trail for the two routes that CREATE an identity link
+ * (self-confirm, link-member) — a LOG LINE, deliberately not a collection.
+ * There is no reviewer, no queue and no retention requirement attached to
+ * these events; a collection would be a schema to migrate and a table nobody
+ * reads. VisaActivityLog is not reused either: it is keyed to a requestId and
+ * describes a visa case's history, and a claim happens before any case exists.
+ */
+const identityLogger = logger.child({ module: "traveller-identity" });
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -1134,6 +1151,243 @@ router.post("/:id/claim", async (req: any, res: any) => {
     res.json({ ok: true, traveller });
   } catch (err: any) {
     console.error("[workspace.travellers CLAIM]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── POST /:id/self-confirm — "Yes, that's me" for a BLANK-email profile ──
+ *
+ * The repair for the one case /claim cannot reach: a workspace leader created
+ * the profile (roster entry or bulk import) and left the email blank, so
+ * /claim's exact-email test can never pass and the employee has no route
+ * forward at all — they can neither see nor edit a profile that is about them.
+ *
+ * NINE CONDITIONS, ALL of which must hold. Any single failure refuses. Five of
+ * them (4-8) are data rules and live in services/travellerIdentity.service.ts,
+ * shared with GET /visa/travellers/me/candidates so the tier that OFFERS this
+ * button and the action behind it can never disagree. The four request-level
+ * ones stay here, alongside every other gate in this router:
+ *
+ *   1. not SUPERADMIN            2. active member of this workspace
+ *   3. session workspace only    9. explicit { confirm: true }
+ *
+ * Identity written is claimedBy (a User id) — the key routes/visa.ts actually
+ * resolves on. linkedMemberId rides along for REQUESTER self-edit rights
+ * (ensureTravellerWriteAccess), never as the identity key.
+ *
+ * See infra/design/visa-self-service-identity-2026-08-10.md.
+ * ──────────────────────────────────────────────────────────────────────── */
+router.post("/:id/self-confirm", async (req: any, res: any) => {
+  try {
+    // ── 1. Not SUPERADMIN. Same posture as /claim: this is a member
+    // self-service action, and a SUPERADMIN has no member identity to
+    // confirm AS.
+    if (isSuperAdmin(req)) {
+      return res.status(400).json({ error: "Self-confirm is a member self-service action" });
+    }
+
+    // ── 9. Explicit confirmation. Checked early and cheaply: this route
+    // exists precisely BECAUSE the link is not inferrable, so it must never
+    // fire off an incidental POST.
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({ error: "confirm: true is required" });
+    }
+
+    // ── 2. Active member of this workspace.
+    const customerId = req.workspace?.customerId;
+    const member: any = await getActorMember(String(customerId), req.user?.email);
+    if (!member || member.isActive === false) {
+      return res.status(403).json({ error: "Not a member of this workspace" });
+    }
+
+    // ── 3. Session workspace context, fail loud (never a quiet empty read),
+    // and the traveller resolved by {_id, workspaceId} — never by id alone.
+    if (!requireWorkspaceContext(req, res)) return;
+    const workspaceId = req.workspaceObjectId;
+
+    const target: any = await TravellerProfile.findOne({ _id: req.params.id, workspaceId })
+      .select("_id")
+      .lean();
+    if (!target) return res.status(404).json({ error: "Traveller not found" });
+
+    // ── 4-8. The data guard: unclaimed on both keys, no contradicting email,
+    // a non-blank member name, unambiguous across ALL active profiles
+    // (claimed and unclaimed alike), and the server's OWN re-derived match
+    // equal to the id supplied — the last of which is what stops :id being
+    // walked as an enumeration oracle.
+    const verdict = await evaluateNameUniqueSelfConfirm({
+      workspaceId,
+      callerEmail: req.user?.email,
+      memberName: member.name,
+      targetId: String(req.params.id),
+    });
+
+    if (!verdict.ok) {
+      identityLogger.info("visa.identity.self_confirm.refused", {
+        actorUserId: actorUserId(req),
+        actorEmail: normalizeEmail(req.user?.email),
+        workspaceId: String(workspaceId),
+        travellerId: String(req.params.id),
+        action: "self_confirm",
+        outcome: "refused",
+        code: verdict.code,
+      });
+      return res.status(verdict.status).json({ error: verdict.error, code: verdict.code });
+    }
+
+    // All nine hold — write the link. claimedBy is the identity;
+    // linkedMemberId is the write-access key that rides along.
+    const doc: any = await TravellerProfile.findOne({ _id: verdict.traveller._id, workspaceId });
+    if (!doc) return res.status(404).json({ error: "Traveller not found" });
+    doc.claimedBy = actorUserId(req);
+    doc.claimedAt = new Date();
+    doc.linkedMemberId = member._id;
+    await doc.save();
+
+    identityLogger.info("visa.identity.self_confirm.linked", {
+      actorUserId: actorUserId(req),
+      actorEmail: normalizeEmail(req.user?.email),
+      workspaceId: String(workspaceId),
+      travellerId: String(doc._id),
+      action: "self_confirm",
+      outcome: "linked",
+      tier: "NAME_UNIQUE",
+    });
+
+    res.json({ ok: true, traveller: doc.toObject() });
+  } catch (err: any) {
+    console.error("[workspace.travellers SELF-CONFIRM]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── PATCH /:id/link-member — the admin link ──────────────────────────────
+ *
+ * The action the audit found missing entirely: no admin-side "link this
+ * traveller to this member" existed anywhere, so recovering an unclaimed
+ * profile required a leader to EDIT ITS EMAIL so the employee could then
+ * claim it. This is also the fallback every self-confirm refusal points at
+ * ("ask your workspace leader to link you").
+ *
+ * GATE: a workspace leader for this workspace, OR an ops user holding
+ * visaApplication at WRITE/FULL. Deliberately NOT requireRoles("ADMIN") —
+ * its ROLE_ALIASES expand ADMIN to include TENANT_ADMIN, a SaaS-HRMS
+ * tenant's OWN admin, who would then be able to link travellers inside
+ * another customer's workspace. Same reasoning admin.visa.roster.ts's header
+ * already records for refusing that helper.
+ *
+ * Body: { memberId, reassign? }.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Ops-side half of the link-member gate: a live visaApplication grant at
+ * WRITE or FULL. Mirrors admin.visa.ts's userCanBeAssignedVisaCases exactly
+ * — never let someone link a traveller who could not open the visa console
+ * that link is for.
+ */
+async function actorHasVisaOpsWriteGrant(req: any): Promise<boolean> {
+  const userId = actorUserId(req);
+  if (!userId) return false;
+  const perm: any = await UserPermission.findOne({ userId: String(userId), status: "active" })
+    .select("modules.visaApplication")
+    .lean();
+  const access = perm?.modules?.visaApplication?.access || "NONE";
+  return hasAccess(access, "WRITE");
+}
+
+router.patch("/:id/link-member", async (req: any, res: any) => {
+  try {
+    // Membership first (SUPERADMIN passes with member === null), then the
+    // narrower link gate.
+    const gate = await requireActiveMember(req, res);
+    if (!gate) return;
+    if (!requireWorkspaceContext(req, res)) return;
+    const workspaceId = req.workspaceObjectId;
+
+    const isLeader = isWorkspaceLeaderActor(req, gate.member);
+    if (!isLeader && !(await actorHasVisaOpsWriteGrant(req))) {
+      return res.status(403).json({
+        error: "Only a workspace leader or visa ops can link a traveller to a member",
+      });
+    }
+
+    const memberId = normStr(req.body?.memberId);
+    if (!memberId || !mongoose.isValidObjectId(memberId)) {
+      return res.status(400).json({ error: "memberId is required" });
+    }
+    const reassign = req.body?.reassign === true;
+
+    // SESSION-scoped, never body-scoped.
+    const traveller: any = await TravellerProfile.findOne({ _id: req.params.id, workspaceId });
+    if (!traveller) return res.status(404).json({ error: "Traveller not found" });
+
+    // SAME-TENANT — the critical check on this route. memberId is
+    // caller-supplied, so resolving it by _id alone would let a leader link
+    // one of their own travellers to a member of a DIFFERENT customer.
+    // customerId comes from the session workspace, never the body.
+    const customerId = req.workspace?.customerId;
+    const target: any = await CustomerMember.findOne({
+      _id: memberId,
+      customerId: String(customerId),
+      isActive: true,
+    })
+      .select("_id email name")
+      .lean();
+    if (!target) return res.status(404).json({ error: "Member not found in this workspace" });
+
+    // NO-LOGIN MEMBER -> REFUSE, never auto-provision. Identity here is a
+    // User id; a member with no account has nothing to write into claimedBy.
+    // Minting one inline (ensureAuthUserForCustomer is right there) would
+    // create a credential nobody asked for, outside the invite flow that owns
+    // account creation and its emails. The refusal names the fix instead.
+    const targetUser: any = await User.findOne({ email: normalizeEmail(target.email) })
+      .select("_id")
+      .lean();
+    if (!targetUser) {
+      return res.status(409).json({
+        error: "That member hasn't been invited yet — invite them first, then link.",
+        code: "member_has_no_login",
+      });
+    }
+
+    // Already linked to SOMEONE ELSE -> 409, overridable ONLY by an explicit
+    // reassign. Re-pointing an identity link is a real operation, but it must
+    // never be the accidental default.
+    const claimedByOther =
+      traveller.claimedBy && String(traveller.claimedBy) !== String(targetUser._id);
+    const linkedToOther =
+      traveller.linkedMemberId && String(traveller.linkedMemberId) !== String(target._id);
+    if ((claimedByOther || linkedToOther) && !reassign) {
+      return res.status(409).json({
+        error: "This traveller is already linked to a different person. Pass reassign: true to move it.",
+        code: "already_linked",
+      });
+    }
+
+    const previousClaimedBy = traveller.claimedBy ? String(traveller.claimedBy) : null;
+
+    traveller.claimedBy = targetUser._id;
+    traveller.claimedAt = new Date();
+    traveller.linkedMemberId = target._id;
+    await traveller.save();
+
+    identityLogger.info("visa.identity.link_member.linked", {
+      actorUserId: actorUserId(req),
+      actorEmail: normalizeEmail(req.user?.email),
+      workspaceId: String(workspaceId),
+      travellerId: String(traveller._id),
+      action: "link_member",
+      outcome: "linked",
+      via: isLeader ? "workspace_leader" : "visa_ops_grant",
+      targetMemberId: String(target._id),
+      targetUserId: String(targetUser._id),
+      reassigned: !!(claimedByOther || linkedToOther),
+      previousClaimedBy,
+    });
+
+    res.json({ ok: true, traveller: traveller.toObject() });
+  } catch (err: any) {
+    console.error("[workspace.travellers LINK-MEMBER]", err.message);
     res.status(500).json({ error: err.message });
   }
 });

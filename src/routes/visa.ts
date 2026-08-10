@@ -131,6 +131,14 @@ import {
   visaUserNameOf,
 } from "../services/visaApproval.service.js";
 import { sendVisaSubmittedEmail } from "../utils/visaEmails.js";
+// Self-service identity (2026-08-10) — the shared resolve/offer rules behind
+// GET /travellers/me and /travellers/me/candidates. The self-confirm ACTION
+// in routes/workspace.travellers.ts calls the same guard.
+import {
+  resolveMyTravellerProfiles,
+  findIdentityCandidates,
+  shapeCandidateProfile,
+} from "../services/travellerIdentity.service.js";
 
 const visaLogger = logger.child({ module: "visa" });
 
@@ -985,6 +993,136 @@ router.get("/travellers", async (req: any, res: any) => {
     res
       .status(500)
       .json({ error: err?.message || "Failed to load travellers" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * SELF-SERVICE IDENTITY (2026-08-10) — "which traveller am I?"
+ *
+ * Two READ-ONLY routes behind the employee self-apply entry. Neither writes
+ * anything: they resolve, or they offer. Every link is created by an
+ * explicit tap (POST /workspace/travellers/:id/claim or .../self-confirm)
+ * or an explicit admin action (PATCH .../link-member).
+ *
+ * The rules live in services/travellerIdentity.service.ts, shared with the
+ * self-confirm ACTION so an offer and the action behind it can never
+ * disagree. See infra/design/visa-self-service-identity-2026-08-10.md.
+ *
+ * Route order: both are declared immediately after GET /travellers and
+ * there is no GET /travellers/:id in this router, so "me" cannot be
+ * captured as an id. Keep it that way — if a /travellers/:id is ever added
+ * it MUST come after these two.
+ * ───────────────────────────────────────────────────────────────────── */
+
+/**
+ * The acting user's CustomerMember identity (name + active), resolved with
+ * the SAME narrow lookup resolveTravellerCanCreate uses above, and for the
+ * same stated reason: workspace.travellers.ts is a Router whose import
+ * chain drags in customerUsers.ts, multer and exceljs, none of which these
+ * reads have any business loading.
+ *
+ * `name` is the key the NAME_UNIQUE tier matches on — the member row is the
+ * authority on what this person is called, not the User document, because
+ * it is what a workspace leader typed when they added them.
+ */
+async function resolveActorMemberIdentity(
+  req: any,
+): Promise<{ name: string; email: string; isActive: boolean } | null> {
+  const customerId = req.workspace?.customerId;
+  const email = req.user?.email;
+  if (!customerId || !email) return null;
+
+  const member: any = await CustomerMember.findOne({
+    customerId: String(customerId),
+    email: String(email).toLowerCase(),
+  })
+    .select("name email isActive")
+    .lean();
+
+  if (!member || member.isActive === false) return null;
+  return { name: String(member.name ?? ""), email: String(member.email ?? email), isActive: true };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /travellers/me — strict resolve on claimedBy === caller.
+ *
+ * NEVER guesses. Three outcomes, decided purely by how many profiles the
+ * caller has actually claimed: exactly one resolves; zero and "more than
+ * one" both come back resolved:false with the reason, and the >1 case
+ * hands back the list for the caller to disambiguate among their OWN
+ * records rather than picking one for them (which would file a visa
+ * against the wrong passport).
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/travellers/me", async (req: any, res: any) => {
+  try {
+    // Same fail-loud guard as GET /travellers above: an undefined
+    // workspaceId is STRIPPED from a Mongoose filter rather than matched,
+    // so without this a SUPERADMIN session with no workspace context would
+    // read claimed profiles across every tenant.
+    if (!req.workspaceObjectId) {
+      return res.status(400).json({
+        error:
+          "No workspace context. SUPERADMIN: pass workspaceId in body, query, or x-workspace-id header.",
+      });
+    }
+
+    const userId = actorId(req);
+    if (!userId) {
+      // No resolvable User id means claimedBy can never match — say so as a
+      // clean "not resolved" rather than running a query keyed on undefined.
+      return res.json({ ok: true, resolved: false, reason: "none", travellers: [] });
+    }
+
+    const result = await resolveMyTravellerProfiles(req.workspaceObjectId, userId);
+    res.json({ ok: true, ...result });
+  } catch (err: any) {
+    console.error("[visa travellers/me GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to resolve your traveller profile" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /travellers/me/candidates — the tiered offer, passport MASKED.
+ *
+ * Only meaningful when /travellers/me did not resolve. Returns the tier and
+ * the profile(s) behind it; the CLIENT decides which action to render, and
+ * the action re-derives its own authority server-side either way:
+ *   EXACT_EMAIL -> POST /workspace/travellers/:id/claim        (already existed)
+ *   NAME_UNIQUE -> POST /workspace/travellers/:id/self-confirm
+ *   NONE        -> the existing add-yourself path
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/travellers/me/candidates", async (req: any, res: any) => {
+  try {
+    if (!req.workspaceObjectId) {
+      return res.status(400).json({
+        error:
+          "No workspace context. SUPERADMIN: pass workspaceId in body, query, or x-workspace-id header.",
+      });
+    }
+
+    // A non-member (SUPERADMIN or a staff/HOUSE account browsing the visa
+    // surface) has no member row to match a name against, and self-service
+    // identity is a MEMBER action — so there is nothing to offer. NONE, not
+    // an error: this is a read the entry screen calls speculatively.
+    const identity = await resolveActorMemberIdentity(req);
+    if (!identity) {
+      return res.json({ ok: true, tier: "NONE", candidates: [] });
+    }
+
+    const { tier, candidates } = await findIdentityCandidates({
+      workspaceId: req.workspaceObjectId,
+      callerEmail: identity.email,
+      memberName: identity.name,
+    });
+
+    res.json({
+      ok: true,
+      tier,
+      candidates: candidates.map((d) => shapeCandidateProfile(d, maskTailId)),
+    });
+  } catch (err: any) {
+    console.error("[visa travellers/me/candidates GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to look up your traveller profile" });
   }
 });
 
