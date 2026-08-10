@@ -34,9 +34,33 @@
 
 import dotenv from "dotenv";
 
-// Load .env FIRST so individual vars populate process.env before the back-fill.
-// dotenv never overrides already-set keys, and config/env.ts calling
-// dotenv.config() again later is a harmless no-op.
+/* ── ENV-FILE PRECEDENCE (2026-08-11) ─────────────────────────────────
+ *
+ * `.env.<NODE_ENV>` is loaded BEFORE `.env`, and dotenv never overrides an
+ * already-set key, so the environment-specific file WINS on any key it
+ * declares while `.env` still supplies everything it doesn't.
+ *
+ * This exists so local development can point at a local database without
+ * editing — or accidentally keeping — the production values in `.env`.
+ * Before it, `.env` was the only file read, which meant the one file every
+ * developer has locally was also the one holding the prod Atlas URI and the
+ * prod S3 bucket: running the dev server at all connected to production.
+ * See docs/dev-setup.md.
+ *
+ * DELIBERATELY OPT-IN, not "default to development when NODE_ENV is unset".
+ * NODE_ENV is genuinely unset in some deployment paths, and defaulting to
+ * development there would have a PRODUCTION process silently prefer a
+ * `.env.development` file if one were ever present on the box. The dev
+ * script sets NODE_ENV=development explicitly; everything else is unchanged.
+ */
+const nodeEnv = process.env.NODE_ENV;
+if (nodeEnv === "development" || nodeEnv === "test") {
+  dotenv.config({ path: `.env.${nodeEnv}` });
+}
+
+// Then `.env` — fills anything the file above didn't declare. Loading this
+// SECOND is what makes the environment-specific file take precedence.
+// config/env.ts calling dotenv.config() again later is a harmless no-op.
 dotenv.config();
 
 try {

@@ -16,6 +16,10 @@ build/
 .env
 .env.*
 !.env.example
+# Reference files are committed; only files holding REAL values are ignored.
+# `.env.*` above already swallows `.env.development.example`, so the
+# negation has to be explicit — and has to sit below the rule it undoes.
+!.env.development.example
 
 # logs
 logs/
