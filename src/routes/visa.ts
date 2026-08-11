@@ -146,6 +146,15 @@ import {
   findIdentityCandidates,
   shapeCandidateProfile,
 } from "../services/travellerIdentity.service.js";
+// The approvals-queue evidence block (2026-08-11) — roster status, filed-for,
+// passport VALIDITY (never the number), documents attached, completeness. All
+// of it is pure derivation, so it lives in a service and is tested without a
+// database; this route only gathers the inputs. See that file's header for
+// why the passport is masked on this variant specifically.
+import {
+  buildVisaApprovalCard,
+  type VisaApprovalCardContext,
+} from "../services/visaApprovalCard.service.js";
 
 const visaLogger = logger.child({ module: "visa" });
 
@@ -2028,13 +2037,68 @@ function visaApprovalsQueueFilter(req: any, workspaceId: any): Record<string, an
   return filter;
 }
 
+/**
+ * The evidence inputs behind the approvals card — loaded ONCE per queue load,
+ * two batched queries, and ONLY on the approvals variant.
+ *
+ * The traveller projection is deliberately NOT the one
+ * hydrateApplicationsWithTravellers uses. That one is the TRACKING view's
+ * (the requestor reading their own request), and it neither carries the claim
+ * fields this card judges roster status on nor has any business growing them.
+ * This is the approver's view of somebody else's traveller: claim state in,
+ * and the passport number in only so it can be MASKED before it leaves the
+ * process — services/visaApprovalCard.service.ts never emits it.
+ */
+async function loadVisaApprovalCardInputs(workspaceId: any, applications: any[]) {
+  const travellerIds = [
+    ...new Set(
+      applications
+        .map((a: any) => a?.travellerProfileId)
+        .filter(Boolean)
+        .map(String),
+    ),
+  ];
+  const applicationIds = applications.map((a: any) => a?._id).filter(Boolean);
+
+  const [profiles, documents] = await Promise.all([
+    travellerIds.length
+      ? TravellerProfile.find({ _id: { $in: travellerIds }, workspaceId })
+          .select(
+            "firstName middleName lastName dob nationality passportNo passportExpiry claimedBy linkedMemberId",
+          )
+          .lean()
+      : Promise.resolve([] as any[]),
+    // Live documents only — a soft-deleted upload is not "attached", and
+    // counting it would tell the approver a document is on file that the
+    // applicant already withdrew. Same { deletedAt: null } filter every other
+    // document read in this file applies.
+    applicationIds.length
+      ? VisaDocument.find({ workspaceId, applicationId: { $in: applicationIds }, deletedAt: null })
+          .select("applicationId docCode")
+          .lean()
+      : Promise.resolve([] as any[]),
+  ]);
+
+  const profilesById = new Map<string, any>(
+    (profiles as any[]).map((p) => [String(p._id), p]),
+  );
+  const documentsByApplicationId = new Map<string, any[]>();
+  for (const doc of documents as any[]) {
+    const key = String(doc.applicationId);
+    if (!documentsByApplicationId.has(key)) documentsByApplicationId.set(key, []);
+    documentsByApplicationId.get(key)!.push(doc);
+  }
+
+  return { profilesById, documentsByApplicationId };
+}
+
 router.get("/requests", async (req: any, res: any) => {
   try {
     const workspaceId = req.workspaceObjectId;
-    const { filter } =
-      String(req.query.queue || "") === "approvals"
-        ? { filter: visaApprovalsQueueFilter(req, workspaceId) }
-        : await resolveVisaRequestsFilter(req, workspaceId);
+    const isApprovalsQueue = String(req.query.queue || "") === "approvals";
+    const { filter } = isApprovalsQueue
+      ? { filter: visaApprovalsQueueFilter(req, workspaceId) }
+      : await resolveVisaRequestsFilter(req, workspaceId);
     const requests = await VisaRequest.find(filter)
       .sort({ createdAt: -1 })
       .lean();
@@ -2061,11 +2125,21 @@ router.get("/requests", async (req: any, res: any) => {
       if (!applicationsByRequest.has(key)) applicationsByRequest.set(key, []);
       applicationsByRequest.get(key)!.push(app);
     }
+    // The RAW applications, kept alongside the hydrated ones. The approvals
+    // card builder reads ruleSnapshot/applicantProfile/linkedBookings off the
+    // document itself rather than off the hydrated payload, so it stays
+    // independent of whatever the tracking-view hydration happens to project.
+    const rawApplicationsByRequest = new Map<string, any[]>();
+    for (const app of applications as any[]) {
+      const key = String(app.requestId);
+      if (!rawApplicationsByRequest.has(key)) rawApplicationsByRequest.set(key, []);
+      rawApplicationsByRequest.get(key)!.push(app);
+    }
 
-    // ── Approvals-queue enrichment (2026-08-10) ────────────────────────
-    // Three things the raw request doc cannot give the approvals UI, all
-    // resolved in ONE batched lookup and ONLY for the approvals queue — the
-    // ordinary tracking list pays nothing for them.
+    // ── Approvals-queue enrichment (2026-08-10, extended 2026-08-11) ────
+    // What the raw request doc cannot give the approvals UI, all resolved in
+    // batched lookups and ONLY for the approvals queue — the ordinary
+    // tracking list pays nothing for any of it.
     //
     //   requestorName  — the doc carries raisedByUserId, an id. The queue's
     //                    first column is a person. Mirrors how
@@ -2079,20 +2153,37 @@ router.get("/requests", async (req: any, res: any) => {
     //                    marked selfApproved), and re-deriving that in the
     //                    client would be a second copy of the rule that can
     //                    disagree with the routes that enforce it.
-    const isApprovalsQueue = String(req.query.queue || "") === "approvals";
+    //   approvalCard   — the EVIDENCE block (2026-08-11): roster status per
+    //                    traveller, self-vs-filed-on-behalf, passport
+    //                    validity, documents attached, completeness. See
+    //                    services/visaApprovalCard.service.ts.
     let nameByUserId = new Map<string, string>();
+    let cardContext: VisaApprovalCardContext | null = null;
     if (isApprovalsQueue) {
+      const { profilesById, documentsByApplicationId } = await loadVisaApprovalCardInputs(
+        workspaceId,
+        applications,
+      );
+
+      // ONE User lookup covers three questions: the requestor's name, each
+      // chain approver's name, and whether each traveller's claimedBy still
+      // resolves to a real account. Rolling the claim ids into the same $in
+      // is what lets resolveRosterStatus report a RESOLVED member link
+      // instead of trusting a non-null pointer — see that function.
       const userIds = [
         ...new Set(
-          requests
-            .flatMap((r: any) => [
+          [
+            ...requests.flatMap((r: any) => [
               r.raisedByUserId,
               ...(Array.isArray(r.approvalChain) ? r.approvalChain.map((l: any) => l?.approverId) : []),
-            ])
+            ]),
+            ...[...profilesById.values()].map((p: any) => p?.claimedBy),
+          ]
             .filter((id: any) => id && mongoose.isValidObjectId(String(id)))
             .map(String),
         ),
       ];
+      const knownUserIds = new Set<string>();
       if (userIds.length) {
         const users = await User.find({ _id: { $in: userIds } })
           .select("firstName lastName name email")
@@ -2103,7 +2194,10 @@ router.get("/requests", async (req: any, res: any) => {
             [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.name || u.email || "",
           ]),
         );
+        for (const u of users as any[]) knownUserIds.add(String(u._id));
       }
+
+      cardContext = { profilesById, documentsByApplicationId, knownUserIds, now: new Date() };
     }
 
     const result = requests.map((r: any) => {
@@ -2111,11 +2205,33 @@ router.get("/requests", async (req: any, res: any) => {
         ...r,
         applications: applicationsByRequest.get(String(r._id)) || [],
       };
-      if (!isApprovalsQueue) return base;
+      if (!isApprovalsQueue || !cardContext) return base;
 
       const decision = canDecideVisaRequest(req.user, r);
+      const approvalCard = buildVisaApprovalCard({
+        request: r,
+        applications: rawApplicationsByRequest.get(String(r._id)) || [],
+        ctx: cardContext,
+      });
+      const cardTravellerByApplicationId = new Map(
+        approvalCard.travellers.map((t) => [t.applicationId, t]),
+      );
+
       return {
         ...base,
+        // ── THE PASSPORT MASK ──────────────────────────────────────────
+        // `traveller` is REPLACED wholesale with the approvals-shaped
+        // subset, never patched by deleting passportNo off the hydrated
+        // object. A rebuilt shape cannot leak a field somebody adds to the
+        // tracking projection later; a delete-list silently can. The
+        // requestor's own view (this route WITHOUT ?queue=approvals, and
+        // GET /requests/:id) is untouched — an applicant reading their own
+        // passport number is not what this guards against.
+        applications: base.applications.map((a: any) => ({
+          ...a,
+          traveller: cardTravellerByApplicationId.get(String(a._id)) ?? null,
+        })),
+        approvalCard,
         requestorName: nameByUserId.get(String(r.raisedByUserId)) || "",
         approvalChain: (Array.isArray(r.approvalChain) ? r.approvalChain : []).map((l: any) => ({
           ...l,

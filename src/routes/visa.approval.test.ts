@@ -28,6 +28,8 @@ const {
   requests,
   applications,
   users,
+  travellerProfiles,
+  visaDocuments,
   workspaceConfig,
   recomputeRequestStatusMock,
   logVisaActivityMock,
@@ -117,6 +119,12 @@ const {
   const requests = makeCollection();
   const applications = makeCollection();
   const users = makeCollection();
+  // Real stores (2026-08-11) rather than the empty stubs these two were: the
+  // approvals CARD is built out of traveller profiles and uploaded documents,
+  // so a queue payload asserted against a stubbed-empty TravellerProfile would
+  // prove nothing about the masking rule it is meant to prove.
+  const travellerProfiles = makeCollection();
+  const visaDocuments = makeCollection();
   // Mutable per-test stand-in for CustomerWorkspace.config.
   const workspaceConfig: { value: any } = { value: null };
 
@@ -124,6 +132,8 @@ const {
     requests,
     applications,
     users,
+    travellerProfiles,
+    visaDocuments,
     workspaceConfig,
     recomputeRequestStatusMock: vi.fn().mockResolvedValue("draft"),
     logVisaActivityMock: vi.fn().mockResolvedValue(undefined),
@@ -132,6 +142,8 @@ const {
       requests.clear();
       applications.clear();
       users.clear();
+      travellerProfiles.clear();
+      visaDocuments.clear();
       workspaceConfig.value = null;
     },
   };
@@ -149,7 +161,18 @@ function chainable(getResult: () => any) {
 }
 
 vi.mock("../models/TravellerProfile.js", () => ({
-  default: { find: () => chainable(() => []) },
+  default: { find: (filter: any = {}) => chainable(() => travellerProfiles.query(filter)) },
+}));
+
+// Reached only by the approvals queue's card build (loadVisaApprovalCardInputs
+// in routes/visa.ts). Every other route exercised in this file leaves it
+// untouched, and an empty store answers those the same way an empty
+// collection would.
+vi.mock("../models/VisaDocument.js", () => ({
+  default: {
+    find: (filter: any = {}) => chainable(() => visaDocuments.query(filter)),
+    findOne: (filter: any = {}) => chainable(() => visaDocuments.query(filter)[0] ?? null),
+  },
 }));
 
 vi.mock("../models/VisaRequest.js", async () => {
@@ -273,6 +296,37 @@ function applicationDoc(requestId: any, overrides: Record<string, any> = {}) {
     status: "draft",
     ruleSnapshot: { documentRequirements: [] },
     linkedBookings: [],
+    ...overrides,
+  });
+}
+
+/**
+ * A traveller record. Defaults to the COMPLETE, ON-ROSTER shape (passport,
+ * expiry well past any travel date, DOB, claimed by a real login) so each
+ * test below removes exactly the one fact it is about.
+ */
+function travellerDoc(overrides: Record<string, any> = {}) {
+  return travellerProfiles.insert({
+    _id: new mongoose.Types.ObjectId(),
+    workspaceId: WORKSPACE,
+    firstName: "Arjun",
+    lastName: "Nair",
+    dob: "1991-04-17",
+    nationality: "IN",
+    passportNo: "M8841203",
+    passportExpiry: "2031-06-30",
+    isActive: true,
+    ...overrides,
+  });
+}
+
+function documentDoc(applicationId: any, docCode: string, overrides: Record<string, any> = {}) {
+  return visaDocuments.insert({
+    _id: new mongoose.Types.ObjectId(),
+    workspaceId: WORKSPACE,
+    applicationId,
+    docCode,
+    deletedAt: null,
     ...overrides,
   });
 }
@@ -785,5 +839,307 @@ describe("approvals queue and pending-count", () => {
     // A route-order slip would 404 here (no request with that id).
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty("approvals");
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * THE APPROVALS CARD (2026-08-11) — the evidence an approver decides on,
+ * and the passport mask that rides with it.
+ *
+ * The derivation rules themselves are unit-tested in
+ * services/visaApprovalCard.service.test.ts. What is proved HERE is the part
+ * a unit test cannot: what actually leaves the route, on the actual wire, for
+ * an actual approver.
+ * ═══════════════════════════════════════════════════════════════════════ */
+describe("approvals card — the payload an approver receives", () => {
+  const TRAVEL_FROM = new Date("2026-09-15T00:00:00.000Z");
+  const TRAVEL_TO = new Date("2026-09-25T00:00:00.000Z");
+
+  /**
+   * One pending request routed to `admin`, raised by `alice`, travelling
+   * `traveller`. Returns everything a test might want to assert against.
+   */
+  async function pendingRequest(opts: {
+    travellerOverrides?: Record<string, any>;
+    /** Who claimed the traveller record; omit for an unclaimed profile. */
+    claimedBy?: any;
+    requestOverrides?: Record<string, any>;
+  } = {}) {
+    setApprovalGate(true);
+    const admin = userDoc(["ADMIN"]);
+    const alice = userDoc(["EMPLOYEE"], { firstName: "Alice", lastName: "Raman" });
+    const traveller = travellerDoc({
+      ...(opts.claimedBy ? { claimedBy: opts.claimedBy } : {}),
+      ...(opts.travellerOverrides || {}),
+    });
+    const req = requestDoc(alice._id, {
+      purpose: "TOURIST",
+      travelDateFrom: TRAVEL_FROM,
+      travelDateTo: TRAVEL_TO,
+      ...(opts.requestOverrides || {}),
+    });
+    const app = applicationDoc(req._id, { travellerProfileId: traveller._id, nationality: "IN" });
+    await submit(alice._id, req._id);
+    return { admin, alice, traveller, req, app };
+  }
+
+  /** The queue as an admin — `actor` is a userDoc(), i.e. a loose store record. */
+  function queue(actor: Record<string, any>) {
+    return request(makeApp({ _id: actor._id, roles: actor.roles ?? ["ADMIN"] })).get(
+      "/requests?queue=approvals",
+    );
+  }
+
+  /* ── The leak this change closes. ──────────────────────────────────── */
+  describe("passport masking", () => {
+    it("the full passport number is ABSENT FROM THE WIRE, not merely unrendered", async () => {
+      const { admin } = await pendingRequest();
+
+      const res = await queue(admin);
+
+      expect(res.status).toBe(200);
+      // The whole serialised body, not a field-by-field walk: a leak that
+      // reappears under some field this test doesn't know to check is still
+      // a leak, and this is the assertion that catches it.
+      expect(JSON.stringify(res.body)).not.toContain("M8841203");
+    });
+
+    it("ships a masked tail and a validity verdict instead", async () => {
+      const { admin } = await pendingRequest();
+
+      const res = await queue(admin);
+      const t = res.body.requests[0].approvalCard.travellers[0];
+
+      expect(t.passportOnFile).toBe(true);
+      expect(t.passportMasked).toBe("****1203");
+      expect(t.passportExpiry).toBe("2031-06-30");
+      expect(t.passportValidity).toBe("VALID");
+    });
+
+    it("masks it on the applications[] traveller too — the shape the old UI read", async () => {
+      const { admin } = await pendingRequest();
+
+      const res = await queue(admin);
+      const traveller = res.body.requests[0].applications[0].traveller;
+
+      // REPLACED, not patched: the tracking view's fields are simply not
+      // here, so a field added to that projection later cannot ride along.
+      expect(traveller).not.toHaveProperty("passportNo");
+      expect(traveller).not.toHaveProperty("email");
+      expect(traveller).not.toHaveProperty("gender");
+      expect(traveller.passportMasked).toBe("****1203");
+    });
+
+    it("leaves the REQUESTOR'S OWN view of their own passport untouched", async () => {
+      // The regression line. This route without ?queue=approvals is the
+      // applicant reading their own record, and masking there would be
+      // hiding somebody's passport from themselves.
+      const { alice, traveller } = await pendingRequest({ claimedBy: undefined });
+      travellerProfiles.findByIdAndUpdate(traveller._id, { $set: { claimedBy: alice._id } });
+
+      const res = await request(makeApp({ _id: alice._id, roles: ["EMPLOYEE"] })).get("/requests");
+
+      expect(res.status).toBe(200);
+      expect(res.body.requests[0].applications[0].traveller.passportNo).toBe("M8841203");
+      // ...and the approvals enrichment is not paid for on that path at all.
+      expect(res.body.requests[0]).not.toHaveProperty("approvalCard");
+    });
+  });
+
+  /* ── Requestor vs traveller. ───────────────────────────────────────── */
+  describe("self-application vs filed-on-behalf", () => {
+    it("SELF when the requestor's own claimed profile is the traveller", async () => {
+      setApprovalGate(true);
+      const admin = userDoc(["ADMIN"]);
+      const alice = userDoc(["EMPLOYEE"]);
+      const traveller = travellerDoc({ claimedBy: alice._id });
+      const req = requestDoc(alice._id);
+      applicationDoc(req._id, { travellerProfileId: traveller._id });
+      await submit(alice._id, req._id);
+
+      const res = await queue(admin);
+
+      expect(res.body.requests[0].approvalCard.filedFor).toBe("SELF");
+      expect(res.body.requests[0].approvalCard.travellers[0].isRequestor).toBe(true);
+    });
+
+    it("ON_BEHALF when the traveller is provably a different person", async () => {
+      setApprovalGate(true);
+      const admin = userDoc(["ADMIN"]);
+      const alice = userDoc(["EMPLOYEE"]);
+      const bob = userDoc(["EMPLOYEE"]);
+      const traveller = travellerDoc({ firstName: "Bob", claimedBy: bob._id });
+      const req = requestDoc(alice._id);
+      applicationDoc(req._id, { travellerProfileId: traveller._id });
+      await submit(alice._id, req._id);
+
+      const res = await queue(admin);
+
+      expect(res.body.requests[0].approvalCard.filedFor).toBe("ON_BEHALF");
+      expect(res.body.requests[0].approvalCard.travellers[0].isRequestor).toBe(false);
+    });
+
+    it("UNKNOWN when nothing ties any traveller to a login", async () => {
+      const { admin } = await pendingRequest({ claimedBy: undefined });
+
+      const res = await queue(admin);
+
+      expect(res.body.requests[0].approvalCard.filedFor).toBe("UNKNOWN");
+    });
+  });
+
+  /* ── Roster status. ────────────────────────────────────────────────── */
+  describe("roster status", () => {
+    it("MEMBER for a traveller whose claim resolves to a live account", async () => {
+      setApprovalGate(true);
+      const admin = userDoc(["ADMIN"]);
+      const alice = userDoc(["EMPLOYEE"]);
+      const traveller = travellerDoc({ claimedBy: alice._id });
+      const req = requestDoc(alice._id);
+      applicationDoc(req._id, { travellerProfileId: traveller._id });
+      await submit(alice._id, req._id);
+
+      const res = await queue(admin);
+      const card = res.body.requests[0].approvalCard;
+
+      expect(card.travellers[0].rosterStatus).toBe("MEMBER");
+      expect(card.travellers[0].rosterBasis).toBe("CLAIMED_LOGIN");
+      expect(card.offRosterCount).toBe(0);
+    });
+
+    it("OFF_ROSTER, and counted, for a traveller with no link of any kind", async () => {
+      const { admin } = await pendingRequest({ claimedBy: undefined });
+
+      const res = await queue(admin);
+      const card = res.body.requests[0].approvalCard;
+
+      expect(card.travellers[0].rosterStatus).toBe("OFF_ROSTER");
+      expect(card.offRosterCount).toBe(1);
+      expect(card.travellerCount).toBe(1);
+    });
+
+    it("MEMBER for an admin-linked roster record with no claim", async () => {
+      const { admin } = await pendingRequest({
+        travellerOverrides: { linkedMemberId: new mongoose.Types.ObjectId() },
+      });
+
+      const res = await queue(admin);
+
+      expect(res.body.requests[0].approvalCard.travellers[0].rosterBasis).toBe("ROSTER_LINK");
+    });
+  });
+
+  /* ── The trip. ─────────────────────────────────────────────────────── */
+  it("carries the travel dates the card had no way to show before", async () => {
+    const { admin } = await pendingRequest();
+
+    const res = await queue(admin);
+    const row = res.body.requests[0];
+
+    expect(new Date(row.travelDateFrom).toISOString()).toBe(TRAVEL_FROM.toISOString());
+    expect(new Date(row.travelDateTo).toISOString()).toBe(TRAVEL_TO.toISOString());
+    expect(row.purpose).toBe("TOURIST");
+  });
+
+  /* ── Completeness. ─────────────────────────────────────────────────── */
+  describe("completeness", () => {
+    it("ready to file when every identity fact is present", async () => {
+      const { admin } = await pendingRequest();
+
+      const res = await queue(admin);
+      const completeness = res.body.requests[0].approvalCard.completeness;
+
+      expect(completeness.ready).toBe(true);
+      expect(completeness.gaps).toEqual([]);
+    });
+
+    it("names the missing passport expiry, against the traveller it belongs to", async () => {
+      const { admin } = await pendingRequest({ travellerOverrides: { passportExpiry: null } });
+
+      const res = await queue(admin);
+      const completeness = res.body.requests[0].approvalCard.completeness;
+
+      expect(completeness.ready).toBe(false);
+      expect(completeness.gaps).toEqual([
+        {
+          code: "PASSPORT_EXPIRY_MISSING",
+          label: "No passport expiry on file",
+          severity: "BLOCKING",
+          travellerName: "Arjun Nair",
+        },
+      ]);
+    });
+
+    it("flags a passport that lapses before the return date", async () => {
+      const { admin } = await pendingRequest({
+        travellerOverrides: { passportExpiry: "2026-09-20" },
+      });
+
+      const res = await queue(admin);
+      const card = res.body.requests[0].approvalCard;
+
+      expect(card.travellers[0].passportValidity).toBe("EXPIRES_BEFORE_TRAVEL");
+      expect(card.completeness.gaps.map((g: any) => g.code)).toContain(
+        "PASSPORT_EXPIRES_BEFORE_TRAVEL",
+      );
+    });
+
+    it("records the consent submit itself wrote, and reports it accepted", async () => {
+      const { admin } = await pendingRequest();
+
+      const res = await queue(admin);
+      const consent = res.body.requests[0].approvalCard.consent;
+
+      expect(consent.accepted).toBe(true);
+      expect(consent.missingClauseIds).toEqual([]);
+    });
+  });
+
+  /* ── Documents. ────────────────────────────────────────────────────── */
+  describe("documents attached", () => {
+    it("counts and names them, and never carries a key or a URL", async () => {
+      const { admin, app } = await pendingRequest();
+      documentDoc(app._id, "DOC-01", { s3Key: "visa-applications/ws/app/secret.jpg" });
+      documentDoc(app._id, "DOC-02");
+
+      const res = await queue(admin);
+      const card = res.body.requests[0].approvalCard;
+
+      expect(card.documents.count).toBe(2);
+      expect(card.documents.docCodes).toEqual(["DOC-01", "DOC-02"]);
+      expect(card.documents.docNames).toHaveLength(2);
+      expect(JSON.stringify(card)).not.toContain("s3Key");
+      expect(JSON.stringify(card)).not.toContain("secret.jpg");
+    });
+
+    it("ignores a soft-deleted upload — a withdrawn document is not attached", async () => {
+      const { admin, app } = await pendingRequest();
+      documentDoc(app._id, "DOC-01", { deletedAt: new Date() });
+
+      const res = await queue(admin);
+
+      expect(res.body.requests[0].approvalCard.documents.count).toBe(0);
+    });
+  });
+
+  /* ── Multi-traveller. ──────────────────────────────────────────────── */
+  it("reports every traveller, and how many of them are off-roster", async () => {
+    setApprovalGate(true);
+    const admin = userDoc(["ADMIN"]);
+    const alice = userDoc(["EMPLOYEE"]);
+    const mine = travellerDoc({ claimedBy: alice._id });
+    const guest = travellerDoc({ firstName: "Priya", lastName: "Sharma" });
+    const req = requestDoc(alice._id);
+    applicationDoc(req._id, { travellerProfileId: mine._id });
+    applicationDoc(req._id, { travellerProfileId: guest._id });
+    await submit(alice._id, req._id);
+
+    const res = await queue(admin);
+    const card = res.body.requests[0].approvalCard;
+
+    expect(card.travellerCount).toBe(2);
+    expect(card.offRosterCount).toBe(1);
+    expect(card.filedFor).toBe("SELF_AND_OTHERS");
+    expect(card.travellers.map((t: any) => t.name)).toEqual(["Arjun Nair", "Priya Sharma"]);
   });
 });

@@ -35,6 +35,10 @@ import TravellerProfile from "../models/TravellerProfile.js";
 import VisaRule from "../models/VisaRule.js";
 import VisaRequest from "../models/VisaRequest.js";
 import VisaApplication from "../models/VisaApplication.js";
+import {
+  CURRENT_VISA_CONSENT_VERSION,
+  VISA_CONSENT_CLAUSE_IDS,
+} from "../config/visaConsent.js";
 
 /* ── The guard ───────────────────────────────────────────────────────────
  *
@@ -84,6 +88,9 @@ function assertLocalDatabase(uri: string): void {
 /* ── What gets seeded ────────────────────────────────────────────────── */
 
 const CUSTOMER_ID = "dev-acme";
+// The Customer row's own identity — see the teardown's note on why this, and
+// not CUSTOMER_ID, is what finds it.
+const CUSTOMER_LEGAL_NAME = "Acme Industries Private Limited";
 const WORKSPACE_SLUG = "acme-dev";
 const PASSWORD = "Passw0rd!";
 
@@ -119,7 +126,6 @@ async function main() {
       User.deleteMany({ workspaceId: wsId }),
       CustomerMember.deleteMany({ customerId: CUSTOMER_ID }),
       CustomerWorkspace.deleteOne({ _id: wsId }),
-      Customer.deleteMany({ customerId: CUSTOMER_ID }),
     ]);
     const total = removed.reduce((n, r: any) => n + (r.deletedCount ?? 0), 0);
     console.log(`[seed:dev] cleared ${total} existing doc(s) for customerId=${CUSTOMER_ID}`);
@@ -127,9 +133,24 @@ async function main() {
 
   /* ── Customer + workspace ──────────────────────────────────────────── */
 
+  // OUTSIDE the guard above, and BY legalName (2026-08-11). Two bugs made
+  // this seed not actually rerunnable, contrary to its own header:
+  //
+  //   1. models/Customer.ts has no `customerId` field at all — that key lives
+  //      on CustomerWorkspace and User — so a `{ customerId }` filter matched
+  //      nothing and left the Customer row behind. The next run then died on
+  //      the unique legalNameNormalized index before writing anything.
+  //   2. The workspace-scoped teardown only runs when the workspace still
+  //      exists, so a run that died PART-WAY (exactly what 1. caused) left an
+  //      orphan Customer that no subsequent run would ever clear.
+  //
+  // Deleting by the exact legalName this seed itself writes is scoped to the
+  // one row it owns, and is correct whichever half of a previous run survived.
+  await Customer.deleteMany({ legalName: CUSTOMER_LEGAL_NAME });
+
   await Customer.create({
     customerId: CUSTOMER_ID,
-    legalName: "Acme Industries Private Limited",
+    legalName: CUSTOMER_LEGAL_NAME,
     isActive: true,
   } as any);
 
@@ -280,7 +301,7 @@ async function main() {
     isActive: true,
   } as any);
 
-  await TravellerProfile.create({
+  const rohan: any = await TravellerProfile.create({
     workspaceId: wsId,
     travelerId: nextTravelerId(),
     firstName: "Rohan",
@@ -387,6 +408,17 @@ async function main() {
   const travelTo = new Date(travelFrom);
   travelTo.setDate(travelTo.getDate() + 9);
 
+  // What POST /requests/:id/submit would have written. Included because the
+  // approvals card READS it (services/visaApprovalCard.service.ts reports a
+  // request with no consents as blocked) — a seed that skipped it would make
+  // every local row falsely read "consent not recorded".
+  const seededConsents = VISA_CONSENT_CLAUSE_IDS.map((clauseId) => ({
+    clauseId,
+    version: CURRENT_VISA_CONSENT_VERSION,
+    acceptedAt: new Date(),
+    acceptedByUserId: employee._id,
+  }));
+
   const request: any = await VisaRequest.create({
     workspaceId: wsId,
     raisedByUserId: employee._id,
@@ -396,6 +428,7 @@ async function main() {
     travelDateFrom: travelFrom,
     travelDateTo: travelTo,
     status: "draft",
+    consents: seededConsents,
     // What the queue filters on.
     approvalStatus: "pending_approval",
     approverId: leader._id,
@@ -439,7 +472,93 @@ async function main() {
     },
   } as any);
 
-  console.log("[seed:dev] 1 visa request pending approval (Arjun → Meera)");
+  /* ── A SECOND pending request, deliberately the awkward one ────────────
+   *
+   * The first request is the happy path: the employee filing for themselves,
+   * on the roster, passport complete. Every signal on the approvals card
+   * reads green there, which makes it useless for seeing what the card is
+   * FOR. This one exercises the other side of each signal at once:
+   *
+   *   raised by KAVYA, for two OTHER people        -> filed on behalf
+   *   Arjun is claimed by the employee             -> the proof it isn't self
+   *   Rohan has no claim and no member link        -> OFF-ROSTER
+   *   Rohan has no passport and no expiry          -> BLOCKING completeness gaps
+   *
+   * Raised by Kavya rather than by the leader ON PURPOSE. The seeded leader's
+   * User.roles is ["CUSTOMER"] — WORKSPACE_LEADER lives on CustomerMember,
+   * not on the login — so isVisaAdmin() is false for them and they are only
+   * the ROUTED approver. A request they raised themselves would therefore hit
+   * the segregation-of-duties rule (a non-admin may never decide their own),
+   * and the one login that can see this row could not action it.
+   * ─────────────────────────────────────────────────────────────────── */
+
+  const groupFrom = new Date();
+  groupFrom.setDate(groupFrom.getDate() + 21);
+  const groupTo = new Date(groupFrom);
+  groupTo.setDate(groupTo.getDate() + 5);
+
+  const groupRequest: any = await VisaRequest.create({
+    workspaceId: wsId,
+    raisedByUserId: colleagueA._id,
+    customerId: CUSTOMER_ID,
+    destinationIso2: "DE",
+    purpose: "TOURIST",
+    travelDateFrom: groupFrom,
+    travelDateTo: groupTo,
+    status: "draft",
+    consents: seededConsents.map((c) => ({ ...c, acceptedByUserId: colleagueA._id })),
+    approvalStatus: "pending_approval",
+    approverId: leader._id,
+    approvalChain: [{ level: 1, approverId: leader._id }],
+    currentLevel: 1,
+    submittedAt: new Date(),
+  } as any);
+
+  const groupSnapshot = {
+    ruleSnapshot: {
+      ruleId: rule._id,
+      capturedAt: new Date(),
+      destinationName: rule.destinationName,
+      isSchengen: rule.isSchengen,
+      productClass: rule.productClass,
+      visaCategory: rule.visaCategory,
+      purpose: rule.purpose,
+      entryType: rule.entryType,
+      serviceTier: rule.serviceTier,
+      validityDays: rule.validityDays,
+      maxStayDays: rule.maxStayDays,
+      etaMinDays: rule.etaMinDays,
+      etaMaxDays: rule.etaMaxDays,
+      etaBasis: rule.etaBasis,
+      appointmentRequired: rule.appointmentRequired,
+      biometricsRequired: rule.biometricsRequired,
+      documentRequirements: [{ docCode: "DOC-01", requirement: "REQUIRED" }],
+    },
+    indicativeCostSnapshot: {
+      embassyFeeInr: rule.embassyFeeInr,
+      vfsFeeInr: rule.vfsFeeInr,
+      plumtripsServiceFeeInr: rule.plumtripsServiceFeeInr,
+      displayMode: "ITEMISED" as const,
+      totalInr,
+    },
+  };
+
+  for (const traveller of [arjun, rohan]) {
+    await VisaApplication.create({
+      workspaceId: wsId,
+      requestId: groupRequest._id,
+      customerId: CUSTOMER_ID,
+      travellerProfileId: traveller._id,
+      nationality: "IN",
+      status: "pending_approval",
+      ...groupSnapshot,
+    } as any);
+  }
+
+  console.log(
+    "[seed:dev] 2 visa requests pending approval " +
+      "(Arjun self-filed → Meera; Arjun+Rohan filed by Kavya, one off-roster)",
+  );
 
   /* ── What to do next ───────────────────────────────────────────────── */
 
@@ -449,7 +568,9 @@ async function main() {
 
   WORKSPACE LEADER   ${LEADER_EMAIL}    ${PASSWORD}
     → Travellers roster, the traveller dossier with every field
-      unlocked, and the Approvals queue (1 pending).
+      unlocked, and the Approvals queue (2 pending — one clean
+      self-application, one filed-on-behalf with an off-roster
+      traveller and missing passport details).
 
   EMPLOYEE           ${EMPLOYEE_EMAIL}  ${PASSWORD}
     → My Profile with the dossier tabs, name/org fields locked,
