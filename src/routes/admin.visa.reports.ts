@@ -209,6 +209,63 @@ async function buildApplicationMatchFilter(filters: CommonFilters): Promise<any>
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * THE GATE, activity half (2026-08-11).
+ *
+ * VisaActivityLog is the one report source that is NOT a VisaApplication
+ * query, so buildApplicationMatchFilter above cannot gate it — its status
+ * exclusion lives on a collection this report never matches against.
+ *
+ * It used to be gated only as a SIDE EFFECT of the optional
+ * destination/status/assignee narrowing: that branch resolved
+ * buildApplicationMatchFilter into an applicationId $in, which happened to
+ * exclude held cases. A DEFAULT download — the common case, and the one the
+ * dashboard's throughput tiles link to — took no such branch and therefore
+ * carried no exclusion at all, exporting the traveller name, reference,
+ * destination and purpose of applications still held at the customer's own
+ * approval gate. ?eventType=APPROVAL_REQUESTED targeted them directly.
+ *
+ * So the exclusion is now STRUCTURAL: these clauses are resolved
+ * unconditionally, before any optional filter is read, and $and-ed onto the
+ * base match. Every optional filter below narrows WITHIN them and none can
+ * replace them — there is no longer a path through this route that omits
+ * the gate.
+ *
+ * A DENY-list, not the allow-list the old branch produced, for two reasons:
+ *   - request-level rows (REQUEST_CREATED, APPROVAL_REQUESTED,
+ *     REQUEST_CANCELLED) carry applicationId: null, so an unconditional
+ *     applicationId $in would silently drop every one of them from the
+ *     default export — a real regression on rows that belong there;
+ *   - the held set is transient and small (cases awaiting one approver's
+ *     click), whereas the visible set is the whole collection.
+ * Both ids are excluded because the request-level rows can only be reached
+ * by requestId, and the application-level ones only by applicationId.
+ *
+ * Keyed on LIVE status, like every other gate in this module: once an
+ * approver releases a request it is a real ops case, and its own approval
+ * history becomes legitimately ops-visible along with it.
+ *
+ * "pending_approval" ONLY, deliberately not the whole
+ * VISA_OPS_HIDDEN_STATUSES set — drafts have always been in these reports
+ * and buildApplicationMatchFilter above says so in as many words. This
+ * closes the approval hole and changes nothing else.
+ * ───────────────────────────────────────────────────────────────────── */
+async function buildActivityGateClauses(): Promise<any[]> {
+  const held = await VisaApplication.find({ status: "pending_approval" })
+    .select("_id requestId")
+    .lean();
+  if (held.length === 0) return [];
+
+  const applicationIds = (held as any[]).map((a) => a._id);
+  // Deduped by string id, keeping the ObjectId itself — several held
+  // applications routinely share one request (one per traveller).
+  const requestIds = [
+    ...new Map((held as any[]).map((a) => [String(a.requestId), a.requestId])).values(),
+  ];
+
+  return [{ applicationId: { $nin: applicationIds } }, { requestId: { $nin: requestIds } }];
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * Activity detail -> human-readable summary. Exported for direct unit
  * coverage. Deliberately never echoes raw ids beyond what's already
  * elsewhere in the row (application reference, traveller) — see
@@ -463,6 +520,12 @@ router.get("/reports/activity", requirePermission("visaApplication", "READ"), as
     if ("error" in parsed) return res.status(400).json({ error: parsed.error });
     const { filters } = parsed;
 
+    // THE GATE. Resolved FIRST and unconditionally — before a single
+    // optional filter below is read — so no path through this route,
+    // including the no-filter default download, can skip it. See
+    // buildActivityGateClauses.
+    const gateClauses = await buildActivityGateClauses();
+
     const activityFilter: any = {};
     if (filters.workspaceId) activityFilter.workspaceId = filters.workspaceId;
     applyDateRange(activityFilter, "at", filters);
@@ -506,6 +569,11 @@ router.get("/reports/activity", requirePermission("visaApplication", "READ"), as
       const matchingApps = await VisaApplication.find(appFilter).select("_id").lean();
       activityFilter.applicationId = { $in: matchingApps.map((a: any) => a._id) };
     }
+
+    // The gate clauses are $and-ed ON TOP of everything above rather than
+    // merged into it: an optional filter can only ever narrow the result
+    // further, never widen it back past the exclusion.
+    if (gateClauses.length > 0) activityFilter.$and = gateClauses;
 
     const totalMatched = await VisaActivityLog.countDocuments(activityFilter);
     const entries = await VisaActivityLog.find(activityFilter).sort({ at: -1 }).limit(REPORT_ROW_CAP).lean();

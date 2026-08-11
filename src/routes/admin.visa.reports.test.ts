@@ -51,6 +51,10 @@ const {
   function matches(rec: Record<string, any>, filter: Record<string, any>): boolean {
     return Object.entries(filter || {}).every(([key, cond]) => {
       if (key === "$or") return (cond as any[]).some((sub) => matches(rec, sub));
+      // The activity report's approval gate is $and-ed onto the base match
+      // (buildActivityGateClauses) — without this the fake ignored it
+      // entirely and the gate tests below would have passed vacuously.
+      if (key === "$and") return (cond as any[]).every((sub) => matches(rec, sub));
       return matchValue(getPath(rec, key), cond);
     });
   }
@@ -675,6 +679,174 @@ describe("GET /reports/activity", () => {
     const rows = parseCsv(res.text);
     expect(rows).toHaveLength(2); // only app2's SUBMITTED row
     expect(rows[1][3]).toBe("SUBMITTED");
+  });
+
+  /* ── THE APPROVAL GATE, activity half (2026-08-11) ────────────────────
+   * The activity export was gated only as a side effect of the optional
+   * destination/status/assignee narrowing: a DEFAULT download took no such
+   * branch and carried no application filter at all, so it exported held
+   * cases — and the dashboard's throughput tiles link straight here.
+   *
+   * Every test below asserts on the SERIALISED ROWS, not on the filter
+   * object: the question is what leaves the building in the file.
+   * ─────────────────────────────────────────────────────────────────── */
+  function seedHeldCase() {
+    const heldRequest = _requests.insert({
+      _id: new mongoose.Types.ObjectId(),
+      workspaceId: WORKSPACE_A,
+      referenceNumber: "HV26-HELD",
+      destinationIso2: "AE",
+    });
+    const heldTraveller = _travellers.insert({ firstName: "Held", lastName: "Traveller" });
+    const heldApp = _applications.insert({
+      _id: new mongoose.Types.ObjectId(),
+      workspaceId: WORKSPACE_A,
+      requestId: heldRequest._id,
+      travellerProfileId: heldTraveller._id,
+      status: "pending_approval",
+      createdAt: daysFromNow(-1),
+      ruleSnapshot: { destinationName: "UAE", purpose: "TOURIST", serviceTier: "STANDARD" },
+    });
+
+    _activityRows.push(
+      // Application-level: carries the traveller name and the corridor.
+      {
+        _id: new mongoose.Types.ObjectId(),
+        applicationId: heldApp._id,
+        requestId: heldRequest._id,
+        workspaceId: WORKSPACE_A,
+        eventType: "APPLICATION_CREATED",
+        actorUserId: null,
+        actorType: "CUSTOMER",
+        at: daysFromNow(-1),
+        detail: { destinationName: "UAE", purpose: "TOURIST", serviceTier: "STANDARD" },
+      },
+      // Request-level: applicationId is null, so an applicationId-only
+      // exclusion would sail straight past it.
+      {
+        _id: new mongoose.Types.ObjectId(),
+        applicationId: null,
+        requestId: heldRequest._id,
+        workspaceId: WORKSPACE_A,
+        eventType: "APPROVAL_REQUESTED",
+        actorUserId: null,
+        actorType: "CUSTOMER",
+        at: daysFromNow(-1),
+        detail: { approverId: String(new mongoose.Types.ObjectId()), selfRouted: false, travellerCount: 1 },
+      },
+    );
+
+    return { heldRequest, heldApp };
+  }
+
+  it("GATE: the DEFAULT download — no filters at all — excludes pending_approval activity", async () => {
+    seedFixtures();
+    seedHeldCase();
+
+    const res = await request(makeApp()).get("/reports/activity").query({ format: "csv" });
+
+    expect(res.status).toBe(200);
+    const rows = parseCsv(res.text);
+    // The three seeded rows survive; neither held row is in the file.
+    expect(rows).toHaveLength(4);
+    expect(res.text).not.toContain("HV26-HELD");
+    expect(res.text).not.toContain("Held Traveller");
+    expect(res.text).not.toContain("APPLICATION_CREATED");
+    expect(res.text).not.toContain("APPROVAL_REQUESTED");
+  });
+
+  it("GATE: ?eventType=APPROVAL_REQUESTED returns no rows for a held request", async () => {
+    seedFixtures();
+    seedHeldCase();
+
+    const res = await request(makeApp())
+      .get("/reports/activity")
+      .query({ format: "csv", eventType: "APPROVAL_REQUESTED" });
+
+    expect(res.status).toBe(200);
+    const rows = parseCsv(res.text);
+    expect(rows).toHaveLength(1); // header only
+    expect(res.text).not.toContain("HV26-HELD");
+  });
+
+  it("GATE: a date window over the held case still exports nothing of it", async () => {
+    seedFixtures();
+    seedHeldCase();
+
+    // workspaceId + a date range are optional filters that do NOT take the
+    // application-join branch — exactly the shape that used to skip the gate.
+    const res = await request(makeApp()).get("/reports/activity").query({
+      format: "csv",
+      workspaceId: String(WORKSPACE_A),
+      dateFrom: new Date(Date.now() - 30 * 86400000).toISOString(),
+      dateTo: new Date().toISOString(),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.text).not.toContain("HV26-HELD");
+    expect(res.text).not.toContain("Held Traveller");
+  });
+
+  it("GATE: refuses an explicit ?status=pending_approval rather than exporting it", async () => {
+    seedFixtures();
+    seedHeldCase();
+
+    const res = await request(makeApp())
+      .get("/reports/activity")
+      .query({ format: "csv", status: "pending_approval" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).not.toContain("pending_approval");
+  });
+
+  it("GATE: a non-hidden status still exports normally — the gate narrows, it does not empty the report", async () => {
+    seedFixtures();
+    seedHeldCase();
+
+    const res = await request(makeApp()).get("/reports/activity").query({ format: "csv", status: "submitted" });
+
+    expect(res.status).toBe(200);
+    const rows = parseCsv(res.text);
+    expect(rows).toHaveLength(2); // header + app2's SUBMITTED row, unchanged by the gate
+    expect(rows[1][3]).toBe("SUBMITTED");
+    expect(rows[1][4]).toBe("HV26-000002");
+  });
+
+  it("GATE: request-level rows for a NON-held request are still exported — the deny-list drops only held ones", async () => {
+    const { req1 } = seedFixtures();
+    seedHeldCase();
+    _activityRows.push({
+      _id: new mongoose.Types.ObjectId(),
+      applicationId: null,
+      requestId: req1._id,
+      workspaceId: WORKSPACE_A,
+      eventType: "REQUEST_CREATED",
+      actorUserId: null,
+      actorType: "CUSTOMER",
+      at: new Date(),
+      detail: { travellerCount: 1, destinationIso2: "FR", purpose: "TOURIST" },
+    });
+
+    const res = await request(makeApp()).get("/reports/activity").query({ format: "csv" });
+
+    const rows = parseCsv(res.text);
+    expect(rows.find((r) => r[3] === "REQUEST_CREATED")).toBeTruthy();
+    expect(res.text).not.toContain("APPROVAL_REQUESTED");
+  });
+
+  it("GATE: once the request is released to ops, its activity — approval history included — exports again", async () => {
+    seedFixtures();
+    const { heldApp } = seedHeldCase();
+    // What POST /requests/:id/approve does: the application moves to
+    // "submitted". The gate is keyed on live status, so the same rows that
+    // were withheld a moment ago are now a real ops case's history.
+    _applications.store.get(String(heldApp._id))!.status = "submitted";
+
+    const res = await request(makeApp()).get("/reports/activity").query({ format: "csv" });
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("HV26-HELD");
+    expect(res.text).toContain("APPROVAL_REQUESTED");
   });
 });
 

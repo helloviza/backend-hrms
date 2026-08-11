@@ -1051,10 +1051,41 @@ router.patch("/documents/:id/review", requirePermission("visaApplication", "WRIT
  * GET /documents/:documentId/url (same presignGetObject call, same
  * ownership-verified-at-signing-time posture — never trust the queue/detail
  * response having already "shown" this document as proof of the right to
- * sign it now), scoped by _id only rather than workspaceId: this router is
- * cross-workspace by design (file header), so there is no caller workspace
- * to re-verify against here — READ on the visaApplication permission key is
- * the only gate.
+ * sign it now).
+ *
+ * THE PARENT CHECK (2026-08-11). The customer-side route scopes its lookup
+ * by {_id, workspaceId} — identity picks the workspace, so the document is
+ * authorised against its owner. This router is cross-workspace by design
+ * (file header), so there is no caller workspace to re-verify against and
+ * that half genuinely does not apply. What DOES apply is the same
+ * ops-visibility check the rest of this file makes: a document is only
+ * signable if the application it hangs off is one ops may hold at all.
+ *
+ * Until now this route never loaded the parent, so a bare document id —
+ * with nothing but a READ grant — minted a presigned URL to the underlying
+ * S3 object, passport scans included, no matter what state the application
+ * was in. That made it the weakest read on the surface: GET
+ * /applications/:id refuses a pending_approval case outright, and PATCH
+ * /documents/:id/review already resolves the owning application before
+ * acting, but the one route that hands out the IMAGE checked neither.
+ *
+ * So the parent is resolved first (same VisaApplication.findById on
+ * doc.applicationId that /documents/:id/review uses — not a new, looser
+ * check) and refused on the same terms as GET /applications/:id: a
+ * pending_approval application is held at the customer's own approval gate
+ * and 404s exactly as if it did not exist. An orphaned document — one whose
+ * application is gone — refuses too: nothing can authorise it, and
+ * "unauthorisable" must never fall through to "sign it".
+ *
+ * The refusal is 404 "Document not found", not 403: a 403 would confirm the
+ * document exists and that its parent is being withheld, which is the fact
+ * the gate is keeping. Same posture as the detail route's own 404.
+ *
+ * Deliberately NOT extended to an erasure refusal. Reads stay open on an
+ * erased traveller by design across this file — GET /applications/:id has
+ * no erasure guard and the queue takes ?includeErased — because the
+ * skeleton has to stay visible for audit; it is the WRITES that 409. Adding
+ * one here would change legitimate ops behaviour, which this fix does not.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/documents/:id/url", requirePermission("visaApplication", "READ"), async (req: any, res: any) => {
   try {
@@ -1065,6 +1096,13 @@ router.get("/documents/:id/url", requirePermission("visaApplication", "READ"), a
 
     const doc = await VisaDocument.findOne({ _id: id, deletedAt: null }).lean();
     if (!doc) return res.status(404).json({ error: "Document not found" });
+
+    // THE PARENT CHECK. Resolved BEFORE presignGetObject is called, so a
+    // refusal never reaches the point of minting a URL.
+    const owningApplication = await VisaApplication.findById((doc as any).applicationId).lean();
+    if (!owningApplication || (owningApplication as any).status === "pending_approval") {
+      return res.status(404).json({ error: "Document not found" });
+    }
 
     const url = await presignGetObject({
       bucket: env.S3_BUCKET,

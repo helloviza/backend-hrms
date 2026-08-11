@@ -1136,10 +1136,13 @@ describe("PATCH /documents/:id/review", () => {
 describe("GET /documents/:id/url", () => {
   beforeEach(() => setAccess("READ"));
 
-  it("signs a URL for an existing document, scoped by _id only (no workspace check)", async () => {
+  it("signs a URL for a document whose application is one ops may hold — no workspace check, this router is cross-workspace", async () => {
     const app = makeApp();
+    // WORKSPACE_B, not the caller's own anything: the cross-workspace
+    // posture is intact — it is the PARENT's state that gates, not tenancy.
+    const parent = applicationDoc(WORKSPACE_B, { status: "docs_under_review" });
     const doc = _documents.insert({
-      applicationId: new mongoose.Types.ObjectId(),
+      applicationId: parent._id,
       docCode: "DOC-03",
       deletedAt: null,
       s3Key: "visa-applications/some-workspace/app/key.pdf",
@@ -1159,7 +1162,8 @@ describe("GET /documents/:id/url", () => {
 
   it("404s for a soft-deleted document", async () => {
     const app = makeApp();
-    const doc = _documents.insert({ applicationId: new mongoose.Types.ObjectId(), docCode: "DOC-03", deletedAt: new Date() });
+    const parent = applicationDoc(WORKSPACE_A);
+    const doc = _documents.insert({ applicationId: parent._id, docCode: "DOC-03", deletedAt: new Date() });
     const res = await request(app).get(`/documents/${doc._id}/url`);
     expect(res.status).toBe(404);
     expect(presignGetObjectMock).not.toHaveBeenCalled();
@@ -1169,6 +1173,89 @@ describe("GET /documents/:id/url", () => {
     const app = makeApp();
     const res = await request(app).get(`/documents/${new mongoose.Types.ObjectId()}/url`);
     expect(res.status).toBe(404);
+    expect(presignGetObjectMock).not.toHaveBeenCalled();
+  });
+
+  /* ── THE PARENT CHECK (2026-08-11) ────────────────────────────────────
+   * A bare document id used to be sufficient to mint a presigned URL to
+   * the underlying S3 object — passport scans included — because this
+   * route never loaded the application the document hangs off. Every
+   * refusal below asserts that NO url was minted, not merely that the
+   * response was an error: the leak is the signature, not the status code.
+   * ─────────────────────────────────────────────────────────────────── */
+  it("PARENT: refuses a document whose application is held at the customer's approval gate, and mints no URL", async () => {
+    const app = makeApp();
+    const parent = applicationDoc(WORKSPACE_A, { status: "pending_approval" });
+    const doc = _documents.insert({
+      applicationId: parent._id,
+      docCode: "DOC-01",
+      deletedAt: null,
+      s3Key: "visa-applications/ws/app/passport-scan.jpg",
+      originalFilename: "passport-scan.jpg",
+      mimeType: "image/jpeg",
+    });
+
+    const res = await request(app).get(`/documents/${doc._id}/url`);
+
+    // 404, not 403 — a 403 would confirm the document exists and that its
+    // parent is being withheld, which is the fact the gate is keeping.
+    expect(res.status).toBe(404);
+    expect(res.body.url).toBeUndefined();
+    expect(presignGetObjectMock).not.toHaveBeenCalled();
+  });
+
+  it("PARENT: refuses an orphaned document whose application no longer exists, and mints no URL", async () => {
+    const app = makeApp();
+    const doc = _documents.insert({
+      applicationId: new mongoose.Types.ObjectId(), // no such application
+      docCode: "DOC-03",
+      deletedAt: null,
+      s3Key: "visa-applications/ws/app/orphan.pdf",
+      originalFilename: "orphan.pdf",
+      mimeType: "application/pdf",
+    });
+
+    const res = await request(app).get(`/documents/${doc._id}/url`);
+
+    expect(res.status).toBe(404);
+    expect(res.body.url).toBeUndefined();
+    expect(presignGetObjectMock).not.toHaveBeenCalled();
+  });
+
+  it("PARENT: a draft application still signs — only pending_approval is withheld, draft visibility is unchanged", async () => {
+    const app = makeApp();
+    const parent = applicationDoc(WORKSPACE_A, { status: "draft" });
+    const doc = _documents.insert({
+      applicationId: parent._id,
+      docCode: "DOC-03",
+      deletedAt: null,
+      s3Key: "visa-applications/ws/app/draft-upload.pdf",
+      originalFilename: "draft-upload.pdf",
+      mimeType: "application/pdf",
+    });
+
+    const res = await request(app).get(`/documents/${doc._id}/url`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe("https://example.com/presigned-url");
+  });
+
+  it("PARENT: an erased traveller's document still signs — reads stay open for audit, it is the WRITES that 409", async () => {
+    const app = makeApp();
+    const parent = applicationDoc(WORKSPACE_A, { status: "lodged", travellerErasedAt: new Date() });
+    const doc = _documents.insert({
+      applicationId: parent._id,
+      docCode: "DOC-03",
+      deletedAt: null,
+      s3Key: "visa-applications/ws/app/erased.pdf",
+      originalFilename: "erased.pdf",
+      mimeType: "application/pdf",
+    });
+
+    const res = await request(app).get(`/documents/${doc._id}/url`);
+
+    expect(res.status).toBe(200);
+    expect(presignGetObjectMock).toHaveBeenCalledTimes(1);
   });
 });
 
