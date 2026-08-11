@@ -41,6 +41,7 @@ const {
   presignGetObjectMock,
   syncVisaApplicationBillingMock,
   createVisaWorkStartBookingMock,
+  syncVisaHoldingMock,
 } = vi.hoisted(() => {
   function matchValue(val: any, cond: any): boolean {
     if (cond && typeof cond === "object" && !(cond instanceof Date) && cond.constructor?.name !== "ObjectId") {
@@ -167,6 +168,13 @@ const {
     // route's own state machine, not work-start billing (that's services/
     // visaBillingSync.test.ts's job again).
     createVisaWorkStartBookingMock: vi.fn().mockResolvedValue({ action: "created", manualBookingId: "stub-work-start-booking-id" }),
+    // Slice 3 (2026-08-11) — same reasoning a third time. This file tests
+    // that the outcome route CALLS the wallet sync on the right outcomes;
+    // what the sync then writes is routes/workspace.travellers.visaWallet
+    // .test.ts's job, against a real database. Stubbed so the route's real
+    // call never reaches the unmocked VisaHolding/VisaRule models (which,
+    // with no connection, hang rather than fail).
+    syncVisaHoldingMock: vi.fn().mockResolvedValue({ action: "created", holdingId: "stub-holding-id" }),
   };
 });
 
@@ -334,6 +342,10 @@ vi.mock("../services/visaBillingSync.js", () => ({
   createVisaWorkStartBooking: (...args: any[]) => createVisaWorkStartBookingMock(...args),
 }));
 
+vi.mock("../services/visaHolding.service.js", () => ({
+  syncVisaHoldingFromApplication: (...args: any[]) => syncVisaHoldingMock(...args),
+}));
+
 vi.mock("../middleware/auth.js", () => ({
   requireAuth: (_req: any, _res: any, next: any) => next(),
   default: (_req: any, _res: any, next: any) => next(),
@@ -458,6 +470,8 @@ beforeEach(() => {
   syncVisaApplicationBillingMock.mockResolvedValue({ action: "created", manualBookingId: "stub-booking-id" });
   createVisaWorkStartBookingMock.mockClear();
   createVisaWorkStartBookingMock.mockResolvedValue({ action: "created", manualBookingId: "stub-work-start-booking-id" });
+  syncVisaHoldingMock.mockClear();
+  syncVisaHoldingMock.mockResolvedValue({ action: "created", holdingId: "stub-holding-id" });
   seq = 0;
   setAccess("FULL");
 });
@@ -1314,6 +1328,75 @@ describe("PATCH /applications/:id/outcome", () => {
     expect(createVisaDocumentUploadMock).toHaveBeenCalledTimes(1);
     expect(createVisaDocumentUploadMock.mock.calls[0][0]).toMatchObject({ docCode: "DOC-10" });
     expect(res.body.document).toBeTruthy();
+  });
+
+  /* ── THE VISA-WALLET TRIGGER (slice 3, 2026-08-11) ──────────────────
+   * "Issued" is outcome === "APPROVED" — the only approving value in
+   * VISA_APPLICATION_OUTCOMES — and THIS route is the only writer of
+   * `outcome` in the codebase, which is why the hand-off lives here.
+   * These assert the trigger fires where it should and, more importantly,
+   * that it cannot fire where it shouldn't: a REJECTED or WITHDRAWN
+   * application must never mint a visa somebody holds. */
+  it("hands an APPROVED outcome to the visa wallet, with the saved application", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "lodged" });
+
+    const res = await request(app)
+      .patch(`/applications/${a._id}/outcome`)
+      .send({ outcome: "APPROVED", visaNumber: "V777", visaIssuedAt: "2026-01-01", visaExpiresAt: "2027-01-01" });
+
+    expect(res.status).toBe(200);
+    expect(syncVisaHoldingMock).toHaveBeenCalledTimes(1);
+    // The application it receives is the one already carrying the outcome
+    // and its visa fields — the sync never has to re-read or infer them.
+    expect(syncVisaHoldingMock.mock.calls[0][0]).toMatchObject({
+      outcome: "APPROVED",
+      visaNumber: "V777",
+    });
+    expect(res.body.wallet).toMatchObject({ action: "created" });
+  });
+
+  it("still calls the wallet for REJECTED/WITHDRAWN — and the service is what refuses to mint a visa", async () => {
+    // The route deliberately does not branch on the outcome value: one
+    // place decides what "issued" means, and it is the service (which
+    // returns not_issued and writes nothing). A branch here would be a
+    // second copy of that rule, free to drift.
+    syncVisaHoldingMock.mockResolvedValue({ action: "not_issued", holdingId: null });
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "lodged" });
+
+    const res = await request(app).patch(`/applications/${a._id}/outcome`).send({ outcome: "REJECTED" });
+
+    expect(res.status).toBe(200);
+    expect(syncVisaHoldingMock.mock.calls[0][0]).toMatchObject({ outcome: "REJECTED" });
+    expect(res.body.wallet).toMatchObject({ action: "not_issued", holdingId: null });
+  });
+
+  it("records the outcome even if the wallet sync throws", async () => {
+    // Best-effort, exactly like the billing sync beside it: the decision is
+    // already saved, and a wallet failure must not fail the response or
+    // leave the outcome half-recorded.
+    syncVisaHoldingMock.mockRejectedValueOnce(new Error("wallet is down"));
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "lodged" });
+
+    const res = await request(app)
+      .patch(`/applications/${a._id}/outcome`)
+      .send({ outcome: "APPROVED", visaNumber: "V888", visaIssuedAt: "2026-01-01", visaExpiresAt: "2027-01-01" });
+
+    expect(res.status).toBe(200);
+    expect(_applications.get(a._id).outcome).toBe("APPROVED");
+    expect(res.body.wallet).toMatchObject({ action: "error" });
+  });
+
+  it("never reaches the wallet for an erased traveller", async () => {
+    const app = makeApp();
+    const a = applicationDoc(WORKSPACE_A, { status: "lodged", travellerErasedAt: new Date() });
+    await request(app)
+      .patch(`/applications/${a._id}/outcome`)
+      .send({ outcome: "APPROVED", visaNumber: "V1", visaIssuedAt: "2026-01-01", visaExpiresAt: "2027-01-01" });
+
+    expect(syncVisaHoldingMock).not.toHaveBeenCalled();
   });
 
   it("rejects recording an outcome once travellerErasedAt is set, and touches nothing", async () => {

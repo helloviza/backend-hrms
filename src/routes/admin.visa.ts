@@ -58,6 +58,13 @@ import {
   createVisaWorkStartBooking,
   type VisaBillingSyncResult,
 } from "../services/visaBillingSync.js";
+// Dossier Tab 3 (2026-08-11) — an APPROVED outcome is the ONE event in this
+// codebase that proves a traveller holds a visa, so it is where the wallet's
+// AUTO half is written from. See the call site below and the service header.
+import {
+  syncVisaHoldingFromApplication,
+  type VisaHoldingSyncResult,
+} from "../services/visaHolding.service.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import VisaActivityLog, { logVisaActivity, type VisaActivityEventType } from "../models/VisaActivityLog.js";
@@ -1325,6 +1332,43 @@ router.patch(
 
       await recomputeRequestStatus(application.requestId);
 
+      /* ── VISA WALLET HANDOFF (2026-08-11, dossier Tab 3) ──────────────
+       *
+       * THE trigger for the wallet's AUTO half, and it fires HERE because
+       * this is the only place in the codebase where `outcome` is written.
+       * "Issued" means outcome === "APPROVED" — the single approving value
+       * in VISA_APPLICATION_OUTCOMES (the other two are REJECTED and
+       * WITHDRAWN); there is no separate ISSUED/GRANTED state to watch for.
+       *
+       * Everything the holding needs is already guaranteed by the branch
+       * above: an APPROVED outcome 400s without visaNumber, visaIssuedAt
+       * and visaExpiresAt, and entryType comes off the immutable
+       * ruleSnapshot. So the sync never has to invent a field.
+       *
+       * The service ignores any non-APPROVED outcome, so a later REJECTED
+       * or WITHDRAWN can never mint a visa, and it upserts on
+       * sourceApplicationId, so re-recording a corrected visa number
+       * updates the same holding instead of adding a second one.
+       *
+       * BEST-EFFORT, exactly like the billing sync below it: the decision
+       * is already saved, and a wallet write failing must not fail the
+       * response or leave the outcome half-recorded. Reported in the
+       * response so the console can see it without grepping logs.
+       */
+      let wallet: VisaHoldingSyncResult | { action: "error"; error: string } = {
+        action: "not_issued",
+        holdingId: null,
+      };
+      try {
+        wallet = await syncVisaHoldingFromApplication(application, actorId(req));
+      } catch (walletErr: any) {
+        adminVisaLogger.error("visa holding sync failed", {
+          applicationId: String(application._id),
+          error: walletErr?.message,
+        });
+        wallet = { action: "error", error: walletErr?.message || "Visa wallet sync failed" };
+      }
+
       // Phase 8 billing handoff — best-effort side effect. The outcome
       // itself is already recorded and saved above; a billing-sync failure
       // (a transient DB error, an unresolvable workspace) must not fail
@@ -1369,6 +1413,7 @@ router.patch(
         application: mapAdminApplicationSummary(application.toObject()),
         document: attachedDocument,
         billing,
+        wallet,
       });
     } catch (err: any) {
       console.error("[admin visa application outcome PATCH]", err?.message);

@@ -43,6 +43,24 @@ import {
 } from "../utils/passportCrossCheck.js";
 import VisaApplication from "../models/VisaApplication.js";
 import VisaDocument from "../models/VisaDocument.js";
+// Dossier Tab 3 — the Digital Visa Wallet, and Tab 5 — the Travel History
+// Log (2026-08-11). Both are their OWN workspace-scoped collections rather
+// than sub-documents on TravellerProfile; see each model's header for why.
+// The summary/derivation helpers live in the service so the wallet tab, the
+// dossier header and any later dashboard all read one set of counts.
+import VisaHolding from "../models/VisaHolding.js";
+import TravellerTrip, {
+  TRIP_PURPOSES,
+  TRIP_DATE_PRECISIONS,
+  deriveTripDurationDays,
+} from "../models/TravellerTrip.js";
+import {
+  resolveVisaWallet,
+  resolveSchengenBlock,
+  mapVisaHoldingRow,
+} from "../services/visaHolding.service.js";
+import { VISA_ENTRY_TYPES } from "../models/VisaRule.js";
+import { normaliseToIso2, getCountryByIso2, COUNTRY_CODES } from "../utils/countryCodes.js";
 import CustomerMember from "../models/CustomerMember.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Department from "../models/Department.js";
@@ -1147,17 +1165,14 @@ async function resolvePassportVault(traveller: any, workspaceId: any) {
 }
 
 /**
- * The header facts that are NOT derivable, stated as explicit nulls rather
- * than omitted — so the client renders an honest empty instead of guessing,
- * and so the reason travels with the data.
+ * The header facts.
  *
- * Every one of these is a real claim about a person, and inventing any of
- * them is worse than leaving the slot blank:
+ * THREE of the four are still NOT derivable, and are stated as explicit
+ * nulls rather than omitted — so the client renders an honest empty instead
+ * of guessing, and so the reason travels with the data. Each is a real
+ * claim about a person, and inventing any of them is worse than leaving the
+ * slot blank:
  *
- *   - activeVisas — needs the VisaHolding model (Tab 3, not built). Counting
- *     visa APPLICATIONS here would be wrong: an application is not a visa,
- *     and per the audit none has ever reached an issued outcome. `null`
- *     means "we don't know", which is different from 0 ("holds no visa").
  *   - hrStatusVerified — no HR-verification event exists for a traveller
  *     profile anywhere. The client shows the real linkage state instead of
  *     a "Verified" badge over nothing.
@@ -1168,11 +1183,36 @@ async function resolvePassportVault(traveller: any, workspaceId: any) {
  *     alone does exist (CstepForexAdvance) but is claim-scoped and
  *     CSTEP-only, so it is not shown here as though it were total travel
  *     spend. A bar needs a denominator; there isn't one.
+ *
+ * activeVisas IS derivable now (2026-08-11, Tab 3): it reads real
+ * VisaHolding rows through summariseVisaWallet, which keeps the ONE
+ * distinction this figure turns on — no rows at all still yields `null`
+ * ("we don't know what this person holds"), never 0, which would assert
+ * they hold no visa. Zero ACTIVE out of two RECORDED is a different, real
+ * answer and does render as 0. Both come from the same summary the wallet
+ * tab renders, so the header and the tab cannot disagree.
  */
-function dossierHeaderUnavailable() {
+async function resolveDossierHeader(traveller: any, workspaceId: any) {
+  let activeVisas: number | null = null;
+  let activeVisasReason: string | null = "No visas recorded yet";
+  try {
+    const { summary } = await resolveVisaWallet(traveller?._id, workspaceId);
+    activeVisas = summary.activeVisas;
+    activeVisasReason = summary.activeVisasReason;
+  } catch (err: any) {
+    // A failed lookup must not 500 the profile fetch, and must not fall
+    // through to 0 — which would assert "holds no visa" on the strength of
+    // a database error. Left null with the honest reason.
+    logger.warn("[workspace.travellers] visa holding count failed", {
+      travellerId: String(traveller?._id ?? ""),
+      error: err?.message,
+    });
+    activeVisasReason = "Couldn't read the visa wallet just now";
+  }
+
   return {
-    activeVisas: null as number | null,
-    activeVisasReason: "Visa holdings are not recorded yet",
+    activeVisas,
+    activeVisasReason,
     hrStatusVerified: false,
     consularReady: null as boolean | null,
     forexLimitInr: null as number | null,
@@ -1409,7 +1449,7 @@ router.get("/me", async (req: any, res: any) => {
       reportingManagerName: await describeReportingManager(traveller, workspaceId),
       designation: await describeDesignation(traveller, workspaceId),
       dossierHealth: computeDossierHealth(traveller),
-      header: dossierHeaderUnavailable(),
+      header: await resolveDossierHeader(traveller, workspaceId),
       capabilities,
       identityCapture: identityCaptureState(),
       passportVault: await resolvePassportVault(traveller, workspaceId),
@@ -2084,7 +2124,7 @@ router.get("/:id", async (req: any, res: any) => {
       reportingManagerName: await describeReportingManager(traveller, workspaceId),
       designation: await describeDesignation(traveller, workspaceId),
       dossierHealth: computeDossierHealth(traveller),
-      header: dossierHeaderUnavailable(),
+      header: await resolveDossierHeader(traveller, workspaceId),
       identityCapture: identityCaptureState(),
       // Tab 2. Same payload on both detail surfaces (this and GET /me) —
       // the admin dossier and the employee's own profile are one record and
@@ -2526,11 +2566,22 @@ function travellerDocUploadMw(req: any, res: any, next: any) {
 }
 
 /**
- * The gate every document route runs: load the profile in this workspace,
+ * The gate every PROFILE SUB-RESOURCE route runs — documents (Tab 2), visa
+ * holdings (Tab 3) and trips (Tab 5): load the profile in this workspace,
  * then apply the edit-level write check. Returns null having already sent
  * the response when the caller may not proceed.
+ *
+ * EDIT-LEVEL FOR READS TOO, and that is deliberate for all three. Any
+ * active member may read another traveller's FIELDS unmasked — booking a
+ * colleague's saved traveller needs their real passport number — but a
+ * passport SCAN, a list of the visas somebody holds and a log of where they
+ * have been are different objects: no booking flow needs any of them, and
+ * each is exactly the kind of dossier a colleague has no business browsing.
+ * So the same access ensureTravellerWriteAccess(…, "edit") grants (the
+ * subject themselves, or WORKSPACE_LEADER/APPROVER) is what opens them.
+ * The divergence from the field-read rule is the point, not an oversight.
  */
-async function requireTravellerDocumentAccess(
+async function requireTravellerSubResourceAccess(
   req: any,
   res: any,
 ): Promise<{ traveller: any; uid: string } | null> {
@@ -2574,7 +2625,7 @@ function mapTravellerDocument(d: any) {
 
 router.get("/:id/documents", async (req: any, res: any) => {
   try {
-    const ctx = await requireTravellerDocumentAccess(req, res);
+    const ctx = await requireTravellerSubResourceAccess(req, res);
     if (!ctx) return;
 
     const docs = await TravellerDocument.find({
@@ -2615,7 +2666,7 @@ router.get("/:id/documents", async (req: any, res: any) => {
 
 router.post("/:id/documents", travellerDocUploadMw, async (req: any, res: any) => {
   try {
-    const ctx = await requireTravellerDocumentAccess(req, res);
+    const ctx = await requireTravellerSubResourceAccess(req, res);
     if (!ctx) return;
 
     const file = req.file;
@@ -2700,7 +2751,7 @@ router.post("/:id/documents", travellerDocUploadMw, async (req: any, res: any) =
 
 router.get("/:id/documents/:documentId/url", async (req: any, res: any) => {
   try {
-    const ctx = await requireTravellerDocumentAccess(req, res);
+    const ctx = await requireTravellerSubResourceAccess(req, res);
     if (!ctx) return;
 
     // travellerProfileId is IN the filter, not checked afterwards: a
@@ -2733,7 +2784,7 @@ router.get("/:id/documents/:documentId/url", async (req: any, res: any) => {
 
 router.delete("/:id/documents/:documentId", async (req: any, res: any) => {
   try {
-    const ctx = await requireTravellerDocumentAccess(req, res);
+    const ctx = await requireTravellerSubResourceAccess(req, res);
     if (!ctx) return;
 
     const doc: any = await TravellerDocument.findOne({
@@ -2756,6 +2807,521 @@ router.delete("/:id/documents/:documentId", async (req: any, res: any) => {
     res.json({ ok: true });
   } catch (err: any) {
     console.error("[workspace.travellers DELETE document]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * TAB 3 — DIGITAL VISA WALLET (2026-08-11)
+ *
+ * Real VisaHolding rows, and NOTHING derived from their absence. The rules
+ * this block enforces, each from infra/design/traveller-profile-tabs-
+ * 2026-08-11.md:
+ *
+ *   §7.3  Every number comes from rows. An empty wallet renders "no visas
+ *         recorded yet" — never 0, which asserts the person holds no visa,
+ *         and never a count of visa APPLICATIONS, which are not visas.
+ *   §7.4  NO Schengen day counter. The Schengen block lists Schengen
+ *         holdings and says why no allowance can be calculated; the payload
+ *         contains no ingredient a client could build a number from.
+ *   §8    AUTO rows (from an APPROVED application) are read-only; MANUAL
+ *         rows — the only way a pre-platform visa ever gets recorded — are
+ *         editable by whoever may edit the profile.
+ *
+ * The AUTO half is written by services/visaHolding.service.ts, called from
+ * routes/admin.visa.ts's PATCH /applications/:id/outcome. Nothing in this
+ * file creates one, which is why every write route below stamps
+ * source: "MANUAL" itself rather than accepting it from the body.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Country in, {iso2, name} out — or an error naming the field.
+ *
+ * Shared by holdings and trips because both key off ISO2 and both must
+ * refuse an unresolvable country rather than storing free text: a row
+ * nobody can place is invisible to the "N countries" count, the Schengen
+ * grouping and every future cross-traveller query, which makes it worse
+ * than a rejected save the person can correct.
+ */
+function resolveCountryInput(raw: any): { iso2: string; name: string } | { error: string } {
+  const input = normStr(raw);
+  if (!input) return { error: "country is required" };
+  const iso2 = normaliseToIso2(input);
+  if (!iso2) return { error: `We don't recognise "${input}" as a country` };
+  const entry = getCountryByIso2(iso2);
+  return { iso2, name: entry?.name || iso2 };
+}
+
+/**
+ * The country list the client's picker renders — THIS server's own table,
+ * not the frontend's 251-entry ISO list.
+ *
+ * Sent rather than left to the client for the same reason editableFields
+ * and uploadableKinds are: a picker offering a country resolveCountryInput
+ * would then refuse is a form that fails on save for no reason the user can
+ * see. utils/countryCodes.ts covers the visa catalogue plus its expansion
+ * targets (~120 states across every region), so a genuinely missing one is
+ * a gap in that table to fix at the source — the honest failure — rather
+ * than a free-text country nothing downstream can place.
+ */
+function countryVocabulary(): { iso2: string; name: string }[] {
+  return COUNTRY_CODES.map((c) => ({ iso2: c.iso2, name: c.name })).sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
+}
+
+/** "YYYY-MM-DD" or nothing. Never a partially-parsed Date. */
+function optionalIsoDate(raw: any, label: string): { value?: string } | { error: string } {
+  const v = normStr(raw);
+  if (!v) return { value: undefined };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return { error: `${label} must be a date (YYYY-MM-DD)` };
+  return { value: v };
+}
+
+/* ── GET /:id/visa-holdings — the wallet ─────────────────────────────── */
+
+router.get("/:id/visa-holdings", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerSubResourceAccess(req, res);
+    if (!ctx) return;
+
+    const { rows, summary } = await resolveVisaWallet(ctx.traveller._id, req.workspaceObjectId);
+
+    res.json({
+      ok: true,
+      holdings: rows,
+      summary,
+      schengen: resolveSchengenBlock(rows),
+      capabilities: {
+        // Reaching this route at all means edit access (see the gate), so
+        // this is `true` for every caller who gets a 200. Sent anyway so the
+        // client reads a capability rather than inferring one from the
+        // absence of a 403, which is what a read-only variant of this
+        // surface would have to change.
+        canEdit: true,
+        // Declared, not capturable — see VisaHolding.stampDocId's own note
+        // on why the TravellerDocument uniqueness index can't hold one stamp
+        // per holding yet. The UI says so instead of offering an upload that
+        // has nowhere correct to land.
+        canAttachStamp: false,
+        stampReason: "Stamped copies aren't stored against individual visas yet.",
+      },
+      vocabularies: { entryTypes: VISA_ENTRY_TYPES, countries: countryVocabulary() },
+    });
+  } catch (err: any) {
+    console.error("[workspace.travellers GET visa-holdings]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Validate a manual holding body. Shared by POST and PUT so the two can
+ * never accept different things — the edit form and the add form are the
+ * same fields.
+ */
+function readHoldingBody(body: any): { fields: Record<string, any> } | { error: string } {
+  const country = resolveCountryInput(body?.country ?? body?.countryIso2);
+  if ("error" in country) return { error: country.error };
+
+  const issue = optionalIsoDate(body?.issueDate, "Issue date");
+  if ("error" in issue) return { error: issue.error };
+  const expiry = optionalIsoDate(body?.expiryDate, "Expiry date");
+  if ("error" in expiry) return { error: expiry.error };
+  if (issue.value && expiry.value && expiry.value < issue.value) {
+    return { error: "Expiry date must be on or after the issue date" };
+  }
+
+  const entryTypeRaw = normStr(body?.entryType).toUpperCase();
+  if (entryTypeRaw && !VISA_ENTRY_TYPES.includes(entryTypeRaw as any)) {
+    return { error: `entryType must be one of ${VISA_ENTRY_TYPES.join(", ")}` };
+  }
+
+  return {
+    fields: {
+      countryIso2: country.iso2,
+      countryName: country.name,
+      visaType: normStr(body?.visaType) || undefined,
+      visaNumber: normStr(body?.visaNumber) || undefined,
+      entryType: entryTypeRaw || undefined,
+      issueDate: issue.value,
+      expiryDate: expiry.value,
+    },
+  };
+}
+
+/* ── POST /:id/visa-holdings — "Add Visa Record" (manual only) ───────── */
+
+router.post("/:id/visa-holdings", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerSubResourceAccess(req, res);
+    if (!ctx) return;
+
+    const parsed = readHoldingBody(req.body || {});
+    if ("error" in parsed) return res.status(400).json({ error: parsed.error });
+
+    const holding = await VisaHolding.create({
+      workspaceId: req.workspaceObjectId,
+      travellerProfileId: ctx.traveller._id,
+      ...parsed.fields,
+      // Stamped here, never taken from the body. "AUTO" means "a real
+      // application issued this", and a client must not be able to claim it.
+      source: "MANUAL",
+      sourceApplicationId: null,
+      createdBy: ctx.uid,
+      updatedBy: ctx.uid,
+    });
+
+    // Recording a visa is an edit of the dossier — the person reading "last
+    // edited" cares that their record changed, not which collection it
+    // landed in. Same treatment document uploads already get.
+    ctx.traveller.updatedBy = ctx.uid;
+    await ctx.traveller.save();
+
+    res.status(201).json({ ok: true, holding: mapVisaHoldingRow(holding.toObject()) });
+  } catch (err: any) {
+    console.error("[workspace.travellers POST visa-holdings]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * The one thing that separates the two kinds of row. An AUTO holding
+ * restates a decision recorded against a real VisaApplication; editing or
+ * deleting it here would leave the wallet and the case saying different
+ * things about the same visa, with nothing recording the divergence. The
+ * refusal names the application so the person knows where the real edit
+ * lives.
+ */
+const AUTO_HOLDING_READONLY_MESSAGE =
+  "This visa came from a visa application processed here, so it's read-only. Ask your concierge to correct the application if a detail is wrong.";
+
+async function loadEditableHolding(req: any, res: any, ctx: { traveller: any }) {
+  const holding: any = await VisaHolding.findOne({
+    _id: req.params.holdingId,
+    workspaceId: req.workspaceObjectId,
+    // travellerProfileId is IN the filter, not checked after — a holdingId
+    // belonging to another profile resolves to nothing rather than to
+    // somebody else's visa.
+    travellerProfileId: ctx.traveller._id,
+    deletedAt: null,
+  });
+  if (!holding) {
+    res.status(404).json({ error: "Visa record not found" });
+    return null;
+  }
+  if (holding.source !== "MANUAL") {
+    res.status(409).json({ error: AUTO_HOLDING_READONLY_MESSAGE });
+    return null;
+  }
+  return holding;
+}
+
+/* ── PUT /:id/visa-holdings/:holdingId — manual rows only ───────────── */
+
+router.put("/:id/visa-holdings/:holdingId", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerSubResourceAccess(req, res);
+    if (!ctx) return;
+    if (!mongoose.isValidObjectId(req.params.holdingId)) {
+      return res.status(404).json({ error: "Visa record not found" });
+    }
+
+    const holding = await loadEditableHolding(req, res, ctx);
+    if (!holding) return;
+
+    const parsed = readHoldingBody(req.body || {});
+    if ("error" in parsed) return res.status(400).json({ error: parsed.error });
+
+    // Assigned wholesale rather than key-by-key: unlike PUT /:id (where an
+    // absent key means "leave alone" because presets send partial bodies),
+    // this form always renders every field, so an absent one means the user
+    // cleared it.
+    Object.assign(holding, parsed.fields);
+    for (const key of ["visaType", "visaNumber", "entryType", "issueDate", "expiryDate"]) {
+      if (parsed.fields[key] === undefined) holding.set(key, undefined);
+    }
+    holding.updatedBy = ctx.uid;
+    await holding.save();
+
+    ctx.traveller.updatedBy = ctx.uid;
+    await ctx.traveller.save();
+
+    res.json({ ok: true, holding: mapVisaHoldingRow(holding.toObject()) });
+  } catch (err: any) {
+    console.error("[workspace.travellers PUT visa-holding]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── DELETE /:id/visa-holdings/:holdingId — soft, manual rows only ──── */
+
+router.delete("/:id/visa-holdings/:holdingId", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerSubResourceAccess(req, res);
+    if (!ctx) return;
+    if (!mongoose.isValidObjectId(req.params.holdingId)) {
+      return res.status(404).json({ error: "Visa record not found" });
+    }
+
+    const holding = await loadEditableHolding(req, res, ctx);
+    if (!holding) return;
+
+    // Soft delete only, both fields together — a removed holding is a claim
+    // somebody withdrew about a real travel document, and losing the row
+    // silently rewrites the wallet's history.
+    holding.deletedAt = new Date();
+    holding.deletedBy = ctx.uid as any;
+    await holding.save();
+
+    ctx.traveller.updatedBy = ctx.uid;
+    await ctx.traveller.save();
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[workspace.travellers DELETE visa-holding]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * TAB 5 — TRAVEL HISTORY LOG (2026-08-11)
+ *
+ * MANUAL ENTRY ONLY, and there is deliberately no import, no "suggest from
+ * your bookings" and no name-matching anywhere in this block. §6 of the
+ * design established that no persisted booking↔traveller link exists, and
+ * that matching bookings to travellers by NAME would put somebody else's
+ * trip into a record a consulate reads as this person's own statement.
+ *
+ * The count this exposes is "trips recorded", never "trips" — nothing in
+ * this system observes travel, so the list is never complete and the
+ * wording must not imply it is.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+function mapTripRow(t: any) {
+  return {
+    _id: String(t._id),
+    countryIso2: t.countryIso2,
+    countryName: t.countryName,
+    purpose: t.purpose,
+    datePrecision: t.datePrecision,
+    startDate: t.startDate ?? null,
+    endDate: t.endDate ?? null,
+    tripMonth: t.tripMonth ?? null,
+    // null is a real answer — "duration not recorded" — for every
+    // month-precision trip and any exact one missing an end date. Never 0,
+    // and never a guess from a month.
+    durationDays: deriveTripDurationDays(t),
+    visaType: t.visaType ?? null,
+    notes: t.notes ?? null,
+    createdAt: t.createdAt ?? null,
+    updatedAt: t.updatedAt ?? null,
+  };
+}
+
+/** Validate a trip body. Shared by POST and PUT, same reason as holdings. */
+function readTripBody(body: any): { fields: Record<string, any> } | { error: string } {
+  const country = resolveCountryInput(body?.country ?? body?.countryIso2);
+  if ("error" in country) return { error: country.error };
+
+  const purpose = normStr(body?.purpose).toUpperCase();
+  if (!TRIP_PURPOSES.includes(purpose as any)) {
+    return { error: `purpose must be one of ${TRIP_PURPOSES.join(", ")}` };
+  }
+
+  const precision = normStr(body?.datePrecision).toUpperCase() || "EXACT";
+  if (!TRIP_DATE_PRECISIONS.includes(precision as any)) {
+    return { error: `datePrecision must be one of ${TRIP_DATE_PRECISIONS.join(", ")}` };
+  }
+
+  if (precision === "MONTH") {
+    const month = normStr(body?.tripMonth);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return { error: "tripMonth must be a month (YYYY-MM)" };
+    }
+    // The exact-date fields are CLEARED, not carried over: a trip recorded
+    // as "March 2019" must not keep day-precision dates from a previous
+    // edit that the surface would then stop showing but the data would
+    // still assert.
+    return {
+      fields: {
+        countryIso2: country.iso2,
+        countryName: country.name,
+        purpose,
+        datePrecision: "MONTH",
+        tripMonth: month,
+        startDate: undefined,
+        endDate: undefined,
+        visaType: normStr(body?.visaType) || undefined,
+        notes: normStr(body?.notes) || undefined,
+      },
+    };
+  }
+
+  const start = optionalIsoDate(body?.startDate, "Start date");
+  if ("error" in start) return { error: start.error };
+  const end = optionalIsoDate(body?.endDate, "End date");
+  if ("error" in end) return { error: end.error };
+  if (!start.value) return { error: "Start date is required for an exact-date trip" };
+  if (end.value && end.value < start.value) {
+    return { error: "End date must be on or after the start date" };
+  }
+
+  return {
+    fields: {
+      countryIso2: country.iso2,
+      countryName: country.name,
+      purpose,
+      datePrecision: "EXACT",
+      startDate: start.value,
+      endDate: end.value,
+      tripMonth: undefined,
+      visaType: normStr(body?.visaType) || undefined,
+      notes: normStr(body?.notes) || undefined,
+    },
+  };
+}
+
+/* ── GET /:id/trips ─────────────────────────────────────────────────── */
+
+router.get("/:id/trips", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerSubResourceAccess(req, res);
+    if (!ctx) return;
+
+    const docs: any[] = await TravellerTrip.find({
+      workspaceId: req.workspaceObjectId,
+      travellerProfileId: ctx.traveller._id,
+      deletedAt: null,
+    })
+      // Most recent trip first. Both precisions sort correctly against each
+      // other because "2019-03" sorts among "2019-03-xx" — close enough for
+      // a reading order, and no date is fabricated to achieve it.
+      .sort({ startDate: -1, tripMonth: -1, createdAt: -1 })
+      .lean();
+
+    const trips = docs.map(mapTripRow);
+
+    res.json({
+      ok: true,
+      trips,
+      summary: {
+        // "recorded", not "total". Every surface renders it as "N trips
+        // recorded" so the number is never read as a complete history.
+        recorded: trips.length,
+        countries: new Set(trips.map((t) => t.countryIso2)).size,
+      },
+      capabilities: { canEdit: true },
+      vocabularies: {
+        purposes: TRIP_PURPOSES,
+        datePrecisions: TRIP_DATE_PRECISIONS,
+        countries: countryVocabulary(),
+      },
+    });
+  } catch (err: any) {
+    console.error("[workspace.travellers GET trips]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── POST /:id/trips ────────────────────────────────────────────────── */
+
+router.post("/:id/trips", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerSubResourceAccess(req, res);
+    if (!ctx) return;
+
+    const parsed = readTripBody(req.body || {});
+    if ("error" in parsed) return res.status(400).json({ error: parsed.error });
+
+    const trip = await TravellerTrip.create({
+      workspaceId: req.workspaceObjectId,
+      travellerProfileId: ctx.traveller._id,
+      ...parsed.fields,
+      createdBy: ctx.uid,
+      updatedBy: ctx.uid,
+    });
+
+    ctx.traveller.updatedBy = ctx.uid;
+    await ctx.traveller.save();
+
+    res.status(201).json({ ok: true, trip: mapTripRow(trip.toObject()) });
+  } catch (err: any) {
+    console.error("[workspace.travellers POST trips]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function loadTrip(req: any, res: any, ctx: { traveller: any }) {
+  if (!mongoose.isValidObjectId(req.params.tripId)) {
+    res.status(404).json({ error: "Trip not found" });
+    return null;
+  }
+  const trip: any = await TravellerTrip.findOne({
+    _id: req.params.tripId,
+    workspaceId: req.workspaceObjectId,
+    travellerProfileId: ctx.traveller._id,
+    deletedAt: null,
+  });
+  if (!trip) {
+    res.status(404).json({ error: "Trip not found" });
+    return null;
+  }
+  return trip;
+}
+
+/* ── PUT /:id/trips/:tripId ─────────────────────────────────────────── */
+
+router.put("/:id/trips/:tripId", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerSubResourceAccess(req, res);
+    if (!ctx) return;
+
+    const trip = await loadTrip(req, res, ctx);
+    if (!trip) return;
+
+    const parsed = readTripBody(req.body || {});
+    if ("error" in parsed) return res.status(400).json({ error: parsed.error });
+
+    Object.assign(trip, parsed.fields);
+    // Same wholesale-replace contract as a holding edit — and here it also
+    // carries the precision switch: readTripBody sets the fields of the
+    // OTHER precision to undefined, and this is what actually unsets them.
+    for (const key of ["startDate", "endDate", "tripMonth", "visaType", "notes"]) {
+      if (parsed.fields[key] === undefined) trip.set(key, undefined);
+    }
+    trip.updatedBy = ctx.uid;
+    await trip.save();
+
+    ctx.traveller.updatedBy = ctx.uid;
+    await ctx.traveller.save();
+
+    res.json({ ok: true, trip: mapTripRow(trip.toObject()) });
+  } catch (err: any) {
+    console.error("[workspace.travellers PUT trip]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── DELETE /:id/trips/:tripId — soft ───────────────────────────────── */
+
+router.delete("/:id/trips/:tripId", async (req: any, res: any) => {
+  try {
+    const ctx = await requireTravellerSubResourceAccess(req, res);
+    if (!ctx) return;
+
+    const trip = await loadTrip(req, res, ctx);
+    if (!trip) return;
+
+    trip.deletedAt = new Date();
+    trip.deletedBy = ctx.uid as any;
+    await trip.save();
+
+    ctx.traveller.updatedBy = ctx.uid;
+    await ctx.traveller.save();
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[workspace.travellers DELETE trip]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
