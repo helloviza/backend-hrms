@@ -1002,6 +1002,61 @@ async function resolvePassportVault(traveller: any, workspaceId: any) {
 
   const sourceCount = (hasTypedPassport ? 1 : 0) + (extractionResult ? 1 : 0);
 
+  const comparison =
+    sourceCount >= 2 && extractionResult
+      ? comparePassportSources(
+          {
+            firstName: traveller?.firstName,
+            middleName: traveller?.middleName,
+            lastName: traveller?.lastName,
+            gender: traveller?.gender,
+            dob: traveller?.dob,
+            nationality: traveller?.nationality,
+            passportNo: traveller?.passportNo,
+            passportExpiry: traveller?.passportExpiry,
+            passportIssueCountry: traveller?.passportIssueCountry,
+          },
+          extractionResult.extraction,
+        )
+      : null;
+
+  /**
+   * HOW MUCH AUTHORITY THE COMPOSED MRZ HAS EARNED (2026-08-11).
+   *
+   * The lines below are reconstructed from typed fields. Formatting them
+   * correctly is not evidence that they are correct — a mistyped passport
+   * number composes into a perfectly well-formed TD3 line with a valid
+   * check digit, because the digit is computed FROM the typo. The only
+   * thing that can lend these lines authority is agreement with a source we
+   * did not type: the MRZ read off an uploaded passport scan.
+   *
+   * So the state is a fact about CORROBORATION, never about authenticity:
+   *
+   *   UNCORROBORATED — no scan to compare against (or nothing in it was
+   *                    comparable). The default, and the honest one.
+   *   CORROBORATED   — a scan exists and every field compared agrees.
+   *   CONTRADICTED   — a scan exists and disagrees on at least one field.
+   *
+   * ZERO mismatches is the bar for CORROBORATED, deliberately not a "high
+   * percentage". A percentage threshold blesses the most dangerous case
+   * there is: an MRZ agreeing on seven fields but carrying the wrong
+   * document number would clear an 80% bar while being worse than useless.
+   * One contradicted identity field is enough to make the whole line
+   * unreliable, so any mismatch lands in CONTRADICTED.
+   *
+   * NOTE ON VOCABULARY: this object deliberately avoids the words the MRZ
+   * half is forbidden to contain (see the route test asserting no
+   * verified/checks/valid/confidence key). That ban exists to stop the
+   * payload making a SELF-verification claim — checking our own arithmetic.
+   * Corroboration is the opposite: it is sourced entirely from the scan, so
+   * it is a claim we are entitled to make. Keeping the vocabulary disjoint
+   * means that guard test still passes untouched.
+   */
+  let corroborationState: "UNCORROBORATED" | "CORROBORATED" | "CONTRADICTED" = "UNCORROBORATED";
+  if (comparison && comparison.comparedCount > 0) {
+    corroborationState = comparison.mismatchedCount > 0 ? "CONTRADICTED" : "CORROBORATED";
+  }
+
   // if/else rather than a ternary purely so the discriminated union narrows
   // cleanly on both branches.
   let mrz: Record<string, any>;
@@ -1018,6 +1073,13 @@ async function resolvePassportVault(traveller: any, workspaceId: any) {
       // server-side so both surfaces say the same thing and neither can
       // quietly upgrade it to a verification claim.
       basis: "Generated from the passport details on this profile.",
+      corroboration: {
+        state: corroborationState,
+        // Counts, so the client can say "6 of 8 fields disagree" without
+        // recomputing — and cannot invent a different fraction.
+        comparedCount: comparison?.comparedCount ?? null,
+        mismatchedCount: comparison?.mismatchedCount ?? null,
+      },
     };
   } else {
     mrz = { available: false, gaps: mrzResult.gaps };
@@ -1025,6 +1087,36 @@ async function resolvePassportVault(traveller: any, workspaceId: any) {
 
   return {
     mrz,
+
+    /**
+     * THE SCAN, AS THE SOURCE OF TRUTH (2026-08-11).
+     *
+     * When a usable extraction exists it outranks anything composed from
+     * typed fields, and the surface leads with it. What is deliberately NOT
+     * here: reconstructed TD3 lines built from these values. We never store
+     * the raw MRZ text a scan was read from — only the parsed fields below
+     * — and composing lines from them would produce a second reconstruction
+     * that LOOKS like the authentic machine-readable zone. Being closer to
+     * the truth would make it more dangerous to mistake, not less. The scan
+     * is therefore presented as the fields it actually gave us.
+     *
+     * null when no usable extraction exists, so the client has nothing to
+     * lead with and falls back to the composed MRZ alone.
+     */
+    scan: extractionResult
+      ? {
+          surname: extractionResult.extraction.surname ?? null,
+          givenNames: extractionResult.extraction.givenNames ?? null,
+          documentNumber: extractionResult.extraction.documentNumber ?? null,
+          nationality: extractionResult.extraction.nationality ?? null,
+          issuingState: extractionResult.extraction.issuingState ?? null,
+          dateOfBirth: extractionResult.extraction.dateOfBirth ?? null,
+          sex: extractionResult.extraction.sex ?? null,
+          dateOfExpiry: extractionResult.extraction.dateOfExpiry ?? null,
+          extractionStatus: extractionResult.extractionStatus,
+          extractedAt: extractionResult.extractedAt,
+        }
+      : null,
 
     mismatch: {
       // 0 / 1 / 2. The client renders NOTHING at 0, the data with no match
@@ -1036,23 +1128,7 @@ async function resolvePassportVault(traveller: any, workspaceId: any) {
       // and letting the client decide whether to show it would put the
       // honest-empty rule in the client, where the next surface would get
       // it wrong.
-      comparison:
-        sourceCount >= 2 && extractionResult
-          ? comparePassportSources(
-              {
-                firstName: traveller?.firstName,
-                middleName: traveller?.middleName,
-                lastName: traveller?.lastName,
-                gender: traveller?.gender,
-                dob: traveller?.dob,
-                nationality: traveller?.nationality,
-                passportNo: traveller?.passportNo,
-                passportExpiry: traveller?.passportExpiry,
-                passportIssueCountry: traveller?.passportIssueCountry,
-              },
-              extractionResult.extraction,
-            )
-          : null,
+      comparison,
       extractionStatus: extractionResult?.extractionStatus ?? null,
       extractionConfidence: extractionResult?.extractionConfidence ?? null,
       extractedAt: extractionResult?.extractedAt ?? null,

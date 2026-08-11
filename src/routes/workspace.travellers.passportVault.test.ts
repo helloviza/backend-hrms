@@ -518,3 +518,91 @@ describe("PUT /:id — Tab 2 field gating", () => {
     }
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * MRZ CORROBORATION — how much authority the composed lines have earned
+ *
+ * The composed MRZ is reconstructed from typed fields, so its check digits
+ * are our arithmetic over our own data and pass by construction. The only
+ * thing that can lend it authority is agreement with a source we did not
+ * type. These tests pin the three states the client styles against, and
+ * the rule that ANY mismatch is disqualifying.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+describe("GET /:id passportVault — MRZ corroboration", () => {
+  it("UNCORROBORATED when there is no scan to compare against", async () => {
+    // 1 source: a typed passport and nothing else. The lines compose fine —
+    // that is precisely the danger, and why the state must not be silent.
+    const { body } = await request(makeApp()).get(`/${TRAVELLER_ID}`);
+
+    expect(body.passportVault.mrz.available).toBe(true);
+    expect(body.passportVault.mrz.corroboration.state).toBe("UNCORROBORATED");
+    expect(body.passportVault.mrz.corroboration.comparedCount).toBeNull();
+    expect(body.passportVault.mrz.corroboration.mismatchedCount).toBeNull();
+  });
+
+  it("CORROBORATED only when a scan agrees on every field compared", async () => {
+    withExtraction();
+
+    const { body } = await request(makeApp()).get(`/${TRAVELLER_ID}`);
+    const { corroboration } = body.passportVault.mrz;
+
+    expect(corroboration.state).toBe("CORROBORATED");
+    expect(corroboration.mismatchedCount).toBe(0);
+    expect(corroboration.comparedCount).toBeGreaterThan(0);
+  });
+
+  it("CONTRADICTED on a SINGLE mismatched field, however high the percentage", async () => {
+    // 7 of 8 agree — 88%, which any "high percentage" threshold would wave
+    // through. The one that disagrees is the document number, i.e. the MRZ
+    // names the wrong passport. There is no percentage at which that is
+    // corroborated, so the bar is zero mismatches and nothing else.
+    withExtraction({
+      extractedFields: EXTRACTED_FIELDS.map((f) =>
+        f.key === "documentNumber" ? { key: "documentNumber", value: "Z999999Z9" } : f,
+      ),
+    });
+
+    const { body } = await request(makeApp()).get(`/${TRAVELLER_ID}`);
+
+    expect(body.passportVault.mismatch.comparison.matchPercent).toBe(88);
+    expect(body.passportVault.mrz.corroboration.state).toBe("CONTRADICTED");
+    expect(body.passportVault.mrz.corroboration.mismatchedCount).toBe(1);
+  });
+
+  it("still makes no SELF-verification claim in any corroboration state", async () => {
+    // The original ban (a green tick over our own arithmetic) survives this
+    // feature. Corroboration is sourced entirely from the scan, so its
+    // vocabulary is deliberately disjoint from the forbidden words rather
+    // than an exception carved out of them.
+    withExtraction();
+    const { body } = await request(makeApp()).get(`/${TRAVELLER_ID}`);
+    const serialised = JSON.stringify(body.passportVault.mrz).toLowerCase();
+
+    for (const forbidden of ["verified", "checkspassed", "checks", "checkdigit", "valid", "confidence"]) {
+      expect(serialised).not.toContain(forbidden);
+    }
+  });
+
+  it("exposes the scan as its own source-of-truth block, with NO reconstructed lines", async () => {
+    // The surface leads with the scan. It must never be handed MRZ lines to
+    // render for it: we do not store the raw text it was read from, so any
+    // lines here would be a second reconstruction wearing the scan's
+    // authority — closer to the truth and therefore easier to mistake.
+    withExtraction();
+
+    const { body } = await request(makeApp()).get(`/${TRAVELLER_ID}`);
+    const { scan } = body.passportVault;
+
+    expect(scan.documentNumber).toBe("L898902C3");
+    expect(scan.surname).toBe("ERIKSSON");
+    expect(scan.extractionStatus).toBe("COMPLETED");
+    expect(scan.line1).toBeUndefined();
+    expect(scan.line2).toBeUndefined();
+  });
+
+  it("has no scan block at all when no usable extraction exists", async () => {
+    const { body } = await request(makeApp()).get(`/${TRAVELLER_ID}`);
+    expect(body.passportVault.scan).toBeNull();
+  });
+});
