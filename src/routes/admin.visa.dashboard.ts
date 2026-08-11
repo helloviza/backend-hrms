@@ -85,7 +85,7 @@ function resolveWindow(query: any): { from: Date; to: Date } | { error: string }
  * QUEUE HEALTH — counts by status, action_required split in two.
  * ───────────────────────────────────────────────────────────────────── */
 const QUEUE_HEALTH_STATUS_ORDER = [
-  "draft", "submitted", "docs_under_review", "action_required",
+  "draft", "submitted", "docs_under_review", "discrepancy_flagged", "action_required",
   "cost_confirmed", "lodged", "decision_received", "closed",
 ] as const;
 

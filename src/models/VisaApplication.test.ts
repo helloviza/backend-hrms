@@ -13,7 +13,13 @@ vi.mock("../utils/logger.js", () => ({
   default: { child: () => ({ warn: vi.fn(), info: vi.fn(), error: vi.fn() }) },
 }));
 
-import VisaApplication, { setActionRequired, clearActionRequired, isTravellerErased } from "./VisaApplication.js";
+import VisaApplication, {
+  setActionRequired,
+  clearActionRequired,
+  setDiscrepancyFlagged,
+  clearDiscrepancyFlagged,
+  isTravellerErased,
+} from "./VisaApplication.js";
 
 function chainWithLean(value: any) {
   return { select: () => ({ lean: () => Promise.resolve(value) }) };
@@ -161,5 +167,112 @@ describe("isTravellerErased", () => {
   it("is false for a null/undefined application — never throws on a not-found lookup", () => {
     expect(isTravellerErased(null)).toBe(false);
     expect(isTravellerErased(undefined)).toBe(false);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * discrepancy_flagged (2026-08-12) — the INTERNAL-hold interrupt, and the
+ * capture slot it shares with action_required.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+describe("setDiscrepancyFlagged / clearDiscrepancyFlagged", () => {
+  const appId = new mongoose.Types.ObjectId();
+  const userId = new mongoose.Types.ObjectId();
+  let store: Record<string, any> | null;
+  let findByIdAndUpdateSpy: any;
+
+  beforeEach(() => {
+    store = { status: "docs_under_review" };
+    vi.spyOn(VisaApplication, "findById").mockImplementation(() => chainWithLean(store ? { ...store } : null) as any);
+    findByIdAndUpdateSpy = vi.spyOn(VisaApplication, "findByIdAndUpdate").mockImplementation(((_id: any, update: any) => {
+      if (!store) return Promise.resolve(null);
+      Object.assign(store, update.$set);
+      return Promise.resolve({ ...store });
+    }) as any);
+  });
+
+  it("rejects an empty reason — an internal hold nobody can read is not a hold", async () => {
+    await expect(setDiscrepancyFlagged(appId, "  ", userId)).rejects.toThrow(/non-empty reason/);
+    expect(findByIdAndUpdateSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns null for a missing application and writes nothing", async () => {
+    store = null;
+    expect(await setDiscrepancyFlagged(appId, "reason", userId)).toBeNull();
+    expect(findByIdAndUpdateSpy).not.toHaveBeenCalled();
+  });
+
+  it("captures the displaced status and records the finding", async () => {
+    await setDiscrepancyFlagged(appId, "Photo face height under spec", userId);
+    expect(store!.status).toBe("discrepancy_flagged");
+    expect(store!.statusBeforeActionRequired).toBe("docs_under_review");
+    expect(store!.discrepancyReason).toBe("Photo face height under spec");
+    expect(store!.discrepancySetAt).toBeInstanceOf(Date);
+    expect(String(store!.discrepancySetByUserId)).toBe(String(userId));
+  });
+
+  it("re-flagging with a fresh finding never captures 'discrepancy_flagged' over the real status", async () => {
+    await setDiscrepancyFlagged(appId, "first finding", userId);
+    await setDiscrepancyFlagged(appId, "second finding", userId);
+    expect(store!.statusBeforeActionRequired).toBe("docs_under_review");
+    expect(store!.discrepancyReason).toBe("second finding");
+  });
+
+  it("clearing restores the captured status and nulls the whole trio", async () => {
+    await setDiscrepancyFlagged(appId, "finding", userId);
+    await clearDiscrepancyFlagged(appId);
+    expect(store!.status).toBe("docs_under_review");
+    expect(store!.discrepancyReason).toBeNull();
+    expect(store!.discrepancySetAt).toBeNull();
+    expect(store!.discrepancySetByUserId).toBeNull();
+    expect(store!.statusBeforeActionRequired).toBeNull();
+  });
+
+  it("falls back to 'submitted' — never a later stage — when no capture survives", async () => {
+    store = { status: "discrepancy_flagged" };
+    await clearDiscrepancyFlagged(appId);
+    expect(store!.status).toBe("submitted");
+  });
+
+  it("does NOT clear customerRespondedAt — flagging internally asks the customer nothing", async () => {
+    const replied = new Date("2026-08-01T00:00:00.000Z");
+    store = { status: "docs_under_review", customerRespondedAt: replied };
+    await setDiscrepancyFlagged(appId, "finding", userId);
+    // setActionRequired deliberately nulls this (a fresh ask starts
+    // unanswered). An internal hold is not an ask, so a reply the customer
+    // really did send must not be erased.
+    expect(store!.customerRespondedAt).toBe(replied);
+  });
+
+  describe("the shared capture slot — the two interrupts hand over, they do not nest", () => {
+    it("discrepancy -> action_required -> clear resumes the ORIGINAL stage, not discrepancy_flagged", async () => {
+      store = { status: "docs_under_review" };
+      await setDiscrepancyFlagged(appId, "we found something", userId);
+      expect(store!.statusBeforeActionRequired).toBe("docs_under_review");
+
+      // Escalate: we have now asked the customer.
+      await setActionRequired(appId, "please resend the photo", userId);
+      expect(store!.status).toBe("action_required");
+      // The capture must NOT have become "discrepancy_flagged" — otherwise
+      // clearing below would strand the case back on an internal hold that
+      // was already resolved into a customer ask.
+      expect(store!.statusBeforeActionRequired).toBe("docs_under_review");
+
+      await clearActionRequired(appId);
+      expect(store!.status).toBe("docs_under_review");
+    });
+
+    it("action_required -> discrepancy_flagged (customer answered, ops investigating) keeps the original capture", async () => {
+      store = { status: "cost_confirmed" };
+      await setActionRequired(appId, "need a bank stamp", userId);
+      expect(store!.statusBeforeActionRequired).toBe("cost_confirmed");
+
+      await setDiscrepancyFlagged(appId, "stamp is there but the balance is short", userId);
+      expect(store!.status).toBe("discrepancy_flagged");
+      expect(store!.statusBeforeActionRequired).toBe("cost_confirmed");
+
+      await clearDiscrepancyFlagged(appId);
+      expect(store!.status).toBe("cost_confirmed");
+    });
   });
 });

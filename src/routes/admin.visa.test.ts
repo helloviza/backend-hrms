@@ -37,6 +37,8 @@ const {
   recomputeRequestStatusMock,
   setActionRequiredMock,
   clearActionRequiredMock,
+  setDiscrepancyFlaggedMock,
+  clearDiscrepancyFlaggedMock,
   createVisaDocumentUploadMock,
   presignGetObjectMock,
   syncVisaApplicationBillingMock,
@@ -156,6 +158,8 @@ const {
     recomputeRequestStatusMock: vi.fn().mockResolvedValue("active"),
     setActionRequiredMock: vi.fn(),
     clearActionRequiredMock: vi.fn(),
+    setDiscrepancyFlaggedMock: vi.fn(),
+    clearDiscrepancyFlaggedMock: vi.fn(),
     createVisaDocumentUploadMock: vi.fn(),
     presignGetObjectMock: vi.fn().mockResolvedValue("https://example.com/presigned-url"),
     // Phase 8 — this file tests the outcome route's own state-machine/upload
@@ -229,8 +233,12 @@ vi.mock("../models/VisaApplication.js", async () => {
       const rec = _applications.get(id);
       if (!rec) return null;
       if (!reason?.trim()) throw new Error("setActionRequired requires a non-empty reason");
+      // Both interrupts inherit rather than overwrite (2026-08-12) — see
+      // INTERRUPT_STATUSES in models/VisaApplication.ts.
       const statusBeforeActionRequired =
-        rec.status === "action_required" ? (rec.statusBeforeActionRequired ?? null) : rec.status;
+        rec.status === "action_required" || rec.status === "discrepancy_flagged"
+          ? (rec.statusBeforeActionRequired ?? null)
+          : rec.status;
       Object.assign(rec, {
         status: "action_required",
         actionRequiredReason: reason.trim(),
@@ -250,6 +258,37 @@ vi.mock("../models/VisaApplication.js", async () => {
         actionRequiredReason: null,
         actionRequiredSetAt: null,
         actionRequiredSetByUserId: null,
+        statusBeforeActionRequired: null,
+      });
+      return { ...rec };
+    },
+    setDiscrepancyFlagged: async (id: any, reason: string, userId: any) => {
+      setDiscrepancyFlaggedMock(id, reason, userId);
+      const rec = _applications.get(id);
+      if (!rec) return null;
+      if (!reason?.trim()) throw new Error("setDiscrepancyFlagged requires a non-empty reason");
+      const statusBeforeActionRequired =
+        rec.status === "action_required" || rec.status === "discrepancy_flagged"
+          ? (rec.statusBeforeActionRequired ?? null)
+          : rec.status;
+      Object.assign(rec, {
+        status: "discrepancy_flagged",
+        discrepancyReason: reason.trim(),
+        discrepancySetAt: new Date(),
+        discrepancySetByUserId: userId,
+        statusBeforeActionRequired,
+      });
+      return { ...rec };
+    },
+    clearDiscrepancyFlagged: async (id: any) => {
+      clearDiscrepancyFlaggedMock(id);
+      const rec = _applications.get(id);
+      if (!rec) return null;
+      Object.assign(rec, {
+        status: rec.statusBeforeActionRequired || "submitted",
+        discrepancyReason: null,
+        discrepancySetAt: null,
+        discrepancySetByUserId: null,
         statusBeforeActionRequired: null,
       });
       return { ...rec };
@@ -463,6 +502,8 @@ beforeEach(() => {
   recomputeRequestStatusMock.mockClear();
   setActionRequiredMock.mockClear();
   clearActionRequiredMock.mockClear();
+  setDiscrepancyFlaggedMock.mockClear();
+  clearDiscrepancyFlaggedMock.mockClear();
   createVisaDocumentUploadMock.mockReset();
   presignGetObjectMock.mockClear();
   presignGetObjectMock.mockResolvedValue("https://example.com/presigned-url");
@@ -1001,6 +1042,141 @@ describe("PATCH /applications/:id/status — state machine", () => {
       expect(_applications.get(a._id).status).toBe("action_required");
       expect(clearActionRequiredMock).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("PATCH /applications/:id/status — discrepancy_flagged (internal hold)", () => {
+  beforeEach(() => setAccess("WRITE"));
+
+  it("can be set from a real pre-decision stage, capturing what it displaced", async () => {
+    const a = applicationDoc(WORKSPACE_A, { status: "docs_under_review" });
+    const res = await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "Photo face height under spec" });
+
+    expect(res.status).toBe(200);
+    const rec = _applications.get(a._id);
+    expect(rec.status).toBe("discrepancy_flagged");
+    expect(rec.discrepancyReason).toBe("Photo face height under spec");
+    expect(rec.statusBeforeActionRequired).toBe("docs_under_review");
+  });
+
+  it("REFUSES without a reason — an internal hold nobody can read is not a hold", async () => {
+    const a = applicationDoc(WORKSPACE_A, { status: "docs_under_review" });
+    const res = await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "discrepancy_flagged" });
+
+    expect(res.status).toBe(400);
+    expect(_applications.get(a._id).status).toBe("docs_under_review");
+  });
+
+  it("REFUSES from a decided case — nothing left to hold", async () => {
+    const a = applicationDoc(WORKSPACE_A, { status: "decision_received" });
+    const res = await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "too late" });
+
+    expect(res.status).toBe(400);
+    expect(_applications.get(a._id).status).toBe("decision_received");
+  });
+
+  it("REFUSES from a closed case", async () => {
+    const a = applicationDoc(WORKSPACE_A, { status: "closed" });
+    const res = await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "too late" });
+    expect(res.status).toBe(400);
+  });
+
+  it("GATE: REFUSES from pending_approval — ops may not touch a case held at the customer's own gate", async () => {
+    const a = applicationDoc(WORKSPACE_A, { status: "pending_approval" });
+    const res = await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "nope" });
+    expect(res.status).toBe(400);
+    expect(_applications.get(a._id).status).toBe("pending_approval");
+  });
+
+  it("REFUSES from draft — the customer has not submitted it", async () => {
+    const a = applicationDoc(WORKSPACE_A, { status: "draft" });
+    const res = await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "nope" });
+    expect(res.status).toBe(400);
+  });
+
+  it("clears back into the captured stage, ignoring a caller's stale guess", async () => {
+    const a = applicationDoc(WORKSPACE_A, { status: "cost_confirmed" });
+    await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "finding" });
+
+    // Caller names "submitted"; the captured value is cost_confirmed and
+    // that is what must be written.
+    const res = await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "submitted" });
+
+    expect(res.status).toBe(200);
+    expect(_applications.get(a._id).status).toBe("cost_confirmed");
+    expect(_applications.get(a._id).discrepancyReason).toBeNull();
+  });
+
+  it("REFUSES to clear into a non-resumable status", async () => {
+    const a = applicationDoc(WORKSPACE_A, { status: "docs_under_review" });
+    await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "finding" });
+
+    const res = await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "closed" });
+
+    expect(res.status).toBe(400);
+    expect(_applications.get(a._id).status).toBe("discrepancy_flagged");
+  });
+
+  it("ESCALATES to action_required — the handover from internal hold to customer ask", async () => {
+    const a = applicationDoc(WORKSPACE_A, { status: "docs_under_review" });
+    await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "photo is wrong" });
+
+    const res = await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "action_required", reason: "Please resend the photograph" });
+
+    expect(res.status).toBe(200);
+    const rec = _applications.get(a._id);
+    expect(rec.status).toBe("action_required");
+    // The original stage survives the handover — clearing must not strand
+    // the case back on the internal hold it already left.
+    expect(rec.statusBeforeActionRequired).toBe("docs_under_review");
+  });
+
+  it("and back again: the customer answers, ops investigates internally, and the original stage still survives", async () => {
+    const a = applicationDoc(WORKSPACE_A, { status: "docs_under_review" });
+    await request(makeApp()).patch(`/applications/${a._id}/status`).send({ status: "discrepancy_flagged", reason: "one" });
+    await request(makeApp()).patch(`/applications/${a._id}/status`).send({ status: "action_required", reason: "ask" });
+    const res = await request(makeApp()).patch(`/applications/${a._id}/status`).send({ status: "discrepancy_flagged", reason: "still wrong" });
+
+    expect(res.status).toBe(200);
+    const rec = _applications.get(a._id);
+    expect(rec.status).toBe("discrepancy_flagged");
+    expect(rec.statusBeforeActionRequired).toBe("docs_under_review");
+  });
+
+  it("is NOT reachable as a forward chain step — no skip-ahead into it from submitted", async () => {
+    // submitted -> discrepancy_flagged IS legal (it is a pre-decision stage),
+    // but only through the reason-carrying branch. The forward table itself
+    // still offers only docs_under_review.
+    const a = applicationDoc(WORKSPACE_A, { status: "submitted" });
+    const res = await request(makeApp())
+      .patch(`/applications/${a._id}/status`)
+      .send({ status: "discrepancy_flagged" }); // no reason
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/reason is required/);
   });
 });
 

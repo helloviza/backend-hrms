@@ -40,6 +40,8 @@ import VisaApplication, {
   VISA_OPS_HIDDEN_STATUSES,
   setActionRequired,
   clearActionRequired,
+  setDiscrepancyFlagged,
+  clearDiscrepancyFlagged,
   isTravellerErased,
   VISA_APPLICATION_ERASED_MESSAGE,
   type VisaApplicationStatus,
@@ -478,13 +480,21 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
     //                  everything below because it is a DEADLINE, not a
     //                  preference: a missed trip is the worst outcome this
     //                  queue can produce.
-    //   2  RESPONDED — action_required and the customer has come back, so
-    //                  we are now the only thing outstanding.
+    //   2  OURS      — we are the only thing outstanding. Two ways to be
+    //                  here: action_required AND the customer has come back
+    //                  (they did their part), or discrepancy_flagged (we
+    //                  found a problem and never asked them at all — the
+    //                  ball has been ours the whole time). Both mean the
+    //                  same thing to an agent scanning the queue: pick this
+    //                  up, nobody else is going to move it.
     //   3  AWAITING  — action_required, still waiting on the customer.
     //   4  the rest.
     // Bands 2 and 3 are the previous top two urgency tiers (Phase 9f)
     // preserved EXACTLY — At-Risk was inserted above them, nothing was
-    // collapsed or reordered underneath.
+    // collapsed or reordered underneath, and discrepancy_flagged joined
+    // band 2 rather than creating a fifth band because it is not a
+    // different KIND of urgency from a responded row, it is the same one
+    // arrived at without ever involving the customer.
     //
     // Within every band: soonest travel first, DATELESS LAST. A row with no
     // travel date is UNASSESSABLE, which is not the same as safe — it can
@@ -533,9 +543,14 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
                 },
                 {
                   case: {
-                    $and: [
-                      { $eq: ["$status", "action_required"] },
-                      { $ne: [{ $ifNull: ["$customerRespondedAt", null] }, null] },
+                    $or: [
+                      { $eq: ["$status", "discrepancy_flagged"] },
+                      {
+                        $and: [
+                          { $eq: ["$status", "action_required"] },
+                          { $ne: [{ $ifNull: ["$customerRespondedAt", null] }, null] },
+                        ],
+                      },
                     ],
                   },
                   then: 2,
@@ -648,6 +663,9 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         id: String(a._id),
         status: a.status,
         actionRequiredReason: a.actionRequiredReason ?? null,
+        // The internal-hold finding (2026-08-12). Ops-facing only — this
+        // route is the concierge console; nothing customer-facing reads it.
+        discrepancyReason: a.discrepancyReason ?? null,
         // The at-risk marker (task brief, 2026-08-01) — "is there still
         // enough runway before travel to plausibly finish processing,"
         // computed by utils/visaEta.ts's assessProcessingRisk and reused
@@ -849,8 +867,31 @@ router.get("/applications/:id", requirePermission("visaApplication", "READ"), as
  * actually resumes into; nothing here tries to remember "the" one state it
  * was raised from.
  * ───────────────────────────────────────────────────────────────────── */
+// The real, resumable stages an interrupt can displace and restore into.
+// Neither interrupt status is a member — an interrupt cannot be the thing
+// another interrupt resumes to.
 const PRE_DECISION_STATUSES: VisaApplicationStatus[] = ["submitted", "docs_under_review", "cost_confirmed", "lodged"];
-const ACTION_REQUIRED_ELIGIBLE = new Set<string>([...PRE_DECISION_STATUSES, "action_required"]);
+
+// action_required is settable from any real pre-decision stage, re-affirmable
+// while already action_required, and (2026-08-12) reachable from
+// discrepancy_flagged — that last one is the escalation "we investigated,
+// now we need the customer", which is exactly the handover the two states
+// exist to distinguish.
+const ACTION_REQUIRED_ELIGIBLE = new Set<string>([
+  ...PRE_DECISION_STATUSES,
+  "action_required",
+  "discrepancy_flagged",
+]);
+
+// discrepancy_flagged is settable from the same real stages, re-affirmable
+// with a fresh finding, and reachable from action_required — the customer
+// answered and ops is investigating internally again. It is NOT reachable
+// from a decided/closed case: there is nothing left to hold.
+const DISCREPANCY_ELIGIBLE = new Set<string>([
+  ...PRE_DECISION_STATUSES,
+  "discrepancy_flagged",
+  "action_required",
+]);
 
 const STATUS_FORWARD_TRANSITIONS: Record<string, VisaApplicationStatus[]> = {
   draft: [],
@@ -867,6 +908,7 @@ const STATUS_FORWARD_TRANSITIONS: Record<string, VisaApplicationStatus[]> = {
   decision_received: ["closed"],
   closed: [],
   action_required: [], // handled as its own branch below, never via this table
+  discrepancy_flagged: [], // likewise — a side-branch, not a chain step
 };
 
 router.patch("/applications/:id/status", requirePermission("visaApplication", "WRITE"), async (req: any, res: any) => {
@@ -915,6 +957,52 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
         actorUserId: actorId(req),
         actorType: "STAFF",
         detail: { reason, interruptedStatus: current },
+      });
+    } else if (target === "discrepancy_flagged") {
+      // The INTERNAL hold. Same shape as the action_required branch above —
+      // a reason is mandatory, the paired helper owns the field group, and
+      // the transition is activity-logged — but it publishes nothing to the
+      // customer. Flagging a discrepancy is ops recording what IT found;
+      // telling the customer is a separate, deliberate act (moving on to
+      // action_required, which carries its own published message).
+      if (!DISCREPANCY_ELIGIBLE.has(current)) {
+        return res.status(400).json({ error: `Cannot set discrepancy_flagged from '${current}'`, current, target });
+      }
+      const reason = String(req.body?.reason || "").trim();
+      if (!reason) {
+        return res.status(400).json({ error: "reason is required to set discrepancy_flagged" });
+      }
+      await setDiscrepancyFlagged(id, reason, actorId(req));
+      // The reason IS logged — an internal ops finding, the same class of
+      // content VisaActivityLog's no-PII rule already allows for
+      // action_required reasons.
+      await logVisaActivity({
+        applicationId: id,
+        requestId: application.requestId,
+        workspaceId: application.workspaceId,
+        eventType: "DISCREPANCY_FLAGGED",
+        actorUserId: actorId(req),
+        actorType: "STAFF",
+        detail: { reason, interruptedStatus: current },
+      });
+    } else if (current === "discrepancy_flagged") {
+      // Resolving the internal hold. As with clearing action_required, the
+      // caller confirms it is resuming into a legal stage, but the value
+      // WRITTEN comes from the captured statusBeforeActionRequired, not
+      // from the caller — a stale guess can never overwrite the record of
+      // where the application really was.
+      if (!PRE_DECISION_STATUSES.includes(target as VisaApplicationStatus)) {
+        return res.status(400).json({ error: `Cannot clear discrepancy_flagged into '${target}'`, current, target });
+      }
+      const resumed = await clearDiscrepancyFlagged(id);
+      await logVisaActivity({
+        applicationId: id,
+        requestId: application.requestId,
+        workspaceId: application.workspaceId,
+        eventType: "DISCREPANCY_CLEARED",
+        actorUserId: actorId(req),
+        actorType: "STAFF",
+        detail: { resumedStatus: resumed?.status ?? null },
       });
     } else if (current === "action_required") {
       // target is validated (must be a legal pre-decision status — i.e. the

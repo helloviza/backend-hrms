@@ -117,6 +117,7 @@ async function seedCase(opts: {
   status?: string;
   outcome?: string | null;
   customerRespondedAt?: Date | null;
+  discrepancyReason?: string | null;
   destinationIso2?: string;
   ref?: string;
   travellerErasedAt?: Date | null;
@@ -175,6 +176,7 @@ async function seedCase(opts: {
     status: opts.status ?? "submitted",
     outcome: opts.outcome ?? undefined,
     customerRespondedAt: opts.customerRespondedAt ?? null,
+    discrepancyReason: opts.discrepancyReason ?? null,
     travellerErasedAt: opts.travellerErasedAt ?? null,
     billingSyncSkippedAt: opts.billingSyncSkippedAt ?? null,
     servicePartnerName: opts.servicePartnerName ?? null,
@@ -313,6 +315,56 @@ describe("GET /queue — priority bands (At-Risk > Responded > Awaiting > Proxim
     expect(body.applications[0].traveller.name).toContain("live");
     const terminal = body.applications.filter((a: any) => !a.traveller.name.includes("live"));
     expect(terminal.every((a: any) => a.risk === null)).toBe(true);
+  });
+  it("discrepancy_flagged sits in band 2 — ops owes the work, same as a responded row", async () => {
+    await seedCase({ ref: "calm", travelInDays: 200, status: "submitted" });
+    await seedCase({ ref: "awaiting", travelInDays: 180, status: "action_required" });
+    await seedCase({ ref: "discrepancy", travelInDays: 190, status: "discrepancy_flagged" });
+
+    const body = await queue();
+    const order = body.applications.map((a: any) => a.traveller.name.split(" ")[1]);
+    // Above awaiting (which is blocked on the customer) and above the calm
+    // row, despite travelling later than both.
+    expect(order).toEqual(["discrepancy", "awaiting", "calm"]);
+  });
+
+  it("a discrepancy row and a responded row share band 2, ordered by travel date between them", async () => {
+    await seedCase({ ref: "discLater", travelInDays: 100, status: "discrepancy_flagged" });
+    await seedCase({
+      ref: "respSooner",
+      travelInDays: 50,
+      status: "action_required",
+      customerRespondedAt: new Date(NOW.getTime() - DAY),
+    });
+
+    const body = await queue();
+    const order = body.applications.map((a: any) => a.traveller.name.split(" ")[1]);
+    // Same band, so the tiebreak decides — neither outranks the other by kind.
+    expect(order).toEqual(["respSooner", "discLater"]);
+  });
+
+  it("an at-risk discrepancy row still goes to band 1 — the deadline outranks the hold", async () => {
+    await seedCase({ ref: "discCalm", travelInDays: 200, status: "discrepancy_flagged" });
+    await seedCase({ ref: "discAtRisk", travelInDays: 2, etaMaxDays: 10, status: "discrepancy_flagged" });
+
+    const body = await queue();
+    expect(body.applications[0].traveller.name).toContain("discAtRisk");
+  });
+
+  it("surfaces discrepancyReason on the row for the ops console", async () => {
+    await seedCase({ ref: "d", travelInDays: 30, status: "discrepancy_flagged", discrepancyReason: "Photo face height under spec" });
+    const body = await queue();
+    expect(body.applications[0].discrepancyReason).toBe("Photo face height under spec");
+  });
+
+  it("is an OPS state — it is NOT hidden from the ops queue the way draft/pending_approval are", async () => {
+    await seedCase({ ref: "d", travelInDays: 30, status: "discrepancy_flagged" });
+    const body = await queue();
+    expect(body.applications).toHaveLength(1);
+
+    // And it is addressable by name, unlike pending_approval.
+    const named = await queue("?status=discrepancy_flagged");
+    expect(named.applications).toHaveLength(1);
   });
 });
 

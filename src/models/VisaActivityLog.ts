@@ -41,6 +41,10 @@ export const VISA_ACTIVITY_EVENT_TYPES = [
   "STATUS_CHANGED",
   "ACTION_REQUIRED_SET",
   "ACTION_REQUIRED_CLEARED",
+  // Internal hold (2026-08-12) — ops found a problem and is investigating.
+  // Distinct from ACTION_REQUIRED_SET, which is ops ASKING the customer.
+  "DISCREPANCY_FLAGGED",
+  "DISCREPANCY_CLEARED",
   "CUSTOMER_RESPONDED",
   "ACTION_REQUIRED_AUTO_CLEARED",
   "OUTCOME_RECORDED",

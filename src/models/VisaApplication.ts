@@ -33,8 +33,23 @@ const visaApplicationLogger = logger.child({ module: "VisaApplication" });
 // to Plumtrips yet. Only reachable when the workspace opted into
 // config.visaApprovalRequired (default false) — see
 // services/visaApproval.service.ts and infra/design/visa-approval-flow-2026-08-10.md.
+// "discrepancy_flagged" (2026-08-12) splits what action_required used to
+// collapse into one state. The two are NOT the same thing and never were:
+//
+//   discrepancy_flagged — WE found a problem. An internal hold: ops owns the
+//                         next move, the customer has not been asked for
+//                         anything and has nothing to do.
+//   action_required     — we have ASKED the customer. They own the next
+//                         move; we are waiting on them.
+//
+// Collapsing them meant the queue could not tell "we owe this case work"
+// from "we are blocked on someone else", which is the single most useful
+// distinction a worklist can make. Like action_required, this is a
+// SIDE-BRANCH interrupt, not a step in the forward chain — see
+// setDiscrepancyFlagged/clearDiscrepancyFlagged below.
 export const VISA_APPLICATION_STATUSES = [
-  "draft", "pending_approval", "submitted", "docs_under_review", "action_required",
+  "draft", "pending_approval", "submitted", "docs_under_review",
+  "discrepancy_flagged", "action_required",
   "cost_confirmed", "lodged", "decision_received", "closed",
 ] as const;
 export type VisaApplicationStatus = (typeof VISA_APPLICATION_STATUSES)[number];
@@ -217,9 +232,39 @@ export interface VisaApplicationDocument extends Document {
   actionRequiredSetAt: Date | null;
   actionRequiredSetByUserId: mongoose.Types.ObjectId | null; // ref User
 
-  // The status this application was actually IN the moment it was flagged
-  // action_required — captured by setActionRequired() so clearActionRequired()
-  // can restore it later. Without this, action_required overwrites `status`
+  // Why THIS application is on an INTERNAL hold, and who/when — the
+  // discrepancy_flagged counterpart of the actionRequired* trio above. Free
+  // text for the same reason: the findings are things like "photo is 35x45
+  // but the face height is under spec" or "bank statement balance doesn't
+  // support the stated stay", not a fixed vocabulary.
+  //
+  // Set together and cleared together, exactly like the actionRequired
+  // fields. Deliberately SEPARATE from actionRequiredReason rather than
+  // reusing it: the two describe different things to different audiences —
+  // a discrepancy reason is an internal note, an action-required reason is
+  // published to the customer — and a case can carry a discrepancy finding
+  // that later becomes a customer ask without one overwriting the other.
+  discrepancyReason: string | null;
+  discrepancySetAt: Date | null;
+  discrepancySetByUserId: mongoose.Types.ObjectId | null; // ref User
+
+  // The status this application was actually IN the moment an INTERRUPT
+  // displaced it — captured by setActionRequired() AND (2026-08-12) by
+  // setDiscrepancyFlagged(), so the matching clear can restore it later.
+  //
+  // ONE slot shared by both interrupts, not one each. That is deliberate:
+  // the two interrupts are alternatives, not a stack. A case moving
+  // discrepancy_flagged -> action_required has not nested a second
+  // interruption inside the first; it has HANDED THE SAME interruption over
+  // to the customer, and when that clears it must resume the status the
+  // original discrepancy displaced — not land back in discrepancy_flagged.
+  // Both setters therefore inherit an existing capture rather than
+  // overwriting it whenever the current status is itself an interrupt (see
+  // INTERRUPT_STATUSES and each setter's own guard).
+  //
+  // Name kept as-is rather than renamed to statusBeforeInterrupt: the field
+  // is on every existing application document, and a rename would be a
+  // migration for zero behavioural gain. Without this, action_required overwrites `status`
   // directly with no record of what it interrupted, and clearing it has no
   // way to know where the application really was (the tracking timeline,
   // track/timelineStages.ts, used to compensate by under-claiming progress
@@ -520,6 +565,9 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     actionRequiredReason: { type: String, trim: true, default: null },
     actionRequiredSetAt: { type: Date, default: null },
     actionRequiredSetByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    discrepancyReason: { type: String, trim: true, default: null },
+    discrepancySetAt: { type: Date, default: null },
+    discrepancySetByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
     statusBeforeActionRequired: { type: String, enum: VISA_APPLICATION_STATUSES, default: null },
     customerRespondedAt: { type: Date, default: null },
     travellerErasedAt: { type: Date, default: null },
@@ -632,6 +680,19 @@ export default VisaApplication;
  * point of capturing it. Falls back to "submitted" (logged) if it's
  * somehow absent, rather than guessing a later stage no evidence supports.
  */
+/**
+ * The two SIDE-BRANCH statuses. Neither is a step in the forward chain;
+ * each displaces whatever real status the application was in, and each
+ * restores it on clear. Shared by both setters' capture guards below —
+ * capturing an interrupt INTO the interrupt slot would permanently destroy
+ * the one record of where the application actually was.
+ */
+export const INTERRUPT_STATUSES: VisaApplicationStatus[] = ["action_required", "discrepancy_flagged"];
+
+function isInterrupt(status: unknown): boolean {
+  return INTERRUPT_STATUSES.includes(status as VisaApplicationStatus);
+}
+
 export async function setActionRequired(
   applicationId: mongoose.Types.ObjectId | string,
   reason: string,
@@ -645,11 +706,16 @@ export async function setActionRequired(
     .lean();
   if (!current) return null;
 
-  // Guard against corrupting the capture: re-affirming action_required
-  // while already action_required must never overwrite the real interrupted
-  // status with the literal string "action_required".
+  // Guard against corrupting the capture. Two cases reach here with an
+  // interrupt already in `status`: re-affirming action_required with a
+  // fresh reason, and escalating discrepancy_flagged -> action_required
+  // (2026-08-12). BOTH must inherit the existing capture rather than
+  // overwrite it — the second is the important one, because a case that
+  // went docs_under_review -> discrepancy_flagged -> action_required must
+  // resume at docs_under_review when the customer answers, not land back
+  // in discrepancy_flagged and strand itself in a loop.
   const statusBeforeActionRequired: VisaApplicationStatus | null =
-    (current as any).status === "action_required"
+    isInterrupt((current as any).status)
       ? ((current as any).statusBeforeActionRequired ?? null)
       : ((current as any).status as VisaApplicationStatus);
 
@@ -698,6 +764,94 @@ export async function clearActionRequired(
         actionRequiredReason: null,
         actionRequiredSetAt: null,
         actionRequiredSetByUserId: null,
+        statusBeforeActionRequired: null,
+      },
+    },
+    { new: true },
+  );
+}
+
+/**
+ * The discrepancy_flagged pair (2026-08-12) — the INTERNAL-hold counterpart
+ * of setActionRequired/clearActionRequired above, and the only sanctioned
+ * way to touch discrepancyReason/discrepancySetAt/discrepancySetByUserId.
+ * No route should $set any of the three directly; going through these keeps
+ * them moving together by construction.
+ *
+ * setDiscrepancyFlagged ALSO sets status — flagging IS the transition. It
+ * captures the displaced status into the shared statusBeforeActionRequired
+ * slot, inheriting rather than overwriting when the current status is
+ * itself an interrupt (customer answered an action_required, and ops is now
+ * investigating internally again: the case must still remember the
+ * docs_under_review it originally left).
+ *
+ * Deliberately does NOT touch customerRespondedAt, unlike setActionRequired:
+ * that stamp answers "has the customer replied since we last asked them",
+ * and flagging an internal discrepancy asks them nothing. Clearing their
+ * previous response stamp here would misrepresent a reply they really did
+ * send as never having happened.
+ */
+export async function setDiscrepancyFlagged(
+  applicationId: mongoose.Types.ObjectId | string,
+  reason: string,
+  userId: mongoose.Types.ObjectId | string,
+): Promise<VisaApplicationDocument | null> {
+  const trimmed = reason?.trim();
+  if (!trimmed) throw new Error("setDiscrepancyFlagged requires a non-empty reason");
+
+  const current = await VisaApplication.findById(applicationId)
+    .select("status statusBeforeActionRequired")
+    .lean();
+  if (!current) return null;
+
+  const statusBeforeActionRequired: VisaApplicationStatus | null =
+    isInterrupt((current as any).status)
+      ? ((current as any).statusBeforeActionRequired ?? null)
+      : ((current as any).status as VisaApplicationStatus);
+
+  return VisaApplication.findByIdAndUpdate(
+    applicationId,
+    {
+      $set: {
+        status: "discrepancy_flagged",
+        discrepancyReason: trimmed,
+        discrepancySetAt: new Date(),
+        discrepancySetByUserId: userId,
+        statusBeforeActionRequired,
+      },
+    },
+    { new: true },
+  );
+}
+
+export async function clearDiscrepancyFlagged(
+  applicationId: mongoose.Types.ObjectId | string,
+): Promise<VisaApplicationDocument | null> {
+  const current = await VisaApplication.findById(applicationId)
+    .select("statusBeforeActionRequired")
+    .lean();
+  if (!current) return null;
+
+  let restoredStatus = (current as any).statusBeforeActionRequired as VisaApplicationStatus | null;
+  if (!restoredStatus) {
+    // Same posture as clearActionRequired: never silently pick a later
+    // stage. "submitted" is the earliest legal resume point, so this can
+    // only under-claim progress, never fabricate a stage nothing confirms.
+    restoredStatus = "submitted";
+    visaApplicationLogger.warn(
+      "clearDiscrepancyFlagged: statusBeforeActionRequired missing, falling back to 'submitted'",
+      { applicationId: String(applicationId) },
+    );
+  }
+
+  return VisaApplication.findByIdAndUpdate(
+    applicationId,
+    {
+      $set: {
+        status: restoredStatus,
+        discrepancyReason: null,
+        discrepancySetAt: null,
+        discrepancySetByUserId: null,
         statusBeforeActionRequired: null,
       },
     },
