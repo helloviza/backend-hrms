@@ -87,7 +87,14 @@ import { UserPermission, hasAccess } from "../models/UserPermission.js";
 import {
   isIdentityNumberCaptureEnabled,
   IDENTITY_CAPTURE_DISABLED_MESSAGE,
+  // Tab 6 (2026-08-11). Two SEPARATE gates, deliberately not folded into
+  // the capture flag above — see each one's note in that config.
+  isIdentityVerificationAvailable,
+  PROFILE_CONSENT_UNBUILT_MESSAGE,
 } from "../config/platformCapabilities.js";
+// Tab 6 — the DPDP consent ledger. Real VisaRequest.consents[] rows only,
+// kept REQUEST-scoped all the way to the screen; see the service header.
+import { resolveConsentLedger } from "../services/travellerConsent.service.js";
 import TravellerDocument, {
   TRAVELLER_DOCUMENT_KINDS,
   GATED_TRAVELLER_DOCUMENT_KINDS,
@@ -1255,6 +1262,18 @@ function identityCaptureState() {
   return {
     enabled,
     message: enabled ? null : IDENTITY_CAPTURE_DISABLED_MESSAGE,
+    /**
+     * THE SEPARATE, STRONGER GATE (2026-08-11, §7.1). Sent alongside
+     * `enabled` precisely so a client cannot reach for `enabled` when it
+     * wants this one: capture asks "may we store the number", verification
+     * asks "has an authority confirmed it belongs to this person". Flipping
+     * encryption on earns the first and says NOTHING about the second.
+     *
+     * False unconditionally — there is no UIDAI integration in this
+     * codebase, so no traveller can have been verified and no surface may
+     * render a "Verified" or "UIDAI Sync" badge on any branch of any flag.
+     */
+    verificationAvailable: isIdentityVerificationAvailable(),
   };
 }
 
@@ -3322,6 +3341,66 @@ router.delete("/:id/trips/:tripId", async (req: any, res: any) => {
     res.json({ ok: true });
   } catch (err: any) {
     console.error("[workspace.travellers DELETE trip]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * TAB 6 — DPDP PRIVACY CONTROL (2026-08-11)
+ *
+ * A READ-ONLY LEDGER, and the read-only-ness is the design, not a phase.
+ * These rows are an audit record of a legal act: somebody ticked three
+ * boxes at a moment in time and the system recorded which clauses, which
+ * version, and when. Editing one after the fact would not correct a
+ * mistake — it would rewrite evidence of consent. So this block has ONE
+ * verb, GET, and there is deliberately no POST/PUT/PATCH/DELETE for a
+ * later change to quietly add a "fix this row" affordance to.
+ *
+ * WITHDRAWING consent is a real and legitimate act, and it is NOT the same
+ * thing as editing the record — it would be a NEW, additive event (a
+ * withdrawal row with its own timestamp), leaving the original acceptance
+ * intact. No such flow exists yet, and this route does not pretend one
+ * does: profileConsent.captured is false with the reason attached.
+ *
+ * Everything else this tab must not do is enforced in the service (see
+ * services/travellerConsent.service.ts): rows stay request-scoped, no
+ * aggregate "has consented" is computed, and an old version's wording is
+ * never filled in from today's text.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+router.get("/:id/consents", async (req: any, res: any) => {
+  try {
+    // Same edit-level gate as documents/holdings/trips. A consent ledger is
+    // a record of what a named person legally agreed to — squarely in the
+    // class of dossier a colleague has no business browsing, and no booking
+    // flow needs.
+    const ctx = await requireTravellerSubResourceAccess(req, res);
+    if (!ctx) return;
+
+    const ledger = await resolveConsentLedger(ctx.traveller._id, req.workspaceObjectId, {
+      subjectUserId: ctx.traveller.claimedBy ? String(ctx.traveller.claimedBy) : null,
+      profileConsentMessage: PROFILE_CONSENT_UNBUILT_MESSAGE,
+    });
+
+    res.json({
+      ok: true,
+      ...ledger,
+      capabilities: {
+        // Stated rather than left for the client to infer from the absence
+        // of a write route — a disabled control and a missing endpoint
+        // should agree for the same stated reason.
+        canEdit: false,
+        readOnlyReason:
+          "Consent records are an audit trail of what was agreed and when. They can't be edited or removed.",
+        // No withdrawal flow exists. Sent as an explicit false so the UI can
+        // stay silent about withdrawal rather than offering a button that
+        // does nothing, or implying consent cannot be withdrawn at all
+        // (it can — just not here, and the copy says so).
+        canWithdraw: false,
+      },
+    });
+  } catch (err: any) {
+    console.error("[workspace.travellers GET consents]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
