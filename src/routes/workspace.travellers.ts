@@ -26,7 +26,23 @@ import TravellerProfile, {
   LOYALTY_PROGRAMME_TYPES,
   HOTEL_PREFERENCES,
   SEAT_PREFERENCES,
+  PASSPORT_BOOKLET_SIZES,
+  PASSPORT_ECR_STATUSES,
+  TRAVEL_BADGE_PROGRAMMES,
 } from "../models/TravellerProfile.js";
+// Dossier Tab 2 — the Passport & MRZ Vault (2026-08-11).
+// composeTD3Mrz RENDERS an MRZ from what we hold; it deliberately returns no
+// notion of validity (see that file's header — verifying a self-composed
+// MRZ's check digits is circular). The only real check on this tab is
+// comparePassportSources, against an MRZ extracted from an uploaded scan.
+import { composeTD3Mrz } from "../utils/mrzCompose.js";
+import {
+  comparePassportSources,
+  readPassportExtraction,
+  isUsablePassportExtraction,
+} from "../utils/passportCrossCheck.js";
+import VisaApplication from "../models/VisaApplication.js";
+import VisaDocument from "../models/VisaDocument.js";
 import CustomerMember from "../models/CustomerMember.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Department from "../models/Department.js";
@@ -234,6 +250,17 @@ const SELF_EDITABLE_FIELDS = [
   // Dossier Tab 4 — preferences and loyalty are the traveller's own by
   // definition; an admin has no better claim to someone's seat preference.
   "seatPreference", "homeAirport", "hotelPreferences", "loyaltyProgrammes",
+  // Dossier Tab 2 (2026-08-11) — the rest of the passport block. Self-editable
+  // for the same reason the four passport fields above already are: these are
+  // facts printed on the person's own document, and the holder is the only
+  // one looking at it. Blank pages in particular is SELF-DECLARED by
+  // definition — an admin asserting how many pages are left in someone
+  // else's booklet would be inventing it.
+  //
+  // travelBadges (Global Entry, APEC/ABTC) is the same class: a membership
+  // the traveller holds, typed in by the traveller, verified by nobody.
+  "passportPlaceOfIssue", "passportBookletSize", "passportBlankPagesRemaining",
+  "passportEcrStatus", "travelBadges",
 ] as const;
 
 /**
@@ -511,6 +538,49 @@ function applyEmergencyContacts(input: any): {
     .filter((c) => c.name || c.phone);
 }
 
+/**
+ * Secondary travel programmes — Global Entry, APEC/ABTC and friends (Tab 2).
+ *
+ * PURE MANUAL ENTRY, and nothing here validates a membership against
+ * anything: there is no CBP or ABTC integration in this codebase, so the
+ * only assertion these rows can carry is "the traveller typed this". Same
+ * shape of rule as the loyalty rows above — an unrecognised programme drops
+ * to undefined rather than rejecting the save, and a row identifying no
+ * membership is dropped rather than stored blank.
+ *
+ * `expiry` is stored EXACTLY as sent (a "YYYY-MM-DD" string from a date
+ * input) and is never interpreted: no surface computes "expired" or
+ * "Active" from it. Repeating the date the user entered is a display of
+ * their own data; deriving a validity badge from it would be a claim about
+ * a membership we have never checked.
+ */
+function applyTravelBadges(input: any): {
+  programme?: string;
+  programmeName?: string;
+  number?: string;
+  expiry?: string;
+}[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((b: any) => {
+      const rawProgramme = String(b?.programme ?? "").trim().toUpperCase();
+      return {
+        programme: (TRAVEL_BADGE_PROGRAMMES as readonly string[]).includes(rawProgramme)
+          ? rawProgramme
+          : undefined,
+        programmeName: normStr(b?.programmeName),
+        number: normStr(b?.number),
+        expiry: normStr(b?.expiry),
+      };
+    })
+    // Filtered on the IDENTIFYING fields only, deliberately not on
+    // `programme`: the picker defaults to a programme the moment "Add" is
+    // clicked, so including it here would mean an empty row the user never
+    // filled in gets stored on every save. Same rule as the loyalty rows
+    // above, which filter on name/number and ignore programmeType.
+    .filter((b) => b.number || b.programmeName);
+}
+
 /** Multi-select, allowlisted against the fixed vocabulary; unknowns dropped. */
 function applyHotelPreferences(input: any): string[] {
   if (!Array.isArray(input)) return [];
@@ -630,6 +700,11 @@ const EDITABLE_STRING_FIELDS = [
   // what keeps PUT and POST agreeing (a caught bug — PUT stored "blr"
   // while POST stored "BLR").
   "costCenterId", "workLocation", "taxResidency",
+  // Dossier Tab 2. The two enums (bookletSize, ecrStatus), the number
+  // (blankPagesRemaining) and the array (travelBadges) are NOT here — each
+  // needs validating against its vocabulary, and blankPagesRemaining also
+  // carries a declared-on stamp. See the PUT handler.
+  "passportPlaceOfIssue",
 ] as const;
 
 /**
@@ -800,6 +875,199 @@ function computeDossierHealth(traveller: any): {
   const total = DOSSIER_HEALTH_FIELDS.length;
   const filled = total - missing.length;
   return { percent: Math.round((filled / total) * 100), filled, total, missing };
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+ * PASSPORT & MRZ VAULT (2026-08-11, Tab 2)
+ *
+ * Two things, and they make very different claims:
+ *
+ *   1. The COMPOSED MRZ — the two TD3 lines built from the passport fields
+ *      on this profile. A rendering of our own data. Presented as
+ *      "generated from your details", never as verified: see
+ *      utils/mrzCompose.ts's header for why a checksum panel over a
+ *      self-composed MRZ is circular, and why this payload therefore
+ *      carries no check-digit results at all.
+ *
+ *   2. The DATABASE MISMATCH CHECK — a real two-source comparison, but only
+ *      when a real second source exists. That source is
+ *      VisaDocument.extractedFields: an MRZ read off an uploaded passport
+ *      scan on a visa application and check-digit verified before storage.
+ *
+ * THE THREE STATES, which are the whole point (design doc §7.2c):
+ *
+ *   0 sources — no typed passport AND no extraction. Render NOTHING. Not an
+ *     empty panel, not "0% checked": there is no subject to say anything
+ *     about.
+ *   1 source — typed passport only (the overwhelmingly common case, since
+ *     profile-level uploads have no extraction pipeline), or an extraction
+ *     with nothing typed. Show the data, make NO match claim. One value
+ *     compared to itself cannot disagree, so a "100% match" here would be a
+ *     tick that can never fail.
+ *   2 sources — the real comparison, with a real percentage, per field.
+ *
+ * The percentage is only ever computed in the 2-source branch, and
+ * comparePassportSources returns null for it when nothing was comparable.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Find an MRZ extraction for this traveller, if one exists.
+ *
+ * VisaDocument is applicationId-keyed, not traveller-keyed, so the path is
+ * traveller -> their VisaApplications -> documents on those applications.
+ * Both queries carry workspaceId, so a stale/cross-tenant applicationId can
+ * never pull another workspace's document.
+ *
+ * Newest first, and the first USABLE one wins: a failed extraction still
+ * writes an extractedFields array (failureCategory/error), and treating
+ * that as a source would render a comparison panel whose every row is
+ * "not comparable" — which reads as "we checked and found nothing wrong".
+ * isUsablePassportExtraction is what rejects those.
+ */
+async function findPassportExtractionForTraveller(travellerId: any, workspaceId: any) {
+  const applications: any[] = await VisaApplication.find({
+    travellerProfileId: travellerId,
+    workspaceId,
+  })
+    .select("_id")
+    .lean();
+  if (!applications.length) return null;
+
+  const documents: any[] = await VisaDocument.find({
+    workspaceId,
+    applicationId: { $in: applications.map((a) => a._id) },
+    deletedAt: null,
+    // COMPLETED = every check digit passed; NEEDS_REVIEW = it parsed but a
+    // check failed. BOTH are included on purpose: a NEEDS_REVIEW extraction
+    // is exactly the case where comparing against typed fields is most
+    // useful, and excluding it would hide the discrepancy the reviewer is
+    // there to resolve. PENDING/PROCESSING/FAILED carry no MRZ fields.
+    extractionStatus: { $in: ["COMPLETED", "NEEDS_REVIEW"] },
+  })
+    .select("extractedFields extractionStatus extractionConfidence createdAt applicationId")
+    .sort({ createdAt: -1 })
+    .lean();
+
+  for (const doc of documents) {
+    const extraction = readPassportExtraction(doc.extractedFields);
+    if (isUsablePassportExtraction(extraction)) {
+      return {
+        extraction,
+        extractionStatus: doc.extractionStatus as string,
+        extractionConfidence: (doc.extractionConfidence ?? null) as string | null,
+        extractedAt: (doc.createdAt ?? null) as Date | null,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * The vault payload for one traveller. Shape is deliberately explicit about
+ * WHY each half is or isn't there, so the client renders the reason rather
+ * than inventing one.
+ */
+async function resolvePassportVault(traveller: any, workspaceId: any) {
+  const mrzResult = composeTD3Mrz({
+    firstName: traveller?.firstName,
+    middleName: traveller?.middleName,
+    lastName: traveller?.lastName,
+    gender: traveller?.gender,
+    dob: traveller?.dob,
+    nationality: traveller?.nationality,
+    passportNo: traveller?.passportNo,
+    passportExpiry: traveller?.passportExpiry,
+    passportIssueCountry: traveller?.passportIssueCountry,
+  });
+
+  // "Typed passport" is anchored on the passport NUMBER specifically, not on
+  // "any passport-ish field being filled". A profile carrying only a
+  // nationality has not told us about a passport.
+  const hasTypedPassport = Boolean(normStr(traveller?.passportNo));
+
+  let extractionResult: Awaited<ReturnType<typeof findPassportExtractionForTraveller>> = null;
+  try {
+    extractionResult = await findPassportExtractionForTraveller(traveller?._id, workspaceId);
+  } catch (err: any) {
+    // A failure to LOOK for the second source must not 500 the profile
+    // fetch, and must not silently downgrade to "1 source" as though we had
+    // checked and found nothing — that would be the fabricated-certainty
+    // failure mode this whole block exists to avoid. Left null, and the
+    // sourceCount below reflects only what we actually established.
+    logger.warn("[workspace.travellers] passport extraction lookup failed", {
+      travellerId: String(traveller?._id ?? ""),
+      error: err?.message,
+    });
+  }
+
+  const sourceCount = (hasTypedPassport ? 1 : 0) + (extractionResult ? 1 : 0);
+
+  // if/else rather than a ternary purely so the discriminated union narrows
+  // cleanly on both branches.
+  let mrz: Record<string, any>;
+  if (mrzResult.ok) {
+    mrz = {
+      available: true,
+      line1: mrzResult.mrz.line1,
+      line2: mrzResult.mrz.line2,
+      issuingState: mrzResult.mrz.issuingState,
+      nationality: mrzResult.mrz.nationality,
+      sex: mrzResult.mrz.sex,
+      nameTruncated: mrzResult.mrz.nameTruncated,
+      // The one sentence the client must render with it. Stated
+      // server-side so both surfaces say the same thing and neither can
+      // quietly upgrade it to a verification claim.
+      basis: "Generated from the passport details on this profile.",
+    };
+  } else {
+    mrz = { available: false, gaps: mrzResult.gaps };
+  }
+
+  return {
+    mrz,
+
+    mismatch: {
+      // 0 / 1 / 2. The client renders NOTHING at 0, the data with no match
+      // claim at 1, and the comparison at 2.
+      sourceCount,
+      hasTypedPassport,
+      hasExtraction: Boolean(extractionResult),
+      // Only ever populated in the 2-source case. Computing it at 1 source
+      // and letting the client decide whether to show it would put the
+      // honest-empty rule in the client, where the next surface would get
+      // it wrong.
+      comparison:
+        sourceCount >= 2 && extractionResult
+          ? comparePassportSources(
+              {
+                firstName: traveller?.firstName,
+                middleName: traveller?.middleName,
+                lastName: traveller?.lastName,
+                gender: traveller?.gender,
+                dob: traveller?.dob,
+                nationality: traveller?.nationality,
+                passportNo: traveller?.passportNo,
+                passportExpiry: traveller?.passportExpiry,
+                passportIssueCountry: traveller?.passportIssueCountry,
+              },
+              extractionResult.extraction,
+            )
+          : null,
+      extractionStatus: extractionResult?.extractionStatus ?? null,
+      extractionConfidence: extractionResult?.extractionConfidence ?? null,
+      extractedAt: extractionResult?.extractedAt ?? null,
+      // The client shows this verbatim in the 0- and 1-source branches. The
+      // wording never implies a check happened.
+      reason:
+        sourceCount >= 2
+          ? null
+          : sourceCount === 0
+            ? "No passport details and no passport scan on file."
+            : extractionResult
+              ? "A passport scan has been read, but no passport details are typed on this profile to check it against."
+              : "No passport scan on file to check these details against. Scans uploaded with a visa application are read automatically; documents added here aren't.",
+    },
+  };
 }
 
 /**
@@ -1068,6 +1336,7 @@ router.get("/me", async (req: any, res: any) => {
       header: dossierHeaderUnavailable(),
       capabilities,
       identityCapture: identityCaptureState(),
+      passportVault: await resolvePassportVault(traveller, workspaceId),
       // MANDATORY-ON-SELF-SURFACE (design doc §2.2). Computed server-side so
       // the prompt and the matrix agree, but deliberately NOT enforced as a
       // 400: every other create path legitimately produces a profile
@@ -1741,6 +2010,10 @@ router.get("/:id", async (req: any, res: any) => {
       dossierHealth: computeDossierHealth(traveller),
       header: dossierHeaderUnavailable(),
       identityCapture: identityCaptureState(),
+      // Tab 2. Same payload on both detail surfaces (this and GET /me) —
+      // the admin dossier and the employee's own profile are one record and
+      // must not disagree about what has been checked.
+      passportVault: await resolvePassportVault(traveller, workspaceId),
     });
   } catch (err: any) {
     console.error("[workspace.travellers GET one]", err.message);
@@ -2022,6 +2295,51 @@ router.put("/:id", async (req: any, res: any) => {
     }
     if ("hotelPreferences" in body) {
       traveller.hotelPreferences = applyHotelPreferences(body.hotelPreferences) as any;
+    }
+
+    /* ── Tab 2 — Passport & MRZ Vault ─────────────────────────────────
+     * Two enums allowlisted against their vocabularies (an unrecognised
+     * value clears rather than rejecting the save, matching how
+     * mealPreference and seatPreference already behave), and one number
+     * that carries a declared-on stamp.
+     * ───────────────────────────────────────────────────────────────── */
+    if ("passportBookletSize" in body) {
+      const size = String(body.passportBookletSize ?? "").trim();
+      traveller.passportBookletSize = (PASSPORT_BOOKLET_SIZES as readonly string[]).includes(size)
+        ? (size as any)
+        : undefined;
+    }
+    if ("passportEcrStatus" in body) {
+      const ecr = String(body.passportEcrStatus ?? "").trim().toUpperCase();
+      traveller.passportEcrStatus = (PASSPORT_ECR_STATUSES as readonly string[]).includes(ecr)
+        ? (ecr as any)
+        : undefined;
+    }
+    // BLANK PAGES — the declared-on stamp is written HERE, by the server,
+    // and only when the VALUE ACTUALLY CHANGES. Both halves matter:
+    //
+    //   - Server-side, because a client-supplied "declared on" date is a
+    //     claim the client could get wrong (or backdate), and this figure's
+    //     only defence against going stale is that its date is trustworthy.
+    //   - Only on change, because re-stamping on every unrelated save (a
+    //     seat preference edit sends the whole form) would silently refresh
+    //     a two-year-old figure to today and erase exactly the staleness the
+    //     stamp exists to expose.
+    if ("passportBlankPagesRemaining" in body) {
+      const raw = body.passportBlankPagesRemaining;
+      const cleared = raw === null || raw === undefined || String(raw).trim() === "";
+      const parsed = cleared ? null : Number(raw);
+      const next =
+        parsed === null || !Number.isFinite(parsed) || parsed < 0 ? undefined : Math.floor(parsed);
+
+      if (next !== traveller.passportBlankPagesRemaining) {
+        traveller.passportBlankPagesRemaining = next;
+        // Cleared means there is no declaration left to date.
+        traveller.passportBlankPagesDeclaredAt = next === undefined ? undefined : new Date();
+      }
+    }
+    if ("travelBadges" in body) {
+      traveller.travelBadges = applyTravelBadges(body.travelBadges) as any;
     }
     if ("loyaltyProgrammes" in body) {
       traveller.loyaltyProgrammes = applyLoyaltyProgrammes(body.loyaltyProgrammes) as any;

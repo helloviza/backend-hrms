@@ -104,6 +104,59 @@ export const HOTEL_PREFERENCES = [
 export type HotelPreference = (typeof HOTEL_PREFERENCES)[number];
 
 /**
+ * Passport booklet size, in pages (2026-08-11, Tab 2). The two sizes Indian
+ * passports are issued in; a fixed vocabulary rather than a free number so
+ * the value stays aggregatable and nobody types "36 pages" into a field the
+ * next reader expects to hold "36".
+ *
+ * Stored as STRINGS rather than numbers on purpose: every other value in
+ * this model's form path is a string, and a numeric enum here would be the
+ * only field needing a parse step on both the wire and the form.
+ */
+export const PASSPORT_BOOKLET_SIZES = ["36", "60"] as const;
+export type PassportBookletSize = (typeof PASSPORT_BOOKLET_SIZES)[number];
+
+/**
+ * Emigration Check Required / Not Required (2026-08-11, Tab 2). A real,
+ * checkable fact printed on the passport itself — unlike blank pages below,
+ * this does not decay, so it carries no declared-on stamp.
+ */
+export const PASSPORT_ECR_STATUSES = ["ECR", "ECNR"] as const;
+export type PassportEcrStatus = (typeof PASSPORT_ECR_STATUSES)[number];
+
+/**
+ * Secondary travel programmes — Global Entry, APEC/ABTC and friends
+ * (2026-08-11, Tab 2).
+ *
+ * PURE MANUAL ENTRY. Nothing in this codebase populates, checks or renews
+ * any of these: there is no CBP integration, no ABTC registry call, nothing.
+ * So the UI stores and displays what the person typed and never badges a row
+ * "Active" or "Valid" — the only expiry claim it can make is to repeat the
+ * date the user themselves entered. Starts empty and stays empty until
+ * somebody fills it in; it must never be seeded.
+ *
+ * `expiry` is a "YYYY-MM-DD" string, matching every other date on this model
+ * (never a Date — see the dob note).
+ */
+export const TRAVEL_BADGE_PROGRAMMES = [
+  "GLOBAL_ENTRY",
+  "APEC_ABTC",
+  "TSA_PRECHECK",
+  "NEXUS",
+  "SENTRI",
+  "OTHER",
+] as const;
+export type TravelBadgeProgramme = (typeof TRAVEL_BADGE_PROGRAMMES)[number];
+
+export interface TravelBadgeEntry {
+  programme?: TravelBadgeProgramme;
+  /** Free text, used only when programme === "OTHER". */
+  programmeName?: string;
+  number?: string;
+  expiry?: string; // "YYYY-MM-DD"
+}
+
+/**
  * A regulated national ID — the number plus a pointer to the scan of the
  * card it came from. Nested rather than four flat keys so "the number" and
  * "the image it was read off" stay visibly one thing, and so the encryption
@@ -233,6 +286,34 @@ export interface TravellerProfileDocument extends Document {
   passportIssueCountry?: string;
   passportIssueDate?: string; // "YYYY-MM-DD"
 
+  /* ── Tab 2 — Passport & MRZ Vault (2026-08-11) ─────────────────────── */
+
+  /** The issuing office printed on the passport, e.g. "BENGALURU". */
+  passportPlaceOfIssue?: string;
+  passportBookletSize?: PassportBookletSize;
+
+  /**
+   * Blank visa pages left in the booklet — SELF-DECLARED, and it DECAYS.
+   *
+   * Nothing in this system observes a stamp, so this number is only ever as
+   * true as the day someone typed it. `passportBlankPagesDeclaredAt` is
+   * therefore written alongside it by the route on every change, and the UI
+   * is required to render the value WITH its declared-on date — a bare "4
+   * pages left" two years stale is exactly the kind of plausible-but-wrong
+   * figure a traveller could be refused boarding over.
+   *
+   * Consequence of the pairing: the stamp is not optional decoration. A
+   * value present with no date means the row predates this field, and the
+   * surface says "declared date unknown" rather than implying it is current.
+   */
+  passportBlankPagesRemaining?: number;
+  passportBlankPagesDeclaredAt?: Date;
+
+  passportEcrStatus?: PassportEcrStatus;
+
+  /** Manual-entry only, never verified — see TRAVEL_BADGE_PROGRAMMES. */
+  travelBadges: TravelBadgeEntry[];
+
   mobile?: string;
   /**
    * Dial code, e.g. "+91" (2026-08-11). Sits ALONGSIDE `mobile`, which
@@ -359,6 +440,16 @@ const LoyaltyProgrammeSchema = new Schema<LoyaltyProgrammeEntry>(
   { _id: false },
 );
 
+const TravelBadgeSchema = new Schema<TravelBadgeEntry>(
+  {
+    programme: { type: String, enum: TRAVEL_BADGE_PROGRAMMES },
+    programmeName: { type: String, trim: true },
+    number: { type: String, trim: true },
+    expiry: { type: String },
+  },
+  { _id: false },
+);
+
 const EmergencyContactSchema = new Schema<EmergencyContactEntry>(
   {
     name: { type: String, trim: true },
@@ -409,6 +500,18 @@ const TravellerProfileSchema = new Schema<TravellerProfileDocument>(
     passportExpiry: { type: String },
     passportIssueCountry: { type: String, trim: true },
     passportIssueDate: { type: String },
+
+    passportPlaceOfIssue: { type: String, trim: true },
+    passportBookletSize: { type: String, enum: PASSPORT_BOOKLET_SIZES },
+    // min 0 only — no upper bound tied to bookletSize. A 60-page booklet
+    // with 61 blank pages is nonsense, but so is refusing to store what
+    // someone typed about their own document; the surface shows the
+    // declared-on date and lets a human judge it.
+    passportBlankPagesRemaining: { type: Number, min: 0 },
+    passportBlankPagesDeclaredAt: { type: Date },
+    passportEcrStatus: { type: String, enum: PASSPORT_ECR_STATUSES },
+
+    travelBadges: { type: [TravelBadgeSchema], default: [] },
 
     mobile: { type: String, trim: true },
     mobileCountryCode: { type: String, trim: true },

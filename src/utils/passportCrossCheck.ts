@@ -12,6 +12,7 @@
 // just flagged (task brief: "Surface it; never auto-reject").
 import { resolveMrzDate, type ParsedMrz } from "./mrz.js";
 import { normaliseToIso2 } from "./countryCodes.js";
+import { mrzSexFromGender } from "./mrzCompose.js";
 import type { PassportVizFields } from "../services/extractPassportGemini.js";
 
 export type PassportCrossCheckField =
@@ -256,4 +257,274 @@ export function crossCheckPassportIdentity(
   }
 
   return mismatches;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * PASSPORT & MRZ VAULT — the Database Mismatch Check (2026-08-11, Tab 2)
+ *
+ * THE WHOLE POINT OF THIS BLOCK IS THAT IT COMPARES TWO DIFFERENT SOURCES.
+ *
+ * Source 1 is what a human TYPED into the traveller profile.
+ * Source 2 is an MRZ actually READ OFF AN UPLOADED SCAN — VisaDocument
+ * .extractedFields, produced by services/visaPassportExtraction.ts and
+ * check-digit verified by utils/mrz.ts before it was ever stored.
+ *
+ * Those are genuinely independent, so agreement between them is real
+ * evidence and disagreement is a real finding. That is what separates this
+ * from the two things the design doc forbids:
+ *
+ *   - "checksum verified" over an MRZ WE composed from our own fields
+ *     (utils/mrzCompose.ts's header) — our arithmetic vs our arithmetic;
+ *   - a "100% match" panel rendered when only ONE source exists — a value
+ *     compared to itself, which cannot fail.
+ *
+ * This function therefore does NOT decide whether to render anything. It
+ * compares whatever it is given, and the CALLER counts sources and decides
+ * (routes/workspace.travellers.ts's resolvePassportVault). The counting is
+ * kept out of here so this stays a pure comparator with no notion of "how
+ * many sources are enough" baked into it.
+ *
+ * Distinct from crossCheckPassportIdentity above, which answers "does this
+ * scan belong to this person" and returns MISMATCHES ONLY. This one returns
+ * a row per field INCLUDING the agreements, because the panel shows the
+ * whole comparison — and because a percentage needs a denominator that only
+ * exists if matches are counted too.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+export type PassportSourceField =
+  | "surname"
+  | "givenNames"
+  | "dateOfBirth"
+  | "documentNumber"
+  | "dateOfExpiry"
+  | "sex"
+  | "nationality"
+  | "issuingState";
+
+/**
+ * NOT_COMPARABLE is a first-class outcome, not a failure. A field only one
+ * source holds has nothing to check — reporting it as a match would invent
+ * agreement, and reporting it as a mismatch would invent a discrepancy.
+ * It is excluded from BOTH halves of the percentage.
+ */
+export type PassportSourceStatus = "MATCH" | "MISMATCH" | "NOT_COMPARABLE";
+
+export interface PassportSourceRow {
+  field: PassportSourceField;
+  status: PassportSourceStatus;
+  /** Exactly as held, never case-forced — the comparison normalises, the display does not. */
+  profileValue: string | null;
+  /** The value read off the scan, resolved to display form (dates as YYYY-MM-DD). */
+  extractedValue: string | null;
+}
+
+export interface PassportSourceComparison {
+  rows: PassportSourceRow[];
+  /** Fields both sources hold — the percentage's denominator. */
+  comparedCount: number;
+  matchedCount: number;
+  mismatchedCount: number;
+  /**
+   * null when comparedCount is 0. A "0 of 0" comparison has no percentage,
+   * and rendering 100% (or 0%) for it would be exactly the fabricated
+   * assurance this whole block exists to avoid.
+   */
+  matchPercent: number | null;
+}
+
+/** The profile side — TravellerProfile's own keys, no model import. */
+export interface PassportSourceProfile {
+  firstName?: string | null;
+  middleName?: string | null;
+  lastName?: string | null;
+  gender?: string | null;
+  dob?: string | null; // "YYYY-MM-DD"
+  nationality?: string | null;
+  passportNo?: string | null;
+  passportExpiry?: string | null; // "YYYY-MM-DD"
+  passportIssueCountry?: string | null;
+}
+
+/**
+ * The extraction side — VisaDocument.extractedFields flattened to a map.
+ * Only the MRZ-derived keys are read; the `viz_`, `check_` and
+ * `identity_mismatch_` families that share that array are ignored, since
+ * they are not passport field values.
+ *
+ * Dates arrive as RAW YYMMDD here (ParsedMrz keeps them unresolved — see
+ * its own type comment), which is why every date below goes through
+ * resolveMrzDate before it is compared or displayed. Comparing "740812"
+ * against "1974-08-12" as strings would report every single passport as a
+ * mismatch.
+ */
+export interface PassportSourceExtraction {
+  surname?: string;
+  givenNames?: string;
+  documentNumber?: string;
+  nationality?: string;
+  issuingState?: string;
+  dateOfBirth?: string; // raw "YYMMDD"
+  sex?: string; // "M" | "F" | "<"
+  dateOfExpiry?: string; // raw "YYMMDD"
+}
+
+/** Pull the MRZ field values out of a VisaDocument.extractedFields array. */
+export function readPassportExtraction(
+  extractedFields: ReadonlyArray<{ key: string; value: string }> | null | undefined,
+): PassportSourceExtraction {
+  const map = new Map<string, string>();
+  for (const f of extractedFields ?? []) {
+    if (f && typeof f.key === "string" && typeof f.value === "string") map.set(f.key, f.value);
+  }
+  const pick = (k: string) => {
+    const v = (map.get(k) || "").trim();
+    return v || undefined;
+  };
+  return {
+    surname: pick("surname"),
+    givenNames: pick("givenNames"),
+    documentNumber: pick("documentNumber"),
+    nationality: pick("nationality"),
+    issuingState: pick("issuingState"),
+    dateOfBirth: pick("dateOfBirth"),
+    sex: pick("sex"),
+    dateOfExpiry: pick("dateOfExpiry"),
+  };
+}
+
+/**
+ * True when this extraction carries enough MRZ data to be a second source
+ * at all. A VisaDocument whose extraction FAILED still has an
+ * extractedFields array — it holds `failureCategory` and `error` — and
+ * treating that as a source would produce a comparison panel with every row
+ * NOT_COMPARABLE, which reads as "we checked and found nothing wrong".
+ *
+ * The document number is the anchor: it is the field the whole comparison
+ * hangs on, and an MRZ read without one isn't a passport read.
+ */
+export function isUsablePassportExtraction(extraction: PassportSourceExtraction): boolean {
+  return Boolean(extraction.documentNumber);
+}
+
+/**
+ * Compare typed profile fields against an MRZ extracted from a scan.
+ *
+ * Every comparison uses the SAME normalisation the rest of this module
+ * already established — tolerant name matching (initials, middle names,
+ * ordering), punctuation-insensitive document numbers, ISO-2 country
+ * folding — so a real-world-equivalent pair is not reported as a
+ * discrepancy. A mismatch here should mean something.
+ */
+export function comparePassportSources(
+  profile: PassportSourceProfile,
+  extraction: PassportSourceExtraction,
+): PassportSourceComparison {
+  const rows: PassportSourceRow[] = [];
+
+  function push(
+    field: PassportSourceField,
+    profileValue: string | null,
+    extractedValue: string | null,
+    matches: () => boolean,
+  ) {
+    const hasProfile = Boolean(profileValue && profileValue.trim());
+    const hasExtracted = Boolean(extractedValue && extractedValue.trim());
+    if (!hasProfile || !hasExtracted) {
+      rows.push({
+        field,
+        status: "NOT_COMPARABLE",
+        profileValue: hasProfile ? profileValue : null,
+        extractedValue: hasExtracted ? extractedValue : null,
+      });
+      return;
+    }
+    rows.push({
+      field,
+      status: matches() ? "MATCH" : "MISMATCH",
+      profileValue,
+      extractedValue,
+    });
+  }
+
+  const profileSurname = (profile.lastName || "").trim() || null;
+  const extractedSurname = extraction.surname || null;
+  push("surname", profileSurname, extractedSurname, () =>
+    namesTolerantMatch(extractedSurname!, profileSurname!),
+  );
+
+  // firstName + middleName, for the same reason crossCheckPassportIdentity
+  // combines them: the MRZ routinely carries a middle name in givenNames
+  // that we keep in its own column.
+  const profileGivenNames =
+    [profile.firstName, profile.middleName]
+      .map((s) => (s || "").trim())
+      .filter(Boolean)
+      .join(" ") || null;
+  const extractedGivenNames = extraction.givenNames || null;
+  push("givenNames", profileGivenNames, extractedGivenNames, () =>
+    namesTolerantMatch(extractedGivenNames!, profileGivenNames!),
+  );
+
+  const profileDob = (profile.dob || "").trim() || null;
+  const extractedDob = extraction.dateOfBirth ? resolveMrzDate(extraction.dateOfBirth, "dob") : null;
+  push("dateOfBirth", profileDob, extractedDob, () => extractedDob === profileDob);
+
+  const profilePassportNo = (profile.passportNo || "").trim() || null;
+  const extractedDocumentNumber = extraction.documentNumber || null;
+  push("documentNumber", profilePassportNo, extractedDocumentNumber, () =>
+    normaliseDocumentNumber(extractedDocumentNumber!) === normaliseDocumentNumber(profilePassportNo!),
+  );
+
+  const profileExpiry = (profile.passportExpiry || "").trim() || null;
+  const extractedExpiry = extraction.dateOfExpiry ? resolveMrzDate(extraction.dateOfExpiry, "expiry") : null;
+  push("dateOfExpiry", profileExpiry, extractedExpiry, () => extractedExpiry === profileExpiry);
+
+  // SEX is compared in MRZ terms on both sides — our free-text gender goes
+  // through the same mapping the composed MRZ uses, so "Male" vs "M" is a
+  // match rather than a discrepancy. An unspecified value on EITHER side
+  // ("<", or an absent gender, which maps to "<") is NOT_COMPARABLE: "<"
+  // means "the document doesn't say", and two sources both saying nothing
+  // is not agreement.
+  const profileSex = (profile.gender || "").trim() ? mrzSexFromGender(profile.gender) : null;
+  const extractedSex = extraction.sex && extraction.sex !== "<" ? extraction.sex.toUpperCase() : null;
+  push(
+    "sex",
+    profileSex === "<" ? null : (profile.gender || "").trim() || null,
+    extractedSex,
+    () => profileSex === extractedSex,
+  );
+
+  // Countries fold to ISO-2 on both sides — the profile stores ISO-2 from
+  // CountryPicker, the MRZ carries ISO-3/ICAO. A literal compare would
+  // report "IN" vs "IND" as a mismatch on every Indian passport.
+  const profileNationality = (profile.nationality || "").trim() || null;
+  const extractedNationality = extraction.nationality || null;
+  push("nationality", profileNationality, extractedNationality, () => {
+    const a = normaliseToIso2(profileNationality);
+    const b = normaliseToIso2(extractedNationality);
+    // An unrecognised code on either side is not evidence of disagreement —
+    // it is our table being incomplete. Treated as a match-by-abstention
+    // rather than a mismatch we'd be asserting without knowing.
+    return !a || !b ? true : a === b;
+  });
+
+  const profileIssueCountry = (profile.passportIssueCountry || "").trim() || null;
+  const extractedIssuingState = extraction.issuingState || null;
+  push("issuingState", profileIssueCountry, extractedIssuingState, () => {
+    const a = normaliseToIso2(profileIssueCountry);
+    const b = normaliseToIso2(extractedIssuingState);
+    return !a || !b ? true : a === b;
+  });
+
+  const matchedCount = rows.filter((r) => r.status === "MATCH").length;
+  const mismatchedCount = rows.filter((r) => r.status === "MISMATCH").length;
+  const comparedCount = matchedCount + mismatchedCount;
+
+  return {
+    rows,
+    comparedCount,
+    matchedCount,
+    mismatchedCount,
+    matchPercent: comparedCount === 0 ? null : Math.round((matchedCount / comparedCount) * 100),
+  };
 }
