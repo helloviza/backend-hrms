@@ -66,8 +66,18 @@ type ModulesTemplate = {
   crmContacts?:      ModulePermission
   crmCompanies?:     ModulePermission
   leads?:            ModulePermission
+  // CSTEP Travel & Claim Portal
+  cstep:             ModulePermission
   // Visa Application (concierge console)
   visaApplication:   ModulePermission
+  // Visa Screening (2026-08-12) — the authority to judge an applicant's
+  // evidence, sibling to visaApplication rather than a tier above it.
+  // DELIBERATELY NONE in every template below, including L6/L8: which
+  // level(s) should carry it is an open product decision about how the ops
+  // team is structured (see infra/audit/
+  // visa-screening-authority-model-2026-08-12.md §"decision"). Introducing
+  // the key without granting it is what makes step 1 a no-op at runtime.
+  visaScreening:     ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -112,7 +122,9 @@ const L1: ModulesTemplate = {
   crmContacts:       NONE,
   crmCompanies:      NONE,
   leads:             NONE,
+  cstep:             NONE,
   visaApplication:   NONE,
+  visaScreening:     NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -192,7 +204,9 @@ const L6: ModulesTemplate = {
   crmContacts:       WRITE_WS,
   crmCompanies:      WRITE_WS,
   leads:             WRITE_WS,
+  cstep:             FULL_WS,
   visaApplication:   FULL_WS,
+  visaScreening:     NONE,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -208,6 +222,7 @@ const L7: ModulesTemplate = {
   crmCompanies:    READ_ALL,
   leads:           READ_ALL,
   visaApplication: READ_ALL,
+  visaScreening:   NONE,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -252,7 +267,9 @@ const L8: ModulesTemplate = {
   crmContacts:       FULL_ALL,
   crmCompanies:      FULL_ALL,
   leads:             FULL_ALL,
+  cstep:             FULL_WS,
   visaApplication:   FULL_ALL,
+  visaScreening:     NONE,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -297,7 +314,9 @@ const VENDOR: ModulesTemplate = {
   crmContacts:       NONE,
   crmCompanies:      NONE,
   leads:             NONE,
+  cstep:             NONE,
   visaApplication:   NONE,
+  visaScreening:     NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -342,7 +361,9 @@ const CUSTOMER_SBT: ModulesTemplate = {
   crmContacts:       NONE,
   crmCompanies:      NONE,
   leads:             NONE,
+  cstep:             NONE,
   visaApplication:   NONE,
+  visaScreening:     NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -387,7 +408,9 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   crmContacts:       NONE,
   crmCompanies:      NONE,
   leads:             NONE,
+  cstep:             NONE,
   visaApplication:   NONE,
+  visaScreening:     NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

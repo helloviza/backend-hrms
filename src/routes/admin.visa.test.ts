@@ -413,10 +413,21 @@ function matchesPermFilter(rec: any, filter: any): boolean {
     return String(val) === String(cond);
   });
 }
-function grantVisaPermission(userId: any, access: "READ" | "WRITE" | "FULL", opts: { level?: string; status?: string } = {}) {
+// `screening` (2026-08-12) grants the SIBLING visaScreening capability. The
+// two assignment slots now validate against different capabilities, so a
+// fixture that only grants visaApplication can no longer be dropped into the
+// screening slot — which is the whole point of the split.
+function grantVisaPermission(
+  userId: any,
+  access: "READ" | "WRITE" | "FULL",
+  opts: { level?: string; status?: string; screening?: "READ" | "WRITE" | "FULL" } = {},
+) {
   _userPermissions.push({
     userId: String(userId),
-    modules: { visaApplication: { access, scope: "ALL" } },
+    modules: {
+      visaApplication: { access, scope: "ALL" },
+      visaScreening: { access: opts.screening ?? "NONE", scope: "ALL" },
+    },
     level: { code: opts.level ?? "L4" },
     status: opts.status ?? "active",
   });
@@ -1750,7 +1761,7 @@ describe("PATCH /applications/:id/assignment", () => {
     const concierge = _users.insert({ name: "Asha Rao", email: "asha@plumtrips.com" });
     const officer = _users.insert({ name: "Ravi Kumar", email: "ravi@plumtrips.com" });
     grantVisaPermission(concierge._id, "WRITE");
-    grantVisaPermission(officer._id, "FULL");
+    grantVisaPermission(officer._id, "FULL", { screening: "WRITE" });
 
     const res = await request(app).patch(`/applications/${a._id}/assignment`).send({
       assignedConciergeUserId: String(concierge._id),

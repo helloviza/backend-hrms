@@ -71,6 +71,7 @@ import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import VisaActivityLog, { logVisaActivity, type VisaActivityEventType } from "../models/VisaActivityLog.js";
 import { assessProcessingRisk, atRiskCutoff } from "../utils/visaEta.js";
+import { checkScreeningAuthority } from "../services/visaScreeningAuthority.js";
 import { hydrateVisaChecklist, computeOutstandingRequirements } from "../utils/visaChecklistHydration.js";
 import { resolveVisaChecklistWithExclusions } from "../utils/visaChecklistResolver.js";
 
@@ -972,6 +973,19 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
       if (!reason) {
         return res.status(400).json({ error: "reason is required to set discrepancy_flagged" });
       }
+      // SCREENING ACT — the discrepancy IS the screening finding. Dormant by
+      // default (config/visaScreening.ts): with VISA_SCREENING_ENFORCED unset
+      // this returns null without touching anything, so today's behaviour is
+      // byte-for-byte unchanged.
+      const screeningRefusal = await checkScreeningAuthority({
+        act: "DISCREPANCY_SET",
+        userId: actorId(req),
+        roles: req.user?.roles,
+        application,
+      });
+      if (screeningRefusal) {
+        return res.status(screeningRefusal.status).json({ error: screeningRefusal.error, reason: screeningRefusal.reason });
+      }
       await setDiscrepancyFlagged(id, reason, actorId(req));
       // The reason IS logged — an internal ops finding, the same class of
       // content VisaActivityLog's no-PII rule already allows for
@@ -993,6 +1007,19 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
       // where the application really was.
       if (!PRE_DECISION_STATUSES.includes(target as VisaApplicationStatus)) {
         return res.status(400).json({ error: `Cannot clear discrepancy_flagged into '${target}'`, current, target });
+      }
+      // SCREENING ACT — only the screener declares their own finding
+      // resolved. A concierge can still hand the finding to the customer
+      // (escalating to action_required, which is shared); they just cannot
+      // say it is fixed. Dormant by default.
+      const clearRefusal = await checkScreeningAuthority({
+        act: "DISCREPANCY_CLEAR",
+        userId: actorId(req),
+        roles: req.user?.roles,
+        application,
+      });
+      if (clearRefusal) {
+        return res.status(clearRefusal.status).json({ error: clearRefusal.error, reason: clearRefusal.reason });
       }
       const resumed = await clearDiscrepancyFlagged(id);
       await logVisaActivity({
@@ -1208,6 +1235,20 @@ router.patch("/documents/:id/review", requirePermission("visaApplication", "WRIT
     const owningApplication = await VisaApplication.findById((existingDoc as any).applicationId).lean();
     if (isTravellerErased(owningApplication)) {
       return res.status(409).json({ error: VISA_APPLICATION_ERASED_MESSAGE });
+    }
+
+    // SCREENING ACT — accepting or rejecting a document against the
+    // checklist is the screening act the audit named. Dormant by default;
+    // owningApplication is already loaded above for the erasure guard, so
+    // the per-case half costs no extra read.
+    const reviewRefusal = await checkScreeningAuthority({
+      act: "DOCUMENT_REVIEW",
+      userId: actorId(req),
+      roles: req.user?.roles,
+      application: owningApplication as any,
+    });
+    if (reviewRefusal) {
+      return res.status(reviewRefusal.status).json({ error: reviewRefusal.error, reason: reviewRefusal.reason });
     }
 
     const update: any = {
@@ -1699,20 +1740,41 @@ const ASSIGNMENT_ROLES = {
 type AssignmentRoleKey = keyof typeof ASSIGNMENT_ROLES;
 const ASSIGNMENT_ROLE_KEYS = Object.keys(ASSIGNMENT_ROLES) as AssignmentRoleKey[];
 
-// True for a SUPERADMIN (who bypasses the visaApplication gate entirely —
-// same posture as requirePermission/isSuperAdmin) or an active, non-
-// suspended/revoked UserPermission grant of visaApplication at WRITE or
-// FULL. Mirrors requirePermission's own gate exactly — never allow
-// assigning a case to someone who could not open it themselves.
-async function userCanBeAssignedVisaCases(userId: any): Promise<boolean> {
+// PER-ROLE eligibility (2026-08-12). Previously ONE shared check
+// (userCanBeAssignedVisaCases) validated both assignment slots, which is
+// precisely what made them interchangeable: anyone assignable as a concierge
+// was equally assignable as a screening officer, so the screening slot was a
+// label with no meaning behind it. Each role now validates against its own
+// capability.
+//
+// Both keep the same two rules requirePermission itself uses — a SUPERADMIN
+// bypasses by role, and everyone else needs an active, non-suspended grant
+// at WRITE or above. Never allow assigning a case to someone who could not
+// act on it themselves.
+//
+// NOTE for step 1: no level template grants visaScreening yet, so the
+// screening pool is EMPTY (SUPERADMINs aside) until that product decision is
+// made. That is correct and honest rather than a bug — an empty list says
+// "nobody has been made a screener", which is true. It is also why the
+// assignment validation below is not gated on the enforcement flag: refusing
+// to assign a non-screener to the screening slot is a data-integrity rule
+// that should hold whether or not the ACT gates are switched on. If that
+// proves too strict before the capability is granted, the fix is to grant
+// it, not to loosen this.
+const ASSIGNMENT_ROLE_CAPABILITY: Record<AssignmentRoleKey, "visaApplication" | "visaScreening"> = {
+  assignedConciergeUserId: "visaApplication",
+  assignedScreeningOfficerId: "visaScreening",
+};
+
+async function userHoldsCapability(userId: any, moduleKey: string): Promise<boolean> {
   const user = await User.findById(userId).select("roles status").lean();
   if (!user || (user as any).status === "INACTIVE") return false;
   if (Array.isArray((user as any).roles) && (user as any).roles.includes("SUPERADMIN")) return true;
 
   const perm = await UserPermission.findOne({ userId: String(userId), status: "active" })
-    .select("modules.visaApplication")
+    .select(`modules.${moduleKey}`)
     .lean();
-  const access = (perm as any)?.modules?.visaApplication?.access || "NONE";
+  const access = (perm as any)?.modules?.[moduleKey]?.access || "NONE";
   return hasAccess(access, "WRITE");
 }
 
@@ -1750,9 +1812,10 @@ async function buildAssignmentUpdate(
     if (!user || (user as any).status === "INACTIVE") {
       return { error: `${key}: no such staff user`, status: 404 };
     }
-    if (!(await userCanBeAssignedVisaCases(userId))) {
+    const capability = ASSIGNMENT_ROLE_CAPABILITY[key];
+    if (!(await userHoldsCapability(userId, capability))) {
       return {
-        error: `${key}: this user does not have visaApplication WRITE access and cannot be assigned a case`,
+        error: `${key}: this user does not have ${capability} WRITE access and cannot be assigned this role`,
         status: 400,
       };
     }
@@ -1918,58 +1981,74 @@ router.post("/applications/bulk-assign", requirePermission("visaApplication", "W
 });
 
 /* ─────────────────────────────────────────────────────────────────────
- * GET /assignable-users — every staff user who could actually be assigned a
- * case: an active, non-suspended/revoked visaApplication WRITE or FULL
- * grant, unioned with SUPERADMINs (who bypass the gate by role — see
- * userCanBeAssignedVisaCases above, same posture as requirePermission
- * itself). Feeds the assign control in the console.
+ * GET /assignable-users — who may be assigned each role, as TWO lists.
+ *
+ * Was one undifferentiated list feeding both pickers, so a user with no
+ * screening authority could be dropped into the screening slot. Each list is
+ * now the pool for its own capability: concierge = visaApplication WRITE/FULL,
+ * screening = visaScreening WRITE/FULL, both unioned with SUPERADMINs (who
+ * bypass by role, same posture as requirePermission itself).
+ *
+ * `screening` will be EMPTY except for SUPERADMINs until visaScreening is
+ * granted to a level — see the note on ASSIGNMENT_ROLE_CAPABILITY. An empty
+ * list is the honest answer to "who are the screeners" while the answer is
+ * "nobody yet".
+ *
+ * `users` is retained, populated with the concierge list, so the existing
+ * console keeps working while the frontend moves to the split shape — a
+ * flag-day change across two apps buys nothing here.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/assignable-users", requirePermission("visaApplication", "READ"), async (_req: any, res: any) => {
   try {
-    const grants = await UserPermission.find({
-      "modules.visaApplication.access": { $in: ["WRITE", "FULL"] },
-      status: "active",
-    })
-      .select("userId modules.visaApplication level")
-      .lean();
-
-    const accessByUserId = new Map<string, { access: "WRITE" | "FULL"; level: string }>();
-    for (const g of grants as any[]) {
-      const uid = String(g.userId || "");
-      if (!mongoose.isValidObjectId(uid)) continue;
-      accessByUserId.set(uid, {
-        access: g.modules?.visaApplication?.access,
-        level: g.level?.code || "",
-      });
-    }
-
     const superAdmins = await User.find({ roles: "SUPERADMIN", status: { $ne: "INACTIVE" } })
       .select("_id")
       .lean();
-    for (const u of superAdmins as any[]) {
-      const uid = String(u._id);
-      if (!accessByUserId.has(uid)) accessByUserId.set(uid, { access: "FULL", level: "SUPERADMIN" });
+
+    async function poolFor(moduleKey: "visaApplication" | "visaScreening") {
+      const grants = await UserPermission.find({
+        [`modules.${moduleKey}.access`]: { $in: ["WRITE", "FULL"] },
+        status: "active",
+      })
+        .select(`userId modules.${moduleKey} level`)
+        .lean();
+
+      const accessByUserId = new Map<string, { access: string; level: string }>();
+      for (const g of grants as any[]) {
+        const uid = String(g.userId || "");
+        if (!mongoose.isValidObjectId(uid)) continue;
+        accessByUserId.set(uid, {
+          access: g.modules?.[moduleKey]?.access,
+          level: g.level?.code || "",
+        });
+      }
+      for (const u of superAdmins as any[]) {
+        const uid = String(u._id);
+        if (!accessByUserId.has(uid)) accessByUserId.set(uid, { access: "FULL", level: "SUPERADMIN" });
+      }
+
+      const ids = [...accessByUserId.keys()];
+      const users = ids.length
+        ? await User.find({ _id: { $in: ids }, status: { $ne: "INACTIVE" } }).select("_id name email").lean()
+        : [];
+
+      return users
+        .map((u: any) => {
+          const grant = accessByUserId.get(String(u._id))!;
+          return {
+            id: String(u._id),
+            name: u.name || u.email || "Unnamed",
+            email: u.email || null,
+            access: grant.access,
+            level: grant.level,
+          };
+        })
+        .sort((a, b) => a.name.localeCompare(b.name));
     }
 
-    const ids = [...accessByUserId.keys()];
-    const users = ids.length
-      ? await User.find({ _id: { $in: ids }, status: { $ne: "INACTIVE" } }).select("_id name email").lean()
-      : [];
+    const concierge = await poolFor("visaApplication");
+    const screening = await poolFor("visaScreening");
 
-    const shaped = users
-      .map((u: any) => {
-        const grant = accessByUserId.get(String(u._id))!;
-        return {
-          id: String(u._id),
-          name: u.name || u.email || "Unnamed",
-          email: u.email || null,
-          access: grant.access,
-          level: grant.level,
-        };
-      })
-      .sort((a, b) => a.name.localeCompare(b.name));
-
-    res.json({ ok: true, users: shaped });
+    res.json({ ok: true, concierge, screening, users: concierge });
   } catch (err: any) {
     console.error("[admin visa assignable-users GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load assignable users" });
