@@ -68,7 +68,7 @@ import {
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import VisaActivityLog, { logVisaActivity, type VisaActivityEventType } from "../models/VisaActivityLog.js";
-import { assessProcessingRisk } from "../utils/visaEta.js";
+import { assessProcessingRisk, atRiskCutoff } from "../utils/visaEta.js";
 import { hydrateVisaChecklist, computeOutstandingRequirements } from "../utils/visaChecklistHydration.js";
 import { resolveVisaChecklistWithExclusions } from "../utils/visaChecklistResolver.js";
 
@@ -247,19 +247,39 @@ function mapAdminApplicationSummary(a: any) {
 /* ─────────────────────────────────────────────────────────────────────
  * GET /queue — cross-workspace list of applications.
  *
- * Deliberately NOT an aggregation pipeline with $lookup — separate finds
- * plus in-memory Map joins, same style routes/visa.ts's own
- * hydrateApplicationsWithTravellers already uses for its (single-
- * workspace) join. At this module's real scale that's simpler to read,
- * test, and reason about than a multi-stage pipeline, and avoids hard-
- * coding collection name strings a schema change could silently break.
+ * MATCHING, BANDING, SORTING and PAGINATION all happen in the database
+ * (2026-08-12). This route used to run find(filter).lean() UNBOUNDED, join
+ * every matching case cross-workspace, then filter destination/at-risk,
+ * sort and slice the page in Node — so the cost of returning 20 rows scaled
+ * with the size of the whole queue. It is now one $match/$addFields/$sort/
+ * $skip/$limit pipeline over fields denormalised onto VisaApplication.
  *
- * Sort is urgency, not arrival (task brief): action_required rows always
- * sort above everything else, then soonest travelDateFrom first (a
- * request with no travel dates set sorts to the very end, never the
- * front, via the sentinel below).
+ * The ENRICHMENT joins (request, workspace, traveller, assignee, documents)
+ * are still separate finds plus in-memory Map joins rather than $lookup —
+ * same style routes/visa.ts's hydrateApplicationsWithTravellers uses, and
+ * it avoids hard-coding collection-name strings a schema change could
+ * silently break. The difference is that they now run for the PAGE only.
+ *
+ * Sort is priority, not arrival — see the band comment inside.
  * ───────────────────────────────────────────────────────────────────── */
-const FAR_FUTURE_SENTINEL = new Date(8640000000000000);
+
+/**
+ * Add one condition to the queue filter without clobbering a key another
+ * filter already claimed — the fold-into-$and idiom the individual filters
+ * below already use inline, factored out because the query-side destination
+ * and at-risk filters (2026-08-12) need it for `status` and `outcome` too.
+ */
+function andCondition(target: any, condition: Record<string, unknown>): void {
+  const key = Object.keys(condition)[0];
+  if (target.$and) {
+    target.$and.push(condition);
+  } else if (target[key] !== undefined) {
+    target.$and = [{ [key]: target[key] }, condition];
+    delete target[key];
+  } else {
+    Object.assign(target, condition);
+  }
+}
 
 router.get("/queue", requirePermission("visaApplication", "READ"), async (req: any, res: any) => {
   try {
@@ -412,44 +432,162 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       }
     }
 
-    const applications = await VisaApplication.find(filter).lean();
+    // ── Query-side narrowing (2026-08-12) ─────────────────────────────
+    // destination and at-risk were the last two filters still applied in
+    // memory AFTER the request join, which is what forced this route to
+    // fetch EVERY matching case cross-workspace into Node before it could
+    // filter, sort or paginate. Both now run in the query, against the
+    // fields denormalised onto VisaApplication (models/VisaApplication.ts).
+    if (req.query.destination != null) {
+      const v = String(req.query.destination).trim().toUpperCase();
+      if (v) andCondition(filter, { destinationIso2: v });
+    }
 
-    const requestIds = [...new Set(applications.map((a: any) => String(a.requestId)))];
+    // One `now` for the whole request — the at-risk filter, the priority
+    // band and the row marker MUST see the same instant, or a row could
+    // satisfy the filter and then be banded not-at-risk in the same
+    // response. riskCutoff is the DAY-granularity comparison point
+    // (utils/visaEta.ts's atRiskCutoff): a deadline falling today has not
+    // been missed, only one on a strictly earlier day has. Because a stored
+    // deadline is an exact instant, `deadline < startOfDay(now)` expresses
+    // that as a plain indexed range match — no day-truncation in the query.
+    const now = new Date();
+    const riskCutoff = atRiskCutoff(now);
+
+    // ?atRisk=true — the same three conditions the At-Risk band uses, and
+    // the same ones computeRowRisk applies below, so the filter, the band
+    // and the row's own `risk` marker can never select differently. An
+    // application with an outcome, or closed/draft, has nothing left to
+    // risk however long its deadline has been past.
+    if (req.query.atRisk === "true") {
+      andCondition(filter, { outcome: null });
+      andCondition(filter, { status: { $nin: ["closed", "draft"] } });
+      andCondition(filter, { processingDeadlineAt: { $ne: null, $lt: riskCutoff } });
+    }
+
+    // Pagination total — counted in the DB against the same filter, rather
+    // than by materialising every matching row and taking .length. The
+    // band/sort stages below cannot change a count, so this needs none of
+    // them and stays index-backed.
+    const total = await VisaApplication.countDocuments(filter);
+
+    // ── Priority bands (2026-08-12) ───────────────────────────────────
+    // This queue is a WORKLIST: what an agent should pick up next, in
+    // order.
+    //   1  AT-RISK   — the processing deadline has passed. Preempts
+    //                  everything below because it is a DEADLINE, not a
+    //                  preference: a missed trip is the worst outcome this
+    //                  queue can produce.
+    //   2  RESPONDED — action_required and the customer has come back, so
+    //                  we are now the only thing outstanding.
+    //   3  AWAITING  — action_required, still waiting on the customer.
+    //   4  the rest.
+    // Bands 2 and 3 are the previous top two urgency tiers (Phase 9f)
+    // preserved EXACTLY — At-Risk was inserted above them, nothing was
+    // collapsed or reordered underneath.
+    //
+    // Within every band: soonest travel first, DATELESS LAST. A row with no
+    // travel date is UNASSESSABLE, which is not the same as safe — it can
+    // never enter band 1 by absence (the band requires a non-null
+    // deadline), it sorts behind every dated row in its own band, and it is
+    // flagged travelDateMissing in the payload so the console can say "no
+    // travel date" instead of rendering a blank. `_dateless` is a boolean
+    // and false sorts before true in BSON, which is exactly that order.
+    //
+    // aggregate() bypasses the workspaceScope plugin (which only hooks
+    // find/findOne/countDocuments/update/delete). That is correct HERE and
+    // only here: this queue is deliberately cross-workspace — the concierge
+    // console works every client's cases — and carries no _workspaceId
+    // option, so the find() it replaces was equally unscoped. Access is
+    // gated by requirePermission("visaApplication","READ") plus the
+    // optional ?workspaceId filter above. No scoping is lost.
+    const riskAssessable = {
+      $and: [
+        { $eq: [{ $ifNull: ["$outcome", null] }, null] },
+        { $not: [{ $in: ["$status", ["closed", "draft"]] }] },
+      ],
+    };
+
+    const pageDocs = await VisaApplication.aggregate([
+      { $match: filter },
+      {
+        $addFields: {
+          _dateless: { $eq: [{ $ifNull: ["$travelDateFrom", null] }, null] },
+          _band: {
+            $switch: {
+              branches: [
+                {
+                  // The $ne-null guard MUST precede the $lt: in BSON order
+                  // null sorts BELOW every date, so a null deadline would
+                  // otherwise satisfy `$lt: now` and a dateless case would
+                  // be banded at-risk purely for having no date. $and
+                  // short-circuits, so this ordering is the guard.
+                  case: {
+                    $and: [
+                      riskAssessable,
+                      { $ne: [{ $ifNull: ["$processingDeadlineAt", null] }, null] },
+                      { $lt: ["$processingDeadlineAt", riskCutoff] },
+                    ],
+                  },
+                  then: 1,
+                },
+                {
+                  case: {
+                    $and: [
+                      { $eq: ["$status", "action_required"] },
+                      { $ne: [{ $ifNull: ["$customerRespondedAt", null] }, null] },
+                    ],
+                  },
+                  then: 2,
+                },
+                { case: { $eq: ["$status", "action_required"] }, then: 3 },
+              ],
+              default: 4,
+            },
+          },
+        },
+      },
+      // _id is the final tiebreak so pagination is STABLE. The old
+      // in-memory sort leaned on Array#sort's stability within one
+      // materialised array; a sort that is paginated in the DB has no such
+      // guarantee, and rows tied on every other key could otherwise
+      // reshuffle between page 1 and page 2 — showing a case twice, or
+      // skipping it entirely.
+      { $sort: { _band: 1, _dateless: 1, travelDateFrom: 1, _id: 1 } },
+      { $skip: (page - 1) * limit },
+      { $limit: limit },
+    ]).allowDiskUse(true);
+
+    // Joins now run for the PAGE ONLY — previously every one of these
+    // resolved against the full pre-pagination row set.
+    const requestIds = [...new Set(pageDocs.map((a: any) => String(a.requestId)))];
     const requests = await VisaRequest.find({ _id: { $in: requestIds } })
       .select("referenceNumber destinationIso2 purpose travelDateFrom travelDateTo status")
       .lean();
     const requestById = new Map(requests.map((r: any) => [String(r._id), r]));
 
-    const destinationFilter = req.query.destination ? String(req.query.destination).trim().toUpperCase() : null;
-    // Phase 9f — same in-memory-after-join posture as destinationFilter
-    // above: travelDateFrom only exists on the joined VisaRequest, not on
-    // VisaApplication itself, so this can't be a DB-level $match either.
-    // Applied over the already-DB-filtered row set (every OTHER filter
-    // above already ran in the query), never over the whole collection.
-    const atRiskOnly = req.query.atRisk === "true";
-
-    // Computed ONCE per row here, reused by both the ?atRisk=true filter
-    // below AND the row payload's own `risk` field (task brief, 2026-08-01:
-    // "confirm it agrees with the ?atRisk=true filter") — a single call to
-    // assessProcessingRisk per row, never recomputed differently for the
-    // filter vs. the marker, so the two can never disagree with each other.
-    // null (not just atRisk:false) once a decision exists or the case is
-    // closed/draft — "nothing left to risk" — mirrors the filter's own
-    // exclusion exactly, and doubles as the row's own signal that no
-    // at-risk marker applies here at all (as opposed to a real, computed
-    // "not at risk").
+    // The row's own at-risk marker. Reads travelDateFrom from the parent
+    // request (the source of truth) rather than the denormalised copy, so
+    // the payload stays correct even for a row written before the
+    // denormalisation existed and not yet backfilled. Post-backfill the two
+    // are identical by the write-once contract, and this marker agrees with
+    // the band and the ?atRisk=true filter exactly — all three now derive
+    // their verdict from computeProcessingDeadline (utils/visaEta.ts), one
+    // definition rather than two that could drift. In the pre-backfill
+    // window the BAND can only under-rank such a row (null deadline =>
+    // unassessable => never band 1), never over-claim risk.
+    // null (not atRisk:false) once a decision exists or the case is
+    // closed/draft — "nothing left to risk" — which is the same exclusion
+    // riskAssessable applies above.
     function computeRowRisk(a: any, r: any): ReturnType<typeof assessProcessingRisk> {
       if (a.outcome || a.status === "closed" || a.status === "draft") return null;
-      return assessProcessingRisk(r?.travelDateFrom, a.ruleSnapshot?.etaMaxDays, a.ruleSnapshot?.etaBasis);
+      return assessProcessingRisk(r?.travelDateFrom, a.ruleSnapshot?.etaMaxDays, a.ruleSnapshot?.etaBasis, now);
     }
 
-    let rows = applications
-      .map((a: any) => {
-        const request = requestById.get(String(a.requestId)) || null;
-        return { application: a, request, risk: computeRowRisk(a, request) };
-      })
-      .filter(({ request }) => !destinationFilter || request?.destinationIso2 === destinationFilter)
-      .filter(({ risk }) => !atRiskOnly || risk?.atRisk === true);
+    const rows = pageDocs.map((a: any) => {
+      const request = requestById.get(String(a.requestId)) || null;
+      return { application: a, request, risk: computeRowRisk(a, request) };
+    });
 
     const workspaceIds = [...new Set(rows.map((r) => String(r.application.workspaceId)))];
     const workspaces = await CustomerWorkspace.find({ _id: { $in: workspaceIds } })
@@ -463,36 +601,12 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       .lean();
     const travellerById = new Map(travellers.map((t: any) => [String(t._id), t]));
 
-    // Urgency first, then soonest travel date. Three urgency tiers, not
-    // two (Phase 9f): a responded-but-still-blocked action_required row
-    // needs an agent MORE urgently than one nobody has touched yet — the
-    // customer already did their part, the agent is now the only thing
-    // outstanding — so it outranks even an untouched action_required row,
-    // not just the non-action_required rest of the queue. Array#sort is
-    // stable in Node, so rows with an identical rank+date keep their
-    // original (createdAt-independent, but deterministic-per-query)
-    // relative order rather than reshuffling across requests.
-    function urgencyRank(a: any): number {
-      if (a.status !== "action_required") return 2;
-      return a.customerRespondedAt ? 0 : 1;
-    }
-    rows.sort((x, y) => {
-      const rankX = urgencyRank(x.application);
-      const rankY = urgencyRank(y.application);
-      if (rankX !== rankY) return rankX - rankY;
-      const dateX = x.request?.travelDateFrom ? new Date(x.request.travelDateFrom).getTime() : FAR_FUTURE_SENTINEL.getTime();
-      const dateY = y.request?.travelDateFrom ? new Date(y.request.travelDateFrom).getTime() : FAR_FUTURE_SENTINEL.getTime();
-      return dateX - dateY;
-    });
+    // Sorting and pagination both happened in the DB (the $sort/$skip/$limit
+    // above), so `rows` IS the page — there is no in-memory sort or slice
+    // left here, and no unbounded fetch behind it.
+    const pageRows = rows;
 
-    const total = rows.length;
-    const start = (page - 1) * limit;
-    const pageRows = rows.slice(start, start + limit);
-
-    // Assignee names, resolved only for the PAGE being returned (unlike
-    // workspace/traveller above, which resolve against the full pre-
-    // pagination `rows` — there's no reason to look up every assignee
-    // across every page just to shape the one page actually being sent).
+    // Assignee names, resolved for the page being returned.
     const assigneeIds = new Set<string>();
     for (const { application: a } of pageRows) {
       if (a.assignedConciergeUserId) assigneeIds.add(String(a.assignedConciergeUserId));
@@ -547,6 +661,14 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         // console's marker can distinguish a narrowly-tight case from one
         // that will not make it (marginDays) rather than a flat yes/no.
         risk,
+        // The dateless bucket, made visible (2026-08-12). A case whose
+        // request carries no travel date is UNASSESSABLE for at-risk — it
+        // is never banded at-risk and never claimed safe either, it just
+        // sorts last within its band. Without this flag the console would
+        // render an empty travel-date cell, which reads as a bug rather
+        // than as "nobody told us when they travel"; the queue can now say
+        // so, and an agent can go and ask.
+        travelDateMissing: !r?.travelDateFrom,
         // Present only once a traveller erasure has run — so an agent who
         // reaches this row via ?includeErased=true sees why the controls
         // are gone rather than assuming a bug (task brief).

@@ -107,6 +107,7 @@ import { computeVisaFeeBlock } from "../utils/visaFee.js";
 import {
   computeEstimatedDecisionWindow,
   assessProcessingRisk,
+  computeProcessingDeadline,
 } from "../utils/visaEta.js";
 import { maskTailId } from "../utils/piiMask.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
@@ -1768,6 +1769,22 @@ router.post("/requests", async (req: any, res: any) => {
         // Copied from the parent request, not re-derived (task brief,
         // 2026-08-01) — see models/VisaApplication.ts's own doc comment.
         customerId,
+        // Queue denormalisation (2026-08-12) — same copy-down-at-creation
+        // move as customerId directly above, for the ops queue's
+        // query-side filter/sort. Written from the SAME in-scope values the
+        // parent VisaRequest was just created from (parsedFrom,
+        // rule.destinationIso2), so parent and children cannot disagree at
+        // birth; nothing mutates them afterwards. processingDeadlineAt is
+        // derived from this application's OWN frozen ruleSnapshot, which is
+        // why it belongs here and not on the request. See
+        // models/VisaApplication.ts for the full write-once contract.
+        travelDateFrom: parsedFrom ?? null,
+        destinationIso2: rule.destinationIso2,
+        processingDeadlineAt: computeProcessingDeadline(
+          parsedFrom,
+          ruleSnapshot.etaMaxDays,
+          ruleSnapshot.etaBasis,
+        ),
         travellerProfileId: traveller!._id,
         nationality: nationalityIso2, // null when it doesn't resolve — see model comment
         nationalityUnresolved: nationalityIso2 == null,

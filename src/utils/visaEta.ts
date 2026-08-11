@@ -59,6 +59,88 @@ export function computeEstimatedDecisionWindow(
   };
 }
 
+// The inverse of addBusinessDays — walks BACKWARD over Mon–Fri only, same
+// "no holiday calendar" simplification as the rest of this module.
+function subtractBusinessDays(start: Date, days: number): Date {
+  const result = new Date(start);
+  let remaining = days;
+  while (remaining > 0) {
+    result.setDate(result.getDate() - 1);
+    const day = result.getDay(); // 0 = Sunday, 6 = Saturday
+    if (day !== 0 && day !== 6) remaining -= 1;
+  }
+  return result;
+}
+
+/**
+ * THE at-risk definition (2026-08-12) — the latest instant at which a case is
+ * still NOT at risk. `atRisk` is exactly `now > processingDeadlineAt`, and
+ * assessProcessingRisk below derives its own verdict from this same function
+ * so the two can never disagree.
+ *
+ * WHY this exists as a stored, precomputed field (models/VisaApplication.ts's
+ * processingDeadlineAt) rather than being computed at read time: MongoDB
+ * cannot count business days — there is no business-day unit for $dateDiff
+ * and no weekday-counting operator — so an ETA-relative, business-day-aware
+ * at-risk verdict is NOT expressible in a query from a travel date alone.
+ * Precomputing the crossing point is what lets the ops queue filter and sort
+ * on at-risk in the database instead of pulling every matching case into
+ * Node. It is only safe to precompute because both other inputs
+ * (ruleSnapshot.etaMaxDays / etaBasis) are frozen at creation and never
+ * change — see that model's own field comment.
+ *
+ * Returns null when there is nothing to assess (no travel date, or the rule
+ * snapshot carries no etaMaxDays) — never a guessed deadline. A null
+ * deadline means UNASSESSABLE, which is not the same as "safe": the queue
+ * gives those rows their own honest bucket rather than letting them fall
+ * into the not-at-risk band by absence.
+ *
+ * Same basis convention as the rest of this module: only the explicit
+ * "BUSINESS" counts Mon–Fri; anything else, including absent, is calendar.
+ */
+/**
+ * Midnight at the start of `d`'s own day. At-risk is denominated in WHOLE
+ * DAYS, so the verdict must be too: comparing raw instants would make a case
+ * with exactly enough runway flip to at-risk a few milliseconds into its
+ * deadline day, which is not what "you are short by a day" means. Comparing
+ * day-starts means a deadline that falls TODAY is not yet missed — you still
+ * have today — and only a deadline on a strictly earlier day is.
+ *
+ * Local midnight, not UTC, to match the local-time convention the rest of
+ * this module already uses (addBusinessDays/getDay operate on local dates).
+ */
+export function startOfDay(d: Date): Date {
+  const result = new Date(d);
+  result.setHours(0, 0, 0, 0);
+  return result;
+}
+
+/**
+ * The instant a queue compares stored deadlines against: anything strictly
+ * earlier than this has missed its day. Because a stored deadline is an
+ * exact instant, `deadline < startOfDay(now)` is exactly
+ * `startOfDay(deadline) < startOfDay(now)` — which is what lets the ops
+ * queue express this as a plain indexed range match rather than needing
+ * day-truncation in the query.
+ */
+export function atRiskCutoff(now: Date = new Date()): Date {
+  return startOfDay(now);
+}
+
+export function computeProcessingDeadline(
+  travelDateFrom: Date | string | null | undefined,
+  etaMaxDays: number | null | undefined,
+  etaBasis: VisaEtaBasis | string | null | undefined,
+): Date | null {
+  if (!travelDateFrom || etaMaxDays == null) return null;
+  const travel = new Date(travelDateFrom);
+  if (Number.isNaN(travel.getTime())) return null;
+
+  return etaBasis === "BUSINESS"
+    ? subtractBusinessDays(travel, etaMaxDays)
+    : addCalendarDays(travel, -etaMaxDays);
+}
+
 function countCalendarDaysBetween(from: Date, to: Date): number {
   return Math.round((to.getTime() - from.getTime()) / 86400000);
 }
@@ -124,5 +206,29 @@ export function assessProcessingRisk(
   const availableDays = countDays(now, travel);
   const marginDays = availableDays - etaMaxDays;
 
-  return { atRisk: marginDays < 0, availableDays, etaMaxDays, marginDays };
+  // atRisk is derived from computeProcessingDeadline above — ONE definition,
+  // shared with the ops queue's query-side band/filter (routes/admin.visa.ts),
+  // so the stored field, the filter and this row marker cannot drift apart.
+  //
+  // BOUNDARY NOTE (2026-08-12): the verdict is now the deadline's, compared
+  // at DAY granularity (atRiskCutoff above) rather than as raw instants — a
+  // deadline falling today has not been missed, you still have today. That
+  // keeps the previous `marginDays < 0` behaviour at the case that actually
+  // matters, exactly-enough-runway (margin 0 => not at risk), which a
+  // millisecond comparison would have broken. The residual difference from
+  // the old rule is ≤1 day and comes from availableDays being Math.round()ed
+  // for CALENDAR (the old flip sat at travel-(etaMax-0.5) days) and from the
+  // BUSINESS counter's 24h-step loop being sensitive to `now`'s time of day.
+  // Pinned by "at-risk boundary" in routes/admin.visa.queue.test.ts, so the
+  // shift is recorded rather than rediscovered.
+  //
+  // availableDays/marginDays keep their exact previous meaning — they are
+  // informational. The queue orders by the deadline itself, which is an
+  // equivalent ordering: marginDays is monotone in the deadline under both
+  // bases (calendar: margin = deadline-now; business: business-day counting
+  // is additive, so margin = businessDays(now, deadline)).
+  const deadline = computeProcessingDeadline(travelDateFrom, etaMaxDays, etaBasis);
+  const atRisk = deadline != null && deadline.getTime() < atRiskCutoff(now).getTime();
+
+  return { atRisk, availableDays, etaMaxDays, marginDays };
 }

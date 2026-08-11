@@ -309,6 +309,63 @@ export interface VisaApplicationDocument extends Document {
   servicePartnerSetAt: Date | null;
   servicePartnerSetByUserId: mongoose.Types.ObjectId | null; // ref User
 
+  // ── Queue denormalisation (2026-08-12) ───────────────────────────────
+  // Copied DOWN from the parent VisaRequest at creation (routes/visa.ts's
+  // POST /requests), on the same line customerId already is, and for the
+  // same reason: the ops queue (routes/admin.visa.ts's GET /queue) drives
+  // off VisaApplication, and filtering/sorting on a field that only exists
+  // on the parent forced it to fetch EVERY matching case into Node and
+  // filter/sort/paginate in memory. With these here the queue's destination
+  // filter, at-risk filter, priority bands and proximity sort all run
+  // query-side, bounded and paginated in the database.
+  //
+  // WRITE-ONCE, and they cannot drift. The sources are immutable after
+  // creation: there is no PATCH/PUT on /requests at all, and none of the
+  // VisaRequest updates anywhere in this codebase ($set on applicationIds,
+  // consents, the approval-chain fields, cancelledAt, status, customerId)
+  // touches travelDateFrom/travelDateTo/destinationIso2. So this is a copy
+  // taken once, from values in scope in the same handler that creates the
+  // parent — not a cache that needs invalidating. No Mongoose hook mirrors
+  // them for exactly that reason: a hook would fire a child write on every
+  // approval transition for fields that never change.
+  //
+  // ⚠ THE CONTRACT, for whoever adds the first travel-date edit route:
+  // if VisaRequest.travelDateFrom or .destinationIso2 ever becomes
+  // mutable, that route MUST propagate the change to every child
+  // application AND recompute processingDeadlineAt via
+  // computeProcessingDeadline() — the copies stop being self-maintaining
+  // the moment the source does.
+  //
+  // null when the parent request carries no travel date (it is optional on
+  // the request) — see processingDeadlineAt below for what that means.
+  travelDateFrom: Date | null;
+  destinationIso2: string | null;
+
+  // The precomputed at-risk crossing point — utils/visaEta.ts's
+  // computeProcessingDeadline(), the single definition of at-risk shared by
+  // this field, the queue's query-side band/filter, and
+  // assessProcessingRisk()'s own row marker. `atRisk` is exactly
+  // `now > processingDeadlineAt`.
+  //
+  // Precomputed because MongoDB cannot count business days, so a
+  // business-day-aware at-risk verdict is not expressible in a query from a
+  // travel date alone. Safe to precompute because its other two inputs
+  // (ruleSnapshot.etaMaxDays / etaBasis) are FROZEN point-in-time values —
+  // the same immutability the rest of ruleSnapshot relies on.
+  //
+  // ⚠ FROZEN-SNAPSHOT SEMANTICS: this reflects the at-risk rule as it stood
+  // when the application was created. Changing the at-risk LOGIC itself
+  // (computeProcessingDeadline's basis handling, or what counts as a
+  // business day) does NOT retroactively update stored rows — it requires a
+  // re-backfill, exactly like migrations/2026-08-12-backfill-visa-
+  // application-travel-denorm.ts did for the initial population.
+  //
+  // null = UNASSESSABLE (no travel date, or a snapshot with no etaMaxDays).
+  // That is NOT "not at risk": the queue gives null-deadline rows their own
+  // bucket, flagged, sorted last — never folded into the safe band by
+  // absence of evidence.
+  processingDeadlineAt: Date | null;
+
   // Case assignment (Phase 9a) — PER APPLICATION, not per request: a
   // five-traveller request can split across officers, and status already
   // lives at this same grain (actionRequiredReason etc., above). Two
@@ -482,6 +539,16 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     servicePartnerSetAt: { type: Date, default: null },
     servicePartnerSetByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
 
+    // Queue denormalisation (2026-08-12) — see the interface fields' own doc
+    // comments above for the write-once contract and the frozen-snapshot
+    // semantics. default: null (not absent) so a document written going
+    // forward always carries them explicitly; the backfill relies on
+    // "$exists: false" meaning "predates this change", which stays true
+    // because Mongoose defaults apply on write, never to stored documents.
+    travelDateFrom: { type: Date, default: null },
+    destinationIso2: { type: String, uppercase: true, trim: true, default: null },
+    processingDeadlineAt: { type: Date, default: null },
+
     assignedConciergeUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
     assignedConciergeAssignedAt: { type: Date, default: null },
     assignedConciergeAssignedByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
@@ -522,6 +589,14 @@ VisaApplicationSchema.index({ servicePartnerName: 1 });
 // Filtering the console queue/reports by customer without joining back
 // through VisaRequest (task brief, 2026-08-01).
 VisaApplicationSchema.index({ workspaceId: 1, customerId: 1 });
+// The ops queue's default read (routes/admin.visa.ts's GET /queue) — status
+// leads because that queue filters by status ACROSS every workspace (same
+// posture as the note below), and processingDeadlineAt trails it to serve
+// both the ?atRisk=true range match and the priority sort's deadline key.
+VisaApplicationSchema.index({ status: 1, processingDeadlineAt: 1 });
+// ?destination= narrowing on that same queue, now a DB-level match on the
+// denormalised copy instead of an in-memory filter after the request join.
+VisaApplicationSchema.index({ destinationIso2: 1, status: 1 });
 // NOTE: the concierge console queue (routes/admin.visa.ts) queries by
 // status ACROSS every workspace — {workspaceId,status} above doesn't serve
 // a workspace-less status filter, since workspaceId is its leading field.
