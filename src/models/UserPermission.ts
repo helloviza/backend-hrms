@@ -123,9 +123,11 @@ export interface UserPermissionDoc extends Document {
     //
     // Granted to NO level template yet — see
     // infra/audit/visa-screening-authority-model-2026-08-12.md. The key
-    // exists so it CAN be granted; who gets it is a pending product
-    // decision, and nothing enforces it until VISA_SCREENING_ENFORCED is
-    // turned on (config/visaScreening.ts).
+    // exists so it CAN be granted. RULED 2026-08-12: granted PER-USER,
+    // independent of level — no level template carries it, so changing
+    // someone's level will not revoke it and off-boarding must do so
+    // explicitly. Nothing enforces it until VISA_SCREENING_ENFORCEMENT is
+    // raised above "off" (config/visaScreening.ts).
     visaScreening: ModulePermission
   }
 

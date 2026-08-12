@@ -54,6 +54,10 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   // (see routes/visa.ts, gated on visaEnabled directly); wired for
   // grantability ahead of the concierge console phase.
   visaApplication:   ["visaEnabled"],
+  // Screening authority — a sibling capability, granted per-user rather than
+  // by level template (RULED 2026-08-12). Gated on the same feature flag: a
+  // workspace without visa has nothing to screen.
+  visaScreening:     ["visaEnabled"],
 };
 
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";

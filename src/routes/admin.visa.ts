@@ -974,9 +974,9 @@ router.patch("/applications/:id/status", requirePermission("visaApplication", "W
         return res.status(400).json({ error: "reason is required to set discrepancy_flagged" });
       }
       // SCREENING ACT — the discrepancy IS the screening finding. Dormant by
-      // default (config/visaScreening.ts): with VISA_SCREENING_ENFORCED unset
-      // this returns null without touching anything, so today's behaviour is
-      // byte-for-byte unchanged.
+      // default (config/visaScreening.ts): at tier "off" this returns null
+      // without touching anything, so today's behaviour is byte-for-byte
+      // unchanged.
       const screeningRefusal = await checkScreeningAuthority({
         act: "DISCREPANCY_SET",
         userId: actorId(req),

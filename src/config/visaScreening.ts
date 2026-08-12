@@ -4,7 +4,7 @@
 // authority matrix it enforces. Step 1 of
 // infra/audit/visa-screening-authority-model-2026-08-12.md.
 //
-// ── WHY THIS IS OFF BY DEFAULT ────────────────────────────────────────
+// ── WHY THIS IS OFF BY DEFAULT ─────────────────────────────────────────
 // The audit found that switching screening enforcement on today would
 // refuse 100% of document review, invisibly:
 //   • no level template grants visaScreening (deliberately — who gets it is
@@ -22,9 +22,9 @@
 // until you notice it cannot tell us anything we do not already know: the
 // answer today is "everyone", because nothing is granted and nothing is
 // assigned. It would produce a stream of warnings that are all expected,
-// which is the fastest way to teach people to ignore a log. The flag gives
-// the one thing that actually matters — a single reversible switch whose
-// two states are both well-defined, each covered by its own tests.
+// which is the fastest way to teach people to ignore a log. The switch gives
+// the one thing that actually matters — a single reversible setting whose
+// every state is well-defined, each covered by its own tests.
 //
 // ── WHY AN ENV FLAG, NOT A PER-WORKSPACE CONFIG ───────────────────────
 // visaApprovalRequired (models/CustomerWorkspace.ts) is per-workspace
@@ -37,23 +37,87 @@
 // visaApprovalRequired (default off, nothing happens until someone turns it
 // on) without borrowing its per-tenant storage.
 
+// ── WHY A TIER, NOT TWO BOOLEANS ──────────────────────────────────────
+// Step 1 shipped ONE flag that gated the capability check and the per-case
+// assignment check together. That made the audit's staged rollout
+// unreachable: you could not enforce "must be a screener" without also
+// enforcing "must be THIS case's screener", which is a much larger
+// operational change needing its own rulings (auto-claim, lead override).
+//
+// The fix is ONE ordered value, not two booleans. Two booleans admit the
+// combination {assignment: true, capability: false} — "must be the assigned
+// screener, but need not be a screener at all" — which is not a policy
+// anyone would choose and which the code would then have to defend against
+// at every read. A single tier makes that state unrepresentable rather than
+// merely discouraged.
+//
+// The tiers are cumulative, each a strict superset of the one before:
+//
+//   off         nothing is checked. Today's behaviour, byte for byte.
+//   capability  you must hold visaScreening. Per-case assignment is NOT
+//               consulted — a screener may work any case they can already
+//               reach. This is the audit's Step 2.
+//   assignment  you must hold visaScreening AND be this case's assigned
+//               screening officer. This is the audit's Step 3, and it is
+//               what step 1 wired behind its single flag.
+
+export const VISA_SCREENING_TIERS = ["off", "capability", "assignment"] as const;
+export type VisaScreeningTier = (typeof VISA_SCREENING_TIERS)[number];
+
+/** Bad values already warned about, so a misconfiguration logs once, not per request. */
+const warnedTierValues = new Set<string>();
+
 /**
- * Whether screening authority is ENFORCED on the screening-act routes.
+ * The enforcement tier for the screening-act routes.
  *
  * Read live from process.env on every call rather than captured once at
  * module load. That is deliberate: it keeps the switch flippable without a
- * rebuild, and it lets each test pin the value it needs — the OFF path
- * (today's behaviour, which must not regress) and the ON path (the future
- * behaviour) are both real code paths that need real coverage, and a
- * boot-time capture would force one of them to be tested by mocking.
+ * rebuild, and it lets each test pin the value it needs — every tier is a
+ * real code path that needs real coverage, and a boot-time capture would
+ * force most of them to be tested by mocking.
+ *
+ * UNRECOGNISED VALUES FALL BACK TO "off" AND WARN. Falling back to off keeps
+ * a typo from being an outage, which matches the opt-in shape of the whole
+ * mechanism — but silently reading `VISA_SCREENING_ENFORCEMENT=capabilty` as
+ * "off" would leave someone believing they had enforcement they do not have,
+ * so it is loud.
+ *
+ * LEGACY: `VISA_SCREENING_ENFORCED=true` (step 1's boolean) maps to
+ * "assignment", which is exactly what it meant — capability AND assignment.
+ * It is consulted only when the tier variable is unset, so an environment
+ * carrying the old flag keeps its precise former meaning instead of silently
+ * changing behaviour on deploy. New environments should set the tier.
  */
+export function visaScreeningTier(): VisaScreeningTier {
+  const raw = String(process.env.VISA_SCREENING_ENFORCEMENT || "").trim().toLowerCase();
+
+  if (!raw) {
+    const legacy = String(process.env.VISA_SCREENING_ENFORCED || "").trim().toLowerCase();
+    return legacy === "true" ? "assignment" : "off";
+  }
+
+  if ((VISA_SCREENING_TIERS as readonly string[]).includes(raw)) {
+    return raw as VisaScreeningTier;
+  }
+
+  if (!warnedTierValues.has(raw)) {
+    warnedTierValues.add(raw);
+    console.warn(
+      `[visaScreening] VISA_SCREENING_ENFORCEMENT="${raw}" is not a known tier ` +
+        `(${VISA_SCREENING_TIERS.join(" | ")}) — falling back to "off", so screening is NOT enforced.`,
+    );
+  }
+  return "off";
+}
+
+/** True at any tier above off — i.e. the gate does something. */
 export function isVisaScreeningEnforced(): boolean {
-  return String(process.env.VISA_SCREENING_ENFORCED || "").trim().toLowerCase() === "true";
+  return visaScreeningTier() !== "off";
 }
 
 /**
- * THE AUTHORITY MATRIX — enforced only while isVisaScreeningEnforced() is
- * true. Recorded here in one place because the split is a product decision,
+ * THE AUTHORITY MATRIX — enforced only while visaScreeningTier() is above
+ * "off". Recorded here in one place because the split is a product decision,
  * not an implementation detail, and reading it out of three scattered route
  * guards is how it drifts.
  *

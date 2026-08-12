@@ -855,6 +855,91 @@ router.get('/search-users', async (req: any, res: any) => {
   }
 })
 
+// ── GET /api/permissions/holders/:moduleKey ─────────────────────────────────
+// "Who currently holds this capability?"
+//
+// This exists because of a cost the visaScreening ruling explicitly accepted
+// (infra/audit/visa-screening-authority-model-2026-08-12.md): the capability
+// is granted PER-USER, not by level template, so no template documents who
+// holds it. Without this endpoint the only answer to "who are our screeners?"
+// is a database query, and an off-boarding step that nobody can see is an
+// off-boarding step that gets skipped. Generic by module key rather than
+// visa-specific — every per-user grant has the same visibility problem.
+//
+// Read-only. Granting and revoking go through /grant and /update, which
+// already accept `modules` overrides; this adds no new write path.
+router.get('/holders/:moduleKey', async (req: any, res: any) => {
+  try {
+    const { moduleKey } = req.params
+    const minAccess = String(req.query.minAccess || 'WRITE').toUpperCase()
+
+    // The key is interpolated into a query path, so it is whitelisted against
+    // the known module set rather than trusted. Without this, a caller could
+    // probe arbitrary document paths via `modules.<anything>.access`.
+    const knownModules = Object.keys(LEVEL_TEMPLATES['L8'] ?? {})
+    if (!knownModules.includes(moduleKey)) {
+      return res.status(400).json({ success: false, message: `Unknown module key: ${moduleKey}` })
+    }
+    if (!['READ', 'WRITE', 'FULL'].includes(minAccess)) {
+      return res.status(400).json({ success: false, message: `Invalid minAccess: ${minAccess}` })
+    }
+
+    // hasAccess is an ordering, not a set membership test, so expand the
+    // minimum into the tiers that satisfy it rather than matching one value.
+    const ORDER = ['NONE', 'READ', 'WRITE', 'FULL']
+    const satisfying = ORDER.slice(ORDER.indexOf(minAccess))
+
+    const filter: Record<string, any> = {
+      status: 'active',
+      [`modules.${moduleKey}.access`]: { $in: satisfying },
+    }
+
+    // Tenant-admin scoping mirrors /list: a tenant admin sees holders inside
+    // their own workspace only. SuperAdmin sees every holder, which is the
+    // point — screening officers are our own ops staff, not a tenant's.
+    const isSuper = (req as any).isPlatformSuperAdmin === true || isSuperAdmin(req)
+    if (!isSuper) {
+      filter.workspaceId = String(req.workspaceObjectId)
+      filter.universe = 'STAFF'
+    }
+
+    const docs = await UserPermission.find(filter, {
+      userId: 1, email: 1, level: 1, workspaceId: 1, [`modules.${moduleKey}`]: 1,
+    })
+      .limit(200)
+      .lean()
+
+    const users = await User.find(
+      { _id: { $in: docs.map(d => d.userId) } },
+      { _id: 1, name: 1, firstName: 1, lastName: 1, email: 1 }
+    ).lean()
+
+    const nameMap: Record<string, string> = {}
+    for (const u of users) {
+      nameMap[String((u as any)._id)] =
+        (u as any).name ||
+        [(u as any).firstName, (u as any).lastName].filter(Boolean).join(' ') ||
+        (u as any).email ||
+        ''
+    }
+
+    const holders = docs.map(d => ({
+      userId: d.userId,
+      email: d.email,
+      name: nameMap[d.userId] || d.email,
+      levelCode: (d as any).level?.code || null,
+      workspaceId: String((d as any).workspaceId || ''),
+      access: (d as any).modules?.[moduleKey]?.access || 'NONE',
+      scope: (d as any).modules?.[moduleKey]?.scope || 'NONE',
+    }))
+
+    return res.json({ success: true, moduleKey, minAccess, total: holders.length, holders })
+  } catch (err: any) {
+    logger.error('[PERMISSION] holders error', { error: err.message })
+    return res.status(500).json({ success: false, message: 'Error listing holders' })
+  }
+})
+
 // ── POST /api/permissions/migrate ────────────────────────────────────────────
 // One-time migration from BillingPermission → UserPermission.
 // Does NOT delete BillingPermission docs.

@@ -167,9 +167,14 @@ async function seedCase(opts: { assignedScreeningOfficerId?: mongoose.Types.Obje
 
 const reviewBody = { reviewStatus: "VERIFIED" };
 
+function clearTierEnv() {
+  delete process.env.VISA_SCREENING_ENFORCEMENT;
+  delete process.env.VISA_SCREENING_ENFORCED;
+}
+
 beforeEach(async () => {
   callerAccess = "WRITE";
-  delete process.env.VISA_SCREENING_ENFORCED;
+  clearTierEnv();
   await Promise.all([
     VisaApplication.deleteMany({}),
     VisaRequest.deleteMany({}),
@@ -183,7 +188,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  delete process.env.VISA_SCREENING_ENFORCED;
+  clearTierEnv();
 });
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -234,15 +239,144 @@ describe("flag OFF (default) — zero regression", () => {
     process.env.VISA_SCREENING_ENFORCED = "1";
     expect((await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody)).status).toBe(200);
   });
+
+  it("tier 'off' is explicitly off", async () => {
+    const { document } = await seedCase({ assignedScreeningOfficerId: null });
+    process.env.VISA_SCREENING_ENFORCEMENT = "off";
+    expect((await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody)).status).toBe(200);
+  });
+
+  it("an UNRECOGNISED tier falls back to off rather than half-enforcing", async () => {
+    // A typo must not become an outage — but it also must not silently look
+    // like enforcement. Behaviour is off; the warning is the loud part.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { document } = await seedCase({ assignedScreeningOfficerId: null });
+    process.env.VISA_SCREENING_ENFORCEMENT = "capabilty"; // deliberate typo
+    expect((await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody)).status).toBe(200);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
 });
 
 /* ═══════════════════════════════════════════════════════════════════════
- * FLAG ON — the future behaviour
+ * TIER "capability" — the point of the split.
+ *
+ * The capability is required; per-case assignment is NOT. This is what
+ * makes the audit's Step 2 shippable without Step 3: it changes WHO may
+ * screen (fixable with a grant) without changing HOW OPS WORKS (every case
+ * needing an assignment before anyone can touch it).
+ *
+ * Every allow-case here runs as a NON-SuperAdmin on purpose. The L8
+ * break-glass clears both halves of the gate at every tier, so an L8 test
+ * would pass no matter how the tier behaved and would prove nothing.
  * ═══════════════════════════════════════════════════════════════════════ */
 
-describe("flag ON — screening authority enforces", () => {
+describe("tier 'capability' — capability required, assignment NOT", () => {
   beforeEach(() => {
-    process.env.VISA_SCREENING_ENFORCED = "true";
+    process.env.VISA_SCREENING_ENFORCEMENT = "capability";
+  });
+
+  it("REFUSES a non-SuperAdmin with no visaScreening capability", async () => {
+    const { document } = await seedCase({ assignedScreeningOfficerId: actor?._id });
+    const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+    expect(res.status).toBe(403);
+    expect(res.body.reason).toBe("NOT_A_SCREENER");
+    expect((await VisaDocument.findById(document._id).lean() as any).reviewStatus).not.toBe("VERIFIED");
+  });
+
+  it("ALLOWS a capability-holder on an UNASSIGNED case", async () => {
+    const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    actor = { _id: screener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const { document } = await seedCase({ assignedScreeningOfficerId: null });
+
+    const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+    expect(res.status).toBe(200);
+    expect((await VisaDocument.findById(document._id).lean() as any).reviewStatus).toBe("VERIFIED");
+  });
+
+  it("ALLOWS a capability-holder on a case assigned to a DIFFERENT screener", async () => {
+    // The same setup returns 403 NOT_ASSIGNED at tier 'assignment' — this is
+    // the single assertion that proves the two checks are now independent.
+    const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    const other = await makeUser({ visaScreening: "WRITE" });
+    actor = { _id: screener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const { document } = await seedCase({ assignedScreeningOfficerId: other._id as mongoose.Types.ObjectId });
+
+    const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+    expect(res.status).toBe(200);
+  });
+
+  it("never returns NOT_ASSIGNED at this tier — assignment is not consulted at all", async () => {
+    const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    const other = await makeUser({ visaScreening: "WRITE" });
+    actor = { _id: screener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const { application } = await seedCase({ assignedScreeningOfficerId: other._id as mongoose.Types.ObjectId });
+
+    const res = await request(makeApp())
+      .patch(`/applications/${application._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "photo" });
+    expect(res.status).toBe(200);
+    expect(res.body.reason).toBeUndefined();
+  });
+
+  it("gates clearing a discrepancy on the capability, not on assignment", async () => {
+    const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    actor = { _id: screener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const { application } = await seedCase({ assignedScreeningOfficerId: null });
+    await request(makeApp())
+      .patch(`/applications/${application._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "photo" });
+
+    // A concierge with no screening capability still cannot resolve it.
+    const concierge = await makeUser({ visaApplication: "WRITE" });
+    actor = { _id: concierge._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const refused = await request(makeApp())
+      .patch(`/applications/${application._id}/status`)
+      .send({ status: "docs_under_review" });
+    expect(refused.status).toBe(403);
+    expect(refused.body.reason).toBe("NOT_A_SCREENER");
+
+    // Any screener may, assigned or not.
+    const otherScreener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    actor = { _id: otherScreener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const allowed = await request(makeApp())
+      .patch(`/applications/${application._id}/status`)
+      .send({ status: "docs_under_review" });
+    expect(allowed.status).toBe(200);
+  });
+
+  it("still does NOT gate the shared acts — action_required stays open to a concierge", async () => {
+    const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    actor = { _id: screener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const { application } = await seedCase({ assignedScreeningOfficerId: null });
+    await request(makeApp())
+      .patch(`/applications/${application._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "photo" });
+
+    const concierge = await makeUser({ visaApplication: "WRITE" });
+    actor = { _id: concierge._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const res = await request(makeApp())
+      .patch(`/applications/${application._id}/status`)
+      .send({ status: "action_required", reason: "Please resend the photograph" });
+    expect(res.status).toBe(200);
+  });
+
+  it("ALLOWS a SUPERADMIN who holds no grant — break-glass survives at this tier", async () => {
+    const su = await makeUser({ roles: ["SUPERADMIN"] });
+    actor = { _id: su._id as mongoose.Types.ObjectId, roles: ["SUPERADMIN"] };
+    const { document } = await seedCase({ assignedScreeningOfficerId: null });
+    expect((await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody)).status).toBe(200);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * TIER "assignment" — the strictest tier, and step 1's wired behaviour.
+ * Everything the single flag used to do lives here, unchanged.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+describe("tier 'assignment' — capability AND assigned-on-this-case", () => {
+  beforeEach(() => {
+    process.env.VISA_SCREENING_ENFORCEMENT = "assignment";
   });
 
   it("REFUSES a reviewer with no visaScreening capability", async () => {
@@ -360,7 +494,35 @@ describe("flag ON — screening authority enforces", () => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════════
- * ASSIGNABLE LISTS + per-role validation (NOT flag-gated)
+ * LEGACY BOOLEAN — an environment still carrying step 1's flag must keep
+ * its exact former meaning, not quietly change behaviour on deploy.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+describe("legacy VISA_SCREENING_ENFORCED", () => {
+  it("'true' still means the assignment tier — capability alone is not enough", async () => {
+    const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    actor = { _id: screener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const { document } = await seedCase({ assignedScreeningOfficerId: null });
+
+    process.env.VISA_SCREENING_ENFORCED = "true";
+    const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+    expect(res.status).toBe(403);
+    expect(res.body.reason).toBe("NOT_ASSIGNED");
+  });
+
+  it("is IGNORED once the tier is set explicitly — the new variable wins", async () => {
+    const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    actor = { _id: screener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const { document } = await seedCase({ assignedScreeningOfficerId: null });
+
+    process.env.VISA_SCREENING_ENFORCED = "true";
+    process.env.VISA_SCREENING_ENFORCEMENT = "capability";
+    expect((await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody)).status).toBe(200);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * ASSIGNABLE LISTS + per-role validation (NOT tier-gated)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 describe("GET /assignable-users — split by capability", () => {

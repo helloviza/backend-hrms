@@ -41,12 +41,15 @@ function requireEnv(key: string, fallback?: string): string {
 export const env = {
   NODE_ENV: process.env.NODE_ENV || "development",
   PORT: Number(process.env.PORT) || 8080,
-  // Screening authority enforcement (2026-08-12) — OFF unless explicitly
-  // "true". Declared here for discoverability; the runtime check lives in
-  // config/visaScreening.ts and reads process.env live rather than this
-  // captured value, so the switch can be flipped without a rebuild and each
-  // test can pin the state it needs. See
+  // Screening authority enforcement (2026-08-12) — a TIER, not a boolean:
+  // "off" (default) | "capability" | "assignment". Declared here for
+  // discoverability; the runtime check lives in config/visaScreening.ts and
+  // reads process.env live rather than this captured value, so the switch can
+  // be flipped without a rebuild and each test can pin the state it needs.
+  // VISA_SCREENING_ENFORCED is step 1's boolean, still honoured as a legacy
+  // alias for "assignment" when the tier is unset. See
   // infra/audit/visa-screening-authority-model-2026-08-12.md.
+  VISA_SCREENING_ENFORCEMENT: String(process.env.VISA_SCREENING_ENFORCEMENT || "").trim().toLowerCase() || "off",
   VISA_SCREENING_ENFORCED: String(process.env.VISA_SCREENING_ENFORCED || "").trim().toLowerCase() === "true",
   DEPLOYMENT_MODE: (process.env.DEPLOYMENT_MODE === "saas" ? "saas" : "plumbox") as "saas" | "plumbox",
 
