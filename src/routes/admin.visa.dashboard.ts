@@ -84,8 +84,28 @@ function resolveWindow(query: any): { from: Date; to: Date } | { error: string }
 /* ─────────────────────────────────────────────────────────────────────
  * QUEUE HEALTH — counts by status, action_required split in two.
  * ───────────────────────────────────────────────────────────────────── */
+// "draft" is NOT here, and its absence is the point (2026-08-12).
+//
+// The $match below excludes VISA_OPS_HIDDEN_STATUSES, so the draft bucket was
+// never populated — but "draft" was left in this render order, so the tile
+// rendered anyway with a hardcoded-looking 0 while the database held real
+// drafts (13 locally). Worse, the tile carried a drilldown of {status: draft},
+// and ?status=draft IS honoured by the ops queue — so clicking a tile that
+// said "0" landed on a list of 13. A tile that contradicts its own drilldown
+// is worse than no tile.
+//
+// Counting them instead would have been the wrong repair. A draft has not
+// been submitted by the customer, so there is no ops work in it; that is
+// exactly why it sits in VISA_OPS_HIDDEN_STATUSES alongside pending_approval
+// and why the console's own status dropdown omits Draft. The gate is the
+// deliberate decision here and this render order was the thing out of step
+// with it, so queue health now shows only statuses that are ops work.
+//
+// Drafts remain reachable where they are meaningful: reports include them by
+// default (documented in admin.visa.reports.ts), and ?status=draft still
+// works on the queue as a deliberate affordance.
 const QUEUE_HEALTH_STATUS_ORDER = [
-  "draft", "submitted", "docs_under_review", "discrepancy_flagged", "action_required",
+  "submitted", "docs_under_review", "discrepancy_flagged", "action_required",
   "cost_confirmed", "lodged", "decision_received", "closed",
 ] as const;
 

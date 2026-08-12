@@ -81,6 +81,9 @@ vi.mock("../models/Designation.js", () => ({
 }));
 
 const cmFindOneMock = vi.fn();
+// Upsert — returns null by default, which is what an upsert-on-insert gives
+// back without `returnDocument: after`, and nothing in the route reads it.
+const cmFindOneAndUpdateMock = vi.fn();
 
 function leanish(value: any) {
   return {
@@ -98,7 +101,36 @@ vi.mock("../models/CustomerMember.js", () => ({
         select: () => ({ lean: () => leanish(value) }),
       };
     },
+    // ensureCstepTravellerLogin upserts the member row before creating the
+    // auth user (workspace.travellers.ts). The mock defined only findOne, so
+    // this call was `undefined(...)` — a TypeError the route surfaced as a
+    // 500, which is why POST /bulk/commit's Tier-1 update case has never
+    // been green on this branch. The gap is here, not in the route: the
+    // upsert is correct and is left exactly as it is.
+    findOneAndUpdate: (...args: any[]) => ({
+      exec: () => Promise.resolve(cmFindOneAndUpdateMock(...args)),
+    }),
   },
+}));
+
+// ensureCstepTravellerLogin (workspace.travellers.ts) delegates the actual
+// account provisioning to customerUsers.ts, which reaches the REAL User model
+// — and User is not mocked in this file, so with no mongoose connection the
+// call buffers until the test times out. That is the second half of the
+// bulk/commit gap: rows WITHOUT an email skip this path entirely (which is
+// why the create test passes), while the Tier-1 update row carries
+// priya@acme.com and walks straight into it.
+//
+// Mocked at the module boundary the route already imports from, so this file
+// keeps testing bulk/commit semantics — created/updated/skipped, which fields
+// a row overwrites — rather than re-testing auth provisioning, which has its
+// own coverage in customerUsers. Route behaviour is untouched.
+const ensureAuthUserMock = vi.fn();
+const trySendInviteMock = vi.fn();
+vi.mock("./customerUsers.js", () => ({
+  ensureAuthUserForCustomer: (...args: any[]) => ensureAuthUserMock(...args),
+  trySendInviteEmailSafe: (...args: any[]) => trySendInviteMock(...args),
+  isStaffPrivileged: () => false,
 }));
 
 const cwFindByIdMock = vi.fn();
@@ -154,6 +186,14 @@ beforeEach(() => {
       Promise.resolve({ _id: "new-id", ...doc, save: vi.fn().mockResolvedValue(undefined) }),
     );
   cmFindOneMock.mockReset().mockReturnValue(null);
+  // Upsert returns null without `returnDocument: after`; nothing reads it.
+  cmFindOneAndUpdateMock.mockReset().mockReturnValue(null);
+  // Default: provisioning succeeds with a brand-new login, the ordinary case
+  // for a bulk row carrying an email.
+  ensureAuthUserMock.mockReset().mockResolvedValue({
+    user: { _id: "login-user-1" }, created: true, tempPassword: null, conflict: false,
+  });
+  trySendInviteMock.mockReset().mockResolvedValue(undefined);
   cwFindByIdMock.mockReset().mockReturnValue({});
   custFindByIdMock.mockReset().mockReturnValue({ legalName: "Acme Pvt Ltd" });
   autoCaptureMock.mockReset().mockResolvedValue(undefined);

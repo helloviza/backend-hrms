@@ -275,7 +275,6 @@ describe("GET /dashboard — queueHealth", () => {
     expect(byKey.action_required_waiting.count).toBe(1);
     expect(byKey.action_required_responded.count).toBe(2);
     expect(byKey.closed.count).toBe(1);
-    expect(byKey.draft.count).toBe(0);
 
     // Every row carries its own drilldown filter.
     expect(byKey.action_required_waiting.filter).toEqual({ actionRequired: "true", customerResponded: "false" });
@@ -296,6 +295,34 @@ describe("GET /dashboard — queueHealth", () => {
   // approval gate has not reached Plumtrips, so it must not appear in any
   // ops health count — not even as an unrendered bucket that a later
   // QUEUE_HEALTH_STATUS_ORDER edit would surface.
+  // THE DRAFT TILE (2026-08-12). This assertion used to read
+  // `expect(byKey.draft.count).toBe(0)` with NO draft fixture in the test —
+  // so it asserted that an empty database contained no drafts, passed
+  // forever, and never once exercised the count it claimed to guard. The
+  // real behaviour it was hiding: the tile said 0 while the DB held 13.
+  it("GATE: renders NO draft tile, and a real draft contributes nothing", async () => {
+    applicationFixture({ status: "draft" });
+    applicationFixture({ status: "draft" });
+    applicationFixture({ status: "submitted" });
+
+    const res = await request(makeApp()).get("/dashboard");
+    expect(res.status).toBe(200);
+
+    const rows = res.body.queueHealth.rows;
+    const byKey = Object.fromEntries(rows.map((r: any) => [r.key, r]));
+
+    // No tile at all — rather than a tile reading 0 next to two real drafts.
+    expect(byKey.draft).toBeUndefined();
+    expect(rows.some((r: any) => r.status === "draft")).toBe(false);
+
+    // And nothing carries a drilldown the tile could have contradicted.
+    expect(rows.some((r: any) => r.filter?.status === "draft")).toBe(false);
+
+    expect(byKey.submitted.count).toBe(1);
+    const total = rows.reduce((s: number, r: any) => s + r.count, 0);
+    expect(total).toBe(1); // the two drafts contribute nothing at all
+  });
+
   it("GATE: never counts pending_approval applications in queue health", async () => {
     applicationFixture({ status: "pending_approval" });
     applicationFixture({ status: "pending_approval" });
