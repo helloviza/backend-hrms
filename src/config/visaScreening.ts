@@ -59,7 +59,10 @@
 //               reach. This is the audit's Step 2.
 //   assignment  you must hold visaScreening AND be this case's assigned
 //               screening officer. This is the audit's Step 3, and it is
-//               what step 1 wired behind its single flag.
+//               what step 1 wired behind its single flag. An UNASSIGNED case
+//               is auto-claimed by the screener who acts on it and logged
+//               (Ruling 1) rather than refused into a dead end; a case owned
+//               by SOMEONE ELSE is refused, pending Ruling 2.
 
 export const VISA_SCREENING_TIERS = ["off", "capability", "assignment"] as const;
 export type VisaScreeningTier = (typeof VISA_SCREENING_TIERS)[number];

@@ -80,6 +80,15 @@ export const VISA_ACTIVITY_EVENT_TYPES = [
   "SCREENING_OFFICER_ASSIGNED",
   "SCREENING_OFFICER_CHANGED",
   "SCREENING_OFFICER_CLEARED",
+  // Auto-claim (2026-08-12, Ruling 1) — a screener acted on an UNASSIGNED
+  // case at enforcement tier "assignment" and became its officer by doing
+  // so. Deliberately its own event rather than SCREENING_OFFICER_ASSIGNED
+  // with a detail flag: "who decided this person owns the case" is exactly
+  // what an assignment audit trail exists to answer, and a coordinator
+  // choosing someone is a different fact from someone taking it themselves.
+  // Folding them together would leave that distinction readable only by
+  // consumers that happen to inspect `detail`.
+  "SCREENING_OFFICER_AUTO_CLAIMED",
 
   // Costs
   "COSTS_RECORDED",

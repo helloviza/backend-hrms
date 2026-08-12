@@ -323,6 +323,10 @@ export function summarizeActivityDetail(eventType: string, detail: Record<string
       return "Screening officer changed";
     case "SCREENING_OFFICER_CLEARED":
       return "Screening officer cleared";
+    case "SCREENING_OFFICER_AUTO_CLAIMED":
+      // Says HOW they became the officer. The export is one of the places
+      // this distinction actually gets read.
+      return `Screening officer auto-claimed by acting on an unassigned case${d.act ? ` (${d.act})` : ""}`;
     case "COSTS_RECORDED":
       return `Total INR ${d.actualTotalInr ?? ""}${d.varianceInr != null ? ` (variance ${d.varianceInr})` : ""}`.trim();
     case "MANUAL_BOOKING_CREATED":

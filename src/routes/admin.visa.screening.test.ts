@@ -59,6 +59,7 @@ import VisaDocument from "../models/VisaDocument.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import User from "../models/User.js";
 import { UserPermission } from "../models/UserPermission.js";
+import VisaActivityLog from "../models/VisaActivityLog.js";
 
 let mongod: MongoMemoryServer;
 
@@ -182,6 +183,7 @@ beforeEach(async () => {
     TravellerProfile.deleteMany({}),
     User.deleteMany({}),
     UserPermission.deleteMany({}),
+    VisaActivityLog.deleteMany({}),
   ]);
   const u = await makeUser({ visaApplication: "WRITE" });
   actor = { _id: u._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
@@ -387,15 +389,8 @@ describe("tier 'assignment' — capability AND assigned-on-this-case", () => {
     expect((await VisaDocument.findById(document._id).lean() as any).reviewStatus).not.toBe("VERIFIED");
   });
 
-  it("REFUSES a screener who is not assigned to THIS case", async () => {
-    const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
-    actor = { _id: screener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
-    const { document } = await seedCase({ assignedScreeningOfficerId: null });
-
-    const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
-    expect(res.status).toBe(403);
-    expect(res.body.reason).toBe("NOT_ASSIGNED");
-  });
+  // NOTE: "unassigned" used to be refused here. Ruling 1 (2026-08-12) made it
+  // an auto-claim instead — see the dedicated describe below.
 
   it("REFUSES a screener when the case belongs to a DIFFERENT screener", async () => {
     const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
@@ -421,10 +416,16 @@ describe("tier 'assignment' — capability AND assigned-on-this-case", () => {
   it("ALLOWS a SUPERADMIN — the break-glass account is not locked out by its own gate", async () => {
     const su = await makeUser({ roles: ["SUPERADMIN"] });
     actor = { _id: su._id as mongoose.Types.ObjectId, roles: ["SUPERADMIN"] };
-    const { document } = await seedCase({ assignedScreeningOfficerId: null });
+    const { application, document } = await seedCase({ assignedScreeningOfficerId: null });
 
     const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
     expect(res.status).toBe(200);
+
+    // And break-glass does NOT auto-claim. An emergency action must not
+    // quietly make the SuperAdmin the accountable officer on a case they
+    // were only unblocking.
+    const fresh: any = await VisaApplication.findById(application._id).lean();
+    expect(fresh.assignedScreeningOfficerId).toBeNull();
   });
 
   it("gates flagging a discrepancy, and allows the assigned screener", async () => {
@@ -494,15 +495,192 @@ describe("tier 'assignment' — capability AND assigned-on-this-case", () => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * RULING 1 — AUTO-CLAIM ON UNASSIGNED (tier "assignment" only).
+ *
+ * A screener acting on a case nobody owns takes it, rather than being
+ * refused into a dead end that only a coordinator could open. Every test
+ * here runs as a NON-SuperAdmin: the break-glass clears the assignment
+ * check outright, so an L8 would never reach the claim and would prove
+ * nothing about it.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+describe("tier 'assignment' — auto-claim on an unassigned case", () => {
+  beforeEach(() => {
+    process.env.VISA_SCREENING_ENFORCEMENT = "assignment";
+  });
+
+  async function screenerActor() {
+    const u = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    actor = { _id: u._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    return u;
+  }
+
+  it("ALLOWS the act, and makes the actor the assigned screening officer", async () => {
+    const screener = await screenerActor();
+    const { application, document } = await seedCase({ assignedScreeningOfficerId: null });
+
+    const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+    expect(res.status).toBe(200);
+    expect((await VisaDocument.findById(document._id).lean() as any).reviewStatus).toBe("VERIFIED");
+
+    const fresh: any = await VisaApplication.findById(application._id).lean();
+    expect(String(fresh.assignedScreeningOfficerId)).toBe(String(screener._id));
+  });
+
+  it("LOGS the claim as its own event, naming who and how", async () => {
+    const screener = await screenerActor();
+    const { application, document } = await seedCase({ assignedScreeningOfficerId: null });
+    await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+
+    const rows: any[] = await VisaActivityLog.find({
+      applicationId: application._id,
+      eventType: "SCREENING_OFFICER_AUTO_CLAIMED",
+    }).lean();
+
+    expect(rows).toHaveLength(1);
+    expect(String(rows[0].actorUserId)).toBe(String(screener._id));
+    expect(rows[0].detail).toMatchObject({ act: "DOCUMENT_REVIEW", autoClaimed: true });
+    expect(rows[0].at).toBeInstanceOf(Date);
+    // Distinct from a coordinator assigning someone — that is the point of
+    // giving it its own event type.
+    expect(
+      await VisaActivityLog.countDocuments({
+        applicationId: application._id,
+        eventType: "SCREENING_OFFICER_ASSIGNED",
+      }),
+    ).toBe(0);
+  });
+
+  it("auto-claims on flagging a discrepancy too, not just document review", async () => {
+    const screener = await screenerActor();
+    const { application } = await seedCase({ assignedScreeningOfficerId: null });
+
+    const res = await request(makeApp())
+      .patch(`/applications/${application._id}/status`)
+      .send({ status: "discrepancy_flagged", reason: "photo is wrong" });
+    expect(res.status).toBe(200);
+
+    const fresh: any = await VisaApplication.findById(application._id).lean();
+    expect(String(fresh.assignedScreeningOfficerId)).toBe(String(screener._id));
+    const rows = await VisaActivityLog.find({ eventType: "SCREENING_OFFICER_AUTO_CLAIMED" }).lean();
+    expect((rows[0] as any).detail.act).toBe("DISCREPANCY_SET");
+  });
+
+  it("claims ONCE — a second act by the same officer does not re-log", async () => {
+    await screenerActor();
+    const { application, document } = await seedCase({ assignedScreeningOfficerId: null });
+
+    await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+    await request(makeApp()).patch(`/documents/${document._id}/review`).send({ reviewStatus: "REJECTED", rejectionReason: "blurred" });
+
+    expect(
+      await VisaActivityLog.countDocuments({
+        applicationId: application._id,
+        eventType: "SCREENING_OFFICER_AUTO_CLAIMED",
+      }),
+    ).toBe(1);
+  });
+
+  it("does NOT satisfy the capability half — a non-screener cannot claim their way in", async () => {
+    // The actor holds visaApplication WRITE but NOT visaScreening. Auto-claim
+    // answers "is this case yours"; it must never answer "are you a screener".
+    const { application, document } = await seedCase({ assignedScreeningOfficerId: null });
+
+    const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+    expect(res.status).toBe(403);
+    expect(res.body.reason).toBe("NOT_A_SCREENER");
+
+    const fresh: any = await VisaApplication.findById(application._id).lean();
+    expect(fresh.assignedScreeningOfficerId).toBeNull();
+    expect(await VisaActivityLog.countDocuments({ eventType: "SCREENING_OFFICER_AUTO_CLAIMED" })).toBe(0);
+  });
+
+  it("never claims a case that already belongs to someone else", async () => {
+    const other = await makeUser({ visaScreening: "WRITE" });
+    await screenerActor();
+    const { application, document } = await seedCase({
+      assignedScreeningOfficerId: other._id as mongoose.Types.ObjectId,
+    });
+
+    const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+    expect(res.status).toBe(403);
+    expect(res.body.reason).toBe("NOT_ASSIGNED");
+
+    const fresh: any = await VisaApplication.findById(application._id).lean();
+    expect(String(fresh.assignedScreeningOfficerId)).toBe(String(other._id));
+  });
+
+  it("only ONE of two racing screeners wins the case", async () => {
+    // Two people working the same queue is the ordinary case, not an exotic
+    // one — a read-then-write claim would let the second silently overwrite
+    // the first and leave the trail naming the wrong officer.
+    const a = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    const b = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    const { application, document } = await seedCase({ assignedScreeningOfficerId: null });
+
+    actor = { _id: a._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const appA = makeApp();
+    await request(appA).patch(`/documents/${document._id}/review`).send(reviewBody);
+
+    actor = { _id: b._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const second = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+
+    // B arrives after A owns it and is refused exactly as if it had been
+    // assigned all along.
+    expect(second.status).toBe(403);
+    expect(second.body.reason).toBe("NOT_ASSIGNED");
+
+    const fresh: any = await VisaApplication.findById(application._id).lean();
+    expect(String(fresh.assignedScreeningOfficerId)).toBe(String(a._id));
+    expect(await VisaActivityLog.countDocuments({ eventType: "SCREENING_OFFICER_AUTO_CLAIMED" })).toBe(1);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * AUTO-CLAIM IS TIER-SPECIFIC — it must not leak into the lower tiers.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+describe("auto-claim does not apply below tier 'assignment'", () => {
+  it("tier OFF leaves an unassigned case unassigned", async () => {
+    const { application, document } = await seedCase({ assignedScreeningOfficerId: null });
+    const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+
+    expect(res.status).toBe(200);
+    expect((await VisaApplication.findById(application._id).lean() as any).assignedScreeningOfficerId).toBeNull();
+    expect(await VisaActivityLog.countDocuments({ eventType: "SCREENING_OFFICER_AUTO_CLAIMED" })).toBe(0);
+  });
+
+  it("tier CAPABILITY leaves an unassigned case unassigned", async () => {
+    process.env.VISA_SCREENING_ENFORCEMENT = "capability";
+    const u = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
+    actor = { _id: u._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+    const { application, document } = await seedCase({ assignedScreeningOfficerId: null });
+
+    const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
+    expect(res.status).toBe(200);
+    // Assignment is not consulted at this tier, so it must not be WRITTEN
+    // either — the tier's promise is that ops keeps working unassigned.
+    expect((await VisaApplication.findById(application._id).lean() as any).assignedScreeningOfficerId).toBeNull();
+    expect(await VisaActivityLog.countDocuments({ eventType: "SCREENING_OFFICER_AUTO_CLAIMED" })).toBe(0);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
  * LEGACY BOOLEAN — an environment still carrying step 1's flag must keep
  * its exact former meaning, not quietly change behaviour on deploy.
  * ═══════════════════════════════════════════════════════════════════════ */
 
 describe("legacy VISA_SCREENING_ENFORCED", () => {
+  // Probed with a case owned by ANOTHER screener, not an unassigned one.
+  // Since Ruling 1 an unassigned case is auto-claimed at the assignment tier,
+  // so it no longer separates the two tiers — "belongs to someone else" is
+  // the difference that remains: refused at assignment, allowed at
+  // capability.
   it("'true' still means the assignment tier — capability alone is not enough", async () => {
+    const other = await makeUser({ visaScreening: "WRITE" });
     const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
     actor = { _id: screener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
-    const { document } = await seedCase({ assignedScreeningOfficerId: null });
+    const { document } = await seedCase({ assignedScreeningOfficerId: other._id as mongoose.Types.ObjectId });
 
     process.env.VISA_SCREENING_ENFORCED = "true";
     const res = await request(makeApp()).patch(`/documents/${document._id}/review`).send(reviewBody);
@@ -511,9 +689,10 @@ describe("legacy VISA_SCREENING_ENFORCED", () => {
   });
 
   it("is IGNORED once the tier is set explicitly — the new variable wins", async () => {
+    const other = await makeUser({ visaScreening: "WRITE" });
     const screener = await makeUser({ visaApplication: "WRITE", visaScreening: "WRITE" });
     actor = { _id: screener._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
-    const { document } = await seedCase({ assignedScreeningOfficerId: null });
+    const { document } = await seedCase({ assignedScreeningOfficerId: other._id as mongoose.Types.ObjectId });
 
     process.env.VISA_SCREENING_ENFORCED = "true";
     process.env.VISA_SCREENING_ENFORCEMENT = "capability";
