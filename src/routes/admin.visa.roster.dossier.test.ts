@@ -24,12 +24,20 @@ vi.mock("../middleware/auth.js", () => ({
   default: (_req: any, _res: any, next: any) => next(),
 }));
 
+// The ONE thing that cannot be real here: presigning talks to S3. Everything
+// this file asserts about documents — which rows a scoped query matches, what
+// the panel is told it may do — is answered by Mongo, not by AWS.
+vi.mock("../utils/s3Presign.js", () => ({
+  presignGetObject: async ({ key }: any) => `https://s3.test/${key}?signed=1`,
+}));
+
 // requirePermission is NOT mocked away — the point of this file is that the
 // ops grant is what opens the dossier. It reads UserPermission for real.
 import router from "./admin.visa.roster.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import TravellerTrip from "../models/TravellerTrip.js";
 import VisaHolding from "../models/VisaHolding.js";
+import TravellerDocument from "../models/TravellerDocument.js";
 import User from "../models/User.js";
 import { UserPermission } from "../models/UserPermission.js";
 
@@ -96,11 +104,31 @@ async function seedTraveller(workspaceId: mongoose.Types.ObjectId, over: any = {
   });
 }
 
+async function seedDocument(
+  workspaceId: mongoose.Types.ObjectId,
+  travellerProfileId: any,
+  over: any = {},
+) {
+  return TravellerDocument.create({
+    workspaceId,
+    travellerProfileId,
+    docKind: "PASSPORT_FRONT",
+    version: 1,
+    s3Key: `traveller-profiles/${workspaceId}/${travellerProfileId}/passport.pdf`,
+    originalFilename: "passport.pdf",
+    mimeType: "application/pdf",
+    sizeBytes: 12345,
+    uploadedByUserId: new mongoose.Types.ObjectId(),
+    ...over,
+  } as any);
+}
+
 beforeEach(async () => {
   await Promise.all([
     TravellerProfile.deleteMany({}),
     TravellerTrip.deleteMany({}),
     VisaHolding.deleteMany({}),
+    TravellerDocument.deleteMany({}),
     User.deleteMany({}),
     UserPermission.deleteMany({}),
   ]);
@@ -133,7 +161,7 @@ describe("ops dossier — the gate", () => {
     actor = { _id: u._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
     const t = await seedTraveller(TENANT_A);
 
-    for (const path of ["visa-holdings", "trips"]) {
+    for (const path of ["visa-holdings", "trips", "documents"]) {
       const res = await request(makeApp()).get(`/workspaces/${TENANT_A}/travellers/${t._id}/${path}`);
       expect(res.status, path).toBe(403);
     }
@@ -236,6 +264,137 @@ describe("ops dossier — read-only and masked", () => {
     }
     // And the record is untouched.
     expect((await TravellerProfile.findById(t._id).lean() as any).firstName).toBe("Priya");
+  });
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * PROFILE DOCUMENTS (2026-08-12) — the passport scans on the ops dossier.
+ *
+ * The same three questions the reads above answer, asked of the one
+ * sub-resource that is a FILE rather than a field: does the ops permission
+ * open it, can a traveller (or document) id alone reach across a tenant
+ * boundary, and is it genuinely read-only rather than read-only-looking.
+ * ═════════════════════════════════════════════════════════════════════ */
+describe("ops dossier — documents", () => {
+  it("lists the latest version of each kind, so the panel renders a real list", async () => {
+    const t = await seedTraveller(TENANT_A);
+    await seedDocument(TENANT_A, t._id, { version: 1, originalFilename: "old.pdf" });
+    await seedDocument(TENANT_A, t._id, { version: 2, originalFilename: "current.pdf" });
+    await seedDocument(TENANT_A, t._id, { docKind: "PASSPORT_BACK", originalFilename: "back.jpg" });
+
+    const res = await request(makeApp()).get(`/workspaces/${TENANT_A}/travellers/${t._id}/documents`);
+
+    expect(res.status).toBe(200);
+    // Two kinds, not three rows — the superseded v1 is not a second entry.
+    expect(res.body.documents).toHaveLength(2);
+    const front = res.body.documents.find((d: any) => d.docKind === "PASSPORT_FRONT");
+    expect(front.originalFilename).toBe("current.pdf");
+    expect(front.version).toBe(2);
+    // The internal storage path is not the client's, here as anywhere else.
+    expect(front).not.toHaveProperty("s3Key");
+  });
+
+  it("omits soft-deleted documents", async () => {
+    const t = await seedTraveller(TENANT_A);
+    await seedDocument(TENANT_A, t._id, { deletedAt: new Date() });
+
+    const res = await request(makeApp()).get(`/workspaces/${TENANT_A}/travellers/${t._id}/documents`);
+    expect(res.body.documents).toHaveLength(0);
+  });
+
+  it("scopes by workspace AND traveller — a document is not reachable by traveller id alone", async () => {
+    const theirs = await seedTraveller(TENANT_B);
+    await seedDocument(TENANT_B, theirs._id);
+
+    const wrong = await request(makeApp()).get(`/workspaces/${TENANT_A}/travellers/${theirs._id}/documents`);
+    expect(wrong.status).toBe(404);
+
+    const right = await request(makeApp()).get(`/workspaces/${TENANT_B}/travellers/${theirs._id}/documents`);
+    expect(right.status).toBe(200);
+    expect(right.body.documents).toHaveLength(1);
+  });
+
+  it("READ-ONLY: sends an empty uploadableKinds, which is what removes the panel's write controls", async () => {
+    const t = await seedTraveller(TENANT_A);
+    await seedDocument(TENANT_A, t._id);
+
+    const res = await request(makeApp()).get(`/workspaces/${TENANT_A}/travellers/${t._id}/documents`);
+
+    expect(res.body.capabilities.uploadableKinds).toEqual([]);
+    // PASSPORT_* are never platform-gated — the customer route offers them for
+    // upload today. Their absence here therefore proves the read-only state is
+    // THIS route's doing and not an accident of the identity-capture flag.
+    expect(res.body.capabilities.uploadableKinds).not.toContain("PASSPORT_FRONT");
+    // …and the platform's own PAN/Aadhaar explanation still travels, so those
+    // rows say why they are closed instead of just looking empty.
+    expect(res.body.identityCapture).toHaveProperty("enabled");
+  });
+
+  it("exposes no upload or delete verb — read-only is the absence of a route, not a flag", async () => {
+    const t = await seedTraveller(TENANT_A);
+    const doc = await seedDocument(TENANT_A, t._id);
+    const base = `/workspaces/${TENANT_A}/travellers/${t._id}/documents`;
+
+    for (const call of [
+      request(makeApp()).post(base).send({ docKind: "PASSPORT_FRONT" }),
+      request(makeApp()).delete(`${base}/${doc._id}`),
+    ]) {
+      expect((await call).status).toBe(404); // no such route on this router
+    }
+    // And the row is untouched — nothing was soft-deleted along the way.
+    expect((await TravellerDocument.findById(doc._id).lean() as any).deletedAt).toBeNull();
+  });
+
+  it("presigns a document that belongs to this traveller in this workspace", async () => {
+    const t = await seedTraveller(TENANT_A);
+    const doc = await seedDocument(TENANT_A, t._id);
+
+    const res = await request(makeApp())
+      .get(`/workspaces/${TENANT_A}/travellers/${t._id}/documents/${doc._id}/url`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.url).toContain(doc.s3Key);
+  });
+
+  it("refuses a documentId belonging to ANOTHER traveller, even inside the same workspace", async () => {
+    const mine = await seedTraveller(TENANT_A, { firstName: "Mine" });
+    const other = await seedTraveller(TENANT_A, { firstName: "Other" });
+    const theirDoc = await seedDocument(TENANT_A, other._id);
+
+    // The id triple is the filter, not a post-hoc check: asking for someone
+    // else's scan under my traveller id matches nothing.
+    const res = await request(makeApp())
+      .get(`/workspaces/${TENANT_A}/travellers/${mine._id}/documents/${theirDoc._id}/url`);
+
+    expect(res.status).toBe(404);
+  });
+
+  it("refuses a documentId from another TENANT", async () => {
+    const t = await seedTraveller(TENANT_A);
+    const theirs = await seedTraveller(TENANT_B);
+    const theirDoc = await seedDocument(TENANT_B, theirs._id);
+
+    const res = await request(makeApp())
+      .get(`/workspaces/${TENANT_A}/travellers/${t._id}/documents/${theirDoc._id}/url`);
+    expect(res.status).toBe(404);
+  });
+
+  it("rejects a malformed documentId rather than casting it into a query", async () => {
+    const t = await seedTraveller(TENANT_A);
+    const res = await request(makeApp())
+      .get(`/workspaces/${TENANT_A}/travellers/${t._id}/documents/not-an-id/url`);
+    expect(res.status).toBe(400);
+  });
+
+  it("refuses the presign to a staff user with no visaApplication grant", async () => {
+    const t = await seedTraveller(TENANT_A);
+    const doc = await seedDocument(TENANT_A, t._id);
+    const u = await makeOpsUser({ visaApplication: "NONE" });
+    actor = { _id: u._id as mongoose.Types.ObjectId, roles: ["ADMIN"] };
+
+    const res = await request(makeApp())
+      .get(`/workspaces/${TENANT_A}/travellers/${t._id}/documents/${doc._id}/url`);
+    expect(res.status).toBe(403);
   });
 });
 

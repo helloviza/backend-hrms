@@ -1257,7 +1257,7 @@ export async function describeDesignation(
  * reassurance the server would not stand behind. While `enabled` is false
  * the client disables capture and shows `message` verbatim.
  */
-function identityCaptureState() {
+export function identityCaptureState() {
   const enabled = isIdentityNumberCaptureEnabled();
   return {
     enabled,
@@ -2627,8 +2627,10 @@ async function requireTravellerSubResourceAccess(
   return { traveller, uid };
 }
 
-/** Never includes s3Key — the internal storage path is not the client's. */
-function mapTravellerDocument(d: any) {
+/** Never includes s3Key — the internal storage path is not the client's.
+ *  Exported for admin.visa.roster.ts's read-only ops twin, so both surfaces
+ *  shape a document row identically — see resolveDossierHeader's note. */
+export function mapTravellerDocument(d: any) {
   return {
     _id: String(d._id),
     docKind: d.docKind,

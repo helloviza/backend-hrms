@@ -73,7 +73,12 @@ import {
   describeDesignation,
   countryVocabulary,
   mapTripRow,
+  mapTravellerDocument,
+  identityCaptureState,
 } from "./workspace.travellers.js";
+import TravellerDocument from "../models/TravellerDocument.js";
+import { presignGetObject } from "../utils/s3Presign.js";
+import { env } from "../config/env.js";
 import { resolveVisaWallet, resolveSchengenBlock } from "../services/visaHolding.service.js";
 import TravellerTrip, { TRIP_PURPOSES, TRIP_DATE_PRECISIONS } from "../models/TravellerTrip.js";
 import { VISA_ENTRY_TYPES } from "../models/VisaRule.js";
@@ -516,5 +521,113 @@ router.get("/workspaces/:workspaceId/travellers/:travellerId/trips", async (req:
     res.status(500).json({ error: err?.message || "Failed to load travel history" });
   }
 });
+
+/* ═════════════════════════════════════════════════════════════════════
+ * PROFILE DOCUMENTS (2026-08-12) — the passport scans, read-only.
+ *
+ * The fourth ops read, added for the same reason as the three above: the
+ * dossier now opens from ops, and an agent working a case could see every
+ * passport FIELD on the record but not the scan those fields were typed
+ * from — which is the one thing worth checking when a case is stuck on a
+ * document.
+ *
+ * WHY HERE AND NOT ON /workspace/travellers, again. Those routes run
+ * requireTravellerSubResourceAccess, which is requireActiveMember plus an
+ * EDIT-level write check — deliberately edit-level even for reads, because
+ * "a passport SCAN … is exactly the kind of dossier a colleague has no
+ * business browsing". Ops holds neither: it is not a member of the customer's
+ * workspace at all. Admitting it there would have meant loosening a gate
+ * whose whole point is to be narrow, and would have handed ops the upload and
+ * delete verbs sitting behind the same helper.
+ *
+ * So: same router-level requirePermission("visaApplication", "READ") as the
+ * roster and the other three dossier reads, same both-ids scoping via
+ * opsTraveller, and READ ONLY — list and presign, no POST, no DELETE.
+ *
+ * `uploadableKinds: []` is what makes the shared panel read-only. That is not
+ * a new mode either: the panel already renders a row without its upload
+ * control when the kind is absent from that list, and already keeps the View
+ * button for a document that exists. Nothing about read-only is invented on
+ * the client.
+ *
+ * identityCaptureState() is sent unchanged, so the PAN/Aadhaar rows still
+ * explain themselves in the platform's own words rather than looking merely
+ * empty on this surface.
+ * ═════════════════════════════════════════════════════════════════════ */
+
+router.get("/workspaces/:workspaceId/travellers/:travellerId/documents", async (req: any, res: any) => {
+  try {
+    const traveller = await opsTraveller(req, res);
+    if (!traveller) return;
+    const workspaceId = new mongoose.Types.ObjectId(req.params.workspaceId);
+
+    const docs: any[] = await TravellerDocument.find({
+      workspaceId,
+      travellerProfileId: traveller._id,
+      deletedAt: null,
+    })
+      .sort({ docKind: 1, version: -1 })
+      .lean();
+
+    // First row per kind wins — same "latest version of each kind" reduction
+    // the workspace route performs on the same sort.
+    const latestByKind = new Map<string, any>();
+    for (const d of docs) {
+      if (!latestByKind.has(d.docKind)) latestByKind.set(d.docKind, d);
+    }
+
+    res.json({
+      ok: true,
+      documents: [...latestByKind.values()].map(mapTravellerDocument),
+      // Ops reads; ops does not manage a customer's scans. An empty allowlist
+      // is what removes every upload/replace/delete control in the shared panel.
+      capabilities: { uploadableKinds: [] },
+      identityCapture: identityCaptureState(),
+    });
+  } catch (err: any) {
+    console.error("[admin.visa.roster GET traveller documents]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load documents" });
+  }
+});
+
+router.get(
+  "/workspaces/:workspaceId/travellers/:travellerId/documents/:documentId/url",
+  async (req: any, res: any) => {
+    try {
+      const traveller = await opsTraveller(req, res);
+      if (!traveller) return;
+      const workspaceId = new mongoose.Types.ObjectId(req.params.workspaceId);
+
+      if (!mongoose.isValidObjectId(req.params.documentId)) {
+        return res.status(400).json({ error: "documentId is not a valid id" });
+      }
+
+      // All three ids in the filter, never checked afterwards — a documentId
+      // from another profile or another tenant resolves to nothing rather
+      // than to somebody else's passport scan. Same idiom as the workspace
+      // route, with workspaceId taken from the path instead of the session.
+      const doc: any = await TravellerDocument.findOne({
+        _id: req.params.documentId,
+        workspaceId,
+        travellerProfileId: traveller._id,
+        deletedAt: null,
+      }).lean();
+      if (!doc) return res.status(404).json({ error: "Document not found" });
+
+      const url = await presignGetObject({
+        bucket: env.S3_BUCKET,
+        key: doc.s3Key,
+        filename: doc.originalFilename,
+        view: true,
+        contentType: doc.mimeType,
+      });
+
+      res.json({ ok: true, url });
+    } catch (err: any) {
+      console.error("[admin.visa.roster GET traveller document url]", err?.message);
+      res.status(500).json({ error: err?.message || "Failed to open document" });
+    }
+  },
+);
 
 export default router;
