@@ -63,6 +63,20 @@ import VisaRequest from "../models/VisaRequest.js";
 import VisaApplication from "../models/VisaApplication.js";
 import Department from "../models/Department.js";
 import { maskTailId } from "../utils/piiMask.js";
+// The dossier is computed by the SAME helpers the workspace-side dossier
+// uses, imported rather than reimplemented — a second copy of "what is in
+// this record" is exactly how two surfaces start disagreeing about one row.
+import {
+  computeDossierHealth,
+  resolvePassportVault,
+  resolveDossierHeader,
+  describeDesignation,
+  countryVocabulary,
+  mapTripRow,
+} from "./workspace.travellers.js";
+import { resolveVisaWallet, resolveSchengenBlock } from "../services/visaHolding.service.js";
+import TravellerTrip, { TRIP_PURPOSES, TRIP_DATE_PRECISIONS } from "../models/TravellerTrip.js";
+import { VISA_ENTRY_TYPES } from "../models/VisaRule.js";
 
 const router = Router();
 
@@ -342,6 +356,164 @@ router.get("/workspaces/:workspaceId/roster", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[admin.visa.roster GET /workspaces/:id/roster]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load roster" });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * OPS → TRAVELLER DOSSIER (2026-08-12)
+ *
+ * The six-tab dossier had no route from any ops surface: the roster
+ * drill-in and the case views name a traveller and dead-end there, so an
+ * agent working a case could not open the record the case is about.
+ *
+ * WHY THESE LIVE HERE AND NOT ON /workspace/travellers. That router is
+ * membership-gated end to end — requireActiveMember admits only an active
+ * CustomerMember of the workspace, bypassed for SUPERADMIN alone, and
+ * requireWorkspace pins a non-SUPERADMIN staff user to their OWN workspace.
+ * So visaApplication authorises NOTHING there: an L6 ops admin holding it
+ * gets 403 "Not a member of this workspace" on every tenant they operate
+ * on. Admitting ops inside requireActiveMember would have been the small
+ * diff and the wrong one — it is shared with ~40 routes including every
+ * write, so it would have handed ops edit rights over customer rosters to
+ * fix a read gap.
+ *
+ * These three reads sit behind THIS file's existing router-level
+ * requirePermission("visaApplication", "READ") — the same gate that already
+ * lets ops read these very TravellerProfile rows for the roster above. No
+ * new gate, nothing loosened, and the customer's own WL path is untouched.
+ *
+ * READ-ONLY BY CONSTRUCTION. Each returns the same payload shape its
+ * /workspace/travellers twin returns, computed by the SAME exported helpers
+ * so the two cannot drift, but with canManage/canEdit false and
+ * editableFields empty. That is not a new read-only mode: TravellerForm
+ * already locks every field the server omits from editableFields, and both
+ * panels already hide their add/edit/delete on capabilities.canEdit — the
+ * wallet route's own comment anticipates exactly this variant.
+ *
+ * THE CONSENT LEDGER IS DELIBERATELY ABSENT. There is no ops equivalent of
+ * GET /:id/consents. That route is gated at EDIT level with an explicit
+ * rationale — "a consent ledger is a record of what a named person legally
+ * agreed to, squarely in the class of dossier a colleague has no business
+ * browsing". A customer's own REQUESTER cannot read it; extending it to
+ * cross-tenant ops would overturn a documented privacy decision, which is a
+ * ruling to take deliberately and not a wiring gap to close in passing. The
+ * tab renders as withheld on the ops surface.
+ *
+ * PASSPORT NUMBERS ARE MASKED, matching the roster above. A new surface
+ * starts masked; nothing here has ever shown the full number, so there is
+ * no behaviour to preserve.
+ * ═════════════════════════════════════════════════════════════════════ */
+
+/** Resolves and scopes the traveller, or answers the request. */
+async function opsTraveller(req: any, res: any): Promise<any | null> {
+  const { workspaceId, travellerId } = req.params;
+  if (!mongoose.isValidObjectId(workspaceId) || !mongoose.isValidObjectId(travellerId)) {
+    res.status(400).json({ error: "workspaceId and travellerId must be valid ids" });
+    return null;
+  }
+  // Scoped by BOTH ids, like every other query in this file — a traveller id
+  // alone must never be enough to read across into another tenant.
+  const traveller: any = await TravellerProfile.findOne({
+    _id: travellerId,
+    workspaceId,
+  }).lean();
+  if (!traveller) {
+    res.status(404).json({ error: "Traveller not found in this workspace" });
+    return null;
+  }
+  return traveller;
+}
+
+router.get("/workspaces/:workspaceId/travellers/:travellerId", async (req: any, res: any) => {
+  try {
+    const traveller = await opsTraveller(req, res);
+    if (!traveller) return;
+    const workspaceId = new mongoose.Types.ObjectId(req.params.workspaceId);
+
+    const [header, designation, passportVault] = await Promise.all([
+      resolveDossierHeader(traveller, workspaceId),
+      describeDesignation(traveller, workspaceId),
+      resolvePassportVault(traveller, workspaceId),
+    ]);
+
+    res.json({
+      ok: true,
+      traveller: { ...traveller, passportNo: maskTailId(traveller.passportNo) ?? null },
+      // Ops reads; ops does not edit a customer's roster. An empty allowlist
+      // is what locks every field in the shared form.
+      canManage: false,
+      editableFields: [],
+      isClaimable: false,
+      dossierHealth: computeDossierHealth(traveller),
+      header,
+      designation,
+      passportVault: {
+        ...passportVault,
+        // The vault echoes the number back for the MRZ/mismatch panels; mask
+        // it there too, or the tab would hand back what the row above hid.
+        passportNo: maskTailId((passportVault as any)?.passportNo) ?? null,
+      },
+      // Named so the client renders an honest withheld state rather than an
+      // empty tab that looks like "this person consented to nothing".
+      consentLedger: {
+        available: false,
+        reason:
+          "The consent ledger is not visible from the ops console — it records what a named " +
+          "person legally agreed to, and is readable only inside their own workspace.",
+      },
+    });
+  } catch (err: any) {
+    console.error("[admin.visa.roster GET traveller dossier]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load dossier" });
+  }
+});
+
+router.get("/workspaces/:workspaceId/travellers/:travellerId/visa-holdings", async (req: any, res: any) => {
+  try {
+    const traveller = await opsTraveller(req, res);
+    if (!traveller) return;
+    const workspaceId = new mongoose.Types.ObjectId(req.params.workspaceId);
+
+    const { rows, summary } = await resolveVisaWallet(traveller._id, workspaceId);
+    res.json({
+      ok: true,
+      holdings: rows,
+      summary,
+      schengen: resolveSchengenBlock(rows),
+      capabilities: { canEdit: false, canAttachStamp: false, stampReason: "Read-only from the ops console." },
+      vocabularies: { entryTypes: VISA_ENTRY_TYPES, countries: countryVocabulary() },
+    });
+  } catch (err: any) {
+    console.error("[admin.visa.roster GET traveller visa-holdings]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load visa wallet" });
+  }
+});
+
+router.get("/workspaces/:workspaceId/travellers/:travellerId/trips", async (req: any, res: any) => {
+  try {
+    const traveller = await opsTraveller(req, res);
+    if (!traveller) return;
+    const workspaceId = new mongoose.Types.ObjectId(req.params.workspaceId);
+
+    const docs: any[] = await TravellerTrip.find({
+      workspaceId,
+      travellerProfileId: traveller._id,
+      deletedAt: null,
+    })
+      .sort({ startDate: -1, tripMonth: -1, createdAt: -1 })
+      .lean();
+
+    const trips = docs.map(mapTripRow);
+    res.json({
+      ok: true,
+      trips,
+      summary: { recorded: trips.length, countries: new Set(trips.map((t) => t.countryIso2)).size },
+      capabilities: { canEdit: false },
+      vocabularies: { purposes: TRIP_PURPOSES, datePrecisions: TRIP_DATE_PRECISIONS, countries: countryVocabulary() },
+    });
+  } catch (err: any) {
+    console.error("[admin.visa.roster GET traveller trips]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load travel history" });
   }
 });
 

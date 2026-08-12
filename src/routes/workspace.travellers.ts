@@ -885,7 +885,7 @@ const DOSSIER_HEALTH_FIELDS = [
  * question "of what?", and the answer has to be inspectable or the number
  * is just decoration.
  */
-function computeDossierHealth(traveller: any): {
+export function computeDossierHealth(traveller: any): {
   percent: number;
   filled: number;
   total: number;
@@ -992,7 +992,7 @@ async function findPassportExtractionForTraveller(travellerId: any, workspaceId:
  * WHY each half is or isn't there, so the client renders the reason rather
  * than inventing one.
  */
-async function resolvePassportVault(traveller: any, workspaceId: any) {
+export async function resolvePassportVault(traveller: any, workspaceId: any) {
   const mrzResult = composeTD3Mrz({
     firstName: traveller?.firstName,
     middleName: traveller?.middleName,
@@ -1199,7 +1199,7 @@ async function resolvePassportVault(traveller: any, workspaceId: any) {
  * answer and does render as 0. Both come from the same summary the wallet
  * tab renders, so the header and the tab cannot disagree.
  */
-async function resolveDossierHeader(traveller: any, workspaceId: any) {
+export async function resolveDossierHeader(traveller: any, workspaceId: any) {
   let activeVisas: number | null = null;
   let activeVisasReason: string | null = "No visas recorded yet";
   try {
@@ -1239,7 +1239,7 @@ async function resolveDossierHeader(traveller: any, workspaceId: any) {
  * Looked up by id AND workspaceId: a stale pointer outside this workspace
  * resolves to no name rather than reading another tenant's row.
  */
-async function describeDesignation(
+export async function describeDesignation(
   traveller: any,
   workspaceId: any,
 ): Promise<{ name: string | null; level: number | null }> {
@@ -2883,7 +2883,7 @@ function resolveCountryInput(raw: any): { iso2: string; name: string } | { error
  * a gap in that table to fix at the source — the honest failure — rather
  * than a free-text country nothing downstream can place.
  */
-function countryVocabulary(): { iso2: string; name: string }[] {
+export function countryVocabulary(): { iso2: string; name: string }[] {
   return COUNTRY_CODES.map((c) => ({ iso2: c.iso2, name: c.name })).sort((a, b) =>
     a.name.localeCompare(b.name),
   );
@@ -3116,7 +3116,7 @@ router.delete("/:id/visa-holdings/:holdingId", async (req: any, res: any) => {
  * wording must not imply it is.
  * ═══════════════════════════════════════════════════════════════════════ */
 
-function mapTripRow(t: any) {
+export function mapTripRow(t: any) {
   return {
     _id: String(t._id),
     countryIso2: t.countryIso2,
