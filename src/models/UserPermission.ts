@@ -104,6 +104,31 @@ export interface UserPermissionDoc extends Document {
     leads?: ModulePermission
     crmContacts?: ModulePermission
     crmCompanies?: ModulePermission
+
+    // CSTEP Travel & Claim Portal
+    cstep: ModulePermission
+
+    // Visa Application (concierge console) — READ = view applications,
+    // WRITE = work applications (concierge agent), FULL = manage fees and
+    // rules (concierge lead). Not yet used by any route (see routes/visa.ts,
+    // which gates on requireWorkspace + visaEnabled instead) — wired now so
+    // it's grantable ahead of the concierge console phase.
+    visaApplication: ModulePermission
+    // Screening authority (2026-08-12) — a SIBLING capability to
+    // visaApplication, deliberately not a higher tier on it. Screening is a
+    // different job, not "more than WRITE": a screening officer judges the
+    // applicant's evidence (accept/reject a document, raise and resolve a
+    // discrepancy), while a concierge owns the customer relationship and the
+    // coordination. Someone can legitimately hold either without the other.
+    //
+    // Granted to NO level template yet — see
+    // infra/audit/visa-screening-authority-model-2026-08-12.md. The key
+    // exists so it CAN be granted. RULED 2026-08-12: granted PER-USER,
+    // independent of level — no level template carries it, so changing
+    // someone's level will not revoke it and off-boarding must do so
+    // explicitly. Nothing enforces it until VISA_SCREENING_ENFORCEMENT is
+    // raised above "off" (config/visaScreening.ts).
+    visaScreening: ModulePermission
   }
 
   grantedBy: string
@@ -173,6 +198,13 @@ const modulesSchema = new Schema(
     leads: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     crmContacts: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     crmCompanies: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+
+    // CSTEP Travel & Claim Portal
+    cstep: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+
+    // Visa Application (concierge console)
+    visaApplication: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    visaScreening: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
   },
   { _id: false }
 )

@@ -30,6 +30,14 @@ export async function presignGetObject(opts: {
   view?: boolean;
   /** Attachment's stored mimeType — only applied when `view` is true. */
   contentType?: string;
+  /**
+   * true → forces `Content-Disposition: attachment` so the browser saves the
+   * file instead of rendering it, regardless of the object's own stored
+   * Content-Type. New, additive option (CSTEP Tour Proposal PDF's explicit
+   * Download button) — omitted/false leaves every existing call site's
+   * "inline" behavior byte-for-byte unchanged.
+   */
+  forceDownload?: boolean;
 }) {
   const cmd = new GetObjectCommand({
     Bucket: opts.bucket,
@@ -38,7 +46,9 @@ export async function presignGetObject(opts: {
     // that used to be here ("makes browser download") was stale/inaccurate.
     // Left unchanged for the existing Download call sites per the
     // don't-touch-download-behavior instruction.
-    ResponseContentDisposition: opts.filename
+    ResponseContentDisposition: opts.forceDownload
+      ? `attachment; filename="${(opts.filename || "document.pdf").replace(/"/g, "")}"`
+      : opts.filename
       ? `inline; filename="${opts.filename.replace(/"/g, "")}"`
       : undefined,
     ResponseContentType: opts.view ? opts.contentType : undefined,

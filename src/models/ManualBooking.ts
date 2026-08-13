@@ -145,8 +145,44 @@ export interface IManualBooking extends Document {
   deletedBy?: Schema.Types.ObjectId;
   deletionReason?: string;
   deletionNote?: string;
+  // Erasure follow-up (2026-07-31, scripts/lib/visaErasureCascade.ts) — set
+  // when a visa erasure strips passengers[].passportNo/email/phone off a
+  // booking found via metadata.visaApplicationId (NOT deleted — this is a
+  // GST invoicing record with its own statutory retention obligations;
+  // passengers[].name and every pricing field are deliberately left alone).
+  // Independent of deletedAt/deletionReason above, which describe the
+  // BOOKING's own soft-delete, a separate and unrelated lifecycle.
+  piiRedactedAt?: Date;
   createdBy?: string;
   createdByEmail?: string;
+  /**
+   * WHERE THE BOOKING WAS AUTHORED FROM — resolved from the creator's IP at
+   * create time by services/location.service.ts.
+   *
+   * ONLY the req-scoped POST / path sets this. The bulk-import, travel-intake
+   * and visa-billing-sync creates have no HTTP client to attribute (a file
+   * upload authored on someone else's behalf, a webhook, a sync job), so the
+   * field is absent there rather than carrying a misleading blank.
+   *
+   * NULLABLE WITH A REASON: every field here can legitimately be null, so
+   * `reason` always carries WHY. Without it, "we deliberately didn't look"
+   * (private-ip, from local dev or an office VPN), "we looked and our city
+   * table doesn't carry the answer" (city_not_in_lookup — a table gap, not a
+   * geo failure) and "the resolver broke" (resolver_error) would collapse
+   * into one indistinguishable blank, which is how a coverage number ends up
+   * lying about itself.
+   */
+  bookedFromCity?: {
+    /** Canonical city via the STRICT destinationLookup — null when unrecognised. */
+    city: string | null;
+    /** What the geo database said pre-canonicalisation, so a table gap stays measurable. */
+    rawCity: string | null;
+    source: "ip" | "private-ip" | "unresolved" | "unavailable-non-http";
+    /** 0..1 — see confidenceFromAccuracyRadius in location.service.ts. */
+    confidence: number;
+    reason: string;
+    resolvedAt: Date;
+  };
   isDemo?: boolean;
   createdByDemoUser?: boolean;
   // Free-form bag (Demo Platform uses metadata.demoRef for seed idempotency;
@@ -161,6 +197,28 @@ export interface IManualBooking extends Document {
   createdAt: Date;
   updatedAt: Date;
 }
+
+// A SUB-SCHEMA, not an inline nested object, for one reason: paired with
+// `default: undefined` on the path below it means the whole block is ABSENT on
+// the create paths that never resolve a location. An inline nested object with
+// leaf defaults would materialise `{ city: null, … }` on every row the bulk
+// importer writes, which reads as "we looked and found nothing" for rows where
+// we never looked at all. See IManualBooking.bookedFromCity.
+const BookedFromCitySchema = new Schema(
+  {
+    city: { type: String, default: null },
+    rawCity: { type: String, default: null },
+    source: {
+      type: String,
+      enum: ["ip", "private-ip", "unresolved", "unavailable-non-http"],
+      required: true,
+    },
+    confidence: { type: Number, default: 0 },
+    reason: { type: String, default: "" },
+    resolvedAt: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
 
 const ManualBookingSchema = new Schema<IManualBooking>(
   {
@@ -271,8 +329,11 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     deletedBy: { type: Schema.Types.ObjectId, ref: 'User' },
     deletionReason: { type: String },
     deletionNote: { type: String },
+    piiRedactedAt: { type: Date },
     createdBy: { type: String, index: true },
     createdByEmail: { type: String },
+    // Absent unless the req-scoped POST / path resolved one — see above.
+    bookedFromCity: { type: BookedFromCitySchema, default: undefined },
     // Demo Platform — booking authored under impersonation / seeded for a demo workspace
     isDemo: { type: Boolean, default: false, index: true },
     createdByDemoUser: { type: Boolean, default: false, index: true },

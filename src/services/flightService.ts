@@ -54,7 +54,11 @@ const IATA_TO_ICAO: Record<string, string> = {
   "SG": "SEJ",   // SpiceJet
   "QP": "AKJ",   // Akasa Air
   "UK": "VTI",   // Vistara
-  "IX": "IAD",   // Air India Express
+  "IX": "AXB",   // Air India Express — NOT IAD. Verified against AeroAPI on
+                 // 2026-08-06 with a same-number comparison: AXB613 returns a
+                 // live occurrence where IAD613 returns none. IAD belongs to
+                 // AirAsia India (I5) below, and was copied onto IX by mistake;
+                 // every IX status lookup had been querying the wrong carrier.
   "G8": "GOW",   // GoFirst
   "I5": "IAD",   // Air Asia India
   "S5": "LKD",   // Star Air
@@ -177,6 +181,26 @@ const MS_HOUR = 3600_000;
 const MS_DAY = 86400_000;
 
 /**
+ * AeroAPI refuses an `end` bound more than 2 days ahead:
+ *   HTTP 400 {"detail":"Invalid end bound: time is too far in the future (limit: 2 days)"}
+ * 47h sits just inside that, leaving an hour of slack for clock skew between us
+ * and FlightAware (a hard 48h would 400 intermittently, which is worse than a
+ * consistent failure because it looks like flakiness).
+ */
+export const AEROAPI_MAX_FORWARD_MS = 47 * MS_HOUR;
+
+/**
+ * AeroAPI's bounds parser rejects fractional seconds outright:
+ *   HTTP 400 {"detail":"Invalid start bound: type is incorrect"}
+ * Date#toISOString() always emits them. Applied at the single outbound choke
+ * point (fetchOccurrences) rather than at each call site, so a future caller
+ * cannot reintroduce it by passing a raw toISOString().
+ */
+export function toAeroBound(iso: string): string {
+  return iso.replace(/\.\d+Z$/, "Z");
+}
+
+/**
  * Calendar date of an instant in a given IANA zone. "en-CA" formats as
  * YYYY-MM-DD, which is exactly the shape we compare against. Falls back to the
  * UTC date when the zone is unknown — never to the SERVER's local zone, which
@@ -256,7 +280,8 @@ async function fetchOccurrences(
     },
     // start/end bound the search to the window we actually care about, instead
     // of accepting AeroAPI's default ~10-day-back window and trusting its head.
-    params: { start: startISO, end: endISO, max_pages: 1 },
+    // toAeroBound strips the fractional seconds AeroAPI rejects — see its note.
+    params: { start: toAeroBound(startISO), end: toAeroBound(endISO), max_pages: 1 },
     timeout: 10000,
   });
   const flights = response.data?.flights;
@@ -288,6 +313,17 @@ function translateAeroError(error: any, cleanIata: string): FlightLookupError {
     if (error.response?.status === 429) {
       throw new Error("FlightAware API rate limit reached — try again shortly");
     }
+    // 400 means WE built a bad request (malformed bound, window past AeroAPI's
+    // 2-day forward cap) — the service was reached and answered. Carrying the
+    // upstream `detail` into the thrown message is the whole point: the generic
+    // fall-through below reported this as "couldn't reach the flight-tracking
+    // service", which sent us hunting a missing API key while every 400 body in
+    // the logs was already naming the real fault.
+    if (error.response?.status === 400) {
+      const body: any = error.response?.data;
+      const detail = body?.detail || body?.title || "no detail returned";
+      throw new Error(`AeroAPI rejected the request (400): ${detail}`);
+    }
   }
   throw new Error(error?.message || "Failed to fetch flight data");
 }
@@ -318,13 +354,37 @@ export async function getFlightOccurrences(
   const requestedDate = opts.date || null;
 
   // Window: a dated ask brackets that day ±1; an undated ask looks back 6h (to
-  // catch a flight already airborne) and forward 3 days.
+  // catch a flight already airborne) and forward as far as AeroAPI permits.
+  //
+  // The forward edge is CLAMPED to AEROAPI_MAX_FORWARD_MS. Both branches used to
+  // overshoot the 2-day cap the header note at "OCCURRENCE SELECTION" already
+  // recorded — the undated ask asked for +3d unconditionally, and the dated ask
+  // asks for date+2d, which is past the cap for any future date. Every such
+  // lookup came back 400 and was reported to the user as a service outage.
   const start = requestedDate
     ? new Date(Date.parse(`${requestedDate}T00:00:00Z`) - MS_DAY)
     : new Date(now.getTime() - 6 * MS_HOUR);
-  const end = requestedDate
+  const requestedEnd = requestedDate
     ? new Date(Date.parse(`${requestedDate}T00:00:00Z`) + 2 * MS_DAY)
     : new Date(now.getTime() + 3 * MS_DAY);
+  const maxEnd = new Date(now.getTime() + AEROAPI_MAX_FORWARD_MS);
+  const end = requestedEnd > maxEnd ? maxEnd : requestedEnd;
+
+  // A date far enough ahead that even its widened start sits past the clamped
+  // end is simply outside AeroAPI's horizon. Sending it would produce a start
+  // >= end request and a second, differently-worded 400. Say so honestly
+  // instead: schedules that far out are not published to this API yet.
+  // Deliberately NOT logged: tripWatchWorker polls every 15 min and a watch on
+  // a departure more than two days out hits this on every pass. That is the
+  // steady state, not an anomaly — warning about it would emit 4 lines/hour per
+  // watch and train everyone to ignore this logger. The returned message
+  // carries the reason to the one caller that shows it.
+  if (start >= end) {
+    return notFound(
+      cleanIata,
+      `Flight schedules for ${cleanIata} aren't published that far ahead yet — live status is available from about two days before departure.`,
+    );
+  }
 
   let raw: any[];
   try {

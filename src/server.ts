@@ -1,7 +1,12 @@
 // apps/backend/src/server.ts
 // ⚠️ MUST be the first import: back-fills process.env from the APP_SECRETS
 // bundle (and loads .env) BEFORE config/env.ts or any route reads SMTP_*/
-// GOOGLE_PLACES_API_KEY/PIXABAY_API_KEY at module-load time.
+// GOOGLE_PLACES_API_KEY/PIXABAY_API_KEY at module-load time. Redundant with
+// config/env.ts now also importing this as ITS first line (2026-08-04) —
+// kept here anyway for the handful of places that read a secret straight
+// off `process.env` instead of through `env` (routes/places.ts, utils/
+// mailer.ts, etc.). ES modules cache by resolved path, so this doesn't
+// double-run the unpack. See bootstrap/loadSecrets.ts's header.
 import "./bootstrap/loadSecrets.js";
 
 import express from "express";
@@ -60,6 +65,7 @@ import travelCopilotRoutes from "./routes/copilot.travel.js";
 import { runPlutoBootCheck } from "./services/plutoBootCheck.js";
 import { invokePlutoGemini } from "./utils/plutoGeminiInvoke.js";
 import plutoVideoRouter from "./routes/pluto.video.js";
+import plutoPanelRouter from "./routes/plutoPanel.js";
 import copilotVideoConsent from "./routes/copilot.videoConsent.js";
 import adminVideoRouter from "./routes/admin.video.js";
 
@@ -114,6 +120,9 @@ import leadsRouter from "./routes/leads.js";
 import crmCompaniesRouter from "./routes/crm.companies.js";
 import crmContactsRouter from "./routes/crm.contacts.js";
 
+// ✅ Shared location service — boot-time assertion of the trust-proxy assumption
+import { logProxyTrustAssumption } from "./services/location.service.js";
+
 const app = express();
 
 /* ────────────────────────────────────────────────────────────────
@@ -121,6 +130,13 @@ const app = express();
  * ──────────────────────────────────────────────────────────────── */
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
+// Stated out loud at boot because the line above is load-bearing for every
+// resolved client location: `1` is correct only while exactly one proxy hop
+// (ALB → app, direct CNAME) sits in front. Put a CDN/WAF there and req.ip
+// silently becomes the edge address — nothing errors, every user just
+// resolves to one city. Logged HERE, next to the assumption it describes, so
+// whoever changes the 1 sees why it matters. See services/location.service.ts.
+logProxyTrustAssumption();
 
 // Prevent 304 with empty body on APIs
 app.set("etag", false);
@@ -487,6 +503,74 @@ app.use("/api/expense-advances", requireAuth, requireWorkspace, requireExpenseAd
 import expenseActivityRouter from "./routes/expenseActivity.js";
 app.use("/api/expense-activity", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseActivityRouter);
 
+// CSTEP Travel & Claim Portal (Phase 3) — pre-trip travel request form.
+// Tenant-scoped via req.workspaceObjectId in-router; owner-only mutations.
+import cstepRouter from "./routes/cstep.js";
+app.use("/api/cstep", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepRouter);
+
+// Visa module (Phase 2a) — read-only destination/rule/content API behind
+// the destination picker. VisaRule/VisaDestinationContent are global
+// reference data, not workspace-scoped, but the module is still gated by
+// workspace context + the visaEnabled feature flag.
+import visaRouter from "./routes/visa.js";
+app.use("/api/visa", requireAuth, requireWorkspace, requireFeature("visaEnabled"), visaRouter);
+
+// Visa module (Phase 6a) — the concierge console API. STAFF routes,
+// deliberately mounted WITHOUT requireWorkspace/requireFeature: an agent
+// works applications across every customer workspace, not just their own
+// (docs/audits/visa-module-recon.md §3, §9). Gated purely on the
+// visaApplication permission key, per-route inside admin.visa.ts — same
+// shape as routes/admin.sessions.ts (requireAuth + a permission gate,
+// nothing tenancy-related at mount time).
+import adminVisaRouter from "./routes/admin.visa.js";
+app.use("/api/admin/visa", adminVisaRouter);
+
+// Visa module (Phase 7a) — fee and rule management API. Same mount prefix
+// as adminVisaRouter above (a second router at the same path — Express
+// tries them in registration order), separated into its own file because
+// it's a different concern: the fee/rule master data every quote is built
+// from, not the application queue. Gated purely on visaApplication FULL —
+// see routes/admin.visa.rules.ts's file header.
+import adminVisaRulesRouter from "./routes/admin.visa.rules.js";
+app.use("/api/admin/visa", adminVisaRulesRouter);
+
+// Visa module (Phase 9d) — CSV/XLSX report exports (case log, activity,
+// status, progress). Same mount prefix again — a third router alongside
+// adminVisaRouter/adminVisaRulesRouter above. Gated purely on
+// visaApplication READ (reports never mutate) — see routes/
+// admin.visa.reports.ts's file header.
+import adminVisaReportsRouter from "./routes/admin.visa.reports.js";
+app.use("/api/admin/visa", adminVisaReportsRouter);
+
+// Visa module (Phase 9f) — the ops dashboard (queue health, at-risk,
+// workload, throughput, outcomes, value). Same mount prefix again — a
+// fourth router alongside the three above. Gated purely on
+// visaApplication READ, workspace-agnostic by design — see routes/
+// admin.visa.dashboard.ts's file header.
+import adminVisaDashboardRouter from "./routes/admin.visa.dashboard.js";
+app.use("/api/admin/visa", adminVisaDashboardRouter);
+
+// Visa module (2026-08-09) — the cross-workspace ROSTER: every customer
+// workspace with its real KPIs, and a drill-in to any one workspace's
+// full traveller roster. A fifth router at the same prefix, gated on the
+// same visaApplication READ.
+//
+// This one INVERTS the customer dashboard's scoping: the caller names an
+// arbitrary workspaceId instead of resolving to their own, so its gate is
+// the entire protection — registered router-level, before any handler.
+// See routes/admin.visa.roster.ts's file header for the full reasoning.
+import adminVisaRosterRouter from "./routes/admin.visa.roster.js";
+app.use("/api/admin/visa", adminVisaRosterRouter);
+
+// Visa module (Phase 10d) — bulk XLSX/CSV export+import for the fee/rule
+// master, so ops can review and edit many checklist-imported DRAFT rules
+// (pricing, ETA, visaCategory) in one pass instead of one at a time in the
+// console's modal. Same mount prefix again — a fifth router alongside the
+// four above. FULL-gated, update-only, never publishes — see routes/
+// admin.visa.rules.importExport.ts's file header.
+import adminVisaRulesImportExportRouter from "./routes/admin.visa.rules.importExport.js";
+app.use("/api/admin/visa", adminVisaRulesImportExportRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";
@@ -518,6 +602,7 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
 // now key on workspaceId (matching the consumer in copilot.travel.ts) instead
 // of the legacy tenantId, which collapsed every internal user to "staff".
 app.use("/api/v1/pluto/video", requireAuth, requireWorkspace, plutoVideoRouter);
+app.use("/api/v1/pluto/panel", plutoPanelRouter);
 app.use("/api/copilot", copilotRouter);
 app.use("/api/v1/copilot/manager", copilotRouter);
 app.use("/api/assistant", assistantRouter);

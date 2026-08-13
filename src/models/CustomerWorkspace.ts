@@ -30,6 +30,11 @@ export interface WorkspaceFeatures {
   vouchersEnabled?: boolean;
   invoicesEnabled?: boolean;
   ticketsEnabled?: boolean;
+
+  // CSTEP Travel & Claim Portal module master switch. SCHEMA DEFAULT false —
+  // new module, not part of any tenant plan preset yet; granted only by
+  // superadmin toggle.
+  cstepEnabled?: boolean;
 }
 
 export type WorkspacePlan = "trial" | "starter" | "growth" | "enterprise";
@@ -107,6 +112,16 @@ export interface CustomerWorkspaceDocument extends Document {
     // second approval level appended at request. Independent of the claim
     // (expense) escalation threshold above.
     advanceEscalationThreshold?: number | null;
+
+    // Visa approval gate (2026-08-10). false/absent = OFF, and OFF is the
+    // schema default: a submitted visa request goes straight to the
+    // Plumtrips concierge desk exactly as it always has. When true, submit
+    // routes the request to the workspace's own approver first and ops
+    // cannot see it until they approve. Opt-in per workspace precisely
+    // because there are live workspaces submitting today — a universal gate
+    // would change their behaviour on deploy. See
+    // infra/design/visa-approval-flow-2026-08-10.md.
+    visaApprovalRequired?: boolean;
   };
 
   // Subscription / billing
@@ -265,6 +280,9 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
       // Advance escalation threshold — null = OFF (single-approver). Independent
       // of the claim threshold above; gates the L2 step on the advance amount.
       advanceEscalationThreshold: { type: Number, default: null },
+      // Visa approval gate — SCHEMA DEFAULT false. Every existing workspace
+      // reads false without a backfill, which is the whole point.
+      visaApprovalRequired: { type: Boolean, default: false },
       features: {
         sbtEnabled: { type: Boolean, default: false },
         approvalFlowEnabled: { type: Boolean, default: true },
@@ -299,6 +317,10 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         vouchersEnabled: { type: Boolean, default: false },
         invoicesEnabled: { type: Boolean, default: false },
         ticketsEnabled: { type: Boolean, default: false },
+        // CSTEP Travel & Claim Portal master switch. SCHEMA DEFAULT false —
+        // gated off until granted by superadmin toggle. Not enabled in any
+        // tenant plan preset (see getDefaultFeaturesForPlan below).
+        cstepEnabled: { type: Boolean, default: false },
       },
     },
 

@@ -73,3 +73,4 @@ export const paymentLogger = logger.child({ module: "payment" });
 export const webhookLogger = logger.child({ module: "webhook" });
 export const whatsappLogger = logger.child({ module: "whatsapp-cloud" });
 export const travelRequestLogger = logger.child({ module: "travel-request" });
+export const placesLogger = logger.child({ module: "places" });
