@@ -35,16 +35,25 @@ describe("matchDocumentType — exact/alias only, never a guess", () => {
     expect(matchDocumentType("Employer NOC")?.code).toBe("EMPLOYER_NOC");
   });
 
-  it("does NOT match ambiguous real checklist text — 'Passport Front Page' (Laos) is genuinely unmatched", () => {
-    expect(matchDocumentType("Passport Front Page")).toBeNull();
+  // 'Passport Front Page' (Laos) and 'National ID' were BOTH genuinely
+  // unmatched until 2026-08-13, and this file asserted exactly that. The
+  // StampMyVisa catalogue asks for both by name, so PASSPORT_FRONT and
+  // NATIONAL_ID are now real types (config/visaDocumentTypeCatalogue.ts)
+  // and matching them is the correct answer, not a fuzzy guess — the
+  // match is still on the catalogue's own name/alias, exactly as before.
+  it("matches 'Passport Front Page' (Laos) — PASSPORT_FRONT, a real type since the StampMyVisa catalogue landed", () => {
+    expect(matchDocumentType("Passport Front Page")?.code).toBe("PASSPORT_FRONT");
   });
 
   it("matches 'Old passport copy' (Canada) — OLD_PASSPORT_COPY, added after the 27-PDF bulk run found it in 9 countries", () => {
     expect(matchDocumentType("Old passport copy")?.code).toBe("OLD_PASSPORT_COPY");
   });
 
-  it("does NOT match 'National ID' / 'Flight tickets' even though a related code exists — never a fuzzy auto-match", () => {
-    expect(matchDocumentType("National ID")).toBeNull();
+  it("matches 'National ID' on the catalogue name — distinct from INDIAN_GOVT_ID_CARD, which is PAN/Aadhaar only", () => {
+    expect(matchDocumentType("National ID")?.code).toBe("NATIONAL_ID");
+  });
+
+  it("does NOT match 'Flight tickets' even though a related code exists — never a fuzzy auto-match", () => {
     expect(matchDocumentType("Flight tickets")).toBeNull(); // real name is "Flight Itinerary" — a near-miss, not a match
   });
 
@@ -243,17 +252,24 @@ describe("resolveDocumentTypeMapping — LLM primary, string matcher as cross-ch
     expect(result.reasoning).toBe("the model claimed this, but it isn't real"); // kept as evidence regardless
   });
 
+  // Was "National ID" until 2026-08-13, when that became a real catalogue
+  // type — the string matcher now finds it, so it no longer demonstrates
+  // "both found nothing". 'Flight tickets' does: a near-miss of
+  // FLIGHT_ITINERARY that the matcher deliberately refuses to apply while
+  // still offering it as a suggestion, which is exactly the shape this
+  // test is about.
   it("both null — reports agreement, with suggestions from the string matcher as a residual aid", () => {
     const result = resolveDocumentTypeMapping({
-      sourceName: "National ID",
+      sourceName: "Flight tickets",
       llmCode: null,
       llmConfidence: null,
-      llmReasoning: "No catalogue entry covers a national ID card",
+      llmReasoning: "Ambiguous — could be the booking confirmation or the itinerary",
     });
     expect(result.matchedCode).toBeNull();
     expect(result.stringMatchCode).toBeNull();
     expect(result.matchesAgree).toBe(true); // both correctly found nothing
-    expect(result.suggestions).toEqual(suggestDocumentTypes("National ID"));
+    expect(result.suggestions).toEqual(suggestDocumentTypes("Flight tickets"));
+    expect(result.suggestions.length).toBeGreaterThan(0); // FLIGHT_ITINERARY offered, never applied
   });
 
   it("flags a genuine disagreement when the string matcher found something but the LLM said null", () => {

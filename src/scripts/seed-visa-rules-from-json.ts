@@ -159,10 +159,16 @@ function argValue(flag: string): string | undefined {
   return hit ? hit.slice(flag.length + 1) : undefined;
 }
 
+// The FIXED file, not the original conversion — 2026-08-13. The original
+// carries 14 truncated-variantKey collisions and 12 visaCategory values
+// outside the model's enum, all of which the dry run reported and the
+// FIXED file resolves. Defaulting to it means a --confirm run cannot
+// silently load the stale one; --file= still overrides for a re-run of a
+// subset.
 function defaultInputPath(): string {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   // apps/backend/src/scripts -> repo root
-  return resolve(scriptDir, "../../../../docs/visa/visa-rules-stampmyvisa.json");
+  return resolve(scriptDir, "../../../../docs/visa/visa-rules-stampmyvisa.FIXED.json");
 }
 
 /* ─────────────────────────────────────────────────────────────────────

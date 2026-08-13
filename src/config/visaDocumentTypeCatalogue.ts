@@ -375,6 +375,79 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     aliases: ["Purpose of Visit Letter"],
     ocrExtractable: false,
   },
+
+  // ── 2026-08-13 — types the StampMyVisa catalogue asks for by name
+  // (docs/visa/visa-rules-stampmyvisa.FIXED.json, 273 requirement rows
+  // across the five). Without these the codes would be written onto
+  // VisaRule.documentGroups[].docTypeCodes — which the model does NOT
+  // validate — and render as unresolvable rows in the checklist UI.
+  //
+  // Three of the five overlap an existing type without being the same
+  // thing; each is documented at its entry rather than silently merged,
+  // and the ALIASES ARE DELIBERATELY SPARSE. Aliases are live matching
+  // input for utils/visaChecklistCatalogueMatcher.ts, so a broad phrase
+  // added here would start stealing matches from the older, more specific
+  // type in every FUTURE checklist extraction — exactly the collision
+  // EMPLOYMENT_CONTRACT's removed "Appointment Letter" alias caused.
+  {
+    code: "PASSPORT_FRONT",
+    name: "Passport Front Page",
+    category: "IDENTITY",
+    // Distinct from PASSPORT_ORIGINAL, which is the physical passport
+    // submitted to the mission. This is the SCAN of the bio-data page an
+    // e-visa portal uploads, and it travels as a pair with PASSPORT_BACK.
+    defaultDescription: "Scan of the passport's front/bio-data page, as uploaded to an e-visa portal",
+    aliases: ["Passport Front Page", "Front page of passport"],
+    ocrExtractable: false,
+  },
+  {
+    code: "PASSPORT_BACK",
+    name: "Passport Back Page",
+    category: "IDENTITY",
+    // Overlaps PASSPORT_LAST_PAGE, which already means the back-page copy
+    // submitted alongside a physical application (and already aliases
+    // "Passport back page"). Kept separate because this one is the e-visa
+    // upload half of the FRONT/BACK pair above, not a supporting copy —
+    // but the two are worth consolidating once ops decides which one the
+    // checklist UI should show. Flagged, not silently merged.
+    defaultDescription: "Scan of the passport's back/address page, as uploaded to an e-visa portal",
+    aliases: [],
+    ocrExtractable: false,
+  },
+  {
+    code: "NATIONAL_ID",
+    name: "National ID",
+    category: "IDENTITY",
+    // Deliberately NOT folded into INDIAN_GOVT_ID_CARD: that type is
+    // specifically PAN/Aadhaar, and this one appears on destinations that
+    // accept any national identity card, including for non-Indian
+    // co-applicants.
+    defaultDescription: "Government-issued national identity card",
+    aliases: [],
+    ocrExtractable: false,
+  },
+  {
+    code: "BUSINESS_PROOF",
+    name: "Business Proof",
+    category: "BUSINESS",
+    // Broader than BUSINESS_REGISTRATION (an incorporation/registration
+    // certificate): the source uses this for whatever evidences the
+    // business — GST certificate, trade licence, partnership deed.
+    defaultDescription: "Evidence of the applicant's business — registration certificate, GST certificate, trade licence or partnership deed",
+    aliases: [],
+    ocrExtractable: false,
+  },
+  {
+    code: "TRAVEL_ITINERARY",
+    name: "Travel Itinerary",
+    category: "TRAVEL",
+    // Not FLIGHT_ITINERARY (the confirmed/held air booking): this is the
+    // day-by-day plan of the trip, which several missions ask for in
+    // ADDITION to the flight booking.
+    defaultDescription: "Day-by-day plan of the trip, covering destinations and dates for the full stay",
+    aliases: ["Day-wise itinerary", "Detailed itinerary"],
+    ocrExtractable: false,
+  },
 ] as const;
 
 // Mechanically derived from legacyCode above — the "old to new" mapping
