@@ -28,12 +28,15 @@
 //     edited is the right workflow, with validation instead of a ban. Only
 //     Destination (name/ISO2/ISO3, via countryCodes.ts) and Purpose are
 //     required; Entry Type/Service Tier default to UNSPECIFIED/STANDARD
-//     when blank (scripts/extract-visa-checklists.ts's own defaults).
+//     when blank (scripts/extract-visa-checklists.ts's own defaults), and
+//     Variant Key to DEFAULT — but Variant Key IS read when it's filled in
+//     (2026-08-13): it's the sixth field of the rule's own unique key, so
+//     variant siblings of one corridor are distinct rules, not duplicates.
 //     visaCategory/ETA/cost are NOT required at create — those are
 //     publish-time requirements (POST /rules/:id/publish), same as every
 //     other DRAFT-creating path in this codebase. A row whose natural key
-//     (destination/purpose/entryType/serviceTier) already exists as a real
-//     rule is rejected, not silently turned into an update — see
+//     (destination/purpose/entryType/serviceTier/variantKey) already exists
+//     as a real rule is rejected, not silently turned into an update — see
 //     resolveCreateRuleRow/processImport's own comments. Every created rule
 //     is seedSource-stamped (scripts/purge-visa-seed.ts's marker) so it's
 //     distinguishable and purgeable, and starts with NO document checklist
@@ -171,10 +174,18 @@ const IMPORT_EXPORT_FIELDS = [
 // at all, so every created rule gets this fixed value, same as it would if
 // created by hand through the ordinary admin form.
 const CREATE_NATIONALITY = "IN";
-// variantKey isn't read from the sheet for a create either (no column, and
-// not asked for) — every created rule gets the schema's own default by
-// simply never setting the field, same as ordinary admin-form creates.
-const CREATE_VARIANT_KEY = "DEFAULT";
+// variantKey IS read from the sheet for a create (2026-08-13) —
+// resolveCreateRuleRow, defaulting to DEFAULT for a blank cell. It used to
+// be pinned to the constant here, which made every variant sibling of a
+// corridor resolve to the IDENTICAL natural key below: Pass 2b then saw
+// them as in-file duplicates and rejected ALL of them (it never keeps the
+// first), so a catalogue with real variants — Canada DEFAULT vs
+// FOR_USA_VISA_HOLDER, Turkey E_VISA vs STICKER — could only ever import
+// the corridors that happened to have exactly one variant. variantKey is
+// the sixth field of VisaRule's own unique index (VisaRule.ts), so these
+// rows were never duplicates in the database's own terms; only in this
+// file's. See CREATE_DEFAULT_VARIANT_KEY in the shared module for what a
+// blank cell resolves to and how a non-blank one is validated.
 // productClass is schema-required with no column on the RULES sheet at all
 // — defaulted the same way scripts/extract-visa-checklists.ts defaults it
 // for its own downstream create path.
@@ -191,13 +202,25 @@ const CREATE_SEED_SOURCE = "visa-rules-spreadsheet-import@2026-08";
 // documentGroups, which this surface DOES carry; see that file's own
 // comment on why its field set is deliberately independent).
 const CREATE_AUDIT_FIELDS = [
-  "nationality", "destinationIso2", "destinationName", "purpose", "entryType", "serviceTier",
+  "nationality", "destinationIso2", "destinationName", "purpose", "entryType", "serviceTier", "variantKey",
   "productClass", "status",
   ...IMPORT_EXPORT_FIELDS,
 ] as const;
 
-function ruleNaturalKey(destinationIso2: string, purpose: string, entryType: string, serviceTier: string): string {
-  return [CREATE_NATIONALITY, destinationIso2, purpose, entryType, serviceTier, CREATE_VARIANT_KEY].join("|");
+// The SIX-field key VisaRule's own unique index uses — not five with
+// variantKey assumed. Both callers (the in-file dedup in Pass 2b and the
+// live-collision check in Pass 2c) must key on exactly what the index keys
+// on, or they either reject rows the database would happily accept (the
+// bug this fixes) or wave through rows it will reject with a raw
+// duplicate-key error at write time.
+function ruleNaturalKey(
+  destinationIso2: string,
+  purpose: string,
+  entryType: string,
+  serviceTier: string,
+  variantKey: string,
+): string {
+  return [CREATE_NATIONALITY, destinationIso2, purpose, entryType, serviceTier, variantKey].join("|");
 }
 
 /* ═════════════════════════════════════════════════════════════════════
@@ -359,6 +382,10 @@ interface RuleCreateEntry {
   purpose: string;
   entryType: string;
   serviceTier: string;
+  // Reported so a batch of variant siblings is legible in the preview —
+  // twelve UK TOURIST/STANDARD rows are otherwise identical on screen, and
+  // the variant is the only thing that distinguishes them.
+  variantKey: string;
   hasChecklist: false;
   ruleId?: string;
 }
@@ -461,13 +488,17 @@ async function processImport(
 
   // ── Pass 2b — same collision problem as Pass 2, but for CREATE rows:
   // two blank-Rule-Id rows resolving to the same destination/purpose/
-  // entryType/serviceTier can't both create — the second would just hit
-  // the DB's own unique index (VisaRule.ts's 6-field compound index).
-  // Reject ALL of them here, before any write is attempted, rather than
-  // let the second fail with a raw duplicate-key error on commit. ──
+  // entryType/serviceTier/variantKey can't both create — the second would
+  // just hit the DB's own unique index (VisaRule.ts's 6-field compound
+  // index). Reject ALL of them here, before any write is attempted, rather
+  // than let the second fail with a raw duplicate-key error on commit.
+  // Rows differing ONLY by Variant Key are NOT duplicates — that's the
+  // whole point of the sixth field, and they each create their own rule. ──
   const createsByKey = new Map<string, { rowNumber: number; create: ResolvedRuleCreate }[]>();
   for (const c of resolvedRuleCreates) {
-    const key = ruleNaturalKey(c.create.destinationIso2, c.create.purpose, c.create.entryType, c.create.serviceTier);
+    const key = ruleNaturalKey(
+      c.create.destinationIso2, c.create.purpose, c.create.entryType, c.create.serviceTier, c.create.variantKey,
+    );
     const list = createsByKey.get(key) || [];
     list.push(c);
     createsByKey.set(key, list);
@@ -484,7 +515,7 @@ async function processImport(
         ruleId: "",
         reason:
           `rows ${list.map((x) => x.rowNumber).join(", ")} all create the same destination/purpose/entry type/` +
-          `service tier — fix the duplicate and re-upload`,
+          `service tier/variant key — fix the duplicate (or give them distinct Variant Keys) and re-upload`,
       });
     }
   }
@@ -504,24 +535,29 @@ async function processImport(
     purpose: create.purpose,
     entryType: create.entryType,
     serviceTier: create.serviceTier,
-    variantKey: CREATE_VARIANT_KEY,
+    variantKey: create.variantKey,
   }));
   const collidingRules = collisionFilters.length ? await VisaRule.find({ $or: collisionFilters }).lean() : [];
   const collidingByKey = new Map(
-    collidingRules.map((r: any) => [ruleNaturalKey(r.destinationIso2, r.purpose, r.entryType, r.serviceTier), r]),
+    collidingRules.map((r: any) => [
+      ruleNaturalKey(r.destinationIso2, r.purpose, r.entryType, r.serviceTier, r.variantKey),
+      r,
+    ]),
   );
 
   const finalRuleCreates: { rowNumber: number; create: ResolvedRuleCreate }[] = [];
   for (const c of uniqueRuleCreates) {
-    const key = ruleNaturalKey(c.create.destinationIso2, c.create.purpose, c.create.entryType, c.create.serviceTier);
+    const key = ruleNaturalKey(
+      c.create.destinationIso2, c.create.purpose, c.create.entryType, c.create.serviceTier, c.create.variantKey,
+    );
     const existing = collidingByKey.get(key);
     if (existing) {
       result.invalidRuleRows.push({
         rowNumber: c.rowNumber,
         ruleId: "",
         reason:
-          `a rule already exists for this destination/purpose/entry type/service tier (Rule Id ${existing._id}) ` +
-          `— that's an update, not a create; fill in its Rule Id and re-upload instead`,
+          `a rule already exists for this destination/purpose/entry type/service tier/variant key ` +
+          `(Rule Id ${existing._id}) — that's an update, not a create; fill in its Rule Id and re-upload instead`,
       });
       continue;
     }
@@ -695,6 +731,7 @@ async function processImport(
       purpose: create.purpose,
       entryType: create.entryType,
       serviceTier: create.serviceTier,
+      variantKey: create.variantKey,
       hasChecklist: false,
     };
 
@@ -706,7 +743,7 @@ async function processImport(
         purpose: create.purpose,
         entryType: create.entryType,
         serviceTier: create.serviceTier,
-        variantKey: CREATE_VARIANT_KEY,
+        variantKey: create.variantKey,
         productClass: CREATE_PRODUCT_CLASS,
         visaCategory: create.visaCategory,
         etaMinDays: create.etaMinDays,

@@ -667,6 +667,133 @@ describe("creating a rule via a blank Rule Id", () => {
     expect(_rules.query({}).length).toBe(0);
   });
 
+  /* ───────────────────────────────────────────────────────────────────
+   * Variant Key on a create (2026-08-13). Before this, the column was
+   * recognised but discarded and every create was pinned to DEFAULT —
+   * so N variant siblings of one corridor resolved to N identical natural
+   * keys, and Pass 2b rejected ALL of them as in-file duplicates (it never
+   * keeps the first). A catalogue with real variants could only import the
+   * corridors that happened to have exactly one.
+   * ─────────────────────────────────────────────────────────────────── */
+  it("creates one rule per Variant Key when rows differ ONLY by that column — never rejects them as duplicates", async () => {
+    const variants = ["DEFAULT", "FOR_USA_VISA_HOLDER", "GROUP_20", "OFFICIAL_DIPLOMATIC"];
+    const csv =
+      RULES_CSV_HEADER +
+      variants
+        .map((variantKey) =>
+          ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST", entryType: "SINGLE", serviceTier: "STANDARD", variantKey }),
+        )
+        .join("");
+
+    const res = await request(makeApp()).post("/rules/import/commit").attach("file", Buffer.from(csv), "variants.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.invalidRuleRows).toEqual([]);
+    expect(res.body.createdCount).toBe(variants.length);
+    expect(res.body.ruleCreates.map((rc: any) => rc.variantKey)).toEqual(variants);
+
+    // Four DISTINCT rules in the store, one per variant — same corridor on
+    // every other identity field.
+    const stored = _rules.query({});
+    expect(stored).toHaveLength(variants.length);
+    expect(stored.map((r: any) => r.variantKey).sort()).toEqual([...variants].sort());
+    expect(new Set(stored.map((r: any) => String(r._id))).size).toBe(variants.length);
+    for (const r of stored) {
+      expect(r.destinationIso2).toBe("FR");
+      expect(r.purpose).toBe("TOURIST");
+      expect(r.entryType).toBe("SINGLE");
+      expect(r.serviceTier).toBe("STANDARD");
+      expect(r.status).toBe("DRAFT");
+    }
+  });
+
+  it("still rejects both rows when two creates share a corridor AND a Variant Key", async () => {
+    const dupRow = ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST", variantKey: "GROUP_20" });
+    const csv = RULES_CSV_HEADER + dupRow + dupRow;
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(0);
+    expect(res.body.invalidRuleRows.map((r: any) => r.rowNumber)).toEqual([2, 3]);
+    expect(res.body.invalidRuleRows[0].reason).toMatch(/variant key/);
+  });
+
+  it("a create whose Variant Key differs from an existing rule's is a create, not a collision", async () => {
+    fullRule({ destinationIso2: "DE", purpose: "TOURIST", entryType: "MULTIPLE", serviceTier: "STANDARD", variantKey: "DEFAULT" });
+    const csv =
+      RULES_CSV_HEADER +
+      ruleCsvRow({
+        destinationIso2: "DE", purpose: "TOURIST", entryType: "MULTIPLE", serviceTier: "STANDARD",
+        variantKey: "FOR_USA_VISA_HOLDER",
+      });
+    const res = await request(makeApp()).post("/rules/import/commit").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.invalidRuleRows).toEqual([]);
+    expect(res.body.createdCount).toBe(1);
+    expect(_rules.query({ variantKey: "FOR_USA_VISA_HOLDER" })).toHaveLength(1);
+  });
+
+  it("still reports the collision when the existing rule shares the SAME Variant Key", async () => {
+    const rule = fullRule({
+      destinationIso2: "DE", purpose: "TOURIST", entryType: "MULTIPLE", serviceTier: "STANDARD",
+      variantKey: "FOR_USA_VISA_HOLDER",
+    });
+    const csv =
+      RULES_CSV_HEADER +
+      ruleCsvRow({
+        destinationIso2: "DE", purpose: "TOURIST", entryType: "MULTIPLE", serviceTier: "STANDARD",
+        variantKey: "FOR_USA_VISA_HOLDER",
+      });
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(0);
+    expect(res.body.invalidRuleRows[0].reason).toContain(String(rule._id));
+  });
+
+  it("uppercases the Variant Key, so one variant typed in two casings is one create, not two", async () => {
+    const csv =
+      RULES_CSV_HEADER +
+      ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST", variantKey: "for_usa_visa_holder" }) +
+      ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST", variantKey: "FOR_USA_VISA_HOLDER" });
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(0);
+    expect(res.body.invalidRuleRows.map((r: any) => r.rowNumber)).toEqual([2, 3]);
+  });
+
+  it("rejects a malformed Variant Key with a clean row error, never a 500", async () => {
+    const csv = RULES_CSV_HEADER + ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST", variantKey: "for usa holder!" });
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.createdCount).toBe(0);
+    expect(res.body.invalidRuleRows).toHaveLength(1);
+    expect(res.body.invalidRuleRows[0].rowNumber).toBe(2);
+    expect(res.body.invalidRuleRows[0].reason).toMatch(/Variant Key/);
+    expect(_rules.query({}).length).toBe(0);
+  });
+
+  it("rejects a Variant Key over the 64-character cap", async () => {
+    const csv = RULES_CSV_HEADER + ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST", variantKey: "A".repeat(65) });
+    const res = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.invalidRuleRows).toHaveLength(1);
+    expect(res.body.invalidRuleRows[0].reason).toMatch(/65 characters; the limit is 64/);
+  });
+
+  it("a blank Variant Key still creates a DEFAULT rule — unchanged behaviour for files that never fill the column", async () => {
+    const csv = RULES_CSV_HEADER + ruleCsvRow({ destinationIso2: "FR", purpose: "TOURIST" });
+    const res = await request(makeApp()).post("/rules/import/commit").attach("file", Buffer.from(csv), "x.csv");
+
+    expect(res.status).toBe(200);
+    expect(res.body.ruleCreates[0].variantKey).toBe("DEFAULT");
+    expect(_rules.query({})[0].variantKey).toBe("DEFAULT");
+  });
+
   it("accepts destination by ISO3 or by name, resolving both to the canonical ISO2/name", async () => {
     const byIso3 = RULES_CSV_HEADER + ruleCsvRow({ destinationIso2: "DEU", purpose: "TOURIST", entryType: "SINGLE" });
     const res1 = await request(makeApp()).post("/rules/import/preview").attach("file", Buffer.from(byIso3), "iso3.csv");

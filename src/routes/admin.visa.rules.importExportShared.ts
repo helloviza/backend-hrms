@@ -201,10 +201,10 @@ export const RULES_COLUMNS = [
 // Matching an UPDATE row is on ruleId alone.
 //
 // A CREATE row (blank Rule Id, 2026-08-04) is the one exception:
-// destinationiso2/destinationname/purpose/entrytype/servicetier DO get read
-// — resolveCreateRuleRow() below — since there is no existing rule to carry
-// an identity forward from. status is still never read, even for a create —
-// see resolveCreateRuleRow's own comment.
+// destinationiso2/destinationname/purpose/entrytype/servicetier/variantkey
+// DO get read — resolveCreateRuleRow() below — since there is no existing
+// rule to carry an identity forward from. status is still never read, even
+// for a create — see resolveCreateRuleRow's own comment.
 export const RULES_CONTEXT_FIELDS = new Set([
   "ruleid", "destinationiso2", "destinationname", "purpose", "entrytype",
   "servicetier", "variantkey", "status", "lastreviewedat",
@@ -346,6 +346,16 @@ export function resolveRuleRow(
  *     blank — matching scripts/extract-visa-checklists.ts's own defaults
  *     for the same two fields (that script feeds scripts/
  *     import-visa-checklist-rules.ts's own create path).
+ *   - Variant Key defaults to DEFAULT when blank (2026-08-13) — the same
+ *     value the schema itself defaults to, so a file that never fills the
+ *     column in behaves exactly as it did before this column was read at
+ *     all. It IS read when present, because variantKey is the sixth field
+ *     of VisaRule's own unique index: two rows differing only by variant
+ *     ("Canada DEFAULT" vs "Canada FOR_USA_VISA_HOLDER") are two genuinely
+ *     distinct rules, and pinning the constant here used to collapse them
+ *     onto one natural key, at which point processImport's own in-file
+ *     dedup rejected BOTH (never "kept the first"). See ruleNaturalKey in
+ *     routes/admin.visa.rules.importExport.ts.
  *   - visaCategory/ETA/fees/notes are validated the SAME WAY resolveRuleRow
  *     validates them (deliberately duplicated below rather than factored
  *     out — resolveRuleRow already has passing tests and an update path in
@@ -362,12 +372,44 @@ export function resolveRuleRow(
  * no-database validation, same contract as resolveRuleRow. processImport
  * does the collision check once, batched, after resolving every row.
  * ───────────────────────────────────────────────────────────────────── */
+/* Variant Key acceptance (2026-08-13). VisaRule.ts's own field is
+ * `{ type: String, required: true, default: "DEFAULT", uppercase: true,
+ * trim: true }` — NO enum and NO maxlength, so there is no model constraint
+ * to mirror here and this is the only place a value entering through a
+ * spreadsheet is checked at all. It is nonetheless an IDENTITY field (the
+ * sixth column of the unique index), so a free-text cell is not accepted
+ * blindly:
+ *   - Uppercased to match the schema's own `uppercase: true`, so the value
+ *     this file dedupes/collision-checks on is byte-for-byte the value Mongo
+ *     will store. Without that, "for_usa_visa_holder" and
+ *     "FOR_USA_VISA_HOLDER" would look like two distinct creates here and
+ *     then collide on the unique index at write time.
+ *   - Restricted to the shape every variantKey in this codebase already has
+ *     — A-Z, 0-9 and underscore, which is exactly what
+ *     slugifyChecklistLabel() (utils/visaChecklistCatalogueMatcher.ts)
+ *     emits and what the live values look like (DEFAULT,
+ *     FOR_USA_VISA_HOLDER, GROUP_20, OFFICIAL_DIPLOMATIC). A cell with
+ *     spaces or punctuation is a clean per-row error naming the shape, NOT
+ *     a silent slugify: this field decides which rule an applicant gets,
+ *     and quietly rewriting it would let a typo become a second, invisible
+ *     variant.
+ *   - Capped at 64 characters, the same ceiling slugifyChecklistLabel()
+ *     itself never exceeds (it hash-suffixes anything longer to exactly
+ *     64). Nothing in the model enforces this; it exists so an accidental
+ *     paste of a whole sentence is reported as a row error instead of
+ *     becoming a permanent identity value.
+ */
+export const CREATE_DEFAULT_VARIANT_KEY = "DEFAULT";
+const VARIANT_KEY_MAX_LENGTH = 64;
+const VARIANT_KEY_PATTERN = /^[A-Z0-9][A-Z0-9_]*$/;
+
 export interface ResolvedRuleCreate {
   destinationIso2: string;
   destinationName: string;
   purpose: VisaPurpose;
   entryType: VisaEntryType;
   serviceTier: VisaServiceTier;
+  variantKey: string;
   visaCategory?: VisaCategory;
   etaMinDays?: number;
   etaMaxDays?: number;
@@ -417,6 +459,23 @@ export function resolveCreateRuleRow(
     return { ok: false, reason: `Service Tier "${mapped.serviceTier}" must be one of ${VISA_SERVICE_TIERS.join(", ")}` };
   }
 
+  const variantKeyRaw = stringIn(mapped.variantKey);
+  const variantKey = variantKeyRaw === undefined ? CREATE_DEFAULT_VARIANT_KEY : variantKeyRaw.toUpperCase();
+  if (variantKey.length > VARIANT_KEY_MAX_LENGTH) {
+    return {
+      ok: false,
+      reason: `Variant Key "${variantKeyRaw}" is ${variantKey.length} characters; the limit is ${VARIANT_KEY_MAX_LENGTH}`,
+    };
+  }
+  if (!VARIANT_KEY_PATTERN.test(variantKey)) {
+    return {
+      ok: false,
+      reason:
+        `Variant Key "${variantKeyRaw}" must be letters, digits and underscores only, starting with a letter or ` +
+        `digit (e.g. DEFAULT, FOR_USA_VISA_HOLDER) — leave it blank for the general rule`,
+    };
+  }
+
   // visaCategory/ETA/fees/notes — same validation as resolveRuleRow, none
   // of it required (see file header above).
   const visaCategoryRaw = stringIn(mapped.visaCategory);
@@ -457,6 +516,7 @@ export function resolveCreateRuleRow(
       purpose: purpose as VisaPurpose,
       entryType: entryType as VisaEntryType,
       serviceTier: serviceTier as VisaServiceTier,
+      variantKey,
       visaCategory: visaCategoryRaw as VisaCategory | undefined,
       etaMinDays: etaMin.value,
       etaMaxDays: etaMax.value,
