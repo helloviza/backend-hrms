@@ -39,7 +39,7 @@
 //   pnpm exec tsx src/migrations/2026-08-13-remap-seeded-checklist-doc-codes.ts --apply
 import "dotenv/config";
 import mongoose from "mongoose";
-import { env } from "../config/env.js";
+import { connectDb } from "../config/db.js";
 import VisaRule from "../models/VisaRule.js";
 import { matchDocumentType } from "../utils/visaChecklistCatalogueMatcher.js";
 import { runMigration } from "./lib/migrationRunner.js";
@@ -111,8 +111,8 @@ interface Summary {
 }
 
 async function main(apply: boolean) {
-  await mongoose.connect(env.MONGO_URI);
-
+  // The connection is established by the caller at the bottom of this file,
+  // BEFORE runMigration — see the note there. Nothing to connect here.
   const rules = await VisaRule.find({ seedSource: SEED_SOURCE });
   const s: Summary = {
     rulesScanned: rules.length,
@@ -241,6 +241,31 @@ function report(s: Summary, apply: boolean) {
 }
 
 const apply = process.argv.includes("--apply");
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Connect BEFORE runMigration, not inside run().
+ *
+ * runMigration's FIRST act in APPLY mode is a MigrationRun.findOne()
+ * against the ledger, to refuse a second apply — that happens before it
+ * ever calls run(). With the connect inside run(), that query fired on an
+ * unconnected client, Mongoose buffered it, and it died with
+ * "Operation `migrationruns.findOne()` buffering timed out after 10000ms".
+ * DRY_RUN mode skips the ledger check entirely, which is exactly why the
+ * dry runs passed and only --apply failed.
+ *
+ * connectDb() (config/db.js) is the same helper the delete and seed
+ * scripts use: it AWAITS mongoose.connect, which resolves only once the
+ * server is actually selected, so nothing below can buffer. The
+ * readyState assertion after it turns any future regression into an
+ * immediate, explicit failure instead of a 10s buffering timeout that
+ * reads like a network problem.
+ * ───────────────────────────────────────────────────────────────────── */
+await connectDb();
+if (mongoose.connection.readyState !== 1) {
+  console.error(`Refusing to run: mongoose readyState is ${mongoose.connection.readyState}, expected 1 (connected).`);
+  process.exit(1);
+}
+
 await runMigration({
   migrationName: MIGRATION_NAME,
   mode: apply ? "APPLY" : "DRY_RUN",
