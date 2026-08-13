@@ -5,8 +5,10 @@ import { describe, it, expect } from "vitest";
 import { normaliseToIso2, getCountryByIso2, VISA_COUNTRY_REGIONS } from "./countryCodes.js";
 // Coverage checklist, not source data — {name, iso2, tier} only. Every
 // entry here must resolve via normaliseToIso2(); countryCodes.ts owns the
-// iso3/demonym/alias data behind that resolution.
-import visaCountryChecklist from "../../../../docs/data/visa-country-codes-required.json" with { type: "json" };
+// iso3/demonym/alias data behind that resolution. It lives beside this test
+// rather than under docs/ because apps/backend is deployed as a git subtree:
+// anything above this directory simply does not exist in the build.
+import visaCountryChecklist from "./visa-country-codes-required.json" with { type: "json" };
 
 describe("normaliseToIso2", () => {
   it("passes through a valid ISO2 code, case-insensitively", () => {
@@ -80,7 +82,7 @@ describe("normaliseToIso2", () => {
 });
 
 describe("visa country coverage checklist", () => {
-  it("resolves every entry in docs/data/visa-country-codes-required.json", () => {
+  it("resolves every entry in visa-country-codes-required.json", () => {
     const unresolved: string[] = [];
     for (const entry of visaCountryChecklist as Array<{ name: string; iso2: string; tier: string }>) {
       const resolved = normaliseToIso2(entry.name);
