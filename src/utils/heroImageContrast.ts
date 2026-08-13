@@ -30,7 +30,17 @@
 // heroBackgroundStyle — if that gradient's stops, saturation %, or the
 // active theme's --s1 ever changes, this drifts out of sync silently.
 
-import sharp from "sharp";
+// NOTE: `sharp` is deliberately NOT imported at the top level. It is a
+// native addon (libvips), and a static import here would put it on the
+// API's boot graph: server.ts -> routes/admin.visa.rules.ts -> this file.
+// When the addon fails to dlopen — wrong platform/libc for the installed
+// binary, a partially-restored node_modules, a base-image change — the
+// throw happens during module evaluation, so the process dies before
+// Express listens and App Runner health-checks it into a rollback. That
+// is exactly what killed both visa deploys (2026-08-13). It is loaded
+// lazily inside computeWorstCaseHeroContrast instead, so a broken sharp
+// degrades to "image-contrast scoring is unavailable" — a failed admin
+// image-fetch job — while every other route, visa included, stays up.
 
 // Matches RequirementsPage.tsx's heroBackgroundStyle exactly: a
 // left-weighted horizontal gradient scrim (2026-08-04), not a flat tint.
@@ -99,7 +109,34 @@ const TEXT_REGIONS: Array<{ name: string; left: number; top: number; right: numb
   { name: "body", left: 0.0375, top: 0.3766, right: 0.5375, bottom: 0.4698 },
 ];
 
-export const MIN_HERO_CONTRAST = 4.5;
+// Re-exported for the callers that need BOTH the threshold and the
+// scorer, so they keep a single import. Callers that need only the
+// number must import it from heroImageContrastConstants.js directly —
+// importing it from here is what dragged sharp onto the boot path.
+export { MIN_HERO_CONTRAST } from "./heroImageContrastConstants.js";
+
+// The lazy, first-call load of the native addon — the whole point of
+// which is that this line runs when someone scores an image, not when
+// Node evaluates the module graph on boot. Node caches the resolved
+// module, so repeat calls don't re-pay the dlopen.
+//
+// Rethrown with context because a raw ERR_DLOPEN_FAILED surfacing out of
+// an image-fetch job reads like a bug in the job rather than a broken
+// native install. Deliberately NOT swallowed into a 0: 0 is the
+// fail-closed "this image fails contrast" value, and stamping every
+// candidate FAIL because a library is missing would be a wrong answer
+// dressed up as a verdict.
+async function loadSharp() {
+  try {
+    return (await import("sharp")).default;
+  } catch (err) {
+    throw new Error(
+      `Hero contrast scoring is unavailable: the "sharp" native module failed to load (${
+        err instanceof Error ? err.message : String(err)
+      }). Reinstall it for this platform; the rest of the API is unaffected.`,
+    );
+  }
+}
 
 function srgbChannelToLinear(c: number): number {
   const v = c / 255;
@@ -132,6 +169,8 @@ function applySaturateFilter(r: number, g: number, b: number, s: number): [numbe
  * passing value nothing actually verified.
  */
 export async function computeWorstCaseHeroContrast(imageBuffer: Buffer): Promise<number> {
+  const sharp = await loadSharp();
+
   const { data, info } = await sharp(imageBuffer)
     .resize(REFERENCE_HERO.width, REFERENCE_HERO.height, { fit: "cover", position: "centre" })
     .raw()
