@@ -98,7 +98,7 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Indian Government ID Card",
     category: "IDENTITY",
     defaultDescription: "Copy of an Indian government-issued ID card (PAN card or Aadhaar card), used as supplementary identity or address proof",
-    aliases: ["Pan Card", "PAN Card Copy", "PAN registration", "Pan card copy of all the applicant", "Sponsor's pan card", "Aadhar card", "Aadhar card or Pan card"],
+    aliases: ["Pan Card", "PAN Card Copy", "PAN registration", "Pan card copy of all the applicant", "Sponsor's pan card", "Aadhar card", "Aadhar card or Pan card", "National Id Card"],
     ocrExtractable: false,
   },
   {
@@ -106,7 +106,7 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Address Proof",
     category: "IDENTITY",
     defaultDescription: "Proof of current residential address (rent agreement, property deed, or utility bill), typically required when the passport's issuing jurisdiction differs from the applicant's current city of residence",
-    aliases: ["Rent agreement", "Lease agreement", "Lease agreements", "Property papers", "Residence Proof", "Address Proof", "Electricity Bill", "Water Bill", "Phone Bill", "Telephone Bill"],
+    aliases: ["Rent agreement", "Rental Agreement", "Lease agreement", "Lease agreements", "Property papers", "Residence Proof", "Address Proof", "Electricity Bill", "Water Bill", "Phone Bill", "Telephone Bill"],
     ocrExtractable: false,
   },
   {
@@ -123,7 +123,11 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Income Tax Return",
     category: "FINANCIAL",
     defaultDescription: "ITR, last 2 assessment years",
-    aliases: ["ITR", "Tax Return Acknowledgement"],
+    // Plural + the business-applicant label, both 2026-08-13 (36 rows).
+    // "Income Tax Returns (sponsor)" is deliberately NOT aliased: that row
+    // asks for the applicant's AND the sponsor's returns, which is two
+    // documents, and folding it in here would lose the sponsor half.
+    aliases: ["ITR", "Tax Return Acknowledgement", "Income Tax Returns", "ITR - Business"],
     ocrExtractable: false,
     legacyCode: "DOC-04",
   },
@@ -137,6 +141,8 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
       "Leave Approval Letter",
       "Leave Letter From Company",
       "No Objection Certificate (NOC)",
+      // 2026-08-13, 18 rows — the corpus's own label for the same letter.
+      "Leave letter - current company",
     ],
     ocrExtractable: false,
     legacyCode: "DOC-05",
@@ -146,7 +152,7 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Invitation Letter",
     category: "BUSINESS",
     defaultDescription: "From the host company, on letterhead, with dates and purpose",
-    aliases: ["Business Invitation", "Host Company Letter"],
+    aliases: ["Business Invitation", "Host Company Letter", "Invitation letter - by inviting company"],
     ocrExtractable: false,
     legacyCode: "DOC-06",
   },
@@ -194,7 +200,10 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Salary Slips",
     category: "EMPLOYMENT",
     defaultDescription: "Most recent 3 months' salary slips",
-    aliases: ["Payslips"],
+    // Singular "Salary slip" added 2026-08-13 — the StampMyVisa corpus's
+    // own label for this exact document (18 rows), which the plural
+    // catalogue name missed by one character.
+    aliases: ["Payslips", "Salary slip"],
     ocrExtractable: false,
   },
   {
@@ -282,7 +291,7 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Sponsorship Letter",
     category: "SPONSORSHIP",
     defaultDescription: "Letter from the sponsor confirming financial support for the trip",
-    aliases: ["Affidavit of Support", "Letter of Financial Sponsorship"],
+    aliases: ["Affidavit of Support", "Letter of Financial Sponsorship", "Sponsorship proof"],
     ocrExtractable: false,
   },
   {
@@ -356,7 +365,7 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Pension / Retirement Proof",
     category: "FINANCIAL",
     defaultDescription: "Pension statement or retirement order for a retired applicant",
-    aliases: ["Retirement Order"],
+    aliases: ["Retirement Order", "pension proof", "Retirement Proof"],
     ocrExtractable: false,
   },
   {
@@ -364,7 +373,10 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Student Enrollment Letter",
     category: "EMPLOYMENT",
     defaultDescription: "Institution letter confirming current enrollment, for a student applicant",
-    aliases: ["Bonafide Certificate"],
+    // "School NOC" added 2026-08-13: the StampMyVisa corpus uses it for the
+    // same document this type already covers ("Bonafide certificate (or)
+    // Leave letter from educational institution"), 14 rows.
+    aliases: ["Bonafide Certificate", "School NOC"],
     ocrExtractable: false,
   },
   {
@@ -434,9 +446,140 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     // certificate): the source uses this for whatever evidences the
     // business — GST certificate, trade licence, partnership deed.
     defaultDescription: "Evidence of the applicant's business — registration certificate, GST certificate, trade licence or partnership deed",
-    aliases: [],
+    // "partnership deed" added 2026-08-13 (20 rows in the StampMyVisa
+    // corpus) — specific enough that it cannot steal a match from
+    // BUSINESS_REGISTRATION, which is the incorporation certificate.
+    aliases: ["partnership deed"],
     ocrExtractable: false,
   },
+  // ── 2026-08-13 (second pass) — the genuinely-missing document types
+  // behind the seeded catalogue's "needs mapping" backlog. NINE of the
+  // types this pass was asked for already existed and are deliberately NOT
+  // duplicated here — Business Registration (BUSINESS_REGISTRATION),
+  // Rental Agreement (ADDRESS_PROOF, which already aliases "Rent
+  // agreement"), Pension/Retirement Proof (PENSION_OR_RETIREMENT_PROOF),
+  // Marriage/Divorce Certificate, Leave Letter (EMPLOYER_NOC's own
+  // aliases), Bonafide Certificate (STUDENT_ENROLLMENT_LETTER). A second
+  // code for a document that already has one would split its checklist
+  // rows across two types forever.
+  {
+    code: "HIGHER_EDUCATION_DEGREE",
+    name: "Higher Education Degree",
+    category: "EMPLOYMENT",
+    defaultDescription: "Degree certificate or marksheet evidencing the applicant's highest completed qualification",
+    aliases: ["Higher Education Degree", "Education certificate"],
+    ocrExtractable: false,
+  },
+  {
+    code: "NAME_CHANGE_AFFIDAVIT",
+    name: "Name Change Affidavit",
+    category: "CIVIL_STATUS",
+    defaultDescription: "Notarised affidavit or gazette notification evidencing a change of name, where the passport and supporting documents differ",
+    aliases: ["Name Change Affidavit", "Name change"],
+    ocrExtractable: false,
+  },
+  {
+    code: "VISITING_CARD",
+    name: "Visiting Card",
+    category: "EMPLOYMENT",
+    defaultDescription: "The applicant's business/visiting card, asked for by several missions as supplementary proof of designation",
+    aliases: ["Visiting Card", "Business Card"],
+    ocrExtractable: false,
+  },
+  {
+    code: "RESUME",
+    name: "Resume",
+    category: "EMPLOYMENT",
+    defaultDescription: "The applicant's curriculum vitae",
+    aliases: ["Resume", "Curriculum Vitae", "CV"],
+    ocrExtractable: false,
+  },
+  {
+    code: "LETTER_OF_ENGAGEMENT",
+    name: "Letter of Engagement",
+    category: "EMPLOYMENT",
+    // A freelancer's equivalent of EMPLOYER_NOC — issued by the CLIENT, not
+    // an employer, so it is not that type and must not alias into it.
+    defaultDescription: "Client's letter of engagement for a freelance or contract applicant, in place of an employer letter",
+    aliases: ["Letter of Engagement"],
+    ocrExtractable: false,
+  },
+  {
+    code: "FREELANCE_PAYMENT_PROOF",
+    name: "Freelance Payment Proof",
+    category: "FINANCIAL",
+    defaultDescription: "Invoices or payment receipts evidencing freelance income",
+    aliases: ["Payment Proof - Freelance"],
+    ocrExtractable: false,
+  },
+  {
+    code: "INVESTMENT_PROOF",
+    name: "Investment Proofs",
+    category: "FINANCIAL",
+    defaultDescription: "Statements for fixed deposits, mutual funds, shares or other investments, offered as evidence of funds",
+    aliases: ["Investment Proofs", "Investment Proof"],
+    ocrExtractable: false,
+  },
+  {
+    code: "PROPERTY_OWNERSHIP_PROOF",
+    name: "Property Ownership Proof",
+    category: "FINANCIAL",
+    // Distinct from INCOME_FROM_PROPERTY_OR_BUSINESS, which evidences the
+    // INCOME a property generates. This one evidences owning it.
+    defaultDescription: "Title deed, sale deed or property tax receipt evidencing ownership of immovable property",
+    aliases: ["Property Ownership Proof", "Property Papers"],
+    ocrExtractable: false,
+  },
+  {
+    code: "POLICE_CLEARANCE_CERTIFICATE",
+    name: "Police Clearance Certificate",
+    category: "IDENTITY",
+    defaultDescription: "Police clearance certificate (PCC) issued by the applicant's local authority",
+    aliases: ["Police Clearance Certificate", "PCC"],
+    ocrExtractable: false,
+  },
+  {
+    code: "JOB_OFFER_LETTER",
+    name: "Job Offer Letter",
+    category: "EMPLOYMENT",
+    // Deliberately separate from EMPLOYMENT_CONTRACT (a signed contract of
+    // CURRENT employment): an offer letter evidences employment not yet
+    // started, which is a different thing to a consulate.
+    defaultDescription: "Offer of employment, for an applicant who has accepted a role not yet commenced",
+    aliases: ["Job Offer Letter", "Offer Letter"],
+    ocrExtractable: false,
+  },
+  {
+    code: "DS_160_CONFIRMATION",
+    name: "DS-160 Confirmation",
+    category: "TRAVEL",
+    // US-specific counterpart of VISA_APPLICATION_FORM. Kept separate
+    // because the DS-160 confirmation PAGE (with its barcode) is what the
+    // consulate actually demands, not the form itself.
+    defaultDescription: "DS-160 confirmation page with barcode, for a United States visa application",
+    aliases: ["DS-160 Form", "DS-160", "DS160 Confirmation"],
+    ocrExtractable: false,
+  },
+  {
+    code: "FOREIGN_COMPANY_REGISTRATION",
+    name: "Foreign Company Registration",
+    category: "BUSINESS",
+    // The registration papers of the DESTINATION-country company hosting
+    // the applicant — not the applicant's own business
+    // (BUSINESS_REGISTRATION), which is why it is its own type.
+    defaultDescription: "Registration papers of the inviting company in the destination country",
+    aliases: ["Destination company's registration papers"],
+    ocrExtractable: false,
+  },
+  {
+    code: "TRAVEL_AGENCY_CERTIFICATE",
+    name: "Travel Agency Certificate",
+    category: "TRAVEL",
+    defaultDescription: "Certificate or covering letter issued by the booking travel agency, signed and stamped by an authorised representative",
+    aliases: ["Travel agency certificate"],
+    ocrExtractable: false,
+  },
+
   {
     code: "TRAVEL_ITINERARY",
     name: "Travel Itinerary",
