@@ -1460,7 +1460,6 @@ router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) =
       }
 
       const ibStatus = ibResult?.Response?.ResponseStatus;
-
       sbtLogger.info('[TICKET-LCC] IB leg result', {
         ibStatus, isReturnGDS: !!isReturnGDS,
       });

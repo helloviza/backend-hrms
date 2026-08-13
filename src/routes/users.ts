@@ -297,19 +297,29 @@ r.get(
 r.post(
   "/profile/update",
   requireAuth,
-  requirePermission("people", "WRITE"),
+  // uiThemePreset is a personal UI preference (e.g. the /dashboard/travel-spend
+  // palette picker), not an HR-managed field — any authenticated user may set
+  // it on their own account without the "people" module permission the other
+  // fields on this route require. Every other field still needs it, unchanged.
+  (req: Request, res: Response, next: NextFunction) => {
+    const bodyKeys = Object.keys(req.body || {});
+    const isThemeOnly = bodyKeys.length > 0 && bodyKeys.every((k) => k === "uiThemePreset");
+    if (isThemeOnly) return next();
+    return requirePermission("people", "WRITE")(req, res, next);
+  },
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const userId = (req as any).user?.sub;
       if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-      const { name, phone, department, location, avatarKey } = req.body || {};
+      const { name, phone, department, jobLocation, avatarKey, uiThemePreset } = req.body || {};
 
       const $set: any = {};
       if (name !== undefined) $set.name = name;
       if (phone !== undefined) $set.phone = phone;
       if (department !== undefined) $set.department = department;
-      if (location !== undefined) $set.location = location;
+      if (jobLocation !== undefined) $set.jobLocation = jobLocation;
+      if (uiThemePreset !== undefined) $set.uiThemePreset = uiThemePreset;
 
       // Optional: allow avatarKey update via this endpoint too
       if (avatarKey) {

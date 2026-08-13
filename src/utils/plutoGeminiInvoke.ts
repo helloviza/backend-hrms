@@ -9,9 +9,18 @@ import { reaskRetryInstruction, type PlutoInvokeOptions } from "./plutoInvoke.js
 // rather than passing malformed JSON into lockDecisions/nextSteps downstream.
 export const GEMINI_FALLBACK_INVALID = "GEMINI_FALLBACK_INVALID";
 
+// NOT gemini-1.5-flash. That model is retired — the endpoint answers 404
+// ("is not found for API version v1beta"), which meant this entire fallback
+// path (copilot.travel.ts's delta-reply retry, and server.ts's pingGemini
+// healthcheck) was dead on every call while still reporting as wired.
+// Pinned rather than an auto-updating `-latest` alias so the fallback cannot
+// change behaviour under us without a deliberate edit — same rule as
+// utils/plutoCityNormalize.ts.
+const GEMINI_MODEL = "gemini-2.5-flash";
+
 // Set up Gemini with your key
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
 
 // Mirrors the corrective retry instruction used by the OpenAI path
 // (plutoInvoke.ts) so the fallback gets a comparable second chance.
