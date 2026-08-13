@@ -50,6 +50,8 @@
 //   node --env-file=.env.development --import tsx src/migrations/2026-08-12-backfill-visa-application-travel-denorm.ts --apply     # write
 import "dotenv/config";
 import path from "node:path";
+import * as readline from "node:readline/promises";
+import { stdin as rlInput, stdout as rlOutput } from "node:process";
 import { fileURLToPath } from "node:url";
 import mongoose from "mongoose";
 import { env } from "../config/env.js";
@@ -117,6 +119,79 @@ export function assertLocalDatabase(uri: string): void {
   }
 }
 
+/* ─────────────────────────────────────────────────────────────────────
+ * THE PRODUCTION PATH (2026-08-13). Added because the 21 pre-existing
+ * production applications genuinely need this backfill — without it the
+ * ops queue reads them as unassessable — and assertLocalDatabase above
+ * cannot be satisfied by any production connection string by design.
+ *
+ * assertLocalDatabase REMAINS THE DEFAULT and is untouched. This path is
+ * only reachable with --i-know-this-is-production, and even then every
+ * one of these must hold:
+ *   1. an interactive TTY (refused outright otherwise, so no CI job, no
+ *      cron, no piped heredoc can ever reach the write);
+ *   2. the target host and database printed FIRST, then the database name
+ *      typed back exactly — the same challenge scripts/
+ *      delete-all-visa-rules.ts uses before a destructive production
+ *      write;
+ *   3. dry run still the default — --apply is a separate, additional
+ *      flag, so the acknowledgement flag alone writes nothing.
+ * The ledger (runMigration) still refuses a second --apply without
+ * --force, and the migration body is untouched: same $exists:false
+ * selection, same write-time recheck, same computeProcessingDeadline.
+ * ───────────────────────────────────────────────────────────────────── */
+export function describeTarget(uri: string): { host: string; db: string } {
+  try {
+    const afterScheme = uri.replace(/^mongodb(\+srv)?:\/\//, "");
+    const afterCreds = afterScheme.includes("@") ? afterScheme.slice(afterScheme.indexOf("@") + 1) : afterScheme;
+    const [hostPart, ...rest] = afterCreds.split("/");
+    return {
+      host: hostPart.split(",")[0].split(":")[0].trim(),
+      db: (rest.join("/") || "").split("?")[0].trim() || "(default)",
+    };
+  } catch {
+    return { host: "(unparseable)", db: "(unparseable)" };
+  }
+}
+
+async function assertProductionAcknowledged(uri: string, willWrite: boolean): Promise<void> {
+  if (!uri) throw new Error("REFUSING TO RUN: MONGO_URI is empty.");
+
+  const { host, db } = describeTarget(uri);
+
+  console.log("──────────────────────────────────────────────────────");
+  console.log("  PRODUCTION TARGET");
+  console.log(`  host:     ${host}`);
+  console.log(`  database: ${db}`);
+  console.log(`  action:   ${willWrite ? "WRITE (--apply)" : "read-only dry run"}`);
+  console.log("──────────────────────────────────────────────────────");
+
+  // The TTY + typed-name challenge guards the WRITE. A dry run touches
+  // nothing — it only reads and prints what a write would do — and making
+  // that unrunnable without a human at a keyboard would block the very
+  // review step that has to happen BEFORE anyone is allowed to --apply.
+  // The explicit --i-know-this-is-production flag is still required for
+  // either, so a production read is never accidental.
+  if (!willWrite) return;
+
+  if (!rlInput.isTTY) {
+    throw new Error(
+      "REFUSING TO RUN: --apply against production requires typing the database name at an " +
+        "interactive terminal, and stdin is not a TTY. Run this yourself in a shell.",
+    );
+  }
+
+  const rl = readline.createInterface({ input: rlInput, output: rlOutput });
+  try {
+    const answer = await rl.question(`Type the database name ("${db}") to WRITE: `);
+    if (answer.trim() !== db) {
+      throw new Error("Aborted: input did not match the database name. Nothing was written.");
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 export interface MigrationSummary {
   applicationsScanned: number; // rows lacking the denormalised fields
   backfilled: number; // parent had a travel date — a real deadline was computed
@@ -130,7 +205,29 @@ export interface MigrationSummary {
  * or disconnects itself. dryRun=true computes and returns exactly the
  * summary a real run would produce, without writing anything.
  */
-export async function backfillVisaApplicationTravelDenorm(dryRun: boolean): Promise<MigrationSummary> {
+export interface BackfillRowReport {
+  applicationId: string;
+  requestId: string;
+  travelDateFrom: Date | null;
+  destinationIso2: string | null;
+  etaMaxDays: number | null;
+  etaBasis: string | null;
+  processingDeadlineAt: Date | null;
+  kind: "backfilled" | "dateless" | "orphaned";
+}
+
+/**
+ * onRow (2026-08-13) — optional, purely observational. Added so a
+ * production dry run can show WHICH deadline each row would get rather
+ * than only the four summary totals: a reviewer approving a production
+ * write needs to see the values, not just the counts. Never affects what
+ * is selected, computed or written; omitting it reproduces the previous
+ * behaviour exactly.
+ */
+export async function backfillVisaApplicationTravelDenorm(
+  dryRun: boolean,
+  onRow?: (row: BackfillRowReport) => void,
+): Promise<MigrationSummary> {
   const summary: MigrationSummary = {
     applicationsScanned: 0,
     backfilled: 0,
@@ -163,6 +260,16 @@ export async function backfillVisaApplicationTravelDenorm(dryRun: boolean): Prom
       // by every future run, which is the correct loud behaviour for data
       // that shouldn't be possible.
       summary.orphaned += 1;
+      onRow?.({
+        applicationId: String(a._id),
+        requestId: String(a.requestId),
+        travelDateFrom: null,
+        destinationIso2: null,
+        etaMaxDays: a.ruleSnapshot?.etaMaxDays ?? null,
+        etaBasis: a.ruleSnapshot?.etaBasis ?? null,
+        processingDeadlineAt: null,
+        kind: "orphaned",
+      });
       continue;
     }
 
@@ -175,6 +282,17 @@ export async function backfillVisaApplicationTravelDenorm(dryRun: boolean): Prom
 
     if (travelDateFrom) summary.backfilled += 1;
     else summary.dateless += 1;
+
+    onRow?.({
+      applicationId: String(a._id),
+      requestId: String(a.requestId),
+      travelDateFrom,
+      destinationIso2: request.destinationIso2 ?? null,
+      etaMaxDays: a.ruleSnapshot?.etaMaxDays ?? null,
+      etaBasis: a.ruleSnapshot?.etaBasis ?? null,
+      processingDeadlineAt,
+      kind: travelDateFrom ? "backfilled" : "dateless",
+    });
 
     if (!dryRun) {
       await VisaApplication.updateOne(
@@ -197,12 +315,19 @@ async function main() {
   const dryRun = !process.argv.includes("--apply");
   const force = process.argv.includes("--force");
 
+  const productionAcknowledged = process.argv.includes("--i-know-this-is-production");
+
   console.log("=== Backfill VisaApplication travel/destination/deadline denormalisation ===");
-  console.log(`Mode: ${dryRun ? "DRY RUN" : "APPLY"}`);
+  console.log(`Mode: ${dryRun ? "DRY RUN" : "APPLY"}${productionAcknowledged ? " (PRODUCTION path)" : ""}`);
 
   // BEFORE connect, always — in both modes. A dry run against production is
-  // still a connection to production.
-  assertLocalDatabase(env.MONGO_URI);
+  // still a connection to production, which is exactly why the production
+  // path prompts before this point too, not just before the write.
+  if (productionAcknowledged) {
+    await assertProductionAcknowledged(env.MONGO_URI, !dryRun);
+  } else {
+    assertLocalDatabase(env.MONGO_URI);
+  }
 
   await mongoose.connect(env.MONGO_URI);
   console.log("Connected to:", env.MONGO_URI?.split("@").pop()?.split("?")[0]);
@@ -214,7 +339,18 @@ async function main() {
       mode: dryRun ? "DRY_RUN" : "APPLY",
       force,
       run: async () => {
-        const summary = await backfillVisaApplicationTravelDenorm(dryRun);
+        // Per-row lines first, then the totals — a reviewer approving a
+        // production write reads the values, not just the counts.
+        const fmt = (d: Date | null) => (d ? d.toISOString().slice(0, 10) : "null");
+        console.log("app id                    dest  travelFrom  etaMax/basis   -> processingDeadlineAt");
+        const summary = await backfillVisaApplicationTravelDenorm(dryRun, (r) => {
+          console.log(
+            `${r.applicationId}  ${(r.destinationIso2 ?? "--").padEnd(4)}  ${fmt(r.travelDateFrom).padEnd(10)}  ` +
+              `${String(r.etaMaxDays ?? "-").padStart(3)}/${(r.etaBasis ?? "-").padEnd(8)}  -> ` +
+              `${fmt(r.processingDeadlineAt).padEnd(10)} [${r.kind}]`,
+          );
+        });
+        console.log("");
         const summaryLine =
           `applicationsScanned=${summary.applicationsScanned} backfilled=${summary.backfilled} ` +
           `dateless=${summary.dateless} orphaned=${summary.orphaned}`;
