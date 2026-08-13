@@ -114,7 +114,7 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Bank Statement",
     category: "FINANCIAL",
     defaultDescription: "Last 6 months, showing salary credits / closing balance",
-    aliases: ["Personal Bank Statement", "Savings Account Statement"],
+    aliases: ["Personal Bank Statement", "Savings Account Statement", "Bank e-Statement"],
     ocrExtractable: false,
     legacyCode: "DOC-03",
   },
@@ -179,7 +179,7 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Travel Insurance",
     category: "TRAVEL",
     defaultDescription: "Required by Schengen and several other missions",
-    aliases: ["Medical Travel Insurance"],
+    aliases: ["Medical Travel Insurance", "Travel Insurance Certificate"],
     ocrExtractable: false,
     legacyCode: "DOC-09",
   },
@@ -357,7 +357,7 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     name: "Business Registration",
     category: "BUSINESS",
     defaultDescription: "Proof of business ownership/registration for a self-employed applicant",
-    aliases: ["Company Registration Certificate"],
+    aliases: ["Company Registration Certificate", "Business Registration Certificate"],
     ocrExtractable: false,
   },
   {
@@ -449,7 +449,7 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     // "partnership deed" added 2026-08-13 (20 rows in the StampMyVisa
     // corpus) — specific enough that it cannot steal a match from
     // BUSINESS_REGISTRATION, which is the incorporation certificate.
-    aliases: ["partnership deed"],
+    aliases: ["partnership deed", "GST Certificate"],
     ocrExtractable: false,
   },
   // ── 2026-08-13 (second pass) — the genuinely-missing document types
@@ -571,6 +571,58 @@ export const VISA_DOCUMENT_TYPE_CATALOGUE: readonly VisaDocumentTypeSeed[] = [
     aliases: ["Destination company's registration papers"],
     ocrExtractable: false,
   },
+  // ── 2026-08-13 (third pass) — three types the seeded corpus asks for
+  // that had no home at all. Each was verified against the STORED labels
+  // before being written: matchDocumentType indexes [code, name,
+  // ...aliases] and compares the WHOLE normalised string, so a type only
+  // clears a flag if one of those three forms equals the stored label
+  // exactly once normalised.
+  {
+    code: "OCCUPATION_PROOF",
+    name: "Occupation Proof",
+    category: "EMPLOYMENT",
+    // No alias needed: the stored labels are "OCCUPATION_PROOF" and
+    // "Occupation proof", both of which normalise to "occupation proof" —
+    // which is this entry's own CODE, and the code is in the match index.
+    //
+    // "Sponsor's Occupation Proof" (16 rules) is deliberately NOT aliased
+    // here: that is the SPONSOR's occupation, a different person's
+    // document, and folding it in would silently answer a question about
+    // the applicant with evidence about someone else.
+    defaultDescription: "Proof of the applicant's current occupation — an employment letter, company ID card, or business registration, whichever fits",
+    aliases: [],
+    ocrExtractable: false,
+  },
+  {
+    code: "STUDENT_ID_CARD",
+    name: "Student ID Card",
+    category: "IDENTITY",
+    // Its own type, NOT an alias of STUDENT_ENROLLMENT_LETTER: an ID card
+    // is a physical identity document, the bonafide/enrollment letter is
+    // an institution's written confirmation. They sit side by side in the
+    // source ("Bonafide certificate (or) ... (or) Student identity card").
+    //
+    // "Student ID" IS required as an alias — the stored label normalises
+    // to "student id", which equals neither the code ("student id card")
+    // nor the name. Without it this entry would clear nothing.
+    defaultDescription: "Institution-issued student identity card",
+    aliases: ["Student ID", "Student identity card"],
+    ocrExtractable: false,
+  },
+  {
+    code: "VISA_FEE_PAYMENT_RECEIPT",
+    name: "Visa Fee Payment Receipt",
+    category: "FINANCIAL",
+    // "Payment receipt" is required for the same reason as above (the
+    // stored label is "Payment receipt", not the code or the name). It is
+    // safe despite being generic: no other type claims a payment receipt,
+    // and FREELANCE_PAYMENT_PROOF's own alias is the distinct string
+    // "Payment Proof - Freelance", so neither can steal from the other.
+    defaultDescription: "Copy of the receipt for the visa fee paid to the mission or visa centre",
+    aliases: ["Payment receipt"],
+    ocrExtractable: false,
+  },
+
   {
     code: "TRAVEL_AGENCY_CERTIFICATE",
     name: "Travel Agency Certificate",
