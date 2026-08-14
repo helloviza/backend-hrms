@@ -18,7 +18,13 @@ import mongoose, { Schema, type Document, type Model } from "mongoose";
 // writes instead of UPDATE — "marked as a bulk import" per that feature's
 // own brief, so a reviewer can tell a spreadsheet-driven change from a
 // hand-edit in the console without reading prose.
-export const VISA_RULE_AUDIT_ACTIONS = ["CREATE", "UPDATE", "PUBLISH", "RETIRE", "CLONE", "IMPORT"] as const;
+// UNRETIRE is its own action rather than a second UPDATE, for the same
+// reason IMPORT is: the field-change shape is identical to any other
+// status transition, but a reviewer scanning the trail needs to see that a
+// withdrawn rule was deliberately brought back — that is a different act
+// from editing one, and it is the entry someone will go looking for when
+// asking "who restored this, and when".
+export const VISA_RULE_AUDIT_ACTIONS = ["CREATE", "UPDATE", "PUBLISH", "RETIRE", "UNRETIRE", "CLONE", "IMPORT"] as const;
 export type VisaRuleAuditAction = (typeof VISA_RULE_AUDIT_ACTIONS)[number];
 
 // One changed field. `from`/`to` are Mixed — a rule field can be a number,
@@ -36,8 +42,8 @@ export interface VisaRuleAuditDocument extends Document {
   action: VisaRuleAuditAction;
   // Field-level diff. For CREATE and CLONE this is every field the new
   // rule was created with (from: null). For UPDATE it is only the fields
-  // that actually changed. For PUBLISH/RETIRE it is always exactly one
-  // entry — the status transition.
+  // that actually changed. For PUBLISH/RETIRE/UNRETIRE it is always exactly
+  // one entry — the status transition.
   changes: VisaRuleFieldChange[];
   // Set only when action === "CLONE" — the rule this one was cloned from.
   clonedFromRuleId?: mongoose.Types.ObjectId; // ref VisaRule

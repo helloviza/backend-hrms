@@ -912,6 +912,66 @@ router.post("/rules/:id/retire", requirePermission("visaApplication", "FULL"), a
 });
 
 /* ─────────────────────────────────────────────────────────────────────
+ * POST /rules/:id/unretire — RETIRED -> DRAFT only. The way back from
+ * Retire.
+ *
+ * Before this existed RETIRED was a terminal state: publish rejects
+ * anything that is not DRAFT, PATCH refuses to write `status` at all, and
+ * the spreadsheet import never reads status from the file. Nothing in the
+ * API could move a rule out of RETIRED, so a misclicked Retire was
+ * unrecoverable without a direct database write.
+ *
+ * ── WHY DRAFT AND NOT STRAIGHT BACK TO PUBLISHED ──────────────────────
+ *
+ * A rule can sit retired for any length of time, and the most likely
+ * reason it was retired is that something REPLACED it — publish's own
+ * conflict check tells ops to "retire it first" when a corridor slot is
+ * taken. Going straight back to PUBLISHED would put two live rules on one
+ * corridor, which is exactly the state publishReadinessGaps() exists to
+ * prevent, and it would do so through a door that never ran the check.
+ *
+ * Landing in DRAFT instead means the ONLY way back to live is
+ * POST /rules/:id/publish, which re-runs both halves of that check against
+ * whatever the world looks like NOW: the completeness gate (a rule retired
+ * a year ago may no longer carry terms we'd quote today) and the corridor
+ * conflict gate (the slot may since have been filled by its replacement).
+ * If the slot IS taken, ops gets publish's existing, specific error rather
+ * than a silent double-publish. The publish DRAFT-only guard is therefore
+ * deliberately left exactly as it was — this route feeds that gate, it
+ * does not bypass it.
+ *
+ * No duplicate-key risk in the transition itself: VisaRule's unique index
+ * is the six identity fields and does NOT include status, so a retired
+ * rule already owns its key and moving it to DRAFT changes nothing about
+ * what it occupies.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/rules/:id/unretire", requirePermission("visaApplication", "FULL"), async (req: any, res: any) => {
+  try {
+    const id = req.params.id;
+    if (!mongoose.isValidObjectId(id)) return res.status(404).json({ error: "Visa rule not found" });
+
+    const rule = await VisaRule.findById(id);
+    if (!rule) return res.status(404).json({ error: "Visa rule not found" });
+
+    if (rule.status !== "RETIRED") {
+      return res.status(400).json({ error: `Only a RETIRED rule can be restored to draft (currently '${rule.status}')` });
+    }
+
+    rule.status = "DRAFT";
+    await rule.save();
+
+    await writeRuleAudit(rule._id, "UNRETIRE", [{ field: "status", from: "RETIRED", to: "DRAFT" }], actorId(req));
+
+    rulesLogger.info("visa rule unretired", { ruleId: String(rule._id), userId: actorId(req) ? String(actorId(req)) : null });
+
+    res.json({ ok: true, rule: mapRuleSummary(rule.toObject()) });
+  } catch (err: any) {
+    console.error("[admin visa rule unretire POST]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to restore visa rule to draft" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * POST /rules/bulk — multi-select changes. The 18 Schengen states move
  * together; editing them one at a time guarantees drift. Atomic: every
  * ruleId is validated to exist BEFORE any write happens, and every write
