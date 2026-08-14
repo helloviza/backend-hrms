@@ -42,6 +42,8 @@ import { env } from "../config/env.js";
 // load, so anything it pulls in is on the boot path.
 import { MIN_HERO_CONTRAST } from "../utils/heroImageContrastConstants.js";
 import { getCountryByIso2 } from "../utils/countryCodes.js";
+import { VISA_DOCUMENT_TYPE_CATALOGUE } from "../config/visaDocumentTypeCatalogue.js";
+import { matchDocumentType, suggestDocumentTypes } from "../utils/visaChecklistCatalogueMatcher.js";
 import { triggerAutoFetchForDestination } from "../services/visaDestinationImageService.js";
 import VisaRule, {
   VISA_PURPOSES,
@@ -388,6 +390,89 @@ export async function writeRuleAudit(
   if (opts.clonedFromRuleId) doc.clonedFromRuleId = opts.clonedFromRuleId;
   await VisaRuleAudit.create([doc], opts.session ? { session: opts.session } : undefined);
 }
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /document-catalogue — the whole document-type catalogue.
+ *
+ * Until now the catalogue existed only as a backend constant. The console
+ * rendered document names from its OWN hardcoded DOC_CODE_LABELS map,
+ * which carries 10 of the catalogue's 54 codes and is duplicated verbatim
+ * in VisaRulesConsole.tsx and VisaConciergeConsole.tsx — so 44 real
+ * document types could not be named, let alone chosen, in the UI. This is
+ * the source both consoles should read instead. (Those two maps are now
+ * obsolete but deliberately still in place; removing them is a UI-stage
+ * change, not this one.)
+ *
+ * Returns the full list unpaginated: it is 54 rows of static reference
+ * data that changes when someone edits a source file, so a picker should
+ * fetch it once and filter client-side rather than round-trip per
+ * keystroke. `legacyCode` is included because stored data still holds old
+ * DOC-NN values in places (see the catalogue file's own header) and a UI
+ * showing both is how anyone reconciles the two.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/document-catalogue", requirePermission("visaApplication", "FULL"), async (_req: any, res: any) => {
+  try {
+    res.json({
+      ok: true,
+      count: VISA_DOCUMENT_TYPE_CATALOGUE.length,
+      documentTypes: VISA_DOCUMENT_TYPE_CATALOGUE.map((d) => ({
+        code: d.code,
+        name: d.name,
+        category: d.category,
+        defaultDescription: d.defaultDescription ?? null,
+        aliases: d.aliases ?? [],
+        legacyCode: (d as any).legacyCode ?? null,
+        ocrExtractable: !!d.ocrExtractable,
+      })),
+    });
+  } catch (err: any) {
+    console.error("[admin visa document-catalogue GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load the document catalogue" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /document-catalogue/suggest?q=…&limit=… — ranked near-matches for a
+ * free-text document name, for the as-you-type suggestions behind
+ * in-console document entry.
+ *
+ * Two DIFFERENT answers, deliberately kept apart rather than merged into
+ * one "best guess":
+ *
+ *   exactMatch  — matchDocumentType(): exact, after normalisation, against
+ *                 a code/name/alias. Null unless it is genuinely that
+ *                 document. This is the only result safe to auto-apply.
+ *   suggestions — suggestDocumentTypes(): token-overlap ranked, explicitly
+ *                 fuzzy. Offer these; never auto-select one.
+ *
+ * The distinction is the whole point of the "explicit save-as-unmatched"
+ * design: ops sees what the system is CERTAIN of separately from what it
+ * is guessing, so choosing to store an unmatched document is a decision
+ * someone made rather than a silent consequence of a weak match. The
+ * default limit is raised from suggestDocumentTypes' own 2 because a
+ * picker wants a shortlist to choose from, not the matcher's top pair.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/document-catalogue/suggest", requirePermission("visaApplication", "FULL"), async (req: any, res: any) => {
+  try {
+    const q = String(req.query.q ?? "").trim();
+    if (!q) return res.status(400).json({ error: "q is required — pass the free-text document name to match" });
+
+    const rawLimit = Number(req.query.limit);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 25) : 8;
+
+    const exact = matchDocumentType(q);
+
+    res.json({
+      ok: true,
+      query: q,
+      exactMatch: exact ? { code: exact.code, name: exact.name } : null,
+      suggestions: suggestDocumentTypes(q, limit),
+    });
+  } catch (err: any) {
+    console.error("[admin visa document-catalogue suggest GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to suggest document types" });
+  }
+});
 
 /* ─────────────────────────────────────────────────────────────────────
  * GET /rules — filter by destination, purpose, status. No pagination —

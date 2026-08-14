@@ -121,6 +121,26 @@ describe("resolveVisaChecklistItems — old-shape ruleSnapshot still renders", (
     expect(items).toEqual([{ key: "DOC-01", label: "Passport", requirement: "REQUIRED", docTypeCodes: ["DOC-01"] }]);
   });
 
+  it("does NOT fall back to legacy when documentGroups is present but EMPTY — an emptied rule has no requirements", () => {
+    // The distinction this whole branch turns on: ABSENT means "this source
+    // predates groups, use the legacy list"; EMPTY means "someone deliberately
+    // cleared this rule's checklist". Before 2026-08-14 both took the legacy
+    // path, so a rule edited down to zero groups would silently start quoting
+    // whatever was left in documentRequirements. Harmless only because that
+    // field is empty on every production rule today — which is not a property
+    // to depend on once the console can write groups.
+    const emptiedRule = {
+      documentGroups: [],
+      documentRequirements: [{ docCode: "DOC-01", requirement: "REQUIRED" as const }],
+    };
+    expect(resolveVisaChecklistItems(emptiedRule, { employmentStatus: "EMPLOYED" })).toEqual([]);
+
+    // And the absent case still behaves exactly as it always did — same
+    // legacy list, same output — so old ruleSnapshots are untouched.
+    const oldSnapshot = { documentRequirements: [{ docCode: "DOC-01", requirement: "REQUIRED" as const }] };
+    expect(resolveVisaChecklistItems(oldSnapshot, { employmentStatus: "EMPLOYED" })).toHaveLength(1);
+  });
+
   it("renders an old snapshot the same way regardless of applicant profile (nothing structured to filter by)", () => {
     const oldSnapshot = { documentRequirements: [{ docCode: "DOC-01", requirement: "REQUIRED" as const }] };
     expect(resolveVisaChecklistItems(oldSnapshot, undefined)).toEqual(resolveVisaChecklistItems(oldSnapshot, { employmentStatus: "UNEMPLOYED" }));

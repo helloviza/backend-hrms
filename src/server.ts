@@ -571,6 +571,15 @@ app.use("/api/admin/visa", adminVisaRosterRouter);
 import adminVisaRulesImportExportRouter from "./routes/admin.visa.rules.importExport.js";
 app.use("/api/admin/visa", adminVisaRulesImportExportRouter);
 
+// Visa module — PER-GROUP writes for VisaRule.documentGroups, the field
+// the customer checklist actually renders. A sixth router on the same
+// prefix. Until this existed, documentGroups was editable only through the
+// XLSX REQUIREMENTS sheet above, while the rule editor's own document
+// section wrote `documentRequirements` — a superseded field no customer
+// reads. See routes/admin.visa.rules.documentGroups.ts's file header.
+import adminVisaRuleDocumentGroupsRouter from "./routes/admin.visa.rules.documentGroups.js";
+app.use("/api/admin/visa", adminVisaRuleDocumentGroupsRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";

@@ -154,7 +154,11 @@ export function describeTarget(uri: string): { host: string; db: string } {
   }
 }
 
-async function assertProductionAcknowledged(uri: string, willWrite: boolean): Promise<void> {
+// Exported so later migrations needing the same production path reuse this
+// one rather than re-deriving it — a second, drifting copy of a guard this
+// careful is a liability. Safe to import: the auto-run at the bottom of
+// this file is behind an isDirectRun check for exactly that reason.
+export async function assertProductionAcknowledged(uri: string, willWrite: boolean): Promise<void> {
   if (!uri) throw new Error("REFUSING TO RUN: MONGO_URI is empty.");
 
   const { host, db } = describeTarget(uri);
