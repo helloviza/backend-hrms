@@ -37,7 +37,10 @@ import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
-import { MIN_HERO_CONTRAST } from "../utils/heroImageContrast.js";
+// The threshold only — from the sharp-free constants module, NOT from
+// heroImageContrast.js. This router is imported by server.ts at module
+// load, so anything it pulls in is on the boot path.
+import { MIN_HERO_CONTRAST } from "../utils/heroImageContrastConstants.js";
 import { getCountryByIso2 } from "../utils/countryCodes.js";
 import { triggerAutoFetchForDestination } from "../services/visaDestinationImageService.js";
 import VisaRule, {
