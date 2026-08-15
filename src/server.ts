@@ -123,6 +123,25 @@ import crmContactsRouter from "./routes/crm.contacts.js";
 // ✅ Shared location service — boot-time assertion of the trust-proxy assumption
 import { logProxyTrustAssumption } from "./services/location.service.js";
 
+/* ────────────────────────────────────────────────────────────────
+ * D2C CONSUMER WALL — FAIL-CLOSED BOOT ASSERTION.
+ *
+ * Throws (refusing to start) when CONSUMER_JWT_SECRET is unset OR equal to
+ * JWT_SECRET. Both are unrecoverable: with no secret nothing can be signed,
+ * and with the SAME secret the wall does not exist — a consumer token would
+ * verify against requireAuth.
+ *
+ * Runs BEFORE `express()` and before any router is mounted, so a
+ * misconfigured process never serves a single request. This is deliberately
+ * the opposite of utils/emailActionToken.ts's `|| JWT_SECRET || "dev-secret"`
+ * chain, which degrades silently and is the exact failure this guards against.
+ *
+ * ⚠ DEPLOY GATE: CONSUMER_JWT_SECRET is now a hard boot requirement in EVERY
+ * environment, local dev included. See .env.example.
+ * ──────────────────────────────────────────────────────────────── */
+import { assertConsumerSecretIsolated } from "./config/consumerAuth.js";
+assertConsumerSecretIsolated();
+
 const app = express();
 
 /* ────────────────────────────────────────────────────────────────
@@ -259,7 +278,14 @@ app.use("/api/copilot", copilotLimiter);
  * Skips when req.user is absent (public/webhook routes).
  * Exempts: /api/auth, /api/health, /api/_probe, /api/webhooks
  * ──────────────────────────────────────────────────────────────── */
-const WORKSPACE_EXEMPT = new Set(["/api/auth", "/api/health", "/api/_probe", "/api/webhooks", "/api/whatsapp", "/api/stubs", "/api/intake", "/api/public"]);
+// "/api/consumer" — the D2C surface never resolves a CustomerWorkspace from
+// the caller's identity. A consumer has no employer; middleware/
+// requireConsumer.ts stamps the fixed synthetic D2C workspace instead
+// (services/consumerWorkspace.ts). requireConsumer also deliberately sets
+// req.consumer and NOT req.user, so this shim would skip the path on that
+// alone — the exemption is belt-and-braces, and is what makes the behaviour
+// independent of a future change to what requireConsumer attaches.
+const WORKSPACE_EXEMPT = new Set(["/api/auth", "/api/health", "/api/_probe", "/api/webhooks", "/api/whatsapp", "/api/stubs", "/api/intake", "/api/public", "/api/consumer"]);
 app.use("/api", (req: any, res, next) => {
   // Skip public routes
   const basePath = "/api" + (req.path.split("/").slice(0, 2).join("/") || "");
@@ -414,6 +440,22 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
 import signupRouter from "./routes/auth.signup.js";
 app.use("/api/auth", signupRouter);
 app.use("/api/auth", auth);
+
+/* ────────────────────────────────────────────────────────────────
+ * D2C CONSUMER AUTH (helloviza.ai) — a SEPARATE identity universe.
+ *
+ * Never behind requireAuth: /signup and /login are public, and /logout and
+ * /me gate on requireConsumer INSIDE the router. requireConsumer verifies
+ * with CONSUMER_JWT_SECRET, so a B2B token fails there on SIGNATURE — and,
+ * symmetrically, a consumer token fails at every B2B verifier for the same
+ * reason, with no B2B file changed. See
+ * infra/design/helloviza-consumer-identity-wall-2026-08-15.md.
+ *
+ * "/api/consumer" is in WORKSPACE_EXEMPT above — a consumer has no
+ * CustomerWorkspace to resolve.
+ * ──────────────────────────────────────────────────────────────── */
+import consumerAuthRouter from "./routes/consumer.auth.js";
+app.use("/api/consumer/auth", consumerAuthRouter);
 
 // Self-service signup (fully public — no requireAuth)
 import selfServiceSignupRouter from "./routes/signup.js";
