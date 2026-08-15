@@ -24,6 +24,11 @@ import {
 } from "./VisaRule.js";
 import { VisaApplicantPredicateConditionSchema } from "./visaAttributes.js";
 import { VisaApplicantProfileSchema, type VisaApplicantProfile } from "./visaAttributes.js";
+import {
+  applyVisaSourceImmutability,
+  visaCaseSourcePath,
+  type VisaCaseSource,
+} from "./visaCaseSource.js";
 import logger from "../utils/logger.js";
 
 const visaApplicationLogger = logger.child({ module: "VisaApplication" });
@@ -162,6 +167,20 @@ export interface VisaApplicationDocument extends Document {
   // is null (staff-raised, no customerId to copy) — never independently
   // derived or backfilled from anything else.
   customerId: string | null;
+  // The CHANNEL this case came in through (Phase 1b, 2026-08-16). Copied
+  // down from the parent VisaRequest at creation, on the same line
+  // customerId already is — every ops read is application-grained, so the
+  // tag has to be readable without joining back to the request.
+  //
+  // IMMUTABLE after creation, enforced two ways (models/visaCaseSource.ts):
+  // `immutable: true` on the path covers save()/create(), and a query
+  // middleware guard covers findOneAndUpdate/updateOne/updateMany — which
+  // is how routes/admin.visa.ts actually mutates applications, and which
+  // the schema flag alone does NOT cover.
+  //
+  // Defaults to "B2B": every case that predates the D2C channel is B2B, and
+  // so is every case the existing B2B path creates.
+  source: VisaCaseSource;
   requestId: mongoose.Types.ObjectId; // ref VisaRequest
   // ref TravellerProfile — applicant identity, not duplicated here. NULL only
   // after scripts/erase-traveller-profile.ts has run (see travellerErasedAt
@@ -530,6 +549,11 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
     // Mirrors the parent VisaRequest's own customerId — see the interface
     // field's doc comment above.
     customerId: { type: String, default: null, index: true },
+    // Channel tag — see the interface field above. `immutable: true` inside
+    // visaCaseSourcePath covers save()/create(); applyVisaSourceImmutability
+    // below covers the update operations, which is the half that actually
+    // matters here (admin.visa.ts mutates via findByIdAndUpdate/updateMany).
+    source: visaCaseSourcePath,
     // NOT `required: true` — deliberately loosened for scripts/
     // erase-traveller-profile.ts, which sets this to null (see
     // travellerErasedAt below). Every application is still created WITH one:
@@ -609,6 +633,10 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
 );
 
 VisaApplicationSchema.plugin(workspaceScopePlugin);
+
+// The update-path half of `source` immutability — see models/visaCaseSource.ts
+// for why the schema's own `immutable: true` is not sufficient on its own.
+applyVisaSourceImmutability(VisaApplicationSchema);
 
 // One application per traveller PER REQUEST (see file-header note on scope).
 // partialFilterExpression excludes travellerProfileId:null from the

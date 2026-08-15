@@ -27,6 +27,11 @@
 // history for what came before (task brief).
 import mongoose, { Schema, type Document, type Model } from "mongoose";
 import logger from "../utils/logger.js";
+import {
+  DEFAULT_VISA_CASE_SOURCE,
+  VISA_CASE_SOURCES,
+  type VisaCaseSource,
+} from "./visaCaseSource.js";
 
 const visaActivityLogger = logger.child({ module: "VisaActivityLog" });
 
@@ -156,6 +161,25 @@ export interface VisaActivityLogDocument extends Document {
   at: Date;
   detail: Record<string, unknown>; // event-specific — NEVER PII, see file header
 
+  // DENORMALISED channel tag (Phase 1b, 2026-08-16), copied from the case
+  // this row describes at write time. Denormalised on purpose: this
+  // collection is the ONE report source that is not a VisaApplication query
+  // (routes/admin.visa.reports.ts's buildActivityGateClauses says so in as
+  // many words), and the ops dashboard's throughput/outcome tiles
+  // (admin.visa.dashboard.ts's buildThroughput/buildOutcomes) match on
+  // eventType + a date window with no join back to the application at all.
+  // Without the tag ON the row, those tiles could never segment by channel.
+  //
+  // Not indexed — this collection indexes only its three real query paths
+  // (applicationId, workspaceId, actorUserId), and segmentation is a filter
+  // applied on top of one of those, not an entry point of its own.
+  //
+  // NOT backfilled onto historical rows: this file's own header records the
+  // standing decision that this collection never synthesises history for
+  // what came before. The "B2B" default makes every pre-existing row read
+  // correctly anyway, since every case that predates D2C is B2B.
+  source: VisaCaseSource;
+
   // Erasure follow-up (2026-07-31) — set ONLY by
   // redactVisaActivityForApplications/redactVisaActivityForRequest below,
   // as part of scripts/erase-visa-request.ts or
@@ -178,6 +202,10 @@ const VisaActivityLogSchema = new Schema<VisaActivityLogDocument>({
   actorType: { type: String, enum: VISA_ACTIVITY_ACTOR_TYPES, required: true },
   at: { type: Date, required: true, default: Date.now },
   detail: { type: Schema.Types.Mixed, default: {} },
+  // Denormalised channel tag — see the interface field above. NOT `immutable`
+  // like the case models': this is a write-once append-only row that nothing
+  // ever updates, so there is no update path to guard.
+  source: { type: String, enum: VISA_CASE_SOURCES, default: DEFAULT_VISA_CASE_SOURCE, required: true },
   redactedAt: { type: Date, default: null },
 });
 
@@ -202,6 +230,10 @@ export interface LogVisaActivityInput {
   actorUserId?: mongoose.Types.ObjectId | string | null;
   actorType: VisaActivityActorType;
   detail?: Record<string, unknown>;
+  // The channel of the case this row describes. Optional at the call site:
+  // every existing caller omits it and gets "B2B", which is correct for all
+  // of them — the D2C paths that will pass it do not exist yet (Phase 4).
+  source?: VisaCaseSource;
 }
 
 /**
@@ -225,6 +257,7 @@ export async function logVisaActivity(entry: LogVisaActivityInput): Promise<void
         actorType: entry.actorType,
         at: new Date(),
         detail: entry.detail ?? {},
+        source: entry.source ?? DEFAULT_VISA_CASE_SOURCE,
       },
     ]);
   } catch (err: any) {

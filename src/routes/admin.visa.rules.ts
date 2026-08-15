@@ -127,6 +127,11 @@ const EDITABLE_FIELDS = [
   "embassyFeeInr",
   "vfsFeeInr",
   "plumtripsServiceFeeInr",
+  // Phase 1b (2026-08-16) — the D2C service fee, authored by ops beside the
+  // B2B one. Being in EDITABLE_FIELDS also puts it in AUDITABLE_FIELDS
+  // automatically, so a D2C price change is diffed into VisaRuleAudit like
+  // every other term.
+  "d2cServiceFeeInr",
   "indicativeVisaCostInr",
   "priceNote",
 ] as const;
@@ -249,7 +254,7 @@ function validateRuleFields(body: any, opts: { requireIdentity: boolean }): Vali
     if (docErr) return { ok: false, error: docErr };
     fields.documentRequirements = b.documentRequirements as VisaDocumentRequirement[];
   }
-  for (const key of ["embassyFeeInr", "vfsFeeInr", "plumtripsServiceFeeInr", "indicativeVisaCostInr"] as const) {
+  for (const key of ["embassyFeeInr", "vfsFeeInr", "plumtripsServiceFeeInr", "d2cServiceFeeInr", "indicativeVisaCostInr"] as const) {
     if (b[key] !== undefined) {
       if (!isNonNegativeNumber(b[key])) return { ok: false, error: `${key} must be a non-negative number` };
       fields[key] = b[key];
@@ -302,6 +307,7 @@ export function mapRuleSummary(r: any) {
     embassyFeeInr: r.embassyFeeInr ?? null,
     vfsFeeInr: r.vfsFeeInr ?? null,
     plumtripsServiceFeeInr: r.plumtripsServiceFeeInr ?? null,
+    d2cServiceFeeInr: r.d2cServiceFeeInr ?? null,
     indicativeVisaCostInr: r.indicativeVisaCostInr ?? null,
     displayMode: r.displayMode ?? null,
     priceNote: r.priceNote ?? null,

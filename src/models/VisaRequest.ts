@@ -9,6 +9,11 @@ import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import Counter from "./Counter.js";
 import { VISA_PURPOSES, type VisaPurpose } from "./VisaRule.js";
 import { VISA_CONSENT_CLAUSE_IDS, type VisaConsentClauseId } from "../config/visaConsent.js";
+import {
+  applyVisaSourceImmutability,
+  visaCaseSourcePath,
+  type VisaCaseSource,
+} from "./visaCaseSource.js";
 // TYPE-ONLY import (erased at compile time — no runtime coupling to the
 // expense module, and no import cycle). The visa approval chain reuses the
 // expenses claim chain's subdocument shape VERBATIM rather than declaring a
@@ -77,6 +82,15 @@ export interface VisaRequestDocument extends Document {
   // workspaceId, which is exactly the many-Customers-one-workspace
   // ambiguity this field exists to stop depending on.
   customerId: string | null;
+  // The CHANNEL this request came in through (Phase 1b, 2026-08-16). The
+  // request is the container a channel actually creates — a D2C purchase
+  // creates a request — so the channel fact is born here and is copied down
+  // onto each child VisaApplication at creation, exactly like customerId.
+  //
+  // IMMUTABLE after creation (models/visaCaseSource.ts). Defaults to "B2B":
+  // every request predating the D2C channel is B2B, as is every request the
+  // existing routes/visa.ts POST /requests path creates.
+  source: VisaCaseSource;
   destinationIso2: string;
   purpose: VisaPurpose;
   travelDateFrom?: Date;
@@ -176,6 +190,8 @@ const VisaRequestSchema = new Schema<VisaRequestDocument>(
     // workspaceId. null (not "default") when unresolvable — see the
     // interface field's own doc comment above for why.
     customerId: { type: String, default: null, index: true },
+    // Channel tag — see the interface field above.
+    source: visaCaseSourcePath,
     destinationIso2: { type: String, required: true, uppercase: true, trim: true },
     purpose: { type: String, enum: VISA_PURPOSES, required: true },
     travelDateFrom: { type: Date },
@@ -206,6 +222,9 @@ const VisaRequestSchema = new Schema<VisaRequestDocument>(
 );
 
 VisaRequestSchema.plugin(workspaceScopePlugin);
+
+// The update-path half of `source` immutability — see models/visaCaseSource.ts.
+applyVisaSourceImmutability(VisaRequestSchema);
 
 VisaRequestSchema.index({ workspaceId: 1, raisedByUserId: 1 });
 VisaRequestSchema.index({ workspaceId: 1, status: 1 });

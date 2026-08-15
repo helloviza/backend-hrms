@@ -229,7 +229,21 @@ export interface VisaRuleDocument extends Document {
   // trust a client-submitted value for it.
   embassyFeeInr?: number;
   vfsFeeInr?: number;
+  // The B2B service fee. Named for history, not for channel — it predates
+  // there being more than one channel. utils/visaFee.ts selects THIS one for
+  // channel "B2B" (its default), so every existing caller is unaffected.
   plumtripsServiceFeeInr?: number;
+  // The D2C (helloviza.ai) service fee — Phase 1b, 2026-08-16. A SECOND
+  // margin field beside the B2B one, never a replacement.
+  //
+  // embassyFeeInr/vfsFeeInr are deliberately NOT duplicated per channel:
+  // they are pass-throughs recovered at actual with no margin (see
+  // utils/visaFee.ts's header), identical for a consumer and a corporate
+  // buyer. Two copies of one government fee is two places for it to drift.
+  //
+  // NOT part of the displayMode derivation below, on purpose — see that
+  // hook's own comment.
+  d2cServiceFeeInr?: number;
   indicativeVisaCostInr?: number;
   displayMode?: VisaRuleDisplayMode;
   priceNote?: string;
@@ -345,6 +359,7 @@ const VisaRuleSchema = new Schema<VisaRuleDocument>(
     embassyFeeInr: { type: Number, min: 0 },
     vfsFeeInr: { type: Number, min: 0 },
     plumtripsServiceFeeInr: { type: Number, min: 0 },
+    d2cServiceFeeInr: { type: Number, min: 0 },
     indicativeVisaCostInr: { type: Number, min: 0 },
     displayMode: { type: String, enum: VISA_RULE_DISPLAY_MODES },
     priceNote: { type: String, trim: true },
@@ -390,6 +405,15 @@ VisaRuleSchema.index({ destinationIso2: 1, status: 1 });
 // three itemised fee components is populated, else INDICATIVE (the fallback
 // tier — including the zero-fee/visa-free case, where indicativeVisaCostInr
 // is an explicit 0 rather than absent).
+//
+// d2cServiceFeeInr is DELIBERATELY EXCLUDED (Phase 1b, 2026-08-16). This
+// stored field is consumed by every B2B read; letting a D2C-only price flip
+// it would be exactly the cross-channel coupling the two-fee split exists to
+// avoid. The consequence is a deliberate asymmetry: the STORED displayMode
+// is B2B-derived, while utils/visaFee.ts derives the EFFECTIVE mode per call
+// from whichever channel it was asked for. Moot on today's data — all 258
+// published rules populate all four itemised fields — but real, and written
+// down here rather than discovered later.
 VisaRuleSchema.pre("validate", function (next) {
   const hasItemised =
     this.embassyFeeInr != null || this.vfsFeeInr != null || this.plumtripsServiceFeeInr != null;
