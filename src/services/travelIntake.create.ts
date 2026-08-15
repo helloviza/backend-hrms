@@ -122,6 +122,17 @@ export interface TravelIntakeInput {
   /** Raw service labels as submitted — this module re-derives the recognized subset. */
   services: unknown;
   submittedAt?: string;
+  /**
+   * Which public surface produced this lead — lands on metadata.channel.
+   *
+   * Optional and defaulted (2026-08-16, Phase 2a), so every pre-existing
+   * caller is byte-identical: routes/intake.travel.ts and
+   * routes/public.travelRequest.ts pass nothing and still get
+   * "TRAVEL_INTAKE_FORM". The helloviza.ai visa lead passes its own value so
+   * ops can tell a consumer visa enquiry from a travel-form submission
+   * without parsing intakeRef.
+   */
+  channel?: string;
 }
 
 export interface TravelIntakeResult {
@@ -137,7 +148,17 @@ function buildCommonFields(input: TravelIntakeInput) {
   const email = String(input.email ?? "").trim();
   const originCity = String(input.originCity ?? "").trim();
   const destination = String(input.destination ?? "").trim();
-  const travelDate = parseIntakeDate(input.travelDate)!;
+  // ManualBooking.travelDate is `required: true`, but a LEAD may legitimately
+  // have no intended date yet (Phase 2a — the visa lead form makes it
+  // optional). Falling back to "now" mirrors what services/visaBillingSync.ts
+  // already does for the same problem
+  // (`travelDateFrom || submittedAt || new Date()`). Callers that require a
+  // real date still validate for one BEFORE calling — public.travelRequest.ts
+  // rejects a submission without one — so this fallback only ever engages for
+  // a caller that has deliberately made the field optional, and that caller
+  // records the fact in `notes` so ops never reads the placeholder as a
+  // stated intention.
+  const travelDate = parseIntakeDate(input.travelDate) ?? new Date();
   const returnDate = parseIntakeDate(input.returnDate) || undefined;
   const purpose = String(input.purpose ?? "").trim();
   const travelerCount = Number(input.travelerCount) || undefined;
@@ -179,7 +200,9 @@ function buildCommonFields(input: TravelIntakeInput) {
     notes: notesParts.length ? notesParts.join(" | ") : undefined,
     metadata: {
       intakeRef: input.intakeRef,
-      channel: "TRAVEL_INTAKE_FORM",
+      // Defaulted, so the two pre-existing callers keep emitting exactly the
+      // value they always did. See TravelIntakeInput.channel.
+      channel: input.channel || "TRAVEL_INTAKE_FORM",
       submittedAt: input.submittedAt || undefined,
     },
   };

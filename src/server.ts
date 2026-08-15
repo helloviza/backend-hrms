@@ -341,6 +341,21 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
 app.use("/api/public", publicSupportContactRouter);
 
 /* ────────────────────────────────────────────────────────────────
+ * HELLOVIZA PUBLIC CONTRACT (Phase 2a) — the consumer map, the
+ * requirements slider, and lead capture. NO auth of any kind.
+ *
+ * Mounted here, on the /api/public prefix that is already in
+ * WORKSPACE_EXEMPT above, so neither requireAuth nor the global
+ * requireWorkspace shim ever runs on it. The two GETs read only PUBLISHED
+ * VisaRule / VisaDestinationContent — global reference data with no PII —
+ * and the POST creates the same zero-price HOUSE lead row the public
+ * travel-request form does. See routes/public.visa.ts's header and
+ * infra/design/helloviza-public-contract-2026-08-16.md.
+ * ──────────────────────────────────────────────────────────────── */
+import publicVisaRouter from "./routes/public.visa.js";
+app.use("/api/public", publicVisaRouter);
+
+/* ────────────────────────────────────────────────────────────────
  * STATIC UPLOADS
  * ──────────────────────────────────────────────────────────────── */
 const __filename = fileURLToPath(import.meta.url);

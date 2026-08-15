@@ -6,6 +6,26 @@ const ALLOWED_ORIGINS = [
   "https://plumbox.plumtrips.com",
   "https://www.plumbox.plumtrips.com",
   "https://app.plumbox.in",
+  // ── Helloviza D2C consumer web (Phase 2a, 2026-08-16) ──────────────────
+  // ⚠ THIS WIDENS CORS API-WIDE, NOT JUST FOR /api/public. corsMiddleware is
+  // mounted globally (server.ts) and there is no per-prefix policy, so a page
+  // on helloviza.ai can now issue credentialed cross-origin requests to EVERY
+  // route, including /api/admin/*.
+  //
+  // Accepted deliberately, because CORS is not the boundary here — the TOKEN
+  // WALL is (Phase 1a): a consumer token fails every B2B verifier on
+  // SIGNATURE, and a browser on helloviza.ai carries no B2B cookie at all
+  // (those are scoped to COOKIE_DOMAIN, .plumtrips.com — a different
+  // registrable domain, so they are never sent here). CORS only decides
+  // whether JS may READ a response; it has never been what stops an
+  // unauthenticated caller.
+  //
+  // Flagged rather than scoped per-prefix this phase, per the build brief.
+  // If per-prefix CORS is ever wanted, the change is in server.ts's mount,
+  // not in this list.
+  "https://helloviza.ai",
+  "https://www.helloviza.ai",
+  "https://app.helloviza.ai",
   "http://localhost:5173",
   "http://localhost:3000",
   "http://localhost:8080",

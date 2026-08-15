@@ -43,12 +43,11 @@
  */
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { travelRequestLimiter } from "../middleware/rateLimit.js";
+import { createTurnstileGate } from "../middleware/turnstile.js";
 import { createIntakeBookings, recognizedServicesOf, parseIntakeDate } from "../services/travelIntake.create.js";
 import { travelRequestLogger } from "../utils/logger.js";
 
 const router = Router();
-
-const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
 function isUuidV4(v: unknown): boolean {
   return typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
@@ -70,49 +69,11 @@ function honeypotGate(req: Request, res: Response, next: NextFunction) {
 }
 
 // ── 3. Turnstile verify ──────────────────────────────────────────────────────
-async function verifyTurnstile(req: Request, res: Response, next: NextFunction) {
-  const secret = process.env.TURNSTILE_SECRET;
-  const devBypass = process.env.TURNSTILE_DEV_BYPASS === "true" && process.env.NODE_ENV !== "production";
-
-  if (!secret) {
-    if (devBypass) {
-      travelRequestLogger.warn("travel-request — TURNSTILE_SECRET unset, TURNSTILE_DEV_BYPASS active (non-production only)");
-      return next();
-    }
-    travelRequestLogger.error("travel-request — TURNSTILE_SECRET not configured; rejecting (fail-closed)");
-    return res.status(400).json({ error: "Verification unavailable. Please try again shortly." });
-  }
-
-  const token = String((req.body as any)?.turnstileToken ?? "").trim();
-  if (!token) {
-    return res.status(400).json({ error: "Verification required." });
-  }
-
-  try {
-    const params = new URLSearchParams();
-    params.set("secret", secret);
-    params.set("response", token);
-    if (req.ip) params.set("remoteip", req.ip);
-
-    const verifyRes = await fetch(TURNSTILE_VERIFY_URL, { method: "POST", body: params });
-    const verifyBody: any = await verifyRes.json().catch(() => null);
-
-    if (!verifyRes.ok || !verifyBody?.success) {
-      travelRequestLogger.warn("travel-request — Turnstile verification failed", {
-        status: verifyRes.status,
-        errorCodes: verifyBody?.["error-codes"],
-      });
-      return res.status(400).json({ error: "Verification failed. Please try again." });
-    }
-
-    next();
-  } catch (err) {
-    travelRequestLogger.error("travel-request — Turnstile verify request errored", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return res.status(400).json({ error: "Verification unavailable. Please try again shortly." });
-  }
-}
+// EXTRACTED 2026-08-16 to middleware/turnstile.ts so /api/public/visa/lead
+// (Phase 2a) uses the SAME fail-closed gate rather than a second copy of it.
+// Behaviour here is unchanged — the extracted factory is the original body
+// verbatim, with the log label as its one parameter.
+const verifyTurnstile = createTurnstileGate("travel-request");
 
 // ── 4. Field validator ───────────────────────────────────────────────────────
 function validatePublicPayload(p: any): { errors: string[] } {
