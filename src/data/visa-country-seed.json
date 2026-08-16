@@ -1,0 +1,1215 @@
+{
+  "$schema": "helloviza-visa-country-seed/v1",
+  "nationality": "IN",
+  "source": "Ministry of External Affairs (Government of India) visa facility list, corroborated via IATA Timatic; compiled from the maintained public register.",
+  "sourceUrl": "https://www.mea.gov.in/VFFIN.htm",
+  "lastVerified": "2026-08-16",
+  "disclaimer": "Visa categories reflect the ordinary Indian passport for tourism and can change without notice. Always verify with the destination's embassy/official portal before travel.",
+  "categoryLegend": {
+    "VISA_FREE": "No visa required (green)",
+    "E_VISA": "Apply online, receive an electronic visa before travel (blue)",
+    "VOA": "Visa on arrival / ETA — obtained at the border or via lightweight online authorization (orange)",
+    "STICKER": "Embassy/VFS sticker visa — apply in advance, usually in person (red)"
+  },
+  "reviewNote": "Entries flagged reviewNeeded are conditional, dual-path, or online-but-high-difficulty and should be confirmed by ops before launch.",
+  "countryCount": 196,
+  "countries": [
+    {
+      "iso2": "AF",
+      "countryName": "Afghanistan",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "AL",
+      "countryName": "Albania",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "DZ",
+      "countryName": "Algeria",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "AD",
+      "countryName": "Andorra",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "AO",
+      "countryName": "Angola",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "AG",
+      "countryName": "Antigua and Barbuda",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "AR",
+      "countryName": "Argentina",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "AM",
+      "countryName": "Armenia",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "AU",
+      "countryName": "Australia",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "Online Visa required",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "AT",
+      "countryName": "Austria",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "AZ",
+      "countryName": "Azerbaijan",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "BS",
+      "countryName": "Bahamas",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "BH",
+      "countryName": "Bahrain",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "BD",
+      "countryName": "Bangladesh",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "BB",
+      "countryName": "Barbados",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "BY",
+      "countryName": "Belarus",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "BE",
+      "countryName": "Belgium",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "BZ",
+      "countryName": "Belize",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "BJ",
+      "countryName": "Benin",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "BT",
+      "countryName": "Bhutan",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Freedom of Movement"
+    },
+    {
+      "iso2": "BO",
+      "countryName": "Bolivia",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "Online Visa",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "BA",
+      "countryName": "Bosnia and Herzegovina",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "BW",
+      "countryName": "Botswana",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "BR",
+      "countryName": "Brazil",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "BN",
+      "countryName": "Brunei",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "BG",
+      "countryName": "Bulgaria",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "BF",
+      "countryName": "Burkina Faso",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "BI",
+      "countryName": "Burundi",
+      "visaCategory": "VOA",
+      "rawRequirement": "Online Visa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "KH",
+      "countryName": "Cambodia",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "CM",
+      "countryName": "Cameroon",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "CA",
+      "countryName": "Canada",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "CV",
+      "countryName": "Cape Verde",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "CF",
+      "countryName": "Central African Republic",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "TD",
+      "countryName": "Chad",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "CL",
+      "countryName": "Chile",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "CN",
+      "countryName": "China",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "CO",
+      "countryName": "Colombia",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "Online Visa",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "KM",
+      "countryName": "Comoros",
+      "visaCategory": "VOA",
+      "rawRequirement": "Visa on arrival"
+    },
+    {
+      "iso2": "CG",
+      "countryName": "Republic of the Congo",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "CD",
+      "countryName": "Democratic Republic of the Congo",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "CR",
+      "countryName": "Costa Rica",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "CI",
+      "countryName": "Cote d'Ivoire",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "HR",
+      "countryName": "Croatia",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "CU",
+      "countryName": "Cuba",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "CY",
+      "countryName": "Cyprus",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "CZ",
+      "countryName": "Czech Republic",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "DK",
+      "countryName": "Denmark",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "DJ",
+      "countryName": "Djibouti",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "DM",
+      "countryName": "Dominica",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "DO",
+      "countryName": "Dominican Republic",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "TL",
+      "countryName": "Timor-Leste",
+      "visaCategory": "VOA",
+      "rawRequirement": "Visa on arrival"
+    },
+    {
+      "iso2": "EC",
+      "countryName": "Ecuador",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "Online Visa",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "EG",
+      "countryName": "Egypt",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "SV",
+      "countryName": "El Salvador",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "GQ",
+      "countryName": "Equatorial Guinea",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "ER",
+      "countryName": "Eritrea",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "EE",
+      "countryName": "Estonia",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "SZ",
+      "countryName": "Eswatini",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "ET",
+      "countryName": "Ethiopia",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "FJ",
+      "countryName": "Fiji",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "FI",
+      "countryName": "Finland",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "FR",
+      "countryName": "France",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "GA",
+      "countryName": "Gabon",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "GM",
+      "countryName": "Gambia",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "GE",
+      "countryName": "Georgia",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "DE",
+      "countryName": "Germany",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "GH",
+      "countryName": "Ghana",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "GR",
+      "countryName": "Greece",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "GD",
+      "countryName": "Grenada",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "GT",
+      "countryName": "Guatemala",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "GN",
+      "countryName": "Guinea",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "GW",
+      "countryName": "Guinea-Bissau",
+      "visaCategory": "VOA",
+      "rawRequirement": "Visa on arrival"
+    },
+    {
+      "iso2": "GY",
+      "countryName": "Guyana",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "HT",
+      "countryName": "Haiti",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "HN",
+      "countryName": "Honduras",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "HU",
+      "countryName": "Hungary",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "IS",
+      "countryName": "Iceland",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "ID",
+      "countryName": "Indonesia",
+      "visaCategory": "VOA",
+      "rawRequirement": "e-VOA / Visa on Arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "IR",
+      "countryName": "Iran",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "IQ",
+      "countryName": "Iraq",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "IE",
+      "countryName": "Ireland",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "IL",
+      "countryName": "Israel",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "IT",
+      "countryName": "Italy",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "JM",
+      "countryName": "Jamaica",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "JP",
+      "countryName": "Japan",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "JO",
+      "countryName": "Jordan",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "KZ",
+      "countryName": "Kazakhstan",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "KE",
+      "countryName": "Kenya",
+      "visaCategory": "VOA",
+      "rawRequirement": "Electronic Travel Authorisation"
+    },
+    {
+      "iso2": "KI",
+      "countryName": "Kiribati",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "KP",
+      "countryName": "North Korea",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "KR",
+      "countryName": "South Korea",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "KW",
+      "countryName": "Kuwait",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "KG",
+      "countryName": "Kyrgyzstan",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "LA",
+      "countryName": "Laos",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "LV",
+      "countryName": "Latvia",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "LB",
+      "countryName": "Lebanon",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "LS",
+      "countryName": "Lesotho",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "LR",
+      "countryName": "Liberia",
+      "visaCategory": "VOA",
+      "rawRequirement": "e-VOA"
+    },
+    {
+      "iso2": "LY",
+      "countryName": "Libya",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "LI",
+      "countryName": "Liechtenstein",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "LT",
+      "countryName": "Lithuania",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "LU",
+      "countryName": "Luxembourg",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "MG",
+      "countryName": "Madagascar",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "MW",
+      "countryName": "Malawi",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "MY",
+      "countryName": "Malaysia",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "MV",
+      "countryName": "Maldives",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "ML",
+      "countryName": "Mali",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "MT",
+      "countryName": "Malta",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "MH",
+      "countryName": "Marshall Islands",
+      "visaCategory": "VOA",
+      "rawRequirement": "Visa on arrival"
+    },
+    {
+      "iso2": "MR",
+      "countryName": "Mauritania",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "MU",
+      "countryName": "Mauritius",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "MX",
+      "countryName": "Mexico",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "FM",
+      "countryName": "Micronesia",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "MD",
+      "countryName": "Moldova",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "MC",
+      "countryName": "Monaco",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "MN",
+      "countryName": "Mongolia",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "ME",
+      "countryName": "Montenegro",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "MA",
+      "countryName": "Morocco",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "MZ",
+      "countryName": "Mozambique",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "MM",
+      "countryName": "Myanmar",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "NA",
+      "countryName": "Namibia",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "NR",
+      "countryName": "Nauru",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "NP",
+      "countryName": "Nepal",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Freedom of Movement"
+    },
+    {
+      "iso2": "NL",
+      "countryName": "Netherlands",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "NZ",
+      "countryName": "New Zealand",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "NI",
+      "countryName": "Nicaragua",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "NE",
+      "countryName": "Niger",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "NG",
+      "countryName": "Nigeria",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "MK",
+      "countryName": "North Macedonia",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "NO",
+      "countryName": "Norway",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "OM",
+      "countryName": "Oman",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "PK",
+      "countryName": "Pakistan",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Admission restricted",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "PW",
+      "countryName": "Palau",
+      "visaCategory": "VOA",
+      "rawRequirement": "Free Visa on arrival"
+    },
+    {
+      "iso2": "PA",
+      "countryName": "Panama",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "PG",
+      "countryName": "Papua New Guinea",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "PY",
+      "countryName": "Paraguay",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "PE",
+      "countryName": "Peru",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "PH",
+      "countryName": "Philippines",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required / eVisa",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "PL",
+      "countryName": "Poland",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "PT",
+      "countryName": "Portugal",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "QA",
+      "countryName": "Qatar",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "RO",
+      "countryName": "Romania",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "RU",
+      "countryName": "Russia",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "RW",
+      "countryName": "Rwanda",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "KN",
+      "countryName": "Saint Kitts and Nevis",
+      "visaCategory": "VOA",
+      "rawRequirement": "Electronic Travel Authorisation"
+    },
+    {
+      "iso2": "LC",
+      "countryName": "Saint Lucia",
+      "visaCategory": "VOA",
+      "rawRequirement": "Visa on arrival"
+    },
+    {
+      "iso2": "VC",
+      "countryName": "Saint Vincent and the Grenadines",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "WS",
+      "countryName": "Samoa",
+      "visaCategory": "VOA",
+      "rawRequirement": "Entry permit on arrival"
+    },
+    {
+      "iso2": "SM",
+      "countryName": "San Marino",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "ST",
+      "countryName": "Sao Tome and Principe",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "SA",
+      "countryName": "Saudi Arabia",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "SN",
+      "countryName": "Senegal",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "RS",
+      "countryName": "Serbia",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "SC",
+      "countryName": "Seychelles",
+      "visaCategory": "VOA",
+      "rawRequirement": "Electronic Border System"
+    },
+    {
+      "iso2": "SL",
+      "countryName": "Sierra Leone",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "SG",
+      "countryName": "Singapore",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "SK",
+      "countryName": "Slovakia",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "SI",
+      "countryName": "Slovenia",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "SB",
+      "countryName": "Solomon Islands",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "SO",
+      "countryName": "Somalia",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "ZA",
+      "countryName": "South Africa",
+      "visaCategory": "VOA",
+      "rawRequirement": "Electronic Travel Authorisation"
+    },
+    {
+      "iso2": "SS",
+      "countryName": "South Sudan",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "ES",
+      "countryName": "Spain",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "LK",
+      "countryName": "Sri Lanka",
+      "visaCategory": "VOA",
+      "rawRequirement": "Free ETA / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "SD",
+      "countryName": "Sudan",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "SR",
+      "countryName": "Suriname",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "SE",
+      "countryName": "Sweden",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "CH",
+      "countryName": "Switzerland",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "SY",
+      "countryName": "Syria",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "TJ",
+      "countryName": "Tajikistan",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "TZ",
+      "countryName": "Tanzania",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "TH",
+      "countryName": "Thailand",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "TG",
+      "countryName": "Togo",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "TO",
+      "countryName": "Tonga",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "TT",
+      "countryName": "Trinidad and Tobago",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "TN",
+      "countryName": "Tunisia",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required (conditional)",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "TR",
+      "countryName": "Turkey",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "TM",
+      "countryName": "Turkmenistan",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "TV",
+      "countryName": "Tuvalu",
+      "visaCategory": "VOA",
+      "rawRequirement": "Visa on arrival"
+    },
+    {
+      "iso2": "UG",
+      "countryName": "Uganda",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "UA",
+      "countryName": "Ukraine",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "AE",
+      "countryName": "United Arab Emirates",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "GB",
+      "countryName": "United Kingdom",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "US",
+      "countryName": "United States",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "UY",
+      "countryName": "Uruguay",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "UZ",
+      "countryName": "Uzbekistan",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "VU",
+      "countryName": "Vanuatu",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "VA",
+      "countryName": "Vatican City",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "VE",
+      "countryName": "Venezuela",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "VN",
+      "countryName": "Vietnam",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "YE",
+      "countryName": "Yemen",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    },
+    {
+      "iso2": "ZM",
+      "countryName": "Zambia",
+      "visaCategory": "E_VISA",
+      "rawRequirement": "eVisa"
+    },
+    {
+      "iso2": "ZW",
+      "countryName": "Zimbabwe",
+      "visaCategory": "VOA",
+      "rawRequirement": "eVisa / Visa on arrival",
+      "reviewNeeded": true
+    },
+    {
+      "iso2": "HK",
+      "countryName": "Hong Kong",
+      "visaCategory": "VOA",
+      "rawRequirement": "Electronic Travel Authorization"
+    },
+    {
+      "iso2": "MO",
+      "countryName": "Macau",
+      "visaCategory": "VISA_FREE",
+      "rawRequirement": "Visa not required"
+    },
+    {
+      "iso2": "TW",
+      "countryName": "Taiwan",
+      "visaCategory": "STICKER",
+      "rawRequirement": "Visa required"
+    }
+  ]
+}

@@ -24,6 +24,12 @@ const { default: VisaDestinationContent } = await import("../models/VisaDestinat
 const { default: ManualBooking } = await import("../models/ManualBooking.js");
 const { default: publicVisaRouter } = await import("./public.visa.js");
 const { travelRequestLimiter } = await import("../middleware/rateLimit.js");
+const { listSeedCountries } = await import("../config/visaCountrySeed.js");
+const { DIFFICULTY_BANDS, SOURCED_APPROVAL } = await import("../utils/visaDifficulty.js");
+
+/** The real shipped seed — these tests read it, never a fixture copy. */
+const SEED = listSeedCountries();
+const seedCategory = (iso2: string) => SEED.find((c) => c.iso2 === iso2)?.visaCategory;
 
 // travelRequestLimiter is a REAL, shared, module-level limiter (15 min / 8 per
 // IP) — deliberately reused rather than stubbed, so these tests exercise the
@@ -46,6 +52,12 @@ function app() {
   a.use(express.json());
   a.use("/api/public", publicVisaRouter);
   return a;
+}
+
+/** One country off the live map payload. */
+async function find(iso2: string) {
+  const res = await request(app()).get("/api/public/visa/map");
+  return res.body.destinations.find((d: any) => d.iso2 === iso2);
 }
 
 beforeAll(async () => {
@@ -148,66 +160,199 @@ describe("no auth of any kind", () => {
 });
 
 /* ═════════════════════════════════════════════════════════════════════
- * GET /visa/map
+ * GET /visa/map — Phase 2c: ALL ~196 countries, decoupled from what we serve.
+ *
+ * The map states where an Indian passport can go. `VisaRule` no longer decides
+ * who appears or what colour they are — only `serviced`, which branches the
+ * CTA. Every assertion below exists to hold that line.
  * ═══════════════════════════════════════════════════════════════════ */
-describe("GET /visa/map", () => {
-  it("returns one entry per destination with the legend counts", async () => {
-    await makeRule();
-    await makeRule({ destinationIso2: "ZW", destinationName: "Zimbabwe", visaCategory: "STICKER" });
-
+describe("GET /visa/map — every country, not just the served ones", () => {
+  it("returns all 196 seed countries even with NOTHING published", async () => {
     const res = await request(app()).get("/api/public/visa/map");
 
     expect(res.body.ok).toBe(true);
     expect(res.body.nationality).toBe("IN");
-    expect(res.body.destinations).toHaveLength(2);
-    expect(res.body.stats.total).toBe(2);
-    expect(res.body.stats.byCategory.E_VISA).toBe(1);
-    expect(res.body.stats.byCategory.STICKER).toBe(1);
-    expect(res.body.stats.byCategory.VISA_FREE).toBe(0);
+    expect(res.body.destinations).toHaveLength(SEED.length);
+    expect(res.body.destinations).toHaveLength(196);
+    expect(res.body.stats.total).toBe(196);
+    // Not one rule exists in this test, and the map is still complete.
+    expect(res.body.stats.serviced).toBe(0);
+    expect(res.body.stats.unserviced).toBe(196);
+  });
+
+  it("carries every seed iso2 exactly once", async () => {
+    await makeRule();
+    const iso2s = (await request(app()).get("/api/public/visa/map")).body.destinations.map(
+      (d: any) => d.iso2,
+    );
+    expect(new Set(iso2s).size).toBe(iso2s.length);
+    expect(iso2s.sort()).toEqual(SEED.map((c) => c.iso2).sort());
+  });
+
+  it("takes visaType from the SEED, not from the published rule", async () => {
+    // The rule says Thailand is E_VISA. The seed says an Indian passport
+    // enters Thailand visa-free. The map states the passport fact.
+    await makeRule({ visaCategory: "E_VISA" });
+    const th = await find("TH");
+
+    expect(seedCategory("TH")).toBe("VISA_FREE");
+    expect(th.visaType).toBe("VISA_FREE");
+    expect(th.visaCategory).toBe("VISA_FREE"); // 2a alias, same value
+    expect(th.serviced).toBe(true); // still served — display is decoupled
+  });
+
+  it("keeps the 2a aliases so Phase 2b's components need no change", async () => {
+    await makeRule();
+    const th = await find("TH");
+    expect(th.destinationName).toBe(th.countryName);
+    expect(th.visaCategory).toBe(th.visaType);
+  });
+
+  /* ── serviced: the ONLY thing a published rule decides ── */
+
+  it("marks serviced true ONLY where a published rule exists", async () => {
+    await makeRule(); // TH
+    const res = await request(app()).get("/api/public/visa/map");
+
+    const serviced = res.body.destinations.filter((d: any) => d.serviced);
+    expect(serviced.map((d: any) => d.iso2)).toEqual(["TH"]);
+    expect(res.body.stats.serviced).toBe(1);
+    expect(res.body.stats.unserviced).toBe(195);
+  });
+
+  it("does NOT count DRAFT or RETIRED rules as serviced", async () => {
+    await makeRule({ status: "DRAFT", destinationIso2: "DE", destinationName: "Germany" });
+    await makeRule({ status: "RETIRED", destinationIso2: "FR", destinationName: "France" });
+    await makeRule(); // the only PUBLISHED one
+
+    const res = await request(app()).get("/api/public/visa/map");
+    expect(res.body.destinations.filter((d: any) => d.serviced).map((d: any) => d.iso2)).toEqual(["TH"]);
+    // …and Germany and France are still ON the map, just unserviced.
+    expect((await find("DE")).serviced).toBe(false);
+    expect((await find("FR")).serviced).toBe(false);
   });
 
   it("collapses several rules for one destination into a single pin", async () => {
     await makeRule();
     await makeRule({ purpose: "BUSINESS", entryType: "MULTIPLE" });
     const res = await request(app()).get("/api/public/visa/map");
-    expect(res.body.destinations).toHaveLength(1);
+    expect(res.body.destinations.filter((d: any) => d.iso2 === "TH")).toHaveLength(1);
   });
 
-  it("EXCLUDES unpublished rules", async () => {
-    await makeRule({ status: "DRAFT", destinationIso2: "DE", destinationName: "Germany" });
-    await makeRule({ status: "RETIRED", destinationIso2: "FR", destinationName: "France" });
-    await makeRule(); // the only PUBLISHED one
-
-    const res = await request(app()).get("/api/public/visa/map");
-    const iso2s = res.body.destinations.map((d: any) => d.iso2);
-    expect(iso2s).toEqual(["TH"]);
-  });
-
-  it("resolves a disagreeing destination to the most permissive category and flags it", async () => {
+  it("flags a corridor whose published rules disagree, and never flags an unserved one", async () => {
     await makeRule({ visaCategory: "STICKER" });
     await makeRule({ purpose: "BUSINESS", visaCategory: "VISA_FREE" });
 
-    const res = await request(app()).get("/api/public/visa/map");
-    const th = res.body.destinations.find((d: any) => d.iso2 === "TH");
-    expect(th.visaCategory).toBe("VISA_FREE");
-    expect(th.categoryIsMixed).toBe(true);
+    expect((await find("TH")).categoryIsMixed).toBe(true);
+    // Nothing published for Zimbabwe — it cannot be "mixed".
+    expect((await find("ZW")).categoryIsMixed).toBe(false);
   });
 
   it("marks a single-category destination as not mixed", async () => {
     await makeRule();
-    const th = (await request(app()).get("/api/public/visa/map")).body.destinations[0];
-    expect(th.categoryIsMixed).toBe(false);
+    expect((await find("TH")).categoryIsMixed).toBe(false);
   });
 
-  it("leaks NOTHING beyond the four documented keys", async () => {
+  /* ── the four tooltip fields, for every country ── */
+
+  it("resolves all four tooltip fields for all 196 — no nulls, no dashes", async () => {
+    const res = await request(app()).get("/api/public/visa/map");
+    for (const d of res.body.destinations) {
+      for (const field of ["countryName", "visaType", "difficulty", "approvalChances"]) {
+        expect(d[field], `${d.iso2}.${field}`).toBeTruthy();
+        expect(typeof d[field], `${d.iso2}.${field}`).toBe("string");
+        expect(d[field], `${d.iso2}.${field}`).not.toBe("—");
+      }
+      expect(DIFFICULTY_BANDS, d.iso2).toContain(d.difficulty);
+    }
+  });
+
+  it("bands difficulty correctly, including the escalated set", async () => {
+    const res = await request(app()).get("/api/public/visa/map");
+    const band = (iso2: string) =>
+      res.body.destinations.find((d: any) => d.iso2 === iso2).difficulty;
+
+    expect(band("US")).toBe("Very Hard");
+    expect(band("CN")).toBe("Very Hard");
+    expect(band("GB")).toBe("Hard");
+    expect(band("FR")).toBe("Hard"); // Schengen
+    expect(band("DE")).toBe("Hard"); // Schengen
+    expect(band("TH")).toBe("Easy"); // VISA_FREE
+    expect(band("VN")).toBe("Moderate"); // E_VISA
+  });
+
+  it("never states a difficulty as a percentage", async () => {
+    const res = await request(app()).get("/api/public/visa/map");
+    for (const d of res.body.destinations) {
+      expect(d.difficulty).not.toMatch(/\d|%/);
+    }
+  });
+
+  it("carries a numeric approval rate ONLY for SOURCED_APPROVAL members", async () => {
+    const res = await request(app()).get("/api/public/visa/map");
+    const sourced = new Set(Object.keys(SOURCED_APPROVAL));
+
+    for (const d of res.body.destinations) {
+      if (sourced.has(d.iso2)) {
+        expect(d.approvalChances, d.iso2).toMatch(/%/);
+      } else {
+        // The whole honesty guarantee, asserted 165 times.
+        expect(d.approvalChances, d.iso2).not.toMatch(/\d/);
+        expect(["Not required", "Very High", "Varies by profile"]).toContain(d.approvalChances);
+      }
+    }
+  });
+
+  it("uses the three sourced figures verbatim and spreads them nowhere else", async () => {
+    const res = await request(app()).get("/api/public/visa/map");
+    const chance = (iso2: string) =>
+      res.body.destinations.find((d: any) => d.iso2 === iso2).approvalChances;
+
+    expect(chance("US")).toBe("~78% (India, FY25)");
+    expect(chance("GB")).toBe("~93% (India)");
+    expect(chance("FR")).toBe("~85% (India, 2024)");
+    // A sticker country with no sourced rate says so.
+    expect(chance("CN")).toBe("Varies by profile");
+    expect(chance("AE")).toBe("Varies by profile");
+  });
+
+  /* ── provenance, legend, leak whitelist ── */
+
+  it("surfaces the seed's source, lastVerified and disclaimer", async () => {
+    const res = await request(app()).get("/api/public/visa/map");
+    expect(res.body.source).toBeTruthy();
+    expect(res.body.sourceUrl).toMatch(/^https?:\/\//);
+    expect(res.body.lastVerified).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(res.body.disclaimer).toMatch(/verify/i);
+  });
+
+  it("keeps the per-category counts, still summing to the whole map", async () => {
+    const res = await request(app()).get("/api/public/visa/map");
+    const by = res.body.stats.byCategory;
+
+    expect(by.VISA_FREE).toBe(26);
+    expect(by.VOA).toBe(28);
+    expect(by.E_VISA).toBe(52);
+    expect(by.STICKER).toBe(90);
+    expect(by.STAMP).toBe(0); // shape kept for the frontend Legend
+    const sum = Object.values(by).reduce((a: any, b: any) => a + b, 0);
+    expect(sum).toBe(196);
+  });
+
+  it("leaks NOTHING beyond the documented keys", async () => {
     await makeRule();
     const res = await request(app()).get("/api/public/visa/map");
     for (const d of res.body.destinations) {
       expect(Object.keys(d).sort()).toEqual([
+        "approvalChances",
         "categoryIsMixed",
+        "countryName",
         "destinationName",
+        "difficulty",
         "iso2",
+        "serviced",
         "visaCategory",
+        "visaType",
       ]);
     }
     // No fee of any kind anywhere in the map payload.
@@ -279,14 +424,13 @@ describe("GET /visa/country/:iso2 — whitelist", () => {
     expect(raw).not.toContain("isPassport");
   });
 
-  it("404s an unpublished corridor without revealing it exists", async () => {
-    await makeRule({ status: "DRAFT", destinationIso2: "DE", destinationName: "Germany" });
-    const draft = await request(app()).get("/api/public/visa/country/DE");
-    const missing = await request(app()).get("/api/public/visa/country/ZZ");
-    expect(draft.status).toBe(404);
-    expect(missing.status).toBe(404);
-    // Indistinguishable.
-    expect(draft.body).toEqual(missing.body);
+  it("404s only a code that is in neither the seed nor the catalogue", async () => {
+    // ZZ is not a country. XK (Kosovo) is not in the seed either.
+    for (const code of ["ZZ", "XK"]) {
+      const res = await request(app()).get(`/api/public/visa/country/${code}`);
+      expect(res.status, code).toBe(404);
+      expect(res.body, code).toEqual({ error: "Destination not found" });
+    }
   });
 
   it("returns heroImageUrl only from PUBLISHED destination content", async () => {
@@ -302,6 +446,187 @@ describe("GET /visa/country/:iso2 — whitelist", () => {
     await VisaDestinationContent.updateOne({ destinationIso2: "TH" }, { $set: { status: "PUBLISHED" } });
     const pubRes = await request(app()).get("/api/public/visa/country/TH");
     expect(pubRes.body.heroImageUrl).toBe("https://example.test/draft-hero.jpg");
+  });
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * GET /visa/country/:iso2 — the UNSERVICED branch (Phase 2c)
+ *
+ * A country we do not sell is still a real country. It answers 200 with the
+ * same four tooltip fields the map gave it, so the frontend can render the
+ * Request-form CTA instead of a dead end.
+ * ═══════════════════════════════════════════════════════════════════ */
+describe("GET /visa/country/:iso2 — unserviced", () => {
+  it("answers 200 with the lightweight payload, not 404", async () => {
+    const res = await request(app()).get("/api/public/visa/country/DE");
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.iso2).toBe("DE");
+    expect(res.body.countryName).toBe("Germany");
+    expect(res.body.serviced).toBe(false);
+    expect(res.body.visaType).toBe(seedCategory("DE"));
+    expect(res.body.difficulty).toBe("Hard");
+    expect(res.body.approvalChances).toBe("~85% (India, 2024)");
+  });
+
+  it("treats a DRAFT-only corridor as unserviced", async () => {
+    await makeRule({ status: "DRAFT", destinationIso2: "DE", destinationName: "Germany" });
+    const res = await request(app()).get("/api/public/visa/country/DE");
+    expect(res.status).toBe(200);
+    expect(res.body.serviced).toBe(false);
+  });
+
+  it("carries lastVerified and the verify-before-travel disclaimer", async () => {
+    const res = await request(app()).get("/api/public/visa/country/DE");
+    expect(res.body.lastVerified).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(res.body.disclaimer).toMatch(/verify/i);
+  });
+
+  it("omits documents, groups and price entirely — there is no rule behind it", async () => {
+    const res = await request(app()).get("/api/public/visa/country/DE");
+    for (const key of ["documents", "documentGroups", "price", "isCurated", "purpose"]) {
+      expect(key in res.body, key).toBe(false);
+    }
+  });
+
+  it("exposes exactly the documented keys", async () => {
+    const res = await request(app()).get("/api/public/visa/country/DE");
+    expect(Object.keys(res.body).sort()).toEqual([
+      "approvalChances",
+      "countryName",
+      "destinationName",
+      "difficulty",
+      "disclaimer",
+      "iso2",
+      "lastVerified",
+      "ok",
+      "serviced",
+      "visaCategory",
+      "visaType",
+    ]);
+  });
+
+  it("is reachable with NO token and NO cookie", async () => {
+    const res = await request(app()).get("/api/public/visa/country/DE");
+    expect(res.status).toBe(200);
+    expect(res.request.getHeader("Authorization")).toBeUndefined();
+    expect(res.request.getHeader("Cookie")).toBeUndefined();
+  });
+
+  /* ── the 77-country resolver gap (design note §3) ── */
+
+  it("resolves countries that countryCodes.ts has never heard of", async () => {
+    // SR, MG and GT are in the seed and NOT in countryCodes.ts. Before the
+    // seed-first resolver these 404'd — the 5-pin defect Phase 2b reported,
+    // which the all-country map would have widened to 77.
+    for (const iso2 of ["SR", "MG", "GT"]) {
+      const res = await request(app()).get(`/api/public/visa/country/${iso2}`);
+      expect(res.status, iso2).toBe(200);
+      expect(res.body.iso2, iso2).toBe(iso2);
+      expect(res.body.countryName, iso2).toBeTruthy();
+    }
+  });
+
+  it("fixes the five map pins Phase 2b diagnosed as 404s", async () => {
+    for (const iso2 of ["BY", "BJ", "DO", "GA", "MG"]) {
+      const res = await request(app()).get(`/api/public/visa/country/${iso2}`);
+      expect(res.status, iso2).toBe(200);
+    }
+  });
+
+  it("still resolves a name or alpha-3 through the countryCodes fallback", async () => {
+    await makeRule();
+    const byName = await request(app()).get("/api/public/visa/country/Thailand");
+    const byAlpha3 = await request(app()).get("/api/public/visa/country/THA");
+    expect(byName.body.iso2).toBe("TH");
+    expect(byAlpha3.body.iso2).toBe("TH");
+  });
+
+  it("every seed country answers 200 — no pin on the map is a dead end", async () => {
+    // The honesty guard, proven exhaustively rather than by sampling.
+    const results = await Promise.all(
+      SEED.map(async (c) => ({
+        iso2: c.iso2,
+        status: (await request(app()).get(`/api/public/visa/country/${c.iso2}`)).status,
+      })),
+    );
+    expect(results.filter((r) => r.status !== 200)).toEqual([]);
+  });
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * The SERVICED payload keeps 2a intact and gains the tooltip fields
+ * ═══════════════════════════════════════════════════════════════════ */
+describe("GET /visa/country/:iso2 — serviced", () => {
+  it("adds the four tooltip fields without disturbing the 2a payload", async () => {
+    await makeRule(); // TH, PUBLISHED, E_VISA
+    const res = await request(app()).get("/api/public/visa/country/TH");
+
+    expect(res.body.serviced).toBe(true);
+    expect(res.body.countryName).toBe("Thailand");
+    expect(res.body.difficulty).toBe("Easy");
+    expect(res.body.approvalChances).toBe("Not required");
+    expect(res.body.lastVerified).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(res.body.disclaimer).toMatch(/verify/i);
+
+    // 2a keys, untouched.
+    expect(res.body.destinationName).toBe("Thailand");
+    expect(res.body.purpose).toBe("TOURIST");
+    expect(res.body.documents.length).toBeGreaterThan(0);
+  });
+
+  it("keeps visaCategory RULE-derived while visaType is SEED-derived", async () => {
+    // The one deliberate divergence, pinned so it cannot drift unnoticed:
+    // the rule says E_VISA (what we will process), the seed says VISA_FREE
+    // (what the passport faces). Design note §6/§8.
+    await makeRule({ visaCategory: "E_VISA" });
+    const res = await request(app()).get("/api/public/visa/country/TH");
+
+    expect(res.body.visaCategory).toBe("E_VISA");
+    expect(res.body.visaType).toBe("VISA_FREE");
+  });
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * DEPLOY SAFETY — the seed is read, never imported
+ * ═══════════════════════════════════════════════════════════════════ */
+describe("seed loading", () => {
+  it("loads via readFileSync from ../data, never a JSON import", async () => {
+    // `tsc` does not copy .json; the file reaches dist/ only via the build's
+    // `cp -r src/data dist/`. A JSON import would resolve at build time and
+    // 404 in production while working locally. See the design note §1.
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(
+      new URL("../config/visaCountrySeed.ts", import.meta.url),
+      "utf-8",
+    );
+
+    expect(src).toContain("readFileSync");
+    expect(src).toContain('path.join(__dirname, "../data/visa-country-seed.json")');
+
+    // Comments are stripped first: the module's header deliberately QUOTES the
+    // forbidden import to explain why it is forbidden, and that explanation
+    // must not be what this test trips over.
+    const code = src
+      .split("\n")
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join("\n");
+
+    expect(code).not.toMatch(/import\s+.*visa-country-seed\.json/);
+    expect(code).not.toMatch(/(with|assert)\s*\{\s*type:\s*["']json["']\s*\}/);
+  });
+
+  it("validated all 196 entries at startup", async () => {
+    const { isSeedReady, getSeedMeta } = await import("../config/visaCountrySeed.js");
+    expect(isSeedReady()).toBe(true);
+    expect(SEED).toHaveLength(196);
+    expect(getSeedMeta().nationality).toBe("IN");
+    for (const c of SEED) {
+      expect(c.iso2, c.iso2).toMatch(/^[A-Z]{2}$/);
+      expect(c.countryName, c.iso2).toBeTruthy();
+      expect(["VISA_FREE", "E_VISA", "VOA", "STICKER"], c.iso2).toContain(c.visaCategory);
+    }
   });
 });
 

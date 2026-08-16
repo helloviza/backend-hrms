@@ -12,11 +12,12 @@
 // NOTHING that requires a session may ever be added here.
 //
 // ── WHAT MAKES THIS SAFE ──────────────────────────────────────────────
-// The two GETs read exactly ONE collection each, both of them global
-// reference data with no PII whatsoever:
+// The two GETs read global reference data only — no PII whatsoever:
 //   · VisaRule                — the corridor catalogue. No traveller, no
 //                               workspace, no user. Filtered to PUBLISHED.
 //   · VisaDestinationContent  — editorial copy/imagery. Filtered to PUBLISHED.
+//   · visa-country-seed.json  — a STATIC file (config/visaCountrySeed.ts).
+//                               196 countries, no database, no caller input.
 // Neither handler touches VisaRequest, VisaApplication, TravellerProfile,
 // User, Consumer, ManualBooking or CustomerWorkspace. There is no id a caller
 // can supply that reaches a case.
@@ -37,6 +38,15 @@ import VisaDestinationContent from "../models/VisaDestinationContent.js";
 import { hydrateVisaChecklist } from "../utils/visaChecklistHydration.js";
 import { computeVisaFeeBlock, VISA_FEE_DISCLAIMER } from "../utils/visaFee.js";
 import { isCuratedCorridor } from "../config/visaFeaturedRanking.js";
+import {
+  findSeedCountry,
+  getSeedMeta,
+  isSeedReady,
+  listSeedCountries,
+  seedFailureReason,
+  type SeedVisaCategory,
+} from "../config/visaCountrySeed.js";
+import { approvalChancesFor, difficultyFor } from "../utils/visaDifficulty.js";
 import { normaliseToIso2 } from "../utils/countryCodes.js";
 import { createTurnstileGate } from "../middleware/turnstile.js";
 import { travelRequestLimiter } from "../middleware/rateLimit.js";
@@ -81,13 +91,40 @@ function mostPermissiveCategory(categories: Set<VisaCategory>): VisaCategory | n
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * GET /visa/map — every PUBLISHED corridor, for map colouring.
+ * THE SEED IS THE DISPLAY AUTHORITY; VisaRule ONLY BRANCHES THE CTA.
  *
- * No fees. No checklist. No ops fields. The .select() below is the whole
- * projection — three fields — so there is nothing else in memory to leak.
+ * The map answers "where can an Indian passport go?", which is a fact about
+ * the world, not about our catalogue. So all 196 countries are drawn from
+ * visa-country-seed.json, and a PUBLISHED VisaRule for IN -> iso2 sets nothing
+ * but `serviced`, which decides Apply vs Request. Nothing about a country's
+ * appearance depends on whether we sell it.
+ *
+ * That means `visaCategory` on THIS endpoint is now the seed's category, not
+ * the rule-derived one it was in Phase 2a. Where the two disagree for one of
+ * the 84 served corridors, the seed wins here. (The country endpoint keeps
+ * rule-derived semantics — see its own note.)
  * ───────────────────────────────────────────────────────────────────── */
+
+/**
+ * The rubric only knows the seed's four categories; VisaRule has five.
+ * STAMP collapses into STICKER — the same thing to a traveller (you go to a
+ * consulate and they put something in your passport), which is exactly how the
+ * frontend legend already buckets it (map/categories.ts LEGEND_MEMBERS).
+ * Only reachable via the fallback below, since no seed entry is STAMP.
+ */
+function rubricCategory(category: VisaCategory): SeedVisaCategory {
+  return category === "STAMP" ? "STICKER" : (category as SeedVisaCategory);
+}
+
 router.get("/visa/map", async (_req: any, res: any) => {
   try {
+    if (!isSeedReady()) {
+      publicVisaLogger.error("map read refused — country seed unavailable", {
+        reason: seedFailureReason(),
+      });
+      return res.status(503).json({ error: "Country data is unavailable" });
+    }
+
     const rules = await VisaRule.find({
       status: "PUBLISHED",
       nationality: PUBLIC_NATIONALITY,
@@ -106,29 +143,76 @@ router.get("/visa/map", async (_req: any, res: any) => {
       if (r.visaCategory) entry.categories.add(r.visaCategory);
     }
 
-    const destinations = [...byIso2.entries()]
-      .map(([iso2, entry]) => ({
+    const meta = getSeedMeta();
+
+    const destinations = listSeedCountries().map((c) => {
+      const served = byIso2.get(c.iso2);
+      return {
+        iso2: c.iso2,
+        countryName: c.countryName,
+        // 2a alias, kept ONLY so Phase 2b's WorldMap/HoverCard/Legend keep
+        // working without a frontend change. Same value as countryName.
+        destinationName: c.countryName,
+        visaType: c.visaCategory,
+        visaCategory: c.visaCategory, // 2a alias, same value as visaType
+        // Rule-derived and still meaningful: this corridor publishes more than
+        // one visa type. Necessarily false where we publish nothing.
+        categoryIsMixed: served ? served.categories.size > 1 : false,
+        difficulty: difficultyFor(c.iso2, c.visaCategory),
+        approvalChances: approvalChancesFor(c.iso2, c.visaCategory),
+        serviced: Boolean(served),
+      };
+    });
+
+    /* A corridor we PUBLISH but the seed does not list would otherwise vanish
+     * from the map — silently dropping a country we actually sell. The seed
+     * covers all 196 today so this is empty, but "empty today" is not a
+     * guarantee, and losing a live corridor must never be the quiet outcome.
+     * Such a corridor is appended from its own rule and logged. */
+    for (const [iso2, entry] of byIso2) {
+      if (findSeedCountry(iso2)) continue;
+      const category = rubricCategory(mostPermissiveCategory(entry.categories) ?? "STICKER");
+      publicVisaLogger.warn("published corridor missing from the country seed", { iso2 });
+      destinations.push({
         iso2,
+        countryName: entry.destinationName,
         destinationName: entry.destinationName,
-        visaCategory: mostPermissiveCategory(entry.categories),
+        visaType: category,
+        visaCategory: category,
         categoryIsMixed: entry.categories.size > 1,
-      }))
-      .sort((a, b) => a.destinationName.localeCompare(b.destinationName));
+        difficulty: difficultyFor(iso2, category),
+        approvalChances: approvalChancesFor(iso2, category),
+        serviced: true,
+      });
+    }
+
+    destinations.sort((a, b) => a.countryName.localeCompare(b.countryName));
 
     // Legend counts, computed from the SAME resolved per-destination category
     // the pins use — so the legend can never disagree with the map it labels.
+    // STAMP is still emitted (as 0) so the frontend Legend's shape is unchanged.
     const byCategory: Record<string, number> = {};
     for (const c of CATEGORY_PRECEDENCE) byCategory[c] = 0;
     for (const d of destinations) {
       if (d.visaCategory) byCategory[d.visaCategory] += 1;
     }
+    const servicedCount = destinations.filter((d) => d.serviced).length;
 
     res.json({
       ok: true,
       nationality: PUBLIC_NATIONALITY,
       generatedAt: new Date().toISOString(),
+      source: meta.source,
+      sourceUrl: meta.sourceUrl,
+      lastVerified: meta.lastVerified,
+      disclaimer: meta.disclaimer,
       destinations,
-      stats: { total: destinations.length, byCategory },
+      stats: {
+        total: destinations.length,
+        byCategory,
+        serviced: servicedCount,
+        unserviced: destinations.length - servicedCount,
+      },
     });
   } catch (err: any) {
     publicVisaLogger.error("map read failed", { error: err?.message });
@@ -209,12 +293,43 @@ function buildPublicPrice(rule: any, iso2: string) {
   };
 }
 
+/**
+ * THE SEED RESOLVES FIRST, `normaliseToIso2` SECOND.
+ *
+ * ⚠ This ordering is load-bearing. `utils/countryCodes.ts` carries 120 iso2
+ * entries; the seed carries 196. Resolving through `normaliseToIso2` alone
+ * would 404 SEVENTY-SEVEN of the countries the map now draws — turning the
+ * five-pin defect Phase 2b diagnosed (BY BJ DO GA MG, see
+ * helloviza-public-map-2026-08-16.md §0(b)) into a 77-pin one.
+ *
+ * `countryCodes.ts` is deliberately NOT widened here: it also drives MRZ
+ * parsing and the authenticated B2B visa module, so adding 77 rows to it is
+ * the backend owner's call, not a consumer phase's — Phase 2b's reasoning,
+ * still correct. The fallback is kept so name and alpha-3 input ("Thailand",
+ * "THA") still resolve.
+ */
+function resolvePublicIso2(input: unknown): string | null {
+  const raw = String(input ?? "").trim().toUpperCase();
+  if (findSeedCountry(raw)) return raw;
+  return normaliseToIso2(String(input ?? ""));
+}
+
 router.get("/visa/country/:iso2", async (req: any, res: any) => {
   try {
-    const iso2 = normaliseToIso2(String(req.params.iso2 || ""));
+    if (!isSeedReady()) {
+      publicVisaLogger.error("country read refused — country seed unavailable", {
+        reason: seedFailureReason(),
+      });
+      return res.status(503).json({ error: "Country data is unavailable" });
+    }
+
+    const iso2 = resolvePublicIso2(req.params.iso2);
     if (!iso2) {
       return res.status(404).json({ error: "Destination not found" });
     }
+
+    const seedCountry = findSeedCountry(iso2);
+    const meta = getSeedMeta();
 
     const rules = await VisaRule.find({
       status: "PUBLISHED",
@@ -223,10 +338,31 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
     }).lean();
 
     if (rules.length === 0) {
-      // Same response for "no such country" and "published nothing" — a
-      // public caller learns nothing about the shape of the unpublished
-      // catalogue.
-      return res.status(404).json({ error: "Destination not found" });
+      // A country we do not serve is still a real country. It gets the same
+      // four tooltip fields the map gave it and `serviced: false`, so the
+      // frontend renders the Request-form branch instead of a dead end.
+      //
+      // No documents, no documentGroups, no price, no isCurated — there is no
+      // rule behind this payload, and an empty documents array would read as
+      // "this visa needs no paperwork", which is a lie about the visa rather
+      // than an admission about us.
+      if (!seedCountry) {
+        // Not in the seed and not in the catalogue: genuinely unknown.
+        return res.status(404).json({ error: "Destination not found" });
+      }
+      return res.json({
+        ok: true,
+        iso2,
+        countryName: seedCountry.countryName,
+        destinationName: seedCountry.countryName, // 2a alias — CountryPanel reads this
+        visaType: seedCountry.visaCategory,
+        visaCategory: seedCountry.visaCategory,
+        difficulty: difficultyFor(iso2, seedCountry.visaCategory),
+        approvalChances: approvalChancesFor(iso2, seedCountry.visaCategory),
+        serviced: false,
+        lastVerified: meta.lastVerified,
+        disclaimer: meta.disclaimer,
+      });
     }
 
     // Prefer a tourist-facing rule, then the cheapest by D2C total so the
@@ -253,11 +389,32 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
     const { documents, documentGroups } = publicDocumentRows(rule);
     const price = buildPublicPrice(rule, iso2);
 
+    /* The tooltip fields, on the serviced branch too, so all four resolve for
+     * every country on both endpoints.
+     *
+     * ⚠ `visaType` and `visaCategory` are NOT the same thing here, and that is
+     * deliberate. `visaCategory` stays rule-derived — the frozen 2a semantics,
+     * "what we will actually process for you". `visaType` is seed-derived —
+     * "what an Indian passport faces", the same value the map pin used. They
+     * agree almost everywhere. Where they disagree, both statements are true
+     * and each is answering a different question. Reported for review in
+     * helloviza-country-datalayer-2026-08-16.md §8.
+     */
+    const tooltipCategory: SeedVisaCategory =
+      seedCountry?.visaCategory ?? rubricCategory(rule.visaCategory ?? "STICKER");
+
     const payload: Record<string, any> = {
       ok: true,
       iso2,
       destinationName: rule.destinationName,
+      countryName: seedCountry?.countryName ?? rule.destinationName,
       visaCategory: rule.visaCategory ?? null,
+      visaType: tooltipCategory,
+      difficulty: difficultyFor(iso2, tooltipCategory),
+      approvalChances: approvalChancesFor(iso2, tooltipCategory),
+      serviced: true,
+      lastVerified: meta.lastVerified,
+      disclaimer: meta.disclaimer,
       purpose: rule.purpose,
       entryType: rule.entryType,
       processingTime:
