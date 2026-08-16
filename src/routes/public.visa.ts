@@ -116,6 +116,52 @@ function rubricCategory(category: VisaCategory): SeedVisaCategory {
   return category === "STAMP" ? "STICKER" : (category as SeedVisaCategory);
 }
 
+/* ─────────────────────────────────────────────────────────────────────
+ * THE DIVERGENCE GUARD.
+ *
+ * A SERVICED corridor has two categories: the seed's (which colours the
+ * map pin and the tooltip) and the rule's (which the country panel
+ * shows). They agree almost everywhere. Where they DON'T, a consumer
+ * sees one answer on the map and a different one after they click —
+ * which looks like a bug and, worse, is one of the two being wrong.
+ *
+ * This is the only place in the process where both values are in hand,
+ * so it is where the check belongs. It REPORTS AND DOES NOT RESOLVE: the
+ * seed still wins the display, exactly as frozen in 2c. Someone has to
+ * decide which source is wrong for that corridor, and that someone is
+ * not this function.
+ *
+ * Logged once per ISO2 per process — the map endpoint is public and
+ * uncached, so warning on every request would bury the signal in its own
+ * volume within a day.
+ * ───────────────────────────────────────────────────────────────────── */
+const divergenceWarned = new Set<string>();
+
+export function findCategoryDivergence(
+  entries: Array<{ iso2: string; seedCategory: SeedVisaCategory; ruleCategory: VisaCategory | null }>,
+): Array<{ iso2: string; seedCategory: string; ruleCategory: string }> {
+  const out: Array<{ iso2: string; seedCategory: string; ruleCategory: string }> = [];
+  for (const e of entries) {
+    if (!e.ruleCategory) continue; // nothing published to disagree with
+    if (rubricCategory(e.ruleCategory) === e.seedCategory) continue;
+    out.push({ iso2: e.iso2, seedCategory: e.seedCategory, ruleCategory: e.ruleCategory });
+  }
+  return out;
+}
+
+function reportCategoryDivergence(
+  found: Array<{ iso2: string; seedCategory: string; ruleCategory: string }>,
+): void {
+  for (const d of found) {
+    if (divergenceWarned.has(d.iso2)) continue;
+    divergenceWarned.add(d.iso2);
+    publicVisaLogger.warn(
+      "visa map — seed/rule category divergence: the map pin and the country panel will disagree",
+      d,
+    );
+  }
+}
+
 router.get("/visa/map", async (_req: any, res: any) => {
   try {
     if (!isSeedReady()) {
@@ -185,6 +231,19 @@ router.get("/visa/map", async (_req: any, res: any) => {
         serviced: true,
       });
     }
+
+    // Both categories are in hand exactly here — see the guard's header.
+    reportCategoryDivergence(
+      findCategoryDivergence(
+        listSeedCountries()
+          .filter((c) => byIso2.has(c.iso2))
+          .map((c) => ({
+            iso2: c.iso2,
+            seedCategory: c.visaCategory,
+            ruleCategory: mostPermissiveCategory(byIso2.get(c.iso2)!.categories),
+          })),
+      ),
+    );
 
     destinations.sort((a, b) => a.countryName.localeCompare(b.countryName));
 

@@ -871,3 +871,50 @@ describe("rate limiting", () => {
     expect(statuses[8]).toBe(429);
   });
 });
+
+/* ═════════════════════════════════════════════════════════════════════
+ * THE DIVERGENCE GUARD (Phase 2d)
+ *
+ * A serviced corridor whose seed category disagrees with its rule-derived
+ * one shows one colour on the map and another in the panel. The guard
+ * REPORTS it; it does not resolve it — the seed still wins the display.
+ * ═══════════════════════════════════════════════════════════════════ */
+describe("seed/rule category divergence", () => {
+  it("flags a serviced corridor whose two categories disagree", async () => {
+    const { findCategoryDivergence } = await import("./public.visa.js");
+    const found = findCategoryDivergence([
+      { iso2: "TH", seedCategory: "VISA_FREE", ruleCategory: "E_VISA" },
+    ]);
+    expect(found).toEqual([{ iso2: "TH", seedCategory: "VISA_FREE", ruleCategory: "E_VISA" }]);
+  });
+
+  it("stays silent when they agree", async () => {
+    const { findCategoryDivergence } = await import("./public.visa.js");
+    expect(
+      findCategoryDivergence([{ iso2: "AE", seedCategory: "STICKER", ruleCategory: "STICKER" }]),
+    ).toEqual([]);
+  });
+
+  it("treats STAMP as STICKER — the same thing to a traveller", async () => {
+    const { findCategoryDivergence } = await import("./public.visa.js");
+    expect(
+      findCategoryDivergence([{ iso2: "AE", seedCategory: "STICKER", ruleCategory: "STAMP" }]),
+    ).toEqual([]);
+  });
+
+  it("ignores a corridor with nothing published — there is no disagreement", async () => {
+    const { findCategoryDivergence } = await import("./public.visa.js");
+    expect(
+      findCategoryDivergence([{ iso2: "US", seedCategory: "STICKER", ruleCategory: null }]),
+    ).toEqual([]);
+  });
+
+  it("does NOT change what the map serves — the seed still wins", async () => {
+    // TH: seed VISA_FREE, rule E_VISA. Divergent, and the pin is still
+    // the seed's colour.
+    await makeRule({ visaCategory: "E_VISA" });
+    const th = await find("TH");
+    expect(th.visaType).toBe("VISA_FREE");
+    expect(th.serviced).toBe(true);
+  });
+});
