@@ -39,14 +39,16 @@ import { hydrateVisaChecklist } from "../utils/visaChecklistHydration.js";
 import { computeVisaFeeBlock, VISA_FEE_DISCLAIMER } from "../utils/visaFee.js";
 import { isCuratedCorridor } from "../config/visaFeaturedRanking.js";
 import {
+  SEED_VISA_CATEGORIES,
   findSeedCountry,
   getSeedMeta,
+  getSeedRegions,
   isSeedReady,
   listSeedCountries,
   seedFailureReason,
   type SeedVisaCategory,
 } from "../config/visaCountrySeed.js";
-import { approvalChancesFor, difficultyFor } from "../utils/visaDifficulty.js";
+import { approvalChancesFor, approvalSourceFor, difficultyFor } from "../utils/visaDifficulty.js";
 import { normaliseToIso2 } from "../utils/countryCodes.js";
 import { createTurnstileGate } from "../middleware/turnstile.js";
 import { travelRequestLimiter } from "../middleware/rateLimit.js";
@@ -207,6 +209,13 @@ router.get("/visa/map", async (_req: any, res: any) => {
         difficulty: difficultyFor(c.iso2, c.visaCategory),
         approvalChances: approvalChancesFor(c.iso2, c.visaCategory),
         serviced: Boolean(served),
+        // Phase 3 (region rail). Both are the SEED's own values, passed
+        // through — the frontend fits and filters by them and holds no
+        // country list of its own. A country's continent never depends on
+        // whether we sell it, which is why these sit beside visaType rather
+        // than anywhere near `serviced`.
+        continent: c.continent,
+        groups: c.groups,
       };
     });
 
@@ -229,6 +238,12 @@ router.get("/visa/map", async (_req: any, res: any) => {
         difficulty: difficultyFor(iso2, category),
         approvalChances: approvalChancesFor(iso2, category),
         serviced: true,
+        // A corridor the seed does not carry has no continent and no group
+        // membership to state. Empty rather than guessed: the region rail
+        // will not place it, which is visibly odd and therefore correct —
+        // the warning above is the fix, not a fabricated continent.
+        continent: "",
+        groups: [],
       });
     }
 
@@ -251,7 +266,12 @@ router.get("/visa/map", async (_req: any, res: any) => {
     // the pins use — so the legend can never disagree with the map it labels.
     // STAMP is still emitted (as 0) so the frontend Legend's shape is unchanged.
     const byCategory: Record<string, number> = {};
+    // Seeded from BOTH vocabularies. CATEGORY_PRECEDENCE is the catalogue's
+    // five (it keeps STAMP: 0 in the shape); SEED_VISA_CATEGORIES is the
+    // seed's six, and without it TRAVEL_AUTH and RESTRICTED would increment
+    // an undefined key and ship NaN as a count.
     for (const c of CATEGORY_PRECEDENCE) byCategory[c] = 0;
+    for (const c of SEED_VISA_CATEGORIES) byCategory[c] = byCategory[c] ?? 0;
     for (const d of destinations) {
       if (d.visaCategory) byCategory[d.visaCategory] += 1;
     }
@@ -266,6 +286,12 @@ router.get("/visa/map", async (_req: any, res: any) => {
       lastVerified: meta.lastVerified,
       disclaimer: meta.disclaimer,
       destinations,
+      // The region vocabulary, verbatim from the seed. Continents and the
+      // curated groupings (Schengen/GCC/ASEAN) with their real membership,
+      // so the rail's buttons, its counts and the countries it lights all
+      // resolve from one list. The loader has already asserted that this
+      // membership and the per-country `groups` agree.
+      regions: getSeedRegions(),
       stats: {
         total: destinations.length,
         byCategory,
@@ -419,8 +445,21 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
         difficulty: difficultyFor(iso2, seedCountry.visaCategory),
         approvalChances: approvalChancesFor(iso2, seedCountry.visaCategory),
         serviced: false,
+        // ── PROVENANCE, READ-ONLY ────────────────────────────────────
+        // The seed's own attribution, passed through unchanged. It was
+        // already on the /map response and the country response carried
+        // only two thirds of it, so the panel could print a date and a
+        // disclaimer but could not say WHERE the category came from.
+        // Nothing is computed here.
+        source: meta.source,
+        sourceUrl: meta.sourceUrl,
         lastVerified: meta.lastVerified,
         disclaimer: meta.disclaimer,
+        // null for every country whose approval string is a fixed
+        // phrase rather than a sourced figure — which is most of them.
+        // See approvalSourceFor: it asks the same question, in the same
+        // order, that the displayed value was produced by.
+        approvalSource: approvalSourceFor(iso2, seedCountry.visaCategory),
       });
     }
 
@@ -472,8 +511,18 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
       difficulty: difficultyFor(iso2, tooltipCategory),
       approvalChances: approvalChancesFor(iso2, tooltipCategory),
       serviced: true,
+      // Same three provenance fields as the unserviced branch above, and
+      // deliberately the same values: the attribution is a property of
+      // the CATALOGUE, not of whether we happen to sell this corridor.
+      source: meta.source,
+      sourceUrl: meta.sourceUrl,
       lastVerified: meta.lastVerified,
       disclaimer: meta.disclaimer,
+      // `tooltipCategory`, not `rule.visaCategory` — the credit has to be
+      // derived from the same category the DISPLAYED approval string was,
+      // or the two can disagree on exactly the countries where those two
+      // categories do (see the note above tooltipCategory).
+      approvalSource: approvalSourceFor(iso2, tooltipCategory),
       purpose: rule.purpose,
       entryType: rule.entryType,
       processingTime:

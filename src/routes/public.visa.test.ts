@@ -190,14 +190,17 @@ describe("GET /visa/map — every country, not just the served ones", () => {
   });
 
   it("takes visaType from the SEED, not from the published rule", async () => {
-    // The rule says Thailand is E_VISA. The seed says an Indian passport
-    // enters Thailand visa-free. The map states the passport fact.
+    // The rule says Thailand is E_VISA. The v3 seed says an Indian
+    // passport needs a TDAC — an arrival card, not a visa. The map states
+    // the passport fact. (v2 said VISA_FREE here; the seed changed on
+    // 2026-08-16 and this assertion follows it, which is the point of
+    // reading the value from `seedCategory` on the line above.)
     await makeRule({ visaCategory: "E_VISA" });
     const th = await find("TH");
 
-    expect(seedCategory("TH")).toBe("VISA_FREE");
-    expect(th.visaType).toBe("VISA_FREE");
-    expect(th.visaCategory).toBe("VISA_FREE"); // 2a alias, same value
+    expect(seedCategory("TH")).toBe("TRAVEL_AUTH");
+    expect(th.visaType).toBe("TRAVEL_AUTH");
+    expect(th.visaCategory).toBe("TRAVEL_AUTH"); // 2a alias, same value
     expect(th.serviced).toBe(true); // still served — display is decoupled
   });
 
@@ -330,10 +333,16 @@ describe("GET /visa/map — every country, not just the served ones", () => {
     const res = await request(app()).get("/api/public/visa/map");
     const by = res.body.stats.byCategory;
 
-    expect(by.VISA_FREE).toBe(26);
-    expect(by.VOA).toBe(28);
+    // The v3 seed's own numbers (2026-08-16). Six categories now: eight
+    // countries moved to TRAVEL_AUTH and one to RESTRICTED, which is
+    // where the two the VISA_FREE and VOA counts lost, and the one
+    // STICKER lost, went.
+    expect(by.VISA_FREE).toBe(24);
+    expect(by.VOA).toBe(22);
     expect(by.E_VISA).toBe(52);
-    expect(by.STICKER).toBe(90);
+    expect(by.TRAVEL_AUTH).toBe(8);
+    expect(by.STICKER).toBe(89);
+    expect(by.RESTRICTED).toBe(1);
     expect(by.STAMP).toBe(0); // shape kept for the frontend Legend
     const sum = Object.values(by).reduce((a: any, b: any) => a + b, 0);
     expect(sum).toBe(196);
@@ -346,9 +355,11 @@ describe("GET /visa/map — every country, not just the served ones", () => {
       expect(Object.keys(d).sort()).toEqual([
         "approvalChances",
         "categoryIsMixed",
+        "continent",
         "countryName",
         "destinationName",
         "difficulty",
+        "groups",
         "iso2",
         "serviced",
         "visaCategory",
@@ -494,6 +505,10 @@ describe("GET /visa/country/:iso2 — unserviced", () => {
     const res = await request(app()).get("/api/public/visa/country/DE");
     expect(Object.keys(res.body).sort()).toEqual([
       "approvalChances",
+      // The panel's Sources footnote. `approvalSource` is a KEY THAT IS
+      // ALWAYS PRESENT and a VALUE THAT IS USUALLY NULL — see the
+      // provenance block below for what decides which.
+      "approvalSource",
       "countryName",
       "destinationName",
       "difficulty",
@@ -502,9 +517,74 @@ describe("GET /visa/country/:iso2 — unserviced", () => {
       "lastVerified",
       "ok",
       "serviced",
+      // The seed's own attribution for the CATEGORY. It was already on
+      // the /map response; the country response used to carry only
+      // lastVerified and disclaimer, so a panel could print the date and
+      // the warning but not say where the category came from.
+      "source",
+      "sourceUrl",
       "visaCategory",
       "visaType",
     ]);
+  });
+
+  /* ── PROVENANCE FOR THE APPROVAL FIGURE ────────────────────────────
+   *
+   * The rule these four cases pin down is the one the whole data layer
+   * exists to protect: A CITATION MAY ONLY APPEAR NEXT TO THE FIGURE IT
+   * JUSTIFIES. `approvalSource` is therefore driven by what the endpoint
+   * is DISPLAYING, not by whether SOURCED_APPROVAL has a row — and those
+   * two questions have different answers on real countries. */
+
+  it("credits the approval figure only where a sourced figure is shown", async () => {
+    const res = await request(app()).get("/api/public/visa/country/US");
+    expect(res.body.approvalChances).toBe("~78% (India, FY25)");
+    // Echoed, not re-derived: the credit leads with the same string the
+    // panel prints, so the two cannot drift.
+    expect(res.body.approvalSource.value).toBe(res.body.approvalChances);
+    expect(res.body.approvalSource.metricType).toBe("issued");
+    expect(res.body.approvalSource.year).toBe("FY25");
+    expect(res.body.approvalSource.sourceName).toBe("US State Department");
+  });
+
+  it("says ISSUED and never CHANCE — the figure is an outcome statistic", async () => {
+    /* The wording rule, asserted rather than trusted to review. The
+     * metric vocabulary is closed, and the disclaimer that bounds it is
+     * on the payload so the panel cannot print the number without it. */
+    const res = await request(app()).get("/api/public/visa/country/FR");
+    expect(["issued", "granted", "approved"]).toContain(res.body.approvalSource.metricType);
+    expect(res.body.approvalSource.disclaimer).toMatch(/not a prediction/i);
+    const blob = JSON.stringify(res.body.approvalSource).toLowerCase();
+    for (const banned of ["chance", "odds", "likelihood", "guarantee"]) {
+      expect(blob, banned).not.toContain(banned);
+    }
+  });
+
+  it("names the Schengen figure as an aggregate, because that is what it is", async () => {
+    /* 29 countries share one European Commission number. The footnote is
+     * the only place a reader can learn that the rate on France's panel
+     * is not France's own, so the qualifier is part of the source name
+     * rather than a comment in the code. */
+    const res = await request(app()).get("/api/public/visa/country/FR");
+    expect(res.body.approvalSource.sourceName).toMatch(/aggregate/i);
+  });
+
+  it("leaves approvalSource null wherever the figure is a fixed phrase", async () => {
+    /* THE CASE THAT MATTERS, and the one a naive `SOURCED_APPROVAL[iso2]`
+     * lookup would get wrong.
+     *
+     *   AU  IS in SOURCED_APPROVAL upstream, but is E_VISA — so
+     *       approvalChancesFor short-circuits to "Very High" before the
+     *       sourced map is consulted. A credit here would put a
+     *       government statistic under the words "Very High".
+     *   DZ  no row at all: "Varies by profile".
+     *   MV  VISA_FREE: "Not required".
+     */
+    for (const iso2 of ["AU", "DZ", "MV"]) {
+      const res = await request(app()).get(`/api/public/visa/country/${iso2}`);
+      expect(res.body.approvalChances, iso2).not.toMatch(/\d/);
+      expect(res.body.approvalSource, iso2).toBeNull();
+    }
   });
 
   it("is reachable with NO token and NO cookie", async () => {
@@ -566,7 +646,10 @@ describe("GET /visa/country/:iso2 — serviced", () => {
     expect(res.body.serviced).toBe(true);
     expect(res.body.countryName).toBe("Thailand");
     expect(res.body.difficulty).toBe("Easy");
-    expect(res.body.approvalChances).toBe("Not required");
+    // TRAVEL_AUTH in the v3 seed: an arrival card is granted on
+    // submission, so it answers with the same string e-visa and
+    // on-arrival do. It is NOT "Not required" — something IS required.
+    expect(res.body.approvalChances).toBe("Very High");
     expect(res.body.lastVerified).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect(res.body.disclaimer).toMatch(/verify/i);
 
@@ -578,13 +661,13 @@ describe("GET /visa/country/:iso2 — serviced", () => {
 
   it("keeps visaCategory RULE-derived while visaType is SEED-derived", async () => {
     // The one deliberate divergence, pinned so it cannot drift unnoticed:
-    // the rule says E_VISA (what we will process), the seed says VISA_FREE
-    // (what the passport faces). Design note §6/§8.
+    // the rule says E_VISA (what we will process), the seed says
+    // TRAVEL_AUTH (what the passport faces). Design note §6/§8.
     await makeRule({ visaCategory: "E_VISA" });
     const res = await request(app()).get("/api/public/visa/country/TH");
 
     expect(res.body.visaCategory).toBe("E_VISA");
-    expect(res.body.visaType).toBe("VISA_FREE");
+    expect(res.body.visaType).toBe("TRAVEL_AUTH");
   });
 });
 
@@ -618,15 +701,41 @@ describe("seed loading", () => {
   });
 
   it("validated all 196 entries at startup", async () => {
-    const { isSeedReady, getSeedMeta } = await import("../config/visaCountrySeed.js");
+    const { isSeedReady, getSeedMeta, SEED_VISA_CATEGORIES } = await import(
+      "../config/visaCountrySeed.js"
+    );
     expect(isSeedReady()).toBe(true);
     expect(SEED).toHaveLength(196);
     expect(getSeedMeta().nationality).toBe("IN");
     for (const c of SEED) {
       expect(c.iso2, c.iso2).toMatch(/^[A-Z]{2}$/);
       expect(c.countryName, c.iso2).toBeTruthy();
-      expect(["VISA_FREE", "E_VISA", "VOA", "STICKER"], c.iso2).toContain(c.visaCategory);
+      // Read from the module's own union rather than a copy of it: the v3
+      // seed added TRAVEL_AUTH and RESTRICTED, and a hardcoded list here
+      // failed for eight countries that were perfectly valid.
+      expect(SEED_VISA_CATEGORIES as readonly string[], c.iso2).toContain(c.visaCategory);
     }
+  });
+
+  /* The region block the rail is driven by. Asserted at the loader, not
+   * through the endpoint, because the guarantee is about what was
+   * VALIDATED at startup: a group whose membership disagrees with the
+   * countries tagged into it must refuse to load at all. */
+  it("parsed the region vocabulary and its curated groupings", async () => {
+    const { getSeedRegions } = await import("../config/visaCountrySeed.js");
+    const regions = getSeedRegions();
+
+    expect(regions.continents).toEqual(["Asia", "Europe", "Africa", "Americas", "Oceania"]);
+    for (const c of SEED) {
+      expect(regions.continents as readonly string[], c.iso2).toContain(c.continent);
+    }
+
+    const schengen = regions.groups.find((g) => g.key === "SCHENGEN");
+    expect(schengen?.members).toHaveLength(29);
+    expect(SEED.filter((c) => c.groups.includes("SCHENGEN"))).toHaveLength(29);
+    expect(regions.groups.find((g) => g.key === "GCC")?.members).toHaveLength(6);
+    expect(regions.groups.find((g) => g.key === "ASEAN")?.members).toHaveLength(10);
+    expect(SEED.filter((c) => c.continent === "Europe")).toHaveLength(45);
   });
 });
 
@@ -910,11 +1019,11 @@ describe("seed/rule category divergence", () => {
   });
 
   it("does NOT change what the map serves — the seed still wins", async () => {
-    // TH: seed VISA_FREE, rule E_VISA. Divergent, and the pin is still
+    // TH: seed TRAVEL_AUTH, rule E_VISA. Divergent, and the pin is still
     // the seed's colour.
     await makeRule({ visaCategory: "E_VISA" });
     const th = await find("TH");
-    expect(th.visaType).toBe("VISA_FREE");
+    expect(th.visaType).toBe("TRAVEL_AUTH");
     expect(th.serviced).toBe(true);
   });
 });

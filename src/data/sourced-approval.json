@@ -1,0 +1,229 @@
+{
+  "$schema": "helloviza-sourced-approval/v1",
+  "nationality": "IN",
+  "lastVerified": "2026-08-16",
+  "wordingRule": "Display as an ISSUANCE/OUTCOME statistic ('~84% issued, India 2025'), NEVER as a personal 'approval chance'. metricType preserves the original construct; the US figure is the complement of an ADJUSTED refusal rate and is not literally an approval rate.",
+  "disclaimer": "Historical destination outcome rate for Indian applicants; not a prediction of any individual's result.",
+  "coverageNote": "Real per-destination data exists for the ~31 destinations below (28 Schengen states + US + AU + NZ). All other countries show 'Varies by profile'.",
+  "count": 31,
+  "sourced": {
+    "AT": {
+      "approvalPct": 79,
+      "displayString": "~79% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "AU": {
+      "approvalPct": 73,
+      "displayString": "~73% (India, 2025)",
+      "metricType": "granted",
+      "year": "2025",
+      "source": "Australia Home Affairs (tourist grant rate)"
+    },
+    "BE": {
+      "approvalPct": 90,
+      "displayString": "~90% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "BG": {
+      "approvalPct": 76,
+      "displayString": "~76% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)",
+      "dataNote": "Issued exceeds applications in source (LTV/carryover) — verify before display"
+    },
+    "CH": {
+      "approvalPct": 80,
+      "displayString": "~80% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "CZ": {
+      "approvalPct": 78,
+      "displayString": "~78% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "DE": {
+      "approvalPct": 85,
+      "displayString": "~85% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "DK": {
+      "approvalPct": 89,
+      "displayString": "~89% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "EE": {
+      "approvalPct": 63,
+      "displayString": "~63% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "ES": {
+      "approvalPct": 85,
+      "displayString": "~85% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "FI": {
+      "approvalPct": 80,
+      "displayString": "~80% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "FR": {
+      "approvalPct": 84,
+      "displayString": "~84% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "GR": {
+      "approvalPct": 69,
+      "displayString": "~69% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "HR": {
+      "approvalPct": 73,
+      "displayString": "~73% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "HU": {
+      "approvalPct": 86,
+      "displayString": "~86% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "IS": {
+      "approvalPct": 80,
+      "displayString": "~80% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "IT": {
+      "approvalPct": 87,
+      "displayString": "~87% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "LT": {
+      "approvalPct": 62,
+      "displayString": "~62% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "LU": {
+      "approvalPct": 84,
+      "displayString": "~84% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "LV": {
+      "approvalPct": 82,
+      "displayString": "~82% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "MT": {
+      "approvalPct": 62,
+      "displayString": "~62% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "NL": {
+      "approvalPct": 83,
+      "displayString": "~83% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "NO": {
+      "approvalPct": 88,
+      "displayString": "~88% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "NZ": {
+      "approvalPct": 76,
+      "displayString": "~76% (India, 2024)",
+      "metricType": "approved",
+      "year": "2024",
+      "source": "Immigration NZ (first-time visitor)"
+    },
+    "PL": {
+      "approvalPct": 82,
+      "displayString": "~82% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "PT": {
+      "approvalPct": 81,
+      "displayString": "~81% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "RO": {
+      "approvalPct": 78,
+      "displayString": "~78% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "SE": {
+      "approvalPct": 85,
+      "displayString": "~85% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "SI": {
+      "approvalPct": 56,
+      "displayString": "~56% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "SK": {
+      "approvalPct": 84,
+      "displayString": "~84% (India, 2025)",
+      "metricType": "issued",
+      "year": "2025",
+      "source": "EU/consulate data (India)"
+    },
+    "US": {
+      "approvalPct": 78,
+      "displayString": "~78% (India, FY25)",
+      "metricType": "issued",
+      "year": "FY25",
+      "source": "US State Dept (adjusted refusal 22.04%)"
+    }
+  }
+}
