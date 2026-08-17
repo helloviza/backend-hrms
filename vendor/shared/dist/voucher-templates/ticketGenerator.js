@@ -51,6 +51,32 @@ function extractFirstName(name) {
         .trim()
         .split(/\s+/)[0] || "Traveller";
 }
+/** The allowance printed when nothing at all is known about this booking. */
+const DEFAULT_CHECKIN_ALLOWANCE = "15 kg";
+const DEFAULT_CABIN_ALLOWANCE = "7 kg";
+function nonEmpty(v) {
+    const s = (v ?? "").trim();
+    return s ? s : null;
+}
+/**
+ * An escaped table cell, or `fallbackHtml` verbatim when the value is absent.
+ * `fallbackHtml` is raw HTML so callers can keep passing entities like `&mdash;`.
+ */
+function cellOr(value, fallbackHtml) {
+    const s = nonEmpty(value);
+    return s ? esc(s) : fallbackHtml;
+}
+/**
+ * One allowance line for the summary tile. Passenger values win when they all
+ * agree; when they disagree the tile refuses to pick one and points at the
+ * manifest, which lists every passenger's own figure.
+ */
+function summarizeAllowance(values, legLevel, fallback) {
+    const distinct = Array.from(new Set(values.map(nonEmpty).filter((v) => !!v)));
+    if (distinct.length > 1)
+        return esc("Varies — see manifest");
+    return esc(distinct[0] ?? nonEmpty(legLevel) ?? fallback);
+}
 function esc(s) {
     return String(s || "")
         .replace(/&/g, "&amp;")
@@ -145,6 +171,10 @@ export function generateFlightSection(b, segmentLabel) {
     const destAirport = airportFullName(b.destination.code);
     const leadPax = b.passengers?.find(p => p.isLead) || b.passengers?.[0];
     const leadName = leadPax ? `${leadPax.title || ""} ${leadPax.firstName || ""} ${leadPax.lastName || ""}`.trim() : "—";
+    // This cell has room for one name, so a group booking shows the lead plus a
+    // count — never a bare lead name that reads as "this is the only traveller".
+    const otherPaxCount = Math.max(0, (b.passengers?.length ?? 0) - 1);
+    const passengerCell = otherPaxCount > 0 ? `${leadName} +${otherPaxCount} more` : leadName;
     return `<div style="background:linear-gradient(135deg,#ffffff 0%,#f8f9ff 100%);border-radius:16px;padding:36px;box-shadow:0 20px 40px rgba(0,42,88,0.06);position:relative;overflow:hidden;margin-bottom:20px;">
   <div style="position:absolute;top:-40px;right:-40px;width:160px;height:160px;background:rgba(0,42,88,0.04);border-radius:50%;pointer-events:none;"></div>
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:24px;">
@@ -182,7 +212,7 @@ export function generateFlightSection(b, segmentLabel) {
     </div>
     <div>
       <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:4px;">Passenger</div>
-      <div style="font-weight:700;color:#002a58;font-size:12px;">${esc(leadName)}</div>
+      <div style="font-weight:700;color:#002a58;font-size:12px;">${esc(passengerCell)}</div>
     </div>
     <div>
       <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:4px;">PNR</div>
@@ -195,7 +225,15 @@ export function generateFlightSection(b, segmentLabel) {
   </div>
 </div>`;
 }
-export async function generateReturnPageHTML(rb, logoUrl = DEFAULT_LOGO_URL) {
+/**
+ * One extra page for a leg beyond the first. `opts` lets a 3+ leg itinerary
+ * title each page and number it correctly; the defaults reproduce the original
+ * two-page round-trip wording exactly.
+ */
+export async function generateReturnPageHTML(rb, logoUrl = DEFAULT_LOGO_URL, opts = {}) {
+    const legLabel = nonEmpty(rb.legLabel) ?? "Return";
+    const pageIndex = opts.pageIndex ?? 2;
+    const pageCount = opts.totalPages ?? 2;
     const rbIsDemo = !!rb.isDemo;
     const rbDemoWatermarkHtml = rbIsDemo
         ? `<div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) rotate(-30deg);font-size:120px;font-weight:bold;color:rgba(208,101,73,0.15);z-index:9999;pointer-events:none;white-space:nowrap;">SAMPLE — NOT A REAL RESERVATION</div>`
@@ -206,11 +244,11 @@ export async function generateReturnPageHTML(rb, logoUrl = DEFAULT_LOGO_URL) {
         return `<tr style="border-bottom:1px solid #f3f4f6;">
       <td style="padding:12px 16px;font-weight:600;color:#002a58;font-size:13px;">${esc(p?.title ?? "")} ${esc(p?.firstName ?? "")} ${esc(p?.lastName ?? "")}</td>
       <td style="padding:12px 16px;color:#6B7280;font-size:13px;">${paxType}</td>
-      <td style="padding:12px 16px;font-family:monospace;font-size:11px;color:#6B7280;text-align:center;">${esc(rb.ticketId || "—")}</td>
-      <td style="padding:12px 16px;font-weight:700;text-align:center;color:#002a58;">&mdash;</td>
-      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">15 kg</td>
-      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">7 kg</td>
-      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">&mdash;</td>
+      <td style="padding:12px 16px;font-family:monospace;font-size:11px;color:#6B7280;text-align:center;">${cellOr(p?.ticketNumber ?? rb.ticketId, "—")}</td>
+      <td style="padding:12px 16px;font-weight:700;text-align:center;color:#002a58;">${cellOr(p?.seat, "&mdash;")}</td>
+      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">${cellOr(p?.checkInBaggage ?? rb.checkInBaggage, DEFAULT_CHECKIN_ALLOWANCE)}</td>
+      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">${cellOr(p?.cabinBaggage ?? rb.cabinBaggage, DEFAULT_CABIN_ALLOWANCE)}</td>
+      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">${cellOr(p?.meal, "&mdash;")}</td>
     </tr>`;
     }).join("");
     const rbBarcodesHtml = (rb.passengers ?? []).map((p, i) => {
@@ -236,21 +274,21 @@ export async function generateReturnPageHTML(rb, logoUrl = DEFAULT_LOGO_URL) {
       <img src="${logoUrl}" style="height:36px;object-fit:contain;" alt="Plumtrips"/>
     </div>
     <div style="text-align:right;">
-      <div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:3px;">Return E-Ticket</div>
+      <div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:3px;">${esc(legLabel)} E-Ticket</div>
       <div style="font-size:10px;color:#C5A059;font-weight:700;text-transform:uppercase;letter-spacing:2px;margin-top:2px;">CONFIRMED</div>
     </div>
   </div>
 
   <div style="max-width:860px;margin:0 auto;padding:28px 40px 40px;">
     <div style="margin-bottom:24px;">
-      <div style="font-size:10px;font-weight:700;color:#002a58;text-transform:uppercase;letter-spacing:3px;border:1px solid rgba(0,42,88,0.2);display:inline-block;padding:3px 10px;border-radius:20px;background:rgba(0,42,88,0.05);margin-bottom:12px;">Return Journey</div>
+      <div style="font-size:10px;font-weight:700;color:#002a58;text-transform:uppercase;letter-spacing:3px;border:1px solid rgba(0,42,88,0.2);display:inline-block;padding:3px 10px;border-radius:20px;background:rgba(0,42,88,0.05);margin-bottom:12px;">${esc(legLabel)} Journey</div>
       <h1 style="font-size:28px;font-weight:900;color:#002a58;letter-spacing:-1px;line-height:1.1;margin-bottom:6px;font-family:Manrope,sans-serif;">Welcome Back, ${rbFirstName}.</h1>
       <p style="font-size:14px;color:#6B7280;">${esc(rbOriginCity)} &rarr; ${esc(rbDestCity)} &bull; Booking ID: ${esc(rb.bookingId)}</p>
     </div>
 
     <div style="display:flex;gap:24px;align-items:flex-start;margin-bottom:24px;">
       <div style="flex:3;min-width:0;">
-        ${generateFlightSection(rb, "Return Flight")}
+        ${generateFlightSection(rb, `${legLabel} Flight`)}
       </div>
       <div style="flex:1;min-width:160px;display:flex;flex-direction:column;gap:16px;">
         <div style="background:#002a58;border-radius:12px;padding:24px;color:#ffffff;text-align:center;">
@@ -295,7 +333,7 @@ export async function generateReturnPageHTML(rb, logoUrl = DEFAULT_LOGO_URL) {
     </div>
 
     <div style="text-align:center;padding-top:8px;margin-bottom:20px;">
-      <p style="font-size:11px;color:#9CA3AF;margin:0;">Page 2 of 2 &bull; Generated via PlumTrips &bull; ${esc(new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }))}</p>
+      <p style="font-size:11px;color:#9CA3AF;margin:0;">Page ${pageIndex} of ${pageCount} &bull; Generated via PlumTrips &bull; ${esc(new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }))}</p>
     </div>
   </div>
 
@@ -328,13 +366,17 @@ export async function generateTicketHTML(b, offers = [], returnBooking, logoUrl 
         return `<tr style="border-bottom:1px solid #f3f4f6;">
       <td style="padding:12px 16px;font-weight:600;color:#002a58;font-size:13px;">${esc(p?.title ?? "")} ${esc(p?.firstName ?? "")} ${esc(p?.lastName ?? "")}</td>
       <td style="padding:12px 16px;color:#6B7280;font-size:13px;">${paxType}</td>
-      <td style="padding:12px 16px;font-family:monospace;font-size:11px;color:#6B7280;text-align:center;">${esc(b.ticketId || "—")}</td>
-      <td style="padding:12px 16px;font-weight:700;text-align:center;color:#002a58;">&mdash;</td>
-      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">15 kg</td>
-      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">7 kg</td>
-      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">&mdash;</td>
+      <td style="padding:12px 16px;font-family:monospace;font-size:11px;color:#6B7280;text-align:center;">${cellOr(p?.ticketNumber ?? b.ticketId, "—")}</td>
+      <td style="padding:12px 16px;font-weight:700;text-align:center;color:#002a58;">${cellOr(p?.seat, "&mdash;")}</td>
+      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">${cellOr(p?.checkInBaggage ?? b.checkInBaggage, DEFAULT_CHECKIN_ALLOWANCE)}</td>
+      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">${cellOr(p?.cabinBaggage ?? b.cabinBaggage, DEFAULT_CABIN_ALLOWANCE)}</td>
+      <td style="padding:12px 16px;color:#374151;text-align:center;font-size:12px;">${cellOr(p?.meal, "&mdash;")}</td>
     </tr>`;
     }).join("");
+    // The tiles summarise the whole leg, so they can only show one figure. When
+    // passengers differ they say so instead of promoting one passenger's number.
+    const checkInAllowance = summarizeAllowance((b.passengers ?? []).map((p) => p?.checkInBaggage), b.checkInBaggage, DEFAULT_CHECKIN_ALLOWANCE);
+    const cabinAllowance = summarizeAllowance((b.passengers ?? []).map((p) => p?.cabinBaggage), b.cabinBaggage, DEFAULT_CABIN_ALLOWANCE);
     const barcodesHtml = (b.passengers ?? []).map((p, i) => {
         const ref = `${b.pnr}-${i + 1}`;
         return `<div style="margin-bottom:12px;">
@@ -392,9 +434,13 @@ export async function generateTicketHTML(b, offers = [], returnBooking, logoUrl 
         <div style="position:absolute;inset:0;background:linear-gradient(to right,#004080 0%,transparent 70%);pointer-events:none;"></div>
       </div>
     </div>`;
-    const segLabel = returnBooking ? "Outbound Flight" : "Segment 1";
-    const returnPageHtml = returnBooking ? await generateReturnPageHTML(returnBooking, logoUrl) : "";
-    const totalPages = returnBooking ? 2 : 1;
+    // Every leg after the first gets its own page. A single booking (the common
+    // round trip) is accepted as-is so existing callers are unaffected.
+    const onwardLegs = (Array.isArray(returnBooking) ? returnBooking : returnBooking ? [returnBooking] : [])
+        .filter((leg) => !!leg);
+    const segLabel = onwardLegs.length > 0 ? "Outbound Flight" : "Segment 1";
+    const totalPages = 1 + onwardLegs.length;
+    const returnPageHtml = (await Promise.all(onwardLegs.map((leg, i) => generateReturnPageHTML(leg, logoUrl, { pageIndex: i + 2, totalPages })))).join("");
     const printButtonHtml = showPrintButton
         ? `<div class="no-print" style="position:fixed;bottom:24px;right:24px;z-index:999;">
   <button onclick="window.print()" style="background:#002a58;color:#ffffff;border:none;border-radius:10px;padding:12px 24px;font-size:13px;font-weight:700;font-family:Manrope,sans-serif;cursor:pointer;box-shadow:0 4px 20px rgba(0,42,88,0.3);">&#128438; Print / Save PDF</button>
@@ -447,13 +493,13 @@ ${printButtonHtml}
         <div style="background:#ffffff;border-radius:12px;padding:20px;display:flex;align-items:center;gap:14px;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
           <div>
             <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:2px;">Check-in Allowance</div>
-            <div style="font-size:20px;font-weight:800;color:#002a58;">15 kg</div>
+            <div style="font-size:20px;font-weight:800;color:#002a58;">${checkInAllowance}</div>
           </div>
         </div>
         <div style="background:#ffffff;border-radius:12px;padding:20px;display:flex;align-items:center;gap:14px;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
           <div>
             <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:2px;">Cabin Allowance</div>
-            <div style="font-size:20px;font-weight:800;color:#002a58;">7 kg</div>
+            <div style="font-size:20px;font-weight:800;color:#002a58;">${cabinAllowance}</div>
           </div>
         </div>
       </div>

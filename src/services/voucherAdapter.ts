@@ -8,10 +8,15 @@
 // The mapping follows infra/audit/voucher-adapter-mapping-audit-2026-05-27.md
 // field-by-field. Locked decisions for this phase:
 //   - One PNR per record (single scalar). No multi-PNR.
-//   - Connecting / 3+ legs collapse to outbound + optional return only.
-//   - Baggage/seat/meal are NOT touched — the template keeps its current
-//     literals (15kg / 7kg / "—"). Real baggage is L3b.
 //   - Cabin: reverse-map class string → CABIN_MAP number; fallback Economy (2).
+//
+// Two decisions from that audit have since been REVERSED, because both dropped
+// data the source document carried (render-fidelity fixes S2 / S3 = F-06):
+//   - Legs: every segment is rendered on its own page. 3+ leg itineraries are
+//     no longer collapsed to first + last.
+//   - Baggage/seat/meal/ticket number: mapped through per passenger and per
+//     segment. Where the document states nothing we print "—" rather than let
+//     the template's "15 kg" literal assert an allowance nobody granted.
 //
 // Five BROKEN-RISK guards from the audit are implemented here:
 //   (a) Hotel: hard-set reconciled:true — generateHotelVoucherHTML throws otherwise.
@@ -246,12 +251,61 @@ function mapPaxType(type?: string | null): string {
   return "adult";
 }
 
+/**
+ * What we print when the source document states no allowance. A blank is the
+ * honest answer: the template's own "15 kg" default is a plausible number the
+ * airline may never have granted, and a passenger reads the voucher at the
+ * bag drop. The e-ticket's policy list already says allowance is as booked.
+ */
+const NOT_STATED = "—";
+
+/** True when the passengers state genuinely different values from each other. */
+function variesAcrossPassengers(values: (string | null | undefined)[]): boolean {
+  return new Set(values.map((v) => (v ?? "").trim()).filter(Boolean)).size > 1;
+}
+
+/**
+ * Passengers are rebuilt per segment, because baggage belongs to a passenger
+ * *on a leg*.
+ *
+ * The extract states allowance on two independent axes — per passenger and per
+ * segment — and neither contains the other. So we take whichever axis actually
+ * carries information: when the passengers differ from each other, their own
+ * figures are what matter; otherwise the segment's figure is the one specific
+ * to the page being rendered (a return leg often has a different allowance from
+ * the outbound, and the per-passenger field tends to hold a merged summary of
+ * both). The other axis fills the gaps.
+ */
 function buildPassengers(
   pax: Passenger[] | undefined,
+  seg: FlightSegment | undefined,
 ): TicketBooking["passengers"] {
-  return (pax || []).map((p, i) => {
+  const anc = seg?.ancillaries;
+  const list = pax || [];
+  const checkInIsPerPassenger = variesAcrossPassengers(list.map((p) => p?.baggage_check_in));
+  const cabinIsPerPassenger = variesAcrossPassengers(list.map((p) => p?.baggage_cabin));
+
+  return list.map((p, i) => {
     const { title, firstName, lastName } = splitName(p?.name);
-    return { title, firstName, lastName, paxType: mapPaxType(p?.type), isLead: i === 0 };
+    return {
+      title,
+      firstName,
+      lastName,
+      paxType: mapPaxType(p?.type),
+      isLead: i === 0,
+      ticketNumber: p?.ticket_no ?? null,
+      checkInBaggage:
+        (checkInIsPerPassenger
+          ? p?.baggage_check_in ?? anc?.checkin_bag
+          : anc?.checkin_bag ?? p?.baggage_check_in) ?? NOT_STATED,
+      cabinBaggage:
+        (cabinIsPerPassenger
+          ? p?.baggage_cabin ?? anc?.cabin_bag
+          : anc?.cabin_bag ?? p?.baggage_cabin) ?? NOT_STATED,
+      // Seat and meal are stated per passenger; a segment value only fills gaps.
+      seat: p?.seat ?? anc?.seat ?? null,
+      meal: p?.meal ?? anc?.meal ?? null,
+    };
   });
 }
 
@@ -265,10 +319,12 @@ function returnsTowardOrigin(first: FlightSegment, last: FlightSegment): boolean
 function buildBookingFromSegment(
   v: PlumtripsVoucher,
   seg: FlightSegment | undefined,
-  shared: { passengers: TicketBooking["passengers"]; ticketId: string; createdAt: string },
+  shared: { ticketId: string; createdAt: string },
+  legLabel?: string,
 ): TicketBooking {
   const origin = seg?.origin;
   const dest = seg?.destination;
+  const anc = seg?.ancillaries;
   return {
     pnr: nz(v?.booking_info?.pnr),
     bookingId: nz(v?.booking_info?.booking_id),
@@ -283,7 +339,12 @@ function buildBookingFromSegment(
     airlineName: nz(seg?.airline),
     flightNumber: nz(seg?.flight_no),
     cabin: classToCabin(seg?.class),
-    passengers: shared.passengers,
+    passengers: buildPassengers(v?.passengers, seg),
+    // Leg-level allowance: what this segment's fare grants, used for the summary
+    // tiles and as the fallback for a passenger who carries no figure of its own.
+    checkInBaggage: anc?.checkin_bag ?? NOT_STATED,
+    cabinBaggage: anc?.cabin_bag ?? NOT_STATED,
+    legLabel: legLabel ?? null,
     // Fares are not rendered on the e-ticket — supply zeros / INR.
     baseFare: 0,
     taxes: 0,
@@ -301,20 +362,23 @@ function buildBookingFromSegment(
 }
 
 /**
- * Map an extracted flight voucher to the shared template's booking + optional
- * return booking. Connecting / 3+ legs collapse to outbound + last (return).
+ * Map an extracted flight voucher to the shared template's booking + the legs
+ * that follow it. EVERY segment is rendered — a 3+ leg itinerary gets a page
+ * per leg rather than being collapsed to first + last (F-06).
+ *
+ * The final leg is titled "Return" only when it actually lands back where the
+ * itinerary began; otherwise it is "Onward". Legs in between are "Connecting".
  */
 export function adaptFlight(v: PlumtripsVoucher): {
   booking: TicketBooking;
-  returnBooking?: TicketBooking;
+  returnBooking?: TicketBooking | TicketBooking[];
 } {
   const segs: FlightSegment[] = Array.isArray(v?.flight_details?.segments)
     ? v.flight_details!.segments
     : [];
 
   const shared = {
-    passengers: buildPassengers(v?.passengers),
-    ticketId: nz(v?.passengers?.[0]?.ticket_no), // lead pax ticket as the single ticketId
+    ticketId: nz(v?.passengers?.[0]?.ticket_no), // lead pax ticket as the booking-level fallback
     createdAt: new Date().toISOString(),
   };
 
@@ -322,33 +386,29 @@ export function adaptFlight(v: PlumtripsVoucher): {
     return { booking: buildBookingFromSegment(v, segs[0], shared) };
   }
 
-  if (segs.length === 2) {
-    const booking = buildBookingFromSegment(v, segs[0], shared);
-    const returnBooking = buildBookingFromSegment(v, segs[1], shared);
-    if (!returnsTowardOrigin(segs[0], segs[1])) {
-      // 2-leg connecting (not a round trip) — both legs still shown, but the
-      // second page is labeled "Return". Log so we can see how often this happens.
-      logger.warn("[voucher-adapter] 2-segment itinerary is not a round trip; second leg shown as 'Return'", {
-        pnr: nz(v?.booking_info?.pnr),
-        seg0: `${nz(segs[0]?.origin?.code)}→${nz(segs[0]?.destination?.code)}`,
-        seg1: `${nz(segs[1]?.origin?.code)}→${nz(segs[1]?.destination?.code)}`,
-      });
-    }
-    return { booking, returnBooking };
+  const onward = segs.slice(1);
+  const isRoundTrip = returnsTowardOrigin(segs[0], segs[segs.length - 1]);
+
+  const onwardBookings = onward.map((seg, i) => {
+    const isFinalLeg = i === onward.length - 1;
+    const legLabel = isFinalLeg ? (isRoundTrip ? "Return" : "Onward") : "Connecting";
+    return buildBookingFromSegment(v, seg, shared, legLabel);
+  });
+
+  if (segs.length > 2) {
+    logger.info("[voucher-adapter] multi-leg itinerary rendered one page per leg", {
+      pnr: nz(v?.booking_info?.pnr),
+      totalSegments: segs.length,
+      route: segs
+        .map((s) => `${nz(s?.origin?.code)}→${nz(s?.destination?.code)}`)
+        .join(" / "),
+    });
   }
 
-  // 3+ legs — outbound = first, return = last, MIDDLE LEGS DROPPED (degradation).
-  const last = segs[segs.length - 1];
-  logger.warn("[voucher-adapter] 3+ segment itinerary collapsed to first+last; middle legs dropped", {
-    pnr: nz(v?.booking_info?.pnr),
-    totalSegments: segs.length,
-    dropped: segs.length - 2,
-    first: `${nz(segs[0]?.origin?.code)}→${nz(segs[0]?.destination?.code)}`,
-    last: `${nz(last?.origin?.code)}→${nz(last?.destination?.code)}`,
-  });
   return {
     booking: buildBookingFromSegment(v, segs[0], shared),
-    returnBooking: buildBookingFromSegment(v, last, shared),
+    // Single extra leg stays a bare object — the shape existing callers expect.
+    returnBooking: onwardBookings.length === 1 ? onwardBookings[0] : onwardBookings,
   };
 }
 
