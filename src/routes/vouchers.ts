@@ -4,14 +4,21 @@ import multer from "multer";
 import mongoose from "mongoose";
 
 import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/rbac.js";
-import { requireWorkspace } from "../middleware/requireWorkspace.js";
-import { scopedFindById } from "../middleware/scopedFindById.js";
+import {
+  requireWorkspace,
+  requireResolvedWorkspace,
+} from "../middleware/requireWorkspace.js";
+import { requireFeature } from "../middleware/requireFeature.js";
+import {
+  requirePermission,
+  requireAnyPermission,
+} from "../middleware/requirePermission.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 
 import VoucherExtraction from "../models/VoucherExtraction.js";
 import type { VoucherType } from "../types/index.js";
 
-import { uploadBufferToS3 } from "../utils/s3Upload.js";
+import { uploadBufferToS3, deleteObject } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 
@@ -33,6 +40,99 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 12 * 1024 * 1024 }, // 12MB
 });
+
+/* ───────────────────────── access model ─────────────────────────
+ *
+ * ONE definition of access, applied to every route in this router. It replaces
+ * three checks that used to disagree with each other: a route-level role
+ * allowlist (requireAdmin), a record-level role sniff (isRequesterAdmin), and
+ * an owner-vs-admin branch inside each handler.
+ *
+ * A caller may act on a voucher record when BOTH hold:
+ *   1. they hold the voucher grant (adminVouchers; upload also accepts
+ *      voucherExtract), and
+ *   2. record.workspaceId === the caller's resolved workspace.
+ *
+ * There is deliberately NO owner-only path. These extractions are a shared ops
+ * queue: whoever holds the grant in a workspace works the whole queue, and
+ * "created it" confers nothing extra. Permission *scope* (OWN/TEAM/WORKSPACE)
+ * is intentionally not consulted for record access — workspace equality is the
+ * whole boundary.
+ *
+ * ── The one exception: a real SUPERADMIN ──
+ *
+ * A platform SUPERADMIN (the JWT role isSuperAdmin() already trusts everywhere
+ * else) bypasses all three of the feature flag, the grant, and the workspace
+ * scope, and works voucher records across every workspace — including records
+ * stranded in deactivated tenants.
+ *
+ * That bypass is written as an explicit branch, never as an absent filter.
+ * `voucherScope()` returns `{}` for a SUPERADMIN because the query is genuinely
+ * meant to be unscoped, and `{ workspaceId }` for everyone else. It is NEVER
+ * reached by letting an undefined workspaceId fall through to Mongoose, which
+ * would strip the condition and produce the same unscoped query by accident.
+ * That distinction is the whole of F-01: for a non-SUPERADMIN, tenantScope()
+ * still throws rather than widen.
+ */
+router.use(
+  requireAuth,
+  requireWorkspace,
+  // Fail closed for everyone except a real SUPERADMIN, who is allowed to
+  // operate with no workspace context at all (see voucherScope below).
+  // requireResolvedWorkspace itself stays strict for every other caller and
+  // every other router — the exemption is declared here, not buried in it.
+  (req, res, next) =>
+    isSuperAdmin(req) ? next() : requireResolvedWorkspace(req, res, next),
+  requireFeature("vouchersEnabled"), // already a no-op for SUPERADMIN
+);
+
+/** Read the tenancy boundary. Throws rather than ever returning undefined. */
+function tenantScope(req: any): mongoose.Types.ObjectId {
+  const ws = req.workspaceObjectId;
+  if (!ws) {
+    // Reachable only for a SUPERADMIN (the sole caller allowed past the guard
+    // above without a workspace) — and every such path goes through
+    // voucherScope() instead. Throwing keeps a future miswiring loud.
+    throw Object.assign(new Error("Workspace context missing"), { status: 403 });
+  }
+  return ws;
+}
+
+/**
+ * The tenancy clause for every voucher query.
+ *
+ * `{}` for a real SUPERADMIN is a deliberate, readable "no workspace
+ * restriction" — not the absence of a filter. Everyone else is pinned to their
+ * own workspace by tenantScope(), which throws rather than return undefined.
+ */
+function voucherScope(req: any): Record<string, unknown> {
+  if (isSuperAdmin(req)) return {};
+  return { workspaceId: tenantScope(req) };
+}
+
+/**
+ * Fetch one record under the caller's scope: workspace-pinned normally,
+ * unrestricted for a SUPERADMIN. Replaces scopedFindById, which cannot express
+ * "deliberately unscoped" — passing it an undefined workspaceId would silently
+ * degrade to a bare findById, the exact failure F-01 closed.
+ */
+function findVoucherInScope(req: any, id: string) {
+  return VoucherExtraction.findOne({ _id: id, ...voucherScope(req) });
+}
+
+/** Grant to view the queue and open documents. */
+const canReadVouchers = requirePermission("adminVouchers", "READ");
+/** Grant to correct JSON or re-render — ops actions, not upload. */
+const canWriteVouchers = requirePermission("adminVouchers", "WRITE");
+/**
+ * Upload. `adminVouchers` is the single source of truth (see the Access Console),
+ * but a legacy `voucherExtract` grant is still honoured for upload alone so
+ * existing holders are not cut off. It confers no page, list or edit access.
+ */
+const canUploadVouchers = requireAnyPermission(
+  ["adminVouchers", "voucherExtract"],
+  "WRITE",
+);
 
 /* ───────────────────────── helpers ───────────────────────── */
 
@@ -68,21 +168,6 @@ type AllowedStatus = (typeof ALLOWED_STATUS)[number];
 
 function isAllowedStatus(v: any): v is AllowedStatus {
   return ALLOWED_STATUS.includes(v);
-}
-
-function isRequesterAdmin(req: any): boolean {
-  const role = String(req.user?.role || req.user?.userType || "").toUpperCase();
-  const roles = Array.isArray(req.user?.roles)
-    ? req.user.roles.map((r: any) => String(r).toUpperCase())
-    : [];
-  return (
-    role === "ADMIN" ||
-    role === "HR" ||
-    role === "HR_ADMIN" ||
-    roles.includes("ADMIN") ||
-    roles.includes("HR") ||
-    roles.includes("HR_ADMIN")
-  );
 }
 
 function safeStr(x: any): string | null {
@@ -314,7 +399,12 @@ async function generateAndStoreRenderedPdf(args: {
 /**
  * POST /api/vouchers/extract
  */
-router.post("/extract", requireAuth, requireWorkspace, upload.single("file"), async (req: any, res) => {
+// Creating a record REQUIRES a workspace even for a SUPERADMIN — workspaceId is
+// required by the schema, and a voucher has to belong to some tenant. A
+// SUPERADMIN uploading must therefore name the workspace (body/query/param or
+// the x-workspace-id header, per requireWorkspace); the read paths below are
+// the ones that go unscoped.
+router.post("/extract", requireResolvedWorkspace, canUploadVouchers, upload.single("file"), async (req: any, res) => {
   const correlationId =
     req.headers["x-request-id"] ||
     req.headers["x-correlation-id"] ||
@@ -332,6 +422,14 @@ router.post("/extract", requireAuth, requireWorkspace, upload.single("file"), as
     const createdBy = getRequesterId(req);
     if (!createdBy) return res.status(401).json({ message: "Unauthenticated", correlationId });
 
+    // The record cannot be created before the upload — VoucherExtraction.s3 is
+    // `required: true`, so there is nothing valid to persist until the object
+    // exists. That leaves a window between upload and create, and anything that
+    // fails inside it (schema validation, a lost Mongo connection) would strand
+    // a customer document in the bucket that no record references and no
+    // retention path can find. So the window is explicitly closed: on any
+    // failure the just-uploaded object is deleted before the error propagates.
+
     // 1) Upload original to S3
     const s3 = await uploadBufferToS3({
       buffer: file.buffer,
@@ -342,21 +440,44 @@ router.post("/extract", requireAuth, requireWorkspace, upload.single("file"), as
     });
 
     // 2) DB record (processing)
-    const record: any = await VoucherExtraction.create({
-      workspaceId: req.workspaceObjectId, // ← tenancy boundary (schema requires it)
-      customerId, // legacy mirror only (not the security boundary)
-      createdBy: new mongoose.Types.ObjectId(createdBy),
-      s3,
-      file: {
-        originalName: file.originalname,
-        mime: file.mimetype,
-        size: file.size,
-      },
-      docType: voucherType,
-      status: "PROCESSING",
-      // Demo Platform — snapshot caller's demo flag so future renders watermark correctly.
-      isDemo: req.user?.isDemoUser === true,
-    });
+    let record: any;
+    try {
+      record = await VoucherExtraction.create({
+        workspaceId: tenantScope(req), // ← tenancy boundary (schema requires it)
+        customerId, // legacy mirror only (not the security boundary)
+        createdBy: new mongoose.Types.ObjectId(createdBy),
+        s3,
+        file: {
+          originalName: file.originalname,
+          mime: file.mimetype,
+          size: file.size,
+        },
+        docType: voucherType,
+        status: "PROCESSING",
+        // Demo Platform — snapshot caller's demo flag so future renders watermark correctly.
+        isDemo: req.user?.isDemoUser === true,
+      });
+    } catch (createErr: any) {
+      try {
+        await deleteObject(s3.key);
+        logger.warn("[vouchers] record create failed; uploaded object removed", {
+          correlationId,
+          key: s3.key,
+          message: createErr?.message,
+        });
+      } catch (cleanupErr: any) {
+        // Deletion is best-effort: report the orphan loudly rather than swallow
+        // the original failure, so it can be reclaimed out of band.
+        logger.error("[vouchers] ORPHANED S3 OBJECT — create failed and cleanup failed", {
+          correlationId,
+          bucket: s3.bucket,
+          key: s3.key,
+          createError: createErr?.message,
+          cleanupError: cleanupErr?.message,
+        });
+      }
+      throw createErr;
+    }
 
     const debug: any = {
       correlationId,
@@ -564,19 +685,15 @@ router.post("/extract", requireAuth, requireWorkspace, upload.single("file"), as
 
 /**
  * POST /api/vouchers/:id/render
- * Force regenerate PDF from extractedJson.
- * USER can only render own record; ADMIN can render any.
+ * Force regenerate PDF from extractedJson. Shared queue — the grant plus the
+ * workspace match is the whole check; authorship confers nothing.
  */
-router.post("/:id/render", requireAuth, requireWorkspace, async (req: any, res) => {
+router.post("/:id/render", canWriteVouchers, async (req: any, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-  const row: any = await scopedFindById(VoucherExtraction, id, req.workspaceObjectId);
+  const row: any = await findVoucherInScope(req, id);
   if (!row) return res.status(404).json({ message: "Not found" });
-
-  const isAdmin = isRequesterAdmin(req);
-  const isOwner = String(row.createdBy) === String(req.user?._id || req.user?.id);
-  if (!isAdmin && !isOwner) return res.status(403).json({ message: "Forbidden" });
 
   if (!row.extractedJson) {
     return res.status(422).json({ message: "Cannot render: extractedJson missing" });
@@ -619,32 +736,20 @@ router.post("/:id/render", requireAuth, requireWorkspace, async (req: any, res) 
 });
 
 /**
- * GET /api/vouchers/my
+ * GET /api/vouchers — the workspace queue.
+ *
+ * This replaces the old pair of listings: GET /my (own records) and GET /
+ * (admin, everything in the workspace). They returned different slices of the
+ * same collection under different guards, which is what made "who can see
+ * what" ambiguous. There is now one list, scoped to the caller's workspace,
+ * behind one grant.
+ *
+ * Explicit workspaceId filter: this route doesn't set the _workspaceId query
+ * option, so the workspaceScope plugin won't auto-inject — workspaceId is the
+ * tenancy boundary and must be in the filter directly.
  */
-router.get("/my", requireAuth, requireWorkspace, async (req: any, res) => {
-  const createdBy = getRequesterId(req);
-
-  // Explicit workspaceId filter: these routes don't set the _workspaceId query
-  // option, so the workspaceScope plugin won't auto-inject — workspaceId is the
-  // tenancy boundary and must be in the filter directly.
-  const rows = await VoucherExtraction.find({
-    workspaceId: req.workspaceObjectId,
-    createdBy,
-  })
-    .sort({ createdAt: -1 })
-    .limit(50)
-    .lean();
-
-  return res.json(rows);
-});
-
-/**
- * GET /api/vouchers (admin)
- */
-router.get("/", requireAuth, requireAdmin, requireWorkspace, async (req: any, res) => {
-  // Explicit workspaceId filter (see note in GET /my): scope every admin listing
-  // to the caller's workspace — never to a client-supplied customerId.
-  const rows = await VoucherExtraction.find({ workspaceId: req.workspaceObjectId })
+router.get("/", canReadVouchers, async (req: any, res) => {
+  const rows = await VoucherExtraction.find({ ...voucherScope(req) })
     .sort({ createdAt: -1 })
     .limit(200)
     .lean();
@@ -654,18 +759,13 @@ router.get("/", requireAuth, requireAdmin, requireWorkspace, async (req: any, re
 
 /**
  * GET /api/vouchers/:id
- * USER can only open own record; ADMIN can open any
  */
-router.get("/:id", requireAuth, requireWorkspace, async (req: any, res) => {
+router.get("/:id", canReadVouchers, async (req: any, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-  const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceObjectId }).lean();
+  const row: any = await findVoucherInScope(req, id).lean();
   if (!row) return res.status(404).json({ message: "Not found" });
-
-  const isAdmin = isRequesterAdmin(req);
-  const isOwner = String(row.createdBy) === String(req.user?._id || req.user?.id);
-  if (!isAdmin && !isOwner) return res.status(403).json({ message: "Forbidden" });
 
   return res.json(row);
 });
@@ -674,17 +774,13 @@ router.get("/:id", requireAuth, requireWorkspace, async (req: any, res) => {
  * GET /api/vouchers/:id/open
  * Signed URL for UPLOADED ORIGINAL voucher file.
  */
-router.get("/:id/open", requireAuth, requireWorkspace, async (req: any, res) => {
+router.get("/:id/open", canReadVouchers, async (req: any, res) => {
   try {
     const { id } = req.params;
     if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-    const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceObjectId }).lean();
+    const row: any = await findVoucherInScope(req, id).lean();
     if (!row) return res.status(404).json({ message: "Not found" });
-
-    const isAdmin = isRequesterAdmin(req);
-    const isOwner = String(row.createdBy) === String(req.user?._id || req.user?.id);
-    if (!isAdmin && !isOwner) return res.status(403).json({ message: "Forbidden" });
 
     const bucket = String(row?.s3?.bucket || env.S3_BUCKET);
     const key = String(row?.s3?.key || "");
@@ -707,17 +803,13 @@ router.get("/:id/open", requireAuth, requireWorkspace, async (req: any, res) => 
  * ✅ GET /api/vouchers/:id/open-rendered
  * Signed URL for REGENERATED PDF stored in record.renderedS3
  */
-router.get("/:id/open-rendered", requireAuth, requireWorkspace, async (req: any, res) => {
+router.get("/:id/open-rendered", canReadVouchers, async (req: any, res) => {
   try {
     const { id } = req.params;
     if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-    const row: any = await VoucherExtraction.findOne({ _id: id, workspaceId: req.workspaceObjectId }).lean();
+    const row: any = await findVoucherInScope(req, id).lean();
     if (!row) return res.status(404).json({ message: "Not found" });
-
-    const isAdmin = isRequesterAdmin(req);
-    const isOwner = String(row.createdBy) === String(req.user?._id || req.user?.id);
-    if (!isAdmin && !isOwner) return res.status(403).json({ message: "Forbidden" });
 
     const bucket = String(row?.renderedS3?.bucket || "");
     const key = String(row?.renderedS3?.key || "");
@@ -747,14 +839,14 @@ router.get("/:id/open-rendered", requireAuth, requireWorkspace, async (req: any,
 });
 
 /**
- * PATCH /api/vouchers/:id (admin correction optional)
+ * PATCH /api/vouchers/:id — correct a record.
  * body: { extractedJson?, docType?, status?, error? }
  */
-router.patch("/:id", requireAuth, requireAdmin, requireWorkspace, async (req: any, res) => {
+router.patch("/:id", canWriteVouchers, async (req: any, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid id" });
 
-  const row: any = await scopedFindById(VoucherExtraction, id, req.workspaceObjectId);
+  const row: any = await findVoucherInScope(req, id);
   if (!row) return res.status(404).json({ message: "Not found" });
 
   const { extractedJson, docType, status, error } = req.body || {};
