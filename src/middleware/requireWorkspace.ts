@@ -134,6 +134,39 @@ export async function resolveWorkspaceForUser(
 }
 
 /**
+ * requireResolvedWorkspace — the fail-closed companion to requireWorkspace.
+ *
+ * requireWorkspace deliberately lets a SUPERADMIN through with NO workspace
+ * context (see the bypass below), and several routes depend on that — payroll
+ * answers such a request with its own 400, admin.task-automations falls back to
+ * the SYSTEM workspace. So the bypass itself cannot simply be deleted.
+ *
+ * The danger is a route that instead feeds the unset value straight into a
+ * query. Mongoose strips undefined conditions, so `find({ workspaceId:
+ * undefined })` becomes `find({})` — every document of every tenant — and
+ * `scopedFindById` degrades to a bare `findById`. That is a silent cross-tenant
+ * read, not an error.
+ *
+ * Mount this immediately after requireWorkspace on any router whose handlers
+ * scope by workspace, and the unresolved case is denied instead of widened.
+ */
+export const requireResolvedWorkspace = (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void => {
+  if (!req.workspaceObjectId || !req.workspaceId) {
+    res.status(403).json({
+      success: false,
+      error:
+        "Workspace context required. Supply workspaceId (body, query, param, or x-workspace-id header).",
+    });
+    return;
+  }
+  next();
+};
+
+/**
  * requireWorkspace — resolves the actual CustomerWorkspace document
  * and attaches `req.workspaceId` (string _id), `req.workspaceObjectId`
  * (ObjectId _id), and `req.workspace` (lean doc).
