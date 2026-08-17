@@ -77,7 +77,45 @@ export interface SourcedApproval {
   refusalRatePct: number;
   /** WHY we are allowed to print `label`. Never optional. */
   citation: string;
+  /* ── The citation, split into the parts a footnote needs ────────────
+   * `citation` is one sentence written for a human reading a code file.
+   * The panel's Sources block needs the same facts as FIELDS, so it can
+   * set them in its own voice ("~78% — issued, FY25. Source: …") without
+   * a frontend parsing an English sentence to find the year in it.
+   *
+   * These are DERIVED FROM the citation above, not new claims, and they
+   * are on the same object for the reason rule 3 in this file's header
+   * gives: a figure cannot be copied out of here without the provenance
+   * that justifies it, and now it cannot be copied out without the
+   * provenance a reader will actually be shown either. */
+  /**
+   * The construct the published statistic actually measures. NOT
+   * interchangeable words — "issued" is a count of visas granted,
+   * "granted" is the destination's own term for the same, "approved" is
+   * a decision rate. The US figure is the complement of an ADJUSTED
+   * REFUSAL rate and is therefore the loosest of the three; it is still
+   * "issued" rather than "approved" because that is what the State
+   * Department's number counts.
+   */
+  metricType: "issued" | "granted" | "approved";
+  /** The publication period, as the publisher labels it. */
+  year: string;
+  /** The publishing body, short enough to end a footnote sentence. */
+  sourceName: string;
 }
+
+/**
+ * The one sentence that has to accompany EVERY approval figure.
+ *
+ * It is a constant rather than per-country copy because it is not a fact
+ * about any destination — it is the boundary of what the number can be
+ * read to mean, and that boundary is identical for all 31. See rule 2 in
+ * this file's header: "~78% of Indian applicants were approved" is a fact
+ * about the US State Department; "you have a 78% chance" is a lie about a
+ * person we know nothing about.
+ */
+export const APPROVAL_OUTCOME_DISCLAIMER =
+  "Historical destination outcome rate for Indian applicants, not a prediction of any individual's result.";
 
 /**
  * THE ONLY PLACE A NUMBER MAY LIVE. 31 entries: US, GB, and the 29 Schengen
@@ -92,11 +130,22 @@ export const SOURCED_APPROVAL: Readonly<Record<string, SourcedApproval>> = Objec
     label: "~78% (India, FY25)",
     refusalRatePct: 22.0,
     citation: "US State Department, adjusted refusal rate 22.0% (FY25)",
+    metricType: "issued",
+    year: "FY25",
+    sourceName: "US State Department",
   },
   GB: {
     label: "~93% (India)",
     refusalRatePct: 7,
     citation: "UK Home Office, under 7% rejection for Indian applicants",
+    /* No year, and that is the honest answer rather than a gap. The Home
+     * Office figure we hold is undated in its own publication, which is
+     * why `label` says "(India)" and not "(India, 2024)". The footnote
+     * omits the period rather than inventing one — see approvalSourceFor,
+     * which treats an empty year as "no period to state". */
+    metricType: "issued",
+    year: "",
+    sourceName: "UK Home Office",
   },
   ...Object.fromEntries(
     SCHENGEN_MEMBERS.map((iso2) => [
@@ -105,21 +154,110 @@ export const SOURCED_APPROVAL: Readonly<Record<string, SourcedApproval>> = Objec
         label: "~85% (India, 2024)",
         refusalRatePct: 15,
         citation: "European Commission, ~15% Schengen visa rejection for Indian applicants (2024 aggregate)",
+        metricType: "issued" as const,
+        year: "2024",
+        /* "(Schengen aggregate)" is load-bearing and is NOT decoration.
+         * This figure is the Commission's number across all Schengen
+         * states, not a rate for the country whose panel it appears on,
+         * and the footnote is the only place a reader can learn that.
+         * Dropping the qualifier would turn one honest aggregate into 29
+         * per-country claims we do not hold. */
+        sourceName: "European Commission (Schengen aggregate)",
       },
     ]),
   ),
 });
 
-/** VISA_FREE/VOA → Easy · E_VISA → Moderate · STICKER → Hard. */
+/**
+ * The provenance for the figure `approvalChancesFor` WILL RETURN — or
+ * null when that figure is not a sourced number.
+ *
+ * ── WHY THIS TAKES THE CATEGORY AND NOT JUST THE ISO2 ────────────────
+ * Because SOURCED_APPROVAL having an entry is NOT the same question as
+ * the panel showing that entry. `approvalChancesFor` short-circuits on
+ * category first: a VISA_FREE country returns "Not required" and an
+ * E_VISA/VOA/TRAVEL_AUTH country returns "Very High" BEFORE the sourced
+ * map is ever consulted. So a country can be in the map and still be
+ * displaying a fixed string.
+ *
+ * Answering "is there a row for this code?" would put a State-Department
+ * citation under the words "Very High", which is precisely the failure
+ * rule 3 of this file's header exists to prevent — a citation next to a
+ * figure it does not justify. This function instead asks the SAME
+ * question in the SAME order the display does, so the credit and the
+ * number can never disagree.
+ *
+ * Pure, like everything else here: no clock, no database, no request.
+ */
+export interface ApprovalProvenance {
+  /** The exact string the panel is showing. Echoed so the footnote can
+   *  lead with it and a reader can see the credit belongs to it. */
+  value: string;
+  metricType: SourcedApproval["metricType"];
+  /** Empty string when the publication is undated — see GB above. */
+  year: string;
+  sourceName: string;
+  /** The full sentence, for a title attribute. */
+  citation: string;
+  /** Identical on every country; carried here so one payload is enough. */
+  disclaimer: string;
+}
+
+export function approvalSourceFor(
+  iso2: string,
+  category: SeedVisaCategory,
+): ApprovalProvenance | null {
+  const value = approvalChancesFor(iso2, category);
+  const sourced = SOURCED_APPROVAL[iso2.toUpperCase()];
+  // The identity check, not a category re-test: the credit is attached
+  // only when the displayed string IS the sourced label. If the two ever
+  // stop matching, this returns null and the panel simply shows no
+  // credit — the safe direction to fail in.
+  if (!sourced || value !== sourced.label) return null;
+  return {
+    value,
+    metricType: sourced.metricType,
+    year: sourced.year,
+    sourceName: sourced.sourceName,
+    citation: sourced.citation,
+    disclaimer: APPROVAL_OUTCOME_DISCLAIMER,
+  };
+}
+
+/**
+ * VISA_FREE/VOA/TRAVEL_AUTH → Easy · E_VISA → Moderate · STICKER → Hard ·
+ * RESTRICTED → Very Hard.
+ *
+ * The two floors added with the v3 seed (2026-08-16), and why they sit where
+ * they do. NO EXISTING FLOOR MOVED — the four original categories band exactly
+ * as they did before, and visaDifficulty.test.ts still asserts every one.
+ *
+ *   · TRAVEL_AUTH is EASY, the same floor as visa-free. A TDAC or an ETA is a
+ *     form submitted before you fly with no adjudication behind it: nobody
+ *     assesses your ties to India, and nobody refuses you for your bank
+ *     balance. Banding it with E_VISA would say the two involve the same kind
+ *     of work, and they do not. It is one step of friction above nothing,
+ *     which the band vocabulary has no room for — and of the two neighbours,
+ *     "Easy" is the true one.
+ *   · RESTRICTED is VERY HARD, the ceiling, and it is the only category that
+ *     starts there. It does not mean a hard visa; it means there is no
+ *     ordinary tourist route at all. The band system cannot say that, so it
+ *     says the hardest thing it can and the country's own note carries the
+ *     rest. This is the honest floor: anything softer would read as "difficult
+ *     but doable", which for Pakistan on an Indian passport is not true.
+ */
 function categoryFloorIndex(category: SeedVisaCategory): number {
   switch (category) {
     case "VISA_FREE":
     case "VOA":
+    case "TRAVEL_AUTH":
       return 0; // Easy
     case "E_VISA":
       return 1; // Moderate
     case "STICKER":
       return 2; // Hard
+    case "RESTRICTED":
+      return 3; // Very Hard
   }
 }
 
@@ -159,7 +297,14 @@ export function difficultyFor(iso2: string, category: SeedVisaCategory): Difficu
  */
 export function approvalChancesFor(iso2: string, category: SeedVisaCategory): string {
   if (category === "VISA_FREE") return "Not required";
-  if (category === "E_VISA" || category === "VOA") return "Very High";
-  // STICKER, from here down.
+  // TRAVEL_AUTH joins e-visa and on-arrival at "Very High" rather than getting
+  // a fifth string. An arrival card is granted on submission — if anything it
+  // is MORE certain than an e-visa — and inventing new copy for it would put a
+  // fourth honest string in a vocabulary the frontend renders by exact match.
+  if (category === "E_VISA" || category === "VOA" || category === "TRAVEL_AUTH") return "Very High";
+  // STICKER and RESTRICTED, from here down. RESTRICTED deliberately falls
+  // through to the same "Varies by profile" rather than getting a string that
+  // sounds like a refusal statistic: we hold no rate for a corridor with no
+  // route, and the seed's own categoryNote is what actually explains it.
   return SOURCED_APPROVAL[iso2.toUpperCase()]?.label ?? "Varies by profile";
 }
