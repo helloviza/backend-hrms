@@ -114,6 +114,25 @@ describe("cookieDomainForPath — domain is a function of the issuing path", () 
     expect(cookieDomainForPath("/api/consumer")).toEqual({ domain: ".helloviza.ai" });
   });
 
+  it("omits the domain attribute for a consumer path when CONSUMER_COOKIE_DOMAIN is set but EMPTY", () => {
+    // ABSENT and PRESENT-BUT-EMPTY are different answers here. Absent means
+    // "nobody configured this, use the production default" (asserted by the
+    // test above). Empty means "deliberately host-only", which is the only
+    // thing that works on localhost — a browser discards a cookie scoped to
+    // .helloviza.ai when the page is on 127.0.0.1, so before this the local
+    // consumer session could not be established at all: /login returned 200
+    // with a Set-Cookie the browser then threw away.
+    process.env.CONSUMER_COOKIE_DOMAIN = "";
+    process.env.COOKIE_DOMAIN = ".plumtrips.com";
+    expect(cookieDomainForPath("/api/consumer")).toEqual({});
+    expect(cookieDomainForPath("/api/consumer/auth/refresh")).toEqual({});
+  });
+
+  it("treats a whitespace-only CONSUMER_COOKIE_DOMAIN as empty, not as a domain", () => {
+    process.env.CONSUMER_COOKIE_DOMAIN = "   ";
+    expect(cookieDomainForPath("/api/consumer")).toEqual({});
+  });
+
   it("uses the B2B COOKIE_DOMAIN for every non-consumer path", () => {
     process.env.CONSUMER_COOKIE_DOMAIN = ".helloviza.ai";
     process.env.COOKIE_DOMAIN = ".plumtrips.com";

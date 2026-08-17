@@ -87,6 +87,21 @@ function clearConsumerCookies(res: any): void {
   res.clearCookie(CONSUMER_REFRESH_COOKIE, refreshOpts);
 }
 
+/**
+ * Mints both tokens and sets both cookies. EXPORTED so the dev-only stub
+ * login (routes/consumer.devAuth.ts) issues a session through this exact
+ * function rather than reimplementing it.
+ *
+ * That matters: a stub that signed its own token would be a second, parallel
+ * notion of "a consumer session" that could drift from this one — different
+ * cookie flags, a missing `typ` claim, a stale tokenVersion. Sharing the
+ * signer means the dev shortcut is only a shortcut past the PASSWORD, and the
+ * wall itself (secret, claims, cookie scoping, revocation) is the real one.
+ */
+export function issueConsumerSession(res: any, consumer: { _id: any; tokenVersion: number }) {
+  return issueSession(res, consumer);
+}
+
 function issueSession(res: any, consumer: { _id: any; tokenVersion: number }) {
   const input = { consumerId: String(consumer._id), tokenVersion: consumer.tokenVersion };
   const accessToken = signConsumerAccessToken(input);

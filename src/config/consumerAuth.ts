@@ -151,9 +151,40 @@ export function assertConsumerSecretIsolated(): void {
 export function cookieDomainForPath(path: string): { domain?: string } {
   const isConsumerPath = String(path || "").startsWith(CONSUMER_PATH_PREFIX);
 
-  const raw = isConsumerPath
-    ? readEnv("CONSUMER_COOKIE_DOMAIN") ?? DEFAULT_CONSUMER_COOKIE_DOMAIN
-    : readEnv("COOKIE_DOMAIN");
+  if (!isConsumerPath) {
+    return domainOption(readEnv("COOKIE_DOMAIN"));
+  }
 
+  /* ── ABSENT vs PRESENT-BUT-EMPTY ───────────────────────────────────
+   *
+   * These are DIFFERENT answers on the consumer branch, and conflating
+   * them made local development impossible.
+   *
+   *   ABSENT            -> ".helloviza.ai"  (the production default)
+   *   PRESENT AND EMPTY -> omit `domain=`   (a host-only cookie)
+   *
+   * The bug this fixes: readEnv() maps "" to undefined, so
+   * `readEnv(...) ?? DEFAULT` treated an explicitly-emptied variable as if
+   * nobody had set it and reinstated ".helloviza.ai". A browser on
+   * localhost silently DISCARDS a cookie scoped to a domain it is not on,
+   * so the failure was invisible in the worst way — /login returned 200
+   * with Set-Cookie, and the very next request was a 401. There was no
+   * value of CONSUMER_COOKIE_DOMAIN that produced a working local session.
+   *
+   * Production is unaffected: an unset variable still yields the default,
+   * which is the case every deployed environment is in. Only an operator
+   * who deliberately writes `CONSUMER_COOKIE_DOMAIN=` gets host-only
+   * cookies — which is exactly what .env.development.example now does, and
+   * what the B2B COOKIE_DOMAIN branch above has always done.
+   * ────────────────────────────────────────────────────────────────── */
+  const declared = process.env.CONSUMER_COOKIE_DOMAIN;
+  if (declared != null && String(declared).trim() === "") {
+    return {};
+  }
+
+  return domainOption(readEnv("CONSUMER_COOKIE_DOMAIN") ?? DEFAULT_CONSUMER_COOKIE_DOMAIN);
+}
+
+function domainOption(raw: string | undefined): { domain?: string } {
   return raw ? { domain: raw } : {};
 }

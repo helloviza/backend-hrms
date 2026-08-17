@@ -472,6 +472,41 @@ app.use("/api/auth", auth);
 import consumerAuthRouter from "./routes/consumer.auth.js";
 app.use("/api/consumer/auth", consumerAuthRouter);
 
+/* The consumer's own profile — passports, addresses, co-travellers and the
+ * shared document locker. Every route inside gates on requireConsumer and
+ * filters on req.consumer.id; there is no by-id lookup and no admin view.
+ * See routes/consumer.profile.ts. */
+import consumerProfileRouter from "./routes/consumer.profile.js";
+app.use("/api/consumer/profile", consumerProfileRouter);
+
+/* ────────────────────────────────────────────────────────────────
+ * DEV-ONLY consumer stub login — /api/consumer/dev-auth.
+ *
+ * Real Google/Microsoft OAuth for helloviza.ai is being built separately.
+ * Until it lands, this issues a REAL consumer session (real secret, real
+ * cookies, real requireConsumer, real revocation) for a SEEDED consumer
+ * without a password, so everything downstream of "who is the current
+ * consumer" can be built and verified.
+ *
+ * ⚠ THE IMPORT IS DYNAMIC AND CONDITIONAL, AND THAT IS THE POINT.
+ * A static `import` is hoisted and evaluated unconditionally, so wrapping a
+ * static import's MOUNT in an if() would still load the module in
+ * production. Awaiting the import inside the guard means that in production
+ * the module is never evaluated, the router never exists, and the path is a
+ * plain 404 — not a 403, which would confirm the endpoint is there.
+ *
+ * The router independently refuses to load, and refuses every request, when
+ * NODE_ENV === "production" (routes/consumer.devAuth.ts). Two gates, because
+ * this one is a property of this call site and one careless edit away.
+ * ──────────────────────────────────────────────────────────────── */
+if (process.env.NODE_ENV !== "production") {
+  const { default: consumerDevAuthRouter } = await import("./routes/consumer.devAuth.js");
+  app.use("/api/consumer/dev-auth", consumerDevAuthRouter);
+  logger.warn(
+    "DEV-ONLY consumer stub login mounted at /api/consumer/dev-auth — issues sessions with NO password",
+  );
+}
+
 // Self-service signup (fully public — no requireAuth)
 import selfServiceSignupRouter from "./routes/signup.js";
 app.use("/api/signup", selfServiceSignupRouter);
