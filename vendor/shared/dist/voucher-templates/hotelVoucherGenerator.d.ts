@@ -33,6 +33,12 @@ export interface HotelVoucherParams {
     amenities?: string[];
     guestFirstName: string;
     leadGuestName: string;
+    /**
+     * Everyone staying on the booking, lead included, in whatever order the
+     * source document listed them. Optional: when absent or when it names only
+     * the lead, the voucher renders exactly as it did before.
+     */
+    allGuestNames?: string[];
     inclusions: string[];
     cancelPolicies: any[];
     displayVoucherStatus: string;

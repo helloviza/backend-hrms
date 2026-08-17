@@ -563,6 +563,12 @@ export function adaptHotel(v: PlumtripsVoucher): HotelVoucherParams {
     rateConditions: meaningfulOptionalList(cleanNotes),
     guestFirstName: firstNameOf(guest.primary_guest),
     leadGuestName: nz(guest.primary_guest),
+    // The co-guests. The extract has carried all_guest_names[] all along —
+    // normalize keeps it, the record holds it — and this adapter simply never
+    // read it, so a two-guest booking rendered as though one person were
+    // travelling. Same miss as the flight baggage fields: data present, never
+    // mapped. The template de-duplicates the lead out of this list.
+    allGuestNames: Array.isArray(guest.all_guest_names) ? guest.all_guest_names : [],
     inclusions: Array.isArray(room.inclusions) ? room.inclusions : [],
     cancelPolicies: synthesizeCancelPolicies(v, checkOut), // Guard (c)
     displayVoucherStatus: "CONFIRMED",
