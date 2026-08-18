@@ -1,0 +1,1077 @@
+[
+  {
+    "territory": "Guernsey",
+    "iso3": "GGY",
+    "haul": "Domestic"
+  },
+  {
+    "territory": "Isle Of Man",
+    "iso3": "IMN",
+    "haul": "Domestic"
+  },
+  {
+    "territory": "Jersey",
+    "iso3": "JEY",
+    "haul": "Domestic"
+  },
+  {
+    "territory": "United Kingdom",
+    "iso3": "GBR",
+    "haul": "Domestic"
+  },
+  {
+    "territory": "Afghanistan",
+    "iso3": "AFG",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "American Samoa",
+    "iso3": "ASM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Angola",
+    "iso3": "AGO",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Anguilla",
+    "iso3": "AIA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Antigua and Barbuda",
+    "iso3": "ATG",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Argentina",
+    "iso3": "ARG",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Armenia",
+    "iso3": "ARM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Aruba",
+    "iso3": "ABW",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Ascension Island",
+    "iso3": "SHN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Australia",
+    "iso3": "AUS",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Azerbaijan",
+    "iso3": "AZE",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Bahamas",
+    "iso3": "BHS",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Bahrain",
+    "iso3": "BHR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Bangladesh",
+    "iso3": "BGD",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Barbados",
+    "iso3": "BRB",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Belize",
+    "iso3": "BLZ",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Benin",
+    "iso3": "BEN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Bermuda",
+    "iso3": "BMU",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Bolivia",
+    "iso3": "BOL",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Botswana",
+    "iso3": "BWA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Brazil",
+    "iso3": "BRA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "British Virgin Islands",
+    "iso3": "VGB",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Brunei",
+    "iso3": "BRN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Burkina Faso",
+    "iso3": "BFA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Burundi",
+    "iso3": "BDI",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Cambodia",
+    "iso3": "KHM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Cameroon",
+    "iso3": "CMR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Canada",
+    "iso3": "CAN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Cape Verde",
+    "iso3": "CPV",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Cayman Islands",
+    "iso3": "CYM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Central African Republic",
+    "iso3": "CAF",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Chad",
+    "iso3": "TCD",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Chile",
+    "iso3": "CHL",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "China",
+    "iso3": "CHN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Colombia",
+    "iso3": "COL",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Comoros",
+    "iso3": "COM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Congo-Brazzaville",
+    "iso3": "COG",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Cook Islands",
+    "iso3": "COK",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Costa Rica",
+    "iso3": "CRI",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Cuba",
+    "iso3": "CUB",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Curacao",
+    "iso3": "CUW",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Djibouti",
+    "iso3": "DJI",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Dominica",
+    "iso3": "DMA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Dominican Republic",
+    "iso3": "DOM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "DR Congo",
+    "iso3": "COD",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Ecuador",
+    "iso3": "ECU",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "El Salvador",
+    "iso3": "SLV",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Equatorial Guinea",
+    "iso3": "GNQ",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Eritrea",
+    "iso3": "ERI",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Ethiopia",
+    "iso3": "ETH",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Falkland Islands",
+    "iso3": "FLK",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Fiji",
+    "iso3": "FJI",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "French Guiana",
+    "iso3": "GUF",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Gabon",
+    "iso3": "GAB",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Gambia",
+    "iso3": "GMB",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Georgia",
+    "iso3": "GEO",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Ghana",
+    "iso3": "GHA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Grenada",
+    "iso3": "GRD",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Guadeloupe",
+    "iso3": "GLP",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Guam",
+    "iso3": "GUM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Guatemala",
+    "iso3": "GTM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Guinea",
+    "iso3": "GIN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Guinea-Bissau",
+    "iso3": "GNB",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Guyana",
+    "iso3": "GUY",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Haiti",
+    "iso3": "HTI",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Honduras",
+    "iso3": "HND",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Hong Kong",
+    "iso3": "HKG",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "India",
+    "iso3": "IND",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Indonesia",
+    "iso3": "IDN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Iran",
+    "iso3": "IRN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Iraq",
+    "iso3": "IRQ",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Israel",
+    "iso3": "ISR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Ivory Coast",
+    "iso3": "CIV",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Jamaica",
+    "iso3": "JAM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Japan",
+    "iso3": "JPN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Jordan",
+    "iso3": "JOR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Kazakhstan",
+    "iso3": "KAZ",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Kenya",
+    "iso3": "KEN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Kuwait",
+    "iso3": "KWT",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Kyrgyzstan",
+    "iso3": "KGZ",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Laos",
+    "iso3": "LAO",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Lebanon",
+    "iso3": "LBN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Lesotho",
+    "iso3": "LSO",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Liberia",
+    "iso3": "LBR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Macao",
+    "iso3": "MAC",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Madagascar",
+    "iso3": "MDG",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Malawi",
+    "iso3": "MWI",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Malaysia",
+    "iso3": "MYS",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Maldives",
+    "iso3": "MDV",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Mali",
+    "iso3": "MLI",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Marshall Islands",
+    "iso3": "MHL",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Martinique",
+    "iso3": "MTQ",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Mauritania",
+    "iso3": "MRT",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Mauritius",
+    "iso3": "MUS",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Mexico",
+    "iso3": "MEX",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Moldova",
+    "iso3": "MDA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Mongolia",
+    "iso3": "MNG",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Mozambique",
+    "iso3": "MOZ",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Myanmar",
+    "iso3": "MMR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Namibia",
+    "iso3": "NAM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Nepal",
+    "iso3": "NPL",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "New Caledonia",
+    "iso3": "NCL",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "New Zealand",
+    "iso3": "NZL",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Nicaragua",
+    "iso3": "NIC",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Niger",
+    "iso3": "NER",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Nigeria",
+    "iso3": "NGA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "North Korea",
+    "iso3": "PRK",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Oman",
+    "iso3": "OMN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Pakistan",
+    "iso3": "PAK",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Palau",
+    "iso3": "PLW",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Panama",
+    "iso3": "PAN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Papua New Guinea",
+    "iso3": "PNG",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Paraguay",
+    "iso3": "PRY",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Peru",
+    "iso3": "PER",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Philippines",
+    "iso3": "PHL",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Puerto Rico",
+    "iso3": "PRI",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Qatar",
+    "iso3": "QAT",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Reunion",
+    "iso3": "REU",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Russia",
+    "iso3": "RUS",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Rwanda",
+    "iso3": "RWA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Sao Tome Islands",
+    "iso3": "STP",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Saudi Arabia",
+    "iso3": "SAU",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Senegal",
+    "iso3": "SEN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Seychelles",
+    "iso3": "SYC",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Sierra Leone",
+    "iso3": "SLE",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Singapore",
+    "iso3": "SGP",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Solomon Islands",
+    "iso3": "SLB",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Somali Republic",
+    "iso3": "SOM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "South Africa",
+    "iso3": "ZAF",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "South Korea",
+    "iso3": "KOR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "South Sudan",
+    "iso3": "SSD",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Sri Lanka",
+    "iso3": "LKA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "St Kitts and Nevis",
+    "iso3": "KNA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "St Lucia",
+    "iso3": "LCA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "St Vincent and the Grenadines",
+    "iso3": "VCT",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Sudan",
+    "iso3": "SDN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Surinam",
+    "iso3": "SUR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Swaziland",
+    "iso3": "SWZ",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Syria",
+    "iso3": "SYR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Tahiti",
+    "iso3": "PYF",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Taiwan",
+    "iso3": "TWN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Tajikistan",
+    "iso3": "TJK",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Tanzania",
+    "iso3": "TZA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Thailand",
+    "iso3": "THA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Timor",
+    "iso3": "TLS",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Togo",
+    "iso3": "TGO",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Tonga",
+    "iso3": "TON",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Trinidad and Tobago",
+    "iso3": "TTO",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Turkmenistan",
+    "iso3": "TKM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Turks and Caicos Islands",
+    "iso3": "TCA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Uganda",
+    "iso3": "UGA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Ukraine",
+    "iso3": "UKR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "United Arab Emirates",
+    "iso3": "ARE",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "United States",
+    "iso3": "USA",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Uruguay",
+    "iso3": "URY",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Uzbekistan",
+    "iso3": "UZB",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Vanuatu",
+    "iso3": "VUT",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Venezuela",
+    "iso3": "VEN",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Vietnam",
+    "iso3": "VNM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Virgin Islands (U.S.A)",
+    "iso3": "VIR",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Wake Islands",
+    "iso3": "UMI",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Yemen",
+    "iso3": "YEM",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Zambia",
+    "iso3": "ZMB",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Zimbabwe",
+    "iso3": "ZWE",
+    "haul": "Long Haul"
+  },
+  {
+    "territory": "Albania",
+    "iso3": "ALB",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Algeria",
+    "iso3": "DZA",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Austria",
+    "iso3": "AUT",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Belarus",
+    "iso3": "BLR",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Belgium",
+    "iso3": "BEL",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Bosnia-Herzegovina",
+    "iso3": "BIH",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Bulgaria",
+    "iso3": "BGR",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Croatia",
+    "iso3": "HRV",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Cyprus",
+    "iso3": "CYP",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Czech Republic",
+    "iso3": "CZE",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Denmark",
+    "iso3": "DNK",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Egypt",
+    "iso3": "EGY",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Estonia",
+    "iso3": "EST",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Faroe Islands",
+    "iso3": "FRO",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Finland",
+    "iso3": "FIN",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "France",
+    "iso3": "FRA",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Germany",
+    "iso3": "DEU",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Gibraltar",
+    "iso3": "GIB",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Greece",
+    "iso3": "GRC",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Greenland",
+    "iso3": "GRL",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Hungary",
+    "iso3": "HUN",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Iceland",
+    "iso3": "ISL",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Ireland",
+    "iso3": "IRL",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Italy",
+    "iso3": "ITA",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Kosovo",
+    "iso3": "XKX",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Latvia",
+    "iso3": "LVA",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Libya",
+    "iso3": "LBY",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Lithuania",
+    "iso3": "LTU",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Luxembourg",
+    "iso3": "LUX",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Macedonia",
+    "iso3": "MKD",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Malta",
+    "iso3": "MLT",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Montenegro",
+    "iso3": "MNE",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Morocco",
+    "iso3": "MAR",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Netherlands",
+    "iso3": "NLD",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Norway",
+    "iso3": "NOR",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Poland",
+    "iso3": "POL",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Portugal",
+    "iso3": "PRT",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Romania",
+    "iso3": "ROU",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Serbia",
+    "iso3": "SRB",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Slovak Republic",
+    "iso3": "SVK",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Slovenia",
+    "iso3": "SVN",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Spain",
+    "iso3": "ESP",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Sweden",
+    "iso3": "SWE",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Switzerland",
+    "iso3": "CHE",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Tunisia",
+    "iso3": "TUN",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Turkey",
+    "iso3": "TUR",
+    "haul": "Short Haul"
+  },
+  {
+    "territory": "Western Sahara",
+    "iso3": "ESH",
+    "haul": "Short Haul"
+  }
+]

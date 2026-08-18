@@ -13,6 +13,7 @@ import {
 import { getObjectBuffer } from "../utils/s3Upload.js";
 import type { PlumtripsVoucher, VoucherType } from "../types/index.js";
 import logger from "../utils/logger.js";
+import { computeCarbonSafely } from "./carbonEngine.service.js";
 
 /**
  * Document extraction engine — shared, module-agnostic.
@@ -412,6 +413,13 @@ export async function runExtraction(doc: ExtractedDocumentDoc): Promise<void> {
     doc.error = undefined;
     doc.claimedAt = null;
     await doc.save();
+
+    // Carbon is a derived view over the rows just saved, so it runs AFTER the
+    // save and can never affect it: computeCarbonSafely swallows its own
+    // failures rather than turning a good extraction into a retry. A document
+    // that misses its carbon pass here is picked up by
+    // scripts/compute-carbon-records.ts, which is idempotent.
+    await computeCarbonSafely(doc, logger);
 
     logger.info("[DocExtraction] extracted", {
       id: String(doc._id),
