@@ -37,15 +37,27 @@ const docA = {
   attempts: 1, modelUsed: "gemini-2.5-flash", validationErrorCount: 0, verified: false,
   createdAt: new Date("2026-08-18T10:00:00Z"), updatedAt: new Date("2026-08-18T10:00:35Z"),
   flightRows: [
-    { passengerName: "Mr A One", passengerType: "Adult", airline: "Air India", flightNo: "AI-865",
+    { passengerIndex: 0, segmentIndex: 0,
+      passengerName: "Mr A One", passengerType: "Adult", airline: "Air India", flightNo: "AI-865",
       cabinClass: "Economy", depAirport: "DEL", depCity: "Delhi", depDate: "14 JUN, 2026",
       depTime: "08:35", arrAirport: "BOM", arrCity: "Mumbai", arrDate: "14 JUN, 2026",
       arrTime: "10:50", pnr: "AAA111", ticketNo: "098-1111111111" },
-    { passengerName: "Mrs A Two", passengerType: "Adult", airline: "Air India", flightNo: "AI-865",
+    { passengerIndex: 1, segmentIndex: 0,
+      passengerName: "Mrs A Two", passengerType: "Adult", airline: "Air India", flightNo: "AI-865",
       cabinClass: "Economy", depAirport: "DEL", depCity: "Delhi", depDate: "14 JUN, 2026",
       depTime: "08:35", arrAirport: "BOM", arrCity: "Mumbai", arrDate: "14 JUN, 2026",
       arrTime: "10:50", pnr: "AAA111", ticketNo: "098-2222222222" },
   ],
+};
+
+/** A hotel document: a supported extraction, but a mode the factor library has no entry for. */
+const docHotel = {
+  _id: "3333cccc3333cccc3333cccc",
+  workspaceId: WS_A, bookingId: BOOKING_A,
+  originalFilename: "tenantA-hotel-voucher.pdf", status: "extracted", docType: "hotel",
+  attempts: 1, modelUsed: "gemini-2.5-flash", validationErrorCount: 0, verified: false,
+  createdAt: new Date("2026-08-18T09:00:00Z"), updatedAt: new Date("2026-08-18T09:00:20Z"),
+  flightRows: [],
 };
 
 const docB = {
@@ -123,6 +135,41 @@ vi.mock("../models/Customer.js", () => ({
   },
 }));
 
+// Carbon results for the master join. Passenger 0 of the tenant-A document is a
+// clean High row; passenger 1 is deliberately an Insufficient Data row, so the
+// tests can prove a refusal to price travels through the join intact — nulls,
+// not zeros — rather than being flattened into a blank that reads like a
+// missing value.
+const carbonFindFilters: any[] = [];
+const carbonRecords = [
+  {
+    extractedDocumentId: "1111aaaa1111aaaa1111aaaa", passengerIndex: 0, segmentIndex: 0,
+    distanceKm: 1148.2, factorValue: 0.10916, factorUnit: "kg CO2e/passenger.km",
+    factorVersion: "DEFRA-2026-v1", factorSource: "DEFRA/DESNZ GHG Conversion Factors 2026",
+    rfVariant: "With RF", haulBand: "International, to/from non-UK",
+    resolvedCabin: "Economy class", cabinResolution: "stated", pax: 1, co2eKg: 125.34,
+    methodology: "CO2e = 1148.2 km x 0.10916 kg CO2e/passenger.km x 1 passenger = 125.34 kg CO2e.",
+    status: "calculated", confidence: "high", notes: null,
+  },
+  {
+    extractedDocumentId: "1111aaaa1111aaaa1111aaaa", passengerIndex: 1, segmentIndex: 0,
+    distanceKm: null, factorValue: null, factorUnit: null, factorVersion: null,
+    factorSource: null, rfVariant: null, haulBand: null, resolvedCabin: null,
+    cabinResolution: null, pax: 1, co2eKg: null,
+    methodology: 'No CO2e calculated: origin "ZZZ" could not be resolved to an airport in the Airport Master.',
+    status: "insufficient_data", confidence: "insufficient", notes: "Unresolved airport code.",
+  },
+];
+
+vi.mock("../models/CarbonRecord.js", () => ({
+  default: {
+    find: (filter: any) => {
+      carbonFindFilters.push(filter);
+      return { select: () => ({ lean: async () => carbonRecords }) };
+    },
+  },
+}));
+
 // Present only to prove it is NOT consulted for the workspace label.
 const workspaceFindSpy = vi.fn();
 vi.mock("../models/CustomerWorkspace.js", () => ({
@@ -134,6 +181,7 @@ vi.mock("../models/CustomerWorkspace.js", () => ({
 import express from "express";
 import request from "supertest";
 import router, { extractedDocScope, buildFilter } from "./admin.extractedDocuments.js";
+import { CARBON_CALCULATION_VERSION } from "../services/carbonEngine.service.js";
 
 /** Builds an app whose caller identity is whatever the test wants. */
 function appAs(user: any, workspaceObjectId?: string) {
@@ -154,6 +202,7 @@ const TENANT_ADMIN = { _id: "tenant00000000000000001", roles: ["TENANT_ADMIN"] }
 beforeEach(() => {
   findFilters.length = 0;
   countFilters.length = 0;
+  carbonFindFilters.length = 0;
   store = [docA, docB];
 });
 
@@ -331,5 +380,118 @@ describe("flattening", () => {
   it("does not ship extractedJson to the client", async () => {
     const res = await request(appAs(SUPERADMIN)).get("/api/admin/extracted-documents");
     expect(JSON.stringify(res.body)).not.toContain("extractedJson");
+  });
+});
+
+// Carbon Engine Phase 1 — the join from CarbonRecord onto the flattened rows.
+//
+// The thing worth testing is not that a number appears, but that a REFUSAL to
+// produce one survives the join: an Insufficient Data row must arrive at the
+// client (and at Excel) as an absent value, never as a zero that a SUM would
+// silently swallow.
+describe("carbon columns", () => {
+  it("joins each carbon result onto its own passenger and segment", async () => {
+    const res = await request(appAs(SUPERADMIN)).get("/api/admin/extracted-documents");
+
+    const p0 = res.body.rows.find((r: any) => r.passengerName === "Mr A One");
+    expect(p0.carbonStatus).toBe("calculated");
+    expect(p0.carbonConfidence).toBe("high");
+    expect(p0.distanceKm).toBe(1148.2);
+    expect(p0.emissionFactor).toBe(0.10916);
+    expect(p0.factorVersion).toBe("DEFRA-2026-v1");
+    expect(p0.co2eKg).toBe(125.34);
+    expect(p0.methodology).toContain("CO2e =");
+
+    // The second passenger gets ITS OWN record, not the first one's.
+    const p1 = res.body.rows.find((r: any) => r.passengerName === "Mrs A Two");
+    expect(p1.carbonStatus).toBe("insufficient_data");
+    expect(p1.co2eKg).toBeNull();
+  });
+
+  it("an Insufficient Data row carries nulls, never zeros", async () => {
+    const res = await request(appAs(SUPERADMIN)).get("/api/admin/extracted-documents");
+    const p1 = res.body.rows.find((r: any) => r.passengerName === "Mrs A Two");
+
+    expect(p1.co2eKg).toBeNull();
+    expect(p1.distanceKm).toBeNull();
+    expect(p1.emissionFactor).toBeNull();
+    expect(p1.co2eKg).not.toBe(0);
+    expect(p1.distanceKm).not.toBe(0);
+    // ...and it says why, rather than leaving the reader to guess.
+    expect(p1.methodology).toContain("could not be resolved");
+  });
+
+  it("a flight row with no carbon record yet reads as not_calculated, not as zero", async () => {
+    const res = await request(appAs(SUPERADMIN)).get("/api/admin/extracted-documents");
+    // docB is a flight document with no flightRows and so no carbon record.
+    const failed = res.body.rows.find((r: any) => r.originalFilename === "tenantB-eticket.pdf");
+    expect(failed.carbonStatus).toBe("not_calculated");
+    expect(failed.co2eKg).toBeNull();
+  });
+
+  it("a non-flight document reads as mode_not_supported, and says so in words", async () => {
+    store = [docHotel];
+    const res = await request(appAs(SUPERADMIN)).get("/api/admin/extracted-documents");
+    const hotel = res.body.rows[0];
+
+    expect(hotel.carbonStatus).toBe("mode_not_supported");
+    expect(hotel.co2eKg).toBeNull();
+    expect(hotel.methodology).toMatch(/not yet supported/i);
+  });
+
+  it("aircraft type is present but empty — the extractor has no such field to report", async () => {
+    const res = await request(appAs(SUPERADMIN)).get("/api/admin/extracted-documents");
+    for (const row of res.body.rows) {
+      expect(row).toHaveProperty("aircraftType");
+      expect(row.aircraftType).toBe("");
+    }
+  });
+
+  it("the carbon read is pinned to one calculation version and carries the same scope clause", async () => {
+    await request(appAs(SUPERADMIN)).get("/api/admin/extracted-documents");
+    const filter = carbonFindFilters[0];
+
+    // Pinned, so seeding a newer engine version cannot silently restate history.
+    expect(filter.calculationVersion).toBe(CARBON_CALCULATION_VERSION);
+    // Same F-01 posture as every other query in this file: for a SuperAdmin the
+    // workspace key is genuinely ABSENT by decision, never present-but-undefined.
+    expect(Object.prototype.hasOwnProperty.call(filter, "workspaceId")).toBe(false);
+    expect(filter.workspaceId).toBeUndefined();
+    // And it can only ever ask about documents the scoped list already returned.
+    expect(filter.extractedDocumentId.$in.map(String)).toEqual([docA._id, docB._id]);
+  });
+
+  it("the export carries the carbon columns, with blanks where no number exists", async () => {
+    const csv = await request(appAs(SUPERADMIN)).get(
+      "/api/admin/extracted-documents/export?format=csv",
+    );
+    const [header, ...lines] = csv.text.trim().split("\n");
+
+    for (const col of ["Distance (km)", "Aircraft Type", "Emission Factor", "Factor Version",
+                       "CO2e (kg)", "Carbon Confidence", "Carbon Status", "Calculation Methodology"]) {
+      expect(header).toContain(col);
+    }
+
+    const priced = lines.find((l) => l.includes("Mr A One"))!;
+    expect(priced).toContain("1148.2");
+    expect(priced).toContain("0.10916");
+    expect(priced).toContain("125.34");
+    expect(priced).toContain("high");
+
+    // The refused row must reach the spreadsheet as empty cells — a "0" here
+    // would be indistinguishable from a real measurement once summed. The six
+    // value columns (distance, aircraft, factor, version, CO2e) run empty right
+    // up to the confidence column.
+    const refused = lines.find((l) => l.includes("Mrs A Two"))!;
+    expect(refused).toContain(",,,,,,insufficient,insufficient_data,");
+    expect(refused).not.toContain(",0,,");
+    expect(refused).not.toContain(",0.0,");
+  });
+
+  it("every row exposes the grain the carbon record is keyed on", async () => {
+    const res = await request(appAs(SUPERADMIN)).get("/api/admin/extracted-documents");
+    const p1 = res.body.rows.find((r: any) => r.passengerName === "Mrs A Two");
+    expect(p1.passengerIndex).toBe(1);
+    expect(p1.segmentIndex).toBe(0);
   });
 });

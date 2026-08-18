@@ -8,6 +8,8 @@ import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import ExtractedDocument from "../models/ExtractedDocument.js";
 import ManualBooking from "../models/ManualBooking.js";
 import Customer from "../models/Customer.js";
+import CarbonRecord from "../models/CarbonRecord.js";
+import { CARBON_CALCULATION_VERSION } from "../services/carbonEngine.service.js";
 
 /**
  * Cross-tenant oversight over the ExtractedDocument master table.
@@ -174,6 +176,96 @@ async function resolveLabels(docs: any[]) {
   return { wsName, bookingRef };
 }
 
+/**
+ * Load the carbon results for a page of documents, keyed for an exact join on
+ * the flattening's own grain.
+ *
+ * Pinned to CARBON_CALCULATION_VERSION rather than "the newest record": an
+ * implicit latest() would silently restate historical numbers the moment a new
+ * engine version is seeded alongside the old one, which is precisely what
+ * CarbonRecord's versioning exists to prevent.
+ *
+ * Scoped with the same extractedDocScope() clause as everything else in this
+ * file. The extractedDocumentId restriction is already strictly tighter (those
+ * ids came out of a scoped query), so this is the second of two independent
+ * layers rather than the load-bearing one — same posture as the rest of the
+ * file, where neither layer is trusted alone.
+ */
+async function loadCarbon(req: any, docs: any[]) {
+  const ids = docs.map((d) => d._id);
+  const byKey = new Map<string, any>();
+  if (!ids.length) return byKey;
+
+  const records = await CarbonRecord.find({
+    ...extractedDocScope(req),
+    extractedDocumentId: { $in: ids },
+    calculationVersion: CARBON_CALCULATION_VERSION,
+  })
+    .select(
+      "extractedDocumentId passengerIndex segmentIndex distanceKm distanceMethod " +
+        "factorValue factorUnit factorVersion factorSource rfVariant haulBand " +
+        "resolvedCabin cabinResolution co2eKg methodology status confidence notes pax",
+    )
+    .lean();
+
+  for (const r of records as any[]) {
+    byKey.set(`${String(r.extractedDocumentId)}|${r.passengerIndex}|${r.segmentIndex}`, r);
+  }
+  return byKey;
+}
+
+/**
+ * The carbon half of a flattened row.
+ *
+ * Every branch here says something true. A flight row that has no record yet
+ * is "not_calculated" (the compute pass has not reached it), NOT zero and not
+ * blank. A hotel or other document is "mode_not_supported" — derived from the
+ * document's own docType rather than from a synthetic placeholder record, which
+ * is why the engine writes no rows for non-flight documents at all.
+ *
+ * `aircraftType` is present, empty, and honest: the extractor's contract has no
+ * aircraft field, so there is nothing to put here. The column exists so the
+ * shape is stable when that changes; it renders as an em dash, never as a
+ * guessed airframe.
+ */
+function carbonFields(docType: string, rec: any | undefined) {
+  if (!rec) {
+    return {
+      carbonStatus: docType === "flight" ? "not_calculated" : "mode_not_supported",
+      carbonConfidence: "",
+      distanceKm: null as number | null,
+      aircraftType: "",
+      emissionFactor: null as number | null,
+      emissionFactorUnit: "",
+      factorVersion: "",
+      factorSource: "",
+      haulBand: "",
+      resolvedCabin: "",
+      co2eKg: null as number | null,
+      methodology:
+        docType === "flight"
+          ? "Not calculated yet — this document has not been through the carbon compute pass."
+          : `Mode "${docType}" is not yet supported by the emission factor library; no CO2e is calculated for it.`,
+      carbonNotes: "",
+    };
+  }
+  return {
+    carbonStatus: rec.status || "",
+    carbonConfidence: rec.confidence || "",
+    distanceKm: rec.distanceKm ?? null,
+    aircraftType: "",
+    emissionFactor: rec.factorValue ?? null,
+    emissionFactorUnit: rec.factorUnit || "",
+    factorVersion: rec.factorVersion || "",
+    factorSource: rec.factorSource || "",
+    haulBand: rec.haulBand || "",
+    resolvedCabin: rec.resolvedCabin || "",
+    co2eKg: rec.co2eKg ?? null,
+    methodology: rec.methodology || "",
+    carbonNotes: rec.notes || "",
+  };
+}
+
 /** Column order for the master table AND the export — one definition, no drift. */
 export const MASTER_COLUMNS = [
   "Workspace",
@@ -202,6 +294,17 @@ export const MASTER_COLUMNS = [
   "Arr Time",
   "PNR",
   "Ticket No",
+  // Carbon Engine Phase 1. Distance and CO2e are blank — never 0 — on a row
+  // the engine refused to price, so a spreadsheet SUM over this export cannot
+  // quietly absorb an unknown as a zero.
+  "Distance (km)",
+  "Aircraft Type",
+  "Emission Factor",
+  "Factor Version",
+  "CO2e (kg)",
+  "Carbon Confidence",
+  "Carbon Status",
+  "Calculation Methodology",
 ];
 
 /**
@@ -211,7 +314,11 @@ export const MASTER_COLUMNS = [
  * document-level fields and blank flight fields — an oversight view that hid
  * its failures would be worse than useless.
  */
-function flattenRows(docs: any[], labels: { wsName: Record<string, string>; bookingRef: Record<string, string> }) {
+function flattenRows(
+  docs: any[],
+  labels: { wsName: Record<string, string>; bookingRef: Record<string, string> },
+  carbon: Map<string, any>,
+) {
   const out: Record<string, any>[] = [];
 
   for (const d of docs) {
@@ -239,14 +346,24 @@ function flattenRows(docs: any[], labels: { wsName: Record<string, string>; book
 
     const frs = Array.isArray(d.flightRows) ? d.flightRows : [];
     if (!frs.length) {
-      out.push({ ...head, passengerName: "", passengerType: "", airline: "", flightNo: "",
+      out.push({ ...head, passengerIndex: null, segmentIndex: null,
+        passengerName: "", passengerType: "", airline: "", flightNo: "",
         cabinClass: "", depAirport: "", depCity: "", depDate: "", depTime: "",
-        arrAirport: "", arrCity: "", arrDate: "", arrTime: "", pnr: "", ticketNo: "" });
+        arrAirport: "", arrCity: "", arrDate: "", arrTime: "", pnr: "", ticketNo: "",
+        ...carbonFields(d.docType || "", undefined) });
       continue;
     }
     for (const f of frs) {
       out.push({
         ...head,
+        // Emitted so the client has the record's own grain to key on, and so a
+        // support question about one line can name the exact segment.
+        passengerIndex: f.passengerIndex,
+        segmentIndex: f.segmentIndex,
+        ...carbonFields(
+          d.docType || "",
+          carbon.get(`${String(d._id)}|${f.passengerIndex}|${f.segmentIndex}`),
+        ),
         passengerName: f.passengerName || "",
         passengerType: f.passengerType || "",
         airline: f.airline || "",
@@ -276,6 +393,11 @@ function rowToArray(r: Record<string, any>) {
     r.depAirport, r.depCity, r.depDate, r.depTime,
     r.arrAirport, r.arrCity, r.arrDate, r.arrTime,
     r.pnr, r.ticketNo,
+    // null (not 0) where the engine emitted no number — csvRow and ExcelJS both
+    // render that as an empty cell, which is what an unknown must look like in
+    // a spreadsheet.
+    r.distanceKm, r.aircraftType, r.emissionFactor, r.factorVersion, r.co2eKg,
+    r.carbonConfidence, r.carbonStatus, r.methodology,
   ];
 }
 
@@ -313,8 +435,8 @@ router.get("/", async (req: any, res: any) => {
       ExtractedDocument.countDocuments(filter),
     ]);
 
-    const labels = await resolveLabels(docs);
-    const rows = flattenRows(docs, labels);
+    const [labels, carbon] = await Promise.all([resolveLabels(docs), loadCarbon(req, docs)]);
+    const rows = flattenRows(docs, labels, carbon);
 
     res.json({
       ok: true,
@@ -344,8 +466,8 @@ router.get("/export", async (req: any, res: any) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    const labels = await resolveLabels(docs);
-    const rows = flattenRows(docs, labels);
+    const [labels, carbon] = await Promise.all([resolveLabels(docs), loadCarbon(req, docs)]);
+    const rows = flattenRows(docs, labels, carbon);
 
     if (format === "csv") {
       res.setHeader("Content-Type", "text/csv");
@@ -364,7 +486,13 @@ router.get("/export", async (req: any, res: any) => {
     headerRow.font = { bold: true };
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
 
-    const widths = [24, 16, 30, 10, 12, 9, 18, 10, 9, 22, 22, 24, 10, 16, 12, 12, 8, 16, 14, 10, 8, 16, 14, 10, 12, 18];
+    const widths = [
+      24, 16, 30, 10, 12, 9, 18, 10, 9, 22, 22, 24, 10, 16, 12, 12, 8, 16, 14, 10, 8, 16, 14, 10, 12, 18,
+      // Carbon columns. Methodology is a full sentence and is given room rather
+      // than being truncated — an unexplained CO2e is the thing this column set
+      // exists to prevent.
+      13, 13, 15, 16, 12, 16, 18, 120,
+    ];
     widths.forEach((w, i) => { sheet.getColumn(i + 1).width = w; });
 
     for (const r of rows) sheet.addRow(rowToArray(r));
