@@ -65,7 +65,11 @@ export interface VisaConsentRecord {
 
 export interface VisaRequestDocument extends Document {
   workspaceId: mongoose.Types.ObjectId; // CustomerWorkspace._id, via workspaceScopePlugin
-  raisedByUserId: mongoose.Types.ObjectId; // ref User — who raised this request
+  // ref User — who raised this request. NULL on a D2C request, where the
+  // actor is a Consumer and not a User at all; see the schema path's note.
+  raisedByUserId: mongoose.Types.ObjectId | null;
+  // ref Consumer — non-null on D2C, null on B2B.
+  consumerId: mongoose.Types.ObjectId | null;
   // Which Customer this request belongs to (2026-08-01) — a stored, indexed
   // fact, not a derived one. Follows TravelBooking.tenantId's own
   // convention exactly: a loose String (matching User.customerId/
@@ -185,7 +189,47 @@ const VisaApprovalChainLevelSchema = new Schema<IApprovalChainLevel>(
 
 const VisaRequestSchema = new Schema<VisaRequestDocument>(
   {
-    raisedByUserId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    /**
+     * ── RELAXED FOR D2C ONLY ──────────────────────────────────────────
+     * A B2B request is raised by a User — a named employee of a customer
+     * workspace. A D2C request has no User at all and never will: a
+     * helloviza.ai consumer is a `Consumer`, deliberately not a User, and
+     * the identity wall exists precisely to keep those two apart
+     * (routes/consumer.auth.ts). Stamping some system User here would
+     * invent an actor who did not act.
+     *
+     * ── GATED ON `source`, NOT ON consumerId ──────────────────────────
+     * `source` was already on this model (below) and is already the
+     * channel discriminator on VisaApplication and VisaActivityLog. It is
+     * `immutable`, indexed, and enum-validated, so it cannot drift; and it
+     * defaults to "B2B", so this predicate returns `true` — the old
+     * behaviour, exactly — for every existing row and every B2B write.
+     * Inferring the channel from `consumerId != null` would have made a
+     * plain data field load-bearing for a validation rule, and would have
+     * given two fields the power to disagree about what a case IS.
+     */
+    raisedByUserId: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: function (this: any) {
+        return this?.source !== "D2C";
+      },
+      index: true,
+    },
+    /**
+     * ref Consumer. Non-null on D2C, null on B2B — the mirror of
+     * VisaApplication.consumerId, and required on D2C for the same reason:
+     * a consumer case nobody can scope a read to is unreachable.
+     */
+    consumerId: {
+      type: Schema.Types.ObjectId,
+      ref: "Consumer",
+      default: null,
+      required: function (this: any) {
+        return this?.source === "D2C";
+      },
+      index: true,
+    },
     // TravelBooking.tenantId's convention — String, indexed, alongside
     // workspaceId. null (not "default") when unresolvable — see the
     // interface field's own doc comment above for why.

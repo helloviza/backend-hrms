@@ -1,0 +1,576 @@
+// apps/backend/src/routes/consumer.applications.ts
+//
+// THE D2C APPLICATION ENDPOINTS. Mounted at /api/consumer/applications
+// behind requireConsumer.
+//
+// ══════════════════════════════════════════════════════════════════════
+// A-PRIME: A D2C SUBMIT MINTS **BOTH** A VisaRequest AND A VisaApplication.
+// ══════════════════════════════════════════════════════════════════════
+// The alternative — a request-less application — would have made the case
+// invisible to routes/admin.visa.roster.ts (which walks requests → their
+// applications) and would have silently dropped it from every
+// destination-filtered report (admin.visa.reports.ts resolves a
+// destination into a set of requestIds). Minting a lightweight parent
+// costs one insert and lets a D2C ticket slot into the ops pipeline with
+// no ops-side branching at all.
+//
+// The parent is LIGHTWEIGHT, not a fake B2B request: raisedByUserId is
+// null (a Consumer is not a User, and inventing a system User would name
+// an actor who did not act), consumerId is set, and `source` is "D2C" on
+// both rows.
+//
+// ── WHAT THIS ENDPOINT REFUSES TO TRUST ──────────────────────────────
+// The client sends an ISO2, a purpose and a list of its own document ids.
+// It does NOT send a rule id, a price, a fee breakup or a total, and this
+// route would ignore them if it did. The rule is RE-RESOLVED server-side
+// by the same tourist-preferred/cheapest-by-D2C-total rule the public
+// country endpoint uses (routes/public.visa.ts), and the price is computed
+// from that rule. A consumer-supplied price is a consumer-supplied
+// invoice.
+//
+// ── OWN-SCOPE, STATED LITERALLY ──────────────────────────────────────
+// Every read here filters on { consumerId, workspaceId } as explicit
+// clauses. The workspaceScope plugin cannot be relied on: it injects only
+// when a query carries `_workspaceId` in its options and otherwise FAILS
+// OPEN. And workspaceId alone is not an isolation boundary anyway — every
+// consumer shares the one synthetic D2C workspace, so consumerId is the
+// real fence (services/consumerWorkspace.ts says so in its own header).
+//
+// ── MILESTONE 2 (RAZORPAY) PLUGS IN HERE ─────────────────────────────
+// Nothing in this file takes money. An application is created at
+// paymentStatus "PENDING" and stage "DOC_SUBMITTED"; the payment stages
+// (PAYMENT_FAILED / PAYMENT_DROPPED / PAYMENT_DONE) and the order-creation
+// call belong to Milestone 2. Every place that will need to change is
+// marked `TODO(milestone-2)`.
+import { Router } from "express";
+import mongoose from "mongoose";
+
+import { requireConsumer } from "../middleware/requireConsumer.js";
+import VisaRule from "../models/VisaRule.js";
+import VisaRequest, { recomputeRequestStatus } from "../models/VisaRequest.js";
+import VisaApplication from "../models/VisaApplication.js";
+import ConsumerDocument from "../models/ConsumerDocument.js";
+import VisaD2CLead from "../models/VisaD2CLead.js";
+import { isUtmEmpty, normaliseUtm } from "../models/visaUtm.js";
+import { d2cWorkspaceObjectId } from "../services/consumerWorkspace.js";
+import {
+  D2C_PAYMENT_STATUS_LABELS,
+  D2C_STAGE_LABELS,
+  D2C_TRACKING_STATUS_LABELS,
+} from "../models/visaD2CLifecycle.js";
+import { buildIndicativeCostSnapshot, buildRuleSnapshot } from "../utils/visaSnapshots.js";
+import { computeVisaFeeBlock } from "../utils/visaFee.js";
+import { computeProcessingDeadline } from "../utils/visaEta.js";
+import { purposeMatchValues } from "../utils/visaPurposes.js";
+import { findSeedCountry } from "../config/visaCountrySeed.js";
+import { normaliseToIso2 } from "../utils/countryCodes.js";
+import logger from "../utils/logger.js";
+
+const router = Router();
+router.use(requireConsumer);
+
+const consumerAppLogger = logger.child({ module: "consumerApplications" });
+
+/** Same constant the public endpoints declare — every published rule is IN. */
+const PUBLIC_NATIONALITY = "IN";
+
+/** The purposes a consumer may actually pick. TOURIST_OR_BUSINESS is a RULE
+ *  shape, never a choice — the public endpoint already widened it into the
+ *  two real ones before the client ever saw it. */
+const SELECTABLE_PURPOSES = ["TOURIST", "BUSINESS", "TRANSIT"] as const;
+
+function me(req: any): mongoose.Types.ObjectId {
+  return new mongoose.Types.ObjectId(String(req.consumer.id));
+}
+
+/**
+ * Resolve the corridor's representative rule for a purpose.
+ *
+ * ── THIS MIRRORS routes/public.visa.ts DELIBERATELY ───────────────────
+ * That endpoint picks tourist-ish first, then the cheapest by D2C total,
+ * and returns the terms the consumer was SHOWN. If this route resolved
+ * differently, a consumer could be quoted ₹1,770 on the panel and have an
+ * application created against a different rule at a different price — the
+ * exact mismatch re-resolving server-side is meant to prevent.
+ *
+ * The one difference is the purpose filter: the public endpoint resolves
+ * the corridor as a whole, this one resolves it for the purpose the
+ * consumer actually chose. purposeMatchValues widens TOURIST to also match
+ * a TOURIST_OR_BUSINESS rule, which is the same widening GET /rules
+ * applies (utils/visaPurposes.ts) — so a corridor whose only rule is
+ * TOURIST_OR_BUSINESS is bookable as either, exactly as the cards offered.
+ */
+async function resolveRuleFor(iso2: string, purpose: string) {
+  const rules = await VisaRule.find({
+    status: "PUBLISHED",
+    nationality: PUBLIC_NATIONALITY,
+    destinationIso2: iso2,
+    purpose: { $in: purposeMatchValues(purpose as any) },
+  }).lean();
+
+  if (rules.length === 0) return null;
+
+  return (rules as any[])
+    .slice()
+    .sort(
+      (a, b) => computeVisaFeeBlock(a, "D2C").totalInr - computeVisaFeeBlock(b, "D2C").totalInr,
+    )[0];
+}
+
+/**
+ * The fields VisaRuleSnapshot marks `required` that a VisaRule can be
+ * PUBLISHED without actually carrying.
+ *
+ * ── WHY THIS CHECK EXISTS, AND WHY IT IS NOT A WORKAROUND ────────────
+ * Found while building this endpoint: the live VN rule has no
+ * `isSchengen` at all. VisaRule declares it `{type: Boolean, default:
+ * false}`, but a default only applies to a document written THROUGH
+ * Mongoose — VN was seeded/imported directly, so the key is simply
+ * absent. VisaRuleSnapshot.isSchengen is `required: true`, so building a
+ * snapshot from that rule throws a ValidationError.
+ *
+ * ⚠ THIS IS PRE-EXISTING AND NOT D2C-SPECIFIC. routes/visa.ts's B2B POST
+ * /requests calls the SAME buildRuleSnapshot and fails the same way on
+ * the same rule — the extraction into utils/visaSnapshots.ts is verbatim
+ * (diffed against HEAD). D2C simply reached the defect first, because VN
+ * is one of only two published corridors in this environment.
+ *
+ * So this does NOT patch the snapshot (that would change B2B behaviour
+ * and silently invent an isSchengen value for a corridor nobody has
+ * checked). It fails EARLY, with a message a consumer can act on and a
+ * warning an ops reader can fix the rule from. The real repair is a data
+ * one: set isSchengen on the offending rules.
+ */
+const SNAPSHOT_REQUIRED_RULE_FIELDS = [
+  "destinationName",
+  "isSchengen",
+  "productClass",
+  "visaCategory",
+  "purpose",
+  "entryType",
+  "serviceTier",
+] as const;
+
+function missingSnapshotFields(rule: any): string[] {
+  return SNAPSHOT_REQUIRED_RULE_FIELDS.filter((f) => rule?.[f] === undefined || rule?.[f] === null);
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /start — the Master Sheet row.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * WHAT COUNTS AS "STARTED", AND WHY NOT LANDING
+ * ══════════════════════════════════════════════════════════════════════
+ * The trigger is DELIBERATE ENGAGEMENT, not arrival:
+ *   · advancing past step 1 (a visa type has been chosen), OR
+ *   · attaching/uploading the first document,
+ * whichever fires first.
+ *
+ * Landing on helloviza.ai is explicitly NOT a start. A landing is
+ * traffic — most of it bounces, much of it is a crawler — and a sheet
+ * that counted it would be a sheet of strangers with a conversion rate
+ * near zero, useless for the question it exists to answer ("who is
+ * genuinely in flight, and where did they stall?"). Both signals above
+ * require a signed-in consumer to have made a choice.
+ *
+ * Also note what this does NOT create: a VisaApplication. A ticket at
+ * this point would flood the concierge queue with cases nobody has
+ * committed to. See models/VisaD2CLead.ts.
+ *
+ * ── IDEMPOTENT BY CONSTRUCTION ───────────────────────────────────────
+ * An upsert on {consumerId, destinationIso2}. Both triggers can fire in
+ * the same session, the reader can leave and come back, and the client
+ * can retry — all of it lands on ONE row. That is also why the client is
+ * free to call this on every step-1 advance without debouncing.
+ * ───────────────────────────────────────────────────────────────────── */
+
+router.post("/start", async (req: any, res: any) => {
+  try {
+    const consumerId = me(req);
+    const workspaceId = d2cWorkspaceObjectId();
+
+    const rawIso2 = String(req.body?.iso2 ?? "").trim().toUpperCase();
+    const iso2 = findSeedCountry(rawIso2) ? rawIso2 : normaliseToIso2(String(req.body?.iso2 ?? ""));
+    if (!iso2) return res.status(400).json({ error: "A valid destination is required" });
+
+    const seed = findSeedCountry(iso2);
+    const purposeRaw = String(req.body?.purpose ?? "").trim().toUpperCase();
+    const purpose = SELECTABLE_PURPOSES.includes(purposeRaw as any) ? purposeRaw : null;
+    const utm = normaliseUtm(req.body?.utm);
+
+    /* FIRST-TOUCH ATTRIBUTION. utm goes in $setOnInsert, never $set, so a
+     * later untagged visit cannot erase the campaign that actually
+     * introduced this person. If the row already exists with empty utm and
+     * a TAGGED visit arrives, the conditional below fills it in — the one
+     * direction that adds information rather than destroying it. */
+    const lead = await VisaD2CLead.findOneAndUpdate(
+      { consumerId, destinationIso2: iso2 },
+      {
+        $setOnInsert: {
+          consumerId,
+          workspaceId,
+          destinationIso2: iso2,
+          destinationName: seed?.countryName ?? iso2,
+          startedAt: new Date(),
+          utm,
+        },
+        // Purpose can legitimately change (they went back and re-chose), so
+        // it is a $set. Status/stage are NOT touched here: a row that has
+        // already converted must not be dragged back to
+        // DOC_SUBMISSION_IN_PROGRESS by a stray start call.
+        ...(purpose ? { $set: { purpose } } : {}),
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+
+    if (!isUtmEmpty(utm) && isUtmEmpty(lead.utm)) {
+      lead.utm = utm as any;
+      await lead.save();
+    }
+
+    return res.status(200).json({ ok: true, lead: publicLead(lead) });
+  } catch (err: any) {
+    // A duplicate-key here means two triggers raced on the same new row.
+    // That is the idempotency working, not a failure — re-read and return.
+    if (err?.code === 11000) {
+      const existing = await VisaD2CLead.findOne({
+        consumerId: me(req),
+        destinationIso2: String(req.body?.iso2 ?? "").trim().toUpperCase(),
+      });
+      if (existing) return res.status(200).json({ ok: true, lead: publicLead(existing) });
+    }
+    consumerAppLogger.error("D2C lead start failed", { error: err?.message });
+    return res.status(500).json({ error: "We couldn't save your progress just now." });
+  }
+});
+
+function publicLead(l: any) {
+  return {
+    id: String(l._id),
+    destinationIso2: l.destinationIso2,
+    destinationName: l.destinationName,
+    status: l.status,
+    stage: l.stage,
+    applicationId: l.applicationId ? String(l.applicationId) : null,
+  };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST / — create a D2C application (the "Submit" on the Apply page).
+ * ───────────────────────────────────────────────────────────────────── */
+
+router.post("/", async (req: any, res: any) => {
+  try {
+    const consumerId = me(req);
+    const workspaceId = d2cWorkspaceObjectId();
+
+    /* ── input ─────────────────────────────────────────────────────── */
+    const rawIso2 = String(req.body?.iso2 ?? "").trim().toUpperCase();
+    // Seed first, normaliseToIso2 second — the same ordering and the same
+    // reason as routes/public.visa.ts's resolvePublicIso2: countryCodes.ts
+    // covers ~120 codes and the seed covers 196, so resolving through the
+    // narrower table alone would 404 corridors the map actually draws.
+    const iso2 = findSeedCountry(rawIso2) ? rawIso2 : normaliseToIso2(String(req.body?.iso2 ?? ""));
+    if (!iso2) {
+      return res.status(400).json({ error: "A valid destination is required" });
+    }
+
+    const purpose = String(req.body?.purpose ?? "").trim().toUpperCase();
+    if (!SELECTABLE_PURPOSES.includes(purpose as any)) {
+      return res.status(400).json({
+        error: `purpose must be one of: ${SELECTABLE_PURPOSES.join(", ")}`,
+      });
+    }
+
+    const utm = normaliseUtm(req.body?.utm);
+
+    const documentIdsRaw = Array.isArray(req.body?.documentIds) ? req.body.documentIds : [];
+    const documentIds = documentIdsRaw
+      .map((v: unknown) => String(v ?? "").trim())
+      .filter((v: string) => mongoose.isValidObjectId(v))
+      .map((v: string) => new mongoose.Types.ObjectId(v));
+
+    /* ── the rule, re-resolved. Never the client's word for it. ────── */
+    const rule = await resolveRuleFor(iso2, purpose);
+    if (!rule) {
+      return res.status(404).json({
+        error: "We don't publish this destination for that visa type yet",
+      });
+    }
+
+    // Fail before anything is written, rather than 500-ing halfway through
+    // with a request already minted. See the constant's own note.
+    const incomplete = missingSnapshotFields(rule);
+    if (incomplete.length) {
+      consumerAppLogger.error(
+        "published visa rule cannot produce a valid ruleSnapshot — application refused",
+        {
+          ruleId: String(rule._id),
+          destinationIso2: rule.destinationIso2,
+          purpose: rule.purpose,
+          missingFields: incomplete,
+        },
+      );
+      return res.status(409).json({
+        error:
+          "This destination isn't fully set up for online applications yet. Send us an enquiry and our team will take it from here.",
+        code: "RULE_INCOMPLETE",
+      });
+    }
+
+    /* ── the documents, ownership-checked BEFORE anything is written ─
+     * A document id belonging to somebody else must never end up linked
+     * to this application, and the check is a filter on consumerId rather
+     * than a trust of the id. Ids that do not resolve are dropped and
+     * REPORTED back, not silently ignored — a consumer who thinks they
+     * attached a passport and did not is the worst outcome here. */
+    const ownedDocuments = documentIds.length
+      ? await ConsumerDocument.find({
+          _id: { $in: documentIds },
+          consumerId,
+          deletedAt: null,
+        })
+          .select("_id")
+          .lean()
+      : [];
+    const ownedIds = (ownedDocuments as any[]).map((d) => d._id);
+    const rejectedDocumentCount = documentIds.length - ownedIds.length;
+
+    /* ── the lightweight parent request ────────────────────────────── */
+    const travelDateFrom = parseDate(req.body?.travelDateFrom);
+
+    const visaRequest = await VisaRequest.create({
+      workspaceId,
+      // NULL, and legitimately so — see the schema path's own note. The
+      // conditional `required` allows it only because source is "D2C".
+      raisedByUserId: null,
+      consumerId,
+      source: "D2C",
+      // customerId is the B2B billing linkage and has no D2C meaning yet.
+      // Left null rather than pointed at the synthetic D2C customer, so
+      // services/visaBillingSync.ts cannot mistake this for a billable
+      // B2B case. TODO(milestone-2): revisit when D2C invoicing lands.
+      customerId: null,
+      destinationIso2: rule.destinationIso2,
+      purpose: rule.purpose,
+      travelDateFrom,
+      applicationIds: [],
+    });
+
+    /* ── the snapshots ─────────────────────────────────────────────── */
+    const ruleSnapshot = buildRuleSnapshot(rule);
+    // "D2C" — the channel the consumer was quoted in. Passing nothing here
+    // would freeze the B2B total (₹354 on TH) onto a consumer's case that
+    // the panel quoted at ₹1,770. See utils/visaSnapshots.ts.
+    const indicativeCostSnapshot = buildIndicativeCostSnapshot(rule, "D2C");
+
+    /* ── the application ───────────────────────────────────────────── */
+    const application = await VisaApplication.create({
+      workspaceId,
+      requestId: visaRequest._id,
+      consumerId,
+      source: "D2C",
+      customerId: null,
+      // No TravellerProfile: that is a B2B corporate-roster entity. The
+      // applicant's identity lives on the ConsumerProfile, and the field is
+      // already nullable (models/VisaApplication.ts).
+      travellerProfileId: null,
+      nationality: PUBLIC_NATIONALITY,
+      nationalityUnresolved: false,
+      travelDateFrom,
+      destinationIso2: rule.destinationIso2,
+      processingDeadlineAt: computeProcessingDeadline(
+        travelDateFrom,
+        ruleSnapshot.etaMaxDays,
+        ruleSnapshot.etaBasis,
+      ),
+      ruleSnapshot,
+      indicativeCostSnapshot,
+      // Attribution carried onto the ticket itself — see the field's note
+      // in models/VisaApplication.ts on why it is stored in both places.
+      utm,
+      /* ── "submitted", NOT "draft", AND THIS IS LOAD-BEARING ────────
+       * Stage-2 finding: `draft` is excluded from the ops queue by
+       * VISA_OPS_HIDDEN_STATUSES *and* has no ops-side transitions at all
+       * (PATCH /applications/:id/status answers `allowed: []` for it).
+       * The only thing that can move a draft is the B2B customer's own
+       * POST /requests/:id/submit, which a consumer cannot reach.
+       *
+       * A D2C ticket created at "draft" would therefore be a row nobody
+       * can see and nobody can work — worse than no ticket, because it
+       * looks like the flow succeeded. Submitting IS the act here: the
+       * consumer has chosen, attached and confirmed, so the case enters
+       * the pipeline at its first genuinely workable state.
+       *
+       * The funnel triple (d2cStatus / d2cStage / d2cPaymentStatus) is
+       * NOT set here — models/VisaApplication.ts defaults each of them
+       * from `source`, so a D2C row cannot be created half-populated by
+       * a route that forgets one. See visaD2CLifecycle.ts. */
+      status: "submitted",
+      submittedAt: new Date(),
+    });
+
+    await VisaRequest.findByIdAndUpdate(visaRequest._id, {
+      $set: { applicationIds: [application._id] },
+    });
+
+    /* DERIVED, never assigned — the rule models/VisaRequest.ts states for
+     * itself. With one submitted child this rolls the parent up to
+     * "active", which is what puts the case on the roster. */
+    await recomputeRequestStatus(visaRequest._id);
+
+    /* ── link the documents ────────────────────────────────────────
+     * $addToSet, not $push: re-submitting must not add the same
+     * application id twice to a locker row that was already attached. */
+    if (ownedIds.length) {
+      await ConsumerDocument.updateMany(
+        { _id: { $in: ownedIds }, consumerId },
+        { $addToSet: { linkedApplicationIds: application._id } },
+      );
+    }
+
+    /* ── CONVERT THE MASTER SHEET ROW ──────────────────────────────
+     * Upsert on the SAME {consumerId, destinationIso2} key the start
+     * endpoint uses, so a started row BECOMES a submitted row. The upsert
+     * (rather than a plain update) covers the reader who never tripped a
+     * start trigger — someone who attached nothing and walked straight
+     * through — so the sheet never misses a submitted case.
+     *
+     * utm here is $setOnInsert only: if a lead row already exists, its
+     * first-touch attribution is the truth and this later payload must
+     * not overwrite it. */
+    await VisaD2CLead.findOneAndUpdate(
+      { consumerId, destinationIso2: rule.destinationIso2 },
+      {
+        $set: {
+          stage: "DOC_SUBMITTED",
+          status: "IN_PROGRESS",
+          paymentStatus: "PENDING",
+          purpose: rule.purpose,
+          applicationId: application._id,
+          referenceNumber: visaRequest.referenceNumber ?? null,
+          submittedAt: new Date(),
+        },
+        $setOnInsert: {
+          consumerId,
+          workspaceId,
+          destinationIso2: rule.destinationIso2,
+          destinationName: seedCountryName(rule),
+          startedAt: new Date(),
+          utm,
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+
+    consumerAppLogger.info("D2C application created", {
+      applicationId: String(application._id),
+      requestId: String(visaRequest._id),
+      iso2: rule.destinationIso2,
+      purpose: rule.purpose,
+      totalInr: indicativeCostSnapshot.totalInr,
+      linkedDocuments: ownedIds.length,
+      rejectedDocumentCount,
+    });
+
+    return res.status(201).json({
+      ok: true,
+      application: publicApplication(application, visaRequest),
+      // Surfaced, not swallowed — see the ownership check above.
+      rejectedDocumentCount,
+    });
+  } catch (err: any) {
+    consumerAppLogger.error("D2C application create failed", { error: err?.message });
+    return res.status(500).json({ error: "We couldn't start your application just now." });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET / — the consumer's own applications.
+ * ───────────────────────────────────────────────────────────────────── */
+
+router.get("/", async (req: any, res: any) => {
+  try {
+    // BOTH clauses, literally. See the file header on why neither alone is
+    // an isolation boundary and why the plugin cannot supply either.
+    const applications = await VisaApplication.find({
+      consumerId: me(req),
+      workspaceId: d2cWorkspaceObjectId(),
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const requestIds = applications
+      .map((a: any) => a.requestId)
+      .filter((id: any) => mongoose.isValidObjectId(id));
+    const requests = requestIds.length
+      ? await VisaRequest.find({ _id: { $in: requestIds } })
+          .select("referenceNumber status")
+          .lean()
+      : [];
+    const requestById = new Map((requests as any[]).map((r) => [String(r._id), r]));
+
+    return res.json({
+      ok: true,
+      applications: applications.map((a: any) =>
+        publicApplication(a, requestById.get(String(a.requestId)) ?? null),
+      ),
+    });
+  } catch (err: any) {
+    consumerAppLogger.error("D2C application list failed", { error: err?.message });
+    return res.status(500).json({ error: "We couldn't load your applications." });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Projection — a WHITELIST, never a spread.
+ *
+ * Same posture as routes/public.visa.ts: the application document carries
+ * B2B pricing fields (plumtripsServiceFeeInr on the snapshot), ops-only
+ * fields (discrepancyReason, assignedConciergeUserId, servicePartnerName)
+ * and internal ids. A delete-list is one schema addition away from
+ * leaking; a whitelist is not.
+ * ───────────────────────────────────────────────────────────────────── */
+
+function publicApplication(a: any, request: any) {
+  return {
+    id: String(a._id),
+    status: a.status,
+    /* The funnel triple, sent as STORED ENUMS plus their display copy.
+     * The consumer surface renders the labels; sending both means the
+     * client never owns a second copy of the vocabulary (the mistake the
+     * public map's own api.ts calls out about country lists). */
+    trackingStatus: a.d2cStatus ?? null,
+    trackingStatusLabel: a.d2cStatus ? D2C_TRACKING_STATUS_LABELS[a.d2cStatus] : null,
+    stage: a.d2cStage ?? null,
+    stageLabel: a.d2cStage ? D2C_STAGE_LABELS[a.d2cStage] : null,
+    paymentStatus: a.d2cPaymentStatus ?? null,
+    paymentStatusLabel: a.d2cPaymentStatus ? D2C_PAYMENT_STATUS_LABELS[a.d2cPaymentStatus] : null,
+    referenceNumber: request?.referenceNumber ?? null,
+    destinationIso2: a.destinationIso2 ?? null,
+    destinationName: a.ruleSnapshot?.destinationName ?? null,
+    purpose: a.ruleSnapshot?.purpose ?? null,
+    entryType: a.ruleSnapshot?.entryType ?? null,
+    processingDeadlineAt: a.processingDeadlineAt ?? null,
+    travelDateFrom: a.travelDateFrom ?? null,
+    // The consumer's own total, in the channel they were quoted in. The
+    // per-line breakup is deliberately NOT sent: the fee block's own
+    // SERVICE_FEE label still reads "Plumtrips Service Fee" for B2B, and
+    // the consumer surface must never render that brand.
+    totalInr: a.indicativeCostSnapshot?.totalInr ?? null,
+    createdAt: a.createdAt,
+  };
+}
+
+/** The seed's country name where we have one, the rule's otherwise. */
+function seedCountryName(rule: any): string {
+  return findSeedCountry(rule.destinationIso2)?.countryName ?? rule.destinationName ?? rule.destinationIso2;
+}
+
+function parseDate(v: unknown): Date | null {
+  if (!v) return null;
+  const d = new Date(String(v));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+export default router;

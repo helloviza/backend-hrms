@@ -29,6 +29,16 @@ import {
   visaCaseSourcePath,
   type VisaCaseSource,
 } from "./visaCaseSource.js";
+import {
+  D2C_INITIAL_LIFECYCLE,
+  D2C_PAYMENT_STATUSES,
+  D2C_STAGES,
+  D2C_TRACKING_STATUSES,
+  type D2CPaymentStatus,
+  type D2CStage,
+  type D2CTrackingStatus,
+} from "./visaD2CLifecycle.js";
+import { VisaUtmSchema, type VisaUtm } from "./visaUtm.js";
 import logger from "../utils/logger.js";
 
 const visaApplicationLogger = logger.child({ module: "VisaApplication" });
@@ -182,6 +192,30 @@ export interface VisaApplicationDocument extends Document {
   // so is every case the existing B2B path creates.
   source: VisaCaseSource;
   requestId: mongoose.Types.ObjectId; // ref VisaRequest
+  /**
+   * ref Consumer — the helloviza.ai consumer who owns this case. NULL on
+   * every B2B application and NON-NULL on every D2C one, enforced by the
+   * conditional `required` on the schema path.
+   *
+   * ── WHY THIS EXISTS WHEN workspaceId ALREADY DOES ──────────────────
+   * Every D2C case carries the SAME workspaceId (the synthetic
+   * HELLOVIZA_D2C_WORKSPACE_ID), so workspaceId separates D2C from B2B and
+   * nothing else — services/consumerWorkspace.ts says so in its own header.
+   * The per-consumer boundary is THIS field, and it is the same row-level
+   * shape models/ConsumerProfile.ts settled on for the same reason.
+   *
+   * Consumer-side reads must therefore put `consumerId` in the filter
+   * LITERALLY. The workspaceScope plugin cannot help: it only injects when
+   * a query carries `_workspaceId` in its options, so it fails OPEN.
+   */
+  consumerId: mongoose.Types.ObjectId | null;
+  /* The D2C funnel triple — null on every B2B row. See
+   * models/visaD2CLifecycle.ts for why these are not `status`. */
+  d2cStatus: D2CTrackingStatus | null;
+  d2cStage: D2CStage | null;
+  d2cPaymentStatus: D2CPaymentStatus | null;
+  /** Campaign attribution captured at landing. Empty on B2B. */
+  utm: VisaUtm;
   // ref TravellerProfile — applicant identity, not duplicated here. NULL only
   // after scripts/erase-traveller-profile.ts has run (see travellerErasedAt
   // below) — every OTHER code path that creates or reads an application must
@@ -545,7 +579,101 @@ const VisaQuestionnaireAnswerSchema = new Schema<VisaQuestionnaireAnswer>(
 
 const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
   {
-    requestId: { type: Schema.Types.ObjectId, ref: "VisaRequest", required: true, index: true },
+    /**
+     * ── CONDITIONALLY REQUIRED, AND B2B IS UNAFFECTED ─────────────────
+     * `required` was an unconditional `true` until the D2C channel landed.
+     * It is now a predicate that returns true for everything EXCEPT
+     * source === "D2C" — which means it evaluates to exactly the old
+     * behaviour for every B2B document, because `source` defaults to "B2B"
+     * and the one B2B creator (routes/visa.ts's POST /requests) always
+     * supplies a requestId anyway.
+     *
+     * D2C still mints a lightweight parent VisaRequest (the A-prime
+     * decision), so in practice this predicate is not currently exercised
+     * — it exists so the model does not LIE about the invariant, and so a
+     * future request-less D2C shape is a route change rather than a
+     * migration.
+     */
+    requestId: {
+      type: Schema.Types.ObjectId,
+      ref: "VisaRequest",
+      required: function (this: any) {
+        return this?.source !== "D2C";
+      },
+      index: true,
+    },
+    /**
+     * Mirror-image predicate: mandatory on D2C, and must stay absent on
+     * B2B. Stated as `required` rather than left to the route, because a
+     * D2C case with no consumer is a row nobody can ever read back —
+     * consumer reads are scoped on this field and nothing else.
+     */
+    consumerId: {
+      type: Schema.Types.ObjectId,
+      ref: "Consumer",
+      default: null,
+      required: function (this: any) {
+        return this?.source === "D2C";
+      },
+      index: true,
+    },
+
+    /* ── THE D2C FUNNEL TRIPLE ──────────────────────────────────────
+     * Status / Stage / Payment status — the consumer-funnel view, NOT a
+     * second copy of `status` below. models/visaD2CLifecycle.ts sets out
+     * at length why the two vocabularies are kept apart.
+     *
+     * ── CONDITIONAL DEFAULTS, NOT CONDITIONAL `required` ────────────
+     * A default FUNCTION can read `this`, so each of these resolves to
+     * the D2C initial value on a D2C document and to null on a B2B one.
+     * That is strictly better than a conditional `required` here: it
+     * makes a valid D2C row impossible to under-populate (no route can
+     * forget one of the three), while a B2B row simply gains a null
+     * field — the same additive shape consumerId above already has.
+     *
+     * Every one is indexed: the ops D2C tab filters on all three, and
+     * the Master Sheet groups by them.
+     */
+    d2cStatus: {
+      type: String,
+      enum: [...D2C_TRACKING_STATUSES, null],
+      default: function (this: any) {
+        return this?.source === "D2C" ? D2C_INITIAL_LIFECYCLE.d2cStatus : null;
+      },
+      index: true,
+    },
+    d2cStage: {
+      type: String,
+      enum: [...D2C_STAGES, null],
+      default: function (this: any) {
+        return this?.source === "D2C" ? D2C_INITIAL_LIFECYCLE.d2cStage : null;
+      },
+      index: true,
+    },
+    /**
+     * Campaign attribution, carried from the landing URL through the whole
+     * flow onto the ticket. Empty strings on every B2B row and on any D2C
+     * case that arrived without tags — see models/visaUtm.ts on why empty
+     * is a correct answer rather than a gap.
+     *
+     * Stored on the TICKET as well as the Master Sheet row, deliberately:
+     * the lead row answers "what did marketing produce", the ticket
+     * answers "what did this specific case cost to acquire", and a join
+     * between them is not always available once cases are archived.
+     */
+    utm: { type: VisaUtmSchema, default: () => ({}) },
+
+    /* TODO(milestone-2): the Razorpay webhook flips this to PAID (and the
+     * stage to PAYMENT_DONE) on capture, or to FAILED on a failed attempt.
+     * Nothing in Milestone 1 writes anything but PENDING. */
+    d2cPaymentStatus: {
+      type: String,
+      enum: [...D2C_PAYMENT_STATUSES, null],
+      default: function (this: any) {
+        return this?.source === "D2C" ? D2C_INITIAL_LIFECYCLE.d2cPaymentStatus : null;
+      },
+      index: true,
+    },
     // Mirrors the parent VisaRequest's own customerId — see the interface
     // field's doc comment above.
     customerId: { type: String, default: null, index: true },
@@ -650,6 +778,12 @@ VisaApplicationSchema.index(
   { unique: true, partialFilterExpression: { travellerProfileId: { $type: "objectId" } } },
 );
 // Console/admin queue filtering (own-workspace angle).
+// The consumer's own list — "my applications, newest first". consumerId
+// leads because it is the equality clause every consumer read carries
+// literally (see the field's own note); createdAt descending is the sort.
+// Sparse-by-nature: null on every B2B row, so this index stays small.
+VisaApplicationSchema.index({ consumerId: 1, createdAt: -1 });
+
 VisaApplicationSchema.index({ workspaceId: 1, status: 1 });
 // A traveller's application history across requests.
 VisaApplicationSchema.index({ workspaceId: 1, travellerProfileId: 1 });

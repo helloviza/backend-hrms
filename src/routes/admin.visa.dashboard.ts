@@ -28,6 +28,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import User from "../models/User.js";
 import { assessProcessingRisk } from "../utils/visaEta.js";
+import { objectIdKeys } from "../utils/objectIdKeys.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -178,7 +179,9 @@ async function buildAtRisk() {
     return { count: 0, filter: { atRisk: "true" }, topApplications: [] as any[] };
   }
 
-  const requestIds = [...new Set(candidates.map((a: any) => String(a.requestId)))];
+  // See utils/objectIdKeys.ts — a null requestId reaching this $in as the
+  // string "null" CastErrors and 500s the whole at-risk tile.
+  const requestIds = objectIdKeys(candidates.map((a: any) => a.requestId));
   const requests = await VisaRequest.find({ _id: { $in: requestIds } })
     .select("referenceNumber travelDateFrom")
     .lean();
@@ -204,7 +207,8 @@ async function buildAtRisk() {
     : [];
   const workspaceById = new Map(workspaces.map((w: any) => [String(w._id), w]));
 
-  const travellerIds = [...new Set(top.map((t) => String(t.application.travellerProfileId)))];
+  // Erased travellers null this field — see utils/objectIdKeys.ts.
+  const travellerIds = objectIdKeys(top.map((t) => t.application.travellerProfileId));
   const travellers = travellerIds.length
     ? await TravellerProfile.find({ _id: { $in: travellerIds } }).select("firstName middleName lastName").lean()
     : [];

@@ -480,6 +480,20 @@ import consumerProfileRouter from "./routes/consumer.profile.js";
 app.use("/api/consumer/profile", consumerProfileRouter);
 
 /* ────────────────────────────────────────────────────────────────
+ * The D2C visa cases — /api/consumer/applications.
+ *
+ * Same wall as the profile router above (requireConsumer inside the
+ * router itself), and the same OWN-scope posture: every read filters on
+ * req.consumer.id LITERALLY, because all consumers share one synthetic
+ * workspace and the workspaceScope plugin fails open.
+ *
+ * A POST here mints BOTH a lightweight VisaRequest and a VisaApplication
+ * (the A-prime shape), so a consumer's case enters the existing ops
+ * pipeline with no ops-side branching. See routes/consumer.applications.ts. */
+import consumerApplicationsRouter from "./routes/consumer.applications.js";
+app.use("/api/consumer/applications", consumerApplicationsRouter);
+
+/* ────────────────────────────────────────────────────────────────
  * DEV-ONLY consumer stub login — /api/consumer/dev-auth.
  *
  * Real Google/Microsoft OAuth for helloviza.ai is being built separately.
@@ -641,6 +655,15 @@ app.use("/api/admin/visa", adminVisaReportsRouter);
 // admin.visa.dashboard.ts's file header.
 import adminVisaDashboardRouter from "./routes/admin.visa.dashboard.js";
 app.use("/api/admin/visa", adminVisaDashboardRouter);
+
+/* Milestone 1 (D2C tracking) — THE MASTER SHEET. Its own prefix rather
+ * than another router at /api/admin/visa, because it reads a different
+ * collection (VisaD2CLead) and answers a commercial question, not an ops
+ * one: its most valuable rows are the people the concierge queue
+ * correctly refuses to show, because they have no ticket yet. Same
+ * visaApplication READ gate. See routes/admin.visa.masterSheet.ts. */
+import adminVisaMasterSheetRouter from "./routes/admin.visa.masterSheet.js";
+app.use("/api/admin/visa/master-sheet", adminVisaMasterSheetRouter);
 
 // Visa module (2026-08-09) — the cross-workspace ROSTER: every customer
 // workspace with its real KPIs, and a drill-in to any one workspace's
@@ -1033,10 +1056,36 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
         const { startHoldBookingReminderCron } = await import("./jobs/hold-booking-reminder.js");
         startHoldBookingReminderCron();
 
-        // BUCKET-C-1: TBO static data refresh (15-day spec rule)
-        const { startStaticDataRefreshCron, seedStaticDataIfEmpty } = await import("./jobs/static-data-refresh.js");
-        startStaticDataRefreshCron();
-        seedStaticDataIfEmpty().catch((e: unknown) => logger.warn("[StaticRefresh] Seed failed", { e }));
+        /* BUCKET-C-1: TBO static data refresh (15-day spec rule)
+         *
+         * ── OFF IN LOCAL DEV, AND NOT ONLY FOR TIDINESS ──────────────────
+         * .env.development blanks the TBO credentials on purpose ("no TBO
+         * calls billed against the real account"), so in dev every call this
+         * job makes returns 401 "Access Credentials is incorrect". It cannot
+         * succeed, and it is not meant to.
+         *
+         * What it DOES do is write a HotelCityList_<timestamp>.json trace per
+         * country into apps/backend/logs/tbo/ on every boot — and those writes
+         * land inside the directory `node --watch` is watching. The watcher
+         * restarts the server, boot runs the seed again, which writes more
+         * traces, which restarts the server. That is a genuine restart loop:
+         * it was observed flapping ~8s apart and reached 93 restarts in one
+         * session, during which the backend is intermittently unreachable and
+         * the Vite proxy surfaces the refused connections as 500s.
+         *
+         * Disabled by an env flag rather than a NODE_ENV check, matching the
+         * convention already used by EOD_CRON_DISABLED and
+         * CRM_SALES_PULSE_DISABLED. Default is ENABLED, so production is
+         * unaffected — only an environment that opts out (.env.development
+         * does) skips it.
+         */
+        if (String(process.env.STATIC_DATA_REFRESH_DISABLED || "").toLowerCase() === "true") {
+          logger.info("[StaticRefresh] disabled by STATIC_DATA_REFRESH_DISABLED — skipping cron and seed");
+        } else {
+          const { startStaticDataRefreshCron, seedStaticDataIfEmpty } = await import("./jobs/static-data-refresh.js");
+          startStaticDataRefreshCron();
+          seedStaticDataIfEmpty().catch((e: unknown) => logger.warn("[StaticRefresh] Seed failed", { e }));
+        }
 
         // BUCKET-C-3: Orphaned PENDING booking cleanup (hourly)
         const { startOrphanPendingCleanupCron } = await import("./jobs/orphan-pending-cleanup.js");

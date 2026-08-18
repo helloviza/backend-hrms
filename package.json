@@ -5,7 +5,8 @@
   "main": "dist/server.js",
   "packageManager": "pnpm@9.0.0",
   "scripts": {
-    "dev": "node --env-file=.env.development --import tsx --watch src/server.ts",
+    "dev": "node --env-file=.env.development --import tsx src/server.ts",
+    "dev:watch": "node --env-file=.env.development --import tsx --watch src/server.ts",
     "dev:test": "node --env-file=.env.test --import tsx src/server.ts",
     "postinstall": "node -e \"if (process.env.NODE_ENV !== 'production') { try { require('child_process').execSync('npx puppeteer browsers install chrome', { stdio: 'inherit' }); } catch (e) { console.warn('[postinstall] puppeteer chrome download skipped:', e?.message); } }\"",
     "build": "NODE_OPTIONS=--max-old-space-size=4096 tsc -p tsconfig.json && cp -r src/data src/fonts dist/ && node dist/services/video/ytDlpProvision.js && node dist/services/geoipProvision.js",

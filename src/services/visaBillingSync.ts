@@ -93,7 +93,11 @@ export type VisaBillingSyncAction =
   | "skipped_already_exists"
   | "skipped_no_request"
   | "skipped_traveller_erased"
-  | "skipped_billing_customer_unresolved";
+  | "skipped_billing_customer_unresolved"
+  // A D2C (helloviza.ai) case. Not an error and not a failure — this
+  // module bills WORKSPACE customers, and a consumer is not one. See the
+  // guard in both entry points below.
+  | "skipped_d2c_billing";
 
 // See resolveBillingCustomer's own doc comment for what each reason means.
 // Exported so callers (routes/admin.visa.ts) can persist the same reason
@@ -320,6 +324,57 @@ async function resolveBillingContext(application: any): Promise<BillingContext |
  * actually run twice for the same application, but a retry/race must
  * never create a duplicate.
  */
+/* ─────────────────────────────────────────────────────────────────────
+ * THE D2C GUARD.
+ *
+ * ── WHY THIS MODULE MUST NOT RUN FOR A CONSUMER CASE ─────────────────
+ * Everything below this line bills a WORKSPACE CUSTOMER: it resolves a
+ * Customer from the application's workspace/customerId, writes a
+ * ManualBooking into that tenant's register, and lets the invoicing module
+ * pick it up. A helloviza.ai consumer is not a Customer and has no tenant
+ * — every D2C case shares one synthetic workspace, which
+ * resolveBillingCustomer would either fail on or, worse, resolve to
+ * something arbitrary shared by every consumer.
+ *
+ * D2C money is collected UP FRONT by the consumer, not invoiced in
+ * arrears to an employer. That is a different mechanism, not a variant of
+ * this one.
+ *
+ * ── WHY IT IS A NAMED SKIP AND NOT LEFT TO FALL THROUGH ──────────────
+ * Without this, a D2C case reaches resolveBillingContext, which does
+ * VisaRequest.findById(application.requestId). Under A-prime that request
+ * EXISTS, so the lookup succeeds and the case would proceed toward billing
+ * a customer that does not exist. And in the request-less shape the model
+ * now permits, findById(null) returns null and the case would be reported
+ * as "parent VisaRequest not found" — an error naming a cause that is not
+ * the cause, sending whoever reads it hunting for a missing row that was
+ * never supposed to be there.
+ *
+ * Both outcomes are wrong in the same way: they describe a D2C case in
+ * B2B terms. So the channel is checked FIRST, by name.
+ *
+ * TODO(milestone-2): D2C's own money path (Razorpay order -> payment
+ * captured -> consumer invoice) plugs in as its OWN service, called from
+ * the payment webhook rather than from a status transition. It does not
+ * belong in this file: the trigger, the payer and the document are all
+ * different. This guard is what keeps the two from being confused for one
+ * another in the meantime.
+ * ───────────────────────────────────────────────────────────────────── */
+
+function isD2CCase(application: any): boolean {
+  return application?.source === "D2C";
+}
+
+function skipD2C(applicationId: string, phase: string): VisaBillingSyncResult {
+  // info, not warn/error — nothing is wrong. A warn here would put a
+  // permanent yellow line in the log for every consumer case we ever run.
+  visaBillingLogger.info(`skipped ${phase} — D2C case, not workspace-billed`, {
+    applicationId,
+    reason: "D2C cases are paid up front by the consumer; see TODO(milestone-2)",
+  });
+  return { action: "skipped_d2c_billing", manualBookingId: null };
+}
+
 export async function createVisaWorkStartBooking(
   application: any,
   actorUserId: any,
@@ -338,6 +393,8 @@ export async function createVisaWorkStartBooking(
     visaBillingLogger.warn("skipped work-start booking — traveller erased", { applicationId });
     return { action: "skipped_traveller_erased", manualBookingId: null };
   }
+
+  if (isD2CCase(application)) return skipD2C(applicationId, "work-start booking");
 
   const existing = await ManualBooking.findOne({ "metadata.visaApplicationId": applicationId });
   if (existing) {
@@ -458,6 +515,8 @@ export async function syncVisaApplicationBilling(
     visaBillingLogger.warn("skipped outcome billing sync — traveller erased", { applicationId });
     return { action: "skipped_traveller_erased", manualBookingId: null };
   }
+
+  if (isD2CCase(application)) return skipD2C(applicationId, "outcome billing sync");
 
   const actualPrice = (application.actualEmbassyFeeInr || 0) + (application.actualVfsFeeInr || 0);
   const serviceFee = application.actualPlumtripsServiceFeeInr || 0;

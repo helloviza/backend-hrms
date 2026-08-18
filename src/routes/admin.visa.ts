@@ -71,6 +71,7 @@ import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import VisaActivityLog, { logVisaActivity, type VisaActivityEventType } from "../models/VisaActivityLog.js";
 import { assessProcessingRisk, atRiskCutoff } from "../utils/visaEta.js";
+import { objectIdKeys } from "../utils/objectIdKeys.js";
 import { checkScreeningAuthority } from "../services/visaScreeningAuthority.js";
 import { hydrateVisaChecklist, computeOutstandingRequirements } from "../utils/visaChecklistHydration.js";
 import { resolveVisaChecklistWithExclusions } from "../utils/visaChecklistResolver.js";
@@ -316,6 +317,30 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       // to us). VISA_OPS_HIDDEN_STATUSES is the single shared constant
       // behind every Plumtrips-facing status filter.
       filter.status = { $nin: VISA_OPS_HIDDEN_STATUSES };
+    }
+
+    /* ── THE CHANNEL TAB FILTER ──────────────────────────────────────
+     * ABSENT => NO FILTER AT ALL. That is what keeps every existing
+     * caller byte-identical: the console before this change sent no
+     * `source`, and a request without one still matches everything.
+     *
+     * ⚠ "B2B" IS `$ne: "D2C"`, NOT `$eq: "B2B"`, AND THE DIFFERENCE IS A
+     * PRODUCTION BUG IF GOT WRONG. `source` shipped recently (Phase 1b);
+     * any application row written before it exists has NO source key at
+     * all. An equality filter would silently drop every one of those from
+     * the B2B tab — the live ops surface quietly losing its oldest cases.
+     * `$ne: "D2C"` matches B2B and missing alike, which is the same rule
+     * services/visaBillingSync.ts's guard applies: absent is not D2C.
+     */
+    if (req.query.source != null) {
+      const src = String(req.query.source).trim().toUpperCase();
+      if (src === "D2C") {
+        filter.source = "D2C";
+      } else if (src === "B2B") {
+        filter.source = { $ne: "D2C" };
+      } else {
+        return res.status(400).json({ error: "source must be B2B or D2C" });
+      }
     }
 
     if (req.query.actionRequired === "true") {
@@ -576,7 +601,10 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
 
     // Joins now run for the PAGE ONLY — previously every one of these
     // resolved against the full pre-pagination row set.
-    const requestIds = [...new Set(pageDocs.map((a: any) => String(a.requestId)))];
+    // objectIdKeys, not String() — a null requestId (a D2C case, or any
+    // future request-less shape) would otherwise reach the $in as the
+    // string "null" and CastError the whole page. See utils/objectIdKeys.ts.
+    const requestIds = objectIdKeys(pageDocs.map((a: any) => a.requestId));
     const requests = await VisaRequest.find({ _id: { $in: requestIds } })
       .select("referenceNumber destinationIso2 purpose travelDateFrom travelDateTo status")
       .lean();
@@ -611,7 +639,10 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       .lean();
     const workspaceById = new Map(workspaces.map((w: any) => [String(w._id), w]));
 
-    const travellerIds = [...new Set(rows.map((r) => String(r.application.travellerProfileId)))];
+    // Same guard, and this one is the ALREADY-LIVE case: an erased
+    // traveller nulls this field, so ?includeErased=true selects rows whose
+    // id would arrive here as "null" and 500 the page.
+    const travellerIds = objectIdKeys(rows.map((r) => r.application.travellerProfileId));
     const travellers = await TravellerProfile.find({ _id: { $in: travellerIds } })
       .select("firstName middleName lastName")
       .lean();
@@ -706,6 +737,30 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         destinationName: a.ruleSnapshot?.destinationName ?? null,
         purpose: a.ruleSnapshot?.purpose ?? null,
         serviceTier: a.ruleSnapshot?.serviceTier ?? null,
+        /* ── CHANNEL + ATTRIBUTION ─────────────────────────────────
+         * Additive fields on an existing payload. `source` falls back to
+         * "B2B" for a pre-channel-tag row so the column never renders a
+         * blank for a case that IS B2B — the same "absent is not D2C"
+         * rule the filter above applies.
+         *
+         * The stored ENUM is sent, never a display label. "Plumbox" and
+         * "Helloviza.ai" are rendered by the console; a rename must
+         * never travel back into the database. */
+        source: a.source ?? "B2B",
+        // Present on D2C rows, empty strings elsewhere. utm.source is the
+        // column; the rest are for the detail view.
+        utm: {
+          source: a.utm?.source ?? "",
+          medium: a.utm?.medium ?? "",
+          campaign: a.utm?.campaign ?? "",
+          content: a.utm?.content ?? "",
+          term: a.utm?.term ?? "",
+        },
+        // The D2C funnel triple — null on B2B rows, which is what lets the
+        // console show these columns on the D2C tab only.
+        d2cStatus: a.d2cStatus ?? null,
+        d2cStage: a.d2cStage ?? null,
+        d2cPaymentStatus: a.d2cPaymentStatus ?? null,
         // Resolved against THIS application's own applicantProfile — see
         // computeAdminCompletenessCounts. Matches what the customer sees
         // for the same application (task brief §3).

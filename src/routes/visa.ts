@@ -62,14 +62,20 @@ import VisaRule, {
   type VisaDocumentRequirement,
   type VisaPurpose,
 } from "../models/VisaRule.js";
+import {
+  CUSTOMER_FACING_PURPOSES,
+  customerPurposesForRule,
+  purposeMatchValues,
+} from "../utils/visaPurposes.js";
 import VisaDestinationContent from "../models/VisaDestinationContent.js";
 import VisaRequest, { recomputeRequestStatus } from "../models/VisaRequest.js";
 import VisaApplication, {
   clearActionRequired,
   isTravellerErased,
   VISA_APPLICATION_ERASED_MESSAGE,
-  type VisaRuleSnapshot,
-  type VisaIndicativeCostSnapshot,
+  // VisaRuleSnapshot / VisaIndicativeCostSnapshot are no longer named here —
+  // the two builders that used them moved to utils/visaSnapshots.ts, which
+  // imports the types itself. Type-only removal; nothing at runtime.
 } from "../models/VisaApplication.js";
 import VisaDocument from "../models/VisaDocument.js";
 import TravellerProfile from "../models/TravellerProfile.js";
@@ -104,6 +110,9 @@ import {
 } from "../config/visaConsent.js";
 import { VISA_FEATURED_DESTINATIONS } from "../config/visaFeaturedDestinations.js";
 import { computeVisaFeeBlock } from "../utils/visaFee.js";
+// Moved out of this file (see the note where they used to be defined) so the
+// D2C consumer create endpoint shares them verbatim.
+import { buildIndicativeCostSnapshot, buildRuleSnapshot } from "../utils/visaSnapshots.js";
 import {
   computeEstimatedDecisionWindow,
   assessProcessingRisk,
@@ -163,39 +172,11 @@ const router = Router();
 
 const DEFAULT_APPLICANT_NATIONALITY = "IN";
 
-// A rule stored as TOURIST_OR_BUSINESS must satisfy BOTH a TOURIST query
-// and a BUSINESS query — it's one rule covering two purposes, not a third
-// distinct purpose a caller would ever ask for directly. TRANSIT (and any
-// other purpose) matches itself only — no widening.
-const PURPOSE_QUERY_EXPANSIONS: Partial<Record<VisaPurpose, VisaPurpose[]>> = {
-  TOURIST: ["TOURIST", "TOURIST_OR_BUSINESS"],
-  BUSINESS: ["BUSINESS", "TOURIST_OR_BUSINESS"],
-};
-
-function purposeMatchValues(purpose: VisaPurpose): VisaPurpose[] {
-  return PURPOSE_QUERY_EXPANSIONS[purpose] ?? [purpose];
-}
-
-// The purposes a customer actually picks from — TOURIST_OR_BUSINESS is never
-// one of them, it's a single RULE that covers two of them at once (see
-// PURPOSE_QUERY_EXPANSIONS above). VISA_PURPOSES' own declared order
-// (TOURIST, BUSINESS, TRANSIT once TOURIST_OR_BUSINESS is dropped) doubles
-// as the canonical card order GET /destinations reports in.
-const CUSTOMER_FACING_PURPOSES: VisaPurpose[] = VISA_PURPOSES.filter(
-  (p) => p !== "TOURIST_OR_BUSINESS",
-);
-
-// The inverse of purposeMatchValues(): given a rule's OWN stored purpose,
-// which customer-facing purpose(s) should it surface as? A TOURIST_OR_
-// BUSINESS rule answers to both a TOURIST and a BUSINESS query, so it must
-// surface as BOTH cards, not a third one nobody would recognise — same
-// widening GET /rules already applies, read in the other direction so the
-// two can never drift apart.
-function customerPurposesForRule(rulePurpose: VisaPurpose): VisaPurpose[] {
-  return CUSTOMER_FACING_PURPOSES.filter((p) =>
-    purposeMatchValues(p).includes(rulePurpose),
-  );
-}
+// Purpose widening (PURPOSE_QUERY_EXPANSIONS / purposeMatchValues /
+// CUSTOMER_FACING_PURPOSES / customerPurposesForRule) now lives in
+// utils/visaPurposes.ts — moved verbatim, imported above, unchanged in
+// behaviour. It moved because the PUBLIC consumer endpoint needs the same
+// answers and a second copy would eventually disagree with this one.
 
 // Cheapest/most-common tier first, not alphabetical — an alphabetical sort
 // on serviceTier put EXPRESS before STANDARD (E < S) and defaulted the UI to
@@ -1222,63 +1203,12 @@ router.get("/travellers/me/candidates", async (req: any, res: any) => {
  * Shared helpers for the /requests routes below.
  * ───────────────────────────────────────────────────────────────────── */
 
-function buildRuleSnapshot(rule: any): VisaRuleSnapshot {
-  return {
-    ruleId: rule._id,
-    capturedAt: new Date(),
-    destinationName: rule.destinationName,
-    isSchengen: rule.isSchengen,
-    productClass: rule.productClass,
-    visaCategory: rule.visaCategory,
-    purpose: rule.purpose,
-    entryType: rule.entryType,
-    serviceTier: rule.serviceTier,
-    validityDays: rule.validityDays,
-    maxStayDays: rule.maxStayDays,
-    isExtension: rule.isExtension,
-    etaMinDays: rule.etaMinDays,
-    etaMaxDays: rule.etaMaxDays,
-    etaBasis: rule.etaBasis,
-    appointmentRequired: rule.appointmentRequired,
-    biometricsRequired: rule.biometricsRequired,
-    // Cloned, not the source array by reference — this is an embedded
-    // POINT-IN-TIME copy (see VisaApplication.ts file header); the source
-    // VisaRule must be free to change later without that ever being
-    // visible through an application already created from it.
-    documentRequirements: (rule.documentRequirements || []).map((d: any) => ({
-      ...d,
-    })),
-    // Phase 10b — captured alongside documentRequirements above so a NEW
-    // application preserves group/appliesWhen fidelity going forward
-    // (existing applications' snapshots are immutable history and never
-    // gain this retroactively — see VisaRuleSnapshot's own doc comment).
-    // undefined (not []) when the rule itself has no groups, so "old-shape"
-    // and "legacy-only rule" both resolve identically downstream.
-    documentGroups:
-      rule.documentGroups && rule.documentGroups.length > 0
-        ? rule.documentGroups.map((g: any) => ({
-            ...g,
-            docTypeCodes: [...(g.docTypeCodes || [])],
-            appliesWhen: g.appliesWhen ? g.appliesWhen.map((c: any) => ({ ...c })) : undefined,
-          }))
-        : undefined,
-  };
-}
-
-// Same computeVisaFeeBlock the read route (GET /rules) uses — never a
-// separately-maintained pricing calculation for the write path.
-function buildIndicativeCostSnapshot(rule: any): VisaIndicativeCostSnapshot {
-  const fee = computeVisaFeeBlock(rule);
-  return {
-    embassyFeeInr: rule.embassyFeeInr,
-    vfsFeeInr: rule.vfsFeeInr,
-    plumtripsServiceFeeInr: rule.plumtripsServiceFeeInr,
-    indicativeVisaCostInr: rule.indicativeVisaCostInr,
-    displayMode: fee.displayMode,
-    totalInr: fee.totalInr,
-    priceNote: fee.priceNote,
-  };
-}
+// buildRuleSnapshot and buildIndicativeCostSnapshot MOVED to
+// utils/visaSnapshots.ts (imported above), unchanged, so the D2C consumer
+// create endpoint freezes a rule exactly the way this route does rather
+// than growing a second implementation of it. This route's calls are
+// untouched: buildIndicativeCostSnapshot's new `channel` argument defaults
+// to "B2B", which is what the call below has always produced.
 
 function travellerDisplayName(t: any): string {
   return [t?.firstName, t?.middleName, t?.lastName].filter(Boolean).join(" ");

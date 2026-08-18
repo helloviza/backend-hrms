@@ -50,6 +50,7 @@ import {
 } from "../config/visaCountrySeed.js";
 import { approvalChancesFor, approvalSourceFor, difficultyFor } from "../utils/visaDifficulty.js";
 import { normaliseToIso2 } from "../utils/countryCodes.js";
+import { customerPurposesForRules } from "../utils/visaPurposes.js";
 import { createTurnstileGate } from "../middleware/turnstile.js";
 import { travelRequestLimiter } from "../middleware/rateLimit.js";
 import { createIntakeBookings } from "../services/travelIntake.create.js";
@@ -334,6 +335,13 @@ function publicDocumentRows(rule: any) {
       key: g.key,
       label: g.label,
       requirement: g.requirement,
+      // docCodes is index-aligned with docNames (visaChecklistHydration.ts:154).
+      // Added for the consumer Apply flow: a group has to be matched against the
+      // consumer's document locker, and the locker is keyed by CODE, not by
+      // display name. Without this the client would have to reverse a name back
+      // into a code — a join it cannot do correctly, since names are localised
+      // catalogue copy and codes are not. Catalogue reference data, no PII.
+      docCodes: g.docCodes,
       docNames: g.docNames,
     })),
   };
@@ -524,6 +532,25 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
       // categories do (see the note above tooltipCategory).
       approvalSource: approvalSourceFor(iso2, tooltipCategory),
       purpose: rule.purpose,
+      /* THE CORRIDOR'S PURPOSES, not the chosen rule's.
+       *
+       * `purpose` above is scalar and belongs to the ONE rule this payload
+       * resolved to (tourist-preferred, then cheapest). `purposes` is the whole
+       * corridor: every customer-facing purpose its PUBLISHED rules cover, in
+       * the canonical card order, deduped. Step 1 of the Apply flow renders one
+       * card per entry — so a corridor is never offered a visa type no rule
+       * behind it exists for.
+       *
+       * Derived through the same customerPurposesForRule() the authenticated
+       * GET /destinations uses, from utils/visaPurposes.ts, so the consumer and
+       * B2B answers cannot drift: TOURIST_OR_BUSINESS surfaces as Tourist AND
+       * Business (never as its own option), and an all-TRANSIT corridor reports
+       * ["TRANSIT"] alone.
+       *
+       * `rules` is already in hand — it was loaded above and, until now,
+       * discarded after picking `rule`. No extra query.
+       */
+      purposes: customerPurposesForRules(rules as any[]),
       entryType: rule.entryType,
       processingTime:
         rule.etaMinDays != null || rule.etaMaxDays != null

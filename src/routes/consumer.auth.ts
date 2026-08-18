@@ -7,14 +7,21 @@
 // /refresh would have been wrong twice over: it reads the B2B `refreshToken`
 // cookie and verifies with JWT_REFRESH_SECRET.
 //
-// PHASE 1a SCOPE — signup just creates a consumer. The dual-identity
-// B2B-collision gate ("this email/mobile already exists in `users`, is that
-// you?") is Phase 1b; Consumer.phone is indexed already so that lookup lands
-// on an index when it arrives. Nothing here reads or writes the `users`
-// collection at all.
+// ── THE DUAL-IDENTITY B2B GATE (was Phase 1b, now built) ─────────────
+// This module now performs ONE read against the `users` collection: does
+// the email in front of us already belong to a CORPORATE Plumtrips
+// account? See b2bAccountExists() below for the full rules. It is a
+// lookup and nothing else — no write, no join, no B2B session, and no
+// field of that account is ever returned or logged.
+//
+// The header used to say "nothing here reads or writes the `users`
+// collection at all". The second half of that is still true and is the
+// part that matters; the first half is not, and this is the note that
+// says so rather than leaving a stale absolute in place.
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import Consumer from "../models/Consumer.js";
+import User from "../models/User.js";
 import { requireConsumer } from "../middleware/requireConsumer.js";
 import {
   signConsumerAccessToken,
@@ -110,6 +117,73 @@ function issueSession(res: any, consumer: { _id: any; tokenVersion: number }) {
   return { accessToken };
 }
 
+/* ══ THE B2B COLLISION LOOKUP ══════════════════════════════════════════
+ *
+ * "Does this email already belong to a corporate Plumtrips account?"
+ *
+ * ── WHY IT EXISTS ─────────────────────────────────────────────────────
+ * `users.email` carries a GLOBAL unique index and `consumers` is a
+ * separate collection, so the same human can hold both — a corporate
+ * traveller by day who buys a family holiday visa at night. That is a
+ * legitimate, expected state, not an error. What is NOT acceptable is
+ * the silent version of it: someone types their work address into the
+ * consumer login, gets "Invalid credentials" because no consumer row
+ * exists, and concludes the product is broken. This lookup turns that
+ * dead end into a question with two real answers.
+ *
+ * ── WHAT IT MAY DO, AND WHAT IT MAY NOT ───────────────────────────────
+ * MAY:  one findOne on `users`, projected to `_id`, converted to a
+ *       boolean before it leaves this function.
+ * MAY NOT: create, update, touch, or authenticate a B2B account; read
+ *       any field of it; return, log or imply anything about it beyond
+ *       the boolean. The return type is `Promise<boolean>` precisely so
+ *       there is no shape here for a detail to leak through — a caller
+ *       cannot accidentally spread an object it was never given.
+ *
+ * Nothing in routes/auth.ts is imported, called or modified. The B2B
+ * login path is untouched by this file; all it ever does is name it in a
+ * message so the reader knows which door to knock on.
+ *
+ * ── THE WORKSPACE SCOPE IS DELIBERATELY ABSENT ────────────────────────
+ * User carries workspaceScopePlugin, which injects a `workspaceId`
+ * filter — but ONLY when a caller passes `_workspaceId` in the query
+ * options. This query passes none, so it is global, and that is correct
+ * rather than a scope bypass: the question is "does this address exist
+ * anywhere in B2B", and a tenant-scoped answer would be meaningless
+ * here. A consumer has no employer to scope to (see the header of
+ * models/Consumer.ts), and `/api/consumer` is in server.ts's
+ * WORKSPACE_EXEMPT list for exactly that reason.
+ *
+ * ── ON ENUMERATION ────────────────────────────────────────────────────
+ * This DOES make the endpoint an oracle for B2B account existence, and
+ * that is an accepted, deliberate cost — the fork cannot be offered
+ * without it. It is kept as narrow as the feature allows:
+ *
+ *   - only reachable when NO consumer row exists for the address, so an
+ *     address that is a consumer never reveals whether it is also a B2B
+ *     user, and a wrong password still returns the same generic
+ *     "Invalid credentials" it always did;
+ *   - the response carries a fixed marker and a fixed sentence, so two
+ *     different B2B accounts are indistinguishable from each other;
+ *   - nothing about the account — not its name, workspace, role or
+ *     status — reaches the wire.
+ *
+ * It is not a NEW oracle in the strict sense either: routes/signup.ts's
+ * /check-email is already one for B2B addresses. That is not a licence,
+ * which is why the constraints above are enforced here rather than
+ * waved through.
+ */
+async function b2bAccountExists(email: string): Promise<boolean> {
+  const hit = await User.findOne({ email }).select("_id").lean();
+  // Coerced at the boundary. The document never escapes this function.
+  return Boolean(hit);
+}
+
+/** The one marker the frontend switches on. Fixed string, no variants. */
+const B2B_MARKER = "B2B_ACCOUNT_EXISTS";
+const B2B_MESSAGE =
+  "That address is already registered as a Plumtrips business account.";
+
 // The shape a consumer is ever described by on the wire. passwordHash is
 // select:false on the model, but this exists so no future field is exposed by
 // accident — a whitelist, not a blocklist.
@@ -143,12 +217,27 @@ router.post("/signup", async (req: any, res: any) => {
       return res.status(400).json({ error: "Password must be at least 8 characters" });
     }
 
-    // Checked against `consumers` ONLY. A collision with a B2B `users` row is
-    // deliberately not consulted here — that is the Phase 1b gate, and
-    // silently rejecting on it now would leak the existence of B2B accounts.
+    // CONSUMERS FIRST. An address that is already a consumer is answered
+    // as one, and the B2B lookup below is never reached for it — so this
+    // endpoint reveals nothing about B2B for any address it already
+    // knows.
     const exists = await Consumer.exists({ email });
     if (exists) {
       return res.status(409).json({ error: "An account with this email already exists" });
+    }
+
+    /* ── THE FORK, ON SIGNUP ──────────────────────────────────────────
+     * This is the more important of the two placements. Login is a
+     * confused reader; signup is a reader about to create a SECOND
+     * identity on an address that already has one, and doing that
+     * silently is how a person ends up with two accounts, one set of
+     * documents, and no idea which is which.
+     *
+     * 409, matching the consumer-collision answer directly above it: the
+     * request conflicts with existing state. The marker is what the
+     * slider switches on; the sentence is what the reader sees. */
+    if (await b2bAccountExists(email)) {
+      return res.status(409).json({ error: B2B_MESSAGE, code: B2B_MARKER });
     }
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_COST);
@@ -178,10 +267,26 @@ router.post("/login", async (req: any, res: any) => {
 
     // passwordHash is select:false on the model — re-selected explicitly.
     const consumer: any = await Consumer.findOne({ email }).select("+passwordHash");
-    // Same generic message for "no such consumer" and "wrong password", so
-    // this endpoint is not an account-existence oracle. (routes/signup.ts's
-    // /check-email already is one for B2B; that is not a precedent to copy.)
     if (!consumer) {
+      /* ── THE FORK, ON LOGIN ────────────────────────────────────────
+       * Reached ONLY when there is no consumer row at all — which is
+       * what keeps the change narrow. An address that IS a consumer
+       * falls straight through to the bcrypt compare below and, on a
+       * wrong password, still gets the same generic "Invalid
+       * credentials" it always did. So this branch cannot be used to
+       * ask "is this consumer also a B2B user?", only "this address is
+       * not a consumer at all — is it perhaps the other thing?".
+       *
+       * 409 rather than 400, and the distinction is the point: this is
+       * not a failed credential, it is a request that conflicts with an
+       * identity that already exists elsewhere. A 400 here would put
+       * the fork in the same bucket as a typo'd password. */
+      if (await b2bAccountExists(email)) {
+        return res.status(409).json({ error: B2B_MESSAGE, code: B2B_MARKER });
+      }
+      // Otherwise the original answer, unchanged: the SAME generic
+      // message for "no such consumer" and "wrong password", so this
+      // endpoint remains no oracle for consumer accounts.
       return res.status(400).json({ error: "Invalid credentials" });
     }
     if (consumer.status !== "ACTIVE") {

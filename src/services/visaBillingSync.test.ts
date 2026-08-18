@@ -890,3 +890,79 @@ describe("resolveBillingCustomer (via createVisaWorkStartBooking) — customer r
     expect(_manualBookings.query({ "metadata.visaApplicationId": String(application._id) })).toHaveLength(0);
   });
 });
+
+/* ─────────────────────────────────────────────────────────────────────
+ * THE D2C GUARD.
+ *
+ * This module bills a WORKSPACE CUSTOMER. A helloviza.ai consumer is not
+ * one — every D2C case shares a single synthetic workspace, and the money
+ * is collected up front rather than invoiced in arrears to an employer.
+ *
+ * The tests below pin BOTH halves of that: D2C never reaches the billing
+ * machinery, and B2B is completely unaffected by the guard's existence.
+ * The second half is the one that matters for "byte-identical" — a guard
+ * that also changed the B2B answer would be a regression wearing a
+ * feature's clothes.
+ * ───────────────────────────────────────────────────────────────────── */
+
+describe("D2C cases are never workspace-billed", () => {
+  it("createVisaWorkStartBooking returns skipped_d2c_billing and writes nothing", async () => {
+    const { application } = fullFixtureSet({
+      source: "D2C",
+      status: "docs_under_review",
+      outcome: undefined,
+    });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    expect(result).toEqual({ action: "skipped_d2c_billing", manualBookingId: null });
+    expect(_manualBookings.query({})).toHaveLength(0);
+  });
+
+  it("syncVisaApplicationBilling returns skipped_d2c_billing and writes nothing", async () => {
+    const { application } = fullFixtureSet({ source: "D2C" });
+
+    const result = await syncVisaApplicationBilling(application, new mongoose.Types.ObjectId());
+
+    expect(result).toEqual({ action: "skipped_d2c_billing", manualBookingId: null });
+    expect(_manualBookings.query({})).toHaveLength(0);
+  });
+
+  it("does NOT report the misleading skipped_no_request, even with no parent request", async () => {
+    // The pre-guard failure mode: a request-less case fell through to
+    // resolveBillingContext, whose null return was reported as "parent
+    // VisaRequest not found" — an error naming a cause that is not the
+    // cause. The channel is the reason, so the channel is what is named.
+    const { application } = fullFixtureSet({
+      source: "D2C",
+      requestId: null,
+      status: "docs_under_review",
+      outcome: undefined,
+    });
+
+    const result = await createVisaWorkStartBooking(application, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("skipped_d2c_billing");
+    expect(result.action).not.toBe("skipped_no_request");
+  });
+
+  it("a B2B case is UNCHANGED by the guard — it still bills normally", async () => {
+    const { application } = fullFixtureSet();
+
+    const result = await syncVisaApplicationBilling(application, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("created");
+    expect(_manualBookings.query({})).toHaveLength(1);
+  });
+
+  it("an application with no source at all still bills — absent is not D2C", async () => {
+    // Every row written before the channel tag existed has no `source`
+    // key. Those are B2B by definition (models/visaCaseSource.ts), and the
+    // guard must not swallow them.
+    const { application } = fullFixtureSet({ source: undefined });
+
+    const result = await syncVisaApplicationBilling(application, new mongoose.Types.ObjectId());
+
+    expect(result.action).toBe("created");
+  });
+});

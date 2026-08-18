@@ -414,3 +414,127 @@ describe("ensureD2CWorkspace", () => {
     expect(row.companyName).toBe("Renamed By Ops");
   });
 });
+
+/* ══ THE DUAL-IDENTITY B2B GATE ═══════════════════════════════════════
+ *
+ * The one place this module reads the `users` collection. These tests
+ * exist because every interesting property of that read is a NEGATIVE
+ * one — what it must not write, must not return, and must not reveal —
+ * and negatives do not show up in manual testing.
+ *
+ * The B2B user rows here are written with the raw driver rather than
+ * through models/User.ts. That is deliberate: User carries
+ * workspaceScopePlugin, which declares workspaceId REQUIRED, so building
+ * a valid document through the model would mean standing up a workspace
+ * and a dozen unrelated required fields to test a lookup that reads one
+ * indexed key. The collection name and the `email` key are the entire
+ * contract under test.
+ */
+describe("the B2B collision fork", () => {
+  const B2B_EMAIL = "admin@plumtrips.com";
+
+  /** A minimal `users` row — only the field the lookup actually reads. */
+  async function seedB2BUser(email = B2B_EMAIL) {
+    await mongoose.connection.db!.collection("users").insertOne({
+      email,
+      name: "Corporate Person",
+      workspaceId: new mongoose.Types.ObjectId(),
+      roles: ["ADMIN"],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+  }
+
+  beforeEach(async () => {
+    await mongoose.connection.db!.collection("users").deleteMany({});
+  });
+
+  it("fires on LOGIN for an address that is only a B2B account", async () => {
+    await seedB2BUser();
+    const res = await request(app())
+      .post("/api/consumer/auth/login")
+      .send({ email: B2B_EMAIL, password: "anything at all" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("B2B_ACCOUNT_EXISTS");
+  });
+
+  it("fires on SIGNUP, which is the case that would otherwise create a second identity", async () => {
+    await seedB2BUser();
+    const res = await signup({ email: B2B_EMAIL });
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("B2B_ACCOUNT_EXISTS");
+    // And no consumer was created behind it.
+    expect(await Consumer.countDocuments({ email: B2B_EMAIL })).toBe(0);
+  });
+
+  it("is case-insensitive, because the login path lowercases before it looks", async () => {
+    await seedB2BUser();
+    const res = await request(app())
+      .post("/api/consumer/auth/login")
+      .send({ email: "ADMIN@Plumtrips.COM", password: "x" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("B2B_ACCOUNT_EXISTS");
+  });
+
+  it("does NOT fire for an address that is in neither collection", async () => {
+    await seedB2BUser();
+    const res = await request(app())
+      .post("/api/consumer/auth/login")
+      .send({ email: "nobody@example.com", password: "x" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid credentials");
+    expect(res.body.code).toBeUndefined();
+  });
+
+  it("does NOT fire for an existing CONSUMER with a wrong password — the oracle is not widened", async () => {
+    /* THE IMPORTANT ONE. An address that is BOTH a consumer and a B2B
+     * user must still get the plain generic failure, or the fork becomes
+     * a way to ask "is this consumer also a corporate user?" — a
+     * question nobody is entitled to an answer to. The gate is reachable
+     * only where no consumer row exists at all. */
+    await signup({ email: B2B_EMAIL });
+    await seedB2BUser();
+
+    const res = await request(app())
+      .post("/api/consumer/auth/login")
+      .send({ email: B2B_EMAIL, password: "the wrong password" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid credentials");
+    expect(res.body.code).toBeUndefined();
+  });
+
+  it("leaks NOTHING about the B2B account beyond the marker itself", async () => {
+    await seedB2BUser();
+    const res = await request(app())
+      .post("/api/consumer/auth/login")
+      .send({ email: B2B_EMAIL, password: "x" });
+
+    // Exactly two keys, and neither is a field of that account.
+    expect(Object.keys(res.body).sort()).toEqual(["code", "error"]);
+    const serialised = JSON.stringify(res.body);
+    for (const leak of ["Corporate Person", "ADMIN", "workspaceId", "_id", "roles"]) {
+      expect(serialised, `response must not carry "${leak}"`).not.toContain(leak);
+    }
+  });
+
+  it("is READ-ONLY — the B2B row is byte-identical after repeated hits on both endpoints", async () => {
+    await seedB2BUser();
+    const users = mongoose.connection.db!.collection("users");
+    const before = JSON.stringify(await users.find({}).toArray());
+
+    for (let i = 0; i < 3; i++) {
+      await request(app())
+        .post("/api/consumer/auth/login")
+        .send({ email: B2B_EMAIL, password: `guess-${i}` });
+      await signup({ email: B2B_EMAIL });
+    }
+
+    expect(JSON.stringify(await users.find({}).toArray())).toBe(before);
+    expect(await users.countDocuments({})).toBe(1);
+  });
+});

@@ -496,7 +496,17 @@ describe("GET /visa/country/:iso2 — unserviced", () => {
 
   it("omits documents, groups and price entirely — there is no rule behind it", async () => {
     const res = await request(app()).get("/api/public/visa/country/DE");
-    for (const key of ["documents", "documentGroups", "price", "isCurated", "purpose"]) {
+    // `purposes` belongs on this list for the same reason `documents` does:
+    // an empty array would read as "we checked and this corridor offers no
+    // visa types", when the truth is that we hold no rule for it at all.
+    for (const key of [
+      "documents",
+      "documentGroups",
+      "price",
+      "isCurated",
+      "purpose",
+      "purposes",
+    ]) {
       expect(key in res.body, key).toBe(false);
     }
   });
@@ -668,6 +678,105 @@ describe("GET /visa/country/:iso2 — serviced", () => {
 
     expect(res.body.visaCategory).toBe("E_VISA");
     expect(res.body.visaType).toBe("TRAVEL_AUTH");
+  });
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * `purposes[]` — THE CORRIDOR'S VISA TYPES, HONESTLY
+ *
+ * Step 1 of the consumer Apply flow renders one card per entry here, so
+ * every one of these assertions is a statement about what a customer is
+ * offered. The rule under test is: a card exists if and only if a
+ * PUBLISHED rule behind it exists.
+ * ═══════════════════════════════════════════════════════════════════ */
+describe("GET /visa/country/:iso2 — purposes[]", () => {
+  it("reports only the purposes the corridor's rules actually cover", async () => {
+    await makeRule({ purpose: "TOURIST" });
+    const res = await request(app()).get("/api/public/visa/country/TH");
+
+    // One rule, one purpose — not the full CUSTOMER_FACING_PURPOSES menu.
+    expect(res.body.purposes).toEqual(["TOURIST"]);
+  });
+
+  it("surfaces a TOURIST_OR_BUSINESS rule as BOTH cards, never as its own", async () => {
+    // The honest-render rule. TOURIST_OR_BUSINESS is one rule covering two
+    // real choices; showing it as a third "Tourist or Business" option would
+    // name a visa type no customer would recognise and no rule is filed under.
+    await makeRule({ purpose: "TOURIST_OR_BUSINESS" });
+    const res = await request(app()).get("/api/public/visa/country/TH");
+
+    expect(res.body.purposes).toEqual(["TOURIST", "BUSINESS"]);
+    expect(res.body.purposes).not.toContain("TOURIST_OR_BUSINESS");
+  });
+
+  it("reports ['TRANSIT'] alone for an all-transit corridor", async () => {
+    // The inverse failure: a corridor we only sell transit visas for must
+    // not offer a Tourist card. TRANSIT never widens.
+    await makeRule({ purpose: "TRANSIT" });
+    const res = await request(app()).get("/api/public/visa/country/TH");
+
+    expect(res.body.purposes).toEqual(["TRANSIT"]);
+  });
+
+  it("dedupes across rules and reports in canonical card order", async () => {
+    // Three rules, overlapping coverage. TOURIST appears twice (once on its
+    // own rule, once via the TOURIST_OR_BUSINESS one) and must appear once.
+    await makeRule({ purpose: "TOURIST" });
+    await makeRule({ purpose: "TOURIST_OR_BUSINESS", entryType: "MULTIPLE" });
+    await makeRule({ purpose: "TRANSIT", entryType: "MULTIPLE" });
+    const res = await request(app()).get("/api/public/visa/country/TH");
+
+    // VISA_PURPOSES' declared order, not insertion order and not alphabetical.
+    expect(res.body.purposes).toEqual(["TOURIST", "BUSINESS", "TRANSIT"]);
+  });
+
+  it("counts the whole corridor, not just the rule the payload resolved to", async () => {
+    // `purpose` (scalar) belongs to the ONE resolved rule; `purposes` is the
+    // corridor. A BUSINESS-only second rule is invisible to `purpose` and
+    // must still produce a Business card.
+    await makeRule({ purpose: "TOURIST" });
+    await makeRule({ purpose: "BUSINESS", entryType: "MULTIPLE" });
+    const res = await request(app()).get("/api/public/visa/country/TH");
+
+    expect(res.body.purpose).toBe("TOURIST"); // tourist-preferred resolution
+    expect(res.body.purposes).toEqual(["TOURIST", "BUSINESS"]);
+  });
+
+  it("ignores DRAFT rules — an unpublished purpose is not an offer", async () => {
+    await makeRule({ purpose: "TOURIST" });
+    await makeRule({ purpose: "BUSINESS", entryType: "MULTIPLE", status: "DRAFT" });
+    const res = await request(app()).get("/api/public/visa/country/TH");
+
+    expect(res.body.purposes).toEqual(["TOURIST"]);
+  });
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * `documentGroups[].docCodes` — the locker join key
+ * ═══════════════════════════════════════════════════════════════════ */
+describe("GET /visa/country/:iso2 — documentGroups docCodes", () => {
+  it("exposes the catalogue codes, index-aligned with docNames", async () => {
+    await makeRule();
+    const res = await request(app()).get("/api/public/visa/country/TH");
+
+    const passport = res.body.documentGroups.find((g: any) => g.key === "PASSPORT");
+    expect(passport.docCodes).toEqual(["PASSPORT_ORIGINAL"]);
+    expect(passport.docCodes).toHaveLength(passport.docNames.length);
+  });
+
+  it("gives an unmapped group an EMPTY docCodes, and still no internal fields", async () => {
+    // The UNMAPPED fixture group has no docTypeCodes. It must come through as
+    // [] — the client shows the requirement with an upload but no locker
+    // match — and must NOT drag needsCatalogueMapping /
+    // unmatchedDocumentNames / unmatchedTemplateReference along with it.
+    await makeRule();
+    const res = await request(app()).get("/api/public/visa/country/TH");
+
+    const unmapped = res.body.documentGroups.find((g: any) => g.key === "UNMAPPED");
+    expect(unmapped.docCodes).toEqual([]);
+    expect(unmapped).not.toHaveProperty("needsCatalogueMapping");
+    expect(unmapped).not.toHaveProperty("unmatchedDocumentNames");
+    expect(unmapped).not.toHaveProperty("unmatchedTemplateReference");
   });
 });
 

@@ -51,6 +51,7 @@ import TravellerProfile from "../models/TravellerProfile.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
 import { csvRow } from "../utils/exportHelpers.js";
+import { objectIdKeys } from "../utils/objectIdKeys.js";
 import { maskTailId } from "../utils/piiMask.js";
 
 const router = Router();
@@ -421,7 +422,8 @@ router.get("/reports/case-log", requirePermission("visaApplication", "READ"), as
       .limit(REPORT_ROW_CAP)
       .lean();
 
-    const requestIds = [...new Set(applications.map((a: any) => String(a.requestId)))];
+    // See utils/objectIdKeys.ts — null ids must be dropped, not stringified.
+    const requestIds = objectIdKeys(applications.map((a: any) => a.requestId));
     const requests = await VisaRequest.find({ _id: { $in: requestIds } })
       .select("referenceNumber travelDateFrom travelDateTo")
       .lean();
@@ -433,7 +435,7 @@ router.get("/reports/case-log", requirePermission("visaApplication", "READ"), as
       : [];
     const workspaceById = new Map(workspaces.map((w: any) => [String(w._id), w]));
 
-    const travellerIds = [...new Set(applications.map((a: any) => String(a.travellerProfileId)))];
+    const travellerIds = objectIdKeys(applications.map((a: any) => a.travellerProfileId));
     const travellers = travellerIds.length
       ? await TravellerProfile.find({ _id: { $in: travellerIds } }).select("firstName middleName lastName passportNo").lean()
       : [];
@@ -732,7 +734,7 @@ router.get("/reports/progress", requirePermission("visaApplication", "READ"), as
       .select("workspaceId requestId travellerProfileId status outcome submittedAt createdAt")
       .lean();
 
-    const requestIds = [...new Set(applications.map((a: any) => String(a.requestId)))];
+    const requestIds = objectIdKeys(applications.map((a: any) => a.requestId));
     const requests = requestIds.length
       ? await VisaRequest.find({ _id: { $in: requestIds } }).select("referenceNumber travelDateFrom").lean()
       : [];
@@ -744,7 +746,7 @@ router.get("/reports/progress", requirePermission("visaApplication", "READ"), as
       : [];
     const workspaceById = new Map(workspaces.map((w: any) => [String(w._id), w]));
 
-    const travellerIds = [...new Set(applications.map((a: any) => String(a.travellerProfileId)))];
+    const travellerIds = objectIdKeys(applications.map((a: any) => a.travellerProfileId));
     const travellers = travellerIds.length
       ? await TravellerProfile.find({ _id: { $in: travellerIds } }).select("firstName middleName lastName").lean()
       : [];

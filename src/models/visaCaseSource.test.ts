@@ -104,10 +104,56 @@ describe("source — default and accepted values", () => {
   });
 
   it('accepts an explicit "D2C" at creation on both models', async () => {
-    const r = await makeRequest({ source: "D2C" });
-    const a = await makeApplication({ source: "D2C" });
+    // consumerId is supplied because a D2C case is now REQUIRED to name its
+    // consumer (models/VisaApplication.ts / VisaRequest.ts). That is the new
+    // invariant, not a workaround for it — this test's subject is the enum
+    // accepting "D2C", and it still asserts exactly that. The invariant
+    // itself gets its own tests directly below.
+    const consumerId = new mongoose.Types.ObjectId();
+    const r = await makeRequest({ source: "D2C", consumerId, raisedByUserId: null });
+    const a = await makeApplication({ source: "D2C", consumerId });
     expect(r.source).toBe("D2C");
     expect(a.source).toBe("D2C");
+  });
+
+  /* ── The A-prime conditional-requirement rules ────────────────────────
+   * Four assertions, because the whole B2B-safety argument rests on these
+   * predicates resolving the OLD way for B2B and only the new way for D2C. */
+
+  it("requires consumerId when source is D2C — on both models", async () => {
+    await expect(makeRequest({ source: "D2C", raisedByUserId: null })).rejects.toThrow(
+      /consumerId/,
+    );
+    await expect(makeApplication({ source: "D2C" })).rejects.toThrow(/consumerId/);
+  });
+
+  it("does NOT require consumerId on B2B — the default path is unchanged", async () => {
+    const r = await makeRequest();
+    const a = await makeApplication();
+    expect(r.consumerId ?? null).toBeNull();
+    expect(a.consumerId ?? null).toBeNull();
+  });
+
+  it("still requires raisedByUserId on a B2B request, and allows null on D2C", async () => {
+    await expect(makeRequest({ raisedByUserId: null })).rejects.toThrow(/raisedByUserId/);
+
+    const d2c = await makeRequest({
+      source: "D2C",
+      raisedByUserId: null,
+      consumerId: new mongoose.Types.ObjectId(),
+    });
+    expect(d2c.raisedByUserId ?? null).toBeNull();
+  });
+
+  it("still requires requestId on a B2B application, and allows null on D2C", async () => {
+    await expect(makeApplication({ requestId: null })).rejects.toThrow(/requestId/);
+
+    const d2c = await makeApplication({
+      source: "D2C",
+      requestId: null,
+      consumerId: new mongoose.Types.ObjectId(),
+    });
+    expect(d2c.requestId ?? null).toBeNull();
   });
 
   it("rejects a channel outside the enum", async () => {
