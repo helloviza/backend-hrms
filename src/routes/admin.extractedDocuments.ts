@@ -7,7 +7,7 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import ExtractedDocument from "../models/ExtractedDocument.js";
 import ManualBooking from "../models/ManualBooking.js";
-import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import Customer from "../models/Customer.js";
 
 /**
  * Cross-tenant oversight over the ExtractedDocument master table.
@@ -135,14 +135,29 @@ const LIST_PROJECTION =
  * booking ref. Both are labels for ids ALREADY stored on the row — no data is
  * introduced that the collection doesn't already point at. Batched into two
  * queries for the whole page rather than one per row.
+ *
+ * The workspace label comes from `Customer`, NOT `CustomerWorkspace`. Despite
+ * the field name, ExtractedDocument.workspaceId is copied verbatim from
+ * ManualBooking.workspaceId, which is ref:"Customer" — the ids live in the
+ * `customers` collection. Looking them up in `customerworkspaces` matched
+ * nothing and rendered raw ObjectIds (verified against prod: 0/3 sampled ids
+ * in customerworkspaces, 3/3 in customers). Name precedence is the model's own
+ * canonical order from Customer.ts's pre-save hook — legalName, then
+ * companyName, then name — the same order routes/manualBookings.ts uses for
+ * the booking export, so one customer reads identically on both surfaces.
+ *
+ * manualBookings is the only writer today and it is Customer-space throughout.
+ * If a future source module stores a workspace id from a different id-space
+ * (a real CustomerWorkspace._id, say), this resolver must become source-aware
+ * — keyed on sourceModule — rather than having a second lookup bolted on.
  */
 async function resolveLabels(docs: any[]) {
   const wsIds = [...new Set(docs.map((d) => String(d.workspaceId)).filter(Boolean))];
   const bkIds = [...new Set(docs.map((d) => String(d.bookingId)).filter(Boolean))];
 
-  const [workspaces, bookings] = await Promise.all([
+  const [customers, bookings] = await Promise.all([
     wsIds.length
-      ? CustomerWorkspace.find({ _id: { $in: wsIds } }).select("companyName name legalName").lean()
+      ? Customer.find({ _id: { $in: wsIds } }).select("legalName companyName name").lean()
       : [],
     bkIds.length
       ? ManualBooking.find({ _id: { $in: bkIds } }).select("bookingRef").lean()
@@ -150,8 +165,8 @@ async function resolveLabels(docs: any[]) {
   ]);
 
   const wsName: Record<string, string> = {};
-  for (const w of workspaces as any[]) {
-    wsName[String(w._id)] = w.companyName || w.name || w.legalName || "";
+  for (const c of customers as any[]) {
+    wsName[String(c._id)] = c.legalName || c.companyName || c.name || "";
   }
   const bookingRef: Record<string, string> = {};
   for (const b of bookings as any[]) bookingRef[String(b._id)] = b.bookingRef || "";
@@ -369,19 +384,21 @@ router.get("/export", async (req: any, res: any) => {
 
 // GET /api/admin/extracted-documents/workspaces
 // The workspace filter's options — only tenants that actually have extracted
-// documents, so the dropdown can't offer an empty selection.
+// documents, so the dropdown can't offer an empty selection. Same Customer-space
+// lookup and same name precedence as resolveLabels above; this had the identical
+// CustomerWorkspace mismatch and would have listed raw ObjectIds in the dropdown.
 router.get("/workspaces", async (req: any, res: any) => {
   try {
     const ids = await ExtractedDocument.distinct("workspaceId", extractedDocScope(req));
-    const workspaces = ids.length
-      ? await CustomerWorkspace.find({ _id: { $in: ids } })
-          .select("companyName name legalName")
+    const customers = ids.length
+      ? await Customer.find({ _id: { $in: ids } })
+          .select("legalName companyName name")
           .lean()
       : [];
     res.json({
       ok: true,
-      workspaces: (workspaces as any[])
-        .map((w) => ({ _id: String(w._id), name: w.companyName || w.name || w.legalName || String(w._id) }))
+      workspaces: (customers as any[])
+        .map((c) => ({ _id: String(c._id), name: c.legalName || c.companyName || c.name || String(c._id) }))
         .sort((a, b) => a.name.localeCompare(b.name)),
     });
   } catch (err: any) {

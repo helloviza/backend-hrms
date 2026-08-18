@@ -100,14 +100,34 @@ vi.mock("../models/ManualBooking.js", () => ({
   },
 }));
 
+// The workspace label resolves through CUSTOMER, not CustomerWorkspace —
+// ExtractedDocument.workspaceId is copied from ManualBooking.workspaceId, which
+// is ref:"Customer". An earlier version of this file mocked CustomerWorkspace
+// with these ids, which made the label appear to resolve while the real query
+// (against `customers`) matched nothing in prod. Mocking the right collection
+// is the point of this fixture, not an incidental detail.
+//
+// The name fields deliberately exercise the precedence Customer.ts's own
+// pre-save hook uses: legalName, then companyName, then name.
+const customerFindArgs: any[] = [];
+vi.mock("../models/Customer.js", () => ({
+  default: {
+    find: (filter: any) => { customerFindArgs.push(filter); return ({
+      select: () => ({ lean: async () => [
+        // legalName wins over the other two
+        { _id: WS_A, legalName: "Tenant A Pvt Ltd", companyName: "A Co", name: "A" },
+        // no legalName → companyName wins
+        { _id: WS_B, companyName: "Tenant B Pvt Ltd", name: "B" },
+      ] }),
+    }); },
+  },
+}));
+
+// Present only to prove it is NOT consulted for the workspace label.
+const workspaceFindSpy = vi.fn();
 vi.mock("../models/CustomerWorkspace.js", () => ({
   default: {
-    find: () => ({
-      select: () => ({ lean: async () => [
-        { _id: WS_A, companyName: "Tenant A Pvt Ltd" },
-        { _id: WS_B, companyName: "Tenant B Pvt Ltd" },
-      ] }),
-    }),
+    find: (...a: any[]) => { workspaceFindSpy(...a); return ({ select: () => ({ lean: async () => [] }) }); },
   },
 }));
 
@@ -281,6 +301,31 @@ describe("flattening", () => {
     const a = res.body.rows.find((r: any) => r.workspaceId === WS_A);
     expect(a.workspace).toBe("Tenant A Pvt Ltd");
     expect(a.bookingRef).toBe("MB-A-0001");
+    // Never a raw id — the symptom this fix exists to remove.
+    expect(a.workspace).not.toMatch(/^[a-f0-9]{24}$/);
+  });
+
+  it("resolves the workspace label out of CUSTOMER-space, not CustomerWorkspace", async () => {
+    customerFindArgs.length = 0;
+    workspaceFindSpy.mockClear();
+    const res = await request(appAs(SUPERADMIN)).get("/api/admin/extracted-documents");
+
+    // The lookup went to `customers`, keyed on the ids actually stored.
+    expect(customerFindArgs).toHaveLength(1);
+    expect(customerFindArgs[0]._id.$in.map(String).sort()).toEqual([WS_A, WS_B].sort());
+    // And CustomerWorkspace was not consulted for the label at all.
+    expect(workspaceFindSpy).not.toHaveBeenCalled();
+
+    const labels = [...new Set(res.body.rows.map((r: any) => r.workspace))].sort();
+    expect(labels).toEqual(["Tenant A Pvt Ltd", "Tenant B Pvt Ltd"]);
+  });
+
+  it("uses Customer's own name precedence: legalName, then companyName, then name", async () => {
+    const res = await request(appAs(SUPERADMIN)).get("/api/admin/extracted-documents");
+    // WS_A has all three set — legalName must win.
+    expect(res.body.rows.find((r: any) => r.workspaceId === WS_A).workspace).toBe("Tenant A Pvt Ltd");
+    // WS_B has no legalName — companyName must win over name.
+    expect(res.body.rows.find((r: any) => r.workspaceId === WS_B).workspace).toBe("Tenant B Pvt Ltd");
   });
 
   it("does not ship extractedJson to the client", async () => {

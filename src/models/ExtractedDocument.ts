@@ -173,7 +173,12 @@ const ExtractedDocumentSchema = new Schema<ExtractedDocumentDoc>(
     sourceModule: { type: String, required: true, index: true },
     sourceId: { type: Schema.Types.ObjectId, required: true, index: true },
     bookingId: { type: Schema.Types.ObjectId, ref: "ManualBooking", index: true },
-    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
+    // `Customer`, not `CustomerWorkspace`: this id is copied straight from
+    // ManualBooking.workspaceId, which is itself ref:"Customer" — the value
+    // lives in the `customers` collection despite the field's name. The ref
+    // said CustomerWorkspace originally, which made the master page's label
+    // lookup miss every row and render a raw ObjectId.
+    workspaceId: { type: Schema.Types.ObjectId, ref: "Customer", required: true, index: true },
 
     // attachmentRef is the S3 key. It is the idempotency key (unique index
     // below): the upload path mints it with Date.now()+random, so one key is
