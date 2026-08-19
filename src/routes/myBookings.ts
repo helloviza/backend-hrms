@@ -22,6 +22,9 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import TravelBooking from "../models/TravelBooking.js";
 import ManualBooking from "../models/ManualBooking.js";
+import CarbonRecord from "../models/CarbonRecord.js";
+import ExtractedDocument from "../models/ExtractedDocument.js";
+import { CARBON_CALCULATION_VERSION } from "../services/carbonEngine.service.js";
 import Customer from "../models/Customer.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { canCustomerAccessBookingAttachments } from "../utils/bookingCustomerAccess.js";
@@ -948,6 +951,179 @@ router.get("/stats", async (req: Request, res: Response) => {
       error: err?.message,
     });
     res.status(500).json({ ok: false, error: "Failed to load booking stats" });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * GET /api/my-bookings/carbon
+ *
+ * The workspace's own flight-emissions figure, for the Flight Emissions card
+ * on the Client Portal Overview. All-time, own workspace, no parameters.
+ *
+ * ── Why this is not a call to /api/admin/carbon ──
+ *
+ * Two reasons, and the second is the load-bearing one.
+ *
+ * 1. That router is admin-gated (routes/admin.carbon.ts's adminOrSuperAdmin),
+ *    so no customer role reaches it at all.
+ * 2. It scopes on `req.workspaceObjectId` — a CustomerWorkspace._id. But
+ *    CarbonRecord.workspaceId is a CUSTOMER id (models/CarbonRecord.ts:193,
+ *    copied from ExtractedDocument, itself copied from ManualBooking.
+ *    workspaceId, ref:"Customer"). Reusing buildCarbonMatch here would match
+ *    a CustomerWorkspace._id against a field holding Customer._ids and return
+ *    zero — a wrong number that looks exactly like a real one, which is the
+ *    failure admin.carbon.ts's own header warns about for aggregations.
+ *
+ * So this endpoint scopes precisely the way GET /stats above does: off
+ * `req.workspace.customerId`, which IS the Customer id space. That shared
+ * derivation is what makes the card's total tie to the ops-side figure.
+ *
+ * ── Nothing is accepted, so nothing needs validating ──
+ *
+ * No workspaceId (the id comes from the resolved workspace, never from the
+ * caller — there is no argument through which to widen) and no from/to (the
+ * card is all-time by design).
+ *
+ * ── Company-wide, therefore ORG-scope only ──
+ *
+ * CarbonRecord carries passengerIndex/segmentIndex but no passenger identity
+ * — no email, no name (models/CarbonRecord.ts). There is no per-traveller
+ * grain to filter on the way /stats gates OWN-scope callers by
+ * email-in-passengers[]. Rather than hand an individual traveller the whole
+ * company's footprint, this answers available:false and issues no query.
+ *
+ * ── Counts, not a coverage percentage ──
+ *
+ * Deliberately no coveragePct. The ops dashboard's figure is priced/records —
+ * the share of segments WE HOLD DOCUMENTS FOR that could be priced. On a
+ * customer's own page a "Coverage 100%" badge reads as "all your travel is
+ * measured", which is a claim this data cannot support. The raw counts go to
+ * the client and the card words them.
+ * ═════════════════════════════════════════════════════════════════════ */
+
+/** The zero payload — valid, all-time, and renders as no card. */
+function emptyCarbon() {
+  return {
+    ok: true,
+    available: true,
+    calculationVersion: CARBON_CALCULATION_VERSION,
+    totalCo2eKg: 0,
+    records: 0,
+    priced: 0,
+    documents: 0,
+    confidence: { high: 0, medium: 0, insufficient: 0 },
+    excluded: { undatedSegments: 0, modeNotSupportedDocuments: 0 },
+  };
+}
+
+router.get("/carbon", async (req: Request, res: Response) => {
+  try {
+    const user: any = (req as any).user;
+
+    // The org gate comes FIRST — before id resolution, before any query. A
+    // plain traveller cannot pull the company total, and no pipeline runs on
+    // their behalf to be accidentally scoped later.
+    if (!isOrgScopeUser(user)) {
+      return res.json({ ok: true, available: false });
+    }
+
+    // Demo sessions. CarbonRecord has no isDemo dimension — the engine writes
+    // one record per real extracted document — so there is no demo-correct
+    // figure to serve. Answer with the empty payload (the card renders
+    // nothing) rather than showing a demo user the real tenant's emissions.
+    if (user?.isDemoUser) {
+      return res.json(emptyCarbon());
+    }
+
+    // Same derivation as /stats above, deliberately: the resolved workspace's
+    // customerId, never req.workspaceObjectId. See the header.
+    const customerId = (req as any).workspace?.customerId ?? null;
+    if (!customerId || !mongoose.isValidObjectId(customerId)) {
+      return res.json(emptyCarbon());
+    }
+
+    const workspaceId = new mongoose.Types.ObjectId(customerId);
+
+    // Pinned to CARBON_CALCULATION_VERSION for the same reason the ops
+    // dashboard is: seeding a newer engine's records must not silently
+    // restate a figure the customer has already seen.
+    const [agg] = await CarbonRecord.aggregate([
+      { $match: { workspaceId, calculationVersion: CARBON_CALCULATION_VERSION } },
+      {
+        $group: {
+          _id: null,
+          // Every segment in scope, including the ones we refused to price —
+          // so "what we emitted" and "what we could measure" are never the
+          // same number by accident.
+          records: { $sum: 1 },
+          // $sum ignores null, which is exactly right: an insufficient-data
+          // row contributes nothing rather than a zero.
+          totalCo2eKg: { $sum: "$co2eKg" },
+          priced: { $sum: { $cond: [{ $eq: ["$status", "calculated"] }, 1, 0] } },
+          high: { $sum: { $cond: [{ $eq: ["$confidence", "high"] }, 1, 0] } },
+          medium: { $sum: { $cond: [{ $eq: ["$confidence", "medium"] }, 1, 0] } },
+          insufficient: { $sum: { $cond: [{ $eq: ["$confidence", "insufficient"] }, 1, 0] } },
+          undatedSegments: { $sum: { $cond: [{ $eq: ["$travelMonth", null] }, 1, 0] } },
+          // The documents these records actually came from — so the card's
+          // "from N flight documents" is derived from the same rows as the
+          // total, not from a second query that could drift away from it.
+          documentIds: { $addToSet: "$extractedDocumentId" },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          records: 1,
+          totalCo2eKg: 1,
+          priced: 1,
+          high: 1,
+          medium: 1,
+          insufficient: 1,
+          undatedSegments: 1,
+          documents: { $size: "$documentIds" },
+        },
+      },
+    ]);
+
+    if (!agg) return res.json(emptyCarbon());
+
+    // Document grain, deliberately kept separate from the segment counts
+    // above and never summed with them: the engine writes NO CarbonRecord at
+    // all for a hotel or other document (the Phase 1 factor library is
+    // air-only), so there is no segment to count for them. Folding these into
+    // the segment denominator would invent rows that do not exist.
+    const modeNotSupportedDocuments = await ExtractedDocument.countDocuments({
+      workspaceId,
+      status: "extracted",
+      docType: { $ne: "flight" },
+    });
+
+    res.json({
+      ok: true,
+      available: true,
+      calculationVersion: CARBON_CALCULATION_VERSION,
+      totalCo2eKg: Math.round((agg.totalCo2eKg || 0) * 100) / 100,
+      records: agg.records || 0,
+      priced: agg.priced || 0,
+      documents: agg.documents || 0,
+      confidence: {
+        high: agg.high || 0,
+        medium: agg.medium || 0,
+        insufficient: agg.insufficient || 0,
+      },
+      excluded: {
+        // Segment grain.
+        undatedSegments: agg.undatedSegments || 0,
+        // Document grain — see above.
+        modeNotSupportedDocuments,
+      },
+    });
+  } catch (err: any) {
+    logger.error("my-bookings carbon failed", {
+      userId: (req as any).user?.sub || (req as any).user?._id,
+      error: err?.message,
+    });
+    res.status(500).json({ ok: false, error: "Failed to load flight emissions" });
   }
 });
 
