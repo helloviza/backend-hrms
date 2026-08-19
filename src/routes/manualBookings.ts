@@ -7,7 +7,7 @@ import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
-import ManualBooking from "../models/ManualBooking.js";
+import ManualBooking, { ATTACHMENT_REQUIRED_TYPES } from "../models/ManualBooking.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import Customer from "../models/Customer.js";
@@ -154,6 +154,8 @@ export function invoicePendingDays(b: any): number {
  *   - givenBy      : required for every type (form + create/update API only)
  *   - City         : required for HOTEL/DUMMY_HOTEL (sector OR itinerary.destination)
  *   - returnDate   : required for HOTEL/DUMMY_HOTEL (check-out)
+ *   - attachments  : >=1 for ATTACHMENT_REQUIRED_TYPES, CREATE only, and only
+ *                    when the payload carries the array (see the rule itself)
  * Import paths (Excel /import, SBT import) carry no givenBy and SBT flights
  * carry no return date, so imports enforce the reduced set (supplier + city).
  */
@@ -166,7 +168,8 @@ function hotelCityPresent(b: any): boolean {
   );
 }
 
-// Full rule set — used by the form-driven create/update API.
+// Full rule set — used by the form-driven CREATE API only (updates go through
+// validateBookingRequiredForUpdate below).
 function validateBookingRequired(b: any): string[] {
   const errors: string[] = [];
   const type = String(b?.type ?? "").toUpperCase();
@@ -175,6 +178,20 @@ function validateBookingRequired(b: any): string[] {
   if (HOTEL_TYPES.includes(type)) {
     if (!hotelCityPresent(b)) errors.push("City is required for hotel bookings");
     if (!b?.returnDate) errors.push("Check-out (return) date is required for hotel bookings");
+  }
+  // Attachment rule — Flight Service + Hotel Type. Scoped to a payload that
+  // ACTUALLY CARRIES the attachment set, which is the only point in a create
+  // where attachments[] is knowable: the form (and every caller today) creates
+  // the booking first and POSTs each file to /:id/attachments afterwards, so
+  // an unconditional "attachments must be non-empty" here would reject every
+  // legitimate flight and hotel create rather than the ones missing a ticket.
+  // See the sequencing note above the POST / handler.
+  if (
+    ATTACHMENT_REQUIRED_TYPES.includes(type as any) &&
+    Array.isArray(b?.attachments) &&
+    b.attachments.length === 0
+  ) {
+    errors.push("At least one attachment is required for flight and hotel bookings");
   }
   return errors;
 }
@@ -455,6 +472,17 @@ async function resolveBookedFromCity(req: any) {
 /* ── CRUD ────────────────────────────────────────────────────────── */
 
 // POST /api/admin/manual-bookings
+//
+// CREATE/ATTACH SEQUENCING — why the attachment rule in
+// validateBookingRequired() is conditional rather than absolute:
+// attachments[] is EMPTY for every booking at this point, always. Files can
+// only be posted to /:id/attachments, which needs an id, so the id has to
+// exist first. ManualBookingForm.tsx stages the files in the browser, calls
+// this route, then uploads them one-per-request in the same Save click.
+// A blanket "reject when attachments[] is empty" here would therefore fail
+// 100% of legitimate flight/hotel creates and 0% of the ones it is meant to
+// catch. The real gate for the staged flow is validate() in that form; this
+// route guards the case a payload does define its own attachments.
 router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, res: any) => {
   try {
     const vErrors = validateBookingRequired(req.body);
