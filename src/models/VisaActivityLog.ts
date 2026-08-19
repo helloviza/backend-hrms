@@ -103,6 +103,27 @@ export const VISA_ACTIVITY_EVENT_TYPES = [
   // /applications/:id/service-partner (routes/admin.visa.ts).
   "SERVICE_PARTNER_SET",
 
+  // Payments (D2C only, Milestone 2 Stage 2). Written by
+  // routes/razorpay.webhook.ts from a SIGNATURE-VERIFIED Razorpay event —
+  // never from a client call, and never on a B2B case: B2B money moves
+  // through invoices, not through a consumer checkout.
+  //
+  // PAYMENT_FAILED is recorded as deliberately as PAYMENT_DONE. A failed
+  // consumer payment is a chase-able lead, not a dead case, and the only
+  // durable evidence that the person tried at all is this row.
+  //
+  // Their `detail` carries amountInr and razorpayPaymentId. That is NOT
+  // PII under this file's rule — a gateway payment id and a price are
+  // commercial facts about the transaction, not applicant data — and the
+  // payment id is what makes a row reconcilable against a Razorpay
+  // settlement report months later.
+  "PAYMENT_DONE",
+  "PAYMENT_FAILED",
+  // Amount cross-check failed: the captured amount did not equal the
+  // application's priced total. Its own event because it is a different
+  // fact from "payment succeeded" — see the webhook's mismatch branch.
+  "PAYMENT_AMOUNT_MISMATCH",
+
   // Billing
   "MANUAL_BOOKING_CREATED",
   "MANUAL_BOOKING_UPDATED",
@@ -143,6 +164,14 @@ export const VISA_ACTIVITY_CUSTOMER_VISIBLE_EVENT_TYPES = new Set<VisaActivityEv
   "DOCUMENT_DELETED",
   "DOCUMENT_ACCEPTED",
   "DOCUMENT_REJECTED",
+  // The three PAYMENT_* types are deliberately ABSENT. This set gates
+  // routes/visa.ts's B2B customer view, and no B2B case can ever carry a
+  // payment row — adding them would widen a B2B-facing surface to match
+  // nothing. The D2C consumer's own timeline is a separate reader that does
+  // not exist yet; when it does, it needs its own visibility set rather
+  // than a widened version of this one, because a consumer must see their
+  // own payment and must NOT see PAYMENT_AMOUNT_MISMATCH, which is an
+  // internal ops finding.
 ]);
 
 export interface VisaActivityLogDocument extends Document {

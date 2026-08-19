@@ -214,6 +214,10 @@ export interface VisaApplicationDocument extends Document {
   d2cStatus: D2CTrackingStatus | null;
   d2cStage: D2CStage | null;
   d2cPaymentStatus: D2CPaymentStatus | null;
+  /* Razorpay linkage — null on B2B. orderId is written at order creation;
+   * paymentId by the Stage-2 webhook. See the schema paths. */
+  razorpayOrderId: string | null;
+  razorpayPaymentId: string | null;
   /** Campaign attribution captured at landing. Empty on B2B. */
   utm: VisaUtm;
   // ref TravellerProfile — applicant identity, not duplicated here. NULL only
@@ -663,9 +667,13 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
      */
     utm: { type: VisaUtmSchema, default: () => ({}) },
 
-    /* TODO(milestone-2): the Razorpay webhook flips this to PAID (and the
-     * stage to PAYMENT_DONE) on capture, or to FAILED on a failed attempt.
-     * Nothing in Milestone 1 writes anything but PENDING. */
+    /* The Razorpay webhook flips this to PAID (and the stage to
+     * PAYMENT_DONE) on capture, or to FAILED on a failed attempt —
+     * routes/razorpay.webhook.ts, which is the ONLY writer.
+     *
+     * PAID doubles as that handler's replay guard: a second delivery of the
+     * same webhook sees PAID and returns without touching anything. Setting
+     * it from anywhere else would disarm that guard. */
     d2cPaymentStatus: {
       type: String,
       enum: [...D2C_PAYMENT_STATUSES, null],
@@ -674,6 +682,29 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
       },
       index: true,
     },
+
+    /* ── THE RAZORPAY JOIN (Milestone 2) ────────────────────────────
+     * Null on every B2B row — SBT keeps its own razorpayOrderId on
+     * SBTBooking/SBTHotelBooking and is untouched by these.
+     *
+     * `razorpayOrderId` is written by the Stage-1 create-order endpoint.
+     * `razorpayPaymentId` is written by the Stage-2 webhook, on capture.
+     *
+     * INDEXED because the webhook's lookup is BY ORDER ID: Razorpay tells
+     * us an order was paid and we must find the application from it. That
+     * lookup is the entire join, so it cannot be a collection scan.
+     *
+     * razorpayPaymentId ALSO carries a unique constraint — declared at the
+     * bottom of this file, not here, because it needs a partial filter that
+     * field-level `unique` cannot express. See it for why. */
+    razorpayOrderId: { type: String, default: null, index: true },
+    /* NO field-level `index: true` here, unlike razorpayOrderId above: the
+     * declaration at the bottom of this file already indexes this key, and
+     * both would be named `razorpayPaymentId_1` while carrying different
+     * options — MongoDB rejects that outright (IndexOptionsConflict), so
+     * adding the "obvious" flag back would break index creation for the
+     * whole collection. */
+    razorpayPaymentId: { type: String, default: null },
     // Mirrors the parent VisaRequest's own customerId — see the interface
     // field's doc comment above.
     customerId: { type: String, default: null, index: true },
@@ -776,6 +807,46 @@ applyVisaSourceImmutability(VisaApplicationSchema);
 VisaApplicationSchema.index(
   { requestId: 1, travellerProfileId: 1 },
   { unique: true, partialFilterExpression: { travellerProfileId: { $type: "objectId" } } },
+);
+/* ── ONE APPLICATION PER RAZORPAY PAYMENT (Milestone 2, Stage 2) ──────
+ * The database-level half of webhook idempotency. The handler's own guard
+ * ("is this already PAID?") is a read followed by a write, so two copies of
+ * the same webhook delivered concurrently can both read PENDING and both
+ * proceed. This index is what makes the second one fail instead of applying
+ * twice — the handler catches the duplicate-key error and treats it as the
+ * no-op it is.
+ *
+ * ── partialFilterExpression, NOT `sparse` ────────────────────────────
+ * The brief asked for a unique SPARSE index and that combination would
+ * break this collection outright. `sparse` skips documents where the field
+ * is ABSENT — but razorpayPaymentId is declared `default: null`, so every
+ * application ever created has the key present holding null. Under a sparse
+ * unique index the FIRST application would insert fine and the SECOND would
+ * die on a duplicate {razorpayPaymentId: null} key, taking down B2B case
+ * creation along with D2C.
+ *
+ * `$type: "string"` restricts uniqueness to rows that carry a real payment
+ * id, which is the property actually wanted, and is the same fix (and the
+ * same reasoning) as the {requestId, travellerProfileId} index above.
+ *
+ * ── UPGRADING FROM AN ENVIRONMENT THAT RAN STAGE 1 ───────────────────
+ * Observed, not theorised: Stage 1 declared this field with a plain
+ * `index: true`, so any database a Stage-1 server ever booted against
+ * already holds a NON-unique index named `razorpayPaymentId_1`. Mongoose
+ * auto-names this one identically, and MongoDB refuses to redefine an
+ * existing index's options — createIndexes() dies with IndexKeySpecsConflict
+ * and takes the whole model's index build with it.
+ *
+ * Deployed environments are unaffected: no released schema has ever carried
+ * this field, so there is no legacy index to collide with. A dev database
+ * that ran Stage 1 needs the old index dropped once
+ * (`db.visaapplications.dropIndex("razorpayPaymentId_1")`) before this one
+ * can be built. Renaming this index to dodge the clash was rejected — it
+ * would leave the redundant legacy index in place forever and hide the
+ * conflict rather than resolve it. */
+VisaApplicationSchema.index(
+  { razorpayPaymentId: 1 },
+  { unique: true, partialFilterExpression: { razorpayPaymentId: { $type: "string" } } },
 );
 // Console/admin queue filtering (own-workspace angle).
 // The consumer's own list — "my applications, newest first". consumerId
@@ -953,10 +1024,21 @@ export async function clearActionRequired(
  * previous response stamp here would misrepresent a reply they really did
  * send as never having happened.
  */
+/* `userId` accepts null as of Milestone 2 Stage 2 — WIDENED, not changed.
+ * Every pre-existing caller passes a real user and behaves exactly as
+ * before; the schema path was already `default: null`, so this only lets
+ * the type say what the storage always allowed.
+ *
+ * The caller that needs it is routes/razorpay.webhook.ts, flagging a
+ * payment whose captured amount disagrees with the priced total. No human
+ * flagged that case, and naming one — a service account, the last concierge
+ * to touch it — would put a person's id against a finding they never made.
+ * The activity-log row alongside it carries actorType SYSTEM for the same
+ * reason. */
 export async function setDiscrepancyFlagged(
   applicationId: mongoose.Types.ObjectId | string,
   reason: string,
-  userId: mongoose.Types.ObjectId | string,
+  userId: mongoose.Types.ObjectId | string | null,
 ): Promise<VisaApplicationDocument | null> {
   const trimmed = reason?.trim();
   if (!trimmed) throw new Error("setDiscrepancyFlagged requires a non-empty reason");

@@ -51,6 +51,7 @@ import VisaRequest, { recomputeRequestStatus } from "../models/VisaRequest.js";
 import VisaApplication from "../models/VisaApplication.js";
 import ConsumerDocument from "../models/ConsumerDocument.js";
 import VisaD2CLead from "../models/VisaD2CLead.js";
+import VisaActivityLog from "../models/VisaActivityLog.js";
 import { isUtmEmpty, normaliseUtm } from "../models/visaUtm.js";
 import { d2cWorkspaceObjectId } from "../services/consumerWorkspace.js";
 import {
@@ -486,6 +487,195 @@ router.post("/", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
+ * POST /:id/payment/order — mint a Razorpay order for a D2C case.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * THE AMOUNT COMES FROM THE DATABASE. THE CLIENT CANNOT NAME A PRICE.
+ * ══════════════════════════════════════════════════════════════════════
+ * This endpoint reads NOTHING from the request body. Not the amount, not
+ * the currency, not a discount — the only input is the application id in
+ * the PATH, and the charge is `indicativeCostSnapshot.totalInr` off the
+ * stored application, frozen at submit.
+ *
+ * That is a deliberate departure from the three existing SBT order
+ * endpoints (sbt.flights.ts's /payment/create-order and /reissue-order,
+ * sbt.hotels.ts's /payment/create-order), every one of which does
+ * `const { amount } = req.body` and charges whatever an authenticated
+ * caller asks to be charged. Those are not changed here — they are B2B
+ * paths outside this milestone's blast radius — but they are NOT the
+ * pattern to copy, and this comment exists so nobody "makes it
+ * consistent" later by reintroducing a client amount.
+ *
+ * The test that guards this sends a bogus `amount` in the body and
+ * asserts the order still prices from the stored total.
+ *
+ * ── OWN-SCOPE ────────────────────────────────────────────────────────
+ * The application is loaded by { _id, consumerId, workspaceId } — all
+ * three clauses LITERAL. A consumer minting an order against somebody
+ * else's case would be paying for a stranger's visa, or worse, learning
+ * its price. The workspaceScope plugin cannot help here: it injects only
+ * when a query carries `_workspaceId` in its options, so it fails OPEN.
+ *
+ * ── IDEMPOTENT BY REUSE ──────────────────────────────────────────────
+ * If an unpaid order already exists on the application it is RETURNED
+ * rather than a second one minted. Razorpay bills per captured payment,
+ * not per created order, so a duplicate order is not a double charge —
+ * but it does leave a second live order id that a stale browser tab could
+ * still pay, and reconciling two orders against one case is exactly the
+ * ambiguity PaymentOrphan exists to mop up. One case, one live order.
+ * ───────────────────────────────────────────────────────────────────── */
+
+/** Statuses at which a consumer may pay. */
+const PAYABLE_STATUSES = ["submitted", "docs_under_review", "cost_confirmed"];
+
+router.post("/:id/payment/order", async (req: any, res: any) => {
+  try {
+    const consumerId = me(req);
+    const workspaceId = d2cWorkspaceObjectId();
+
+    const id = String(req.params.id ?? "");
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    /* All three clauses, literally. See the header. */
+    const application: any = await VisaApplication.findOne({
+      _id: new mongoose.Types.ObjectId(id),
+      consumerId,
+      workspaceId,
+    });
+
+    // 404, never 403 — a consumer must not be able to learn that somebody
+    // else's application id exists by the shape of the refusal.
+    if (!application) {
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    if (application.d2cPaymentStatus === "PAID") {
+      return res.status(409).json({
+        error: "This application is already paid.",
+        code: "ALREADY_PAID",
+      });
+    }
+
+    if (!PAYABLE_STATUSES.includes(String(application.status))) {
+      return res.status(409).json({
+        error: "This application isn't ready for payment yet.",
+        code: "NOT_PAYABLE",
+      });
+    }
+
+    /* ── THE AMOUNT ───────────────────────────────────────────────
+     * Read from the stored snapshot. Never from `req.body`, which this
+     * handler does not touch at all. */
+    const totalInr = Number(application.indicativeCostSnapshot?.totalInr);
+    if (!Number.isFinite(totalInr) || totalInr <= 0) {
+      // A corridor with no quotable price must not reach a payment screen.
+      // Refusing beats charging zero or charging NaN.
+      consumerAppLogger.error("payment order refused — application has no usable total", {
+        applicationId: id,
+        totalInr: application.indicativeCostSnapshot?.totalInr,
+      });
+      return res.status(409).json({
+        error: "This application has no price to charge yet.",
+        code: "NO_PRICE",
+      });
+    }
+    const amountPaise = Math.round(totalInr * 100);
+
+    const keyId = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!keyId || !keySecret) {
+      // Same posture as the SBT endpoints: a clean 503 rather than a
+      // crash, so this ships before the test keys are in .env and starts
+      // working the moment they are.
+      consumerAppLogger.warn("payment order refused — Razorpay not configured", { applicationId: id });
+      return res.status(503).json({
+        error: "Online payment isn't switched on yet.",
+        code: "GATEWAY_NOT_CONFIGURED",
+      });
+    }
+
+    /* ── REUSE AN EXISTING UNPAID ORDER ──────────────────────────── */
+    if (application.razorpayOrderId) {
+      consumerAppLogger.info("payment order reused", {
+        applicationId: id,
+        razorpayOrderId: application.razorpayOrderId,
+      });
+      return res.json({
+        ok: true,
+        orderId: application.razorpayOrderId,
+        amount: amountPaise,
+        currency: "INR",
+        keyId,
+        reused: true,
+      });
+    }
+
+    /* ── MINT THE ORDER ──────────────────────────────────────────
+     * Same call shape as the SBT callers (raw fetch, Basic auth, paise) —
+     * mirrored rather than refactored, so no existing B2B payment path is
+     * touched by this milestone.
+     *
+     * `notes` is the ONE addition, and Stage 2 depends on it: no existing
+     * order sets notes, so the webhook has nothing to branch on. A D2C
+     * payment must be self-describing, because the webhook's fallback for
+     * an unrecognised order is PaymentOrphan — i.e. a real consumer
+     * payment silently filed as an anomaly. */
+    const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+    const orderRes = await fetch("https://api.razorpay.com/v1/orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Basic ${auth}` },
+      body: JSON.stringify({
+        amount: amountPaise,
+        currency: "INR",
+        receipt: `hvd2c_${id}_${Date.now()}`,
+        notes: {
+          channel: "D2C",
+          applicationId: id,
+        },
+      }),
+    });
+
+    const order: any = await orderRes.json().catch(() => ({}));
+    if (!orderRes.ok || !order?.id) {
+      consumerAppLogger.error("razorpay order creation failed", {
+        applicationId: id,
+        status: orderRes.status,
+        error: order?.error?.description,
+      });
+      return res.status(502).json({
+        error: order?.error?.description || "We couldn't reach the payment gateway.",
+      });
+    }
+
+    application.razorpayOrderId = order.id;
+    await application.save();
+
+    consumerAppLogger.info("payment order created", {
+      applicationId: id,
+      razorpayOrderId: order.id,
+      amountPaise,
+    });
+
+    return res.json({
+      ok: true,
+      orderId: order.id,
+      // Echo OUR computed figure, not the gateway's, so a mismatch would
+      // surface here rather than being laundered through the response.
+      amount: amountPaise,
+      currency: "INR",
+      // The PUBLISHABLE key id. The secret never leaves the server.
+      keyId,
+      reused: false,
+    });
+  } catch (err: any) {
+    consumerAppLogger.error("payment order failed", { error: err?.message });
+    return res.status(500).json({ error: "We couldn't start the payment just now." });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * GET / — the consumer's own applications.
  * ───────────────────────────────────────────────────────────────────── */
 
@@ -510,15 +700,173 @@ router.get("/", async (req: any, res: any) => {
       : [];
     const requestById = new Map((requests as any[]).map((r) => [String(r._id), r]));
 
+    /* ── THE "STILL NEEDS N DOCUMENTS" HINT ───────────────────────────
+     * One query for every application on the page rather than one per
+     * card. The list is small (a consumer's own cases) but the N+1 shape
+     * is the one that stops being small quietly, and the group-by below
+     * costs nothing next to a second round trip.
+     *
+     * Counted from the SNAPSHOT's checklist, same as the detail view, so
+     * a card and the page it opens can never disagree about what is
+     * outstanding. */
+    const attachedDocs = applications.length
+      ? await ConsumerDocument.find({
+          consumerId: me(req),
+          linkedApplicationIds: { $in: applications.map((a: any) => a._id) },
+        })
+          .select("docCode linkedApplicationIds")
+          .lean()
+      : [];
+
+    const codesByApplication = new Map<string, Set<string>>();
+    for (const doc of attachedDocs as any[]) {
+      const code = String(doc.docCode ?? "").toUpperCase();
+      if (!code) continue;
+      for (const appId of doc.linkedApplicationIds ?? []) {
+        const key = String(appId);
+        if (!codesByApplication.has(key)) codesByApplication.set(key, new Set());
+        codesByApplication.get(key)!.add(code);
+      }
+    }
+
     return res.json({
       ok: true,
-      applications: applications.map((a: any) =>
-        publicApplication(a, requestById.get(String(a.requestId)) ?? null),
-      ),
+      applications: applications.map((a: any) => {
+        const have = codesByApplication.get(String(a._id)) ?? new Set<string>();
+        const required = requiredDocCodes(a);
+        return {
+          ...publicApplication(a, requestById.get(String(a.requestId)) ?? null),
+          documentsTotal: required.length,
+          documentsOutstanding: required.filter((c) => !have.has(c)).length,
+        };
+      }),
     });
   } catch (err: any) {
     consumerAppLogger.error("D2C application list failed", { error: err?.message });
     return res.status(500).json({ error: "We couldn't load your applications." });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /:id — ONE application, and the endpoint the payment UI polls.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * THIS EXISTS SO THE CLIENT NEVER HAS TO TAKE ITS OWN WORD FOR A PAYMENT.
+ * ══════════════════════════════════════════════════════════════════════
+ * Razorpay's checkout handler fires in the browser the moment the card is
+ * authorised. It is NOT the authority on whether we have been paid — the
+ * webhook is (routes/razorpay.webhook.ts), and it may land a beat later.
+ * So the Apply flow's success path does not flip itself to "paid" on the
+ * strength of the callback; it polls THIS route until d2cPaymentStatus
+ * reads PAID, which only the webhook writes.
+ *
+ * That makes this a read of a value the client cannot influence, which is
+ * the entire point. A client that could set its own payment status would
+ * make the webhook decorative.
+ *
+ * ── SAME FENCE AS EVERY OTHER READ HERE ──────────────────────────────
+ * { _id, consumerId, workspaceId }, all three LITERAL, and a 404 rather
+ * than a 403 on a miss — identical to the order endpoint above, for the
+ * identical reason: a consumer must not learn that a stranger's
+ * application id exists by the shape of the refusal. Polling makes that
+ * sharper, not softer — this route is called repeatedly and fast, so it
+ * is the cheapest id oracle in the surface if the scope clauses are ever
+ * dropped.
+ *
+ * The projection is the SAME publicApplication() whitelist the list uses.
+ * A detail route with its own hand-rolled projection is how the B2B-only
+ * fields (plumtripsServiceFeeInr, assignedConciergeUserId,
+ * discrepancyReason) would eventually reach a consumer screen.
+ * ───────────────────────────────────────────────────────────────────── */
+
+router.get("/:id", async (req: any, res: any) => {
+  try {
+    const id = String(req.params.id ?? "");
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    const application: any = await VisaApplication.findOne({
+      _id: new mongoose.Types.ObjectId(id),
+      consumerId: me(req),
+      workspaceId: d2cWorkspaceObjectId(),
+    }).lean();
+
+    if (!application) {
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    const request = mongoose.isValidObjectId(application.requestId)
+      ? await VisaRequest.find({ _id: application.requestId })
+          .select("referenceNumber status")
+          .lean()
+          .then((rows) => rows[0] ?? null)
+      : null;
+
+    /* The documents this consumer actually attached to THIS case. Scoped by
+     * consumerId as well as the link — a document id is not a capability,
+     * and linkedApplicationIds is written by the create route, not by the
+     * reader. */
+    const attached = await ConsumerDocument.find({
+      consumerId: me(req),
+      linkedApplicationIds: application._id,
+    })
+      .select("docCode label originalFilename createdAt")
+      .lean();
+
+    /* WHEN the payment was applied. There is no `d2cPaidAt` on the
+     * application — the webhook sets the funnel triple and the payment id
+     * and nothing else — so the timestamp comes from the activity log row
+     * that same handler writes. That row IS the record of when we became
+     * paid; inventing a second field would give us two answers to one
+     * question, and the older paid cases would have a null in the new one. */
+    const paidLog: any = application.d2cPaymentStatus === "PAID"
+      ? await VisaActivityLog.find({ applicationId: application._id, eventType: "PAYMENT_DONE" })
+          .select("at")
+          .sort({ at: 1 })
+          .lean()
+          .then((rows) => rows[0] ?? null)
+      : null;
+
+    return res.json({
+      ok: true,
+      application: publicApplication(application, request),
+      documents: checklistRows(application, attached),
+      price: consumerPrice(application),
+      payment: {
+        razorpayPaymentId: application.razorpayPaymentId ?? null,
+        paidAt: paidLog?.at ?? null,
+      },
+      /* The OPS axis, which drives the back half of the consumer tracker.
+       * Sent as raw values because the tracker maps them to steps — and
+       * because there is no consumer-facing label set for ops statuses,
+       * which is deliberate: they are Plumtrips' vocabulary, not copy. */
+      /* The OPS axis. The extra three fields exist so the consumer tracker
+       * can drive the back half of its rail through the SAME builder the
+       * B2B tracking page uses (frontend pages/visa/track/timelineStages),
+       * rather than a second mapping that would drift from it:
+       *
+       *   submittedAt / lodgedAt              — the only two stage dates
+       *                                         that builder will ever show
+       *   statusBeforeActionRequired          — where an interrupted case
+       *                                         was actually paused
+       *
+       * All three are ops-written and none of them is a consumer secret:
+       * they describe the reader's own case. `actionRequiredSetByUserId`
+       * and the concierge assignment are NOT sent — who inside Plumtrips
+       * touched a case is our business, not the customer's. */
+      ops: {
+        status: application.status,
+        outcome: application.outcome ?? null,
+        actionRequiredReason: application.actionRequiredReason ?? null,
+        statusBeforeActionRequired: application.statusBeforeActionRequired ?? null,
+        submittedAt: application.submittedAt ?? null,
+        lodgedAt: application.lodgedAt ?? null,
+      },
+    });
+  } catch (err: any) {
+    consumerAppLogger.error("D2C application read failed", { error: err?.message });
+    return res.status(500).json({ error: "We couldn't load that application." });
   }
 });
 
@@ -559,6 +907,124 @@ function publicApplication(a: any, request: any) {
     // the consumer surface must never render that brand.
     totalInr: a.indicativeCostSnapshot?.totalInr ?? null,
     createdAt: a.createdAt,
+  };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * THE CHECKLIST, READ FROM THE SNAPSHOT — NOT FROM THE LIVE RULE.
+ *
+ * `ruleSnapshot.documentGroups` is what the corridor asked for AT SUBMIT,
+ * frozen. Re-resolving the live VisaRule here would be the bug the
+ * snapshot exists to prevent: ops edits a checklist, and every already-
+ * submitted case silently grows a requirement its owner was never shown.
+ *
+ * A group's docTypeCodes are matched against the consumer's own locker
+ * codes, which is sound because the D2C corridors are seeded with the
+ * locker's short vocabulary (PASSPORT / PHOTO / BANK_STATEMENT) rather
+ * than the ops catalogue's canonical codes (PASSPORT_ORIGINAL /
+ * PHOTOGRAPH / APPLICANT_BANK_STATEMENT). Those two taxonomies are NOT
+ * the same list — ConsumerDocument's own header says so — so this does
+ * not reach for getVisaDocumentTypeSeed(): that lookup would miss on all
+ * three of the codes actually in use and produce a checklist of blanks.
+ *
+ * The display name therefore comes from the attached document's real
+ * label where there is one, and from the code itself where there is not.
+ * Title-casing a code is a presentation transform of a real value; it is
+ * not invented reference data.
+ * ───────────────────────────────────────────────────────────────────── */
+
+function checklistRows(application: any, attached: any[]) {
+  const byCode = new Map<string, any>();
+  for (const doc of attached) {
+    const code = String(doc.docCode ?? "").toUpperCase();
+    if (code && !byCode.has(code)) byCode.set(code, doc);
+  }
+
+  const groups = Array.isArray(application.ruleSnapshot?.documentGroups)
+    ? application.ruleSnapshot.documentGroups
+    : [];
+
+  return groups.map((g: any) => ({
+    key: g.key,
+    label: g.label,
+    requirement: g.requirement,
+    specification: g.specification ?? null,
+    docs: (Array.isArray(g.docTypeCodes) ? g.docTypeCodes : []).map((raw: any) => {
+      const code = String(raw ?? "").toUpperCase();
+      const doc = byCode.get(code) ?? null;
+      return {
+        docCode: code,
+        label: doc?.label || titleCaseCode(code),
+        attached: Boolean(doc),
+        // Only ever the consumer's OWN filename, and only for a row they
+        // themselves attached. No id, so this cannot become a fetch handle.
+        filename: doc?.originalFilename ?? null,
+      };
+    }),
+  }));
+}
+
+/** Every doc code the frozen checklist asks for, de-duplicated across groups. */
+function requiredDocCodes(application: any): string[] {
+  const groups = Array.isArray(application.ruleSnapshot?.documentGroups)
+    ? application.ruleSnapshot.documentGroups
+    : [];
+  const codes = new Set<string>();
+  for (const g of groups) {
+    for (const raw of Array.isArray(g.docTypeCodes) ? g.docTypeCodes : []) {
+      const code = String(raw ?? "").toUpperCase();
+      if (code) codes.add(code);
+    }
+  }
+  return [...codes];
+}
+
+function titleCaseCode(code: string): string {
+  const words = code.toLowerCase().split(/[_\s]+/).filter(Boolean);
+  if (!words.length) return code;
+  return words[0].charAt(0).toUpperCase() + words[0].slice(1) + (words.length > 1 ? " " + words.slice(1).join(" ") : "");
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * THE PRICE — FROZEN, AND WITHOUT THE B2B MARGIN FIELD.
+ *
+ * The snapshot carries `plumtripsServiceFeeInr`, and on a D2C case that
+ * number is NOT what the consumer was charged. buildIndicativeCostSnapshot
+ * stores the rule's B2B field verbatim (300 on the Thailand corridor)
+ * while pricing the case from d2cServiceFeeInr (1500 + GST = the 1770
+ * `totalInr`). Sending it would put a figure on a consumer's receipt that
+ * is neither what they paid nor any line of it — and it would leak our
+ * B2B margin besides. It is omitted, not relabelled.
+ *
+ * What CAN be told truthfully from frozen fields:
+ *   pass-through  = embassyFeeInr + vfsFeeInr   (both stored, both real)
+ *   ours          = totalInr - pass-through     (derived, includes GST)
+ *
+ * That is exactly the two-way split the Apply flow's review step already
+ * shows ("Paid to the embassy & visa centre" / "Our service fee & GST"),
+ * so the receipt and the quote use one vocabulary. A finer breakup would
+ * need the D2C fee and its GST stored separately on the snapshot, which
+ * they are not — and guessing the split out of a total would be fiction.
+ * ───────────────────────────────────────────────────────────────────── */
+
+function consumerPrice(application: any) {
+  const snap = application.indicativeCostSnapshot ?? {};
+  const embassy = Number(snap.embassyFeeInr);
+  const vfs = Number(snap.vfsFeeInr);
+  const total = Number(snap.totalInr);
+
+  const passThroughInr =
+    (Number.isFinite(embassy) ? embassy : 0) + (Number.isFinite(vfs) ? vfs : 0);
+
+  return {
+    embassyFeeInr: Number.isFinite(embassy) ? embassy : null,
+    vfsFeeInr: Number.isFinite(vfs) ? vfs : null,
+    passThroughInr,
+    // Never negative, even if a snapshot were ever malformed — a receipt
+    // showing a minus sign is worse than one showing zero.
+    ourFeesInr: Number.isFinite(total) ? Math.max(0, total - passThroughInr) : null,
+    totalInr: Number.isFinite(total) ? total : null,
+    priceNote: snap.priceNote ?? null,
   };
 }
 

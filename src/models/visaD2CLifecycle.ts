@@ -36,7 +36,29 @@
 // So "In-Progress / Doc Submitted" maps onto status "submitted", which is
 // the first genuinely workable state.
 
-export const D2C_TRACKING_STATUSES = ["IN_PROGRESS", "COMPLETED", "DROPPED"] as const;
+/**
+ * ── VISA_FEES_PAID (Milestone 2, Stage 2) ────────────────────────────
+ * APPENDED, never inserted mid-list. The three original values keep their
+ * exact positions, so nothing that happens to read this array by index —
+ * a filter chip order, a report's column order — reorders under it.
+ *
+ * It is a STATUS and not a stage because the stage slot is already spoken
+ * for: a captured payment sets stage PAYMENT_DONE ("how far through the
+ * funnel"), and the status answers the different question the Master
+ * Sheet's Status column asks ("what commercial state is this case in").
+ * A paid case is still in progress operationally — nobody has a visa yet —
+ * but "In-Progress" on a sheet that a commercial reader scans for money
+ * collected is the wrong answer, and COMPLETED would be a lie.
+ *
+ * NOT a terminal value: the case still moves to COMPLETED (or DROPPED) on
+ * its ops outcome. This says only that the fee is in.
+ */
+export const D2C_TRACKING_STATUSES = [
+  "IN_PROGRESS",
+  "COMPLETED",
+  "DROPPED",
+  "VISA_FEES_PAID",
+] as const;
 export type D2CTrackingStatus = (typeof D2C_TRACKING_STATUSES)[number];
 
 /**
@@ -47,12 +69,15 @@ export type D2CTrackingStatus = (typeof D2C_TRACKING_STATUSES)[number];
  * it — the application row does not exist until submit — which is exactly
  * the Scenario-1 distinction the Master Sheet exists to make visible.
  *
- * TODO(milestone-2): PAYMENT_FAILED / PAYMENT_DROPPED / PAYMENT_DONE are
- * declared here but NOT yet writable by any code path — nothing takes
- * money in Milestone 1. They are in the enum now so the Master Sheet's
- * column vocabulary and the ops filter are built against the final shape
- * rather than a shape that changes under them. The Razorpay webhook is
- * what will set them.
+ * PAYMENT_DONE and PAYMENT_FAILED became writable in Milestone 2 Stage 2 —
+ * routes/razorpay.webhook.ts sets them from a verified payment.captured /
+ * payment.failed, on the application AND (mirrored) on the lead row.
+ *
+ * TODO(milestone-3): PAYMENT_DROPPED is still written by nothing, and
+ * deliberately so — "dropped" is the ABSENCE of an event. Razorpay never
+ * sends a webhook for a person who opened the checkout and closed the tab,
+ * so no webhook branch can ever set it. It needs a timeout sweep over
+ * applications left at PENDING past a cutoff, which is Milestone 3's job.
  */
 export const D2C_STAGES = [
   "DOC_SUBMISSION_IN_PROGRESS",
@@ -68,9 +93,14 @@ export type D2CStage = (typeof D2C_STAGES)[number];
  * one: the case is real, the money is not collected, and nothing pretends
  * otherwise.
  *
- * TODO(milestone-2): FAILED / PAID become writable from the payment
- * webhook. Note there is deliberately no "NOT_APPLICABLE" — every D2C case
+ * FAILED / PAID became writable from the payment webhook in Milestone 2
+ * Stage 2. Note there is deliberately no "NOT_APPLICABLE" — every D2C case
  * owes money; a corridor we cannot quote does not reach this flow.
+ *
+ * PAID is the IDEMPOTENCY KEY of the whole payment path: the webhook's
+ * first act on a captured payment is to check whether this is already PAID
+ * and do nothing if so. Anything that sets it outside that handler would
+ * silently disarm a replayed webhook's only in-process guard.
  */
 export const D2C_PAYMENT_STATUSES = ["PENDING", "FAILED", "PAID"] as const;
 export type D2CPaymentStatus = (typeof D2C_PAYMENT_STATUSES)[number];
@@ -85,6 +115,7 @@ export const D2C_TRACKING_STATUS_LABELS: Record<D2CTrackingStatus, string> = {
   IN_PROGRESS: "In-Progress",
   COMPLETED: "Completed",
   DROPPED: "Dropped",
+  VISA_FEES_PAID: "Visa Fees Paid",
 };
 
 export const D2C_STAGE_LABELS: Record<D2CStage, string> = {
