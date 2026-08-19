@@ -125,6 +125,36 @@ export interface CarbonRecordDoc extends Document {
   pax: number;
   co2eKg?: number | null;
 
+  /**
+   * When the SEGMENT FLEW, parsed from the extracted row's departure date.
+   * Null when the document gave no date or gave one too ambiguous to read.
+   *
+   * Stored rather than joined because every trend query groups by it: joining
+   * back to ExtractedDocument.flightRows per query would mean unwinding a
+   * subdocument array on every dashboard load to recover a field that never
+   * changes once the document is extracted.
+   *
+   * DISTINCT FROM `calculatedAt`, and the distinction is the point: a trend
+   * keyed on calculatedAt would show one enormous spike on the day the backfill
+   * ran, which describes our compute schedule and tells you nothing about when
+   * anyone travelled.
+   */
+  travelDate?: Date | null;
+  /** "YYYY-MM" of travelDate, for grouping without re-deriving it per query. */
+  travelMonth?: string | null;
+
+  /**
+   * Operating airline as the document named it, carried for the same reason as
+   * travelDate: the by-airline aggregation would otherwise have to $unwind
+   * ExtractedDocument.flightRows on every dashboard load to reach it.
+   *
+   * Null/blank is a real outcome (some screenshots carry no carrier), and the
+   * aggregation reports those as "Unattributed" rather than dropping them —
+   * a share table whose rows silently vanish cannot be reconciled against the
+   * total.
+   */
+  airline?: string | null;
+
   /** The exact arithmetic, in words and numbers. Never a template stub. */
   methodology: string;
 
@@ -199,6 +229,12 @@ const CarbonRecordSchema = new Schema<CarbonRecordDoc>(
     pax: { type: Number, required: true, default: 1 },
     co2eKg: { type: Number, default: null },
 
+    // Null, never "unknown" or an epoch fallback — an unparseable date must be
+    // excludable from a trend, not silently bucketed into 1970.
+    travelDate: { type: Date, default: null },
+    travelMonth: { type: String, default: null },
+    airline: { type: String, default: null },
+
     methodology: { type: String, required: true },
 
     status: { type: String, required: true, enum: CARBON_STATUSES },
@@ -223,6 +259,10 @@ CarbonRecordSchema.index({ calculationVersion: 1, extractedDocumentId: 1 });
 
 // Every tenant-facing read is scoped; this is the index behind it.
 CarbonRecordSchema.index({ workspaceId: 1, calculationVersion: 1 });
+
+// The dashboard's shape: one tenant (or all), one engine version, bucketed or
+// ranged by travel month. Field order matches the $match-then-$group pipeline.
+CarbonRecordSchema.index({ calculationVersion: 1, workspaceId: 1, travelMonth: 1 });
 
 export const CarbonRecord = model<CarbonRecordDoc>("CarbonRecord", CarbonRecordSchema);
 

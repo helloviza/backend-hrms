@@ -688,6 +688,7 @@ app.use("/api/admin/demo", adminDemoRouter);
 // instead of requireAdmin to allow RM-scoped access).
 import manualBookingsRouter from "./routes/manualBookings.js";
 import extractedDocumentsRouter from "./routes/admin.extractedDocuments.js";
+import carbonRouter from "./routes/admin.carbon.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Manual bookings + broad /api/admin routers (Plumtrips Travel).
@@ -701,6 +702,10 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // requireFeature("sbtEnabled") — it is a platform oversight surface, not a
   // tenant feature, and a real SuperAdmin bypasses that flag anyway.
   app.use("/api/admin/extracted-documents", extractedDocumentsRouter);
+  // Carbon Ledger aggregations behind the Sustainability dashboard. Mounted
+  // before the broad /api/admin routers for the same interception reason, and
+  // carries its own requireAuth/requireWorkspace + admin guard.
+  app.use("/api/admin/carbon", carbonRouter);
   // Admin
   app.use("/api/admin", adminRouter);
   app.use("/api/admin", adminAnalyticsRouter);

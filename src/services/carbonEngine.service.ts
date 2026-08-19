@@ -152,6 +152,85 @@ export function haversineKm(a: GeoPoint, b: GeoPoint): number {
 
 export const DISTANCE_METHOD = `Great-circle (haversine), Earth radius ${EARTH_RADIUS_KM} km, no routing uplift applied`;
 
+/* ───────────────────────── travel date ───────────────────────── */
+
+const MONTHS: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+/**
+ * The extractor copies the departure date as the DOCUMENT PRINTED IT, so this
+ * sees eleven different shapes across the live corpus: "2026-07-14",
+ * "14-Jul-2026", "27JUL2026", "Mon, Jul 14, 2026", "2026/07/14", "7 Jul 2026",
+ * and stranger. It reads the ones that are unambiguous and returns null for the
+ * rest.
+ *
+ * A 4-DIGIT YEAR IS MANDATORY, and that is the whole safety rule. The corpus
+ * contains "Jul 26" — which is either the 26th of July in an unstated year, or
+ * July 2026 with no day. Both readings are defensible, so neither is taken: a
+ * guess here would silently move emissions into the wrong month on a trend
+ * chart, which is worse than the row being visibly undated.
+ *
+ * Returns a UTC midnight Date. A flight's local departure date is what the
+ * ticket asserts; re-interpreting it in the server's zone would shift some
+ * segments a day and, at month boundaries, into the wrong bucket.
+ */
+export function parseTravelDate(raw: string | null | undefined): Date | null {
+  let s = String(raw ?? "").trim();
+  if (!s) return null;
+
+  // Drop a leading weekday ("Mon, ", "Monday ") — it carries no information the
+  // rest of the string doesn't already have.
+  s = s.replace(/^[A-Za-z]{3,9},?\s+/, (m) =>
+    /^(mon|tue|wed|thu|fri|sat|sun)/i.test(m.trim()) ? "" : m,
+  );
+  s = s.trim().replace(/,/g, " ").replace(/\s+/g, " ");
+
+  const mk = (y: number, mo: number, d: number): Date | null => {
+    if (mo < 0 || mo > 11 || d < 1 || d > 31) return null;
+    const dt = new Date(Date.UTC(y, mo, d));
+    // Rejects impossible dates that Date would roll forward (e.g. 31 Feb).
+    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo || dt.getUTCDate() !== d) return null;
+    return dt;
+  };
+
+  // 2026-07-14 | 2026/07/14
+  let m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (m) return mk(+m[1], +m[2] - 1, +m[3]);
+
+  // 14-Jul-2026 | 14 Jul 2026 | 7 Jul 2026
+  m = s.match(/^(\d{1,2})[-\s]([A-Za-z]{3,9})[-\s](\d{4})$/);
+  if (m) {
+    const mo = MONTHS[m[2].slice(0, 3).toLowerCase()];
+    return mo === undefined ? null : mk(+m[3], mo, +m[1]);
+  }
+
+  // 27JUL2026
+  m = s.match(/^(\d{1,2})([A-Za-z]{3,9})(\d{4})$/);
+  if (m) {
+    const mo = MONTHS[m[2].slice(0, 3).toLowerCase()];
+    return mo === undefined ? null : mk(+m[3], mo, +m[1]);
+  }
+
+  // Jul 14 2026
+  m = s.match(/^([A-Za-z]{3,9})\s(\d{1,2})\s(\d{4})$/);
+  if (m) {
+    const mo = MONTHS[m[1].slice(0, 3).toLowerCase()];
+    return mo === undefined ? null : mk(+m[3], mo, +m[2]);
+  }
+
+  // Anything else — including "Jul 26" and any string carrying two month names
+  // — is not read. See the mandatory-year rule above.
+  return null;
+}
+
+/** "YYYY-MM" for grouping. Null in, null out. */
+export function travelMonthOf(d: Date | null): string | null {
+  if (!d) return null;
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
 /* ───────────────────────── cabin mapping ───────────────────────── */
 
 /**
@@ -509,6 +588,10 @@ export async function computeCarbonForDocument(
     else if (c.confidence === "medium") result.medium++;
     else result.insufficient++;
 
+    // Independent of whether a CO2e could be produced: a row we refused to
+    // price still flew on a date, and the Data Quality panel needs to say when.
+    const travelDate = parseTravelDate(row.depDate);
+
     ops.push({
       updateOne: {
         filter: {
@@ -556,6 +639,9 @@ export async function computeCarbonForDocument(
             rfVariant: c.factor?.rfVariant ?? null,
             pax: c.pax,
             co2eKg: c.co2eKg,
+            travelDate,
+            travelMonth: travelMonthOf(travelDate),
+            airline: (row.airline ?? "").trim() || null,
             methodology: c.methodology,
             status: c.status,
             confidence: c.confidence,
