@@ -11,6 +11,7 @@ import User from "../models/User.js";
 import { sendReply } from "../services/gmail.js";
 import { buildQuotedBody } from "../utils/emailQuoteBuilder.js";
 import { uploadTicketAttachment } from "../services/ticketAttachments.js";
+import { openLocalTicketAttachment } from "../services/ticketAttachmentStorage.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
@@ -449,7 +450,36 @@ router.post("/:id/reply", requirePermission("supportTickets", "WRITE"), upload, 
         return res.status(502).json({ success: false, error: "Failed to send email via Gmail" });
       }
     } else {
-      logger.warn("[TicketsConsole] No gmailThreadId — skipping Gmail send", { ticketId: ticket._id });
+      // NO SEND CHANNEL — REFUSE, DO NOT PRETEND.
+      //
+      // This branch used to log a warning and then fall through to create an
+      // OUTBOUND TicketMessage with deliveryStatus "SENT" and to stamp
+      // firstResponseAt, returning success:true. Nothing was emailed. The
+      // agent saw their reply in the thread, the SLA clock stopped, and the
+      // customer received silence — the worst failure shape available, because
+      // it looks exactly like success.
+      //
+      // It was unreachable while Gmail was the only ticket source (every
+      // ticket had a thread). Web cases from services/consumerSupport.ts have
+      // no thread, so it is reachable now, and it has to be honest before it
+      // is reachable rather than after.
+      //
+      // Refusing here leaves internal notes working on web cases: the
+      // isInternalNote branch returns above this point.
+      //
+      // A real outbound send for web cases (SMTP to ticket.fromEmail, or a
+      // consumer-visible in-app thread) is a deliberate fast-follow.
+      logger.warn("[TicketsConsole] Reply refused — ticket has no email thread", {
+        ticketId: ticket._id,
+        ticketRef: ticket.ticketRef,
+        sourceChannel: (ticket as any).sourceChannel,
+      });
+      return res.status(409).json({
+        success: false,
+        error:
+          "This case has no email thread — outbound reply isn't wired for web cases yet. Leave an internal note instead.",
+        reason: "NO_EMAIL_THREAD",
+      });
     }
 
     const msg = await TicketMessage.create({
@@ -599,9 +629,22 @@ router.get("/:id/attachments/:attachmentId/download", requirePermission("support
 
     if (!att) return res.status(404).json({ success: false, error: "Attachment not found" });
 
+    // LOCAL-DISK ROWS have no bucket to presign against, so they are handed
+    // a URL to the raw route below instead. The client contract is
+    // unchanged either way — it receives { url } and opens it — which is
+    // what keeps components/admin/TicketDetail.tsx untouched.
+    if ((att as any).driver === "local-disk") {
+      return res.json({
+        success: true,
+        url: `/api/admin/tickets/${req.params.id}/attachments/${req.params.attachmentId}/raw`,
+      });
+    }
+
     const url = await presignGetObject({
-      bucket: att.s3Bucket,
-      key: att.s3Key,
+      bucket: att.s3Bucket!,
+      // storageKey and s3Key are the same string on an s3 row; the fallback
+      // covers rows written before storageKey existed.
+      key: (att.s3Key || (att as any).storageKey)!,
       expiresInSeconds: 300,
     });
 
@@ -609,6 +652,52 @@ router.get("/:id/attachments/:attachmentId/download", requirePermission("support
   } catch (err) {
     logger.error("[TicketsConsole] attachment download error", { err });
     return res.status(500).json({ success: false, error: "Failed to generate download URL" });
+  }
+});
+
+/* ── GET /:id/attachments/:attachmentId/raw ──────────────────────
+ *
+ * Streams a LOCAL-DISK attachment's bytes.
+ *
+ * S3 rows never reach here — they are served by a presigned URL from the
+ * route above, exactly as they always were. This exists because a
+ * local-disk object has no bucket to presign, and dev is the only place
+ * such a row can be created (services/ticketAttachmentStorage.ts refuses
+ * the local driver under NODE_ENV=production).
+ *
+ * Auth comes from the COOKIE rather than a Bearer header: the download is
+ * opened with window.open, and a new tab carries no Authorization header.
+ * middleware/auth.ts reads a cookie token for exactly this case.          */
+router.get("/:id/attachments/:attachmentId/raw", requirePermission("supportTickets", "READ"), async (req, res) => {
+  try {
+    const att = await TicketAttachment.findOne({
+      _id: req.params.attachmentId,
+      ticketId: req.params.id,
+    }).lean();
+
+    if (!att) return res.status(404).json({ success: false, error: "Attachment not found" });
+    if ((att as any).driver !== "local-disk") {
+      return res.status(400).json({
+        success: false,
+        error: "This attachment is stored in S3 — use the download route",
+      });
+    }
+
+    const stream = await openLocalTicketAttachment((att as any).storageKey);
+    res.setHeader("Content-Type", att.mimeType || "application/octet-stream");
+    res.setHeader("Content-Length", String(att.size));
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${String(att.fileName).replace(/"/g, "")}"`,
+    );
+    stream.on("error", () => {
+      if (!res.headersSent) res.status(500).end();
+      else res.end();
+    });
+    return stream.pipe(res);
+  } catch (err) {
+    logger.error("[TicketsConsole] attachment raw error", { err });
+    return res.status(500).json({ success: false, error: "Failed to read attachment" });
   }
 });
 

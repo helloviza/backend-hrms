@@ -12,7 +12,10 @@ export interface ITicket extends Document {
   assignedTo?: Schema.Types.ObjectId;
   leadId?: Schema.Types.ObjectId;
   workspaceId?: Schema.Types.ObjectId;
-  sourceChannel: "EMAIL";
+  /** A D2C consumer's own support case. Null for every Gmail-ingested B2B
+   *  ticket — ingestion never sets it. See services/consumerSupport.ts. */
+  consumerId?: Schema.Types.ObjectId | null;
+  sourceChannel: "EMAIL" | "WEB";
   gmailThreadId?: string;
   gmailHistoryId?: string;
   extractedFields?: {
@@ -52,7 +55,13 @@ const TicketSchema = new Schema<ITicket>(
     assignedTo: { type: Schema.Types.ObjectId, ref: "User", default: null },
     leadId: { type: Schema.Types.ObjectId, ref: "TicketLead" },
     workspaceId: { type: Schema.Types.ObjectId, ref: "Customer", default: null },
-    sourceChannel: { type: String, enum: ["EMAIL"], default: "EMAIL" },
+    // A consumer support case has no employer and therefore no Customer
+    // workspace — workspaceId stays null, which is already the common case
+    // on B2B tickets whose sender matches no Customer.
+    consumerId: { type: Schema.Types.ObjectId, ref: "Consumer", default: null, index: true },
+    // "WEB" is a D2C consumer filing through /api/consumer/support/cases.
+    // The default stays "EMAIL" so Gmail ingestion is untouched.
+    sourceChannel: { type: String, enum: ["EMAIL", "WEB"], default: "EMAIL" },
     gmailThreadId: String,
     gmailHistoryId: String,
     extractedFields: { type: Schema.Types.Mixed },

@@ -494,6 +494,31 @@ import consumerApplicationsRouter from "./routes/consumer.applications.js";
 app.use("/api/consumer/applications", consumerApplicationsRouter);
 
 /* ────────────────────────────────────────────────────────────────
+ * The consumer's payment history — /api/consumer/payments.
+ *
+ * READ-ONLY, and one row per payment Razorpay actually captured. It
+ * takes no money and holds no balance: there is no wallet, credit or
+ * invoice model in this system, so this router deliberately exposes no
+ * field one could be faked from. See routes/consumer.payments.ts. */
+import consumerPaymentsRouter from "./routes/consumer.payments.js";
+app.use("/api/consumer/payments", consumerPaymentsRouter);
+
+/* ────────────────────────────────────────────────────────────────
+ * The consumer's support cases — /api/consumer/support.
+ *
+ * A POST here creates a REAL Ticket on the shared B2B model, with
+ * sourceChannel "WEB" and a consumerId, so it lands in the same
+ * /admin/tickets queue an emailed case does and needs no ops-side
+ * branching to be worked.
+ *
+ * The GET is own-scoped on req.consumer.id and returns a hand-written
+ * allowlist projection: a Ticket carries assignment, SLA timers, Gemini
+ * extractions and an ops tag vocabulary, none of which is a consumer's to
+ * read. See routes/consumer.support.ts. */
+import consumerSupportRouter from "./routes/consumer.support.js";
+app.use("/api/consumer/support", consumerSupportRouter);
+
+/* ────────────────────────────────────────────────────────────────
  * DEV-ONLY consumer stub login — /api/consumer/dev-auth.
  *
  * Real Google/Microsoft OAuth for helloviza.ai is being built separately.
