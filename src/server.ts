@@ -504,6 +504,16 @@ import consumerPaymentsRouter from "./routes/consumer.payments.js";
 app.use("/api/consumer/payments", consumerPaymentsRouter);
 
 /* ────────────────────────────────────────────────────────────────
+ * The consumer's own tax invoices — /api/consumer/invoices.
+ *
+ * READ-ONLY. Own-scoped through the APPLICATION (consumerId), never
+ * through the workspace: a D2C invoice's workspaceId is the shared
+ * house Customer._id, so a workspace query would hand every consumer
+ * everyone else's receipt. See routes/consumer.invoices.ts. */
+import consumerInvoicesRouter from "./routes/consumer.invoices.js";
+app.use("/api/consumer/invoices", consumerInvoicesRouter);
+
+/* ────────────────────────────────────────────────────────────────
  * The consumer's support cases — /api/consumer/support.
  *
  * A POST here creates a REAL Ticket on the shared B2B model, with

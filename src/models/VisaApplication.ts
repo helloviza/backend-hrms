@@ -218,6 +218,22 @@ export interface VisaApplicationDocument extends Document {
    * paymentId by the Stage-2 webhook. See the schema paths. */
   razorpayOrderId: string | null;
   razorpayPaymentId: string | null;
+  /* ── THE D2C RECEIPT (Milestone 2 Stage 4) ──────────────────────────
+   * Written by services/d2cInvoicing.ts after the payment webhook has
+   * already marked the case paid. Null on every B2B row and on any D2C
+   * case whose invoice has not been raised (or failed to raise — invoice
+   * generation is explicitly NOT allowed to fail the payment, so a paid
+   * case with all three still null is a real, expected state that ops has
+   * to be able to see).
+   *
+   * d2cManualBookingId is ALSO the durable link back to the commercial
+   * record; the idempotency key itself is ManualBooking.metadata
+   * .visaApplicationId, so a replayed webhook resolves through that rather
+   * than through this field being set. */
+  d2cManualBookingId: mongoose.Types.ObjectId | null;
+  d2cInvoiceId: mongoose.Types.ObjectId | null;
+  d2cInvoiceNo: string | null;
+  d2cInvoicedAt: Date | null;
   /** Campaign attribution captured at landing. Empty on B2B. */
   utm: VisaUtm;
   // ref TravellerProfile — applicant identity, not duplicated here. NULL only
@@ -705,6 +721,14 @@ const VisaApplicationSchema = new Schema<VisaApplicationDocument>(
      * adding the "obvious" flag back would break index creation for the
      * whole collection. */
     razorpayPaymentId: { type: String, default: null },
+    /* D2C receipt linkage — see the interface fields above. Additive and
+     * null-defaulted, so every B2B row simply gains three nulls. Only
+     * d2cInvoiceId is indexed: the Payments page looks an invoice up from a
+     * case, never the reverse. */
+    d2cManualBookingId: { type: Schema.Types.ObjectId, ref: "ManualBooking", default: null },
+    d2cInvoiceId: { type: Schema.Types.ObjectId, ref: "Invoice", default: null, index: true },
+    d2cInvoiceNo: { type: String, trim: true, default: null },
+    d2cInvoicedAt: { type: Date, default: null },
     // Mirrors the parent VisaRequest's own customerId — see the interface
     // field's doc comment above.
     customerId: { type: String, default: null, index: true },

@@ -47,6 +47,24 @@ export interface ICompanySettings extends Document {
   // keeps using the flat gstin/supplierState/supplierStateCode fields above,
   // which the PUT route mirrors from whichever profile has isDefault:true.
   gstProfiles: IGstProfile[];
+  // WHICH REGISTRATION THE D2C (helloviza.ai) CHANNEL ISSUES UNDER.
+  //
+  // A GSTIN string, not a gstProfiles[]._id, deliberately: the GSTIN is
+  // already the join key everywhere downstream — utils/sellerGstResolver.ts
+  // matches on it, models/Invoice.ts's and models/CreditNote.ts's numbering
+  // hooks match on it, and Customer.defaultSellerGstin is the same shape. A
+  // profile _id would be a fourth identity for one thing.
+  //
+  // EMPTY IS THE DEFAULT AND MEANS "NO OPINION". services/d2cInvoicing.ts
+  // OMITS opts.sellerGstin entirely when this is blank, so the resolver
+  // takes its ordinary global-isDefault path — identical to what a D2C
+  // invoice would have done before this field existed. Nothing else in the
+  // codebase reads it, so a blank value is inert for every B2B caller.
+  //
+  // Validated on write (routes/companySettings.ts) against the ACTIVE
+  // profiles, the same rule routes/customers.ts already applies to
+  // Customer.defaultSellerGstin.
+  d2cSellerGstin: string;
   logoUrl: string;
   // Bank Details
   bankAccountHolder: string;
@@ -119,6 +137,9 @@ const CompanySettingsSchema = new Schema<ICompanySettings>(
       }],
       default: [],
     },
+    // See the interface field above. Default "" = fall through to the global
+    // isDefault profile, which is exactly today's behaviour.
+    d2cSellerGstin:      { type: String, default: "", trim: true, uppercase: true },
     logoUrl:             { type: String, default: "" },
     bankAccountHolder:   { type: String, default: "" },
     bankAccountNumber:   { type: String, default: "" },
@@ -208,6 +229,34 @@ export function validateGstProfiles(
     seenPrefixes.add(prefix);
   }
 
+  return null;
+}
+
+/**
+ * Validates the D2C issuing-registration pointer against the profile registry.
+ *
+ * Mirrors the rule routes/customers.ts:362-376 already applies to
+ * Customer.defaultSellerGstin: a non-empty pointer MUST name an ACTIVE
+ * company registration, or the write is rejected. Empty/undefined is always
+ * valid and means "fall through to the global default".
+ *
+ * Deliberately NOT wired into the pre('validate') hook below. That hook fires
+ * on every .save(), including saves that never touched this field, and it has
+ * no way to see the profiles as they will be AFTER a partial update — the PUT
+ * route resolves "the profiles this pointer will actually be checked against"
+ * and calls this explicitly, the same split validateGstProfiles already uses.
+ */
+export function validateD2CSellerGstin(
+  d2cSellerGstin: string | undefined | null,
+  profiles: Array<Partial<IGstProfile>> | undefined | null,
+): string | null {
+  const gstin = (d2cSellerGstin || "").toUpperCase().trim();
+  if (!gstin) return null;
+  const active = (profiles || []).filter((p) => p.active);
+  const found = active.find((p) => (p.gstin || "").toUpperCase().trim() === gstin);
+  if (!found) {
+    return `d2cSellerGstin "${d2cSellerGstin}" does not match any active company GST registration`;
+  }
   return null;
 }
 

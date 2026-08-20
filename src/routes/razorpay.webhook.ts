@@ -28,6 +28,7 @@ import PaymentOrphan from "../models/PaymentOrphan.js";
 import VisaApplication, { setDiscrepancyFlagged } from "../models/VisaApplication.js";
 import VisaD2CLead from "../models/VisaD2CLead.js";
 import { logVisaActivity } from "../models/VisaActivityLog.js";
+import { issueD2CInvoiceForApplication } from "../services/d2cInvoicing.js";
 import { webhookLogger } from "../utils/logger.js";
 
 const router = Router();
@@ -271,6 +272,56 @@ async function handleD2CPaymentCaptured(application: any, paymentEntity: any): P
     razorpayPaymentId,
     amountInr: capturedPaise / 100,
   });
+
+  /* ── THE RECEIPT — LAST, AND IT CANNOT UN-PAY THE CASE ────────────
+   * Deliberately after every write above, and deliberately inside its own
+   * catch.
+   *
+   * The money is already collected and the case is already PAID. If the
+   * invoice pipeline fails — a missing house identity, a GST registration
+   * deactivated mid-flight, Mongo blinking — the correct outcome is a paid
+   * case with no receipt yet, NOT a rethrow. A rethrow would reach the
+   * route's own handler, return 500, and Razorpay would redeliver; the
+   * replay guard at the top of this function would then see PAID and
+   * return early, so the retry could never reach the invoice step anyway.
+   * We would have converted a missing document into a permanently missing
+   * document plus a lie in the logs.
+   *
+   * The failure is loud (error level, with the ids needed to re-run) and
+   * recoverable: the case is left with d2cInvoiceId still null, and
+   * issueD2CInvoiceForApplication is idempotent and safe to call again —
+   * including when a booking was minted before the failure, which it
+   * invoices rather than duplicating.
+   *
+   * NO VisaActivityLog row either way. The activity trail is the
+   * CONSUMER-visible case history; a billing document that ops raises on
+   * our side does not belong in it, and the PAYMENT_DONE row above already
+   * records the event the consumer cares about. */
+  try {
+    const result = await issueD2CInvoiceForApplication(application);
+    if (result.action === "created") {
+      webhookLogger.info("payment.captured — D2C receipt raised", {
+        applicationId: String(application._id),
+        invoiceNo: result.invoiceNo,
+        invoiceId: result.invoiceId,
+      });
+    } else {
+      // Every non-created outcome is already logged with its own reason by
+      // the service; this keeps the webhook's own trail complete.
+      webhookLogger.warn("payment.captured — D2C receipt not raised", {
+        applicationId: String(application._id),
+        action: result.action,
+      });
+    }
+  } catch (err: any) {
+    webhookLogger.error("payment.captured — D2C receipt FAILED; payment stands, case left uninvoiced", {
+      applicationId: String(application._id),
+      razorpayPaymentId,
+      razorpayOrderId: application.razorpayOrderId ?? null,
+      error: err?.message,
+      stack: err?.stack,
+    });
+  }
 }
 
 /* ─────────────────────────────────────────────────────────────────────

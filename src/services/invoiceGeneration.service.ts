@@ -168,6 +168,44 @@ export interface CreateInvoiceOpts {
   // state at the generation popup. Absent = auto-resolve via
   // Customer.gstRegisteredState fallback chain (today's behaviour, unchanged).
   customerStateOverride?: string;
+  /**
+   * BILL-TO OVERRIDE — replaces the client block only, and only when present.
+   *
+   * ── WHY THIS EXISTS ────────────────────────────────────────────────
+   * clientDetails is built entirely from the Customer row that owns the
+   * booking (buildInvoiceContext). That is right for B2B, where the tenant
+   * IS the buyer. It is wrong for D2C: every consumer case is owned by ONE
+   * house Customer row for tenancy purposes, so without this seam every
+   * consumer receipt would be addressed to "Helloviza D2C" rather than to
+   * the person who paid. See services/d2cInvoicing.ts, the only caller.
+   *
+   * ── WHAT IT DELIBERATELY CANNOT DO ─────────────────────────────────
+   * `state` is NOT overridable, and its absence from this type is the
+   * enforcement. clientDetails.state is a RENDERING of the resolved GST
+   * detection (ctx.detection.customerState) — the same value that produced
+   * placeOfSupply, clientState and the CGST/SGST-vs-IGST split. Letting a
+   * caller rewrite it would let an invoice display a bill-to state that
+   * contradicts the tax it charges. The knob for place of supply is
+   * customerStateOverride above, which runs BEFORE detection and therefore
+   * moves the tax with it; this one runs after, and moves nothing.
+   *
+   * Amounts, line items, the issuer/seller block and invoice numbering are
+   * all resolved independently of clientDetails and are untouched by this.
+   *
+   * ABSENT (the case for every existing caller) = zero behavioural change.
+   */
+  clientDetailsOverride?: {
+    companyName?: string;
+    gstin?: string;
+    billingAddress?: string;
+    addressLine1?: string;
+    addressLine2?: string;
+    city?: string;
+    country?: string;
+    pincode?: string;
+    contactPerson?: string;
+    email?: string;
+  };
   createdBy: string;
   isDemoUser?: boolean;
   // Explicit tenant scope for non-HTTP callers (e.g. the auto-invoice
@@ -311,6 +349,20 @@ function buildInvoiceContext(
     issuerState,
     clientState: detection.customerState,
   };
+}
+
+/** Overlay a bill-to override onto an already-built context's clientDetails.
+ *  Only keys the caller actually supplied with a non-empty value are replaced,
+ *  so a partial override (say, just companyName + email) keeps the rest of the
+ *  resolved block rather than blanking it. `state` is not a key of the
+ *  override type — see CreateInvoiceOpts.clientDetailsOverride for why. */
+function applyClientDetailsOverride(ctx: InvoiceContext, override: NonNullable<CreateInvoiceOpts["clientDetailsOverride"]>): InvoiceContext {
+  const patch: Record<string, string> = {};
+  for (const [key, value] of Object.entries(override)) {
+    if (typeof value === "string" && value.trim() !== "") patch[key] = value.trim();
+  }
+  if (!Object.keys(patch).length) return ctx;
+  return { ...ctx, clientDetails: { ...ctx.clientDetails, ...patch } };
 }
 
 /** Create ONE invoice from the given bookings. Used for both COMBINED (all
@@ -477,7 +529,13 @@ export async function createInvoiceFromBookings(
 
   const companySettings = await getCompanySettings();
 
-  const ctx = buildInvoiceContext(customer, workspace, companySettings, invoiceWorkspaceId, opts);
+  let ctx = buildInvoiceContext(customer, workspace, companySettings, invoiceWorkspaceId, opts);
+
+  // Bill-to override — client block only, and only when a caller asked for
+  // one. Every existing caller passes nothing and skips this entirely.
+  if (opts.clientDetailsOverride) {
+    ctx = applyClientDetailsOverride(ctx, opts.clientDetailsOverride);
+  }
 
   if (opts.format === "COMBINED") {
     // None already invoiced (whole-batch reject — preserves /generate behavior).

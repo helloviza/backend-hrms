@@ -5,7 +5,7 @@ import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import { requirePermission } from "../middleware/requirePermission.js";
-import CompanySettings, { getCompanySettings, validateGstProfiles } from "../models/CompanySettings.js";
+import CompanySettings, { getCompanySettings, validateGstProfiles, validateD2CSellerGstin } from "../models/CompanySettings.js";
 import Counter from "../models/Counter.js";
 import { invalidateCompanySettingsCache } from "../utils/companySettings.js";
 import { s3 } from "../config/aws.js";
@@ -54,6 +54,22 @@ router.put("/", requirePermission("companySettings", "WRITE"), async (req: any, 
         body.city = defaultProfile.city || "";
         body.pincode = defaultProfile.pincode || "";
       }
+    }
+
+    // D2C issuing registration — checked against the profiles this write will
+    // actually leave behind: the incoming array when one was sent, the stored
+    // array otherwise (a PUT that changes only this pointer must still be
+    // validated against the registry as it stands). Same rule
+    // routes/customers.ts applies to Customer.defaultSellerGstin.
+    if (body.d2cSellerGstin !== undefined) {
+      const profilesForCheck = body.gstProfiles !== undefined
+        ? body.gstProfiles
+        : (await CompanySettings.findOne().select("gstProfiles").lean())?.gstProfiles;
+      const d2cError = validateD2CSellerGstin(body.d2cSellerGstin, profilesForCheck as any);
+      if (d2cError) {
+        return res.status(400).json({ error: d2cError });
+      }
+      body.d2cSellerGstin = String(body.d2cSellerGstin || "").toUpperCase().trim();
     }
 
     const settings = await CompanySettings.findOneAndUpdate(

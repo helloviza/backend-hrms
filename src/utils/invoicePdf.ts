@@ -122,11 +122,62 @@ export async function prefetchInvoiceAssets(): Promise<InvoicePdfPrefetch> {
   return { settings, logoBuffer };
 }
 
+/* ── Render options ─────────────────────────────────── */
+/**
+ * OPT-IN presentation switches. Every field defaults to false, and false is
+ * this renderer's behaviour as it has always been — an omitted third
+ * argument produces a byte-identical document (modulo the PDF's own
+ * CreationDate). Every existing caller in routes/invoices.ts omits it.
+ *
+ * ── WHY THESE EXIST AT ALL ───────────────────────────────────────────
+ * A D2C consumer receipt documents money Razorpay has ALREADY captured.
+ * Two things this renderer prints unconditionally are wrong on such a
+ * document, and neither can be suppressed from the call site by shaping
+ * the input:
+ *
+ *   - the bank-details card is drawn whether or not the settings behind it
+ *     are populated (blanking them yields a card full of em-dashes, which
+ *     is worse than the card itself), and
+ *   - "BALANCE DUE" is a literal string paired with invoice.grandTotal, so
+ *     no input can turn it into a settled figure without also corrupting
+ *     the Total.
+ *
+ * Hence flags rather than input shaping. They are consumed ONLY by
+ * routes/consumer.invoices.ts.
+ */
+export interface InvoicePdfOptions {
+  /**
+   * Suppress the "Bank Details" card. A receipt for money already taken
+   * must not print "pay us here" account numbers.
+   */
+  hideBankDetails?: boolean;
+  /**
+   * Present the document as SETTLED: the top-left stat box reads "AMOUNT
+   * PAID" instead of "BALANCE DUE", and the box beside it reads
+   * "STATUS / Paid" instead of a due date.
+   *
+   * The AMOUNT is unchanged either way — it is still invoice.grandTotal,
+   * because on a settled document the amount due and the amount paid are
+   * the same number. This flag relabels; it never re-computes.
+   *
+   * NOTE this renderer has no notion of PARTIAL payment and this flag does
+   * not add one. It is a caller's assertion that the whole invoice is
+   * settled, and the only caller that sets it does so for invoices raised
+   * against an already-captured Razorpay payment.
+   */
+  paid?: boolean;
+}
+
 /* ── Main export ────────────────────────────────────── */
 export async function generateInvoicePdf(
   invoice: IInvoice,
   prefetch?: InvoicePdfPrefetch,
+  options: InvoicePdfOptions = {},
 ): Promise<Buffer> {
+  // Read once into locals so every guarded branch below reads the same
+  // value, and so the default-path cost is a boolean test.
+  const hideBankDetails = options.hideBankDetails === true;
+  const renderAsPaid = options.paid === true;
   await ensureFonts();
 
   const useNoto = fs.existsSync(FONT_PATH) && fs.existsSync(FONT_BOLD_PATH);
@@ -281,20 +332,22 @@ export async function generateInvoicePdf(
     const BOX1_X = BOX2_X - BOX_W - BOX_GAP;
     const BOX_Y = M;
 
-    // Box 1: BALANCE DUE
+    // Box 1: BALANCE DUE — or AMOUNT PAID on a settled document. Same
+    // figure, same geometry, same colours; only the caption changes.
     doc.rect(BOX1_X, BOX_Y, BOX_W, BOX_H).fill(C_PRIMARY);
     doc.fillColor("#aab4c4").fontSize(9).font(FONT_NORMAL)
-      .text("BALANCE DUE", BOX1_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
+      .text(renderAsPaid ? "AMOUNT PAID" : "BALANCE DUE", BOX1_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
     doc.fillColor("#ffffff").fontSize(14).font(FONT_BOLD)
       .text(fmtCur(invoice.grandTotal ?? 0), BOX1_X + 8, BOX_Y + 24, { width: BOX_W - 16, lineBreak: false });
 
-    // Box 2: DUE DATE
+    // Box 2: DUE DATE — or STATUS/Paid. A due date on a settled receipt
+    // ("On Receipt", against money already received) reads as a demand.
     doc.rect(BOX2_X, BOX_Y, BOX_W, BOX_H).fill(C_SURF_LOW);
     doc.fillColor(C_MID).fontSize(9).font(FONT_NORMAL)
-      .text("DUE DATE", BOX2_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
+      .text(renderAsPaid ? "STATUS" : "DUE DATE", BOX2_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
     const dueDateStr = invoice.dueDate ? fmtDate(invoice.dueDate) : "On Receipt";
     doc.fillColor(C_PRIMARY).fontSize(11).font(FONT_BOLD)
-      .text(dueDateStr, BOX2_X + 8, BOX_Y + 26, { width: BOX_W - 16, lineBreak: false });
+      .text(renderAsPaid ? "Paid" : dueDateStr, BOX2_X + 8, BOX_Y + 26, { width: BOX_W - 16, lineBreak: false });
 
     y = Math.max(leftTitleBottomY, BOX_Y + BOX_H) + 24;
 
@@ -588,38 +641,43 @@ export async function generateInvoicePdf(
 
     const BANK_W = CW * 0.40;
     const BANK_X = L;
-    const BANK_CARD_H = 110;
+    // Contributes 0 to the bottom-section height when the card is hidden, so
+    // the footer follows the totals column instead of a 110px hole. See the
+    // `Math.max(y + BANK_CARD_H, totY)` at the end of this section.
+    const BANK_CARD_H = hideBankDetails ? 0 : 110;
 
-    // Bank Details card — filled rect
-    doc.rect(BANK_X, y, BANK_W, BANK_CARD_H).fill(C_SURF_LOW);
-    let bankY = y + 10;
-    doc.fillColor(C_PRIMARY).fontSize(11).font(FONT_BOLD)
-      .text("Bank Details", BANK_X + 10, bankY, { lineBreak: false });
-    bankY += 18;
+    if (!hideBankDetails) {
+      // Bank Details card — filled rect
+      doc.rect(BANK_X, y, BANK_W, BANK_CARD_H).fill(C_SURF_LOW);
+      let bankY = y + 10;
+      doc.fillColor(C_PRIMARY).fontSize(11).font(FONT_BOLD)
+        .text("Bank Details", BANK_X + 10, bankY, { lineBreak: false });
+      bankY += 18;
 
-    // Account Holder — full width
-    const holderVal = dbSettings.bankAccountHolder || issuer.companyName || "—";
-    doc.fontSize(7).font(FONT_NORMAL).fillColor(C_MID)
-      .text("ACCOUNT HOLDER", BANK_X + 12, bankY, { lineBreak: false });
-    doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
-      .text(holderVal, BANK_X + 12, bankY + 10, { width: BANK_W - 24 });
-    const holderLines = Math.ceil(holderVal.length / 35);
-    bankY += 10 + (holderLines * 12) + 10;
+      // Account Holder — full width
+      const holderVal = dbSettings.bankAccountHolder || issuer.companyName || "—";
+      doc.fontSize(7).font(FONT_NORMAL).fillColor(C_MID)
+        .text("ACCOUNT HOLDER", BANK_X + 12, bankY, { lineBreak: false });
+      doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
+        .text(holderVal, BANK_X + 12, bankY + 10, { width: BANK_W - 24 });
+      const holderLines = Math.ceil(holderVal.length / 35);
+      bankY += 10 + (holderLines * 12) + 10;
 
-    // Account Number + IFSC — two columns
-    const col1X = BANK_X + 12;
-    const col2X = BANK_X + (BANK_W / 2) + 4;
-    const colW = (BANK_W / 2) - 16;
+      // Account Number + IFSC — two columns
+      const col1X = BANK_X + 12;
+      const col2X = BANK_X + (BANK_W / 2) + 4;
+      const colW = (BANK_W / 2) - 16;
 
-    doc.fontSize(7).font(FONT_NORMAL).fillColor(C_MID)
-      .text("ACCOUNT NUMBER", col1X, bankY, { width: colW, lineBreak: false });
-    doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
-      .text(dbSettings.bankAccountNumber || "—", col1X, bankY + 10, { width: colW, lineBreak: false });
+      doc.fontSize(7).font(FONT_NORMAL).fillColor(C_MID)
+        .text("ACCOUNT NUMBER", col1X, bankY, { width: colW, lineBreak: false });
+      doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
+        .text(dbSettings.bankAccountNumber || "—", col1X, bankY + 10, { width: colW, lineBreak: false });
 
-    doc.fontSize(7).font(FONT_NORMAL).fillColor(C_MID)
-      .text("IFSC CODE", col2X, bankY, { width: colW, lineBreak: false });
-    doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
-      .text(dbSettings.bankIfsc || "—", col2X, bankY + 10, { width: colW, lineBreak: false });
+      doc.fontSize(7).font(FONT_NORMAL).fillColor(C_MID)
+        .text("IFSC CODE", col2X, bankY, { width: colW, lineBreak: false });
+      doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
+        .text(dbSettings.bankIfsc || "—", col2X, bankY + 10, { width: colW, lineBreak: false });
+    }
 
     // Totals block — right column
     const TOT_W = CW * 0.55;
