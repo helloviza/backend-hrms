@@ -123,7 +123,16 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
     const enrichedClient = await enrichClientDetails(invoice);
-    const pdfBuffer = await generateInvoicePdf({ ...invoice, clientDetails: enrichedClient } as any);
+    // A settled invoice must not print "BALANCE DUE" — relabel the top boxes
+    // to AMOUNT PAID / STATUS: Paid. PAID only: PAYMENT_DECLARED is the
+    // customer's own claim awaiting finance (see declare-payment below), and
+    // printing it as paid would let the payer settle their own invoice.
+    // Unlike the D2C receipt, a B2B invoice KEEPS its bank block.
+    const pdfBuffer = await generateInvoicePdf(
+      { ...invoice, clientDetails: enrichedClient } as any,
+      undefined,
+      { paid: invoice.status === "PAID" },
+    );
 
     const s3 = new S3Client({
       region: env.AWS_REGION,
@@ -817,7 +826,13 @@ router.get("/bulk-pdf", requirePermission("invoices", "READ"), async (req: any, 
 
     for (const inv of invoices) {
       const enrichedClient = await enrichClientDetails(inv);
-      const buf = await generateInvoicePdf({ ...inv, clientDetails: enrichedClient } as any, prefetch);
+      // Same settled-vs-due relabel as the single-invoice routes, decided per
+      // invoice — a filtered zip mixes PAID and SENT rows freely.
+      const buf = await generateInvoicePdf(
+        { ...inv, clientDetails: enrichedClient } as any,
+        prefetch,
+        { paid: inv.status === "PAID" },
+      );
       archive.append(buf, { name: `${inv.invoiceNo}.pdf` });
     }
 
@@ -1824,7 +1839,13 @@ router.post("/:id/pdf", requirePermission("invoices", "WRITE"), async (req: any,
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
     const enrichedClient = await enrichClientDetails(invoice);
-    const pdfBuffer = await generateInvoicePdf({ ...invoice, clientDetails: enrichedClient } as any);
+    // Settled invoices read AMOUNT PAID / STATUS: Paid rather than BALANCE
+    // DUE; PAID only, for the reason given on the workspace /pdf route above.
+    const pdfBuffer = await generateInvoicePdf(
+      { ...invoice, clientDetails: enrichedClient } as any,
+      undefined,
+      { paid: invoice.status === "PAID" },
+    );
 
     const s3 = new S3Client({
       region: env.AWS_REGION,

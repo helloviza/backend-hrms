@@ -127,7 +127,7 @@ export async function prefetchInvoiceAssets(): Promise<InvoicePdfPrefetch> {
  * OPT-IN presentation switches. Every field defaults to false, and false is
  * this renderer's behaviour as it has always been — an omitted third
  * argument produces a byte-identical document (modulo the PDF's own
- * CreationDate). Every existing caller in routes/invoices.ts omits it.
+ * CreationDate).
  *
  * ── WHY THESE EXIST AT ALL ───────────────────────────────────────────
  * A D2C consumer receipt documents money Razorpay has ALREADY captured.
@@ -142,8 +142,18 @@ export async function prefetchInvoiceAssets(): Promise<InvoicePdfPrefetch> {
  *     no input can turn it into a settled figure without also corrupting
  *     the Total.
  *
- * Hence flags rather than input shaping. They are consumed ONLY by
- * routes/consumer.invoices.ts.
+ * Hence flags rather than input shaping.
+ *
+ * ── WHO PASSES THEM ──────────────────────────────────────────────────
+ * routes/consumer.invoices.ts sets BOTH, as literals: a Razorpay receipt
+ * is settled by construction and must not print "pay us here" account
+ * numbers.
+ *
+ * The three B2B routes in routes/invoices.ts (the workspace /pdf, the
+ * admin /pdf, and the bulk zip) pass `paid: invoice.status === "PAID"`
+ * and NEVER hideBankDetails — a B2B invoice keeps its bank block whether
+ * or not it is settled. PAID is the only settled status; PAYMENT_DECLARED
+ * is the customer's own unconfirmed claim (see models/Invoice.ts).
  */
 export interface InvoicePdfOptions {
   /**

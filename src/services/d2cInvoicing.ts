@@ -324,6 +324,52 @@ export async function issueD2CInvoiceForApplication(application: any): Promise<D
     throw new Error(`D2C invoice generation returned no invoice for application ${applicationId}`);
   }
 
+  /* ── Born settled ─────────────────────────────────────────────────
+   * This function only runs downstream of a CAPTURED Razorpay payment
+   * whose amount cross-check has already passed, so the money is in
+   * before the invoice exists. Leaving it at the schema default (DRAFT)
+   * made a receipt masquerade as an unsent draft: it printed "BALANCE
+   * DUE" through the admin PDF route, sat in the EOD digest's
+   * drafts-to-send queue, counted toward outstanding on the invoice
+   * stats, and — because creditNotes.ts only credits SENT or PAID — a
+   * refund could not be raised against it at all.
+   *
+   * Same two fields the staff route sets when finance confirms receipt
+   * (PUT /admin/invoices/:id/status), plus the same editHistory entry,
+   * so a D2C receipt is auditable exactly like a B2B one. There is no
+   * shared mark-paid service to call — that route does the work inline
+   * behind requirePermission and reads req.user, neither of which a
+   * webhook has. `source` stays absent: it marks a customer-portal
+   * claim, and this is a confirmed capture, not a claim.
+   *
+   * The DRAFT->PAID rejection on that route does not apply here — it
+   * guards the human transition ("mark as SENT first"), and nothing
+   * moves this invoice through it. */
+  const paidAt = new Date();
+  await Invoice.updateOne(
+    { _id: invoice._id },
+    {
+      $set: { status: "PAID", paidAt, editedAt: paidAt, editedBy: house.systemUserId },
+      $push: {
+        editHistory: {
+          editedAt: paidAt,
+          editedBy: house.systemUserId,
+          fieldsChanged: ["status"],
+          oldValues: { status: invoice.status },
+          newValues: {
+            status: "PAID",
+            paidAt,
+            paymentRef: application.razorpayPaymentId || undefined,
+          },
+        },
+      },
+    },
+  );
+  // The returned doc was read before that write — keep it honest for
+  // anything downstream of this call.
+  invoice.status = "PAID";
+  invoice.paidAt = paidAt;
+
   /* ── Link it back onto the case ──────────────────────────────────── */
   // updateOne, not application.save(): the caller holds this same document
   // and has already saved its own payment writes to it. A second full save
