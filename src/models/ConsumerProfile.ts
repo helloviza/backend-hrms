@@ -7,18 +7,36 @@
 // ⚠ PII: THIS COLLECTION IS THE MOST SENSITIVE ONE IN THE CODEBASE.
 //
 // Passport numbers, dates of birth, home addresses and family members'
-// passport numbers all live here, IN CLEAN TEXT, deliberately and
-// temporarily. Every such field carries a
+// passport numbers all live here. They are now ENCRYPTED AT REST — see the
+// ENCRYPTED_PII_FIELDS block at the bottom of this file, which is the
+// authoritative list, and plugins/fieldEncryption.plugin.ts for the
+// mechanism. Every such field still carries a
 //
-//     // PII: encrypt-at-rest before prod
+//     // PII: encrypted at rest
 //
-// marker on its own line. Encrypting them is a separate hardening pass;
-// the markers exist so that pass cannot miss a field. Grep for the marker
-// to enumerate the work:
+// marker on its own line, so the set stays greppable:
 //
-//     grep -rn "PII: encrypt-at-rest before prod" apps/backend/src
+//     grep -rn "PII: encrypted at rest" apps/backend/src
 //
-// DO NOT add a new field holding identity data without a marker.
+// DO NOT add a new field holding identity data without BOTH a marker and an
+// entry in ENCRYPTED_PII_FIELDS. A marker alone encrypts nothing.
+//
+// ── DUAL READ: ROWS WRITTEN BEFORE THIS ARE STILL PLAINTEXT ───────────
+// Nothing has been backfilled. A row written before encryption was switched
+// on reads back exactly as it always did (the plugin passes a non-envelope
+// value through untouched) and converts to ciphertext on its NEXT save. A
+// bulk conversion is a separate, gated step — until it runs, this
+// collection is deliberately MIXED, and that is a supported state, not a
+// half-finished migration.
+//
+// ── WHAT IS DELIBERATELY *NOT* ENCRYPTED ──────────────────────────────
+// passports[].frontDocumentId / backDocumentId. They were marked PII in the
+// original audit, but they are ObjectId REFERENCES to ConsumerDocument
+// rows, not identity data — the located row holds the passport scan, and
+// that row is what an erasure destroys. Encrypting a reference would break
+// `ref` population and the arrayFilters $unset in
+// routes/consumer.profile.ts, and protect nothing that isn't already
+// protected. Recorded here so the next reader does not "fix" the omission.
 // ══════════════════════════════════════════════════════════════════════
 //
 // ── ISOLATION: ROW-LEVEL ON consumerId ────────────────────────────────
@@ -40,6 +58,7 @@
 // stored inline here either — a passport holds ConsumerDocument ids. One
 // store, reused, never copied.
 import mongoose, { Schema, type Document, type Model } from "mongoose";
+import { fieldEncryptionPlugin } from "../plugins/fieldEncryption.plugin.js";
 
 /* ── Enums ──────────────────────────────────────────────────────────── */
 
@@ -73,14 +92,14 @@ export const SEAT_PREFERENCES = ["WINDOW", "AISLE", "MIDDLE", "NO_PREFERENCE"] a
  */
 const AddressSchema = new Schema(
   {
-    // PII: encrypt-at-rest before prod
+    // PII: encrypted at rest
     line1: { type: String, trim: true },
-    // PII: encrypt-at-rest before prod
+    // PII: encrypted at rest
     line2: { type: String, trim: true },
-    // PII: encrypt-at-rest before prod
+    // PII: encrypted at rest
     city: { type: String, trim: true },
     state: { type: String, trim: true },
-    // PII: encrypt-at-rest before prod
+    // PII: encrypted at rest
     postalCode: { type: String, trim: true },
     country: { type: String, trim: true },
   },
@@ -95,7 +114,7 @@ const AddressSchema = new Schema(
  */
 const PassportSchema = new Schema(
   {
-    // PII: encrypt-at-rest before prod
+    // PII: encrypted at rest
     // The single highest-value field in this collection.
     number: { type: String, trim: true, uppercase: true },
     type: { type: String, enum: PASSPORT_TYPES, default: "ORDINARY" },
@@ -107,12 +126,13 @@ const PassportSchema = new Schema(
     expiryDate: { type: Date },
     placeOfIssue: { type: String, trim: true },
 
-    // PII: encrypt-at-rest before prod
+    // NOT encrypted — a reference, not identity data. See the file header's
+    // "WHAT IS DELIBERATELY *NOT* ENCRYPTED" note.
     // Scans live in the shared locker (models/ConsumerDocument.ts); these are
     // references, so the Apply page reuses the same file rather than asking
     // for a second upload of the same page.
     frontDocumentId: { type: Schema.Types.ObjectId, ref: "ConsumerDocument" },
-    // PII: encrypt-at-rest before prod
+    // NOT encrypted — see frontDocumentId above.
     backDocumentId: { type: Schema.Types.ObjectId, ref: "ConsumerDocument" },
 
     isPrimary: { type: Boolean, default: false },
@@ -142,9 +162,13 @@ const CoTravellerSchema = new Schema(
   {
     fullName: { type: String, trim: true },
     relationship: { type: String, trim: true },
-    // PII: encrypt-at-rest before prod
-    dateOfBirth: { type: Date },
-    // PII: encrypt-at-rest before prod
+    // PII: encrypted at rest
+    // Mixed, not Date — TRAP 2 in plugins/fieldEncryption.plugin.ts: this
+    // path has to hold either a real Date (a legacy row, never rewritten)
+    // or a ciphertext string. The plugin owns the Date<->ISO conversion
+    // Mongoose no longer does, so readers still get a Date object.
+    dateOfBirth: { type: Schema.Types.Mixed },
+    // PII: encrypted at rest
     passportNumber: { type: String, trim: true, uppercase: true },
     passportExpiryDate: { type: Date },
     nationality: { type: String, trim: true },
@@ -161,8 +185,13 @@ const PersonalSchema = new Schema(
     firstName: { type: String, trim: true },
     middleName: { type: String, trim: true },
     lastName: { type: String, trim: true },
-    // PII: encrypt-at-rest before prod
-    dateOfBirth: { type: Date },
+    // PII: encrypted at rest
+    // Mixed, not Date — see the CoTraveller dateOfBirth comment above and
+    // TRAP 2 in plugins/fieldEncryption.plugin.ts. Nothing queries or does
+    // date math on this field; services/consumerProfileCompletion.ts only
+    // checks it for presence, and the <6-month expiry warning reads
+    // passports[].expiryDate, which is NOT encrypted and stays a Date.
+    dateOfBirth: { type: Schema.Types.Mixed },
     gender: { type: String, enum: GENDERS },
     placeOfBirthCity: { type: String, trim: true },
     placeOfBirthCountry: { type: String, trim: true },
@@ -179,7 +208,7 @@ const PersonalSchema = new Schema(
 
 const ContactSchema = new Schema(
   {
-    // PII: encrypt-at-rest before prod
+    // PII: encrypted at rest
     mobile: { type: String, trim: true },
     // OTP wiring is a later task. The flag is modelled now so the UI can show
     // a real state rather than a decorative badge, and so nothing has to
@@ -190,7 +219,7 @@ const ContactSchema = new Schema(
     // Mirrored from the login identity at read time. Consumer.email is the
     // source of truth; this exists so the tab has something to render when
     // the consumer has not touched the tab at all.
-    // PII: encrypt-at-rest before prod
+    // PII: encrypted at rest
     alternateEmail: { type: String, trim: true, lowercase: true },
 
     currentAddress: { type: AddressSchema, default: () => ({}) },
@@ -308,6 +337,57 @@ const ConsumerProfileSchema = new Schema<ConsumerProfileDocument>(
   },
   { timestamps: true },
 );
+
+/* ── Encryption at rest ─────────────────────────────────────────────── */
+
+/**
+ * THE authoritative list of encrypted paths on this collection — 14 of
+ * them, from the 12 `PII: encrypted at rest` markers above (AddressSchema is
+ * reused for current + permanent, so its 4 markers are 8 paths).
+ *
+ * Exported so tests and any future backfill script enumerate the same set
+ * this schema actually encrypts, rather than a second copy that can drift.
+ *
+ * `$` means "every element of this array" (plugins/fieldEncryption.plugin.ts).
+ * `type: "date"` paths are declared Schema.Types.Mixed above — see TRAP 2.
+ */
+export const ENCRYPTED_PII_FIELDS = [
+  { path: "personal.dateOfBirth", type: "date" as const },
+
+  { path: "contact.mobile" },
+  { path: "contact.alternateEmail" },
+  { path: "contact.currentAddress.line1" },
+  { path: "contact.currentAddress.line2" },
+  { path: "contact.currentAddress.city" },
+  { path: "contact.currentAddress.postalCode" },
+  { path: "contact.permanentAddress.line1" },
+  { path: "contact.permanentAddress.line2" },
+  { path: "contact.permanentAddress.city" },
+  { path: "contact.permanentAddress.postalCode" },
+
+  { path: "passports.$.number" },
+
+  { path: "coTravellers.$.dateOfBirth", type: "date" as const },
+  { path: "coTravellers.$.passportNumber" },
+];
+
+/**
+ * The subject is the CONSUMER — the same `consumerId` that is already this
+ * collection's isolation boundary, so encryption and row-level access
+ * control key on exactly the same identity, and there is no second notion
+ * of "whose data is this" to keep in sync.
+ *
+ * A co-traveller stored in `coTravellers[]` is NOT a separate subject:
+ * they have no login and no independent erasure right (see this file's own
+ * note on why they are not Consumer rows). Their passport number and date
+ * of birth encrypt under the owning consumer's key, so erasing the consumer
+ * erases them too — which is the intended outcome.
+ */
+ConsumerProfileSchema.plugin(fieldEncryptionPlugin, {
+  fields: ENCRYPTED_PII_FIELDS,
+  subject: (doc: any) =>
+    doc?.consumerId ? { subjectType: "CONSUMER", subjectId: doc.consumerId } : null,
+});
 
 const ConsumerProfile: Model<ConsumerProfileDocument> =
   mongoose.models.ConsumerProfile ||

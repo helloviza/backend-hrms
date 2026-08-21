@@ -20,6 +20,8 @@
 // audit; see routes/visa.ts's DELETE /documents/:documentId.
 import mongoose, { Schema, type Document, type Model } from "mongoose";
 import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
+import { fieldEncryptionPlugin } from "../plugins/fieldEncryption.plugin.js";
+import { PII_SUBJECT_TYPES, type PiiSubjectType } from "./SubjectKey.js";
 
 // PENDING -> PROCESSING -> COMPLETED | NEEDS_REVIEW | FAILED (Phase 4b —
 // see services/visaPassportExtraction.ts). Two distinct terminal-success
@@ -68,6 +70,22 @@ export interface VisaDocumentDocument extends Document {
   extractedFields: VisaExtractedField[];
   extractionConfidence?: VisaMrzConfidenceLevel;
 
+  // ── The encryption subject, DENORMALISED ───────────────────────────
+  // Whose PII `extractedFields` holds. Denormalised rather than joined on
+  // read for two reasons: resolving it live would mean a VisaApplication
+  // lookup per document (an N+1 on every document-list read), and the
+  // answer must survive scripts/erase-traveller-profile.ts nulling
+  // VisaApplication.travellerProfileId.
+  //
+  // NULL on every row written before encryption was switched on. That is
+  // not a gap to backfill: those rows hold PLAINTEXT extractedFields, which
+  // the dual-read window passes straight through without ever asking who
+  // the subject is. A row only needs a subject once it holds ciphertext,
+  // and every path that writes ciphertext stamps these first
+  // (services/visaPassportExtraction.ts, routes/visa.ts's upload).
+  subjectType: PiiSubjectType | null;
+  subjectId: mongoose.Types.ObjectId | null;
+
   reviewStatus: VisaDocumentReviewStatus;
   reviewedBy?: mongoose.Types.ObjectId; // ref User
   reviewedAt?: Date;
@@ -111,6 +129,12 @@ const VisaDocumentSchema = new Schema<VisaDocumentDocument>(
     extractedFields: { type: [VisaExtractedFieldSchema], default: [] },
     extractionConfidence: { type: String, enum: VISA_MRZ_CONFIDENCE_LEVELS },
 
+    // See the interface above. Nullable and un-indexed on purpose: nothing
+    // queries BY subject — these exist to be read off a document already in
+    // hand, so the plugin can find the right key.
+    subjectType: { type: String, enum: PII_SUBJECT_TYPES, default: null },
+    subjectId: { type: Schema.Types.ObjectId, default: null },
+
     reviewStatus: { type: String, enum: VISA_DOCUMENT_REVIEW_STATUSES, default: "PENDING" },
     reviewedBy: { type: Schema.Types.ObjectId, ref: "User" },
     reviewedAt: { type: Date },
@@ -123,6 +147,56 @@ const VisaDocumentSchema = new Schema<VisaDocumentDocument>(
 );
 
 VisaDocumentSchema.plugin(workspaceScopePlugin);
+
+/* ── Encryption at rest ─────────────────────────────────────────────── */
+
+/**
+ * `extractedFields[].value` — the MRZ/VIZ read off an uploaded passport.
+ * Document number, surname, given names, date of birth, nationality, place
+ * of birth: the same identity data ConsumerProfile holds, arriving by a
+ * different route. The `key` half of each pair is NOT encrypted; it names
+ * the field and is what every reader filters on.
+ *
+ * THE WHOLE ARRAY IS ENCRYPTED, INCLUDING THE NON-PII ENTRIES.
+ * extractedFields is heterogeneous — alongside the MRZ it carries
+ * `failureCategory`, `error`, `check_*` (passed/failed) and
+ * `*_severity`, none of which are PII. Encrypting only the PII keys would
+ * mean deciding per element based on a sibling field, which the plugin's
+ * path model cannot express; encrypting the whole array's values is the
+ * honest alternative, and the entries that are not PII lose nothing by it.
+ *
+ * ONE REAL COST, and it is not hypothetical: a randomized ciphertext cannot
+ * be queried, so `find({ extractedFields: { $elemMatch: { key: "...",
+ * value: "..." } } })` no longer works. There was exactly one such query
+ * (scripts/rerun-visa-passport-extraction.ts) and it now filters in memory
+ * after the read. Anything new that wants to select ON a value has the same
+ * constraint — filter after reading, or store a non-PII discriminator in
+ * the `key`.
+ */
+export const ENCRYPTED_PII_FIELDS = [{ path: "extractedFields.$.value" }];
+
+/**
+ * The subject is TWO-BRANCH, and getting this wrong would encrypt a
+ * consumer's data under a key their erasure never destroys:
+ *
+ *   B2B  — the applicant is a TravellerProfile (a corporate-roster entity),
+ *          reached through VisaApplication.travellerProfileId. This is the
+ *          subject scripts/erase-traveller-profile.ts already cascades along.
+ *   D2C  — there IS no TravellerProfile. routes/consumer.applications.ts
+ *          creates consumer applications with travellerProfileId: null and
+ *          consumerId set, deliberately ("the applicant's identity lives on
+ *          the ConsumerProfile"). The subject is the CONSUMER — the same
+ *          key their ConsumerProfile uses, so one shred covers both.
+ *
+ * Resolved from the denormalised fields above, never from a join.
+ */
+VisaDocumentSchema.plugin(fieldEncryptionPlugin, {
+  fields: ENCRYPTED_PII_FIELDS,
+  subject: (doc: any) =>
+    doc?.subjectType && doc?.subjectId
+      ? { subjectType: doc.subjectType, subjectId: doc.subjectId }
+      : null,
+});
 
 // Enforces "never overwrite" at the DB level, not just by the route
 // computing "next version" carefully — a second, concurrent upload of the
@@ -138,6 +212,30 @@ VisaDocumentSchema.index({ workspaceId: 1, reviewStatus: 1 });
 // never physically removed — this index is what keeps "documents for this
 // application" fast once a workspace has accumulated deleted history.
 VisaDocumentSchema.index({ workspaceId: 1, deletedAt: 1 });
+
+/**
+ * Derive a document's encryption subject from its owning VisaApplication —
+ * the ONE place the two-branch rule above is implemented. Every path that
+ * is about to write `extractedFields` calls this and stamps the result
+ * before saving; nothing re-derives the rule inline.
+ *
+ * Returns null when the application can name neither (an application whose
+ * travellerProfileId has already been nulled by an erasure, with no
+ * consumerId). Callers must NOT invent a subject in that case — a wrong
+ * subject encrypts data under a key that person's erasure will never
+ * destroy, which is worse than failing.
+ */
+export function subjectFromApplication(
+  application: { travellerProfileId?: any; consumerId?: any } | null | undefined,
+): { subjectType: PiiSubjectType; subjectId: mongoose.Types.ObjectId } | null {
+  if (application?.travellerProfileId) {
+    return { subjectType: "TRAVELLER_PROFILE", subjectId: application.travellerProfileId };
+  }
+  if (application?.consumerId) {
+    return { subjectType: "CONSUMER", subjectId: application.consumerId };
+  }
+  return null;
+}
 
 const VisaDocument: Model<VisaDocumentDocument> =
   mongoose.models.VisaDocument ||

@@ -65,6 +65,7 @@ import {
   planCstepImpact,
   assertCstepImpactAcknowledged,
   assertNoDanglingVisaDocuments,
+  destroyErasureSubjectKey,
 } from "./lib/visaErasureCascade.js";
 
 function getArgValue(flag: string): string | null {
@@ -154,6 +155,16 @@ async function run() {
 
   await assertNoDanglingVisaDocuments();
 
+  // THE KEY DIES LAST — see destroyErasureSubjectKey()'s own comment. Every
+  // document is already gone above; this makes any ciphertext encrypted
+  // under this traveller unreadable even where a row was missed.
+  const subjectKeysDestroyed = await destroyErasureSubjectKey(
+    "TRAVELLER_PROFILE",
+    travellerId,
+    actor.email,
+    reason,
+  );
+
   await recordVisaErasure({
     scope: "TRAVELLER_PROFILE",
     targetId: travellerId,
@@ -167,6 +178,7 @@ async function run() {
       activityRowsRedacted,
       manualBookingsRedacted,
       applicationsScrubbed,
+      subjectKeysDestroyed,
     },
     s3KeysDeleted,
     cstepImpact: { ...cstepImpact, acknowledged: cstepAcknowledged },
@@ -175,7 +187,8 @@ async function run() {
   console.log(
     `Erased: 1 TravellerProfile, ${documentsDeleted} VisaDocument(s), ${s3KeysDeleted.length} S3 object(s). ` +
       `${activityRowsRedacted} activity row(s) redacted, ${manualBookingsRedacted} ManualBooking(s) redacted, ` +
-      `${applicationsScrubbed} VisaApplication(s) scrubbed (travellerProfileId nulled, actionRequiredReason cleared).`,
+      `${applicationsScrubbed} VisaApplication(s) scrubbed (travellerProfileId nulled, actionRequiredReason cleared), ` +
+      `${subjectKeysDestroyed} subject key(s) crypto-shredded.`,
   );
   process.exit(0);
 }

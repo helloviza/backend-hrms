@@ -188,6 +188,27 @@ function slotsFor(doc: any, spec: EncryptedFieldSpec): Slot[] {
   return collectSlots(doc, spec.path.split("."), []);
 }
 
+/**
+ * Normalise an UPDATE key's array addressing to the `$` a spec path uses, so
+ * the refusal below compares like with like. Mongo has three spellings for
+ * "an element of this array" and an update can use any of them:
+ *
+ *   passports.$[front].frontDocumentId   (arrayFilters — live in this codebase,
+ *   passports.$.number                    routes/consumer.profile.ts:678/687)
+ *   passports.0.number                   (a literal index)
+ *
+ * Without this, a `$set` of `passports.$[x].number` matched no spec and
+ * sailed straight past the guard into the database as plaintext — the exact
+ * leak the guard exists to stop. Found while auditing the two arrayFilters
+ * `$unset` calls in consumer.profile.ts (which are themselves harmless —
+ * they target document references, not encrypted fields).
+ */
+function normaliseUpdateKey(key: string): string {
+  return key
+    .replace(/\.\$\[[^\]]*\]/g, ".$") // .$[front] -> .$
+    .replace(/\.\d+(?=\.|$)/g, ".$"); // .0        -> .$
+}
+
 /* ─────────────────────────────────────────────────────────────────────
  * Type conversion — the Date half of TRAP 2.
  * ───────────────────────────────────────────────────────────────────── */
@@ -488,11 +509,17 @@ export function fieldEncryptionPlugin(schema: Schema, options: FieldEncryptionOp
           ? Object.keys((payload ?? {}) as Record<string, unknown>)
           : [operator];
         for (const key of keys) {
+          const normalised = normaliseUpdateKey(key);
           for (const spec of options.fields) {
-            const specRoot = spec.path.split(".$.")[0].split(".$")[0];
-            // "contact.mobile" is hit by a $set of "contact.mobile", of
-            // "contact", or of the whole array root "passports".
-            if (key === spec.path || key.startsWith(`${spec.path}.`) || key === specRoot || specRoot.startsWith(`${key}.`)) {
+            // Three ways an update key can reach an encrypted path: it IS
+            // the path, it is INSIDE the path, or it is an ANCESTOR that
+            // replaces the path wholesale (a $set of "contact", or of the
+            // whole "passports" array).
+            if (
+              normalised === spec.path ||
+              normalised.startsWith(`${spec.path}.`) ||
+              spec.path.startsWith(`${normalised}.`)
+            ) {
               touched.add(spec.path);
             }
           }

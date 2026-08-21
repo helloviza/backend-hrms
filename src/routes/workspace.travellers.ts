@@ -969,7 +969,11 @@ async function findPassportExtractionForTraveller(travellerId: any, workspaceId:
     // there to resolve. PENDING/PROCESSING/FAILED carry no MRZ fields.
     extractionStatus: { $in: ["COMPLETED", "NEEDS_REVIEW"] },
   })
-    .select("extractedFields extractionStatus extractionConfidence createdAt applicationId")
+    // subjectType/subjectId are what the field-encryption plugin resolves the
+    // decryption key from (models/VisaDocument.ts). A projection that keeps
+    // extractedFields but drops them makes the read throw rather than hand
+    // back ciphertext — so they are not optional here.
+    .select("extractedFields extractionStatus extractionConfidence createdAt applicationId subjectType subjectId")
     .sort({ createdAt: -1 })
     .lean();
 

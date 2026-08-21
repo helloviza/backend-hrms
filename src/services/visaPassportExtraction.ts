@@ -57,7 +57,7 @@
 // visibility only — routes/visa.ts's PASSPORT_FIELD_CONVERTERS never reads
 // a `viz_`-prefixed key, so nothing here is ever written back without
 // explicit user confirmation through the normal flow.
-import VisaDocument from "../models/VisaDocument.js";
+import VisaDocument, { subjectFromApplication } from "../models/VisaDocument.js";
 import VisaApplication from "../models/VisaApplication.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import { extractPassportMrzViaGemini } from "./extractPassportGemini.js";
@@ -120,15 +120,20 @@ async function markFailed(
   ctx: { applicationId: any; requestId: any; workspaceId: any },
 ) {
   try {
-    await VisaDocument.findByIdAndUpdate(documentId, {
-      $set: {
-        extractionStatus: "FAILED",
-        extractedFields: [
-          { key: "failureCategory", value: category },
-          { key: "error", value: message.slice(0, 500) },
-        ],
-      },
-    });
+    // LOAD AND SAVE, not findByIdAndUpdate. extractedFields is encrypted at
+    // rest, and a direct $set goes to the database with no document in the
+    // middle to encrypt it — the plugin refuses that write outright rather
+    // than let it store values in the clear (models/VisaDocument.ts).
+    // These two entries are diagnostics, not PII, but they share the array
+    // with the MRZ and so share its handling.
+    const doc = await VisaDocument.findById(documentId);
+    if (!doc) return;
+    doc.extractionStatus = "FAILED";
+    doc.extractedFields = [
+      { key: "failureCategory", value: category },
+      { key: "error", value: message.slice(0, 500) },
+    ] as any;
+    await doc.save();
   } catch (err: any) {
     // Never let a failure-to-record-a-failure escape this fire-and-forget
     // path — the caller already isn't awaiting this function.
@@ -173,13 +178,33 @@ export async function runVisaPassportExtraction(documentId: string): Promise<voi
   // COMPLETED/FAILED all need requestId) and is reused later for the
   // identity cross-check, rather than fetched a second time there.
   const application = await VisaApplication.findById(doc.applicationId)
-    .select("requestId workspaceId travellerProfileId")
+    .select("requestId workspaceId travellerProfileId consumerId")
     .lean();
   const activityCtx = {
     applicationId: doc.applicationId,
     requestId: (application as any)?.requestId,
     workspaceId: (application as any)?.workspaceId,
   };
+
+  /* ── Stamp the encryption subject BEFORE the first save ────────────
+   * extractedFields is encrypted at rest (models/VisaDocument.ts), and the
+   * plugin resolves the key from doc.subjectType/subjectId. This has to
+   * happen before the PROCESSING save below, not just before the results
+   * are written: re-extracting a row from BEFORE encryption was switched on
+   * means that save is already carrying plaintext extractedFields that the
+   * plugin will convert, and it cannot do that without a subject. Stamping
+   * here is also what lets a legacy row self-heal on its next extraction.
+   *
+   * A null subject is left null rather than guessed — see
+   * subjectFromApplication(). The save below then fails loudly if the row
+   * genuinely holds PII with nobody to own it, which is the correct
+   * outcome and strictly better than encrypting it under the wrong key.
+   */
+  const subject = subjectFromApplication(application as any);
+  if (subject) {
+    doc.subjectType = subject.subjectType;
+    doc.subjectId = subject.subjectId;
+  }
 
   doc.extractionStatus = "PROCESSING";
   await doc.save();

@@ -17,6 +17,16 @@
 // the invoice; see visaErasureCascade.ts's own comment on why the name
 // isn't touched here).
 //
+// THIS SCRIPT DELIBERATELY DOES NOT CRYPTO-SHRED. erase-traveller-profile.ts
+// destroys the subject's data key at the end of its run (the key dies last —
+// see destroyErasureSubjectKey in scripts/lib/visaErasureCascade.ts); this
+// one must not, and the difference is not an oversight. A key belongs to a
+// SUBJECT, not to a case: one traveller can hold applications across several
+// requests, so destroying their key while erasing ONE case would make their
+// OTHER, still-live cases' extracted passport data permanently unreadable.
+// Deleting this case's VisaDocument rows outright — which this script does —
+// is the erasure that is actually in scope here.
+//
 // SUPERADMIN ONLY — enforced by resolving --actor-email against a real User
 // document and requiring it carry the SUPERADMIN role (this script runs
 // outside any HTTP request, so there is no req.user/JWT to trust instead).

@@ -58,7 +58,13 @@ const {
   };
 });
 
-vi.mock("../models/VisaDocument.js", () => ({
+// importOriginal, not a bare factory: the MODEL is mocked (these tests never
+// stand up a mongod), but subjectFromApplication is a pure function the
+// service now calls to decide whose key encrypts extractedFields, and a
+// hand-written stub of it here would assert this file's belief about the
+// two-branch B2B/D2C rule rather than the rule itself.
+vi.mock("../models/VisaDocument.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../models/VisaDocument.js")>()),
   default: {
     findById: (id: any) => findByIdMock(id),
     findByIdAndUpdate: (id: any, update: any) => findByIdAndUpdateMock(id, update),

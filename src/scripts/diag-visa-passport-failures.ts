@@ -16,7 +16,9 @@ async function main() {
     await mongoose.connect(env.MONGO_URI);
 
     const docs = await VisaDocument.find({ docCode: "DOC-01", extractionStatus: "FAILED" })
-      .select("applicationId extractionStatus extractionConfidence extractedFields version createdAt updatedAt")
+      // subjectType/subjectId: required to decrypt extractedFields — see
+      // models/VisaDocument.ts. Without them this read throws.
+      .select("applicationId extractionStatus extractionConfidence extractedFields version createdAt updatedAt subjectType subjectId")
       .sort({ updatedAt: -1 })
       .lean();
 

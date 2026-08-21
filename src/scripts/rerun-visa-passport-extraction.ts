@@ -47,14 +47,39 @@ async function main() {
   await mongoose.connect(env.MONGO_URI);
 
   const filter: Record<string, any> = { docCode: "DOC-01", extractionStatus: "FAILED" };
-  if (category) {
-    // failureCategory lives inside extractedFields (a flat {key,value}[]),
-    // not as its own indexed schema field — see models/VisaDocument.ts —
-    // so this is an $elemMatch, not a plain equality filter.
-    filter.extractedFields = { $elemMatch: { key: "failureCategory", value: category } };
-  }
 
-  const before = await VisaDocument.find(filter).select("_id applicationId").lean();
+  /* ── WHY THIS FILTERS IN MEMORY ────────────────────────────────────
+   * failureCategory lives inside extractedFields (a flat {key,value}[]),
+   * not as its own indexed schema field — see models/VisaDocument.ts. This
+   * used to be an `$elemMatch: { key: "failureCategory", value: category }`.
+   *
+   * That query CANNOT work any more, and would have failed silently rather
+   * than loudly: extractedFields[].value is now encrypted with a RANDOMIZED
+   * IV, so the same category produces different ciphertext in every row and
+   * matches nothing. An $elemMatch on it returns zero documents and reads
+   * exactly like "no failures of this category" — the worst possible
+   * failure mode for an ops tool.
+   *
+   * So the category filter moved to after the read, where the plugin has
+   * already decrypted. The candidate set is bounded by
+   * extractionStatus: "FAILED" (single-digit-to-dozens in practice), so
+   * this is a small scan, not a collection sweep. The `key` half of each
+   * pair is NOT encrypted, but filtering on key alone is not what this
+   * needs — it is the VALUE that names the category.
+   * ────────────────────────────────────────────────────────────────── */
+  const candidates = await VisaDocument.find(filter)
+    .select("_id applicationId extractedFields subjectType subjectId")
+    .lean();
+
+  const before = (
+    category
+      ? candidates.filter((d: any) =>
+          (d.extractedFields ?? []).some(
+            (f: any) => f?.key === "failureCategory" && f?.value === category,
+          ),
+        )
+      : candidates
+  ).map((d: any) => ({ _id: d._id, applicationId: d.applicationId }));
 
   if (!before.length) {
     console.log(
@@ -81,7 +106,9 @@ async function main() {
     }
 
     const after: any = await VisaDocument.findById(id)
-      .select("extractionStatus extractionConfidence extractedFields")
+      // subjectType/subjectId: required to decrypt extractedFields — see
+      // models/VisaDocument.ts. Without them this read throws.
+      .select("extractionStatus extractionConfidence extractedFields subjectType subjectId")
       .lean();
 
     if (!after) {

@@ -43,6 +43,8 @@ import User from "../../models/User.js";
 import CstepTravelRequest from "../../models/cstep/CstepTravelRequest.js";
 import CstepClaim from "../../models/cstep/CstepClaim.js";
 import { deleteObject } from "../../utils/s3Upload.js";
+import { destroySubjectDek } from "../../security/subjectKeys.js";
+import { type PiiSubjectType } from "../../models/SubjectKey.js";
 
 /* ─────────────────────────────────────────────────────────────────────
  * Guard 1 — model scope, same shape as seed-visa-rules.ts/purge-visa-seed.ts.
@@ -60,6 +62,10 @@ export const VISA_ERASURE_ALLOWED_MODELS = [
   "CstepTravelRequest",
   "CstepClaim",
   "VisaErasureLog",
+  // The per-subject data keys. Registered because the cascade now
+  // crypto-shreds the subject at the end of every run — see
+  // destroyErasureSubjectKey() below.
+  "SubjectKey",
 ] as const;
 
 export function assertModelScope(): void {
@@ -323,6 +329,46 @@ export function assertCstepImpactAcknowledged(impact: CstepImpact, acknowledged:
         `--acknowledge-cstep-impact to proceed.`,
     );
   }
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * CRYPTO-SHRED — the key dies LAST.
+ *
+ * VisaDocument.extractedFields and ConsumerProfile's identity fields are
+ * encrypted under a per-subject data key (security/subjectKeys.ts).
+ * Destroying that key is what makes any ciphertext this cascade could not
+ * reach — a stray copy, a row a future code path forgot about — unreadable
+ * rather than merely deleted-where-we-looked.
+ *
+ * ── ORDERING, AND WHY IT IS SAFE ──────────────────────────────────────
+ * Both entry points call this at the very END of their cascade, after every
+ * document is gone and after the applications have been scrubbed. That
+ * order matters in ONE direction: destroying the key first would leave the
+ * rest of the cascade planning against rows it could no longer read.
+ *
+ * The reverse worry — that scrubApplicationsAfterTravellerErasure() nulls
+ * travellerProfileId and so strands a document that can no longer name its
+ * subject — does not arise. deleteDocumentsAndS3() runs FIRST and deletes
+ * every one of this traveller's documents; there is nothing left to resolve
+ * a subject for by the time the scrub happens. (And VisaDocument carries
+ * its subject denormalised anyway, precisely so it never depends on the
+ * application still pointing at the traveller.)
+ *
+ * Idempotent: a re-run reports alreadyDestroyed rather than failing, in
+ * keeping with every other step here.
+ * ───────────────────────────────────────────────────────────────────── */
+export async function destroyErasureSubjectKey(
+  subjectType: PiiSubjectType,
+  subjectId: mongoose.Types.ObjectId | string,
+  actorEmail: string,
+  reason: string,
+): Promise<number> {
+  const result = await destroySubjectDek(subjectType, subjectId, { actorEmail, reason });
+  // 1 = a live key was destroyed by THIS run. 0 covers both "already
+  // destroyed by an earlier run" and "this subject never encrypted
+  // anything" — neither is a failure, and the erasure log records the
+  // count, not the reason.
+  return result.destroyed ? 1 : 0;
 }
 
 /* ─────────────────────────────────────────────────────────────────────
