@@ -55,6 +55,21 @@ export const env = {
   VISA_SCREENING_ENFORCED: String(process.env.VISA_SCREENING_ENFORCED || "").trim().toLowerCase() === "true",
   DEPLOYMENT_MODE: (process.env.DEPLOYMENT_MODE === "saas" ? "saas" : "plumbox") as "saas" | "plumbox",
 
+  // PII field encryption master key — base64 of 32 random bytes, wrapping
+  // the per-subject data keys in security/subjectKeys.ts. Declared here for
+  // DISCOVERABILITY only, on the same line VISA_SCREENING_ENFORCEMENT above
+  // is: the runtime read lives in security/piiMasterKey.ts and goes to
+  // process.env live, so each test can pin the key state it needs and the
+  // value can be rotated without a rebuild.
+  //
+  // Deliberately NOT requireEnv(): this key is only needed by the
+  // collections that carry encrypted fields, and making it mandatory would
+  // fail the boot of every process that touches none of them — including
+  // every standalone script under src/scripts/*. Absence is enforced where
+  // it matters instead: piiMasterKey.ts THROWS on first use in production.
+  // Threaded in via the APP_SECRETS bundle — see that file's header.
+  PII_MASTER_KEY: process.env.PII_MASTER_KEY || "",
+
   MONGO_URI: requireEnv("MONGO_URI"),
   JWT_SECRET: requireEnv("JWT_SECRET"),
   JWT_REFRESH_SECRET: requireEnv("JWT_REFRESH_SECRET", process.env.JWT_SECRET),
