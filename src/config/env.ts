@@ -19,6 +19,8 @@
 // duplicate unpack.
 import "../bootstrap/loadSecrets.js";
 
+import { assertRazorpayKeyMatchesEnv } from "./razorpayMode.js";
+
 import dotenv from "dotenv";
 // Harmless no-op here — loadSecrets.ts above already called dotenv.config()
 // (and dotenv never overrides an already-set key), kept only so this file
@@ -133,3 +135,22 @@ if (
     ].join("\n"),
   );
 }
+
+/**
+ * Guardrail: the Razorpay key's declared mode must agree with the
+ * environment. Unlike the MONGO_URI warning above this one THROWS, because
+ * the failure it prevents is not "you read the wrong data" but "you moved,
+ * or failed to move, somebody's money" — and neither direction announces
+ * itself at the time.
+ *
+ * Deliberately here rather than at the payment call sites: this is the one
+ * module every boot goes through (server.ts imports it directly), so the
+ * check runs exactly once per process instead of once per checkout. A
+ * per-request version would also be a per-request chance to refuse a
+ * customer's payment, which is the wrong place to discover a
+ * misconfiguration.
+ *
+ * The key is shared by D2C and B2B/SBT alike — see config/razorpayMode.ts
+ * for the full rule and why an absent key stays legal outside production.
+ */
+assertRazorpayKeyMatchesEnv(process.env.RAZORPAY_KEY_ID, env.NODE_ENV);

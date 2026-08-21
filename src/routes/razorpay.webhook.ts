@@ -42,10 +42,22 @@ function verifyWebhookSignature(
     .createHmac("sha256", secret)
     .update(rawBody)
     .digest("hex");
-  return crypto.timingSafeEqual(
-    Buffer.from(expectedSignature),
-    Buffer.from(signature),
-  );
+
+  const expected = Buffer.from(expectedSignature);
+  const received = Buffer.from(signature);
+
+  /* timingSafeEqual THROWS on a length mismatch rather than returning
+   * false, and the thrown error escapes to the handler's outer catch —
+   * so a forged signature of the wrong length used to answer 500
+   * "Webhook processing failed" (a server fault, logged with a stack)
+   * instead of a plain rejection. Same outcome for the attacker, wrong
+   * story for whoever reads the logs, and a free way to fill them.
+   *
+   * A length check is safe to do in variable time: the length of a
+   * sha256 hex digest is public knowledge, not a secret. */
+  if (expected.length !== received.length) return false;
+
+  return crypto.timingSafeEqual(expected, received);
 }
 
 /**
@@ -397,11 +409,42 @@ router.post("/razorpay", async (req: Request, res: Response) => {
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
 
     if (!secret) {
-      if (process.env.NODE_ENV === "production") {
-        webhookLogger.error("RAZORPAY_WEBHOOK_SECRET not set in production!");
+      /* ── FAIL CLOSED ────────────────────────────────────────────────
+       * This used to read `if (NODE_ENV === "production") refuse; else
+       * skip`, which is an ALLOWLIST OF ONE pretending to be a safety
+       * check: every other value on earth took the skip branch. Staging,
+       * preprod, a container that never set NODE_ENV at all, and
+       * "Production" with a capital P all landed in "skip signature
+       * verification" — on an endpoint whose whole job is to mark orders
+       * paid and raise invoices. Anyone who could reach the URL could
+       * post their own payment.captured and get a free visa.
+       *
+       * That mattered more than it looks: NODE_ENV is set by the runtime
+       * environment, not by this repo — `start` is plain `node
+       * dist/server.js` with no NODE_ENV in it — so "production is
+       * definitely production" was an assumption about infrastructure
+       * this code could not see, defended by nothing.
+       *
+       * Inverted: the skip is now an allowlist of the two values that can
+       * only mean a developer's own machine. Everything else — including
+       * unset, including a typo — requires the secret and refuses without
+       * it. The failure mode is a webhook endpoint that returns 500 until
+       * someone sets the secret, which is loud, and recoverable, and not
+       * a fake payment. */
+      const nodeEnv = process.env.NODE_ENV;
+      const isLocalDev = nodeEnv === "development" || nodeEnv === "test";
+
+      if (!isLocalDev) {
+        webhookLogger.error(
+          "RAZORPAY_WEBHOOK_SECRET not set — REFUSING to process an unverifiable webhook",
+          { nodeEnv: nodeEnv ?? "<unset>" },
+        );
         return res.status(500).json({ error: "Webhook secret not configured" });
       }
-      webhookLogger.warn("RAZORPAY_WEBHOOK_SECRET not set — skipping signature verification in dev");
+      webhookLogger.warn(
+        "RAZORPAY_WEBHOOK_SECRET not set — skipping signature verification (local dev only)",
+        { nodeEnv },
+      );
     } else {
       if (!signature) {
         return res.status(400).json({ error: "Invalid signature" });
