@@ -373,8 +373,13 @@ describe("GET /cases — consumer-safe projection", () => {
         "yourMessage",
         // A COUNT of the reader's own uploads — not filenames, not links.
         "attachmentCount",
+        // Agent replies marked visibleToConsumer. Empty here: this case was
+        // worked by ops but never answered, and none of the internal work
+        // above sets that flag.
+        "replies",
       ].sort(),
     );
+    expect(row.replies).toEqual([]);
 
     // WAITING_SUPPLIER must read as plain progress — never the word supplier.
     expect(row.status).toBe("In progress");

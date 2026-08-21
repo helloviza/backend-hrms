@@ -30,19 +30,22 @@
 // block, where the concierge assignment is withheld: who inside Plumtrips
 // touched a case is our business, not the customer's.
 //
-// ── WHY THE THREAD IS THE CONSUMER'S OWN MESSAGE ONLY ────────────────
-// TicketMessage has NO public/internal flag. It has `channel`, which is
-// EMAIL|SYSTEM, and the console writes SYSTEM for three different things:
-// agent internal notes (tickets.console.ts, the isInternalNote branch),
-// status-change audit entries, and assignment audit entries ("Assigned to
-// Priya"). `channel` is therefore a transport bucket, not a visibility
-// flag, and "not SYSTEM" is not a safe proxy for "the customer may read
-// this".
+// ── WHAT OF THE THREAD THE CONSUMER SEES ─────────────────────────────
+// Their own submitted message, the mapped status, and agent replies that
+// were EXPLICITLY marked for them — `TicketMessage.visibleToConsumer`.
 //
-// So v1 returns the consumer's OWN submitted message and the mapped status,
-// and no agent-authored content at all. Exposing agent messages needs a
-// real visibility flag on TicketMessage — a deliberate change, not an
-// inference from a field that was never meant to carry this weight.
+// That flag exists because `channel` never could carry this weight. It is
+// a transport bucket (EMAIL|SYSTEM|PORTAL), and the console writes SYSTEM
+// for three different things: agent internal notes (tickets.console.ts,
+// the isInternalNote branch), status-change audit entries, and assignment
+// audit entries ("Assigned to Priya"). "Not SYSTEM" was never a safe
+// proxy for "the customer may read this", so nothing here infers from it.
+//
+// visibleToConsumer defaults to FALSE, which makes the read an allowlist:
+// the three SYSTEM writers never set it, so they cannot appear here no
+// matter how the query is later edited, and no message that predates the
+// field can either. WHO replied is still withheld — the projection takes
+// bodyHtml and createdAt, never fromEmail or sentBy.
 import { Router } from "express";
 import mongoose from "mongoose";
 import multer from "multer";
@@ -355,6 +358,40 @@ router.get("/cases", async (req: any, res: any) => {
       }
     }
 
+    /* ── AGENT REPLIES ────────────────────────────────────────────────
+     * `visibleToConsumer: true` is the whole gate, and it is an ALLOWLIST:
+     * a message that does not say yes is not returned. Internal notes,
+     * status audit and assignment audit never set it, so they cannot
+     * match — not because they are filtered out, but because they were
+     * never let in. Same for every message written before the field
+     * existed.
+     *
+     * The projection is bodyHtml + createdAt and nothing else. No
+     * fromEmail, no sentBy, no channel: WHO inside Plumtrips answered is
+     * withheld on the same rule as the concierge assignment (see this
+     * file's header). The ticket scope comes from `tickets`, which is
+     * already fenced to this consumer, so a reply cannot arrive from a
+     * case the reader does not own. */
+    const agentReplies = await TicketMessage.find({
+      ticketId: { $in: tickets.map((t) => t._id) },
+      direction: "OUTBOUND",
+      visibleToConsumer: true,
+    })
+      .select("ticketId bodyHtml createdAt")
+      .sort({ createdAt: 1 })
+      .lean();
+
+    const repliesByTicket = new Map<string, Array<{ bodyHtml: string; createdAt: Date }>>();
+    for (const msg of agentReplies) {
+      const key = String(msg.ticketId);
+      const list = repliesByTicket.get(key) ?? [];
+      list.push({
+        bodyHtml: String((msg as any).bodyHtml || ""),
+        createdAt: (msg as any).createdAt,
+      });
+      repliesByTicket.set(key, list);
+    }
+
     // How many files the reader themselves attached. A COUNT, not the
     // files: this is the consumer confirming their upload persisted, which
     // is the one thing they cannot otherwise verify. Filenames and download
@@ -378,6 +415,8 @@ router.get("/cases", async (req: any, res: any) => {
       lastActivityAt: (t as any).updatedAt ?? t.createdAt,
       yourMessage: firstMessageByTicket.get(String(t._id)) ?? "",
       attachmentCount: countByTicket.get(String(t._id)) ?? 0,
+      // Oldest first — the reader scrolls a conversation, not a stack.
+      replies: repliesByTicket.get(String(t._id)) ?? [],
     }));
 
     return res.json({ ok: true, cases });

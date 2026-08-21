@@ -10,6 +10,7 @@ import { fetchAttachmentData, markMessageAsProcessed, sendReply } from "./gmail.
 import { shouldSkipIngestionEntirely, shouldSendAutoAck } from "./ticketEmailFilter.js";
 import { buildAutoAckHtml } from "../utils/ticketAutoAck.js";
 import { buildQuotedBody } from "../utils/emailQuoteBuilder.js";
+import { sanitizeEmailHtml } from "@plumtrips/shared/security/htmlSanitize";
 import { triggerTaskAutomation } from "./taskAutomation.js";
 import logger from "../utils/logger.js";
 
@@ -56,8 +57,23 @@ export type IngestResult =
 export async function ingestEmailToTicket(
   gmailMsg: gmail_v1.Schema$Message,
 ): Promise<IngestResult> {
-  const parsed = parseEmail(gmailMsg);
+  const rawParsed = parseEmail(gmailMsg);
   const gmailHeaders = gmailMsg.payload?.headers || [];
+
+  /* ── THE UNTRUSTED BOUNDARY ────────────────────────────────────────────
+   * Everything above this line came out of a stranger's mail client. Anyone
+   * who can send to the ticketing inbox controls parsed.bodyHtml verbatim,
+   * and the console renders stored bodies as markup — so this string is the
+   * injection point for stored XSS against an authenticated ops session.
+   *
+   * It is sanitized ONCE, here, rather than at each of the three places it
+   * is later used (the stored message, the Gemini extraction fallback, the
+   * auto-ack quote trail). A per-use sanitize is a per-use chance to forget.
+   *
+   * EMAIL profile, not STRICT: an ops user reading a supplier's fare table
+   * must still see a table. See packages/shared/src/security/htmlSanitize.ts.
+   */
+  const parsed = { ...rawParsed, bodyHtml: sanitizeEmailHtml(rawParsed.bodyHtml) };
 
   logger.info("[TicketIngestion] Ingesting message", {
     gmailId: parsed.gmailId,

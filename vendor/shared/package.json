@@ -10,9 +10,14 @@
     "./voucher-templates/*": {
       "types": "./dist/voucher-templates/*.d.ts",
       "import": "./dist/voucher-templates/*.js"
+    },
+    "./security/*": {
+      "types": "./dist/security/*.d.ts",
+      "import": "./dist/security/*.js"
     }
   },
   "dependencies": {
+    "isomorphic-dompurify": "^3.22.0",
     "qrcode": "^1.5.4"
   },
   "_vendoredFrom": "packages/shared",

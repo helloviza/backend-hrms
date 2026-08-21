@@ -10,6 +10,7 @@ import TicketAttachment from "../models/TicketAttachment.js";
 import User from "../models/User.js";
 import { sendReply } from "../services/gmail.js";
 import { buildQuotedBody } from "../utils/emailQuoteBuilder.js";
+import { sanitizeStrictHtml } from "@plumtrips/shared/security/htmlSanitize";
 import { uploadTicketAttachment } from "../services/ticketAttachments.js";
 import { openLocalTicketAttachment } from "../services/ticketAttachmentStorage.js";
 import { presignGetObject } from "../utils/s3Presign.js";
@@ -297,8 +298,22 @@ function dedupeEmails(addrs: string[]): string[] {
 /* ── POST /:id/reply — send reply or internal note ──────────────── */
 router.post("/:id/reply", requirePermission("supportTickets", "WRITE"), upload, async (req, res) => {
   try {
-    const bodyHtml = req.body?.bodyHtml || "";
+    /* The console's TipTap editor cannot produce anything STRICT removes, so
+     * for every legitimate reply this is a no-op. It is here for the request
+     * that did not come from the editor: this endpoint takes bodyHtml off the
+     * wire, and an ops session that has been hijacked — or a token that has
+     * leaked — can POST whatever it likes. Sanitizing on the way in means a
+     * stored body is clean regardless of which client wrote it.
+     *
+     * STRICT, not EMAIL: this content is agent-authored, and on a web case it
+     * is served to the consumer's browser. Nothing that gets here needs a
+     * table. The quote trail appended further down is sanitized separately
+     * under the EMAIL profile, because that part IS mail. */
+    const bodyHtml = sanitizeStrictHtml(req.body?.bodyHtml || "");
     const isInternalNote = req.body?.isInternalNote === "true" || req.body?.isInternalNote === true;
+    // Opt-in, and only meaningful on a ticket with no email thread. Absent =
+    // every existing caller, which keeps the Gmail path exactly as it was.
+    const replyToConsumer = req.body?.replyToConsumer === "true" || req.body?.replyToConsumer === true;
     const userId = (req as any).user?._id || (req as any).user?.id;
     const userEmail = (req as any).user?.email || "";
     const uploadedFiles = (req.files as Express.Multer.File[]) || [];
@@ -449,6 +464,58 @@ router.post("/:id/reply", requirePermission("supportTickets", "WRITE"), upload, 
         });
         return res.status(502).json({ success: false, error: "Failed to send email via Gmail" });
       }
+    } else if (replyToConsumer && ticket.consumerId) {
+      /* ── PORTAL REPLY — the write IS the delivery ──────────────────
+       * A web case has a consumer who reads their cases on
+       * /account/support, so a reply reaches them by being persisted and
+       * marked readable. There is no send to attempt and therefore no
+       * send to fail: if this create resolves, the consumer can read it,
+       * and if it throws we are in the catch and have written nothing.
+       *
+       * That is why this branch MAY stamp firstResponseAt where the old
+       * threadless branch must not have: the thing the stamp claims
+       * happened actually happened. The stamp sits AFTER the create for
+       * the same reason it sits after the Gmail send below — it records
+       * a delivery, so it cannot run before one.
+       *
+       * The gate is consumerId, not sourceChannel: it names the person
+       * who can read the result. A threadless ticket with nobody
+       * attached still falls through to the honest 409.
+       *
+       * NO email of any kind. Notifying the consumer that a reply is
+       * waiting is a separate, later feature. */
+      const msg = await TicketMessage.create({
+        ticketId: ticket._id,
+        direction: "OUTBOUND",
+        channel: "PORTAL",
+        fromEmail: userEmail,
+        toEmail: [],
+        subject: ticket.subject,
+        bodyHtml,
+        bodyText: "",
+        sentBy: userId,
+        sentAt: new Date(),
+        deliveryStatus: "SENT",
+        visibleToConsumer: true,
+      });
+
+      // Same linking the other two branches do — an uploaded file that
+      // never gets a messageId is an orphan in S3.
+      if (attachmentDocs.length > 0) {
+        for (const att of attachmentDocs) (att as any).messageId = msg._id;
+        const saved = await TicketAttachment.insertMany(attachmentDocs);
+        await TicketMessage.findByIdAndUpdate(msg._id, {
+          $set: { attachmentRefs: saved.map((a) => a._id) },
+        });
+      }
+
+      if (!ticket.firstResponseAt) {
+        ticket.firstResponseAt = new Date();
+        await ticket.save();
+      }
+
+      const populated = await TicketMessage.findById(msg._id).populate("sentBy", "name email").lean();
+      return res.json({ success: true, message: populated, ticket });
     } else {
       // NO SEND CHANNEL — REFUSE, DO NOT PRETEND.
       //
@@ -467,8 +534,10 @@ router.post("/:id/reply", requirePermission("supportTickets", "WRITE"), upload, 
       // Refusing here leaves internal notes working on web cases: the
       // isInternalNote branch returns above this point.
       //
-      // A real outbound send for web cases (SMTP to ticket.fromEmail, or a
-      // consumer-visible in-app thread) is a deliberate fast-follow.
+      // The consumer-visible in-app thread now exists — the branch above.
+      // What reaches here is a ticket with neither a thread nor a consumer,
+      // which has no reader by either route. Email to ticket.fromEmail
+      // remains unbuilt.
       logger.warn("[TicketsConsole] Reply refused — ticket has no email thread", {
         ticketId: ticket._id,
         ticketRef: ticket.ticketRef,
