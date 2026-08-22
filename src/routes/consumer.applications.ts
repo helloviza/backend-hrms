@@ -899,8 +899,49 @@ function publicApplication(a: any, request: any) {
     destinationName: a.ruleSnapshot?.destinationName ?? null,
     purpose: a.ruleSnapshot?.purpose ?? null,
     entryType: a.ruleSnapshot?.entryType ?? null,
+    /* THE QUOTED PROCESSING WINDOW, frozen at submit — "Typically 3-5
+     * working days". Off the SNAPSHOT, like destinationName and purpose
+     * above, so a later edit to the live rule cannot retroactively change
+     * what this consumer was told.
+     *
+     * ── THESE ARE NOT processingDeadlineAt, AND THE DIFFERENCE MATTERS ─
+     * That field (below) is computeProcessingDeadline(travelDateFrom,
+     * etaMaxDays, etaBasis) — travel date MINUS the ETA, i.e. the LAST
+     * SAFE DATE TO LODGE. It is an ops deadline and it runs backwards
+     * from the trip. Rendering it as "your visa should arrive by" would
+     * be the exact opposite of what it means, and it is null for every
+     * case submitted without a travel date besides.
+     *
+     * Nullable for the same honest reason: a rule that publishes no ETA
+     * gives us nothing to quote, and a screen that says "Typically —"
+     * is right where "Typically 0 days" would be a fabrication. */
+    etaMinDays: a.ruleSnapshot?.etaMinDays ?? null,
+    etaMaxDays: a.ruleSnapshot?.etaMaxDays ?? null,
     processingDeadlineAt: a.processingDeadlineAt ?? null,
     travelDateFrom: a.travelDateFrom ?? null,
+    /* ── THE TWO OPS FIELDS THE LIST NEEDS ────────────────────────────
+     * Both were already sent on the DETAIL route's `ops` block, and are
+     * now on the projection itself so a dashboard can render "action
+     * required" badges and Approved/Rejected filters over the whole list
+     * without a detail fetch per row. That overlap on the detail response
+     * is deliberate and harmless — the same two document fields, read
+     * once, serialised twice — and is strictly better than a second
+     * list-only projection, which is the drift this file's own header
+     * argues against.
+     *
+     * `actionRequiredReason` is ops-written prose about the READER'S OWN
+     * case ("passport copy unclear"), which is why it may cross the wall.
+     * What still does not: actionRequiredSetByUserId, discrepancyReason
+     * and the concierge assignment — who inside Plumtrips touched a case
+     * is our business. The `ops` block already draws that line; this
+     * copies the line, not just the fields.
+     *
+     * `outcome` is undefined (no schema default) until a decision is
+     * recorded, so it is coalesced to null rather than dropped from the
+     * response — an absent key and a pending decision must not look the
+     * same to a client. */
+    actionRequiredReason: a.actionRequiredReason ?? null,
+    outcome: a.outcome ?? null,
     // The consumer's own total, in the channel they were quoted in. The
     // per-line breakup is deliberately NOT sent: the fee block's own
     // SERVICE_FEE label still reads "Plumtrips Service Fee" for B2B, and
