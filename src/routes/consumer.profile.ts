@@ -50,6 +50,7 @@ import {
   storageDescription,
 } from "../services/consumerDocumentStorage.js";
 import { processAvatar, AVATAR_MIME } from "../services/consumerAvatar.js";
+import { getCountryDisplayName, getDemonymOrName } from "@plumtrips/shared/countries";
 
 const router = Router();
 
@@ -1070,6 +1071,83 @@ router.post("/account/logout-all", async (req: any, res: any) => {
  * URL the consumer can already fetch. Streaming a zip of passport scans
  * through an endpoint that returns JSON is a different piece of work.
  */
+/* ── COUNTRY FIELDS IN THE DATA EXPORT ────────────────────────────────
+ *
+ * The eight country paths on this profile now store ISO 3166-1 alpha-2.
+ * That is right for the database and wrong for THIS response: /account/
+ * export is the DPDP "download my data" artifact, the copy a person is
+ * entitled to take away and read. Handing them
+ *
+ *     "issuingCountry": "IN"
+ *
+ * is technically their data and practically a worse answer than the free
+ * text it replaced — they typed "India", the screen shows "India", and
+ * the export should not be the one place that says something else.
+ *
+ * ── DUAL READ, SAME RULE AS THE CLIENT ────────────────────────────────
+ * Two letters that resolve become a name; anything else passes through
+ * untouched, because a row written before the ISO change still holds
+ * "India" and rewriting it here would be inventing data. Mirrors
+ * apps/frontend/src/pages/helloviza/account/country.ts deliberately — one
+ * behaviour, stated twice, rather than two behaviours.
+ *
+ * Nationality resolves to the DEMONYM ("Indian"), matching the field's
+ * own register and what the profile screen shows for it.
+ * ──────────────────────────────────────────────────────────────────── */
+function isIso2(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z]{2}$/.test(value.trim());
+}
+
+function nameOf(stored: unknown): unknown {
+  if (!isIso2(stored)) return stored;
+  return getCountryDisplayName(stored.trim().toUpperCase()) ?? stored;
+}
+
+function demonymOf(stored: unknown): unknown {
+  if (!isIso2(stored)) return stored;
+  return getDemonymOrName(stored.trim().toUpperCase()) ?? stored;
+}
+
+/**
+ * Returns a COPY with the eight country paths named. Never mutates the
+ * input — `profile` here is publicProfile()'s output, but a helper that
+ * quietly rewrote its argument would be one refactor away from renaming
+ * the fields on the document the rest of the request still reads.
+ */
+function namedCountries(profile: any): any {
+  if (!profile || typeof profile !== "object") return profile;
+  const personal = { ...(profile.personal ?? {}) };
+  personal.nationality = demonymOf(personal.nationality);
+  personal.countryOfResidence = nameOf(personal.countryOfResidence);
+  personal.placeOfBirthCountry = nameOf(personal.placeOfBirthCountry);
+
+  const contact = { ...(profile.contact ?? {}) };
+  for (const key of ["currentAddress", "permanentAddress"] as const) {
+    if (contact[key]) contact[key] = { ...contact[key], country: nameOf(contact[key].country) };
+  }
+
+  const travel = { ...(profile.travel ?? {}) };
+  if (Array.isArray(travel.travelHistory)) {
+    travel.travelHistory = travel.travelHistory.map((h: any) => ({
+      ...h,
+      country: nameOf(h?.country),
+    }));
+  }
+
+  return {
+    ...profile,
+    personal,
+    contact,
+    travel,
+    passports: Array.isArray(profile.passports)
+      ? profile.passports.map((p: any) => ({ ...p, issuingCountry: nameOf(p?.issuingCountry) }))
+      : profile.passports,
+    coTravellers: Array.isArray(profile.coTravellers)
+      ? profile.coTravellers.map((c: any) => ({ ...c, nationality: demonymOf(c?.nationality) }))
+      : profile.coTravellers,
+  };
+}
+
 router.get("/account/export", async (req: any, res: any) => {
   try {
     const consumerId = me(req);
@@ -1091,7 +1169,7 @@ router.get("/account/export", async (req: any, res: any) => {
             email: req.consumer.email,
             name: req.consumer.name,
           },
-          profile: publicProfile(profile, req.consumer),
+          profile: namedCountries(publicProfile(profile, req.consumer)),
           documents: docs.map(publicDocument),
         },
         null,
