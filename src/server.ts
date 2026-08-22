@@ -529,6 +529,17 @@ import consumerSupportRouter from "./routes/consumer.support.js";
 app.use("/api/consumer/support", consumerSupportRouter);
 
 /* ────────────────────────────────────────────────────────────────
+ * The consumer's SAVED COUNTRIES — /api/consumer/saved.
+ *
+ * Bookmarks, own-scoped like every other consumer collection. Not
+ * PII-encrypted: a saved destination is a preference, not identity data
+ * (models/SavedCountry.ts states the distinction). Rows are enriched
+ * from the static country seed server-side, so the client never holds a
+ * second copy of the catalogue vocabulary. */
+import consumerSavedRouter from "./routes/consumer.saved.js";
+app.use("/api/consumer/saved", consumerSavedRouter);
+
+/* ────────────────────────────────────────────────────────────────
  * DEV-ONLY consumer stub login — /api/consumer/dev-auth.
  *
  * Real Google/Microsoft OAuth for helloviza.ai is being built separately.
