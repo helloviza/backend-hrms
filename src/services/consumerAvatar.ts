@@ -22,7 +22,7 @@
 // is also the only option that reads EXIF orientation, which is the
 // difference between an avatar and a sideways avatar for every photo
 // taken on a phone held in portrait.
-import sharp from "sharp";
+import sharp, { type Metadata } from "sharp";
 
 /**
  * The stored format.
@@ -76,7 +76,7 @@ export class AvatarProcessingError extends Error {
  * rendered into a 104px circle by the browser.
  */
 export async function processAvatar(input: Buffer): Promise<Buffer> {
-  let meta: sharp.Metadata;
+  let meta: Metadata;
   try {
     meta = await sharp(input).metadata();
   } catch {
