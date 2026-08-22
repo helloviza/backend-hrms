@@ -38,6 +38,17 @@ export interface RequestConsumer {
   email: string;
   name: string;
   tokenVersion: number;
+  /**
+   * When the account was created — the real "member since".
+   *
+   * Optional because a Consumer row written before `timestamps: true`
+   * would not carry one. Every row in every environment checked does,
+   * but a reader must not have to trust that: the surfaces that show it
+   * render nothing when it is absent rather than substituting a date
+   * that means something else (routes/consumer.profile.ts publishes it
+   * as `memberSince`, and AccountBanner omits the line on null).
+   */
+  createdAt?: Date;
 }
 
 declare global {
@@ -90,7 +101,9 @@ export async function requireConsumer(
 
   try {
     const consumer = await Consumer.findById(payload.sub)
-      .select("_id email name tokenVersion status")
+      // createdAt rides along on a read this request already makes — no
+      // extra query for the "Member since" line.
+      .select("_id email name tokenVersion status createdAt")
       .lean();
 
     if (!consumer) {
@@ -113,6 +126,7 @@ export async function requireConsumer(
       email: (consumer as any).email,
       name: (consumer as any).name,
       tokenVersion: (consumer as any).tokenVersion,
+      createdAt: (consumer as any).createdAt,
     };
     // Constant, no DB read — see services/consumerWorkspace.ts for why this
     // is a hardcoded id rather than an upserted one.

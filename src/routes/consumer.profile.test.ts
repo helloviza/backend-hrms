@@ -657,3 +657,279 @@ describe("profile behaviour", () => {
     await request(app).get("/api/consumer/profile").set("Authorization", a.auth).expect(401);
   });
 });
+
+/* ══════════════════════════════════════════════════════════════════════
+ * THE PROFILE PHOTO
+ *
+ * The avatar shares the byte store with the document locker and NOTHING
+ * else — see the block comment above the routes. The assertions that
+ * matter most here are the NON-events: no ConsumerDocument row, no move
+ * in completion, no move in readiness. Those are what stop an account
+ * picture from telling a consumer they are ready to apply for a visa.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+describe("profile photo", () => {
+  /** A real, decodable image — sharp has to be able to read what we send. */
+  async function makeImage(
+    width: number,
+    height: number,
+    format: "png" | "jpeg" = "png",
+  ): Promise<Buffer> {
+    const { default: sharp } = await import("sharp");
+    const img = sharp({
+      create: { width, height, channels: 3, background: { r: 20, g: 90, b: 200 } },
+    });
+    return format === "png" ? img.png().toBuffer() : img.jpeg().toBuffer();
+  }
+
+  it("401s without a consumer token — every photo route is gated", async () => {
+    await request(app)
+      .post("/api/consumer/profile/photo")
+      .attach("file", await makeImage(80, 80), {
+        filename: "me.png",
+        contentType: "image/png",
+      })
+      .expect(401);
+
+    await request(app).get("/api/consumer/profile/photo").expect(401);
+    await request(app).delete("/api/consumer/profile/photo").expect(401);
+  });
+
+  it("uploads, squares the image, and serves it back as WEBP", async () => {
+    const a = await makeConsumer("a@helloviza.test", "Consumer A");
+
+    // Deliberately NOT square, and deliberately landscape — the crop is
+    // the thing under test, not the round trip.
+    const uploaded = await request(app)
+      .post("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .attach("file", await makeImage(600, 300), {
+        filename: "me.png",
+        contentType: "image/png",
+      })
+      .expect(200);
+
+    // The wire carries a version token, never the storage key.
+    expect(uploaded.body.profile.photoUpdatedAt).toBeTruthy();
+    expect(uploaded.body.profile.personal.photoStorageKey).toBeUndefined();
+    expect(uploaded.body.profile.personal.photoDriver).toBeUndefined();
+    expect(JSON.stringify(uploaded.body)).not.toContain("consumer-documents/");
+
+    const bytes = await request(app)
+      .get("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .buffer()
+      .parse(binaryParser)
+      .expect(200);
+
+    expect(bytes.headers["content-type"]).toBe("image/webp");
+    // No shared cache may hold a consumer's face.
+    expect(bytes.headers["cache-control"]).toContain("private");
+
+    const { default: sharp } = await import("sharp");
+    const meta = await sharp(bytes.body).metadata();
+    expect(meta.format).toBe("webp");
+    expect(meta.width).toBe(512);
+    expect(meta.height).toBe(512);
+  });
+
+  it("404s the bytes route when no photo has been set", async () => {
+    const a = await makeConsumer("a@helloviza.test", "Consumer A");
+    await request(app)
+      .get("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .expect(404);
+  });
+
+  it("is OWN-scoped — B's photo is unreachable from A's session", async () => {
+    const a = await makeConsumer("a@helloviza.test", "Consumer A");
+    const b = await makeConsumer("b@helloviza.test", "Consumer B");
+
+    await request(app)
+      .post("/api/consumer/profile/photo")
+      .set("Authorization", b.auth)
+      .attach("file", await makeImage(300, 300), {
+        filename: "b.png",
+        contentType: "image/png",
+      })
+      .expect(200);
+
+    // A has no photo of their own, and there is no request shape that
+    // reaches B's — the route takes no id at all.
+    await request(app)
+      .get("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .expect(404);
+
+    const aProfile = await request(app)
+      .get("/api/consumer/profile")
+      .set("Authorization", a.auth)
+      .expect(200);
+    expect(aProfile.body.profile.photoUpdatedAt).toBeNull();
+
+    const bProfile = await request(app)
+      .get("/api/consumer/profile")
+      .set("Authorization", b.auth)
+      .expect(200);
+    expect(bProfile.body.profile.photoUpdatedAt).toBeTruthy();
+  });
+
+  it("rejects a non-image file type", async () => {
+    const a = await makeConsumer("a@helloviza.test", "Consumer A");
+
+    // A PDF is accepted by the DOCUMENT uploader and must not be here.
+    await request(app)
+      .post("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .attach("file", Buffer.from("%PDF-1.4 x"), {
+        filename: "scan.pdf",
+        contentType: "application/pdf",
+      })
+      .expect(400);
+
+    await request(app)
+      .post("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .attach("file", Buffer.from("MZ executable"), {
+        filename: "virus.exe",
+        contentType: "application/x-msdownload",
+      })
+      .expect(400);
+  });
+
+  it("rejects a file that claims an image type but does not decode", async () => {
+    const a = await makeConsumer("a@helloviza.test", "Consumer A");
+
+    const res = await request(app)
+      .post("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .attach("file", Buffer.from("this is not a png"), {
+        filename: "liar.png",
+        contentType: "image/png",
+      })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/could not be read as an image/i);
+  });
+
+  it("rejects an oversized image with 413", async () => {
+    const a = await makeConsumer("a@helloviza.test", "Consumer A");
+
+    // Over the 5MB ceiling. Random bytes so nothing compresses it away.
+    const { randomBytes } = await import("node:crypto");
+    await request(app)
+      .post("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .attach("file", randomBytes(6 * 1024 * 1024), {
+        filename: "huge.png",
+        contentType: "image/png",
+      })
+      .expect(413);
+  });
+
+  it("does NOT create a locker row, and does NOT move completion or readiness", async () => {
+    const a = await makeConsumer("a@helloviza.test", "Consumer A");
+
+    const before = await request(app)
+      .get("/api/consumer/profile")
+      .set("Authorization", a.auth)
+      .expect(200);
+
+    const after = await request(app)
+      .post("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .attach("file", await makeImage(400, 400, "jpeg"), {
+        filename: "me.jpg",
+        contentType: "image/jpeg",
+      })
+      .expect(200);
+
+    // THE POINT OF THE WHOLE SPLIT. An account picture is not a visa
+    // artefact and not a locker file, so neither number may move.
+    expect(after.body.completion.percent).toBe(before.body.completion.percent);
+    expect(after.body.readiness.percent).toBe(before.body.readiness.percent);
+    expect(after.body.readiness.items.find((i: any) => i.key === "photograph").ready).toBe(false);
+
+    // And no ConsumerDocument was created — nothing appears in the locker.
+    expect(await ConsumerDocument.countDocuments({})).toBe(0);
+
+    const docs = await request(app)
+      .get("/api/consumer/profile/documents")
+      .set("Authorization", a.auth)
+      .expect(200);
+    expect(docs.body.documents).toHaveLength(0);
+  });
+
+  it("replaces an existing photo, moving the version token", async () => {
+    const a = await makeConsumer("a@helloviza.test", "Consumer A");
+
+    const first = await request(app)
+      .post("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .attach("file", await makeImage(200, 200), {
+        filename: "one.png",
+        contentType: "image/png",
+      })
+      .expect(200);
+
+    const firstRow: any = await ConsumerProfile.findOne({
+      consumerId: a.consumer._id,
+    }).lean();
+    const firstKey = firstRow.personal.photoStorageKey;
+    expect(firstKey).toBeTruthy();
+
+    const second = await request(app)
+      .post("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .attach("file", await makeImage(240, 240), {
+        filename: "two.png",
+        contentType: "image/png",
+      })
+      .expect(200);
+
+    const secondRow: any = await ConsumerProfile.findOne({
+      consumerId: a.consumer._id,
+    }).lean();
+
+    // A NEW object, so the ?v= token the client hangs on the <img> URL
+    // actually changes and the browser re-fetches.
+    expect(secondRow.personal.photoStorageKey).not.toBe(firstKey);
+    expect(new Date(second.body.profile.photoUpdatedAt).getTime()).toBeGreaterThanOrEqual(
+      new Date(first.body.profile.photoUpdatedAt).getTime(),
+    );
+
+    // Still serves, and still exactly one photo.
+    await request(app)
+      .get("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .expect(200);
+  });
+
+  it("removes the photo and its pointer", async () => {
+    const a = await makeConsumer("a@helloviza.test", "Consumer A");
+
+    await request(app)
+      .post("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .attach("file", await makeImage(150, 150), {
+        filename: "me.png",
+        contentType: "image/png",
+      })
+      .expect(200);
+
+    const removed = await request(app)
+      .delete("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .expect(200);
+
+    expect(removed.body.profile.photoUpdatedAt).toBeNull();
+
+    const row: any = await ConsumerProfile.findOne({ consumerId: a.consumer._id }).lean();
+    expect(row.personal.photoStorageKey).toBeUndefined();
+
+    await request(app)
+      .get("/api/consumer/profile/photo")
+      .set("Authorization", a.auth)
+      .expect(404);
+  });
+});

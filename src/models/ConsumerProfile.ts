@@ -37,6 +37,11 @@
 // `ref` population and the arrayFilters $unset in
 // routes/consumer.profile.ts, and protect nothing that isn't already
 // protected. Recorded here so the next reader does not "fix" the omission.
+//
+// personal.photoStorageKey / photoDriver / photoMimeType / photoUpdatedAt.
+// Same reasoning one step further: a storage LOCATOR for the account
+// avatar, not identity data. The bytes are covered by SSE-S3 at rest, and
+// encrypting the key would break the read-back path that serves them.
 // ══════════════════════════════════════════════════════════════════════
 //
 // ── ISOLATION: ROW-LEVEL ON consumerId ────────────────────────────────
@@ -198,10 +203,56 @@ const PersonalSchema = new Schema(
     nationality: { type: String, trim: true },
     maritalStatus: { type: String, enum: MARITAL_STATUSES },
     countryOfResidence: { type: String, trim: true },
-    // The ACCOUNT avatar. Explicitly not the visa photograph, which has
-    // biometric composition rules this one does not meet — keeping them
-    // separate stops someone submitting a selfie to an embassy.
+    /**
+     * ⚠ UNUSED, AND THE AVATAR DELIBERATELY DOES NOT LIVE HERE.
+     *
+     * This was modelled as a forward hook before the upload existed and
+     * nothing has ever written it. When the upload was built it did NOT
+     * take this path, because a ConsumerDocument row is a LOCKER row: it
+     * is counted by services/consumerProfileCompletion.ts and its docCode
+     * is read by services/consumerVisaReadiness.ts. Storing an avatar as
+     * one would mean uploading a selfie moved a consumer's completion bar
+     * and could satisfy the PHOTO readiness item — an account avatar
+     * silently reporting that the visa photograph requirement is met.
+     *
+     * The avatar is therefore a plain pointer on this section
+     * (photoStorageKey below), owned by nothing but the profile.
+     * Left in place rather than dropped so an existing row carrying one
+     * is not orphaned by a schema removal; delete it once a migration
+     * confirms the field is empty everywhere.
+     */
     photoDocumentId: { type: Schema.Types.ObjectId, ref: "ConsumerDocument" },
+
+    /* ── The ACCOUNT avatar ─────────────────────────────────────────
+     *
+     * Explicitly not the visa photograph, which has biometric
+     * composition rules a selfie does not meet — keeping them separate
+     * is what stops someone submitting one to an embassy. The UI says so
+     * on the tile ("Account photo only"), and the storage split above is
+     * what makes that sentence true rather than decorative.
+     *
+     * NOT ENCRYPTED, and not in ENCRYPTED_PII_FIELDS — the same
+     * reasoning the file header gives for passports[].frontDocumentId:
+     * these are LOCATORS, not identity data. The bytes they point at are
+     * covered by S3 SSE-S3 at rest (utils/s3Upload.ts). Encrypting a
+     * storage key would protect nothing and break the read-back path.
+     *
+     * ── WHY FOUR FIELDS AND NOT ONE ──────────────────────────────────
+     * `openConsumerDocument()` needs BOTH the driver and the key: the
+     * same key means an S3 object in production and a path under
+     * .devdata/ in development, and a row written under one driver must
+     * still be readable when the other is active. models/
+     * ConsumerDocument.ts stores exactly this pair for exactly this
+     * reason. mimeType is stored so the bytes route can set a real
+     * Content-Type instead of guessing from the extension, and
+     * photoUpdatedAt is what lets the client bust the <img> cache when a
+     * consumer replaces their photo — without it the browser keeps
+     * showing the old avatar at an unchanged URL.
+     */
+    photoStorageKey: { type: String, trim: true },
+    photoDriver: { type: String, trim: true },
+    photoMimeType: { type: String, trim: true },
+    photoUpdatedAt: { type: Date },
   },
   { _id: false },
 );

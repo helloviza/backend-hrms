@@ -42,11 +42,14 @@ import { d2cWorkspaceObjectId } from "../services/consumerWorkspace.js";
 import {
   computeProfileCompletion,
 } from "../services/consumerProfileCompletion.js";
+import { computeVisaReadiness } from "../services/consumerVisaReadiness.js";
 import {
   putConsumerDocument,
   openConsumerDocument,
+  deleteConsumerDocumentBytes,
   storageDescription,
 } from "../services/consumerDocumentStorage.js";
+import { processAvatar, AVATAR_MIME } from "../services/consumerAvatar.js";
 
 const router = Router();
 
@@ -102,6 +105,42 @@ function documentUploadMw(req: any, res: any, next: any) {
   });
 }
 
+/* ── Avatar upload config — NARROWER than the document one above ────── */
+
+/**
+ * Images only, and a tenth of the document ceiling.
+ *
+ * A separate multer instance rather than a shared one, because the two
+ * uploads have genuinely different contracts: the locker accepts a 15MB
+ * PDF because a passport scan is one, and an avatar that arrives as a PDF
+ * is a mistake worth rejecting at the door. Sharing the config would mean
+ * the tighter rule could only ever be enforced after the bytes were
+ * already buffered.
+ */
+export const CONSUMER_PHOTO_ALLOWED_MIME = ["image/png", "image/jpeg", "image/webp"];
+export const CONSUMER_PHOTO_MAX_BYTES = 5 * 1024 * 1024;
+
+const photoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: CONSUMER_PHOTO_MAX_BYTES },
+  fileFilter: (_req, file, cb) => {
+    if (CONSUMER_PHOTO_ALLOWED_MIME.includes(file.mimetype)) return cb(null, true);
+    cb(new Error("Only PNG, JPEG, or WEBP images are allowed."));
+  },
+});
+
+function photoUploadMw(req: any, res: any, next: any) {
+  photoUpload.single("file")(req, res, (err: any) => {
+    if (!err) return next();
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        error: `Image too large. Maximum size is ${CONSUMER_PHOTO_MAX_BYTES / (1024 * 1024)}MB.`,
+      });
+    }
+    return res.status(400).json({ error: err?.message || "Upload failed" });
+  });
+}
+
 /* ── Loading ────────────────────────────────────────────────────────── */
 
 /**
@@ -122,11 +161,31 @@ async function loadOwnProfile(consumerId: string) {
   );
 }
 
-async function liveDocumentCount(consumerId: string): Promise<number> {
-  return ConsumerDocument.countDocuments({
+/**
+ * The caller's live locker rows, projected to the ONE field the readers
+ * below need.
+ *
+ * This replaced a countDocuments(): completion wants the count and
+ * readiness wants the docCodes, and issuing two queries for two views of
+ * the same rows is how they end up disagreeing — a document deleted
+ * between them would leave a response whose count and whose code set
+ * describe different lockers. One read, both answers.
+ *
+ * `find().select()`, deliberately NOT `.distinct("docCode")`. Nothing on
+ * ConsumerDocument is encrypted today, so distinct would work — but
+ * plugins/fieldEncryption.plugin.ts states plainly that distinct() and
+ * aggregate() bypass its post('find') decryption entirely and return
+ * envelopes. Using the one query shape that IS hooked means a future
+ * `PII: encrypted at rest` marker on this collection cannot silently turn
+ * this line into a ciphertext leak.
+ */
+async function liveDocuments(consumerId: string): Promise<Array<{ docCode?: string | null }>> {
+  return ConsumerDocument.find({
     consumerId: new mongoose.Types.ObjectId(consumerId),
     deletedAt: null,
-  });
+  })
+    .select("docCode")
+    .lean();
 }
 
 /* ── Wire shapes — whitelists, not blocklists ──────────────────────── */
@@ -149,7 +208,34 @@ function publicDocument(d: any) {
   };
 }
 
-function publicProfile(doc: any, consumer: { email: string; name: string }) {
+/**
+ * The `personal` section minus its storage internals.
+ *
+ * A DENYLIST here rather than the whitelist this file prefers everywhere
+ * else, and the exception is deliberate: `personal` is a progressive
+ * section whose field list grows, and a whitelist would mean every new
+ * personal field silently failing to reach the client until someone
+ * remembered this function. The fields being removed are a closed set —
+ * the storage locators — and they are named in one place.
+ */
+const PERSONAL_INTERNAL_FIELDS = [
+  "photoStorageKey",
+  "photoDriver",
+  "photoMimeType",
+  "photoUpdatedAt",
+  "photoDocumentId",
+];
+
+function publicPersonal(personal: any): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...(personal ?? {}) };
+  for (const key of PERSONAL_INTERNAL_FIELDS) delete out[key];
+  return out;
+}
+
+function publicProfile(
+  doc: any,
+  consumer: { email: string; name: string; createdAt?: Date },
+) {
   /* ── NEVER SPREAD A MONGOOSE DOCUMENT ─────────────────────────────
    *
    * `{ ...subdoc }` does NOT copy a Mongoose subdocument's fields. The
@@ -174,7 +260,24 @@ function publicProfile(doc: any, consumer: { email: string; name: string }) {
     // Echoed so the client never has to hold a consumer id to make a call.
     consumerId: String(p.consumerId),
     workspaceId: String(p.workspaceId),
-    personal: p.personal ?? {},
+    /* ── THE AVATAR: A FLAG AND A VERSION, NEVER THE STORAGE KEY ─────
+     *
+     * `personal` is published wholesale below, so the four photo* fields
+     * would ride along with it — and one of them is a storage key. That
+     * is the exact thing publicDocument() above strips for documents,
+     * and for the same reason: a key is an internal locator, publishing
+     * it invites clients to build their own URLs and leaks the bucket
+     * layout. So `personal` is filtered here rather than spread.
+     *
+     * What replaces it is what a client actually needs: whether there IS
+     * a photo, and a version token to hang on the <img> URL so replacing
+     * one is visible immediately instead of after a cache expiry. The
+     * URL itself is assembled client-side against its own API base — the
+     * same shape as documentFileUrl() on the frontend, and the reason is
+     * that this server does not know the public origin the browser is
+     * talking to. */
+    personal: publicPersonal(p.personal),
+    photoUpdatedAt: p.personal?.photoStorageKey ? (p.personal.photoUpdatedAt ?? null) : null,
     passports: (p.passports ?? []).map((pp: any) => ({
       id: String(pp._id),
       number: pp.number ?? null,
@@ -206,6 +309,24 @@ function publicProfile(doc: any, consumer: { email: string; name: string }) {
       nationality: c.nationality ?? null,
     })),
     accountPrefs: p.accountPrefs ?? {},
+    /**
+     * "Member since" — Consumer.createdAt, NOT this profile's timestamps.
+     *
+     * The banner used to derive it from `updatedAt` below, which made it
+     * read "member since your last save": editing your marital status
+     * moved the date you joined. That was tolerable while the banner sat
+     * on one page; it is now on every account page, so the wrong fact
+     * would be wrong seven times.
+     *
+     * It comes from the CONSUMER because that is the row that records
+     * joining — a ConsumerProfile is upserted lazily on first read
+     * (loadOwnProfile), so even its own createdAt would mean "when you
+     * first opened the profile page", not "when you signed up".
+     *
+     * Null when absent, and every reader renders nothing rather than
+     * falling back — no date is honest, the wrong date is not.
+     */
+    memberSince: consumer.createdAt ?? null,
     updatedAt: p.updatedAt,
   };
 }
@@ -267,12 +388,26 @@ router.get("/", async (req: any, res: any) => {
   try {
     const consumerId = me(req);
     const profile = await loadOwnProfile(consumerId);
-    const documentCount = await liveDocumentCount(consumerId);
+    const documents = await liveDocuments(consumerId);
 
     return res.json({
       ok: true,
       profile: publicProfile(profile, req.consumer),
-      completion: computeProfileCompletion(profile as any, documentCount),
+      completion: computeProfileCompletion(profile as any, documents.length),
+      /* ── READINESS, ALONGSIDE COMPLETION — NOT INSTEAD OF IT ────────
+       * Two different questions about the same profile, answered in one
+       * round trip because every screen that wants one tends to want the
+       * other. services/consumerVisaReadiness.ts opens by explaining why
+       * they are not the same number and must not be presented as one:
+       * completion measures the FORM, readiness measures the ARTEFACTS a
+       * mission asks for, and a 100%-complete profile can sit at 4/6.
+       *
+       * Computed on read, never stored — the same argument completion's
+       * own header makes, and it applies harder here: readiness also
+       * moves with the CALENDAR (a passport crosses the six-month line
+       * without anybody writing anything), so a stored value would go
+       * stale with no write path to hang a recompute on. */
+      readiness: computeVisaReadiness(profile as any, documents),
       storage: storageDescription(),
     });
   } catch (err: any) {
@@ -287,10 +422,13 @@ router.get("/completion", async (req: any, res: any) => {
   try {
     const consumerId = me(req);
     const profile = await loadOwnProfile(consumerId);
-    const documentCount = await liveDocumentCount(consumerId);
+    const documents = await liveDocuments(consumerId);
+    /* Completion ALONE, deliberately. This endpoint exists for the profile
+     * page's progress panel and its contract is unchanged; the dashboard
+     * wants the profile anyway and reads both off GET / above. */
     return res.json({
       ok: true,
-      completion: computeProfileCompletion(profile as any, documentCount),
+      completion: computeProfileCompletion(profile as any, documents.length),
     });
   } catch (err: any) {
     console.error("[consumer profile completion]", err?.message);
@@ -349,16 +487,222 @@ router.patch("/:section", async (req: any, res: any) => {
     }
 
     await profile.save();
-    const documentCount = await liveDocumentCount(consumerId);
+    const documents = await liveDocuments(consumerId);
 
+    /* Readiness rides along here too, and not merely for symmetry with
+     * GET /: PATCH "personal" and PATCH "travel" are the two writes that
+     * MOVE readiness (its Personal Details and Travel History items read
+     * exactly those sections). A response that refreshed the completion
+     * bar and left the readiness gauge on a pre-save value would be this
+     * endpoint handing a client two views of one profile that disagree —
+     * and the client has no way to tell which one is current. */
     return res.json({
       ok: true,
       profile: publicProfile(profile, req.consumer),
-      completion: computeProfileCompletion(profile as any, documentCount),
+      completion: computeProfileCompletion(profile as any, documents.length),
+      readiness: computeVisaReadiness(profile as any, documents),
     });
   } catch (err: any) {
     console.error("[consumer profile PATCH]", err?.message);
     return res.status(500).json({ error: "Failed to update profile" });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+ * PROFILE PHOTO — the ACCOUNT avatar
+ * ══════════════════════════════════════════════════════════════════════
+ *
+ * ── WHY THIS IS NOT A DOCUMENT UPLOAD WITH A DIFFERENT CATEGORY ──────
+ * It would have been three lines: POST /documents with category IDENTITY
+ * and docCode PHOTO, then point the profile at the row. That is exactly
+ * the version that must not be built.
+ *
+ * A ConsumerDocument is a LOCKER row. It is counted by
+ * services/consumerProfileCompletion.ts, its docCode is read by
+ * services/consumerVisaReadiness.ts, and it can be attached to a visa
+ * application. Routing an avatar through it means uploading a selfie
+ * nudges the completion bar, and — with the docCode the category implies
+ * — satisfies the PHOTOGRAPH readiness item. A consumer would be told
+ * they are ready to apply because they set an account picture.
+ *
+ * So the avatar shares the BYTE STORE and nothing else: the same
+ * putConsumerDocument() helper writes it (same bucket, same SSE-S3, same
+ * per-consumer key prefix, no second S3 client), while the pointer lives
+ * on the profile itself. No row, no docCode, no category, no readiness.
+ *
+ * ── AND IT IS STILL NOT A VISA PHOTOGRAPH ────────────────────────────
+ * services/consumerAvatar.ts opens by saying so at length. The UI says
+ * it too, on the tile. This split is what makes that sentence true.
+ */
+
+/** The standard profile response body, shared by every write in this file. */
+async function profileResponseBody(profile: any, consumerId: string, req: any) {
+  const documents = await liveDocuments(consumerId);
+  return {
+    ok: true as const,
+    profile: publicProfile(profile, req.consumer),
+    /* Both recomputed, and both deliberately UNMOVED by a photo — the
+     * assertion is in consumer.profile.test.ts. Completion reads four
+     * personal fields (none of them the photo) and readiness reads
+     * locker docCodes (the avatar has no row), so these are here for
+     * response-shape symmetry with PATCH, not because a photo changes
+     * them. If a future edit ever makes one of them move, that test
+     * fails, which is the point of asserting a non-event. */
+    completion: computeProfileCompletion(profile as any, documents.length),
+    readiness: computeVisaReadiness(profile as any, documents),
+  };
+}
+
+/**
+ * Best-effort removal of the bytes an avatar USED to point at.
+ *
+ * Never throws. A consumer replacing their photo must not see the upload
+ * fail because the previous object was already gone from the bucket — the
+ * new photo is saved either way, and an orphaned object is a cleanup
+ * problem, not a user-facing one.
+ */
+async function discardPreviousAvatar(personal: any): Promise<void> {
+  const key = personal?.photoStorageKey;
+  const driver = personal?.photoDriver;
+  if (!key || !driver) return;
+  try {
+    await deleteConsumerDocumentBytes({ driver, storageKey: key });
+  } catch (err: any) {
+    console.warn("[consumer photo] could not remove previous avatar bytes:", err?.message);
+  }
+}
+
+router.post("/photo", photoUploadMw, async (req: any, res: any) => {
+  try {
+    const consumerId = me(req);
+    const file = req.file;
+    if (!file || !file.buffer) {
+      return res.status(400).json({ error: "An image file is required" });
+    }
+
+    /* Squared and re-encoded BEFORE anything is stored, so what lands in
+     * the bucket is the only thing that was ever there — no original,
+     * full-resolution, EXIF-bearing copy sitting beside it. */
+    let processed: Buffer;
+    try {
+      processed = await processAvatar(file.buffer);
+    } catch (err: any) {
+      if (err?.name === "AvatarProcessingError") {
+        return res.status(400).json({ error: err.message });
+      }
+      throw err;
+    }
+
+    const profile: any = await loadOwnProfile(consumerId);
+    const previous = {
+      photoStorageKey: profile.personal?.photoStorageKey,
+      photoDriver: profile.personal?.photoDriver,
+    };
+
+    // The SAME helper the locker uses — same bucket, same SSE-S3, same
+    // per-consumer key path. The only difference is that no
+    // ConsumerDocument row is created for it.
+    const stored = await putConsumerDocument({
+      buffer: processed,
+      mime: AVATAR_MIME,
+      originalName: "avatar.webp",
+      consumerId,
+    });
+
+    profile.personal.photoStorageKey = stored.storageKey;
+    profile.personal.photoDriver = stored.driver;
+    profile.personal.photoMimeType = AVATAR_MIME;
+    profile.personal.photoUpdatedAt = new Date();
+    await profile.save();
+
+    // Only after the new pointer is durably saved. Reversing these two
+    // would mean a failed save left the profile pointing at bytes that
+    // had already been deleted.
+    await discardPreviousAvatar(previous);
+
+    return res.json(await profileResponseBody(profile, consumerId, req));
+  } catch (err: any) {
+    console.error("[consumer photo POST]", err?.message);
+    return res.status(500).json({ error: "Failed to upload photo" });
+  }
+});
+
+/**
+ * The bytes.
+ *
+ * Streamed through this handler for the reason the document file route
+ * gives: a presigned URL is a bearer credential that outlives the session
+ * and can be forwarded. Own-scoped for free — there is no id in the path,
+ * so this route can only ever serve the CALLER's own avatar. There is no
+ * shape of request that reaches somebody else's.
+ */
+router.get("/photo", async (req: any, res: any) => {
+  try {
+    const consumerId = me(req);
+    const profile: any = await loadOwnProfile(consumerId);
+    const personal = profile.personal ?? {};
+
+    if (!personal.photoStorageKey || !personal.photoDriver) {
+      return res.status(404).json({ error: "No profile photo" });
+    }
+
+    const stream = await openConsumerDocument({
+      driver: personal.photoDriver,
+      storageKey: personal.photoStorageKey,
+    });
+
+    res.setHeader("Content-Type", personal.photoMimeType || AVATAR_MIME);
+    res.setHeader("Content-Disposition", 'inline; filename="avatar.webp"');
+    /* `private` so no shared cache holds one consumer's face, but NOT
+     * `no-store`: unlike a passport scan this image is re-fetched on
+     * every page paint, and the URL already carries a ?v= version token
+     * that changes on replacement. A short private max-age therefore
+     * cannot serve a stale avatar — the URL is different once it moves. */
+    res.setHeader("Cache-Control", "private, max-age=300");
+
+    stream.on("error", (streamErr: any) => {
+      console.error("[consumer photo stream]", streamErr?.message);
+      if (!res.headersSent) res.status(500).json({ error: "Failed to read photo" });
+      else res.end();
+    });
+    stream.pipe(res);
+  } catch (err: any) {
+    console.error("[consumer photo GET]", err?.message);
+    return res.status(500).json({ error: "Failed to read photo" });
+  }
+});
+
+/**
+ * Remove it.
+ *
+ * A HARD delete, and the contrast with DELETE /documents/:id — which is a
+ * soft delete — is the point. A locker document is soft-deleted because a
+ * visa application may reference it and erasing it would break that case
+ * retroactively. An avatar is referenced by nothing: it is one pointer on
+ * one profile. So "remove my photo" can mean what it says, and the bytes
+ * go with it.
+ */
+router.delete("/photo", async (req: any, res: any) => {
+  try {
+    const consumerId = me(req);
+    const profile: any = await loadOwnProfile(consumerId);
+    const previous = {
+      photoStorageKey: profile.personal?.photoStorageKey,
+      photoDriver: profile.personal?.photoDriver,
+    };
+
+    profile.personal.photoStorageKey = undefined;
+    profile.personal.photoDriver = undefined;
+    profile.personal.photoMimeType = undefined;
+    profile.personal.photoUpdatedAt = undefined;
+    await profile.save();
+
+    await discardPreviousAvatar(previous);
+
+    return res.json(await profileResponseBody(profile, consumerId, req));
+  } catch (err: any) {
+    console.error("[consumer photo DELETE]", err?.message);
+    return res.status(500).json({ error: "Failed to remove photo" });
   }
 });
 
