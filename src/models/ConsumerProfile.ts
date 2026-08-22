@@ -64,6 +64,7 @@
 // store, reused, never copied.
 import mongoose, { Schema, type Document, type Model } from "mongoose";
 import { fieldEncryptionPlugin } from "../plugins/fieldEncryption.plugin.js";
+import { emptyEnumToUnsetPlugin } from "../plugins/emptyEnumToUnset.plugin.js";
 
 /* ── Enums ──────────────────────────────────────────────────────────── */
 
@@ -434,6 +435,21 @@ export const ENCRYPTED_PII_FIELDS = [
  * of birth encrypt under the owning consumer's key, so erasing the consumer
  * erases them too — which is the intended outcome.
  */
+/* ── "" ON AN ENUM MEANS UNSET ────────────────────────────────────────
+ *
+ * Five optional enums on this schema — personal.gender,
+ * personal.maritalStatus, travel.employmentType,
+ * travelPreferences.cabinClass and travelPreferences.seatPreference — are
+ * fed by controls that submit `""` for "nothing chosen". Mongoose
+ * validates `""` against the enum (it only skips undefined/null), so
+ * without this every one of them turned an ordinary profile save into a
+ * 500. See the plugin's header for the two paths that hit it in practice.
+ *
+ * passports[].type is deliberately NOT covered: it declares
+ * `default: "ORDINARY"`, and the plugin leaves any path the schema says
+ * always holds a value. */
+ConsumerProfileSchema.plugin(emptyEnumToUnsetPlugin);
+
 ConsumerProfileSchema.plugin(fieldEncryptionPlugin, {
   fields: ENCRYPTED_PII_FIELDS,
   subject: (doc: any) =>
