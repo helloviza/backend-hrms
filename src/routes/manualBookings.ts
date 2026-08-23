@@ -7,7 +7,7 @@ import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
-import ManualBooking from "../models/ManualBooking.js";
+import ManualBooking, { ATTACHMENT_REQUIRED_TYPES } from "../models/ManualBooking.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import Customer from "../models/Customer.js";
@@ -23,6 +23,10 @@ import { presignGetObject } from "../utils/s3Presign.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 import { resolveActorFromRequest } from "../services/location.service.js";
+import { maskTailId } from "../utils/piiMask.js";
+import ExtractedDocument from "../models/ExtractedDocument.js";
+import { enqueueExtraction } from "../services/documentExtraction.service.js";
+import type { VoucherType } from "../types/index.js";
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -61,6 +65,15 @@ function bookingAccessContextFromReq(req: any) {
     permissionScope: req.permissionScope,
     isSuperAdmin: isSuperAdmin(req),
   };
+}
+
+// Best-guess document type for the extractor, from the booking's own service
+// type. Only a starting hint — extractDocument() overrides it with the model's
+// detected_type when the two disagree, so an attachment that doesn't match its
+// booking's type (a hotel voucher filed on a flight booking) still extracts
+// correctly.
+function bookingTypeToVoucherHint(bookingType?: string): VoucherType {
+  return bookingType === "HOTEL" || bookingType === "DUMMY_HOTEL" ? "hotel" : "flight";
 }
 
 function buildSearchFilter(query: Record<string, any>) {
@@ -126,7 +139,7 @@ async function applyInvoiceFilter(filter: Record<string, any>, invoiceNo: string
   }
 }
 
-function invoicePendingDays(b: any): number {
+export function invoicePendingDays(b: any): number {
   if (!b.invoiceRaisedDate) return 0;
   if (b.status === "PAID" || b.status === "CANCELLED") return 0;
   return Math.floor(
@@ -141,6 +154,8 @@ function invoicePendingDays(b: any): number {
  *   - givenBy      : required for every type (form + create/update API only)
  *   - City         : required for HOTEL/DUMMY_HOTEL (sector OR itinerary.destination)
  *   - returnDate   : required for HOTEL/DUMMY_HOTEL (check-out)
+ *   - attachments  : >=1 for ATTACHMENT_REQUIRED_TYPES, CREATE only, and only
+ *                    when the payload carries the array (see the rule itself)
  * Import paths (Excel /import, SBT import) carry no givenBy and SBT flights
  * carry no return date, so imports enforce the reduced set (supplier + city).
  */
@@ -153,7 +168,8 @@ function hotelCityPresent(b: any): boolean {
   );
 }
 
-// Full rule set — used by the form-driven create/update API.
+// Full rule set — used by the form-driven CREATE API only (updates go through
+// validateBookingRequiredForUpdate below).
 function validateBookingRequired(b: any): string[] {
   const errors: string[] = [];
   const type = String(b?.type ?? "").toUpperCase();
@@ -162,6 +178,20 @@ function validateBookingRequired(b: any): string[] {
   if (HOTEL_TYPES.includes(type)) {
     if (!hotelCityPresent(b)) errors.push("City is required for hotel bookings");
     if (!b?.returnDate) errors.push("Check-out (return) date is required for hotel bookings");
+  }
+  // Attachment rule — Flight Service + Hotel Type. Scoped to a payload that
+  // ACTUALLY CARRIES the attachment set, which is the only point in a create
+  // where attachments[] is knowable: the form (and every caller today) creates
+  // the booking first and POSTs each file to /:id/attachments afterwards, so
+  // an unconditional "attachments must be non-empty" here would reject every
+  // legitimate flight and hotel create rather than the ones missing a ticket.
+  // See the sequencing note above the POST / handler.
+  if (
+    ATTACHMENT_REQUIRED_TYPES.includes(type as any) &&
+    Array.isArray(b?.attachments) &&
+    b.attachments.length === 0
+  ) {
+    errors.push("At least one attachment is required for flight and hotel bookings");
   }
   return errors;
 }
@@ -286,8 +316,22 @@ const BOOKING_COLUMNS = [
 // (shifted +2 by the "Booking Date" (pos 2) and "Ref No." (pos 3) columns)
 const MONEY_COLS = [17, 18, 19, 20, 21, 22];
 
+// Mask passport/PAN to last-4 for the admin list view — full plaintext stays
+// available on the single-booking detail read (staff need it to service the
+// booking) and to SUPERADMIN, but the list/export surface should never hand
+// out full numbers to every manualBookings:READ holder. maskTailId itself
+// lives in utils/piiMask.ts, shared with TravellerProfile's export route.
+function maskPassengerPII(passengers: any[] | undefined): any[] | undefined {
+  if (!Array.isArray(passengers)) return passengers;
+  return passengers.map((p: any) => ({
+    ...p,
+    panNo: maskTailId(p?.panNo),
+    passportNo: maskTailId(p?.passportNo),
+  }));
+}
+
 // One flat cell per booking — see the "Line Items" column comment above.
-function formatLineItems(b: any): string {
+export function formatLineItems(b: any): string {
   const items: any[] = Array.isArray(b.lineItems) ? b.lineItems : [];
   if (!items.length) return "";
   return items
@@ -428,6 +472,17 @@ async function resolveBookedFromCity(req: any) {
 /* ── CRUD ────────────────────────────────────────────────────────── */
 
 // POST /api/admin/manual-bookings
+//
+// CREATE/ATTACH SEQUENCING — why the attachment rule in
+// validateBookingRequired() is conditional rather than absolute:
+// attachments[] is EMPTY for every booking at this point, always. Files can
+// only be posted to /:id/attachments, which needs an id, so the id has to
+// exist first. ManualBookingForm.tsx stages the files in the browser, calls
+// this route, then uploads them one-per-request in the same Save click.
+// A blanket "reject when attachments[] is empty" here would therefore fail
+// 100% of legitimate flight/hotel creates and 0% of the ones it is meant to
+// catch. The real gate for the staged flow is validate() in that form; this
+// route guards the case a payload does define its own attachments.
 router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, res: any) => {
   try {
     const vErrors = validateBookingRequired(req.body);
@@ -593,6 +648,11 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
       ...b,
       clientName: clientNameMap[b.workspaceId?.toString()] || "",
       invoicePendingDays: invoicePendingDays(b),
+      // panNo/passportNo masked to last-4 unless the caller is SUPERADMIN —
+      // this list is reachable by any manualBookings:READ holder, not just
+      // the staff actually servicing the booking (see docs/audits/
+      // traveller-profiles-scoping.md §4.2).
+      passengers: accessCtx.isSuperAdmin ? b.passengers : maskPassengerPII(b.passengers),
     }));
 
     console.log('[manualBookings GET] enriched[0].clientName:', enriched?.[0]?.clientName);
@@ -1386,6 +1446,10 @@ router.get("/:id", requirePermission("manualBookings", "READ"), async (req: any,
       return res.status(403).json({ success: false, message: "Not found" });
     }
 
+    // NOT masked here, unlike the list view — ManualBookingForm.tsx prefills
+    // its edit form straight from this response (line ~433) and PUTs the
+    // passengers array back unchanged for untouched fields; masking would
+    // silently overwrite real passport/PAN numbers with "****1234" on save.
     res.json({ ok: true, booking: { ...booking, invoicePendingDays: invoicePendingDays(booking) } });
   } catch (err: any) {
     console.error("[ManualBookings GET one]", err.message);
@@ -1612,6 +1676,27 @@ router.post(
 
       const created = booking.attachments[booking.attachments.length - 1];
       res.status(201).json({ ok: true, attachment: created });
+
+      // Queue AI extraction for PDFs/images. Deliberately AFTER the response
+      // and not awaited: the request path must stay a pure upload, and this is
+      // one small indexed insert whose outcome the client has no use for. The
+      // extractor itself is never called here — the sweep worker owns that.
+      // enqueueExtraction() no-ops on non-extractable types and is idempotent
+      // on the S3 key, so a retry can never double-queue a file.
+      enqueueExtraction({
+        sourceModule: "manualBookings",
+        sourceId: booking._id,
+        bookingId: booking._id,
+        workspaceId: booking.workspaceId,
+        attachmentId: created?._id,
+        attachmentRef: uploaded.key,
+        originalFilename: file.originalname,
+        mimeType: file.mimetype,
+        size: file.size,
+        typeHint: bookingTypeToVoucherHint(booking.type),
+      }).catch((e: any) =>
+        console.error("[ManualBookings ATTACHMENTS enqueue extraction]", e?.message),
+      );
     } catch (err: any) {
       console.error("[ManualBookings ATTACHMENTS upload]", err.message);
       res.status(500).json({ error: err.message });
@@ -1712,6 +1797,147 @@ router.delete(
       res.json({ ok: true });
     } catch (err: any) {
       console.error("[ManualBookings ATTACHMENTS delete]", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+/* ── Extracted documents (AI ticket extraction) ─────────────────────
+ * Read/review surface over the ExtractedDocument master table for one
+ * booking. Same two-tier gate as the attachment routes above:
+ * requirePermission() for the module, then canAccessBooking() per record —
+ * and every query is additionally pinned to the booking's own workspaceId so
+ * a row can never be read or written across tenants.
+ *
+ * Extraction itself is not triggered from here; the sweep worker owns it
+ * (workers/documentExtractionWorker.ts). Review is not a gate: rows are
+ * stored and served whatever `verified` says.
+ * ──────────────────────────────────────────────────────────────────── */
+
+// GET /api/admin/manual-bookings/:id/extracted-documents
+router.get(
+  "/:id/extracted-documents",
+  requirePermission("manualBookings", "READ"),
+  async (req: any, res: any) => {
+    try {
+      const booking: any = await ManualBooking.findById(req.params.id)
+        .select("workspaceId createdBy assignPerson assignmentStatus type")
+        .lean();
+      if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "READ")) {
+        return res.status(403).json({ success: false, message: "Not found" });
+      }
+
+      const docs = await ExtractedDocument.find({
+        bookingId: booking._id,
+        workspaceId: booking.workspaceId,
+      })
+        // extractedJson is the full voucher and can be large; the review table
+        // renders flightRows, so keep it off the list payload.
+        .select("-extractedJson")
+        .sort({ createdAt: 1 })
+        .lean();
+
+      res.json({ ok: true, documents: docs });
+    } catch (err: any) {
+      console.error("[ManualBookings EXTRACTED list]", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// PATCH /api/admin/manual-bookings/:id/extracted-documents/:docId
+// Inline review edits: corrected flightRows and/or the verified flag.
+router.patch(
+  "/:id/extracted-documents/:docId",
+  requirePermission("manualBookings", "WRITE"),
+  async (req: any, res: any) => {
+    try {
+      const booking: any = await ManualBooking.findById(req.params.id)
+        .select("workspaceId createdBy assignPerson assignmentStatus")
+        .lean();
+      if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+        return res.status(403).json({ success: false, message: "Not found" });
+      }
+
+      const doc: any = await ExtractedDocument.findOne({
+        _id: req.params.docId,
+        bookingId: booking._id,
+        workspaceId: booking.workspaceId,
+      });
+      if (!doc) return res.status(404).json({ error: "Extracted document not found" });
+
+      // Only these two are writable. extractedJson stays exactly as the
+      // extractor produced it — it is the audit trail of what the model
+      // actually said, and operator corrections belong in flightRows.
+      if (Array.isArray(req.body?.flightRows)) {
+        doc.flightRows = req.body.flightRows.map((r: any, i: number) => ({
+          ...r,
+          passengerIndex: Number.isFinite(r?.passengerIndex) ? r.passengerIndex : i,
+          segmentIndex: Number.isFinite(r?.segmentIndex) ? r.segmentIndex : 0,
+        }));
+      }
+
+      if (typeof req.body?.verified === "boolean") {
+        doc.verified = req.body.verified;
+        doc.verifiedBy = req.body.verified ? req.user._id : undefined;
+        doc.verifiedAt = req.body.verified ? new Date() : undefined;
+      }
+
+      await doc.save();
+      res.json({ ok: true, document: doc.toObject() });
+    } catch (err: any) {
+      console.error("[ManualBookings EXTRACTED patch]", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// POST /api/admin/manual-bookings/:id/extracted-documents/:docId/retry
+// Put a failed row back in the queue with a fresh attempt budget. The worker
+// picks it up on its next sweep; nothing runs inline here.
+router.post(
+  "/:id/extracted-documents/:docId/retry",
+  requirePermission("manualBookings", "WRITE"),
+  async (req: any, res: any) => {
+    try {
+      const booking: any = await ManualBooking.findById(req.params.id)
+        .select("workspaceId createdBy assignPerson assignmentStatus")
+        .lean();
+      if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+        return res.status(403).json({ success: false, message: "Not found" });
+      }
+
+      const doc: any = await ExtractedDocument.findOne({
+        _id: req.params.docId,
+        bookingId: booking._id,
+        workspaceId: booking.workspaceId,
+      });
+      if (!doc) return res.status(404).json({ error: "Extracted document not found" });
+
+      // `skipped` is terminal by design (the file is too large to ever send),
+      // so retrying it would just re-park it every sweep.
+      if (doc.status !== "failed") {
+        return res.status(409).json({ error: `Only failed documents can be retried (this one is ${doc.status}).` });
+      }
+
+      doc.status = "pending";
+      doc.attempts = 0;
+      doc.claimedAt = null;
+      // Clear any backoff left over from the failure run, so a human-triggered
+      // retry is picked up by the next sweep rather than waiting one out.
+      doc.nextAttemptAt = new Date();
+      doc.error = undefined;
+      await doc.save();
+
+      res.json({ ok: true, document: doc.toObject() });
+    } catch (err: any) {
+      console.error("[ManualBookings EXTRACTED retry]", err.message);
       res.status(500).json({ error: err.message });
     }
   },

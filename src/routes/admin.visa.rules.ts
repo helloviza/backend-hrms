@@ -37,8 +37,13 @@ import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
-import { MIN_HERO_CONTRAST } from "../utils/heroImageContrast.js";
+// The threshold only — from the sharp-free constants module, NOT from
+// heroImageContrast.js. This router is imported by server.ts at module
+// load, so anything it pulls in is on the boot path.
+import { MIN_HERO_CONTRAST } from "../utils/heroImageContrastConstants.js";
 import { getCountryByIso2 } from "../utils/countryCodes.js";
+import { VISA_DOCUMENT_TYPE_CATALOGUE } from "../config/visaDocumentTypeCatalogue.js";
+import { matchDocumentType, suggestDocumentTypes } from "../utils/visaChecklistCatalogueMatcher.js";
 import { triggerAutoFetchForDestination } from "../services/visaDestinationImageService.js";
 import VisaRule, {
   VISA_PURPOSES,
@@ -391,6 +396,89 @@ export async function writeRuleAudit(
   if (opts.clonedFromRuleId) doc.clonedFromRuleId = opts.clonedFromRuleId;
   await VisaRuleAudit.create([doc], opts.session ? { session: opts.session } : undefined);
 }
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /document-catalogue — the whole document-type catalogue.
+ *
+ * Until now the catalogue existed only as a backend constant. The console
+ * rendered document names from its OWN hardcoded DOC_CODE_LABELS map,
+ * which carries 10 of the catalogue's 54 codes and is duplicated verbatim
+ * in VisaRulesConsole.tsx and VisaConciergeConsole.tsx — so 44 real
+ * document types could not be named, let alone chosen, in the UI. This is
+ * the source both consoles should read instead. (Those two maps are now
+ * obsolete but deliberately still in place; removing them is a UI-stage
+ * change, not this one.)
+ *
+ * Returns the full list unpaginated: it is 54 rows of static reference
+ * data that changes when someone edits a source file, so a picker should
+ * fetch it once and filter client-side rather than round-trip per
+ * keystroke. `legacyCode` is included because stored data still holds old
+ * DOC-NN values in places (see the catalogue file's own header) and a UI
+ * showing both is how anyone reconciles the two.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/document-catalogue", requirePermission("visaApplication", "FULL"), async (_req: any, res: any) => {
+  try {
+    res.json({
+      ok: true,
+      count: VISA_DOCUMENT_TYPE_CATALOGUE.length,
+      documentTypes: VISA_DOCUMENT_TYPE_CATALOGUE.map((d) => ({
+        code: d.code,
+        name: d.name,
+        category: d.category,
+        defaultDescription: d.defaultDescription ?? null,
+        aliases: d.aliases ?? [],
+        legacyCode: (d as any).legacyCode ?? null,
+        ocrExtractable: !!d.ocrExtractable,
+      })),
+    });
+  } catch (err: any) {
+    console.error("[admin visa document-catalogue GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load the document catalogue" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /document-catalogue/suggest?q=…&limit=… — ranked near-matches for a
+ * free-text document name, for the as-you-type suggestions behind
+ * in-console document entry.
+ *
+ * Two DIFFERENT answers, deliberately kept apart rather than merged into
+ * one "best guess":
+ *
+ *   exactMatch  — matchDocumentType(): exact, after normalisation, against
+ *                 a code/name/alias. Null unless it is genuinely that
+ *                 document. This is the only result safe to auto-apply.
+ *   suggestions — suggestDocumentTypes(): token-overlap ranked, explicitly
+ *                 fuzzy. Offer these; never auto-select one.
+ *
+ * The distinction is the whole point of the "explicit save-as-unmatched"
+ * design: ops sees what the system is CERTAIN of separately from what it
+ * is guessing, so choosing to store an unmatched document is a decision
+ * someone made rather than a silent consequence of a weak match. The
+ * default limit is raised from suggestDocumentTypes' own 2 because a
+ * picker wants a shortlist to choose from, not the matcher's top pair.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/document-catalogue/suggest", requirePermission("visaApplication", "FULL"), async (req: any, res: any) => {
+  try {
+    const q = String(req.query.q ?? "").trim();
+    if (!q) return res.status(400).json({ error: "q is required — pass the free-text document name to match" });
+
+    const rawLimit = Number(req.query.limit);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 25) : 8;
+
+    const exact = matchDocumentType(q);
+
+    res.json({
+      ok: true,
+      query: q,
+      exactMatch: exact ? { code: exact.code, name: exact.name } : null,
+      suggestions: suggestDocumentTypes(q, limit),
+    });
+  } catch (err: any) {
+    console.error("[admin visa document-catalogue suggest GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to suggest document types" });
+  }
+});
 
 /* ─────────────────────────────────────────────────────────────────────
  * GET /rules — filter by destination, purpose, status. No pagination —
@@ -911,6 +999,66 @@ router.post("/rules/:id/retire", requirePermission("visaApplication", "FULL"), a
   } catch (err: any) {
     console.error("[admin visa rule retire POST]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to retire visa rule" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /rules/:id/unretire — RETIRED -> DRAFT only. The way back from
+ * Retire.
+ *
+ * Before this existed RETIRED was a terminal state: publish rejects
+ * anything that is not DRAFT, PATCH refuses to write `status` at all, and
+ * the spreadsheet import never reads status from the file. Nothing in the
+ * API could move a rule out of RETIRED, so a misclicked Retire was
+ * unrecoverable without a direct database write.
+ *
+ * ── WHY DRAFT AND NOT STRAIGHT BACK TO PUBLISHED ──────────────────────
+ *
+ * A rule can sit retired for any length of time, and the most likely
+ * reason it was retired is that something REPLACED it — publish's own
+ * conflict check tells ops to "retire it first" when a corridor slot is
+ * taken. Going straight back to PUBLISHED would put two live rules on one
+ * corridor, which is exactly the state publishReadinessGaps() exists to
+ * prevent, and it would do so through a door that never ran the check.
+ *
+ * Landing in DRAFT instead means the ONLY way back to live is
+ * POST /rules/:id/publish, which re-runs both halves of that check against
+ * whatever the world looks like NOW: the completeness gate (a rule retired
+ * a year ago may no longer carry terms we'd quote today) and the corridor
+ * conflict gate (the slot may since have been filled by its replacement).
+ * If the slot IS taken, ops gets publish's existing, specific error rather
+ * than a silent double-publish. The publish DRAFT-only guard is therefore
+ * deliberately left exactly as it was — this route feeds that gate, it
+ * does not bypass it.
+ *
+ * No duplicate-key risk in the transition itself: VisaRule's unique index
+ * is the six identity fields and does NOT include status, so a retired
+ * rule already owns its key and moving it to DRAFT changes nothing about
+ * what it occupies.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/rules/:id/unretire", requirePermission("visaApplication", "FULL"), async (req: any, res: any) => {
+  try {
+    const id = req.params.id;
+    if (!mongoose.isValidObjectId(id)) return res.status(404).json({ error: "Visa rule not found" });
+
+    const rule = await VisaRule.findById(id);
+    if (!rule) return res.status(404).json({ error: "Visa rule not found" });
+
+    if (rule.status !== "RETIRED") {
+      return res.status(400).json({ error: `Only a RETIRED rule can be restored to draft (currently '${rule.status}')` });
+    }
+
+    rule.status = "DRAFT";
+    await rule.save();
+
+    await writeRuleAudit(rule._id, "UNRETIRE", [{ field: "status", from: "RETIRED", to: "DRAFT" }], actorId(req));
+
+    rulesLogger.info("visa rule unretired", { ruleId: String(rule._id), userId: actorId(req) ? String(actorId(req)) : null });
+
+    res.json({ ok: true, rule: mapRuleSummary(rule.toObject()) });
+  } catch (err: any) {
+    console.error("[admin visa rule unretire POST]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to restore visa rule to draft" });
   }
 });
 

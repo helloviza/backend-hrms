@@ -44,6 +44,7 @@ export interface ITravelBooking extends Document {
   metadata?: Record<string, unknown>;
   isDemo?: boolean;
   createdByDemoUser?: boolean;
+  isActive?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -104,6 +105,12 @@ const TravelBookingSchema = new Schema(
     // Demo Platform — mirror flags so demo bookings are filterable on the customer side
     isDemo: { type: Boolean, default: false, index: true },
     createdByDemoUser: { type: Boolean, default: false, index: true },
+    // Mirrors ManualBooking.isActive — a soft-deleted source booking must not
+    // keep counting as CONFIRMED (or any other status) here. See
+    // syncManualBookingToMirror (ManualBooking.ts) and buildScopedMatch
+    // (admin.unified.billing.ts), the single shared match every endpoint in
+    // that router filters through.
+    isActive: { type: Boolean, default: true },
   },
   { timestamps: true },
 );

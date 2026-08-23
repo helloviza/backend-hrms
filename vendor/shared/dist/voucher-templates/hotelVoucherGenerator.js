@@ -140,12 +140,60 @@ export async function generateHotelVoucherHTML(params) {
         throw new Error("Cannot generate voucher: booking has not been reconciled with hotel. " +
             "Please wait for confirmation to complete.");
     }
-    const { hotelName, hotelAddress, checkIn, checkOut, roomName, bookingId, confirmationNo, bookingRefNo, invoiceNumber, tboReferenceNo, roomDescription, rateConditions, amenities, guestFirstName, leadGuestName, inclusions, cancelPolicies, displayVoucherStatus, totalFare, logoBodyBase64, offers, hotelPolicies, additionalConditions, supportEmail = "hello@plumtrips.com", showPrintButton = true, isDemo = false, } = params;
+    const { hotelName, hotelAddress, checkIn, checkOut, roomName, bookingId, confirmationNo, bookingRefNo, invoiceNumber, tboReferenceNo, roomDescription, rateConditions, amenities, guestFirstName, leadGuestName, allGuestNames, inclusions, cancelPolicies, displayVoucherStatus, totalFare, logoBodyBase64, offers, hotelPolicies, additionalConditions, supportEmail = "hello@plumtrips.com", showPrintButton = true, isDemo = false, } = params;
     const demoWatermarkHtml = isDemo
         ? `<div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) rotate(-30deg);font-size:120px;font-weight:bold;color:rgba(208,101,73,0.15);z-index:9999;pointer-events:none;white-space:nowrap;">SAMPLE — NOT A REAL RESERVATION</div>`
         : "";
     const demoFooterDisclaimerHtml = isDemo
         ? `<div style="text-align:center;margin:24px 40px;padding:12px 16px;background:#FFF4E5;border:1px solid #D06549;color:#7A3A1E;font-size:11px;font-style:italic;">This document is a sample generated for demonstration purposes only. No booking has been made and no service has been confirmed with any airline, hotel, or supplier.</div>`
+        : "";
+    /**
+     * The full travelling party.
+     *
+     * The summary card's third cell is labelled "Primary Guest" and shows exactly
+     * that — which is accurate but, on a two-guest booking, reads as though the
+     * second person is not on the reservation. So when there IS more than one
+     * guest, a full-width row below the card names all of them.
+     *
+     * It goes below the 3-column grid rather than inside that third cell because
+     * the cell is a third of the card: two Indian full names wrap it into an
+     * unreadable stack, and the hotel desk reads these names off the page at
+     * check-in. Full width also scales to a family of five without reflowing the
+     * card. When there is one guest — or the source only ever named the lead —
+     * nothing is added and the voucher is byte-identical to before.
+     */
+    const guestList = (() => {
+        // Match the same person written two ways. Extraction routinely gives the
+        // lead an honorific and omits it in the list — "Mrs. Elena Solomonova" vs
+        // "Elena Solomonova" is one guest, and 8 of 55 live hotel records look
+        // exactly like that. Comparing the raw strings would count her twice and
+        // announce "Guests (2)" on a solo booking, which is a worse lie than the
+        // co-guest omission this fixes. So the key drops the honorific and every
+        // non-alphanumeric before comparing.
+        const key = (s) => s
+            .toLowerCase()
+            .replace(/^(mr|mrs|ms|miss|mstr|master|dr|prof)\.?\s+/, "")
+            .replace(/[^a-z0-9]+/g, "");
+        const seen = new Set();
+        const out = [];
+        // Lead first, so when the two spellings collide the titled one is kept.
+        for (const raw of [leadGuestName, ...(allGuestNames ?? [])]) {
+            const name = (raw ?? "").trim();
+            if (!name)
+                continue;
+            const k = key(name);
+            if (!k || seen.has(k))
+                continue;
+            seen.add(k);
+            out.push(name);
+        }
+        return out;
+    })();
+    const additionalGuestsHtml = guestList.length > 1
+        ? `<div style="grid-column:1/-1;margin-top:2px;padding-top:12px;border-top:1px solid #e2e4e7;">
+          <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:4px;">Guests (${guestList.length})</div>
+          <div style="font-weight:700;color:#002a58;font-size:12px;line-height:1.5;">${guestList.map((g) => esc(g)).join(" &nbsp;&bull;&nbsp; ")}</div>
+        </div>`
         : "";
     const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent((hotelName || "") + " " + (hotelAddress || ""))}`;
     const qrDataUrl = await generateQRDataUrl(mapsUrl);
@@ -307,6 +355,7 @@ ${printButtonHtml}
           <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:3px;">Primary Guest</div>
           <div style="font-weight:700;color:#002a58;font-size:12px;">${esc(leadGuestName)}</div>
         </div>
+        ${additionalGuestsHtml}
       </div>
     </div>
     <div style="flex:1;background:#002a58;padding:28px;color:#ffffff;display:flex;flex-direction:column;gap:10px;min-width:170px;box-shadow:inset 0 0 30px rgba(0,64,128,0.5),0 20px 40px rgba(0,42,88,0.3);">

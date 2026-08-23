@@ -9,7 +9,7 @@
 // normaliseToIso2() is the one converter all three should go through before
 // they meet, rather than each call site growing its own ad-hoc mapping.
 //
-// Coverage: every entry in docs/data/visa-country-codes-required.json — the
+// Coverage: every entry in ./visa-country-codes-required.json — the
 // coverage checklist (46 live catalogue destinations, 68 expansion targets,
 // plus India on the nationality side; 115 total). That file carries only
 // {name, iso2, tier}; this file is the source of truth for iso3/demonym/

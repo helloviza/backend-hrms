@@ -22,10 +22,16 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import TravelBooking from "../models/TravelBooking.js";
 import ManualBooking from "../models/ManualBooking.js";
+import CarbonRecord from "../models/CarbonRecord.js";
+import ExtractedDocument from "../models/ExtractedDocument.js";
+import { CARBON_CALCULATION_VERSION } from "../services/carbonEngine.service.js";
+import Customer from "../models/Customer.js";
+import CustomerMember from "../models/CustomerMember.js";
 import { canCustomerAccessBookingAttachments } from "../utils/bookingCustomerAccess.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
+import { formatLineItems, invoicePendingDays } from "./manualBookings.js";
 
 const router = Router();
 
@@ -364,37 +370,107 @@ async function loadManualBookingsForCustomer(
 
   const docs: any[] = await ManualBooking.find(filter)
     .select(
-      "workspaceId bookingDate reqDate givenBy sector type travelDate returnDate " +
+      "workspaceId bookingDate bookingRef reqDate sector type travelDate returnDate " +
+        "status subStatus priceBenefits invoiceRaisedDate bookingWeek bookingMonth supplierPNR " +
         "pricing.grandTotal pricing.totalWithGST pricing.quotedPrice " +
         "passengers.name passengers.email " +
-        "itinerary.origin itinerary.destination itinerary.hotelName invoiceId",
+        "itinerary.origin itinerary.destination itinerary.hotelName itinerary.flightNo itinerary.airline " +
+        "itinerary.trainClass itinerary.roomType itinerary.nights itinerary.roomCount itinerary.description " +
+        "itinerary.pickupLocation itinerary.dropLocation itinerary.vehicleType itinerary.visaCountry itinerary.visaType " +
+        "lineItems invoiceId",
     )
-    .populate("invoiceId", "invoiceNo invoiceDate")
+    .populate("invoiceId", "invoiceNo invoiceDate status")
     .sort({ bookingDate: -1 })
     .limit(Math.min(2000, Math.max(1, opts.limit ?? 2000)))
     .lean();
 
   // Re-run the access predicate per record — the tenant clause in `filter`
   // above is a coarse pre-filter, not the authority (see doc comment above).
-  return docs.filter((b) => canCustomerAccessBookingAttachments(ctx, b));
+  const filtered = docs.filter((b) => canCustomerAccessBookingAttachments(ctx, b));
+
+  // Business Name — same value for every row (the caller's own tenant), no
+  // cross-tenant lookup: Customer.findById(customerId), the id this whole
+  // query is already scoped to. Column is redundant on a customer's own
+  // export but harmless — kept for parity with the reference/admin layout.
+  const customer = await Customer.findById(customerId).select("legalName companyName name").lean().catch(() => null);
+  const wsName = (customer as any)?.legalName || (customer as any)?.companyName || (customer as any)?.name || "";
+
+  // Traveler ID — same "customerId:email" lookup the admin export uses
+  // (manualBookings.ts bookingToRow's tidMap), narrowed to this one tenant.
+  const emails = [
+    ...new Set(
+      filtered
+        .map((b) => String(b.passengers?.[0]?.email || "").toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
+  const tidMap: Record<string, string> = {};
+  if (emails.length > 0) {
+    const members = await CustomerMember.find({ customerId, email: { $in: emails } })
+      .select("email travelerId")
+      .lean();
+    members.forEach((m: any) => {
+      tidMap[String(m.email).toLowerCase()] = String(m.travelerId || "");
+    });
+  }
+
+  return filtered.map((b) => ({
+    ...b,
+    _wsName: wsName,
+    _travelerId: tidMap[String(b.passengers?.[0]?.email || "").toLowerCase()] || "",
+  }));
 }
 
 const CUSTOMER_BOOKING_COLUMNS = [
+  // Original 11 (Given By removed 2026-07-24 — see decision note below) —
+  // positions stable for anyone's saved template.
   "S. No",
   "Booking Date",
   "Invoice Date",
   "Invoice Number",
   "Req Date",
   "Pax Name",
-  "Given By",
   "Type",
   "Sector",
   "Travel Date",
   "Arrival Date",
   "Grand Total",
+  // Appended (infra/audit/manual-bookings-export-fields-audit.md +
+  // 2026-07-24 customer-export scoping decision) — Booked By excluded
+  // (internal staff identity), Given By removed (same date — free-text field
+  // found to carry internal staff names on a non-trivial share of rows, not
+  // reliably the customer's own requester); everything else here is
+  // customer-safe, sourced from the same fields the 46-col admin export uses
+  // minus Partner/Quoted/Actual/Diff/GST/Base Price/Request Process TAT.
+  "Ref No.",
+  "Business Name",
+  "Traveler ID",
+  "Status",
+  "Sub Status",
+  "Price Benefits",
+  "Invoice Raised Date",
+  "Invoice Status",
+  "Invoice Pending Days",
+  "Booking Week",
+  "Booking Month",
+  "Flight / Train No",
+  "Airline",
+  "Train Class",
+  "Hotel Name",
+  "Room Type",
+  "Nights",
+  "Rooms",
+  "Service Description",
+  "Supplier PNR / Booking ID",
+  "Line Items",
+  "Pickup Location",
+  "Drop Location",
+  "Vehicle Type",
+  "Visa Country",
+  "Visa Type",
 ];
 
-/** The 12 customer-safe fields, keyed — shared by the JSON list and the export row builder. */
+/** The 37 customer-safe fields, keyed — shared by the JSON list and the export row builder. */
 function customerBookingFields(b: any) {
   const paxName = (b.passengers || [])
     .map((p: any) => String(p?.name ?? "").trim())
@@ -412,7 +488,6 @@ function customerBookingFields(b: any) {
     invoiceNumber: b.invoiceId?.invoiceNo ?? "",
     reqDate: fmtDateDMY(b.reqDate),
     paxName,
-    givenBy: b.givenBy ?? "",
     type: b.type ?? "",
     sector,
     travelDate: fmtDateDMY(b.travelDate),
@@ -420,6 +495,32 @@ function customerBookingFields(b: any) {
     // Customer-facing sell price only — same fallback chain the mirror sync
     // itself uses (ManualBooking.ts:528-529) — never cost/margin.
     grandTotal: b.pricing?.grandTotal ?? b.pricing?.totalWithGST ?? b.pricing?.quotedPrice ?? 0,
+    refNo: b.bookingRef ?? "",
+    businessName: b._wsName ?? "",
+    travelerId: b._travelerId ?? "",
+    status: b.status ?? "",
+    subStatus: b.subStatus ?? "",
+    priceBenefits: b.priceBenefits ?? "",
+    invoiceRaisedDate: fmtDateDMY(b.invoiceRaisedDate),
+    invoiceStatus: b.invoiceId?.status ?? "",
+    invoicePendingDays: invoicePendingDays(b),
+    bookingWeek: b.bookingWeek ? `Week ${b.bookingWeek}` : "",
+    bookingMonth: b.bookingMonth ?? "",
+    flightTrainNo: b.itinerary?.flightNo ?? "",
+    airline: b.itinerary?.airline ?? "",
+    trainClass: b.itinerary?.trainClass ?? "",
+    hotelName: b.itinerary?.hotelName ?? "",
+    roomType: b.itinerary?.roomType ?? "",
+    nights: b.itinerary?.nights ?? "",
+    rooms: b.itinerary?.roomCount ?? "",
+    serviceDescription: b.itinerary?.description ?? "",
+    supplierPNR: b.supplierPNR ?? "",
+    lineItems: formatLineItems(b),
+    pickupLocation: b.itinerary?.pickupLocation ?? "",
+    dropLocation: b.itinerary?.dropLocation ?? "",
+    vehicleType: b.itinerary?.vehicleType ?? "",
+    visaCountry: b.itinerary?.visaCountry ?? "",
+    visaType: b.itinerary?.visaType ?? "",
   };
 }
 
@@ -432,16 +533,41 @@ function customerBookingRow(b: any, srNo: number): (string | number)[] {
     f.invoiceNumber,
     f.reqDate,
     f.paxName,
-    f.givenBy,
     f.type,
     f.sector,
     f.travelDate,
     f.arrivalDate,
     f.grandTotal,
+    f.refNo,
+    f.businessName,
+    f.travelerId,
+    f.status,
+    f.subStatus,
+    f.priceBenefits,
+    f.invoiceRaisedDate,
+    f.invoiceStatus,
+    f.invoicePendingDays,
+    f.bookingWeek,
+    f.bookingMonth,
+    f.flightTrainNo,
+    f.airline,
+    f.trainClass,
+    f.hotelName,
+    f.roomType,
+    f.nights,
+    f.rooms,
+    f.serviceDescription,
+    f.supplierPNR,
+    f.lineItems,
+    f.pickupLocation,
+    f.dropLocation,
+    f.vehicleType,
+    f.visaCountry,
+    f.visaType,
   ];
 }
 
-// GET /api/my-bookings/manual — the 12-column table, JSON.
+// GET /api/my-bookings/manual — the 37-column table, JSON.
 router.get("/manual", async (req: Request, res: Response) => {
   try {
     const docs = await loadManualBookingsForCustomer(req, {
@@ -460,7 +586,7 @@ router.get("/manual", async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/my-bookings/manual/export?format=xlsx|csv — same 12 columns, full history (no limit).
+// GET /api/my-bookings/manual/export?format=xlsx|csv — same 37 columns, full history (no limit).
 router.get("/manual/export", async (req: Request, res: Response) => {
   try {
     const docs = await loadManualBookingsForCustomer(req, {
@@ -486,9 +612,14 @@ router.get("/manual/export", async (req: Request, res: Response) => {
     headerRow.font = { bold: true };
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
 
-    const colWidths = [7, 14, 14, 18, 12, 28, 18, 14, 22, 14, 14, 16];
+    const colWidths = [
+      7, 14, 14, 18, 12, 28, 14, 22, 14, 14, 16, // original 11 (Given By removed)
+      16, 22, 14, 14, 28, 28, 16, 14, 18, 12, 22, // Ref No...Booking Month
+      16, 16, 12, 22, 14, 8, 8, 30, 22, 40, 20, 20, 16, 16, 16, // detail block
+    ];
     colWidths.forEach((width, i) => { sheet.getColumn(i + 1).width = width; });
-    sheet.getColumn(12).numFmt = "#,##0.00";
+    sheet.getColumn(11).numFmt = "#,##0.00"; // Grand Total
+    sheet.getColumn(20).numFmt = "0"; // Invoice Pending Days
 
     docs.forEach((b, idx) => sheet.addRow(customerBookingRow(b, idx + 1)));
 
@@ -636,6 +767,26 @@ function periodTravellersBranch(from: Date, to: Date) {
   ];
 }
 
+// AVG BOOKED IN ADVANCE — bookingDate -> travelDate, days. Rows where
+// travelDate is missing are excluded (nothing to compute). Rows where
+// travelDate falls BEFORE bookingDate are also excluded — that's not a valid
+// "days in advance" value, it's bad data (a backdated correction or entry
+// error), and letting it through would drag the average down/negative for a
+// reason a customer can't see. Zero-day (same-day booking) rows ARE counted
+// — that's a real, legitimate advance value.
+function periodAvgAdvanceBranch(from: Date, to: Date) {
+  return [
+    { $match: { bookingDate: { $gte: from, $lte: to }, travelDate: { $ne: null } } },
+    {
+      $addFields: {
+        _advanceDays: { $divide: [{ $subtract: ["$travelDate", "$bookingDate"] }, 1000 * 60 * 60 * 24] },
+      },
+    },
+    { $match: { _advanceDays: { $gte: 0 } } },
+    { $group: { _id: null, avgDays: { $avg: "$_advanceDays" }, n: { $sum: 1 } } },
+  ];
+}
+
 function parseDayStart(v: unknown): Date | null {
   if (!v) return null;
   const d = new Date(String(v));
@@ -654,6 +805,7 @@ function shapeFacetResult(raw: any): {
   hotelCount: number;
   travellerCount: number;
   breakdown: { service: string; count: number; spend: number }[];
+  avgDaysAdvance: number | null;
 } {
   const totals = raw?.totals?.[0] || { totalTrips: 0, totalSpend: 0 };
   const byService: any[] = raw?.byService || [];
@@ -664,6 +816,10 @@ function shapeFacetResult(raw: any): {
   const flightCount = breakdown.find((b) => b.service === "FLIGHT")?.count || 0;
   const hotelCount = breakdown.find((b) => b.service === "HOTEL")?.count || 0;
   const travellerCount = raw?.travellers?.[0]?.n || 0;
+  // No usable rows this period → null, never 0 (0 reads as "booked same-day
+  // on average", which is a different claim than "no data").
+  const avgAdvanceRow = raw?.avgAdvance?.[0];
+  const avgDaysAdvance = avgAdvanceRow?.n ? Math.round(avgAdvanceRow.avgDays) : null;
   return {
     totalTrips: totals.totalTrips || 0,
     totalSpend: totals.totalSpend || 0,
@@ -671,6 +827,7 @@ function shapeFacetResult(raw: any): {
     hotelCount,
     travellerCount,
     breakdown,
+    avgDaysAdvance,
   };
 }
 
@@ -727,17 +884,21 @@ router.get("/stats", async (req: Request, res: Response) => {
       primaryTotals: periodTotalsBranch(from, to),
       primaryByService: periodByServiceBranch(from, to),
       primaryTravellers: periodTravellersBranch(from, to),
+      primaryAvgAdvance: periodAvgAdvanceBranch(from, to),
     };
     if (hasCompare) {
       facet.compareTotals = periodTotalsBranch(compareFrom as Date, compareTo as Date);
       facet.compareByService = periodByServiceBranch(compareFrom as Date, compareTo as Date);
       facet.compareTravellers = periodTravellersBranch(compareFrom as Date, compareTo as Date);
+      facet.compareAvgAdvance = periodAvgAdvanceBranch(compareFrom as Date, compareTo as Date);
     }
 
     const pipeline = [
       { $match: match },
       // Explicit allowlist — see doc comment above. No cost/margin/PII field
-      // exists past this stage for any later $group/$sum to touch.
+      // exists past this stage for any later $group/$sum to touch. travelDate
+      // is the only addition beyond bookingDate — needed for the AVG BOOKED
+      // IN ADVANCE branch, itself just a scheduling date (no cost/PII).
       {
         $project: {
           type: 1,
@@ -747,6 +908,7 @@ router.get("/stats", async (req: Request, res: Response) => {
           "passengers.name": 1,
           "passengers.email": 1,
           bookingDate: 1,
+          travelDate: 1,
         },
       },
       { $facet: facet },
@@ -761,12 +923,14 @@ router.get("/stats", async (req: Request, res: Response) => {
       totals: result?.primaryTotals,
       byService: result?.primaryByService,
       travellers: result?.primaryTravellers,
+      avgAdvance: result?.primaryAvgAdvance,
     };
     const compareRaw = hasCompare
       ? {
           totals: result?.compareTotals,
           byService: result?.compareByService,
           travellers: result?.compareTravellers,
+          avgAdvance: result?.compareAvgAdvance,
         }
       : null;
 
@@ -787,6 +951,179 @@ router.get("/stats", async (req: Request, res: Response) => {
       error: err?.message,
     });
     res.status(500).json({ ok: false, error: "Failed to load booking stats" });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+ * GET /api/my-bookings/carbon
+ *
+ * The workspace's own flight-emissions figure, for the Flight Emissions card
+ * on the Client Portal Overview. All-time, own workspace, no parameters.
+ *
+ * ── Why this is not a call to /api/admin/carbon ──
+ *
+ * Two reasons, and the second is the load-bearing one.
+ *
+ * 1. That router is admin-gated (routes/admin.carbon.ts's adminOrSuperAdmin),
+ *    so no customer role reaches it at all.
+ * 2. It scopes on `req.workspaceObjectId` — a CustomerWorkspace._id. But
+ *    CarbonRecord.workspaceId is a CUSTOMER id (models/CarbonRecord.ts:193,
+ *    copied from ExtractedDocument, itself copied from ManualBooking.
+ *    workspaceId, ref:"Customer"). Reusing buildCarbonMatch here would match
+ *    a CustomerWorkspace._id against a field holding Customer._ids and return
+ *    zero — a wrong number that looks exactly like a real one, which is the
+ *    failure admin.carbon.ts's own header warns about for aggregations.
+ *
+ * So this endpoint scopes precisely the way GET /stats above does: off
+ * `req.workspace.customerId`, which IS the Customer id space. That shared
+ * derivation is what makes the card's total tie to the ops-side figure.
+ *
+ * ── Nothing is accepted, so nothing needs validating ──
+ *
+ * No workspaceId (the id comes from the resolved workspace, never from the
+ * caller — there is no argument through which to widen) and no from/to (the
+ * card is all-time by design).
+ *
+ * ── Company-wide, therefore ORG-scope only ──
+ *
+ * CarbonRecord carries passengerIndex/segmentIndex but no passenger identity
+ * — no email, no name (models/CarbonRecord.ts). There is no per-traveller
+ * grain to filter on the way /stats gates OWN-scope callers by
+ * email-in-passengers[]. Rather than hand an individual traveller the whole
+ * company's footprint, this answers available:false and issues no query.
+ *
+ * ── Counts, not a coverage percentage ──
+ *
+ * Deliberately no coveragePct. The ops dashboard's figure is priced/records —
+ * the share of segments WE HOLD DOCUMENTS FOR that could be priced. On a
+ * customer's own page a "Coverage 100%" badge reads as "all your travel is
+ * measured", which is a claim this data cannot support. The raw counts go to
+ * the client and the card words them.
+ * ═════════════════════════════════════════════════════════════════════ */
+
+/** The zero payload — valid, all-time, and renders as no card. */
+function emptyCarbon() {
+  return {
+    ok: true,
+    available: true,
+    calculationVersion: CARBON_CALCULATION_VERSION,
+    totalCo2eKg: 0,
+    records: 0,
+    priced: 0,
+    documents: 0,
+    confidence: { high: 0, medium: 0, insufficient: 0 },
+    excluded: { undatedSegments: 0, modeNotSupportedDocuments: 0 },
+  };
+}
+
+router.get("/carbon", async (req: Request, res: Response) => {
+  try {
+    const user: any = (req as any).user;
+
+    // The org gate comes FIRST — before id resolution, before any query. A
+    // plain traveller cannot pull the company total, and no pipeline runs on
+    // their behalf to be accidentally scoped later.
+    if (!isOrgScopeUser(user)) {
+      return res.json({ ok: true, available: false });
+    }
+
+    // Demo sessions. CarbonRecord has no isDemo dimension — the engine writes
+    // one record per real extracted document — so there is no demo-correct
+    // figure to serve. Answer with the empty payload (the card renders
+    // nothing) rather than showing a demo user the real tenant's emissions.
+    if (user?.isDemoUser) {
+      return res.json(emptyCarbon());
+    }
+
+    // Same derivation as /stats above, deliberately: the resolved workspace's
+    // customerId, never req.workspaceObjectId. See the header.
+    const customerId = (req as any).workspace?.customerId ?? null;
+    if (!customerId || !mongoose.isValidObjectId(customerId)) {
+      return res.json(emptyCarbon());
+    }
+
+    const workspaceId = new mongoose.Types.ObjectId(customerId);
+
+    // Pinned to CARBON_CALCULATION_VERSION for the same reason the ops
+    // dashboard is: seeding a newer engine's records must not silently
+    // restate a figure the customer has already seen.
+    const [agg] = await CarbonRecord.aggregate([
+      { $match: { workspaceId, calculationVersion: CARBON_CALCULATION_VERSION } },
+      {
+        $group: {
+          _id: null,
+          // Every segment in scope, including the ones we refused to price —
+          // so "what we emitted" and "what we could measure" are never the
+          // same number by accident.
+          records: { $sum: 1 },
+          // $sum ignores null, which is exactly right: an insufficient-data
+          // row contributes nothing rather than a zero.
+          totalCo2eKg: { $sum: "$co2eKg" },
+          priced: { $sum: { $cond: [{ $eq: ["$status", "calculated"] }, 1, 0] } },
+          high: { $sum: { $cond: [{ $eq: ["$confidence", "high"] }, 1, 0] } },
+          medium: { $sum: { $cond: [{ $eq: ["$confidence", "medium"] }, 1, 0] } },
+          insufficient: { $sum: { $cond: [{ $eq: ["$confidence", "insufficient"] }, 1, 0] } },
+          undatedSegments: { $sum: { $cond: [{ $eq: ["$travelMonth", null] }, 1, 0] } },
+          // The documents these records actually came from — so the card's
+          // "from N flight documents" is derived from the same rows as the
+          // total, not from a second query that could drift away from it.
+          documentIds: { $addToSet: "$extractedDocumentId" },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          records: 1,
+          totalCo2eKg: 1,
+          priced: 1,
+          high: 1,
+          medium: 1,
+          insufficient: 1,
+          undatedSegments: 1,
+          documents: { $size: "$documentIds" },
+        },
+      },
+    ]);
+
+    if (!agg) return res.json(emptyCarbon());
+
+    // Document grain, deliberately kept separate from the segment counts
+    // above and never summed with them: the engine writes NO CarbonRecord at
+    // all for a hotel or other document (the Phase 1 factor library is
+    // air-only), so there is no segment to count for them. Folding these into
+    // the segment denominator would invent rows that do not exist.
+    const modeNotSupportedDocuments = await ExtractedDocument.countDocuments({
+      workspaceId,
+      status: "extracted",
+      docType: { $ne: "flight" },
+    });
+
+    res.json({
+      ok: true,
+      available: true,
+      calculationVersion: CARBON_CALCULATION_VERSION,
+      totalCo2eKg: Math.round((agg.totalCo2eKg || 0) * 100) / 100,
+      records: agg.records || 0,
+      priced: agg.priced || 0,
+      documents: agg.documents || 0,
+      confidence: {
+        high: agg.high || 0,
+        medium: agg.medium || 0,
+        insufficient: agg.insufficient || 0,
+      },
+      excluded: {
+        // Segment grain.
+        undatedSegments: agg.undatedSegments || 0,
+        // Document grain — see above.
+        modeNotSupportedDocuments,
+      },
+    });
+  } catch (err: any) {
+    logger.error("my-bookings carbon failed", {
+      userId: (req as any).user?.sub || (req as any).user?._id,
+      error: err?.message,
+    });
+    res.status(500).json({ ok: false, error: "Failed to load flight emissions" });
   }
 });
 

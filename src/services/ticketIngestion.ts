@@ -30,6 +30,12 @@ If a field is unclear, use null. Do not infer.
 Email:
 `;
 
+// NOT gemini-1.5-flash. That model is retired — the endpoint answers 404
+// ("is not found for API version v1beta"), so anything still pointing at it
+// fails on every call. Pinned rather than an auto-updating `-latest` alias so
+// extraction behaviour cannot change under us without a deliberate edit.
+const GEMINI_MODEL = "gemini-2.5-flash";
+
 let _gemini: GoogleGenerativeAI | null = null;
 function getGemini() {
   if (!_gemini) _gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
@@ -38,7 +44,7 @@ function getGemini() {
 
 async function extractTravelDetails(bodyText: string): Promise<Record<string, unknown>> {
   try {
-    const model = getGemini().getGenerativeModel({ model: "gemini-1.5-flash" });
+    const model = getGemini().getGenerativeModel({ model: GEMINI_MODEL });
     const result = await model.generateContent(GEMINI_EXTRACTION_PROMPT + bodyText);
     const text = result.response.text();
     const jsonMatch = text.match(/\{[\s\S]*\}/);

@@ -1,0 +1,577 @@
+[
+  {
+    "name": "Albania",
+    "iso2": "AL",
+    "tier": "expansion"
+  },
+  {
+    "name": "Algeria",
+    "iso2": "DZ",
+    "tier": "live"
+  },
+  {
+    "name": "Argentina",
+    "iso2": "AR",
+    "tier": "live"
+  },
+  {
+    "name": "Armenia",
+    "iso2": "AM",
+    "tier": "expansion"
+  },
+  {
+    "name": "Australia",
+    "iso2": "AU",
+    "tier": "live"
+  },
+  {
+    "name": "Austria",
+    "iso2": "AT",
+    "tier": "expansion"
+  },
+  {
+    "name": "Azerbaijan",
+    "iso2": "AZ",
+    "tier": "expansion"
+  },
+  {
+    "name": "Bahrain",
+    "iso2": "BH",
+    "tier": "expansion"
+  },
+  {
+    "name": "Bangladesh",
+    "iso2": "BD",
+    "tier": "expansion"
+  },
+  {
+    "name": "Belgium",
+    "iso2": "BE",
+    "tier": "live"
+  },
+  {
+    "name": "Bhutan",
+    "iso2": "BT",
+    "tier": "expansion"
+  },
+  {
+    "name": "Bosnia & Herzegovina",
+    "iso2": "BA",
+    "tier": "expansion"
+  },
+  {
+    "name": "Botswana",
+    "iso2": "BW",
+    "tier": "expansion"
+  },
+  {
+    "name": "Brazil",
+    "iso2": "BR",
+    "tier": "live"
+  },
+  {
+    "name": "Brunei",
+    "iso2": "BN",
+    "tier": "expansion"
+  },
+  {
+    "name": "Bulgaria",
+    "iso2": "BG",
+    "tier": "expansion"
+  },
+  {
+    "name": "Cambodia",
+    "iso2": "KH",
+    "tier": "live"
+  },
+  {
+    "name": "Canada",
+    "iso2": "CA",
+    "tier": "live"
+  },
+  {
+    "name": "Chile",
+    "iso2": "CL",
+    "tier": "expansion"
+  },
+  {
+    "name": "China",
+    "iso2": "CN",
+    "tier": "live"
+  },
+  {
+    "name": "Colombia",
+    "iso2": "CO",
+    "tier": "expansion"
+  },
+  {
+    "name": "Costa Rica",
+    "iso2": "CR",
+    "tier": "expansion"
+  },
+  {
+    "name": "Croatia",
+    "iso2": "HR",
+    "tier": "live"
+  },
+  {
+    "name": "Cuba",
+    "iso2": "CU",
+    "tier": "expansion"
+  },
+  {
+    "name": "Cyprus",
+    "iso2": "CY",
+    "tier": "expansion"
+  },
+  {
+    "name": "Czech Republic",
+    "iso2": "CZ",
+    "tier": "live"
+  },
+  {
+    "name": "Denmark",
+    "iso2": "DK",
+    "tier": "live"
+  },
+  {
+    "name": "Ecuador",
+    "iso2": "EC",
+    "tier": "expansion"
+  },
+  {
+    "name": "Egypt",
+    "iso2": "EG",
+    "tier": "live"
+  },
+  {
+    "name": "Estonia",
+    "iso2": "EE",
+    "tier": "live"
+  },
+  {
+    "name": "Ethiopia",
+    "iso2": "ET",
+    "tier": "expansion"
+  },
+  {
+    "name": "Fiji",
+    "iso2": "FJ",
+    "tier": "expansion"
+  },
+  {
+    "name": "Finland",
+    "iso2": "FI",
+    "tier": "live"
+  },
+  {
+    "name": "France",
+    "iso2": "FR",
+    "tier": "live"
+  },
+  {
+    "name": "Georgia",
+    "iso2": "GE",
+    "tier": "expansion"
+  },
+  {
+    "name": "Germany",
+    "iso2": "DE",
+    "tier": "live"
+  },
+  {
+    "name": "Ghana",
+    "iso2": "GH",
+    "tier": "expansion"
+  },
+  {
+    "name": "Greece",
+    "iso2": "GR",
+    "tier": "live"
+  },
+  {
+    "name": "Hong Kong SAR",
+    "iso2": "HK",
+    "tier": "live"
+  },
+  {
+    "name": "Hungary",
+    "iso2": "HU",
+    "tier": "live"
+  },
+  {
+    "name": "Iceland",
+    "iso2": "IS",
+    "tier": "expansion"
+  },
+  {
+    "name": "India",
+    "iso2": "IN",
+    "tier": "nationality"
+  },
+  {
+    "name": "Indonesia",
+    "iso2": "ID",
+    "tier": "live"
+  },
+  {
+    "name": "Ireland",
+    "iso2": "IE",
+    "tier": "live"
+  },
+  {
+    "name": "Israel",
+    "iso2": "IL",
+    "tier": "expansion"
+  },
+  {
+    "name": "Italy",
+    "iso2": "IT",
+    "tier": "live"
+  },
+  {
+    "name": "Japan",
+    "iso2": "JP",
+    "tier": "live"
+  },
+  {
+    "name": "Jordan",
+    "iso2": "JO",
+    "tier": "live"
+  },
+  {
+    "name": "Kazakhstan",
+    "iso2": "KZ",
+    "tier": "expansion"
+  },
+  {
+    "name": "Kenya",
+    "iso2": "KE",
+    "tier": "expansion"
+  },
+  {
+    "name": "Kuwait",
+    "iso2": "KW",
+    "tier": "expansion"
+  },
+  {
+    "name": "Kyrgyzstan",
+    "iso2": "KG",
+    "tier": "expansion"
+  },
+  {
+    "name": "Laos",
+    "iso2": "LA",
+    "tier": "live"
+  },
+  {
+    "name": "Latvia",
+    "iso2": "LV",
+    "tier": "expansion"
+  },
+  {
+    "name": "Liechtenstein",
+    "iso2": "LI",
+    "tier": "expansion"
+  },
+  {
+    "name": "Lithuania",
+    "iso2": "LT",
+    "tier": "expansion"
+  },
+  {
+    "name": "Luxembourg",
+    "iso2": "LU",
+    "tier": "live"
+  },
+  {
+    "name": "Malaysia",
+    "iso2": "MY",
+    "tier": "live"
+  },
+  {
+    "name": "Maldives",
+    "iso2": "MV",
+    "tier": "expansion"
+  },
+  {
+    "name": "Malta",
+    "iso2": "MT",
+    "tier": "live"
+  },
+  {
+    "name": "Mauritius",
+    "iso2": "MU",
+    "tier": "expansion"
+  },
+  {
+    "name": "Mexico",
+    "iso2": "MX",
+    "tier": "expansion"
+  },
+  {
+    "name": "Moldova",
+    "iso2": "MD",
+    "tier": "expansion"
+  },
+  {
+    "name": "Mongolia",
+    "iso2": "MN",
+    "tier": "expansion"
+  },
+  {
+    "name": "Montenegro",
+    "iso2": "ME",
+    "tier": "expansion"
+  },
+  {
+    "name": "Morocco",
+    "iso2": "MA",
+    "tier": "expansion"
+  },
+  {
+    "name": "Myanmar",
+    "iso2": "MM",
+    "tier": "live"
+  },
+  {
+    "name": "Namibia",
+    "iso2": "NA",
+    "tier": "expansion"
+  },
+  {
+    "name": "Nepal",
+    "iso2": "NP",
+    "tier": "expansion"
+  },
+  {
+    "name": "Netherlands",
+    "iso2": "NL",
+    "tier": "live"
+  },
+  {
+    "name": "New Zealand",
+    "iso2": "NZ",
+    "tier": "live"
+  },
+  {
+    "name": "Nigeria",
+    "iso2": "NG",
+    "tier": "expansion"
+  },
+  {
+    "name": "North Macedonia",
+    "iso2": "MK",
+    "tier": "expansion"
+  },
+  {
+    "name": "Norway",
+    "iso2": "NO",
+    "tier": "expansion"
+  },
+  {
+    "name": "Oman",
+    "iso2": "OM",
+    "tier": "expansion"
+  },
+  {
+    "name": "Panama",
+    "iso2": "PA",
+    "tier": "expansion"
+  },
+  {
+    "name": "Papua New Guinea",
+    "iso2": "PG",
+    "tier": "expansion"
+  },
+  {
+    "name": "Peru",
+    "iso2": "PE",
+    "tier": "expansion"
+  },
+  {
+    "name": "Philippines",
+    "iso2": "PH",
+    "tier": "live"
+  },
+  {
+    "name": "Poland",
+    "iso2": "PL",
+    "tier": "live"
+  },
+  {
+    "name": "Portugal",
+    "iso2": "PT",
+    "tier": "live"
+  },
+  {
+    "name": "Qatar",
+    "iso2": "QA",
+    "tier": "live"
+  },
+  {
+    "name": "Romania",
+    "iso2": "RO",
+    "tier": "expansion"
+  },
+  {
+    "name": "Rwanda",
+    "iso2": "RW",
+    "tier": "expansion"
+  },
+  {
+    "name": "Samoa",
+    "iso2": "WS",
+    "tier": "expansion"
+  },
+  {
+    "name": "Saudi Arabia",
+    "iso2": "SA",
+    "tier": "live"
+  },
+  {
+    "name": "Serbia",
+    "iso2": "RS",
+    "tier": "expansion"
+  },
+  {
+    "name": "Seychelles",
+    "iso2": "SC",
+    "tier": "expansion"
+  },
+  {
+    "name": "Singapore",
+    "iso2": "SG",
+    "tier": "live"
+  },
+  {
+    "name": "Slovakia",
+    "iso2": "SK",
+    "tier": "expansion"
+  },
+  {
+    "name": "Slovenia",
+    "iso2": "SI",
+    "tier": "expansion"
+  },
+  {
+    "name": "South Africa",
+    "iso2": "ZA",
+    "tier": "live"
+  },
+  {
+    "name": "South Korea",
+    "iso2": "KR",
+    "tier": "expansion"
+  },
+  {
+    "name": "Spain",
+    "iso2": "ES",
+    "tier": "live"
+  },
+  {
+    "name": "Sri Lanka",
+    "iso2": "LK",
+    "tier": "expansion"
+  },
+  {
+    "name": "Sweden",
+    "iso2": "SE",
+    "tier": "live"
+  },
+  {
+    "name": "Switzerland",
+    "iso2": "CH",
+    "tier": "expansion"
+  },
+  {
+    "name": "Taiwan",
+    "iso2": "TW",
+    "tier": "expansion"
+  },
+  {
+    "name": "Tajikistan",
+    "iso2": "TJ",
+    "tier": "expansion"
+  },
+  {
+    "name": "Tanzania",
+    "iso2": "TZ",
+    "tier": "expansion"
+  },
+  {
+    "name": "Thailand",
+    "iso2": "TH",
+    "tier": "live"
+  },
+  {
+    "name": "Tunisia",
+    "iso2": "TN",
+    "tier": "expansion"
+  },
+  {
+    "name": "Turkey",
+    "iso2": "TR",
+    "tier": "live"
+  },
+  {
+    "name": "Turkmenistan",
+    "iso2": "TM",
+    "tier": "expansion"
+  },
+  {
+    "name": "Uganda",
+    "iso2": "UG",
+    "tier": "expansion"
+  },
+  {
+    "name": "Ukraine",
+    "iso2": "UA",
+    "tier": "expansion"
+  },
+  {
+    "name": "United Arab Emirates",
+    "iso2": "AE",
+    "tier": "live"
+  },
+  {
+    "name": "United Kingdom",
+    "iso2": "GB",
+    "tier": "live"
+  },
+  {
+    "name": "United States",
+    "iso2": "US",
+    "tier": "live"
+  },
+  {
+    "name": "Uruguay",
+    "iso2": "UY",
+    "tier": "expansion"
+  },
+  {
+    "name": "Uzbekistan",
+    "iso2": "UZ",
+    "tier": "expansion"
+  },
+  {
+    "name": "Vanuatu",
+    "iso2": "VU",
+    "tier": "expansion"
+  },
+  {
+    "name": "Vietnam",
+    "iso2": "VN",
+    "tier": "live"
+  },
+  {
+    "name": "Zambia",
+    "iso2": "ZM",
+    "tier": "expansion"
+  },
+  {
+    "name": "Zimbabwe",
+    "iso2": "ZW",
+    "tier": "expansion"
+  }
+]

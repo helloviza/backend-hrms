@@ -39,6 +39,22 @@ export const MANUAL_BOOKING_TYPES = [
 
 export type ManualBookingType = (typeof MANUAL_BOOKING_TYPES)[number];
 
+// Types that cannot be committed-created without at least one attachment.
+//
+// NOTE ON DERIVATION: MANUAL_BOOKING_TYPES above is deliberately FLAT — it
+// carries membership, not grouping. The Flight Service / Hotel Type grouping
+// this rule is stated in terms of lives only in the frontend's
+// constants/serviceTaxonomy.ts (as a requiresAttachment flag on those two
+// groups). There is no shared package between the apps, so this list is the
+// backend twin of that flag, hand-kept in lockstep exactly like
+// SERVICE_TYPE_MAP in services/travelIntake.create.ts. It is typed against
+// ManualBookingType so renaming or dropping a type breaks the build here
+// rather than silently narrowing the rule to nothing.
+export const ATTACHMENT_REQUIRED_TYPES: readonly ManualBookingType[] = [
+  "FLIGHT", "FLIGHT_RESCHEDULE", "DUMMY_FLIGHT",
+  "HOTEL", "DUMMY_HOTEL",
+];
+
 export interface IManualBooking extends Document {
   workspaceId: Schema.Types.ObjectId;
   bookingRef: string;

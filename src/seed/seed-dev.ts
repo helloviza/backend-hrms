@@ -55,7 +55,19 @@ import {
 
 /* ── What gets seeded ────────────────────────────────────────────────── */
 
-const CUSTOMER_ID = "dev-acme";
+// A REAL ObjectId, and it has to be (2026-08-16). This value is written to
+// CustomerWorkspace.customerId, and the product treats that field as a
+// Customer._id — utils/travelerId.ts's mintTravellerProfileId does
+// `Customer.findById(customerId)`. The previous value, the string "dev-acme",
+// was not castable, so that lookup threw
+//   Cast to ObjectId failed for value "dev-acme" ... for model "Customer"
+// and EVERY traveller creation on seeded data 500'd — single Add Traveller and
+// bulk import alike. It was invisible because the seed writes its own four
+// traveller rows directly and never mints an id.
+//
+// Fixed rather than generated so a re-seed keeps the same id and the teardown
+// below still finds the previous run's rows.
+const CUSTOMER_ID = "dec0ded0dec0ded0dec0ded0";
 // The Customer row's own identity — see the teardown's note on why this, and
 // not CUSTOMER_ID, is what finds it.
 const CUSTOMER_LEGAL_NAME = "Acme Industries Private Limited";
@@ -116,8 +128,14 @@ async function main() {
   // one row it owns, and is correct whichever half of a previous run survived.
   await Customer.deleteMany({ legalName: CUSTOMER_LEGAL_NAME });
 
+  // _id, not a `customerId` field: models/Customer.ts declares no such field
+  // (the note above says so), so passing it merely dropped it on the floor and
+  // left the row with an auto id unrelated to what CustomerWorkspace pointed
+  // at. Pinning _id is what makes `Customer.findById(workspace.customerId)`
+  // resolve — and resolve to a row with the right legalName, so minted
+  // traveller ids read "ACME-001" rather than the "Traveller" fallback.
   await Customer.create({
-    customerId: CUSTOMER_ID,
+    _id: new mongoose.Types.ObjectId(CUSTOMER_ID),
     legalName: CUSTOMER_LEGAL_NAME,
     isActive: true,
   } as any);

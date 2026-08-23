@@ -732,6 +732,15 @@ app.use("/api/admin/visa", adminVisaRosterRouter);
 import adminVisaRulesImportExportRouter from "./routes/admin.visa.rules.importExport.js";
 app.use("/api/admin/visa", adminVisaRulesImportExportRouter);
 
+// Visa module — PER-GROUP writes for VisaRule.documentGroups, the field
+// the customer checklist actually renders. A sixth router on the same
+// prefix. Until this existed, documentGroups was editable only through the
+// XLSX REQUIREMENTS sheet above, while the rule editor's own document
+// section wrote `documentRequirements` — a superseded field no customer
+// reads. See routes/admin.visa.rules.documentGroups.ts's file header.
+import adminVisaRuleDocumentGroupsRouter from "./routes/admin.visa.rules.documentGroups.js";
+app.use("/api/admin/visa", adminVisaRuleDocumentGroupsRouter);
+
 // Workspace provisioning (onboarding, invites)
 import onboardingRouter from "./routes/workspace.onboarding.js";
 import inviteRouter from "./routes/workspace.invites.js";
@@ -839,12 +848,25 @@ app.use("/api/admin/demo", adminDemoRouter);
 // these paths before manualBookingsRouter (which uses billing-access
 // instead of requireAdmin to allow RM-scoped access).
 import manualBookingsRouter from "./routes/manualBookings.js";
+import extractedDocumentsRouter from "./routes/admin.extractedDocuments.js";
+import carbonRouter from "./routes/admin.carbon.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Manual bookings + broad /api/admin routers (Plumtrips Travel).
   // Order matters: manualBookings must precede adminRouter/adminAnalyticsRouter
   // so the broad mounts do not intercept the manual-bookings paths.
   app.use("/api/admin/manual-bookings", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), manualBookingsRouter);
+  // Cross-tenant oversight over extracteddocuments. SuperAdmin-only; the router
+  // carries its own requireAuth/requireWorkspace + superAdminOnly guard, and is
+  // mounted before the broad /api/admin routers for the same interception
+  // reason as manual-bookings above. Deliberately NOT behind
+  // requireFeature("sbtEnabled") — it is a platform oversight surface, not a
+  // tenant feature, and a real SuperAdmin bypasses that flag anyway.
+  app.use("/api/admin/extracted-documents", extractedDocumentsRouter);
+  // Carbon Ledger aggregations behind the Sustainability dashboard. Mounted
+  // before the broad /api/admin routers for the same interception reason, and
+  // carries its own requireAuth/requireWorkspace + admin guard.
+  app.use("/api/admin/carbon", carbonRouter);
   // Admin
   app.use("/api/admin", adminRouter);
   app.use("/api/admin", adminAnalyticsRouter);

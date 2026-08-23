@@ -59,6 +59,7 @@ function canned(overrides: any = {}) {
       { _id: "OTHER", count: 6, spend: 80_000 },
     ],
     primaryTravellers: [{ n: 153 }],
+    primaryAvgAdvance: [{ avgDays: 5.16, n: 266 }],
     ...overrides,
   };
 }
@@ -96,7 +97,7 @@ describe("GET /my-bookings/stats — cost/PII safety of the pipeline itself", ()
     }
   });
 
-  it("the $project stage allowlists exactly the six customer-safe fields", async () => {
+  it("the $project stage allowlists exactly the seven customer-safe fields", async () => {
     aggregateMock.mockResolvedValue([canned()]);
     const app = makeApp({ roles: ["WORKSPACE_LEADER"], email: LEADER_EMAIL });
     await request(app).get("/stats?from=2026-01-01&to=2026-07-20");
@@ -104,7 +105,7 @@ describe("GET /my-bookings/stats — cost/PII safety of the pipeline itself", ()
     const pipeline = aggregateMock.mock.calls[0][0];
     const projectStage = pipeline.find((s: any) => s.$project);
     expect(Object.keys(projectStage.$project).sort()).toEqual(
-      ["bookingDate", "passengers.email", "passengers.name", "pricing.grandTotal", "pricing.quotedPrice", "pricing.totalWithGST", "type"].sort(),
+      ["bookingDate", "travelDate", "passengers.email", "passengers.name", "pricing.grandTotal", "pricing.quotedPrice", "pricing.totalWithGST", "type"].sort(),
     );
   });
 });
@@ -185,6 +186,20 @@ describe("GET /my-bookings/stats — response shaping", () => {
     const app = makeApp({ roles: ["WORKSPACE_LEADER"], email: LEADER_EMAIL });
     const res = await request(app).get("/stats?from=2026-01-01&to=2026-07-20");
     expect(res.body.primary.travellerCount).toBe(153);
+  });
+
+  it("avgDaysAdvance is rounded from the avgAdvance facet", async () => {
+    aggregateMock.mockResolvedValue([canned({ primaryAvgAdvance: [{ avgDays: 5.16, n: 266 }] })]);
+    const app = makeApp({ roles: ["WORKSPACE_LEADER"], email: LEADER_EMAIL });
+    const res = await request(app).get("/stats?from=2026-01-01&to=2026-07-20");
+    expect(res.body.primary.avgDaysAdvance).toBe(5);
+  });
+
+  it("avgDaysAdvance is null (never 0) when the period has no usable rows", async () => {
+    aggregateMock.mockResolvedValue([canned({ primaryAvgAdvance: [] })]);
+    const app = makeApp({ roles: ["WORKSPACE_LEADER"], email: LEADER_EMAIL });
+    const res = await request(app).get("/stats?from=2026-01-01&to=2026-07-20");
+    expect(res.body.primary.avgDaysAdvance).toBeNull();
   });
 
   it("compare is null when compareFrom/compareTo are absent, and no compare facet is requested", async () => {

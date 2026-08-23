@@ -125,7 +125,25 @@ export function resolveVisaChecklistItems(
   const groups = source.documentGroups;
   const bypassFiltering = applicantProfile === undefined || applicantProfile === null;
 
-  if (Array.isArray(groups) && groups.length > 0) {
+  // PRESENT, not NON-EMPTY (2026-08-14). This used to read
+  // `groups.length > 0`, which meant a rule edited down to zero groups fell
+  // through to the legacy branch instead of resolving to "no requirements".
+  // That was harmless only by accident: `documentRequirements` happens to be
+  // empty on every rule in production, so the fallthrough produced an empty
+  // list either way. It stops being harmless the moment anyone puts a row
+  // back in the legacy field — a rule with a deliberately emptied checklist
+  // would silently start quoting whatever was left in the old one. Making
+  // the array's PRESENCE the signal closes that without changing any
+  // existing behaviour.
+  //
+  // Old ruleSnapshots are still handled exactly as before, and by the same
+  // test rather than a special case: VisaRuleSnapshotSchema has no
+  // `documentGroups` field at all, so `groups` is undefined there — not an
+  // empty array — and undefined still means "this source predates groups,
+  // use the legacy list". A VisaRule always has the field (Mongoose
+  // defaults the array), so a rule always resolves from groups. That is the
+  // whole distinction: absent means legacy, empty means empty.
+  if (Array.isArray(groups)) {
     return groups
       .filter((g) => bypassFiltering || evaluateApplicantPredicate(g.appliesWhen, applicantProfile))
       .map(groupToItem);

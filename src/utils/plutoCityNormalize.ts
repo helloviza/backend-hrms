@@ -35,9 +35,9 @@ const MAX_NAME_LEN = 60;
  * auto-updating `-latest` alias, so this step cannot change behaviour under us
  * without a deliberate edit.
  *
- * NOTE for whoever reads this next: utils/plutoGeminiInvoke.ts still targets
- * gemini-1.5-flash, which means the concierge's whole Gemini fallback path is
- * dead in the same way. Out of scope here, reported separately.
+ * (utils/plutoGeminiInvoke.ts and services/ticketIngestion.ts were still on
+ * gemini-1.5-flash when this note was first written — both repointed here too,
+ * so no live call site targets the retired model any more.)
  */
 const MODEL = "gemini-2.5-flash";
 

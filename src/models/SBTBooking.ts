@@ -1,6 +1,7 @@
 import { Schema, model, type Document } from "mongoose";
 import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import TravelBooking from "./TravelBooking.js";
+import { canonicalCity, countryFor } from "../data/destinationLookup.js";
 
 export interface ISBTBooking extends Document {
   userId: Schema.Types.ObjectId;
@@ -266,6 +267,12 @@ function mapStatus(s: string): "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" 
 
 SBTBookingSchema.post("save", async function (doc: any) {
   try {
+    // Cities-only Top Destinations ranking fields — Tier 2 of the backfill's
+    // resolver (backfill-destination-fields.ts's `resolve()`): trust the
+    // structured destination.city field (canonicalized via the lookup
+    // table), country from destination.code (IATA) falling back to city.
+    const destCity = canonicalCity(doc.destination?.city);
+    const destCountry = countryFor(doc.destination?.code, doc.destination?.city);
     await TravelBooking.findOneAndUpdate(
       { reference: doc._id },
       {
@@ -279,6 +286,9 @@ SBTBookingSchema.post("save", async function (doc: any) {
         reference: doc._id,
         referenceModel: "SBTBooking",
         destination: doc.destination?.city || "",
+        destinationCity: destCity,
+        destinationCountry: destCountry,
+        isInternational: destCountry == null ? null : destCountry !== "IN",
         origin: doc.origin?.city || "",
         bookedAt: doc.bookedAt || doc.createdAt,
         travelDate: doc.departureTime ? new Date(doc.departureTime) : null,

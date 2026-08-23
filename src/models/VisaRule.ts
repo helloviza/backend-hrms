@@ -78,7 +78,23 @@ export interface VisaDocumentRequirement {
  * immigration on arrival").
  */
 export interface VisaDocumentRequirementGroup {
-  key: string; // stable slug within the rule, e.g. "PROOF_OF_OCCUPATION"
+  // THE stable identity of this group, for per-group editing (2026-08-14).
+  //
+  // `key` below cannot serve that purpose: it is DERIVED FROM THE LABEL
+  // (slugifyChecklistLabel), so renaming a requirement changes its key, and
+  // a per-group edit keyed on it would orphan the original row and add a
+  // second one instead of updating. groupId is assigned once and never
+  // changes, whatever happens to the label.
+  //
+  // Optional in the schema, and that is on purpose rather than an
+  // oversight: every group stored before this existed has none until
+  // migrations/2026-08-14-backfill-document-group-ids.ts runs. The per-group
+  // edit and delete routes REFUSE to operate on a group without one rather
+  // than falling back to key or array index — a silent fallback is exactly
+  // how you edit the wrong requirement. Once the backfill has run
+  // everywhere, this can become required.
+  groupId?: string;
+  key: string; // display/import slug, DERIVED FROM THE LABEL — not an identity, see groupId
   label: string; // human label, e.g. "Proof of occupation (if employed)"
   requirement: VisaDocRequirementLevel;
   appliesWhen?: VisaApplicantPredicate;
@@ -292,6 +308,14 @@ const VisaDocumentRequirementSchema = new Schema<VisaDocumentRequirement>(
 
 const VisaDocumentRequirementGroupSchema = new Schema<VisaDocumentRequirementGroup>(
   {
+    // Deliberately NO `default:` — see the interface comment. A default
+    // would mint a fresh id every time a stored group without one is
+    // hydrated, so the "stable" id would differ between two GETs of the
+    // same rule and per-group editing would target the wrong row. Ids are
+    // assigned in exactly two places, both of which then SAVE: the
+    // backfill migration, and the create path in
+    // routes/admin.visa.rules.documentGroups.ts.
+    groupId: { type: String, trim: true },
     key: { type: String, required: true, trim: true },
     label: { type: String, required: true, trim: true },
     requirement: { type: String, enum: VISA_DOC_REQUIREMENT_LEVELS, required: true },

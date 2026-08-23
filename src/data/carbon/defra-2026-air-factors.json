@@ -1,0 +1,282 @@
+[
+  {
+    "defraId": "21_316_3160_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Domestic, to/from UK",
+    "classLabel": "Average passenger",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.22928
+  },
+  {
+    "defraId": "21_316_3161_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Domestic, to/from UK",
+    "classLabel": "Average passenger",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.13552
+  },
+  {
+    "defraId": "21_316_3162_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Short-haul, to/from UK",
+    "classLabel": "Average passenger",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.12786
+  },
+  {
+    "defraId": "21_316_3163_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Short-haul, to/from UK",
+    "classLabel": "Average passenger",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.07559
+  },
+  {
+    "defraId": "21_316_3164_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Short-haul, to/from UK",
+    "classLabel": "Economy class",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.12576
+  },
+  {
+    "defraId": "21_316_3165_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Short-haul, to/from UK",
+    "classLabel": "Economy class",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.07435
+  },
+  {
+    "defraId": "21_316_3166_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Short-haul, to/from UK",
+    "classLabel": "Business class",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.18863
+  },
+  {
+    "defraId": "21_316_3167_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Short-haul, to/from UK",
+    "classLabel": "Business class",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.11152
+  },
+  {
+    "defraId": "21_316_3168_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Long-haul, to/from UK",
+    "classLabel": "Average passenger",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.15282
+  },
+  {
+    "defraId": "21_316_3169_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Long-haul, to/from UK",
+    "classLabel": "Average passenger",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.09043
+  },
+  {
+    "defraId": "21_316_3170_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Long-haul, to/from UK",
+    "classLabel": "Economy class",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.11704
+  },
+  {
+    "defraId": "21_316_3171_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Long-haul, to/from UK",
+    "classLabel": "Economy class",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.06926
+  },
+  {
+    "defraId": "21_316_3172_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Long-haul, to/from UK",
+    "classLabel": "Premium economy class",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.18726
+  },
+  {
+    "defraId": "21_316_3173_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Long-haul, to/from UK",
+    "classLabel": "Premium economy class",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.11081
+  },
+  {
+    "defraId": "21_316_3174_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Long-haul, to/from UK",
+    "classLabel": "Business class",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.3394
+  },
+  {
+    "defraId": "21_316_3175_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Long-haul, to/from UK",
+    "classLabel": "Business class",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.20083
+  },
+  {
+    "defraId": "21_316_3176_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Long-haul, to/from UK",
+    "classLabel": "First class",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.46814
+  },
+  {
+    "defraId": "21_316_3177_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "Long-haul, to/from UK",
+    "classLabel": "First class",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.27701
+  },
+  {
+    "defraId": "21_316_3178_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "International, to/from non-UK",
+    "classLabel": "Average passenger",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.14253
+  },
+  {
+    "defraId": "21_316_3179_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "International, to/from non-UK",
+    "classLabel": "Average passenger",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.0842
+  },
+  {
+    "defraId": "21_316_3180_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "International, to/from non-UK",
+    "classLabel": "Economy class",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.10916
+  },
+  {
+    "defraId": "21_316_3181_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "International, to/from non-UK",
+    "classLabel": "Economy class",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.06449
+  },
+  {
+    "defraId": "21_316_3182_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "International, to/from non-UK",
+    "classLabel": "Premium economy class",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.17465
+  },
+  {
+    "defraId": "21_316_3183_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "International, to/from non-UK",
+    "classLabel": "Premium economy class",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.10318
+  },
+  {
+    "defraId": "21_316_3184_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "International, to/from non-UK",
+    "classLabel": "Business class",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.31656
+  },
+  {
+    "defraId": "21_316_3185_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "International, to/from non-UK",
+    "classLabel": "Business class",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.18701
+  },
+  {
+    "defraId": "21_316_3186_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "International, to/from non-UK",
+    "classLabel": "First class",
+    "rfVariant": "With RF",
+    "unit": "passenger.km",
+    "value": 0.43663
+  },
+  {
+    "defraId": "21_316_3187_11_1",
+    "scope": "Scope 3",
+    "activity": "Flights",
+    "haulLabel": "International, to/from non-UK",
+    "classLabel": "First class",
+    "rfVariant": "Without RF",
+    "unit": "passenger.km",
+    "value": 0.25794
+  }
+]

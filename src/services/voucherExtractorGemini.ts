@@ -162,7 +162,7 @@ function pickBestBarcode(candidates: any): string | null {
 
 /* ───────────────────────── RAW contract (Gemini output) ───────────────────────── */
 
-type RawCandidate = {
+export type RawCandidate = {
   detected_type: "hotel" | "flight" | "unknown";
 
   booking_info?: {
@@ -493,7 +493,18 @@ function validateVoucherShape(v: any): ValidationError[] {
 
 /* ───────────────────────── normalize RAW -> PlumtripsVoucher ───────────────────────── */
 
-function normalizeToVoucher(args: {
+/**
+ * Exported (pure, no I/O) so a caller holding an already-returned raw
+ * candidate can re-normalize it under a different forced type without paying
+ * a second Gemini call. `voucherType` on extractVoucherViaGemini() is FORCED,
+ * not a hint — it beats the model's own detected_type below — so a caller that
+ * cannot know the document's type up front extracts once with its best guess,
+ * reads raw.raw_candidate.detected_type, and re-normalizes here when the two
+ * disagree. The raw candidate always carries both the flight and hotel blocks,
+ * so nothing is lost by having guessed wrong. Used by
+ * services/documentExtraction.service.ts.
+ */
+export function normalizeToVoucher(args: {
   raw: RawCandidate;
   forcedType: VoucherType;
   customLogo: string;
