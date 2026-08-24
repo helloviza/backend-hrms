@@ -480,6 +480,21 @@ import consumerProfileRouter from "./routes/consumer.profile.js";
 app.use("/api/consumer/profile", consumerProfileRouter);
 
 /* ────────────────────────────────────────────────────────────────
+ * Mobile verification — /api/consumer/mobile/otp/{send,resend,verify}.
+ *
+ * A SEPARATE router from the profile above even though it writes one field
+ * on the profile document, because the two have different middleware: these
+ * routes carry a Turnstile gate and a cost-based rate limiter that no other
+ * profile route wants, and folding them in would mean either applying those
+ * to the whole profile router or wiring per-route middleware into a file
+ * whose guarantee is that its guard is mounted router-wide.
+ *
+ * It is also the ONLY writer of contact.mobileVerified — see that file's
+ * header for why that list must stay short. */
+import consumerMobileOtpRouter from "./routes/consumer.mobileOtp.js";
+app.use("/api/consumer/mobile", consumerMobileOtpRouter);
+
+/* ────────────────────────────────────────────────────────────────
  * The D2C visa cases — /api/consumer/applications.
  *
  * Same wall as the profile router above (requireConsumer inside the

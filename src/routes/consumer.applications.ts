@@ -50,6 +50,7 @@ import VisaRule from "../models/VisaRule.js";
 import VisaRequest, { recomputeRequestStatus } from "../models/VisaRequest.js";
 import VisaApplication from "../models/VisaApplication.js";
 import ConsumerDocument from "../models/ConsumerDocument.js";
+import ConsumerProfile from "../models/ConsumerProfile.js";
 import VisaD2CLead from "../models/VisaD2CLead.js";
 import VisaActivityLog from "../models/VisaActivityLog.js";
 import { isUtmEmpty, normaliseUtm } from "../models/visaUtm.js";
@@ -280,6 +281,43 @@ router.post("/", async (req: any, res: any) => {
     if (!SELECTABLE_PURPOSES.includes(purpose as any)) {
       return res.status(400).json({
         error: `purpose must be one of: ${SELECTABLE_PURPOSES.join(", ")}`,
+      });
+    }
+
+    /* ── THE VERIFIED-MOBILE GATE ──────────────────────────────────────
+     * A visa case is worked by a human who will phone the applicant, and a
+     * case whose number nobody has proven reachable is a case that stalls
+     * at the first callback. The gate sits HERE — after the cheap input
+     * validation, before resolveRuleFor — so an unverified consumer is
+     * turned away without us paying for a rule lookup, and before any of
+     * the writes further down have started.
+     *
+     * Read from the consumer's OWN profile, never from the request. The
+     * flag has exactly two writers, both server-side
+     * (routes/consumer.mobileOtp.ts sets it true after MSG91 confirms; the
+     * contact save in routes/consumer.profile.ts sets it false when the
+     * number changes) and it is absent from that file's PATCH allowlist, so
+     * a client cannot grant itself passage.
+     *
+     * .lean() and a one-field projection: this is an authorisation read on
+     * the hot path of every submit, and it must not drag the most sensitive
+     * document in the database — passports, addresses, dates of birth —
+     * through the decryption plugin to answer a boolean. mobileVerified is
+     * NOT an encrypted field, so a lean read returns it plainly; a lean read
+     * of contact.mobile would return an envelope, which is exactly why this
+     * projects the flag and never the number.
+     *
+     * The code is machine-readable because the frontend routes on it — a
+     * blocked submit sends the consumer to the verify flow rather than
+     * showing them a dead end. See account/api.ts's ApiError.code. */
+    const verification = await ConsumerProfile.findOne({ consumerId })
+      .select("contact.mobileVerified")
+      .lean();
+
+    if ((verification as any)?.contact?.mobileVerified !== true) {
+      return res.status(403).json({
+        error: "Please verify your mobile number before submitting an application.",
+        code: "MOBILE_NOT_VERIFIED",
       });
     }
 

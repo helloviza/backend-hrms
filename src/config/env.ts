@@ -108,6 +108,34 @@ export const env = {
   WA_ACCESS_TOKEN: process.env.WA_ACCESS_TOKEN || "",       // Graph API bearer token
   WA_PHONE_NUMBER_ID: process.env.WA_PHONE_NUMBER_ID || "", // business number id (send replies)
   WA_GRAPH_VERSION: process.env.WA_GRAPH_VERSION || "v21.0",
+
+  // --- MSG91 (consumer mobile OTP) ------------------------------------------
+  // The FIRST transactional SMS path in this codebase — there was no SMS
+  // provider of any kind before this (the two WhatsApp layers are WhatsApp,
+  // not SMS). Threaded in via the APP_SECRETS bundle like every other
+  // provider credential above; never hardcoded, and never logged (the
+  // service redacts the key out of every URL before it reaches a log line).
+  //
+  // Deliberately NOT requireEnv(), for exactly the reason PII_MASTER_KEY
+  // above is not: only the OTP routes need these, and making them mandatory
+  // would fail the boot of every process that touches none of them —
+  // including every standalone script under src/scripts/*. Absence is
+  // enforced where it matters instead: services/consumerMobileOtp.ts THROWS
+  // on first use in production and degrades to a typed "not configured"
+  // error outside it, so a dev box with no key gets a clear 503 rather than
+  // a confusing 502 from a request MSG91 never saw.
+  //
+  // MSG91_VERIFY_TEMPLATE_ID is the `verifyMobile` DLT-registered template
+  // specifically. The reference implementation carried a three-entry
+  // TEMPLATE_MAP (login / resetPassword / verifyMobile) with the ids inline;
+  // only the verifyMobile flow exists here, so this is one env var rather
+  // than a map — a login-by-OTP flow would add its own, not reuse this one.
+  MSG91_AUTH_KEY: process.env.MSG91_AUTH_KEY || "",
+  MSG91_VERIFY_TEMPLATE_ID: process.env.MSG91_VERIFY_TEMPLATE_ID || "",
+  // Minutes. MSG91 owns the countdown — we send it and never store it.
+  // 5, not 15: the codes are 4-digit (10,000 wide), so the window in which a
+  // live code is guessable is itself a control. Prod inherits this default.
+  MSG91_OTP_EXPIRY_MIN: Number(process.env.MSG91_OTP_EXPIRY_MIN || 5),
 } as const;
 
 /**

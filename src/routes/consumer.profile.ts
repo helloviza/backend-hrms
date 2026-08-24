@@ -50,6 +50,7 @@ import {
   storageDescription,
 } from "../services/consumerDocumentStorage.js";
 import { processAvatar, AVATAR_MIME } from "../services/consumerAvatar.js";
+import { normaliseIndiaMobile } from "../services/consumerMobileOtp.js";
 import { getCountryDisplayName, getDemonymOrName } from "@plumtrips/shared/countries";
 
 const router = Router();
@@ -374,6 +375,25 @@ const SECTION_FIELDS: Record<string, string[]> = {
 
 const ADDRESS_FIELDS = ["line1", "line2", "city", "state", "postalCode", "country"];
 
+/**
+ * "Is this the same phone number?" — for the reset-on-edit rule in the
+ * contact PATCH below.
+ *
+ * Compares normalised Indian digits when BOTH sides normalise (so
+ * "+91 98765 43210", "919876543210" and "9876543210" are one number), and
+ * falls back to a trimmed string compare when either side does not — a
+ * number we cannot normalise is still a number that can be edited, and the
+ * fallback means an unrecognised format is compared literally rather than
+ * collapsing to "" and reading as unchanged against everything else that
+ * also fails to normalise.
+ */
+function sameMobile(a: unknown, b: unknown): boolean {
+  const na = normaliseIndiaMobile(a);
+  const nb = normaliseIndiaMobile(b);
+  if (na && nb) return na === nb;
+  return String(a ?? "").trim() === String(b ?? "").trim();
+}
+
 function pick(source: any, allowed: string[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if (!source || typeof source !== "object") return out;
@@ -461,6 +481,33 @@ router.patch("/:section", async (req: any, res: any) => {
       }
       if (updates.permanentAddress !== undefined) {
         updates.permanentAddress = pick(updates.permanentAddress, ADDRESS_FIELDS);
+      }
+
+      /* ── RESET-ON-EDIT ─────────────────────────────────────────────
+       * Changing your number un-verifies it. Without this, the sequence
+       * "verify 98765 43210 → edit the field to a number you do not own →
+       * submit an application" walks straight through the submit gate in
+       * consumer.applications.ts carrying a verified flag that was earned
+       * by a different phone.
+       *
+       * This is the ONLY place the flag is written to false, and
+       * routes/consumer.mobileOtp.ts is the only place it is written to
+       * true. It stays off SECTION_FIELDS.contact above, so a client still
+       * cannot set it either way by asking — pick() would drop it.
+       *
+       * A SAVE THAT DOES NOT CHANGE THE NUMBER KEEPS ITS STATE. The
+       * comparison is on the normalised digits, not the raw strings, so
+       * re-saving the contact tab after editing only an address — or
+       * saving "+91 98765 43210" over a stored "9876543210" — is not
+       * treated as a change. Treating a reformat as a new number would
+       * make the badge flicker off for a user who changed nothing, and
+       * would cost them (and us) another SMS to get it back. */
+      if (updates.mobile !== undefined) {
+        const before = profile.contact?.mobile;
+        if (!sameMobile(before, updates.mobile)) {
+          profile.contact.mobileVerified = false;
+          profile.contact.mobileVerifiedAt = undefined;
+        }
       }
     }
 
