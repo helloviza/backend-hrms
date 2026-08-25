@@ -293,15 +293,27 @@ describe("GET /visa/map — every country, not just the served ones", () => {
 
   it("carries a numeric approval rate ONLY for SOURCED_APPROVAL members", async () => {
     const res = await request(app()).get("/api/public/visa/map");
+    /* THE HONESTY GUARANTEE, in its post-dataset form.
+     *
+     * "Is there a row?" is no longer the same question as "is a number
+     * shown?" — the dataset covers 194 countries, but the category
+     * short-circuit still returns a fixed string for every VISA_FREE /
+     * E_VISA / VOA / TRAVEL_AUTH corridor regardless. So this asks the
+     * only question that matters to a reader: whatever string is on the
+     * surface, either it is a sourced figure WITH its figures object, or
+     * it is one of exactly three fixed phrases carrying no digit at all.
+     * There is still no fourth possibility. */
     const sourced = new Set(Object.keys(SOURCED_APPROVAL));
 
     for (const d of res.body.destinations) {
-      if (sourced.has(d.iso2)) {
-        expect(d.approvalChances, d.iso2).toMatch(/%/);
+      if (/%/.test(d.approvalChances)) {
+        expect(sourced.has(d.iso2), `${d.iso2} shows a figure so must be sourced`).toBe(true);
+        expect(d.approvalFigures, d.iso2).toBeTruthy();
       } else {
-        // The whole honesty guarantee, asserted 165 times.
         expect(d.approvalChances, d.iso2).not.toMatch(/\d/);
         expect(["Not required", "Very High", "Varies by profile"]).toContain(d.approvalChances);
+        // No figures may ride along with a fixed phrase.
+        expect(d.approvalFigures, d.iso2).toBeNull();
       }
     }
   });
@@ -311,12 +323,33 @@ describe("GET /visa/map — every country, not just the served ones", () => {
     const chance = (iso2: string) =>
       res.body.destinations.find((d: any) => d.iso2 === iso2).approvalChances;
 
-    expect(chance("US")).toBe("~78% (India, FY25)");
-    expect(chance("GB")).toBe("~93% (India)");
-    expect(chance("FR")).toBe("~85% (India, 2024)");
-    // A sticker country with no sourced rate says so.
-    expect(chance("CN")).toBe("Varies by profile");
-    expect(chance("AE")).toBe("Varies by profile");
+    // Per-country now, each derived from that country's own y2026 — the
+    // 29 Schengen members no longer share one aggregate string.
+    const figures = (iso2: string) =>
+      res.body.destinations.find((d: any) => d.iso2 === iso2).approvalFigures;
+
+    expect(figures("FR")).toEqual({ avg5: 79, avg3: 81, y2026: 82 });
+    expect(chance("FR")).toBe("~82% (India, 2026)");
+    expect(chance("FR")).not.toBe(chance("PT"));
+    /* The three seed countries the dataset does NOT cover. CN and AE used
+     * to stand here as "Varies by profile" and no longer can — both now
+     * carry figures.
+     *
+     * ⚠ WORTH KNOWING: "Varies by profile" is now UNREACHABLE on this
+     * endpoint. It was the string for a STICKER country with no sourced
+     * rate, and there is no longer such a country — the dataset covers
+     * every STICKER corridor in the seed, and CI/HK/MO (the only gaps)
+     * are E_VISA, TRAVEL_AUTH and VISA_FREE, so all three short-circuit
+     * on category first. The phrase is kept as the fallback because the
+     * gap can reopen the moment a country is added to the seed and not
+     * to the dataset; it is simply not exercised today.
+     *
+     * So this asserts the property that still holds for them: no digit
+     * reaches a reader, and no figures object rides along. */
+    for (const iso2 of ["CI", "HK", "MO"]) {
+      expect(chance(iso2), iso2).not.toMatch(/\d/);
+      expect(figures(iso2), iso2).toBeNull();
+    }
   });
 
   /* ── provenance, legend, leak whitelist ── */
@@ -354,6 +387,7 @@ describe("GET /visa/map — every country, not just the served ones", () => {
     for (const d of res.body.destinations) {
       expect(Object.keys(d).sort()).toEqual([
         "approvalChances",
+        "approvalFigures",
         "categoryIsMixed",
         "continent",
         "countryName",
@@ -477,8 +511,12 @@ describe("GET /visa/country/:iso2 — unserviced", () => {
     expect(res.body.countryName).toBe("Germany");
     expect(res.body.serviced).toBe(false);
     expect(res.body.visaType).toBe(seedCategory("DE"));
+    /* Hard, unchanged from HEAD. Germany's own 2026 figure is 78% — a 22%
+     * refusal, which WOULD have escalated it while the approval data was
+     * wired into difficulty. The figures are display-only, so it does not. */
     expect(res.body.difficulty).toBe("Hard");
-    expect(res.body.approvalChances).toBe("~85% (India, 2024)");
+    expect(res.body.approvalChances).toBe("~78% (India, 2026)");
+    expect(res.body.approvalFigures).toEqual({ avg5: 73, avg3: 73, y2026: 78 });
   });
 
   it("treats a DRAFT-only corridor as unserviced", async () => {
@@ -515,10 +553,10 @@ describe("GET /visa/country/:iso2 — unserviced", () => {
     const res = await request(app()).get("/api/public/visa/country/DE");
     expect(Object.keys(res.body).sort()).toEqual([
       "approvalChances",
+      "approvalFigures",
       // The panel's Sources footnote. `approvalSource` is a KEY THAT IS
       // ALWAYS PRESENT and a VALUE THAT IS USUALLY NULL — see the
       // provenance block below for what decides which.
-      "approvalSource",
       "countryName",
       "destinationName",
       "difficulty",
@@ -538,62 +576,77 @@ describe("GET /visa/country/:iso2 — unserviced", () => {
     ]);
   });
 
-  /* ── PROVENANCE FOR THE APPROVAL FIGURE ────────────────────────────
+  /* ── WHAT REPLACED PER-COUNTRY PROVENANCE ─────────────────────────
    *
-   * The rule these four cases pin down is the one the whole data layer
-   * exists to protect: A CITATION MAY ONLY APPEAR NEXT TO THE FIGURE IT
-   * JUSTIFIES. `approvalSource` is therefore driven by what the endpoint
-   * is DISPLAYING, not by whether SOURCED_APPROVAL has a row — and those
-   * two questions have different answers on real countries. */
+   * `approvalSource` is GONE from this payload. The rule it enforced — a
+   * citation may only appear next to the figure it justifies — could not
+   * survive a dataset aggregated from many public sources with no single
+   * publisher per row, and the alternative (a fabricated per-country
+   * credit) is the exact failure the data layer exists to prevent.
+   *
+   * The honesty guarantee moved to the surface: every figure is rendered
+   * beside APPROVAL_ESTIMATE_DISCLAIMER by the same component, so no
+   * arrangement of props yields a number without it. What this endpoint
+   * still owes is narrower and asserted below — figures appear only where
+   * the sourced label is what is displayed, and the payload never adopts
+   * the vocabulary of a personal prediction. */
 
-  it("credits the approval figure only where a sourced figure is shown", async () => {
+  it("carries NO per-country citation machinery at all", async () => {
     const res = await request(app()).get("/api/public/visa/country/US");
-    expect(res.body.approvalChances).toBe("~78% (India, FY25)");
-    // Echoed, not re-derived: the credit leads with the same string the
-    // panel prints, so the two cannot drift.
-    expect(res.body.approvalSource.value).toBe(res.body.approvalChances);
-    expect(res.body.approvalSource.metricType).toBe("issued");
-    expect(res.body.approvalSource.year).toBe("FY25");
-    expect(res.body.approvalSource.sourceName).toBe("US State Department");
+    expect(res.body.approvalSource).toBeUndefined();
+    const blob = JSON.stringify(res.body);
+    for (const gone of ["TODO_CITATION", "sourceName", "metricType", "citation"]) {
+      expect(blob, gone).not.toContain(gone);
+    }
   });
 
-  it("says ISSUED and never CHANCE — the figure is an outcome statistic", async () => {
-    /* The wording rule, asserted rather than trusted to review. The
-     * metric vocabulary is closed, and the disclaimer that bounds it is
-     * on the payload so the panel cannot print the number without it. */
+  it("says nothing that reads as a personal prediction", async () => {
+    /* The wording rule, asserted rather than trusted to review. It used to
+     * be scoped to the approvalSource object; with that gone it applies to
+     * the approval fields themselves. */
     const res = await request(app()).get("/api/public/visa/country/FR");
-    expect(["issued", "granted", "approved"]).toContain(res.body.approvalSource.metricType);
-    expect(res.body.approvalSource.disclaimer).toMatch(/not a prediction/i);
-    const blob = JSON.stringify(res.body.approvalSource).toLowerCase();
+    /* VALUES ONLY. Stringifying the object would fold in the KEY
+     * `approvalChances`, which contains "chance" — the field name is not
+     * copy a reader ever sees, and matching it would fail every payload
+     * forever. */
+    const blob = [res.body.approvalChances, JSON.stringify(res.body.approvalFigures)]
+      .join(" ")
+      .toLowerCase();
     for (const banned of ["chance", "odds", "likelihood", "guarantee"]) {
       expect(blob, banned).not.toContain(banned);
     }
   });
 
-  it("names the Schengen figure as an aggregate, because that is what it is", async () => {
-    /* 29 countries share one European Commission number. The footnote is
-     * the only place a reader can learn that the rate on France's panel
-     * is not France's own, so the qualifier is part of the source name
-     * rather than a comment in the code. */
-    const res = await request(app()).get("/api/public/visa/country/FR");
-    expect(res.body.approvalSource.sourceName).toMatch(/aggregate/i);
+  /* ── THE E-VISA THRESHOLD ──────────────────────────────────────────
+   *
+   * An e-visa/VOA/travel-auth corridor keeps the words "Very High" only
+   * while its own data agrees. Below VERY_HIGH_MIN_PCT the figures win,
+   * because a card asserting "Very High" over a 3% dataset entry is worse
+   * than a card that says less. */
+
+  it("shows figures for an e-visa corridor whose own data contradicts \"Very High\"", async () => {
+    const res = await request(app()).get("/api/public/visa/country/UA");
+    expect(res.body.visaType).toBe("E_VISA");
+    expect(res.body.approvalFigures).toEqual({ avg5: 3, avg3: 4, y2026: 3 });
+    expect(res.body.approvalChances).toBe("~3% (India, 2026)");
   });
 
-  it("leaves approvalSource null wherever the figure is a fixed phrase", async () => {
-    /* THE CASE THAT MATTERS, and the one a naive `SOURCED_APPROVAL[iso2]`
-     * lookup would get wrong.
-     *
-     *   AU  IS in SOURCED_APPROVAL upstream, but is E_VISA — so
-     *       approvalChancesFor short-circuits to "Very High" before the
-     *       sourced map is consulted. A credit here would put a
-     *       government statistic under the words "Very High".
-     *   DZ  no row at all: "Varies by profile".
-     *   MV  VISA_FREE: "Not required".
-     */
-    for (const iso2 of ["AU", "DZ", "MV"]) {
+  it("shows a HIGH e-visa corridor's figures too — no threshold, no substitution", async () => {
+    /* Russia was the case that outlived both earlier rules: "Very High"
+     * unconditionally, then "Very High" because 95% is above 90. Under the
+     * plain rule it shows what we hold, like everything else that is not
+     * visa-free. */
+    const res = await request(app()).get("/api/public/visa/country/RU");
+    expect(res.body.visaType).toBe("E_VISA");
+    expect(res.body.approvalChances).toBe("~95% (India, 2026)");
+    expect(res.body.approvalFigures).toEqual({ avg5: 93, avg3: 94, y2026: 95 });
+  });
+
+  it("keeps \"Very High\" only where the dataset has no row at all", async () => {
+    for (const iso2 of ["CI", "HK"]) {
       const res = await request(app()).get(`/api/public/visa/country/${iso2}`);
-      expect(res.body.approvalChances, iso2).not.toMatch(/\d/);
-      expect(res.body.approvalSource, iso2).toBeNull();
+      expect(res.body.approvalChances, iso2).toBe("Very High");
+      expect(res.body.approvalFigures, iso2).toBeNull();
     }
   });
 
@@ -656,10 +709,16 @@ describe("GET /visa/country/:iso2 — serviced", () => {
     expect(res.body.serviced).toBe(true);
     expect(res.body.countryName).toBe("Thailand");
     expect(res.body.difficulty).toBe("Easy");
-    // TRAVEL_AUTH in the v3 seed: an arrival card is granted on
-    // submission, so it answers with the same string e-visa and
-    // on-arrival do. It is NOT "Not required" — something IS required.
-    expect(res.body.approvalChances).toBe("Very High");
+    /* TH is TRAVEL_AUTH in the v3 seed and used to answer "Very High" —
+     * the same string e-visa and on-arrival gave, and never "Not required",
+     * because something IS required. It holds figures (99/100/100), so
+     * under the plain rule it shows them instead. The phrase now appears
+     * only where the dataset has no row. */
+    /* Stored 99/100/100; displayed 99/99/99 — the 1-99 clamp, applied per
+     * line and to the headline alike. A flat 100% reads as "guaranteed",
+     * which no aggregate can support. */
+    expect(res.body.approvalChances).toBe("~99% (India, 2026)");
+    expect(res.body.approvalFigures).toEqual({ avg5: 99, avg3: 99, y2026: 99 });
     expect(res.body.lastVerified).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect(res.body.disclaimer).toMatch(/verify/i);
 

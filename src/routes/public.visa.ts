@@ -48,7 +48,11 @@ import {
   seedFailureReason,
   type SeedVisaCategory,
 } from "../config/visaCountrySeed.js";
-import { approvalChancesFor, approvalSourceFor, difficultyFor } from "../utils/visaDifficulty.js";
+import {
+  approvalChancesFor,
+  approvalFiguresFor,
+  difficultyFor,
+} from "../utils/visaDifficulty.js";
 import { normaliseToIso2 } from "../utils/countryCodes.js";
 import { customerPurposesForRules } from "../utils/visaPurposes.js";
 import { createTurnstileGate } from "../middleware/turnstile.js";
@@ -209,6 +213,9 @@ router.get("/visa/map", async (_req: any, res: any) => {
         categoryIsMixed: served ? served.categories.size > 1 : false,
         difficulty: difficultyFor(c.iso2, c.visaCategory),
         approvalChances: approvalChancesFor(c.iso2, c.visaCategory),
+        // The three readings. Null where the corridor shows a fixed string
+        // instead of a number — see approvalFiguresFor.
+        approvalFigures: approvalFiguresFor(c.iso2, c.visaCategory),
         serviced: Boolean(served),
         // Phase 3 (region rail). Both are the SEED's own values, passed
         // through — the frontend fits and filters by them and holds no
@@ -238,6 +245,9 @@ router.get("/visa/map", async (_req: any, res: any) => {
         categoryIsMixed: entry.categories.size > 1,
         difficulty: difficultyFor(iso2, category),
         approvalChances: approvalChancesFor(iso2, category),
+        // The three readings. Null where the corridor shows a fixed string
+        // instead of a number — see approvalFiguresFor.
+        approvalFigures: approvalFiguresFor(iso2, category),
         serviced: true,
         // A corridor the seed does not carry has no continent and no group
         // membership to state. Empty rather than guessed: the region rail
@@ -452,6 +462,9 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
         visaCategory: seedCountry.visaCategory,
         difficulty: difficultyFor(iso2, seedCountry.visaCategory),
         approvalChances: approvalChancesFor(iso2, seedCountry.visaCategory),
+        // The three readings. Null where the corridor shows a fixed string
+        // instead of a number — see approvalFiguresFor.
+        approvalFigures: approvalFiguresFor(iso2, seedCountry.visaCategory),
         serviced: false,
         // ── PROVENANCE, READ-ONLY ────────────────────────────────────
         // The seed's own attribution, passed through unchanged. It was
@@ -465,9 +478,6 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
         disclaimer: meta.disclaimer,
         // null for every country whose approval string is a fixed
         // phrase rather than a sourced figure — which is most of them.
-        // See approvalSourceFor: it asks the same question, in the same
-        // order, that the displayed value was produced by.
-        approvalSource: approvalSourceFor(iso2, seedCountry.visaCategory),
       });
     }
 
@@ -518,6 +528,9 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
       visaType: tooltipCategory,
       difficulty: difficultyFor(iso2, tooltipCategory),
       approvalChances: approvalChancesFor(iso2, tooltipCategory),
+      // The three readings. Null where the corridor shows a fixed string
+      // instead of a number — see approvalFiguresFor.
+      approvalFigures: approvalFiguresFor(iso2, tooltipCategory),
       serviced: true,
       // Same three provenance fields as the unserviced branch above, and
       // deliberately the same values: the attribution is a property of
@@ -530,7 +543,6 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
       // derived from the same category the DISPLAYED approval string was,
       // or the two can disagree on exactly the countries where those two
       // categories do (see the note above tooltipCategory).
-      approvalSource: approvalSourceFor(iso2, tooltipCategory),
       purpose: rule.purpose,
       /* THE CORRIDOR'S PURPOSES, not the chosen rule's.
        *

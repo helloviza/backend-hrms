@@ -1,0 +1,1172 @@
+{
+ "AF": {
+  "name": "Afghanistan",
+  "avg5": 45,
+  "avg3": 50,
+  "y2026": 75
+ },
+ "AL": {
+  "name": "Albania",
+  "avg5": 93,
+  "avg3": 94,
+  "y2026": 95
+ },
+ "DZ": {
+  "name": "Algeria",
+  "avg5": 84,
+  "avg3": 84,
+  "y2026": 88
+ },
+ "AD": {
+  "name": "Andorra",
+  "avg5": 86,
+  "avg3": 86,
+  "y2026": 90
+ },
+ "AO": {
+  "name": "Angola",
+  "avg5": 86,
+  "avg3": 88,
+  "y2026": 90
+ },
+ "AG": {
+  "name": "Antigua and Barbuda",
+  "avg5": 94,
+  "avg3": 94,
+  "y2026": 95
+ },
+ "AR": {
+  "name": "Argentina",
+  "avg5": 88,
+  "avg3": 89,
+  "y2026": 94
+ },
+ "AM": {
+  "name": "Armenia",
+  "avg5": 85,
+  "avg3": 86,
+  "y2026": 88
+ },
+ "AU": {
+  "name": "Australia",
+  "avg5": 75,
+  "avg3": 75,
+  "y2026": 72
+ },
+ "AT": {
+  "name": "Austria",
+  "avg5": 75,
+  "avg3": 76,
+  "y2026": 78
+ },
+ "AZ": {
+  "name": "Azerbaijan",
+  "avg5": 95,
+  "avg3": 96,
+  "y2026": 96
+ },
+ "BS": {
+  "name": "The Bahamas",
+  "avg5": 91,
+  "avg3": 92,
+  "y2026": 95
+ },
+ "BH": {
+  "name": "Bahrain",
+  "avg5": 90,
+  "avg3": 91,
+  "y2026": 94
+ },
+ "BD": {
+  "name": "Bangladesh",
+  "avg5": 87,
+  "avg3": 86,
+  "y2026": 95
+ },
+ "BB": {
+  "name": "Barbados",
+  "avg5": 98,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "BY": {
+  "name": "Belarus",
+  "avg5": 84,
+  "avg3": 86,
+  "y2026": 88
+ },
+ "BE": {
+  "name": "Belgium",
+  "avg5": 88,
+  "avg3": 89,
+  "y2026": 92
+ },
+ "BZ": {
+  "name": "Belize",
+  "avg5": 90,
+  "avg3": 91,
+  "y2026": 92
+ },
+ "BJ": {
+  "name": "Benin",
+  "avg5": 92,
+  "avg3": 93,
+  "y2026": 95
+ },
+ "BT": {
+  "name": "Bhutan",
+  "avg5": 80,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "BO": {
+  "name": "Bolivia",
+  "avg5": 88,
+  "avg3": 89,
+  "y2026": 94
+ },
+ "BA": {
+  "name": "Bosnia and Herzegovina",
+  "avg5": 80,
+  "avg3": 81,
+  "y2026": 82
+ },
+ "BW": {
+  "name": "Botswana",
+  "avg5": 84,
+  "avg3": 86,
+  "y2026": 88
+ },
+ "BR": {
+  "name": "Brazil",
+  "avg5": 90,
+  "avg3": 91,
+  "y2026": 94
+ },
+ "BN": {
+  "name": "Brunei",
+  "avg5": 88,
+  "avg3": 90,
+  "y2026": 94
+ },
+ "BG": {
+  "name": "Bulgaria",
+  "avg5": 77,
+  "avg3": 78,
+  "y2026": 80
+ },
+ "BF": {
+  "name": "Burkina Faso",
+  "avg5": 78,
+  "avg3": 79,
+  "y2026": 82
+ },
+ "BI": {
+  "name": "Burundi",
+  "avg5": 84,
+  "avg3": 86,
+  "y2026": 88
+ },
+ "CV": {
+  "name": "Cape Verde",
+  "avg5": 94,
+  "avg3": 95,
+  "y2026": 91
+ },
+ "KH": {
+  "name": "Cambodia",
+  "avg5": 95,
+  "avg3": 96,
+  "y2026": 96
+ },
+ "CM": {
+  "name": "Cameroon",
+  "avg5": 84,
+  "avg3": 86,
+  "y2026": 88
+ },
+ "CA": {
+  "name": "Canada",
+  "avg5": 55,
+  "avg3": 53,
+  "y2026": 52
+ },
+ "CF": {
+  "name": "Central African Republic",
+  "avg5": 74,
+  "avg3": 76,
+  "y2026": 78
+ },
+ "TD": {
+  "name": "Chad",
+  "avg5": 78,
+  "avg3": 79,
+  "y2026": 82
+ },
+ "CL": {
+  "name": "Chile",
+  "avg5": 87,
+  "avg3": 89,
+  "y2026": 94
+ },
+ "CN": {
+  "name": "China",
+  "avg5": 66,
+  "avg3": 81,
+  "y2026": 88
+ },
+ "CO": {
+  "name": "Colombia",
+  "avg5": 88,
+  "avg3": 90,
+  "y2026": 92
+ },
+ "KM": {
+  "name": "Comoros",
+  "avg5": 94,
+  "avg3": 95,
+  "y2026": 96
+ },
+ "CG": {
+  "name": "Republic of the Congo",
+  "avg5": 78,
+  "avg3": 79,
+  "y2026": 82
+ },
+ "CD": {
+  "name": "Democratic Republic of the Congo",
+  "avg5": 78,
+  "avg3": 79,
+  "y2026": 82
+ },
+ "CR": {
+  "name": "Costa Rica",
+  "avg5": 89,
+  "avg3": 91,
+  "y2026": 94
+ },
+ "HR": {
+  "name": "Croatia",
+  "avg5": 78,
+  "avg3": 75,
+  "y2026": 78
+ },
+ "CU": {
+  "name": "Cuba",
+  "avg5": 88,
+  "avg3": 89,
+  "y2026": 94
+ },
+ "CY": {
+  "name": "Cyprus",
+  "avg5": 80,
+  "avg3": 81,
+  "y2026": 82
+ },
+ "CZ": {
+  "name": "Czech Republic",
+  "avg5": 70,
+  "avg3": 70,
+  "y2026": 72
+ },
+ "DK": {
+  "name": "Denmark",
+  "avg5": 73,
+  "avg3": 73,
+  "y2026": 78
+ },
+ "DJ": {
+  "name": "Djibouti",
+  "avg5": 94,
+  "avg3": 96,
+  "y2026": 96
+ },
+ "DM": {
+  "name": "Dominica",
+  "avg5": 98,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "DO": {
+  "name": "Dominican Republic",
+  "avg5": 90,
+  "avg3": 91,
+  "y2026": 94
+ },
+ "EC": {
+  "name": "Ecuador",
+  "avg5": 80,
+  "avg3": 81,
+  "y2026": 82
+ },
+ "EG": {
+  "name": "Egypt",
+  "avg5": 92,
+  "avg3": 93,
+  "y2026": 96
+ },
+ "SV": {
+  "name": "El Salvador",
+  "avg5": 89,
+  "avg3": 91,
+  "y2026": 94
+ },
+ "GQ": {
+  "name": "Equatorial Guinea",
+  "avg5": 77,
+  "avg3": 79,
+  "y2026": 82
+ },
+ "ER": {
+  "name": "Eritrea",
+  "avg5": 42,
+  "avg3": 52,
+  "y2026": 55
+ },
+ "EE": {
+  "name": "Estonia",
+  "avg5": 68,
+  "avg3": 69,
+  "y2026": 72
+ },
+ "SZ": {
+  "name": "Eswatini",
+  "avg5": 90,
+  "avg3": 91,
+  "y2026": 94
+ },
+ "ET": {
+  "name": "Ethiopia",
+  "avg5": 95,
+  "avg3": 96,
+  "y2026": 96
+ },
+ "FJ": {
+  "name": "Fiji",
+  "avg5": 98,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "FI": {
+  "name": "Finland",
+  "avg5": 73,
+  "avg3": 73,
+  "y2026": 78
+ },
+ "FR": {
+  "name": "France",
+  "avg5": 79,
+  "avg3": 81,
+  "y2026": 82
+ },
+ "GA": {
+  "name": "Gabon",
+  "avg5": 88,
+  "avg3": 89,
+  "y2026": 92
+ },
+ "GM": {
+  "name": "The Gambia",
+  "avg5": 89,
+  "avg3": 89,
+  "y2026": 95
+ },
+ "GE": {
+  "name": "Georgia",
+  "avg5": 80,
+  "avg3": 81,
+  "y2026": 82
+ },
+ "DE": {
+  "name": "Germany",
+  "avg5": 73,
+  "avg3": 73,
+  "y2026": 78
+ },
+ "GH": {
+  "name": "Ghana",
+  "avg5": 80,
+  "avg3": 82,
+  "y2026": 88
+ },
+ "GR": {
+  "name": "Greece",
+  "avg5": 73,
+  "avg3": 73,
+  "y2026": 78
+ },
+ "GD": {
+  "name": "Grenada",
+  "avg5": 98,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "GT": {
+  "name": "Guatemala",
+  "avg5": 89,
+  "avg3": 91,
+  "y2026": 94
+ },
+ "GN": {
+  "name": "Guinea",
+  "avg5": 90,
+  "avg3": 92,
+  "y2026": 96
+ },
+ "GW": {
+  "name": "Guinea-Bissau",
+  "avg5": 88,
+  "avg3": 89,
+  "y2026": 92
+ },
+ "GY": {
+  "name": "Guyana",
+  "avg5": 82,
+  "avg3": 83,
+  "y2026": 88
+ },
+ "HT": {
+  "name": "Haiti",
+  "avg5": 89,
+  "avg3": 88,
+  "y2026": 96
+ },
+ "HN": {
+  "name": "Honduras",
+  "avg5": 89,
+  "avg3": 91,
+  "y2026": 94
+ },
+ "HU": {
+  "name": "Hungary",
+  "avg5": 73,
+  "avg3": 73,
+  "y2026": 78
+ },
+ "IS": {
+  "name": "Iceland",
+  "avg5": 73,
+  "avg3": 73,
+  "y2026": 78
+ },
+ "IN": {
+  "name": "India",
+  "avg5": null,
+  "avg3": null,
+  "y2026": null
+ },
+ "ID": {
+  "name": "Indonesia",
+  "avg5": 97,
+  "avg3": 98,
+  "y2026": 98
+ },
+ "IR": {
+  "name": "Iran",
+  "avg5": 93,
+  "avg3": 95,
+  "y2026": 98
+ },
+ "IQ": {
+  "name": "Iraq",
+  "avg5": 73,
+  "avg3": 75,
+  "y2026": 78
+ },
+ "IE": {
+  "name": "Republic of Ireland",
+  "avg5": 80,
+  "avg3": 81,
+  "y2026": 84
+ },
+ "IL": {
+  "name": "Israel",
+  "avg5": 77,
+  "avg3": 79,
+  "y2026": 78
+ },
+ "IT": {
+  "name": "Italy",
+  "avg5": 77,
+  "avg3": 78,
+  "y2026": 80
+ },
+ "JM": {
+  "name": "Jamaica",
+  "avg5": 98,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "JP": {
+  "name": "Japan",
+  "avg5": 92,
+  "avg3": 93,
+  "y2026": 96
+ },
+ "JO": {
+  "name": "Jordan",
+  "avg5": 92,
+  "avg3": 93,
+  "y2026": 96
+ },
+ "KZ": {
+  "name": "Kazakhstan",
+  "avg5": 99,
+  "avg3": 99,
+  "y2026": 100
+ },
+ "KE": {
+  "name": "Kenya",
+  "avg5": 94,
+  "avg3": 95,
+  "y2026": 96
+ },
+ "KI": {
+  "name": "Kiribati",
+  "avg5": 82,
+  "avg3": 82,
+  "y2026": 88
+ },
+ "KW": {
+  "name": "Kuwait",
+  "avg5": 58,
+  "avg3": 71,
+  "y2026": 78
+ },
+ "KG": {
+  "name": "Kyrgyzstan",
+  "avg5": 88,
+  "avg3": 89,
+  "y2026": 92
+ },
+ "LA": {
+  "name": "Laos",
+  "avg5": 94,
+  "avg3": 95,
+  "y2026": 96
+ },
+ "LV": {
+  "name": "Latvia",
+  "avg5": 68,
+  "avg3": 69,
+  "y2026": 72
+ },
+ "LB": {
+  "name": "Lebanon",
+  "avg5": 82,
+  "avg3": 83,
+  "y2026": 88
+ },
+ "LS": {
+  "name": "Lesotho",
+  "avg5": 90,
+  "avg3": 91,
+  "y2026": 94
+ },
+ "LR": {
+  "name": "Liberia",
+  "avg5": 79,
+  "avg3": 79,
+  "y2026": 86
+ },
+ "LY": {
+  "name": "Libya",
+  "avg5": 45,
+  "avg3": 47,
+  "y2026": 52
+ },
+ "LI": {
+  "name": "Liechtenstein",
+  "avg5": 73,
+  "avg3": 73,
+  "y2026": 78
+ },
+ "LT": {
+  "name": "Lithuania",
+  "avg5": 68,
+  "avg3": 69,
+  "y2026": 72
+ },
+ "LU": {
+  "name": "Luxembourg",
+  "avg5": 68,
+  "avg3": 69,
+  "y2026": 72
+ },
+ "MG": {
+  "name": "Madagascar",
+  "avg5": 94,
+  "avg3": 95,
+  "y2026": 96
+ },
+ "MW": {
+  "name": "Malawi",
+  "avg5": 95,
+  "avg3": 97,
+  "y2026": 100
+ },
+ "MY": {
+  "name": "Malaysia",
+  "avg5": 97,
+  "avg3": 98,
+  "y2026": 100
+ },
+ "MV": {
+  "name": "Maldives",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "ML": {
+  "name": "Mali",
+  "avg5": 78,
+  "avg3": 79,
+  "y2026": 82
+ },
+ "MT": {
+  "name": "Malta",
+  "avg5": 71,
+  "avg3": 72,
+  "y2026": 78
+ },
+ "MH": {
+  "name": "Marshall Islands",
+  "avg5": 89,
+  "avg3": 90,
+  "y2026": 96
+ },
+ "MR": {
+  "name": "Mauritania",
+  "avg5": 91,
+  "avg3": 93,
+  "y2026": 96
+ },
+ "MU": {
+  "name": "Mauritius",
+  "avg5": 98,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "MX": {
+  "name": "Mexico",
+  "avg5": 89,
+  "avg3": 91,
+  "y2026": 94
+ },
+ "FM": {
+  "name": "Federated States of Micronesia",
+  "avg5": 96,
+  "avg3": 97,
+  "y2026": 100
+ },
+ "MD": {
+  "name": "Moldova",
+  "avg5": 76,
+  "avg3": 77,
+  "y2026": 82
+ },
+ "MC": {
+  "name": "Monaco",
+  "avg5": 79,
+  "avg3": 81,
+  "y2026": 82
+ },
+ "MN": {
+  "name": "Mongolia",
+  "avg5": 93,
+  "avg3": 95,
+  "y2026": 96
+ },
+ "ME": {
+  "name": "Montenegro",
+  "avg5": 78,
+  "avg3": 80,
+  "y2026": 82
+ },
+ "MA": {
+  "name": "Morocco",
+  "avg5": 94,
+  "avg3": 95,
+  "y2026": 96
+ },
+ "MZ": {
+  "name": "Mozambique",
+  "avg5": 90,
+  "avg3": 93,
+  "y2026": 96
+ },
+ "MM": {
+  "name": "Myanmar",
+  "avg5": 89,
+  "avg3": 92,
+  "y2026": 96
+ },
+ "NA": {
+  "name": "Namibia",
+  "avg5": 89,
+  "avg3": 90,
+  "y2026": 96
+ },
+ "NR": {
+  "name": "Nauru",
+  "avg5": 82,
+  "avg3": 82,
+  "y2026": 88
+ },
+ "NP": {
+  "name": "Nepal",
+  "avg5": 97,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "NL": {
+  "name": "Netherlands",
+  "avg5": 77,
+  "avg3": 79,
+  "y2026": 81
+ },
+ "NZ": {
+  "name": "New Zealand",
+  "avg5": 77,
+  "avg3": 80,
+  "y2026": 82
+ },
+ "NI": {
+  "name": "Nicaragua",
+  "avg5": 88,
+  "avg3": 91,
+  "y2026": 88
+ },
+ "NE": {
+  "name": "Niger",
+  "avg5": 78,
+  "avg3": 79,
+  "y2026": 82
+ },
+ "NG": {
+  "name": "Nigeria",
+  "avg5": 78,
+  "avg3": 79,
+  "y2026": 82
+ },
+ "KP": {
+  "name": "North Korea",
+  "avg5": 84,
+  "avg3": 85,
+  "y2026": 88
+ },
+ "MK": {
+  "name": "North Macedonia",
+  "avg5": 78,
+  "avg3": 80,
+  "y2026": 82
+ },
+ "NO": {
+  "name": "Norway",
+  "avg5": 88,
+  "avg3": 90,
+  "y2026": 87
+ },
+ "OM": {
+  "name": "Oman",
+  "avg5": 98,
+  "avg3": 98,
+  "y2026": 99
+ },
+ "PK": {
+  "name": "Pakistan",
+  "avg5": 5,
+  "avg3": 6,
+  "y2026": 2
+ },
+ "PW": {
+  "name": "Palau",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "PS": {
+  "name": "Palestinian National Authority",
+  "avg5": 0,
+  "avg3": 0,
+  "y2026": 0
+ },
+ "PA": {
+  "name": "Panama",
+  "avg5": 90,
+  "avg3": 91,
+  "y2026": 91
+ },
+ "PG": {
+  "name": "Papua New Guinea",
+  "avg5": 88,
+  "avg3": 90,
+  "y2026": 91
+ },
+ "PY": {
+  "name": "Paraguay",
+  "avg5": 86,
+  "avg3": 87,
+  "y2026": 87
+ },
+ "PE": {
+  "name": "Peru",
+  "avg5": 90,
+  "avg3": 91,
+  "y2026": 91
+ },
+ "PH": {
+  "name": "Philippines",
+  "avg5": 89,
+  "avg3": 90,
+  "y2026": 92
+ },
+ "PL": {
+  "name": "Poland",
+  "avg5": 72,
+  "avg3": 74,
+  "y2026": 72
+ },
+ "PT": {
+  "name": "Portugal",
+  "avg5": 68,
+  "avg3": 71,
+  "y2026": 68
+ },
+ "QA": {
+  "name": "Qatar",
+  "avg5": 97,
+  "avg3": 98,
+  "y2026": 97
+ },
+ "RO": {
+  "name": "Romania",
+  "avg5": 79,
+  "avg3": 78,
+  "y2026": 74
+ },
+ "RU": {
+  "name": "Russia",
+  "avg5": 93,
+  "avg3": 94,
+  "y2026": 95
+ },
+ "RW": {
+  "name": "Rwanda",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "KN": {
+  "name": "Saint Kitts and Nevis",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "LC": {
+  "name": "Saint Lucia",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 99
+ },
+ "VC": {
+  "name": "Saint Vincent and the Grenadines",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "WS": {
+  "name": "Samoa",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "SM": {
+  "name": "San Marino",
+  "avg5": 86,
+  "avg3": 88,
+  "y2026": 87
+ },
+ "ST": {
+  "name": "São Tomé and Príncipe",
+  "avg5": 97,
+  "avg3": 98,
+  "y2026": 97
+ },
+ "SA": {
+  "name": "Saudi Arabia",
+  "avg5": 96,
+  "avg3": 97,
+  "y2026": 97
+ },
+ "SN": {
+  "name": "Senegal",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "RS": {
+  "name": "Serbia",
+  "avg5": 82,
+  "avg3": 78,
+  "y2026": 76
+ },
+ "SC": {
+  "name": "Seychelles",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "SL": {
+  "name": "Sierra Leone",
+  "avg5": 94,
+  "avg3": 95,
+  "y2026": 94
+ },
+ "SG": {
+  "name": "Singapore",
+  "avg5": 91,
+  "avg3": 92,
+  "y2026": 92
+ },
+ "SK": {
+  "name": "Slovakia",
+  "avg5": 78,
+  "avg3": 80,
+  "y2026": 79
+ },
+ "SI": {
+  "name": "Slovenia",
+  "avg5": 73,
+  "avg3": 76,
+  "y2026": 73
+ },
+ "SB": {
+  "name": "Solomon Islands",
+  "avg5": 97,
+  "avg3": 98,
+  "y2026": 98
+ },
+ "SO": {
+  "name": "Somalia",
+  "avg5": 93,
+  "avg3": 94,
+  "y2026": 92
+ },
+ "ZA": {
+  "name": "South Africa",
+  "avg5": 92,
+  "avg3": 93,
+  "y2026": 96
+ },
+ "KR": {
+  "name": "South Korea",
+  "avg5": 92,
+  "avg3": 93,
+  "y2026": 94
+ },
+ "SS": {
+  "name": "South Sudan",
+  "avg5": 84,
+  "avg3": 86,
+  "y2026": 84
+ },
+ "ES": {
+  "name": "Spain",
+  "avg5": 78,
+  "avg3": 81,
+  "y2026": 79
+ },
+ "LK": {
+  "name": "Sri Lanka",
+  "avg5": 98,
+  "avg3": 98,
+  "y2026": 98
+ },
+ "SD": {
+  "name": "Sudan",
+  "avg5": 50,
+  "avg3": 40,
+  "y2026": 48
+ },
+ "SR": {
+  "name": "Suriname",
+  "avg5": 96,
+  "avg3": 97,
+  "y2026": 96
+ },
+ "SE": {
+  "name": "Sweden",
+  "avg5": 69,
+  "avg3": 71,
+  "y2026": 68
+ },
+ "CH": {
+  "name": "Switzerland",
+  "avg5": 90,
+  "avg3": 92,
+  "y2026": 92
+ },
+ "SY": {
+  "name": "Syria",
+  "avg5": 20,
+  "avg3": 22,
+  "y2026": 18
+ },
+ "TW": {
+  "name": "Taiwan",
+  "avg5": 91,
+  "avg3": 92,
+  "y2026": 92
+ },
+ "TJ": {
+  "name": "Tajikistan",
+  "avg5": 93,
+  "avg3": 94,
+  "y2026": 94
+ },
+ "TZ": {
+  "name": "Tanzania",
+  "avg5": 94,
+  "avg3": 96,
+  "y2026": 94
+ },
+ "TH": {
+  "name": "Thailand",
+  "avg5": 99,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "TL": {
+  "name": "East Timor",
+  "avg5": 97,
+  "avg3": 98,
+  "y2026": 98
+ },
+ "TG": {
+  "name": "Togo",
+  "avg5": 95,
+  "avg3": 96,
+  "y2026": 96
+ },
+ "TO": {
+  "name": "Tonga",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "TT": {
+  "name": "Trinidad and Tobago",
+  "avg5": 96,
+  "avg3": 97,
+  "y2026": 96
+ },
+ "TN": {
+  "name": "Tunisia",
+  "avg5": 90,
+  "avg3": 91,
+  "y2026": 91
+ },
+ "TR": {
+  "name": "Turkey",
+  "avg5": 91,
+  "avg3": 93,
+  "y2026": 92
+ },
+ "TM": {
+  "name": "Turkmenistan",
+  "avg5": 14,
+  "avg3": 15,
+  "y2026": 15
+ },
+ "TV": {
+  "name": "Tuvalu",
+  "avg5": 100,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "UG": {
+  "name": "Uganda",
+  "avg5": 95,
+  "avg3": 96,
+  "y2026": 95
+ },
+ "UA": {
+  "name": "Ukraine",
+  "avg5": 3,
+  "avg3": 4,
+  "y2026": 3
+ },
+ "AE": {
+  "name": "United Arab Emirates",
+  "avg5": 98,
+  "avg3": 98,
+  "y2026": 98
+ },
+ "GB": {
+  "name": "United Kingdom",
+  "avg5": 81,
+  "avg3": 83,
+  "y2026": 88
+ },
+ "US": {
+  "name": "United States",
+  "avg5": 72,
+  "avg3": 73,
+  "y2026": 76
+ },
+ "UY": {
+  "name": "Uruguay",
+  "avg5": 81,
+  "avg3": 83,
+  "y2026": 82
+ },
+ "UZ": {
+  "name": "Uzbekistan",
+  "avg5": 93,
+  "avg3": 94,
+  "y2026": 96
+ },
+ "VU": {
+  "name": "Vanuatu",
+  "avg5": 89,
+  "avg3": 89,
+  "y2026": 96
+ },
+ "VA": {
+  "name": "Vatican City",
+  "avg5": 77,
+  "avg3": 78,
+  "y2026": 80
+ },
+ "VE": {
+  "name": "Venezuela",
+  "avg5": 74,
+  "avg3": 75,
+  "y2026": 76
+ },
+ "VN": {
+  "name": "Vietnam",
+  "avg5": 93,
+  "avg3": 95,
+  "y2026": 96
+ },
+ "YE": {
+  "name": "Yemen",
+  "avg5": 3,
+  "avg3": 3,
+  "y2026": 2
+ },
+ "ZM": {
+  "name": "Zambia",
+  "avg5": 97,
+  "avg3": 100,
+  "y2026": 100
+ },
+ "ZW": {
+  "name": "Zimbabwe",
+  "avg5": 93,
+  "avg3": 94,
+  "y2026": 96
+ }
+}
