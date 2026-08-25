@@ -156,11 +156,98 @@ function photoUploadMw(req: any, res: any, next: any) {
  */
 async function loadOwnProfile(consumerId: string) {
   const _id = new mongoose.Types.ObjectId(consumerId);
-  return ConsumerProfile.findOneAndUpdate(
+
+  /* Asked BEFORE the upsert, because the upsert cannot answer it.
+   *
+   * The seed below must fire exactly once, at the moment the row is minted
+   * — "contact.mobile is empty" is not a usable substitute, since it is also
+   * true for a consumer who deliberately cleared theirs, and seeding on that
+   * would put the number back on their next page load.
+   *
+   * The obvious mechanism, `includeResultMetadata: true`, is a TRAP HERE and
+   * was tried first: it makes findOneAndUpdate resolve to a ModifyResult
+   * wrapper, and plugins/fieldEncryption.plugin.ts decrypts via
+   * post('findOneAndUpdate') on the DOCUMENT. Handed the wrapper, the hook
+   * decrypts nothing and every encrypted field on this profile — mobile,
+   * passport numbers, address, date of birth — comes back as a raw
+   * `penc.1.…` envelope. One extra indexed query is the cheaper mistake.
+   *
+   * The race is the same one the upsert already has: two concurrent first
+   * loads can both see "absent" and both seed. That is harmless — the second
+   * finds the number already there and skips, and if it does not, it writes
+   * the identical normalised digits and the identical `false`. */
+  const existedBefore = await ConsumerProfile.exists({ consumerId: _id });
+
+  const profile: any = await ConsumerProfile.findOneAndUpdate(
     { consumerId: _id },
     { $setOnInsert: { consumerId: _id, workspaceId: d2cWorkspaceObjectId() } },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   );
+
+  if (!existedBefore) await seedMobileFromSignup(profile, _id);
+  return profile;
+}
+
+/**
+ * Copies the SIGNUP number onto the profile, once, unverified.
+ *
+ * ── WHY THIS EXISTS ──────────────────────────────────────────────────
+ * Signup writes the number the consumer typed to `Consumer.phone`
+ * (routes/consumer.auth.ts) and nothing else ever reads it. The OTP flow,
+ * the contact tab, the completion meter and the submit gate all read
+ * `ConsumerProfile.contact.mobile`. Those were never connected, so someone
+ * who gave us a number at signup was still told "Add your mobile number to
+ * your profile first" the moment they tried to verify it.
+ *
+ * `contact.mobile` is the canonical one and this closes the gap towards it.
+ * `Consumer.phone` is NOT deleted or stopped being written: it is the only
+ * INDEXED, queryable copy (contact.mobile is encrypted, so it cannot be
+ * searched at all), and Phase 1b's B2B-collision check needs exactly that.
+ * Its role narrows to "the signup-captured identity hint"; this field
+ * becomes "the number we contact and verify".
+ *
+ * ── ENCRYPTION: HYDRATED .save(), NEVER AN UPDATE OPERATOR ───────────
+ * contact.mobile is in ENCRYPTED_PII_FIELDS. plugins/fieldEncryption.plugin.ts
+ * throws EncryptedFieldUpdateError on an updateOne/findOneAndUpdate that
+ * touches an encrypted path, precisely so a raw write cannot drop plaintext
+ * into a field every reader will try to decrypt. The seed therefore mutates
+ * the hydrated document and saves it, the same way the OTP verify writes
+ * mobileVerified.
+ *
+ * ── SEEDED UNVERIFIED, AND ONLY WHEN IT NORMALISES ──────────────────
+ * `mobileVerified: false` is the point of the whole exercise: a number typed
+ * into a signup form is a claim, not a confirmed fact, and the submit gate
+ * reads that flag. Seeding it true would hand out the gate for free.
+ *
+ * The stored form is the NORMALISED ten digits rather than what was typed,
+ * so the canonical field holds one shape. Nothing depends on the `+91` the
+ * signup form may have carried — every reader either normalises first or
+ * renders the string as-is. A number that does NOT normalise (a non-Indian
+ * one, say) seeds NOTHING rather than an empty string: MSG91's OTP product
+ * is India-only, so there is no code we could send it, and leaving the
+ * field empty keeps the contact tab's own prompt as the honest next step.
+ *
+ * Exported for scripts/backfill-consumer-mobile-from-phone.ts, so the
+ * one-time pass over existing rows and the live path cannot drift apart.
+ */
+export async function seedMobileFromSignup(
+  profile: any,
+  consumerId: mongoose.Types.ObjectId,
+): Promise<boolean> {
+  // Never overwrite. A number already here was set by the consumer and may
+  // carry a hard-won mobileVerified — see the reset-on-edit rule below.
+  if (String(profile?.contact?.mobile ?? "").trim()) return false;
+
+  const consumer: any = await Consumer.findById(consumerId).select("phone").lean();
+  const seeded = normaliseIndiaMobile(consumer?.phone);
+  if (!seeded) return false;
+
+  profile.contact = profile.contact ?? {};
+  profile.contact.mobile = seeded;
+  profile.contact.mobileVerified = false;
+  profile.contact.mobileVerifiedAt = undefined;
+  await profile.save();
+  return true;
 }
 
 /**

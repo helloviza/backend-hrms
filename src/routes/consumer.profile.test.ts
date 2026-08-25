@@ -933,3 +933,108 @@ describe("profile photo", () => {
       .expect(404);
   });
 });
+
+/*
+ * ══════════════════════════════════════════════════════════════════════
+ * THE SIGNUP NUMBER REACHES THE FIELD THE OTP FLOW READS.
+ * ══════════════════════════════════════════════════════════════════════
+ * Signup writes Consumer.phone; everything else reads
+ * ConsumerProfile.contact.mobile. Before the seed, a consumer who gave us
+ * a number at signup was still told "Add your mobile number to your
+ * profile first" when they tried to verify it — the two fields had never
+ * been connected. These pin the connection AND its limits.
+ */
+describe("contact.mobile is seeded from the signup number", () => {
+  it("seeds the profile's mobile from Consumer.phone, UNVERIFIED, on first touch", async () => {
+    const c = await makeConsumer("seed-me@helloviza.test", "Seed Me");
+    await Consumer.updateOne({ _id: c.consumer._id }, { $set: { phone: "+919000000123" } });
+
+    // No profile row exists yet — this GET is what mints it.
+    expect(await ConsumerProfile.countDocuments({ consumerId: c.consumer._id })).toBe(0);
+
+    const res = await request(app)
+      .get("/api/consumer/profile")
+      .set("Authorization", c.auth)
+      .expect(200);
+
+    // Normalised to bare ten digits, not the "+91…" the signup form carried.
+    expect(res.body.profile.contact.mobile).toBe("9000000123");
+    // The whole point: a number typed at signup is a claim, not a fact.
+    expect(res.body.profile.contact.mobileVerified).toBe(false);
+  });
+
+  it("stores the seeded number ENCRYPTED, like any other write to that field", async () => {
+    const c = await makeConsumer("seed-enc@helloviza.test", "Seed Enc");
+    await Consumer.updateOne({ _id: c.consumer._id }, { $set: { phone: "9000000124" } });
+
+    await request(app).get("/api/consumer/profile").set("Authorization", c.auth).expect(200);
+
+    // Straight to the driver, bypassing the decryption hook: what is ON DISK
+    // must be an envelope. A raw update operator would have left plaintext
+    // here and every reader would then decrypt garbage.
+    const raw: any = await mongoose.connection.db
+      .collection("consumerprofiles")
+      .findOne({ consumerId: c.consumer._id });
+    expect(typeof raw.contact.mobile).toBe("string");
+    expect(raw.contact.mobile.startsWith("penc.")).toBe(true);
+    expect(raw.contact.mobile).not.toContain("9000000124");
+  });
+
+  it("does NOT clobber a number the consumer already set — nor its verified state", async () => {
+    const c = await makeConsumer("seed-skip@helloviza.test", "Seed Skip");
+    await Consumer.updateOne({ _id: c.consumer._id }, { $set: { phone: "+919000000125" } });
+
+    // Mint the profile and put a DIFFERENT number on it, verified.
+    await request(app).get("/api/consumer/profile").set("Authorization", c.auth).expect(200);
+    const profile: any = await ConsumerProfile.findOne({ consumerId: c.consumer._id });
+    profile.contact.mobile = "9876500000";
+    profile.contact.mobileVerified = true;
+    await profile.save();
+
+    // Every subsequent load must leave both alone.
+    const res = await request(app)
+      .get("/api/consumer/profile")
+      .set("Authorization", c.auth)
+      .expect(200);
+
+    expect(res.body.profile.contact.mobile).toBe("9876500000");
+    expect(res.body.profile.contact.mobileVerified).toBe(true);
+  });
+
+  it("seeds NOTHING when the signup phone is absent or not an Indian mobile", async () => {
+    const none = await makeConsumer("seed-none@helloviza.test", "No Phone");
+    const foreign = await makeConsumer("seed-foreign@helloviza.test", "Foreign Phone");
+    await Consumer.updateOne({ _id: foreign.consumer._id }, { $set: { phone: "+1 555 0100" } });
+
+    for (const who of [none, foreign]) {
+      const res = await request(app)
+        .get("/api/consumer/profile")
+        .set("Authorization", who.auth)
+        .expect(200);
+      // Absent, NOT an empty string: MSG91's OTP product is India-only, so
+      // there is no code we could send — the contact tab's own prompt is the
+      // honest next step.
+      expect(res.body.profile.contact.mobile ?? "").toBe("");
+      expect(res.body.profile.contact.mobileVerified).toBe(false);
+    }
+  });
+
+  it("does not resurrect a number the consumer deliberately cleared", async () => {
+    const c = await makeConsumer("seed-cleared@helloviza.test", "Cleared");
+    await Consumer.updateOne({ _id: c.consumer._id }, { $set: { phone: "+919000000126" } });
+
+    await request(app).get("/api/consumer/profile").set("Authorization", c.auth).expect(200);
+
+    const profile: any = await ConsumerProfile.findOne({ consumerId: c.consumer._id });
+    profile.contact.mobile = "";
+    await profile.save();
+
+    // The seed fires on INSERT only, so a later load must not put it back.
+    const res = await request(app)
+      .get("/api/consumer/profile")
+      .set("Authorization", c.auth)
+      .expect(200);
+
+    expect(res.body.profile.contact.mobile ?? "").toBe("");
+  });
+});
