@@ -49,6 +49,19 @@ export type VisaDocumentReviewStatus = (typeof VISA_DOCUMENT_REVIEW_STATUSES)[nu
 export const VISA_MRZ_CONFIDENCE_LEVELS = ["high", "medium", "low"] as const;
 export type VisaMrzConfidenceLevel = (typeof VISA_MRZ_CONFIDENCE_LEVELS)[number];
 
+/**
+ * The two byte stores, mirroring models/ConsumerDocument.ts's
+ * CONSUMER_DOCUMENT_DRIVERS exactly — same two values, same meaning.
+ *
+ * Declared here rather than imported from that model on purpose: these are
+ * two independent collections, and a shared import would make a change to
+ * the consumer locker's storage options silently redefine what this
+ * collection accepts. Two lists that happen to agree, checked by the
+ * matching test, beats one list that couples two schemas.
+ */
+export const VISA_DOCUMENT_DRIVERS = ["s3", "local-disk"] as const;
+export type VisaDocumentDriver = (typeof VISA_DOCUMENT_DRIVERS)[number];
+
 export interface VisaExtractedField {
   key: string;
   value: string;
@@ -59,11 +72,71 @@ export interface VisaDocumentDocument extends Document {
   applicationId: mongoose.Types.ObjectId; // ref VisaApplication
   docCode: string; // config/visaDocumentCodes.ts key, e.g. "DOC-01"
 
+  /**
+   * ⚠ THE NAME IS NOW NARROWER THAN THE FIELD.
+   *
+   * For a `driver: "s3"` row — which is every row that has ever existed and
+   * every B2B upload — this is exactly what it always was: an S3 object key
+   * in `bucket` (or in env.S3_BUCKET when `bucket` is absent).
+   *
+   * For a `driver: "local-disk"` row it holds a DISK PATH instead, relative
+   * to the same .devdata/uploads root services/consumerDocumentStorage.ts
+   * uses. Renaming it to something honest (`storageKey`, as
+   * models/ConsumerDocument.ts calls it) would touch every reader in
+   * routes/visa.ts, routes/admin.visa.ts, the extraction service and the
+   * scripts — a cross-model rename that is deliberately NOT part of this
+   * change. Recorded here so the next reader knows the mismatch is known
+   * rather than sloppy.
+   */
   s3Key: string;
+  /**
+   * WHERE the bytes are, recorded on the row rather than inferred from the
+   * environment at read time — the same reasoning, and the same two values,
+   * as models/ConsumerDocument.ts's own `driver`. A row written by the dev
+   * disk driver must stay recognisable as such if the process is later
+   * restarted pointing at S3; otherwise the read path builds an S3 key out
+   * of a disk path and 404s confusingly.
+   *
+   * DEFAULT "s3", and that default is load-bearing: every row already in
+   * the database predates this field, every one of them is an S3 object,
+   * and the default is what keeps them on the presign path without a
+   * backfill.
+   */
+  driver: VisaDocumentDriver;
+  /**
+   * The S3 bucket, when it is worth being explicit. Optional and usually
+   * absent: every writer in this repo uses env.S3_BUCKET, so a null here
+   * means "wherever env.S3_BUCKET points", which is what the read path
+   * already assumed. Present so a row can name its bucket when the bytes
+   * were written by something that is not this process's default.
+   */
+  bucket?: string;
   originalFilename: string;
   mimeType: string;
   sizeBytes: number;
-  uploadedByUserId: mongoose.Types.ObjectId; // ref User
+  /**
+   * NULLABLE as of the D2C plumbing pass — it was `required: true`.
+   *
+   * B2B is unaffected: routes/visa.ts's upload path sets it on every row it
+   * has ever written and still does, so relaxing the constraint removes no
+   * guarantee anything actually relied on. What it permits is a row whose
+   * uploader is a CONSUMER, who is not a User and has no id in that
+   * collection — see uploadedByConsumerId below. Pointing this at some
+   * staff id to satisfy a `required` would put a name in the audit trail
+   * for an upload that person never touched.
+   */
+  uploadedByUserId: mongoose.Types.ObjectId | null; // ref User
+  /**
+   * The D2C counterpart. Exactly one of this and uploadedByUserId is set on
+   * a well-formed row; both null is possible only for a legacy row and is
+   * not a state anything writes.
+   *
+   * Two fields rather than one polymorphic {type,id} pair, because `ref`
+   * populate and every existing reader of uploadedByUserId keep working
+   * untouched — the same shape models/VisaApplication.ts already uses for
+   * travellerProfileId vs consumerId.
+   */
+  uploadedByConsumerId: mongoose.Types.ObjectId | null; // ref Consumer
   version: number; // 1-based; a re-upload of the same docCode increments this, never overwrites
 
   extractionStatus: VisaDocumentExtractionStatus;
@@ -115,10 +188,28 @@ const VisaDocumentSchema = new Schema<VisaDocumentDocument>(
     docCode: { type: String, required: true },
 
     s3Key: { type: String, required: true },
+    // required WITH a default — mongoose applies the default before
+    // validating, so an insert that omits it gets "s3" rather than a
+    // validation error, and a row can still never end up with the field
+    // explicitly unset. Every pre-existing row reads back as "s3" too: an
+    // absent path in the database takes the schema default on hydration,
+    // which is why this needs no backfill.
+    driver: { type: String, enum: VISA_DOCUMENT_DRIVERS, required: true, default: "s3" },
+    bucket: { type: String },
     originalFilename: { type: String, required: true },
     mimeType: { type: String, required: true },
     sizeBytes: { type: Number, required: true, min: 0 },
-    uploadedByUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    // required:false now — see the interface above. B2B still always sets it.
+    uploadedByUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    // Indexed because the consumer-facing question "which rows did THIS
+    // person upload" is one an erasure has to be able to ask; nothing
+    // queries by uploadedByUserId, which is why that one never was.
+    uploadedByConsumerId: {
+      type: Schema.Types.ObjectId,
+      ref: "Consumer",
+      default: null,
+      index: true,
+    },
     version: { type: Number, required: true, default: 1, min: 1 },
 
     extractionStatus: {

@@ -32,6 +32,11 @@
 
 import { Router } from "express";
 import mongoose from "mongoose";
+// For the local-disk branch of the document download below — same three
+// imports services/consumerDocumentStorage.ts uses for the same job.
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
+import path from "node:path";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import VisaApplication, {
@@ -57,6 +62,9 @@ import User from "../models/User.js";
 import { UserPermission, hasAccess } from "../models/UserPermission.js";
 import { visaDocumentUploadMw, createVisaDocumentUpload } from "./visa.js";
 import { presignGetObject } from "../utils/s3Presign.js";
+// The dev-disk root, borrowed rather than recomputed — see the local-disk
+// branch of GET /documents/:id/url.
+import { CONSUMER_DOCUMENT_LOCAL_ROOT } from "../services/consumerDocumentStorage.js";
 import {
   syncVisaApplicationBilling,
   createVisaWorkStartBooking,
@@ -1628,8 +1636,72 @@ router.get("/documents/:id/url", requirePermission("visaApplication", "READ"), a
       return res.status(404).json({ error: "Document not found" });
     }
 
+    /* ── LOCAL-DISK ROWS ARE STREAMED, NOT PRESIGNED ─────────────────
+     * There is nothing in an object store to sign a URL for: a
+     * driver:"local-disk" row's bytes are on this machine's disk, and
+     * `s3Key` holds a PATH rather than a key (the naming mismatch is
+     * documented on the field in models/VisaDocument.ts — renaming it is a
+     * cross-model change, deliberately out of scope). Presigning one would
+     * mint a URL for a key that does not exist and fail at the click, with
+     * an S3 404 that says nothing about the real cause.
+     *
+     * Mirrors services/consumerDocumentStorage.ts's openConsumerDocument:
+     * same .devdata/uploads root, same "stat first so a missing file
+     * throws ENOENT rather than yielding an empty stream", same
+     * private/no-store headers the consumer bytes route already sets.
+     *
+     * THE `?? "s3"` IS THE B2B GUARANTEE. Every row written before the
+     * driver field existed has no value for it, and every one of those is
+     * an S3 object — absent MUST take the presign path. The schema default
+     * already makes a hydrated row read "s3"; this repeats it at the
+     * branch so the invariant is visible where it matters rather than
+     * inferred from a default two files away. A `.lean()` read of a
+     * pre-existing raw document still gets it. */
+    if (((doc as any).driver ?? "s3") === "local-disk") {
+      const relative = String((doc as any).s3Key);
+      /* The root is DERIVED FROM the consumer locker's own, never
+       * recomputed. consumerDocumentStorage.ts resolves it from
+       * import.meta.url (src/services -> … -> repo root) precisely because
+       * process.cwd() is wrong the moment the backend is started from
+       * apps/backend, which is how it is normally started. Taking the
+       * dirname of its exported root — <repo>/.devdata/uploads/
+       * consumer-documents -> <repo>/.devdata/uploads — gives the same
+       * base its resolveLocalPath() uses, and cannot drift from it. */
+      const root = path.dirname(CONSUMER_DOCUMENT_LOCAL_ROOT);
+      // Resolved against that root and then checked to be INSIDE it — the
+      // same containment guard openConsumerDocument applies, because a
+      // stored path is still a path and "../" in one must never escape.
+      const abs = path.resolve(root, relative);
+      if (abs !== root && !abs.startsWith(root + path.sep)) {
+        return res.status(404).json({ error: "Document not found" });
+      }
+      await stat(abs); // ENOENT here, not an empty 200
+      adminVisaLogger.info("admin visa document streamed from local disk", {
+        documentId: String((doc as any)._id),
+        applicationId: String((doc as any).applicationId),
+        userId: actorId(req) ? String(actorId(req)) : null,
+        requestedAt: new Date().toISOString(),
+      });
+      res.setHeader("Content-Type", (doc as any).mimeType);
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${String((doc as any).originalFilename).replace(/"/g, "")}"`,
+      );
+      // The bytes are personal data; no shared cache may hold them.
+      res.setHeader("Cache-Control", "private, no-store");
+      const stream = createReadStream(abs);
+      stream.on("error", () => {
+        if (!res.headersSent) res.status(500).json({ error: "Failed to read document" });
+        else res.destroy();
+      });
+      return stream.pipe(res);
+    }
+
     const url = await presignGetObject({
-      bucket: env.S3_BUCKET,
+      // The row's own bucket when it names one, env.S3_BUCKET otherwise —
+      // which is every row today, and is exactly what this line did
+      // before `bucket` existed as a field.
+      bucket: (doc as any).bucket || env.S3_BUCKET,
       key: (doc as any).s3Key,
       filename: (doc as any).originalFilename,
       expiresInSeconds: env.PRESIGN_TTL,

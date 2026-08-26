@@ -77,7 +77,7 @@ import VisaApplication, {
   // the two builders that used them moved to utils/visaSnapshots.ts, which
   // imports the types itself. Type-only removal; nothing at runtime.
 } from "../models/VisaApplication.js";
-import VisaDocument from "../models/VisaDocument.js";
+import VisaDocument, { type VisaDocumentDriver } from "../models/VisaDocument.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import Department from "../models/Department.js";
 import TravelBooking from "../models/TravelBooking.js";
@@ -3536,12 +3536,122 @@ function mapDocumentSummary(d: any) {
  * — nothing here extracts anything (see docs/audits/visa-module-recon.md
  * §4 and the OCR investigation in this phase's build report).
  * ───────────────────────────────────────────────────────────────────── */
+/**
+ * THE ROW, FOR BYTES THAT ARE ALREADY SOMEWHERE.
+ *
+ * The half of createVisaDocumentUpload below that does not touch the object
+ * store: pick the next version, write the VisaDocument, log the activity.
+ * Split out so a caller that ALREADY has stored bytes can mint a row
+ * pointing at them instead of uploading a second copy — a D2C case whose
+ * applicant uploaded into their ConsumerDocument locker being the case this
+ * exists for (models/ConsumerDocument.ts: "no surface ever copies a file.
+ * It links").
+ *
+ * DELIBERATELY DOES TWO THINGS LESS than its caller:
+ *   - it does not upload. The caller has already put the bytes somewhere
+ *     and passes the reference.
+ *   - it does not fire passport extraction. Extraction is a decision about
+ *     a NEW upload, and it stays where it was, in
+ *     createVisaDocumentUpload, so the B2B trigger fires at exactly the
+ *     same point in exactly the same conditions as before this split.
+ *
+ * `driver`/`bucket` travel with the reference rather than being assumed,
+ * so the ops download route can tell a presignable S3 object from a dev
+ * disk path (models/VisaDocument.ts).
+ */
+export async function createVisaDocumentRow(opts: {
+  workspaceId: any;
+  applicationId: any;
+  requestId: any;
+  docCode: string;
+  driver: VisaDocumentDriver;
+  bucket?: string;
+  s3Key: string;
+  originalFilename: string;
+  mimeType: string;
+  sizeBytes: number;
+  /** Set for a staff/customer upload. Exactly one of this and the next. */
+  uploadedByUserId?: any;
+  /** Set for a D2C consumer upload. Exactly one of this and the previous. */
+  uploadedByConsumerId?: any;
+  actorType: VisaActivityActorType;
+}) {
+  const {
+    workspaceId,
+    applicationId,
+    requestId,
+    docCode,
+    driver,
+    bucket,
+    s3Key,
+    originalFilename,
+    mimeType,
+    sizeBytes,
+    uploadedByUserId,
+    uploadedByConsumerId,
+    actorType,
+  } = opts;
+
+  const latest = await VisaDocument.findOne({ applicationId, docCode })
+    .sort({ version: -1 })
+    .select("version")
+    .lean();
+  const version = (latest?.version ?? 0) + 1;
+
+  const doc = await VisaDocument.create({
+    workspaceId,
+    applicationId,
+    docCode,
+    version,
+    driver,
+    bucket,
+    s3Key,
+    originalFilename,
+    mimeType,
+    sizeBytes,
+    uploadedByUserId: uploadedByUserId ?? null,
+    uploadedByConsumerId: uploadedByConsumerId ?? null,
+    // Explicit, not just relying on the schema default — "extraction
+    // starts as pending" is a requirement of this phase, not an
+    // incidental default. Nothing here (or anywhere yet) extracts
+    // anything for non-passport docCodes; see the OCR investigation in
+    // that phase's build report.
+    extractionStatus: "PENDING",
+    // Also explicit, for the same reason: this call is EVERY upload,
+    // including a replace of a version an agent already reviewed
+    // (VERIFIED/REJECTED). A new version is a document nobody has looked
+    // at yet — it must never inherit the prior version's verdict, so
+    // reviewStatus/reviewedBy/reviewedAt are never copied forward here,
+    // ever (task brief: "close the document-mutation hole").
+    reviewStatus: "PENDING",
+  });
+
+  await logVisaActivity({
+    applicationId,
+    requestId,
+    workspaceId,
+    eventType: version === 1 ? "DOCUMENT_UPLOADED" : "DOCUMENT_REPLACED",
+    actorUserId: uploadedByUserId ?? null,
+    actorType,
+    detail: { documentId: String(doc._id), docCode, version },
+  });
+
+  return doc;
+}
+
 // Extracted so routes/admin.visa.ts's outcome-capture route (attaching a
 // scanned issued visa) can go through the EXACT same versioning/S3-key/
 // extraction-trigger logic, rather than a second copy of it — "reusing the
 // existing upload path" (task brief) means this function, not just the
 // same utility calls assembled a second time. Behaviour is unchanged from
 // what used to be inlined directly in the POST route below.
+//
+// SINCE THE D2C PLUMBING PASS this is the "and upload the bytes first"
+// wrapper around createVisaDocumentRow above: it still owns the S3 write,
+// the key prefix and the extraction trigger, and the row/version/activity
+// half now lives in the shared helper. Everything observable about a B2B
+// upload — row shape, version numbering, key prefix, activity event,
+// extraction firing — is what it was.
 export async function createVisaDocumentUpload(opts: {
   workspaceId: any;
   applicationId: any;
@@ -3566,12 +3676,6 @@ export async function createVisaDocumentUpload(opts: {
     actorType,
   } = opts;
 
-  const latest = await VisaDocument.findOne({ applicationId, docCode })
-    .sort({ version: -1 })
-    .select("version")
-    .lean();
-  const version = (latest?.version ?? 0) + 1;
-
   // workspaceId IN the S3 key path (not just the workspaceId field) — see
   // models/VisaDocument.ts file header — so a key can never be reused
   // across tenants.
@@ -3584,39 +3688,25 @@ export async function createVisaDocumentUpload(opts: {
     keyPrefix: `visa-applications/${workspaceId}/${applicationId}`,
   });
 
-  const doc = await VisaDocument.create({
+  // The version read, the row and the activity log now live in
+  // createVisaDocumentRow above — same three steps, same order, same
+  // values. `driver: "s3"` and the bucket are stated rather than left to
+  // the schema default: these bytes demonstrably went to S3 one line ago,
+  // and a row that says so explicitly does not depend on a default staying
+  // what it is today.
+  const doc = await createVisaDocumentRow({
     workspaceId,
     applicationId,
+    requestId,
     docCode,
-    version,
+    driver: "s3",
+    bucket: uploaded.bucket,
     s3Key: uploaded.key,
     originalFilename: file.originalname,
     mimeType: file.mimetype,
     sizeBytes: file.size,
     uploadedByUserId: uploaderId,
-    // Explicit, not just relying on the schema default — "extraction
-    // starts as pending" is a requirement of this phase, not an
-    // incidental default. Nothing here (or anywhere yet) extracts
-    // anything for non-passport docCodes; see the OCR investigation in
-    // that phase's build report.
-    extractionStatus: "PENDING",
-    // Also explicit, for the same reason: this call is EVERY upload,
-    // including a replace of a version an agent already reviewed
-    // (VERIFIED/REJECTED). A new version is a document nobody has looked
-    // at yet — it must never inherit the prior version's verdict, so
-    // reviewStatus/reviewedBy/reviewedAt are never copied forward here,
-    // ever (task brief: "close the document-mutation hole").
-    reviewStatus: "PENDING",
-  });
-
-  await logVisaActivity({
-    applicationId,
-    requestId,
-    workspaceId,
-    eventType: version === 1 ? "DOCUMENT_UPLOADED" : "DOCUMENT_REPLACED",
-    actorUserId: uploaderId,
     actorType,
-    detail: { documentId: String(doc._id), docCode, version },
   });
 
   // Fire-and-forget — the upload response must never wait on extraction.
