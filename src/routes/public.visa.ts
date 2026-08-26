@@ -410,6 +410,11 @@ function buildPublicPrice(rule: any, iso2: string) {
  * the backend owner's call, not a consumer phase's — Phase 2b's reasoning,
  * still correct. The fallback is kept so name and alpha-3 input ("Thailand",
  * "THA") still resolve.
+ *
+ * EVERY public entry point resolves through here — the two GETs (where a miss
+ * is a 404) and POST /visa/lead's validator and handler (where a miss is a
+ * 400). A caller that resolves its own way can accept a pin the panel rejects,
+ * or reject a pin the map drew. Add callers here; do not add resolvers.
  */
 function resolvePublicIso2(input: unknown): string | null {
   const raw = String(input ?? "").trim().toUpperCase();
@@ -647,7 +652,11 @@ function validateLead(p: any): string[] {
   if (!email && !phone) errors.push("An email address or phone number is required");
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.push("Email address is not valid");
 
-  if (!normaliseToIso2(String(p?.iso2 ?? ""))) errors.push("A valid destination is required");
+  // resolvePublicIso2, NOT normaliseToIso2 — the map draws all 196 seed
+  // countries, so the enquiry form must accept every pin it draws. Bare
+  // normaliseToIso2 rejected the 77 seed countries countryCodes.ts has no row
+  // for, which is a dead Request button on 39% of the map.
+  if (!resolvePublicIso2(p?.iso2)) errors.push("A valid destination is required");
 
   if (!isUuidV4(p?.submissionId)) errors.push("Invalid submission");
 
@@ -667,7 +676,9 @@ router.post(
         return res.status(400).json({ error: errors.join("; "), details: errors });
       }
 
-      const iso2 = normaliseToIso2(String(body.iso2))!;
+      // Same resolver as validateLead above — re-resolving through a
+      // different function is how the two answers start to disagree.
+      const iso2 = resolvePublicIso2(body.iso2)!;
       const submissionId = String(body.submissionId).trim();
       // Its own namespace — a visa lead can never false-dedupe against the
       // travel form's "public:" or the dormant HMAC endpoint's "gform:".

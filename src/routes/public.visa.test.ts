@@ -25,6 +25,10 @@ const { default: ManualBooking } = await import("../models/ManualBooking.js");
 const { default: publicVisaRouter } = await import("./public.visa.js");
 const { travelRequestLimiter } = await import("../middleware/rateLimit.js");
 const { listSeedCountries } = await import("../config/visaCountrySeed.js");
+// Used only to PROVE the premise of the M1 tests — that the seed-only
+// countries really are absent from countryCodes.ts, so their acceptance can
+// only come from the seed-first resolver.
+const { normaliseToIso2 } = await import("../utils/countryCodes.js");
 const { DIFFICULTY_BANDS, SOURCED_APPROVAL } = await import("../utils/visaDifficulty.js");
 
 /** The real shipped seed — these tests read it, never a fixture copy. */
@@ -1122,6 +1126,110 @@ describe("POST /visa/lead", () => {
     expect(booking).toBeTruthy();
     expect(JSON.stringify(res.body)).not.toContain(String(booking._id));
   });
+
+  /* ═══════════════════════════════════════════════════════════════════
+   * M1 — the lead endpoint accepts every country the map draws.
+   *
+   * It used to resolve iso2 through `normaliseToIso2` alone, so the 77 seed
+   * countries countryCodes.ts has no row for 400'd with "A valid destination
+   * is required" — a dead Request button on 39% of the map, on exactly the
+   * long-tail corridors an enquiry form exists to catch. Both the validator
+   * and the handler's re-resolution now go through `resolvePublicIso2`, the
+   * same seed-first resolver the GET endpoints use.
+   * ═════════════════════════════════════════════════════════════════ */
+
+  // Seed-only: present in the 196-country seed, absent from countryCodes.ts.
+  const SEED_ONLY = ["DO", "JM", "BS", "VA", "MO"] as const;
+
+  it("M1: accepts the seed-only countries that used to 400", async () => {
+    withBypass();
+
+    for (const [i, iso2] of SEED_ONLY.entries()) {
+      // Proves the premise rather than assuming it: each of these really is
+      // outside countryCodes.ts, so a pass here can only come from the seed.
+      expect(normaliseToIso2(iso2)).toBeNull();
+      expect(SEED.some((c) => c.iso2 === iso2)).toBe(true);
+
+      const res = await request(app())
+        .post("/api/public/visa/lead")
+        .send({ ...LEAD, iso2, submissionId: `3f2504e0-4f89-41d3-9a0c-0305e82c34${10 + i}` });
+
+      expect(res.status).toBe(201);
+    }
+
+    // Every one produced a real concierge row, stamped with its own country.
+    const rows = await ManualBooking.find({}).lean();
+    expect(rows).toHaveLength(SEED_ONLY.length);
+    for (const iso2 of SEED_ONLY) {
+      expect(rows.some((r: any) => r.notes.includes(`destination ${iso2}`))).toBe(true);
+    }
+  });
+
+  it("M1: the validator and the handler resolve to the SAME code", async () => {
+    withBypass();
+    // Lowercase and padded — the validator must not accept a value the
+    // handler then resolves differently (or throws on).
+    const res = await request(app())
+      .post("/api/public/visa/lead")
+      .send({ ...LEAD, iso2: "  mo  " });
+
+    expect(res.status).toBe(201);
+    const booking: any = await ManualBooking.findOne({}).lean();
+    expect(booking.notes).toContain("destination MO");
+  });
+
+  it("M1: no regression — a countryCodes.ts country still works", async () => {
+    withBypass();
+    expect(normaliseToIso2("TH")).toBe("TH");
+
+    const res = await request(app()).post("/api/public/visa/lead").send(LEAD);
+    expect(res.status).toBe(201);
+    const booking: any = await ManualBooking.findOne({}).lean();
+    expect(booking.notes).toContain("destination TH");
+  });
+
+  it("M1: still rejects a genuinely invalid destination", async () => {
+    withBypass();
+    // Widened to the seed, NOT disabled. ZZ is in neither table.
+    for (const iso2 of ["ZZ", "QQ", "", "not-a-country"]) {
+      const res = await request(app())
+        .post("/api/public/visa/lead")
+        .send({ ...LEAD, iso2 });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/A valid destination is required/);
+    }
+    expect(await ManualBooking.countDocuments({})).toBe(0);
+  });
+
+  it(
+    "M1: every one of the 196 seed countries is accepted by the real endpoint",
+    async () => {
+      withBypass();
+      expect(SEED).toHaveLength(196);
+
+      // Driven through HTTP rather than by re-deriving the resolver here: a
+      // test that reimplements resolvePublicIso2 would keep passing after the
+      // endpoint stopped using it, which is the exact failure this guards.
+      const rejected: string[] = [];
+      for (const [i, country] of SEED.entries()) {
+        // The limiter is real and shared (8 per IP); reset inside the loop so
+        // a 429 can never be mistaken for a validation pass or failure.
+        await resetRateLimiter();
+        const res = await request(app())
+          .post("/api/public/visa/lead")
+          .send({
+            ...LEAD,
+            iso2: country.iso2,
+            submissionId: `3f2504e0-4f89-41d3-9a0c-${String(i).padStart(12, "0")}`,
+          });
+        if (res.status !== 201) rejected.push(`${country.iso2}:${res.status}`);
+      }
+
+      expect(rejected).toEqual([]);
+      expect(await ManualBooking.countDocuments({})).toBe(196);
+    },
+    120_000,
+  );
 });
 
 describe("rate limiting", () => {
