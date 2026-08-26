@@ -296,6 +296,42 @@ function mapAdminApplicationSummary(a: any) {
     id: String(a._id),
     requestId: String(a.requestId),
     workspaceId: String(a.workspaceId),
+    /* ── CHANNEL + ATTRIBUTION ─────────────────────────────────────────
+     * The queue row has carried both since the D2C channel landed; the
+     * DETAIL never did, so an agent who opened a case lost the two facts
+     * the list had just shown them — which channel it arrived through, and
+     * for a consumer case, what brought them. Purely additive: two new
+     * keys, nothing renamed, nothing removed.
+     *
+     * `source` falls back to "B2B" for a row written before the channel
+     * tag existed — the same "absent is not D2C" rule the queue and its
+     * filter already apply. The stored ENUM travels, never a display
+     * label: "Plumbox" and "Helloviza.ai" are the console's words, and a
+     * rename there must never reach the database.
+     *
+     * `utm` is NULL on B2B rather than five empty strings. That differs
+     * from the queue on purpose: the queue always ships the object because
+     * it renders a column for it on one tab, whereas here null is the
+     * honest answer to "what campaign brought this corporate case" — a
+     * B2B application arrives through an account manager, not a click, so
+     * there is no attribution to report rather than an empty one.
+     *
+     * Within a D2C case, empty strings are preserved as-is: models/
+     * visaUtm.ts is explicit that "" means "arrived without campaign tags"
+     * and that it must not be re-spelt as null or absent. The console
+     * turns that into "Direct" at the point of RENDER, which is where a
+     * display word belongs. */
+    source: a.source ?? "B2B",
+    utm:
+      (a.source ?? "B2B") === "D2C"
+        ? {
+            source: a.utm?.source ?? "",
+            medium: a.utm?.medium ?? "",
+            campaign: a.utm?.campaign ?? "",
+            content: a.utm?.content ?? "",
+            term: a.utm?.term ?? "",
+          }
+        : null,
     // null after scripts/erase-traveller-profile.ts has run (models/
     // VisaApplication.ts) — String(null) would otherwise render the literal
     // string "null", which reads as a real (broken) id rather than "erased".
