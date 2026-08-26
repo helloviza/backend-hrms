@@ -50,6 +50,8 @@ import VisaApplication, {
 import VisaRequest, { recomputeRequestStatus } from "../models/VisaRequest.js";
 import VisaDocument from "../models/VisaDocument.js";
 import TravellerProfile from "../models/TravellerProfile.js";
+import Consumer from "../models/Consumer.js";
+import ConsumerProfile from "../models/ConsumerProfile.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
 import { UserPermission, hasAccess } from "../models/UserPermission.js";
@@ -94,6 +96,113 @@ function travellerDisplayName(t: any): string {
 function resolveUserName(u: any): string {
   if (!u) return "Unknown";
   return u.name || [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.email || "Unknown";
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * THE D2C APPLICANT — the identity a consumer case has instead of a
+ * TravellerProfile.
+ *
+ * Both ops reads below (GET /queue, GET /applications/:id) resolve their
+ * applicant through TravellerProfile. A D2C case has no such row — the
+ * create path in routes/consumer.applications.ts writes
+ * travellerProfileId: null on purpose ("that is a B2B corporate-roster
+ * entity") and carries `consumerId` instead. So every D2C ticket reached
+ * the console anonymous: no name in the queue, a null traveller block in
+ * the detail. This is the missing branch, and NOTHING else: a row that is
+ * not source:"D2C" never touches a line of it, and the B2B object handed
+ * to the frontend is assembled by exactly the code it always was.
+ *
+ * ── THE SHAPE IS THE B2B SHAPE, DELIBERATELY ─────────────────────────
+ * The keys below mirror the TravellerProfile projection one-for-one
+ * (TravellerDetail in apps/frontend/src/pages/admin/VisaConciergeConsole.tsx),
+ * INCLUDING the plain "YYYY-MM-DD" date strings TravellerProfile stores —
+ * ConsumerProfile holds real Dates, so they are converted here rather than
+ * shipped as ISO datetimes the console would render differently for a D2C
+ * case than a B2B one. The frontend needs no change and no new type.
+ *
+ * ⚠ NEVER RESOLVE THIS THROUGH AN AGGREGATE.
+ * ConsumerProfile carries the field-encryption plugin on 14 paths
+ * (models/ConsumerProfile.ts, plugins/fieldEncryption.plugin.ts). Decryption
+ * happens in post('find')/post('findOne') — which DO cover .lean() — and is
+ * bypassed entirely by Model.aggregate(), $lookup, $group and distinct(),
+ * every one of which would return raw `penc.1.…` envelopes and put
+ * ciphertext on an agent's screen. find/findOne only, in both reads. The
+ * plugin's own header says the same thing; this is the call site that has
+ * to honour it.
+ * ───────────────────────────────────────────────────────────────────── */
+
+function isD2CApplication(a: any): boolean {
+  return a?.source === "D2C";
+}
+
+/**
+ * "YYYY-MM-DD" — the shape TravellerProfile.dob / passportExpiry /
+ * passportIssueDate are already stored in, so the console renders a D2C
+ * date exactly as it renders a B2B one.
+ *
+ * UTC, not local: a Date decrypted from an ISO string is a UTC instant, and
+ * formatting it in the server's timezone is how a birthday moves a day
+ * (the timezone-shift history models/TravellerProfile.ts's own dob comment
+ * warns about).
+ */
+function toPlainDateString(value: any): string | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(String(value));
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+/**
+ * A consumer may hold SEVERAL passports (dual nationality, or a renewed
+ * book kept for the valid visas in it — models/ConsumerProfile.ts). The
+ * route layer enforces exactly one `isPrimary`, so that is the one the
+ * application is being made on; falling back to the first entry means a
+ * profile written before the flag existed still shows a passport rather
+ * than a blank field.
+ */
+function primaryPassport(profile: any): any | null {
+  const passports = Array.isArray(profile?.passports) ? profile.passports : [];
+  if (!passports.length) return null;
+  return passports.find((p: any) => p?.isPrimary) || passports[0];
+}
+
+/**
+ * `consumer` is the identity (Consumer is NOT encrypted — a plain read);
+ * `profile` is the travel document detail and may be absent for a consumer
+ * who applied before filling their profile in, in which case the name and
+ * email still resolve and the document fields are null. Returns null only
+ * when there is no Consumer row at all, which is the same "join missed"
+ * outcome the B2B branch already renders as a null traveller.
+ */
+function shapeD2CApplicant(application: any, consumer: any, profile: any) {
+  if (!consumer) return null;
+  const personal = profile?.personal || {};
+  const passport = primaryPassport(profile);
+  return {
+    // The CONSUMER's id, not a TravellerProfile id — the console shows it
+    // and does not navigate on it (there is no D2C dossier page), so this
+    // is an identifier an agent can search on rather than a dead link.
+    id: String(consumer._id),
+    // Consumer.name is the account's own required name. The profile's
+    // three-part name is the fallback, so a consumer who has since split
+    // their name into passport parts still reads sensibly.
+    name:
+      consumer.name ||
+      [personal.firstName, personal.middleName, personal.lastName].filter(Boolean).join(" "),
+    dob: toPlainDateString(personal.dateOfBirth),
+    email: consumer.email ?? null,
+    // Off the APPLICATION, never derived: the D2C create path stamps
+    // nationality at creation (PUBLIC_NATIONALITY, "IN") and that stamp is
+    // what the rule was resolved against. ConsumerProfile.personal.
+    // nationality is free text the consumer types and would disagree.
+    nationality: application?.nationality ?? null,
+    // Unmasked, exactly as the B2B branch is — see this route's file
+    // header on why the console is the reserved exception.
+    passportNo: passport?.number ?? null,
+    passportExpiry: toPlainDateString(passport?.expiryDate),
+    passportIssueCountry: passport?.issuingCountry ?? null,
+    passportIssueDate: toPlainDateString(passport?.issueDate),
+  };
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -648,6 +757,33 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
       .lean();
     const travellerById = new Map(travellers.map((t: any) => [String(t._id), t]));
 
+    /* ── the D2C half of the same join ───────────────────────────────
+     * A D2C row's applicant is a Consumer, not a TravellerProfile — see
+     * shapeD2CApplicant above. Batched exactly like the join it sits
+     * beside: one $in for the page, then an in-memory Map.
+     *
+     * Consumer ONLY, deliberately — no ConsumerProfile read here. The
+     * queue renders a NAME (the B2B branch selects nothing but
+     * firstName/middleName/lastName either), and ConsumerProfile is the
+     * encrypted collection: fetching it would decrypt every passport
+     * number on the page to render a column that never shows one. The
+     * detail read below is where that cost is actually paid for, once,
+     * for the one case an agent opened. Consumer itself is unencrypted,
+     * so this stays a plain read.
+     *
+     * objectIdKeys for the same reason every join above uses it — and
+     * here it also does the source filtering's work for free, since
+     * consumerId is null on every B2B row. */
+    const consumerIds = objectIdKeys(
+      rows.filter((r) => isD2CApplication(r.application)).map((r) => r.application.consumerId),
+    );
+    const consumers = consumerIds.length
+      ? await Consumer.find({ _id: { $in: consumerIds } })
+          .select("name email")
+          .lean()
+      : [];
+    const consumerById = new Map(consumers.map((c: any) => [String(c._id), c]));
+
     // Sorting and pagination both happened in the DB (the $sort/$skip/$limit
     // above), so `rows` IS the page — there is no in-memory sort or slice
     // left here, and no unbounded fetch behind it.
@@ -691,6 +827,18 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
     const shaped = pageRows.map(({ application: a, request: r, risk }) => {
       const workspace = workspaceById.get(String(a.workspaceId)) || null;
       const traveller = travellerById.get(String(a.travellerProfileId)) || null;
+      // The one branch. B2B is the expression that was always here; D2C
+      // resolves through the Consumer join above and is projected down to
+      // the same two keys, so the console's row renderer cannot tell the
+      // two channels apart — which is the point.
+      const applicant = isD2CApplication(a)
+        ? (() => {
+            const d2c = shapeD2CApplicant(a, consumerById.get(String(a.consumerId)), null);
+            return d2c ? { id: d2c.id, name: d2c.name } : null;
+          })()
+        : traveller
+          ? { id: String(traveller._id), name: travellerDisplayName(traveller) }
+          : null;
       return {
         id: String(a._id),
         status: a.status,
@@ -776,7 +924,7 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
               travelDateTo: r.travelDateTo ?? null,
             }
           : null,
-        traveller: traveller ? { id: String(traveller._id), name: travellerDisplayName(traveller) } : null,
+        traveller: applicant,
         assignedConcierge: assigneeSummary(a.assignedConciergeUserId),
         assignedScreeningOfficer: assigneeSummary(a.assignedScreeningOfficerId),
       };
@@ -836,6 +984,37 @@ router.get("/applications/:id", requirePermission("visaApplication", "READ"), as
         .lean(),
     ]);
 
+    /* ── the D2C applicant ───────────────────────────────────────────
+     * Runs ONLY for source:"D2C". A B2B case evaluates one false `if` and
+     * is otherwise served by the four reads above exactly as before —
+     * these two queries are never issued for it.
+     *
+     * find/findOne, NEVER an aggregate or a $lookup — ConsumerProfile is
+     * the encrypted collection and only the query middleware decrypts.
+     * See the shapeD2CApplicant block at the top of this file.
+     *
+     * findOne({ consumerId }), not findById: consumerId is this
+     * collection's own unique key (one profile per consumer), and we hold
+     * the consumer's id, not the profile's. `consumerId` stays in the
+     * projection because it is the DECRYPTION SUBJECT — a projection that
+     * drops it while keeping an encrypted path makes the plugin throw
+     * rather than hand back ciphertext.
+     *
+     * A consumer who applied before filling in their profile resolves to
+     * name + email with null document fields, which is a true statement
+     * about the case and the cue for an agent to go and ask. */
+    const [consumer, consumerProfile] = isD2CApplication(application)
+      ? await Promise.all([
+          Consumer.findById((application as any).consumerId).select("name email").lean(),
+          ConsumerProfile.findOne({ consumerId: (application as any).consumerId })
+            .select("consumerId personal passports")
+            .lean(),
+        ])
+      : [null, null];
+    const d2cApplicant = isD2CApplication(application)
+      ? shapeD2CApplicant(application, consumer, consumerProfile)
+      : null;
+
     // Case assignment lives on the APPLICATION itself now (Phase 9a — see
     // models/VisaApplication.ts), not the parent request.
     const assigneeIds = [
@@ -873,7 +1052,10 @@ router.get("/applications/:id", requirePermission("visaApplication", "READ"), as
       // could show a different number than what the customer sees for the
       // same application.
       completeness: computeAdminCompletenessCounts(application, documents as any[]),
-      traveller: traveller
+      // The same key, the same nine fields, either channel — the D2C
+      // branch is null for every B2B case, so what follows it is the
+      // untouched original expression.
+      traveller: d2cApplicant ?? (traveller
         ? {
             id: String((traveller as any)._id),
             name: travellerDisplayName(traveller),
@@ -888,7 +1070,7 @@ router.get("/applications/:id", requirePermission("visaApplication", "READ"), as
             passportIssueCountry: (traveller as any).passportIssueCountry ?? null,
             passportIssueDate: (traveller as any).passportIssueDate ?? null,
           }
-        : null,
+        : null),
       request: visaRequest || null,
       assignedConcierge,
       assignedScreeningOfficer,
