@@ -50,6 +50,11 @@ import VisaRule from "../models/VisaRule.js";
 import VisaRequest, { recomputeRequestStatus } from "../models/VisaRequest.js";
 import VisaApplication from "../models/VisaApplication.js";
 import ConsumerDocument from "../models/ConsumerDocument.js";
+import VisaDocument, { subjectFromApplication } from "../models/VisaDocument.js";
+// The ops-side row minted from a locker attachment — the bytes are shared,
+// so this is the "already stored elsewhere" half of the B2B upload helper,
+// never the uploading half. See the mint block in POST /.
+import { createVisaDocumentRow } from "./visa.js";
 import ConsumerProfile from "../models/ConsumerProfile.js";
 import VisaD2CLead from "../models/VisaD2CLead.js";
 import VisaActivityLog from "../models/VisaActivityLog.js";
@@ -365,11 +370,16 @@ router.post("/", async (req: any, res: any) => {
      * attached a passport and did not is the worst outcome here. */
     const ownedDocuments = documentIds.length
       ? await ConsumerDocument.find({
+          // THE FILTER IS UNCHANGED. Only the projection below grew — the
+          // ops-side VisaDocument mint needs the storage reference and the
+          // file metadata off these same rows, and re-reading them in a
+          // second query would be a second chance to get the ownership
+          // clause wrong.
           _id: { $in: documentIds },
           consumerId,
           deletedAt: null,
         })
-          .select("_id")
+          .select("_id docCode driver storageKey bucket originalFilename mimeType sizeBytes")
           .lean()
       : [];
     const ownedIds = (ownedDocuments as any[]).map((d) => d._id);
@@ -468,6 +478,122 @@ router.post("/", async (req: any, res: any) => {
       );
     }
 
+    /* ── MINT THE OPS-SIDE DOCUMENT ROWS ───────────────────────────
+     *
+     * The linkage above is how the CONSUMER side reads its own
+     * attachments, and it stays exactly as it was. It is invisible to
+     * ops: the concierge console lists VisaDocument.find({applicationId}),
+     * so before this block a D2C case arrived with "No documents
+     * uploaded" no matter what the applicant had attached. This mints the
+     * rows that panel reads. Both linkages are true after a submit;
+     * neither replaces the other.
+     *
+     * ── THE BYTES ARE SHARED, NOT COPIED ──────────────────────────
+     * driver / storageKey / bucket are carried across UNCHANGED, so the
+     * VisaDocument points at the object the locker already holds. No
+     * re-upload, no second copy, no S3 write on this path at all — which
+     * is what models/ConsumerDocument.ts means by "no surface ever copies
+     * a file. It links." `driver` is taken from the ROW rather than
+     * re-derived from NODE_ENV, so a dev-disk document stays a dev-disk
+     * document and the ops download route streams it instead of
+     * presigning a key that was never in S3.
+     *
+     * ── FROZEN AT SUBMIT ──────────────────────────────────────────
+     * Minted once, here. Nothing re-syncs them when the consumer edits
+     * their locker afterwards — an in-flight case's evidence is fixed at
+     * the moment it was submitted, the same reasoning that freezes
+     * ruleSnapshot and indicativeCostSnapshot two blocks up. A consumer
+     * who wants ops to see a newer file is making a new statement about
+     * their case, which is a conversation, not a silent overwrite.
+     *
+     * ── NO EXTRACTION ─────────────────────────────────────────────
+     * Deliberately no runVisaPassportExtraction call. The applicant's
+     * passport data already lives (encrypted) on their ConsumerProfile
+     * and the ops applicant panel reads it from there; re-deriving it
+     * from an image would add a second, weaker source of the same facts.
+     * createVisaDocumentRow does not extract on its own — this comment
+     * exists so nobody "restores parity" with the B2B upload by adding a
+     * trigger here.
+     *
+     * ── A CODE-LESS ATTACHMENT IS SKIPPED, AND SAID SO ────────────
+     * VisaDocument.docCode is required; ConsumerDocument.docCode is
+     * optional (models/ConsumerDocument.ts calls it "the optional bridge"
+     * to the ops taxonomy). A locker row with no code cannot become a
+     * checklist item without someone inventing which requirement it
+     * satisfies — so it is not minted, and the count comes back in the
+     * response rather than the file quietly not existing for ops. */
+    let documentsLinked = 0;
+    let documentsSkippedNoCode = 0;
+    if (ownedDocuments.length) {
+      /* IDEMPOTENCY — CHECK-EXISTING, NOT THE UNIQUE INDEX.
+       *
+       * The index on {applicationId, docCode, version} does NOT protect
+       * this: createVisaDocumentRow computes version = highest + 1, so a
+       * second mint for the same docCode would land on version 2 and
+       * insert cleanly rather than collide. Relying on a duplicate-key
+       * error to stop a re-run would therefore not stop it at all.
+       *
+       * So the guard is an explicit read of the codes this application
+       * already carries. On the normal path the application was created
+       * milliseconds ago and this returns nothing — one cheap indexed
+       * query for the guarantee that re-running the block is a no-op
+       * instead of a second set of rows.
+       *
+       * Note it is read ONCE, before the loop: two locker rows that share
+       * a docCode still mint as version 1 and version 2 of that code,
+       * which is correct — they are two real files the applicant
+       * attached, and the ops detail lists every version rather than only
+       * the newest. */
+      const existing = await VisaDocument.find({ applicationId: application._id })
+        .select("docCode")
+        .lean();
+      const alreadyMinted = new Set(existing.map((d: any) => String(d.docCode)));
+
+      const subject = subjectFromApplication(application as any);
+
+      for (const attached of ownedDocuments as any[]) {
+        const docCode = String(attached.docCode || "").trim();
+        if (!docCode) {
+          documentsSkippedNoCode += 1;
+          continue;
+        }
+        if (alreadyMinted.has(docCode)) continue;
+
+        await createVisaDocumentRow({
+          workspaceId,
+          applicationId: application._id,
+          requestId: visaRequest._id,
+          docCode,
+          // SHARED, all three — see the block header.
+          driver: attached.driver,
+          bucket: attached.bucket,
+          s3Key: attached.storageKey,
+          originalFilename: attached.originalFilename,
+          mimeType: attached.mimeType,
+          sizeBytes: attached.sizeBytes,
+          // A consumer is not a User and has no id in that collection.
+          uploadedByUserId: null,
+          uploadedByConsumerId: consumerId,
+          // CONSUMER/consumerId for a D2C application, because
+          // travellerProfileId is null on one — resolved by the single
+          // helper that owns that two-branch rule (models/VisaDocument.ts),
+          // never rebuilt inline. Stamped at mint because nothing on this
+          // path will ever stamp it later: D2C runs no extraction.
+          subjectType: subject?.subjectType ?? null,
+          subjectId: subject?.subjectId ?? null,
+          /* "CUSTOMER", not "CONSUMER" — VISA_ACTIVITY_ACTOR_TYPES is
+           * ["STAFF","CUSTOMER","SYSTEM"] (models/VisaActivityLog.ts) and
+           * has no consumer member. CUSTOMER is the honest one of the
+           * three: the act was the applicant's, not staff's and not the
+           * system's. Adding a fourth enum value would rewrite the
+           * meaning of every activity row already stored and is not this
+           * change's business — flagged rather than done. */
+          actorType: "CUSTOMER",
+        });
+        documentsLinked += 1;
+      }
+    }
+
     /* ── CONVERT THE MASTER SHEET ROW ──────────────────────────────
      * Upsert on the SAME {consumerId, destinationIso2} key the start
      * endpoint uses, so a started row BECOMES a submitted row. The upsert
@@ -510,6 +636,8 @@ router.post("/", async (req: any, res: any) => {
       totalInr: indicativeCostSnapshot.totalInr,
       linkedDocuments: ownedIds.length,
       rejectedDocumentCount,
+      documentsLinked,
+      documentsSkippedNoCode,
     });
 
     return res.status(201).json({
@@ -517,6 +645,13 @@ router.post("/", async (req: any, res: any) => {
       application: publicApplication(application, visaRequest),
       // Surfaced, not swallowed — see the ownership check above.
       rejectedDocumentCount,
+      // How many attachments reached the ops review panel, and how many
+      // could not because they carry no docCode. Reported rather than
+      // silently dropped, for the same reason rejectedDocumentCount is:
+      // an applicant who believes they attached a passport and did not is
+      // the worst outcome on this route.
+      documentsLinked,
+      documentsSkippedNoCode,
     });
   } catch (err: any) {
     consumerAppLogger.error("D2C application create failed", { error: err?.message });

@@ -1619,82 +1619,89 @@ router.patch("/documents/:id/review", requirePermission("visaApplication", "WRIT
  * skeleton has to stay visible for audit; it is the WRITES that 409. Adding
  * one here would change legitimate ops behaviour, which this fix does not.
  * ───────────────────────────────────────────────────────────────────── */
+/**
+ * The document a download route is allowed to serve, or null.
+ *
+ * Shared by /url and /bytes so the two can never disagree about who may
+ * see what — the parent-application gate below is the same one the detail
+ * route applies, and duplicating it in two handlers is exactly how the
+ * second one ends up missing a clause.
+ */
+async function loadDownloadableDocument(id: string): Promise<any | null> {
+  if (!mongoose.isValidObjectId(id)) return null;
+
+  const doc = await VisaDocument.findOne({ _id: id, deletedAt: null }).lean();
+  if (!doc) return null;
+
+  // THE PARENT CHECK. Resolved BEFORE any URL is minted or any byte is
+  // read, so a refusal never reaches the point of serving something.
+  const owningApplication = await VisaApplication.findById((doc as any).applicationId).lean();
+  if (!owningApplication || (owningApplication as any).status === "pending_approval") return null;
+
+  return doc as any;
+}
+
+/**
+ * `"s3"` for every row that does not say otherwise.
+ *
+ * THE `?? "s3"` IS THE B2B GUARANTEE. Every row written before the driver
+ * field existed has no value for it, and every one of those is an S3
+ * object — absent MUST take the presign path. The schema default already
+ * makes a hydrated row read "s3"; naming it here keeps the invariant
+ * visible at both call sites rather than inferred from a default two files
+ * away, and a `.lean()` read of a pre-existing raw document still gets it.
+ */
+function documentDriver(doc: any): string {
+  return doc?.driver ?? "s3";
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /documents/:id/url — ONE CONTRACT: always JSON, never bytes.
+ *
+ * ── WHY THIS IS WORTH SAYING OUT LOUD ────────────────────────────────
+ * This route briefly returned EITHER `{ok,url}` (s3) or a raw PDF stream
+ * (local-disk) depending on the row. Every caller in the codebase reads it
+ * the first way — apps/frontend/src/pages/admin/VisaConciergeConsole.tsx's
+ * viewDocument does `const data = await api.get(...); if (data?.url)
+ * window.open(data.url)` — so a local-disk document handed the viewer a
+ * PDF body, `data.url` came back undefined, and the View button silently
+ * did nothing at all. Not an error, not a broken tab: nothing. One
+ * endpoint answering with two content types is what did that, so it does
+ * not do it any more.
+ *
+ * Both drivers now answer with a URL. The difference is only what kind:
+ *   s3          -> a presigned S3 URL, exactly as before this split
+ *   local-disk  -> a same-origin path to /documents/:id/bytes below
+ *
+ * The caller does not have to know which, which is the entire point.
+ * ───────────────────────────────────────────────────────────────────── */
 router.get("/documents/:id/url", requirePermission("visaApplication", "READ"), async (req: any, res: any) => {
   try {
-    const id = req.params.id;
-    if (!mongoose.isValidObjectId(id)) {
-      return res.status(404).json({ error: "Document not found" });
-    }
-
-    const doc = await VisaDocument.findOne({ _id: id, deletedAt: null }).lean();
+    const doc = await loadDownloadableDocument(req.params.id);
     if (!doc) return res.status(404).json({ error: "Document not found" });
 
-    // THE PARENT CHECK. Resolved BEFORE presignGetObject is called, so a
-    // refusal never reaches the point of minting a URL.
-    const owningApplication = await VisaApplication.findById((doc as any).applicationId).lean();
-    if (!owningApplication || (owningApplication as any).status === "pending_approval") {
-      return res.status(404).json({ error: "Document not found" });
-    }
+    if (documentDriver(doc) === "local-disk") {
+      /* Built from req.baseUrl, not a hardcoded "/api/admin/visa" — the
+       * mount point lives in server.ts and a literal here would be a
+       * second copy of it, wrong the day the router moves. Same-origin
+       * and relative on purpose: the browser sends the httpOnly
+       * hrms_accessToken cookie (path "/api", refreshed by /auth/refresh)
+       * with a plain window.open, which is what lets the existing viewer
+       * open it with no change at all. */
+      const url = `${req.baseUrl}/documents/${String(doc._id)}/bytes`;
 
-    /* ── LOCAL-DISK ROWS ARE STREAMED, NOT PRESIGNED ─────────────────
-     * There is nothing in an object store to sign a URL for: a
-     * driver:"local-disk" row's bytes are on this machine's disk, and
-     * `s3Key` holds a PATH rather than a key (the naming mismatch is
-     * documented on the field in models/VisaDocument.ts — renaming it is a
-     * cross-model change, deliberately out of scope). Presigning one would
-     * mint a URL for a key that does not exist and fail at the click, with
-     * an S3 404 that says nothing about the real cause.
-     *
-     * Mirrors services/consumerDocumentStorage.ts's openConsumerDocument:
-     * same .devdata/uploads root, same "stat first so a missing file
-     * throws ENOENT rather than yielding an empty stream", same
-     * private/no-store headers the consumer bytes route already sets.
-     *
-     * THE `?? "s3"` IS THE B2B GUARANTEE. Every row written before the
-     * driver field existed has no value for it, and every one of those is
-     * an S3 object — absent MUST take the presign path. The schema default
-     * already makes a hydrated row read "s3"; this repeats it at the
-     * branch so the invariant is visible where it matters rather than
-     * inferred from a default two files away. A `.lean()` read of a
-     * pre-existing raw document still gets it. */
-    if (((doc as any).driver ?? "s3") === "local-disk") {
-      const relative = String((doc as any).s3Key);
-      /* The root is DERIVED FROM the consumer locker's own, never
-       * recomputed. consumerDocumentStorage.ts resolves it from
-       * import.meta.url (src/services -> … -> repo root) precisely because
-       * process.cwd() is wrong the moment the backend is started from
-       * apps/backend, which is how it is normally started. Taking the
-       * dirname of its exported root — <repo>/.devdata/uploads/
-       * consumer-documents -> <repo>/.devdata/uploads — gives the same
-       * base its resolveLocalPath() uses, and cannot drift from it. */
-      const root = path.dirname(CONSUMER_DOCUMENT_LOCAL_ROOT);
-      // Resolved against that root and then checked to be INSIDE it — the
-      // same containment guard openConsumerDocument applies, because a
-      // stored path is still a path and "../" in one must never escape.
-      const abs = path.resolve(root, relative);
-      if (abs !== root && !abs.startsWith(root + path.sep)) {
-        return res.status(404).json({ error: "Document not found" });
-      }
-      await stat(abs); // ENOENT here, not an empty 200
-      adminVisaLogger.info("admin visa document streamed from local disk", {
-        documentId: String((doc as any)._id),
-        applicationId: String((doc as any).applicationId),
+      adminVisaLogger.info("admin visa document local-disk URL issued", {
+        documentId: String(doc._id),
+        applicationId: String(doc.applicationId),
         userId: actorId(req) ? String(actorId(req)) : null,
         requestedAt: new Date().toISOString(),
       });
-      res.setHeader("Content-Type", (doc as any).mimeType);
-      res.setHeader(
-        "Content-Disposition",
-        `inline; filename="${String((doc as any).originalFilename).replace(/"/g, "")}"`,
-      );
-      // The bytes are personal data; no shared cache may hold them.
-      res.setHeader("Cache-Control", "private, no-store");
-      const stream = createReadStream(abs);
-      stream.on("error", () => {
-        if (!res.headersSent) res.status(500).json({ error: "Failed to read document" });
-        else res.destroy();
-      });
-      return stream.pipe(res);
+
+      // expiresIn is null rather than a number: nothing expires here. The
+      // bytes route re-checks permission and the parent application on
+      // every hit, so the path is not a bearer capability the way a
+      // presigned URL is — it grants nothing to whoever holds it.
+      return res.json({ ok: true, url, expiresIn: null });
     }
 
     const url = await presignGetObject({
@@ -1720,6 +1727,93 @@ router.get("/documents/:id/url", requirePermission("visaApplication", "READ"), a
   } catch (err: any) {
     console.error("[admin visa document url GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to generate document URL" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /documents/:id/bytes — the ONLY streaming route on this router.
+ *
+ * A driver:"local-disk" row's bytes are on this machine's disk, and there
+ * is nothing in an object store to sign a URL for: `s3Key` holds a PATH
+ * rather than a key (the naming mismatch is documented on the field in
+ * models/VisaDocument.ts — renaming it is a cross-model change,
+ * deliberately out of scope). Presigning one would mint a URL for a key
+ * that was never uploaded and fail at the click with an S3 404 that says
+ * nothing about the real cause.
+ *
+ * Mirrors services/consumerDocumentStorage.ts's openConsumerDocument: same
+ * .devdata/uploads root, same "stat first so a missing file throws ENOENT
+ * rather than yielding an empty stream", same private/no-store headers the
+ * consumer bytes route already sets.
+ *
+ * ── LOCAL-DISK ONLY, AND THAT IS A GUARD, NOT A LIMITATION ───────────
+ * An s3 row hitting this route 404s. Serving it here would mean the API
+ * proxying object-store bytes through itself on a path that exists for a
+ * dev-disk fallback — a second, unaudited way to read production
+ * documents that bypasses the presigned URL's expiry entirely. S3 rows go
+ * through /url and only through /url.
+ *
+ * Same permission key and the SAME parent-application gate as /url (both
+ * call loadDownloadableDocument), so this cannot serve a case /url would
+ * have refused.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/documents/:id/bytes", requirePermission("visaApplication", "READ"), async (req: any, res: any) => {
+  try {
+    const doc = await loadDownloadableDocument(req.params.id);
+    if (!doc) return res.status(404).json({ error: "Document not found" });
+
+    if (documentDriver(doc) !== "local-disk") {
+      return res.status(404).json({ error: "Document not found" });
+    }
+
+    /* The root is DERIVED FROM the consumer locker's own, never
+     * recomputed. consumerDocumentStorage.ts resolves it from
+     * import.meta.url (src/services -> … -> repo root) precisely because
+     * process.cwd() is wrong the moment the backend is started from
+     * apps/backend, which is how it is normally started. Taking the
+     * dirname of its exported root — <repo>/.devdata/uploads/
+     * consumer-documents -> <repo>/.devdata/uploads — gives the same base
+     * its resolveLocalPath() uses, and cannot drift from it. */
+    const root = path.dirname(CONSUMER_DOCUMENT_LOCAL_ROOT);
+    // Resolved against that root and then checked to be INSIDE it — the
+    // same containment guard openConsumerDocument applies, because a
+    // stored path is still a path and "../" in one must never escape.
+    const abs = path.resolve(root, String(doc.s3Key));
+    if (abs !== root && !abs.startsWith(root + path.sep)) {
+      return res.status(404).json({ error: "Document not found" });
+    }
+
+    await stat(abs); // ENOENT here, not an empty 200
+
+    adminVisaLogger.info("admin visa document streamed from local disk", {
+      documentId: String(doc._id),
+      applicationId: String(doc.applicationId),
+      userId: actorId(req) ? String(actorId(req)) : null,
+      requestedAt: new Date().toISOString(),
+    });
+
+    res.setHeader("Content-Type", doc.mimeType);
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${String(doc.originalFilename).replace(/"/g, "")}"`,
+    );
+    // The bytes are personal data; no shared cache may hold them.
+    res.setHeader("Cache-Control", "private, no-store");
+
+    const stream = createReadStream(abs);
+    stream.on("error", () => {
+      if (!res.headersSent) res.status(500).json({ error: "Failed to read document" });
+      else res.destroy();
+    });
+    return stream.pipe(res);
+  } catch (err: any) {
+    // A missing file lands here via stat()'s ENOENT — 404, not 500: the
+    // row exists, the bytes do not, and that is "not found" to a caller.
+    if (err?.code === "ENOENT") {
+      return res.status(404).json({ error: "Document not found" });
+    }
+    console.error("[admin visa document bytes GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to read document" });
   }
 });
 

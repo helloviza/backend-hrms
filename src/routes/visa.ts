@@ -3574,6 +3574,23 @@ export async function createVisaDocumentRow(opts: {
   uploadedByUserId?: any;
   /** Set for a D2C consumer upload. Exactly one of this and the previous. */
   uploadedByConsumerId?: any;
+  /**
+   * The encryption subject, when the caller already knows it.
+   *
+   * OPTIONAL, and omitting it is the B2B behaviour: an upload has no
+   * extractedFields yet, so it holds no ciphertext and needs no subject —
+   * services/visaPassportExtraction.ts stamps one at the moment it is
+   * about to write encrypted values (models/VisaDocument.ts's own note).
+   * The D2C mint passes it because that path never runs extraction, so
+   * nothing downstream would ever stamp it, and a row that later acquires
+   * extractedFields by any route must not be subject-less.
+   *
+   * Callers pass the result of subjectFromApplication() — never a
+   * hand-built pair. Absent stays null, exactly as before this parameter
+   * existed.
+   */
+  subjectType?: any;
+  subjectId?: any;
   actorType: VisaActivityActorType;
 }) {
   const {
@@ -3589,6 +3606,8 @@ export async function createVisaDocumentRow(opts: {
     sizeBytes,
     uploadedByUserId,
     uploadedByConsumerId,
+    subjectType,
+    subjectId,
     actorType,
   } = opts;
 
@@ -3611,6 +3630,10 @@ export async function createVisaDocumentRow(opts: {
     sizeBytes,
     uploadedByUserId: uploadedByUserId ?? null,
     uploadedByConsumerId: uploadedByConsumerId ?? null,
+    // null unless the caller named one — the schema default, and what
+    // every B2B upload has always stored here.
+    subjectType: subjectType ?? null,
+    subjectId: subjectId ?? null,
     // Explicit, not just relying on the schema default — "extraction
     // starts as pending" is a requirement of this phase, not an
     // incidental default. Nothing here (or anywhere yet) extracts
