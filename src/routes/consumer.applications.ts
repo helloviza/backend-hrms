@@ -66,7 +66,7 @@ import {
   D2C_TRACKING_STATUS_LABELS,
 } from "../models/visaD2CLifecycle.js";
 import { buildIndicativeCostSnapshot, buildRuleSnapshot } from "../utils/visaSnapshots.js";
-import { computeVisaFeeBlock } from "../utils/visaFee.js";
+import { selectHeadlineRule } from "../utils/visaHeadlineRule.js";
 import { computeProcessingDeadline } from "../utils/visaEta.js";
 import { purposeMatchValues } from "../utils/visaPurposes.js";
 import { findSeedCountry } from "../config/visaCountrySeed.js";
@@ -107,7 +107,12 @@ function me(req: any): mongoose.Types.ObjectId {
  * applies (utils/visaPurposes.ts) — so a corridor whose only rule is
  * TOURIST_OR_BUSINESS is bookable as either, exactly as the cards offered.
  */
-async function resolveRuleFor(iso2: string, purpose: string) {
+// Exported ONLY so routes/visaHeadlineSelection.test.ts can assert that this
+// path and the public headline path resolve the SAME rule for the same
+// corridor. Reaching it through the route would need a consumer session for
+// a question that has nothing to do with authentication. Same convention as
+// public.visa.ts's exported findCategoryDivergence.
+export async function resolveRuleFor(iso2: string, purpose: string) {
   const rules = await VisaRule.find({
     status: "PUBLISHED",
     nationality: PUBLIC_NATIONALITY,
@@ -117,11 +122,12 @@ async function resolveRuleFor(iso2: string, purpose: string) {
 
   if (rules.length === 0) return null;
 
-  return (rules as any[])
-    .slice()
-    .sort(
-      (a, b) => computeVisaFeeBlock(a, "D2C").totalInr - computeVisaFeeBlock(b, "D2C").totalInr,
-    )[0];
+  // ⚠ SHARED with routes/public.visa.ts — see utils/visaHeadlineRule.ts.
+  // The two endpoints MUST pick the same rule; calling one function is what
+  // guarantees it. `?? null` keeps this route's documented null contract
+  // (selectHeadlineRule only returns undefined for an empty array, which the
+  // guard above has already excluded).
+  return selectHeadlineRule(rules as any[]) ?? null;
 }
 
 /**

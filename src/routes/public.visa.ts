@@ -37,6 +37,7 @@ import VisaRule, { type VisaCategory } from "../models/VisaRule.js";
 import VisaDestinationContent from "../models/VisaDestinationContent.js";
 import { hydrateVisaChecklist } from "../utils/visaChecklistHydration.js";
 import { computeVisaFeeBlock, VISA_FEE_DISCLAIMER } from "../utils/visaFee.js";
+import { selectHeadlineRule } from "../utils/visaHeadlineRule.js";
 import { isCuratedCorridor } from "../config/visaFeaturedRanking.js";
 import {
   SEED_VISA_CATEGORIES,
@@ -486,17 +487,21 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
       });
     }
 
-    // Prefer a tourist-facing rule, then the cheapest by D2C total so the
-    // headline figure is the one a consumer would actually be quoted.
+    // Prefer a tourist-facing rule, then hand the narrowed pool to the
+    // shared selector so the headline figure is the one a consumer would
+    // actually be quoted.
+    //
+    // ⚠ The pick itself lives in utils/visaHeadlineRule.ts and is SHARED
+    // with routes/consumer.applications.ts's resolveRuleFor. Both must
+    // resolve identically or a consumer is quoted one price and booked at
+    // another; a shared function is what makes that impossible rather than
+    // merely intended. Read that file's header for the ladder and for why
+    // the fallback is a preference rather than a filter.
     const touristish = (rules as any[]).filter(
       (r) => r.purpose === "TOURIST" || r.purpose === "TOURIST_OR_BUSINESS",
     );
     const candidates = touristish.length ? touristish : (rules as any[]);
-    const rule = candidates
-      .slice()
-      .sort(
-        (a, b) => computeVisaFeeBlock(a, "D2C").totalInr - computeVisaFeeBlock(b, "D2C").totalInr,
-      )[0];
+    const rule = selectHeadlineRule(candidates);
 
     // The key field is `destinationIso2`, NOT `iso2` — VisaDestinationContent
     // does not follow VisaRule's naming here.
