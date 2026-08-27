@@ -912,7 +912,8 @@ describe("seed loading", () => {
 });
 
 /* ═════════════════════════════════════════════════════════════════════
- * THE PRICE GATE — both conditions, and absence (never ₹0)
+ * THE PRICE GATE — one condition (a populated D2C fee), and absence
+ * (never ₹0). Curation is NOT a condition: see the non-curated pair below.
  * ═══════════════════════════════════════════════════════════════════ */
 describe("price gate", () => {
   it("INCLUDES a price for a curated corridor with a populated D2C fee", async () => {
@@ -956,8 +957,32 @@ describe("price gate", () => {
     expect(JSON.stringify(res.body)).not.toContain('"totalInr":0');
   });
 
-  it("OMITS price for a NON-curated corridor even with a D2C fee populated", async () => {
+  /* THE NEW CONTRACT (2026-08-27): a D2C fee alone makes a corridor
+   * sellable. This test used to assert the opposite — that a priced
+   * corridor stayed unpriced unless it was also in the hardcoded curated
+   * set. That AND had never once been satisfied in production (the one
+   * corridor with a fee was not curated; all eleven curated ones were
+   * unpriced), so it was not gating a decision, it was holding the door
+   * shut. Inverted deliberately, and kept, because it is now the test that
+   * pins "authoring a fee IS the act of making a corridor sellable". */
+  it("INCLUDES a price for a NON-curated corridor with a D2C fee populated", async () => {
     await makeRule({ destinationIso2: "ZW", destinationName: "Zimbabwe", d2cServiceFeeInr: 3000 });
+    const res = await request(app()).get("/api/public/visa/country/ZW");
+
+    // Not curated — and that no longer has any bearing on the price.
+    expect(res.body.isCurated).toBe(false);
+    expect("price" in res.body).toBe(true);
+    // Same arithmetic as the curated case: embassy 8000 + vfs 1500 + d2c 3000 + GST 540.
+    expect(res.body.price.totalInr).toBe(13040);
+    expect(res.body.price.currency).toBe("INR");
+  });
+
+  it("OMITS price for a NON-curated corridor with NO D2C fee — the fee is the only gate", async () => {
+    await makeRule({
+      destinationIso2: "ZW",
+      destinationName: "Zimbabwe",
+      d2cServiceFeeInr: undefined,
+    });
     const res = await request(app()).get("/api/public/visa/country/ZW");
 
     expect(res.body.isCurated).toBe(false);

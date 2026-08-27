@@ -359,23 +359,40 @@ function publicDocumentRows(rule: any) {
 }
 
 /**
- * THE PRICE GATE. Both conditions, in one place, so neither can be satisfied
- * without the other:
- *   (i)  the corridor is in the curated set (config/visaFeaturedRanking.ts)
- *   (ii) the rule carries a POPULATED d2cServiceFeeInr
+ * THE PRICE GATE — one condition: the selected rule carries a POPULATED
+ * d2cServiceFeeInr.
  *
- * Returns null when either fails — and the caller OMITS the key entirely
- * rather than sending null/0. A ₹0 price is a claim that the visa is free;
- * an absent price is the truth, which is "we do not quote this corridor
- * online yet, talk to us". The B2B fee is never a fallback, under any
- * condition.
+ * ── WHY THE CURATED-SET CLAUSE IS GONE (2026-08-27) ──────────────────
+ * This used to be an AND of two things: the corridor had to be in the
+ * eleven-entry curated set (config/visaFeaturedRanking.ts) AND carry a fee.
+ * Measured against production, those two conditions had never once been
+ * satisfied together — the single corridor with an authored fee (AU) was
+ * not curated, and all eleven curated corridors were unpriced. The gate
+ * was not gating a decision; it was holding the door shut.
+ *
+ * The rule now is the one ops actually acts on: authoring a D2C service fee
+ * IS the act of making a corridor sellable. A second, hardcoded list that
+ * has to be edited in a deploy before that fee can surface just means a
+ * priced corridor stays invisible for reasons no one at the keyboard can
+ * see.
+ *
+ * The curated list KEEPS its other job. isCuratedCorridor still feeds the
+ * `isCurated` payload flag below, which the country panel renders as the
+ * "We do this one often" badge, and the ranked landing grid still orders by
+ * it. Those are editorial signals; this was a commercial gate, and only the
+ * gate is removed.
+ *
+ * Returns null when the fee is absent — and the caller OMITS the key
+ * entirely rather than sending null/0. A ₹0 price is a claim that the visa
+ * is free; an absent price is the truth, which is "we do not quote this
+ * corridor online yet, talk to us". The B2B fee is never a fallback, under
+ * any condition.
  *
  * `d2cServiceFeeInr != null` (not truthiness): a deliberate ₹0 D2C service
  * fee is a real, quotable price — free service on top of real embassy costs —
  * and `!fee` would silently drop it.
  */
-function buildPublicPrice(rule: any, iso2: string) {
-  if (!isCuratedCorridor(iso2)) return null;
+function buildPublicPrice(rule: any) {
   if (rule?.d2cServiceFeeInr == null) return null;
 
   const block = computeVisaFeeBlock(rule, "D2C");
@@ -513,7 +530,7 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
       .lean();
 
     const { documents, documentGroups } = publicDocumentRows(rule);
-    const price = buildPublicPrice(rule, iso2);
+    const price = buildPublicPrice(rule);
 
     /* The tooltip fields, on the serviced branch too, so all four resolve for
      * every country on both endpoints.
