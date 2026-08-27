@@ -20,6 +20,7 @@
 // says so rather than leaving a stale absolute in place.
 import { Router } from "express";
 import bcrypt from "bcryptjs";
+import { OAuth2Client } from "google-auth-library";
 import Consumer from "../models/Consumer.js";
 import User from "../models/User.js";
 import { requireConsumer } from "../middleware/requireConsumer.js";
@@ -181,6 +182,10 @@ async function b2bAccountExists(email: string): Promise<boolean> {
 
 /** The one marker the frontend switches on. Fixed string, no variants. */
 const B2B_MARKER = "B2B_ACCOUNT_EXISTS";
+/** Password login attempted against an account that has no password. */
+const NO_PASSWORD_MARKER = "CONSUMER_NO_PASSWORD";
+/** GOOGLE_OAUTH_CLIENT_ID is unset on this server. Deployment, not code. */
+const GOOGLE_UNCONFIGURED_MARKER = "GOOGLE_SIGNIN_UNCONFIGURED";
 const B2B_MESSAGE =
   "That address is already registered as a Plumtrips business account.";
 
@@ -293,6 +298,27 @@ router.post("/login", async (req: any, res: any) => {
       return res.status(403).json({ error: "Account is not active" });
     }
 
+    /* ── THE NO-PASSWORD GUARD ─────────────────────────────────────
+     * passwordHash is optional since Google sign-in, and this check is
+     * not defensive style — it is load-bearing. bcryptjs's compare()
+     * THROWS on an undefined hash ("Illegal arguments: string,
+     * undefined") rather than returning false, so without this line a
+     * Google user typing their address into the password form would fall
+     * into the catch below and receive a 500 "Login failed". That reads
+     * as an outage to them and to us; it is not one.
+     *
+     * The message names the real situation instead of the generic
+     * "Invalid credentials", and it can: reaching here already proves a
+     * consumer exists for this address, so nothing is disclosed that the
+     * account itself did not. What it must not do is imply the password
+     * was merely wrong — there is no password to get right. */
+    if (!consumer.passwordHash) {
+      return res.status(400).json({
+        error: "This account signs in with Google. Use the Google button instead.",
+        code: NO_PASSWORD_MARKER,
+      });
+    }
+
     const ok = await bcrypt.compare(password, consumer.passwordHash);
     if (!ok) {
       return res.status(400).json({ error: "Invalid credentials" });
@@ -360,6 +386,181 @@ router.post("/logout", requireConsumer, async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[consumer logout]", err?.message);
     return res.status(500).json({ error: "Logout failed" });
+  }
+});
+
+/* ══ GOOGLE SIGN-IN — THE ID-TOKEN FLOW ═════════════════════════
+ *
+ * The browser talks to Google, Google hands the browser a signed ID
+ * token, the browser posts that token here, and this endpoint verifies
+ * the SIGNATURE against Google's published keys.
+ *
+ * ── WHY THERE IS NO CLIENT SECRET ANYWHERE IN THIS FILE ───────────
+ * This is not the authorization-code flow. There is no redirect, no
+ * callback route, no code exchange, and therefore no client secret to
+ * hold — which is the whole reason the flow was chosen. A secret is a
+ * thing that leaks; the one we do not have cannot.
+ *
+ * What replaces it is the AUDIENCE CHECK. verifyIdToken({ audience })
+ * rejects any token that was not minted for our client id, so a valid
+ * Google token issued to some other site is useless here. Passing the
+ * wrong audience — or none — is the single mistake that would turn this
+ * into "any Google user of any app can log in as anyone", which is why
+ * the client id is read fail-closed below rather than defaulted.
+ * ════════════════════════════════════════════════════════════════ */
+
+/**
+ * The client id, read PER CALL and never cached at module scope.
+ *
+ * Deliberately mirrors config/consumerAuth.ts's getConsumerJwtSecret()
+ * read pattern rather than the `const X = process.env.Y || ""` pattern:
+ * a module-level read resolves once at import, so a deployment that adds
+ * the variable without restarting, or a test that sets it after import,
+ * silently gets the stale value.
+ *
+ * It does NOT throw at boot the way the JWT secret does, and the
+ * difference is deliberate. The JWT secret is load-bearing for every
+ * consumer request, so a server without it is useless and should refuse
+ * to start. This one gates ONE endpoint. Killing the whole API — email
+ * login, the map, every account page — because Google sign-in is not
+ * configured yet would be a self-inflicted outage. So: unset means this
+ * route answers 503, and nothing else changes.
+ */
+function getGoogleClientId(): string | null {
+  const raw = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  const trimmed = String(raw ?? "").trim();
+  return trimmed || null;
+}
+
+/** Built per request from the current client id. Cheap — it holds no
+ *  connection state; the key fetch inside verifyIdToken is what does the
+ *  network work, and google-auth-library caches Google's certs itself. */
+function googleClient(clientId: string): OAuth2Client {
+  return new OAuth2Client(clientId);
+}
+
+/* ── POST /google — PUBLIC ───────────────────────────────── */
+router.post("/google", async (req: any, res: any) => {
+  try {
+    const clientId = getGoogleClientId();
+    if (!clientId) {
+      // 503, not 500: the code is fine, the deployment is incomplete.
+      // Distinguishable so the frontend can hide the button rather than
+      // present a control that cannot work.
+      console.warn("[consumer google] GOOGLE_OAUTH_CLIENT_ID is not set");
+      return res.status(503).json({
+        error: "Google sign-in is not configured on this server.",
+        code: GOOGLE_UNCONFIGURED_MARKER,
+      });
+    }
+
+    /* `credential` is what Google Identity Services calls it in the
+     * callback it hands the browser, so that is the primary name.
+     * `idToken` is accepted as an alias purely so a curl reproduction or
+     * a future non-GIS caller does not have to know GIS's vocabulary. */
+    const idToken = String(req.body?.credential ?? req.body?.idToken ?? "").trim();
+    if (!idToken) {
+      return res.status(400).json({ error: "Missing Google credential" });
+    }
+
+    let payload: any;
+    try {
+      const ticket = await googleClient(clientId).verifyIdToken({
+        idToken,
+        // THE LINE THAT MAKES THIS SAFE. See the block comment above.
+        audience: clientId,
+      });
+      payload = ticket.getPayload();
+    } catch (err: any) {
+      // Expired, malformed, wrong audience, bad signature — all one
+      // answer to the caller. Which of them it was is a detail an
+      // attacker would enjoy and a user cannot act on.
+      console.warn("[consumer google] token rejected:", err?.message);
+      return res.status(401).json({ error: "That Google sign-in could not be verified." });
+    }
+
+    if (!payload) {
+      return res.status(401).json({ error: "That Google sign-in could not be verified." });
+    }
+
+    const email = normalizeEmail(payload.email);
+    /* email_verified is REQUIRED, not decorative. Google will issue a
+     * token for an account whose address it has not confirmed, and
+     * treating that as proof of the address would let somebody claim an
+     * email they do not control — and, through find-or-create below,
+     * walk into an existing consumer account that legitimately holds it. */
+    if (!email || payload.email_verified !== true) {
+      return res.status(401).json({
+        error: "Your Google account's email address is not verified.",
+      });
+    }
+
+    const googleSub = String(payload.sub ?? "").trim() || undefined;
+    const name = String(payload.name ?? "").trim() || email.split("@")[0];
+
+    /* ── FIND ─────────────────────────────────────────────
+     * By googleSub FIRST, falling back to email.
+     *
+     * The order is the point. sub is immutable; email is not. Somebody
+     * who changed the address on their Google account must come back to
+     * the SAME consumer row, not a second one — and a sub lookup gets
+     * that right where an email lookup silently creates a duplicate. */
+    let consumer: any = googleSub ? await Consumer.findOne({ googleSub }) : null;
+    if (!consumer) consumer = await Consumer.findOne({ email });
+
+    if (consumer) {
+      if (consumer.status !== "ACTIVE") {
+        return res.status(403).json({ error: "Account is not active" });
+      }
+
+      /* An account that already exists keeps its identity. We attach the
+       * sub if it is missing — that is the email-signup user linking
+       * Google for the first time, and it is new information — but we do
+       * NOT rewrite name, and we do NOT touch authProvider or
+       * passwordHash. Somebody who set a password still has one, and
+       * flipping their provider to "google" would misrecord history and
+       * strip a working login. */
+      if (googleSub && !consumer.googleSub) {
+        await Consumer.updateOne({ _id: consumer._id }, { $set: { googleSub } });
+      }
+
+      issueSession(res, consumer);
+      return res.json({ ok: true, consumer: publicConsumer(consumer), created: false });
+    }
+
+    /* ── NO CONSUMER — THE B2B FORK, BEFORE ANY WRITE ───────────────
+     * The SAME b2bAccountExists() the email signup and login paths use,
+     * returning the SAME 409 and the SAME marker, so the frontend's
+     * existing fork screen handles this with no Google-specific branch.
+     *
+     * Placed after the consumer lookup for the same reason it is there:
+     * an address that is already a consumer is answered as one and never
+     * reaches this question, so the endpoint reveals nothing about B2B
+     * for any address it already knows. */
+    if (await b2bAccountExists(email)) {
+      return res.status(409).json({ error: B2B_MESSAGE, code: B2B_MARKER });
+    }
+
+    /* ── CREATE ── no password, and the record says so ───────────────
+     * passwordHash is simply absent. There is no placeholder, no random
+     * unusable hash, nothing that a later reader could mistake for a
+     * credential. authProvider carries the truth instead. */
+    const created = await Consumer.create({
+      email,
+      name,
+      authProvider: "google",
+      googleSub,
+    });
+
+    issueSession(res, created as any);
+    return res.status(201).json({
+      ok: true,
+      consumer: publicConsumer(created),
+      created: true,
+    });
+  } catch (err: any) {
+    console.error("[consumer google]", err?.message);
+    return res.status(500).json({ error: "Google sign-in failed" });
   }
 });
 
