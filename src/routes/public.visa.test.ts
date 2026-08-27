@@ -1007,6 +1007,146 @@ describe("price gate", () => {
 });
 
 /* ═════════════════════════════════════════════════════════════════════
+ * variants[] — every genuine visa the corridor publishes
+ *
+ * Modelled on the real AU and GB catalogues: AU publishes three visitor
+ * visas plus a Visa Transfer and a Transit 771 (both retyped off VISA in
+ * the 2026-08-27 migration); GB publishes a dozen visas, none priced yet.
+ * ═══════════════════════════════════════════════════════════════════ */
+describe("variants[] — the corridor's visa types", () => {
+  /** AU as production actually holds it, post-retype. */
+  async function makeAu() {
+    const base = {
+      nationality: "IN",
+      destinationIso2: "AU",
+      destinationName: "Australia",
+      purpose: "TOURIST",
+      entryType: "SINGLE",
+      serviceTier: "STANDARD",
+      productClass: "VISA",
+      visaCategory: "E_VISA",
+      status: "PUBLISHED",
+      isSchengen: false,
+      embassyFeeInr: 17250,
+      vfsFeeInr: 0,
+      plumtripsServiceFeeInr: 1200,
+    };
+    await VisaRule.create({ ...base, variantKey: "VISITOR_VISA_EASY_APPLY", priceNote: "Visitor Visa (Easy Apply) | validity Decided by embassy", d2cServiceFeeInr: 2000 });
+    await VisaRule.create({ ...base, variantKey: "VISITOR_VISA", priceNote: "Visitor Visa | validity Decided by embassy", d2cServiceFeeInr: 2500 });
+    await VisaRule.create({ ...base, variantKey: "VISITOR_VISA_EXPRESS", priceNote: "Visitor Visa - Express | validity Decided by embassy", d2cServiceFeeInr: 3000, embassyFeeInr: 82653 });
+    // The two the retype moved OFF productClass VISA — they must not appear.
+    await VisaRule.create({ ...base, variantKey: "VISA_TRANSFER", priceNote: "Visa Transfer | validity Decided by embassy", productClass: "VISA_AMENDMENT", d2cServiceFeeInr: 1200, embassyFeeInr: 0 });
+    await VisaRule.create({ ...base, variantKey: "TRANSIT_VISA_SUBCLASS_77", priceNote: "Transit visa - (Subclass 771) | validity 3 days post issue", productClass: "TRANSIT_VISA", purpose: "TRANSIT", d2cServiceFeeInr: 1500, embassyFeeInr: 0 });
+  }
+
+  it("lists exactly the three genuine visas — Transfer and Transit are absent", async () => {
+    await makeAu();
+    const res = await request(app()).get("/api/public/visa/country/AU");
+
+    expect(Array.isArray(res.body.variants)).toBe(true);
+    expect(res.body.variants).toHaveLength(3);
+    expect(res.body.variants.map((v: any) => v.name)).toEqual([
+      "Visitor Visa (Easy Apply)",
+      "Visitor Visa",
+      "Visitor Visa - Express",
+    ]);
+
+    const keys = JSON.stringify(res.body.variants);
+    expect(keys).not.toMatch(/Visa Transfer|Transit visa/i);
+    // variantKey is ops-internal and stays off this surface — see the
+    // leak whitelist above.
+    expect(keys).not.toContain("variantKey");
+  });
+
+  it("strips the ` | validity …` suffix from the display name", async () => {
+    await makeAu();
+    const res = await request(app()).get("/api/public/visa/country/AU");
+    expect(res.body.variants.map((v: any) => v.name)).toEqual([
+      "Visitor Visa (Easy Apply)",
+      "Visitor Visa",
+      "Visitor Visa - Express",
+    ]);
+    expect(JSON.stringify(res.body.variants)).not.toContain("validity");
+  });
+
+  it("sorts priced variants cheapest-first", async () => {
+    await makeAu();
+    const res = await request(app()).get("/api/public/visa/country/AU");
+    const totals = res.body.variants.map((v: any) => v.price.totalInr);
+    // 17250+2000+360, 17250+2500+450, 82653+3000+540
+    expect(totals).toEqual([19610, 20200, 86193]);
+    expect([...totals].sort((a: number, b: number) => a - b)).toEqual(totals);
+  });
+
+  it("INCLUDES unpriced variants, carrying price: null (the GB case)", async () => {
+    const base = {
+      nationality: "IN", destinationIso2: "GB", destinationName: "United Kingdom",
+      purpose: "TOURIST", entryType: "SINGLE", serviceTier: "STANDARD",
+      productClass: "VISA", visaCategory: "E_VISA", status: "PUBLISHED", isSchengen: false,
+      embassyFeeInr: 15574, vfsFeeInr: 0, plumtripsServiceFeeInr: 2000, d2cServiceFeeInr: undefined,
+    };
+    await VisaRule.create({ ...base, variantKey: "TOURIST_VISA_6_MONTHS", priceNote: "Tourist Visa - 6 Months. | validity 180 days post issue" });
+    await VisaRule.create({ ...base, variantKey: "PRIORITY_VISA_2_YEARS", priceNote: "Priority Visa - 2 years | validity 730 days post issue" });
+
+    const res = await request(app()).get("/api/public/visa/country/GB");
+    expect(res.body.variants).toHaveLength(2);
+    for (const v of res.body.variants) expect(v.price).toBeNull();
+    // Trailing full stop removed too — ops types it inconsistently.
+    expect(res.body.variants.map((v: any) => v.name).sort()).toEqual([
+      "Priority Visa - 2 years",
+      "Tourist Visa - 6 Months",
+    ]);
+  });
+
+  it("puts every priced variant ahead of every unpriced one", async () => {
+    await makeAu();
+    await VisaRule.create({
+      nationality: "IN", destinationIso2: "AU", destinationName: "Australia",
+      purpose: "TOURIST", entryType: "SINGLE", serviceTier: "STANDARD",
+      productClass: "VISA", visaCategory: "E_VISA", status: "PUBLISHED", isSchengen: false,
+      variantKey: "AAA_UNPRICED", priceNote: "AAA Unpriced Visa | validity Decided by embassy",
+      embassyFeeInr: 100, vfsFeeInr: 0, plumtripsServiceFeeInr: 900, d2cServiceFeeInr: undefined,
+    });
+
+    const res = await request(app()).get("/api/public/visa/country/AU");
+    const priced = res.body.variants.map((v: any) => v.price !== null);
+    // Alphabetically first and by far the cheapest — and still last, because
+    // it cannot be quoted.
+    expect(priced).toEqual([true, true, true, false]);
+    expect(res.body.variants[3].name).toBe("AAA Unpriced Visa");
+  });
+
+  it("is ADDITIVE — the headline fields still describe the single selected rule", async () => {
+    await makeAu();
+    const res = await request(app()).get("/api/public/visa/country/AU");
+
+    // The headline price is the cheapest genuine visa, unchanged by variants[].
+    expect(res.body.price.totalInr).toBe(19610);
+    // And the scalar rule-derived fields are still present and scalar.
+    expect(res.body.purpose).toBe("TOURIST");
+    expect(res.body.entryType).toBe("SINGLE");
+    expect(Array.isArray(res.body.purposes)).toBe(true);
+    expect(res.body).toHaveProperty("documents");
+    expect(res.body).toHaveProperty("documentGroups");
+  });
+
+  it("a corridor whose only rules are ancillary reports an EMPTY list, not a missing key", async () => {
+    await VisaRule.create({
+      nationality: "IN", destinationIso2: "TH", destinationName: "Thailand",
+      purpose: "TOURIST", entryType: "SINGLE", serviceTier: "STANDARD",
+      productClass: "ARRIVAL_CARD", visaCategory: "VISA_FREE", status: "PUBLISHED", isSchengen: false,
+      variantKey: "TDAC", priceNote: "Tourist Visa TDAC. | validity 30 days post issue",
+      embassyFeeInr: 0, vfsFeeInr: 0, plumtripsServiceFeeInr: 0, d2cServiceFeeInr: 350,
+    });
+
+    const res = await request(app()).get("/api/public/visa/country/TH");
+    // serviced is still true — the corridor IS sold, just not as a "visa".
+    expect(res.body.serviced).toBe(true);
+    expect(res.body.variants).toEqual([]);
+  });
+});
+
+/* ═════════════════════════════════════════════════════════════════════
  * POST /visa/lead
  * ═══════════════════════════════════════════════════════════════════ */
 describe("POST /visa/lead", () => {

@@ -414,6 +414,97 @@ function buildPublicPrice(rule: any) {
   };
 }
 
+/* ─────────────────────────────────────────────────────────────────────
+ * THE VISA TYPES A CORRIDOR OFFERS.
+ *
+ * Until now this endpoint answered with ONE rule — the headline pick — and
+ * threw the rest away. That is fine for a price, and wrong for a reader:
+ * GB publishes twelve distinct visas (Tourist 6mo/2y/5y/10y, Priority ×4,
+ * Super Priority ×4) and the panel showed one, with nothing to suggest the
+ * other eleven existed. AU publishes three, at ₹19,610 / ₹20,200 / ₹86,193
+ * — a 66,583-rupee spread the reader could not see.
+ *
+ * `rules` is already in hand; this adds no query.
+ * ───────────────────────────────────────────────────────────────────── */
+
+/**
+ * The display name for a variant, from its priceNote.
+ *
+ * priceNote is authored as "<product> | validity <term>" — the validity
+ * half is already its own field on the payload and repeating it inside
+ * every name would make the list unreadable:
+ *
+ *   "Visitor Visa (Easy Apply) | validity Decided by embassy"
+ *                                          -> "Visitor Visa (Easy Apply)"
+ *   "Tourist Visa - 6 Months. | validity 180 days post issue"
+ *                                          -> "Tourist Visa - 6 Months"
+ *   "Tourist Visa."                        -> "Tourist Visa"
+ *
+ * Everything before the first pipe, trimmed, with a trailing full stop
+ * removed (ops types it inconsistently — roughly a third of the rows carry
+ * one). variantKey is the fallback and NOT the default: it is the field the
+ * catalogue audit found disagrees with priceNote across the board
+ * (AT's MEET_ASSIST reads "Appointment & Document Assistance"), so it is
+ * only reached when there is no priceNote at all.
+ */
+function variantDisplayName(rule: any): string {
+  const note = String(rule?.priceNote ?? "").split("|")[0].trim().replace(/\.+$/, "").trim();
+  if (note) return note;
+  return String(rule?.variantKey ?? "").trim() || "Visa";
+}
+
+/**
+ * Every genuine visa the corridor publishes, priced where ops has authored
+ * a D2C fee.
+ *
+ * `productClass === "VISA"` is the whole filter, and it is doing real work:
+ * the 2026-08-27 retype moved arrival cards, appointment services, transit
+ * visas, transfers, levies and letters off that class precisely so a list
+ * like this one could be built without re-deriving "is this a visa" from
+ * prose. AU's Visa Transfer (VISA_AMENDMENT) and Transit 771 (TRANSIT_VISA)
+ * drop out here automatically.
+ *
+ * UNPRICED VARIANTS ARE INCLUDED, carrying `price: null`. A corridor where
+ * ops has priced nothing still has a real, knowable product list, and
+ * hiding it would tell the reader the corridor offers one visa when it
+ * offers twelve. Whether to show a "price on request" affordance is the
+ * panel's decision; the payload's job is to say what exists.
+ */
+function buildPublicVariants(rules: any[]) {
+  const variants = (rules ?? [])
+    .filter((r) => r?.productClass === "VISA")
+    .map((r) => ({
+      /* NO variantKey. It is on the public leak deny-list next to opsNotes,
+       * applicability and reviewedBy (see public.visa.test.ts's "NEVER
+       * exposes ops/internal fields"), and that classification is right:
+       * it is an ops authoring key whose values the catalogue audit found
+       * routinely disagree with the product they name — AT's MEET_ASSIST
+       * row reads "Appointment & Document Assistance". Publishing it would
+       * put an unreliable internal taxonomy on a consumer surface.
+       *
+       * `name` is the identity this payload offers. If a future per-variant
+       * Apply step needs a stable handle, that wants a deliberate public id,
+       * not this field promoted by default. */
+      name: variantDisplayName(r),
+      purpose: r.purpose ?? null,
+      entryType: r.entryType ?? null,
+      processingTime:
+        r.etaMinDays != null || r.etaMaxDays != null
+          ? { minDays: r.etaMinDays ?? null, maxDays: r.etaMaxDays ?? null, basis: r.etaBasis ?? null }
+          : null,
+      price: buildPublicPrice(r),
+    }));
+
+  // Priced first, cheapest first; then the unpriced, alphabetically so the
+  // tail is stable rather than in whatever order Mongo returned.
+  return variants.sort((a, b) => {
+    if (a.price && b.price) return a.price.totalInr - b.price.totalInr;
+    if (a.price) return -1;
+    if (b.price) return 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
 /**
  * THE SEED RESOLVES FIRST, `normaliseToIso2` SECOND.
  *
@@ -606,6 +697,11 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
       // PUBLISHED editorial content only — a DRAFT row's image is not live.
       heroImageUrl: content?.heroImageUrl ?? null,
       isCurated: isCuratedCorridor(iso2),
+      /* EVERY genuine visa this corridor publishes — see
+       * buildPublicVariants. Additive: `purpose`, `purposes`, `price`,
+       * `documents` and `documentGroups` above all still describe the
+       * single HEADLINE rule and are untouched by this. */
+      variants: buildPublicVariants(rules as any[]),
       documents,
       documentGroups,
     };
