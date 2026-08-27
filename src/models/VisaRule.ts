@@ -26,8 +26,34 @@ export const VISA_SERVICE_TIERS = [
 ] as const;
 export type VisaServiceTier = (typeof VISA_SERVICE_TIERS)[number];
 
+// ── WHAT A ROW ACTUALLY SELLS ────────────────────────────────────────
+// "VISA" is the only class the public headline selector will price a
+// corridor from (utils/visaHeadlineRule.ts tests `productClass === "VISA"`,
+// an ALLOWLIST — so every value below other than VISA is excluded from the
+// headline automatically, with no selector change needed, ever).
+//
+// The four service classes after VISA existed already. The four after them
+// were added 2026-08-27 because a catalogue audit found 103 of 258 published
+// rows are ancillary products that the StampMyVisa import had flattened to
+// productClass "VISA" — and being cheap, they were winning the "from" price
+// (AU headlined a ₹1,416 Visa Transfer over a ₹19,610 visitor visa).
+//
+// 93 of those rows retype into ARRIVAL_CARD / FORM_SERVICE /
+// APPOINTMENT_SERVICE. The remaining 10 had no honest home: a transit visa
+// is not an arrival card, and a Bali tourist levy is not a form service.
+// Rather than file them under a class that is merely close, they get their
+// own — the alternative is a data model that lies to the next reader.
 export const VISA_PRODUCT_CLASSES = [
   "VISA", "ARRIVAL_CARD", "FORM_SERVICE", "APPOINTMENT_SERVICE",
+  // A real visa, but never the product a corridor should headline with.
+  "TRANSIT_VISA",
+  // Transfer to a new passport, correction, amendment — operates on a visa
+  // the traveller already holds.
+  "VISA_AMENDMENT",
+  // A government charge collected as a product (Bali Tourist Levy).
+  "TRAVEL_LEVY",
+  // A document we produce or procure (guarantee letter, sponsor letter).
+  "DOCUMENT_SERVICE",
 ] as const;
 export type VisaProductClass = (typeof VISA_PRODUCT_CLASSES)[number];
 

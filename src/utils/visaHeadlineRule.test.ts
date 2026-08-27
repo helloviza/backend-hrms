@@ -149,6 +149,54 @@ describe("selectHeadlineRule — the ladder", () => {
     expect(selectHeadlineRule([])).toBeUndefined();
   });
 
+  /* ── the 2026-08-27 product classes ───────────────────────────────────
+   * The predicate is an ALLOWLIST (`productClass === "VISA"`), so every
+   * non-VISA class is excluded by construction and adding a class needs no
+   * change here. These pin that property per value, so a future edit that
+   * turns the allowlist into a denylist fails loudly instead of silently
+   * letting a transit visa headline a corridor again.
+   * ─────────────────────────────────────────────────────────────────── */
+  for (const cls of ["TRANSIT_VISA", "VISA_AMENDMENT", "TRAVEL_LEVY", "DOCUMENT_SERVICE"] as const) {
+    it(`excludes a PRICED ${cls} from the preferred pool`, () => {
+      const ancillary = rule({ variantKey: "anc", productClass: cls, d2cServiceFeeInr: 300 });
+      const visa = rule({ variantKey: "real-visa", d2cServiceFeeInr: 5000 });
+
+      expect(isSellableHeadlineRule(ancillary)).toBe(false);
+      // Dearer, but it is the only genuine visa — it must still headline.
+      expect(selectHeadlineRule([ancillary, visa])?.variantKey).toBe("real-visa");
+    });
+  }
+
+  it("the AU case end-to-end: a priced Visa Transfer never outranks the visitor visa", () => {
+    const transfer = rule({ variantKey: "VISA_TRANSFER", productClass: "VISA_AMENDMENT", d2cServiceFeeInr: 1200 });
+    const transit = rule({ variantKey: "TRANSIT_771", productClass: "TRANSIT_VISA", d2cServiceFeeInr: 1500 });
+    const visitor = rule({ variantKey: "VISITOR_EASY_APPLY", d2cServiceFeeInr: 2000, embassyFeeInr: 17250 });
+
+    expect(selectHeadlineRule([transfer, transit, visitor])?.variantKey).toBe("VISITOR_EASY_APPLY");
+  });
+
+  it("TH/MY survive the retype: an ARRIVAL_CARD that is VISA_FREE stays eligible", () => {
+    // Retyped away from VISA, so arm one now fails — arm two is what saves it,
+    // and this is the case that arm exists for.
+    const tdac = rule({
+      variantKey: "TDAC",
+      productClass: "ARRIVAL_CARD",
+      visaCategory: "VISA_FREE",
+      d2cServiceFeeInr: 350,
+    });
+
+    expect(isSellableHeadlineRule(tdac)).toBe(true);
+    expect(selectHeadlineRule([tdac])?.variantKey).toBe("TDAC");
+  });
+
+  it("an ARRIVAL_CARD that is NOT visa-free is excluded (SG/VN-style)", () => {
+    const card = rule({ variantKey: "sg-card", productClass: "ARRIVAL_CARD", visaCategory: "E_VISA", d2cServiceFeeInr: 500 });
+    const visa = rule({ variantKey: "sg-visa", d2cServiceFeeInr: 1800 });
+
+    expect(isSellableHeadlineRule(card)).toBe(false);
+    expect(selectHeadlineRule([card, visa])?.variantKey).toBe("sg-visa");
+  });
+
   it("a single unpriced rule still resolves — the uncurated-corridor case", () => {
     const only = rule({ variantKey: "solo", d2cServiceFeeInr: null });
     expect(selectHeadlineRule([only])?.variantKey).toBe("solo");

@@ -224,6 +224,57 @@ describe("tie inside the preferred pool", () => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * 4b. THE NEW PRODUCT CLASSES — the SCHEMA accepts them, and a retyped
+ *     corridor headlines the real visa instead of the ancillary.
+ * ═════════════════════════════════════════════════════════════════════ */
+describe("new productClass values (2026-08-27)", () => {
+  const NEW_CLASSES = ["TRANSIT_VISA", "VISA_AMENDMENT", "TRAVEL_LEVY", "DOCUMENT_SERVICE"] as const;
+
+  for (const cls of NEW_CLASSES) {
+    it(`the VisaRule schema accepts productClass "${cls}"`, async () => {
+      // Would throw a Mongoose ValidationError if the enum had not been widened.
+      const created = await VisaRule.create(
+        ruleDoc({ destinationIso2: "MX", destinationName: "Mexico", variantKey: `V-${cls}`, productClass: cls }),
+      );
+      expect(created.productClass).toBe(cls);
+    });
+  }
+
+  it("a retyped AU headlines the visitor visa, not the transfer or the transit", async () => {
+    await VisaRule.create(
+      ruleDoc({ destinationIso2: "AU", destinationName: "Australia", variantKey: "VISA_TRANSFER", productClass: "VISA_AMENDMENT", d2cServiceFeeInr: 1200 }),
+    );
+    await VisaRule.create(
+      ruleDoc({ destinationIso2: "AU", destinationName: "Australia", variantKey: "TRANSIT_771", productClass: "TRANSIT_VISA", d2cServiceFeeInr: 1500 }),
+    );
+    await VisaRule.create(
+      ruleDoc({ destinationIso2: "AU", destinationName: "Australia", variantKey: "VISITOR_EASY_APPLY", d2cServiceFeeInr: 2000, embassyFeeInr: 17250 }),
+    );
+
+    const rule = await resolveRuleFor("AU", "TOURIST");
+    expect(rule?.variantKey).toBe("VISITOR_EASY_APPLY");
+  });
+
+  it("a retyped TH still headlines its TDAC via the VISA_FREE arm", async () => {
+    await VisaRule.create(
+      ruleDoc({
+        destinationIso2: "TH",
+        destinationName: "Thailand",
+        variantKey: "TDAC",
+        productClass: "ARRIVAL_CARD",
+        visaCategory: "VISA_FREE",
+        d2cServiceFeeInr: 350,
+      }),
+    );
+
+    const rule = await resolveRuleFor("TH", "TOURIST");
+    expect(rule?.variantKey).toBe("TDAC");
+    const body = await panel("TH");
+    expect(body.serviced).toBe(true);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
  * 5. B2B IS UNTOUCHED.
  * ═════════════════════════════════════════════════════════════════════ */
 describe("B2B channel is unaffected by D2C headline selection", () => {
