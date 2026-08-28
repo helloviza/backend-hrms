@@ -182,7 +182,14 @@ function primaryPassport(profile: any): any | null {
  * when there is no Consumer row at all, which is the same "join missed"
  * outcome the B2B branch already renders as a null traveller.
  */
-function shapeD2CApplicant(application: any, consumer: any, profile: any) {
+/* EXPORTED for routes/admin.consumers.ts, which shows the SAME identity
+ * from the other direction: this file answers "who is this case about",
+ * the registry answers "what has this person done". Reusing the function
+ * rather than writing a second one is what keeps a D2C applicant's name,
+ * date of birth and passport rendering identically on both screens —
+ * including the plain "YYYY-MM-DD" conversion, which is the detail a
+ * second copy would get subtly wrong first. */
+export function shapeD2CApplicant(application: any, consumer: any, profile: any) {
   if (!consumer) return null;
   const personal = profile?.personal || {};
   const passport = primaryPassport(profile);

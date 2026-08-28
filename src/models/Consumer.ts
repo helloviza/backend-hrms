@@ -75,9 +75,81 @@ export interface ConsumerDocument extends Document {
   // tokenVersion, no session store — see the tokenwall audit §5.3).
   tokenVersion: number;
   status: ConsumerStatus;
+  /**
+   * MARKETING CONSENT — a consent RECORD, not a notification preference.
+   *
+   * ⚠ THIS IS NOT ConsumerProfile.accountPrefs.notifyByEmail. That flag says
+   * "send me transactional mail about my own application" and defaults TRUE
+   * because a person who filed a visa case has asked to hear about it. This
+   * block says "you may market to me", and it is the thing a regulator, or
+   * the consumer themselves, asks us to prove. The two must never be read
+   * for each other's question — which is why they live on different
+   * collections rather than as two booleans in one bag.
+   *
+   * ── WHY IT IS ON Consumer AND NOT ConsumerProfile ─────────────────
+   * ConsumerProfile is the encrypted collection, and encryption there is
+   * absolute: any read that touches it must go through find/findOne so the
+   * plugin's post-hooks can decrypt (models/ConsumerProfile.ts). Consent
+   * STATUS is not identity data — it is a yes/no about a communication
+   * channel — and the registry list has to sort, filter and count on it
+   * across every consumer at once. Putting it behind the decryption
+   * boundary would make "how many people opted in?" an unanswerable
+   * question without decrypting the entire population.
+   *
+   * ── WHY EACH CHANNEL IS AN OBJECT AND NOT A BOOLEAN ───────────────
+   * `optedIn: true` alone is an assertion with no evidence behind it. The
+   * three fields beside it are what turn it into a record: WHEN (`at`),
+   * WHERE (`source` — the surface that collected it), and WHAT THEY WERE
+   * SHOWN (`version` — the consent-copy version, so a later change to the
+   * wording cannot retroactively rewrite what somebody agreed to). A
+   * boolean cannot answer "prove they consented", and that is the only
+   * question this field will ever be asked.
+   *
+   * ── ABSENT MEANS NOT OPTED IN, AND THERE IS NO DEFAULT ────────────
+   * No `default` anywhere in this block, on purpose. A default-true would
+   * manufacture consent for every consumer who already exists and every one
+   * created by a path that never showed them a checkbox; a default-false
+   * would write a consent RECORD that nobody produced. Absent is the honest
+   * third state, and every reader treats absent and false identically —
+   * see consentView() in routes/admin.consumers.ts, the one place that
+   * collapses them.
+   */
+  marketingConsent?: {
+    email?: MarketingConsentEntry;
+    whatsapp?: MarketingConsentEntry;
+  };
   createdAt?: Date;
   updatedAt?: Date;
 }
+
+/**
+ * ONE CHANNEL'S CONSENT. See ConsumerDocument.marketingConsent below for why
+ * this is a record rather than a boolean.
+ *
+ * `_id: false` — this is a singleton value object, not an addressable row;
+ * nothing ever looks one up by id.
+ */
+export interface MarketingConsentEntry {
+  optedIn: boolean;
+  at?: Date;
+  /** The surface that collected it, e.g. "signup". */
+  source?: string;
+  /** The consent-copy version they were shown, e.g. "2026-08-v1". */
+  version?: string;
+}
+
+const MarketingConsentEntrySchema = new Schema(
+  {
+    /* No `default`. An entry only exists because something wrote one, and a
+     * written entry always states its own value — see the interface note on
+     * why absent is a real third state rather than a missing default. */
+    optedIn: { type: Boolean, required: true },
+    at: { type: Date },
+    source: { type: String, trim: true },
+    version: { type: String, trim: true },
+  },
+  { _id: false },
+);
 
 const ConsumerSchema = new Schema<ConsumerDocument>(
   {
@@ -125,9 +197,36 @@ const ConsumerSchema = new Schema<ConsumerDocument>(
     name: { type: String, required: true, trim: true },
     tokenVersion: { type: Number, required: true, default: 0 },
     status: { type: String, enum: CONSUMER_STATUSES, default: "ACTIVE", index: true },
+
+    /* Deliberately no `default: () => ({})`. An empty object here would put
+     * a marketingConsent key on every consumer row that has never been
+     * asked, and "the field is present but empty" is a state the registry
+     * would then have to distinguish from "opted out" — a distinction with
+     * no meaning. Absent is the state; see the interface note. */
+    marketingConsent: {
+      type: new Schema(
+        {
+          email: { type: MarketingConsentEntrySchema },
+          whatsapp: { type: MarketingConsentEntrySchema },
+        },
+        { _id: false },
+      ),
+    },
   },
   { timestamps: true },
 );
+
+/**
+ * THE REGISTRY'S DEFAULT SORT — newest first.
+ *
+ * `timestamps: true` creates createdAt but indexes nothing. The admin
+ * registry (routes/admin.consumers.ts) sorts every page on it, and an
+ * unindexed sort is a full collection scan plus an in-memory sort that
+ * mongo aborts outright once the result set passes 32MB. Three consumers
+ * today; this is the index that has to already exist the day there are
+ * three hundred thousand.
+ */
+ConsumerSchema.index({ createdAt: -1 });
 
 const Consumer: Model<ConsumerDocument> =
   mongoose.models.Consumer || mongoose.model<ConsumerDocument>("Consumer", ConsumerSchema);

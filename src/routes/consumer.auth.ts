@@ -192,6 +192,56 @@ const B2B_MESSAGE =
 // The shape a consumer is ever described by on the wire. passwordHash is
 // select:false on the model, but this exists so no future field is exposed by
 // accident — a whitelist, not a blocklist.
+/* ─────────────────────────────────────────────────────────────────────
+ * MARKETING CONSENT, AT SIGNUP.
+ *
+ * THE VERSION IS A CONSTANT IN CODE, NOT A ROW IN A TABLE. What a consumer
+ * agreed to is the SENTENCE they were shown, and that sentence ships in
+ * apps/frontend/src/pages/helloviza/auth/LoginContent.tsx. Bumping this
+ * string is therefore the same act as editing that copy, and keeping them
+ * one commit apart is what makes "prove what they agreed to" answerable a
+ * year later: `git log -S "2026-08-v1"` finds the wording.
+ *
+ * ⚠ BUMP THIS WHENEVER THE CHECKBOX COPY CHANGES. A consent record that
+ * names a version whose text has since been rewritten is worse than no
+ * record — it asserts agreement to words nobody saw.
+ * ───────────────────────────────────────────────────────────────────── */
+export const MARKETING_CONSENT_VERSION = "2026-08-v1";
+
+/**
+ * Build the marketingConsent block from what the signup form posted, or
+ * return undefined.
+ *
+ * ── UNDEFINED, NOT `{ optedIn: false }` ───────────────────────────────
+ * An unticked box is not a decision to record — it is the absence of one,
+ * and writing `optedIn: false` with a timestamp would fabricate a consent
+ * event ("at 14:02 they declined") out of a person who simply did not
+ * click anything. models/Consumer.ts's marketingConsent carries no default
+ * for exactly this reason, so returning undefined leaves the field off the
+ * document entirely, which is the true state.
+ *
+ * ── ONLY `true` COUNTS ────────────────────────────────────────────────
+ * Strict equality against the boolean and the string "true", never a
+ * truthiness test. A JSON body is attacker-shaped: `"false"`, `"0"` and
+ * `{}` are all truthy in JS, and any of them silently opting somebody in
+ * is precisely the failure this whole block exists to make impossible.
+ */
+function buildSignupConsent(body: any): Record<string, any> | undefined {
+  const wants = (v: unknown): boolean => v === true || v === "true";
+  const emailOptIn = wants(body?.marketingConsentEmail);
+  const whatsappOptIn = wants(body?.marketingConsentWhatsapp);
+  if (!emailOptIn && !whatsappOptIn) return undefined;
+
+  // One instant for both channels: they were granted by one tick of one
+  // box on one screen, and two Date.now() calls would imply otherwise.
+  const at = new Date();
+  const entry = { optedIn: true, at, source: "signup", version: MARKETING_CONSENT_VERSION };
+  const consent: Record<string, any> = {};
+  if (emailOptIn) consent.email = { ...entry };
+  if (whatsappOptIn) consent.whatsapp = { ...entry };
+  return consent;
+}
+
 function publicConsumer(c: any) {
   return {
     id: String(c._id),
@@ -246,7 +296,18 @@ router.post("/signup", async (req: any, res: any) => {
     }
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_COST);
-    const consumer = await Consumer.create({ email, name, phone, passwordHash });
+    /* PURELY ADDITIVE. A body with no consent keys produces `undefined`
+     * here, and Mongoose omits an undefined path — so a client that has
+     * never heard of this field creates exactly the document it always
+     * did. See buildSignupConsent() on why unticked writes nothing. */
+    const marketingConsent = buildSignupConsent(req.body);
+    const consumer = await Consumer.create({
+      email,
+      name,
+      phone,
+      passwordHash,
+      ...(marketingConsent ? { marketingConsent } : {}),
+    });
 
     const { accessToken } = issueSession(res, consumer as any);
 

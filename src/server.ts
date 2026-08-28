@@ -726,6 +726,18 @@ app.use("/api/admin/visa", adminVisaDashboardRouter);
 import adminVisaMasterSheetRouter from "./routes/admin.visa.masterSheet.js";
 app.use("/api/admin/visa/master-sheet", adminVisaMasterSheetRouter);
 
+/* THE CONSUMER REGISTRY — one row per helloviza.ai ACCOUNT, where the
+ * master sheet above is one row per account-per-corridor. Deliberately
+ * NOT under /api/admin/visa: it is not a visa surface. A consumer who
+ * registered and has never opened a corridor is invisible on every visa
+ * read in this app and is exactly who this endpoint exists to show, so
+ * mounting it under the visa prefix would misfile it by its gate rather
+ * than by its subject. It shares the visaApplication READ gate because
+ * that is who may see the D2C population, not because it is about visas.
+ * See routes/admin.consumers.ts. */
+import adminConsumersRouter from "./routes/admin.consumers.js";
+app.use("/api/admin/consumers", adminConsumersRouter);
+
 // Visa module (2026-08-09) — the cross-workspace ROSTER: every customer
 // workspace with its real KPIs, and a drill-in to any one workspace's
 // full traveller roster. A fifth router at the same prefix, gated on the
