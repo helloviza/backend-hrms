@@ -57,7 +57,18 @@ describe("schema", () => {
   });
 
   it("constrains actorType and source to the known sets", () => {
-    expect((schema.path("actorType") as any).enumValues).toEqual(["EMPLOYEE", "CUSTOMER", "VENDOR"]);
+    /* CONSUMER added when the helloviza.ai D2C population was wired in — it
+     * is a SEPARATE identity namespace from `users`, so it needs its own
+     * discriminator rather than being folded into CUSTOMER (see the type's
+     * own note in ActorLocation.ts). This assertion is an exact-set guard on
+     * purpose: extending it should be a deliberate edit, which is what this
+     * line is. */
+    expect((schema.path("actorType") as any).enumValues).toEqual([
+      "EMPLOYEE",
+      "CUSTOMER",
+      "VENDOR",
+      "CONSUMER",
+    ]);
     expect((schema.path("source") as any).enumValues).toEqual([
       "ip",
       "private-ip",

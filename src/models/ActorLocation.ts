@@ -33,7 +33,20 @@
 import mongoose, { Schema, type Document, type Types } from "mongoose";
 
 /** Which identity collection `actorId` points into. */
-export type ActorType = "EMPLOYEE" | "CUSTOMER" | "VENDOR";
+/**
+ * CONSUMER is the helloviza.ai D2C account holder (models/Consumer.ts) — a
+ * SEPARATE identity namespace from the B2B `users` collection, so a Consumer
+ * _id and a User _id can collide numerically and mean different people. That
+ * is precisely why it is its own actorType rather than being folded into
+ * CUSTOMER: the unique index below keys on (actorId, actorType, workspaceId),
+ * and without the discriminator a consumer and a corporate customer sharing
+ * an ObjectId would fight over one row.
+ *
+ * Note every consumer carries the SAME synthetic workspaceId
+ * (HELLOVIZA_D2C_WORKSPACE_ID), so workspaceId does no separating work here —
+ * actorType is the whole of it.
+ */
+export type ActorType = "EMPLOYEE" | "CUSTOMER" | "VENDOR" | "CONSUMER";
 
 /** How the location was arrived at. Mirrors LocationSource in location.service.ts. */
 export type ActorLocationSource = "ip" | "private-ip" | "unresolved" | "unavailable-non-http";
@@ -85,7 +98,7 @@ export interface IActorLocation extends Document {
 const ActorLocationSchema = new Schema<IActorLocation>(
   {
     actorId: { type: Schema.Types.ObjectId, required: true, index: true },
-    actorType: { type: String, enum: ["EMPLOYEE", "CUSTOMER", "VENDOR"], required: true },
+    actorType: { type: String, enum: ["EMPLOYEE", "CUSTOMER", "VENDOR", "CONSUMER"], required: true },
     workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", default: null, index: true },
 
     city: { type: String, default: null },

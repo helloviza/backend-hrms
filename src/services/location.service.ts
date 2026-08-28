@@ -512,7 +512,37 @@ function normalizeActorType(v: unknown): ActorType {
 export function actorFromRequest(req: Request): RequestActor | null {
   const user: any = (req as any)?.user;
   const actorId = firstString(user?.sub, user?._id, user?.id);
-  if (!actorId) return null;
+
+  /* ── THE D2C BRANCH ───────────────────────────────────────────────
+   * B2B FIRST, ALWAYS. middleware/auth.ts sets req.user; middleware/
+   * requireConsumer.ts sets req.consumer, and NOTHING sets both — they
+   * verify different tokens with different secrets against different
+   * collections (see routes/consumer.auth.ts's header). Testing req.user
+   * first therefore cannot change any existing B2B answer: on a B2B
+   * request this branch is never reached, and on a consumer request the
+   * old code returned null and the caller recorded nothing.
+   *
+   * That null is the bug this fixes. Every consumer request resolved to
+   * "no actor", so resolveActorFromRequest() returned recorded:false and
+   * the D2C population was invisible in ActorLocation.
+   *
+   * ⚠ NOT REACHED AT SIGNUP. requireConsumer does not run on /signup —
+   * it cannot, because the account does not exist until mid-request. The
+   * signup path therefore resolves by IP directly and stamps the actor
+   * afterwards; see recordConsumerRegistrationLocation() below. */
+  if (!actorId) {
+    const consumer: any = (req as any)?.consumer;
+    const consumerId = firstString(consumer?.id, consumer?._id);
+    if (!consumerId) return null;
+    return {
+      actorId: consumerId,
+      actorType: "CONSUMER",
+      // The synthetic D2C tenant, constant for every consumer — a STAMP,
+      // never an isolation boundary (services/consumerWorkspace.ts).
+      workspaceId: firstString((req as any)?.consumerWorkspaceId) || null,
+      ip: firstString(req?.ip),
+    };
+  }
 
   // requireWorkspace sets req.workspaceObjectId; routes that don't run it
   // fall back to the ids auth.ts normalised onto the token payload.
@@ -553,4 +583,55 @@ export async function resolveActorFromRequest(req: Request): Promise<ActorLocati
 
   const recorded = await upsertCurrentLocation(actor, location, hashIp(actor.ip));
   return { actor, location, recorded };
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * BOUNDED RESOLUTION — the shared guard both call sites need.
+ *
+ * routes/manualBookings.ts's resolveBookedFromCity() carried this logic with
+ * a note: "one consumer does not make a shared helper … when a second
+ * consumer arrives, that is the moment to move it." Consumer signup is that
+ * second consumer, so the RACE lives here now. The two call sites still
+ * choose their own timeout, because that is the part that is genuinely
+ * per-surface — a booking and a registration do not owe the same latency.
+ *
+ * ── WHY A TIMEOUT AT ALL ──────────────────────────────────────────────
+ * The FIRST lookup on a fresh instance provisions a ~70 MB MaxMind download
+ * (services/geoipProvision.ts). This is not hypothetical: on this service
+ * MAXMIND_LICENSE_KEY is a RUNTIME-only variable, so the build-time
+ * provisioning step fails and the database is fetched lazily on first use.
+ * Production shows exactly that shape after every restart — the first
+ * lookups return `resolver_timeout`, then every later one resolves. An
+ * unbounded await would park a signup behind that download.
+ *
+ * NEVER THROWS, NEVER REJECTS. Every failure is returned as a
+ * ResolvedLocation whose `reason` distinguishes the causes, because
+ * "the resolver broke" and "we looked and the database had nothing" need
+ * different fixes and must not be collapsed into one blank.
+ * ──────────────────────────────────────────────────────────────────────── */
+export async function resolveCityFromIpBounded(
+  ip: string | null | undefined,
+  timeoutMs: number,
+): Promise<ResolvedLocation> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const result = await Promise.race([
+      resolveCityFromIp(ip),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+    // The losing promise keeps running; it is not awaited and its result is
+    // discarded. That is deliberate — the download it may be doing still
+    // warms the on-disk database for the NEXT caller, which is why the
+    // second request after a cold start succeeds.
+    return result ?? nothing("unresolved", "resolver_timeout");
+  } catch (err: any) {
+    // resolveCityFromIp's contract says this cannot happen. If it ever does,
+    // the caller must still succeed, and the row must say which failure it
+    // was.
+    return nothing("unresolved", "resolver_error");
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }

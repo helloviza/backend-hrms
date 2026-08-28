@@ -48,6 +48,7 @@ const { default: VisaD2CLead } = await import("../models/VisaD2CLead.js");
 const { default: VisaApplication } = await import("../models/VisaApplication.js");
 const { UserPermission } = await import("../models/UserPermission.js");
 const { default: adminConsumersRouter } = await import("./admin.consumers.js");
+const locationService = await import("../services/location.service.js");
 const { default: consumerAuthRouter } = await import("./consumer.auth.js");
 const { MARKETING_CONSENT_VERSION } = await import("./consumer.auth.js");
 const { HELLOVIZA_D2C_WORKSPACE_ID } = await import("../services/consumerWorkspace.js");
@@ -191,6 +192,97 @@ describe("signup captures marketing consent", () => {
 
     const doc: any = await Consumer.findOne({ email: "truthy@example.com" }).lean();
     expect(doc.marketingConsent).toBeUndefined();
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 1b. REGISTRATION LOCATION — CAPTURED, AND NEVER AT THE COST OF A SIGNUP
+ *
+ * The resolver is stubbed rather than exercised for real: a unit test must
+ * not depend on a 70 MB MaxMind download, and what is under test here is
+ * the WIRING and the FAILURE HANDLING, not MaxMind's accuracy. The real
+ * resolution is proven in production (163 rows resolved via source:"ip").
+ * ═══════════════════════════════════════════════════════════════ */
+describe("registration location at signup", () => {
+  it("stores the block when the resolver returns a place", async () => {
+    vi.spyOn(locationService, "resolveCityFromIpBounded").mockResolvedValue({
+      city: "Bengaluru",
+      rawCity: "Bengaluru",
+      region: "Karnataka",
+      country: "IN",
+      source: "ip",
+      confidence: 1,
+      accuracyRadiusKm: 5,
+      reason: "ok",
+    } as any);
+
+    const res = await request(app()).post("/api/consumer/auth/signup").send({
+      email: "located@example.com",
+      name: "Located",
+      password: "correct-horse",
+    });
+    expect(res.status).toBe(201);
+
+    const doc: any = await Consumer.findOne({ email: "located@example.com" }).lean();
+    expect(doc.registrationLocation.city).toBe("Bengaluru");
+    expect(doc.registrationLocation.region).toBe("Karnataka");
+    expect(doc.registrationLocation.country).toBe("IN");
+    expect(doc.registrationLocation.source).toBe("ip");
+    expect(doc.registrationLocation.confidence).toBe(1);
+    expect(doc.registrationLocation.capturedAt).toBeInstanceOf(Date);
+  });
+
+  it("⚠ A THROWING RESOLVER MUST NOT COST SOMEBODY THEIR ACCOUNT", async () => {
+    /* The whole point of the wiring. If this ever fails, a geo outage takes
+     * signup down with it — which is exactly the trade nobody would make. */
+    const spy = vi
+      .spyOn(locationService, "resolveCityFromIpBounded")
+      .mockRejectedValue(new Error("geo database exploded"));
+
+    const res = await request(app()).post("/api/consumer/auth/signup").send({
+      email: "geoboom@example.com",
+      name: "Geo Boom",
+      password: "correct-horse",
+    });
+    /* ⚠ THE SPY MUST HAVE FIRED, or this test passes for the wrong reason:
+     * supertest connects over loopback, so the REAL resolver would classify
+     * the IP as private, return no place, and leave registrationLocation
+     * absent too — an identical outcome that proves nothing about error
+     * handling. Asserting the call is what makes the 201 below evidence. */
+    expect(spy).toHaveBeenCalled();
+    expect(res.status).toBe(201);
+    expect(res.body.ok).toBe(true);
+
+    const doc: any = await Consumer.findOne({ email: "geoboom@example.com" }).lean();
+    expect(doc).toBeTruthy();
+    // Absent, not a row of nulls — the honest-absent rule.
+    expect(doc.registrationLocation).toBeUndefined();
+  });
+
+  it("a timeout / unplaceable IP writes NOTHING rather than a blank row", async () => {
+    vi.spyOn(locationService, "resolveCityFromIpBounded").mockResolvedValue({
+      city: null,
+      rawCity: null,
+      region: null,
+      country: null,
+      source: "unresolved",
+      confidence: 0,
+      accuracyRadiusKm: null,
+      reason: "resolver_timeout",
+    } as any);
+
+    const res = await request(app()).post("/api/consumer/auth/signup").send({
+      email: "timedout@example.com",
+      name: "Timed Out",
+      password: "correct-horse",
+    });
+    expect(locationService.resolveCityFromIpBounded).toHaveBeenCalled();
+    expect(res.status).toBe(201);
+
+    const doc: any = await Consumer.findOne({ email: "timedout@example.com" }).lean();
+    /* `source:"unresolved"` alone is not a location. Storing it would make
+     * every unplaceable consumer look located-but-blank in the registry. */
+    expect(doc.registrationLocation).toBeUndefined();
   });
 });
 
@@ -381,6 +473,76 @@ describe("GET /api/admin/consumers — the list", () => {
     expect(res.body.summary.optedInEmail).toBe(0);
     expect(res.body.summary.optedInWhatsapp).toBe(0);
     expect(res.body.summary.total).toBe(res.body.rows.length);
+  });
+
+  it("surfaces location in the list, and filters by country", async () => {
+    const { newer } = await seed();
+    await Consumer.updateOne(
+      { _id: newer._id },
+      {
+        $set: {
+          registrationLocation: {
+            city: "Bengaluru",
+            rawCity: "Bengaluru",
+            region: "Karnataka",
+            country: "IN",
+            source: "ip",
+            confidence: 1,
+            accuracyRadiusKm: 5,
+            reason: "ok",
+            capturedAt: new Date(),
+          },
+        },
+      },
+    );
+
+    const res = await request(app())
+      .get("/api/admin/consumers")
+      .set("Authorization", `Bearer ${SUPER_TOKEN}`);
+    const located = res.body.rows.find((r: any) => r.id === String(newer._id));
+    const unlocated = res.body.rows.find((r: any) => r.id !== String(newer._id));
+    expect(located.location).toMatchObject({ located: true, city: "Bengaluru", country: "IN" });
+    // The consumer with no block reads as an explicit not-located, not as a
+    // half-filled object the client has to guess about.
+    expect(unlocated.location.located).toBe(false);
+    expect(unlocated.location.city).toBeNull();
+
+    const inRows = await request(app())
+      .get("/api/admin/consumers?country=IN")
+      .set("Authorization", `Bearer ${SUPER_TOKEN}`);
+    expect(inRows.body.rows).toHaveLength(1);
+    expect(inRows.body.rows[0].id).toBe(String(newer._id));
+
+    // lowercase must find the same row — the model uppercases on write.
+    const lower = await request(app())
+      .get("/api/admin/consumers?country=in")
+      .set("Authorization", `Bearer ${SUPER_TOKEN}`);
+    expect(lower.body.rows).toHaveLength(1);
+
+    // An unlocated consumer belongs to NO country segment.
+    const ae = await request(app())
+      .get("/api/admin/consumers?country=AE")
+      .set("Authorization", `Bearer ${SUPER_TOKEN}`);
+    expect(ae.body.rows).toHaveLength(0);
+
+    const notLocated = await request(app())
+      .get("/api/admin/consumers?located=false")
+      .set("Authorization", `Bearer ${SUPER_TOKEN}`);
+    expect(notLocated.body.rows.map((r: any) => r.id)).not.toContain(String(newer._id));
+
+    // …and country + another OR-shaped filter still AND correctly.
+    const combo = await request(app())
+      .get("/api/admin/consumers?country=IN&located=true")
+      .set("Authorization", `Bearer ${SUPER_TOKEN}`);
+    expect(combo.body.rows).toHaveLength(1);
+  });
+
+  it("rejects a malformed country code", async () => {
+    await seed();
+    const res = await request(app())
+      .get("/api/admin/consumers?country=INDIA")
+      .set("Authorization", `Bearer ${SUPER_TOKEN}`);
+    expect(res.status).toBe(400);
   });
 
   it("paginates", async () => {

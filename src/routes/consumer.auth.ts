@@ -40,6 +40,8 @@ import {
   cookieDomainForPath,
 } from "../config/consumerAuth.js";
 import { HELLOVIZA_D2C_WORKSPACE_ID } from "../services/consumerWorkspace.js";
+import { resolveCityFromIpBounded, hashIp } from "../services/location.service.js";
+import { upsertCurrentLocation } from "../models/ActorLocation.js";
 
 const router = Router();
 
@@ -193,6 +195,105 @@ const B2B_MESSAGE =
 // select:false on the model, but this exists so no future field is exposed by
 // accident — a whitelist, not a blocklist.
 /* ─────────────────────────────────────────────────────────────────────
+ * WHERE THIS REGISTRATION CAME FROM.
+ *
+ * ⚠ THIS MUST NEVER COST SOMEBODY THEIR ACCOUNT.
+ * A geo lookup is a nice-to-have on a marketing sheet. Account creation is
+ * the entire product. So every failure mode here is swallowed and turned
+ * into data — a timeout, a thrown resolver, a private IP, a database that
+ * was never provisioned. There is no path from this function to a failed
+ * signup, and the tests assert exactly that by making the resolver throw.
+ *
+ * ── WHY 1500ms ───────────────────────────────────────────────────────
+ * The same budget routes/manualBookings.ts chose, and for the same reason:
+ * the first lookup on a fresh instance provisions a ~70 MB MaxMind
+ * download. On this service MAXMIND_LICENSE_KEY is set at RUNTIME only, so
+ * the build-time provisioning step fails and that download happens lazily
+ * on first use. Production shows the shape plainly after every restart:
+ * the first one or two lookups stamp `resolver_timeout`, and every one
+ * after that resolves. A registration is not worth parking behind it.
+ *
+ * ── WHY resolveCityFromIp AND NOT resolveActorFromRequest ────────────
+ * resolveActorFromRequest() derives the actor from req.user/req.consumer
+ * and writes its ActorLocation row in the same call. NEITHER EXISTS YET
+ * HERE: /signup is public, requireConsumer does not run on it, and the
+ * Consumer row is created further down this handler. So the IP is resolved
+ * directly now, and the actor row is stamped afterwards by
+ * stampConsumerActorLocation() once there is an id to key it on.
+ * ───────────────────────────────────────────────────────────────────── */
+const SIGNUP_LOCATION_TIMEOUT_MS = 1500;
+
+async function resolveRegistrationLocation(req: any): Promise<Record<string, any> | undefined> {
+  try {
+    const loc = await resolveCityFromIpBounded(req?.ip, SIGNUP_LOCATION_TIMEOUT_MS);
+
+    /* A lookup that produced no place at all is stored as NOTHING, not as a
+     * row of nulls — the same honest-absent rule marketingConsent follows.
+     * `source` alone is not a location; a document saying
+     * {city:null, country:null, source:"private-ip"} would make every
+     * unlocated consumer look located-but-blank in the registry and would
+     * have to be filtered out again at every read. Absent says it once. */
+    if (!loc || (!loc.city && !loc.rawCity && !loc.country)) return undefined;
+
+    return {
+      city: loc.city ?? null,
+      rawCity: loc.rawCity ?? null,
+      region: loc.region ?? null,
+      country: loc.country ?? null,
+      source: loc.source,
+      confidence: loc.confidence ?? 0,
+      accuracyRadiusKm: loc.accuracyRadiusKm ?? null,
+      reason: loc.reason ?? "",
+      capturedAt: new Date(),
+    };
+  } catch (err: any) {
+    // Belt and braces. resolveCityFromIpBounded's contract is that it never
+    // throws; if that contract is ever broken, a signup must not be what
+    // discovers it.
+    console.warn("[consumer signup] location resolve failed (signup proceeds):", err?.message);
+    return undefined;
+  }
+}
+
+/**
+ * Stamp the CURRENT-location row for a freshly created consumer.
+ *
+ * Separate from the snapshot above because they are different records with
+ * different lifetimes: `registrationLocation` is frozen on the Consumer for
+ * good, while ActorLocation is one overwritten row per actor that expires
+ * after 90 days. Both come from the one resolution we already paid for —
+ * this does not perform a second lookup.
+ *
+ * Fire-and-forget and fully swallowed: the account already exists by the
+ * time this runs, so nothing it does may surface as a signup failure.
+ */
+async function stampConsumerActorLocation(consumerId: string, ip: any, snapshot: any): Promise<void> {
+  if (!snapshot) return;
+  try {
+    await upsertCurrentLocation(
+      {
+        actorId: consumerId,
+        actorType: "CONSUMER",
+        workspaceId: HELLOVIZA_D2C_WORKSPACE_ID,
+      },
+      {
+        city: snapshot.city,
+        rawCity: snapshot.rawCity,
+        region: snapshot.region,
+        country: snapshot.country,
+        source: snapshot.source,
+        confidence: snapshot.confidence,
+        accuracyRadiusKm: snapshot.accuracyRadiusKm,
+        reason: snapshot.reason,
+      } as any,
+      hashIp(typeof ip === "string" ? ip : null),
+    );
+  } catch (err: any) {
+    console.warn("[consumer signup] actor-location stamp failed (account is unaffected):", err?.message);
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * MARKETING CONSENT, AT SIGNUP.
  *
  * THE VERSION IS A CONSTANT IN CODE, NOT A ROW IN A TABLE. What a consumer
@@ -301,13 +402,22 @@ router.post("/signup", async (req: any, res: any) => {
      * never heard of this field creates exactly the document it always
      * did. See buildSignupConsent() on why unticked writes nothing. */
     const marketingConsent = buildSignupConsent(req.body);
+    /* Awaited, but BOUNDED and non-throwing — see resolveRegistrationLocation.
+     * Worst case it costs this request 1500ms and returns undefined, which
+     * writes no field at all. It cannot fail the signup. */
+    const registrationLocation = await resolveRegistrationLocation(req);
     const consumer = await Consumer.create({
       email,
       name,
       phone,
       passwordHash,
       ...(marketingConsent ? { marketingConsent } : {}),
+      ...(registrationLocation ? { registrationLocation } : {}),
     });
+
+    // The account exists now; the current-location row is a side record and
+    // is deliberately NOT awaited into the response path.
+    void stampConsumerActorLocation(String((consumer as any)._id), req?.ip, registrationLocation);
 
     const { accessToken } = issueSession(res, consumer as any);
 
@@ -606,12 +716,23 @@ router.post("/google", async (req: any, res: any) => {
      * passwordHash is simply absent. There is no placeholder, no random
      * unusable hash, nothing that a later reader could mistake for a
      * credential. authProvider carries the truth instead. */
+    /* A Google signup is a REGISTRATION too, so it is located on exactly
+     * the same terms as the password path — same helper, same 1500ms bound,
+     * same never-blocks rule. Only the CREATE branch does this: the
+     * find-or-create above returns early for an existing account, and
+     * re-stamping registrationLocation there would quietly turn a frozen
+     * provenance snapshot into a last-seen field, which is the one thing
+     * models/Consumer.ts says it must never become. */
+    const registrationLocation = await resolveRegistrationLocation(req);
     const created = await Consumer.create({
       email,
       name,
       authProvider: "google",
       googleSub,
+      ...(registrationLocation ? { registrationLocation } : {}),
     });
+
+    void stampConsumerActorLocation(String((created as any)._id), req?.ip, registrationLocation);
 
     issueSession(res, created as any);
     return res.status(201).json({

@@ -125,6 +125,35 @@ function consentView(consumer: any) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * Registration location, as the registry reads it.
+ *
+ * ABSENT AND BLANK COLLAPSE TO ONE SHAPE, exactly as consent does — but
+ * `located` is kept as its own boolean so the client can say "Unknown"
+ * rather than rendering an em-dash that reads like a data bug. A consumer
+ * who registered before this field existed, or through a private IP, or
+ * during a cold-start timeout, is genuinely unlocated; that is a fact
+ * about our lookup, not about them.
+ *
+ * NOT masked by the PII tier. City/region/country are coarse and shared by
+ * millions — see models/Consumer.ts on why they are plaintext. The IP that
+ * produced them is never stored here at all.
+ * ───────────────────────────────────────────────────────────────────── */
+function locationView(consumer: any) {
+  const l = consumer?.registrationLocation;
+  const city = l?.city ?? l?.rawCity ?? null;
+  return {
+    located: Boolean(l && (l.city || l.rawCity || l.country)),
+    city,
+    region: l?.region ?? null,
+    country: l?.country ?? null,
+    source: l?.source ?? null,
+    confidence: l?.confidence ?? null,
+    reason: l?.reason ?? null,
+    capturedAt: l?.capturedAt ?? null,
+  };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * THE TIER. Decided once per request.
  *
  * `isSuperAdmin(req)` is the canonical check — middleware/isSuperAdmin.ts,
@@ -312,6 +341,32 @@ router.get("/", requirePermission("visaApplication", "READ"), async (req: any, r
       filter.status = v;
     }
 
+    /* ?country=IN — the marketing segment.
+     *
+     * Uppercased to match the model's own `uppercase: true` on write, so a
+     * lowercase query string still finds its rows. Consumers with NO
+     * location never match any country value, which is correct: "unlocated"
+     * is not a country and must not be swept into one. */
+    if (req.query.country != null && String(req.query.country).trim() !== "") {
+      const v = String(req.query.country).trim().toUpperCase();
+      if (!/^[A-Z]{2}$/.test(v)) {
+        return res.status(400).json({ error: "country must be an ISO-3166-1 alpha-2 code" });
+      }
+      filter["registrationLocation.country"] = v;
+    }
+
+    /* ?located=true|false — "who could we place at all", the coverage
+     * question this data's own reliability depends on.
+     *
+     * Expressed on the BLOCK's existence, not on a field inside it: the
+     * signup path writes the whole block or none of it (see
+     * resolveRegistrationLocation), so presence is exactly the predicate.
+     * Deliberately its own key rather than folded into the country filter
+     * above — combining ?country=IN&located=true then simply ANDs two
+     * compatible clauses instead of one overwriting the other. */
+    if (req.query.located === "true") and.push({ registrationLocation: { $exists: true } });
+    else if (req.query.located === "false") and.push({ registrationLocation: { $exists: false } });
+
     /* ?hasApplied=true|false
      *
      * A pre-pass, not a join. "Has this person ever filed an application"
@@ -340,7 +395,7 @@ router.get("/", requirePermission("visaApplication", "READ"), async (req: any, r
      * decryption hook needing a hydrated document, and nothing below calls
      * a document method. */
     const rows = await Consumer.find(filter)
-      .select("email name phone authProvider status marketingConsent createdAt")
+      .select("email name phone authProvider status marketingConsent registrationLocation createdAt")
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
@@ -382,6 +437,8 @@ router.get("/", requirePermission("visaApplication", "READ"), async (req: any, r
         registeredAt: c.createdAt ?? null,
 
         marketingConsent: consentView(c),
+        // Plaintext, and NOT masked — see locationView's own note.
+        location: locationView(c),
 
         // The derived block — three plaintext aggregations, above.
         savedCountryCount: derived.saved.get(key)?.count ?? 0,
@@ -471,7 +528,7 @@ router.get("/:id", requirePermission("visaApplication", "READ"), async (req: any
     }
 
     const consumer: any = await Consumer.findById(id)
-      .select("email name phone authProvider googleSub status marketingConsent createdAt updatedAt")
+      .select("email name phone authProvider googleSub status marketingConsent registrationLocation createdAt updatedAt")
       .lean();
     if (!consumer) return res.status(404).json({ error: "Consumer not found" });
 
@@ -546,6 +603,10 @@ router.get("/:id", requirePermission("visaApplication", "READ"), async (req: any
         updatedAt: consumer.updatedAt ?? null,
         piiMasked: !full,
         marketingConsent: consentView(consumer),
+        // The fuller block on the detail: source/confidence/reason are how an
+        // agent tells "we placed them in Delhi" from "we timed out and know
+        // nothing", which a bare city string cannot express.
+        location: locationView(consumer),
       },
 
       identity,

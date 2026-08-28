@@ -118,6 +118,53 @@ export interface ConsumerDocument extends Document {
     email?: MarketingConsentEntry;
     whatsapp?: MarketingConsentEntry;
   };
+  /**
+   * WHERE THIS ACCOUNT WAS CREATED FROM — a one-shot snapshot taken at
+   * registration, never updated afterwards.
+   *
+   * ── A SNAPSHOT, NOT A CURRENT LOCATION ────────────────────────────
+   * The name says `registration` because that is the only thing this can
+   * honestly claim. A consumer who signs up in Delhi and moves to Dubai
+   * still carries `Delhi` here forever, and that is correct: the field
+   * answers "where did this account come from", which is a marketing and
+   * provenance question with a fixed answer. "Where are they now" is a
+   * different question with a different lifetime, and models/
+   * ActorLocation.ts already answers it — one row per actor, overwritten
+   * on each request, expiring after 90 days. Do not teach this field to
+   * track movement; that collection already does.
+   *
+   * ── PLAINTEXT, DELIBERATELY ───────────────────────────────────────
+   * City/region/country are not identity data the way a passport number
+   * is — they are coarse, shared by millions, and derived from an address
+   * we did not store. The registry must group and filter on them across
+   * the whole population ("consumers in India"), which is exactly the
+   * aggregation the encrypted collection cannot do (models/
+   * ConsumerProfile.ts). The IP itself is NOT stored here at all — that
+   * is the identifying part, and location.service.ts hashes it.
+   *
+   * ── ABSENT IS A REAL AND EXPECTED STATE ───────────────────────────
+   * No default, same rule as marketingConsent. Absent means the lookup
+   * did not produce anything — a private IP, a cold-start timeout, or an
+   * account created before this field existed. It must NEVER be inferred
+   * to mean "unknown country" in a filter; the registry renders it as
+   * "Unknown" and the country filter simply does not match it.
+   */
+  registrationLocation?: {
+    /** Canonical city via the STRICT destinationLookup — null when unrecognised. */
+    city: string | null;
+    /** What the geo database said pre-canonicalisation, so a lookup-table gap stays measurable. */
+    rawCity: string | null;
+    region: string | null;
+    /** ISO-3166-1 alpha-2, straight from the geo database. */
+    country: string | null;
+    source: string;
+    /** 0..1 — see confidenceFromAccuracyRadius in location.service.ts. */
+    confidence: number;
+    accuracyRadiusKm: number | null;
+    /** Machine-readable "why this answer" — distinguishes a timeout from a miss. */
+    reason: string;
+    capturedAt: Date;
+  };
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -212,6 +259,30 @@ const ConsumerSchema = new Schema<ConsumerDocument>(
         { _id: false },
       ),
     },
+
+    /* No default, for the same reason marketingConsent has none: an empty
+     * object would put the key on every row that was never located, and
+     * "present but blank" is a state with no meaning here. See the
+     * interface note — absent IS the answer. */
+    registrationLocation: {
+      type: new Schema(
+        {
+          city: { type: String, default: null },
+          rawCity: { type: String, default: null },
+          region: { type: String, default: null },
+          // Uppercased on write: the geo database emits ISO alpha-2 already,
+          // but the registry's country filter compares exactly, and one
+          // lowercase row would silently drop out of its own segment.
+          country: { type: String, default: null, uppercase: true, trim: true },
+          source: { type: String, required: true },
+          confidence: { type: Number, default: 0 },
+          accuracyRadiusKm: { type: Number, default: null },
+          reason: { type: String, default: "" },
+          capturedAt: { type: Date, required: true },
+        },
+        { _id: false },
+      ),
+    },
   },
   { timestamps: true },
 );
@@ -227,6 +298,14 @@ const ConsumerSchema = new Schema<ConsumerDocument>(
  * three hundred thousand.
  */
 ConsumerSchema.index({ createdAt: -1 });
+
+/**
+ * The registry's country segment — "every consumer who registered from IN".
+ * Sparse, because absent is the common state (see registrationLocation's own
+ * note) and there is no reason for the many unlocated rows to pile up under
+ * one null key.
+ */
+ConsumerSchema.index({ "registrationLocation.country": 1 }, { sparse: true });
 
 const Consumer: Model<ConsumerDocument> =
   mongoose.models.Consumer || mongoose.model<ConsumerDocument>("Consumer", ConsumerSchema);
