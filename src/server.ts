@@ -10,6 +10,11 @@
 import "./bootstrap/loadSecrets.js";
 
 import express from "express";
+// Boot-warm only — see the call inside the app.listen callback. The module is
+// already on the boot path via routes/manualBookings.ts → services/
+// location.service.ts, so importing it here adds nothing new to load, and its
+// self-execution guard (isMainModule) is false under `node dist/server.js`.
+import { ensureGeoipDatabase } from "./services/geoipProvision.js";
 import cookieParser from "cookie-parser";
 import morgan from "morgan";
 import compression from "compression";
@@ -1203,6 +1208,44 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
 
       const server = app.listen(env.PORT, () => {
         logger.info("API running", { port: env.PORT });
+
+        /* ── WARM THE GEO DATABASE ────────────────────────────────────
+         * The MaxMind database is fetched lazily, by the FIRST location
+         * lookup that needs it (services/location.service.ts →
+         * ensureGeoipDatabase). That download is ~70 MB, so on a fresh
+         * instance the first few lookups exceed their 1500ms budget and
+         * come back `resolver_timeout` — blank. Production shows exactly
+         * that after every restart: two blank rows, then real cities.
+         *
+         * For manual bookings, which are frequent, that costs two rows.
+         * For CONSUMER SIGNUP it is worse: registrations are rare enough
+         * that a whole cold window can pass with a single signup in it,
+         * and that person is then permanently unlocated — the snapshot is
+         * taken once and never revisited (models/Consumer.ts).
+         *
+         * Starting the download here moves the window from "until the
+         * first signup arrives, plus download time" to "download time,
+         * starting now".
+         *
+         * ── WHY IT CANNOT BE BAKED INTO THE IMAGE INSTEAD ────────────
+         * The build step that would do it (`node dist/services/
+         * geoipProvision.js`, last in package.json's build) fails on App
+         * Runner because MAXMIND_LICENSE_KEY is a RUNTIME-only variable
+         * and the managed runtime has no build-phase env field at all —
+         * CodeConfigurationValues offers only RuntimeEnvironmentVariables
+         * and RuntimeEnvironmentSecrets. So the runtime download is the
+         * only avenue, and this is the earliest safe moment to start it.
+         *
+         * ── NOT AWAITED, AND THAT IS THE POINT ───────────────────────
+         * Inside the listen callback, so the port is ALREADY open and the
+         * health check can already pass before this runs. `void` + a
+         * swallowing `.catch` so a rejected promise can never become an
+         * unhandled rejection — the health check is 10s x 5, and a
+         * blocking or throwing boot step is precisely the shape that
+         * rolled a previous release back. Failure is already non-fatal
+         * inside the provisioner; this catch is the second guard, not the
+         * first. */
+        void ensureGeoipDatabase().catch(() => {});
       });
 
       const shutdown = async () => {
