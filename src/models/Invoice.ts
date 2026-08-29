@@ -100,6 +100,19 @@ export interface IInvoice extends Document {
   notes?: string;
   showInclusiveTaxNote?: boolean;
   isDemo?: boolean;
+
+  // Set by the consumer erasure cascade (scripts/lib/consumerErasureCascade.ts,
+  // motion (b)) when this invoice's recipient PII was stripped. The invoice
+  // itself is NEVER deleted — the number series must stay gapless and s.36
+  // requires the document be retained — so this stamp is the only thing that
+  // distinguishes "redacted under an erasure request" from "issued with
+  // sparse client details". Same field, same meaning, same convention as
+  // ManualBooking.piiRedactedAt.
+  //
+  // It is also the IDEMPOTENCY key for that motion: a re-run skips any
+  // invoice already carrying it, so a second erasure pass cannot append a
+  // second editHistory entry for work already done.
+  piiRedactedAt?: Date;
   invoiceDate: Date;
   dueDate?: Date;
   pdfUrl?: string;
@@ -179,6 +192,7 @@ const InvoiceSchema = new Schema<IInvoice>(
     showInclusiveTaxNote: { type: Boolean, default: false },
     // Demo Platform — invoice generated from demo bookings (seed or impersonation)
     isDemo: { type: Boolean, default: false, index: true },
+    piiRedactedAt: { type: Date },
     invoiceDate: { type: Date, required: true, default: () => new Date() },
     dueDate: Date,
     pdfUrl: String,

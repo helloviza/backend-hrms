@@ -55,6 +55,23 @@ export const env = {
   VISA_SCREENING_ENFORCED: String(process.env.VISA_SCREENING_ENFORCED || "").trim().toLowerCase() === "true",
   DEPLOYMENT_MODE: (process.env.DEPLOYMENT_MODE === "saas" ? "saas" : "plumbox") as "saas" | "plumbox",
 
+  // Consumer erasure, decision D1 — does the recipient NAME come off the
+  // tax invoice too? Default false = KEEP it (the safer legal error, since
+  // keeping is reversible and defacing a statutory record is not). Declared
+  // here for DISCOVERABILITY only, on the same line VISA_SCREENING_ENFORCEMENT
+  // above is: the runtime read lives in config/erasurePolicy.ts and goes to
+  // process.env live, so counsel's ruling can be applied by flipping an env
+  // var and each test can pin the state it needs. See that file's header for
+  // the full reasoning and for what the flag deliberately does NOT govern.
+  ERASURE_REDACT_INVOICE_NAME:
+    String(process.env.ERASURE_REDACT_INVOICE_NAME || "").trim().toLowerCase() === "true",
+
+  // Salt for the pseudonymised subject reference on ConsumerErasureRequest
+  // (decision D6). Optional — falls back to JWT_SECRET. See
+  // config/erasurePolicy.ts's erasurePseudonymSalt() for the rotation
+  // consequence of leaving it unset.
+  ERASURE_PSEUDONYM_SALT: process.env.ERASURE_PSEUDONYM_SALT || "",
+
   // PII field encryption master key — base64 of 32 random bytes, wrapping
   // the per-subject data keys in security/subjectKeys.ts. Declared here for
   // DISCOVERABILITY only, on the same line VISA_SCREENING_ENFORCEMENT above

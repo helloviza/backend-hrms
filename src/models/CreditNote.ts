@@ -111,6 +111,12 @@ export interface ICreditNote extends Document {
   notes?: string;
   showInclusiveTaxNote?: boolean;
   isDemo?: boolean;
+
+  // Consumer erasure, motion (b) — see models/Invoice.piiRedactedAt for the
+  // full note. A credit note is a fiscal document in its own numbered
+  // series (CreditNote.ts's own counter, mirroring the invoice series), so
+  // it is redacted and stamped, never deleted.
+  piiRedactedAt?: Date;
   creditNoteDate: Date;
   pdfUrl?: string;
 
@@ -232,6 +238,7 @@ const CreditNoteSchema = new Schema<ICreditNote>(
     showInclusiveTaxNote: { type: Boolean, default: false },
 
     isDemo: { type: Boolean, default: false, index: true },
+    piiRedactedAt: { type: Date },
 
     creditNoteDate: { type: Date, required: true, default: () => new Date() },
     pdfUrl: String,

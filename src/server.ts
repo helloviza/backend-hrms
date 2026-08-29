@@ -560,6 +560,20 @@ import consumerSavedRouter from "./routes/consumer.saved.js";
 app.use("/api/consumer/saved", consumerSavedRouter);
 
 /* ────────────────────────────────────────────────────────────────
+ * The consumer's own DELETE-MY-ACCOUNT — /api/consumer/erasure.
+ *
+ * IT DELETES NOTHING. The POST raises a ConsumerErasureRequest in state
+ * `requested` and returns; the erasure itself is reviewed and executed by
+ * a Super Admin (routes/admin.consumerErasure.ts). That split is not
+ * caution for its own sake — a paid consumer has a tax invoice that has to
+ * survive with its number series gapless, the cascade crypto-shreds a key
+ * with no undo, and an application already lodged with an embassy cannot
+ * be recalled. All three are judgements made by a human reading the
+ * dry-run plan, not by a button. See routes/consumer.erasure.ts. */
+import consumerErasureRouter from "./routes/consumer.erasure.js";
+app.use("/api/consumer/erasure", consumerErasureRouter);
+
+/* ────────────────────────────────────────────────────────────────
  * DEV-ONLY consumer stub login — /api/consumer/dev-auth.
  *
  * Real Google/Microsoft OAuth for helloviza.ai is being built separately.
@@ -742,6 +756,18 @@ app.use("/api/admin/visa/master-sheet", adminVisaMasterSheetRouter);
  * See routes/admin.consumers.ts. */
 import adminConsumersRouter from "./routes/admin.consumers.js";
 app.use("/api/admin/consumers", adminConsumersRouter);
+
+/* The ERASURE QUEUE — /api/admin/consumer-erasure. Review and execute a
+ * consumer's deletion request. Reading and reviewing sit on the same
+ * visaApplication READ gate the registry above uses (same population, same
+ * purpose); approving, rejecting and EXECUTING are SUPERADMIN-only, checked
+ * with isSuperAdmin() rather than a permission key, because a key can be
+ * granted to a level and this cannot. Sibling prefix to /admin/consumers
+ * rather than a path under it: the queue is a list of REQUESTS, not of
+ * consumers, and half its rows point at accounts that no longer exist.
+ * See routes/admin.consumerErasure.ts. */
+import adminConsumerErasureRouter from "./routes/admin.consumerErasure.js";
+app.use("/api/admin/consumer-erasure", adminConsumerErasureRouter);
 
 // Visa module (2026-08-09) — the cross-workspace ROSTER: every customer
 // workspace with its real KPIs, and a drill-in to any one workspace's
