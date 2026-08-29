@@ -477,6 +477,22 @@ app.use("/api/auth", auth);
 import consumerAuthRouter from "./routes/consumer.auth.js";
 app.use("/api/consumer/auth", consumerAuthRouter);
 
+/* ────────────────────────────────────────────────────────────────
+ * Mobile-OTP sign-in and sign-up — /api/consumer/auth/mobile/{start,
+ * verify,complete}. PUBLIC, like the /signup and /login it sits beside:
+ * proving you hold a phone number is the credential, so requiring a
+ * session to do it would be circular.
+ *
+ * Mounted UNDER /auth rather than beside the older /api/consumer/mobile
+ * router, because these are auth endpoints that happen to use SMS, not
+ * profile endpoints. The other one verifies a number for somebody already
+ * signed in and is session-gated router-wide; this one has no session to
+ * gate on and pays for that with Turnstile plus per-NUMBER rate limits.
+ * See routes/consumer.mobileAuth.ts for why they are two files.
+ * ──────────────────────────────────────────────────────────────── */
+import consumerMobileAuthRouter from "./routes/consumer.mobileAuth.js";
+app.use("/api/consumer/auth/mobile", consumerMobileAuthRouter);
+
 /* The consumer's own profile — passports, addresses, co-travellers and the
  * shared document locker. Every route inside gates on requireConsumer and
  * filters on req.consumer.id; there is no by-id lookup and no admin view.

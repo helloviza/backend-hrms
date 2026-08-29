@@ -49,7 +49,10 @@ const router = Router();
 const isProd = process.env.NODE_ENV === "production";
 const BCRYPT_COST = 12; // same as routes/signup.ts
 
-function normalizeEmail(v: unknown): string {
+/* EXPORTED for routes/consumer.mobileAuth.ts. The OTP signup door has to
+ * key on the same normalised address this one does, or the two doors could
+ * disagree about whether an account already exists. */
+export function normalizeEmail(v: unknown): string {
   return String(v ?? "").trim().toLowerCase();
 }
 
@@ -177,19 +180,19 @@ function issueSession(res: any, consumer: { _id: any; tokenVersion: number }) {
  * which is why the constraints above are enforced here rather than
  * waved through.
  */
-async function b2bAccountExists(email: string): Promise<boolean> {
+export async function b2bAccountExists(email: string): Promise<boolean> {
   const hit = await User.findOne({ email }).select("_id").lean();
   // Coerced at the boundary. The document never escapes this function.
   return Boolean(hit);
 }
 
 /** The one marker the frontend switches on. Fixed string, no variants. */
-const B2B_MARKER = "B2B_ACCOUNT_EXISTS";
+export const B2B_MARKER = "B2B_ACCOUNT_EXISTS";
 /** Password login attempted against an account that has no password. */
 const NO_PASSWORD_MARKER = "CONSUMER_NO_PASSWORD";
 /** GOOGLE_OAUTH_CLIENT_ID is unset on this server. Deployment, not code. */
 const GOOGLE_UNCONFIGURED_MARKER = "GOOGLE_SIGNIN_UNCONFIGURED";
-const B2B_MESSAGE =
+export const B2B_MESSAGE =
   "That address is already registered as a Plumtrips business account.";
 
 // The shape a consumer is ever described by on the wire. passwordHash is
@@ -224,7 +227,7 @@ const B2B_MESSAGE =
  * ───────────────────────────────────────────────────────────────────── */
 const SIGNUP_LOCATION_TIMEOUT_MS = 1500;
 
-async function resolveRegistrationLocation(req: any): Promise<Record<string, any> | undefined> {
+export async function resolveRegistrationLocation(req: any): Promise<Record<string, any> | undefined> {
   try {
     const loc = await resolveCityFromIpBounded(req?.ip, SIGNUP_LOCATION_TIMEOUT_MS);
 
@@ -268,7 +271,7 @@ async function resolveRegistrationLocation(req: any): Promise<Record<string, any
  * Fire-and-forget and fully swallowed: the account already exists by the
  * time this runs, so nothing it does may surface as a signup failure.
  */
-async function stampConsumerActorLocation(consumerId: string, ip: any, snapshot: any): Promise<void> {
+export async function stampConsumerActorLocation(consumerId: string, ip: any, snapshot: any): Promise<void> {
   if (!snapshot) return;
   try {
     await upsertCurrentLocation(
@@ -328,7 +331,7 @@ export const MARKETING_CONSENT_VERSION = "2026-08-v1";
  * `{}` are all truthy in JS, and any of them silently opting somebody in
  * is precisely the failure this whole block exists to make impossible.
  */
-function buildSignupConsent(body: any): Record<string, any> | undefined {
+export function buildSignupConsent(body: any): Record<string, any> | undefined {
   const wants = (v: unknown): boolean => v === true || v === "true";
   const emailOptIn = wants(body?.marketingConsentEmail);
   const whatsappOptIn = wants(body?.marketingConsentWhatsapp);
@@ -344,7 +347,7 @@ function buildSignupConsent(body: any): Record<string, any> | undefined {
   return consent;
 }
 
-function publicConsumer(c: any) {
+export function publicConsumer(c: any) {
   return {
     id: String(c._id),
     email: c.email,
