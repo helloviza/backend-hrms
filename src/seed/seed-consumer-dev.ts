@@ -28,6 +28,7 @@ import bcrypt from "bcryptjs";
 import { env } from "../config/env.js";
 import { assertLocalDatabase } from "./assertLocalDatabase.js";
 import Consumer from "../models/Consumer.js";
+import { normaliseIndiaMobile } from "../services/consumerMobileOtp.js";
 import {
   ensureD2CWorkspace,
   HELLOVIZA_D2C_WORKSPACE_ID,
@@ -75,10 +76,15 @@ async function upsertConsumer(spec: (typeof SEEDED)[number]): Promise<void> {
   }
 
   const passwordHash = await bcrypt.hash(DEV_CONSUMER_PASSWORD, BCRYPT_COST);
+  /* Through the SAME normaliser every other writer uses, so the seeded
+   * rows carry the bare ten digits production rows carry rather than the
+   * "+91…" the specs above are written in. A dev database that stores a
+   * different shape from prod is a dev database that hides format bugs. */
+  const phone = normaliseIndiaMobile(spec.phone) || undefined;
   const created = await Consumer.create({
     email: spec.email,
     name: spec.name,
-    phone: spec.phone,
+    ...(phone ? { phone } : {}),
     passwordHash,
   });
 

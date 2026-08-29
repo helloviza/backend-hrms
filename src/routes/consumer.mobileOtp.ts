@@ -40,6 +40,7 @@ import {
   consumerOtpSendLimiter,
   consumerOtpVerifyLimiter,
 } from "../middleware/rateLimit.js";
+import Consumer from "../models/Consumer.js";
 import ConsumerProfile from "../models/ConsumerProfile.js";
 import {
   MobileOtpNotConfiguredError,
@@ -249,6 +250,45 @@ router.post("/otp/verify", consumerOtpVerifyLimiter, async (req: any, res: any) 
     profile.contact.mobileVerified = true;
     profile.contact.mobileVerifiedAt = new Date();
     await profile.save();
+
+    /* ── THE MIRROR — the proven number, where a query can find it ─────
+     * contact.mobile above is ENCRYPTED, which makes it unsearchable: no
+     * findOne({"contact.mobile": x}) can ever work, because every stored
+     * value is a distinct envelope. So the moment a number is proven, the
+     * plaintext ten digits are copied to Consumer.verifiedPhone, which is
+     * indexed and unique and is what a future OTP login will resolve
+     * against. Without this line the number is verified but unfindable,
+     * and login could not exist.
+     *
+     * `mobile` is already the normalised bare-ten (resolveOwnMobile ran it
+     * through normaliseIndiaMobile before we ever called MSG91), so the two
+     * copies cannot drift into two shapes. It is non-empty by construction
+     * — an unnormalisable number is refused before any code is sent — so
+     * this can never write the "" that would break the sparse index.
+     *
+     * updateOne is safe HERE and nowhere near the profile: Consumer carries
+     * no encrypted paths, so the plugin's EncryptedFieldUpdateError guard
+     * does not apply to it.
+     *
+     * ── WHY THE FAILURE IS SWALLOWED RATHER THAN RAISED ──────────────
+     * The verification itself has already SUCCEEDED and been persisted.
+     * Turning a mirror failure into a 500 would tell the reader their
+     * correct code was wrong and invite them to burn another SMS on a
+     * number that is, in fact, already verified. The duplicate-key case is
+     * a real one — another account proved the same number first — and it is
+     * logged rather than surfaced because there is nothing this endpoint's
+     * caller can do about it. Phase 2's login will read it as "no account
+     * for this number" and route accordingly, which is the correct outcome
+     * for a number whose ownership is genuinely contested. */
+    try {
+      await Consumer.updateOne({ _id: me(req) }, { $set: { verifiedPhone: mobile } });
+    } catch (mirrorErr: any) {
+      otpRouteLogger.error("verify — verifiedPhone mirror failed", {
+        consumerId: me(req),
+        duplicate: mirrorErr?.code === 11000,
+        error: mirrorErr?.message,
+      });
+    }
 
     otpRouteLogger.info("verify — mobile verified", { consumerId: me(req) });
 

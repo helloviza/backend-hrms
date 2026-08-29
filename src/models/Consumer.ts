@@ -40,12 +40,28 @@ export type ConsumerStatus = (typeof CONSUMER_STATUSES)[number];
  * provider says the true thing instead, and says it in one field a query
  * can filter on.
  */
-export const CONSUMER_AUTH_PROVIDERS = ["password", "google"] as const;
+export const CONSUMER_AUTH_PROVIDERS = ["password", "google", "mobile"] as const;
 export type ConsumerAuthProvider = (typeof CONSUMER_AUTH_PROVIDERS)[number];
 
 export interface ConsumerDocument extends Document {
   email: string;
+  /**
+   * THE SIGNUP-CAPTURED IDENTITY HINT. Unverified, and not a login key.
+   *
+   * Normalised to bare ten digits on every write, so one shape is stored no
+   * matter what a form sent. Nobody has proved they hold this number — it is
+   * whatever was typed — which is exactly why `verifiedPhone` below is a
+   * SEPARATE field and not a flag on this one. See it for the reasoning.
+   */
   phone?: string;
+  /**
+   * THE VERIFIED, LOGIN-USABLE NUMBER. Unique across all consumers.
+   *
+   * Written in exactly one place — the OTP verify route, after MSG91
+   * confirms the code — and absent until then. Bare ten digits, the same
+   * shape `phone` holds, so a lookup never has to guess a format.
+   */
+  verifiedPhone?: string;
   /**
    * OPTIONAL, as of Google sign-in. Absent for every consumer whose
    * account was created by an identity provider rather than by choosing a
@@ -215,6 +231,39 @@ const ConsumerSchema = new Schema<ConsumerDocument>(
     // uniqueness guarantee on the other side to mirror. Optional because a
     // consumer can sign up with email alone.
     phone: { type: String, trim: true, index: true },
+    /* ── THE UNIQUE, VERIFIED LOGIN KEY ────────────────────────────────
+     * SEPARATE FROM `phone` ABOVE, AND THE SEPARATION IS THE WHOLE POINT.
+     *
+     * `phone` is what somebody typed into a signup form. This is a number
+     * MSG91 has confirmed they can receive an SMS at. Those are different
+     * facts with different trust levels, and collapsing them into one
+     * unique field creates a specific, nasty failure:
+     *
+     *   A types 98765-43210 at signup — a typo, or somebody else's number,
+     *   never verified. It takes the unique slot. B, who actually HOLDS
+     *   98765-43210, then tries to verify it and is refused, because a
+     *   stranger's typo is squatting on their real number. The unverified
+     *   claim beats the proven one.
+     *
+     * With two fields that cannot happen: unverified claims live on `phone`,
+     * where duplicates are harmless, and only proven numbers reach this
+     * index. The constraint then means exactly one thing — "one account per
+     * verified number" — which is what an OTP login needs to resolve a
+     * number to a single account.
+     *
+     * ── sparse, NOT merely unique ─────────────────────────────────────
+     * Almost every consumer has no verified number (all 3 in production
+     * today, and every account created by Google or email signup). Without
+     * `sparse` they would all collide on the missing value and the index
+     * could not build at all. Sparse omits documents that lack the field.
+     *
+     * ⚠ THE EMPTY STRING IS NOT A MISSING VALUE. `sparse` skips ABSENT
+     * fields; `""` is present, so two rows storing `""` would collide and
+     * the second write would fail with a duplicate-key error. Every writer
+     * must therefore store a valid ten-digit string or NOTHING AT ALL —
+     * never the empty string normaliseIndiaMobile() returns on rejection.
+     * The writers enforce that; this note is why they bother. */
+    verifiedPhone: { type: String, trim: true, unique: true, sparse: true },
     // select:false so an incidental .find() can never return it; the login
     // path re-selects it explicitly.
     //

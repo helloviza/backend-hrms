@@ -24,6 +24,7 @@ import { OAuth2Client } from "google-auth-library";
 import Consumer from "../models/Consumer.js";
 import User from "../models/User.js";
 import { requireConsumer } from "../middleware/requireConsumer.js";
+import { normaliseIndiaMobile } from "../services/consumerMobileOtp.js";
 import {
   signConsumerAccessToken,
   signConsumerRefreshToken,
@@ -361,7 +362,18 @@ router.post("/signup", async (req: any, res: any) => {
     const email = normalizeEmail(req.body?.email);
     const name = String(req.body?.name ?? "").trim();
     const password = String(req.body?.password ?? "");
-    const phone = String(req.body?.phone ?? "").trim() || undefined;
+    /* NORMALISED, NOT STORED AS TYPED. `phone` is the unverified signup
+     * hint (models/Consumer.ts), and it is kept in ONE shape — bare ten
+     * digits — so that it and the verified login key are directly
+     * comparable and neither reader has to guess a format.
+     *
+     * `|| undefined` is load-bearing, not tidiness: normaliseIndiaMobile
+     * returns "" for anything it cannot make an Indian ten-digit number of,
+     * and "" must never reach the database. It is a PRESENT value, so it
+     * would sit in a sparse index rather than being skipped by it — see the
+     * empty-string warning on verifiedPhone. undefined makes the field
+     * absent, which is the honest record of "no usable number given". */
+    const phone = normaliseIndiaMobile(req.body?.phone) || undefined;
 
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: "A valid email is required" });
@@ -409,7 +421,10 @@ router.post("/signup", async (req: any, res: any) => {
     const consumer = await Consumer.create({
       email,
       name,
-      phone,
+      /* Spread, so an unusable number writes NO KEY rather than an
+       * explicit undefined — the same shape the two conditional fields
+       * below use, and the reason `phone: ""` cannot exist. */
+      ...(phone ? { phone } : {}),
       passwordHash,
       ...(marketingConsent ? { marketingConsent } : {}),
       ...(registrationLocation ? { registrationLocation } : {}),
