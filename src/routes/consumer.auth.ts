@@ -47,7 +47,13 @@ import { upsertCurrentLocation } from "../models/ActorLocation.js";
 const router = Router();
 
 const isProd = process.env.NODE_ENV === "production";
-const BCRYPT_COST = 12; // same as routes/signup.ts
+/* EXPORTED for routes/public.visa.ts, the public enquiry door, which hashes
+ * a password on the same signup sequence this file owns. A second door
+ * hard-coding its own cost is how one of them silently ends up cheaper than
+ * the other — the same reason normalizeEmail and b2bAccountExists below are
+ * exported rather than copied. */
+export const CONSUMER_BCRYPT_COST = 12; // same as routes/signup.ts
+const BCRYPT_COST = CONSUMER_BCRYPT_COST;
 
 /* EXPORTED for routes/consumer.mobileAuth.ts. The OTP signup door has to
  * key on the same normalised address this one does, or the two doors could

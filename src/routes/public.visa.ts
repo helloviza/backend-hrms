@@ -58,8 +58,46 @@ import { normaliseToIso2 } from "../utils/countryCodes.js";
 import { customerPurposesForRules } from "../utils/visaPurposes.js";
 import { createTurnstileGate } from "../middleware/turnstile.js";
 import { travelRequestLimiter } from "../middleware/rateLimit.js";
-import { createIntakeBookings } from "../services/travelIntake.create.js";
 import logger from "../utils/logger.js";
+
+/* ── THE ENQUIRY DOOR'S DEPENDENCIES ──────────────────────────────────
+ * POST /visa/lead used to import one service (travelIntake.create) and
+ * write a ManualBooking. It now composes the two paths that already exist
+ * for this exact work — the consumer signup sequence and the consumer
+ * support case — so what it imports is the seam list, not new machinery.
+ *
+ * The consumer.auth.js import is a ROUTE MODULE importing another route
+ * module's exported helpers, which is unusual enough to justify. Those
+ * helpers were extracted and exported for precisely this reason during the
+ * mobile-OTP work (routes/consumer.mobileAuth.ts is the first consumer of
+ * them, and issueConsumerSession's own comment says why the session wall is
+ * shared rather than reimplemented). The alternative — a second copy of the
+ * signup sequence living here — is how two doors into one identity start
+ * writing two different shapes of account.
+ *
+ * No cycle: consumer.auth.ts imports models, middleware and services, and
+ * nothing under routes/. */
+import bcrypt from "bcryptjs";
+import Consumer from "../models/Consumer.js";
+import Ticket from "../models/Ticket.js";
+import { normaliseIndiaMobile } from "../services/consumerMobileOtp.js";
+import {
+  B2B_MARKER,
+  B2B_MESSAGE,
+  CONSUMER_BCRYPT_COST,
+  b2bAccountExists,
+  buildSignupConsent,
+  issueConsumerSession,
+  normalizeEmail,
+  publicConsumer,
+  resolveRegistrationLocation,
+  stampConsumerActorLocation,
+} from "./consumer.auth.js";
+import {
+  createConsumerSupportCase,
+  isAllowedSubject,
+  type ConsumerSupportSubject,
+} from "../services/consumerSupport.js";
 
 const router = Router();
 const publicVisaLogger = logger.child({ module: "publicVisa" });
@@ -717,24 +755,92 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
- * POST /visa/lead — Milestone A's monetization hook.
+ * POST /visa/lead — the PUBLIC ENQUIRY DOOR.
  *
- * A HUMAN-CLOSED SALE, not a self-serve application: this creates NO
- * VisaRequest, NO VisaApplication and NO consumer identity. It produces the
- * same ₹0 HOUSE-tenant ManualBooking row the public travel-request form
- * produces, in the same register ops already watches — reusing
- * services/travelIntake.create.ts rather than inventing a second notification
- * path.
+ * ── WHAT THIS USED TO BE, AND WHY IT CHANGED ─────────────────────────
+ * Until now this route created a ₹0 HOUSE-tenant ManualBooking and nothing
+ * else: no account, no ticket, no way for the enquirer to ever see their own
+ * enquiry again. The caption under the button promised "a specialist replies
+ * within one business day" and the only thing backing that promise was
+ * somebody remembering to watch the unassigned manual-bookings queue — there
+ * was no notification, no SLA and no thread.
  *
- * Guards, in the same order routes/public.travelRequest.ts established:
+ * It now creates a CONSUMER ACCOUNT and a SUPPORT TICKET instead. The ticket
+ * lands in the same /admin/tickets queue an emailed B2B case does, with a
+ * real PT ref and a 30-minute first-response SLA, and it lands on the
+ * enquirer's own /account/support at the same time. The promise is the same
+ * sentence; the difference is that something now carries it.
+ *
+ * NO ManualBooking is written any more. That is a REPLACEMENT, not an
+ * addition, and deliberately so: two rows for one enquiry means two ops
+ * queues, and the second one is the one nobody watches. (Verified before
+ * cutover: zero HELLOVIZA_VISA_LEAD rows exist in production, so nothing is
+ * orphaned by the switch.)
+ *
+ * ── WHAT IT COMPOSES, AND WHAT IS NEW ────────────────────────────────
+ * Almost nothing here is new. It is the existing signup sequence from
+ * routes/consumer.auth.ts's POST /signup followed by the existing
+ * services/consumerSupport.ts case creation. The genuinely net-new part is
+ * that both are reachable WITHOUT a session — every other door into either
+ * sits behind requireConsumer.
+ *
+ * That is also why the guard chain matters more than it did: this is now an
+ * ACCOUNT-CREATION endpoint on a public surface. The chain is unchanged and
+ * runs in the same order routes/public.travelRequest.ts established:
+ *
  *   1. honeypot   — fake-success, so a bot learns nothing
  *   2. rate limit — travelRequestLimiter, REUSED (15 min / 8 per IP)
  *   3. Turnstile  — the shared fail-closed gate (middleware/turnstile.ts)
  *   4. validation
+ *
+ * ── THE THREE-WAY FORK ───────────────────────────────────────────────
+ * An email address is one of exactly three things, and the order is the
+ * order routes/consumer.auth.ts already established — CONSUMERS FIRST, so an
+ * address we already know as a consumer never reaches the B2B lookup and
+ * this endpoint reveals nothing about B2B for it:
+ *
+ *   1. a KNOWN CONSUMER   file the case against that account, issue NO
+ *                         session, answer "existing_account". We cannot log
+ *                         someone in from an email address alone, and doing
+ *                         it would be an account takeover with extra steps.
+ *   2. a KNOWN B2B USER   the existing B2B_MARKER fork, 409. No account and
+ *                         no ticket: createConsumerSupportCase needs a
+ *                         consumerId and there is none to give it.
+ *   3. NEW                create the consumer exactly as /signup does, file
+ *                         the case, issue the session, answer "created".
+ *
+ * ── ORDERING, AND WHAT A FAILURE LEAVES BEHIND ───────────────────────
+ * Account, THEN ticket, THEN session. There is no transaction and none is
+ * wanted, because the two failure modes are not symmetrical:
+ *
+ *   account fails  -> nothing exists. Clean.
+ *   ticket fails   -> the account exists and the caller gets a 500. That is
+ *                     RECOVERABLE by design: they own an account they can
+ *                     sign into and raise a case from /account/support with,
+ *                     which is strictly better than rolling back an identity
+ *                     they may already have a session cookie for.
+ *
+ * The session is issued LAST so a 500 never hands out a cookie for a
+ * half-finished signup.
  * ───────────────────────────────────────────────────────────────────── */
 
-const LEAD_INTAKE_REF_PREFIX = "hvlead";
-const LEAD_CHANNEL = "HELLOVIZA_VISA_LEAD";
+const ENQUIRY_REF_PREFIX = "hvenq";
+/**
+ * MUST be a member of CONSUMER_SUPPORT_SUBJECTS — the server-side allowlist
+ * in services/consumerSupport.ts is the authority on what a consumer case
+ * may be about, and this door does not get to widen it. Verified against
+ * that array at module load below rather than trusted from this comment.
+ */
+const ENQUIRY_SUBJECT: ConsumerSupportSubject = "Visa application help";
+
+/* A typo here would be a runtime 500 on every enquiry, discovered by a
+ * customer. isAllowedSubject is the same predicate the consumer router
+ * applies to a submitted subject, so the two can never disagree. */
+if (!isAllowedSubject(ENQUIRY_SUBJECT)) {
+  throw new Error(
+    `public.visa: enquiry subject "${ENQUIRY_SUBJECT}" is not in CONSUMER_SUPPORT_SUBJECTS`,
+  );
+}
 
 function isUuidV4(v: unknown): boolean {
   return (
@@ -747,28 +853,44 @@ function honeypotGate(req: any, res: any, next: any) {
   const trap = req.body?.hpField;
   if (typeof trap === "string" && trap.trim().length > 0) {
     const submissionId = String(req.body?.submissionId ?? "").trim();
-    publicVisaLogger.warn("visa-lead — honeypot triggered, discarding silently", {
+    publicVisaLogger.warn("visa-enquiry — honeypot triggered, discarding silently", {
       ip: req.ip,
       hasSubmissionId: Boolean(submissionId),
     });
-    // Fake success, byte-identical to the real 201 — a hard reject would
-    // teach a scripted bot which field to leave blank.
-    return res.status(201).json({ ok: true, reference: submissionId || undefined });
+    /* Fake success. It answers with the EXISTING-ACCOUNT outcome rather than
+     * the created one, because that is the branch with no side effects to
+     * imitate: the frontend shows a "sign in to see it" note and navigates
+     * nowhere, so a bot gets a plausible 201 and no session, no account and
+     * no ticket. A hard reject would teach a scripted bot which field to
+     * leave blank. */
+    return res.status(201).json({
+      ok: true,
+      outcome: "existing_account",
+      email: normalizeEmail(req.body?.email) || undefined,
+      reference: submissionId || undefined,
+    });
   }
   next();
 }
 
-function validateLead(p: any): string[] {
+function validateEnquiry(p: any): string[] {
   const errors: string[] = [];
 
   if (!String(p?.name ?? "").trim()) errors.push("Name is required");
 
-  const email = String(p?.email ?? "").trim();
-  const phone = String(p?.phone ?? "").trim();
-  // At least one reachable channel — a lead nobody can contact cannot be
-  // qualified, the same rule public.travelRequest.ts applies.
-  if (!email && !phone) errors.push("An email address or phone number is required");
-  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.push("Email address is not valid");
+  /* EMAIL IS NOW REQUIRED, where the lead form accepted email-OR-phone. It
+   * is the account key: there is no way to create a consumer, or to file a
+   * repliable ticket, without one. Phone survives as the optional hint the
+   * signup form also collects. */
+  const email = normalizeEmail(p?.email);
+  if (!email) errors.push("An email address is required");
+  else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.push("Email address is not valid");
+
+  // The SAME floor routes/consumer.auth.ts's /signup applies. A second,
+  // looser rule on a second door is how a weak password gets in.
+  const password = String(p?.password ?? "");
+  if (!password) errors.push("A password is required");
+  else if (password.length < 8) errors.push("Password must be at least 8 characters");
 
   // resolvePublicIso2, NOT normaliseToIso2 — the map draws all 196 seed
   // countries, so the enquiry form must accept every pin it draws. Bare
@@ -781,61 +903,187 @@ function validateLead(p: any): string[] {
   return errors;
 }
 
+/**
+ * The case body an agent opens.
+ *
+ * Built here rather than in the service because the service is channel-blind
+ * — it takes a message and files it. The destination and the travel date are
+ * this door's vocabulary, and an agent reading the thread needs them in the
+ * first line rather than in a field they have to go looking for.
+ */
+function buildEnquiryMessage(args: {
+  iso2: string;
+  countryName: string;
+  travelDate?: string | null;
+  phone?: string;
+  message?: string;
+}): string {
+  const lines = [`Country enquiry: ${args.countryName} (${args.iso2})`];
+  lines.push(
+    args.travelDate ? `Intended travel date: ${args.travelDate}` : "No travel date supplied",
+  );
+  // The number rides in the body for the same reason the callback subject's
+  // does — see createConsumerSupportCase. It is also on the Consumer row as
+  // the unverified signup hint, but an agent should not have to look there.
+  if (args.phone) lines.push(`Phone: ${args.phone}`);
+  if (args.message) {
+    lines.push("");
+    lines.push(args.message);
+  }
+  return lines.join("\n");
+}
+
 router.post(
   "/visa/lead",
   honeypotGate,
   travelRequestLimiter,
-  createTurnstileGate("visa-lead"),
+  createTurnstileGate("visa-enquiry"),
   async (req: any, res: any) => {
     try {
       const body = req.body ?? {};
-      const errors = validateLead(body);
+      const errors = validateEnquiry(body);
       if (errors.length) {
         return res.status(400).json({ error: errors.join("; "), details: errors });
       }
 
-      // Same resolver as validateLead above — re-resolving through a
-      // different function is how the two answers start to disagree.
       const iso2 = resolvePublicIso2(body.iso2)!;
+      const countryName = findSeedCountry(iso2)?.countryName || iso2;
+      const email = normalizeEmail(body.email);
+      const name = String(body.name).trim();
+      const password = String(body.password);
       const submissionId = String(body.submissionId).trim();
-      // Its own namespace — a visa lead can never false-dedupe against the
-      // travel form's "public:" or the dormant HMAC endpoint's "gform:".
-      const intakeRef = `${LEAD_INTAKE_REF_PREFIX}:${submissionId}`;
+      /* Its own namespace, the same discipline the ManualBooking intakeRef
+       * used: an enquiry can never false-dedupe against the travel form's
+       * "public:" or the dormant HMAC endpoint's "gform:". */
+      const enquiryRef = `${ENQUIRY_REF_PREFIX}:${submissionId}`;
 
+      /* NORMALISED, NOT STORED AS TYPED — and `|| undefined` is load-bearing.
+       * Verbatim from /signup, including the reason: normaliseIndiaMobile
+       * returns "" for anything it cannot make an Indian ten-digit number of,
+       * and "" is a PRESENT value that would sit in a sparse index rather
+       * than being skipped by it. */
+      const phone = normaliseIndiaMobile(body.phone) || undefined;
+      const travelDate = String(body.travelDate ?? "").trim() || null;
       const message = String(body.message ?? "").trim();
-      const travelDate = body.travelDate ?? null;
 
-      const noteParts = [`Helloviza visa lead — destination ${iso2}`];
-      if (!travelDate) {
-        // So ops never reads the placeholder travelDate (today) as a stated
-        // intention. See travelIntake.create.ts's own fallback comment.
-        noteParts.push("No travel date supplied");
+      /* ── IDEMPOTENCY, BEFORE ANYTHING IS CREATED ───────────────────────
+       * The submissionId is minted once per page load and re-sent on retry,
+       * so a caller who resubmits after a transport failure must not file a
+       * second case. Answered with the existing-account outcome, which is
+       * both true by then (an account exists for this address) and the
+       * branch with no side effects. */
+      const priorCase = await Ticket.findOne({ "extractedFields.enquiryRef": enquiryRef })
+        .select("_id ticketRef")
+        .lean();
+      if (priorCase) {
+        publicVisaLogger.info("visa-enquiry — duplicate submission, returning prior case", {
+          iso2,
+          ticketRef: (priorCase as any).ticketRef,
+        });
+        return res.status(200).json({
+          ok: true,
+          outcome: "existing_account",
+          email,
+          ticketRef: (priorCase as any).ticketRef,
+          reference: submissionId,
+        });
       }
-      if (message) noteParts.push(message);
 
-      const result = await createIntakeBookings({
-        intakeRef,
-        fullName: String(body.name).trim(),
-        email: String(body.email ?? "").trim() || undefined,
-        mobile: String(body.phone ?? "").trim() || undefined,
-        destination: iso2,
-        travelDate,
-        notes: noteParts.join(" | "),
-        services: ["Visa"], // -> ManualBooking.type "VISA", at zero price
-        channel: LEAD_CHANNEL,
-        submittedAt: new Date().toISOString(),
+      /* ── FORK 1 — A CONSUMER WE ALREADY KNOW ───────────────────────────
+       * File the case against the account they already have, and send them
+       * to sign in. No session is issued and no password is checked, so the
+       * `password` they typed is DISCARDED here — it is not a login
+       * attempt, and treating it as one would turn this public endpoint
+       * into an unrated password oracle.
+       *
+       * Consumers first, so this address never reaches the B2B lookup. */
+      const existing = await Consumer.findOne({ email }).select("_id").lean();
+      if (existing) {
+        const { ticket } = await createConsumerSupportCase({
+          consumerId: String((existing as any)._id),
+          subject: ENQUIRY_SUBJECT,
+          message: buildEnquiryMessage({ iso2, countryName, travelDate, phone, message }),
+          enquiryRef,
+        });
+
+        publicVisaLogger.info("visa-enquiry — filed against existing consumer", {
+          iso2,
+          ticketRef: ticket.ticketRef,
+        });
+
+        return res.status(201).json({
+          ok: true,
+          outcome: "existing_account",
+          email,
+          ticketRef: ticket.ticketRef,
+          reference: submissionId,
+        });
+      }
+
+      /* ── FORK 2 — THE ADDRESS IS A B2B ACCOUNT ─────────────────────────
+       * The same fork /signup and /login apply, with the same fixed marker
+       * and the same fixed sentence. Nothing is created: there is no
+       * consumerId to hang a ticket on, and silently minting a second
+       * identity for someone who already has a corporate one is exactly the
+       * outcome that fork exists to prevent. */
+      if (await b2bAccountExists(email)) {
+        return res.status(409).json({ error: B2B_MESSAGE, code: B2B_MARKER });
+      }
+
+      /* ── FORK 3 — A NEW ACCOUNT ────────────────────────────────────────
+       * Byte-for-byte the /signup creation sequence. Deliberately NOT
+       * factored into a shared helper in this pass: /signup is a live,
+       * tested path and the right time to extract a common creator is when
+       * a third door needs one, not while the second is still in review. */
+      const passwordHash = await bcrypt.hash(password, CONSUMER_BCRYPT_COST);
+      const marketingConsent = buildSignupConsent(body);
+      /* Awaited, but BOUNDED and non-throwing — worst case it costs this
+       * request 1500ms and returns undefined, which writes no field at all.
+       * It cannot fail the enquiry. */
+      const registrationLocation = await resolveRegistrationLocation(req);
+
+      const consumer = await Consumer.create({
+        email,
+        name,
+        ...(phone ? { phone } : {}),
+        passwordHash,
+        ...(marketingConsent ? { marketingConsent } : {}),
+        ...(registrationLocation ? { registrationLocation } : {}),
       });
 
-      publicVisaLogger.info("visa-lead — submission processed", {
+      // Side record, deliberately not awaited into the response path.
+      void stampConsumerActorLocation(String((consumer as any)._id), req?.ip, registrationLocation);
+
+      /* THEN the ticket. If this throws, the account survives and the caller
+       * gets a 500 — see the ordering note in this route's header. */
+      const { ticket } = await createConsumerSupportCase({
+        consumerId: String((consumer as any)._id),
+        subject: ENQUIRY_SUBJECT,
+        message: buildEnquiryMessage({ iso2, countryName, travelDate, phone, message }),
+        enquiryRef,
+      });
+
+      // LAST, so a failure above never hands out a cookie for a half-made
+      // signup. Same signer, same cookie flags, same tokenVersion as every
+      // other consumer door — see issueConsumerSession's own note on why the
+      // wall is shared rather than reimplemented.
+      const { accessToken } = issueConsumerSession(res, consumer as any);
+
+      publicVisaLogger.info("visa-enquiry — account created and case filed", {
         iso2,
-        deduped: result.deduped,
-        count: result.count,
+        ticketRef: ticket.ticketRef,
       });
 
-      // Never returns a Mongo id — only the caller's own reference.
-      return res.status(201).json({ ok: true, reference: submissionId });
+      return res.status(201).json({
+        ok: true,
+        outcome: "created",
+        consumer: publicConsumer(consumer),
+        accessToken,
+        ticketRef: ticket.ticketRef,
+        reference: submissionId,
+      });
     } catch (err: any) {
-      publicVisaLogger.error("visa-lead — processing failed", { error: err?.message });
+      publicVisaLogger.error("visa-enquiry — processing failed", { error: err?.message });
       return res
         .status(500)
         .json({ error: "We couldn't submit your enquiry. Please try again shortly." });

@@ -108,6 +108,30 @@ export interface CreateConsumerSupportCaseInput {
   message: string;
   /** Only meaningful for the callback subject; folded into the body. */
   callbackPhone?: string | null;
+  /**
+   * An IDEMPOTENCY KEY owned by the caller, landing on
+   * `extractedFields.enquiryRef`.
+   *
+   * Optional and defaulted-absent, so both pre-existing callers
+   * (routes/consumer.support.ts's two POSTs) write exactly the document they
+   * always did — the same additive shape `channel` uses in
+   * services/travelIntake.create.ts, and for the same reason.
+   *
+   * It exists for the PUBLIC enquiry door (routes/public.visa.ts), which is
+   * reachable by an anonymous caller who can retry: that route looks a case
+   * up by this ref BEFORE creating anything, so a resubmitted enquiry files
+   * one ticket rather than one per attempt. The ManualBooking path it
+   * replaced deduped on `metadata.intakeRef` and this preserves the
+   * property.
+   *
+   * ── WHY extractedFields AND NOT tags ─────────────────────────────────
+   * `tags` is an ops FILING VOCABULARY that the console renders and lets
+   * agents filter on; a submission UUID in there is visible clutter with no
+   * meaning to a human. extractedFields is already the model's bag for
+   * machine-written per-ticket data, and consumer.support.ts's projection
+   * allowlist never sends it to a consumer.
+   */
+  enquiryRef?: string | null;
 }
 
 export interface CreateConsumerSupportCaseResult {
@@ -156,6 +180,8 @@ export async function createConsumerSupportCase(
   const tags = [CONSUMER_SUPPORT_TAG];
   if (input.subject === CALLBACK_SUBJECT) tags.push(CALLBACK_TAG);
 
+  const enquiryRef = input.enquiryRef?.trim() || "";
+
   // .create() — the ticketRef pre-save hook depends on it.
   const ticket = await Ticket.create({
     subject: input.subject,
@@ -167,6 +193,10 @@ export async function createConsumerSupportCase(
     // no Customer. leadId is left absent for the same reason — TicketLead
     // is the B2B lead-resolution artefact and a consumer is not a lead.
     tags,
+    // Spread, so a caller that passes nothing writes NO extractedFields key
+    // at all rather than an empty object — the same rule the Consumer
+    // signup path applies to its own optional blocks.
+    ...(enquiryRef ? { extractedFields: { enquiryRef } } : {}),
   });
 
   // The phone rides in the body rather than in a new column, so an agent

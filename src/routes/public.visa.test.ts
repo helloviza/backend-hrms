@@ -21,7 +21,21 @@ process.env.NODE_ENV = "test";
 
 const { default: VisaRule } = await import("../models/VisaRule.js");
 const { default: VisaDestinationContent } = await import("../models/VisaDestinationContent.js");
+/* ManualBooking is still imported, and now for the OPPOSITE reason: the
+ * enquiry door used to write one and must never write one again. Every
+ * assertion on it below is a zero. */
 const { default: ManualBooking } = await import("../models/ManualBooking.js");
+/* The identity and support models the enquiry door creates. Real models on
+ * the in-memory server, never fixtures — the point of these tests is what is
+ * actually persisted, and a literal object would prove nothing about a
+ * schema default (authProvider, tokenVersion, status) or a pre-save hook
+ * (ticketRef). */
+const { default: Consumer } = await import("../models/Consumer.js");
+const { default: User } = await import("../models/User.js");
+const { default: Ticket } = await import("../models/Ticket.js");
+const { default: TicketMessage } = await import("../models/TicketMessage.js");
+const { CONSUMER_SUPPORT_SUBJECTS } = await import("../services/consumerSupport.js");
+const { default: bcrypt } = await import("bcryptjs");
 const { default: publicVisaRouter } = await import("./public.visa.js");
 const { travelRequestLimiter } = await import("../middleware/rateLimit.js");
 const { listSeedCountries } = await import("../config/visaCountrySeed.js");
@@ -79,6 +93,15 @@ beforeEach(async () => {
     VisaRule.deleteMany({}),
     VisaDestinationContent.deleteMany({}),
     ManualBooking.deleteMany({}),
+    /* The enquiry door's own collections. Without these, "creates exactly
+     * one account" would pass or fail depending on which test ran before
+     * it — and the whole suite leans on absolute counts rather than deltas,
+     * because a delta cannot tell a duplicate account apart from a
+     * carried-over one. */
+    Consumer.deleteMany({}),
+    User.deleteMany({}),
+    Ticket.deleteMany({}),
+    TicketMessage.deleteMany({}),
   ]);
   delete process.env.TURNSTILE_SECRET;
   delete process.env.TURNSTILE_DEV_BYPASS;
@@ -1147,12 +1170,25 @@ describe("variants[] — the corridor's visa types", () => {
 });
 
 /* ═════════════════════════════════════════════════════════════════════
- * POST /visa/lead
+ * POST /visa/lead — THE PUBLIC ENQUIRY DOOR
+ *
+ * The route kept its path and changed its whole job: it used to write a ₹0
+ * HOUSE ManualBooking and nothing else, and it now creates a CONSUMER
+ * ACCOUNT plus a SUPPORT TICKET and writes no booking at all.
+ *
+ * So the assertions below come in two halves. The ones that survived
+ * unchanged are the GUARDS and the iso2 resolution — the honeypot, the
+ * fail-closed Turnstile, the rate limiter, the seed-first M1 cases — because
+ * none of that was what changed. The ones that are new are about identity:
+ * which of the three forks an address takes, what exactly gets created on
+ * each, and the negative that pays for the whole change, which is that NO
+ * ManualBooking is written on any path any more.
  * ═══════════════════════════════════════════════════════════════════ */
-describe("POST /visa/lead", () => {
-  const LEAD = {
+describe("POST /visa/lead — the public enquiry door", () => {
+  const ENQUIRY = {
     name: "Asha Menon",
     email: "asha@example.com",
+    password: "correct-horse-battery",
     phone: "+919876543210",
     iso2: "TH",
     message: "Need a tourist visa for December.",
@@ -1164,237 +1200,470 @@ describe("POST /visa/lead", () => {
     process.env.NODE_ENV = "test"; // not production, so the bypass is permitted
   }
 
+  const post = (patch: Record<string, any> = {}) =>
+    request(app()).post("/api/public/visa/lead").send({ ...ENQUIRY, ...patch });
+
+  /** Did this response hand out a consumer session? */
+  const hasSession = (res: any) =>
+    (res.headers["set-cookie"] ?? []).some((c: string) => c.startsWith("hv_consumerAccess="));
+
+  /* ── THE GUARDS, UNCHANGED BY THE REWRITE ────────────────────────────
+   * These matter MORE than they did, not less: the endpoint they protect
+   * creates accounts now. Kept verbatim from the lead suite so a
+   * regression in the chain reads as a regression, not as a rewritten
+   * expectation. */
+
   it("REQUIRES Turnstile — fail-closed when the secret is unset", async () => {
     // No secret, no bypass.
-    const res = await request(app()).post("/api/public/visa/lead").send(LEAD);
+    delete process.env.TURNSTILE_DEV_BYPASS;
+    delete process.env.TURNSTILE_SECRET;
+    const res = await post();
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/Verification unavailable/);
-    expect(await ManualBooking.countDocuments({})).toBe(0);
+    expect(await Consumer.countDocuments({})).toBe(0);
+    expect(await Ticket.countDocuments({})).toBe(0);
   });
 
   it("rejects a missing Turnstile token when a secret IS configured", async () => {
+    delete process.env.TURNSTILE_DEV_BYPASS;
     process.env.TURNSTILE_SECRET = "test-secret";
-    const res = await request(app()).post("/api/public/visa/lead").send(LEAD);
+    const res = await post();
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/Verification required/);
-  });
-
-  it("creates the concierge-funnel row on a valid submission", async () => {
-    withBypass();
-    const res = await request(app()).post("/api/public/visa/lead").send(LEAD);
-
-    expect(res.status).toBe(201);
-    expect(res.body).toEqual({ ok: true, reference: LEAD.submissionId });
-
-    const booking: any = await ManualBooking.findOne({}).lean();
-    expect(booking).toBeTruthy();
-    // The SAME fan-out the travel-request form uses: HOUSE tenant, VISA type,
-    // zero price, namespaced intakeRef.
-    expect(booking.type).toBe("VISA");
-    expect(booking.metadata.intakeRef).toBe(`hvlead:${LEAD.submissionId}`);
-    expect(booking.metadata.channel).toBe("HELLOVIZA_VISA_LEAD");
-    expect(booking.pricing.quotedPrice).toBe(0);
-    expect(booking.passengers[0].name).toBe("Asha Menon");
-    expect(booking.passengers[0].email).toBe("asha@example.com");
-    expect(booking.notes).toContain("Helloviza visa lead");
-    expect(booking.notes).toContain(LEAD.message);
-  });
-
-  it("DEDUPS on a resubmitted submissionId", async () => {
-    withBypass();
-    await request(app()).post("/api/public/visa/lead").send(LEAD);
-    await request(app()).post("/api/public/visa/lead").send(LEAD);
-
-    expect(await ManualBooking.countDocuments({})).toBe(1);
-  });
-
-  it("does not false-dedupe against the travel form's namespace", async () => {
-    withBypass();
-    const { createIntakeBookings } = await import("../services/travelIntake.create.js");
-    // A travel-form row with the SAME uuid but the other namespace.
-    await createIntakeBookings({
-      intakeRef: `public:${LEAD.submissionId}`,
-      fullName: "Someone Else",
-      travelDate: "2026-12-01",
-      services: ["Visa"],
-    });
-
-    await request(app()).post("/api/public/visa/lead").send(LEAD);
-
-    // Two distinct rows — the namespaces kept them apart.
-    expect(await ManualBooking.countDocuments({})).toBe(2);
-  });
-
-  it("records that no travel date was supplied", async () => {
-    withBypass();
-    await request(app()).post("/api/public/visa/lead").send(LEAD);
-    const booking: any = await ManualBooking.findOne({}).lean();
-    expect(booking.notes).toContain("No travel date supplied");
-    // The placeholder is still a real date, so the required field is satisfied.
-    expect(booking.travelDate).toBeInstanceOf(Date);
-  });
-
-  it("validates name, contact and destination", async () => {
-    withBypass();
-    const bad = async (patch: Record<string, any>) =>
-      (await request(app()).post("/api/public/visa/lead").send({ ...LEAD, ...patch })).status;
-
-    expect(await bad({ name: "  " })).toBe(400);
-    expect(await bad({ email: "", phone: "" })).toBe(400);
-    expect(await bad({ email: "not-an-email", phone: "" })).toBe(400);
-    expect(await bad({ iso2: "ZZZZ" })).toBe(400);
-    expect(await bad({ submissionId: "not-a-uuid" })).toBe(400);
-    expect(await ManualBooking.countDocuments({})).toBe(0);
-  });
-
-  it("accepts phone-only and email-only leads", async () => {
-    withBypass();
-    const a = await request(app())
-      .post("/api/public/visa/lead")
-      .send({ ...LEAD, email: "" });
-    const b = await request(app())
-      .post("/api/public/visa/lead")
-      .send({ ...LEAD, phone: "", submissionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3302" });
-    expect(a.status).toBe(201);
-    expect(b.status).toBe(201);
-  });
-
-  it("swallows a honeypot hit with a fake 201 and writes nothing", async () => {
-    withBypass();
-    const res = await request(app())
-      .post("/api/public/visa/lead")
-      .send({ ...LEAD, hpField: "i am a bot" });
-
-    expect(res.status).toBe(201);
-    expect(res.body.ok).toBe(true);
-    expect(await ManualBooking.countDocuments({})).toBe(0);
-  });
-
-  it("creates NO visa case and NO consumer identity — this is a lead, not an application", async () => {
-    withBypass();
-    await request(app()).post("/api/public/visa/lead").send(LEAD);
-
-    const { default: VisaRequest } = await import("../models/VisaRequest.js");
-    const { default: VisaApplication } = await import("../models/VisaApplication.js");
-    const { default: Consumer } = await import("../models/Consumer.js");
-
-    expect(await VisaRequest.countDocuments({})).toBe(0);
-    expect(await VisaApplication.countDocuments({})).toBe(0);
     expect(await Consumer.countDocuments({})).toBe(0);
   });
 
-  it("never returns a Mongo id", async () => {
+  it("swallows a honeypot hit with a fake 201 that creates NOTHING", async () => {
     withBypass();
-    const res = await request(app()).post("/api/public/visa/lead").send(LEAD);
+    const res = await post({ hpField: "i am a bot" });
+
     expect(res.status).toBe(201);
-    const booking: any = await ManualBooking.findOne({}).lean();
-    expect(booking).toBeTruthy();
-    expect(JSON.stringify(res.body)).not.toContain(String(booking._id));
+    expect(res.body.ok).toBe(true);
+    // The no-side-effect outcome, so a bot gets a plausible answer and the
+    // frontend it is imitating would navigate nowhere.
+    expect(res.body.outcome).toBe("existing_account");
+    expect(hasSession(res)).toBe(false);
+    expect(await Consumer.countDocuments({})).toBe(0);
+    expect(await Ticket.countDocuments({})).toBe(0);
+    expect(await ManualBooking.countDocuments({})).toBe(0);
+  });
+
+  /* ── FORK 3 — A NEW ADDRESS ──────────────────────────────────────── */
+
+  it("NEW EMAIL: creates the account, files the case, and issues the session", async () => {
+    withBypass();
+    const res = await post();
+
+    expect(res.status).toBe(201);
+    expect(res.body.outcome).toBe("created");
+    expect(res.body.reference).toBe(ENQUIRY.submissionId);
+    expect(hasSession(res)).toBe(true);
+
+    const consumer: any = await Consumer.findOne({}).lean();
+    expect(consumer).toBeTruthy();
+    expect(consumer.email).toBe("asha@example.com");
+    expect(consumer.name).toBe("Asha Menon");
+
+    const ticket: any = await Ticket.findOne({}).lean();
+    expect(ticket).toBeTruthy();
+    expect(String(ticket.consumerId)).toBe(String(consumer._id));
+    expect(ticket.ticketRef).toBeTruthy();
+    // The ref is echoed so the reader can quote it before they can read the
+    // thread — the one branch where they cannot see it any other way.
+    expect(res.body.ticketRef).toBe(ticket.ticketRef);
+  });
+
+  it("NEW EMAIL: the ticket is a consumer WEB case with the allowlisted subject", async () => {
+    withBypass();
+    await post();
+
+    const ticket: any = await Ticket.findOne({}).lean();
+    expect(ticket.subject).toBe("Visa application help");
+    // The subject the enquiry door hard-codes must be one the consumer
+    // router would itself accept — the same allowlist, not a parallel one.
+    expect(CONSUMER_SUPPORT_SUBJECTS).toContain(ticket.subject);
+    expect(ticket.sourceChannel).toBe("WEB");
+    expect(ticket.status).toBe("NEW");
+    expect(ticket.tags).toContain("d2c-support");
+    // A consumer has no employer, so no Customer workspace and no B2B lead.
+    expect(ticket.workspaceId ?? null).toBeNull();
+    expect(ticket.leadId ?? null).toBeNull();
+    // fromEmail is read from the Consumer row, never from the request body.
+    expect(ticket.fromEmail).toBe("asha@example.com");
+  });
+
+  it("NEW EMAIL: the case body carries the corridor, the date and their words", async () => {
+    withBypass();
+    await post({ travelDate: "2026-12-01" });
+
+    const msg: any = await TicketMessage.findOne({}).lean();
+    expect(msg.direction).toBe("INBOUND");
+    // The country NAME, not just the code — an agent should not have to
+    // decode "TH" to know what they are looking at.
+    expect(msg.bodyText).toContain("Country enquiry: Thailand (TH)");
+    expect(msg.bodyText).toContain("Intended travel date: 2026-12-01");
+    expect(msg.bodyText).toContain("Need a tourist visa for December.");
+    // The unverified number rides in the body so an agent has it in the
+    // thread rather than on a record they would have to go and open.
+    expect(msg.bodyText).toContain("9876543210");
+  });
+
+  it("NEW EMAIL: says so plainly when no travel date was given", async () => {
+    withBypass();
+    await post({ travelDate: "" });
+    const msg: any = await TicketMessage.findOne({}).lean();
+    expect(msg.bodyText).toContain("No travel date supplied");
+  });
+
+  it("NEW EMAIL: the account matches one made at the normal signup door", async () => {
+    withBypass();
+    await post();
+
+    // passwordHash is select:false, so it has to be asked for by name.
+    const consumer: any = await Consumer.findOne({}).select("+passwordHash").lean();
+
+    // The default the model documents for every email-created account.
+    expect(consumer.authProvider).toBe("password");
+    expect(consumer.status).toBe("ACTIVE");
+    expect(consumer.tokenVersion).toBe(0);
+    // A real bcrypt hash at the shared cost, never the plaintext.
+    expect(consumer.passwordHash).toMatch(/^\$2[aby]\$12\$/);
+    expect(consumer.passwordHash).not.toContain(ENQUIRY.password);
+    expect(await bcrypt.compare(ENQUIRY.password, consumer.passwordHash)).toBe(true);
+
+    // The phone is the UNVERIFIED signup hint, normalised to bare ten
+    // digits — and it must NOT have become a verified login key. This door
+    // does no OTP, so granting one would be a login credential minted from
+    // an unproven number.
+    expect(consumer.phone).toBe("9876543210");
+    expect(consumer.verifiedPhone).toBeUndefined();
+    expect(consumer.mobileVerified ?? false).toBe(false);
+
+    // No consent was posted, so no consent block is written at all —
+    // "never asked" must stay distinguishable from "said no".
+    expect(consumer.marketingConsent).toBeUndefined();
+    expect(consumer.googleSub).toBeUndefined();
+  });
+
+  it("NEW EMAIL: records marketing consent through the SHARED builder", async () => {
+    withBypass();
+    // The flat body keys buildSignupConsent reads — the same two the signup
+    // form posts. A second door inventing its own consent shape is how one
+    // of them ends up writing a record the registry cannot read.
+    await post({ marketingConsentEmail: true });
+
+    const consumer: any = await Consumer.findOne({}).lean();
+    expect(consumer.marketingConsent?.email?.optedIn).toBe(true);
+    expect(consumer.marketingConsent?.email?.source).toBe("signup");
+    // Only what was ticked. Nothing infers the other channel.
+    expect(consumer.marketingConsent?.whatsapp).toBeUndefined();
+  });
+
+  it("NEW EMAIL: only `true` opts anybody in", async () => {
+    withBypass();
+    // A JSON body is attacker-shaped, and "false" is truthy in JS.
+    await post({ marketingConsentEmail: "false" });
+    const consumer: any = await Consumer.findOne({}).lean();
+    expect(consumer.marketingConsent).toBeUndefined();
+  });
+
+  /* ── FORK 1 — AN ADDRESS WE ALREADY KNOW ─────────────────────────── */
+
+  it("EXISTING EMAIL: files against the existing account, makes no second one, issues NO session", async () => {
+    withBypass();
+    const existing: any = await Consumer.create({
+      email: "asha@example.com",
+      name: "Asha From Before",
+      passwordHash: await bcrypt.hash("her-real-password", 12),
+    });
+
+    const res = await post();
+
+    expect(res.status).toBe(201);
+    expect(res.body.outcome).toBe("existing_account");
+    expect(res.body.email).toBe("asha@example.com");
+
+    // THE WHOLE POINT: no session. We cannot sign somebody in from an email
+    // address alone, and this endpoint never checks the password it was
+    // given, so issuing one here would be an account takeover with extra
+    // steps.
+    expect(hasSession(res)).toBe(false);
+    expect(res.body.accessToken).toBeUndefined();
+
+    // Exactly one account, and it is the one that was already there —
+    // unchanged, including its name.
+    expect(await Consumer.countDocuments({})).toBe(1);
+    const after: any = await Consumer.findById(existing._id).select("+passwordHash").lean();
+    expect(after.name).toBe("Asha From Before");
+    expect(await bcrypt.compare("her-real-password", after.passwordHash)).toBe(true);
+
+    // The case is filed all the same — that is what makes the "sign in to
+    // read it" answer honest.
+    const ticket: any = await Ticket.findOne({}).lean();
+    expect(String(ticket.consumerId)).toBe(String(existing._id));
+    expect(ticket.subject).toBe("Visa application help");
+  });
+
+  it("EXISTING EMAIL: matches on the NORMALISED address, not the typed one", async () => {
+    withBypass();
+    const existing: any = await Consumer.create({ email: "asha@example.com", name: "Asha" });
+
+    // Same address, shouted, with padding. normalizeEmail is the shared
+    // key — a second door that keyed differently would mint a duplicate.
+    const res = await post({ email: "  ASHA@Example.COM  " });
+
+    expect(res.body.outcome).toBe("existing_account");
+    expect(await Consumer.countDocuments({})).toBe(1);
+    const ticket: any = await Ticket.findOne({}).lean();
+    expect(String(ticket.consumerId)).toBe(String(existing._id));
+  });
+
+  /* ── FORK 2 — A BUSINESS ACCOUNT ─────────────────────────────────── */
+
+  it("B2B EMAIL: 409 with the shared marker, and creates NOTHING", async () => {
+    withBypass();
+    await User.create({
+      email: "asha@example.com",
+      name: "Asha At Work",
+      passwordHash: "irrelevant",
+      roles: ["EMPLOYEE"],
+      // required on User — a B2B account always belongs to a tenant, which
+      // is exactly the thing a consumer does not have.
+      workspaceId: new mongoose.Types.ObjectId(),
+    });
+
+    const res = await post();
+
+    expect(res.status).toBe(409);
+    // Switched on the TYPED CODE — the frontend forks on this, not on prose.
+    expect(res.body.code).toBe("B2B_ACCOUNT_EXISTS");
+    expect(res.body.error).toMatch(/business account/i);
+    expect(hasSession(res)).toBe(false);
+
+    // No consumer, and no ticket: there is no consumerId to hang one on.
+    expect(await Consumer.countDocuments({})).toBe(0);
+    expect(await Ticket.countDocuments({})).toBe(0);
+  });
+
+  it("B2B is never consulted for an address that is ALREADY a consumer", async () => {
+    withBypass();
+    // The same address on both sides. Consumers are checked first, so this
+    // must take the consumer fork and reveal nothing about the B2B row.
+    const consumer: any = await Consumer.create({ email: "asha@example.com", name: "Asha" });
+    await User.create({
+      email: "asha@example.com",
+      name: "Asha At Work",
+      passwordHash: "irrelevant",
+      roles: ["EMPLOYEE"],
+      // required on User — a B2B account always belongs to a tenant, which
+      // is exactly the thing a consumer does not have.
+      workspaceId: new mongoose.Types.ObjectId(),
+    });
+
+    const res = await post();
+
+    expect(res.status).toBe(201);
+    expect(res.body.outcome).toBe("existing_account");
+    expect(res.body.code).toBeUndefined();
+    const ticket: any = await Ticket.findOne({}).lean();
+    expect(String(ticket.consumerId)).toBe(String(consumer._id));
+  });
+
+  /* ── VALIDATION ──────────────────────────────────────────────────── */
+
+  it("requires name, email, a >=8 password, a real destination and a v4 submissionId", async () => {
+    withBypass();
+    const status = async (patch: Record<string, any>) => (await post(patch)).status;
+
+    expect(await status({ name: "  " })).toBe(400);
+    // EMAIL IS NOW REQUIRED. The old route took email-OR-phone; an account
+    // has no key without one.
+    expect(await status({ email: "" })).toBe(400);
+    expect(await status({ email: "not-an-email" })).toBe(400);
+    expect(await status({ password: "" })).toBe(400);
+    expect(await status({ password: "short" })).toBe(400);
+    expect(await status({ iso2: "ZZZZ" })).toBe(400);
+    expect(await status({ submissionId: "not-a-uuid" })).toBe(400);
+
+    // Not one of them got as far as creating anything.
+    expect(await Consumer.countDocuments({})).toBe(0);
+    expect(await Ticket.countDocuments({})).toBe(0);
+  });
+
+  it("a phone-only submission is now REJECTED — it used to be accepted", async () => {
+    withBypass();
+    const res = await post({ email: "" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/email address is required/i);
+  });
+
+  it("password floor matches the signup door exactly at 8", async () => {
+    withBypass();
+    expect((await post({ password: "1234567" })).status).toBe(400);
+    expect((await post({ password: "12345678" })).status).toBe(201);
+  });
+
+  /* ── THE NEGATIVE THAT PAYS FOR THE CHANGE ───────────────────────── */
+
+  it("writes NO ManualBooking on ANY path — the booking IS the thing replaced", async () => {
+    withBypass();
+
+    await post(); // created
+    await post({ submissionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3302" }); // existing now
+    await post({ hpField: "bot", submissionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3303" });
+    await post({ email: "", submissionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3304" }); // 400
+
+    expect(await ManualBooking.countDocuments({})).toBe(0);
+    // And the register the leads used to land in is untouched entirely.
+    expect(await ManualBooking.countDocuments({ "metadata.channel": "HELLOVIZA_VISA_LEAD" })).toBe(0);
+  });
+
+  it("creates no VisaRequest and no VisaApplication — there is still no self-serve application", async () => {
+    withBypass();
+    await post();
+
+    const { default: VisaRequest } = await import("../models/VisaRequest.js");
+    const { default: VisaApplication } = await import("../models/VisaApplication.js");
+    expect(await VisaRequest.countDocuments({})).toBe(0);
+    expect(await VisaApplication.countDocuments({})).toBe(0);
+  });
+
+  /**
+   * The lead route returned no id at all, because it had none worth
+   * returning. The created branch DOES return the consumer's id, and that is
+   * correct rather than a regression: it is `publicConsumer(...)`, the same
+   * allowlisted shape POST /signup answers with, and the frontend session
+   * store keys on it.
+   *
+   * So the invariant is not "no ids" any more — it is that the body carries
+   * the consumer ALLOWLIST and nothing else, and that no OPS id leaks. A
+   * ticket's Mongo id is ops-internal; the human-readable ticketRef is what
+   * a customer is given.
+   */
+  it("returns the consumer allowlist and no ops ids", async () => {
+    withBypass();
+    const res = await post();
+    const consumer: any = await Consumer.findOne({}).select("+passwordHash").lean();
+    const ticket: any = await Ticket.findOne({}).lean();
+
+    expect(res.body.consumer).toEqual({
+      id: String(consumer._id),
+      email: "asha@example.com",
+      name: "Asha Menon",
+      phone: "9876543210",
+    });
+    // Never the hash, never the ticket's internal id.
+    expect(JSON.stringify(res.body)).not.toContain(consumer.passwordHash);
+    expect(JSON.stringify(res.body)).not.toContain(String(ticket._id));
+    // The customer-facing reference IS returned — that is the point of it.
+    expect(res.body.ticketRef).toBe(ticket.ticketRef);
+  });
+
+  it("EXISTING EMAIL: leaks nothing about the account it found", async () => {
+    withBypass();
+    const existing: any = await Consumer.create({
+      email: "asha@example.com",
+      name: "Asha From Before",
+    });
+    const res = await post();
+
+    // The address they typed comes back so the sign-in field can be
+    // prefilled. Nothing else about the account does — not its id, not the
+    // name it is under, not when it was made.
+    expect(res.body.consumer).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain(String(existing._id));
+    expect(JSON.stringify(res.body)).not.toContain("Asha From Before");
+  });
+
+  /* ── IDEMPOTENCY ─────────────────────────────────────────────────── */
+
+  it("DEDUPES a resubmitted submissionId into ONE case", async () => {
+    withBypass();
+    await post();
+    const second = await post(); // same submissionId, minted once per page load
+
+    expect(second.status).toBe(200);
+    expect(second.body.outcome).toBe("existing_account");
+    expect(await Ticket.countDocuments({})).toBe(1);
+    expect(await Consumer.countDocuments({})).toBe(1);
+    // No second session handed out on the replay.
+    expect(hasSession(second)).toBe(false);
+  });
+
+  it("the dedup key is namespaced, so it cannot collide with the travel form's", async () => {
+    withBypass();
+    await post();
+    const ticket: any = await Ticket.findOne({}).lean();
+    expect(ticket.extractedFields?.enquiryRef).toBe(`hvenq:${ENQUIRY.submissionId}`);
+    // Same uuid, the travel form's namespace — a different key entirely.
+    expect(ticket.extractedFields?.enquiryRef).not.toBe(`public:${ENQUIRY.submissionId}`);
+  });
+
+  it("a DIFFERENT submissionId from the same person files a second case", async () => {
+    withBypass();
+    await post();
+    await post({ submissionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3399" });
+
+    // Two enquiries, one account.
+    expect(await Ticket.countDocuments({})).toBe(2);
+    expect(await Consumer.countDocuments({})).toBe(1);
   });
 
   /* ═══════════════════════════════════════════════════════════════════
-   * M1 — the lead endpoint accepts every country the map draws.
+   * M1 — the door accepts every country the map draws.
    *
-   * It used to resolve iso2 through `normaliseToIso2` alone, so the 77 seed
-   * countries countryCodes.ts has no row for 400'd with "A valid destination
-   * is required" — a dead Request button on 39% of the map, on exactly the
-   * long-tail corridors an enquiry form exists to catch. Both the validator
-   * and the handler's re-resolution now go through `resolvePublicIso2`, the
-   * same seed-first resolver the GET endpoints use.
+   * Carried over unchanged from the lead suite. The resolver is the part
+   * of this route the rewrite did NOT touch, and it is the part with a
+   * history: resolving through `normaliseToIso2` alone 400'd the 77 seed
+   * countries countryCodes.ts has no row for — a dead Request button on
+   * 39% of the map, on exactly the long-tail corridors an enquiry form
+   * exists to catch.
    * ═════════════════════════════════════════════════════════════════ */
 
   // Seed-only: present in the 196-country seed, absent from countryCodes.ts.
   const SEED_ONLY = ["DO", "JM", "BS", "VA", "MO"] as const;
 
+  /* The explicit timeout is about BCRYPT, not about the resolver this test
+   * is checking. Five sequential enquiries now mean five cost-12 hashes,
+   * which is deliberately expensive work, and under a full parallel suite
+   * run that overruns vitest'''s 5s default. Raising it here is honest;
+   * lowering the cost to make a test fast would not be. */
   it("M1: accepts the seed-only countries that used to 400", async () => {
     withBypass();
 
     for (const [i, iso2] of SEED_ONLY.entries()) {
-      // Proves the premise rather than assuming it: each of these really is
-      // outside countryCodes.ts, so a pass here can only come from the seed.
+      // Proves the premise rather than assuming it.
       expect(normaliseToIso2(iso2)).toBeNull();
       expect(SEED.some((c) => c.iso2 === iso2)).toBe(true);
 
-      const res = await request(app())
-        .post("/api/public/visa/lead")
-        .send({ ...LEAD, iso2, submissionId: `3f2504e0-4f89-41d3-9a0c-0305e82c34${10 + i}` });
+      const res = await post({
+        iso2,
+        email: `enquirer-${i}@example.com`,
+        submissionId: `3f2504e0-4f89-41d3-9a0c-0305e82c34${10 + i}`,
+      });
 
       expect(res.status).toBe(201);
+      expect(res.body.outcome).toBe("created");
     }
 
-    // Every one produced a real concierge row, stamped with its own country.
-    const rows = await ManualBooking.find({}).lean();
-    expect(rows).toHaveLength(SEED_ONLY.length);
+    // Every one produced a real case, stamped with its own corridor.
+    const messages = await TicketMessage.find({}).lean();
+    expect(messages).toHaveLength(SEED_ONLY.length);
     for (const iso2 of SEED_ONLY) {
-      expect(rows.some((r: any) => r.notes.includes(`destination ${iso2}`))).toBe(true);
+      expect(messages.some((m: any) => m.bodyText.includes(`(${iso2})`))).toBe(true);
     }
-  });
+  }, 30_000);
 
   it("M1: the validator and the handler resolve to the SAME code", async () => {
     withBypass();
     // Lowercase and padded — the validator must not accept a value the
     // handler then resolves differently (or throws on).
-    const res = await request(app())
-      .post("/api/public/visa/lead")
-      .send({ ...LEAD, iso2: "  mo  " });
+    const res = await post({ iso2: "  mo  " });
 
     expect(res.status).toBe(201);
-    const booking: any = await ManualBooking.findOne({}).lean();
-    expect(booking.notes).toContain("destination MO");
+    const msg: any = await TicketMessage.findOne({}).lean();
+    expect(msg.bodyText).toContain("(MO)");
   });
-
-  it("M1: no regression — a countryCodes.ts country still works", async () => {
-    withBypass();
-    expect(normaliseToIso2("TH")).toBe("TH");
-
-    const res = await request(app()).post("/api/public/visa/lead").send(LEAD);
-    expect(res.status).toBe(201);
-    const booking: any = await ManualBooking.findOne({}).lean();
-    expect(booking.notes).toContain("destination TH");
-  });
-
-  it("M1: still rejects a genuinely invalid destination", async () => {
-    withBypass();
-    // Widened to the seed, NOT disabled. ZZ is in neither table.
-    for (const iso2 of ["ZZ", "QQ", "", "not-a-country"]) {
-      const res = await request(app())
-        .post("/api/public/visa/lead")
-        .send({ ...LEAD, iso2 });
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/A valid destination is required/);
-    }
-    expect(await ManualBooking.countDocuments({})).toBe(0);
-  });
-
-  it(
-    "M1: every one of the 196 seed countries is accepted by the real endpoint",
-    async () => {
-      withBypass();
-      expect(SEED).toHaveLength(196);
-
-      // Driven through HTTP rather than by re-deriving the resolver here: a
-      // test that reimplements resolvePublicIso2 would keep passing after the
-      // endpoint stopped using it, which is the exact failure this guards.
-      const rejected: string[] = [];
-      for (const [i, country] of SEED.entries()) {
-        // The limiter is real and shared (8 per IP); reset inside the loop so
-        // a 429 can never be mistaken for a validation pass or failure.
-        await resetRateLimiter();
-        const res = await request(app())
-          .post("/api/public/visa/lead")
-          .send({
-            ...LEAD,
-            iso2: country.iso2,
-            submissionId: `3f2504e0-4f89-41d3-9a0c-${String(i).padStart(12, "0")}`,
-          });
-        if (res.status !== 201) rejected.push(`${country.iso2}:${res.status}`);
-      }
-
-      expect(rejected).toEqual([]);
-      expect(await ManualBooking.countDocuments({})).toBe(196);
-    },
-    120_000,
-  );
 });
 
 describe("rate limiting", () => {
@@ -1402,15 +1671,21 @@ describe("rate limiting", () => {
     process.env.TURNSTILE_DEV_BYPASS = "true";
     const a = app();
 
-    // 8 allowed, the 9th refused. Distinct submissionIds so dedup is not what
+    // 8 allowed, the 9th refused. Distinct submissionIds AND distinct
+    // addresses, so neither the dedup nor the existing-account fork is what
     // stops them — this must fail on the limiter, not on the write path.
+    //
+    // The payload gained a password when the route became an
+    // account-creation door; without it every request would 400 at
+    // validation and the limiter would never be the thing under test.
     const statuses: number[] = [];
     for (let i = 0; i < 9; i += 1) {
       const res = await request(a)
         .post("/api/public/visa/lead")
         .send({
           name: "Rate Limited",
-          email: "rl@example.com",
+          email: `rl-${i}@example.com`,
+          password: "a-long-enough-password",
           iso2: "TH",
           submissionId: `3f2504e0-4f89-41d3-9a0c-0305e82c33${String(10 + i)}`,
         });
@@ -1419,7 +1694,10 @@ describe("rate limiting", () => {
 
     expect(statuses.slice(0, 8).every((s) => s === 201)).toBe(true);
     expect(statuses[8]).toBe(429);
-  });
+    /* 30s for the same reason the M1 case above carries one: eight of these
+     * nine requests now create an account, and a cost-12 bcrypt hash apiece
+     * is the single slowest thing in this suite. */
+  }, 30_000);
 });
 
 /* ═════════════════════════════════════════════════════════════════════

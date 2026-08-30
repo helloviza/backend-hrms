@@ -27,6 +27,14 @@ export interface ITicket extends Document {
     tripType?: string | null;
     requestType?: string | null;
     summary?: string | null;
+    /**
+     * Caller-owned idempotency key for a WEB case — the only field in this
+     * bag that is NOT a Gemini extraction. Written solely by
+     * services/consumerSupport.ts on behalf of the public enquiry door, and
+     * queried by routes/public.visa.ts before it creates anything, so a
+     * resubmitted enquiry files one ticket rather than one per attempt.
+     */
+    enquiryRef?: string | null;
   };
   firstResponseAt?: Date;
   closedAt?: Date;
