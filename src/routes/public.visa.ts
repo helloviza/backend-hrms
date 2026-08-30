@@ -466,11 +466,25 @@ function buildPublicPrice(rule: any) {
  * ───────────────────────────────────────────────────────────────────── */
 
 /**
- * The display name for a variant, from its priceNote.
+ * The display name for a variant.
  *
- * priceNote is authored as "<product> | validity <term>" — the validity
- * half is already its own field on the payload and repeating it inside
- * every name would make the list unreadable:
+ * `visaTypeName` is the field that holds it (models/VisaRule.ts). Read it
+ * first, and in normal operation that is the whole function.
+ *
+ * ── WHY THE priceNote PARSE IS STILL HERE ────────────────────────────
+ * It is a TRANSITION FALLBACK, not a second source of truth. Until
+ * 2026-08-31 the product name had no field of its own: ops authored it
+ * into priceNote as "<product> | validity <term>", and this function
+ * recovered it by splitting the pipe back off. scripts/
+ * backfill-visa-type-name.ts has since populated visaTypeName on every
+ * published IN rule from exactly this parse (proving equality per row
+ * first, so no name on screen moved), but a rule created or imported
+ * before the admin console starts authoring the new field can still arrive
+ * without one — and a corridor rendering "MEET_ASSIST" because a field is
+ * absent is a worse failure than one more year of a two-line fallback.
+ *
+ * Remove the fallback once nothing can produce a nameless rule; the parse
+ * is dead weight the moment that is true, not before.
  *
  *   "Visitor Visa (Easy Apply) | validity Decided by embassy"
  *                                          -> "Visitor Visa (Easy Apply)"
@@ -480,12 +494,20 @@ function buildPublicPrice(rule: any) {
  *
  * Everything before the first pipe, trimmed, with a trailing full stop
  * removed (ops types it inconsistently — roughly a third of the rows carry
- * one). variantKey is the fallback and NOT the default: it is the field the
- * catalogue audit found disagrees with priceNote across the board
+ * one). variantKey is the LAST resort and NOT a default: it is the field
+ * the catalogue audit found disagrees with priceNote across the board
  * (AT's MEET_ASSIST reads "Appointment & Document Assistance"), so it is
- * only reached when there is no priceNote at all.
+ * only reached when there is neither a visaTypeName nor a priceNote.
+ *
+ * NOT TOUCHED HERE: priceNote's own rendering under "Total payable"
+ * (utils/visaFee.ts -> FeeCard.tsx). That string stays exactly where it is.
+ * Clearing it is a separate task and a careful one — 60 published rows
+ * state a numeric validity term ONLY inside it, with validityDays and
+ * maxStayDays both null.
  */
 function variantDisplayName(rule: any): string {
+  const named = String(rule?.visaTypeName ?? "").trim();
+  if (named) return named;
   const note = String(rule?.priceNote ?? "").split("|")[0].trim().replace(/\.+$/, "").trim();
   if (note) return note;
   return String(rule?.variantKey ?? "").trim() || "Visa";

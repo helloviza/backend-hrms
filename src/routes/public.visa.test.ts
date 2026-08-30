@@ -1092,6 +1092,61 @@ describe("variants[] — the corridor's visa types", () => {
     expect(JSON.stringify(res.body.variants)).not.toContain("validity");
   });
 
+  /* ── the visaTypeName repoint (2026-08-31) ─────────────────────────
+   * variantDisplayName() now reads the dedicated field first and only
+   * falls back to parsing priceNote. Both halves are pinned here: the
+   * fallback is what keeps a not-yet-backfilled rule rendering a real
+   * name, so deleting it by accident must fail a test, not a corridor. */
+
+  it("takes the display name from visaTypeName when the rule has one", async () => {
+    await makeAu();
+    // Exactly what scripts/backfill-visa-type-name.ts writes for these
+    // three rows: the parse of their own priceNote, unchanged.
+    await VisaRule.updateOne({ variantKey: "VISITOR_VISA_EASY_APPLY" }, { $set: { visaTypeName: "Visitor Visa (Easy Apply)" } });
+    await VisaRule.updateOne({ variantKey: "VISITOR_VISA" }, { $set: { visaTypeName: "Visitor Visa" } });
+    await VisaRule.updateOne({ variantKey: "VISITOR_VISA_EXPRESS" }, { $set: { visaTypeName: "Visitor Visa - Express" } });
+
+    const res = await request(app()).get("/api/public/visa/country/AU");
+    // Byte-identical to the pre-migration expectation two tests above —
+    // that IS the migration's guarantee for all 257 cleanly-parsed rows.
+    expect(res.body.variants.map((v: any) => v.name)).toEqual([
+      "Visitor Visa (Easy Apply)",
+      "Visitor Visa",
+      "Visitor Visa - Express",
+    ]);
+  });
+
+  it("prefers visaTypeName OVER the priceNote parse where the two differ", async () => {
+    await makeAu();
+    // The IN->AM shape: priceNote separates the validity term with a dash,
+    // so the parse would keep the whole string. The field overrules it.
+    await VisaRule.updateOne(
+      { variantKey: "VISITOR_VISA" },
+      { $set: { priceNote: "Tourist Visa - 21 Days (Single Entry) - validity 90 days post issue", visaTypeName: "Tourist Visa - 21 Days (Single Entry)" } },
+    );
+    const res = await request(app()).get("/api/public/visa/country/AU");
+    const names = res.body.variants.map((v: any) => v.name);
+    expect(names).toContain("Tourist Visa - 21 Days (Single Entry)");
+    expect(JSON.stringify(res.body.variants)).not.toContain("validity 90 days post issue");
+  });
+
+  it("falls back to the priceNote parse when visaTypeName is absent", async () => {
+    await makeAu(); // none of these rows carries visaTypeName
+    const res = await request(app()).get("/api/public/visa/country/AU");
+    expect(res.body.variants.map((v: any) => v.name)).toEqual([
+      "Visitor Visa (Easy Apply)",
+      "Visitor Visa",
+      "Visitor Visa - Express",
+    ]);
+  });
+
+  it("ignores a blank visaTypeName rather than rendering an empty name", async () => {
+    await makeAu();
+    await VisaRule.updateOne({ variantKey: "VISITOR_VISA" }, { $set: { visaTypeName: "   " } });
+    const res = await request(app()).get("/api/public/visa/country/AU");
+    expect(res.body.variants.map((v: any) => v.name)).toContain("Visitor Visa");
+  });
+
   it("sorts priced variants cheapest-first", async () => {
     await makeAu();
     const res = await request(app()).get("/api/public/visa/country/AU");

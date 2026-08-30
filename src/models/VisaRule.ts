@@ -229,6 +229,30 @@ export interface VisaRuleDocument extends Document {
   // POST /rules/:id/publish independently refuses to publish a rule
   // that's missing it, so a PUBLISHED row is never left without one.
   visaCategory?: VisaCategory;
+  // THE PRODUCT NAME — "Tourist Visa - 30 Days", "Visitor Visa (Easy
+  // Apply)", "Priority Visa - 10 years". What a customer is being sold,
+  // as a first-class field.
+  //
+  // It lives HERE, beside productClass and visaCategory, and deliberately
+  // NOT next to priceNote down in the fee block: this is a type
+  // descriptor, not an annotation on a price. That priceNote has been
+  // carrying it (248 of 258 published rows author it as
+  // "<product name> | validity <term>", and routes/public.visa.ts's
+  // variantDisplayName splits the pipe back off to recover the name) is
+  // the defect this field exists to end — a name parsed out of a free-text
+  // note is a name that breaks whenever ops types a dash where a pipe
+  // belongs, which is exactly what IN->AM's row does today.
+  //
+  // The validity half of that string is NOT duplicated here: validityDays
+  // already holds it structurally.
+  //
+  // Optional, because the transition has three stages and this is stage
+  // one: the field exists and is backfilled
+  // (scripts/backfill-visa-type-name.ts) before any reader is repointed at
+  // it, and the ~10 rows with no parseable name in priceNote are left
+  // unset on purpose rather than guessed at — a reader must keep its
+  // existing fallback for them.
+  visaTypeName?: string;
 
   // ── validity / stay ──────────────────────────────────────────────────
   validityDays?: number;
@@ -389,6 +413,9 @@ const VisaRuleSchema = new Schema<VisaRuleDocument>(
     productClass: { type: String, enum: VISA_PRODUCT_CLASSES, required: true },
     // NOT required — see VisaRuleDocument.visaCategory above.
     visaCategory: { type: String, enum: VISA_CATEGORIES },
+    // See VisaRuleDocument.visaTypeName above. Trimmed; no default, no
+    // enum — it is a free-text product name, not a taxonomy.
+    visaTypeName: { type: String, trim: true },
 
     validityDays: { type: Number },
     maxStayDays: { type: Number },
