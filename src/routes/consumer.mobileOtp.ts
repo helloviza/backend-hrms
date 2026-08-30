@@ -244,21 +244,13 @@ router.post("/otp/verify", consumerOtpVerifyLimiter, async (req: any, res: any) 
         .json({ error: result.message, code: result.reason.toUpperCase() });
     }
 
-    /* ── THE WRITE ────────────────────────────────────────────────────
-     * .save() on a hydrated document, never an update operator — see
-     * loadOwnProfile above for why the encryption plugin forces this. */
-    profile.contact.mobileVerified = true;
-    profile.contact.mobileVerifiedAt = new Date();
-    await profile.save();
-
-    /* ── THE MIRROR — the proven number, where a query can find it ─────
-     * contact.mobile above is ENCRYPTED, which makes it unsearchable: no
+    /* ── THE MIRROR — FIRST, AND THE ORDER IS LOAD-BEARING ────────────
+     * contact.mobile is ENCRYPTED, which makes it unsearchable: no
      * findOne({"contact.mobile": x}) can ever work, because every stored
      * value is a distinct envelope. So the moment a number is proven, the
      * plaintext ten digits are copied to Consumer.verifiedPhone, which is
-     * indexed and unique and is what a future OTP login will resolve
-     * against. Without this line the number is verified but unfindable,
-     * and login could not exist.
+     * indexed and unique and is what an OTP login resolves against.
+     * Without this write the number is verified but unfindable.
      *
      * `mobile` is already the normalised bare-ten (resolveOwnMobile ran it
      * through normaliseIndiaMobile before we ever called MSG91), so the two
@@ -270,25 +262,82 @@ router.post("/otp/verify", consumerOtpVerifyLimiter, async (req: any, res: any) 
      * no encrypted paths, so the plugin's EncryptedFieldUpdateError guard
      * does not apply to it.
      *
-     * ── WHY THE FAILURE IS SWALLOWED RATHER THAN RAISED ──────────────
-     * The verification itself has already SUCCEEDED and been persisted.
-     * Turning a mirror failure into a 500 would tell the reader their
-     * correct code was wrong and invite them to burn another SMS on a
-     * number that is, in fact, already verified. The duplicate-key case is
-     * a real one — another account proved the same number first — and it is
-     * logged rather than surfaced because there is nothing this endpoint's
-     * caller can do about it. Phase 2's login will read it as "no account
-     * for this number" and route accordingly, which is the correct outcome
-     * for a number whose ownership is genuinely contested. */
+     * ══════════════════════════════════════════════════════════════════
+     * THIS USED TO RUN AFTER THE FLAG, AND SWALLOW ITS OWN FAILURE.
+     * ══════════════════════════════════════════════════════════════════
+     * The old order set contact.mobileVerified = true, saved, then tried
+     * the mirror and merely LOGGED a failure — answering `verified: true`
+     * either way. That produced the one state this pair must never be in:
+     * a profile carrying the badge, and no login key to match it. The
+     * reader was told they were verified, and a later OTP login answered
+     * "no account for this number" with nothing on screen to explain it.
+     *
+     * Worse than confusing, on the duplicate-key path it was a hole. E11000
+     * here means ANOTHER account has already proven this same number. The
+     * unique index exists precisely to make "one account per verified
+     * number" true — but the flag it was guarding lives on an UNINDEXED
+     * field, so a second account could hold mobileVerified on a number it
+     * did not own the key to, and walk through the submit gate in
+     * consumer.applications.ts on the strength of it. One SIM, unlimited
+     * gate-passing identities, with the constraint meant to stop that
+     * reduced to a log line.
+     *
+     * Running the mirror FIRST removes both. Nothing has been persisted
+     * when it fails, so there is nothing to roll back and no half-state to
+     * describe — the endpoint simply refuses, and this invariant holds by
+     * construction:
+     *
+     *   contact.mobileVerified === true  ⟹  Consumer.verifiedPhone === it
+     *
+     * The reverse does NOT hold, deliberately: the mirror can land and the
+     * save below fail, leaving a login key with no badge. That direction is
+     * safe — the number really is theirs, so logging in with it is correct,
+     * and the submit gate stays shut until they verify again. Re-verifying
+     * then re-writes the SAME value on the SAME document, which raises no
+     * duplicate-key error, so that state heals itself. */
     try {
       await Consumer.updateOne({ _id: me(req) }, { $set: { verifiedPhone: mobile } });
     } catch (mirrorErr: any) {
+      /* ── SOMEBODY ELSE PROVED THIS NUMBER FIRST ────────────────────
+       * Permanent and semantic: no retry helps, because the other account
+       * holds the index entry until it changes its own number. So this is
+       * a 409 naming the actual situation, rather than a 500 that would
+       * read as "our fault, try again".
+       *
+       * It does disclose that SOME account has verified this number — the
+       * same disclosure routes/consumer.mobileAuth.ts's /verify makes when
+       * it answers mode:"login", and for the same reason: the caller has
+       * just PROVED to MSG91 that they hold the SIM. It is their own
+       * number they are being told about. */
+      if (mirrorErr?.code === 11000) {
+        otpRouteLogger.warn("verify — number is verified on another account", {
+          consumerId: me(req),
+        });
+        return res.status(409).json({
+          error:
+            "This number is already verified on another account. Sign in to that account, or verify a different number.",
+          code: "PHONE_ON_ANOTHER_ACCOUNT",
+        });
+      }
+      /* Anything else is transient. It also refuses rather than claiming
+       * verified: the cost is one more SMS on a retry, which is a smaller
+       * price than a badge whose login key was never written. */
       otpRouteLogger.error("verify — verifiedPhone mirror failed", {
         consumerId: me(req),
-        duplicate: mirrorErr?.code === 11000,
         error: mirrorErr?.message,
       });
+      return res.status(500).json({
+        error: "We couldn't finish verifying that number. Request a new code and try again.",
+        code: "VERIFY_INCOMPLETE",
+      });
     }
+
+    /* ── THE FLAG, ONLY NOW THAT THE KEY IS SAFELY DOWN ───────────────
+     * .save() on a hydrated document, never an update operator — see
+     * loadOwnProfile above for why the encryption plugin forces this. */
+    profile.contact.mobileVerified = true;
+    profile.contact.mobileVerifiedAt = new Date();
+    await profile.save();
 
     otpRouteLogger.info("verify — mobile verified", { consumerId: me(req) });
 

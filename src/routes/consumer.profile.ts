@@ -594,6 +594,54 @@ router.patch("/:section", async (req: any, res: any) => {
         if (!sameMobile(before, updates.mobile)) {
           profile.contact.mobileVerified = false;
           profile.contact.mobileVerifiedAt = undefined;
+
+          /* ── AND THE LOGIN KEY GOES WITH IT ───────────────────────
+           * Clearing the badge alone left the account reachable by the
+           * OLD number. contact.mobileVerified gates the SUBMIT path;
+           * Consumer.verifiedPhone is what routes/consumer.mobileAuth.ts's
+           * /verify resolves an OTP login against — a different field, in
+           * a different collection, that nothing here used to touch. So
+           * "I no longer use that number" removed the badge and left the
+           * key in the door: whoever holds that SIM next could still
+           * request a code for it and be signed straight into this
+           * account. A credential the owner believes they removed.
+           *
+           * It also blocked the rightful owner. While this row keeps the
+           * index entry for a number it no longer claims, the person who
+           * actually holds that SIM can never verify it on their own
+           * account — their mirror write hits the unique index, which
+           * routes/consumer.mobileOtp.ts now surfaces as a 409 rather
+           * than swallowing. Releasing the entry here is what makes that
+           * 409 rare and truthful instead of permanent and mysterious.
+           *
+           * ── $unset, NEVER null AND NEVER "" ──────────────────────
+           * The index is unique + SPARSE, and sparse skips ABSENT fields
+           * only. An explicit null is a present value and so is the empty
+           * string, so either would put every cleared account onto ONE
+           * index key and the second clear would die with a duplicate-key
+           * error. models/Consumer.ts flags this trap in the field's own
+           * comment and consumerPhonePhase1.test.ts proves it with two
+           * rows storing "". Removing the field is the only clear that
+           * leaves the index able to hold the next real number.
+           *
+           * ── BEFORE profile.save(), AND THAT IS THE SAFE ORDER ────
+           * These are two collections and this is not a transaction, so
+           * one of them can land alone. Revoking first means a failure
+           * between the two costs the reader their OTP login until they
+           * verify again — an inconvenience. Saving first would mean the
+           * same failure leaves the old number still able to sign in,
+           * which is the bug. When they disagree, disagree towards less
+           * access.
+           *
+           * Unconditional, deliberately: no check that verifiedPhone
+           * matches the number being replaced. If it holds something
+           * else, that is already an inconsistent account and the honest
+           * reading is still "this profile has no verified number" —
+           * contact.mobile is the canonical one (see seedMobileFromSignup).
+           * $unset on an absent field is a no-op, so the common case of a
+           * consumer who never verified costs one cheap write and errors
+           * on nothing. */
+          await Consumer.updateOne({ _id: consumerId }, { $unset: { verifiedPhone: 1 } });
         }
       }
     }

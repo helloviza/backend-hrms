@@ -75,6 +75,16 @@ const { default: VisaApplication } = await import("../models/VisaApplication.js"
 const { default: mobileOtpRouter } = await import("./consumer.mobileOtp.js");
 const { default: profileRouter } = await import("./consumer.profile.js");
 const { default: applicationsRouter } = await import("./consumer.applications.js");
+/* THE PUBLIC SIGN-IN DOOR, mounted alongside the session-gated one.
+ *
+ * It has its own suite (consumer.mobileAuth.test.ts) and this is not a
+ * second copy of it. It is here because the property proved at the bottom
+ * of this file spans BOTH doors and cannot be stated inside either: that
+ * editing your number in the profile stops the OLD number from signing you
+ * in. Asserting that the field was unset would only restate the
+ * implementation; asking the login door and watching it fail to find the
+ * account is the actual security claim. */
+const { default: mobileAuthRouter } = await import("./consumer.mobileAuth.js");
 const { signConsumerAccessToken } = await import("../utils/consumerJwt.js");
 
 const app = express();
@@ -83,6 +93,7 @@ app.use(cookieParser());
 app.use("/api/consumer/mobile", mobileOtpRouter);
 app.use("/api/consumer/profile", profileRouter);
 app.use("/api/consumer/applications", applicationsRouter);
+app.use("/api/consumer/auth/mobile", mobileAuthRouter);
 
 let mongod: MongoMemoryServer;
 
@@ -644,5 +655,284 @@ describe("verify is rate limited", () => {
     expect(blocked.body.code).toBe("OTP_RATE_LIMITED");
     // Five provider calls, not six — the limiter refused before MSG91.
     expect(msg91Calls).toHaveLength(5);
+  });
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+ * 6. THE LOGIN KEY — Consumer.verifiedPhone
+ * ══════════════════════════════════════════════════════════════════════
+ * contact.mobileVerified answers "can we reach this person by SMS?" and
+ * gates the submit path. Consumer.verifiedPhone answers "which account
+ * does this number sign in to?" and is the unique, sparse index the public
+ * OTP door resolves against. Two fields, two questions — and every test
+ * below is about the ONE relationship that has to hold between them:
+ *
+ *   contact.mobileVerified === true  ⟹  Consumer.verifiedPhone === it
+ *
+ * Both directions of drift were live bugs. The badge could be set with no
+ * key written (the mirror swallowed its own duplicate-key failure), and
+ * the key could outlive the badge (changing your number cleared one and
+ * not the other, leaving the old number able to sign in).
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/** The consumers row as MONGO holds it — no Mongoose casting in between.
+ *
+ *  Needed because the distinction under test is ABSENT vs null vs "", and a
+ *  hydrated document flattens all three to undefined. The sparse index only
+ *  skips the first one, so only the raw read can prove the clear was safe. */
+async function rawConsumer(id: any) {
+  return mongoose.connection.db!.collection("consumers").findOne({ _id: id });
+}
+
+describe("verify writes the login key, and will not claim verified without it", () => {
+  it("mirrors the proven number to Consumer.verifiedPhone", async () => {
+    const c = await makeConsumerWithMobile("mirror@helloviza.test", "9811100001");
+    await verifyMobileFor(c.auth);
+
+    const fresh = await Consumer.findById(c.consumer._id);
+    expect(fresh?.verifiedPhone).toBe("9811100001");
+  });
+
+  it("409s when ANOTHER account already verified that number", async () => {
+    // The index entry is taken. Whether that other account is real or a
+    // leftover is not this endpoint's business — it cannot have the key.
+    await Consumer.create({
+      email: "holder@helloviza.test",
+      name: "Holder",
+      verifiedPhone: "9811100002",
+    });
+    const c = await makeConsumerWithMobile("second@helloviza.test", "9811100002");
+
+    stubMsg91({ type: "success", message: "OTP verified success" });
+    const res = await request(app)
+      .post("/api/consumer/mobile/otp/verify")
+      .set("Authorization", c.auth)
+      .send({ code: "1234" })
+      .expect(409);
+
+    expect(res.body.code).toBe("PHONE_ON_ANOTHER_ACCOUNT");
+    // Not the old lie. The response must never say this succeeded.
+    expect(res.body.verified).toBeUndefined();
+  });
+
+  it("DOES NOT SET THE BADGE when the key could not be written", async () => {
+    // The regression that mattered: MSG91 says yes, the mirror says no, and
+    // the profile used to keep the flag anyway — a verified badge with no
+    // login key behind it, on a number belonging to somebody else.
+    await Consumer.create({
+      email: "holder2@helloviza.test",
+      name: "Holder",
+      verifiedPhone: "9811100003",
+    });
+    const c = await makeConsumerWithMobile("second2@helloviza.test", "9811100003");
+
+    stubMsg91({ type: "success", message: "OTP verified success" });
+    await request(app)
+      .post("/api/consumer/mobile/otp/verify")
+      .set("Authorization", c.auth)
+      .send({ code: "1234" })
+      .expect(409);
+
+    const p = await ConsumerProfile.findOne({ consumerId: c.consumer._id });
+    expect(p?.contact?.mobileVerified).toBe(false);
+    expect(p?.contact?.mobileVerifiedAt ?? null).toBeNull();
+
+    // And the key stayed with the account that earned it.
+    const mine = await Consumer.findById(c.consumer._id);
+    expect(mine?.verifiedPhone ?? null).toBeNull();
+  });
+
+  it("the refused account is still BLOCKED at the submit gate", async () => {
+    /* Why the badge and the key must move together, stated as the thing a
+     * user can actually do. Without this, one SIM yields any number of
+     * gate-passing identities: sign up again under a new address, verify
+     * the same number, and the unique index — the constraint meant to stop
+     * exactly that — is bypassed, because the gate reads the unindexed
+     * flag and the flag was set regardless. */
+    await Consumer.create({
+      email: "holder3@helloviza.test",
+      name: "Holder",
+      verifiedPhone: "9811100004",
+    });
+    const c = await makeConsumerWithMobile("second3@helloviza.test", "9811100004");
+    await makePublishedRule();
+
+    stubMsg91({ type: "success", message: "OTP verified success" });
+    await request(app)
+      .post("/api/consumer/mobile/otp/verify")
+      .set("Authorization", c.auth)
+      .send({ code: "1234" })
+      .expect(409);
+
+    const res = await request(app)
+      .post("/api/consumer/applications")
+      .set("Authorization", c.auth)
+      .send({ iso2: "AE", purpose: "TOURIST" })
+      .expect(403);
+
+    expect(res.body.code).toBe("MOBILE_NOT_VERIFIED");
+    expect(await VisaApplication.countDocuments({})).toBe(0);
+  });
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+ * 7. CHANGING THE NUMBER RELEASES THE KEY — the security invariant
+ * ══════════════════════════════════════════════════════════════════════ */
+
+describe("changing the number releases the login key", () => {
+  it("A REMOVED NUMBER CAN NO LONGER SIGN IN", async () => {
+    /* THE INVARIANT THIS WHOLE SECTION EXISTS FOR.
+     *
+     * Deliberately asked at the PUBLIC door rather than by inspecting the
+     * field: "the column is empty" is an implementation detail, "the old
+     * number does not open this account" is the security property. Before
+     * the fix this test got mode:"login" and a set of session cookies for
+     * a number the owner had already replaced. */
+    const c = await makeConsumerWithMobile("released@helloviza.test", "9811100010");
+    await verifyMobileFor(c.auth);
+    expect((await Consumer.findById(c.consumer._id))?.verifiedPhone).toBe("9811100010");
+
+    await request(app)
+      .patch("/api/consumer/profile/contact")
+      .set("Authorization", c.auth)
+      .send({ mobile: "9811100011" })
+      .expect(200);
+
+    stubMsg91({ type: "success", message: "OTP verified success" });
+    const res = await request(app)
+      .post("/api/consumer/auth/mobile/verify")
+      .send({ mobile: "9811100010", code: "1234" })
+      .expect(200);
+
+    expect(res.body.mode).toBe("signup_required");
+    expect(res.body.consumer).toBeUndefined();
+  });
+
+  it("clears it by REMOVING the field, never by writing null or the empty string", async () => {
+    /* The sparse index skips ABSENT fields and nothing else. A null or a ""
+     * is a present value, so every cleared account would pile onto one
+     * index key and the SECOND clear would die with a duplicate-key error
+     * — see the two-empty-strings case in consumerPhonePhase1.test.ts. */
+    const c = await makeConsumerWithMobile("unset@helloviza.test", "9811100012");
+    await verifyMobileFor(c.auth);
+
+    await request(app)
+      .patch("/api/consumer/profile/contact")
+      .set("Authorization", c.auth)
+      .send({ mobile: "9811100013" })
+      .expect(200);
+
+    const raw = await rawConsumer(c.consumer._id);
+    expect("verifiedPhone" in raw!).toBe(false);
+  });
+
+  it("a SECOND account clearing its number does not collide with the first", async () => {
+    // The direct consequence of the line above, proved rather than argued.
+    const a = await makeConsumerWithMobile("clearA@helloviza.test", "9811100014");
+    await verifyMobileFor(a.auth);
+    const b = await makeConsumerWithMobile("clearB@helloviza.test", "9811100015");
+    await verifyMobileFor(b.auth);
+
+    for (const [c, next] of [
+      [a, "9811100016"],
+      [b, "9811100017"],
+    ] as const) {
+      await request(app)
+        .patch("/api/consumer/profile/contact")
+        .set("Authorization", c.auth)
+        .send({ mobile: next })
+        .expect(200);
+    }
+
+    expect("verifiedPhone" in (await rawConsumer(a.consumer._id))!).toBe(false);
+    expect("verifiedPhone" in (await rawConsumer(b.consumer._id))!).toBe(false);
+  });
+
+  it("releases it when the number is CLEARED rather than replaced", async () => {
+    // "I do not want a number on file" has to revoke the login too.
+    const c = await makeConsumerWithMobile("emptied@helloviza.test", "9811100018");
+    await verifyMobileFor(c.auth);
+
+    await request(app)
+      .patch("/api/consumer/profile/contact")
+      .set("Authorization", c.auth)
+      .send({ mobile: "" })
+      .expect(200);
+
+    expect("verifiedPhone" in (await rawConsumer(c.consumer._id))!).toBe(false);
+  });
+
+  it("KEEPS the key when the number is re-saved unchanged", async () => {
+    // The mirror of the existing mobileVerified case: a contact-tab save
+    // that changes an address must not cost somebody their OTP login.
+    const c = await makeConsumerWithMobile("keepkey@helloviza.test", "9811100019");
+    await verifyMobileFor(c.auth);
+
+    await request(app)
+      .patch("/api/consumer/profile/contact")
+      .set("Authorization", c.auth)
+      .send({ mobile: "9811100019", currentAddress: { city: "Pune" } })
+      .expect(200);
+
+    expect((await Consumer.findById(c.consumer._id))?.verifiedPhone).toBe("9811100019");
+  });
+
+  it("KEEPS the key when only the FORMATTING changes", async () => {
+    const c = await makeConsumerWithMobile("reformat@helloviza.test", "9811100020");
+    await verifyMobileFor(c.auth);
+
+    await request(app)
+      .patch("/api/consumer/profile/contact")
+      .set("Authorization", c.auth)
+      .send({ mobile: "+91 98111 00020" })
+      .expect(200);
+
+    expect((await Consumer.findById(c.consumer._id))?.verifiedPhone).toBe("9811100020");
+  });
+
+  it("KEEPS the key when the contact tab is saved without touching mobile", async () => {
+    const c = await makeConsumerWithMobile("untouched@helloviza.test", "9811100021");
+    await verifyMobileFor(c.auth);
+
+    await request(app)
+      .patch("/api/consumer/profile/contact")
+      .set("Authorization", c.auth)
+      .send({ currentAddress: { city: "Kochi" } })
+      .expect(200);
+
+    expect((await Consumer.findById(c.consumer._id))?.verifiedPhone).toBe("9811100021");
+  });
+
+  it("HANDS THE NUMBER BACK to whoever actually holds the SIM", async () => {
+    /* The two bugs compounding, and the proof that fixing both undoes it.
+     *
+     * A verifies a number and later moves on from it. B, who now holds that
+     * SIM, tries to verify it. Before: A's row kept the index entry
+     * forever, so B's mirror hit E11000 — which was swallowed, so B was
+     * told "verified" and then could never sign in with it. The number was
+     * permanently unusable and nobody was told why. */
+    const a = await makeConsumerWithMobile("previous@helloviza.test", "9811100022");
+    await verifyMobileFor(a.auth);
+
+    await request(app)
+      .patch("/api/consumer/profile/contact")
+      .set("Authorization", a.auth)
+      .send({ mobile: "9811100023" })
+      .expect(200);
+
+    const b = await makeConsumerWithMobile("current@helloviza.test", "9811100022");
+    await verifyMobileFor(b.auth);
+
+    expect((await Consumer.findById(b.consumer._id))?.verifiedPhone).toBe("9811100022");
+
+    // And the number now signs B in — the whole point of releasing it.
+    stubMsg91({ type: "success", message: "OTP verified success" });
+    const res = await request(app)
+      .post("/api/consumer/auth/mobile/verify")
+      .send({ mobile: "9811100022", code: "1234" })
+      .expect(200);
+
+    expect(res.body.mode).toBe("login");
+    expect(res.body.consumer?.email).toBe("current@helloviza.test");
   });
 });
