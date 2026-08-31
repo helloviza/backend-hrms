@@ -20,8 +20,9 @@ vi.mock("../middleware/auth.js", () => ({
   requireAuth: (_req: any, _res: any, next: any) => next(),
   default: (_req: any, _res: any, next: any) => next(),
 }));
-vi.mock("../middleware/requireSuperAdminOrTenantAdmin.js", () => ({
-  requireSuperAdminOrTenantAdmin: (_req: any, _res: any, next: any) => next(),
+vi.mock("../middleware/requireAccessConsole.js", () => ({
+  requireAccessConsole: (_req: any, _res: any, next: any) => next(),
+  requireAccessConsoleWrite: (_req: any, _res: any, next: any) => next(),
 }));
 vi.mock("../middleware/requireWorkspace.js", () => ({
   requireWorkspace: (_req: any, _res: any, next: any) => next(),

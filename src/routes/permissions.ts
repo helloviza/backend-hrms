@@ -2,7 +2,7 @@ import express from 'express'
 import mongoose from 'mongoose'
 import { requireAuth } from '../middleware/auth.js'
 import { requireSuperAdmin } from '../middleware/requireSuperAdmin.js'
-import { requireSuperAdminOrTenantAdmin } from '../middleware/requireSuperAdminOrTenantAdmin.js'
+import { requireAccessConsole, requireAccessConsoleWrite } from '../middleware/requireAccessConsole.js'
 import { requireWorkspace } from '../middleware/requireWorkspace.js'
 import { isSuperAdmin } from '../middleware/isSuperAdmin.js'
 import { UserPermission, PermissionTier } from '../models/UserPermission.js'
@@ -195,7 +195,33 @@ router.get('/levels', requireAuth, (_req: any, res: any) => {
 // ── All management routes below: SuperAdmin OR TENANT_ADMIN (workspace-scoped) ─
 // Per-endpoint handlers below MUST enforce workspaceId scoping for non-SuperAdmin
 // callers using (req as any).isPlatformSuperAdmin.
-router.use(requireAuth, requireSuperAdminOrTenantAdmin, requireWorkspace)
+router.use(requireAuth, requireAccessConsole, requireWorkspace)
+
+// ── LEVEL CEILING FOR NON-SUPERADMIN CALLERS ────────────────────────────────
+//
+// /grant and /apply-template both sync the granted level onto the target
+// User: levelToRole('L8') is 'SUPERADMIN' and roleToRolesArray writes
+// roles: ['SUPERADMIN']. Nothing below restricted WHICH level a non-super
+// caller may hand out, so a workspace-scoped caller could grant L8 to
+// anyone in their own workspace -- themselves included -- and walk out a
+// platform SuperAdmin.
+//
+// That hole predates the accessConsole door (any TENANT_ADMIN could already
+// do it) but admitting permission holders would widen it, so it is closed
+// here for every non-super caller at once. A platform SuperAdmin is minted
+// by a platform SuperAdmin, never by a workspace-scoped one.
+function refuseSuperAdminLevel(req: any, res: any, levelCode: string): boolean {
+  if ((req as any).isPlatformSuperAdmin === true) return false
+  if (levelToRole(String(levelCode)) !== 'SUPERADMIN') return false
+  logger.warn(
+    `[permissions] BLOCKED non-superadmin attempt to grant ${levelCode} (SUPERADMIN) by ${req.user?.email ?? req.user?._id}`
+  )
+  res.status(403).json({
+    success: false,
+    message: 'Only a platform SuperAdmin can grant SuperAdmin level',
+  })
+  return true
+}
 
 // ── GET /api/permissions/templates/:levelCode ────────────────────────────────
 router.get('/templates/:levelCode', (req: any, res: any) => {
@@ -275,7 +301,7 @@ router.get('/list', async (req: any, res: any) => {
 })
 
 // ── POST /api/permissions/grant ──────────────────────────────────────────────
-router.post('/grant', async (req: any, res: any) => {
+router.post('/grant', requireAccessConsoleWrite, async (req: any, res: any) => {
   try {
     const { email, workspaceId, universe, levelCode, designation, modules: moduleOverrides } = req.body
 
@@ -287,6 +313,7 @@ router.post('/grant', async (req: any, res: any) => {
     if (!template) {
       return res.status(400).json({ success: false, message: `Unknown levelCode: ${levelCode}` })
     }
+    if (refuseSuperAdminLevel(req, res, levelCode)) return
 
     const normalizedEmail = String(email).toLowerCase()
     const user = await User.findOne({
@@ -407,7 +434,7 @@ router.post('/grant', async (req: any, res: any) => {
 })
 
 // ── PATCH /api/permissions/update ────────────────────────────────────────────
-router.patch('/update', async (req: any, res: any) => {
+router.patch('/update', requireAccessConsoleWrite, async (req: any, res: any) => {
   try {
     const { userId, modules: moduleChanges, level: levelChanges, levelCode: levelCodeBody, designation } = req.body
 
@@ -462,6 +489,9 @@ router.patch('/update', async (req: any, res: any) => {
 
     // Accept levelCode as a top-level field (sent by AccessConsole frontend)
     const resolvedLevelCode = levelCodeBody || levelChanges?.code
+    // This path syncs User.roles from the resolved level (see below), so it
+    // is a third way to mint a SUPERADMIN and needs the same ceiling.
+    if (resolvedLevelCode && refuseSuperAdminLevel(req, res, resolvedLevelCode)) return
     if (resolvedLevelCode) {
       existing.level.code = resolvedLevelCode
       const levelMeta = LEVEL_METADATA.find(l => l.code === resolvedLevelCode)
@@ -514,7 +544,7 @@ router.patch('/update', async (req: any, res: any) => {
 
 // ── PATCH /api/permissions/demo-access ───────────────────────────────────────
 // Demo Platform — grant or revoke a STAFF user's ability to impersonate
-// mapped demo seed users. Router-level gate is requireSuperAdminOrTenantAdmin
+// mapped demo seed users. Router-level gate is requireAccessConsole
 // (too loose for this feature), so we re-gate with requireSuperAdmin here.
 router.patch('/demo-access', requireSuperAdmin, async (req: any, res: any) => {
   try {
@@ -661,7 +691,7 @@ router.get('/demo-seed-users', requireSuperAdmin, async (_req: any, res: any) =>
 })
 
 // ── POST /api/permissions/apply-template ─────────────────────────────────────
-router.post('/apply-template', async (req: any, res: any) => {
+router.post('/apply-template', requireAccessConsoleWrite, async (req: any, res: any) => {
   try {
     const { userId, levelCode } = req.body
 
@@ -673,6 +703,8 @@ router.post('/apply-template', async (req: any, res: any) => {
     if (!template) {
       return res.status(400).json({ success: false, message: `Unknown levelCode: ${levelCode}` })
     }
+
+    if (refuseSuperAdminLevel(req, res, levelCode)) return
 
     const existing = await UserPermission.findOne({ userId })
     if (!existing) {
@@ -762,7 +794,7 @@ router.post('/apply-template', async (req: any, res: any) => {
 })
 
 // ── POST /api/permissions/revoke ─────────────────────────────────────────────
-router.post('/revoke', async (req: any, res: any) => {
+router.post('/revoke', requireAccessConsoleWrite, async (req: any, res: any) => {
   try {
     const { userId } = req.body
     if (!userId) {
