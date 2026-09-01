@@ -688,7 +688,7 @@ const SERVICE_BUCKET_EXPR = {
     branches: [
       { case: { $in: ["$type", ["FLIGHT", "FLIGHT_RESCHEDULE", "DUMMY_FLIGHT"]] }, then: "FLIGHT" },
       { case: { $in: ["$type", ["HOTEL", "DUMMY_HOTEL"]] }, then: "HOTEL" },
-      { case: { $in: ["$type", ["VISA", "US_VISA_EARLY_APPOINTMENT_FEE"]] }, then: "VISA" },
+      { case: { $eq: ["$type", "VISA"] }, then: "VISA" },
       { case: { $eq: ["$type", "CAB"] }, then: "CAB" },
       { case: { $eq: ["$type", "FOREX"] }, then: "FOREX" },
       { case: { $eq: ["$type", "EVENTS"] }, then: "MICE" },

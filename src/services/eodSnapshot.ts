@@ -580,13 +580,15 @@ export function buildEodMessageFromSnapshot(snapshot: EodSnapshot): string {
           ? "✈️"
           : b._id === "HOTEL"
             ? "🏨"
-            : b._id === "VISA" || b._id === "US_VISA_EARLY_APPOINTMENT_FEE"
+            : b._id === "VISA"
               ? "📑"
-              : b._id === "TRANSFER" || b._id === "CAB"
-                ? "🚖"
-                : b._id === "TRAIN"
-                  ? "🚆"
-                  : "📦";
+              : b._id === "US_VISA_EARLY_APPOINTMENT_FEE"
+                ? "🇺🇸"
+                : b._id === "TRANSFER" || b._id === "CAB"
+                  ? "🚖"
+                  : b._id === "TRAIN"
+                    ? "🚆"
+                    : "📦";
       msg += `${emoji} ${b._id}: ${b.bookings} booking${b.bookings !== 1 ? "s" : ""} · ${formatINR(b.netSales)} · ${b.margin.toFixed(1)}% margin\n`;
     });
     msg += `\n`;

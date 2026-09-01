@@ -334,7 +334,7 @@ async function buildOutcomes(from: Date, to: Date) {
  * ───────────────────────────────────────────────────────────────────── */
 async function buildValue() {
   const grouped = await ManualBooking.aggregate([
-    { $match: { type: { $in: ["VISA", "US_VISA_EARLY_APPOINTMENT_FEE"] }, status: { $in: ["WIP", "CONFIRMED"] } } },
+    { $match: { type: "VISA", status: { $in: ["WIP", "CONFIRMED"] } } },
     { $group: { _id: "$status", total: { $sum: "$pricing.grandTotal" } } },
   ]);
   const totalByStatus = new Map<string, number>((grouped as any[]).map((g) => [g._id, g.total]));

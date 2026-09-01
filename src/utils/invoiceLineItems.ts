@@ -8,7 +8,7 @@ const TYPE_COST_LABELS: Record<string, string> = {
   DUMMY_HOTEL:  "Hotel Cost",
   TRAIN:        "Train Cost",
   VISA:         "Visa Cost",
-  US_VISA_EARLY_APPOINTMENT_FEE: "Visa Cost",
+  US_VISA_EARLY_APPOINTMENT_FEE: "US Visa early Appointment Fee",
   TRANSFER:     "Transfer Cost",
   CAB:          "Cab Cost",
   FOREX:        "Forex Cost",
@@ -179,9 +179,13 @@ function buildSubDescription(booking: any, paxStr: string): string {
       checkIn  ? `Check-in: ${checkIn}`   : undefined,
       checkOut ? `Check-out: ${checkOut}` : undefined,
     ];
-  } else if (t === "VISA" || t === "US_VISA_EARLY_APPOINTMENT_FEE") {
+  } else if (t === "VISA") {
     const dateStr = fmtDate(booking.travelDate);
     parts = [paxStr, "Visa Service", dateStr ? `Travel Date: ${dateStr}` : undefined];
+  } else if (t === "US_VISA_EARLY_APPOINTMENT_FEE") {
+    // Standalone type — same descriptor SHAPE as Visa, but carries its own name.
+    const dateStr = fmtDate(booking.travelDate);
+    parts = [paxStr, "US Visa early Appointment Fee", dateStr ? `Travel Date: ${dateStr}` : undefined];
   } else if (t === "HOLIDAYS") {
     const desc    = booking.itinerary?.description || "";
     const dateStr = fmtDate(booking.travelDate);
@@ -405,7 +409,7 @@ const COMBINED_COST_LABELS: Record<string, string> = {
   HOTEL:             "Hotel Booking",
   TRAIN:             "Train Booking",
   VISA:              "VISA",
-  US_VISA_EARLY_APPOINTMENT_FEE: "VISA",
+  US_VISA_EARLY_APPOINTMENT_FEE: "US Visa early Appointment Fee",
 };
 function combinedCostLabel(groupKey: string): string {
   return COMBINED_COST_LABELS[groupKey] || TYPE_COST_LABELS[groupKey] || "Service Cost";

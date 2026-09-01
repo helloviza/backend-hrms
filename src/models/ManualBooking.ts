@@ -540,9 +540,7 @@ function manualTypeToService(t: string): string {
     case "DUMMY_FLIGHT": return "FLIGHT";
     case "HOTEL":
     case "DUMMY_HOTEL":  return "HOTEL";
-    case "VISA":
-    case "US_VISA_EARLY_APPOINTMENT_FEE":  // a visa fee — mirrors as VISA, same as its group sibling
-                         return "VISA";
+    case "VISA":         return "VISA";
     case "CAB":          return "CAB";
     case "TRANSFER":     return "TRANSFER";
     case "FOREX":        return "FOREX";
@@ -555,6 +553,8 @@ function manualTypeToService(t: string): string {
     case "GIFT":
     case "STATIONERY":
     case "INSURANCE":
+    case "US_VISA_EARLY_APPOINTMENT_FEE": // standalone type with no TravelBooking.service slot — same
+                                          // treatment as INSURANCE: own identity everywhere else, OTHER here
     case "GROUP_BOOKING":  return "OTHER"; // for now — revisit once the line-item builder lands
     default:             return "OTHER";
   }
