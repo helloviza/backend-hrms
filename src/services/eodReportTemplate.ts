@@ -65,6 +65,7 @@ function bookingTypeLabel(t: string): string {
     case "HOTEL":
       return "Hotels";
     case "VISA":
+    case "US_VISA_EARLY_APPOINTMENT_FEE":
       return "Visas";
     case "TRANSFER":
     case "CAB":

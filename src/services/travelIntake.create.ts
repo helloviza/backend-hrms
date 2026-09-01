@@ -48,6 +48,7 @@ const CANONICAL_SERVICE_TYPE_MAP: Record<string, ManualBookingType> = {
   "Transfer": "TRANSFER",
   "Cab": "CAB",
   "Visa": "VISA",
+  "US Visa early Appointment Fee": "US_VISA_EARLY_APPOINTMENT_FEE",
   "Holidays": "HOLIDAYS",
   "Events": "EVENTS",
   "Group Booking": "GROUP_BOOKING",

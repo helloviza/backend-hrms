@@ -35,6 +35,7 @@ export const MANUAL_BOOKING_TYPES = [
   "DUMMY_FLIGHT", "DUMMY_HOTEL", "TRAIN",
   "FLIGHT_RESCHEDULE", "TROPHY", "GIFT", "STATIONERY",
   "INSURANCE", "GROUP_BOOKING",
+  "US_VISA_EARLY_APPOINTMENT_FEE",
 ] as const;
 
 export type ManualBookingType = (typeof MANUAL_BOOKING_TYPES)[number];
@@ -539,7 +540,9 @@ function manualTypeToService(t: string): string {
     case "DUMMY_FLIGHT": return "FLIGHT";
     case "HOTEL":
     case "DUMMY_HOTEL":  return "HOTEL";
-    case "VISA":         return "VISA";
+    case "VISA":
+    case "US_VISA_EARLY_APPOINTMENT_FEE":  // a visa fee — mirrors as VISA, same as its group sibling
+                         return "VISA";
     case "CAB":          return "CAB";
     case "TRANSFER":     return "TRANSFER";
     case "FOREX":        return "FOREX";

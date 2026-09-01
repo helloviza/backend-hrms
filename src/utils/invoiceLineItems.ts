@@ -8,6 +8,7 @@ const TYPE_COST_LABELS: Record<string, string> = {
   DUMMY_HOTEL:  "Hotel Cost",
   TRAIN:        "Train Cost",
   VISA:         "Visa Cost",
+  US_VISA_EARLY_APPOINTMENT_FEE: "Visa Cost",
   TRANSFER:     "Transfer Cost",
   CAB:          "Cab Cost",
   FOREX:        "Forex Cost",
@@ -119,7 +120,7 @@ function buildUnitCountPrefix(booking: any): string {
   if (t === "FLIGHT" || t === "FLIGHT_RESCHEDULE" || t === "DUMMY_FLIGHT" || t === "TRAIN") {
     return `${paxCount} ${paxCount === 1 ? "Passenger" : "Passengers"}`;
   }
-  if (t === "VISA") {
+  if (t === "VISA" || t === "US_VISA_EARLY_APPOINTMENT_FEE") {
     return `${paxCount} ${paxCount === 1 ? "Applicant" : "Applicants"}`;
   }
   if (t === "TRANSFER" || t === "CAB" || t === "HOLIDAYS") {
@@ -178,7 +179,7 @@ function buildSubDescription(booking: any, paxStr: string): string {
       checkIn  ? `Check-in: ${checkIn}`   : undefined,
       checkOut ? `Check-out: ${checkOut}` : undefined,
     ];
-  } else if (t === "VISA") {
+  } else if (t === "VISA" || t === "US_VISA_EARLY_APPOINTMENT_FEE") {
     const dateStr = fmtDate(booking.travelDate);
     parts = [paxStr, "Visa Service", dateStr ? `Travel Date: ${dateStr}` : undefined];
   } else if (t === "HOLIDAYS") {
@@ -404,6 +405,7 @@ const COMBINED_COST_LABELS: Record<string, string> = {
   HOTEL:             "Hotel Booking",
   TRAIN:             "Train Booking",
   VISA:              "VISA",
+  US_VISA_EARLY_APPOINTMENT_FEE: "VISA",
 };
 function combinedCostLabel(groupKey: string): string {
   return COMBINED_COST_LABELS[groupKey] || TYPE_COST_LABELS[groupKey] || "Service Cost";

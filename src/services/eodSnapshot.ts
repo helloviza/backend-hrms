@@ -580,7 +580,7 @@ export function buildEodMessageFromSnapshot(snapshot: EodSnapshot): string {
           ? "✈️"
           : b._id === "HOTEL"
             ? "🏨"
-            : b._id === "VISA"
+            : b._id === "VISA" || b._id === "US_VISA_EARLY_APPOINTMENT_FEE"
               ? "📑"
               : b._id === "TRANSFER" || b._id === "CAB"
                 ? "🚖"

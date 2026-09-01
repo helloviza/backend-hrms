@@ -32,7 +32,9 @@ function manualTypeToService(t: string): string {
     case "DUMMY_FLIGHT": return "FLIGHT";
     case "HOTEL":
     case "DUMMY_HOTEL":  return "HOTEL";
-    case "VISA":         return "VISA";
+    case "VISA":
+    case "US_VISA_EARLY_APPOINTMENT_FEE":  // keep in lockstep with models/ManualBooking.ts
+                         return "VISA";
     case "CAB":          return "CAB";
     case "TRANSFER":     return "TRANSFER";
     case "FOREX":        return "FOREX";
