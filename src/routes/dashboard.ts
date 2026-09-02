@@ -18,6 +18,20 @@ const router = Router();
 // ---------------------------------------------------------------------------
 // Helpers to parse dates & filters
 // ---------------------------------------------------------------------------
+/**
+ * Roles allowed to request the org-wide member list (?scope=org) on
+ * GET /manager. Mirrors the org-wide set used by GET /api/attendance/reports
+ * and GET /api/attendance/payroll-summary — keep the three in step.
+ */
+function hasOrgWideRole(user: any): boolean {
+  const roles: string[] = Array.isArray(user?.roles) ? user.roles : [];
+  return roles.some((r) =>
+    ["HR", "ADMIN", "SUPERADMIN", "TENANT_ADMIN"].includes(
+      String(r).toUpperCase().replace(/[\s-]/g, "_"),
+    ),
+  );
+}
+
 function parseDate(input: any): Date | null {
   if (!input) return null;
 
@@ -313,10 +327,29 @@ router.get(
       delete teamFilter.managerId;
     }
 
+    /* OPT-IN org-wide member list: ?scope=org, honoured only for HR / ADMIN /
+     * TENANT_ADMIN (SUPERADMIN is already unscoped above).
+     *
+     * Deliberately opt-in rather than automatic. The other caller of this
+     * endpoint — pages/dashboard/Manager.tsx — renders "your team ... mapped to
+     * you" and counts teamSize off this list, so silently widening it for HR
+     * would turn that page into a whole-org roster. The attendance team view
+     * asks for it explicitly; the manager dashboard does not and is unchanged. */
+    const wantsOrgScope =
+      String((req.query as any)?.scope || "").toLowerCase() === "org";
+    const mayUseOrgScope =
+      isSuperAdmin(req) || hasOrgWideRole((req as any).user);
+    if (wantsOrgScope && mayUseOrgScope) {
+      delete teamFilter.managerId;
+    }
+
     // ── FIX 3: Include phone + email in select ──
     const employees = await Employee.find(teamFilter)
       .select(
-        "fullName name email employeeCode employeeId department location jobTitle designation hrmsAccessRole status joiningDate managerId phone email"
+        // ownerId is the User._id behind each Employee. Attendance, leaves and
+        // every other per-person record key on User._id, so a consumer that
+        // only had Employee._id was querying the wrong id-space.
+        "fullName name email employeeCode employeeId department location jobTitle designation hrmsAccessRole status joiningDate managerId phone email ownerId"
       )
       .sort({ fullName: 1 })
       .limit(200)
@@ -340,6 +373,15 @@ router.get(
 
     const enriched = employees.map((e: any) => ({
       ...e,
+      /* The member's USER id, additively. Resolved from ownerId, falling back
+       * to the email→User join above for legacy Employee rows that never had
+       * ownerId set. Consumers that need to query attendance/leave for a member
+       * must use THIS, not _id (which is Employee-space). */
+      userId: e.ownerId
+        ? String(e.ownerId)
+        : userMap.get(e.email)?._id
+          ? String(userMap.get(e.email)._id)
+          : "",
       designation:
         userMap.get(e.email)?.designation || e.designation || e.jobTitle || "",
       roleTitle:

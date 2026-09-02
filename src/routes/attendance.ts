@@ -132,17 +132,92 @@ r.get("/reports", requireWorkspace, async (req, res) => {
     });
   }
 
-  // ───────────────── legacy list mode (admin reports etc.) ─────────────────
-  const authUserId2 = (req as any).user?.sub;
-  const targetUserId = userIdParam || authUserId2;
+  /* ───────────────── list mode — team / self attendance ─────────────────
+   * Scoping is resolved in USER id-space, because Attendance.userId refs User.
+   * The report set mirrors GET /regularize/team below:
+   *
+   *   HR / ADMIN / SUPERADMIN → the whole workspace
+   *   MANAGER                 → their direct reports (Employee.managerId →
+   *                             ownerId); they may also open their own record
+   *   everyone else           → themselves only
+   *
+   * Two separate sets, deliberately:
+   *   viewableIds  — what an unfiltered ("all") request spans. For a manager
+   *                  this is their REPORTS, not themselves: collapsing to the
+   *                  caller's own id is what made "All reportees" show a
+   *                  manager only their own attendance, labelled as the team's.
+   *                  A manager with no reports now gets an honest empty set.
+   *   permittedIds — what an explicit ?userId is allowed to name. Reports plus
+   *                  self, since your own record is always yours to read.
+   *                  Previously this was a ROLE check only, so any MANAGER
+   *                  could pass any colleague's id and read their punches.
+   */
+  const authUserId2 = String((req as any).user?.sub || "");
+  const workspaceObjectId = (req as any).workspaceObjectId;
 
-  // Non-admin users can only view their own attendance
-  if (userIdParam && !hasRole(req, "MANAGER", "HR", "ADMIN") && String(userIdParam) !== String(authUserId2)) {
+  if (!authUserId2) {
+    return res.status(401).json({ message: "Unauthorised" });
+  }
+
+  /* DECISION: HR is ORG-WIDE on this screen, matching the payroll-summary
+   * precedent (GET /payroll-summary is HR/ADMIN over the whole workspace).
+   * Previously HR was handed a manager's scoping and saw only their own
+   * reports — which for a typical HR user is nobody. To make HR
+   * manager-scoped again, remove "HR" from this one call; nothing else
+   * needs to change. hasRole() already treats SUPERADMIN as passing. */
+  const isOrgWide = hasRole(req, "HR", "ADMIN");
+
+  // null = unrestricted (org-wide); otherwise an explicit allow-list.
+  let viewableIds: string[] | null = null;
+  let permittedIds: string[] | null = null;
+
+  if (!isOrgWide) {
+    const reportIds: string[] = [];
+    const isManager = hasRole(req, "MANAGER");
+
+    if (isManager) {
+      // Resolve the caller's OWN Employee doc, then their reports — the same
+      // two hops /regularize/team makes. Employee.managerId is Employee-space;
+      // ownerId brings each report back to User-space for the query below.
+      const myEmp = await Employee.findOne({
+        ownerId: authUserId2,
+        workspaceId: workspaceObjectId,
+      })
+        .select("_id")
+        .lean();
+
+      if (myEmp) {
+        const reports = await Employee.find({
+          managerId: (myEmp as any)._id,
+          workspaceId: workspaceObjectId,
+        })
+          .select("ownerId")
+          .lean();
+        for (const rep of reports as any[]) {
+          if (rep?.ownerId) reportIds.push(String(rep.ownerId));
+        }
+      }
+    }
+
+    /* A MANAGER's unfiltered view is their REPORTS — an empty list stays empty
+     * rather than falling back to self, so a manager with nobody mapped to them
+     * sees "no data" instead of their own row dressed up as the team.
+     * A non-manager's unfiltered view is their own record. */
+    viewableIds = isManager ? reportIds : [authUserId2];
+    permittedIds = [...new Set([...reportIds, authUserId2])];
+  }
+
+  if (userIdParam && permittedIds && !permittedIds.includes(String(userIdParam))) {
     return res.status(403).json({ error: "Cannot view other users attendance" });
   }
 
-  const q: any = { workspaceId: (req as any).workspaceObjectId };
-  if (targetUserId) q.userId = targetUserId;
+  const q: any = { workspaceId: workspaceObjectId };
+  if (userIdParam) {
+    q.userId = String(userIdParam);
+  } else if (viewableIds) {
+    q.userId = { $in: viewableIds };
+  }
+  // org-wide with no ?userId → the workspace filter alone is the scope
   if (from && to) q.date = { $gte: from, $lte: to };
 
   const items = await Attendance.find(q).lean();
