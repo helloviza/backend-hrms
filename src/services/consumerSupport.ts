@@ -58,6 +58,18 @@ export const CALLBACK_TAG = "callback";
 /** Tag marking every ticket this file creates, so ops can see the channel. */
 export const CONSUMER_SUPPORT_TAG = "d2c-support";
 
+/**
+ * Tag on a case filed for an UNVERIFIED email address — an anonymous lead
+ * that owns no account here (see the `lead` input below).
+ *
+ * It is on the ticket rather than only in the body because it changes how
+ * an agent should treat the thread: nobody has proved they hold that
+ * address, so it must not be used to disclose anything the sender did not
+ * themselves supply. A tag is the one place the console shows that before
+ * the agent starts typing.
+ */
+export const UNVERIFIED_LEAD_TAG = "unverified-lead";
+
 export function isAllowedSubject(value: unknown): value is ConsumerSupportSubject {
   return (
     typeof value === "string" &&
@@ -103,7 +115,35 @@ function escapeHtml(text: string): string {
 }
 
 export interface CreateConsumerSupportCaseInput {
-  consumerId: string | mongoose.Types.ObjectId;
+  /**
+   * The account this case belongs to. EXACTLY ONE of `consumerId` and
+   * `lead` must be given — see the identity fork in the function body.
+   */
+  consumerId?: string | mongoose.Types.ObjectId | null;
+  /**
+   * AN ANONYMOUS LEAD — a caller who has no account and is not being given
+   * one. Added for the public Visa Profile Score gate (routes/
+   * public.visaScore.ts), which captures an email mid-assessment.
+   *
+   * ── HOW THIS SITS WITH INVARIANT 1 AT THE TOP OF THIS FILE ──────────
+   * That invariant says fromEmail is read from the server-side consumer
+   * record and never taken from a request body. It still holds wherever
+   * there IS a record: `consumerId` is the only way to file against an
+   * account, and the read below is unchanged. What it protected against was
+   * a caller naming somebody ELSE's account as the sender — impossible
+   * here, because this branch is chosen only after the caller's route has
+   * confirmed the address matches no consumer at all. A ticket on this
+   * branch is attached to no account, grants no access to one, and is
+   * tagged UNVERIFIED_LEAD_TAG so an agent knows the address is a claim
+   * rather than an identity.
+   *
+   * The alternative — mint a passwordless Consumer just so this function
+   * had an id to read — would have written a real identity, into the
+   * consumer registry and the DPDP erasure surface, for someone who only
+   * typed an email into a calculator. That is a heavier act than the one
+   * being requested.
+   */
+  lead?: { email: string; name?: string } | null;
   subject: ConsumerSupportSubject;
   message: string;
   /** Only meaningful for the callback subject; folded into the body. */
@@ -132,6 +172,16 @@ export interface CreateConsumerSupportCaseInput {
    * allowlist never sends it to a consumer.
    */
   enquiryRef?: string | null;
+  /**
+   * Extra ops FILING TAGS, appended to the ones this service always sets.
+   *
+   * Unlike enquiryRef these are meant to be seen: a channel that wants its
+   * own queue filter (the score gate's "visa-score-lead") says so here
+   * rather than by inventing a subject outside CONSUMER_SUPPORT_SUBJECTS,
+   * which is a closed allowlist for a reason. Deduped, so a caller cannot
+   * double a tag this function already applied.
+   */
+  extraTags?: readonly string[];
 }
 
 export interface CreateConsumerSupportCaseResult {
@@ -152,26 +202,52 @@ export interface CreateConsumerSupportCaseResult {
 export async function createConsumerSupportCase(
   input: CreateConsumerSupportCaseInput,
 ): Promise<CreateConsumerSupportCaseResult> {
-  const consumerObjectId = new mongoose.Types.ObjectId(String(input.consumerId));
-
-  // THE INTEGRITY READ. The identity on the ticket is whatever the database
-  // says this consumer is, resolved here and not accepted from the caller.
-  const consumer = await Consumer.findById(consumerObjectId)
-    .select("_id email name")
-    .lean();
-
-  if (!consumer) {
-    throw new Error("Consumer not found");
+  /* ── THE IDENTITY FORK ──────────────────────────────────────────────
+   * Exactly one of the two, checked rather than assumed: passing both
+   * would leave the sender ambiguous and passing neither would produce a
+   * ticket with no fromEmail, which is a thread no agent can answer. */
+  const hasConsumer = Boolean(input.consumerId);
+  const hasLead = Boolean(input.lead);
+  if (hasConsumer === hasLead) {
+    throw new Error("createConsumerSupportCase requires exactly one of consumerId or lead");
   }
 
-  const fromEmail = String((consumer as any).email || "").toLowerCase();
-  const fromName = String((consumer as any).name || "");
+  let consumerObjectId: mongoose.Types.ObjectId | null = null;
+  let fromEmail: string;
+  let fromName: string;
 
-  if (!fromEmail) {
-    // Not reachable through the router (requireConsumer loaded this same
-    // record), but a ticket with no fromEmail is unrepliable, so refuse it
-    // rather than create one an agent cannot answer.
-    throw new Error("Consumer has no email address");
+  if (hasConsumer) {
+    consumerObjectId = new mongoose.Types.ObjectId(String(input.consumerId));
+
+    // THE INTEGRITY READ. The identity on the ticket is whatever the database
+    // says this consumer is, resolved here and not accepted from the caller.
+    const consumer = await Consumer.findById(consumerObjectId)
+      .select("_id email name")
+      .lean();
+
+    if (!consumer) {
+      throw new Error("Consumer not found");
+    }
+
+    fromEmail = String((consumer as any).email || "").toLowerCase();
+    fromName = String((consumer as any).name || "");
+
+    if (!fromEmail) {
+      // Not reachable through the router (requireConsumer loaded this same
+      // record), but a ticket with no fromEmail is unrepliable, so refuse it
+      // rather than create one an agent cannot answer.
+      throw new Error("Consumer has no email address");
+    }
+  } else {
+    fromEmail = String(input.lead?.email || "").trim().toLowerCase();
+    fromName = String(input.lead?.name || "").trim();
+
+    /* The same shape check every door applies before it accepts an address.
+     * It is not verification — nothing here proves the person holds it —
+     * but an unrepliable string must never become a ticket. */
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(fromEmail)) {
+      throw new Error("Lead email address is not valid");
+    }
   }
 
   const trimmedMessage = input.message.trim();
@@ -179,6 +255,11 @@ export async function createConsumerSupportCase(
 
   const tags = [CONSUMER_SUPPORT_TAG];
   if (input.subject === CALLBACK_SUBJECT) tags.push(CALLBACK_TAG);
+  if (!hasConsumer) tags.push(UNVERIFIED_LEAD_TAG);
+  for (const t of input.extraTags ?? []) {
+    const tag = String(t).trim();
+    if (tag && !tags.includes(tag)) tags.push(tag);
+  }
 
   const enquiryRef = input.enquiryRef?.trim() || "";
 
@@ -232,7 +313,7 @@ export async function createConsumerSupportCase(
   supportLogger.info("[ConsumerSupport] Created web case", {
     ticketRef: ticket.ticketRef,
     ticketId: String(ticket._id),
-    consumerId: String(consumerObjectId),
+    consumerId: consumerObjectId ? String(consumerObjectId) : null,
     subject: input.subject,
   });
 

@@ -357,10 +357,18 @@ export const consumerPassportExtractLimiter = rateLimit({
  * live-updating assessments per window while still putting full extraction
  * of even one corridor over multiple windows.
  *
- * If Phase 3 scores once on submit rather than per answer, this should
- * come down sharply — 15 or 20 would then be generous. Revisit it when
- * that decision is made rather than leaving it at the looser number by
- * default.
+ * ── DECIDED, PHASE 3b: SIXTY STAYS. ─────────────────────────────────
+ * The open question above was "does Phase 3 score once on submit, or per
+ * answer?", because a score-once UI would make 15 or 20 generous. It
+ * scores PER ANSWER — the live gauge is the product — so the looser
+ * number is not a default left standing, it is the sized one: ~15 calls
+ * for one assessment, four assessments per window.
+ *
+ * This also became the ONLY control on /score in the same phase. The
+ * endpoint's Turnstile gate was removed because a per-submission token
+ * cannot cover a per-answer gauge (routes/public.visaScore.ts states the
+ * full reasoning at the route). Cutting this to 20 now would break an
+ * honest reader's second assessment AND leave nothing else standing.
  */
 export const visaScoreLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -369,4 +377,29 @@ export const visaScoreLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many scoring requests, please try again later.' },
+});
+
+/* ── VISA PROFILE SCORE — LEAD CAPTURE (2026-09-02) ───────────────────
+ * POST /api/public/visa-score/lead — the email gate on the breakdown.
+ *
+ * A DIFFERENT limit from visaScoreLimiter above, and deliberately its own
+ * budget rather than a share of one. /score computes and writes nothing;
+ * this endpoint CREATES A TICKET in the queue ops actually works, so the
+ * cost of abuse is somebody's inbox rather than some CPU.
+ *
+ * WHY 5. The honest ceiling is one submission per assessment, and a reader
+ * comparing three destinations submits three. Five leaves room for a retry
+ * after a transport failure — which the submissionId dedupe absorbs
+ * anyway — and puts a scripted flood of ops tickets out of reach at four
+ * per hour per address. travelRequestLimiter's 8 is NOT reused: the two
+ * doors would then share one counter, and an enquiry form submission would
+ * eat a score submission's budget for no reason a user could understand.
+ */
+export const visaScoreLeadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests, please try again later.' },
 });

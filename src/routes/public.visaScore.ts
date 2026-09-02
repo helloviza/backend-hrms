@@ -18,8 +18,13 @@
 // already converted.
 //
 // It is also safe to be public, which is the part that matters more:
-//   · no PII is required — the inputs are OPTION INDICES, not identity;
-//   · nothing is persisted, by anyone, on any path (see DPDP below);
+//   · no PII is required to be SCORED — the inputs are option indices,
+//     not identity. POST /lead takes an email, but only because the reader
+//     typed one to unlock their breakdown, and it is the one endpoint here
+//     that does;
+//   · the assessment is never persisted, by anyone, on any path. /lead
+//     writes a support ticket carrying the DERIVED result and nothing
+//     else — never the answers (see DPDP below);
 //   · every read is global reference data — the ruleset file and the
 //     country seed. No traveller, no workspace, no user, no case. There is
 //     no id a caller can supply that reaches a record.
@@ -43,7 +48,14 @@
 //                       NO deltas. These are restatements of a public
 //                       statistic, not part of the model.
 //   GET /meta/ruleset   version, provenance, citations. NO weights.
-//   POST /score         the RESULT. No inputs echoed, no weights.
+//   POST /score         the RESULT. No inputs echoed, no weights. NO
+//                       Turnstile — the gauge scores per answer and a
+//                       per-submission token cannot cover that; the rate
+//                       limit is this endpoint's control. See its header.
+//   POST /lead          a ticketRef. The email gate on the breakdown; it
+//                       WRITES (one Ticket), and is the only one that
+//                       does. Keeps its own honeypot + tighter limiter.
+//                       No weights, no answers — see its own header.
 //
 // publicVisaScore.test.ts greps every serialised response for the actual
 // delta values and asserts they are absent.
@@ -55,7 +67,9 @@
 // table in ~75 per corridor. The firewall raises the cost from "read the
 // bundle" to "run a few hundred requests"; the RATE LIMIT is what makes
 // that cost real. The two are one control, not two, and neither is
-// sufficient alone.
+// sufficient alone — and since Phase 3b they are the ONLY two, /score
+// having deliberately shed its Turnstile gate (see that route's header
+// for why a per-submission token cannot guard a per-answer gauge).
 import { Router } from "express";
 
 import {
@@ -67,7 +81,18 @@ import {
   schengenSyntheticRate,
   schengenSyntheticSeries,
   type ScoreAnswers,
+  type VisaScoreResult,
 } from "../services/visaProfileScore.js";
+/* The lead endpoint's two models and the shared case service. The rest of
+ * this file touches no model at all and must stay that way — see the
+ * scoped persistence note in the DPDP block below. */
+import Consumer from "../models/Consumer.js";
+import Ticket from "../models/Ticket.js";
+import {
+  createConsumerSupportCase,
+  isAllowedSubject,
+  type ConsumerSupportSubject,
+} from "../services/consumerSupport.js";
 import {
   BASE_RATES,
   SOURCED_APPROVAL,
@@ -77,8 +102,7 @@ import {
   type BaseRateMode,
 } from "../utils/visaDifficulty.js";
 import { findSeedCountry, isSeedReady, listSeedCountries } from "../config/visaCountrySeed.js";
-import { createTurnstileGate } from "../middleware/turnstile.js";
-import { visaScoreLimiter } from "../middleware/rateLimit.js";
+import { visaScoreLeadLimiter, visaScoreLimiter } from "../middleware/rateLimit.js";
 import logger from "../utils/logger.js";
 
 const router = Router();
@@ -93,8 +117,15 @@ const scoreLogger = logger.child({ module: "visaScore" });
  *
  * Three things make that true, and all three are needed:
  *
- *   1. NOTHING IS PERSISTED AT ALL. No endpoint here writes to Mongo. The
- *      strongest guarantee is the absence of a writer, not a redactor.
+ *   1. THE ANSWERS ARE NEVER PERSISTED. Three of the four endpoints here
+ *      write to Mongo at all; the fourth, POST /lead, writes exactly one
+ *      support ticket, and it is built from the engine's DERIVED output by
+ *      buildScoreBrief() — which drops every factor and flag belonging to
+ *      a sensitive question before a word of it is written. The answers
+ *      themselves are an argument to a pure function and are discarded
+ *      with the request. (Read that as: three endpoints have the absence
+ *      of a writer, which is the strongest guarantee; the fourth has a
+ *      writer that has never been given the sensitive values.)
  *   2. THE ACCESS LOG CANNOT SEE THEM. server.ts's morgan format is
  *      ":request-id :method :url :status :response-time ms" — no body, and
  *      these arrive in a POST body rather than a query string, so they
@@ -223,25 +254,39 @@ function validateScoreBody(body: any): string[] {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /**
- * ── WHY A TURNSTILE GATE ON A READ-SHAPED ENDPOINT ────────────────────
- * It computes rather than persists, so it is not a form submission in the
- * usual sense — but it is the one endpoint whose repeated use recovers the
- * model (see the firewall note in this file's header). The gate and the
- * limiter together are the anti-extraction control.
+ * ── NO TURNSTILE HERE. THE RATE LIMIT IS THE CONTROL. ─────────────────
+ * This endpoint carried a createTurnstileGate("visa-score") until Phase 3b
+ * and no longer does. That is a DELIBERATE REMOVAL, recorded here because
+ * a missing gate is exactly the kind of thing a later reader re-adds in
+ * good faith.
  *
- * CONSEQUENCE FOR PHASE 3, stated here because it is a product constraint
- * and not an implementation detail: a Turnstile token is per-submission, so
- * the client must score ONCE when the questionnaire is complete. The
- * reference UI re-scores on every answer to animate its gauge; that design
- * would need ~15 tokens per assessment and cannot work against this gate.
- * If the live gauge is wanted, the choice is to drop the gate and lean
- * entirely on the rate limit — worth deciding deliberately rather than
- * discovering during the UI build.
+ * A Turnstile token is PER-SUBMISSION. The Phase 3a gauge scores on every
+ * answered question — ~15 calls per assessment — so it would need ~15
+ * tokens, and a widget cannot mint them. The gate was therefore not a
+ * stricter control than the limiter, it was a BROKEN one: the client sends
+ * no token, so in production (where TURNSTILE_SECRET is set) every score
+ * call returned 400 and the gauge was dead. It only appeared to work
+ * locally because .env.development sets TURNSTILE_DEV_BYPASS=true. The
+ * choice was the live gauge or the widget, and the live gauge is the
+ * product.
+ *
+ * WHAT GUARDS THIS ENDPOINT NOW: visaScoreLimiter, and nothing else. It
+ * stays at 60 per 15 minutes per IP precisely BECAUSE scoring is
+ * per-answer — one honest assessment costs ~15 calls, so 60 leaves room
+ * for a reader comparing a few corridors while still putting full
+ * extraction of even one corridor over multiple windows. Lowering it to
+ * the ~20 that a score-once-on-submit UI would allow would break the real
+ * per-answer case on a reader's first visit. See the limiter's own note.
+ *
+ * AND WHAT THIS DOES NOT CHANGE: POST /lead keeps its own, tighter gate —
+ * honeypot plus visaScoreLeadLimiter at 5 per 15 minutes — because it
+ * WRITES a ticket into a queue ops read. A compute endpoint and a write
+ * endpoint do not get the same control, and only /score lost anything
+ * here.
  */
 router.post(
   "/visa-score/score",
   visaScoreLimiter,
-  createTurnstileGate("visa-score"),
   async (req: any, res: any) => {
     try {
       const body = req.body ?? {};
@@ -599,5 +644,362 @@ router.get("/visa-score/meta/ruleset", async (_req: any, res: any) => {
     return res.status(500).json({ error: "Could not load ruleset metadata." });
   }
 });
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * POST /visa-score/lead — THE EMAIL GATE ON THE BREAKDOWN
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * The score, band and range are free (Phase 3a). The factor-by-factor
+ * breakdown — what is helping, what is holding the applicant back, and the
+ * consular rule each is assessed under — costs an email address. This is
+ * the endpoint behind that field.
+ *
+ * ── IT FILES A TICKET. IT DOES NOT CREATE AN ACCOUNT. ────────────────
+ * The lead lands in /admin/tickets, the same queue an emailed B2B case and
+ * a D2C support case land in, through the same services/consumerSupport.ts
+ * every other consumer door uses. There is no "score leads" table, because
+ * a second queue is the one nobody watches — the exact reasoning
+ * routes/public.visa.ts records for replacing its enquiry ManualBooking
+ * with a ticket.
+ *
+ * It differs from that door in one deliberate way: NO CONSUMER ACCOUNT IS
+ * CREATED. The enquiry form asks for a password because a person who has
+ * decided to enquire is signing up; this gate interrupts someone in the
+ * middle of an assessment they have not finished reading. Asking them to
+ * choose a password there costs conversions on the one surface whose whole
+ * job is capture, and it would mint an identity — in the consumer
+ * registry, in the DPDP erasure surface, in the marketing base — for
+ * somebody who only typed an address into a calculator. The ticket IS the
+ * lead. If they go on to apply, the account is made then, by the door that
+ * actually needs one.
+ *
+ * The one lookup that does happen: if the address ALREADY belongs to a
+ * consumer, the case is filed against that account, so it appears on their
+ * own /account/support beside everything else of theirs. Nothing is
+ * created on either branch and the response is identical, so the endpoint
+ * discloses nothing about who has an account here.
+ *
+ * ── THE BRIEF IS BUILT SERVER-SIDE, FROM A RECOMPUTED SCORE ──────────
+ * The request carries the ANSWERS, not the result. The engine is run again
+ * here and the ticket is written from ITS output, for two reasons:
+ *
+ *   1. TRUTH. A client-supplied score is a number ops would act on and
+ *      nobody checked. The engine is deterministic on (answers, route,
+ *      mode, ruleset), so the recomputed score is the same one the reader
+ *      saw — asserted by test rather than assumed.
+ *   2. NO CALLER-AUTHORED TEXT REACHES THE QUEUE. Every word of the brief
+ *      below comes from the ruleset. The only strings a caller controls
+ *      are their own email and name. A body assembled from client-sent
+ *      factor text would be an open write into an ops inbox.
+ *
+ * ── DPDP §12.7 — WHAT THE TICKET MAY NOT CARRY ───────────────────────
+ * The compliance and character answers are sensitive personal data, and
+ * this is the FIRST endpoint in this file that writes anything at all, so
+ * "nothing here is persisted" no longer covers it. What replaces it is
+ * narrower and explicit:
+ *
+ *   · the ANSWERS are never written and never logged unredacted — they are
+ *     an input to a pure function and are discarded with the request;
+ *   · buildScoreBrief() DROPS every factor and every flag belonging to a
+ *     sensitive question, so a disclosed overstay or conviction cannot
+ *     reach an ops screen through its factor line or its hard-stop
+ *     message;
+ *   · the brief does not say the score was CAPPED either. The only two
+ *     caps in the ruleset are the misrepresentation and custodial hard
+ *     stops, so "capped" names the sensitive fact by elimination. The band
+ *     is reported; why it is low is the applicant's to tell.
+ *
+ * ── ABUSE CONTROL ────────────────────────────────────────────────────
+ * No Turnstile, decided in Phase 3a: the gate itself is the friction, and
+ * a widget on the reveal step would cost more capture than it saves. What
+ * guards a write endpoint instead is the same trio public.travelRequest.ts
+ * uses minus the widget — honeypot (fake success, so a bot learns nothing),
+ * visaScoreLeadLimiter (15 min / 5 per IP), and a submissionId dedupe so a
+ * retry files one ticket rather than one per attempt.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/** Namespaced so a score lead can never false-dedupe against an enquiry. */
+const SCORE_LEAD_REF_PREFIX = "hvscore";
+
+/** Ops filter for this channel. A TAG, not a new subject — see below. */
+export const SCORE_LEAD_TAG = "visa-score-lead";
+
+/**
+ * MUST be a member of CONSUMER_SUPPORT_SUBJECTS.
+ *
+ * A "Visa readiness enquiry" subject was considered and rejected: that
+ * array is not a free ops taxonomy, it is the list a CONSUMER picks from in
+ * /account/support, and adding a subject there puts a phrase in a dropdown
+ * that no consumer filing a support case would ever mean. The channel is
+ * carried by SCORE_LEAD_TAG instead, which is what tags are for and what
+ * CALLBACK_TAG already does for the one other sub-channel.
+ */
+const SCORE_LEAD_SUBJECT: ConsumerSupportSubject = "Visa application help";
+
+/* Verified against the allowlist at module load rather than trusted from
+ * the comment — a typo here would be a 500 discovered by a customer. */
+if (!isAllowedSubject(SCORE_LEAD_SUBJECT)) {
+  throw new Error(
+    `public.visaScore: lead subject "${SCORE_LEAD_SUBJECT}" is not in CONSUMER_SUPPORT_SUBJECTS`,
+  );
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function normalizeLeadEmail(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+/**
+ * Is this factor or flag safe to put in front of an agent?
+ *
+ * The check is on the QUESTION ID, not on the message text, because the
+ * text is ruleset-authored and a future edit could reword a hard stop
+ * without anyone re-reading this file. The id is the stable fact.
+ */
+function isSensitiveQuestion(questionId: string): boolean {
+  return SENSITIVE_ANSWER_KEYS.includes(String(questionId));
+}
+
+/**
+ * THE OPS BRIEF — a self-diagnosed lead with its own objections on the
+ * front page.
+ *
+ * The point of filing a score lead as a ticket rather than as a row is that
+ * the visa desk opens it already knowing what the conversation is about:
+ * the corridor, where this applicant stands on it, and — the part that
+ * makes it a brief rather than a notification — WHICH FACTORS ARE HOLDING
+ * THEM BACK. "No travel history, employment under a year" is the objection
+ * the desk would otherwise spend the first call discovering.
+ *
+ * Exported for the test that asserts what is in it and, more importantly,
+ * what is not.
+ */
+export function buildScoreBrief(args: {
+  result: VisaScoreResult;
+  scoreMode: ScoreMode;
+  destinationName: string;
+  destinationIso2: string;
+  mode: BaseRateMode;
+}): string {
+  const { result, destinationName, destinationIso2 } = args;
+  const lines: string[] = [];
+
+  lines.push(`Visa Profile Score enquiry — ${destinationName} (${destinationIso2})`);
+
+  if (result.score !== null && result.band) {
+    lines.push(`Score ${result.score} · Band: ${result.band.name}`);
+  } else if (args.scoreMode === "suppressed") {
+    lines.push("No score — the engine withheld it for this route.");
+  } else {
+    lines.push("No score — this corridor has no sourced approval rate to assess against.");
+  }
+
+  if (result.range) {
+    lines.push(
+      `Likely range ${result.range.low}–${result.range.high} (${result.range.label.toLowerCase()} confidence)`,
+    );
+  }
+
+  /* Route context. baseRate and baseScore are already published on /routes
+   * and on the public map, so neither adds a disclosure here. */
+  if (result.build.baseRate !== null) {
+    /* baseRate is a PROBABILITY (0..1) — utils/visaDifficulty.ts's prob()
+     * normalises every published figure to one, and the engine works in
+     * that scale throughout. Printing it raw put "0.7333%" in front of an
+     * agent, which reads as a corridor nobody gets through. Converted here
+     * with the same display clamp the public map applies, so the number in
+     * the brief is the number on the site. */
+    const window = args.mode === "a5" ? "5-year average" : "3-year average";
+    const pct = clampDisplayPct(result.build.baseRate * 100);
+    lines.push(`Corridor approval rate ${pct.toFixed(1)}% (${window})`);
+  }
+  if (result.build.baseScore !== null) {
+    lines.push(`Where an average applicant on this route starts: ${result.build.baseScore}`);
+  }
+
+  /* ── THE OBJECTIONS. Sensitive questions dropped — see the DPDP note. */
+  const holding = result.factors.holdingBack.filter((f) => !isSensitiveQuestion(f.questionId));
+  const helping = result.factors.helping.filter((f) => !isSensitiveQuestion(f.questionId));
+
+  if (holding.length) {
+    lines.push("");
+    lines.push("HOLDING THEM BACK");
+    for (const f of holding.slice(0, 6)) {
+      lines.push(`· ${f.questionText}: ${f.answerLabel} (${f.impact}, ${f.cite})`);
+    }
+  }
+
+  if (helping.length) {
+    lines.push("");
+    lines.push("STRENGTHENING THE APPLICATION");
+    for (const f of helping.slice(0, 4)) {
+      lines.push(`· ${f.questionText}: ${f.answerLabel} (+${f.impact}, ${f.cite})`);
+    }
+  }
+
+  const flags = result.flags.filter((f) => !isSensitiveQuestion(f.questionId));
+  if (flags.length) {
+    lines.push("");
+    lines.push("FLAGS");
+    for (const f of flags.slice(0, 6)) {
+      lines.push(`· [${f.severity}] ${f.message}`);
+    }
+  }
+
+  lines.push("");
+  lines.push(
+    `Self-assessed on the public Visa Profile Score calculator (ruleset ${result.rulesetVersion}) at ${result.generatedAt}.`,
+  );
+  lines.push(
+    "The applicant's individual answers are not recorded — only the derived factors above. Anything sensitive they disclosed is deliberately absent, so ask rather than assume.",
+  );
+
+  return lines.join("\n");
+}
+
+function validateLeadBody(body: any): string[] {
+  const errors: string[] = [];
+
+  const email = normalizeLeadEmail(body?.email);
+  if (!email) errors.push("An email address is required");
+  else if (!EMAIL_RE.test(email)) errors.push("Email address is not valid");
+
+  if (!UUID_V4.test(String(body?.submissionId ?? ""))) errors.push("Invalid submission");
+
+  /* The route and the answers are validated by the SAME function /score
+   * uses. Two validators over one input shape is how two endpoints drift
+   * into disagreeing about what a valid assessment is. */
+  errors.push(...validateScoreBody(body));
+
+  return errors;
+}
+
+function leadHoneypotGate(req: any, res: any, next: any) {
+  const trap = req.body?.hpField;
+  if (typeof trap === "string" && trap.trim().length > 0) {
+    scoreLogger.warn("lead — honeypot triggered, discarding silently", {
+      ip: req.ip,
+    });
+    /* Fake success, and the DUPLICATE outcome specifically: it is the
+     * branch with no side effects to imitate, so a bot gets a plausible
+     * 200 with no ticket behind it and learns nothing about which field to
+     * leave blank next time. */
+    return res.status(200).json({ ok: true, outcome: "duplicate" });
+  }
+  next();
+}
+
+router.post(
+  "/visa-score/lead",
+  leadHoneypotGate,
+  visaScoreLeadLimiter,
+  async (req: any, res: any) => {
+    try {
+      const body = req.body ?? {};
+
+      const errors = validateLeadBody(body);
+      if (errors.length) {
+        // redactAnswers, never body — the same discipline /score applies.
+        scoreLogger.warn("lead rejected — invalid input", {
+          destination: String(body?.destination ?? "").toUpperCase().slice(0, 16),
+          errors,
+          answers: redactAnswers(body?.answers),
+        });
+        return res.status(400).json({ error: errors.join("; "), details: errors });
+      }
+
+      const email = normalizeLeadEmail(body.email);
+      const name = String(body.name ?? "").trim();
+      const passport = String(body.passport).trim().toUpperCase();
+      const destination = String(body.destination).trim().toUpperCase();
+      const mode = (body.mode ? String(body.mode) : RULESET.baseRate.defaultMode) as BaseRateMode;
+      const submissionId = String(body.submissionId).trim();
+      const enquiryRef = `${SCORE_LEAD_REF_PREFIX}:${submissionId}`;
+
+      /* ── IDEMPOTENCY, BEFORE ANYTHING IS WRITTEN ────────────────────
+       * The submissionId is minted once per assessment and re-sent on
+       * retry, so a double-click or a lost response does not file a second
+       * ticket. Verbatim the enquiry door's dedupe, on its own namespace. */
+      const prior = await Ticket.findOne({ "extractedFields.enquiryRef": enquiryRef })
+        .select("_id ticketRef")
+        .lean();
+      if (prior) {
+        return res.status(200).json({
+          ok: true,
+          outcome: "duplicate",
+          ticketRef: (prior as any).ticketRef,
+          reference: submissionId,
+        });
+      }
+
+      /* THE SCORE, RECOMPUTED. generatedAt is minted here for the reason
+       * /score mints its own: the engine is pure and must not read a
+       * clock. */
+      const result = computeVisaProfileScore({
+        passportIso2: passport,
+        destinationIso2: destination,
+        answers: body.answers as ScoreAnswers,
+        heldVisas: Array.isArray(body.heldVisas) ? body.heldVisas.map(String) : undefined,
+        mode,
+        generatedAt: new Date().toISOString(),
+      });
+      const scoreMode = resolveScoreMode(destination, result);
+
+      const brief = buildScoreBrief({
+        result,
+        scoreMode,
+        destinationName: destinationNameFor(destination) ?? destination,
+        destinationIso2: destination,
+        mode,
+      });
+
+      /* ── THE IDENTITY FORK ──────────────────────────────────────────
+       * A read, never a write. An address we already know is filed against
+       * that account so the case shows up on the person's own support
+       * page; one we do not know is filed as an anonymous lead. No account
+       * is created on either branch.
+       *
+       * There is deliberately NO B2B fork here, where the enquiry door has
+       * one and 409s. That fork exists to stop a second identity being
+       * minted for a corporate user — and nothing is minted here at all. A
+       * B2B colleague assessing their own personal trip is an ordinary
+       * lead, and refusing them mid-assessment would be a dead end with
+       * nothing behind it. */
+      const existing = await Consumer.findOne({ email }).select("_id").lean();
+
+      const { ticket } = await createConsumerSupportCase({
+        ...(existing
+          ? { consumerId: String((existing as any)._id) }
+          : { lead: { email, ...(name ? { name } : {}) } }),
+        subject: SCORE_LEAD_SUBJECT,
+        message: brief,
+        enquiryRef,
+        extraTags: [SCORE_LEAD_TAG],
+      });
+
+      scoreLogger.info("lead — case filed", {
+        destination,
+        ticketRef: ticket.ticketRef,
+        knownConsumer: Boolean(existing),
+        // The SCORE is logged. What produced it never is — see DPDP above.
+        score: result.score,
+      });
+
+      return res.status(201).json({
+        ok: true,
+        outcome: "filed",
+        ticketRef: ticket.ticketRef,
+        reference: submissionId,
+      });
+    } catch (err: any) {
+      scoreLogger.error("lead failed", { message: err?.message });
+      return res
+        .status(500)
+        .json({ error: "We couldn't unlock your breakdown just then. Please try again." });
+    }
+  },
+);
 
 export default router;

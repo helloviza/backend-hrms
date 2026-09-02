@@ -19,10 +19,18 @@ import express from "express";
 import request from "supertest";
 
 process.env.NODE_ENV = "test";
-// The gate is exercised as a real fail-closed control in its own block; the
-// happy paths run under the documented non-production bypass.
-process.env.TURNSTILE_DEV_BYPASS = "true";
-delete process.env.TURNSTILE_SECRET;
+/* ── DELIBERATELY PRODUCTION-SHAPED TURNSTILE ENV ──────────────────────
+ * A secret set, and NO dev bypass. This suite used to do the opposite,
+ * and that inversion is what hid the Phase 3a deploy blocker: /score
+ * carried a Turnstile gate, the client sent no token, and every call would
+ * have 400'd in production — while the tests passed all the way through
+ * because TURNSTILE_DEV_BYPASS=true waved them past.
+ *
+ * These two lines are now the load-bearing part of "no Turnstile on
+ * /score": under them, a re-added gate fails EVERY scoring test in this
+ * file rather than none of them. Do not set the bypass here again. */
+process.env.TURNSTILE_SECRET = "prod-shaped-secret-no-bypass";
+delete process.env.TURNSTILE_DEV_BYPASS;
 
 const { default: visaScoreRouter, redactAnswers, resolveScoreMode, SENSITIVE_ANSWER_KEYS } =
   await import("./public.visaScore.js");
@@ -254,11 +262,77 @@ describe("DPDP — the compliance and character answers", () => {
     expect(res.body.answers).toBeUndefined();
   });
 
-  it("persists nothing — the router imports no model", async () => {
+  it("has NO Turnstile gate on /score, and still has the rate limiter", async () => {
+    /* Two assertions for one guarantee, because either alone is weak.
+     *
+     * The SOURCE one stops the gate coming back by hand. The BEHAVIOURAL
+     * one is what the whole suite already carries: with TURNSTILE_SECRET
+     * set and no bypass (see the env block at the top of this file), a
+     * re-added gate would 400 every scoring test here — so the gate's
+     * absence is proven by the 40-odd requests above succeeding, not only
+     * by a regex.
+     *
+     * And the limiter must STAY. Dropping the gate left it as the sole
+     * control on this endpoint (middleware/rateLimit.ts's note), so a
+     * change that removed both would be the real accident. */
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("./public.visaScore.ts", import.meta.url), "utf-8");
-    expect(src).not.toMatch(/from "\.\.\/models\//);
-    expect(src).not.toMatch(/\.save\(\)|\.create\(|\.updateOne\(|\.insertMany\(/);
+
+    // The module is not imported, so no gate can be constructed at all.
+    // (Matched on the IMPORT, not on the identifier: the route's header
+    // names the removed gate on purpose, and that prose must stay.)
+    expect(src).not.toMatch(/from "\.\.\/middleware\/turnstile\.js"/);
+
+    /* And the chain on /score is EXACTLY path -> limiter -> handler.
+     * Anchoring the handler is what makes this an assertion about the
+     * WHOLE chain rather than about its first element: any middleware
+     * slipped in between breaks the match. */
+    expect(src).toMatch(/"\/visa-score\/score",\s*\n\s*visaScoreLimiter,\s*\n\s*async \(req/);
+
+    // Belt and braces: a real prod-shaped request still scores.
+    expect(process.env.TURNSTILE_SECRET).toBeTruthy();
+    expect(process.env.TURNSTILE_DEV_BYPASS).toBeUndefined();
+    const res = await post({ passport: "IN", destination: "US", answers: MODAL });
+    expect(res.status).toBe(200);
+  });
+
+  it("keeps the /lead endpoint's own gate — only /score lost a control", async () => {
+    /* The removal was scoped. /lead WRITES a ticket into the queue ops
+     * read, so it keeps the honeypot and its own tighter limiter; a future
+     * "tidy up the gates" pass must not read the /score decision as
+     * applying to both. */
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("./public.visaScore.ts", import.meta.url), "utf-8");
+
+    expect(src).toMatch(/"\/visa-score\/lead",\s*\n\s*leadHoneypotGate,\s*\n\s*visaScoreLeadLimiter,/);
+  });
+
+  it("stores no assessment, and never writes through a model directly", async () => {
+    /* THIS TEST USED TO SAY "the router imports no model", and that was the
+     * strongest possible form of the guarantee: no writer at all. Phase 3b
+     * added POST /lead, which files one support ticket, so that sentence is
+     * no longer true — and leaving it green by narrowing the regex would be
+     * a passing test over a false claim.
+     *
+     * What replaces it is narrower and still the thing worth pinning:
+     *
+     *   · exactly two models are imported, and both are read here — Consumer
+     *     for the identity fork, Ticket for the submissionId dedupe;
+     *   · NOTHING in this file writes through a model directly. The single
+     *     write goes through services/consumerSupport.ts, which owns the
+     *     ticketRef pre-save hook and the fromEmail integrity rule;
+     *   · no endpoint stores an assessment. The answers are an argument to
+     *     a pure function, and public.visaScore.lead.test.ts proves the
+     *     sensitive ones reach neither the ticket nor any other document.
+     */
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("./public.visaScore.ts", import.meta.url), "utf-8");
+
+    const models = [...src.matchAll(/from "\.\.\/models\/(\w+)\.js"/g)].map((m) => m[1]);
+    expect(new Set(models)).toEqual(new Set(["Consumer", "Ticket"]));
+
+    expect(src).not.toMatch(/\.save\(\)|\.create\(|\.updateOne\(|\.insertMany\(|\.deleteOne\(/);
+    expect(src).toMatch(/createConsumerSupportCase\(/);
   });
 });
 
