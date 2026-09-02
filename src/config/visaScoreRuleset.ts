@@ -124,6 +124,8 @@ export interface VisaScoreRuleset {
     eligible: string[];
   };
   bands: RulesetBand[];
+  /** Bands over the corridor's approval RATE (0..1), not over a score. */
+  climateBands: RulesetBand[];
   confidence: {
     grades: Record<ConfidenceGrade, { halfWidthPp: number; label: string; note: string }>;
   };
@@ -193,6 +195,20 @@ function validate(r: any): asserts r is VisaScoreRuleset {
     req(r.bands[i - 1].min > r.bands[i].min, `bands[${i}] is not in descending min order — the engine takes the first match`);
   }
   req((r?.bands ?? []).at(-1)?.min === 0, "the last band must have min 0 so every score matches something");
+
+  /* climateBands are read by GET /visa-score/routes and band a PROBABILITY,
+   * so they carry the same descending-order requirement as bands[] and the
+   * additional one that they live in 0..1 — a climate band with min 800
+   * would silently match nothing and every corridor would fall through to
+   * the last entry. */
+  req(Array.isArray(r?.climateBands) && r.climateBands.length > 0, "climateBands[] is empty");
+  for (let i = 1; i < (r?.climateBands ?? []).length; i++) {
+    req(r.climateBands[i - 1].min > r.climateBands[i].min, `climateBands[${i}] is not in descending min order`);
+  }
+  for (const [i, b] of (r?.climateBands ?? []).entries()) {
+    req(b?.min >= 0 && b?.min <= 1, `climateBands[${i}].min must be a probability in 0..1, not a score`);
+  }
+  req((r?.climateBands ?? []).at(-1)?.min === 0, "the last climate band must have min 0");
 
   for (const g of ["high", "medium", "low"] as const) {
     req(typeof r?.confidence?.grades?.[g]?.halfWidthPp === "number", `confidence.grades.${g}.halfWidthPp is missing`);

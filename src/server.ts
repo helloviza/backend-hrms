@@ -361,6 +361,24 @@ import publicVisaRouter from "./routes/public.visa.js";
 app.use("/api/public", publicVisaRouter);
 
 /* ────────────────────────────────────────────────────────────────
+ * PUBLIC — VISA PROFILE SCORE (/api/public/visa-score/*)
+ *
+ * Its own router beside the one above, and unauthenticated for the same
+ * reason: the score exists to be used BEFORE someone applies, so gating it
+ * behind a login would mean it only ever reaches people who already
+ * converted. It is safe to be public because it requires no PII (the
+ * inputs are option indices), persists nothing on any path, and reads only
+ * the ruleset file and the country seed — no traveller, workspace, user or
+ * case is reachable from it.
+ *
+ * The scoring weights never leave this process: see the §12.2 firewall in
+ * routes/public.visaScore.ts, and publicVisaScore.test.ts, which greps
+ * every serialised response for the delta values.
+ * ──────────────────────────────────────────────────────────────── */
+import publicVisaScoreRouter from "./routes/public.visaScore.js";
+app.use("/api/public", publicVisaScoreRouter);
+
+/* ────────────────────────────────────────────────────────────────
  * STATIC UPLOADS
  * ──────────────────────────────────────────────────────────────── */
 const __filename = fileURLToPath(import.meta.url);

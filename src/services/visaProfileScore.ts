@@ -195,6 +195,35 @@ export function schengenSyntheticRate(
   return Math.round((sum / rows.length) * factor) / factor;
 }
 
+/**
+ * The Schengen synthetic's YEAR SERIES — the same unweighted mean, applied
+ * per year slot.
+ *
+ * Not used by the score (which reads a3/a5), and here because the public
+ * catalogue's trend chart would otherwise have nothing to draw for one of
+ * the most-asked corridors. Same all-or-nothing rule as the rate: a member
+ * missing a series would silently shorten the average for some years and
+ * not others, which is a different statistic per point on the chart.
+ */
+export function schengenSyntheticSeries(
+  ruleset: VisaScoreRuleset = VISA_SCORE_RULESET,
+): number[] {
+  const rows = ruleset.schengen.members
+    .map((iso2) => BASE_RATES[iso2.toUpperCase()])
+    .filter((r): r is NonNullable<typeof r> => Boolean(r));
+
+  if (rows.length !== ruleset.schengen.members.length) return [];
+
+  const length = rows[0]?.years.length ?? 0;
+  if (length === 0 || rows.some((r) => r.years.length !== length)) return [];
+
+  const factor = 10 ** ruleset.schengen.precision;
+  return Array.from({ length }, (_, i) => {
+    const sum = rows.reduce((acc, r) => acc + r.years[i], 0);
+    return Math.round((sum / rows.length) * factor) / factor;
+  });
+}
+
 function resolveBaseRate(
   input: VisaScoreInput,
   mode: BaseRateMode,

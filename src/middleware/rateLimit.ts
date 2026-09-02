@@ -331,3 +331,42 @@ export const consumerPassportExtractLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: "You've read a lot of passports just now — please try again in a few minutes." },
 });
+
+/* ── VISA PROFILE SCORE (2026-09-02) ──────────────────────────────────
+ * POST /api/public/visa-score/score — unauthenticated COMPUTE endpoint.
+ *
+ * This limit is not a spam control, it is the anti-model-extraction
+ * control, and it is sized from that threat rather than from politeness.
+ *
+ * The response deliberately withholds every weight (routes/public.visaScore
+ * .ts §12.2 firewall), but hiding them is not the same as making them
+ * unrecoverable: hold every answer fixed, vary ONE question across its
+ * options, and diff the returned scores, and that question's deltas fall
+ * out in about five calls. The full 15-question table costs roughly 75
+ * calls per corridor. The firewall raises the price from "read the JS
+ * bundle" — which is how the competitor this was modelled against got
+ * cloned — to "run a few hundred requests"; this limiter is what keeps
+ * that price real.
+ *
+ * WHY 60 AND NOT travelRequestLimiter's 8. The enquiry form is submitted
+ * once per visit. An assessment is not: someone comparing three
+ * destinations legitimately scores three times, and if the Phase 3 UI
+ * re-scores as each answer is chosen (as the reference UI does, to animate
+ * its gauge) one assessment costs ~15 calls on its own. Eight would break
+ * the honest case on the first visit. Sixty leaves room for roughly four
+ * live-updating assessments per window while still putting full extraction
+ * of even one corridor over multiple windows.
+ *
+ * If Phase 3 scores once on submit rather than per answer, this should
+ * come down sharply — 15 or 20 would then be generous. Revisit it when
+ * that decision is made rather than leaving it at the looser number by
+ * default.
+ */
+export const visaScoreLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many scoring requests, please try again later.' },
+});

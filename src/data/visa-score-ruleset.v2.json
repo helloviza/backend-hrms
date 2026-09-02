@@ -63,7 +63,16 @@
     { "min": 450, "name": "Fair", "hex": "#D9772E", "note": "Several factors are weighing on this route. Strengthen them before applying." },
     { "min": 0, "name": "Needs Attention", "hex": "#B4462F", "note": "This profile faces significant headwinds on this route. Consider expert review before applying." }
   ],
-  "bandNote": "These band the SCORE. The reference's own BANDS array bands the destination's approval RATE, which is a different statement (route climate, not this applicant) and belongs to the map, not here.",
+  "bandNote": "These band the SCORE - a statement about THIS applicant. They are distinct from climateBands below, which band the destination's approval RATE and say nothing about any applicant.",
+
+  "climateBands": [
+    { "min": 0.85, "name": "Very Strong", "hex": "#2E8B67", "note": "Historically one of the most reachable routes on an Indian passport." },
+    { "min": 0.70, "name": "Strong", "hex": "#5AA17A", "note": "A favourable route - most well-prepared Indian applicants are approved." },
+    { "min": 0.55, "name": "Moderate", "hex": "#C98A1A", "note": "A mixed route - preparation and documentation make a real difference here." },
+    { "min": 0.40, "name": "Demanding", "hex": "#D9772E", "note": "A tougher route - approvals lean heavily on a strong, well-evidenced profile." },
+    { "min": 0, "name": "Very Demanding", "hex": "#B4462F", "note": "One of the hardest routes on an Indian passport - expert guidance is worth it." }
+  ],
+  "climateBandNote": "The REFERENCE ENGINE'S own BANDS array, banding the corridor's historical approval rate. Route climate, not a personal assessment - safe to disclose on the public catalogue because it restates a published statistic rather than any part of the model. Added in Phase 2 for GET /visa-score/routes.",
 
   "confidence": {
     "grades": {
