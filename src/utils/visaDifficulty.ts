@@ -472,3 +472,103 @@ export function approvalChancesFor(iso2: string, category: SeedVisaCategory): st
   }
   return "Varies by profile";
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * THE SCORE ENGINE'S BASE-RATE READ (2026-09-02)
+ *
+ * services/visaProfileScore.ts needs a corridor's approval rate as a real
+ * PROBABILITY, and it must be the same dataset the map prints or the two
+ * surfaces will quietly disagree about the same country.
+ *
+ * So it reads from HERE rather than opening data/approval_by_iso2.json
+ * itself. One reader of that file, as this module's header requires.
+ *
+ * ── WHY A SECOND MAP AND NOT SOURCED_APPROVAL ─────────────────────────
+ * SOURCED_APPROVAL stores `figures` as ROUNDED INTEGER percentages, which
+ * is right for a card that prints "~78%" and wrong for a logit: rounding a
+ * base rate to whole percent moves a final score by up to 8 points, and
+ * shifts 89 of 194 countries by 2 or more. The dataset carries the
+ * un-rounded `a3`/`a5`/`years` alongside the integers for exactly this
+ * reason, and BASE_RATES is where they land.
+ *
+ * The two are built from ONE parse of ONE file, so a country cannot be
+ * present for the map and absent for the engine.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/** A probability strictly inside (0,1), or null. Never NaN, never a guess. */
+function prob(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1 ? v : null;
+}
+
+/** Which averaging window a base rate is read over. */
+export type BaseRateMode = "a3" | "a5";
+
+/** The DEFAULT window. Three years smooths the recent years without
+ *  dragging in the post-pandemic recovery; it is the reference engine's
+ *  own default and the ruleset repeats it so the two cannot drift. */
+export const DEFAULT_BASE_RATE_MODE: BaseRateMode = "a3";
+
+export interface CountryBaseRate {
+  /** 3-year average approval probability, 0..1 un-rounded. */
+  a3: number;
+  /** 5-year average approval probability, 0..1 un-rounded. */
+  a5: number;
+  /** Newest-first, aligned to $meta.yearOrder = [2026,2025,2024,2023,2022]. */
+  years: readonly number[];
+}
+
+function buildBaseRates(): Readonly<Record<string, CountryBaseRate>> {
+  let raw: Record<string, any>;
+  try {
+    raw = JSON.parse(readFileSync(APPROVAL_FILE, "utf-8"));
+  } catch {
+    // Already warned by buildSourcedApproval on the same file. Degrading to
+    // an empty map means baseRateFor returns null and the engine declines to
+    // score, which is the safe direction: no base, no number.
+    return Object.freeze({});
+  }
+
+  const out: Record<string, CountryBaseRate> = {};
+  for (const [key, row] of Object.entries(raw ?? {})) {
+    const iso2 = String(key).toUpperCase();
+    if (!/^[A-Z]{2}$/.test(iso2)) continue; // skips $schema / $meta
+
+    const a3 = prob(row?.a3);
+    const a5 = prob(row?.a5);
+    const years = Array.isArray(row?.years) ? row.years.map(prob) : null;
+
+    /* BOTH AVERAGES OR NEITHER — the same all-or-nothing rule
+     * buildSourcedApproval applies, and for the same reason: India carries
+     * nulls because India-into-India is not a corridor, and a half-filled
+     * row would let the engine score off one window while the toggle
+     * silently fell back to the other. */
+    if (a3 === null || a5 === null) continue;
+
+    out[iso2] = {
+      a3,
+      a5,
+      years: years && years.every((y): y is number => y !== null) ? Object.freeze(years) : Object.freeze([]),
+    };
+  }
+  return Object.freeze(out);
+}
+
+/** Un-rounded corridor base rates, keyed by iso2. Engine-only. */
+export const BASE_RATES: Readonly<Record<string, CountryBaseRate>> = buildBaseRates();
+
+/**
+ * The corridor's base approval probability for the given averaging window,
+ * or null when we hold no figure for it.
+ *
+ * NULL IS A REAL ANSWER and callers must handle it: it means "no sourced
+ * rate", not "zero". The engine turns it into a declined assessment rather
+ * than scoring against an invented number.
+ */
+export function baseRateFor(
+  iso2: string,
+  mode: BaseRateMode = DEFAULT_BASE_RATE_MODE,
+): number | null {
+  const row = BASE_RATES[String(iso2 ?? "").toUpperCase()];
+  if (!row) return null;
+  return mode === "a5" ? row.a5 : row.a3;
+}

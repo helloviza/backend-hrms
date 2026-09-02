@@ -1,0 +1,214 @@
+{
+  "$schema": "helloviza-visa-score-ruleset/v2",
+  "version": "2.0.0",
+  "effectiveFrom": "2026-09-02",
+  "derivedFrom": "helloviza-vps-v2 reference engine (scoreAgainstBase), with the pre-logit base clamp added",
+  "serverSideOnly": true,
+  "notes": [
+    "SERVER-SIDE ONLY. The deltas below are the model. Shipping them to a browser lets anyone read off the exact weight of every answer and back-solve the questionnaire, so no API response may echo this file - Phase 2 enforces that at the route layer. Nothing here is imported by apps/frontend.",
+    "Deltas are ZERO-CENTERED: the modal/neutral option on each question is 0, so a modal profile lands on the route baseline. Fixture F1 asserts this within +/-2.",
+    "Citations are harvested from the v1 ruleset, which carried them; the v2 reference dropped the field but did not change what each question assesses."
+  ],
+
+  "transform": {
+    "K": 0.016,
+    "envelope": { "min": 0.05, "max": 0.95 },
+    "scoreBase": 300,
+    "scoreSpan": 600,
+    "scoreFloor": 310,
+    "scoreCap": 870,
+    "clampBaseBeforeLogit": true,
+    "clampBeforeLogitNote": "THE FIX. The reference calls logit(baseRate) directly and clamps only afterwards, which breaks 47 of the 194 corridors in three classes. (1) 19 rows hold a3 or a5 at EXACTLY 0 or 1 (BB BT DM FJ GD JM KN LC MU NP PS RW SC SN TO TV VC WS ZM): logit(1) is +Infinity, sig() saturates, and the score pins at the cap regardless of every answer. (2) 26 rows sit ABOVE the envelope max of 0.95 (AE AZ DJ ET FM ID KH KM KZ LK MV MW MY OM PW QA SA SB SR ST TG TH TL TT TZ UG): no infinity, but the extra logit headroom is more than any realistic points total can spend, so strong and weak profiles collapse onto the cap together. (3) 2 rows sit BELOW the envelope min of 0.05 (UA YE), stuck at the floor. Clamping the base into the envelope BEFORE the logit fixes all three. For the 147 countries already strictly inside the envelope this changes nothing at all - parity with the reference is asserted over 5,800 comparisons."
+  },
+
+  "baseRate": {
+    "defaultMode": "a3",
+    "modes": ["a3", "a5"],
+    "modeNote": "3-year default per the ruling. The toggle only selects which stored average feeds the logit."
+  },
+
+  "schengen": {
+    "code": "SCHENGEN",
+    "name": "Schengen Area",
+    "synthetic": true,
+    "members": ["FR", "DE", "IT", "ES", "NL", "CH", "AT", "BE", "PT", "GR"],
+    "memberNote": "The REFERENCE ENGINE'S ten core members, per the ruling - deliberately NOT utils/visaDifficulty.ts's SCHENGEN_MEMBERS, which enumerates all 29 for map colouring. Unweighted mean of the members' a3/a5/year slots, rounded to 4dp. Yields a3 = 0.7939.",
+    "precision": 4
+  },
+
+  "firstTimer": {
+    "triggerQuestion": "travel",
+    "triggerOptionIndex": 0,
+    "skipQuestions": ["compliance", "schdays"],
+    "skipNote": "Section 4.4. A first-time traveller has no compliance history and no Schengen window to have exhausted, so these are not asked and contribute nothing - they are REMOVED from the set, not answered as zero.",
+    "boostQuestions": ["employment", "family", "payer", "finproof"],
+    "boostMultiplier": 1.25,
+    "boostNote": "Section 4.5. With no travel history to lean on, the ties-and-means questions carry proportionally more of the assessment. Applied as Math.round(points * 1.25) per the reference."
+  },
+
+  "heldVisas": {
+    "enabled": true,
+    "pointsPerVisa": 6,
+    "cap": 12,
+    "excludeTargetCountry": true,
+    "excludeDuplicates": true,
+    "eligible": ["US", "GB", "CA", "AU", "JP", "KR", "SCHENGEN"],
+    "note": "Section 4.6. A valid unexpired visa for a tier-1 destination is corroboration that a consulate already trusted this applicant. The TARGET country's own visa is excluded (holding a US visa tells a US officer nothing new), duplicates collapse, and the total is capped so a collector cannot buy an unbounded bonus. Fixture F12 pins all three rules."
+  },
+
+  "bands": [
+    { "min": 800, "name": "Exceptional", "hex": "#2E8B67", "note": "Outstanding profile for this route. Prepare documents that match these answers exactly." },
+    { "min": 700, "name": "Excellent", "hex": "#5AA17A", "note": "Strong preparation for this application. A little more polish on the factors below helps." },
+    { "min": 600, "name": "Good", "hex": "#C98A1A", "note": "A workable profile with clear areas to strengthen before you apply." },
+    { "min": 450, "name": "Fair", "hex": "#D9772E", "note": "Several factors are weighing on this route. Strengthen them before applying." },
+    { "min": 0, "name": "Needs Attention", "hex": "#B4462F", "note": "This profile faces significant headwinds on this route. Consider expert review before applying." }
+  ],
+  "bandNote": "These band the SCORE. The reference's own BANDS array bands the destination's approval RATE, which is a different statement (route climate, not this applicant) and belongs to the map, not here.",
+
+  "confidence": {
+    "grades": {
+      "high": { "halfWidthPp": 5.0, "label": "Sourced", "note": "A published per-country figure is recorded for this corridor." },
+      "medium": { "halfWidthPp": 7.5, "label": "Aggregated", "note": "A full five-year series from mixed public sources." },
+      "low": { "halfWidthPp": 10.0, "label": "Thin", "note": "Sparse or boundary-valued data; the range widens to say so." }
+    },
+    "note": "halfWidthPp is in PROBABILITY POINTS and is converted to score points by multiplying by transform.scoreSpan/100. The range is then clamped to [scoreFloor, scoreCap] - fixture F11 asserts it never exceeds the cap."
+  },
+
+  "hardStops": [
+    { "code": "misrep", "question": "compliance", "optionIndex": 3, "action": "cap", "capAt": 449, "severity": "critical", "message": "A refusal of entry, removal, or a misrepresentation finding is treated as near-disqualifying under UK Part 9 s9.8, IRPA s.40 and Schengen Annex VI. Disclose it - concealment is assessed far more harshly than the original event." },
+    { "code": "custodial", "question": "character", "optionIndex": 3, "action": "cap", "capAt": 449, "severity": "critical", "message": "A custodial sentence of 12 months or more engages the character provisions directly (Australia PIC 4001, UK Part 9 s9.4, IRPA s.36). Expert review before applying is strongly advised." },
+    { "code": "window", "question": "schdays", "optionIndex": 3, "action": "suppress", "severity": "critical", "message": "The 90-days-in-180 short-stay allowance is already exhausted, so a Schengen short-stay visa cannot be used for this trip whatever the rest of the profile says. No score is shown, because none would be meaningful." }
+  ],
+  "hardStopNote": "Section 7. Hard stops act at the DISPLAY layer only - the raw computed score is preserved in build.rawScore so a cap is visible as a cap rather than silently becoming the number. 'cap' lowers the displayed score to capAt when it would otherwise be higher; 'suppress' withholds the number entirely.",
+
+  "flagSeverities": {
+    "critical": "Blocks or caps the assessment.",
+    "warning": "A materially negative factor the applicant can still act on.",
+    "info": "Worth knowing, not a problem."
+  },
+  "warningThreshold": -10,
+  "warningThresholdNote": "Any non-silent answered option at or below this delta raises a 'warning' flag alongside its citation.",
+
+  "disclaimer": "Advisory readiness index based on the information you provided, measured against this destination's historical outcome rate for Indian applicants. Not a prediction or guarantee - visa decisions are made solely by the consular authority.",
+
+  "questions": [
+    { "id": "residence", "dim": "stability", "cite": "9 FAM 402.2-2(C) / IRCC 'immigration status'", "text": "Where do you currently live?",
+      "options": [
+        { "label": "In my country of citizenship", "points": 0 },
+        { "label": "PR / long-term resident of a tier-1 country (US/UK/CA/AU)", "points": 14 },
+        { "label": "PR of a Schengen country", "points": 11 },
+        { "label": "Residence permit - Gulf (UAE/Qatar/etc.)", "points": 7 },
+        { "label": "Residence permit - another country", "points": 2 },
+        { "label": "No fixed residency / digital nomad", "points": -8 }
+      ] },
+    { "id": "age", "dim": "stability", "silent": true, "cite": "Actuarial proxy - not a named consular criterion", "text": "Your age group",
+      "options": [
+        { "label": "Under 23", "points": -14 },
+        { "label": "23-27", "points": -10 },
+        { "label": "27-55", "points": 0 },
+        { "label": "Over 55", "points": 4 }
+      ] },
+    { "id": "travel", "dim": "history", "cite": "IRCC 'travel history' / UK Visit guidance", "text": "Countries visited in the last 5 years",
+      "options": [
+        { "label": "None - first international trip", "points": -18 },
+        { "label": "1-2 countries", "points": -6 },
+        { "label": "3-5 countries", "points": 0 },
+        { "label": "6-10 countries", "points": 8 },
+        { "label": "More than 10 countries", "points": 12 }
+      ] },
+    { "id": "purpose", "dim": "trip", "cite": "9 FAM 402.2-2(B)(1)(c) / Annex VI r.2 / cl 600.221", "text": "Purpose of this trip",
+      "options": [
+        { "label": "Tourism / leisure", "points": 0 },
+        { "label": "Business with invitation", "points": 5 },
+        { "label": "Conference / event", "points": 4 },
+        { "label": "Visiting relatives / friends", "points": -5 },
+        { "label": "Medical treatment", "points": -3 }
+      ] },
+    { "id": "staylen", "dim": "trip", "cite": "IRCC 'length of proposed stay' / 9 FAM 402.2-2(D)", "text": "Length of your proposed stay",
+      "options": [
+        { "label": "Under 2 weeks", "points": 2 },
+        { "label": "2-4 weeks", "points": 0 },
+        { "label": "1-3 months", "points": -6 },
+        { "label": "Near the maximum permitted", "points": -12 }
+      ] },
+    { "id": "companions", "dim": "trip", "silent": true, "cite": "Context signal - not a named consular criterion", "text": "Who are you travelling with?",
+      "options": [
+        { "label": "Spouse / partner and children", "points": 4 },
+        { "label": "Spouse / partner", "points": 0 },
+        { "label": "Tour group", "points": 1 },
+        { "label": "Colleagues", "points": 2 },
+        { "label": "Friends", "points": -1 },
+        { "label": "Alone", "points": -10 }
+      ] },
+    { "id": "family", "dim": "stability", "cite": "IRCC 'family ties' / 9 FAM 402.2-2(B)(b) / PAM3 s7.2", "text": "Family ties and dependants at home",
+      "options": [
+        { "label": "Spouse AND children at home", "points": 6 },
+        { "label": "Spouse / partner at home", "points": 0 },
+        { "label": "Parents / dependants I support", "points": 0 },
+        { "label": "Immediate family mostly in destination country", "points": -18 },
+        { "label": "No family ties anchoring me", "points": -12 }
+      ] },
+    { "id": "assets", "dim": "stability", "cite": "IRCC 'personal assets and financial status'", "text": "Assets and commitments at home",
+      "options": [
+        { "label": "Property AND business / permanent job", "points": 5 },
+        { "label": "Property or long-term lease", "points": 0 },
+        { "label": "Financial assets, no property", "points": -4 },
+        { "label": "No significant assets", "points": -17 }
+      ] },
+    { "id": "employment", "dim": "financial", "cite": "IRCC 'current employment situation' / PAM3 GenGuide H", "text": "Employment at your current / last job",
+      "options": [
+        { "label": "Employed 7+ years", "points": 5 },
+        { "label": "Employed 3-7 years", "points": 0 },
+        { "label": "Employed 1-3 years", "points": -4 },
+        { "label": "Employed under 1 year", "points": -17 },
+        { "label": "Self-employed 3+ years", "points": 1 },
+        { "label": "Student", "points": -12 },
+        { "label": "Retired", "points": 1 },
+        { "label": "Unemployed", "points": -22 }
+      ] },
+    { "id": "payer", "dim": "financial", "cite": "9 FAM 402.2-2(E) / UK V 4.3", "text": "Who is paying for the trip?",
+      "options": [
+        { "label": "My personal funds", "points": 0 },
+        { "label": "My employer", "points": 3 },
+        { "label": "Host organisation (lawful status)", "points": 1 },
+        { "label": "My parents (adult applicant)", "points": -11 },
+        { "label": "Third party - non-relative", "points": -15 },
+        { "label": "Sponsor with unclear status", "points": -19 }
+      ] },
+    { "id": "finproof", "dim": "financial", "cite": "Annex VI r.3 / UK FIN 2.1", "text": "Financial documents and income",
+      "options": [
+        { "label": "Above-average income, fully documented", "points": 6 },
+        { "label": "Average income, documented", "points": 0 },
+        { "label": "Below-average / unstable but documented", "points": -9 },
+        { "label": "Income not officially documented", "points": -16 }
+      ] },
+    { "id": "refusals", "dim": "history", "cite": "UK Visit guidance / Schengen Annex VI r.8", "text": "Visa refusals in the last 5 years",
+      "options": [
+        { "label": "Never refused", "points": 0 },
+        { "label": "One - different country", "points": -13 },
+        { "label": "One - this destination", "points": -20 },
+        { "label": "Multiple - this destination", "points": -27 }
+      ] },
+    { "id": "compliance", "dim": "history", "cite": "UK Part 9 s9.8 / IRPA s.40 / Annex VI r.1 and r.8", "text": "Immigration compliance history",
+      "options": [
+        { "label": "Always complied - no overstays", "points": 0 },
+        { "label": "Minor overstay (under 30 days), long ago", "points": -17 },
+        { "label": "Significant overstay / violation", "points": -33 },
+        { "label": "Deported / misrepresentation finding", "points": -45 }
+      ] },
+    { "id": "character", "dim": "history", "cite": "Australia PIC 4001 / UK Part 9 s9.4 / IRPA s.36", "text": "Character / criminal history",
+      "options": [
+        { "label": "No criminal record", "points": 0 },
+        { "label": "Minor offence, resolved over 5 years ago", "points": -11 },
+        { "label": "Conviction - non-custodial", "points": -21 },
+        { "label": "Custodial sentence 12 months or more", "points": -38 }
+      ] },
+    { "id": "schdays", "dim": "history", "cite": "Schengen Annex VI r.4 (90/180 short-stay allowance)", "text": "Days spent in the Schengen area in the current 180-day window", "appliesTo": ["SCHENGEN"],
+      "options": [
+        { "label": "None", "points": 2 },
+        { "label": "Under 45 days", "points": 0 },
+        { "label": "45-89 days", "points": -6 },
+        { "label": "90 days or more - window exhausted", "points": -25 }
+      ] }
+  ]
+}
