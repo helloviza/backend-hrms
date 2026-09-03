@@ -302,11 +302,33 @@ describe("PATCH /documents/:id/review — no PII in the rejection detail", () =>
     const res = await request(app).patch(`/documents/${doc._id}/review`).send({ reviewStatus: "REJECTED", rejectionReason: "Photo page is blurry" });
     expect(res.status).toBe(200);
 
-    expect(_activityRows).toHaveLength(1);
+    /* TWO rows now, and the second one is the fix.
+     *
+     * Rejecting a document used to write only the document, leaving the
+     * case in docs_under_review with a refused file inside it — the
+     * customer's own surface renders `action_required`, so nothing told
+     * them to act. The reject handler now derives that status through the
+     * same setActionRequired helper the manual route uses, and logs the
+     * same ACTION_REQUIRED_SET event, so an automatic flag is
+     * indistinguishable downstream from a hand-set one. */
+    expect(_activityRows).toHaveLength(2);
     expect(_activityRows[0].eventType).toBe("DOCUMENT_REJECTED");
     expect(_activityRows[0].detail).toEqual({ documentId: String(doc._id), docCode: "DOC-01", reason: "Photo page is blurry" });
     // No passport/extracted-field keys anywhere in the payload.
     expect(Object.keys(_activityRows[0].detail)).toEqual(["documentId", "docCode", "reason"]);
+
+    expect(_activityRows[1].eventType).toBe("ACTION_REQUIRED_SET");
+    // Same discipline on the derived row: the concierge's own sentence and
+    // the interrupted status, and nothing extracted from the document.
+    expect(_activityRows[1].detail).toEqual({
+      reason: "Photo page is blurry",
+      // The fixture's application is `submitted` — the status the case is
+      // interrupted FROM, captured so it can be resumed when the customer
+      // replaces the document.
+      interruptedStatus: "submitted",
+      documentId: String(doc._id),
+    });
+    expect(res.body.actionRequired).toBe(true);
   });
 });
 

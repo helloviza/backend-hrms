@@ -1577,7 +1577,61 @@ router.patch("/documents/:id/review", requirePermission("visaApplication", "WRIT
       });
     }
 
-    res.json({ ok: true, document: mapAdminDocumentSummary(doc) });
+    /* ── A REJECTION FLAGS THE CASE, WITHOUT A SECOND OPS ACTION ──────
+     *
+     * Rejecting a document used to write only the document. Putting the
+     * application into action_required — the status the customer's own
+     * surface renders, and the only one that says "we need something from
+     * you" — was a SEPARATE call to PATCH /applications/:id/status that an
+     * agent had to remember. When they didn't, the case sat in
+     * docs_under_review with a refused document inside it and the
+     * applicant had no reason to look.
+     *
+     * So the rejection now derives it. Same helper the manual route uses
+     * (setActionRequired owns statusBeforeActionRequired, including the
+     * re-affirm and escalation cases), same activity event, so an
+     * automatic flag is indistinguishable downstream from a hand-set one.
+     *
+     * GUARDED, not unconditional: only from a status where action_required
+     * is a legal destination. Rejecting a document on a closed or decided
+     * case records the rejection and leaves the case alone — there is
+     * nothing left for the applicant to act on.
+     *
+     * BEST-EFFORT, like the logging above: the review itself has already
+     * been written and must not be failed by a follow-on. */
+    let actionRequired = false;
+    if (reviewStatus === "REJECTED" && owningApplication) {
+      const current = String((owningApplication as any).status ?? "");
+      if (ACTION_REQUIRED_ELIGIBLE.has(current)) {
+        try {
+          const label = doc.docCode ? `${doc.docCode}: ` : "";
+          await setActionRequired(
+            String((owningApplication as any)._id),
+            `${label}${rejectionReason}`,
+            actorId(req),
+          );
+          actionRequired = true;
+          await logVisaActivity({
+            applicationId: (owningApplication as any)._id,
+            requestId: (owningApplication as any).requestId,
+            workspaceId: doc.workspaceId,
+            eventType: "ACTION_REQUIRED_SET",
+            actorUserId: actorId(req),
+            actorType: "STAFF",
+            // The reason is the concierge's own message, not extracted
+            // applicant data — the same allowance the manual route documents.
+            detail: { reason: rejectionReason, interruptedStatus: current, documentId: String(doc._id) },
+          });
+        } catch (arErr: any) {
+          adminVisaLogger.error("document rejected but action_required could not be set", {
+            documentId: String(doc._id),
+            error: arErr?.message,
+          });
+        }
+      }
+    }
+
+    res.json({ ok: true, document: mapAdminDocumentSummary(doc), actionRequired });
   } catch (err: any) {
     console.error("[admin visa document review PATCH]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to review document" });

@@ -990,7 +990,35 @@ router.get("/:id", async (req: any, res: any) => {
       consumerId: me(req),
       linkedApplicationIds: application._id,
     })
-      .select("docCode label originalFilename createdAt")
+      .select("docCode label originalFilename createdAt storageKey")
+      .lean();
+
+    /* ── THE OPS REVIEW STATE — the half the customer could not see ──
+     *
+     * When ops rejects a document they write reviewStatus/rejectionReason
+     * on the VisaDocument MIRROR (admin.visa.ts PATCH /documents/:id/review),
+     * not on the consumer's locker row. This read path only ever loaded
+     * the locker row, and ConsumerDocument has no review fields at all —
+     * so a rejected document went on rendering as a satisfied green tick
+     * and the applicant was never told to re-upload anything.
+     *
+     * ── JOINED ON THE FILE, NOT ON THE CODE ──────────────────────────
+     * The obvious join is docCode, and it would be wrong: 103 of 259
+     * published corridors list the same docTypeCode in more than one
+     * group, so a code-keyed join would paint one rejection across every
+     * row sharing that code. The mirror carries `s3Key`, which IS the
+     * consumer's `storageKey` — the same stored object, one row each
+     * side. That is a per-FILE identity and it is unaffected by however
+     * bad the corridor's codes are. The VisaDocument _id then travels to
+     * the client as the row's stable handle.
+     *
+     * Scoped by applicationId, which is already proven to be this
+     * consumer's application by the ownership check above. */
+    const reviewRows = await VisaDocument.find({
+      applicationId: application._id,
+      deletedAt: null,
+    })
+      .select("_id docCode reviewStatus rejectionReason s3Key")
       .lean();
 
     /* WHEN the payment was applied. There is no `d2cPaidAt` on the
@@ -1010,7 +1038,7 @@ router.get("/:id", async (req: any, res: any) => {
     return res.json({
       ok: true,
       application: publicApplication(application, request),
-      documents: checklistRows(application, attached),
+      documents: checklistRows(application, attached, reviewRows),
       price: consumerPrice(application),
       payment: {
         razorpayPaymentId: application.razorpayPaymentId ?? null,
@@ -1153,11 +1181,28 @@ function publicApplication(a: any, request: any) {
  * not invented reference data.
  * ───────────────────────────────────────────────────────────────────── */
 
-function checklistRows(application: any, attached: any[]) {
+/**
+ * Exported for consumer.applicationChecklist.test.ts.
+ *
+ * The join this performs is the whole of the rejection-visibility fix and
+ * it has two properties worth pinning independently of the route: it keys
+ * on the stored object rather than on docCode, and a rejected file is not
+ * counted as attached. Both are cheap to get wrong in a later edit and
+ * neither is visible from the endpoint's happy path.
+ */
+export function checklistRows(application: any, attached: any[], reviewRows: any[] = []) {
   const byCode = new Map<string, any>();
   for (const doc of attached) {
     const code = String(doc.docCode ?? "").toUpperCase();
     if (code && !byCode.has(code)) byCode.set(code, doc);
+  }
+
+  /* The ops mirror, keyed by the STORED OBJECT the two rows share — see
+   * the block at the read above for why this is not keyed on docCode. */
+  const reviewByStorageKey = new Map<string, any>();
+  for (const r of reviewRows) {
+    const key = String(r.s3Key ?? "");
+    if (key && !reviewByStorageKey.has(key)) reviewByStorageKey.set(key, r);
   }
 
   const groups = Array.isArray(application.ruleSnapshot?.documentGroups)
@@ -1172,13 +1217,36 @@ function checklistRows(application: any, attached: any[]) {
     docs: (Array.isArray(g.docTypeCodes) ? g.docTypeCodes : []).map((raw: any) => {
       const code = String(raw ?? "").toUpperCase();
       const doc = byCode.get(code) ?? null;
+      const review = doc ? reviewByStorageKey.get(String(doc.storageKey ?? "")) ?? null : null;
+      const rejected = review?.reviewStatus === "REJECTED";
+
       return {
         docCode: code,
         label: doc?.label || titleCaseCode(code),
-        attached: Boolean(doc),
+        /* REJECTED IS NOT ATTACHED.
+         *
+         * This used to be `Boolean(doc)` — a file present meant a
+         * requirement met, which stayed true after ops refused the file.
+         * The applicant saw a tick against the very document they had
+         * been asked to replace. A rejected row now reads as outstanding,
+         * because it is. */
+        attached: Boolean(doc) && !rejected,
         // Only ever the consumer's OWN filename, and only for a row they
         // themselves attached. No id, so this cannot become a fetch handle.
         filename: doc?.originalFilename ?? null,
+        /* PENDING | VERIFIED | REJECTED, or null when nothing has been
+         * mirrored for review yet (pre-submit, or a file ops has not
+         * reached). Null is not "fine" — it is "not looked at". */
+        reviewStatus: review?.reviewStatus ?? null,
+        /* The concierge's own sentence, written FOR the applicant — the
+         * admin route makes it mandatory on rejection precisely so there
+         * is something to show here. Ops-authored copy, not extracted
+         * applicant data, so it carries no PII of its own. */
+        rejectionReason: rejected ? review?.rejectionReason ?? null : null,
+        /* The mirror's id — a stable handle for the re-upload control, so
+         * the client never has to re-derive which row was refused from a
+         * docCode that may not be unique. */
+        reviewDocumentId: review ? String(review._id) : null,
       };
     }),
   }));
