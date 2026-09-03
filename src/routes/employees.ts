@@ -1,5 +1,6 @@
 // apps/backend/src/routes/employees.ts
 import { Router } from "express";
+import mongoose from "mongoose";
 import multer from "multer";
 import bcrypt from "bcryptjs";
 import { requireAuth } from "../middleware/auth.js";
@@ -95,6 +96,107 @@ function sanitise(user: AnyUser) {
   delete (obj as any).__v;
   return obj;
 }
+
+/** ObjectId → string for JSON payloads; "" when unset. */
+function idOrEmpty(v: any): string {
+  return v ? String(v) : "";
+}
+
+/** Human label for a resolved manager, mirroring expenseAdmin's employeeNameOf. */
+function reportingDisplayName(...docs: any[]): string {
+  for (const d of docs) {
+    if (!d || typeof d !== "object") continue;
+    const full = [d.firstName, d.lastName].filter(Boolean).join(" ").trim();
+    const label = full || d.fullName || d.name || "";
+    if (label) return String(label);
+  }
+  for (const d of docs) {
+    if (d?.email) return String(d.email);
+  }
+  return "";
+}
+
+/**
+ * Resolve a picked reporting-manager candidate into BOTH id-spaces.
+ *
+ * The /profile/team picker is fed by GET /api/employees, whose rows are
+ * EMPLOYEE documents — so the id it sends is an `Employee._id`. But
+ * `User.managerId` refs User while `Employee.managerId` refs Employee, and a
+ * person's id is not the same in the two collections. Resolving the
+ * counterpart here (via `Employee.ownerId`, falling back to a same-workspace
+ * email match) is what keeps the two id-spaces from being conflated.
+ *
+ * Accepts an id from either space, so a value stored by another surface (e.g.
+ * expense-admin writes a User id) round-trips through a save unharmed.
+ *
+ * `workspaceId` is the SUBJECT's workspace: a manager must always live in the
+ * same tenant as the employee they manage, including for SUPERADMIN callers.
+ * Returns null when the id resolves to nobody in that workspace.
+ */
+async function resolveManagerRefs(
+  rawId: any,
+  workspaceId: any
+): Promise<{ userId: any; employeeId: any; displayName: string } | null> {
+  const id = String(rawId ?? "").trim();
+  if (!id || !mongoose.Types.ObjectId.isValid(id)) return null;
+
+  const oid = new mongoose.Types.ObjectId(id);
+  const wsFilter: any = workspaceId ? { workspaceId } : {};
+  const empFields = "_id email ownerId fullName name firstName lastName";
+  const userFields = "_id email name firstName lastName";
+
+  // Employee id-space first — that is what the picker sends.
+  let employeeDoc: any = await Employee.findOne({ _id: oid, ...wsFilter })
+    .select(empFields)
+    .lean();
+  let userDoc: any = null;
+
+  if (employeeDoc) {
+    if (employeeDoc.ownerId) {
+      userDoc = await User.findOne({ _id: employeeDoc.ownerId, ...wsFilter })
+        .select(userFields)
+        .lean();
+    }
+    if (!userDoc && employeeDoc.email) {
+      userDoc = await User.findOne({ email: employeeDoc.email, ...wsFilter })
+        .select(userFields)
+        .lean();
+    }
+  } else {
+    // User id-space — a value written by another surface, or a prior save.
+    userDoc = await User.findOne({ _id: oid, ...wsFilter }).select(userFields).lean();
+    if (userDoc) {
+      employeeDoc = await Employee.findOne({
+        ...wsFilter,
+        $or: [
+          { ownerId: userDoc._id },
+          ...(userDoc.email ? [{ email: userDoc.email }] : []),
+        ],
+      })
+        .select(empFields)
+        .lean();
+    }
+  }
+
+  // No User doc means no join key we can store on User.managerId.
+  if (!userDoc) return null;
+
+  return {
+    userId: userDoc._id,
+    employeeId: employeeDoc?._id ?? null,
+    displayName: reportingDisplayName(userDoc, employeeDoc),
+  };
+}
+
+/**
+ * The three reporting levels: join key on User, and the denormalised display
+ * string that every existing read site renders.
+ */
+const REPORTING_LEVELS = [
+  { idKey: "managerId", nameKey: "reportingL1" },
+  { idKey: "managerL2Id", nameKey: "reportingL2" },
+  { idKey: "managerL3Id", nameKey: "reportingL3" },
+] as const;
 
 /**
  * GET /api/employees
@@ -205,6 +307,13 @@ router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       reportingL2:              userMap.get(e.email)?.reportingL2              || e.reportingL2              || "",
       reportingL3:              userMap.get(e.email)?.reportingL3              || e.reportingL3              || "",
       managerName:              userMap.get(e.email)?.managerName              || e.managerName              || "",
+      // Reporting-line join keys from the USER document, so the /profile/team
+      // picker can tell a mapped row from a legacy typed name. Named
+      // *UserId to stay clear of the spread `e.managerId` above, which is this
+      // row's own Employee-space link — same word, different collection.
+      managerUserId:            idOrEmpty(userMap.get(e.email)?.managerId),
+      managerL2UserId:          idOrEmpty(userMap.get(e.email)?.managerL2Id),
+      managerL3UserId:          idOrEmpty(userMap.get(e.email)?.managerL3Id),
       jobLocation:              userMap.get(e.email)?.jobLocation              || e.jobLocation              || "",
       employmentStatus:         userMap.get(e.email)?.employmentStatus         || e.employmentStatus         || "",
       shiftDetails:             userMap.get(e.email)?.shiftDetails             || e.shiftDetails             || "",
@@ -1339,21 +1448,102 @@ router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async 
       ownerId: _ownerId,
       onboardingId: _onboardingId,
       onboardingSnapshot: _onboardingSnapshot,
+      // Reporting-line join keys are validated and written below — never let
+      // the blanket Object.assign set an unresolved id.
+      managerId: _managerId,
+      managerL2Id: _managerL2Id,
+      managerL3Id: _managerL3Id,
+      /* Read-only mirrors of those ids that GET /employees returns for the
+       * picker. The form PUTs its whole state back, so they arrive on every
+       * save. Today they are dropped anyway because User is a strict schema —
+       * but that is implicit protection: the day someone adds a matching path
+       * to the schema, Object.assign below would start writing an unvalidated,
+       * possibly stale id straight onto the User doc. Dropped explicitly here
+       * so that can never happen. */
+      managerUserId: _managerUserId,
+      managerL2UserId: _managerL2UserId,
+      managerL3UserId: _managerL3UserId,
       ...safeBody
     } = body;
 
     Object.assign(existing, safeBody);
 
-    // Mirror reporting fields — keep both in sync
-    if (safeBody.reportingL1 !== undefined) {
-      existing.managerName = safeBody.reportingL1;
+    /* ── Reporting lines ──────────────────────────────────────────────────
+     * managerId / managerL2Id / managerL3Id are the join keys; reportingL1-3
+     * and managerName are the denormalised display strings, refreshed here
+     * from the resolved user so every existing read site keeps working.
+     *
+     * Only a level actually PRESENT in the body is touched, and when an id is
+     * supplied it wins over any display string sent alongside it.
+     * A manager must be in the SUBJECT's workspace and cannot be the subject.
+     */
+    const managerScopeWs = (existing as any).workspaceId || req.workspaceObjectId;
+    const subjectUserId = String(existing._id);
+    const subjectEmployeeId = employeeDoc ? String(employeeDoc._id) : "";
+
+    // undefined = L1 untouched; null = cleared; else the manager's Employee id.
+    let l1EmployeeId: any;
+
+    for (const level of REPORTING_LEVELS) {
+      if (!(level.idKey in body)) continue;
+
+      const raw = (body as any)[level.idKey];
+
+      /* Clearing is an EXPLICIT null only. The /profile/team form PUTs its whole
+       * state back on every save, so an unmapped row round-trips `""` here —
+       * treating that as "clear" would wipe the legacy typed name in
+       * reportingL* on a save that never touched the reporting section. */
+      if (raw === undefined || String(raw).trim() === "") continue;
+
+      if (raw === null) {
+        (existing as any)[level.idKey] = null;
+        (existing as any)[level.nameKey] = "";
+        if (level.idKey === "managerId") {
+          existing.managerName = "";
+          l1EmployeeId = null;
+        }
+        continue;
+      }
+
+      if (!mongoose.Types.ObjectId.isValid(String(raw))) {
+        return res.status(400).json({ error: `Invalid ${level.idKey}` });
+      }
+
+      const resolved = await resolveManagerRefs(raw, managerScopeWs);
+      if (!resolved) {
+        return res.status(400).json({
+          error: `${level.idKey} must be a user in this workspace.`,
+        });
+      }
+      if (
+        String(resolved.userId) === subjectUserId ||
+        (subjectEmployeeId && String(resolved.employeeId || "") === subjectEmployeeId)
+      ) {
+        return res.status(400).json({ error: "A user can't be their own manager." });
+      }
+
+      (existing as any)[level.idKey] = resolved.userId;
+      (existing as any)[level.nameKey] = resolved.displayName;
+      if (level.idKey === "managerId") {
+        existing.managerName = resolved.displayName;
+        l1EmployeeId = resolved.employeeId;
+      }
     }
-    if (safeBody.managerName !== undefined && !safeBody.reportingL1) {
-      existing.reportingL1 = safeBody.managerName;
-    }
-    if (safeBody.managerL1 !== undefined) {
-      existing.reportingL1 = safeBody.managerL1;
-      existing.managerName = safeBody.managerL1;
+
+    // Legacy name-only callers (bulk paths, older clients) and unmapped rows:
+    // keep reportingL1 ⇄ managerName in step whenever no id actually drove L1
+    // above (l1EmployeeId stays undefined in exactly that case).
+    if (l1EmployeeId === undefined) {
+      if (safeBody.reportingL1 !== undefined) {
+        existing.managerName = safeBody.reportingL1;
+      }
+      if (safeBody.managerName !== undefined && !safeBody.reportingL1) {
+        existing.reportingL1 = safeBody.managerName;
+      }
+      if (safeBody.managerL1 !== undefined) {
+        existing.reportingL1 = safeBody.managerL1;
+        existing.managerName = safeBody.managerL1;
+      }
     }
 
     // Sync roles AFTER Object.assign so nothing can overwrite them
@@ -1372,6 +1562,16 @@ router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async 
 
     if (safeBody.relationshipManager !== undefined) {
       employeeFields.relationshipManager = safeBody.relationshipManager;
+    }
+
+    // Mirror the primary reporting line into Employee.managerId — the join key
+    // the HR org chart and the attendance team view actually read. That field
+    // refs Employee, so this is the manager's EMPLOYEE id (resolved above), not
+    // their User id. A manager with no Employee record cannot be represented in
+    // that id-space, so the link is cleared rather than left pointing at a
+    // stale predecessor.
+    if (l1EmployeeId !== undefined) {
+      employeeFields.managerId = l1EmployeeId;
     }
 
     if (employeeDoc && Object.keys(employeeFields).length > 0) {

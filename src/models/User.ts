@@ -118,7 +118,19 @@ const UserSchema = new Schema(
     reportingL3: { type: String, trim: true },
     managerName: { type: String, trim: true },
 
+    /**
+     * Reporting-line JOIN KEYS. `reportingL1/L2/L3` + `managerName` above are
+     * denormalised DISPLAY strings kept in step with these — read sites render
+     * the strings, anything that needs to traverse the hierarchy uses the ids.
+     *
+     * These ref User. Note `Employee.managerId` refs Employee, so a person's
+     * id differs between the two collections; never assign one to the other
+     * without resolving through `Employee.ownerId`.
+     */
     managerId: { type: Schema.Types.ObjectId, ref: "User" },
+    managerL2Id: { type: Schema.Types.ObjectId, ref: "User" },
+    managerL3Id: { type: Schema.Types.ObjectId, ref: "User" },
+
     hrOwnerId: { type: Schema.Types.ObjectId, ref: "User" },
 
     /* -------------------------------------------------------------- */
