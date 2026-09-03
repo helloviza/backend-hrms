@@ -104,6 +104,7 @@ import {
 import { findSeedCountry, isSeedReady, listSeedCountries } from "../config/visaCountrySeed.js";
 import { visaScoreLeadLimiter, visaScoreLimiter } from "../middleware/rateLimit.js";
 import logger from "../utils/logger.js";
+import { isSensitiveQuestion, toSafeBreakdown } from "../services/visaScoreSafeBreakdown.js";
 
 const router = Router();
 const scoreLogger = logger.child({ module: "visaScore" });
@@ -138,8 +139,18 @@ const scoreLogger = logger.child({ module: "visaScore" });
  * result, not their own submission reflected into a client-side log.
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/** Question ids whose ANSWER VALUE may never appear in a log line. */
-export const SENSITIVE_ANSWER_KEYS: readonly string[] = ["compliance", "character"];
+/**
+ * Question ids whose ANSWER VALUE may never appear in a log line.
+ *
+ * RE-EXPORTED, not declared. The canonical definition moved to
+ * services/visaScoreSafeBreakdown.ts when persistence became a second
+ * writer of this rule — two writers filtering with two copies of the same
+ * key list is how a rule like this rots. Kept exported from here because
+ * public.visaScore.lead.test.ts and other callers import it from this
+ * module, and one definition behind two names is fine; two definitions is
+ * not.
+ */
+export { SENSITIVE_ANSWER_KEYS } from "../services/visaScoreSafeBreakdown.js";
 
 /**
  * Answers with the sensitive values replaced. The KEY is kept — knowing
@@ -150,7 +161,7 @@ export function redactAnswers(answers: unknown): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if (!answers || typeof answers !== "object") return out;
   for (const [k, v] of Object.entries(answers as Record<string, unknown>)) {
-    out[k] = SENSITIVE_ANSWER_KEYS.includes(k) ? "[redacted]" : v;
+    out[k] = isSensitiveQuestion(k) ? "[redacted]" : v;
   }
   return out;
 }
@@ -751,16 +762,8 @@ function normalizeLeadEmail(value: unknown): string {
   return String(value ?? "").trim().toLowerCase();
 }
 
-/**
- * Is this factor or flag safe to put in front of an agent?
- *
- * The check is on the QUESTION ID, not on the message text, because the
- * text is ruleset-authored and a future edit could reword a hard stop
- * without anyone re-reading this file. The id is the stable fact.
- */
-function isSensitiveQuestion(questionId: string): boolean {
-  return SENSITIVE_ANSWER_KEYS.includes(String(questionId));
-}
+/* isSensitiveQuestion() and the filtering below now come from
+ * services/visaScoreSafeBreakdown.ts — see the import block. */
 
 /**
  * THE OPS BRIEF — a self-diagnosed lead with its own objections on the
@@ -819,9 +822,15 @@ export function buildScoreBrief(args: {
     lines.push(`Where an average applicant on this route starts: ${result.build.baseScore}`);
   }
 
-  /* ── THE OBJECTIONS. Sensitive questions dropped — see the DPDP note. */
-  const holding = result.factors.holdingBack.filter((f) => !isSensitiveQuestion(f.questionId));
-  const helping = result.factors.helping.filter((f) => !isSensitiveQuestion(f.questionId));
+  /* ── THE OBJECTIONS. Sensitive questions dropped — see the DPDP note.
+   *
+   * ONE FILTER, TWO WRITERS. toSafeBreakdown() is the same call
+   * services/visaScoreAssessments.ts makes before it persists a row, so
+   * the ops brief and the stored assessment cannot come to disagree about
+   * what is safe to keep. */
+  const safe = toSafeBreakdown(result);
+  const holding = safe.holdingBack;
+  const helping = safe.helping;
 
   if (holding.length) {
     lines.push("");
@@ -839,7 +848,7 @@ export function buildScoreBrief(args: {
     }
   }
 
-  const flags = result.flags.filter((f) => !isSensitiveQuestion(f.questionId));
+  const flags = safe.flags;
   if (flags.length) {
     lines.push("");
     lines.push("FLAGS");

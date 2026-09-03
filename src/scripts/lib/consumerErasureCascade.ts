@@ -63,6 +63,7 @@
 //   ConsumerProfile          delete   + avatar bytes; also the shred subject
 //   ConsumerDocument         delete   + stored bytes (s3 or local-disk)
 //   SavedCountry             delete   saved corridors
+//   VisaScoreAssessment      delete   stored Visa Profile Scores
 //   VisaD2CLead              delete   funnel rows
 //   ActorLocation            delete   scoped actorType:"CONSUMER"
 //   Ticket                   delete   D5 — see the block on tickets below
@@ -120,6 +121,7 @@ import Consumer from "../../models/Consumer.js";
 import ConsumerProfile from "../../models/ConsumerProfile.js";
 import ConsumerDocument from "../../models/ConsumerDocument.js";
 import SavedCountry from "../../models/SavedCountry.js";
+import VisaScoreAssessment from "../../models/VisaScoreAssessment.js";
 import VisaD2CLead from "../../models/VisaD2CLead.js";
 import ActorLocation from "../../models/ActorLocation.js";
 import Ticket from "../../models/Ticket.js";
@@ -165,6 +167,7 @@ export const CONSUMER_ERASURE_ALLOWED_MODELS = [
   "ConsumerProfile",
   "ConsumerDocument",
   "SavedCountry",
+  "VisaScoreAssessment",
   "VisaD2CLead",
   "ActorLocation",
   "Ticket",
@@ -336,6 +339,7 @@ export interface ConsumerErasurePlan {
   consumerProfileIds: string[];
   consumerDocumentIds: string[];
   savedCountryIds: string[];
+  visaScoreAssessmentIds: string[];
   visaD2CLeadIds: string[];
   actorLocationIds: string[];
   ticketIds: string[];
@@ -430,7 +434,8 @@ export async function planConsumerErasure(
       : 0;
 
   /* ── Plaintext PII collections ──────────────────────────────────── */
-  const [profiles, documents, savedCountries, leads, locations, tickets] = await Promise.all([
+  const [profiles, documents, savedCountries, scoreAssessments, leads, locations, tickets] =
+    await Promise.all([
     ConsumerProfile.find({ consumerId: oid })
       // .lean() SKIPS the field-encryption plugin's post-hook, which is
       // exactly what is wanted: the plan must not decrypt anything. It only
@@ -440,6 +445,11 @@ export async function planConsumerErasure(
       .lean(),
     ConsumerDocument.find({ consumerId: oid }).select("_id driver storageKey").lean(),
     SavedCountry.find({ consumerId: oid }).select("_id").lean(),
+    /* A stored Visa Profile Score is consumer data — score, band and the
+     * filtered factors, keyed on consumerId. It carries no retention
+     * claim of any kind, so it is a plain DELETE alongside the saved
+     * corridors it sits beside. */
+    VisaScoreAssessment.find({ consumerId: oid }).select("_id").lean(),
     VisaD2CLead.find({ consumerId: oid }).select("_id").lean(),
     ActorLocation.find({ actorId: oid, actorType: "CONSUMER" }).select("_id").lean(),
     Ticket.find({ consumerId: oid }).select("_id").lean(),
@@ -565,6 +575,7 @@ export async function planConsumerErasure(
     consumerProfileIds: ids(profiles as any[]),
     consumerDocumentIds: ids(documents as any[]),
     savedCountryIds: ids(savedCountries as any[]),
+    visaScoreAssessmentIds: ids(scoreAssessments as any[]),
     visaD2CLeadIds: ids(leads as any[]),
     actorLocationIds: ids(locations as any[]),
     ticketIds,
@@ -679,6 +690,10 @@ export function planToManifest(
         { collection: "ConsumerProfile", count: plan.consumerProfileIds.length },
         { collection: "ConsumerDocument", count: plan.consumerDocumentIds.length },
         { collection: "SavedCountry", count: plan.savedCountryIds.length },
+        {
+          collection: "VisaScoreAssessment",
+          count: plan.visaScoreAssessmentIds.length,
+        },
         { collection: "VisaD2CLead", count: plan.visaD2CLeadIds.length },
         { collection: "ActorLocation", count: plan.actorLocationIds.length },
         { collection: "TicketAttachment", count: plan.ticketAttachmentIds.length },
@@ -1007,6 +1022,7 @@ export async function deleteConsumerRows(plan: ConsumerErasurePlan): Promise<Del
     "VisaRequest",
     "ConsumerDocument",
     "SavedCountry",
+    "VisaScoreAssessment",
     "VisaD2CLead",
     "ActorLocation",
     "ConsumerProfile",
@@ -1059,6 +1075,11 @@ export async function deleteConsumerRows(plan: ConsumerErasurePlan): Promise<Del
   await del("SavedCountry", () =>
     plan.savedCountryIds.length
       ? SavedCountry.deleteMany({ _id: { $in: plan.savedCountryIds } })
+      : Promise.resolve({ deletedCount: 0 }),
+  );
+  await del("VisaScoreAssessment", () =>
+    plan.visaScoreAssessmentIds.length
+      ? VisaScoreAssessment.deleteMany({ _id: { $in: plan.visaScoreAssessmentIds } })
       : Promise.resolve({ deletedCount: 0 }),
   );
   await del("VisaD2CLead", () =>

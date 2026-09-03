@@ -52,6 +52,9 @@ const { default: Consumer } = await import("../../models/Consumer.js");
 const { default: ConsumerProfile } = await import("../../models/ConsumerProfile.js");
 const { default: ConsumerDocument } = await import("../../models/ConsumerDocument.js");
 const { default: SavedCountry } = await import("../../models/SavedCountry.js");
+const { default: VisaScoreAssessment } = await import(
+  "../../models/VisaScoreAssessment.js"
+);
 const { default: VisaD2CLead } = await import("../../models/VisaD2CLead.js");
 const { default: ActorLocation } = await import("../../models/ActorLocation.js");
 const { default: Ticket } = await import("../../models/Ticket.js");
@@ -115,6 +118,7 @@ beforeEach(async () => {
       ConsumerProfile,
       ConsumerDocument,
       SavedCountry,
+      VisaScoreAssessment,
       VisaD2CLead,
       ActorLocation,
       Ticket,
@@ -374,6 +378,37 @@ async function makeBrowsingData(consumer: any) {
     { consumerId: consumer._id, workspaceId: WORKSPACE_ID, iso2: "TH", source: "manual" },
     { consumerId: consumer._id, workspaceId: WORKSPACE_ID, iso2: "AE", source: "get-started" },
   ]);
+  /* TWO assessments for ONE corridor. A retake appends rather than
+   * overwriting (models/VisaScoreAssessment.ts), so the erasure has to
+   * clear a history and not just "the score". */
+  await VisaScoreAssessment.create([
+    {
+      consumerId: consumer._id,
+      workspaceId: WORKSPACE_ID,
+      destination: "TH",
+      passport: "IN",
+      rulesetVersion: "2.0.0",
+      mode: "a3",
+      score: 690,
+      band: { name: "Good", hex: "#C98A1A" },
+      baseScore: 700,
+      generatedAt: new Date(),
+      source: "gate",
+    },
+    {
+      consumerId: consumer._id,
+      workspaceId: WORKSPACE_ID,
+      destination: "TH",
+      passport: "IN",
+      rulesetVersion: "2.0.0",
+      mode: "a3",
+      score: 744,
+      band: { name: "Excellent", hex: "#5AA17A" },
+      baseScore: 700,
+      generatedAt: new Date(),
+      source: "retake",
+    },
+  ]);
   await VisaD2CLead.create({
     consumerId: consumer._id,
     workspaceId: WORKSPACE_ID,
@@ -409,6 +444,7 @@ describe("the allow-list", () => {
       "ConsumerProfile",
       "ConsumerDocument",
       "SavedCountry",
+      "VisaScoreAssessment",
       "VisaD2CLead",
       "ActorLocation",
       "Ticket",
@@ -489,6 +525,8 @@ describe("dry run", () => {
     });
 
     expect(count(m.motions.delete, "SavedCountry")).toBe(2);
+    // Both rows of the score history, planned for deletion.
+    expect(count(m.motions.delete, "VisaScoreAssessment")).toBe(2);
     expect(count(m.motions.delete, "VisaD2CLead")).toBe(1);
     expect(count(m.motions.delete, "ActorLocation")).toBe(1);
     expect(count(m.motions.delete, "ConsumerProfile")).toBe(1);
@@ -546,6 +584,7 @@ describe("dry run", () => {
     expect(await Consumer.countDocuments({})).toBe(1);
     expect(await ConsumerProfile.countDocuments({})).toBe(1);
     expect(await SavedCountry.countDocuments({})).toBe(2);
+    expect(await VisaScoreAssessment.countDocuments({})).toBe(2);
     expect(await Ticket.countDocuments({})).toBe(1);
     expect(await Invoice.countDocuments({})).toBe(1);
     expect(vi.mocked(deleteObject)).not.toHaveBeenCalled();
@@ -601,6 +640,7 @@ describe("apply — the paid consumer, end to end", () => {
     expect(await ConsumerProfile.countDocuments({ consumerId: c._id })).toBe(0);
     expect(await ConsumerDocument.countDocuments({ consumerId: c._id })).toBe(0);
     expect(await SavedCountry.countDocuments({ consumerId: c._id })).toBe(0);
+    expect(await VisaScoreAssessment.countDocuments({ consumerId: c._id })).toBe(0);
     expect(await VisaD2CLead.countDocuments({ consumerId: c._id })).toBe(0);
     expect(await ActorLocation.countDocuments({ actorId: c._id })).toBe(0);
     expect(await Ticket.countDocuments({})).toBe(0);
