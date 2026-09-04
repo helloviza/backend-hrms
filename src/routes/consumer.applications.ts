@@ -893,30 +893,92 @@ router.get("/", async (req: any, res: any) => {
           consumerId: me(req),
           linkedApplicationIds: { $in: applications.map((a: any) => a._id) },
         })
-          .select("docCode linkedApplicationIds")
+          // storageKey joins to the ops mirror's s3Key below. Same read,
+          // one more projected field — no extra round trip for it.
+          .select("docCode linkedApplicationIds storageKey")
           .lean()
       : [];
 
-    const codesByApplication = new Map<string, Set<string>>();
+    /* ── AND THE REJECTIONS, WHICH THIS COUNT USED TO IGNORE ──────────
+     *
+     * The detail route learned to join the ops mirror (checklistRows,
+     * below: a REJECTED document is not an attached one, because the
+     * requirement is outstanding again). This route did not, so the two
+     * screens disagreed about the same case in the one way the header
+     * above promises they cannot: the card said "still needs 1 document"
+     * while the page it opened said 2.
+     *
+     * ── ONE QUERY, NOT ONE PER ROW ───────────────────────────────────
+     * Batched with a single $in over every application on the page —
+     * same shape as the ConsumerDocument read it sits beside. A per-card
+     * mirror lookup is the N+1 that this block's original comment was
+     * written to avoid, and adding one back to fix a count would be
+     * trading a wrong number for a slow one.
+     *
+     * Scoped by applicationId alone, which is sound because every id in
+     * the list came out of a find() already clamped to
+     * {consumerId, workspaceId} — the ownership proof is upstream.
+     *
+     * ── KEYED ON THE STORED OBJECT, NOT ON docCode ───────────────────
+     * Same reasoning as the detail route's join, and it matters more
+     * here because this side counts: 103 of 259 published corridors
+     * repeat a docTypeCode across groups, so a code-keyed join would
+     * smear one rejection over every requirement sharing the code and
+     * inflate the outstanding figure. `s3Key` on the mirror IS
+     * `storageKey` on the locker row — one file, one row each side. */
+    const rejectedRows = applications.length
+      ? await VisaDocument.find({
+          applicationId: { $in: applications.map((a: any) => a._id) },
+          reviewStatus: "REJECTED",
+          deletedAt: null,
+        })
+          .select("applicationId s3Key")
+          .lean()
+      : [];
+
+    /* `${applicationId}|${s3Key}` — the rejection is per CASE as well as
+     * per file. A locker document can be linked to two applications and
+     * refused on only one of them; keying on the file alone would fail
+     * the second case for the first case's rejection. */
+    const rejectedByApplicationAndKey = new Set<string>();
+    for (const r of rejectedRows as any[]) {
+      const key = String(r.s3Key ?? "");
+      if (!key) continue;
+      rejectedByApplicationAndKey.add(`${String(r.applicationId)}|${key}`);
+    }
+
+    /* code -> the FIRST locker row carrying it, per application. First
+     * rather than "any un-rejected one" on purpose: checklistRows()
+     * resolves a requirement to the first document under its code and
+     * judges THAT row, so picking a different one here would reintroduce
+     * the disagreement this whole block exists to remove. */
+    const docsByApplication = new Map<string, Map<string, any>>();
     for (const doc of attachedDocs as any[]) {
       const code = String(doc.docCode ?? "").toUpperCase();
       if (!code) continue;
       for (const appId of doc.linkedApplicationIds ?? []) {
         const key = String(appId);
-        if (!codesByApplication.has(key)) codesByApplication.set(key, new Set());
-        codesByApplication.get(key)!.add(code);
+        let byCode = docsByApplication.get(key);
+        if (!byCode) {
+          byCode = new Map<string, any>();
+          docsByApplication.set(key, byCode);
+        }
+        if (!byCode.has(code)) byCode.set(code, doc);
       }
     }
 
     return res.json({
       ok: true,
       applications: applications.map((a: any) => {
-        const have = codesByApplication.get(String(a._id)) ?? new Set<string>();
+        const applicationId = String(a._id);
+        const byCode = docsByApplication.get(applicationId) ?? new Map<string, any>();
         const required = requiredDocCodes(a);
         return {
           ...publicApplication(a, requestById.get(String(a.requestId)) ?? null),
           documentsTotal: required.length,
-          documentsOutstanding: required.filter((c) => !have.has(c)).length,
+          documentsOutstanding: required.filter(
+            (c) => !satisfiedDocCode(applicationId, byCode.get(c), rejectedByApplicationAndKey),
+          ).length,
         };
       }),
     });
@@ -1190,6 +1252,31 @@ function publicApplication(a: any, request: any) {
  * counted as attached. Both are cheap to get wrong in a later edit and
  * neither is visible from the endpoint's happy path.
  */
+/**
+ * IS THIS REQUIREMENT MET — the list's half of the rejection rule.
+ *
+ * Exported for consumer.applicationChecklist.test.ts, and for the same
+ * reason checklistRows() is: the rule ("a rejected file does not satisfy
+ * the requirement it was uploaded for") now lives on two read paths, and
+ * a fix applied to one of them and not the other is exactly the bug this
+ * function was added to close.
+ *
+ * `rejected` is keyed `${applicationId}|${s3Key}` — see the list route.
+ */
+export function satisfiedDocCode(
+  applicationId: string,
+  doc: any | undefined,
+  rejected: Set<string>,
+): boolean {
+  if (!doc) return false;
+  const storageKey = String(doc.storageKey ?? "");
+  // No storage key means nothing to join on. The document is present, so
+  // it counts — the rejection mirror is what could be missing here, and
+  // an unjoinable row must not be assumed refused.
+  if (!storageKey) return true;
+  return !rejected.has(`${applicationId}|${storageKey}`);
+}
+
 export function checklistRows(application: any, attached: any[], reviewRows: any[] = []) {
   const byCode = new Map<string, any>();
   for (const doc of attached) {
