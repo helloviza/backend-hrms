@@ -330,9 +330,36 @@ router.post("/", async (req: any, res: any) => {
       .filter((v: string) => mongoose.isValidObjectId(v))
       .map((v: string) => new mongoose.Types.ObjectId(v));
 
+    /* ── WHICH VARIANT, IF THE READER PICKED ONE ─────────────────────
+     *
+     * An opaque handle from the corridor payload, never a price and
+     * never a rule id. The server re-resolves it inside this corridor's
+     * own purpose pool, so the only thing the client gets to decide is
+     * WHICH published visa — never what it costs. That is the same
+     * posture as the rest of this route: a client-supplied price is a
+     * client-supplied invoice.
+     *
+     * Absent on a single-variant corridor, and on every application
+     * created before the picker shipped, which is why it is optional
+     * rather than required — omitting it means "the headline", exactly
+     * as before. */
+    const variantId = String(req.body?.variantId ?? "").trim() || null;
+
     /* ── the rule, re-resolved. Never the client's word for it. ────── */
-    const rule = await resolveRuleFor(iso2, purpose);
+    const rule = await resolveRuleFor(iso2, purpose, variantId);
     if (!rule) {
+      /* A named variant that no longer resolves is NOT the headline.
+       * Falling back would take a reader who chose Express — and was
+       * quoted Express — and book them onto the cheapest standard rule
+       * at a price they never agreed to. The refusal is machine-readable
+       * so the flow can send them back to re-pick rather than showing a
+       * dead end. */
+      if (variantId) {
+        return res.status(404).json({
+          error: "That visa option is no longer available — please choose again.",
+          code: "VARIANT_UNAVAILABLE",
+        });
+      }
       return res.status(404).json({
         error: "We don't publish this destination for that visa type yet",
       });

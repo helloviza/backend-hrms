@@ -1089,7 +1089,13 @@ describe("variants[] — the corridor's visa types", () => {
       "Visitor Visa",
       "Visitor Visa - Express",
     ]);
-    expect(JSON.stringify(res.body.variants)).not.toContain("validity");
+    /* Asserted on the NAMES, which is what this test is about and what
+     * its title says. It used to scan the whole serialised list for the
+     * substring — fine while no field was called anything like it, and a
+     * false positive the moment `validityDays` was added for the variant
+     * picker's fact chips. The suffix leaking into a name is the defect;
+     * a field whose name contains the word is not. */
+    for (const v of res.body.variants) expect(v.name).not.toMatch(/validity/i);
   });
 
   /* ── the visaTypeName repoint (2026-08-31) ─────────────────────────

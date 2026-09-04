@@ -38,7 +38,7 @@ import VisaDestinationContent from "../models/VisaDestinationContent.js";
 import { hydrateVisaChecklist } from "../utils/visaChecklistHydration.js";
 import { computeVisaFeeBlock, VISA_FEE_DISCLAIMER } from "../utils/visaFee.js";
 import { selectHeadlineRule } from "../utils/visaHeadlineRule.js";
-import { resolveRuleFor } from "../utils/visaRuleResolution.js";
+import { resolveRuleFor, variantIdFor } from "../utils/visaRuleResolution.js";
 import { isCuratedCorridor } from "../config/visaFeaturedRanking.js";
 import {
   SEED_VISA_CATEGORIES,
@@ -663,12 +663,32 @@ function buildPublicVariants(rules: any[]) {
        * Apply step needs a stable handle, that wants a deliberate public id,
        * not this field promoted by default. */
       name: variantDisplayName(r),
+      /* THE HANDLE the Apply step selects by, and the ONE field that
+       * makes a variant addressable. An opaque digest — utils/
+       * visaRuleResolution.ts's variantIdFor explains why it is not the
+       * variantKey (deny-listed, unreliable values) and not an array
+       * index (this list re-sorts whenever ops re-prices anything).
+       *
+       * Safe to publish precisely because it carries no authority: it
+       * names a PUBLISHED rule the corridor endpoint would serve to
+       * anyone, and the server re-resolves it inside the corridor's own
+       * purpose pool rather than trusting it. */
+      variantId: variantIdFor(r),
       purpose: r.purpose ?? null,
       entryType: r.entryType ?? null,
       processingTime:
         r.etaMinDays != null || r.etaMaxDays != null
           ? { minDays: r.etaMinDays ?? null, maxDays: r.etaMaxDays ?? null, basis: r.etaBasis ?? null }
           : null,
+      /* Carried per variant so an option card can render the same fact
+       * chips the single option already showed. Without these the picker
+       * would print "Maximum stay —" against every variant while the
+       * one-option path beside it printed a real number, purely because
+       * the payload narrowed on the way through. Nullable, and rendered
+       * only when present — a corridor that states no validity gets no
+       * chip rather than a dash. */
+      maxStayDays: r.maxStayDays ?? null,
+      validityDays: r.validityDays ?? null,
       price: buildPublicPrice(r),
     }));
 
@@ -877,8 +897,29 @@ router.get("/visa/corridor/:iso2/:purpose", async (req: any, res: any) => {
       return res.status(404).json({ error: "Unknown visa purpose" });
     }
 
-    const rule: any = await resolveRuleFor(iso2, purpose);
+    /* ── ?variant= — ONE SPECIFIC VISA, NOT THE HEADLINE ─────────────
+     *
+     * Absent, this behaves exactly as before: the purpose's headline
+     * rule. Present, it resolves that variant — which is how the Apply
+     * step gets Express's OWN documents and price rather than the
+     * cheapest standard rule's.
+     *
+     * A re-fetch rather than shipping every variant's documentGroups in
+     * variants[]: AU would carry three checklists on every corridor
+     * read and CN sixteen, to render one. The list payload says what
+     * EXISTS; this endpoint says what one of them ASKS FOR. */
+    const variantId = String(req.query?.variant ?? "").trim() || null;
+
+    const rule: any = await resolveRuleFor(iso2, purpose, variantId);
     if (!rule) {
+      /* Two different misses, deliberately told apart. An unknown variant
+       * is a stale or wrong handle — a client holding a link from before
+       * ops unpublished that visa — and it must never quietly become the
+       * headline, because that is a customer being shown one visa and
+       * charged for another. */
+      if (variantId) {
+        return res.status(404).json({ error: "No published visa for that variant" });
+      }
       // Serviced-or-not is not the question here: the corridor may well be
       // serviced for some OTHER purpose. This says only that it publishes
       // nothing for the one asked for.
@@ -922,6 +963,11 @@ router.get("/visa/corridor/:iso2/:purpose", async (req: any, res: any) => {
      * Present ONLY on this endpoint. /country/:iso2 was resolved for no
      * particular purpose and must not claim otherwise. */
     payload.resolvedForPurpose = purpose;
+    /* WHICH variant this payload describes — always set, whether the
+     * caller named one or took the headline. The client gates on it the
+     * same way it gates on resolvedForPurpose: a payload is only allowed
+     * to price and document the selection currently in hand. */
+    payload.resolvedVariantId = variantIdFor(rule);
 
     res.json(payload);
   } catch (err: any) {

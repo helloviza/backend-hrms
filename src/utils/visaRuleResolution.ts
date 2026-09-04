@@ -42,6 +42,8 @@
 // GET /visa/country/:iso2 deliberately does NOT call this. Its
 // representative-rule contract is correct for what it serves and it is
 // left exactly as it was.
+import crypto from "node:crypto";
+
 import VisaRule from "../models/VisaRule.js";
 import { purposeMatchValues } from "./visaPurposes.js";
 import { selectHeadlineRule } from "./visaHeadlineRule.js";
@@ -62,7 +64,17 @@ export const PUBLIC_NATIONALITY = "IN";
  * a real answer and not an error: a caller must not fall back to another
  * purpose's rule, because doing so is the bug above.
  */
-export async function resolveRuleFor(iso2: string, purpose: string) {
+export async function resolveRuleFor(
+  iso2: string,
+  purpose: string,
+  /**
+   * An opaque variantId from variantIdFor(). Given one, the corridor
+   * resolves to THAT variant instead of the headline — see the block
+   * above variantIdFor for why this is an opaque digest rather than the
+   * variantKey or an array index.
+   */
+  variantId?: string | null,
+) {
   const rules = await VisaRule.find({
     status: "PUBLISHED",
     nationality: PUBLIC_NATIONALITY,
@@ -72,8 +84,70 @@ export async function resolveRuleFor(iso2: string, purpose: string) {
 
   if (rules.length === 0) return null;
 
+  /* ── A NAMED VARIANT RESOLVES TO ITSELF, OR TO NOTHING ────────────
+   *
+   * The match is made INSIDE the purpose pool, which is what makes the
+   * id safe to accept from a client: a variantId belonging to another
+   * corridor, another purpose, or a rule that has since been
+   * unpublished simply finds nothing here.
+   *
+   * Returning null — never the headline — is the whole point. A silent
+   * fallback would let a customer select Express, have that id go stale
+   * between the quote and the submit, and be booked onto the cheapest
+   * standard rule at a price they never saw. That is the same
+   * quote-vs-charge failure this module was extracted to end, so the
+   * caller gets a refusal it must handle rather than a plausible wrong
+   * answer. */
+  if (variantId) {
+    const wanted = String(variantId).trim().toLowerCase();
+    return (rules as any[]).find((r) => variantIdFor(r) === wanted) ?? null;
+  }
+
   // The final pick, shared with the browse endpoint. `?? null` keeps the
   // documented null contract (selectHeadlineRule only returns undefined
   // for an empty array, which the guard above has already excluded).
   return selectHeadlineRule(rules as any[]) ?? null;
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+ * THE PUBLIC VARIANT HANDLE.
+ * ═════════════════════════════════════════════════════════════════════
+ *
+ * A stable, opaque id for one published rule, so a customer can say
+ * WHICH visa they picked without the server ever taking their word for
+ * its price.
+ *
+ * ── WHY NOT variantKey ───────────────────────────────────────────────
+ * It is on the public deny-list (routes/public.visa.test.ts asserts the
+ * raw body never contains the string) and the classification is right:
+ * the catalogue audit found its values routinely disagree with the
+ * product they name. Publishing it would put an unreliable internal
+ * taxonomy on a consumer surface, and its VALUES would leak that
+ * taxonomy even under a different field name.
+ *
+ * ── WHY NOT AN ARRAY INDEX ───────────────────────────────────────────
+ * buildPublicVariants sorts priced-first, cheapest-first. Ops re-pricing
+ * one variant reshuffles the list, so a saved draft's "option 2" would
+ * silently become a different visa. An index is a position, not an
+ * identity.
+ *
+ * ── WHY NOT THE RAW _id ──────────────────────────────────────────────
+ * It would work, and it is not unprecedented on this surface. A digest
+ * is preferred only because it is one-way: nothing a client holds can be
+ * fed back into an unrelated route as a Mongo id.
+ *
+ * ── WHY A DIGEST IS ENOUGH ───────────────────────────────────────────
+ * Twelve hex characters over an ObjectId. There is no secret here and no
+ * authorisation attached to the value — the id names a PUBLISHED rule
+ * that the corridor endpoint would serve to anyone — so this needs
+ * collision resistance within one corridor's handful of rules, not
+ * unguessability. resolveRuleFor recomputes it over the pool rather than
+ * reversing it, so nothing needs to be stored and no migration is owed.
+ */
+export function variantIdFor(rule: { _id?: unknown }): string {
+  return crypto
+    .createHash("sha256")
+    .update(`visa-variant:${String(rule?._id ?? "")}`)
+    .digest("hex")
+    .slice(0, 12);
 }
