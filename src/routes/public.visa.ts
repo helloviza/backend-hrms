@@ -33,11 +33,12 @@
 //   · applicability / appliesWhen predicates
 //   · anything from a case or identity collection
 import { Router } from "express";
-import VisaRule, { type VisaCategory } from "../models/VisaRule.js";
+import VisaRule, { VISA_PURPOSES, type VisaCategory } from "../models/VisaRule.js";
 import VisaDestinationContent from "../models/VisaDestinationContent.js";
 import { hydrateVisaChecklist } from "../utils/visaChecklistHydration.js";
 import { computeVisaFeeBlock, VISA_FEE_DISCLAIMER } from "../utils/visaFee.js";
 import { selectHeadlineRule } from "../utils/visaHeadlineRule.js";
+import { resolveRuleFor } from "../utils/visaRuleResolution.js";
 import { isCuratedCorridor } from "../config/visaFeaturedRanking.js";
 import {
   SEED_VISA_CATEGORIES,
@@ -354,6 +355,122 @@ router.get("/visa/map", async (_req: any, res: any) => {
     res.status(500).json({ error: "Failed to load the visa map" });
   }
 });
+
+/* ─────────────────────────────────────────────────────────────────────
+ * THE SERVICED-CORRIDOR PAYLOAD, built in ONE place.
+ *
+ * Extracted verbatim from GET /visa/country/:iso2 so that the new
+ * purpose-scoped GET /visa/corridor/:iso2/:purpose returns the SAME
+ * shape. Two hand-written payloads would be two vocabularies, and the
+ * Apply flow reads both endpoints — a field present on one and missing
+ * on the other is a blank on the page rather than a type error.
+ *
+ * ── WHAT VARIES AND WHAT DOES NOT ────────────────────────────────────
+ * `rule` is the SELECTED rule and everything scalar comes off it:
+ * purpose, entryType, processingTime, maxStay, validity, documents,
+ * documentGroups and the price. `rules` is the WHOLE corridor and only
+ * two fields come off it — `purposes` (Step 1 renders one card per
+ * entry) and `variants` (the product axis). Those two must stay
+ * corridor-wide on both endpoints: narrowing them to the selected
+ * purpose would delete the reader's ability to switch visa type.
+ * ───────────────────────────────────────────────────────────────────── */
+function buildServicedCountryPayload(args: {
+  iso2: string;
+  rule: any;
+  rules: any[];
+  seedCountry: any;
+  meta: any;
+  content: any;
+}): Record<string, any> {
+  const { iso2, rule, rules, seedCountry, meta, content } = args;
+
+  const { documents, documentGroups } = publicDocumentRows(rule);
+  const price = buildPublicPrice(rule);
+
+  /* ⚠ `visaType` and `visaCategory` are NOT the same thing here, and that is
+   * deliberate. `visaCategory` stays rule-derived — the frozen 2a semantics,
+   * "what we will actually process for you". `visaType` is seed-derived —
+   * "what an Indian passport faces", the same value the map pin used. They
+   * agree almost everywhere. Where they disagree, both statements are true
+   * and each is answering a different question. */
+  const tooltipCategory: SeedVisaCategory =
+    seedCountry?.visaCategory ?? rubricCategory(rule.visaCategory ?? "STICKER");
+
+  const payload: Record<string, any> = {
+    ok: true,
+    iso2,
+    destinationName: rule.destinationName,
+    countryName: seedCountry?.countryName ?? rule.destinationName,
+    visaCategory: rule.visaCategory ?? null,
+    visaType: tooltipCategory,
+    difficulty: difficultyFor(iso2, tooltipCategory),
+    approvalChances: approvalChancesFor(iso2, tooltipCategory),
+    // The three readings. Null where the corridor shows a fixed string
+    // instead of a number — see approvalFiguresFor.
+    approvalFigures: approvalFiguresFor(iso2, tooltipCategory),
+    serviced: true,
+    // Same three provenance fields as the unserviced branch above, and
+    // deliberately the same values: the attribution is a property of
+    // the CATALOGUE, not of whether we happen to sell this corridor.
+    source: meta.source,
+    sourceUrl: meta.sourceUrl,
+    lastVerified: meta.lastVerified,
+    disclaimer: meta.disclaimer,
+    // `tooltipCategory`, not `rule.visaCategory` — the credit has to be
+    // derived from the same category the DISPLAYED approval string was,
+    // or the two can disagree on exactly the countries where those two
+    // categories do (see the note above tooltipCategory).
+    purpose: rule.purpose,
+    /* THE CORRIDOR'S PURPOSES, not the chosen rule's.
+     *
+     * `purpose` above is scalar and belongs to the ONE rule this payload
+     * resolved to (tourist-preferred, then cheapest). `purposes` is the whole
+     * corridor: every customer-facing purpose its PUBLISHED rules cover, in
+     * the canonical card order, deduped. Step 1 of the Apply flow renders one
+     * card per entry — so a corridor is never offered a visa type no rule
+     * behind it exists for.
+     *
+     * Derived through the same customerPurposesForRule() the authenticated
+     * GET /destinations uses, from utils/visaPurposes.ts, so the consumer and
+     * B2B answers cannot drift: TOURIST_OR_BUSINESS surfaces as Tourist AND
+     * Business (never as its own option), and an all-TRANSIT corridor reports
+     * ["TRANSIT"] alone.
+     *
+     * `rules` is already in hand — it was loaded above and, until now,
+     * discarded after picking `rule`. No extra query.
+     */
+    purposes: customerPurposesForRules(rules as any[]),
+    entryType: rule.entryType,
+    processingTime:
+      rule.etaMinDays != null || rule.etaMaxDays != null
+        ? {
+            minDays: rule.etaMinDays ?? null,
+            maxDays: rule.etaMaxDays ?? null,
+            basis: rule.etaBasis ?? null,
+          }
+        : null,
+    maxStayDays: rule.maxStayDays ?? null,
+    validityDays: rule.validityDays ?? null,
+    appointmentRequired: Boolean(rule.appointmentRequired),
+    biometricsRequired: Boolean(rule.biometricsRequired),
+    // PUBLISHED editorial content only — a DRAFT row's image is not live.
+    heroImageUrl: content?.heroImageUrl ?? null,
+    isCurated: isCuratedCorridor(iso2),
+    /* EVERY genuine visa this corridor publishes — see
+     * buildPublicVariants. Additive: `purpose`, `purposes`, `price`,
+     * `documents` and `documentGroups` above all still describe the
+     * single HEADLINE rule and are untouched by this. */
+    variants: buildPublicVariants(rules as any[]),
+    documents,
+    documentGroups,
+  };
+
+
+  // OMITTED, not nulled — see buildPublicPrice.
+  if (price) payload.price = price;
+
+  return payload;
+}
 
 /* ─────────────────────────────────────────────────────────────────────
  * GET /visa/country/:iso2 — the requirements-slider payload.
@@ -680,98 +797,135 @@ router.get("/visa/country/:iso2", async (req: any, res: any) => {
       .select("heroImageUrl")
       .lean();
 
-    const { documents, documentGroups } = publicDocumentRows(rule);
-    const price = buildPublicPrice(rule);
-
-    /* The tooltip fields, on the serviced branch too, so all four resolve for
-     * every country on both endpoints.
-     *
-     * ⚠ `visaType` and `visaCategory` are NOT the same thing here, and that is
-     * deliberate. `visaCategory` stays rule-derived — the frozen 2a semantics,
-     * "what we will actually process for you". `visaType` is seed-derived —
-     * "what an Indian passport faces", the same value the map pin used. They
-     * agree almost everywhere. Where they disagree, both statements are true
-     * and each is answering a different question. Reported for review in
-     * helloviza-country-datalayer-2026-08-16.md §8.
-     */
-    const tooltipCategory: SeedVisaCategory =
-      seedCountry?.visaCategory ?? rubricCategory(rule.visaCategory ?? "STICKER");
-
-    const payload: Record<string, any> = {
-      ok: true,
+    const payload = buildServicedCountryPayload({
       iso2,
-      destinationName: rule.destinationName,
-      countryName: seedCountry?.countryName ?? rule.destinationName,
-      visaCategory: rule.visaCategory ?? null,
-      visaType: tooltipCategory,
-      difficulty: difficultyFor(iso2, tooltipCategory),
-      approvalChances: approvalChancesFor(iso2, tooltipCategory),
-      // The three readings. Null where the corridor shows a fixed string
-      // instead of a number — see approvalFiguresFor.
-      approvalFigures: approvalFiguresFor(iso2, tooltipCategory),
-      serviced: true,
-      // Same three provenance fields as the unserviced branch above, and
-      // deliberately the same values: the attribution is a property of
-      // the CATALOGUE, not of whether we happen to sell this corridor.
-      source: meta.source,
-      sourceUrl: meta.sourceUrl,
-      lastVerified: meta.lastVerified,
-      disclaimer: meta.disclaimer,
-      // `tooltipCategory`, not `rule.visaCategory` — the credit has to be
-      // derived from the same category the DISPLAYED approval string was,
-      // or the two can disagree on exactly the countries where those two
-      // categories do (see the note above tooltipCategory).
-      purpose: rule.purpose,
-      /* THE CORRIDOR'S PURPOSES, not the chosen rule's.
-       *
-       * `purpose` above is scalar and belongs to the ONE rule this payload
-       * resolved to (tourist-preferred, then cheapest). `purposes` is the whole
-       * corridor: every customer-facing purpose its PUBLISHED rules cover, in
-       * the canonical card order, deduped. Step 1 of the Apply flow renders one
-       * card per entry — so a corridor is never offered a visa type no rule
-       * behind it exists for.
-       *
-       * Derived through the same customerPurposesForRule() the authenticated
-       * GET /destinations uses, from utils/visaPurposes.ts, so the consumer and
-       * B2B answers cannot drift: TOURIST_OR_BUSINESS surfaces as Tourist AND
-       * Business (never as its own option), and an all-TRANSIT corridor reports
-       * ["TRANSIT"] alone.
-       *
-       * `rules` is already in hand — it was loaded above and, until now,
-       * discarded after picking `rule`. No extra query.
-       */
-      purposes: customerPurposesForRules(rules as any[]),
-      entryType: rule.entryType,
-      processingTime:
-        rule.etaMinDays != null || rule.etaMaxDays != null
-          ? {
-              minDays: rule.etaMinDays ?? null,
-              maxDays: rule.etaMaxDays ?? null,
-              basis: rule.etaBasis ?? null,
-            }
-          : null,
-      maxStayDays: rule.maxStayDays ?? null,
-      validityDays: rule.validityDays ?? null,
-      appointmentRequired: Boolean(rule.appointmentRequired),
-      biometricsRequired: Boolean(rule.biometricsRequired),
-      // PUBLISHED editorial content only — a DRAFT row's image is not live.
-      heroImageUrl: content?.heroImageUrl ?? null,
-      isCurated: isCuratedCorridor(iso2),
-      /* EVERY genuine visa this corridor publishes — see
-       * buildPublicVariants. Additive: `purpose`, `purposes`, `price`,
-       * `documents` and `documentGroups` above all still describe the
-       * single HEADLINE rule and are untouched by this. */
-      variants: buildPublicVariants(rules as any[]),
-      documents,
-      documentGroups,
-    };
-
-    // OMITTED, not nulled — see buildPublicPrice.
-    if (price) payload.price = price;
+      rule,
+      rules: rules as any[],
+      seedCountry,
+      meta,
+      content,
+    });
 
     res.json(payload);
   } catch (err: any) {
     publicVisaLogger.error("country read failed", { error: err?.message });
+    res.status(500).json({ error: "Failed to load destination requirements" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /visa/corridor/:iso2/:purpose — THE APPLY FLOW'S PAYLOAD.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * THE SAME RULE THE SUBMIT WILL STORE. THAT IS THE ENTIRE POINT.
+ * ══════════════════════════════════════════════════════════════════════
+ *
+ * ── WHY THIS EXISTS AND /country/:iso2 WAS NOT ENOUGH ────────────────
+ * /country/:iso2 resolves ONE REPRESENTATIVE rule for the corridor:
+ * tourist-ish preferred, then cheapest. That is the right answer for the
+ * requirements slider, which is a BROWSE surface — a reader who has not
+ * said which visa they want is best shown the one most people want.
+ *
+ * The Apply flow is not that surface. By the time it needs a document
+ * checklist and a price, the reader HAS said which visa they want, and
+ * showing them a different rule's answer is simply wrong. On AU it was
+ * wrong in the worst possible way: the browse pool filters to TOURIST
+ * before selecting, so a TRANSIT applicant was never even a candidate to
+ * be shown their own rule. They saw the Tourist rule's four document
+ * slots (no PHOTOGRAPH) and ₹19,610, then had an application created
+ * against the Transit rule at ₹1,770 with fourteen checklist rows.
+ *
+ * ── HOW IT CANNOT DRIFT AGAIN ────────────────────────────────────────
+ * This calls resolveRuleFor() — literally the function
+ * routes/consumer.applications.ts's POST / calls to decide what to STORE.
+ * Not a mirror of it, not a second implementation that shares a
+ * tie-breaker: the same function, one module. Quote and charge are the
+ * same computation, so they cannot disagree.
+ *
+ * (Sharing only selectHeadlineRule was the previous arrangement, and it
+ * was believed sufficient. It was not: the tie-breaker was shared but the
+ * candidate POOLS were built separately, and the pools were never equal.)
+ *
+ * ── WHAT IT DOES NOT DO ──────────────────────────────────────────────
+ * No fallback. A corridor that publishes nothing for the requested
+ * purpose 404s rather than quietly serving another purpose's rule —
+ * quietly serving another purpose's rule is the bug.
+ *
+ * `purposes` and `variants` stay CORRIDOR-WIDE (see
+ * buildServicedCountryPayload), so Step 1 can still offer every visa type
+ * the corridor publishes and the reader can switch.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/visa/corridor/:iso2/:purpose", async (req: any, res: any) => {
+  try {
+    if (!isSeedReady()) {
+      publicVisaLogger.error("corridor read refused — country seed unavailable", {
+        reason: seedFailureReason(),
+      });
+      return res.status(503).json({ error: "Country data is unavailable" });
+    }
+
+    const iso2 = resolvePublicIso2(req.params.iso2);
+    if (!iso2) {
+      return res.status(404).json({ error: "Destination not found" });
+    }
+
+    /* The purpose is validated against the enum, not merely uppercased.
+     * It reaches a Mongo query, and an unvalidated path segment that
+     * reaches a query is how a caller gets to choose the shape of it. */
+    const purpose = String(req.params.purpose ?? "").trim().toUpperCase();
+    if (!VISA_PURPOSES.includes(purpose as any)) {
+      return res.status(404).json({ error: "Unknown visa purpose" });
+    }
+
+    const rule: any = await resolveRuleFor(iso2, purpose);
+    if (!rule) {
+      // Serviced-or-not is not the question here: the corridor may well be
+      // serviced for some OTHER purpose. This says only that it publishes
+      // nothing for the one asked for.
+      return res.status(404).json({ error: "No published visa for that purpose" });
+    }
+
+    /* The corridor's FULL rule set, for `purposes` and `variants` only.
+     * Deliberately not purpose-filtered — see buildServicedCountryPayload. */
+    const rules = await VisaRule.find({
+      status: "PUBLISHED",
+      nationality: PUBLIC_NATIONALITY,
+      destinationIso2: iso2,
+    }).lean();
+
+    const seedCountry = findSeedCountry(iso2);
+    const meta = getSeedMeta();
+
+    const content: any = await VisaDestinationContent.findOne({
+      destinationIso2: iso2,
+      status: "PUBLISHED",
+    })
+      .select("heroImageUrl")
+      .lean();
+
+    const payload = buildServicedCountryPayload({
+      iso2,
+      rule,
+      rules: rules as any[],
+      seedCountry,
+      meta,
+      content,
+    });
+
+    /* ── THE FIELD THE CLIENT GATES ON ───────────────────────────────
+     * The REQUESTED purpose, echoed back — not `rule.purpose`, which is
+     * the rule's own stored value and legitimately differs: a TOURIST
+     * request can resolve a TOURIST_OR_BUSINESS rule (purposeMatchValues
+     * widens it). A client comparing rule.purpose to what it asked for
+     * would read that correct answer as a mismatch and refuse to render.
+     *
+     * Present ONLY on this endpoint. /country/:iso2 was resolved for no
+     * particular purpose and must not claim otherwise. */
+    payload.resolvedForPurpose = purpose;
+
+    res.json(payload);
+  } catch (err: any) {
+    publicVisaLogger.error("corridor read failed", { error: err?.message });
     res.status(500).json({ error: "Failed to load destination requirements" });
   }
 });

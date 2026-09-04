@@ -66,9 +66,7 @@ import {
   D2C_TRACKING_STATUS_LABELS,
 } from "../models/visaD2CLifecycle.js";
 import { buildIndicativeCostSnapshot, buildRuleSnapshot } from "../utils/visaSnapshots.js";
-import { selectHeadlineRule } from "../utils/visaHeadlineRule.js";
 import { computeProcessingDeadline } from "../utils/visaEta.js";
-import { purposeMatchValues } from "../utils/visaPurposes.js";
 import { findSeedCountry } from "../config/visaCountrySeed.js";
 import { normaliseToIso2 } from "../utils/countryCodes.js";
 import logger from "../utils/logger.js";
@@ -107,28 +105,20 @@ function me(req: any): mongoose.Types.ObjectId {
  * applies (utils/visaPurposes.ts) — so a corridor whose only rule is
  * TOURIST_OR_BUSINESS is bookable as either, exactly as the cards offered.
  */
-// Exported ONLY so routes/visaHeadlineSelection.test.ts can assert that this
-// path and the public headline path resolve the SAME rule for the same
-// corridor. Reaching it through the route would need a consumer session for
-// a question that has nothing to do with authentication. Same convention as
-// public.visa.ts's exported findCategoryDivergence.
-export async function resolveRuleFor(iso2: string, purpose: string) {
-  const rules = await VisaRule.find({
-    status: "PUBLISHED",
-    nationality: PUBLIC_NATIONALITY,
-    destinationIso2: iso2,
-    purpose: { $in: purposeMatchValues(purpose as any) },
-  }).lean();
-
-  if (rules.length === 0) return null;
-
-  // ⚠ SHARED with routes/public.visa.ts — see utils/visaHeadlineRule.ts.
-  // The two endpoints MUST pick the same rule; calling one function is what
-  // guarantees it. `?? null` keeps this route's documented null contract
-  // (selectHeadlineRule only returns undefined for an empty array, which the
-  // guard above has already excluded).
-  return selectHeadlineRule(rules as any[]) ?? null;
-}
+/* MOVED to utils/visaRuleResolution.ts, and re-exported here unchanged.
+ *
+ * It moved because GET /visa/corridor/:iso2/:purpose — the endpoint the
+ * Apply flow now reads its documents and price from — must resolve the
+ * SAME rule this route stores, and a resolver living inside a consumer
+ * route file cannot be called from the public one without dragging a
+ * whole authenticated router into the public module graph.
+ *
+ * Re-exported rather than relocated at the call sites so
+ * routes/visaHeadlineSelection.test.ts keeps importing it from here —
+ * that test asserts this path and the public headline path agree, which
+ * is exactly the property the move protects. */
+import { resolveRuleFor } from "../utils/visaRuleResolution.js";
+export { resolveRuleFor };
 
 /**
  * The fields VisaRuleSnapshot marks `required` that a VisaRule can be
