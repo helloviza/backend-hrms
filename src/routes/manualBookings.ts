@@ -7,7 +7,7 @@ import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
-import ManualBooking, { ATTACHMENT_REQUIRED_TYPES } from "../models/ManualBooking.js";
+import ManualBooking, { ATTACHMENT_REQUIRED_TYPES, isNewModelLineItems } from "../models/ManualBooking.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import Customer from "../models/Customer.js";
@@ -334,8 +334,20 @@ function maskPassengerPII(passengers: any[] | undefined): any[] | undefined {
 export function formatLineItems(b: any): string {
   const items: any[] = Array.isArray(b.lineItems) ? b.lineItems : [];
   if (!items.length) return "";
+  // Legacy (pre two-rate) bookings keep their original single-rate rendering.
+  if (!isNewModelLineItems(items)) {
+    return items
+      .map((li) => `${li.sNo}. ${li.itemDescription} — Qty ${li.quantity} x ₹${li.rate} (GST ${li.gstPct}%) = ₹${li.amount}`)
+      .join(" | ");
+  }
+
+  // Staff-only export — this sheet already carries an "Actual Price" column,
+  // so the supplier rate is shown here too. The customer-facing invoice never
+  // prints it (utils/invoiceLineItems.ts).
   return items
-    .map((li) => `${li.sNo}. ${li.itemDescription} — Qty ${li.quantity} x ₹${li.rate} (GST ${li.gstPct}%) = ₹${li.amount}`)
+    .map((li) =>
+      `${li.sNo}. ${li.itemDescription} — Qty ${li.quantity} x ₹${li.quotedRate}` +
+      ` (cost ₹${li.actualRate ?? 0}, GST ₹${li.gstAmount ?? 0}) = ₹${li.amount}`)
     .join(" | ");
 }
 
