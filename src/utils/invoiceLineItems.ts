@@ -1,5 +1,4 @@
 import logger from "./logger.js";
-import { isNewModelLineItems } from "../models/ManualBooking.js";
 
 const TYPE_COST_LABELS: Record<string, string> = {
   FLIGHT:            "Flight Cost",
@@ -210,43 +209,20 @@ export function buildLineItemsForBooking(booking: any): any[] {
   const passengerNames: string[] = (booking.passengers || []).map((p: any) => p.name);
   const paxStr = passengerNames.join(", ") || "—";
 
-  // Group Booking with an explicit lineItems[] table — one invoice row per
-  // line item, no COST/SERVICE_FEE split. Each row bills the CLIENT rate
-  // (quotedRate); its GST was apportioned from the booking-level gstMode/
-  // gstPercent by apportionLineItemGst() in the ManualBooking pre-save hook,
-  // so Σ igst === pricing.gstAmount and Σ amount === pricing.grandTotal by
-  // construction — there is no reconciliation drift to absorb here.
-  //
-  // NEVER emit actualRate/actualAmount: that is supplier cost, and this array
-  // is served verbatim to customers via GET /api/invoices/workspace/mine.
-  // See infra/audit/group-booking-lineitems-ledger-audit.md.
+  // Events/Group Booking with an explicit lineItems[] table — one invoice row
+  // per line item, no COST/SERVICE_FEE split (no per-row markup concept; see
+  // infra/audit/events-line-items-audit.md, C1 / Open Questions 4 & 6). The
+  // booking's pricing.grandTotal is already Σ these amounts (derived in the
+  // ManualBooking pre-save hook), so there is no reconciliation drift to
+  // absorb here — amounts are read straight off the stored rows.
   if (Array.isArray(booking.lineItems) && booking.lineItems.length > 0) {
-    // Legacy (pre two-rate) rows keep their original single-`rate` shape,
-    // byte-for-byte — see isNewModelLineItems() in models/ManualBooking.ts.
-    if (!isNewModelLineItems(booking.lineItems)) {
-      return booking.lineItems.map((li: any) => ({
-        bookingRef:     booking.bookingRef,
-        rowType:        "COST",
-        description:    li.itemDescription,
-        subDescription: `Qty ${li.quantity} × Rate ${li.rate}`,
-        qty:            li.quantity,
-        rate:           li.rate,
-        igst:           li.gstAmount,
-        amount:         li.amount,
-        passengerNames,
-        travelDate:     booking.travelDate,
-        type:           booking.type,
-        sNo:            li.sNo,
-      }));
-    }
-
     return booking.lineItems.map((li: any) => ({
       bookingRef:     booking.bookingRef,
       rowType:        "COST",
       description:    li.itemDescription,
-      subDescription: `Qty ${li.quantity} × Rate ${li.quotedRate}`,
+      subDescription: `Qty ${li.quantity} × Rate ${li.rate}`,
       qty:            li.quantity,
-      rate:           li.quotedRate,
+      rate:           li.rate,
       igst:           li.gstAmount,
       amount:         li.amount,
       passengerNames,
