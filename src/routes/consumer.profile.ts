@@ -50,6 +50,9 @@ import {
   storageDescription,
 } from "../services/consumerDocumentStorage.js";
 import { processAvatar, AVATAR_MIME } from "../services/consumerAvatar.js";
+import { extractConsumerPassport } from "../services/consumerPassportExtraction.js";
+import { isPassportDocCode } from "../config/visaDocumentTypeCatalogue.js";
+import { consumerPassportExtractLimiter } from "../middleware/rateLimit.js";
 import { normaliseIndiaMobile } from "../services/consumerMobileOtp.js";
 import { getCountryDisplayName, getDemonymOrName } from "@plumtrips/shared/countries";
 
@@ -284,6 +287,23 @@ function publicDocument(d: any) {
     id: String(d._id),
     category: d.category,
     docCode: d.docCode ?? null,
+    /* IS THIS THE PASSPORT — ANSWERED HERE, ONCE, BY THE SERVER.
+     *
+     * The client needs this to know whether to offer passport autofill,
+     * and it must NOT answer it by comparing docCode against a literal.
+     * The passport has two live codes ("DOC-01" and "PASSPORT_ORIGINAL"),
+     * and a client-side equality against either one reads false for every
+     * document carrying the other. That is not hypothetical: it is the
+     * 2026-08-08 bug, in which the B2B module's mirrored "DOC-01" silently
+     * disabled OCR and reported uploaded passports as missing. Its
+     * post-mortem (pages/visa/documents/constants.ts) ends "do not
+     * reintroduce a doc-code literal for the passport" and puts the answer
+     * on the wire instead. This is that same answer, for this locker.
+     *
+     * isPassportDocCode owns the alias map, so a third alias later cannot
+     * reopen the hole in either client.
+     */
+    isPassport: isPassportDocCode(d.docCode),
     label: d.label ?? d.originalFilename,
     originalFilename: d.originalFilename,
     mimeType: d.mimeType,
@@ -1171,6 +1191,118 @@ router.get("/documents/:documentId/file", async (req: any, res: any) => {
     return res.status(500).json({ error: "Failed to read document" });
   }
 });
+
+/* ── Passport autofill — READ, RETURN, FORGET ───────────────────────
+ *
+ * POST /documents/:documentId/extract
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * THIS ROUTE WRITES NOTHING. NOT THE FIELDS, NOT A STATUS, NOT A FLAG.
+ * ══════════════════════════════════════════════════════════════════════
+ * It is a read of bytes the caller already owns, run through the passport
+ * reader, and handed back in the response body. There is no create, no
+ * save, no updateOne anywhere in this handler or in the service it calls
+ * (services/consumerPassportExtraction.ts, whose header states the same
+ * thing and holds no model import that could break the promise).
+ *
+ * WHY THAT IS THE DESIGN AND NOT AN OVERSIGHT. The B2B twin stores its
+ * result on the VisaDocument because a concierge opens that record days
+ * later and must not re-run Gemini to see it — which is why VisaDocument
+ * had to grow field-level encryption for `extractedFields`. This flow has
+ * no such reader: the one consumer of the result is the form the person is
+ * looking at while they wait. Persisting it would mint a second at-rest
+ * copy of a passport number, with its own key handling and its own DPDP
+ * erasure obligation, to serve nobody.
+ *
+ * The values reach the database exactly once, later, by the route they
+ * already travel when someone types them: the person reviews the populated
+ * fields, corrects them, and PATCH /:section + the passport routes write
+ * them (encrypted by ConsumerProfile's own field markers). No new write
+ * path is introduced by passport autofill, which is what makes its DPDP
+ * posture identical to typing.
+ *
+ * OWNERSHIP is the same clause as GET /documents/:id/file above — part of
+ * the query, not a check on a loaded row — and the consumer id comes from
+ * req.consumer.id. There is no consumerId in the body to get wrong: a
+ * document belonging to someone else is never loaded, and answers 404.
+ */
+router.post(
+  "/documents/:documentId/extract",
+  consumerPassportExtractLimiter,
+  async (req: any, res: any) => {
+    try {
+      const consumerId = me(req);
+      if (!isValidId(req.params.documentId)) {
+        return res.status(404).json({ error: "Document not found" });
+      }
+
+      const doc: any = await ConsumerDocument.findOne({
+        _id: req.params.documentId,
+        // THE OWNERSHIP CLAUSE.
+        consumerId: new mongoose.Types.ObjectId(consumerId),
+        deletedAt: null,
+      }).lean();
+
+      if (!doc) return res.status(404).json({ error: "Document not found" });
+
+      // Only a passport is read. isPassportDocCode, never a raw equality —
+      // the passport has two live codes ("DOC-01" and "PASSPORT_ORIGINAL")
+      // and comparing against either one silently skips the other. That was
+      // the 2026-08-08 bug; see the predicate's own comment.
+      //
+      // 400, not 404: the document exists and is theirs. Telling them it
+      // does not exist would be a lie, and this is not a case the UI can
+      // reach anyway — the client gates on the same predicate.
+      if (!isPassportDocCode(doc.docCode)) {
+        return res.status(400).json({
+          error: "Only a passport can be read automatically.",
+          code: "NOT_A_PASSPORT",
+        });
+      }
+
+      const outcome = await extractConsumerPassport({
+        driver: doc.driver,
+        storageKey: doc.storageKey,
+        mimeType: doc.mimeType,
+        documentId: String(doc._id),
+      });
+
+      // `"category" in outcome`, not `!outcome.ok` — this repo compiles
+      // with strictNullChecks:false, under which TS refuses to narrow a
+      // boolean-literal ("ok: true" | "ok: false") union into its false
+      // branch. `in` narrowing is unaffected. Same workaround, same
+      // reason, as services/visaPassportExtraction.ts's parseResult.
+      if ("category" in outcome) {
+        // 422, NOT 500. The request was well-formed and the caller did
+        // nothing wrong — we simply could not read the picture. A 500 here
+        // would put "server error" in front of someone whose passport is
+        // merely badly lit, and would page an on-call engineer for it.
+        // `category` is what lets the client pick the right sentence
+        // (see visaPassportExtraction.ts for what the three mean).
+        return res.status(422).json({
+          error: outcome.message,
+          category: outcome.category,
+          code: "EXTRACTION_FAILED",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        confidence: outcome.confidence,
+        fields: outcome.fields,
+        mismatches: outcome.mismatches,
+        unconverted: outcome.unconverted,
+      });
+    } catch (err: any) {
+      // The service never throws — it returns { ok: false } for every
+      // failure it can have. This catch covers the handler's own code
+      // (a malformed row, a Mongo hiccup) and logs a MESSAGE ONLY, never
+      // the document.
+      console.error("[consumer passport extract]", err?.message);
+      return res.status(500).json({ error: "Failed to read the document" });
+    }
+  },
+);
 
 /**
  * SOFT delete — see models/ConsumerDocument.ts.

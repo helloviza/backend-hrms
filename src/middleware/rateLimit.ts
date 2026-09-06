@@ -301,3 +301,33 @@ export const travelRequestLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later.' },
 });
+
+/* ── CONSUMER PASSPORT AUTOFILL (2026-09-06) ──────────────────────────
+ * POST /api/consumer/profile/documents/:id/extract — reading a passport
+ * so the apply form can fill itself in.
+ *
+ * KEYED ON THE CONSUMER, NOT THE IP. The route is behind requireConsumer,
+ * so a caller always has an identity, and that identity is the honest unit
+ * of the budget: two people on one office NAT are two people, and one
+ * person cycling addresses is still one person. The other limiters in this
+ * file key on IP because their routes are reached BEFORE anyone is signed
+ * in, which is not the case here.
+ *
+ * WHY 12 IN 15 MINUTES. One upload costs one call — two when the first
+ * transcription fails the TD3 parse and the engine takes its one plain
+ * retry. The honest ceiling for one sitting is a passport, a re-photograph
+ * after a glare failure, and a co-traveller's passport: three uploads, so
+ * at most six calls. Twelve leaves room for a bad-lighting afternoon
+ * without letting anyone turn the endpoint into a free Gemini vision
+ * budget, which is the actual thing being rationed — the extraction stores
+ * nothing, so there is no data-shaped abuse to price, only spend.
+ */
+export const consumerPassportExtractLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 12,
+  keyGenerator: (req: any) =>
+    req?.consumer?.id ? `consumer:${req.consumer.id}` : ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "You've read a lot of passports just now — please try again in a few minutes." },
+});
