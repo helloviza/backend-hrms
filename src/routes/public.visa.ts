@@ -38,7 +38,7 @@ import VisaDestinationContent from "../models/VisaDestinationContent.js";
 import { hydrateVisaChecklist } from "../utils/visaChecklistHydration.js";
 import { computeVisaFeeBlock, VISA_FEE_DISCLAIMER } from "../utils/visaFee.js";
 import { selectHeadlineRule } from "../utils/visaHeadlineRule.js";
-import { resolveRuleFor, variantIdFor } from "../utils/visaRuleResolution.js";
+import { pickRuleForPurpose, resolveRuleFor, variantIdFor } from "../utils/visaRuleResolution.js";
 import { isCuratedCorridor } from "../config/visaFeaturedRanking.js";
 import {
   SEED_VISA_CATEGORIES,
@@ -440,6 +440,34 @@ function buildServicedCountryPayload(args: {
      * discarded after picking `rule`. No extra query.
      */
     purposes: customerPurposesForRules(rules as any[]),
+    /* ── WHICH OF THOSE PURPOSES CAN ACTUALLY BE BOUGHT ───────────────
+     *
+     * A subset of `purposes` above: the ones whose rule carries an
+     * authored D2C fee, so the apply flow can quote them.
+     *
+     * ── WHY THE CLIENT CANNOT WORK THIS OUT ITSELF ───────────────────
+     * `price` above is the HEADLINE rule's, and the headline is chosen
+     * tourist-first — so it says nothing about any other purpose. And
+     * `variants[]` is filtered to productClass VISA, which is correct
+     * for a visa-types list but means a priced TRANSIT_VISA or
+     * VISA_AMENDMENT purpose never appears in it. AU is exactly that
+     * shape: a priced transit visa that is invisible in both fields.
+     *
+     * So the panel had no way to know a corridor was sellable on a
+     * non-tourist purpose, and gated its "Get Started" CTA on the
+     * headline price alone. A corridor with an unpriced tourist rule and
+     * a priced transit one would show NO apply CTA at all — the purpose
+     * unreachable rather than merely undiscoverable. This field is what
+     * lets that gate ask the right question.
+     *
+     * Computed IN MEMORY from `rules`, which the caller already holds —
+     * no extra query — and through pickRuleForPurpose, the same function
+     * resolveRuleFor delegates to. That shared call is deliberate: a flag
+     * that disagreed with what the apply flow actually resolves would
+     * advertise a purpose the next screen could not price. */
+    pricedPurposes: customerPurposesForRules(rules as any[]).filter((p) =>
+      Boolean(buildPublicPrice(pickRuleForPurpose(rules as any[], p))),
+    ),
     entryType: rule.entryType,
     processingTime:
       rule.etaMinDays != null || rule.etaMaxDays != null

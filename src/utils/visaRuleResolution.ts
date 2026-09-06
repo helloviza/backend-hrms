@@ -82,7 +82,38 @@ export async function resolveRuleFor(
     purpose: { $in: purposeMatchValues(purpose as any) },
   }).lean();
 
-  if (rules.length === 0) return null;
+  return pickRuleForPurpose(rules as any[], purpose, variantId);
+}
+
+/**
+ * THE PICK ITSELF, with no database in it.
+ *
+ * resolveRuleFor is this function plus a query. It was split out because
+ * a SECOND caller needs the same answer about rules it is already
+ * holding: GET /visa/country/:iso2 has the corridor's whole rule set in
+ * hand and needs to know which purposes are actually BUYABLE, and doing
+ * that with one round trip per purpose would be an N+1 for a question
+ * already answerable in memory.
+ *
+ * Splitting rather than reimplementing is the point. The buyable-purpose
+ * flag has to agree with what the apply flow will really resolve when the
+ * reader picks that purpose; if the two were separate readings of the
+ * same intent they would drift, and the failure mode is a corridor
+ * advertising a purpose it then cannot price — which is the class of bug
+ * this module was extracted to end.
+ *
+ * `rules` must ALREADY be the corridor's published set for the
+ * nationality; this filters by purpose, it does not re-scope.
+ */
+export function pickRuleForPurpose(
+  rules: any[],
+  purpose: string,
+  variantId?: string | null,
+) {
+  const wanted = new Set(purposeMatchValues(purpose as any) as string[]);
+  const pool = (rules ?? []).filter((r) => wanted.has(String(r?.purpose)));
+
+  if (pool.length === 0) return null;
 
   /* ── A NAMED VARIANT RESOLVES TO ITSELF, OR TO NOTHING ────────────
    *
@@ -99,14 +130,14 @@ export async function resolveRuleFor(
    * caller gets a refusal it must handle rather than a plausible wrong
    * answer. */
   if (variantId) {
-    const wanted = String(variantId).trim().toLowerCase();
-    return (rules as any[]).find((r) => variantIdFor(r) === wanted) ?? null;
+    const target = String(variantId).trim().toLowerCase();
+    return pool.find((r) => variantIdFor(r) === target) ?? null;
   }
 
   // The final pick, shared with the browse endpoint. `?? null` keeps the
   // documented null contract (selectHeadlineRule only returns undefined
   // for an empty array, which the guard above has already excluded).
-  return selectHeadlineRule(rules as any[]) ?? null;
+  return selectHeadlineRule(pool) ?? null;
 }
 
 /* ═════════════════════════════════════════════════════════════════════
