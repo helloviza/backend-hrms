@@ -125,10 +125,27 @@ export interface IManualBooking extends Document {
     sNo: number;
     itemDescription: string;
     quantity: number;
-    rate: number;
-    gstPct: number;
+    /** Supplier cost per unit. Rolls up to pricing.actualPrice. NEVER shown on
+     *  a customer-facing invoice — see utils/invoiceLineItems.ts.
+     *  Absent on legacy (pre-two-rate) rows. */
+    actualRate?: number;
+    /** Client-billed rate per unit. Rolls up to pricing.quotedPrice.
+     *  Its PRESENCE is the new-model discriminator — absent on legacy rows. */
+    quotedRate?: number;
+    /** Derived: quantity × actualRate. Absent on legacy rows. */
+    actualAmount?: number;
+    /** Derived: quantity × quotedRate. Absent on legacy rows. */
+    quotedAmount?: number;
+    /** Derived from the booking-level gstMode/gstPercent, not from the row. */
     gstAmount: number;
+    /** Derived: client-payable line total. */
     amount: number;
+    /** @deprecated Pre-two-rate rows billed a single `rate` with a per-row
+     *  `gstPct`. Retained so legacy documents keep their original values;
+     *  `rate` is read as a fallback for `quotedRate`, `gstPct` is unused. */
+    rate?: number;
+    /** @deprecated See `rate`. */
+    gstPct?: number;
   }[];
   pricing: {
     // primary fields
@@ -303,15 +320,39 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     lineItems: [
       {
         sNo: { type: Number, required: true },
-        itemDescription: { type: String, required: true },
+        // NOT required: the description is a LABEL, not what makes a row
+        // billable. "Save as Pending" deliberately parks an incomplete draft,
+        // and a rate-bearing row must keep its money rather than be rejected
+        // or silently dropped over a missing label. A full save still demands
+        // it — enforced in ManualBookingForm's validate(), which blocks the
+        // save and points at the offending row.
+        itemDescription: { type: String, default: "" },
         quantity: { type: Number, required: true, default: 1 },
-        rate: { type: Number, required: true, default: 0 },
-        gstPct: { type: Number, required: true, default: 0 },
-        // gstAmount/amount are server-recomputed every save (pre-save hook
-        // below) from quantity×rate×gstPct — never trusted as submitted, same
-        // convention as the top-level pricing.* derived fields.
+        // Two rates per row: supplier cost and client price. They roll up to
+        // pricing.actualPrice / pricing.quotedPrice, which feed the shared
+        // ON_MARKUP/ON_FULL formula in the pre-save hook below.
+        //
+        // DELIBERATELY no `default` and not `required`: the presence of
+        // `quotedRate` IS the new-model discriminator (isNewModelLineItems()
+        // below). A default would materialise quotedRate: 0 on every legacy
+        // row the moment it is hydrated, making legacy bookings indistinguish-
+        // able from new ones and silently re-pricing them on save.
+        actualRate: { type: Number },
+        quotedRate: { type: Number },
+        // actualAmount/quotedAmount/gstAmount/amount are all server-recomputed
+        // every save (pre-save hook below) — never trusted as submitted, same
+        // convention as the top-level pricing.* derived fields. GST comes from
+        // the booking-level gstMode/gstPercent, never from the row. Also
+        // default-less so a legacy row gains no new keys on save.
+        actualAmount: { type: Number },
+        quotedAmount: { type: Number },
         gstAmount: { type: Number, default: 0 },
         amount: { type: Number, default: 0 },
+        // Legacy pre-two-rate fields, kept so existing documents retain their
+        // original values. `rate` is read as a fallback for `quotedRate`;
+        // `gstPct` is no longer a GST source.
+        rate: { type: Number },
+        gstPct: { type: Number },
       },
     ],
     pricing: {
@@ -374,6 +415,92 @@ ManualBookingSchema.index({ workspaceId: 1, status: 1 });
 ManualBookingSchema.index({ workspaceId: 1, travelDate: -1 });
 ManualBookingSchema.index({ bookingRef: 1 });
 
+/**
+ * NEW-MODEL DISCRIMINATOR — by data, never by date.
+ *
+ * A line-item row is "new model" iff it carries `quotedRate`, the field the
+ * two-rate redesign introduced. Legacy rows (written before it) carry `rate` +
+ * `gstPct` and no `quotedRate` — and because `quotedRate` is declared with no
+ * schema default, it stays `undefined` on a hydrated legacy row rather than
+ * materialising as 0.
+ *
+ * A booking is treated as new-model only when EVERY row qualifies. `some()`
+ * would be unsafe: a half-converted booking would take the new path and bill
+ * its not-yet-converted rows at ₹0. Under `every()`, a partially converted
+ * booking stays legacy — its rows still carry rate/gstPct, so it keeps pricing
+ * exactly as it always has until the conversion is finished.
+ *
+ * Consequence (intended, per the forward-only decision): a legacy Group
+ * Booking opened and saved with no edits re-runs the LEGACY path and is
+ * therefore byte-identical afterwards — no re-pricing, no margin reset.
+ */
+export function isNewModelLineItems(lineItems: any[]): boolean {
+  return (
+    Array.isArray(lineItems) &&
+    lineItems.length > 0 &&
+    lineItems.every((li: any) => li?.quotedRate != null)
+  );
+}
+
+/**
+ * Distribute a Group Booking's booking-level GST across its line items using
+ * the SAME contract as pricing.gstAmount, then force the rows to reconcile to
+ * it exactly (any sub-paisa rounding drift lands on the last GST-bearing row).
+ *
+ *   ON_FULL   — GST is charged on top:  lineGst = quotedAmount × g/100
+ *               and the row bills quotedAmount + lineGst.
+ *   ON_MARKUP — the markup is tax-INCLUSIVE, so GST is backed OUT of it:
+ *               lineGst = (quotedAmount − actualAmount) × g/(100+g), and the
+ *               row bills quotedAmount (GST already inside). A non-positive
+ *               line markup carries no GST rather than a negative one, mirroring
+ *               the suppressed fee line in utils/invoiceLineItems.ts.
+ *
+ * Guarantees Σ li.gstAmount === pricing.gstAmount (whenever any row bears GST)
+ * and Σ li.amount === pricing.grandTotal.
+ */
+function apportionLineItemGst(
+  lineItems: any[],
+  gstMode: string,
+  gstPercent: number,
+  totalGst: number,
+): void {
+  let running = 0;
+  let lastGstRow = -1;
+
+  lineItems.forEach((li: any, idx: number) => {
+    const quotedAmount = Number(li.quotedAmount) || 0;
+    const actualAmount = Number(li.actualAmount) || 0;
+
+    let lineGst = 0;
+    if (gstMode === "ON_FULL") {
+      lineGst = parseFloat(((quotedAmount * gstPercent) / 100).toFixed(2));
+    } else {
+      const lineMarkup = quotedAmount - actualAmount;
+      lineGst = lineMarkup > 0
+        ? parseFloat(((lineMarkup * gstPercent) / (100 + gstPercent)).toFixed(2))
+        : 0;
+    }
+
+    li.gstAmount = lineGst;
+    running += lineGst;
+    if (lineGst !== 0) lastGstRow = idx;
+  });
+
+  const drift = parseFloat((totalGst - running).toFixed(2));
+  if (drift !== 0 && lastGstRow >= 0) {
+    lineItems[lastGstRow].gstAmount = parseFloat(
+      (Number(lineItems[lastGstRow].gstAmount) + drift).toFixed(2),
+    );
+  }
+
+  lineItems.forEach((li: any) => {
+    const quotedAmount = Number(li.quotedAmount) || 0;
+    li.amount = gstMode === "ON_FULL"
+      ? parseFloat((quotedAmount + (Number(li.gstAmount) || 0)).toFixed(2))
+      : parseFloat(quotedAmount.toFixed(2));
+  });
+}
+
 ManualBookingSchema.pre("save", async function (next) {
   // Auto-generate bookingRef for new documents
   if (this.isNew && !this.bookingRef) {
@@ -392,18 +519,15 @@ ManualBookingSchema.pre("save", async function (next) {
   // Recalculate pricing fields every save
   const p = this.pricing;
   const hasLineItems = Array.isArray((this as any).lineItems) && (this as any).lineItems.length > 0;
+  const hasNewModelLineItems = isNewModelLineItems((this as any).lineItems);
 
-  if (p && hasLineItems) {
-    // Group Booking with an explicit line-item table (infra/audit/
-    // events-line-items-audit.md, section B2): pricing.quotedPrice/grandTotal
-    // are DERIVED from Σ line amounts here, instead of the ON_MARKUP/ON_FULL
-    // markup-diff math below — so the invoice total always matches the rows,
-    // by construction (no separate re-derivation to drift against). Each
-    // row's gstAmount/amount is itself server-recomputed from
-    // quantity×rate×gstPct — never trusted as submitted, same convention as
-    // every other pricing.* derived field. actualPrice is left exactly as
-    // typed — Group Booking still tracks margin against a single Actual
-    // Inventory Price; only the client-facing total is line-item-driven.
+  if (p && hasLineItems && !hasNewModelLineItems) {
+    // ── LEGACY line items (pre two-rate). Reproduced verbatim from 6bc735e2 ──
+    // Forward-only by decision: an old Group Booking must not re-price when it
+    // is opened and saved. Per-row `rate` × `gstPct` drives everything here,
+    // exactly as before, including the quotedPrice=Σ-base behaviour and the
+    // margin it yields. Converting is a deliberate act — once every row has a
+    // quotedRate, isNewModelLineItems() sends the booking down the new path.
     let lineSubtotal = 0;
     let lineGstTotal = 0;
     let lineGrandTotal = 0;
@@ -440,9 +564,49 @@ ManualBookingSchema.pre("save", async function (next) {
       ? parseFloat(((p.basePrice / actualPrice) * 100).toFixed(2))
       : 0;
   } else if (p) {
-    // Resolve actual/quoted from either field name (backward compat)
-    const actualPrice = p.actualPrice || p.supplierCost || 0;
-    const quotedPrice = p.quotedPrice || p.sellingPrice || 0;
+    // Group Booking (HOLIDAYS/EVENTS/GROUP_BOOKING) prices from a line-item
+    // table whose rows carry TWO rates — actualRate (supplier) and quotedRate
+    // (client). Those roll up into pricing.actualPrice / pricing.quotedPrice
+    // and then feed the exact same ON_MARKUP/ON_FULL formula every other
+    // booking type uses below — there is no parallel line-item GST math. GST
+    // is apportioned back onto the rows afterwards (apportionLineItemGst), so
+    // Σ rows reconciles to the authoritative totals by construction and the
+    // sidebar, pricing.* and the invoice can never disagree.
+    // See infra/audit/group-booking-lineitems-ledger-audit.md.
+    let actualPrice: number;
+    let quotedPrice: number;
+
+    if (hasNewModelLineItems) {
+      let rollupActual = 0;
+      let rollupQuoted = 0;
+
+      (this as any).lineItems.forEach((li: any, idx: number) => {
+        const quantity = Number(li.quantity) || 0;
+        // Every row is guaranteed to carry quotedRate here — a booking with
+        // any row missing it took the legacy branch above.
+        const actualRate = Number(li.actualRate) || 0;
+        const quotedRate = Number(li.quotedRate) || 0;
+        const actualAmount = parseFloat((quantity * actualRate).toFixed(2));
+        const quotedAmount = parseFloat((quantity * quotedRate).toFixed(2));
+
+        li.sNo = li.sNo != null ? li.sNo : idx + 1;
+        li.actualRate = actualRate;
+        li.quotedRate = quotedRate;
+        li.actualAmount = actualAmount;
+        li.quotedAmount = quotedAmount;
+
+        rollupActual += actualAmount;
+        rollupQuoted += quotedAmount;
+      });
+
+      actualPrice = parseFloat(rollupActual.toFixed(2));
+      quotedPrice = parseFloat(rollupQuoted.toFixed(2));
+    } else {
+      // Resolve actual/quoted from either field name (backward compat)
+      actualPrice = p.actualPrice || p.supplierCost || 0;
+      quotedPrice = p.quotedPrice || p.sellingPrice || 0;
+    }
+
     const gstPercent = p.gstPercent ?? 18;
     const gstMode = p.gstMode ?? "ON_MARKUP";
 
@@ -483,6 +647,10 @@ ManualBookingSchema.pre("save", async function (next) {
     p.profitMargin = actualPrice > 0
       ? parseFloat(((basePrice / actualPrice) * 100).toFixed(2))
       : 0;
+
+    if (hasNewModelLineItems) {
+      apportionLineItemGst((this as any).lineItems, gstMode, gstPercent, gstAmount);
+    }
   }
 
   // Always compute from booking creation date, not travel date
