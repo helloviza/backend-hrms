@@ -594,6 +594,20 @@ import consumerSavedRouter from "./routes/consumer.saved.js";
 app.use("/api/consumer/saved", consumerSavedRouter);
 
 /* ────────────────────────────────────────────────────────────────
+ * The consumer's own VISA PROFILE SCORES — /api/consumer/visa-score.
+ *
+ * READ-ONLY, and session-gated. The public scoring surface lives at
+ * /api/public/visa-score and is deliberately unauthenticated; this is the
+ * account side of the same feature, and it returns nothing but rows that
+ * already belong to the caller.
+ *
+ * The stored rows carry the score and the FILTERED explanation only —
+ * models/VisaScoreAssessment.ts has no path a raw answer could occupy, so
+ * there is no sensitive value here for a read to expose. */
+import consumerVisaScoreRouter from "./routes/consumer.visaScore.js";
+app.use("/api/consumer/visa-score", consumerVisaScoreRouter);
+
+/* ────────────────────────────────────────────────────────────────
  * The consumer's own DELETE-MY-ACCOUNT — /api/consumer/erasure.
  *
  * IT DELETES NOTHING. The POST raises a ConsumerErasureRequest in state
