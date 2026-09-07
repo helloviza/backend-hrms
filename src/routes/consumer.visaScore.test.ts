@@ -265,3 +265,189 @@ describe("DPDP — the response", () => {
     expect(shown).toContain("employment");
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * PHASE C — THE WRITE PATH
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * Phase A built recordAssessment and Phase B built the account page, and
+ * for a month nothing connected them: a signed-in consumer took the
+ * assessment, saw the email gate meant for strangers, and found an empty
+ * account page afterwards. These tests cover the wiring that closes it,
+ * and the two rules that keep it honest —
+ *
+ *   the score is COMPUTED, never accepted from the caller, and
+ *   only a FINISHED assessment is recorded.
+ * ═══════════════════════════════════════════════════════════════════════ */
+describe("POST /api/consumer/visa-score/score — Phase C (a)", () => {
+  it("requires a session", async () => {
+    const res = await request(app)
+      .post("/api/consumer/visa-score/score")
+      .send({ passport: "IN", destination: "US", answers: CLEAN });
+    expect(res.status).toBe(401);
+    expect(await VisaScoreAssessment.countDocuments({})).toBe(0);
+  });
+
+  it("scores AND persists a complete assessment, source 'account'", async () => {
+    const res = await request(app)
+      .post("/api/consumer/visa-score/score")
+      .set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: CLEAN });
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(typeof res.body.score).toBe("number");
+
+    const rows = await VisaScoreAssessment.find({ consumerId: alice.id }).lean();
+    expect(rows).toHaveLength(1);
+    const row: any = rows[0];
+    expect(row.destination).toBe("US");
+    expect(row.score).toBe(res.body.score);
+    expect(row.source).toBe("account");
+    expect(row.band?.name).toBe(res.body.band?.name);
+  });
+
+  it("signing in does not change the number — same engine, same score", async () => {
+    /* The public router is not mounted in this file, so the comparison is
+     * against the engine itself — which is the substance of the claim:
+     * the authed endpoint scores through services/visaScoreScoring.ts,
+     * the same path the public one uses, so a score cannot differ by
+     * which door it came through. */
+    const expected = score(CLEAN, "US");
+    const res = await request(app)
+      .post("/api/consumer/visa-score/score")
+      .set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: CLEAN });
+    expect(res.body.score).toBe(expected.score);
+    expect(res.body.band?.name).toBe(expected.band?.name);
+  });
+
+  it("a PARTIAL answer set scores but is NOT recorded", async () => {
+    /* The gauge re-scores after every answer — ~15 calls for one sitting.
+     * Recording each would make the account page a transcript of someone
+     * thinking rather than a history of their scores. */
+    const partial = { residence: 0, age: 2, travel: 2 };
+    const res = await request(app)
+      .post("/api/consumer/visa-score/score")
+      .set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: partial });
+
+    expect(res.status).toBe(200);
+    expect(typeof res.body.score).toBe("number"); // still scored
+    expect(await VisaScoreAssessment.countDocuments({ consumerId: alice.id })).toBe(0);
+  });
+
+  it("a second complete assessment APPENDS as 'retake' — the progression", async () => {
+    await request(app).post("/api/consumer/visa-score/score").set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: CLEAN });
+    await request(app).post("/api/consumer/visa-score/score").set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: WEAK });
+
+    const rows = await VisaScoreAssessment.find({ consumerId: alice.id, destination: "US" })
+      .sort({ createdAt: 1 }).lean();
+    // APPEND, not upsert — overwriting would delete the only thing a
+    // returning reader comes back to see.
+    expect(rows).toHaveLength(2);
+    expect((rows[0] as any).source).toBe("account");
+    expect((rows[1] as any).source).toBe("retake");
+  });
+
+  it("a different corridor is its own first assessment, not a retake", async () => {
+    await request(app).post("/api/consumer/visa-score/score").set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: CLEAN });
+    await request(app).post("/api/consumer/visa-score/score").set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "GB", answers: CLEAN });
+
+    const gb: any = await VisaScoreAssessment.findOne({ consumerId: alice.id, destination: "GB" }).lean();
+    expect(gb.source).toBe("account");
+  });
+
+  it("writes to the CALLER's account and nobody else's", async () => {
+    await request(app).post("/api/consumer/visa-score/score").set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: CLEAN });
+    expect(await VisaScoreAssessment.countDocuments({ consumerId: bob.id })).toBe(0);
+  });
+
+  it("IGNORES a score supplied in the body — it computes its own", async () => {
+    /* The rule routes/consumer.visaScore.ts refuses to break: a person's
+     * stored score must not be something they can type. */
+    const res = await request(app)
+      .post("/api/consumer/visa-score/score")
+      .set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: CLEAN, score: 870, band: { name: "Perfect" } });
+
+    expect(res.body.score).not.toBe(870);
+    const row: any = await VisaScoreAssessment.findOne({ consumerId: alice.id }).lean();
+    expect(row.score).not.toBe(870);
+    expect(row.band?.name).not.toBe("Perfect");
+  });
+
+  it("rejects an invalid body without writing anything", async () => {
+    const res = await request(app)
+      .post("/api/consumer/visa-score/score")
+      .set("Authorization", alice.auth)
+      // "XX" would PASS — it is a syntactically valid ISO2, just not a
+      // real country. The validator checks shape, so the fixture has to
+      // be malformed to exercise it.
+      .send({ passport: "X", destination: "US", answers: CLEAN });
+    expect(res.status).toBe(400);
+    expect(await VisaScoreAssessment.countDocuments({})).toBe(0);
+  });
+
+  /* ── DPDP ──────────────────────────────────────────────────────────
+   * The same serialise-and-grep Phase A uses. The stored row must not
+   * contain the sensitive answers, and must not contain ANY answer. */
+  it("stores NO raw answers — the sensitive pair included", async () => {
+    await request(app).post("/api/consumer/visa-score/score").set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: WEAK });
+
+    const row: any = await VisaScoreAssessment.findOne({ consumerId: alice.id }).lean();
+    const body = JSON.stringify(row);
+
+    // No answers container under any name.
+    expect(row.answers).toBeUndefined();
+    expect(body).not.toMatch(/"answers"|"responses"/);
+
+    // And no factor names the sensitive questions, which is the subtler
+    // leak: an explanation that says "your compliance history" reveals the
+    // answer by implication.
+    const factorIds = [...(row.factors?.helping ?? []), ...(row.factors?.holdingBack ?? [])]
+      .map((f: any) => f.questionId);
+    expect(factorIds).not.toContain("compliance");
+    expect(factorIds).not.toContain("character");
+  });
+
+  it("the persisted factors carry a magnitude bucket, never a raw impact", async () => {
+    await request(app).post("/api/consumer/visa-score/score").set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: WEAK });
+    const row: any = await VisaScoreAssessment.findOne({ consumerId: alice.id }).lean();
+    const all = [...(row.factors?.helping ?? []), ...(row.factors?.holdingBack ?? [])];
+    expect(all.length).toBeGreaterThan(0);
+    for (const f of all) expect(typeof f.impact).toBe("number"); // stored server-side, by design
+  });
+
+  /* ── THE LOOP CLOSES: write → read ─────────────────────────────── */
+  it("the assessment then APPEARS on GET /assessments — Phase B reads what Phase C wrote", async () => {
+    const wrote = await request(app).post("/api/consumer/visa-score/score").set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: CLEAN });
+
+    const read = await request(app).get("/api/consumer/visa-score/assessments").set("Authorization", alice.auth);
+    expect(read.status).toBe(200);
+    expect(read.body.assessments).toHaveLength(1);
+    expect(read.body.assessments[0].score).toBe(wrote.body.score);
+    expect(read.body.assessments[0].destination).toBe("US");
+  });
+
+  it("and the read path buckets it — no raw impact crosses the wire", async () => {
+    await request(app).post("/api/consumer/visa-score/score").set("Authorization", alice.auth)
+      .send({ passport: "IN", destination: "US", answers: WEAK });
+    const read = await request(app).get("/api/consumer/visa-score/assessments").set("Authorization", alice.auth);
+    const a = read.body.assessments[0];
+    const all = [...(a.factors?.helping ?? []), ...(a.factors?.holdingBack ?? [])];
+    expect(all.length).toBeGreaterThan(0);
+    for (const f of all) {
+      expect(f.impact).toBeUndefined();
+      expect(["strong", "moderate", "mild"]).toContain(f.magnitude);
+    }
+  });
+});

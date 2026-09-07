@@ -41,6 +41,17 @@
 // for them.
 import { Router } from "express";
 import { publicFactorShape } from "../services/visaScoreSafeBreakdown.js";
+import {
+  computeScoreFromBody,
+  isCompleteAnswerSet,
+  scoreResponsePayload,
+  validateScoreBody,
+} from "../services/visaScoreScoring.js";
+import { latestAssessmentFor, recordAssessment } from "../services/visaScoreAssessments.js";
+import { consumerVisaScoreLimiter } from "../middleware/rateLimit.js";
+import logger from "../utils/logger.js";
+
+const scoreLogger = logger.child({ module: "consumer-visa-score" });
 
 import { requireConsumer } from "../middleware/requireConsumer.js";
 import { findSeedCountry } from "../config/visaCountrySeed.js";
@@ -165,3 +176,119 @@ router.get("/assessments", async (req: any, res: any) => {
 });
 
 export default router;
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * POST /api/consumer/visa-score/score — PHASE C, THE MISSING WRITE
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * The header above used to say "Phase B is read-only, on purpose" and that
+ * recordAssessment() "gets its caller when the breakdown gate learns to
+ * fork on an account (Phase C)". This is that caller.
+ *
+ * ── WHY THE ENDPOINT LIVES HERE AND NOT ON THE PUBLIC ROUTER ─────────
+ * Not preference — the session cookie is scoped Path=/api/consumer
+ * (config/consumerAuth.ts). A browser will not attach it to
+ * /api/public/visa-score/score however the client asks, so adding
+ * `credentials: "include"` over there authenticates nothing. An endpoint
+ * under this prefix is the only place the cookie actually arrives, short
+ * of widening the cookie path — which is exactly the narrowing that keeps
+ * a consumer session off every public endpoint.
+ *
+ * It therefore also inherits `router.use(requireConsumer)` at the top of
+ * this file: session-gated by construction, with no second gate to get
+ * wrong.
+ *
+ * ── THE SCORE IS COMPUTED, NEVER ACCEPTED ────────────────────────────
+ * The body carries ANSWERS. It does not carry a score, and if it did this
+ * route would ignore it. A POST that wrote a client-supplied number into
+ * an account would be the "unauthenticated-score-shaped hole" the header
+ * above refuses to open — the caller is authenticated here, but a person's
+ * own stored score still must not be something they can type.
+ *
+ * Scoring goes through services/visaScoreScoring.ts, the same path the
+ * public endpoint uses, so signing in cannot change the number.
+ *
+ * ── PERSIST-THEN-RESPOND, AND WHAT HAPPENS IF THE WRITE FAILS ────────
+ * The write is awaited before the response so a 200 means "recorded", not
+ * "computed and probably recorded". A reader who is told their score was
+ * saved and then finds an empty account page has been lied to by the
+ * cheaper ordering.
+ * ═══════════════════════════════════════════════════════════════════════ */
+router.post("/score", consumerVisaScoreLimiter, async (req: any, res: any) => {
+  try {
+    const consumerId = req.consumer?.id;
+    if (!consumerId) {
+      // Unreachable behind requireConsumer; thrown rather than defaulted
+      // for the same reason routes/consumer.profile.ts throws here.
+      throw new Error("consumer.visaScore: reached a handler with no req.consumer");
+    }
+
+    const body = req.body ?? {};
+
+    const errors = validateScoreBody(body);
+    if (errors.length) {
+      /* NO ANSWERS IN THE LOG. The public route redacts them here; this
+       * one does not log them at all. Two of the fourteen are the
+       * sensitive pair, and a validation failure is not worth the risk of
+       * a redaction bug on an authenticated, attributable request. */
+      scoreLogger.warn("consumer score rejected — invalid input", {
+        consumerId: String(consumerId),
+        errors,
+      });
+      return res.status(400).json({ error: errors.join("; "), details: errors });
+    }
+
+    const { result, scoreMode, input } = computeScoreFromBody(body);
+
+    /* ── "account" OR "retake" ──────────────────────────────────────
+     * The enum (models/VisaScoreAssessment.ts) is ["gate","retake",
+     * "account"]. "gate" belongs to the anonymous funnel — someone who
+     * unlocked their breakdown with an email that turned out to be an
+     * account. In here the person is already signed in, so a first
+     * assessment for this corridor is "account" and any later one is
+     * "retake". The distinction is what lets the account page say "you
+     * were at 690, you are at 744" rather than showing two unrelated
+     * rows. */
+    /* ── PERSIST ONLY A FINISHED ASSESSMENT ────────────────────────
+     * The gauge re-scores after every answer, so this endpoint is called
+     * ~15 times for one sitting. Writing each one would put fifteen rows
+     * behind a single assessment and make the account page's progression
+     * a transcript of someone thinking rather than a history of their
+     * scores. isCompleteAnswerSet() asks the engine's own resolver which
+     * questions are actually in play (route-conditional, first-timer
+     * skip), so the rule cannot drift from the one that scored them.
+     *
+     * A partial set still SCORES and still returns — the live gauge is the
+     * product — it simply is not recorded. */
+    const persisted = isCompleteAnswerSet(input.destination, body.answers as any);
+
+    const prior = persisted ? await latestAssessmentFor(consumerId, input.destination) : null;
+    const source = prior ? "retake" : "account";
+
+    /* APPEND, never upsert — recordAssessment calls create(). The
+     * progression IS the history; overwriting would delete the only thing
+     * a returning reader comes back to see.
+     *
+     * DPDP: recordAssessment takes the RESULT, not the answers. It runs
+     * toSafeBreakdown() and the schema has no answers path at all, so this
+     * write cannot store the compliance or character answer even by
+     * mistake. Phase A built it that way; this route inherits it and adds
+     * nothing of its own. */
+    if (persisted) await recordAssessment({
+      consumerId,
+      result,
+      source,
+      ...(typeof body.submissionId === "string" && body.submissionId.trim()
+        ? { submissionId: body.submissionId.trim() }
+        : {}),
+    });
+
+    /* The SAME payload the public endpoint returns — one allow-list, so a
+     * field added for one caller is a decision for both, and the client
+     * can render either response with the same code. */
+    return res.json(scoreResponsePayload(result, scoreMode, input.destination));
+  } catch (err: any) {
+    scoreLogger.error("consumer score failed", { message: err?.message });
+    return res.status(500).json({ error: "Could not compute a score right now." });
+  }
+});

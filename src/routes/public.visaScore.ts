@@ -105,6 +105,15 @@ import { findSeedCountry, isSeedReady, listSeedCountries } from "../config/visaC
 import { visaScoreLeadLimiter, visaScoreLimiter } from "../middleware/rateLimit.js";
 import logger from "../utils/logger.js";
 import { isSensitiveQuestion, toSafeBreakdown, publicFactorShape } from "../services/visaScoreSafeBreakdown.js";
+import { recordAssessment } from "../services/visaScoreAssessments.js";
+import {
+  computeScoreFromBody,
+  destinationNameFor,
+  resolveScoreMode,
+  scoreResponsePayload,
+  validateScoreBody,
+  type ScoreMode,
+} from "../services/visaScoreScoring.js";
 
 const router = Router();
 const scoreLogger = logger.child({ module: "visaScore" });
@@ -170,7 +179,9 @@ export function redactAnswers(answers: unknown): Record<string, unknown> {
  * SCORE MODES
  * ═══════════════════════════════════════════════════════════════════════ */
 
-export type ScoreMode = "score" | "indicative" | "no_visa" | "blocked" | "suppressed";
+/* Defined in services/visaScoreScoring.ts (the scoring path owns it now)
+ * and re-exported below, so the union cannot be widened in one place and
+ * not the other. */
 
 /**
  * Which of the five answers this route gets, resolved deterministically.
@@ -190,75 +201,19 @@ export type ScoreMode = "score" | "indicative" | "no_visa" | "blocked" | "suppre
  *   4. suppressed — the engine withheld the number (Schengen window).
  *   5. score      — a real assessment.
  */
-export function resolveScoreMode(
-  destinationIso2: string,
-  engine: { eligibility: { assessable: boolean }; build: { suppressed: boolean } },
-): ScoreMode {
-  const dest = String(destinationIso2 ?? "").toUpperCase();
-
-  // SCHENGEN is the ruleset's synthetic and has no seed row of its own; it
-  // is unambiguously a visa route, so it skips the two category checks.
-  if (dest !== RULESET.schengen.code) {
-    const seed = findSeedCountry(dest);
-    if (seed?.visaCategory === "VISA_FREE") return "no_visa";
-    if (seed?.visaCategory === "RESTRICTED") return "blocked";
-  }
-
-  if (!engine.eligibility.assessable) return "indicative";
-  if (engine.build.suppressed) return "suppressed";
-  return "score";
-}
+/* resolveScoreMode, destinationNameFor and validateScoreBody MOVED to
+ * services/visaScoreScoring.ts, so the public route, the consumer route
+ * (Phase C) and the lead handler all score through one implementation.
+ * Re-exported here because this module's test imports resolveScoreMode
+ * from it, and because a route file is the honest place to look for what
+ * that route returns. */
+export { resolveScoreMode, destinationNameFor };
+export type { ScoreMode };
 
 /* ═══════════════════════════════════════════════════════════════════════
  * VALIDATION
  * ═══════════════════════════════════════════════════════════════════════ */
 
-const ISO2 = /^[A-Z]{2}$/;
-
-function validateScoreBody(body: any): string[] {
-  const errors: string[] = [];
-
-  const passport = String(body?.passport ?? "").trim().toUpperCase();
-  if (!ISO2.test(passport)) errors.push("passport must be an ISO 3166-1 alpha-2 code");
-
-  const destination = String(body?.destination ?? "").trim().toUpperCase();
-  const isSchengen = destination === RULESET.schengen.code;
-  if (!isSchengen && !ISO2.test(destination)) {
-    errors.push(`destination must be an ISO 3166-1 alpha-2 code or "${RULESET.schengen.code}"`);
-  }
-
-  if (body?.mode !== undefined && !RULESET.baseRate.modes.includes(String(body.mode))) {
-    errors.push(`mode must be one of ${RULESET.baseRate.modes.join(", ")}`);
-  }
-
-  const answers = body?.answers;
-  if (answers === undefined || answers === null || typeof answers !== "object" || Array.isArray(answers)) {
-    errors.push("answers must be an object of questionId -> option index");
-    return errors;
-  }
-
-  /* Each answer must name a real question and select a real option.
-   * Rejecting an out-of-range index rather than coercing it matters: the
-   * engine reads `q.options[i].points`, and an index past the end would
-   * silently contribute 0 — a wrong score returned with full confidence. */
-  for (const [id, value] of Object.entries(answers as Record<string, unknown>)) {
-    const q = RULESET.questions.find((x) => x.id === id);
-    if (!q) { errors.push(`unknown question "${id}"`); continue; }
-    if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value >= q.options.length) {
-      // The INDEX is named, never the label — an error string is a log line
-      // waiting to happen, and "character: 3" would defeat the redaction.
-      errors.push(`answer for "${id}" must be an integer option index in 0..${q.options.length - 1}`);
-    }
-  }
-
-  const held = body?.heldVisas;
-  if (held !== undefined) {
-    if (!Array.isArray(held)) errors.push("heldVisas must be an array of ISO 3166-1 alpha-2 codes");
-    else if (held.some((h: unknown) => typeof h !== "string")) errors.push("heldVisas must contain only strings");
-  }
-
-  return errors;
-}
 
 /* ═══════════════════════════════════════════════════════════════════════
  * POST /visa-score/score
@@ -313,89 +268,18 @@ router.post(
         return res.status(400).json({ error: errors.join("; "), details: errors });
       }
 
-      const passport = String(body.passport).trim().toUpperCase();
-      const destination = String(body.destination).trim().toUpperCase();
-      const mode = (body.mode ? String(body.mode) : RULESET.baseRate.defaultMode) as BaseRateMode;
-
-      /* generatedAt is minted HERE and injected. The engine is a pure
-       * function and must stay one — a service that reads the clock cannot
-       * be compared to itself, which is what the determinism fixture
-       * depends on. This is the only non-deterministic value in the
-       * response, and it is the route's to own. */
-      const generatedAt = new Date().toISOString();
-
-      const result = computeVisaProfileScore({
-        passportIso2: passport,
-        destinationIso2: destination,
-        answers: body.answers as ScoreAnswers,
-        heldVisas: Array.isArray(body.heldVisas) ? body.heldVisas.map(String) : undefined,
-        mode,
-        generatedAt,
-      });
-
-      const scoreMode = resolveScoreMode(destination, result);
-
-      /* ── THE RESPONSE, FIELD BY NAMED FIELD ────────────────────────────
-       * Constructed, never spread. `result` is the engine's own object and
-       * spreading it here would ship whatever a future engine field holds
-       * — which is exactly how a weight would eventually leak. */
-      return res.json({
-        ok: true,
-        mode: scoreMode,
-        rulesetVersion: result.rulesetVersion,
-        route: {
-          passport: result.route.passportIso2,
-          destination: result.route.destinationIso2,
-          destinationName: result.route.destinationName ?? destinationNameFor(destination),
-          averagingWindow: result.route.mode,
-          synthetic: result.route.synthetic,
-        },
-        eligibility: result.eligibility,
-        score: result.score,
-        band: result.band,
-        range: result.range,
-        profileStrength: result.profileStrength,
-        /* BUCKETED, never the raw leave-one-out number — see
-         * services/visaScoreSafeBreakdown.ts's impact-firewall block.
-         * A per-question point figure here collapsed §12.2's ~5-calls-
-         * per-question extraction cost to one call. */
-        factors: {
-          helping: result.factors.helping.map(publicFactorShape),
-          holdingBack: result.factors.holdingBack.map(publicFactorShape),
-        },
-        flags: result.flags,
-        silentExcluded: result.silentExcluded,
-        /* The arithmetic trail MINUS the model. baseRate and baseScore are
-         * the corridor's published rate and where an average applicant
-         * starts — both already disclosed on /routes and the public map.
-         * `totalPoints`, `p` and `clampedBase` are NOT here: a points total
-         * returned beside a known answer set is a direct read of the
-         * deltas, and it is the single most extractable field in the whole
-         * contract. rawScore stays, because a capped applicant is entitled
-         * to know they were capped. */
-        build: {
-          baseRate: result.build.baseRate,
-          baseScore: result.build.baseScore,
-          rawScore: result.build.rawScore,
-          displayScore: result.build.displayScore,
-          capped: result.build.capped,
-          suppressed: result.build.suppressed,
-        },
-        disclaimer: result.disclaimer,
-        approvalDataDisclaimer: APPROVAL_ESTIMATE_DISCLAIMER,
-        generatedAt: result.generatedAt,
-      });
+      /* THE ONE SCORING PATH — services/visaScoreScoring.ts. The consumer
+       * endpoint and the lead handler compute through the same function,
+       * so a score cannot differ by which door it came through, and the
+       * response allow-list (the §12.2 firewall) is written once. */
+      const { result, scoreMode, input } = computeScoreFromBody(body);
+      return res.json(scoreResponsePayload(result, scoreMode, input.destination));
     } catch (err: any) {
       scoreLogger.error("score failed", { message: err?.message });
       return res.status(500).json({ error: "Could not compute a score right now." });
     }
   },
 );
-
-function destinationNameFor(iso2: string): string | null {
-  if (iso2 === RULESET.schengen.code) return RULESET.schengen.name;
-  return findSeedCountry(iso2)?.countryName ?? null;
-}
 
 /* ═══════════════════════════════════════════════════════════════════════
  * GET /visa-score/routes — the destination catalogue
@@ -994,6 +878,48 @@ router.post(
         enquiryRef,
         extraTags: [SCORE_LEAD_TAG],
       });
+
+      /* ── PHASE C (b): AN EMAIL WE RECOGNISE ALSO GETS THE ASSESSMENT ──
+       *
+       * The fork above already resolved `existing` in order to file the
+       * ticket against the right account. When it found one, this person
+       * IS an account holder who simply happened to assess while signed
+       * out — the commonest way to reach this gate, since the account page
+       * links straight to the public calculator. Filing their case and
+       * then throwing away the assessment it is about would leave
+       * /account/visa-score empty for someone who has just done the work.
+       *
+       * The result persisted is the one RECOMPUTED above from their
+       * answers, never a number from the request. Same principle as the
+       * consumer endpoint: a stored score must not be typeable.
+       *
+       * source "gate" — the enum's name for exactly this door. The
+       * consumer endpoint uses "account"/"retake"; this is the third.
+       *
+       * NOT AWAITED INTO THE RESPONSE PATH. The lead ticket is what the
+       * reader is waiting on, and it is already filed. A persistence
+       * failure here must not turn a successful unlock into an error, so
+       * it is logged and swallowed — the assessment is a convenience on
+       * top of the ticket, not a precondition for it.
+       *
+       * DPDP: recordAssessment takes the RESULT and runs toSafeBreakdown;
+       * there is no answers path on the schema. The anonymous branch below
+       * writes nothing at all. */
+      if (existing) {
+        try {
+          await recordAssessment({
+            consumerId: String((existing as any)._id),
+            result,
+            source: "gate",
+            ...(submissionId ? { submissionId } : {}),
+          });
+        } catch (persistErr: any) {
+          scoreLogger.warn("lead — assessment persist failed, ticket already filed", {
+            destination,
+            message: persistErr?.message,
+          });
+        }
+      }
 
       scoreLogger.info("lead — case filed", {
         destination,

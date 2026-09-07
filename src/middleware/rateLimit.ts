@@ -403,3 +403,47 @@ export const visaScoreLeadLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later.' },
 });
+
+/* ── CONSUMER VISA SCORE (Phase C, 2026-09-08) ────────────────────────
+ * POST /api/consumer/visa-score/score — a signed-in consumer scoring
+ * their own profile, which also PERSISTS the assessment to their account.
+ *
+ * ITS OWN COUNTER, NOT A SHARE OF visaScoreLimiter's 60. Two reasons.
+ * The public budget is keyed on IP and sized against weight extraction;
+ * this one is keyed on a consumer and sized against ordinary use. Folding
+ * them together would mean a household behind one NAT exhausting each
+ * other's assessments, and it would let a signed-in caller spend the
+ * anonymous budget as well as their own.
+ *
+ * WHY 30. The gauge re-scores PER ANSWER — that is the product, and it is
+ * why the public limit is 60 rather than 8 — so one complete in-account
+ * assessment costs roughly 15 calls. Thirty covers an assessment plus a
+ * round of corrections, or two assessments back to back for someone
+ * comparing corridors. Below about 20 the honest second assessment starts
+ * failing; far above 30 and a signed-up scraper gets a bigger allowance
+ * than an anonymous one, which would make free signup the cheapest way
+ * around the firewall.
+ *
+ * ── AND WHY AN IDENTITY IS NOT ITSELF A MOAT ─────────────────────────
+ * Consumer signup is self-service, so "logged in" costs an attacker one
+ * email address. What the identity buys is attribution and revocability —
+ * a scraping account can be disabled, an IP cannot — not a licence to
+ * raise the ceiling. The §12.2 extraction cost is unchanged by
+ * authentication: the weights are recovered by differencing scores, and
+ * that arithmetic does not care who is asking.
+ *
+ * (The impact firewall since 2026-09-07 means factors carry a bucket
+ * rather than a raw delta, so a single response no longer hands over a
+ * per-question weight at all. That lowered the risk this number is
+ * defending against; it did not remove it, which is why 30 is sized for
+ * real use rather than opened up.)
+ */
+export const consumerVisaScoreLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  keyGenerator: (req: any) =>
+    req?.consumer?.id ? `consumer:${req.consumer.id}` : ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "You've scored a lot of profiles just now — please try again in a few minutes." },
+});
