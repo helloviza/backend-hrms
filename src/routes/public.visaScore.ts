@@ -104,7 +104,7 @@ import {
 import { findSeedCountry, isSeedReady, listSeedCountries } from "../config/visaCountrySeed.js";
 import { visaScoreLeadLimiter, visaScoreLimiter } from "../middleware/rateLimit.js";
 import logger from "../utils/logger.js";
-import { isSensitiveQuestion, toSafeBreakdown } from "../services/visaScoreSafeBreakdown.js";
+import { isSensitiveQuestion, toSafeBreakdown, publicFactorShape } from "../services/visaScoreSafeBreakdown.js";
 
 const router = Router();
 const scoreLogger = logger.child({ module: "visaScore" });
@@ -355,7 +355,14 @@ router.post(
         band: result.band,
         range: result.range,
         profileStrength: result.profileStrength,
-        factors: result.factors,
+        /* BUCKETED, never the raw leave-one-out number — see
+         * services/visaScoreSafeBreakdown.ts's impact-firewall block.
+         * A per-question point figure here collapsed §12.2's ~5-calls-
+         * per-question extraction cost to one call. */
+        factors: {
+          helping: result.factors.helping.map(publicFactorShape),
+          holdingBack: result.factors.holdingBack.map(publicFactorShape),
+        },
         flags: result.flags,
         silentExcluded: result.silentExcluded,
         /* The arithmetic trail MINUS the model. baseRate and baseScore are

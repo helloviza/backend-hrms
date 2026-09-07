@@ -40,6 +40,7 @@
 // off a public response for the ordinary reason that a client has no use
 // for them.
 import { Router } from "express";
+import { publicFactorShape } from "../services/visaScoreSafeBreakdown.js";
 
 import { requireConsumer } from "../middleware/requireConsumer.js";
 import { findSeedCountry } from "../config/visaCountrySeed.js";
@@ -117,16 +118,12 @@ function publicAssessment(row: any) {
   };
 }
 
-function publicFactor(f: any) {
-  return {
-    questionId: f.questionId,
-    questionText: f.questionText,
-    dim: f.dim,
-    cite: f.cite,
-    answerLabel: f.answerLabel,
-    impact: f.impact,
-  };
-}
+/* Delegates to the ONE serialisation boundary — see the impact-firewall
+ * block in services/visaScoreSafeBreakdown.ts. Stored rows still hold the
+ * raw `impact` (models/VisaScoreAssessment.ts requires it, and rows written
+ * before the firewall carry it), so the bucketing happens HERE, on the way
+ * out. No migration, no lost history, and the number never crosses the wire. */
+const publicFactor = publicFactorShape;
 
 /**
  * GET /api/consumer/visa-score/assessments

@@ -126,3 +126,103 @@ export function toSafeBreakdown(result: VisaScoreResult): SafeBreakdown {
     suppressed: result.build.suppressed,
   };
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * THE IMPACT FIREWALL — a factor says HOW MUCH, never HOW MANY POINTS
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * ScoreFactor.impact is a leave-one-out counterfactual in display points.
+ * It is genuinely not the option's raw `points` — the logistic transform
+ * is not linear, so the same -13 moves a mid-range route further than a
+ * near-saturated one, and most impacts land on values no option holds.
+ *
+ * MOST is not NONE, and that is the whole problem. Observed live on
+ * 2026-09-07: a single ordinary profile returned impacts of -39, -29, -27
+ * and -18, and -27 and -18 are both exact ruleset deltas. The collision is
+ * a coincidence of the curve, but a scraper does not need to know which
+ * values are coincidences — it needs a distribution, and this handed one
+ * over per question, per call.
+ *
+ * WORSE THAN THE COLLISION IS THE SHORTCUT. routes/public.visaScore.ts's
+ * §12.2 firewall reasons that the weights stay recoverable in principle —
+ * hold every answer fixed, vary ONE question across its options, diff the
+ * scores — and sizes visaScoreLimiter (60 / 15 min) against that cost:
+ * about five calls per question, ~75 per corridor. A per-question impact
+ * in the response collapses that to ONE call. The rate limit was pricing a
+ * door that had been left open beside it.
+ *
+ * ── WHY BUCKETS AND NOT A SCALED NUMBER ──────────────────────────────
+ * Any monotonic re-scaling (0-100, a normalised index) is still a function
+ * of the delta: recoverable by inversion, and still ordered exactly as the
+ * weights are. Rounding is worse than it looks — quantising to multiples
+ * of 5 emits -25, -20, -15, every one of which IS a ruleset delta.
+ *
+ * A small ordinal set has no arithmetic relationship to the points at all.
+ * Three levels per direction means an observer learns which of three bins
+ * |impact| fell in and nothing else; there is no arrangement of calls that
+ * turns "moderate" back into a number. It is the only one of the three
+ * that is structurally safe rather than merely inconvenient.
+ *
+ * ── AND IT IS THE HONEST SHAPE FOR THE READER ────────────────────────
+ * "-27 pts" on an 870-point scale is not something a person can act on;
+ * the precision implies an exactness the model does not have. What they
+ * can act on is "this is holding you back a lot". Direction already comes
+ * from which list the factor is in, and the engine's own ordering is
+ * preserved, so the breakdown loses a number and keeps every claim.
+ *
+ * Thresholds are ABSOLUTE, not relative to the strongest factor in the
+ * response: a reader who improves one answer must not see an untouched
+ * factor jump from "mild" to "strong" because the maximum moved under it.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/** How much a factor moves the score, in bins that cannot encode a weight. */
+export type FactorMagnitude = "strong" | "moderate" | "mild";
+
+/**
+ * Bin boundaries on |impact|, in display points.
+ *
+ * Chosen against the live distribution rather than invented: ordinary
+ * profiles produce impacts clustered in the teens and twenties, so 25 and
+ * 10 put a meaningful number of factors in each bin instead of collapsing
+ * everything into one. An observer who knows these numbers exactly still
+ * learns only which of three intervals a factor fell into.
+ */
+export const MAGNITUDE_STRONG_MIN = 25;
+export const MAGNITUDE_MODERATE_MIN = 10;
+
+export function factorMagnitude(impact: number): FactorMagnitude {
+  const m = Math.abs(Number(impact) || 0);
+  if (m >= MAGNITUDE_STRONG_MIN) return "strong";
+  if (m >= MAGNITUDE_MODERATE_MIN) return "moderate";
+  return "mild";
+}
+
+/**
+ * THE SERIALISATION BOUNDARY. Every factor leaving this server for a
+ * client goes through here, and `impact` is dropped rather than
+ * transformed-in-place so that a future field added to ScoreFactor cannot
+ * ride out unnoticed: this is an allow-list, and the number is not on it.
+ *
+ * `impact` is still computed, still used for ordering, and still stored
+ * (models/VisaScoreAssessment.ts) — it simply never crosses the wire.
+ * Keeping it server-side is what lets stored rows written before this
+ * change render correctly: the read path buckets on the way out, so no
+ * migration is needed and no history is lost.
+ */
+export function publicFactorShape(f: {
+  questionId: string;
+  questionText: string;
+  dim: string;
+  cite: string;
+  answerLabel: string;
+  impact: number;
+}) {
+  return {
+    questionId: f.questionId,
+    questionText: f.questionText,
+    dim: f.dim,
+    cite: f.cite,
+    answerLabel: f.answerLabel,
+    magnitude: factorMagnitude(f.impact),
+  };
+}

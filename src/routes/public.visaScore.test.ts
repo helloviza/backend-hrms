@@ -666,3 +666,132 @@ describe("resolveScoreMode", () => {
     expect(resolveScoreMode("SCHENGEN", ok)).toBe("score");
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * THE IMPACT FIREWALL — and why the fixtures above were not enough
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * The negative-delta assertion in the block above is the right assertion.
+ * It ran against two /score fixtures and passed for six weeks while the
+ * endpoint was, in fact, emitting raw deltas in production.
+ *
+ * It passed because MODAL — the profile it scores — is a strong one, and a
+ * strong profile produces an EMPTY `factors` list. There was nothing in the
+ * payload to leak. The one weak fixture beside it happened to land on
+ * impacts that were not ruleset values. So the test was not wrong; it was
+ * blind, and the blindness was a property of the fixtures rather than of
+ * the assertion.
+ *
+ * Observed live on 2026-09-07: an ordinary profile returned -39, -29, -27,
+ * -18, of which -27 and -18 are exact ruleset deltas.
+ *
+ * ── WHAT THIS BLOCK DOES INSTEAD ──────────────────────────────────────
+ * It runs the actual attack. §12.2 prices weight-extraction at "hold every
+ * answer fixed, vary ONE question across its options, diff the scores" —
+ * so that is the sweep: every question, every option, one request each.
+ * If any weight is recoverable from a single response, this finds it, and
+ * it cannot be fixture-blind because the fixtures ARE the option space.
+ *
+ * The two assertions are deliberately different in kind:
+ *
+ *   VALUE   — no negative ruleset delta appears as a bare JSON number in
+ *             any response. Catches a leak whatever field carries it.
+ *   SHAPE   — a factor's keys are exactly the allow-list, so `impact`
+ *             cannot come back under its own name or a new one. This is
+ *             the assertion that would have caught the original leak on
+ *             day one, because it does not depend on which numbers a
+ *             given profile happens to produce.
+ * ═══════════════════════════════════════════════════════════════════════ */
+describe("FIREWALL — the impact sweep (every question, every option)", () => {
+  /** Every option index for every non-silent question, as one profile each. */
+  function sweepProfiles(): Array<{ label: string; answers: Record<string, number> }> {
+    const out: Array<{ label: string; answers: Record<string, number> }> = [];
+    for (const q of R.questions) {
+      for (let i = 0; i < q.options.length; i++) {
+        if (MODAL[q.id] === i) continue; // already covered by the modal run
+        out.push({ label: `${q.id}=${i}`, answers: { ...MODAL, [q.id]: i } });
+      }
+    }
+    return out;
+  }
+
+  /** As a bare JSON number — a value, not a digit inside a longer one. */
+  const asValue = (n: number) => new RegExp(`(^|[\\[,:\\s])${n}([,}\\]\\s]|$)`);
+
+  function negativeDeltas(): number[] {
+    const s = new Set<number>();
+    for (const q of R.questions) for (const o of q.options) s.add(o.points);
+    return [...s].filter((d) => d < 0);
+  }
+
+  it("never leaks a negative ruleset delta — across the WHOLE option space", async () => {
+    const negatives = negativeDeltas();
+    expect(negatives.length).toBeGreaterThan(10);
+
+    const profiles = sweepProfiles();
+    // The sweep must be big enough to be the real attack, not a token few.
+    expect(profiles.length).toBeGreaterThan(40);
+
+    let factorsSeen = 0;
+    for (const p of profiles) {
+      resetRateLimiter();
+      const res = await post({ passport: "IN", destination: "US", answers: p.answers });
+      if (res.status !== 200) continue;
+      const f = res.body?.factors ?? {};
+      factorsSeen += (f.helping?.length ?? 0) + (f.holdingBack?.length ?? 0);
+      const body = JSON.stringify(res.body);
+      for (const d of negatives) {
+        expect(asValue(d).test(body), `${p.label} leaked the delta ${d}`).toBe(false);
+      }
+    }
+
+    /* THE GUARD ON THE GUARD. If a future change made `factors` empty for
+     * every profile, every assertion above would pass while proving
+     * nothing — which is precisely how the original blind spot worked.
+     * The sweep is only meaningful if it actually produced factors. */
+    // 20, not a tight number: the guard exists to catch `factors` going
+    // EMPTY (the exact shape of the original blind spot), not to pin a
+    // count that a ruleset edit would break for no reason. The sweep
+    // currently yields ~46.
+    expect(factorsSeen, "the sweep produced no factors — it proved nothing").toBeGreaterThan(20);
+  });
+
+  it("a factor's keys are EXACTLY the allow-list — no impact, under any name", async () => {
+    /* The fixture-independent assertion. A number cannot ride out under
+     * `impact`, `points`, `delta`, `w`, or anything else, whatever profile
+     * produced it — so this cannot go blind the way the value check did. */
+    const ALLOWED = ["questionId", "questionText", "dim", "cite", "answerLabel", "magnitude"];
+
+    let checked = 0;
+    for (const p of sweepProfiles().slice(0, 20)) {
+      resetRateLimiter();
+      const res = await post({ passport: "IN", destination: "US", answers: p.answers });
+      if (res.status !== 200) continue;
+      const f = res.body?.factors ?? {};
+      for (const factor of [...(f.helping ?? []), ...(f.holdingBack ?? [])]) {
+        expect(Object.keys(factor).sort(), `${p.label} factor key set`).toEqual([...ALLOWED].sort());
+        expect(["strong", "moderate", "mild"]).toContain(factor.magnitude);
+        checked += 1;
+      }
+    }
+    expect(checked, "no factors were inspected — the assertion proved nothing").toBeGreaterThan(10);
+  });
+
+  it("magnitude is a BUCKET, not a re-scaled weight", async () => {
+    /* The distinction that makes bucketing safe rather than merely
+     * obfuscating: the output alphabet is three symbols, so no arrangement
+     * of calls recovers a number from it. A scaled integer would fail this
+     * — it would take many distinct values across the sweep. */
+    const seen = new Set<string>();
+    for (const p of sweepProfiles().slice(0, 30)) {
+      resetRateLimiter();
+      const res = await post({ passport: "IN", destination: "US", answers: p.answers });
+      if (res.status !== 200) continue;
+      const f = res.body?.factors ?? {};
+      for (const factor of [...(f.helping ?? []), ...(f.holdingBack ?? [])]) seen.add(factor.magnitude);
+    }
+    expect(seen.size).toBeGreaterThan(1); // it does distinguish
+    expect([...seen].every((v) => ["strong", "moderate", "mild"].includes(v))).toBe(true);
+    expect(seen.size).toBeLessThanOrEqual(3); // and never more than three
+  });
+});
