@@ -123,6 +123,7 @@ import ConsumerDocument from "../../models/ConsumerDocument.js";
 import SavedCountry from "../../models/SavedCountry.js";
 import VisaScoreAssessment from "../../models/VisaScoreAssessment.js";
 import VisaD2CLead from "../../models/VisaD2CLead.js";
+import VisaScoreLead from "../../models/VisaScoreLead.js";
 import ActorLocation from "../../models/ActorLocation.js";
 import Ticket from "../../models/Ticket.js";
 import TicketMessage from "../../models/TicketMessage.js";
@@ -169,6 +170,9 @@ export const CONSUMER_ERASURE_ALLOWED_MODELS = [
   "SavedCountry",
   "VisaScoreAssessment",
   "VisaD2CLead",
+  /* Marketing rows from the Visa Score gate. Reached by TWO keys — see
+   * the collection note in buildPlan below. */
+  "VisaScoreLead",
   "ActorLocation",
   "Ticket",
   "TicketMessage",
@@ -341,6 +345,7 @@ export interface ConsumerErasurePlan {
   savedCountryIds: string[];
   visaScoreAssessmentIds: string[];
   visaD2CLeadIds: string[];
+  visaScoreLeadIds: string[];
   actorLocationIds: string[];
   ticketIds: string[];
   ticketMessageIds: string[];
@@ -434,7 +439,7 @@ export async function planConsumerErasure(
       : 0;
 
   /* ── Plaintext PII collections ──────────────────────────────────── */
-  const [profiles, documents, savedCountries, scoreAssessments, leads, locations, tickets] =
+  const [profiles, documents, savedCountries, scoreAssessments, leads, scoreLeads, locations, tickets] =
     await Promise.all([
     ConsumerProfile.find({ consumerId: oid })
       // .lean() SKIPS the field-encryption plugin's post-hook, which is
@@ -451,6 +456,31 @@ export async function planConsumerErasure(
      * corridors it sits beside. */
     VisaScoreAssessment.find({ consumerId: oid }).select("_id").lean(),
     VisaD2CLead.find({ consumerId: oid }).select("_id").lean(),
+    /* ── TWO KEYS, AND THE SECOND ONE IS THE WHOLE POINT ─────────────
+     * models/VisaScoreLead.ts holds a row for anybody who unlocked the
+     * score breakdown, and most of those people have NO account — the
+     * row carries their email and a null consumerId.
+     *
+     * Sweeping consumerId alone would therefore erase a consumer while
+     * leaving behind a marketable row bearing the address they just
+     * asked us to forget, in a sheet ops reads daily. That is precisely
+     * the erasure miss this collection was designed from day one to
+     * avoid.
+     *
+     * So: consumerId OR email. The email is matched case-insensitively
+     * and anchored, because the schema lowercases on write but a row
+     * predating that (or written by a future caller that forgets) must
+     * still be caught. `$or` rather than two queries so a row carrying
+     * BOTH keys is collected once. */
+    (async () => {
+      const or: any[] = [{ consumerId: oid }];
+      if (consumer?.email) {
+        or.push({
+          email: new RegExp(`^${String(consumer.email).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+        });
+      }
+      return VisaScoreLead.find({ $or: or }).select("_id").lean();
+    })(),
     ActorLocation.find({ actorId: oid, actorType: "CONSUMER" }).select("_id").lean(),
     Ticket.find({ consumerId: oid }).select("_id").lean(),
   ]);
@@ -577,6 +607,7 @@ export async function planConsumerErasure(
     savedCountryIds: ids(savedCountries as any[]),
     visaScoreAssessmentIds: ids(scoreAssessments as any[]),
     visaD2CLeadIds: ids(leads as any[]),
+    visaScoreLeadIds: ids(scoreLeads as any[]),
     actorLocationIds: ids(locations as any[]),
     ticketIds,
     ticketMessageIds: ids(ticketMessages as any[]),
@@ -695,6 +726,7 @@ export function planToManifest(
           count: plan.visaScoreAssessmentIds.length,
         },
         { collection: "VisaD2CLead", count: plan.visaD2CLeadIds.length },
+        { collection: "VisaScoreLead", count: plan.visaScoreLeadIds.length },
         { collection: "ActorLocation", count: plan.actorLocationIds.length },
         { collection: "TicketAttachment", count: plan.ticketAttachmentIds.length },
         { collection: "TicketMessage", count: plan.ticketMessageIds.length },
@@ -1085,6 +1117,11 @@ export async function deleteConsumerRows(plan: ConsumerErasurePlan): Promise<Del
   await del("VisaD2CLead", () =>
     plan.visaD2CLeadIds.length
       ? VisaD2CLead.deleteMany({ _id: { $in: plan.visaD2CLeadIds } })
+      : Promise.resolve({ deletedCount: 0 }),
+  );
+  await del("VisaScoreLead", () =>
+    plan.visaScoreLeadIds.length
+      ? VisaScoreLead.deleteMany({ _id: { $in: plan.visaScoreLeadIds } })
       : Promise.resolve({ deletedCount: 0 }),
   );
   await del("ActorLocation", () =>

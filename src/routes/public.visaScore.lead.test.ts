@@ -12,9 +12,10 @@
 // ── WHAT THIS FILE IS REALLY FOR ──────────────────────────────────────
 // Two things, and the second matters more than the first:
 //
-//   1. THE LEAD LANDS AS A TICKET, through services/consumerSupport.ts,
-//      with an ops brief the visa desk can act on — destination, score,
-//      band, and the FACTORS HOLDING THE APPLICANT BACK.
+//   1. THE LEAD LANDS IN models/VisaScoreLead — AND NOT AS A TICKET.
+//      A score check is a marketing signal, not a support request; it
+//      filed into the agent queue for a release and must not again, so
+//      "no ticket" is asserted as hard as the row itself.
 //   2. THE SENSITIVE ANSWERS NEVER GET THERE. compliance and character are
 //      sensitive personal data under DPDP §12.7. They are answered in the
 //      requests below at their most disclosing options, and every
@@ -22,7 +23,8 @@
 //      question text, the option label, the hard-stop message and the cap
 //      itself. Real documents on a real (in-memory) server, never
 //      fixtures: a literal object would prove nothing about what was
-//      actually written.
+//      actually written. The lead row has no answers path at all, which
+//      is the schema-level half of the same guarantee.
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import mongoose from "mongoose";
 import { MongoMemoryServer } from "mongodb-memory-server";
@@ -38,17 +40,13 @@ process.env.FRONTEND_ORIGIN ||= "http://localhost:5173";
 process.env.S3_BUCKET ||= "test-bucket";
 process.env.GEMINI_API_KEY ||= "test-gemini-key";
 
-const { default: visaScoreRouter, buildScoreBrief, SCORE_LEAD_TAG, SENSITIVE_ANSWER_KEYS } =
+const { default: visaScoreRouter, buildScoreBrief, SENSITIVE_ANSWER_KEYS } =
   await import("./public.visaScore.js");
 const { default: Consumer } = await import("../models/Consumer.js");
 const { default: VisaScoreAssessment } = await import("../models/VisaScoreAssessment.js");
 const { default: Ticket } = await import("../models/Ticket.js");
+const { default: VisaScoreLead } = await import("../models/VisaScoreLead.js");
 const { default: TicketMessage } = await import("../models/TicketMessage.js");
-const {
-  CONSUMER_SUPPORT_SUBJECTS,
-  CONSUMER_SUPPORT_TAG,
-  UNVERIFIED_LEAD_TAG,
-} = await import("../services/consumerSupport.js");
 const { visaScoreLeadLimiter } = await import("../middleware/rateLimit.js");
 const { VISA_SCORE_RULESET: R } = await import("../config/visaScoreRuleset.js");
 const { computeVisaProfileScore } = await import("../services/visaProfileScore.js");
@@ -82,7 +80,13 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await Promise.all([Consumer.deleteMany({}), Ticket.deleteMany({}), TicketMessage.deleteMany({}), VisaScoreAssessment.deleteMany({})]);
+  await Promise.all([
+    Consumer.deleteMany({}),
+    Ticket.deleteMany({}),
+    TicketMessage.deleteMany({}),
+    VisaScoreAssessment.deleteMany({}),
+    VisaScoreLead.deleteMany({}),
+  ]);
   await resetRateLimiter();
 });
 
@@ -138,74 +142,142 @@ const postLead = (body: unknown) =>
  * IT FILES A TICKET — through the shared service, in the shared queue
  * ═══════════════════════════════════════════════════════════════════════ */
 
-describe("POST /visa-score/lead — the ticket", () => {
-  it("files exactly one ticket with a minted ref and its first inbound message", async () => {
+/* ═══════════════════════════════════════════════════════════════════════
+ * THE LEAD ROW — what this door writes now
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * This describe used to be called "the ticket" and asserted that a
+ * support case was filed. It no longer is, and that is the change these
+ * tests now pin: a Visa Score check is a MARKETING signal, not a support
+ * request, so it lands in models/VisaScoreLead and NOT in the agent
+ * queue. The "no ticket" assertions below are the load-bearing half —
+ * without them a future edit could quietly reinstate the old behaviour
+ * and every other test here would still pass.
+ */
+describe("POST /visa-score/lead — the lead row", () => {
+  it("writes exactly one score-lead row and NO support ticket", async () => {
     const res = await postLead(leadBody());
 
     expect(res.status).toBe(201);
     expect(res.body.ok).toBe(true);
     expect(res.body.outcome).toBe("filed");
-    expect(res.body.ticketRef).toBeTruthy();
 
-    const tickets = await Ticket.find({}).lean();
-    expect(tickets).toHaveLength(1);
+    /* THE REGRESSION GUARD. The agent queue must stay empty: this door
+     * filed into it for a whole release and must never do so again. */
+    expect(await Ticket.countDocuments({})).toBe(0);
+    expect(await TicketMessage.countDocuments({})).toBe(0);
+    expect(res.body.ticketRef).toBeUndefined();
 
-    const ticket: any = tickets[0];
-    // ticketRef is minted by the model's pre("save") hook — its presence is
-    // the proof the case went through .create() and not some other writer.
-    expect(ticket.ticketRef).toBe(res.body.ticketRef);
-    expect(ticket.fromEmail).toBe("lead@example.com");
-    expect(ticket.fromName).toBe("Test Applicant");
-    expect(ticket.sourceChannel).toBe("WEB");
+    const rows = await VisaScoreLead.find({}).lean();
+    expect(rows).toHaveLength(1);
 
-    const messages = await TicketMessage.find({ ticketId: ticket._id }).lean();
-    expect(messages).toHaveLength(1);
-    expect(messages[0].direction).toBe("INBOUND");
+    const row: any = rows[0];
+    expect(row.email).toBe("lead@example.com");
+    expect(row.name).toBe("Test Applicant");
+    expect(row.destinationIso2).toBe("US");
+    expect(typeof row.destinationName).toBe("string");
+    expect(typeof row.score).toBe("number");
+    expect(row.checkCount).toBe(1);
   });
 
-  it("uses an allowlisted subject and carries the channel as a tag", async () => {
+  it("stamps the consent basis and the disclosure timestamp", async () => {
     await postLead(leadBody());
-    const ticket: any = await Ticket.findOne({}).lean();
+    const row: any = await VisaScoreLead.findOne({}).lean();
 
-    /* The subject is NOT a new one invented for this door — the allowlist
-     * in consumerSupport.ts is what a consumer picks from in
-     * /account/support and this endpoint does not get to widen it. */
-    expect(CONSUMER_SUPPORT_SUBJECTS).toContain(ticket.subject);
-    expect(ticket.subject).toBe("Visa application help");
-
-    // The channel rides on tags, which is what ops filter on.
-    expect(ticket.tags).toContain(CONSUMER_SUPPORT_TAG);
-    expect(ticket.tags).toContain(SCORE_LEAD_TAG);
+    /* The row exists because a disclosure was on screen when the address
+     * was typed. Storing WHICH disclosure is what stops a later copy
+     * change retroactively re-characterising rows captured under the
+     * old wording. */
+    expect(row.consentBasis).toBe("GATE_DISCLOSURE_V1");
+    expect(row.disclosureShownAt).toBeTruthy();
   });
 
-  it("dedupes on submissionId, so a retry files one ticket and not two", async () => {
+  it("upserts on (email, destination): a retry is one lead that checked twice", async () => {
     const body = leadBody();
 
     const first = await postLead(body);
     const second = await postLead(body);
 
     expect(first.status).toBe(201);
-    expect(second.status).toBe(200);
-    expect(second.body.outcome).toBe("duplicate");
-    expect(second.body.ticketRef).toBe(first.body.ticketRef);
-    expect(await Ticket.countDocuments({})).toBe(1);
+    expect(second.status).toBe(201);
+
+    /* ONE row, not two — the collection is keyed so a re-check cannot
+     * inflate the sheet. The re-check is not lost: checkCount carries
+     * it, which is the number adoption actually wants. */
+    expect(await VisaScoreLead.countDocuments({})).toBe(1);
+    const row: any = await VisaScoreLead.findOne({}).lean();
+    expect(row.checkCount).toBe(2);
+
+    // And still no ticket, on either pass.
+    expect(await Ticket.countDocuments({})).toBe(0);
+  });
+
+  it("keeps first-touch attribution and firstCheckedAt across a re-check", async () => {
+    await postLead(leadBody({ utm: { utm_source: "google" } }));
+    const before: any = await VisaScoreLead.findOne({}).lean();
+
+    // A later, untagged visit must not erase the campaign that introduced
+    // them — the same rule VisaD2CLead applies to its own attribution.
+    await postLead(leadBody({ submissionId: randomUUID() }));
+    const after: any = await VisaScoreLead.findOne({}).lean();
+
+    expect(after.utm.source).toBe("google");
+    expect(new Date(after.firstCheckedAt).getTime()).toBe(
+      new Date(before.firstCheckedAt).getTime(),
+    );
+    expect(new Date(after.lastCheckedAt).getTime()).toBeGreaterThanOrEqual(
+      new Date(before.lastCheckedAt).getTime(),
+    );
+  });
+
+  it("stores the RESULT and never the answers", async () => {
+    await postLead(leadBody());
+    const row: any = await VisaScoreLead.findOne({}).lean();
+
+    /* DPDP §12.7 at the schema level: there is no answers path on this
+     * collection, so the sensitive replies cannot be here even by
+     * accident. Asserted against the serialised row so a future field
+     * addition that smuggles them in fails. */
+    const serialised = JSON.stringify(row);
+    for (const needle of sensitiveStrings()) {
+      expect(serialised).not.toContain(needle);
+    }
+    expect(row.answers).toBeUndefined();
   });
 });
 
 /* ═══════════════════════════════════════════════════════════════════════
- * THE OPS BRIEF — what the visa desk actually opens
- * ═══════════════════════════════════════════════════════════════════════ */
-
-describe("POST /visa-score/lead — the ops brief", () => {
-  async function bodyText(): Promise<string> {
-    const ticket: any = await Ticket.findOne({}).lean();
-    const message: any = await TicketMessage.findOne({ ticketId: ticket._id }).lean();
-    return String(message.bodyText);
+ * THE OPS BRIEF — buildScoreBrief(), exercised directly
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * These used to read the brief out of the ticket message body. There is
+ * no ticket any more, so they call the builder instead. THE FUNCTION NOW
+ * HAS NO PRODUCTION CALLER — it is kept because the brief is what an ops
+ * "call this lead" view would render off the sheet, and because its
+ * sensitive-factor stripping (asserted under DPDP below) is the rule any
+ * such view has to inherit. If that view is never built, the function and
+ * this describe should go together; leaving it half-alive is the worse
+ * outcome.
+ */
+describe("buildScoreBrief — the ops brief", () => {
+  function brief(answers: Record<string, number>): string {
+    return buildScoreBrief({
+      result: computeVisaProfileScore({
+        passportIso2: "IN",
+        destinationIso2: "US",
+        answers,
+        mode: R.baseRate.defaultMode,
+        generatedAt: new Date().toISOString(),
+      }),
+      scoreMode: "score",
+      destinationName: "United States",
+      destinationIso2: "US",
+      mode: R.baseRate.defaultMode,
+    });
   }
 
   it("names the destination, the score and the band", async () => {
-    await postLead(leadBody({ answers: MODAL }));
-    const text = await bodyText();
+    const text = brief(MODAL);
 
     // The route, spelled out rather than left as an iso2 an agent decodes.
     expect(text).toContain("United States");
@@ -226,8 +298,7 @@ describe("POST /visa-score/lead — the ops brief", () => {
   });
 
   it("surfaces the weak factors — the objections, on the first screen", async () => {
-    await postLead(leadBody({ answers: MODAL }));
-    const text = await bodyText();
+    const text = brief(MODAL);
 
     expect(text).toContain("HOLDING THEM BACK");
 
@@ -254,8 +325,7 @@ describe("POST /visa-score/lead — the ops brief", () => {
   });
 
   it("prints the corridor rate as a percentage, not as the raw probability", async () => {
-    await postLead(leadBody({ answers: MODAL }));
-    const text = await bodyText();
+    const text = brief(MODAL);
 
     /* build.baseRate is a PROBABILITY (0..1) — the engine's scale
      * throughout. Rendering it raw put "0.7333%" in front of an agent,
@@ -271,8 +341,10 @@ describe("POST /visa-score/lead — the ops brief", () => {
   });
 
   it("is built entirely server-side — a client-claimed score never appears", async () => {
-    /* Every one of these is a field a caller might hope to inject into an
-     * ops queue. None of them is read by the endpoint. */
+    /* The builder takes a typed VisaScoreResult, so injection can only be
+     * attempted at the DOOR. Asserted there instead: every one of these is
+     * a field a caller might hope to push into a sheet ops will act on,
+     * and none of them is read by the endpoint. */
     await postLead(
       leadBody({
         answers: MODAL,
@@ -282,10 +354,20 @@ describe("POST /visa-score/lead — the ops brief", () => {
         message: "INJECTED FREE TEXT",
       }),
     );
-    const text = await bodyText();
 
-    expect(text).not.toContain("INJECTED");
-    expect(text).not.toContain("Score 900");
+    const row: any = await VisaScoreLead.findOne({}).lean();
+    const expected = computeVisaProfileScore({
+      passportIso2: "IN",
+      destinationIso2: "US",
+      answers: MODAL,
+      mode: R.baseRate.defaultMode,
+      generatedAt: new Date().toISOString(),
+    });
+
+    expect(row.score).toBe(expected.score);
+    expect(row.score).not.toBe(900);
+    expect(row.band).toBe(expected.band!.name);
+    expect(JSON.stringify(row)).not.toContain("INJECTED");
   });
 });
 
@@ -325,7 +407,15 @@ describe("POST /visa-score/lead — DPDP", () => {
       await Ticket.find({}).lean(),
       await TicketMessage.find({}).lean(),
       await Consumer.find({}).lean(),
+      /* THE COLLECTION THE WRITE ACTUALLY LANDS IN NOW. Without this line
+       * the sweep reads three empty arrays and passes for the wrong
+       * reason — the ticket it was written against no longer exists. */
+      await VisaScoreLead.find({}).lean(),
+      await VisaScoreAssessment.find({}).lean(),
     ]);
+
+    // The premise for THAT, too: there is a row to search.
+    expect(await VisaScoreLead.countDocuments({})).toBe(1);
 
     for (const needle of sensitiveStrings()) {
       expect(persisted).not.toContain(needle);
@@ -342,6 +432,7 @@ describe("POST /visa-score/lead — DPDP", () => {
     const persisted = JSON.stringify([
       await Ticket.find({}).lean(),
       await TicketMessage.find({}).lean(),
+      await VisaScoreLead.find({}).lean(),
     ]);
 
     /* The ruleset's only two caps are the misrepresentation and custodial
@@ -389,10 +480,13 @@ describe("POST /visa-score/lead — identity", () => {
 
     expect(await Consumer.countDocuments({})).toBe(0);
 
-    const ticket: any = await Ticket.findOne({}).lean();
-    expect(ticket.consumerId).toBeNull();
-    // Tagged, so an agent knows the address is a claim and not an identity.
-    expect(ticket.tags).toContain(UNVERIFIED_LEAD_TAG);
+    /* The row records the address WITHOUT claiming it is an identity:
+     * consumerId stays null and hadAccount stays false, which is what the
+     * UNVERIFIED_LEAD_TAG used to say on the ticket. It is also the field
+     * the sheet's "No account" column reads — the marketable population. */
+    const row: any = await VisaScoreLead.findOne({}).lean();
+    expect(row.consumerId).toBeNull();
+    expect(row.hadAccount).toBe(false);
   });
 
   it("issues no session — the response carries no token and sets no cookie", async () => {
@@ -403,7 +497,7 @@ describe("POST /visa-score/lead — identity", () => {
     expect(res.headers["set-cookie"]).toBeUndefined();
   });
 
-  it("files against an EXISTING consumer, so the case shows on their support page", async () => {
+  it("links an EXISTING consumer to the row, matched case-insensitively", async () => {
     const consumer = await Consumer.create({
       email: "known@example.com",
       name: "Known Person",
@@ -413,12 +507,12 @@ describe("POST /visa-score/lead — identity", () => {
     const res = await postLead(leadBody({ email: "Known@Example.com " }));
     expect(res.status).toBe(201);
 
-    const ticket: any = await Ticket.findOne({}).lean();
-    expect(String(ticket.consumerId)).toBe(String(consumer._id));
-    // The identity came from the DATABASE, not from the request body.
-    expect(ticket.fromEmail).toBe("known@example.com");
-    expect(ticket.fromName).toBe("Known Person");
-    expect(ticket.tags).not.toContain(UNVERIFIED_LEAD_TAG);
+    const row: any = await VisaScoreLead.findOne({}).lean();
+    expect(String(row.consumerId)).toBe(String(consumer._id));
+    expect(row.hadAccount).toBe(true);
+    // The address is stored normalised, so the sheet and the erasure
+    // cascade can both find it by a plain lowercase lookup.
+    expect(row.email).toBe("known@example.com");
 
     // Still no account created — the existing one was found, not remade.
     expect(await Consumer.countDocuments({})).toBe(1);
@@ -451,6 +545,7 @@ describe("POST /visa-score/lead — validation", () => {
     expect(res.body.error).toBeTruthy();
     expect(await Ticket.countDocuments({})).toBe(0);
     expect(await TicketMessage.countDocuments({})).toBe(0);
+    expect(await VisaScoreLead.countDocuments({})).toBe(0);
   });
 
   it("never names a sensitive answer in a validation error", async () => {
@@ -465,13 +560,14 @@ describe("POST /visa-score/lead — validation", () => {
 });
 
 describe("POST /visa-score/lead — abuse control", () => {
-  it("swallows a honeypot submission with a plausible success and no ticket", async () => {
+  it("swallows a honeypot submission with a plausible success and no row", async () => {
     const res = await postLead(leadBody({ hpField: "https://spam.example" }));
 
     // A bot must not learn which field gave it away.
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
     expect(await Ticket.countDocuments({})).toBe(0);
+    expect(await VisaScoreLead.countDocuments({})).toBe(0);
     expect(await Consumer.countDocuments({})).toBe(0);
   });
 
@@ -484,8 +580,13 @@ describe("POST /visa-score/lead — abuse control", () => {
     const blocked = await postLead(leadBody());
     expect(blocked.status).toBe(429);
 
-    // Five tickets, not six: the limiter refused before the writer ran.
-    expect(await Ticket.countDocuments({})).toBe(5);
+    /* The five accepted attempts all carry the SAME email and
+     * destination, so they collapse into one row that counted five checks
+     * — and the sixth left no trace at all, because the limiter refused
+     * before the writer ran. */
+    expect(await VisaScoreLead.countDocuments({})).toBe(1);
+    const row: any = await VisaScoreLead.findOne({}).lean();
+    expect(row.checkCount).toBe(5);
   });
 });
 
@@ -526,8 +627,8 @@ describe("lead — Phase C (b): persist when the email matches an account", () =
     const res = await postLead(leadBody({ email: "stranger@example.com" }));
     expect(res.status).toBe(201);
 
-    // The ticket is still filed — the anonymous funnel is untouched.
-    expect(await Ticket.countDocuments({})).toBe(1);
+    // The lead row is still written — the anonymous funnel is untouched.
+    expect(await VisaScoreLead.countDocuments({})).toBe(1);
     // But nothing is persisted to any account, because there is no account.
     expect(await VisaScoreAssessment.countDocuments({})).toBe(0);
   });
@@ -564,15 +665,15 @@ describe("lead — Phase C (b): persist when the email matches an account", () =
     expect(ids).not.toContain("character");
   });
 
-  it("a persistence failure does NOT break the unlock — the ticket is what they waited for", async () => {
-    /* The assessment is a convenience on top of the case, not a
-     * precondition for it. Simulated by a duplicate submissionId path is
-     * not available here, so this asserts the shape of the guarantee: the
-     * lead still returns 201 and the ticket still exists even when no
-     * assessment is written (the non-matching branch above proves the
-     * same code path completes without one). */
+  it("a persistence failure does NOT break the unlock — the breakdown is what they waited for", async () => {
+    /* The assessment is a convenience, not a precondition. With the ticket
+     * gone, the thing the reader is actually waiting for is the 201 that
+     * opens their breakdown — so that is what this pins: the door still
+     * succeeds when no assessment is written (the non-matching branch
+     * above proves the same code path completes without one). */
     const res = await postLead(leadBody({ email: "nobody@example.com" }));
     expect(res.status).toBe(201);
-    expect(res.body.ticketRef).toBeTruthy();
+    expect(res.body.ok).toBe(true);
+    expect(res.body.outcome).toBe("filed");
   });
 });

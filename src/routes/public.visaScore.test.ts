@@ -297,10 +297,10 @@ describe("DPDP — the compliance and character answers", () => {
   });
 
   it("keeps the /lead endpoint's own gate — only /score lost a control", async () => {
-    /* The removal was scoped. /lead WRITES a ticket into the queue ops
-     * read, so it keeps the honeypot and its own tighter limiter; a future
-     * "tidy up the gates" pass must not read the /score decision as
-     * applying to both. */
+    /* The removal was scoped. /lead WRITES — a lead row ops act on — so it
+     * keeps the honeypot and its own tighter limiter; a future "tidy up
+     * the gates" pass must not read the /score decision as applying to
+     * both. */
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("./public.visaScore.ts", import.meta.url), "utf-8");
 
@@ -310,29 +310,45 @@ describe("DPDP — the compliance and character answers", () => {
   it("stores no assessment, and never writes through a model directly", async () => {
     /* THIS TEST USED TO SAY "the router imports no model", and that was the
      * strongest possible form of the guarantee: no writer at all. Phase 3b
-     * added POST /lead, which files one support ticket, so that sentence is
-     * no longer true — and leaving it green by narrowing the regex would be
-     * a passing test over a false claim.
+     * added POST /lead, which wrote, so that sentence stopped being true —
+     * and leaving it green by narrowing the regex would be a passing test
+     * over a false claim.
      *
-     * What replaces it is narrower and still the thing worth pinning:
+     * It said "exactly two models — Consumer and Ticket" until the ticket
+     * was removed from this door. ONE now, and that is a tightening, not a
+     * loosening: the file is back to a single model, read and never
+     * written.
      *
-     *   · exactly two models are imported, and both are read here — Consumer
-     *     for the identity fork, Ticket for the submissionId dedupe;
+     *   · exactly one model is imported, and it is READ — Consumer, for
+     *     the identity fork that decides whether the address already
+     *     belongs to an account;
      *   · NOTHING in this file writes through a model directly. The single
-     *     write goes through services/consumerSupport.ts, which owns the
-     *     ticketRef pre-save hook and the fromEmail integrity rule;
+     *     write goes through services/visaScoreLeads.ts, which owns the
+     *     upsert key and the first-touch rule;
+     *   · Ticket is absent, and asserted absent: this door filed support
+     *     cases for a release and must not again;
      *   · no endpoint stores an assessment. The answers are an argument to
      *     a pure function, and public.visaScore.lead.test.ts proves the
-     *     sensitive ones reach neither the ticket nor any other document.
+     *     sensitive ones reach no document at all.
      */
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("./public.visaScore.ts", import.meta.url), "utf-8");
 
     const models = [...src.matchAll(/from "\.\.\/models\/(\w+)\.js"/g)].map((m) => m[1]);
-    expect(new Set(models)).toEqual(new Set(["Consumer", "Ticket"]));
+    expect(new Set(models)).toEqual(new Set(["Consumer"]));
 
     expect(src).not.toMatch(/\.save\(\)|\.create\(|\.updateOne\(|\.insertMany\(|\.deleteOne\(/);
-    expect(src).toMatch(/createConsumerSupportCase\(/);
+
+    /* The write, named — through the service, not inline. */
+    expect(src).toMatch(/recordVisaScoreCheck\(/);
+
+    /* AND THE TICKET IS GONE, asserted rather than assumed. A source scan
+     * is the right instrument here: an integration test can only show no
+     * ticket was filed on the paths it exercises, whereas this fails the
+     * moment the import comes back. */
+    expect(src).not.toMatch(/createConsumerSupportCase\(/);
+    expect(src).not.toMatch(/from "\.\.\/services\/consumerSupport\.js"/);
+    expect(src).not.toMatch(/from "\.\.\/models\/Ticket\.js"/);
   });
 });
 

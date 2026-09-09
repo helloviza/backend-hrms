@@ -26,6 +26,7 @@ import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import VisaD2CLead from "../models/VisaD2CLead.js";
+import VisaScoreLead from "../models/VisaScoreLead.js";
 import Consumer from "../models/Consumer.js";
 import {
   D2C_PAYMENT_STATUS_LABELS,
@@ -161,6 +162,119 @@ router.get("/", requirePermission("visaApplication", "READ"), async (req: any, r
   } catch (err: any) {
     masterSheetLogger.error("master sheet read failed", { error: err?.message });
     return res.status(500).json({ error: "Failed to load the master sheet" });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+ * GET /score-leads — THE VISA SCORE CALC TAB
+ * ══════════════════════════════════════════════════════════════════════
+ * A second population on the same sheet, and deliberately a second
+ * ENDPOINT rather than a mode flag on the one above: the two read
+ * different collections with different keys and different meanings, and
+ * a shared handler branching on a query parameter would be two functions
+ * wearing one name.
+ *
+ * Same guard as the apply funnel — visaApplication READ — because it is
+ * the same commercially-sensitive population viewed a different way, and
+ * splitting the permission would mean an ops user who can see somebody's
+ * application cannot see that they measured their odds first.
+ *
+ * ⚠ NO ANSWERS ARE READABLE HERE, because none are stored. See
+ * models/VisaScoreLead.ts: the collection holds the OUTPUT (score, band,
+ * range) and never the compliance or character answers behind it.
+ */
+router.get("/score-leads", requirePermission("visaApplication", "READ"), async (req: any, res: any) => {
+  try {
+    const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? "50"), 10) || 50));
+
+    const filter: Record<string, any> = {};
+
+    if (req.query.destination != null) {
+      const v = String(req.query.destination).trim().toUpperCase();
+      if (v) filter.destinationIso2 = v;
+    }
+
+    /* "Did they have an account?" is the adoption question this tab is
+     * for, so it is a first-class filter rather than something to eyeball
+     * down a column. */
+    if (req.query.hadAccount === "true") filter.hadAccount = true;
+    if (req.query.hadAccount === "false") filter.hadAccount = false;
+
+    if (req.query.q != null) {
+      const q = String(req.query.q).trim();
+      if (q) {
+        const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+        filter.$or = [{ email: rx }, { name: rx }, { destinationName: rx }];
+      }
+    }
+
+    const total = await VisaScoreLead.countDocuments(filter);
+    const rows = await VisaScoreLead.find(filter)
+      .sort({ lastCheckedAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
+
+    const shaped = (rows as any[]).map((r) => ({
+      id: String(r._id),
+      email: r.email,
+      name: r.name ?? null,
+      consumerId: r.consumerId ? String(r.consumerId) : null,
+      hadAccount: Boolean(r.hadAccount),
+
+      destinationIso2: r.destinationIso2,
+      destinationName: r.destinationName,
+
+      score: r.score ?? null,
+      band: r.band ?? null,
+      rangeLow: r.rangeLow ?? null,
+      rangeHigh: r.rangeHigh ?? null,
+
+      checkCount: r.checkCount ?? 1,
+      firstCheckedAt: r.firstCheckedAt ?? null,
+      lastCheckedAt: r.lastCheckedAt ?? null,
+
+      utm: {
+        source: r.utm?.source ?? "",
+        medium: r.utm?.medium ?? "",
+        campaign: r.utm?.campaign ?? "",
+        content: r.utm?.content ?? "",
+        term: r.utm?.term ?? "",
+      },
+
+      consentBasis: r.consentBasis ?? null,
+      disclosureShownAt: r.disclosureShownAt ?? null,
+    }));
+
+    /* Adoption counts over the WHOLE filtered set, not the page — same
+     * rule the apply funnel's totals follow. `repeatCheckers` is the one
+     * number the row count cannot show, because the collection upserts.
+     *
+     * $and, NOT a spread. `{ ...filter, hadAccount: true }` silently
+     * OVERWRITES an active hadAccount filter, so asking for "no account"
+     * returned two rows under a header claiming one of them had one —
+     * a summary contradicting the rows directly beneath it. Caught by
+     * admin.visa.masterSheet.scoreLeads.test.ts before review. */
+    const [withAccount, repeatCheckers] = await Promise.all([
+      VisaScoreLead.countDocuments({ $and: [filter, { hadAccount: true }] }),
+      VisaScoreLead.countDocuments({ $and: [filter, { checkCount: { $gt: 1 } }] }),
+    ]);
+
+    return res.json({
+      ok: true,
+      rows: shaped,
+      summary: {
+        total,
+        withAccount,
+        withoutAccount: Math.max(0, total - withAccount),
+        repeatCheckers,
+      },
+      pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+    });
+  } catch (err: any) {
+    masterSheetLogger.error("score leads read failed", { error: err?.message });
+    return res.status(500).json({ error: "Failed to load the Visa Score leads" });
   }
 });
 

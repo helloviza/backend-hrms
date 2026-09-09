@@ -52,10 +52,13 @@
 //                       Turnstile — the gauge scores per answer and a
 //                       per-submission token cannot cover that; the rate
 //                       limit is this endpoint's control. See its header.
-//   POST /lead          a ticketRef. The email gate on the breakdown; it
-//                       WRITES (one Ticket), and is the only one that
-//                       does. Keeps its own honeypot + tighter limiter.
-//                       No weights, no answers — see its own header.
+//   POST /lead          the email gate on the breakdown. It WRITES (one
+//                       VisaScoreLead row, upserted), and is the only one
+//                       that does. It files NO support ticket — that was
+//                       the old behaviour and was wrong; a score check is
+//                       a marketing signal, not a support request. Keeps
+//                       its own honeypot + tighter limiter. No weights,
+//                       no answers — see its own header.
 //
 // publicVisaScore.test.ts greps every serialised response for the actual
 // delta values and asserts they are absent.
@@ -83,16 +86,15 @@ import {
   type ScoreAnswers,
   type VisaScoreResult,
 } from "../services/visaProfileScore.js";
-/* The lead endpoint's two models and the shared case service. The rest of
- * this file touches no model at all and must stay that way — see the
- * scoped persistence note in the DPDP block below. */
+/* The lead endpoint reads Consumer to decide whether the address already
+ * belongs to an account, and writes through services/visaScoreLeads. The
+ * rest of this file touches no model at all and must stay that way — see
+ * the scoped persistence note in the DPDP block below.
+ *
+ * Ticket and services/consumerSupport used to be imported here. They are
+ * not any more: this door no longer files a support case, and leaving the
+ * imports would keep suggesting it might. */
 import Consumer from "../models/Consumer.js";
-import Ticket from "../models/Ticket.js";
-import {
-  createConsumerSupportCase,
-  isAllowedSubject,
-  type ConsumerSupportSubject,
-} from "../services/consumerSupport.js";
 import {
   BASE_RATES,
   SOURCED_APPROVAL,
@@ -106,6 +108,7 @@ import { visaScoreLeadLimiter, visaScoreLimiter } from "../middleware/rateLimit.
 import logger from "../utils/logger.js";
 import { isSensitiveQuestion, toSafeBreakdown, publicFactorShape } from "../services/visaScoreSafeBreakdown.js";
 import { recordAssessment } from "../services/visaScoreAssessments.js";
+import { recordVisaScoreCheck } from "../services/visaScoreLeads.js";
 import {
   computeScoreFromBody,
   destinationNameFor,
@@ -616,35 +619,20 @@ router.get("/visa-score/meta/ruleset", async (_req: any, res: any) => {
  * a widget on the reveal step would cost more capture than it saves. What
  * guards a write endpoint instead is the same trio public.travelRequest.ts
  * uses minus the widget — honeypot (fake success, so a bot learns nothing),
- * visaScoreLeadLimiter (15 min / 5 per IP), and a submissionId dedupe so a
- * retry files one ticket rather than one per attempt.
+ * visaScoreLeadLimiter (15 min / 5 per IP), and an idempotent write — the
+ * lead row is upserted on (email, destination), so a retry increments a
+ * counter rather than adding a row.
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/** Namespaced so a score lead can never false-dedupe against an enquiry. */
-const SCORE_LEAD_REF_PREFIX = "hvscore";
-
-/** Ops filter for this channel. A TAG, not a new subject — see below. */
-export const SCORE_LEAD_TAG = "visa-score-lead";
-
-/**
- * MUST be a member of CONSUMER_SUPPORT_SUBJECTS.
+/* SCORE_LEAD_REF_PREFIX, SCORE_LEAD_TAG and SCORE_LEAD_SUBJECT lived here
+ * — a ref namespace, an ops tag and an allowlisted subject, all three of
+ * them only ever arguments to the createConsumerSupportCase call this door
+ * no longer makes. They are gone rather than kept "in case": a constant
+ * naming a ticket field is a standing suggestion to file a ticket.
  *
- * A "Visa readiness enquiry" subject was considered and rejected: that
- * array is not a free ops taxonomy, it is the list a CONSUMER picks from in
- * /account/support, and adding a subject there puts a phrase in a dropdown
- * that no consumer filing a support case would ever mean. The channel is
- * carried by SCORE_LEAD_TAG instead, which is what tags are for and what
- * CALLBACK_TAG already does for the one other sub-channel.
- */
-const SCORE_LEAD_SUBJECT: ConsumerSupportSubject = "Visa application help";
-
-/* Verified against the allowlist at module load rather than trusted from
- * the comment — a typo here would be a 500 discovered by a customer. */
-if (!isAllowedSubject(SCORE_LEAD_SUBJECT)) {
-  throw new Error(
-    `public.visaScore: lead subject "${SCORE_LEAD_SUBJECT}" is not in CONSUMER_SUPPORT_SUBJECTS`,
-  );
-}
+ * Tickets ALREADY filed under the old behaviour keep the literal
+ * "visa-score-lead" tag in the database and stay filterable by it; nothing
+ * here was what made that work. */
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -784,7 +772,7 @@ function leadHoneypotGate(req: any, res: any, next: any) {
     });
     /* Fake success, and the DUPLICATE outcome specifically: it is the
      * branch with no side effects to imitate, so a bot gets a plausible
-     * 200 with no ticket behind it and learns nothing about which field to
+     * 200 with no lead row behind it and learns nothing about which field to
      * leave blank next time. */
     return res.status(200).json({ ok: true, outcome: "duplicate" });
   }
@@ -816,23 +804,18 @@ router.post(
       const destination = String(body.destination).trim().toUpperCase();
       const mode = (body.mode ? String(body.mode) : RULESET.baseRate.defaultMode) as BaseRateMode;
       const submissionId = String(body.submissionId).trim();
-      const enquiryRef = `${SCORE_LEAD_REF_PREFIX}:${submissionId}`;
 
-      /* ── IDEMPOTENCY, BEFORE ANYTHING IS WRITTEN ────────────────────
-       * The submissionId is minted once per assessment and re-sent on
-       * retry, so a double-click or a lost response does not file a second
-       * ticket. Verbatim the enquiry door's dedupe, on its own namespace. */
-      const prior = await Ticket.findOne({ "extractedFields.enquiryRef": enquiryRef })
-        .select("_id ticketRef")
-        .lean();
-      if (prior) {
-        return res.status(200).json({
-          ok: true,
-          outcome: "duplicate",
-          ticketRef: (prior as any).ticketRef,
-          reference: submissionId,
-        });
-      }
+      /* ── IDEMPOTENCY IS NOW THE UPSERT ITSELF ───────────────────────
+       * This used to look for a prior Ticket on the enquiryRef, because
+       * the door filed one. It no longer does — see the identity fork
+       * below — and recordVisaScoreCheck upserts on (email, destination),
+       * so a double-click or a retried request lands on the SAME row and
+       * increments checkCount rather than creating a second lead.
+       *
+       * That makes the old pre-flight read redundant, and dropping it
+       * removes a Ticket query from a path that no longer writes tickets.
+       * `enquiryRef` is retained below only as the caller-facing
+       * `reference`, which the client echoes for its own retry dedupe. */
 
       /* THE SCORE, RECOMPUTED. generatedAt is minted here for the reason
        * /score mints its own: the engine is pure and must not read a
@@ -847,37 +830,56 @@ router.post(
       });
       const scoreMode = resolveScoreMode(destination, result);
 
-      const brief = buildScoreBrief({
-        result,
-        scoreMode,
-        destinationName: destinationNameFor(destination) ?? destination,
-        destinationIso2: destination,
-        mode,
-      });
+      /* buildScoreBrief() is no longer called here — it existed to write
+       * the ops brief INTO the ticket body, and there is no ticket now.
+       * The function itself stays exported and tested: it is the
+       * DPDP-safe renderer of a result (it drops every factor and flag
+       * belonging to a sensitive question), and it is what any future
+       * surface that needs to show a result to staff should use. */
 
       /* ── THE IDENTITY FORK ──────────────────────────────────────────
-       * A read, never a write. An address we already know is filed against
-       * that account so the case shows up on the person's own support
-       * page; one we do not know is filed as an anonymous lead. No account
-       * is created on either branch.
+       * A read, never a write. An address we already know is stamped onto
+       * the lead row with its consumerId so the sheet can say "this one
+       * has an account"; one we do not know is an anonymous-but-emailed
+       * lead. No account is created on either branch, and — as before —
+       * THE RESPONSE IS IDENTICAL EITHER WAY, so this endpoint still
+       * discloses nothing about who has an account here.
        *
-       * There is deliberately NO B2B fork here, where the enquiry door has
-       * one and 409s. That fork exists to stop a second identity being
-       * minted for a corporate user — and nothing is minted here at all. A
-       * B2B colleague assessing their own personal trip is an ordinary
-       * lead, and refusing them mid-assessment would be a dead end with
-       * nothing behind it. */
+       * ── THIS NO LONGER FILES A SUPPORT TICKET ──────────────────────
+       * It used to call createConsumerSupportCase, and that was the wrong
+       * door. A Visa Score check is a MARKETING signal: somebody measured
+       * their odds for a corridor. Filing it into the agent queue put a
+       * case in front of a human that nobody had committed to working,
+       * and diluted the one number that queue exists to answer — how many
+       * real support cases are open.
+       *
+       * The enquiry door (routes/public.visa.ts) still files its ticket
+       * and MUST keep doing so: a person who fills in an enquiry form is
+       * asking to be contacted about a specific request. This door is not
+       * that, and the swap here is deliberately surgical to it.
+       *
+       * NOT AWAITED INTO THE FAILURE PATH. The reader is waiting on their
+       * breakdown; a marketing row that fails to write must not turn a
+       * successful unlock into an error. Same posture recordAssessment
+       * already has below. */
       const existing = await Consumer.findOne({ email }).select("_id").lean();
 
-      const { ticket } = await createConsumerSupportCase({
-        ...(existing
-          ? { consumerId: String((existing as any)._id) }
-          : { lead: { email, ...(name ? { name } : {}) } }),
-        subject: SCORE_LEAD_SUBJECT,
-        message: brief,
-        enquiryRef,
-        extraTags: [SCORE_LEAD_TAG],
-      });
+      let leadRef: string | null = null;
+      try {
+        const lead = await recordVisaScoreCheck({
+          email,
+          name: name || null,
+          consumerId: existing ? String((existing as any)._id) : null,
+          result,
+          utm: (body as any).utm,
+        });
+        leadRef = lead?.id ?? null;
+      } catch (leadErr: any) {
+        scoreLogger.warn("lead — score-lead write failed, breakdown still unlocked", {
+          destination,
+          message: leadErr?.message,
+        });
+      }
 
       /* ── PHASE C (b): AN EMAIL WE RECOGNISE ALSO GETS THE ASSESSMENT ──
        *
@@ -921,19 +923,24 @@ router.post(
         }
       }
 
-      scoreLogger.info("lead — case filed", {
+      scoreLogger.info("lead — score lead recorded", {
         destination,
-        ticketRef: ticket.ticketRef,
         knownConsumer: Boolean(existing),
         // The SCORE is logged. What produced it never is — see DPDP above.
         score: result.score,
       });
 
+      /* `ticketRef` is GONE from this response, because no ticket is
+       * filed any more. `reference` stays — it is the submissionId the
+       * client already echoes, and the only field it ever used.
+       *
+       * The response is still byte-identical between the matched and
+       * unmatched branches: leadRef is the row id, which exists on both. */
       return res.status(201).json({
         ok: true,
         outcome: "filed",
-        ticketRef: ticket.ticketRef,
         reference: submissionId,
+        ...(leadRef ? { leadRef } : {}),
       });
     } catch (err: any) {
       scoreLogger.error("lead failed", { message: err?.message });

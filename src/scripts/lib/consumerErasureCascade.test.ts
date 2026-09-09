@@ -56,6 +56,7 @@ const { default: VisaScoreAssessment } = await import(
   "../../models/VisaScoreAssessment.js"
 );
 const { default: VisaD2CLead } = await import("../../models/VisaD2CLead.js");
+const { default: VisaScoreLead } = await import("../../models/VisaScoreLead.js");
 const { default: ActorLocation } = await import("../../models/ActorLocation.js");
 const { default: Ticket } = await import("../../models/Ticket.js");
 const { default: TicketMessage } = await import("../../models/TicketMessage.js");
@@ -120,6 +121,7 @@ beforeEach(async () => {
       SavedCountry,
       VisaScoreAssessment,
       VisaD2CLead,
+      VisaScoreLead,
       ActorLocation,
       Ticket,
       TicketMessage,
@@ -415,6 +417,40 @@ async function makeBrowsingData(consumer: any) {
     destinationIso2: "TH",
     destinationName: "Thailand",
   });
+  /* ── THE TWO-KEY ERASURE CASE ────────────────────────────────────
+   * Two score-lead rows for the SAME person, reachable by different
+   * keys, because that is exactly the situation the collection creates:
+   *
+   *   TH  written after they had an account  -> carries consumerId
+   *   AU  written while still anonymous      -> consumerId is null and
+   *                                             the EMAIL is the only
+   *                                             thing tying it to them
+   *
+   * A cascade that swept consumerId alone would delete the first and
+   * leave the second — a marketable row bearing the address of somebody
+   * who asked to be forgotten. The assertions below fail if that
+   * regresses. The AU row is deliberately cased differently to prove the
+   * match is case-insensitive. */
+  await VisaScoreLead.create([
+    {
+      email: consumer.email,
+      consumerId: consumer._id,
+      hadAccount: true,
+      destinationIso2: "TH",
+      destinationName: "Thailand",
+      score: 712,
+      band: "Good",
+    },
+    {
+      email: String(consumer.email).toUpperCase(),
+      consumerId: null,
+      hadAccount: false,
+      destinationIso2: "AU",
+      destinationName: "Australia",
+      score: 749,
+      band: "Excellent",
+    },
+  ]);
   await ActorLocation.create({
     actorId: consumer._id,
     actorType: "CONSUMER",
@@ -528,6 +564,9 @@ describe("dry run", () => {
     // Both rows of the score history, planned for deletion.
     expect(count(m.motions.delete, "VisaScoreAssessment")).toBe(2);
     expect(count(m.motions.delete, "VisaD2CLead")).toBe(1);
+    /* BOTH score-lead rows are planned for deletion — the consumerId one
+     * and the email-only one. If this reads 1, the email key was lost. */
+    expect(count(m.motions.delete, "VisaScoreLead")).toBe(2);
     expect(count(m.motions.delete, "ActorLocation")).toBe(1);
     expect(count(m.motions.delete, "ConsumerProfile")).toBe(1);
     expect(count(m.motions.redact, "Invoice")).toBe(0);
@@ -642,6 +681,12 @@ describe("apply — the paid consumer, end to end", () => {
     expect(await SavedCountry.countDocuments({ consumerId: c._id })).toBe(0);
     expect(await VisaScoreAssessment.countDocuments({ consumerId: c._id })).toBe(0);
     expect(await VisaD2CLead.countDocuments({ consumerId: c._id })).toBe(0);
+    /* ── DPDP: THE SCORE-LEAD SHEET IS ERASED BY BOTH KEYS ─────────
+     * Not scoped to consumerId in the assertion either — counting the
+     * WHOLE collection is what proves the email-only row went too. A
+     * consumerId-scoped count would pass even if the anonymous row
+     * survived, which is the exact miss this guards. */
+    expect(await VisaScoreLead.countDocuments({})).toBe(0);
     expect(await ActorLocation.countDocuments({ actorId: c._id })).toBe(0);
     expect(await Ticket.countDocuments({})).toBe(0);
     expect(await TicketMessage.countDocuments({})).toBe(0);
