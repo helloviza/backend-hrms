@@ -125,6 +125,26 @@ export interface MasterSheetFilters {
   /** ISO2 corridor the person touched in either funnel. */
   destination?: string | null;
   funnel?: FunnelFilter | null;
+  /**
+   * utm.source, matched against ANY of the person's touches.
+   *
+   * ── "ANY TOUCH", NOT "THE CAMPAIGN COLUMN" — DELIBERATELY ──────────
+   * The column shows FIRST-TOUCH attribution, and first-touch is derived
+   * inside the $facet's rows branch, over ONE PAGE, precisely so the
+   * expensive per-person pick never runs over the whole funnel (see the
+   * stage-order note on buildMasterSheetPipeline). Filtering on the
+   * derived value would force that derivation across every person before
+   * paging — the one cost the pipeline is shaped to avoid.
+   *
+   * So this filters the raw signals instead: "somebody whose funnel was
+   * touched by this source at least once". That is the question a
+   * marketing reader is actually asking, and it is a SUPERSET of the
+   * first-touch column, never a contradiction of it — a row can match
+   * `google` on a later touch while its Campaign column names the source
+   * that got there first. The console labels the control "any touch" for
+   * exactly that reason; it must never be relabelled to imply otherwise.
+   */
+  campaignSource?: string | null;
   sort?: "lastActivity" | "firstSeen" | "rung" | null;
   direction?: "asc" | "desc" | null;
   page?: number;
@@ -177,6 +197,21 @@ interface SignalProjection {
   applicationId: unknown;
   referenceNumber: unknown;
   hadAccount: unknown;
+  /* ── DRILL-DOWN-ONLY FIELDS ────────────────────────────────────────
+   * Added for the console's row expand (Deploy 3). They are per-SIGNAL
+   * facts that no column on the collapsed row shows and that no filter,
+   * sort or rung reads — a corridor's purpose, how many times a score was
+   * re-checked, and the consent the score check was captured under.
+   *
+   * They still have to appear on EVERY arm, as $literal null where the
+   * collection has no such field, because the union is only coherent while
+   * the three arms agree field-for-field. A field present in one arm and
+   * absent in another becomes null after the group anyway — but silently,
+   * and a silent null is indistinguishable from a stored one. */
+  purpose: unknown;
+  checkCount: unknown;
+  consentBasis: unknown;
+  disclosureShownAt: unknown;
 }
 
 /** True when any UTM member carries a value. Computed per arm so the
@@ -224,6 +259,12 @@ function scoreArmProjection(): SignalProjection {
     applicationId: { $literal: null },
     referenceNumber: { $literal: null },
     hadAccount: "$hadAccount",
+    // A score check has no purpose — it is a corridor question, not an
+    // application — but it has the consent evidence, which lives ONLY here.
+    purpose: { $literal: null },
+    checkCount: "$checkCount",
+    consentBasis: "$consentBasis",
+    disclosureShownAt: "$disclosureShownAt",
   };
 }
 
@@ -252,6 +293,12 @@ function leadArmProjection(): SignalProjection {
     referenceNumber: "$referenceNumber",
     // A lead row only exists for someone who signed in, so by construction.
     hadAccount: { $literal: true },
+    purpose: "$purpose",
+    // A lead is one application, not a repeated measurement, and it carries
+    // no consent stamp — the disclosure belongs to the score gate.
+    checkCount: { $literal: null },
+    consentBasis: { $literal: null },
+    disclosureShownAt: { $literal: null },
   };
 }
 
@@ -286,6 +333,10 @@ function consumerArmProjection(): SignalProjection {
     applicationId: { $literal: null },
     referenceNumber: { $literal: null },
     hadAccount: { $literal: true },
+    purpose: { $literal: null },
+    checkCount: { $literal: null },
+    consentBasis: { $literal: null },
+    disclosureShownAt: { $literal: null },
   };
 }
 
@@ -394,6 +445,10 @@ export function buildMasterSheetPipeline(
           utm: "$utm",
           utmPresent: "$utmPresent",
           utmAt: "$utmAt",
+          purpose: "$purpose",
+          checkCount: "$checkCount",
+          consentBasis: "$consentBasis",
+          disclosureShownAt: "$disclosureShownAt",
         },
       },
     },
@@ -409,6 +464,16 @@ export function buildMasterSheetPipeline(
   }
   if (filters.destination) {
     match.corridors = String(filters.destination).trim().toUpperCase();
+  }
+  if (filters.campaignSource && String(filters.campaignSource).trim()) {
+    /* Anchored + case-insensitive, not a substring: "google" must not also
+     * match "google-display" — a marketing reader filtering by source is
+     * naming a source, not searching for one. Case-insensitive because the
+     * value comes off a URL somebody typed into an ad platform. */
+    match["signals.utm.source"] = new RegExp(
+      "^" + escapeRegex(String(filters.campaignSource).trim()) + "$",
+      "i",
+    );
   }
   if (filters.funnel === "SCORE") match.scoreCount = { $gt: 0 };
   if (filters.funnel === "APPLY") match.applyCount = { $gt: 0 };
@@ -665,6 +730,20 @@ export function shapeRow(
       referenceNumber: s?.referenceNumber ?? null,
       applicationId: s?.applicationId ? String(s.applicationId) : null,
       utm: s?.utm ?? null,
+      /* utmAt / utmPresent are what let the console name WHICH signal the
+       * row's firstTouchUtm came from, instead of showing a campaign with
+       * no provenance. The pick is the same one applyPageDerivations makes
+       * — earliest utmAt among the tagged signals — so the console does not
+       * re-derive it, it just matches it. */
+      utmPresent: Boolean(s?.utmPresent),
+      utmAt: s?.utmAt ?? null,
+      purpose: s?.purpose ?? null,
+      checkCount: s?.checkCount ?? null,
+      /* Consent evidence, and it is per-SIGNAL by nature: a person who
+       * checked two corridors under two different disclosure versions has
+       * two answers, and a single row-level field would have to pick one. */
+      consentBasis: s?.consentBasis ?? null,
+      disclosureShownAt: s?.disclosureShownAt ?? null,
     })),
   };
 }

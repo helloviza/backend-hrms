@@ -55,9 +55,22 @@
 //   node --env-file=.env.development --import tsx src/migrations/2026-09-10-backfill-visa-d2c-lead-email.ts           # dry-run
 //   node --env-file=.env.development --import tsx src/migrations/2026-09-10-backfill-visa-d2c-lead-email.ts --apply   # write
 //
-// Production (deliberate, interactive, never scriptable):
-//   ... --i-know-this-is-production            # dry run against prod
-//   ... --i-know-this-is-production --apply    # prompts for the db name
+// Production (deliberate, interactive, never scriptable).
+//
+// ⚠ NOTE THE ENV FILE. It is NOT .env.development, and it is NOT the bare
+// `.env` that "dotenv/config" loads by default — pass the PRODUCTION env
+// file by path, explicitly, on the command line. This block used to open
+// each prod line with a bare `...`, which reads as "same command as
+// above" — i.e. as --env-file=.env.development — and that is precisely the
+// mistake that runs the production flags against the dev database and
+// reports a reassuring zero rows:
+//
+//   node --env-file=<path to the prod .env> --import tsx src/migrations/2026-09-10-backfill-visa-d2c-lead-email.ts --i-know-this-is-production            # dry run against prod
+//   node --env-file=<path to the prod .env> --import tsx src/migrations/2026-09-10-backfill-visa-d2c-lead-email.ts --i-know-this-is-production --apply    # writes; prompts for the db name
+//
+// ALREADY RUN against production on 2026-09-10 (Deploy 2). The MigrationRun
+// ledger refuses a second --apply unless --force is also passed, so this
+// block is here for a re-run that has a reason, not for a routine one.
 import "dotenv/config";
 import path from "node:path";
 import * as readline from "node:readline/promises";
