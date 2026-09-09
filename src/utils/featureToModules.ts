@@ -58,6 +58,10 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   // by level template (RULED 2026-08-12). Gated on the same feature flag: a
   // workspace without visa has nothing to screen.
   visaScreening:     ["visaEnabled"],
+  // Consumer contact PII — the authority to unmask consumer email/phone on
+  // the visa Master Sheet. Same flag: a workspace without visa has no funnel
+  // to read, so there are no contacts for this to unmask.
+  consumerContactPII: ["visaEnabled"],
 };
 
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";

@@ -455,7 +455,32 @@ export async function planConsumerErasure(
      * claim of any kind, so it is a plain DELETE alongside the saved
      * corridors it sits beside. */
     VisaScoreAssessment.find({ consumerId: oid }).select("_id").lean(),
-    VisaD2CLead.find({ consumerId: oid }).select("_id").lean(),
+    /* ── TWO KEYS HERE TOO, SINCE 2026-09-10 ───────────────────────
+     * VisaD2CLead gained a denormalised `email` (models/VisaD2CLead.ts)
+     * so the Master Sheet could key it to the same person as their score
+     * checks. That is a SECOND PLAINTEXT COPY of the address, and a copy
+     * of an identifier that erasure cannot reach is worse than not having
+     * it: the person is told they were forgotten while the address
+     * survives in the sheet ops reads daily.
+     *
+     * consumerId is still required on this model, so — unlike
+     * VisaScoreLead below — every row is already reachable by the first
+     * key. The email arm is therefore not fixing a miss today; it is what
+     * keeps the sweep correct if a row is ever written whose consumerId
+     * has been detached or re-pointed, and it costs one clause.
+     *
+     * Anchored and case-insensitive for the same reason the VisaScoreLead
+     * sweep is: the schema lowercases on write, but a row predating that
+     * (or written by a future caller that forgets) must still be caught. */
+    (async () => {
+      const or: any[] = [{ consumerId: oid }];
+      if (consumer?.email) {
+        or.push({
+          email: new RegExp(`^${String(consumer.email).replace(/[.*+?^${}()|[]\]/g, "\$&")}$`, "i"),
+        });
+      }
+      return VisaD2CLead.find({ $or: or }).select("_id").lean();
+    })(),
     /* ── TWO KEYS, AND THE SECOND ONE IS THE WHOLE POINT ─────────────
      * models/VisaScoreLead.ts holds a row for anybody who unlocked the
      * score breakdown, and most of those people have NO account — the
@@ -666,6 +691,14 @@ export async function planConsumerErasure(
 export interface MotionEntry {
   collection: string;
   count: number;
+  /**
+   * Optional one-line explanation of HOW the rows were matched, printed
+   * beside the count. Only the two-key sweeps carry one: a reviewer
+   * reading a dry run for the two collections that hold a loose email
+   * copy needs to see that the email arm ran, and a count alone cannot
+   * tell them whether it did.
+   */
+  note?: string;
 }
 
 export interface ConsumerErasureManifest {
@@ -725,8 +758,18 @@ export function planToManifest(
           collection: "VisaScoreAssessment",
           count: plan.visaScoreAssessmentIds.length,
         },
-        { collection: "VisaD2CLead", count: plan.visaD2CLeadIds.length },
-        { collection: "VisaScoreLead", count: plan.visaScoreLeadIds.length },
+        {
+          collection: "VisaD2CLead",
+          count: plan.visaD2CLeadIds.length,
+          // Named in the plan so a reviewer reading a dry run can see that
+          // the denormalised address is swept, not just the consumerId.
+          note: "matched by consumerId OR denormalised email",
+        },
+        {
+          collection: "VisaScoreLead",
+          count: plan.visaScoreLeadIds.length,
+          note: "matched by consumerId OR email (most rows have no account)",
+        },
         { collection: "ActorLocation", count: plan.actorLocationIds.length },
         { collection: "TicketAttachment", count: plan.ticketAttachmentIds.length },
         { collection: "TicketMessage", count: plan.ticketMessageIds.length },
@@ -1401,7 +1444,9 @@ export function renderManifest(m: ConsumerErasureManifest): string {
   lines.push("MOTION (b) — REDACT (rows kept, PII stripped):");
   for (const e of m.motions.redact) lines.push(`  ${e.collection.padEnd(20)} ${e.count}`);
   lines.push("MOTION (a) — DELETE (rows removed):");
-  for (const e of m.motions.delete) lines.push(`  ${e.collection.padEnd(20)} ${e.count}`);
+  for (const e of m.motions.delete) {
+    lines.push(`  ${e.collection.padEnd(20)} ${e.count}${e.note ? `   — ${e.note}` : ""}`);
+  }
   lines.push("MOTION (c) — CRYPTO-SHRED (last):");
   for (const e of m.motions.shred) lines.push(`  ${e.subjectType}/${e.subjectId} — ${e.outcome}`);
 

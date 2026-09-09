@@ -129,6 +129,33 @@ export interface UserPermissionDoc extends Document {
     // explicitly. Nothing enforces it until VISA_SCREENING_ENFORCEMENT is
     // raised above "off" (config/visaScreening.ts).
     visaScreening: ModulePermission
+    /**
+     * consumerContactPII — the authority to SEE a consumer's contact
+     * details on a cross-consumer ops surface, not the authority to reach
+     * that surface at all.
+     *
+     * A SIBLING of visaApplication, on the visaScreening precedent, and
+     * deliberately not a higher tier of it. visaApplication answers "may
+     * this person work visa cases"; a concierge needs that at WRITE to do
+     * their job and gets it. This answers the separate question "may this
+     * person read the email address and phone number of every consumer who
+     * ever touched the funnel" — a marketing-list-shaped power that a
+     * caseworker does not need to work a case, and that someone can
+     * legitimately hold without the other.
+     *
+     * Because it is separate, the Master Sheet MASKS BY DEFAULT: a reader
+     * with visaApplication at FULL still sees i•••@gmail.com until this is
+     * granted. If it were a tier of visaApplication, every concierge lead
+     * would have been handed the whole contact list by a permission granted
+     * for a different reason.
+     *
+     * Granted to NO level template — same posture and same reasoning as
+     * visaScreening: which levels should carry it is a product decision
+     * about the ops team, and a per-user grant means changing someone's
+     * level cannot silently confer or revoke it. Off-boarding must revoke
+     * it explicitly.
+     */
+    consumerContactPII: ModulePermission
   }
 
   grantedBy: string
@@ -205,6 +232,7 @@ const modulesSchema = new Schema(
     // Visa Application (concierge console)
     visaApplication: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     visaScreening: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    consumerContactPII: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
   },
   { _id: false }
 )

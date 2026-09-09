@@ -211,6 +211,12 @@ router.post("/start", async (req: any, res: any) => {
       {
         $setOnInsert: {
           consumerId,
+          // Denormalised so the Master Sheet can key this row to the same
+          // person as their score checks — email is the only identifier
+          // all three of its arms carry (models/VisaD2CLead.ts). Already
+          // in scope from requireConsumer, so this costs no extra query.
+          // $setOnInsert: the address the lead was CREATED under.
+          email: req.consumer?.email,
           workspaceId,
           destinationIso2: iso2,
           destinationName: seed?.countryName ?? iso2,
@@ -641,6 +647,10 @@ router.post("/", async (req: any, res: any) => {
         },
         $setOnInsert: {
           consumerId,
+          // See the /start upsert above — same field, same reason, and it
+          // must be on BOTH: this branch is the only writer for a reader
+          // who walked straight through without tripping a start trigger.
+          email: req.consumer?.email,
           workspaceId,
           destinationIso2: rule.destinationIso2,
           destinationName: seedCountryName(rule),

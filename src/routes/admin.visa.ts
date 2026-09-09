@@ -85,6 +85,16 @@ import { objectIdKeys } from "../utils/objectIdKeys.js";
 import { checkScreeningAuthority } from "../services/visaScreeningAuthority.js";
 import { hydrateVisaChecklist, computeOutstandingRequirements } from "../utils/visaChecklistHydration.js";
 import { resolveVisaChecklistWithExclusions } from "../utils/visaChecklistResolver.js";
+import { holdsCapability } from "../services/capabilityProbe.js";
+import { rungVocabulary } from "../models/visaMasterSheetRungs.js";
+import {
+  MASTER_SHEET_EXPORT_MAX_ROWS,
+  runMasterSheet,
+  toCsv,
+  type FunnelFilter,
+  type MasterSheetFilters,
+} from "../services/visaMasterSheet.js";
+import { d2cWorkspaceObjectId } from "../services/consumerWorkspace.js";
 
 const router = Router();
 const adminVisaLogger = logger.child({ module: "admin.visa" });
@@ -2606,6 +2616,174 @@ router.get(
     } catch (err: any) {
       console.error("[admin visa application activity GET]", err?.message);
       res.status(500).json({ error: err?.message || "Failed to load activity" });
+    }
+  },
+);
+
+/* ═════════════════════════════════════════════════════════════════════
+ * THE UNIFIED MASTER SHEET — one row per PERSON.
+ * ═════════════════════════════════════════════════════════════════════
+ *
+ * The pipeline, the ladder and the masking all live in
+ * services/visaMasterSheet.ts; these two routes are the HTTP edge and
+ * nothing more. That split is what lets B6 exercise the aggregation against
+ * real collections without standing up Express, and it is why the export
+ * cannot drift from the list — both call the same shaping function, from
+ * the same service, with the same resolved grant.
+ *
+ * ── TWO PERMISSIONS, TWO DIFFERENT QUESTIONS ──────────────────────────
+ * The GATE is visaApplication:READ — the same one the concierge queue uses.
+ * Everyone who may work visa cases may read this sheet.
+ *
+ * The CONTACT COLUMN is consumerContactPII, resolved as a soft boolean
+ * (services/capabilityProbe.ts) rather than as a second gate. A reader
+ * without it gets the whole sheet with addresses and phone numbers masked —
+ * not a 403. See the capability's note in models/UserPermission.ts for why
+ * it is a sibling of visaApplication and not a tier of it: this is a
+ * marketing-list-shaped power, and a caseworker does not need it to work a
+ * case.
+ */
+
+function parseMasterSheetFilters(req: any): MasterSheetFilters {
+  const num = (v: unknown): number | null => {
+    if (v === undefined || v === null || String(v).trim() === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const funnel = String(req.query?.funnel ?? "").toUpperCase();
+  const sort = String(req.query?.sort ?? "");
+  return {
+    q: req.query?.q ? String(req.query.q) : null,
+    rungMin: num(req.query?.rungMin),
+    rungMax: num(req.query?.rungMax),
+    destination: req.query?.destination ? String(req.query.destination) : null,
+    funnel: ["SCORE", "APPLY", "REGISTERED"].includes(funnel) ? (funnel as FunnelFilter) : null,
+    sort: ["lastActivity", "firstSeen", "rung"].includes(sort) ? (sort as any) : null,
+    direction: String(req.query?.direction) === "asc" ? "asc" : "desc",
+    page: Number(req.query?.page) || 1,
+    pageSize: Number(req.query?.pageSize) || 50,
+  };
+}
+
+router.get(
+  "/master-sheet/people",
+  requirePermission("visaApplication", "READ"),
+  async (req: any, res: any) => {
+    try {
+      const filters = parseMasterSheetFilters(req);
+      // ONCE per request, never per row — see capabilityProbe's header.
+      const canSeeContacts = await holdsCapability(req, "consumerContactPII");
+
+      const result = await runMasterSheet(filters, { canSeeContacts });
+
+      /* Instrumented because this is the one read on this router that unions
+       * three collections and groups without a bound. A slow sheet is the
+       * first symptom of the funnel growing, and a duration in the log is
+       * what turns that into a number somebody can act on before it becomes
+       * a timeout.
+       *
+       * NO PII IN THE LINE. The free-text `q` is a search term a reader
+       * typed and can perfectly well be somebody's email address, so only
+       * its LENGTH is recorded — logging the term itself would put the
+       * addresses back into a place the masking cannot reach. */
+      adminVisaLogger.info("master sheet read", {
+        durationMs: result.meta.durationMs,
+        rows: result.rows.length,
+        total: result.total,
+        contactsMasked: result.contactsMasked,
+        consumerArmIncluded: result.meta.consumerArmIncluded,
+        sortArrayUsed: result.meta.sortArrayUsed,
+        mongoVersion: result.meta.mongoVersion,
+        legacyUnkeyedLeads: result.legacyUnkeyedLeads,
+        qLength: filters.q ? String(filters.q).length : 0,
+      });
+
+      res.json({
+        ok: true,
+        ...result,
+        // The console holds NO copy of the ladder — it renders these labels
+        // and filters on the integers. See models/visaMasterSheetRungs.ts.
+        vocabulary: rungVocabulary(),
+      });
+    } catch (err: any) {
+      adminVisaLogger.error("master sheet read failed", { message: err?.message });
+      res.status(500).json({ error: err?.message || "Failed to load the master sheet" });
+    }
+  },
+);
+
+/**
+ * CSV export.
+ *
+ * ── IT HONOURS THE GRANT BY CONSTRUCTION ──────────────────────────────
+ * It does not re-query and it does not re-shape: it runs the SAME service
+ * with the same resolved `canSeeContacts`, and toCsv() only accepts rows
+ * that shapeRow() produced. A masked reader exports a file of masked
+ * addresses, and there is no code path here that could produce anything
+ * else — which matters more on this route than on the list, because the
+ * output leaves the building as a file.
+ *
+ * ── AND IT IS LOGGED EITHER WAY ───────────────────────────────────────
+ * Who, with what filter, how many rows, and whether the contacts were
+ * masked. An export of the entire consumer funnel is exactly the act that
+ * has to be answerable months later, and "masked or not" is the fact that
+ * makes the row meaningful — the same export by two readers is two very
+ * different events.
+ */
+router.get(
+  "/master-sheet/people/export",
+  requirePermission("visaApplication", "READ"),
+  async (req: any, res: any) => {
+    try {
+      const filters = parseMasterSheetFilters(req);
+      const canSeeContacts = await holdsCapability(req, "consumerContactPII");
+
+      const result = await runMasterSheet(
+        { ...filters, page: 1, pageSize: MASTER_SHEET_EXPORT_MAX_ROWS },
+        { canSeeContacts },
+      );
+
+      const actorId = String(req.user?._id || req.user?.id || req.user?.sub || "");
+      try {
+        await mongoose.connection.collection("workspaceauditlogs").insertOne({
+          workspaceId: d2cWorkspaceObjectId(),
+          event: "VISA_MASTER_SHEET_EXPORT",
+          runAt: new Date(),
+          triggeredBy: actorId,
+          status: "SUCCESS",
+          details:
+            `rows=${result.rows.length} total=${result.total} ` +
+            `contactsMasked=${result.contactsMasked} ` +
+            `rungMin=${filters.rungMin ?? ""} rungMax=${filters.rungMax ?? ""} ` +
+            `destination=${filters.destination ?? ""} funnel=${filters.funnel ?? ""} ` +
+            `qLength=${filters.q ? String(filters.q).length : 0}`,
+        });
+      } catch {
+        /* Non-fatal, deliberately: an audit write that fails must not hand
+         * the reader a 500 for an export that already succeeded. The logger
+         * line below is the second record, and it is not optional. */
+      }
+      adminVisaLogger.info("master sheet exported", {
+        actorId,
+        rows: result.rows.length,
+        total: result.total,
+        contactsMasked: result.contactsMasked,
+        durationMs: result.meta.durationMs,
+      });
+
+      const stamp = new Date().toISOString().slice(0, 10);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      // The filename says which kind of export this is. A masked file that
+      // looks like a full one is how a half-empty contact list ends up
+      // pasted into a campaign tool.
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="visa-master-sheet-${stamp}${result.contactsMasked ? "-masked" : ""}.csv"`,
+      );
+      res.send(toCsv(result.rows));
+    } catch (err: any) {
+      adminVisaLogger.error("master sheet export failed", { message: err?.message });
+      res.status(500).json({ error: err?.message || "Failed to export the master sheet" });
     }
   },
 );

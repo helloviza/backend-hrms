@@ -78,6 +78,14 @@ type ModulesTemplate = {
   // visa-screening-authority-model-2026-08-12.md §"decision"). Introducing
   // the key without granting it is what makes step 1 a no-op at runtime.
   visaScreening:     ModulePermission
+  // Consumer contact PII (2026-09-10) — the authority to read a consumer's
+  // email and phone on a cross-consumer ops surface (the visa Master Sheet).
+  // NONE in every template below on the visaScreening precedent, and for the
+  // same reason: which level should be able to read the whole funnel's contact
+  // list is a product decision about the ops team, not a property of seniority.
+  // Granted PER-USER, so a level change can neither confer nor revoke it — and
+  // off-boarding has to revoke it explicitly.
+  consumerContactPII: ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -125,6 +133,7 @@ const L1: ModulesTemplate = {
   cstep:             NONE,
   visaApplication:   NONE,
   visaScreening:     NONE,
+  consumerContactPII: NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -207,6 +216,7 @@ const L6: ModulesTemplate = {
   cstep:             FULL_WS,
   visaApplication:   FULL_WS,
   visaScreening:     NONE,
+  consumerContactPII: NONE,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -223,6 +233,7 @@ const L7: ModulesTemplate = {
   leads:           READ_ALL,
   visaApplication: READ_ALL,
   visaScreening:   NONE,
+  consumerContactPII: NONE,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -270,6 +281,7 @@ const L8: ModulesTemplate = {
   cstep:             FULL_WS,
   visaApplication:   FULL_ALL,
   visaScreening:     NONE,
+  consumerContactPII: NONE,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -317,6 +329,7 @@ const VENDOR: ModulesTemplate = {
   cstep:             NONE,
   visaApplication:   NONE,
   visaScreening:     NONE,
+  consumerContactPII: NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -364,6 +377,7 @@ const CUSTOMER_SBT: ModulesTemplate = {
   cstep:             NONE,
   visaApplication:   NONE,
   visaScreening:     NONE,
+  consumerContactPII: NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -411,6 +425,7 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   cstep:             NONE,
   visaApplication:   NONE,
   visaScreening:     NONE,
+  consumerContactPII: NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

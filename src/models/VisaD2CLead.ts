@@ -43,6 +43,35 @@ import { VisaUtmSchema, type VisaUtm } from "./visaUtm.js";
 
 export interface VisaD2CLeadDocument extends Document {
   consumerId: mongoose.Types.ObjectId;
+  /**
+   * DENORMALISED FROM Consumer — the address this lead was created under.
+   *
+   * ── WHY A COPY AND NOT A $lookup ────────────────────────────────
+   * The Master Sheet is ONE ROW PER PERSON across three collections
+   * that share no key: a score-check row has an email and often no
+   * consumerId (models/VisaScoreLead.ts explains why), a lead row has a
+   * consumerId and no email, and a registered-but-idle person has only a
+   * Consumer. Email is the only identifier all three can carry, so it is
+   * the only thing the $group can key on. Joining Consumer per row
+   * instead would put a lookup inside the union — the shape that makes
+   * a whole-collection sheet unservable.
+   *
+   * ── $setOnInsert, NOT $set ──────────────────────────────────────
+   * This records the address the lead was CREATED under, which is the
+   * question the sheet asks. Re-writing it on every start call would
+   * make a person who later changes their account email retroactively
+   * merge into a different sheet row, silently rewriting history that
+   * has already been read and acted on.
+   *
+   * ── NO DEFAULT, DELIBERATELY ────────────────────────────────────
+   * Not `default: null`. A Mongoose default applies on write and never
+   * to already-stored documents, so { email: { $exists: false } } stays
+   * a true "predates this field" marker — which is exactly what the
+   * backfill migration selects on, and what it re-checks at write time.
+   * A default would make every legacy row indistinguishable from a row
+   * the backfill had already visited.
+   */
+  email?: string;
   workspaceId: mongoose.Types.ObjectId;
 
   destinationIso2: string;
@@ -71,6 +100,11 @@ export interface VisaD2CLeadDocument extends Document {
 const VisaD2CLeadSchema = new Schema<VisaD2CLeadDocument>(
   {
     consumerId: { type: Schema.Types.ObjectId, ref: "Consumer", required: true, index: true },
+    // Indexed because it is the Master Sheet's union key AND the second
+    // erasure key — see the interface note and scripts/lib/
+    // consumerErasureCascade.ts. NOT required: rows written before this
+    // field existed have none until the backfill runs.
+    email: { type: String, lowercase: true, trim: true, index: true },
     // Stamped, not scoped — see the file header.
     workspaceId: { type: Schema.Types.ObjectId, required: true, index: true },
 
