@@ -347,6 +347,45 @@ function mapAdminApplicationSummary(a: any) {
             term: a.utm?.term ?? "",
           }
         : null,
+    /* ── THE D2C FUNNEL TRIPLE, AND THE TWO GATEWAY IDS ────────────────
+     * The QUEUE row has carried the triple since Milestone 2 (see the
+     * `shaped` projection below); the DETAIL never did. So an agent who
+     * opened a consumer case lost every commercial fact the list had just
+     * shown them — how far through the funnel the applicant got, and
+     * whether the fee is in — and the case read as a bare "Submitted"
+     * with no money story at all. That blank is what made a real,
+     * payment-dropped case look suspicious rather than chaseable.
+     *
+     * Purely additive, and DISPLAY-ONLY: nothing here is written by this
+     * route, and the values are exactly the ones routes/consumer.
+     * applications.ts and routes/razorpay.webhook.ts already store. The
+     * stored ENUM travels, never a display label — models/
+     * visaD2CLifecycle.ts owns the words and the console renders them,
+     * the same split `source` above states for "Plumbox"/"Helloviza.ai".
+     *
+     * Null on B2B, which is what lets the console gate the panel on the
+     * channel rather than on a second flag.
+     *
+     * ── WHY razorpayOrderId IS HERE AND IS NOT A PAYMENT ──────────────
+     * It is minted when the consumer opens the checkout (routes/consumer.
+     * applications.ts's POST /:id/payment/order) and is the ONLY stored
+     * trace that they got that far. Razorpay sends no webhook for someone
+     * who opens the modal and closes it, so a dropped payment is
+     * otherwise byte-identical to a case that never reached a payment
+     * screen — same stage, same PENDING. Shipping the order id lets the
+     * console tell those two apart TODAY, without waiting for the
+     * PAYMENT_DROPPED sweep that models/visaD2CLifecycle.ts still marks
+     * TODO(milestone-3).
+     *
+     * Neither id is a secret: an order id is handed to the consumer's own
+     * browser to open the checkout with, and a payment id is already on
+     * their receipt. This route is ops-only and already the reserved
+     * exception for an unmasked passport number. */
+    d2cStatus: a.d2cStatus ?? null,
+    d2cStage: a.d2cStage ?? null,
+    d2cPaymentStatus: a.d2cPaymentStatus ?? null,
+    razorpayOrderId: a.razorpayOrderId ?? null,
+    razorpayPaymentId: a.razorpayPaymentId ?? null,
     // null after scripts/erase-traveller-profile.ts has run (models/
     // VisaApplication.ts) — String(null) would otherwise render the literal
     // string "null", which reads as a real (broken) id rather than "erased".
@@ -960,6 +999,14 @@ router.get("/queue", requirePermission("visaApplication", "READ"), async (req: a
         d2cStatus: a.d2cStatus ?? null,
         d2cStage: a.d2cStage ?? null,
         d2cPaymentStatus: a.d2cPaymentStatus ?? null,
+        /* THE CHECKOUT-REACHED FACT. Same two ids the detail carries, and
+         * on the row for the same reason: PENDING alone cannot tell an
+         * agent scanning the queue whether this person got as far as the
+         * payment screen. An order id means they did. See
+         * mapAdminApplicationSummary above for the full argument and for
+         * why neither id is a secret. */
+        razorpayOrderId: a.razorpayOrderId ?? null,
+        razorpayPaymentId: a.razorpayPaymentId ?? null,
         // Resolved against THIS application's own applicantProfile — see
         // computeAdminCompletenessCounts. Matches what the customer sees
         // for the same application (task brief §3).
