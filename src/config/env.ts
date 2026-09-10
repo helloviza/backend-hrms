@@ -19,7 +19,7 @@
 // duplicate unpack.
 import "../bootstrap/loadSecrets.js";
 
-import { assertRazorpayKeyMatchesEnv } from "./razorpayMode.js";
+import { assertRazorpayKeyMatchesEnv, assertRazorpayKeyModeMatchesEnv } from "./razorpayMode.js";
 
 import dotenv from "dotenv";
 // Harmless no-op here — loadSecrets.ts above already called dotenv.config()
@@ -210,7 +210,44 @@ if (
  * customer's payment, which is the wrong place to discover a
  * misconfiguration.
  *
- * The key is shared by D2C and B2B/SBT alike — see config/razorpayMode.ts
- * for the full rule and why an absent key stays legal outside production.
+ * This is the B2B/SBT key (flights, hotels). D2C settles to its own MID and
+ * is guarded separately below — see config/razorpayMode.ts for the full rule,
+ * why an absent key stays legal outside production, and why the two keys do
+ * not share a fate when one is missing.
  */
 assertRazorpayKeyMatchesEnv(process.env.RAZORPAY_KEY_ID, env.NODE_ENV);
+
+/**
+ * The same guardrail for the D2C (helloviza) Razorpay MID — with one
+ * deliberate difference, and it is the only asymmetry between the two.
+ *
+ * A WRONG-MODE D2C key throws exactly like the B2B one does. That check is
+ * about wrong money (a test key in production marks visa fees paid while
+ * nothing settles; a live key in dev charges a real card), and wrong money
+ * is wrong money whichever MID it belongs to.
+ *
+ * An ABSENT D2C key does NOT throw. It cannot move money — with no key,
+ * routes/consumer.applications.ts returns 503 GATEWAY_NOT_CONFIGURED and no
+ * order is ever minted — so the failure is already loud and already
+ * contained to the one feature that needs the key. Throwing here would
+ * instead refuse to boot the whole backend, taking flights, hotels and HRMS
+ * down because a visa-fee variable was unset. That trades a small correct
+ * failure for a large unrelated one, and it would make "unset the D2C vars"
+ * unusable as a rollback for the MID split.
+ *
+ * So: logged at error level, loudly, once per boot — and the process serves
+ * traffic.
+ */
+const d2cKeyStatus = assertRazorpayKeyModeMatchesEnv(
+  process.env.RAZORPAY_D2C_KEY_ID,
+  env.NODE_ENV,
+  "RAZORPAY_D2C_KEY_ID",
+);
+if (d2cKeyStatus === "NOT_CONFIGURED" && env.NODE_ENV === "production") {
+  console.error(
+    "[razorpay] RAZORPAY_D2C_KEY_ID is not configured but NODE_ENV=production. " +
+      "D2C (helloviza) payments are OFF — /api/consumer/applications/:id/payment/order " +
+      "will answer 503 GATEWAY_NOT_CONFIGURED for every consumer. B2B/SBT payments are " +
+      "unaffected. Set RAZORPAY_D2C_KEY_ID/_SECRET to the helloviza MID's live keys.",
+  );
+}

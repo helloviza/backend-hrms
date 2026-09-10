@@ -789,8 +789,20 @@ router.post("/:id/payment/order", async (req: any, res: any) => {
     }
     const amountPaise = Math.round(totalInr * 100);
 
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    /* ── THE D2C MID, AND NOTHING ELSE ───────────────────────────────
+     * D2C visa fees settle to the helloviza Razorpay account; B2B/SBT keeps
+     * the original (RAZORPAY_KEY_ID/_SECRET, read by routes/sbt.flights.ts
+     * and routes/sbt.hotels.ts, untouched by this).
+     *
+     * THERE IS DELIBERATELY NO FALLBACK to the B2B keys. A fallback reads
+     * as helpful and is the worst option available: with the D2C vars unset
+     * it would quietly mint consumer orders on the Plumtrips MID, settle
+     * consumer money into the B2B account, and look exactly like success
+     * from every screen — the silent wrong-money failure that
+     * config/razorpayMode.ts exists to prevent. Unset means OFF, and off
+     * means the 503 below. */
+    const keyId = process.env.RAZORPAY_D2C_KEY_ID;
+    const keySecret = process.env.RAZORPAY_D2C_KEY_SECRET;
     if (!keyId || !keySecret) {
       // Same posture as the SBT endpoints: a clean 503 rather than a
       // crash, so this ships before the test keys are in .env and starts

@@ -219,10 +219,35 @@ app.use((req, res, next) => {
 
 // Razorpay webhook — MUST be before express.json() to receive raw body
 import razorpayWebhookRouter from "./routes/razorpay.webhook.js";
+import razorpayWebhookD2cRouter from "./routes/razorpay.webhook.d2c.js";
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Razorpay webhook (Plumtrips Travel payments).
   // Must be mounted BEFORE express.json() so it receives the raw body.
   app.use("/api/webhooks", express.raw({ type: "application/json" }), razorpayWebhookRouter);
+
+  /* The D2C (helloviza) MID's own webhook — POST /api/webhooks/razorpay-d2c.
+   * Separate account, separate signing secret, so separate endpoint; see
+   * routes/razorpay.webhook.d2c.ts for why not one endpoint trying both
+   * secrets.
+   *
+   * THREE THINGS ABOUT THIS POSITION ARE LOAD-BEARING, and all three fail
+   * as "Razorpay says delivery failed" rather than as anything that looks
+   * like a routing bug:
+   *
+   *   express.raw() and BEFORE express.json() — the HMAC is computed over
+   *   the exact bytes Razorpay sent. A JSON-parsed-then-reserialised body
+   *   hashes to something the sender never signed, so every delivery would
+   *   fail verification.
+   *
+   *   Ahead of the rate limiter and every auth layer, like the webhook
+   *   above it — a webhook carries no session and must not be throttled
+   *   into a retry storm.
+   *
+   *   Under /api/webhooks — WORKSPACE_EXEMPT below keys on the first two
+   *   path segments, so this path inherits the workspace-resolution bypass
+   *   for free. Mounted anywhere else it would meet requireWorkspace,
+   *   which a webhook has no user or workspace to satisfy. */
+  app.use("/api/webhooks", express.raw({ type: "application/json" }), razorpayWebhookD2cRouter);
 }
 
 // WhatsApp Cloud API webhook (Expense Management inbound capture).

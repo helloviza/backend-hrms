@@ -154,7 +154,7 @@ function isDuplicateKeyError(err: any): boolean {
  * Layer 1 without layer 2 is a race. Layer 2 without layer 1 would make
  * every ordinary replay an exception. Both, or neither is honest.
  * ───────────────────────────────────────────────────────────────────── */
-async function handleD2CPaymentCaptured(application: any, paymentEntity: any): Promise<void> {
+export async function handleD2CPaymentCaptured(application: any, paymentEntity: any): Promise<void> {
   const razorpayPaymentId: string = paymentEntity.id || "";
   const capturedPaise = Number(paymentEntity.amount);
 
@@ -350,7 +350,7 @@ async function handleD2CPaymentCaptured(application: any, paymentEntity: any): P
  * it can never be set here; it needs a timeout sweep over applications
  * still PENDING past a cutoff. Not built in this stage, on purpose.
  * ───────────────────────────────────────────────────────────────────── */
-async function handleD2CPaymentFailed(application: any, paymentEntity: any): Promise<void> {
+export async function handleD2CPaymentFailed(application: any, paymentEntity: any): Promise<void> {
   /* Never demote a paid case. Razorpay can deliver a failed attempt AFTER
    * a successful retry on the same order, and applying it in arrival order
    * would un-pay a case whose money we hold. */

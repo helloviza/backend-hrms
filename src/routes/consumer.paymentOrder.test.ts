@@ -64,6 +64,12 @@ afterAll(async () => {
 beforeEach(async () => {
   await VisaApplication.deleteMany({});
   sentRequests = [];
+  /* The D2C MID's keys — NOT RAZORPAY_KEY_ID/_SECRET, which are B2B/SBT's
+   * and which this endpoint no longer reads. Both are set here on purpose:
+   * the B2B pair being present throughout is what makes the
+   * "no fallback" test below mean something. */
+  process.env.RAZORPAY_D2C_KEY_ID = "rzp_test_FAKED2CKEYID";
+  process.env.RAZORPAY_D2C_KEY_SECRET = "fake_d2c_test_secret";
   process.env.RAZORPAY_KEY_ID = "rzp_test_FAKEKEYID";
   process.env.RAZORPAY_KEY_SECRET = "fake_test_secret";
 
@@ -179,8 +185,11 @@ describe("POST /:id/payment/order — amount integrity", () => {
     expect(fresh.razorpayOrderId).toBe("order_TESTFAKE123");
     expect(fresh.razorpayPaymentId ?? null).toBeNull(); // Stage 2 writes this
 
-    expect(res.body.keyId).toBe("rzp_test_FAKEKEYID"); // publishable — fine
+    expect(res.body.keyId).toBe("rzp_test_FAKED2CKEYID"); // publishable — fine
+    expect(JSON.stringify(res.body)).not.toContain("fake_d2c_test_secret");
+    // Neither half of the B2B pair may appear in a D2C response.
     expect(JSON.stringify(res.body)).not.toContain("fake_test_secret");
+    expect(JSON.stringify(res.body)).not.toContain("rzp_test_FAKEKEYID");
   });
 });
 
@@ -252,9 +261,9 @@ describe("POST /:id/payment/order — state guards", () => {
 });
 
 describe("POST /:id/payment/order — gateway not configured", () => {
-  it("503s cleanly when the keys are absent, and mints nothing", async () => {
-    delete process.env.RAZORPAY_KEY_ID;
-    delete process.env.RAZORPAY_KEY_SECRET;
+  it("503s cleanly when the D2C keys are absent, and mints nothing", async () => {
+    delete process.env.RAZORPAY_D2C_KEY_ID;
+    delete process.env.RAZORPAY_D2C_KEY_SECRET;
 
     const consumerId = new mongoose.Types.ObjectId();
     actingConsumerId = String(consumerId);
@@ -268,5 +277,53 @@ describe("POST /:id/payment/order — gateway not configured", () => {
 
     const fresh: any = await VisaApplication.findById(app._id).lean();
     expect(fresh.razorpayOrderId ?? null).toBeNull();
+  });
+
+  /* ══════════════════════════════════════════════════════════════════
+   * NO FALLBACK TO THE B2B MID. This is the test that keeps the split
+   * honest, and it is worth more than it looks.
+   *
+   * RAZORPAY_KEY_ID/_SECRET are set (beforeEach) and perfectly usable. A
+   * "helpful" fallback would notice the D2C pair is missing, reach for
+   * them, and mint a real consumer order on the PLUMTRIPS MID — settling
+   * consumer money into the B2B account while every screen showed success.
+   * That is the silent wrong-money failure the whole guard exists to stop.
+   *
+   * Unset means OFF. 503, and no call to Razorpay at all.
+   * ══════════════════════════════════════════════════════════════════ */
+  it("does NOT fall back to the B2B keys when only the D2C pair is missing", async () => {
+    delete process.env.RAZORPAY_D2C_KEY_ID;
+    delete process.env.RAZORPAY_D2C_KEY_SECRET;
+    expect(process.env.RAZORPAY_KEY_ID).toBeTruthy();
+    expect(process.env.RAZORPAY_KEY_SECRET).toBeTruthy();
+
+    const consumerId = new mongoose.Types.ObjectId();
+    actingConsumerId = String(consumerId);
+    const app = await seedD2CApplication({ consumerId });
+
+    const res = await request(makeApp()).post(`/${app._id}/payment/order`).send({});
+
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe("GATEWAY_NOT_CONFIGURED");
+    expect(sentRequests).toHaveLength(0);
+  });
+
+  it("mints on the D2C MID and echoes the D2C key id — never the B2B one", async () => {
+    // The browser opens checkout with whatever key id comes back, so this
+    // response field is what decides which merchant takes the money.
+    const consumerId = new mongoose.Types.ObjectId();
+    actingConsumerId = String(consumerId);
+    const app = await seedD2CApplication({ consumerId });
+
+    const res = await request(makeApp()).post(`/${app._id}/payment/order`).send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body.keyId).toBe("rzp_test_FAKED2CKEYID");
+    expect(res.body.keyId).not.toBe(process.env.RAZORPAY_KEY_ID);
+
+    // And the order was authorised with the D2C secret, not the B2B one.
+    const auth = String((sentRequests[0].headers as any).Authorization ?? "");
+    const decoded = Buffer.from(auth.replace(/^Basic /, ""), "base64").toString("utf8");
+    expect(decoded).toBe("rzp_test_FAKED2CKEYID:fake_d2c_test_secret");
   });
 });
