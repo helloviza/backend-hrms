@@ -692,7 +692,15 @@ export async function sendEodReport(opts?: {
       {},
       {
         lastSentAt: new Date(),
-        lastSentStatus: result.failed === 0 ? "success" : "partial",
+        // Three-state, not two. The old `failed === 0 ? "success" : "partial"`
+        // logged a run where EVERY recipient failed as "partial", which is how a
+        // four-day 0-ok/3-failed outage sat unnoticed on the settings screen.
+        lastSentStatus:
+          result.failed === 0
+            ? "success"
+            : result.sent > 0
+              ? "partial"
+              : "failed",
         lastSentError: result.errors.join(", "),
         lastSentMode: mode,
       },

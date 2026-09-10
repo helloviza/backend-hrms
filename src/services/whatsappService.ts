@@ -6,6 +6,10 @@ const QRCode = require("qrcode");
 import path from "path";
 import { getChromeLaunchOptions, cleanStaleChromeLocks } from "../utils/chromeResolver.js";
 import { EodReportConfig, type IEodRecipient } from "../models/EodReportConfig.js";
+import {
+  uploadMedia,
+  sendTemplateWithImageHeader,
+} from "./whatsappCloud.service.js";
 import logger from "../utils/logger.js";
 
 // LocalAuth({ clientId: "plumtrips-eod" }) with the default dataPath persists the
@@ -16,6 +20,70 @@ const WA_SESSION_DIR = path.join(process.cwd(), ".wwebjs_auth", "session-plumtri
 // SingletonLock, detached frame, Store-injection timeout) must not become a
 // silent forever-hang — on timeout we exit so ECS restarts with a clean lock.
 const WA_INIT_TIMEOUT_MS = 90_000;
+
+/* ─────────────────── Hybrid report delivery (Cloud API + web.js) ───────────
+ * When enabled, sendImageToRecipients() splits the roster:
+ *   • type "individual" → Meta Cloud API, as an approved image-header template
+ *   • type "group"      → whatsapp-web.js (Meta exposes NO group send at all)
+ *
+ * DEFAULT OFF. With the flag unset the method behaves exactly as before —
+ * everything over whatsapp-web.js — so deploying this code changes nothing
+ * until an operator opts in. That matters because the Cloud API leg depends on
+ * WA_PHONE_NUMBER_ID / WA_ACCESS_TOKEN pointing at the intended WABA and on the
+ * template being approved there; flipping this on before both are true would
+ * fail every individual recipient.
+ * ───────────────────────────────────────────────────────────────────────── */
+const HYBRID_REPORTS_ENABLED = /^(1|true|yes)$/i.test(
+  (process.env.WA_REPORTS_HYBRID_ENABLED || "").trim(),
+);
+
+/** Approved template used for report delivery. Env-named, mirroring the
+ *  WA_DISRUPTION_TEMPLATE / WA_ARRIVAL_TEMPLATE pattern. */
+const REPORT_TEMPLATE_NAME = (
+  process.env.WA_REPORT_TEMPLATE || "plumtrips_report_ready"
+).trim();
+const REPORT_TEMPLATE_LANG = (process.env.WA_REPORT_TEMPLATE_LANG || "en").trim();
+
+/** Minimum digits for a usable international WhatsApp number (matches the
+ *  admin UI's own add-recipient rule). Deliberately NOT waNumber.ts's
+ *  isValidWhatsAppNumber(), which requires a leading "+" that these stored
+ *  digits-only recipients never have. */
+const MIN_MSISDN_DIGITS = 8;
+
+/** Template body variables: {{1}} report name, {{2}} date/slot label. */
+export interface ReportSendMeta {
+  reportName?: string;
+  dateLabel?: string;
+}
+
+/**
+ * Derive the two template body vars from the caption when the caller does not
+ * supply them, so eodSnapshot.ts / crmSalesPulseDelivery.ts stay untouched.
+ *
+ * Both captions open with "<emoji> Plumtrips <Report> · <date>[ (slot)]":
+ *   "📊 Plumtrips EOD · 05 Sep 2026"                    → ["EOD", "05 Sep 2026"]
+ *   "📊 Plumtrips Sales Pulse · 05 Sep 2026 (4 PM)"     → ["Sales Pulse", "05 Sep 2026 (4 PM)"]
+ * Anything unparseable falls back to safe generic values rather than throwing —
+ * a template send must never fail because a caption was reworded.
+ */
+export function deriveReportVars(
+  caption: string,
+  meta?: ReportSendMeta,
+): { reportName: string; dateLabel: string } {
+  const firstLine = String(caption ?? "").split("\n")[0] ?? "";
+  const [rawName, ...rest] = firstLine.split("·");
+
+  const derivedName = rawName
+    .replace(/[^\p{L}\p{N} .&/-]/gu, "") // drop leading emoji/pictographs
+    .replace(/\bPlumtrips\b/i, "")
+    .trim();
+  const derivedDate = rest.join("·").trim();
+
+  return {
+    reportName: meta?.reportName?.trim() || derivedName || "Report",
+    dateLabel: meta?.dateLabel?.trim() || derivedDate || "",
+  };
+}
 
 type WaStatus = "disconnected" | "qr_ready" | "connecting" | "connected" | "failed";
 
@@ -395,19 +463,177 @@ class WhatsAppService {
     return this.sendToRecipients(message);
   }
 
+  /**
+   * Deliver the report image to every active recipient.
+   *
+   * With WA_REPORTS_HYBRID_ENABLED unset this is the original whatsapp-web.js
+   * broadcast, unchanged. With it set the roster is split: individuals go over
+   * the Cloud API as an image-header template, groups stay on web.js. Both
+   * legs' tallies are merged so lastSentStatus stays truthful either way.
+   *
+   * `meta` is optional — when omitted the template body vars are derived from
+   * the caption, which keeps eodSnapshot.ts / crmSalesPulseDelivery.ts callers
+   * untouched.
+   */
   async sendImageToRecipients(
     imageBuffer: Buffer,
     caption: string,
     recipientsOverride?: IEodRecipient[],
+    meta?: ReportSendMeta,
   ): Promise<{ sent: number; failed: number; errors: string[] }> {
-    let recipients: IEodRecipient[];
-    if (recipientsOverride) {
-      recipients = recipientsOverride.filter((r) => r.active !== false);
-    } else {
-      const config = await EodReportConfig.findOne().lean();
-      recipients = (config?.recipients ?? []).filter((r) => r.active !== false);
+    const recipients = await this.resolveActiveRecipients(recipientsOverride);
+
+    if (!HYBRID_REPORTS_ENABLED) {
+      return this.sendImageViaWebClient(imageBuffer, caption, recipients);
     }
 
+    // Partition on the schema-enforced discriminator. Rows are still validated
+    // per-leg below — a `type` value is never assumed to agree with its payload.
+    const groupRows = recipients.filter((r) => r.type === "group");
+    const individualRows = recipients.filter((r) => r.type !== "group");
+
+    // Reject malformed group ids here rather than inside the web.js leg, so the
+    // legacy path stays a faithful copy of the original loop.
+    const validGroups = groupRows.filter((r) =>
+      String(r.groupId ?? "").trim().endsWith("@g.us"),
+    );
+    const badGroups = groupRows.filter(
+      (r) => !String(r.groupId ?? "").trim().endsWith("@g.us"),
+    );
+
+    logger.info("[WA] Hybrid report split", {
+      individuals: individualRows.length,
+      groups: validGroups.length,
+      malformedGroups: badGroups.length,
+      template: REPORT_TEMPLATE_NAME,
+    });
+
+    const cloud = await this.sendImageViaCloudApi(
+      imageBuffer,
+      caption,
+      individualRows,
+      meta,
+    );
+
+    // The web.js leg runs only for groups. Its null-client guard lives inside
+    // sendImageViaWebClient, so a dead session fails groups ALONE — the Cloud
+    // API individuals above have already dispatched regardless.
+    const web = validGroups.length
+      ? await this.sendImageViaWebClient(imageBuffer, caption, validGroups)
+      : { sent: 0, failed: 0, errors: [] as string[] };
+
+    return {
+      sent: cloud.sent + web.sent,
+      failed: cloud.failed + web.failed + badGroups.length,
+      errors: [
+        ...cloud.errors,
+        ...web.errors,
+        ...badGroups.map((r) => `[${r.name}] group id must end in @g.us`),
+      ],
+    };
+  }
+
+  /** Shared roster resolution: explicit override, else the EOD config, always
+   *  filtered to active rows. */
+  private async resolveActiveRecipients(
+    recipientsOverride?: IEodRecipient[],
+  ): Promise<IEodRecipient[]> {
+    if (recipientsOverride) {
+      return recipientsOverride.filter((r) => r.active !== false);
+    }
+    const config = await EodReportConfig.findOne().lean();
+    return (config?.recipients ?? []).filter((r) => r.active !== false);
+  }
+
+  /**
+   * INDIVIDUAL leg — Meta Cloud API, image-header template.
+   *
+   * The PNG is uploaded ONCE per run and the resulting media id reused for
+   * every recipient (mirroring the build-media-once pattern in the web.js leg).
+   * An upload failure fails this leg only; the group leg is unaffected.
+   */
+  private async sendImageViaCloudApi(
+    imageBuffer: Buffer,
+    caption: string,
+    individuals: IEodRecipient[],
+    meta?: ReportSendMeta,
+  ): Promise<{ sent: number; failed: number; errors: string[] }> {
+    if (!individuals.length) return { sent: 0, failed: 0, errors: [] };
+
+    let sent = 0;
+    let failed = 0;
+    const errors: string[] = [];
+
+    // Validate before uploading — no point paying for an upload if nobody is
+    // addressable.
+    const addressable: { row: IEodRecipient; to: string }[] = [];
+    for (const r of individuals) {
+      const digits = String(r.number ?? "").replace(/[^0-9]/g, "");
+      if (digits.length < MIN_MSISDN_DIGITS) {
+        failed++;
+        errors.push(`[${r.name}] invalid WhatsApp number`);
+        continue;
+      }
+      // Stored numbers are already digits-only with no "+", which is exactly
+      // the shape Meta's `to` field wants.
+      addressable.push({ row: r, to: digits });
+    }
+
+    if (!addressable.length) return { sent, failed, errors };
+
+    let mediaId: string;
+    try {
+      mediaId = await uploadMedia(imageBuffer, "image/png", "plumtrips-report.png");
+    } catch (err: any) {
+      const msg = err?.message ?? "media upload failed";
+      logger.error("[WA] Cloud API media upload failed — all individuals failed", {
+        message: msg,
+        individuals: addressable.length,
+      });
+      return {
+        sent,
+        failed: failed + addressable.length,
+        errors: [...errors, ...addressable.map((a) => `[${a.row.name}] ${msg}`)],
+      };
+    }
+
+    const { reportName, dateLabel } = deriveReportVars(caption, meta);
+
+    for (const { row, to } of addressable) {
+      const result = await sendTemplateWithImageHeader(
+        to,
+        REPORT_TEMPLATE_NAME,
+        REPORT_TEMPLATE_LANG,
+        mediaId,
+        [reportName, dateLabel],
+      );
+      if (result.sent) {
+        sent++;
+        logger.info("[WA] Cloud API template sent", { name: row.name, to });
+      } else {
+        failed++;
+        errors.push(`[${row.name}] ${result.error ?? "Send failed"}`);
+        logger.error("[WA] Cloud API template send failed", {
+          name: row.name,
+          to,
+          error: result.error,
+        });
+      }
+    }
+
+    return { sent, failed, errors };
+  }
+
+  /**
+   * GROUP / legacy leg — whatsapp-web.js. Extracted verbatim from the original
+   * sendImageToRecipients loop, including its null-client guard, which now
+   * scopes to this leg alone.
+   */
+  private async sendImageViaWebClient(
+    imageBuffer: Buffer,
+    caption: string,
+    recipients: IEodRecipient[],
+  ): Promise<{ sent: number; failed: number; errors: string[] }> {
     if (!this.client) {
       logger.warn("[WA] Client is null, reinitializing for image send...");
       await this.initialize();
