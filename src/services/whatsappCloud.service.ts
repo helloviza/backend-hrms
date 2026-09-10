@@ -226,3 +226,182 @@ export async function sendButtonMessage(
     await sendTextMessage(to, body);
   }
 }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Outbound MEDIA + image-header TEMPLATE sends.
+ *
+ * Added for the hybrid EOD / Sales-Pulse split: individual recipients move to
+ * the Cloud API while group recipients stay on whatsapp-web.js (which has no
+ * Cloud API equivalent — Meta exposes no group-messaging surface).
+ *
+ * Both helpers are ADDITIVE. The shared sendTemplateMessage() signature above
+ * is deliberately left alone: arrivalSession.ts and tripNotifier.ts call it and
+ * must not be disturbed.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/** Meta's documented ceiling for an image sent over the Cloud API. */
+export const WA_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Upload media bytes and return the resulting media id.
+ * POST /<phoneNumberId>/media as multipart/form-data with `messaging_product`,
+ * `type` and `file`.
+ *
+ * The id is WABA-scoped and reusable across sends, so callers should upload
+ * ONCE per batch and reuse the id for every recipient — never once per person.
+ *
+ * Multipart body uses Node's native FormData/Blob (Node 18+); axios derives the
+ * boundary from the FormData instance, so Content-Type is deliberately NOT set
+ * here — setting it by hand would omit the boundary and Meta would reject it.
+ * No new dependency is required.
+ *
+ * THROWS on failure (unlike sendTextMessage, which swallows) so a caller can
+ * record the real outcome instead of reporting a send that never happened.
+ */
+export async function uploadMedia(
+  buffer: Buffer,
+  mimeType: string,
+  filename = "upload",
+): Promise<string> {
+  if (!isWhatsAppCloudConfigured()) {
+    throw new Error(
+      "WhatsApp Cloud API not configured (WA_ACCESS_TOKEN / WA_PHONE_NUMBER_ID)",
+    );
+  }
+  if (!buffer?.length) {
+    throw new Error("uploadMedia: empty buffer");
+  }
+  if (buffer.length > WA_IMAGE_MAX_BYTES) {
+    throw new Error(
+      `uploadMedia: ${buffer.length} bytes exceeds the ${WA_IMAGE_MAX_BYTES}-byte media limit`,
+    );
+  }
+
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("type", mimeType);
+  form.append("file", new Blob([new Uint8Array(buffer)], { type: mimeType }), filename);
+
+  try {
+    const { data } = await axios.post(
+      `${GRAPH_BASE}/${env.WA_GRAPH_VERSION}/${env.WA_PHONE_NUMBER_ID}/media`,
+      form,
+      {
+        headers: { Authorization: `Bearer ${env.WA_ACCESS_TOKEN}` },
+        timeout: 60_000,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      },
+    );
+    const id = data?.id;
+    if (!id) {
+      throw new Error(
+        `media upload returned no id (keys: ${Object.keys(data || {}).join(",") || "none"})`,
+      );
+    }
+    whatsappLogger.info("uploadMedia ok", { bytes: buffer.length, mimeType, mediaId: id });
+    return String(id);
+  } catch (err) {
+    const detail = describeGraphError(err);
+    whatsappLogger.error("uploadMedia failed", { bytes: buffer.length, mimeType, error: detail });
+    throw new Error(`WhatsApp media upload failed: ${detail}`);
+  }
+}
+
+/** Outcome of an image-header template send. Never throws; never swallows. */
+export interface TemplateSendResult {
+  sent: boolean;
+  error?: string;
+}
+
+/**
+ * Send an approved template whose HEADER is an image, with text body variables.
+ *
+ * Sibling of sendTemplateMessage() — that one builds a body-only `components`
+ * array and is shared by the arrival + trip-notifier callers, so it is left
+ * untouched rather than gaining an optional header parameter.
+ *
+ * `headerMediaId` comes from uploadMedia(); pass the SAME id for every
+ * recipient in a run.
+ *
+ * Returns { sent, error? } rather than throwing or swallowing, so the caller's
+ * { sent, failed, errors } tally stays truthful.
+ */
+export async function sendTemplateWithImageHeader(
+  to: string,
+  templateName: string,
+  langCode: string,
+  headerMediaId: string,
+  bodyParams: string[],
+): Promise<TemplateSendResult> {
+  if (!isWhatsAppCloudConfigured()) {
+    return { sent: false, error: "WhatsApp Cloud API not configured" };
+  }
+  if (!templateName) {
+    return { sent: false, error: "No template name configured" };
+  }
+  if (!headerMediaId) {
+    return { sent: false, error: "No header media id" };
+  }
+  try {
+    await axios.post(
+      `${GRAPH_BASE}/${env.WA_GRAPH_VERSION}/${env.WA_PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "template",
+        template: {
+          name: templateName,
+          language: { code: langCode || "en" },
+          components: [
+            {
+              type: "header",
+              parameters: [{ type: "image", image: { id: headerMediaId } }],
+            },
+            {
+              type: "body",
+              parameters: (bodyParams || []).map((t) => ({
+                type: "text",
+                text: String(t),
+              })),
+            },
+          ],
+        },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${env.WA_ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 30_000,
+      },
+    );
+    return { sent: true };
+  } catch (err) {
+    const detail = describeGraphError(err);
+    whatsappLogger.error("sendTemplateWithImageHeader failed", {
+      to,
+      templateName,
+      error: detail,
+    });
+    return { sent: false, error: detail };
+  }
+}
+
+/**
+ * Pull the useful message out of a Graph failure. Meta puts the actionable text
+ * in response.data.error.message (e.g. an unapproved template name, a paused
+ * template, a number outside the allow-list) — err.message alone is usually
+ * just "Request failed with status code 400".
+ */
+function describeGraphError(err: unknown): string {
+  if (axios.isAxiosError(err)) {
+    const g = (err.response?.data as any)?.error;
+    if (g?.message) {
+      return g.code ? `${g.message} (code ${g.code})` : String(g.message);
+    }
+    return err.message;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
