@@ -428,6 +428,101 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   consumerContactPII: NONE,
 }
 
+// ── TENANT_ADMIN template ─────────────────────────────────────────────────────
+//
+// The administrator of a self-service SaaS HRMS tenant — the account created by
+// routes/saas.signup.ts and routes/signup.ts (both mounted PUBLIC, no auth) and
+// by superadmin.workspaces.ts.
+//
+// WHY THIS TEMPLATE DID NOT EXIST BEFORE: all three of those call sites
+// hand-rolled an identical inline object granting all 34 modules
+// { access: "FULL", scope: "ALL" }. Nothing referenced levelTemplates at all,
+// so the grant drifted free of the one place grants are supposed to be defined,
+// and two of the three sites are reachable by anyone on the internet.
+//
+// TWO THINGS ARE WRONG WITH THAT GRANT, and this template fixes both:
+//
+//  1. scope ALL, not WORKSPACE. "ALL" is the cross-tenant breadth reserved for
+//     Plumtrips' own staff. A tenant admin administers ONE workspace — their
+//     own — so every module here is WORKSPACE-scoped.
+//
+//  2. Plumtrips-internal travel/billing modules granted at all. A SaaS HRMS
+//     tenant runs their own HR: people, leave, payroll, policies. They are not
+//     a Plumtrips travel-ops desk, so adminQueue / manualBookings / invoices /
+//     adminVouchers / voucherExtract / directCustomers / CRM / visa / cstep are
+//     NONE. `invoices` in particular is what let three self-signed-up accounts
+//     read all 633 invoices across all 58 tenants.
+//
+// WHAT IS DELIBERATELY KEPT, and why removing it would be a regression:
+//   - the full HR/People/Payroll set, at WORKSPACE — this is the product they
+//     signed up for.
+//   - accessConsole at WORKSPACE — they must be able to invite and grant their
+//     own team. middleware/requireAccessConsole.ts admits them by their
+//     TENANT_ADMIN *role*, and routes/permissions.ts then confines /list,
+//     /grant and /update to their own workspace, so this is already bounded.
+//   - the SBT/travel set at WORKSPACE — harmless, because every one of those
+//     routes additionally sits behind requireFeature("sbtEnabled") on the
+//     workspace. A tenant without the flag reaches none of them regardless.
+const TENANT_ADMIN: ModulesTemplate = {
+  // HR & People — the actual product.
+  myProfile:         FULL_WS,
+  attendance:        FULL_WS,
+  leaves:            FULL_WS,
+  leaveApprovals:    FULL_WS,
+  holidays:          FULL_WS,
+  holidayManagement: FULL_WS,
+  orgChart:          FULL_WS,
+  policies:          FULL_WS,
+  teamProfiles:      FULL_WS,
+  teamPresence:      FULL_WS,
+  teamCalendar:      FULL_WS,
+  hrWorkspace:       FULL_WS,
+  onboarding:        FULL_WS,
+  people:            FULL_WS,
+  masterData:        FULL_WS,
+  // Payroll — their own employees'.
+  payroll:           FULL_WS,
+  payrollAdmin:      FULL_WS,
+  // Plumtrips travel-ops & billing — NOT theirs. This is the leak surface.
+  adminQueue:        NONE,
+  manualBookings:    NONE,
+  invoices:          NONE,
+  adminVouchers:     NONE,
+  voucherExtract:    NONE,
+  // Reporting on their own workspace is fine; cross-tenant is not.
+  reports:           FULL_WS,
+  companySettings:   FULL_WS,
+  analytics:         FULL_WS,
+  workspaceSettings: FULL_WS,
+  accessConsole:     FULL_WS,
+  // Travel self-booking — workspace-scoped AND feature-flagged behind
+  // sbtEnabled, so this grants nothing to a tenant without the flag.
+  sbt:               FULL_WS,
+  sbtSearch:         FULL_WS,
+  sbtBookings:       FULL_WS,
+  sbtRequest:        FULL_WS,
+  approvals:         FULL_WS,
+  travelSpend:       FULL_WS,
+  // Operations — own workspace only.
+  supportTickets:    FULL_WS,
+  tasks:             FULL_WS,
+  // Plumtrips-internal books of record — never a tenant's.
+  vendorProfile:     NONE,
+  vendorManagement:  NONE,
+  directCustomers:   NONE,
+  crmContacts:       NONE,
+  crmCompanies:      NONE,
+  leads:             NONE,
+  cstep:             NONE,
+  visaApplication:   NONE,
+  visaScreening:     NONE,
+  // Consumer (D2C/Helloviza) contact details. Plumtrips-internal like the
+  // rest of this group, and this template is what PUBLIC signup self-grants
+  // — so it is the one grant that must never be self-issuable. NONE matches
+  // every other template in this file; no template grants it.
+  consumerContactPII: NONE,
+}
+
 // ── Exports ───────────────────────────────────────────────────────────────────
 
 export const LEVEL_TEMPLATES: Record<string, ModulesTemplate> = {
@@ -442,6 +537,11 @@ export const LEVEL_TEMPLATES: Record<string, ModulesTemplate> = {
   VENDOR,
   CUSTOMER_SBT,
   CUSTOMER_APPROVAL,
+  TENANT_ADMIN,
+  // The signup routes historically wrote level.code "L0" for this account.
+  // Alias it so an existing L0 doc resolves to the same template rather than
+  // to `undefined` (which callers spread into `{}` = no modules at all).
+  L0: TENANT_ADMIN,
 }
 
 export interface LevelMetadata {

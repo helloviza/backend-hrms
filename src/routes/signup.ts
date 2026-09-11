@@ -14,6 +14,7 @@ import {
   provisionNewTenant,
 } from "../services/tenantProvisioning.js";
 import { seedTaskAutomations } from "../services/taskAutomationSeed.js";
+import { LEVEL_TEMPLATES } from "../config/levelTemplates.js";
 import { env } from "../config/env.js";
 import { sbtLogger } from "../utils/logger.js";
 
@@ -151,33 +152,26 @@ router.post("/", async (req, res) => {
       "billing", "access",
     ];
 
-    const fullAccess = { access: "FULL", scope: "ALL" } as const;
-    const tenantAdminModules = {
-      myProfile: fullAccess, attendance: fullAccess, leaves: fullAccess,
-      leaveApprovals: fullAccess, holidays: fullAccess, holidayManagement: fullAccess,
-      orgChart: fullAccess, policies: fullAccess, teamProfiles: fullAccess,
-      teamPresence: fullAccess, teamCalendar: fullAccess, hrWorkspace: fullAccess,
-      onboarding: fullAccess, people: fullAccess, masterData: fullAccess,
-      payroll: fullAccess, payrollAdmin: fullAccess,
-      adminQueue: fullAccess, manualBookings: fullAccess, invoices: fullAccess,
-      reports: fullAccess, companySettings: fullAccess, adminVouchers: fullAccess,
-      voucherExtract: fullAccess,
-      analytics: fullAccess, workspaceSettings: fullAccess, accessConsole: fullAccess,
-      sbt: fullAccess, sbtSearch: fullAccess, sbtBookings: fullAccess,
-      sbtRequest: fullAccess, approvals: fullAccess, travelSpend: fullAccess,
-      vendorProfile: fullAccess,
-    };
-
+    // Grant from the TENANT_ADMIN template — see config/levelTemplates.ts.
+    // This file is the OTHER fully-public signup route (see the header comment
+    // above and server.ts), and it carried a byte-identical copy of the
+    // all-modules-FULL-ALL grant that saas.signup.ts did. Fixing only one of
+    // the two would have left the same self-grant reachable from this form.
     await UserPermission.create({
       userId: user._id.toString(),
       email: normalizedEmail,
       workspaceId: workspace._id.toString(),
+      // STAFF is deliberate — it is the population administered, not employment
+      // by Plumtrips, and permissions.ts keys this account's own nav and Access
+      // Console visibility off it. Isolation comes from WORKSPACE scope.
       universe: "STAFF",
-      level: { code: "L0", name: "Workspace Admin" },
+      level: { code: "TENANT_ADMIN", name: "Workspace Admin" },
       tier: 3,
-      roleType: "SUPERADMIN",
+      // NOT "SUPERADMIN" — GET /permissions/me short-circuits on that value and
+      // synthesises every module at FULL/ALL regardless of what is stored.
+      roleType: "EMPLOYEE",
       grantedModules: allModules,
-      modules: tenantAdminModules,
+      modules: LEVEL_TEMPLATES.TENANT_ADMIN,
       grantedBy: user._id.toString(),
       source: "system",
       status: "active",

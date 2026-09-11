@@ -11,6 +11,7 @@ import { UserPermission } from "../models/UserPermission.js";
 import { sendMail } from "../utils/mailer.js";
 import { buildEmailShell, escapeHtml } from "./approvals.email.js";
 import { generateSlug, ensureUniqueSlug, provisionNewTenant } from "../services/tenantProvisioning.js";
+import { LEVEL_TEMPLATES } from "../config/levelTemplates.js";
 import { env } from "../config/env.js";
 import TenantSetupProgress from "../models/TenantSetupProgress.js";
 
@@ -86,8 +87,17 @@ r.post("/signup", async (req, res) => {
       status: "ACTIVE",
     });
 
-    // 7. Create UserPermission with full module access
-    const fullAccess = { access: "FULL", scope: "ALL" } as const;
+    // 7. Create UserPermission from the TENANT_ADMIN template.
+    //
+    // This endpoint is mounted PUBLIC (server.ts: "fully public — no
+    // requireAuth"), so whatever it grants is self-granted by anyone on the
+    // internet who fills in the form. It used to hand out all 34 modules at
+    // { access: "FULL", scope: "ALL" } — including `invoices`, which let three
+    // self-signed-up accounts read every invoice of every tenant.
+    //
+    // The grant now comes from config/levelTemplates.ts like every other
+    // grant in the system, rather than being hand-rolled here. See that
+    // template for what is included and excluded and why.
     const allModules = [
       "dashboard", "employees", "leaves", "attendance",
       "payroll", "onboarding", "vendors", "customers",
@@ -95,32 +105,30 @@ r.post("/signup", async (req, res) => {
       "profile", "myBookings", "myInvoices", "sbt",
       "billing", "access",
     ];
-    const tenantAdminModules = {
-      myProfile: fullAccess, attendance: fullAccess, leaves: fullAccess,
-      leaveApprovals: fullAccess, holidays: fullAccess, holidayManagement: fullAccess,
-      orgChart: fullAccess, policies: fullAccess, teamProfiles: fullAccess,
-      teamPresence: fullAccess, teamCalendar: fullAccess, hrWorkspace: fullAccess,
-      onboarding: fullAccess, people: fullAccess, masterData: fullAccess,
-      payroll: fullAccess, payrollAdmin: fullAccess,
-      adminQueue: fullAccess, manualBookings: fullAccess, invoices: fullAccess,
-      reports: fullAccess, companySettings: fullAccess, adminVouchers: fullAccess,
-      voucherExtract: fullAccess,
-      analytics: fullAccess, workspaceSettings: fullAccess, accessConsole: fullAccess,
-      sbt: fullAccess, sbtSearch: fullAccess, sbtBookings: fullAccess,
-      sbtRequest: fullAccess, approvals: fullAccess, travelSpend: fullAccess,
-      vendorProfile: fullAccess,
-    };
 
     await UserPermission.create({
       userId: user._id.toString(),
       email: normalizedEmail,
       workspaceId: workspace._id.toString(),
+      // universe stays STAFF deliberately. It does NOT mean "Plumtrips
+      // employee" — it is the population this person administers, and three
+      // consumers depend on it being STAFF for this account: permissions.ts
+      // derives their nav from it (:166), and /list and the holders query
+      // force universe:'STAFF' for any non-SuperAdmin caller (:251, :935), so
+      // flipping it would erase the tenant admin from their own Access
+      // Console while closing no hole. Isolation is enforced by SCOPE, below.
       universe: "STAFF",
-      level: { code: "L0", name: "Workspace Admin" },
+      level: { code: "TENANT_ADMIN", name: "Workspace Admin" },
       tier: 3,
-      roleType: "SUPERADMIN",
+      // NOT "SUPERADMIN". GET /api/permissions/me short-circuits on
+      // roleType === 'SUPERADMIN' (routes/permissions.ts:124-150) and answers
+      // with isSuperAdmin:true plus EVERY module synthesised at FULL/ALL,
+      // ignoring what is stored here entirely. Left as SUPERADMIN, the
+      // frontend would still render the full platform nav — Invoices included
+      // — and the stored grant below would be decorative.
+      roleType: "EMPLOYEE",
       grantedModules: allModules,
-      modules: tenantAdminModules,
+      modules: LEVEL_TEMPLATES.TENANT_ADMIN,
       grantedBy: user._id.toString(),
       source: "system",
       status: "active",
