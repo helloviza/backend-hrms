@@ -230,11 +230,143 @@ import { env } from "../config/env.js";
 import { resolveCustomerState, buildAddressStr } from "../utils/invoiceClient.js";
 import { createInvoiceFromBookings, InvoiceGenerationError } from "../services/invoiceGeneration.service.js";
 import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { isHouseCallerContext } from "../utils/bookingAccess.js";
+import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
+import { buildInvoiceQueryFilter } from "./invoices.filters.js";
+
+
+/** Today's IST calendar date as YYYY-MM-DD, for the "settled today" stat.
+ *  The server may run in any timezone (App Runner is UTC), so "today" has to
+ *  be asked of Asia/Kolkata explicitly rather than taken from the local clock —
+ *  otherwise between 00:00 and 05:30 IST it reports yesterday. */
+function todayIST(): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date());
+}
 
 const router = express.Router();
 
 router.use(requireAuth);
 router.use(requireAdmin);
+
+/* ── Admin read-path scoping ──────────────────────────────────────────
+ *
+ * THE TENANT GATE FOR EVERY ADMIN INVOICE READ. Before this existed, the
+ * admin list/export/bulk-pdf/activity/insight handlers each built their own
+ * `filter` starting from `{}` and never consulted the caller's workspace at
+ * all — requirePermission("invoices","READ") ATTACHES req.permissionScope but
+ * does no filtering of its own, and requireWorkspace only proves that *a*
+ * workspace resolved, not that the rows belong to it. Any invoices:READ holder
+ * could therefore read every invoice of every tenant.
+ *
+ * That was not theoretical: routes/saas.signup.ts (mounted PUBLIC at /api/saas,
+ * no requireAuth) provisions every self-service signup with
+ * invoices: { access: "FULL", scope: "ALL" }. Three of the six live holders of
+ * that grant are such self-signed-up tenant admins, not Plumtrips staff.
+ *
+ * CONSEQUENCE FOR THIS GATE'S DESIGN: the bypass must NOT key off
+ * permissionScope === "ALL". All six holders carry scope ALL, so that test
+ * would preserve the leak exactly. It keys off SuperAdmin / HOUSE only —
+ * the same rule the bookings list uses (routes/manualBookings.ts ~552-596),
+ * where ALL-scope relaxes only the booking-workflow own-scope sub-tier and
+ * never the tenant gate itself.
+ *
+ * DELIBERATELY NOT PORTED from that route: its createdBy / PENDING_TO_ASSIGN /
+ * assignPerson carve-outs. Those encode booking triage workflow and have no
+ * invoice equivalent — an invoice has no assignee and no intake queue. The
+ * required behaviour here is plain workspace-level isolation.
+ */
+
+/**
+ * The caller's own tenant as a query clause, or null for "no restriction".
+ *
+ * Null (unrestricted) for exactly two callers, matching the bookings gate:
+ * a genuine platform SUPERADMIN, and HOUSE staff — both manage all tenants.
+ *
+ * ID-SPACE: Invoice.workspaceId is declared ref:"CustomerWorkspace", but the
+ * collection demonstrably holds a MIX of CustomerWorkspace._id and Customer._id
+ * in that one field — which is why the caller-supplied workspaceId filter has
+ * always had to query both spaces. The gate therefore probes both too; matching
+ * only the declared space would silently hide a tenant's own legacy invoices
+ * from them.
+ *
+ * FAIL CLOSED: a caller whose tenant resolves in NEITHER space gets
+ * `_id: {$in: []}` — an empty result — never an absent clause. An absent clause
+ * is what "return everything" looks like, and is the precise shape of the bug
+ * being fixed.
+ */
+function invoiceTenantClause(req: any): Record<string, any> | null {
+  if (isSuperAdmin(req)) return null;
+
+  const ctx = {
+    callerId: String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? ""),
+    customerId: req.workspace?.customerId ?? null,
+    workspaceObjectId: req.workspaceObjectId,
+    permissionScope: req.permissionScope,
+    isSuperAdmin: false,
+  };
+  if (isHouseCallerContext(ctx)) return null;
+
+  const tenantOr: any[] = [];
+  // CustomerWorkspace._id space — the declared ref, so the common case.
+  if (ctx.workspaceObjectId && mongoose.Types.ObjectId.isValid(String(ctx.workspaceObjectId))) {
+    tenantOr.push({ workspaceId: new mongoose.Types.ObjectId(String(ctx.workspaceObjectId)) });
+  }
+  // Customer._id space — legacy rows written before the ref settled.
+  if (ctx.customerId && mongoose.Types.ObjectId.isValid(String(ctx.customerId))) {
+    tenantOr.push({ workspaceId: new mongoose.Types.ObjectId(String(ctx.customerId)) });
+  }
+
+  return tenantOr.length ? { $or: tenantOr } : { _id: { $in: [] } };
+}
+
+/**
+ * ANDs the tenant gate onto an arbitrary base query.
+ *
+ * For the read paths that aren't filter-driven (/activity, /insight) and so
+ * have no use for buildInvoiceReadFilter's status/date/search handling, but
+ * must still be confined to the caller's tenant. Pushes onto `$and`; never
+ * reassigns it.
+ */
+function withInvoiceTenantScope(
+  req: any,
+  base: Record<string, any> = {},
+): Record<string, any> {
+  const gate = invoiceTenantClause(req);
+  if (!gate) return base;
+  return { ...base, $and: [...(base.$and ?? []), gate] };
+}
+
+
+/**
+ * THE single filter builder for the admin invoice read paths that take
+ * user-supplied filters: GET /, GET /export, GET /bulk-pdf. One copy of the
+ * scope logic, not three.
+ *
+ * Clause placement is load-bearing. The tenant gate and the caller-supplied
+ * workspaceId narrowing BOTH constrain `workspaceId`, so both go into `$and`
+ * as separate entries. Writing them as two sibling `filter.workspaceId = …`
+ * assignments would have the second silently overwrite the first — and since
+ * the narrowing is the one a caller controls, that ordering would let a tenant
+ * user pass ?workspaceId=<someone else's> and erase their own gate.
+ *
+ * The narrowing stays a NARROWING filter: ANDed with the gate, so staff can
+ * focus one client while a tenant caller can never widen past their own.
+ */
+async function buildInvoiceReadFilter(req: any): Promise<Record<string, any>> {
+  // Caller-supplied narrowing first (routes/invoices.filters.ts — no access
+  // logic in there at all), then THIS file's gate ANDed on top. Two files, and
+  // the security half is the half that stayed here.
+  const filter = await buildInvoiceQueryFilter(req.query ?? {});
+
+  const gate = invoiceTenantClause(req);
+  // Append, never reassign — reassigning $and is how the gate gets dropped.
+  if (gate) filter.$and = [...(filter.$and ?? []), gate];
+
+  return filter;
+}
 
 /* ── GST helpers ─────────────────────────────────────────────────── */
 // resolveCustomerState + buildAddressStr now live in utils/invoiceClient.ts
@@ -664,29 +796,64 @@ router.get("/", requirePermission("invoices", "READ"), async (req: any, res: any
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(200, parseInt(req.query.limit) || 20);
-    const filter: Record<string, any> = {};
+    const filter = await buildInvoiceReadFilter(req);
 
-    if (req.query.workspaceId) {
-      const cws = await CustomerWorkspace
-        .findOne({ customerId: req.query.workspaceId })
-        .select("_id")
-        .lean();
-      filter.workspaceId = { $in: [req.query.workspaceId, ...(cws ? [cws._id] : [])] };
-    }
-    if (req.query.status) filter.status = req.query.status;
-
-    if (req.query.dateFrom || req.query.dateTo) {
-      filter.generatedAt = {};
-      if (req.query.dateFrom) filter.generatedAt.$gte = new Date(req.query.dateFrom);
-      if (req.query.dateTo) filter.generatedAt.$lte = new Date(req.query.dateTo);
-    }
-
-    const [docs, total] = await Promise.all([
+    // Stats aggregate over the FULL filtered set, not the current page.
+    // Mirrors the bookings list (routes/manualBookings.ts): same `filter`
+    // object feeds find + countDocuments + aggregate, so the cards, the row
+    // count and the rows can never describe different sets.
+    //
+    // Before this, the four cards were summed client-side from `docs` — i.e.
+    // from 25 rows — so "Total Receivables" changed as you paged. OUTSTANDING
+    // counts DRAFT + SENT + PAYMENT_DECLARED: a customer's payment claim is
+    // not finance-confirmed receipt (see Invoice.ts's status doc comment).
+    const [docs, total, statsAgg] = await Promise.all([
       Invoice.find(filter).sort({ generatedAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
       Invoice.countDocuments(filter),
+      Invoice.aggregate([
+        { $match: filter },
+        { $group: {
+          _id: null,
+          totalReceivables: { $sum: { $ifNull: ["$grandTotal", 0] } },
+          outstanding: { $sum: { $cond: [
+            { $in: ["$status", ["DRAFT", "SENT", "PAYMENT_DECLARED"]] },
+            { $ifNull: ["$grandTotal", 0] },
+            0,
+          ] } },
+          pendingCount: { $sum: { $cond: [
+            { $in: ["$status", ["DRAFT", "SENT", "PAYMENT_DECLARED"]] }, 1, 0,
+          ] } },
+          overdueCount: { $sum: { $cond: [
+            { $and: [
+              { $in: ["$status", ["SENT", "PAYMENT_DECLARED"]] },
+              { $ne: ["$dueDate", null] },
+              { $lt: ["$dueDate", new Date()] },
+            ] }, 1, 0,
+          ] } },
+          settledToday: { $sum: { $cond: [
+            { $and: [
+              { $eq: ["$status", "PAID"] },
+              { $gte: ["$paidAt", parseISTStart(todayIST())] },
+              { $lte: ["$paidAt", parseISTEnd(todayIST())] },
+            ] },
+            { $ifNull: ["$grandTotal", 0] },
+            0,
+          ] } },
+        } },
+      ]),
     ]);
 
-    res.json({ ok: true, docs, total, page, pages: Math.ceil(total / limit) });
+    const s = statsAgg[0] ?? {};
+    res.json({
+      ok: true, docs, total, page, pages: Math.ceil(total / limit),
+      stats: {
+        totalReceivables: s.totalReceivables ?? 0,
+        outstanding:      s.outstanding      ?? 0,
+        settledToday:     s.settledToday     ?? 0,
+        pendingCount:     s.pendingCount     ?? 0,
+        overdueCount:     s.overdueCount     ?? 0,
+      },
+    });
   } catch (err: any) {
     console.error("[Invoices GET list]", err.message);
     res.status(500).json({ error: err.message });
@@ -698,20 +865,7 @@ router.get("/", requirePermission("invoices", "READ"), async (req: any, res: any
 // GET /api/admin/invoices/export
 router.get("/export", requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
-    const filter: Record<string, any> = {};
-    if (req.query.workspaceId) {
-      const cws = await CustomerWorkspace
-        .findOne({ customerId: req.query.workspaceId })
-        .select("_id")
-        .lean();
-      filter.workspaceId = { $in: [req.query.workspaceId, ...(cws ? [cws._id] : [])] };
-    }
-    if (req.query.status) filter.status = req.query.status;
-    if (req.query.dateFrom || req.query.dateTo) {
-      filter.generatedAt = {};
-      if (req.query.dateFrom) filter.generatedAt.$gte = new Date(req.query.dateFrom);
-      if (req.query.dateTo) filter.generatedAt.$lte = new Date(req.query.dateTo);
-    }
+    const filter = await buildInvoiceReadFilter(req);
 
     const format = req.query.format === "xlsx" ? "xlsx" : "csv";
     const docs = await Invoice.find(filter).sort({ generatedAt: -1 }).lean();
@@ -764,21 +918,8 @@ router.get("/export", requirePermission("invoices", "READ"), async (req: any, re
 // registered before the GET "/:id" route so the literal path is matched.
 router.get("/bulk-pdf", requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
-    // Filter block — kept identical to the export handler (~956).
-    const filter: Record<string, any> = {};
-    if (req.query.workspaceId) {
-      const cws = await CustomerWorkspace
-        .findOne({ customerId: req.query.workspaceId })
-        .select("_id")
-        .lean();
-      filter.workspaceId = { $in: [req.query.workspaceId, ...(cws ? [cws._id] : [])] };
-    }
-    if (req.query.status) filter.status = req.query.status;
-    if (req.query.dateFrom || req.query.dateTo) {
-      filter.generatedAt = {};
-      if (req.query.dateFrom) filter.generatedAt.$gte = new Date(req.query.dateFrom);
-      if (req.query.dateTo) filter.generatedAt.$lte = new Date(req.query.dateTo);
-    }
+    // Same builder as the list and export handlers — including the tenant gate.
+    const filter = await buildInvoiceReadFilter(req);
 
     const invoices = await Invoice.find(filter).sort({ generatedAt: -1 }).lean();
 
@@ -982,9 +1123,12 @@ function timeAgo(date: Date): string {
 }
 
 // GET /api/admin/invoices/activity
-router.get("/activity", requirePermission("invoices", "READ"), async (_req: any, res: any) => {
+router.get("/activity", requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
-    const invoices = await Invoice.find({})
+    // Was Invoice.find({}) with the request ignored entirely (`_req`), so the
+    // "recent activity" feed showed the last 10 invoices platform-wide —
+    // invoice numbers and client names from every tenant.
+    const invoices = await Invoice.find(withInvoiceTenantScope(req))
       .sort({ updatedAt: -1 })
       .limit(10)
       .lean();
@@ -1034,22 +1178,24 @@ router.get("/activity", requirePermission("invoices", "READ"), async (_req: any,
 /* ── Insight ──────────────────────────────────────────────────────── */
 
 // GET /api/admin/invoices/insight
-router.get("/insight", requirePermission("invoices", "READ"), async (_req: any, res: any) => {
+router.get("/insight", requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
     const now            = new Date();
     const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
+    // Every arm below was previously unscoped (the handler took `_req`), so the
+    // outstanding-receivables figure summed every tenant's unpaid invoices.
     const [totalThisMonth, paidThisMonth, paidWithin15, outstandingAgg] =
       await Promise.all([
-        Invoice.countDocuments({
+        Invoice.countDocuments(withInvoiceTenantScope(req, {
           generatedAt: { $gte: thisMonthStart },
           status: { $ne: "CANCELLED" },
-        }),
-        Invoice.countDocuments({
+        })),
+        Invoice.countDocuments(withInvoiceTenantScope(req, {
           generatedAt: { $gte: thisMonthStart },
           status: "PAID",
-        }),
-        Invoice.countDocuments({
+        })),
+        Invoice.countDocuments(withInvoiceTenantScope(req, {
           generatedAt: { $gte: thisMonthStart },
           status: "PAID",
           $expr: {
@@ -1058,14 +1204,16 @@ router.get("/insight", requirePermission("invoices", "READ"), async (_req: any, 
               15 * 24 * 60 * 60 * 1000,
             ],
           },
-        }),
+        })),
         // PAYMENT_DECLARED is still outstanding — it's a customer claim, not
         // finance-confirmed receipt (see Invoice.ts's status doc comment).
         // Omitting it here would make this figure silently shrink the
         // moment invoices start entering that state, before any money is
         // actually confirmed received.
         Invoice.aggregate([
-          { $match: { status: { $in: ["DRAFT", "SENT", "PAYMENT_DECLARED"] } } },
+          { $match: withInvoiceTenantScope(req, {
+            status: { $in: ["DRAFT", "SENT", "PAYMENT_DECLARED"] },
+          }) },
           { $group: { _id: null, total: { $sum: "$grandTotal" } } },
         ]),
       ]);

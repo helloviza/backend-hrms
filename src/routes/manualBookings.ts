@@ -7,7 +7,12 @@ import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
-import ManualBooking, { ATTACHMENT_REQUIRED_TYPES, isNewModelLineItems } from "../models/ManualBooking.js";
+import ManualBooking, {
+  ATTACHMENT_REQUIRED_TYPES,
+  isNewModelLineItems,
+  MANUAL_BOOKING_TYPES,
+  ALL_SUB_STATUSES,
+} from "../models/ManualBooking.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import Customer from "../models/Customer.js";
@@ -15,7 +20,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import Invoice from "../models/Invoice.js";
 import User from "../models/User.js";
-import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
+import { buildSearchFilter, applyInvoiceFilter } from "./manualBookings.filters.js";
 import { canAccessBooking, isHouseCallerContext } from "../utils/bookingAccess.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
@@ -50,6 +55,13 @@ const attachmentUpload = multer({
 // would otherwise hide them from every non-ALL-scope triage staffer.
 const HOUSE_CUSTOMER_ID = "6a4e0d2ea90c293c9e129f48";
 
+/* Enum value lists for the multi-select filters. status/source/assignmentStatus
+ * have no exported constant on the model (unlike MANUAL_BOOKING_TYPES and
+ * ALL_SUB_STATUSES), so they are restated here against the schema's own enum
+ * arrays in models/ManualBooking.ts. Note `DONE` is deliberately absent from
+ * BOOKING_STATUSES — it was an option in the UI dropdown that the schema never
+ * accepted, so it always returned zero rows. */
+
 router.use(requireAuth);
 
 /* ── Helpers ────────────────────────────────────────────────────── */
@@ -76,66 +88,98 @@ function bookingTypeToVoucherHint(bookingType?: string): VoucherType {
   return bookingType === "HOTEL" || bookingType === "DUMMY_HOTEL" ? "hotel" : "flight";
 }
 
-function buildSearchFilter(query: Record<string, any>) {
-  const filter: Record<string, any> = {};
+/**
+ * applyBookingReadGates — THE access gates every ManualBooking read must carry.
+ *
+ * Extracted from the list handler, which was the only caller that had them.
+ * GET /export ran buildSearchFilter + applyInvoiceFilter and then queried with
+ * NO tenant gate, NO own-scope gate and NO isActive clause — so a caller who
+ * could not see another tenant's bookings in the list could still download
+ * them (with cost and margin columns) by hitting the export URL with the same
+ * query string. Both callers now share this one copy.
+ *
+ * Mutates `filter` in place, matching applyInvoiceFilter's convention directly
+ * above. Call it AFTER buildSearchFilter (it has to lift the $or that free-text
+ * search may have installed) and before/after applyInvoiceFilter indifferently
+ * — that one only writes the sibling scalars `invoiceId` / `_id`.
+ *
+ * THREE GATES, in the order the list applied them:
+ *
+ *  1. TENANT — bypassed ONLY for SuperAdmin and HOUSE staff, who genuinely
+ *     manage every tenant. Explicitly NOT bypassed for permissionScope "ALL":
+ *     ALL is an access breadth within a tenant, not a cross-tenant licence,
+ *     and treating it as one is exactly the hole just closed on the invoices
+ *     routes (where every live holder of the grant had scope ALL). Probes both
+ *     id-spaces because ManualBooking.workspaceId is a Customer._id while
+ *     req.workspaceObjectId is a CustomerWorkspace._id. Fails CLOSED.
+ *
+ *  2. OWN-SCOPE — for non-ALL callers only: their own rows, plus the HOUSE
+ *     intake carve-outs (unassigned triage rows, and rows assigned to them).
+ *     Booking-workflow specific; this is the tier that has no invoice analogue.
+ *
+ *  3. SOFT DELETE — deleted rows hidden unless a SUPERADMIN asks for them.
+ *
+ * isDemo is NOT here: buildSearchFilter already sets `isDemo: {$ne: true}`
+ * unconditionally, and both callers run it, so demo rows were already excluded
+ * from the export. Keeping it there rather than duplicating it here preserves
+ * the single copy.
+ *
+ * TRAP: clauses are PUSHED onto $and, never assigned over it, and the lifted
+ * $or is re-added as an $and entry rather than left as a sibling — a later
+ * `filter.$or = …` or `filter.$and = […]` anywhere downstream would silently
+ * drop every gate above.
+ */
+function applyBookingReadGates(req: any, filter: Record<string, any>): void {
+  const accessCtx = bookingAccessContextFromReq(req);
+  const isAllScope = req.permissionScope === "ALL";
+  const selfId = accessCtx.callerId;
 
-  // Bug 5 fix: explicit ObjectId cast so the query is always typed correctly
-  if (query.workspaceId) {
-    try {
-      filter.workspaceId = new mongoose.Types.ObjectId(query.workspaceId);
-    } catch {
-      filter._id = { $in: [] }; // invalid id → force empty result
+  const andClauses: any[] = [];
+  if (filter.$or) {
+    // buildSearchFilter may already own $or (free-text search) — AND it in
+    // alongside whatever gets added below instead of clobbering it.
+    andClauses.push({ $or: filter.$or });
+    delete filter.$or;
+  }
+
+  // 1. Tenant gate (infra/audit/manual-bookings-access-verification.md).
+  if (!accessCtx.isSuperAdmin && !isHouseCallerContext(accessCtx)) {
+    const tenantOr: any[] = [];
+    if (accessCtx.customerId && mongoose.Types.ObjectId.isValid(accessCtx.customerId)) {
+      tenantOr.push({ workspaceId: new mongoose.Types.ObjectId(accessCtx.customerId) });
     }
+    if (accessCtx.workspaceObjectId) {
+      tenantOr.push({ workspaceId: accessCtx.workspaceObjectId });
+    }
+    // No resolvable tenant identity for a non-HOUSE caller — fail closed
+    // rather than skip the gate.
+    andClauses.push(tenantOr.length ? { $or: tenantOr } : { _id: { $in: [] } });
   }
 
-  if (query.status) filter.status = query.status;
-  if (query.type) filter.type = query.type;
-  if (query.source) filter.source = query.source;
-  if (query.givenBy) filter.givenBy = new RegExp(query.givenBy, "i");
-  if (query.sector) filter.sector = new RegExp(query.sector, "i");
-  if (query.week) filter.bookingWeek = parseInt(query.week);
-  if (query.month) filter.bookingMonth = query.month;
-  if (query.sourceBookingId) filter.sourceBookingId = query.sourceBookingId;
-
-  // createdBy is stored as a plain string (String(user._id))
-  if (query.createdBy) filter.createdBy = String(query.createdBy);
-
-  // Filter bookingDate (what the UI column shows). YYYY-MM-DD inputs are
-  // interpreted as IST calendar days; full last day is included.
-  if (query.dateFrom || query.dateTo) {
-    filter.bookingDate = {};
-    if (query.dateFrom) filter.bookingDate.$gte = parseISTStart(query.dateFrom);
-    if (query.dateTo)   filter.bookingDate.$lte = parseISTEnd(query.dateTo);
-  }
-
-  if (query.search) {
-    const re = new RegExp(query.search, "i");
-    filter.$or = [
-      { bookingRef: re },
-      { sourceBookingRef: re },
-      { supplierPNR: re },
-      { "passengers.name": re },
-      { sector: re },
-      { givenBy: re },
+  // 2. Own-scope gate — own bookings only, plus the HOUSE triage carve-outs.
+  if (!isAllScope) {
+    const scopeOr = [
+      { createdBy: selfId },
+      { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignmentStatus: "PENDING_TO_ASSIGN" },
+      // Once a HOUSE intake row is ASSIGNED, assignmentStatus no longer
+      // matches the clause above and createdBy is still the System Intake
+      // User (never the assignee) — without this, the assignee loses their
+      // own assigned booking from the list the moment it's assigned to them.
+      { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignPerson: new mongoose.Types.ObjectId(selfId) },
     ];
+    andClauses.push({ $or: scopeOr });
   }
 
-  // Demo Platform — exclude demo bookings from admin manual-bookings views.
-  filter.isDemo = { $ne: true };
+  if (andClauses.length) {
+    filter.$and = [...(filter.$and || []), ...andClauses];
+  }
 
-  return filter;
-}
-
-// Bug 3 fix: async invoice-number filter applied after buildSearchFilter
-async function applyInvoiceFilter(filter: Record<string, any>, invoiceNo: string) {
-  const matches = await Invoice.find({
-    invoiceNo: { $regex: invoiceNo, $options: "i" },
-  }).select("_id").lean();
-  const ids = matches.map((inv: any) => inv._id);
-  if (ids.length === 0) {
-    filter._id = { $in: [] };
+  // 3. Soft delete — hide deleted rows unless SuperAdmin explicitly asks.
+  const callerIsSuperAdmin = Array.isArray(req.user?.roles) && req.user.roles.includes("SUPERADMIN");
+  if (req.query?.showDeleted === "true" && callerIsSuperAdmin) {
+    filter.isActive = false;
   } else {
-    filter.invoiceId = { $in: ids };
+    filter.isActive = { $ne: false };
   }
 }
 
@@ -330,8 +374,80 @@ function maskPassengerPII(passengers: any[] | undefined): any[] | undefined {
   }));
 }
 
+/* ── Internal-money masking ───────────────────────────────────────────
+ *
+ * WHAT: our cost and our margin. These are Plumtrips' own commercial
+ * numbers, not the customer's — the customer's number is what they pay
+ * (quotedPrice / grandTotal / gstAmount), and that still ships to everyone.
+ *
+ * WHY IT IS DONE HERE AND NOT WITH .select() OR A HIDDEN COLUMN: a
+ * projection is easy to widen by accident on the next edit, and column
+ * visibility is browser state the caller controls outright. Stripping the
+ * keys off the outgoing object — exactly how maskPassengerPII already works
+ * — means the field is absent from the JSON no matter what the caller asks
+ * for. Absent, not zeroed: a 0 is indistinguishable from a real 0 margin.
+ *
+ * PREDICATE: the tenant gate's own test, verbatim — SuperAdmin, or a HOUSE
+ * caller (applyBookingReadGates step 1 uses
+ * `!isSuperAdmin && !isHouseCallerContext` to decide who may see other
+ * tenants' rows at all). NOTE this is deliberately STRICTER than
+ * `permissionScope === "ALL"`: a tenant admin can hold ALL scope within
+ * their own workspace (the seeded admin@northwind.local is exactly that)
+ * and they are a CUSTOMER — our cost is none of their business. Scope
+ * answers "which rows", this answers "which fields", and they are not the
+ * same question.
+ */
+const WITHHELD_PRICING_FIELDS = [
+  "supplierCost",
+  // actualPrice is supplierCost's twin — the export's "Actual Price" column
+  // is literally `actualPrice ?? supplierCost`. Withholding one and not the
+  // other would leave the cost on the wire under its other name.
+  "actualPrice",
+  "markupAmount",
+  "profitMargin",
+  "basePrice",   // rendered as "Base Profit" in the admin table
+  "diff",        // quoted − actual, i.e. the margin by subtraction
+] as const;
+
+export function canSeeBookingInternals(req: any): boolean {
+  const ctx = bookingAccessContextFromReq(req);
+  return Boolean(ctx.isSuperAdmin) || isHouseCallerContext(ctx);
+}
+
+/**
+ * Returns a copy of the booking with every internal-money field removed —
+ * from `pricing` AND from the per-line `lineItems[].actualRate`, which is the
+ * same cost expressed one row down and would otherwise walk straight past a
+ * pricing-only mask.
+ */
+export function maskBookingInternals<T extends Record<string, any>>(b: T): T {
+  const out: any = { ...b };
+
+  if (out.pricing && typeof out.pricing === "object") {
+    const pricing = { ...out.pricing };
+    for (const f of WITHHELD_PRICING_FIELDS) delete pricing[f];
+    out.pricing = pricing;
+  }
+
+  if (Array.isArray(out.lineItems)) {
+    out.lineItems = out.lineItems.map((li: any) =>
+      li && typeof li === "object" && "actualRate" in li
+        ? (({ actualRate, ...rest }) => rest)(li)
+        : li,
+    );
+  }
+
+  return out as T;
+}
+
 // One flat cell per booking — see the "Line Items" column comment above.
-export function formatLineItems(b: any): string {
+//
+// `includeCost` DEFAULTS TO FALSE, and that default is the safety property:
+// this function is shared with the CUSTOMER-facing /api/my-bookings export
+// (routes/myBookings.ts), which reads real ManualBooking documents — so the
+// two-rate branch below used to print our supplier rate ("cost ₹…") into a
+// customer's own downloaded spreadsheet. Only the staff export opts in.
+export function formatLineItems(b: any, includeCost = false): string {
   const items: any[] = Array.isArray(b.lineItems) ? b.lineItems : [];
   if (!items.length) return "";
   // Legacy (pre two-rate) bookings keep their original single-rate rendering.
@@ -341,17 +457,31 @@ export function formatLineItems(b: any): string {
       .join(" | ");
   }
 
-  // Staff-only export — this sheet already carries an "Actual Price" column,
-  // so the supplier rate is shown here too. The customer-facing invoice never
-  // prints it (utils/invoiceLineItems.ts).
+  // The supplier rate is shown ONLY when the caller has opted in — i.e. the
+  // privileged staff export, whose sheet already carries an "Actual Price"
+  // column. The customer-facing invoice never prints it
+  // (utils/invoiceLineItems.ts), and neither does the customer export.
   return items
-    .map((li) =>
-      `${li.sNo}. ${li.itemDescription} — Qty ${li.quantity} x ₹${li.quotedRate}` +
-      ` (cost ₹${li.actualRate ?? 0}, GST ₹${li.gstAmount ?? 0}) = ₹${li.amount}`)
+    .map((li) => {
+      const cost = includeCost ? `cost ₹${li.actualRate ?? 0}, ` : "";
+      return `${li.sNo}. ${li.itemDescription} — Qty ${li.quantity} x ₹${li.quotedRate}` +
+        ` (${cost}GST ₹${li.gstAmount ?? 0}) = ₹${li.amount}`;
+    })
     .join(" | ");
 }
 
-function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = {}, tidMap: Record<string, string> = {}): (string | number | undefined)[] {
+// `redacted` blanks the three internal-money cells rather than letting them
+// fall through to their `?? 0` defaults: a 0 in "Actual Price" next to a real
+// "Quoted Price" reads as 100% margin, which is a worse answer than an empty
+// cell. The row shape (and therefore the column count and the XLSX totals
+// row) is identical either way.
+function bookingToRow(
+  b: any,
+  srNo: number,
+  wsNameMap: Record<string, string> = {},
+  tidMap: Record<string, string> = {},
+  redacted = false,
+): (string | number | undefined)[] {
   const wsName =
     wsNameMap[b.workspaceId?.toString() ?? ""] ||
     b.workspaceId?.name || b.workspaceId?.companyName || String(b.workspaceId ?? "");
@@ -388,10 +518,10 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
     fmtDateDMY(b.travelDate),
     fmtDateDMY(b.returnDate),
     b.pricing?.quotedPrice ?? b.pricing?.sellingPrice ?? 0,
-    b.pricing?.actualPrice ?? b.pricing?.supplierCost ?? 0,
-    b.pricing?.diff ?? b.pricing?.markupAmount ?? 0,
+    redacted ? "" : (b.pricing?.actualPrice ?? b.pricing?.supplierCost ?? 0),
+    redacted ? "" : (b.pricing?.diff ?? b.pricing?.markupAmount ?? 0),
     b.pricing?.gstAmount ?? 0,
-    b.pricing?.basePrice ?? 0,
+    redacted ? "" : (b.pricing?.basePrice ?? 0),
     b.pricing?.grandTotal ?? b.pricing?.quotedPrice ?? 0,
     b.status ?? "",
     b.subStatus ?? "",
@@ -411,7 +541,7 @@ function bookingToRow(b: any, srNo: number, wsNameMap: Record<string, string> = 
     b.itinerary?.roomCount ?? "",
     b.itinerary?.description ?? "",
     b.supplierPNR ?? "",
-    formatLineItems(b),
+    formatLineItems(b, !redacted),
     b.itinerary?.pickupLocation ?? "",
     b.itinerary?.dropLocation ?? "",
     b.itinerary?.vehicleType ?? "",
@@ -545,63 +675,9 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     const limit = Math.min(200, parseInt(req.query.limit) || 25);
     const filter = buildSearchFilter(req.query);
 
-    // Scope non-ALL users to their own bookings only — with a bypass for
-    // HOUSE intake rows still awaiting triage (see HOUSE_CUSTOMER_ID above),
-    // since those are createdBy=SYSTEM_INTAKE_USER_ID, never the viewing staffer.
-    const accessCtx = bookingAccessContextFromReq(req);
-    const isAllScope = req.permissionScope === "ALL";
-    const selfId = accessCtx.callerId;
-
-    const andClauses: any[] = [];
-    if (filter.$or) {
-      // buildSearchFilter may already own $or (free-text search) — AND it in
-      // alongside whatever gets added below instead of clobbering it.
-      andClauses.push({ $or: filter.$or });
-      delete filter.$or;
-    }
-
-    // Tenant gate (infra/audit/manual-bookings-access-verification.md) — HOUSE
-    // staff and SuperAdmin manage all tenants and are exempt. Everyone else,
-    // including ALL-scope holders, is restricted to their own tenant, checked
-    // in both id-spaces (ManualBooking.workspaceId is a Customer._id;
-    // req.workspaceObjectId is a CustomerWorkspace._id — see bookingAccess.ts).
-    if (!accessCtx.isSuperAdmin && !isHouseCallerContext(accessCtx)) {
-      const tenantOr: any[] = [];
-      if (accessCtx.customerId && mongoose.Types.ObjectId.isValid(accessCtx.customerId)) {
-        tenantOr.push({ workspaceId: new mongoose.Types.ObjectId(accessCtx.customerId) });
-      }
-      if (accessCtx.workspaceObjectId) {
-        tenantOr.push({ workspaceId: accessCtx.workspaceObjectId });
-      }
-      // No resolvable tenant identity for a non-HOUSE caller — fail closed
-      // rather than skip the gate.
-      andClauses.push(tenantOr.length ? { $or: tenantOr } : { _id: { $in: [] } });
-    }
-
-    if (!isAllScope) {
-      const scopeOr = [
-        { createdBy: selfId },
-        { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignmentStatus: "PENDING_TO_ASSIGN" },
-        // Once a HOUSE intake row is ASSIGNED, assignmentStatus no longer
-        // matches the clause above and createdBy is still the System Intake
-        // User (never the assignee) — without this, the assignee loses their
-        // own assigned booking from the list the moment it's assigned to them.
-        { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignPerson: new mongoose.Types.ObjectId(selfId) },
-      ];
-      andClauses.push({ $or: scopeOr });
-    }
-
-    if (andClauses.length) {
-      filter.$and = [...(filter.$and || []), ...andClauses];
-    }
-
-    // Soft delete filter — hide deleted rows unless SuperAdmin requests them
-    const isSuperAdmin = Array.isArray(req.user.roles) && req.user.roles.includes("SUPERADMIN");
-    if (req.query.showDeleted === "true" && isSuperAdmin) {
-      filter.isActive = false;
-    } else {
-      filter.isActive = { $ne: false };
-    }
+    // Tenant + own-scope + soft-delete gates — shared verbatim with GET /export
+    // (see applyBookingReadGates above), which previously had none of them.
+    applyBookingReadGates(req, filter);
 
     // Bug 3 fix: resolve invoice number to booking invoiceId
     if (req.query.invoiceNo) await applyInvoiceFilter(filter, req.query.invoiceNo);
@@ -614,6 +690,15 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
         .populate("bookedBy", "name email")
         .populate("workspaceId", "name companyName")
         .populate("invoiceId", "invoiceNo status")
+        // Assignee display name for the list's "Assigned to" column. The
+        // denormalised ManualBooking.assignPersonName is declared on the model
+        // and read by GET /assignees, but NOTHING in this codebase ever writes
+        // it — it is null on every row — so the column has to resolve the name
+        // through the ref. Projected to `name` ALONE and nothing else: this
+        // list is reachable by any manualBookings:READ holder, so a broader
+        // projection here would hand out staff email addresses (and, on a User
+        // doc, far worse) to callers who were only asking who owns a booking.
+        .populate("assignPerson", "name")
         .lean(),
       ManualBooking.countDocuments(filter),
       // Bug 4 fix: aggregate over the full filtered set, not just the current page.
@@ -656,18 +741,30 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
       clientNameMap[c._id.toString()] = c.legalName || c.name || c.companyName || "";
     });
 
-    const enriched = docs.map((b: any) => ({
-      ...b,
-      clientName: clientNameMap[b.workspaceId?.toString()] || "",
-      invoicePendingDays: invoicePendingDays(b),
-      // panNo/passportNo masked to last-4 unless the caller is SUPERADMIN —
-      // this list is reachable by any manualBookings:READ holder, not just
-      // the staff actually servicing the booking (see docs/audits/
-      // traveller-profiles-scoping.md §4.2).
-      passengers: accessCtx.isSuperAdmin ? b.passengers : maskPassengerPII(b.passengers),
-    }));
+    // Re-derived here purely for the PII-masking decision below. It used to
+    // be a by-product of the gate assembly that now lives in
+    // applyBookingReadGates; this response-shaping concern is separate from
+    // access filtering, so it names its own dependency rather than relying on
+    // a variable left behind by the gates.
+    const accessCtx = bookingAccessContextFromReq(req);
+    const seeInternals = canSeeBookingInternals(req);
 
-    console.log('[manualBookings GET] enriched[0].clientName:', enriched?.[0]?.clientName);
+    const enriched = docs.map((b: any) => {
+      const row = {
+        ...b,
+        clientName: clientNameMap[b.workspaceId?.toString()] || "",
+        invoicePendingDays: invoicePendingDays(b),
+        // panNo/passportNo masked to last-4 unless the caller is SUPERADMIN —
+        // this list is reachable by any manualBookings:READ holder, not just
+        // the staff actually servicing the booking (see docs/audits/
+        // traveller-profiles-scoping.md §4.2).
+        passengers: accessCtx.isSuperAdmin ? b.passengers : maskPassengerPII(b.passengers),
+      };
+      // Cost/margin stripped for anyone outside HOUSE — see the mask's own
+      // doc comment. Done last so it also covers anything spread in above.
+      return seeInternals ? row : maskBookingInternals(row);
+    });
+
     res.json({
       ok: true,
       docs: enriched,
@@ -678,9 +775,13 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
         grossSales,
         netSales,
         gstPayable,
-        netProfit,
+        // netProfit is Σ pricing.basePrice and avgMargin is derived from it —
+        // the same internal numbers the row mask strips, re-exposed in
+        // aggregate. Masking the rows and leaving these would hand over the
+        // margin for the whole filtered set in one field.
+        netProfit: seeInternals ? netProfit : 0,
         bookingCount:    total,
-        avgMargin,
+        avgMargin: seeInternals ? avgMargin : 0,
         pendingInvoices: aggStats.pendingInvoices,
       },
     });
@@ -694,6 +795,10 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
 router.get("/export", requirePermission("manualBookings", "FULL"), async (req: any, res: any) => {
   try {
     const filter = buildSearchFilter(req.query);
+    // LEAK 2: this handler used to stop here. Same three gates as the list —
+    // without them, anything hidden from the list was still downloadable from
+    // the export, cost and margin columns included.
+    applyBookingReadGates(req, filter);
     if (req.query.invoiceNo) await applyInvoiceFilter(filter, req.query.invoiceNo);
     const format = req.query.format === "xlsx" ? "xlsx" : "csv";
     const docs = await ManualBooking.find(filter)
@@ -736,13 +841,19 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
       }
     }
 
+    // Same predicate, same strip as the list handler — the export is just
+    // another read of the same rows, and before the gates landed it was the
+    // easier of the two to walk off with.
+    const seeInternals = canSeeBookingInternals(req);
+    const redacted = !seeInternals;
+
     if (format === "csv") {
       res.setHeader("Content-Type", "text/csv");
       res.setHeader("Content-Disposition", 'attachment; filename="bookings-export.csv"');
 
       res.write(csvRow(BOOKING_COLUMNS));
       docs.forEach((b, idx) => {
-        res.write(csvRow(bookingToRow(b, idx + 1, wsNameMap, tidMap)));
+        res.write(csvRow(bookingToRow(b, idx + 1, wsNameMap, tidMap, redacted)));
       });
       res.end();
       return;
@@ -776,7 +887,7 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     MONEY_COLS.forEach((ci) => { totals[ci] = 0; });
 
     docs.forEach((b, idx) => {
-      const row = bookingToRow(b, idx + 1, wsNameMap, tidMap);
+      const row = bookingToRow(b, idx + 1, wsNameMap, tidMap, redacted);
       sheet.addRow(row);
       MONEY_COLS.forEach((ci) => {
         totals[ci] = (totals[ci] || 0) + (Number(row[ci - 1]) || 0);
@@ -1408,6 +1519,28 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
 
 // GET /api/admin/manual-bookings/creators
 // Returns the distinct set of staff users who have created at least one booking
+// GET /api/admin/manual-bookings/assignees
+// Distinct assignPerson values, for the "Assigned to" filter dropdown. Same
+// shape and same rationale as /creators below: an exact-match id dropdown
+// instead of a free-text box keeps the query on the indexed assignPerson path.
+//
+// assignPersonName is denormalised onto the booking, so the label needs no
+// $lookup — unlike /creators, whose createdBy is a bare string id.
+router.get("/assignees", requirePermission("manualBookings", "READ"), async (_req: any, res: any) => {
+  try {
+    const raw = await ManualBooking.aggregate([
+      { $match: { assignPerson: { $ne: null }, isDemo: { $ne: true } } },
+      { $group: { _id: "$assignPerson", name: { $last: "$assignPersonName" } } },
+      { $project: { _id: 1, name: { $ifNull: ["$name", ""] } } },
+      { $sort: { name: 1 } },
+    ]);
+    res.json({ ok: true, assignees: raw.map((a: any) => ({ _id: String(a._id), name: a.name })) });
+  } catch (err: any) {
+    console.error("[ManualBookings assignees]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get("/creators", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
   try {
     const raw = await ManualBooking.aggregate([
