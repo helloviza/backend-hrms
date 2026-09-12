@@ -1,14 +1,14 @@
 import mongoose from "mongoose";
 import CRMCompany from "../models/CRMCompany.js";
+import { normalizeCompanyName } from "./companyName.js";
 
 /**
- * Canonical company-name normalization: trim, collapse internal whitespace to a
- * single space, lowercase. This is the dedupe key (CRMCompany.nameNormalized)
- * and the only thing resolve-or-create matches on.
+ * Canonical company-name normalization now lives in utils/companyName.ts (a
+ * leaf module the CRMCompany model can also import without a cycle). Re-exported
+ * here so scripts/backfill-lead-companyId.ts and any other existing importer
+ * keep working unchanged.
  */
-export function normalizeCompanyName(s: string): string {
-  return String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
-}
+export { normalizeCompanyName };
 
 export interface ResolveCompanyInput {
   name: string;
