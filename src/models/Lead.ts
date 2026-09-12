@@ -1,5 +1,25 @@
 import mongoose, { Document, Schema } from "mongoose";
+import { isCrmV2OpportunityEnabled } from "../config/crmV2.js";
+import {
+  LEAD_STATUSES,
+  SOURCE_CHANNELS,
+  ENQUIRY_TYPES,
+  STATUS_TO_LEGACY_STAGE,
+  legacyStageToStatus,
+  type LeadStatus,
+  type SourceChannel,
+  type EnquiryType,
+} from "./crmTaxonomy.js";
+import { TravelRequirementSchema, type TravelRequirement } from "./travelRequirement.js";
 
+// ── Phase 1 / Slice 2 (CRM_V2_OPPORTUNITY) ───────────────────────────
+// `stage` below is the LEGACY 9-value sales pipeline. It is kept — readable,
+// still written, still indexed — because (a) the unchanged frontend reads it,
+// (b) the migration reads it, and (c) gap analysis §4.4 keeps it populated
+// until Phase 2 sign-off. The new intake taxonomy lives in `status`
+// (models/crmTaxonomy.ts), and the commercial lifecycle moved to
+// models/Opportunity.ts. Under the flag the pre-validate hook keeps the two
+// columns coherent; with the flag off nothing touches the new paths.
 export const LEAD_STAGES = [
   "new", "email_sent", "contacted", "demo_scheduled", "proposal_sent",
   "negotiation", "follow_up", "won", "lost",
@@ -67,6 +87,22 @@ export interface LeadDoc extends Document {
   // for display/search/export. null for individuals / blank-company leads.
   companyId?: mongoose.Types.ObjectId | null;
 
+  // ── Slice 2 (CRM_V2_OPPORTUNITY) — additive, all optional ──
+  /** New intake taxonomy (PRD E). null on rows written before Slice 2 —
+   *  read it through effectiveLeadStatus(), never raw. */
+  status?: LeadStatus | null;
+  /** source_channel / enquiry_type split (PRD E): `source` stays as the
+   *  legacy overloaded field; sourceChannel is a lossless copy of it plus
+   *  the PRD channels, enquiryType is what the prospect asked for. */
+  sourceChannel: SourceChannel | "";
+  enquiryType: EnquiryType | "";
+  /** Intake snapshot (gap §5 — embedded, captured once, promotable). */
+  travelRequirement: TravelRequirement;
+  /** Back-ref to the Opportunity this lead converted into (one per lead). */
+  opportunityId?: mongoose.Types.ObjectId | null;
+  /** Reserved (decision A). Never read, never written. */
+  workspaceId?: mongoose.Types.ObjectId | null;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -124,6 +160,17 @@ const LeadSchema = new Schema<LeadDoc>(
       ref: "CRMCompany",
       default: null,
     },
+
+    // ── Slice 2 (CRM_V2_OPPORTUNITY) — additive, all optional / defaulted ──
+    // No default on `status`: a defaulted "NEW" would lie about every legacy
+    // row on hydration (a won lead would read NEW). Absent means "derive from
+    // stage" — see effectiveLeadStatus().
+    status: { type: String, enum: [...LEAD_STATUSES, null], default: null },
+    sourceChannel: { type: String, enum: [...SOURCE_CHANNELS, ""], default: "" },
+    enquiryType: { type: String, enum: [...ENQUIRY_TYPES, ""], default: "" },
+    travelRequirement: { type: TravelRequirementSchema, default: () => ({}) },
+    opportunityId: { type: Schema.Types.ObjectId, ref: "Opportunity", default: null },
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", default: null },
   },
   { timestamps: true }
 );
@@ -134,6 +181,38 @@ LeadSchema.index({ source: 1 });
 LeadSchema.index({ createdAt: -1 });
 LeadSchema.index({ companyId: 1 });
 LeadSchema.index({ leadCode: 1 }, { unique: true, sparse: true });
+LeadSchema.index({ status: 1 }, { sparse: true });
+LeadSchema.index({ opportunityId: 1 }, { sparse: true });
+
+/** The lead's status in the new taxonomy, whether or not the row has been
+ *  migrated: the stored `status` when present, else derived from the legacy
+ *  `stage` through the one transition table. Works on lean rows. */
+export function effectiveLeadStatus(lead: { status?: string | null; stage?: string | null }): LeadStatus {
+  const s = lead?.status;
+  if (s && (LEAD_STATUSES as readonly string[]).includes(s)) return s as LeadStatus;
+  return legacyStageToStatus(lead?.stage);
+}
+
+// Flag ON only: keep `status` and the legacy `stage` coherent on every save.
+//   • a legacy write (routes set `stage`)  → derive `status`
+//   • a new-taxonomy write (sets `status`) → derive the mildest legacy `stage`
+//     so the unchanged frontend still places the card somewhere sensible
+//   • `sourceChannel` is a lossless copy of `source` until a caller sets it
+// Flag OFF: byte-for-byte legacy — none of the new paths are touched.
+LeadSchema.pre("validate", function (next) {
+  if (!isCrmV2OpportunityEnabled()) return next();
+  const stageChanged = this.isNew || this.isModified("stage");
+  const statusChanged = this.isModified("status");
+  if (statusChanged && !stageChanged && this.status) {
+    this.stage = STATUS_TO_LEGACY_STAGE[this.status];
+  } else if (stageChanged || !this.status) {
+    this.status = legacyStageToStatus(this.stage);
+  }
+  if (!this.sourceChannel && this.source) {
+    this.sourceChannel = this.source as SourceChannel;
+  }
+  next();
+});
 
 LeadSchema.pre("save", async function (next) {
   if (this.leadCode) return next();
