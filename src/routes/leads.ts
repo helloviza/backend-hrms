@@ -1,8 +1,11 @@
 import express from "express";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
-import Lead, { LEAD_STAGES, LEAD_SOURCES } from "../models/Lead.js";
+import Lead, { LEAD_STAGES, LEAD_SOURCES, effectiveLeadStatus } from "../models/Lead.js";
 import LeadActivity, { ACTIVITY_TYPES } from "../models/LeadActivity.js";
+import Opportunity from "../models/Opportunity.js";
+import { isCrmV2OpportunityEnabled } from "../config/crmV2.js";
+import { applyLegacyStageTransition, automationTriggerForPlan } from "../services/leadSplit.js";
 import CRMCompany from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
 import { resolveOrCreateCompany } from "../utils/crmCompany.js";
@@ -51,6 +54,37 @@ async function resolveUserName(uid: string): Promise<string> {
     `${u.firstName || ""} ${u.lastName || ""}`.trim() ||
     (u.email ? String(u.email).trim() : "")
   );
+}
+
+// ── Slice 2 (CRM_V2_OPPORTUNITY): split hook for the legacy stage routes ──
+// The unchanged frontend keeps sending the 9 legacy stage values. With the
+// flag on, every route that sets Lead.stage calls this AFTER its own save (so
+// the model hook has already derived Lead.status) and the split service
+// creates/advances/closes the lead's Opportunity to match, logs a demo for
+// demo_scheduled, and hands back the trigger key for the new taxonomy
+// (legacy keys resolve as aliases inside triggerTaskAutomation). With the
+// flag off this is a no-op and the caller fires its legacy trigger.
+async function runOpportunitySplit(
+  lead: any,
+  user: AnyObj,
+): Promise<{ triggered: boolean; opportunityId: string | null }> {
+  if (!isCrmV2OpportunityEnabled()) return { triggered: false, opportunityId: null };
+  const actorId = mongoose.isValidObjectId(userId(user)) ? new mongoose.Types.ObjectId(userId(user)) : null;
+  const actorName = user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System";
+  const { plan, result } = await applyLegacyStageTransition(lead, { actorId, actorName });
+  const trig = automationTriggerForPlan(plan);
+  if (trig) {
+    const isOpp = trig.entityType === "OPPORTUNITY" && result.opportunityId;
+    triggerTaskAutomation(trig.key, {
+      workspaceId: SYSTEM_WORKSPACE_ID,
+      entityType: isOpp ? "OPPORTUNITY" : "LEAD",
+      entityId: isOpp ? new mongoose.Types.ObjectId(result.opportunityId!) : (lead._id as mongoose.Types.ObjectId),
+      entityRef: lead.leadCode,
+      ownerId: lead.assignedTo,
+      variables: { leadName: lead.contactName || lead.companyName || "Lead", ownerName: lead.assignedToName || "" },
+    }).catch(() => {});
+  }
+  return { triggered: !!trig, opportunityId: result.opportunityId };
 }
 
 // ── requireLeadsAccess ──────────────────────────────────────────
@@ -1155,7 +1189,14 @@ router.get("/:id", async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    return res.json({ lead, activities });
+    // Slice 2: the converted-to Opportunity rides along under the flag so a
+    // detail page can show the deal without a second round trip.
+    const opportunity =
+      isCrmV2OpportunityEnabled() && (lead as any).opportunityId
+        ? await Opportunity.findById((lead as any).opportunityId).lean()
+        : null;
+
+    return res.json({ lead, activities, ...(opportunity ? { opportunity } : {}) });
   } catch (err) {
     logger.error("leads GET /:id error", { err });
     return res.status(500).json({ error: "Failed to get lead." });
@@ -1188,6 +1229,8 @@ router.put("/:id", async (req, res) => {
       // companyId is resolved server-side from companyName/type below — never
       // accept it raw from the client.
       "companyId",
+      // Slice 2: derived by the model hook / the split service, never client-set.
+      "status", "opportunityId", "workspaceId",
     ]);
 
     const body = req.body as AnyObj;
@@ -1278,6 +1321,8 @@ router.put("/:id/stage", async (req, res) => {
 
     const user = (req as any).user as AnyObj;
     const fromStage = lead.stage;
+    const flagOn = isCrmV2OpportunityEnabled();
+    const fromStatus = flagOn ? effectiveLeadStatus(lead) : undefined;
 
     lead.stage = stage as LeadStage;
     if (stage === "follow_up" && nextFollowUpDate) {
@@ -1285,25 +1330,36 @@ router.put("/:id/stage", async (req, res) => {
     }
     await lead.save();
 
+    // fromStage/toStage keep the legacy vocabulary (what the frontend sent and
+    // renders). Under the flag the same row also records the LEAD-status
+    // transition in the new taxonomy and names its subject.
     await LeadActivity.create({
       leadId: lead._id,
       type: "stage_change" as ActivityType,
       note: note || `Stage changed from ${fromStage} to ${stage}`,
       fromStage: String(fromStage),
       toStage: String(stage),
+      ...(flagOn
+        ? { subject: { type: "LEAD", id: lead._id }, fromStatus, toStatus: effectiveLeadStatus(lead) }
+        : {}),
       createdBy: mongoose.isValidObjectId(userId(user))
         ? new mongoose.Types.ObjectId(userId(user))
         : undefined,
       createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
 
-    // Task automation hook for stage transitions
+    // Slice 2: under the flag the split service owns the Opportunity side
+    // effects AND the trigger (new keys, legacy aliases); the legacy stage
+    // map below is only used when the flag is off.
+    const split = await runOpportunitySplit(lead, user);
+
+    // Task automation hook for stage transitions (legacy keys, flag off)
     const stageMap: Record<string, string> = {
       contacted: "lead.stage_contacted",
       demo_scheduled: "lead.stage_demo",
       proposal_sent: "lead.stage_proposal",
     };
-    const stageTrigger = stageMap[stage];
+    const stageTrigger = flagOn ? undefined : stageMap[stage];
     if (stageTrigger) {
       triggerTaskAutomation(stageTrigger, {
         workspaceId: SYSTEM_WORKSPACE_ID,
@@ -1315,7 +1371,7 @@ router.put("/:id/stage", async (req, res) => {
       }).catch(() => {});
     }
 
-    return res.json({ lead });
+    return res.json({ lead, ...(split.opportunityId ? { opportunityId: split.opportunityId } : {}) });
   } catch (err) {
     logger.error("leads PUT /:id/stage error", { err });
     return res.status(500).json({ error: "Failed to update stage." });
@@ -1516,8 +1572,11 @@ router.post("/:id/win", async (req, res) => {
       createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
 
-    // Task automation hook
-    triggerTaskAutomation("lead.won", {
+    // Slice 2: Closed Won Opportunity + opportunity.won trigger under the flag.
+    const winSplit = await runOpportunitySplit(lead, user);
+
+    // Task automation hook (legacy key, flag off)
+    if (!winSplit.triggered) triggerTaskAutomation("lead.won", {
       workspaceId: SYSTEM_WORKSPACE_ID,
       entityType: "LEAD",
       entityId: lead._id as mongoose.Types.ObjectId,
@@ -1565,6 +1624,10 @@ router.post("/:id/lose", async (req, res) => {
         : undefined,
       createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
+
+    // Slice 2: under the flag a lead that ever reached the commercial process
+    // closes its Opportunity as lost; otherwise it is lost at the lead grain.
+    await runOpportunitySplit(lead, user);
 
     return res.json({ lead });
   } catch (err) {
@@ -1708,7 +1771,10 @@ router.post("/:id/convert", async (req, res) => {
       createdByName: byName,
     });
 
-    triggerTaskAutomation("lead.won", {
+    // Slice 2: Closed Won Opportunity + opportunity.won trigger under the flag.
+    const convertSplit = await runOpportunitySplit(lead, user);
+
+    if (!convertSplit.triggered) triggerTaskAutomation("lead.won", {
       workspaceId: SYSTEM_WORKSPACE_ID,
       entityType: "LEAD",
       entityId: lead._id as mongoose.Types.ObjectId,
