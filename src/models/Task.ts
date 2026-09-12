@@ -2,7 +2,7 @@ import mongoose, { Schema, Document } from 'mongoose'
 
 export const TASK_PRIORITIES = ['LOW', 'MEDIUM', 'HIGH', 'URGENT'] as const
 export const TASK_STATUSES = ['OPEN', 'IN_PROGRESS', 'DONE', 'CANCELLED'] as const
-export const TASK_LINKED_TYPES = ['LEAD', 'CONTACT', 'COMPANY', 'BOOKING', 'TICKET', 'INVOICE'] as const
+export const TASK_LINKED_TYPES = ['LEAD', 'CONTACT', 'COMPANY', 'BOOKING', 'TICKET', 'INVOICE', 'OPPORTUNITY'] as const
 
 export type TaskPriority = typeof TASK_PRIORITIES[number]
 export type TaskStatus = typeof TASK_STATUSES[number]

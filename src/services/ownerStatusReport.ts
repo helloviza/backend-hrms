@@ -13,8 +13,29 @@
 // stage values, day-bounded dates) — this service does the queries + math only.
 
 import mongoose from "mongoose";
-import Lead, { LEAD_STAGES } from "../models/Lead.js";
+import Lead, { LEAD_STAGES, effectiveLeadStatus } from "../models/Lead.js";
 import LeadActivity from "../models/LeadActivity.js";
+import Opportunity from "../models/Opportunity.js";
+import { isCrmV2OpportunityEnabled } from "../config/crmV2.js";
+import {
+  LEAD_STATUSES,
+  LEAD_STATUS_LABEL,
+  isClosedLeadStatus,
+  isClosedOpportunityStage,
+  closedStage,
+} from "../models/crmTaxonomy.js";
+
+// ── Slice 2 (CRM_V2_OPPORTUNITY) ──────────────────────────────────────
+// With the flag OFF every number below is computed exactly as before from
+// the legacy 9-stage Lead.stage. With the flag ON the report speaks the new
+// taxonomy: leads are bucketed by effectiveLeadStatus() (stored status, else
+// derived from stage — tolerant of unmigrated rows), "closed" at the lead
+// grain means CONVERTED / LOST, and the money numbers (won, lost, pipeline
+// value, stale potential) come from the leads' Opportunities rather than
+// from Lead.dealValue — a CONVERTED lead's deal is open on its Opportunity,
+// not on the lead. Stage FILTERS still arrive in the legacy vocabulary from
+// the unchanged frontend and still match Lead.stage, which the model hook
+// keeps populated under the flag.
 
 type AnyObj = Record<string, any>;
 
@@ -101,11 +122,21 @@ export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise
   if (sourceF.length) leadMatch.source = { $in: sourceF };
   if (typeF.length) leadMatch.type = { $in: typeF };
 
+  const v2 = isCrmV2OpportunityEnabled();
   const leads = (await Lead.find(leadMatch)
-    .select("_id assignedTo assignedToName stage source type dealValue currency createdAt")
+    .select("_id assignedTo assignedToName stage status opportunityId source type dealValue currency createdAt")
     .lean()) as any[];
 
   const leadIds = leads.map((l) => l._id);
+
+  // Flag on: the deal side of every lead, keyed by leadId (one per lead).
+  const oppByLead = new Map<string, any>();
+  if (v2 && leadIds.length) {
+    const opps = (await Opportunity.find({ leadId: { $in: leadIds } })
+      .select("_id leadId pipeline stage dealValue currency")
+      .lean()) as any[];
+    for (const o of opps) oppByLead.set(String(o.leadId), o);
+  }
   const activities = leadIds.length
     ? ((await LeadActivity.find({ leadId: { $in: leadIds } })
         .select("leadId type createdAt")
@@ -145,16 +176,49 @@ export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise
   const ownerLabel = (l: any) =>
     (l.assignedToName && String(l.assignedToName).trim()) ||
     (l.assignedTo ? "Unknown" : "Unassigned");
-  const STAGES = LEAD_STAGES as readonly string[];
-  const STAGE_LABEL = OWNER_STATUS_STAGE_LABEL;
-  const isClosed = (s: string) => s === "won" || s === "lost";
+  const STAGES = (v2 ? LEAD_STATUSES : LEAD_STAGES) as readonly string[];
+  const STAGE_LABEL = v2 ? (LEAD_STATUS_LABEL as Record<string, string>) : OWNER_STATUS_STAGE_LABEL;
+  // The bucket a lead falls in: new status (flag on) or legacy stage.
+  const bucketOf_ = (l: any): string => (v2 ? effectiveLeadStatus(l) : l.stage);
+  const isClosed = (s: string) => (v2 ? isClosedLeadStatus(s) : s === "won" || s === "lost");
+  // Deal outcome per lead. Flag off: the legacy stage IS the deal. Flag on:
+  // won = the lead's Opportunity is closed-won; lost = LOST at lead grain or
+  // Opportunity closed-lost.
+  const oppOf = (l: any) => oppByLead.get(String(l._id));
+  const isWon = (l: any): boolean => {
+    if (!v2) return l.stage === "won";
+    const o = oppOf(l);
+    return !!o && o.stage === closedStage(o.pipeline, "won");
+  };
+  const isLost = (l: any): boolean => {
+    if (!v2) return l.stage === "lost";
+    if (effectiveLeadStatus(l) === "LOST") return true;
+    const o = oppOf(l);
+    return !!o && o.stage === closedStage(o.pipeline, "lost");
+  };
+  // Open money on a lead: legacy dealValue, or the open Opportunity's value.
+  const openValue = (l: any): number => {
+    if (!v2) return Number(l.dealValue) || 0;
+    const o = oppOf(l);
+    if (!o || isClosedOpportunityStage(o.pipeline, o.stage)) return 0;
+    return Number(o.dealValue) || 0;
+  };
+  // "Open" for ageing/stale/pipeline: lead-grain open, OR (flag on) a lead
+  // whose Opportunity is still open — a stalled deal is still someone's work.
+  const isOpen = (l: any): boolean => {
+    const s = bucketOf_(l);
+    if (!isClosed(s)) return true;
+    if (!v2) return false;
+    const o = oppOf(l);
+    return !!o && !isClosedOpportunityStage(o.pipeline, o.stage);
+  };
   const r1 = (n: number) => Math.round(n * 10) / 10;
   const total = scoped.length;
 
   // ── S1 — status snapshot ──
   const statusCount: Record<string, number> = {};
   for (const s of STAGES) statusCount[s] = 0;
-  for (const l of scoped) statusCount[l.stage] = (statusCount[l.stage] || 0) + 1;
+  for (const l of scoped) statusCount[bucketOf_(l)] = (statusCount[bucketOf_(l)] || 0) + 1;
   const statusSnapshot = STAGES.map((s) => ({
     stage: s, label: STAGE_LABEL[s], count: statusCount[s],
     pct: total ? r1((statusCount[s] / total) * 100) : 0,
@@ -175,7 +239,7 @@ export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise
     owners: owners.map((o) => {
       const byStatus: Record<string, number> = {};
       for (const s of STAGES) byStatus[s] = 0;
-      for (const l of o.leads) byStatus[l.stage]++;
+      for (const l of o.leads) byStatus[bucketOf_(l)] = (byStatus[bucketOf_(l)] || 0) + 1;
       return { ownerId: o.ownerId, ownerName: o.ownerName, total: o.leads.length, byStatus };
     }),
   };
@@ -183,8 +247,8 @@ export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise
   // ── S3 — performance (conversion%, win% null-safe, avgAgeDays) ──
   const performance = owners.map((o) => {
     const t = o.leads.length;
-    const won = o.leads.filter((l) => l.stage === "won").length;
-    const lost = o.leads.filter((l) => l.stage === "lost").length;
+    const won = o.leads.filter(isWon).length;
+    const lost = o.leads.filter(isLost).length;
     const closed = won + lost;
     const ageSum = o.leads.reduce((s, l) => s + Math.max(0, Math.floor((now - l._created) / DAY)), 0);
     return {
@@ -205,7 +269,7 @@ export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise
   ];
   const daysSinceAct = (l: any) => Math.max(0, Math.floor((now - l._lastActivity) / DAY));
   const bucketOf = (d: number) => BUCKETS.find((b) => d >= b.min && d <= b.max)!.key;
-  const openLeads = scoped.filter((l) => !isClosed(l.stage));
+  const openLeads = scoped.filter(isOpen);
   const openTotal = openLeads.length;
   const ageingCount: Record<string, number> = {};
   for (const b of BUCKETS) ageingCount[b.key] = 0;
@@ -217,7 +281,7 @@ export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise
       pct: openTotal ? r1((ageingCount[b.key] / openTotal) * 100) : 0,
     })),
     byOwner: owners.map((o) => {
-      const open = o.leads.filter((l) => !isClosed(l.stage));
+      const open = o.leads.filter(isOpen);
       const bc: Record<string, number> = {};
       for (const b of BUCKETS) bc[b.key] = 0;
       for (const l of open) bc[bucketOf(daysSinceAct(l))]++;
@@ -235,8 +299,8 @@ export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise
   let totalPotential = 0;
   const staleByOwner = owners
     .map((o) => {
-      const staleLeads = o.leads.filter((l) => !isClosed(l.stage) && daysSinceAct(l) >= STALE_DAYS);
-      const potentialValue = staleLeads.reduce((s, l) => s + (Number(l.dealValue) || 0), 0);
+      const staleLeads = o.leads.filter((l) => isOpen(l) && daysSinceAct(l) >= STALE_DAYS);
+      const potentialValue = staleLeads.reduce((s, l) => s + openValue(l), 0);
       const criticalCount = staleLeads.filter((l) => daysSinceAct(l) >= CRIT_DAYS).length;
       totalStale += staleLeads.length;
       totalPotential += potentialValue;
@@ -257,9 +321,9 @@ export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise
   let anyValue = false;
   const pipelineByOwner = owners
     .map((o) => {
-      const open = o.leads.filter((l) => !isClosed(l.stage));
-      const pipelineValue = open.reduce((s, l) => s + (Number(l.dealValue) || 0), 0);
-      const valuedLeads = open.filter((l) => (Number(l.dealValue) || 0) > 0).length;
+      const open = o.leads.filter(isOpen);
+      const pipelineValue = open.reduce((s, l) => s + openValue(l), 0);
+      const valuedLeads = open.filter((l) => openValue(l) > 0).length;
       if (pipelineValue > 0) anyValue = true;
       totalPipeline += pipelineValue;
       return {
@@ -305,7 +369,7 @@ export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise
     })),
     byOwner: owners.map((o) => {
       const counts = actByOwner.get(o.ownerId)!;
-      const won = o.leads.filter((l) => l.stage === "won").length;
+      const won = o.leads.filter(isWon).length;
       return {
         ownerId: o.ownerId, ownerName: o.ownerName, activityCounts: counts,
         totalActivities: INTERACTION_TYPES.reduce((s, k) => s + counts[k], 0),

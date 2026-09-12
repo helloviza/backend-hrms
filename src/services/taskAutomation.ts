@@ -3,6 +3,7 @@ import Task from '../models/Task.js'
 import TaskAutomation from '../models/TaskAutomation.js'
 import User from '../models/User.js'
 import logger from '../utils/logger.js'
+import { TRIGGER_KEY_ALIASES } from '../config/defaultTaskAutomations.js'
 
 export interface TriggerContext {
   workspaceId: string
@@ -47,17 +48,28 @@ export async function triggerTaskAutomation(
   context: TriggerContext
 ): Promise<InstanceType<typeof Task> | null> {
   try {
-    const automation = await TaskAutomation.findOne({
-      workspaceId: context.workspaceId,
-      triggerKey,
-      enabled: true,
-    }).lean()
+    // Slice 2: a new-taxonomy key resolves to its own row first, then to the
+    // legacy alias row that may already exist in prod (config/
+    // defaultTaskAutomations.ts TRIGGER_KEY_ALIASES). Whichever row matched,
+    // the task is stamped with the key that was FIRED, and dedup looks at
+    // both spellings so a lead cannot get one task per vocabulary.
+    const alias = TRIGGER_KEY_ALIASES[triggerKey]
+    const keys = alias ? [triggerKey, alias] : [triggerKey]
+    let automation: any = null
+    for (const k of keys) {
+      automation = await TaskAutomation.findOne({
+        workspaceId: context.workspaceId,
+        triggerKey: k,
+        enabled: true,
+      }).lean()
+      if (automation) break
+    }
 
     if (!automation) return null
 
     // Dedup: skip if an open auto-task for this trigger+entity already exists
     const existing = await Task.findOne({
-      autoTriggerKey: triggerKey,
+      autoTriggerKey: { $in: keys },
       linkedId: context.entityId,
       status: { $nin: ['DONE', 'CANCELLED'] },
     }).lean()

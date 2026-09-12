@@ -1,7 +1,7 @@
 import mongoose, { Schema, Document } from 'mongoose'
 
 export const AUTOMATION_PRIORITIES = ['LOW', 'MEDIUM', 'HIGH', 'URGENT'] as const
-export const AUTOMATION_ENTITY_TYPES = ['LEAD', 'CONTACT', 'COMPANY', 'BOOKING', 'TICKET', 'INVOICE'] as const
+export const AUTOMATION_ENTITY_TYPES = ['LEAD', 'CONTACT', 'COMPANY', 'BOOKING', 'TICKET', 'INVOICE', 'OPPORTUNITY'] as const
 export const AUTOMATION_ASSIGNEE_RULE_TYPES = ['OWNER', 'SPECIFIC'] as const
 
 export type AutomationPriority = typeof AUTOMATION_PRIORITIES[number]

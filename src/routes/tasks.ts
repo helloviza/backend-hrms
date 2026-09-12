@@ -60,6 +60,11 @@ async function fetchLinkedRef(linkedType: string, linkedId: string): Promise<str
       const company = await CRMCompany.findById(linkedId).select('name').lean() as any
       if (company) return company.name || ''
     }
+    if (linkedType === 'OPPORTUNITY') {
+      const { default: Opportunity } = await import('../models/Opportunity.js')
+      const opp = await Opportunity.findById(linkedId).select('opportunityCode name').lean() as any
+      if (opp) return opp.opportunityCode || opp.name || ''
+    }
   } catch {
     // ref is cosmetic — don't fail task creation
   }

@@ -18,9 +18,34 @@
 //     "deal values not yet captured" state instead of a ₹0 headline.
 //   • Productivity % is explicitly flagged as derived (see meta.productivityNote).
 
-import Lead, { LEAD_STAGES, type LeadStage } from "../models/Lead.js";
+import Lead, { LEAD_STAGES, effectiveLeadStatus } from "../models/Lead.js";
 import LeadActivity from "../models/LeadActivity.js";
+import { isCrmV2OpportunityEnabled } from "../config/crmV2.js";
+import {
+  LEAD_STATUSES,
+  LEAD_STATUS_LABEL,
+  MILESTONES,
+  activityHitsMilestone,
+  isClosedLeadStatus,
+  stageLabel,
+  type MilestoneKey,
+} from "../models/crmTaxonomy.js";
 import { parseISTStart } from "../utils/dateIST.js";
+
+// ── Slice 2 (CRM_V2_OPPORTUNITY) ──────────────────────────────────────
+// This report is a LIVE scheduled WhatsApp send that read Lead.stage
+// directly (risk M4). It now speaks both vocabularies:
+//   • Milestone counts (demos / proposals / negotiation / won / lost, the
+//     conversion funnel, per-rep demos/won) go through
+//     crmTaxonomy.activityHitsMilestone(), which recognises a legacy
+//     stage_change (toStage "demo_scheduled"), a new-taxonomy lead row
+//     (toStatus "ENGAGED" / type "demo") and an Opportunity stage_change
+//     (toStage "proposal" / "closed_won" …). Un-gated: on pre-migration data
+//     it yields exactly the old numbers.
+//   • The movement list and the ageing labels switch vocabulary with the
+//     flag: legacy 9 stages off, lead statuses + deal milestones on.
+//   • The donut / closure value / roster come from buildOwnerStatusReport,
+//     which is flag-aware itself.
 import {
   buildOwnerStatusReport,
   OWNER_STATUS_STAGE_LABEL,
@@ -45,8 +70,22 @@ export const STAGE_COLORS: Record<string, string> = {
   follow_up: "#06b6d4",
   won: "#10b981",
   lost: "#ef4444",
+  // Slice 2 — lead statuses
+  NEW: "#64748b",
+  ASSIGNED: "#6366f1",
+  CONTACTED: "#3b82f6",
+  ENGAGED: "#8b5cf6",
+  QUALIFIED: "#a855f7",
+  CONVERTED: "#f59e0b",
+  NURTURE: "#06b6d4",
+  LOST: "#ef4444",
+  // Slice 2 — deal milestones (movement list, flag on)
+  "opp:proposal": "#f59e0b",
+  "opp:negotiation": "#f97316",
+  "opp:won": "#10b981",
+  "opp:lost": "#ef4444",
 };
-const STAGE_LABEL = OWNER_STATUS_STAGE_LABEL;
+const STAGE_LABEL: Record<string, string> = { ...OWNER_STATUS_STAGE_LABEL, ...LEAD_STATUS_LABEL };
 
 /* ── Activity Score weights (TRANSPARENT — surfaced in the report footer) ──
  * Weighted by sales effort/intent. Only the five "interaction" activity types
@@ -201,16 +240,20 @@ interface ActLite {
   leadId: string;
   type: string;
   toStage?: string;
+  toStatus?: string;
+  subjectType?: string;
   createdAt: Date;
 }
 async function fetchActivities(start: Date, end: Date): Promise<ActLite[]> {
   const rows = (await LeadActivity.find({ createdAt: { $gte: start, $lte: end } })
-    .select("leadId type toStage createdAt")
+    .select("leadId type toStage toStatus subject createdAt")
     .lean()) as any[];
   return rows.map((a) => ({
     leadId: String(a.leadId),
     type: String(a.type),
     toStage: a.toStage ? String(a.toStage) : undefined,
+    toStatus: a.toStatus ? String(a.toStatus) : undefined,
+    subjectType: a.subject?.type ? String(a.subject.type) : undefined,
     createdAt: new Date(a.createdAt),
   }));
 }
@@ -228,7 +271,7 @@ async function fetchLeadsByIds(ids: string[]): Promise<Map<string, LeadLite>> {
   const map = new Map<string, LeadLite>();
   if (!ids.length) return map;
   const rows = (await Lead.find({ _id: { $in: ids } })
-    .select("_id assignedTo assignedToName companyId companyName contactName stage")
+    .select("_id assignedTo assignedToName companyId companyName contactName stage status")
     .lean()) as any[];
   for (const l of rows) {
     map.set(String(l._id), {
@@ -238,19 +281,29 @@ async function fetchLeadsByIds(ids: string[]): Promise<Map<string, LeadLite>> {
       companyId: l.companyId ? String(l.companyId) : null,
       companyName: l.companyName || "",
       contactName: l.contactName || "",
-      stage: l.stage,
+      stage: isCrmV2OpportunityEnabled() ? effectiveLeadStatus(l) : l.stage,
     });
   }
   return map;
 }
 
-/* Movement into a stage today: stage_change.toStage for new→follow_up; the
- * dedicated won/lost activity types for the terminal stages (those routes don't
- * write a stage_change). "new" movement is creation, handled separately. */
+/* Movement into a LEGACY stage today (flag off): stage_change.toStage for
+ * new→follow_up; the dedicated won/lost activity types for the terminal
+ * stages (those routes don't write a stage_change). "new" = creation. */
 function movementInto(stage: string, acts: ActLite[]): number {
   if (stage === "won") return acts.filter((a) => a.type === "won").length;
   if (stage === "lost") return acts.filter((a) => a.type === "lost").length;
-  return acts.filter((a) => a.type === "stage_change" && a.toStage === stage).length;
+  return acts.filter((a) => a.type === "stage_change" && (a.subjectType ?? "LEAD") === "LEAD" && a.toStage === stage).length;
+}
+/* Movement into a MILESTONE today — both vocabularies (Slice 2). */
+function milestoneCount(m: MilestoneKey, acts: ActLite[]): number {
+  return acts.filter((a) => activityHitsMilestone(a, m)).length;
+}
+/* Movement into a lead STATUS today (flag on): lead-subject stage_change
+ * rows carry toStatus; LOST also arrives as the dedicated `lost` type. */
+function movementIntoStatus(status: string, acts: ActLite[]): number {
+  if (status === "LOST") return milestoneCount("lost", acts.filter((a) => (a.subjectType ?? "LEAD") === "LEAD"));
+  return acts.filter((a) => a.type === "stage_change" && (a.subjectType ?? "LEAD") === "LEAD" && a.toStatus === status).length;
 }
 
 /* ── Window KPI counts (reused for today + prior so deltas are honest). ── */
@@ -286,11 +339,11 @@ async function computeWindowKpis(start: Date, end: Date): Promise<WindowKpis> {
     activeReps: activeOwners.size,
     companiesTouched: companies.size,
     newLeads,
-    demos: movementInto("demo_scheduled", acts),
-    proposals: movementInto("proposal_sent", acts),
-    negotiation: movementInto("negotiation", acts),
-    won: movementInto("won", acts),
-    lost: movementInto("lost", acts),
+    demos: milestoneCount("demo", acts),
+    proposals: milestoneCount("proposal", acts),
+    negotiation: milestoneCount("negotiation", acts),
+    won: milestoneCount("won", acts),
+    lost: milestoneCount("lost", acts),
   };
 }
 
@@ -308,27 +361,43 @@ function deltaCard(
 
 /* ── Conversion funnel from stage history (ever-entered milestones). ── */
 async function computeConversion(): Promise<SalesPulseSnapshot["conversion"]> {
-  const [allLeads, stageChanges, wins] = await Promise.all([
-    Lead.find({}).select("_id stage").lean() as any,
-    LeadActivity.find({ type: "stage_change" }).select("leadId toStage").lean() as any,
-    LeadActivity.find({ type: "won" }).select("leadId").lean() as any,
+  const [allLeads, milestoneActs] = await Promise.all([
+    Lead.find({}).select("_id stage status").lean() as any,
+    LeadActivity.find({ type: { $in: ["stage_change", "won", "lost", "demo"] } })
+      .select("leadId type toStage toStatus subject")
+      .lean() as any,
   ]);
 
-  const reached = new Map<string, Set<string>>();
+  // Milestones ever reached per lead, in both vocabularies: the current
+  // legacy stage (a lead sitting in demo_scheduled has reached "demo"), the
+  // stored status, and every history row through activityHitsMilestone().
+  const reached = new Map<string, Set<MilestoneKey>>();
   const ensure = (id: string) => {
-    if (!reached.has(id)) reached.set(id, new Set());
+    if (!reached.has(id)) reached.set(id, new Set<MilestoneKey>());
     return reached.get(id)!;
   };
-  for (const l of allLeads as any[]) ensure(String(l._id)).add(l.stage); // current stage
-  for (const sc of stageChanges as any[]) if (sc.toStage) ensure(String(sc.leadId)).add(String(sc.toStage));
-  for (const w of wins as any[]) ensure(String(w.leadId)).add("won");
+  const CURRENT_STAGE_MILESTONE: Record<string, MilestoneKey> = {
+    demo_scheduled: "demo", proposal_sent: "proposal", negotiation: "negotiation", won: "won", lost: "lost",
+  };
+  for (const l of allLeads as any[]) {
+    const set = ensure(String(l._id));
+    const m = CURRENT_STAGE_MILESTONE[String(l.stage)];
+    if (m) set.add(m);
+    if (l.status === "ENGAGED") set.add("demo");
+  }
+  for (const a of milestoneActs as any[]) {
+    const set = ensure(String(a.leadId));
+    for (const m of Object.keys(MILESTONES) as MilestoneKey[]) {
+      if (activityHitsMilestone({ type: a.type, toStage: a.toStage, toStatus: a.toStatus, subjectType: a.subject?.type }, m)) set.add(m);
+    }
+  }
 
   const totalLeads = (allLeads as any[]).length;
-  const has = (id: string, stage: string) => reached.get(id)?.has(stage) ?? false;
+  const has = (id: string, m: MilestoneKey) => reached.get(id)?.has(m) ?? false;
   let demos = 0, proposals = 0, won = 0;
   for (const id of reached.keys()) {
-    if (has(id, "demo_scheduled")) demos++;
-    if (has(id, "proposal_sent")) proposals++;
+    if (has(id, "demo")) demos++;
+    if (has(id, "proposal")) proposals++;
     if (has(id, "won")) won++;
   }
 
@@ -353,9 +422,13 @@ async function computeConversion(): Promise<SalesPulseSnapshot["conversion"]> {
 
 /* ── Top-5 oldest open leads by days since last activity. ── */
 async function computeAgeingAlert(): Promise<SalesPulseSnapshot["ageingAlert"]> {
-  const openLeads = (await Lead.find({ stage: { $nin: ["won", "lost"] } })
-    .select("_id companyName contactName assignedToName stage createdAt")
-    .lean()) as any[];
+  // Flag on: a CONVERTED lead's ageing belongs to its Opportunity, not here.
+  // Filtered on the EFFECTIVE status (stored, else derived from stage) so an
+  // unmigrated proposal_sent row is treated exactly like a migrated one.
+  const v2 = isCrmV2OpportunityEnabled();
+  const openLeads = ((await Lead.find({ stage: { $nin: ["won", "lost"] } })
+    .select("_id companyName contactName assignedToName stage status createdAt")
+    .lean()) as any[]).filter((l) => !v2 || !isClosedLeadStatus(effectiveLeadStatus(l)));
   if (!openLeads.length) return [];
 
   const ids = openLeads.map((l) => l._id);
@@ -373,13 +446,14 @@ async function computeAgeingAlert(): Promise<SalesPulseSnapshot["ageingAlert"]> 
       const created = new Date(l.createdAt).getTime();
       const last = Math.max(created, lastMap.get(String(l._id)) ?? 0);
       const daysSince = Math.max(0, Math.floor((now - last) / DAY));
+      const stage = isCrmV2OpportunityEnabled() ? effectiveLeadStatus(l) : l.stage;
       return {
         leadId: String(l._id),
         name: l.companyName || l.contactName || "Unnamed lead",
         ownerName: (l.assignedToName && String(l.assignedToName).trim()) || "Unassigned",
-        stage: l.stage,
-        stageLabel: STAGE_LABEL[l.stage] ?? l.stage,
-        color: STAGE_COLORS[l.stage] ?? "#64748b",
+        stage,
+        stageLabel: STAGE_LABEL[stage] ?? stageLabel(stage),
+        color: STAGE_COLORS[stage] ?? "#64748b",
         daysSince,
       };
     })
@@ -482,10 +556,10 @@ export async function computeSalesPulseSnapshot(
     if (SCORED_TYPES.includes(a.type)) {
       perRepScore.set(o.id, (perRepScore.get(o.id) ?? 0) + ACTIVITY_WEIGHTS[a.type]);
     }
-    if (a.type === "stage_change" && a.toStage === "demo_scheduled") {
+    if (activityHitsMilestone(a, "demo")) {
       perRepDemos.set(o.id, (perRepDemos.get(o.id) ?? 0) + 1);
     }
-    if (a.type === "won") perRepWon.set(o.id, (perRepWon.get(o.id) ?? 0) + 1);
+    if (activityHitsMilestone(a, "won")) perRepWon.set(o.id, (perRepWon.get(o.id) ?? 0) + 1);
 
     const co = leadsMap.get(a.leadId);
     if (co) {
@@ -528,13 +602,27 @@ export async function computeSalesPulseSnapshot(
       .sort((a, b) => b.score - a.score),
   };
 
-  /* ── Movement funnel (all 9 stages). "new" = leads created today. ── */
-  const movement = (LEAD_STAGES as readonly string[]).map((stage) => ({
-    stage,
-    label: STAGE_LABEL[stage],
-    color: STAGE_COLORS[stage] ?? "#64748b",
-    count: stage === "new" ? todayKpis.newLeads : movementInto(stage, todayActs),
-  }));
+  /* ── Movement funnel. Flag off: the 9 legacy stages. Flag on: the lead
+   * statuses followed by the deal milestones. "New" = leads created today. ── */
+  const movement = isCrmV2OpportunityEnabled()
+    ? [
+        ...(LEAD_STATUSES as readonly string[]).map((status) => ({
+          stage: status,
+          label: STAGE_LABEL[status] ?? status,
+          color: STAGE_COLORS[status] ?? "#64748b",
+          count: status === "NEW" ? todayKpis.newLeads : movementIntoStatus(status, todayActs),
+        })),
+        { stage: "opp:proposal", label: "Deal: Proposal / quote", color: STAGE_COLORS["opp:proposal"], count: todayKpis.proposals },
+        { stage: "opp:negotiation", label: "Deal: Negotiation", color: STAGE_COLORS["opp:negotiation"], count: todayKpis.negotiation },
+        { stage: "opp:won", label: "Deal: Won", color: STAGE_COLORS["opp:won"], count: todayKpis.won },
+        { stage: "opp:lost", label: "Deal: Lost", color: STAGE_COLORS["opp:lost"], count: milestoneCount("lost", todayActs.filter((a) => a.subjectType === "OPPORTUNITY")) },
+      ]
+    : (LEAD_STAGES as readonly string[]).map((stage) => ({
+        stage,
+        label: STAGE_LABEL[stage],
+        color: STAGE_COLORS[stage] ?? "#64748b",
+        count: stage === "new" ? todayKpis.newLeads : movementInto(stage, todayActs),
+      }));
 
   /* ── Stage distribution donut (reused, current snapshot). ── */
   const stageDistribution = allReport.statusSnapshot.map((s) => ({
@@ -652,7 +740,9 @@ export async function computeSalesPulseSnapshot(
       weights: ACTIVITY_WEIGHTS,
       productivityNote: "Productivity % is derived: share of a rep's assigned leads with ≥1 activity logged today.",
       conversionNote: conversion?.basis ?? "",
-      movementNote: "Movement counts leads that entered each stage today (stage-change events; New = leads created today; Won/Lost = win/lose events).",
+      movementNote: isCrmV2OpportunityEnabled()
+        ? "Movement counts leads that entered each status today and deals that entered each milestone (New = leads created today; Deal rows = Opportunity stage events)."
+        : "Movement counts leads that entered each stage today (stage-change events; New = leads created today; Won/Lost = win/lose events).",
     },
   };
 }

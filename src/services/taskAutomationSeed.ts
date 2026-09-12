@@ -1,5 +1,6 @@
 import TaskAutomation from '../models/TaskAutomation.js'
-import { DEFAULT_AUTOMATIONS } from '../config/defaultTaskAutomations.js'
+import { DEFAULT_AUTOMATIONS, OPPORTUNITY_AUTOMATIONS } from '../config/defaultTaskAutomations.js'
+import { isCrmV2OpportunityEnabled } from '../config/crmV2.js'
 import logger from '../utils/logger.js'
 
 export async function seedTaskAutomations(workspaceId: string): Promise<void> {
@@ -7,7 +8,13 @@ export async function seedTaskAutomations(workspaceId: string): Promise<void> {
     const existing = await TaskAutomation.find({ workspaceId }).select('triggerKey').lean()
     const existingKeys = new Set(existing.map((a: any) => a.triggerKey))
 
-    const toInsert = DEFAULT_AUTOMATIONS.filter((a) => !existingKeys.has(a.triggerKey))
+    // Slice 2: the new-taxonomy rows are seeded only under CRM_V2_OPPORTUNITY
+    // so the OFF state adds nothing (the legacy rows stay and keep firing
+    // through the alias lookup either way).
+    const catalogue = isCrmV2OpportunityEnabled()
+      ? [...DEFAULT_AUTOMATIONS, ...OPPORTUNITY_AUTOMATIONS]
+      : DEFAULT_AUTOMATIONS
+    const toInsert = catalogue.filter((a) => !existingKeys.has(a.triggerKey))
 
     if (toInsert.length === 0) return
 
