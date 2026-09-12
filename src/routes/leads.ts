@@ -821,14 +821,21 @@ router.get("/reports/owner-status", async (req, res) => {
     // Aggregation extracted to services/ownerStatusReport so the Sales Pulse
     // snapshot reuses identical numbers. The route only parses/validates the
     // query (above) and shapes the response (the service returns it whole).
-    const report = await buildOwnerStatusReport({
-      assignedTo: assignedToF,
-      stage: stageF,
-      source: sourceF,
-      type: typeF,
-      dateFrom,
-      dateTo,
-    });
+    // Slice 2: this route feeds pages/crm/Reports.tsx, which indexes the
+    // snapshot by the 9 legacy stage keys — pin the legacy vocabulary until
+    // the frontend is taught the new one (risk M12). Sales Pulse follows the
+    // flag through the same builder.
+    const report = await buildOwnerStatusReport(
+      {
+        assignedTo: assignedToF,
+        stage: stageF,
+        source: sourceF,
+        type: typeF,
+        dateFrom,
+        dateTo,
+      },
+      { vocabulary: "legacy" },
+    );
 
     return res.json(report);
   } catch (err) {

@@ -104,7 +104,20 @@ const TYPE_LABEL: Record<string, string> = {
   call: "Calls", email: "Emails", meeting: "Meetings", note: "Notes", follow_up: "Follow-ups",
 };
 
-export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise<OwnerStatusReport> {
+export interface OwnerStatusOptions {
+  /** Which vocabulary the report speaks. Default: the new taxonomy when
+   *  CRM_V2_OPPORTUNITY is on, legacy otherwise. The FE-facing route
+   *  (GET /leads/reports/owner-status) pins "legacy" for this slice because
+   *  pages/crm/Reports.tsx indexes statusSnapshot by the 9 legacy stage keys
+   *  and crashes on the 8 new ones (risk M12: backend first, frontend second).
+   *  Sales Pulse leaves it unset and follows the flag. */
+  vocabulary?: "legacy" | "v2";
+}
+
+export async function buildOwnerStatusReport(
+  params: OwnerStatusParams,
+  options: OwnerStatusOptions = {},
+): Promise<OwnerStatusReport> {
   const assignedToF = (params.assignedTo ?? []).filter((s) => mongoose.isValidObjectId(s));
   const stageF = (params.stage ?? []).filter((s) => (LEAD_STAGES as readonly string[]).includes(s));
   const sourceF = params.source ?? [];
@@ -122,7 +135,7 @@ export async function buildOwnerStatusReport(params: OwnerStatusParams): Promise
   if (sourceF.length) leadMatch.source = { $in: sourceF };
   if (typeF.length) leadMatch.type = { $in: typeF };
 
-  const v2 = isCrmV2OpportunityEnabled();
+  const v2 = options.vocabulary ? options.vocabulary === "v2" : isCrmV2OpportunityEnabled();
   const leads = (await Lead.find(leadMatch)
     .select("_id assignedTo assignedToName stage status opportunityId source type dealValue currency createdAt")
     .lean()) as any[];

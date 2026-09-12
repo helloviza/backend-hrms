@@ -152,4 +152,12 @@ describe("owner-status report — money follows the Opportunity under the flag",
     expect(r.ageing.openTotal).toBe(3);
   });
 
+  it("vocabulary:'legacy' pins the 9 legacy stages even with the flag ON (the FE-facing route, M12)", async () => {
+    await seedMixedDay();
+    flag(true);
+    const r = await buildOwnerStatusReport({}, { vocabulary: "legacy" });
+    expect(r.statusSnapshot.map((s) => s.stage)).toEqual(["new", "email_sent", "contacted", "demo_scheduled", "proposal_sent", "negotiation", "follow_up", "won", "lost"]);
+    expect(r.statusSnapshot.every((s) => typeof s.count === "number")).toBe(true);
+    expect(r.pipeline.totalPipelineValue).toBe(170000); // legacy dealValue sums
+  });
 });
