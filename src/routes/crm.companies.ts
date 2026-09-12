@@ -113,10 +113,28 @@ router.post("/", async (req, res) => {
       ? new mongoose.Types.ObjectId(userId(user))
       : undefined;
 
-    // ── Legacy path (CRM_V2_FOUNDATION off): unchanged ──
+    // ── Legacy path (CRM_V2_FOUNDATION off): body spread, no dedupe ──
+    // The model now keys nameNormalized on every save (Slice 2, un-gated), so
+    // a duplicate name meets the prod unique+partial index here. That is a
+    // 409 with the existing row's id, not a silent second company and not an
+    // opaque 500 — the collapse-and-return behaviour stays behind the flag.
     if (!isCrmV2FoundationEnabled()) {
-      const company = await CRMCompany.create({ ...body, createdBy });
-      return res.status(201).json({ company });
+      try {
+        const company = await CRMCompany.create({ ...body, createdBy });
+        return res.status(201).json({ company });
+      } catch (e: any) {
+        if (e?.code === 11000) {
+          const existing = await CRMCompany.findOne({ nameNormalized: normalizeCompanyName(body.name) })
+            .select("_id name")
+            .lean();
+          return res.status(409).json({
+            error: "Another company already has this name.",
+            existingId: existing ? String(existing._id) : undefined,
+            existingName: existing?.name,
+          });
+        }
+        throw e;
+      }
     }
 
     // ── CRM_V2_FOUNDATION path: allow-list + dedupe on nameNormalized ──
@@ -340,7 +358,9 @@ router.put("/:id", async (req, res) => {
 
     const body = req.body as AnyObj;
 
-    // ── Legacy path (CRM_V2_FOUNDATION off): unchanged ──
+    // ── Legacy path (CRM_V2_FOUNDATION off): body spread ──
+    // Same E11000 → 409 translation as POST: the un-gated key hook means a
+    // rename onto another company's name is refused by the index.
     if (!isCrmV2FoundationEnabled()) {
       const PROTECTED = new Set(["_id", "companyCode", "createdBy", "createdAt"]);
       for (const key of Object.keys(body)) {
@@ -348,7 +368,24 @@ router.put("/:id", async (req, res) => {
           (company as any)[key] = body[key];
         }
       }
-      await company.save();
+      try {
+        await company.save();
+      } catch (e: any) {
+        if (e?.code === 11000) {
+          const clash = await CRMCompany.findOne({
+            nameNormalized: normalizeCompanyName(company.name),
+            _id: { $ne: company._id },
+          })
+            .select("_id name")
+            .lean();
+          return res.status(409).json({
+            error: "Another company already has this name.",
+            existingId: clash ? String(clash._id) : undefined,
+            existingName: clash?.name,
+          });
+        }
+        throw e;
+      }
       return res.json({ company });
     }
 

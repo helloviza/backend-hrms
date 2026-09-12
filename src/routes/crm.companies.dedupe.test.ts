@@ -140,18 +140,10 @@ describe("Company Account fields — existing docs load without error", () => {
     expect(raw!.nameNormalized).toBe("");
   });
 
-  it("flag OFF: saving a legacy row leaves nameNormalized '' (byte-for-byte legacy)", async () => {
-    flag(false);
-    const id = await insertLegacyRaw("Ather Energy");
-    const doc = await CRMCompany.findById(id);
-    doc!.notes = "touched";
-    await doc!.save();
-    const raw = await CRMCompany.collection.findOne({ _id: id });
-    expect(raw!.nameNormalized).toBe("");
-  });
-
-  it("flag ON: saving a legacy row re-keys nameNormalized from name", async () => {
-    flag(true);
+  // Slice 2 (review item 1): the key hook is UN-GATED — data hygiene, not a
+  // feature. Both flag states re-key a legacy row on its next save.
+  it.each([false, true])("saving a legacy row re-keys nameNormalized from name (flag=%s)", async (on) => {
+    flag(on);
     const id = await insertLegacyRaw("Ather Energy");
     const doc = await CRMCompany.findById(id);
     doc!.notes = "touched";
@@ -169,14 +161,28 @@ describe("Company Account fields — existing docs load without error", () => {
 /* ───────────────────────── 2. POST / — legacy path ───────────────────────── */
 
 describe("POST /crm/companies — flag OFF (legacy)", () => {
-  it("creates with nameNormalized '' and does NOT dedupe", async () => {
+  // Slice 2: the key is written whatever the flag says, so a duplicate name
+  // meets the prod unique+partial index. The legacy path does NOT collapse
+  // onto the existing row (that is the gated behaviour) — it refuses with a
+  // 409 naming the existing row, instead of a silent duplicate or a 500.
+  it("keys nameNormalized and refuses a duplicate with 409 (no collapse)", async () => {
     flag(false);
     const a = await request(app()).post("/api/crm/companies").send({ name: "Ather Energy" });
     const b = await request(app()).post("/api/crm/companies").send({ name: "ather  energy" });
     expect(a.status).toBe(201);
+    expect(a.body.company.nameNormalized).toBe("ather energy");
+    expect(b.status).toBe(409);
+    expect(b.body.existingId).toBe(a.body.company._id);
+    expect(b.body).not.toHaveProperty("deduped");
+    expect(await CRMCompany.countDocuments({})).toBe(1);
+  });
+
+  it("distinct names still create distinct rows", async () => {
+    flag(false);
+    const a = await request(app()).post("/api/crm/companies").send({ name: "Ather Energy" });
+    const b = await request(app()).post("/api/crm/companies").send({ name: "Ola Electric" });
+    expect(a.status).toBe(201);
     expect(b.status).toBe(201);
-    expect(a.body.company._id).not.toBe(b.body.company._id);
-    expect(a.body.company.nameNormalized).toBe("");
     expect(await CRMCompany.countDocuments({})).toBe(2);
   });
 
@@ -343,14 +349,25 @@ describe("POST /crm/companies — flag ON (dedupe on nameNormalized)", () => {
 /* ───────────────────────── 4. PUT /:id ───────────────────────── */
 
 describe("PUT /crm/companies/:id", () => {
-  it("flag OFF: rename leaves nameNormalized stale (legacy)", async () => {
+  it("flag OFF: rename re-keys nameNormalized (hook is un-gated since Slice 2)", async () => {
     flag(true);
     const c = await request(app()).post("/api/crm/companies").send({ name: "Old Name" });
     flag(false);
     const r = await request(app()).put(`/api/crm/companies/${c.body.company._id}`).send({ name: "New Name" });
     expect(r.status).toBe(200);
     expect(r.body.company.name).toBe("New Name");
-    expect(r.body.company.nameNormalized).toBe("old name");
+    expect(r.body.company.nameNormalized).toBe("new name");
+  });
+
+  it("flag OFF: rename onto another company's key is a 409 from the index, not a 500", async () => {
+    flag(false);
+    const a = await request(app()).post("/api/crm/companies").send({ name: "Ather Energy" });
+    const b = await request(app()).post("/api/crm/companies").send({ name: "Ola Electric" });
+    const r = await request(app()).put(`/api/crm/companies/${b.body.company._id}`).send({ name: "ather energy" });
+    expect(r.status).toBe(409);
+    expect(r.body.existingId).toBe(a.body.company._id);
+    const untouched = await CRMCompany.findById(b.body.company._id).lean();
+    expect(untouched!.nameNormalized).toBe("ola electric");
   });
 
   it("flag ON: rename re-keys nameNormalized via the shared function", async () => {

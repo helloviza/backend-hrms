@@ -1,6 +1,5 @@
 import mongoose, { Document, Schema } from "mongoose";
 import { normalizeCompanyName } from "../utils/companyName.js";
-import { isCrmV2FoundationEnabled } from "../config/crmV2.js";
 
 // ── Company Account (Phase 1 / Slice 1) ──────────────────────────────
 // The PRD's Company Account is built IN PLACE on this collection (locked
@@ -26,8 +25,8 @@ export interface CRMCompanyDoc extends Document {
   // Declared non-unique here on purpose: the prod unique index is PARTIAL over
   // non-empty strings and was built by backfill-lead-companyId.ts --apply AFTER
   // dedupe, so Mongoose never auto-builds a unique index over dirty data.
-  // Set on every save by the pre-validate hook below when CRM_V2_FOUNDATION is
-  // on; before that only resolveOrCreateCompany wrote it (M8, code half).
+  // Set on every save by the pre-validate hook below (un-gated since Slice 2);
+  // before that only resolveOrCreateCompany wrote it (M8, code half).
   nameNormalized: string;
   industry: string;
   companySize: string;
@@ -105,15 +104,18 @@ CRMCompanySchema.index({ accountManagerId: 1 }, { sparse: true });
 // from `name` on EVERY save path, so manual creates and renames stop writing
 // "" / stale keys. A legacy row still carrying "" is re-keyed on its next save
 // (the route checks for a clash first). pre("validate") rather than
-// pre("save") so validators see the final value. Gated so the OFF state stays
-// byte-for-byte legacy.
+// pre("save") so validators see the final value.
+// NOT flag-gated (Slice 2, review item 1): the key is data hygiene, not a
+// feature — every row should carry it whatever the flag says. Only the dedupe
+// BEHAVIOUR (collapse-on-create, 409-on-rename) stays behind
+// CRM_V2_FOUNDATION in routes/crm.companies.ts. Consequence with the flag off:
+// the legacy create/rename paths now hit the prod unique+partial index on a
+// duplicate name instead of silently minting a second row — the route turns
+// that E11000 into a 409 rather than an opaque 500.
 // NOTE: findOneAndUpdate paths (resolveOrCreateCompany) bypass document hooks
 // and set the key themselves.
 CRMCompanySchema.pre("validate", function (next) {
-  if (
-    isCrmV2FoundationEnabled() &&
-    (this.isNew || this.isModified("name") || !this.nameNormalized)
-  ) {
+  if (this.isNew || this.isModified("name") || !this.nameNormalized) {
     this.nameNormalized = normalizeCompanyName(this.name);
   }
   next();
