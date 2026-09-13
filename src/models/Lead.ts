@@ -103,6 +103,17 @@ export interface LeadDoc extends Document {
   /** Reserved (decision A). Never read, never written. */
   workspaceId?: mongoose.Types.ObjectId | null;
 
+  // ── Disposition slice (CRM_V2_DISPOSITION) — additive, all optional ──
+  /** The calling pipeline this lead is worked in (models/CrmPipeline.ts).
+   *  null until first dispositioned; the default pipeline is stamped then. */
+  pipelineId?: mongoose.Types.ObjectId | null;
+  /** The rep's pick. Everything below it is DERIVED from the pipeline's set. */
+  disposition: string;
+  subDisposition: string;
+  dispositionStage: string; // Prospect | In-progress | Lost | Onboarded | NC
+  dispositionStatus: string; // Open | In-progress | Lost | Won
+  dispositionAt?: Date | null;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -171,6 +182,14 @@ const LeadSchema = new Schema<LeadDoc>(
     travelRequirement: { type: TravelRequirementSchema, default: () => ({}) },
     opportunityId: { type: Schema.Types.ObjectId, ref: "Opportunity", default: null },
     workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", default: null },
+
+    // ── Disposition slice — additive. "" / null = fresh (Open / Prospect). ──
+    pipelineId: { type: Schema.Types.ObjectId, ref: "CrmPipeline", default: null },
+    disposition: { type: String, trim: true, default: "" },
+    subDisposition: { type: String, trim: true, default: "" },
+    dispositionStage: { type: String, trim: true, default: "" },
+    dispositionStatus: { type: String, trim: true, default: "" },
+    dispositionAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
@@ -183,6 +202,7 @@ LeadSchema.index({ companyId: 1 });
 LeadSchema.index({ leadCode: 1 }, { unique: true, sparse: true });
 LeadSchema.index({ status: 1 }, { sparse: true });
 LeadSchema.index({ opportunityId: 1 }, { sparse: true });
+LeadSchema.index({ pipelineId: 1, dispositionStatus: 1 }, { sparse: true });
 
 /** The lead's status in the new taxonomy, whether or not the row has been
  *  migrated: the stored `status` when present, else derived from the legacy
@@ -203,7 +223,10 @@ LeadSchema.pre("validate", function (next) {
   if (!isCrmV2OpportunityEnabled()) return next();
   const stageChanged = this.isNew || this.isModified("stage");
   const statusChanged = this.isModified("status");
-  if (statusChanged && !stageChanged && this.status) {
+  if (statusChanged && stageChanged && this.status) {
+    // Both set explicitly in one save (the disposition service does this —
+    // its set carries a legacy stage AND a status per entry): trust the caller.
+  } else if (statusChanged && !stageChanged && this.status) {
     this.stage = STATUS_TO_LEGACY_STAGE[this.status];
   } else if (stageChanged || !this.status) {
     this.status = legacyStageToStatus(this.stage);

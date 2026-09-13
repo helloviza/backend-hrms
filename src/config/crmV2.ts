@@ -73,3 +73,19 @@ export const CRM_V2_OPPORTUNITY_ENV = "CRM_V2_OPPORTUNITY";
 export function isCrmV2OpportunityEnabled(): boolean {
   return String(process.env[CRM_V2_OPPORTUNITY_ENV] || "").trim().toLowerCase() === "true";
 }
+
+// ── CRM_V2_DISPOSITION — Phase 1 / calling disposition + shadow opportunity ──
+//
+// OFF (default): the disposition routes answer 404, no pipeline row is seeded,
+// no lead carries a disposition, nothing derives stage/status from a set.
+// ON ("true"): POST /leads/:id/disposition derives stage/status from the
+// lead's pipeline disposition set, appends a `disposition` activity and
+// creates/syncs the shadow Opportunity (services/disposition.ts). Independent
+// of the other two flags; it assumes the Slice-2 schema (Opportunity,
+// LeadActivity.subject) is deployed, which it is on this branch.
+
+export const CRM_V2_DISPOSITION_ENV = "CRM_V2_DISPOSITION";
+
+export function isCrmV2DispositionEnabled(): boolean {
+  return String(process.env[CRM_V2_DISPOSITION_ENV] || "").trim().toLowerCase() === "true";
+}

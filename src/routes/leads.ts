@@ -4,8 +4,10 @@ import ExcelJS from "exceljs";
 import Lead, { LEAD_STAGES, LEAD_SOURCES, effectiveLeadStatus } from "../models/Lead.js";
 import LeadActivity, { ACTIVITY_TYPES } from "../models/LeadActivity.js";
 import Opportunity from "../models/Opportunity.js";
-import { isCrmV2OpportunityEnabled } from "../config/crmV2.js";
+import { isCrmV2OpportunityEnabled, isCrmV2DispositionEnabled } from "../config/crmV2.js";
 import { applyLegacyStageTransition, automationTriggerForPlan } from "../services/leadSplit.js";
+import { applyDisposition, snapshotOf, DispositionError } from "../services/disposition.js";
+import { resolvePipelineForLead, groupedSet, canWorkPipeline } from "../services/crmPipelines.js";
 import CRMCompany from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
 import { resolveOrCreateCompany } from "../utils/crmCompany.js";
@@ -1238,6 +1240,8 @@ router.put("/:id", async (req, res) => {
       "companyId",
       // Slice 2: derived by the model hook / the split service, never client-set.
       "status", "opportunityId", "workspaceId",
+      // Disposition slice: derived from the pipeline set by POST /:id/disposition.
+      "pipelineId", "disposition", "subDisposition", "dispositionStage", "dispositionStatus", "dispositionAt",
     ]);
 
     const body = req.body as AnyObj;
@@ -1382,6 +1386,79 @@ router.put("/:id/stage", async (req, res) => {
   } catch (err) {
     logger.error("leads PUT /:id/stage error", { err });
     return res.status(500).json({ error: "Failed to update stage." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTE 9b — disposition capture (CRM_V2_DISPOSITION)
+// ═══════════════════════════════════════════════════════════════
+// GET  /:id/dispositions  → the lead's pipeline, its grouped disposition set
+//                           and the lead's current (or fresh) disposition.
+// POST /:id/disposition   → { subDisposition, note?, nextFollowUpDate? }
+//                           derives stage/status, appends the activity, fires
+//                           / syncs the shadow opportunity (services/disposition.ts)
+//                           and returns the cascade so the UI can show it.
+// Flag off: 404 — the surface does not exist.
+
+router.get("/:id/dispositions", async (req, res) => {
+  if (!isCrmV2DispositionEnabled()) return res.status(404).json({ error: "Not found." });
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid lead ID." });
+    const lead = await Lead.findById(req.params.id).lean();
+    if (!lead) return res.status(404).json({ error: "Lead not found." });
+    const user = (req as any).user as AnyObj;
+    const pipeline = await resolvePipelineForLead(lead as any);
+    return res.json({
+      pipeline: { _id: String(pipeline._id), key: pipeline.key, name: pipeline.name, opportunityPipeline: pipeline.opportunityPipeline },
+      canWork: canWorkPipeline({ id: userId(user), roles: user.roles }, pipeline) && canWrite((req as any).leadsAccess),
+      groups: groupedSet(pipeline).map((g) => ({
+        disposition: g.disposition,
+        subs: g.subs.map((e) => ({
+          subDisposition: e.subDisposition, stage: e.stage, status: e.status,
+          nextTouch: e.nextTouch, opportunityEffect: e.opportunityEffect, opportunityStage: e.opportunityStage ?? null,
+        })),
+      })),
+      current: snapshotOf(lead as any),
+      opportunityId: (lead as any).opportunityId ? String((lead as any).opportunityId) : null,
+    });
+  } catch (err) {
+    logger.error("leads GET /:id/dispositions error", { err });
+    return res.status(500).json({ error: "Failed to load dispositions." });
+  }
+});
+
+router.post("/:id/disposition", async (req, res) => {
+  if (!isCrmV2DispositionEnabled()) return res.status(404).json({ error: "Not found." });
+  try {
+    if (!canWrite((req as any).leadsAccess)) return res.status(403).json({ error: "Write access required." });
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid lead ID." });
+    const { subDisposition, note, nextFollowUpDate } = req.body as AnyObj;
+    if (!subDisposition || !String(subDisposition).trim()) return res.status(400).json({ error: "subDisposition is required." });
+
+    const lead = await Lead.findById(req.params.id);
+    if (!lead) return res.status(404).json({ error: "Lead not found." });
+
+    const user = (req as any).user as AnyObj;
+    const actorName = user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System";
+    const result = await applyDisposition(lead, {
+      subDisposition: String(subDisposition),
+      note: note ? String(note) : "",
+      nextFollowUpDate: nextFollowUpDate || null,
+      actor: { id: userId(user), roles: user.roles, name: actorName },
+    });
+    return res.json({
+      lead: result.lead,
+      from: result.from,
+      to: result.to,
+      entry: { disposition: result.entry.disposition, subDisposition: result.entry.subDisposition, stage: result.entry.stage, status: result.entry.status, opportunityEffect: result.entry.opportunityEffect },
+      opportunity: result.opportunity,
+      pipeline: result.pipeline,
+      activityId: result.activityId,
+    });
+  } catch (err: any) {
+    if (err instanceof DispositionError) return res.status(err.status).json({ error: err.message });
+    logger.error("leads POST /:id/disposition error", { err });
+    return res.status(500).json({ error: "Failed to save disposition." });
   }
 });
 

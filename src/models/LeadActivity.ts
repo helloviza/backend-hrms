@@ -30,6 +30,8 @@ export const ACTIVITY_TYPES = [
   "note", "call", "email", "meeting", "demo",
   "stage_change", "assignment", "follow_up",
   "won", "lost", "invite_sent",
+  // Disposition slice: a rep's disposition pick and everything it derived.
+  "disposition",
 ] as const;
 export type ActivityType = typeof ACTIVITY_TYPES[number];
 
@@ -41,6 +43,14 @@ export interface ActivitySubject {
   id: mongoose.Types.ObjectId;
 }
 
+/** Snapshot of a lead's disposition fields at one moment (activity payload). */
+export interface DispositionSnapshot {
+  disposition: string;
+  subDisposition: string;
+  stage: string;
+  status: string;
+}
+
 export interface LeadActivityDoc extends Document {
   leadId?: mongoose.Types.ObjectId | null;
   subject?: ActivitySubject | null;
@@ -50,6 +60,8 @@ export interface LeadActivityDoc extends Document {
   toStage?: string;
   fromStatus?: string;
   toStatus?: string;
+  /** Disposition slice: from → to, so the cascade is explainable per row. */
+  disposition?: { from: DispositionSnapshot; to: DispositionSnapshot } | null;
   automatedByRule: string;
   createdBy: mongoose.Types.ObjectId;
   createdByName: string;
@@ -64,6 +76,16 @@ const SubjectSchema = new Schema<ActivitySubject>(
   { _id: false },
 );
 
+const DispositionSnapshotSchema = new Schema<DispositionSnapshot>(
+  {
+    disposition: { type: String, default: "" },
+    subDisposition: { type: String, default: "" },
+    stage: { type: String, default: "" },
+    status: { type: String, default: "" },
+  },
+  { _id: false },
+);
+
 const LeadActivitySchema = new Schema<LeadActivityDoc>(
   {
     leadId: { type: Schema.Types.ObjectId, ref: "Lead", default: null },
@@ -74,6 +96,10 @@ const LeadActivitySchema = new Schema<LeadActivityDoc>(
     toStage: { type: String },
     fromStatus: { type: String },
     toStatus: { type: String },
+    disposition: {
+      type: new Schema({ from: DispositionSnapshotSchema, to: DispositionSnapshotSchema }, { _id: false }),
+      default: undefined,
+    },
     automatedByRule: { type: String, trim: true, default: "" },
     createdBy: { type: Schema.Types.ObjectId, ref: "User" },
     createdByName: { type: String, default: "" },
