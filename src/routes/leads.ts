@@ -1741,6 +1741,102 @@ router.post("/:id/assign", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// ROUTE 11b — POST /bulk-assign  (ask #8)
+// ═══════════════════════════════════════════════════════════════
+// Reassign up to BULK_ASSIGN_CAP leads to one rep in a single call. Same
+// FULL-access gate as POST /:id/assign — reassigning other people's leads is
+// a privileged action, WRITE is not enough. Per lead it does exactly what the
+// single route does: set owner, write one `assignment` activity, cascade the
+// open auto-tasks. Each lead is applied independently and reported: a missing
+// or failing id lands in `failed` with its reason, the rest still land — the
+// caller sees precisely what happened, nothing is half-applied silently.
+const BULK_ASSIGN_CAP = 200;
+
+router.post("/bulk-assign", async (req, res) => {
+  try {
+    if ((req as any).leadsAccess !== "FULL") {
+      return res.status(403).json({ error: "Full access required to reassign leads." });
+    }
+    const body = req.body as AnyObj;
+    const repId = String(body.assignedTo || "");
+    if (!mongoose.isValidObjectId(repId)) {
+      return res.status(400).json({ error: "Valid assignedTo is required." });
+    }
+    const rawIds: unknown[] = Array.isArray(body.leadIds) ? body.leadIds : [];
+    const leadIds = Array.from(new Set(rawIds.map((v) => String(v))));
+    if (leadIds.length === 0) return res.status(400).json({ error: "leadIds is required." });
+    if (leadIds.length > BULK_ASSIGN_CAP) {
+      return res.status(400).json({ error: `At most ${BULK_ASSIGN_CAP} leads per reassignment.` });
+    }
+
+    const repName = await resolveUserName(repId);
+    if (!repName) return res.status(404).json({ error: "User not found." });
+
+    const user = (req as any).user as AnyObj;
+    const actorId = mongoose.isValidObjectId(userId(user)) ? new mongoose.Types.ObjectId(userId(user)) : undefined;
+    // Actor label from the DB, not the JWT (the token carries no name).
+    const actorName = (await resolveUserName(userId(user))) || user.email || "System";
+    const repObjectId = new mongoose.Types.ObjectId(repId);
+
+    const updated: Array<{ _id: string; leadCode: string; previousOwnerName: string; unchanged: boolean }> = [];
+    const failed: Array<{ _id: string; reason: string }> = [];
+
+    for (const id of leadIds) {
+      if (!mongoose.isValidObjectId(id)) {
+        failed.push({ _id: id, reason: "Invalid lead ID." });
+        continue;
+      }
+      try {
+        const lead = await Lead.findById(id);
+        if (!lead) {
+          failed.push({ _id: id, reason: "Lead not found." });
+          continue;
+        }
+        const previousOwnerName = lead.assignedToName || "";
+        const unchanged = String(lead.assignedTo || "") === repId;
+        lead.assignedTo = repObjectId;
+        lead.assignedToName = repName;
+        await lead.save();
+
+        await LeadActivity.create({
+          leadId: lead._id,
+          type: "assignment" as ActivityType,
+          note: previousOwnerName && !unchanged ? `Reassigned to ${repName} (from ${previousOwnerName})` : `Assigned to ${repName}`,
+          createdBy: actorId,
+          createdByName: actorName,
+        });
+
+        // Reassignment cascade — identical to POST /:id/assign.
+        Task.updateMany(
+          {
+            linkedType: "LEAD",
+            linkedId: lead._id,
+            status: { $in: ["OPEN", "IN_PROGRESS"] },
+            autoTriggerKey: { $exists: true },
+          },
+          { $set: { assignedTo: lead.assignedTo } }
+        ).catch((err: any) => logger.error("leads bulk-assign cascade error", { err }));
+
+        updated.push({ _id: String(lead._id), leadCode: lead.leadCode, previousOwnerName, unchanged });
+      } catch (e: any) {
+        failed.push({ _id: id, reason: e?.message || "Could not reassign this lead." });
+      }
+    }
+
+    return res.json({
+      assignedTo: repId,
+      assignedToName: repName,
+      updated,
+      failed,
+      summary: { requested: leadIds.length, updated: updated.length, failed: failed.length },
+    });
+  } catch (err) {
+    logger.error("leads POST /bulk-assign error", { err });
+    return res.status(500).json({ error: "Failed to reassign leads." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // ROUTE 12 — POST /:id/win
 // ═══════════════════════════════════════════════════════════════
 
