@@ -1094,8 +1094,14 @@ const EFFECTIVE_LEAD_STATUS_EXPR = {
   },
 };
 
+// "Has a value" for a field that may be ABSENT: prod rows predate the
+// disposition / opportunity paths, so those fields are missing rather than
+// null, and `{ $ne: ["$missing", null] }` is TRUE in an aggregation expression
+// (found on the prod-copy rehearsal: funnel 939/939 contacted, 695 overdue).
+const HAS = (field: string) => ({ $ne: [{ $ifNull: [field, null] }, null] });
+
 // Funnel step predicates, cumulative by construction (each implies the previous).
-const STEP_CONTACTED = { $or: [{ $not: { $in: ["$effLead", ["NEW", "ASSIGNED"]] } }, { $ne: ["$dispositionAt", null] }] };
+const STEP_CONTACTED = { $or: [{ $not: { $in: ["$effLead", ["NEW", "ASSIGNED"]] } }, HAS("$dispositionAt")] };
 const STEP_INTERESTED = {
   $or: [
     { $eq: ["$disposition", "Interested"] },
@@ -1103,7 +1109,7 @@ const STEP_INTERESTED = {
     { $in: ["$effLead", ["ENGAGED", "QUALIFIED", "CONVERTED"]] },
   ],
 };
-const STEP_OPPORTUNITY = { $or: [{ $ne: ["$opportunityId", null] }, { $eq: ["$effLead", "CONVERTED"] }, { $eq: ["$effStatus", "Won"] }] };
+const STEP_OPPORTUNITY = { $or: [HAS("$opportunityId"), { $eq: ["$effLead", "CONVERTED"] }, { $eq: ["$effStatus", "Won"] }] };
 const STEP_WON = { $eq: ["$effStatus", "Won"] };
 const IS_OPEN = { $in: ["$effStatus", ["Open", "In-progress"]] };
 const pct = (a: number, b: number) => (b > 0 ? Math.round((a / b) * 1000) / 10 : null);
@@ -1258,7 +1264,7 @@ router.get("/reports/follow-up-health", async (req, res) => {
             _id: null,
             open: { $sum: 1 },
             dueToday: { $sum: { $cond: [{ $and: [{ $gte: ["$nextFollowUpDate", todayStart] }, { $lt: ["$nextFollowUpDate", dueBefore] }] }, 1, 0] } },
-            overdue: { $sum: { $cond: [{ $and: [{ $ne: ["$nextFollowUpDate", null] }, { $lt: ["$nextFollowUpDate", now] }] }, 1, 0] } },
+            overdue: { $sum: { $cond: [{ $and: [HAS("$nextFollowUpDate"), { $lt: ["$nextFollowUpDate", now] }] }, 1, 0] } },
             noNextAction: { $sum: { $cond: [{ $eq: [{ $ifNull: ["$nextFollowUpDate", null] }, null] }, 1, 0] } },
           },
         },

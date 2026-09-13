@@ -95,6 +95,21 @@ describe("GET /reports/funnel", () => {
     expect(r.body.overallConversion).toBe(20);
   });
 
+  it("treats ABSENT dispositionAt / opportunityId / nextFollowUpDate like null (prod rows predate those paths)", async () => {
+    // Raw inserts with NO disposition / opportunity / follow-up fields at all —
+    // the shape of every pre-migration prod row. `$ne: ["$missing", null]` is
+    // true in an aggregation, which made the prod-copy funnel read 939/939
+    // contacted and 939 opportunities, and follow-up health 695 overdue.
+    const bare = (o: Record<string, any>) => ({ _id: new mongoose.Types.ObjectId(), type: "company", stage: "new", source: "manual", dealValue: 0, createdAt: now, updatedAt: now, ...o });
+    await Lead.collection.insertMany([bare({ stage: "new" }), bare({ stage: "new" }), bare({ stage: "contacted" }), bare({ stage: "won" })] as any);
+
+    const funnel = await get("funnel");
+    expect(funnel.body.steps.map((s: any) => [s.key, s.count])).toEqual([["leads", 4], ["contacted", 2], ["interested", 1], ["opportunity", 1], ["won", 1]]);
+
+    const health = await get("follow-up-health");
+    expect(health.body).toMatchObject({ open: 3, overdue: 0, noNextAction: 3 });
+  });
+
   it("is zero-safe with no leads and honours the date range", async () => {
     await lead({ createdAt: daysAgo(40), stage: "won" });
     const r = await get(`funnel?dateFrom=${encodeURIComponent(daysAgo(7).toISOString())}`);
