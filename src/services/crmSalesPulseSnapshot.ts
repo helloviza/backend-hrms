@@ -6,7 +6,7 @@
 //
 // Reuse: the per-stage distribution, open-pipeline value, lead-ageing buckets
 // and the rep roster all come from buildOwnerStatusReport() — the SAME shared
-// aggregation the /leads/reports/owner-status route uses, so the numbers can
+// aggregation the command center's /leads/reports/hygiene panel uses, so the numbers can
 // never drift. Everything that is genuinely "today-only" (activity events,
 // stage movement, new leads, heatmap) is queried directly here, scoped to IST.
 //

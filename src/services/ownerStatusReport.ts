@@ -1,8 +1,10 @@
 // apps/backend/src/services/ownerStatusReport.ts
 //
-// Shared owner-status CRM aggregation, extracted verbatim from the
-// GET /leads/reports/owner-status route handler so it can be reused by both
-// that route AND the Sales Pulse snapshot service (services/crmSalesPulseSnapshot).
+// Shared owner-status CRM aggregation. Callers today: the Sales Pulse
+// snapshot (services/crmSalesPulseSnapshot — follows the flag) and
+// GET /leads/reports/hygiene (the command center's lead-hygiene panel —
+// vocabulary "v2", reads only the ageing / stale slices). The Owner Wise
+// report page and its /leads/reports/owner-status route are retired.
 //
 // Read-only. The snapshot is keyed on last_activity_date =
 //   max(latest LeadActivity.createdAt, Lead.createdAt)
@@ -44,7 +46,11 @@ export interface OwnerStatusParams {
   assignedTo?: string[];
   /** Validated stage values (subset of LEAD_STAGES). */
   stage?: string[];
+  /** Matches Lead.source only (legacy). */
   source?: string[];
+  /** Matches the lead's channel the way the command center derives it:
+   *  sourceChannel when set, else the legacy source. */
+  sourceChannel?: string[];
   /** "company" | "individual". */
   type?: string[];
   /** Day-bounded Date (or null) — filter on last_activity_date. */
@@ -106,11 +112,9 @@ const TYPE_LABEL: Record<string, string> = {
 
 export interface OwnerStatusOptions {
   /** Which vocabulary the report speaks. Default: the new taxonomy when
-   *  CRM_V2_OPPORTUNITY is on, legacy otherwise. The FE-facing route
-   *  (GET /leads/reports/owner-status) pins "legacy" for this slice because
-   *  pages/crm/Reports.tsx indexes statusSnapshot by the 9 legacy stage keys
-   *  and crashes on the 8 new ones (risk M12: backend first, frontend second).
-   *  Sales Pulse leaves it unset and follows the flag. */
+   *  CRM_V2_OPPORTUNITY is on, legacy otherwise. Sales Pulse leaves it unset
+   *  and follows the flag; /reports/hygiene pins "v2" so the command center
+   *  never speaks legacy stages or Lead.dealValue. */
   vocabulary?: "legacy" | "v2";
 }
 
@@ -121,6 +125,7 @@ export async function buildOwnerStatusReport(
   const assignedToF = (params.assignedTo ?? []).filter((s) => mongoose.isValidObjectId(s));
   const stageF = (params.stage ?? []).filter((s) => (LEAD_STAGES as readonly string[]).includes(s));
   const sourceF = params.source ?? [];
+  const sourceChannelF = params.sourceChannel ?? [];
   const typeF = (params.type ?? []).filter((s) => s === "company" || s === "individual");
 
   const fromMs = params.dateFrom && !isNaN(params.dateFrom.getTime()) ? params.dateFrom.getTime() : null;
@@ -133,6 +138,7 @@ export async function buildOwnerStatusReport(
     leadMatch.assignedTo = { $in: assignedToF.map((s) => new mongoose.Types.ObjectId(s)) };
   if (stageF.length) leadMatch.stage = { $in: stageF };
   if (sourceF.length) leadMatch.source = { $in: sourceF };
+  if (sourceChannelF.length) leadMatch.$or = [{ sourceChannel: { $in: sourceChannelF } }, { sourceChannel: { $in: [null, ""] }, source: { $in: sourceChannelF } }];
   if (typeF.length) leadMatch.type = { $in: typeF };
 
   const v2 = options.vocabulary ? options.vocabulary === "v2" : isCrmV2OpportunityEnabled();

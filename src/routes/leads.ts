@@ -905,17 +905,62 @@ function createdAtFilter(q: AnyObj): AnyObj {
   return f;
 }
 
+/** The command center's owner / source scope (the range bar's two extra
+ *  filters). `owner` = an assignee id or "unassigned"; `source` matches the
+ *  lead's channel the way /reports/by-source derives it — sourceChannel when
+ *  set, else the legacy source. */
+function ownerSourceFilter(q: AnyObj): AnyObj {
+  const f: AnyObj = {};
+  if (q.owner === "unassigned") f.assignedTo = null;
+  else if (q.owner && mongoose.isValidObjectId(String(q.owner))) f.assignedTo = new mongoose.Types.ObjectId(String(q.owner));
+  if (q.source) {
+    const src = String(q.source);
+    f.$or = [{ sourceChannel: src }, { sourceChannel: { $in: [null, ""] }, source: src }];
+  }
+  return f;
+}
+/** createdAt range + owner / source scope — what every range-bar panel matches on. */
+function scopeFilter(q: AnyObj): AnyObj {
+  return { ...createdAtFilter(q), ...ownerSourceFilter(q) };
+}
+/** Opportunity-side twin of the scope: owner → ownerUserId; a source filter
+ *  narrows to the deals of the leads that match it (deals carry no source). */
+async function opportunityScope(q: AnyObj): Promise<AnyObj> {
+  const f: AnyObj = {};
+  if (q.owner === "unassigned") f.ownerUserId = null;
+  else if (q.owner && mongoose.isValidObjectId(String(q.owner))) f.ownerUserId = new mongoose.Types.ObjectId(String(q.owner));
+  if (q.source) f.leadId = { $in: await Lead.distinct("_id", ownerSourceFilter({ source: q.source })) };
+  return f;
+}
+
+const INTERACTION_TYPES = ["call", "email", "meeting", "note"] as const;
+
 router.get("/reports/by-rep", async (req, res) => {
   try {
     const q = req.query as AnyObj;
-    const dateFilter = createdAtFilter(q);
+    const dateFilter = scopeFilter(q);
     const todayStartRaw = q.todayStart ? new Date(String(q.todayStart)) : null;
     const todayStart = todayStartRaw && !isNaN(todayStartRaw.getTime()) ? todayStartRaw : new Date(new Date().setHours(0, 0, 0, 0));
+    // Per-lead interaction counts (the old report's "activity effectiveness"),
+    // summed per owner below; `n(type)` reads one type's count out of the join.
+    const n = (type: string) => ({ $sum: { $map: { input: { $filter: { input: "$acts", cond: { $eq: ["$$this._id", type] } } }, in: "$$this.n" } } });
 
     const [reps, opps] = await Promise.all([
       Lead.aggregate([
         { $match: dateFilter },
-        { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
+        { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR, ageDays: { $floor: { $divide: [{ $subtract: ["$$NOW", "$createdAt"] }, DAY_MS] } } } },
+        {
+          $lookup: {
+            from: LeadActivity.collection.name,
+            let: { lid: "$_id" },
+            pipeline: [
+              { $match: { $expr: { $eq: ["$leadId", "$$lid"] }, type: { $in: [...INTERACTION_TYPES] } } },
+              { $group: { _id: "$type", n: { $sum: 1 } } },
+            ],
+            as: "acts",
+          },
+        },
+        { $addFields: { calls: n("call"), emails: n("email"), meetings: n("meeting"), notes: n("note") } },
         {
           $group: {
             _id: "$assignedTo",
@@ -927,6 +972,11 @@ router.get("/reports/by-rep", async (req, res) => {
             wonValue: { $sum: { $cond: [{ $eq: ["$effStatus", "Won"] }, "$dealValue", 0] } },
             pipelineValue: { $sum: { $cond: [{ $in: ["$effStatus", ["Open", "In-progress"]] }, "$dealValue", 0] } },
             dispositionedToday: { $sum: { $cond: [{ $gte: ["$dispositionAt", todayStart] }, 1, 0] } },
+            openAgeSum: { $sum: { $cond: [{ $in: ["$effStatus", ["Open", "In-progress"]] }, "$ageDays", 0] } },
+            calls: { $sum: "$calls" },
+            emails: { $sum: "$emails" },
+            meetings: { $sum: "$meetings" },
+            notes: { $sum: "$notes" },
           },
         },
         {
@@ -948,12 +998,16 @@ router.get("/reports/by-rep", async (req, res) => {
                 0,
               ],
             },
+            // Average age of the owner's OPEN leads (days since created) — how
+            // long their live work has been sitting. null when nothing is open.
+            avgOpenAgeDays: { $cond: [{ $gt: ["$open", 0] }, { $round: [{ $divide: ["$openAgeSum", "$open"] }, 0] }, null] },
+            activity: { calls: "$calls", emails: "$emails", meetings: "$meetings", notes: "$notes", total: { $add: ["$calls", "$emails", "$meetings", "$notes"] } },
           },
         },
         { $sort: { total: -1 } },
       ]),
       Opportunity.aggregate([
-        { $match: { stage: { $nin: ["closed_won", "closed_lost", "active_partner"] } } },
+        { $match: { ...(await opportunityScope(q)), stage: { $nin: ["closed_won", "closed_lost", "active_partner"] } } },
         { $group: { _id: "$ownerUserId", openOpportunities: { $sum: 1 } } },
       ]),
     ]);
@@ -984,7 +1038,7 @@ const DISPOSITION_STATUSES = ["Open", "In-progress", "Won", "Lost"] as const;
 router.get("/reports/by-status", async (req, res) => {
   try {
     const rows = await Lead.aggregate([
-      { $match: createdAtFilter(req.query as AnyObj) },
+      { $match: scopeFilter(req.query as AnyObj) },
       { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
       { $group: { _id: "$effStatus", count: { $sum: 1 }, value: { $sum: "$dealValue" } } },
     ]);
@@ -1040,7 +1094,7 @@ const pct = (a: number, b: number) => (b > 0 ? Math.round((a / b) * 1000) / 10 :
 router.get("/reports/funnel", async (req, res) => {
   try {
     const rows = await Lead.aggregate([
-      { $match: createdAtFilter(req.query as AnyObj) },
+      { $match: scopeFilter(req.query as AnyObj) },
       { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR, effLead: EFFECTIVE_LEAD_STATUS_EXPR } },
       {
         $group: {
@@ -1075,7 +1129,7 @@ router.get("/reports/funnel", async (req, res) => {
 router.get("/reports/by-source", async (req, res) => {
   try {
     const rows = await Lead.aggregate([
-      { $match: createdAtFilter(req.query as AnyObj) },
+      { $match: scopeFilter(req.query as AnyObj) },
       {
         $addFields: {
           effStatus: EFFECTIVE_STATUS_EXPR,
@@ -1215,7 +1269,8 @@ router.get("/reports/kpis", async (req, res) => {
   try {
     const q = req.query as AnyObj;
     const now = new Date();
-    const range = createdAtFilter(q);
+    const range = scopeFilter(q);
+    const scope = ownerSourceFilter(q);
     const from = range.createdAt?.$gte as Date | undefined;
     const to = range.createdAt?.$lte as Date | undefined;
     const todayStartRaw = q.todayStart ? new Date(String(q.todayStart)) : null;
@@ -1225,18 +1280,21 @@ router.get("/reports/kpis", async (req, res) => {
     let prior: AnyObj | null = null;
     if (from && to && to.getTime() > from.getTime()) {
       const len = to.getTime() - from.getTime();
-      prior = { createdAt: { $gte: new Date(from.getTime() - len - 1), $lt: from } };
+      prior = { ...scope, createdAt: { $gte: new Date(from.getTime() - len - 1), $lt: from } };
     }
 
+    // Owner / source scope applies to every tile; the range only to new leads.
     const [current, priorCount, openAgg, hotAgg, oppAgg] = await Promise.all([
       Lead.countDocuments(range),
       prior ? Lead.countDocuments(prior) : Promise.resolve(null),
       Lead.aggregate([
+        { $match: scope },
         { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
         { $match: { $expr: IS_OPEN } },
         { $group: { _id: null, count: { $sum: 1 }, value: { $sum: "$dealValue" } } },
       ]),
       Lead.aggregate([
+        { $match: scope },
         { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
         { $match: { $expr: IS_OPEN } },
         { $lookup: { from: LeadActivity.collection.name, localField: "_id", foreignField: "leadId", as: "last", pipeline: [{ $sort: { createdAt: -1 } }, { $limit: 1 }, { $project: { createdAt: 1 } }] } },
@@ -1253,7 +1311,7 @@ router.get("/reports/kpis", async (req, res) => {
         { $count: "n" },
       ]),
       Opportunity.aggregate([
-        { $match: { stage: { $nin: ["closed_won", "closed_lost", "active_partner"] } } },
+        { $match: { ...(await opportunityScope(q)), stage: { $nin: ["closed_won", "closed_lost", "active_partner"] } } },
         { $group: { _id: null, count: { $sum: 1 }, value: { $sum: "$dealValue" } } },
       ]),
     ]);
@@ -1357,57 +1415,46 @@ router.get("/reports/monthly", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// ROUTE 5b — GET /reports/owner-status  (Owner Wise Lead Status Report)
+// ROUTE 5b — GET /reports/hygiene  (Lead hygiene by owner — command center)
 // ═══════════════════════════════════════════════════════════════
-// Read-only. The snapshot is keyed on last_activity_date =
-//   max(latest LeadActivity.createdAt, Lead.createdAt)
-// which is computed per lead FIRST, then the date-range filter is applied to it
-// (the other filters are plain lead fields, matched in Mongo up front).
-// Optional multi-value params (comma-separated or repeated): dateFrom, dateTo
-// (on last_activity_date), assignedTo, stage, source, type.
-// Sits beside /reports/* so it inherits requireAuth + requireHouse + leads access.
-router.get("/reports/owner-status", async (req, res) => {
+// The two views the retired Owner Wise report had that nothing else did:
+// ageing of OPEN leads by days since last activity (0-7 / 8-14 / 15-30 /
+// 31-60 / 60+) and stale leads (14+ days, critical 30+) with the ₹ at risk.
+// Spoken in the v2 vocabulary — services/ownerStatusReport with
+// vocabulary:"v2": "open" = lead status not CONVERTED/LOST OR an open
+// Opportunity, and ₹ at risk is the open Opportunity's dealValue, never
+// Lead.dealValue — so it agrees with the board and the rest of /crm.
+// No date range: hygiene is about today's open work (like follow-up health).
+// Optional owner (assignee id | "unassigned") and source (sourceChannel, else
+// legacy source — the by-source derivation) scope it like the other panels.
+router.get("/reports/hygiene", async (req, res) => {
   try {
     const q = req.query as AnyObj;
-
-    const toArr = (v: unknown): string[] => {
-      if (v == null) return [];
-      const raw = Array.isArray(v) ? v : String(v).split(",");
-      return raw.map((s) => String(s).trim()).filter(Boolean);
-    };
-
-    const assignedToF = toArr(q.assignedTo).filter((s) => mongoose.isValidObjectId(s));
-    const stageF = toArr(q.stage).filter((s) => (LEAD_STAGES as readonly string[]).includes(s));
-    const sourceF = toArr(q.source);
-    const typeF = toArr(q.type).filter((s) => s === "company" || s === "individual");
-
-    const dateFrom = q.dateFrom ? new Date(String(q.dateFrom)) : null;
-    const dateTo = q.dateTo ? new Date(String(q.dateTo)) : null;
-    if (dateFrom && !isNaN(dateFrom.getTime())) dateFrom.setHours(0, 0, 0, 0);
-    if (dateTo && !isNaN(dateTo.getTime())) dateTo.setHours(23, 59, 59, 999);
-    // Aggregation extracted to services/ownerStatusReport so the Sales Pulse
-    // snapshot reuses identical numbers. The route only parses/validates the
-    // query (above) and shapes the response (the service returns it whole).
-    // Slice 2: this route feeds pages/crm/Reports.tsx, which indexes the
-    // snapshot by the 9 legacy stage keys — pin the legacy vocabulary until
-    // the frontend is taught the new one (risk M12). Sales Pulse follows the
-    // flag through the same builder.
+    const ownerId = q.owner && q.owner !== "unassigned" && mongoose.isValidObjectId(String(q.owner)) ? String(q.owner) : null;
     const report = await buildOwnerStatusReport(
-      {
-        assignedTo: assignedToF,
-        stage: stageF,
-        source: sourceF,
-        type: typeF,
-        dateFrom,
-        dateTo,
-      },
-      { vocabulary: "legacy" },
+      { assignedTo: ownerId ? [ownerId] : [], sourceChannel: q.source ? [String(q.source)] : [] },
+      { vocabulary: "v2" },
     );
-
-    return res.json(report);
+    const staleBy = new Map(report.stale.byOwner.map((o) => [o.ownerId, o]));
+    let byOwner = report.ageing.byOwner
+      .map((o) => {
+        const s = staleBy.get(o.ownerId);
+        return { ownerId: o.ownerId === "unassigned" ? null : o.ownerId, ownerName: o.ownerName, open: o.total, buckets: o.buckets, stale: s?.count || 0, critical: s?.criticalCount || 0, atRisk: s?.potentialValue || 0 };
+      })
+      .filter((o) => o.open > 0);
+    if (q.owner === "unassigned") byOwner = byOwner.filter((o) => o.ownerId === null);
+    byOwner.sort((a, b) => b.stale - a.stale || b.open - a.open);
+    const buckets = report.ageing.buckets.map((b) => ({ key: b.key, label: b.label, count: byOwner.reduce((s, o) => s + (o.buckets[b.key] || 0), 0) }));
+    return res.json({
+      openTotal: byOwner.reduce((s, o) => s + o.open, 0),
+      buckets,
+      stale: { thresholdDays: report.stale.thresholdDays, criticalDays: report.stale.criticalDays, total: byOwner.reduce((s, o) => s + o.stale, 0), critical: byOwner.reduce((s, o) => s + o.critical, 0), atRisk: byOwner.reduce((s, o) => s + o.atRisk, 0) },
+      byOwner,
+      generatedAt: report.generatedAt,
+    });
   } catch (err) {
-    logger.error("leads GET /reports/owner-status error", { err });
-    return res.status(500).json({ error: "Failed to load owner-status report." });
+    logger.error("leads GET /reports/hygiene error", { err });
+    return res.status(500).json({ error: "Failed to load lead hygiene." });
   }
 });
 
