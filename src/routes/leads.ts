@@ -869,57 +869,102 @@ router.get("/reports/summary", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// ROUTE 4 — GET /reports/by-rep
+// ROUTE 4 — GET /reports/by-rep  (Agent-wise snapshot, ask #10)
 // ═══════════════════════════════════════════════════════════════
+// Per owner: leads owned, dispositioned today, open leads, won (count + ₹),
+// win rate, open opportunities. Optional dateFrom / dateTo scope the LEAD
+// rows on createdAt; `todayStart` (ISO, the caller's start of day) scopes
+// "dispositioned today" — defaults to the server's. Won / lost read the
+// effective disposition status (dispositionStatus, else the legacy stage)
+// so pre-disposition rows still count. Open opportunities come from a
+// second aggregate on Opportunity.ownerUserId, joined here by rep id.
 
-router.get("/reports/by-rep", async (_req, res) => {
+/** Effective disposition status: dispositionStatus, else legacy stage → Won / Lost / Open. */
+const EFFECTIVE_STATUS_EXPR = {
+  $switch: {
+    branches: [
+      { case: { $in: ["$dispositionStatus", ["Won", "Lost", "In-progress", "Open"]] }, then: "$dispositionStatus" },
+      { case: { $eq: ["$stage", "won"] }, then: "Won" },
+      { case: { $eq: ["$stage", "lost"] }, then: "Lost" },
+    ],
+    default: "Open",
+  },
+};
+
+function createdAtFilter(q: AnyObj): AnyObj {
+  const f: AnyObj = {};
+  const from = q.dateFrom ? new Date(String(q.dateFrom)) : null;
+  const to = q.dateTo ? new Date(String(q.dateTo)) : null;
+  if ((from && !isNaN(from.getTime())) || (to && !isNaN(to.getTime()))) {
+    f.createdAt = {};
+    if (from && !isNaN(from.getTime())) f.createdAt.$gte = from;
+    if (to && !isNaN(to.getTime())) f.createdAt.$lte = to;
+  }
+  return f;
+}
+
+router.get("/reports/by-rep", async (req, res) => {
   try {
-    const reps = await Lead.aggregate([
-      {
-        $group: {
-          _id: "$assignedTo",
-          repName: { $first: "$assignedToName" },
-          total: { $sum: 1 },
-          won: { $sum: { $cond: [{ $eq: ["$stage", "won"] }, 1, 0] } },
-          lost: { $sum: { $cond: [{ $eq: ["$stage", "lost"] }, 1, 0] } },
-          pipelineValue: {
-            $sum: {
+    const q = req.query as AnyObj;
+    const dateFilter = createdAtFilter(q);
+    const todayStartRaw = q.todayStart ? new Date(String(q.todayStart)) : null;
+    const todayStart = todayStartRaw && !isNaN(todayStartRaw.getTime()) ? todayStartRaw : new Date(new Date().setHours(0, 0, 0, 0));
+
+    const [reps, opps] = await Promise.all([
+      Lead.aggregate([
+        { $match: dateFilter },
+        { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
+        {
+          $group: {
+            _id: "$assignedTo",
+            repName: { $first: "$assignedToName" },
+            total: { $sum: 1 },
+            won: { $sum: { $cond: [{ $eq: ["$effStatus", "Won"] }, 1, 0] } },
+            lost: { $sum: { $cond: [{ $eq: ["$effStatus", "Lost"] }, 1, 0] } },
+            open: { $sum: { $cond: [{ $in: ["$effStatus", ["Open", "In-progress"]] }, 1, 0] } },
+            wonValue: { $sum: { $cond: [{ $eq: ["$effStatus", "Won"] }, "$dealValue", 0] } },
+            pipelineValue: { $sum: { $cond: [{ $in: ["$effStatus", ["Open", "In-progress"]] }, "$dealValue", 0] } },
+            dispositionedToday: { $sum: { $cond: [{ $gte: ["$dispositionAt", todayStart] }, 1, 0] } },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            repId: "$_id",
+            repName: 1,
+            total: 1,
+            won: 1,
+            lost: 1,
+            open: 1,
+            wonValue: 1,
+            pipelineValue: 1,
+            dispositionedToday: 1,
+            conversion: {
               $cond: [
-                { $and: [{ $ne: ["$stage", "won"] }, { $ne: ["$stage", "lost"] }] },
-                "$dealValue",
+                { $gt: [{ $add: ["$won", "$lost"] }, 0] },
+                { $round: [{ $multiply: [{ $divide: ["$won", { $add: ["$won", "$lost"] }] }, 100] }, 1] },
                 0,
               ],
             },
           },
         },
-      },
-      {
-        $project: {
-          _id: 0,
-          repId: "$_id",
-          repName: 1,
-          total: 1,
-          won: 1,
-          lost: 1,
-          pipelineValue: 1,
-          conversion: {
-            $cond: [
-              { $gt: [{ $add: ["$won", "$lost"] }, 0] },
-              {
-                $round: [
-                  { $multiply: [{ $divide: ["$won", { $add: ["$won", "$lost"] }] }, 100] },
-                  1,
-                ],
-              },
-              0,
-            ],
-          },
-        },
-      },
-      { $sort: { total: -1 } },
+        { $sort: { total: -1 } },
+      ]),
+      Opportunity.aggregate([
+        { $match: { stage: { $nin: ["closed_won", "closed_lost", "active_partner"] } } },
+        { $group: { _id: "$ownerUserId", openOpportunities: { $sum: 1 } } },
+      ]),
     ]);
 
-    return res.json({ reps });
+    const oppByRep = new Map<string, number>(opps.map((o: any) => [String(o._id), o.openOpportunities]));
+    const withOpps = reps.map((r: any) => ({
+      ...r,
+      repId: r.repId ? String(r.repId) : null,
+      repName: r.repName || (r.repId ? "" : "Unassigned"),
+      openOpportunities: oppByRep.get(String(r.repId)) || 0,
+    }));
+
+    return res.json({ reps: withOpps, todayStart: todayStart.toISOString() });
   } catch (err) {
     logger.error("leads GET /reports/by-rep error", { err });
     return res.status(500).json({ error: "Failed to load rep report." });
@@ -927,36 +972,107 @@ router.get("/reports/by-rep", async (_req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// ROUTE 5 — GET /reports/monthly
+// ROUTE 4b — GET /reports/by-status  (Status-wise snapshot, ask #10)
 // ═══════════════════════════════════════════════════════════════
+// Counts per DISPOSITION status (Open / In-progress / Won / Lost), not the
+// legacy stages. Rows never dispositioned map through the legacy stage, so
+// the four buckets always sum to the total. Optional dateFrom / dateTo.
+const DISPOSITION_STATUSES = ["Open", "In-progress", "Won", "Lost"] as const;
 
-router.get("/reports/monthly", async (_req, res) => {
+router.get("/reports/by-status", async (req, res) => {
   try {
-    const twelveMonthsAgo = new Date();
-    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
+    const rows = await Lead.aggregate([
+      { $match: createdAtFilter(req.query as AnyObj) },
+      { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
+      { $group: { _id: "$effStatus", count: { $sum: 1 }, value: { $sum: "$dealValue" } } },
+    ]);
+    const map = new Map<string, { count: number; value: number }>(rows.map((r: any) => [r._id, { count: r.count, value: r.value }]));
+    const byStatus = DISPOSITION_STATUSES.map((status) => ({ status, count: map.get(status)?.count || 0, value: map.get(status)?.value || 0 }));
+    return res.json({ byStatus, total: byStatus.reduce((s, b) => s + b.count, 0) });
+  } catch (err) {
+    logger.error("leads GET /reports/by-status error", { err });
+    return res.status(500).json({ error: "Failed to load status report." });
+  }
+});
 
-    const monthly = await Lead.aggregate([
-      { $match: { createdAt: { $gte: twelveMonthsAgo } } },
+// ═══════════════════════════════════════════════════════════════
+// ROUTE 4c — GET /reports/daily?days=30  (Day-wise snapshot, ask #10)
+// ═══════════════════════════════════════════════════════════════
+// Leads created per day for the last N days (default 30, max 92), and how
+// many of those are won today — the same "won" reading as /reports/monthly.
+// Days are bucketed in the caller's timezone (`tz`, IANA, default UTC) and
+// every day in the window is present, zero-filled.
+router.get("/reports/daily", async (req, res) => {
+  try {
+    const q = req.query as AnyObj;
+    const days = Math.min(92, Math.max(1, parseInt(String(q.days || "30"), 10) || 30));
+    const tz = typeof q.tz === "string" && q.tz ? q.tz : "UTC";
+    const now = new Date();
+    const from = new Date(now.getTime() - (days - 1) * 86_400_000);
+    from.setUTCHours(0, 0, 0, 0);
+    // One extra day of slack so a tz ahead of UTC still gets its first bucket.
+    const matchFrom = new Date(from.getTime() - 86_400_000);
+
+    let rows: any[];
+    let fmt: Intl.DateTimeFormat;
+    try {
+      fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+      rows = await Lead.aggregate([
+        { $match: { createdAt: { $gte: matchFrom } } },
+        { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR, day: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: tz } } } },
+        { $group: { _id: "$day", created: { $sum: 1 }, won: { $sum: { $cond: [{ $eq: ["$effStatus", "Won"] }, 1, 0] } } } },
+      ]);
+    } catch {
+      return res.status(400).json({ error: "Unknown timezone." });
+    }
+    const map = new Map<string, { created: number; won: number }>(rows.map((r) => [r._id, { created: r.created, won: r.won }]));
+    const daily: Array<{ day: string; created: number; won: number }> = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const day = fmt.format(new Date(now.getTime() - i * 86_400_000));
+      daily.push({ day, created: map.get(day)?.created || 0, won: map.get(day)?.won || 0 });
+    }
+    return res.json({ daily, days, tz });
+  } catch (err) {
+    logger.error("leads GET /reports/daily error", { err });
+    return res.status(500).json({ error: "Failed to load daily report." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTE 5 — GET /reports/monthly  (Month-wise snapshot, ask #10)
+// ═══════════════════════════════════════════════════════════════
+// Leads created per month over the last 12, and how many of those are won /
+// lost today (effective disposition status). Every month is present,
+// zero-filled; `key` is YYYY-MM for stable charting, `month` the label.
+router.get("/reports/monthly", async (req, res) => {
+  try {
+    const q = req.query as AnyObj;
+    const months = Math.min(36, Math.max(1, parseInt(String(q.months || "12"), 10) || 12));
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth() - (months - 1), 1);
+
+    const rows = await Lead.aggregate([
+      { $match: { createdAt: { $gte: start } } },
+      { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
       {
         $group: {
           _id: { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } },
           new: { $sum: 1 },
-          won: { $sum: { $cond: [{ $eq: ["$stage", "won"] }, 1, 0] } },
-          lost: { $sum: { $cond: [{ $eq: ["$stage", "lost"] }, 1, 0] } },
+          won: { $sum: { $cond: [{ $eq: ["$effStatus", "Won"] }, 1, 0] } },
+          lost: { $sum: { $cond: [{ $eq: ["$effStatus", "Lost"] }, 1, 0] } },
         },
       },
-      { $sort: { "_id.year": 1, "_id.month": 1 } },
     ]);
-
     const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    const formatted = monthly.map((m: any) => ({
-      month: `${MONTHS[m._id.month - 1]} ${m._id.year}`,
-      new: m.new,
-      won: m.won,
-      lost: m.lost,
-    }));
-
-    return res.json({ monthly: formatted });
+    const map = new Map<string, any>(rows.map((m: any) => [`${m._id.year}-${String(m._id.month).padStart(2, "0")}`, m]));
+    const monthly: Array<{ key: string; month: string; new: number; won: number; lost: number }> = [];
+    for (let i = 0; i < months; i++) {
+      const d = new Date(start.getFullYear(), start.getMonth() + i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      const m = map.get(key);
+      monthly.push({ key, month: `${MONTHS[d.getMonth()]} ${d.getFullYear()}`, new: m?.new || 0, won: m?.won || 0, lost: m?.lost || 0 });
+    }
+    return res.json({ monthly });
   } catch (err) {
     logger.error("leads GET /reports/monthly error", { err });
     return res.status(500).json({ error: "Failed to load monthly report." });
