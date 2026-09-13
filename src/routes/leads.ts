@@ -1492,6 +1492,43 @@ router.get("/reports/hygiene", async (req, res) => {
   }
 });
 
+// ── GET /reports/owner-status — LEGACY Owner Wise report (pages/crm/Reports) ──
+// Kept for the flags-OFF frontend, which still routes /crm/reports to the
+// legacy page: it indexes statusSnapshot by the 9 legacy stage keys, so the
+// vocabulary is pinned. Retire with the flag. Scope follows crmScope like
+// every other report: an OWN rep gets their own rows regardless of the
+// assignedTo filter.
+router.get("/reports/owner-status", async (req, res) => {
+  try {
+    const q = req.query as AnyObj;
+    const toArr = (v: unknown): string[] => {
+      if (v == null) return [];
+      const raw = Array.isArray(v) ? v : String(v).split(",");
+      return raw.map((s) => String(s).trim()).filter(Boolean);
+    };
+    const scope = leadScope(req);
+    const assignedToF = isAll(scope)
+      ? toArr(q.assignedTo).filter((s) => mongoose.isValidObjectId(s))
+      : scope.userId ? [String(scope.userId)] : [];
+    if (!isAll(scope) && !assignedToF.length) return res.status(403).json({ error: "No lead scope." });
+    const stageF = toArr(q.stage).filter((s) => (LEAD_STAGES as readonly string[]).includes(s));
+    const sourceF = toArr(q.source);
+    const typeF = toArr(q.type).filter((s) => s === "company" || s === "individual");
+    const dateFrom = q.dateFrom ? new Date(String(q.dateFrom)) : null;
+    const dateTo = q.dateTo ? new Date(String(q.dateTo)) : null;
+    if (dateFrom && !isNaN(dateFrom.getTime())) dateFrom.setHours(0, 0, 0, 0);
+    if (dateTo && !isNaN(dateTo.getTime())) dateTo.setHours(23, 59, 59, 999);
+    const report = await buildOwnerStatusReport(
+      { assignedTo: assignedToF, stage: stageF, source: sourceF, type: typeF, dateFrom, dateTo },
+      { vocabulary: "legacy" },
+    );
+    return res.json(report);
+  } catch (err) {
+    logger.error("leads GET /reports/owner-status error", { err });
+    return res.status(500).json({ error: "Failed to load owner-status report." });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════
 // ROUTE 6 — GET /export  (XLSX)
 // ═══════════════════════════════════════════════════════════════

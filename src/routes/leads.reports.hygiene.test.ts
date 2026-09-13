@@ -192,3 +192,20 @@ describe("owner / source scope on the command-center aggregates", () => {
     expect((await get("by-rep")).body.reps[0].avgOpenAgeDays).toBeNull();
   });
 });
+
+describe("GET /reports/owner-status — LEGACY Owner Wise report (flags-off /crm/reports)", () => {
+  it("still serves the legacy 9-stage vocabulary the pre-v2 Reports page indexes by", async () => {
+    await Lead.deleteMany({});
+    await lead({ assignedTo: NEEL, assignedToName: "Neel", stage: "contacted" });
+    await lead({ assignedTo: NEEL, assignedToName: "Neel", stage: "won" });
+    await lead({ assignedTo: NEEL, assignedToName: "Neel", stage: "lost" });
+    const r = await get("owner-status");
+    expect(r.status).toBe(200);
+    // legacy stage keys, not the v2 statuses (NEW / CONTACTED / CONVERTED / LOST)
+    const stages = r.body.statusSnapshot.map((s: any) => s.stage);
+    expect(stages).toEqual(expect.arrayContaining(["new", "contacted", "proposal_sent", "won", "lost"]));
+    expect(stages).not.toContain("CONVERTED");
+    expect(r.body.totals.byStatus).toMatchObject({ contacted: 1, won: 1, lost: 1 });
+    expect(r.body.ownerMatrix.owners.some((o: any) => o.ownerName === "Neel" && o.total === 3)).toBe(true);
+  });
+});
