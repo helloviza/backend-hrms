@@ -773,6 +773,15 @@ router.get("/", async (req, res) => {
       filter.companyId = new mongoose.Types.ObjectId(String(q.companyId));
     }
 
+    // Additive read filter — the Leads page's Today view (ask #11): follow-up
+    // overdue or due today. The client sends its own end-of-day cutoff (its
+    // timezone), so "today" here is exactly the Inbox's derivation:
+    // nextFollowUpDate < startOfTomorrow.
+    if (q.dueBefore) {
+      const cutoff = new Date(String(q.dueBefore));
+      if (!isNaN(cutoff.getTime())) filter.nextFollowUpDate = { $lt: cutoff };
+    }
+
     if (q.dateFrom || q.dateTo) {
       filter.createdAt = {};
       if (q.dateFrom) filter.createdAt.$gte = new Date(String(q.dateFrom));
