@@ -2075,6 +2075,10 @@ router.get("/:id/dispositions", async (req, res) => {
         })),
       })),
       current: snapshotOf(lead as any),
+      // The legacy stage travels with the snapshot so the UI can tell a
+      // migrated lead (worked before dispositions existed) from a fresh one
+      // instead of calling every pre-migration row "not worked yet".
+      legacyStage: String((lead as any).stage || ""),
       opportunityId: (lead as any).opportunityId ? String((lead as any).opportunityId) : null,
     });
   } catch (err) {
