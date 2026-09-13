@@ -124,6 +124,7 @@ import meetingRoutes from "./routes/meetings.js";
 import leadsRouter from "./routes/leads.js";
 import crmCompaniesRouter from "./routes/crm.companies.js";
 import crmContactsRouter from "./routes/crm.contacts.js";
+import opportunitiesRouter from "./routes/opportunities.js";
 
 // ✅ Shared location service — boot-time assertion of the trust-proxy assumption
 import { logProxyTrustAssumption } from "./services/location.service.js";
@@ -1103,6 +1104,7 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/leads", requireAuth, requireWorkspace, requireFeature("crmEnabled"), leadsRouter);
   app.use("/api/crm/companies", requireAuth, requireWorkspace, requireFeature("crmEnabled"), crmCompaniesRouter);
   app.use("/api/crm/contacts", requireAuth, requireWorkspace, requireFeature("crmEnabled"), crmContactsRouter);
+  app.use("/api/opportunities", requireAuth, requireWorkspace, requireFeature("crmEnabled"), opportunitiesRouter);
 }
 
 // Tasks / Reminders

@@ -92,8 +92,10 @@ async function runOpportunitySplit(
 }
 
 // ── requireLeadsAccess ──────────────────────────────────────────
+// Exported: routes/opportunities.ts sits behind the same gate (an opportunity
+// is the lead's deal — one permission module, one scope).
 
-async function requireLeadsAccess(
+export async function requireLeadsAccess(
   req: express.Request,
   res: express.Response,
   next: express.NextFunction
