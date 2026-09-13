@@ -2123,6 +2123,10 @@ router.post("/:id/assign", async (req, res) => {
       },
       { $set: { assignedTo: lead.assignedTo } }
     ).catch((err: any) => logger.error("leads assign cascade error", { err }));
+    // …and the shadow opportunity's owner (the disposition service only stamps
+    // it when empty, so without this the OWN-scoped board drifts from the lead).
+    Opportunity.updateOne({ leadId: lead._id }, { $set: { ownerUserId: lead.assignedTo, ownerName: lead.assignedToName } })
+      .catch((err: any) => logger.error("leads assign opportunity cascade error", { err }));
 
     return res.json({ lead });
   } catch (err) {
@@ -2207,6 +2211,8 @@ router.post("/bulk-assign", async (req, res) => {
           },
           { $set: { assignedTo: lead.assignedTo } }
         ).catch((err: any) => logger.error("leads bulk-assign cascade error", { err }));
+        Opportunity.updateOne({ leadId: lead._id }, { $set: { ownerUserId: lead.assignedTo, ownerName: lead.assignedToName } })
+          .catch((err: any) => logger.error("leads bulk-assign opportunity cascade error", { err }));
 
         updated.push({ _id: String(lead._id), leadCode: lead.leadCode, previousOwnerName, unchanged });
       } catch (e: any) {
