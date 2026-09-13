@@ -996,6 +996,281 @@ router.get("/reports/by-status", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// Command center aggregates (ask: CRM command center)
+// ═══════════════════════════════════════════════════════════════
+// Everything below is a Mongo aggregation over the leads (and activities /
+// opportunities) collections — the dashboard never pulls lead rows. All
+// share EFFECTIVE_STATUS_EXPR (disposition status, legacy stage as the
+// fallback) and createdAtFilter (dateFrom / dateTo on createdAt).
+
+/** Effective LEAD status (the v2 taxonomy): stored status, else the legacy
+ *  stage through the same table the model's pre-validate uses. */
+const EFFECTIVE_LEAD_STATUS_EXPR = {
+  $switch: {
+    branches: [
+      { case: { $in: ["$status", ["NEW", "ASSIGNED", "CONTACTED", "ENGAGED", "QUALIFIED", "CONVERTED", "NURTURE", "LOST"]] }, then: "$status" },
+      { case: { $in: ["$stage", ["email_sent", "contacted", "follow_up"]] }, then: "CONTACTED" },
+      { case: { $eq: ["$stage", "demo_scheduled"] }, then: "ENGAGED" },
+      { case: { $in: ["$stage", ["proposal_sent", "negotiation", "won"]] }, then: "CONVERTED" },
+      { case: { $eq: ["$stage", "lost"] }, then: "LOST" },
+    ],
+    default: "NEW",
+  },
+};
+
+// Funnel step predicates, cumulative by construction (each implies the previous).
+const STEP_CONTACTED = { $or: [{ $not: { $in: ["$effLead", ["NEW", "ASSIGNED"]] } }, { $ne: ["$dispositionAt", null] }] };
+const STEP_INTERESTED = {
+  $or: [
+    { $eq: ["$disposition", "Interested"] },
+    { $in: ["$effStatus", ["In-progress", "Won"]] },
+    { $in: ["$effLead", ["ENGAGED", "QUALIFIED", "CONVERTED"]] },
+  ],
+};
+const STEP_OPPORTUNITY = { $or: [{ $ne: ["$opportunityId", null] }, { $eq: ["$effLead", "CONVERTED"] }, { $eq: ["$effStatus", "Won"] }] };
+const STEP_WON = { $eq: ["$effStatus", "Won"] };
+const IS_OPEN = { $in: ["$effStatus", ["Open", "In-progress"]] };
+const pct = (a: number, b: number) => (b > 0 ? Math.round((a / b) * 1000) / 10 : null);
+
+// ── GET /reports/funnel ──────────────────────────────────────────
+// lead → contacted → interested → opportunity → won for leads created in the
+// range, with each step's conversion from the previous step and from the top.
+router.get("/reports/funnel", async (req, res) => {
+  try {
+    const rows = await Lead.aggregate([
+      { $match: createdAtFilter(req.query as AnyObj) },
+      { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR, effLead: EFFECTIVE_LEAD_STATUS_EXPR } },
+      {
+        $group: {
+          _id: null,
+          leads: { $sum: 1 },
+          contacted: { $sum: { $cond: [STEP_CONTACTED, 1, 0] } },
+          interested: { $sum: { $cond: [STEP_INTERESTED, 1, 0] } },
+          opportunity: { $sum: { $cond: [STEP_OPPORTUNITY, 1, 0] } },
+          won: { $sum: { $cond: [STEP_WON, 1, 0] } },
+          wonValue: { $sum: { $cond: [STEP_WON, "$dealValue", 0] } },
+        },
+      },
+    ]);
+    const r = rows[0] || { leads: 0, contacted: 0, interested: 0, opportunity: 0, won: 0, wonValue: 0 };
+    const order: Array<[string, string, number]> = [["leads", "Leads", r.leads], ["contacted", "Contacted", r.contacted], ["interested", "Interested", r.interested], ["opportunity", "Opportunity", r.opportunity], ["won", "Won", r.won]];
+    const steps = order.map(([key, label, count], i) => ({
+      key, label, count,
+      fromPrevious: i === 0 ? null : pct(count, order[i - 1][2]),
+      fromTop: i === 0 ? null : pct(count, r.leads),
+    }));
+    return res.json({ steps, wonValue: r.wonValue, overallConversion: pct(r.won, r.leads) });
+  } catch (err) {
+    logger.error("leads GET /reports/funnel error", { err });
+    return res.status(500).json({ error: "Failed to load funnel." });
+  }
+});
+
+// ── GET /reports/by-source ───────────────────────────────────────
+// Source-to-outcome: per source (sourceChannel, else legacy source) — leads,
+// contacted, interested, opportunities, won, lost, conversion %, pipeline ₹
+// (open dealValue), won ₹. Same range filter as the funnel.
+router.get("/reports/by-source", async (req, res) => {
+  try {
+    const rows = await Lead.aggregate([
+      { $match: createdAtFilter(req.query as AnyObj) },
+      {
+        $addFields: {
+          effStatus: EFFECTIVE_STATUS_EXPR,
+          effLead: EFFECTIVE_LEAD_STATUS_EXPR,
+          src: { $cond: [{ $gt: [{ $strLenCP: { $ifNull: ["$sourceChannel", ""] } }, 0] }, "$sourceChannel", { $ifNull: ["$source", "other"] }] },
+        },
+      },
+      {
+        $group: {
+          _id: "$src",
+          leads: { $sum: 1 },
+          contacted: { $sum: { $cond: [STEP_CONTACTED, 1, 0] } },
+          interested: { $sum: { $cond: [STEP_INTERESTED, 1, 0] } },
+          opportunities: { $sum: { $cond: [STEP_OPPORTUNITY, 1, 0] } },
+          won: { $sum: { $cond: [STEP_WON, 1, 0] } },
+          lost: { $sum: { $cond: [{ $eq: ["$effStatus", "Lost"] }, 1, 0] } },
+          wonValue: { $sum: { $cond: [STEP_WON, "$dealValue", 0] } },
+          pipelineValue: { $sum: { $cond: [IS_OPEN, "$dealValue", 0] } },
+        },
+      },
+      { $sort: { leads: -1, _id: 1 } },
+    ]);
+    const sources = rows.map((r: any) => ({
+      source: r._id || "other",
+      leads: r.leads, contacted: r.contacted, interested: r.interested, opportunities: r.opportunities, won: r.won, lost: r.lost,
+      wonValue: r.wonValue, pipelineValue: r.pipelineValue,
+      conversion: pct(r.won, r.leads),
+    }));
+    return res.json({ sources, total: sources.reduce((s, r) => s + r.leads, 0) });
+  } catch (err) {
+    logger.error("leads GET /reports/by-source error", { err });
+    return res.status(500).json({ error: "Failed to load source report." });
+  }
+});
+
+// ── GET /reports/activity?todayStart=&tz=&days=7 ─────────────────
+// Team activity logged today (LeadActivity rows by type since the caller's
+// start of day) plus a per-day total over the trailing `days` for the trend.
+router.get("/reports/activity", async (req, res) => {
+  try {
+    const q = req.query as AnyObj;
+    const todayStartRaw = q.todayStart ? new Date(String(q.todayStart)) : null;
+    const todayStart = todayStartRaw && !isNaN(todayStartRaw.getTime()) ? todayStartRaw : new Date(new Date().setHours(0, 0, 0, 0));
+    const tz = typeof q.tz === "string" && q.tz ? q.tz : "UTC";
+    const days = Math.min(31, Math.max(1, parseInt(String(q.days || "7"), 10) || 7));
+    const now = new Date();
+    const trendFrom = new Date(now.getTime() - days * 86_400_000);
+
+    let byType: any[];
+    let trendRows: any[];
+    let fmt: Intl.DateTimeFormat;
+    try {
+      fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+      [byType, trendRows] = await Promise.all([
+        LeadActivity.aggregate([{ $match: { createdAt: { $gte: todayStart } } }, { $group: { _id: "$type", count: { $sum: 1 } } }]),
+        LeadActivity.aggregate([
+          { $match: { createdAt: { $gte: trendFrom } } },
+          { $addFields: { day: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: tz } } } },
+          { $group: { _id: "$day", count: { $sum: 1 } } },
+        ]),
+      ]);
+    } catch {
+      return res.status(400).json({ error: "Unknown timezone." });
+    }
+    const today: Record<string, number> = {};
+    for (const r of byType) today[r._id] = r.count;
+    const trendMap = new Map<string, number>(trendRows.map((r) => [r._id, r.count]));
+    const trend: Array<{ day: string; count: number }> = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const day = fmt.format(new Date(now.getTime() - i * 86_400_000));
+      trend.push({ day, count: trendMap.get(day) || 0 });
+    }
+    return res.json({ today, total: byType.reduce((s: number, r: any) => s + r.count, 0), trend, todayStart: todayStart.toISOString() });
+  } catch (err) {
+    logger.error("leads GET /reports/activity error", { err });
+    return res.status(500).json({ error: "Failed to load activity." });
+  }
+});
+
+// ── GET /reports/follow-up-health?todayStart=&dueBefore= ──────────
+// The Inbox's definitions, counted server-side over OPEN leads (effective
+// disposition Open / In-progress):
+//   dueToday    nextFollowUpDate in [todayStart, dueBefore)
+//   overdue     nextFollowUpDate < now                (Inbox isOverdue)
+//   noNextAction no nextFollowUpDate at all
+//   slaRisk     overdue, or NEW and untouched for a day  (Inbox slaRisk)
+router.get("/reports/follow-up-health", async (req, res) => {
+  try {
+    const q = req.query as AnyObj;
+    const now = new Date();
+    const todayStartRaw = q.todayStart ? new Date(String(q.todayStart)) : null;
+    const todayStart = todayStartRaw && !isNaN(todayStartRaw.getTime()) ? todayStartRaw : new Date(new Date().setHours(0, 0, 0, 0));
+    const dueBeforeRaw = q.dueBefore ? new Date(String(q.dueBefore)) : null;
+    const dueBefore = dueBeforeRaw && !isNaN(dueBeforeRaw.getTime()) ? dueBeforeRaw : new Date(todayStart.getTime() + 86_400_000);
+    const dayAgo = new Date(now.getTime() - 86_400_000);
+
+    const [agg, untouched] = await Promise.all([
+      Lead.aggregate([
+        { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
+        { $match: { $expr: IS_OPEN } },
+        {
+          $group: {
+            _id: null,
+            open: { $sum: 1 },
+            dueToday: { $sum: { $cond: [{ $and: [{ $gte: ["$nextFollowUpDate", todayStart] }, { $lt: ["$nextFollowUpDate", dueBefore] }] }, 1, 0] } },
+            overdue: { $sum: { $cond: [{ $and: [{ $ne: ["$nextFollowUpDate", null] }, { $lt: ["$nextFollowUpDate", now] }] }, 1, 0] } },
+            noNextAction: { $sum: { $cond: [{ $eq: [{ $ifNull: ["$nextFollowUpDate", null] }, null] }, 1, 0] } },
+          },
+        },
+      ]),
+      // NEW leads older than a day with no activity at all — the Inbox's second SLA fact.
+      Lead.aggregate([
+        { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR, effLead: EFFECTIVE_LEAD_STATUS_EXPR } },
+        { $match: { $expr: { $and: [IS_OPEN, { $eq: ["$effLead", "NEW"] }, { $lt: ["$createdAt", dayAgo] }, { $or: [{ $eq: [{ $ifNull: ["$nextFollowUpDate", null] }, null] }, { $gte: ["$nextFollowUpDate", now] }] }] } } },
+        { $lookup: { from: LeadActivity.collection.name, localField: "_id", foreignField: "leadId", as: "acts", pipeline: [{ $limit: 1 }, { $project: { _id: 1 } }] } },
+        { $match: { acts: { $size: 0 } } },
+        { $count: "n" },
+      ]),
+    ]);
+    const a = agg[0] || { open: 0, dueToday: 0, overdue: 0, noNextAction: 0 };
+    const newUntouched = untouched[0]?.n || 0;
+    return res.json({ open: a.open, dueToday: a.dueToday, overdue: a.overdue, noNextAction: a.noNextAction, newUntouched, slaRisk: a.overdue + newUntouched });
+  } catch (err) {
+    logger.error("leads GET /reports/follow-up-health error", { err });
+    return res.status(500).json({ error: "Failed to load follow-up health." });
+  }
+});
+
+// ── GET /reports/kpis?dateFrom=&dateTo=&todayStart= ──────────────
+// Ribbon numbers. newLeads carries a prior-period value ONLY when the range
+// is bounded on both ends (an equally-sized window immediately before it);
+// otherwise `prior` is null and the client shows no delta — never a made-up
+// percentage. hot = the server's own temperature rule (computeTemperature)
+// over open leads; pipelineValue = open dealValue; openOpportunities from the
+// opportunities collection.
+router.get("/reports/kpis", async (req, res) => {
+  try {
+    const q = req.query as AnyObj;
+    const now = new Date();
+    const range = createdAtFilter(q);
+    const from = range.createdAt?.$gte as Date | undefined;
+    const to = range.createdAt?.$lte as Date | undefined;
+    const todayStartRaw = q.todayStart ? new Date(String(q.todayStart)) : null;
+    const startOfToday = todayStartRaw && !isNaN(todayStartRaw.getTime()) ? todayStartRaw : new Date(new Date().setHours(0, 0, 0, 0));
+    const threeDaysAgo = new Date(now.getTime() - 3 * DAY_MS);
+
+    let prior: AnyObj | null = null;
+    if (from && to && to.getTime() > from.getTime()) {
+      const len = to.getTime() - from.getTime();
+      prior = { createdAt: { $gte: new Date(from.getTime() - len - 1), $lt: from } };
+    }
+
+    const [current, priorCount, openAgg, hotAgg, oppAgg] = await Promise.all([
+      Lead.countDocuments(range),
+      prior ? Lead.countDocuments(prior) : Promise.resolve(null),
+      Lead.aggregate([
+        { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
+        { $match: { $expr: IS_OPEN } },
+        { $group: { _id: null, count: { $sum: 1 }, value: { $sum: "$dealValue" } } },
+      ]),
+      Lead.aggregate([
+        { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
+        { $match: { $expr: IS_OPEN } },
+        { $lookup: { from: LeadActivity.collection.name, localField: "_id", foreignField: "leadId", as: "last", pipeline: [{ $sort: { createdAt: -1 } }, { $limit: 1 }, { $project: { createdAt: 1 } }] } },
+        {
+          $match: {
+            $expr: {
+              $or: [
+                { $and: [{ $ne: [{ $ifNull: ["$nextFollowUpDate", null] }, null] }, { $lt: ["$nextFollowUpDate", startOfToday] }] },
+                { $and: [{ $in: ["$stage", Array.from(LATE_STAGES)] }, { $gte: [{ $ifNull: [{ $arrayElemAt: ["$last.createdAt", 0] }, new Date(0)] }, threeDaysAgo] }] },
+              ],
+            },
+          },
+        },
+        { $count: "n" },
+      ]),
+      Opportunity.aggregate([
+        { $match: { stage: { $nin: ["closed_won", "closed_lost", "active_partner"] } } },
+        { $group: { _id: null, count: { $sum: 1 }, value: { $sum: "$dealValue" } } },
+      ]),
+    ]);
+
+    return res.json({
+      newLeads: { current, prior: priorCount },
+      hot: hotAgg[0]?.n || 0,
+      open: openAgg[0]?.count || 0,
+      pipelineValue: openAgg[0]?.value || 0,
+      openOpportunities: { count: oppAgg[0]?.count || 0, value: oppAgg[0]?.value || 0 },
+      period: from && to ? { from: from.toISOString(), to: to.toISOString(), prior: prior ? { from: prior.createdAt.$gte.toISOString(), to: prior.createdAt.$lt.toISOString() } : null } : null,
+    });
+  } catch (err) {
+    logger.error("leads GET /reports/kpis error", { err });
+    return res.status(500).json({ error: "Failed to load KPIs." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // ROUTE 4c — GET /reports/daily?days=30  (Day-wise snapshot, ask #10)
 // ═══════════════════════════════════════════════════════════════
 // Leads created per day for the last N days (default 30, max 92), and how
