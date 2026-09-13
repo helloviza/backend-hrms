@@ -1,5 +1,6 @@
 import mongoose, { Document, Schema } from "mongoose";
 import { isCrmV2OpportunityEnabled } from "../config/crmV2.js";
+import { nextCode } from "../utils/codeSequence.js";
 import {
   LEAD_STATUSES,
   SOURCE_CHANNELS,
@@ -237,12 +238,13 @@ LeadSchema.pre("validate", function (next) {
   next();
 });
 
+// LEAD-YYYY-NNNN from the atomic Counter (utils/codeSequence.ts) — never
+// countDocuments()+1, which reissued a number after any delete and collided
+// on concurrent creates (E11000 → 500). First use seeds from existing codes.
 LeadSchema.pre("save", async function (next) {
   if (this.leadCode) return next();
   try {
-    const year = new Date().getFullYear();
-    const count = await (this.constructor as any).countDocuments({});
-    this.leadCode = `LEAD-${year}-${String(count + 1).padStart(4, "0")}`;
+    this.leadCode = await nextCode(this.constructor as any, "leadCode", "LEAD");
   } catch {
     // non-blocking — leadCode can be set manually if hook fails
   }

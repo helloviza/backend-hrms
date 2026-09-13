@@ -1,5 +1,6 @@
 import mongoose, { Document, Schema } from "mongoose";
 import { normalizeCompanyName } from "../utils/companyName.js";
+import { nextCode } from "../utils/codeSequence.js";
 
 // ── Company Account (Phase 1 / Slice 1) ──────────────────────────────
 // The PRD's Company Account is built IN PLACE on this collection (locked
@@ -121,12 +122,12 @@ CRMCompanySchema.pre("validate", function (next) {
   next();
 });
 
+// COMP-YYYY-NNNN from the atomic Counter (utils/codeSequence.ts) — never
+// countDocuments()+1 (gap reissue + concurrent collision → E11000 → 500).
 CRMCompanySchema.pre("save", async function (next) {
   if (this.companyCode) return next();
   try {
-    const year = new Date().getFullYear();
-    const count = await (this.constructor as any).countDocuments({});
-    this.companyCode = `COMP-${year}-${String(count + 1).padStart(4, "0")}`;
+    this.companyCode = await nextCode(this.constructor as any, "companyCode", "COMP");
   } catch {
     // non-blocking — companyCode can be set manually if hook fails
   }

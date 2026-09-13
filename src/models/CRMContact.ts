@@ -1,4 +1,5 @@
 import mongoose, { Document, Schema } from "mongoose";
+import { nextCode } from "../utils/codeSequence.js";
 
 export interface CRMContactDoc extends Document {
   contactCode: string;
@@ -81,12 +82,12 @@ CRMContactSchema.index({ createdBy: 1 });
 CRMContactSchema.index({ leadId: 1 });
 CRMContactSchema.index({ contactCode: 1 }, { unique: true, sparse: true });
 
+// CONT-YYYY-NNNN from the atomic Counter (utils/codeSequence.ts) — never
+// countDocuments()+1 (gap reissue + concurrent collision → E11000 → 500).
 CRMContactSchema.pre("save", async function (next) {
   if (this.contactCode) return next();
   try {
-    const year = new Date().getFullYear();
-    const count = await (this.constructor as any).countDocuments({});
-    this.contactCode = `CONT-${year}-${String(count + 1).padStart(4, "0")}`;
+    this.contactCode = await nextCode(this.constructor as any, "contactCode", "CONT");
   } catch {
     // non-blocking — contactCode can be set manually if hook fails
   }
