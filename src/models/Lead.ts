@@ -115,6 +115,12 @@ export interface LeadDoc extends Document {
   dispositionStatus: string; // Open | In-progress | Lost | Won
   dispositionAt?: Date | null;
 
+  /** Bulk import (ask #6) — additive. Which import batch created the row, and
+   *  the open lead the same company already carried at import time (the
+   *  dedupe flag: advisory, never a block). "" / null for every other lead. */
+  importBatchId: string;
+  possibleDuplicateOf?: mongoose.Types.ObjectId | null;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -191,6 +197,10 @@ const LeadSchema = new Schema<LeadDoc>(
     dispositionStage: { type: String, trim: true, default: "" },
     dispositionStatus: { type: String, trim: true, default: "" },
     dispositionAt: { type: Date, default: null },
+
+    // ── Bulk import — additive. See LeadDoc.importBatchId. ──
+    importBatchId: { type: String, trim: true, default: "" },
+    possibleDuplicateOf: { type: Schema.Types.ObjectId, ref: "Lead", default: null },
   },
   { timestamps: true }
 );
@@ -204,6 +214,7 @@ LeadSchema.index({ leadCode: 1 }, { unique: true, sparse: true });
 LeadSchema.index({ status: 1 }, { sparse: true });
 LeadSchema.index({ opportunityId: 1 }, { sparse: true });
 LeadSchema.index({ pipelineId: 1, dispositionStatus: 1 }, { sparse: true });
+LeadSchema.index({ importBatchId: 1 }, { sparse: true });
 
 /** The lead's status in the new taxonomy, whether or not the row has been
  *  migrated: the stored `status` when present, else derived from the legacy

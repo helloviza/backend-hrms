@@ -11,7 +11,8 @@ import { resolvePipelineForLead, groupedSet, canWorkPipeline } from "../services
 import CRMCompany from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
 import { resolveOrCreateCompany, normalizeCompanyName } from "../utils/crmCompany.js";
-import { isClosedLeadStatus } from "../models/crmTaxonomy.js";
+import multer from "multer";
+import { companyCheck, commitImport, dedupeSnapshot, normaliseSource, parseSpreadsheet, suggestMapping, validateRows, IMPORT_FIELDS, IMPORT_FILE_CAP_BYTES, IMPORT_ROW_CAP } from "../services/leadImport.js";
 import type { LeadStage } from "../models/Lead.js";
 import type { ActivityType } from "../models/LeadActivity.js";
 import { UserPermission } from "../models/UserPermission.js";
@@ -423,78 +424,145 @@ router.get("/reps", async (_req, res) => {
 router.get("/company-check", async (req, res) => {
   try {
     const q = req.query as AnyObj;
-    const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-    let company: any = null;
-    if (q.companyId && mongoose.isValidObjectId(String(q.companyId))) {
-      company = await CRMCompany.findById(String(q.companyId))
-        .select("name companyCode industry city country customerId")
-        .lean();
-    } else {
-      const name = String(q.name || "").trim();
-      const nameNormalized = normalizeCompanyName(name);
-      if (!nameNormalized) {
-        return res.status(400).json({ error: "name or companyId is required." });
-      }
-      company = await CRMCompany.findOne({
-        $or: [
-          { nameNormalized },
-          { nameNormalized: "", name: new RegExp(`^${escapeRe(name)}$`, "i") },
-        ],
-      })
-        .select("name companyCode industry city country customerId")
-        .lean();
+    const hasId = q.companyId && mongoose.isValidObjectId(String(q.companyId));
+    if (!hasId && !normalizeCompanyName(q.name)) {
+      return res.status(400).json({ error: "name or companyId is required." });
     }
-
-    if (!company) return res.json({ match: false, company: null, leads: [], openCount: 0, total: 0 });
-
-    const rows = (await Lead.find({
-      $or: [
-        { companyId: company._id },
-        { companyId: null, companyName: new RegExp(`^${escapeRe(String(company.name))}$`, "i") },
-      ],
-    })
-      .select("leadCode contactName contactDesignation stage status dispositionStage dispositionStatus subDisposition assignedTo assignedToName nextFollowUpDate createdAt")
-      .sort({ createdAt: -1 })
-      .limit(50)
-      .lean()) as any[];
-
-    // Owner labels: the stored assignedToName, resolved from User when blank.
-    const missing = rows.filter((l) => !l.assignedToName && l.assignedTo).map((l) => l.assignedTo);
-    const users = missing.length
-      ? ((await User.find({ _id: { $in: missing } }).select("name firstName lastName email").lean()) as any[])
-      : [];
-    const nameOf = new Map(
-      users.map((u) => [String(u._id), (u.name && String(u.name).trim()) || `${u.firstName || ""} ${u.lastName || ""}`.trim() || String(u.email || "")])
-    );
-
-    const leads = rows.map((l) => ({
-      _id: String(l._id),
-      leadCode: l.leadCode,
-      contactName: l.contactName || "",
-      contactDesignation: l.contactDesignation || "",
-      stage: l.stage,
-      status: effectiveLeadStatus(l),
-      dispositionStage: l.dispositionStage || "",
-      dispositionStatus: l.dispositionStatus || "",
-      subDisposition: l.subDisposition || "",
-      assignedTo: l.assignedTo ? String(l.assignedTo) : null,
-      assignedToName: l.assignedToName || (l.assignedTo ? nameOf.get(String(l.assignedTo)) || "" : ""),
-      open: !isClosedLeadStatus(effectiveLeadStatus(l)),
-      nextFollowUpDate: l.nextFollowUpDate ?? null,
-      createdAt: l.createdAt,
-    }));
-
-    return res.json({
-      match: true,
-      company: { ...company, _id: String(company._id) },
-      leads,
-      openCount: leads.filter((l) => l.open).length,
-      total: leads.length,
-    });
+    return res.json(await companyCheck(hasId ? { companyId: String(q.companyId) } : { name: String(q.name) }));
   } catch (err) {
     logger.error("leads GET /company-check error", { err });
     return res.status(500).json({ error: "Failed to check the company." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTE 0c — POST /import/preview · POST /import/commit  (ask #6)
+// ═══════════════════════════════════════════════════════════════
+// Bulk lead import. preview parses the upload (CSV / XLSX, ≤ 10 MB, ≤ 1000
+// rows) or re-validates already-parsed rows under a confirmed mapping, and
+// runs every row through the same-company dedupe — it writes NOTHING.
+// commit creates the valid rows through Lead.create (atomic leadCode from
+// the Counter, company anchored on nameNormalized exactly like POST /),
+// tags a row whose company already carried an open lead as a possible
+// duplicate (advisory), and reports created / invalid / failed per row.
+// Both need write access: import is a write intent.
+// See services/leadImport.ts.
+const importUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: IMPORT_FILE_CAP_BYTES } });
+
+function importDefaults(raw: AnyObj): { source: string } | { error: string } {
+  const src = raw?.source ? normaliseSource(String(raw.source)) : "manual";
+  if (!src) return { error: `Unknown source "${raw.source}". Use one of: ${LEAD_SOURCES.join(", ")}.` };
+  return { source: src };
+}
+
+router.post("/import/preview", importUpload.single("file"), async (req, res) => {
+  try {
+    if (!canWrite((req as any).leadsAccess)) {
+      return res.status(403).json({ error: "Write access required." });
+    }
+    const body = (req.body || {}) as AnyObj;
+    const parseJson = (v: unknown) => (typeof v === "string" ? JSON.parse(v) : v);
+
+    let columns: string[];
+    let rows: Record<string, string>[];
+    let truncated = false;
+    let totalRows = 0;
+    if ((req as any).file?.buffer) {
+      const parsed = parseSpreadsheet((req as any).file.buffer);
+      if (!parsed.columns.length) return res.status(400).json({ error: "The file has no header row." });
+      columns = parsed.columns;
+      rows = parsed.rows;
+      truncated = parsed.truncated;
+      totalRows = parsed.totalRows;
+    } else if (Array.isArray(parseJson(body.rows))) {
+      rows = parseJson(body.rows);
+      if (rows.length > IMPORT_ROW_CAP) return res.status(400).json({ error: `At most ${IMPORT_ROW_CAP} rows per import.` });
+      columns = Array.isArray(parseJson(body.columns)) ? parseJson(body.columns) : Object.keys(rows[0] || {});
+      totalRows = rows.length;
+    } else {
+      return res.status(400).json({ error: "Upload a CSV / XLSX as `file`, or send parsed `rows`." });
+    }
+
+    const suggestedMapping = suggestMapping(columns);
+    const mapping: Record<string, string> = parseJson(body.mapping) || suggestedMapping;
+    const defaults = importDefaults(parseJson(body.defaults) || {});
+    if ("error" in defaults) return res.status(400).json({ error: defaults.error });
+
+    const validated = validateRows(rows, mapping, defaults);
+    const snapshot = await dedupeSnapshot(validated.filter((r) => r.lead));
+    const out = validated.map((r) => {
+      const d = snapshot.get(r.row);
+      return {
+        row: r.row,
+        values: r.values,
+        valid: !!r.lead,
+        errors: r.errors,
+        warnings: r.warnings,
+        duplicate: d && d.existingOpen.length ? d.existingOpen[0] : null,
+        existingOpenCount: d?.existingOpen.length ?? 0,
+        sameCompanyRowsInFile: d?.sameCompanyRowsInFile ?? 0,
+      };
+    });
+    return res.json({
+      columns,
+      suggestedMapping,
+      mapping,
+      fields: IMPORT_FIELDS,
+      defaults,
+      rowCount: rows.length,
+      totalRows,
+      truncated,
+      cap: IMPORT_ROW_CAP,
+      rows: out,
+      summary: {
+        total: out.length,
+        valid: out.filter((r) => r.valid).length,
+        invalid: out.filter((r) => !r.valid).length,
+        flagged: out.filter((r) => r.valid && r.duplicate).length,
+      },
+    });
+  } catch (err: any) {
+    if (err?.code === "LIMIT_FILE_SIZE") return res.status(400).json({ error: "File is larger than 10 MB." });
+    logger.error("leads POST /import/preview error", { err });
+    return res.status(500).json({ error: "Could not read that file." });
+  }
+});
+
+router.post("/import/commit", async (req, res) => {
+  try {
+    if (!canWrite((req as any).leadsAccess)) {
+      return res.status(403).json({ error: "Write access required." });
+    }
+    const user = (req as any).user as AnyObj;
+    const body = (req.body || {}) as AnyObj;
+    const rows = body.rows;
+    if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ error: "rows is required." });
+    if (rows.length > IMPORT_ROW_CAP) return res.status(400).json({ error: `At most ${IMPORT_ROW_CAP} rows per import.` });
+    if (!body.mapping || typeof body.mapping !== "object") return res.status(400).json({ error: "mapping is required." });
+    const defaults = importDefaults(body.defaults || {});
+    if ("error" in defaults) return res.status(400).json({ error: defaults.error });
+
+    // Every row must be valid up front — the batch never starts half-baked.
+    const validated = validateRows(rows, body.mapping, defaults);
+    if (!validated.some((r) => r.lead)) {
+      return res.status(400).json({ error: "No valid rows to import.", invalid: validated.map((r) => ({ row: r.row, errors: r.errors })) });
+    }
+
+    const importerId = userId(user);
+    const importerName = await resolveUserName(importerId);
+    const ownerId = body.assignedTo && mongoose.isValidObjectId(String(body.assignedTo)) ? String(body.assignedTo) : importerId;
+    const ownerName = ownerId === importerId ? importerName : await resolveUserName(ownerId);
+    if (ownerId !== importerId && !ownerName) return res.status(400).json({ error: "assignedTo is not a known user." });
+
+    const report = await commitImport({
+      rows, mapping: body.mapping, defaults,
+      importer: { id: importerId, name: importerName },
+      owner: { id: ownerId, name: ownerName },
+    });
+    return res.status(201).json(report);
+  } catch (err) {
+    logger.error("leads POST /import/commit error", { err });
+    return res.status(500).json({ error: "Import failed." });
   }
 });
 
