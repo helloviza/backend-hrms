@@ -36,6 +36,7 @@ import { isCrmV2DispositionEnabled, isCrmV2OpportunityEnabled } from "../config/
 import { requireAuth } from "../middleware/auth.js";
 import { requireHouse } from "../middleware/requireHouse.js";
 import { requireLeadsAccess } from "./leads.js";
+import { leadScope, opportunityMatch, ownsOpportunity, isAll } from "../services/crmScope.js";
 import logger from "../utils/logger.js";
 
 const router = express.Router();
@@ -49,10 +50,6 @@ router.use((_req, res, next) => {
   next();
 });
 
-function userId(user: AnyObj): string {
-  return String(user.id || user.sub || "");
-}
-
 // Every closed stage key across the three pipelines (closed_won / closed_lost
 // / active_partner) — pipeline-agnostic filters use the union, the same way
 // /leads/reports/kpis does.
@@ -65,16 +62,13 @@ type StatusFilter = (typeof STATUS_FILTERS)[number];
 
 /** The base $match every list/summary query starts from: scope + filters. */
 function baseMatch(req: express.Request, q: AnyObj = req.query as AnyObj): AnyObj {
-  const user = (req as any).user as AnyObj;
-  const match: AnyObj = {};
-
-  if ((req as any).leadsScope === "OWN") {
-    const uid = userId(user);
-    match.ownerUserId = mongoose.isValidObjectId(uid) ? new mongoose.Types.ObjectId(uid) : null;
-  } else if (q.owner && mongoose.isValidObjectId(String(q.owner))) {
-    match.ownerUserId = new mongoose.Types.ObjectId(String(q.owner));
-  } else if (q.owner === "unassigned") {
-    match.ownerUserId = null;
+  // Caller scope first (services/crmScope): OWN pins ownerUserId to the
+  // caller and ignores the owner param; ALL honours it.
+  const scope = leadScope(req);
+  const match: AnyObj = { ...opportunityMatch(scope) };
+  if (isAll(scope)) {
+    if (q.owner && mongoose.isValidObjectId(String(q.owner))) match.ownerUserId = new mongoose.Types.ObjectId(String(q.owner));
+    else if (q.owner === "unassigned") match.ownerUserId = null;
   }
 
   if (q.pipeline && (OPPORTUNITY_PIPELINES as readonly string[]).includes(String(q.pipeline))) match.pipeline = String(q.pipeline);
@@ -246,11 +240,9 @@ router.get("/:id", async (req, res) => {
     ]);
     if (!row) return res.status(404).json({ error: "Opportunity not found." });
 
-    // OWN scope: your deals only — the board never listed it, the URL must not either.
-    if ((req as any).leadsScope === "OWN") {
-      const uid = userId((req as any).user);
-      if (!row.ownerUserId || String(row.ownerUserId) !== uid) return res.status(403).json({ error: "This opportunity is owned by someone else." });
-    }
+    // Outside the caller's scope: the board never listed it, the URL must not
+    // confirm it exists either.
+    if (!ownsOpportunity(leadScope(req), row)) return res.status(404).json({ error: "Opportunity not found." });
 
     const { lead, company, primaryContact, ...opportunity } = row;
     const activities = row.leadId ? await LeadActivity.find({ leadId: row.leadId }).sort({ createdAt: -1 }).lean() : [];

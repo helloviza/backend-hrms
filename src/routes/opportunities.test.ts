@@ -261,12 +261,12 @@ describe("GET /opportunities/:id", () => {
     expect(r.body.activities.filter((a: any) => a.subject?.type === "OPPORTUNITY")).toHaveLength(2);
   });
 
-  it("is 400 on a bad id, 404 when missing, 403 for an OWN-scoped rep on someone else's deal", async () => {
+  it("is 400 on a bad id, 404 when missing, and 404 (not 403) for an OWN-scoped rep on someone else's deal", async () => {
     expect((await asAdmin("/nope")).status).toBe(400);
     expect((await asAdmin(`/${new mongoose.Types.ObjectId()}`)).status).toBe(404);
     const theirs = await seedOpp({ ownerUserId: OTHER, ownerName: "Other" });
     const mine = await seedOpp({ ownerUserId: REP });
-    expect((await asRep(`/${theirs}`)).status).toBe(403);
+    expect((await asRep(`/${theirs}`)).status).toBe(404);
     expect((await asRep(`/${mine}`)).status).toBe(200);
     expect((await asAdmin(`/${theirs}`)).status).toBe(200);
   });

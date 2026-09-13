@@ -22,6 +22,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireHouse } from "../middleware/requireHouse.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import { buildOwnerStatusReport } from "../services/ownerStatusReport.js";
+import { leadScope, leadMatch, opportunityMatch, activityMatch, ownsLead, canManageOthers, isAll, findVisibleLead, redactCompanyCheck } from "../services/crmScope.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import logger from "../utils/logger.js";
 
@@ -121,6 +122,9 @@ export async function requireLeadsAccess(
       .select("modules")
       .lean()) as any;
 
+    // The whole map rides along so services/crmScope can scope a rollup that
+    // belongs to another module (a company page's deals follow the leads scope).
+    (req as any).crmModules = perm?.modules || {};
     const leadsModule = perm?.modules?.leads;
     const access: string = leadsModule?.access || "NONE";
     const scope: string = leadsModule?.scope || "NONE";
@@ -180,8 +184,6 @@ async function resolveExportLeads(
   opts: { ignoreDateFilter?: boolean } = {}
 ): Promise<any[]> {
   const q = req.query as AnyObj;
-  const user = (req as any).user as AnyObj;
-  const leadsScope = (req as any).leadsScope as string;
 
   const toArr = (v: unknown): string[] => {
     if (v == null) return [];
@@ -202,28 +204,26 @@ async function resolveExportLeads(
   const toMs = dateTo && !isNaN(dateTo.getTime()) ? dateTo.getTime() : null;
   const byActivity = String(q.dateBasis || "") === "last_activity";
 
-  const leadMatch: AnyObj = {};
-  // OWN scope wins over any assignedTo param.
-  if (leadsScope === "OWN") {
-    const uid = userId(user);
-    if (mongoose.isValidObjectId(uid)) leadMatch.assignedTo = new mongoose.Types.ObjectId(uid);
-  } else if (assignedToF.length) {
-    leadMatch.assignedTo = { $in: assignedToF.map((s) => new mongoose.Types.ObjectId(s)) };
+  // Scope wins over any assignedTo param (services/crmScope).
+  const scope = leadScope(req);
+  const exportMatch: AnyObj = { ...leadMatch(scope) };
+  if (isAll(scope) && assignedToF.length) {
+    exportMatch.assignedTo = { $in: assignedToF.map((s) => new mongoose.Types.ObjectId(s)) };
   }
-  if (stageF.length) leadMatch.stage = { $in: stageF };
-  if (sourceF.length) leadMatch.source = { $in: sourceF };
-  if (typeF.length) leadMatch.type = { $in: typeF };
+  if (stageF.length) exportMatch.stage = { $in: stageF };
+  if (sourceF.length) exportMatch.source = { $in: sourceF };
+  if (typeF.length) exportMatch.type = { $in: typeF };
 
   // Legacy date basis (createdAt) — unchanged for existing callers.
   // ignoreDateFilter ⇒ owner/status/source/type + OWN scope only (the activities
   // export applies its date range to the activity's own createdAt instead).
   if (!opts.ignoreDateFilter && !byActivity && (fromMs != null || toMs != null)) {
-    leadMatch.createdAt = {};
-    if (fromMs != null) leadMatch.createdAt.$gte = new Date(fromMs);
-    if (toMs != null) leadMatch.createdAt.$lte = new Date(toMs);
+    exportMatch.createdAt = {};
+    if (fromMs != null) exportMatch.createdAt.$gte = new Date(fromMs);
+    if (toMs != null) exportMatch.createdAt.$lte = new Date(toMs);
   }
 
-  const leads = (await Lead.find(leadMatch).sort({ createdAt: -1 }).lean()) as any[];
+  const leads = (await Lead.find(exportMatch).sort({ createdAt: -1 }).lean()) as any[];
 
   // last_activity_date basis — compute + filter in memory (matches the report).
   if (!opts.ignoreDateFilter && byActivity && (fromMs != null || toMs != null)) {
@@ -430,7 +430,10 @@ router.get("/company-check", async (req, res) => {
     if (!hasId && !normalizeCompanyName(q.name)) {
       return res.status(400).json({ error: "name or companyId is required." });
     }
-    return res.json(await companyCheck(hasId ? { companyId: String(q.companyId) } : { name: String(q.name) }));
+    const check = await companyCheck(hasId ? { companyId: String(q.companyId) } : { name: String(q.name) });
+    // The dedupe signal is for everyone (match, counts, owner names); the
+    // per-lead detail is the id-discovery path into other reps' leads.
+    return res.json(isAll(leadScope(req)) ? check : redactCompanyCheck(check));
   } catch (err) {
     logger.error("leads GET /company-check error", { err });
     return res.status(500).json({ error: "Failed to check the company." });
@@ -492,6 +495,7 @@ router.post("/import/preview", importUpload.single("file"), async (req, res) => 
 
     const validated = validateRows(rows, mapping, defaults);
     const snapshot = await dedupeSnapshot(validated.filter((r) => r.lead));
+    const seeAll = isAll(leadScope(req));
     const out = validated.map((r) => {
       const d = snapshot.get(r.row);
       return {
@@ -500,7 +504,7 @@ router.post("/import/preview", importUpload.single("file"), async (req, res) => 
         valid: !!r.lead,
         errors: r.errors,
         warnings: r.warnings,
-        duplicate: d && d.existingOpen.length ? d.existingOpen[0] : null,
+        duplicate: d && d.existingOpen.length ? (seeAll ? d.existingOpen[0] : { leadId: null, leadCode: "", contactName: "", ownerName: d.existingOpen[0].ownerName, status: "" }) : null,
         existingOpenCount: d?.existingOpen.length ?? 0,
         sameCompanyRowsInFile: d?.sameCompanyRowsInFile ?? 0,
       };
@@ -552,7 +556,8 @@ router.post("/import/commit", async (req, res) => {
 
     const importerId = userId(user);
     const importerName = await resolveUserName(importerId);
-    const ownerId = body.assignedTo && mongoose.isValidObjectId(String(body.assignedTo)) ? String(body.assignedTo) : importerId;
+    // OWN scope: the rows land on the importer, whatever the body says.
+    const ownerId = isAll(leadScope(req)) && body.assignedTo && mongoose.isValidObjectId(String(body.assignedTo)) ? String(body.assignedTo) : importerId;
     const ownerName = ownerId === importerId ? importerName : await resolveUserName(ownerId);
     if (ownerId !== importerId && !ownerName) return res.status(400).json({ error: "assignedTo is not a known user." });
 
@@ -561,6 +566,9 @@ router.post("/import/commit", async (req, res) => {
       importer: { id: importerId, name: importerName },
       owner: { id: ownerId, name: ownerName },
     });
+    if (!isAll(leadScope(req))) {
+      for (const c of report.created) if (c.duplicateOf) c.duplicateOf = { leadId: "", leadCode: "", contactName: "", ownerName: c.duplicateOf.ownerName, status: "" };
+    }
     return res.status(201).json(report);
   } catch (err) {
     logger.error("leads POST /import/commit error", { err });
@@ -585,7 +593,8 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: "contactName and contactPhone are required." });
     }
 
-    const assignedToId = body.assignedTo || userId(user);
+    // OWN scope: the lead is the caller's, whatever the body says.
+    const assignedToId = (isAll(leadScope(req)) && body.assignedTo) || userId(user);
     // Resolve the owner label from the assignee id via DB lookup — one path for
     // both the self-assign default and an explicitly-passed rep. A caller-
     // supplied assignedToName is honored as-is; otherwise we resolve from the
@@ -747,20 +756,15 @@ async function enrichLeads(leads: any[]): Promise<any[]> {
 
 router.get("/", async (req, res) => {
   try {
-    const user = (req as any).user as AnyObj;
-    const leadsScope = (req as any).leadsScope as string;
     const q = req.query as AnyObj;
     const filter: AnyObj = {};
 
-    if (leadsScope === "OWN") {
-      const uid = userId(user);
-      if (mongoose.isValidObjectId(uid)) {
-        filter.assignedTo = new mongoose.Types.ObjectId(uid);
-      }
-    } else {
-      if (q.assignedTo && mongoose.isValidObjectId(String(q.assignedTo))) {
-        filter.assignedTo = new mongoose.Types.ObjectId(String(q.assignedTo));
-      }
+    // Scope first (services/crmScope): OWN pins assignedTo to the caller and
+    // ignores any assignedTo param; ALL honours the param.
+    const scope = leadScope(req);
+    Object.assign(filter, leadMatch(scope));
+    if (isAll(scope) && q.assignedTo && mongoose.isValidObjectId(String(q.assignedTo))) {
+      filter.assignedTo = new mongoose.Types.ObjectId(String(q.assignedTo));
     }
 
     if (q.stage) {
@@ -825,7 +829,7 @@ router.get("/", async (req, res) => {
 router.get("/reports/summary", async (req, res) => {
   try {
     const q = req.query as AnyObj;
-    const dateFilter: AnyObj = {};
+    const dateFilter: AnyObj = { ...leadMatch(leadScope(req)) };
     if (q.dateFrom || q.dateTo) {
       dateFilter.createdAt = {};
       if (q.dateFrom) dateFilter.createdAt.$gte = new Date(String(q.dateFrom));
@@ -919,16 +923,29 @@ function ownerSourceFilter(q: AnyObj): AnyObj {
   }
   return f;
 }
-/** createdAt range + owner / source scope — what every range-bar panel matches on. */
-function scopeFilter(q: AnyObj): AnyObj {
-  return { ...createdAtFilter(q), ...ownerSourceFilter(q) };
+/** The caller's data scope + the range bar's owner / source filters. OWN
+ *  pins assignedTo to the caller (the owner param is ignored); ALL honours
+ *  the owner param. Every /reports/* panel matches on this. */
+function ownerSourceScope(req: express.Request): AnyObj {
+  const q = req.query as AnyObj;
+  const scope = leadScope(req);
+  const f = isAll(scope) ? ownerSourceFilter(q) : { ...ownerSourceFilter({ source: q.source }), ...leadMatch(scope) };
+  return f;
+}
+/** createdAt range + caller scope + owner / source — what every range-bar panel matches on. */
+function scopeFilter(req: express.Request): AnyObj {
+  return { ...createdAtFilter(req.query as AnyObj), ...ownerSourceScope(req) };
 }
 /** Opportunity-side twin of the scope: owner → ownerUserId; a source filter
  *  narrows to the deals of the leads that match it (deals carry no source). */
-async function opportunityScope(q: AnyObj): Promise<AnyObj> {
-  const f: AnyObj = {};
-  if (q.owner === "unassigned") f.ownerUserId = null;
-  else if (q.owner && mongoose.isValidObjectId(String(q.owner))) f.ownerUserId = new mongoose.Types.ObjectId(String(q.owner));
+async function opportunityScope(req: express.Request): Promise<AnyObj> {
+  const q = req.query as AnyObj;
+  const scope = leadScope(req);
+  const f: AnyObj = { ...opportunityMatch(scope) };
+  if (isAll(scope)) {
+    if (q.owner === "unassigned") f.ownerUserId = null;
+    else if (q.owner && mongoose.isValidObjectId(String(q.owner))) f.ownerUserId = new mongoose.Types.ObjectId(String(q.owner));
+  }
   if (q.source) f.leadId = { $in: await Lead.distinct("_id", ownerSourceFilter({ source: q.source })) };
   return f;
 }
@@ -938,7 +955,10 @@ const INTERACTION_TYPES = ["call", "email", "meeting", "note"] as const;
 router.get("/reports/by-rep", async (req, res) => {
   try {
     const q = req.query as AnyObj;
-    const dateFilter = scopeFilter(q);
+    // Per-rep comparison — everyone by name. ALL scope only; an OWN rep's
+    // own numbers live in the other panels.
+    if (!isAll(leadScope(req))) return res.status(403).json({ error: "Agent-wise comparison needs team-wide access." });
+    const dateFilter = scopeFilter(req);
     const todayStartRaw = q.todayStart ? new Date(String(q.todayStart)) : null;
     const todayStart = todayStartRaw && !isNaN(todayStartRaw.getTime()) ? todayStartRaw : new Date(new Date().setHours(0, 0, 0, 0));
     // Per-lead interaction counts (the old report's "activity effectiveness"),
@@ -1007,7 +1027,7 @@ router.get("/reports/by-rep", async (req, res) => {
         { $sort: { total: -1 } },
       ]),
       Opportunity.aggregate([
-        { $match: { ...(await opportunityScope(q)), stage: { $nin: ["closed_won", "closed_lost", "active_partner"] } } },
+        { $match: { ...(await opportunityScope(req)), stage: { $nin: ["closed_won", "closed_lost", "active_partner"] } } },
         { $group: { _id: "$ownerUserId", openOpportunities: { $sum: 1 } } },
       ]),
     ]);
@@ -1038,7 +1058,7 @@ const DISPOSITION_STATUSES = ["Open", "In-progress", "Won", "Lost"] as const;
 router.get("/reports/by-status", async (req, res) => {
   try {
     const rows = await Lead.aggregate([
-      { $match: scopeFilter(req.query as AnyObj) },
+      { $match: scopeFilter(req) },
       { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
       { $group: { _id: "$effStatus", count: { $sum: 1 }, value: { $sum: "$dealValue" } } },
     ]);
@@ -1094,7 +1114,7 @@ const pct = (a: number, b: number) => (b > 0 ? Math.round((a / b) * 1000) / 10 :
 router.get("/reports/funnel", async (req, res) => {
   try {
     const rows = await Lead.aggregate([
-      { $match: scopeFilter(req.query as AnyObj) },
+      { $match: scopeFilter(req) },
       { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR, effLead: EFFECTIVE_LEAD_STATUS_EXPR } },
       {
         $group: {
@@ -1129,7 +1149,7 @@ router.get("/reports/funnel", async (req, res) => {
 router.get("/reports/by-source", async (req, res) => {
   try {
     const rows = await Lead.aggregate([
-      { $match: scopeFilter(req.query as AnyObj) },
+      { $match: scopeFilter(req) },
       {
         $addFields: {
           effStatus: EFFECTIVE_STATUS_EXPR,
@@ -1183,10 +1203,11 @@ router.get("/reports/activity", async (req, res) => {
     let fmt: Intl.DateTimeFormat;
     try {
       fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+      const mine = await activityMatch(leadScope(req));
       [byType, trendRows] = await Promise.all([
-        LeadActivity.aggregate([{ $match: { createdAt: { $gte: todayStart } } }, { $group: { _id: "$type", count: { $sum: 1 } } }]),
+        LeadActivity.aggregate([{ $match: { ...mine, createdAt: { $gte: todayStart } } }, { $group: { _id: "$type", count: { $sum: 1 } } }]),
         LeadActivity.aggregate([
-          { $match: { createdAt: { $gte: trendFrom } } },
+          { $match: { ...mine, createdAt: { $gte: trendFrom } } },
           { $addFields: { day: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: tz } } } },
           { $group: { _id: "$day", count: { $sum: 1 } } },
         ]),
@@ -1226,8 +1247,10 @@ router.get("/reports/follow-up-health", async (req, res) => {
     const dueBefore = dueBeforeRaw && !isNaN(dueBeforeRaw.getTime()) ? dueBeforeRaw : new Date(todayStart.getTime() + 86_400_000);
     const dayAgo = new Date(now.getTime() - 86_400_000);
 
+    const mine = leadMatch(leadScope(req));
     const [agg, untouched] = await Promise.all([
       Lead.aggregate([
+        { $match: mine },
         { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
         { $match: { $expr: IS_OPEN } },
         {
@@ -1242,6 +1265,7 @@ router.get("/reports/follow-up-health", async (req, res) => {
       ]),
       // NEW leads older than a day with no activity at all — the Inbox's second SLA fact.
       Lead.aggregate([
+        { $match: mine },
         { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR, effLead: EFFECTIVE_LEAD_STATUS_EXPR } },
         { $match: { $expr: { $and: [IS_OPEN, { $eq: ["$effLead", "NEW"] }, { $lt: ["$createdAt", dayAgo] }, { $or: [{ $eq: [{ $ifNull: ["$nextFollowUpDate", null] }, null] }, { $gte: ["$nextFollowUpDate", now] }] }] } } },
         { $lookup: { from: LeadActivity.collection.name, localField: "_id", foreignField: "leadId", as: "acts", pipeline: [{ $limit: 1 }, { $project: { _id: 1 } }] } },
@@ -1269,8 +1293,8 @@ router.get("/reports/kpis", async (req, res) => {
   try {
     const q = req.query as AnyObj;
     const now = new Date();
-    const range = scopeFilter(q);
-    const scope = ownerSourceFilter(q);
+    const range = scopeFilter(req);
+    const scope = ownerSourceScope(req);
     const from = range.createdAt?.$gte as Date | undefined;
     const to = range.createdAt?.$lte as Date | undefined;
     const todayStartRaw = q.todayStart ? new Date(String(q.todayStart)) : null;
@@ -1311,7 +1335,7 @@ router.get("/reports/kpis", async (req, res) => {
         { $count: "n" },
       ]),
       Opportunity.aggregate([
-        { $match: { ...(await opportunityScope(q)), stage: { $nin: ["closed_won", "closed_lost", "active_partner"] } } },
+        { $match: { ...(await opportunityScope(req)), stage: { $nin: ["closed_won", "closed_lost", "active_partner"] } } },
         { $group: { _id: null, count: { $sum: 1 }, value: { $sum: "$dealValue" } } },
       ]),
     ]);
@@ -1353,7 +1377,7 @@ router.get("/reports/daily", async (req, res) => {
     try {
       fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
       rows = await Lead.aggregate([
-        { $match: { createdAt: { $gte: matchFrom } } },
+        { $match: { ...leadMatch(leadScope(req)), createdAt: { $gte: matchFrom } } },
         { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR, day: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: tz } } } },
         { $group: { _id: "$day", created: { $sum: 1 }, won: { $sum: { $cond: [{ $eq: ["$effStatus", "Won"] }, 1, 0] } } } },
       ]);
@@ -1387,7 +1411,7 @@ router.get("/reports/monthly", async (req, res) => {
     const start = new Date(now.getFullYear(), now.getMonth() - (months - 1), 1);
 
     const rows = await Lead.aggregate([
-      { $match: { createdAt: { $gte: start } } },
+      { $match: { ...leadMatch(leadScope(req)), createdAt: { $gte: start } } },
       { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
       {
         $group: {
@@ -1430,7 +1454,11 @@ router.get("/reports/monthly", async (req, res) => {
 router.get("/reports/hygiene", async (req, res) => {
   try {
     const q = req.query as AnyObj;
-    const ownerId = q.owner && q.owner !== "unassigned" && mongoose.isValidObjectId(String(q.owner)) ? String(q.owner) : null;
+    const scope = leadScope(req);
+    const ownerId = isAll(scope)
+      ? q.owner && q.owner !== "unassigned" && mongoose.isValidObjectId(String(q.owner)) ? String(q.owner) : null
+      : scope.userId ? String(scope.userId) : null;
+    if (!isAll(scope) && !ownerId) return res.json({ openTotal: 0, buckets: [], stale: { thresholdDays: 14, criticalDays: 30, total: 0, critical: 0, atRisk: 0 }, byOwner: [], generatedAt: new Date().toISOString() });
     const report = await buildOwnerStatusReport(
       { assignedTo: ownerId ? [ownerId] : [], sourceChannel: q.source ? [String(q.source)] : [] },
       { vocabulary: "v2" },
@@ -1442,7 +1470,7 @@ router.get("/reports/hygiene", async (req, res) => {
         return { ownerId: o.ownerId === "unassigned" ? null : o.ownerId, ownerName: o.ownerName, open: o.total, buckets: o.buckets, stale: s?.count || 0, critical: s?.criticalCount || 0, atRisk: s?.potentialValue || 0 };
       })
       .filter((o) => o.open > 0);
-    if (q.owner === "unassigned") byOwner = byOwner.filter((o) => o.ownerId === null);
+    if (isAll(scope) && q.owner === "unassigned") byOwner = byOwner.filter((o) => o.ownerId === null);
     byOwner.sort((a, b) => b.stale - a.stale || b.open - a.open);
     const buckets = report.ageing.buckets.map((b) => ({ key: b.key, label: b.label, count: byOwner.reduce((s, o) => s + (o.buckets[b.key] || 0), 0) }));
     return res.json({
@@ -1561,7 +1589,9 @@ router.get("/export/activities", async (req, res) => {
         ? ((await LeadActivity.find(actFilter).sort({ createdAt: -1 }).lean()) as any[])
         : [];
     } else {
-      activities = (await LeadActivity.find({}).sort({ createdAt: -1 }).lean()) as any[];
+      // No filter: everything the caller may see — ALL is the whole
+      // collection, OWN is the activities on the caller's own leads.
+      activities = (await LeadActivity.find(await activityMatch(leadScope(req))).sort({ createdAt: -1 }).lean()) as any[];
     }
 
     const leadIds = [...new Set(activities.map((a: any) => a.leadId?.toString()).filter(Boolean))];
@@ -1658,9 +1688,10 @@ router.get("/export/activities", async (req, res) => {
 // ROUTE 6c — GET /counts-by-stage
 // ═══════════════════════════════════════════════════════════════
 
-router.get("/counts-by-stage", async (_req, res) => {
+router.get("/counts-by-stage", async (req, res) => {
   try {
     const agg = await Lead.aggregate([
+      { $match: leadMatch(leadScope(req)) },
       { $group: { _id: "$stage", count: { $sum: 1 } } },
     ]);
     const counts: Record<string, number> = {};
@@ -1685,8 +1716,11 @@ router.get("/counts-by-stage", async (_req, res) => {
 // NOTE: sumValue / openPipelineValue sum dealValue across mixed currencies
 // (INR/USD/AED) without conversion — this mirrors GET /reports/summary, which
 // the existing reports already do. The frontend renders these as INR-dominant.
-router.get("/pipeline-summary", async (_req, res) => {
+router.get("/pipeline-summary", async (req, res) => {
   try {
+    const scope = leadScope(req);
+    const mine = leadMatch(scope);
+    const mineActs = await activityMatch(scope);
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
@@ -1708,31 +1742,32 @@ router.get("/pipeline-summary", async (_req, res) => {
     ] = await Promise.all([
         // per-stage lead count + summed deal value
         Lead.aggregate([
+          { $match: mine },
           { $group: { _id: "$stage", count: { $sum: 1 }, sumValue: { $sum: "$dealValue" } } },
         ]),
         // per-stage follow-ups due (date set and not in the future)
         Lead.aggregate([
-          { $match: { nextFollowUpDate: { $ne: null, $lte: now } } },
+          { $match: { ...mine, nextFollowUpDate: { $ne: null, $lte: now } } },
           { $group: { _id: "$stage", due: { $sum: 1 } } },
         ]),
         // open pipeline: summed value + active count (everything except won/lost)
         Lead.aggregate([
-          { $match: { stage: { $nin: CLOSED } } },
+          { $match: { ...mine, stage: { $nin: CLOSED } } },
           { $group: { _id: null, value: { $sum: "$dealValue" }, count: { $sum: 1 } } },
         ]),
         // won value this calendar month (by wonDate)
         Lead.aggregate([
-          { $match: { stage: "won", wonDate: { $gte: startOfMonth } } },
+          { $match: { ...mine, stage: "won", wonDate: { $gte: startOfMonth } } },
           { $group: { _id: null, value: { $sum: "$dealValue" } } },
         ]),
         // overdue follow-ups across open stages (strictly past due)
-        Lead.countDocuments({ stage: { $nin: CLOSED }, nextFollowUpDate: { $lt: now } }),
+        Lead.countDocuments({ ...mine, stage: { $nin: CLOSED }, nextFollowUpDate: { $lt: now } }),
         // trend inputs
-        Lead.countDocuments({ stage: { $nin: CLOSED }, createdAt: { $gte: weekAgo } }),
-        LeadActivity.countDocuments({ type: "won", createdAt: { $gte: startOfMonth } }),
-        LeadActivity.countDocuments({ type: "lost", createdAt: { $gte: startOfMonth } }),
-        LeadActivity.countDocuments({ type: "won", createdAt: { $gte: startOfLastMonth, $lt: startOfMonth } }),
-        LeadActivity.countDocuments({ type: "lost", createdAt: { $gte: startOfLastMonth, $lt: startOfMonth } }),
+        Lead.countDocuments({ ...mine, stage: { $nin: CLOSED }, createdAt: { $gte: weekAgo } }),
+        LeadActivity.countDocuments({ ...mineActs, type: "won", createdAt: { $gte: startOfMonth } }),
+        LeadActivity.countDocuments({ ...mineActs, type: "lost", createdAt: { $gte: startOfMonth } }),
+        LeadActivity.countDocuments({ ...mineActs, type: "won", createdAt: { $gte: startOfLastMonth, $lt: startOfMonth } }),
+        LeadActivity.countDocuments({ ...mineActs, type: "lost", createdAt: { $gte: startOfLastMonth, $lt: startOfMonth } }),
       ]);
 
     const byStage = Object.fromEntries((stageAgg as any[]).map((s) => [s._id, s]));
@@ -1803,7 +1838,8 @@ router.get("/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid lead ID." });
     }
 
-    const lead = await Lead.findById(req.params.id).lean();
+    // Outside the caller's scope reads as "not found" — never confirm existence.
+    const lead = (await findVisibleLead(leadScope(req), req.params.id))?.toObject();
     if (!lead) return res.status(404).json({ error: "Lead not found." });
 
     const activities = await LeadActivity.find({ leadId: lead._id })
@@ -1839,6 +1875,7 @@ router.put("/:id", async (req, res) => {
 
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
+    if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
 
     if (lead.stage === "won" || lead.stage === "lost") {
       return res.status(400).json({ error: "Cannot edit a closed lead." });
@@ -1941,6 +1978,7 @@ router.put("/:id/stage", async (req, res) => {
 
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
+    if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
 
     const user = (req as any).user as AnyObj;
     const fromStage = lead.stage;
@@ -2016,7 +2054,7 @@ router.get("/:id/dispositions", async (req, res) => {
   if (!isCrmV2DispositionEnabled()) return res.status(404).json({ error: "Not found." });
   try {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid lead ID." });
-    const lead = await Lead.findById(req.params.id).lean();
+    const lead = (await findVisibleLead(leadScope(req), req.params.id))?.toObject();
     if (!lead) return res.status(404).json({ error: "Lead not found." });
     const user = (req as any).user as AnyObj;
     const pipeline = await resolvePipelineForLead(lead as any);
@@ -2049,6 +2087,7 @@ router.post("/:id/disposition", async (req, res) => {
 
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
+    if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
 
     const user = (req as any).user as AnyObj;
     const actorName = user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System";
@@ -2098,6 +2137,7 @@ router.post("/:id/activity", async (req, res) => {
 
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
+    if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
 
     const user = (req as any).user as AnyObj;
 
@@ -2132,6 +2172,8 @@ router.post("/:id/assign", async (req, res) => {
     if ((req as any).leadsAccess !== "FULL") {
       return res.status(403).json({ error: "Full access required to reassign leads." });
     }
+    // FULL + OWN may hand their own lead over; cross-user needs FULL + ALL
+    // (canManageOthers) — the per-lead ownsLead check below enforces it.
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(400).json({ error: "Invalid lead ID." });
     }
@@ -2146,6 +2188,7 @@ router.post("/:id/assign", async (req, res) => {
 
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
+    if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
 
     const user = (req as any).user as AnyObj;
     lead.assignedTo = new mongoose.Types.ObjectId(String(repId));
@@ -2206,6 +2249,7 @@ router.post("/bulk-assign", async (req, res) => {
     if (!mongoose.isValidObjectId(repId)) {
       return res.status(400).json({ error: "Valid assignedTo is required." });
     }
+    const bulkScope = leadScope(req);
     const rawIds: unknown[] = Array.isArray(body.leadIds) ? body.leadIds : [];
     const leadIds = Array.from(new Set(rawIds.map((v) => String(v))));
     if (leadIds.length === 0) return res.status(400).json({ error: "leadIds is required." });
@@ -2234,6 +2278,10 @@ router.post("/bulk-assign", async (req, res) => {
         const lead = await Lead.findById(id);
         if (!lead) {
           failed.push({ _id: id, reason: "Lead not found." });
+          continue;
+        }
+        if (!canManageOthers(bulkScope) && !ownsLead(bulkScope, lead)) {
+          failed.push({ _id: id, reason: "This lead is owned by someone else." });
           continue;
         }
         const previousOwnerName = lead.assignedToName || "";
@@ -2297,6 +2345,7 @@ router.post("/:id/win", async (req, res) => {
 
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
+    if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
 
     const user = (req as any).user as AnyObj;
 
@@ -2406,6 +2455,7 @@ router.post("/:id/lose", async (req, res) => {
 
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
+    if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
 
     const { lostReason = "" } = req.body as AnyObj;
     const user = (req as any).user as AnyObj;
@@ -2450,6 +2500,7 @@ router.post("/:id/convert", async (req, res) => {
 
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
+    if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
 
     if (lead.convertedToContactId) {
       return res.status(409).json({
@@ -2611,6 +2662,7 @@ router.delete("/:id", async (req, res) => {
 
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
+    if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
 
     await Promise.all([
       Lead.deleteOne({ _id: lead._id }),

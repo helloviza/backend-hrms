@@ -29,6 +29,9 @@ export function requireCRMAccess(module: string): express.RequestHandler {
         .select("modules")
         .lean()) as any;
 
+      // The whole map rides along so services/crmScope can scope a rollup
+      // that belongs to another module (a company's deals follow the leads scope).
+      (req as any).crmModules = perm?.modules || {};
       const mod = (perm?.modules as any)?.[module];
       if (!mod || mod.access === "NONE") {
         res.status(403).json({ error: "No CRM access" });

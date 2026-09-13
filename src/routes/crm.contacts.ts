@@ -10,6 +10,7 @@ import { isCrmV2OpportunityEnabled } from "../config/crmV2.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireHouse } from "../middleware/requireHouse.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
+import { crmScope, moduleScope, contactMatch, leadMatch, opportunityMatch } from "../services/crmScope.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import logger from "../utils/logger.js";
@@ -282,12 +283,16 @@ router.get("/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid contact ID." });
     }
 
-    const contact = await CRMContact.findById(req.params.id).lean();
+    // Same rule as the list (assigned to me OR created by me under OWN);
+    // outside it reads as "not found" — never confirm existence.
+    const contact = await CRMContact.findOne({ _id: req.params.id, ...contactMatch(crmScope(req)) }).lean();
     if (!contact) return res.status(404).json({ error: "Contact not found." });
 
+    // The linked lead and deal follow the viewer's LEADS scope (services/crmScope).
+    const leadsScope = moduleScope(req, "leads");
     let linkedLead = null;
-    if (contact.leadId) {
-      linkedLead = await Lead.findById(contact.leadId)
+    if (contact.leadId && leadsScope) {
+      linkedLead = await Lead.findOne({ _id: contact.leadId, ...leadMatch(leadsScope) })
         .select(
           "leadCode contactName companyName companyId stage status source sourceChannel dealValue currency assignedToName opportunityId disposition subDisposition dispositionStage dispositionStatus nextFollowUpDate createdAt"
         )
@@ -297,10 +302,10 @@ router.get("/:id", async (req, res) => {
     // The deal this person is buying on — as the primary contact, or via the
     // lead they were materialised from. Gated like `opportunity` on GET /leads/:id.
     let opportunity = null;
-    if (isCrmV2OpportunityEnabled()) {
+    if (isCrmV2OpportunityEnabled() && leadsScope) {
       const or: AnyObj[] = [{ primaryContactId: contact._id }];
       if (contact.leadId) or.push({ leadId: contact.leadId });
-      opportunity = await Opportunity.findOne({ $or: or })
+      opportunity = await Opportunity.findOne({ ...opportunityMatch(leadsScope), $or: or })
         .select("opportunityCode name pipeline stage dealValue currency closeDate closedAt nextAction nextActionDueAt lostReason ownerName leadId companyId createdAt updatedAt")
         .sort({ createdAt: -1 })
         .lean();

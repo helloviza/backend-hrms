@@ -13,6 +13,7 @@ import { isClosedLeadStatus, isClosedOpportunityStage, legacyStageToStatus } fro
 import { requireAuth } from "../middleware/auth.js";
 import { requireHouse } from "../middleware/requireHouse.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
+import { moduleScope, leadMatch, opportunityMatch, contactMatch } from "../services/crmScope.js";
 import { normalizeCompanyName } from "../utils/companyName.js";
 import { isCrmV2FoundationEnabled, isCrmV2OpportunityEnabled } from "../config/crmV2.js";
 import logger from "../utils/logger.js";
@@ -301,8 +302,12 @@ router.get("/", async (req, res) => {
     // canonical status (status ?? legacy stage) not in CONVERTED / LOST.
     // Opportunities are read only under CRM_V2_OPPORTUNITY, matching
     // GET /leads/:id; off, the counts are 0 and the UI hides them.
-    const leadRows = companyIds.length
-      ? await Lead.find({ companyId: { $in: companyIds } }).select("companyId stage status").lean()
+    // Rollups follow the VIEWER's leads scope (services/crmScope): an OWN rep
+    // counts their own leads / deals at the company, not everyone's; no
+    // leads access at all → zeros.
+    const leadsScope = moduleScope(req, "leads");
+    const leadRows = companyIds.length && leadsScope
+      ? await Lead.find({ ...leadMatch(leadsScope), companyId: { $in: companyIds } }).select("companyId stage status").lean()
       : [];
     const leadCounts = new Map<string, { total: number; open: number }>();
     for (const l of leadRows as any[]) {
@@ -313,8 +318,8 @@ router.get("/", async (req, res) => {
       leadCounts.set(k, e);
     }
     const oppRows =
-      isCrmV2OpportunityEnabled() && companyIds.length
-        ? await Opportunity.find({ companyId: { $in: companyIds } }).select("companyId pipeline stage").lean()
+      isCrmV2OpportunityEnabled() && companyIds.length && leadsScope
+        ? await Opportunity.find({ ...opportunityMatch(leadsScope), companyId: { $in: companyIds } }).select("companyId pipeline stage").lean()
         : [];
     const oppCounts = new Map<string, { total: number; open: number; won: number }>();
     for (const o of oppRows as any[]) {
@@ -355,17 +360,24 @@ router.get("/:id", async (req, res) => {
     const company = await CRMCompany.findById(req.params.id).lean();
     if (!company) return res.status(404).json({ error: "Company not found." });
 
-    const contacts = await CRMContact.find({ companyId: company._id })
-      .select("firstName lastName jobTitle phone email status")
-      .lean();
+    // The company itself is a shared entity (a rep's own lead may sit at a
+    // company someone else created), but every rollup on it follows the
+    // viewer's scope for THAT module (services/crmScope): contacts by the
+    // crmContacts scope, deals by the leads scope; no access → empty.
+    const contactsScope = moduleScope(req, "crmContacts");
+    const leadsScope = moduleScope(req, "leads");
+    const contactFilter = contactsScope ? { ...contactMatch(contactsScope), companyId: company._id } : null;
+    const contacts = contactFilter
+      ? await CRMContact.find(contactFilter).select("firstName lastName jobTitle phone email status").lean()
+      : [];
 
     // contactCount is computed-on-read — the stored field is never trusted.
-    const contactCount = await CRMContact.countDocuments({ companyId: company._id });
+    const contactCount = contactFilter ? await CRMContact.countDocuments(contactFilter) : 0;
 
     // Opportunities anchored on this company (Opportunity.companyId ← Lead.companyId).
     // Gated like the `opportunity` on GET /leads/:id; off, the array is empty.
-    const opportunities = isCrmV2OpportunityEnabled()
-      ? await Opportunity.find({ companyId: company._id })
+    const opportunities = isCrmV2OpportunityEnabled() && leadsScope
+      ? await Opportunity.find({ ...opportunityMatch(leadsScope), companyId: company._id })
           .select("opportunityCode name pipeline stage dealValue currency closeDate closedAt nextAction nextActionDueAt lostReason ownerName leadId primaryContactId createdAt updatedAt")
           .sort({ createdAt: -1 })
           .lean()
