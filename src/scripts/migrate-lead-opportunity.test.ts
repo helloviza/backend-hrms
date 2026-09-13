@@ -283,6 +283,48 @@ describe("apply", () => {
     expect((await Lead.findById(liveLead).lean())!.status).toBe("CONVERTED");
   });
 
+  it("rollback RETAINS a migration opportunity that was worked since (live activity), and rolls back the untouched ones", async () => {
+    const ids = await seedFixture();
+    const plan = await planMigration();
+    await applyMigration(plan, DEFAULT_RULE_ID);
+    const worked = (await Opportunity.findOne({ leadId: ids.proposal }).lean()) as any;
+    expect(worked.automatedByRule).toBe(DEFAULT_RULE_ID);
+    const migrationRowsOnWorked = await LeadActivity.countDocuments({ "subject.id": worked._id, automatedByRule: DEFAULT_RULE_ID });
+    expect(migrationRowsOnWorked).toBe(1);
+
+    // A rep moves the deal (the shape services/disposition.ts and the
+    // flagged stage routes write: OPPORTUNITY subject, rule "").
+    await Opportunity.updateOne({ _id: worked._id }, { $set: { stage: "negotiation" } });
+    const live = await LeadActivity.create({
+      leadId: ids.proposal, subject: { type: "OPPORTUNITY", id: worked._id }, type: "stage_change",
+      note: 'Opportunity moved proposal → negotiation (disposition "Negotiation in Progress")',
+      fromStage: "proposal", toStage: "negotiation", automatedByRule: "", createdBy: REP, createdByName: "Rep One",
+    });
+
+    const dry = await rollbackMigration(DEFAULT_RULE_ID, true);
+    expect(dry.opportunitiesRetained).toEqual([{ id: String(worked._id), opportunityCode: worked.opportunityCode, leadCode: "LEAD-2026-0007", liveActivities: 1 }]);
+    expect(dry).toMatchObject({ opportunitiesToDelete: 5, activitiesToDelete: 6, leadsToReset: 13 });
+
+    const rb = await rollbackMigration(DEFAULT_RULE_ID, false);
+    expect(rb).toMatchObject({ opportunitiesDeleted: 5, activitiesDeleted: 6, leadsReset: 13 });
+    // the worked deal, its live row, its own "opened at" row and its lead's state all survive
+    expect(await Opportunity.countDocuments({})).toBe(1);
+    expect((await Opportunity.findById(worked._id).lean())!.stage).toBe("negotiation");
+    expect(await LeadActivity.countDocuments({ _id: live._id })).toBe(1);
+    expect(await LeadActivity.countDocuments({ "subject.id": worked._id, automatedByRule: DEFAULT_RULE_ID })).toBe(1);
+    expect((await Lead.findById(ids.proposal).lean())!).toMatchObject({ status: "CONVERTED", opportunityId: worked._id });
+    // no OPPORTUNITY-subject row points at a deleted deal
+    const orphans = await LeadActivity.aggregate([
+      { $match: { "subject.type": "OPPORTUNITY" } },
+      { $lookup: { from: Opportunity.collection.name, localField: "subject.id", foreignField: "_id", as: "o" } },
+      { $match: { o: { $size: 0 } } }, { $count: "n" },
+    ]);
+    expect(orphans[0]?.n ?? 0).toBe(0);
+    // everything else is back to the pre-migration shape
+    expect(await Lead.countDocuments({ _id: { $ne: ids.proposal }, $or: [{ status: { $type: "string" } }, { opportunityId: { $type: "objectId" } }] })).toBe(0);
+    expect(await LeadActivity.countDocuments({ automatedByRule: DEFAULT_RULE_ID })).toBe(1);
+  });
+
   it("refuses unmapped rows and reports them without aborting the rest", async () => {
     await seedFixture();
     const bad = await prodLead("", {}); // blank stage — does not map

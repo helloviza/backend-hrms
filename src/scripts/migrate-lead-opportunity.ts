@@ -26,6 +26,9 @@
 // Opportunity's unique partial index on leadId makes a duplicate impossible.
 // --rollback reverses step 3 by rule id (see rollbackMigration below and the
 // plan doc §7); the nameNormalized backfill is data hygiene and is NOT reverted.
+// A migration opportunity that a human has since worked (any OPPORTUNITY-
+// subject activity not stamped with the rule id) is RETAINED with its lead
+// state and listed — deleting it would orphan that live row.
 //
 // ⚠ TARGET GUARD (risk M13). Host-based, default-deny:
 //   • mongodb+srv:// is refused outright unless --i-know-this-is-production.
@@ -416,14 +419,40 @@ export interface RollbackSummary {
   opportunitiesToDelete: number;
   activitiesToDelete: number;
   leadsToReset: number;
+  /** Migration-created opportunities that carry activity written by someone
+   *  other than the migration (a disposition, a stage move) — deleting them
+   *  would orphan that live row, so they are kept, lead state and all. */
+  opportunitiesRetained: Array<{ id: string; opportunityCode: string; leadCode: string; liveActivities: number }>;
   opportunitiesDeleted: number;
   activitiesDeleted: number;
   leadsReset: number;
 }
 
 export async function rollbackMigration(ruleId: string, dryRun: boolean): Promise<RollbackSummary> {
-  const oppIds = (await Opportunity.find({ automatedByRule: ruleId }).select("_id").lean()).map((o: any) => o._id);
-  // (points at a migration opportunity OR has none) AND (carries something to reset)
+  const migrationOpps = (await Opportunity.find({ automatedByRule: ruleId }).select("_id opportunityCode leadId").lean()) as any[];
+  const allIds = migrationOpps.map((o) => o._id);
+
+  // "Worked since migration": any OPPORTUNITY-subject activity on the row that
+  // the migration itself did not write (rule id differs — "" for a human).
+  const liveBySubject = allIds.length
+    ? await LeadActivity.aggregate([
+        { $match: { "subject.type": "OPPORTUNITY", "subject.id": { $in: allIds }, automatedByRule: { $ne: ruleId } } },
+        { $group: { _id: "$subject.id", n: { $sum: 1 } } },
+      ])
+    : [];
+  const liveCount = new Map<string, number>(liveBySubject.map((r: any) => [String(r._id), r.n]));
+  const retained = migrationOpps.filter((o) => liveCount.has(String(o._id)));
+  const retainedLeadCodes = retained.length
+    ? new Map<string, string>(
+        ((await Lead.find({ _id: { $in: retained.map((o) => o.leadId) } }).select("_id leadCode").lean()) as any[]).map((l) => [String(l._id), l.leadCode || ""]),
+      )
+    : new Map<string, string>();
+  const retainedIds = new Set(retained.map((o) => String(o._id)));
+  const oppIds = allIds.filter((id) => !retainedIds.has(String(id)));
+
+  // (points at a migration opportunity being deleted OR has none) AND (carries
+  // something to reset). A lead whose opportunity is retained keeps its state,
+  // exactly like a lead whose opportunity was created live.
   const leadFilter = {
     $and: [
       { $or: [{ opportunityId: { $in: oppIds } }, { opportunityId: null }] },
@@ -437,10 +466,21 @@ export async function rollbackMigration(ruleId: string, dryRun: boolean): Promis
       },
     ],
   };
+  // The migration's own rows on a retained opportunity stay too — its
+  // "opened at …" line is the start of a story a human continued.
+  const activityFilter = retained.length
+    ? { automatedByRule: ruleId, $nor: [{ "subject.type": "OPPORTUNITY", "subject.id": { $in: retained.map((o) => o._id) } }] }
+    : { automatedByRule: ruleId };
   const out: RollbackSummary = {
     opportunitiesToDelete: oppIds.length,
-    activitiesToDelete: await LeadActivity.countDocuments({ automatedByRule: ruleId }),
+    activitiesToDelete: await LeadActivity.countDocuments(activityFilter),
     leadsToReset: await Lead.countDocuments(leadFilter),
+    opportunitiesRetained: retained.map((o) => ({
+      id: String(o._id),
+      opportunityCode: o.opportunityCode || "",
+      leadCode: retainedLeadCodes.get(String(o.leadId)) || "",
+      liveActivities: liveCount.get(String(o._id)) || 0,
+    })),
     opportunitiesDeleted: 0,
     activitiesDeleted: 0,
     leadsReset: 0,
@@ -448,7 +488,7 @@ export async function rollbackMigration(ruleId: string, dryRun: boolean): Promis
   if (dryRun) return out;
   const l = await Lead.collection.updateMany(leadFilter, { $unset: { status: "", sourceChannel: "", enquiryType: "", opportunityId: "" } });
   out.leadsReset = l.modifiedCount ?? 0;
-  const a = await LeadActivity.deleteMany({ automatedByRule: ruleId });
+  const a = await LeadActivity.deleteMany(activityFilter);
   out.activitiesDeleted = a.deletedCount ?? 0;
   const o = await Opportunity.deleteMany({ _id: { $in: oppIds } });
   out.opportunitiesDeleted = o.deletedCount ?? 0;
@@ -539,6 +579,10 @@ async function main() {
       console.log(`  opportunities: ${dryRun ? `${r.opportunitiesToDelete} would be deleted` : `${r.opportunitiesDeleted} deleted`}`);
       console.log(`  activities:    ${dryRun ? `${r.activitiesToDelete} would be deleted` : `${r.activitiesDeleted} deleted`}`);
       console.log(`  leads:         ${dryRun ? `${r.leadsToReset} would be reset` : `${r.leadsReset} reset`}`);
+      if (r.opportunitiesRetained.length) {
+        console.log(`  retained:      ${r.opportunitiesRetained.length} migration opportunit${r.opportunitiesRetained.length === 1 ? "y" : "ies"} — worked since migration (live activity would be orphaned)`);
+        for (const k of r.opportunitiesRetained) console.log(`    ${k.opportunityCode || k.id}  lead ${k.leadCode || "?"}  live activities: ${k.liveActivities}`);
+      }
       if (dryRun) console.log("\nRe-run with --apply to perform the rollback.");
       return;
     }
