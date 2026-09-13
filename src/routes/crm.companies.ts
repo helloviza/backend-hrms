@@ -7,11 +7,14 @@ import CRMCompany, {
   ACCOUNT_TIERS,
 } from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
+import Lead from "../models/Lead.js";
+import Opportunity from "../models/Opportunity.js";
+import { isClosedLeadStatus, isClosedOpportunityStage, legacyStageToStatus } from "../models/crmTaxonomy.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireHouse } from "../middleware/requireHouse.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
 import { normalizeCompanyName } from "../utils/companyName.js";
-import { isCrmV2FoundationEnabled } from "../config/crmV2.js";
+import { isCrmV2FoundationEnabled, isCrmV2OpportunityEnabled } from "../config/crmV2.js";
 import logger from "../utils/logger.js";
 
 const router = express.Router();
@@ -293,9 +296,43 @@ router.get("/", async (req, res) => {
     const countMap = new Map<string, number>(
       countAgg.map((r: any) => [String(r._id), r.count])
     );
+    // Lead / opportunity rollups for the page — same computed-on-read posture.
+    // Leads anchor on Lead.companyId (backfill-lead-companyId); "open" is the
+    // canonical status (status ?? legacy stage) not in CONVERTED / LOST.
+    // Opportunities are read only under CRM_V2_OPPORTUNITY, matching
+    // GET /leads/:id; off, the counts are 0 and the UI hides them.
+    const leadRows = companyIds.length
+      ? await Lead.find({ companyId: { $in: companyIds } }).select("companyId stage status").lean()
+      : [];
+    const leadCounts = new Map<string, { total: number; open: number }>();
+    for (const l of leadRows as any[]) {
+      const k = String(l.companyId);
+      const e = leadCounts.get(k) || { total: 0, open: 0 };
+      e.total += 1;
+      if (!isClosedLeadStatus(l.status || legacyStageToStatus(l.stage))) e.open += 1;
+      leadCounts.set(k, e);
+    }
+    const oppRows =
+      isCrmV2OpportunityEnabled() && companyIds.length
+        ? await Opportunity.find({ companyId: { $in: companyIds } }).select("companyId pipeline stage").lean()
+        : [];
+    const oppCounts = new Map<string, { total: number; open: number; won: number }>();
+    for (const o of oppRows as any[]) {
+      const k = String(o.companyId);
+      const e = oppCounts.get(k) || { total: 0, open: 0, won: 0 };
+      e.total += 1;
+      if (!isClosedOpportunityStage(o.pipeline, o.stage)) e.open += 1;
+      else if (o.stage !== "closed_lost") e.won += 1;
+      oppCounts.set(k, e);
+    }
     const withCounts = companies.map((c: any) => ({
       ...c,
       contactCount: countMap.get(String(c._id)) || 0,
+      leadCount: leadCounts.get(String(c._id))?.total || 0,
+      openLeadCount: leadCounts.get(String(c._id))?.open || 0,
+      opportunityCount: oppCounts.get(String(c._id))?.total || 0,
+      openOpportunityCount: oppCounts.get(String(c._id))?.open || 0,
+      wonOpportunityCount: oppCounts.get(String(c._id))?.won || 0,
     }));
 
     return res.json({ companies: withCounts, total, page, pages: Math.ceil(total / limit) });
@@ -319,13 +356,22 @@ router.get("/:id", async (req, res) => {
     if (!company) return res.status(404).json({ error: "Company not found." });
 
     const contacts = await CRMContact.find({ companyId: company._id })
-      .select("firstName lastName jobTitle phone email")
+      .select("firstName lastName jobTitle phone email status")
       .lean();
 
     // contactCount is computed-on-read — the stored field is never trusted.
     const contactCount = await CRMContact.countDocuments({ companyId: company._id });
 
-    return res.json({ company: { ...company, contactCount }, contacts });
+    // Opportunities anchored on this company (Opportunity.companyId ← Lead.companyId).
+    // Gated like the `opportunity` on GET /leads/:id; off, the array is empty.
+    const opportunities = isCrmV2OpportunityEnabled()
+      ? await Opportunity.find({ companyId: company._id })
+          .select("opportunityCode name pipeline stage dealValue currency closeDate closedAt nextAction nextActionDueAt lostReason ownerName leadId primaryContactId createdAt updatedAt")
+          .sort({ createdAt: -1 })
+          .lean()
+      : [];
+
+    return res.json({ company: { ...company, contactCount }, contacts, opportunities });
   } catch (err) {
     logger.error("crm.companies GET /:id error", { err });
     return res.status(500).json({ error: "Failed to get company." });

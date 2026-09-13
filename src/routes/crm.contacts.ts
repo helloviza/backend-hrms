@@ -4,7 +4,9 @@ import ExcelJS from "exceljs";
 import CRMContact from "../models/CRMContact.js";
 import CRMCompany from "../models/CRMCompany.js";
 import Lead from "../models/Lead.js";
+import Opportunity from "../models/Opportunity.js";
 import User from "../models/User.js";
+import { isCrmV2OpportunityEnabled } from "../config/crmV2.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireHouse } from "../middleware/requireHouse.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
@@ -286,7 +288,21 @@ router.get("/:id", async (req, res) => {
     let linkedLead = null;
     if (contact.leadId) {
       linkedLead = await Lead.findById(contact.leadId)
-        .select("leadCode contactName companyName stage source dealValue assignedToName")
+        .select(
+          "leadCode contactName companyName companyId stage status source sourceChannel dealValue currency assignedToName opportunityId disposition subDisposition dispositionStage dispositionStatus nextFollowUpDate createdAt"
+        )
+        .lean();
+    }
+
+    // The deal this person is buying on — as the primary contact, or via the
+    // lead they were materialised from. Gated like `opportunity` on GET /leads/:id.
+    let opportunity = null;
+    if (isCrmV2OpportunityEnabled()) {
+      const or: AnyObj[] = [{ primaryContactId: contact._id }];
+      if (contact.leadId) or.push({ leadId: contact.leadId });
+      opportunity = await Opportunity.findOne({ $or: or })
+        .select("opportunityCode name pipeline stage dealValue currency closeDate closedAt nextAction nextActionDueAt lostReason ownerName leadId companyId createdAt updatedAt")
+        .sort({ createdAt: -1 })
         .lean();
     }
 
@@ -304,7 +320,7 @@ router.get("/:id", async (req, res) => {
       }
     }
 
-    return res.json({ contact: { ...(contact as any), assignedToName }, linkedLead });
+    return res.json({ contact: { ...(contact as any), assignedToName }, linkedLead, opportunity });
   } catch (err) {
     logger.error("crm.contacts GET /:id error", { err });
     return res.status(500).json({ error: "Failed to get contact." });
