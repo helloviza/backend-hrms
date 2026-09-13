@@ -10,7 +10,8 @@ import { applyDisposition, snapshotOf, DispositionError } from "../services/disp
 import { resolvePipelineForLead, groupedSet, canWorkPipeline } from "../services/crmPipelines.js";
 import CRMCompany from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
-import { resolveOrCreateCompany } from "../utils/crmCompany.js";
+import { resolveOrCreateCompany, normalizeCompanyName } from "../utils/crmCompany.js";
+import { isClosedLeadStatus } from "../models/crmTaxonomy.js";
 import type { LeadStage } from "../models/Lead.js";
 import type { ActivityType } from "../models/LeadActivity.js";
 import { UserPermission } from "../models/UserPermission.js";
@@ -400,6 +401,100 @@ router.get("/reps", async (_req, res) => {
   } catch (err) {
     logger.error("leads GET /reps error", { err });
     return res.status(500).json({ error: "Failed to load reps." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTE 0b — GET /company-check?name=… | ?companyId=…
+// ═══════════════════════════════════════════════════════════════
+// Same-company dedupe context for the new-lead form: does this company
+// already exist, and which leads does it already carry (with their owner)?
+// Read-only and ADVISORY — POST / never consults it; the rep decides.
+//
+// Resolution is the one dedupe key (utils/companyName.ts nameNormalized),
+// with a case-insensitive exact-name fallback for legacy rows whose key is
+// still "". Leads are matched on Lead.companyId, plus unanchored legacy rows
+// whose companyName equals the resolved company's name.
+//
+// Scope: deliberately NOT narrowed to OWN — the point is to reveal that a
+// colleague owns the account. Only leadCode / contact / stage / owner are
+// exposed. `open` uses the same definition as the Companies rollups
+// (canonical status not in CONVERTED / LOST).
+router.get("/company-check", async (req, res) => {
+  try {
+    const q = req.query as AnyObj;
+    const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    let company: any = null;
+    if (q.companyId && mongoose.isValidObjectId(String(q.companyId))) {
+      company = await CRMCompany.findById(String(q.companyId))
+        .select("name companyCode industry city country customerId")
+        .lean();
+    } else {
+      const name = String(q.name || "").trim();
+      const nameNormalized = normalizeCompanyName(name);
+      if (!nameNormalized) {
+        return res.status(400).json({ error: "name or companyId is required." });
+      }
+      company = await CRMCompany.findOne({
+        $or: [
+          { nameNormalized },
+          { nameNormalized: "", name: new RegExp(`^${escapeRe(name)}$`, "i") },
+        ],
+      })
+        .select("name companyCode industry city country customerId")
+        .lean();
+    }
+
+    if (!company) return res.json({ match: false, company: null, leads: [], openCount: 0, total: 0 });
+
+    const rows = (await Lead.find({
+      $or: [
+        { companyId: company._id },
+        { companyId: null, companyName: new RegExp(`^${escapeRe(String(company.name))}$`, "i") },
+      ],
+    })
+      .select("leadCode contactName contactDesignation stage status dispositionStage dispositionStatus subDisposition assignedTo assignedToName nextFollowUpDate createdAt")
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean()) as any[];
+
+    // Owner labels: the stored assignedToName, resolved from User when blank.
+    const missing = rows.filter((l) => !l.assignedToName && l.assignedTo).map((l) => l.assignedTo);
+    const users = missing.length
+      ? ((await User.find({ _id: { $in: missing } }).select("name firstName lastName email").lean()) as any[])
+      : [];
+    const nameOf = new Map(
+      users.map((u) => [String(u._id), (u.name && String(u.name).trim()) || `${u.firstName || ""} ${u.lastName || ""}`.trim() || String(u.email || "")])
+    );
+
+    const leads = rows.map((l) => ({
+      _id: String(l._id),
+      leadCode: l.leadCode,
+      contactName: l.contactName || "",
+      contactDesignation: l.contactDesignation || "",
+      stage: l.stage,
+      status: effectiveLeadStatus(l),
+      dispositionStage: l.dispositionStage || "",
+      dispositionStatus: l.dispositionStatus || "",
+      subDisposition: l.subDisposition || "",
+      assignedTo: l.assignedTo ? String(l.assignedTo) : null,
+      assignedToName: l.assignedToName || (l.assignedTo ? nameOf.get(String(l.assignedTo)) || "" : ""),
+      open: !isClosedLeadStatus(effectiveLeadStatus(l)),
+      nextFollowUpDate: l.nextFollowUpDate ?? null,
+      createdAt: l.createdAt,
+    }));
+
+    return res.json({
+      match: true,
+      company: { ...company, _id: String(company._id) },
+      leads,
+      openCount: leads.filter((l) => l.open).length,
+      total: leads.length,
+    });
+  } catch (err) {
+    logger.error("leads GET /company-check error", { err });
+    return res.status(500).json({ error: "Failed to check the company." });
   }
 });
 
