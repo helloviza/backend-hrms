@@ -34,6 +34,8 @@ const { default: Lead } = await import("../models/Lead.js");
 const { default: LeadActivity } = await import("../models/LeadActivity.js");
 const { default: Opportunity } = await import("../models/Opportunity.js");
 const { default: User } = await import("../models/User.js");
+const { default: CRMContact } = await import("../models/CRMContact.js");
+const { default: CRMCompany } = await import("../models/CRMCompany.js");
 const { ensureDefaultPipeline, findEntry, groupedSet, canWorkPipeline } = await import("./crmPipelines.js");
 const { applyDisposition, snapshotOf, DispositionError } = await import("./disposition.js");
 const { default: router } = await import("../routes/leads.js");
@@ -52,7 +54,7 @@ afterAll(async () => {
   await mongod.stop();
 });
 beforeEach(async () => {
-  await Promise.all([Lead.deleteMany({}), LeadActivity.deleteMany({}), Opportunity.deleteMany({}), CrmPipeline.deleteMany({})]);
+  await Promise.all([Lead.deleteMany({}), LeadActivity.deleteMany({}), Opportunity.deleteMany({}), CrmPipeline.deleteMany({}), CRMContact.deleteMany({}), CRMCompany.deleteMany({})]);
   process.env[CRM_V2_DISPOSITION_ENV] = "true";
   process.env[CRM_V2_OPPORTUNITY_ENV] = "true";
 });
@@ -252,6 +254,116 @@ describe("applyDisposition — derivation, activity, shadow opportunity", () => 
     await expect(applyDisposition(lead, { subDisposition: "Ghosted", actor: ACTOR })).rejects.toBeInstanceOf(DispositionError);
     expect(await LeadActivity.countDocuments({})).toBe(0);
     expect((await Lead.collection.findOne({ _id: lead._id }))!.disposition).toBe("");
+  });
+});
+
+/* ───────────────────────── Onboarded → CRM contact ───────────────────────── */
+
+describe("Onboarded → CRMContact (what /win materialised, with the guards it lacked)", () => {
+  it("creates exactly one contact + company, links the lead, logs a CONTACT row, and the deal picks up primaryContactId", async () => {
+    const lead = await freshLead({ contactName: "Priya Nair", contactEmail: "Priya@Zepto.com", contactDesignation: "Travel Desk", notes: "Met at expo" });
+    const r = await applyDisposition(lead, { subDisposition: "Onboarded", actor: ACTOR });
+    expect(r.contact).toMatchObject({ how: "created" });
+    expect(await CRMContact.countDocuments({})).toBe(1);
+    expect(await CRMCompany.countDocuments({})).toBe(1);
+
+    // the /win shape: name split, designation → jobTitle, email lower-cased, linked via leadId/companyId/assignedTo
+    const contact = (await CRMContact.findOne({}).lean()) as any;
+    const company = (await CRMCompany.findOne({}).lean()) as any;
+    expect(contact).toMatchObject({ firstName: "Priya", lastName: "Nair", jobTitle: "Travel Desk", phone: "9880123456", email: "priya@zepto.com", companyName: "Zepto", notes: "Met at expo", isPrivate: false, status: "active" });
+    expect(String(contact.leadId)).toBe(String(lead._id));
+    expect(String(contact.companyId)).toBe(String(company._id));
+    expect(String(contact.assignedTo)).toBe(ADMIN_ID);
+    expect(String(contact.createdBy)).toBe(ADMIN_ID);
+    expect(company.name).toBe("Zepto");
+
+    // lead links — the "View Contact" link resolves; companyId aligned with convertedToCompanyId
+    const raw = (await Lead.collection.findOne({ _id: lead._id })) as any;
+    expect(String(raw.convertedToContactId)).toBe(String(contact._id));
+    expect(String(raw.convertedToCompanyId)).toBe(String(company._id));
+    expect(String(raw.companyId)).toBe(String(company._id));
+    expect(r.contact!.id).toBe(String(contact._id));
+
+    // timeline: disposition → contact (CONTACT-subject won row) → opportunity closed_won, in that order
+    const acts = await LeadActivity.find({ leadId: lead._id }).sort({ createdAt: 1, _id: 1 }).lean();
+    expect(acts.map((a: any) => [a.type, a.subject?.type])).toEqual([["disposition", "LEAD"], ["won", "CONTACT"], ["stage_change", "OPPORTUNITY"]]);
+    const contactRow = acts[1] as any;
+    expect(String(contactRow.subject.id)).toBe(String(contact._id));
+    expect(contactRow.note).toBe('Converted: Contact "Priya Nair" and Company "Zepto" created.');
+    expect(contactRow.createdByName).toBe("Ops Admin");
+
+    // the shadow deal was created AFTER the contact, so it carries the links
+    const opp = (await Opportunity.findOne({ leadId: lead._id }).lean()) as any;
+    expect(opp.stage).toBe("closed_won");
+    expect(String(opp.primaryContactId)).toBe(String(contact._id));
+    expect(String(opp.companyId)).toBe(String(company._id));
+  });
+
+  it("re-Onboarding creates ZERO more contacts and no second contact row (the /win duplicate bug)", async () => {
+    const lead = await freshLead({ contactEmail: "priya@zepto.com" });
+    const r1 = await applyDisposition(lead, { subDisposition: "Onboarded", actor: ACTOR });
+    const r2 = await applyDisposition(lead, { subDisposition: "Onboarded", actor: ACTOR });
+    expect(r1.contact).toMatchObject({ how: "created" });
+    expect(r2.contact).toMatchObject({ how: "already_converted", id: r1.contact!.id });
+    expect(await CRMContact.countDocuments({})).toBe(1);
+    expect(await CRMCompany.countDocuments({})).toBe(1);
+    expect(await LeadActivity.countDocuments({ "subject.type": "CONTACT" })).toBe(1);
+    expect(await LeadActivity.countDocuments({ type: "disposition" })).toBe(2);
+    expect(String((await Lead.collection.findOne({ _id: lead._id }))!.convertedToContactId)).toBe(r1.contact!.id);
+
+    // an Onboarded lead re-saved through the model (no disposition) stays converted once
+    const doc = (await Lead.findById(lead._id))!;
+    doc.notes = "touched";
+    await doc.save();
+    expect(await CRMContact.countDocuments({})).toBe(1);
+
+    // and a lead that arrives already converted (e.g. via legacy /convert) is left alone too
+    const pre = await CRMContact.create({ firstName: "Existing", phone: "1", createdBy: new mongoose.Types.ObjectId(ADMIN_ID) });
+    const lead2 = await freshLead({ contactName: "Two", contactEmail: "two@zepto.com", convertedToContactId: pre._id });
+    const r3 = await applyDisposition(lead2, { subDisposition: "Onboarded", actor: ACTOR });
+    expect(r3.contact).toMatchObject({ how: "already_converted", id: String(pre._id) });
+    expect(await CRMContact.countDocuments({})).toBe(2);
+    expect(await LeadActivity.countDocuments({ leadId: lead2._id, "subject.type": "CONTACT" })).toBe(0);
+  });
+
+  it("an existing contact with the same email is reused untouched (the /convert dedup lookup), never duplicated", async () => {
+    const company = await CRMCompany.create({ name: "Zepto", nameNormalized: "zepto" });
+    const existing = await CRMContact.create({ firstName: "P", lastName: "N", phone: "0000", email: "priya@zepto.com", jobTitle: "Old title", companyId: company._id, companyName: "Zepto", createdBy: new mongoose.Types.ObjectId(ADMIN_ID) });
+    const lead = await freshLead({ contactName: "Priya Nair", contactEmail: "PRIYA@zepto.com", contactDesignation: "New title" });
+    const r = await applyDisposition(lead, { subDisposition: "Onboarded", actor: ACTOR });
+    expect(r.contact).toMatchObject({ how: "existing_email", id: String(existing._id) });
+    expect(await CRMContact.countDocuments({})).toBe(1);
+    expect(await CRMCompany.countDocuments({})).toBe(1); // resolved by normalised name, not re-created
+
+    // reused contact is not rewritten by the lead's values (useExistingContactId semantics)
+    const after = (await CRMContact.findById(existing._id).lean()) as any;
+    expect(after).toMatchObject({ firstName: "P", lastName: "N", phone: "0000", jobTitle: "Old title" });
+    expect(after.leadId).toBeNull();
+
+    const raw = (await Lead.collection.findOne({ _id: lead._id })) as any;
+    expect(String(raw.convertedToContactId)).toBe(String(existing._id));
+    expect(String(raw.convertedToCompanyId)).toBe(String(company._id));
+    const row = (await LeadActivity.findOne({ leadId: lead._id, "subject.type": "CONTACT" }).lean()) as any;
+    expect(String(row.subject.id)).toBe(String(existing._id));
+    expect(row.note).toMatch(/existing Contact matched by email \(priya@zepto\.com\) linked and Company "Zepto"/);
+
+    // no email on the lead → nothing to match on; a fresh contact is created (and a second Onboarded still doesn't duplicate)
+    const noEmail = await freshLead({ contactName: "No Mail", contactPhone: "5555" });
+    expect((await applyDisposition(noEmail, { subDisposition: "Onboarded", actor: ACTOR })).contact).toMatchObject({ how: "created" });
+    expect(await CRMContact.countDocuments({})).toBe(2);
+  });
+
+  it("no contact on a non-Won disposition; Won reached via the route returns the contact in the cascade", async () => {
+    const lead = await freshLead({ contactEmail: "a@b.com" });
+    const r = await applyDisposition(lead, { subDisposition: "Introduction Email Sent", actor: ACTOR });
+    expect(r.contact).toBeNull();
+    expect(await CRMContact.countDocuments({})).toBe(0);
+
+    const res = await request(app()).post(`/api/leads/${lead._id}/disposition`).send({ subDisposition: "Onboarded" });
+    expect(res.status).toBe(200);
+    expect(res.body.contact).toMatchObject({ how: "created" });
+    expect(res.body.lead.convertedToContactId).toBe(res.body.contact.id);
+    expect(await CRMContact.countDocuments({})).toBe(1);
   });
 });
 

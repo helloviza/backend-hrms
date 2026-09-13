@@ -14,6 +14,11 @@
 //      then, ignored otherwise); lostReason ← sub-disposition on a Lost status;
 //   4. append ONE `disposition` activity carrying from → to (explainable, never
 //      rewrites history);
+//   4a/4b. status Won (Onboarded) → the CRM CONTACT + company the legacy /win
+//      materialised (ensureConvertedContact): convertedToContactId /
+//      convertedToCompanyId / companyId on the lead, plus a CONTACT-subject
+//      `won` row. Guarded: already converted → nothing; same email exists →
+//      reuse. Repeat Onboarded never duplicates (the /win bug);
 //   5. the SHADOW OPPORTUNITY — the rep works the lead only:
 //        effect "open"  first time → create the Opportunity in the pipeline's
 //                       deal pipeline at the entry's stage; later → sync stage
@@ -38,6 +43,9 @@ import mongoose from "mongoose";
 import Lead, { type LeadDoc } from "../models/Lead.js";
 import LeadActivity, { type DispositionSnapshot } from "../models/LeadActivity.js";
 import Opportunity from "../models/Opportunity.js";
+import CRMContact from "../models/CRMContact.js";
+import CRMCompany from "../models/CRMCompany.js";
+import { resolveOrCreateCompany } from "../utils/crmCompany.js";
 import { closedStage, isClosedOpportunityStage, MILESTONES } from "../models/crmTaxonomy.js";
 import { FRESH_DISPOSITION, type DispositionEntry } from "../models/crmDisposition.js";
 import { triggerTaskAutomation } from "./taskAutomation.js";
@@ -64,8 +72,71 @@ export interface ApplyDispositionResult {
   from: DispositionSnapshot;
   to: DispositionSnapshot;
   opportunity: null | { id: string; created: boolean; stage: string; fromStage: string | null; effect: DispositionEntry["opportunityEffect"] };
+  /** Won only. `how` says whether the contact was created, matched by email,
+   *  or was already on the lead (nothing written, no activity). */
+  contact: null | { id: string; companyId: string | null; how: "created" | "existing_email" | "already_converted" };
   activityId: string;
   pipeline: { id: string; key: string; name: string };
+}
+
+/**
+ * Won → the CRM contact + company, exactly the way the legacy /win path
+ * materialised them — with the guards /win lacked:
+ *   • `convertedToContactId` already set → nothing (the /convert guard; the
+ *     legacy /win had none and duplicated a contact on every repeat call);
+ *   • a contact with the same email already exists → reuse it, untouched
+ *     (the /convert dedup lookup: exact, lower-cased email);
+ *   • else create from the lead's contact fields, linked via leadId /
+ *     companyId / assignedTo.
+ * The company is the lead's anchor (`companyId`) when set, else
+ * resolve-or-create by name — never a second company for the same lead.
+ * Mutates the lead doc (convertedTo*, companyId); the caller saves.
+ */
+async function ensureConvertedContact(
+  lead: LeadDoc,
+  createdBy: mongoose.Types.ObjectId | null,
+): Promise<NonNullable<ApplyDispositionResult["contact"]>> {
+  if (lead.convertedToContactId) {
+    return { id: String(lead.convertedToContactId), companyId: lead.convertedToCompanyId ? String(lead.convertedToCompanyId) : null, how: "already_converted" };
+  }
+
+  let company: any = null;
+  if (lead.companyId) company = await CRMCompany.findById(lead.companyId);
+  if (!company && lead.companyName && lead.companyName.trim()) {
+    company = await resolveOrCreateCompany(
+      { name: lead.companyName, industry: lead.industry, companySize: lead.companySize, location: lead.location, website: lead.website, gstin: lead.gstin },
+      createdBy ?? undefined,
+    );
+  }
+
+  const email = String(lead.contactEmail || "").trim().toLowerCase();
+  let contact: any = email ? await CRMContact.findOne({ email }) : null;
+  let how: "created" | "existing_email" = "existing_email";
+  if (!contact) {
+    const nameParts = (lead.contactName || "").trim().split(" ");
+    contact = await CRMContact.create({
+      firstName: nameParts[0] || lead.contactName,
+      lastName: nameParts.slice(1).join(" ") || "",
+      jobTitle: lead.contactDesignation || "",
+      phone: lead.contactPhone,
+      email,
+      companyId: company?._id || null,
+      companyName: company?.name || lead.companyName || "",
+      source: lead.source,
+      notes: lead.notes || "",
+      leadId: lead._id,
+      assignedTo: lead.assignedTo || null,
+      createdBy: createdBy ?? undefined,
+      isPrivate: false,
+      status: "active",
+    });
+    how = "created";
+  }
+
+  lead.convertedToContactId = contact._id;
+  lead.convertedToCompanyId = company?._id || null;
+  if (company?._id) lead.companyId = company._id;
+  return { id: String(contact._id), companyId: company ? String(company._id) : null, how };
 }
 
 export function snapshotOf(lead: Pick<LeadDoc, "disposition" | "subDisposition" | "dispositionStage" | "dispositionStatus">): DispositionSnapshot {
@@ -117,6 +188,10 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
   }
   if (entry.status === "Lost") lead.lostReason = entry.subDisposition;
   if (entry.status === "Won" && !lead.wonDate) lead.wonDate = new Date();
+
+  // ── 4a. Won → the CRM contact/company (before the save so it is one write;
+  //        before the opportunity so the deal picks up primaryContactId/companyId) ──
+  const contact = entry.status === "Won" ? await ensureConvertedContact(lead, actorId) : null;
   await lead.save();
 
   // ── 4. the disposition activity ──
@@ -133,6 +208,23 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
     createdBy: actorId ?? undefined,
     createdByName: actorName,
   });
+
+  // ── 4b. the contact row — a CONTACT-subject `won` row, the way /convert
+  //        logs it; nothing when the lead was already converted ──
+  if (contact && contact.how !== "already_converted") {
+    const companyLabel = lead.convertedToCompanyId ? ` and Company "${lead.companyName}"` : "";
+    await LeadActivity.create({
+      leadId: lead._id,
+      subject: { type: "CONTACT", id: new mongoose.Types.ObjectId(contact.id) },
+      type: "won",
+      note:
+        contact.how === "created"
+          ? `Converted: Contact "${lead.contactName}"${companyLabel} created.`
+          : `Converted: existing Contact matched by email (${String(lead.contactEmail).trim().toLowerCase()}) linked${companyLabel}.`,
+      createdBy: actorId ?? undefined,
+      createdByName: actorName,
+    });
+  }
 
   // ── 5. shadow opportunity ──
   let oppResult: ApplyDispositionResult["opportunity"] = null;
@@ -256,6 +348,7 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
     from,
     to,
     opportunity: oppResult,
+    contact,
     activityId: String(act._id),
     pipeline: { id: String(pipeline._id), key: pipeline.key, name: pipeline.name },
   };

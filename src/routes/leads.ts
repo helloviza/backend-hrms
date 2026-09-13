@@ -1452,6 +1452,7 @@ router.post("/:id/disposition", async (req, res) => {
       to: result.to,
       entry: { disposition: result.entry.disposition, subDisposition: result.entry.subDisposition, stage: result.entry.stage, status: result.entry.status, opportunityEffect: result.entry.opportunityEffect },
       opportunity: result.opportunity,
+      contact: result.contact,
       pipeline: result.pipeline,
       activityId: result.activityId,
     });
