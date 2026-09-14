@@ -131,9 +131,19 @@ function reportingDisplayName(...docs: any[]): string {
  *
  * `workspaceId` is the SUBJECT's workspace: a manager must always live in the
  * same tenant as the employee they manage, including for SUPERADMIN callers.
+ * The gate is applied to the resolved USER (and to an Employee row only when
+ * it is actually stamped with a workspace) — see wsKey / sameOrUnstampedWs.
  * Returns null when the id resolves to nobody in that workspace.
  */
-async function resolveManagerRefs(
+/** workspaceId as stored on a doc → canonical hex string ("" when absent).
+ *  Employee rows written before workspace stamping carry no value, and one
+ *  legacy row carried it as a STRING — so the workspace check compares
+ *  normalised strings rather than trusting the stored type. */
+function wsKey(v: any): string {
+  return v ? String(v) : "";
+}
+
+export async function resolveManagerRefs(
   rawId: any,
   workspaceId: any
 ): Promise<{ userId: any; employeeId: any; displayName: string } | null> {
@@ -142,13 +152,21 @@ async function resolveManagerRefs(
 
   const oid = new mongoose.Types.ObjectId(id);
   const wsFilter: any = workspaceId ? { workspaceId } : {};
-  const empFields = "_id email ownerId fullName name firstName lastName";
+  const subjectWs = wsKey(workspaceId);
+  const empFields = "_id email ownerId fullName name firstName lastName workspaceId";
   const userFields = "_id email name firstName lastName";
 
-  // Employee id-space first — that is what the picker sends.
-  let employeeDoc: any = await Employee.findOne({ _id: oid, ...wsFilter })
-    .select(empFields)
-    .lean();
+  // A doc's stored workspace is acceptable when it is absent (legacy row) or
+  // equals the subject's — never when it names ANOTHER workspace.
+  const sameOrUnstampedWs = (doc: any) => !subjectWs || !wsKey(doc?.workspaceId) || wsKey(doc.workspaceId) === subjectWs;
+
+  // Employee id-space first — that is what the picker sends. Looked up by id
+  // alone: the workspace gate is enforced on the OWNER USER below, so a legacy
+  // Employee row with a missing / string-typed workspaceId cannot reject a
+  // manager who genuinely lives in the subject's workspace. A row stamped
+  // with a different workspace is still rejected outright.
+  let employeeDoc: any = await Employee.findOne({ _id: oid }).select(empFields).lean();
+  if (employeeDoc && !sameOrUnstampedWs(employeeDoc)) return null;
   let userDoc: any = null;
 
   if (employeeDoc) {
@@ -166,8 +184,7 @@ async function resolveManagerRefs(
     // User id-space — a value written by another surface, or a prior save.
     userDoc = await User.findOne({ _id: oid, ...wsFilter }).select(userFields).lean();
     if (userDoc) {
-      employeeDoc = await Employee.findOne({
-        ...wsFilter,
+      const candidates: any[] = await Employee.find({
         $or: [
           { ownerId: userDoc._id },
           ...(userDoc.email ? [{ email: userDoc.email }] : []),
@@ -175,6 +192,7 @@ async function resolveManagerRefs(
       })
         .select(empFields)
         .lean();
+      employeeDoc = candidates.find(sameOrUnstampedWs) ?? null;
     }
   }
 
