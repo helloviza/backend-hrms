@@ -64,6 +64,10 @@ export interface ApplyDispositionInput {
   note?: string;
   nextFollowUpDate?: string | Date | null;
   actor: PipelineActor & { name?: string };
+  /** When the disposition happened (bulk re-import only). Stamps
+   *  dispositionAt / wonDate, the disposition activity, and a newly created
+   *  opportunity's createdAt / closedAt. Live calls leave it unset = now. */
+  at?: Date;
 }
 
 export interface ApplyDispositionResult {
@@ -170,6 +174,7 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
   const actorId = oid(input.actor.id);
   const actorName = input.actor.name || "System";
   const note = String(input.note || "").trim();
+  const at = input.at instanceof Date && !isNaN(input.at.getTime()) ? input.at : null;
 
   // ── 2/3. derive onto the lead ──
   if (!lead.pipelineId) lead.pipelineId = pipeline._id as mongoose.Types.ObjectId;
@@ -177,7 +182,7 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
   lead.subDisposition = entry.subDisposition;
   lead.dispositionStage = entry.stage;
   lead.dispositionStatus = entry.status;
-  lead.dispositionAt = new Date();
+  lead.dispositionAt = at ?? new Date();
   const fromLegacyStage = lead.stage;
   const fromStatus = lead.status || null;
   lead.stage = entry.legacyStage;
@@ -187,7 +192,7 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
     if (note) lead.followUpNotes = note;
   }
   if (entry.status === "Lost") lead.lostReason = entry.subDisposition;
-  if (entry.status === "Won" && !lead.wonDate) lead.wonDate = new Date();
+  if (entry.status === "Won" && !lead.wonDate) lead.wonDate = at ?? new Date();
 
   // ── 4a. Won → the CRM contact/company (before the save so it is one write;
   //        before the opportunity so the deal picks up primaryContactId/companyId) ──
@@ -207,6 +212,7 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
     disposition: { from, to },
     createdBy: actorId ?? undefined,
     createdByName: actorName,
+    ...(at ? { createdAt: at } : {}),
   });
 
   // ── 4b. the contact row — a CONTACT-subject `won` row, the way /convert
@@ -259,6 +265,7 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
             lostReason: effect === "lost" ? entry.subDisposition : "",
             travelRequirement: (lead as any).travelRequirement ?? {},
             serviceMix: (lead as any).travelRequirement?.serviceMix ?? [],
+            ...(at ? { createdAt: at, ...(effect !== "open" ? { closedAt: at } : {}) } : {}),
           });
           created = true;
         } catch (e: any) {

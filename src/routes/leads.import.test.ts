@@ -139,7 +139,7 @@ describe("POST /leads/import/preview", () => {
       mapping: { Who: "contactName", Tel: "contactPhone" }, defaults: { source: "LinkedIn" },
     });
     expect(r.status).toBe(200);
-    expect(r.body.defaults).toEqual({ source: "linkedin" });
+    expect(r.body.defaults).toMatchObject({ source: "linkedin", owner: { id: ADMIN_ID, name: "Ops Admin" }, dispositionsEnabled: false });
     expect(r.body.summary).toEqual({ total: 2, valid: 1, invalid: 1, flagged: 0 });
     expect(r.body.rows[1].errors).toEqual(["Contact name is required"]);
   });
@@ -166,7 +166,7 @@ describe("POST /leads/import/commit", () => {
 
     const r = await request(app()).post("/api/leads/import/commit").send({ rows: rows(), mapping, defaults: { source: "referral" } });
     expect(r.status).toBe(201);
-    expect(r.body.summary).toEqual({ total: 5, created: 3, flagged: 2, invalid: 2, failed: 0 });
+    expect(r.body.summary).toEqual({ total: 5, created: 3, flagged: 2, invalid: 2, failed: 0, dispositioned: 0 });
     expect(r.body.invalid.map((x: any) => x.row)).toEqual([3, 4]);
     expect(r.body.batchId).toMatch(/^IMP-\d{4}-\d{2}-\d{2}-[0-9a-f]{6}$/);
 

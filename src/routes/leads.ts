@@ -12,7 +12,8 @@ import CRMCompany from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
 import { resolveOrCreateCompany, normalizeCompanyName } from "../utils/crmCompany.js";
 import multer from "multer";
-import { companyCheck, commitImport, dedupeSnapshot, normaliseSource, parseSpreadsheet, suggestMapping, validateRows, IMPORT_FIELDS, IMPORT_FILE_CAP_BYTES, IMPORT_ROW_CAP } from "../services/leadImport.js";
+import { companyCheck, commitImport, dedupeSnapshot, normaliseSource, parseSpreadsheet, suggestMapping, validateRows, IMPORT_FIELDS, IMPORT_FILE_CAP_BYTES, IMPORT_ROW_CAP, type ImportDefaults } from "../services/leadImport.js";
+import { buildImportTemplate } from "../services/leadImportTemplate.js";
 import type { LeadStage } from "../models/Lead.js";
 import type { ActivityType } from "../models/LeadActivity.js";
 import { UserPermission } from "../models/UserPermission.js";
@@ -344,8 +345,9 @@ router.use(requireLeadsAccess);
 // NOT included — their existing leads remain in the data but won't appear as a
 // filter option. UserPermission.status (suspended/revoked) is intentionally
 // NOT special-cased in v1, matching the current gate which ignores it.
-router.get("/reps", async (_req, res) => {
-  try {
+/** The CRM rep set (see the route comment above), with email — shared by
+ *  GET /reps and the bulk import's per-row owner resolution. */
+async function listCrmReps(): Promise<Array<{ _id: string; name: string; email: string }>> {
     // Access arm. UserPermission stores workspaceId + userId as Strings, and
     // userId === String(User._id) (the value requireLeadsAccess looks up).
     const grants = await UserPermission.find({
@@ -389,17 +391,22 @@ router.get("/reps", async (_req, res) => {
       .select("_id name firstName lastName email")
       .lean()) as any[];
 
-    const reps = users
+    return users
       .map((u) => ({
         _id: String(u._id),
         name:
           (u.name && String(u.name).trim()) ||
           `${u.firstName || ""} ${u.lastName || ""}`.trim() ||
           (u.email ? String(u.email).trim() : ""),
+        email: u.email ? String(u.email).trim() : "",
       }))
       .filter((r) => r.name)
       .sort((a, b) => a.name.localeCompare(b.name));
+}
 
+router.get("/reps", async (_req, res) => {
+  try {
+    const reps = (await listCrmReps()).map(({ _id, name }) => ({ _id, name }));
     return res.json({ reps });
   } catch (err) {
     logger.error("leads GET /reps error", { err });
@@ -454,11 +461,53 @@ router.get("/company-check", async (req, res) => {
 // See services/leadImport.ts.
 const importUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: IMPORT_FILE_CAP_BYTES } });
 
-function importDefaults(raw: AnyObj): { source: string } | { error: string } {
+/**
+ * Per-request import context: the batch source, the batch default owner
+ * (body.assignedTo for ALL scope, else the importer), the rep set an `owner`
+ * cell may name, and the disposition set the rows will be validated against
+ * (null with CRM_V2_DISPOSITION off). Returns { error } for a bad source /
+ * unknown assignedTo.
+ */
+async function loadImportDefaults(req: express.Request, raw: AnyObj, assignedTo: unknown): Promise<ImportDefaults | { error: string }> {
   const src = raw?.source ? normaliseSource(String(raw.source)) : "manual";
   if (!src) return { error: `Unknown source "${raw.source}". Use one of: ${LEAD_SOURCES.join(", ")}.` };
-  return { source: src };
+
+  const user = (req as any).user as AnyObj;
+  const importerId = userId(user);
+  const importerName = await resolveUserName(importerId);
+  const all = isAll(leadScope(req));
+  // OWN scope: the rows land on the importer, whatever the body says.
+  const ownerId = all && assignedTo && mongoose.isValidObjectId(String(assignedTo)) ? String(assignedTo) : importerId;
+  const ownerName = ownerId === importerId ? importerName : await resolveUserName(ownerId);
+  if (ownerId !== importerId && !ownerName) return { error: "assignedTo is not a known user." };
+
+  const reps = (await listCrmReps()).map((r) => ({ id: r._id, name: r.name, email: r.email }));
+  const dispositionSet = isCrmV2DispositionEnabled() ? (await resolvePipelineForLead({})).dispositionSet : null;
+  return { source: src, owner: { id: ownerId, name: ownerName }, reps, lockOwnerTo: all ? null : importerId, dispositionSet };
 }
+
+// GET /import/template — the fill-in workbook: sheet 1 = exactly the columns
+// the importer maps (one valid example row), sheet 2 = the allowed values
+// (live disposition set, statuses, stages, sources, currencies, rep emails)
+// and how each column is read. See services/leadImportTemplate.ts.
+router.get("/import/template", async (req, res) => {
+  try {
+    if (!canWrite((req as any).leadsAccess)) return res.status(403).json({ error: "Write access required." });
+    const user = (req as any).user as AnyObj;
+    const me = userId(user);
+    const reps = await listCrmReps();
+    const self = reps.find((r) => r._id === me) ?? null;
+    const dispositionSet = isCrmV2DispositionEnabled() ? (await resolvePipelineForLead({})).dispositionSet : null;
+    const workbook = buildImportTemplate({ reps, dispositionSet, exampleOwner: self ? { name: self.name, email: self.email } : null, ownScope: !isAll(leadScope(req)) });
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", 'attachment; filename="leads-import-template.xlsx"');
+    await workbook.xlsx.write(res as any);
+    res.end();
+  } catch (err) {
+    logger.error("leads GET /import/template error", { err });
+    return res.status(500).json({ error: "Could not build the template." });
+  }
+});
 
 router.post("/import/preview", importUpload.single("file"), async (req, res) => {
   try {
@@ -490,7 +539,7 @@ router.post("/import/preview", importUpload.single("file"), async (req, res) => 
 
     const suggestedMapping = suggestMapping(columns);
     const mapping: Record<string, string> = parseJson(body.mapping) || suggestedMapping;
-    const defaults = importDefaults(parseJson(body.defaults) || {});
+    const defaults = await loadImportDefaults(req, parseJson(body.defaults) || {}, body.assignedTo);
     if ("error" in defaults) return res.status(400).json({ error: defaults.error });
 
     const validated = validateRows(rows, mapping, defaults);
@@ -498,12 +547,23 @@ router.post("/import/preview", importUpload.single("file"), async (req, res) => 
     const seeAll = isAll(leadScope(req));
     const out = validated.map((r) => {
       const d = snapshot.get(r.row);
+      const e = r.disposition?.entry;
       return {
         row: r.row,
         values: r.values,
         valid: !!r.lead,
         errors: r.errors,
         warnings: r.warnings,
+        // What the row will land as — so the preview can show it before anything is written.
+        resolved: r.lead
+          ? {
+              ownerName: r.owner?.name ?? "",
+              createdAt: r.lead.createdAt ? new Date(r.lead.createdAt).toISOString() : null,
+              disposition: e ? { disposition: e.disposition, subDisposition: e.subDisposition, stage: e.stage, status: e.status, leadStatus: e.leadStatus, legacyStage: e.legacyStage, opportunityEffect: e.opportunityEffect } : null,
+              stage: e ? e.legacyStage : r.lead.stage || "new",
+              status: e ? e.leadStatus : r.lead.status || null,
+            }
+          : null,
         duplicate: d && d.existingOpen.length ? (seeAll ? d.existingOpen[0] : { leadId: null, leadCode: "", contactName: "", ownerName: d.existingOpen[0].ownerName, status: "" }) : null,
         existingOpenCount: d?.existingOpen.length ?? 0,
         sameCompanyRowsInFile: d?.sameCompanyRowsInFile ?? 0,
@@ -514,7 +574,7 @@ router.post("/import/preview", importUpload.single("file"), async (req, res) => 
       suggestedMapping,
       mapping,
       fields: IMPORT_FIELDS,
-      defaults,
+      defaults: { source: defaults.source, owner: defaults.owner, dispositionsEnabled: !!defaults.dispositionSet },
       rowCount: rows.length,
       totalRows,
       truncated,
@@ -545,7 +605,7 @@ router.post("/import/commit", async (req, res) => {
     if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ error: "rows is required." });
     if (rows.length > IMPORT_ROW_CAP) return res.status(400).json({ error: `At most ${IMPORT_ROW_CAP} rows per import.` });
     if (!body.mapping || typeof body.mapping !== "object") return res.status(400).json({ error: "mapping is required." });
-    const defaults = importDefaults(body.defaults || {});
+    const defaults = await loadImportDefaults(req, body.defaults || {}, body.assignedTo);
     if ("error" in defaults) return res.status(400).json({ error: defaults.error });
 
     // Every row must be valid up front — the batch never starts half-baked.
@@ -556,15 +616,9 @@ router.post("/import/commit", async (req, res) => {
 
     const importerId = userId(user);
     const importerName = await resolveUserName(importerId);
-    // OWN scope: the rows land on the importer, whatever the body says.
-    const ownerId = isAll(leadScope(req)) && body.assignedTo && mongoose.isValidObjectId(String(body.assignedTo)) ? String(body.assignedTo) : importerId;
-    const ownerName = ownerId === importerId ? importerName : await resolveUserName(ownerId);
-    if (ownerId !== importerId && !ownerName) return res.status(400).json({ error: "assignedTo is not a known user." });
-
     const report = await commitImport({
       rows, mapping: body.mapping, defaults,
-      importer: { id: importerId, name: importerName },
-      owner: { id: ownerId, name: ownerName },
+      importer: { id: importerId, name: importerName, roles: user.roles },
     });
     if (!isAll(leadScope(req))) {
       for (const c of report.created) if (c.duplicateOf) c.duplicateOf = { leadId: "", leadCode: "", contactName: "", ownerName: c.duplicateOf.ownerName, status: "" };
