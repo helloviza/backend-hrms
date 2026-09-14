@@ -54,6 +54,8 @@ import {
 } from "../models/crmTaxonomy.js";
 import { hasTravelRequirement } from "../models/travelRequirement.js";
 import { isCrmV2OpportunityEnabled, CrmV2DisabledError, CRM_V2_OPPORTUNITY_ENV } from "../config/crmV2.js";
+import { triggerTaskAutomation } from "./taskAutomation.js";
+import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 
 type AnyObj = Record<string, any>;
 
@@ -464,4 +466,34 @@ export function automationTriggerForPlan(plan: SplitPlan): { key: string; entity
   if (plan.leadStatus === "CONTACTED") return { key: "lead.status_contacted", entityType: "LEAD" };
   if (plan.leadStatus === "ENGAGED") return { key: "lead.status_engaged", entityType: "LEAD" };
   return null;
+}
+
+/* ───────────── The split hook every stage-setting write path calls ────────
+ * Called AFTER the caller has set and saved the legacy `stage` (so the model
+ * hook has already derived `status`): re-plans against history, applies the
+ * Opportunity side effects, and fires the task-automation trigger for the new
+ * taxonomy (legacy keys resolve as aliases inside triggerTaskAutomation).
+ * Flag off → no-op, the caller fires its legacy trigger. Shared by
+ * PUT /leads/:id/stage (+ /win, /lose, /convert) and the bulk stage / status
+ * actions (services/leadBulk.ts). */
+export async function runOpportunitySplit(
+  lead: LeadLike & { leadCode?: string; assignedTo?: any; assignedToName?: string; contactName?: string; companyName?: string },
+  actor: { id: string; name: string },
+): Promise<{ triggered: boolean; opportunityId: string | null }> {
+  if (!isCrmV2OpportunityEnabled()) return { triggered: false, opportunityId: null };
+  const actorId = mongoose.isValidObjectId(actor.id) ? new mongoose.Types.ObjectId(actor.id) : null;
+  const { plan, result } = await applyLegacyStageTransition(lead, { actorId, actorName: actor.name || "System" });
+  const trig = automationTriggerForPlan(plan);
+  if (trig) {
+    const isOpp = trig.entityType === "OPPORTUNITY" && result.opportunityId;
+    triggerTaskAutomation(trig.key, {
+      workspaceId: SYSTEM_WORKSPACE_ID,
+      entityType: isOpp ? "OPPORTUNITY" : "LEAD",
+      entityId: isOpp ? new mongoose.Types.ObjectId(result.opportunityId!) : (lead._id as mongoose.Types.ObjectId),
+      entityRef: lead.leadCode || "",
+      ownerId: lead.assignedTo,
+      variables: { leadName: lead.contactName || lead.companyName || "Lead", ownerName: lead.assignedToName || "" },
+    }).catch(() => {});
+  }
+  return { triggered: !!trig, opportunityId: result.opportunityId };
 }

@@ -5,7 +5,7 @@ import Lead, { LEAD_STAGES, LEAD_SOURCES, effectiveLeadStatus } from "../models/
 import LeadActivity, { ACTIVITY_TYPES } from "../models/LeadActivity.js";
 import Opportunity from "../models/Opportunity.js";
 import { isCrmV2OpportunityEnabled, isCrmV2DispositionEnabled } from "../config/crmV2.js";
-import { applyLegacyStageTransition, automationTriggerForPlan } from "../services/leadSplit.js";
+import { runOpportunitySplit as runSplit } from "../services/leadSplit.js";
 import { applyDisposition, snapshotOf, DispositionError } from "../services/disposition.js";
 import { resolvePipelineForLead, groupedSet, canWorkPipeline } from "../services/crmPipelines.js";
 import CRMCompany from "../models/CRMCompany.js";
@@ -14,6 +14,7 @@ import { resolveOrCreateCompany, normalizeCompanyName } from "../utils/crmCompan
 import multer from "multer";
 import { companyCheck, commitImport, dedupeSnapshot, normaliseSource, parseSpreadsheet, suggestMapping, validateRows, IMPORT_FIELDS, IMPORT_FILE_CAP_BYTES, IMPORT_ROW_CAP, type ImportDefaults } from "../services/leadImport.js";
 import { buildImportTemplate } from "../services/leadImportTemplate.js";
+import { BulkError, BULK_CAP, resolveBulkTarget, runBulk, validateBulkParams } from "../services/leadBulk.js";
 import type { LeadStage } from "../models/Lead.js";
 import type { ActivityType } from "../models/LeadActivity.js";
 import { UserPermission } from "../models/UserPermission.js";
@@ -70,27 +71,9 @@ async function resolveUserName(uid: string): Promise<string> {
 // demo_scheduled, and hands back the trigger key for the new taxonomy
 // (legacy keys resolve as aliases inside triggerTaskAutomation). With the
 // flag off this is a no-op and the caller fires its legacy trigger.
-async function runOpportunitySplit(
-  lead: any,
-  user: AnyObj,
-): Promise<{ triggered: boolean; opportunityId: string | null }> {
-  if (!isCrmV2OpportunityEnabled()) return { triggered: false, opportunityId: null };
-  const actorId = mongoose.isValidObjectId(userId(user)) ? new mongoose.Types.ObjectId(userId(user)) : null;
+async function runOpportunitySplit(lead: any, user: AnyObj): Promise<{ triggered: boolean; opportunityId: string | null }> {
   const actorName = user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System";
-  const { plan, result } = await applyLegacyStageTransition(lead, { actorId, actorName });
-  const trig = automationTriggerForPlan(plan);
-  if (trig) {
-    const isOpp = trig.entityType === "OPPORTUNITY" && result.opportunityId;
-    triggerTaskAutomation(trig.key, {
-      workspaceId: SYSTEM_WORKSPACE_ID,
-      entityType: isOpp ? "OPPORTUNITY" : "LEAD",
-      entityId: isOpp ? new mongoose.Types.ObjectId(result.opportunityId!) : (lead._id as mongoose.Types.ObjectId),
-      entityRef: lead.leadCode,
-      ownerId: lead.assignedTo,
-      variables: { leadName: lead.contactName || lead.companyName || "Lead", ownerName: lead.assignedToName || "" },
-    }).catch(() => {});
-  }
-  return { triggered: !!trig, opportunityId: result.opportunityId };
+  return runSplit(lead, { id: userId(user), name: actorName });
 }
 
 // ── requireLeadsAccess ──────────────────────────────────────────
@@ -403,6 +386,32 @@ async function listCrmReps(): Promise<Array<{ _id: string; name: string; email: 
       .filter((r) => r.name)
       .sort((a, b) => a.name.localeCompare(b.name));
 }
+
+// GET /dispositions — the default pipeline's disposition set, grouped, for a
+// picker that is not anchored on one lead (the bulk action bar). Same shape as
+// the groups of GET /:id/dispositions. 404 with the flag off, like the rest of
+// the disposition surface.
+router.get("/dispositions", async (req, res) => {
+  if (!isCrmV2DispositionEnabled()) return res.status(404).json({ error: "Not found." });
+  try {
+    const user = (req as any).user as AnyObj;
+    const pipeline = await resolvePipelineForLead({});
+    return res.json({
+      pipeline: { _id: String(pipeline._id), key: pipeline.key, name: pipeline.name, opportunityPipeline: pipeline.opportunityPipeline },
+      canWork: canWorkPipeline({ id: userId(user), roles: user.roles }, pipeline) && canWrite((req as any).leadsAccess),
+      groups: groupedSet(pipeline).map((g) => ({
+        disposition: g.disposition,
+        subs: g.subs.map((e) => ({
+          subDisposition: e.subDisposition, stage: e.stage, status: e.status,
+          nextTouch: e.nextTouch, opportunityEffect: e.opportunityEffect, opportunityStage: e.opportunityStage ?? null,
+        })),
+      })),
+    });
+  } catch (err) {
+    logger.error("leads GET /dispositions error", { err });
+    return res.status(500).json({ error: "Failed to load dispositions." });
+  }
+});
 
 router.get("/reps", async (_req, res) => {
   try {
@@ -808,55 +817,67 @@ async function enrichLeads(leads: any[]): Promise<any[]> {
   });
 }
 
+/**
+ * The Full Table's filter contract, as ONE Mongo filter: the caller's scope
+ * (OWN pins assignedTo, ALL honours the param) + stage / source / companyId /
+ * dueBefore / dateFrom / dateTo / search. Shared by GET / (the list) and
+ * POST /bulk (target.filter), so "all N leads matching this filter" resolves
+ * to exactly the rows the table showed.
+ */
+export function leadListFilter(req: express.Request, q: AnyObj): AnyObj {
+  const filter: AnyObj = {};
+
+  // Scope first (services/crmScope): OWN pins assignedTo to the caller and
+  // ignores any assignedTo param; ALL honours the param.
+  const scope = leadScope(req);
+  Object.assign(filter, leadMatch(scope));
+  if (isAll(scope) && q.assignedTo && mongoose.isValidObjectId(String(q.assignedTo))) {
+    filter.assignedTo = new mongoose.Types.ObjectId(String(q.assignedTo));
+  }
+
+  if (q.stage) {
+    const stages = String(q.stage).split(",").filter(Boolean);
+    filter.stage = { $in: stages };
+  }
+  if (q.source) filter.source = q.source;
+
+  // Additive read filter — used by the lead form's CompanyPicker to count how
+  // many leads already exist for a picked canonical company (dedup context).
+  if (q.companyId && mongoose.isValidObjectId(String(q.companyId))) {
+    filter.companyId = new mongoose.Types.ObjectId(String(q.companyId));
+  }
+
+  // Additive read filter — the Leads page's Today view (ask #11): follow-up
+  // overdue or due today. The client sends its own end-of-day cutoff (its
+  // timezone), so "today" here is exactly the Inbox's derivation:
+  // nextFollowUpDate < startOfTomorrow.
+  if (q.dueBefore) {
+    const cutoff = new Date(String(q.dueBefore));
+    if (!isNaN(cutoff.getTime())) filter.nextFollowUpDate = { $lt: cutoff };
+  }
+
+  if (q.dateFrom || q.dateTo) {
+    filter.createdAt = {};
+    if (q.dateFrom) filter.createdAt.$gte = new Date(String(q.dateFrom));
+    if (q.dateTo) filter.createdAt.$lte = new Date(String(q.dateTo));
+  }
+
+  if (q.search) {
+    const re = new RegExp(String(q.search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    filter.$or = [
+      { contactName: re },
+      { companyName: re },
+      { contactPhone: re },
+      { contactEmail: re },
+    ];
+  }
+  return filter;
+}
+
 router.get("/", async (req, res) => {
   try {
     const q = req.query as AnyObj;
-    const filter: AnyObj = {};
-
-    // Scope first (services/crmScope): OWN pins assignedTo to the caller and
-    // ignores any assignedTo param; ALL honours the param.
-    const scope = leadScope(req);
-    Object.assign(filter, leadMatch(scope));
-    if (isAll(scope) && q.assignedTo && mongoose.isValidObjectId(String(q.assignedTo))) {
-      filter.assignedTo = new mongoose.Types.ObjectId(String(q.assignedTo));
-    }
-
-    if (q.stage) {
-      const stages = String(q.stage).split(",").filter(Boolean);
-      filter.stage = { $in: stages };
-    }
-    if (q.source) filter.source = q.source;
-
-    // Additive read filter — used by the lead form's CompanyPicker to count how
-    // many leads already exist for a picked canonical company (dedup context).
-    if (q.companyId && mongoose.isValidObjectId(String(q.companyId))) {
-      filter.companyId = new mongoose.Types.ObjectId(String(q.companyId));
-    }
-
-    // Additive read filter — the Leads page's Today view (ask #11): follow-up
-    // overdue or due today. The client sends its own end-of-day cutoff (its
-    // timezone), so "today" here is exactly the Inbox's derivation:
-    // nextFollowUpDate < startOfTomorrow.
-    if (q.dueBefore) {
-      const cutoff = new Date(String(q.dueBefore));
-      if (!isNaN(cutoff.getTime())) filter.nextFollowUpDate = { $lt: cutoff };
-    }
-
-    if (q.dateFrom || q.dateTo) {
-      filter.createdAt = {};
-      if (q.dateFrom) filter.createdAt.$gte = new Date(String(q.dateFrom));
-      if (q.dateTo) filter.createdAt.$lte = new Date(String(q.dateTo));
-    }
-
-    if (q.search) {
-      const re = new RegExp(String(q.search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-      filter.$or = [
-        { contactName: re },
-        { companyName: re },
-        { contactPhone: re },
-        { contactEmail: re },
-      ];
-    }
+    const filter = leadListFilter(req, q);
 
     const page = Math.max(1, parseInt(String(q.page || "1"), 10));
     const limit = Math.min(100, Math.max(1, parseInt(String(q.limit || "20"), 10)));
@@ -2329,15 +2350,49 @@ router.post("/:id/assign", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// ROUTE 11b — POST /bulk-assign  (ask #8)
+// ROUTE 11b — POST /bulk  ·  POST /bulk-assign (legacy alias)
 // ═══════════════════════════════════════════════════════════════
-// Reassign up to BULK_ASSIGN_CAP leads to one rep in a single call. Same
-// FULL-access gate as POST /:id/assign — reassigning other people's leads is
-// a privileged action, WRITE is not enough. Per lead it does exactly what the
-// single route does: set owner, write one `assignment` activity, cascade the
-// open auto-tasks. Each lead is applied independently and reported: a missing
-// or failing id lands in `failed` with its reason, the rest still land — the
-// caller sees precisely what happened, nothing is half-applied silently.
+// Bulk actions on leads — services/leadBulk.ts. FULL access, the same gate as
+// POST /:id/assign: changing other people's leads in bulk is a privileged
+// action, WRITE is not enough. Scope still applies inside (an OWN-scope FULL
+// user's filter never reaches another rep's rows; an explicit foreign id
+// fails per lead).
+//
+//   { action: "reassign" | "stage" | "status" | "disposition",
+//     target: { leadIds: [...] } | { filter: { search, stage, source, assignedTo, dueBefore, dateFrom, dateTo } },
+//     params: { assignedTo } | { stage, note?, nextFollowUpDate? } | { status, note? }
+//           | { subDisposition, disposition?, note?, nextFollowUpDate? } }
+//
+// Inputs are validated ONCE up front (400 before any write); each lead is
+// then applied independently through the single-lead write path and
+// reported: updated / unchanged / failed with reason. Capped at BULK_CAP.
+//
+// /bulk-assign is the pre-existing reassign-only shape, kept for callers
+// that still send { leadIds, assignedTo }; it runs through the same service.
+async function bulkActor(req: express.Request): Promise<{ id: string; name: string; roles: string[] }> {
+  const user = (req as any).user as AnyObj;
+  // Actor label from the DB, not the JWT (the token carries no name).
+  const name = (await resolveUserName(userId(user))) || user.email || "System";
+  return { id: userId(user), name, roles: user.roles || [] };
+}
+
+router.post("/bulk", async (req, res) => {
+  try {
+    if ((req as any).leadsAccess !== "FULL") {
+      return res.status(403).json({ error: "Full access required for bulk actions." });
+    }
+    const body = (req.body || {}) as AnyObj;
+    const params = await validateBulkParams(body.action, body.params || {}, resolveUserName);
+    const target = await resolveBulkTarget(body.target, (q) => leadListFilter(req, q));
+    const report = await runBulk({ target, params, scope: leadScope(req), actor: await bulkActor(req) });
+    return res.json({ ...report, cap: BULK_CAP });
+  } catch (err: any) {
+    if (err instanceof BulkError) return res.status(err.status).json({ error: err.message, ...err.extra });
+    logger.error("leads POST /bulk error", { err });
+    return res.status(500).json({ error: "Bulk action failed." });
+  }
+});
+
 const BULK_ASSIGN_CAP = 200;
 
 router.post("/bulk-assign", async (req, res) => {
@@ -2346,86 +2401,28 @@ router.post("/bulk-assign", async (req, res) => {
       return res.status(403).json({ error: "Full access required to reassign leads." });
     }
     const body = req.body as AnyObj;
-    const repId = String(body.assignedTo || "");
-    if (!mongoose.isValidObjectId(repId)) {
-      return res.status(400).json({ error: "Valid assignedTo is required." });
-    }
-    const bulkScope = leadScope(req);
     const rawIds: unknown[] = Array.isArray(body.leadIds) ? body.leadIds : [];
     const leadIds = Array.from(new Set(rawIds.map((v) => String(v))));
+    if (!mongoose.isValidObjectId(String(body.assignedTo || ""))) {
+      return res.status(400).json({ error: "Valid assignedTo is required." });
+    }
     if (leadIds.length === 0) return res.status(400).json({ error: "leadIds is required." });
     if (leadIds.length > BULK_ASSIGN_CAP) {
       return res.status(400).json({ error: `At most ${BULK_ASSIGN_CAP} leads per reassignment.` });
     }
-
-    const repName = await resolveUserName(repId);
-    if (!repName) return res.status(404).json({ error: "User not found." });
-
-    const user = (req as any).user as AnyObj;
-    const actorId = mongoose.isValidObjectId(userId(user)) ? new mongoose.Types.ObjectId(userId(user)) : undefined;
-    // Actor label from the DB, not the JWT (the token carries no name).
-    const actorName = (await resolveUserName(userId(user))) || user.email || "System";
-    const repObjectId = new mongoose.Types.ObjectId(repId);
-
-    const updated: Array<{ _id: string; leadCode: string; previousOwnerName: string; unchanged: boolean }> = [];
-    const failed: Array<{ _id: string; reason: string }> = [];
-
-    for (const id of leadIds) {
-      if (!mongoose.isValidObjectId(id)) {
-        failed.push({ _id: id, reason: "Invalid lead ID." });
-        continue;
-      }
-      try {
-        const lead = await Lead.findById(id);
-        if (!lead) {
-          failed.push({ _id: id, reason: "Lead not found." });
-          continue;
-        }
-        if (!canManageOthers(bulkScope) && !ownsLead(bulkScope, lead)) {
-          failed.push({ _id: id, reason: "This lead is owned by someone else." });
-          continue;
-        }
-        const previousOwnerName = lead.assignedToName || "";
-        const unchanged = String(lead.assignedTo || "") === repId;
-        lead.assignedTo = repObjectId;
-        lead.assignedToName = repName;
-        await lead.save();
-
-        await LeadActivity.create({
-          leadId: lead._id,
-          type: "assignment" as ActivityType,
-          note: previousOwnerName && !unchanged ? `Reassigned to ${repName} (from ${previousOwnerName})` : `Assigned to ${repName}`,
-          createdBy: actorId,
-          createdByName: actorName,
-        });
-
-        // Reassignment cascade — identical to POST /:id/assign.
-        Task.updateMany(
-          {
-            linkedType: "LEAD",
-            linkedId: lead._id,
-            status: { $in: ["OPEN", "IN_PROGRESS"] },
-            autoTriggerKey: { $exists: true },
-          },
-          { $set: { assignedTo: lead.assignedTo } }
-        ).catch((err: any) => logger.error("leads bulk-assign cascade error", { err }));
-        Opportunity.updateOne({ leadId: lead._id }, { $set: { ownerUserId: lead.assignedTo, ownerName: lead.assignedToName } })
-          .catch((err: any) => logger.error("leads bulk-assign opportunity cascade error", { err }));
-
-        updated.push({ _id: String(lead._id), leadCode: lead.leadCode, previousOwnerName, unchanged });
-      } catch (e: any) {
-        failed.push({ _id: id, reason: e?.message || "Could not reassign this lead." });
-      }
-    }
-
+    const params = await validateBulkParams("reassign", { assignedTo: body.assignedTo }, resolveUserName);
+    if (params.action !== "reassign") return res.status(400).json({ error: "Invalid action." });
+    const report = await runBulk({ target: { mode: "ids", leadIds, matched: leadIds.length }, params, scope: leadScope(req), actor: await bulkActor(req), tagNotes: false });
+    // Legacy response shape: an unchanged lead still counts as updated here.
     return res.json({
-      assignedTo: repId,
-      assignedToName: repName,
-      updated,
-      failed,
-      summary: { requested: leadIds.length, updated: updated.length, failed: failed.length },
+      assignedTo: params.assignedTo,
+      assignedToName: params.assignedToName,
+      updated: report.updated.map((u) => ({ _id: u._id, leadCode: u.leadCode, previousOwnerName: u.from, unchanged: u.unchanged })),
+      failed: report.failed.map((f) => ({ _id: f._id, reason: f.reason })),
+      summary: { requested: leadIds.length, updated: report.updated.length, failed: report.failed.length },
     });
-  } catch (err) {
+  } catch (err: any) {
+    if (err instanceof BulkError) return res.status(err.status).json({ error: err.message });
     logger.error("leads POST /bulk-assign error", { err });
     return res.status(500).json({ error: "Failed to reassign leads." });
   }
