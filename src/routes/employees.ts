@@ -25,12 +25,16 @@ import { HeadObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import {
   activeEmployeeFilter,
+  applyEmploymentStatusCoupling,
   inactiveEmployeeFilter,
+  isTerminalEmploymentStatus,
   isUserActive,
   normalizeUserStatus,
   setUserActiveStatus,
+  USER_STATUS_ACTIVE,
   USER_STATUS_INACTIVE,
 } from "../utils/userActiveStatus.js";
+import { collectPendingWork, summarizePendingWork } from "../services/pendingWork.service.js";
 
 const router = Router();
 
@@ -95,6 +99,29 @@ function isAdminish(user: any): boolean {
   return roles.some((r) =>
     ["ADMIN", "SUPERADMIN", "SUPER_ADMIN", "HR", "HR_MANAGER", "HR_ADMIN", "TENANT_ADMIN"].includes(r)
   );
+}
+
+/** Who is acting, for the UserStatusAudit row. */
+function actorOf(req: any): { actorId: string | null; actorEmail: string | null } {
+  const id = String(req.user?._id || req.user?.id || req.user?.sub || "");
+  return {
+    actorId: mongoose.Types.ObjectId.isValid(id) ? id : null,
+    actorEmail: req.user?.email ? String(req.user.email).toLowerCase() : null,
+  };
+}
+
+/**
+ * Resolve `:id` (Employee id first — what /profile/team holds — then User id)
+ * to the target User, tenant-scoped. Shared by PATCH /:id/status and
+ * GET /:id/pending-work so both refuse cross-tenant identically (404, never
+ * confirming existence).
+ */
+async function resolveStatusTarget(req: any, id: string) {
+  const wsScope = !isSuperAdmin(req) && req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {};
+  const employeeDoc = await Employee.findOne({ _id: id, ...wsScope }).select("_id ownerId workspaceId").lean();
+  const userId = (employeeDoc as any)?.ownerId ?? id;
+  const targetUser = await User.findOne({ _id: userId, ...wsScope }).select("_id status email workspaceId").lean();
+  return { employeeDoc: employeeDoc as any, targetUser: targetUser as any, wsScope };
 }
 
 function sanitise(user: AnyUser) {
@@ -514,6 +541,7 @@ router.post("/bulk-update", requireAuth, requireWorkspace, async (req: any, res,
           userId: String(id),
           workspaceId: isSuperAdmin(req) ? null : req.workspaceObjectId,
           status: statusUpdate,
+          audit: { trigger: "bulk_update", ...actorOf(req) },
         });
         if (r.userMatched) updated += 1;
       }
@@ -1051,12 +1079,26 @@ router.post(
                 designation: designation || undefined,
                 joiningDate: dateOfJoining || undefined,
                 employeeCode: employeeCode || undefined,
-                status: "ACTIVE",
-                isActive: true,
+                // Mirror the canonical User.status (utils/userActiveStatus) —
+                // a hard-coded ACTIVE here would silently reactivate the
+                // Employee row of a deactivated person on every re-import.
+                status: normalizeUserStatus(user.status),
+                isActive: normalizeUserStatus(user.status) === USER_STATUS_ACTIVE,
               },
             },
             { upsert: true }
           );
+
+          // Terminal Employment Status on the sheet → deactivate through the
+          // one write path (value-based; no-op if already inactive). Runs
+          // after the Employee upsert so the mirror it stamps is the final one.
+          await applyEmploymentStatusCoupling({
+            userId: user._id,
+            workspaceId,
+            employmentStatus: user.employmentStatus,
+            currentStatus: user.status,
+            audit: { trigger: "bulk_import", ...actorOf(req) },
+          });
 
           // ── Auto-create UserPermission (L1/Employee template) if missing ──
           const existingPerm = await UserPermission.findOne({
@@ -1188,6 +1230,16 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       return res
         .status(400)
         .json({ error: "Official email is required for employee" });
+    }
+
+    // A terminal Employment Status means the person has LEFT — creating an
+    // active employee with it is a data-entry error, not a state to support
+    // (decision Q3, 2026-09-16). Historical leavers come in via bulk-import.
+    if (isTerminalEmploymentStatus(body.employmentStatus)) {
+      return res.status(400).json({
+        error: `Employment Status "${String(body.employmentStatus).trim()}" marks a departed employee — it cannot be used when creating one. Create the employee as Active, or deactivate them from their profile.`,
+        code: "TERMINAL_EMPLOYMENT_STATUS_ON_CREATE",
+      });
     }
 
     // Try to find existing user by company email — scoped to workspace to prevent cross-tenant contamination
@@ -1436,7 +1488,41 @@ router.post("/:id/avatar/confirm", validateObjectId("id"), requireAuth, requireW
  * - Does not allow direct passwordHash changes here.
  */
 /**
- * PATCH /api/employees/:id/status   { status: "ACTIVE" | "INACTIVE" }
+ * GET /api/employees/:id/pending-work
+ *
+ * The pre-deactivation guard's single data source (read-only). Everything
+ * still open on this person, in three sections — awaitingAction (will
+ * stall), owned (will be orphaned), standing (roles to reassign) — plus
+ * `flags` for anything the User ↔ Employee join could not resolve. Admin
+ * only; `:id` resolves exactly like PATCH /:id/status and refuses
+ * cross-tenant with 404.
+ */
+router.get("/:id/pending-work", validateObjectId("id"), requireAuth, requireWorkspace, async (req: any, res, next) => {
+  try {
+    if (!isAdminish(req.user)) {
+      return res.status(403).json({ error: "Only admins can view pending work" });
+    }
+    const { employeeDoc, targetUser } = await resolveStatusTarget(req, req.params.id);
+    if (!targetUser) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+    const report = await collectPendingWork({
+      userId: targetUser._id,
+      workspaceId: targetUser.workspaceId ?? (isSuperAdmin(req) ? null : req.workspaceObjectId),
+    });
+    return res.json({
+      ...report,
+      employeeId: employeeDoc ? String(employeeDoc._id) : null,
+      email: targetUser.email,
+      currentStatus: normalizeUserStatus(targetUser.status),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PATCH /api/employees/:id/status   { status: "ACTIVE" | "INACTIVE", acknowledgedPendingWork?: boolean }
  *
  * THE admin (de)activation action. `:id` is an Employee id (what /profile/team
  * holds) or, as a fallback, a User id. Writes the canonical User.status and
@@ -1461,13 +1547,7 @@ router.patch("/:id/status", validateObjectId("id"), requireAuth, requireWorkspac
     const status = normalizeUserStatus(raw);
 
     const { id } = req.params;
-    const wsScope = !isSuperAdmin(req) && req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {};
-
-    // Resolve the User behind the id — Employee id first (what the picker
-    // holds), User id as a fallback. Both lookups are tenant-scoped.
-    const employeeDoc = await Employee.findOne({ _id: id, ...wsScope }).select("_id ownerId workspaceId").lean();
-    const userId = (employeeDoc as any)?.ownerId ?? id;
-    const targetUser = await User.findOne({ _id: userId, ...wsScope }).select("_id status workspaceId").lean();
+    const { employeeDoc, targetUser } = await resolveStatusTarget(req, id);
     if (!targetUser) {
       return res.status(404).json({ error: "Employee not found" });
     }
@@ -1477,20 +1557,40 @@ router.patch("/:id/status", validateObjectId("id"), requireAuth, requireWorkspac
       return res.status(400).json({ error: "You cannot deactivate your own account." });
     }
 
+    // Scope the mirror write to the SUBJECT's workspace, never the caller's
+    // (a SUPERADMIN may be acting on another tenant).
+    const subjectWs = targetUser.workspaceId ?? (isSuperAdmin(req) ? null : req.workspaceObjectId);
+
+    // Deactivation is ADVISORY on pending work: the guard is the UI modal fed
+    // by GET /:id/pending-work; here we only record what was open at the
+    // moment the admin proceeded, so the audit row answers "what stalled?".
+    let pendingWorkSnapshot = null;
+    if (status === USER_STATUS_INACTIVE && isUserActive(targetUser)) {
+      pendingWorkSnapshot = summarizePendingWork(
+        await collectPendingWork({ userId: targetUser._id, workspaceId: subjectWs }),
+      );
+    }
+
     const result = await setUserActiveStatus({
       userId: targetUser._id,
-      // Scope the mirror write to the SUBJECT's workspace, never the caller's
-      // (a SUPERADMIN may be acting on another tenant).
-      workspaceId: (targetUser as any).workspaceId ?? (isSuperAdmin(req) ? null : req.workspaceObjectId),
+      workspaceId: subjectWs,
       status,
+      audit: {
+        trigger: "explicit",
+        ...actorOf(req),
+        acknowledgedPendingWork: req.body?.acknowledgedPendingWork === true,
+        pendingWorkSnapshot,
+      },
     });
 
     return res.json({
       ok: true,
       userId: result.userId,
-      employeeId: employeeDoc ? String((employeeDoc as any)._id) : null,
+      employeeId: employeeDoc ? String(employeeDoc._id) : null,
       status: result.status,
+      changed: result.changed,
       employeeMirrorsUpdated: result.employeeMirrorsUpdated,
+      pendingWorkTotals: pendingWorkSnapshot?.totals ?? null,
     });
   } catch (err) {
     next(err);
@@ -1676,6 +1776,30 @@ router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async 
     }
 
     const saved = await existing.save();
+
+    // Employment Status coupling (value-based): a terminal value left on an
+    // ACTIVE user deactivates them through the one write path — even when
+    // this save only touched an unrelated field. Snapshot what is open so
+    // the audit row records it; the UI has already shown the guard.
+    const coupling = await applyEmploymentStatusCoupling({
+      userId: existing._id,
+      workspaceId: (existing as any).workspaceId ?? req.workspaceObjectId,
+      employmentStatus: (existing as any).employmentStatus,
+      currentStatus: (existing as any).status,
+      audit: {
+        ...actorOf(req),
+        acknowledgedPendingWork: req.body?.acknowledgedPendingWork === true,
+        pendingWorkSnapshot: isTerminalEmploymentStatus((existing as any).employmentStatus) && isUserActive(existing as any)
+          ? summarizePendingWork(await collectPendingWork({
+              userId: existing._id,
+              workspaceId: (existing as any).workspaceId ?? req.workspaceObjectId,
+            }))
+          : null,
+      },
+    });
+    if (coupling?.changed) {
+      (saved as any).status = coupling.status;
+    }
 
     // Update Employee doc for fields that live on Employee schema
     const employeeFields: any = {};
