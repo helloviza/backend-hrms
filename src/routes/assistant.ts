@@ -7,6 +7,7 @@ import LeaveRequest from "../models/LeaveRequest.js";
 import Document from "../models/Document.js";
 import User from "../models/User.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
+import requireAuth from "../middleware/auth.js";
 
 const router = Router();
 
@@ -352,23 +353,19 @@ function roleExampleQuestions(roleRaw: RoleString): string {
  */
 async function buildBackendContext(req: Request): Promise<AssistantContext> {
   const authUser: any = (req as any).user || {};
-  const clientContext = (req.body as any)?.context || {};
-  const clientProfile = clientContext?.profile || {};
 
-  // Prefer `sub`, then other common id fields, THEN `_id` (mongoose doc),
-  // THEN anything we might have in client context profile
+  // The user id comes ONLY from the authenticated principal (requireAuth sets
+  // sub/id/_id). The request body's context.profile is never consulted for
+  // identity: before 2026-09-15 it was the last fallback, which let an
+  // unauthenticated caller read any user's attendance/leave/profile/document
+  // summary by posting that user's id.
   const userId: UserId | undefined =
     authUser.sub ??
     authUser.id ??
     authUser.userId ??
     authUser.user_id ??
     authUser.employeeId ??
-    authUser._id ??
-    clientProfile.userId ??
-    clientProfile.id ??
-    clientProfile._id ??
-    clientProfile.employeeId ??
-    clientProfile.employeeCode;
+    authUser._id;
 
   // Helpful debug to confirm what we're seeing on server side
 
@@ -443,6 +440,7 @@ async function buildBackendContext(req: Request): Promise<AssistantContext> {
 
 router.post(
   "/hr",
+  requireAuth,
   async (
     req: Request<{}, AssistantResponseBody, AssistantRequestBody>,
     res: Response<AssistantResponseBody>
