@@ -248,6 +248,7 @@ describe("GET /employees/:id/pending-work", () => {
     const b2 = byKey(res.body.owned);
     expect(b2.leads.count).toBe(1);
     expect(b2.leads.items[0].title).toBe("L-1 · Acme");
+    expect(b2.leads.items[0].href).toMatch(/^\/crm\/leads\/[0-9a-f]{24}$/); // CRM routes live under /crm
     expect(b2.opportunities.count).toBe(1);
     expect(b2.ownLeaveRequests.count).toBe(1);
     expect(b2.ownExpenseClaims.count).toBe(1);
@@ -258,6 +259,26 @@ describe("GET /employees/:id/pending-work", () => {
     expect(b2.ownDeclarations.count).toBe(1);
     expect(b2.ownDateChangeRequests.count).toBe(1);
     expect(res.body.totals.owned).toBe(10);
+
+    // Every emitted link must be a route an ADMIN can load (router.tsx);
+    // sources with no admin-reachable page carry no link and say why.
+    const ADMIN_ROUTES = [
+      "/admin/tasks", "/admin/tickets", "/expenses/approvals", "/expenses/advances/queues", "/admin/approvals",
+      "/admin/manual-bookings", "/admin/visa-applications", "/leaves/team", "/attendance/regularize",
+      "/crm/leads", "/crm/opportunities", "/payroll/reimbursements", "/payroll/declarations/manage", "/admin/sbt/date-change-requests",
+    ];
+    const DETAIL = /^\/(admin\/tickets|expenses\/claims|expenses\/advances|admin\/manual-bookings|admin\/visa-applications|crm\/leads|crm\/opportunities)\/[0-9a-f]{24}(\/edit)?$/;
+    for (const src of [...res.body.awaitingAction, ...res.body.owned]) {
+      if (src.hrefAll === null) {
+        expect(src.note).toMatch(/no admin page/i);
+        for (const it of src.items) expect(it.href).toBeNull();
+        continue;
+      }
+      expect(ADMIN_ROUTES).toContain(src.hrefAll);
+      for (const it of src.items) expect(it.href === src.hrefAll || DETAIL.test(it.href)).toBe(true);
+    }
+    expect([...res.body.awaitingAction, ...res.body.owned].filter((s: any) => s.hrefAll === null).map((s: any) => s.key))
+      .toEqual(["sbtRequestsToBook", "ownSbtRequests"]);
   });
 
   it("standing section returns counts + names, deduplicating reports across User- and Employee-space", async () => {

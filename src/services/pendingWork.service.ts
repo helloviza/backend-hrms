@@ -56,8 +56,9 @@ export interface PendingWorkItem {
   id: string;
   title: string;
   status: string;
-  /** Frontend path where this item can be actioned / reassigned. */
-  href: string;
+  /** Frontend path where this item can be actioned / reassigned; null when
+   *  no admin-reachable page exists (see the source's `note`). */
+  href: string | null;
 }
 
 export interface PendingWorkSource {
@@ -67,8 +68,10 @@ export interface PendingWorkSource {
   count: number | null;
   unresolved?: true;
   items: PendingWorkItem[];
-  /** Frontend path for the whole list. */
-  hrefAll: string;
+  /** Frontend path for the whole list; null when no admin-reachable page
+   *  exists — `note` then says where the item is actually handled. */
+  hrefAll: string | null;
+  note?: string;
 }
 
 export interface StandingAssignment {
@@ -129,15 +132,16 @@ async function source(
   label: string,
   model: mongoose.Model<any>,
   filter: Record<string, unknown>,
-  hrefAll: string,
+  hrefAll: string | null,
   toItem: (doc: any) => PendingWorkItem,
   sort: Record<string, 1 | -1> = { updatedAt: -1 },
+  note?: string,
 ): Promise<PendingWorkSource> {
   const [count, docs] = await Promise.all([
     model.countDocuments(filter),
     model.find(filter).sort(sort).limit(ITEM_LIMIT).lean(),
   ]);
-  return { key, label, count, items: (docs as any[]).map(toItem), hrefAll };
+  return { key, label, count, items: (docs as any[]).map(toItem), hrefAll, ...(note ? { note } : {}) };
 }
 
 function unresolvedSource(key: string, label: string, hrefAll: string): PendingWorkSource {
@@ -207,10 +211,14 @@ export async function collectPendingWork(args: {
       { approverId: userId, status: { $in: ["awaiting_approval", "clarification_required"] } },
       "/expenses/advances/queues",
       (d) => ({ id: String(d._id), title: [d.ref, d.purpose].filter(Boolean).join(" · ") || "(advance)", status: d.status, href: `/expenses/advances/${d._id}` })),
+    // No admin-reachable page: /sbt/inbox is the CALLER's booker inbox
+    // (403 unless they are an L2 booker / Workspace Leader of that tenant).
     source("sbtRequestsToBook", "SBT requests to book", SBTRequest,
       { assignedBookerId: userId, status: "PENDING" },
-      "/sbt/inbox",
-      (d) => ({ id: String(d._id), title: `${d.type || "travel"} request${d.passengerDetails?.[0] ? ` · ${`${d.passengerDetails[0].firstName || ""} ${d.passengerDetails[0].lastName || ""}`.trim()}` : ""}`, status: d.status, href: "/sbt/inbox" })),
+      null,
+      (d) => ({ id: String(d._id), title: `${d.type || "travel"} request${d.passengerDetails?.[0] ? ` · ${`${d.passengerDetails[0].firstName || ""} ${d.passengerDetails[0].lastName || ""}`.trim()}` : ""}`, status: d.status, href: null }),
+      { updatedAt: -1 },
+      "Handled in that workspace's SBT inbox by its Workspace Leader (no admin page)."),
     source("travelApprovalsToDecide", "Travel approvals to decide", CustomerApprovalRequest,
       { approverId: userId, status: { $in: ["pending", "on_hold"] } },
       "/admin/approvals",
@@ -243,24 +251,24 @@ export async function collectPendingWork(args: {
   const owned: PendingWorkSource[] = await Promise.all([
     source("leads", "Open leads owned", Lead,
       { assignedTo: userId, stage: { $nin: ["won", "lost"] } },
-      "/leads",
-      (d) => ({ id: String(d._id), title: [d.leadCode, d.companyName || d.contactName].filter(Boolean).join(" · ") || "(lead)", status: d.stage, href: `/leads/${d._id}` })),
+      "/crm/leads",
+      (d) => ({ id: String(d._id), title: [d.leadCode, d.companyName || d.contactName].filter(Boolean).join(" · ") || "(lead)", status: d.stage, href: `/crm/leads/${d._id}` })),
     source("opportunities", "Open opportunities owned", Opportunity,
       { ownerUserId: userId, stage: { $nin: ["closed_won", "closed_lost"] } },
-      "/opportunities",
-      (d) => ({ id: String(d._id), title: d.name || "(opportunity)", status: d.stage, href: `/opportunities/${d._id}` })),
+      "/crm/opportunities",
+      (d) => ({ id: String(d._id), title: d.name || "(opportunity)", status: d.stage, href: `/crm/opportunities/${d._id}` })),
     source("ownLeaveRequests", "Own pending leave requests", LeaveRequest,
       { userId, status: "PENDING" },
-      "/leaves/my",
-      (d) => ({ id: String(d._id), title: `${d.type || "Leave"} · ${fmtDate(d.from)} → ${fmtDate(d.to)}`, status: d.status, href: "/leaves/my" }),
+      "/leaves/team",
+      (d) => ({ id: String(d._id), title: `${d.type || "Leave"} · ${fmtDate(d.from)} → ${fmtDate(d.to)}`, status: d.status, href: "/leaves/team" }),
       { from: 1 }),
     source("ownExpenseClaims", "Own expense claims in flight", Report,
       { employeeId: userId, status: { $in: ["submitted", "clarification_required"] } },
-      "/expenses/claims",
+      "/expenses/approvals",
       (d) => ({ id: String(d._id), title: [d.ref, d.name].filter(Boolean).join(" · ") || "(claim)", status: d.status, href: `/expenses/claims/${d._id}` })),
     source("ownAdvances", "Own expense advances open", ExpenseAdvance,
       { requesterId: userId, status: { $nin: ["draft", "declined", "settled", "cancelled"] } },
-      "/expenses/advances",
+      "/expenses/advances/queues",
       (d) => ({ id: String(d._id), title: [d.ref, d.purpose].filter(Boolean).join(" · ") || "(advance)", status: d.status, href: `/expenses/advances/${d._id}` })),
     source("ownReimbursementClaims", "Own payroll reimbursement claims submitted", ReimbursementClaim,
       { userId, status: "SUBMITTED" },
@@ -268,12 +276,14 @@ export async function collectPendingWork(args: {
       (d) => ({ id: String(d._id), title: `Reimbursement · ${d.month || ""}`, status: d.status, href: "/payroll/reimbursements" })),
     source("ownSbtRequests", "Own SBT requests pending", SBTRequest,
       { requesterId: userId, status: "PENDING" },
-      "/sbt/my-requests",
-      (d) => ({ id: String(d._id), title: `${d.type || "travel"} request`, status: d.status, href: "/sbt/my-requests" })),
+      null,
+      (d) => ({ id: String(d._id), title: `${d.type || "travel"} request`, status: d.status, href: null }),
+      { updatedAt: -1 },
+      "Visible only to the requester and their booker / Workspace Leader (no admin page)."),
     source("ownTravelApprovals", "Own travel approval requests pending", CustomerApprovalRequest,
       { requesterId: userId, status: { $in: ["pending", "on_hold"] } },
-      "/customer/approvals/mine",
-      (d) => ({ id: String(d._id), title: d.ticketId ? `Ticket ${d.ticketId}` : "(approval request)", status: d.status, href: "/customer/approvals/mine" })),
+      "/admin/approvals",
+      (d) => ({ id: String(d._id), title: d.ticketId ? `Ticket ${d.ticketId}` : "(approval request)", status: d.status, href: "/admin/approvals" })),
     source("ownDeclarations", "Tax declarations unsubmitted / in flight", EmployeeDeclaration,
       { userId, $or: [{ declarationStatus: { $in: ["DRAFT", "SUBMITTED", "HR_UNLOCKED"] } }, { proofStatus: { $in: ["PARTIAL", "SUBMITTED"] } }] },
       "/payroll/declarations/manage",
