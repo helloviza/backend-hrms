@@ -14,6 +14,7 @@ import { env } from "../config/env.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import crypto from "crypto";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 import {
   computeTDSOldRegime,
   computeHRAExemption,
@@ -295,7 +296,7 @@ r.post(
           declarationStatus: { $in: ["SUBMITTED", "FROZEN"] },
         }).select("userId").lean();
         const submittedIds = submitted.map((d: any) => d.userId);
-        filter = { workspaceId: req.workspaceObjectId, status: { $ne: "INACTIVE" }, _id: { $nin: submittedIds } };
+        filter = { workspaceId: req.workspaceObjectId, ...activeUserFilter(), _id: { $nin: submittedIds } };
       } else {
         // Proof phase — employees who have FROZEN declaration but no proofs
         const pending = await EmployeeDeclaration.find({

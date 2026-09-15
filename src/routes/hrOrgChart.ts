@@ -6,6 +6,7 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireRoles } from "../middleware/roles.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import EmployeeModel from "../models/Employee.js";
+import { activeEmployeeFilter } from "../utils/userActiveStatus.js";
 
 const router = express.Router();
 
@@ -52,8 +53,9 @@ router.get(
       const employees = await EmployeeModel.find(
         {
           workspaceId: req.workspaceObjectId,
-          // treat isActive=false as hidden if field exists
-          $or: [{ isActive: { $ne: false } }, { isActive: { $exists: false } }],
+          // Canonical active/inactive (utils/userActiveStatus): honours both
+          // Employee mirrors — status and isActive — absent counts as active.
+          ...activeEmployeeFilter(),
         },
         {
           // projection: keep the payload lean but useful

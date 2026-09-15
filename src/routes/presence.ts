@@ -5,6 +5,7 @@ import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import UserPresence from "../models/UserPresence.js";
 import Employee from "../models/Employee.js";
 import User from "../models/User.js";
+import { activeUserFilter, isUserActive } from "../utils/userActiveStatus.js";
 
 const r = Router();
 
@@ -40,7 +41,7 @@ r.get("/team", requireRoles("MANAGER", "ADMIN", "SUPERADMIN"), async (req, res, 
       if (!wsOid) {
         return res.status(403).json({ error: "Workspace scope required" });
       }
-      const wsUsers = await User.find({ workspaceId: wsOid }).select("_id").lean();
+      const wsUsers = await User.find({ workspaceId: wsOid, ...activeUserFilter() }).select("_id").lean();
       const allowedUserIds = wsUsers.map((u: any) => u._id);
       presenceFilter.userId = { $in: allowedUserIds };
     }
@@ -48,14 +49,17 @@ r.get("/team", requireRoles("MANAGER", "ADMIN", "SUPERADMIN"), async (req, res, 
     const docs = await UserPresence.find(presenceFilter)
       .populate(
         "userId",
-        "name email avatarKey department designation accountType userType vendorId vendor_id businessId customerId clientId companyId"
+        "name email avatarKey department designation status accountType userType vendorId vendor_id businessId customerId clientId companyId"
       )
       .lean();
 
     const now = Date.now();
 
-    // Filter to staff-only, exclude ghosts/vendors/customers
-    const staffDocs = docs.filter((doc: any) => !isNonStaff(doc.userId));
+    // Filter to staff-only, exclude ghosts/vendors/customers — and anyone
+    // deactivated (the SUPERADMIN path above has no workspace pre-filter, so
+    // this is the only gate on that branch; a stale UserPresence row must
+    // never resurface an inactive person).
+    const staffDocs = docs.filter((doc: any) => !isNonStaff(doc.userId) && isUserActive(doc.userId));
 
     // Collect user IDs for Employee lookup
     const userIds = staffDocs.map((d: any) => d.userId?._id ?? d.userId);

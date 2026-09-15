@@ -86,7 +86,18 @@ const UserSchema = new Schema(
     middleName: { type: String, trim: true },
     lastName: { type: String, trim: true },
 
-    status: { type: String, trim: true, default: "ACTIVE" },
+    /**
+     * THE active/inactive flag — see utils/userActiveStatus.ts. "ACTIVE" |
+     * "INACTIVE"; written only through setUserActiveStatus (and the legacy
+     * bulk-update path that delegates to it). Uppercased on write so a
+     * pass-through "Inactive" can never slip past `{ $ne: "INACTIVE" }`.
+     */
+    status: {
+      type: String,
+      trim: true,
+      default: "ACTIVE",
+      set: (v: unknown) => String(v ?? "ACTIVE").trim().toUpperCase() || "ACTIVE",
+    },
 
     /* -------------------------------------------------------------- */
     /* HR structure / roles                                           */

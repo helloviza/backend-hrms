@@ -12,6 +12,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import requireRoles from "../middleware/roles.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { activeEmployeeFilter } from "../utils/userActiveStatus.js";
 
 const router = Router();
 
@@ -318,7 +319,7 @@ router.get(
 
     const managerEmpId = (managerEmployee as any)?._id;
 
-    const teamFilter: any = { ...employeeFilter, ...wsFilter, isActive: true };
+    const teamFilter: any = { ...employeeFilter, ...wsFilter, ...activeEmployeeFilter() };
     if (managerEmpId) {
       teamFilter.managerId = managerEmpId;
     }

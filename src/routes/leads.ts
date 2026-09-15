@@ -27,6 +27,7 @@ import { buildOwnerStatusReport } from "../services/ownerStatusReport.js";
 import { leadScope, leadMatch, opportunityMatch, activityMatch, ownsLead, canManageOthers, isAll, findVisibleLead, redactCompanyCheck } from "../services/crmScope.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import logger from "../utils/logger.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const router = express.Router();
 
@@ -369,7 +370,7 @@ async function listCrmReps(): Promise<Array<{ _id: string; name: string; email: 
     const users = (await User.find({
       workspaceId: houseObjectId,
       _id: { $in: [...union.values()] },
-      status: { $ne: "INACTIVE" },
+      ...activeUserFilter(),
     })
       .select("_id name firstName lastName email")
       .lean()) as any[];

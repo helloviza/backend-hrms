@@ -21,6 +21,7 @@ import {
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import { stripTravelFields } from "../utils/stripTravelFields.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const r = Router();
 
@@ -124,7 +125,7 @@ r.get(
       const { limit = "500", department, status, search } = req.query as any;
 
       const filter: any = { workspaceId };
-      if (status !== "all") filter.status = { $ne: "INACTIVE" };
+      if (status !== "all") Object.assign(filter, activeUserFilter());
       if (department) filter.department = department;
       if (search) {
         filter.$or = [

@@ -21,6 +21,7 @@ import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 import TravellerProfile, {
   MEAL_PREFERENCE_CODES,
   LOYALTY_PROGRAMME_TYPES,
@@ -1377,7 +1378,7 @@ router.get("/tour-approver-candidates", async (req: any, res: any) => {
     }
     if (!requireWorkspaceContext(req, res)) return;
 
-    const users = await User.find({ workspaceId: req.workspaceObjectId })
+    const users = await User.find({ workspaceId: req.workspaceObjectId, ...activeUserFilter() })
       .select("firstName lastName name email")
       .sort({ firstName: 1, lastName: 1 })
       .lean();
@@ -1522,7 +1523,7 @@ router.get("/reporting-manager-candidates", async (req: any, res: any) => {
       return res.status(403).json({ error: "Only a workspace leader can set a reporting manager" });
     }
 
-    const users = await User.find({ workspaceId })
+    const users = await User.find({ workspaceId, ...activeUserFilter() })
       .select("firstName lastName name email")
       .sort({ firstName: 1, lastName: 1 })
       .lean();

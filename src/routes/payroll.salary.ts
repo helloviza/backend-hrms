@@ -17,6 +17,7 @@ import {
   STATUTORY,
 } from "../services/payroll.statutory.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 /**
  * Resolve workspaceId — for SUPERADMIN without workspace context,
@@ -240,7 +241,7 @@ r.get(
       const { department, page = "1", limit = "50" } = req.query as any;
 
       // 1. Fetch ALL active users in workspace
-      const userFilter: any = { workspaceId, status: { $ne: "INACTIVE" } };
+      const userFilter: any = { workspaceId, ...activeUserFilter() };
       if (department) userFilter.department = department;
 
       const users = await User.find(userFilter)

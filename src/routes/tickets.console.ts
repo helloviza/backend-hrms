@@ -17,6 +17,7 @@ import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import { notifyUser } from "../services/notificationDispatch.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -250,7 +251,7 @@ router.get("/users", requirePermission("supportTickets", "READ"), async (req, re
       "userId",
     ).lean();
     const userIds = permDocs.map((p) => p.userId);
-    const users = await User.find({ _id: { $in: userIds } }, "name email roles").lean();
+    const users = await User.find({ _id: { $in: userIds }, ...activeUserFilter() }, "name email roles").lean();
     return res.json({ success: true, users });
   } catch (err) {
     logger.error("[TicketsConsole] users list error", { err });

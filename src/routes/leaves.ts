@@ -17,6 +17,7 @@ import {
   calculateLeaveDays,
 } from "../services/leavePolicy.service.js";
 import { executeLeaveAccrual } from "../workers/leaveAccrual.worker.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const r = Router();
 
@@ -703,7 +704,7 @@ r.post(
 
       const year = new Date().getFullYear();
       const policy = await LeavePolicy.getOrCreate((req as any).workspaceObjectId);
-      const users = await User.find({ status: { $ne: "INACTIVE" }, workspaceId: (req as any).workspaceObjectId })
+      const users = await User.find({ ...activeUserFilter(), workspaceId: (req as any).workspaceObjectId })
         .select("_id dateOfJoining")
         .lean();
 
@@ -904,7 +905,7 @@ r.post(
       // Find all users in workspace
       const users = await User.find({
         ...(wsId ? { workspaceId: wsId } : {}),
-        status: { $ne: "INACTIVE" },
+        ...activeUserFilter(),
       }).select("_id").lean();
 
       let processed = 0;

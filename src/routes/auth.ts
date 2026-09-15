@@ -24,6 +24,7 @@ import { generateTravelerId } from "../utils/travelerId.js";
 import TenantSetupProgress from "../models/TenantSetupProgress.js";
 import { stripTravelFields } from "../utils/stripTravelFields.js";
 import { signLogoUrl } from "../utils/signLogoUrl.js";
+import { isUserActive } from "../utils/userActiveStatus.js";
 
 const r = Router();
 
@@ -809,6 +810,28 @@ r.post("/login", loginLimiter, async (req, res) => {
       return res.status(400).json({ error: "Invalid credentials or password not set" });
     }
 
+    // Deactivated account — canonical User.status (utils/userActiveStatus).
+    // Sits ABOVE the SuperAdmin / external-user bypasses on purpose: those
+    // only skip the UserPermission gate, and nothing may re-admit an
+    // INACTIVE person. No token is issued.
+    if (!isUserActive(user)) {
+      authLogger.warn("Failed login attempt", { email: normalizedEmail, ip: req.ip, reason: "account_inactive" });
+      SessionLog.create({
+        userId: user._id,
+        email: normalizedEmail,
+        role: normalizeRoles(user.roles || [])[0],
+        event: "LOGIN_FAILED",
+        ipAddress: req.ip || req.headers["x-forwarded-for"] as string,
+        userAgent: req.headers["user-agent"],
+        success: false,
+        failureReason: "account_inactive",
+      }).catch(() => {});
+      return res.status(403).json({
+        error: "This account has been deactivated. Please contact your administrator.",
+        code: "ACCOUNT_INACTIVE",
+      });
+    }
+
     // SuperAdmin bypass — role-based or email-based
     const SUPERADMIN_EMAILS = [
       'admin@plumtrips.com',
@@ -974,6 +997,16 @@ r.post("/refresh", async (req, res) => {
     // NOTE: pre-auth lookup, workspace not yet available
     const user: any = await User.findById(payload.sub);
     if (!user) return res.status(401).json({ error: "User not found" });
+
+    // A refresh cookie outlives deactivation (7d). Refuse to mint a new
+    // access token for an INACTIVE person — same gate as /login.
+    if (!isUserActive(user)) {
+      clearRefreshCookie(res);
+      return res.status(403).json({
+        error: "This account has been deactivated. Please contact your administrator.",
+        code: "ACCOUNT_INACTIVE",
+      });
+    }
 
     let built = await buildAuthSafeUser(user);
 

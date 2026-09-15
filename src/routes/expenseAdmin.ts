@@ -26,6 +26,7 @@ import mongoose from "mongoose";
 import { isAdmin, isFinance, userIdOf } from "../services/expense.access.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const router = express.Router();
 
@@ -65,7 +66,7 @@ router.use((req: any, res: any, next: any) => {
 router.get("/users", async (req: any, res: any) => {
   try {
     const ws = req.workspaceObjectId;
-    const docs: any[] = await User.find({ workspaceId: ws })
+    const docs: any[] = await User.find({ workspaceId: ws, ...activeUserFilter() })
       .select("firstName lastName name email designation department roles managerId managerName reportingL1 status")
       .sort({ name: 1, firstName: 1 })
       .lean();

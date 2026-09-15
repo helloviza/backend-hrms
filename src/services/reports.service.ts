@@ -19,6 +19,7 @@ import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseAct
 import { refFromId } from "../utils/refFromId.js";
 import { sendClaimSubmittedEmail } from "../utils/claimEmails.js";
 import { isAdmin, userIdOf } from "./expense.access.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 /* ──────────────────────────────────────────────────────────────────────
  * Activity / audit log.
@@ -369,6 +370,7 @@ export async function resolveL1Approver(
     workspaceId,
     _id: { $ne: submitterId },
     roles: { $in: [/ADMIN/i, /LEADER/i, /^HR$/i, /^OPS$/i] },
+    ...activeUserFilter(),
   })
     .select(APPROVER_USER_FIELDS)
     .lean();
@@ -431,6 +433,7 @@ export async function resolveL2Approver(
     workspaceId,
     _id: { $nin: excludeObjIds },
     roles: { $in: [/ADMIN/i, /LEADER/i, /^HR$/i, /^OPS$/i] },
+    ...activeUserFilter(),
   })
     .select(APPROVER_USER_FIELDS)
     .lean();

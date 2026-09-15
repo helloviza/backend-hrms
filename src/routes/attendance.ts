@@ -10,6 +10,7 @@ import LeaveRequest from "../models/LeaveRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { audit } from "../middleware/audit.js";
 import dayjs from "dayjs";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const r = Router();
 
@@ -560,7 +561,7 @@ r.get(
       }
 
       // Get users in scope
-      let userQuery: any = { workspaceId, status: { $ne: "INACTIVE" } };
+      let userQuery: any = { workspaceId, ...activeUserFilter() };
       if (singleUserId) userQuery._id = singleUserId;
       const users = await User.find(userQuery)
         .select("_id firstName lastName email employeeCode name")
@@ -766,7 +767,7 @@ r.get(
         }
       }
 
-      const users = await User.find({ workspaceId, status: { $ne: "INACTIVE" } })
+      const users = await User.find({ workspaceId, ...activeUserFilter() })
         .select("_id firstName lastName email employeeCode name").lean();
       const userIds = users.map((u: any) => u._id);
 

@@ -21,6 +21,7 @@ import { isGenericDomain } from "../utils/blockedDomains.js";
 import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMemberRoles.js";
 import { generateTravelerId } from "../utils/travelerId.js";
 import { parseCsv as parseCsvRaw } from "../utils/csv.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const router = Router();
 
@@ -2491,7 +2492,7 @@ router.get("/workspace/available-bookers", requireAuth, async (req: any, res: an
         { sbtRole: { $in: ["L2", "BOTH"] } },
         { roles: "WORKSPACE_LEADER" },
       ],
-      status: { $ne: "INACTIVE" },
+      ...activeUserFilter(),
     })
       .select("name email sbtRole roles")
       .lean();

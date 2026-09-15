@@ -23,6 +23,14 @@ import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 import { HeadObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import {
+  activeEmployeeFilter,
+  inactiveEmployeeFilter,
+  isUserActive,
+  normalizeUserStatus,
+  setUserActiveStatus,
+  USER_STATUS_INACTIVE,
+} from "../utils/userActiveStatus.js";
 
 const router = Router();
 
@@ -236,10 +244,12 @@ router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
     // SUPERADMIN sees all employees across workspaces
     if (!isSuperAdmin(req) && req.workspaceObjectId) filter.workspaceId = req.workspaceObjectId;
 
+    // Canonical active/inactive — utils/userActiveStatus. The Employee row
+    // carries both mirrors (status + isActive); the helper honours both.
     if (statusParam === "inactive") {
-      filter.status = "INACTIVE";
+      Object.assign(filter, inactiveEmployeeFilter());
     } else if (statusParam !== "all") {
-      filter.status = { $ne: "INACTIVE" };
+      Object.assign(filter, activeEmployeeFilter());
     }
     if (department) filter.department = department;
     if (designation) filter.designation = designation;
@@ -285,7 +295,14 @@ router.get("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       ...e,
       roles: userMap.get(e.email)?.roles || ["EMPLOYEE"],
       hrmsAccessRole: userMap.get(e.email)?.hrmsAccessRole || "EMPLOYEE",
-      isActive: userMap.get(e.email)?.isActive ?? e.isActive,
+      // Canonical active/inactive comes from User.status (utils/
+      // userActiveStatus); the Employee mirrors are the fallback for a row
+      // with no User behind it. `User.isActive` is NOT a schema field — the
+      // old `userMap.get(e.email)?.isActive` read was always undefined.
+      status: userMap.has(e.email) ? normalizeUserStatus(userMap.get(e.email)?.status) : e.status,
+      isActive: userMap.has(e.email)
+        ? isUserActive(userMap.get(e.email))
+        : e.isActive !== false && String(e.status || "").toUpperCase() !== USER_STATUS_INACTIVE,
       avatarKey: userMap.get(e.email)?.avatarKey || "",
       avatarUrl: userMap.get(e.email)?.avatarUrl || "",
       firstName: userMap.get(e.email)?.firstName || e.firstName || "",
@@ -460,33 +477,49 @@ router.post("/bulk-update", requireAuth, requireWorkspace, async (req: any, res,
     const $set: any = {};
     if (updates.department !== undefined) $set.department = String(updates.department).trim();
     if (updates.designation !== undefined) $set.designation = String(updates.designation).trim();
-    if (updates.status !== undefined) $set.status = String(updates.status).toUpperCase();
+    // Active/inactive is NOT part of $set — it goes through the single
+    // (de)activation write path below so User + Employee mirrors stay in step.
+    const statusUpdate = updates.status !== undefined ? normalizeUserStatus(updates.status) : undefined;
 
-    if (Object.keys($set).length === 0) {
+    if (Object.keys($set).length === 0 && statusUpdate === undefined) {
       return res.status(400).json({ error: "No valid updates provided" });
     }
 
     // Update User records — SUPERADMIN can update across workspaces
     const wsScope = !isSuperAdmin(req) && req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {};
-    const userResult = await User.updateMany(
-      { _id: { $in: userIds }, ...wsScope },
-      { $set },
-    );
+    const selfId = String(req.user?._id || req.user?.id || req.user?.sub || "");
+    if (statusUpdate === USER_STATUS_INACTIVE && userIds.map(String).includes(selfId)) {
+      return res.status(400).json({ error: "You cannot deactivate your own account." });
+    }
 
-    // Also update Employee records (by ownerId match)
-    const employeeSet: any = {};
-    if ($set.department) employeeSet.department = $set.department;
-    if ($set.designation) employeeSet.designation = $set.designation;
-    if ($set.status) employeeSet.status = $set.status;
+    let updated = 0;
+    if (Object.keys($set).length > 0) {
+      const userResult = await User.updateMany(
+        { _id: { $in: userIds }, ...wsScope },
+        { $set },
+      );
+      updated = userResult.modifiedCount;
 
-    if (Object.keys(employeeSet).length > 0) {
+      // Also update Employee records (by ownerId match)
       await Employee.updateMany(
         { ownerId: { $in: userIds }, ...wsScope },
-        { $set: employeeSet },
+        { $set },
       );
     }
 
-    return res.json({ updated: userResult.modifiedCount });
+    if (statusUpdate !== undefined) {
+      for (const id of userIds) {
+        if (!mongoose.Types.ObjectId.isValid(String(id))) continue;
+        const r = await setUserActiveStatus({
+          userId: String(id),
+          workspaceId: isSuperAdmin(req) ? null : req.workspaceObjectId,
+          status: statusUpdate,
+        });
+        if (r.userMatched) updated += 1;
+      }
+    }
+
+    return res.json({ updated });
   } catch (err) {
     next(err);
   }
@@ -1402,6 +1435,68 @@ router.post("/:id/avatar/confirm", validateObjectId("id"), requireAuth, requireW
  * - Requires Admin / HR.
  * - Does not allow direct passwordHash changes here.
  */
+/**
+ * PATCH /api/employees/:id/status   { status: "ACTIVE" | "INACTIVE" }
+ *
+ * THE admin (de)activation action. `:id` is an Employee id (what /profile/team
+ * holds) or, as a fallback, a User id. Writes the canonical User.status and
+ * mirrors it onto the Employee row through setUserActiveStatus — the only
+ * place that write happens. Login, /auth/refresh, Team Presence, CRM reps,
+ * attendance, payroll and every "active employee" list read that flag.
+ *
+ * Tenant-scoped: a tenant admin can only flip users in their own workspace.
+ * Nothing historical is touched — bookings, attendance, invoices and audit
+ * rows still resolve the person by id.
+ */
+router.patch("/:id/status", validateObjectId("id"), requireAuth, requireWorkspace, async (req: any, res, next) => {
+  try {
+    if (!isAdminish(req.user)) {
+      return res.status(403).json({ error: "Only admins can change employee status" });
+    }
+
+    const raw = String(req.body?.status ?? "").trim().toUpperCase();
+    if (raw !== "ACTIVE" && raw !== USER_STATUS_INACTIVE) {
+      return res.status(400).json({ error: "status must be ACTIVE or INACTIVE" });
+    }
+    const status = normalizeUserStatus(raw);
+
+    const { id } = req.params;
+    const wsScope = !isSuperAdmin(req) && req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {};
+
+    // Resolve the User behind the id — Employee id first (what the picker
+    // holds), User id as a fallback. Both lookups are tenant-scoped.
+    const employeeDoc = await Employee.findOne({ _id: id, ...wsScope }).select("_id ownerId workspaceId").lean();
+    const userId = (employeeDoc as any)?.ownerId ?? id;
+    const targetUser = await User.findOne({ _id: userId, ...wsScope }).select("_id status workspaceId").lean();
+    if (!targetUser) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const selfId = String(req.user?._id || req.user?.id || req.user?.sub || "");
+    if (status === USER_STATUS_INACTIVE && String(targetUser._id) === selfId) {
+      return res.status(400).json({ error: "You cannot deactivate your own account." });
+    }
+
+    const result = await setUserActiveStatus({
+      userId: targetUser._id,
+      // Scope the mirror write to the SUBJECT's workspace, never the caller's
+      // (a SUPERADMIN may be acting on another tenant).
+      workspaceId: (targetUser as any).workspaceId ?? (isSuperAdmin(req) ? null : req.workspaceObjectId),
+      status,
+    });
+
+    return res.json({
+      ok: true,
+      userId: result.userId,
+      employeeId: employeeDoc ? String((employeeDoc as any)._id) : null,
+      status: result.status,
+      employeeMirrorsUpdated: result.employeeMirrorsUpdated,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async (req: any, res, next) => {
   try {
     if (!isAdminish(req.user)) {
@@ -1481,6 +1576,13 @@ router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async 
       managerUserId: _managerUserId,
       managerL2UserId: _managerL2UserId,
       managerL3UserId: _managerL3UserId,
+      /* Active/inactive is canonical on User.status and mirrored onto the
+       * Employee row ONLY via PATCH /:id/status (utils/userActiveStatus).
+       * The /profile/team form PUTs its whole row back — including the
+       * `status` / `isActive` it was handed by GET — so letting these through
+       * would let an ordinary profile save silently (re)activate someone. */
+      status: _status,
+      isActive: _isActive,
       ...safeBody
     } = body;
 

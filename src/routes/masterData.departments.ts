@@ -4,6 +4,7 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import Department from "../models/Department.js";
 import Designation from "../models/Designation.js";
 import User from "../models/User.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const router = Router();
 
@@ -65,7 +66,7 @@ router.get(
 
       // Compute headcount per department from User collection
       const headcounts = await User.aggregate([
-        { $match: { workspaceId: wsId, status: { $ne: "INACTIVE" } } },
+        { $match: { workspaceId: wsId, ...activeUserFilter() } },
         { $group: { _id: "$department", count: { $sum: 1 } } },
       ]);
       const hcMap = new Map(headcounts.map((h: any) => [h._id, h.count]));
@@ -188,7 +189,7 @@ router.delete(
       const usersCount = await User.countDocuments({
         workspaceId: req.workspaceObjectId,
         department: dept.name,
-        status: { $ne: "INACTIVE" },
+        ...activeUserFilter(),
       });
 
       if (usersCount > 0) {

@@ -15,6 +15,7 @@ import {
   isOnline,
 } from "../services/chatSSE.js";
 import logger from "../utils/logger.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const router = Router();
 
@@ -326,7 +327,7 @@ router.get("/users", requireAuth, requireWorkspace, async (req: Request, res: Re
   const wsId = String((req as any).workspaceObjectId);
 
   const users = await User.find(
-    { workspaceId: wsId, _id: { $ne: userId } },
+    { workspaceId: wsId, _id: { $ne: userId }, ...activeUserFilter() },
     "name firstName lastName avatarUrl email hrmsAccessRole lastSeenAt"
   ).lean();
 
