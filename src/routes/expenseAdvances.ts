@@ -39,6 +39,7 @@ import Report from "../models/Report.js";
 import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseActivity.js";
 import User from "../models/User.js";
 import { refFromId } from "../utils/refFromId.js";
+import { getWorkspaceBaseCurrency, normalizeCurrency } from "../services/expenseFx.service.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { csvRow } from "../utils/exportHelpers.js";
 import { sendAdvanceSubmittedEmail } from "../utils/advanceEmails.js";
@@ -188,7 +189,19 @@ router.post("/", async (req: any, res: any) => {
     const purpose = String(req.body?.purpose || "").trim();
     if (!purpose) return res.status(400).json({ error: "purpose is required" });
 
-    const currency = String(req.body?.currency || "INR").trim().toUpperCase() || "INR";
+    // FX slice 0: an advance is netted against claim totals and capped by them,
+    // and those are BASE-currency figures — so an advance must be requested in
+    // the workspace base. (A foreign-currency advance would need its own frozen
+    // conversion + settlement in base; not built in this slice.) An omitted
+    // currency = base, which is what the form sends today.
+    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
+    const currency = normalizeCurrency(req.body?.currency) || baseCurrency;
+    if (currency !== baseCurrency) {
+      return res.status(400).json({
+        error: `Advances are requested in the workspace base currency (${baseCurrency}).`,
+        code: "ADVANCE_CURRENCY_NOT_BASE",
+      });
+    }
     let neededBy: Date | null = null;
     if (req.body?.neededBy) {
       const d = new Date(req.body.neededBy);

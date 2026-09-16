@@ -566,6 +566,11 @@ router.get("/config", async (req: AnyObj, res) => {
       ? ws.config
       : deriveConfigFromLegacy(ws.travelMode);
 
+    // Expense base currency (FX slice 0) — always present for the frontend,
+    // "INR" for every workspace that predates the field.
+    (config as any).baseCurrency =
+      String(ws.config?.baseCurrency || "INR").trim().toUpperCase() || "INR";
+
     // Merge feature flags that may have been set directly on config.features
     // (e.g. payrollEnabled set via workspace.settings payroll-enable endpoint)
     if (ws.config?.features) {

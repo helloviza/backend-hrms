@@ -7,6 +7,11 @@
 
 import mongoose from "mongoose";
 import Expense, { type IExpense } from "../models/Expense.js";
+import {
+  getWorkspaceBaseCurrency,
+  normalizeCurrency,
+  resolveFxAtEntry,
+} from "./expenseFx.service.js";
 
 export type CreateExpenseInput = {
   workspaceId: mongoose.Types.ObjectId | string;
@@ -39,6 +44,13 @@ export type CreateExpenseInput = {
 };
 
 export async function createExpense(input: CreateExpenseInput): Promise<IExpense> {
+  // FX freeze at entry (slice 0). The receipt currency defaults to the
+  // workspace base (was a hard-coded "INR"); a non-ISO string from the
+  // extractor also falls back to the base rather than being stored verbatim.
+  const baseCurrency = await getWorkspaceBaseCurrency(input.workspaceId);
+  const currency = normalizeCurrency(input.currency) || baseCurrency;
+  const fx = await resolveFxAtEntry({ amount: Number(input.amount), currency, baseCurrency });
+
   const doc: Record<string, any> = {
     workspaceId: input.workspaceId,
     employeeId: input.employeeId,
@@ -48,7 +60,28 @@ export async function createExpense(input: CreateExpenseInput): Promise<IExpense
     merchant: input.merchant ?? null,
     date: input.date ? new Date(input.date) : null,
     amount: input.amount,
-    currency: input.currency || "INR",
+    currency,
+    exchangeRate: fx.exchangeRate,
+    rateDate: fx.rateDate,
+    rateSource: fx.rateSource,
+    amountBase: fx.amountBase,
+    baseCurrency: fx.baseCurrency,
+    // A resolved entry-time rate is the first history row; a pending line has
+    // none until a person supplies the rate.
+    rateHistory:
+      fx.rateSource && fx.amountBase != null
+        ? [
+            {
+              exchangeRate: fx.exchangeRate,
+              rateDate: fx.rateDate,
+              rateSource: fx.rateSource,
+              amountBase: fx.amountBase,
+              setBy: null,
+              setAt: new Date(),
+              reason: fx.rateSource === "base" ? "Same as workspace base currency" : "Live rate at entry",
+            },
+          ]
+        : [],
     taxAmount: input.taxAmount ?? null,
     gstin: input.gstin ?? null,
     suggestedCategory: input.suggestedCategory ?? null,

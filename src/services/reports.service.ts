@@ -20,6 +20,11 @@ import { refFromId } from "../utils/refFromId.js";
 import { sendClaimSubmittedEmail } from "../utils/claimEmails.js";
 import { isAdmin, userIdOf } from "./expense.access.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
+import {
+  amountBaseExpr,
+  getWorkspaceBaseCurrency,
+  isConversionPending,
+} from "./expenseFx.service.js";
 
 /* ──────────────────────────────────────────────────────────────────────
  * Activity / audit log.
@@ -166,7 +171,7 @@ export async function validateReportForSubmit(
     workspaceId: new mongoose.Types.ObjectId(String(workspaceId)),
     reportId: new mongoose.Types.ObjectId(String(reportId)),
   })
-    .select("ref merchant amount date imageKey categoryId")
+    .select("ref merchant amount currency amountBase date imageKey categoryId")
     .lean();
 
   // BLOCKING: nothing to submit.
@@ -182,6 +187,19 @@ export async function validateReportForSubmit(
     }
     if (!e.date) {
       blocking.push(`${expenseLabel(e)} is missing a date.`);
+    }
+  }
+
+  // BLOCKING (FX slice 0): every line must carry a resolved base-currency
+  // amount — approval routes and pays on the base total, and a claim with a
+  // conversion-pending line has no true total. Capture stays open; only the
+  // submit waits for a rate (live at entry, or manual via PATCH /expenses/:id/rate).
+  const baseCurrency = await getWorkspaceBaseCurrency(workspaceId);
+  for (const e of expenses) {
+    if (isConversionPending(e, baseCurrency)) {
+      blocking.push(
+        `${expenseLabel(e)} (${e.currency}) is awaiting a ${baseCurrency} exchange rate — enter one before submitting.`,
+      );
     }
   }
 
@@ -631,12 +649,15 @@ export async function submitReport(
   const { blocking, warnings } = await validateReportForSubmit(ws, rid);
   if (blocking.length > 0) return { ok: false, reason: "blocking", blocking, warnings };
 
-  // Totals (for the response + email).
+  // Totals (for the response + email) — in the workspace BASE currency (slice
+  // 0): validateReportForSubmit has just guaranteed every line is converted,
+  // so this is the true total the L2 threshold gate below compares against.
+  const baseCurrency = await getWorkspaceBaseCurrency(ws);
   const [agg] = await Expense.aggregate([
     { $match: { workspaceId: ws, reportId: rid } },
-    { $group: { _id: null, total: { $sum: { $ifNull: ["$amount", 0] } }, count: { $sum: 1 } } },
+    { $group: { _id: null, total: { $sum: amountBaseExpr(baseCurrency) }, count: { $sum: 1 } } },
   ]);
-  const totalAmount = agg?.total ?? 0;
+  const totalAmount = Math.round((agg?.total ?? 0) * 100) / 100;
   const expenseCount = agg?.count ?? 0;
 
   // L1 routing guard — a submitted claim must NEVER land with approverId=null.

@@ -48,6 +48,12 @@ import {
 const EDITABLE_STATUSES = new Set(["draft", "clarification_required"]);
 import Expense from "../models/Expense.js";
 import User from "../models/User.js";
+import {
+  amountBaseExpr,
+  pendingConversionExpr,
+  getWorkspaceBaseCurrency,
+  fxView,
+} from "../services/expenseFx.service.js";
 
 const router = express.Router();
 
@@ -89,17 +95,37 @@ async function loadReportAny(req: any, id: string) {
 }
 
 /** Per-report counts + totals, aggregated on read (no cached counts). */
+// Per-claim count + total. `amount` is the BASE-CURRENCY total (Σ amountBase,
+// slice 0 — audit F-19) and is round2'd here so it agrees with claimTotal()
+// in advanceSettlement.service (audit F-20). `pendingConversion` counts the
+// foreign lines that still have no rate — such a claim's total is partial and
+// the UI says so; the submit gate refuses it anyway.
 async function countsForReports(
   workspaceId: mongoose.Types.ObjectId,
   reportIds: mongoose.Types.ObjectId[],
-): Promise<Record<string, { count: number; amount: number }>> {
+  baseCurrency?: string,
+): Promise<Record<string, { count: number; amount: number; pendingConversion: number }>> {
   if (reportIds.length === 0) return {};
+  const base = baseCurrency || (await getWorkspaceBaseCurrency(workspaceId));
   const rows = await Expense.aggregate([
     { $match: { workspaceId, reportId: { $in: reportIds } } },
-    { $group: { _id: "$reportId", count: { $sum: 1 }, amount: { $sum: { $ifNull: ["$amount", 0] } } } },
+    {
+      $group: {
+        _id: "$reportId",
+        count: { $sum: 1 },
+        amount: { $sum: amountBaseExpr(base) },
+        pendingConversion: { $sum: pendingConversionExpr(base) },
+      },
+    },
   ]);
-  const out: Record<string, { count: number; amount: number }> = {};
-  for (const r of rows) out[String(r._id)] = { count: r.count || 0, amount: r.amount || 0 };
+  const out: Record<string, { count: number; amount: number; pendingConversion: number }> = {};
+  for (const r of rows) {
+    out[String(r._id)] = {
+      count: r.count || 0,
+      amount: round2(r.amount || 0),
+      pendingConversion: r.pendingConversion || 0,
+    };
+  }
   return out;
 }
 
@@ -145,9 +171,11 @@ router.get("/", async (req: any, res: any) => {
       .populate("employeeId", "firstName lastName email name")
       .sort({ createdAt: -1 })
       .lean();
+    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
     const counts = await countsForReports(
       req.workspaceObjectId,
       reports.map((r: any) => r._id),
+      baseCurrency,
     );
 
     const docs = reports.map((r: any) => {
@@ -157,11 +185,13 @@ router.get("/", async (req: any, res: any) => {
         employeeId: emp && typeof emp === "object" ? emp._id : emp,
         employeeName: employeeNameOf(emp),
         expenseCount: counts[String(r._id)]?.count ?? 0,
-        totalAmount: counts[String(r._id)]?.amount ?? 0,
+        totalAmount: counts[String(r._id)]?.amount ?? 0, // base currency
+        baseCurrency,
+        pendingConversion: counts[String(r._id)]?.pendingConversion ?? 0,
       };
     });
 
-    res.json({ ok: true, docs });
+    res.json({ ok: true, docs, baseCurrency });
   } catch (err: any) {
     console.error("[Reports GET list]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to list reports" });
@@ -260,6 +290,8 @@ const CLAIM_REPORT_COLUMNS: ClaimCol[] = [
   { key: "status", label: "Status" },
   { key: "expenses", label: "Expenses", type: "number" },
   { key: "total", label: "Total", money: true, type: "money" },
+  // Base currency the Total / Advance Applied / Net Payout columns are in.
+  { key: "currency", label: "Currency" },
   { key: "advanceApplied", label: "Advance Applied", money: true, type: "money" },
   { key: "netPayout", label: "Net Payout", money: true, type: "money" },
   { key: "advances", label: "Advances" },
@@ -329,8 +361,9 @@ router.get("/export", async (req: any, res: any) => {
     const reportObjIds = docs.map((r: any) => r._id);
     const reportIdSet = new Set(reportObjIds.map(String));
 
-    // ── Batched: per-claim counts + totals (one aggregation) ──
-    const counts = await countsForReports(req.workspaceObjectId, reportObjIds);
+    // ── Batched: per-claim counts + totals (one aggregation; base currency) ──
+    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
+    const counts = await countsForReports(req.workspaceObjectId, reportObjIds, baseCurrency);
 
     // ── Batched: employee names + emails (one lookup) ──
     const employeeIds = [
@@ -402,7 +435,7 @@ router.get("/export", async (req: any, res: any) => {
 
     const rows = docs.map((r: any) => {
       const id = String(r._id);
-      const c = counts[id] || { count: 0, amount: 0 };
+      const c = counts[id] || { count: 0, amount: 0, pendingConversion: 0 };
       const emp = employeeById.get(String(r.employeeId));
       const totalAmount = round2(c.amount);
       const appliedTotal = round2(appliedByReport.get(id) || 0);
@@ -421,6 +454,7 @@ router.get("/export", async (req: any, res: any) => {
         status: humanizeClaimStatus(r.status),
         expenses: c.count,
         total: totalAmount,
+        currency: baseCurrency,
         // Blank when no advance applied (reads clean; mirrors the expenses export).
         advanceApplied: appliedTotal ? appliedTotal : "",
         netPayout: round2(totalAmount - appliedTotal),
@@ -504,6 +538,7 @@ router.get("/:id", async (req: any, res: any) => {
       .sort({ date: -1, createdAt: -1 })
       .lean();
 
+    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
     const enriched = expenses.map((d: any) => {
       const cat = d.categoryId;
       return {
@@ -511,10 +546,17 @@ router.get("/:id", async (req: any, res: any) => {
         categoryId: cat && typeof cat === "object" ? cat._id : cat,
         categoryName: categoryNameOf(d),
         hasReceipt: !!d.imageKey,
+        ...fxView(d, baseCurrency), // amountBase / rate / conversionPending
       };
     });
 
-    const totalAmount = enriched.reduce((s, e) => s + (Number(e.amount) || 0), 0);
+    // Claim total in the BASE currency (slice 0). A conversion-pending line
+    // contributes 0 and is counted in pendingConversion so the total is never
+    // presented as complete while a rate is missing.
+    const totalAmount = round2(
+      enriched.reduce((s, e) => s + (Number(e.amountBase) || 0), 0),
+    );
+    const pendingConversion = enriched.filter((e) => e.conversionPending).length;
 
     // Resolve submitter + approver display names (small, two lookups).
     const [submitter, approver] = await Promise.all([
@@ -568,7 +610,9 @@ router.get("/:id", async (req: any, res: any) => {
       approverName: employeeNameOf(approver),
       approvalChain, // override the raw chain with the name-enriched one
       expenseCount: enriched.length,
-      totalAmount,
+      totalAmount, // base currency
+      baseCurrency,
+      pendingConversion,
       // ── Advance application (additive; empty/0 for a no-advance claim) ──
       appliedAdvances,
       advanceAppliedTotal: appliedTotal,

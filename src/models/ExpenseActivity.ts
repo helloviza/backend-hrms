@@ -23,6 +23,9 @@ export type ExpenseActivityEvent =
   | "expense_added"
   | "expense_removed"
   | "policy_check"
+  // FX slice 0: a manual / finance exchange-rate write on a line in this claim
+  // (PATCH /expenses/:id/rate). The note carries old → new rate + amountBase.
+  | "fx_rate_set"
   // ── Advance (System B) events — additive ──
   | "requested"
   | "disbursed"
@@ -44,6 +47,7 @@ export const EXPENSE_ACTIVITY_EVENTS: ExpenseActivityEvent[] = [
   "expense_added",
   "expense_removed",
   "policy_check",
+  "fx_rate_set",
   "requested",
   "disbursed",
   "advance_applied",

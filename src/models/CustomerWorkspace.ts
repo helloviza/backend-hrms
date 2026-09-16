@@ -99,6 +99,15 @@ export interface CustomerWorkspaceDocument extends Document {
     tokenExpiryHours: number;
     features: WorkspaceFeatures;
 
+    // Expense base currency (FX slice 0, 2026-09-16). The ONE currency every
+    // expense total, cap, threshold, report and analytics figure for this
+    // workspace is expressed in. Each Expense line freezes its conversion
+    // into this currency at entry (Expense.amountBase). ISO-4217, uppercase.
+    // Absent on every workspace created before this field existed → read as
+    // "INR" everywhere (schema default + services/expenseFx.service.ts), so
+    // no backfill is required for correctness.
+    baseCurrency?: string;
+
     // Expense approval escalation (Phase 2). null = OFF: claims route to a single
     // approver exactly as before. When set, a claim whose total EXCEEDS this
     // amount gets a second approval level appended at submit.
@@ -274,6 +283,10 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         requireProposal: { type: Boolean, default: true },
       },
       tokenExpiryHours: { type: Number, default: 12 },
+      // Expense base currency — SCHEMA DEFAULT "INR"; lean reads of legacy docs
+      // get the same default from getWorkspaceBaseCurrency(). Only changeable
+      // while the workspace has zero expenses (routes/expenseAdmin.ts).
+      baseCurrency: { type: String, trim: true, uppercase: true, default: "INR" },
       // Expense escalation threshold — null = OFF (single-approver, unchanged).
       expenseEscalationThreshold: { type: Number, default: null },
       seniorApproverId: { type: Schema.Types.ObjectId, ref: "User", default: null },

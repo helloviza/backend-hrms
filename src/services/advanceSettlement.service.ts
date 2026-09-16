@@ -22,6 +22,7 @@
 import mongoose from "mongoose";
 import ExpenseAdvance, { type IExpenseAdvance } from "../models/ExpenseAdvance.js";
 import Expense from "../models/Expense.js";
+import { amountBaseExpr, getWorkspaceBaseCurrency } from "./expenseFx.service.js";
 
 /** Round money to 2dp (kills float drift on sums/subtractions). */
 export function round2(n: number): number {
@@ -30,14 +31,18 @@ export function round2(n: number): number {
 
 const oid = (v: mongoose.Types.ObjectId | string) => new mongoose.Types.ObjectId(String(v));
 
-/** Claim total = Σ linked expense amounts (the same figure the lists/queues use). */
+/** Claim total = Σ linked expense amounts IN THE WORKSPACE BASE CURRENCY (the
+ *  same figure the lists/queues use). An earmark cap and a net payout are base-
+ *  currency figures, so a foreign-currency line contributes its frozen
+ *  amountBase, never its raw amount (audit F-19). */
 export async function claimTotal(
   workspaceId: mongoose.Types.ObjectId | string,
   reportId: mongoose.Types.ObjectId | string,
 ): Promise<number> {
+  const baseCurrency = await getWorkspaceBaseCurrency(workspaceId);
   const [agg] = await Expense.aggregate([
     { $match: { workspaceId: oid(workspaceId), reportId: oid(reportId) } },
-    { $group: { _id: null, total: { $sum: { $ifNull: ["$amount", 0] } } } },
+    { $group: { _id: null, total: { $sum: amountBaseExpr(baseCurrency) } } },
   ]);
   return round2(agg?.total ?? 0);
 }

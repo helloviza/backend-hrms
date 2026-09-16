@@ -20,14 +20,25 @@ import express from "express";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
 import multer from "multer";
-import { seesAll, userIdOf } from "../services/expense.access.js";
+import { seesAll, isFinance, userIdOf } from "../services/expense.access.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { csvRow } from "../utils/exportHelpers.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
 import { extractReceipt } from "../services/receiptExtractorGemini.js";
 import { createExpense } from "../services/expenses.service.js";
-import { propagateReportLifecycle } from "../services/reports.service.js";
+import { propagateReportLifecycle, logActivity } from "../services/reports.service.js";
+import {
+  amountBaseExpr,
+  pendingConversionExpr,
+  getWorkspaceBaseCurrency,
+  fxView,
+  manualFx,
+  normalizeCurrency,
+  isConversionPending,
+  round2,
+} from "../services/expenseFx.service.js";
+import { getLiveRate } from "../utils/exchangeRate.js";
 import { env } from "../config/env.js";
 import Expense from "../models/Expense.js";
 import ExpenseCategory from "../models/ExpenseCategory.js";
@@ -211,6 +222,14 @@ const EXPORT_COLUMNS: Col[] = [
   { key: "amount", label: "Amount", money: true, type: "money" },
   { key: "tax", label: "Tax", money: true, type: "money" },
   { key: "currency", label: "Currency" },
+  // ── Base-currency conversion (slice 0). Amount/Tax/Currency above stay the
+  // TRUE receipt; these are the frozen conversion every total is built from.
+  // Base Amount is blank while a foreign line is conversion-pending. ──
+  { key: "amountBase", label: "Base Amount", money: true, type: "money" },
+  { key: "baseCurrency", label: "Base Currency" },
+  { key: "exchangeRate", label: "Rate", type: "number" },
+  { key: "rateDate", label: "Rate Date" },
+  { key: "rateSource", label: "Rate Source" },
   { key: "gstin", label: "GSTIN" },
   { key: "status", label: "Status" },
   { key: "reimbursedOn", label: "Reimbursed On" },
@@ -269,8 +288,10 @@ function expenseToExportRow(
   >,
   // reportId → "ADV-… (₹…); …" — advances applied to that claim (preformatted).
   advancesByReport: Map<string, string>,
+  baseCurrency: string,
 ): Record<string, any> {
   const claim = d.reportId ? claimsById.get(String(d.reportId)) : null;
+  const fx = fxView(d, baseCurrency);
   return {
     date: fmtDate(d.date),
     employee: employeeNameOf(d.employeeId),
@@ -279,6 +300,11 @@ function expenseToExportRow(
     amount: d.amount ?? 0,
     tax: d.taxAmount ?? 0,
     currency: d.currency || "",
+    amountBase: fx.amountBase ?? "",
+    baseCurrency: fx.baseCurrency,
+    exchangeRate: fx.exchangeRate ?? "",
+    rateDate: fx.rateDate || "",
+    rateSource: fx.conversionPending ? "pending" : fx.rateSource || "",
     gstin: d.gstin || "",
     status: humanizeLifecycle(d.lifecycleStatus), // user-facing lifecycle, not record-state
     // reimbursedAt of the claim this expense sits in; blank unless reimbursed.
@@ -331,6 +357,7 @@ router.get("/", async (req: any, res: any) => {
       Expense.countDocuments(filter),
     ]);
 
+    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
     const enriched = docs.map((d: any) => {
       const emp = d.employeeId;
       const cat = d.categoryId;
@@ -341,10 +368,11 @@ router.get("/", async (req: any, res: any) => {
         categoryId: cat && typeof cat === "object" ? cat._id : cat,
         categoryName: categoryNameOf(d), // managed name ?? AI hint (legacy)
         hasReceipt: !!d.imageKey,
+        ...fxView(d, baseCurrency), // amountBase / rate / conversionPending
       };
     });
 
-    res.json({ ok: true, docs: enriched, total, page, pages: Math.ceil(total / limit) });
+    res.json({ ok: true, docs: enriched, total, page, pages: Math.ceil(total / limit), baseCurrency });
   } catch (err: any) {
     console.error("[Expenses GET list]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to list expenses" });
@@ -368,6 +396,7 @@ router.get("/export", async (req: any, res: any) => {
     const format =
       req.query.format === "xlsx" ? "xlsx" : req.query.format === "csv" ? "csv" : "json";
     const filter = await buildExpenseFilter(req);
+    const exportBaseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
 
     // JSON is paged; file exports carry the FULL filtered set (unchanged).
     const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
@@ -420,7 +449,7 @@ router.get("/export", async (req: any, res: any) => {
         // reimbursedAmount is null (no-advance / pre-P2).
         Expense.aggregate([
           { $match: { workspaceId: req.workspaceObjectId, reportId: { $in: reportObjIds } } },
-          { $group: { _id: "$reportId", total: { $sum: { $ifNull: ["$amount", 0] } } } },
+          { $group: { _id: "$reportId", total: { $sum: amountBaseExpr(exportBaseCurrency) } } },
         ]),
       ]);
       const totalByReport = new Map<string, number>();
@@ -467,7 +496,9 @@ router.get("/export", async (req: any, res: any) => {
       partsByReport.forEach((parts, rid) => advancesByReport.set(rid, parts.join("; ")));
     }
 
-    const rows = docs.map((d: any) => expenseToExportRow(d, claimsById, advancesByReport));
+    const rows = docs.map((d: any) =>
+      expenseToExportRow(d, claimsById, advancesByReport, exportBaseCurrency),
+    );
 
     // JSON (shared report contract) — same columns + rows, paginated.
     if (format === "json") {
@@ -553,12 +584,24 @@ router.get("/summary", async (req: any, res: any) => {
     const monthStartStr = `${nowIst.getUTCFullYear()}-${String(nowIst.getUTCMonth() + 1).padStart(2, "0")}-01`;
     const monthStart = parseISTStart(monthStartStr);
 
-    const sumAmount = { $sum: { $ifNull: ["$amount", 0] } };
+    // Base-currency sums (slice 0): a foreign line contributes its frozen
+    // amountBase; a conversion-pending one contributes 0 and is counted.
+    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
+    const sumAmount = { $sum: amountBaseExpr(baseCurrency) };
     const [agg] = await Expense.aggregate([
       { $match: match },
       {
         $facet: {
-          totals: [{ $group: { _id: null, count: { $sum: 1 }, amount: sumAmount } }],
+          totals: [
+            {
+              $group: {
+                _id: null,
+                count: { $sum: 1 },
+                amount: sumAmount,
+                pendingConversion: { $sum: pendingConversionExpr(baseCurrency) },
+              },
+            },
+          ],
           byStatus: [
             {
               $group: {
@@ -601,8 +644,13 @@ router.get("/summary", async (req: any, res: any) => {
     res.json({
       ok: true,
       summary: {
-        total: { count: totals.count || 0, amount: totals.amount || 0 },
-        month: { count: month.count || 0, amount: month.amount || 0, since: monthStartStr },
+        baseCurrency,
+        total: {
+          count: totals.count || 0,
+          amount: round2(totals.amount || 0),
+          pendingConversion: totals.pendingConversion || 0,
+        },
+        month: { count: month.count || 0, amount: round2(month.amount || 0), since: monthStartStr },
         byStatus,
       },
     });
@@ -658,7 +706,9 @@ router.get("/analytics", async (req: any, res: any) => {
     const rangeStart = parseISTStart(dateFromStr);
     const rangeEnd = parseISTEnd(dateToStr);
 
-    const sumAmount = { $sum: { $ifNull: ["$amount", 0] } };
+    // Base-currency sums (slice 0) — see /summary.
+    const baseCurrency = await getWorkspaceBaseCurrency(workspaceId);
+    const sumAmount = { $sum: amountBaseExpr(baseCurrency) };
     const expMatch = {
       workspaceId,
       date: { $gte: rangeStart, $lte: rangeEnd },
@@ -703,7 +753,16 @@ router.get("/analytics", async (req: any, res: any) => {
       },
       {
         $facet: {
-          totals: [{ $group: { _id: null, amount: sumAmount, count: { $sum: 1 } } }],
+          totals: [
+            {
+              $group: {
+                _id: null,
+                amount: sumAmount,
+                count: { $sum: 1 },
+                pendingConversion: { $sum: pendingConversionExpr(baseCurrency) },
+              },
+            },
+          ],
           byMonthCat: [
             {
               $group: {
@@ -844,32 +903,20 @@ router.get("/analytics", async (req: any, res: any) => {
      * range (unlike every other block): finance needs the full current
      * outstanding liability, not just claims approved within the window. The
      * card is labelled "as of now" on the frontend to make this explicit. */
-    const [awaitAgg] = await Report.aggregate([
-      {
-        $match: {
-          workspaceId,
-          status: "approved",
-        },
-      },
-      {
-        $lookup: {
-          from: Expense.collection.name,
-          localField: "_id",
-          foreignField: "reportId",
-          as: "_exp",
-        },
-      },
-      {
-        $group: {
-          _id: null,
-          count: { $sum: 1 },
-          amount: { $sum: { $sum: "$_exp.amount" } },
-        },
-      },
-    ]);
+    // Two steps instead of the old $lookup + $sum("$_exp.amount"): the base-
+    // currency expression needs the LINE as the aggregation root.
+    const approvedIds = (
+      await Report.find({ workspaceId, status: "approved" }).select("_id").lean()
+    ).map((r: any) => r._id);
+    const [awaitAgg] = approvedIds.length
+      ? await Expense.aggregate([
+          { $match: { workspaceId, reportId: { $in: approvedIds } } },
+          { $group: { _id: null, amount: sumAmount } },
+        ])
+      : [null];
     const awaitingReimbursement = {
-      amount: awaitAgg?.amount || 0,
-      count: awaitAgg?.count || 0,
+      amount: round2(awaitAgg?.amount || 0),
+      count: approvedIds.length,
     };
 
     /* ── Block 4: cycle times + policy-flag rate (ExpenseActivity) ─────── */
@@ -943,9 +990,11 @@ router.get("/analytics", async (req: any, res: any) => {
     res.json({
       ok: true,
       range: { dateFrom: dateFromStr, dateTo: dateToStr },
+      baseCurrency,
       kpis: {
-        totalSpend: totals.amount || 0,
+        totalSpend: round2(totals.amount || 0),
         totalCount: totals.count || 0,
+        pendingConversion: totals.pendingConversion || 0,
         awaitingReimbursement,
         avgApprovalDays,
         policyFlagRate,
@@ -966,6 +1015,154 @@ router.get("/analytics", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[Expenses analytics]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load analytics" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /api/expenses/fx-rate?currency=USD
+ * Live rate PRE-FILL for the manual-rate form (a conversion-pending line, or a
+ * finance correction): base-currency units per 1 unit of `currency`, via the
+ * same ExchangeRate-API lookup entry freezes with. Never fails hard — on any
+ * lookup failure responds { ok: true, rate: null } so the form falls back to
+ * typing the rate. Declared BEFORE /:id so ":id" never captures "fx-rate".
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/fx-rate", async (req: any, res: any) => {
+  try {
+    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
+    const currency = normalizeCurrency(req.query?.currency);
+    if (!currency) return res.status(400).json({ error: "currency must be a 3-letter ISO code" });
+    const live = await getLiveRate(currency, baseCurrency);
+    if (!live) return res.json({ ok: true, baseCurrency, currency, rate: null });
+    res.json({ ok: true, baseCurrency, currency, rate: live.rate, date: live.date });
+  } catch (err: any) {
+    console.error("[Expenses fx-rate]", err?.message);
+    res.json({ ok: true, rate: null });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * PATCH /api/expenses/:id/rate  { exchangeRate, rateDate?, reason? }
+ * The ONLY way amountBase changes after entry. Two callers:
+ *   • the OWNER, to resolve a CONVERSION-PENDING line (live lookup failed at
+ *     entry) while the line is still theirs to edit (pending_to_submit /
+ *     clarification_required);
+ *   • FINANCE (or an expense admin), to CORRECT a wrong frozen rate on any line
+ *     that has not been paid out yet — a deliberate, logged edit, never an
+ *     automatic recompute. Refused (409) once the claim is reimbursed: the
+ *     payout was made on the old figure and the record must keep saying so.
+ * Either way the stored rate becomes "manual" with who/when, the previous
+ * values stay in rateHistory, and the claim timeline gets an entry when the
+ * line sits in a claim. `amount`/`currency` (the receipt) are never touched.
+ * ───────────────────────────────────────────────────────────────────── */
+router.patch("/:id/rate", async (req: any, res: any) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(404).json({ error: "Expense not found" });
+    }
+    const b = req.body || {};
+    const rate = Number(b.exchangeRate);
+    if (!Number.isFinite(rate) || rate <= 0) {
+      return res.status(400).json({ error: "exchangeRate must be a positive number" });
+    }
+    const rateDate = b.rateDate ? String(b.rateDate).trim() : null;
+    if (rateDate && !/^\d{4}-\d{2}-\d{2}$/.test(rateDate)) {
+      return res.status(400).json({ error: "rateDate must be YYYY-MM-DD" });
+    }
+    const reason = String(b.reason || "").trim() || null;
+
+    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
+    const finance = isFinance(req.user);
+
+    // Scope: own rows for everyone; finance/admin see the whole workspace
+    // (buildExpenseFilter already widens for seesAll). Routed-claim visibility
+    // is read-only and must not confer a rate write.
+    const filter = await buildExpenseFilter(req, { includeRoutedClaims: false });
+    filter._id = new mongoose.Types.ObjectId(id);
+    const expense: any = await Expense.findOne(filter);
+    if (!expense) return res.status(404).json({ error: "Expense not found" });
+
+    const currency = normalizeCurrency(expense.currency) || baseCurrency;
+    if (currency === baseCurrency) {
+      return res.status(400).json({ error: `This expense is already in ${baseCurrency} — no conversion to set.` });
+    }
+
+    const pending = isConversionPending(expense, baseCurrency);
+    const lifecycle = expense.lifecycleStatus || "pending_to_submit";
+    if (lifecycle === "reimbursed") {
+      return res.status(409).json({
+        error: "This expense has been reimbursed — its exchange rate is final.",
+      });
+    }
+    if (!finance) {
+      // Owner: resolve a pending line while it is still editable. Corrections
+      // of an already-frozen rate are finance's call, not the claimant's.
+      if (!pending) {
+        return res.status(403).json({
+          error: "Only finance can change a rate that is already set. Ask finance to correct it.",
+        });
+      }
+      if (lifecycle !== "pending_to_submit" && lifecycle !== "clarification_required") {
+        return res.status(409).json({ error: "This expense is no longer editable." });
+      }
+    }
+
+    const previous = {
+      exchangeRate: expense.exchangeRate ?? null,
+      amountBase: expense.amountBase ?? null,
+      rateSource: expense.rateSource ?? null,
+    };
+    const fx = manualFx({ amount: Number(expense.amount), exchangeRate: rate, rateDate, baseCurrency });
+    const me = new mongoose.Types.ObjectId(ownEmployeeId(req));
+    const now = new Date();
+    const historyReason =
+      reason ||
+      (pending ? "Manual rate — live lookup unavailable at entry" : "Finance correction of frozen rate");
+
+    expense.exchangeRate = fx.exchangeRate;
+    expense.rateDate = fx.rateDate;
+    expense.rateSource = "manual";
+    expense.amountBase = fx.amountBase;
+    expense.baseCurrency = fx.baseCurrency;
+    expense.rateEnteredBy = me;
+    expense.rateEnteredAt = now;
+    expense.rateHistory = [
+      ...(Array.isArray(expense.rateHistory) ? expense.rateHistory : []),
+      {
+        exchangeRate: fx.exchangeRate,
+        rateDate: fx.rateDate,
+        rateSource: "manual",
+        amountBase: fx.amountBase,
+        setBy: me,
+        setAt: now,
+        reason: historyReason,
+      },
+    ];
+    await expense.save();
+
+    // Claim timeline (only when the line is in a claim — a loose line has just
+    // the on-document history). Non-fatal, like every logActivity call.
+    if (expense.reportId) {
+      const from =
+        previous.amountBase != null
+          ? `${previous.rateSource || "rate"} ${previous.exchangeRate} → ${baseCurrency} ${previous.amountBase}`
+          : "pending";
+      await logActivity({
+        workspaceId: req.workspaceObjectId,
+        reportId: expense.reportId,
+        expenseId: expense._id,
+        event: "fx_rate_set",
+        actorId: me,
+        actorName: employeeNameOf(req.user) || String(req.user?.email || "User"),
+        note: `${pending ? "Exchange rate set" : "Exchange rate corrected"} on ${expense.ref}: ${currency} ${expense.amount} × ${rate} = ${baseCurrency} ${fx.amountBase} (was ${from})${reason ? ` — ${reason}` : ""}`,
+      });
+    }
+
+    const doc: any = expense.toObject();
+    res.json({ ok: true, expense: { ...doc, ...fxView(doc, baseCurrency) } });
+  } catch (err: any) {
+    console.error("[Expenses PATCH rate]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to set exchange rate" });
   }
 });
 
@@ -1048,6 +1245,7 @@ router.get("/:id", async (req: any, res: any) => {
         categoryId: cat && typeof cat === "object" ? cat._id : cat,
         categoryName: categoryNameOf(doc),
         hasReceipt: !!doc.imageKey,
+        ...fxView(doc, await getWorkspaceBaseCurrency(req.workspaceObjectId)),
       },
     });
   } catch (err: any) {
@@ -1116,6 +1314,7 @@ router.patch("/:id", async (req: any, res: any) => {
         categoryId: cat && typeof cat === "object" ? cat._id : cat,
         categoryName: categoryNameOf(updated),
         hasReceipt: !!updated.imageKey,
+        ...fxView(updated, await getWorkspaceBaseCurrency(req.workspaceObjectId)),
       },
     });
   } catch (err: any) {
@@ -1212,6 +1411,13 @@ router.post("/", async (req: any, res: any) => {
     const b = req.body || {};
     if (b.amount == null || Number.isNaN(Number(b.amount))) {
       return res.status(400).json({ error: "amount is required" });
+    }
+    // A typed/extracted currency must be an ISO-4217 code — anything else
+    // would silently be read as the workspace base (createExpense's fallback),
+    // which is exactly the currency-blindness this slice removes. Empty is
+    // fine (= base).
+    if (b.currency != null && String(b.currency).trim() !== "" && !normalizeCurrency(b.currency)) {
+      return res.status(400).json({ error: "currency must be a 3-letter ISO code (e.g. INR, USD)" });
     }
 
     const imageKey = b.imageKey ? String(b.imageKey) : undefined;

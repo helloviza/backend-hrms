@@ -27,6 +27,8 @@ import { isAdmin, isFinance, userIdOf } from "../services/expense.access.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
+import Expense from "../models/Expense.js";
+import { getWorkspaceBaseCurrency, normalizeCurrency } from "../services/expenseFx.service.js";
 
 const router = express.Router();
 
@@ -257,9 +259,16 @@ router.get("/policy", async (req: any, res: any) => {
     const ws: any = await CustomerWorkspace.findById(req.workspaceObjectId)
       .select("config.expenseEscalationThreshold config.seniorApproverId config.advanceEscalationThreshold")
       .lean();
+    // baseCurrency (slice 0) is the unit of both thresholds below. It can only
+    // be changed while the workspace has no expenses (see PATCH), so the
+    // response also says whether it is still editable.
+    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
+    const expenseCount = await Expense.countDocuments({ workspaceId: req.workspaceObjectId });
     res.json({
       ok: true,
       policy: {
+        baseCurrency,
+        baseCurrencyLocked: expenseCount > 0,
         expenseEscalationThreshold: ws?.config?.expenseEscalationThreshold ?? null,
         seniorApproverId: ws?.config?.seniorApproverId ? String(ws.config.seniorApproverId) : null,
         advanceEscalationThreshold: ws?.config?.advanceEscalationThreshold ?? null,
@@ -281,6 +290,28 @@ router.patch("/policy", async (req: any, res: any) => {
   try {
     const b = req.body || {};
     const update: Record<string, any> = {};
+
+    // Base currency (slice 0): ISO-4217, and ONLY while no expense exists —
+    // every stored amountBase is frozen in the old base, so a later switch
+    // would silently mis-state every total. Not a migration path; a workspace
+    // that needs to change base after capturing expenses is a separate task.
+    if ("baseCurrency" in b) {
+      const next = normalizeCurrency(b.baseCurrency);
+      if (!next) {
+        return res.status(400).json({ error: "baseCurrency must be a 3-letter ISO code (e.g. INR, USD)." });
+      }
+      const current = await getWorkspaceBaseCurrency(req.workspaceObjectId);
+      if (next !== current) {
+        const n = await Expense.countDocuments({ workspaceId: req.workspaceObjectId });
+        if (n > 0) {
+          return res.status(409).json({
+            error: `Base currency is locked at ${current}: this workspace already has ${n} expense${n === 1 ? "" : "s"} converted into it.`,
+            code: "BASE_CURRENCY_LOCKED",
+          });
+        }
+        update["config.baseCurrency"] = next;
+      }
+    }
 
     if ("expenseEscalationThreshold" in b) {
       const raw = b.expenseEscalationThreshold;
@@ -333,26 +364,33 @@ router.patch("/policy", async (req: any, res: any) => {
     }
 
     if (Object.keys(update).length === 0) {
-      return res
-        .status(400)
-        .json({
+      // A baseCurrency equal to the current one is a legitimate no-op PATCH.
+      if (!("baseCurrency" in b)) {
+        return res.status(400).json({
           error:
-            "Nothing to change (pass expenseEscalationThreshold, advanceEscalationThreshold and/or seniorApproverId).",
+            "Nothing to change (pass baseCurrency, expenseEscalationThreshold, advanceEscalationThreshold and/or seniorApproverId).",
         });
+      }
     }
 
-    const ws: any = await CustomerWorkspace.findOneAndUpdate(
-      { _id: req.workspaceObjectId },
-      { $set: update },
-      { new: true },
-    )
-      .select("config.expenseEscalationThreshold config.seniorApproverId config.advanceEscalationThreshold")
-      .lean();
+    const ws: any = Object.keys(update).length
+      ? await CustomerWorkspace.findOneAndUpdate(
+          { _id: req.workspaceObjectId },
+          { $set: update },
+          { new: true },
+        )
+          .select("config.expenseEscalationThreshold config.seniorApproverId config.advanceEscalationThreshold config.baseCurrency")
+          .lean()
+      : await CustomerWorkspace.findById(req.workspaceObjectId)
+          .select("config.expenseEscalationThreshold config.seniorApproverId config.advanceEscalationThreshold config.baseCurrency")
+          .lean();
     if (!ws) return res.status(404).json({ error: "Workspace not found" });
 
     res.json({
       ok: true,
       policy: {
+        baseCurrency: normalizeCurrency(ws?.config?.baseCurrency) || "INR",
+        baseCurrencyLocked: (await Expense.countDocuments({ workspaceId: req.workspaceObjectId })) > 0,
         expenseEscalationThreshold: ws?.config?.expenseEscalationThreshold ?? null,
         seniorApproverId: ws?.config?.seniorApproverId ? String(ws.config.seniorApproverId) : null,
         advanceEscalationThreshold: ws?.config?.advanceEscalationThreshold ?? null,
