@@ -23,6 +23,9 @@ import { expenseAdminUserIds, withGrants } from "./expenseGrants.service.js";
 import { appendActivity, lineSnapshot, msBetween } from "./expenseAudit.service.js";
 import { SYSTEM_ACTOR, type ExpenseActorType } from "../models/ExpenseActivity.js";
 import { getPolicy } from "./expensePolicy.service.js";
+import { routeClaim, type RoutingDecision } from "./expenseRouting.service.js";
+import { buildRoutingInput } from "./expenseRoutingInput.service.js";
+import { APPROVAL_BOT_ACTOR } from "../models/ExpenseActivity.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import {
   amountBaseExpr,
@@ -803,32 +806,128 @@ export async function submitReport(
   // threshold is set and this claim's total exceeds it; with the threshold OFF
   // the chain is length 1 and this stamps exactly as before. approverId is the
   // L1 (current pending) approver — the denorm pointer the queues already read.
-  const { chain, approverId, approver, routing } = await resolveApprovalChain(ws, emp, totalAmount, baseCurrency);
-  if (!approverId) {
-    return {
-      ok: false,
-      reason: "blocking",
-      blocking: [
-        "No approver available — set a manager for this employee, or add an admin to the workspace.",
-      ],
-      warnings,
-    };
+  //
+  // ── THE ENGINE SWITCH (approval-engine sub-step 5) ──────────────────────
+  // Branch on the workspace policy's engine master switch. OFF (the default,
+  // and every workspace today) → the legacy manager → admin path below,
+  // unchanged. ON → routeClaim(), the SAME pure function the simulator runs,
+  // on the claim's base total / department / categories / pre-checks, and the
+  // chain is built from its result. Only claims submitted AFTER the switch is
+  // on go through here; an in-flight claim keeps the chain it already has
+  // (nothing re-routes it).
+  const policy = await getPolicy(ws);
+  let chain: IApprovalChainLevel[];
+  let approverId: mongoose.Types.ObjectId | null;
+  let approver: any;
+  let routing: Record<string, any>;
+  let engineDecision: RoutingDecision | null = null;
+
+  if (policy.engineEnabled) {
+    const built = await buildRoutingInput({ workspaceId: ws, kind: "claim", reportId: String(rid) });
+    if (built.error || !built.input) {
+      return { ok: false, reason: "blocking", blocking: [built.error || "Could not route this claim."], warnings };
+    }
+    engineDecision = routeClaim(built.input);
+    routing = engineDecision;
+
+    // Nobody can approve this amount. Every top-of-chain mode presupposes a
+    // pool with at least one limit; with none (NO_APPROVER), or when the
+    // policy is REFUSE_SUBMIT, the claim stays a draft with a clear message —
+    // never silently accepted, never stranded.
+    if (engineDecision.outcome === "NO_APPROVER" || engineDecision.outcome === "REFUSE") {
+      return {
+        ok: false,
+        reason: "blocking",
+        blocking: [
+          engineDecision.outcome === "REFUSE"
+            ? `No approver is configured who can approve this amount (${baseCurrency} ${engineDecision.requiredLimitBase}) — contact your admin.`
+            : "No approver is configured who can approve this amount — contact your admin.",
+        ],
+        warnings,
+      };
+    }
+
+    const now = new Date();
+    if (engineDecision.outcome === "BOT_AUTO_APPROVE") {
+      // The bot is a real chain level, already decided.
+      chain = [
+        {
+          level: 1,
+          approverId: null,
+          status: "approved",
+          decidedAt: now,
+          note: engineDecision.bot.reason,
+          actorType: "bot",
+          via: "bot",
+          routedAt: now,
+          heldMs: 0,
+          overLimit: false,
+          limitBase: engineDecision.bot.thresholdBase ?? null,
+        },
+      ];
+      approverId = null;
+      approver = null;
+    } else {
+      chain = engineDecision.chain.map((c, i) => ({
+        level: c.level,
+        approverId: c.approverId ? new mongoose.Types.ObjectId(c.approverId) : null,
+        status: "pending" as const,
+        decidedAt: null,
+        note: null,
+        actorType: "user" as const,
+        via: c.via,
+        routedAt: i === 0 ? now : null, // later levels start their clock when the previous one approves
+        heldMs: null,
+        overLimit: !!c.overLimit,
+        limitBase: c.limitBase ?? null,
+      }));
+      approverId = chain[0]?.approverId ?? null;
+      if (!approverId) {
+        return { ok: false, reason: "blocking", blocking: ["No approver is configured who can approve this amount — contact your admin."], warnings };
+      }
+      approver = await User.findById(approverId).select(APPROVER_USER_FIELDS).lean();
+    }
+  } else {
+    // ── Legacy path — untouched ──
+    const legacy = await resolveApprovalChain(ws, emp, totalAmount, baseCurrency);
+    chain = legacy.chain;
+    approverId = legacy.approverId;
+    approver = legacy.approver;
+    routing = legacy.routing;
+    if (!approverId) {
+      return {
+        ok: false,
+        reason: "blocking",
+        blocking: [
+          "No approver available — set a manager for this employee, or add an admin to the workspace.",
+        ],
+        warnings,
+      };
+    }
   }
+
   // A submit after a withdraw is a round-trip worth marking on the trail.
   const priorWithdraws = await ExpenseActivity.countDocuments({ workspaceId: ws, reportId: rid, event: "withdrawn" });
   const priorSubmits = await ExpenseActivity.countDocuments({ workspaceId: ws, reportId: rid, event: { $in: ["submitted", "resubmitted"] } });
 
+  const botApproved = engineDecision?.outcome === "BOT_AUTO_APPROVE";
   report.approvalChain = chain;
   report.currentLevel = 1;
   report.approverId = approverId;
-  report.status = "submitted";
   report.submittedAt = new Date();
   report.decisionNote = null;
   report.selfApproved = false;
   report.routing = routing;
+  if (botApproved) {
+    // Straight to approved — the bot decided at submit; finance picks it up.
+    report.status = "approved";
+    report.approvedAt = report.submittedAt;
+  } else {
+    report.status = "submitted";
+  }
   await report.save();
 
-  await propagateReportLifecycle(ws, rid, "submitted");
+  await propagateReportLifecycle(ws, rid, botApproved ? "approved" : "submitted");
 
   // Audit (sub-step 2): the submission carries the base total and EVERY line's
   // original + converted amount; then the routing decision as a system entry;
@@ -862,11 +961,33 @@ export async function submitReport(
     actorId: null,
     actorName: "Routing",
     actorType: "system",
-    note: routing.chosen
-      .map((c: any) => `L${c.level} → ${c.name || c.userId} (${String(c.via).replace(/_/g, " ")})`)
-      .join(" · "),
+    note: engineDecision
+      ? engineDecision.explain.join(" ")
+      : routing.chosen
+          .map((c: any) => `L${c.level} → ${c.name || c.userId} (${String(c.via).replace(/_/g, " ")})`)
+          .join(" · "),
     details: routing,
   });
+  if (botApproved && engineDecision) {
+    await logActivity({
+      workspaceId: ws,
+      reportId: rid,
+      event: "auto_approved",
+      actorId: APPROVAL_BOT_ACTOR.actorId,
+      actorName: APPROVAL_BOT_ACTOR.actorName,
+      actorType: APPROVAL_BOT_ACTOR.actorType,
+      heldMs: 0,
+      note: `Auto-approved: ${engineDecision.bot.reason}`,
+      details: {
+        thresholdBase: engineDecision.bot.thresholdBase,
+        amountBase: engineDecision.amountBase,
+        baseCurrency,
+        checks: engineDecision.bot.checks,
+        policyVersion: engineDecision.policyVersion,
+        final: true,
+      },
+    });
+  }
   for (const w of warnings) {
     await logActivity({
       workspaceId: ws,
@@ -878,12 +999,13 @@ export async function submitReport(
     });
   }
 
-  const approverName = employeeNameOf(approver);
+  const approverName = botApproved ? APPROVAL_BOT_ACTOR.actorName : employeeNameOf(approver);
 
   // Approver email — non-fatal: log and continue, never block the submit. When
   // there's no approver email (no manager + no admin, or SMTP off) the in-app
-  // approvals badge remains the notice.
-  if (approver?.email) {
+  // approvals badge remains the notice. A bot-approved claim has no approver
+  // to notify.
+  if (!botApproved && approver?.email) {
     try {
       const submitter: any = await User.findById(emp).select("firstName lastName name email").lean();
       await sendClaimSubmittedEmail({

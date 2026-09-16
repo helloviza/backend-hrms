@@ -590,10 +590,18 @@ router.get("/:id", async (req: any, res: any) => {
     const approvalChain = rawChain.map((l: any) => ({
       level: l.level,
       approverId: l.approverId ? String(l.approverId) : null,
-      approverName: l.approverId ? chainNameById.get(String(l.approverId)) || "" : "",
+      // A bot level has no user — name it for the stepper (engine, sub-step 5).
+      approverName: l.approverId ? chainNameById.get(String(l.approverId)) || "" : l.actorType === "bot" ? "Approval Bot" : "",
       status: l.status,
       decidedAt: l.decidedAt ?? null,
       note: l.note ?? null,
+      // Audit / engine plumbing (sub-steps 2 + 5)
+      actorType: l.actorType ?? "user",
+      via: l.via ?? null,
+      routedAt: l.routedAt ?? null,
+      heldMs: l.heldMs ?? null,
+      overLimit: !!l.overLimit,
+      limitBase: l.limitBase ?? null,
     }));
 
     // Advances (Phase 2) applied to this claim — earmarked or settled — plus the
