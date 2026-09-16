@@ -738,32 +738,36 @@ app.use("/api/v1/workspace", expenseBandsRouter);
 // Expense Management — read API + export (Sprint 3a). Tenant-scoped; role-gated
 // in-handler (Finance/Admin see all workspace expenses, others see own).
 import expensesRouter from "./routes/expenses.js";
-app.use("/api/expenses", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expensesRouter);
+// Approval-engine sub-step 1: expense capabilities live in the per-person
+// grant store; this loads the caller's grant once per request onto req.user
+// so expense.access.ts's synchronous predicates can read it.
+import { attachExpenseGrant } from "./services/expenseGrants.service.js";
+app.use("/api/expenses", requireAuth, requireWorkspace, attachExpenseGrant, requireFeature("expensesEnabled"), expensesRouter);
 
 // Expense categories (Layer 1) — tenant-scoped managed category list.
 import expenseCategoriesRouter from "./routes/expenseCategories.js";
-app.use("/api/expense-categories", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseCategoriesRouter);
+app.use("/api/expense-categories", requireAuth, requireWorkspace, attachExpenseGrant, requireFeature("expensesEnabled"), expenseCategoriesRouter);
 
 // Expense reports (Layer 2) — tenant-scoped; owner-only mutations, admin-all reads.
 import expenseReportsRouter from "./routes/expenseReports.js";
-app.use("/api/reports", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseReportsRouter);
+app.use("/api/reports", requireAuth, requireWorkspace, attachExpenseGrant, requireFeature("expensesEnabled"), expenseReportsRouter);
 
 // Expense administration — the assignment surface (capabilities + manager).
 // Tenant-scoped; expense-Admin-gated in-router (isAdmin from expense.access).
 import expenseAdminRouter from "./routes/expenseAdmin.js";
-app.use("/api/expense-admin", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseAdminRouter);
+app.use("/api/expense-admin", requireAuth, requireWorkspace, attachExpenseGrant, requireFeature("expensesEnabled"), expenseAdminRouter);
 
 // Expense advances (System B) — cash advances, a peer of claims. Gated behind
 // BOTH expensesEnabled AND advancesEnabled (requireExpenseAdvancesFeature runs
 // the expenses check first, then the advances opt-in).
 import expenseAdvancesRouter from "./routes/expenseAdvances.js";
 import { requireExpenseAdvancesFeature } from "./middleware/requireFeature.js";
-app.use("/api/expense-advances", requireAuth, requireWorkspace, requireExpenseAdvancesFeature, expenseAdvancesRouter);
+app.use("/api/expense-advances", requireAuth, requireWorkspace, attachExpenseGrant, requireExpenseAdvancesFeature, expenseAdvancesRouter);
 
 // Reports hub (Activity Logs report) — fused claim+advance audit stream on the
 // shared report contract. Tenant-scoped; seesAll (finance/admin) gated in-router.
 import expenseActivityRouter from "./routes/expenseActivity.js";
-app.use("/api/expense-activity", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expenseActivityRouter);
+app.use("/api/expense-activity", requireAuth, requireWorkspace, attachExpenseGrant, requireFeature("expensesEnabled"), expenseActivityRouter);
 
 // CSTEP Travel & Claim Portal (Phase 3) — pre-trip travel request form.
 // Tenant-scoped via req.workspaceObjectId in-router; owner-only mutations.

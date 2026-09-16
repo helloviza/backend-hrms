@@ -32,6 +32,7 @@ const { requireAuth } = await import("../middleware/auth.js");
 const { requireWorkspace } = await import("../middleware/requireWorkspace.js");
 const { requireFeature, requireExpenseAdvancesFeature } = await import("../middleware/requireFeature.js");
 const { signToken } = await import("../utils/jwt.js");
+const { attachExpenseGrant, upsertGrant } = await import("../services/expenseGrants.service.js");
 const { default: CustomerWorkspace } = await import("../models/CustomerWorkspace.js");
 const { default: User } = await import("../models/User.js");
 const { default: Expense } = await import("../models/Expense.js");
@@ -53,10 +54,10 @@ beforeAll(async () => {
   app = express();
   app.use(express.json({ limit: "2mb" }));
   app.use(cookieParser());
-  app.use("/api/expenses", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expensesRouter);
-  app.use("/api/reports", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), reportsRouter);
-  app.use("/api/expense-admin", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), adminRouter);
-  app.use("/api/expense-advances", requireAuth, requireWorkspace, requireExpenseAdvancesFeature, advancesRouter);
+  app.use("/api/expenses", requireAuth, requireWorkspace, attachExpenseGrant, requireFeature("expensesEnabled"), expensesRouter);
+  app.use("/api/reports", requireAuth, requireWorkspace, attachExpenseGrant, requireFeature("expensesEnabled"), reportsRouter);
+  app.use("/api/expense-admin", requireAuth, requireWorkspace, attachExpenseGrant, requireFeature("expensesEnabled"), adminRouter);
+  app.use("/api/expense-advances", requireAuth, requireWorkspace, attachExpenseGrant, requireExpenseAdvancesFeature, advancesRouter);
 }, 120_000);
 
 afterAll(async () => {
@@ -114,8 +115,11 @@ async function makeTeam(wsOverrides: Record<string, any> = {}) {
   const wsId = await makeWorkspace(wsOverrides);
   const manager = await makeUser(wsId, ["MANAGER"]);
   const employee = await makeUser(wsId, ["EMPLOYEE"], { managerId: manager.id });
-  const finance = await makeUser(wsId, ["FINANCE"]);
-  const admin = await makeUser(wsId, ["ADMIN"]);
+  // Finance / expense-admin are GRANTS now (approval-engine sub-step 1), not role tokens.
+  const finance = await makeUser(wsId, ["EMPLOYEE"]);
+  await upsertGrant({ workspaceId: wsId, userId: finance.id, patch: { finance: true } });
+  const admin = await makeUser(wsId, ["EMPLOYEE"]);
+  await upsertGrant({ workspaceId: wsId, userId: admin.id, patch: { expenseAdmin: true } });
   return { wsId, employee, manager, finance, admin };
 }
 

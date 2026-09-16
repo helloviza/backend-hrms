@@ -20,7 +20,15 @@ import express from "express";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
 import multer from "multer";
-import { seesAll, isFinance, userIdOf } from "../services/expense.access.js";
+import {
+  seesAll,
+  isAdmin,
+  isFinance,
+  isApprover,
+  personalLimitOf,
+  departmentScopeOf,
+  userIdOf,
+} from "../services/expense.access.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { csvRow } from "../utils/exportHelpers.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
@@ -1018,6 +1026,29 @@ router.get("/analytics", async (req: any, res: any) => {
     console.error("[Expenses analytics]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load analytics" });
   }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /api/expenses/capabilities
+ * The caller's expense capabilities in THIS workspace, as the server sees
+ * them (structural role OR grant — the same predicates every gate uses). The
+ * frontend reads this instead of guessing from the JWT role list, because
+ * since approval-engine sub-step 1 capabilities live in the grant store and
+ * are not on the token. Declared BEFORE /:id.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/capabilities", async (req: any, res: any) => {
+  const u = req.user;
+  res.json({
+    ok: true,
+    capabilities: {
+      admin: isAdmin(u),
+      finance: isFinance(u),
+      seesAll: seesAll(u),
+      approver: isApprover(u),
+      limitBase: personalLimitOf(u),
+      departmentIds: departmentScopeOf(u),
+    },
+  });
 });
 
 /* ─────────────────────────────────────────────────────────────────────

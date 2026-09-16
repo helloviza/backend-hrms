@@ -1,45 +1,47 @@
 // apps/backend/src/routes/expenseAdmin.ts
 //
-// Expense administration — the assignment surface (Phase 1 / Step 3).
+// Expense administration — the assignment surface.
 //
-// A FOCUSED, workspace-scoped, expense-Admin-gated console for two operability
+// A FOCUSED, workspace-scoped, expense-Admin-gated console for the operability
 // levers the expense module needs:
-//   • EXPENSE CAPABILITIES — add/remove the FINANCE / ADMIN role on a user's
-//     User.roles[] (the dedicated finance capability + broad admin).
+//   • EXPENSE CAPABILITIES — finance / expense-admin / approver flag / personal
+//     limit / department scope, held in the per-person GRANT store
+//     (models/ExpenseApproverGrant.ts). Since approval-engine sub-step 1
+//     (2026-09-16) this NEVER writes User.roles[]: the old behaviour wrote the
+//     literal platform `ADMIN` (audit F-01, Red — a customer WORKSPACE_LEADER
+//     could mint platform admin) and `FINANCE` tokens, which AccessConsole
+//     level changes then wiped (F-21).
 //   • MANAGER — set User.managerId (the approver-routing source) from a picker
 //     of THIS workspace's users; surfaces who has NO manager (the routing gap).
+//   • POLICY — base currency + the (legacy) escalation scalars.
 //
-// Mounted at /api/expense-admin behind requireAuth + requireWorkspace (server.ts).
+// Mounted at /api/expense-admin behind requireAuth + requireWorkspace +
+// attachExpenseGrant (server.ts).
 //
 // TENANT SAFETY (non-negotiable): EVERY user read/write is constrained to
 // req.workspaceObjectId. A tenant admin can therefore only ever see/edit users
-// in their OWN workspace — never cross-workspace. There is no ?customerId /
-// MasterData indirection here (that's the customer-side console); this operates
-// directly on workspace Users, mirroring the /users/admin/users/:id/sbt pattern.
+// in their OWN workspace — never cross-workspace.
 //
 // Gating: isAdmin() from services/expense.access.ts — the SAME predicate the
-// expense routes use, so the broad admin set (incl. TENANT_ADMIN/WORKSPACE_ADMIN)
-// can self-serve within their workspace. Does NOT touch sbtRole / CustomerMember.
+// expense routes use (structural workspace roles OR an expenseAdmin grant).
 
 import express from "express";
 import mongoose from "mongoose";
 import { isAdmin, isFinance, userIdOf } from "../services/expense.access.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import Department from "../models/Department.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import Expense from "../models/Expense.js";
 import { getWorkspaceBaseCurrency, normalizeCurrency } from "../services/expenseFx.service.js";
+import {
+  grantsByUserId,
+  resolveDepartmentIds,
+  upsertGrant,
+  grantView,
+} from "../services/expenseGrants.service.js";
 
 const router = express.Router();
-
-/** Normalize a role token the same way expense.access does (upper + strip sep). */
-function normRole(v: any): string {
-  return String(v ?? "").trim().toUpperCase().replace(/[\s\-_]/g, "");
-}
-
-/** The literal, togglable capability tokens (what we add to / remove from roles[]). */
-const FINANCE_TOKEN = "FINANCE";
-const ADMIN_TOKEN = "ADMIN";
 
 function employeeNameOf(u: any): string {
   if (!u || typeof u !== "object") return "";
@@ -58,53 +60,67 @@ router.use((req: any, res: any, next: any) => {
   return next();
 });
 
+/** One user row for the Team page: identity + manager + the grant view. */
+function teamRow(u: any, grant: ReturnType<typeof grantView>, nameById: Map<string, string>) {
+  const managerId = u.managerId ? String(u.managerId) : null;
+  const withGrant = { ...u, expenseGrant: grant };
+  return {
+    id: String(u._id),
+    name: employeeNameOf(u),
+    email: u.email || "",
+    designation: u.designation || "",
+    department: u.department || "",
+    roles: Array.isArray(u.roles) ? u.roles : [],
+    // Togglable capability state — from the GRANT store, never roles[].
+    finance: !!grant?.finance,
+    admin: !!grant?.expenseAdmin,
+    approver: !!grant?.approver,
+    limitBase: grant?.limitBase ?? null,
+    departmentIds: grant?.departmentIds ?? [],
+    // Effective predicate (structural roles / superadmin flag / grant), for an
+    // honest hint when a capability is conferred by a role we don't toggle here.
+    effectiveFinance: isFinance(withGrant),
+    effectiveAdmin: isAdmin(withGrant),
+    managerId,
+    managerName: (managerId && nameById.get(managerId)) || u.managerName || u.reportingL1 || "",
+    hasManager: !!managerId,
+  };
+}
+
 /* ─────────────────────────────────────────────────────────────────────
  * GET /api/expense-admin/users
- * Every user in THIS workspace with their expense-capability flags + manager.
- * `finance`/`admin` are the LITERAL togglable tokens on roles[]; `effective*`
- * reflect the full predicate (e.g. an HR/SuperAdmin is an effective admin even
- * without the bare ADMIN token). `noManagerCount` surfaces the routing gap.
+ * Every user in THIS workspace with their expense capabilities (grant) +
+ * manager. Also returns the workspace's active departments for the scope
+ * picker. `noManagerCount` surfaces the routing gap.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/users", async (req: any, res: any) => {
   try {
     const ws = req.workspaceObjectId;
     const docs: any[] = await User.find({ workspaceId: ws, ...activeUserFilter() })
-      .select("firstName lastName name email designation department roles managerId managerName reportingL1 status")
+      .select(
+        "firstName lastName name email designation department roles role userType accountType hrmsAccessRole hrmsAccessLevel isSuperAdmin managerId managerName reportingL1 status",
+      )
       .sort({ name: 1, firstName: 1 })
       .lean();
 
-    // Resolve manager display names from WITHIN the workspace pool only (a
-    // manager outside this workspace falls back to the stored managerName so we
-    // never read another tenant's user as a side effect).
+    const [grants, departments] = await Promise.all([
+      grantsByUserId(ws, docs.map((u) => u._id)),
+      Department.find({ workspaceId: ws, isActive: true }).select("_id name code").sort({ name: 1 }).lean(),
+    ]);
+
+    // Resolve manager display names from WITHIN the workspace pool only.
     const nameById = new Map<string, string>();
     for (const u of docs) nameById.set(String(u._id), employeeNameOf(u));
 
-    const users = docs.map((u: any) => {
-      const roles: string[] = Array.isArray(u.roles) ? u.roles : [];
-      const normed = roles.map(normRole);
-      const managerId = u.managerId ? String(u.managerId) : null;
-      return {
-        id: String(u._id),
-        name: employeeNameOf(u),
-        email: u.email || "",
-        designation: u.designation || "",
-        department: u.department || "",
-        roles,
-        // Togglable capability state (literal tokens on roles[]):
-        finance: normed.includes(FINANCE_TOKEN),
-        admin: normed.includes(ADMIN_TOKEN),
-        // Effective predicate (broad sets / superadmin flag), for an honest hint
-        // when a capability is conferred by another role we don't toggle here.
-        effectiveFinance: isFinance(u),
-        effectiveAdmin: isAdmin(u),
-        managerId,
-        managerName: (managerId && nameById.get(managerId)) || u.managerName || u.reportingL1 || "",
-        hasManager: !!managerId,
-      };
-    });
-
+    const users = docs.map((u: any) => teamRow(u, grants.get(String(u._id)) ?? null, nameById));
     const noManagerCount = users.filter((u) => !u.hasManager).length;
-    res.json({ ok: true, users, total: users.length, noManagerCount });
+    res.json({
+      ok: true,
+      users,
+      total: users.length,
+      noManagerCount,
+      departments: departments.map((d: any) => ({ id: String(d._id), name: d.name, code: d.code || "" })),
+    });
   } catch (err: any) {
     console.error("[ExpenseAdmin users]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load workspace users" });
@@ -112,9 +128,12 @@ router.get("/users", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
- * PATCH /api/expense-admin/users/:id/capabilities  { finance?, admin? }
- * Add/remove the FINANCE / ADMIN role on roles[]. Only the keys present are
- * touched. Self-lockout guard: an admin may not strip their OWN admin token.
+ * PATCH /api/expense-admin/users/:id/capabilities
+ *   { finance?, admin?, approver?, limitBase?, departmentIds? }
+ * Upserts the user's GRANT. Only the keys present are touched; every change
+ * is appended to the grant's history with the actor. Self-lockout guard: an
+ * admin may not strip their OWN expense-admin capability. Nothing here
+ * touches User.roles[] — a grant confers nothing outside the expense module.
  * ───────────────────────────────────────────────────────────────────── */
 router.patch("/users/:id/capabilities", async (req: any, res: any) => {
   try {
@@ -126,11 +145,35 @@ router.patch("/users/:id/capabilities", async (req: any, res: any) => {
     const b = req.body || {};
     const wantFinance = "finance" in b ? !!b.finance : undefined;
     const wantAdmin = "admin" in b ? !!b.admin : undefined;
-    if (wantFinance === undefined && wantAdmin === undefined) {
-      return res.status(400).json({ error: "Nothing to change (pass finance and/or admin)" });
+    const wantApprover = "approver" in b ? !!b.approver : undefined;
+    let wantLimit: number | null | undefined = undefined;
+    if ("limitBase" in b) {
+      if (b.limitBase === null || b.limitBase === undefined || String(b.limitBase).trim() === "") {
+        wantLimit = null;
+      } else {
+        const n = Number(b.limitBase);
+        if (!Number.isFinite(n) || n < 0) {
+          return res.status(400).json({ error: "limitBase must be a non-negative number, or null to clear." });
+        }
+        wantLimit = n;
+      }
+    }
+    const dept = await resolveDepartmentIds(req.workspaceObjectId, "departmentIds" in b ? b.departmentIds : undefined);
+    if (dept.error) return res.status(400).json({ error: dept.error });
+
+    if (
+      wantFinance === undefined &&
+      wantAdmin === undefined &&
+      wantApprover === undefined &&
+      wantLimit === undefined &&
+      dept.value === undefined
+    ) {
+      return res.status(400).json({
+        error: "Nothing to change (pass finance, admin, approver, limitBase and/or departmentIds)",
+      });
     }
 
-    // Self-lockout guard: never let an admin remove their own ADMIN token.
+    // Self-lockout guard: never let an admin remove their own expense-admin capability.
     if (wantAdmin === false && userIdOf(req.user) === String(id)) {
       return res.status(403).json({
         error: "You can't remove your own Admin capability. Ask another admin.",
@@ -142,40 +185,29 @@ router.patch("/users/:id/capabilities", async (req: any, res: any) => {
     const user: any = await User.findOne({
       _id: new mongoose.Types.ObjectId(id),
       workspaceId: req.workspaceObjectId,
-    });
+    })
+      .select(
+        "firstName lastName name email designation department roles role userType accountType hrmsAccessRole hrmsAccessLevel isSuperAdmin managerId managerName reportingL1",
+      )
+      .lean();
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    const current: string[] = Array.isArray(user.roles) ? user.roles : [];
-    // Drop the literal tokens we manage, then re-add per the requested state.
-    // Other roles (SUPERADMIN, HR, MANAGER, EMPLOYEE, CUSTOMER, …) are preserved.
-    const kept = current.filter((r) => {
-      const n = normRole(r);
-      if (n === FINANCE_TOKEN) return false;
-      if (n === ADMIN_TOKEN) return false;
-      return true;
-    });
-
-    const next = new Set(kept.map((r) => String(r).toUpperCase()));
-    const hasFinanceNow = current.some((r) => normRole(r) === FINANCE_TOKEN);
-    const hasAdminNow = current.some((r) => normRole(r) === ADMIN_TOKEN);
-    if ((wantFinance === undefined ? hasFinanceNow : wantFinance)) next.add(FINANCE_TOKEN);
-    if ((wantAdmin === undefined ? hasAdminNow : wantAdmin)) next.add(ADMIN_TOKEN);
-
-    user.roles = Array.from(next); // schema setter uppercases + defaults to EMPLOYEE if empty
-    await user.save();
-
-    const normed = (user.roles as string[]).map(normRole);
-    res.json({
-      ok: true,
-      user: {
-        id: String(user._id),
-        roles: user.roles,
-        finance: normed.includes(FINANCE_TOKEN),
-        admin: normed.includes(ADMIN_TOKEN),
-        effectiveFinance: isFinance(user),
-        effectiveAdmin: isAdmin(user),
+    const grant = await upsertGrant({
+      workspaceId: req.workspaceObjectId,
+      userId: user._id,
+      actorId: userIdOf(req.user),
+      patch: {
+        finance: wantFinance,
+        expenseAdmin: wantAdmin,
+        approver: wantApprover,
+        limitBase: wantLimit,
+        departmentObjectIds: dept.value,
       },
     });
+
+    const view = grantView(grant.toObject());
+    const nameById = new Map<string, string>();
+    res.json({ ok: true, user: teamRow(user, view, nameById) });
   } catch (err: any) {
     console.error("[ExpenseAdmin capabilities]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to update capabilities" });

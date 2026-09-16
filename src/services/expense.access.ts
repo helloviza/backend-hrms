@@ -6,18 +6,27 @@
 //   • routes/expenseReports.ts  — FINANCE_ADMIN_ROLES + seesAllReports + isFinance + canDecide
 //   • the reimburse gate         — the isFinance() check on POST /reports/:id/reimburse
 //
-// TWO-AXIS access model:
-//   • CAPABILITY role — Admin (broad staff-admin) vs Finance (NEW, additive,
-//     dedicated). Drives visibility ("see all") and the act gates.
-//   • ACCESS level    — L0 / L1 / L2 derived from User.hrmsAccessRole, reserved
-//     for the Phase-2 approval chain. Vestigial today (see levelOf note).
+// TWO SOURCES, one predicate each (approval engine sub-step 1, 2026-09-16):
+//   • STRUCTURAL workspace roles — SUPERADMIN / TENANT_ADMIN / WORKSPACE_ADMIN /
+//     WORKSPACE_LEADER / HR / HR_ADMIN / OPS / OPS_ADMIN — the people who
+//     administer a workspace by construction (signup, AccessConsole). Read from
+//     the role bag exactly as before.
+//   • The PER-PERSON GRANT (models/ExpenseApproverGrant.ts) — finance and
+//     expense-admin capabilities, approver flag, personal limit, department
+//     scope. Read from `user.expenseGrant`, which attachExpenseGrant
+//     (services/expenseGrants.service.ts) parks on req.user once per request
+//     and withGrants() attaches to User docs.
+//
+// The literal `ADMIN` and `FINANCE` tokens on User.roles[] are NO LONGER READ
+// here. They were what the Team page used to write (audit F-01: a customer
+// WORKSPACE_LEADER could mint platform ADMIN; F-21: AccessConsole wiped them).
+// scripts/migrate-expense-capabilities-to-grants-2026-09-16.ts moves existing
+// holders into grants so nobody loses a capability they had.
 //
 // ONE normalization convention for the whole module: uppercase, then strip
 // spaces / hyphens / underscores. So SUPER_ADMIN, SUPER-ADMIN and SUPERADMIN all
 // collapse to SUPERADMIN; HR_ADMIN → HRADMIN; WORKSPACE_ADMIN → WORKSPACEADMIN.
 // (This is why the sets below don't need to list the punctuation variants.)
-
-export type AccessLevel = "L0" | "L1" | "L2";
 
 /** The ONE normalization convention for this module. */
 function norm(v: any): string {
@@ -25,20 +34,16 @@ function norm(v: any): string {
 }
 
 /**
- * Broad staff-admin set — preserves the legacy "see all + act" behavior that the
- * old FINANCE_ADMIN_ROLES / requireAdmin sets granted.
+ * STRUCTURAL workspace-admin roles — expense-admin by construction. The bare
+ * platform `ADMIN` token is deliberately NOT here any more: platform admins who
+ * should administer expenses hold an expenseAdmin grant (the migration gives
+ * every existing holder one), and the Team page can no longer create one.
  *
- * WORKSPACE_LEADER is included as a deliberate policy: a customer workspace
- * leader is the full expense-admin for THEIR OWN workspace (Team / Categories /
- * Analytics + reimburse + approval override + configure). Tenant scoping
- * (req.workspaceObjectId on every query) already confines that authority to
- * their own workspace. This set is EXPENSE-LOCAL — it is only consulted by the
- * expense module (expenses / expenseReports / expenseAdmin / expenseCategories /
- * reports.service), NOT by the platform-wide requireAdmin (middleware/rbac.ts),
- * so this does not elevate workspace leaders anywhere outside expenses.
+ * WORKSPACE_LEADER stays as a deliberate policy: a customer workspace leader is
+ * the full expense-admin for THEIR OWN workspace. Tenant scoping confines it;
+ * this set is EXPENSE-LOCAL and never consulted by middleware/rbac.ts.
  */
 export const ADMIN_ROLES = [
-  "ADMIN",
   "SUPERADMIN",
   "TENANT_ADMIN",
   "WORKSPACE_ADMIN",
@@ -49,21 +54,18 @@ export const ADMIN_ROLES = [
   "OPS_ADMIN",
 ].map(norm);
 
-/** NEW dedicated finance capability role — additive, does NOT replace admin. */
-export const FINANCE_ROLES = ["FINANCE"].map(norm);
-
-/**
- * No-manager approver fallback set (unchanged — mirrors APPROVER_FALLBACK_ROLES
- * in services/reports.service.ts, normalized here under this module's convention).
- */
-export const APPROVER_FALLBACK_ROLES = [
-  "ADMIN",
-  "SUPERADMIN",
-  "HR",
-  "HR_ADMIN",
-  "OPS",
-  "OPS_ADMIN",
-].map(norm);
+/** Coarse Mongo prefilter that agrees with ADMIN_ROLES (used by the approver
+ *  candidate scans in reports.service.ts; isAdmin() remains the authority). */
+export const ADMIN_ROLE_PREFILTER: RegExp[] = [
+  /SUPER[\s_-]?ADMIN/i,
+  /TENANT[\s_-]?ADMIN/i,
+  /WORKSPACE[\s_-]?ADMIN/i,
+  /LEADER/i,
+  /^HR$/i,
+  /^HR[\s_-]?ADMIN$/i,
+  /^OPS$/i,
+  /^OPS[\s_-]?ADMIN$/i,
+];
 
 /**
  * Collect every role signal off a user (JWT payload or User doc) — the same
@@ -86,36 +88,51 @@ export function userIdOf(user: any): string {
   return String(user?.id || user?._id || user?.sub || "");
 }
 
+/** The attached grant view (null when none / not attached). */
+function grantOf(user: any): {
+  approver: boolean;
+  limitBase: number | null;
+  departmentIds: string[];
+  finance: boolean;
+  expenseAdmin: boolean;
+} | null {
+  const g = user?.expenseGrant;
+  return g && typeof g === "object" ? g : null;
+}
+
 /**
- * Broad staff admin. SUPERADMIN is covered through the role bag; the explicit
- * `isSuperAdmin` flag path mirrors middleware/isSuperAdmin and is demo-guarded
- * (an impersonated demo user never gets the SUPERADMIN bypass via the flag).
+ * Expense admin = a STRUCTURAL workspace role, the SUPERADMIN flag (demo-
+ * guarded, mirrors middleware/isSuperAdmin), OR an active grant with
+ * capabilities.expenseAdmin. Nothing here reads the bare ADMIN token.
  */
 export function isAdmin(user: any): boolean {
   const bag = roleBag(user);
   if (bag.some((r) => ADMIN_ROLES.includes(r))) return true;
   if (user && user.isSuperAdmin === true && !user._demoImpersonation) return true;
+  if (grantOf(user)?.expenseAdmin) return true;
   return false;
 }
 
-/** Finance capability = the dedicated FINANCE role OR any admin. */
+/** Finance capability = grant.finance OR any expense admin. Nothing reads the FINANCE token. */
 export function isFinance(user: any): boolean {
   if (isAdmin(user)) return true;
-  return roleBag(user).some((r) => FINANCE_ROLES.includes(r));
+  return !!grantOf(user)?.finance;
 }
 
-/**
- * Access level L0 / L1 / L2 from User.hrmsAccessRole; default L0.
- *
- * NOTE (vestigial today): hrmsAccessRole currently stores role NAMES
- * (EMPLOYEE / MANAGER / HR / ADMIN / SUPERADMIN — see routes/permissions.ts),
- * NOT L-levels, so this returns "L0" for essentially everyone until a later
- * step writes real L-values. It exists now as forward-looking scaffolding for
- * the Phase-2 approval chain; nothing in Phase 1 branches on it.
- */
-export function levelOf(user: any): AccessLevel {
-  const m = /^L([012])$/.exec(norm(user?.hrmsAccessRole));
-  return m ? (`L${m[1]}` as AccessLevel) : "L0";
+/** In the approval-routing pool (engine, next steps). Admins are not implicitly approvers. */
+export function isApprover(user: any): boolean {
+  return !!grantOf(user)?.approver;
+}
+
+/** Personal approval limit from the grant (null = none / use rank default). */
+export function personalLimitOf(user: any): number | null {
+  const g = grantOf(user);
+  return g && g.limitBase != null ? Number(g.limitBase) : null;
+}
+
+/** Department scope from the grant ([] = whole workspace). */
+export function departmentScopeOf(user: any): string[] {
+  return grantOf(user)?.departmentIds ?? [];
 }
 
 /** Finance OR Admin → sees every expense / claim in the workspace. */

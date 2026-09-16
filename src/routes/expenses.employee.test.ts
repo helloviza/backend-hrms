@@ -31,6 +31,7 @@ const { requireAuth } = await import("../middleware/auth.js");
 const { requireWorkspace } = await import("../middleware/requireWorkspace.js");
 const { requireFeature, requireExpenseAdvancesFeature } = await import("../middleware/requireFeature.js");
 const { signToken } = await import("../utils/jwt.js");
+const { attachExpenseGrant, upsertGrant } = await import("../services/expenseGrants.service.js");
 const { default: CustomerWorkspace } = await import("../models/CustomerWorkspace.js");
 const { default: User } = await import("../models/User.js");
 const { default: Expense } = await import("../models/Expense.js");
@@ -50,9 +51,9 @@ beforeAll(async () => {
   app = express();
   app.use(express.json({ limit: "2mb" }));
   app.use(cookieParser());
-  app.use("/api/expenses", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), expensesRouter);
-  app.use("/api/reports", requireAuth, requireWorkspace, requireFeature("expensesEnabled"), reportsRouter);
-  app.use("/api/expense-advances", requireAuth, requireWorkspace, requireExpenseAdvancesFeature, advancesRouter);
+  app.use("/api/expenses", requireAuth, requireWorkspace, attachExpenseGrant, requireFeature("expensesEnabled"), expensesRouter);
+  app.use("/api/reports", requireAuth, requireWorkspace, attachExpenseGrant, requireFeature("expensesEnabled"), reportsRouter);
+  app.use("/api/expense-advances", requireAuth, requireWorkspace, attachExpenseGrant, requireExpenseAdvancesFeature, advancesRouter);
 }, 120_000);
 
 afterAll(async () => {
@@ -93,7 +94,9 @@ async function makeTeam() {
   const manager = await makeUser(wsId, ["MANAGER"]);
   const employee = await makeUser(wsId, ["EMPLOYEE"], { managerId: manager.id });
   const colleague = await makeUser(wsId, ["EMPLOYEE"], { managerId: manager.id });
-  const finance = await makeUser(wsId, ["FINANCE"]);
+  // Finance / expense-admin are GRANTS now (approval-engine sub-step 1), not role tokens.
+  const finance = await makeUser(wsId, ["EMPLOYEE"]);
+  await upsertGrant({ workspaceId: wsId, userId: finance.id, patch: { finance: true } });
   return { wsId, employee, colleague, manager, finance };
 }
 const TODAY = new Date().toISOString().slice(0, 10);
@@ -415,7 +418,8 @@ describe("6 · withdraw a submitted claim", () => {
 
     // 2-level chain: L1 approved → claim still `submitted` but under review
     team = await makeTeam();
-    const admin = await makeUser(team.wsId, ["ADMIN"]);
+    const admin = await makeUser(team.wsId, ["EMPLOYEE"]);
+    await upsertGrant({ workspaceId: team.wsId, userId: admin.id, patch: { expenseAdmin: true } });
     await CustomerWorkspace.updateOne(
       { _id: new mongoose.Types.ObjectId(team.wsId) },
       { $set: { "config.expenseEscalationThreshold": 100, "config.seniorApproverId": new mongoose.Types.ObjectId(admin.id) } },
@@ -437,7 +441,8 @@ describe("6 · withdraw a submitted claim", () => {
     const { claim } = await submittedClaim(team);
     expect((await as(team.colleague).post(`/api/reports/${claim._id}/withdraw`)).status).toBe(404);
     expect((await as(team.manager).post(`/api/reports/${claim._id}/withdraw`)).status).toBe(404);
-    const admin = await makeUser(team.wsId, ["ADMIN"]);
+    const admin = await makeUser(team.wsId, ["EMPLOYEE"]);
+    await upsertGrant({ workspaceId: team.wsId, userId: admin.id, patch: { expenseAdmin: true } });
     expect((await as(admin).post(`/api/reports/${claim._id}/withdraw`)).status).toBe(404); // ownerOnly, even for admins
     expect((await Report.findById(claim._id).lean())!.status).toBe("submitted");
   });

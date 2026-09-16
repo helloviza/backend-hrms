@@ -18,7 +18,8 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseActivity.js";
 import { refFromId } from "../utils/refFromId.js";
 import { sendClaimSubmittedEmail } from "../utils/claimEmails.js";
-import { isAdmin, userIdOf } from "./expense.access.js";
+import { isAdmin, userIdOf, ADMIN_ROLE_PREFILTER } from "./expense.access.js";
+import { expenseAdminUserIds, withGrants } from "./expenseGrants.service.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import {
   amountBaseExpr,
@@ -336,6 +337,30 @@ const APPROVER_USER_FIELDS =
   "firstName lastName name email roles role userType accountType hrmsAccessRole hrmsAccessLevel isSuperAdmin managerId";
 
 /**
+ * Expense-admin candidates for the no-manager fallback (approval engine
+ * sub-step 1): users carrying a STRUCTURAL admin role (coarse regex prefilter
+ * that agrees with expense.access.ADMIN_ROLES) UNION users holding an active
+ * expenseAdmin GRANT — the bare ADMIN token is no longer a signal. Every
+ * returned doc has its grant attached so isAdmin() (the authority) can decide.
+ * Workspace-scoped, active-filtered, never includes `excludeIds`.
+ */
+async function expenseAdminCandidates(
+  workspaceId: mongoose.Types.ObjectId,
+  excludeIds: mongoose.Types.ObjectId[],
+): Promise<any[]> {
+  const grantHolders = await expenseAdminUserIds(workspaceId);
+  const users: any[] = await User.find({
+    workspaceId,
+    _id: { $nin: excludeIds },
+    $or: [{ roles: { $in: ADMIN_ROLE_PREFILTER } }, { _id: { $in: grantHolders } }],
+    ...activeUserFilter(),
+  })
+    .select(APPROVER_USER_FIELDS)
+    .lean();
+  return withGrants(workspaceId, users);
+}
+
+/**
  * Resolve the L1 approver to snapshot — workspace-scoped; every lookup stamps
  * workspaceId. Order:
  *   1. the submitter's own manager (must be in this workspace, and never the
@@ -383,15 +408,9 @@ export async function resolveL1Approver(
     if (mgr) return { id: mgr._id as mongoose.Types.ObjectId, user: mgr };
   }
 
-  // 2) any OTHER workspace admin (separator-safe: isAdmin() is the authority).
-  const candidates: any[] = await User.find({
-    workspaceId,
-    _id: { $ne: submitterId },
-    roles: { $in: [/ADMIN/i, /LEADER/i, /^HR$/i, /^OPS$/i] },
-    ...activeUserFilter(),
-  })
-    .select(APPROVER_USER_FIELDS)
-    .lean();
+  // 2) any OTHER workspace expense-admin — structural role OR expenseAdmin
+  //    grant (isAdmin() is the authority; grants are attached to the docs).
+  const candidates = await expenseAdminCandidates(workspaceId, [submitterId]);
   const admin = candidates.find((u) => userIdOf(u) !== meId && isAdmin(u));
   if (admin) return { id: admin._id as mongoose.Types.ObjectId, user: admin };
 
@@ -443,18 +462,11 @@ export async function resolveL2Approver(
     if (ok(senior)) return senior;
   }
 
-  // c) any OTHER workspace admin.
+  // c) any OTHER workspace expense-admin (structural role OR grant).
   const excludeObjIds = excludeIds
     .filter((x) => mongoose.Types.ObjectId.isValid(x))
     .map((x) => new mongoose.Types.ObjectId(x));
-  const candidates: any[] = await User.find({
-    workspaceId,
-    _id: { $nin: excludeObjIds },
-    roles: { $in: [/ADMIN/i, /LEADER/i, /^HR$/i, /^OPS$/i] },
-    ...activeUserFilter(),
-  })
-    .select(APPROVER_USER_FIELDS)
-    .lean();
+  const candidates = await expenseAdminCandidates(workspaceId, excludeObjIds);
   const admin = candidates.find((u) => ok(u) && isAdmin(u));
   return admin || null;
 }
