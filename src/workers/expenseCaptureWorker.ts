@@ -509,8 +509,10 @@ async function handleCaptureReply(capture: any, waId: string, text: string): Pro
     await capture.save();
     await sendTextMessage(waId, "Discarded. Send a new receipt photo whenever you're ready.");
   } else if (intent.kind === "confirm") {
-    if (capture.extraction?.amount == null) {
-      await sendTextMessage(waId, "I still need the amount. " + CORRECTION_HINT);
+    // createExpense refuses a non-positive amount (audit F-11); catch it here
+    // as a correction prompt, same as a missing one.
+    if (capture.extraction?.amount == null || !(Number(capture.extraction.amount) > 0)) {
+      await sendTextMessage(waId, "I still need a valid amount (greater than zero). " + CORRECTION_HINT);
     } else {
       await confirmCapture(capture);
     }

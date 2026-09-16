@@ -1156,10 +1156,17 @@ router.delete("/:id", async (req: any, res: any) => {
       return res.status(409).json({ error: "Only draft or clarification-required reports can be deleted" });
     }
 
+    // Audit F-05: an advance earmarked against this claim must be released
+    // first (mirrors the decline handler) or it points at a deleted claim
+    // forever — never settles, permanently reduces availableToEarmark.
+    const { releasedCount } = await releaseEarmarksForClaim(
+      req.workspaceObjectId,
+      report._id as mongoose.Types.ObjectId,
+    );
     await unlinkAllExpenses(req.workspaceObjectId, report._id as mongoose.Types.ObjectId);
     await report.deleteOne();
 
-    res.json({ ok: true });
+    res.json({ ok: true, releasedEarmarks: releasedCount });
   } catch (err: any) {
     console.error("[Reports DELETE]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to delete report" });

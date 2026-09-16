@@ -26,7 +26,7 @@ import { csvRow } from "../utils/exportHelpers.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
 import { extractReceipt } from "../services/receiptExtractorGemini.js";
-import { createExpense } from "../services/expenses.service.js";
+import { createExpense, ExpenseInputError } from "../services/expenses.service.js";
 import { propagateReportLifecycle, logActivity } from "../services/reports.service.js";
 import {
   amountBaseExpr,
@@ -195,7 +195,9 @@ async function buildExpenseFilter(
   }
 
   if (req.query.search) {
-    const re = new RegExp(String(req.query.search), "i");
+    // Escaped: user text is a literal, never a pattern (audit F-13 — regex
+    // injection / ReDoS on the list + export).
+    const re = new RegExp(String(req.query.search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
     filter.$or = [{ merchant: re }, { ref: re }];
   }
 
@@ -1351,12 +1353,14 @@ router.post("/upload", receiptUploadMw, async (req: any, res: any) => {
     });
 
     // Extraction is best-effort: on failure (e.g. no amount found) we still
-    // return the stored imageKey so the user can fill the draft manually.
+    // return the stored imageKey so the user can fill the draft manually. The
+    // empty draft's currency is the WORKSPACE BASE, not a hard-coded INR.
+    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
     let draft: Record<string, any> = {
       merchant: null,
       date: null,
       amount: null,
-      currency: "INR",
+      currency: baseCurrency,
       taxAmount: null,
       gstin: null,
       suggestedCategory: null,
@@ -1369,7 +1373,7 @@ router.post("/upload", receiptUploadMw, async (req: any, res: any) => {
     try {
       const result = await extractReceipt({ buffer: file.buffer, mime: file.mimetype });
       const { perFieldConfidence: pfc, ...fields } = result.fields;
-      draft = fields;
+      draft = { ...fields, currency: normalizeCurrency(fields.currency) || baseCurrency };
       perFieldConfidence = pfc;
       extractionModel = result.raw.model;
       rawExtraction = result.raw.raw_candidate;
@@ -1381,6 +1385,7 @@ router.post("/upload", receiptUploadMw, async (req: any, res: any) => {
     res.json({
       ok: true,
       draft,
+      baseCurrency,
       perFieldConfidence,
       extractionModel,
       rawExtraction,
@@ -1411,6 +1416,21 @@ router.post("/", async (req: any, res: any) => {
     const b = req.body || {};
     if (b.amount == null || Number.isNaN(Number(b.amount))) {
       return res.status(400).json({ error: "amount is required" });
+    }
+    // Audit F-11: a bill is a positive amount, and a date must be a real day
+    // that is not in the future (tomorrow is allowed for time-zone slack).
+    if (!Number.isFinite(Number(b.amount)) || Number(b.amount) <= 0) {
+      return res.status(400).json({ error: "amount must be greater than zero" });
+    }
+    if (Number(b.amount) > 10_000_000) {
+      return res.status(400).json({ error: "amount is implausibly large — check the receipt" });
+    }
+    if (b.date != null && String(b.date).trim() !== "") {
+      const d = new Date(String(b.date));
+      if (Number.isNaN(d.getTime())) return res.status(400).json({ error: "date must be a valid date" });
+      if (d.getTime() > Date.now() + 24 * 60 * 60 * 1000) {
+        return res.status(400).json({ error: "date cannot be in the future" });
+      }
     }
     // A typed/extracted currency must be an ISO-4217 code — anything else
     // would silently be read as the workspace base (createExpense's fallback),
@@ -1484,7 +1504,9 @@ router.post("/", async (req: any, res: any) => {
       categoryId,
       reportId,
       imageKey,
-      s3Bucket: b.s3Bucket,
+      // Audit F-12: the bucket is ours, never the client's — the presigned
+      // receipt GET reads this field back verbatim.
+      s3Bucket: imageKey ? env.S3_BUCKET : undefined,
       rawExtraction: b.rawExtraction,
       perFieldConfidence: b.perFieldConfidence,
       extractionModel: b.extractionModel,
@@ -1500,8 +1522,68 @@ router.post("/", async (req: any, res: any) => {
 
     res.status(201).json({ ok: true, expense });
   } catch (err: any) {
+    if (err instanceof ExpenseInputError) return res.status(400).json({ error: err.message });
     console.error("[Expenses create]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to create expense" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * DELETE /api/expenses/:id  — discard a mis-captured bill (owner only).
+ * Allowed only while the bill is still the employee's to edit: lifecycle
+ * pending_to_submit — loose, or sitting in their OWN draft / clarification
+ * claim (it is unlinked from the claim first, with an expense_removed entry on
+ * the claim timeline). Anything that has been submitted, decided or paid is
+ * refused (409): those rows are part of an approval record. The receipt object
+ * in S3 is left in place (audit trail); only the Expense row goes.
+ * ───────────────────────────────────────────────────────────────────── */
+router.delete("/:id", async (req: any, res: any) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(404).json({ error: "Expense not found" });
+    }
+    const me = ownEmployeeId(req);
+    const expense: any = await Expense.findOne({
+      _id: new mongoose.Types.ObjectId(id),
+      workspaceId: req.workspaceObjectId,
+      employeeId: new mongoose.Types.ObjectId(me), // owner only — never via routed/admin visibility
+    });
+    if (!expense) return res.status(404).json({ error: "Expense not found" });
+
+    const lifecycle = expense.lifecycleStatus || "pending_to_submit";
+    if (lifecycle !== "pending_to_submit") {
+      return res.status(409).json({
+        error: "Only a bill that hasn't been submitted can be deleted. Remove it from the claim first if the claim was sent back.",
+      });
+    }
+
+    if (expense.reportId) {
+      // Must be the owner's own editable claim (draft / clarification_required).
+      const report: any = await Report.findOne({
+        _id: expense.reportId,
+        workspaceId: req.workspaceObjectId,
+        employeeId: new mongoose.Types.ObjectId(me),
+      }).lean();
+      if (!report || (report.status !== "draft" && report.status !== "clarification_required")) {
+        return res.status(409).json({ error: "This bill is in a claim that can no longer be edited." });
+      }
+      await logActivity({
+        workspaceId: req.workspaceObjectId,
+        reportId: report._id,
+        event: "expense_removed",
+        actorId: me,
+        actorName: employeeNameOf(req.user) || String(req.user?.email || "User"),
+        expenseId: expense._id,
+        note: `Deleted ${expense.ref}${expense.merchant ? ` (${expense.merchant})` : ""} from the claim`,
+      });
+    }
+
+    await Expense.deleteOne({ _id: expense._id, workspaceId: req.workspaceObjectId });
+    res.json({ ok: true, deleted: String(expense._id) });
+  } catch (err: any) {
+    console.error("[Expenses DELETE]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to delete expense" });
   }
 });
 

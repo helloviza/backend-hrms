@@ -43,7 +43,24 @@ export type CreateExpenseInput = {
   extractionModel?: string;
 };
 
+export class ExpenseInputError extends Error {
+  status = 400;
+}
+
 export async function createExpense(input: CreateExpenseInput): Promise<IExpense> {
+  // A bill is a positive amount — for BOTH channels (audit F-11: a ≤0 line
+  // silently lowered a claim total). Thrown, not defaulted: the web route maps
+  // it to a 400 and the WhatsApp worker to a "couldn't read the amount" reply.
+  const amount = Number(input.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new ExpenseInputError("amount must be a positive number");
+  }
+  // An unparseable date (extractor noise) is stored as null — the claim
+  // submit gate asks for a date later — rather than failing the save with a
+  // cast error.
+  const parsedDate = input.date ? new Date(input.date) : null;
+  const date = parsedDate && !Number.isNaN(parsedDate.getTime()) ? parsedDate : null;
+
   // FX freeze at entry (slice 0). The receipt currency defaults to the
   // workspace base (was a hard-coded "INR"); a non-ISO string from the
   // extractor also falls back to the base rather than being stored verbatim.
@@ -58,8 +75,8 @@ export async function createExpense(input: CreateExpenseInput): Promise<IExpense
     imageKey: input.imageKey,
     s3Bucket: input.s3Bucket,
     merchant: input.merchant ?? null,
-    date: input.date ? new Date(input.date) : null,
-    amount: input.amount,
+    date,
+    amount,
     currency,
     exchangeRate: fx.exchangeRate,
     rateDate: fx.rateDate,
