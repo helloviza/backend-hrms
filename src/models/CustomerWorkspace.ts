@@ -108,19 +108,12 @@ export interface CustomerWorkspaceDocument extends Document {
     // no backfill is required for correctness.
     baseCurrency?: string;
 
-    // Expense approval escalation (Phase 2). null = OFF: claims route to a single
-    // approver exactly as before. When set, a claim whose total EXCEEDS this
-    // amount gets a second approval level appended at submit.
-    expenseEscalationThreshold?: number | null;
-    // Preferred L2 approver when escalating, before the manager's-manager / admin
-    // fallback. Optional. Shared by claims AND advances.
-    seniorApproverId?: Schema.Types.ObjectId | null;
-
-    // Advance approval escalation (System B). null = OFF: advances route to a
-    // single approver. When set, an advance whose AMOUNT exceeds this gets a
-    // second approval level appended at request. Independent of the claim
-    // (expense) escalation threshold above.
-    advanceEscalationThreshold?: number | null;
+    // RETIRED (approval-engine sub-step 4, 2026-09-16): expenseEscalationThreshold,
+    // seniorApproverId and advanceEscalationThreshold moved to
+    // ExpenseApprovalPolicy.legacyEscalation (models/ExpenseApprovalPolicy.ts)
+    // so the expense module has ONE settings home. Migrated by
+    // scripts/migrate-expense-policy-thresholds-2026-09-16.ts; no longer read
+    // from here by anything.
 
     // Visa approval gate (2026-08-10). false/absent = OFF, and OFF is the
     // schema default: a submitted visa request goes straight to the
@@ -287,12 +280,8 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
       // get the same default from getWorkspaceBaseCurrency(). Only changeable
       // while the workspace has zero expenses (routes/expenseAdmin.ts).
       baseCurrency: { type: String, trim: true, uppercase: true, default: "INR" },
-      // Expense escalation threshold — null = OFF (single-approver, unchanged).
-      expenseEscalationThreshold: { type: Number, default: null },
-      seniorApproverId: { type: Schema.Types.ObjectId, ref: "User", default: null },
-      // Advance escalation threshold — null = OFF (single-approver). Independent
-      // of the claim threshold above; gates the L2 step on the advance amount.
-      advanceEscalationThreshold: { type: Number, default: null },
+      // expenseEscalationThreshold / seniorApproverId / advanceEscalationThreshold:
+      // RETIRED — see ExpenseApprovalPolicy.legacyEscalation (sub-step 4).
       // Visa approval gate — SCHEMA DEFAULT false. Every existing workspace
       // reads false without a backfill, which is the whole point.
       visaApprovalRequired: { type: Boolean, default: false },

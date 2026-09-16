@@ -45,6 +45,7 @@ import Department from "../models/Department.js";
 import CRMCompany from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import ExpenseApprovalPolicy from "../models/ExpenseApprovalPolicy.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import Pipeline from "../models/Pipeline.js";
 import { isCrmV2DispositionEnabled, isCrmV2OpportunityEnabled } from "../config/crmV2.js";
@@ -384,8 +385,12 @@ export async function collectPendingWork(args: {
   await standingSource("crmContacts", "CRM contacts assigned to them", CRMContact,
     { assignedTo: userId, status: { $ne: "inactive" } }, (d) => [d.firstName, d.lastName].filter(Boolean).join(" ") || d.companyName || "(contact)");
   await standingSource("workspaceRoles", "Client workspaces where they hold a role", CustomerWorkspace,
-    { $or: [{ accountManagerId: userId }, { "config.seniorApproverId": userId }, { adminUserId: userId }] },
+    { $or: [{ accountManagerId: userId }, { adminUserId: userId }] },
     (d) => d.companyName || d.slug || String(d._id));
+  // Senior expense approver moved to ExpenseApprovalPolicy.legacyEscalation (sub-step 4).
+  await standingSource("expenseSeniorApprover", "Expense policies naming them senior approver", ExpenseApprovalPolicy,
+    { "legacyEscalation.seniorApproverId": userId },
+    (d) => String(d.workspaceId));
   await standingSource("travellerApprover", "Travellers routed to them (tour approver / manager / finance)", TravellerProfile,
     { $or: [{ tourApproverId: userId }, { reportingManagerId: userId }, { officialUserId: userId }, { financeUserId: userId }], isActive: { $ne: false } },
     (d) => d.name || [d.firstName, d.lastName].filter(Boolean).join(" ") || "(traveller)");

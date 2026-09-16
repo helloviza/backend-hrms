@@ -50,6 +50,10 @@ import {
   type EffectiveLimit,
 } from "../services/expenseAuthority.service.js";
 import CustomerMember from "../models/CustomerMember.js";
+import ExpenseCategory from "../models/ExpenseCategory.js";
+import { getPolicy, updatePolicy, validatePolicyPatch } from "../services/expensePolicy.service.js";
+import { routeClaim } from "../services/expenseRouting.service.js";
+import { buildRoutingInput } from "../services/expenseRoutingInput.service.js";
 
 const router = express.Router();
 
@@ -450,29 +454,33 @@ router.patch("/users/:id/manager", async (req: any, res: any) => {
 
 /* ─────────────────────────────────────────────────────────────────────
  * GET /api/expense-admin/policy
- * The workspace's expense approval-escalation policy (Phase 2). null threshold
- * = OFF (single-approver). Workspace-scoped; isAdmin gate (router-level).
+ * The Team page's settings block: base currency + the LEGACY escalation
+ * scalars (expenseEscalationThreshold / advanceEscalationThreshold /
+ * seniorApproverId). Since approval-engine sub-step 4 those three live on
+ * the ExpenseApprovalPolicy document (legacyEscalation), NOT on
+ * CustomerWorkspace.config — one settings home. The response keys are kept
+ * so the existing Team page works unchanged.
  * ───────────────────────────────────────────────────────────────────── */
+async function legacyPolicyView(workspaceId: any) {
+  const [pol, baseCurrency, expenseCount] = await Promise.all([
+    getPolicy(workspaceId),
+    getWorkspaceBaseCurrency(workspaceId),
+    Expense.countDocuments({ workspaceId }),
+  ]);
+  return {
+    baseCurrency,
+    baseCurrencyLocked: expenseCount > 0,
+    expenseEscalationThreshold: pol.legacyEscalation.claimThresholdBase,
+    seniorApproverId: pol.legacyEscalation.seniorApproverId,
+    advanceEscalationThreshold: pol.legacyEscalation.advanceThresholdBase,
+    policyVersion: pol.version,
+    engineEnabled: pol.engineEnabled,
+  };
+}
+
 router.get("/policy", async (req: any, res: any) => {
   try {
-    const ws: any = await CustomerWorkspace.findById(req.workspaceObjectId)
-      .select("config.expenseEscalationThreshold config.seniorApproverId config.advanceEscalationThreshold")
-      .lean();
-    // baseCurrency (slice 0) is the unit of both thresholds below. It can only
-    // be changed while the workspace has no expenses (see PATCH), so the
-    // response also says whether it is still editable.
-    const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
-    const expenseCount = await Expense.countDocuments({ workspaceId: req.workspaceObjectId });
-    res.json({
-      ok: true,
-      policy: {
-        baseCurrency,
-        baseCurrencyLocked: expenseCount > 0,
-        expenseEscalationThreshold: ws?.config?.expenseEscalationThreshold ?? null,
-        seniorApproverId: ws?.config?.seniorApproverId ? String(ws.config.seniorApproverId) : null,
-        advanceEscalationThreshold: ws?.config?.advanceEscalationThreshold ?? null,
-      },
-    });
+    res.json({ ok: true, policy: await legacyPolicyView(req.workspaceObjectId) });
   } catch (err: any) {
     console.error("[ExpenseAdmin policy GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load policy" });
@@ -480,20 +488,16 @@ router.get("/policy", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
- * PATCH /api/expense-admin/policy  { expenseEscalationThreshold?, seniorApproverId? }
- * Only the keys present are touched. Threshold: a non-negative number, or
- * null/"" to turn escalation OFF. seniorApproverId: a user in THIS workspace,
- * or null/"" to clear. Workspace-scoped; isAdmin gate (router-level).
+ * PATCH /api/expense-admin/policy
+ *   { baseCurrency?, expenseEscalationThreshold?, advanceEscalationThreshold?, seniorApproverId? }
+ * Only the keys present are touched. baseCurrency stays on the workspace
+ * (locked once expenses exist); the three legacy scalars are written to the
+ * policy document's legacyEscalation block.
  * ───────────────────────────────────────────────────────────────────── */
 router.patch("/policy", async (req: any, res: any) => {
   try {
     const b = req.body || {};
-    const update: Record<string, any> = {};
 
-    // Base currency (slice 0): ISO-4217, and ONLY while no expense exists —
-    // every stored amountBase is frozen in the old base, so a later switch
-    // would silently mis-state every total. Not a migration path; a workspace
-    // that needs to change base after capturing expenses is a separate task.
     if ("baseCurrency" in b) {
       const next = normalizeCurrency(b.baseCurrency);
       if (!next) {
@@ -508,96 +512,103 @@ router.patch("/policy", async (req: any, res: any) => {
             code: "BASE_CURRENCY_LOCKED",
           });
         }
-        update["config.baseCurrency"] = next;
+        await CustomerWorkspace.updateOne({ _id: req.workspaceObjectId }, { $set: { "config.baseCurrency": next } });
       }
     }
 
-    if ("expenseEscalationThreshold" in b) {
-      const raw = b.expenseEscalationThreshold;
-      if (raw === null || raw === undefined || String(raw).trim() === "") {
-        update["config.expenseEscalationThreshold"] = null; // OFF
-      } else {
-        const n = Number(raw);
-        if (!Number.isFinite(n) || n < 0) {
-          return res
-            .status(400)
-            .json({ error: "expenseEscalationThreshold must be a non-negative number, or null to disable." });
-        }
-        update["config.expenseEscalationThreshold"] = n;
-      }
+    const legacy: Record<string, any> = {};
+    if ("expenseEscalationThreshold" in b) legacy.claimThresholdBase = b.expenseEscalationThreshold;
+    if ("advanceEscalationThreshold" in b) legacy.advanceThresholdBase = b.advanceEscalationThreshold;
+    if ("seniorApproverId" in b) legacy.seniorApproverId = b.seniorApproverId;
+
+    if (Object.keys(legacy).length === 0 && !("baseCurrency" in b)) {
+      return res.status(400).json({
+        error: "Nothing to change (pass baseCurrency, expenseEscalationThreshold, advanceEscalationThreshold and/or seniorApproverId).",
+      });
     }
-
-    if ("advanceEscalationThreshold" in b) {
-      const raw = b.advanceEscalationThreshold;
-      if (raw === null || raw === undefined || String(raw).trim() === "") {
-        update["config.advanceEscalationThreshold"] = null; // OFF
-      } else {
-        const n = Number(raw);
-        if (!Number.isFinite(n) || n < 0) {
-          return res
-            .status(400)
-            .json({ error: "advanceEscalationThreshold must be a non-negative number, or null to disable." });
-        }
-        update["config.advanceEscalationThreshold"] = n;
-      }
+    if (Object.keys(legacy).length > 0) {
+      const errors = await validatePolicyPatch(req.workspaceObjectId, { legacyEscalation: legacy });
+      if (errors.length) return res.status(400).json({ error: errors[0], errors });
+      await updatePolicy({ workspaceId: req.workspaceObjectId, patch: { legacyEscalation: legacy }, actorId: userIdOf(req.user) });
     }
-
-    if ("seniorApproverId" in b) {
-      const raw = b.seniorApproverId;
-      if (raw === null || raw === undefined || String(raw).trim() === "") {
-        update["config.seniorApproverId"] = null;
-      } else {
-        if (!mongoose.Types.ObjectId.isValid(String(raw))) {
-          return res.status(400).json({ error: "Invalid seniorApproverId" });
-        }
-        // Must be a user in THIS workspace (never cross-workspace).
-        const u: any = await User.findOne({
-          _id: new mongoose.Types.ObjectId(String(raw)),
-          workspaceId: req.workspaceObjectId,
-        })
-          .select("_id")
-          .lean();
-        if (!u) return res.status(400).json({ error: "Senior approver must be a user in this workspace." });
-        update["config.seniorApproverId"] = u._id;
-      }
-    }
-
-    if (Object.keys(update).length === 0) {
-      // A baseCurrency equal to the current one is a legitimate no-op PATCH.
-      if (!("baseCurrency" in b)) {
-        return res.status(400).json({
-          error:
-            "Nothing to change (pass baseCurrency, expenseEscalationThreshold, advanceEscalationThreshold and/or seniorApproverId).",
-        });
-      }
-    }
-
-    const ws: any = Object.keys(update).length
-      ? await CustomerWorkspace.findOneAndUpdate(
-          { _id: req.workspaceObjectId },
-          { $set: update },
-          { new: true },
-        )
-          .select("config.expenseEscalationThreshold config.seniorApproverId config.advanceEscalationThreshold config.baseCurrency")
-          .lean()
-      : await CustomerWorkspace.findById(req.workspaceObjectId)
-          .select("config.expenseEscalationThreshold config.seniorApproverId config.advanceEscalationThreshold config.baseCurrency")
-          .lean();
-    if (!ws) return res.status(404).json({ error: "Workspace not found" });
-
-    res.json({
-      ok: true,
-      policy: {
-        baseCurrency: normalizeCurrency(ws?.config?.baseCurrency) || "INR",
-        baseCurrencyLocked: (await Expense.countDocuments({ workspaceId: req.workspaceObjectId })) > 0,
-        expenseEscalationThreshold: ws?.config?.expenseEscalationThreshold ?? null,
-        seniorApproverId: ws?.config?.seniorApproverId ? String(ws.config.seniorApproverId) : null,
-        advanceEscalationThreshold: ws?.config?.advanceEscalationThreshold ?? null,
-      },
-    });
+    res.json({ ok: true, policy: await legacyPolicyView(req.workspaceObjectId) });
   } catch (err: any) {
     console.error("[ExpenseAdmin policy PATCH]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to update policy" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * THE RULEBOOK (approval-engine sub-step 4)
+ *
+ * GET  /api/expense-admin/approval-policy   — the full policy (defaults when none)
+ * PUT  /api/expense-admin/approval-policy   — partial update; validated against
+ *                                             THIS workspace's categories/users
+ * POST /api/expense-admin/approval-policy/simulate — "test a claim": pure
+ *      what-if through the SAME routeClaim() the live engine will use.
+ *      Creates and submits NOTHING.
+ *
+ * Admin / leadership gated (router-level isAdmin). Amounts in base currency.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/approval-policy", async (req: any, res: any) => {
+  try {
+    const [policy, baseCurrency, categories] = await Promise.all([
+      getPolicy(req.workspaceObjectId),
+      getWorkspaceBaseCurrency(req.workspaceObjectId),
+      ExpenseCategory.find({ workspaceId: req.workspaceObjectId }).select("_id name active").sort({ name: 1 }).lean(),
+    ]);
+    res.json({
+      ok: true,
+      policy,
+      baseCurrency,
+      categories: categories.map((c: any) => ({ id: String(c._id), name: c.name, active: c.active !== false })),
+    });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin approval-policy GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load approval policy" });
+  }
+});
+
+router.put("/approval-policy", async (req: any, res: any) => {
+  try {
+    const patch = req.body || {};
+    const allowed = ["engineEnabled", "bot", "managerAllowance", "categoryRules", "departmentScopeEnforced", "topOfChain", "firstStep", "legacyEscalation"];
+    const keys = Object.keys(patch).filter((k) => allowed.includes(k));
+    if (keys.length === 0) return res.status(400).json({ error: `Nothing to change (pass any of ${allowed.join(", ")})` });
+    const errors = await validatePolicyPatch(req.workspaceObjectId, patch);
+    if (errors.length) return res.status(400).json({ error: errors[0], errors });
+    const policy = await updatePolicy({ workspaceId: req.workspaceObjectId, patch, actorId: userIdOf(req.user) });
+    res.json({ ok: true, policy, baseCurrency: await getWorkspaceBaseCurrency(req.workspaceObjectId) });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin approval-policy PUT]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to update approval policy" });
+  }
+});
+
+router.post("/approval-policy/simulate", async (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const built = await buildRoutingInput({
+      workspaceId: req.workspaceObjectId,
+      kind: b.kind === "advance" ? "advance" : "claim",
+      reportId: b.reportId ? String(b.reportId) : undefined,
+      submitterId: b.submitterId ? String(b.submitterId) : undefined,
+      amountBase: b.amountBase != null ? Number(b.amountBase) : undefined,
+      categoryIds: Array.isArray(b.categoryIds) ? b.categoryIds.map(String) : undefined,
+      departmentId: b.departmentId === null ? null : b.departmentId ? String(b.departmentId) : undefined,
+      checks: b.checks && typeof b.checks === "object" ? b.checks : undefined,
+    });
+    if (built.error) return res.status(built.status || 400).json({ error: built.error });
+    const decision = routeClaim(built.input!);
+    res.json({
+      ok: true,
+      simulated: true, // nothing was created, submitted or routed
+      input: built.summary,
+      decision,
+    });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin simulate]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to simulate" });
   }
 });
 

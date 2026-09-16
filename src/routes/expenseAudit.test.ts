@@ -25,6 +25,7 @@ const { requireAuth } = await import("../middleware/auth.js");
 const { requireWorkspace } = await import("../middleware/requireWorkspace.js");
 const { requireFeature, requireExpenseAdvancesFeature } = await import("../middleware/requireFeature.js");
 const { attachExpenseGrant, upsertGrant } = await import("../services/expenseGrants.service.js");
+const { updatePolicy } = await import("../services/expensePolicy.service.js");
 const { signToken } = await import("../utils/jwt.js");
 const { default: CustomerWorkspace } = await import("../models/CustomerWorkspace.js");
 const { default: User } = await import("../models/User.js");
@@ -383,8 +384,9 @@ describe("4 · append-only", () => {
 /* ── 5. Multi-approver claim ───────────────────────────────────────── */
 describe("5 · each approver on a multi-level claim is recorded the same way", () => {
   it("L1 and L2 each carry their own who / when / held; L2's clock starts when L1 approves", async () => {
-    const t = await makeTeam({ expenseEscalationThreshold: 1000, seniorApproverId: null });
-    await CustomerWorkspace.updateOne({ _id: new mongoose.Types.ObjectId(t.wsId) }, { $set: { "config.seniorApproverId": new mongoose.Types.ObjectId(t.admin.id) } });
+    const t = await makeTeam();
+    // The legacy escalation settings live on the policy document (sub-step 4).
+    await updatePolicy({ workspaceId: t.wsId, patch: { legacyEscalation: { claimThresholdBase: 1000, seniorApproverId: t.admin.id } } });
     const E = as(t.employee);
     const line = (await E.post("/api/expenses", { amount: 5000, date: TODAY })).body.expense;
     const claim = (await E.post("/api/reports", { name: "Two levels" })).body.report;

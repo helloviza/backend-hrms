@@ -1,0 +1,189 @@
+// apps/backend/src/services/expenseRoutingInput.service.ts
+//
+// Builds the input for routeClaim() from the database — the ONE place that
+// knows how to turn a workspace + a submitter + an amount into the pool of
+// candidates, the manager, the rank table, the policy and the bot pre-checks.
+// Used by the simulator now (sub-step 4) and by the live engine next
+// (sub-step 5), so both route from identical facts. Read-only.
+//
+// Department of the submitter: the engine keys on the managed Department
+// collection (ids). Today HRMS users carry a free-text `department` NAME;
+// travellers carry TravellerProfile.departmentId. Resolution order:
+//   explicit departmentId (simulator) → TravellerProfile.departmentId for
+//   this user → Department by name = User.department (within the workspace)
+//   → null.
+import mongoose from "mongoose";
+import User from "../models/User.js";
+import Report from "../models/Report.js";
+import Expense from "../models/Expense.js";
+import Department from "../models/Department.js";
+import TravellerProfile from "../models/TravellerProfile.js";
+import ExpenseApproverGrant from "../models/ExpenseApproverGrant.js";
+import { getPolicy } from "./expensePolicy.service.js";
+import { getRankTable } from "./expenseAuthority.service.js";
+import { getWorkspaceBaseCurrency, effectiveAmountBase } from "./expenseFx.service.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
+import type { RoutingInput, RoutingPerson, RoutingChecks } from "./expenseRouting.service.js";
+
+const oid = (v: any) => new mongoose.Types.ObjectId(String(v));
+
+function nameOf(u: any): string {
+  return [u?.firstName, u?.lastName].filter(Boolean).join(" ").trim() || u?.name || u?.email || String(u?._id || "");
+}
+
+export async function resolveSubmitterDepartmentId(workspaceId: any, user: any): Promise<string | null> {
+  if (!user) return null;
+  const tp: any = await TravellerProfile.findOne({ workspaceId: oid(workspaceId), officialUserId: user._id })
+    .select("departmentId")
+    .lean()
+    .catch(() => null);
+  if (tp?.departmentId) return String(tp.departmentId);
+  const name = String(user.department || "").trim();
+  if (!name) return null;
+  const d: any = await Department.findOne({ workspaceId: oid(workspaceId), name, isActive: true }).select("_id").lean();
+  return d ? String(d._id) : null;
+}
+
+/** Bot pre-checks from a claim's lines (the same facts validateReportForSubmit warns on). */
+export function checksFromLines(lines: any[]): RoutingChecks {
+  const seen = new Set<string>();
+  let dupes = 0;
+  for (const e of lines) {
+    const day = e.date ? new Date(e.date).toISOString().slice(0, 10) : "";
+    const key = [String(e.merchant || "").trim().toLowerCase(), Number(e.amount) || 0, day].join("|");
+    if (seen.has(key)) dupes++;
+    else seen.add(key);
+  }
+  return {
+    receipt: lines.length > 0 && lines.every((e) => !!e.imageKey),
+    category: lines.length > 0 && lines.every((e) => !!e.categoryId),
+    noDuplicate: dupes === 0,
+    positiveAmounts: lines.length > 0 && lines.every((e) => Number(e.amount) > 0),
+  };
+}
+
+/** Everyone in the workspace who could be an approver, with their grant. */
+export async function loadRoutingPeople(workspaceId: any): Promise<RoutingPerson[]> {
+  const ws = oid(workspaceId);
+  const [users, grants] = await Promise.all([
+    User.find({ workspaceId: ws }).select("firstName lastName name email status bandNumber").lean(),
+    ExpenseApproverGrant.find({ workspaceId: ws, active: true }).lean(),
+  ]);
+  const gById = new Map<string, any>(grants.map((g: any) => [String(g.userId), g]));
+  const activeFilter: any = activeUserFilter();
+  const isActive = (u: any) => String(u.status || "ACTIVE").toUpperCase() !== "INACTIVE" && (activeFilter ? true : true);
+  return users.map((u: any) => {
+    const g = gById.get(String(u._id));
+    return {
+      id: String(u._id),
+      name: nameOf(u),
+      active: isActive(u),
+      bandNumber: u.bandNumber ?? null,
+      approver: !!g?.approver,
+      personalLimitBase: g?.limitBase == null ? null : Number(g.limitBase),
+      departmentIds: Array.isArray(g?.scope?.departmentIds) ? g.scope.departmentIds.map(String) : [],
+    };
+  });
+}
+
+export type BuildRoutingParams = {
+  workspaceId: any;
+  kind?: "claim" | "advance";
+  reportId?: string; // existing claim → amount, categories, checks, submitter from it
+  submitterId?: string; // hypothetical: who submits
+  amountBase?: number;
+  categoryIds?: string[];
+  departmentId?: string | null;
+  checks?: Partial<RoutingChecks>; // hypothetical: assume these (default all pass)
+};
+
+export type BuildRoutingResult = {
+  input?: RoutingInput;
+  summary?: Record<string, any>;
+  error?: string;
+  status?: number;
+};
+
+export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRoutingResult> {
+  const ws = oid(p.workspaceId);
+  const kind = p.kind ?? "claim";
+
+  let submitterId = p.submitterId;
+  let amountBase = p.amountBase;
+  let categoryIds = p.categoryIds ?? [];
+  let checks: RoutingChecks = { receipt: true, category: true, noDuplicate: true, positiveAmounts: true, ...(p.checks || {}) };
+  let fromClaim: any = null;
+
+  if (p.reportId) {
+    if (!mongoose.Types.ObjectId.isValid(p.reportId)) return { error: "Invalid reportId", status: 400 };
+    const report: any = await Report.findOne({ _id: oid(p.reportId), workspaceId: ws }).lean();
+    if (!report) return { error: "Claim not found", status: 404 };
+    const baseCurrency = await getWorkspaceBaseCurrency(ws);
+    const lines: any[] = await Expense.find({ workspaceId: ws, reportId: report._id }).lean();
+    const pending = lines.filter((l) => effectiveAmountBase(l, baseCurrency) == null).length;
+    amountBase = Math.round(lines.reduce((s, l) => s + (effectiveAmountBase(l, baseCurrency) ?? 0), 0) * 100) / 100;
+    categoryIds = [...new Set(lines.map((l) => (l.categoryId ? String(l.categoryId) : null)).filter(Boolean) as string[])];
+    checks = checksFromLines(lines);
+    submitterId = submitterId ?? String(report.employeeId);
+    fromClaim = { reportId: String(report._id), ref: report.ref, status: report.status, lineCount: lines.length, pendingConversion: pending };
+  }
+
+  if (!submitterId || !mongoose.Types.ObjectId.isValid(submitterId)) return { error: "submitterId (or reportId) is required", status: 400 };
+  if (amountBase == null || !Number.isFinite(Number(amountBase)) || Number(amountBase) < 0) {
+    return { error: "amountBase must be a non-negative number (or pass reportId)", status: 400 };
+  }
+  if (categoryIds.some((c) => !mongoose.Types.ObjectId.isValid(String(c)))) return { error: "categoryIds contains an invalid id", status: 400 };
+
+  const submitter: any = await User.findOne({ _id: oid(submitterId), workspaceId: ws })
+    .select("firstName lastName name email department managerId status bandNumber")
+    .lean();
+  if (!submitter) return { error: "Submitter not found in this workspace", status: 404 };
+
+  let departmentId: string | null;
+  if (p.departmentId !== undefined) {
+    if (p.departmentId === null) departmentId = null;
+    else {
+      if (!mongoose.Types.ObjectId.isValid(p.departmentId)) return { error: "departmentId is not a valid id", status: 400 };
+      const d = await Department.findOne({ _id: oid(p.departmentId), workspaceId: ws }).select("_id").lean();
+      if (!d) return { error: "departmentId is not a department of this workspace", status: 400 };
+      departmentId = String(d._id);
+    }
+  } else {
+    departmentId = await resolveSubmitterDepartmentId(ws, submitter);
+  }
+
+  const [policy, rankTable, people, baseCurrency] = await Promise.all([
+    getPolicy(ws),
+    getRankTable(ws),
+    loadRoutingPeople(ws),
+    getWorkspaceBaseCurrency(ws),
+  ]);
+  const manager = submitter.managerId ? people.find((x) => x.id === String(submitter.managerId)) ?? null : null;
+
+  const input: RoutingInput = {
+    kind,
+    amountBase: Number(amountBase),
+    baseCurrency,
+    categoryIds: categoryIds.map(String),
+    submitter: { id: String(submitter._id), name: nameOf(submitter), departmentId, managerId: submitter.managerId ? String(submitter.managerId) : null },
+    manager,
+    candidates: people,
+    checks,
+    policy,
+    rankTable,
+  };
+  const summary = {
+    kind,
+    amountBase: input.amountBase,
+    baseCurrency,
+    submitter: input.submitter,
+    departmentId,
+    categoryIds: input.categoryIds,
+    checks,
+    fromClaim,
+    policyVersion: policy.version,
+    engineEnabled: policy.engineEnabled,
+    approverPoolSize: people.filter((x) => x.approver && x.active && x.id !== input.submitter.id).length,
+  };
+  return { input, summary };
+}

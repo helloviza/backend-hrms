@@ -32,6 +32,7 @@ const { requireWorkspace } = await import("../middleware/requireWorkspace.js");
 const { requireFeature, requireExpenseAdvancesFeature } = await import("../middleware/requireFeature.js");
 const { signToken } = await import("../utils/jwt.js");
 const { attachExpenseGrant, upsertGrant } = await import("../services/expenseGrants.service.js");
+const { updatePolicy } = await import("../services/expensePolicy.service.js");
 const { default: CustomerWorkspace } = await import("../models/CustomerWorkspace.js");
 const { default: User } = await import("../models/User.js");
 const { default: Expense } = await import("../models/Expense.js");
@@ -420,10 +421,8 @@ describe("6 · withdraw a submitted claim", () => {
     team = await makeTeam();
     const admin = await makeUser(team.wsId, ["EMPLOYEE"]);
     await upsertGrant({ workspaceId: team.wsId, userId: admin.id, patch: { expenseAdmin: true } });
-    await CustomerWorkspace.updateOne(
-      { _id: new mongoose.Types.ObjectId(team.wsId) },
-      { $set: { "config.expenseEscalationThreshold": 100, "config.seniorApproverId": new mongoose.Types.ObjectId(admin.id) } },
-    );
+    // The legacy escalation settings live on the policy document (sub-step 4).
+    await updatePolicy({ workspaceId: team.wsId, patch: { legacyEscalation: { claimThresholdBase: 100, seniorApproverId: admin.id } } });
     ({ me, claim } = await submittedClaim(team)); // total 350 > 100 → 2 levels
     expect((await Report.findById(claim._id).lean())!.approvalChain).toHaveLength(2);
     expect((await as(team.manager).post(`/api/reports/${claim._id}/approve`)).status).toBe(200);

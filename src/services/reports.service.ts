@@ -22,6 +22,7 @@ import { isAdmin, userIdOf, ADMIN_ROLE_PREFILTER } from "./expense.access.js";
 import { expenseAdminUserIds, withGrants } from "./expenseGrants.service.js";
 import { appendActivity, lineSnapshot, msBetween } from "./expenseAudit.service.js";
 import { SYSTEM_ACTOR, type ExpenseActorType } from "../models/ExpenseActivity.js";
+import { getPolicy } from "./expensePolicy.service.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import {
   amountBaseExpr,
@@ -555,10 +556,11 @@ async function resolveApprovalChain(
   const l1 = await resolveL1Approver(workspaceId, submitterId, trace);
 
   // L2 escalation — gated on a configured threshold the claim total exceeds.
-  const ws: any = await CustomerWorkspace.findById(workspaceId)
-    .select("config.expenseEscalationThreshold config.seniorApproverId")
-    .lean();
-  const threshold = ws?.config?.expenseEscalationThreshold ?? null;
+  // The threshold + senior approver live on the policy document (legacy
+  // block) since sub-step 4; the walk itself is unchanged until sub-step 5.
+  const legacy = (await getPolicy(workspaceId)).legacyEscalation;
+  const threshold = legacy.claimThresholdBase;
+  const seniorApproverId = legacy.seniorApproverId;
   const overThreshold = threshold != null && Number(totalAmount) > Number(threshold);
 
   // The routing decision, recorded in the shape the engine (sub-step 5) will
@@ -600,7 +602,7 @@ async function resolveApprovalChain(
     const l2 = await resolveL2Approver(
       workspaceId,
       l1.user,
-      ws?.config?.seniorApproverId,
+      seniorApproverId,
       [String(submitterId), String(l1.id)],
       trace,
     );
@@ -649,10 +651,8 @@ export async function resolveAdvanceApprovalChain(
   const now = new Date();
   const trace: RoutingTraceEntry[] = [];
   const l1 = await resolveL1Approver(ws, reqId, trace);
-  const cfg: any = await CustomerWorkspace.findById(ws)
-    .select("config.advanceEscalationThreshold config.seniorApproverId")
-    .lean();
-  const threshold = cfg?.config?.advanceEscalationThreshold ?? null;
+  const legacy = (await getPolicy(ws)).legacyEscalation;
+  const threshold = legacy.advanceThresholdBase;
   const overThreshold = threshold != null && Number(amount) > Number(threshold);
   const routing: Record<string, any> = {
     mode: "legacy_manager_admin",
@@ -678,7 +678,7 @@ export async function resolveAdvanceApprovalChain(
   routing.chosen.push({ level: 1, userId: String(l1.id), name: employeeNameOf(l1.user), via: l1Via });
 
   if (overThreshold) {
-    const l2 = await resolveL2Approver(ws, l1.user, cfg?.config?.seniorApproverId, [String(reqId), String(l1.id)], trace);
+    const l2 = await resolveL2Approver(ws, l1.user, legacy.seniorApproverId, [String(reqId), String(l1.id)], trace);
     if (l2) {
       const l2Via = trace.find((e) => e.level === 2 && e.outcome === "chosen")?.step ?? "unknown";
       chain.push({ level: 2, approverId: l2._id, status: "pending", decidedAt: null, note: null, actorType: "user", via: l2Via, routedAt: null });
