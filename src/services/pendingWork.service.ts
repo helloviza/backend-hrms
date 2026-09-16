@@ -167,7 +167,14 @@ export async function collectPendingWork(args: {
    *    the live approver inbox matches on managerEmail. So match id OR email,
    *    exactly as that route does. "Open" for an L2 decision is status
    *    "pending" (on-hold is written as pending + stage REQUEST_ON_HOLD); the
-   *    schema's legacy "on_hold" status is kept in the set. */
+   *    schema's legacy "on_hold" status is kept in the set.
+   *
+   *    Deliberately NOT workspace-scoped: ApprovalRequest.workspaceId is the
+   *    tenant the request was raised IN (prod: HOUSE approvers on customer-
+   *    workspace requests), not the person's home workspace — scoping by the
+   *    latter drops exactly the cross-workspace approvals that stall. Cross-
+   *    tenant safety is enforced upstream (resolveStatusTarget 404s before
+   *    this runs). This reasoning is specific to this model's id-space. */
   const userIdStr = String(userId);
   const userEmail = String(((await User.findById(userId).select("email").lean()) as any)?.email || "").trim();
   const personMatch = (idField: string, emailField: string) => ({
@@ -244,7 +251,7 @@ export async function collectPendingWork(args: {
       { updatedAt: -1 },
       "Handled in that workspace's SBT inbox by its Workspace Leader (no admin page)."),
     source("travelApprovalsToDecide", "Travel approvals to decide", ApprovalRequest,
-      { ...personMatch("managerId", "managerEmail"), ...APPROVAL_OPEN, ...wsScope },
+      { ...personMatch("managerId", "managerEmail"), ...APPROVAL_OPEN },
       "/admin/approvals",
       approvalItem),
     source("manualBookingsAssigned", "Manual bookings assigned (ops)", ManualBooking,
@@ -312,7 +319,7 @@ export async function collectPendingWork(args: {
       { updatedAt: -1 },
       "Visible only to the requester and their booker / Workspace Leader (no admin page)."),
     source("ownTravelApprovals", "Own travel approval requests pending", ApprovalRequest,
-      { ...personMatch("frontlinerId", "frontlinerEmail"), ...APPROVAL_OPEN, ...wsScope },
+      { ...personMatch("frontlinerId", "frontlinerEmail"), ...APPROVAL_OPEN },
       "/admin/approvals",
       approvalItem),
     source("ownDeclarations", "Tax declarations unsubmitted / in flight", EmployeeDeclaration,

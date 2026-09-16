@@ -167,10 +167,19 @@ beforeAll(async () => {
     // Already decided — excluded
     { workspaceId: WS, ticketId: "T-099", frontlinerId: String(ids.peer), frontlinerEmail: "peer@plumtrips.com", managerId: String(RAVI), managerEmail: "ravi@plumtrips.com", status: "approved", stage: "PROPOSAL_PENDING", adminState: "pending" },
     { workspaceId: WS, ticketId: "T-098", frontlinerId: String(ids.peer), frontlinerEmail: "peer@plumtrips.com", managerId: String(RAVI), managerEmail: "ravi@plumtrips.com", status: "declined", stage: "REQUEST_DECLINED", adminState: "cancelled" },
-    // Another tenant's row pointing at the same id — never counted
-    { workspaceId: new mongoose.Types.ObjectId(), ticketId: "T-OTHER", frontlinerId: String(ids.peer), frontlinerEmail: "peer@other.test", managerId: String(RAVI), managerEmail: "ravi@plumtrips.com", status: "pending", stage: "REQUEST_RAISED" },
+    // Raised in ANOTHER customer workspace with Ravi as approver — COUNTED:
+    // ApprovalRequest.workspaceId is the tenant the request was raised in
+    // (prod: HOUSE approvers on customer-workspace requests), not the
+    // approver's home workspace, so the source is not workspace-scoped.
+    { workspaceId: OTHER_WS, ticketId: "T-OTHER", frontlinerId: String(ids.peer), frontlinerEmail: "peer@other.test", managerId: String(RAVI), managerEmail: "ravi@plumtrips.com", status: "pending", stage: "REQUEST_RAISED" },
+    // Same workspace, a DIFFERENT approver (id and email) — never Ravi's
+    { workspaceId: WS, ticketId: "T-NOT-RAVI", frontlinerId: String(ids.peer), frontlinerEmail: "peer@plumtrips.com", managerId: String(ids.admin), managerEmail: "ops@plumtrips.com", status: "pending", stage: "REQUEST_RAISED" },
     // Ravi RAISED this one, awaiting the admin — owned, still open
     { workspaceId: WS, ticketId: "T-101", frontlinerId: String(RAVI), frontlinerEmail: "ravi@plumtrips.com", managerId: String(ids.admin), managerEmail: "ops@plumtrips.com", status: "pending", stage: "REQUEST_RAISED" },
+    // Ravi raised it, but frontlinerId is a STALE id (the User doc it named
+    // was replaced in the duplicate-user cleanup) — attributed by email, the
+    // live Inteletek shape (4 of prod's 6 pending rows, 2026-09-16). Counted.
+    { workspaceId: WS, ticketId: "T-STALE", frontlinerId: new mongoose.Types.ObjectId().toHexString(), frontlinerEmail: "ravi@plumtrips.com", managerId: String(ids.admin), managerEmail: "ops@plumtrips.com", status: "pending", stage: "REQUEST_RAISED" },
     // Ravi raised, already approved — excluded from "owned"
     { workspaceId: WS, ticketId: "T-097", frontlinerId: String(RAVI), frontlinerEmail: "ravi@plumtrips.com", managerId: String(ids.admin), managerEmail: "ops@plumtrips.com", status: "approved", stage: "BOOKING_DONE", adminState: "done" },
   ] as any[]);
@@ -252,17 +261,18 @@ describe("GET /employees/:id/pending-work", () => {
     expect(b1.advancesToApprove.count).toBe(1);
     expect(b1.sbtRequestsToBook.count).toBe(1);
     expect(b1.sbtRequestsToBook.items[0].title).toBe("flight request · P Q");
-    // ApprovalRequest (live model): by managerId (T-100) + by managerEmail only,
-    // on hold (T-102); approved / declined / other-tenant rows excluded.
-    expect(b1.travelApprovalsToDecide.count).toBe(2);
-    expect(b1.travelApprovalsToDecide.items.map((i: any) => i.title).sort()).toEqual(["Ticket T-100 · Acme", "Ticket T-102"]);
+    // ApprovalRequest (live model): by managerId (T-100), by managerEmail only
+    // on hold (T-102), raised in another workspace (T-OTHER); approved /
+    // declined / different-approver rows excluded.
+    expect(b1.travelApprovalsToDecide.count).toBe(3);
+    expect(b1.travelApprovalsToDecide.items.map((i: any) => i.title).sort()).toEqual(["Ticket T-100 · Acme", "Ticket T-102", "Ticket T-OTHER"]);
     expect(b1.travelApprovalsToDecide.items.find((i: any) => i.title === "Ticket T-102").status).toBe("on hold");
     expect(b1.travelApprovalsToDecide.hrefAll).toBe("/admin/approvals");
     expect(b1.manualBookingsAssigned.count).toBe(1);
     expect(b1.visaApplicationsAssigned.count).toBe(1); // closed + draft excluded
     expect(b1.leaveApprovalsOfReports.count).toBe(1); // report1 PENDING; report2 APPROVED excluded
     expect(b1.odApprovalsOfReports.count).toBe(1);
-    expect(res.body.totals.awaitingAction).toBe(11);
+    expect(res.body.totals.awaitingAction).toBe(12);
 
     const b2 = byKey(res.body.owned);
     expect(b2.leads.count).toBe(1);
@@ -280,11 +290,12 @@ describe("GET /employees/:id/pending-work", () => {
     expect(b2.ownAdvances.count).toBe(1);
     expect(b2.ownReimbursementClaims.count).toBe(1);
     expect(b2.ownSbtRequests.count).toBe(1);
-    expect(b2.ownTravelApprovals.count).toBe(1); // T-101 raised by Ravi, pending; T-097 approved excluded
-    expect(b2.ownTravelApprovals.items[0].title).toBe("Ticket T-101");
+    // T-101 (by id) + T-STALE (stale frontlinerId, matched by email); T-097 approved excluded
+    expect(b2.ownTravelApprovals.count).toBe(2);
+    expect(b2.ownTravelApprovals.items.map((i: any) => i.title).sort()).toEqual(["Ticket T-101", "Ticket T-STALE"]);
     expect(b2.ownDeclarations.count).toBe(1);
     expect(b2.ownDateChangeRequests.count).toBe(1);
-    expect(res.body.totals.owned).toBe(10);
+    expect(res.body.totals.owned).toBe(11);
 
     // Every emitted link must be a route an ADMIN can load (router.tsx);
     // sources with no admin-reachable page carry no link and say why.
@@ -434,7 +445,7 @@ describe("Employment Status coupling", () => {
     const audit: any = await UserStatusAudit.findOne({ userId: oid(ids.ravi) }).lean();
     expect(audit.trigger).toBe("employment_status");
     expect(audit.employmentStatus).toBe("terminated");
-    expect(audit.pendingWorkSnapshot.totals).toEqual({ awaitingAction: 11, owned: 10, standing: 9 });
+    expect(audit.pendingWorkSnapshot.totals).toEqual({ awaitingAction: 12, owned: 11, standing: 9 });
     expect(audit.pendingWorkSnapshot.awaitingAction.tasks).toBe(1);
     expect(audit.pendingWorkSnapshot.standing.reportsTo).toBe(2);
   });
