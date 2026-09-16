@@ -14,6 +14,7 @@ import mongoose from "mongoose";
 import ExcelJS from "exceljs";
 import {
   seesAll,
+  isAdmin as isAdminUser,
   isFinance as isFinanceUser,
   canDecide as canDecideUser,
   canReimburse as canReimburseUser,
@@ -40,6 +41,7 @@ import {
   settleEarmarksForClaim,
   releaseEarmarksForClaim,
   listAppliedAdvancesForClaim,
+  claimTotal,
   round2,
 } from "../services/advanceSettlement.service.js";
 
@@ -54,6 +56,8 @@ import {
   getWorkspaceBaseCurrency,
   fxView,
 } from "../services/expenseFx.service.js";
+import { appendActivity, msBetween, fmtDuration } from "../services/expenseAudit.service.js";
+import { normalizeActorType } from "../models/ExpenseActivity.js";
 
 const router = express.Router();
 
@@ -645,8 +649,12 @@ router.get("/:id", async (req: any, res: any) => {
       event: a.event,
       actorName: a.actorName,
       actorId: a.actorId ? String(a.actorId) : null,
+      actorType: normalizeActorType(a), // rows from before sub-step 2 normalise by name
       expenseId: a.expenseId ? String(a.expenseId) : null,
       note: a.note ?? null,
+      elapsedMs: a.elapsedMs ?? null,
+      heldMs: a.heldMs ?? null,
+      details: a.details ?? null,
       createdAt: a.createdAt,
     }));
 
@@ -851,13 +859,18 @@ router.post("/:id/withdraw", async (req: any, res: any) => {
     await propagateReportLifecycle(req.workspaceObjectId, rid, "draft");
 
     const me = ownEmployeeId(req);
+    const withdrawnAt = new Date();
+    const inReviewMs = msBetween(report.submittedAt, withdrawnAt);
     await logActivity({
       workspaceId: req.workspaceObjectId,
       reportId: rid,
       event: "withdrawn",
       actorId: me,
       actorName: actorNameOf(req),
-      note: "Withdrawn before review — back to draft",
+      actorType: "user",
+      heldMs: inReviewMs,
+      note: `Withdrawn before review (after ${fmtDuration(inReviewMs) || "n/a"}) — back to draft`,
+      details: { submittedAt: report.submittedAt ?? null, withdrawnAt, inReviewMs, previousApproverId: report.approverId ? String(report.approverId) : null },
     });
 
     res.json({ ok: true, report: flipped.toObject() });
@@ -866,6 +879,19 @@ router.post("/:id/withdraw", async (req: any, res: any) => {
     res.status(500).json({ error: err?.message || "Failed to withdraw report" });
   }
 });
+
+/** Audit plumbing (sub-step 2): ms the CURRENT chain level sat with its
+ *  approver — from the level's routedAt (stamped at submit / on advance), or
+ *  the submit time for a chain that predates routedAt. Also stamps heldMs on
+ *  the level itself so the chain and the timeline agree. */
+function stampHeld(report: any, idx: number, decidedAt: Date): number | null {
+  const chain: any[] = Array.isArray(report.approvalChain) ? report.approvalChain : [];
+  const lvl = chain[idx];
+  const routedAt = lvl?.routedAt ?? (idx === 0 ? report.submittedAt : null);
+  const held = msBetween(routedAt, decidedAt);
+  if (lvl) lvl.heldMs = held;
+  return held;
+}
 
 /* ── Authorization helper for approve/reject ─────────────────────────
  * The actor must be the routed approver OR an admin. A NON-admin cannot decide
@@ -902,16 +928,29 @@ router.post("/:id/approve", async (req: any, res: any) => {
     const idx = Math.min(Math.max((report.currentLevel || 1) - 1, 0), Math.max(chain.length - 1, 0));
     const levelNo = idx + 1;
 
-    // Stamp THIS level approved + who actually decided it.
+    // Stamp THIS level approved + who actually decided it + how long it sat.
+    const decidedAt = new Date();
+    const heldMs = stampHeld(report, idx, decidedAt);
     if (chain[idx]) {
       chain[idx].status = "approved";
-      chain[idx].decidedAt = new Date();
+      chain[idx].decidedAt = decidedAt;
       chain[idx].approverId = new mongoose.Types.ObjectId(me);
       if (note) chain[idx].note = note;
     }
     report.markModified("approvalChain");
 
     const hasNext = idx < chain.length - 1;
+    const decisionDetails = {
+      level: levelNo,
+      ofLevels: totalLevels,
+      routedAt: chain[idx]?.routedAt ?? report.submittedAt ?? null,
+      decidedAt,
+      heldMs,
+      via: chain[idx]?.via ?? null,
+      note,
+      selfApproved: isSelf,
+      adminOverride: !!(canDecide(req, report).admin && String(report.approverId) !== me), // decided by an admin who was not the routed approver
+    };
 
     if (hasNext) {
       // ── Advance: not the last level → move to the next approver. The claim
@@ -919,6 +958,7 @@ router.post("/:id/approve", async (req: any, res: any) => {
       // "awaiting L2" is derived from currentLevel. approverId is repointed to the
       // next approver so the queue + pending-count + canDecide all follow along.
       const next = chain[idx + 1];
+      next.routedAt = decidedAt; // the next approver's clock starts now
       report.currentLevel = levelNo + 1;
       report.approverId = next.approverId; // denorm pointer → next pending approver
       report.selfApproved = isSelf;
@@ -930,7 +970,10 @@ router.post("/:id/approve", async (req: any, res: any) => {
         event: "approved",
         actorId: me,
         actorName: actorNameOf(req),
-        note: `Approved (L${levelNo}) → awaiting L${levelNo + 1}`,
+        actorType: "user",
+        heldMs,
+        note: `Approved (L${levelNo}, held ${fmtDuration(heldMs) || "n/a"}) → awaiting L${levelNo + 1}`,
+        details: { ...decisionDetails, nextLevel: levelNo + 1, nextApproverId: String(next.approverId) },
       });
 
       // Notify the next approver (best-effort — mirrors the submit notification).
@@ -975,11 +1018,16 @@ router.post("/:id/approve", async (req: any, res: any) => {
       event: "approved",
       actorId: me,
       actorName: actorNameOf(req),
+      actorType: "user",
+      heldMs,
       note: totalLevels > 1
-        ? `Approved (final, L${levelNo})`
+        ? `Approved (final, L${levelNo}, held ${fmtDuration(heldMs) || "n/a"})`
         : isSelf
           ? "Self-approved by admin"
-          : null,
+          : heldMs != null
+            ? `Approved (held ${fmtDuration(heldMs)})`
+            : null,
+      details: { ...decisionDetails, final: true },
     });
 
     res.json({ ok: true, report: report.toObject() });
@@ -1015,9 +1063,11 @@ router.post("/:id/decline", async (req: any, res: any) => {
     const chain: any[] = Array.isArray(report.approvalChain) ? report.approvalChain : [];
     const idx = Math.min(Math.max((report.currentLevel || 1) - 1, 0), Math.max(chain.length - 1, 0));
     const levelNo = idx + 1;
+    const decidedAt = new Date();
+    const heldMs = stampHeld(report, idx, decidedAt);
     if (chain[idx]) {
       chain[idx].status = "declined";
-      chain[idx].decidedAt = new Date();
+      chain[idx].decidedAt = decidedAt;
       chain[idx].approverId = new mongoose.Types.ObjectId(me);
       chain[idx].note = note;
     }
@@ -1059,7 +1109,10 @@ router.post("/:id/decline", async (req: any, res: any) => {
       event: "declined",
       actorId: me,
       actorName: actorNameOf(req),
+      actorType: "user",
+      heldMs,
       note: (chain.length || 1) > 1 ? `Declined (L${levelNo}): ${note}` : note,
+      details: { level: levelNo, ofLevels: chain.length || 1, routedAt: chain[idx]?.routedAt ?? report.submittedAt ?? null, decidedAt, heldMs, via: chain[idx]?.via ?? null, note, selfApproved: isSelf },
     });
 
     res.json({ ok: true, report: report.toObject() });
@@ -1096,9 +1149,11 @@ router.post("/:id/request-clarification", async (req: any, res: any) => {
     const chain: any[] = Array.isArray(report.approvalChain) ? report.approvalChain : [];
     const idx = Math.min(Math.max((report.currentLevel || 1) - 1, 0), Math.max(chain.length - 1, 0));
     const levelNo = idx + 1;
+    const decidedAt = new Date();
+    const heldMs = stampHeld(report, idx, decidedAt);
     if (chain[idx]) {
       chain[idx].status = "clarification_required";
-      chain[idx].decidedAt = new Date();
+      chain[idx].decidedAt = decidedAt;
       chain[idx].approverId = new mongoose.Types.ObjectId(me);
       chain[idx].note = note;
     }
@@ -1123,7 +1178,10 @@ router.post("/:id/request-clarification", async (req: any, res: any) => {
       event: "clarification_requested",
       actorId: me,
       actorName: actorNameOf(req),
+      actorType: "user",
+      heldMs,
       note: (chain.length || 1) > 1 ? `Clarification (L${levelNo}): ${note}` : note,
+      details: { level: levelNo, ofLevels: chain.length || 1, routedAt: chain[idx]?.routedAt ?? report.submittedAt ?? null, decidedAt, heldMs, via: chain[idx]?.via ?? null, note, selfApproved: isSelf },
     });
 
     res.json({ ok: true, report: report.toObject() });
@@ -1144,14 +1202,27 @@ router.post("/:id/reimburse", async (req: any, res: any) => {
     if (report.status !== "approved") {
       return res.status(409).json({ error: "Only approved reports can be reimbursed" });
     }
+    // Audit integrity (sub-step 2): NOBODY pays their own claim — not finance,
+    // not an admin, not a superadmin. Checked before every other gate.
+    if (String(report.employeeId) === ownEmployeeId(req)) {
+      return res.status(403).json({
+        error: "You can't reimburse your own claim — a different finance user must pay it out.",
+        code: "OWN_CLAIM_PAYOUT_DENIED",
+      });
+    }
     // Finance-only + same-claim SoD: a finance user may not reimburse a claim
-    // they themselves approved; an admin may (owner-operator override). UNCHANGED.
+    // they themselves approved; an admin may (owner-operator override, LOGGED
+    // below as sodOverride — audit F-18).
     if (!canReimburseUser(req.user, report)) {
       if (!isFinance(req)) return res.status(403).json({ error: "Finance access required" });
       return res.status(403).json({
         error: "You approved this claim — a different finance user must reimburse it.",
       });
     }
+    const payerWasApprover = [
+      ...(Array.isArray(report.approvalChain) ? report.approvalChain.map((l: any) => String(l?.approverId || "")) : []),
+      String(report.approverId || ""),
+    ].includes(ownEmployeeId(req));
 
     const ws = req.workspaceObjectId;
     const rid = report._id as mongoose.Types.ObjectId;
@@ -1188,13 +1259,15 @@ router.post("/:id/reimburse", async (req: any, res: any) => {
       // Audit each advance drawdown on the ADVANCE timeline (best-effort).
       for (const pa of perAdvance) {
         try {
-          await ExpenseActivity.create({
+          await appendActivity({
             workspaceId: ws,
-            advanceId: new mongoose.Types.ObjectId(pa.advanceId),
+            advanceId: pa.advanceId,
             event: "settled",
-            actorId: new mongoose.Types.ObjectId(ownEmployeeId(req)),
+            actorId: ownEmployeeId(req),
             actorName: actorNameOf(req),
+            actorType: "user",
             note: `Settled ${pa.settledAmount} against ${report.ref} (→ ${pa.newStatus})`,
+            details: { reportId: String(rid), claimRef: report.ref, settledAmount: pa.settledAmount, newStatus: pa.newStatus },
           });
         } catch (e: any) {
           console.error("[advance settle log]", e?.message || e);
@@ -1204,13 +1277,30 @@ router.post("/:id/reimburse", async (req: any, res: any) => {
 
     await propagateReportLifecycle(ws, rid, "reimbursed");
 
+    const paidAt = flipped.reimbursedAt ?? new Date();
+    const paidClaimTotal = await claimTotal(ws, rid);
+    const sinceApprovalMs = msBetween(report.approvedAt, paidAt);
     await logActivity({
       workspaceId: ws,
       reportId: rid,
       event: "reimbursed",
       actorId: ownEmployeeId(req),
       actorName: actorNameOf(req),
-      note: reimburseNote,
+      actorType: "user",
+      heldMs: sinceApprovalMs,
+      note: [reimburseNote, payerWasApprover ? "Admin SoD override: payer also approved this claim" : null]
+        .filter(Boolean)
+        .join(" · ") || null,
+      details: {
+        approvedAt: report.approvedAt ?? null,
+        paidAt,
+        sinceApprovalMs,
+        claimTotal: paidClaimTotal,
+        advancesApplied: flipped.advanceAppliedTotal ?? 0,
+        netPayout: flipped.reimbursedAmount ?? null,
+        sodOverride: payerWasApprover,
+        payerIsAdmin: isAdminUser(req.user),
+      },
     });
 
     res.json({ ok: true, report: flipped.toObject() });

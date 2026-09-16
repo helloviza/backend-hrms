@@ -20,6 +20,8 @@ import { refFromId } from "../utils/refFromId.js";
 import { sendClaimSubmittedEmail } from "../utils/claimEmails.js";
 import { isAdmin, userIdOf, ADMIN_ROLE_PREFILTER } from "./expense.access.js";
 import { expenseAdminUserIds, withGrants } from "./expenseGrants.service.js";
+import { appendActivity, lineSnapshot, msBetween } from "./expenseAudit.service.js";
+import { SYSTEM_ACTOR, type ExpenseActorType } from "../models/ExpenseActivity.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import {
   amountBaseExpr,
@@ -46,24 +48,25 @@ export async function logActivity(params: {
   actorId?: mongoose.Types.ObjectId | string | null;
   expenseId?: mongoose.Types.ObjectId | string | null;
   note?: string | null;
+  // Audit plumbing (sub-step 2): who-vs-what, how long it sat with the actor,
+  // and the structured payload. All optional — every pre-existing call site
+  // keeps working and gets elapsedMs for free from appendActivity.
+  actorType?: ExpenseActorType;
+  heldMs?: number | null;
+  details?: Record<string, any> | null;
 }): Promise<void> {
   try {
-    const actorId =
-      params.actorId && mongoose.Types.ObjectId.isValid(String(params.actorId))
-        ? new mongoose.Types.ObjectId(String(params.actorId))
-        : null;
-    const expenseId =
-      params.expenseId && mongoose.Types.ObjectId.isValid(String(params.expenseId))
-        ? new mongoose.Types.ObjectId(String(params.expenseId))
-        : null;
-    await ExpenseActivity.create({
-      workspaceId: new mongoose.Types.ObjectId(String(params.workspaceId)),
-      reportId: new mongoose.Types.ObjectId(String(params.reportId)),
-      expenseId,
+    await appendActivity({
+      workspaceId: params.workspaceId,
+      reportId: params.reportId,
+      expenseId: params.expenseId ?? null,
       event: params.event,
-      actorId,
+      actorId: params.actorId ?? null,
       actorName: params.actorName || "System",
+      actorType: params.actorType,
       note: params.note ?? null,
+      heldMs: params.heldMs ?? null,
+      details: params.details ?? null,
     });
   } catch (err: any) {
     console.error("[expense activity log]", params.event, err?.message || err);
@@ -391,11 +394,32 @@ async function expenseAdminCandidates(
 // answering "who approves this?" identically. A visa request whose submitter
 // has no distinct approver is handled by the CALLER (visa self-routes rather
 // than refusing, unlike claims) — not by changing anything here.
+/**
+ * One line of the routing explanation (audit plumbing, sub-step 2). The
+ * resolvers push into an optional `trace` array as they consider people, so
+ * the `routed` activity can say who was considered, who was skipped and why,
+ * and who was chosen — in the same shape the engine (sub-step 5) will fill
+ * with limits / climbs / rules.
+ */
+export type RoutingTraceEntry = {
+  step: string; // manager | admin_fallback | managers_manager | senior_approver | admin_fallback_l2 | limit (engine) | bot (engine)
+  level: number;
+  userId: string | null;
+  name: string | null;
+  outcome: "chosen" | "skipped" | "considered" | "none";
+  reason: string;
+  // engine fields (null today): the limit that applied, whether it covered
+  limitBase?: number | null;
+  covers?: boolean | null;
+};
+
 export async function resolveL1Approver(
   workspaceId: mongoose.Types.ObjectId,
   submitterId: mongoose.Types.ObjectId,
+  trace?: RoutingTraceEntry[],
 ): Promise<{ id: mongoose.Types.ObjectId | null; user: any | null }> {
   const meId = String(submitterId);
+  const t = (e: RoutingTraceEntry) => trace?.push(e);
 
   // 1) submitter's manager — same workspace, and not the submitter themselves.
   const submitter: any = await User.findOne({ _id: submitterId, workspaceId })
@@ -405,16 +429,37 @@ export async function resolveL1Approver(
     const mgr: any = await User.findOne({ _id: submitter.managerId, workspaceId })
       .select(APPROVER_USER_FIELDS)
       .lean();
-    if (mgr) return { id: mgr._id as mongoose.Types.ObjectId, user: mgr };
+    if (mgr) {
+      t({ step: "manager", level: 1, userId: String(mgr._id), name: employeeNameOf(mgr), outcome: "chosen", reason: "submitter's line manager" });
+      return { id: mgr._id as mongoose.Types.ObjectId, user: mgr };
+    }
+    t({ step: "manager", level: 1, userId: String(submitter.managerId), name: null, outcome: "skipped", reason: "managerId points outside this workspace" });
+  } else if (submitter?.managerId) {
+    t({ step: "manager", level: 1, userId: meId, name: null, outcome: "skipped", reason: "manager is the submitter" });
+  } else {
+    t({ step: "manager", level: 1, userId: null, name: null, outcome: "none", reason: "no manager set" });
   }
 
   // 2) any OTHER workspace expense-admin — structural role OR expenseAdmin
   //    grant (isAdmin() is the authority; grants are attached to the docs).
   const candidates = await expenseAdminCandidates(workspaceId, [submitterId]);
-  const admin = candidates.find((u) => userIdOf(u) !== meId && isAdmin(u));
-  if (admin) return { id: admin._id as mongoose.Types.ObjectId, user: admin };
+  let chosen: any = null;
+  for (const u of candidates) {
+    if (chosen) {
+      t({ step: "admin_fallback", level: 1, userId: String(u._id), name: employeeNameOf(u), outcome: "considered", reason: "eligible admin, not first in order" });
+      continue;
+    }
+    if (userIdOf(u) !== meId && isAdmin(u)) {
+      chosen = u;
+      t({ step: "admin_fallback", level: 1, userId: String(u._id), name: employeeNameOf(u), outcome: "chosen", reason: "first eligible workspace expense-admin (insertion order)" });
+    } else {
+      t({ step: "admin_fallback", level: 1, userId: String(u._id), name: employeeNameOf(u), outcome: "skipped", reason: "not an expense admin" });
+    }
+  }
+  if (chosen) return { id: chosen._id as mongoose.Types.ObjectId, user: chosen };
 
   // 3) nobody eligible — caller refuses; no null approver is ever submitted.
+  t({ step: "admin_fallback", level: 1, userId: null, name: null, outcome: "none", reason: "no other expense-admin in the workspace" });
   return { id: null, user: null };
 }
 
@@ -441,9 +486,11 @@ export async function resolveL2Approver(
   l1User: any,
   seniorApproverId: any,
   excludeIds: string[],
+  trace?: RoutingTraceEntry[],
 ): Promise<any | null> {
   const excluded = new Set(excludeIds.map(String));
   const ok = (u: any) => u && !excluded.has(String(u._id));
+  const t = (e: RoutingTraceEntry) => trace?.push(e);
 
   // a) manager's-manager — APPROVER_USER_FIELDS already carries L1's managerId.
   const l1MgrId = l1User?.managerId;
@@ -451,7 +498,10 @@ export async function resolveL2Approver(
     const mgr: any = await User.findOne({ _id: l1MgrId, workspaceId })
       .select(APPROVER_USER_FIELDS)
       .lean();
-    if (ok(mgr)) return mgr;
+    if (ok(mgr)) {
+      t({ step: "managers_manager", level: 2, userId: String(mgr._id), name: employeeNameOf(mgr), outcome: "chosen", reason: "L1 approver's own manager" });
+      return mgr;
+    }
   }
 
   // b) configured senior approver.
@@ -459,7 +509,10 @@ export async function resolveL2Approver(
     const senior: any = await User.findOne({ _id: seniorApproverId, workspaceId })
       .select(APPROVER_USER_FIELDS)
       .lean();
-    if (ok(senior)) return senior;
+    if (ok(senior)) {
+      t({ step: "senior_approver", level: 2, userId: String(senior._id), name: employeeNameOf(senior), outcome: "chosen", reason: "workspace senior approver" });
+      return senior;
+    }
   }
 
   // c) any OTHER workspace expense-admin (structural role OR grant).
@@ -468,6 +521,11 @@ export async function resolveL2Approver(
     .map((x) => new mongoose.Types.ObjectId(x));
   const candidates = await expenseAdminCandidates(workspaceId, excludeObjIds);
   const admin = candidates.find((u) => ok(u) && isAdmin(u));
+  if (admin) {
+    t({ step: "admin_fallback_l2", level: 2, userId: String(admin._id), name: employeeNameOf(admin), outcome: "chosen", reason: "first other expense-admin" });
+  } else {
+    t({ step: "admin_fallback_l2", level: 2, userId: null, name: null, outcome: "none", reason: "no distinct L2 — chain stays length 1" });
+  }
   return admin || null;
 }
 
@@ -485,34 +543,77 @@ async function resolveApprovalChain(
   workspaceId: mongoose.Types.ObjectId,
   submitterId: mongoose.Types.ObjectId,
   totalAmount: number,
+  baseCurrency: string,
 ): Promise<{
   chain: IApprovalChainLevel[];
   approverId: mongoose.Types.ObjectId | null;
   approver: any | null;
+  routing: Record<string, any>;
 }> {
-  const l1 = await resolveL1Approver(workspaceId, submitterId);
-  if (!l1.id) return { chain: [], approverId: null, approver: null };
-
-  const chain: IApprovalChainLevel[] = [
-    { level: 1, approverId: l1.id, status: "pending", decidedAt: null, note: null },
-  ];
+  const now = new Date();
+  const trace: RoutingTraceEntry[] = [];
+  const l1 = await resolveL1Approver(workspaceId, submitterId, trace);
 
   // L2 escalation — gated on a configured threshold the claim total exceeds.
   const ws: any = await CustomerWorkspace.findById(workspaceId)
     .select("config.expenseEscalationThreshold config.seniorApproverId")
     .lean();
-  const threshold = ws?.config?.expenseEscalationThreshold;
-  if (threshold != null && Number(totalAmount) > Number(threshold)) {
-    const l2 = await resolveL2Approver(workspaceId, l1.user, ws?.config?.seniorApproverId, [
-      String(submitterId),
-      String(l1.id),
-    ]);
+  const threshold = ws?.config?.expenseEscalationThreshold ?? null;
+  const overThreshold = threshold != null && Number(totalAmount) > Number(threshold);
+
+  // The routing decision, recorded in the shape the engine (sub-step 5) will
+  // fill richly. Today's resolver is the "legacy manager → admin" mode: there
+  // is no bot, no per-person limit and no climb yet, and those fields say so
+  // explicitly (null / false) rather than being absent.
+  const routing: Record<string, any> = {
+    mode: "legacy_manager_admin",
+    engineVersion: 0,
+    policyVersion: null,
+    amountBase: Number(totalAmount),
+    baseCurrency,
+    bot: { evaluated: false, enabled: false, thresholdBase: null, underThreshold: null, checks: null },
+    requiredLimitBase: null,
+    rule: {
+      kind: overThreshold ? "workspace_escalation_threshold" : "single_approver",
+      thresholdBase: threshold,
+      overThreshold,
+      department: null,
+      categoryIds: [],
+    },
+    climbed: false,
+    overLimit: false,
+    fourEyes: false,
+    trace,
+    chosen: [] as { level: number; userId: string; name: string; via: string }[],
+    decidedAt: now,
+  };
+
+  if (!l1.id) return { chain: [], approverId: null, approver: null, routing };
+
+  const l1Via = trace.find((e) => e.level === 1 && e.outcome === "chosen")?.step ?? "unknown";
+  const chain: IApprovalChainLevel[] = [
+    { level: 1, approverId: l1.id, status: "pending", decidedAt: null, note: null, actorType: "user", via: l1Via, routedAt: now },
+  ];
+  routing.chosen.push({ level: 1, userId: String(l1.id), name: employeeNameOf(l1.user), via: l1Via });
+
+  if (overThreshold) {
+    const l2 = await resolveL2Approver(
+      workspaceId,
+      l1.user,
+      ws?.config?.seniorApproverId,
+      [String(submitterId), String(l1.id)],
+      trace,
+    );
     if (l2) {
-      chain.push({ level: 2, approverId: l2._id, status: "pending", decidedAt: null, note: null });
+      const l2Via = trace.find((e) => e.level === 2 && e.outcome === "chosen")?.step ?? "unknown";
+      // routedAt for L2 is stamped when L1 approves (the approve handler).
+      chain.push({ level: 2, approverId: l2._id, status: "pending", decidedAt: null, note: null, actorType: "user", via: l2Via, routedAt: null });
+      routing.chosen.push({ level: 2, userId: String(l2._id), name: employeeNameOf(l2), via: l2Via });
+      routing.climbed = true; // a second level was appended because the total exceeded the threshold
     }
   }
 
-  return { chain, approverId: l1.id, approver: l1.user };
+  return { chain, approverId: l1.id, approver: l1.user, routing };
 }
 
 /**
@@ -540,32 +641,53 @@ export async function resolveAdvanceApprovalChain(
   chain: IApprovalChainLevel[];
   approverId: mongoose.Types.ObjectId | null;
   approver: any | null;
+  routing: Record<string, any>;
 }> {
   const ws = new mongoose.Types.ObjectId(String(workspaceId));
   const reqId = new mongoose.Types.ObjectId(String(requesterId));
 
-  const l1 = await resolveL1Approver(ws, reqId);
-  if (!l1.id) return { chain: [], approverId: null, approver: null };
-
-  const chain: IApprovalChainLevel[] = [
-    { level: 1, approverId: l1.id, status: "pending", decidedAt: null, note: null },
-  ];
-
+  const now = new Date();
+  const trace: RoutingTraceEntry[] = [];
+  const l1 = await resolveL1Approver(ws, reqId, trace);
   const cfg: any = await CustomerWorkspace.findById(ws)
     .select("config.advanceEscalationThreshold config.seniorApproverId")
     .lean();
-  const threshold = cfg?.config?.advanceEscalationThreshold;
-  if (threshold != null && Number(amount) > Number(threshold)) {
-    const l2 = await resolveL2Approver(ws, l1.user, cfg?.config?.seniorApproverId, [
-      String(reqId),
-      String(l1.id),
-    ]);
+  const threshold = cfg?.config?.advanceEscalationThreshold ?? null;
+  const overThreshold = threshold != null && Number(amount) > Number(threshold);
+  const routing: Record<string, any> = {
+    mode: "legacy_manager_admin",
+    engineVersion: 0,
+    policyVersion: null,
+    amountBase: Number(amount),
+    bot: { evaluated: false, enabled: false, thresholdBase: null, underThreshold: null, checks: null },
+    requiredLimitBase: null,
+    rule: { kind: overThreshold ? "workspace_escalation_threshold" : "single_approver", thresholdBase: threshold, overThreshold },
+    climbed: false,
+    overLimit: false,
+    fourEyes: false,
+    trace,
+    chosen: [] as any[],
+    decidedAt: now,
+  };
+  if (!l1.id) return { chain: [], approverId: null, approver: null, routing };
+
+  const l1Via = trace.find((e) => e.level === 1 && e.outcome === "chosen")?.step ?? "unknown";
+  const chain: IApprovalChainLevel[] = [
+    { level: 1, approverId: l1.id, status: "pending", decidedAt: null, note: null, actorType: "user", via: l1Via, routedAt: now },
+  ];
+  routing.chosen.push({ level: 1, userId: String(l1.id), name: employeeNameOf(l1.user), via: l1Via });
+
+  if (overThreshold) {
+    const l2 = await resolveL2Approver(ws, l1.user, cfg?.config?.seniorApproverId, [String(reqId), String(l1.id)], trace);
     if (l2) {
-      chain.push({ level: 2, approverId: l2._id, status: "pending", decidedAt: null, note: null });
+      const l2Via = trace.find((e) => e.level === 2 && e.outcome === "chosen")?.step ?? "unknown";
+      chain.push({ level: 2, approverId: l2._id, status: "pending", decidedAt: null, note: null, actorType: "user", via: l2Via, routedAt: null });
+      routing.chosen.push({ level: 2, userId: String(l2._id), name: employeeNameOf(l2), via: l2Via });
+      routing.climbed = true;
     }
   }
 
-  return { chain, approverId: l1.id, approver: l1.user };
+  return { chain, approverId: l1.id, approver: l1.user, routing };
 }
 
 /**
@@ -681,7 +803,7 @@ export async function submitReport(
   // threshold is set and this claim's total exceeds it; with the threshold OFF
   // the chain is length 1 and this stamps exactly as before. approverId is the
   // L1 (current pending) approver — the denorm pointer the queues already read.
-  const { chain, approverId, approver } = await resolveApprovalChain(ws, emp, totalAmount);
+  const { chain, approverId, approver, routing } = await resolveApprovalChain(ws, emp, totalAmount, baseCurrency);
   if (!approverId) {
     return {
       ok: false,
@@ -692,6 +814,10 @@ export async function submitReport(
       warnings,
     };
   }
+  // A submit after a withdraw is a round-trip worth marking on the trail.
+  const priorWithdraws = await ExpenseActivity.countDocuments({ workspaceId: ws, reportId: rid, event: "withdrawn" });
+  const priorSubmits = await ExpenseActivity.countDocuments({ workspaceId: ws, reportId: rid, event: { $in: ["submitted", "resubmitted"] } });
+
   report.approvalChain = chain;
   report.currentLevel = 1;
   report.approverId = approverId;
@@ -699,19 +825,47 @@ export async function submitReport(
   report.submittedAt = new Date();
   report.decisionNote = null;
   report.selfApproved = false;
+  report.routing = routing;
   await report.save();
 
   await propagateReportLifecycle(ws, rid, "submitted");
 
-  // Audit: the submission itself, then one Policy Bot entry per non-blocking
-  // warning surfaced by validateReportForSubmit (receipts, categories, dupes).
+  // Audit (sub-step 2): the submission carries the base total and EVERY line's
+  // original + converted amount; then the routing decision as a system entry;
+  // then one Policy Bot entry per non-blocking warning.
   const submitterName = (await actorNameById(emp)) || "System";
+  const lines = await Expense.find({ workspaceId: ws, reportId: rid })
+    .select("ref merchant date amount currency amountBase baseCurrency exchangeRate rateSource categoryId imageKey")
+    .lean();
   await logActivity({
     workspaceId: ws,
     reportId: rid,
     event: wasClarification ? "resubmitted" : "submitted",
     actorId: emp,
     actorName: submitterName,
+    actorType: "user",
+    details: {
+      totalBase: totalAmount,
+      baseCurrency,
+      lineCount: expenseCount,
+      lines: lines.map(lineSnapshot),
+      afterClarification: wasClarification,
+      afterWithdraw: priorWithdraws > 0,
+      submissionNumber: priorSubmits + 1,
+      warnings,
+    },
+  });
+  await logActivity({
+    workspaceId: ws,
+    reportId: rid,
+    event: "routed",
+    actorId: null,
+    actorName: "Routing",
+    actorType: "system",
+    note: routing.chosen
+      .map((c: any) => `L${c.level} → ${c.name || c.userId} (${String(c.via).replace(/_/g, " ")})`)
+      .join(" · "),
+    details: routing,
   });
   for (const w of warnings) {
     await logActivity({
@@ -719,6 +873,7 @@ export async function submitReport(
       reportId: rid,
       event: "policy_check",
       actorName: "Policy Bot",
+      actorType: "bot",
       note: w,
     });
   }

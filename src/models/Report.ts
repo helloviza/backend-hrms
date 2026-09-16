@@ -42,6 +42,13 @@ export interface IApprovalChainLevel {
   status: ChainLevelStatus;
   decidedAt?: Date | null;
   note?: string | null;
+  // ── Audit plumbing (approval-engine sub-step 2) ──
+  actorType?: "user" | "bot"; // who this step belongs to; the bot has approverId null
+  via?: string | null; // HOW this approver was chosen: manager | admin_fallback | managers_manager | senior_approver | bot | limit | …
+  routedAt?: Date | null; // when the item was handed to this step → heldMs = decidedAt − routedAt
+  heldMs?: number | null; // stamped at decision
+  overLimit?: boolean; // permanent marker (engine, sub-step 5)
+  limitBase?: number | null; // the limit this step was judged against (engine)
 }
 
 export interface IReport extends Document {
@@ -65,6 +72,11 @@ export interface IReport extends Document {
   // approverId above stays the denorm pointer to chain[currentLevel-1].approverId.
   approvalChain?: IApprovalChainLevel[];
   currentLevel?: number; // 1-based; which chain step is currently pending
+
+  // ── Audit plumbing (sub-step 2): the routing decision snapshot, as the
+  // resolver explained it at submit. Also appended to the timeline as a
+  // `routed` activity. The engine (sub-step 5) fills the same shape richly.
+  routing?: Record<string, any> | null;
 
   // ── Phase 2 (advances): net-reimburse record. PURELY ADDITIVE — only written
   // when the claim has applied advances. A claim with NO applied advances
@@ -91,6 +103,12 @@ const ApprovalChainLevelSchema = new Schema<IApprovalChainLevel>(
     },
     decidedAt: { type: Date, default: null },
     note: { type: String, trim: true, default: null },
+    actorType: { type: String, enum: ["user", "bot"], default: "user" },
+    via: { type: String, trim: true, default: null },
+    routedAt: { type: Date, default: null },
+    heldMs: { type: Number, default: null },
+    overLimit: { type: Boolean, default: false },
+    limitBase: { type: Number, default: null },
   },
   { _id: false },
 );
@@ -119,6 +137,7 @@ const ReportSchema = new Schema<IReport>(
     // ── Phase 2: approval chain (resolved at submit; length 1 = today) ──
     approvalChain: { type: [ApprovalChainLevelSchema], default: [] },
     currentLevel: { type: Number, default: 1 },
+    routing: { type: Schema.Types.Mixed, default: null },
 
     // ── Phase 2 (advances): net-reimburse record (additive; null until a
     // reimburse with applied advances writes them). ──

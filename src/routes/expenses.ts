@@ -1187,7 +1187,20 @@ router.patch("/:id/rate", async (req: any, res: any) => {
         event: "fx_rate_set",
         actorId: me,
         actorName: employeeNameOf(req.user) || String(req.user?.email || "User"),
+        actorType: "user",
         note: `${pending ? "Exchange rate set" : "Exchange rate corrected"} on ${expense.ref}: ${currency} ${expense.amount} × ${rate} = ${baseCurrency} ${fx.amountBase} (was ${from})${reason ? ` — ${reason}` : ""}`,
+        // Append-only: the correction is a NEW row carrying the old values —
+        // nothing earlier on the timeline (or in rateHistory) is rewritten.
+        details: {
+          expenseRef: expense.ref,
+          kind: pending ? "set" : "correction",
+          receipt: { amount: Number(expense.amount), currency },
+          from: previous,
+          to: { exchangeRate: fx.exchangeRate, rateDate: fx.rateDate, rateSource: "manual", amountBase: fx.amountBase },
+          baseCurrency,
+          reason,
+          byFinance: finance,
+        },
       });
     }
 

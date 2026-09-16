@@ -28,6 +28,16 @@ export type ExpenseActivityEvent =
   | "fx_rate_set"
   // Owner withdrew a submitted-but-untouched claim back to draft (audit F-14).
   | "withdrawn"
+  // ── Audit trail / actor plumbing (approval-engine sub-step 2) ──
+  // The routing decision at submit — the "why" (details.routing). Written by
+  // the system actor today from the current manager→admin resolver; the
+  // engine (sub-step 5) fills the same shape richly (limits, climb, rule).
+  | "routed"
+  // Reserved for the Approval Bot (sub-step 5): a bot decision is a chain
+  // level AND this event, actorType "bot".
+  | "auto_approved"
+  // Reserved: the claim climbed / was flagged over-limit / four-eyes appended.
+  | "escalated"
   // ── Advance (System B) events — additive ──
   | "requested"
   | "disbursed"
@@ -51,6 +61,9 @@ export const EXPENSE_ACTIVITY_EVENTS: ExpenseActivityEvent[] = [
   "policy_check",
   "fx_rate_set",
   "withdrawn",
+  "routed",
+  "auto_approved",
+  "escalated",
   "requested",
   "disbursed",
   "advance_applied",
@@ -58,6 +71,24 @@ export const EXPENSE_ACTIVITY_EVENTS: ExpenseActivityEvent[] = [
   "settled",
   "recovered",
 ];
+
+/** WHO or WHAT acted. "user" = a person; "bot" = the Approval Bot / Policy
+ *  Bot; "system" = the platform itself (routing, migrations). Rows written
+ *  before sub-step 2 have no actorType — readers normalise from actorName
+ *  ("Policy Bot" → bot, "System" → system, else user). */
+export type ExpenseActorType = "user" | "bot" | "system";
+
+/** The canonical bot identity — the engine and the policy checker both use it. */
+export const APPROVAL_BOT_ACTOR = { actorType: "bot" as ExpenseActorType, actorId: null, actorName: "Approval Bot" };
+export const SYSTEM_ACTOR = { actorType: "system" as ExpenseActorType, actorId: null, actorName: "System" };
+
+export function normalizeActorType(a: { actorType?: string | null; actorName?: string | null; actorId?: any }): ExpenseActorType {
+  if (a?.actorType === "user" || a?.actorType === "bot" || a?.actorType === "system") return a.actorType;
+  const n = String(a?.actorName || "").trim().toLowerCase();
+  if (n.endsWith("bot")) return "bot";
+  if (n === "system" || n === "routing") return "system";
+  return "user";
+}
 
 export interface IExpenseActivity extends Document {
   workspaceId: mongoose.Types.ObjectId;
@@ -72,7 +103,28 @@ export interface IExpenseActivity extends Document {
   actorId?: mongoose.Types.ObjectId | null;
   // Display name: a real user's name, or "Policy Bot" / "System" for automated.
   actorName: string;
+  // WHO vs WHAT (sub-step 2). See normalizeActorType for pre-existing rows.
+  actorType?: ExpenseActorType;
   note?: string | null;
+  // ── Timing (sub-step 2): every entry carries its own clock ──
+  // elapsedMs   ms since the PREVIOUS entry on the same claim / advance
+  //             (null on the first entry). Computed by the writer, never
+  //             by the reader, so the trail is reconstructable offline.
+  // heldMs      for a decision / payment: ms the item sat with THIS actor —
+  //             from the moment it was routed to them (chain level routedAt,
+  //             or submittedAt / approvedAt) to the moment they acted. null
+  //             when the event is not an actor's turn ending.
+  elapsedMs?: number | null;
+  heldMs?: number | null;
+  prevActivityId?: mongoose.Types.ObjectId | null;
+  // ── Structured payload (sub-step 2) — the audit-grade "how" ──
+  // Free shape per event, documented at each writer: e.g. `submitted` carries
+  // the base total + every line's original AND converted amount; `routed`
+  // carries the routing decision; `approved` carries level / heldMs / note;
+  // `reimbursed` carries the payout figures + the SoD-override marker;
+  // `fx_rate_set` carries from → to. Corrections never edit an earlier row —
+  // they are a NEW row whose details reference the old values.
+  details?: Record<string, any> | null;
   createdAt: Date;
 }
 
@@ -93,11 +145,45 @@ const ExpenseActivitySchema = new Schema<IExpenseActivity>(
     event: { type: String, enum: EXPENSE_ACTIVITY_EVENTS, required: true },
     actorId: { type: Schema.Types.ObjectId, ref: "User", default: null },
     actorName: { type: String, required: true, trim: true },
+    actorType: { type: String, enum: ["user", "bot", "system"], default: "user" },
     note: { type: String, trim: true, default: null },
+    elapsedMs: { type: Number, default: null },
+    heldMs: { type: Number, default: null },
+    prevActivityId: { type: Schema.Types.ObjectId, ref: "ExpenseActivity", default: null },
+    details: { type: Schema.Types.Mixed, default: null },
   },
   // Append-only: createdAt is the timeline key; no updatedAt.
   { timestamps: { createdAt: true, updatedAt: false } },
 );
+
+/* ── APPEND-ONLY, enforced (sub-step 2) ───────────────────────────────
+ * The trail is never edited or deleted through the model. Every Mongoose
+ * update / replace / delete path throws; a re-save of an existing document
+ * throws. The only way to change history is to append a new row. (Raw
+ * collection access — migrations, the audit cleanup script — deliberately
+ * bypasses this; that is an explicit, visible choice at the call site.) */
+const APPEND_ONLY = "ExpenseActivity is append-only: write a new entry instead of editing or deleting history.";
+for (const op of [
+  "updateOne",
+  "updateMany",
+  "findOneAndUpdate",
+  "findOneAndReplace",
+  "replaceOne",
+  "deleteOne",
+  "deleteMany",
+  "findOneAndDelete",
+] as const) {
+  ExpenseActivitySchema.pre(op as any, function (next: any) {
+    next(new Error(APPEND_ONLY));
+  });
+}
+ExpenseActivitySchema.pre("save", function (next) {
+  if (!this.isNew) return next(new Error(APPEND_ONLY));
+  next();
+});
+ExpenseActivitySchema.pre("deleteOne", { document: true, query: false } as any, function (next: any) {
+  next(new Error(APPEND_ONLY));
+});
 
 // Timeline read: every event for a claim in chronological order.
 ExpenseActivitySchema.index({ reportId: 1, createdAt: 1 });

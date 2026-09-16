@@ -171,7 +171,9 @@ export function canDecide(
  */
 export function canReimburse(user: any, report: any): boolean {
   if (!report || report.status !== "approved") return false;
-  if (isAdmin(user)) return true; // admin bypasses SoD
+  // Audit integrity (sub-step 2): nobody pays their OWN claim — no admin bypass.
+  if (report.employeeId && String(report.employeeId) === userIdOf(user)) return false;
+  if (isAdmin(user)) return true; // admin bypasses chain SoD (logged as sodOverride)
   if (!isFinance(user)) return false;
 
   const me = userIdOf(user);
@@ -222,7 +224,9 @@ export function canDecideAdvance(
  */
 export function canDisburse(user: any, advance: any): boolean {
   if (!advance || advance.status !== "approved") return false;
-  if (isAdmin(user)) return true; // admin bypasses SoD
+  // Audit integrity (sub-step 2): nobody disburses their OWN advance — no admin bypass.
+  if (advance.requesterId && String(advance.requesterId) === userIdOf(user)) return false;
+  if (isAdmin(user)) return true; // admin bypasses chain SoD
   if (!isFinance(user)) return false;
 
   const me = userIdOf(user);

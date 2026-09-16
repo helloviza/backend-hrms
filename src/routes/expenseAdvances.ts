@@ -36,10 +36,11 @@ import {
 } from "../services/advanceSettlement.service.js";
 import ExpenseAdvance from "../models/ExpenseAdvance.js";
 import Report from "../models/Report.js";
-import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseActivity.js";
+import ExpenseActivity, { type ExpenseActivityEvent, normalizeActorType } from "../models/ExpenseActivity.js";
 import User from "../models/User.js";
 import { refFromId } from "../utils/refFromId.js";
 import { getWorkspaceBaseCurrency, normalizeCurrency } from "../services/expenseFx.service.js";
+import { appendActivity, msBetween, fmtDuration } from "../services/expenseAudit.service.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { csvRow } from "../utils/exportHelpers.js";
 import { sendAdvanceSubmittedEmail } from "../utils/advanceEmails.js";
@@ -138,23 +139,33 @@ async function logAdvanceActivity(params: {
   actorName: string;
   actorId?: mongoose.Types.ObjectId | string | null;
   note?: string | null;
+  // Audit plumbing (sub-step 2) — see services/expenseAudit.service.ts.
+  actorType?: "user" | "bot" | "system";
+  heldMs?: number | null;
+  details?: Record<string, any> | null;
 }): Promise<void> {
-  try {
-    const actorId =
-      params.actorId && mongoose.Types.ObjectId.isValid(String(params.actorId))
-        ? new mongoose.Types.ObjectId(String(params.actorId))
-        : null;
-    await ExpenseActivity.create({
-      workspaceId: new mongoose.Types.ObjectId(String(params.workspaceId)),
-      advanceId: new mongoose.Types.ObjectId(String(params.advanceId)),
-      event: params.event,
-      actorId,
-      actorName: params.actorName || "System",
-      note: params.note ?? null,
-    });
-  } catch (err: any) {
-    console.error("[advance activity log]", params.event, err?.message || err);
-  }
+  await appendActivity({
+    workspaceId: params.workspaceId,
+    advanceId: params.advanceId,
+    event: params.event,
+    actorId: params.actorId ?? null,
+    actorName: params.actorName || "System",
+    actorType: params.actorType,
+    note: params.note ?? null,
+    heldMs: params.heldMs ?? null,
+    details: params.details ?? null,
+  });
+}
+
+/** ms the current chain level sat with its approver (routedAt → decidedAt);
+ *  also stamps heldMs on the level. Mirrors expenseReports.ts#stampHeld. */
+function stampHeld(advance: any, idx: number, decidedAt: Date): number | null {
+  const chain: any[] = Array.isArray(advance.approvalChain) ? advance.approvalChain : [];
+  const lvl = chain[idx];
+  const routedAt = lvl?.routedAt ?? (idx === 0 ? advance.submittedAt : null);
+  const held = msBetween(routedAt, decidedAt);
+  if (lvl) lvl.heldMs = held;
+  return held;
 }
 
 /** Load an advance by id within the tenant, WITHOUT an owner restriction —
@@ -210,7 +221,7 @@ router.post("/", async (req: any, res: any) => {
 
     // Resolve the chain BEFORE creating — refuse (409) if no approver, exactly
     // like a claim submit, so we never persist an unroutable advance.
-    const { chain, approverId, approver } = await resolveAdvanceApprovalChain(
+    const { chain, approverId, approver, routing } = await resolveAdvanceApprovalChain(
       req.workspaceObjectId,
       requesterId,
       amount,
@@ -231,6 +242,7 @@ router.post("/", async (req: any, res: any) => {
       neededBy,
       status: "awaiting_approval",
       approvalChain: chain,
+      routing,
       currentLevel: 1,
       approverId,
       submittedAt: new Date(),
@@ -244,6 +256,18 @@ router.post("/", async (req: any, res: any) => {
       event: "requested",
       actorId: requesterId,
       actorName: actorNameOf(req),
+      actorType: "user",
+      details: { amount, currency, purpose, neededBy },
+    });
+    await logAdvanceActivity({
+      workspaceId: req.workspaceObjectId,
+      advanceId: advance._id as mongoose.Types.ObjectId,
+      event: "routed",
+      actorId: null,
+      actorName: "Routing",
+      actorType: "system",
+      note: routing.chosen.map((c: any) => `L${c.level} → ${c.name || c.userId} (${String(c.via).replace(/_/g, " ")})`).join(" · "),
+      details: routing,
     });
 
     // Approver email — best-effort, never blocks the request.
@@ -914,7 +938,11 @@ router.get("/:id", async (req: any, res: any) => {
       event: a.event,
       actorName: a.actorName,
       actorId: a.actorId ? String(a.actorId) : null,
+      actorType: normalizeActorType(a),
       note: a.note ?? null,
+      elapsedMs: a.elapsedMs ?? null,
+      heldMs: a.heldMs ?? null,
+      details: a.details ?? null,
       createdAt: a.createdAt,
     }));
 
@@ -950,9 +978,11 @@ router.post("/:id/approve", async (req: any, res: any) => {
     const idx = Math.min(Math.max((advance.currentLevel || 1) - 1, 0), Math.max(chain.length - 1, 0));
     const levelNo = idx + 1;
 
+    const decidedAt = new Date();
+    const heldMs = stampHeld(advance, idx, decidedAt);
     if (chain[idx]) {
       chain[idx].status = "approved";
-      chain[idx].decidedAt = new Date();
+      chain[idx].decidedAt = decidedAt;
       chain[idx].approverId = new mongoose.Types.ObjectId(me);
       if (note) chain[idx].note = note;
     }
@@ -963,6 +993,7 @@ router.post("/:id/approve", async (req: any, res: any) => {
     if (hasNext) {
       const next = chain[idx + 1];
       advance.currentLevel = levelNo + 1;
+      next.routedAt = decidedAt; // the next approver's clock starts now
       advance.approverId = next.approverId; // denorm pointer → next pending approver
       advance.selfApproved = isSelf;
       await advance.save();
@@ -1229,6 +1260,13 @@ router.post("/:id/disburse", async (req: any, res: any) => {
       return res.status(409).json({ error: "Only approved advances can be disbursed" });
     }
 
+    // Audit integrity (sub-step 2): nobody disburses their OWN advance.
+    if (String(advance.requesterId) === ownRequesterId(req)) {
+      return res.status(403).json({
+        error: "You can't disburse your own advance — a different finance user must pay it out.",
+        code: "OWN_ADVANCE_PAYOUT_DENIED",
+      });
+    }
     if (!canDisburseUser(req.user, advance)) {
       if (!isFinance(req)) return res.status(403).json({ error: "Finance access required" });
       return res.status(403).json({
@@ -1257,13 +1295,26 @@ router.post("/:id/disburse", async (req: any, res: any) => {
     advance.disbursementRef = disbursementRef;
     await advance.save();
 
+    const sinceApprovalMs = msBetween(advance.approvedAt, advance.disbursedAt);
     await logAdvanceActivity({
       workspaceId: req.workspaceObjectId,
       advanceId: advance._id as mongoose.Types.ObjectId,
       event: "disbursed",
       actorId: me,
       actorName: actorNameOf(req),
+      actorType: "user",
+      heldMs: sinceApprovalMs,
       note: isAdmin(req) && wasApprover ? "Disbursed (admin SoD override)" : disbursementRef || null,
+      details: {
+        amount: advance.amount,
+        currency: advance.currency,
+        approvedAt: advance.approvedAt ?? null,
+        disbursedAt: advance.disbursedAt,
+        sinceApprovalMs,
+        disbursementMode,
+        disbursementRef,
+        sodOverride: !!(isAdmin(req) && wasApprover),
+      },
     });
 
     res.json({ ok: true, advance: advance.toObject() });
@@ -1293,13 +1344,15 @@ router.post("/:id/apply", async (req: any, res: any) => {
 
     // Log on the CLAIM timeline — the employee is on the claim when applying.
     try {
-      await ExpenseActivity.create({
+      await appendActivity({
         workspaceId: req.workspaceObjectId,
-        reportId: new mongoose.Types.ObjectId(reportId),
+        reportId,
         event: "advance_applied",
-        actorId: new mongoose.Types.ObjectId(ownRequesterId(req)),
+        actorId: ownRequesterId(req),
         actorName: actorNameOf(req),
+        actorType: "user",
         note: `Applied ${result.advance.ref} — ${result.amountApplied}`,
+        details: { advanceId: String(result.advance._id), advanceRef: result.advance.ref, amountApplied: result.amountApplied },
       });
     } catch (e: any) {
       console.error("[advance apply log]", e?.message || e);
@@ -1329,13 +1382,15 @@ router.post("/:id/detach", async (req: any, res: any) => {
     if (!result.ok) return res.status(result.status).json({ error: result.error });
 
     try {
-      await ExpenseActivity.create({
+      await appendActivity({
         workspaceId: req.workspaceObjectId,
-        reportId: new mongoose.Types.ObjectId(reportId),
+        reportId,
         event: "advance_detached",
-        actorId: new mongoose.Types.ObjectId(ownRequesterId(req)),
+        actorId: ownRequesterId(req),
         actorName: actorNameOf(req),
+        actorType: "user",
         note: `Detached ${result.advance.ref} (${result.amountReleased})`,
+        details: { advanceId: String(result.advance._id), advanceRef: result.advance.ref, amountReleased: result.amountReleased },
       });
     } catch (e: any) {
       console.error("[advance detach log]", e?.message || e);

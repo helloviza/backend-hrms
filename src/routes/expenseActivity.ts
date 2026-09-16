@@ -35,6 +35,8 @@ import mongoose from "mongoose";
 import ExcelJS from "exceljs";
 import { seesAll } from "../services/expense.access.js";
 import ExpenseActivity, { type ExpenseActivityEvent } from "../models/ExpenseActivity.js";
+import { normalizeActorType } from "../models/ExpenseActivity.js";
+import { fmtDuration } from "../services/expenseAudit.service.js";
 import Report from "../models/Report.js";
 import ExpenseAdvance from "../models/ExpenseAdvance.js";
 import User from "../models/User.js";
@@ -54,6 +56,10 @@ const COLUMNS: { key: string; label: string }[] = [
   { key: "entity", label: "Entity" },
   { key: "ref", label: "Ref" },
   { key: "detail", label: "Detail" },
+  // Audit plumbing (sub-step 2): who-vs-what and the clock.
+  { key: "actorType", label: "Actor Type" },
+  { key: "elapsed", label: "Since Previous" },
+  { key: "held", label: "Held By Actor" },
 ];
 
 /* ── Action humanization — mirrors the two on-screen ACTIVITY_META maps ─────
@@ -72,6 +78,11 @@ const CLAIM_LABELS: Partial<Record<ExpenseActivityEvent, string>> = {
   policy_check: "policy check",
   advance_applied: "applied an advance",
   advance_detached: "detached an advance",
+  fx_rate_set: "set an exchange rate",
+  withdrawn: "withdrew the claim",
+  routed: "routed for approval",
+  auto_approved: "auto-approved (bot)",
+  escalated: "escalated",
 };
 const ADVANCE_LABELS: Partial<Record<ExpenseActivityEvent, string>> = {
   requested: "requested the advance",
@@ -82,6 +93,7 @@ const ADVANCE_LABELS: Partial<Record<ExpenseActivityEvent, string>> = {
   clarification_requested: "requested clarification",
   settled: "settled against a claim",
   recovered: "recovered cash",
+  routed: "routed for approval",
 };
 
 function humanizeAction(event: ExpenseActivityEvent, isAdvance: boolean): string {
@@ -240,6 +252,9 @@ router.get("/", async (req: any, res: any) => {
         // Normalized to "" (never null) to match the CSV/XLSX cell behavior and
         // keep the JSON contract uniform.
         detail: a.note ?? "",
+        actorType: normalizeActorType(a),
+        elapsed: fmtDuration(a.elapsedMs) || "",
+        held: fmtDuration(a.heldMs) || "",
       } as Record<string, any>;
     });
 

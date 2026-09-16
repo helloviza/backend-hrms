@@ -88,6 +88,7 @@ export interface IExpenseAdvance extends Document {
   // Same subdocument shape as Report.approvalChain. Length 1 = single approver;
   // length ≥2 only when advanceEscalationThreshold is set AND amount exceeds it.
   approvalChain?: IApprovalChainLevel[];
+  routing?: Record<string, any> | null;
   currentLevel?: number; // 1-based; which chain step is currently pending
   approverId?: mongoose.Types.ObjectId | null; // denorm pointer → chain[currentLevel-1]
   decisionNote?: string | null;
@@ -134,6 +135,13 @@ const AdvanceApprovalChainLevelSchema = new Schema<IApprovalChainLevel>(
     },
     decidedAt: { type: Date, default: null },
     note: { type: String, trim: true, default: null },
+    // Audit plumbing (sub-step 2) — same fields as the claim chain.
+    actorType: { type: String, enum: ["user", "bot"], default: "user" },
+    via: { type: String, trim: true, default: null },
+    routedAt: { type: Date, default: null },
+    heldMs: { type: Number, default: null },
+    overLimit: { type: Boolean, default: false },
+    limitBase: { type: Number, default: null },
   },
   { _id: false },
 );
@@ -192,6 +200,8 @@ const ExpenseAdvanceSchema = new Schema<IExpenseAdvance>(
     },
 
     approvalChain: { type: [AdvanceApprovalChainLevelSchema], default: [] },
+    // Routing decision snapshot (audit plumbing, sub-step 2) — see Report.routing.
+    routing: { type: Schema.Types.Mixed, default: null },
     currentLevel: { type: Number, default: 1 },
     approverId: { type: Schema.Types.ObjectId, ref: "User", default: null },
     decisionNote: { type: String, trim: true, default: null },
