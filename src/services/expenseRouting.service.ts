@@ -35,7 +35,16 @@ export type RoutingPerson = {
   departmentIds: string[]; // grant scope ([] = all)
 };
 
-export type RoutingChecks = { receipt: boolean; category: boolean; noDuplicate: boolean; positiveAmounts: boolean };
+/**
+ * Bot pre-checks. The KEYS depend on what is being routed — the walk only
+ * asks "did every check pass?" and names the failed ones:
+ *   claim   { receipt, category, noDuplicate, positiveAmounts }   (from the lines)
+ *   advance { positiveAmount, purposePresent, validDates }         (no bills exist yet —
+ *            receipts / categories / duplicate bills are NOT applied)
+ */
+export type RoutingChecks = Record<string, boolean>;
+export type ClaimChecks = { receipt: boolean; category: boolean; noDuplicate: boolean; positiveAmounts: boolean };
+export type AdvanceChecks = { positiveAmount: boolean; purposePresent: boolean; validDates: boolean };
 
 export type RoutingInput = {
   kind: "claim" | "advance";

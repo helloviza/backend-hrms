@@ -23,7 +23,8 @@ import { getPolicy } from "./expensePolicy.service.js";
 import { getRankTable } from "./expenseAuthority.service.js";
 import { getWorkspaceBaseCurrency, effectiveAmountBase } from "./expenseFx.service.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
-import type { RoutingInput, RoutingPerson, RoutingChecks } from "./expenseRouting.service.js";
+import ExpenseAdvance from "../models/ExpenseAdvance.js";
+import type { RoutingInput, RoutingPerson, RoutingChecks, ClaimChecks, AdvanceChecks } from "./expenseRouting.service.js";
 
 const oid = (v: any) => new mongoose.Types.ObjectId(String(v));
 
@@ -44,8 +45,31 @@ export async function resolveSubmitterDepartmentId(workspaceId: any, user: any):
   return d ? String(d._id) : null;
 }
 
+/**
+ * Bot pre-checks for an ADVANCE (sub-step 6). There are no bills yet, so the
+ * claim checks (receipts / categories / duplicate lines) do not apply. An
+ * advance is "clean" when the amount is a positive number, a purpose is
+ * given, and every date it carries is a real date that is not in the past
+ * (neededBy is optional; absent = fine).
+ */
+export function checksForAdvance(a: { amount: any; purpose?: any; neededBy?: any; submittedAt?: any }): AdvanceChecks {
+  const amount = Number(a.amount);
+  const purpose = String(a.purpose ?? "").trim();
+  let validDates = true;
+  if (a.neededBy != null && String(a.neededBy).trim() !== "") {
+    const d = new Date(a.neededBy);
+    if (Number.isNaN(d.getTime())) validDates = false;
+    else {
+      const ref = a.submittedAt ? new Date(a.submittedAt) : new Date();
+      const startOfRefDay = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate());
+      if (d.getTime() < startOfRefDay.getTime()) validDates = false; // needed-by in the past
+    }
+  }
+  return { positiveAmount: Number.isFinite(amount) && amount > 0, purposePresent: purpose.length > 0, validDates };
+}
+
 /** Bot pre-checks from a claim's lines (the same facts validateReportForSubmit warns on). */
-export function checksFromLines(lines: any[]): RoutingChecks {
+export function checksFromLines(lines: any[]): ClaimChecks {
   const seen = new Set<string>();
   let dupes = 0;
   for (const e of lines) {
@@ -90,11 +114,14 @@ export type BuildRoutingParams = {
   workspaceId: any;
   kind?: "claim" | "advance";
   reportId?: string; // existing claim → amount, categories, checks, submitter from it
+  advanceId?: string; // existing advance → amount, purpose, dates, checks, requester from it
   submitterId?: string; // hypothetical: who submits
   amountBase?: number;
   categoryIds?: string[];
   departmentId?: string | null;
   checks?: Partial<RoutingChecks>; // hypothetical: assume these (default all pass)
+  // hypothetical advance facts (kind "advance") — drive the advance checks
+  advance?: { purpose?: string | null; neededBy?: string | Date | null };
 };
 
 export type BuildRoutingResult = {
@@ -106,13 +133,32 @@ export type BuildRoutingResult = {
 
 export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRoutingResult> {
   const ws = oid(p.workspaceId);
-  const kind = p.kind ?? "claim";
+  // An existing advance is an advance whatever the caller said.
+  const kind: "claim" | "advance" = p.advanceId ? "advance" : p.kind ?? "claim";
 
   let submitterId = p.submitterId;
   let amountBase = p.amountBase;
   let categoryIds = p.categoryIds ?? [];
-  let checks: RoutingChecks = { receipt: true, category: true, noDuplicate: true, positiveAmounts: true, ...(p.checks || {}) };
+  // Default checks per kind — a hypothetical claim assumes clean lines; a
+  // hypothetical advance is checked on the facts given (amount / purpose /
+  // dates). Explicit `checks` override either.
+  let checks: RoutingChecks =
+    kind === "advance"
+      ? { ...checksForAdvance({ amount: amountBase, purpose: p.advance?.purpose, neededBy: p.advance?.neededBy }), ...(p.checks || {}) }
+      : { receipt: true, category: true, noDuplicate: true, positiveAmounts: true, ...(p.checks || {}) };
   let fromClaim: any = null;
+  let fromAdvance: any = null;
+
+  if (p.advanceId) {
+    if (!mongoose.Types.ObjectId.isValid(p.advanceId)) return { error: "Invalid advanceId", status: 400 };
+    const adv: any = await ExpenseAdvance.findOne({ _id: oid(p.advanceId), workspaceId: ws }).lean();
+    if (!adv) return { error: "Advance not found", status: 404 };
+    amountBase = Number(adv.amount);
+    categoryIds = [];
+    checks = { ...checksForAdvance(adv), ...(p.checks || {}) };
+    submitterId = submitterId ?? String(adv.requesterId);
+    fromAdvance = { advanceId: String(adv._id), ref: adv.ref, status: adv.status, currency: adv.currency, purpose: adv.purpose ?? null, neededBy: adv.neededBy ?? null };
+  }
 
   if (p.reportId) {
     if (!mongoose.Types.ObjectId.isValid(p.reportId)) return { error: "Invalid reportId", status: 400 };
@@ -128,9 +174,9 @@ export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRou
     fromClaim = { reportId: String(report._id), ref: report.ref, status: report.status, lineCount: lines.length, pendingConversion: pending };
   }
 
-  if (!submitterId || !mongoose.Types.ObjectId.isValid(submitterId)) return { error: "submitterId (or reportId) is required", status: 400 };
+  if (!submitterId || !mongoose.Types.ObjectId.isValid(submitterId)) return { error: "submitterId (or reportId / advanceId) is required", status: 400 };
   if (amountBase == null || !Number.isFinite(Number(amountBase)) || Number(amountBase) < 0) {
-    return { error: "amountBase must be a non-negative number (or pass reportId)", status: 400 };
+    return { error: "amountBase must be a non-negative number (or pass reportId / advanceId)", status: 400 };
   }
   if (categoryIds.some((c) => !mongoose.Types.ObjectId.isValid(String(c)))) return { error: "categoryIds contains an invalid id", status: 400 };
 
@@ -181,6 +227,7 @@ export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRou
     categoryIds: input.categoryIds,
     checks,
     fromClaim,
+    fromAdvance,
     policyVersion: policy.version,
     engineEnabled: policy.engineEnabled,
     approverPoolSize: people.filter((x) => x.approver && x.active && x.id !== input.submitter.id).length,

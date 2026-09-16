@@ -41,6 +41,10 @@ import User from "../models/User.js";
 import { refFromId } from "../utils/refFromId.js";
 import { getWorkspaceBaseCurrency, normalizeCurrency } from "../services/expenseFx.service.js";
 import { appendActivity, msBetween, fmtDuration } from "../services/expenseAudit.service.js";
+import { getPolicy } from "../services/expensePolicy.service.js";
+import { routeClaim, type RoutingDecision } from "../services/expenseRouting.service.js";
+import { buildRoutingInput, checksForAdvance } from "../services/expenseRoutingInput.service.js";
+import { APPROVAL_BOT_ACTOR } from "../models/ExpenseActivity.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { csvRow } from "../utils/exportHelpers.js";
 import { sendAdvanceSubmittedEmail } from "../utils/advanceEmails.js";
@@ -220,18 +224,85 @@ router.post("/", async (req: any, res: any) => {
     }
 
     // Resolve the chain BEFORE creating — refuse (409) if no approver, exactly
-    // like a claim submit, so we never persist an unroutable advance.
-    const { chain, approverId, approver, routing } = await resolveAdvanceApprovalChain(
-      req.workspaceObjectId,
-      requesterId,
-      amount,
-    );
-    if (!approverId) {
-      return res.status(409).json({
-        error:
-          "No approver available — set a manager for this employee, or add an admin to the workspace.",
+    // like a claim submit, so we never persist an unroutable advance. An
+    // advance has no draft state: a refused request persists nothing and the
+    // form keeps what was typed.
+    //
+    // ── THE ENGINE SWITCH (approval-engine sub-step 6) ─────────────────────
+    // Same gate as claim submit: OFF (default) → the legacy manager → admin
+    // resolver below, unchanged; ON → routeClaim() on the advance amount
+    // (already base currency — enforced above), the requester's department
+    // and the ADVANCE bot pre-checks (positive amount, purpose present, valid
+    // dates — never receipts / categories / duplicate bills). Only advances
+    // requested after the switch flips come through here; in-flight advances
+    // keep their chain.
+    const policy = await getPolicy(req.workspaceObjectId);
+    let chain: any[];
+    let approverId: mongoose.Types.ObjectId | null;
+    let approver: any;
+    let routing: Record<string, any>;
+    let engineDecision: RoutingDecision | null = null;
+    const now = new Date();
+
+    if (policy.engineEnabled) {
+      const built = await buildRoutingInput({
+        workspaceId: req.workspaceObjectId,
+        kind: "advance",
+        submitterId: requesterId,
+        amountBase: amount,
+        advance: { purpose, neededBy },
+        checks: checksForAdvance({ amount, purpose, neededBy, submittedAt: now }),
       });
+      if (built.error || !built.input) return res.status(built.status || 400).json({ error: built.error || "Could not route this advance." });
+      engineDecision = routeClaim(built.input);
+      routing = engineDecision;
+      if (engineDecision.outcome === "NO_APPROVER" || engineDecision.outcome === "REFUSE") {
+        return res.status(409).json({
+          error:
+            engineDecision.outcome === "REFUSE"
+              ? `No approver is configured who can approve this amount (${baseCurrency} ${engineDecision.requiredLimitBase}) — contact your admin.`
+              : "No approver is configured who can approve this amount — contact your admin.",
+          code: engineDecision.outcome,
+        });
+      }
+      if (engineDecision.outcome === "BOT_AUTO_APPROVE") {
+        chain = [
+          { level: 1, approverId: null, status: "approved", decidedAt: now, note: engineDecision.bot.reason, actorType: "bot", via: "bot", routedAt: now, heldMs: 0, overLimit: false, limitBase: engineDecision.bot.thresholdBase ?? null },
+        ];
+        approverId = null;
+        approver = null;
+      } else {
+        chain = engineDecision.chain.map((c, i) => ({
+          level: c.level,
+          approverId: c.approverId ? new mongoose.Types.ObjectId(c.approverId) : null,
+          status: "pending",
+          decidedAt: null,
+          note: null,
+          actorType: "user",
+          via: c.via,
+          routedAt: i === 0 ? now : null,
+          heldMs: null,
+          overLimit: !!c.overLimit,
+          limitBase: c.limitBase ?? null,
+        }));
+        approverId = chain[0]?.approverId ?? null;
+        if (!approverId) return res.status(409).json({ error: "No approver is configured who can approve this amount — contact your admin.", code: "NO_APPROVER" });
+        approver = await User.findById(approverId).select("firstName lastName name email").lean();
+      }
+    } else {
+      const legacy = await resolveAdvanceApprovalChain(req.workspaceObjectId, requesterId, amount);
+      chain = legacy.chain;
+      approverId = legacy.approverId;
+      approver = legacy.approver;
+      routing = legacy.routing;
+      if (!approverId) {
+        return res.status(409).json({
+          error:
+            "No approver available — set a manager for this employee, or add an admin to the workspace.",
+        });
+      }
     }
+    const botApproved = engineDecision?.outcome === "BOT_AUTO_APPROVE";
 
     const advance = new ExpenseAdvance({
       workspaceId: req.workspaceObjectId,
@@ -240,12 +311,13 @@ router.post("/", async (req: any, res: any) => {
       currency,
       purpose,
       neededBy,
-      status: "awaiting_approval",
+      status: botApproved ? "approved" : "awaiting_approval",
       approvalChain: chain,
       routing,
       currentLevel: 1,
       approverId,
-      submittedAt: new Date(),
+      submittedAt: now,
+      ...(botApproved ? { approvedAt: now } : {}),
     });
     advance.ref = refFromId("ADV", advance._id as mongoose.Types.ObjectId);
     await advance.save();
@@ -266,12 +338,28 @@ router.post("/", async (req: any, res: any) => {
       actorId: null,
       actorName: "Routing",
       actorType: "system",
-      note: routing.chosen.map((c: any) => `L${c.level} → ${c.name || c.userId} (${String(c.via).replace(/_/g, " ")})`).join(" · "),
+      note: engineDecision
+        ? engineDecision.explain.join(" ")
+        : routing.chosen.map((c: any) => `L${c.level} → ${c.name || c.userId} (${String(c.via).replace(/_/g, " ")})`).join(" · "),
       details: routing,
     });
+    if (botApproved && engineDecision) {
+      await logAdvanceActivity({
+        workspaceId: req.workspaceObjectId,
+        advanceId: advance._id as mongoose.Types.ObjectId,
+        event: "auto_approved",
+        actorId: APPROVAL_BOT_ACTOR.actorId,
+        actorName: APPROVAL_BOT_ACTOR.actorName,
+        actorType: APPROVAL_BOT_ACTOR.actorType,
+        heldMs: 0,
+        note: `Auto-approved: ${engineDecision.bot.reason}`,
+        details: { thresholdBase: engineDecision.bot.thresholdBase, amountBase: engineDecision.amountBase, baseCurrency, checks: engineDecision.bot.checks, policyVersion: engineDecision.policyVersion, final: true },
+      });
+    }
 
-    // Approver email — best-effort, never blocks the request.
-    if (approver?.email) {
+    // Approver email — best-effort, never blocks the request. A bot-approved
+    // advance has no approver to notify.
+    if (!botApproved && approver?.email) {
       try {
         await sendAdvanceSubmittedEmail({
           to: approver.email,

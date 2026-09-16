@@ -592,6 +592,8 @@ router.post("/approval-policy/simulate", async (req: any, res: any) => {
       workspaceId: req.workspaceObjectId,
       kind: b.kind === "advance" ? "advance" : "claim",
       reportId: b.reportId ? String(b.reportId) : undefined,
+      advanceId: b.advanceId ? String(b.advanceId) : undefined,
+      advance: b.advance && typeof b.advance === "object" ? { purpose: b.advance.purpose ?? null, neededBy: b.advance.neededBy ?? null } : undefined,
       submitterId: b.submitterId ? String(b.submitterId) : undefined,
       amountBase: b.amountBase != null ? Number(b.amountBase) : undefined,
       categoryIds: Array.isArray(b.categoryIds) ? b.categoryIds.map(String) : undefined,
