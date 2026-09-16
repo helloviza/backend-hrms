@@ -20,7 +20,7 @@ import Department from "../models/Department.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import ExpenseApproverGrant from "../models/ExpenseApproverGrant.js";
 import { getPolicy } from "./expensePolicy.service.js";
-import { getRankTable } from "./expenseAuthority.service.js";
+import { getRankTable, effectiveApprovalLimit } from "./expenseAuthority.service.js";
 import { getWorkspaceBaseCurrency, effectiveAmountBase } from "./expenseFx.service.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import ExpenseAdvance from "../models/ExpenseAdvance.js";
@@ -108,6 +108,49 @@ export async function loadRoutingPeople(workspaceId: any): Promise<RoutingPerson
       departmentIds: Array.isArray(g?.scope?.departmentIds) ? g.scope.departmentIds.map(String) : [],
     };
   });
+}
+
+/**
+ * ENGINE READINESS (setup console, sub-step 7a). The engine has no admin
+ * fallback: with nobody in the pool able to cover anything, EVERY submit would
+ * be refused. So before the master switch may be turned on there must be at
+ * least one active, approver-flagged person whose effective limit is > 0.
+ * Returned in full so the console can say exactly what is missing.
+ */
+export type EngineReadiness = {
+  ready: boolean;
+  usableApprovers: { id: string; name: string; effectiveLimitBase: number; limitSource: string }[];
+  approversWithoutLimit: { id: string; name: string }[];
+  inactiveApprovers: number;
+  ranksWithDefault: number;
+  peopleWithRank: number;
+  missing: string[];
+};
+
+export async function engineReadiness(workspaceId: any): Promise<EngineReadiness> {
+  const [people, rankTable] = await Promise.all([loadRoutingPeople(workspaceId), getRankTable(workspaceId)]);
+  const usable: EngineReadiness["usableApprovers"] = [];
+  const noLimit: EngineReadiness["approversWithoutLimit"] = [];
+  let inactive = 0;
+  for (const p of people) {
+    if (!p.approver) continue;
+    if (!p.active) {
+      inactive++;
+      continue;
+    }
+    const lim = effectiveApprovalLimit({ bandNumber: p.bandNumber, rankTable, grant: { limitBase: p.personalLimitBase } });
+    if (lim.effectiveLimitBase > 0) usable.push({ id: p.id, name: p.name, effectiveLimitBase: lim.effectiveLimitBase, limitSource: lim.limitSource });
+    else noLimit.push({ id: p.id, name: p.name });
+  }
+  const ranksWithDefault = rankTable.filter((r) => r.defaultApprovalLimitBase != null && r.defaultApprovalLimitBase > 0).length;
+  const peopleWithRank = people.filter((p) => p.bandNumber != null).length;
+  const missing: string[] = [];
+  if (usable.length === 0) {
+    if (people.filter((p) => p.approver).length === 0) missing.push("No one is marked as an approver on the Team page.");
+    else if (noLimit.length > 0) missing.push(`${noLimit.length} approver${noLimit.length === 1 ? " has" : "s have"} no approval limit — set a rank default or a personal limit.`);
+    if (ranksWithDefault === 0) missing.push("No rank has a default approval limit in the rulebook.");
+  }
+  return { ready: usable.length > 0, usableApprovers: usable, approversWithoutLimit: noLimit, inactiveApprovers: inactive, ranksWithDefault, peopleWithRank, missing };
 }
 
 export type BuildRoutingParams = {

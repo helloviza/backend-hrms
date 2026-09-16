@@ -384,6 +384,58 @@ describe("B · policy endpoints, simulator, legacy contract, live submit untouch
     expect((await L.post("/api/expense-admin/approval-policy/simulate", { reportId: new mongoose.Types.ObjectId().toString() })).status).toBe(404);
   });
 
+  it("master switch guardrail: cannot be switched ON with no usable approver; readiness explains; history names the actor", async () => {
+    const t = await makeWorkspace();
+    const L = as(t.leader);
+    // Nothing configured → not ready, and the switch is BLOCKED (409), not warned.
+    const r0 = await L.get("/api/expense-admin/approval-policy/readiness");
+    expect(r0.status).toBe(200);
+    expect(r0.body.readiness).toMatchObject({ ready: false, usableApprovers: [], ranksWithDefault: 0 });
+    expect(r0.body.readiness.missing.join(" ")).toMatch(/No one is marked as an approver/);
+    const on0 = await L.put("/api/expense-admin/approval-policy", { engineEnabled: true });
+    expect(on0.status).toBe(409);
+    expect(on0.body.code).toBe("ENGINE_NEEDS_APPROVER");
+    expect(on0.body.error).toMatch(/can't be switched on yet/);
+    expect((await getPolicy(t.wsId)).engineEnabled).toBe(false);
+
+    // An approver flag with NO limit is still not enough.
+    const ann = await makeUser(t.wsId, ["EMPLOYEE"], "Ann");
+    await L.patch(`/api/expense-admin/users/${ann.id}/capabilities`, { approver: true });
+    const r1 = await L.get("/api/expense-admin/approval-policy/readiness");
+    expect(r1.body.readiness.ready).toBe(false);
+    expect(r1.body.readiness.approversWithoutLimit.map((x: any) => x.id)).toEqual([ann.id]);
+    expect(r1.body.readiness.missing.join(" ")).toMatch(/1 approver has no approval limit/);
+    expect((await L.put("/api/expense-admin/approval-policy", { engineEnabled: true })).status).toBe(409);
+
+    // A rank default that Ann holds makes her usable → the switch goes on.
+    await L.put("/api/expense-admin/ranks/4", { label: "Manager", defaultApprovalLimitBase: 50000 });
+    await L.patch(`/api/expense-admin/users/${ann.id}/rank`, { bandNumber: 4 });
+    const r2 = await L.get("/api/expense-admin/approval-policy/readiness");
+    expect(r2.body.readiness.ready).toBe(true);
+    expect(r2.body.readiness.usableApprovers).toEqual([{ id: ann.id, name: "Ann T", effectiveLimitBase: 50000, limitSource: "rank" }]);
+    const on1 = await L.put("/api/expense-admin/approval-policy", { engineEnabled: true });
+    expect(on1.status).toBe(200);
+    expect(on1.body.policy.engineEnabled).toBe(true);
+    expect(on1.body.readiness.ready).toBe(true);
+
+    // Other settings can still change while ON; turning OFF never needs readiness.
+    expect((await L.put("/api/expense-admin/approval-policy", { bot: { enabled: true, thresholdBase: 1000 } })).status).toBe(200);
+    expect((await L.put("/api/expense-admin/approval-policy", { engineEnabled: false })).status).toBe(200);
+
+    // "Who changed what": the GET carries the last changes with the actor's name.
+    const g = await L.get("/api/expense-admin/approval-policy");
+    expect(g.body.history.length).toBeGreaterThanOrEqual(3);
+    expect(g.body.history[0]).toMatchObject({ byName: "Lena T", changed: ["engineEnabled"] });
+    expect(g.body.readiness.ready).toBe(true);
+    // …and per person on the Team list.
+    const team = await L.get("/api/expense-admin/users");
+    const row = team.body.users.find((u: any) => u.id === ann.id);
+    expect(row.lastGrantChange).toMatchObject({ byName: "Lena T", changed: ["approver"] });
+
+    // Employees see none of it.
+    expect((await as(t.employee).get("/api/expense-admin/approval-policy/readiness")).status).toBe(403);
+  });
+
   it("legacy Team-page contract works off the policy document; live submit still routes the OLD way", async () => {
     const t = await makeWorkspace();
     const L = as(t.leader);

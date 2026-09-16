@@ -53,7 +53,9 @@ import CustomerMember from "../models/CustomerMember.js";
 import ExpenseCategory from "../models/ExpenseCategory.js";
 import { getPolicy, updatePolicy, validatePolicyPatch } from "../services/expensePolicy.service.js";
 import { routeClaim } from "../services/expenseRouting.service.js";
-import { buildRoutingInput } from "../services/expenseRoutingInput.service.js";
+import { buildRoutingInput, engineReadiness } from "../services/expenseRoutingInput.service.js";
+import ExpenseApprovalPolicy from "../models/ExpenseApprovalPolicy.js";
+import ExpenseApproverGrant from "../models/ExpenseApproverGrant.js";
 
 const router = express.Router();
 
@@ -129,19 +131,35 @@ router.get("/users", async (req: any, res: any) => {
       .sort({ name: 1, firstName: 1 })
       .lean();
 
-    const [grants, departments, limits, ranks, baseCurrency] = await Promise.all([
+    const [grants, departments, limits, ranks, baseCurrency, grantDocs] = await Promise.all([
       grantsByUserId(ws, docs.map((u) => u._id)),
       Department.find({ workspaceId: ws, isActive: true }).select("_id name code").sort({ name: 1 }).lean(),
       getEffectiveLimitsForUsers(ws, docs),
       getRankTable(ws),
       getWorkspaceBaseCurrency(ws),
+      ExpenseApproverGrant.find({ workspaceId: ws }).select("userId updatedBy updatedAt history").lean(),
     ]);
 
     // Resolve manager display names from WITHIN the workspace pool only.
     const nameById = new Map<string, string>();
     for (const u of docs) nameById.set(String(u._id), employeeNameOf(u));
 
-    const users = docs.map((u: any) => teamRow(u, grants.get(String(u._id)) ?? null, nameById, limits.get(String(u._id))));
+    // "Who changed what" per person: the grant's last change (actor + when).
+    const lastChangeByUser = new Map<string, { at: any; byName: string; changed: string[] }>();
+    for (const g of grantDocs as any[]) {
+      const last = Array.isArray(g.history) && g.history.length ? g.history[g.history.length - 1] : null;
+      if (!last) continue;
+      lastChangeByUser.set(String(g.userId), {
+        at: last.at,
+        byName: last.by ? nameById.get(String(last.by)) || "" : "System",
+        changed: Object.keys(last.change || {}),
+      });
+    }
+
+    const users = docs.map((u: any) => ({
+      ...teamRow(u, grants.get(String(u._id)) ?? null, nameById, limits.get(String(u._id))),
+      lastGrantChange: lastChangeByUser.get(String(u._id)) ?? null,
+    }));
     const noManagerCount = users.filter((u) => !u.hasManager).length;
     res.json({
       ok: true,
@@ -552,16 +570,33 @@ router.patch("/policy", async (req: any, res: any) => {
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/approval-policy", async (req: any, res: any) => {
   try {
-    const [policy, baseCurrency, categories] = await Promise.all([
+    const [policy, baseCurrency, categories, readiness, doc] = await Promise.all([
       getPolicy(req.workspaceObjectId),
       getWorkspaceBaseCurrency(req.workspaceObjectId),
       ExpenseCategory.find({ workspaceId: req.workspaceObjectId }).select("_id name active").sort({ name: 1 }).lean(),
+      engineReadiness(req.workspaceObjectId),
+      ExpenseApprovalPolicy.findOne({ workspaceId: req.workspaceObjectId }).select("history").lean(),
     ]);
+    // "Who changed what" — the last 10 policy changes with actor names.
+    const hist: any[] = Array.isArray((doc as any)?.history) ? (doc as any).history.slice(-10).reverse() : [];
+    const byIds = [...new Set(hist.map((h) => h.by).filter(Boolean).map(String))];
+    const byUsers = byIds.length
+      ? await User.find({ _id: { $in: byIds.map((id) => new mongoose.Types.ObjectId(id)) } }).select("firstName lastName name email").lean()
+      : [];
+    const nameById = new Map(byUsers.map((u: any) => [String(u._id), employeeNameOf(u)]));
     res.json({
       ok: true,
       policy,
       baseCurrency,
       categories: categories.map((c: any) => ({ id: String(c._id), name: c.name, active: c.active !== false })),
+      readiness,
+      history: hist.map((h) => ({
+        at: h.at,
+        version: h.version,
+        byId: h.by ? String(h.by) : null,
+        byName: h.by ? nameById.get(String(h.by)) || "" : "System",
+        changed: Object.keys(h.change || {}),
+      })),
     });
   } catch (err: any) {
     console.error("[ExpenseAdmin approval-policy GET]", err?.message);
@@ -577,11 +612,40 @@ router.put("/approval-policy", async (req: any, res: any) => {
     if (keys.length === 0) return res.status(400).json({ error: `Nothing to change (pass any of ${allowed.join(", ")})` });
     const errors = await validatePolicyPatch(req.workspaceObjectId, patch);
     if (errors.length) return res.status(400).json({ error: errors[0], errors });
+    // GUARDRAIL (setup console, sub-step 7a): the engine has no fallback, so
+    // it may not be switched ON while nobody can approve anything — every
+    // claim and advance would be refused. Blocked, not just warned; the
+    // response says exactly what is missing.
+    if (patch.engineEnabled === true) {
+      const current = await getPolicy(req.workspaceObjectId);
+      if (!current.engineEnabled) {
+        const readiness = await engineReadiness(req.workspaceObjectId);
+        if (!readiness.ready) {
+          return res.status(409).json({
+            error:
+              "The approval engine can't be switched on yet: no approver can cover any amount, so every claim and advance would be refused. " +
+              readiness.missing.join(" "),
+            code: "ENGINE_NEEDS_APPROVER",
+            readiness,
+          });
+        }
+      }
+    }
     const policy = await updatePolicy({ workspaceId: req.workspaceObjectId, patch, actorId: userIdOf(req.user) });
-    res.json({ ok: true, policy, baseCurrency: await getWorkspaceBaseCurrency(req.workspaceObjectId) });
+    res.json({ ok: true, policy, baseCurrency: await getWorkspaceBaseCurrency(req.workspaceObjectId), readiness: await engineReadiness(req.workspaceObjectId) });
   } catch (err: any) {
     console.error("[ExpenseAdmin approval-policy PUT]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to update approval policy" });
+  }
+});
+
+/** GET /api/expense-admin/approval-policy/readiness — can the engine be switched on? */
+router.get("/approval-policy/readiness", async (req: any, res: any) => {
+  try {
+    res.json({ ok: true, readiness: await engineReadiness(req.workspaceObjectId) });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin readiness]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to compute readiness" });
   }
 });
 
