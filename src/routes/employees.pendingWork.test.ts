@@ -72,7 +72,7 @@ const { default: Ticket } = await import("../models/Ticket.js");
 const { default: Report } = await import("../models/Report.js");
 const { default: ExpenseAdvance } = await import("../models/ExpenseAdvance.js");
 const { default: SBTRequest } = await import("../models/SBTRequest.js");
-const { default: CustomerApprovalRequest } = await import("../models/CustomerApprovalRequest.js");
+const { default: ApprovalRequest } = await import("../models/ApprovalRequest.js");
 const { default: ManualBooking } = await import("../models/ManualBooking.js");
 const { default: VisaApplication } = await import("../models/VisaApplication.js");
 const { default: LeaveRequest } = await import("../models/LeaveRequest.js");
@@ -155,10 +155,24 @@ beforeAll(async () => {
     { workspaceId: WS, requesterId: oid(ids.peer), assignedBookerId: RAVI, type: "flight", status: "BOOKED", searchParams: {}, selectedOption: {} },
     { workspaceId: WS, requesterId: RAVI, assignedBookerId: oid(ids.admin), type: "hotel", status: "PENDING", searchParams: {}, selectedOption: {} },
   ] as any[]);
-  await CustomerApprovalRequest.collection.insertMany([
-    { workspaceId: WS, requesterId: oid(ids.peer), approverId: RAVI, ticketId: "T-100", status: "on_hold", adminState: "pending" },
-    { workspaceId: WS, requesterId: oid(ids.peer), approverId: RAVI, ticketId: "T-099", status: "approved", adminState: "done" },
-    { workspaceId: WS, requesterId: RAVI, approverId: oid(ids.admin), ticketId: "T-101", status: "pending", adminState: "pending" },
+  // Travel approvals: the LIVE model (routes/approvals.ts). People are STRING
+  // user ids + email; managerId is absent when the approver email did not
+  // resolve to a user at create time (the inbox matches managerEmail).
+  // On-hold is written as status "pending" + stage REQUEST_ON_HOLD.
+  await ApprovalRequest.collection.insertMany([
+    // Ravi is the approver, by id — awaiting his decision
+    { workspaceId: WS, ticketId: "T-100", customerName: "Acme", frontlinerId: String(ids.peer), frontlinerEmail: "peer@plumtrips.com", managerId: String(RAVI), managerEmail: "ravi@plumtrips.com", status: "pending", stage: "REQUEST_RAISED" },
+    // Ravi is the approver by EMAIL only (no managerId) and it is on hold — still his
+    { workspaceId: WS, ticketId: "T-102", frontlinerId: String(ids.peer), frontlinerEmail: "peer@plumtrips.com", managerEmail: "Ravi@Plumtrips.com", status: "pending", stage: "REQUEST_ON_HOLD", adminState: "on_hold" },
+    // Already decided — excluded
+    { workspaceId: WS, ticketId: "T-099", frontlinerId: String(ids.peer), frontlinerEmail: "peer@plumtrips.com", managerId: String(RAVI), managerEmail: "ravi@plumtrips.com", status: "approved", stage: "PROPOSAL_PENDING", adminState: "pending" },
+    { workspaceId: WS, ticketId: "T-098", frontlinerId: String(ids.peer), frontlinerEmail: "peer@plumtrips.com", managerId: String(RAVI), managerEmail: "ravi@plumtrips.com", status: "declined", stage: "REQUEST_DECLINED", adminState: "cancelled" },
+    // Another tenant's row pointing at the same id — never counted
+    { workspaceId: new mongoose.Types.ObjectId(), ticketId: "T-OTHER", frontlinerId: String(ids.peer), frontlinerEmail: "peer@other.test", managerId: String(RAVI), managerEmail: "ravi@plumtrips.com", status: "pending", stage: "REQUEST_RAISED" },
+    // Ravi RAISED this one, awaiting the admin — owned, still open
+    { workspaceId: WS, ticketId: "T-101", frontlinerId: String(RAVI), frontlinerEmail: "ravi@plumtrips.com", managerId: String(ids.admin), managerEmail: "ops@plumtrips.com", status: "pending", stage: "REQUEST_RAISED" },
+    // Ravi raised, already approved — excluded from "owned"
+    { workspaceId: WS, ticketId: "T-097", frontlinerId: String(RAVI), frontlinerEmail: "ravi@plumtrips.com", managerId: String(ids.admin), managerEmail: "ops@plumtrips.com", status: "approved", stage: "BOOKING_DONE", adminState: "done" },
   ] as any[]);
   await ManualBooking.collection.insertMany([
     { workspaceId: WS, bookingRef: "MB-1", travellerName: "X", status: "WIP", isActive: true, assignPerson: RAVI, assignmentStatus: "ASSIGNED" },
@@ -238,24 +252,36 @@ describe("GET /employees/:id/pending-work", () => {
     expect(b1.advancesToApprove.count).toBe(1);
     expect(b1.sbtRequestsToBook.count).toBe(1);
     expect(b1.sbtRequestsToBook.items[0].title).toBe("flight request · P Q");
-    expect(b1.travelApprovalsToDecide.count).toBe(1);
+    // ApprovalRequest (live model): by managerId (T-100) + by managerEmail only,
+    // on hold (T-102); approved / declined / other-tenant rows excluded.
+    expect(b1.travelApprovalsToDecide.count).toBe(2);
+    expect(b1.travelApprovalsToDecide.items.map((i: any) => i.title).sort()).toEqual(["Ticket T-100 · Acme", "Ticket T-102"]);
+    expect(b1.travelApprovalsToDecide.items.find((i: any) => i.title === "Ticket T-102").status).toBe("on hold");
+    expect(b1.travelApprovalsToDecide.hrefAll).toBe("/admin/approvals");
     expect(b1.manualBookingsAssigned.count).toBe(1);
     expect(b1.visaApplicationsAssigned.count).toBe(1); // closed + draft excluded
     expect(b1.leaveApprovalsOfReports.count).toBe(1); // report1 PENDING; report2 APPROVED excluded
     expect(b1.odApprovalsOfReports.count).toBe(1);
-    expect(res.body.totals.awaitingAction).toBe(10);
+    expect(res.body.totals.awaitingAction).toBe(11);
 
     const b2 = byKey(res.body.owned);
     expect(b2.leads.count).toBe(1);
     expect(b2.leads.items[0].title).toBe("L-1 · Acme");
     expect(b2.leads.items[0].href).toMatch(/^\/crm\/leads\/[0-9a-f]{24}$/); // CRM routes live under /crm
     expect(b2.opportunities.count).toBe(1);
+    // CRM v2 flags are unset in this suite → the opportunity board does not
+    // exist (router folds it into /crm/leads; /api/opportunities 404s), so the
+    // source carries no link and says where to act.
+    expect(b2.opportunities.hrefAll).toBeNull();
+    expect(b2.opportunities.items[0].href).toBeNull();
+    expect(b2.opportunities.note).toMatch(/CRM v2/);
     expect(b2.ownLeaveRequests.count).toBe(1);
     expect(b2.ownExpenseClaims.count).toBe(1);
     expect(b2.ownAdvances.count).toBe(1);
     expect(b2.ownReimbursementClaims.count).toBe(1);
     expect(b2.ownSbtRequests.count).toBe(1);
-    expect(b2.ownTravelApprovals.count).toBe(1);
+    expect(b2.ownTravelApprovals.count).toBe(1); // T-101 raised by Ravi, pending; T-097 approved excluded
+    expect(b2.ownTravelApprovals.items[0].title).toBe("Ticket T-101");
     expect(b2.ownDeclarations.count).toBe(1);
     expect(b2.ownDateChangeRequests.count).toBe(1);
     expect(res.body.totals.owned).toBe(10);
@@ -278,7 +304,21 @@ describe("GET /employees/:id/pending-work", () => {
       for (const it of src.items) expect(it.href === src.hrefAll || DETAIL.test(it.href)).toBe(true);
     }
     expect([...res.body.awaitingAction, ...res.body.owned].filter((s: any) => s.hrefAll === null).map((s: any) => s.key))
-      .toEqual(["sbtRequestsToBook", "ownSbtRequests"]);
+      .toEqual(["sbtRequestsToBook", "opportunities", "ownSbtRequests"]);
+  });
+
+  it("links opportunities to /crm/opportunities only when a CRM v2 flag is on", async () => {
+    caller.current = "admin";
+    process.env.CRM_V2_OPPORTUNITY = "true";
+    try {
+      const res = await pendingWork(emp.ravi);
+      const opp = byKey(res.body.owned).opportunities;
+      expect(opp.hrefAll).toBe("/crm/opportunities");
+      expect(opp.items[0].href).toMatch(/^\/crm\/opportunities\/[0-9a-f]{24}$/);
+      expect(opp.note).toBeUndefined();
+    } finally {
+      delete process.env.CRM_V2_OPPORTUNITY;
+    }
   });
 
   it("standing section returns counts + names, deduplicating reports across User- and Employee-space", async () => {
@@ -394,7 +434,7 @@ describe("Employment Status coupling", () => {
     const audit: any = await UserStatusAudit.findOne({ userId: oid(ids.ravi) }).lean();
     expect(audit.trigger).toBe("employment_status");
     expect(audit.employmentStatus).toBe("terminated");
-    expect(audit.pendingWorkSnapshot.totals).toEqual({ awaitingAction: 10, owned: 10, standing: 9 });
+    expect(audit.pendingWorkSnapshot.totals).toEqual({ awaitingAction: 11, owned: 10, standing: 9 });
     expect(audit.pendingWorkSnapshot.awaitingAction.tasks).toBe(1);
     expect(audit.pendingWorkSnapshot.standing.reportsTo).toBe(2);
   });

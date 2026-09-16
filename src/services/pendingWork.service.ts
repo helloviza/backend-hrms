@@ -30,7 +30,8 @@ import Ticket from "../models/Ticket.js";
 import Report from "../models/Report.js";
 import ExpenseAdvance from "../models/ExpenseAdvance.js";
 import SBTRequest from "../models/SBTRequest.js";
-import CustomerApprovalRequest from "../models/CustomerApprovalRequest.js";
+import ApprovalRequest from "../models/ApprovalRequest.js";
+import { exactIRegex } from "../routes/approvals.security.js";
 import ManualBooking from "../models/ManualBooking.js";
 import VisaApplication from "../models/VisaApplication.js";
 import LeaveRequest from "../models/LeaveRequest.js";
@@ -46,6 +47,7 @@ import CRMContact from "../models/CRMContact.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import Pipeline from "../models/Pipeline.js";
+import { isCrmV2DispositionEnabled, isCrmV2OpportunityEnabled } from "../config/crmV2.js";
 
 /** Drill-down rows per source — enough to act on, not a report. */
 const ITEM_LIMIT = 10;
@@ -157,6 +159,28 @@ export async function collectPendingWork(args: {
   const wsScope: Record<string, unknown> = wsId ? { workspaceId: wsId } : {};
   const flags: string[] = [];
 
+  /* ── Travel approvals live in ApprovalRequest (routes/approvals.ts), NOT
+   *    CustomerApprovalRequest — that router was never mounted and its
+   *    collection is empty. ApprovalRequest keys people by STRING user id
+   *    (frontlinerId / managerId) with an email beside each, and managerId is
+   *    only set when the approver's email resolved to a user at create time —
+   *    the live approver inbox matches on managerEmail. So match id OR email,
+   *    exactly as that route does. "Open" for an L2 decision is status
+   *    "pending" (on-hold is written as pending + stage REQUEST_ON_HOLD); the
+   *    schema's legacy "on_hold" status is kept in the set. */
+  const userIdStr = String(userId);
+  const userEmail = String(((await User.findById(userId).select("email").lean()) as any)?.email || "").trim();
+  const personMatch = (idField: string, emailField: string) => ({
+    $or: [{ [idField]: userIdStr }, ...(userEmail ? [{ [emailField]: exactIRegex(userEmail) }] : [])],
+  });
+  const APPROVAL_OPEN = { status: { $in: ["pending", "on_hold"] } };
+  const approvalItem = (d: any): PendingWorkItem => ({
+    id: String(d._id),
+    title: [d.ticketId ? `Ticket ${d.ticketId}` : "", d.customerName].filter(Boolean).join(" · ") || "(approval request)",
+    status: d.stage === "REQUEST_ON_HOLD" ? "on hold" : d.status,
+    href: "/admin/approvals",
+  });
+
   /* ── The User ↔ Employee join, resolved explicitly ──────────────────── */
   const employeeRows = (await Employee.find({ ownerId: userId, ...wsScope })
     .select("_id ownerId workspaceId")
@@ -219,10 +243,10 @@ export async function collectPendingWork(args: {
       (d) => ({ id: String(d._id), title: `${d.type || "travel"} request${d.passengerDetails?.[0] ? ` · ${`${d.passengerDetails[0].firstName || ""} ${d.passengerDetails[0].lastName || ""}`.trim()}` : ""}`, status: d.status, href: null }),
       { updatedAt: -1 },
       "Handled in that workspace's SBT inbox by its Workspace Leader (no admin page)."),
-    source("travelApprovalsToDecide", "Travel approvals to decide", CustomerApprovalRequest,
-      { approverId: userId, status: { $in: ["pending", "on_hold"] } },
+    source("travelApprovalsToDecide", "Travel approvals to decide", ApprovalRequest,
+      { ...personMatch("managerId", "managerEmail"), ...APPROVAL_OPEN, ...wsScope },
       "/admin/approvals",
-      (d) => ({ id: String(d._id), title: d.ticketId ? `Ticket ${d.ticketId}` : "(approval request)", status: d.status, href: "/admin/approvals" })),
+      approvalItem),
     source("manualBookingsAssigned", "Manual bookings assigned (ops)", ManualBooking,
       { assignPerson: userId, status: { $in: ["PENDING", "WIP"] }, isActive: { $ne: false } },
       "/admin/manual-bookings",
@@ -248,15 +272,22 @@ export async function collectPendingWork(args: {
   ]);
 
   /* ── BUCKET 2 — owned by this person, still open ─────────────────────── */
+  const crmV2On = isCrmV2OpportunityEnabled() || isCrmV2DispositionEnabled();
   const owned: PendingWorkSource[] = await Promise.all([
     source("leads", "Open leads owned", Lead,
       { assignedTo: userId, stage: { $nin: ["won", "lost"] } },
       "/crm/leads",
       (d) => ({ id: String(d._id), title: [d.leadCode, d.companyName || d.contactName].filter(Boolean).join(" · ") || "(lead)", status: d.stage, href: `/crm/leads/${d._id}` })),
+    // /crm/opportunities(/:id) only exists with CRM v2 on: router.tsx folds
+    // it back into /crm/leads when the VITE_ flag is off, and /api/opportunities
+    // 404s when CRM_V2_OPPORTUNITY / CRM_V2_DISPOSITION are off — so with the
+    // flags off the link would land on the wrong page.
     source("opportunities", "Open opportunities owned", Opportunity,
       { ownerUserId: userId, stage: { $nin: ["closed_won", "closed_lost"] } },
-      "/crm/opportunities",
-      (d) => ({ id: String(d._id), title: d.name || "(opportunity)", status: d.stage, href: `/crm/opportunities/${d._id}` })),
+      crmV2On ? "/crm/opportunities" : null,
+      (d) => ({ id: String(d._id), title: d.name || "(opportunity)", status: d.stage, href: crmV2On ? `/crm/opportunities/${d._id}` : null }),
+      { updatedAt: -1 },
+      crmV2On ? undefined : "Reassign via the lead it belongs to — the opportunity board is off until CRM v2 is enabled (no admin page)."),
     source("ownLeaveRequests", "Own pending leave requests", LeaveRequest,
       { userId, status: "PENDING" },
       "/leaves/team",
@@ -280,10 +311,10 @@ export async function collectPendingWork(args: {
       (d) => ({ id: String(d._id), title: `${d.type || "travel"} request`, status: d.status, href: null }),
       { updatedAt: -1 },
       "Visible only to the requester and their booker / Workspace Leader (no admin page)."),
-    source("ownTravelApprovals", "Own travel approval requests pending", CustomerApprovalRequest,
-      { requesterId: userId, status: { $in: ["pending", "on_hold"] } },
+    source("ownTravelApprovals", "Own travel approval requests pending", ApprovalRequest,
+      { ...personMatch("frontlinerId", "frontlinerEmail"), ...APPROVAL_OPEN, ...wsScope },
       "/admin/approvals",
-      (d) => ({ id: String(d._id), title: d.ticketId ? `Ticket ${d.ticketId}` : "(approval request)", status: d.status, href: "/admin/approvals" })),
+      approvalItem),
     source("ownDeclarations", "Tax declarations unsubmitted / in flight", EmployeeDeclaration,
       { userId, $or: [{ declarationStatus: { $in: ["DRAFT", "SUBMITTED", "HR_UNLOCKED"] } }, { proofStatus: { $in: ["PARTIAL", "SUBMITTED"] } }] },
       "/payroll/declarations/manage",
