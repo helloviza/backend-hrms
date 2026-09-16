@@ -40,6 +40,16 @@ import {
   upsertGrant,
   grantView,
 } from "../services/expenseGrants.service.js";
+import {
+  RANKS,
+  getRankTable,
+  setRankRow,
+  getEffectiveLimitForUser,
+  getEffectiveLimitsForUsers,
+  effectiveApprovalLimit,
+  type EffectiveLimit,
+} from "../services/expenseAuthority.service.js";
+import CustomerMember from "../models/CustomerMember.js";
 
 const router = express.Router();
 
@@ -60,11 +70,23 @@ router.use((req: any, res: any, next: any) => {
   return next();
 });
 
-/** One user row for the Team page: identity + manager + the grant view. */
-function teamRow(u: any, grant: ReturnType<typeof grantView>, nameById: Map<string, string>) {
+/** One user row for the Team page: identity + manager + the grant view + the
+ *  resolved approval limit (sub-step 3). */
+function teamRow(
+  u: any,
+  grant: ReturnType<typeof grantView>,
+  nameById: Map<string, string>,
+  limit?: EffectiveLimit | null,
+) {
   const managerId = u.managerId ? String(u.managerId) : null;
   const withGrant = { ...u, expenseGrant: grant };
   return {
+    // ── Authority (sub-step 3): rank + resolved limit, base currency ──
+    bandNumber: u.bandNumber ?? null,
+    rankLabel: limit?.rankLabel ?? null,
+    rankDefaultLimitBase: limit?.rankDefaultLimitBase ?? null,
+    effectiveLimitBase: limit?.effectiveLimitBase ?? 0,
+    limitSource: limit?.limitSource ?? "none",
     id: String(u._id),
     name: employeeNameOf(u),
     email: u.email || "",
@@ -98,21 +120,24 @@ router.get("/users", async (req: any, res: any) => {
     const ws = req.workspaceObjectId;
     const docs: any[] = await User.find({ workspaceId: ws, ...activeUserFilter() })
       .select(
-        "firstName lastName name email designation department roles role userType accountType hrmsAccessRole hrmsAccessLevel isSuperAdmin managerId managerName reportingL1 status",
+        "firstName lastName name email designation department roles role userType accountType hrmsAccessRole hrmsAccessLevel isSuperAdmin managerId managerName reportingL1 status bandNumber",
       )
       .sort({ name: 1, firstName: 1 })
       .lean();
 
-    const [grants, departments] = await Promise.all([
+    const [grants, departments, limits, ranks, baseCurrency] = await Promise.all([
       grantsByUserId(ws, docs.map((u) => u._id)),
       Department.find({ workspaceId: ws, isActive: true }).select("_id name code").sort({ name: 1 }).lean(),
+      getEffectiveLimitsForUsers(ws, docs),
+      getRankTable(ws),
+      getWorkspaceBaseCurrency(ws),
     ]);
 
     // Resolve manager display names from WITHIN the workspace pool only.
     const nameById = new Map<string, string>();
     for (const u of docs) nameById.set(String(u._id), employeeNameOf(u));
 
-    const users = docs.map((u: any) => teamRow(u, grants.get(String(u._id)) ?? null, nameById));
+    const users = docs.map((u: any) => teamRow(u, grants.get(String(u._id)) ?? null, nameById, limits.get(String(u._id))));
     const noManagerCount = users.filter((u) => !u.hasManager).length;
     res.json({
       ok: true,
@@ -120,6 +145,8 @@ router.get("/users", async (req: any, res: any) => {
       total: users.length,
       noManagerCount,
       departments: departments.map((d: any) => ({ id: String(d._id), name: d.name, code: d.code || "" })),
+      ranks,
+      baseCurrency,
     });
   } catch (err: any) {
     console.error("[ExpenseAdmin users]", err?.message);
@@ -207,10 +234,150 @@ router.patch("/users/:id/capabilities", async (req: any, res: any) => {
 
     const view = grantView(grant.toObject());
     const nameById = new Map<string, string>();
-    res.json({ ok: true, user: teamRow(user, view, nameById) });
+    const rankTable = await getRankTable(req.workspaceObjectId);
+    const limit = effectiveApprovalLimit({ bandNumber: (user as any).bandNumber ?? null, rankTable, grant: view });
+    res.json({ ok: true, user: teamRow(user, view, nameById, limit) });
   } catch (err: any) {
     console.error("[ExpenseAdmin capabilities]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to update capabilities" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * RANK DEFAULTS + PER-PERSON LIMITS (approval-engine sub-step 3)
+ *
+ * GET  /api/expense-admin/ranks                — the 10-row rank table
+ * PUT  /api/expense-admin/ranks/:bandNumber    — { label?, defaultApprovalLimitBase? }
+ * PUT  /api/expense-admin/ranks                — { ranks: [{ bandNumber, label?, defaultApprovalLimitBase? }] }
+ * PATCH /api/expense-admin/users/:id/rank      — { bandNumber: 1..10 | null }
+ * GET  /api/expense-admin/users/:id/authority  — the resolved effective limit
+ *
+ * All behind the router-level isAdmin() gate (structural workspace roles —
+ * incl. WORKSPACE_LEADER — or an expenseAdmin grant): "admin / leadership"
+ * per D6. Limits are in the workspace base currency. The table ships EMPTY.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/ranks", async (req: any, res: any) => {
+  try {
+    const [ranks, baseCurrency] = await Promise.all([
+      getRankTable(req.workspaceObjectId),
+      getWorkspaceBaseCurrency(req.workspaceObjectId),
+    ]);
+    res.json({ ok: true, ranks, baseCurrency });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin ranks GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load ranks" });
+  }
+});
+
+// Flat shape (this package compiles with strictNullChecks:false, where a
+// boolean-literal discriminant does not narrow): branch on `ok`, read `error`.
+function parseRankPatch(b: any): { ok: boolean; error?: string; label?: string | null; limit?: number | null } {
+  const out: { ok: boolean; error?: string; label?: string | null; limit?: number | null } = { ok: true };
+  if ("label" in (b || {})) {
+    const l = b.label == null ? "" : String(b.label).trim();
+    if (l.length > 60) return { ok: false, error: "label must be 60 characters or fewer" };
+    out.label = l;
+  }
+  if ("defaultApprovalLimitBase" in (b || {})) {
+    const raw = b.defaultApprovalLimitBase;
+    if (raw === null || raw === undefined || String(raw).trim() === "") {
+      out.limit = null;
+    } else {
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < 0) return { ok: false, error: "defaultApprovalLimitBase must be a non-negative number, or null to clear" };
+      out.limit = n;
+    }
+  }
+  return out;
+}
+
+router.put("/ranks/:bandNumber", async (req: any, res: any) => {
+  try {
+    const n = parseInt(String(req.params.bandNumber), 10);
+    if (!RANKS.includes(n as any)) return res.status(400).json({ error: "bandNumber must be 1-10" });
+    const p = parseRankPatch(req.body);
+    if (!p.ok) return res.status(400).json({ error: p.error });
+    if (p.label === undefined && p.limit === undefined) {
+      return res.status(400).json({ error: "Nothing to change (pass label and/or defaultApprovalLimitBase)" });
+    }
+    const row = await setRankRow({
+      workspaceId: req.workspaceObjectId,
+      bandNumber: n,
+      label: p.label,
+      defaultApprovalLimitBase: p.limit,
+    });
+    res.json({ ok: true, rank: row, baseCurrency: await getWorkspaceBaseCurrency(req.workspaceObjectId) });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin ranks PUT]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to update rank" });
+  }
+});
+
+router.put("/ranks", async (req: any, res: any) => {
+  try {
+    const list = Array.isArray(req.body?.ranks) ? req.body.ranks : null;
+    if (!list || list.length === 0) return res.status(400).json({ error: "ranks[] is required" });
+    // Validate everything first — an all-or-nothing table write.
+    const parsed: { n: number; label?: string | null; limit?: number | null }[] = [];
+    for (const item of list) {
+      const n = parseInt(String(item?.bandNumber), 10);
+      if (!RANKS.includes(n as any)) return res.status(400).json({ error: `bandNumber must be 1-10 (got ${item?.bandNumber})` });
+      const p = parseRankPatch(item);
+      if (!p.ok) return res.status(400).json({ error: `Rank ${n}: ${p.error}` });
+      parsed.push({ n, label: p.label, limit: p.limit });
+    }
+    for (const p of parsed) {
+      await setRankRow({ workspaceId: req.workspaceObjectId, bandNumber: p.n, label: p.label, defaultApprovalLimitBase: p.limit });
+    }
+    res.json({ ok: true, ranks: await getRankTable(req.workspaceObjectId), baseCurrency: await getWorkspaceBaseCurrency(req.workspaceObjectId) });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin ranks bulk PUT]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to update ranks" });
+  }
+});
+
+router.patch("/users/:id/rank", async (req: any, res: any) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(404).json({ error: "User not found" });
+    const raw = req.body?.bandNumber;
+    let bandNumber: number | null = null;
+    if (raw !== null && raw !== undefined && String(raw).trim() !== "") {
+      const n = Number(raw);
+      if (!Number.isInteger(n) || !RANKS.includes(n as any)) return res.status(400).json({ error: "bandNumber must be an integer 1-10, or null" });
+      bandNumber = n;
+    }
+    const user: any = await User.findOne({ _id: new mongoose.Types.ObjectId(id), workspaceId: req.workspaceObjectId })
+      .select("email customerId bandNumber")
+      .lean();
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    await User.updateOne({ _id: user._id }, { $set: { bandNumber } });
+    // Mirror to CustomerMember exactly as routes/expenseBands.ts does (same
+    // customerId + email key) so the two writers never disagree.
+    const customerId = req.workspace?.customerId || user.customerId;
+    if (customerId && user.email) {
+      await CustomerMember.findOneAndUpdate({ customerId, email: user.email }, { $set: { bandNumber } });
+    }
+    const authority = await getEffectiveLimitForUser(req.workspaceObjectId, user._id);
+    res.json({ ok: true, user: { id: String(user._id), bandNumber }, authority });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin rank PATCH]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to set rank" });
+  }
+});
+
+router.get("/users/:id/authority", async (req: any, res: any) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(404).json({ error: "User not found" });
+    const exists = await User.exists({ _id: new mongoose.Types.ObjectId(id), workspaceId: req.workspaceObjectId });
+    if (!exists) return res.status(404).json({ error: "User not found" });
+    const authority = await getEffectiveLimitForUser(req.workspaceObjectId, id);
+    res.json({ ok: true, userId: id, authority, baseCurrency: await getWorkspaceBaseCurrency(req.workspaceObjectId) });
+  } catch (err: any) {
+    console.error("[ExpenseAdmin authority GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to resolve authority" });
   }
 });
 

@@ -47,6 +47,7 @@ import {
   round2,
 } from "../services/expenseFx.service.js";
 import { getLiveRate } from "../utils/exchangeRate.js";
+import { getEffectiveLimitForUser } from "../services/expenseAuthority.service.js";
 import { env } from "../config/env.js";
 import Expense from "../models/Expense.js";
 import ExpenseCategory from "../models/ExpenseCategory.js";
@@ -1038,6 +1039,13 @@ router.get("/analytics", async (req: any, res: any) => {
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/capabilities", async (req: any, res: any) => {
   const u = req.user;
+  // Authority (sub-step 3): the resolved effective limit, base currency.
+  let authority: any = null;
+  try {
+    authority = await getEffectiveLimitForUser(req.workspaceObjectId, ownEmployeeId(req));
+  } catch (err: any) {
+    console.error("[Expenses capabilities authority]", err?.message);
+  }
   res.json({
     ok: true,
     capabilities: {
@@ -1047,6 +1055,10 @@ router.get("/capabilities", async (req: any, res: any) => {
       approver: isApprover(u),
       limitBase: personalLimitOf(u),
       departmentIds: departmentScopeOf(u),
+      bandNumber: authority?.bandNumber ?? null,
+      rankLabel: authority?.rankLabel ?? null,
+      effectiveLimitBase: authority?.effectiveLimitBase ?? 0,
+      limitSource: authority?.limitSource ?? "none",
     },
   });
 });
