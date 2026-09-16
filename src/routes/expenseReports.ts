@@ -791,6 +791,82 @@ router.post("/:id/submit", async (req: any, res: any) => {
   }
 });
 
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /api/reports/:id/withdraw  — submitted → draft (OWNER only). Audit F-14.
+ *
+ * Allowed ONLY while nobody has acted: status is still `submitted` AND every
+ * chain level is still `pending` (a multi-level claim whose L1 has already
+ * approved is "being reviewed" even though the claim itself still reads
+ * submitted). The guard is a single conditional update on exactly that shape,
+ * so a withdraw racing an approve/decline/send-back loses cleanly (409) instead
+ * of overwriting the decision (the F-07 pattern).
+ *
+ * The claim goes back to DRAFT, not deleted: its lines stay linked and return
+ * to pending_to_submit; the chain snapshot is cleared (a resubmit re-resolves
+ * it); advance earmarks are kept (a draft may hold them). Timeline: `withdrawn`.
+ * A claim already sent back (clarification_required) is already the owner's —
+ * nothing to withdraw; declined / approved / reimbursed are refused.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/:id/withdraw", async (req: any, res: any) => {
+  try {
+    const report = await loadReport(req, req.params.id, { ownerOnly: true });
+    if (!report) return res.status(404).json({ error: "Report not found" }); // incl. someone else's claim
+
+    const reviewed = "This claim is already being reviewed and can't be withdrawn — ask the approver to send it back.";
+    if (report.status === "draft") {
+      return res.status(409).json({ error: "This claim is already a draft." });
+    }
+    if (report.status === "clarification_required") {
+      return res.status(409).json({ error: "This claim has been sent back to you — it is already editable." });
+    }
+    if (report.status !== "submitted") {
+      return res.status(409).json({ error: reviewed });
+    }
+
+    const rid = report._id as mongoose.Types.ObjectId;
+    const flipped = await Report.findOneAndUpdate(
+      {
+        _id: rid,
+        workspaceId: req.workspaceObjectId,
+        employeeId: new mongoose.Types.ObjectId(ownEmployeeId(req)),
+        status: "submitted",
+        // No level decided yet — every chain step (if any) is still pending.
+        approvalChain: { $not: { $elemMatch: { status: { $ne: "pending" } } } },
+      },
+      {
+        $set: {
+          status: "draft",
+          approverId: null,
+          approvalChain: [],
+          currentLevel: 1,
+          submittedAt: null,
+          decisionNote: null,
+          selfApproved: false,
+        },
+      },
+      { new: true },
+    );
+    if (!flipped) return res.status(409).json({ error: reviewed });
+
+    await propagateReportLifecycle(req.workspaceObjectId, rid, "draft");
+
+    const me = ownEmployeeId(req);
+    await logActivity({
+      workspaceId: req.workspaceObjectId,
+      reportId: rid,
+      event: "withdrawn",
+      actorId: me,
+      actorName: actorNameOf(req),
+      note: "Withdrawn before review — back to draft",
+    });
+
+    res.json({ ok: true, report: flipped.toObject() });
+  } catch (err: any) {
+    console.error("[Reports withdraw]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to withdraw report" });
+  }
+});
+
 /* ── Authorization helper for approve/reject ─────────────────────────
  * The actor must be the routed approver OR an admin. A NON-admin cannot decide
  * their OWN report (segregation of duties); an ADMIN may (owner-operator

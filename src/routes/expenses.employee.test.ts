@@ -334,6 +334,115 @@ describe("4 · submit the claim", () => {
   });
 });
 
+/* ── 6. Withdraw a submitted claim (F-14) ──────────────────────────── */
+describe("6 · withdraw a submitted claim", () => {
+  async function submittedClaim(team: Awaited<ReturnType<typeof makeTeam>>) {
+    const me = as(team.employee);
+    const a = (await me.post("/api/expenses", { amount: 100, merchant: "A", date: TODAY })).body.expense;
+    const b = (await me.post("/api/expenses", { amount: 250, merchant: "B", date: TODAY })).body.expense;
+    const claim = (await me.post("/api/reports", { name: "W" })).body.report;
+    await me.post(`/api/reports/${claim._id}/expenses`, { expenseIds: [a._id, b._id] });
+    expect((await me.post(`/api/reports/${claim._id}/submit`)).status).toBe(200);
+    return { me, claim, a, b };
+  }
+
+  it("owner withdraws an untouched submitted claim → draft, editable, lines intact, logged; then resubmits normally", async () => {
+    const team = await makeTeam();
+    const { me, claim, a, b } = await submittedClaim(team);
+
+    const w = await me.post(`/api/reports/${claim._id}/withdraw`);
+    expect(w.status).toBe(200);
+    expect(w.body.report.status).toBe("draft");
+    expect(w.body.report.approverId).toBeNull();
+    expect(w.body.report.approvalChain).toEqual([]);
+    expect(w.body.report.submittedAt).toBeNull();
+
+    // Lines are still in the claim, back to pending_to_submit ("In claim").
+    const lines = await Expense.find({ reportId: claim._id }).lean();
+    expect(lines.map((l: any) => String(l._id)).sort()).toEqual([a._id, b._id].sort());
+    expect(lines.every((l: any) => l.lifecycleStatus === "pending_to_submit")).toBe(true);
+    expect((await me.get("/api/expenses?status=in_claim")).body.docs).toHaveLength(2);
+
+    // Timeline.
+    const log = await ExpenseActivity.find({ reportId: claim._id, event: "withdrawn" }).lean();
+    expect(log).toHaveLength(1);
+    expect(String(log[0].actorId)).toBe(team.employee.id);
+
+    // Editable again: rename, drop a line, add one, resubmit.
+    expect((await me.patch(`/api/reports/${claim._id}`, { name: "W (edited)" })).status).toBe(200);
+    expect((await me.delete(`/api/reports/${claim._id}/expenses/${a._id}`)).status).toBe(200);
+    const c = (await me.post("/api/expenses", { amount: 75, merchant: "C", date: TODAY, reportId: claim._id })).body.expense;
+    expect(c.lifecycleStatus).toBe("pending_to_submit");
+    const re = await me.post(`/api/reports/${claim._id}/submit`);
+    expect(re.status).toBe(200);
+    expect(re.body.report.status).toBe("submitted");
+    expect(String(re.body.report.approverId)).toBe(team.manager.id); // chain re-resolved fresh
+    expect((await me.get(`/api/reports/${claim._id}`)).body.report.totalAmount).toBe(325);
+    const events = (await me.get(`/api/reports/${claim._id}`)).body.activity.map((x: any) => x.event);
+    expect(events.filter((e: string) => e === "submitted")).toHaveLength(2);
+    expect(events).toContain("withdrawn");
+
+    // A second withdraw of the already-withdrawn (now resubmitted) claim works
+    // again; a withdraw of a DRAFT is a no-op 409.
+    expect((await me.post(`/api/reports/${claim._id}/withdraw`)).status).toBe(200);
+    expect((await me.post(`/api/reports/${claim._id}/withdraw`)).status).toBe(409);
+  });
+
+  it("is refused (409, clear message) once anyone has acted: approved, declined, sent back, or L1 of a 2-level chain", async () => {
+    // approved
+    let team = await makeTeam();
+    let { me, claim } = await submittedClaim(team);
+    expect((await as(team.manager).post(`/api/reports/${claim._id}/approve`)).status).toBe(200);
+    let r = await me.post(`/api/reports/${claim._id}/withdraw`);
+    expect(r.status).toBe(409);
+    expect(r.body.error).toMatch(/already being reviewed/);
+    expect((await Report.findById(claim._id).lean())!.status).toBe("approved");
+
+    // declined
+    team = await makeTeam();
+    ({ me, claim } = await submittedClaim(team));
+    expect((await as(team.manager).post(`/api/reports/${claim._id}/decline`, { decisionNote: "no" })).status).toBe(200);
+    expect((await me.post(`/api/reports/${claim._id}/withdraw`)).status).toBe(409);
+
+    // sent back — already the owner's, nothing to withdraw (but it IS editable)
+    team = await makeTeam();
+    ({ me, claim } = await submittedClaim(team));
+    expect((await as(team.manager).post(`/api/reports/${claim._id}/request-clarification`, { decisionNote: "receipt?" })).status).toBe(200);
+    r = await me.post(`/api/reports/${claim._id}/withdraw`);
+    expect(r.status).toBe(409);
+    expect(r.body.error).toMatch(/already editable/);
+    expect((await me.patch(`/api/reports/${claim._id}`, { name: "still mine" })).status).toBe(200);
+
+    // 2-level chain: L1 approved → claim still `submitted` but under review
+    team = await makeTeam();
+    const admin = await makeUser(team.wsId, ["ADMIN"]);
+    await CustomerWorkspace.updateOne(
+      { _id: new mongoose.Types.ObjectId(team.wsId) },
+      { $set: { "config.expenseEscalationThreshold": 100, "config.seniorApproverId": new mongoose.Types.ObjectId(admin.id) } },
+    );
+    ({ me, claim } = await submittedClaim(team)); // total 350 > 100 → 2 levels
+    expect((await Report.findById(claim._id).lean())!.approvalChain).toHaveLength(2);
+    expect((await as(team.manager).post(`/api/reports/${claim._id}/approve`)).status).toBe(200);
+    const mid: any = await Report.findById(claim._id).lean();
+    expect(mid.status).toBe("submitted");
+    expect(mid.currentLevel).toBe(2);
+    r = await me.post(`/api/reports/${claim._id}/withdraw`);
+    expect(r.status).toBe(409);
+    expect(r.body.error).toMatch(/already being reviewed/);
+    expect((await Report.findById(claim._id).lean())!.currentLevel).toBe(2); // untouched
+  });
+
+  it("another employee cannot see or withdraw it (404), and the approver/admin cannot withdraw on the owner's behalf", async () => {
+    const team = await makeTeam();
+    const { claim } = await submittedClaim(team);
+    expect((await as(team.colleague).post(`/api/reports/${claim._id}/withdraw`)).status).toBe(404);
+    expect((await as(team.manager).post(`/api/reports/${claim._id}/withdraw`)).status).toBe(404);
+    const admin = await makeUser(team.wsId, ["ADMIN"]);
+    expect((await as(admin).post(`/api/reports/${claim._id}/withdraw`)).status).toBe(404); // ownerOnly, even for admins
+    expect((await Report.findById(claim._id).lean())!.status).toBe("submitted");
+  });
+});
+
 /* ── 5. Delete a mis-captured bill (new) ───────────────────────────── */
 describe("5 · delete a mis-captured bill", () => {
   it("owner can delete a never-submitted bill (loose or in own draft); anything submitted is refused; not others' bills", async () => {

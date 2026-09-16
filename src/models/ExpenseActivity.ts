@@ -26,6 +26,8 @@ export type ExpenseActivityEvent =
   // FX slice 0: a manual / finance exchange-rate write on a line in this claim
   // (PATCH /expenses/:id/rate). The note carries old → new rate + amountBase.
   | "fx_rate_set"
+  // Owner withdrew a submitted-but-untouched claim back to draft (audit F-14).
+  | "withdrawn"
   // ── Advance (System B) events — additive ──
   | "requested"
   | "disbursed"
@@ -48,6 +50,7 @@ export const EXPENSE_ACTIVITY_EVENTS: ExpenseActivityEvent[] = [
   "expense_removed",
   "policy_check",
   "fx_rate_set",
+  "withdrawn",
   "requested",
   "disbursed",
   "advance_applied",
