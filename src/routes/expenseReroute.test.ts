@@ -125,8 +125,50 @@ async function submittedClaim(who: Actor, wsId: string, name: string, amount: nu
   return { id: String(c._id), ref: String(c.ref), submit: sub.body.report };
 }
 
+/** An advance of `amount`, created AND routed by the live engine. */
+async function submittedAdvance(who: Actor, wsId: string, amount: number) {
+  const created = await as(who).post("/api/expense-advances", { amount, purpose: `Float ${amount}` });
+  expect(created.status, JSON.stringify(created.body)).toBe(201);
+  return { id: String(created.body.advance._id), advance: created.body.advance };
+}
+
 const deactivate = (userId: string, workspaceId: string) =>
   setUserActiveStatus({ userId, workspaceId, status: "INACTIVE", audit: { trigger: "explicit" } as any });
+
+/**
+ * A claim stuck in the flagged state with NO line-manager step in the way — the
+ * submitter has no manager, so ₹3,00,000 goes straight to Dev (the only ₹5L
+ * limit). Priya then loses the approver flag and Dev is deactivated: nobody left
+ * can cover it. Used where the test is about WHO the retry picks, so the answer
+ * is one name and not a manager-endorses chain.
+ */
+async function flaggedSoloClaim(t: any, name: string) {
+  const nisha = await makeUser(t.wsId, ["EMPLOYEE"], "Nisha"); // deliberately no managerId
+  const c = await submittedClaim(nisha, t.wsId, name, 300000, t.travel);
+  expect(String((await Report.findById(c.id).lean() as any).approverId)).toBe(t.dev.id);
+  // Nisha has no manager, so Meera is an ordinary candidate here and would be
+  // flagged as top-of-chain; both smaller limits have to go for the pool to be
+  // genuinely empty. Neither grant edit touches this claim — it is with Dev.
+  await upsertGrant({ workspaceId: t.wsId, userId: t.priya.id, patch: { approver: false } });
+  await upsertGrant({ workspaceId: t.wsId, userId: t.meera.id, patch: { approver: false } });
+  await deactivate(t.dev.id, t.wsId);
+  expect((await Report.findById(c.id).lean() as any).needsAttention, "setup: the claim must be flagged").toBeTruthy();
+  return c;
+}
+
+/**
+ * The same flagged state, but reached through Arjun — whose line manager Meera
+ * endorsed level 1 before Dev got it. Used where the test is about the DECIDED
+ * level surviving.
+ */
+async function flaggedClaim(t: any, name: string) {
+  const c = await submittedClaim(t.arjun, t.wsId, name, 300000, t.travel);
+  expect((await as(t.meera).post(`/api/reports/${c.id}/approve`)).status).toBe(200);
+  await upsertGrant({ workspaceId: t.wsId, userId: t.priya.id, patch: { approver: false } });
+  await deactivate(t.dev.id, t.wsId);
+  expect((await Report.findById(c.id).lean() as any).needsAttention, "setup: the claim must be flagged").toBeTruthy();
+  return c;
+}
 
 const trail = (id: string) => ExpenseActivity.find({ reportId: new mongoose.Types.ObjectId(id) }).sort({ createdAt: 1 }).lean();
 
@@ -319,20 +361,159 @@ describe("PART 1 — when nobody can cover it, it is flagged, not stranded", () 
     expect(detail.report.needsAttention.reason).toMatch(/Needs admin attention/);
   });
 
-  it("a later successful re-route clears the flag", async () => {
+  it("an unrelated later departure does NOT retry it — it stays flagged, untouched", async () => {
     const t = await makeWorkspace();
-    const c = await submittedClaim(t.arjun, t.wsId, "flag then clear", 300000, t.travel);
-    await as(t.meera).post(`/api/reports/${c.id}/approve`);
-    await upsertGrant({ workspaceId: t.wsId, userId: t.priya.id, patch: { approver: false } });
-    await deactivate(t.dev.id, t.wsId);
-    expect((await Report.findById(c.id).lean() as any).needsAttention).toBeTruthy();
+    const c = await flaggedClaim(t, "stays flagged");
 
-    // Give Priya the authority back and take the rights off a nobody: the next
-    // re-route pass (triggered by any departure) can now place it.
+    const before: any = await Report.findById(c.id).lean();
+    const beforeState = JSON.stringify({ chain: before.approvalChain, flag: before.needsAttention, routing: before.routing });
+    const beforeEntries = (await trail(c.id)).length;
+
+    // The authority is even fixed in the meantime — Priya could cover it now —
+    // and somebody ELSE leaves. Neither event may move this claim: only an
+    // admin asking for it does.
     await upsertGrant({ workspaceId: t.wsId, userId: t.priya.id, patch: { approver: true, limitBase: 400000 } });
-    await upsertGrant({ workspaceId: t.wsId, userId: t.meera.id, patch: { approver: false } });
+    const stranger = await makeUser(t.wsId, ["EMPLOYEE"], "Ravi");
+    await upsertGrant({ workspaceId: t.wsId, userId: stranger.id, patch: { approver: true, limitBase: 900000 } });
+    await deactivate(stranger.id, t.wsId);
 
     const after: any = await Report.findById(c.id).lean();
+    expect(after.needsAttention).toBeTruthy();
+    expect(after.approverId).toBeNull();
+    expect(JSON.stringify({ chain: after.approvalChain, flag: after.needsAttention, routing: after.routing })).toBe(beforeState);
+    expect((await trail(c.id)).length).toBe(beforeEntries); // nothing appended either
+  });
+});
+
+/* ═════════════ PART 3 — the EXPLICIT admin retry ═════════════ */
+
+describe("PART 3 — an admin retries a flagged claim on purpose", () => {
+  it("routes it once the authority is fixed, clears the flag, and logs the manual retry", async () => {
+    const t = await makeWorkspace();
+    const c = await flaggedSoloClaim(t, "admin retries");
+
+    // The admin fixes the setup FIRST — Priya can now cover ₹3,00,000 …
+    await upsertGrant({ workspaceId: t.wsId, userId: t.priya.id, patch: { approver: true, limitBase: 400000 } });
+    // … and only then asks for the re-route.
+    const r = await t.L.post(`/api/reports/${c.id}/reroute`);
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    expect(r.body.ok).toBe(true);
+    expect(r.body.result).toBe("rerouted");
+    expect(r.body.newApproverId).toBe(t.priya.id);
+    expect(r.body.message).toBe("Re-routed to Priya T.");
+
+    const after: any = await Report.findById(c.id).lean();
+    expect(after.needsAttention).toBeNull();
+    expect(String(after.approverId)).toBe(t.priya.id);
+    expect(after.status).toBe("submitted");
+
+    const re = (await trail(c.id)).find((a: any) => a.event === "re_routed") as any;
+    expect(re, "a re_routed entry must exist").toBeTruthy();
+    expect(re.actorType).toBe("user");                                 // the ADMIN, not System
+    expect(String(re.actorId)).toBe(t.leader.id);
+    expect(re.note).toMatch(/^Re-routed — retried by .+; re-assigned to Priya T by the engine\.$/);
+    expect(re.details).toMatchObject({
+      trigger: "manual_retry",
+      manual: true,
+      formerApproverName: "Dev T",     // who left is still on the record
+      newApproverName: "Priya T",
+    });
+  });
+
+  it("keeps an already-decided level and re-runs the rest exactly as the engine would", async () => {
+    const t = await makeWorkspace();
+    const c = await flaggedClaim(t, "kept level on retry"); // Meera endorsed level 1, then Dev left
+    await upsertGrant({ workspaceId: t.wsId, userId: t.priya.id, patch: { approver: true, limitBase: 400000 } });
+
+    const r = await t.L.post(`/api/reports/${c.id}/reroute`);
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    expect(r.body.ok).toBe(true);
+
+    const after: any = await Report.findById(c.id).lean();
+    expect(after.needsAttention).toBeNull();
+    // Meera's decision is kept verbatim as level 1 …
+    expect(after.approvalChain[0].status).toBe("approved");
+    expect(String(after.approvalChain[0].approverId)).toBe(t.meera.id);
+    // … and the fresh chain appended after it is the one a NEW submit would get:
+    // the line manager endorses, then Priya finalises. (The retry does not skip
+    // the manager step — same chain rebuild as the automatic pass in PART 1.)
+    expect(after.currentLevel).toBe(2);
+    expect(String(after.approverId)).toBe(t.meera.id);
+    expect(String(after.approvalChain[2].approverId)).toBe(t.priya.id);
+    const re = (await trail(c.id)).find((a: any) => a.event === "re_routed") as any;
+    expect(re.details.keptDecidedLevels).toBe(1);
+  });
+
+  it("a retry that still cannot be covered stays flagged, with the message that says what to do", async () => {
+    const t = await makeWorkspace();
+    const c = await flaggedClaim(t, "still uncovered");
+    const since = (await Report.findById(c.id).lean() as any).needsAttention.since;
+
+    // Nothing was fixed — the admin retries anyway.
+    const r = await t.L.post(`/api/reports/${c.id}/reroute`);
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    expect(r.body.ok).toBe(false);
+    expect(r.body.result).toBe("needs_attention");
+    expect(r.body.message).toBe("Still no approver can cover this — raise a limit or add an approver, then retry.");
+
+    const after: any = await Report.findById(c.id).lean();
+    expect(after.status).toBe("submitted");            // still open, still in the queue
+    expect(after.approverId).toBeNull();
+    expect(after.needsAttention).toBeTruthy();
+    expect(after.needsAttention.reason).toBe(r.body.message);
+    expect(String(after.needsAttention.formerApproverId)).toBe(t.dev.id);   // who left is kept
+    expect(new Date(after.needsAttention.since).getTime()).toBe(new Date(since).getTime()); // and the clock
+
+    const entries = (await trail(c.id)).filter((a: any) => a.event === "needs_attention");
+    expect(entries).toHaveLength(2);                   // the departure's, then this retry's
+    const last: any = entries[1];
+    expect(last.actorType).toBe("user");
+    expect(String(last.actorId)).toBe(t.leader.id);
+    expect(last.details).toMatchObject({ trigger: "manual_retry", manual: true });
+  });
+
+  it("a non-admin cannot trigger the retry — not the owner, not an approver", async () => {
+    const t = await makeWorkspace();
+    const c = await flaggedClaim(t, "non-admin blocked");
+    await upsertGrant({ workspaceId: t.wsId, userId: t.priya.id, patch: { approver: true, limitBase: 400000 } });
+
+    for (const who of [t.arjun, t.meera, t.farah]) {
+      const r = await as(who).post(`/api/reports/${c.id}/reroute`);
+      expect(r.status, `${who.name} must not be able to re-route`).toBe(403);
+    }
+    // …and the claim is exactly as it was.
+    const after: any = await Report.findById(c.id).lean();
+    expect(after.needsAttention).toBeTruthy();
+    expect(after.approverId).toBeNull();
+    expect((await trail(c.id)).some((a: any) => a.event === "re_routed")).toBe(false);
+  });
+
+  it("refuses a claim that is not flagged — there is nothing to re-route", async () => {
+    const t = await makeWorkspace();
+    const c = await submittedClaim(t.arjun, t.wsId, "not flagged", 20000, t.travel);
+    const r = await t.L.post(`/api/reports/${c.id}/reroute`);
+    expect(r.status).toBe(409);
+    expect(String((await Report.findById(c.id).lean() as any).approverId)).toBe(t.meera.id); // untouched
+  });
+
+  it("re-routes a flagged ADVANCE too", async () => {
+    const t = await makeWorkspace();
+    // A requester with no line manager, so only Dev's ₹5L covers it; strip
+    // Priya, then Dev leaves → nobody can cover it.
+    const nisha = await makeUser(t.wsId, ["EMPLOYEE"], "Nisha");
+    const a = await submittedAdvance(nisha, t.wsId, 300000);
+    expect((await ExpenseAdvance.findById(a.id).lean() as any).status).toBe("awaiting_approval");
+    await upsertGrant({ workspaceId: t.wsId, userId: t.priya.id, patch: { approver: false } });
+    await upsertGrant({ workspaceId: t.wsId, userId: t.meera.id, patch: { approver: false } });
+    await deactivate(t.dev.id, t.wsId);
+    expect((await ExpenseAdvance.findById(a.id).lean() as any).needsAttention).toBeTruthy();
+
+    await upsertGrant({ workspaceId: t.wsId, userId: t.priya.id, patch: { approver: true, limitBase: 400000 } });
+    const r = await t.L.post(`/api/expense-advances/${a.id}/reroute`);
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    expect(r.body.ok).toBe(true);
+
+    const after: any = await ExpenseAdvance.findById(a.id).lean();
     expect(after.needsAttention).toBeNull();
     expect(String(after.approverId)).toBe(t.priya.id);
   });

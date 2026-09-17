@@ -1232,6 +1232,48 @@ router.post("/:id/request-clarification", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
+ * POST /api/reports/:id/reroute  — sub-step 8, the EXPLICIT ADMIN RETRY.
+ *
+ * A claim flagged `needsAttention` is one nobody could be found to approve when
+ * its approver left. Nothing un-sticks it on its own: an admin raises a limit or
+ * flags another approver on the Team page, then asks for this. It re-runs the
+ * engine on the claim's current facts and either places it (flag cleared,
+ * `re_routed` on the trail with the admin as actor) or leaves it flagged with a
+ * message saying what still has to change.
+ *
+ * Admin only, and checked BEFORE the claim is loaded so a non-admin learns
+ * nothing about which ids exist.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/:id/reroute", async (req: any, res: any) => {
+  try {
+    if (!isAdminUser(req.user)) {
+      return res.status(403).json({ error: "Only an expense admin can re-route a claim" });
+    }
+    const report = await loadReportAny(req, req.params.id);
+    if (!report) return res.status(404).json({ error: "Report not found" });
+    if (report.status !== "submitted") {
+      return res.status(409).json({ error: "Only a submitted claim can be re-routed" });
+    }
+    if (!report.needsAttention) {
+      return res.status(409).json({ error: "This claim is not waiting for a re-route" });
+    }
+
+    const { retryRoutingNow } = await import("../services/expenseReroute.service.js");
+    const outcome = await retryRoutingNow({
+      kind: "claim",
+      doc: report,
+      workspaceId: req.workspaceObjectId,
+      actor: { id: String(userIdOf(req.user)), name: actorNameOf(req) },
+    });
+
+    res.json({ ...outcome, report: report.toObject() });
+  } catch (err: any) {
+    console.error("[Reports reroute]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to re-route this claim" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * POST /api/reports/:id/reimburse  — approved → reimbursed (FINANCE only).
  * Finance may reimburse their own approved report (owner-operator leniency).
  * ───────────────────────────────────────────────────────────────────── */

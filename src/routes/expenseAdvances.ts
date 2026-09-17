@@ -1334,6 +1334,40 @@ router.post("/:id/resubmit", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
+ * POST /api/expense-advances/:id/reroute  — sub-step 8, EXPLICIT ADMIN RETRY.
+ * The advance mirror of POST /api/reports/:id/reroute — see the comment there.
+ * Admin only, checked before the advance is loaded.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/:id/reroute", async (req: any, res: any) => {
+  try {
+    if (!isAdmin(req)) {
+      return res.status(403).json({ error: "Only an expense admin can re-route an advance" });
+    }
+    const advance = await loadAdvanceAny(req, req.params.id);
+    if (!advance) return res.status(404).json({ error: "Advance not found" });
+    if (advance.status !== "awaiting_approval") {
+      return res.status(409).json({ error: "Only an advance awaiting approval can be re-routed" });
+    }
+    if (!advance.needsAttention) {
+      return res.status(409).json({ error: "This advance is not waiting for a re-route" });
+    }
+
+    const { retryRoutingNow } = await import("../services/expenseReroute.service.js");
+    const outcome = await retryRoutingNow({
+      kind: "advance",
+      doc: advance,
+      workspaceId: req.workspaceObjectId,
+      actor: { id: ownRequesterId(req), name: actorNameOf(req) },
+    });
+
+    res.json({ ...outcome, advance: advance.toObject() });
+  } catch (err: any) {
+    console.error("[Advances reroute]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to re-route this advance" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * POST /api/expense-advances/:id/disburse  — approved → disbursed (FINANCE).
  * canDisburse: finance-only + whole-chain SoD (a finance user may not disburse
  * an advance they approved); an admin bypasses SoD (owner-operator, logged).
