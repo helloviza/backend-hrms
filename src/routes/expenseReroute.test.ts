@@ -136,6 +136,21 @@ const deactivate = (userId: string, workspaceId: string) =>
   setUserActiveStatus({ userId, workspaceId, status: "INACTIVE", audit: { trigger: "explicit" } as any });
 
 /**
+ * THE invariant a re-route must never break: one person, one decision per claim.
+ * Nobody who has already decided a level may be sitting on a pending one, and no
+ * two levels may name the same person at all.
+ */
+function expectNobodyDecidesTwice(doc: any) {
+  const chain: any[] = Array.isArray(doc.approvalChain) ? doc.approvalChain : [];
+  const ids = chain.map((l) => (l.approverId ? String(l.approverId) : null)).filter(Boolean) as string[];
+  expect(new Set(ids).size, `the same person appears on two levels: ${JSON.stringify(ids)}`).toBe(ids.length);
+  const decided = new Set(chain.filter((l) => l.status && l.status !== "pending").map((l) => String(l.approverId)));
+  for (const l of chain.filter((x) => x.status === "pending")) {
+    expect(decided.has(String(l.approverId)), "somebody is being asked to decide twice").toBe(false);
+  }
+}
+
+/**
  * A claim stuck in the flagged state with NO line-manager step in the way — the
  * submitter has no manager, so ₹3,00,000 goes straight to Dev (the only ₹5L
  * limit). Priya then loses the approver flag and Dev is deactivated: nobody left
@@ -257,8 +272,13 @@ describe("PART 1 — deactivating an approver re-routes what was waiting on them
     expect(String(after.approvalChain[0].approverId)).toBe(t.meera.id);
     expect(after.currentLevel).toBe(2);
     expect(String(after.approverId)).not.toBe(t.dev.id);
+    // Meera endorsed already, so the rebuilt chain does NOT ask her again even
+    // though a fresh submit would start with the line manager.
+    expect(String(after.approverId)).not.toBe(t.meera.id);
+    expectNobodyDecidesTwice(after);
     const re = (await trail(c.id)).find((a: any) => a.event === "re_routed") as any;
     expect(re.details.keptDecidedLevels).toBe(1);
+    expect(re.details.skippedAlreadyDecided).toEqual([{ userId: t.meera.id, name: "Meera T" }]);
   });
 
   it("re-routes an advance that was awaiting the departing approver", async () => {
@@ -420,7 +440,7 @@ describe("PART 3 — an admin retries a flagged claim on purpose", () => {
     });
   });
 
-  it("keeps an already-decided level and re-runs the rest exactly as the engine would", async () => {
+  it("keeps the endorsement it already has and never asks that person again", async () => {
     const t = await makeWorkspace();
     const c = await flaggedClaim(t, "kept level on retry"); // Meera endorsed level 1, then Dev left
     await upsertGrant({ workspaceId: t.wsId, userId: t.priya.id, patch: { approver: true, limitBase: 400000 } });
@@ -428,20 +448,53 @@ describe("PART 3 — an admin retries a flagged claim on purpose", () => {
     const r = await t.L.post(`/api/reports/${c.id}/reroute`);
     expect(r.status, JSON.stringify(r.body)).toBe(200);
     expect(r.body.ok).toBe(true);
+    expect(r.body.newApproverId).toBe(t.priya.id);
 
     const after: any = await Report.findById(c.id).lean();
     expect(after.needsAttention).toBeNull();
-    // Meera's decision is kept verbatim as level 1 …
+    // Meera's endorsement is kept verbatim as level 1 …
     expect(after.approvalChain[0].status).toBe("approved");
     expect(String(after.approvalChain[0].approverId)).toBe(t.meera.id);
-    // … and the fresh chain appended after it is the one a NEW submit would get:
-    // the line manager endorses, then Priya finalises. (The retry does not skip
-    // the manager step — same chain rebuild as the automatic pass in PART 1.)
+    // … and although a FRESH submit would open with the line manager again, her
+    // answer is already on this claim, so that step is dropped: the chain is two
+    // levels, not three, and it is pending on Priya alone.
+    expect(after.approvalChain).toHaveLength(2);
     expect(after.currentLevel).toBe(2);
-    expect(String(after.approverId)).toBe(t.meera.id);
-    expect(String(after.approvalChain[2].approverId)).toBe(t.priya.id);
+    expect(String(after.approverId)).toBe(t.priya.id);
+    expect(after.approvalChain[1].status).toBe("pending");
+    expectNobodyDecidesTwice(after);
+
     const re = (await trail(c.id)).find((a: any) => a.event === "re_routed") as any;
     expect(re.details.keptDecidedLevels).toBe(1);
+    expect(re.details.skippedAlreadyDecided).toEqual([{ userId: t.meera.id, name: "Meera T" }]);
+  });
+
+  it("flags rather than auto-approves when every step left is one the claim already answered", async () => {
+    const t = await makeWorkspace();
+    const c = await flaggedClaim(t, "nobody left to ask"); // Meera endorsed, then Dev left
+
+    // The admin's fix is to raise MEERA's own limit — so the engine would now
+    // make her the sole, final approver. She has already decided this claim, so
+    // there is no new step to ask for. It must not quietly become approved.
+    await upsertGrant({ workspaceId: t.wsId, userId: t.meera.id, patch: { approver: true, limitBase: 400000 } });
+
+    const r = await t.L.post(`/api/reports/${c.id}/reroute`);
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    expect(r.body.ok).toBe(false);
+
+    const after: any = await Report.findById(c.id).lean();
+    expect(after.status).toBe("submitted");            // NOT approved
+    expect(after.approverId).toBeNull();
+    expect(after.needsAttention).toBeTruthy();
+    expect(after.approvalChain[0].status).toBe("approved");   // her endorsement still stands
+    // She is not put back on the chain to answer her own endorsement. (The level
+    // still pending here is the departed Dev's, left as it was: flagging has
+    // never rewritten the chain — only `approverId` is cleared.)
+    expect(after.approvalChain.filter((l: any) => l.status === "pending" && String(l.approverId) === t.meera.id)).toHaveLength(0);
+    expectNobodyDecidesTwice(after);
+
+    const why = (await trail(c.id)).filter((a: any) => a.event === "needs_attention").pop() as any;
+    expect(why.details.why).toBe("everyone the engine would route it to has already decided it");
   });
 
   it("a retry that still cannot be covered stays flagged, with the message that says what to do", async () => {

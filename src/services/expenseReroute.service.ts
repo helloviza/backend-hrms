@@ -18,6 +18,13 @@
 //      the candidate pool (and from the manager slot).
 //   2. Keeps every level they had ALREADY decided; only the level pending on
 //      them, and anything after it, is re-resolved. History is never undone.
+//      NOBODY IS ASKED TWICE: the engine rebuilds its chain from scratch and
+//      will put the line manager's endorsement back at the front of it, so any
+//      step belonging to someone whose answer this claim already holds — an
+//      endorsement exactly as much as a final approval — is dropped instead of
+//      re-created. No claim ever carries two decisions from one person. If that
+//      leaves NO step to ask, the item is flagged for an admin rather than
+//      auto-approved: a re-route must never upgrade an outcome (see below).
 //   3. Re-routed → append-only trail entry `re_routed` (actor: System) carrying
 //      the new approver, the reason and the engine's reasoning.
 //   4. Cannot be placed → NOT silently stranded: `needsAttention` is flagged on
@@ -155,20 +162,47 @@ function withoutPerson(input: RoutingInput, userId: string | null): RoutingInput
 function rebuildChain(existing: any[], decision: RoutingDecision, now: Date) {
   const decided = (Array.isArray(existing) ? existing : []).filter((l: any) => l?.status && l.status !== "pending");
   const kept = decided.map((l: any, i: number) => ({ ...(l.toObject ? l.toObject() : l), level: i + 1 }));
-  const fresh = decision.chain.map((c, i) => ({
-    level: kept.length + i + 1,
-    approverId: c.approverId ? oid(c.approverId) : null,
-    status: "pending" as const,
-    decidedAt: null,
-    note: null,
-    actorType: "user" as const,
-    via: c.via,
-    routedAt: i === 0 ? now : null,
-    heldMs: null,
-    overLimit: !!c.overLimit,
-    limitBase: c.limitBase ?? null,
-  }));
-  return { chain: [...kept, ...fresh], currentLevel: kept.length + 1, firstPending: fresh[0] ?? null };
+
+  // NOBODY IS ASKED TWICE. `approverId` on a decided level is who actually
+  // decided it (the approve route stamps the real actor, not the routed one),
+  // so this is the set of people whose answer this claim already holds — an
+  // endorsement exactly as much as a final approval. The engine builds its
+  // chain from scratch and will happily put the line manager back at the front
+  // of it; their endorsement is already on record, so that step is dropped
+  // rather than re-created. Only genuinely open steps survive into `fresh`.
+  const alreadyDecided = new Set<string>(
+    kept.map((l: any) => (l.approverId ? String(l.approverId) : "")).filter(Boolean),
+  );
+  const skippedAlreadyDecided: string[] = [];
+  const fresh = decision.chain
+    .filter((c) => {
+      const who = c.approverId ? String(c.approverId) : "";
+      if (who && alreadyDecided.has(who)) {
+        skippedAlreadyDecided.push(who);
+        return false;
+      }
+      return true;
+    })
+    .map((c, i) => ({
+      level: kept.length + i + 1,
+      approverId: c.approverId ? oid(c.approverId) : null,
+      status: "pending" as const,
+      decidedAt: null,
+      note: null,
+      actorType: "user" as const,
+      via: c.via,
+      routedAt: i === 0 ? now : null,
+      heldMs: null,
+      overLimit: !!c.overLimit,
+      limitBase: c.limitBase ?? null,
+    }));
+  return {
+    chain: [...kept, ...fresh],
+    currentLevel: kept.length + 1,
+    firstPending: fresh[0] ?? null,
+    keptCount: kept.length,
+    skippedAlreadyDecided,
+  };
 }
 
 /** Re-route one claim or advance. Returns what happened, never throws. */
@@ -198,10 +232,28 @@ async function rerouteOne(params: {
     return { kind, id, ref, result: "needs_attention", newApproverId: null, newApproverName: null, detail: "nobody can cover it" };
   }
 
-  const { chain, currentLevel, firstPending } = rebuildChain(doc.approvalChain, decision, now);
+  const { chain, currentLevel, firstPending, keptCount, skippedAlreadyDecided } = rebuildChain(doc.approvalChain, decision, now);
+  if (!firstPending) {
+    // Every step the engine would ask for is one this claim already holds an
+    // answer to. There is nobody new to route to, and re-asking them is exactly
+    // what this guards against — but auto-approving would UPGRADE the outcome,
+    // which a re-route must never do. So it goes to an admin, who can decide it
+    // directly from the queue.
+    await flagNeedsAttention({ kind, doc, workspaceId, ctx, why: "everyone the engine would route it to has already decided it", decision });
+    return { kind, id, ref, result: "needs_attention", newApproverId: null, newApproverName: null, detail: "no step left to ask" };
+  }
   const newApproverId = firstPending?.approverId ?? null;
   const newApprover: any = newApproverId ? await User.findById(newApproverId).select("firstName lastName name email").lean() : null;
   const newApproverName = newApprover ? nameOf(newApprover) : decision.chain[0]?.name || "the new approver";
+  // Names, not ids, for the people whose step was dropped — the trail is read.
+  // Keyed by id: a $in query answers in its own order, not the argument's.
+  const skippedNames = new Map<string, string>();
+  if (skippedAlreadyDecided.length) {
+    const people: any[] = await User.find({ _id: { $in: skippedAlreadyDecided.map(oid) } })
+      .select("firstName lastName name email")
+      .lean();
+    for (const p of people) skippedNames.set(String(p._id), nameOf(p));
+  }
 
   doc.approvalChain = chain;
   doc.currentLevel = currentLevel;
@@ -225,7 +277,9 @@ async function rerouteOne(params: {
       formerApproverName: ctx.formerApprover.name,
       newApproverId: newApproverId ? String(newApproverId) : null,
       newApproverName,
-      keptDecidedLevels: chain.length - decision.chain.length,
+      keptDecidedLevels: keptCount,
+      // Who the engine would have asked again, and was not.
+      skippedAlreadyDecided: skippedAlreadyDecided.map((sid) => ({ userId: sid, name: skippedNames.get(sid) ?? null })),
       routing: decision,
     },
   });
