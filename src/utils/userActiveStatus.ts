@@ -109,6 +109,8 @@ export interface SetUserActiveStatusResult {
   /** false when the user was already in the requested state (no audit row). */
   changed: boolean;
   employeeMirrorsUpdated: number;
+  /** Sub-step 8: what the engine did with work that was waiting on them. */
+  expenseReroute?: unknown | null;
 }
 
 /**
@@ -159,12 +161,35 @@ export async function setUserActiveStatus(args: SetUserActiveStatusArgs): Promis
     });
   }
 
+  // ── Approval-engine sub-step 8 ──────────────────────────────────────
+  // A person going INACTIVE strands every claim/advance sitting in their
+  // approval queue. Re-route them through the engine now that the status is
+  // persisted (so the engine's own active-user filter already excludes them).
+  // Imported lazily: this util is loaded by auth and by scripts that have no
+  // business pulling in the expense engine, and the dependency only exists on
+  // this one branch of the flow. It never throws — a re-route problem must not
+  // fail, or roll back, the deactivation itself.
+  let reroute: unknown = null;
+  if (changed && status === USER_STATUS_INACTIVE) {
+    try {
+      const { rerouteForDepartedApprover } = await import("../services/expenseReroute.service.js");
+      reroute = await rerouteForDepartedApprover({
+        userId: userOid,
+        workspaceId: before.workspaceId ?? args.workspaceId ?? null,
+        trigger: "deactivated",
+      });
+    } catch (err: any) {
+      console.error("[userActiveStatus] expense re-route failed:", err?.message);
+    }
+  }
+
   return {
     userId: String(userOid),
     status,
     userMatched: true,
     changed,
     employeeMirrorsUpdated: empResult.modifiedCount,
+    expenseReroute: (reroute as any) ?? null,
   };
 }
 

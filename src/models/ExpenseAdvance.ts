@@ -88,6 +88,8 @@ export interface IExpenseAdvance extends Document {
   // Same subdocument shape as Report.approvalChain. Length 1 = single approver;
   // length ≥2 only when advanceEscalationThreshold is set AND amount exceeds it.
   approvalChain?: IApprovalChainLevel[];
+  /** Sub-step 8: set when an approver's departure left nobody who can cover it. */
+  needsAttention?: { reason: string; since: Date; formerApproverId?: mongoose.Types.ObjectId | null; trigger?: string | null } | null;
   routing?: Record<string, any> | null;
   currentLevel?: number; // 1-based; which chain step is currently pending
   approverId?: mongoose.Types.ObjectId | null; // denorm pointer → chain[currentLevel-1]
@@ -200,6 +202,19 @@ const ExpenseAdvanceSchema = new Schema<IExpenseAdvance>(
     },
 
     approvalChain: { type: [AdvanceApprovalChainLevelSchema], default: [] },
+    // Sub-step 8 — see Report.needsAttention; identical shape and meaning.
+    needsAttention: {
+      type: new Schema(
+        {
+          reason: { type: String, trim: true, required: true },
+          since: { type: Date, default: Date.now },
+          formerApproverId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+          trigger: { type: String, trim: true, default: null },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
     // Routing decision snapshot (audit plumbing, sub-step 2) — see Report.routing.
     routing: { type: Schema.Types.Mixed, default: null },
     currentLevel: { type: Number, default: 1 },

@@ -78,6 +78,9 @@ export interface IReport extends Document {
   // `routed` activity. The engine (sub-step 5) fills the same shape richly.
   routing?: Record<string, any> | null;
 
+  // Sub-step 8: set when an approver's departure left nobody who can cover it.
+  needsAttention?: { reason: string; since: Date; formerApproverId?: mongoose.Types.ObjectId | null; trigger?: string | null } | null;
+
   // ── Phase 2 (advances): net-reimburse record. PURELY ADDITIVE — only written
   // when the claim has applied advances. A claim with NO applied advances
   // reimburses exactly as before and these stay null/0 (regression line). ──
@@ -113,6 +116,24 @@ const ApprovalChainLevelSchema = new Schema<IApprovalChainLevel>(
   { _id: false },
 );
 
+
+/**
+ * Sub-step 8 — "an admin must look at this". Set when an approver departed and
+ * the engine could find nobody left who can cover the item; cleared by a
+ * successful re-route. The item KEEPS its open status (an admin already sees
+ * every submitted claim / awaiting advance), so this is a flag on top, never a
+ * new terminal state that could hide it from a queue.
+ */
+const NeedsAttentionSchema = new Schema(
+  {
+    reason: { type: String, trim: true, required: true },
+    since: { type: Date, default: Date.now },
+    formerApproverId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    trigger: { type: String, trim: true, default: null },
+  },
+  { _id: false },
+);
+
 const ReportSchema = new Schema<IReport>(
   {
     workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
@@ -136,6 +157,7 @@ const ReportSchema = new Schema<IReport>(
 
     // ── Phase 2: approval chain (resolved at submit; length 1 = today) ──
     approvalChain: { type: [ApprovalChainLevelSchema], default: [] },
+    needsAttention: { type: NeedsAttentionSchema, default: null },
     currentLevel: { type: Number, default: 1 },
     routing: { type: Schema.Types.Mixed, default: null },
 

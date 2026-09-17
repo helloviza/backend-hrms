@@ -209,7 +209,26 @@ export async function upsertGrant(params: {
     g.history.push({ at: new Date(), by, change, reason: params.reason ?? null });
   }
   await g.save();
+  // Sub-step 8: losing the approver flag strands whatever was waiting on them.
+  if (change.approver && change.approver.from === true && change.approver.to === false) {
+    await rerouteAfterLosingApproverRights(ws, uid);
+  }
   return g;
+}
+
+/**
+ * Sub-step 8 — shared by both ways approver rights end (the flag switched off
+ * above, and a whole grant revoked below). Lazily imported and never allowed to
+ * throw, exactly like the deactivation hook: the grant change has already been
+ * persisted and must stand whatever happens here.
+ */
+async function rerouteAfterLosingApproverRights(ws: mongoose.Types.ObjectId, uid: mongoose.Types.ObjectId): Promise<void> {
+  try {
+    const { rerouteForDepartedApprover } = await import("./expenseReroute.service.js");
+    await rerouteForDepartedApprover({ userId: uid, workspaceId: ws, trigger: "grant_removed" });
+  } catch (err: any) {
+    console.error("[expenseGrants] re-route after losing approver rights failed:", err?.message);
+  }
 }
 
 /** Revoke (soft) — used on user deactivation. Idempotent. */
@@ -231,6 +250,10 @@ export async function revokeGrant(params: {
   g.revokedBy = by;
   g.revokeReason = params.reason;
   g.history.push({ at: new Date(), by, change: { active: { from: true, to: false } }, reason: params.reason });
+  const wasApprover = !!g.approver;
   await g.save();
+  if (wasApprover) {
+    await rerouteAfterLosingApproverRights(oid(params.workspaceId), oid(params.userId));
+  }
   return true;
 }

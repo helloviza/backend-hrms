@@ -33,6 +33,13 @@ export type ExpenseActivityEvent =
   // the system actor today from the current manager→admin resolver; the
   // engine (sub-step 5) fills the same shape richly (limits, climb, rule).
   | "routed"
+  // Sub-step 8: the engine moved a waiting item to a new approver because the
+  // one it was sitting with was deactivated or lost approver rights. Carries
+  // the former/new approver and the full routing decision in details.
+  | "re_routed"
+  // Sub-step 8: the engine could NOT place it after that departure — an admin
+  // has to intervene. Pairs with Report/ExpenseAdvance.needsAttention.
+  | "needs_attention"
   // Reserved for the Approval Bot (sub-step 5): a bot decision is a chain
   // level AND this event, actorType "bot".
   | "auto_approved"
@@ -62,6 +69,8 @@ export const EXPENSE_ACTIVITY_EVENTS: ExpenseActivityEvent[] = [
   "fx_rate_set",
   "withdrawn",
   "routed",
+  "re_routed",
+  "needs_attention",
   "auto_approved",
   "escalated",
   "requested",
