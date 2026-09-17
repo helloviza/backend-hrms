@@ -134,7 +134,7 @@ describe("F-01 · Team-page admin grant no longer touches User.roles[]", () => {
     // Same expense-admin capability as before, via the grant:
     const E = as(employee);
     expect((await E.get("/api/expense-admin/users")).status).toBe(200); // Team page
-    expect((await E.post("/api/expense-categories", { name: "Travel-X" })).status).toBe(201); // configure
+    expect((await E.post("/api/expense-categories", { name: "Travel-X", botLimitMode: "na" })).status).toBe(201); // configure
     expect((await E.get("/api/expenses/analytics")).status).toBe(200); // see-all
     const caps = (await E.get("/api/expenses/capabilities")).body.capabilities;
     expect(caps).toMatchObject({ admin: true, finance: true, seesAll: true, approver: false });

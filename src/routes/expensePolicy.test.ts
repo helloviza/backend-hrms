@@ -230,8 +230,11 @@ async function makeWorkspace() {
   const wsId = String(ws._id);
   const leader = await makeUser(wsId, ["CUSTOMER", "WORKSPACE_LEADER"], "Lena", { customerId });
   const employee = await makeUser(wsId, ["EMPLOYEE"], "Arjun");
-  const travel = await ExpenseCategory.create({ workspaceId: wsId, name: "Travel", active: true });
-  const ent = await ExpenseCategory.create({ workspaceId: wsId, name: "Entertainment", active: true });
+  // Per-category bot limits: both match the workspace-wide threshold used below,
+  // so these cases keep exercising weights / never-auto-approve rather than the
+  // (newer) single-category ceiling.
+  const travel = await ExpenseCategory.create({ workspaceId: wsId, name: "Travel", active: true, botLimitMode: "amount", botLimitBase: 2000 });
+  const ent = await ExpenseCategory.create({ workspaceId: wsId, name: "Entertainment", active: true, botLimitMode: "amount", botLimitBase: 2000 });
   const eng = await Department.create({ workspaceId: wsId, name: "Engineering", isActive: true });
   return { wsId, customerId, leader, employee, travelId: String(travel._id), entId: String(ent._id), engId: String(eng._id) };
 }

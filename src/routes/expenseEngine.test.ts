@@ -79,7 +79,8 @@ async function makeUser(workspaceId: string, roles: string[], first: string, ext
  * A workspace with the sub-step 3/4 authority + rulebook set up, engine OFF:
  *   ranks: L4 Manager ₹50k, L8 Director ₹5L
  *   Meera (manager of Arjun) L4 → ₹50k · Lata personal ₹20k · Dev L8 → ₹5L · Chitra personal ₹20L
- *   bot: on, threshold ₹2,000 · Entertainment never-bot · Travel ×2
+ *   bot: on, mixed-category limit ₹2,000; Travel and Entertainment each carry a
+ *   ₹2,000 category bot limit · Entertainment never-bot · Travel ×2
  *   finance: Farah
  */
 async function makeEngineWorkspace() {
@@ -101,8 +102,13 @@ async function makeEngineWorkspace() {
   await upsertGrant({ workspaceId: wsId, userId: chitra.id, patch: { approver: true, limitBase: 2000000 } });
   await upsertGrant({ workspaceId: wsId, userId: farah.id, patch: { finance: true } });
   const arjun = await makeUser(wsId, ["EMPLOYEE"], "Arjun", { managerId: meera.id });
-  const travel = String((await ExpenseCategory.create({ workspaceId: wsId, name: "Travel", active: true }))._id);
-  const ent = String((await ExpenseCategory.create({ workspaceId: wsId, name: "Entertainment", active: true }))._id);
+  // Per-category bot limits (Part A): both are set to the SAME ₹2,000 as the
+  // workspace-wide mixed-category limit below, so every expectation in this
+  // suite — which predates per-category limits — keeps testing exactly what it
+  // was written to test. Entertainment stays blocked by its never-auto-approve
+  // rule, not by an absent limit.
+  const travel = String((await ExpenseCategory.create({ workspaceId: wsId, name: "Travel", active: true, botLimitMode: "amount", botLimitBase: 2000 }))._id);
+  const ent = String((await ExpenseCategory.create({ workspaceId: wsId, name: "Entertainment", active: true, botLimitMode: "amount", botLimitBase: 2000 }))._id);
   await L.put("/api/expense-admin/approval-policy", {
     bot: { enabled: true, thresholdBase: 2000 },
     categoryRules: [{ categoryId: ent, neverAutoApprove: true }, { categoryId: travel, weight: 2 }],

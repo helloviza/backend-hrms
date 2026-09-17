@@ -11,8 +11,11 @@
 //   1. category modifiers — strictest of each lever across the claim's
 //      categories: neverAutoApprove (any), floor (max), weight (max, ≥1)
 //   2. required limit = max(amount × weight, floor)
-//   3. the bot — enabled ∧ amount ≤ threshold ∧ not category-blocked ∧ every
-//      pre-check passes → auto-approve; otherwise it hands off (never declines)
+//   3. the bot — enabled ∧ amount ≤ the ceiling that applies (a single-category
+//      claim: THAT category's bot limit, "Not Applicable" = never; otherwise the
+//      workspace-wide threshold) ∧ not category-blocked ∧ every ENFORCED
+//      pre-check (policy.bot.require) passes → auto-approve; otherwise it hands
+//      off (never declines)
 //   4. candidates — approver-flagged, active, in scope, ≠ submitter, sorted by
 //      effective limit ascending
 //   5. manager first (firstStep) — covers → FINAL; else endorses, then …
@@ -43,6 +46,16 @@ export type RoutingPerson = {
  *            receipts / categories / duplicate bills are NOT applied)
  */
 export type RoutingChecks = Record<string, boolean>;
+
+/** A category on the claim + the ceiling under which the bot may approve it. */
+export type CategoryBotLimit = {
+  categoryId: string;
+  name: string;
+  mode: "amount" | "na";
+  amountBase: number | null;
+  /** false = the admin has never answered for this category (legacy row). */
+  set: boolean;
+};
 export type ClaimChecks = { receipt: boolean; category: boolean; noDuplicate: boolean; positiveAmounts: boolean };
 export type AdvanceChecks = { positiveAmount: boolean; purposePresent: boolean; validDates: boolean };
 
@@ -51,6 +64,8 @@ export type RoutingInput = {
   amountBase: number;
   baseCurrency: string;
   categoryIds: string[];
+  /** Per-category bot ceilings for the categories on this claim (see the bot step). */
+  categoryBotLimits?: CategoryBotLimit[];
   submitter: { id: string; name: string; departmentId: string | null; managerId: string | null };
   manager: RoutingPerson | null; // the submitter's line manager, if any (may not be an approver)
   candidates: RoutingPerson[]; // everyone in the workspace who could be an approver (the walk filters)
@@ -102,10 +117,21 @@ export type RoutingDecision = {
   bot: {
     evaluated: boolean;
     enabled: boolean;
+    /** The ceiling actually applied — a category's for a single-category claim, the global one otherwise. */
     thresholdBase: number | null;
+    /** Which rule supplied it. */
+    limitSource: "category" | "global" | null;
+    /** The single category that governed it (null for mixed / none). */
+    limitCategory: { categoryId: string; name: string } | null;
+    /** true = a single-category claim whose category is Not Applicable → never auto-approves. */
+    categoryNotApplicable: boolean;
+    /** The workspace-wide threshold, kept for reference even when a category governed. */
+    globalThresholdBase: number | null;
     underThreshold: boolean | null;
     blockedByCategory: boolean;
     checks: RoutingChecks;
+    /** Only the checks the policy actually enforces (policy.bot.require). */
+    checksEnforced: string[];
     checksPassed: boolean | null;
     wouldAutoApprove: boolean;
     reason: string;
@@ -171,26 +197,68 @@ export function routeClaim(input: RoutingInput): RoutingDecision {
   );
 
   // ── 3. the bot ──
-  const checksPassed = Object.values(input.checks).every(Boolean);
-  const botEnabled = !!policy.bot.enabled && policy.bot.thresholdBase != null;
-  const under = botEnabled ? amount <= Number(policy.bot.thresholdBase) : null;
-  const wouldAuto = !!(botEnabled && under && !neverBot && checksPassed);
+  //
+  // (a) WHICH CEILING APPLIES. A claim whose bills are all ONE category is
+  //     governed by THAT category's bot limit — including "Not Applicable",
+  //     which means it never auto-approves however small it is. A claim
+  //     spanning MORE THAN ONE category (or carrying none at all, and every
+  //     advance) is governed by the workspace-wide threshold on the Rulebook
+  //     tab. A category limit is never overridden by the global one.
+  const globalThreshold = policy.bot.thresholdBase;
+  const catLimits = input.categoryBotLimits ?? [];
+  const singleCat = input.kind === "claim" && cats.size === 1
+    ? catLimits.find((c) => cats.has(String(c.categoryId))) ?? null
+    : null;
+  const categoryNotApplicable = !!singleCat && singleCat.mode !== "amount";
+  const limitSource: "category" | "global" | null = singleCat ? "category" : "global";
+  const appliedLimit: number | null = singleCat ? (singleCat.mode === "amount" ? singleCat.amountBase : null) : globalThreshold;
+
+  // (b) WHICH PRE-CHECKS ARE ENFORCED (audit F-22). The engine used to demand
+  //     that EVERY computed check pass, ignoring policy.bot.require entirely —
+  //     so switching a pre-check off changed nothing. Now a check is enforced
+  //     only when the policy says so. Keys the policy has no switch for (the
+  //     advance checks) stay enforced, as before.
+  const isEnforced = (key: string): boolean => {
+    const req = policy.bot.require as Record<string, boolean> | undefined;
+    if (!req || !(key in req)) return true;
+    return !!req[key];
+  };
+  const enforcedEntries = Object.entries(input.checks).filter(([k]) => isEnforced(k));
+  const checksEnforced = enforcedEntries.map(([k]) => k);
+  const checksPassed = enforcedEntries.every(([, v]) => v);
+
+  const botEnabled = !!policy.bot.enabled && (appliedLimit != null || categoryNotApplicable);
+  // null = no ceiling was applied at all (bot off, or the category is N/A).
+  const under = botEnabled && appliedLimit != null ? amount <= Number(appliedLimit) : null;
+  const wouldAuto = !!(botEnabled && !categoryNotApplicable && under && !neverBot && checksPassed);
+  const ceiling = () => `${fmt(Number(appliedLimit), input.baseCurrency)}${singleCat ? ` (${singleCat.name} limit)` : " (mixed-category limit)"}`;
   let botReason = "bot not enabled";
   if (botEnabled) {
-    if (!under) botReason = `over the bot threshold (${fmt(policy.bot.thresholdBase!, input.baseCurrency)})`;
-    else if (neverBot) botReason = "a category on this claim is marked never-auto-approve";
-    else if (!checksPassed) {
-      const failed = Object.entries(input.checks).filter(([, v]) => !v).map(([k]) => k);
+    if (categoryNotApplicable) {
+      botReason = `${singleCat!.name} never auto-approves (bot limit: Not Applicable)`;
+    } else if (!under) {
+      botReason = `over the bot limit ${ceiling()}`;
+    } else if (neverBot) {
+      botReason = "a category on this claim is marked never-auto-approve";
+    } else if (!checksPassed) {
+      const failed = enforcedEntries.filter(([, v]) => !v).map(([k]) => k);
       botReason = `pre-check failed: ${failed.join(", ")}`;
-    } else botReason = `under the bot threshold (${fmt(policy.bot.thresholdBase!, input.baseCurrency)}) and every pre-check passed`;
+    } else {
+      botReason = `under the bot limit ${ceiling()} and every enforced pre-check passed`;
+    }
   }
   const bot: RoutingDecision["bot"] = {
     evaluated: botEnabled,
     enabled: !!policy.bot.enabled,
-    thresholdBase: policy.bot.thresholdBase,
+    thresholdBase: appliedLimit,
+    limitSource: botEnabled || singleCat ? limitSource : null,
+    limitCategory: singleCat ? { categoryId: String(singleCat.categoryId), name: singleCat.name } : null,
+    categoryNotApplicable,
+    globalThresholdBase: globalThreshold,
     underThreshold: under,
     blockedByCategory: neverBot,
     checks: input.checks,
+    checksEnforced,
     checksPassed: botEnabled ? checksPassed : null,
     wouldAutoApprove: wouldAuto,
     reason: botReason,
@@ -233,8 +301,11 @@ export function routeClaim(input: RoutingInput): RoutingDecision {
   });
 
   if (wouldAuto) {
-    chain.push({ level: 1, actorType: "bot", approverId: null, name: "Approval Bot", via: "bot", limitBase: policy.bot.thresholdBase, overLimit: false, final: true });
-    explain.push("The Approval Bot approves it: under the threshold, clean, no blocked category.");
+    chain.push({ level: 1, actorType: "bot", approverId: null, name: "Approval Bot", via: "bot", limitBase: appliedLimit, overLimit: false, final: true });
+    explain.push(
+      `The Approval Bot approves it: under the ${singleCat ? `${singleCat.name} limit` : "mixed-category limit"} ` +
+        `${fmt(Number(appliedLimit), input.baseCurrency)}, clean, no blocked category.`,
+    );
     return base("BOT_AUTO_APPROVE");
   }
   if (botEnabled) explain.push(`The Bot steps aside — ${botReason}.`);

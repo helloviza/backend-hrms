@@ -59,6 +59,9 @@ import {
 import { appendActivity, msBetween, fmtDuration } from "../services/expenseAudit.service.js";
 import { normalizeActorType } from "../models/ExpenseActivity.js";
 
+import ExpenseCategory from "../models/ExpenseCategory.js";
+import { claimDisplayName, withDisplayName } from "../services/expenseClaimNaming.js";
+
 const router = express.Router();
 
 /* ── Access predicates: delegated to the single source of truth ──────
@@ -108,7 +111,7 @@ async function countsForReports(
   workspaceId: mongoose.Types.ObjectId,
   reportIds: mongoose.Types.ObjectId[],
   baseCurrency?: string,
-): Promise<Record<string, { count: number; amount: number; pendingConversion: number }>> {
+): Promise<Record<string, { count: number; amount: number; pendingConversion: number; categoryNames: string[] }>> {
   if (reportIds.length === 0) return {};
   const base = baseCurrency || (await getWorkspaceBaseCurrency(workspaceId));
   const rows = await Expense.aggregate([
@@ -119,15 +122,34 @@ async function countsForReports(
         count: { $sum: 1 },
         amount: { $sum: amountBaseExpr(base) },
         pendingConversion: { $sum: pendingConversionExpr(base) },
+        // Distinct categories on the claim — drives the display-name prefix.
+        categoryIds: { $addToSet: "$categoryId" },
       },
     },
   ]);
-  const out: Record<string, { count: number; amount: number; pendingConversion: number }> = {};
+  // One lookup for every category id seen across the page of claims.
+  const catIds = [
+    ...new Set(
+      rows.flatMap((r: any) => (Array.isArray(r.categoryIds) ? r.categoryIds : [])).filter(Boolean).map((c: any) => String(c)),
+    ),
+  ];
+  const catNames = new Map<string, string>();
+  if (catIds.length) {
+    const cats = await ExpenseCategory.find({ workspaceId, _id: { $in: catIds.map((c) => new mongoose.Types.ObjectId(c)) } })
+      .select("name")
+      .lean();
+    for (const c of cats as any[]) catNames.set(String(c._id), String(c.name));
+  }
+  const out: Record<string, { count: number; amount: number; pendingConversion: number; categoryNames: string[] }> = {};
   for (const r of rows) {
     out[String(r._id)] = {
       count: r.count || 0,
       amount: round2(r.amount || 0),
       pendingConversion: r.pendingConversion || 0,
+      categoryNames: (Array.isArray(r.categoryIds) ? r.categoryIds : [])
+        .filter(Boolean)
+        .map((c: any) => catNames.get(String(c)) || "")
+        .filter(Boolean),
     };
   }
   return out;
@@ -192,6 +214,8 @@ router.get("/", async (req: any, res: any) => {
         totalAmount: counts[String(r._id)]?.amount ?? 0, // base currency
         baseCurrency,
         pendingConversion: counts[String(r._id)]?.pendingConversion ?? 0,
+        // Derived every read from the bills the claim holds now — never stored.
+        displayName: claimDisplayName(String(r.name || ""), counts[String(r._id)]?.categoryNames ?? []),
       };
     });
 
@@ -240,7 +264,7 @@ router.post("/", async (req: any, res: any) => {
     // Shared state machine (CLM- ref + draft status live in createReport).
     const report = await createReport(req.workspaceObjectId, employeeId, name);
 
-    res.status(201).json({ ok: true, report: { ...report.toObject(), expenseCount: 0, totalAmount: 0 } });
+    res.status(201).json({ ok: true, report: withDisplayName({ ...report.toObject(), expenseCount: 0, totalAmount: 0 }, []) });
   } catch (err: any) {
     console.error("[Reports POST]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to create report" });
@@ -642,6 +666,8 @@ router.get("/:id", async (req: any, res: any) => {
       viewerIsOwner: isOwner,
       canApprove: report.status === "submitted" && decision.ok,
       canReimburse: canReimburseUser(req.user, report),
+      // System-owned prefix, derived from the lines just loaded (never stored).
+      displayName: claimDisplayName(String((report as any).name || ""), enriched.map((d: any) => d.categoryName)),
     };
 
     // Activity timeline (oldest → newest). Tenant-scoped: workspaceId is stamped
@@ -686,9 +712,15 @@ router.patch("/:id", async (req: any, res: any) => {
     const name = String(req.body?.name || "").trim();
     if (!name) return res.status(400).json({ error: "name is required" });
 
+    // The employee types the descriptive half only; if they pasted a prefix back
+    // in, it is stripped on read — `name` stays exactly what they typed.
     report.name = name;
     await report.save();
-    res.json({ ok: true, report: report.toObject() });
+    const lineCats = await Expense.find({ workspaceId: req.workspaceObjectId, reportId: report._id })
+      .populate("categoryId", "name")
+      .select("categoryId")
+      .lean();
+    res.json({ ok: true, report: withDisplayName(report.toObject(), lineCats.map((d: any) => categoryNameOf(d))) });
   } catch (err: any) {
     console.error("[Reports PATCH]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to update report" });

@@ -24,7 +24,8 @@ import { getRankTable, effectiveApprovalLimit } from "./expenseAuthority.service
 import { getWorkspaceBaseCurrency, effectiveAmountBase } from "./expenseFx.service.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import ExpenseAdvance from "../models/ExpenseAdvance.js";
-import type { RoutingInput, RoutingPerson, RoutingChecks, ClaimChecks, AdvanceChecks } from "./expenseRouting.service.js";
+import ExpenseCategory, { categoryBotLimit } from "../models/ExpenseCategory.js";
+import type { RoutingInput, RoutingPerson, RoutingChecks, ClaimChecks, AdvanceChecks, CategoryBotLimit } from "./expenseRouting.service.js";
 
 const oid = (v: any) => new mongoose.Types.ObjectId(String(v));
 
@@ -84,6 +85,25 @@ export function checksFromLines(lines: any[]): ClaimChecks {
     noDuplicate: dupes === 0,
     positiveAmounts: lines.length > 0 && lines.every((e) => Number(e.amount) > 0),
   };
+}
+
+/**
+ * The bot limit of every category ON THIS CLAIM, in the shape routeClaim()
+ * reads. A category id that no longer resolves (deleted/foreign) is returned
+ * as "na" — an unknown ceiling can never justify an auto-approval.
+ */
+export async function loadCategoryBotLimits(workspaceId: any, categoryIds: string[]): Promise<CategoryBotLimit[]> {
+  const ids = [...new Set(categoryIds.map(String))].filter((id) => mongoose.Types.ObjectId.isValid(id));
+  if (ids.length === 0) return [];
+  const cats: any[] = await ExpenseCategory.find({ _id: { $in: ids.map(oid) }, workspaceId: oid(workspaceId) })
+    .select("name botLimitMode botLimitBase")
+    .lean();
+  const byId = new Map(cats.map((c) => [String(c._id), c]));
+  return ids.map((id) => {
+    const c = byId.get(id);
+    const lim = categoryBotLimit(c);
+    return { categoryId: id, name: c?.name ? String(c.name) : "Unknown category", mode: lim.mode, amountBase: lim.amountBase, set: lim.set && !!c };
+  });
 }
 
 /** Everyone in the workspace who could be an approver, with their grant. */
@@ -241,11 +261,12 @@ export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRou
     departmentId = await resolveSubmitterDepartmentId(ws, submitter);
   }
 
-  const [policy, rankTable, people, baseCurrency] = await Promise.all([
+  const [policy, rankTable, people, baseCurrency, categoryBotLimits] = await Promise.all([
     getPolicy(ws),
     getRankTable(ws),
     loadRoutingPeople(ws),
     getWorkspaceBaseCurrency(ws),
+    loadCategoryBotLimits(ws, categoryIds.map(String)),
   ]);
   const manager = submitter.managerId ? people.find((x) => x.id === String(submitter.managerId)) ?? null : null;
 
@@ -254,6 +275,7 @@ export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRou
     amountBase: Number(amountBase),
     baseCurrency,
     categoryIds: categoryIds.map(String),
+    categoryBotLimits,
     submitter: { id: String(submitter._id), name: nameOf(submitter), departmentId, managerId: submitter.managerId ? String(submitter.managerId) : null },
     manager,
     candidates: people,
@@ -268,6 +290,7 @@ export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRou
     submitter: input.submitter,
     departmentId,
     categoryIds: input.categoryIds,
+    categoryBotLimits,
     checks,
     fromClaim,
     fromAdvance,

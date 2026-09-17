@@ -36,6 +36,39 @@ function requireExpenseAdmin(req: any, res: any, next: any) {
   return next();
 }
 
+/* ── Bot limit (per-category auto-approve ceiling) ────────────────────
+ * MANDATORY on create, and on any update that touches it: the admin either
+ * names an amount (≥ 1, workspace base currency) or picks "Not Applicable",
+ * which means the category never auto-approves. There is no third state to
+ * choose — an unset value only exists on categories that predate the field.
+ *
+ * Returns the {mode, amount} to persist, or an error string. `required` is
+ * false for a PATCH that does not mention the bot limit at all (rename,
+ * GL-code edit, activate/deactivate must keep working untouched).
+ */
+function readBotLimit(
+  b: any,
+  required: boolean,
+): { error: string } | { patch: { botLimitMode: "amount" | "na"; botLimitBase: number | null } } | { patch: null } {
+  const mentioned = b.botLimitMode !== undefined || b.botLimitBase !== undefined;
+  if (!mentioned) {
+    if (required) {
+      return { error: "A bot approval limit is required: send botLimitMode 'amount' with botLimitBase ≥ 1, or botLimitMode 'na' (never auto-approve)." };
+    }
+    return { patch: null };
+  }
+  const mode = String(b.botLimitMode ?? "").trim();
+  if (mode !== "amount" && mode !== "na") {
+    return { error: "botLimitMode must be 'amount' (with botLimitBase ≥ 1) or 'na' (never auto-approve)." };
+  }
+  if (mode === "na") return { patch: { botLimitMode: "na", botLimitBase: null } };
+  const n = Number(b.botLimitBase);
+  if (!Number.isFinite(n) || n < 1) {
+    return { error: "botLimitBase must be a number ≥ 1 when botLimitMode is 'amount' (or choose 'na')." };
+  }
+  return { patch: { botLimitMode: "amount", botLimitBase: Math.round(n * 100) / 100 } };
+}
+
 /* ─────────────────────────────────────────────────────────────────────
  * GET /api/expense-categories
  * Workspace-scoped, sorted. Lazy-seeds 10 defaults when the workspace has none.
@@ -80,6 +113,10 @@ router.post("/", requireExpenseAdmin, async (req: any, res: any) => {
     const existing = await ExpenseCategory.findOne({ workspaceId, name }).lean();
     if (existing) return res.status(409).json({ error: "A category with this name already exists" });
 
+    // Mandatory on create — no category may exist without an explicit answer.
+    const bot = readBotLimit(b, true);
+    if ("error" in bot) return res.status(400).json({ error: bot.error });
+
     const category = await ExpenseCategory.create({
       workspaceId, // explicit tenant scope
       name,
@@ -87,6 +124,7 @@ router.post("/", requireExpenseAdmin, async (req: any, res: any) => {
       sortOrder: Number.isFinite(Number(b.sortOrder)) ? Number(b.sortOrder) : 0,
       active: true,
       isDefault: false,
+      ...(bot.patch ?? {}),
     });
 
     res.status(201).json({ ok: true, category });
@@ -121,6 +159,9 @@ router.patch("/:id", requireExpenseAdmin, async (req: any, res: any) => {
       update.sortOrder = Number(b.sortOrder);
     }
     if (b.active !== undefined) update.active = !!b.active;
+    const bot = readBotLimit(b, false);
+    if ("error" in bot) return res.status(400).json({ error: bot.error });
+    if (bot.patch) Object.assign(update, bot.patch);
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: "Nothing to update" });
