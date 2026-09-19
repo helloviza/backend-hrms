@@ -561,6 +561,60 @@ describe("9 · the tolerance setting is respected", () => {
   });
 });
 
+// F-30: the claim page's "extracted data" panel used to print the LINE's
+// amount (the submitter's number) as if it were what the receipt said, hiding
+// the very mismatch the bot routed the claim for. GET /reports/:id now carries
+// the server-held read (`receiptRead`) and the per-line verdict beside each
+// line so the approver sees receipt ₹1,400 next to claimed ₹500.
+describe("10 · F-30 — GET /reports/:id carries the RECEIPT's read next to the claimed line", () => {
+  it("mismatch: receiptRead.amount is the receipt's 1,400, the line's amount stays the claimed 500, verdict says mismatch", async () => {
+    const t = await makeWorkspace();
+    const up = await uploadBill(t.arjun, { amount: 1400, merchant: "Shree Thaker Bhojanalay" });
+    const line = await saveLine(t.arjun, t.meals, 500, { imageKey: up.imageKey, merchant: "Typed Cafe" });
+    const c = await claimOf(t.arjun, "f30", [line._id]);
+    await submit(t.arjun, c);
+    const byManager = await as(t.meera).get(`/api/reports/${c}`);
+    expect(byManager.status).toBe(200);
+    const [row] = byManager.body.expenses;
+    expect(row.amount).toBe(500); // what was claimed, unchanged
+    expect(row.merchant).toBe("Typed Cafe");
+    expect(row.receiptRead).toMatchObject({ readable: true, amount: 1400, currency: "INR", merchant: "Shree Thaker Bhojanalay", suggestedCategory: "Meals" });
+    expect(row.receiptVerdict).toMatchObject({ status: "mismatch", claimedAmount: 500, extractedAmount: 1400, extractedCurrency: "INR", toleranceApplied: 70 });
+    expect(row.receiptVerdict.reason).toMatch(/receipt amount INR 1,400\.00 doesn't match claimed INR 500\.00 \(tolerance INR 70\.00\)/);
+    // the raw blobs the client echoed are still not exposed
+    expect(row.rawExtraction).toBeUndefined();
+    expect(row.perFieldConfidence).toBeUndefined();
+  });
+
+  it("match, unreadable, no receipt, and a never-read key each describe themselves", async () => {
+    const t = await makeWorkspace();
+    const ok = await uploadBill(t.arjun, { amount: 1400 });
+    const okLine = await saveLine(t.arjun, t.meals, 1400, { imageKey: ok.imageKey });
+    const bad = await uploadBill(t.arjun, { amount: null });
+    const badLine = await saveLine(t.arjun, t.meals, 150, { imageKey: bad.imageKey });
+    const none = await saveLine(t.arjun, t.meals, 90);
+    const legacy = await saveLine(t.arjun, t.meals, 80, { imageKey: `hrms/expenses/${t.wsId}/${t.arjun.id}/legacy-${Date.now()}.jpg` });
+    const c = await claimOf(t.arjun, "f30-mix", [okLine._id, badLine._id, none._id, legacy._id]);
+    const rows: any[] = (await as(t.arjun).get(`/api/reports/${c}`)).body.expenses;
+    const by = (id: string) => rows.find((r) => String(r._id) === String(id));
+
+    expect(by(okLine._id).receiptRead).toMatchObject({ readable: true, amount: 1400 });
+    expect(by(okLine._id).receiptVerdict).toMatchObject({ status: "ok", extractedAmount: 1400, claimedAmount: 1400 });
+
+    expect(by(badLine._id).receiptRead).toMatchObject({ readable: false, amount: null });
+    expect(by(badLine._id).receiptRead.errorMessage).toBeTruthy();
+    expect(by(badLine._id).receiptVerdict.status).toBe("unreadable");
+
+    expect(by(none._id).hasReceipt).toBe(false);
+    expect(by(none._id).receiptRead).toBeNull();
+    expect(by(none._id).receiptVerdict.status).toBe("missing");
+
+    expect(by(legacy._id).hasReceipt).toBe(true);
+    expect(by(legacy._id).receiptRead).toBeNull(); // the server never read this key
+    expect(by(legacy._id).receiptVerdict.status).toBe("unreadable");
+  });
+});
+
 describe("simulator", () => {
   it("'test this claim' shows the same receipt verdict the live engine would apply, without changing anything", async () => {
     const t = await makeWorkspace();

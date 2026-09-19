@@ -82,6 +82,42 @@ export async function loadExtractionsForLines(workspaceId: any, lines: { imageKe
   return new Map(rows.map((r) => [String(r.imageKey), r]));
 }
 
+/**
+ * What the RECEIPT said, for a reviewer (F-30). This is the server-held read —
+ * never the values on the Expense line, which the submitter can edit — so a
+ * claim page can put "receipt ₹1,400" next to "claimed ₹500" and the approver
+ * sees the exact gap the bot flagged. `null` when the server never read this
+ * key (no receipt, or a line older than the ReceiptExtraction store).
+ */
+export type ReceiptReadView = {
+  readable: boolean;
+  errorMessage: string | null;
+  merchant: string | null;
+  date: string | null;
+  amount: number | null;
+  currency: string | null;
+  taxAmount: number | null;
+  gstin: string | null;
+  suggestedCategory: string | null;
+  extractedAt: Date | null;
+};
+
+export function receiptReadView(extraction: IReceiptExtraction | null | undefined): ReceiptReadView | null {
+  if (!extraction) return null;
+  return {
+    readable: !!extraction.readable,
+    errorMessage: extraction.errorMessage ?? null,
+    merchant: extraction.merchant ?? null,
+    date: extraction.date ?? null,
+    amount: extraction.amount ?? null,
+    currency: extraction.currency ?? null,
+    taxAmount: extraction.taxAmount ?? null,
+    gstin: extraction.gstin ?? null,
+    suggestedCategory: extraction.suggestedCategory ?? null,
+    extractedAt: extraction.extractedAt ?? null,
+  };
+}
+
 export type ReceiptLineStatus = "ok" | "missing" | "unreadable" | "mismatch" | "currency_mismatch";
 export type ReceiptLineVerdict = {
   expenseId: string;

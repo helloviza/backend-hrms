@@ -62,6 +62,8 @@ import { normalizeActorType } from "../models/ExpenseActivity.js";
 
 import ExpenseCategory from "../models/ExpenseCategory.js";
 import { claimDisplayName, withDisplayName } from "../services/expenseClaimNaming.js";
+import { loadExtractionsForLines, receiptReadView, verifyReceiptLine } from "../services/receiptExtractions.service.js";
+import { getPolicy } from "../services/expensePolicy.service.js";
 
 const router = express.Router();
 
@@ -570,14 +572,34 @@ router.get("/:id", async (req: any, res: any) => {
       .lean();
 
     const baseCurrency = await getWorkspaceBaseCurrency(req.workspaceObjectId);
+    // F-30: what the RECEIPT said, from the server-held ReceiptExtraction row,
+    // next to what the line claims — the panel a reviewer reads must show the
+    // receipt's own numbers, not the submitter-editable ones. The verdict is
+    // the same per-line check the Approval Bot ran (today's tolerance).
+    const [extractions, policy] = await Promise.all([
+      loadExtractionsForLines(req.workspaceObjectId, expenses as any[]),
+      getPolicy(req.workspaceObjectId),
+    ]);
     const enriched = expenses.map((d: any) => {
       const cat = d.categoryId;
+      const extraction = d.imageKey ? extractions.get(String(d.imageKey)) : null;
+      const verdict = verifyReceiptLine({ ...d, baseCurrency }, extraction, policy.bot.receiptMatch, baseCurrency);
       return {
         ...d,
         categoryId: cat && typeof cat === "object" ? cat._id : cat,
         categoryName: categoryNameOf(d),
         hasReceipt: !!d.imageKey,
         ...fxView(d, baseCurrency), // amountBase / rate / conversionPending
+        receiptRead: receiptReadView(extraction),
+        receiptVerdict: {
+          status: verdict.status,
+          claimedAmount: verdict.claimedAmount,
+          claimedCurrency: verdict.claimedCurrency,
+          extractedAmount: verdict.extractedAmount,
+          extractedCurrency: verdict.extractedCurrency,
+          toleranceApplied: verdict.toleranceApplied,
+          reason: verdict.reason,
+        },
       };
     });
 
