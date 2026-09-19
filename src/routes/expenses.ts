@@ -34,6 +34,7 @@ import { csvRow } from "../utils/exportHelpers.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
 import { extractReceipt } from "../services/receiptExtractorGemini.js";
+import { recordReceiptExtraction } from "../services/receiptExtractions.service.js";
 import { createExpense, ExpenseInputError } from "../services/expenses.service.js";
 import { propagateReportLifecycle, logActivity } from "../services/reports.service.js";
 import {
@@ -1425,9 +1426,11 @@ router.post("/upload", receiptUploadMw, async (req: any, res: any) => {
     let extractionModel: string | undefined;
     let rawExtraction: any = undefined;
     let extractionError: string | undefined;
+    let extractionResult: Awaited<ReturnType<typeof extractReceipt>> | null = null;
 
     try {
       const result = await extractReceipt({ buffer: file.buffer, mime: file.mimetype });
+      extractionResult = result;
       const { perFieldConfidence: pfc, ...fields } = result.fields;
       draft = { ...fields, currency: normalizeCurrency(fields.currency) || baseCurrency };
       perFieldConfidence = pfc;
@@ -1436,6 +1439,26 @@ router.post("/upload", receiptUploadMw, async (req: any, res: any) => {
     } catch (exErr: any) {
       extractionError = exErr?.message || "Extraction failed";
       console.warn("[Expenses upload] extraction failed", extractionError);
+    }
+
+    // Receipt verification: keep the SERVER'S copy of what was read (or that
+    // nothing usable was), keyed to this receipt. The Approval Bot compares
+    // the claimed amount against THIS row — the draft returned below is only
+    // a convenience for the form and can be edited freely. Non-fatal: a
+    // failure to record must not lose the upload.
+    try {
+      await recordReceiptExtraction({
+        workspaceId: req.workspaceObjectId,
+        employeeId,
+        imageKey: key,
+        s3Bucket: bucket,
+        mime: file.mimetype,
+        sourceChannel: "web",
+        result: extractionResult,
+        error: extractionError ?? null,
+      });
+    } catch (recErr: any) {
+      console.error("[Expenses upload] could not record the server-side extraction", recErr?.message);
     }
 
     res.json({

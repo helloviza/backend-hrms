@@ -26,6 +26,12 @@ import { activeUserFilter } from "../utils/userActiveStatus.js";
 import ExpenseAdvance from "../models/ExpenseAdvance.js";
 import ExpenseCategory, { categoryBotLimit } from "../models/ExpenseCategory.js";
 import type { RoutingInput, RoutingPerson, RoutingChecks, ClaimChecks, AdvanceChecks, CategoryBotLimit } from "./expenseRouting.service.js";
+import {
+  loadExtractionsForLines,
+  receiptVerdictForLines,
+  type ReceiptMatchTolerance,
+  type ReceiptVerdict,
+} from "./receiptExtractions.service.js";
 
 const oid = (v: any) => new mongoose.Types.ObjectId(String(v));
 
@@ -69,8 +75,21 @@ export function checksForAdvance(a: { amount: any; purpose?: any; neededBy?: any
   return { positiveAmount: Number.isFinite(amount) && amount > 0, purposePresent: purpose.length > 0, validDates };
 }
 
-/** Bot pre-checks from a claim's lines (the same facts validateReportForSubmit warns on). */
-export function checksFromLines(lines: any[]): ClaimChecks {
+/**
+ * Bot pre-checks from a claim's lines (the same facts validateReportForSubmit
+ * warns on). The `receipt` check is the receipt-VERIFICATION gate: it passes
+ * only when EVERY line carries a receipt the server itself read (a
+ * ReceiptExtraction row, never the client-echoed blob on the Expense) with a
+ * usable amount, in the line's currency, within the policy tolerance of the
+ * claimed amount. A bill that is attached but unreadable, or that reads a
+ * different amount, fails the check — the claim then goes to a person.
+ *
+ * `verdict` is the per-line breakdown for the trail / simulator.
+ */
+export function checksFromLines(
+  lines: any[],
+  receipts?: { extractions: Map<string, any>; tolerance: ReceiptMatchTolerance; baseCurrency: string },
+): { checks: ClaimChecks; reasons: Partial<Record<keyof ClaimChecks, string>>; verdict: ReceiptVerdict | null } {
   const seen = new Set<string>();
   let dupes = 0;
   for (const e of lines) {
@@ -79,13 +98,24 @@ export function checksFromLines(lines: any[]): ClaimChecks {
     if (seen.has(key)) dupes++;
     else seen.add(key);
   }
-  return {
-    receipt: lines.length > 0 && lines.every((e) => !!e.imageKey),
+  const verdict = receipts ? receiptVerdictForLines(lines, receipts.extractions, receipts.tolerance, receipts.baseCurrency) : null;
+  const checks: ClaimChecks = {
+    // No receipt facts supplied (hypothetical claim) → attached is all we can ask.
+    receipt: verdict ? verdict.pass : lines.length > 0 && lines.every((e) => !!e.imageKey),
     category: lines.length > 0 && lines.every((e) => !!e.categoryId),
     noDuplicate: dupes === 0,
     positiveAmounts: lines.length > 0 && lines.every((e) => Number(e.amount) > 0),
   };
+  const reasons: Partial<Record<keyof ClaimChecks, string>> = {};
+  if (!checks.receipt) reasons.receipt = verdict && verdict.failures.length ? verdict.failures.join("; ") : "a bill has no receipt attached";
+  if (!checks.category) reasons.category = "a bill has no category";
+  if (!checks.noDuplicate) reasons.noDuplicate = `${dupes} possible duplicate bill${dupes === 1 ? "" : "s"} (same merchant, amount and date)`;
+  if (!checks.positiveAmounts) reasons.positiveAmounts = "a bill has a non-positive amount";
+  return { checks, reasons, verdict };
 }
+
+/** The bypass reason, when the submitter marked the claim as having no attachments. */
+export const ATTACHMENTS_NOT_REQUIRED_REASON = "the submitter marked this claim as having no attachments — sent to a person";
 
 /**
  * The bot limit of every category ON THIS CLAIM, in the shape routeClaim()
@@ -209,8 +239,15 @@ export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRou
     kind === "advance"
       ? { ...checksForAdvance({ amount: amountBase, purpose: p.advance?.purpose, neededBy: p.advance?.neededBy }), ...(p.checks || {}) }
       : { receipt: true, category: true, noDuplicate: true, positiveAmounts: true, ...(p.checks || {}) };
+  let checkReasons: Partial<Record<string, string>> = {};
+  let receiptVerdict: ReceiptVerdict | null = null;
+  let skipBot: string | null = null;
   let fromClaim: any = null;
   let fromAdvance: any = null;
+
+  // The policy is needed BEFORE the checks (the receipt tolerance lives on it)
+  // and again for the input itself — read once.
+  const policy = await getPolicy(ws);
 
   if (p.advanceId) {
     if (!mongoose.Types.ObjectId.isValid(p.advanceId)) return { error: "Invalid advanceId", status: 400 };
@@ -232,9 +269,25 @@ export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRou
     const pending = lines.filter((l) => effectiveAmountBase(l, baseCurrency) == null).length;
     amountBase = Math.round(lines.reduce((s, l) => s + (effectiveAmountBase(l, baseCurrency) ?? 0), 0) * 100) / 100;
     categoryIds = [...new Set(lines.map((l) => (l.categoryId ? String(l.categoryId) : null)).filter(Boolean) as string[])];
-    checks = checksFromLines(lines);
+    // Receipt verification reads the SERVER-HELD extraction rows — never the
+    // rawExtraction blob the browser echoed onto the Expense.
+    const extractions = await loadExtractionsForLines(ws, lines);
+    const fromLines = checksFromLines(lines, { extractions, tolerance: policy.bot.receiptMatch, baseCurrency });
+    checks = fromLines.checks; // an existing claim is judged on its facts — no hypothetical override
+    checkReasons = fromLines.reasons;
+    receiptVerdict = fromLines.verdict;
+    // The submitter's escape hatch: "no attachments for this claim" → the bot
+    // is not consulted and the claim goes straight to a person.
+    if (report.attachmentsNotRequired) skipBot = ATTACHMENTS_NOT_REQUIRED_REASON;
     submitterId = submitterId ?? String(report.employeeId);
-    fromClaim = { reportId: String(report._id), ref: report.ref, status: report.status, lineCount: lines.length, pendingConversion: pending };
+    fromClaim = {
+      reportId: String(report._id),
+      ref: report.ref,
+      status: report.status,
+      lineCount: lines.length,
+      pendingConversion: pending,
+      attachmentsNotRequired: !!report.attachmentsNotRequired,
+    };
   }
 
   if (!submitterId || !mongoose.Types.ObjectId.isValid(submitterId)) return { error: "submitterId (or reportId / advanceId) is required", status: 400 };
@@ -261,8 +314,7 @@ export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRou
     departmentId = await resolveSubmitterDepartmentId(ws, submitter);
   }
 
-  const [policy, rankTable, people, baseCurrency, categoryBotLimits] = await Promise.all([
-    getPolicy(ws),
+  const [rankTable, people, baseCurrency, categoryBotLimits] = await Promise.all([
     getRankTable(ws),
     loadRoutingPeople(ws),
     getWorkspaceBaseCurrency(ws),
@@ -280,6 +332,8 @@ export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRou
     manager,
     candidates: people,
     checks,
+    checkReasons,
+    skipBot,
     policy,
     rankTable,
   };
@@ -292,6 +346,9 @@ export async function buildRoutingInput(p: BuildRoutingParams): Promise<BuildRou
     categoryIds: input.categoryIds,
     categoryBotLimits,
     checks,
+    checkReasons,
+    receiptVerdict,
+    skipBot,
     fromClaim,
     fromAdvance,
     policyVersion: policy.version,

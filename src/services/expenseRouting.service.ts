@@ -70,6 +70,18 @@ export type RoutingInput = {
   manager: RoutingPerson | null; // the submitter's line manager, if any (may not be an approver)
   candidates: RoutingPerson[]; // everyone in the workspace who could be an approver (the walk filters)
   checks: RoutingChecks; // bot pre-checks, computed by the caller from the lines
+  /**
+   * Why a failed check failed, per key, in words fit for the trail — e.g.
+   * receipt → "EXP-1A2B: receipt amount INR 1,180.00 doesn't match claimed
+   * INR 1,500.00 (tolerance INR 59.00)". Optional; absent = the key alone.
+   */
+  checkReasons?: Partial<Record<string, string>>;
+  /**
+   * The submitter (or a rule) asked for a person: the bot is not evaluated at
+   * all and the walk starts at step 4. The string is the reason for the trail
+   * — e.g. "the submitter marked this claim as having no attachments".
+   */
+  skipBot?: string | null;
   policy: PolicyView;
   rankTable: Pick<RankRow, "bandNumber" | "label" | "defaultApprovalLimitBase">[];
   now?: Date;
@@ -133,6 +145,10 @@ export type RoutingDecision = {
     /** Only the checks the policy actually enforces (policy.bot.require). */
     checksEnforced: string[];
     checksPassed: boolean | null;
+    /** The failed enforced checks, in words (from input.checkReasons, else the key). */
+    checksFailed: string[];
+    /** Set when the bot was deliberately not consulted (input.skipBot). */
+    skipped: string | null;
     wouldAutoApprove: boolean;
     reason: string;
   };
@@ -227,22 +243,29 @@ export function routeClaim(input: RoutingInput): RoutingDecision {
   const checksEnforced = enforcedEntries.map(([k]) => k);
   const checksPassed = enforcedEntries.every(([, v]) => v);
 
+  const failedKeys = enforcedEntries.filter(([, v]) => !v).map(([k]) => k);
+  // "receipt (EXP-1A2B: receipt not readable); category (a bill has no category)"
+  // — the KEY first so the trail stays greppable, the words after it.
+  const checksFailed = failedKeys.map((k) => (input.checkReasons?.[k] ? `${k} (${input.checkReasons[k]})` : k));
+  const botSkipped = input.skipBot ? String(input.skipBot) : null;
+
   const botEnabled = !!policy.bot.enabled && (appliedLimit != null || categoryNotApplicable);
   // null = no ceiling was applied at all (bot off, or the category is N/A).
   const under = botEnabled && appliedLimit != null ? amount <= Number(appliedLimit) : null;
-  const wouldAuto = !!(botEnabled && !categoryNotApplicable && under && !neverBot && checksPassed);
+  const wouldAuto = !!(botEnabled && !botSkipped && !categoryNotApplicable && under && !neverBot && checksPassed);
   const ceiling = () => `${fmt(Number(appliedLimit), input.baseCurrency)}${singleCat ? ` (${singleCat.name} limit)` : " (mixed-category limit)"}`;
   let botReason = "bot not enabled";
   if (botEnabled) {
-    if (categoryNotApplicable) {
+    if (botSkipped) {
+      botReason = `not consulted — ${botSkipped}`;
+    } else if (categoryNotApplicable) {
       botReason = `${singleCat!.name} never auto-approves (bot limit: Not Applicable)`;
     } else if (!under) {
       botReason = `over the bot limit ${ceiling()}`;
     } else if (neverBot) {
       botReason = "a category on this claim is marked never-auto-approve";
     } else if (!checksPassed) {
-      const failed = enforcedEntries.filter(([, v]) => !v).map(([k]) => k);
-      botReason = `pre-check failed: ${failed.join(", ")}`;
+      botReason = `pre-check failed: ${checksFailed.join("; ")}`;
     } else {
       botReason = `under the bot limit ${ceiling()} and every enforced pre-check passed`;
     }
@@ -260,6 +283,8 @@ export function routeClaim(input: RoutingInput): RoutingDecision {
     checks: input.checks,
     checksEnforced,
     checksPassed: botEnabled ? checksPassed : null,
+    checksFailed,
+    skipped: botSkipped,
     wouldAutoApprove: wouldAuto,
     reason: botReason,
   };

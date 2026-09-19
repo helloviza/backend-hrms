@@ -104,9 +104,14 @@ export interface IExpense extends Document {
   status: "submitted";
 
   // Audit of what the model produced + its confidences (immutable record).
+  // NOTE: on the web channel these arrive from the browser (the upload
+  // response echoed back on POST /expenses) — display/audit only. The
+  // Approval Bot's receipt gate reads the SERVER-held ReceiptExtraction row
+  // linked below, never these.
   rawExtraction?: any;
   perFieldConfidence?: any;
   extractionModel?: string;
+  receiptExtractionId?: mongoose.Types.ObjectId | null;
 
   createdAt: Date;
   updatedAt: Date;
@@ -181,6 +186,7 @@ const ExpenseSchema = new Schema<IExpense>(
     rawExtraction: { type: Schema.Types.Mixed },
     perFieldConfidence: { type: Schema.Types.Mixed },
     extractionModel: { type: String, trim: true },
+    receiptExtractionId: { type: Schema.Types.ObjectId, ref: "ReceiptExtraction", default: null },
   },
   { timestamps: true },
 );

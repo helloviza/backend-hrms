@@ -25,6 +25,8 @@ export type PolicyView = {
     enabled: boolean;
     thresholdBase: number | null;
     require: { receipt: boolean; category: boolean; noDuplicate: boolean; positiveAmounts: boolean };
+    /** Receipt amount-match slack: the larger of absToleranceBase (base ccy) and pctTolerance % applies. */
+    receiptMatch: { absToleranceBase: number; pctTolerance: number };
   };
   managerAllowance: { enabled: boolean; limitBase: number | null };
   categoryRules: { categoryId: string; neverAutoApprove: boolean; minApproverLimitBase: number | null; weight: number | null }[];
@@ -41,7 +43,12 @@ export function defaultPolicyView(workspaceId: mongoose.Types.ObjectId | string)
     version: 0,
     exists: false,
     engineEnabled: false,
-    bot: { enabled: false, thresholdBase: null, require: { receipt: true, category: true, noDuplicate: true, positiveAmounts: true } },
+    bot: {
+      enabled: false,
+      thresholdBase: null,
+      require: { receipt: true, category: true, noDuplicate: true, positiveAmounts: true },
+      receiptMatch: { absToleranceBase: 10, pctTolerance: 5 },
+    },
     managerAllowance: { enabled: false, limitBase: null },
     categoryRules: [],
     departmentScopeEnforced: false,
@@ -64,6 +71,11 @@ export function policyView(doc: any, workspaceId: mongoose.Types.ObjectId | stri
       enabled: !!doc.bot?.enabled,
       thresholdBase: doc.bot?.thresholdBase == null ? null : Number(doc.bot.thresholdBase),
       require: { ...d.bot.require, ...(doc.bot?.require || {}) },
+      receiptMatch: {
+        absToleranceBase:
+          doc.bot?.receiptMatch?.absToleranceBase == null ? d.bot.receiptMatch.absToleranceBase : Number(doc.bot.receiptMatch.absToleranceBase),
+        pctTolerance: doc.bot?.receiptMatch?.pctTolerance == null ? d.bot.receiptMatch.pctTolerance : Number(doc.bot.receiptMatch.pctTolerance),
+      },
     },
     managerAllowance: {
       enabled: !!doc.managerAllowance?.enabled,
@@ -95,7 +107,12 @@ export async function getPolicy(workspaceId: mongoose.Types.ObjectId | string): 
 
 export type PolicyPatch = {
   engineEnabled?: boolean;
-  bot?: { enabled?: boolean; thresholdBase?: number | null; require?: Partial<PolicyView["bot"]["require"]> };
+  bot?: {
+    enabled?: boolean;
+    thresholdBase?: number | null;
+    require?: Partial<PolicyView["bot"]["require"]>;
+    receiptMatch?: Partial<PolicyView["bot"]["receiptMatch"]>;
+  };
   managerAllowance?: { enabled?: boolean; limitBase?: number | null };
   categoryRules?: { categoryId: string; neverAutoApprove?: boolean; minApproverLimitBase?: number | null; weight?: number | null }[];
   departmentScopeEnforced?: boolean;
@@ -126,6 +143,23 @@ export async function validatePolicyPatch(
   const errors: string[] = [];
   if (patch.bot) {
     nonNegOrNull(patch.bot.thresholdBase, "bot.thresholdBase", errors);
+    if (patch.bot.receiptMatch) {
+      const rm = patch.bot.receiptMatch;
+      if (rm.absToleranceBase !== undefined) {
+        const n = Number(rm.absToleranceBase);
+        if (rm.absToleranceBase === null || !Number.isFinite(n) || n < 0) errors.push("bot.receiptMatch.absToleranceBase must be a non-negative number");
+      }
+      if (rm.pctTolerance !== undefined) {
+        const n = Number(rm.pctTolerance);
+        if (rm.pctTolerance === null || !Number.isFinite(n) || n < 0 || n > 100) errors.push("bot.receiptMatch.pctTolerance must be a number between 0 and 100");
+      }
+    }
+    if (patch.bot.require) {
+      for (const [k, v] of Object.entries(patch.bot.require)) {
+        if (!["receipt", "category", "noDuplicate", "positiveAmounts"].includes(k)) errors.push(`bot.require.${k} is not a pre-check`);
+        else if (typeof v !== "boolean") errors.push(`bot.require.${k} must be true or false`);
+      }
+    }
   }
   if (patch.managerAllowance) {
     nonNegOrNull(patch.managerAllowance.limitBase, "managerAllowance.limitBase", errors);
@@ -183,6 +217,14 @@ export async function updatePolicy(params: {
     if (p.bot.enabled !== undefined) doc.bot.enabled = !!p.bot.enabled;
     if (p.bot.thresholdBase !== undefined) doc.bot.thresholdBase = p.bot.thresholdBase == null ? null : Number(p.bot.thresholdBase);
     if (p.bot.require) doc.bot.require = { ...doc.bot.require, ...p.bot.require } as any;
+    if (p.bot.receiptMatch) {
+      const cur = doc.bot.receiptMatch || ({} as any);
+      const rm = p.bot.receiptMatch;
+      doc.bot.receiptMatch = {
+        absToleranceBase: rm.absToleranceBase !== undefined ? Number(rm.absToleranceBase) : (cur.absToleranceBase ?? 10),
+        pctTolerance: rm.pctTolerance !== undefined ? Number(rm.pctTolerance) : (cur.pctTolerance ?? 5),
+      };
+    }
   }
   if (p.managerAllowance) {
     if (p.managerAllowance.enabled !== undefined) doc.managerAllowance.enabled = !!p.managerAllowance.enabled;

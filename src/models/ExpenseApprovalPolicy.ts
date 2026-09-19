@@ -50,6 +50,10 @@ export interface IExpenseApprovalPolicy extends Document {
     enabled: boolean;
     thresholdBase: number | null;
     require: { receipt: boolean; category: boolean; noDuplicate: boolean; positiveAmounts: boolean };
+    // Receipt verification (the "readable, matching receipt" gate): how far a
+    // claimed line amount may sit from the server-read receipt amount and
+    // still count as matching — the LARGER of the two applies.
+    receiptMatch: { absToleranceBase: number; pctTolerance: number };
   };
   managerAllowance: { enabled: boolean; limitBase: number | null };
   categoryRules: ICategoryRule[];
@@ -90,6 +94,10 @@ const ExpenseApprovalPolicySchema = new Schema<IExpenseApprovalPolicy>(
         category: { type: Boolean, default: true },
         noDuplicate: { type: Boolean, default: true },
         positiveAmounts: { type: Boolean, default: true },
+      },
+      receiptMatch: {
+        absToleranceBase: { type: Number, default: 10, min: 0 },
+        pctTolerance: { type: Number, default: 5, min: 0, max: 100 },
       },
     },
     managerAllowance: {

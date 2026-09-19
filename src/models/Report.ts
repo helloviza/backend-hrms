@@ -81,6 +81,11 @@ export interface IReport extends Document {
   // Sub-step 8: set when an approver's departure left nobody who can cover it.
   needsAttention?: { reason: string; since: Date; formerApproverId?: mongoose.Types.ObjectId | null; trigger?: string | null } | null;
 
+  // Receipt verification: the submitter's escape hatch. true = "there are no
+  // attachments for this claim" — the Approval Bot is not consulted at all and
+  // the claim goes straight to a person. Set at submit; carried on the trail.
+  attachmentsNotRequired?: boolean;
+
   // ── Phase 2 (advances): net-reimburse record. PURELY ADDITIVE — only written
   // when the claim has applied advances. A claim with NO applied advances
   // reimburses exactly as before and these stay null/0 (regression line). ──
@@ -160,6 +165,7 @@ const ReportSchema = new Schema<IReport>(
     needsAttention: { type: NeedsAttentionSchema, default: null },
     currentLevel: { type: Number, default: 1 },
     routing: { type: Schema.Types.Mixed, default: null },
+    attachmentsNotRequired: { type: Boolean, default: false },
 
     // ── Phase 2 (advances): net-reimburse record (additive; null until a
     // reimburse with applied advances writes them). ──

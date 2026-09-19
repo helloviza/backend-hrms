@@ -30,6 +30,7 @@ const { updatePolicy } = await import("../services/expensePolicy.service.js");
 const { signToken } = await import("../utils/jwt.js");
 const { default: CustomerWorkspace } = await import("../models/CustomerWorkspace.js");
 const { default: User } = await import("../models/User.js");
+const { recordReceiptExtraction } = await import("../services/receiptExtractions.service.js");
 const { default: ExpenseCategory, categoryBotLimit } = await import("../models/ExpenseCategory.js");
 const { claimDisplayName, stripSystemPrefix } = await import("../services/expenseClaimNaming.js");
 const { default: expensesRouter } = await import("./expenses.js");
@@ -115,13 +116,27 @@ async function makeWorkspace() {
 }
 
 /** Build a claim with the given lines and return its id/ref. */
+/** What the upload route records for a bill the reader could read (INR, amount as given). */
+async function seedReceipt(wsId: string, employeeId: string, imageKey: string, amount: number, currency = "INR") {
+  await recordReceiptExtraction({
+    workspaceId: wsId, employeeId, imageKey, mime: "image/jpeg", sourceChannel: "web",
+    result: {
+      fields: { merchant: "Seeded", date: TODAY, amount, currency, taxAmount: null, gstin: null, suggestedCategory: null, perFieldConfidence: { amount: 0.95 } },
+      raw: { raw_candidate: { amount, currency }, raw_text: "", model: "test-mock" },
+    },
+  });
+}
 async function claimWith(who: Actor, wsId: string, name: string, lines: { amount: number; categoryId?: string; receipt?: boolean }[]) {
   const W = as(who);
   const ids: string[] = [];
   for (const l of lines) {
+    // A "receipt" is what a real upload leaves behind: the S3 key AND the
+    // server-held read of it (receipt verification gate) — amount matching.
+    const imageKey = l.receipt ? `hrms/expenses/${wsId}/${who.id}/${name}-${ids.length}-${Date.now()}.jpg` : undefined;
+    if (imageKey) await seedReceipt(wsId, who.id, imageKey, l.amount);
     const r = await W.post("/api/expenses", {
       amount: l.amount, date: TODAY, merchant: `${name} ${ids.length + 1}`, categoryId: l.categoryId,
-      ...(l.receipt ? { imageKey: `hrms/expenses/${wsId}/${who.id}/${name}-${ids.length}-${Date.now()}.jpg` } : {}),
+      ...(imageKey ? { imageKey } : {}),
     });
     expect(r.status, JSON.stringify(r.body)).toBe(201);
     ids.push(r.body.expense._id);

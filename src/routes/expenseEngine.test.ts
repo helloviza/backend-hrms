@@ -30,6 +30,7 @@ const { default: User } = await import("../models/User.js");
 const { default: ExpenseCategory } = await import("../models/ExpenseCategory.js");
 const { default: Report } = await import("../models/Report.js");
 const { default: Expense } = await import("../models/Expense.js");
+const { recordReceiptExtraction } = await import("../services/receiptExtractions.service.js");
 const { default: ExpenseActivity } = await import("../models/ExpenseActivity.js");
 const { default: expensesRouter } = await import("./expenses.js");
 const { default: adminRouter } = await import("./expenseAdmin.js");
@@ -117,14 +118,27 @@ async function makeEngineWorkspace() {
 }
 const engineOn = (wsId: string, on = true) => updatePolicy({ workspaceId: wsId, patch: { engineEnabled: on } });
 
-/** Capture a claim with the given lines (amount, categoryId?, receipt?) as `who`. */
+/** What the upload route records for a bill the reader could read (amount as given, line currency). */
+async function seedReceipt(wsId: string, employeeId: string, imageKey: string, amount: number, currency = "INR") {
+  await recordReceiptExtraction({
+    workspaceId: wsId, employeeId, imageKey, mime: "image/jpeg", sourceChannel: "web",
+    result: {
+      fields: { merchant: "Seeded", date: TODAY, amount, currency, taxAmount: null, gstin: null, suggestedCategory: null, perFieldConfidence: { amount: 0.95 } },
+      raw: { raw_candidate: { amount, currency }, raw_text: "", model: "test-mock" },
+    },
+  });
+}
+
+/** Capture a claim with the given lines (amount, categoryId?, receipt?) as `who`. A receipt = the S3 key AND the server-held read of it (receipt verification gate), matching. */
 async function claimWith(who: Actor, wsId: string, name: string, lines: { amount: number; categoryId?: string; receipt?: boolean; currency?: string }[]) {
   const W = as(who);
   const ids: string[] = [];
   for (const l of lines) {
+    const imageKey = l.receipt ? `hrms/expenses/${wsId}/${who.id}/${name}-${ids.length}-${Date.now()}.jpg` : undefined;
+    if (imageKey) await seedReceipt(wsId, who.id, imageKey, l.amount, l.currency || "INR");
     const r = await W.post("/api/expenses", {
       amount: l.amount, currency: l.currency, date: TODAY, merchant: name, categoryId: l.categoryId,
-      ...(l.receipt ? { imageKey: `hrms/expenses/${wsId}/${who.id}/${name}-${ids.length}-${Date.now()}.jpg` } : {}),
+      ...(imageKey ? { imageKey } : {}),
     });
     expect(r.status, JSON.stringify(r.body)).toBe(201);
     ids.push(r.body.expense._id);

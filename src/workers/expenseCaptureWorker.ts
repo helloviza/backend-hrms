@@ -14,6 +14,7 @@ import {
 } from "../services/whatsappCloud.service.js";
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
 import { extractReceipt } from "../services/receiptExtractorGemini.js";
+import { recordReceiptExtraction } from "../services/receiptExtractions.service.js";
 import { createExpense } from "../services/expenses.service.js";
 import { resolveCategoryId } from "../services/expenseCategories.service.js";
 import {
@@ -271,6 +272,22 @@ async function processOneExtraction(): Promise<boolean> {
       mime: capture.mime,
     });
 
+    // Receipt verification: the same server-held row the web upload writes,
+    // so the Approval Bot's receipt gate treats a WhatsApp bill identically.
+    // A sender who later "fixes" the amount by text changes the LINE, not
+    // this row — which is exactly the mismatch the gate exists to catch.
+    if (capture.workspaceId && capture.employeeId) {
+      await recordReceiptExtraction({
+        workspaceId: capture.workspaceId,
+        employeeId: capture.employeeId,
+        imageKey: capture.imageKey,
+        s3Bucket: capture.s3Bucket ?? null,
+        mime: capture.mime,
+        sourceChannel: "whatsapp",
+        result: { fields, raw },
+      }).catch((e: any) => whatsappLogger.warn("Could not record the server-side extraction", { messageId: capture.messageId, error: e?.message }));
+    }
+
     capture.extraction = {
       merchant: fields.merchant,
       date: fields.date,
@@ -302,6 +319,19 @@ async function processOneExtraction(): Promise<boolean> {
       capture.status = "awaiting_correction";
       capture.errorMessage = message;
       await capture.save();
+      // The bill exists but nobody could read it: record that as a fact, so the
+      // gate sees "attached but unreadable" rather than "never uploaded".
+      if (capture.workspaceId && capture.employeeId && capture.imageKey) {
+        await recordReceiptExtraction({
+          workspaceId: capture.workspaceId,
+          employeeId: capture.employeeId,
+          imageKey: capture.imageKey,
+          s3Bucket: capture.s3Bucket ?? null,
+          mime: capture.mime,
+          sourceChannel: "whatsapp",
+          error: message,
+        }).catch((e: any) => whatsappLogger.warn("Could not record the failed extraction", { messageId: capture.messageId, error: e?.message }));
+      }
       await sendTextMessage(
         capture.waId,
         "I couldn't read that receipt automatically. Please reply with the amount " +

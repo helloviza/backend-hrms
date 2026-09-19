@@ -25,6 +25,7 @@ import { SYSTEM_ACTOR, type ExpenseActorType } from "../models/ExpenseActivity.j
 import { getPolicy } from "./expensePolicy.service.js";
 import { routeClaim, type RoutingDecision } from "./expenseRouting.service.js";
 import { buildRoutingInput } from "./expenseRoutingInput.service.js";
+import type { ReceiptVerdict } from "./receiptExtractions.service.js";
 import { APPROVAL_BOT_ACTOR } from "../models/ExpenseActivity.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import {
@@ -770,6 +771,15 @@ export async function submitReport(
   workspaceId: mongoose.Types.ObjectId | string,
   employeeId: mongoose.Types.ObjectId | string,
   reportId: mongoose.Types.ObjectId | string,
+  opts: {
+    /**
+     * Receipt verification — the submitter's escape hatch. true = "no
+     * attachments for this claim": persisted on the report, the Approval Bot
+     * is not consulted and the claim goes straight to a person. Omitted =
+     * leave whatever the report already says (false by default).
+     */
+    attachmentsNotRequired?: boolean;
+  } = {},
 ): Promise<SubmitReportResult> {
   const ws = new mongoose.Types.ObjectId(String(workspaceId));
   const emp = new mongoose.Types.ObjectId(String(employeeId));
@@ -785,6 +795,13 @@ export async function submitReport(
 
   const { blocking, warnings } = await validateReportForSubmit(ws, rid);
   if (blocking.length > 0) return { ok: false, reason: "blocking", blocking, warnings };
+
+  // The bypass is a fact about THIS submission: written before routing so the
+  // engine (buildRoutingInput reads it off the report) and the trail see it.
+  if (opts.attachmentsNotRequired !== undefined && !!report.attachmentsNotRequired !== !!opts.attachmentsNotRequired) {
+    report.attachmentsNotRequired = !!opts.attachmentsNotRequired;
+    await report.save();
+  }
 
   // Totals (for the response + email) — in the workspace BASE currency (slice
   // 0): validateReportForSubmit has just guaranteed every line is converted,
@@ -821,6 +838,7 @@ export async function submitReport(
   let approver: any;
   let routing: Record<string, any>;
   let engineDecision: RoutingDecision | null = null;
+  let receiptVerdict: ReceiptVerdict | null = null;
 
   if (policy.engineEnabled) {
     const built = await buildRoutingInput({ workspaceId: ws, kind: "claim", reportId: String(rid) });
@@ -828,7 +846,11 @@ export async function submitReport(
       return { ok: false, reason: "blocking", blocking: [built.error || "Could not route this claim."], warnings };
     }
     engineDecision = routeClaim(built.input);
-    routing = engineDecision;
+    routing = engineDecision; // same shape the simulator returns — kept identical on purpose
+    // The per-line receipt verdict goes on the trail (policy_check entries
+    // below), not onto Report.routing: the words are already in
+    // bot.checksFailed / bot.reason, the structured rows belong with the log.
+    receiptVerdict = built.summary?.receiptVerdict ?? null;
 
     // Nobody can approve this amount. Every top-of-chain mode presupposes a
     // pool with at least one limit; with none (NO_APPROVER), or when the
@@ -997,6 +1019,39 @@ export async function submitReport(
       actorType: "bot",
       note: w,
     });
+  }
+  // Receipt verification — WHY the bot stepped aside, in words, one entry per
+  // failing bill ("EXP-1A2B: receipt amount INR 1,180.00 doesn't match claimed
+  // INR 1,500.00 (tolerance INR 59.00)", "…: receipt not readable"), or the
+  // bypass the submitter chose. The structured verdict rides on `details`.
+  if (engineDecision && !botApproved && engineDecision.bot.enabled) {
+    const verdict = receiptVerdict;
+    if (engineDecision.bot.skipped) {
+      await logActivity({
+        workspaceId: ws,
+        reportId: rid,
+        event: "policy_check",
+        actorName: "Approval Bot",
+        actorType: "bot",
+        note: `Approval Bot not consulted — ${engineDecision.bot.skipped}.`,
+        details: { skipped: engineDecision.bot.skipped, attachmentsNotRequired: !!report.attachmentsNotRequired },
+      });
+    } else if (engineDecision.bot.checksEnforced.includes("receipt") && engineDecision.bot.checks.receipt === false) {
+      const lines: any[] = verdict?.lines?.filter((l: any) => l.status !== "ok") ?? [];
+      const notes = lines.length ? lines.map((l: any) => l.reason) : [engineDecision.bot.checksFailed.find((s) => /receipt/i.test(s)) || "receipt check failed"];
+      for (let i = 0; i < notes.length; i++) {
+        await logActivity({
+          workspaceId: ws,
+          reportId: rid,
+          event: "policy_check",
+          actorName: "Approval Bot",
+          actorType: "bot",
+          expenseId: lines[i]?.expenseId ?? null,
+          note: `Receipt check failed — ${notes[i]}. Sent to a person.`,
+          details: lines[i] ? { receipt: lines[i], tolerance: policy.bot.receiptMatch } : { tolerance: policy.bot.receiptMatch },
+        });
+      }
+    }
   }
 
   const approverName = botApproved ? APPROVAL_BOT_ACTOR.actorName : employeeNameOf(approver);

@@ -813,7 +813,11 @@ router.delete("/:id/expenses/:eid", async (req: any, res: any) => {
  * ───────────────────────────────────────────────────────────────────── */
 router.post("/:id/submit", async (req: any, res: any) => {
   try {
-    const result = await submitReport(req.workspaceObjectId, ownEmployeeId(req), req.params.id);
+    // Receipt verification: the optional "no attachments for this claim"
+    // bypass rides on the submit body. Only an explicit boolean is honoured.
+    const b = req.body || {};
+    const opts = typeof b.attachmentsNotRequired === "boolean" ? { attachmentsNotRequired: b.attachmentsNotRequired } : {};
+    const result = await submitReport(req.workspaceObjectId, ownEmployeeId(req), req.params.id, opts);
     if (!result.ok) {
       if (result.reason === "not_found") return res.status(404).json({ error: "Report not found" });
       if (result.reason === "not_editable") {

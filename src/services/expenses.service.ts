@@ -12,6 +12,7 @@ import {
   normalizeCurrency,
   resolveFxAtEntry,
 } from "./expenseFx.service.js";
+import { findExtractionByKey } from "./receiptExtractions.service.js";
 
 export type CreateExpenseInput = {
   workspaceId: mongoose.Types.ObjectId | string;
@@ -68,6 +69,14 @@ export async function createExpense(input: CreateExpenseInput): Promise<IExpense
   const currency = normalizeCurrency(input.currency) || baseCurrency;
   const fx = await resolveFxAtEntry({ amount: Number(input.amount), currency, baseCurrency });
 
+  // Receipt verification: link the SERVER-held read of this receipt (written by
+  // the upload route / capture worker at extraction time). When one exists its
+  // copy of the extraction fields is what gets stored on the line — the
+  // client-echoed rawExtraction / perFieldConfidence are only a fallback for a
+  // receipt the server never read (legacy uploads). The bot gate reads the
+  // linked row, so neither copy on the Expense is trusted for approval.
+  const serverRead = input.imageKey ? await findExtractionByKey(input.workspaceId, input.imageKey) : null;
+
   const doc: Record<string, any> = {
     workspaceId: input.workspaceId,
     employeeId: input.employeeId,
@@ -105,9 +114,10 @@ export async function createExpense(input: CreateExpenseInput): Promise<IExpense
     categoryId: input.categoryId ?? null,
     reportId: input.reportId ?? null,
     status: "submitted",
-    rawExtraction: input.rawExtraction,
-    perFieldConfidence: input.perFieldConfidence,
-    extractionModel: input.extractionModel,
+    rawExtraction: serverRead ? serverRead.rawCandidate : input.rawExtraction,
+    perFieldConfidence: serverRead ? serverRead.perFieldConfidence : input.perFieldConfidence,
+    extractionModel: serverRead ? (serverRead.extractionModel ?? undefined) : input.extractionModel,
+    receiptExtractionId: serverRead ? serverRead._id : null,
   };
 
   // Only set when present — never write null (see note on the field above).
