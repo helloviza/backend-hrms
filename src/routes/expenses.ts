@@ -116,6 +116,30 @@ async function routedClaimIdsFor(req: any, me: string): Promise<mongoose.Types.O
   return reports.map((r: any) => r._id as mongoose.Types.ObjectId);
 }
 
+/* ── The two dates a list can be filtered / sorted on ──────────────────────
+ * "receipt" = Expense.date (what the bill says), "entered" = Expense.createdAt
+ * (when the line was saved). Anything else — absent, junk — is "receipt", the
+ * behaviour the list always had. */
+export function dateFieldOf(raw: unknown): "date" | "createdAt" {
+  return String(raw ?? "") === "entered" ? "createdAt" : "date";
+}
+
+/* ── List order. `sort` = receipt_desc (default — the order the list always
+ * had) | receipt_asc | entered_desc | entered_asc. The other date is always
+ * the tie-break, so two bills with the same receipt date fall back to
+ * entry order and vice versa. Junk → the default. */
+export const EXPENSE_SORTS = {
+  receipt_desc: { date: -1, createdAt: -1 },
+  receipt_asc: { date: 1, createdAt: 1 },
+  entered_desc: { createdAt: -1, date: -1 },
+  entered_asc: { createdAt: 1, date: 1 },
+} as const;
+export type ExpenseSort = keyof typeof EXPENSE_SORTS;
+export function expenseSortOf(raw: unknown): ExpenseSort {
+  const k = String(raw ?? "");
+  return k in EXPENSE_SORTS ? (k as ExpenseSort) : "receipt_desc";
+}
+
 /* ── Shared filter builder — the single guarantee of tenant + own scoping ──
  * `includeRoutedClaims` adds claim-aware visibility (own rows OR the expenses
  * of claims routed to me): ON for read/list/export/detail, OFF for personal
@@ -199,9 +223,15 @@ async function buildExpenseFilter(
 
   if (req.query.dateFrom || req.query.dateTo) {
     // YYYY-MM-DD interpreted as an IST calendar day; parseISTEnd is inclusive.
-    filter.date = {};
-    if (req.query.dateFrom) filter.date.$gte = parseISTStart(String(req.query.dateFrom));
-    if (req.query.dateTo) filter.date.$lte = parseISTEnd(String(req.query.dateTo));
+    // `dateField` picks WHICH date the range applies to: "receipt" (default —
+    // Expense.date, what the bill says) or "entered" (Expense.createdAt, when
+    // the line was saved). createdAt is a full timestamp, so the IST window
+    // matters even more there: a line saved 00:10 IST belongs to that IST
+    // day even though the server clock (UTC) still says the day before.
+    const field = dateFieldOf(req.query.dateField);
+    filter[field] = {};
+    if (req.query.dateFrom) filter[field].$gte = parseISTStart(String(req.query.dateFrom));
+    if (req.query.dateTo) filter[field].$lte = parseISTEnd(String(req.query.dateTo));
   }
 
   if (req.query.search) {
@@ -362,7 +392,7 @@ router.get("/", async (req: any, res: any) => {
         .select("-rawExtraction -perFieldConfidence")
         .populate("employeeId", "firstName lastName email name")
         .populate("categoryId", "name")
-        .sort({ date: -1, createdAt: -1 })
+        .sort(EXPENSE_SORTS[expenseSortOf(req.query.sort)])
         .skip((page - 1) * limit)
         .limit(limit)
         .lean(),
@@ -418,7 +448,7 @@ router.get("/export", async (req: any, res: any) => {
       .select("-rawExtraction -perFieldConfidence")
       .populate("employeeId", "firstName lastName email name")
       .populate("categoryId", "name")
-      .sort({ date: -1, createdAt: -1 });
+      .sort(EXPENSE_SORTS[expenseSortOf(req.query.sort)]); // the same order the list shows
 
     let docs: any[];
     let total: number;
@@ -521,6 +551,8 @@ router.get("/export", async (req: any, res: any) => {
         range: {
           dateFrom: req.query.dateFrom ? String(req.query.dateFrom) : "",
           dateTo: req.query.dateTo ? String(req.query.dateTo) : "",
+          // which date the range was applied to ("receipt" | "entered")
+          dateField: dateFieldOf(req.query.dateField) === "createdAt" ? "entered" : "receipt",
         },
       });
     }

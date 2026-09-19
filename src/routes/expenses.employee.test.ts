@@ -475,3 +475,117 @@ describe("5 · delete a mis-captured bill", () => {
     expect(await Expense.findById(theirs._id)).not.toBeNull();
   });
 });
+
+/* ── 5. Filter + sort by RECEIPT date vs ENTERED date ───────────────────
+ * The list has two dates: what the bill says (Expense.date) and when the
+ * line was saved (Expense.createdAt). `dateField=receipt|entered` picks which
+ * one the dateFrom/dateTo range applies to (default receipt — the behaviour
+ * the list always had); `sort=` orders by either. Both server-side, both on
+ * the IST calendar day via parseISTStart/End. createdAt is backdated through
+ * the raw collection (Mongoose timestamps ignore it on an update). */
+describe("5 · filter + sort by receipt date vs entered date", () => {
+  /** A bill dated `receipt` (YYYY-MM-DD), saved at `enteredUtc` (ISO). */
+  async function bill(who: Actor, merchant: string, receipt: string, enteredUtc: string) {
+    const e = (await as(who).post("/api/expenses", { amount: 100, merchant, date: receipt })).body.expense;
+    await Expense.collection.updateOne({ _id: new mongoose.Types.ObjectId(String(e._id)) }, { $set: { createdAt: new Date(enteredUtc) } });
+    return String(e._id);
+  }
+  const ids = (r: request.Response) => r.body.docs.map((d: any) => String(d._id));
+  const merchants = (r: request.Response) => r.body.docs.map((d: any) => d.merchant);
+
+  it("the diagnosis case: a bill dated 1 Sept but entered 3 Sept (03:46 IST) shows under entered=3 Sept, not under receipt=3 Sept", async () => {
+    const { employee } = await makeTeam();
+    const me = as(employee);
+    // 2026-09-02T22:16Z = 3 Sept 2026, 03:46 IST — the server's UTC clock still says the 2nd.
+    const a = await bill(employee, "Random Cafe", "2026-09-01", "2026-09-02T22:16:00.000Z");
+
+    const entered3 = await me.get("/api/expenses?dateField=entered&dateFrom=2026-09-03&dateTo=2026-09-03");
+    expect(entered3.status).toBe(200);
+    expect(ids(entered3)).toEqual([a]);
+
+    const receipt3 = await me.get("/api/expenses?dateField=receipt&dateFrom=2026-09-03&dateTo=2026-09-03");
+    expect(ids(receipt3)).toEqual([]);
+
+    const receipt1 = await me.get("/api/expenses?dateField=receipt&dateFrom=2026-09-01&dateTo=2026-09-01");
+    expect(ids(receipt1)).toEqual([a]);
+    // …and by entered, 1 Sept is empty: nothing was SAVED that day
+    expect(ids(await me.get("/api/expenses?dateField=entered&dateFrom=2026-09-01&dateTo=2026-09-01"))).toEqual([]);
+  });
+
+  it("the entered range is an inclusive IST calendar day on createdAt (00:10 IST is in; 23:50 IST the night before is not)", async () => {
+    const { employee } = await makeTeam();
+    const me = as(employee);
+    const night = await bill(employee, "23:50 on 2 Sept", "2026-08-30", "2026-09-02T18:20:00.000Z"); // 23:50 IST 2 Sept
+    const early = await bill(employee, "00:10 on 3 Sept", "2026-08-30", "2026-09-02T18:40:00.000Z"); // 00:10 IST 3 Sept
+    const late = await bill(employee, "23:59:59 on 3 Sept", "2026-08-30", "2026-09-03T18:29:59.000Z"); // last second of 3 Sept IST
+    const next = await bill(employee, "00:00 on 4 Sept", "2026-08-30", "2026-09-03T18:30:00.000Z"); // first instant of 4 Sept IST
+
+    const day3 = ids(await me.get("/api/expenses?dateField=entered&dateFrom=2026-09-03&dateTo=2026-09-03&sort=entered_asc"));
+    expect(day3).toEqual([early, late]);
+    expect(day3).not.toContain(night);
+    expect(day3).not.toContain(next);
+    expect(ids(await me.get("/api/expenses?dateField=entered&dateFrom=2026-09-02&dateTo=2026-09-02"))).toEqual([night]);
+    expect(ids(await me.get("/api/expenses?dateField=entered&dateFrom=2026-09-04&dateTo=2026-09-04"))).toEqual([next]);
+    // open-ended: from only / to only
+    expect(ids(await me.get("/api/expenses?dateField=entered&dateFrom=2026-09-04&sort=entered_asc"))).toEqual([next]);
+    expect(ids(await me.get("/api/expenses?dateField=entered&dateTo=2026-09-02&sort=entered_asc"))).toEqual([night]);
+    // by RECEIPT date all four are 30 Aug — the entered window never leaks into it
+    expect(ids(await me.get("/api/expenses?dateFrom=2026-08-30&dateTo=2026-08-30&sort=entered_asc"))).toEqual([night, early, late, next]);
+  });
+
+  it("no dateField (and junk) still filters the receipt date — the list's original behaviour", async () => {
+    const { employee } = await makeTeam();
+    const me = as(employee);
+    const a = await bill(employee, "A", "2026-09-01", "2026-09-05T10:00:00.000Z");
+    const b = await bill(employee, "B", "2026-09-05", "2026-09-01T10:00:00.000Z");
+    expect(ids(await me.get("/api/expenses?dateFrom=2026-09-01&dateTo=2026-09-01"))).toEqual([a]);
+    expect(ids(await me.get("/api/expenses?dateField=whatever&dateFrom=2026-09-01&dateTo=2026-09-01"))).toEqual([a]);
+    expect(ids(await me.get("/api/expenses?dateField=receipt&dateFrom=2026-09-05&dateTo=2026-09-05"))).toEqual([b]);
+    expect(ids(await me.get("/api/expenses?dateField=entered&dateFrom=2026-09-05&dateTo=2026-09-05"))).toEqual([a]);
+  });
+
+  it("sort: default is receipt date desc (createdAt tie-break); entered_desc / entered_asc order by createdAt; receipt_asc; junk → default", async () => {
+    const { employee } = await makeTeam();
+    const me = as(employee);
+    // receipt order: C (3rd) > B (2nd) > A (1st); entered order is the REVERSE: A newest, C oldest
+    const a = await bill(employee, "A", "2026-09-01", "2026-09-10T10:00:00.000Z");
+    const b = await bill(employee, "B", "2026-09-02", "2026-09-09T10:00:00.000Z");
+    const c = await bill(employee, "C", "2026-09-03", "2026-09-08T10:00:00.000Z");
+    // same receipt date as C, saved later → tie broken by createdAt desc under the default
+    const c2 = await bill(employee, "C2", "2026-09-03", "2026-09-08T12:00:00.000Z");
+
+    expect(ids(await me.get("/api/expenses"))).toEqual([c2, c, b, a]); // default
+    expect(ids(await me.get("/api/expenses?sort=receipt_desc"))).toEqual([c2, c, b, a]);
+    expect(ids(await me.get("/api/expenses?sort=receipt_asc"))).toEqual([a, b, c, c2]);
+    expect(ids(await me.get("/api/expenses?sort=entered_desc"))).toEqual([a, b, c2, c]); // most recently entered first
+    expect(ids(await me.get("/api/expenses?sort=entered_asc"))).toEqual([c, c2, b, a]);
+    expect(ids(await me.get("/api/expenses?sort=garbage"))).toEqual([c2, c, b, a]);
+    // sort + entered filter compose
+    expect(merchants(await me.get("/api/expenses?dateField=entered&dateFrom=2026-09-08&dateTo=2026-09-09&sort=entered_desc"))).toEqual(["B", "C2", "C"]);
+  });
+
+  it("export inherits dateField + sort (same builder): JSON echoes the field, CSV carries only the entered-window rows", async () => {
+    const { employee } = await makeTeam();
+    const me = as(employee);
+    await bill(employee, "Entered Third", "2026-09-01", "2026-09-02T22:16:00.000Z"); // 3 Sept 03:46 IST
+    await bill(employee, "Dated Third", "2026-09-03", "2026-09-10T10:00:00.000Z");
+
+    const json = await me.get("/api/expenses/export?format=json&dateField=entered&dateFrom=2026-09-03&dateTo=2026-09-03");
+    expect(json.status).toBe(200);
+    expect(json.body.range).toEqual({ dateFrom: "2026-09-03", dateTo: "2026-09-03", dateField: "entered" });
+    expect(json.body.rows.map((r: any) => r.merchant)).toEqual(["Entered Third"]);
+    expect(json.body.total).toBe(1);
+
+    const byReceipt = await me.get("/api/expenses/export?format=json&dateFrom=2026-09-03&dateTo=2026-09-03");
+    expect(byReceipt.body.range.dateField).toBe("receipt");
+    expect(byReceipt.body.rows.map((r: any) => r.merchant)).toEqual(["Dated Third"]);
+
+    const csv = await me.get("/api/expenses/export?format=csv&dateField=entered&dateFrom=2026-09-03&dateTo=2026-09-03");
+    expect(csv.status).toBe(200);
+    expect(csv.headers["content-type"]).toMatch(/text\/csv/);
+    const lines = csv.text.trim().split(/\r?\n/);
+    expect(lines).toHaveLength(2); // header + the one row
+    expect(lines[1]).toContain("Entered Third");
+    expect(lines[1]).not.toContain("Dated Third");
+  });
+});
