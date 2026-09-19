@@ -10,6 +10,7 @@ import LeaveRequest from "../models/LeaveRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { audit } from "../middleware/audit.js";
 import dayjs from "dayjs";
+import { todayIST, addDaysIST } from "../utils/dateIST.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const r = Router();
@@ -26,7 +27,9 @@ r.use(requireAuth);
  */
 r.post("/punch", requireWorkspace, audit("punch-toggle"), async (req: any, res) => {
   const userId = req.user.sub;
-  const date = dayjs().format("YYYY-MM-DD");
+  // The IST calendar day, never the server's (UTC) day — a punch at 00:30 IST
+  // belongs to today, not to yesterday (the attendance P0).
+  const date = todayIST();
   const geo = req.body?.geo || null;
   const workspaceId = req.workspaceObjectId;
 
@@ -50,7 +53,7 @@ r.post("/punch", requireWorkspace, audit("punch-toggle"), async (req: any, res) 
 
 r.post("/punch-in", requireWorkspace, audit("punch-in"), async (req: any, res) => {
   const userId = req.user.sub;
-  const date = dayjs().format("YYYY-MM-DD");
+  const date = todayIST();
   const geo = req.body.geo || null;
   const doc = await Attendance.findOneAndUpdate(
     { userId, date, workspaceId: req.workspaceObjectId },
@@ -62,7 +65,7 @@ r.post("/punch-in", requireWorkspace, audit("punch-in"), async (req: any, res) =
 
 r.post("/punch-out", requireWorkspace, audit("punch-out"), async (req: any, res) => {
   const userId = req.user.sub;
-  const date = dayjs().format("YYYY-MM-DD");
+  const date = todayIST();
   const geo = req.body.geo || null;
   const doc = await Attendance.findOneAndUpdate(
     { userId, date, workspaceId: req.workspaceObjectId },
@@ -90,12 +93,11 @@ r.get("/reports", requireWorkspace, async (req, res) => {
       return res.status(401).json({ message: "Unauthorised" });
     }
 
-    const today = dayjs();
-    const start = today.startOf("month");
-    const end = today; // up to today
-
-    const fromStr = start.format("YYYY-MM-DD");
-    const toStr = end.format("YYYY-MM-DD");
+    // "This month, up to today" on the IST calendar — dayjs() here read the
+    // server's UTC day, which is yesterday for the first 5½ hours of every
+    // IST day (and the previous MONTH on the 1st).
+    const toStr = todayIST();
+    const fromStr = `${toStr.slice(0, 8)}01`;
 
     const records: any[] = await Attendance.find({
       workspaceId: (req as any).workspaceObjectId,
@@ -111,7 +113,7 @@ r.get("/reports", requireWorkspace, async (req, res) => {
       }
     }
 
-    const totalDays = end.diff(start, "day") + 1;
+    const totalDays = Number(toStr.slice(8, 10)); // day-of-month of today = days elapsed incl. today
     const presentCount = presentDates.size;
     const thisMonthPercent =
       totalDays > 0 ? Math.round((presentCount / totalDays) * 100) : 0;
@@ -119,9 +121,8 @@ r.get("/reports", requireWorkspace, async (req, res) => {
     // Build simple daily chart: 100 = present, 0 = absent
     const points: { label: string; value: number }[] = [];
     for (let i = 0; i < totalDays; i++) {
-      const d = start.add(i, "day");
-      const dateStr = d.format("YYYY-MM-DD");
-      const label = d.format("DD");
+      const dateStr = addDaysIST(fromStr, i);
+      const label = dateStr.slice(8, 10);
       const value = presentDates.has(dateStr) ? 100 : 0;
       points.push({ label, value });
     }
@@ -249,14 +250,15 @@ r.post(
         return res.status(400).json({ error: "date, reason, from, and to are required" });
       }
 
-      // Validate date is not in the future
-      const today = dayjs().format("YYYY-MM-DD");
+      // Validate date is not in the future — against the IST day, so today's
+      // date submitted at 00:30 IST is not "in the future" by the UTC clock.
+      const today = todayIST();
       if (date > today) {
         return res.status(400).json({ error: "Cannot regularize a future date" });
       }
 
       // Validate date is within last 30 days
-      const cutoff = dayjs().subtract(30, "day").format("YYYY-MM-DD");
+      const cutoff = addDaysIST(today, -30);
       if (date < cutoff) {
         return res.status(400).json({ error: "Regularization allowed only for last 30 days" });
       }
