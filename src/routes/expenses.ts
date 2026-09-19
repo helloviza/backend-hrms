@@ -34,7 +34,7 @@ import { csvRow } from "../utils/exportHelpers.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
 import { extractReceipt } from "../services/receiptExtractorGemini.js";
-import { recordReceiptExtraction } from "../services/receiptExtractions.service.js";
+import { recordReceiptExtraction, findExtractionByKey } from "../services/receiptExtractions.service.js";
 import { createExpense, ExpenseInputError } from "../services/expenses.service.js";
 import { propagateReportLifecycle, logActivity } from "../services/reports.service.js";
 import {
@@ -1295,6 +1295,11 @@ router.get("/:id", async (req: any, res: any) => {
 
     const emp = doc.employeeId;
     const cat = doc.categoryId;
+    // When the receipt image itself was uploaded and read — the server-held
+    // ReceiptExtraction row's timestamp. The truest "entered our system"
+    // signal for a verifier (createdAt is when the LINE was saved, which can
+    // be minutes later). Detail view only; lists stay lean.
+    const extraction = doc.imageKey ? await findExtractionByKey(req.workspaceObjectId, String(doc.imageKey)) : null;
     res.json({
       ok: true,
       expense: {
@@ -1304,6 +1309,7 @@ router.get("/:id", async (req: any, res: any) => {
         categoryId: cat && typeof cat === "object" ? cat._id : cat,
         categoryName: categoryNameOf(doc),
         hasReceipt: !!doc.imageKey,
+        receiptExtractedAt: extraction?.extractedAt ?? null,
         ...fxView(doc, await getWorkspaceBaseCurrency(req.workspaceObjectId)),
       },
     });

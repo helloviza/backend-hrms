@@ -615,6 +615,39 @@ describe("10 · F-30 — GET /reports/:id carries the RECEIPT's read next to the
   });
 });
 
+// The verifier's dates: GET /expenses/:id carries when the receipt IMAGE was
+// read (ReceiptExtraction.extractedAt) beside createdAt (when the LINE was
+// saved) and date (what the BILL says). Detail only — lists stay lean.
+describe("11 · GET /expenses/:id carries receiptExtractedAt; the list does not", () => {
+  it("a read receipt → extractedAt is set and precedes the line's createdAt; the bill date is untouched", async () => {
+    const t = await makeWorkspace();
+    const up = await uploadBill(t.arjun, { amount: 1400 });
+    await new Promise((r) => setTimeout(r, 20));
+    const line = await saveLine(t.arjun, t.meals, 1400, { imageKey: up.imageKey, date: "2023-11-13" });
+    const one = (await as(t.arjun).get(`/api/expenses/${line._id}`)).body.expense;
+    expect(one.receiptExtractedAt).toBeTruthy();
+    expect(new Date(one.receiptExtractedAt).getTime()).toBeLessThan(new Date(one.createdAt).getTime());
+    expect(String(one.date).slice(0, 10)).toBe("2023-11-13");
+    expect(one.createdAt.slice(0, 4)).not.toBe("2023");
+    // the list endpoint does not carry it
+    const list = (await as(t.arjun).get(`/api/expenses?employeeId=${t.arjun.id}`)).body.docs;
+    const row = list.find((r: any) => String(r._id) === String(line._id));
+    expect(row).toBeTruthy();
+    expect(row.receiptExtractedAt).toBeUndefined();
+    expect(row.createdAt).toBeTruthy();
+  });
+  it("unreadable receipt still has a read time; a line with no receipt, or a never-read key, has null", async () => {
+    const t = await makeWorkspace();
+    const bad = await uploadBill(t.arjun, { amount: null });
+    const badLine = await saveLine(t.arjun, t.meals, 150, { imageKey: bad.imageKey });
+    expect((await as(t.arjun).get(`/api/expenses/${badLine._id}`)).body.expense.receiptExtractedAt).toBeTruthy();
+    const none = await saveLine(t.arjun, t.meals, 90);
+    expect((await as(t.arjun).get(`/api/expenses/${none._id}`)).body.expense.receiptExtractedAt).toBeNull();
+    const legacy = await saveLine(t.arjun, t.meals, 80, { imageKey: `hrms/expenses/${t.wsId}/${t.arjun.id}/legacy-${Date.now()}.jpg` });
+    expect((await as(t.arjun).get(`/api/expenses/${legacy._id}`)).body.expense.receiptExtractedAt).toBeNull();
+  });
+});
+
 describe("simulator", () => {
   it("'test this claim' shows the same receipt verdict the live engine would apply, without changing anything", async () => {
     const t = await makeWorkspace();
