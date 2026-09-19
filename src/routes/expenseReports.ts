@@ -32,6 +32,7 @@ import {
   submitReport,
   logActivity,
   ensureApprovalChain,
+  actorNameById,
 } from "../services/reports.service.js";
 import Report from "../models/Report.js";
 import ExpenseActivity from "../models/ExpenseActivity.js";
@@ -86,9 +87,11 @@ function employeeNameOf(u: any): string {
   return full || u.name || u.email || "";
 }
 
-/** Acting user's display name for the activity log (falls back to "System"). */
-function actorNameOf(req: any): string {
-  return employeeNameOf(req.user) || "System";
+/** The acting person's NAME for the trail (audit F-25). req.user is the JWT
+ *  payload — no first/last name — so resolve through the User document like
+ *  the submitter entries do; fall back to the token's email, never blank. */
+async function actorNameOf(req: any): Promise<string> {
+  return (await actorNameById(userIdOf(req.user))) || employeeNameOf(req.user) || "System";
 }
 
 /** Load a report by id within the tenant, WITHOUT an owner restriction —
@@ -793,7 +796,7 @@ router.delete("/:id/expenses/:eid", async (req: any, res: any) => {
       reportId: report._id as mongoose.Types.ObjectId,
       event: "expense_removed",
       actorId: ownEmployeeId(req),
-      actorName: actorNameOf(req),
+      actorName: await actorNameOf(req),
       expenseId: eid,
     });
 
@@ -910,7 +913,7 @@ router.post("/:id/withdraw", async (req: any, res: any) => {
       reportId: rid,
       event: "withdrawn",
       actorId: me,
-      actorName: actorNameOf(req),
+      actorName: await actorNameOf(req),
       actorType: "user",
       heldMs: inReviewMs,
       note: `Withdrawn before review (after ${fmtDuration(inReviewMs) || "n/a"}) — back to draft`,
@@ -1013,7 +1016,7 @@ router.post("/:id/approve", async (req: any, res: any) => {
         reportId: report._id as mongoose.Types.ObjectId,
         event: "approved",
         actorId: me,
-        actorName: actorNameOf(req),
+        actorName: await actorNameOf(req),
         actorType: "user",
         heldMs,
         note: `Approved (L${levelNo}, held ${fmtDuration(heldMs) || "n/a"}) → awaiting L${levelNo + 1}`,
@@ -1061,7 +1064,7 @@ router.post("/:id/approve", async (req: any, res: any) => {
       reportId: report._id as mongoose.Types.ObjectId,
       event: "approved",
       actorId: me,
-      actorName: actorNameOf(req),
+      actorName: await actorNameOf(req),
       actorType: "user",
       heldMs,
       note: totalLevels > 1
@@ -1139,7 +1142,7 @@ router.post("/:id/decline", async (req: any, res: any) => {
           reportId: report._id as mongoose.Types.ObjectId,
           event: "advance_detached",
           actorId: me,
-          actorName: actorNameOf(req),
+          actorName: await actorNameOf(req),
           note: `Released ${releasedCount} earmarked advance${releasedCount === 1 ? "" : "s"} (claim declined)`,
         });
       }
@@ -1152,7 +1155,7 @@ router.post("/:id/decline", async (req: any, res: any) => {
       reportId: report._id as mongoose.Types.ObjectId,
       event: "declined",
       actorId: me,
-      actorName: actorNameOf(req),
+      actorName: await actorNameOf(req),
       actorType: "user",
       heldMs,
       note: (chain.length || 1) > 1 ? `Declined (L${levelNo}): ${note}` : note,
@@ -1221,7 +1224,7 @@ router.post("/:id/request-clarification", async (req: any, res: any) => {
       reportId: report._id as mongoose.Types.ObjectId,
       event: "clarification_requested",
       actorId: me,
-      actorName: actorNameOf(req),
+      actorName: await actorNameOf(req),
       actorType: "user",
       heldMs,
       note: (chain.length || 1) > 1 ? `Clarification (L${levelNo}): ${note}` : note,
@@ -1267,7 +1270,7 @@ router.post("/:id/reroute", async (req: any, res: any) => {
       kind: "claim",
       doc: report,
       workspaceId: req.workspaceObjectId,
-      actor: { id: String(userIdOf(req.user)), name: actorNameOf(req) },
+      actor: { id: String(userIdOf(req.user)), name: await actorNameOf(req) },
     });
 
     res.json({ ...outcome, report: report.toObject() });
@@ -1350,7 +1353,7 @@ router.post("/:id/reimburse", async (req: any, res: any) => {
             advanceId: pa.advanceId,
             event: "settled",
             actorId: ownEmployeeId(req),
-            actorName: actorNameOf(req),
+            actorName: await actorNameOf(req),
             actorType: "user",
             note: `Settled ${pa.settledAmount} against ${report.ref} (→ ${pa.newStatus})`,
             details: { reportId: String(rid), claimRef: report.ref, settledAmount: pa.settledAmount, newStatus: pa.newStatus },
@@ -1371,7 +1374,7 @@ router.post("/:id/reimburse", async (req: any, res: any) => {
       reportId: rid,
       event: "reimbursed",
       actorId: ownEmployeeId(req),
-      actorName: actorNameOf(req),
+      actorName: await actorNameOf(req),
       actorType: "user",
       heldMs: sinceApprovalMs,
       note: [reimburseNote, payerWasApprover ? "Admin SoD override: payer also approved this claim" : null]

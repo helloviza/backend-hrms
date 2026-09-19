@@ -78,8 +78,12 @@ export async function logActivity(params: {
   }
 }
 
-/** Resolve a display name for an actor by id (best-effort; "" when unknown). */
-async function actorNameById(userId: mongoose.Types.ObjectId | string): Promise<string> {
+/** Resolve a display name for an actor by id (best-effort; "" when unknown).
+ *  Names come from the User document, never the JWT — the token payload has
+ *  no firstName/lastName, so anything derived from req.user alone falls
+ *  through to the email (audit F-25). employeeNameOf() still ends on the
+ *  email when a user has no name on file, so the trail is never blank. */
+export async function actorNameById(userId: mongoose.Types.ObjectId | string): Promise<string> {
   try {
     const u: any = await User.findById(userId).select("firstName lastName name email").lean();
     return employeeNameOf(u);

@@ -451,3 +451,66 @@ describe("5 · each approver on a multi-level claim is recorded the same way", (
     }
   });
 });
+
+/* ── 6. Approver / payer entries carry NAMES, like the submitter's (F-25) ── */
+describe("6 · every human actor on the trail is named the same way", () => {
+  it("approve / reimburse / decline / send-back entries show the person's name, never their email", async () => {
+    const t = await makeTeam();
+    const E = as(t.employee);
+    const line = (await E.post("/api/expenses", { amount: 900, date: TODAY, merchant: "Cab" })).body.expense;
+    const claim = (await E.post("/api/reports", { name: "names" })).body.report;
+    await E.post(`/api/reports/${claim._id}/expenses`, { expenseIds: [line._id] });
+    expect((await E.post(`/api/reports/${claim._id}/submit`)).status).toBe(200);
+    expect((await as(t.manager).post(`/api/reports/${claim._id}/request-clarification`, { decisionNote: "receipt?" })).status).toBe(200);
+    expect((await E.post(`/api/reports/${claim._id}/submit`)).status).toBe(200);
+    expect((await as(t.manager).post(`/api/reports/${claim._id}/approve`, { decisionNote: "ok" })).status).toBe(200);
+    expect((await as(t.finance).post(`/api/reports/${claim._id}/reimburse`)).status).toBe(200);
+
+    const trail = await trailOf(t.employee, claim._id);
+    const by = (event: string) => trail.filter((a) => a.event === event);
+    expect(by("submitted")[0].actorName).toBe("Arjun T");
+    expect(by("clarification_requested")[0].actorName).toBe("Meera T");
+    expect(by("approved")[0].actorName).toBe("Meera T");
+    expect(by("reimbursed")[0].actorName).toBe("Farah T");
+    // No entry anywhere on the trail names a person by email.
+    for (const a of trail) expect(a.actorName, `${a.event} actorName`).not.toMatch(/@/);
+
+    // Decline path too.
+    const line2 = (await E.post("/api/expenses", { amount: 100, date: TODAY })).body.expense;
+    const c2 = (await E.post("/api/reports", { name: "declined" })).body.report;
+    await E.post(`/api/reports/${c2._id}/expenses`, { expenseIds: [line2._id] });
+    await E.post(`/api/reports/${c2._id}/submit`);
+    expect((await as(t.manager).post(`/api/reports/${c2._id}/decline`, { decisionNote: "no" })).status).toBe(200);
+    expect((await trailOf(t.employee, c2._id)).find((a) => a.event === "declined").actorName).toBe("Meera T");
+  });
+
+  it("advances: approver and payer entries are named too", async () => {
+    const t = await makeTeam();
+    const adv = (await as(t.employee).post("/api/expense-advances", { amount: 500, purpose: "kit" })).body.advance;
+    expect((await as(t.manager).post(`/api/expense-advances/${adv._id}/approve`)).status).toBe(200);
+    expect((await as(t.finance).post(`/api/expense-advances/${adv._id}/disburse`)).status).toBe(200);
+    const activity: any[] = (await as(t.employee).get(`/api/expense-advances/${adv._id}`)).body.activity;
+    const names = Object.fromEntries(activity.map((a) => [a.event, a.actorName]));
+    expect(names.approved).toBe("Meera T");
+    expect(names.disbursed).toBe("Farah T");
+    for (const a of activity) if (a.actorType === "user") expect(a.actorName, a.event).not.toMatch(/@/);
+  });
+
+  it("a person with no name on file falls back to their email — never a blank", async () => {
+    const t = await makeTeam();
+    // A manager-equivalent approver whose User row has no first/last/name.
+    seq++;
+    const bare = await User.create({ email: `bare-${seq}-${Date.now()}@test.local`, passwordHash: "x", roles: ["EMPLOYEE"], workspaceId: t.wsId, status: "ACTIVE" });
+    await upsertGrant({ workspaceId: t.wsId, userId: String(bare._id), patch: { expenseAdmin: true } });
+    const B: Actor = { id: String(bare._id), email: bare.email, roles: ["EMPLOYEE"], workspaceId: t.wsId, name: "" };
+    const E = as(t.employee);
+    const line = (await E.post("/api/expenses", { amount: 200, date: TODAY })).body.expense;
+    const claim = (await E.post("/api/reports", { name: "bare" })).body.report;
+    await E.post(`/api/reports/${claim._id}/expenses`, { expenseIds: [line._id] });
+    await E.post(`/api/reports/${claim._id}/submit`);
+    expect((await as(B).post(`/api/reports/${claim._id}/approve`)).status).toBe(200);
+    const approved = (await trailOf(t.employee, claim._id)).find((a) => a.event === "approved");
+    expect(approved.actorName).toBe(bare.email);
+    expect(approved.actorName.trim()).not.toBe("");
+  });
+});
