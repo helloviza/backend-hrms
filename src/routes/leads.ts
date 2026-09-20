@@ -26,6 +26,7 @@ import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import { buildOwnerStatusReport } from "../services/ownerStatusReport.js";
 import { leadScope, leadMatch, opportunityMatch, activityMatch, ownsLead, canManageOthers, isAll, findVisibleLead, redactCompanyCheck } from "../services/crmScope.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
+import { createLead } from "../services/leads.service.js";
 import logger from "../utils/logger.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 
@@ -671,57 +672,20 @@ router.post("/", async (req, res) => {
       ? new mongoose.Types.ObjectId(userId(user))
       : undefined;
 
-    // Anchor on a shared company (resolve-or-create) for company-type leads with
-    // a non-blank name. companyId is set server-side, never trusted from the body.
-    const leadType = body.type === "individual" ? "individual" : "company";
-    let companyId: mongoose.Types.ObjectId | null = null;
-    if (leadType === "company" && body.companyName && String(body.companyName).trim()) {
-      const co = await resolveOrCreateCompany(
-        {
-          name: body.companyName,
-          industry: body.industry,
-          companySize: body.companySize,
-          location: body.location,
-          website: body.website,
-          gstin: body.gstin,
-        },
-        createdById
-      );
-      companyId = co?._id ?? null;
-    }
-
-    const lead = await Lead.create({
-      ...body,
+    // The shared tail — company anchor, Lead.create({ ...body, … }), note
+    // activity, lead.created automation — lives in services/leads.service.ts
+    // so PlumConnect creates leads through the same path (Slice 3a). The
+    // automation handle it returns is ignored here on purpose: the route
+    // never waited on the automation and still does not.
+    const { lead } = await createLead({
+      body,
       assignedTo: mongoose.isValidObjectId(assignedToId)
         ? new mongoose.Types.ObjectId(String(assignedToId))
         : undefined,
       assignedToName,
-      companyId,
       createdBy: createdById,
+      noteAuthorName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
     });
-
-    if (body.notes) {
-      await LeadActivity.create({
-        leadId: lead._id,
-        type: "note" as ActivityType,
-        note: String(body.notes),
-        createdBy: lead.createdBy,
-        createdByName: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System",
-      });
-    }
-
-    // Task automation hook — fire-and-forget, never breaks lead creation
-    triggerTaskAutomation("lead.created", {
-      workspaceId: SYSTEM_WORKSPACE_ID,
-      entityType: "LEAD",
-      entityId: lead._id as mongoose.Types.ObjectId,
-      entityRef: lead.leadCode,
-      ownerId: lead.assignedTo,
-      variables: {
-        leadName: lead.contactName || lead.companyName || "Lead",
-        ownerName: lead.assignedToName || "",
-      },
-    }).catch(() => {});
 
     return res.status(201).json({ lead });
   } catch (err) {
