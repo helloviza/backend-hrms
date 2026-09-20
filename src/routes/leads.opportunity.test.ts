@@ -51,7 +51,24 @@ function flag(on: boolean) {
   if (on) process.env[CRM_V2_OPPORTUNITY_ENV] = "true";
   else delete process.env[CRM_V2_OPPORTUNITY_ENV];
 }
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/**
+ * Task automation is fire-and-forget on the route (`triggerTaskAutomation(...)
+ * .catch(() => {})`, routes/leads.ts), so a Task row lands some milliseconds
+ * AFTER the HTTP response — 15–139 ms measured under a parallel vitest batch,
+ * which is why a fixed 50 ms sleep flaked. Poll until the row the assertion
+ * needs exists (bounded), instead of guessing a delay. Waiting for our own
+ * task also drains the automation before the next test's beforeEach wipes
+ * the collection, so a late row can never bleed into the next case.
+ */
+async function waitForTasks(pred: (rows: any[]) => boolean, timeoutMs = 5_000): Promise<any[]> {
+  const start = Date.now();
+  let rows: any[] = [];
+  for (;;) {
+    rows = await Task.find({}).lean();
+    if (pred(rows) || Date.now() - start > timeoutMs) return rows;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
 
 beforeAll(async () => {
   mongod = await MongoMemoryServer.create();
@@ -90,7 +107,7 @@ describe("flag OFF — byte-for-byte legacy", () => {
     expect(act).toMatchObject({ fromStage: "new", toStage: "proposal_sent" });
     expect(act).not.toHaveProperty("subject");
     expect(act).not.toHaveProperty("toStatus");
-    await sleep(50);
+    await waitForTasks((rows) => rows.some((r) => String(r.linkedId) === String(lead._id)));
     const task = await Task.findOne({ linkedId: lead._id }).lean();
     expect(task?.autoTriggerKey).toBe("lead.stage_proposal");
     expect(task?.linkedType).toBe("LEAD");
@@ -136,7 +153,7 @@ describe("flag ON — Lead + Opportunity", () => {
     expect(leadRow).toMatchObject({ fromStage: "new", toStage: "proposal_sent", fromStatus: "NEW", toStatus: "CONVERTED" });
     expect(oppRow).toMatchObject({ fromStage: "", toStage: "proposal" });
 
-    await sleep(50);
+    await waitForTasks((rows) => rows.some((r) => String(r.linkedId) === String(opp!._id)));
     const task = await Task.findOne({ linkedId: opp!._id }).lean();
     expect(task).not.toBeNull();
     expect(task!.autoTriggerKey).toBe("opportunity.stage_proposal");
@@ -153,8 +170,7 @@ describe("flag ON — Lead + Opportunity", () => {
     await TaskAutomation.create({ workspaceId: SYSTEM_WORKSPACE_ID, triggerKey: "opportunity.stage_proposal", label: "new", entityType: "OPPORTUNITY", titleTemplate: "NEW {{leadName}}", dueOffsetMinutes: 10, priority: "MEDIUM", assigneeRule: { type: "OWNER" }, tags: [] });
     const lead = await createLead();
     await request(app()).put(`/api/leads/${lead._id}/stage`).send({ stage: "proposal_sent" });
-    await sleep(50);
-    const tasks = await Task.find({}).lean();
+    const tasks = await waitForTasks((rows) => rows.some((r) => r.title === "NEW Priya"));
     expect(tasks).toHaveLength(1);
     expect(tasks[0].title).toBe("NEW Priya");
   });
@@ -203,8 +219,7 @@ describe("flag ON — Lead + Opportunity", () => {
     expect(raw!.status).toBe("CONVERTED");
     expect(String(opp!.primaryContactId)).toBe(String(raw!.convertedToContactId));
     expect(String(raw!.opportunityId)).toBe(String(opp!._id));
-    await sleep(50);
-    const tasks = await Task.find({}).lean();
+    const tasks = await waitForTasks((rows) => rows.some((r) => r.autoTriggerKey === "opportunity.won"));
     expect(tasks).toHaveLength(1);
     expect(tasks[0].autoTriggerKey).toBe("opportunity.won");
     expect(String(tasks[0].linkedId)).toBe(String(opp!._id));
