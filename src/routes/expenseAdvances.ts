@@ -948,11 +948,17 @@ router.get("/:id", async (req: any, res: any) => {
       return res.status(404).json({ error: "Advance not found" });
     }
 
-    // Resolve requester + current approver display names.
-    const [requester, approver] = await Promise.all([
+    // Resolve requester + current approver + disburser display names. The
+    // disburser is a FINANCE user, never the approver — the UI's "Disbursed by"
+    // callout must name whoever actually paid it out (disbursedBy is stamped
+    // by POST /:id/disburse).
+    const [requester, approver, disburser] = await Promise.all([
       User.findById(advance.requesterId).select("firstName lastName email name").lean(),
       advance.approverId
         ? User.findById(advance.approverId).select("firstName lastName email name").lean()
+        : Promise.resolve(null),
+      advance.disbursedBy
+        ? User.findById(advance.disbursedBy).select("firstName lastName email name").lean()
         : Promise.resolve(null),
     ]);
 
@@ -1009,6 +1015,7 @@ router.get("/:id", async (req: any, res: any) => {
       ...advance.toObject(),
       requesterName: employeeNameOf(requester),
       approverName: employeeNameOf(approver),
+      disbursedByName: disburser ? employeeNameOf(disburser) : "",
       approvalChain,
       appliedToClaims,
       viewerIsOwner: isOwner,
@@ -1421,12 +1428,13 @@ router.post("/:id/disburse", async (req: any, res: any) => {
     await advance.save();
 
     const sinceApprovalMs = msBetween(advance.approvedAt, advance.disbursedAt);
+    const disbursedByName = await actorNameOf(req);
     await logAdvanceActivity({
       workspaceId: req.workspaceObjectId,
       advanceId: advance._id as mongoose.Types.ObjectId,
       event: "disbursed",
       actorId: me,
-      actorName: await actorNameOf(req),
+      actorName: disbursedByName,
       actorType: "user",
       heldMs: sinceApprovalMs,
       note: isAdmin(req) && wasApprover ? "Disbursed (admin SoD override)" : disbursementRef || null,
@@ -1442,7 +1450,9 @@ router.post("/:id/disburse", async (req: any, res: any) => {
       },
     });
 
-    res.json({ ok: true, advance: advance.toObject() });
+    // Same enrichment GET /:id returns, so a caller that renders the response
+    // directly shows the disburser's name without a refetch.
+    res.json({ ok: true, advance: { ...advance.toObject(), disbursedByName } });
   } catch (err: any) {
     console.error("[Advances disburse]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to disburse advance" });
