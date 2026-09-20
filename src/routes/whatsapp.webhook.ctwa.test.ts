@@ -4,7 +4,8 @@
 // verbatim referral + the inbound Message → exactly one lead.created. Then
 // dedup on the same phone, the assignee fallback, the two Slice-2 routes
 // that must be unchanged, and flag OFF = byte-identical Slice-2 behaviour.
-// Nothing is sent: the Cloud service is not mocked and never called.
+// Every sender is a spy; since Slice 3c the bot's welcome is the one send a
+// first-touch lead produces (asserted), and nothing else here sends.
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import mongoose from "mongoose";
 import { MongoMemoryServer } from "mongodb-memory-server";
@@ -174,10 +175,12 @@ describe("E2E-A capture half — stranger taps a CTWA ad", () => {
     await H.trigger.mock.results[0].value;
     expect(await Task.countDocuments({})).toBe(1);
 
-    // no expense side-effects, no outbound
+    // no expense side-effects; the only outbound is the bot's welcome (Slice 3c)
     expect(await ExpenseReply.countDocuments({})).toBe(0);
     expect(await ExpenseCapture.countDocuments({})).toBe(0);
-    expect(H.send).not.toHaveBeenCalled();
+    expect(H.send).toHaveBeenCalledTimes(1);
+    expect(H.send.mock.calls[0][0]).toBe(STRANGER);
+    expect(String(H.send.mock.calls[0][1])).toContain("what's your name?");
   });
 
   it("dedup: the same phone tapping a second ad → NO second Lead; touch recorded; first attribution intact; leadIds still 1", async () => {
@@ -205,7 +208,9 @@ describe("E2E-A capture half — stranger taps a CTWA ad", () => {
     expect(acts.filter((a) => a.note.includes("repeat touch"))).toHaveLength(1);
     expect((await Contact.findOne({ phone: STRANGER }).lean())!.refs.leadIds).toHaveLength(1);
     expect(H.trigger).toHaveBeenCalledTimes(1); // lead.created fired once, on the first touch only
-    expect(H.send).not.toHaveBeenCalled();
+    // Slice 3c: the welcome on the first touch, then the bot took "continue my
+    // Bali trip" as the name answer and asked for the destination.
+    expect(H.send).toHaveBeenCalledTimes(2);
   });
 
   it("assignee fallback: config unset → first admin; config set → that user", async () => {

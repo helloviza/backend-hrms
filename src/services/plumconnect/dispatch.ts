@@ -17,6 +17,9 @@
 //   4. SUPPORT          everything else                  → support conversation,
 //                       OPEN, no expense row, no expense-bot reply.
 //                       THIS REPLACES the legacy "default to expense".
+//                       Slice 3c refines this bucket, in order: a pending
+//                       consent answer → an active bot turn → a receipt from
+//                       a soft-matched employee (consent prompt) → support.
 //
 // Hard invariant (plan §9): the chain's enqueuers are called through
 // enqueueForChain(), which refuses without a hard identity. Soft matches
@@ -26,8 +29,9 @@
 // as it does for the legacy path; this file decides WHO reaches the
 // enqueue, nothing more.
 //
-// Nothing here sends. The consent prompt for soft-matched employees and the
-// qualification bot are Slice 3c; human replies are Slice 4.
+// Slice 3c: the bot and the consent flow send through sendAndPersist()
+// (services/plumconnect/send.ts) — the only outbound path here. Human
+// replies are Slice 4.
 
 import type mongoose from "mongoose";
 import { toCanonical } from "../../utils/phone.js";
@@ -35,7 +39,17 @@ import { resolveIdentity, type IdentityResolution } from "./resolveIdentity.js";
 import { readExpenseInFlow, type ExpenseInFlow } from "./expenseInFlow.js";
 import { upsertContact, openOrGetConversation, appendInbound } from "./conversationStore.js";
 import { enqueueExpenseReply, enqueueExpenseButton, enqueueExpenseCapture, type EnqueueResult } from "./enqueueExpense.js";
-import { captureHolidayLead, type CaptureHolidayLeadResult } from "./holidayLead.js";
+import { captureHolidayLead, parseReferral, type CaptureHolidayLeadResult } from "./holidayLead.js";
+import { startBot, handleBotTurn, botIsActive, type BotTurnOutcome } from "./bot.js";
+import {
+  isExpenseShaped,
+  parseConsentAnswer,
+  consentPending,
+  promptForConsent,
+  recordConsentAnswer,
+  type ConsentPromptOutcome,
+  type ConsentAnswerOutcome,
+} from "./consent.js";
 import type { ConversationKind } from "../../models/plumconnect/Conversation.js";
 import { whatsappLogger } from "../../utils/logger.js";
 
@@ -102,7 +116,15 @@ export function buildInboundEnvelope(message: any, value: any, phoneNumberId: st
 
 /* ───────────────────────────── outcome ───────────────────────────── */
 
-export type DispatchRoute = "expense_inflow" | "lead_referral" | "expense_verified" | "support";
+export type DispatchRoute =
+  | "expense_inflow"
+  | "lead_referral"
+  | "expense_verified"
+  | "support"
+  // Slice 3c — all three are refinements of what Slice 2 called "support":
+  | "bot" // the qualification bot answered on an active lead thread
+  | "consent_prompt" // soft-matched employee sent a receipt → bind prompt, nothing enqueued
+  | "consent_answer"; // soft-matched employee answered YES/NO to the bind prompt
 
 export type DispatchOutcome =
   | {
@@ -115,6 +137,9 @@ export type DispatchOutcome =
       enqueue?: EnqueueResult & { collection: "ExpenseReply" | "ExpenseCapture" } | { enqueued: false; collection: null; reason: string };
       /** Present on lead_referral for a non-employee: what the holiday-lead adapter did. */
       lead?: CaptureHolidayLeadResult;
+      /** Slice 3c: what the bot / consent flow did on this turn. */
+      bot?: BotTurnOutcome;
+      consent?: ConsentPromptOutcome | ConsentAnswerOutcome;
       inFlow: ExpenseInFlow;
     }
   | { route: "duplicate"; canonical: string; messageId: string }
@@ -267,7 +292,49 @@ export async function dispatchInbound(env: InboundEnvelope, now: Date = new Date
       messageId: env.messageId,
       now,
     });
+    // Slice 3c: a brand-new lead gets the bot's first question; a repeat
+    // touch on a thread where the bot is mid-flow treats the text as the
+    // answer it was waiting for.
+    if (lead.touch === "first") {
+      await startBot({ conversation, to: canonical, leadId: lead.leadId, now }, parseReferral(env.referral).headline);
+      return { route, ...base, lead };
+    }
+    if (botIsActive(conversation)) {
+      const bot = await handleBotTurn({ conversation, to: canonical, leadId: lead.leadId, now }, env.text);
+      return { route, ...base, lead, bot };
+    }
     return { route, ...base, lead };
+  }
+
+  // ── Slice 3c refinements of the support bucket ───────────────────────────
+  // (a) A pending consent answer from a soft-matched employee.
+  if (identity.identityState === "soft_employee" && consentPending(contact.consent)) {
+    const answer = parseConsentAnswer(env.text, env.buttonId);
+    if (answer) {
+      const consent = await recordConsentAnswer(
+        { contactId: contact._id as mongoose.Types.ObjectId, conversationId: conversation._id as mongoose.Types.ObjectId, canonical, identity, consent: contact.consent, now },
+        answer,
+      );
+      return { route: "consent_answer", ...base, consent };
+    }
+  }
+  // (b) The qualification bot is mid-flow on this (non-employee) thread.
+  if (conversation.leadId && botIsActive(conversation)) {
+    const bot = await handleBotTurn({ conversation, to: canonical, leadId: conversation.leadId as mongoose.Types.ObjectId, now }, env.text);
+    if (bot.handled) return { route: "bot", ...base, bot };
+    // not handled (assigned → stopped, or no text) → falls through to support below
+  }
+  // (c) A soft-matched employee sent a receipt: ask before ever enqueuing.
+  if (identity.identityState === "soft_employee" && isExpenseShaped(env.type) && !env.referral) {
+    const consent = await promptForConsent({
+      contactId: contact._id as mongoose.Types.ObjectId,
+      conversationId: conversation._id as mongoose.Types.ObjectId,
+      canonical,
+      identity,
+      consent: contact.consent,
+      now,
+    });
+    return { route: "consent_prompt", ...base, consent };
   }
 
   // SUPPORT — the killed default. No enqueue, no reply; the inbox (Slice 4)

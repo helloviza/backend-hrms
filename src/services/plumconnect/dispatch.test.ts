@@ -21,6 +21,10 @@ const H = vi.hoisted(() => ({
   enqueueExpenseButton: vi.fn(),
   enqueueExpenseCapture: vi.fn(),
   captureHolidayLead: vi.fn(),
+  startBot: vi.fn(),
+  handleBotTurn: vi.fn(),
+  promptForConsent: vi.fn(),
+  recordConsentAnswer: vi.fn(),
 }));
 
 vi.mock("./resolveIdentity.js", () => ({ resolveIdentity: H.resolveIdentity }));
@@ -30,7 +34,20 @@ vi.mock("./enqueueExpense.js", () => ({
   enqueueExpenseButton: H.enqueueExpenseButton,
   enqueueExpenseCapture: H.enqueueExpenseCapture,
 }));
-vi.mock("./holidayLead.js", () => ({ captureHolidayLead: H.captureHolidayLead }));
+vi.mock("./holidayLead.js", async (importOriginal) => {
+  const real: any = await importOriginal();
+  return { ...real, captureHolidayLead: H.captureHolidayLead };
+});
+// Slice 3c collaborators are unit-tested on their own; here they are spies so
+// this file keeps proving ROUTING only.
+vi.mock("./bot.js", async (importOriginal) => {
+  const real: any = await importOriginal();
+  return { ...real, startBot: H.startBot, handleBotTurn: H.handleBotTurn };
+});
+vi.mock("./consent.js", async (importOriginal) => {
+  const real: any = await importOriginal();
+  return { ...real, promptForConsent: H.promptForConsent, recordConsentAnswer: H.recordConsentAnswer };
+});
 vi.mock("../../utils/logger.js", () => ({
   whatsappLogger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -111,6 +128,10 @@ beforeEach(async () => {
   H.enqueueExpenseButton.mockResolvedValue({ enqueued: true });
   H.enqueueExpenseCapture.mockResolvedValue({ enqueued: true });
   H.captureHolidayLead.mockImplementation(async (input: any) => ({ touch: "first", created: true, leadId: new mongoose.Types.ObjectId(), assignedTo: null, _conversationId: input.conversation._id }));
+  H.startBot.mockResolvedValue(undefined);
+  H.handleBotTurn.mockResolvedValue({ handled: true, step: "ask_destination", advanced: true, stopped: null });
+  H.promptForConsent.mockResolvedValue({ prompted: true });
+  H.recordConsentAnswer.mockResolvedValue({ answer: "no", bound: false });
 });
 
 const anyEnqueue = () =>
@@ -193,6 +214,9 @@ describe("dispatchInbound — precedence", () => {
     expect(String(H.captureHolidayLead.mock.calls[0][0].conversation._id)).toBe(String(conv!._id));
     expect(H.captureHolidayLead.mock.calls[0][0]).toMatchObject({ canonical: WA, profileName: "Priya", referralRaw: REFERRAL });
     expect((out as any).lead).toMatchObject({ touch: "first", created: true });
+    // Slice 3c: a first-touch lead starts the bot; the adapter's headline is passed through
+    expect(H.startBot).toHaveBeenCalledTimes(1);
+    expect(H.startBot.mock.calls[0][1]).toBe("Bali");
   });
 
   it("2'. referral + hard identity (employee clicks an ad) → lead thread, not expense, and NO Lead row (adapter not called)", async () => {
@@ -264,14 +288,23 @@ describe("dispatchInbound — precedence", () => {
     expect(String(msg!.conversationId)).toBe(String(conv!._id));
   });
 
-  it("4'. SOFT-matched sender (employee by phone, no waId) → support + label only; never enqueued, no refs.userId", async () => {
+  it("4'. SOFT-matched sender (employee by phone, no waId) sending a RECEIPT → consent prompt (3c); never enqueued, no refs.userId", async () => {
     H.resolveIdentity.mockResolvedValue(soft());
     const out = await dispatchInbound(env({ type: "image", media: IMAGE }), NOW);
-    expect(out.route).toBe("support");
+    expect(out.route).toBe("consent_prompt");
+    expect(H.promptForConsent).toHaveBeenCalledTimes(1);
     expect(anyEnqueue()).toBe(0);
     const contact = await Contact.findOne({}).lean();
     expect(contact!.identityState).toBe("soft_employee");
     expect(contact!.refs.userId).toBeNull(); // a reference is written only from a HARD identity
+  });
+
+  it("4''. SOFT-matched sender saying 'hi' → still plain support (consent is the receipt case only)", async () => {
+    H.resolveIdentity.mockResolvedValue(soft());
+    const out = await dispatchInbound(env({ text: "hi" }), NOW);
+    expect(out.route).toBe("support");
+    expect(H.promptForConsent).not.toHaveBeenCalled();
+    expect(anyEnqueue()).toBe(0);
   });
 
   it("unsupported Meta types from a stranger are still recorded as support (location, sticker, reaction)", async () => {

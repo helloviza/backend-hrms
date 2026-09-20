@@ -29,12 +29,16 @@ export type ConversationKind = (typeof CONVERSATION_KINDS)[number];
 export const CONVERSATION_STATUSES = ["OPEN", "PENDING", "RESOLVED"] as const;
 export type ConversationStatus = (typeof CONVERSATION_STATUSES)[number];
 
-export const BOT_STOP_REASONS = ["human", "complete", "timeout"] as const;
+// "unparsed" — Slice 3c: the bot re-asked once and still could not parse the
+// answer; it stops and leaves the step for a human.
+export const BOT_STOP_REASONS = ["human", "complete", "timeout", "unparsed"] as const;
 export type BotStopReason = (typeof BOT_STOP_REASONS)[number];
 
 export interface IPlumConnectConversationBot {
   active: boolean;
   step: string;
+  /** Re-asks on the CURRENT step (Slice 3c; reset when the step advances). */
+  retries: number;
   stoppedBy?: BotStopReason | null;
   stoppedAt?: Date | null;
 }
@@ -62,6 +66,7 @@ const BotSchema = new Schema<IPlumConnectConversationBot>(
   {
     active: { type: Boolean, default: false },
     step: { type: String, trim: true, default: "" },
+    retries: { type: Number, default: 0 },
     stoppedBy: { type: String, enum: [...BOT_STOP_REASONS, null], default: null },
     stoppedAt: { type: Date, default: null },
   },

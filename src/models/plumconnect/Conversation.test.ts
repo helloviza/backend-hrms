@@ -63,7 +63,7 @@ describe("PlumConnectConversation", () => {
     expect(row!.assignedTo).toBeNull();
     expect(row!.leadId).toBeNull();
     expect(row!.referralRaw).toBeNull();
-    expect(row!.bot).toEqual({ active: false, step: "", stoppedBy: null, stoppedAt: null });
+    expect(row!.bot).toEqual({ active: false, step: "", retries: 0, stoppedBy: null, stoppedAt: null });
     expect(row!.lastInboundAt).toBeNull();
     expect(row!.lastOutboundAt).toBeNull();
     expect(row!.lastMessageAt).toBeNull();
@@ -123,7 +123,7 @@ describe("PlumConnectConversation", () => {
       { $set: { "bot.active": false, "bot.stoppedBy": "human", "bot.stoppedAt": stoppedAt } },
     );
     const row = await Conversation.findById(created._id).lean();
-    expect(row!.bot).toEqual({ active: false, step: "ask_destination", stoppedBy: "human", stoppedAt });
+    expect(row!.bot).toEqual({ active: false, step: "ask_destination", retries: 0, stoppedBy: "human", stoppedAt });
 
     await expect(
       Conversation.create({ contactId: contact._id, bot: { active: false, step: "", stoppedBy: "agent" as any } }),
