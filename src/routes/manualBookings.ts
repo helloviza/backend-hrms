@@ -30,7 +30,13 @@ import { env } from "../config/env.js";
 import { resolveActorFromRequest } from "../services/location.service.js";
 import { maskTailId } from "../utils/piiMask.js";
 import ExtractedDocument from "../models/ExtractedDocument.js";
-import { enqueueExtraction } from "../services/documentExtraction.service.js";
+import {
+  enqueueExtraction,
+  extractDocument,
+  isExtractableMime,
+  MAX_EXTRACTABLE_BYTES,
+} from "../services/documentExtraction.service.js";
+import { buildFlightAutofill } from "../services/flightAutofill.js";
 import type { VoucherType } from "../types/index.js";
 
 const router = express.Router();
@@ -1745,6 +1751,83 @@ router.get("/creators", requirePermission("manualBookings", "READ"), async (req:
     res.status(500).json({ error: err.message });
   }
 });
+
+/* ── Extraction PREVIEW for a staged file (create form) ──────────────
+ *
+ * POST /api/admin/manual-bookings/extract-preview   (multipart, field "file")
+ *
+ * The create form stages its attachments client-side and only uploads them
+ * once the booking exists (see the sequencing note on POST /). The normal
+ * extraction is queued on that upload and run later by the sweep worker —
+ * far too late to fill the form the operator is looking at now. This route
+ * is the synchronous twin, same shape as /api/expenses/upload for Spendbox:
+ * read the bytes, run the extractor INLINE, hand back the form-shaped fill.
+ *
+ * Deliberately stateless: NOTHING is written — not to S3, not to
+ * ExtractedDocument. The file is still uploaded on Save through
+ * POST /:id/attachments exactly as before, and the worker extracts it again
+ * for the review table (one repeat model call per flight ticket, accepted
+ * for now to keep the request path free of any side effect a cancelled form
+ * would have to undo).
+ *
+ * NEVER BLOCKS: an unreadable document, a non-flight document, an oversize
+ * file — all return 200 with `extracted:false` (+ a reason) so the form
+ * simply stays manual. Only a missing/invalid file or the multer allowlist
+ * is a 4xx, and only a broken server is a 500.
+ *
+ * FLIGHT ONLY (Step 2): a hotel voucher is reported as docType "hotel" with
+ * flight:null; the form says so and leaves the fields alone.
+ */
+router.post(
+  "/extract-preview",
+  requirePermission("manualBookings", "READ"),
+  attachmentUpload.single("file"),
+  async (req: any, res: any) => {
+    try {
+      const file = req.file;
+      if (!file || !file.buffer) {
+        return res.status(400).json({ error: "File is required" });
+      }
+      if (!isExtractableMime(file.mimetype)) {
+        return res.json({ ok: true, extracted: false, extractionError: "Not an extractable file type" });
+      }
+      if (file.buffer.length > MAX_EXTRACTABLE_BYTES) {
+        return res.json({
+          ok: true,
+          extracted: false,
+          extractionError: `File is ${(file.buffer.length / 1048576).toFixed(1)} MB; reading is capped at ${(
+            MAX_EXTRACTABLE_BYTES / 1048576
+          ).toFixed(0)} MB. Fill the details manually.`,
+        });
+      }
+
+      let result;
+      try {
+        result = await extractDocument({ buffer: file.buffer, mimeType: file.mimetype, typeHint: "flight" });
+      } catch (exErr: any) {
+        console.warn("[ManualBookings extract-preview] extraction failed", exErr?.message);
+        return res.json({
+          ok: true,
+          extracted: false,
+          extractionError: "We couldn't read this document automatically. Fill the details manually.",
+        });
+      }
+
+      const flight = result.docType === "flight" ? buildFlightAutofill(result.voucher) : null;
+
+      res.json({
+        ok: true,
+        extracted: true,
+        docType: result.docType,
+        modelUsed: result.modelUsed,
+        flight,
+      });
+    } catch (err: any) {
+      console.error("[ManualBookings extract-preview]", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 // GET /api/admin/manual-bookings/:id
 router.get("/:id", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
