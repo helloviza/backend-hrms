@@ -1,9 +1,14 @@
 // apps/backend/src/routes/whatsapp.webhook.ts
 import { Router, type Request, type Response } from "express";
-import ExpenseCapture from "../models/ExpenseCapture.js";
-import ExpenseReply from "../models/ExpenseReply.js";
 import { verifyMetaSignature } from "../services/whatsappCloud.service.js";
 import { dispatchArrivalInbound, hasActiveArrivalSession } from "../services/arrivalInbound.js";
+import {
+  enqueueExpenseReply,
+  enqueueExpenseButton,
+  enqueueExpenseCapture,
+} from "../services/plumconnect/enqueueExpense.js";
+import { isPlumConnectEnabled } from "../config/plumconnect.js";
+import { dispatchInbound, buildInboundEnvelope } from "../services/plumconnect/dispatch.js";
 import { env } from "../config/env.js";
 import { whatsappLogger } from "../utils/logger.js";
 
@@ -98,6 +103,25 @@ router.post("/webhook", async (req: Request, res: Response) => {
               }
             }
 
+            // ── PlumConnect (Slice 2) — context-first dispatcher ────────────
+            // ONLY when PLUMCONNECT_ENABLED=true. Off (the default), control
+            // falls through to the legacy expense path below, byte-for-byte.
+            // Arrival messages never reach here (they `continue` above).
+            // Errors are logged and the message is acked — same posture as
+            // the legacy path; there is deliberately no fallback into the
+            // expense default for a message the dispatcher failed on.
+            if (isPlumConnectEnabled()) {
+              try {
+                await dispatchInbound(buildInboundEnvelope(message, value, phoneNumberId));
+              } catch (err) {
+                whatsappLogger.error("PlumConnect dispatch failed", {
+                  messageId: message?.id,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+              continue;
+            }
+
             // ── TEXT replies (confirm / correct / cancel) ───────────────────
             // Enqueue idempotently; the worker matches them to the pending
             // capture by waId. We never handle replies synchronously here so
@@ -111,21 +135,9 @@ router.post("/webhook", async (req: Request, res: Response) => {
                 continue;
               }
 
-              const replyResult = await ExpenseReply.updateOne(
-                { messageId },
-                {
-                  $setOnInsert: {
-                    messageId,
-                    waId,
-                    phoneNumberId,
-                    text,
-                    status: "queued",
-                  },
-                },
-                { upsert: true },
-              );
+              const replyResult = await enqueueExpenseReply({ messageId, waId, phoneNumberId, text });
 
-              if (replyResult.upsertedCount > 0) {
+              if (replyResult.enqueued) {
                 whatsappLogger.info("Text reply queued", { messageId, waId });
               } else {
                 whatsappLogger.info("Duplicate text webhook — already queued", { messageId });
@@ -152,13 +164,9 @@ router.post("/webhook", async (req: Request, res: Response) => {
                 continue;
               }
 
-              const interResult = await ExpenseReply.updateOne(
-                { messageId },
-                { $setOnInsert: { messageId, waId, phoneNumberId, text: btnId, status: "queued" } },
-                { upsert: true },
-              );
+              const interResult = await enqueueExpenseButton({ messageId, waId, phoneNumberId, buttonId: btnId });
 
-              if (interResult.upsertedCount > 0) {
+              if (interResult.enqueued) {
                 whatsappLogger.info("Button reply queued", { messageId, waId, btnId });
               } else {
                 whatsappLogger.info("Duplicate interactive webhook — already queued", { messageId });
@@ -180,26 +188,18 @@ router.post("/webhook", async (req: Request, res: Response) => {
             }
 
             // Idempotent enqueue: insert once per WhatsApp messageId.
-            const result = await ExpenseCapture.updateOne(
-              { messageId },
-              {
-                $setOnInsert: {
-                  messageId,
-                  mediaId,
-                  mime,
-                  mediaType: type,
-                  filename: media?.filename,
-                  caption: media?.caption,
-                  waId,
-                  phoneNumberId,
-                  sourceChannel: "whatsapp",
-                  status: "queued",
-                },
-              },
-              { upsert: true },
-            );
+            const result = await enqueueExpenseCapture({
+              messageId,
+              mediaId,
+              mime,
+              mediaType: type as "image" | "document",
+              filename: media?.filename,
+              caption: media?.caption,
+              waId,
+              phoneNumberId,
+            });
 
-            if (result.upsertedCount > 0) {
+            if (result.enqueued) {
               whatsappLogger.info("Receipt queued", { messageId, mediaType: type, waId });
             } else {
               whatsappLogger.info("Duplicate webhook — already processed", { messageId });

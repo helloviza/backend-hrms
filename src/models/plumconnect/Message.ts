@@ -33,6 +33,16 @@ export const MESSAGE_TYPES = [
   "button",
   "system",
   "note",
+  // Slice 2 — the remaining inbound types Meta can deliver. The legacy
+  // expense path drops these; the dispatcher records them so a support
+  // conversation shows the voice note / pin / sticker the contact sent.
+  "audio",
+  "video",
+  "sticker",
+  "location",
+  "contacts",
+  "reaction",
+  "unsupported",
 ] as const;
 export type MessageType = (typeof MESSAGE_TYPES)[number];
 

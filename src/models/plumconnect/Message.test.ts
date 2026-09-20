@@ -123,12 +123,15 @@ describe("PlumConnectMessage", () => {
       Message.create({ conversationId, direction: "SIDEWAYS" as any, type: "text" }),
     ).rejects.toThrow(/direction/);
     await expect(
-      Message.create({ conversationId, direction: "INBOUND", type: "sticker" as any }),
+      Message.create({ conversationId, direction: "INBOUND", type: "hologram" as any }),
     ).rejects.toThrow(/type/);
     await expect(
       Message.create({ conversationId, direction: "OUTBOUND", type: "text", deliveryStatus: "bounced" as any }),
     ).rejects.toThrow(/deliveryStatus/);
-    expect(MESSAGE_TYPES).toEqual(["text", "interactive", "image", "document", "template", "button", "system", "note"]);
+    expect(MESSAGE_TYPES).toEqual([
+      "text", "interactive", "image", "document", "template", "button", "system", "note",
+      "audio", "video", "sticker", "location", "contacts", "reaction", "unsupported",
+    ]);
   });
 
   it("declares the unique+sparse externalId index and the thread index", async () => {
