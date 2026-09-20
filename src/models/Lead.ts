@@ -42,6 +42,39 @@ export const LEAD_INDUSTRIES = [
 
 export const COMPANY_SIZES = ["1-10", "11-50", "51-200", "201-500", "500+"] as const;
 
+/** See LeadDoc.attribution. Field names follow Meta's referral object
+ *  (source_type / source_id / source_url / ctwa_clid / headline / body /
+ *  media_type) in camelCase; `channel` is the transport ("whatsapp"), not
+ *  the ad platform. */
+export interface LeadAttribution {
+  channel: string;
+  sourceType: string;
+  sourceId: string;
+  sourceUrl: string;
+  ctwaClid: string;
+  headline: string;
+  body: string;
+  mediaType: string;
+  capturedAt?: Date | null;
+  conversationId?: mongoose.Types.ObjectId | null;
+}
+
+const LeadAttributionSchema = new Schema<LeadAttribution>(
+  {
+    channel: { type: String, trim: true, default: "" },
+    sourceType: { type: String, trim: true, default: "" },
+    sourceId: { type: String, trim: true, default: "" },
+    sourceUrl: { type: String, trim: true, default: "" },
+    ctwaClid: { type: String, trim: true, default: "" },
+    headline: { type: String, trim: true, default: "" },
+    body: { type: String, trim: true, default: "" },
+    mediaType: { type: String, trim: true, default: "" },
+    capturedAt: { type: Date, default: null },
+    conversationId: { type: Schema.Types.ObjectId, ref: "PlumConnectConversation", default: null },
+  },
+  { _id: false },
+);
+
 export interface LeadDoc extends Document {
   leadCode: string;
   type: "company" | "individual";
@@ -103,6 +136,15 @@ export interface LeadDoc extends Document {
   opportunityId?: mongoose.Types.ObjectId | null;
   /** Reserved (decision A). Never read, never written. */
   workspaceId?: mongoose.Types.ObjectId | null;
+
+  // ── PlumConnect Slice 0 — additive, nothing writes it yet ──
+  /** Ad attribution captured from a WhatsApp CTWA referral (Meta's
+   *  `message.referral`). Lives on the LEAD, not the Opportunity, because the
+   *  lead is what is kept for attribution after conversion
+   *  (crmTaxonomy CONVERTED). Empty object on every row until the
+   *  PlumConnect lead consumer (plan §5) writes it; legacy rows are never
+   *  backfilled. docs/plumconnect/PLUMCONNECT_IMPLEMENTATION_PLAN.md §2. */
+  attribution: LeadAttribution;
 
   // ── Disposition slice (CRM_V2_DISPOSITION) — additive, all optional ──
   /** The calling pipeline this lead is worked in (models/CrmPipeline.ts).
@@ -189,6 +231,9 @@ const LeadSchema = new Schema<LeadDoc>(
     travelRequirement: { type: TravelRequirementSchema, default: () => ({}) },
     opportunityId: { type: Schema.Types.ObjectId, ref: "Opportunity", default: null },
     workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", default: null },
+
+    // ── PlumConnect Slice 0 — additive, no index. See LeadDoc.attribution. ──
+    attribution: { type: LeadAttributionSchema, default: () => ({}) },
 
     // ── Disposition slice — additive. "" / null = fresh (Open / Prospect). ──
     pipelineId: { type: Schema.Types.ObjectId, ref: "CrmPipeline", default: null },
