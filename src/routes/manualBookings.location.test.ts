@@ -56,7 +56,11 @@ const { bookingStore, locationStore, geo } = vi.hoisted(() => {
   };
 });
 
-vi.mock("../models/ManualBooking.js", () => ({
+// Only `default` (the model) is faked; the router's named imports
+// (ATTACHMENT_REQUIRED_TYPES, MANUAL_BOOKING_TYPES, …) are the real
+// constants — a partial mock would leave them undefined and every POST 500s.
+vi.mock("../models/ManualBooking.js", async (importOriginal) => ({
+  ...(await importOriginal<any>()),
   default: {
     create: async (doc: any) => {
       bookingStore.created.push(doc);

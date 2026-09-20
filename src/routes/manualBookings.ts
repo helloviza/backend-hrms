@@ -223,21 +223,150 @@ function validateBookingRequired(b: any): string[] {
     if (!hotelCityPresent(b)) errors.push("City is required for hotel bookings");
     if (!b?.returnDate) errors.push("Check-out (return) date is required for hotel bookings");
   }
-  // Attachment rule — Flight Service + Hotel Type. Scoped to a payload that
-  // ACTUALLY CARRIES the attachment set, which is the only point in a create
-  // where attachments[] is knowable: the form (and every caller today) creates
-  // the booking first and POSTs each file to /:id/attachments afterwards, so
-  // an unconditional "attachments must be non-empty" here would reject every
-  // legitimate flight and hotel create rather than the ones missing a ticket.
-  // See the sequencing note above the POST / handler.
-  if (
-    ATTACHMENT_REQUIRED_TYPES.includes(type as any) &&
-    Array.isArray(b?.attachments) &&
-    b.attachments.length === 0
-  ) {
-    errors.push("At least one attachment is required for flight and hotel bookings");
-  }
+  // No attachment rule here any more. attachments[] is never part of a
+  // create/update body (see rejectClientAttachments), so a payload-shaped
+  // check could only ever be dead code. The Flight/Hotel document rule is
+  // enforced as a STATUS gate instead — see attachmentGateError below.
   return errors;
+}
+
+/* ── Body whitelists — what a create/update may set ──────────────────
+ *
+ * POST / and PUT /:id used to spread/assign req.body straight onto the
+ * document. Two things were wrong with that: any schema path was writable
+ * (workspaceId, bookedBy, createdBy, bookingRef, isDemo, invoiceId …), and —
+ * the one that mattered — attachments[] was writable, so a caller could
+ * write an entry with any s3Key it liked and then have /:id/attachments/
+ * :attId/url presign it. Every object in the shared bucket was one PUT away.
+ *
+ * Now the body is PICKED, not spread. Anything not listed is dropped
+ * (server-owned fields are simply never read), with two loud exceptions
+ * that 400 instead — see rejectClientAttachments / the status checks in the
+ * handlers — because a client sending them is a client bug worth surfacing,
+ * not a value to quietly ignore.
+ */
+const CREATE_BODY_FIELDS = [
+  "workspaceId",
+  "bookingDate", "travelDate", "returnDate", "reqDate",
+  "givenBy", "sector", "priceBenefits",
+  "type", "status", "subStatus", "source", "sourceBookingId",
+  "itinerary", "passengers", "lineItems", "pricing",
+  "supplierName", "supplierPNR", "notes",
+  "assignPerson", "assignPersonName",
+] as const;
+
+// Update: everything above EXCEPT workspaceId (a booking never changes
+// tenant — the sanctioned path for a wrong client is cancel as
+// WRONG_CUSTOMER and re-create) and source (import-from-sbt writes SBT
+// sources directly on the model; letting a PUT flip a manual booking to
+// "SBT" would both skip the mirror sync and dodge the attachment gate).
+const UPDATE_BODY_FIELDS = CREATE_BODY_FIELDS.filter(
+  (f) => f !== "workspaceId" && f !== "source",
+);
+
+// Only the INPUT half of pricing — every derived figure (diff, gstAmount,
+// grandTotal, profitMargin …) is recomputed by the pre-save hook regardless.
+const PRICING_INPUT_FIELDS = [
+  "actualPrice", "quotedPrice", "supplierCost", "sellingPrice",
+  "gstMode", "gstPercent", "currency",
+] as const;
+const PASSENGER_INPUT_FIELDS = ["name", "email", "phone", "panNo", "passportNo", "type"] as const;
+
+// Sources a client may claim on create. SBT / SBT_AUTO rows are written by
+// the import-from-sbt handler and the SBT auto-mirror, never by this body.
+const CLIENT_CREATABLE_SOURCES = ["MANUAL", "ADMIN_QUEUE"];
+
+// Statuses a client may set. INVOICED is written by the invoice flow only
+// (routes/invoices.ts) — and PUT already refuses to touch an INVOICED row.
+const CLIENT_SETTABLE_STATUSES = ["PENDING", "WIP", "CONFIRMED", "CANCELLED"];
+
+function pickFields<T extends readonly string[]>(src: any, fields: T): Record<string, any> {
+  const out: Record<string, any> = {};
+  if (!src || typeof src !== "object") return out;
+  for (const f of fields) {
+    if (Object.prototype.hasOwnProperty.call(src, f)) out[f] = src[f];
+  }
+  return out;
+}
+
+function pickBookingBody(body: any, mode: "create" | "update"): Record<string, any> {
+  const picked = pickFields(body, mode === "create" ? CREATE_BODY_FIELDS : UPDATE_BODY_FIELDS);
+  if (picked.pricing && typeof picked.pricing === "object") {
+    picked.pricing = pickFields(picked.pricing, PRICING_INPUT_FIELDS);
+  }
+  if (Array.isArray(picked.passengers)) {
+    picked.passengers = picked.passengers.map((p: any) => pickFields(p, PASSENGER_INPUT_FIELDS));
+  }
+  return picked;
+}
+
+/**
+ * attachments[] is managed ONLY by POST /:id/attachments, where the server
+ * writes the s3Key itself. A create/update body that carries `attachments`
+ * (or an s3Key anywhere in it) is refused outright — not stripped — so a
+ * smuggling attempt is a visible 400, never a silent no-op.
+ */
+function rejectClientAttachments(body: any): string | null {
+  if (!body || typeof body !== "object") return null;
+  if (Object.prototype.hasOwnProperty.call(body, "attachments")) {
+    return "attachments are managed via POST /:id/attachments and cannot be set on the booking body";
+  }
+  const seen = new Set<any>();
+  const walk = (v: any): boolean => {
+    if (!v || typeof v !== "object" || seen.has(v)) return false;
+    seen.add(v);
+    if (Array.isArray(v)) return v.some(walk);
+    if (Object.prototype.hasOwnProperty.call(v, "s3Key")) return true;
+    return Object.values(v).some(walk);
+  };
+  return walk(body) ? "s3Key cannot be supplied by the client" : null;
+}
+
+/* ── Mandatory-attachment STATUS gate (Flight Service + Hotel Type) ────
+ *
+ * The rule: a flight/hotel booking is not really a booking without its
+ * ticket/voucher. The reality: create and upload are separate requests
+ * (files can only be POSTed once an id exists), so "must have an attachment"
+ * cannot be checked at create time — every legitimate create has zero.
+ *
+ * So the gate is on the STATUS, not on existence: the row may exist, may be
+ * edited, may sit at PENDING or WIP indefinitely, but it may not ENTER a
+ * final status (CONFIRMED / INVOICED) while attachments[] is empty. The
+ * form creates as PENDING, uploads, then PUTs the requested status — and if
+ * an upload fails the row simply stays PENDING until someone attaches a
+ * file on the edit screen and marks it Done. That is the manual fallback,
+ * and it needs no special casing.
+ *
+ * Scope, deliberately narrow:
+ *   - ENTERING only. A row that was ALREADY final-and-gated before this
+ *     write (legacy CONFIRMED flights predating the rule) is not re-policed
+ *     on an unrelated edit — same Option-B stance as the field rules.
+ *   - Non-SBT sources only. import-from-sbt writes CONFIRMED flight/hotel
+ *     rows whose document lives in the SBT system, not here.
+ *   - This route only, not the pre-save hook: cancel/restore/attachment
+ *     saves and the sync jobs all call save() and must never trip it.
+ */
+const FINAL_BOOKING_STATUSES = ["CONFIRMED", "INVOICED"];
+const ATTACHMENT_EXEMPT_SOURCES = ["SBT", "SBT_AUTO"];
+
+function isAttachmentGated(b: { type?: string; status?: string; source?: string } | null | undefined): boolean {
+  if (!b) return false;
+  return (
+    ATTACHMENT_REQUIRED_TYPES.includes(String(b.type ?? "").toUpperCase() as any) &&
+    FINAL_BOOKING_STATUSES.includes(String(b.status ?? "").toUpperCase()) &&
+    !ATTACHMENT_EXEMPT_SOURCES.includes(String(b.source ?? "MANUAL").toUpperCase())
+  );
+}
+
+const ATTACHMENT_GATE_MESSAGE =
+  "At least one attachment (ticket/voucher) is required before a flight or hotel booking can be marked Done";
+
+/** Returns the 400 message when `after` would ENTER the gated state without a file, else null. */
+function attachmentGateError(before: any, after: any): string | null {
+  if (!isAttachmentGated(after)) return null;
+  if (isAttachmentGated(before)) return null; // already there — not our edit to police
+  const count = Array.isArray(after?.attachments) ? after.attachments.length : 0;
+  return count > 0 ? null : ATTACHMENT_GATE_MESSAGE;
 }
 
 // Reduced rule set for import paths — supplier + hotel-city only.
@@ -615,30 +744,69 @@ async function resolveBookedFromCity(req: any) {
 
 // POST /api/admin/manual-bookings
 //
-// CREATE/ATTACH SEQUENCING — why the attachment rule in
-// validateBookingRequired() is conditional rather than absolute:
-// attachments[] is EMPTY for every booking at this point, always. Files can
-// only be posted to /:id/attachments, which needs an id, so the id has to
-// exist first. ManualBookingForm.tsx stages the files in the browser, calls
-// this route, then uploads them one-per-request in the same Save click.
-// A blanket "reject when attachments[] is empty" here would therefore fail
-// 100% of legitimate flight/hotel creates and 0% of the ones it is meant to
-// catch. The real gate for the staged flow is validate() in that form; this
-// route guards the case a payload does define its own attachments.
+// CREATE/ATTACH SEQUENCING: attachments[] is EMPTY for every booking at this
+// point, always. Files can only be posted to /:id/attachments, which needs
+// an id, so the id has to exist first. ManualBookingForm.tsx stages the
+// files in the browser, calls this route (as PENDING when files are staged),
+// uploads them one-per-request in the same Save click, then PUTs the status
+// the user actually asked for. The Flight/Hotel document rule is therefore
+// a STATUS gate (attachmentGateError above): this route refuses to create a
+// gated type directly in a final status, because nothing can be attached
+// yet — and PUT refuses the transition until something is.
 router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, res: any) => {
   try {
-    const vErrors = validateBookingRequired(req.body);
+    const attErr = rejectClientAttachments(req.body);
+    if (attErr) return res.status(400).json({ error: attErr });
+
+    const body = pickBookingBody(req.body, "create");
+
+    // TENANT GATE ON CREATE — the same predicate every read/update runs,
+    // applied to the booking-to-be. A caller may only create for a customer
+    // whose existing bookings they could open: HOUSE staff and SuperAdmin
+    // for anyone, everyone else only their own tenant (either id-space).
+    // Modelled as "the caller is this row's creator", so scope is moot — the
+    // tenant check is what decides.
+    if (!body.workspaceId || !mongoose.isValidObjectId(body.workspaceId)) {
+      return res.status(400).json({ error: "workspaceId is required" });
+    }
+    const accessCtx = bookingAccessContextFromReq(req);
+    const prospective = {
+      workspaceId: String(body.workspaceId),
+      createdBy: accessCtx.callerId,
+      assignPerson: undefined,
+      assignmentStatus: undefined,
+    };
+    if (!canAccessBooking(accessCtx, prospective, "WRITE")) {
+      return res.status(403).json({ success: false, message: "Not found" });
+    }
+
+    const source = String(body.source || "MANUAL").toUpperCase();
+    if (!CLIENT_CREATABLE_SOURCES.includes(source)) {
+      return res.status(400).json({ error: `source must be one of: ${CLIENT_CREATABLE_SOURCES.join(", ")}` });
+    }
+    const status = String(body.status || "PENDING").toUpperCase();
+    if (!CLIENT_SETTABLE_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${CLIENT_SETTABLE_STATUSES.join(", ")}` });
+    }
+
+    const vErrors = validateBookingRequired(body);
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
 
+    // No row exists yet, so attachments[] is [] by construction — a gated
+    // type asking to be born CONFIRMED is refused here, before any write.
+    const gateErr = attachmentGateError(null, { ...body, source, status, attachments: [] });
+    if (gateErr) return res.status(400).json({ error: gateErr, code: "ATTACHMENT_REQUIRED" });
+
     const bookedFromCity = await resolveBookedFromCity(req);
 
     const booking = await ManualBooking.create({
-      ...req.body,
+      ...body,
+      source,
+      status,
       bookedBy: req.user._id,
-      source: req.body.source || "MANUAL",
-      sourceBookingId: req.body.sourceBookingId || undefined,
+      sourceBookingId: body.sourceBookingId || undefined,
       createdBy: String(req.user._id || req.user.id || req.user.sub),
       createdByEmail: req.user.email,
       // Demo Platform — booking authored under impersonation
@@ -1617,16 +1785,37 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
       return res.status(400).json({ message: "Cannot edit an invoiced booking" });
     }
 
+    const attErr = rejectClientAttachments(req.body);
+    if (attErr) return res.status(400).json({ error: attErr });
+
+    // Whitelisted, never assigned wholesale — workspaceId, source, bookedBy,
+    // createdBy, bookingRef, attachments, invoiceId … are not on the list
+    // and so cannot be reached from here (see UPDATE_BODY_FIELDS).
+    const body = pickBookingBody(req.body, "update");
+    if (body.status != null) {
+      const status = String(body.status).toUpperCase();
+      if (!CLIENT_SETTABLE_STATUSES.includes(status)) {
+        return res.status(400).json({ error: `status must be one of: ${CLIENT_SETTABLE_STATUSES.join(", ")}` });
+      }
+      body.status = status;
+    }
+
     // Snapshot the pre-update document so we can tell which required fields
     // were already present (Option B: enforce only those — don't force legacy
     // bookings to backfill fields they never had).
     const before = booking.toObject();
-    Object.assign(booking, req.body);
+    Object.assign(booking, body);
 
     const vErrors = validateBookingRequiredForUpdate(booking, before);
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
+
+    // Flight/Hotel may not ENTER Done without a file on record. `booking`
+    // here is the merged document, whose attachments[] is whatever the
+    // upload route has actually written — the client cannot influence it.
+    const gateErr = attachmentGateError(before, booking);
+    if (gateErr) return res.status(400).json({ error: gateErr, code: "ATTACHMENT_REQUIRED" });
 
     await booking.save();
     res.json({ ok: true, booking });
@@ -1928,6 +2117,16 @@ router.delete(
 
       const attachment = booking.attachments.id(req.params.attId);
       if (!attachment) return res.status(404).json({ error: "Attachment not found" });
+
+      // The other half of the status gate: a Done flight/hotel booking may
+      // not be stripped of its last document either. Move it back to
+      // Pending/WIP first, or upload the replacement before removing this.
+      if (isAttachmentGated(booking) && booking.attachments.length <= 1) {
+        return res.status(409).json({
+          error: "This is the only attachment on a Done flight/hotel booking. Upload a replacement first, or move the booking back to Pending.",
+          code: "ATTACHMENT_REQUIRED",
+        });
+      }
 
       // No shared delete helper exists in utils/s3Upload.ts — inline
       // DeleteObjectCommand, same pattern as workspace.branding.ts / users.ts.
