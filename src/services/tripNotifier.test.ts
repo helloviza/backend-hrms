@@ -6,9 +6,9 @@ const H = vi.hoisted(() => ({
   sendMailMock: vi.fn(),
   emitMetricMock: vi.fn(),
 }));
-vi.mock("./whatsappCloud.service.js", () => ({
-  sendTemplateMessage: H.sendTemplateMock,
-  sendTextMessageResult: H.sendTextResultMock,
+// Slice 4a: tripNotifier gets its senders from the outbound wrapper.
+vi.mock("./plumconnect/outbound.js", () => ({
+  outboundFor: () => ({ sendTemplateMessage: H.sendTemplateMock, sendTextMessageResult: H.sendTextResultMock }),
 }));
 vi.mock("../utils/mailer.js", () => ({ sendMail: H.sendMailMock }));
 vi.mock("../utils/plutoMetricsSink.js", () => ({ emitMetric: H.emitMetricMock }));

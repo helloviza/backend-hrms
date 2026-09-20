@@ -14,11 +14,10 @@ import ArrivalSession from "../models/ArrivalSession.js";
 import SBTRequest from "../models/SBTRequest.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import User from "../models/User.js";
-import {
-  sendTemplateMessage,
-  sendTextMessageResult,
-  sendButtonMessage,
-} from "./whatsappCloud.service.js";
+// Slice 4a: the same senders via the PlumConnect outbound wrapper (persists
+// under PLUMCONNECT_ENABLED; identical names, parameters and return values).
+import { outboundFor } from "./plumconnect/outbound.js";
+const { sendTemplateMessage, sendTextMessageResult, sendButtonMessage } = outboundFor("arrival");
 import { toWaRecipient } from "../utils/waNumber.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { arriveMetric } from "../utils/plutoMetricsBuilder.js";

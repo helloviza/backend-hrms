@@ -5,10 +5,10 @@
 // free-form for dev / open-window). On WhatsApp failure/unconfigured with a
 // fallback email, falls back to EMAIL. Retry once next cycle, then mark FAILED.
 
-import {
-  sendTemplateMessage,
-  sendTextMessageResult,
-} from "./whatsappCloud.service.js";
+// Slice 4a: the same senders via the PlumConnect outbound wrapper (persists
+// under PLUMCONNECT_ENABLED; identical names, parameters and return values).
+import { outboundFor } from "./plumconnect/outbound.js";
+const { sendTemplateMessage, sendTextMessageResult } = outboundFor("trip");
 import { toWaRecipient } from "../utils/waNumber.js";
 import { sendMail } from "../utils/mailer.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";

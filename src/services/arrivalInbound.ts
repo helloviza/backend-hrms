@@ -9,7 +9,10 @@
 // text — this is a constrained command set (a prompt-injection boundary).
 
 import ArrivalSession from "../models/ArrivalSession.js";
-import { sendTextMessageResult, sendButtonMessage } from "./whatsappCloud.service.js";
+// Slice 4a: the same senders via the PlumConnect outbound wrapper (persists
+// under PLUMCONNECT_ENABLED; identical names, parameters and return values).
+import { outboundFor } from "./plumconnect/outbound.js";
+const { sendTextMessageResult, sendButtonMessage } = outboundFor("arrival");
 import { toWaRecipient } from "../utils/waNumber.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { arriveMetric } from "../utils/plutoMetricsBuilder.js";

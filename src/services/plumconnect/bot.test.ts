@@ -15,6 +15,7 @@ process.env.S3_BUCKET ||= "test-bucket";
 process.env.GEMINI_API_KEY ||= "test-gemini-key";
 process.env.WA_ACCESS_TOKEN = "test-token";
 process.env.WA_PHONE_NUMBER_ID = "1265026903369191";
+process.env.PLUMCONNECT_ENABLED = "true"; // persistence is flag-gated since Slice 4a
 
 const { startBot, handleBotTurn, stopBot, botIsActive, sanitize, parseName, parseDestination, parseDates } = await import("./bot.js");
 const { CONTACT_NAME_FALLBACK } = await import("./holidayLead.js");

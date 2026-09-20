@@ -9,9 +9,12 @@ import {
   isWhatsAppCloudConfigured,
   getMediaUrl,
   downloadMedia,
-  sendTextMessage,
-  sendButtonMessage,
 } from "../services/whatsappCloud.service.js";
+// Slice 4a: the same two senders, routed through the PlumConnect outbound
+// wrapper so the chain's replies persist when PLUMCONNECT_ENABLED is on.
+// Same names, parameters and behaviour; every call site below is unchanged.
+import { outboundFor } from "../services/plumconnect/outbound.js";
+const { sendTextMessage, sendButtonMessage } = outboundFor("expense");
 import { uploadExpenseReceiptToS3 } from "../utils/s3Upload.js";
 import { extractReceipt } from "../services/receiptExtractorGemini.js";
 import { recordReceiptExtraction } from "../services/receiptExtractions.service.js";

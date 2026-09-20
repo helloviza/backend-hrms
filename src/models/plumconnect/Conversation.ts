@@ -23,7 +23,9 @@ import mongoose, { Schema, type Document } from "mongoose";
 export const CONVERSATION_CHANNELS = ["whatsapp"] as const;
 export type ConversationChannel = (typeof CONVERSATION_CHANNELS)[number];
 
-export const CONVERSATION_KINDS = ["support", "lead", "expense", "arrival", "unknown"] as const;
+// "trip" — Slice 4a: flight-disruption alerts from the trip notifier, so a
+// legacy send has a thread of the right kind to land on.
+export const CONVERSATION_KINDS = ["support", "lead", "expense", "arrival", "trip", "unknown"] as const;
 export type ConversationKind = (typeof CONVERSATION_KINDS)[number];
 
 export const CONVERSATION_STATUSES = ["OPEN", "PENDING", "RESOLVED"] as const;

@@ -1,8 +1,8 @@
-// PlumConnect Slice 3c, Part A — sendAndPersist. The REAL whatsappCloud
-// senders run (zero mocks on that module); axios gets a fake ADAPTER so the
-// full request pipeline — including the wamid-capturing response
-// interceptor — executes and every Graph call is recorded. Persistence is
-// on mongodb-memory-server.
+// PlumConnect sendAndPersist (3c, re-based on the Slice-4a outbound wrapper).
+// The REAL whatsappCloud senders run (zero mocks on that module); axios gets
+// a fake ADAPTER so the full request pipeline executes and every Graph call
+// is recorded; the senders return Meta's wamid directly. Persistence is on
+// mongodb-memory-server and flag-gated.
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
 import mongoose from "mongoose";
 import { MongoMemoryServer } from "mongodb-memory-server";
@@ -15,6 +15,7 @@ process.env.S3_BUCKET ||= "test-bucket";
 process.env.GEMINI_API_KEY ||= "test-gemini-key";
 process.env.WA_ACCESS_TOKEN = "test-token";
 process.env.WA_PHONE_NUMBER_ID = "1265026903369191";
+process.env.PLUMCONNECT_ENABLED = "true"; // persistence is flag-gated since Slice 4a
 
 const { sendAndPersist } = await import("./send.js");
 const { default: Message } = await import("../../models/plumconnect/Message.js");
@@ -120,10 +121,17 @@ describe("sendAndPersist", () => {
     expect(await Message.countDocuments({})).toBe(0);
   });
 
-  it("the interceptor is inert outside a sendAndPersist context: a plain Graph call persists nothing", async () => {
-    await axios.post("https://graph.facebook.com/v21.0/1265026903369191/messages", { to: TO });
-    expect(graph).toHaveLength(1);
-    expect(await Message.countDocuments({})).toBe(0);
+  it("FLAG OFF: the send still goes out exactly once and nothing is persisted (Slice 4a gating)", async () => {
+    delete process.env.PLUMCONNECT_ENABLED;
+    try {
+      const r = await sendAndPersist({ conversationId, to: TO, text: "flag off" });
+      expect(graph).toHaveLength(1);
+      expect(graph[0].body.text.body).toBe("flag off");
+      expect(r).toEqual({ sent: true, wamid: expect.stringMatching(/^wamid\.OUT\d+$/), messageId: null, persistFailed: false });
+      expect(await Message.countDocuments({})).toBe(0);
+    } finally {
+      process.env.PLUMCONNECT_ENABLED = "true";
+    }
   });
 
   it("two concurrent sends each get their own wamid (context isolation)", async () => {

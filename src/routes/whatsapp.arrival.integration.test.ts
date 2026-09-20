@@ -157,6 +157,10 @@ vi.mock("../services/whatsappCloud.service.js", async (orig) => {
     isWhatsAppCloudConfigured: () => true,
   };
 });
+// Slice 4a: arrival code now takes its senders from the outbound wrapper.
+vi.mock("../services/plumconnect/outbound.js", () => ({
+  outboundFor: () => ({ sendTemplateMessage: H.spies.sendTemplate, sendTextMessageResult: H.spies.sendText, sendButtonMessage: H.spies.sendButtons }),
+}));
 // 0.3: worker calls getFlightOccurrenceForDate(flightNo, departDate) now.
 vi.mock("../services/flightService.js", () => ({
   getFlightOccurrenceForDate: H.spies.flightStatus,

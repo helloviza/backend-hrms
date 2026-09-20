@@ -15,9 +15,9 @@ vi.mock("./arrivalEscalation.js", () => ({ escalateToBooker: H.escalate }));
 vi.mock("../models/ArrivalSession.js", () => ({
   default: { findOne: H.findOne, findOneAndUpdate: H.findOneAndUpdate },
 }));
-vi.mock("./whatsappCloud.service.js", () => ({
-  sendTextMessageResult: H.sendText,
-  sendButtonMessage: H.sendButtons,
+// Slice 4a: arrivalInbound gets its senders from the outbound wrapper.
+vi.mock("./plumconnect/outbound.js", () => ({
+  outboundFor: () => ({ sendTextMessageResult: H.sendText, sendButtonMessage: H.sendButtons }),
 }));
 vi.mock("../utils/plutoMetricsSink.js", () => ({ emitMetric: H.emitMetric }));
 

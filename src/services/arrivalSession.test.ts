@@ -18,10 +18,9 @@ vi.mock("../models/ArrivalSession.js", () => ({ default: { findOne: H.asFindOne,
 vi.mock("../models/SBTRequest.js", () => ({ default: { findById: H.reqFindById } }));
 vi.mock("../models/SBTHotelBooking.js", () => ({ default: { findOne: H.hbFindOne } }));
 vi.mock("../models/User.js", () => ({ default: { findById: H.userFindById } }));
-vi.mock("./whatsappCloud.service.js", () => ({
-  sendTemplateMessage: H.sendTemplate,
-  sendTextMessageResult: H.sendText,
-  sendButtonMessage: H.sendButtons,
+// Slice 4a: arrivalSession gets its senders from the outbound wrapper.
+vi.mock("./plumconnect/outbound.js", () => ({
+  outboundFor: () => ({ sendTemplateMessage: H.sendTemplate, sendTextMessageResult: H.sendText, sendButtonMessage: H.sendButtons }),
 }));
 vi.mock("../utils/plutoMetricsSink.js", () => ({ emitMetric: H.emitMetric }));
 

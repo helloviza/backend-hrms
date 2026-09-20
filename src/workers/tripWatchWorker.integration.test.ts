@@ -28,6 +28,8 @@ vi.mock("../services/flightService.js", () => ({
   isFlightLookupError: (r: any) => Boolean(r && r.error),
 }));
 vi.mock("../services/whatsappCloud.service.js", () => ({ sendTemplateMessage: H.sendTemplate, sendTextMessageResult: H.sendText, sendButtonMessage: H.sendButtons }));
+// Slice 4a: arrival/trip code takes its senders from the outbound wrapper.
+vi.mock("../services/plumconnect/outbound.js", () => ({ outboundFor: () => ({ sendTemplateMessage: H.sendTemplate, sendTextMessageResult: H.sendText, sendButtonMessage: H.sendButtons }) }));
 vi.mock("../models/ArrivalSession.js", () => ({ default: { find: H.arrFind, findOne: H.arrFindOne, create: vi.fn(), findOneAndUpdate: vi.fn() } }));
 vi.mock("../utils/mailer.js", () => ({ sendMail: H.sendMail }));
 vi.mock("../services/weatherService.js", () => ({ getDestinationWeather: H.getWeather }));

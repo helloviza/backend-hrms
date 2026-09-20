@@ -107,7 +107,7 @@ describe("PlumConnectConversation", () => {
       Conversation.create({ contactId: contact._id, status: "CLOSED" as any }),
     ).rejects.toThrow(/status/);
     expect(CONVERSATION_STATUSES).toEqual(["OPEN", "PENDING", "RESOLVED"]);
-    expect(CONVERSATION_KINDS).toEqual(["support", "lead", "expense", "arrival", "unknown"]);
+    expect(CONVERSATION_KINDS).toEqual(["support", "lead", "expense", "arrival", "trip", "unknown"]);
   });
 
   it("records bot state including the human-takeover stop reason", async () => {

@@ -20,6 +20,49 @@ export function isWhatsAppCloudConfigured(): boolean {
   return Boolean(env.WA_ACCESS_TOKEN && env.WA_PHONE_NUMBER_ID);
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * SendOutcome — PlumConnect Slice 4a.
+ *
+ * Every message sender below now RETURNS what Meta answered instead of
+ * discarding it: `wamid` is data.messages[0].id, `raw` the response body.
+ * This is ADDITIVE and byte-identical on the wire:
+ *   • what is sent, the headers, timeouts, side effects, logging and error
+ *     handling of every sender are unchanged;
+ *   • sendTextMessage / sendButtonMessage used to return void — nobody read
+ *     that, so they now return the outcome;
+ *   • sendTextMessageResult / sendTemplateMessage keep their boolean return
+ *     (callers branch on it) and gain *Outcome siblings with the SAME
+ *     parameters; sendTemplateMessage's parameter signature stays frozen;
+ *   • sendTemplateWithImageHeader keeps its { sent, error } shape and gains
+ *     `wamid` / `raw`.
+ * The outbound wrapper (services/plumconnect/outbound.ts) is what persists
+ * these outcomes; this file never touches a PlumConnect model.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+export interface SendOutcome {
+  /** Meta accepted the message (an HTTP 2xx came back). */
+  ok: boolean;
+  /** data.messages[0].id from the Graph response, when Meta returned one. */
+  wamid: string | null;
+  /** The Graph response body, when there was one. */
+  raw: unknown;
+  /** Why it was not sent: "not_configured", or the error message. */
+  error?: string;
+}
+
+function outcomeOf(res: { data?: any } | undefined): SendOutcome {
+  const id = res?.data?.messages?.[0]?.id;
+  return { ok: true, wamid: typeof id === "string" && id ? id : null, raw: res?.data ?? null };
+}
+
+function notSent(error: string): SendOutcome {
+  return { ok: false, wamid: null, raw: null, error };
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 /**
  * Verify Meta's `X-Hub-Signature-256` header against the RAW request body.
  * Header format: "sha256=<hex hmac>". Keyed with the Meta App Secret.
@@ -78,13 +121,13 @@ export async function downloadMedia(url: string): Promise<Buffer> {
  * POST /<phoneNumberId>/messages. Best-effort: logs and swallows failures so a
  * failed reply never blocks capture processing.
  */
-export async function sendTextMessage(to: string, body: string): Promise<void> {
+export async function sendTextMessage(to: string, body: string): Promise<SendOutcome> {
   if (!isWhatsAppCloudConfigured()) {
     whatsappLogger.warn("sendTextMessage skipped — Cloud API not configured", { to });
-    return;
+    return notSent("not_configured");
   }
   try {
-    await axios.post(
+    const res = await axios.post(
       `${GRAPH_BASE}/${env.WA_GRAPH_VERSION}/${env.WA_PHONE_NUMBER_ID}/messages`,
       {
         messaging_product: "whatsapp",
@@ -101,11 +144,13 @@ export async function sendTextMessage(to: string, body: string): Promise<void> {
         timeout: 30_000,
       },
     );
+    return outcomeOf(res);
   } catch (err) {
     whatsappLogger.error("sendTextMessage failed", {
       to,
       error: err instanceof Error ? err.message : String(err),
     });
+    return notSent(errorText(err));
   }
 }
 
@@ -121,17 +166,22 @@ export async function sendTextMessage(to: string, body: string): Promise<void> {
  * registration is a business action outside this repo.
  */
 export async function sendTextMessageResult(to: string, body: string): Promise<boolean> {
-  if (!isWhatsAppCloudConfigured()) return false;
+  return (await sendTextMessageResultOutcome(to, body)).ok;
+}
+
+/** sendTextMessageResult, returning the full outcome (same wire, same logging). */
+export async function sendTextMessageResultOutcome(to: string, body: string): Promise<SendOutcome> {
+  if (!isWhatsAppCloudConfigured()) return notSent("not_configured");
   try {
-    await axios.post(
+    const res = await axios.post(
       `${GRAPH_BASE}/${env.WA_GRAPH_VERSION}/${env.WA_PHONE_NUMBER_ID}/messages`,
       { messaging_product: "whatsapp", recipient_type: "individual", to, type: "text", text: { preview_url: false, body } },
       { headers: { Authorization: `Bearer ${env.WA_ACCESS_TOKEN}`, "Content-Type": "application/json" }, timeout: 30_000 },
     );
-    return true;
+    return outcomeOf(res);
   } catch (err) {
     whatsappLogger.error("sendTextMessageResult failed", { to, error: err instanceof Error ? err.message : String(err) });
-    return false;
+    return notSent(errorText(err));
   }
 }
 
@@ -141,9 +191,19 @@ export async function sendTemplateMessage(
   bodyParams: string[],
   languageCode = "en",
 ): Promise<boolean> {
-  if (!isWhatsAppCloudConfigured()) return false;
+  return (await sendTemplateMessageOutcome(to, templateName, bodyParams, languageCode)).ok;
+}
+
+/** sendTemplateMessage, returning the full outcome. Same parameters, same wire, same logging. */
+export async function sendTemplateMessageOutcome(
+  to: string,
+  templateName: string,
+  bodyParams: string[],
+  languageCode = "en",
+): Promise<SendOutcome> {
+  if (!isWhatsAppCloudConfigured()) return notSent("not_configured");
   try {
-    await axios.post(
+    const res = await axios.post(
       `${GRAPH_BASE}/${env.WA_GRAPH_VERSION}/${env.WA_PHONE_NUMBER_ID}/messages`,
       {
         messaging_product: "whatsapp",
@@ -160,10 +220,10 @@ export async function sendTemplateMessage(
       },
       { headers: { Authorization: `Bearer ${env.WA_ACCESS_TOKEN}`, "Content-Type": "application/json" }, timeout: 30_000 },
     );
-    return true;
+    return outcomeOf(res);
   } catch (err) {
     whatsappLogger.error("sendTemplateMessage failed", { to, error: err instanceof Error ? err.message : String(err) });
-    return false;
+    return notSent(errorText(err));
   }
 }
 
@@ -182,21 +242,20 @@ export async function sendButtonMessage(
   to: string,
   body: string,
   buttons: ReplyButton[],
-): Promise<void> {
+): Promise<SendOutcome> {
   if (!isWhatsAppCloudConfigured()) {
     whatsappLogger.warn("sendButtonMessage skipped — Cloud API not configured", { to });
-    return;
+    return notSent("not_configured");
   }
   const replyButtons = (buttons || []).slice(0, 3).map((b) => ({
     type: "reply",
     reply: { id: b.id, title: String(b.title).slice(0, 20) },
   }));
   if (replyButtons.length === 0) {
-    await sendTextMessage(to, body);
-    return;
+    return sendTextMessage(to, body);
   }
   try {
-    await axios.post(
+    const res = await axios.post(
       `${GRAPH_BASE}/${env.WA_GRAPH_VERSION}/${env.WA_PHONE_NUMBER_ID}/messages`,
       {
         messaging_product: "whatsapp",
@@ -217,13 +276,14 @@ export async function sendButtonMessage(
         timeout: 30_000,
       },
     );
+    return outcomeOf(res);
   } catch (err) {
     whatsappLogger.error("sendButtonMessage failed — falling back to text", {
       to,
       error: err instanceof Error ? err.message : String(err),
     });
     // Text fallback keeps the flow working (the typed keywords still apply).
-    await sendTextMessage(to, body);
+    return sendTextMessage(to, body);
   }
 }
 
@@ -312,6 +372,9 @@ export async function uploadMedia(
 export interface TemplateSendResult {
   sent: boolean;
   error?: string;
+  /** Slice 4a — the Graph wamid / body when sent. */
+  wamid?: string | null;
+  raw?: unknown;
 }
 
 /**
@@ -344,7 +407,7 @@ export async function sendTemplateWithImageHeader(
     return { sent: false, error: "No header media id" };
   }
   try {
-    await axios.post(
+    const res = await axios.post(
       `${GRAPH_BASE}/${env.WA_GRAPH_VERSION}/${env.WA_PHONE_NUMBER_ID}/messages`,
       {
         messaging_product: "whatsapp",
@@ -377,7 +440,8 @@ export async function sendTemplateWithImageHeader(
         timeout: 30_000,
       },
     );
-    return { sent: true };
+    const o = outcomeOf(res);
+    return { sent: true, wamid: o.wamid, raw: o.raw };
   } catch (err) {
     const detail = describeGraphError(err);
     whatsappLogger.error("sendTemplateWithImageHeader failed", {

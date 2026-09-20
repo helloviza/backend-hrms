@@ -56,6 +56,8 @@ vi.mock("../whatsappCloud.service.js", async (importOriginal) => {
     downloadMedia: H.downloadMedia,
   };
 });
+// Slice 4a: the worker takes sendTextMessage/sendButtonMessage from the outbound wrapper.
+vi.mock("./outbound.js", () => ({ outboundFor: () => ({ sendTextMessage: H.sendTextMessage, sendButtonMessage: H.sendButtonMessage }) }));
 vi.mock("../../utils/s3Upload.js", () => ({ uploadExpenseReceiptToS3: H.upload }));
 vi.mock("../receiptExtractorGemini.js", () => ({ extractReceipt: H.extract }));
 
