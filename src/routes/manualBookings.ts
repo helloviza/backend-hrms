@@ -37,6 +37,7 @@ import {
   MAX_EXTRACTABLE_BYTES,
 } from "../services/documentExtraction.service.js";
 import { buildFlightAutofill } from "../services/flightAutofill.js";
+import { buildHotelAutofill } from "../services/hotelAutofill.js";
 import type { VoucherType } from "../types/index.js";
 
 const router = express.Router();
@@ -1775,8 +1776,9 @@ router.get("/creators", requirePermission("manualBookings", "READ"), async (req:
  * simply stays manual. Only a missing/invalid file or the multer allowlist
  * is a 4xx, and only a broken server is a 500.
  *
- * FLIGHT ONLY (Step 2): a hotel voucher is reported as docType "hotel" with
- * flight:null; the form says so and leaves the fields alone.
+ * Returns BOTH `flight` and `hotel` fills, exactly one of them non-null
+ * (whichever the model detected). The form branches on docType. An "other"
+ * document has neither and the form stays manual.
  */
 router.post(
   "/extract-preview",
@@ -1814,6 +1816,7 @@ router.post(
       }
 
       const flight = result.docType === "flight" ? buildFlightAutofill(result.voucher) : null;
+      const hotel = result.docType === "hotel" ? buildHotelAutofill(result.voucher) : null;
 
       res.json({
         ok: true,
@@ -1821,6 +1824,7 @@ router.post(
         docType: result.docType,
         modelUsed: result.modelUsed,
         flight,
+        hotel,
       });
     } catch (err: any) {
       console.error("[ManualBookings extract-preview]", err.message);
