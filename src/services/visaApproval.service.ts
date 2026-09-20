@@ -18,9 +18,16 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
 import type { IApprovalChainLevel } from "../models/Report.js";
 // THE reuse. resolveL1Approver is exported from reports.service.ts purely so
-// this file can call it — its logic is untouched, so "who approves this?" is
-// answered identically for a claim, a cash advance and a visa request.
-import { resolveL1Approver } from "./reports.service.js";
+// this file can call it. The manager-first walk is shared; the no-manager
+// admin fallback takes an AdminCandidateSource from the caller, and visa
+// passes its own (VISA_ADMIN_SOURCE below) so the expense module's
+// grant-based admin definition never decides a visa route.
+import {
+  resolveL1Approver,
+  APPROVER_USER_FIELDS,
+  type AdminCandidateSource,
+} from "./reports.service.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 /* ──────────────────────────────────────────────────────────────────────
  * Access model — a VISA-LOCAL mirror of services/expense.access.ts.
@@ -180,6 +187,27 @@ export type VisaApprovalChainResult = {
 const VISA_APPROVER_USER_FIELDS = "firstName lastName name email";
 
 /**
+ * Visa's OWN admin-candidate rule for resolveL1Approver's no-manager
+ * fallback. The query is the one the resolver ran before the expense
+ * approval engine (coarse role prefilter, active only, never the excluded
+ * ids) and isVisaAdmin — VISA_ADMIN_ROLES, which keeps bare ADMIN — is the
+ * authority. Expense grants play no part: an expense-scoped change to who
+ * administers claims must never move a visa request.
+ */
+const VISA_ADMIN_SOURCE: AdminCandidateSource = {
+  candidates: (ws, excludeIds) =>
+    User.find({
+      workspaceId: ws,
+      _id: { $nin: excludeIds },
+      roles: { $in: [/ADMIN/i, /LEADER/i, /^HR$/i, /^OPS$/i] },
+      ...activeUserFilter(),
+    })
+      .select(APPROVER_USER_FIELDS)
+      .lean(),
+  isAdmin: isVisaAdmin,
+};
+
+/**
  * Build the approval chain to snapshot at submit.
  *
  * v1 is ALWAYS length 1 — no L2, no escalation threshold. resolveL2Approver
@@ -200,8 +228,9 @@ const VISA_APPROVER_USER_FIELDS = "firstName lastName name email";
  * is never silently auto-approved either — somebody still has to press
  * approve, and the audit trail records that they approved their own request.
  *
- * resolveL1Approver itself is reused UNTOUCHED; the self-route is a fallback
- * this caller applies to its null return, not a change to the resolver.
+ * resolveL1Approver's walk is reused as-is (with visa's own admin-candidate
+ * source); the self-route is a fallback this caller applies to its null
+ * return, not a change to the resolver.
  */
 export async function resolveVisaApprovalChain(
   workspaceId: mongoose.Types.ObjectId | string,
@@ -210,7 +239,7 @@ export async function resolveVisaApprovalChain(
   const ws = new mongoose.Types.ObjectId(String(workspaceId));
   const requester = new mongoose.Types.ObjectId(String(requesterId));
 
-  const l1 = await resolveL1Approver(ws, requester);
+  const l1 = await resolveL1Approver(ws, requester, undefined, VISA_ADMIN_SOURCE);
 
   if (l1.id) {
     return {

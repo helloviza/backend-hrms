@@ -345,8 +345,28 @@ export async function linkExpensesToReport(
 
 // Fields the snapshot needs (name/email) PLUS every role signal isAdmin() reads,
 // so the admin-fallback filter below can decide eligibility off the lean doc.
-const APPROVER_USER_FIELDS =
+// Exported so a caller-supplied AdminCandidateSource loads the same shape.
+export const APPROVER_USER_FIELDS =
   "firstName lastName name email roles role userType accountType hrmsAccessRole hrmsAccessLevel isSuperAdmin managerId";
+
+/**
+ * WHO counts as an admin candidate for the no-manager fallback is the
+ * CALLER's rule, not this file's. Claims and advances pass the expense
+ * definition (EXPENSE_ADMIN_SOURCE — grant-aware); visa passes its own
+ * (services/visaApproval.service.ts). Before this existed, visa borrowed the
+ * expense definition through resolveL1Approver, so the F-01 fix that removed
+ * bare ADMIN from expense.access.ADMIN_ROLES silently rewrote visa's routing.
+ *   candidates — loads the workspace's candidate docs (never `excludeIds`),
+ *                carrying every signal `isAdmin` reads;
+ *   isAdmin    — the authority that decides whether a loaded doc counts.
+ */
+export type AdminCandidateSource = {
+  candidates: (
+    workspaceId: mongoose.Types.ObjectId,
+    excludeIds: mongoose.Types.ObjectId[],
+  ) => Promise<any[]>;
+  isAdmin: (user: any) => boolean;
+};
 
 /**
  * Expense-admin candidates for the no-manager fallback (approval engine
@@ -371,6 +391,12 @@ async function expenseAdminCandidates(
     .lean();
   return withGrants(workspaceId, users);
 }
+
+/** The expense module's own rule — the default for claims and cash advances. */
+export const EXPENSE_ADMIN_SOURCE: AdminCandidateSource = {
+  candidates: expenseAdminCandidates,
+  isAdmin,
+};
 
 /**
  * Resolve the L1 approver to snapshot — workspace-scoped; every lookup stamps
@@ -426,6 +452,7 @@ export async function resolveL1Approver(
   workspaceId: mongoose.Types.ObjectId,
   submitterId: mongoose.Types.ObjectId,
   trace?: RoutingTraceEntry[],
+  source: AdminCandidateSource = EXPENSE_ADMIN_SOURCE,
 ): Promise<{ id: mongoose.Types.ObjectId | null; user: any | null }> {
   const meId = String(submitterId);
   const t = (e: RoutingTraceEntry) => trace?.push(e);
@@ -449,16 +476,16 @@ export async function resolveL1Approver(
     t({ step: "manager", level: 1, userId: null, name: null, outcome: "none", reason: "no manager set" });
   }
 
-  // 2) any OTHER workspace expense-admin — structural role OR expenseAdmin
-  //    grant (isAdmin() is the authority; grants are attached to the docs).
-  const candidates = await expenseAdminCandidates(workspaceId, [submitterId]);
+  // 2) any OTHER workspace admin by the CALLER's rule (source.isAdmin is the
+  //    authority; for expenses that is structural role OR expenseAdmin grant).
+  const candidates = await source.candidates(workspaceId, [submitterId]);
   let chosen: any = null;
   for (const u of candidates) {
     if (chosen) {
       t({ step: "admin_fallback", level: 1, userId: String(u._id), name: employeeNameOf(u), outcome: "considered", reason: "eligible admin, not first in order" });
       continue;
     }
-    if (userIdOf(u) !== meId && isAdmin(u)) {
+    if (userIdOf(u) !== meId && source.isAdmin(u)) {
       chosen = u;
       t({ step: "admin_fallback", level: 1, userId: String(u._id), name: employeeNameOf(u), outcome: "chosen", reason: "first eligible workspace expense-admin (insertion order)" });
     } else {
@@ -496,6 +523,7 @@ export async function resolveL2Approver(
   seniorApproverId: any,
   excludeIds: string[],
   trace?: RoutingTraceEntry[],
+  source: AdminCandidateSource = EXPENSE_ADMIN_SOURCE,
 ): Promise<any | null> {
   const excluded = new Set(excludeIds.map(String));
   const ok = (u: any) => u && !excluded.has(String(u._id));
@@ -524,12 +552,13 @@ export async function resolveL2Approver(
     }
   }
 
-  // c) any OTHER workspace expense-admin (structural role OR grant).
+  // c) any OTHER workspace admin by the caller's rule (expenses: structural
+  //    role OR grant).
   const excludeObjIds = excludeIds
     .filter((x) => mongoose.Types.ObjectId.isValid(x))
     .map((x) => new mongoose.Types.ObjectId(x));
-  const candidates = await expenseAdminCandidates(workspaceId, excludeObjIds);
-  const admin = candidates.find((u) => ok(u) && isAdmin(u));
+  const candidates = await source.candidates(workspaceId, excludeObjIds);
+  const admin = candidates.find((u) => ok(u) && source.isAdmin(u));
   if (admin) {
     t({ step: "admin_fallback_l2", level: 2, userId: String(admin._id), name: employeeNameOf(admin), outcome: "chosen", reason: "first other expense-admin" });
   } else {
