@@ -25,7 +25,8 @@
     "verify:travel-request": "tsx src/scripts/verify-travel-request.ts",
     "dev:mongo": "node scripts/dev-mongo.mjs",
     "seed:dev": "node --env-file=.env.development --import tsx src/seed/seed-dev.ts",
-    "seed:consumer": "node --env-file=.env.development --import tsx src/seed/seed-consumer-dev.ts"
+    "seed:consumer": "node --env-file=.env.development --import tsx src/seed/seed-consumer-dev.ts",
+    "seed:expenses": "node --env-file=.env.development --import tsx src/seed/seed-expense-engine-dev.ts"
   },
   "dependencies": {
     "@aws-sdk/client-apprunner": "^3.693.0",
