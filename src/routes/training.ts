@@ -27,6 +27,7 @@ const TRAINING_DIR = path.join(__dirname, "../training");
 const FILES: Record<string, string> = {
   "learning-hub.html": "learning-hub.html",
   "crm-walkthrough.html": "crm-walkthrough.html",
+  "spendbox-walkthrough.html": "spendbox-walkthrough.html",
 };
 
 const router = Router();
