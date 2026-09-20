@@ -12,7 +12,9 @@
 //   1. IN-FLOW EXPENSE  a fresh (non-stale) expense capture/session for this
 //                       sender AND a hard identity      → hand to the chain
 //   2. CTWA REFERRAL    message.referral present         → lead conversation +
-//                       (non-employee) a holiday Lead via createLead() — Slice 3b
+//                       (non-employee) the Intent Engine picks the business
+//                       line (campaign map → keywords → menu) and a Lead is
+//                       created through createLead() — Slice 3b/5
 //   3. VERIFIED         hard identity (ACTIVE User.waId) → hand to the chain
 //   4. SUPPORT          everything else                  → support conversation,
 //                       OPEN, no expense row, no expense-bot reply.
@@ -20,6 +22,9 @@
 //                       Slice 3c refines this bucket, in order: a pending
 //                       consent answer → an active bot turn → a receipt from
 //                       a soft-matched employee (consent prompt) → support.
+//                       Slice 5 inserts the Intent Engine between (a) and
+//                       (b) for a tapped menu button, and after (c) for an
+//                       organic message on a thread not yet routed.
 //
 // Hard invariant (plan §9): the chain's enqueuers are called through
 // enqueueForChain(), which refuses without a hard identity. Soft matches
@@ -30,8 +35,18 @@
 // enqueue, nothing more.
 //
 // Slice 3c: the bot and the consent flow send through sendAndPersist()
-// (services/plumconnect/send.ts) — the only outbound path here. Human
-// replies are Slice 4.
+// (services/plumconnect/send.ts); Slice 5's menu goes through the 4a wrapper
+// (sendButtonsOutcome, origin "support"). Human replies are Slice 4.
+//
+// Slice 5 — the Intent Engine (intent.ts). For a NON-employee the business
+// line is resolved ONCE per thread and stored on the Conversation:
+//   menu tap → "menu"; mapped ad id → "campaign_map"; keywords → "keyword";
+//   nothing → the interactive menu is sent and the thread waits.
+// concierge keeps the exact 3b/3c behaviour (holiday Lead + qualification
+// bot); plumtrips / helloviza get a Lead (enquiryType corporate_account /
+// visa) on a businessLine-tagged thread for the department's human queue —
+// no bot, no qualification (Slice 6). Business line and campaign lineage
+// are orthogonal: classifyIntent() never reads attribution.
 
 import type mongoose from "mongoose";
 import { toCanonical } from "../../utils/phone.js";
@@ -39,7 +54,16 @@ import { resolveIdentity, type IdentityResolution } from "./resolveIdentity.js";
 import { readExpenseInFlow, type ExpenseInFlow } from "./expenseInFlow.js";
 import { upsertContact, openOrGetConversation, appendInbound } from "./conversationStore.js";
 import { enqueueExpenseReply, enqueueExpenseButton, enqueueExpenseCapture, type EnqueueResult } from "./enqueueExpense.js";
-import { captureHolidayLead, parseReferral, type CaptureHolidayLeadResult } from "./holidayLead.js";
+import { captureLead, parseReferral, type CaptureHolidayLeadResult } from "./holidayLead.js";
+import {
+  classifyIntent,
+  lookupCampaignMap,
+  isMenuButton,
+  menuChoiceToBusinessLine,
+  menuRecentlySent,
+  sendIntentMenu,
+  recordIntent,
+} from "./intent.js";
 import { startBot, handleBotTurn, botIsActive, type BotTurnOutcome } from "./bot.js";
 import {
   isExpenseShaped,
@@ -50,7 +74,7 @@ import {
   type ConsentPromptOutcome,
   type ConsentAnswerOutcome,
 } from "./consent.js";
-import type { ConversationKind } from "../../models/plumconnect/Conversation.js";
+import type { ConversationKind, BusinessLine, IntentSource, IPlumConnectConversation } from "../../models/plumconnect/Conversation.js";
 import { whatsappLogger } from "../../utils/logger.js";
 
 /* ───────────────────────────── envelope ───────────────────────────── */
@@ -124,7 +148,10 @@ export type DispatchRoute =
   // Slice 3c — all three are refinements of what Slice 2 called "support":
   | "bot" // the qualification bot answered on an active lead thread
   | "consent_prompt" // soft-matched employee sent a receipt → bind prompt, nothing enqueued
-  | "consent_answer"; // soft-matched employee answered YES/NO to the bind prompt
+  | "consent_answer" // soft-matched employee answered YES/NO to the bind prompt
+  // Slice 5 — the Intent Engine on an organic (non-referral) thread:
+  | "intent_menu" // business line unknown → the menu was sent (or is still pending)
+  | "intent_lead"; // business line resolved (menu tap / keywords) → Lead created or touched
 
 export type DispatchOutcome =
   | {
@@ -135,8 +162,10 @@ export type DispatchOutcome =
       identityState: IdentityResolution["identityState"];
       /** Present only when the chain was handed the message. */
       enqueue?: EnqueueResult & { collection: "ExpenseReply" | "ExpenseCapture" } | { enqueued: false; collection: null; reason: string };
-      /** Present on lead_referral for a non-employee: what the holiday-lead adapter did. */
+      /** Present on lead_referral / intent_lead for a non-employee: what the lead adapter did. */
       lead?: CaptureHolidayLeadResult;
+      /** Slice 5: how the business line was (or was not) resolved on this turn. */
+      intent?: IntentOutcome;
       /** Slice 3c: what the bot / consent flow did on this turn. */
       bot?: BotTurnOutcome;
       consent?: ConsentPromptOutcome | ConsentAnswerOutcome;
@@ -144,6 +173,15 @@ export type DispatchOutcome =
     }
   | { route: "duplicate"; canonical: string; messageId: string }
   | { route: "dropped"; reason: "unusable_phone" | "missing_message_id"; from: string };
+
+export interface IntentOutcome {
+  businessLine: BusinessLine | null;
+  /** null when the line was already on the thread (no resolution this turn) or nothing resolved. */
+  source: IntentSource | null;
+  confidence: number;
+  /** Set on intent_menu: whether the menu went out on THIS turn (false = recently sent, waiting). */
+  menuSent?: boolean;
+}
 
 /* ───────────────────────────── the wrap (Part C) ───────────────────────────── */
 
@@ -268,14 +306,14 @@ export async function dispatchInbound(env: InboundEnvelope, now: Date = new Date
     return { route, ...base, enqueue };
   }
 
+  // Everything below is the NON-employee world (plus the soft-employee
+  // consent flow). A hard identity never reaches the Intent Engine.
+  const leadCtx = { env, canonical, contactId: contact._id as mongoose.Types.ObjectId, conversation, base, now };
+
   if (route === "lead_referral") {
     // Slice 3b: the referral is already verbatim on the Conversation
-    // (openOrGetConversation) and on the inbound Message payload. For a
-    // NON-employee it now also becomes a holiday Lead through the 3a
-    // createLead() seam — or, when this contact's open lead thread already
-    // has its Lead, a repeat-touch record and nothing else. An employee who
-    // taps an ad keeps the lead-kind thread but gets no Lead row. Nothing is
-    // sent (bot + consent prompt are Slice 3c).
+    // (openOrGetConversation) and on the inbound Message payload. An employee
+    // who taps an ad keeps the lead-kind thread but gets no Lead row.
     if (identity.hard) {
       whatsappLogger.info("PlumConnect: CTWA referral from a verified employee — thread only, no Lead", {
         messageId: env.messageId,
@@ -283,27 +321,22 @@ export async function dispatchInbound(env: InboundEnvelope, now: Date = new Date
       });
       return { route, ...base };
     }
-    const lead = await captureHolidayLead({
-      canonical,
-      profileName: env.profileName,
-      referralRaw: env.referral,
-      contactId: contact._id as mongoose.Types.ObjectId,
-      conversation,
-      messageId: env.messageId,
-      now,
-    });
-    // Slice 3c: a brand-new lead gets the bot's first question; a repeat
-    // touch on a thread where the bot is mid-flow treats the text as the
-    // answer it was waiting for.
-    if (lead.touch === "first") {
-      await startBot({ conversation, to: canonical, leadId: lead.leadId, now }, parseReferral(env.referral).headline);
-      return { route, ...base, lead };
+    // Slice 5: which business line does this ad sell? A thread that is
+    // already routed keeps its line (a repeat referral is a touch, 3b).
+    // Otherwise: Ops' campaign map → keywords in the text → ask.
+    const routed = threadBusinessLine(conversation);
+    if (routed) return routeToBusinessLine({ ...leadCtx, route, businessLine: routed, source: null, confidence: 1, label: "" });
+    const parsed = parseReferral(env.referral);
+    const mapped = await lookupCampaignMap({ sourceId: parsed.sourceId });
+    if (mapped) {
+      return routeToBusinessLine({ ...leadCtx, route, businessLine: mapped, source: "campaign_map", confidence: 1, label: `ad:${parsed.sourceId}` });
     }
-    if (botIsActive(conversation)) {
-      const bot = await handleBotTurn({ conversation, to: canonical, leadId: lead.leadId, now }, env.text);
-      return { route, ...base, lead, bot };
+    const c = classifyIntent(env.text);
+    if (c.businessLine) {
+      return routeToBusinessLine({ ...leadCtx, route, businessLine: c.businessLine, source: "keyword", confidence: c.confidence, label: c.matched.join(",") });
     }
-    return { route, ...base, lead };
+    const menuSent = await offerMenu(conversation, canonical, now);
+    return { route: "intent_menu", ...base, intent: { businessLine: null, source: null, confidence: c.confidence, menuSent } };
   }
 
   // ── Slice 3c refinements of the support bucket ───────────────────────────
@@ -317,6 +350,21 @@ export async function dispatchInbound(env: InboundEnvelope, now: Date = new Date
       );
       return { route: "consent_answer", ...base, consent };
     }
+  }
+  // Slice 5 — a tapped intent-menu button resolves the line ("menu").
+  if (!identity.hard && env.type === "interactive" && isMenuButton(env.buttonId)) {
+    const chosen = menuChoiceToBusinessLine(env.buttonId);
+    const routed = threadBusinessLine(conversation);
+    if (chosen && !routed) {
+      return routeToBusinessLine({ ...leadCtx, route: "intent_lead", businessLine: chosen, source: "menu", confidence: 1, label: `menu:${chosen}` });
+    }
+    // "Something else" (or a stale tap on an already-routed thread) → support.
+    whatsappLogger.info("PlumConnect intent: menu answered without a line — support", {
+      conversationId: String(conversation._id),
+      buttonId: env.buttonId,
+      alreadyRouted: routed,
+    });
+    return { route: "support", ...base, intent: { businessLine: routed, source: routed ? null : "menu", confidence: 0 } };
   }
   // (b) The qualification bot is mid-flow on this (non-employee) thread.
   if (conversation.leadId && botIsActive(conversation)) {
@@ -337,6 +385,21 @@ export async function dispatchInbound(env: InboundEnvelope, now: Date = new Date
     return { route: "consent_prompt", ...base, consent };
   }
 
+  // Slice 5 — an organic message on a thread the Intent Engine has not
+  // routed yet: keywords decide, or the menu is sent (at most once a day
+  // while unanswered). A routed thread falls through: the department's
+  // human queue owns it (no qualification — Slice 6).
+  // A soft-matched employee mid-consent is answering a different question:
+  // no menu on top of the bind prompt.
+  if (!identity.hard && !threadBusinessLine(conversation) && !consentPending(contact.consent)) {
+    const c = classifyIntent(env.text);
+    if (c.businessLine) {
+      return routeToBusinessLine({ ...leadCtx, route: "intent_lead", businessLine: c.businessLine, source: "keyword", confidence: c.confidence, label: c.matched.join(",") });
+    }
+    const menuSent = await offerMenu(conversation, canonical, now);
+    return { route: "intent_menu", ...base, intent: { businessLine: null, source: null, confidence: c.confidence, menuSent } };
+  }
+
   // SUPPORT — the killed default. No enqueue, no reply; the inbox (Slice 4)
   // is the reply path.
   whatsappLogger.info("PlumConnect: support conversation", {
@@ -345,4 +408,98 @@ export async function dispatchInbound(env: InboundEnvelope, now: Date = new Date
     identityState: identity.identityState,
   });
   return { route, ...base };
+}
+
+/* ───────────────────────────── Slice 5 helpers ───────────────────────────── */
+
+/**
+ * The line a thread is already routed to. A pre-Slice-5 lead thread (Lead
+ * exists, no businessLine stamped) was a holiday lead by construction.
+ */
+function threadBusinessLine(conversation: IPlumConnectConversation): BusinessLine | null {
+  if (conversation.businessLine) return conversation.businessLine;
+  if (conversation.leadId) return "concierge";
+  return null;
+}
+
+/** Send the menu unless one is still pending from the last day. */
+async function offerMenu(conversation: IPlumConnectConversation, to: string, now: Date): Promise<boolean> {
+  if (menuRecentlySent(conversation.intentMenuSentAt, now)) {
+    whatsappLogger.info("PlumConnect intent: menu pending — not re-sent", { conversationId: String(conversation._id) });
+    return false;
+  }
+  const sent = await sendIntentMenu(conversation._id as mongoose.Types.ObjectId, to, now);
+  if (sent) conversation.intentMenuSentAt = now;
+  return sent;
+}
+
+interface RouteToLineInput {
+  env: InboundEnvelope;
+  canonical: string;
+  contactId: mongoose.Types.ObjectId;
+  conversation: IPlumConnectConversation;
+  base: {
+    canonical: string;
+    contactId: mongoose.Types.ObjectId;
+    conversationId: mongoose.Types.ObjectId;
+    identityState: IdentityResolution["identityState"];
+    inFlow: ExpenseInFlow;
+  };
+  now: Date;
+  route: DispatchRoute;
+  businessLine: BusinessLine;
+  /** null = the thread was already routed; nothing to record this turn. */
+  source: IntentSource | null;
+  confidence: number;
+  /** Audit label for Conversation.intent — NEVER the user's text. */
+  label: string;
+}
+
+/**
+ * Business line resolved → stamp it (first time only), create-or-touch the
+ * Lead through the 3a seam, and — for concierge ONLY — run the exact 3b/3c
+ * flow (bot's first question on a new Lead, bot turn on a mid-flow thread).
+ * plumtrips / helloviza stop at the Lead: the thread sits in the department
+ * queue with its businessLine and no bot ever starts.
+ */
+async function routeToBusinessLine(input: RouteToLineInput): Promise<DispatchOutcome> {
+  const { env, canonical, conversation, base, now, route, businessLine, source, confidence } = input;
+  const conversationId = conversation._id as mongoose.Types.ObjectId;
+  const intent: IntentOutcome = { businessLine, source, confidence };
+
+  if (source) {
+    await recordIntent(conversationId, businessLine, source, confidence, input.label);
+    conversation.businessLine = businessLine;
+    conversation.intentSource = source;
+    conversation.intentConfidence = confidence;
+    conversation.intent = input.label;
+    conversation.kind = "lead";
+    whatsappLogger.info("PlumConnect intent: resolved", { conversationId: String(conversationId), businessLine, source, confidence });
+  }
+
+  const lead = await captureLead({
+    businessLine,
+    canonical,
+    profileName: env.profileName,
+    referralRaw: env.referral ?? undefined,
+    contactId: input.contactId,
+    conversation,
+    messageId: env.messageId,
+    now,
+  });
+
+  if (businessLine === "concierge") {
+    // Slice 3c, unchanged: a brand-new lead gets the bot's first question; a
+    // repeat touch on a thread where the bot is mid-flow treats the text as
+    // the answer it was waiting for.
+    if (lead.touch === "first") {
+      await startBot({ conversation, to: canonical, leadId: lead.leadId, now }, parseReferral(env.referral).headline);
+      return { route, ...base, lead, intent };
+    }
+    if (botIsActive(conversation)) {
+      const bot = await handleBotTurn({ conversation, to: canonical, leadId: lead.leadId, now }, env.text);
+      return { route, ...base, lead, bot, intent };
+    }
+  }
+  return { route, ...base, lead, intent };
 }

@@ -47,6 +47,7 @@ const { default: ExpenseCapture } = await import("../models/ExpenseCapture.js");
 const { default: Contact } = await import("../models/plumconnect/Contact.js");
 const { default: Conversation } = await import("../models/plumconnect/Conversation.js");
 const { default: Message } = await import("../models/plumconnect/Message.js");
+const { default: CampaignMap } = await import("../models/plumconnect/CampaignMap.js");
 
 /* ── fake Graph: every send recorded, wamid returned ────────────────────── */
 type Sent = { to: string; type: string; text: string; buttons?: string[] };
@@ -109,7 +110,10 @@ beforeEach(async () => {
   graph.length = 0;
   H.trigger.mockClear();
   delete process.env.CRM_V2_OPPORTUNITY;
-  await Promise.all([User.deleteMany({}), Lead.deleteMany({}), LeadActivity.deleteMany({}), Task.deleteMany({}), TaskAutomation.deleteMany({}), Counter.deleteMany({}), ExpenseReply.deleteMany({}), ExpenseCapture.deleteMany({}), Contact.deleteMany({}), Conversation.deleteMany({}), Message.deleteMany({})]);
+  await Promise.all([User.deleteMany({}), Lead.deleteMany({}), LeadActivity.deleteMany({}), Task.deleteMany({}), TaskAutomation.deleteMany({}), Counter.deleteMany({}), ExpenseReply.deleteMany({}), ExpenseCapture.deleteMany({}), Contact.deleteMany({}), Conversation.deleteMany({}), Message.deleteMany({}), CampaignMap.deleteMany({})]);
+  // Slice 5: the Bali ad is mapped to holidays (campaign map) — the CTWA
+  // flow below is byte-for-byte the 3c flow.
+  await CampaignMap.create({ adId: REFERRAL.source_id, businessLine: "concierge", label: "Bali promo" });
   await User.collection.insertOne({ _id: ADMIN, name: "Ops Admin", email: "ops@plumtrips.com", roles: ["ADMIN"], passwordHash: "x", workspaceId: WS } as any);
   await User.create({ email: "bound@x.test", passwordHash: "x", workspaceId: WS, name: "Bound Employee", status: "ACTIVE", waId: BOUND });
   const soft = await User.create({ email: "soft@x.test", passwordHash: "x", workspaceId: WS, name: "Soft Employee", status: "ACTIVE", phone: "+91 92222 22222" });
@@ -290,12 +294,14 @@ describe("soft-employee consent bind", () => {
 
   it("an INACTIVE soft employee saying YES cannot bind (ACTIVE-only writer), no waId, no enqueue", async () => {
     // resolveIdentity's soft User match is ACTIVE-only, so this sender is
-    // 'unknown', gets support, and never even sees a prompt.
+    // 'unknown' and never sees a consent prompt. As any stranger on an
+    // unrouted thread they get the Slice 5 intent menu — once — and nothing else.
     await post([image(SOFT_INACTIVE)]);
-    expect(graph).toHaveLength(0);
+    expect(graph).toHaveLength(1);
+    expect(graph[0].buttons).toEqual(["pc_bl_plumtrips", "pc_bl_helloviza", "pc_bl_concierge"]);
     expect((await Contact.findOne({ phone: SOFT_INACTIVE }).lean())!.identityState).toBe("unknown");
     await post([text(SOFT_INACTIVE, "yes")]);
-    expect(graph).toHaveLength(0);
+    expect(graph).toHaveLength(1); // not a consent answer, not a re-sent menu
     expect(await User.countDocuments({ waId: SOFT_INACTIVE })).toBe(0);
     expect(await ExpenseCapture.countDocuments({})).toBe(0);
   });
@@ -304,18 +310,21 @@ describe("soft-employee consent bind", () => {
 /* ───────────────────────────── unchanged routes / flag off ───────────────────────────── */
 
 describe("Slice 2 / 3b unchanged; flag OFF", () => {
-  it("bound employee → expense wrap; stranger 'hi' → support; hard + referral → lead thread without a Lead; none of these send", async () => {
+  it("bound employee → expense wrap; stranger 'hi' → support thread + intent menu (Slice 5); hard + referral → lead thread without a Lead and no send", async () => {
     const m = text(BOUND, "confirm");
     await post([m]);
     expect(await ExpenseReply.countDocuments({ messageId: m.id })).toBe(1);
+    expect(graph).toHaveLength(0);
 
     await post([text(STRANGER, "hi")]);
     expect((await Conversation.findOne({ kind: "support" }).lean())).toBeTruthy();
     expect(await Lead.countDocuments({})).toBe(0);
+    expect(graph).toHaveLength(1); // the intent menu is the only send a bare "hi" produces
+    expect(graph[0].to).toBe(STRANGER);
 
     await post([text(BOUND, "ad", { referral: REFERRAL })]);
     expect(await Lead.countDocuments({})).toBe(0);
-    expect(graph).toHaveLength(0);
+    expect(graph).toHaveLength(1);
   });
 
   it("FLAG OFF: a CTWA stranger, a soft employee's receipt and a bound employee produce ZERO Graph calls and no PlumConnect records", async () => {

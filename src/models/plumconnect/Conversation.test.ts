@@ -11,7 +11,7 @@ process.env.FRONTEND_ORIGIN ||= "http://localhost:5173";
 process.env.S3_BUCKET ||= "test-bucket";
 process.env.GEMINI_API_KEY ||= "test-gemini-key";
 
-const { default: Conversation, CONVERSATION_STATUSES, CONVERSATION_KINDS } = await import("./Conversation.js");
+const { default: Conversation, CONVERSATION_STATUSES, CONVERSATION_KINDS, BUSINESS_LINES, INTENT_SOURCES } = await import("./Conversation.js");
 const { default: Contact } = await import("./Contact.js");
 
 let mongod: MongoMemoryServer;
@@ -142,5 +142,33 @@ describe("PlumConnectConversation", () => {
     expect(has({ assignedTo: 1, status: 1 })).toBe(true);
     const leadIdx = indexes.find((i) => JSON.stringify(i.key) === JSON.stringify({ leadId: 1 }));
     expect(leadIdx?.sparse).toBe(true);
+  });
+
+  // Slice 5 — business line + intent are additive and default to "unset".
+  describe("Slice 5 fields", () => {
+    it("default to null / '' so every pre-Slice-5 row reads as unrouted", async () => {
+      const contact = await Contact.create({ phone: "919876543210" });
+      const created = await Conversation.create({ contactId: contact._id, channelAccountId: "1265026903369191" });
+      const row = await Conversation.findById(created._id).lean();
+      expect(row).toMatchObject({ businessLine: null, intent: "", intentSource: null, intentConfidence: null, intentMenuSentAt: null });
+    });
+
+    it("accept the three lines and three sources, reject anything else", async () => {
+      const contact = await Contact.create({ phone: "919876543211" });
+      const row = await Conversation.create({ contactId: contact._id, businessLine: "helloviza", intentSource: "menu", intentConfidence: 1, intent: "menu:helloviza" });
+      expect((await Conversation.findById(row._id).lean())).toMatchObject({ businessLine: "helloviza", intentSource: "menu", intentConfidence: 1 });
+      expect(BUSINESS_LINES).toEqual(["plumtrips", "helloviza", "concierge"]);
+      expect(INTENT_SOURCES).toEqual(["keyword", "menu", "campaign_map"]);
+      await expect(Conversation.create({ contactId: contact._id, businessLine: "sales" })).rejects.toThrow(/businessLine/);
+      await expect(Conversation.create({ contactId: contact._id, intentSource: "llm" })).rejects.toThrow(/intentSource/);
+    });
+
+    it("adds ONE index, {businessLine:1} sparse — nothing on intent/source/confidence", async () => {
+      const indexes = await Conversation.collection.indexes();
+      const bl = indexes.find((i) => JSON.stringify(i.key) === JSON.stringify({ businessLine: 1 }));
+      expect(bl?.sparse).toBe(true);
+      const keys = indexes.map((i) => Object.keys(i.key).join(","));
+      expect(keys.some((k) => /intent/.test(k))).toBe(false);
+    });
   });
 });

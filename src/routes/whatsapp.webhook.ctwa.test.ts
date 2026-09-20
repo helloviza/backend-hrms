@@ -55,6 +55,7 @@ const { default: ExpenseCapture } = await import("../models/ExpenseCapture.js");
 const { default: Contact } = await import("../models/plumconnect/Contact.js");
 const { default: Conversation } = await import("../models/plumconnect/Conversation.js");
 const { default: Message } = await import("../models/plumconnect/Message.js");
+const { default: CampaignMap } = await import("../models/plumconnect/CampaignMap.js");
 
 const app = express();
 app.use("/api/whatsapp", express.raw({ type: "application/json" }), router);
@@ -104,7 +105,10 @@ beforeEach(async () => {
   H.trigger.mockClear();
   H.send.mockClear();
   delete process.env.CRM_V2_OPPORTUNITY;
-  await Promise.all([User.deleteMany({}), Lead.deleteMany({}), LeadActivity.deleteMany({}), Task.deleteMany({}), TaskAutomation.deleteMany({}), Counter.deleteMany({}), ExpenseReply.deleteMany({}), ExpenseCapture.deleteMany({}), Contact.deleteMany({}), Conversation.deleteMany({}), Message.deleteMany({})]);
+  await Promise.all([User.deleteMany({}), Lead.deleteMany({}), LeadActivity.deleteMany({}), Task.deleteMany({}), TaskAutomation.deleteMany({}), Counter.deleteMany({}), ExpenseReply.deleteMany({}), ExpenseCapture.deleteMany({}), Contact.deleteMany({}), Conversation.deleteMany({}), Message.deleteMany({}), CampaignMap.deleteMany({})]);
+  // Slice 5: Ops has mapped the Bali ad to holidays, so every referral below
+  // routes to concierge by the campaign map — the exact 3b behaviour.
+  await CampaignMap.create({ adId: REFERRAL.source_id, businessLine: "concierge", label: "Bali promo" });
   await User.collection.insertOne({ _id: ADMIN, name: "Ops Admin", email: "ops@plumtrips.com", roles: ["ADMIN"], passwordHash: "x", workspaceId: WS } as any);
   await User.collection.insertOne({ _id: SALES, name: "Sana Holiday", email: "sana@plumtrips.com", roles: ["EMPLOYEE"], passwordHash: "x", workspaceId: WS } as any);
   await User.create({ email: "emp@x.test", passwordHash: "x", workspaceId: WS, name: "Bound Employee", status: "ACTIVE", waId: EMPLOYEE });

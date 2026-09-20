@@ -25,6 +25,14 @@
 //     transport — the ad fact lives in attribution, never in sourceChannel.
 //   • Assignee: PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE, else the first
 //     ADMIN/SUPERADMIN — the website-capture rule (routes/leads.ts:260-264).
+//
+// Slice 5: captureLead({ businessLine, ... }) generalises the capture to the
+// three business lines (LEAD_SHAPE_FOR_LINE picks enquiryType / type) and to
+// ORGANIC contacts (no referral → no attribution, no ad note). The
+// businessLine comes from the Intent Engine (dispatch.ts / intent.ts) and is
+// never derived from attribution here. captureHolidayLead() is the 3b
+// signature, fixed to "concierge". The assignee rule is shared by all three
+// lines for now — per-line routing is a later slice.
 
 import mongoose from "mongoose";
 import User from "../../models/User.js";
@@ -33,6 +41,7 @@ import PlumConnectContact from "../../models/plumconnect/Contact.js";
 import PlumConnectConversation, { type IPlumConnectConversation } from "../../models/plumconnect/Conversation.js";
 import PlumConnectMessage from "../../models/plumconnect/Message.js";
 import { LEAD_SOURCES, type LeadAttribution } from "../../models/Lead.js";
+import type { BusinessLine } from "../../models/plumconnect/Conversation.js";
 import { createLead } from "../leads.service.js";
 import { holidayLeadAssigneeId } from "../../config/plumconnect.js";
 import { whatsappLogger } from "../../utils/logger.js";
@@ -130,6 +139,28 @@ export async function resolveHolidayLeadAssignee(): Promise<{ id: mongoose.Types
 
 /* ───────────────────────────── capture ───────────────────────────── */
 
+/** Slice 5 — which department a lead belongs to decides its enquiryType / type. */
+export const LEAD_SHAPE_FOR_LINE: Record<BusinessLine, { enquiryType: string; type: "individual" | "company"; label: string }> = {
+  concierge: { enquiryType: "holiday_package", type: "individual", label: "holiday" },
+  helloviza: { enquiryType: "visa", type: "individual", label: "visa" },
+  plumtrips: { enquiryType: "corporate_account", type: "company", label: "corporate travel" },
+};
+
+export interface CaptureLeadInput {
+  /** Slice 5 — the Intent Engine's answer. captureHolidayLead() fixes it to "concierge". */
+  businessLine: BusinessLine;
+  canonical: string;
+  profileName: string;
+  /** Present on a CTWA first message; null/undefined for an organic contact. */
+  referralRaw?: unknown;
+  contactId: mongoose.Types.ObjectId;
+  conversation: IPlumConnectConversation;
+  /** The wamid of the inbound that triggered this (for the touch record). */
+  messageId: string;
+  now?: Date;
+}
+
+/** The 3b signature — a concierge (holiday) capture. Kept as-is for callers and tests. */
 export interface CaptureHolidayLeadInput {
   canonical: string;
   profileName: string;
@@ -146,13 +177,30 @@ export type CaptureHolidayLeadResult =
   | { touch: "repeat"; created: false; leadId: mongoose.Types.ObjectId };
 
 export async function captureHolidayLead(input: CaptureHolidayLeadInput): Promise<CaptureHolidayLeadResult> {
+  return captureLead({ ...input, businessLine: "concierge" });
+}
+
+/**
+ * Create (or, on a repeat touch, record against) the Lead for a routed
+ * conversation. For businessLine "concierge" this is byte-for-byte the 3b
+ * holiday capture; helloviza / plumtrips differ only in enquiryType / type
+ * and the wording of the notes (LEAD_SHAPE_FOR_LINE).
+ */
+export async function captureLead(input: CaptureLeadInput): Promise<CaptureHolidayLeadResult> {
   const now = input.now ?? new Date();
+  const hasReferral = Boolean(input.referralRaw);
   const parsed = parseReferral(input.referralRaw);
   const conversationId = input.conversation._id as mongoose.Types.ObjectId;
+  const shape = LEAD_SHAPE_FOR_LINE[input.businessLine];
 
   // ── Dedup: the open lead thread already has its Lead ──────────────────
   if (input.conversation.leadId) {
     const leadId = input.conversation.leadId as mongoose.Types.ObjectId;
+    if (!hasReferral) {
+      // An organic repeat message on a routed thread is just conversation —
+      // the department's human queue sees it; nothing to record on the Lead.
+      return { touch: "repeat", created: false, leadId };
+    }
     await PlumConnectMessage.create({
       conversationId,
       direction: "INBOUND",
@@ -180,7 +228,7 @@ export async function captureHolidayLead(input: CaptureHolidayLeadInput): Promis
   const assignee = await resolveHolidayLeadAssignee();
 
   const body = {
-    type: "individual",
+    type: shape.type,
     // Lead.contactName is `required` and Mongoose rejects "" — a sender with
     // no WhatsApp profile name gets the plan's placeholder (§5), not a
     // validation error.
@@ -190,10 +238,12 @@ export async function captureHolidayLead(input: CaptureHolidayLeadInput): Promis
     companyName: "",
     source: leadSourceForReferral(parsed),
     stage: "new",
-    notes: parsed.headline || parsed.body ? `WhatsApp ad referral: ${referralSummary(parsed)}` : "",
-    enquiryType: "holiday_package",
+    notes: hasReferral && (parsed.headline || parsed.body) ? `WhatsApp ad referral: ${referralSummary(parsed)}` : "",
+    enquiryType: shape.enquiryType,
     sourceChannel: "whatsapp",
-    attribution: attributionFor(parsed, conversationId, now),
+    // Attribution is typed only when a referral exists (Slice 3b); an organic
+    // contact leaves the sub-doc at its defaults.
+    ...(hasReferral ? { attribution: attributionFor(parsed, conversationId, now) } : {}),
   };
 
   const { lead } = await createLead({
@@ -210,8 +260,9 @@ export async function captureHolidayLead(input: CaptureHolidayLeadInput): Promis
   await PlumConnectContact.updateOne({ _id: input.contactId }, { $addToSet: { "refs.leadIds": leadId } });
   input.conversation.leadId = leadId;
 
-  whatsappLogger.info("PlumConnect: holiday lead created from CTWA referral", {
+  whatsappLogger.info(`PlumConnect: ${shape.label} lead created (${hasReferral ? "CTWA referral" : "organic"})`, {
     leadId: String(leadId),
+    businessLine: input.businessLine,
     leadCode: lead.leadCode,
     conversationId: String(conversationId),
     assignedTo: assignee ? String(assignee.id) : null,

@@ -33,6 +33,14 @@ export type ConversationStatus = (typeof CONVERSATION_STATUSES)[number];
 
 // "unparsed" — Slice 3c: the bot re-asked once and still could not parse the
 // answer; it stops and leaves the step for a human.
+// Slice 5 — Stage-1 routing. businessLine = WHAT the contact wants; campaign
+// lineage (Slice 8) = WHERE they came from. Orthogonal by design: intent
+// classification never reads attribution and attribution never reads intent.
+export const BUSINESS_LINES = ["plumtrips", "helloviza", "concierge"] as const;
+export type BusinessLine = (typeof BUSINESS_LINES)[number];
+export const INTENT_SOURCES = ["keyword", "menu", "campaign_map"] as const;
+export type IntentSource = (typeof INTENT_SOURCES)[number];
+
 export const BOT_STOP_REASONS = ["human", "complete", "timeout", "unparsed"] as const;
 export type BotStopReason = (typeof BOT_STOP_REASONS)[number];
 
@@ -54,6 +62,13 @@ export interface IPlumConnectConversation extends Document {
   assignedTo?: mongoose.Types.ObjectId | null;
   leadId?: mongoose.Types.ObjectId | null;
   referralRaw?: unknown;
+  /** Slice 5 — set once the Intent Engine has routed the thread; null until then. */
+  businessLine?: BusinessLine | null;
+  intent: string;
+  intentSource?: IntentSource | null;
+  intentConfidence?: number | null;
+  /** When the interactive intent menu was last sent (null = never). */
+  intentMenuSentAt?: Date | null;
   bot: IPlumConnectConversationBot;
   lastInboundAt?: Date | null;
   lastOutboundAt?: Date | null;
@@ -85,6 +100,12 @@ const PlumConnectConversationSchema = new Schema<IPlumConnectConversation>(
     assignedTo: { type: Schema.Types.ObjectId, ref: "User", default: null },
     leadId: { type: Schema.Types.ObjectId, ref: "Lead", default: null },
     referralRaw: { type: Schema.Types.Mixed, default: null },
+    // Slice 5 — additive, all default null / "".
+    businessLine: { type: String, enum: [...BUSINESS_LINES, null], default: null },
+    intent: { type: String, trim: true, default: "" },
+    intentSource: { type: String, enum: [...INTENT_SOURCES, null], default: null },
+    intentConfidence: { type: Number, default: null },
+    intentMenuSentAt: { type: Date, default: null },
     bot: { type: BotSchema, default: () => ({}) },
     lastInboundAt: { type: Date, default: null },
     lastOutboundAt: { type: Date, default: null },
@@ -103,6 +124,8 @@ PlumConnectConversationSchema.index({ status: 1, lastMessageAt: -1 });
 PlumConnectConversationSchema.index({ assignedTo: 1, status: 1 });
 // Lead detail → its conversation.
 PlumConnectConversationSchema.index({ leadId: 1 }, { sparse: true });
+// Department queues (Slice 5): the inbox filters by business line.
+PlumConnectConversationSchema.index({ businessLine: 1 }, { sparse: true });
 
 const PlumConnectConversation =
   (mongoose.models.PlumConnectConversation as mongoose.Model<IPlumConnectConversation>) ||

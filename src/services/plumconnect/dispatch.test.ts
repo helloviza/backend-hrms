@@ -20,7 +20,9 @@ const H = vi.hoisted(() => ({
   enqueueExpenseReply: vi.fn(),
   enqueueExpenseButton: vi.fn(),
   enqueueExpenseCapture: vi.fn(),
-  captureHolidayLead: vi.fn(),
+  captureLead: vi.fn(),
+  sendIntentMenu: vi.fn(),
+  lookupCampaignMap: vi.fn(),
   startBot: vi.fn(),
   handleBotTurn: vi.fn(),
   promptForConsent: vi.fn(),
@@ -36,7 +38,13 @@ vi.mock("./enqueueExpense.js", () => ({
 }));
 vi.mock("./holidayLead.js", async (importOriginal) => {
   const real: any = await importOriginal();
-  return { ...real, captureHolidayLead: H.captureHolidayLead };
+  return { ...real, captureLead: H.captureLead };
+});
+// Slice 5: the classifier and the menu helpers are real (pure); the menu SEND
+// and the campaign-map READ are spies, so this file still proves routing only.
+vi.mock("./intent.js", async (importOriginal) => {
+  const real: any = await importOriginal();
+  return { ...real, sendIntentMenu: H.sendIntentMenu, lookupCampaignMap: H.lookupCampaignMap };
 });
 // Slice 3c collaborators are unit-tested on their own; here they are spies so
 // this file keeps proving ROUTING only.
@@ -127,7 +135,15 @@ beforeEach(async () => {
   H.enqueueExpenseReply.mockResolvedValue({ enqueued: true });
   H.enqueueExpenseButton.mockResolvedValue({ enqueued: true });
   H.enqueueExpenseCapture.mockResolvedValue({ enqueued: true });
-  H.captureHolidayLead.mockImplementation(async (input: any) => ({ touch: "first", created: true, leadId: new mongoose.Types.ObjectId(), assignedTo: null, _conversationId: input.conversation._id }));
+  H.captureLead.mockImplementation(async (input: any) => {
+    const leadId = new mongoose.Types.ObjectId();
+    // mirror the real adapter's one side effect the dispatcher relies on
+    input.conversation.leadId = leadId;
+    await Conversation.updateOne({ _id: input.conversation._id }, { $set: { leadId } });
+    return { touch: "first", created: true, leadId, assignedTo: null, _conversationId: input.conversation._id };
+  });
+  H.sendIntentMenu.mockResolvedValue(true);
+  H.lookupCampaignMap.mockResolvedValue(null);
   H.startBot.mockResolvedValue(undefined);
   H.handleBotTurn.mockResolvedValue({ handled: true, step: "ask_destination", advanced: true, stopped: null });
   H.promptForConsent.mockResolvedValue({ prompted: true });
@@ -179,7 +195,7 @@ describe("dispatchInbound — precedence", () => {
     H.resolveIdentity.mockResolvedValue(unknown());
     H.readExpenseInFlow.mockResolvedValue(FRESH);
     const out = await dispatchInbound(env({ text: "confirm" }), NOW);
-    expect(out.route).toBe("support");
+    expect(out.route).toBe("intent_menu"); // Slice 5: an unrouted stranger is asked, never enqueued
     expect(anyEnqueue()).toBe(0);
   });
 
@@ -201,6 +217,7 @@ describe("dispatchInbound — precedence", () => {
 
   it("2. referral, no flow, unknown sender → lead conversation with referralRaw verbatim, no enqueue", async () => {
     H.resolveIdentity.mockResolvedValue(unknown());
+    H.lookupCampaignMap.mockResolvedValue("concierge"); // Slice 5: Ops mapped this ad to holidays
     const out = await dispatchInbound(env({ referral: REFERRAL, text: "saw your ad" }), NOW);
     expect(out.route).toBe("lead_referral");
     expect(anyEnqueue()).toBe(0);
@@ -209,11 +226,15 @@ describe("dispatchInbound — precedence", () => {
     expect(conv!.status).toBe("OPEN");
     expect(conv!.referralRaw).toEqual(REFERRAL);
     expect(conv!.channelAccountId).toBe(PN);
-    // Slice 3b: the holiday-lead adapter runs for a non-employee, on this thread
-    expect(H.captureHolidayLead).toHaveBeenCalledTimes(1);
-    expect(String(H.captureHolidayLead.mock.calls[0][0].conversation._id)).toBe(String(conv!._id));
-    expect(H.captureHolidayLead.mock.calls[0][0]).toMatchObject({ canonical: WA, profileName: "Priya", referralRaw: REFERRAL });
+    // Slice 3b: the lead adapter runs for a non-employee, on this thread — as a holiday lead (Slice 5 line)
+    expect(H.captureLead).toHaveBeenCalledTimes(1);
+    expect(String(H.captureLead.mock.calls[0][0].conversation._id)).toBe(String(conv!._id));
+    expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "concierge", canonical: WA, profileName: "Priya", referralRaw: REFERRAL });
     expect((out as any).lead).toMatchObject({ touch: "first", created: true });
+    expect((out as any).intent).toMatchObject({ businessLine: "concierge", source: "campaign_map" });
+    expect(conv).toMatchObject({ businessLine: "concierge", intentSource: "campaign_map" });
+    expect(H.lookupCampaignMap).toHaveBeenCalledWith({ sourceId: "1202" });
+    expect(H.sendIntentMenu).not.toHaveBeenCalled();
     // Slice 3c: a first-touch lead starts the bot; the adapter's headline is passed through
     expect(H.startBot).toHaveBeenCalledTimes(1);
     expect(H.startBot.mock.calls[0][1]).toBe("Bali");
@@ -224,7 +245,8 @@ describe("dispatchInbound — precedence", () => {
     const out = await dispatchInbound(env({ referral: REFERRAL }), NOW);
     expect(out.route).toBe("lead_referral");
     expect(anyEnqueue()).toBe(0);
-    expect(H.captureHolidayLead).not.toHaveBeenCalled();
+    expect(H.captureLead).not.toHaveBeenCalled();
+    expect(H.sendIntentMenu).not.toHaveBeenCalled();
     expect((out as any).lead).toBeUndefined();
   });
 
@@ -270,7 +292,12 @@ describe("dispatchInbound — precedence", () => {
   it("4. unknown sender, no referral, no flow → SUPPORT: no enqueue, conversation OPEN/support, inbound Message persisted", async () => {
     H.resolveIdentity.mockResolvedValue(unknown());
     const out = await dispatchInbound(env({ text: "hi" }), NOW);
-    expect(out.route).toBe("support");
+    // Slice 5: "hi" resolves nothing → the menu goes out; the thread stays a
+    // support thread with no Lead until the contact answers.
+    expect(out.route).toBe("intent_menu");
+    expect((out as any).intent).toMatchObject({ businessLine: null, menuSent: true });
+    expect(H.sendIntentMenu).toHaveBeenCalledTimes(1);
+    expect(H.captureLead).not.toHaveBeenCalled();
     expect(anyEnqueue()).toBe(0);
 
     const contact = await Contact.findOne({}).lean();
@@ -280,7 +307,7 @@ describe("dispatchInbound — precedence", () => {
     expect(contact!.refs.userId).toBeNull();
 
     const conv = await Conversation.findOne({}).lean();
-    expect(conv).toMatchObject({ kind: "support", status: "OPEN", channel: "whatsapp", channelAccountId: PN });
+    expect(conv).toMatchObject({ kind: "support", status: "OPEN", channel: "whatsapp", channelAccountId: PN, businessLine: null, leadId: null });
     expect(conv!.lastInboundAt).toEqual(NOW);
 
     const msg = await Message.findOne({}).lean();
@@ -299,10 +326,10 @@ describe("dispatchInbound — precedence", () => {
     expect(contact!.refs.userId).toBeNull(); // a reference is written only from a HARD identity
   });
 
-  it("4''. SOFT-matched sender saying 'hi' → still plain support (consent is the receipt case only)", async () => {
+  it("4''. SOFT-matched sender saying 'hi' → no consent prompt (that is the receipt case only); Slice 5 asks the menu", async () => {
     H.resolveIdentity.mockResolvedValue(soft());
     const out = await dispatchInbound(env({ text: "hi" }), NOW);
-    expect(out.route).toBe("support");
+    expect(out.route).toBe("intent_menu");
     expect(H.promptForConsent).not.toHaveBeenCalled();
     expect(anyEnqueue()).toBe(0);
   });
@@ -315,6 +342,181 @@ describe("dispatchInbound — precedence", () => {
     const types = (await Message.find({}).lean()).map((m) => m.type).sort();
     expect(types).toEqual(["location", "reaction", "sticker", "unsupported"]);
     expect(anyEnqueue()).toBe(0);
+  });
+});
+
+/* ───────────────────────────── Slice 5 — the Intent Engine ───────────────────────────── */
+
+describe("dispatchInbound — Intent Engine (non-employee only)", () => {
+  const conv = () => Conversation.findOne({}).lean();
+
+  it("keywords: 'visa for Germany' → helloviza Lead (intent_lead, source keyword), NO bot", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    const out = await dispatchInbound(env({ text: "Need a visa for Germany next month" }), NOW);
+    expect(out.route).toBe("intent_lead");
+    expect((out as any).intent).toMatchObject({ businessLine: "helloviza", source: "keyword" });
+    expect(H.captureLead).toHaveBeenCalledTimes(1);
+    expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "helloviza", canonical: WA, referralRaw: undefined });
+    expect(H.startBot).not.toHaveBeenCalled();
+    expect(H.sendIntentMenu).not.toHaveBeenCalled();
+    const c = await conv();
+    expect(c).toMatchObject({ kind: "lead", businessLine: "helloviza", intentSource: "keyword" });
+    expect(c!.intent).toBe("visa"); // the audit label is the matched term, never the message
+    expect(c!.intentConfidence).toBeGreaterThan(0);
+  });
+
+  it("keywords: 'corporate travel platform' → plumtrips Lead, NO bot", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    const out = await dispatchInbound(env({ text: "Looking for a corporate travel platform for our company" }), NOW);
+    expect(out.route).toBe("intent_lead");
+    expect((out as any).intent).toMatchObject({ businessLine: "plumtrips", source: "keyword" });
+    expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "plumtrips" });
+    expect(H.startBot).not.toHaveBeenCalled();
+  });
+
+  it("keywords: 'plan a Bali holiday' → concierge Lead AND the qualification bot starts (3c flow, no referral headline)", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    const out = await dispatchInbound(env({ text: "Want to plan a Bali holiday in December" }), NOW);
+    expect(out.route).toBe("intent_lead");
+    expect((out as any).intent).toMatchObject({ businessLine: "concierge", source: "keyword" });
+    expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "concierge" });
+    expect(H.startBot).toHaveBeenCalledTimes(1);
+    expect(H.startBot.mock.calls[0][1]).toBe(""); // organic: no ad headline
+  });
+
+  it("menu: bare 'hi' → menu once; a second 'hello?' inside 24h does NOT re-send; tapping Visa → helloviza Lead with source 'menu'", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    const a = await dispatchInbound(env({ text: "hi" }), NOW);
+    expect(a.route).toBe("intent_menu");
+    expect((a as any).intent.menuSent).toBe(true);
+    // the dispatcher re-reads the thread on the next inbound; the real sender stamped intentMenuSentAt
+    await Conversation.updateOne({}, { $set: { intentMenuSentAt: NOW } });
+
+    const b = await dispatchInbound(env({ text: "hello?" }), new Date(NOW.getTime() + 60_000));
+    expect(b.route).toBe("intent_menu");
+    expect((b as any).intent.menuSent).toBe(false);
+    expect(H.sendIntentMenu).toHaveBeenCalledTimes(1);
+    expect(H.captureLead).not.toHaveBeenCalled();
+
+    const c = await dispatchInbound(env({ type: "interactive", text: "", buttonId: "pc_bl_helloviza" }), new Date(NOW.getTime() + 120_000));
+    expect(c.route).toBe("intent_lead");
+    expect((c as any).intent).toMatchObject({ businessLine: "helloviza", source: "menu", confidence: 1 });
+    expect(H.captureLead).toHaveBeenCalledTimes(1);
+    expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "helloviza" });
+    expect(H.startBot).not.toHaveBeenCalled();
+    expect(await conv()).toMatchObject({ kind: "lead", businessLine: "helloviza", intentSource: "menu", intent: "menu:helloviza" });
+    expect(await Conversation.countDocuments({})).toBe(1);
+  });
+
+  it("menu: tapping Holiday → concierge Lead + bot (exactly the ad path); a later text on that thread is a bot turn, not a re-classification", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    await dispatchInbound(env({ text: "hi" }), NOW);
+    const b = await dispatchInbound(env({ type: "interactive", text: "", buttonId: "pc_bl_concierge" }), NOW);
+    expect(b.route).toBe("intent_lead");
+    expect(H.startBot).toHaveBeenCalledTimes(1);
+    await Conversation.updateOne({}, { $set: { "bot.active": true, "bot.step": "ask_name" } });
+    const c = await dispatchInbound(env({ text: "visa please" }), NOW); // would classify helloviza if the thread were unrouted
+    expect(c.route).toBe("bot");
+    expect(H.handleBotTurn).toHaveBeenCalledTimes(1);
+    expect(H.captureLead).toHaveBeenCalledTimes(1);
+    expect((await conv())!.businessLine).toBe("concierge");
+  });
+
+  it("menu: 'Something else' (pc_bl_other) → support; no Lead, no bot, no second menu", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    await dispatchInbound(env({ text: "hi" }), NOW);
+    const b = await dispatchInbound(env({ type: "interactive", text: "", buttonId: "pc_bl_other" }), NOW);
+    expect(b.route).toBe("support");
+    expect((b as any).intent).toMatchObject({ businessLine: null, source: "menu" });
+    expect(H.captureLead).not.toHaveBeenCalled();
+    expect(H.startBot).not.toHaveBeenCalled();
+    expect(H.sendIntentMenu).toHaveBeenCalledTimes(1);
+    expect((await conv())!.kind).toBe("support");
+  });
+
+  it("routed department thread: later organic text is plain support for the human queue — no re-classification, no menu, no second Lead", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    await dispatchInbound(env({ text: "corporate travel for my company" }), NOW);
+    H.captureLead.mockImplementation(async (input: any) => ({ touch: "repeat", created: false, leadId: input.conversation.leadId }));
+    const b = await dispatchInbound(env({ text: "we need a holiday package too" }), NOW); // concierge words on a plumtrips thread
+    expect(b.route).toBe("support");
+    expect(H.captureLead).toHaveBeenCalledTimes(1); // only the first message created a Lead
+    expect(H.sendIntentMenu).not.toHaveBeenCalled();
+    expect(H.startBot).not.toHaveBeenCalled();
+    expect((await conv())!.businessLine).toBe("plumtrips");
+  });
+
+  it("referral: a mapped ad routes by the campaign map WITHOUT classifying (text says visa, map says concierge → concierge)", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    H.lookupCampaignMap.mockResolvedValue("concierge");
+    const out = await dispatchInbound(env({ referral: REFERRAL, text: "visa visa visa" }), NOW);
+    expect(out.route).toBe("lead_referral");
+    expect((out as any).intent).toMatchObject({ businessLine: "concierge", source: "campaign_map", confidence: 1 });
+    expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "concierge", referralRaw: REFERRAL });
+    expect(H.startBot).toHaveBeenCalledTimes(1);
+    expect((await conv())!.intent).toBe("ad:1202");
+  });
+
+  it("referral: an UNMAPPED ad with classifiable text → keyword line (helloviza) on a lead_referral, no bot", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    const out = await dispatchInbound(env({ referral: REFERRAL, text: "Hi, I saw your ad about Schengen visa" }), NOW);
+    expect(out.route).toBe("lead_referral");
+    expect((out as any).intent).toMatchObject({ businessLine: "helloviza", source: "keyword" });
+    expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "helloviza", referralRaw: REFERRAL });
+    expect(H.startBot).not.toHaveBeenCalled();
+    expect(H.sendIntentMenu).not.toHaveBeenCalled();
+  });
+
+  it("referral: an UNMAPPED ad with the default CTWA text → the menu, no Lead yet; a repeat referral on a routed thread is a touch, not a re-route", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    const a = await dispatchInbound(env({ referral: REFERRAL, text: "Hello! Can I get more info on this?" }), NOW);
+    expect(a.route).toBe("intent_menu");
+    expect((a as any).intent.menuSent).toBe(true);
+    expect(H.captureLead).not.toHaveBeenCalled();
+    expect((await conv())!.kind).toBe("lead"); // the referral thread is a lead thread (3b), still unrouted
+    expect((await conv())!.businessLine).toBeNull();
+
+    const b = await dispatchInbound(env({ type: "interactive", text: "", buttonId: "pc_bl_plumtrips" }), NOW);
+    expect(b.route).toBe("intent_lead");
+    expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "plumtrips", referralRaw: undefined });
+
+    H.captureLead.mockImplementation(async (input: any) => ({ touch: "repeat", created: false, leadId: input.conversation.leadId }));
+    H.lookupCampaignMap.mockResolvedValue("concierge"); // a DIFFERENT, mapped ad — must not re-route
+    const c = await dispatchInbound(env({ referral: { ...REFERRAL, source_id: "1203" }, text: "hi" }), NOW);
+    expect(c.route).toBe("lead_referral");
+    expect((c as any).intent).toMatchObject({ businessLine: "plumtrips", source: null });
+    expect(H.lookupCampaignMap).toHaveBeenCalledTimes(1); // only the first referral was looked up
+    expect(H.captureLead).toHaveBeenLastCalledWith(expect.objectContaining({ businessLine: "plumtrips", referralRaw: { ...REFERRAL, source_id: "1203" } }));
+    expect(H.startBot).not.toHaveBeenCalled();
+  });
+
+  it("a pre-Slice-5 lead thread (leadId, no businessLine) is treated as concierge — never re-asked", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    await dispatchInbound(env({ text: "hi" }), NOW);
+    await Conversation.updateOne({}, { $set: { kind: "lead", leadId: new mongoose.Types.ObjectId() } });
+    H.captureLead.mockImplementation(async (input: any) => ({ touch: "repeat", created: false, leadId: input.conversation.leadId }));
+    const b = await dispatchInbound(env({ text: "visa please" }), NOW);
+    expect(b.route).toBe("support");
+    expect(H.sendIntentMenu).toHaveBeenCalledTimes(1);
+    expect(H.captureLead).not.toHaveBeenCalled();
+  });
+
+  it("a soft-matched employee with a consent prompt pending gets NO menu on top of it", async () => {
+    H.resolveIdentity.mockResolvedValue(soft());
+    await dispatchInbound(env({ type: "image", media: IMAGE }), NOW);
+    await Contact.updateOne({}, { $set: { "consent.expenseBindAskedAt": NOW } });
+    const b = await dispatchInbound(env({ text: "who is this?" }), NOW);
+    expect(b.route).toBe("support");
+    expect(H.sendIntentMenu).not.toHaveBeenCalled();
+  });
+
+  it("the Intent Engine never sees a hard identity: a verified employee's text is the chain's, whatever the words", async () => {
+    H.resolveIdentity.mockResolvedValue(hard());
+    const out = await dispatchInbound(env({ text: "visa for Germany" }), NOW);
+    expect(out.route).toBe("expense_verified");
+    expect(H.captureLead).not.toHaveBeenCalled();
+    expect(H.sendIntentMenu).not.toHaveBeenCalled();
+    expect((await conv())!.businessLine).toBeNull();
   });
 });
 
@@ -373,7 +575,7 @@ describe("dispatchInbound — its own records", () => {
     expect(anyEnqueue()).toBe(0);
   });
 
-  it("the dispatcher never calls a sender (this slice sends nothing)", async () => {
+  it("the dispatcher never calls a cloud sender directly (bot/consent → sendAndPersist, menu → the 4a wrapper)", async () => {
     // whatsappCloud.service is not imported by dispatch.ts at all.
     const src = await import("node:fs").then((fs) => fs.readFileSync(new URL("./dispatch.ts", import.meta.url), "utf8"));
     expect(src).not.toMatch(/whatsappCloud\.service/);
