@@ -122,6 +122,7 @@ import activityRoutes from "./routes/activity.js";
 import presenceRoutes from "./routes/presence.js";
 import meetingRoutes from "./routes/meetings.js";
 import leadsRouter from "./routes/leads.js";
+import plumconnectRouter from "./routes/plumconnect.js";
 import crmCompaniesRouter from "./routes/crm.companies.js";
 import crmContactsRouter from "./routes/crm.contacts.js";
 import trainingRouter from "./routes/training.js";
@@ -1116,6 +1117,9 @@ app.use("/api/meetings", meetingRoutes);
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Sales CRM (Plumtrips Travel)
   app.use("/api/leads", requireAuth, requireWorkspace, requireFeature("crmEnabled"), leadsRouter);
+  // PlumConnect inbox API (Slice 4b). HOUSE-only; the router itself 404s
+  // unless PLUMCONNECT_ENABLED=true and 403s without a plumconnect grant.
+  app.use("/api/plumconnect", requireAuth, requireWorkspace, requireFeature("plumconnectEnabled"), requireHouse, plumconnectRouter);
   app.use("/api/crm/companies", requireAuth, requireWorkspace, requireFeature("crmEnabled"), crmCompaniesRouter);
   app.use("/api/crm/contacts", requireAuth, requireWorkspace, requireFeature("crmEnabled"), crmContactsRouter);
   // Plumtrips Learning Hub — internal training HTML, HOUSE staff only (routes/training.ts).

@@ -108,6 +108,15 @@ export interface UserPermissionDoc extends Document {
     // CSTEP Travel & Claim Portal
     cstep: ModulePermission
 
+    // PlumConnect inbox (Slice 4b). READ = see the conversations in scope,
+    // WRITE = reply / note / assign to self / resolve, FULL = reassign to
+    // others. Scope OWN = conversations assigned to me, ALL = every
+    // conversation (ADMIN/SUPERADMIN are ALL by role). Dark-launch posture
+    // like visaScreening: NONE in every level template, granted per-user in
+    // AccessConsole. Gated on the plumconnectEnabled workspace feature
+    // (HOUSE bypasses requireFeature).
+    plumconnect: ModulePermission
+
     // Visa Application (concierge console) — READ = view applications,
     // WRITE = work applications (concierge agent), FULL = manage fees and
     // rules (concierge lead). Not yet used by any route (see routes/visa.ts,
@@ -256,6 +265,7 @@ const modulesSchema = new Schema(
 
     // CSTEP Travel & Claim Portal
     cstep: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    plumconnect: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
 
     // Visa Application (concierge console)
     visaApplication: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },

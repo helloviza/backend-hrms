@@ -68,6 +68,7 @@ type ModulesTemplate = {
   leads?:            ModulePermission
   // CSTEP Travel & Claim Portal
   cstep:             ModulePermission
+  plumconnect:       ModulePermission // Slice 4b — NONE everywhere; per-user grant
   // Visa Application (concierge console)
   visaApplication:   ModulePermission
   // Visa Screening (2026-08-12) — the authority to judge an applicant's
@@ -134,6 +135,7 @@ const L1: ModulesTemplate = {
   crmCompanies:      NONE,
   leads:             NONE,
   cstep:             NONE,
+  plumconnect:       NONE,
   visaApplication:   NONE,
   visaScreening:     NONE,
   consumerContactPII: NONE,
@@ -218,6 +220,7 @@ const L6: ModulesTemplate = {
   crmCompanies:      WRITE_WS,
   leads:             WRITE_WS,
   cstep:             FULL_WS,
+  plumconnect:       NONE,
   visaApplication:   FULL_WS,
   visaScreening:     NONE,
   consumerContactPII: NONE,
@@ -285,6 +288,7 @@ const L8: ModulesTemplate = {
   crmCompanies:      FULL_ALL,
   leads:             FULL_ALL,
   cstep:             FULL_WS,
+  plumconnect:       NONE,
   visaApplication:   FULL_ALL,
   visaScreening:     NONE,
   consumerContactPII: NONE,
@@ -334,6 +338,7 @@ const VENDOR: ModulesTemplate = {
   crmCompanies:      NONE,
   leads:             NONE,
   cstep:             NONE,
+  plumconnect:       NONE,
   visaApplication:   NONE,
   visaScreening:     NONE,
   consumerContactPII: NONE,
@@ -383,6 +388,7 @@ const CUSTOMER_SBT: ModulesTemplate = {
   crmCompanies:      NONE,
   leads:             NONE,
   cstep:             NONE,
+  plumconnect:       NONE,
   visaApplication:   NONE,
   visaScreening:     NONE,
   consumerContactPII: NONE,
@@ -432,6 +438,7 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   crmCompanies:      NONE,
   leads:             NONE,
   cstep:             NONE,
+  plumconnect:       NONE,
   visaApplication:   NONE,
   visaScreening:     NONE,
   consumerContactPII: NONE,
@@ -524,6 +531,7 @@ const TENANT_ADMIN: ModulesTemplate = {
   crmCompanies:      NONE,
   leads:             NONE,
   cstep:             NONE,
+  plumconnect:       NONE,
   visaApplication:   NONE,
   visaScreening:     NONE,
   // Consumer (D2C/Helloviza) contact details. Plumtrips-internal like the

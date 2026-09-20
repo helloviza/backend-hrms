@@ -50,6 +50,8 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   crmContacts:       ["crmEnabled"],
   crmCompanies:      ["crmEnabled"],
   leads:             ["crmEnabled"],
+  // PLUMCONNECT (Slice 4b) — the WhatsApp inbox; its own workspace feature.
+  plumconnect:       ["plumconnectEnabled"],
   // VISA APPLICATION (concierge console) — not yet consumed by any route
   // (see routes/visa.ts, gated on visaEnabled directly); wired for
   // grantability ahead of the concierge console phase.

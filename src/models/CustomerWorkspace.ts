@@ -35,6 +35,10 @@ export interface WorkspaceFeatures {
   // new module, not part of any tenant plan preset yet; granted only by
   // superadmin toggle.
   cstepEnabled?: boolean;
+
+  // PlumConnect WhatsApp inbox (Slice 4b). SCHEMA DEFAULT false; not in any
+  // plan preset; HOUSE is entitled by the requireFeature bypass.
+  plumconnectEnabled?: boolean;
 }
 
 export type WorkspacePlan = "trial" | "starter" | "growth" | "enterprise";
@@ -323,6 +327,7 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         // gated off until granted by superadmin toggle. Not enabled in any
         // tenant plan preset (see getDefaultFeaturesForPlan below).
         cstepEnabled: { type: Boolean, default: false },
+        plumconnectEnabled: { type: Boolean, default: false },
       },
     },
 
