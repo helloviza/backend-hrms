@@ -11,8 +11,8 @@
 // Precedence — the first that applies wins:
 //   1. IN-FLOW EXPENSE  a fresh (non-stale) expense capture/session for this
 //                       sender AND a hard identity      → hand to the chain
-//   2. CTWA REFERRAL    message.referral present         → lead conversation
-//                       (Slice 3 owns the lead; here the thread + raw referral)
+//   2. CTWA REFERRAL    message.referral present         → lead conversation +
+//                       (non-employee) a holiday Lead via createLead() — Slice 3b
 //   3. VERIFIED         hard identity (ACTIVE User.waId) → hand to the chain
 //   4. SUPPORT          everything else                  → support conversation,
 //                       OPEN, no expense row, no expense-bot reply.
@@ -26,8 +26,8 @@
 // as it does for the legacy path; this file decides WHO reaches the
 // enqueue, nothing more.
 //
-// This slice sends nothing. The consent prompt for soft-matched employees
-// and the qualification bot are Slice 3; human replies are Slice 4.
+// Nothing here sends. The consent prompt for soft-matched employees and the
+// qualification bot are Slice 3c; human replies are Slice 4.
 
 import type mongoose from "mongoose";
 import { toCanonical } from "../../utils/phone.js";
@@ -35,6 +35,7 @@ import { resolveIdentity, type IdentityResolution } from "./resolveIdentity.js";
 import { readExpenseInFlow, type ExpenseInFlow } from "./expenseInFlow.js";
 import { upsertContact, openOrGetConversation, appendInbound } from "./conversationStore.js";
 import { enqueueExpenseReply, enqueueExpenseButton, enqueueExpenseCapture, type EnqueueResult } from "./enqueueExpense.js";
+import { captureHolidayLead, type CaptureHolidayLeadResult } from "./holidayLead.js";
 import type { ConversationKind } from "../../models/plumconnect/Conversation.js";
 import { whatsappLogger } from "../../utils/logger.js";
 
@@ -112,6 +113,8 @@ export type DispatchOutcome =
       identityState: IdentityResolution["identityState"];
       /** Present only when the chain was handed the message. */
       enqueue?: EnqueueResult & { collection: "ExpenseReply" | "ExpenseCapture" } | { enqueued: false; collection: null; reason: string };
+      /** Present on lead_referral for a non-employee: what the holiday-lead adapter did. */
+      lead?: CaptureHolidayLeadResult;
       inFlow: ExpenseInFlow;
     }
   | { route: "duplicate"; canonical: string; messageId: string }
@@ -241,14 +244,30 @@ export async function dispatchInbound(env: InboundEnvelope, now: Date = new Date
   }
 
   if (route === "lead_referral") {
-    // Slice 3 creates the Lead + starts the bot here. Slice 2 only records
-    // the thread with the verbatim referral (a CTWA referral arrives on the
-    // first message only — it must be captured now or never).
-    whatsappLogger.info("PlumConnect: CTWA referral captured (lead consumer not enabled)", {
+    // Slice 3b: the referral is already verbatim on the Conversation
+    // (openOrGetConversation) and on the inbound Message payload. For a
+    // NON-employee it now also becomes a holiday Lead through the 3a
+    // createLead() seam — or, when this contact's open lead thread already
+    // has its Lead, a repeat-touch record and nothing else. An employee who
+    // taps an ad keeps the lead-kind thread but gets no Lead row. Nothing is
+    // sent (bot + consent prompt are Slice 3c).
+    if (identity.hard) {
+      whatsappLogger.info("PlumConnect: CTWA referral from a verified employee — thread only, no Lead", {
+        messageId: env.messageId,
+        conversationId: String(conversation._id),
+      });
+      return { route, ...base };
+    }
+    const lead = await captureHolidayLead({
+      canonical,
+      profileName: env.profileName,
+      referralRaw: env.referral,
+      contactId: contact._id as mongoose.Types.ObjectId,
+      conversation,
       messageId: env.messageId,
-      conversationId: String(conversation._id),
+      now,
     });
-    return { route, ...base };
+    return { route, ...base, lead };
   }
 
   // SUPPORT — the killed default. No enqueue, no reply; the inbox (Slice 4)

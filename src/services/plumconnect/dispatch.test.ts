@@ -20,6 +20,7 @@ const H = vi.hoisted(() => ({
   enqueueExpenseReply: vi.fn(),
   enqueueExpenseButton: vi.fn(),
   enqueueExpenseCapture: vi.fn(),
+  captureHolidayLead: vi.fn(),
 }));
 
 vi.mock("./resolveIdentity.js", () => ({ resolveIdentity: H.resolveIdentity }));
@@ -29,6 +30,7 @@ vi.mock("./enqueueExpense.js", () => ({
   enqueueExpenseButton: H.enqueueExpenseButton,
   enqueueExpenseCapture: H.enqueueExpenseCapture,
 }));
+vi.mock("./holidayLead.js", () => ({ captureHolidayLead: H.captureHolidayLead }));
 vi.mock("../../utils/logger.js", () => ({
   whatsappLogger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -108,6 +110,7 @@ beforeEach(async () => {
   H.enqueueExpenseReply.mockResolvedValue({ enqueued: true });
   H.enqueueExpenseButton.mockResolvedValue({ enqueued: true });
   H.enqueueExpenseCapture.mockResolvedValue({ enqueued: true });
+  H.captureHolidayLead.mockImplementation(async (input: any) => ({ touch: "first", created: true, leadId: new mongoose.Types.ObjectId(), assignedTo: null, _conversationId: input.conversation._id }));
 });
 
 const anyEnqueue = () =>
@@ -185,13 +188,20 @@ describe("dispatchInbound — precedence", () => {
     expect(conv!.status).toBe("OPEN");
     expect(conv!.referralRaw).toEqual(REFERRAL);
     expect(conv!.channelAccountId).toBe(PN);
+    // Slice 3b: the holiday-lead adapter runs for a non-employee, on this thread
+    expect(H.captureHolidayLead).toHaveBeenCalledTimes(1);
+    expect(String(H.captureHolidayLead.mock.calls[0][0].conversation._id)).toBe(String(conv!._id));
+    expect(H.captureHolidayLead.mock.calls[0][0]).toMatchObject({ canonical: WA, profileName: "Priya", referralRaw: REFERRAL });
+    expect((out as any).lead).toMatchObject({ touch: "first", created: true });
   });
 
-  it("2'. referral + hard identity (employee clicks an ad) → lead, not expense", async () => {
+  it("2'. referral + hard identity (employee clicks an ad) → lead thread, not expense, and NO Lead row (adapter not called)", async () => {
     H.resolveIdentity.mockResolvedValue(hard());
     const out = await dispatchInbound(env({ referral: REFERRAL }), NOW);
     expect(out.route).toBe("lead_referral");
     expect(anyEnqueue()).toBe(0);
+    expect(H.captureHolidayLead).not.toHaveBeenCalled();
+    expect((out as any).lead).toBeUndefined();
   });
 
   it("3. hard identity, media → chain capture with the SAME input shape the legacy path used", async () => {
