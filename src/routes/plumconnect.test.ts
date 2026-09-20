@@ -123,6 +123,37 @@ const list = (who: mongoose.Types.ObjectId, q = "") => request(app).get(`/api/pl
 const open = (who: mongoose.Types.ObjectId, id: any) => request(app).get(`/api/plumconnect/conversations/${id}`).set(as(who));
 const act = (who: mongoose.Types.ObjectId, id: any, verb: string, body: any = {}) => request(app).post(`/api/plumconnect/conversations/${id}/${verb}`).set(as(who)).send(body);
 
+/* ───────────────────────────── list payload (Slice 5 follow-through) ───────────────────────────── */
+
+describe("list payload carries businessLine", () => {
+  it("surfaces plumtrips / helloviza / concierge on lead threads, and null on a thread with no line (support)", async () => {
+    await Conversation.updateOne({ _id: convA._id }, { $set: { businessLine: "concierge", intentSource: "campaign_map" } });
+    const now = new Date();
+    const cH = await Contact.create({ phone: "919555555555", displayName: "Viza" });
+    const cP = await Contact.create({ phone: "919666666666", displayName: "Corp" });
+    await Conversation.create({ contactId: cH._id, kind: "lead", status: "OPEN", assignedTo: null, businessLine: "helloviza", intentSource: "keyword", lastInboundAt: now, lastMessageAt: now });
+    await Conversation.create({ contactId: cP._id, kind: "lead", status: "OPEN", assignedTo: null, businessLine: "plumtrips", intentSource: "menu", lastInboundAt: now, lastMessageAt: now });
+
+    const r = await list(IDS.manager);
+    expect(r.status).toBe(200);
+    const byName = Object.fromEntries(r.body.conversations.map((c: any) => [c.contact.displayName, c]));
+    expect(byName.Alpha).toMatchObject({ kind: "lead", businessLine: "concierge" });
+    expect(byName.Viza).toMatchObject({ kind: "lead", businessLine: "helloviza" });
+    expect(byName.Corp).toMatchObject({ kind: "lead", businessLine: "plumtrips" });
+    // a support thread (pre-Slice-5 row shape: field absent) serialises as an explicit null, not undefined
+    expect(byName.Bravo.kind).toBe("support");
+    expect(byName.Bravo).toHaveProperty("businessLine", null);
+    expect(new Set(r.body.conversations.map((c: any) => c.businessLine))).toEqual(new Set(["concierge", "helloviza", "plumtrips", null]));
+    // every pre-existing field is still there (additive)
+    for (const k of ["_id", "kind", "status", "assignedTo", "leadId", "bot", "lastInboundAt", "lastOutboundAt", "lastMessageAt", "resolvedAt", "resolvedBy", "createdAt", "contact"]) {
+      expect(byName.Alpha).toHaveProperty(k);
+    }
+    // the same summary shape comes back from open()
+    const o = await open(IDS.manager, convA._id);
+    expect(o.body.conversation).toMatchObject({ businessLine: "concierge" });
+  });
+});
+
 /* ───────────────────────────── scope isolation ───────────────────────────── */
 
 describe("scope isolation (the security property)", () => {

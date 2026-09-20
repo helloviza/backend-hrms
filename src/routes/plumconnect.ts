@@ -121,6 +121,9 @@ function summarize(c: any, contact: any) {
   return {
     _id: c._id,
     kind: c.kind,
+    // Slice 5: which department a lead-kind thread belongs to (null = not
+    // yet routed, or not a lead). Additive; the list shows it as the label.
+    businessLine: c.businessLine ?? null,
     status: c.status,
     assignedTo: c.assignedTo ?? null,
     leadId: c.leadId ?? null,
