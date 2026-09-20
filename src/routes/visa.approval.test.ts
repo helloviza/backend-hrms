@@ -218,6 +218,20 @@ vi.mock("../models/User.js", () => ({
   },
 }));
 
+// resolveL1Approver (reports.service) now consults the per-person expense grant
+// store (expenseGrants.service -> models/ExpenseApproverGrant) for its admin
+// fallback. Visa has no grants of its own: an EMPTY store is the honest
+// fixture — the same shape prod has before the grant migration runs — and it
+// keeps the seeded users' role tokens as the only admin signal, exactly as the
+// assertions below assume. Without this mock the lookup hits the never-
+// connected sentinel Mongo and every decision test buffers for 10s.
+vi.mock("../models/ExpenseApproverGrant.js", () => ({
+  default: {
+    find: () => chainable(() => []),
+    findOne: () => chainable(() => null),
+  },
+}));
+
 vi.mock("../models/CustomerWorkspace.js", () => ({
   default: {
     findById: () => chainable(() => (workspaceConfig.value ? { config: workspaceConfig.value } : null)),
