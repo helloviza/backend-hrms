@@ -32,6 +32,8 @@ import PlumConnectConversation, { CONVERSATION_KINDS, CONVERSATION_STATUSES } fr
 import PlumConnectMessage from "../models/plumconnect/Message.js";
 import PlumConnectContact from "../models/plumconnect/Contact.js";
 import User from "../models/User.js";
+import { UserPermission } from "../models/UserPermission.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 import { inboxScope, conversationMatch, canSee, canWrite, canReassign } from "../services/plumconnect/inboxScope.js";
 import { stopBot, botIsActive } from "../services/plumconnect/bot.js";
 import { sendTextOutcome } from "../services/plumconnect/outbound.js";
@@ -42,6 +44,8 @@ type AnyObj = Record<string, any>;
 /** Free-form replies must land inside Meta's customer-service window. */
 export const REPLY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const LIST_LIMIT = 100;
+// Mirrors routes/leads.ts:39 / middleware/requireHouse.ts:7. NEVER write to it.
+const HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
 const TEXT_CAP = 4096;
 
 const router = express.Router();
@@ -132,6 +136,40 @@ function summarize(c: any, contact: any) {
 }
 
 /* ───────────────────────────── routes ───────────────────────────── */
+
+// GET /agents — who can be assigned a conversation. Mirrors
+// requirePlumConnectAccess EXACTLY (the /leads/reps posture): HOUSE
+// ADMIN/SUPERADMIN by role, unioned with explicit plumconnect grants;
+// resolved against ACTIVE HOUSE users. Added for the 4c reassign picker.
+router.get("/agents", async (_req, res) => {
+  try {
+    const houseObjectId = new mongoose.Types.ObjectId(HOUSE_WORKSPACE_ID);
+    const grants = await UserPermission.find({
+      workspaceId: HOUSE_WORKSPACE_ID,
+      universe: "STAFF",
+      "modules.plumconnect.access": { $in: ["READ", "WRITE", "FULL"] },
+    })
+      .select("userId")
+      .lean();
+    const roleAgents = await User.find({ workspaceId: houseObjectId, roles: { $in: ["ADMIN", "SUPERADMIN"] } }).select("_id").lean();
+    const union = new Map<string, mongoose.Types.ObjectId>();
+    for (const g of grants as any[]) {
+      const id = String(g.userId || "");
+      if (mongoose.isValidObjectId(id)) union.set(id, new mongoose.Types.ObjectId(id));
+    }
+    for (const u of roleAgents as any[]) union.set(String(u._id), u._id);
+    const users = (await User.find({ workspaceId: houseObjectId, _id: { $in: [...union.values()] }, ...activeUserFilter() })
+      .select("_id name firstName lastName email")
+      .lean()) as any[];
+    const agents = users
+      .map((u) => ({ _id: String(u._id), name: (u.name && String(u.name).trim()) || `${u.firstName || ""} ${u.lastName || ""}`.trim() || String(u.email || ""), email: String(u.email || "") }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return res.json({ agents });
+  } catch (err) {
+    logger.error("plumconnect GET /agents error", { err });
+    return res.status(500).json({ error: "Failed to list agents." });
+  }
+});
 
 // GET / — the inbox list, scoped, newest activity first.
 router.get("/conversations", async (req, res) => {

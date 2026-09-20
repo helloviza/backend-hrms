@@ -328,6 +328,22 @@ describe("resolve / reopen", () => {
 
 /* ───────────────────────────── flag / permission key ───────────────────────────── */
 
+describe("GET /agents — the reassign picker mirrors the gate", () => {
+  it("lists ADMIN by role + explicit plumconnect grants, ACTIVE HOUSE users only; NONE-only users are absent", async () => {
+    // The fixtures' workspace is not HOUSE; move the relevant users under HOUSE for this check.
+    const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
+    await User.updateMany({ _id: { $in: [IDS.admin, IDS.manager, IDS.repA, IDS.reader, IDS.leadsOnly, IDS.nobody] } }, { $set: { workspaceId: HOUSE } });
+    await UserPermission.updateMany({ userId: { $in: [String(IDS.manager), String(IDS.repA), String(IDS.reader), String(IDS.leadsOnly)] } }, { $set: { workspaceId: String(HOUSE) } });
+    await User.updateOne({ _id: IDS.reader }, { $set: { status: "INACTIVE" } });
+    const r = await request(app).get("/api/plumconnect/agents").set(as(IDS.repA));
+    expect(r.status).toBe(200);
+    const ids = r.body.agents.map((a: any) => a._id).sort();
+    expect(ids).toEqual([String(IDS.admin), String(IDS.manager), String(IDS.repA)].sort()); // reader inactive, leadsOnly/nobody ungranted, repB not HOUSE
+    expect(r.body.agents.find((a: any) => a._id === String(IDS.repA)).name).toBe("User repA");
+    await User.updateOne({ _id: IDS.reader }, { $set: { status: "ACTIVE" } });
+  });
+});
+
 describe("flag OFF and the permission key", () => {
   it("PLUMCONNECT_ENABLED off → 404 on every route, for everyone, before any permission check", async () => {
     delete process.env.PLUMCONNECT_ENABLED;
