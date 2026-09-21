@@ -39,11 +39,10 @@
 import "../bootstrap/loadSecrets.js";
 import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
-import { assertLocalDatabase } from "../seed/assertLocalDatabase.js";
+import { plumconnectDevTargetProblem } from "../seed/plumconnectDevGuard.js";
 
 /* ───────────────────────────── the guard ───────────────────────────── */
-
-const PROD_LOOKALIKE = /prod|mongodb\.net|atlas|amazonaws|plumtrips_hrms/i;
+// One definition, shared with scripts/plumconnect-local.mjs: seed/plumconnectDevGuard.ts.
 
 function refuse(reason: string): never {
   console.error(`\n[plumconnect-seed-dev] REFUSING TO RUN: ${reason}\n`);
@@ -51,14 +50,9 @@ function refuse(reason: string): never {
 }
 
 function guard(): string {
-  if (process.env.NODE_ENV === "production") refuse("NODE_ENV is 'production'. This seed writes fake data and never runs there.");
   const uri = String(process.env.MONGO_URI || "");
-  try {
-    assertLocalDatabase(uri);
-  } catch (e) {
-    refuse((e as Error).message);
-  }
-  if (PROD_LOOKALIKE.test(uri)) refuse(`MONGO_URI looks like a production target (${uri.replace(/\/\/[^@]*@/, "//<creds>@")}).`);
+  const problem = plumconnectDevTargetProblem(uri, process.env.NODE_ENV);
+  if (problem) refuse(problem);
   return uri;
 }
 

@@ -27,7 +27,8 @@
     "seed:dev": "node --env-file=.env.development --import tsx src/seed/seed-dev.ts",
     "seed:consumer": "node --env-file=.env.development --import tsx src/seed/seed-consumer-dev.ts",
     "seed:expenses": "node --env-file=.env.development --import tsx src/seed/seed-expense-engine-dev.ts",
-    "seed:plumconnect": "node --env-file=.env.development --import tsx src/scripts/plumconnect-seed-dev.ts"
+    "seed:plumconnect": "node --env-file=.env.development --import tsx src/scripts/plumconnect-seed-dev.ts",
+    "plumconnect:local": "node --env-file=.env.development --import tsx scripts/plumconnect-local.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-apprunner": "^3.693.0",
