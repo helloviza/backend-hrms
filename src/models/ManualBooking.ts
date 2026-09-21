@@ -2,6 +2,7 @@ import { Schema, model, type Document } from "mongoose";
 import TravelBooking from "./TravelBooking.js";
 import CustomerWorkspace from "./CustomerWorkspace.js";
 import { lookupDestination, lookupDestinationFuzzy } from "../data/destinationLookup.js";
+import { returnJourneyStart } from "../services/flightLegs.js";
 
 export const PENDING_SUB_STATUSES = [
   "Pending for Customer Confirmation",
@@ -56,6 +57,27 @@ export const ATTACHMENT_REQUIRED_TYPES: readonly ManualBookingType[] = [
   "HOTEL", "DUMMY_HOTEL",
 ];
 
+export const MANUAL_BOOKING_TRIP_TYPES = ["ONE_WAY", "ROUND_TRIP", "MULTI_CITY"] as const;
+export type ManualBookingTripType = (typeof MANUAL_BOOKING_TRIP_TYPES)[number];
+
+// One flight segment of a multi-leg booking — 1:1 with the ticket's printed
+// segments (a round trip via a hub is FOUR legs). Connection-vs-journey is a
+// display concern; `layover` is the only hint stored for it.
+export interface ManualBookingLeg {
+  origin: string;
+  destination: string;
+  flightNo?: string;
+  airline?: string;
+  departDate?: Date;
+  /** Printed clock time, e.g. "06:30" — text as printed, never parsed. */
+  departTime?: string;
+  arriveDate?: Date;
+  arriveTime?: string;
+  cabinClass?: string;
+  /** Layover printed AFTER this leg (e.g. "2h 15m"); present ⇒ the next leg is a connection. */
+  layover?: string;
+}
+
 export interface IManualBooking extends Document {
   workspaceId: Schema.Types.ObjectId;
   bookingRef: string;
@@ -94,6 +116,15 @@ export interface IManualBooking extends Document {
     // Visa Service group only.
     visaCountry?: string;
     visaType?: string;
+    // Multi-leg flights (Step 4). ADDITIVE: legacy rows have neither field
+    // (absent — `undefined` under .lean(), `[]` on a hydrated doc), so every
+    // reader guards with `Array.isArray(legs) && legs.length`. When legs are
+    // present the flat fields above are DERIVED from them by the pre-save
+    // hook (deriveFlatFromLegs below), so the mirror, invoices, exports and
+    // markup-analysis keep reading the single origin/destination/flightNo/
+    // airline they always did.
+    tripType?: ManualBookingTripType;
+    legs?: ManualBookingLeg[];
   };
   passengers: {
     name: string;
@@ -295,6 +326,29 @@ const ManualBookingSchema = new Schema<IManualBooking>(
       vehicleType: String,
       visaCountry: String,
       visaType: String,
+      tripType: { type: String, enum: MANUAL_BOOKING_TRIP_TYPES },
+      legs: {
+        type: [
+          new Schema<ManualBookingLeg>(
+            {
+              origin: { type: String, required: true },
+              destination: { type: String, required: true },
+              flightNo: String,
+              airline: String,
+              departDate: Date,
+              departTime: String,
+              arriveDate: Date,
+              arriveTime: String,
+              cabinClass: String,
+              layover: String,
+            },
+            { _id: false },
+          ),
+        ],
+        // No `[]` default: Mongoose would persist an empty array on every
+        // save and "legacy row" would become indistinguishable from "no legs".
+        default: undefined,
+      },
     },
     passengers: [
       {
@@ -500,6 +554,65 @@ function apportionLineItemGst(
       : parseFloat(quotedAmount.toFixed(2));
   });
 }
+
+/* ── Multi-leg → flat-field derivation ───────────────────────────────
+ * Every reader of a flight booking (the TravelBooking mirror below,
+ * invoiceLineItems, bookingToRow / the customer export, markup-analysis,
+ * the list page) reads ONE origin/destination/flightNo/airline plus the
+ * top-level travelDate/returnDate. Rather than teach each of them about
+ * legs[], the flat fields become a derived summary whenever legs exist:
+ *
+ *   origin      = legs[0].origin
+ *   destination = ROUND_TRIP: the turnaround city — the destination of the
+ *                 last leg BEFORE the return journey. NOT the final leg's
+ *                 destination, which for a round trip is the origin again
+ *                 and would make Top Destinations rank Delhi as the
+ *                 destination of DEL→BOM→DEL. Otherwise the last leg's.
+ *   flightNo    = legs[0].flightNo  — leg 0 only, never joined, so the
+ *   airline     = legs[0].airline     markup-analysis route key and every
+ *                                      old sheet keep a single value.
+ *   travelDate  = legs[0].departDate
+ *   returnDate  = ROUND_TRIP: the RETURN leg's DEPARTURE date. This is the
+ *                 fix for the Step-2 autofill that stored leg 0's ARRIVAL
+ *                 here and so made the mirror's travelDateEnd the outbound
+ *                 arrival. Otherwise the last leg's arrival date.
+ *
+ * Legacy rows carry no legs[] and are never touched — the guard is
+ * `legs.length > 0`. Exported so the test can drive it without a DB. The
+ * turnaround is located by services/flightLegs.ts returnJourneyStart (shared
+ * with the auto-fill so both agree on which leg is the return).
+ */
+export function deriveFlatFromLegs(doc: {
+  itinerary?: IManualBooking["itinerary"];
+  travelDate?: Date;
+  returnDate?: Date;
+}): void {
+  const it = doc.itinerary;
+  const legs = it?.legs;
+  if (!it || !Array.isArray(legs) || legs.length === 0) return;
+  const first = legs[0];
+  const last = legs[legs.length - 1];
+
+  it.origin = first.origin;
+  it.flightNo = first.flightNo;
+  it.airline = first.airline;
+  if (first.departDate) doc.travelDate = first.departDate;
+
+  if (it.tripType === "ROUND_TRIP" && legs.length >= 2) {
+    const home = returnJourneyStart(legs);
+    it.destination = legs[home - 1].destination;
+    const back = legs[home].departDate;
+    if (back) doc.returnDate = back;
+  } else {
+    it.destination = last.destination;
+    if (last.arriveDate) doc.returnDate = last.arriveDate;
+  }
+}
+
+ManualBookingSchema.pre("save", function (next) {
+  deriveFlatFromLegs(this as any);
+  next();
+});
 
 ManualBookingSchema.pre("save", async function (next) {
   // Auto-generate bookingRef for new documents

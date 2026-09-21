@@ -5,23 +5,50 @@
 // it is unit-testable against hand-written vouchers and re-runnable over a
 // stored extractedJson.
 //
-// SINGLE LEG ONLY (Step 2). The form has one itinerary block, so this reads
-// SEGMENT 0 and reports how many segments the ticket actually had; the form
-// tells the operator when it was more than one. Multi-leg / round-trip lands
-// with a model change in a later step — do not grow this to cover it.
+// MULTI-LEG (Step 4). EVERY segment the extractor read becomes one entry of
+// `legs[]`, 1:1 and lossless — a round trip via a hub is four legs;
+// connection-vs-journey is a display concern. `tripType` is derived from
+// the legs (services/flightLegs.ts). The leg-0 scalars are STILL returned so
+// the single-itinerary form keeps working until it grows leg rows.
 //
 // Field-name contract (form ⇄ voucher), verified against ManualBookingForm's
-// FormState / PassengerInput and types/voucher.ts:
-//   travelDate  ← flight_details.segments[0].origin.date
-//   returnDate  ← flight_details.segments[0].destination.date   ("Arrival / Return Date")
-//   origin      ← segments[0].origin.code        (form label "Origin Code")
-//   destination ← segments[0].destination.code
-//   flightNo    ← segments[0].flight_no
-//   airline     ← segments[0].airline
+// FormState / PassengerInput, models/ManualBooking.ts ManualBookingLeg and
+// types/voucher.ts:
+//   legs[i].origin/destination ← segments[i].origin.code / destination.code
+//   legs[i].flightNo/airline   ← segments[i].flight_no / airline
+//   legs[i].departDate/Time    ← segments[i].origin.date / origin.time
+//   legs[i].arriveDate/Time    ← segments[i].destination.date / destination.time
+//   legs[i].cabinClass/layover ← segments[i].class / layover_duration
+//   travelDate  ← legs[0].departDate
+//   returnDate  ← ROUND_TRIP: the RETURN leg's departDate (fixes the Step-2
+//                 bug that put leg 0's ARRIVAL here); otherwise the last
+//                 leg's arriveDate. Same rule as the model's pre-save
+//                 derivation (deriveFlatFromLegs), so a booking saved from
+//                 this fill and one saved with legs[] agree.
+//   origin / flightNo / airline ← legs[0]  (compat scalars; leg 0 by decision)
+//   destination ← the turnaround city (ROUND_TRIP) / last leg's destination,
+//                 same as deriveFlatFromLegs — never merely leg 0's.
 //   supplierPNR ← booking_info.pnr, else booking_info.booking_id
 //   supplierName — NO source on the voucher (no agency/issuer field); always null
 //   passengers[] ← passengers[].{name,type,email,phone}; PAN has no source
 import type { PlumtripsVoucher } from "../types/index.js";
+import { deriveTripType, returnJourneyStart, type TripType } from "./flightLegs.js";
+
+export interface FlightAutofillLeg {
+  origin: string | null;
+  destination: string | null;
+  flightNo: string | null;
+  airline: string | null;
+  /** ISO YYYY-MM-DD, or null when unparseable (raw kept alongside). */
+  departDate: string | null;
+  departDateRaw: string | null;
+  departTime: string | null;
+  arriveDate: string | null;
+  arriveDateRaw: string | null;
+  arriveTime: string | null;
+  cabinClass: string | null;
+  layover: string | null;
+}
 
 export interface FlightAutofillPassenger {
   name: string;
@@ -43,8 +70,12 @@ export interface FlightAutofill {
   airline: string | null;
   supplierPNR: string | null;
   supplierName: null;
-  /** Segments the ticket carried; the form fills from the first only. */
+  /** Segments the ticket carried — always equals legs.length. */
   segmentCount: number;
+  /** ONE_WAY | ROUND_TRIP | MULTI_CITY, derived from the legs; null when the ticket had no segment. */
+  tripType: TripType | null;
+  /** Every segment, in ticket order, 1:1. Empty when the ticket had none. */
+  legs: FlightAutofillLeg[];
   passengers: FlightAutofillPassenger[];
 }
 
@@ -161,22 +192,63 @@ export function buildFlightAutofill(voucher: PlumtripsVoucher | null | undefined
 
   if (!segments.length && !passengers.length) return null;
 
-  const seg = segments[0];
-  const depRaw = str(seg?.origin?.date);
-  const arrRaw = str(seg?.destination?.date);
+  const legs: FlightAutofillLeg[] = segments.map((seg) => {
+    const depRaw = str(seg?.origin?.date);
+    const arrRaw = str(seg?.destination?.date);
+    return {
+      origin: str(seg?.origin?.code)?.toUpperCase() ?? null,
+      destination: str(seg?.destination?.code)?.toUpperCase() ?? null,
+      flightNo: str(seg?.flight_no),
+      airline: str(seg?.airline),
+      departDate: parseTicketDate(depRaw),
+      departDateRaw: depRaw,
+      departTime: str(seg?.origin?.time),
+      arriveDate: parseTicketDate(arrRaw),
+      arriveDateRaw: arrRaw,
+      arriveTime: str(seg?.destination?.time),
+      cabinClass: str(seg?.class),
+      layover: str(seg?.layover_duration),
+    };
+  });
+
+  const first = legs[0];
+  const last = legs[legs.length - 1];
+  const tripType = legs.length ? deriveTripType(legs) : null;
+
+  // "Arrival / Return Date": the return leg's departure for a round trip,
+  // else the final arrival. Falls back to the leg-0 arrival (the old value)
+  // only when the chosen date is unparseable — keeps the raw for the hint.
+  // `destination` follows the same rule (turnaround city for a round trip,
+  // final arrival otherwise) so the unchanged single-itinerary form saves the
+  // journey's destination, not merely leg 0's — DEL→BOM→DXB fills DXB, not
+  // BOM. flightNo/airline stay leg 0 by decision.
+  let returnDate: string | null = null;
+  let returnDateRaw: string | null = null;
+  let destination: string | null = last?.destination ?? null;
+  if (tripType === "ROUND_TRIP") {
+    const home = returnJourneyStart(legs);
+    destination = legs[home - 1].destination;
+    returnDate = legs[home].departDate;
+    returnDateRaw = legs[home].departDateRaw;
+  } else if (last) {
+    returnDate = last.arriveDate;
+    returnDateRaw = last.arriveDateRaw;
+  }
 
   return {
-    travelDate: parseTicketDate(depRaw),
-    travelDateRaw: depRaw,
-    returnDate: parseTicketDate(arrRaw),
-    returnDateRaw: arrRaw,
-    origin: str(seg?.origin?.code)?.toUpperCase() ?? null,
-    destination: str(seg?.destination?.code)?.toUpperCase() ?? null,
-    flightNo: str(seg?.flight_no),
-    airline: str(seg?.airline),
+    travelDate: first?.departDate ?? null,
+    travelDateRaw: first?.departDateRaw ?? null,
+    returnDate,
+    returnDateRaw,
+    origin: first?.origin ?? null,
+    destination,
+    flightNo: first?.flightNo ?? null,
+    airline: first?.airline ?? null,
     supplierPNR: str(voucher.booking_info?.pnr) ?? str(voucher.booking_info?.booking_id),
     supplierName: null,
-    segmentCount: segments.length,
+    segmentCount: legs.length,
+    tripType,
+    legs,
     passengers,
   };
 }

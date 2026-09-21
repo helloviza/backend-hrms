@@ -3,7 +3,7 @@
 // the shapes the extractor actually emits.
 import { describe, it, expect } from "vitest";
 import { buildFlightAutofill, normalizePassengerType, parseTicketDate } from "./flightAutofill.js";
-import type { PlumtripsVoucher } from "../types/index.js";
+import type { PlumtripsVoucher, FlightSegment } from "../types/index.js";
 
 function voucher(over: Partial<PlumtripsVoucher> = {}): PlumtripsVoucher {
   return {
@@ -101,17 +101,17 @@ describe("buildFlightAutofill — single leg into the form's own field names", (
     expect(fill.travelDateRaw).toBe("sometime in October");
   });
 
-  it("reports segmentCount but fills only the first leg (multi-leg is a later step)", () => {
-    const v = voucher();
-    v.flight_details!.segments.push({
-      airline: "IndiGo", flight_no: "6E 202", class: null, duration: null,
-      origin: { city: "Mumbai", code: "BOM", time: null, date: "20 Oct 2026", terminal: null },
-      destination: { city: "Delhi", code: "DEL", time: null, date: "20 Oct 2026", terminal: null },
-    });
-    const fill = buildFlightAutofill(v)!;
-    expect(fill.segmentCount).toBe(2);
-    expect(fill.origin).toBe("DEL");
-    expect(fill.travelDate).toBe("2026-10-15");
+  it("a single leg is ONE_WAY with one leg entry mirroring the scalars", () => {
+    const fill = buildFlightAutofill(voucher())!;
+    expect(fill.tripType).toBe("ONE_WAY");
+    expect(fill.legs).toEqual([
+      {
+        origin: "DEL", destination: "BOM", flightNo: "6E 201", airline: "IndiGo",
+        departDate: "2026-10-15", departDateRaw: "15 Oct 2026", departTime: "06:30",
+        arriveDate: "2026-10-15", arriveDateRaw: "15 Oct 2026", arriveTime: "08:40",
+        cabinClass: "Economy", layover: null,
+      },
+    ]);
   });
 
   it("drops nameless passengers, keeps the rest", () => {
@@ -130,6 +130,107 @@ describe("buildFlightAutofill — single leg into the form's own field names", (
     const fill = buildFlightAutofill(voucher({ flight_details: { segments: [] } }))!;
     expect(fill.segmentCount).toBe(0);
     expect(fill.origin).toBeNull();
+    expect(fill.tripType).toBeNull();
+    expect(fill.legs).toEqual([]);
     expect(fill.passengers).toHaveLength(2);
+  });
+});
+
+/* ── Multi-leg (Step 4): every segment becomes a leg, 1:1 ───────────── */
+
+
+function seg(
+  o: string, d: string, dep: string, arr: string,
+  over: Partial<FlightSegment> & { layover?: string | null } = {},
+): FlightSegment {
+  const { layover = null, ...rest } = over;
+  return {
+    airline: "Air India", flight_no: "AI 101", class: "Economy", duration: null,
+    origin: { city: null, code: o, time: "06:30", date: dep, terminal: null },
+    destination: { city: null, code: d, time: "08:40", date: arr, terminal: null },
+    layover_duration: layover,
+    ...rest,
+  };
+}
+
+describe("buildFlightAutofill — multi-leg: legs[] + tripType, leg-0 scalars kept", () => {
+  it("2-segment round trip → ROUND_TRIP; returnDate is the RETURN leg's DEPARTURE (the fix), destination the turnaround", () => {
+    const v = voucher({
+      flight_details: {
+        segments: [
+          seg("DEL", "BOM", "15 Oct 2026", "15 Oct 2026", { flight_no: "AI 101" }),
+          seg("BOM", "DEL", "20 Oct 2026", "20 Oct 2026", { flight_no: "AI 102" }),
+        ],
+      },
+    });
+    const fill = buildFlightAutofill(v)!;
+    expect(fill.tripType).toBe("ROUND_TRIP");
+    expect(fill.segmentCount).toBe(2);
+    expect(fill.legs.map((l) => `${l.origin}-${l.destination}/${l.flightNo}`)).toEqual([
+      "DEL-BOM/AI 101",
+      "BOM-DEL/AI 102",
+    ]);
+    // Leg-0 scalars still present for the single-itinerary form.
+    expect(fill).toMatchObject({ origin: "DEL", flightNo: "AI 101", airline: "Air India", travelDate: "2026-10-15" });
+    // Destination is where the trip turned around — NOT DEL.
+    expect(fill.destination).toBe("BOM");
+    // Was 2026-10-15 (leg-0 arrival) before Step 4.
+    expect(fill.returnDate).toBe("2026-10-20");
+    expect(fill.returnDateRaw).toBe("20 Oct 2026");
+  });
+
+  it("3-segment multi-city → MULTI_CITY; destination + returnDate from the LAST leg", () => {
+    const v = voucher({
+      flight_details: {
+        segments: [
+          seg("DEL", "BOM", "15 Oct 2026", "15 Oct 2026"),
+          seg("BOM", "GOI", "18 Oct 2026", "18 Oct 2026"),
+          seg("GOI", "BLR", "22 Oct 2026", "23 Oct 2026"),
+        ],
+      },
+    });
+    const fill = buildFlightAutofill(v)!;
+    expect(fill.tripType).toBe("MULTI_CITY");
+    expect(fill.legs).toHaveLength(3);
+    expect(fill.origin).toBe("DEL");
+    expect(fill.destination).toBe("BLR");
+    expect(fill.travelDate).toBe("2026-10-15");
+    expect(fill.returnDate).toBe("2026-10-23");
+  });
+
+  it("2-segment one-way via a hub (layover printed) → ONE_WAY; destination is the final arrival", () => {
+    const v = voucher({
+      flight_details: {
+        segments: [
+          seg("DEL", "BOM", "15 Oct 2026", "15 Oct 2026", { layover: "2h 15m" }),
+          seg("BOM", "DXB", "15 Oct 2026", "15 Oct 2026"),
+        ],
+      },
+    });
+    const fill = buildFlightAutofill(v)!;
+    expect(fill.tripType).toBe("ONE_WAY");
+    expect(fill.legs[0].layover).toBe("2h 15m");
+    expect(fill.legs[1].layover).toBeNull();
+    expect(fill.origin).toBe("DEL");
+    expect(fill.destination).toBe("DXB");
+    expect(fill.flightNo).toBe("AI 101"); // leg 0, never joined
+  });
+
+  it("4-segment round trip via a hub each way: turnaround + return leg found from the layover pattern", () => {
+    const v = voucher({
+      flight_details: {
+        segments: [
+          seg("DEL", "BOM", "15 Oct 2026", "15 Oct 2026", { layover: "1h 30m" }),
+          seg("BOM", "DXB", "15 Oct 2026", "15 Oct 2026"),
+          seg("DXB", "BOM", "22 Oct 2026", "22 Oct 2026", { layover: "3h" }),
+          seg("BOM", "DEL", "22 Oct 2026", "23 Oct 2026"),
+        ],
+      },
+    });
+    const fill = buildFlightAutofill(v)!;
+    expect(fill.tripType).toBe("ROUND_TRIP");
+    expect(fill.destination).toBe("DXB");
+    expect(fill.returnDate).toBe("2026-10-22");
+    expect(fill.legs).toHaveLength(4);
   });
 });
