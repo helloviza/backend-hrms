@@ -175,6 +175,10 @@
     "consumerContactPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L2": {
@@ -351,6 +355,10 @@
       "scope": "NONE"
     },
     "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -531,6 +539,10 @@
     "consumerContactPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L4": {
@@ -707,6 +719,10 @@
       "scope": "NONE"
     },
     "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -887,6 +903,10 @@
     "consumerContactPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L6": {
@@ -1063,6 +1083,10 @@
       "scope": "NONE"
     },
     "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1243,6 +1267,10 @@
     "consumerContactPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L8": {
@@ -1419,6 +1447,10 @@
       "scope": "NONE"
     },
     "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1599,6 +1631,10 @@
     "consumerContactPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_SBT": {
@@ -1777,6 +1813,10 @@
     "consumerContactPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_APPROVAL": {
@@ -1953,6 +1993,10 @@
       "scope": "NONE"
     },
     "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -2137,6 +2181,10 @@
     "consumerContactPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L0": {
@@ -2317,6 +2365,10 @@
       "scope": "NONE"
     },
     "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
     }

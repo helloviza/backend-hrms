@@ -591,7 +591,11 @@ describe("per-line isolation (the Slice 7 security property)", () => {
 /* ───────────────────────────── other modules unchanged ───────────────────────────── */
 
 describe("the five-site edit did not leak into other modules", () => {
-  it("every level template is byte-identical to the pre-Slice-7 recording once the PlumConnect keys are set aside", () => {
+  // levelTemplates.pre-slice7.golden.json is origin/main's LEVEL_TEMPLATES
+  // (which carry no PlumConnect key at all). When upstream adds a module
+  // key, re-record it FROM origin/main — never from this branch — so the
+  // property stays "identical to main minus the PlumConnect keys".
+  it("every level template is byte-identical to origin/main's once the PlumConnect keys are set aside", () => {
     const golden = JSON.parse(readFileSync(join(process.cwd(), "src/config/levelTemplates.pre-slice7.golden.json"), "utf8"));
     const now: Record<string, unknown> = {};
     for (const [code, t] of Object.entries(LEVEL_TEMPLATES as Record<string, any>)) {
