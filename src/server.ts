@@ -986,6 +986,7 @@ app.use("/api/admin/demo", adminDemoRouter);
 // these paths before manualBookingsRouter (which uses billing-access
 // instead of requireAdmin to allow RM-scoped access).
 import manualBookingsRouter from "./routes/manualBookings.js";
+import adminTravellersRouter from "./routes/admin.travellers.js";
 import extractedDocumentsRouter from "./routes/admin.extractedDocuments.js";
 import carbonRouter from "./routes/admin.carbon.js";
 
@@ -994,6 +995,13 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // Order matters: manualBookings must precede adminRouter/adminAnalyticsRouter
   // so the broad mounts do not intercept the manual-bookings paths.
   app.use("/api/admin/manual-bookings", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), manualBookingsRouter);
+  // HOUSE-staff read access to a CLIENT's saved travellers (Ops viewer +
+  // booking-form passenger picker). requireHouse = Plumtrips workspace or
+  // SuperAdmin; the router adds requirePermission("manualBookings","READ").
+  // The customer's workspace is resolved server-side from :customerId —
+  // see routes/admin.travellers.ts. Same interception reason for the
+  // position as manual-bookings above.
+  app.use("/api/admin/customers", requireAuth, requireWorkspace, requireHouse, adminTravellersRouter);
   // Cross-tenant oversight over extracteddocuments. SuperAdmin-only; the router
   // carries its own requireAuth/requireWorkspace + superAdminOnly guard, and is
   // mounted before the broad /api/admin routers for the same interception
