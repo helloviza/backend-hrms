@@ -350,14 +350,16 @@ describe("dispatchInbound — precedence", () => {
 describe("dispatchInbound — Intent Engine (non-employee only)", () => {
   const conv = () => Conversation.findOne({}).lean();
 
-  it("keywords: 'visa for Germany' → helloviza Lead (intent_lead, source keyword), NO bot", async () => {
+  it("keywords: 'visa for Germany' → helloviza Lead (intent_lead, source keyword) AND the helloviza flow starts (Slice 6)", async () => {
     H.resolveIdentity.mockResolvedValue(unknown());
     const out = await dispatchInbound(env({ text: "Need a visa for Germany next month" }), NOW);
     expect(out.route).toBe("intent_lead");
     expect((out as any).intent).toMatchObject({ businessLine: "helloviza", source: "keyword" });
     expect(H.captureLead).toHaveBeenCalledTimes(1);
     expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "helloviza", canonical: WA, referralRaw: undefined });
-    expect(H.startBot).not.toHaveBeenCalled();
+    expect(H.startBot).toHaveBeenCalledTimes(1);
+    expect(H.startBot.mock.calls[0][0].conversation.businessLine).toBe("helloviza"); // the bot sees the line it must qualify for
+    expect(H.startBot.mock.calls[0][1]).toBe(""); // organic: no ad headline
     expect(H.sendIntentMenu).not.toHaveBeenCalled();
     const c = await conv();
     expect(c).toMatchObject({ kind: "lead", businessLine: "helloviza", intentSource: "keyword" });
@@ -365,13 +367,14 @@ describe("dispatchInbound — Intent Engine (non-employee only)", () => {
     expect(c!.intentConfidence).toBeGreaterThan(0);
   });
 
-  it("keywords: 'corporate travel platform' → plumtrips Lead, NO bot", async () => {
+  it("keywords: 'corporate travel platform' → plumtrips Lead AND the plumtrips flow starts (Slice 6)", async () => {
     H.resolveIdentity.mockResolvedValue(unknown());
     const out = await dispatchInbound(env({ text: "Looking for a corporate travel platform for our company" }), NOW);
     expect(out.route).toBe("intent_lead");
     expect((out as any).intent).toMatchObject({ businessLine: "plumtrips", source: "keyword" });
     expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "plumtrips" });
-    expect(H.startBot).not.toHaveBeenCalled();
+    expect(H.startBot).toHaveBeenCalledTimes(1);
+    expect(H.startBot.mock.calls[0][0].conversation.businessLine).toBe("plumtrips");
   });
 
   it("keywords: 'plan a Bali holiday' → concierge Lead AND the qualification bot starts (3c flow, no referral headline)", async () => {
@@ -403,7 +406,7 @@ describe("dispatchInbound — Intent Engine (non-employee only)", () => {
     expect((c as any).intent).toMatchObject({ businessLine: "helloviza", source: "menu", confidence: 1 });
     expect(H.captureLead).toHaveBeenCalledTimes(1);
     expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "helloviza" });
-    expect(H.startBot).not.toHaveBeenCalled();
+    expect(H.startBot).toHaveBeenCalledTimes(1); // Slice 6: the helloviza flow starts on the new Lead
     expect(await conv()).toMatchObject({ kind: "lead", businessLine: "helloviza", intentSource: "menu", intent: "menu:helloviza" });
     expect(await Conversation.countDocuments({})).toBe(1);
   });
@@ -434,16 +437,31 @@ describe("dispatchInbound — Intent Engine (non-employee only)", () => {
     expect((await conv())!.kind).toBe("support");
   });
 
-  it("routed department thread: later organic text is plain support for the human queue — no re-classification, no menu, no second Lead", async () => {
+  it("routed department thread whose flow is over: later organic text is plain support for the human queue — no re-classification, no menu, no second Lead, no second flow", async () => {
     H.resolveIdentity.mockResolvedValue(unknown());
     await dispatchInbound(env({ text: "corporate travel for my company" }), NOW);
+    expect(H.startBot).toHaveBeenCalledTimes(1); // Slice 6: the flow started (the spy does not activate it — a finished flow looks the same)
     H.captureLead.mockImplementation(async (input: any) => ({ touch: "repeat", created: false, leadId: input.conversation.leadId }));
     const b = await dispatchInbound(env({ text: "we need a holiday package too" }), NOW); // concierge words on a plumtrips thread
     expect(b.route).toBe("support");
     expect(H.captureLead).toHaveBeenCalledTimes(1); // only the first message created a Lead
     expect(H.sendIntentMenu).not.toHaveBeenCalled();
-    expect(H.startBot).not.toHaveBeenCalled();
+    expect(H.startBot).toHaveBeenCalledTimes(1); // never restarted
+    expect(H.handleBotTurn).not.toHaveBeenCalled();
     expect((await conv())!.businessLine).toBe("plumtrips");
+  });
+
+  it("routed department thread mid-flow: the next text is a bot turn for THAT department (plumtrips), not support", async () => {
+    H.resolveIdentity.mockResolvedValue(unknown());
+    await dispatchInbound(env({ text: "corporate travel for my company" }), NOW);
+    await Conversation.updateOne({}, { $set: { "bot.active": true, "bot.step": "ask_company" } });
+    H.captureLead.mockImplementation(async (input: any) => ({ touch: "repeat", created: false, leadId: input.conversation.leadId }));
+    const b = await dispatchInbound(env({ text: "Acme Logistics" }), NOW);
+    expect(b.route).toBe("bot");
+    expect(H.handleBotTurn).toHaveBeenCalledTimes(1);
+    expect(H.handleBotTurn.mock.calls[0][0].conversation.businessLine).toBe("plumtrips");
+    expect(H.handleBotTurn.mock.calls[0][1]).toBe("Acme Logistics");
+    expect(H.sendIntentMenu).not.toHaveBeenCalled();
   });
 
   it("referral: a mapped ad routes by the campaign map WITHOUT classifying (text says visa, map says concierge → concierge)", async () => {
@@ -457,13 +475,14 @@ describe("dispatchInbound — Intent Engine (non-employee only)", () => {
     expect((await conv())!.intent).toBe("ad:1202");
   });
 
-  it("referral: an UNMAPPED ad with classifiable text → keyword line (helloviza) on a lead_referral, no bot", async () => {
+  it("referral: an UNMAPPED ad with classifiable text → keyword line (helloviza) on a lead_referral; the helloviza flow starts with the ad headline", async () => {
     H.resolveIdentity.mockResolvedValue(unknown());
     const out = await dispatchInbound(env({ referral: REFERRAL, text: "Hi, I saw your ad about Schengen visa" }), NOW);
     expect(out.route).toBe("lead_referral");
     expect((out as any).intent).toMatchObject({ businessLine: "helloviza", source: "keyword" });
     expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "helloviza", referralRaw: REFERRAL });
-    expect(H.startBot).not.toHaveBeenCalled();
+    expect(H.startBot).toHaveBeenCalledTimes(1);
+    expect(H.startBot.mock.calls[0][1]).toBe("Bali"); // the headline, exactly as the concierge path passes it
     expect(H.sendIntentMenu).not.toHaveBeenCalled();
   });
 
@@ -479,6 +498,7 @@ describe("dispatchInbound — Intent Engine (non-employee only)", () => {
     const b = await dispatchInbound(env({ type: "interactive", text: "", buttonId: "pc_bl_plumtrips" }), NOW);
     expect(b.route).toBe("intent_lead");
     expect(H.captureLead.mock.calls[0][0]).toMatchObject({ businessLine: "plumtrips", referralRaw: undefined });
+    expect(H.startBot).toHaveBeenCalledTimes(1); // Slice 6: the plumtrips flow starts on the new Lead
 
     H.captureLead.mockImplementation(async (input: any) => ({ touch: "repeat", created: false, leadId: input.conversation.leadId }));
     H.lookupCampaignMap.mockResolvedValue("concierge"); // a DIFFERENT, mapped ad — must not re-route
@@ -487,7 +507,7 @@ describe("dispatchInbound — Intent Engine (non-employee only)", () => {
     expect((c as any).intent).toMatchObject({ businessLine: "plumtrips", source: null });
     expect(H.lookupCampaignMap).toHaveBeenCalledTimes(1); // only the first referral was looked up
     expect(H.captureLead).toHaveBeenLastCalledWith(expect.objectContaining({ businessLine: "plumtrips", referralRaw: { ...REFERRAL, source_id: "1203" } }));
-    expect(H.startBot).not.toHaveBeenCalled();
+    expect(H.startBot).toHaveBeenCalledTimes(1); // a repeat touch never restarts the flow
   });
 
   it("a pre-Slice-5 lead thread (leadId, no businessLine) is treated as concierge — never re-asked", async () => {

@@ -42,11 +42,16 @@
 // line is resolved ONCE per thread and stored on the Conversation:
 //   menu tap → "menu"; mapped ad id → "campaign_map"; keywords → "keyword";
 //   nothing → the interactive menu is sent and the thread waits.
-// concierge keeps the exact 3b/3c behaviour (holiday Lead + qualification
-// bot); plumtrips / helloviza get a Lead (enquiryType corporate_account /
-// visa) on a businessLine-tagged thread for the department's human queue —
-// no bot, no qualification (Slice 6). Business line and campaign lineage
-// are orthogonal: classifyIntent() never reads attribution.
+// Business line and campaign lineage are orthogonal: classifyIntent() never
+// reads attribution.
+//
+// Slice 6 — Stage 2. Once a line is resolved and the Lead exists, the gate
+// requiresQualification(line) (flows/index.ts) decides whether the
+// department's qualification flow runs: concierge (the exact 3c flow),
+// plumtrips and helloviza each have one; support / expense / general have
+// none and are never asked anything. The bot drives whichever flow the
+// registry returns; the takeover contract (assignment / agent send silences
+// it for good) is unchanged.
 
 import type mongoose from "mongoose";
 import { toCanonical } from "../../utils/phone.js";
@@ -65,6 +70,7 @@ import {
   recordIntent,
 } from "./intent.js";
 import { startBot, handleBotTurn, botIsActive, type BotTurnOutcome } from "./bot.js";
+import { requiresQualification, threadBusinessLine } from "./flows/index.js";
 import {
   isExpenseShaped,
   parseConsentAnswer,
@@ -366,7 +372,8 @@ export async function dispatchInbound(env: InboundEnvelope, now: Date = new Date
     });
     return { route: "support", ...base, intent: { businessLine: routed, source: routed ? null : "menu", confidence: 0 } };
   }
-  // (b) The qualification bot is mid-flow on this (non-employee) thread.
+  // (b) A qualification flow is mid-way on this (non-employee) thread — the
+  //     bot answers with whichever department's flow the thread is on.
   if (conversation.leadId && botIsActive(conversation)) {
     const bot = await handleBotTurn({ conversation, to: canonical, leadId: conversation.leadId as mongoose.Types.ObjectId, now }, env.text);
     if (bot.handled) return { route: "bot", ...base, bot };
@@ -387,8 +394,8 @@ export async function dispatchInbound(env: InboundEnvelope, now: Date = new Date
 
   // Slice 5 — an organic message on a thread the Intent Engine has not
   // routed yet: keywords decide, or the menu is sent (at most once a day
-  // while unanswered). A routed thread falls through: the department's
-  // human queue owns it (no qualification — Slice 6).
+  // while unanswered). A routed thread whose flow is over (or that has
+  // none) falls through: the department's human queue owns it.
   // A soft-matched employee mid-consent is answering a different question:
   // no menu on top of the bind prompt.
   if (!identity.hard && !threadBusinessLine(conversation) && !consentPending(contact.consent)) {
@@ -411,16 +418,6 @@ export async function dispatchInbound(env: InboundEnvelope, now: Date = new Date
 }
 
 /* ───────────────────────────── Slice 5 helpers ───────────────────────────── */
-
-/**
- * The line a thread is already routed to. A pre-Slice-5 lead thread (Lead
- * exists, no businessLine stamped) was a holiday lead by construction.
- */
-function threadBusinessLine(conversation: IPlumConnectConversation): BusinessLine | null {
-  if (conversation.businessLine) return conversation.businessLine;
-  if (conversation.leadId) return "concierge";
-  return null;
-}
 
 /** Send the menu unless one is still pending from the last day. */
 async function offerMenu(conversation: IPlumConnectConversation, to: string, now: Date): Promise<boolean> {
@@ -457,10 +454,11 @@ interface RouteToLineInput {
 
 /**
  * Business line resolved → stamp it (first time only), create-or-touch the
- * Lead through the 3a seam, and — for concierge ONLY — run the exact 3b/3c
- * flow (bot's first question on a new Lead, bot turn on a mid-flow thread).
- * plumtrips / helloviza stop at the Lead: the thread sits in the department
- * queue with its businessLine and no bot ever starts.
+ * Lead through the 3a seam, then consult the Slice 6 gate: a line that
+ * requires qualification gets its flow (the bot's first question on a new
+ * Lead; a bot turn on a mid-flow thread — for concierge this is exactly the
+ * 3b/3c behaviour). A line without a flow stops at the Lead: the thread sits
+ * in the department queue with its businessLine and no bot ever starts.
  */
 async function routeToBusinessLine(input: RouteToLineInput): Promise<DispatchOutcome> {
   const { env, canonical, conversation, base, now, route, businessLine, source, confidence } = input;
@@ -488,10 +486,10 @@ async function routeToBusinessLine(input: RouteToLineInput): Promise<DispatchOut
     now,
   });
 
-  if (businessLine === "concierge") {
-    // Slice 3c, unchanged: a brand-new lead gets the bot's first question; a
-    // repeat touch on a thread where the bot is mid-flow treats the text as
-    // the answer it was waiting for.
+  if (requiresQualification(businessLine)) {
+    // A brand-new lead gets the flow's first question; a repeat touch on a
+    // thread where the bot is mid-flow treats the text as the answer it was
+    // waiting for (Slice 3c, unchanged).
     if (lead.touch === "first") {
       await startBot({ conversation, to: canonical, leadId: lead.leadId, now }, parseReferral(env.referral).headline);
       return { route, ...base, lead, intent };

@@ -2,7 +2,9 @@
 // webhook (HMAC, real env, real dispatcher, real classifier, real campaign
 // map, real senders over a fake Graph adapter that records every send):
 //   • keyword classification → helloviza / plumtrips / concierge Leads with
-//     the right enquiryType; departments get NO bot, concierge gets the bot
+//     the right enquiryType; each line's Slice-6 qualification flow starts
+//     (the department flows are proved in whatsapp.webhook.slice6.test.ts —
+//     here only their first question is asserted)
 //   • bare "hi" → the menu (sent + persisted on the thread), NO Lead; tap
 //     Visa → helloviza Lead with intentSource "menu"; "Something else" → support
 //   • campaign map hit → intentSource "campaign_map" with no classification;
@@ -141,27 +143,30 @@ afterEach(() => {
 /* ───────────────────────────── keywords ───────────────────────────── */
 
 describe("keyword classification (organic, non-employee)", () => {
-  it("'visa for Germany' → helloviza Lead (enquiryType visa, individual), thread tagged, NO bot, nothing sent", async () => {
+  it("'visa for Germany' → helloviza Lead (enquiryType visa, individual), thread tagged, the helloviza flow's first question (Slice 6)", async () => {
     await post([text(STRANGER, "Hi, I need a visa for Germany next month")], profile(STRANGER, "Priya"));
     const lead: any = await Lead.findOne({}).lean();
     expect(lead).toMatchObject({ enquiryType: "visa", type: "individual", contactName: "Priya", contactPhone: STRANGER, sourceChannel: "whatsapp", source: "other" });
     expect(lead.notes).toBe(""); // the message text is NEVER written onto the Lead
     expect(lead.attribution?.sourceId ?? "").toBe(""); // organic: no lineage
+    expect(lead.travelRequirement.destination).toBe(""); // routing reads the text; only the flow's parsers write, and only from answers
     const c = await conv(STRANGER);
     expect(c).toMatchObject({ kind: "lead", businessLine: "helloviza", intentSource: "keyword", intent: "visa" });
     expect(String(c!.leadId)).toBe(String(lead._id));
     expect(c!.intentConfidence).toBeGreaterThan(0);
-    expect(c!.bot.active).toBe(false);
-    expect(graph).toHaveLength(0);
+    expect(c!.bot).toMatchObject({ active: true, step: "ask_name" });
+    expect(graph).toHaveLength(1);
+    expect(graph[0].text).toBe("Hi! Thanks for reaching out to Helloviza. To get started, what's your name?");
     expect(H.trigger).toHaveBeenCalledTimes(1); // lead.created, like every other lead
   });
 
-  it("'corporate travel platform' → plumtrips Lead (enquiryType corporate_account, company), NO bot, nothing sent", async () => {
+  it("'corporate travel platform' → plumtrips Lead (enquiryType corporate_account, company), the plumtrips flow's first question (Slice 6)", async () => {
     await post([text(STRANGER, "We are looking for a corporate travel platform for our company")], profile(STRANGER, "Rahul"));
     const lead: any = await Lead.findOne({}).lean();
-    expect(lead).toMatchObject({ enquiryType: "corporate_account", type: "company", contactName: "Rahul" });
-    expect(await conv(STRANGER)).toMatchObject({ kind: "lead", businessLine: "plumtrips", intentSource: "keyword" });
-    expect(graph).toHaveLength(0);
+    expect(lead).toMatchObject({ enquiryType: "corporate_account", type: "company", contactName: "Rahul", companyName: "" });
+    expect(await conv(STRANGER)).toMatchObject({ kind: "lead", businessLine: "plumtrips", intentSource: "keyword", bot: expect.objectContaining({ active: true, step: "ask_name" }) });
+    expect(graph).toHaveLength(1);
+    expect(graph[0].text).toBe("Hi! Thanks for reaching out to Plumtrips. To get started, what's your name?");
   });
 
   it("'plan a Bali holiday' → concierge Lead (holiday_package) AND the bot's first question — the 3c flow, organic headline", async () => {
@@ -176,16 +181,28 @@ describe("keyword classification (organic, non-employee)", () => {
     expect((await outbound(c!._id))[0].externalId).toBe("wamid.OUT1");
   });
 
-  it("a department thread stays a human-queue thread: later texts get no bot, no menu, no second Lead — whatever the words", async () => {
+  it("a department thread never re-routes: later texts are flow answers while the flow runs, then plain human-queue texts — no menu, no second Lead, whatever the words", async () => {
     await post([text(STRANGER, "visa for Germany")]);
-    await post([text(STRANGER, "actually also a holiday package and a honeymoon")]); // concierge words
-    await post([text(STRANGER, "hi?")]);
+    expect(graph).toHaveLength(1); // the flow's first question
+    await post([text(STRANGER, "actually also a holiday package and a honeymoon")]); // concierge words — taken as the NAME answer, not re-classified
+    await post([text(STRANGER, "hi?")]); // a name is 2+ chars → the country answer, ISO-2 unknown
     expect(await Lead.countDocuments({})).toBe(1);
-    expect(graph).toHaveLength(0);
+    expect(graph).toHaveLength(3); // ask_name (welcome) → ask_country → ask_visa_type; no menu anywhere
+    expect(graph.every((g) => g.type === "text")).toBe(true);
     const c = await conv(STRANGER);
     expect(c!.businessLine).toBe("helloviza");
+    expect(c!.bot).toMatchObject({ active: true, step: "ask_visa_type" });
     expect(await Message.countDocuments({ conversationId: c!._id, direction: "INBOUND" })).toBe(3);
     expect(await Conversation.countDocuments({})).toBe(1);
+    // the flow ends; from here the thread is the department's human queue
+    await post([text(STRANGER, "tourist")]);
+    expect(graph).toHaveLength(4);
+    expect((await conv(STRANGER))!.bot).toMatchObject({ active: false, stoppedBy: "complete" });
+    await post([text(STRANGER, "visa for France now")]); // classifiable, but the thread is routed and the flow is over
+    await post([text(STRANGER, "hi")]);
+    expect(graph).toHaveLength(4);
+    expect(await Lead.countDocuments({})).toBe(1);
+    expect((await conv(STRANGER))!.businessLine).toBe("helloviza");
   });
 });
 
@@ -221,7 +238,9 @@ describe("menu fallback", () => {
     expect(c).toMatchObject({ kind: "lead", businessLine: "helloviza", intentSource: "menu", intentConfidence: 1, intent: "menu:helloviza" });
     expect(String(c!.leadId)).toBe(String(lead._id));
     expect(await Conversation.countDocuments({})).toBe(1);
-    expect(graph).toHaveLength(1); // no bot for a department
+    expect(graph).toHaveLength(2); // the menu, then the helloviza flow's first question (Slice 6)
+    expect(graph[1].text).toBe("Hi! Thanks for reaching out to Helloviza. To get started, what's your name?");
+    expect(c!.bot).toMatchObject({ active: true, step: "ask_name" });
     expect(await Message.countDocuments({ conversationId: c!._id, direction: "INBOUND" })).toBe(3);
   });
 
@@ -238,12 +257,13 @@ describe("menu fallback", () => {
     expect((await Lead.findOne({}).lean())!.contactName).toBe("Priya Sharma");
   });
 
-  it("tap Corporate travel → plumtrips Lead (company / corporate_account)", async () => {
+  it("tap Corporate travel → plumtrips Lead (company / corporate_account) + the plumtrips flow starts", async () => {
     await post([text(STRANGER, "hi")]);
     await post([button(STRANGER, MENU_BUTTON_IDS.plumtrips)]);
     expect(await Lead.findOne({}).lean()).toMatchObject({ enquiryType: "corporate_account", type: "company" });
     expect((await conv(STRANGER))!.businessLine).toBe("plumtrips");
-    expect(graph).toHaveLength(1);
+    expect(graph).toHaveLength(2);
+    expect(graph[1].text).toBe("Hi! Thanks for reaching out to Plumtrips. To get started, what's your name?");
   });
 
   it("'Something else' typed after the menu → general support: no Lead, no re-sent menu, the thread waits for a human", async () => {
@@ -287,13 +307,14 @@ describe("CTWA referrals", () => {
     expect(H.trigger).toHaveBeenCalledTimes(1);
   });
 
-  it("UNMAPPED ad + classifiable text → keyword line (helloviza) with the referral's attribution, no bot", async () => {
+  it("UNMAPPED ad + classifiable text → keyword line (helloviza) with the referral's attribution; the flow opens with the ad headline", async () => {
     await post([text(STRANGER, "Saw your ad — do you do Schengen visas?", { referral: referral(UNMAPPED_AD, "Europe visas") })], profile(STRANGER, "Priya"));
     const lead: any = await Lead.findOne({}).lean();
     expect(lead).toMatchObject({ enquiryType: "visa", type: "individual" });
     expect(lead.attribution.sourceId).toBe(UNMAPPED_AD);
     expect(await conv(STRANGER)).toMatchObject({ kind: "lead", businessLine: "helloviza", intentSource: "keyword" });
-    expect(graph).toHaveLength(0);
+    expect(graph).toHaveLength(1);
+    expect(graph[0].text).toBe('Hi! Thanks for reaching out to Helloviza about "Europe visas". To get started, what\'s your name?');
   });
 
   it("UNMAPPED ad + Meta's default text → the menu (no Lead yet); tap → Lead WITH the referral's attribution from the thread", async () => {
@@ -313,12 +334,15 @@ describe("CTWA referrals", () => {
     c = await conv(STRANGER);
     expect(c).toMatchObject({ businessLine: "plumtrips", intentSource: "menu" });
     expect(c!.referralRaw).toEqual(referral(UNMAPPED_AD, "Corporate travel made easy"));
-    expect(graph).toHaveLength(1);
+    expect(graph).toHaveLength(2); // menu, then the plumtrips flow's first question
+    // the tap carries no referral, so — exactly like the concierge menu path — the welcome has no headline
+    expect(graph[1].text).toBe("Hi! Thanks for reaching out to Plumtrips. To get started, what's your name?");
   });
 
-  it("a repeat referral on a routed department thread is a touch (3b dedup), never a re-route — even when the second ad is mapped elsewhere", async () => {
+  it("a repeat referral on a routed department thread is a touch (3b dedup), never a re-route — even when the second ad is mapped elsewhere; mid-flow the text is the answer", async () => {
     await post([text(STRANGER, "corporate travel for my company", { referral: referral(UNMAPPED_AD) })], profile(STRANGER, "Rahul"));
     expect(await Lead.countDocuments({})).toBe(1);
+    expect(graph).toHaveLength(1); // the plumtrips flow's first question
     await post([text(STRANGER, "saw this too", { referral: referral(MAPPED_AD) })]); // mapped to concierge
     expect(await Lead.countDocuments({})).toBe(1);
     const c = await conv(STRANGER);
@@ -326,7 +350,11 @@ describe("CTWA referrals", () => {
     expect(c!.referralRaw).toEqual(referral(UNMAPPED_AD)); // first referral stays
     expect(await Message.countDocuments({ conversationId: c!._id, type: "system" })).toBe(1); // the touch record
     expect(await LeadActivity.countDocuments({ note: /repeat touch/ })).toBe(1);
-    expect(graph).toHaveLength(0);
+    // the text on the repeat tap is the answer the flow was waiting for (the 3c dedup rule, now for every department)
+    expect(graph).toHaveLength(2);
+    expect(graph[1].text).toBe("Nice to meet you, saw this too! Which company are you with?");
+    expect((await Lead.findOne({}).lean())!.contactName).toBe("saw this too");
+    expect(c!.bot).toMatchObject({ active: true, step: "ask_company" });
   });
 
   it("a verified employee tapping an ad: lead thread, no Lead, no menu, no classification", async () => {
