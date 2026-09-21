@@ -44,6 +44,27 @@ export type IntentSource = (typeof INTENT_SOURCES)[number];
 export const BOT_STOP_REASONS = ["human", "complete", "timeout", "unparsed"] as const;
 export type BotStopReason = (typeof BOT_STOP_REASONS)[number];
 
+// Track B — how the assignment matrix last routed this thread. Additive,
+// defaults empty; a pre-Track-B thread reads state "".
+//   assigned  assignedTo was set by the router (autoAssigned: true — NOT a
+//             human takeover, so the qualification bot keeps running)
+//   tie       two+ mapped agents at the same priority were eligible: left
+//             UNASSIGNED, `candidates` are the tied agents; first to take wins
+//   held      nobody mapped / nobody eligible: OPEN + unassigned, awaiting
+//             an agent; re-resolved on the unassigned queue's read
+export const ROUTING_STATES = ["", "assigned", "tie", "held"] as const;
+export type RoutingState = (typeof ROUTING_STATES)[number];
+
+export interface IPlumConnectConversationRouting {
+  state: RoutingState;
+  targetType: string;
+  targetKey: string;
+  candidates: mongoose.Types.ObjectId[];
+  autoAssigned: boolean;
+  resolvedAt?: Date | null;
+  reason: string;
+}
+
 export interface IPlumConnectConversationBot {
   active: boolean;
   step: string;
@@ -70,6 +91,7 @@ export interface IPlumConnectConversation extends Document {
   /** When the interactive intent menu was last sent (null = never). */
   intentMenuSentAt?: Date | null;
   bot: IPlumConnectConversationBot;
+  routing: IPlumConnectConversationRouting;
   lastInboundAt?: Date | null;
   lastOutboundAt?: Date | null;
   lastMessageAt?: Date | null;
@@ -86,6 +108,19 @@ const BotSchema = new Schema<IPlumConnectConversationBot>(
     retries: { type: Number, default: 0 },
     stoppedBy: { type: String, enum: [...BOT_STOP_REASONS, null], default: null },
     stoppedAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
+const RoutingSchema = new Schema<IPlumConnectConversationRouting>(
+  {
+    state: { type: String, enum: ROUTING_STATES, default: "" },
+    targetType: { type: String, trim: true, default: "" },
+    targetKey: { type: String, trim: true, default: "" },
+    candidates: { type: [{ type: Schema.Types.ObjectId, ref: "User" }], default: [] },
+    autoAssigned: { type: Boolean, default: false },
+    resolvedAt: { type: Date, default: null },
+    reason: { type: String, trim: true, default: "" },
   },
   { _id: false },
 );
@@ -107,6 +142,7 @@ const PlumConnectConversationSchema = new Schema<IPlumConnectConversation>(
     intentConfidence: { type: Number, default: null },
     intentMenuSentAt: { type: Date, default: null },
     bot: { type: BotSchema, default: () => ({}) },
+    routing: { type: RoutingSchema, default: () => ({}) },
     lastInboundAt: { type: Date, default: null },
     lastOutboundAt: { type: Date, default: null },
     lastMessageAt: { type: Date, default: null },
@@ -126,6 +162,9 @@ PlumConnectConversationSchema.index({ assignedTo: 1, status: 1 });
 PlumConnectConversationSchema.index({ leadId: 1 }, { sparse: true });
 // Department queues (Slice 5): the inbox filters by business line.
 PlumConnectConversationSchema.index({ businessLine: 1 }, { sparse: true });
+// Track B: the unassigned queue's re-resolve, and "surfaced to the tied agents".
+PlumConnectConversationSchema.index({ "routing.state": 1, assignedTo: 1, status: 1 });
+PlumConnectConversationSchema.index({ "routing.candidates": 1 }, { sparse: true });
 
 const PlumConnectConversation =
   (mongoose.models.PlumConnectConversation as mongoose.Model<IPlumConnectConversation>) ||

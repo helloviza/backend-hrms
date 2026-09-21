@@ -1,7 +1,8 @@
 // PlumConnect Slice 3b — the holiday-lead adapter against real collections:
 // referral parsing, the explicit field set through the 3a createLead() seam,
 // attribution at first touch only, Contact-layer phone dedup (repeat touch =
-// record, never a second Lead), and the assignee config → first-admin
+// record, never a second Lead), and Track B routing (matrix → SALES; no
+// matrix → held, unassigned — the first-admin
 // fallback. Nothing here sends anything.
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import mongoose from "mongoose";
@@ -20,8 +21,10 @@ vi.mock("../taskAutomation.js", async (importOriginal) => {
   return { ...real, triggerTaskAutomation: H.trigger };
 });
 
-const { captureHolidayLead, parseReferral, leadSourceForReferral, resolveHolidayLeadAssignee } = await import("./holidayLead.js");
-const { PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV } = await import("../../config/plumconnect.js");
+const { captureHolidayLead, parseReferral, leadSourceForReferral } = await import("./holidayLead.js");
+const { default: AssignmentRule } = await import("../../models/plumconnect/AssignmentRule.js");
+const { default: AgentPresence } = await import("../../models/plumconnect/AgentPresence.js");
+const { UserPermission } = await import("../../models/UserPermission.js");
 const { default: Lead } = await import("../../models/Lead.js");
 const { default: LeadActivity } = await import("../../models/LeadActivity.js");
 const { default: CRMCompany } = await import("../../models/CRMCompany.js");
@@ -65,17 +68,19 @@ afterAll(async () => {
 
 beforeEach(async () => {
   H.trigger.mockClear();
-  delete process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV];
   delete process.env[CRM_V2_OPPORTUNITY_ENV];
-  await Promise.all([Lead.deleteMany({}), LeadActivity.deleteMany({}), CRMCompany.deleteMany({}), Task.deleteMany({}), TaskAutomation.deleteMany({}), User.deleteMany({}), Counter.deleteMany({}), Contact.deleteMany({}), Conversation.deleteMany({}), Message.deleteMany({})]);
-  // Insertion order matters for the "first admin" rule: the admin first.
-  await User.collection.insertOne({ _id: ADMIN, name: "Ops Admin", email: "ops@plumtrips.com", roles: ["ADMIN"], passwordHash: "x", workspaceId: WS } as any);
-  await User.collection.insertOne({ _id: SALES, firstName: "Sana", lastName: "Holiday", email: "sana@plumtrips.com", roles: ["EMPLOYEE"], passwordHash: "x", workspaceId: WS } as any);
+  await Promise.all([Lead.deleteMany({}), LeadActivity.deleteMany({}), CRMCompany.deleteMany({}), Task.deleteMany({}), TaskAutomation.deleteMany({}), User.deleteMany({}), UserPermission.deleteMany({}), AssignmentRule.deleteMany({}), AgentPresence.deleteMany({}), Counter.deleteMany({}), Contact.deleteMany({}), Conversation.deleteMany({}), Message.deleteMany({})]);
+  await User.collection.insertOne({ _id: ADMIN, name: "Ops Admin", email: "ops@plumtrips.com", roles: ["ADMIN"], passwordHash: "x", workspaceId: WS, status: "ACTIVE" } as any);
+  await User.collection.insertOne({ _id: SALES, firstName: "Sana", lastName: "Holiday", email: "sana@plumtrips.com", roles: ["EMPLOYEE"], passwordHash: "x", workspaceId: WS, status: "ACTIVE" } as any);
 });
 
-afterEach(() => {
-  delete process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV];
-});
+/** Track B: map SALES onto concierge (WRITE grant + present), so the matrix routes to them. */
+async function mapSalesToConcierge(now: Date) {
+  await UserPermission.deleteMany({ userId: String(SALES) });
+  await UserPermission.create({ userId: String(SALES), email: "sana@plumtrips.com", workspaceId: String(WS), universe: "STAFF", source: "manual", level: { code: "L3", name: "Exec", designation: "x" }, status: "active", tier: 1, grantedModules: [], roleType: "EMPLOYEE", grantedBy: "test", grantedAt: new Date(), modules: { plumconnectConcierge: { access: "WRITE", scope: "OWN" } } } as any);
+  await AssignmentRule.create({ target: { type: "department", line: "concierge" }, userId: SALES, priority: 1, enabled: true });
+  await AgentPresence.findOneAndUpdate({ userId: SALES, line: "concierge" }, { $set: { active: true, activeSince: now, updatedAt: now } }, { upsert: true, timestamps: false });
+}
 
 async function thread() {
   const contact = await Contact.create({ phone: CANON, displayName: "Curious" });
@@ -106,32 +111,45 @@ describe("parseReferral / leadSourceForReferral", () => {
   });
 });
 
-/* ───────────────────────────── assignee ───────────────────────────── */
+/* ───────────────────────────── assignee (Track B) ───────────────────────────── */
 
-describe("resolveHolidayLeadAssignee", () => {
-  it("config unset → first ADMIN/SUPERADMIN (the website-capture rule)", async () => {
-    const a = await resolveHolidayLeadAssignee();
-    expect(String(a!.id)).toBe(String(ADMIN));
-    expect(a!.name).toBe("Ops Admin");
+describe("assignee — the matrix, never the first admin", () => {
+  it("no matrix rule → HELD: lead created unassigned, thread unassigned + routing 'held'; the ADMIN is NOT picked", async () => {
+    const { contact, conversation } = await thread();
+    const r = await captureHolidayLead({ canonical: CANON, profileName: "Curious", referralRaw: REFERRAL, contactId: contact._id as any, conversation, messageId: "w", now: NOW });
+    expect(r).toMatchObject({ touch: "first", assignedTo: null, routing: "held" });
+    const lead: any = await Lead.collection.findOne({ _id: (r as any).leadId });
+    expect(lead).not.toHaveProperty("assignedTo");
+    expect(lead.assignedToName).toBe("");
+    const c: any = await Conversation.findById(conversation._id).lean();
+    expect(c.assignedTo).toBeNull();
+    expect(c.routing).toMatchObject({ state: "held", targetType: "department", targetKey: "department:concierge", candidates: [], autoAssigned: false, reason: "nobody mapped" });
+    expect(c.routing.resolvedAt).toEqual(NOW);
   });
 
-  it("config set to a real user → that user, with the DB-resolved label", async () => {
-    process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV] = String(SALES);
-    const a = await resolveHolidayLeadAssignee();
-    expect(String(a!.id)).toBe(String(SALES));
-    expect(a!.name).toBe("Sana Holiday");
+  it("SALES mapped on concierge, present, WRITE → assigned to SALES with the DB-resolved label; the thread carries the decision", async () => {
+    await mapSalesToConcierge(NOW);
+    const { contact, conversation } = await thread();
+    const r = await captureHolidayLead({ canonical: CANON, profileName: "Curious", referralRaw: REFERRAL, contactId: contact._id as any, conversation, messageId: "w", now: NOW });
+    expect(r).toMatchObject({ touch: "first", routing: "assigned" });
+    expect(String((r as any).assignedTo)).toBe(String(SALES));
+    const lead: any = await Lead.collection.findOne({ _id: (r as any).leadId });
+    expect(lead).toMatchObject({ assignedTo: SALES, assignedToName: "Sana Holiday", createdBy: SALES });
+    const c: any = await Conversation.findById(conversation._id).lean();
+    expect(String(c.assignedTo)).toBe(String(SALES));
+    expect(c.routing).toMatchObject({ state: "assigned", targetKey: "department:concierge", autoAssigned: true, reason: "priority 1" });
+    expect(c.routing.candidates.map(String)).toEqual([String(SALES)]);
+    // the thread's message ledger is untouched by routing
+    expect(await Message.countDocuments({ conversationId: conversation._id })).toBe(0);
   });
 
-  it("config naming a missing user or malformed → falls back to first admin", async () => {
-    process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV] = String(new mongoose.Types.ObjectId());
-    expect(String((await resolveHolidayLeadAssignee())!.id)).toBe(String(ADMIN));
-    process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV] = "not-an-id";
-    expect(String((await resolveHolidayLeadAssignee())!.id)).toBe(String(ADMIN));
-  });
-
-  it("no admin at all → null (lead is still created, unassigned)", async () => {
-    await User.deleteMany({ roles: "ADMIN" });
-    expect(await resolveHolidayLeadAssignee()).toBeNull();
+  it("SALES mapped but AWAY → held (no first-admin fallback)", async () => {
+    await mapSalesToConcierge(NOW);
+    await AgentPresence.updateOne({ userId: SALES, line: "concierge" }, { $set: { active: false } });
+    const { contact, conversation } = await thread();
+    const r = await captureHolidayLead({ canonical: CANON, profileName: "Curious", referralRaw: REFERRAL, contactId: contact._id as any, conversation, messageId: "w", now: NOW });
+    expect(r).toMatchObject({ assignedTo: null, routing: "held" });
+    expect((await Conversation.findById(conversation._id).lean())!.routing).toMatchObject({ state: "held", reason: "nobody eligible (away or cannot act)" });
   });
 });
 
@@ -140,7 +158,7 @@ describe("resolveHolidayLeadAssignee", () => {
 describe("captureHolidayLead — first touch", () => {
   it("creates the Lead with the explicit field set, attribution, links, and exactly one lead.created call", async () => {
     await TaskAutomation.create({ workspaceId: SYSTEM_WORKSPACE_ID, triggerKey: "lead.created", label: "welcome", entityType: "LEAD", titleTemplate: "Welcome {{leadName}}", dueOffsetMinutes: 60, priority: "MEDIUM", assigneeRule: { type: "OWNER" }, tags: [] });
-    process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV] = String(SALES);
+    await mapSalesToConcierge(NOW);
     const { contact, conversation } = await thread();
 
     const r = await captureHolidayLead({ canonical: CANON, profileName: "Curious", referralRaw: REFERRAL, contactId: contact._id as any, conversation, messageId: "wamid.first", now: NOW });
@@ -214,7 +232,7 @@ describe("captureHolidayLead — first touch", () => {
     expect(lead.enquiryType).toBe("holiday_package");
   });
 
-  it("blank profile name → the 'WhatsApp contact' placeholder (contactName is required); no admin → unassigned", async () => {
+  it("blank profile name → the 'WhatsApp contact' placeholder (contactName is required); nobody mapped → unassigned", async () => {
     await User.deleteMany({});
     const { contact, conversation } = await thread();
     const r = await captureHolidayLead({ canonical: CANON, profileName: "", referralRaw: { source_type: "ad" }, contactId: contact._id as any, conversation, messageId: "w", now: NOW });
@@ -251,7 +269,7 @@ describe("captureHolidayLead — repeat touch on an open lead thread", () => {
     expect(leadNow.attribution.capturedAt).toEqual(NOW);
 
     // the touch is recorded twice over: thread + lead timeline
-    const touch = await Message.findOne({ conversationId: conversation._id, type: "system" }).lean();
+    const touch = await Message.findOne({ conversationId: conversation._id, type: "system", "payload.kind": "referral_touch" }).lean();
     expect(touch).toMatchObject({ direction: "INBOUND", visibleToContact: false });
     expect(touch!.text).toContain("Bali — last seats!");
     expect((touch!.payload as any)).toMatchObject({ kind: "referral_touch", inboundExternalId: "wamid.second", referral: SECOND_REFERRAL });

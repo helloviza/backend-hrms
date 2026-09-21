@@ -1,10 +1,9 @@
 // apps/backend/src/services/plumconnect/presence.ts
 //
-// PlumConnect Track A — agent presence, per department line. This slice
-// STORES and EXPOSES the signal; nothing consumes it for routing yet
-// (Track B, the matrix, will call activeAgentsForLine()). Assignment today
-// is exactly what Slice 3b/5 do (holidayLead.resolveHolidayLeadAssignee)
-// and this module is imported by no capture-path code.
+// PlumConnect Track A — agent presence, per department line. Track A
+// stores and exposes the signal; Track B (services/plumconnect/
+// assignment.ts, the matrix) consumes activeAgentsForLine() to route a
+// captured lead to a present agent who can act on it.
 //
 //   setPresence          only on a line the agent HOLDS (Slice 7 grant ≥
 //                        READ — access.ts is the authority, nothing here
@@ -120,10 +119,11 @@ export async function getPresence(userId: mongoose.Types.ObjectId | string, now:
 /**
  * The agents Track B may route a `line` lead to: an active, FRESH presence
  * row, an ACTIVE User, and — resolved right now, never from the row — a
- * Slice 7 grant ≥ READ on that line. A revoked grant with a stale-but-true
- * row is not eligible.
+ * Slice 7 grant at `min` or above on that line (READ by default; the
+ * router passes WRITE — present ≠ able). A revoked grant with a
+ * stale-but-true row is not eligible.
  */
-export async function activeAgentsForLine(line: AccessLine, now: Date = new Date()): Promise<mongoose.Types.ObjectId[]> {
+export async function activeAgentsForLine(line: AccessLine, now: Date = new Date(), min: "READ" | "WRITE" | "FULL" = "READ"): Promise<mongoose.Types.ObjectId[]> {
   const since = new Date(now.getTime() - presenceTtlMs());
   const rows: any[] = await PlumConnectAgentPresence.find({ line, active: true, updatedAt: { $gt: since } }).select("userId").lean();
   if (rows.length === 0) return [];
@@ -132,7 +132,7 @@ export async function activeAgentsForLine(line: AccessLine, now: Date = new Date
   const eligible: mongoose.Types.ObjectId[] = [];
   for (const u of users) {
     const grants = await lineGrantsForUserId(u._id, u.roles);
-    if (holdsAtLeast(canAccessLine(grants, line), "READ")) eligible.push(u._id);
+    if (holdsAtLeast(canAccessLine(grants, line), min)) eligible.push(u._id);
   }
   return eligible;
 }

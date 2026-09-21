@@ -21,20 +21,10 @@ export function isPlumConnectEnabled(): boolean {
   return String(process.env[PLUMCONNECT_ENABLED_ENV] || "").trim().toLowerCase() === "true";
 }
 
-// ── PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE — Slice 3b ──────────────────────────
-//
-// The User._id that owns holiday leads captured from a CTWA referral
-// (services/plumconnect/holidayLead.ts). Unset or malformed → the adapter
-// falls back to the same "first ADMIN/SUPERADMIN" rule the website-capture
-// route uses (routes/leads.ts:260-264). Read live, like the flag above.
-
-export const PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV = "PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE";
-
-/** The configured assignee id as a 24-hex string, or null when unset/invalid. */
-export function holidayLeadAssigneeId(): string | null {
-  const raw = String(process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV] || "").trim();
-  return /^[0-9a-fA-F]{24}$/.test(raw) ? raw : null;
-}
+// (PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE — the Slice 3b static assignee — was
+// retired by Track B: a captured lead is routed by the assignment matrix
+// (services/plumconnect/assignment.ts) or held unassigned. The env var is
+// no longer read anywhere.)
 
 // ── PLUMCONNECT_ADS_READ_TOKEN — Slice 8 ────────────────────────────────────
 //

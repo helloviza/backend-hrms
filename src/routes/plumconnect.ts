@@ -45,6 +45,9 @@ import { inboxScope, conversationMatch, canSee, canWrite, canReassign, lineGrant
 import { isAccessLine, lineOfConversation, holdsAtLeast, canAccessLine, lineGrantsForUserId, heldLines, PLUMCONNECT_MODULE_KEYS, ACCESS_LINES } from "../services/plumconnect/access.js";
 import { buildCampaignRollup } from "../services/plumconnect/campaignRollup.js";
 import { getPresence, setPresence, presenceTtlMs } from "../services/plumconnect/presence.js";
+import { reResolveHeld, validateRuleTarget, validateRuleUser } from "../services/plumconnect/assignment.js";
+import PlumConnectAssignmentRule, { ASSIGNMENT_TARGET_TYPES, assignmentTargetKey } from "../models/plumconnect/AssignmentRule.js";
+import Lead from "../models/Lead.js";
 import type { ScopeCtx } from "../services/crmScope.js";
 import { stopBot, botIsActive } from "../services/plumconnect/bot.js";
 import { sendTextOutcome } from "../services/plumconnect/outbound.js";
@@ -145,6 +148,8 @@ function summarize(c: any, contact: any) {
     assignedTo: c.assignedTo ?? null,
     leadId: c.leadId ?? null,
     bot: c.bot,
+    // Track B: how the matrix routed this thread ("" on a pre-Track-B thread).
+    routing: c.routing ? { state: c.routing.state ?? "", targetKey: c.routing.targetKey ?? "", candidates: (c.routing.candidates ?? []).map(String), reason: c.routing.reason ?? "", resolvedAt: c.routing.resolvedAt ?? null } : null,
     lastInboundAt: c.lastInboundAt ?? null,
     lastOutboundAt: c.lastOutboundAt ?? null,
     lastMessageAt: c.lastMessageAt ?? null,
@@ -220,6 +225,116 @@ router.get("/campaigns/rollup", async (req, res) => {
   }
 });
 
+// ── Track B — the assignment matrix (CRUD; the admin page is Track D) ────
+// Admin-gated: ADMIN by role, or FULL on the target's line. The mapped
+// user must hold the target line at WRITE+ (someone who can act); a
+// campaign / ad target must name something known (Slice 8 row or Slice 5
+// campaign-map entry).
+
+function canManageRules(req: express.Request, line: any): boolean {
+  return isAccessLine(line) && holdsAtLeast(canAccessLine(lineGrants(req), line), "FULL");
+}
+
+async function ruleView(rule: any) {
+  const u: any = await User.findById(rule.userId).select("name firstName lastName email").lean();
+  return {
+    _id: rule._id,
+    target: rule.target,
+    targetKey: rule.targetKey,
+    userId: String(rule.userId),
+    userName: (u?.name && String(u.name).trim()) || `${u?.firstName || ""} ${u?.lastName || ""}`.trim() || String(u?.email || ""),
+    priority: rule.priority,
+    enabled: rule.enabled,
+    createdAt: rule.createdAt,
+    updatedAt: rule.updatedAt,
+  };
+}
+
+// GET /assignment-rules[?line=] — the rules on the lines I may manage.
+router.get("/assignment-rules", async (req, res) => {
+  try {
+    const lineParam = String(req.query.line || "");
+    if (lineParam && !isAccessLine(lineParam)) return res.status(400).json({ error: "Invalid line." });
+    const manageable = heldLines(lineGrants(req), "FULL").filter((l) => !lineParam || l === lineParam);
+    if (manageable.length === 0) return res.status(403).json({ error: "FULL access on a PlumConnect line is required to manage assignment rules." });
+    const rules = await PlumConnectAssignmentRule.find({ "target.line": { $in: manageable } }).sort({ "target.line": 1, targetKey: 1, priority: 1, createdAt: 1 }).lean();
+    return res.json({ rules: await Promise.all(rules.map(ruleView)), lines: manageable });
+  } catch (err) {
+    logger.error("plumconnect GET /assignment-rules error", { err });
+    return res.status(500).json({ error: "Failed to list assignment rules." });
+  }
+});
+
+// POST /assignment-rules — { target: { type, line, metaId? }, userId, priority?, enabled? }
+router.post("/assignment-rules", async (req, res) => {
+  try {
+    const body = (req.body as AnyObj) ?? {};
+    const target = body.target ?? {};
+    if (!(ASSIGNMENT_TARGET_TYPES as readonly string[]).includes(String(target.type))) return res.status(400).json({ error: "target.type must be department, campaign or ad." });
+    if (!isAccessLine(target.line)) return res.status(400).json({ error: "target.line must be one of plumtrips, helloviza, concierge, support." });
+    if (!canManageRules(req, target.line)) return res.status(403).json({ error: "FULL access on that line is required." });
+    const t = { type: target.type, line: target.line, metaId: String(target.metaId || "").trim() };
+    const vt = await validateRuleTarget(t);
+    if (vt.ok === false) return res.status(400).json({ error: vt.error });
+    const vu = await validateRuleUser(body.userId, t.line);
+    if (vu.ok === false) return res.status(400).json({ error: vu.error });
+    const priority = body.priority === undefined ? 100 : Number(body.priority);
+    if (!Number.isInteger(priority) || priority < 0) return res.status(400).json({ error: "priority must be a non-negative integer." });
+    const enabled = body.enabled === undefined ? true : Boolean(body.enabled);
+    const ctx = inboxScope(req, t.line);
+    const existing = await PlumConnectAssignmentRule.findOne({ userId: new mongoose.Types.ObjectId(String(body.userId)), targetKey: assignmentTargetKey(t) });
+    if (existing) return res.status(409).json({ error: "This user is already mapped to that target — update the existing rule." });
+    const rule = await PlumConnectAssignmentRule.create({ target: t, userId: new mongoose.Types.ObjectId(String(body.userId)), priority, enabled, createdBy: ctx.userId });
+    return res.status(201).json({ rule: await ruleView(rule.toObject()) });
+  } catch (err) {
+    logger.error("plumconnect POST /assignment-rules error", { err });
+    return res.status(500).json({ error: "Failed to create the assignment rule." });
+  }
+});
+
+// PATCH /assignment-rules/:id — { priority?, enabled?, userId? }
+router.patch("/assignment-rules/:id", async (req, res) => {
+  try {
+    const id = oid(req.params.id);
+    const rule = id ? await PlumConnectAssignmentRule.findById(id) : null;
+    if (!rule) return res.status(404).json({ error: "Rule not found." });
+    if (!canManageRules(req, rule.target.line)) return res.status(403).json({ error: "FULL access on that line is required." });
+    const body = (req.body as AnyObj) ?? {};
+    if (body.priority !== undefined) {
+      const priority = Number(body.priority);
+      if (!Number.isInteger(priority) || priority < 0) return res.status(400).json({ error: "priority must be a non-negative integer." });
+      rule.priority = priority;
+    }
+    if (body.enabled !== undefined) rule.enabled = Boolean(body.enabled);
+    if (body.userId !== undefined) {
+      const vu = await validateRuleUser(body.userId, rule.target.line);
+      if (vu.ok === false) return res.status(400).json({ error: vu.error });
+      rule.userId = new mongoose.Types.ObjectId(String(body.userId));
+    }
+    await rule.save();
+    return res.json({ rule: await ruleView(rule.toObject()) });
+  } catch (err: any) {
+    if (err?.code === 11000) return res.status(409).json({ error: "This user is already mapped to that target." });
+    logger.error("plumconnect PATCH /assignment-rules error", { err });
+    return res.status(500).json({ error: "Failed to update the assignment rule." });
+  }
+});
+
+// DELETE /assignment-rules/:id
+router.delete("/assignment-rules/:id", async (req, res) => {
+  try {
+    const id = oid(req.params.id);
+    const rule = id ? await PlumConnectAssignmentRule.findById(id) : null;
+    if (!rule) return res.status(404).json({ error: "Rule not found." });
+    if (!canManageRules(req, rule.target.line)) return res.status(403).json({ error: "FULL access on that line is required." });
+    await rule.deleteOne();
+    return res.json({ deleted: true });
+  } catch (err) {
+    logger.error("plumconnect DELETE /assignment-rules error", { err });
+    return res.status(500).json({ error: "Failed to delete the assignment rule." });
+  }
+});
+
 // ── Track A — agent presence, per line ─────────────────────────────────
 // Stored and exposed only; nothing routes on it yet (Track B). The guard
 // above already resolved the caller's Slice 7 grants: a line the caller
@@ -265,6 +380,10 @@ router.get("/conversations", async (req, res) => {
     const lineParam = String(req.query.line || "");
     if (lineParam && !isAccessLine(lineParam)) return res.status(400).json({ error: "Invalid line." });
     const only = isAccessLine(lineParam) ? lineParam : undefined;
+    // Track B: the light re-resolve — held / tied threads on the caller's
+    // lines get another look now (an agent may have come active), so the
+    // list below already reflects it. Bounded; no background job.
+    await reResolveHeld({ lines: heldLines(lineGrants(req)).filter((l) => !only || l === only), now: new Date() });
     const filter: AnyObj = { $and: [conversationMatch(req, only)] };
 
     const status = String(req.query.status || "").toUpperCase();
@@ -351,10 +470,16 @@ router.post("/conversations/:id/assign", async (req, res) => {
     const previous = conversation.assignedTo ?? null;
     conversation.assignedTo = target;
     if (conversation.status === "RESOLVED") conversation.status = "OPEN";
+    // Track B: a take / reassign by a person ends any matrix state (a tie is
+    // claimed, a hold is over) and IS a human takeover for the bot.
+    const prevRouting: AnyObj = (conversation.routing as any)?.toObject?.() ?? conversation.routing ?? {};
+    conversation.routing = { ...prevRouting, state: "assigned", candidates: [target], autoAssigned: false, resolvedAt: now, reason: claimingFree ? "taken" : "reassigned" } as any;
     await conversation.save();
     if (botIsActive(conversation)) await stopBot(conversation._id as mongoose.Types.ObjectId, "human", now);
 
     const name = await displayName(target);
+    // The CRM Lead follows the thread's owner.
+    if (conversation.leadId) await Lead.updateOne({ _id: conversation.leadId }, { $set: { assignedTo: target, assignedToName: name } });
     await systemNote(conversation._id as mongoose.Types.ObjectId, `Assigned to ${name || String(target)}`, ctx.userId, { kind: "assignment", from: previous, to: target }, now);
 
     const fresh = await PlumConnectConversation.findById(conversation._id).lean();

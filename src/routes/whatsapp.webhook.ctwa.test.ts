@@ -42,7 +42,10 @@ vi.mock("../services/whatsappCloud.service.js", async (importOriginal) => {
 });
 
 const { default: router } = await import("./whatsapp.webhook.js");
-const { PLUMCONNECT_ENABLED_ENV, PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV } = await import("../config/plumconnect.js");
+const { PLUMCONNECT_ENABLED_ENV } = await import("../config/plumconnect.js");
+const { default: AssignmentRule } = await import("../models/plumconnect/AssignmentRule.js");
+const { default: AgentPresence } = await import("../models/plumconnect/AgentPresence.js");
+const { UserPermission } = await import("../models/UserPermission.js");
 const { SYSTEM_WORKSPACE_ID } = await import("../config/defaultTaskAutomations.js");
 const { default: User } = await import("../models/User.js");
 const { default: Lead } = await import("../models/Lead.js");
@@ -105,24 +108,31 @@ beforeEach(async () => {
   H.trigger.mockClear();
   H.send.mockClear();
   delete process.env.CRM_V2_OPPORTUNITY;
-  await Promise.all([User.deleteMany({}), Lead.deleteMany({}), LeadActivity.deleteMany({}), Task.deleteMany({}), TaskAutomation.deleteMany({}), Counter.deleteMany({}), ExpenseReply.deleteMany({}), ExpenseCapture.deleteMany({}), Contact.deleteMany({}), Conversation.deleteMany({}), Message.deleteMany({}), CampaignMap.deleteMany({})]);
+  await Promise.all([User.deleteMany({}), UserPermission.deleteMany({}), AssignmentRule.deleteMany({}), AgentPresence.deleteMany({}), Lead.deleteMany({}), LeadActivity.deleteMany({}), Task.deleteMany({}), TaskAutomation.deleteMany({}), Counter.deleteMany({}), ExpenseReply.deleteMany({}), ExpenseCapture.deleteMany({}), Contact.deleteMany({}), Conversation.deleteMany({}), Message.deleteMany({}), CampaignMap.deleteMany({})]);
   // Slice 5: Ops has mapped the Bali ad to holidays, so every referral below
   // routes to concierge by the campaign map — the exact 3b behaviour.
   await CampaignMap.create({ adId: REFERRAL.source_id, businessLine: "concierge", label: "Bali promo" });
-  await User.collection.insertOne({ _id: ADMIN, name: "Ops Admin", email: "ops@plumtrips.com", roles: ["ADMIN"], passwordHash: "x", workspaceId: WS } as any);
-  await User.collection.insertOne({ _id: SALES, name: "Sana Holiday", email: "sana@plumtrips.com", roles: ["EMPLOYEE"], passwordHash: "x", workspaceId: WS } as any);
+  await User.collection.insertOne({ _id: ADMIN, name: "Ops Admin", email: "ops@plumtrips.com", roles: ["ADMIN"], passwordHash: "x", workspaceId: WS, status: "ACTIVE" } as any);
+  await User.collection.insertOne({ _id: SALES, name: "Sana Holiday", email: "sana@plumtrips.com", roles: ["EMPLOYEE"], passwordHash: "x", workspaceId: WS, status: "ACTIVE" } as any);
   await User.create({ email: "emp@x.test", passwordHash: "x", workspaceId: WS, name: "Bound Employee", status: "ACTIVE", waId: EMPLOYEE });
   process.env[PLUMCONNECT_ENABLED_ENV] = "true";
 });
 
 afterEach(() => {
   delete process.env[PLUMCONNECT_ENABLED_ENV];
-  delete process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV];
 });
+
+/** Track B: map SALES onto concierge (WRITE grant + present), so the matrix routes to them. */
+async function mapSalesToConcierge(now: Date) {
+  await UserPermission.deleteMany({ userId: String(SALES) });
+  await UserPermission.create({ userId: String(SALES), email: "sana@plumtrips.com", workspaceId: String(WS), universe: "STAFF", source: "manual", level: { code: "L3", name: "Exec", designation: "x" }, status: "active", tier: 1, grantedModules: [], roleType: "EMPLOYEE", grantedBy: "test", grantedAt: new Date(), modules: { plumconnectConcierge: { access: "WRITE", scope: "OWN" } } } as any);
+  await AssignmentRule.create({ target: { type: "department", line: "concierge" }, userId: SALES, priority: 1, enabled: true });
+  await AgentPresence.findOneAndUpdate({ userId: SALES, line: "concierge" }, { $set: { active: true, activeSince: now, updatedAt: now } }, { upsert: true, timestamps: false });
+}
 
 describe("E2E-A capture half — stranger taps a CTWA ad", () => {
   it("referral → Contact → holiday Lead with attribution → lead Conversation + inbound Message; one lead.created; nothing sent", async () => {
-    process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV] = String(SALES);
+    await mapSalesToConcierge(new Date());
     await TaskAutomation.create({ workspaceId: SYSTEM_WORKSPACE_ID, triggerKey: "lead.created", label: "welcome", entityType: "LEAD", titleTemplate: "Welcome {{leadName}}", dueOffsetMinutes: 60, priority: "MEDIUM", assigneeRule: { type: "OWNER" }, tags: [] });
 
     const m = text(STRANGER, "Hi, saw your Bali ad", { referral: REFERRAL });
@@ -217,17 +227,29 @@ describe("E2E-A capture half — stranger taps a CTWA ad", () => {
     expect(H.send).toHaveBeenCalledTimes(2);
   });
 
-  it("assignee fallback: config unset → first admin; config set → that user", async () => {
+  it("assignee (Track B): no matrix → HELD unassigned (the first-admin fallback is gone); SALES mapped + present → SALES; the bot still runs on an auto-assigned thread", async () => {
     await post([text(STRANGER, "ad", { referral: REFERRAL })], profile(STRANGER, "A"));
     let lead: any = await Lead.findOne({ contactName: "A" }).lean();
-    expect(String(lead.assignedTo)).toBe(String(ADMIN));
-    expect(lead.assignedToName).toBe("Ops Admin");
+    expect(lead).not.toHaveProperty("assignedTo");
+    expect(lead.assignedToName).toBe("");
+    let conv: any = await Conversation.findOne({ leadId: lead._id }).lean();
+    expect(conv.assignedTo).toBeNull();
+    expect(conv.routing).toMatchObject({ state: "held", targetKey: "department:concierge" });
 
-    process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV] = String(SALES);
+    await mapSalesToConcierge(new Date());
     await post([text("919222222222", "ad", { referral: REFERRAL })], profile("919222222222", "B"));
     lead = await Lead.findOne({ contactName: "B" }).lean();
     expect(String(lead.assignedTo)).toBe(String(SALES));
     expect(lead.assignedToName).toBe("Sana Holiday");
+    conv = await Conversation.findOne({ leadId: lead._id }).lean();
+    expect(String(conv.assignedTo)).toBe(String(SALES));
+    expect(conv.routing).toMatchObject({ state: "assigned", autoAssigned: true });
+    expect(conv.bot).toMatchObject({ active: true, step: "ask_name" });
+    // an auto-assignment is not a human takeover: the next text is the name answer
+    await post([text("919222222222", "Bea")]);
+    conv = await Conversation.findOne({ leadId: lead._id }).lean();
+    expect(conv.bot).toMatchObject({ active: true, step: "ask_destination" });
+    expect((await Lead.findById(lead._id).lean())!.contactName).toBe("Bea");
   });
 
   it("no profile name → 'WhatsApp contact' placeholder; a redelivered wamid does not create a second Lead", async () => {

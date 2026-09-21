@@ -106,8 +106,12 @@ export async function handleBotTurn(ctx: BotContext, text: string): Promise<BotT
 
   if (!botIsActive(conv)) return { handled: false, reason: "inactive" };
 
-  // Human takeover: an assigned thread silences the bot for good.
-  if (conv.assignedTo) {
+  // Human takeover: an assigned thread silences the bot for good. An
+  // assignment made by the routing matrix (Track B, routing.autoAssigned)
+  // is not a takeover — the agent owns the thread while the bot still
+  // qualifies it; their first reply / take through the inbox stops the bot
+  // explicitly (routes/plumconnect.ts).
+  if (conv.assignedTo && !conv.routing?.autoAssigned) {
     await stopBot(conversationId, "human", now);
     whatsappLogger.info("PlumConnect bot: stopped — conversation assigned to a human", { conversationId: String(conversationId) });
     return { handled: false, reason: "human" };

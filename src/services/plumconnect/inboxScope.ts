@@ -53,15 +53,30 @@ const NOTHING: AnyObj = { _id: null };
 export function conversationMatch(req: express.Request, only?: AccessLine): AnyObj {
   const lines = heldLines(lineGrants(req)).filter((line) => !only || line === only);
   if (lines.length === 0) return NOTHING;
-  const clauses = lines.map((line) => ({ $and: [lineMatch(line), rowsFor(inboxScope(req, line), "assignedTo")] }));
+  const clauses = lines.map((line) => {
+    const ctx = inboxScope(req, line);
+    const own = rowsFor(ctx, "assignedTo");
+    // Track B: an unassigned thread the matrix surfaced to me (a tie I am
+    // part of) is mine to see and take, even under OWN scope.
+    const surfaced = !isAll(ctx) && ctx.userId ? { $or: [own, { assignedTo: null, "routing.candidates": ctx.userId }] } : own;
+    return { $and: [lineMatch(line), surfaced] };
+  });
   return clauses.length === 1 ? clauses[0] : { $or: clauses };
 }
 
-/** May the caller see THIS conversation on its line? (held at READ+, and OWN: it is assigned to them.) */
-export function canSee(ctx: ScopeCtx, conversation: { assignedTo?: mongoose.Types.ObjectId | null }): boolean {
+/** Track B: an unassigned thread whose routing candidates include this user. */
+export function isSurfacedTo(userId: mongoose.Types.ObjectId | null, conversation: { assignedTo?: mongoose.Types.ObjectId | null; routing?: { candidates?: mongoose.Types.ObjectId[] } | null }): boolean {
+  if (!userId || conversation.assignedTo) return false;
+  return (conversation.routing?.candidates ?? []).some((c) => String(c) === String(userId));
+}
+
+/** May the caller see THIS conversation on its line? (held at READ+, and OWN: it is assigned to them, or surfaced to them by the matrix.) */
+export function canSee(ctx: ScopeCtx, conversation: { assignedTo?: mongoose.Types.ObjectId | null; routing?: { candidates?: mongoose.Types.ObjectId[] } | null }): boolean {
   if (!holdsAtLeast({ access: ctx.access, scope: ctx.scope }, "READ")) return false;
   if (isAll(ctx)) return true;
-  if (!ctx.userId || !conversation.assignedTo) return false;
+  if (!ctx.userId) return false;
+  if (isSurfacedTo(ctx.userId, conversation)) return true;
+  if (!conversation.assignedTo) return false;
   return String(conversation.assignedTo) === String(ctx.userId);
 }
 

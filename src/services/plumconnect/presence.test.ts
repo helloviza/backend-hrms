@@ -1,8 +1,8 @@
 // PlumConnect Track A — agent presence over real collections
 // (mongodb-memory-server): held-line enforcement, per-department
 // independence, default away, grant-revocation safety, staleness, and the
-// no-routing-change guarantee (a lead assigns exactly as Slice 3b/5 do,
-// whatever presence says; no capture-path module imports this service).
+// routing boundary (Track B: presence alone never assigns — only a matrix
+// row does; only assignment.ts and the presence routes import this).
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import mongoose from "mongoose";
 import { MongoMemoryServer } from "mongodb-memory-server";
@@ -195,38 +195,34 @@ describe("default away, revocation safety, staleness", () => {
   });
 });
 
-describe("no routing change", () => {
-  it("a lead assigns exactly as before — the first ADMIN (the Slice 3b rule) — whatever presence says; the presence rows are untouched by capture", async () => {
-    // a non-admin is loudly active on concierge…
+describe("presence feeds routing (Track B) — presence alone never assigns", () => {
+  it("an active, WRITE+ agent with NO matrix row does not receive a lead; capture never writes presence rows", async () => {
     await UserPermission.create({ userId: String(IDS.ghost), email: "ghost@x.test", workspaceId: String(WS), universe: "STAFF", source: "manual", level: { code: "L3", name: "Exec", designation: "x" }, status: "active", tier: 1, grantedModules: [], roleType: "EMPLOYEE", grantedBy: "test", grantedAt: new Date(), modules: { plumconnectConcierge: { access: "FULL", scope: "ALL" } } } as any);
     await setPresence({ userId: IDS.ghost, grants: grantOf({ plumconnectConcierge: { access: "FULL", scope: "ALL" } }), line: "concierge", active: true, now: NOW });
-    expect(await activeAgentsForLine("concierge", at(1000))).toEqual([IDS.ghost]);
-    // …and the admin is explicitly away
+    expect(await activeAgentsForLine("concierge", at(1000), "WRITE")).toEqual([IDS.ghost]);
     await setPresence({ userId: IDS.admin, grants: adminLineGrants(), line: "concierge", active: false, now: NOW });
 
     const contact = await Contact.create({ phone: "919111111111" });
     const conversation = await Conversation.create({ contactId: contact._id, kind: "lead", businessLine: "concierge" });
     const r = await captureLead({ businessLine: "concierge", canonical: "919111111111", profileName: "Priya", referralRaw: { source_type: "ad", source_id: "120200000000000001", headline: "Bali" }, contactId: contact._id as any, conversation, messageId: "wamid.1", now: at(2000) });
-    expect(r.touch).toBe("first");
-    expect(String((r as any).assignedTo)).toBe(String(IDS.admin)); // not the active agent
+    expect(r).toMatchObject({ touch: "first", assignedTo: null, routing: "held" }); // present but not mapped; and never the admin
     const lead: any = await Lead.findById(r.leadId).lean();
-    expect(String(lead.assignedTo)).toBe(String(IDS.admin));
-    expect(lead.assignedToName).toBe("Ops Admin");
+    expect(lead).not.toHaveProperty("assignedTo");
     expect(await AgentPresence.countDocuments({})).toBe(2);
     expect((await AgentPresence.findOne({ userId: IDS.ghost }).lean())!.updatedAt).toEqual(NOW);
   });
 
-  it("no capture-path, worker, sender or webhook module imports presence (static)", () => {
+  it("presence is read by routing only through assignment.ts; no worker, sender or webhook module imports it (static)", () => {
     const root = join(process.cwd(), "src");
     const offenders: string[] = [];
     const walk = (dir: string) => {
       for (const name of readdirSync(dir)) {
         const p = join(dir, name);
         if (statSync(p).isDirectory()) walk(p);
-        else if (p.endsWith(".ts") && !p.endsWith(".test.ts") && /plumconnect[\\/]presence\.js/.test(readFileSync(p, "utf8"))) offenders.push(p.slice(root.length + 1).replace(/\\/g, "/"));
+        else if (p.endsWith(".ts") && !p.endsWith(".test.ts") && /(plumconnect[\\/]|\.\/)presence\.js/.test(readFileSync(p, "utf8"))) offenders.push(p.slice(root.length + 1).replace(/\\/g, "/"));
       }
     };
     walk(root);
-    expect(offenders.sort()).toEqual(["routes/plumconnect.ts"]);
+    expect(offenders.sort()).toEqual(["routes/plumconnect.ts", "services/plumconnect/assignment.ts"]);
   });
 });

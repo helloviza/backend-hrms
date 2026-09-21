@@ -23,19 +23,20 @@
 //     WhatsApp-born lead may carry. enquiryType = "holiday_package" is the
 //     motion discriminator (D1''); sourceChannel = "whatsapp" is the
 //     transport — the ad fact lives in attribution, never in sourceChannel.
-//   • Assignee: PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE, else the first
-//     ADMIN/SUPERADMIN — the website-capture rule (routes/leads.ts:260-264).
+//   • Assignee (Track B): the assignment matrix — services/plumconnect/
+//     assignment.ts resolveAssignee(): a mapped agent who is present on the
+//     line and can act on it, else the thread is HELD unassigned. The 3b
+//     static rule (configured user, else first ADMIN) is gone: a lead is
+//     never handed to someone who is not available.
 //
 // Slice 5: captureLead({ businessLine, ... }) generalises the capture to the
 // three business lines (LEAD_SHAPE_FOR_LINE picks enquiryType / type) and to
 // ORGANIC contacts (no referral → no attribution, no ad note). The
 // businessLine comes from the Intent Engine (dispatch.ts / intent.ts) and is
 // never derived from attribution here. captureHolidayLead() is the 3b
-// signature, fixed to "concierge". The assignee rule is shared by all three
-// lines for now — per-line routing is a later slice.
+// signature, fixed to "concierge".
 
 import mongoose from "mongoose";
-import User from "../../models/User.js";
 import LeadActivity, { type ActivityType } from "../../models/LeadActivity.js";
 import PlumConnectContact from "../../models/plumconnect/Contact.js";
 import PlumConnectConversation, { type IPlumConnectConversation } from "../../models/plumconnect/Conversation.js";
@@ -43,7 +44,7 @@ import PlumConnectMessage from "../../models/plumconnect/Message.js";
 import { LEAD_SOURCES, type LeadAttribution } from "../../models/Lead.js";
 import type { BusinessLine } from "../../models/plumconnect/Conversation.js";
 import { createLead } from "../leads.service.js";
-import { holidayLeadAssigneeId } from "../../config/plumconnect.js";
+import { resolveAssignee, applyRouting } from "./assignment.js";
 import { whatsappLogger } from "../../utils/logger.js";
 
 /* ───────────────────────────── referral parsing ───────────────────────────── */
@@ -112,31 +113,6 @@ function referralSummary(p: ParsedReferral): string {
   return bits.length ? bits.join(" · ") : "(no referral details)";
 }
 
-/* ───────────────────────────── assignee ───────────────────────────── */
-
-function displayName(u: any): string {
-  return (
-    (u?.name && String(u.name).trim()) ||
-    `${u?.firstName || ""} ${u?.lastName || ""}`.trim() ||
-    (u?.email ? String(u.email).trim() : "")
-  );
-}
-
-/** Configured owner if it names a real user, else the first admin (website-capture rule). */
-export async function resolveHolidayLeadAssignee(): Promise<{ id: mongoose.Types.ObjectId; name: string } | null> {
-  const configured = holidayLeadAssigneeId();
-  if (configured) {
-    const u: any = await User.findById(configured).select("_id name firstName lastName email").lean();
-    if (u) return { id: u._id, name: displayName(u) };
-    whatsappLogger.warn("PlumConnect: PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE names no user — falling back", { configured });
-  }
-  const defaultRep: any = await (User as any)
-    .findOne({ roles: { $in: ["ADMIN", "SUPERADMIN"] } })
-    .select("_id name firstName lastName email")
-    .lean();
-  return defaultRep ? { id: defaultRep._id, name: displayName(defaultRep) } : null;
-}
-
 /* ───────────────────────────── capture ───────────────────────────── */
 
 /** Slice 5 — which department a lead belongs to decides its enquiryType / type. */
@@ -173,7 +149,7 @@ export interface CaptureHolidayLeadInput {
 }
 
 export type CaptureHolidayLeadResult =
-  | { touch: "first"; created: true; leadId: mongoose.Types.ObjectId; assignedTo: mongoose.Types.ObjectId | null }
+  | { touch: "first"; created: true; leadId: mongoose.Types.ObjectId; assignedTo: mongoose.Types.ObjectId | null; routing: "assigned" | "tie" | "held" }
   | { touch: "repeat"; created: false; leadId: mongoose.Types.ObjectId };
 
 export async function captureHolidayLead(input: CaptureHolidayLeadInput): Promise<CaptureHolidayLeadResult> {
@@ -225,7 +201,11 @@ export async function captureLead(input: CaptureLeadInput): Promise<CaptureHolid
   }
 
   // ── First touch: create the Lead through the 3a seam ──────────────────
-  const assignee = await resolveHolidayLeadAssignee();
+  // Track B: the matrix decides the owner BEFORE the Lead exists, so
+  // Lead.assignedTo is right at creation (the lead.created automation's
+  // OWNER rule reads it). Held / tied → no owner; the thread waits.
+  const decision = await resolveAssignee({ conversation: input.conversation, line: input.businessLine, sourceId: parsed.sourceId, now });
+  const assignee = decision.assignee;
 
   const body = {
     type: shape.type,
@@ -259,13 +239,17 @@ export async function captureLead(input: CaptureLeadInput): Promise<CaptureHolid
   await PlumConnectConversation.updateOne({ _id: conversationId }, { $set: { leadId } });
   await PlumConnectContact.updateOne({ _id: input.contactId }, { $addToSet: { "refs.leadIds": leadId } });
   input.conversation.leadId = leadId;
+  // The thread follows the decision (assignedTo + routing state); the Lead
+  // already carries the owner from createLead.
+  await applyRouting(input.conversation, decision, now);
 
   whatsappLogger.info(`PlumConnect: ${shape.label} lead created (${hasReferral ? "CTWA referral" : "organic"})`, {
     leadId: String(leadId),
     businessLine: input.businessLine,
     leadCode: lead.leadCode,
     conversationId: String(conversationId),
+    routing: decision.state,
     assignedTo: assignee ? String(assignee.id) : null,
   });
-  return { touch: "first", created: true, leadId, assignedTo: assignee?.id ?? null };
+  return { touch: "first", created: true, leadId, assignedTo: assignee?.id ?? null, routing: decision.state };
 }
