@@ -42,9 +42,29 @@ import { requirePermission } from "../middleware/requirePermission.js";
 import { audit } from "../middleware/audit.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
-import { maskTailId } from "../utils/piiMask.js";
+import { maskTailId, maskPassportVault } from "../utils/piiMask.js";
 import { holdsCapability } from "../services/capabilityProbe.js";
 import logger from "../utils/logger.js";
+// The tabbed dossier is computed by the SAME helpers the customer dossier
+// and the visa-roster ops dossier use — imported, never reimplemented, so
+// the three surfaces cannot disagree about one record (see
+// routes/admin.visa.roster.ts, whose handlers these twins copy verbatim).
+import {
+  computeDossierHealth,
+  resolvePassportVault,
+  resolveDossierHeader,
+  describeDesignation,
+  countryVocabulary,
+  mapTripRow,
+  mapTravellerDocument,
+  identityCaptureState,
+} from "./workspace.travellers.js";
+import TravellerDocument from "../models/TravellerDocument.js";
+import TravellerTrip, { TRIP_PURPOSES, TRIP_DATE_PRECISIONS } from "../models/TravellerTrip.js";
+import { VISA_ENTRY_TYPES } from "../models/VisaRule.js";
+import { resolveVisaWallet, resolveSchengenBlock } from "../services/visaHolding.service.js";
+import { presignGetObject } from "../utils/s3Presign.js";
+import { env } from "../config/env.js";
 
 const router = Router();
 
@@ -197,5 +217,185 @@ router.get(
     }
   },
 );
+
+/* ═════════════════════════════════════════════════════════════════════
+ * THE TABBED DOSSIER — booking-gated twins of routes/admin.visa.roster.ts
+ *
+ * Client Travellers' "View" popup renders the SAME six-tab dossier the
+ * customer portal and the visa roster render (TravellerForm + the wallet /
+ * history / documents panels), pointed at these routes through the
+ * components' detailPath / basePath props. Each handler below is the roster
+ * handler copied verbatim, with two deliberate differences:
+ *   - the tenant comes from the Customer._id hop (resolveWorkspaceForCustomer)
+ *     instead of a :workspaceId the caller names;
+ *   - the gate is this router's (HOUSE + manualBookings:READ), so a booking
+ *     operator does not need the visa console's visaApplication grant.
+ * Everything that makes the shared components read-only is a SERVER signal
+ * sent here exactly as the roster sends it: editableFields:[],
+ * capabilities.canEdit:false / canAttachStamp:false, uploadableKinds:[].
+ * Identity numbers follow travellerIdentityPII (Piece 1) — same rule, same
+ * masker. Documents are list + presign only: no POST, no DELETE.
+ * ═════════════════════════════════════════════════════════════════════ */
+
+const dossierGate = [requirePermission("manualBookings", "READ"), audit("house-traveller-dossier")];
+
+/** Hop + both-ids scoped traveller read, or a 404 already sent. */
+async function opsTravellerForCustomer(req: any, res: any): Promise<{ traveller: any; workspaceId: mongoose.Types.ObjectId } | null> {
+  const ws = await resolveWorkspaceForCustomer(String(req.params.customerId));
+  if (!ws || !mongoose.isValidObjectId(req.params.id)) {
+    res.status(404).json({ error: "Traveller not found" });
+    return null;
+  }
+  // Scoped by BOTH ids — a traveller id alone must never read across tenants.
+  const traveller: any = await TravellerProfile.findOne({ _id: req.params.id, workspaceId: ws._id }).lean();
+  if (!traveller) {
+    res.status(404).json({ error: "Traveller not found" });
+    return null;
+  }
+  return { traveller, workspaceId: ws._id };
+}
+
+// GET /:customerId/travellers/:id/dossier — what TravellerForm{detailPath} reads.
+router.get("/:customerId/travellers/:id/dossier", ...dossierGate, async (req: any, res: any) => {
+  try {
+    const ctx = await opsTravellerForCustomer(req, res);
+    if (!ctx) return;
+    const { traveller, workspaceId } = ctx;
+    const [header, designation, passportVault, unmasked] = await Promise.all([
+      resolveDossierHeader(traveller, workspaceId),
+      describeDesignation(traveller, workspaceId),
+      resolvePassportVault(traveller, workspaceId),
+      holdsCapability(req, "travellerIdentityPII"),
+    ]);
+    recordCrossTenantRead(req, "dossier", { workspaceId: String(workspaceId), travellerId: String(traveller._id), identityUnmasked: unmasked });
+    res.json({
+      ok: true,
+      identityUnmasked: unmasked,
+      traveller: { ...traveller, passportNo: unmasked ? (traveller.passportNo ?? null) : (maskTailId(traveller.passportNo) ?? null) },
+      // Ops reads; ops does not edit a customer's roster. An empty allowlist
+      // is what locks every field in the shared form.
+      canManage: false,
+      editableFields: [],
+      isClaimable: false,
+      dossierHealth: computeDossierHealth(traveller),
+      header,
+      designation,
+      passportVault: unmasked ? passportVault : maskPassportVault(passportVault),
+      consentLedger: {
+        available: false,
+        reason:
+          "The consent ledger is not visible from the ops console — it records what a named " +
+          "person legally agreed to, and is readable only inside their own workspace.",
+      },
+    });
+  } catch (err: any) {
+    console.error("[admin.travellers GET dossier]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load dossier" });
+  }
+});
+
+router.get("/:customerId/travellers/:id/visa-holdings", ...dossierGate, async (req: any, res: any) => {
+  try {
+    const ctx = await opsTravellerForCustomer(req, res);
+    if (!ctx) return;
+    const { traveller, workspaceId } = ctx;
+    const [{ rows, summary }, unmasked] = await Promise.all([
+      resolveVisaWallet(traveller._id, workspaceId),
+      holdsCapability(req, "travellerIdentityPII"),
+    ]);
+    const holdings = unmasked ? rows : rows.map((r: any) => ({ ...r, visaNumber: maskTailId(r.visaNumber) ?? null }));
+    res.json({
+      ok: true,
+      identityUnmasked: unmasked,
+      holdings,
+      summary,
+      schengen: resolveSchengenBlock(holdings),
+      capabilities: { canEdit: false, canAttachStamp: false, stampReason: "Read-only from the ops console." },
+      vocabularies: { entryTypes: VISA_ENTRY_TYPES, countries: countryVocabulary() },
+    });
+  } catch (err: any) {
+    console.error("[admin.travellers GET visa-holdings]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load visa wallet" });
+  }
+});
+
+router.get("/:customerId/travellers/:id/trips", ...dossierGate, async (req: any, res: any) => {
+  try {
+    const ctx = await opsTravellerForCustomer(req, res);
+    if (!ctx) return;
+    const { traveller, workspaceId } = ctx;
+    const docs: any[] = await TravellerTrip.find({ workspaceId, travellerProfileId: traveller._id, deletedAt: null })
+      .sort({ startDate: -1, tripMonth: -1, createdAt: -1 })
+      .lean();
+    const trips = docs.map(mapTripRow);
+    res.json({
+      ok: true,
+      trips,
+      summary: { recorded: trips.length, countries: new Set(trips.map((t) => t.countryIso2)).size },
+      capabilities: { canEdit: false },
+      vocabularies: { purposes: TRIP_PURPOSES, datePrecisions: TRIP_DATE_PRECISIONS, countries: countryVocabulary() },
+    });
+  } catch (err: any) {
+    console.error("[admin.travellers GET trips]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load travel history" });
+  }
+});
+
+router.get("/:customerId/travellers/:id/documents", ...dossierGate, async (req: any, res: any) => {
+  try {
+    const ctx = await opsTravellerForCustomer(req, res);
+    if (!ctx) return;
+    const { traveller, workspaceId } = ctx;
+    const docs: any[] = await TravellerDocument.find({ workspaceId, travellerProfileId: traveller._id, deletedAt: null })
+      .sort({ docKind: 1, version: -1 })
+      .lean();
+    // First row per kind wins — "latest version of each kind", same as the
+    // workspace route and the roster.
+    const latestByKind = new Map<string, any>();
+    for (const d of docs) if (!latestByKind.has(d.docKind)) latestByKind.set(d.docKind, d);
+    res.json({
+      ok: true,
+      documents: [...latestByKind.values()].map(mapTravellerDocument),
+      // An empty allowlist is what removes every upload/replace/delete
+      // control in the shared panel; View stays.
+      capabilities: { uploadableKinds: [] },
+      identityCapture: identityCaptureState(),
+    });
+  } catch (err: any) {
+    console.error("[admin.travellers GET documents]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load documents" });
+  }
+});
+
+router.get("/:customerId/travellers/:id/documents/:documentId/url", ...dossierGate, async (req: any, res: any) => {
+  try {
+    const ctx = await opsTravellerForCustomer(req, res);
+    if (!ctx) return;
+    const { traveller, workspaceId } = ctx;
+    if (!mongoose.isValidObjectId(req.params.documentId)) return res.status(404).json({ error: "Document not found" });
+    // All three ids in the filter, never checked afterwards — a documentId
+    // from another profile or another tenant resolves to nothing rather than
+    // to somebody else's passport scan.
+    const doc: any = await TravellerDocument.findOne({
+      _id: req.params.documentId,
+      workspaceId,
+      travellerProfileId: traveller._id,
+      deletedAt: null,
+    }).lean();
+    if (!doc) return res.status(404).json({ error: "Document not found" });
+    const url = await presignGetObject({
+      bucket: env.S3_BUCKET,
+      key: doc.s3Key,
+      filename: doc.originalFilename,
+      view: true,
+      contentType: doc.mimeType,
+    });
+    recordCrossTenantRead(req, "document presign", { workspaceId: String(workspaceId), travellerId: String(traveller._id), documentId: String(doc._id), docKind: doc.docKind });
+    res.json({ ok: true, url });
+  } catch (err: any) {
+    console.error("[admin.travellers GET document url]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to open document" });
+  }
+});
 
 export default router;
