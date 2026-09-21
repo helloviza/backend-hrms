@@ -7,6 +7,12 @@
 // the registry (index.ts) returns for the conversation's businessLine.
 // No question may call an LLM, read anything but the answer text, or write
 // anything but the Lead paths it names.
+//
+// Track C: copy is no longer inline. A flow names the canned-message KEY
+// for each send (services/plumconnect/messages.ts) and, where the text
+// takes a placeholder, how to fill it from the turn; the bot resolves the
+// key through the store (line override → global → seed default) at send
+// time, so an admin's edit takes effect on the next message.
 
 import type { BusinessLine } from "../../../models/plumconnect/Conversation.js";
 
@@ -20,13 +26,20 @@ export interface ParsedAnswer {
   set: LeadPatch;
 }
 
+/** A canned-message reference: the store key, plus the placeholder values the turn supplies. */
+export interface MessageRef {
+  key: string;
+  /** Placeholder values for this send, from the previous answer's `display` (the name, usually). */
+  vars?: (ctx: { previousAnswer: string }) => Record<string, string>;
+}
+
 export interface FlowQuestion {
   /** Conversation.bot.step while this question is open. Unique within the flow. */
   id: string;
-  /** The question, given the previous answer's `display` ("" when there is none). */
-  ask: (previousAnswer: string) => string;
+  /** The question (the store key; `vars` fills e.g. {name} from the previous answer). */
+  ask: MessageRef;
   /** The re-ask after an unparseable answer (asked once; the second miss stops the bot). */
-  askAgain: string;
+  askAgain: MessageRef;
   /** Deterministic parse of the answer → the Lead patch; null = unparseable. */
   parse: (text: string, now: Date) => ParsedAnswer | null;
   /**
@@ -39,12 +52,12 @@ export interface FlowQuestion {
 
 export interface QualificationFlow {
   businessLine: BusinessLine;
-  /** Message 1 on a fresh Lead: greeting + the first question in one send. `headline` is the (capped) ad headline or "". */
-  welcome: (headline: string) => string;
+  /** Message 1 on a fresh Lead: greeting + the first question in one send — `key` without an ad headline, `withHeadline` (takes {headline}) with one. */
+  welcome: { key: string; withHeadline: string };
   /** Asked in order, one per turn. The last answer completes the flow. */
   questions: readonly FlowQuestion[];
-  /** The completion ack when the Lead has a real contact name. */
-  handover: (name: string) => string;
+  /** The completion ack when the Lead has a real contact name (takes {name}). */
+  handover: string;
   /** The completion ack without a name, and the give-up ack after a second unparseable answer. */
   handoverUnparsed: string;
 }

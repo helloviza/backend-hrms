@@ -8,31 +8,25 @@
 // second miss) and the same handover. bot.parity.test.ts pins the whole
 // transcript against a recording of the pre-Slice-6 bot.
 //
+// Track C: the copy lives in the canned-message store under concierge.*
+// (services/plumconnect/messages.ts holds today's exact strings as the
+// seed / fallback); this file names the keys.
+//
 //   ask_name ──answer──▶ ask_destination ──answer──▶ ask_dates ──answer──▶ done
 
 import type { QualificationFlow } from "./types.js";
 import { parseDates, parseDestination, parseName, sanitize } from "./parse.js";
 
-const COPY = {
-  welcome: (headline: string) =>
-    `Hi! Thanks for reaching out to Plumtrips${headline ? ` about "${headline}"` : ""}. To get started, what's your name?`,
-  askNameAgain: "Sorry, I didn't catch that — what's your name?",
-  askDestination: (name: string) => `Nice to meet you, ${name}! Where would you like to go?`,
-  askDestinationAgain: "Which destination did you have in mind?",
-  askDates: "Great — when are you planning to travel? (e.g. 12 Oct to 19 Oct)",
-  askDatesAgain: "Could you share your travel dates? A rough date is fine, e.g. 15 Nov.",
-  handover: (name: string) => `Perfect, ${name}. A Plumtrips holiday planner will be with you shortly.`,
-  handoverUnparsed: "Thanks — a Plumtrips holiday planner will pick this up with you shortly.",
-};
+const byName = ({ previousAnswer }: { previousAnswer: string }) => ({ name: previousAnswer });
 
 export const conciergeFlow: QualificationFlow = {
   businessLine: "concierge",
-  welcome: COPY.welcome,
+  welcome: { key: "concierge.welcome", withHeadline: "concierge.welcome_headline" },
   questions: [
     {
       id: "ask_name",
-      ask: () => COPY.welcome(""),
-      askAgain: COPY.askNameAgain,
+      ask: { key: "concierge.welcome" },
+      askAgain: { key: "concierge.ask_name_again" },
       parse: (text) => {
         const name = parseName(text);
         // Overwrite the placeholder (or whatever the profile gave us) with what they said.
@@ -41,8 +35,8 @@ export const conciergeFlow: QualificationFlow = {
     },
     {
       id: "ask_destination",
-      ask: COPY.askDestination,
-      askAgain: COPY.askDestinationAgain,
+      ask: { key: "concierge.ask_destination", vars: byName },
+      askAgain: { key: "concierge.ask_destination_again" },
       parse: (text) => {
         const destination = parseDestination(text);
         return destination ? { display: destination, set: { "travelRequirement.destination": destination } } : null;
@@ -50,8 +44,8 @@ export const conciergeFlow: QualificationFlow = {
     },
     {
       id: "ask_dates",
-      ask: () => COPY.askDates,
-      askAgain: COPY.askDatesAgain,
+      ask: { key: "concierge.ask_dates" },
+      askAgain: { key: "concierge.ask_dates_again" },
       parse: (text, now) => {
         const dates = parseDates(text, now);
         return dates ? { display: "", set: { "travelRequirement.travelDate": dates.start, "travelRequirement.travelDateEnd": dates.end } } : null;
@@ -60,6 +54,6 @@ export const conciergeFlow: QualificationFlow = {
       keepOnGiveUp: (text) => ({ "travelRequirement.notes": `Dates (as typed): ${sanitize(text, 200)}` }),
     },
   ],
-  handover: COPY.handover,
-  handoverUnparsed: COPY.handoverUnparsed,
+  handover: "concierge.handover",
+  handoverUnparsed: "concierge.handover_unparsed",
 };

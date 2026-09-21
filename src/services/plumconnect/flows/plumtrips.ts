@@ -30,28 +30,17 @@ export function companySizeBucket(n: number): (typeof COMPANY_SIZES)[number] {
   return "500+";
 }
 
-const COPY = {
-  welcome: (headline: string) =>
-    `Hi! Thanks for reaching out to Plumtrips${headline ? ` about "${headline}"` : ""}. To get started, what's your name?`,
-  askNameAgain: "Sorry, I didn't catch that — what's your name?",
-  askCompany: (name: string) => `Nice to meet you, ${name}! Which company are you with?`,
-  askCompanyAgain: "Which company or organisation is this for?",
-  askTravellers: "Thanks. Roughly how many employees travel for work? (a number is fine, e.g. 50)",
-  askTravellersAgain: "Could you give a rough number of travelling employees? e.g. 20",
-  askTrips: "And roughly how many trips a month does the team take? (e.g. 10)",
-  askTripsAgain: "A rough number of trips per month is fine, e.g. 5.",
-  handover: (name: string) => `Perfect, ${name}. A Plumtrips corporate travel specialist will be with you shortly.`,
-  handoverUnparsed: "Thanks — a Plumtrips corporate travel specialist will pick this up with you shortly.",
-};
+// Track C: copy lives in the store under plumtrips.* (messages.ts).
+const byName = ({ previousAnswer }: { previousAnswer: string }) => ({ name: previousAnswer });
 
 export const plumtripsFlow: QualificationFlow = {
   businessLine: "plumtrips",
-  welcome: COPY.welcome,
+  welcome: { key: "plumtrips.welcome", withHeadline: "plumtrips.welcome_headline" },
   questions: [
     {
       id: "ask_name",
-      ask: () => COPY.welcome(""),
-      askAgain: COPY.askNameAgain,
+      ask: { key: "plumtrips.welcome" },
+      askAgain: { key: "plumtrips.ask_name_again" },
       parse: (text) => {
         const name = parseName(text);
         return name ? { display: name, set: { contactName: name } } : null;
@@ -59,8 +48,8 @@ export const plumtripsFlow: QualificationFlow = {
     },
     {
       id: "ask_company",
-      ask: COPY.askCompany,
-      askAgain: COPY.askCompanyAgain,
+      ask: { key: "plumtrips.ask_company", vars: byName },
+      askAgain: { key: "plumtrips.ask_company_again" },
       parse: (text) => {
         const company = parseCompany(text);
         return company ? { display: company, set: { companyName: company } } : null;
@@ -68,8 +57,8 @@ export const plumtripsFlow: QualificationFlow = {
     },
     {
       id: "ask_travellers",
-      ask: () => COPY.askTravellers,
-      askAgain: COPY.askTravellersAgain,
+      ask: { key: "plumtrips.ask_travellers" },
+      askAgain: { key: "plumtrips.ask_travellers_again" },
       parse: (text) => {
         const n = parseCount(text);
         return n === null ? null : { display: String(n), set: { companySize: companySizeBucket(n), "travelRequirement.travellerCount": n } };
@@ -78,8 +67,8 @@ export const plumtripsFlow: QualificationFlow = {
     },
     {
       id: "ask_trips",
-      ask: () => COPY.askTrips,
-      askAgain: COPY.askTripsAgain,
+      ask: { key: "plumtrips.ask_trips" },
+      askAgain: { key: "plumtrips.ask_trips_again" },
       parse: (text) => {
         const n = parseCount(text);
         return n === null ? null : { display: String(n), set: { "travelRequirement.notes": `Approx trips per month: ${n}` } };
@@ -87,6 +76,6 @@ export const plumtripsFlow: QualificationFlow = {
       keepOnGiveUp: (text) => ({ "travelRequirement.notes": `Trips per month (as typed): ${sanitize(text, 200)}` }),
     },
   ],
-  handover: COPY.handover,
-  handoverUnparsed: COPY.handoverUnparsed,
+  handover: "plumtrips.handover",
+  handoverUnparsed: "plumtrips.handover_unparsed",
 };

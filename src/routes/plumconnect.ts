@@ -46,6 +46,7 @@ import { isAccessLine, lineOfConversation, holdsAtLeast, canAccessLine, lineGran
 import { buildCampaignRollup } from "../services/plumconnect/campaignRollup.js";
 import { getPresence, setPresence, presenceTtlMs } from "../services/plumconnect/presence.js";
 import { reResolveHeld, validateRuleTarget, validateRuleUser } from "../services/plumconnect/assignment.js";
+import { listMessages, upsertMessage, deleteLineOverride } from "../services/plumconnect/messages.js";
 import PlumConnectAssignmentRule, { ASSIGNMENT_TARGET_TYPES, assignmentTargetKey } from "../models/plumconnect/AssignmentRule.js";
 import Lead from "../models/Lead.js";
 import type { ScopeCtx } from "../services/crmScope.js";
@@ -332,6 +333,61 @@ router.delete("/assignment-rules/:id", async (req, res) => {
   } catch (err) {
     logger.error("plumconnect DELETE /assignment-rules error", { err });
     return res.status(500).json({ error: "Failed to delete the assignment rule." });
+  }
+});
+
+// ── Track C — the canned-message store (the editor page is Track D) ─────
+// Every string the system sends, by key, with per-line overrides. Reads are
+// live: an edit is what the next send uses. ADMIN or FULL on a line may
+// read; a line override needs FULL on THAT line; the global text needs
+// FULL on any line (or ADMIN). A message can never be blanked.
+
+function canEditMessages(req: express.Request, line: string | null): boolean {
+  const grants = lineGrants(req);
+  if (line) return isAccessLine(line) && holdsAtLeast(canAccessLine(grants, line), "FULL");
+  return heldLines(grants, "FULL").length > 0;
+}
+
+// GET /messages — every key (global text + whether overridden) and every line override.
+router.get("/messages", async (req, res) => {
+  try {
+    if (heldLines(lineGrants(req), "FULL").length === 0) return res.status(403).json({ error: "FULL access on a PlumConnect line is required to manage messages." });
+    return res.json({ messages: await listMessages() });
+  } catch (err) {
+    logger.error("plumconnect GET /messages error", { err });
+    return res.status(500).json({ error: "Failed to list messages." });
+  }
+});
+
+// PATCH /messages — { key, line?, text?, enabled? }
+router.patch("/messages", async (req, res) => {
+  try {
+    const body = (req.body as AnyObj) ?? {};
+    const line = body.line === undefined || body.line === null || body.line === "" ? null : String(body.line);
+    if (line && !isAccessLine(line)) return res.status(400).json({ error: "Invalid line." });
+    if (!canEditMessages(req, line)) return res.status(403).json({ error: line ? `FULL access on the ${line} line is required.` : "FULL access on a PlumConnect line is required." });
+    const ctx = inboxScope(req, "support");
+    const r = await upsertMessage({ key: body.key, line, text: body.text, enabled: body.enabled, updatedBy: ctx.userId });
+    if (r.ok === false) return res.status(400).json({ error: r.error });
+    return res.json({ message: r.view });
+  } catch (err) {
+    logger.error("plumconnect PATCH /messages error", { err });
+    return res.status(500).json({ error: "Failed to update the message." });
+  }
+});
+
+// DELETE /messages/:key/:line — drop a line override (the line falls back to the global text).
+router.delete("/messages/:key/:line", async (req, res) => {
+  try {
+    const line = String(req.params.line || "");
+    if (!isAccessLine(line)) return res.status(400).json({ error: "Invalid line." });
+    if (!canEditMessages(req, line)) return res.status(403).json({ error: `FULL access on the ${line} line is required.` });
+    const deleted = await deleteLineOverride(String(req.params.key || ""), line);
+    if (!deleted) return res.status(404).json({ error: "No override for that key on that line." });
+    return res.json({ deleted: true });
+  } catch (err) {
+    logger.error("plumconnect DELETE /messages error", { err });
+    return res.status(500).json({ error: "Failed to delete the override." });
   }
 });
 

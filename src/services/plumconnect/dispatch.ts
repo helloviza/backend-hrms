@@ -71,6 +71,7 @@ import {
 } from "./intent.js";
 import { startBot, handleBotTurn, botIsActive, type BotTurnOutcome } from "./bot.js";
 import { requiresQualification, threadBusinessLine } from "./flows/index.js";
+import { sendBusyIfHeld } from "./assignment.js";
 import {
   isExpenseShaped,
   parseConsentAnswer,
@@ -492,6 +493,8 @@ async function routeToBusinessLine(input: RouteToLineInput): Promise<DispatchOut
     // waiting for (Slice 3c, unchanged).
     if (lead.touch === "first") {
       await startBot({ conversation, to: canonical, leadId: lead.leadId, now }, parseReferral(env.referral).headline);
+      // Track C: the team is mapped but away → say so, once, after the welcome.
+      await sendBusyIfHeld({ conversation, to: canonical, now });
       return { route, ...base, lead, intent };
     }
     if (botIsActive(conversation)) {

@@ -20,6 +20,7 @@ process.env.PLUMCONNECT_ENABLED = "true";
 const { QUALIFICATION_FLOWS, requiresQualification, qualificationFlowFor, flowForConversation, threadBusinessLine } = await import("./index.js");
 const { parseCompany, parseCount, resolveCountry, parseVisaType, sanitize } = await import("./parse.js");
 const { companySizeBucket } = await import("./plumtrips.js");
+const { defaultMessage, getMessage, isMessageKey } = await import("../messages.js");
 const { startBot, handleBotTurn, stopBot, botIsActive } = await import("../bot.js");
 const { CONTACT_NAME_FALLBACK, LEAD_SHAPE_FOR_LINE } = await import("../holidayLead.js");
 const { BUSINESS_LINES } = await import("../../../models/plumconnect/Conversation.js");
@@ -115,18 +116,25 @@ describe("registry and gate", () => {
     expect(flowForConversation(conv({ businessLine: null, leadId: null }))).toBeNull();
   });
 
-  it("the concierge flow's copy and step ids are the Slice 3c ones, verbatim", () => {
+  it("the concierge flow's copy (Track C: store keys → seed defaults) and step ids are the Slice 3c ones, verbatim", async () => {
     const f = QUALIFICATION_FLOWS.concierge;
     expect(f.questions.map((q) => q.id)).toEqual(["ask_name", "ask_destination", "ask_dates"]);
-    expect(f.welcome("Bali from ₹49,999")).toBe('Hi! Thanks for reaching out to Plumtrips about "Bali from ₹49,999". To get started, what\'s your name?');
-    expect(f.welcome("")).toBe("Hi! Thanks for reaching out to Plumtrips. To get started, what's your name?");
-    expect(f.questions[0].askAgain).toBe("Sorry, I didn't catch that — what's your name?");
-    expect(f.questions[1].ask("Priya")).toBe("Nice to meet you, Priya! Where would you like to go?");
-    expect(f.questions[1].askAgain).toBe("Which destination did you have in mind?");
-    expect(f.questions[2].ask("")).toBe("Great — when are you planning to travel? (e.g. 12 Oct to 19 Oct)");
-    expect(f.questions[2].askAgain).toBe("Could you share your travel dates? A rough date is fine, e.g. 15 Nov.");
-    expect(f.handover("Priya")).toBe("Perfect, Priya. A Plumtrips holiday planner will be with you shortly.");
-    expect(f.handoverUnparsed).toBe("Thanks — a Plumtrips holiday planner will pick this up with you shortly.");
+    expect(f.welcome).toEqual({ key: "concierge.welcome", withHeadline: "concierge.welcome_headline" });
+    expect(defaultMessage(f.welcome.withHeadline, { headline: "Bali from ₹49,999" })).toBe('Hi! Thanks for reaching out to Plumtrips about "Bali from ₹49,999". To get started, what\'s your name?');
+    expect(defaultMessage(f.welcome.key)).toBe("Hi! Thanks for reaching out to Plumtrips. To get started, what's your name?");
+    expect(defaultMessage(f.questions[0].askAgain.key)).toBe("Sorry, I didn't catch that — what's your name?");
+    expect(defaultMessage(f.questions[1].ask.key, f.questions[1].ask.vars!({ previousAnswer: "Priya" }))).toBe("Nice to meet you, Priya! Where would you like to go?");
+    expect(defaultMessage(f.questions[1].askAgain.key)).toBe("Which destination did you have in mind?");
+    expect(defaultMessage(f.questions[2].ask.key)).toBe("Great — when are you planning to travel? (e.g. 12 Oct to 19 Oct)");
+    expect(defaultMessage(f.questions[2].askAgain.key)).toBe("Could you share your travel dates? A rough date is fine, e.g. 15 Nov.");
+    expect(defaultMessage(f.handover, { name: "Priya" })).toBe("Perfect, Priya. A Plumtrips holiday planner will be with you shortly.");
+    expect(defaultMessage(f.handoverUnparsed)).toBe("Thanks — a Plumtrips holiday planner will pick this up with you shortly.");
+    // every key a flow names exists in the store's defaults, for all three flows; and the live read (no rows) resolves to the default
+    for (const flow of Object.values(QUALIFICATION_FLOWS)) {
+      const keys = [flow.welcome.key, flow.welcome.withHeadline, flow.handover, flow.handoverUnparsed, ...flow.questions.flatMap((q) => [q.ask.key, q.askAgain.key])];
+      for (const k of keys) expect(isMessageKey(k), `${flow.businessLine}: ${k}`).toBe(true);
+      expect(await getMessage(flow.handoverUnparsed, flow.businessLine)).toBe(defaultMessage(flow.handoverUnparsed));
+    }
   });
 });
 

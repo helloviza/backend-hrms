@@ -17,26 +17,17 @@
 import type { QualificationFlow } from "./types.js";
 import { parseDestination, parseName, parseVisaType, resolveCountry, sanitize } from "./parse.js";
 
-const COPY = {
-  welcome: (headline: string) =>
-    `Hi! Thanks for reaching out to Helloviza${headline ? ` about "${headline}"` : ""}. To get started, what's your name?`,
-  askNameAgain: "Sorry, I didn't catch that — what's your name?",
-  askCountry: (name: string) => `Nice to meet you, ${name}! Which country do you need a visa for?`,
-  askCountryAgain: "Which country is the visa for?",
-  askVisaType: "Got it. What type of visa is it — tourist, business, student, work, transit or medical?",
-  askVisaTypeAgain: "Is that a tourist, business, student, work, transit or medical visa?",
-  handover: (name: string) => `Perfect, ${name}. A Helloviza visa expert will be with you shortly.`,
-  handoverUnparsed: "Thanks — a Helloviza visa expert will pick this up with you shortly.",
-};
+// Track C: copy lives in the store under helloviza.* (messages.ts).
+const byName = ({ previousAnswer }: { previousAnswer: string }) => ({ name: previousAnswer });
 
 export const hellovizaFlow: QualificationFlow = {
   businessLine: "helloviza",
-  welcome: COPY.welcome,
+  welcome: { key: "helloviza.welcome", withHeadline: "helloviza.welcome_headline" },
   questions: [
     {
       id: "ask_name",
-      ask: () => COPY.welcome(""),
-      askAgain: COPY.askNameAgain,
+      ask: { key: "helloviza.welcome" },
+      askAgain: { key: "helloviza.ask_name_again" },
       parse: (text) => {
         const name = parseName(text);
         return name ? { display: name, set: { contactName: name } } : null;
@@ -44,8 +35,8 @@ export const hellovizaFlow: QualificationFlow = {
     },
     {
       id: "ask_country",
-      ask: COPY.askCountry,
-      askAgain: COPY.askCountryAgain,
+      ask: { key: "helloviza.ask_country", vars: byName },
+      askAgain: { key: "helloviza.ask_country_again" },
       parse: (text) => {
         const destination = parseDestination(text);
         if (!destination) return null;
@@ -58,8 +49,8 @@ export const hellovizaFlow: QualificationFlow = {
     },
     {
       id: "ask_visa_type",
-      ask: () => COPY.askVisaType,
-      askAgain: COPY.askVisaTypeAgain,
+      ask: { key: "helloviza.ask_visa_type" },
+      askAgain: { key: "helloviza.ask_visa_type_again" },
       parse: (text) => {
         const type = parseVisaType(text);
         return type ? { display: type, set: { "travelRequirement.notes": `Visa type: ${type}` } } : null;
@@ -67,6 +58,6 @@ export const hellovizaFlow: QualificationFlow = {
       keepOnGiveUp: (text) => ({ "travelRequirement.notes": `Visa type (as typed): ${sanitize(text, 200)}` }),
     },
   ],
-  handover: COPY.handover,
-  handoverUnparsed: COPY.handoverUnparsed,
+  handover: "helloviza.handover",
+  handoverUnparsed: "helloviza.handover_unparsed",
 };

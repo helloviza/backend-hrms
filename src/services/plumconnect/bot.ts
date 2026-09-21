@@ -35,6 +35,7 @@ import { sendAndPersist } from "./send.js";
 import { CONTACT_NAME_FALLBACK } from "./holidayLead.js";
 import { flowForConversation } from "./flows/index.js";
 import { sanitize } from "./flows/parse.js";
+import { getMessage } from "./messages.js";
 import { whatsappLogger } from "../../utils/logger.js";
 
 // The Slice 3c parsers live with the flows now; re-exported so nothing that
@@ -86,7 +87,10 @@ export async function startBot(ctx: BotContext, headline: string): Promise<void>
   }
   const first = flow.questions[0];
   await setBot(conversationId, { active: true, step: first.id, retries: 0, stoppedBy: null, stoppedAt: null });
-  await sendAndPersist({ conversationId, to: ctx.to, text: flow.welcome(sanitize(headline, 80)), payload: { bot: first.id }, now });
+  // Track C: copy from the store (line override → global → seed default).
+  const h = sanitize(headline, 80);
+  const welcome = h ? await getMessage(flow.welcome.withHeadline, flow.businessLine, { headline: h }) : await getMessage(flow.welcome.key, flow.businessLine);
+  await sendAndPersist({ conversationId, to: ctx.to, text: welcome, payload: { bot: first.id }, now });
   whatsappLogger.info("PlumConnect bot: started", { conversationId: String(conversationId), leadId: String(ctx.leadId), flow: flow.businessLine });
 }
 
@@ -129,14 +133,15 @@ export async function handleBotTurn(ctx: BotContext, text: string): Promise<BotT
   const question = flow.questions[index];
   const retries = conv.bot.retries || 0;
 
+  const line = flow.businessLine;
   const retryOrGiveUp = async (): Promise<BotTurnOutcome> => {
     if (retries < MAX_RETRIES) {
       await setBot(conversationId, { retries: retries + 1 });
-      await sendAndPersist({ conversationId, to: ctx.to, text: question.askAgain, payload: { bot: step, retry: retries + 1 }, now });
+      await sendAndPersist({ conversationId, to: ctx.to, text: await getMessage(question.askAgain.key, line), payload: { bot: step, retry: retries + 1 }, now });
       return { handled: true, step, advanced: false, stopped: null };
     }
     await stopBot(conversationId, "unparsed", now);
-    await sendAndPersist({ conversationId, to: ctx.to, text: flow.handoverUnparsed, payload: { bot: step, gaveUp: true }, now });
+    await sendAndPersist({ conversationId, to: ctx.to, text: await getMessage(flow.handoverUnparsed, line), payload: { bot: step, gaveUp: true }, now });
     return { handled: true, step, advanced: false, stopped: "unparsed" };
   };
 
@@ -154,7 +159,8 @@ export async function handleBotTurn(ctx: BotContext, text: string): Promise<BotT
   const next = flow.questions[index + 1];
   if (next) {
     await setBot(conversationId, { step: next.id, retries: 0 });
-    await sendAndPersist({ conversationId, to: ctx.to, text: next.ask(parsed.display), payload: { bot: next.id }, now });
+    const text = await getMessage(next.ask.key, line, next.ask.vars?.({ previousAnswer: parsed.display }) ?? {});
+    await sendAndPersist({ conversationId, to: ctx.to, text, payload: { bot: next.id }, now });
     return { handled: true, step: next.id, advanced: true, stopped: null };
   }
 
@@ -164,7 +170,8 @@ export async function handleBotTurn(ctx: BotContext, text: string): Promise<BotT
   await stopBot(conversationId, "complete", now);
   const lead: any = await Lead.findById(ctx.leadId).select("contactName").lean();
   const name = lead?.contactName && lead.contactName !== CONTACT_NAME_FALLBACK ? lead.contactName : "";
-  await sendAndPersist({ conversationId, to: ctx.to, text: name ? flow.handover(name) : flow.handoverUnparsed, payload: { bot: BOT_DONE_STEP }, now });
+  const ack = name ? await getMessage(flow.handover, line, { name }) : await getMessage(flow.handoverUnparsed, line);
+  await sendAndPersist({ conversationId, to: ctx.to, text: ack, payload: { bot: BOT_DONE_STEP }, now });
   whatsappLogger.info("PlumConnect bot: complete", { conversationId: String(conversationId), leadId: String(ctx.leadId), flow: flow.businessLine });
   return { handled: true, step: BOT_DONE_STEP, advanced: true, stopped: "complete" };
 }

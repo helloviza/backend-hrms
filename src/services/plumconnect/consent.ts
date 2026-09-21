@@ -22,6 +22,7 @@ import PlumConnectContact from "../../models/plumconnect/Contact.js";
 import type { IdentityResolution } from "./resolveIdentity.js";
 import { bindWaId } from "./resolveIdentity.js";
 import { sendAndPersist } from "./send.js";
+import { getMessage } from "./messages.js";
 import { whatsappLogger } from "../../utils/logger.js";
 
 export const CONSENT_YES_BUTTON = "pc_bind_yes";
@@ -80,10 +81,10 @@ export async function promptForConsent(ctx: ConsentContext): Promise<ConsentProm
   const r = await sendAndPersist({
     conversationId: ctx.conversationId,
     to: ctx.canonical,
-    text: "I can log expenses for you once you confirm this is your Plumtrips number. Reply YES to link it, or NO to leave it.",
+    text: await getMessage("consent.prompt", null),
     buttons: [
-      { id: CONSENT_YES_BUTTON, title: "Yes, link it" },
-      { id: CONSENT_NO_BUTTON, title: "No" },
+      { id: CONSENT_YES_BUTTON, title: (await getMessage("consent.prompt.yes", null)).slice(0, 20) },
+      { id: CONSENT_NO_BUTTON, title: (await getMessage("consent.prompt.no", null)).slice(0, 20) },
     ],
     origin: "consent", payload: { consent: "expense_bind_prompt" },
     now,
@@ -106,14 +107,14 @@ export async function recordConsentAnswer(ctx: ConsentContext, answer: "yes" | "
 
   if (answer === "no") {
     await PlumConnectContact.updateOne({ _id: ctx.contactId }, { $set: base });
-    await sendAndPersist({ conversationId: ctx.conversationId, to: ctx.canonical, text: "No problem — I won't log expenses from this number.", origin: "consent", payload: { consent: "declined" }, now });
+    await sendAndPersist({ conversationId: ctx.conversationId, to: ctx.canonical, text: await getMessage("consent.declined", null), origin: "consent", payload: { consent: "declined" }, now });
     return { answer: "no", bound: false };
   }
 
   const users = ctx.identity.soft.users;
   if (users.length !== 1) {
     await PlumConnectContact.updateOne({ _id: ctx.contactId }, { $set: base });
-    await sendAndPersist({ conversationId: ctx.conversationId, to: ctx.canonical, text: "I couldn't match this number to a single Plumtrips account. Please contact your admin to link it.", origin: "consent", payload: { consent: "ambiguous" }, now });
+    await sendAndPersist({ conversationId: ctx.conversationId, to: ctx.canonical, text: await getMessage("consent.ambiguous", null), origin: "consent", payload: { consent: "ambiguous" }, now });
     whatsappLogger.warn("PlumConnect consent: YES but no single user behind the soft match", { contactId: String(ctx.contactId), candidates: users.length });
     return { answer: "yes", bound: false, reason: "ambiguous_or_no_user" };
   }
@@ -123,7 +124,7 @@ export async function recordConsentAnswer(ctx: ConsentContext, answer: "yes" | "
   if (bind.ok === false) {
     const reason = bind.reason;
     await PlumConnectContact.updateOne({ _id: ctx.contactId }, { $set: base });
-    await sendAndPersist({ conversationId: ctx.conversationId, to: ctx.canonical, text: "I couldn't link this number just now. Please contact your admin.", origin: "consent", payload: { consent: "bind_failed", reason }, now });
+    await sendAndPersist({ conversationId: ctx.conversationId, to: ctx.canonical, text: await getMessage("consent.bind_failed", null), origin: "consent", payload: { consent: "bind_failed", reason }, now });
     return { answer: "yes", bound: false, reason };
   }
 
@@ -131,7 +132,7 @@ export async function recordConsentAnswer(ctx: ConsentContext, answer: "yes" | "
     { _id: ctx.contactId },
     { $set: { ...base, "refs.userId": userId, identityState: "verified_employee" } },
   );
-  await sendAndPersist({ conversationId: ctx.conversationId, to: ctx.canonical, text: "Linked! Send the receipt again and I'll log it.", origin: "consent", payload: { consent: "bound", userId: String(userId) }, now });
+  await sendAndPersist({ conversationId: ctx.conversationId, to: ctx.canonical, text: await getMessage("consent.bound", null), origin: "consent", payload: { consent: "bound", userId: String(userId) }, now });
   whatsappLogger.info("PlumConnect consent: bound", { contactId: String(ctx.contactId), userId: String(userId) });
   return { answer: "yes", bound: true, userId: String(userId) };
 }

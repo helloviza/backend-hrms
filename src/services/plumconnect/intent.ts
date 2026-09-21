@@ -21,6 +21,7 @@ import PlumConnectCampaignMap from "../../models/plumconnect/CampaignMap.js";
 import PlumConnectConversation, { type BusinessLine, type IntentSource } from "../../models/plumconnect/Conversation.js";
 import type { ReplyButton } from "../whatsappCloud.service.js";
 import { sendButtonsOutcome } from "./outbound.js";
+import { getMessage, MESSAGE_DEFAULTS } from "./messages.js";
 import { whatsappLogger } from "../../utils/logger.js";
 
 /* ───────────────────────────── keyword rules ───────────────────────────── */
@@ -134,15 +135,33 @@ export const MENU_BUTTON_IDS = {
 // WhatsApp caps reply buttons at 3 per message: the three business lines
 // go on the menu; "Something else" is a typed fallback (plain text) and any
 // unclassified reply after the menu is treated the same way.
+// Track C: the copy lives in the canned-message store (menu.*); these are
+// the seed defaults, kept for tests and as the fallback.
 export const MENU_BUTTONS: ReplyButton[] = [
-  { id: MENU_BUTTON_IDS.plumtrips, title: "Corporate travel" },
-  { id: MENU_BUTTON_IDS.helloviza, title: "Visa" },
-  { id: MENU_BUTTON_IDS.concierge, title: "Holiday" },
+  { id: MENU_BUTTON_IDS.plumtrips, title: MESSAGE_DEFAULTS["menu.button.plumtrips"].text },
+  { id: MENU_BUTTON_IDS.helloviza, title: MESSAGE_DEFAULTS["menu.button.helloviza"].text },
+  { id: MENU_BUTTON_IDS.concierge, title: MESSAGE_DEFAULTS["menu.button.concierge"].text },
 ];
 
-export const MENU_TEXT =
-  "Hi! You've reached Plumtrips. What can we help with today?\n" +
-  "Tap an option — or just tell us in a few words if it's something else.";
+export const MENU_TEXT = MESSAGE_DEFAULTS["menu.text"].text;
+
+/** The menu as the store has it right now (an edit takes effect on the next send). */
+export async function menuCopy(): Promise<{ text: string; buttons: ReplyButton[] }> {
+  const [text, plumtrips, helloviza, concierge] = await Promise.all([
+    getMessage("menu.text", null),
+    getMessage("menu.button.plumtrips", null),
+    getMessage("menu.button.helloviza", null),
+    getMessage("menu.button.concierge", null),
+  ]);
+  return {
+    text,
+    buttons: [
+      { id: MENU_BUTTON_IDS.plumtrips, title: plumtrips.slice(0, 20) },
+      { id: MENU_BUTTON_IDS.helloviza, title: helloviza.slice(0, 20) },
+      { id: MENU_BUTTON_IDS.concierge, title: concierge.slice(0, 20) },
+    ],
+  };
+}
 
 /** A tapped menu button → the business line; "other"/anything else → null. */
 export function menuChoiceToBusinessLine(buttonId: string): BusinessLine | null {
@@ -172,7 +191,8 @@ export function menuRecentlySent(sentAt: Date | null | undefined, now: Date): bo
  * accepted the send.
  */
 export async function sendIntentMenu(conversationId: mongoose.Types.ObjectId, to: string, now: Date): Promise<boolean> {
-  const { outcome } = await sendButtonsOutcome(to, MENU_TEXT, MENU_BUTTONS, { origin: "support", conversationId, payload: { intentMenu: true }, now });
+  const menu = await menuCopy();
+  const { outcome } = await sendButtonsOutcome(to, menu.text, menu.buttons, { origin: "support", conversationId, payload: { intentMenu: true }, now });
   const sent = outcome.ok && Boolean(outcome.wamid);
   if (sent) await PlumConnectConversation.updateOne({ _id: conversationId }, { $set: { intentMenuSentAt: now } });
   whatsappLogger.info("PlumConnect intent: menu " + (sent ? "sent" : "NOT sent"), { conversationId: String(conversationId) });

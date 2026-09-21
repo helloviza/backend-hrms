@@ -30,6 +30,14 @@
 //     the light re-resolve: held / tied, unassigned, non-resolved threads
 //     on the given lines are resolved again — called from the inbox list
 //     read, bounded, no background job (the repo's no-heavy-jobs rule).
+//
+//   sendBusyIfHeld({ conversation, to, now })   Track C
+//     a thread held because its mapped agents are ALL AWAY (mapped > 0,
+//     nobody eligible) gets the line's busy/away reply — canned key
+//     busy.<line> — ONCE (routing.busySentAt), through the persisting
+//     wrapper. A thread held because NOBODY IS MAPPED (the matrix is not
+//     configured for that target) gets nothing: "busy" would be a lie, and
+//     the bot's own handover already says someone will respond.
 
 import mongoose from "mongoose";
 import Lead from "../../models/Lead.js";
@@ -42,6 +50,8 @@ import PlumConnectCampaignMap from "../../models/plumconnect/CampaignMap.js";
 import { activeUserFilter } from "../../utils/userActiveStatus.js";
 import { lineMatch, lineOfConversation, canAccessLine, holdsAtLeast, lineGrantsForUserId, type AccessLine } from "./access.js";
 import { activeAgentsForLine } from "./presence.js";
+import { getMessage } from "./messages.js";
+import { sendAndPersist } from "./send.js";
 import { whatsappLogger } from "../../utils/logger.js";
 
 type AnyObj = Record<string, any>;
@@ -148,6 +158,7 @@ export async function resolveAssignee(input: {
 export async function applyRouting(conversation: IPlumConnectConversation, decision: RoutingDecision, now: Date = new Date()): Promise<void> {
   const conversationId = conversation._id as mongoose.Types.ObjectId;
   const assignedTo = decision.state === "assigned" ? decision.assignee!.id : null;
+  const previous: AnyObj = (conversation as any).routing ?? {};
   const routing = {
     state: decision.state,
     targetType: decision.target.type,
@@ -156,6 +167,9 @@ export async function applyRouting(conversation: IPlumConnectConversation, decis
     autoAssigned: decision.state === "assigned",
     resolvedAt: now,
     reason: decision.reason,
+    mapped: decision.mapped,
+    // The busy reply is once per thread: a re-resolve never resets it.
+    busySentAt: previous.busySentAt ?? null,
   };
   await PlumConnectConversation.updateOne({ _id: conversationId }, { $set: { assignedTo, routing } });
   conversation.assignedTo = assignedTo;
@@ -168,6 +182,31 @@ export async function applyRouting(conversation: IPlumConnectConversation, decis
   }
 
   whatsappLogger.info("PlumConnect routing", { conversationId: String(conversationId), state: decision.state, target: decision.target.key, assignedTo: assignedTo ? String(assignedTo) : null, reason: decision.reason });
+}
+
+export type BusyOutcome = "sent" | "not_held" | "nobody_mapped" | "already_sent" | "not_sent";
+
+/**
+ * Track C — the busy/away reply. Fires only for a thread that is HELD with
+ * agents mapped but none eligible, once per thread. Reads the thread's
+ * current routing (set by applyRouting), sends busy.<line> from the store.
+ */
+export async function sendBusyIfHeld(input: { conversation: IPlumConnectConversation; to: string; now?: Date }): Promise<BusyOutcome> {
+  const now = input.now ?? new Date();
+  const routing: AnyObj = (input.conversation as any).routing ?? {};
+  if (routing.state !== "held") return "not_held";
+  if (!Number(routing.mapped || 0)) return "nobody_mapped";
+  if (routing.busySentAt) return "already_sent";
+  const line = lineOfConversation(input.conversation);
+  const conversationId = input.conversation._id as mongoose.Types.ObjectId;
+  const text = await getMessage(`busy.${line}`, line);
+  const r = await sendAndPersist({ conversationId, to: input.to, text, payload: { busy: true, line, targetKey: routing.targetKey }, now });
+  if (!r.sent) return "not_sent";
+  await PlumConnectConversation.updateOne({ _id: conversationId }, { $set: { "routing.busySentAt": now } });
+  routing.busySentAt = now;
+  (input.conversation as any).routing = routing;
+  whatsappLogger.info("PlumConnect routing: busy reply sent", { conversationId: String(conversationId), line });
+  return "sent";
 }
 
 /**

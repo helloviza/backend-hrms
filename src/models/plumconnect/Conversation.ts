@@ -63,6 +63,10 @@ export interface IPlumConnectConversationRouting {
   autoAssigned: boolean;
   resolvedAt?: Date | null;
   reason: string;
+  /** How many agents the target had mapped when last resolved (0 = matrix not configured for it). */
+  mapped: number;
+  /** Track C: when the busy/away reply went out (once per held thread; null = never). */
+  busySentAt?: Date | null;
 }
 
 export interface IPlumConnectConversationBot {
@@ -121,6 +125,8 @@ const RoutingSchema = new Schema<IPlumConnectConversationRouting>(
     autoAssigned: { type: Boolean, default: false },
     resolvedAt: { type: Date, default: null },
     reason: { type: String, trim: true, default: "" },
+    mapped: { type: Number, default: 0 },
+    busySentAt: { type: Date, default: null },
   },
   { _id: false },
 );
