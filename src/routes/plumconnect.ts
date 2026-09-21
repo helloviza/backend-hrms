@@ -42,7 +42,8 @@ import User from "../models/User.js";
 import { UserPermission } from "../models/UserPermission.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import { inboxScope, conversationMatch, canSee, canWrite, canReassign, lineGrants } from "../services/plumconnect/inboxScope.js";
-import { isAccessLine, lineOfConversation, holdsAtLeast, canAccessLine, lineGrantsForUserId, PLUMCONNECT_MODULE_KEYS, ACCESS_LINES } from "../services/plumconnect/access.js";
+import { isAccessLine, lineOfConversation, holdsAtLeast, canAccessLine, lineGrantsForUserId, heldLines, PLUMCONNECT_MODULE_KEYS, ACCESS_LINES } from "../services/plumconnect/access.js";
+import { buildCampaignRollup } from "../services/plumconnect/campaignRollup.js";
 import type { ScopeCtx } from "../services/crmScope.js";
 import { stopBot, botIsActive } from "../services/plumconnect/bot.js";
 import { sendTextOutcome } from "../services/plumconnect/outbound.js";
@@ -191,6 +192,30 @@ router.get("/agents", async (req, res) => {
   } catch (err) {
     logger.error("plumconnect GET /agents error", { err });
     return res.status(500).json({ error: "Failed to list agents." });
+  }
+});
+
+// GET /campaigns/rollup[?from=&to=] — Slice 8: the Campaign → AdSet → Ad
+// drill-down (services/plumconnect/campaignRollup.ts). A cross-line report
+// (an ad's leads span departments), so it needs FULL on at least one line
+// or ADMIN by role — a WRITE/OWN rep does not get the whole funnel.
+router.get("/campaigns/rollup", async (req, res) => {
+  try {
+    if (heldLines(lineGrants(req), "FULL").length === 0) return res.status(403).json({ error: "FULL access on a PlumConnect line is required for campaign reporting." });
+    const parse = (v: unknown): Date | null | undefined => {
+      const raw = String(v || "");
+      if (!raw) return null;
+      const d = new Date(raw);
+      return Number.isNaN(d.getTime()) ? undefined : d;
+    };
+    const from = parse(req.query.from);
+    const to = parse(req.query.to);
+    if (from === undefined || to === undefined) return res.status(400).json({ error: "Invalid date range." });
+    const rollup = await buildCampaignRollup({ from, to });
+    return res.json(rollup);
+  } catch (err) {
+    logger.error("plumconnect GET /campaigns/rollup error", { err });
+    return res.status(500).json({ error: "Failed to build the campaign roll-up." });
   }
 });
 

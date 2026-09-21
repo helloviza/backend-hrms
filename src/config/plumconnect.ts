@@ -35,3 +35,24 @@ export function holidayLeadAssigneeId(): string | null {
   const raw = String(process.env[PLUMCONNECT_HOLIDAY_LEAD_ASSIGNEE_ENV] || "").trim();
   return /^[0-9a-fA-F]{24}$/.test(raw) ? raw : null;
 }
+
+// ── PLUMCONNECT_ADS_READ_TOKEN — Slice 8 ────────────────────────────────────
+//
+// A Meta system-user token with `ads_read` on the ad account, used ONLY by
+// workers/plumconnectEnrichmentWorker.ts to resolve an ad id upward to its
+// ad set and campaign (names, statuses). NOT a dependency of anything else:
+// unset → the worker discovers ad ids and leaves them pending, capture is
+// untouched, nothing errors. Read live like the flag above; lives in
+// APP_SECRETS in prod like every other credential. Never in code.
+
+export const PLUMCONNECT_ADS_READ_TOKEN_ENV = "PLUMCONNECT_ADS_READ_TOKEN";
+
+export function adsReadToken(): string | null {
+  const raw = String(process.env[PLUMCONNECT_ADS_READ_TOKEN_ENV] || "").trim();
+  return raw || null;
+}
+
+/** Enrichment runs only with the flag on AND a token present. */
+export function isEnrichmentEnabled(): boolean {
+  return isPlumConnectEnabled() && adsReadToken() !== null;
+}
