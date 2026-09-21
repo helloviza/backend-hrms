@@ -156,6 +156,34 @@ export interface UserPermissionDoc extends Document {
      * it explicitly.
      */
     consumerContactPII: ModulePermission
+    /**
+     * travellerIdentityPII — the authority to SEE a traveller's identity
+     * document numbers UNMASKED on a cross-tenant ops surface: the passport
+     * number (and its echoes — MRZ line 2, the scan's document number, the
+     * typed-vs-scan comparison) and visa numbers in the visa wallet.
+     *
+     * A SIBLING of manualBookings / visaApplication on the consumerContactPII
+     * precedent, and deliberately not a tier of either. Those answer "may
+     * this person work bookings / visa cases"; this answers the separate
+     * question "may this person read another client's passport numbers in
+     * full" — a document-dump-shaped power that neither job needs by
+     * default. Because it is separate, every OPS / cross-tenant traveller
+     * read MASKS BY DEFAULT (last-4 via maskTailId) and unmasks only for a
+     * holder; SUPERADMIN bypasses, as everywhere.
+     *
+     * SCOPE, precisely: the HOUSE/ops surfaces only —
+     * routes/admin.travellers.ts and routes/admin.visa.roster.ts. The
+     * customer's OWN-workspace detail (routes/workspace.travellers.ts
+     * GET /:id) stays unmasked for an active member: booking a colleague's
+     * saved traveller needs the real number, and that is the member's own
+     * data inside their own tenant, not a cross-tenant read.
+     *
+     * Granted to NO level template — same posture and reasoning as
+     * visaScreening / consumerContactPII: per-user, so a level change can
+     * neither confer nor revoke it, and off-boarding must revoke explicitly.
+     * READ is the whole grant; there is no write path behind this key.
+     */
+    travellerIdentityPII: ModulePermission
   }
 
   grantedBy: string
@@ -233,6 +261,7 @@ const modulesSchema = new Schema(
     visaApplication: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     visaScreening: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     consumerContactPII: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    travellerIdentityPII: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
   },
   { _id: false }
 )

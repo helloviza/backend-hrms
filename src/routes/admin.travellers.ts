@@ -29,9 +29,13 @@
 // POST /api/workspace/travellers, which 403s staff — correctly.
 //
 // Two-step disclosure, mirroring pages/sbt/SBTPassengers.tsx: the LIST is
-// masked (passportMasked = last-4, no PAN/Aadhaar) and capped; the full
-// record only crosses the wire on the DETAIL read for a traveller the
-// operator actually picked.
+// masked (passportMasked = last-4, no PAN/Aadhaar) and capped; the DETAIL
+// read for a traveller the operator actually picked carries the full record
+// — EXCEPT the passport number, which is masked to last-4 unless the caller
+// holds travellerIdentityPII (models/UserPermission.ts; SUPERADMIN bypasses).
+// The response says which (`identityUnmasked`) so the booking picker can
+// leave the passenger's passport BLANK rather than store "****4567" as if
+// it were a number.
 import { Router } from "express";
 import mongoose from "mongoose";
 import { requirePermission } from "../middleware/requirePermission.js";
@@ -39,6 +43,7 @@ import { audit } from "../middleware/audit.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { maskTailId } from "../utils/piiMask.js";
+import { holdsCapability } from "../services/capabilityProbe.js";
 import logger from "../utils/logger.js";
 
 const router = Router();
@@ -179,8 +184,13 @@ router.get(
         .lean();
       if (!traveller) return res.status(404).json({ error: "Traveller not found" });
 
-      recordCrossTenantRead(req, "detail", { workspaceId: String(ws._id), travellerId: String(traveller._id), travelerId: traveller.travelerId });
-      res.json({ ok: true, workspaceId: String(ws._id), traveller });
+      // Masked by default; the grant (or SUPERADMIN) unmasks. Decided
+      // server-side, before the value is written into the body.
+      const identityUnmasked = await holdsCapability(req, "travellerIdentityPII");
+      if (!identityUnmasked) traveller.passportNo = maskTailId(traveller.passportNo) ?? null;
+
+      recordCrossTenantRead(req, "detail", { workspaceId: String(ws._id), travellerId: String(traveller._id), travelerId: traveller.travelerId, identityUnmasked });
+      res.json({ ok: true, workspaceId: String(ws._id), identityUnmasked, traveller });
     } catch (err: any) {
       console.error("[admin.travellers GET one]", err.message);
       res.status(500).json({ error: err.message });

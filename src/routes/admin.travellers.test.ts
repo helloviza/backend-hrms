@@ -106,10 +106,11 @@ beforeEach(async () => {
 
   // Real permission rows drive the real requirePermission. userId is a STRING
   // path on UserPermission (raw inserts bypass casting — an ObjectId here would
-  // never match the middleware's string lookup).
-  await UserPermission.collection.insertOne({ userId: HOUSE_STAFF, email: `${HOUSE_STAFF}@test.local`, modules: { manualBookings: { access: "READ", scope: "ALL" } } } as any);
-  await UserPermission.collection.insertOne({ userId: HOUSE_STAFF_NO_GRANT, email: `${HOUSE_STAFF_NO_GRANT}@test.local`, modules: { manualBookings: { access: "NONE", scope: "NONE" } } } as any);
-  await UserPermission.collection.insertOne({ userId: TENANT_ADMIN, email: `${TENANT_ADMIN}@test.local`, modules: { manualBookings: { access: "FULL", scope: "ALL" } } } as any);
+  // never match the middleware's string lookup). status:"active" because
+  // holdsCapability() — the unmask probe — only reads active rows.
+  await UserPermission.collection.insertOne({ userId: HOUSE_STAFF, email: `${HOUSE_STAFF}@test.local`, status: "active", modules: { manualBookings: { access: "READ", scope: "ALL" } } } as any);
+  await UserPermission.collection.insertOne({ userId: HOUSE_STAFF_NO_GRANT, email: `${HOUSE_STAFF_NO_GRANT}@test.local`, status: "active", modules: { manualBookings: { access: "NONE", scope: "NONE" } } } as any);
+  await UserPermission.collection.insertOne({ userId: TENANT_ADMIN, email: `${TENANT_ADMIN}@test.local`, status: "active", modules: { manualBookings: { access: "FULL", scope: "ALL" } } } as any);
 });
 
 /* ── gating ─────────────────────────────────────────────────────────── */
@@ -258,20 +259,36 @@ describe("disclosure — masked list, full-but-gated detail", () => {
     expect((await list(CUSTOMER_A, asHouse, "?search=.*")).body.travellers).toHaveLength(0); // literal, not a wildcard
   });
 
-  it("detail returns the full record (unmasked passport) minus pan/aadhaar", async () => {
+  it("detail returns the full record minus pan/aadhaar — passport MASKED without travellerIdentityPII", async () => {
     const r = await detail(CUSTOMER_A, String(travA1._id));
     expect(r.status).toBe(200);
     expect(r.body.workspaceId).toBe(String(wsA));
+    expect(r.body.identityUnmasked).toBe(false);
     expect(r.body.traveller).toMatchObject({
-      travelerId: "ACM-001", firstName: "Anita", lastName: "Rao", passportNo: "P1234567", passportExpiry: "2031-01-01",
+      travelerId: "ACM-001", firstName: "Anita", lastName: "Rao", passportNo: "****4567", passportExpiry: "2031-01-01",
       mobile: "9876543210", email: "anita@acme.test", dob: "1990-04-12",
     });
+    expect(JSON.stringify(r.body)).not.toContain("P1234567");
     expect(r.body.traveller).not.toHaveProperty("pan");
     expect(r.body.traveller).not.toHaveProperty("aadhaar");
     expect(r.body.traveller).not.toHaveProperty("__v");
     // Read-only surface: none of the customer router's write affordances.
     expect(r.body).not.toHaveProperty("canManage");
     expect(r.body).not.toHaveProperty("editableFields");
+  });
+
+  it("detail UNMASKS the passport for a travellerIdentityPII holder, and for SUPERADMIN", async () => {
+    await UserPermission.collection.updateOne({ userId: HOUSE_STAFF }, { $set: { "modules.travellerIdentityPII": { access: "READ", scope: "ALL" } } });
+    const r = await detail(CUSTOMER_A, String(travA1._id));
+    expect(r.body.identityUnmasked).toBe(true);
+    expect(r.body.traveller.passportNo).toBe("P1234567");
+    const s = await detail(CUSTOMER_A, String(travA1._id), asSuper);
+    expect(s.body.identityUnmasked).toBe(true);
+    expect(s.body.traveller.passportNo).toBe("P1234567");
+    // The list never carries the full number regardless of the grant.
+    const l = await list(CUSTOMER_A, asHouse, "?search=ACM-001");
+    expect(l.body.travellers[0].passportMasked).toBe("****4567");
+    expect(l.body.travellers[0]).not.toHaveProperty("passportNo");
   });
 
   it("the router exposes nothing but the two GETs (read-only by construction)", async () => {

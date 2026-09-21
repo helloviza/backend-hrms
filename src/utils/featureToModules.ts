@@ -62,6 +62,10 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   // the visa Master Sheet. Same flag: a workspace without visa has no funnel
   // to read, so there are no contacts for this to unmask.
   consumerContactPII: ["visaEnabled"],
+  // Traveller identity-document unmask — an ops/bookings-side power (the
+  // Client Travellers viewer and the booking-form picker live behind
+  // sbtEnabled with manual bookings), so it follows that flag, not visa's.
+  travellerIdentityPII: ["sbtEnabled"],
 };
 
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";

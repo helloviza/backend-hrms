@@ -86,6 +86,9 @@ type ModulesTemplate = {
   // Granted PER-USER, so a level change can neither confer nor revoke it — and
   // off-boarding has to revoke it explicitly.
   consumerContactPII: ModulePermission
+  // Traveller identity-document unmask (passport/visa numbers on ops surfaces).
+  // NONE everywhere, per-user only — same posture as the two above.
+  travellerIdentityPII: ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -134,6 +137,7 @@ const L1: ModulesTemplate = {
   visaApplication:   NONE,
   visaScreening:     NONE,
   consumerContactPII: NONE,
+  travellerIdentityPII: NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -217,6 +221,7 @@ const L6: ModulesTemplate = {
   visaApplication:   FULL_WS,
   visaScreening:     NONE,
   consumerContactPII: NONE,
+  travellerIdentityPII: NONE,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -234,6 +239,7 @@ const L7: ModulesTemplate = {
   visaApplication: READ_ALL,
   visaScreening:   NONE,
   consumerContactPII: NONE,
+  travellerIdentityPII: NONE,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -282,6 +288,7 @@ const L8: ModulesTemplate = {
   visaApplication:   FULL_ALL,
   visaScreening:     NONE,
   consumerContactPII: NONE,
+  travellerIdentityPII: NONE,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -330,6 +337,7 @@ const VENDOR: ModulesTemplate = {
   visaApplication:   NONE,
   visaScreening:     NONE,
   consumerContactPII: NONE,
+  travellerIdentityPII: NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -378,6 +386,7 @@ const CUSTOMER_SBT: ModulesTemplate = {
   visaApplication:   NONE,
   visaScreening:     NONE,
   consumerContactPII: NONE,
+  travellerIdentityPII: NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -426,6 +435,7 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   visaApplication:   NONE,
   visaScreening:     NONE,
   consumerContactPII: NONE,
+  travellerIdentityPII: NONE,
 }
 
 // ── TENANT_ADMIN template ─────────────────────────────────────────────────────
@@ -521,6 +531,7 @@ const TENANT_ADMIN: ModulesTemplate = {
   // — so it is the one grant that must never be self-issuable. NONE matches
   // every other template in this file; no template grants it.
   consumerContactPII: NONE,
+  travellerIdentityPII: NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

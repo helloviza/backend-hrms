@@ -62,7 +62,8 @@ import TravellerProfile from "../models/TravellerProfile.js";
 import VisaRequest from "../models/VisaRequest.js";
 import VisaApplication from "../models/VisaApplication.js";
 import Department from "../models/Department.js";
-import { maskTailId } from "../utils/piiMask.js";
+import { maskTailId, maskPassportVault } from "../utils/piiMask.js";
+import { holdsCapability } from "../services/capabilityProbe.js";
 // The dossier is computed by the SAME helpers the workspace-side dossier
 // uses, imported rather than reimplemented — a second copy of "what is in
 // this record" is exactly how two surfaces start disagreeing about one row.
@@ -271,6 +272,9 @@ router.get("/workspaces/:workspaceId/roster", async (req: any, res: any) => {
       for (const d of depts) deptNameById.set(String(d._id), d.name);
     }
 
+    // passportMasked is always the last-4 form; the full number rides along
+    // as `passportNo` ONLY for a travellerIdentityPII holder.
+    const unmasked = await identityUnmasked(req);
     const travellers = docs.map((d) => ({
       id: String(d._id),
       name: [d.firstName, d.middleName, d.lastName].filter(Boolean).join(" "),
@@ -278,6 +282,7 @@ router.get("/workspaces/:workspaceId/roster", async (req: any, res: any) => {
       email: d.email ?? null,
       nationality: d.nationality ?? null,
       passportMasked: maskTailId(d.passportNo) ?? null,
+      ...(unmasked ? { passportNo: d.passportNo ?? null } : {}),
       passportExpiry: d.passportExpiry ?? null,
       isWorkspaceMember: !!d.linkedMemberId,
       departmentId: d.departmentId ? String(d.departmentId) : null,
@@ -429,21 +434,35 @@ async function opsTraveller(req: any, res: any): Promise<any | null> {
   return traveller;
 }
 
+/**
+ * Identity-document numbers on this cross-tenant surface are MASKED BY
+ * DEFAULT (last-4). The travellerIdentityPII grant — models/UserPermission.ts,
+ * a sibling of visaApplication on the consumerContactPII precedent — unmasks
+ * them; SUPERADMIN bypasses, as everywhere. Same rule the Client Travellers
+ * foundation (routes/admin.travellers.ts) applies, so an agent sees the same
+ * thing whichever ops door they came through.
+ */
+async function identityUnmasked(req: any): Promise<boolean> {
+  return holdsCapability(req, "travellerIdentityPII");
+}
+
 router.get("/workspaces/:workspaceId/travellers/:travellerId", async (req: any, res: any) => {
   try {
     const traveller = await opsTraveller(req, res);
     if (!traveller) return;
     const workspaceId = new mongoose.Types.ObjectId(req.params.workspaceId);
 
-    const [header, designation, passportVault] = await Promise.all([
+    const [header, designation, passportVault, unmasked] = await Promise.all([
       resolveDossierHeader(traveller, workspaceId),
       describeDesignation(traveller, workspaceId),
       resolvePassportVault(traveller, workspaceId),
+      identityUnmasked(req),
     ]);
 
     res.json({
       ok: true,
-      traveller: { ...traveller, passportNo: maskTailId(traveller.passportNo) ?? null },
+      identityUnmasked: unmasked,
+      traveller: { ...traveller, passportNo: unmasked ? (traveller.passportNo ?? null) : (maskTailId(traveller.passportNo) ?? null) },
       // Ops reads; ops does not edit a customer's roster. An empty allowlist
       // is what locks every field in the shared form.
       canManage: false,
@@ -452,12 +471,10 @@ router.get("/workspaces/:workspaceId/travellers/:travellerId", async (req: any, 
       dossierHealth: computeDossierHealth(traveller),
       header,
       designation,
-      passportVault: {
-        ...passportVault,
-        // The vault echoes the number back for the MRZ/mismatch panels; mask
-        // it there too, or the tab would hand back what the row above hid.
-        passportNo: maskTailId((passportVault as any)?.passportNo) ?? null,
-      },
+      // The vault echoes the number back for the MRZ/mismatch panels (MRZ
+      // line 2, the scan's document number, the typed-vs-scan comparison);
+      // mask it there too, or the tab would hand back what the row above hid.
+      passportVault: unmasked ? passportVault : maskPassportVault(passportVault),
       // Named so the client renders an honest withheld state rather than an
       // empty tab that looks like "this person consented to nothing".
       consentLedger: {
@@ -479,12 +496,18 @@ router.get("/workspaces/:workspaceId/travellers/:travellerId/visa-holdings", asy
     if (!traveller) return;
     const workspaceId = new mongoose.Types.ObjectId(req.params.workspaceId);
 
-    const { rows, summary } = await resolveVisaWallet(traveller._id, workspaceId);
+    const [{ rows, summary }, unmasked] = await Promise.all([
+      resolveVisaWallet(traveller._id, workspaceId),
+      identityUnmasked(req),
+    ]);
+    // Visa numbers are identity-document numbers too — same grant, same mask.
+    const holdings = unmasked ? rows : rows.map((r: any) => ({ ...r, visaNumber: maskTailId(r.visaNumber) ?? null }));
     res.json({
       ok: true,
-      holdings: rows,
+      identityUnmasked: unmasked,
+      holdings,
       summary,
-      schengen: resolveSchengenBlock(rows),
+      schengen: resolveSchengenBlock(holdings),
       capabilities: { canEdit: false, canAttachStamp: false, stampReason: "Read-only from the ops console." },
       vocabularies: { entryTypes: VISA_ENTRY_TYPES, countries: countryVocabulary() },
     });

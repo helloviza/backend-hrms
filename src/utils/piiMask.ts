@@ -9,6 +9,57 @@ export function maskTailId(value: unknown): string | undefined {
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * PASSPORT VAULT MASKING — for the ops/cross-tenant dossier when the
+ * caller does not hold travellerIdentityPII (models/UserPermission.ts).
+ *
+ * resolvePassportVault() (routes/workspace.travellers.ts) echoes the
+ * passport number in THREE places besides the traveller record itself,
+ * and masking the record alone would hand the number straight back through
+ * the tab beside it:
+ *   - mrz.line2         — a TD3 line 2 opens with the 9-character document
+ *                         number field (positions 0–8), then its check digit;
+ *   - scan.documentNumber — what the passport scan was read as;
+ *   - mismatch.comparison — per-field rows whose `field` is "documentNumber"
+ *                         carry the typed and extracted values side by side.
+ * Everything else in the vault (names, dates, nationality, corroboration
+ * state) is what the dossier's own fields already show, and stays.
+ *
+ * Deliberately a deep, key-driven walk rather than a hand-written copy of
+ * the vault's shape: the vault has grown fields three times already, and a
+ * shape-copy would silently stop masking the next one.
+ * ───────────────────────────────────────────────────────────────────── */
+const MRZ_TD3_DOC_NUMBER_LEN = 9;
+const ALWAYS_MASK_KEYS = new Set(["passportNo", "documentNumber", "passportValue", "fileValue", "profileValue"]);
+const VALUE_KEYS_MASKED_FOR_DOC_NUMBER = new Set(["typedValue", "extractedValue", "mrzValue", "vizValue", "value"]);
+
+export function maskMrzLine2(line: unknown): unknown {
+  if (typeof line !== "string" || !line) return line;
+  const head = line.slice(0, MRZ_TD3_DOC_NUMBER_LEN);
+  return (maskTailId(head) ?? head) + line.slice(MRZ_TD3_DOC_NUMBER_LEN);
+}
+
+export function maskPassportVault<T>(vault: T): T {
+  const seen = new WeakSet<object>();
+  const walk = (node: any, parent?: any): any => {
+    if (node === null || typeof node !== "object") return node;
+    if (seen.has(node)) return node;
+    seen.add(node);
+    if (Array.isArray(node)) return node.map((v) => walk(v, node));
+    const out: Record<string, any> = {};
+    const isDocNumberRow = String(node.field ?? "") === "documentNumber";
+    for (const [k, v] of Object.entries(node)) {
+      if (k === "line2" && typeof v === "string") out[k] = maskMrzLine2(v);
+      else if (ALWAYS_MASK_KEYS.has(k) && typeof v === "string") out[k] = maskTailId(v);
+      else if (isDocNumberRow && VALUE_KEYS_MASKED_FOR_DOC_NUMBER.has(k) && typeof v === "string") out[k] = maskTailId(v);
+      else out[k] = walk(v, node);
+    }
+    void parent;
+    return out;
+  };
+  return walk(vault) as T;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * CONTACT-CHANNEL MASKING — for surfaces that must show WHO a row is
  * about without handing out a way to reach them.
  *
