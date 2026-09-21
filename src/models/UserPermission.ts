@@ -108,14 +108,29 @@ export interface UserPermissionDoc extends Document {
     // CSTEP Travel & Claim Portal
     cstep: ModulePermission
 
-    // PlumConnect inbox (Slice 4b). READ = see the conversations in scope,
-    // WRITE = reply / note / assign to self / resolve, FULL = reassign to
-    // others. Scope OWN = conversations assigned to me, ALL = every
-    // conversation (ADMIN/SUPERADMIN are ALL by role). Dark-launch posture
+    // PlumConnect inbox — PER-DEPARTMENT capabilities (Slice 7; replaces the
+    // single `plumconnect` key of Slice 4b, which no code reads any more —
+    // scripts/plumconnect-permission-lines-migrate.ts folds a legacy grant
+    // into these). One {access, scope} per business line the Intent Engine
+    // routes to (Conversation.businessLine: plumtrips | helloviza |
+    // concierge) plus one for the threads that belong to NO line — support
+    // conversations, lead threads the menu has not routed yet, and the
+    // system kinds (expense bot / arrival / trip alerts). A conversation is
+    // checked against exactly one of the four (services/plumconnect/
+    // access.ts lineOfConversation): an agent can be FULL/ALL on helloviza
+    // and NONE on plumtrips, and never sees a plumtrips thread.
+    //   READ  = see the line's conversations in scope
+    //   WRITE = reply / note / assign to self / resolve / reopen
+    //   FULL  = (+ALL) reassign to others
+    //   scope OWN = assigned to me, ALL = every conversation on that line
+    // ADMIN/SUPERADMIN are FULL/ALL on all four by role. Dark-launch posture
     // like visaScreening: NONE in every level template, granted per-user in
-    // AccessConsole. Gated on the plumconnectEnabled workspace feature
-    // (HOUSE bypasses requireFeature).
-    plumconnect: ModulePermission
+    // AccessConsole (PLUMCONNECT group). Gated on the plumconnectEnabled
+    // workspace feature (HOUSE bypasses requireFeature).
+    plumconnectPlumtrips: ModulePermission
+    plumconnectHelloviza: ModulePermission
+    plumconnectConcierge: ModulePermission
+    plumconnectSupport: ModulePermission
 
     // Visa Application (concierge console) — READ = view applications,
     // WRITE = work applications (concierge agent), FULL = manage fees and
@@ -265,7 +280,11 @@ const modulesSchema = new Schema(
 
     // CSTEP Travel & Claim Portal
     cstep: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
-    plumconnect: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    // PlumConnect — per department (Slice 7). See the interface comment.
+    plumconnectPlumtrips: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    plumconnectHelloviza: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    plumconnectConcierge: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    plumconnectSupport:   { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
 
     // Visa Application (concierge console)
     visaApplication: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },

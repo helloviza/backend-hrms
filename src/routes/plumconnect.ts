@@ -11,6 +11,13 @@
 // WRITE = reply / note / assign-to-self / resolve / reopen, FULL (+ALL) =
 // reassign to others.
 //
+// Slice 7 — PER LINE. The grant is one {access, scope} per line (plumtrips /
+// helloviza / concierge / support — services/plumconnect/access.ts). The
+// list is the union of the caller's held lines, each under its own scope;
+// every per-conversation route resolves the conversation's line FIRST and
+// checks THAT line's grant — no grant on the line is a 403, exactly like a
+// scope miss. The API is the control; the UI only mirrors it.
+//
 // Human takeover contract (Slice 3c bot.ts): assigning a conversation or an
 // agent sending on it sets bot.stoppedBy = "human" — the bot is silent on
 // that thread for good.
@@ -34,7 +41,9 @@ import PlumConnectContact from "../models/plumconnect/Contact.js";
 import User from "../models/User.js";
 import { UserPermission } from "../models/UserPermission.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
-import { inboxScope, conversationMatch, canSee, canWrite, canReassign } from "../services/plumconnect/inboxScope.js";
+import { inboxScope, conversationMatch, canSee, canWrite, canReassign, lineGrants } from "../services/plumconnect/inboxScope.js";
+import { isAccessLine, lineOfConversation, holdsAtLeast, canAccessLine, lineGrantsForUserId, PLUMCONNECT_MODULE_KEYS, ACCESS_LINES } from "../services/plumconnect/access.js";
+import type { ScopeCtx } from "../services/crmScope.js";
 import { stopBot, botIsActive } from "../services/plumconnect/bot.js";
 import { sendTextOutcome } from "../services/plumconnect/outbound.js";
 import logger from "../utils/logger.js";
@@ -76,8 +85,9 @@ async function displayName(userId: mongoose.Types.ObjectId | null | undefined): 
 
 /**
  * Load a conversation the caller may act on. 404 when it does not exist,
- * 403 when it exists but is outside the caller's scope — the security
- * property the tests pin.
+ * 403 when it exists but the caller holds nothing on its LINE, or holds it
+ * at OWN and it is not theirs — the security property the tests pin. The
+ * two 403s are indistinguishable on purpose.
  */
 async function loadVisible(req: express.Request, res: express.Response) {
   const id = oid(req.params.id);
@@ -90,15 +100,20 @@ async function loadVisible(req: express.Request, res: express.Response) {
     res.status(404).json({ error: "Conversation not found." });
     return null;
   }
-  if (!canSee(inboxScope(req), conversation)) {
+  if (!canSee(inboxScope(req, lineOfConversation(conversation)), conversation)) {
     res.status(403).json({ error: "This conversation is not in your scope." });
     return null;
   }
   return conversation;
 }
 
-function requireWrite(req: express.Request, res: express.Response): boolean {
-  if (canWrite(inboxScope(req))) return true;
+/** The caller's scope on the conversation's line (after loadVisible). */
+function ctxFor(req: express.Request, conversation: { businessLine?: any; leadId?: any }): ScopeCtx {
+  return inboxScope(req, lineOfConversation(conversation));
+}
+
+function requireWrite(ctx: ScopeCtx, res: express.Response): boolean {
+  if (canWrite(ctx)) return true;
   res.status(403).json({ error: "Write access required." });
   return false;
 }
@@ -140,17 +155,22 @@ function summarize(c: any, contact: any) {
 
 /* ───────────────────────────── routes ───────────────────────────── */
 
-// GET /agents — who can be assigned a conversation. Mirrors
+// GET /agents[?line=] — who can be assigned a conversation. Mirrors
 // requirePlumConnectAccess EXACTLY (the /leads/reps posture): HOUSE
-// ADMIN/SUPERADMIN by role, unioned with explicit plumconnect grants;
-// resolved against ACTIVE HOUSE users. Added for the 4c reassign picker.
-router.get("/agents", async (_req, res) => {
+// ADMIN/SUPERADMIN by role, unioned with explicit grants on ANY line — or,
+// with ?line=, on THAT line, so the reassign picker for a helloviza thread
+// offers only people who can see helloviza threads. Resolved against
+// ACTIVE HOUSE users. Added for the 4c reassign picker.
+router.get("/agents", async (req, res) => {
   try {
     const houseObjectId = new mongoose.Types.ObjectId(HOUSE_WORKSPACE_ID);
+    const line = String(req.query.line || "");
+    if (line && !isAccessLine(line)) return res.status(400).json({ error: "Invalid line." });
+    const keys = line ? [PLUMCONNECT_MODULE_KEYS[line]] : ACCESS_LINES.map((l) => PLUMCONNECT_MODULE_KEYS[l]);
     const grants = await UserPermission.find({
       workspaceId: HOUSE_WORKSPACE_ID,
       universe: "STAFF",
-      "modules.plumconnect.access": { $in: ["READ", "WRITE", "FULL"] },
+      $or: keys.map((k) => ({ [`modules.${k}.access`]: { $in: ["READ", "WRITE", "FULL"] } })),
     })
       .select("userId")
       .lean();
@@ -174,11 +194,14 @@ router.get("/agents", async (_req, res) => {
   }
 });
 
-// GET / — the inbox list, scoped, newest activity first.
+// GET / — the inbox list: the union of the caller's held lines, each under
+// its own scope, newest activity first. ?line= narrows to one held line.
 router.get("/conversations", async (req, res) => {
   try {
-    const ctx = inboxScope(req);
-    const filter: AnyObj = { ...conversationMatch(ctx) };
+    const lineParam = String(req.query.line || "");
+    if (lineParam && !isAccessLine(lineParam)) return res.status(400).json({ error: "Invalid line." });
+    const only = isAccessLine(lineParam) ? lineParam : undefined;
+    const filter: AnyObj = { $and: [conversationMatch(req, only)] };
 
     const status = String(req.query.status || "").toUpperCase();
     if (status) {
@@ -191,9 +214,10 @@ router.get("/conversations", async (req, res) => {
       filter.kind = kind;
     }
     if (String(req.query.unassigned || "") === "true") {
-      // OWN scope already pins assignedTo to the caller; "unassigned" can
-      // only ever match for an ALL scope. Never widen OWN.
-      filter.assignedTo = filter.assignedTo ? { $in: [] } : null;
+      // A line held at OWN already pins assignedTo to the caller inside its
+      // clause, so "unassigned" can only ever match on a line held at ALL.
+      // Never widens OWN.
+      filter.assignedTo = null;
     }
 
     const rows = await PlumConnectConversation.find(filter)
@@ -204,7 +228,7 @@ router.get("/conversations", async (req, res) => {
     const contacts = await PlumConnectContact.find({ _id: { $in: contactIds } }).select("phone displayName identityState").lean();
     const byId = new Map(contacts.map((c: any) => [String(c._id), c]));
 
-    return res.json({ conversations: rows.map((r: any) => summarize(r, byId.get(String(r.contactId)))), scope: ctx.scope, access: ctx.access });
+    return res.json({ conversations: rows.map((r: any) => summarize(r, byId.get(String(r.contactId)))), lines: lineGrants(req) });
   } catch (err) {
     logger.error("plumconnect GET /conversations error", { err });
     return res.status(500).json({ error: "Failed to list conversations." });
@@ -228,13 +252,16 @@ router.get("/conversations/:id", async (req, res) => {
 // POST /:id/assign — assign to self (WRITE) or to someone else (FULL + ALL).
 router.post("/conversations/:id/assign", async (req, res) => {
   try {
-    const ctx = inboxScope(req);
-    if (!ctx.userId) return res.status(401).json({ error: "Unauthorized" });
-    if (!requireWrite(req, res)) return;
-
     const id = oid(req.params.id);
     const conversation = id ? await PlumConnectConversation.findById(id) : null;
     if (!conversation) return res.status(404).json({ error: "Conversation not found." });
+
+    // The line decides which grant applies — before any verb is considered.
+    const line = lineOfConversation(conversation);
+    const ctx = inboxScope(req, line);
+    if (!ctx.userId) return res.status(401).json({ error: "Unauthorized" });
+    if (!holdsAtLeast({ access: ctx.access, scope: ctx.scope }, "READ")) return res.status(403).json({ error: "This conversation is not in your scope." });
+    if (!requireWrite(ctx, res)) return;
 
     const target = oid((req.body as AnyObj)?.userId) ?? ctx.userId;
     const toSelf = String(target) === String(ctx.userId);
@@ -248,8 +275,13 @@ router.post("/conversations/:id/assign", async (req, res) => {
       if (!toSelf && !canReassign(ctx)) return res.status(403).json({ error: "Reassigning to another user needs FULL access." });
     }
 
-    const targetUser = await User.findById(target).select("_id").lean();
+    const targetUser: any = await User.findById(target).select("_id roles").lean();
     if (!targetUser) return res.status(400).json({ error: "Assignee not found." });
+    // Never hand a thread to someone who cannot see its line — it would
+    // vanish from every inbox that could act on it.
+    if (!toSelf && !holdsAtLeast(canAccessLine(await lineGrantsForUserId(targetUser._id, targetUser.roles), line), "READ")) {
+      return res.status(400).json({ error: "Assignee has no access to this conversation's line." });
+    }
 
     const now = new Date();
     const previous = conversation.assignedTo ?? null;
@@ -272,10 +304,10 @@ router.post("/conversations/:id/assign", async (req, res) => {
 // POST /:id/note — internal note: a Message the contact never sees. Never sent.
 router.post("/conversations/:id/note", async (req, res) => {
   try {
-    const ctx = inboxScope(req);
-    if (!requireWrite(req, res)) return;
     const conversation = await loadVisible(req, res);
     if (!conversation) return;
+    const ctx = ctxFor(req, conversation);
+    if (!requireWrite(ctx, res)) return;
 
     const text = String((req.body as AnyObj)?.text ?? "").trim().slice(0, TEXT_CAP);
     if (!text) return res.status(400).json({ error: "Note text is required." });
@@ -300,10 +332,10 @@ router.post("/conversations/:id/note", async (req, res) => {
 // POST /:id/reply — send a text to the contact; the agent takes over.
 router.post("/conversations/:id/reply", async (req, res) => {
   try {
-    const ctx = inboxScope(req);
-    if (!requireWrite(req, res)) return;
     const conversation = await loadVisible(req, res);
     if (!conversation) return;
+    const ctx = ctxFor(req, conversation);
+    if (!requireWrite(ctx, res)) return;
 
     const text = String((req.body as AnyObj)?.text ?? "").trim().slice(0, TEXT_CAP);
     if (!text) return res.status(400).json({ error: "Reply text is required." });
@@ -351,10 +383,10 @@ router.post("/conversations/:id/reply", async (req, res) => {
 // POST /:id/resolve — close the conversation.
 router.post("/conversations/:id/resolve", async (req, res) => {
   try {
-    const ctx = inboxScope(req);
-    if (!requireWrite(req, res)) return;
     const conversation = await loadVisible(req, res);
     if (!conversation) return;
+    const ctx = ctxFor(req, conversation);
+    if (!requireWrite(ctx, res)) return;
     if (conversation.status === "RESOLVED") return res.status(409).json({ error: "Already resolved." });
 
     const now = new Date();
@@ -374,10 +406,10 @@ router.post("/conversations/:id/resolve", async (req, res) => {
 // POST /:id/reopen — back to OPEN.
 router.post("/conversations/:id/reopen", async (req, res) => {
   try {
-    const ctx = inboxScope(req);
-    if (!requireWrite(req, res)) return;
     const conversation = await loadVisible(req, res);
     if (!conversation) return;
+    const ctx = ctxFor(req, conversation);
+    if (!requireWrite(ctx, res)) return;
     if (conversation.status !== "RESOLVED") return res.status(409).json({ error: "Only a resolved conversation can be reopened." });
 
     const now = new Date();

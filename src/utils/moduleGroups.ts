@@ -19,5 +19,5 @@ export const MODULE_GROUP_MAP: Record<string, string[]> = {
   crm: ['leads', 'crmContacts', 'crmCompanies'],
   vendor: ['vendorProfile', 'vendorManagement'],
   operations: ['supportTickets', 'tasks', 'directCustomers'],
-  plumconnect: ['plumconnect'],
+  plumconnect: ['plumconnectPlumtrips', 'plumconnectHelloviza', 'plumconnectConcierge', 'plumconnectSupport'],
 }

@@ -1,0 +1,2324 @@
+{
+  "L1": {
+    "myProfile": {
+      "access": "FULL",
+      "scope": "OWN"
+    },
+    "attendance": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "leaves": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "leaveApprovals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "holidays": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "holidayManagement": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "orgChart": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "policies": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "teamProfiles": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamPresence": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamCalendar": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "hrWorkspace": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "onboarding": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "people": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "masterData": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payroll": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "payrollAdmin": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoices": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "reports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "companySettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "analytics": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "workspaceSettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "accessConsole": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbt": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtSearch": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtRequest": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "approvals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelSpend": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "supportTickets": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "tasks": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "directCustomers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmContacts": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmCompanies": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leads": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "L2": {
+    "myProfile": {
+      "access": "FULL",
+      "scope": "OWN"
+    },
+    "attendance": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "leaves": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "leaveApprovals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "holidays": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "holidayManagement": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "orgChart": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "policies": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "teamProfiles": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "teamPresence": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamCalendar": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "hrWorkspace": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "onboarding": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "people": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "masterData": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payroll": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "payrollAdmin": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoices": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "reports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "companySettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "analytics": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "workspaceSettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "accessConsole": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbt": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtSearch": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtRequest": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "approvals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelSpend": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "supportTickets": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "tasks": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "directCustomers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmContacts": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "crmCompanies": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "leads": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "L3": {
+    "myProfile": {
+      "access": "FULL",
+      "scope": "OWN"
+    },
+    "attendance": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "leaves": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "leaveApprovals": {
+      "access": "WRITE",
+      "scope": "TEAM"
+    },
+    "holidays": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "holidayManagement": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "orgChart": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "policies": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "teamProfiles": {
+      "access": "WRITE",
+      "scope": "TEAM"
+    },
+    "teamPresence": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "teamCalendar": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "hrWorkspace": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "onboarding": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "people": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "masterData": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payroll": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "payrollAdmin": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoices": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "reports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "companySettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "analytics": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "workspaceSettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "accessConsole": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbt": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtSearch": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtRequest": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "approvals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelSpend": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "supportTickets": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "tasks": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "directCustomers": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "crmContacts": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "crmCompanies": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "leads": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "L4": {
+    "myProfile": {
+      "access": "FULL",
+      "scope": "OWN"
+    },
+    "attendance": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "leaves": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "leaveApprovals": {
+      "access": "FULL",
+      "scope": "TEAM"
+    },
+    "holidays": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "holidayManagement": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "orgChart": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "policies": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "teamProfiles": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "teamPresence": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "teamCalendar": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "hrWorkspace": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "onboarding": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "people": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "masterData": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payroll": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "payrollAdmin": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoices": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "reports": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "companySettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "analytics": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "workspaceSettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "accessConsole": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbt": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtSearch": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtRequest": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "approvals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelSpend": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "supportTickets": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "tasks": {
+      "access": "WRITE",
+      "scope": "TEAM"
+    },
+    "directCustomers": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "crmContacts": {
+      "access": "WRITE",
+      "scope": "TEAM"
+    },
+    "crmCompanies": {
+      "access": "WRITE",
+      "scope": "TEAM"
+    },
+    "leads": {
+      "access": "WRITE",
+      "scope": "TEAM"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "L5": {
+    "myProfile": {
+      "access": "FULL",
+      "scope": "OWN"
+    },
+    "attendance": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "leaves": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "leaveApprovals": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "holidays": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "holidayManagement": {
+      "access": "WRITE",
+      "scope": "WORKSPACE"
+    },
+    "orgChart": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "policies": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "teamProfiles": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "teamPresence": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "teamCalendar": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "hrWorkspace": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "onboarding": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "people": {
+      "access": "WRITE",
+      "scope": "WORKSPACE"
+    },
+    "masterData": {
+      "access": "WRITE",
+      "scope": "WORKSPACE"
+    },
+    "payroll": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "payrollAdmin": {
+      "access": "WRITE",
+      "scope": "WORKSPACE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoices": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "reports": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "companySettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "analytics": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "workspaceSettings": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "accessConsole": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbt": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtSearch": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtRequest": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "approvals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelSpend": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "supportTickets": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "tasks": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "directCustomers": {
+      "access": "WRITE",
+      "scope": "TEAM"
+    },
+    "crmContacts": {
+      "access": "WRITE",
+      "scope": "TEAM"
+    },
+    "crmCompanies": {
+      "access": "WRITE",
+      "scope": "TEAM"
+    },
+    "leads": {
+      "access": "WRITE",
+      "scope": "TEAM"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "L6": {
+    "myProfile": {
+      "access": "FULL",
+      "scope": "OWN"
+    },
+    "attendance": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "leaves": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "leaveApprovals": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "holidays": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "holidayManagement": {
+      "access": "WRITE",
+      "scope": "WORKSPACE"
+    },
+    "orgChart": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "policies": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "teamProfiles": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "teamPresence": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "teamCalendar": {
+      "access": "READ",
+      "scope": "TEAM"
+    },
+    "hrWorkspace": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "onboarding": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "people": {
+      "access": "WRITE",
+      "scope": "WORKSPACE"
+    },
+    "masterData": {
+      "access": "WRITE",
+      "scope": "WORKSPACE"
+    },
+    "payroll": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "payrollAdmin": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "adminQueue": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "manualBookings": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "invoices": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "reports": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "companySettings": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "adminVouchers": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "voucherExtract": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "analytics": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "workspaceSettings": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "accessConsole": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbt": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "sbtSearch": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtRequest": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "approvals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelSpend": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "supportTickets": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "tasks": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "directCustomers": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "crmContacts": {
+      "access": "WRITE",
+      "scope": "WORKSPACE"
+    },
+    "crmCompanies": {
+      "access": "WRITE",
+      "scope": "WORKSPACE"
+    },
+    "leads": {
+      "access": "WRITE",
+      "scope": "WORKSPACE"
+    },
+    "cstep": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "visaApplication": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "L7": {
+    "myProfile": {
+      "access": "FULL",
+      "scope": "OWN"
+    },
+    "attendance": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "leaves": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "leaveApprovals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "holidays": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "holidayManagement": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "orgChart": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "policies": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "teamProfiles": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamPresence": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamCalendar": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "hrWorkspace": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "onboarding": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "people": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "masterData": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payroll": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "payrollAdmin": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "invoices": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "reports": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "companySettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "analytics": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "workspaceSettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "accessConsole": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbt": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtSearch": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtRequest": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "approvals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelSpend": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "supportTickets": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "tasks": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "directCustomers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmContacts": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "crmCompanies": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "leads": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "READ",
+      "scope": "ALL"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "L8": {
+    "myProfile": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "attendance": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "leaves": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "leaveApprovals": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "holidays": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "holidayManagement": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "orgChart": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "policies": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "teamProfiles": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "teamPresence": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "teamCalendar": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "hrWorkspace": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "onboarding": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "people": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "masterData": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "payroll": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "payrollAdmin": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "adminQueue": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "manualBookings": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "invoices": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "reports": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "companySettings": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "adminVouchers": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "voucherExtract": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "analytics": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "workspaceSettings": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "accessConsole": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "sbt": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "sbtSearch": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "sbtBookings": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "sbtRequest": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "approvals": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "travelSpend": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "vendorProfile": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "supportTickets": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "tasks": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "directCustomers": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "crmContacts": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "crmCompanies": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "leads": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "cstep": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "visaApplication": {
+      "access": "FULL",
+      "scope": "ALL"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "VENDOR": {
+    "myProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "attendance": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leaves": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leaveApprovals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "holidays": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "holidayManagement": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "orgChart": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "policies": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "teamProfiles": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamPresence": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamCalendar": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "hrWorkspace": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "onboarding": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "people": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "masterData": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payroll": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payrollAdmin": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoices": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "reports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "companySettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "analytics": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "workspaceSettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "accessConsole": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbt": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtSearch": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtRequest": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "approvals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelSpend": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "vendorProfile": {
+      "access": "FULL",
+      "scope": "OWN"
+    },
+    "supportTickets": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "tasks": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "directCustomers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmContacts": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmCompanies": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leads": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "CUSTOMER_SBT": {
+    "myProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "attendance": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leaves": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leaveApprovals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "holidays": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "holidayManagement": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "orgChart": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "policies": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamProfiles": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamPresence": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamCalendar": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "hrWorkspace": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "onboarding": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "people": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "masterData": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payroll": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payrollAdmin": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoices": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "reports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "companySettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "analytics": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "workspaceSettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "accessConsole": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbt": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtSearch": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "sbtBookings": {
+      "access": "READ",
+      "scope": "OWN"
+    },
+    "sbtRequest": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "approvals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelSpend": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "supportTickets": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "tasks": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "directCustomers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmContacts": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmCompanies": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leads": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "CUSTOMER_APPROVAL": {
+    "myProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "attendance": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leaves": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leaveApprovals": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "holidays": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "holidayManagement": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "orgChart": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "policies": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamProfiles": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamPresence": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "teamCalendar": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "hrWorkspace": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "onboarding": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "people": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "masterData": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payroll": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "payrollAdmin": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoices": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "reports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "companySettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "analytics": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "workspaceSettings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "accessConsole": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbt": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtSearch": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "sbtRequest": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "approvals": {
+      "access": "WRITE",
+      "scope": "OWN"
+    },
+    "travelSpend": {
+      "access": "READ",
+      "scope": "WORKSPACE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "supportTickets": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "tasks": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "directCustomers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmContacts": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmCompanies": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leads": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "TENANT_ADMIN": {
+    "myProfile": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "attendance": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "leaves": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "leaveApprovals": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "holidays": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "holidayManagement": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "orgChart": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "policies": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "teamProfiles": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "teamPresence": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "teamCalendar": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "hrWorkspace": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "onboarding": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "people": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "masterData": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "payroll": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "payrollAdmin": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoices": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "reports": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "companySettings": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "analytics": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "workspaceSettings": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "accessConsole": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "sbt": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "sbtSearch": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "sbtBookings": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "sbtRequest": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "approvals": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "travelSpend": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "supportTickets": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "tasks": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "vendorManagement": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "directCustomers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmContacts": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmCompanies": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leads": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  },
+  "L0": {
+    "myProfile": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "attendance": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "leaves": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "leaveApprovals": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "holidays": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "holidayManagement": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "orgChart": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "policies": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "teamProfiles": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "teamPresence": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "teamCalendar": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "hrWorkspace": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "onboarding": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "people": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "masterData": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "payroll": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "payrollAdmin": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "adminQueue": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "manualBookings": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoices": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "adminVouchers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "voucherExtract": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "reports": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "companySettings": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "analytics": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "workspaceSettings": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "accessConsole": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "sbt": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "sbtSearch": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "sbtBookings": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "sbtRequest": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "approvals": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "travelSpend": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "supportTickets": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "tasks": {
+      "access": "FULL",
+      "scope": "WORKSPACE"
+    },
+    "vendorProfile": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "vendorManagement": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "directCustomers": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmContacts": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "crmCompanies": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "leads": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "cstep": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaApplication": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "visaScreening": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "consumerContactPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    }
+  }
+}
