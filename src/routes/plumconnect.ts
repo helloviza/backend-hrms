@@ -44,6 +44,7 @@ import { activeUserFilter } from "../utils/userActiveStatus.js";
 import { inboxScope, conversationMatch, canSee, canWrite, canReassign, lineGrants } from "../services/plumconnect/inboxScope.js";
 import { isAccessLine, lineOfConversation, holdsAtLeast, canAccessLine, lineGrantsForUserId, heldLines, PLUMCONNECT_MODULE_KEYS, ACCESS_LINES } from "../services/plumconnect/access.js";
 import { buildCampaignRollup } from "../services/plumconnect/campaignRollup.js";
+import { getPresence, setPresence, presenceTtlMs } from "../services/plumconnect/presence.js";
 import type { ScopeCtx } from "../services/crmScope.js";
 import { stopBot, botIsActive } from "../services/plumconnect/bot.js";
 import { sendTextOutcome } from "../services/plumconnect/outbound.js";
@@ -216,6 +217,44 @@ router.get("/campaigns/rollup", async (req, res) => {
   } catch (err) {
     logger.error("plumconnect GET /campaigns/rollup error", { err });
     return res.status(500).json({ error: "Failed to build the campaign roll-up." });
+  }
+});
+
+// ── Track A — agent presence, per line ─────────────────────────────────
+// Stored and exposed only; nothing routes on it yet (Track B). The guard
+// above already resolved the caller's Slice 7 grants: a line the caller
+// does not hold is a 403 and nothing is written.
+
+// GET /presence — my per-line active/away map + the lines I hold.
+router.get("/presence", async (req, res) => {
+  try {
+    const ctx = inboxScope(req, "support"); // only for the caller id
+    if (!ctx.userId) return res.status(401).json({ error: "Unauthorized" });
+    const presence = await getPresence(ctx.userId, new Date());
+    return res.json({ presence, lines: heldLines(lineGrants(req)), ttlMs: presenceTtlMs() });
+  } catch (err) {
+    logger.error("plumconnect GET /presence error", { err });
+    return res.status(500).json({ error: "Failed to load presence." });
+  }
+});
+
+// POST /presence — { line, active }: set my presence on a line I hold.
+router.post("/presence", async (req, res) => {
+  try {
+    const ctx = inboxScope(req, "support");
+    if (!ctx.userId) return res.status(401).json({ error: "Unauthorized" });
+    const body = (req.body as AnyObj) ?? {};
+    if (!isAccessLine(body.line)) return res.status(400).json({ error: "line must be one of plumtrips, helloviza, concierge, support." });
+    if (typeof body.active !== "boolean") return res.status(400).json({ error: "active must be true or false." });
+    const r = await setPresence({ userId: ctx.userId, grants: lineGrants(req), line: body.line, active: body.active, now: new Date() });
+    if (r.ok === false) {
+      if (r.reason === "line_not_held") return res.status(403).json({ error: "You do not hold this PlumConnect line." });
+      return res.status(400).json({ error: "Invalid presence request." });
+    }
+    return res.json({ line: r.line, presence: r.presence, all: await getPresence(ctx.userId, new Date()) });
+  } catch (err) {
+    logger.error("plumconnect POST /presence error", { err });
+    return res.status(500).json({ error: "Failed to set presence." });
   }
 });
 
