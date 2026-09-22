@@ -164,7 +164,9 @@ describe("staff export — three appended multi-leg columns", () => {
     });
     expect(res.status).toBe(200);
     const wb = new ExcelJS.Workbook();
-    await wb.xlsx.load(res.body as Buffer);
+    // exceljs's `Buffer` type predates Node 22's generic Buffer<ArrayBufferLike>;
+    // the bytes are a plain Buffer from the parser above.
+    await wb.xlsx.load(res.body as any);
     const sheet = wb.worksheets[0];
     const header = sheet.getRow(1).values as any[]; // 1-based
     expect(header.length - 1).toBe(COLS);
