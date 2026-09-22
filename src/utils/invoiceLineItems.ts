@@ -1,5 +1,6 @@
 import logger from "./logger.js";
 import { isNewModelLineItems } from "../models/ManualBooking.js";
+import { bookingLegRoute, bookingLegCarriers } from "./bookingLegs.js";
 
 const TYPE_COST_LABELS: Record<string, string> = {
   FLIGHT:            "Flight Cost",
@@ -146,12 +147,18 @@ function buildSubDescription(booking: any, paxStr: string): string {
   let parts: (string | undefined)[];
 
   if (t === "FLIGHT" || t === "FLIGHT_RESCHEDULE" || t === "DUMMY_FLIGHT") {
+    // Multi-leg (Step 4): when the booking carries legs[], the route is the
+    // whole trip ("DEL-BOM-DEL") and the carrier lists every leg; legacy rows
+    // (no legs) print the flat origin-destination + single carrier exactly
+    // as before. Description only — still ONE line per booking, and the
+    // qty/rate/GST maths below never looks at legs.
+    const legRoute    = bookingLegRoute(booking, "-");
     const origin      = booking.itinerary?.origin || "";
     const destination = booking.itinerary?.destination || "";
-    const route       = origin && destination ? `${origin}-${destination}` : origin || destination || "—";
+    const route       = legRoute || (origin && destination ? `${origin}-${destination}` : origin || destination || "—");
     const airline     = booking.itinerary?.airline || "";
     const flightNo    = booking.itinerary?.flightNo || "";
-    const carrier     = [airline, flightNo].filter(Boolean).join(" ");
+    const carrier     = bookingLegCarriers(booking) || [airline, flightNo].filter(Boolean).join(" ");
     const dateStr     = fmtDate(booking.travelDate);
     parts = [paxStr, route, carrier || undefined, dateStr ? `Travel Date: ${dateStr}` : undefined];
   } else if (t === "TRAIN") {

@@ -38,6 +38,7 @@ import {
 } from "../services/documentExtraction.service.js";
 import { buildFlightAutofill } from "../services/flightAutofill.js";
 import { buildHotelAutofill } from "../services/hotelAutofill.js";
+import { bookingTripType, bookingLegRoute, bookingLegDetail } from "../utils/bookingLegs.js";
 import type { VoucherType } from "../types/index.js";
 
 const router = express.Router();
@@ -490,6 +491,15 @@ const BOOKING_COLUMNS = [
   "Vehicle Type",
   "Visa Country",
   "Visa Type",
+  // Multi-leg flights (Step 4) — appended at the END, same reason as above.
+  // Sector / Flight No / Airline keep the flat (outbound, leg-0) values they
+  // always carried; these three add the whole trip. Blank for non-flight
+  // and legacy (no legs[]) rows. "Legs" is ONE cell per booking, never a
+  // row per leg — the money columns and the XLSX TOTALS row stay
+  // one-row-per-booking (utils/bookingLegs.ts).
+  "Trip Type",
+  "Route (all legs)",
+  "Legs",
 ];
 
 // Money column indices (1-based): Quoted=17, Actual=18, Diff=19, GST=20, Base=21, Grand=22
@@ -683,6 +693,9 @@ function bookingToRow(
     b.itinerary?.vehicleType ?? "",
     b.itinerary?.visaCountry ?? "",
     b.itinerary?.visaType ?? "",
+    bookingTripType(b),
+    bookingLegRoute(b),
+    bookingLegDetail(b),
   ];
 }
 
@@ -1045,10 +1058,11 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     headerRow.font = { bold: true };
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8EAF0" } };
 
-    // Column widths (46 cols: Booking Date at pos 2, Ref No. at pos 3, Traveler ID after Pax Name;
+    // Column widths (49 cols: Booking Date at pos 2, Ref No. at pos 3, Traveler ID after Pax Name;
     // cols 32-40 are the appended per-type detail columns; col 41 is Line Items;
-    // cols 42-46 are the Transfer/Cab + Visa detail columns appended after that)
-    const colWidths = [7, 14, 16, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16, 16, 16, 12, 24, 18, 9, 8, 30, 22, 40, 20, 20, 16, 16, 16];
+    // cols 42-46 are the Transfer/Cab + Visa detail columns appended after that;
+    // cols 47-49 are Trip Type / Route (all legs) / Legs)
+    const colWidths = [7, 14, 16, 22, 14, 18, 16, 12, 28, 14, 22, 16, 10, 18, 14, 14, 14, 14, 12, 10, 12, 14, 12, 22, 25, 20, 14, 14, 16, 12, 16, 16, 16, 12, 24, 18, 9, 8, 30, 22, 40, 20, 20, 16, 16, 16, 12, 24, 60];
     colWidths.forEach((width, i) => {
       sheet.getColumn(i + 1).width = width;
     });

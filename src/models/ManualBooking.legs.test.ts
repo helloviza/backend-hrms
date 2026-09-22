@@ -221,6 +221,22 @@ describe("the TravelBooking mirror gets a single, correct origin/destination —
     expect(m.travelDateEnd).toEqual(D("2026-10-20")); // was the outbound arrival before the fix
     expect(m.metadata.airline).toBe("Air India");
     expect(m.service).toBe("FLIGHT");
+    // Piece 3: the whole trip rides along in metadata (descriptive only).
+    expect(m.metadata.tripType).toBe("ROUND_TRIP");
+    expect(m.metadata.legs.map((l: any) => `${l.origin}-${l.destination}/${l.flightNo}`)).toEqual(["DEL-BOM/AI 101", "BOM-DEL/AI 102"]);
+    expect(m.metadata.legs[1].departDate).toEqual(D("2026-10-20"));
+    expect(Object.keys(m.metadata.legs[0]).sort()).toEqual(["airline", "arriveDate", "departDate", "destination", "flightNo", "origin"]);
+  });
+
+  it("a legacy booking mirrors empty legs/tripType metadata", async () => {
+    const b = await ManualBooking.create(
+      base({ itinerary: { origin: "BLR", destination: "HYD", flightNo: "6E 77", airline: "IndiGo" } }),
+    );
+    const m: any = await TravelBooking.findOne({ reference: b._id }).lean();
+    expect(m.origin).toBe("BLR");
+    expect(m.destination).toBe("HYD");
+    expect(m.metadata.tripType).toBe("");
+    expect(m.metadata.legs).toEqual([]);
   });
 
   it("MULTI_CITY mirrors the final destination", async () => {

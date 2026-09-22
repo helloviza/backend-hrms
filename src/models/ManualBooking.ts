@@ -953,6 +953,21 @@ export async function syncManualBookingToMirror(doc: any): Promise<void> {
       hotelName: doc.itinerary?.hotelName || "",
       airline: doc.itinerary?.airline || "",
       sector: doc.sector || "",
+      // Multi-leg (Step 4): the whole trip, descriptive only (no cost on a
+      // leg). origin/destination above stay the DERIVED flat summary —
+      // turnaround city for a round trip — so Top Destinations is unchanged.
+      // Legacy rows carry no legs → "" / [] here, same as the fields above.
+      tripType: doc.itinerary?.tripType || "",
+      legs: Array.isArray(doc.itinerary?.legs)
+        ? doc.itinerary.legs.map((l: any) => ({
+            origin: l.origin || "",
+            destination: l.destination || "",
+            flightNo: l.flightNo || "",
+            airline: l.airline || "",
+            departDate: l.departDate ? new Date(l.departDate) : null,
+            arriveDate: l.arriveDate ? new Date(l.arriveDate) : null,
+          }))
+        : [],
     },
   };
   if (workspaceId) update.workspaceId = workspaceId;

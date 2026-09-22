@@ -27,9 +27,19 @@ function makeFindChain(result: any[]) {
 }
 
 const findMock = vi.fn();
-vi.mock("../models/ManualBooking.js", () => ({
-  default: { find: (...args: any[]) => findMock(...args) },
-}));
+// The route imports formatLineItems from routes/manualBookings.ts, which
+// calls the model module's isNewModelLineItems at request time — a mock
+// without it turns every /manual request into a 500 before any assertion.
+vi.mock("../models/ManualBooking.js", async () => {
+  const actual: any = await vi.importActual("../models/ManualBooking.js");
+  return {
+    isNewModelLineItems: actual.isNewModelLineItems,
+    MANUAL_BOOKING_TYPES: actual.MANUAL_BOOKING_TYPES,
+    ALL_SUB_STATUSES: actual.ALL_SUB_STATUSES,
+    ATTACHMENT_REQUIRED_TYPES: actual.ATTACHMENT_REQUIRED_TYPES,
+    default: { find: (...args: any[]) => findMock(...args) },
+  };
+});
 
 vi.mock("../models/TravelBooking.js", () => ({
   default: { find: () => ({ populate: () => ({ sort: () => ({ limit: () => ({ lean: () => ({ exec: () => Promise.resolve([]) }) }) }) }) }) },
@@ -202,8 +212,8 @@ describe("GET /manual — OWN-scope email matching (mirrors attachment routes, n
   });
 });
 
-describe("GET /manual — response shape (exactly the 37 columns, never cost/margin/PII)", () => {
-  it("returns only sNo + the 37 customer-safe fields", async () => {
+describe("GET /manual — response shape (exactly the 40 columns, never cost/margin/PII)", () => {
+  it("returns only sNo + the 40 customer-safe fields", async () => {
     findMock.mockReturnValue(makeFindChain([manualBookingDoc()]));
     const app = makeApp({ roles: ["WORKSPACE_LEADER"], email: LEADER_EMAIL });
     const res = await request(app).get("/manual");
@@ -251,6 +261,10 @@ describe("GET /manual — response shape (exactly the 37 columns, never cost/mar
         "vehicleType",
         "visaCountry",
         "visaType",
+        // multi-leg (Step 4, Piece 3) — appended 3
+        "tripType",
+        "route",
+        "legs",
       ].sort(),
     );
   });
@@ -311,7 +325,7 @@ describe("GET /manual — response shape (exactly the 37 columns, never cost/mar
 });
 
 describe("GET /manual/export — same security guarantees as the JSON list", () => {
-  it("csv header is exactly the 37 columns, in order, original 11 stable then the 26 appended", async () => {
+  it("csv header is exactly the 40 columns, in order, original 11 stable then the 26 + 3 appended", async () => {
     findMock.mockReturnValue(makeFindChain([manualBookingDoc()]));
     const app = makeApp({ roles: ["WORKSPACE_LEADER"], email: LEADER_EMAIL });
     const res = await request(app).get("/manual/export?format=csv");
@@ -325,6 +339,7 @@ describe("GET /manual/export — same security guarantees as the JSON list", () 
         "Flight / Train No", "Airline", "Train Class", "Hotel Name", "Room Type", "Nights", "Rooms",
         "Service Description", "Supplier PNR / Booking ID", "Line Items",
         "Pickup Location", "Drop Location", "Vehicle Type", "Visa Country", "Visa Type",
+        "Trip Type", "Route (all legs)", "Legs",
       ].join(","),
     );
   });
@@ -338,6 +353,43 @@ describe("GET /manual/export — same security guarantees as the JSON list", () 
     expect(dataRow).toContain("Company A Pvt Ltd");
     expect(dataRow).toContain("CSTEP-001");
     expect(dataRow).toContain("PNR-XYZ123");
+  });
+
+  it("multi-leg flight: the 3 appended columns carry Trip Type / Route / Legs (one row, JSON + CSV); a legacy row leaves them blank", async () => {
+    const multi = manualBookingDoc({
+      _id: "mb0000000000000000000002",
+      bookingRef: "MB-LEGS-0001",
+      type: "FLIGHT",
+      sector: "",
+      itinerary: {
+        origin: "DEL", destination: "BOM", flightNo: "AI 302", airline: "Air India",
+        tripType: "ROUND_TRIP",
+        legs: [
+          { origin: "DEL", destination: "BOM", flightNo: "AI 302", airline: "Air India", departDate: "2026-10-15T00:00:00.000Z" },
+          { origin: "BOM", destination: "DEL", flightNo: "AI 303", airline: "Air India", departDate: "2026-10-20T00:00:00.000Z" },
+        ],
+      },
+    });
+    findMock.mockReturnValue(makeFindChain([multi, manualBookingDoc()]));
+    const app = makeApp({ roles: ["WORKSPACE_LEADER"], email: LEADER_EMAIL });
+
+    const json = await request(app).get("/manual");
+    expect(json.body.bookings).toHaveLength(2);
+    expect(json.body.bookings[0]).toMatchObject({
+      sector: "DEL-BOM",            // flat outbound→turnaround, unchanged
+      flightTrainNo: "AI 302",      // leg 0, never joined
+      tripType: "ROUND_TRIP",
+      route: "DEL→BOM→DEL",
+      legs: "1. DEL→BOM AI 302 Air India 15/10/2026 | 2. BOM→DEL AI 303 Air India 20/10/2026",
+    });
+    expect(json.body.bookings[1]).toMatchObject({ tripType: "", route: "", legs: "" });
+
+    const csv = await request(app).get("/manual/export?format=csv");
+    const lines = csv.text.trim().split("\n");
+    expect(lines).toHaveLength(3); // header + 2 bookings, never a row per leg
+    // csvRow only quotes cells containing , " or newline — none of these do.
+    expect(lines[1]).toMatch(/,ROUND_TRIP,DEL→BOM→DEL,1\. DEL→BOM AI 302 Air India 15\/10\/2026 \| 2\. BOM→DEL AI 303 Air India 20\/10\/2026\s*$/);
+    expect(lines[2]).toMatch(/,,,\s*$/);
   });
 
   it("xlsx export never leaks cost/margin/Partner(supplierName)/PII — Supplier PNR IS present (approved column)", async () => {

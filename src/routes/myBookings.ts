@@ -32,6 +32,7 @@ import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
 import { formatLineItems, invoicePendingDays } from "./manualBookings.js";
+import { bookingTripType, bookingLegRoute, bookingLegDetail } from "../utils/bookingLegs.js";
 
 const router = Router();
 
@@ -377,6 +378,7 @@ async function loadManualBookingsForCustomer(
         "itinerary.origin itinerary.destination itinerary.hotelName itinerary.flightNo itinerary.airline " +
         "itinerary.trainClass itinerary.roomType itinerary.nights itinerary.roomCount itinerary.description " +
         "itinerary.pickupLocation itinerary.dropLocation itinerary.vehicleType itinerary.visaCountry itinerary.visaType " +
+        "itinerary.tripType itinerary.legs " +
         "lineItems invoiceId",
     )
     .populate("invoiceId", "invoiceNo invoiceDate status")
@@ -468,9 +470,15 @@ const CUSTOMER_BOOKING_COLUMNS = [
   "Vehicle Type",
   "Visa Country",
   "Visa Type",
+  // Multi-leg flights — appended at the END, same three as the staff export
+  // (utils/bookingLegs.ts). Blank for non-flight / legacy rows; "Legs" is
+  // one cell per booking, never a row per leg.
+  "Trip Type",
+  "Route (all legs)",
+  "Legs",
 ];
 
-/** The 37 customer-safe fields, keyed — shared by the JSON list and the export row builder. */
+/** The 40 customer-safe fields, keyed — shared by the JSON list and the export row builder. */
 function customerBookingFields(b: any) {
   const paxName = (b.passengers || [])
     .map((p: any) => String(p?.name ?? "").trim())
@@ -521,6 +529,9 @@ function customerBookingFields(b: any) {
     vehicleType: b.itinerary?.vehicleType ?? "",
     visaCountry: b.itinerary?.visaCountry ?? "",
     visaType: b.itinerary?.visaType ?? "",
+    tripType: bookingTripType(b),
+    route: bookingLegRoute(b),
+    legs: bookingLegDetail(b),
   };
 }
 
@@ -564,10 +575,13 @@ function customerBookingRow(b: any, srNo: number): (string | number)[] {
     f.vehicleType,
     f.visaCountry,
     f.visaType,
+    f.tripType,
+    f.route,
+    f.legs,
   ];
 }
 
-// GET /api/my-bookings/manual — the 37-column table, JSON.
+// GET /api/my-bookings/manual — the 40-column table, JSON.
 router.get("/manual", async (req: Request, res: Response) => {
   try {
     const docs = await loadManualBookingsForCustomer(req, {
@@ -586,7 +600,7 @@ router.get("/manual", async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/my-bookings/manual/export?format=xlsx|csv — same 37 columns, full history (no limit).
+// GET /api/my-bookings/manual/export?format=xlsx|csv — same 40 columns, full history (no limit).
 router.get("/manual/export", async (req: Request, res: Response) => {
   try {
     const docs = await loadManualBookingsForCustomer(req, {
@@ -616,6 +630,7 @@ router.get("/manual/export", async (req: Request, res: Response) => {
       7, 14, 14, 18, 12, 28, 14, 22, 14, 14, 16, // original 11 (Given By removed)
       16, 22, 14, 14, 28, 28, 16, 14, 18, 12, 22, // Ref No...Booking Month
       16, 16, 12, 22, 14, 8, 8, 30, 22, 40, 20, 20, 16, 16, 16, // detail block
+      12, 24, 60, // Trip Type / Route (all legs) / Legs
     ];
     colWidths.forEach((width, i) => { sheet.getColumn(i + 1).width = width; });
     sheet.getColumn(11).numFmt = "#,##0.00"; // Grand Total
