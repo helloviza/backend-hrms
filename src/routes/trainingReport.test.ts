@@ -9,7 +9,10 @@
 //     registry proving a newly-published deck appears with no backend change)
 //   • department filter, normalisation and the Unassigned bucket
 //   • per-module counts + completion rate
-//   • row population: active HOUSE staff only
+//   • row population: the People & Culture roster — active Employee rows in
+//     HOUSE → ownerId → active User; Resigned/Terminated left out; a User
+//     with no Employee row (customer workspace leader mis-scoped to HOUSE,
+//     onboarding stub, test/seed login) never appears, in the grid or export
 //   • the gate: the per-person trainingReports capability + HOUSE — decoupled
 //     from HR: people:READ without the grant is 403; NONE by default; no level
 //     template confers it; SUPERADMIN bypasses; export behind the same gate
@@ -32,6 +35,7 @@ process.env.GEMINI_API_KEY ||= "test-gemini-key";
 
 const { default: TrainingProgress } = await import("../models/TrainingProgress.js");
 const { default: User } = await import("../models/User.js");
+const { default: Employee } = await import("../models/Employee.js");
 const { default: Department } = await import("../models/Department.js");
 const { UserPermission } = await import("../models/UserPermission.js");
 const { default: trainingReportRouter } = await import("./trainingReport.js");
@@ -55,6 +59,19 @@ const P = {
   hr: oid(),        // HR with people:READ but NO trainingReports — must be refused
   employee: oid(),  // ordinary employee, nothing granted
 };
+// Logins that live in HOUSE but are NOT employees (no Employee row) — each
+// active and given progress / a department, so a leak would show in rows,
+// counts and the export. Plus ex-employees whose flags still say active.
+const X = {
+  leader: oid(),     // a CUSTOMER company's WORKSPACE_LEADER mis-scoped to HOUSE (external PII)
+  stub: oid(),       // onboarding stub: invited, never joined (tempPassword, personal email)
+  seed: oid(),       // test/seed login (e1@plumtrips.com)
+  resigned: oid(),   // Employee row active-flagged, User.employmentStatus "Resigned"
+  terminated: oid(), // Employee row active-flagged, Employee.employmentStatus "Terminated"
+  empOff: oid(),     // Employee row isActive:false (User still ACTIVE)
+};
+const LEADER_EMAIL = "cfo@bakerco-client.in";
+const STUB_EMAIL = "newjoiner.personal@gmail.com";
 // Permission-only sessions (no User row, so the report's rows are unchanged).
 const REPORTER = oid();  // granted trainingReports:READ — the report's reader
 const RAWPERM = oid();   // permission doc written without the key at all
@@ -103,6 +120,24 @@ beforeAll(async () => {
     u(P.hr, { name: "Gita HR", email: "gita@plumtrips.com", roles: ["HR"], department: "People & Culture" }),
     { _id: P.employee, workspaceId: house, passwordHash: "x", roles: ["EMPLOYEE"], firstName: "Hari", lastName: "Employee", email: "hari@plumtrips.com" }, // no status, no department
     { _id: TENANT_USER, workspaceId: TENANT, passwordHash: "x", roles: ["HR"], status: "ACTIVE", name: "Ivy Tenant", email: "ivy@tenant.com" },
+    u(X.leader, { name: "BAKER CO (Leader)", email: LEADER_EMAIL, roles: ["WORKSPACE_LEADER"], department: "Tech & Product" }),
+    u(X.stub, { name: "Asha Personal", email: STUB_EMAIL, tempPassword: true, employeeCode: "PTS001999", department: "Tech & Product" }),
+    u(X.seed, { name: "e1", email: "e1@plumtrips.com", tempPassword: true }),
+    u(X.resigned, { name: "Ravi Resigned", email: "ravi@plumtrips.com", department: "Tech & Product", employmentStatus: "Resigned" }),
+    u(X.terminated, { name: "Tara Terminated", email: "tara@plumtrips.com", department: "Tech & Product", employmentStatus: "Active" }),
+    u(X.empOff, { name: "Omar Off", email: "omar@plumtrips.com", department: "Tech & Product" }),
+  ] as any[]);
+  // The HR roster (People & Culture). Raw inserts shaped like prod: linked by
+  // ownerId only, employmentStatus stored outside the Employee schema, and a
+  // legacy row with neither status nor isActive stamped (absent = active).
+  const emp = (owner: mongoose.Types.ObjectId, o: Record<string, any> = {}) => ({ workspaceId: house, ownerId: owner, email: `${owner}@e`, status: "ACTIVE", isActive: true, ...o });
+  await Employee.collection.insertMany([
+    emp(P.never), emp(P.done, { employmentStatus: "Active" }), emp(P.started), emp(P.noDept), emp(P.hr),
+    { workspaceId: house, ownerId: P.employee, email: "hari@e" },            // legacy: no status / isActive
+    emp(P.inactive),                                                          // mirror says active, User is INACTIVE
+    emp(X.resigned), emp(X.terminated, { employmentStatus: "Terminated" }),
+    emp(X.empOff, { isActive: false }),
+    { workspaceId: TENANT, ownerId: TENANT_USER, email: "ivy@e", status: "ACTIVE", isActive: true }, // other workspace
   ] as any[]);
   await Department.collection.insertMany([
     { workspaceId: house, name: "Tech & Product" },
@@ -118,6 +153,7 @@ beforeAll(async () => {
     perm(P.employee, "L1", {}),                                                // nothing — defaults only
     perm(REPORTER, "L1", { trainingReports: { access: "READ", scope: "NONE" } }),
     perm(L8NOGRANT, "L8", { people: { access: "FULL", scope: "ALL" } }),
+    { ...perm(X.leader, "L1", {}), universe: "CUSTOMER", roleType: "CLIENT" }, // the customer access grant
     { ...perm(TENANT_USER, "L1", { trainingReports: { access: "READ", scope: "NONE" } }), workspaceId: TENANT.toHexString() },
   ] as any);
   // Written straight to the collection with no trainingReports path at all —
@@ -129,6 +165,10 @@ beforeAll(async () => {
     { userId: P.started, module: "crm", total: 63, maxSlide: 0, lastSlide: 0, completed: false, updatedAt: new Date("2026-09-23T06:00:00Z") },
     { userId: P.inactive, module: "crm", total: 63, maxSlide: 62, completed: true },
     { userId: P.never, module: "helloviza", total: 10, maxSlide: 3, completed: false }, // a "soon" module — must not surface
+    // Progress on non-employees — it would move the counts if they leaked in.
+    { userId: X.leader, module: "crm", total: 63, maxSlide: 62, completed: true, completedAt: new Date() },
+    { userId: X.stub, module: "crm", total: 63, maxSlide: 10, completed: false },
+    { userId: X.resigned, module: "crm", total: 63, maxSlide: 62, completed: true, completedAt: new Date() },
   ] as any[]);
 }, 120_000);
 afterAll(async () => {
@@ -199,13 +239,53 @@ describe("columns come from the registry — live modules only", () => {
 });
 
 describe("rows and departments", () => {
-  it("active HOUSE staff only — no inactive, customer or other-workspace users", async () => {
+  it("the People & Culture roster only — the fixture set yields exactly the 6 real employees", async () => {
     const r = await get("super");
     const ids = r.body.rows.map((x: any) => x.userId);
+    expect(ids.sort()).toEqual([P.never, P.done, P.started, P.noDept, P.hr, P.employee].map((x) => x.toHexString()).sort());
+    expect(r.body.counts.crm.total).toBe(6);
+  });
+
+  it("PII: a CUSTOMER workspace leader mis-scoped to HOUSE (WORKSPACE_LEADER, customer grant) is EXCLUDED — even with progress", async () => {
+    const leader: any = await User.findById(X.leader).lean();
+    expect(String(leader.workspaceId)).toBe(HOUSE);            // the mis-scope is real
+    expect(leader.roles).toEqual(["WORKSPACE_LEADER"]);        // …and not CUSTOMER, so a role $nin misses it
+    expect(await TrainingProgress.countDocuments({ userId: X.leader })).toBe(1);
+    const r = await get("super");
+    expect(r.body.rows.map((x: any) => x.userId)).not.toContain(X.leader.toHexString());
+    expect(JSON.stringify(r.body)).not.toContain(LEADER_EMAIL);
+    expect(JSON.stringify(r.body)).not.toContain("BAKER CO");
+  });
+
+  it("an onboarding stub (EMPLOYEE role, tempPassword, personal email, no Employee row) is EXCLUDED", async () => {
+    const r = await get("super");
+    expect(r.body.rows.map((x: any) => x.userId)).not.toContain(X.stub.toHexString());
+    expect(JSON.stringify(r.body)).not.toContain(STUB_EMAIL);
+  });
+
+  it("a test/seed login with no Employee row is EXCLUDED", async () => {
+    const r = await get("super");
+    expect(r.body.rows.map((x: any) => x.email)).not.toContain("e1@plumtrips.com");
+  });
+
+  it("Resigned / Terminated are EXCLUDED while their flags still say active (User- or Employee-side status)", async () => {
+    const ids = (await get("super")).body.rows.map((x: any) => x.userId);
+    expect(ids).not.toContain(X.resigned.toHexString());   // User.employmentStatus Resigned
+    expect(ids).not.toContain(X.terminated.toHexString()); // Employee.employmentStatus Terminated
+  });
+
+  it("inactive on either side is EXCLUDED: INACTIVE User, isActive:false Employee, CUSTOMER role, other workspace", async () => {
+    const ids = (await get("super")).body.rows.map((x: any) => x.userId);
     expect(ids).not.toContain(P.inactive.toHexString());
+    expect(ids).not.toContain(X.empOff.toHexString());
     expect(ids).not.toContain(P.customer.toHexString());
     expect(ids).not.toContain(TENANT_USER.toHexString());
-    expect(ids.sort()).toEqual([P.never, P.done, P.started, P.noDept, P.hr, P.employee].map((x) => x.toHexString()).sort());
+  });
+
+  it("a real employee (active Employee row + active User) is INCLUDED with correct progress — legacy unstamped row too", async () => {
+    const r = await get("super");
+    expect(rowOf(r.body, P.done).cells.crm).toMatchObject({ status: "completed", pct: 100 });
+    expect(rowOf(r.body, P.employee)).toMatchObject({ name: "Hari Employee", department: UNASSIGNED });
   });
 
   it("departments are normalised (spacing + casing from the Department list) and blanks bucket as Unassigned", async () => {
@@ -290,6 +370,31 @@ describe("the gate — the trainingReports capability (+ HOUSE), decoupled from 
 });
 
 describe("XLSX export", () => {
+  it("the full export carries only the real employees — no customer, stub, seed or ex-employee emails", async () => {
+    const res = await request(app)
+      .get("/api/training/report/export")
+      .set("x-test-user", "reporter")
+      .buffer(true)
+      .parse((r, cb) => {
+        const chunks: Buffer[] = [];
+        r.on("data", (c: Buffer) => chunks.push(c));
+        r.on("end", () => cb(null, Buffer.concat(chunks)));
+      });
+    expect(res.status).toBe(200);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(res.body as any);
+    const grid = wb.getWorksheet("Progress")!;
+    const emails: string[] = [];
+    for (let n = 2; n <= grid.rowCount; n++) emails.push(String((grid.getRow(n).values as any[])[2]));
+    expect(emails.sort()).toEqual(["asha@plumtrips.com", "bala@plumtrips.com", "chitra@plumtrips.com", "dev@plumtrips.com", "gita@plumtrips.com", "hari@plumtrips.com"]);
+    const all: string[] = [];
+    wb.eachSheet((ws) => ws.eachRow((row) => all.push(JSON.stringify(row.values))));
+    const dump = all.join("\n");
+    for (const leak of [LEADER_EMAIL, STUB_EMAIL, "e1@plumtrips.com", "ravi@plumtrips.com", "tara@plumtrips.com", "omar@plumtrips.com"]) {
+      expect(dump).not.toContain(leak);
+    }
+  });
+
   it("carries the grid (status + % per live module) and the summary", async () => {
     const res = await request(app)
       .get("/api/training/report/export?department=Tech%20%26%20Product")

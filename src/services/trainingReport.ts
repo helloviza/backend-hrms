@@ -8,9 +8,15 @@
 // no row for a module is "not_started" — they are exactly who the report is
 // for, so they must appear rather than drop out of a join.
 //
-// Rows = active HOUSE staff: User in the HOUSE workspace, active by the
-// canonical User.status rule (utils/userActiveStatus), minus non-staff
-// accounts that live there (customers, the intake system user, vendors).
+// Rows = the People & Culture roster, not "every login in HOUSE": active
+// Employee rows in the HOUSE workspace (activeEmployeeFilter — the filter
+// GET /api/employees and the org chart use) → Employee.ownerId → a User that
+// is also active (activeUserFilter; progress keys by User._id). Anyone whose
+// employment status is Resigned/Terminated is left out even while the flags
+// still say active. A User with no Employee row — onboarding stubs that never
+// joined, test/seed logins, customer workspace leaders mis-scoped to HOUSE —
+// is not an employee and never appears (their emails must not reach this
+// report or its export).
 // Department = User.department — on the same User._id the progress is keyed
 // by — normalised; blank → "Unassigned". Casing is taken from the workspace's
 // Department list when the text matches one, so "tech & product" and
@@ -19,14 +25,14 @@ import mongoose from "mongoose";
 import User from "../models/User.js";
 import TrainingProgress from "../models/TrainingProgress.js";
 import Department from "../models/Department.js";
-import { activeUserFilter } from "../utils/userActiveStatus.js";
+import Employee from "../models/Employee.js";
+import { activeEmployeeFilter, activeUserFilter, isTerminalEmploymentStatus } from "../utils/userActiveStatus.js";
 import { liveTrainingModules, type TrainingModule } from "./trainingModules.js";
 
 // HOUSE (Plumtrips internal) workspace — per-file literal, the repo convention
 // (see middleware/requireHouse.ts). Training is HOUSE-only.
 export const HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
 export const UNASSIGNED = "Unassigned";
-const NON_STAFF_ROLES = ["CUSTOMER", "SYSTEM_INTAKE", "VENDOR"];
 
 export type CellStatus = "not_started" | "in_progress" | "completed";
 
@@ -98,14 +104,36 @@ function displayName(u: any): string {
   return squash(u.name) || full || String(u.email || "—");
 }
 
+/**
+ * The real HOUSE employees, as Users. Employee.employmentStatus is not in the
+ * Employee schema (strictQuery would silently drop a filter on it), so the
+ * terminal check runs here on the loaded rows — on both the Employee row and
+ * the User, the same two places GET /api/employees reads it from.
+ */
+async function houseEmployeeUsers(house: mongoose.Types.ObjectId): Promise<any[]> {
+  const employees = (await Employee.find({ workspaceId: house, ...activeEmployeeFilter() })
+    .select("ownerId employmentStatus")
+    .lean()) as any[];
+  const ownerIds = [
+    ...new Set(
+      employees
+        .filter((e) => e.ownerId && !isTerminalEmploymentStatus(e.employmentStatus))
+        .map((e) => String(e.ownerId)),
+    ),
+  ].map((id) => new mongoose.Types.ObjectId(id));
+  if (!ownerIds.length) return [];
+  const users = (await User.find({ _id: { $in: ownerIds }, workspaceId: house, ...activeUserFilter() })
+    .select("_id name firstName lastName email department employmentStatus")
+    .lean()) as any[];
+  return users.filter((u) => !isTerminalEmploymentStatus(u.employmentStatus));
+}
+
 export async function buildTrainingReport(opts: { departments?: string[]; hubFile?: string } = {}): Promise<TrainingReport> {
   const modules = (opts.hubFile ? liveTrainingModules(opts.hubFile) : liveTrainingModules()).map(({ id, title, total }) => ({ id, title, total }));
   const house = new mongoose.Types.ObjectId(HOUSE_WORKSPACE_ID);
 
   const [users, deptDocs] = await Promise.all([
-    User.find({ workspaceId: house, ...activeUserFilter(), roles: { $nin: NON_STAFF_ROLES } })
-      .select("_id name firstName lastName email department")
-      .lean(),
+    houseEmployeeUsers(house),
     Department.find({ workspaceId: house }).select("name").lean(),
   ]);
   const canonical = new Map<string, string>((deptDocs as any[]).map((d) => [squash(d.name).toLowerCase(), squash(d.name)]));
