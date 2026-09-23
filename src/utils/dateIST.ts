@@ -52,3 +52,39 @@ export function addDaysIST(dateStr: string, deltaDays: number): string {
   d.setUTCDate(d.getUTCDate() + deltaDays);
   return istDateString(d);
 }
+
+/* ── Range bounds from a query param ──────────────────────────────────────
+ *
+ * Report/export filters take dateFrom/dateTo in two shapes: "YYYY-MM-DD"
+ * (the date inputs — the API contract above: an IST day) and a full ISO
+ * timestamp (dashboards that pre-compute browser-local midnight). Either way
+ * the bound means a WHOLE IST calendar day: the day the string names, or the
+ * IST day containing the instant. `new Date(x).setHours(0,0,0,0)` did this
+ * on the server's UTC day instead, so a filtered day lost its 00:00–05:30
+ * IST rows to the day before. Unparseable input → null (no bound), as before.
+ */
+const YMD = /^\d{4}-\d{2}-\d{2}$/;
+
+function istDayOfParam(raw: unknown): string | null {
+  if (raw == null || raw === "") return null;
+  const s = String(raw).trim();
+  // Round-trip, so an impossible day ("2026-02-31") is refused, not rolled into March.
+  if (YMD.test(s)) {
+    const start = parseISTStart(s);
+    return !isNaN(start.getTime()) && istDateString(start) === s ? s : null;
+  }
+  const at = new Date(s);
+  return isNaN(at.getTime()) ? null : istDateString(at);
+}
+
+/** 00:00:00.000 IST of the day a dateFrom param names, or null. */
+export function istRangeStart(raw: unknown): Date | null {
+  const day = istDayOfParam(raw);
+  return day ? parseISTStart(day) : null;
+}
+
+/** 23:59:59.999 IST of the day a dateTo param names, or null. */
+export function istRangeEnd(raw: unknown): Date | null {
+  const day = istDayOfParam(raw);
+  return day ? parseISTEnd(day) : null;
+}

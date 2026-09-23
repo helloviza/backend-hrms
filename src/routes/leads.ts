@@ -28,6 +28,7 @@ import { leadScope, leadMatch, opportunityMatch, activityMatch, ownsLead, canMan
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import { createLead } from "../services/leads.service.js";
 import logger from "../utils/logger.js";
+import { istDateString, istRangeStart, istRangeEnd } from "../utils/dateIST.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 
 const router = express.Router();
@@ -147,11 +148,14 @@ function checkRateLimit(ip: string): boolean {
 
 // ── Date formatter ──────────────────────────────────────────────
 
+// DD/MM/YYYY of the IST calendar day — the server runs UTC, so the process-local
+// getDate() put anything stamped 00:00–05:30 IST on the day before.
 function fmtDate(d: Date | null | undefined): string {
   if (!d) return "";
   const dt = new Date(d as any);
   if (isNaN(dt.getTime())) return "";
-  return `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
+  const [y, m, day] = istDateString(dt).split("-");
+  return `${day}/${m}/${y}`;
 }
 
 // ── Shared export filter resolver ───────────────────────────────
@@ -182,12 +186,9 @@ async function resolveExportLeads(
   const sourceF = toArr(q.source);
   const typeF = toArr(q.type).filter((s) => s === "company" || s === "individual");
 
-  const dateFrom = q.dateFrom ? new Date(String(q.dateFrom)) : null;
-  const dateTo = q.dateTo ? new Date(String(q.dateTo)) : null;
-  if (dateFrom && !isNaN(dateFrom.getTime())) dateFrom.setHours(0, 0, 0, 0);
-  if (dateTo && !isNaN(dateTo.getTime())) dateTo.setHours(23, 59, 59, 999);
-  const fromMs = dateFrom && !isNaN(dateFrom.getTime()) ? dateFrom.getTime() : null;
-  const toMs = dateTo && !isNaN(dateTo.getTime()) ? dateTo.getTime() : null;
+  // Whole IST days (utils/dateIST), not the server's UTC day.
+  const fromMs = istRangeStart(q.dateFrom)?.getTime() ?? null;
+  const toMs = istRangeEnd(q.dateTo)?.getTime() ?? null;
   const byActivity = String(q.dateBasis || "") === "last_activity";
 
   // Scope wins over any assignedTo param (services/crmScope).
@@ -1554,10 +1555,9 @@ router.get("/reports/owner-status", async (req, res) => {
     const stageF = toArr(q.stage).filter((s) => (LEAD_STAGES as readonly string[]).includes(s));
     const sourceF = toArr(q.source);
     const typeF = toArr(q.type).filter((s) => s === "company" || s === "individual");
-    const dateFrom = q.dateFrom ? new Date(String(q.dateFrom)) : null;
-    const dateTo = q.dateTo ? new Date(String(q.dateTo)) : null;
-    if (dateFrom && !isNaN(dateFrom.getTime())) dateFrom.setHours(0, 0, 0, 0);
-    if (dateTo && !isNaN(dateTo.getTime())) dateTo.setHours(23, 59, 59, 999);
+    // Whole IST days (utils/dateIST), not the server's UTC day.
+    const dateFrom = istRangeStart(q.dateFrom);
+    const dateTo = istRangeEnd(q.dateTo);
     const report = await buildOwnerStatusReport(
       { assignedTo: assignedToF, stage: stageF, source: sourceF, type: typeF, dateFrom, dateTo },
       { vocabulary: "legacy" },
@@ -1655,17 +1655,16 @@ router.get("/export/activities", async (req, res) => {
       const scopedLeads = await resolveExportLeads(req, { ignoreDateFilter: true });
       const scopedIds = scopedLeads.map((l) => l._id);
 
-      // Date range applied to each activity's own createdAt.
-      const aFrom = q.dateFrom ? new Date(String(q.dateFrom)) : null;
-      const aTo = q.dateTo ? new Date(String(q.dateTo)) : null;
-      if (aFrom && !isNaN(aFrom.getTime())) aFrom.setHours(0, 0, 0, 0);
-      if (aTo && !isNaN(aTo.getTime())) aTo.setHours(23, 59, 59, 999);
+      // Date range applied to each activity's own createdAt — whole IST days
+      // (utils/dateIST), not the server's UTC day.
+      const aFrom = istRangeStart(q.dateFrom);
+      const aTo = istRangeEnd(q.dateTo);
 
       const actFilter: AnyObj = { leadId: { $in: scopedIds } };
-      if ((aFrom && !isNaN(aFrom.getTime())) || (aTo && !isNaN(aTo.getTime()))) {
+      if (aFrom || aTo) {
         actFilter.createdAt = {};
-        if (aFrom && !isNaN(aFrom.getTime())) actFilter.createdAt.$gte = aFrom;
-        if (aTo && !isNaN(aTo.getTime())) actFilter.createdAt.$lte = aTo;
+        if (aFrom) actFilter.createdAt.$gte = aFrom;
+        if (aTo) actFilter.createdAt.$lte = aTo;
       }
 
       activities = scopedIds.length
@@ -1745,6 +1744,7 @@ router.get("/export/activities", async (req, res) => {
           ? new Date(activity.createdAt).toLocaleString("en-IN", {
               day: "2-digit", month: "short", year: "numeric",
               hour: "2-digit", minute: "2-digit",
+              timeZone: "Asia/Kolkata", // server runs UTC; users (and the on-screen timeline) are IST
             })
           : "—",
       });
