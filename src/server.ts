@@ -127,7 +127,9 @@ import crmCompaniesRouter from "./routes/crm.companies.js";
 import crmContactsRouter from "./routes/crm.contacts.js";
 import trainingRouter from "./routes/training.js";
 import trainingProgressRouter from "./routes/trainingProgress.js";
+import trainingReportRouter from "./routes/trainingReport.js";
 import { requireHouse } from "./middleware/requireHouse.js";
+import { requirePermission } from "./middleware/requirePermission.js";
 import opportunitiesRouter from "./routes/opportunities.js";
 
 // ✅ Shared location service — boot-time assertion of the trust-proxy assumption
@@ -1127,6 +1129,9 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // Progress (routes/trainingProgress.ts) is mounted first: the learner's own
   // per-module row, same HOUSE-only gate chain.
   app.use("/api/training/progress", requireAuth, requireWorkspace, requireHouse, trainingProgressRouter);
+  // The org-wide completion report (routes/trainingReport.ts): org-wide people
+  // data, so HOUSE AND the HR/leadership `people` key — not `reports`.
+  app.use("/api/training/report", requireAuth, requireWorkspace, requireHouse, requirePermission("people", "READ"), trainingReportRouter);
   app.use("/api/training", requireAuth, requireWorkspace, requireHouse, trainingRouter);
   app.use("/api/opportunities", requireAuth, requireWorkspace, requireFeature("crmEnabled"), opportunitiesRouter);
 }
