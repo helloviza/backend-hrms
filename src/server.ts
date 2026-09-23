@@ -126,6 +126,7 @@ import plumconnectRouter from "./routes/plumconnect.js";
 import crmCompaniesRouter from "./routes/crm.companies.js";
 import crmContactsRouter from "./routes/crm.contacts.js";
 import trainingRouter from "./routes/training.js";
+import trainingProgressRouter from "./routes/trainingProgress.js";
 import { requireHouse } from "./middleware/requireHouse.js";
 import opportunitiesRouter from "./routes/opportunities.js";
 
@@ -1123,6 +1124,9 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/crm/companies", requireAuth, requireWorkspace, requireFeature("crmEnabled"), crmCompaniesRouter);
   app.use("/api/crm/contacts", requireAuth, requireWorkspace, requireFeature("crmEnabled"), crmContactsRouter);
   // Plumtrips Learning Hub — internal training HTML, HOUSE staff only (routes/training.ts).
+  // Progress (routes/trainingProgress.ts) is mounted first: the learner's own
+  // per-module row, same HOUSE-only gate chain.
+  app.use("/api/training/progress", requireAuth, requireWorkspace, requireHouse, trainingProgressRouter);
   app.use("/api/training", requireAuth, requireWorkspace, requireHouse, trainingRouter);
   app.use("/api/opportunities", requireAuth, requireWorkspace, requireFeature("crmEnabled"), opportunitiesRouter);
 }

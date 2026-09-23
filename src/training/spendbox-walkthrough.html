@@ -157,7 +157,10 @@ html.embedded #bar{padding-right:104px} /* in-app: clear the floating chat bubbl
 </nav>
 <script>
 /* ── Plumtrips Learning · shared progress storage ─────────────────────
-   KEEP IDENTICAL in learning-hub.html and every deck. localStorage only.
+   KEEP IDENTICAL in learning-hub.html and every deck (and the build-deck.mjs generators;
+   routes/trainingProgress.sharedBlock.test.ts checks). Saved to localStorage; when embedded
+   in the app, write() also posts {type:'pt-progress',module,record} to the host page, which
+   saves it to the learner's account (LearningHub.tsx → PUT /api/training/progress/:module).
    Keys:  plumtrips.learning.learner.name / learner.uid   → "Priya Sharma" / app user id (embedded)
           plumtrips.learning.progress.<uid-or-name-slug>.<module> → {module,total,maxSlide,lastSlide,viewed,completed,startedAt,updatedAt,completedAt}
    All files must live in the SAME folder: on file:// the browser scopes
@@ -178,7 +181,7 @@ var PT=(function(){var NS='plumtrips.learning.';
   return{slug:slug,embedded:embedded,
     getName:function(){return get('learner.name')||''},setName:function(n){set('learner.name',String(n).trim());set('learner.uid',null)},
     learnerKey:function(){return get('learner.uid')||slug(this.getName())},
-    key:function(mod){return 'progress.'+this.learnerKey()+'.'+mod},read:function(mod){return get(this.key(mod))},write:function(mod,p){set(this.key(mod),p)},
+    key:function(mod){return 'progress.'+this.learnerKey()+'.'+mod},read:function(mod){return get(this.key(mod))},write:function(mod,p){set(this.key(mod),p);if(embedded){try{window.parent.postMessage({type:'pt-progress',module:mod,record:p},location.origin)}catch(e){}}},
     pct:function(p){if(!p||!p.total)return 0;if(p.completed)return 100;return Math.min(99,Math.round((p.maxSlide+1)/p.total*100))},
     initials:function(n){return String(n||'').trim().split(/ +/).slice(0,2).map(function(w){return w.charAt(0).toUpperCase()}).join('')||'?'},
     /* In-app navigation: the host page listens for this and routes with react-router. */

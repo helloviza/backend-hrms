@@ -93,7 +93,7 @@ a.path:hover .chip.open{background:var(--navy-dark)}
   <div class="brand"><span class="dot"></span>Plumtrips Learning Hub</div>
   <div class="kicker">Training · self-paced</div>
   <h1 id="greet">Welcome</h1>
-  <p class="lead">Short, screenshot-driven walkthroughs of the Plumtrips platform. Open a path, click through at your own pace — your progress is saved on this computer and you can resume any time.</p>
+  <p class="lead">Short, screenshot-driven walkthroughs of the Plumtrips platform. Open a path, click through at your own pace — your progress is saved to your Plumtrips account (and on this computer) so you can resume any time.</p>
   <div class="who" id="who"></div>
 </div></header>
 
@@ -106,14 +106,17 @@ a.path:hover .chip.open{background:var(--navy-dark)}
 <main>
   <div class="sechead"><h2>Learning paths</h2><span id="pathCount"></span></div>
   <div class="paths" id="paths"></div>
-  <p class="foot" id="foot">Progress is stored in this browser's localStorage — nothing is sent anywhere. New paths are added by registering them in <code>PATHS</code> in this file and dropping the deck file alongside (in-app: also map the route in <code>pages/learning/LearningHub.tsx</code>).</p>
+  <p class="foot" id="foot">Progress is stored in this browser's localStorage and, inside the Plumtrips app, saved to your account so your training record follows you. Opened as a standalone file, nothing is sent anywhere. New paths are added by registering them in <code>PATHS</code> in this file and dropping the deck file alongside (in-app: also map the route in <code>pages/learning/LearningHub.tsx</code>).</p>
 </main>
 
 <div id="nameveil" role="dialog" aria-modal="true" aria-labelledby="nameh"><div id="namebox"><div class="k">Plumtrips Learning</div><h3 id="nameh">Welcome — what's your name?</h3><p>We'll greet you by it and keep your training progress on this computer under your name. No login needed.</p><input id="nameinput" type="text" placeholder="e.g. Priya Sharma" autocomplete="name" maxlength="60"><div class="err" id="nameerr"></div><div class="row"><button class="ghost" id="namecancel" hidden>Cancel</button><button id="namego">Continue →</button></div></div></div>
 
 <script>
 /* ── Plumtrips Learning · shared progress storage ─────────────────────
-   KEEP IDENTICAL in learning-hub.html and every deck. localStorage only.
+   KEEP IDENTICAL in learning-hub.html and every deck (and the build-deck.mjs generators;
+   routes/trainingProgress.sharedBlock.test.ts checks). Saved to localStorage; when embedded
+   in the app, write() also posts {type:'pt-progress',module,record} to the host page, which
+   saves it to the learner's account (LearningHub.tsx → PUT /api/training/progress/:module).
    Keys:  plumtrips.learning.learner.name / learner.uid   → "Priya Sharma" / app user id (embedded)
           plumtrips.learning.progress.<uid-or-name-slug>.<module> → {module,total,maxSlide,lastSlide,viewed,completed,startedAt,updatedAt,completedAt}
    All files must live in the SAME folder: on file:// the browser scopes
@@ -134,7 +137,7 @@ var PT=(function(){var NS='plumtrips.learning.';
   return{slug:slug,embedded:embedded,
     getName:function(){return get('learner.name')||''},setName:function(n){set('learner.name',String(n).trim());set('learner.uid',null)},
     learnerKey:function(){return get('learner.uid')||slug(this.getName())},
-    key:function(mod){return 'progress.'+this.learnerKey()+'.'+mod},read:function(mod){return get(this.key(mod))},write:function(mod,p){set(this.key(mod),p)},
+    key:function(mod){return 'progress.'+this.learnerKey()+'.'+mod},read:function(mod){return get(this.key(mod))},write:function(mod,p){set(this.key(mod),p);if(embedded){try{window.parent.postMessage({type:'pt-progress',module:mod,record:p},location.origin)}catch(e){}}},
     pct:function(p){if(!p||!p.total)return 0;if(p.completed)return 100;return Math.min(99,Math.round((p.maxSlide+1)/p.total*100))},
     initials:function(n){return String(n||'').trim().split(/ +/).slice(0,2).map(function(w){return w.charAt(0).toUpperCase()}).join('')||'?'},
     /* In-app navigation: the host page listens for this and routes with react-router. */
@@ -162,11 +165,17 @@ var PATHS=[
 (function(){
   var esc=function(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')};
   function fmtWhen(iso){if(!iso)return'';var d=new Date(iso);if(isNaN(d))return'';var diff=(Date.now()-d.getTime())/864e5;if(diff<1)return'today';if(diff<2)return'yesterday';if(diff<7)return Math.floor(diff)+' days ago';return d.toLocaleDateString('en-IN',{day:'numeric',month:'short'})}
+  /* Last "sync this browser" result — kept outside render(), which re-runs on storage/focus. */
+  var syncNote='';
   function render(){
     var name=PT.getName();
     document.getElementById('greet').textContent=name?'Welcome, '+name.split(/\s+/)[0]:'Welcome';
-    document.getElementById('who').innerHTML=name?(PT.embedded?'Progress is saved on this device for <b>'+esc(name)+'</b>':'Signed in as <b>'+esc(name)+'</b> on this computer · <button id="changeName">not you? change name</button>'):'';
+    document.getElementById('who').innerHTML=name?(PT.embedded?'Progress is saved to your Plumtrips account for <b>'+esc(name)+'</b> · <button id="syncBtn" title="Upload progress saved earlier in this browser to your account">Sync this browser&#39;s progress</button>'+(syncNote?'<span> · '+esc(syncNote)+'</span>':''):'Signed in as <b>'+esc(name)+'</b> on this computer · <button id="changeName">not you? change name</button>'):'';
     var el=document.getElementById('changeName');if(el)el.onclick=function(){openName(true)};
+    /* One-time catch-up: the host app reads this browser's saved records for the signed-in
+       learner and uploads them (LearningHub.tsx, pt-sync). Safe to repeat — the server
+       never moves progress backwards or un-completes a module. */
+    var sb=document.getElementById('syncBtn');if(sb)sb.onclick=function(){syncNote='syncing…';render();try{window.parent.postMessage({type:'pt-sync'},location.origin)}catch(e){syncNote='sync unavailable';render()}};
     var live=0,done=0,prog=0,sum=0,rows='';
     PATHS.forEach(function(p){
       var rec=p.status==='live'?PT.read(p.id):null;var pct=PT.pct(rec);
@@ -199,6 +208,8 @@ var PATHS=[
   function submitName(){var v=ni.value.trim();if(v.length<2){document.getElementById('nameerr').textContent='Please enter your name (at least 2 letters).';ni.focus();return}PT.setName(v);nv.classList.remove('on');render()}
   document.getElementById('namego').onclick=submitName;cancel.onclick=function(){nv.classList.remove('on')};
   ni.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();submitName()}if(e.key==='Escape'&&!cancel.hidden)cancel.onclick()});
+  window.addEventListener('message',function(e){var d=e.data;if(e.origin!==location.origin||!d||d.type!=='pt-sync-done')return;
+    syncNote=d.failed?'synced '+d.synced+', '+d.failed+' failed — try again':d.synced?'synced '+d.synced+' module'+(d.synced===1?'':'s'):'nothing to sync in this browser';render()});
   window.addEventListener('storage',render);window.addEventListener('focus',render);window.addEventListener('pageshow',render);
   if(PT.getName()||PT.embedded){render()}else{render();openName(false)}
   /* Embedded: a path chip routes inside the app (/learning/<id>) instead of loading the deck into this frame. */
