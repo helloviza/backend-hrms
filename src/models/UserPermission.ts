@@ -208,6 +208,22 @@ export interface UserPermissionDoc extends Document {
      * READ is the whole grant; there is no write path behind this key.
      */
     travellerIdentityPII: ModulePermission
+    /**
+     * trainingReports — the authority to SEE the org-wide Learning Hub
+     * progress report (GET /api/training/report + /export,
+     * routes/trainingReport.ts): every staff member's training status.
+     *
+     * A sibling on the consumerContactPII / travellerIdentityPII precedent,
+     * deliberately NOT tied to `people`: the report is visible only to
+     * whoever an admin explicitly grants it to in the Access Console,
+     * whatever their HR access. HOUSE-only at the route (training is
+     * HOUSE-only); SUPERADMIN bypasses, as everywhere.
+     *
+     * Granted to NO level template — per-user, so a level change can
+     * neither confer nor revoke it, and off-boarding must revoke it
+     * explicitly. READ is the whole grant; there is no write path.
+     */
+    trainingReports: ModulePermission
   }
 
   grantedBy: string
@@ -291,6 +307,7 @@ const modulesSchema = new Schema(
     visaScreening: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     consumerContactPII: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     travellerIdentityPII: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    trainingReports: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
   },
   { _id: false }
 )

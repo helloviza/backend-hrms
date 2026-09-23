@@ -72,6 +72,10 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   // Client Travellers viewer and the booking-form picker live behind
   // sbtEnabled with manual bookings), so it follows that flag, not visa's.
   travellerIdentityPII: ["sbtEnabled"],
+  // trainingReports is deliberately UNMAPPED (no feature flag): the training
+  // surfaces gate on requireHouse alone, with no workspace feature, so the
+  // report does too. Unmapped = grantable everywhere; a grant outside HOUSE
+  // opens nothing because the route is HOUSE-only.
 };
 
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";

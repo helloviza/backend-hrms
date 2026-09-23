@@ -1,7 +1,8 @@
 // GET /api/training/report (+ /export) — the org-wide Learning Hub progress
-// report. Real Mongo (memory server), the real router, the REAL requireHouse
-// and the REAL requirePermission("people","READ"); only authentication is
-// stubbed (x-test-user picks the session). Pins:
+// report. Real Mongo (memory server), the real router with its REAL
+// trainingReports capability gate, and the REAL requireHouse — mounted exactly
+// as server.ts does; only authentication is stubbed (x-test-user picks the
+// session). Pins:
 //   • a person with NO progress row appears, Not started, in every module
 //   • completed / in progress / % derive from real rows
 //   • columns = LIVE registry modules only (the real hub file; plus a fixture
@@ -9,7 +10,9 @@
 //   • department filter, normalisation and the Unassigned bucket
 //   • per-module counts + completion rate
 //   • row population: active HOUSE staff only
-//   • the gate: people:READ + HOUSE (employee 403, tenant 403, HR 200, SUPERADMIN 200)
+//   • the gate: the per-person trainingReports capability + HOUSE — decoupled
+//     from HR: people:READ without the grant is 403; NONE by default; no level
+//     template confers it; SUPERADMIN bypasses; export behind the same gate
 //   • the XLSX export carries the grid
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
@@ -33,7 +36,7 @@ const { default: Department } = await import("../models/Department.js");
 const { UserPermission } = await import("../models/UserPermission.js");
 const { default: trainingReportRouter } = await import("./trainingReport.js");
 const { requireHouse } = await import("../middleware/requireHouse.js");
-const { requirePermission } = await import("../middleware/requirePermission.js");
+const { LEVEL_TEMPLATES } = await import("../config/levelTemplates.js");
 const { buildTrainingReport, normalizeDepartment, cellFor, UNASSIGNED } = await import("../services/trainingReport.js");
 const { parsePathsRegistry, HUB_FILE } = await import("../services/trainingModules.js");
 
@@ -49,14 +52,22 @@ const P = {
   noDept: oid(),    // blank department → Unassigned
   inactive: oid(),  // INACTIVE — must not appear
   customer: oid(),  // a CUSTOMER account in the HOUSE workspace — not staff
-  hr: oid(),        // HR with people:READ — the report's reader
-  employee: oid(),  // ordinary employee, people:NONE
+  hr: oid(),        // HR with people:READ but NO trainingReports — must be refused
+  employee: oid(),  // ordinary employee, nothing granted
 };
+// Permission-only sessions (no User row, so the report's rows are unchanged).
+const REPORTER = oid();  // granted trainingReports:READ — the report's reader
+const RAWPERM = oid();   // permission doc written without the key at all
+const L8NOGRANT = oid(); // top level, not SUPERADMIN, no grant
 const TENANT_USER = oid();
 
 const SESSIONS: Record<string, any> = {
   super: { id: oid().toHexString(), roles: ["SUPERADMIN"], workspaceId: HOUSE },
   hr: { id: P.hr.toHexString(), roles: ["HR"], workspaceId: HOUSE },
+  reporter: { id: REPORTER.toHexString(), roles: ["EMPLOYEE"], workspaceId: HOUSE },
+  rawperm: { id: RAWPERM.toHexString(), roles: ["EMPLOYEE"], workspaceId: HOUSE },
+  l8: { id: L8NOGRANT.toHexString(), roles: ["ADMIN"], workspaceId: HOUSE },
+  tenantgranted: { id: TENANT_USER.toHexString(), roles: ["EMPLOYEE"], workspaceId: TENANT.toHexString() },
   employee: { id: P.employee.toHexString(), roles: ["EMPLOYEE"], workspaceId: HOUSE },
   noperm: { id: P.never.toHexString(), roles: ["EMPLOYEE"], workspaceId: HOUSE },
   tenant: { id: TENANT_USER.toHexString(), roles: ["HR"], workspaceId: TENANT.toHexString() },
@@ -72,7 +83,6 @@ app.use(
     next();
   },
   requireHouse,
-  requirePermission("people", "READ"),
   trainingReportRouter,
 );
 const get = (who: string, qs = "") => request(app).get(`/api/training/report${qs}`).set("x-test-user", who);
@@ -99,11 +109,20 @@ beforeAll(async () => {
     { workspaceId: house, name: "Ops & Service Delivery" },
     { workspaceId: house, name: "People & Culture" },
   ] as any[]);
-  const perm = (userId: mongoose.Types.ObjectId, access: string) => ({
+  const perm = (userId: mongoose.Types.ObjectId, level: string, modules: Record<string, any>) => ({
     userId: userId.toHexString(), email: `${userId}@x`, workspaceId: HOUSE, universe: "STAFF",
-    level: { code: access === "NONE" ? "L1" : "L5", name: "x" }, modules: { people: { access, scope: "ALL" } }, grantedBy: "test",
+    level: { code: level, name: "x" }, modules, grantedBy: "test",
   });
-  await UserPermission.create([perm(P.hr, "READ"), perm(P.employee, "NONE")] as any);
+  await UserPermission.create([
+    perm(P.hr, "L5", { people: { access: "READ", scope: "ALL" } }),           // HR access, no report grant
+    perm(P.employee, "L1", {}),                                                // nothing — defaults only
+    perm(REPORTER, "L1", { trainingReports: { access: "READ", scope: "NONE" } }),
+    perm(L8NOGRANT, "L8", { people: { access: "FULL", scope: "ALL" } }),
+    { ...perm(TENANT_USER, "L1", { trainingReports: { access: "READ", scope: "NONE" } }), workspaceId: TENANT.toHexString() },
+  ] as any);
+  // Written straight to the collection with no trainingReports path at all —
+  // how every pre-existing prod row looks until something saves it.
+  await UserPermission.collection.insertOne({ userId: RAWPERM.toHexString(), email: "raw@x", workspaceId: HOUSE, status: "active", level: { code: "L1" }, modules: { people: { access: "READ", scope: "ALL" } } } as any);
   await TrainingProgress.collection.insertMany([
     { userId: P.done, module: "crm", total: 63, maxSlide: 62, lastSlide: 62, completed: true, completedAt: new Date("2026-09-20T06:00:00Z"), updatedAt: new Date("2026-09-20T06:00:00Z") },
     { userId: P.done, module: "expense", total: 133, maxSlide: 65, lastSlide: 65, completed: false, updatedAt: new Date("2026-09-22T06:00:00Z") },
@@ -223,26 +242,50 @@ describe("per-module counts", () => {
   });
 });
 
-describe("the gate — HOUSE + people:READ", () => {
-  it("HR with people:READ gets the report", async () => {
-    expect((await get("hr")).status).toBe(200);
+describe("the gate — the trainingReports capability (+ HOUSE), decoupled from HR", () => {
+  it("a holder of trainingReports:READ gets the report", async () => {
+    const r = await get("reporter");
+    expect(r.status).toBe(200);
+    expect(r.body.rows.length).toBeGreaterThan(0);
   });
-  it("SUPERADMIN gets the report", async () => {
+  it("SUPERADMIN gets it without any grant (bypass)", async () => {
     expect((await get("super")).status).toBe(200);
   });
-  it("an ordinary employee with people:NONE is refused", async () => {
-    const r = await get("employee");
+  it("HR with people:READ but WITHOUT trainingReports is refused — HR access confers nothing here", async () => {
+    const r = await get("hr");
     expect(r.status).toBe(403);
+    expect(r.body).toMatchObject({ module: "trainingReports", required: "READ" });
     expect(r.body.rows).toBeUndefined();
   });
-  it("an employee with no permission record at all is refused", async () => {
+  it("a top-level (L8) admin who is not SUPERADMIN and has no grant is refused — no level or tier confers it", async () => {
+    expect((await get("l8")).status).toBe(403);
+  });
+  it("NONE by default: a permission saved through the model defaults the key to NONE → 403", async () => {
+    const doc: any = await UserPermission.findOne({ userId: P.employee.toHexString() }).lean();
+    expect(doc.modules.trainingReports).toEqual({ access: "NONE", scope: "NONE" });
+    expect((await get("employee")).status).toBe(403);
+  });
+  it("a legacy permission row with no trainingReports path at all is NONE → 403", async () => {
+    const raw: any = await UserPermission.collection.findOne({ userId: RAWPERM.toHexString() });
+    expect(raw.modules.trainingReports).toBeUndefined();
+    expect((await get("rawperm")).status).toBe(403);
+  });
+  it("no permission row at all → 403", async () => {
     expect((await get("noperm")).status).toBe(403);
   });
-  it("a tenant user is refused even with an HR role", async () => {
+  it("a tenant user is refused even WITH the grant — the report is HOUSE-only", async () => {
+    expect((await get("tenantgranted")).status).toBe(403);
     expect((await get("tenant")).status).toBe(403);
   });
   it("the export is behind the same gate", async () => {
+    expect((await get("hr", "/export")).status).toBe(403);
     expect((await get("employee", "/export")).status).toBe(403);
+    expect((await get("reporter", "/export")).status).toBe(200);
+  });
+  it("no level template grants trainingReports — per-user only", () => {
+    const levels = Object.keys(LEVEL_TEMPLATES);
+    expect(levels.length).toBeGreaterThanOrEqual(8);
+    for (const l of levels) expect((LEVEL_TEMPLATES as any)[l].trainingReports, l).toEqual({ access: "NONE", scope: "NONE" });
   });
 });
 
@@ -250,7 +293,7 @@ describe("XLSX export", () => {
   it("carries the grid (status + % per live module) and the summary", async () => {
     const res = await request(app)
       .get("/api/training/report/export?department=Tech%20%26%20Product")
-      .set("x-test-user", "hr")
+      .set("x-test-user", "reporter")
       .buffer(true)
       .parse((r, cb) => {
         const chunks: Buffer[] = [];

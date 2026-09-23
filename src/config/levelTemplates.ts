@@ -96,6 +96,11 @@ type ModulesTemplate = {
   // Traveller identity-document unmask (passport/visa numbers on ops surfaces).
   // NONE everywhere, per-user only — same posture as the two above.
   travellerIdentityPII: ModulePermission
+  // Learning Hub training-progress report (2026-09-24) — org-wide completion
+  // data, visible ONLY to whoever an admin grants it to, independent of
+  // HR/people access. NONE everywhere, per-user only — same posture as the
+  // three above; off-boarding revokes it explicitly.
+  trainingReports: ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -149,6 +154,7 @@ const L1: ModulesTemplate = {
   visaScreening:     NONE,
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
+  trainingReports: NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -237,6 +243,7 @@ const L6: ModulesTemplate = {
   visaScreening:     NONE,
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
+  trainingReports: NONE,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -255,6 +262,7 @@ const L7: ModulesTemplate = {
   visaScreening:   NONE,
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
+  trainingReports: NONE,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -308,6 +316,7 @@ const L8: ModulesTemplate = {
   visaScreening:     NONE,
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
+  trainingReports: NONE,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -361,6 +370,7 @@ const VENDOR: ModulesTemplate = {
   visaScreening:     NONE,
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
+  trainingReports: NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -414,6 +424,7 @@ const CUSTOMER_SBT: ModulesTemplate = {
   visaScreening:     NONE,
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
+  trainingReports: NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -467,6 +478,7 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   visaScreening:     NONE,
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
+  trainingReports: NONE,
 }
 
 // ── TENANT_ADMIN template ─────────────────────────────────────────────────────
@@ -567,6 +579,7 @@ const TENANT_ADMIN: ModulesTemplate = {
   // every other template in this file; no template grants it.
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
+  trainingReports: NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

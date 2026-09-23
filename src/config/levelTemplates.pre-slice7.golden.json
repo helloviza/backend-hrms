@@ -179,6 +179,10 @@
     "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L2": {
@@ -359,6 +363,10 @@
       "scope": "NONE"
     },
     "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -543,6 +551,10 @@
     "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L4": {
@@ -723,6 +735,10 @@
       "scope": "NONE"
     },
     "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -907,6 +923,10 @@
     "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L6": {
@@ -1087,6 +1107,10 @@
       "scope": "NONE"
     },
     "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1271,6 +1295,10 @@
     "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L8": {
@@ -1451,6 +1479,10 @@
       "scope": "NONE"
     },
     "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1635,6 +1667,10 @@
     "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_SBT": {
@@ -1817,6 +1853,10 @@
     "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_APPROVAL": {
@@ -1997,6 +2037,10 @@
       "scope": "NONE"
     },
     "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -2185,6 +2229,10 @@
     "travellerIdentityPII": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L0": {
@@ -2369,6 +2417,10 @@
       "scope": "NONE"
     },
     "travellerIdentityPII": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
     }

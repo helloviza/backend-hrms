@@ -2,11 +2,12 @@
 //
 // The org-wide Learning Hub progress report (services/trainingReport.ts).
 // Mounted in server.ts as
-//   app.use("/api/training/report", requireAuth, requireWorkspace, requireHouse,
-//           requirePermission("people", "READ"), trainingReportRouter)
-// — HOUSE (training is HOUSE-only) AND the `people` key at READ+: this is
-// org-wide people data, so it takes the HR/leadership key that guards user
-// creation, not `reports` (business/sales reports). SUPERADMIN passes both.
+//   app.use("/api/training/report", requireAuth, requireWorkspace, requireHouse, trainingReportRouter)
+// — HOUSE (training is HOUSE-only) — and every route here additionally needs
+// the dedicated `trainingReports` capability (models/UserPermission.ts),
+// checked by the router-level gate below. It is granted per-person in the
+// Access Console and deliberately NOT implied by HR/people access: the report
+// is visible only to whoever an admin grants it to. SUPERADMIN bypasses.
 //
 //   GET /          JSON: live modules × active staff, per-module counts
 //   GET /export    XLSX: the same grid + a per-module summary sheet
@@ -14,9 +15,22 @@
 import { Router } from "express";
 import ExcelJS from "exceljs";
 import { buildTrainingReport, type CellStatus } from "../services/trainingReport.js";
+import { holdsCapability } from "../services/capabilityProbe.js";
 import logger from "../utils/logger.js";
 
 const router = Router();
+
+// One gate for the report AND the export. holdsCapability: SUPERADMIN → true,
+// else the caller's own modules.trainingReports at READ+ (absent = NONE).
+router.use(async (req, res, next) => {
+  try {
+    if (await holdsCapability(req, "trainingReports", "READ")) return next();
+    return res.status(403).json({ success: false, message: "Module access not granted", module: "trainingReports", required: "READ" });
+  } catch (err: any) {
+    logger.error("training report gate error", { err: err?.message });
+    return res.status(500).json({ error: "Could not check access" });
+  }
+});
 
 function departmentsParam(q: any): string[] {
   const v = q?.department;
