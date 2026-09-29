@@ -36,6 +36,12 @@ const { default: CustomerMember } = await import("../models/CustomerMember.js");
 const { default: masterDataRouter } = await import("./masterData.js");
 const { default: onboardingRouter } = await import("./onboarding.js");
 const { syncCustomerFromOnboarding } = await import("../services/syncCustomerFromOnboarding.js");
+const { sendMail } = await import("../utils/mailer.js");
+const mail = sendMail as unknown as ReturnType<typeof vi.fn>;
+const subjects = () => mail.mock.calls.map((c: any[]) => String(c[0]?.subject || ""));
+const ACCESS_ACTIVATED = "Welcome to Plumtrips — Access Activated";
+const CLIENT_CREDENTIALS = "Welcome to Plumbox — Your Account is Ready";
+const EMPLOYEE_WELCOME = "Welcome to the Team — Your HRMS Access is Ready";
 
 let mongod: MongoMemoryServer;
 
@@ -115,6 +121,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  mail.mockClear();
   await Promise.all(
     [Customer, User, Employee, Onboarding, CustomerWorkspace, CustomerMember].map((m: any) =>
       m.deleteMany({}),
@@ -406,5 +413,144 @@ describe("promote-employee: same lookup order + graceful conflicts (FIX 5)", () 
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Fields the routes always wrote but the strict Onboarding / Customer
+ * schemas silently dropped. Each test below failed before they were declared.
+ * ──────────────────────────────────────────────────────────────────────── */
+describe("onboarding fields now persist", () => {
+  const decide = (token: string, body: Record<string, any>) => post(`/api/onboarding/${token}/decision`, body);
+
+  it("welcome email: approval sends it once; promote-after-approval sends no second welcome", async () => {
+    const ob = await onboarding({ status: "submitted", inviteeName: "Ranjeet Kumar", formPayload: bizForm() });
+
+    expect((await decide(ob.token as string, { action: "approved" })).status).toBe(200);
+    expect(subjects()).toEqual([ACCESS_ACTIVATED]);
+    expect(((await Onboarding.findById(ob._id).lean()) as any).welcomeEmailSent).toBe(true);
+
+    mail.mockClear();
+    const res = await post(`/api/master-data/${ob._id}/promote-customer`, { sendEmail: true });
+    expect(res.status).toBe(200);
+    // Only the new login's credentials — the welcome was approval's.
+    expect(subjects()).toEqual([CLIENT_CREDENTIALS]);
+
+    mail.mockClear();
+    expect((await post(`/api/master-data/${ob._id}/promote-customer`, { sendEmail: true })).status).toBe(200);
+    expect(subjects()).toEqual([]);
+  });
+
+  it("re-approving does not re-send the welcome", async () => {
+    const ob = await onboarding({ status: "submitted", formPayload: bizForm() });
+    await decide(ob.token as string, { action: "approved" });
+    await decide(ob.token as string, { action: "approved" });
+    expect(subjects().filter((s) => s === ACCESS_ACTIVATED)).toHaveLength(1);
+  });
+
+  it("promote still sends the welcome when approval never did, then never again", async () => {
+    const ob = await onboarding({ status: "approved", formPayload: bizForm() }); // no welcomeEmailSent
+    expect((await post(`/api/master-data/${ob._id}/promote-customer`, { sendEmail: true })).status).toBe(200);
+    expect(subjects().sort()).toEqual([ACCESS_ACTIVATED, CLIENT_CREDENTIALS].sort());
+
+    mail.mockClear();
+    await post(`/api/master-data/${ob._id}/promote-customer`, { sendEmail: true });
+    expect(subjects()).toEqual([]);
+  });
+
+  it("a new employee login still gets its temp-password email after approval sent the welcome", async () => {
+    const ob = await onboarding({
+      type: "employee",
+      status: "approved",
+      email: "dev.new@gmail.com",
+      inviteeName: "Dev New",
+      welcomeEmailSent: true,
+      formPayload: { fullName: "Dev New", employment: { dateOfJoining: "2026-10-01" } },
+    });
+    const res = await post(`/api/master-data/${ob._id}/promote-employee`, { officialEmail: "dev@plumtrips.com" });
+    expect(res.status).toBe(200);
+    expect(subjects()).toHaveLength(1);
+    expect(subjects()[0].startsWith(EMPLOYEE_WELCOME)).toBe(true);
+    expect(String(mail.mock.calls[0][0].html)).toMatch(/Temporary Password/);
+  });
+
+  it("an existing employee login gets no second welcome once approval sent one", async () => {
+    const ob = await onboarding({
+      type: "employee",
+      status: "approved",
+      email: "old.hand@gmail.com",
+      welcomeEmailSent: true,
+      formPayload: { fullName: "Old Hand" },
+    });
+    expect((await post(`/api/master-data/${ob._id}/promote-employee`, { officialEmail: "oldhand@plumtrips.com" })).status).toBe(200);
+    mail.mockClear();
+    expect((await post(`/api/master-data/${ob._id}/promote-employee`, { officialEmail: "oldhand@plumtrips.com" })).status).toBe(200);
+    expect(subjects()).toEqual([]);
+  });
+
+  it("display name: the submitted company name persists and becomes the customer's name", async () => {
+    const ob = await onboarding({ status: "sent", inviteeName: "Ranjeet Kumar" });
+    const submit = await request(app())
+      .post(`/api/onboarding/submit/${ob.token}`)
+      .send({ core: bizForm() });
+    expect(submit.status).toBe(200);
+    expect(((await Onboarding.findById(ob._id).lean()) as any).name).toBe(LEGAL);
+
+    await decide(ob.token as string, { action: "approved" });
+    const res = await post(`/api/master-data/${ob._id}/promote-customer`, { sendEmail: false });
+    expect(res.status).toBe(200);
+    const c: any = await Customer.findOne({ onboardingId: ob._id }).lean();
+    expect(c.name).toBe(LEGAL);
+    expect(c.legalName).toBe(LEGAL);
+  });
+
+  it("display name: an onboarding submitted before `name` persisted still gets the company, not the contact", async () => {
+    // Exactly ABC Cleantech's shape: no onboarding.name, legal name only in the form.
+    const ob = await onboarding({ status: "approved", inviteeName: "Ranjeet Kumar", formPayload: bizForm() });
+    await syncCustomerFromOnboarding(ob);
+    const res = await post(`/api/master-data/${ob._id}/promote-customer`, { sendEmail: false });
+    expect(res.status).toBe(200);
+    expect(((await Customer.findOne({ onboardingId: ob._id }).lean()) as any).name).toBe(LEGAL);
+  });
+
+  it("remarks persist on approve and reject and come back on the details view", async () => {
+    const a = await onboarding({ status: "submitted", formPayload: bizForm() });
+    const r = await onboarding({ status: "submitted", formPayload: bizForm("Other Co Pvt Ltd") });
+    await decide(a.token as string, { action: "approved", remarks: "KYC verified" });
+    await decide(r.token as string, { action: "rejected", remarks: "GST certificate unreadable" });
+
+    expect(((await Onboarding.findById(a._id).lean()) as any).remarks).toBe("KYC verified");
+    expect(((await Onboarding.findById(r._id).lean()) as any).remarks).toBe("GST certificate unreadable");
+    expect((await get(`/api/onboarding/${r._id}/details`)).body.remarks).toBe("GST certificate unreadable");
+  });
+
+  it("promote links persist: onboarding → customer + code + login, customer → login", async () => {
+    const ob = await onboarding({ status: "approved", formPayload: bizForm() });
+    const res = await post(`/api/master-data/${ob._id}/promote-customer`, { sendEmail: false });
+    const o: any = await Onboarding.findById(ob._id).lean();
+    const c: any = await Customer.findById(res.body.customer._id).lean();
+    const u: any = await User.findOne({ email: EMAIL }).lean();
+    expect(String(o.linkedCustomerId)).toBe(String(c._id));
+    expect(o.customerCode).toBe(res.body.customerCode);
+    expect(String(c.linkedUserId)).toBe(String(u._id));
+  });
+
+  it("Master Data active/inactive: toggle persists; legacy rows without the flag count as active", async () => {
+    const legacy = await onboarding({ status: "approved", formPayload: bizForm() });
+    const toggled = await onboarding({ status: "approved", formPayload: bizForm("Toggle Co Pvt Ltd") });
+
+    const t = await request(app())
+      .patch(`/api/master-data/${toggled._id}/status`)
+      .set("Authorization", `Bearer ${TOKEN}`)
+      .set("x-workspace-id", String(HOUSE_WS))
+      .send({ status: "Inactive" });
+    expect(t.status).toBe(200);
+    expect(((await Onboarding.findById(toggled._id).lean()) as any).isActive).toBe(false);
+
+    const ids = async (status: string) =>
+      (await get(`/api/master-data?status=${status}`)).body.items.map((i: any) => i.id);
+    expect(await ids("Active")).toContain(String(legacy._id));
+    expect(await ids("Active")).not.toContain(String(toggled._id));
+    expect(await ids("Inactive")).toEqual([String(toggled._id)]);
   });
 });

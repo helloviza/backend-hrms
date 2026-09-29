@@ -114,6 +114,8 @@ const CustomerSchema = new Schema(
        ONBOARDING LINKAGE
        ============================================================ */
     onboardingId: { type: Schema.Types.ObjectId, ref: "Onboarding" },
+    // The client login created on promote (was written but dropped).
+    linkedUserId: { type: Schema.Types.ObjectId, ref: "User" },
 
     onboardingSnapshot: {
       type: Schema.Types.Mixed, // FULL formPayload snapshot

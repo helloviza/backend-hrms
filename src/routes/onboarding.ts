@@ -1287,6 +1287,7 @@ router.get("/:token/details", requireAuth, requireWorkspace, noStore, async (req
       email: doc.email,
       type: doc.type,
       status: doc.status,
+      remarks: doc.remarks || "",
       ticket: doc.ticket,
       submittedAt: doc.submittedAt,
       updatedAt: doc.updatedAt,

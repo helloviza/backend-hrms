@@ -654,7 +654,9 @@ router.get("/", requireAuth, requireWorkspace, async (req, res, next) => {
     const obFilter: any = { status: { $in: ["approved", "submitted", "verified"] }, ...wsFilter };
     if (type && type !== "All") obFilter.type = new RegExp(`^${type}$`, "i");
     if (status && /inactive/i.test(status)) obFilter.isActive = false;
-    else if (status && /active/i.test(status) && !/inactive/i.test(status)) obFilter.isActive = true;
+    // Absent = active (as the list renders it) — most onboardings predate
+    // isActive persisting, and `true` alone would hide them all.
+    else if (status && /active/i.test(status) && !/inactive/i.test(status)) obFilter.isActive = { $ne: false };
 
     const obDocs = await Onboarding.find(obFilter)
       .sort({ updatedAt: -1 })
@@ -1395,7 +1397,9 @@ router.post(
   (onboardingDoc as any).employeeCode = employeeCode;
   (onboardingDoc as any).linkedUserId = saved._id;
 
-  // 🔒 Send welcome email ONLY ONCE — use warm employee template
+  // Welcome is owned by approval (/onboarding/:token/decision); this only
+  // fills in for an onboarding whose approval never sent one. No credentials
+  // here — the login already exists.
   if (!(onboardingDoc as any).welcomeEmailSent) {
     try {
       const loginUrl = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
@@ -1479,8 +1483,10 @@ router.post(
 (onboardingDoc as any).employeeCode = employeeCode;
 (onboardingDoc as any).linkedUserId = user._id;
 
-// 🔒 Send employee welcome + credentials email only once
-if (!(onboardingDoc as any).welcomeEmailSent) {
+// Always sent: this email is the ONLY delivery of the new login's temp
+// password. Gating it on welcomeEmailSent (already true once approval sent
+// its welcome) would leave the employee with an account they can't open.
+{
   try {
     const loginUrl = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
     await sendEmployeeWelcomeEmail({
@@ -1805,20 +1811,25 @@ router.post(
         onboardingDoc.extras_json ||
         {};
 
+      // The company, never the contact person: onboarding.name (set at submit,
+      // or by a Master Data edit) first, then the submitted form's legal name —
+      // which also covers onboardings submitted before `name` persisted. The
+      // invitee's own name is only a last resort for a form with no company.
       const headerName =
         onboardingDoc.companyName ||
         onboardingDoc.businessName ||
         onboardingDoc.name ||
-        onboardingDoc.inviteeName ||
         "";
       const formName =
+        form.legalName ||
         form.companyName ||
         form.businessName ||
         form.customerName ||
         form.accountName ||
         "";
       const name =
-        String(headerName || formName || "").trim() || "Unnamed Customer";
+        String(headerName || formName || onboardingDoc.inviteeName || "").trim() ||
+        "Unnamed Customer";
 
       const emailRaw: string | undefined =
         (req.body &&
@@ -2013,8 +2024,10 @@ router.post(
       (onboardingDoc as any).customerCode = customerCode;
 (onboardingDoc as any).linkedCustomerId = customer._id;
 
-// 🔒 Send welcome email only once — crash-safe: a mailer failure must never
-// abort promotion (the User/Customer login below is the real deliverable).
+// Welcome is owned by approval (/onboarding/:token/decision); promote only
+// fills in when approval never sent one. The temp-password email for a new
+// login (sendClientWelcomeEmail, below) is separate and not gated on this.
+// Crash-safe: a mailer failure must never abort promotion.
 if (sendEmail && !(onboardingDoc as any).welcomeEmailSent) {
   try {
     await sendOnboardingWelcomeEmail({

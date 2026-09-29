@@ -76,6 +76,23 @@ const OnboardingSchema = new Schema(
 
     ticket: { type: String },
     createdBy: { type: Schema.Types.ObjectId, ref: "User" },
+
+    // Everything below was already written by the routes but silently
+    // dropped (strict schema) until 2026-09-29 — e.g. welcomeEmailSent never
+    // stuck, so approval AND promote both sent the welcome email.
+    name: { type: String, trim: true }, // company / employee name set at submit
+    photoKey: { type: String }, // employee photo, copied to the User on sync
+    remarks: { type: String }, // admin's approve/reject note
+    isActive: { type: Boolean }, // Master Data active/inactive; absent = active
+    welcomeEmailSent: { type: Boolean },
+
+    // What the onboarding became on promote.
+    linkedCustomerId: { type: Schema.Types.ObjectId, ref: "Customer" },
+    customerCode: { type: String },
+    linkedUserId: { type: Schema.Types.ObjectId, ref: "User" },
+    employeeCode: { type: String },
+    linkedVendorId: { type: Schema.Types.ObjectId, ref: "Vendor" },
+    vendorCode: { type: String },
   },
   { timestamps: true }
 );

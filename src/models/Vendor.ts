@@ -25,6 +25,7 @@ interface IVendor extends Document {
   };
   ownerId?: Schema.Types.ObjectId;
   onboardingId?: Schema.Types.ObjectId;
+  linkedUserId?: Schema.Types.ObjectId;
   onboardingSnapshot?: any;
   accountTeam?: any;
 }
@@ -208,6 +209,8 @@ const VendorSchema = new Schema<IVendor>(
     ownerId: { type: Schema.Types.ObjectId, ref: "User" },
 
     onboardingId: { type: Schema.Types.ObjectId, ref: "Onboarding" },
+    // The vendor login created on promote (was written but dropped).
+    linkedUserId: { type: Schema.Types.ObjectId, ref: "User" },
 
     accountTeam: {
       accountManager: {
