@@ -382,16 +382,23 @@ const CustomerSchema = new Schema(
   { timestamps: true }
 );
 
+// The value the pre-save hook stores in legalNameNormalized. Exported so a
+// route's duplicate-name pre-check computes the SAME key the unique index
+// sees — checking any other field lets a real collision through to E11000.
+export function normalizeCustomerLegalName(c: {
+  legalName?: unknown;
+  companyName?: unknown;
+  name?: unknown;
+}): string {
+  const raw = String(c.legalName || c.companyName || c.name || "");
+  return raw.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
 // Keep legalNameNormalized in sync with the canonical business name.
 // The unique index on this field (created by the migration script) prevents
 // case-duplicate customer records from being inserted.
 CustomerSchema.pre("save", function (next) {
-  const raw =
-    (this as any).legalName ||
-    (this as any).companyName ||
-    (this as any).name ||
-    "";
-  (this as any).legalNameNormalized = raw.trim().replace(/\s+/g, " ").toLowerCase();
+  (this as any).legalNameNormalized = normalizeCustomerLegalName(this as any);
   next();
 });
 

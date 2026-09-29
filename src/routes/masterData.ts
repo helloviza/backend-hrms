@@ -7,7 +7,7 @@ import Onboarding from "../models/Onboarding.js";
 import MasterData from "../models/MasterData.js";
 import User from "../models/User.js";
 import Vendor from "../models/Vendor.js";
-import Customer from "../models/Customer.js";
+import Customer, { normalizeCustomerLegalName } from "../models/Customer.js";
 import Employee from "../models/Employee.js";
 import DocumentModel from "../models/Document.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
@@ -219,13 +219,21 @@ async function syncEmployeeRecord({
     workspaceId: user.workspaceId || user.customerId || user.businessId || null,
   };
 
-  const existing = await Employee.findOne({
-    $or: [
-      { onboardingId: onboardingDoc._id },
-      { email: user.email },
-      { employeeCode: user.employeeCode },
-    ],
-  }).exec();
+  // Onboarding link, then owner, then email/code — and an email/code match is
+  // only taken when that row is not tied to a different onboarding or owner,
+  // so one employee's row is never overwritten with another's data.
+  const belongsHere = (e: any) =>
+    e &&
+    (!e.onboardingId || String(e.onboardingId) === String(onboardingDoc._id)) &&
+    (!e.ownerId || String(e.ownerId) === String(user._id));
+  const existing =
+    (await Employee.findOne({ onboardingId: onboardingDoc._id }).exec()) ||
+    (await Employee.findOne({ ownerId: user._id }).exec()) ||
+    [
+      user.email ? await Employee.findOne({ email: user.email }).exec() : null,
+      user.employeeCode ? await Employee.findOne({ employeeCode: user.employeeCode }).exec() : null,
+    ].find(belongsHere) ||
+    null;
 
   if (existing) {
     Object.assign(existing, base);
@@ -236,6 +244,154 @@ async function syncEmployeeRecord({
 
   // Transfer onboarding documents into the employee's Document Vault.
   await migrateOnboardingDocuments({ user, onboardingDoc });
+}
+
+type PromoteConflict = { status: number; body: Record<string, any> };
+
+function customerNameConflict(existing: any): PromoteConflict {
+  const existingName = existing.legalName || existing.name || "this name";
+  return {
+    status: 409,
+    body: {
+      error: `A customer named "${existingName}" already exists${
+        existing.customerCode ? ` (${existing.customerCode})` : ""
+      } — link this contact to it instead of creating a new customer.`,
+      code: "CUSTOMER_NAME_EXISTS",
+      existingId: String(existing._id),
+      existingName,
+      existingCustomerCode: existing.customerCode || null,
+    },
+  };
+}
+
+/**
+ * Turn a Mongo duplicate-key error into a 409 an admin can act on. Raw
+ * E11000 text (index names, key values) must never reach the dialog.
+ */
+async function duplicateKeyConflict(err: any): Promise<PromoteConflict | null> {
+  if (err?.code !== 11000) return null;
+  const fields = Object.keys(err.keyPattern || err.keyValue || {});
+  if (fields.includes("legalNameNormalized")) {
+    const value = err.keyValue?.legalNameNormalized;
+    const existing: any = value
+      ? await Customer.findOne({ legalNameNormalized: value }).lean()
+      : null;
+    if (existing) return customerNameConflict(existing);
+    return {
+      status: 409,
+      body: { error: "A customer with this business name already exists.", code: "CUSTOMER_NAME_EXISTS" },
+    };
+  }
+  if (fields.includes("email")) {
+    return {
+      status: 409,
+      body: { error: "A login with this email address already exists.", code: "EMAIL_IN_USE" },
+    };
+  }
+  if (fields.includes("customerCode") || fields.includes("employeeCode")) {
+    return {
+      status: 409,
+      body: { error: "Another record took the same code at the same moment — please try again.", code: "CODE_COLLISION" },
+    };
+  }
+  return {
+    status: 409,
+    body: { error: "This record conflicts with an existing one.", code: "DUPLICATE_RECORD" },
+  };
+}
+
+/**
+ * The customer a promote should update, matched on the onboarding it came
+ * from. Email is only a fallback for legacy customers that carry no
+ * onboardingId at all: a customer created from a DIFFERENT onboarding is
+ * never overwritten just because the contact email matches (a re-invited
+ * contact's old stub was grabbed, renamed, and collided — ABC Cleantech).
+ */
+async function findCustomerForPromote(
+  onboardingId: any,
+  email: string,
+): Promise<{ existing: any; conflict?: PromoteConflict }> {
+  const byOnboarding = await Customer.findOne({ onboardingId }).exec();
+  if (byOnboarding) return { existing: byOnboarding };
+
+  const unlinked = (await Customer.find({ email }).exec()).filter(
+    (c: any) => !c.onboardingId,
+  );
+  if (unlinked.length > 1) {
+    return {
+      existing: null,
+      conflict: {
+        status: 409,
+        body: {
+          error: `More than one existing customer uses ${email} — resolve the duplicates before promoting.`,
+          code: "CUSTOMER_EMAIL_AMBIGUOUS",
+          customerIds: unlinked.map((c: any) => String(c._id)),
+        },
+      },
+    };
+  }
+  return { existing: unlinked[0] || null };
+}
+
+const NON_STAFF_ROLES = ["CUSTOMER", "VENDOR", "WORKSPACE_LEADER", "BUSINESS", "CLIENT"];
+
+/**
+ * The login an employee promote should update, onboarding link first. Email
+ * (unique across all users) is a fallback only for a login that is not
+ * already tied to a different onboarding and is not a client/vendor account —
+ * overwriting either would hand someone else's login an employee identity.
+ */
+async function findUserForEmployeePromote(
+  onboardingId: any,
+  email: string,
+): Promise<{ existing: any; conflict?: PromoteConflict }> {
+  const byOnboarding = await User.findOne({ onboardingId }).exec();
+  const byEmail = await User.findOne({ email }).exec();
+  const label = (u: any) => u.name || u.email;
+
+  if (byOnboarding) {
+    if (byEmail && String(byEmail._id) !== String(byOnboarding._id)) {
+      return {
+        existing: null,
+        conflict: {
+          status: 409,
+          body: {
+            error: `${email} already belongs to another login (${label(byEmail)}) — use a different official email.`,
+            code: "EMAIL_IN_USE",
+            existingUserId: String(byEmail._id),
+          },
+        },
+      };
+    }
+    return { existing: byOnboarding };
+  }
+
+  if (!byEmail) return { existing: null };
+
+  const otherOnboarding =
+    byEmail.onboardingId && String(byEmail.onboardingId) !== String(onboardingId);
+  const roles = [...(byEmail.roles || []), byEmail.role]
+    .filter(Boolean)
+    .map((r: any) => String(r).toUpperCase());
+  const nonStaff = roles.some((r) => NON_STAFF_ROLES.includes(r) || r.startsWith("CUSTOMER_"));
+  if (otherOnboarding || nonStaff) {
+    return {
+      existing: null,
+      conflict: {
+        status: 409,
+        body: {
+          error: nonStaff
+            ? `${email} is already a client/vendor login (${label(byEmail)}) — use a different official email for this employee.`
+            : `${email} already belongs to an employee promoted from a different onboarding (${label(byEmail)}${
+                byEmail.employeeCode ? `, ${byEmail.employeeCode}` : ""
+              }) — use a different official email or link to that employee.`,
+          code: nonStaff ? "EMAIL_IN_USE" : "USER_FROM_OTHER_ONBOARDING",
+          existingUserId: String(byEmail._id),
+        },
+      },
+    };
+  }
+  return { existing: byEmail };
 }
 
 /**
@@ -1110,9 +1266,11 @@ router.post(
         });
       }
 
-      let existingUser: any = await User.findOne({
-        $or: [{ onboardingId: onboardingDoc._id }, { email }],
-      }).exec();
+      const userMatch = await findUserForEmployeePromote(onboardingDoc._id, email);
+      if (userMatch.conflict) {
+        return res.status(userMatch.conflict.status).json(userMatch.conflict.body);
+      }
+      let existingUser: any = userMatch.existing;
 
       // Decide employee code
       let employeeCode =
@@ -1381,6 +1539,8 @@ return res.json({
   user,
 });
     } catch (err) {
+      const conflict = await duplicateKeyConflict(err);
+      if (conflict) return res.status(conflict.status).json(conflict.body);
       next(err);
     }
   },
@@ -1699,9 +1859,11 @@ router.post(
         onboardingDoc.segment ||
         "CUSTOMER";
 
-      let existingCustomer: any = await Customer.findOne({
-        $or: [{ onboardingId: onboardingDoc._id }, { email }],
-      }).exec();
+      const customerMatch = await findCustomerForPromote(onboardingDoc._id, email);
+      if (customerMatch.conflict) {
+        return res.status(customerMatch.conflict.status).json(customerMatch.conflict.body);
+      }
+      let existingCustomer: any = customerMatch.existing;
 
       let customerCode =
         (existingCustomer && existingCustomer.customerCode) ||
@@ -1801,6 +1963,18 @@ router.post(
 };
 
 
+      // Same key the Customer pre-save hook writes into the unique index, on
+      // BOTH paths, excluding the record being updated — a check on any other
+      // field (it used to normalize the invitee's name) lets E11000 through.
+      const nameClash = await Customer.findOne({
+        legalNameNormalized: normalizeCustomerLegalName(base),
+        ...(existingCustomer ? { _id: { $ne: existingCustomer._id } } : {}),
+      }).lean();
+      if (nameClash) {
+        const conflict = customerNameConflict(nameClash);
+        return res.status(conflict.status).json(conflict.body);
+      }
+
       let customer: any;
       if (existingCustomer) {
         Object.assign(existingCustomer, {
@@ -1815,17 +1989,6 @@ router.post(
           return res.status(409).json({
             error: "Customer already exists for this email",
             customerId: dupCustomer._id,
-          });
-        }
-
-        // Case-insensitive name uniqueness check
-        const normalizedName = name.trim().replace(/\s+/g, " ").toLowerCase();
-        const dupByName = await Customer.findOne({ legalNameNormalized: normalizedName }).lean();
-        if (dupByName) {
-          return res.status(409).json({
-            error: "Customer with this business name already exists",
-            existingId: (dupByName as any)._id,
-            existingName: (dupByName as any).legalName || (dupByName as any).name,
           });
         }
 
@@ -2043,6 +2206,8 @@ return res.json({
     : {}),
 });
     } catch (err) {
+      const conflict = await duplicateKeyConflict(err);
+      if (conflict) return res.status(conflict.status).json(conflict.body);
       next(err);
     }
   },

@@ -109,7 +109,14 @@ const EmployeeSchema = new Schema<EmployeeDoc>(
 );
 
 EmployeeSchema.plugin(workspaceScopePlugin);
-EmployeeSchema.index({ workspaceId: 1, userId: 1 }, { unique: true });
+// Partial: no code writes Employee.userId (not even a schema path — the
+// owning user is ownerId), so as a plain unique index every row carries
+// userId=null and a SECOND employee in a workspace hits E11000. Prod never
+// managed to build it for that reason (43 rows, 0 with userId).
+EmployeeSchema.index(
+  { workspaceId: 1, userId: 1 },
+  { unique: true, partialFilterExpression: { userId: { $exists: true } } },
+);
 
 // Indexes for performance
 EmployeeSchema.index({ employeeCode: 1 });

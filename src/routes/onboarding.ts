@@ -1211,7 +1211,7 @@ router.get(
   }
 );
 
-/** 🧑‍💼 Admin details (authed) – also triggers sync to HRMS */
+/** 🧑‍💼 Admin details (authed) – read-only */
 router.get("/:token/details", requireAuth, requireWorkspace, noStore, async (req, res, next) => {
   try {
     const { token } = req.params;
@@ -1244,10 +1244,11 @@ router.get("/:token/details", requireAuth, requireWorkspace, noStore, async (req
     }
     if (!doc) return res.status(404).json({ error: "Not found" });
 
-    // Ensure HRMS sync whenever admin opens details
-    await syncEmployeeFromOnboarding(doc);
-    await syncCustomerFromOnboarding(doc);
-
+    // Viewing is read-only. This used to run both HRMS syncs, so merely
+    // opening an invite created a Customer stub (even for unsubmitted or
+    // expired invites) or an employee login with a temp password, and
+    // re-copied the onboarding form over an existing user's HR fields.
+    // Submit (/submit/:token) and approval (/:token/decision) already sync.
 
     let formData: any = {};
     try {
