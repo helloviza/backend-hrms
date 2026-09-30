@@ -973,6 +973,15 @@ function ownerSourceScope(req: express.Request): AnyObj {
   const f = isAll(scope) ? ownerSourceFilter(q) : { ...ownerSourceFilter({ source: q.source }), ...leadMatch(scope) };
   return f;
 }
+/** Activity-side twin of ownerSourceScope: rows on the leads the caller may
+ *  see AND the owner / source filters pick. No filter on an ALL caller stays
+ *  {} (no lead-id list); an OWN caller is still pinned by leadMatch. */
+async function ownerSourceActivityMatch(req: express.Request): Promise<AnyObj> {
+  const q = req.query as AnyObj;
+  const scope = leadScope(req);
+  if (!q.source && (!isAll(scope) || !q.owner)) return activityMatch(scope);
+  return { leadId: { $in: await Lead.distinct("_id", ownerSourceScope(req)) } };
+}
 /** createdAt range + caller scope + owner / source — what every range-bar panel matches on. */
 function scopeFilter(req: express.Request): AnyObj {
   return { ...createdAtFilter(req.query as AnyObj), ...ownerSourceScope(req) };
@@ -1232,9 +1241,10 @@ router.get("/reports/by-source", async (req, res) => {
   }
 });
 
-// ── GET /reports/activity?todayStart=&tz=&days=7 ─────────────────
+// ── GET /reports/activity?todayStart=&tz=&days=7&owner=&source= ──
 // Team activity logged today (LeadActivity rows by type since the caller's
 // start of day) plus a per-day total over the trailing `days` for the trend.
+// Owner / source narrow it to those leads' activity; the range bar does not.
 router.get("/reports/activity", async (req, res) => {
   try {
     const q = req.query as AnyObj;
@@ -1250,7 +1260,7 @@ router.get("/reports/activity", async (req, res) => {
     let fmt: Intl.DateTimeFormat;
     try {
       fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
-      const mine = await activityMatch(leadScope(req));
+      const mine = await ownerSourceActivityMatch(req);
       [byType, trendRows] = await Promise.all([
         LeadActivity.aggregate([{ $match: { ...mine, createdAt: { $gte: todayStart } } }, { $group: { _id: "$type", count: { $sum: 1 } } }]),
         LeadActivity.aggregate([
@@ -1277,7 +1287,7 @@ router.get("/reports/activity", async (req, res) => {
   }
 });
 
-// ── GET /reports/follow-up-health?todayStart=&dueBefore= ──────────
+// ── GET /reports/follow-up-health?todayStart=&dueBefore=&owner=&source= ──
 // The Inbox's definitions, counted server-side over OPEN leads (effective
 // disposition Open / In-progress):
 //   dueToday    nextFollowUpDate in [todayStart, dueBefore)
@@ -1294,7 +1304,8 @@ router.get("/reports/follow-up-health", async (req, res) => {
     const dueBefore = dueBeforeRaw && !isNaN(dueBeforeRaw.getTime()) ? dueBeforeRaw : new Date(todayStart.getTime() + 86_400_000);
     const dayAgo = new Date(now.getTime() - 86_400_000);
 
-    const mine = leadMatch(leadScope(req));
+    // Live state: owner / source narrow it, the date range never does.
+    const mine = ownerSourceScope(req);
     const [agg, untouched] = await Promise.all([
       Lead.aggregate([
         { $match: mine },
@@ -1801,9 +1812,10 @@ router.get("/counts-by-stage", async (req, res) => {
 // the existing reports already do. The frontend renders these as INR-dominant.
 router.get("/pipeline-summary", async (req, res) => {
   try {
-    const scope = leadScope(req);
-    const mine = leadMatch(scope);
-    const mineActs = await activityMatch(scope);
+    // Caller scope + the command center's owner / source (no params → the
+    // caller's whole scope, which is what the Leads page header asks for).
+    const mine = ownerSourceScope(req);
+    const mineActs = await ownerSourceActivityMatch(req);
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);

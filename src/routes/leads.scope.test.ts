@@ -303,6 +303,44 @@ describe("aggregates — an OWN rep sees only their own numbers; ALL sees the te
     expect((await get("admin", "/leads/counts-by-stage")).body).toEqual({ new: 2, won: 1, proposal_sent: 1 });
   });
 
+  it("live panels (follow-up-health / activity / pipeline-summary) take owner + source, never the date range, and never widen OWN", async () => {
+    // ALL + owner=REP → REP's numbers, not a mix with the team's.
+    expect((await get("admin", `/leads/reports/follow-up-health?owner=${ids.REP}`)).body).toMatchObject({ open: 1, overdue: 1 });
+    expect((await get("admin", "/leads/reports/follow-up-health?owner=unassigned")).body).toMatchObject({ open: 1, overdue: 0 });
+    expect((await get("admin", `/leads/reports/activity?owner=${ids.REP}`)).body.total).toBe(1);
+    expect((await get("admin", `/leads/reports/activity?owner=${ids.OTHER}`)).body.total).toBe(2);
+    const repPs = await get("admin", `/leads/pipeline-summary?owner=${ids.REP}`);
+    expect(repPs.body.kpis).toMatchObject({ openPipelineValue: 100, activeCount: 1, overdueFollowups: 1 });
+    expect(repPs.body.trends.wonThisMonthCount).toBe(1);
+    expect(repPs.body.perStage.proposal_sent.count).toBe(0);
+    // source narrows too (every fixture lead is "manual").
+    expect((await get("admin", "/leads/reports/follow-up-health?source=website")).body).toMatchObject({ open: 0, overdue: 0 });
+    expect((await get("admin", "/leads/reports/activity?source=website")).body.total).toBe(0);
+    expect((await get("admin", "/leads/pipeline-summary?source=manual")).body.kpis.activeCount).toBe(3);
+
+    // An OWN rep: owner=OTHER is ignored, source still narrows.
+    expect((await get("rep", `/leads/reports/follow-up-health?owner=${ids.OTHER}`)).body).toMatchObject({ open: 1, overdue: 1 });
+    expect((await get("rep", `/leads/reports/activity?owner=${ids.OTHER}`)).body.total).toBe(1);
+    expect((await get("rep", `/leads/pipeline-summary?owner=${ids.OTHER}`)).body.kpis).toMatchObject({ activeCount: 1, openPipelineValue: 100 });
+    expect((await get("rep", "/leads/reports/activity?source=website")).body.total).toBe(0);
+
+    // The date range does NOT scope them: a window with no leads in it changes nothing.
+    const future = encodeURIComponent(new Date(now.getTime() + 30 * 86_400_000).toISOString());
+    expect((await get("admin", `/leads/reports/follow-up-health?dateFrom=${future}`)).body).toMatchObject({ open: 3, overdue: 2 });
+    expect((await get("admin", `/leads/reports/activity?dateFrom=${future}`)).body.total).toBe(3);
+    expect((await get("admin", `/leads/pipeline-summary?dateFrom=${future}`)).body.kpis.activeCount).toBe(3);
+  });
+
+  it("pipeline strip data: open stages count open leads now; won / lost are every closed lead (all-time)", async () => {
+    await lead({ assignedTo: REP, stage: "won", createdAt: new Date(now.getTime() - 400 * 86_400_000) });
+    await lead({ assignedTo: REP, stage: "lost", createdAt: new Date(now.getTime() - 400 * 86_400_000) });
+    const ps = (await get("admin", `/leads/pipeline-summary?owner=${ids.REP}`)).body;
+    expect(ps.perStage.new.count).toBe(1);
+    expect(ps.perStage.won.count).toBe(2); // this month's + the 400-day-old one
+    expect(ps.perStage.lost.count).toBe(1);
+    expect(ps.kpis.activeCount).toBe(1); // open = everything but won / lost
+  });
+
   it("by-rep is ALL-only; hygiene is the caller's own row for OWN, whatever owner says", async () => {
     expect((await get("rep", "/leads/reports/by-rep")).status).toBe(403);
     expect((await get("fullown", "/leads/reports/by-rep")).status).toBe(403);
