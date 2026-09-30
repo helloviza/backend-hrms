@@ -1442,6 +1442,7 @@ router.post("/:token/decision", requireAuth, requireWorkspace, requireAdmin, noS
               setPasswordUrl: syncResult?.userId
                 ? await issueSetPasswordLink(syncResult.userId, ONBOARDING_LINK_TTL_MS)
                 : undefined,
+              workspaceId: doc.workspaceId,
             });
           } else {
             // Vendor / Customer: formal welcome

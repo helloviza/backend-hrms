@@ -16,6 +16,7 @@ import { sendEmployeeInvite } from "../services/email.service.js";
 import { UserPermission } from "../models/UserPermission.js";
 import { LEVEL_TEMPLATES } from "../config/levelTemplates.js";
 import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
+import { issueSetPasswordLink, ONBOARDING_LINK_TTL_MS } from "../utils/setPasswordLink.js";
 import { parseCsv } from "../utils/csv.js";
 import * as XLSX from "xlsx";
 import crypto from "crypto";
@@ -935,8 +936,10 @@ router.post(
         warnings: [] as Array<{ row: number; email: string; reason: string }>,
       };
 
-      // Hash the temp password once — all new accounts share the same starter.
-      const tempPasswordHash = await bcrypt.hash("Welcome@123", 10);
+      // One random, never-shown password per import (hashed once). New
+      // accounts can't sign in with it; they set their own via Forgot
+      // password or an admin grant-access link. No shared default password.
+      const tempPasswordHash = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 10);
 
       const VALID_ROLES = new Set(["EMPLOYEE", "MANAGER", "HR"]);
       const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -1325,9 +1328,9 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       return res.json(sanitise(saved));
     }
 
-    // CREATE new user – we must provide a passwordHash.
-    const tempPassword = "Welcome@123";
-    const passwordHash = await bcrypt.hash(tempPassword, 10);
+    // CREATE new user – we must provide a passwordHash. Random and never
+    // shown; the employee sets their own via the emailed 72h link below.
+    const passwordHash = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 10);
 
     const payload: any = {
       ...commonFields,
@@ -1365,16 +1368,17 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       console.error("[POST /employees] UserPermission auto-create failed:", permErr?.message);
     }
 
-    // ── Send welcome email with credentials ──
+    // ── Send welcome email with a set-password link ──
     try {
       const loginUrl = String(process.env.FRONTEND_ORIGIN || "http://localhost:5173").replace(/\/+$/, "");
       await sendCredentialsEmail({
         to: officialEmail,
         name: fullName || officialEmail,
         officialEmail,
-        tempPassword,
+        setPasswordUrl: await issueSetPasswordLink(created._id, ONBOARDING_LINK_TTL_MS),
         loginUrl,
         employeeCode: (created as any).employeeCode || employeeCode || "",
+        workspaceId: req.workspaceObjectId,
       });
     } catch (emailErr: any) {
       console.error("[POST /employees] welcome email failed:", emailErr?.message);

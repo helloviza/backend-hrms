@@ -11,7 +11,9 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 import mongoose from "mongoose";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
+import { issueSetPasswordLink, ONBOARDING_LINK_TTL_MS } from "../utils/setPasswordLink.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -514,6 +516,25 @@ r.get(
 
 /* ─────────────── POST /admin/grant-access ─────────────── */
 
+// Emails a newly activated staff login its 72h set-password link. Fire and
+// forget, like the credentials email it replaces — never fails the grant.
+function sendStaffSetPasswordEmail(user: any, to: string, workspaceId: unknown) {
+  const loginUrl = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
+  issueSetPasswordLink(user._id, ONBOARDING_LINK_TTL_MS)
+    .then((setPasswordUrl) =>
+      sendCredentialsEmail({
+        to,
+        name: user.name || user.email,
+        officialEmail: to,
+        setPasswordUrl,
+        loginUrl,
+        employeeCode: user.employeeCode || undefined,
+        workspaceId,
+      }),
+    )
+    .catch((err) => console.error("[grant-access] credentials email failed:", err));
+}
+
 r.post(
   "/admin/grant-access",
   requireAuth,
@@ -521,22 +542,20 @@ r.post(
   requireRoles("ADMIN", "SUPERADMIN", "HR"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { userId, onboardingId, role, password, officialEmail } = req.body as {
+      // Any `password` in the body (older clients) is ignored: the login gets
+      // a random password nobody sees and sets its own via the emailed link.
+      const { userId, onboardingId, role, officialEmail } = req.body as {
         userId?: string;
         onboardingId?: string;
         role?: string;
-        password?: string;
         officialEmail?: string;
       };
 
-      if (!role || !password) {
-        return res.status(400).json({ error: "role and password are required." });
-      }
-      if (password.length < 6) {
-        return res.status(400).json({ error: "Password must be at least 6 characters." });
+      if (!role) {
+        return res.status(400).json({ error: "role is required." });
       }
 
-      const hashed = await bcrypt.hash(password, 10);
+      const hashed = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 10);
 
       // HOUSE/Plumtrips internal: SBT is on by default for newly activated
       // STAFF accounts (excluding external personas). Scoped to the HOUSE
@@ -564,15 +583,7 @@ r.post(
         if (!target) return res.status(404).json({ error: "User not found." });
         Object.assign(target, activation, ...(officialEmail ? [{ officialEmail }] : []));
         await (target as any).save();
-        const loginUrl = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
-        sendCredentialsEmail({
-          to: (target as any).officialEmail || (target as any).email,
-          name: (target as any).name || (target as any).email,
-          officialEmail: (target as any).officialEmail || (target as any).email,
-          tempPassword: password,
-          loginUrl,
-          employeeCode: (target as any).employeeCode || undefined,
-        }).catch(err => console.error("[grant-access] credentials email failed:", err));
+        sendStaffSetPasswordEmail(target, (target as any).officialEmail || (target as any).email, (req as any).workspaceObjectId);
         return res.json({
           success: true,
           user: { _id: target._id, name: (target as any).name, email: (target as any).email, roles: (target as any).roles },
@@ -607,15 +618,7 @@ r.post(
       if (existing) {
         Object.assign(existing, activation, ...(officialEmail ? [{ officialEmail }] : []));
         await (existing as any).save();
-        const loginUrlB = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
-        sendCredentialsEmail({
-          to: officialEmail || (existing as any).email,
-          name: (existing as any).name || (existing as any).email,
-          officialEmail: officialEmail || (existing as any).email,
-          tempPassword: password,
-          loginUrl: loginUrlB,
-          employeeCode: (existing as any).employeeCode || undefined,
-        }).catch(err => console.error("[grant-access] credentials email failed:", err));
+        sendStaffSetPasswordEmail(existing, officialEmail || (existing as any).email, (req as any).workspaceObjectId);
         return res.json({
           success: true,
           user: { _id: existing._id, name: (existing as any).name, email: (existing as any).email, roles: (existing as any).roles },
@@ -623,15 +626,7 @@ r.post(
       }
 
       const newUser = await User.create({ name, email, isActive: true, ...activation, ...(officialEmail && { officialEmail }), workspaceId: (req as any).workspaceObjectId });
-      const loginUrlC = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
-      sendCredentialsEmail({
-        to: (newUser as any).officialEmail || (newUser as any).email,
-        name: (newUser as any).name || (newUser as any).email,
-        officialEmail: (newUser as any).officialEmail || (newUser as any).email,
-        tempPassword: password,
-        loginUrl: loginUrlC,
-        employeeCode: (newUser as any).employeeCode || undefined,
-      }).catch(err => console.error("[grant-access] credentials email failed:", err));
+      sendStaffSetPasswordEmail(newUser, (newUser as any).officialEmail || (newUser as any).email, (req as any).workspaceObjectId);
 
       return res.status(201).json({
         success: true,

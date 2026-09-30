@@ -1413,6 +1413,7 @@ router.post(
           onboardingDoc.dateOfJoining ||
           Date.now()
         ),
+        workspaceId: saved.workspaceId,
       });
     } catch (empEmailErr) {
       console.error("[promote-employee] welcome email failed:", empEmailErr);
@@ -1501,6 +1502,7 @@ router.post(
         Date.now()
       ),
       setPasswordUrl,
+      workspaceId: user.workspaceId,
     });
   } catch (empEmailErr) {
     console.error("[promote-employee] welcome email failed:", empEmailErr);

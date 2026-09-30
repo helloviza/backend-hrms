@@ -38,8 +38,13 @@ const { default: masterDataRouter } = await import("./masterData.js");
 const { default: onboardingRouter } = await import("./onboarding.js");
 const { syncCustomerFromOnboarding } = await import("../services/syncCustomerFromOnboarding.js");
 const { sendMail } = await import("../utils/mailer.js");
+const { ONBOARDING_NOTIFY_ADDRESS } = await import("../utils/onboardingNotice.js");
 const mail = sendMail as unknown as ReturnType<typeof vi.fn>;
-const subjects = () => mail.mock.calls.map((c: any[]) => String(c[0]?.subject || ""));
+// Emails to users only — the team's onboarding-visibility notices are
+// asserted separately (notices()).
+const userMails = () => mail.mock.calls.map((c: any[]) => c[0]).filter((m: any) => m?.to !== ONBOARDING_NOTIFY_ADDRESS);
+const notices = () => mail.mock.calls.map((c: any[]) => c[0]).filter((m: any) => m?.to === ONBOARDING_NOTIFY_ADDRESS);
+const subjects = () => userMails().map((m: any) => String(m?.subject || ""));
 const ACCESS_ACTIVATED = "Welcome to Plumtrips — Access Activated";
 const CLIENT_CREDENTIALS = "Welcome to Plumbox — Your Account is Ready";
 const EMPLOYEE_WELCOME = "Welcome to the Team — Your HRMS Access is Ready";
@@ -475,10 +480,16 @@ describe("onboarding fields now persist", () => {
 
     // No password in the email and no BCC — a set-password link instead, whose
     // token is stored hashed on the new login with a ~72h expiry.
-    const sent = mail.mock.calls[0][0];
+    const sent = userMails()[0];
     const html = String(sent.html);
     expect(html).not.toMatch(/Temporary Password/);
     expect(sent.bcc).toBeUndefined();
+
+    // The team's copy is one separate notice carrying nothing usable.
+    expect(notices()).toHaveLength(1);
+    const notice = `${notices()[0].subject}\n${notices()[0].html}`;
+    expect(notice).toContain("dev@plumtrips.com");
+    expect(notice).not.toMatch(/https?:\/\/|token|reset-password|password/i);
     const token = html.match(/\/reset-password\?token=([0-9a-f]{64})/)?.[1];
     expect(token).toBeTruthy();
     const hash = createHash("sha256").update(String(token)).digest("hex");

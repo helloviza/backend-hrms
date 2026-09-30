@@ -1,8 +1,10 @@
 import { sendMail } from "./mailer.js";
+import { sendOnboardingNotice } from "./onboardingNotice.js";
 
 // Never carries a password. A brand-new login gets a set-password link
 // (utils/setPasswordLink.ts, 72h); an existing login gets no credentials.
-function setPasswordBlock(setPasswordUrl: string): string {
+// Shared with utils/credentialsEmail.ts.
+export function setPasswordBlock(setPasswordUrl: string): string {
   return `
 <div style="margin:24px 0;">
 <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:18px 20px;">
@@ -28,6 +30,8 @@ export async function sendEmployeeWelcomeEmail(params: {
   effectiveDate: Date;
   /** Only for a brand-new login; omit for an existing one. */
   setPasswordUrl?: string;
+  /** For the onboarding-visibility notice only. */
+  workspaceId?: unknown;
 }): Promise<void> {
   const { name, email, loginUrl, effectiveDate, setPasswordUrl } = params;
   const firstName = String(name || "").trim().split(/\s+/)[0] || "there";
@@ -95,6 +99,7 @@ This is an automated message from PlumTrips HRMS. Do not reply to this email.<br
       "PlumTrips HRMS <onboarding@plumtrips.com>",
     kind: "WELCOME",
   });
+  await sendOnboardingNotice({ emailType: "Employee welcome", recipient: email, workspaceId: params.workspaceId });
 }
 
 export async function sendClientWelcomeEmail(params: {
@@ -104,6 +109,7 @@ export async function sendClientWelcomeEmail(params: {
   loginUrl: string;
 }): Promise<void> {
   const { to, name, setPasswordUrl, loginUrl } = params;
+  // name is the client (customer/vendor) company for every caller
   const firstName = String(name || "").trim().split(/\s+/)[0] || "there";
 
   const html = `<!DOCTYPE html>
@@ -151,4 +157,5 @@ This is an automated message from Plumbox. Do not reply to this email.<br/>
       "Plumbox <onboarding@plumtrips.com>",
     kind: "WELCOME",
   });
+  await sendOnboardingNotice({ emailType: "Client welcome", recipient: to, company: name });
 }
