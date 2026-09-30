@@ -10,6 +10,7 @@ import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { authLogger } from "../utils/logger.js";
+import { publicAppUrl } from "../utils/publicAppUrl.js";
 import SessionLog from "../models/SessionLog.js";
 import Customer from "../models/Customer.js";
 import Vendor from "../models/Vendor.js";
@@ -1255,8 +1256,7 @@ r.post("/forgot-password", async (req, res) => {
     user.resetTokenExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
     await user.save();
 
-    const frontendOrigin = String(process.env.FRONTEND_ORIGIN || "http://localhost:5173").replace(/\/$/, "");
-    const resetLink = `${frontendOrigin}/reset-password?token=${rawToken}`;
+    const resetLink = `${publicAppUrl()}/reset-password?token=${rawToken}`;
 
     await sendMail({
       to: normalizedEmail,

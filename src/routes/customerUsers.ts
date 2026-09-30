@@ -17,6 +17,7 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 
 import { sendMail } from "../utils/mailer.js";
 import { signEmailActionToken } from "../utils/emailActionToken.js";
+import { publicAppUrl } from "../utils/publicAppUrl.js";
 import { isGenericDomain } from "../utils/blockedDomains.js";
 import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMemberRoles.js";
 import { generateTravelerId } from "../utils/travelerId.js";
@@ -192,9 +193,6 @@ export function isStaffPrivileged(u: any) {
   );
 }
 
-function publicBaseUrl() {
-  return (process.env.PUBLIC_APP_URL || process.env.FRONTEND_ORIGIN || "http://localhost:5173").replace(/\/+$/, "");
-}
 function invitePath() {
   return process.env.CUSTOMER_INVITE_PATH || "/customer/invite";
 }
@@ -720,7 +718,7 @@ async function sendInviteEmail(params: { to: string; customerId: string; inviter
     inviterEmail: normEmail(params.inviterEmail),
   });
 
-  const url = `${publicBaseUrl()}${invitePath()}?token=${encodeURIComponent(token)}`;
+  const url = `${publicAppUrl()}${invitePath()}?token=${encodeURIComponent(token)}`;
 
   const subject = "You're invited to PlumTrips HRMS";
   const body = `
