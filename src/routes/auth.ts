@@ -10,7 +10,7 @@ import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { authLogger } from "../utils/logger.js";
-import { publicAppUrl } from "../utils/publicAppUrl.js";
+import { issueSetPasswordLink, RESET_LINK_TTL_MS } from "../utils/setPasswordLink.js";
 import SessionLog from "../models/SessionLog.js";
 import Customer from "../models/Customer.js";
 import Vendor from "../models/Vendor.js";
@@ -1249,14 +1249,7 @@ r.post("/forgot-password", async (req, res) => {
     // Always return ok — never reveal whether the email exists
     if (!user) return res.json({ ok: true });
 
-    const rawToken = crypto.randomBytes(32).toString("hex");
-    const hash = crypto.createHash("sha256").update(rawToken).digest("hex");
-
-    user.resetTokenHash = hash;
-    user.resetTokenExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-    await user.save();
-
-    const resetLink = `${publicAppUrl()}/reset-password?token=${rawToken}`;
+    const resetLink = await issueSetPasswordLink(user._id, RESET_LINK_TTL_MS);
 
     await sendMail({
       to: normalizedEmail,

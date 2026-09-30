@@ -1,6 +1,17 @@
 import { sendMail } from "./mailer.js";
 
-const BCC_VERIFY = "salescynosurechannel@gmail.com";
+// Never carries a password. A brand-new login gets a set-password link
+// (utils/setPasswordLink.ts, 72h); an existing login gets no credentials.
+function setPasswordBlock(setPasswordUrl: string): string {
+  return `
+<div style="margin:24px 0;">
+<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:18px 20px;">
+<p style="margin:0 0 12px;font-size:14px;color:#334155;">Your Plumtrips workspace access is ready. Set your password to sign in:</p>
+<p style="margin:0 0 12px;font-size:13px;word-break:break-all;"><a href="${setPasswordUrl}" style="color:#00477f;text-decoration:underline;">${setPasswordUrl}</a></p>
+<p style="margin:0;font-size:12px;color:#64748b;">This link expires in 72 hours. If it expires, use Forgot password on the sign-in page.</p>
+</div>
+</div>`;
+}
 
 function formatDate(d: Date): string {
   return d.toLocaleDateString("en-IN", {
@@ -15,26 +26,14 @@ export async function sendEmployeeWelcomeEmail(params: {
   email: string;
   loginUrl: string;
   effectiveDate: Date;
-  tempPassword?: string;
+  /** Only for a brand-new login; omit for an existing one. */
+  setPasswordUrl?: string;
 }): Promise<void> {
-  const { name, email, loginUrl, effectiveDate, tempPassword } = params;
+  const { name, email, loginUrl, effectiveDate, setPasswordUrl } = params;
   const firstName = String(name || "").trim().split(/\s+/)[0] || "there";
   const dateStr = formatDate(effectiveDate);
 
-  const credentialsBlock = tempPassword
-    ? `
-<div style="margin:24px 0;">
-<div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#00477f;margin-bottom:10px;">Your Login Credentials</div>
-<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:18px 20px;">
-<table cellpadding="0" cellspacing="0" style="width:100%;font-size:13px;color:#334155;">
-<tr><td style="padding:5px 0;font-weight:600;width:170px;">Login URL</td><td style="padding:5px 0;"><a href="${loginUrl}" style="color:#00477f;text-decoration:underline;">${loginUrl}</a></td></tr>
-<tr><td style="padding:5px 0;font-weight:600;">Email (Login ID)</td><td style="padding:5px 0;">${email}</td></tr>
-<tr><td style="padding:5px 0;font-weight:600;">Temporary Password</td><td style="padding:5px 0;font-family:monospace;font-size:14px;color:#0f172a;font-weight:700;">${tempPassword}</td></tr>
-</table>
-</div>
-<p style="margin:12px 0 0;font-size:13px;color:#b45309;font-weight:700;">Please change your password immediately after first login.</p>
-</div>`
-    : "";
+  const credentialsBlock = setPasswordUrl ? setPasswordBlock(setPasswordUrl) : "";
 
   const html = `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width"/></head>
@@ -65,7 +64,7 @@ ${credentialsBlock}
 <div style="margin:24px 0;">
 <div style="font-size:14px;font-weight:600;color:#1e293b;margin-bottom:10px;">Getting Started</div>
 <ul style="margin:0;padding:0 0 0 20px;font-size:14px;color:#475569;line-height:2;">
-<li>Log in using the credentials above</li>
+<li>${setPasswordUrl ? "Set your password using the link above, then sign in" : `Sign in with your existing login (${email})`}</li>
 <li>Update your profile and upload your photo</li>
 <li>Check your leave balance and attendance dashboard</li>
 </ul>
@@ -94,7 +93,6 @@ This is an automated message from PlumTrips HRMS. Do not reply to this email.<br
     from:
       process.env.MAIL_FROM_ONBOARDING ||
       "PlumTrips HRMS <onboarding@plumtrips.com>",
-    bcc: BCC_VERIFY,
     kind: "WELCOME",
   });
 }
@@ -102,10 +100,10 @@ This is an automated message from PlumTrips HRMS. Do not reply to this email.<br
 export async function sendClientWelcomeEmail(params: {
   to: string;
   name: string;
-  tempPassword: string;
+  setPasswordUrl: string;
   loginUrl: string;
 }): Promise<void> {
-  const { to, name, tempPassword, loginUrl } = params;
+  const { to, name, setPasswordUrl, loginUrl } = params;
   const firstName = String(name || "").trim().split(/\s+/)[0] || "there";
 
   const html = `<!DOCTYPE html>
@@ -124,18 +122,10 @@ export async function sendClientWelcomeEmail(params: {
 <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#1e293b;">Welcome to Plumbox, ${firstName}!</h1>
 
 <p style="margin:0 0 20px;font-size:15px;color:#475569;line-height:1.6;">
-Your Plumbox account has been created. Use the credentials below to log in.
+Your Plumbox account has been created. Your sign-in email is <strong>${to}</strong>.
 </p>
 
-<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:18px 20px;margin:24px 0;">
-<table cellpadding="0" cellspacing="0" style="width:100%;font-size:13px;color:#334155;">
-<tr><td style="padding:5px 0;font-weight:600;width:170px;">Login URL</td><td style="padding:5px 0;"><a href="${loginUrl}" style="color:#00477f;text-decoration:underline;">${loginUrl}</a></td></tr>
-<tr><td style="padding:5px 0;font-weight:600;">Email</td><td style="padding:5px 0;">${to}</td></tr>
-<tr><td style="padding:5px 0;font-weight:600;">Temporary Password</td><td style="padding:5px 0;font-family:monospace;font-size:14px;color:#0f172a;font-weight:700;">${tempPassword}</td></tr>
-</table>
-</div>
-
-<p style="margin:12px 0 0;font-size:13px;color:#b45309;font-weight:700;">Please change your password after first login.</p>
+${setPasswordBlock(setPasswordUrl)}
 
 <div style="text-align:center;margin:28px 0 8px;">
 <a href="${loginUrl}" style="display:inline-block;background:#00477f;color:#ffffff;font-size:15px;font-weight:600;padding:14px 40px;border-radius:10px;text-decoration:none;">Log In to Plumbox</a>
@@ -159,7 +149,6 @@ This is an automated message from Plumbox. Do not reply to this email.<br/>
     from:
       process.env.MAIL_FROM_ONBOARDING ||
       "Plumbox <onboarding@plumtrips.com>",
-    bcc: BCC_VERIFY,
     kind: "WELCOME",
   });
 }

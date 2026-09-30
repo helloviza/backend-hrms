@@ -16,8 +16,7 @@ import { ensureCustomerWorkspace } from "../services/customerWorkspace.service.j
 import { scopedFindById } from "../middleware/scopedFindById.js";
 
 import { sendMail } from "../utils/mailer.js";
-import { signEmailActionToken } from "../utils/emailActionToken.js";
-import { publicAppUrl } from "../utils/publicAppUrl.js";
+import { issueSetPasswordLink, ONBOARDING_LINK_TTL_MS } from "../utils/setPasswordLink.js";
 import { isGenericDomain } from "../utils/blockedDomains.js";
 import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMemberRoles.js";
 import { generateTravelerId } from "../utils/travelerId.js";
@@ -191,10 +190,6 @@ export function isStaffPrivileged(u: any) {
     r.includes("HR") ||
     r.includes("HR_ADMIN")
   );
-}
-
-function invitePath() {
-  return process.env.CUSTOMER_INVITE_PATH || "/customer/invite";
 }
 
 async function getActorMember(customerId: string, actorEmail: string) {
@@ -584,6 +579,15 @@ async function ensureOwnerIsLeaderSafe(customerId: string, ws: any, actor: any, 
   return actorEmail;
 }
 
+/** Append an approver to the end of the workspace's defaultApproverEmails (no-op if present). */
+async function appendDefaultApprover(ws: any, email: string) {
+  const list = normalizeEmailList((ws as any).defaultApproverEmails);
+  if (!list.includes(email)) {
+    (ws as any).defaultApproverEmails = [...list, email];
+    await ws.save();
+  }
+}
+
 async function ensureDefaultApproverFallback(ws: any, leaderEmail: string, actor?: any) {
   const list = normalizeEmailList((ws as any)?.defaultApproverEmails);
   if (list.length > 0) return list;
@@ -711,21 +715,28 @@ export async function trySendInviteEmailSafe(params: { to: string; customerId: s
 }
 
 async function sendInviteEmail(params: { to: string; customerId: string; inviterEmail: string; inviteeName?: string }) {
-  const token = signEmailActionToken({
-    purpose: "customer_invite",
-    email: normEmail(params.to),
+  // The login this invite is for — same scoped lookup as
+  // ensureAuthUserForCustomer, so an invite from one workspace can never
+  // issue a set-password link for another workspace's user.
+  const email = normEmail(params.to);
+  const user: any = await User.findOne({
+    $or: [{ email }, { officialEmail: email }, { personalEmail: email }],
     customerId: normStr(params.customerId),
-    inviterEmail: normEmail(params.inviterEmail),
-  });
+  })
+    .select("_id")
+    .lean()
+    .exec();
+  if (!user) throw new Error("No login for this email in this workspace");
 
-  const url = `${publicAppUrl()}${invitePath()}?token=${encodeURIComponent(token)}`;
+  const url = await issueSetPasswordLink(user._id, ONBOARDING_LINK_TTL_MS);
 
   const subject = "You're invited to PlumTrips HRMS";
   const body = `
     <div style="font-family:Arial,sans-serif;line-height:1.5">
       <p>Hi ${params.inviteeName ? normStr(params.inviteeName) : "there"},</p>
-      <p>Your workspace access has been created. Click below to continue:</p>
+      <p>Your Plumtrips workspace access is ready. Set your password to sign in:</p>
       <p><a href="${url}" target="_blank" rel="noreferrer">${url}</a></p>
+      <p>This link expires in 72 hours. If it expires, use Forgot password on the sign-in page.</p>
       <p style="color:#666;font-size:12px">If you didn’t expect this email, you can ignore it.</p>
     </div>
   `;
@@ -1972,11 +1983,7 @@ router.post("/bulk", requireAuth, upload.single("file"), async (req: any, res) =
 
       const setAsDefaultApprover = normBool(row.setAsDefaultApprover);
       if (role === "APPROVER" && setAsDefaultApprover) {
-        const list = normalizeEmailList((ws as any).defaultApproverEmails);
-        if (!list.includes(email)) {
-          (ws as any).defaultApproverEmails = [...list, email];
-          await ws.save();
-        }
+        await appendDefaultApprover(ws, email);
       }
 
       await ensureDefaultApproverFallback(ws, leaderEmail, actor);
@@ -2209,11 +2216,7 @@ router.post("/", requireAuth, async (req: any, res) => {
 
     const setAsDefaultApprover = normBool(req.body?.setAsDefaultApprover);
     if (role === "APPROVER" && setAsDefaultApprover) {
-      const list = normalizeEmailList((ws as any).defaultApproverEmails);
-      if (!list.includes(email)) {
-        (ws as any).defaultApproverEmails = [...list, email];
-        await ws.save();
-      }
+      await appendDefaultApprover(ws, email);
     }
 
     await ensureDefaultApproverFallback(ws, leaderEmail, actor);
@@ -2769,18 +2772,30 @@ router.post("/workspace/invite", requireAuth, async (req: any, res: any) => {
       : "REQUESTER";
 
     const wsForInvite: any = await ensureWorkspace(customerId);
-    const { user: targetUser } = await ensureAuthUserForCustomer({
+    const { user: targetUser, conflict } = await ensureAuthUserForCustomer({
       email,
       customerId,
       workspaceId: wsForInvite._id,
       memberRole,
     });
+    if (conflict || !targetUser) {
+      return res.status(409).json({
+        error: "This email already has a login in another workspace. Use a different email, or contact PlumTrips support.",
+        code: "EMAIL_IN_OTHER_WORKSPACE",
+      });
+    }
 
     await CustomerMember.findOneAndUpdate(
       { email: normEmail(email), customerId },
       { $set: { role: memberRole, customerId, email: normEmail(email), userId: String(targetUser._id), isActive: true } },
       { upsert: true, new: true },
     );
+
+    // An invited APPROVER joins the workspace's approver list (appended, so
+    // an existing defaultApproverEmails[0] keeps first place).
+    if (memberRole === "APPROVER") {
+      await appendDefaultApprover(wsForInvite, normEmail(email));
+    }
 
     const emailResult = await trySendInviteEmailSafe({
       to: normEmail(email),

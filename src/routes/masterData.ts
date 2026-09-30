@@ -21,6 +21,7 @@ import { sendMail } from "../utils/mailer.js";
 import { sendCredentialsEmail } from "../utils/credentialsEmail.js";
 import { sendOnboardingWelcomeEmail } from "../utils/onboardingWelcomeEmail.js";
 import { sendEmployeeWelcomeEmail, sendClientWelcomeEmail } from "../utils/employeeWelcomeEmail.js";
+import { issueSetPasswordLink, ONBOARDING_LINK_TTL_MS } from "../utils/setPasswordLink.js";
 import { UserPermission } from "../models/UserPermission.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { generateTravelerId } from "../utils/travelerId.js";
@@ -1483,12 +1484,13 @@ router.post(
 (onboardingDoc as any).employeeCode = employeeCode;
 (onboardingDoc as any).linkedUserId = user._id;
 
-// Always sent: this email is the ONLY delivery of the new login's temp
-// password. Gating it on welcomeEmailSent (already true once approval sent
-// its welcome) would leave the employee with an account they can't open.
+// Always sent: this email is the ONLY delivery of the new login's
+// set-password link. Gating it on welcomeEmailSent (already true once approval
+// sent its welcome) would leave the employee with an account they can't open.
 {
   try {
     const loginUrl = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
+    const setPasswordUrl = await issueSetPasswordLink(user._id, ONBOARDING_LINK_TTL_MS);
     await sendEmployeeWelcomeEmail({
       name: baseName || "Employee",
       email: email!,
@@ -1498,7 +1500,7 @@ router.post(
         onboardingDoc.dateOfJoining ||
         Date.now()
       ),
-      tempPassword,
+      setPasswordUrl,
     });
   } catch (empEmailErr) {
     console.error("[promote-employee] welcome email failed:", empEmailErr);
@@ -1713,10 +1715,10 @@ if (email) {
 
     try {
       await sendClientWelcomeEmail({
-        to:        email,
-        name:      (vendorUser as any).name,
-        tempPassword,
-        loginUrl:  'https://plumbox.plumtrips.com',
+        to:             email,
+        name:           (vendorUser as any).name,
+        setPasswordUrl: await issueSetPasswordLink((vendorUser as any)._id, ONBOARDING_LINK_TTL_MS),
+        loginUrl:       'https://plumbox.plumtrips.com',
       })
     } catch (emailErr) {
       console.warn('[promote-vendor] Welcome email failed:', emailErr)
@@ -2117,10 +2119,10 @@ if (email) {
     if (sendEmail) {
       try {
         await sendClientWelcomeEmail({
-          to:        email,
-          name:      (clientUser as any).name,
-          tempPassword,
-          loginUrl:  'https://plumbox.plumtrips.com',
+          to:             email,
+          name:           (clientUser as any).name,
+          setPasswordUrl: await issueSetPasswordLink((clientUser as any)._id, ONBOARDING_LINK_TTL_MS),
+          loginUrl:       'https://plumbox.plumtrips.com',
         })
       } catch (emailErr) {
         console.warn('[promote-customer] Welcome email failed:', emailErr)

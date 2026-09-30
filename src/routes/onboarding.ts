@@ -23,6 +23,7 @@ import { sendOnboardingEmail } from "../emails/index.js";
 import { sendOnboardingWelcomeEmail } from "../utils/onboardingWelcomeEmail.js";
 import { sendRejectionEmail } from "../utils/credentialsEmail.js";
 import { sendEmployeeWelcomeEmail } from "../utils/employeeWelcomeEmail.js";
+import { issueSetPasswordLink, ONBOARDING_LINK_TTL_MS } from "../utils/setPasswordLink.js";
 import { syncCustomerFromOnboarding } from "../services/syncCustomerFromOnboarding.js";
 
 const router = Router();
@@ -213,7 +214,7 @@ function buildEducationString(edu: any): string | undefined {
 
 async function syncEmployeeFromOnboarding(
   rawDoc: OnboardingDoc | any
-): Promise<{ tempPassword: string; email: string } | null> {
+): Promise<{ userId: string; email: string } | null> {
   try {
     const doc = rawDoc as OnboardingDoc;
     const type = String(doc.type || "").toLowerCase();
@@ -341,7 +342,9 @@ async function syncEmployeeFromOnboarding(
         tempPassword: true,
       });
 
-      return { tempPassword, email };
+      // The random password is never handed out; the welcome email carries a
+      // set-password link for this new login instead.
+      return { userId: String(user._id), email };
     } else {
       Object.assign(user, update);
       if (!user.workspaceId && resolvedWorkspaceId) {
@@ -1424,7 +1427,7 @@ router.post("/:token/decision", requireAuth, requireWorkspace, requireAdmin, noS
           const loginUrl = (env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "") + "/login";
 
           if (docType === "employee") {
-            // Employee: warm welcome with credentials included
+            // Employee: warm welcome; a brand-new login gets a set-password link
             const officialEmail =
               doc.formPayload?.contact?.companyEmail ||
               doc.formPayload?.contact?.workEmail ||
@@ -1436,7 +1439,9 @@ router.post("/:token/decision", requireAuth, requireWorkspace, requireAdmin, noS
               email: officialEmail,
               loginUrl,
               effectiveDate: new Date(),
-              tempPassword: syncResult?.tempPassword,
+              setPasswordUrl: syncResult?.userId
+                ? await issueSetPasswordLink(syncResult.userId, ONBOARDING_LINK_TTL_MS)
+                : undefined,
             });
           } else {
             // Vendor / Customer: formal welcome

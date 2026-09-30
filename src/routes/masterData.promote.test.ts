@@ -13,6 +13,7 @@ import { MongoMemoryServer } from "mongodb-memory-server";
 import express from "express";
 import request from "supertest";
 import jwt from "jsonwebtoken";
+import { createHash } from "crypto";
 
 const SECRET = "masterdata-promote-test-secret";
 process.env.JWT_SECRET = SECRET;
@@ -458,7 +459,7 @@ describe("onboarding fields now persist", () => {
     expect(subjects()).toEqual([]);
   });
 
-  it("a new employee login still gets its temp-password email after approval sent the welcome", async () => {
+  it("a new employee login still gets its set-password email after approval sent the welcome", async () => {
     const ob = await onboarding({
       type: "employee",
       status: "approved",
@@ -471,7 +472,21 @@ describe("onboarding fields now persist", () => {
     expect(res.status).toBe(200);
     expect(subjects()).toHaveLength(1);
     expect(subjects()[0].startsWith(EMPLOYEE_WELCOME)).toBe(true);
-    expect(String(mail.mock.calls[0][0].html)).toMatch(/Temporary Password/);
+
+    // No password in the email and no BCC — a set-password link instead, whose
+    // token is stored hashed on the new login with a ~72h expiry.
+    const sent = mail.mock.calls[0][0];
+    const html = String(sent.html);
+    expect(html).not.toMatch(/Temporary Password/);
+    expect(sent.bcc).toBeUndefined();
+    const token = html.match(/\/reset-password\?token=([0-9a-f]{64})/)?.[1];
+    expect(token).toBeTruthy();
+    const hash = createHash("sha256").update(String(token)).digest("hex");
+    const login: any = await User.findOne({ resetTokenHash: hash }).lean();
+    expect(login?.email).toBe("dev@plumtrips.com");
+    const hoursLeft = (new Date(login.resetTokenExpiry).getTime() - Date.now()) / 3_600_000;
+    expect(hoursLeft).toBeGreaterThan(71);
+    expect(hoursLeft).toBeLessThanOrEqual(72);
   });
 
   it("an existing employee login gets no second welcome once approval sent one", async () => {
