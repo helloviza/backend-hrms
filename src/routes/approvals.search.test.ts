@@ -42,7 +42,13 @@ vi.mock("../middleware/requireWorkspace.js", () => ({
     next();
   },
 }));
-vi.mock("../utils/mailer.js", () => ({ sendMail: async () => ({ messageId: "test" }) }));
+const mails = vi.hoisted(() => [] as Array<{ to: any; subject: string; html: string }>);
+vi.mock("../utils/mailer.js", () => ({
+  sendMail: async (m: any) => {
+    mails.push({ to: m.to, subject: String(m.subject || ""), html: String(m.html || "") });
+    return { messageId: "test" };
+  },
+}));
 const tbo = vi.hoisted(() => ({ flights: null as any, hotels: null as any }));
 vi.mock("../services/tbo.flight.service.js", async (orig) => {
   const { vi: v } = await import("vitest");
@@ -638,5 +644,73 @@ describe("POST /search/hotels", () => {
     tbo.hotels.mockResolvedValueOnce({ ok: false, status: 404, code: "NO_HOTELS_FOUND", message: "x" });
     r = await searchHotelsAs(U.req, hotelBody());
     expect([r.status, r.body.message, r.body.hotels]).toEqual([200, "No hotels found", []]);
+  });
+});
+
+/* ── emails + leader access ──────────────────────────────────────────────── */
+
+describe("the picked option in emails, and no snapshot for a Workspace Leader", () => {
+  beforeEach(() => {
+    tbo.flights.mockReset();
+    mails.length = 0;
+  });
+
+  it("approver email and leader FYI show the selected flight, with no price", async () => {
+    tbo.flights.mockResolvedValue(tboOk([
+      [tboFlight("OB1", [[tboSeg("5321", "BLR", "BOM", "2026-10-12T06:10:00", "2026-10-12T07:55:00")]])],
+      [tboFlight("IB1", [[tboSeg("640", "BOM", "BLR", "2026-10-15T18:00:00", "2026-10-15T19:50:00")]], { IsRefundable: false })],
+    ]));
+    const r = await searchFlightsAs(U.req, flightBody({ tripType: "roundtrip", returnDate: "2026-10-15" }));
+    const created = await createReq(U.req, WS, [flightItem({
+      tripType: "roundtrip", returnDate: "2026-10-15",
+      optionRef: r.body.outbound[0].optionRef, returnOptionRef: r.body.inbound[0].optionRef,
+    })]);
+    expect(created.status).toBe(200);
+
+    const approver = mails.find((m) => String(m.to).includes("approver@cust.test"));
+    expect(approver, mails.map((m) => m.subject).join(" | ")).toBeTruthy();
+    expect(approver!.html).toContain("Outbound flight");
+    expect(approver!.html).toContain("IndiGo 6E 5321");
+    expect(approver!.html).toContain("Return flight");
+    expect(approver!.html).toContain("6E 640");
+    expect(approver!.html).toMatch(/BLR 06:10 → BOM 07:55 · 12 Oct 2026 · 1h 45m · Non-stop/);
+    expect(approver!.html).toMatch(/Economy · 15 Kg \+ 7 Kg cabin · Saver · Refundable/);
+    expect(approver!.html).toContain("Non-refundable");
+
+    const fyi = mails.find((m) => /^FYI/.test(m.subject));
+    expect(fyi, mails.map((m) => m.subject).join(" | ")).toBeTruthy();
+    expect(fyi!.html).toContain("Selected: 6E 5321 BLR 06:10 → BOM 07:55");
+
+    for (const m of [approver!, fyi!]) {
+      expect(m.html).not.toMatch(/₹|&#8377;|\bINR\b|\bRs\.?\s*\d/);
+      expect(m.html).not.toMatch(/5432|5280|4632|Fare|fare/);
+    }
+  });
+
+  it("hotel selection in the approver email: name, stars, room, meal plan, cancel-by", async () => {
+    const h = await createSearchSession({
+      workspaceId: WS, userId: String(U.req), kind: "hotel", params: { CheckIn: "2026-10-12", CheckOut: "2026-10-14" },
+      results: [{ ...hotelRaw, Rooms: [{ ...hotelRaw.Rooms[0], CancelPolicies: [{ FromDate: "10-10-2026 00:00:00", CancellationCharge: 100 }] }] }],
+    });
+    await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { city: "Mumbai", checkIn: "2026-10-12", checkOut: "2026-10-14", optionRef: optionRefFor(h.sid, 0, 0) } }]);
+    const approver = mails.find((m) => String(m.to).includes("approver@cust.test"));
+    expect(approver!.html).toContain("Taj Lands End (5★)");
+    expect(approver!.html).toContain("Luxury Room · Breakfast");
+    expect(approver!.html).toContain("free cancellation before 10 Oct 2026");
+    expect(approver!.html).not.toMatch(/₹|\bINR\b|28400|14200/);
+  });
+
+  it("a Workspace Leader cannot read the snapshot of a request in their own workspace", async () => {
+    const sid = await flightSession(U.req, WS);
+    await createReq(U.req, WS, [flightItem({ optionRef: optionRefFor(sid, 0) })]);
+    const id = String((await col("approvalrequests").findOne({}))!._id);
+    const r = await as(request(app).get(`/api/approvals/admin/requests/${id}/selection-snapshot`), U.wl, WS, ["WORKSPACE_LEADER"]);
+    expect(r.status).toBe(403);
+    expect(r.body.snapshots).toBeUndefined();
+    // the same leader still reads the request itself, with the price-free selection only
+    const detail = await as(request(app).get(`/api/approvals/admin/requests/${id}`), U.wl, WS, ["WORKSPACE_LEADER"]);
+    expect(detail.status).toBe(200);
+    expect(detail.body.cartItems[0].meta.selection.kind).toBe("flight");
+    expect(JSON.stringify(detail.body)).not.toMatch(/5432|PublishedFare|rawOption/);
   });
 });

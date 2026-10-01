@@ -648,6 +648,87 @@ export function eItemsHtml(items: any[]): string {
  * Clean item card helpers (used by buildApproverEmailHtml)
  * ──────────────────────────────────────────────────────────────── */
 
+/* ── Live-search pick (meta.selection) — price-free by construction ──────── */
+
+const selHm = (iso: any) => {
+  const m = String(iso ?? "").match(/T(\d{2}:\d{2})/);
+  return m ? m[1] : "";
+};
+const selDay = (iso: any) => {
+  const d = new Date(String(iso ?? "").slice(0, 10) + "T00:00:00Z");
+  return isNaN(d.getTime())
+    ? ""
+    : d.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+};
+const selDuration = (min: any) => {
+  const n = Number(min) || 0;
+  return n ? `${Math.floor(n / 60)}h ${String(n % 60).padStart(2, "0")}m` : "";
+};
+const selStops = (n: any) => (Number(n) === 0 ? "Non-stop" : Number(n) === 1 ? "1 stop" : `${Number(n) || 0} stops`);
+const selRefund = (v: any, cancelBy?: any) =>
+  v === true ? (cancelBy ? `Refundable · free cancellation before ${selDay(cancelBy)}` : "Refundable") : v === false ? "Non-refundable" : "";
+
+function selectionOf(m: any): any | null {
+  const s = m?.selection;
+  return s && typeof s === "object" && (s.kind === "flight" || s.kind === "hotel") ? s : null;
+}
+
+/** [label, text] rows describing the picked flight/hotel. Plain text — callers escape. */
+export function selectionEmailRows(m: any): Array<[string, string]> {
+  const s = selectionOf(m);
+  if (!s) return [];
+  const clean = (v: any) => stripPriceText(String(v ?? "").trim());
+  if (s.kind === "hotel") {
+    return ([
+      ["Hotel", `${clean(s.name)}${Number(s.stars) > 0 ? ` (${Number(s.stars)}★)` : ""}`],
+      ["Address", clean(s.address)],
+      ["Room", [clean(s.roomName), clean(s.mealPlan)].filter(Boolean).join(" · ")],
+      ["Cancellation", selRefund(s.refundable, s.cancelBy)],
+    ] as Array<[string, string]>).filter(([, v]) => v);
+  }
+  const legs: any[] = Array.isArray(s.legs) ? s.legs : [];
+  const rows: Array<[string, string]> = [];
+  for (const leg of legs) {
+    const segs: any[] = Array.isArray(leg?.segments) ? leg.segments : [];
+    const first = segs[0];
+    const last = segs[segs.length - 1];
+    if (!first || !last) continue;
+    const label = legs.length > 1 ? (leg.direction === "back" ? "Return flight" : "Outbound flight") : "Selected flight";
+    const flights = segs.map((x) => `${clean(x.airlineCode)} ${clean(x.flightNumber)}`).join(" + ");
+    rows.push([label, `${clean(first.airlineName)} ${flights}`]);
+    rows.push([
+      "",
+      `${clean(first.from?.code)} ${selHm(first.departAt)} → ${clean(last.to?.code)} ${selHm(last.arriveAt)} · ${selDay(first.departAt)} · ${selDuration(leg.journeyMin)} · ${selStops(leg.stopCount)}`,
+    ]);
+    const bag = [clean(first.baggage?.checkIn), first.baggage?.cabin ? `${clean(first.baggage.cabin)} cabin` : ""].filter(Boolean).join(" + ");
+    rows.push(["", [clean(first.cabin), bag, clean(leg.productLabel), selRefund(leg.refundable)].filter(Boolean).join(" · ")]);
+  }
+  return rows;
+}
+
+/** One line for compact emails (leader FYI). */
+export function selectionEmailLine(m: any): string {
+  const s = selectionOf(m);
+  if (!s) return "";
+  if (s.kind === "hotel") return [s.name, s.roomName, s.mealPlan].map((v) => stripPriceText(String(v ?? "").trim())).filter(Boolean).join(" · ");
+  return (Array.isArray(s.legs) ? s.legs : [])
+    .map((leg: any) => {
+      const segs: any[] = Array.isArray(leg?.segments) ? leg.segments : [];
+      const f = segs[0];
+      const l = segs[segs.length - 1];
+      return f && l ? `${f.airlineCode} ${f.flightNumber} ${f.from?.code} ${selHm(f.departAt)} → ${l.to?.code} ${selHm(l.arriveAt)} ${selDay(f.departAt)}` : "";
+    })
+    .filter(Boolean)
+    .map((x: string) => stripPriceText(x))
+    .join(" | ");
+}
+
+function selectionDetailRows(m: any): string {
+  return selectionEmailRows(m)
+    .map(([label, value]) => approverDetailRow(escapeHtml(label), escapeHtml(value)))
+    .join("");
+}
+
 function approverDetailRow(label: string, value: string): string {
   return (
     "<tr>" +
@@ -689,7 +770,7 @@ function buildCleanItemHtml(it: any): string {
   const m = pickMeta(it);
 
   if (isHotel) {
-    const propertyName = safeStr(m?.hotelName || m?.propertyName || it?.hotelName || it?.propertyName || it?.title);
+    const propertyName = safeStr(selectionOf(m)?.name || m?.hotelName || m?.propertyName || it?.hotelName || it?.propertyName || it?.title);
     const checkIn      = safeStr(m?.checkIn || m?.checkInDate || it?.checkIn || it?.checkInDate);
     const checkOut     = safeStr(m?.checkOut || m?.checkOutDate || it?.checkOut || it?.checkOutDate);
     const rooms        = safeStr(m?.rooms || m?.roomCount || it?.rooms || it?.roomCount);
@@ -708,6 +789,7 @@ function buildCleanItemHtml(it: any): string {
       <table cellpadding="0" cellspacing="0">
         ${checkIn  ? approverDetailRow("Check-In",  escapeHtml(checkIn))  : ""}
         ${checkOut ? approverDetailRow("Check-Out", escapeHtml(checkOut)) : ""}
+        ${selectionDetailRows(m)}
       </table>
     </td>
     <td width="70" valign="top" align="right">
@@ -807,6 +889,7 @@ function buildCleanItemHtml(it: any): string {
       <table cellpadding="0" cellspacing="0">
         ${departDate    ? approverDetailRow("Depart Date",    escapeHtml(departDate))    : ""}
         ${returnDate    ? approverDetailRow("Return Date",    escapeHtml(returnDate))    : ""}
+        ${selectionDetailRows(m)}
         ${preferredTime ? approverDetailRow("Preferred Time", escapeHtml(preferredTime)) : ""}
         ${priority      ? approverDetailRow("Priority",       escapeHtml(priority))      : ""}
         ${notes         ? approverDetailRow("Notes",          escapeHtml(notes))         : ""}
@@ -1068,6 +1151,7 @@ export function buildLeaderFyiHtml(opts: {
     .map((it, idx) => {
       const title = escapeHtml(stripPriceText(String(it?.title || it?.type || "Item").trim()));
       const desc = escapeHtml(firstLine(stripPriceText(it?.description || ""), 110));
+      const picked = escapeHtml(selectionEmailLine(pickMeta(it)));
       const typeLabel = escapeHtml(serviceTypeOfItem(it).toUpperCase());
       return `
         <tr>
@@ -1078,6 +1162,11 @@ export function buildLeaderFyiHtml(opts: {
             <div style="margin-top:6px;font-size:14px;color:${ink};font-weight:900;line-height:1.25;">
               ${title}
             </div>
+            ${
+              picked
+                ? `<div style="margin-top:6px;font-size:13px;line-height:1.55;color:${ink};">Selected: ${picked}</div>`
+                : ""
+            }
             ${
               desc
                 ? `<div style="margin-top:6px;font-size:13px;line-height:1.55;color:${slate};">${desc}</div>`
