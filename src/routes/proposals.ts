@@ -1981,7 +1981,6 @@ router.post(
               processedByName: adminName,
               comment: sanitizeAdminCommentForEmail(""),
               items: Array.isArray(ar.cartItems) ? ar.cartItems : [],
-              bookingAmount: ar.bookingAmount,
             }),
           });
         } catch {

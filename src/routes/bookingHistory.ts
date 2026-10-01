@@ -6,6 +6,7 @@ import fs from "fs";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { requireAuth } from "../middleware/auth.js";
+import { sanitizeApprovalForViewer } from "./approvals.security.js";
 
 const router = Router();
 
@@ -423,7 +424,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
         const attachmentDownloadUrl = pdfCandidate ? makeAttachmentDownloadUrl(pdfCandidate) : "";
         const requesterEmail = String(r.requesterEmail || r.frontlinerEmail || "").toLowerCase();
 
-        return {
+        return sanitizeApprovalForViewer({
           ...r,
           requesterTravelerId: travelerMap.get(requesterEmail) || "",
           _latestParsed: {
@@ -435,7 +436,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
             attachmentDownloadUrl,
             raw: parsed.raw,
           },
-        };
+        }, user);
       }),
     });
   }
@@ -480,7 +481,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
       const attachmentDownloadUrl = pdfCandidate ? makeAttachmentDownloadUrl(pdfCandidate) : "";
       const requesterEmail = String(r.requesterEmail || r.frontlinerEmail || "").toLowerCase();
 
-      return {
+      return sanitizeApprovalForViewer({
         ...r,
         history: safeHist,
         requesterTravelerId: travelerMap.get(requesterEmail) || "",
@@ -493,7 +494,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
           attachmentDownloadUrl,
           raw: parsed.raw,
         },
-      };
+      }, user);
     });
 
     // Optional debug (helps you verify what ids were used)
@@ -527,7 +528,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
     const attachmentDownloadUrl = pdfCandidate ? makeAttachmentDownloadUrl(pdfCandidate) : "";
     const requesterEmail = String(r.requesterEmail || r.frontlinerEmail || "").toLowerCase();
 
-    return {
+    return sanitizeApprovalForViewer({
       ...r,
       history: safeHist,
       requesterTravelerId: travelerMap.get(requesterEmail) || "",
@@ -540,7 +541,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
         attachmentDownloadUrl,
         raw: parsed.raw,
       },
-    };
+    }, user);
   });
 
   return res.json({ ok: true, rows: out });

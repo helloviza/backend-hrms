@@ -53,6 +53,8 @@ import {
   setNoStore,
   uniqEmails,
   collectRoles,
+  sanitizeApprovalForViewer,
+  stripPriceText,
 } from "./approvals.security.js";
 
 import {
@@ -628,7 +630,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       await doc.save();
     }
 
-    res.json({ ok: true, request: doc, message: "Submitted for approval" });
+    res.json({ ok: true, request: sanitizeApprovalForViewer(doc, req.user), message: "Submitted for approval" });
   } catch (err) {
     next(err);
   }
@@ -653,10 +655,7 @@ router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("A
       .lean()
       .exec();
 
-    // sanitize on response for non-admin
-    const safeRows = rows.map((r: any) =>
-      isStaffAdmin(req.user) ? r : JSON.parse(JSON.stringify(r)),
-    );
+    const safeRows = rows.map((r: any) => sanitizeApprovalForViewer(r, req.user));
     res.json({ rows: safeRows });
   } catch (err) {
     next(err);
@@ -702,9 +701,7 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
       .lean()
       .exec();
 
-    const safeRows = rows.map((r: any) =>
-      isStaffAdmin(req.user) ? r : JSON.parse(JSON.stringify(r)),
-    );
+    const safeRows = rows.map((r: any) => sanitizeApprovalForViewer(r, req.user));
     res.json({ rows: safeRows });
   } catch (err) {
     next(err);
@@ -730,7 +727,7 @@ router.get("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
 
     if (!canView) return res.status(403).json({ error: "Not allowed" });
 
-    res.json({ ok: true, request: doc });
+    res.json({ ok: true, request: sanitizeApprovalForViewer(doc, user) });
   } catch (err) {
     next(err);
   }
@@ -784,7 +781,7 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
     });
 
     await doc.save();
-    res.json({ ok: true, request: doc, message: "Updated" });
+    res.json({ ok: true, request: sanitizeApprovalForViewer(doc, req.user), message: "Updated" });
   } catch (err) {
     next(err);
   }
@@ -909,7 +906,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
         doc.meta.resendCount = Number(doc.meta.resendCount || 0) + 1;
 
         await doc.save();
-        return res.json({ ok: true, request: doc, message: "Resent approval email" });
+        return res.json({ ok: true, request: sanitizeApprovalForViewer(doc, req.user), message: "Resent approval email" });
       } catch (e) {
         if (process.env.NODE_ENV !== "production") {
           // eslint-disable-next-line no-console
@@ -1062,7 +1059,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
       }
     }
 
-    res.json({ ok: true, request: doc, message: "Updated" });
+    res.json({ ok: true, request: sanitizeApprovalForViewer(doc, req.user), message: "Updated" });
   } catch (err) {
     next(err);
   }
@@ -1083,7 +1080,7 @@ router.get("/admin/pending", requireApprovalsAdminRead, async (req: AnyObj, res,
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows });
+    res.json({ rows: rows.map((r: any) => sanitizeApprovalForViewer(r, req.user)) });
   } catch (err) {
     next(err);
   }
@@ -1108,7 +1105,7 @@ router.get("/admin/approved", requireApprovalsAdminRead, async (req: AnyObj, res
       .lean()
       .exec();
 
-    res.json({ rows });
+    res.json({ rows: rows.map((r: any) => sanitizeApprovalForViewer(r, req.user)) });
   } catch (err) {
     next(err);
   }
@@ -1125,7 +1122,7 @@ router.get("/admin/done", requireApprovalsAdminRead, async (req: AnyObj, res, ne
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows });
+    res.json({ rows: rows.map((r: any) => sanitizeApprovalForViewer(r, req.user)) });
   } catch (err) {
     next(err);
   }
@@ -1142,7 +1139,7 @@ router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows });
+    res.json({ rows: rows.map((r: any) => sanitizeApprovalForViewer(r, req.user)) });
   } catch (err) {
     next(err);
   }
@@ -1161,7 +1158,7 @@ router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj,
 
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
-    res.json(doc);
+    res.json(sanitizeApprovalForViewer(doc, req.user));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1438,7 +1435,6 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
           processedByName: adminName,
           comment: sanitizeAdminCommentForEmail(comment),
           items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
-          bookingAmount: doc.bookingAmount,
           attachments: attachmentsForHtml,
         }),
         attachments: emailAtts.length ? emailAtts : undefined,
@@ -1865,9 +1861,25 @@ router.post("/email/consume", async (req: AnyObj, res) => {
       }
     }
 
+    // Public, token-only caller: return just what the decision page needs.
+    // Never the request document — it carries prices and everyone's emails.
+    const safe = sanitizeApprovalForViewer(doc, null);
+    const stageAfter = String(safe.stage || "").toUpperCase();
     return res.json({
       ok: true,
-      request: doc.toObject(),
+      request: {
+        id: String(safe._id),
+        ticketId: safe.ticketId || undefined,
+        requesterName: frontlinerDisplayNameEmail,
+        customerName: safe.customerName || undefined,
+        tripSummary: stripPriceText(pickTripSummary(safe.cartItems || []).seg),
+        status: safe.status,
+        stage: safe.stage,
+        allowedActions:
+          String(safe.status || "").toLowerCase() === "pending" && stageAfter === "REQUEST_ON_HOLD"
+            ? ["approved", "declined"]
+            : [],
+      },
       message: "Decision recorded successfully.",
     });
   } catch (err: any) {
@@ -1997,7 +2009,7 @@ router.put("/requests/:id/revoke", requireAuth, requireWorkspace, async (req: An
       { new: true }
     );
 
-    res.json({ ok: true, request: updated, message: "Request revoked" });
+    res.json({ ok: true, request: sanitizeApprovalForViewer(updated, req.user), message: "Request revoked" });
   } catch (err) {
     next(err);
   }
@@ -2100,7 +2112,7 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
       }
     } catch { /* non-blocking */ }
 
-    res.json({ ok: true, request: updated, message: "Resubmitted" });
+    res.json({ ok: true, request: sanitizeApprovalForViewer(updated, req.user), message: "Resubmitted" });
   } catch (err) {
     next(err);
   }

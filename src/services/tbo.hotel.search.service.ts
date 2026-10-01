@@ -28,7 +28,6 @@ import {
 } from "./tbo.hotel.shared.js";
 import {
   getMarginConfig,
-  applyMargin,
   applyMarginWithFloor,
 } from "../utils/margin.js";
 import { sbtLogger } from "../utils/logger.js";
@@ -463,20 +462,14 @@ export async function searchHotels(
     ...hotel,
     Rooms: hotel.Rooms?.map((room: any) => {
       const net = room.TotalFare ?? 0;
-      const markupAmount = marginPct > 0 ? applyMargin(net, marginPct) - net : 0;
-      const _rsp = typeof room.recommendedSellingRate === "number"
+      const rsp = typeof room.recommendedSellingRate === "number"
         ? room.recommendedSellingRate
         : null;
-      const _displayTotalFare = applyMarginWithFloor(net, marginPct, _rsp);
-      const _rspClamped = _rsp != null && _rsp > applyMargin(net, marginPct);
+      // Customer-facing (SBT /search): only the selling price is added. No
+      // _netAmount/_markupAmount/_marginPercent/_rsp/_rspClamped.
       return {
         ...room,
-        _netAmount: room.NetAmount ?? net,
-        _markupAmount: markupAmount,
-        _displayTotalFare,
-        _marginPercent: marginPct,
-        _rsp,
-        _rspClamped,
+        _displayTotalFare: applyMarginWithFloor(net, marginPct, rsp),
       };
     }),
   }));

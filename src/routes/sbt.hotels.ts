@@ -1041,9 +1041,6 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       ),
       rspFloorCeil,
     );
-    const rspClamped =
-      typeof recommendedSellingRate === "number" &&
-      recommendedSellingRate > applyMargin(prebookTotalFare, prebookMarginPct);
 
     // RC3a: Published Fare TDS extraction from PriceBreakUp node
     const priceBreakup: any[] = room0?.PriceBreakUp ?? [];
@@ -1083,12 +1080,10 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       priceDiff,
       netAmount,
       recommendedSellingRate,
-      rspClamped,
       supplements,
       cancelPolicies,
       isRefundable,
       displayTotalFare,
-      marginPercent: prebookMarginPct,
       tds,
       agentCommission,
       isPublishedFare,
@@ -3793,13 +3788,10 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
         typeof room.RecommendedSellingRate === "number"
           ? room.RecommendedSellingRate
           : null;
+      // Customer-facing: selling price only (see tbo.hotel.search.service).
       return {
         ...room,
-        _netAmount: room.NetAmount ?? net,
-        _markupAmount: roomsMarginPct > 0 ? applyMargin(net, roomsMarginPct) - net : 0,
         _displayTotalFare: applyMarginWithFloor(net, roomsMarginPct, _rsp),
-        _marginPercent: roomsMarginPct,
-        _rsp,
       };
     });
 

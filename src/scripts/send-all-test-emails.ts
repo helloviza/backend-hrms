@@ -238,7 +238,6 @@ async function sendBookingConfirmationEmail(doc: any) {
     processedByName: doc.managerName,
     comment: doc.adminComment || doc.comments,
     items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
-    bookingAmount: doc.bookingAmount,
     attachments: Array.isArray(doc.attachments) ? doc.attachments : [],
   });
 

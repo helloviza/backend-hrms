@@ -219,32 +219,95 @@ export function removeActualPriceFieldsDeep(obj: any) {
   }
 }
 
+/* ────────────────────────────────────────────────────────────────
+ * Security: no price of any kind to customer-side viewers
+ *
+ * Flows 2/3 are manual booking. Requester, approver, Workspace Leader and
+ * every other customer role see no amount anywhere in the request path;
+ * only Plumtrips staff (isStaffAdmin) do.
+ *
+ * A key is money when any camelCase / snake_case segment of it is in
+ * PRICE_KEY_TOKENS ("_netPublishedFare" → net|published|fare), or when its
+ * lowercased form contains one of PRICE_KEY_SUBSTRINGS (catches compounds
+ * written in one word: "bookingamount", "totalfare", "actualbookingprice").
+ * Ambiguous words (rate, tax, total, net, cost, fee, ...) are segment-only
+ * so "corporate", "taxi", "network" survive.
+ * ──────────────────────────────────────────────────────────────── */
+
+export const PRICE_KEY_TOKENS = new Set([
+  "price", "prices", "fare", "fares", "amount", "amounts",
+  "cost", "costs", "rate", "rates", "tax", "taxes", "total", "totals",
+  "margin", "margins", "markup", "markups", "commission", "commissions", "net",
+  "budget", "fee", "fees", "charge", "charges", "discount", "gst", "tds", "inr",
+]);
+
+export const PRICE_KEY_SUBSTRINGS = [
+  "price", "fare", "amount", "margin", "markup", "commission",
+];
+
+/** Keys that match the rules above but carry no number (a tier label). */
+const PRICE_KEY_KEEP = new Set(["budgetband"]);
+
+function keySegments(key: string): string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .split(/[^a-zA-Z0-9]+/)
+    .map((s) => s.toLowerCase())
+    .filter(Boolean);
+}
+
+export function isPriceKey(key: string): boolean {
+  const lk = String(key || "").toLowerCase();
+  if (!lk || PRICE_KEY_KEEP.has(lk)) return false;
+  if (keySegments(String(key)).some((s) => PRICE_KEY_TOKENS.has(s))) return true;
+  return PRICE_KEY_SUBSTRINGS.some((s) => lk.includes(s));
+}
+
+/**
+ * Currency figures in free text: "₹5,432", "(₹ 5,432)", "INR 5432.00",
+ * "Rs. 500", "5,432 INR", "₹4,200/nt", plus admin tags like
+ * "[BOOKING_AMOUNT:26000]" / "[ACTUAL_PRICE:32000]".
+ */
+const PRICE_TEXT_PATTERNS: RegExp[] = [
+  /\[\s*(?:ACTUAL[_ ]?)?(?:BOOKING[_ ]?)?(?:PRICE|AMOUNT|FARE|COST)\s*:[^\]]*\]/gi,
+  /\b(?:ACTUAL|BOOKING)[_ ]?(?:PRICE|AMOUNT)\s*:\s*[\d,]+(?:\.\d+)?/gi,
+  /\(\s*(?:₹|&#8377;|INR|Rs\.?)\s*[\d,]+(?:\.\d+)?\s*(?:\/\s*(?:nt|night))?\s*\)/gi,
+  /(?:₹|&#8377;|\bINR|\bRs\.?)\s*[\d,]+(?:\.\d+)?(?:\s*\/\s*(?:nt|night))?/gi,
+  /\b[\d,]+(?:\.\d+)?\s*(?:₹|INR\b)/gi,
+];
+
+export function stripPriceText(input: any): string {
+  let s = String(input ?? "");
+  if (!s) return s;
+  for (const rx of PRICE_TEXT_PATTERNS) s = s.replace(rx, " ");
+  // Separators the removed figure leaves dangling: "AI 101 — " / "IndiGo ()".
+  s = s.replace(/\(\s*\)/g, " ");
+  s = s.replace(/[ \t]*[—–\-|:,·][ \t]*$/gm, "");
+  s = s.replace(/[ \t]{2,}/g, " ").trim();
+  return s;
+}
+
+function stripPricesDeep(v: any): any {
+  if (typeof v === "string") return stripPriceText(v);
+  if (!v || typeof v !== "object") return v;
+  if (Array.isArray(v)) return v.map(stripPricesDeep);
+  const out: AnyObj = {};
+  for (const k of Object.keys(v)) {
+    if (isPriceKey(k)) continue;
+    out[k] = stripPricesDeep(v[k]);
+  }
+  return out;
+}
+
 export function sanitizeApprovalForViewer(doc: any, user: any) {
   // Admins can see everything
   if (isStaffAdmin(user)) return doc;
+  if (!doc) return doc;
 
-  // Make a safe mutable clone (works for lean objects + mongoose docs)
-  const safe = JSON.parse(JSON.stringify(doc));
-
-  // Strip ACTUAL_PRICE tokens from any user-visible text fields
-  if (safe.comments) safe.comments = stripActualPriceTokens(safe.comments);
-
-  if (Array.isArray(safe.history)) {
-    safe.history = safe.history.map((h: any) => {
-      if (h?.comment) h.comment = stripActualPriceTokens(h.comment);
-      return h;
-    });
-  }
-
-  // Remove actual price fields wherever they exist
-  removeActualPriceFieldsDeep(safe.meta);
-  removeActualPriceFieldsDeep(safe.cartItems);
-
-  // ✅ ALSO remove root-level internal pricing
-  if ("actualBookingPrice" in safe) delete safe.actualBookingPrice;
-  if ("actualPrice" in safe) delete safe.actualPrice;
-  if ("actual_amount" in safe) delete safe.actual_amount;
-  if ("actualAmount" in safe) delete safe.actualAmount;
+  // Clone (works for lean objects + mongoose docs), then drop every money key
+  // at any depth and every currency figure in any string.
+  const safe = stripPricesDeep(JSON.parse(JSON.stringify(doc)));
 
   // ✅ Hide protected attachment URLs from non-admin viewers
   if (safe?.meta?.attachments && Array.isArray(safe.meta.attachments)) {

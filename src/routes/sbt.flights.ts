@@ -639,8 +639,9 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
                 _netOfferedFare: netOffered,
                 PublishedFare: applyMargin(netPublished, marginPct),
                 OfferedFare: applyMargin(netOffered, marginPct),
-                _marginPercent: marginPct,
-                _marginAmount: applyMargin(netOffered, marginPct) - netOffered,
+                // No _marginPercent/_marginAmount: the customer sees this
+                // response. _net* stay — SBTReview sends them as the TBO
+                // Book/Ticket net fare.
               },
             };
           });
@@ -766,8 +767,7 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
           _netOfferedFare: netOffered,
           PublishedFare: applyMargin(netPublished, marginPct),
           OfferedFare: applyMargin(netOffered, marginPct),
-          _marginPercent: marginPct,
-          _marginAmount: applyMargin(netOffered, marginPct) - netOffered,
+          // No _marginPercent/_marginAmount (customer-facing); see /search.
         };
       }
     }

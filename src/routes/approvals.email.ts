@@ -1,6 +1,7 @@
 // apps/backend/src/routes/approvals.email.ts
 import fs from "fs";
 import path from "path";
+import { stripPriceText } from "./approvals.security.js";
 
 export type AnyObj = Record<string, any>;
 
@@ -206,7 +207,7 @@ export function pickTripSummary(items: any[]) {
         ? `${countryFrom} → ${countryTo}`
         : String(primary?.title || primary?.type || primary?.service || "Travel request").trim();
 
-  return { seg: String(seg || "Travel request") };
+  return { seg: stripPriceText(String(seg || "Travel request")) || "Travel request" };
 }
 
 function flattenMeta(meta: AnyObj, depth = 2) {
@@ -405,7 +406,6 @@ export function buildRequesterApprovedHtml(opts: {
 
   const items = Array.isArray(opts.items) ? opts.items : [];
   const { seg } = pickTripSummary(items);
-  const totalBookingAmount = sumBookingAmount(items);
 
     return `<!doctype html>
 <html>
@@ -431,14 +431,6 @@ export function buildRequesterApprovedHtml(opts: {
             ? `<b style="color:${ink};">Approved by:</b> ${approverName || approverEmail} <br/>`
             : ""
         }
-                ${
-          totalBookingAmount
-            ? `<span style="display:inline-block;margin-left:8px;padding:8px 10px;border-radius:999px;
-                    background:#eef2ff;border:1px solid #c7d2fe;color:#1e293b;font-size:12px;font-weight:900;">
-                Booking Amount: ₹${escapeHtml(moneyINR(totalBookingAmount))}
-              </span>`
-            : ""
-        }
       </div>
     </div>
 
@@ -462,7 +454,6 @@ export function buildAdminProcessedEmailHtml(opts: {
   processedByName?: string;
   comment?: string;
   items: any[];
-  bookingAmount?: number;
   attachments?: Array<{ url?: string; filename?: string }>;
 }) {
   const ticketId = escapeHtml(opts.ticketId || "");
@@ -470,14 +461,9 @@ export function buildAdminProcessedEmailHtml(opts: {
   const processedByEmail = escapeHtml(opts.processedByEmail || "");
   const processedByName = escapeHtml(opts.processedByName || "");
 
-  const safeComment = escapeHtml(sanitizeAdminCommentForEmail(opts.comment || ""));
+  const safeComment = escapeHtml(stripPriceText(sanitizeAdminCommentForEmail(opts.comment || "")));
 
   const items = Array.isArray(opts.items) ? opts.items : [];
-
-  const totalBookingAmount =
-    Number.isFinite(Number(opts.bookingAmount))
-      ? Number(opts.bookingAmount)
-      : sumBookingAmount(items);
 
   // attachments (filenames only)
   const atts = Array.isArray(opts.attachments) ? opts.attachments : [];
@@ -515,7 +501,6 @@ export function buildAdminProcessedEmailHtml(opts: {
         <b style="color:#0f172a;">Requester:</b> ${requesterEmail}<br/>
         <b style="color:#0f172a;">Processed by:</b> ${processedByName || processedByEmail}
         ${ticketId ? `<br/><b style="color:#0f172a;">Ticket:</b> ${ticketId}` : ""}
-        ${totalBookingAmount ? `<br/><b style="color:#0f172a;">Booking Amount:</b> &#8377;${escapeHtml(moneyINR(totalBookingAmount))}` : ""}
       </div>
     `)}
 
@@ -692,8 +677,6 @@ function buildCleanItemHtml(it: any): string {
     const checkOut     = safeStr(m?.checkOut || m?.checkOutDate || it?.checkOut || it?.checkOutDate);
     const rooms        = safeStr(m?.rooms || m?.roomCount || it?.rooms || it?.roomCount);
     const guests       = safeStr(m?.guests || m?.guestCount || m?.adults || it?.guests || it?.adults);
-    const fareNum      = Number(m?.fare || m?.amount || it?.fare || it?.amount || it?.totalFare || it?.price);
-    const fare         = Number.isFinite(fareNum) && fareNum > 0 ? "&#8377;" + fareNum.toLocaleString("en-IN") : "";
     const subline      = [rooms ? rooms + " Room(s)" : "", guests ? guests + " Guest(s)" : ""].filter(Boolean).join(" · ");
 
     return `
@@ -708,7 +691,6 @@ function buildCleanItemHtml(it: any): string {
       <table cellpadding="0" cellspacing="0">
         ${checkIn  ? approverDetailRow("Check-In",  escapeHtml(checkIn))  : ""}
         ${checkOut ? approverDetailRow("Check-Out", escapeHtml(checkOut)) : ""}
-        ${fare     ? approverDetailRow("Fare",      fare)                 : ""}
       </table>
     </td>
     <td width="70" valign="top" align="right">
@@ -743,7 +725,7 @@ function buildCleanItemHtml(it: any): string {
   const adults        = safeStr(m?.adults ?? it?.adults ?? it?.passengers?.adults) || "1";
   const preferredTime = safeStr(m?.preferredTime || m?.preferredFlightTime || it?.preferredTime);
   const priority      = safeStr(m?.priority || it?.priority);
-  const notes         = safeStr(m?.notes || it?.notes || it?.description);
+  const notes         = stripPriceText(safeStr(m?.notes || it?.notes || it?.description));
 
   // Travellers array: meta.travellers is primary, then item.travellers
   const travellersArr = Array.isArray(m?.travellers) ? m.travellers
@@ -757,9 +739,6 @@ function buildCleanItemHtml(it: any): string {
     })
     .filter(Boolean)
     .join(", ");
-
-  const fareNum = Number(m?.fare || m?.amount || it?.fare || it?.amount || it?.totalFare || it?.price);
-  const fare    = Number.isFinite(fareNum) && fareNum > 0 ? "&#8377;" + fareNum.toLocaleString("en-IN") : "";
 
   const subline = [tripType, cabinClass, adults ? adults + " Adult(s)" : ""].filter(Boolean).join(" &nbsp;&middot;&nbsp; ");
 
@@ -779,7 +758,6 @@ function buildCleanItemHtml(it: any): string {
         ${priority      ? approverDetailRow("Priority",       escapeHtml(priority))      : ""}
         ${notes         ? approverDetailRow("Notes",          escapeHtml(notes))         : ""}
         ${travellers    ? approverDetailRow("Travellers",     escapeHtml(travellers))    : ""}
-        ${fare          ? approverDetailRow("Fare",           fare)                      : ""}
       </table>
     </td>
     <td width="70" valign="top" align="right" style="padding:20px 20px 0 0;">
@@ -816,7 +794,7 @@ export function buildApproverEmailHtml(opts: {
   const requesterEmail = escapeHtml(opts.requesterEmail || "");
   const customerName = escapeHtml(opts.customerName || "Workspace");
   const ticketId = escapeHtml(opts.ticketId || "");
-  const comments = escapeHtml(opts.comments || "");
+  const comments = escapeHtml(stripPriceText(opts.comments || ""));
   const requestId = escapeHtml(opts.requestId || "");
 
   const items = Array.isArray(opts.items) ? opts.items : [];
@@ -1031,7 +1009,7 @@ export function buildLeaderFyiHtml(opts: {
   const requesterEmail = escapeHtml(opts.requesterEmail || "");
   const customerName = escapeHtml(opts.customerName || "Workspace");
   const ticketId = escapeHtml(opts.ticketId || "");
-  const comments = escapeHtml(opts.comments || "");
+  const comments = escapeHtml(stripPriceText(opts.comments || ""));
 
   const items = Array.isArray(opts.items) ? opts.items : [];
   const { seg } = pickTripSummary(items);
@@ -1039,8 +1017,8 @@ export function buildLeaderFyiHtml(opts: {
   const bullets = items
     .slice(0, 8)
     .map((it, idx) => {
-      const title = escapeHtml(String(it?.title || it?.type || "Item").trim());
-      const desc = escapeHtml(firstLine(it?.description || "", 110));
+      const title = escapeHtml(stripPriceText(String(it?.title || it?.type || "Item").trim()));
+      const desc = escapeHtml(firstLine(stripPriceText(it?.description || ""), 110));
       const typeLabel = escapeHtml(serviceTypeOfItem(it).toUpperCase());
       return `
         <tr>
