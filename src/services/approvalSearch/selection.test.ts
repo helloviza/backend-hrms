@@ -15,7 +15,8 @@ import { describe, it, expect } from "vitest";
 
 process.env.JWT_SECRET ||= "jwt-secret-for-tests";
 
-const { toFlightSelection, toHotelSelection, cabinLabel, parseStars, cancelByDate } = await import("./selection.js");
+const { toFlightSelection, toHotelSelection, toInboundOption, toHotelSearchResult, cabinLabel, parseStars, cancelByDate } =
+  await import("./selection.js");
 const { isPriceKey, sanitizeApprovalForViewer } = await import("../../routes/approvals.security.js");
 
 /* ── TBO-shaped fixtures (prices everywhere) ─────────────────────────────── */
@@ -104,6 +105,9 @@ const flightOW = () => toFlightSelection({ out: oneWay, optionRef: "s.0", search
 const flightRTDom = () =>
   toFlightSelection({ out: oneWay, back: domesticBack, optionRef: "s.0", returnOptionRef: "t.3", searchedAt: AT });
 const flightRTIntl = () => toFlightSelection({ out: intlReturn, optionRef: "s.6", searchedAt: AT });
+const inboundOpt = () => toInboundOption({ raw: domesticBack, optionRef: "t.3", searchedAt: AT });
+const hotelResult = () =>
+  toHotelSearchResult({ hotel, refFor: (j) => `h.0.${j}`, checkIn: "2026-10-12", checkOut: "2026-10-14" });
 const hotelSel = (room = 0) =>
   toHotelSelection({ hotel, room: hotel.Rooms[room], optionRef: `h.0.${room}`, checkIn: "2026-10-12", checkOut: "2026-10-14", searchedAt: AT });
 
@@ -127,6 +131,7 @@ const CURRENCY_FIGURE = /(₹|&#8377;|\bINR\b|\bRs\.?)\s*\d|\d[\d,]*\s*(₹|\bIN
 const EXPECTED_FLIGHT_KEYS = [
   "$.kind", "$.optionRef", "$.returnOptionRef", "$.tripKind", "$.legs", "$.searchedAt",
   "$.legs[].direction", "$.legs[].segments", "$.legs[].stopCount", "$.legs[].journeyMin", "$.legs[].refundable", "$.legs[].isLCC",
+  "$.legs[].productLabel", "$.legs[].seatsLeft",
   "$.legs[].segments[].airlineCode", "$.legs[].segments[].airlineName", "$.legs[].segments[].flightNumber",
   "$.legs[].segments[].from", "$.legs[].segments[].from.code", "$.legs[].segments[].from.city", "$.legs[].segments[].from.terminal",
   "$.legs[].segments[].to", "$.legs[].segments[].to.code", "$.legs[].segments[].to.city", "$.legs[].segments[].to.terminal",
@@ -137,12 +142,19 @@ const EXPECTED_HOTEL_KEYS = [
   "$.kind", "$.optionRef", "$.hotelCode", "$.name", "$.stars", "$.address", "$.city", "$.checkIn", "$.checkOut",
   "$.roomName", "$.mealPlan", "$.refundable", "$.cancelBy", "$.inclusions", "$.searchedAt",
 ].sort();
+const EXPECTED_HOTEL_RESULT_KEYS = [
+  "$.hotelCode", "$.name", "$.stars", "$.address", "$.city", "$.checkIn", "$.checkOut", "$.rooms",
+  "$.rooms[].optionRef", "$.rooms[].roomName", "$.rooms[].mealPlan", "$.rooms[].refundable", "$.rooms[].cancelBy", "$.rooms[].inclusions",
+].sort();
 const uniq = (a: string[]) => [...new Set(a)].sort();
 
 /* ── tests ───────────────────────────────────────────────────────────────── */
 
 describe("approval search selection — price-free contract", () => {
-  const all = { flightOW, flightRTDom, flightRTIntl, hotelRefundable: () => hotelSel(0), hotelNonRefundable: () => hotelSel(1) };
+  const all = {
+    flightOW, flightRTDom, flightRTIntl, inboundOpt,
+    hotelRefundable: () => hotelSel(0), hotelNonRefundable: () => hotelSel(1), hotelResult,
+  };
 
   for (const [name, make] of Object.entries(all)) {
     it(`${name}: no key the sanitiser treats as money, no currency figure`, () => {
@@ -153,19 +165,34 @@ describe("approval search selection — price-free contract", () => {
 
     it(`${name}: sanitizeApprovalForViewer leaves it unchanged for a customer viewer`, () => {
       const sel = make();
-      const doc = { cartItems: [{ type: sel.kind, title: "x", meta: { selection: sel } }] };
+      const doc = { cartItems: [{ type: (sel as any).kind ?? "hotel", title: "x", meta: { selection: sel } }] };
       const out = sanitizeApprovalForViewer(doc, { roles: ["EMPLOYEE"] });
       expect(out.cartItems[0].meta.selection).toEqual(JSON.parse(JSON.stringify(sel)));
     });
   }
 
   it("the key set is exactly the reviewed allow-list (flight)", () => {
-    const keys = uniq([...keyPaths(flightOW()), ...keyPaths(flightRTDom()), ...keyPaths(flightRTIntl())]);
+    const keys = uniq([...keyPaths(flightOW()), ...keyPaths(flightRTDom()), ...keyPaths(flightRTIntl()), ...keyPaths(inboundOpt())]);
     expect(keys).toEqual(EXPECTED_FLIGHT_KEYS);
   });
 
   it("the key set is exactly the reviewed allow-list (hotel)", () => {
     expect(uniq([...keyPaths(hotelSel(0)), ...keyPaths(hotelSel(1))])).toEqual(EXPECTED_HOTEL_KEYS);
+  });
+
+  it("the key set is exactly the reviewed allow-list (hotel search result)", () => {
+    expect(uniq(keyPaths(hotelResult()))).toEqual(EXPECTED_HOTEL_RESULT_KEYS);
+  });
+
+  it("fare-type label and seats left (D2); inbound option is a single back leg", () => {
+    expect(flightOW().legs[0]).toMatchObject({ productLabel: "Saver", seatsLeft: 4 });
+    expect(toFlightSelection({ out: { ...oneWay, FareClassification: undefined }, optionRef: "x", searchedAt: AT }).legs[0].productLabel).toBe("Regular");
+    expect(inboundOpt()).toMatchObject({ tripKind: "RT_DOM", legs: [{ direction: "back" }] });
+  });
+
+  it("hotel result rooms are in name order, not TBO's price order", () => {
+    expect(hotelResult().rooms.map((r) => r.roomName)).toEqual(["Deluxe Room", "Luxury Room, 1 King Bed"]);
+    expect(hotelResult().rooms.map((r) => r.optionRef)).toEqual(["h.0.1", "h.0.0"]);
   });
 
   it("the guard itself catches a price-like key if one is ever added", () => {

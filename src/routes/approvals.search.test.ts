@@ -43,6 +43,17 @@ vi.mock("../middleware/requireWorkspace.js", () => ({
   },
 }));
 vi.mock("../utils/mailer.js", () => ({ sendMail: async () => ({ messageId: "test" }) }));
+const tbo = vi.hoisted(() => ({ flights: null as any, hotels: null as any }));
+vi.mock("../services/tbo.flight.service.js", async (orig) => {
+  const { vi: v } = await import("vitest");
+  tbo.flights = v.fn();
+  return { ...(await orig<any>()), searchFlights: tbo.flights };
+});
+vi.mock("../services/tbo.hotel.search.service.js", async (orig) => {
+  const { vi: v } = await import("vitest");
+  tbo.hotels = v.fn();
+  return { ...(await orig<any>()), searchHotels: tbo.hotels };
+});
 vi.mock("../utils/emailActionToken.js", () => ({
   signEmailActionToken: () => "tok",
   verifyEmailActionToken: () => null,
@@ -158,18 +169,21 @@ beforeEach(async () => {
 describe("/api/approvals/search gates", () => {
   const search = (path = "/flights") => request(app).post(`/api/approvals/search${path}`).send({});
 
-  it("an allowed requester reaches the (not yet built) handlers", async () => {
-    for (const [method, path] of [["post", "/flights"], ["post", "/hotels"], ["get", "/hotel-cities"]] as const) {
-      const r = await as((request(app) as any)[method](`/api/approvals/search${path}`), U.req, WS);
-      expect(r.status).toBe(501);
-      expect(r.body.code).toBe("NOT_IMPLEMENTED");
+  // Past every gate, an empty body stops at the handler's own input check (400 BAD_REQUEST).
+  it("an allowed requester reaches the handlers", async () => {
+    for (const path of ["/flights", "/hotels"]) {
+      const r = await as(request(app).post(`/api/approvals/search${path}`).send({}), U.req, WS);
+      expect([r.status, r.body.code]).toEqual([400, "BAD_REQUEST"]);
     }
+    const cities = await as(request(app).get("/api/approvals/search/hotel-cities"), U.req, WS);
+    expect([cities.status, cities.body.code]).toEqual([501, "NOT_IMPLEMENTED"]);
+    expect(tbo.flights).not.toHaveBeenCalled();
   });
 
   it("refuses an SBT user and a user with canRaiseRequest=false; a Workspace Leader bypasses both", async () => {
     expect((await as(search(), U.sbt, WS)).body.code).toBe("SBT_USER_CANNOT_RAISE_REQUEST");
     expect((await as(search(), U.noRaise, WS)).body.code).toBe("RAISE_REQUEST_DISABLED");
-    expect((await as(search(), U.wl, WS, ["WORKSPACE_LEADER"])).status).toBe(501);
+    expect((await as(search(), U.wl, WS, ["WORKSPACE_LEADER"])).status).toBe(400);
   });
 
   it("demo sessions get 403 'contact sales' before any other gate", async () => {
@@ -193,7 +207,7 @@ describe("/api/approvals/search gates", () => {
       const r = await as(search(), oid(), wsId);
       expect([r.status, r.body.error]).toEqual([403, "This flow is not enabled for your workspace"]);
     }
-    expect((await as(search(), oid(), WS_DIRECT)).status).toBe(501);
+    expect((await as(search(), oid(), WS_DIRECT)).status).toBe(400);
   });
 });
 
@@ -216,13 +230,13 @@ describe("search limits (D8)", () => {
     await col("customerworkspaces").insertOne(ws(wsId, "L1", "APPROVAL_FLOW") as any);
     const a = oid();
     for (let i = 0; i < SEARCH_LIMITS.flight.perUser; i++) {
-      expect((await as(request(app).post("/api/approvals/search/flights"), a, wsId)).status).toBe(501);
+      expect((await as(request(app).post("/api/approvals/search/flights"), a, wsId)).status).toBe(400);
     }
     const over = await as(request(app).post("/api/approvals/search/flights"), a, wsId);
     expect([over.status, over.body.code]).toEqual([429, "SEARCH_RATE_LIMITED_USER"]);
-    expect((await as(request(app).post("/api/approvals/search/flights"), oid(), wsId)).status).toBe(501);
+    expect((await as(request(app).post("/api/approvals/search/flights"), oid(), wsId)).status).toBe(400);
     // hotel budget is separate
-    expect((await as(request(app).post("/api/approvals/search/hotels"), a, wsId)).status).toBe(501);
+    expect((await as(request(app).post("/api/approvals/search/hotels"), a, wsId)).status).toBe(400);
   });
 
   it("per user: 10 hotel searches", async () => {
@@ -230,7 +244,7 @@ describe("search limits (D8)", () => {
     await col("customerworkspaces").insertOne(ws(wsId, "L2", "APPROVAL_FLOW") as any);
     const a = oid();
     for (let i = 0; i < SEARCH_LIMITS.hotel.perUser; i++) {
-      expect((await as(request(app).post("/api/approvals/search/hotels"), a, wsId)).status).toBe(501);
+      expect((await as(request(app).post("/api/approvals/search/hotels"), a, wsId)).status).toBe(400);
     }
     expect((await as(request(app).post("/api/approvals/search/hotels"), a, wsId)).body.code).toBe("SEARCH_RATE_LIMITED_USER");
   });
@@ -241,13 +255,13 @@ describe("search limits (D8)", () => {
     const users = Array.from({ length: SEARCH_LIMITS.flight.perWorkspace / SEARCH_LIMITS.flight.perUser }, oid);
     for (const u of users) {
       for (let i = 0; i < SEARCH_LIMITS.flight.perUser; i++) {
-        expect((await as(request(app).post("/api/approvals/search/flights"), u, wsId)).status).toBe(501);
+        expect((await as(request(app).post("/api/approvals/search/flights"), u, wsId)).status).toBe(400);
       }
     }
     const fresh = await as(request(app).post("/api/approvals/search/flights"), oid(), wsId);
     expect([fresh.status, fresh.body.code]).toEqual([429, "SEARCH_RATE_LIMITED_WORKSPACE"]);
     // a different workspace is unaffected
-    expect((await as(request(app).post("/api/approvals/search/flights"), oid(), WS2)).status).toBe(501);
+    expect((await as(request(app).post("/api/approvals/search/flights"), oid(), WS2)).status).toBe(400);
   }, 60_000);
 });
 
@@ -391,5 +405,238 @@ describe("GET /admin/requests/:id/selection-snapshot", () => {
     expect((await as(request(app).get(url), U.req, WS)).status).toBe(403);
 
     expect((await as(request(app).get(url), oid(), WS2, ["ADMIN"])).status).toBe(404);
+  });
+});
+
+/* ── live search (TBO stubbed) ───────────────────────────────────────────── */
+
+const { isPriceKey } = await import("./approvals.security.js");
+
+function priceKeyPaths(v: any, path = "$"): string[] {
+  if (!v || typeof v !== "object") return [];
+  const out: string[] = [];
+  for (const k of Object.keys(v)) {
+    const p = Array.isArray(v) ? `${path}[${k}]` : `${path}.${k}`;
+    if (!Array.isArray(v) && isPriceKey(k)) out.push(p);
+    out.push(...priceKeyPaths(v[k], p));
+  }
+  return out;
+}
+const CURRENCY = /(₹|&#8377;|\bINR\b|\bRs\.?)\s*\d|\d[\d,]*\s*(₹|\bINR\b)/i;
+function expectNoPrices(body: any) {
+  expect(priceKeyPaths(body)).toEqual([]);
+  expect(JSON.stringify(body)).not.toMatch(CURRENCY);
+  expect(JSON.stringify(body)).not.toMatch(/5432|28400|_net|_margin|_markup|_display|DayRates|TotalFare|PublishedFare/);
+}
+
+const money = {
+  Fare: { Currency: "INR", BaseFare: 4632, Tax: 800, PublishedFare: 5432, OfferedFare: 5280, TotalFare: 5432, CommissionEarned: 120 },
+  FareBreakdown: [{ PassengerType: 1, BaseFare: 4632, Tax: 800 }],
+  MiniFareRules: [[{ Type: "Cancellation", Details: "INR 3,500" }]],
+  _netPublishedFare: 5100, _marginPercent: 6, _marginAmount: 332,
+};
+const tboSeg = (no: string, from: string, to: string, dep: string, arr: string, seats = 9) => ({
+  Airline: { AirlineCode: "6E", AirlineName: "IndiGo", FlightNumber: no },
+  Origin: { Airport: { AirportCode: from, CityName: from, Terminal: "1" }, DepTime: dep },
+  Destination: { Airport: { AirportCode: to, CityName: to, Terminal: "2" }, ArrTime: arr },
+  Duration: 105, GroundTime: 0, Baggage: "15 Kg", CabinBaggage: "7 Kg", CabinClass: 2, NoOfSeatAvailable: seats,
+});
+const tboFlight = (idx: string, segs: any[][], extra: any = {}) => ({
+  ResultIndex: idx, IsLCC: true, IsRefundable: true, FareClassification: { Type: "Saver" }, ...money, Segments: segs, ...extra,
+});
+const tboOk = (results: any[]) => ({ Response: { ResponseStatus: 1, TraceId: "trace-x", Results: results } });
+
+const flightBody = (extra: any = {}) => ({
+  origin: "blr", destination: "bom", departDate: "2026-10-12", tripType: "oneway", adults: 2, cabinClass: "Business", ...extra,
+});
+const searchFlightsAs = (sub: any, body: any) => as(request(app).post("/api/approvals/search/flights"), sub, WS).send(body);
+
+describe("POST /search/flights", () => {
+  beforeEach(() => {
+    tbo.flights.mockReset();
+    delete process.env.APPROVAL_SEARCH_TIMEOUT_MS;
+  });
+
+  it("one-way: calls the shared searchFlights, returns price-free options in departure order with optionRefs", async () => {
+    // TBO order is by price; ours must not be.
+    tbo.flights.mockResolvedValue(tboOk([[
+      tboFlight("OB3", [[tboSeg("1101", "BLR", "BOM", "2026-10-12T13:45:00", "2026-10-12T15:30:00")]]),
+      tboFlight("OB1", [[tboSeg("5321", "BLR", "BOM", "2026-10-12T06:10:00", "2026-10-12T07:55:00", 3)]], { FareClassification: { Type: "Flexi" } }),
+      tboFlight("OB2", [[tboSeg("639", "BLR", "BOM", "2026-10-12T09:00:00", "2026-10-12T10:50:00")]], { IsRefundable: false }),
+    ]]));
+    const u = oid();
+    const r = await searchFlightsAs(u, flightBody());
+    expect(r.status).toBe(200);
+    expect(tbo.flights).toHaveBeenCalledWith(expect.objectContaining({
+      origin: "BLR", destination: "BOM", departDate: "2026-10-12", JourneyType: 1, adults: 2, cabinClass: 4,
+    }));
+    expect(r.body.tripKind).toBe("OW");
+    expect(r.body.outbound.map((o: any) => o.legs[0].segments[0].flightNumber)).toEqual(["5321", "639", "1101"]);
+    expect(r.body.outbound[0].legs[0]).toMatchObject({ productLabel: "Flexi", seatsLeft: 3, refundable: true });
+    expect(r.body.outbound[1].legs[0].refundable).toBe(false);
+    expect(r.body.inbound).toEqual([]);
+    expectNoPrices(r.body);
+
+    const session: any = await col("approvalsearchsessions").findOne({ userId: String(u) });
+    expect(session.results[0].Fare.PublishedFare).toBe(5432);
+    expect(session.results.map((x: any) => x.ResultIndex)).toEqual(["OB1", "OB2", "OB3"]);
+    expect(r.body.outbound[0].optionRef).toBe(`${session.sid}.0`);
+  });
+
+  it("domestic return: both directions listed; attaching out + return builds a two-leg selection", async () => {
+    tbo.flights.mockResolvedValue(tboOk([
+      [tboFlight("OB1", [[tboSeg("5321", "BLR", "BOM", "2026-10-12T06:10:00", "2026-10-12T07:55:00")]])],
+      [tboFlight("IB1", [[tboSeg("640", "BOM", "BLR", "2026-10-15T18:00:00", "2026-10-15T19:50:00")]], { IsRefundable: false })],
+    ]));
+    const r = await searchFlightsAs(U.req, flightBody({ tripType: "roundtrip", returnDate: "2026-10-15" }));
+    expect(tbo.flights).toHaveBeenCalledWith(expect.objectContaining({ JourneyType: 2, returnDate: "2026-10-15" }));
+    expect(r.body.tripKind).toBe("RT_DOM");
+    expect(r.body.inbound[0].legs[0]).toMatchObject({ direction: "back", refundable: false });
+    expectNoPrices(r.body);
+
+    const created = await createReq(U.req, WS, [flightItem({
+      optionRef: r.body.outbound[0].optionRef, returnOptionRef: r.body.inbound[0].optionRef, selection: r.body.outbound[0],
+    })]);
+    expect(created.status).toBe(200);
+    const doc: any = await col("approvalrequests").findOne({});
+    expect(doc.cartItems[0].meta.selection.tripKind).toBe("RT_DOM");
+    expect(doc.cartItems[0].meta.selection.legs.map((l: any) => l.segments[0].flightNumber)).toEqual(["5321", "640"]);
+    const snap: any = await col("approvalselectionsnapshots").findOne({});
+    expect(snap.rawOption.back.Fare.PublishedFare).toBe(5432);
+  });
+
+  it("international return: one list, each option carries both legs", async () => {
+    tbo.flights.mockResolvedValue(tboOk([[
+      tboFlight("OB7", [
+        [tboSeg("507", "BOM", "DXB", "2026-11-01T04:30:00", "2026-11-01T06:15:00")],
+        [tboSeg("500", "DXB", "BOM", "2026-11-08T21:40:00", "2026-11-09T02:10:00")],
+      ]),
+    ]]));
+    const r = await searchFlightsAs(U.req, flightBody({ origin: "BOM", destination: "DXB", departDate: "2026-11-01", tripType: "roundtrip", returnDate: "2026-11-08" }));
+    expect(r.body.tripKind).toBe("RT_INTL");
+    expect(r.body.outbound[0].legs.map((l: any) => l.direction)).toEqual(["out", "back"]);
+    expect(r.body.inbound).toEqual([]);
+    expectNoPrices(r.body);
+  });
+
+  it("a TBO failure is 503 'Live search unavailable', never 'no flights'; only a real empty result says 'No flights found'", async () => {
+    tbo.flights.mockResolvedValueOnce({ Response: { ResponseStatus: 2, Error: { ErrorCode: 3, ErrorMessage: "Agency is not active" } } });
+    let r = await searchFlightsAs(U.req, flightBody());
+    expect([r.status, r.body.error, r.body.code]).toEqual([503, "Live search unavailable — enter details manually", "TBO_ERROR"]);
+
+    tbo.flights.mockRejectedValueOnce(new Error("socket hang up"));
+    r = await searchFlightsAs(U.req, flightBody());
+    expect([r.status, r.body.code]).toEqual([503, "TBO_ERROR"]);
+
+    tbo.flights.mockResolvedValueOnce("<html>gateway</html>");
+    r = await searchFlightsAs(U.req, flightBody());
+    expect(r.status).toBe(503);
+
+    process.env.APPROVAL_SEARCH_TIMEOUT_MS = "50";
+    tbo.flights.mockReturnValueOnce(new Promise(() => {}));
+    r = await searchFlightsAs(U.req, flightBody());
+    expect([r.status, r.body.code]).toEqual([503, "SEARCH_TIMEOUT"]);
+    delete process.env.APPROVAL_SEARCH_TIMEOUT_MS;
+
+    tbo.flights.mockResolvedValueOnce({ Response: { ResponseStatus: 2, Error: { ErrorCode: 25, ErrorMessage: "No Result Found" } } });
+    r = await searchFlightsAs(U.req, flightBody());
+    expect([r.status, r.body.message, r.body.outbound]).toEqual([200, "No flights found", []]);
+
+    tbo.flights.mockResolvedValueOnce(tboOk([[]]));
+    r = await searchFlightsAs(U.req, flightBody());
+    expect([r.status, r.body.message]).toEqual([200, "No flights found"]);
+  });
+
+  it("bad input and multi-city are 400 before TBO is called", async () => {
+    expect((await searchFlightsAs(U.req, flightBody({ tripType: "multicity" }))).body.code).toBe("MULTICITY_NOT_SUPPORTED");
+    expect((await searchFlightsAs(U.req, flightBody({ destination: "BLR" }))).status).toBe(400);
+    expect((await searchFlightsAs(U.req, flightBody({ tripType: "roundtrip", returnDate: "2026-10-01" }))).status).toBe(400);
+    expect(tbo.flights).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /search/hotels", () => {
+  const CITY = "144306";
+  const room = (name: string, meal: string, total: number, refundable: boolean) => ({
+    Name: [name], MealType: meal, IsRefundable: refundable, Inclusion: "Free WiFi",
+    TotalFare: total, TotalTax: 3000, DayRates: [[{ BasePrice: total / 2 }]], RecommendedSellingRate: total + 900,
+    _displayTotalFare: total + 1700, _netAmount: total - 2000, _markupAmount: 1700, BookingCode: `BC-${name}`,
+    CancelPolicies: refundable ? [{ FromDate: "11-10-2026 00:00:00", ChargeType: "Percentage", CancellationCharge: 100 }] : [],
+    Supplements: [[{ Description: "City tax", Price: 300, Currency: "INR" }]],
+  });
+
+  beforeAll(async () => {
+    await col("tbocities").insertMany([
+      { code: CITY, name: "Mumbai", searchName: "mumbai", countryCode: "IN" },
+      { code: "999", name: "Mumbai Suburban Extra", searchName: "mumbai suburban extra", countryCode: "IN" },
+    ]);
+    // 120 catalog hotels: 20 five-star, 100 three-star — only the top 100 by stars get priced.
+    await col("tbohotelmasters").insertMany(
+      Array.from({ length: 120 }, (_, i) => ({
+        hotelCode: String(1000 + i), hotelName: `Hotel ${String(i).padStart(3, "0")}`, cityCode: CITY, countryCode: "IN",
+        rating: i < 20 ? "FiveStar" : "ThreeStar", address: `Street ${i}, Mumbai`,
+      })),
+    );
+  });
+  beforeEach(() => tbo.hotels.mockReset());
+
+  const hotelBody = (extra: any = {}) => ({ city: "mumbai", checkIn: "2026-10-12", checkOut: "2026-10-14", adults: 3, rooms: 2, ...extra });
+  const searchHotelsAs = (sub: any, body: any) => as(request(app).post("/api/approvals/search/hotels"), sub, WS).send(body);
+
+  it("resolves the city from the catalog, prices only the top 100 by stars, returns price-free hotels by stars then name", async () => {
+    // service output: cheapest first, no names (TBO search returns codes + rooms)
+    tbo.hotels.mockResolvedValue({
+      ok: true,
+      hotels: [
+        { HotelCode: "1050", Rooms: [room("Standard", "Room_Only", 6000, false)] },
+        { HotelCode: "1003", Rooms: [room("Luxury", "BreakFast", 28400, true), room("Deluxe", "Room_Only", 21000, false)] },
+        { HotelCode: "1001", Rooms: [room("Suite", "BreakFast", 40000, true)] },
+      ],
+    });
+    const r = await searchHotelsAs(U.req, hotelBody());
+    expect(r.status).toBe(200);
+
+    const call = tbo.hotels.mock.calls[0][0];
+    expect(call.HotelCodes).toHaveLength(100);
+    expect(call.HotelCodes.slice(0, 20).sort()).toEqual(Array.from({ length: 20 }, (_, i) => String(1000 + i)).sort());
+    expect(call).toMatchObject({ CityCode: CITY, CountryCode: "IN", CheckIn: "2026-10-12", CheckOut: "2026-10-14" });
+    expect(call.Rooms).toEqual([{ Adults: 2, Children: 0, ChildrenAges: null }, { Adults: 1, Children: 0, ChildrenAges: null }]);
+
+    expect(r.body.city).toEqual({ name: "Mumbai", countryCode: "IN" });
+    expect(r.body.hotels.map((h: any) => [h.name, h.stars])).toEqual([["Hotel 001", 5], ["Hotel 003", 5], ["Hotel 050", 3]]);
+    const h3 = r.body.hotels[1];
+    expect(h3.rooms.map((x: any) => [x.roomName, x.mealPlan, x.refundable, x.cancelBy])).toEqual([
+      ["Deluxe", "Room only", false, null],
+      ["Luxury", "Breakfast", true, "2026-10-11"],
+    ]);
+    expect(h3.address).toBe("Street 3, Mumbai");
+    expectNoPrices(r.body);
+
+    // attach a room: selection rebuilt server-side from the session
+    const created = await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { city: "Mumbai", optionRef: h3.rooms[1].optionRef } }]);
+    expect(created.status).toBe(200);
+    const doc: any = await col("approvalrequests").findOne({});
+    expect(doc.cartItems[0].meta.selection).toMatchObject({ kind: "hotel", name: "Hotel 003", roomName: "Luxury", stars: 5, checkIn: "2026-10-12" });
+    const snap: any = await col("approvalselectionsnapshots").findOne({});
+    expect(snap.rawOption.room.TotalFare).toBe(28400);
+  });
+
+  it("unknown city is a clear 400 and TBO is not called", async () => {
+    const r = await searchHotelsAs(U.req, hotelBody({ city: "Mumbaai" }));
+    expect([r.status, r.body.error, r.body.code]).toEqual([400, "City not found — check spelling", "CITY_NOT_FOUND"]);
+    expect(tbo.hotels).not.toHaveBeenCalled();
+  });
+
+  it("TBO failure → 503; a real empty result → 'No hotels found'", async () => {
+    tbo.hotels.mockResolvedValueOnce({ ok: false, status: 502, code: "HOTEL_API_ERROR", message: "x" });
+    let r = await searchHotelsAs(U.req, hotelBody());
+    expect([r.status, r.body.error]).toEqual([503, "Live search unavailable — enter details manually"]);
+
+    tbo.hotels.mockRejectedValueOnce(new Error("ECONNRESET"));
+    expect((await searchHotelsAs(U.req, hotelBody())).status).toBe(503);
+
+    tbo.hotels.mockResolvedValueOnce({ ok: false, status: 404, code: "NO_HOTELS_FOUND", message: "x" });
+    r = await searchHotelsAs(U.req, hotelBody());
+    expect([r.status, r.body.message, r.body.hotels]).toEqual([200, "No hotels found", []]);
   });
 });

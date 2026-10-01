@@ -14,8 +14,8 @@
 // not "totalDuration", "stopCount" not "totalStops". selection.test.ts fails
 // if a key here would be stripped, or if any value carries a currency figure.
 //
-// Not included until Imran decides D2: fare-type label (Saver/Flexi) and seats
-// left.
+// D2 (Imran, 2026-10-02): fare-type label (productLabel: "Saver", "Flexi",
+// ...) and seats left are shown — neither is a price.
 
 import { stripPriceText } from "../../routes/approvals.security.js";
 
@@ -42,6 +42,10 @@ export type FlightLegSelection = {
   journeyMin: number;
   refundable: boolean | null;
   isLCC: boolean;
+  /** Fare product name from TBO (FareClassification.Type / ResultFareType), e.g. "Saver". */
+  productLabel: string;
+  /** Fewest seats left on any segment of this leg; null when TBO doesn't say. */
+  seatsLeft: number | null;
 };
 
 export type FlightTripKind = "OW" | "RT_DOM" | "RT_INTL";
@@ -75,6 +79,27 @@ export type HotelSelection = {
 };
 
 export type ApprovalSelection = FlightSelection | HotelSelection;
+
+/** One hotel in a search response: hotel facts once, one pickable entry per room. */
+export type HotelRoomOption = {
+  optionRef: string;
+  roomName: string;
+  mealPlan: string;
+  refundable: boolean | null;
+  cancelBy: string | null;
+  inclusions: string[];
+};
+
+export type HotelSearchResult = {
+  hotelCode: string;
+  name: string;
+  stars: number | null;
+  address: string;
+  city: string;
+  checkIn: string;
+  checkOut: string;
+  rooms: HotelRoomOption[];
+};
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -119,6 +144,29 @@ function segment(s: any, i: number): FlightSegmentSelection {
   };
 }
 
+// TBO ResultFareType codes → readable names; anything else is shown as sent.
+const RESULT_FARE_TYPE: Record<string, string> = {
+  RegularFare: "Regular",
+  StudentFare: "Student",
+  ArmedForceFare: "Armed forces",
+  SeniorCitizenFare: "Senior citizen",
+  CorporateFare: "Corporate",
+};
+
+export function productLabelOf(raw: any): string {
+  const t = text(raw?.FareClassification?.Type);
+  if (t) return t;
+  const r = text(raw?.ResultFareType);
+  return RESULT_FARE_TYPE[r] ?? r.replace(/Fare$/, "");
+}
+
+function seatsLeftOf(rawSegments: any[]): number | null {
+  const counts = (Array.isArray(rawSegments) ? rawSegments : [])
+    .map((s) => Number(s?.NoOfSeatAvailable ?? s?.SeatsAvailable))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  return counts.length ? Math.min(...counts) : null;
+}
+
 function leg(rawSegments: any[], raw: any, direction: "out" | "back"): FlightLegSelection {
   const segments = (Array.isArray(rawSegments) ? rawSegments : []).map(segment);
   return {
@@ -128,10 +176,28 @@ function leg(rawSegments: any[], raw: any, direction: "out" | "back"): FlightLeg
     journeyMin: segments.reduce((m, s) => m + s.durationMin + s.layoverMin, 0),
     refundable: bool(raw?.IsRefundable),
     isLCC: raw?.IsLCC === true,
+    productLabel: productLabelOf(raw),
+    seatsLeft: seatsLeftOf(rawSegments),
   };
 }
 
 /* ── projections ─────────────────────────────────────────────────────────── */
+
+/**
+ * One option of a DOMESTIC round trip's inbound list (TBO Results[1]) as its
+ * own single-leg card. Attached to the item as meta.returnOptionRef; the item
+ * then carries both legs (toFlightSelection with `back`).
+ */
+export function toInboundOption(args: { raw: any; optionRef: string; searchedAt: Date }): FlightSelection {
+  const segs = Array.isArray(args.raw?.Segments) ? args.raw.Segments : [];
+  return {
+    kind: "flight",
+    optionRef: args.optionRef,
+    tripKind: "RT_DOM",
+    legs: [leg(segs[0], args.raw, "back")],
+    searchedAt: args.searchedAt.toISOString(),
+  };
+}
 
 /**
  * One TBO flight Result → selection. Domestic round trip: TBO returns the
@@ -215,6 +281,36 @@ function inclusions(room: any): string[] {
   const inc = room?.Inclusion;
   const list = Array.isArray(inc) ? inc : String(inc ?? "").split(",");
   return list.map(text).filter(Boolean);
+}
+
+/** One TBO HotelResult → search-result card; refFor(roomIndex) issues each room's optionRef. */
+export function toHotelSearchResult(args: {
+  hotel: any;
+  refFor: (roomIndex: number) => string;
+  checkIn: string;
+  checkOut: string;
+}): HotelSearchResult {
+  const rooms: any[] = Array.isArray(args.hotel?.Rooms) ? args.hotel.Rooms : [];
+  return {
+    hotelCode: text(args.hotel?.HotelCode),
+    name: text(args.hotel?.HotelName),
+    stars: parseStars(args.hotel?.HotelRating ?? args.hotel?.StarRating),
+    address: text(args.hotel?.Address),
+    city: text(args.hotel?.CityName),
+    checkIn: text(args.checkIn),
+    checkOut: text(args.checkOut),
+    rooms: rooms
+      .map((room, j) => ({
+        optionRef: args.refFor(j),
+        roomName: roomName(room),
+        mealPlan: formatMealPlan(room?.MealType),
+        refundable: bool(room?.IsRefundable),
+        cancelBy: cancelByDate(room),
+        inclusions: inclusions(room),
+      }))
+      // TBO lists rooms cheapest first; a neutral order shows no price ranking.
+      .sort((a, b) => a.roomName.localeCompare(b.roomName) || a.mealPlan.localeCompare(b.mealPlan)),
+  };
 }
 
 /** One TBO HotelResult + the chosen room → selection. */

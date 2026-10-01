@@ -14,14 +14,20 @@
 // Responses are price-free by construction (services/approvalSearch/selection.ts
 // is the contract). Raw TBO results go only to ApprovalSearchSession.
 //
-// S0: the search handlers return 501. S1 fills /flights, S2 /hotels and
-// /hotel-cities.
+// /flights and /hotels call TBO through services/approvalSearch/search.ts.
+// /hotel-cities is not built yet (501): the form sends the typed city, which
+// the hotel search resolves against the local catalog.
 
 import { Router, type Request, type Response, type NextFunction } from "express";
 import rateLimit from "express-rate-limit";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
 import { blockTravelForSaas } from "../middleware/blockTravelForSaas.js";
 import { requireCanRaiseRequest } from "./approvals.security.js";
+import {
+  searchFlightsForApproval,
+  searchHotelsForApproval,
+  type SearchReply,
+} from "../services/approvalSearch/search.js";
 
 const MIN = 60 * 1000;
 
@@ -73,6 +79,22 @@ export function blockDemoSearch(req: Request, res: Response, next: NextFunction)
   next();
 }
 
+const caller = (req: Request) => ({
+  userId: String((req as any).user?.sub || (req as any).user?._id || ""),
+  workspaceId: (req as any).workspaceObjectId,
+});
+
+const run = (search: (input: any, c: ReturnType<typeof caller>) => Promise<SearchReply>) =>
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { status, body } = await search(req.body || {}, caller(req));
+      res.setHeader("Cache-Control", "no-store");
+      res.status(status).json(body);
+    } catch (err) {
+      next(err);
+    }
+  };
+
 const notYet = (what: string) => (_req: Request, res: Response) =>
   res.status(501).json({ error: `${what} search is not available yet.`, code: "NOT_IMPLEMENTED" });
 
@@ -85,8 +107,8 @@ export function buildApprovalSearchRouter(): Router {
   router.use(requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"));
   router.use(requireCanRaiseRequest);
 
-  router.post("/flights", ...limitsFor("flight"), notYet("Flight"));
-  router.post("/hotels", ...limitsFor("hotel"), notYet("Hotel"));
+  router.post("/flights", ...limitsFor("flight"), run(searchFlightsForApproval));
+  router.post("/hotels", ...limitsFor("hotel"), run(searchHotelsForApproval));
   router.get("/hotel-cities", notYet("Hotel city"));
 
   return router;
