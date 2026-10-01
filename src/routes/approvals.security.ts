@@ -232,6 +232,10 @@ export function removeActualPriceFieldsDeep(obj: any) {
  * written in one word: "bookingamount", "totalfare", "actualbookingprice").
  * Ambiguous words (rate, tax, total, net, cost, fee, ...) are segment-only
  * so "corporate", "taxi", "network" survive.
+ *
+ * NON_PRICE_KEYS is checked FIRST: every non-money key the request form
+ * (ApprovalNew.tsx, all services) writes, plus the count/quantity names a
+ * total-ish rule would otherwise catch ("totalTravellers", "totalNights").
  * ──────────────────────────────────────────────────────────────── */
 
 export const PRICE_KEY_TOKENS = new Set([
@@ -245,8 +249,33 @@ export const PRICE_KEY_SUBSTRINGS = [
   "price", "fare", "amount", "margin", "markup", "commission",
 ];
 
-/** Keys that match the rules above but carry no number (a tier label). */
-const PRICE_KEY_KEEP = new Set(["budgetband"]);
+/** Never stripped, whatever the rules below say. Lowercased. */
+export const NON_PRICE_KEYS = new Set([
+  // counts and quantities
+  "qty", "quantity", "pax", "paxcount", "totalpax", "adults", "children", "infants",
+  "rooms", "roomcount", "totalrooms", "nights", "totalnights", "days", "totaldays",
+  "travellers", "travelers", "totaltravellers", "totaltravelers", "numberoftravellers",
+  "travellercount", "passengers", "people", "attendees", "guests", "guestcount", "luggage",
+  // ApprovalNew.tsx — flight
+  "triptype", "origin", "destination", "originmeta", "destinationmeta", "departdate", "returndate",
+  "cabinclass", "preferredtime", "preferredairline", "directonly", "flexibledates", "preferredflighttime",
+  // hotel
+  "city", "checkin", "checkout", "hoteltype", "starrating", "roomtype", "mealplan", "locationpreference",
+  // visa
+  "destinationcountry", "visatype", "purpose", "traveldate", "processingspeed", "passportvaliditymonths",
+  // cab
+  "pickup", "drop", "pickupdate", "pickuptime", "vehicletype",
+  // forex (the requested quantity itself is exempted per item, see FOREX_META_KEEP)
+  "currency", "deliverymode", "requiredby",
+  // esim / holiday / mice
+  "country", "startdate", "datapack", "budgetband", "hotelclass", "inclusions", "interests",
+  "mode", "location", "enddate", "travelmode", "addons", "foodpref", "servicesneeded",
+  // every service
+  "notes", "priority", "needby", "travelscope",
+]);
+
+/** A forex item's requested currency quantity ("USD 2,000") is the request itself, not a price. */
+const FOREX_META_KEEP = new Set(["amount", "currency"]);
 
 function keySegments(key: string): string[] {
   return key
@@ -259,7 +288,7 @@ function keySegments(key: string): string[] {
 
 export function isPriceKey(key: string): boolean {
   const lk = String(key || "").toLowerCase();
-  if (!lk || PRICE_KEY_KEEP.has(lk)) return false;
+  if (!lk || NON_PRICE_KEYS.has(lk)) return false;
   if (keySegments(String(key)).some((s) => PRICE_KEY_TOKENS.has(s))) return true;
   return PRICE_KEY_SUBSTRINGS.some((s) => lk.includes(s));
 }
@@ -288,18 +317,23 @@ export function stripPriceText(input: any): string {
   return s;
 }
 
-function stripPricesDeep(v: any): any {
+function stripPricesDeep(v: any, keep?: Set<string>): any {
   if (typeof v === "string") return stripPriceText(v);
   if (!v || typeof v !== "object") return v;
-  if (Array.isArray(v)) return v.map(stripPricesDeep);
+  if (Array.isArray(v)) return v.map((x) => stripPricesDeep(x));
+  const isForexItem = String(v.type || "").toLowerCase() === "forex";
   const out: AnyObj = {};
   for (const k of Object.keys(v)) {
-    if (isPriceKey(k)) continue;
-    out[k] = stripPricesDeep(v[k]);
+    if (!keep?.has(k) && isPriceKey(k)) continue;
+    out[k] = stripPricesDeep(v[k], isForexItem && k === "meta" ? FOREX_META_KEEP : undefined);
   }
   return out;
 }
 
+/**
+ * The one price sanitiser for customer-side viewers. Used for approval
+ * requests (approvals.ts, bookingHistory.ts) and proposals (proposals.ts).
+ */
 export function sanitizeApprovalForViewer(doc: any, user: any) {
   // Admins can see everything
   if (isStaffAdmin(user)) return doc;
@@ -308,6 +342,14 @@ export function sanitizeApprovalForViewer(doc: any, user: any) {
   // Clone (works for lean objects + mongoose docs), then drop every money key
   // at any depth and every currency figure in any string.
   const safe = stripPricesDeep(JSON.parse(JSON.stringify(doc)));
+
+  // Proposal option PDFs are supplier quotes (they carry prices) — staff only.
+  // Booking documents (safe.booking.attachments) stay.
+  if (Array.isArray(safe?.options)) {
+    safe.options = safe.options.map((o: any) =>
+      o && typeof o === "object" ? { ...o, attachments: [] } : o,
+    );
+  }
 
   // ✅ Hide protected attachment URLs from non-admin viewers
   if (safe?.meta?.attachments && Array.isArray(safe.meta.attachments)) {

@@ -161,6 +161,7 @@ export function serviceTypeOfItem(it: any): string {
   if (t.includes("flight") || t.includes("air")) return "flight";
   if (t.includes("hotel") || t.includes("stay")) return "hotel";
   if (t.includes("visa")) return "visa";
+  if (t.includes("forex")) return "forex";
   if (t.includes("cab") || t.includes("taxi") || t.includes("transfer")) return "cab";
   if (t.includes("rail") || t.includes("train")) return "rail";
   if (t.includes("holiday") || t.includes("package")) return "holiday";
@@ -480,11 +481,7 @@ export function buildAdminProcessedEmailHtml(opts: {
       : `<div style="color:#64748b;">No attachments were added for this request.</div>`;
 
   const uniqueItems = items.filter((item, index, arr) =>
-    arr.findIndex(i =>
-      (i.meta?.origin || i.origin) === (item.meta?.origin || item.origin) &&
-      (i.meta?.destination || i.destination) === (item.meta?.destination || item.destination) &&
-      (i.meta?.departDate || i.departDate) === (item.meta?.departDate || item.departDate)
-    ) === index
+    arr.findIndex((i) => itemDedupeKey(i) === itemDedupeKey(item)) === index
   );
   const itineraryRows = uniqueItems.map((it) => buildCleanItemHtml(it)).join("");
 
@@ -660,6 +657,26 @@ function approverDetailRow(label: string, value: string): string {
   );
 }
 
+/**
+ * Same item listed twice collapses to one card. The key includes the service
+ * and its own identifying fields — origin/destination/departDate alone made a
+ * hotel and a forex item (none of the three set) look identical.
+ */
+function itemDedupeKey(it: any): string {
+  const m = pickMeta(it);
+  return [
+    serviceTypeOfItem(it),
+    m?.origin ?? it?.origin,
+    m?.destination ?? it?.destination,
+    m?.departDate ?? it?.departDate,
+    m?.city ?? it?.city,
+    m?.checkIn ?? it?.checkIn,
+    m?.currency,
+    m?.amount,
+    it?.title,
+  ].map((x) => String(x ?? "")).join("|");
+}
+
 function safeStr(v: any): string {
   if (v === undefined || v === null) return "";
   return String(v).trim();
@@ -696,6 +713,42 @@ function buildCleanItemHtml(it: any): string {
     <td width="70" valign="top" align="right">
       <span style="background:#fef3c7;color:#92400e;font-size:11px;font-weight:700;letter-spacing:1px;padding:4px 10px;border-radius:20px;text-transform:uppercase;display:inline-block;">
         Hotel
+      </span>
+    </td>
+  </tr>
+</table>`;
+  }
+
+  if (svcType === "forex") {
+    // The requested currency quantity is the request itself, not a price.
+    const currency = safeStr(m?.currency).toUpperCase();
+    const amountNum = Number(m?.amount);
+    const requested = Number.isFinite(amountNum) && amountNum > 0
+      ? `${currency ? currency + " " : ""}${amountNum.toLocaleString("en-IN")} requested`
+      : "";
+    const deliveryMode = safeStr(m?.deliveryMode);
+    const city = safeStr(m?.city);
+    const requiredBy = safeStr(m?.requiredBy);
+    const notes = stripPriceText(safeStr(m?.notes || it?.description));
+
+    return `
+<table width="100%" cellpadding="0" cellspacing="0"
+  bgcolor="#f4f5f7" style="background:#f4f5f7;border-radius:10px;margin-bottom:12px;">
+  <tr>
+    <td bgcolor="#f4f5f7" style="background:#f4f5f7;padding:20px;">
+      <div style="font-size:19px;font-weight:700;color:#111827;letter-spacing:-0.3px;margin-bottom:3px;">
+        ${escapeHtml(requested || "Forex")}
+      </div>
+      <table cellpadding="0" cellspacing="0">
+        ${deliveryMode ? approverDetailRow("Delivery",    escapeHtml(deliveryMode)) : ""}
+        ${city         ? approverDetailRow("City",        escapeHtml(city))         : ""}
+        ${requiredBy   ? approverDetailRow("Required By", escapeHtml(requiredBy))   : ""}
+        ${notes        ? approverDetailRow("Notes",       escapeHtml(notes))        : ""}
+      </table>
+    </td>
+    <td width="70" valign="top" align="right" style="padding:20px 20px 0 0;">
+      <span style="background:#ecfdf5;color:#047857;font-size:11px;font-weight:700;letter-spacing:1px;padding:4px 10px;border-radius:20px;text-transform:uppercase;display:inline-block;">
+        Forex
       </span>
     </td>
   </tr>
@@ -859,11 +912,7 @@ export function buildApproverEmailHtml(opts: {
   `;
 
   const uniqueItems = items.filter((item, index, arr) =>
-    arr.findIndex(i =>
-      (i.meta?.origin || i.origin) === (item.meta?.origin || item.origin) &&
-      (i.meta?.destination || i.destination) === (item.meta?.destination || item.destination) &&
-      (i.meta?.departDate || i.departDate) === (item.meta?.departDate || item.departDate)
-    ) === index
+    arr.findIndex((i) => itemDedupeKey(i) === itemDedupeKey(item)) === index
   );
   const itemCards = uniqueItems.map((it) => buildCleanItemHtml(it)).join("");
 

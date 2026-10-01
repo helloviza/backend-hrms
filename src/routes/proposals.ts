@@ -33,6 +33,7 @@ import {
   buildProposalDeclinedEmailHtml,
   sanitizeAdminCommentForEmail,
 } from "./approvals.email.js";
+import { sanitizeApprovalForViewer } from "./approvals.security.js";
 
 type AnyObj = Record<string, any>;
 type ProposalStatus = "DRAFT" | "SUBMITTED" | "APPROVED" | "DECLINED" | "EXPIRED";
@@ -733,6 +734,13 @@ const requireProposalViewerFromDownloadPath: RequestHandler = async (req: Reques
 
     if (!myRoles.length && !owner) return res.status(403).json({ error: "Not allowed" });
 
+    // Customer-side viewers may download booking documents (tickets/vouchers)
+    // only. Option PDFs are supplier quotes with prices — staff only.
+    const bookingDoc = ensureArray(p?.booking?.attachments).some(
+      (u: any) => extractRelativeUploadPathFromAttachmentUrl(String(u || "")) === rel,
+    );
+    if (!bookingDoc) return res.status(403).json({ error: "Not allowed" });
+
     return next();
   } catch (e) {
     return next(e);
@@ -779,12 +787,6 @@ function buildEmailActionUrl(token: string) {
   return `${base}/api/proposals/email-action?token=${encodeURIComponent(token)}`;
 }
 
-function moneyINR(n: any) {
-  const v = Number(n);
-  if (!Number.isFinite(v)) return "₹0";
-  return `₹${v.toLocaleString("en-IN")}`;
-}
-
 function itemLabel(li: any): string {
   const origin = String(li?.meta?.origin || li?.from || li?.origin || "").trim();
   const dest   = String(li?.meta?.destination || li?.to || li?.destination || "").trim();
@@ -805,24 +807,15 @@ function buildProposalSummaryHtml(p: any) {
 
       const rows = lines
         .map((li: any) => {
+          // Goes to L2/L0 (customer-side): itinerary only, no unit/line price.
           const title = itemLabel(li);
           const qty = Number(li?.qty || 1);
-          const unit = Number(li?.unitPrice || 0);
-          const total = Number(li?.totalPrice || qty * unit || 0);
           return `<tr>
             <td style="padding:6px 8px;border-bottom:1px solid #eee;">${title}</td>
             <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${qty}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${moneyINR(unit)}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${moneyINR(total)}</td>
           </tr>`;
         })
         .join("");
-
-      const attachments = ensureArray(opt?.attachments);
-      const attHtml =
-        attachments.length
-          ? `<div style="color:#666;margin-top:6px;">${attachments.length} PDF attachment(s) included.</div>`
-          : `<div style="color:#666;margin-top:6px;">No attachments</div>`;
 
       return `
         <div style="border:1px solid #eee;border-radius:10px;padding:14px;margin-top:12px;">
@@ -835,22 +828,10 @@ function buildProposalSummaryHtml(p: any) {
               <tr>
                 <th style="text-align:left;padding:6px 8px;border-bottom:1px solid #eee;">Item</th>
                 <th style="text-align:right;padding:6px 8px;border-bottom:1px solid #eee;">Qty</th>
-                <th style="text-align:right;padding:6px 8px;border-bottom:1px solid #eee;">Unit</th>
-                <th style="text-align:right;padding:6px 8px;border-bottom:1px solid #eee;">Total</th>
               </tr>
             </thead>
             <tbody>${rows || ""}</tbody>
           </table>
-
-          <div style="display:flex;justify-content:space-between;margin-top:10px;">
-            <div style="color:#666;">Option Total</div>
-            <div style="font-weight:900;">${moneyINR(opt?.totalAmount)}</div>
-          </div>
-
-          <div style="margin-top:10px;">
-            <div style="font-weight:700;">Attachments</div>
-            ${attHtml}
-          </div>
         </div>
       `;
     })
@@ -874,13 +855,6 @@ function buildProposalSummaryHtml(p: any) {
       <h2 style="margin:0 0 8px;">Proposal submitted for approval</h2>
       ${requesterSectionHtml}
       <div style="color:#666;margin-bottom:10px;">Proposal ID: <b>${String(p?._id || "")}</b></div>
-
-      <table width="100%" cellpadding="0" cellspacing="0" style="margin:8px 0 6px;">
-        <tr>
-          <td style="color:#666;font-size:14px;">Grand Total</td>
-          <td align="right" style="font-weight:900;font-size:14px;">&#8377;${Number(p?.totalAmount || 0).toLocaleString("en-IN")}</td>
-        </tr>
-      </table>
 
       ${optBlocks || `<div style="color:#666;">No options</div>`}
     </div>
@@ -918,36 +892,6 @@ function extractRelativeUploadPathFromAttachmentUrl(u: string): string {
     return "";
   }
 }
-
-function buildPdfAttachmentsForEmail(p: any, maxFiles = 10) {
-  const uploadsRoot = path.resolve(process.cwd(), "uploads");
-
-  const urls: string[] = [];
-  for (const opt of ensureArray(p?.options)) {
-    for (const u of ensureArray(opt?.attachments)) urls.push(String(u || ""));
-  }
-
-  const uniq = Array.from(new Set(urls.filter(Boolean))).slice(0, maxFiles);
-
-  const attachments: any[] = [];
-  for (const u of uniq) {
-    const rel = extractRelativeUploadPathFromAttachmentUrl(u);
-    if (!rel.startsWith("proposals/")) continue;
-
-    const abs = path.resolve(uploadsRoot, rel);
-    if (!abs.startsWith(uploadsRoot + path.sep)) continue;
-    if (!fs.existsSync(abs)) continue;
-
-    attachments.push({
-      filename: path.basename(abs),
-      content: fs.readFileSync(abs),
-      contentType: "application/pdf",
-    });
-  }
-
-  return attachments;
-}
-
 
 /* ────────────────────────────────────────────────────────────────
  * Routes (specific FIRST, :id LAST)
@@ -1185,7 +1129,7 @@ router.get("/inbox", requireAnyAuth, requireWorkspace, async (req: Request, res:
     }
 
     const enriched = await enrichProposalsWithRequestData(out);
-    return res.json({ ok: true, items: enriched });
+    return res.json({ ok: true, items: enriched.map((p: AnyObj) => sanitizeApprovalForViewer(p, aReq.user)) });
   } catch (err) {
     next(err);
   }
@@ -1275,7 +1219,7 @@ router.get("/mine", requireAnyAuth, requireWorkspace, async (req: Request, res: 
     return res.json({
       ok: true,
       scope: l0WorkspaceIds.size ? "WORKSPACE_L0" : "USER",
-      items: enriched,
+      items: enriched.map((p: AnyObj) => sanitizeApprovalForViewer(p, aReq.user)),
     });
   } catch (err) {
     next(err);
@@ -1561,7 +1505,7 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
     // Send email (signature may vary; we call as any)
     try {
       const sendMail = sendMailAny as any;
-      const attachments = buildPdfAttachmentsForEmail(doc, 10);
+      // No option PDFs: L2 and L0 are customer-side and the PDFs carry prices.
 
       // Send L2 email with L2 tokens
       await sendMail({
@@ -1569,7 +1513,6 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
         to: l2Email,
         subject: `Proposal Approval Needed — ${reqCode || "Request"}`,
         html,
-        attachments,
       });
 
       // Send separate L0 emails with L0-specific tokens
@@ -1631,7 +1574,6 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
           to: l0Addr,
           subject: `Proposal Approval Needed — ${reqCode || "Request"}`,
           html: l0Html,
-          attachments,
         });
       }
 
@@ -2170,7 +2112,7 @@ router.post("/:id/decide", requireAnyAuth, requireWorkspace, requireProposalView
       } catch { /* non-blocking */ }
 
       const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
-      return res.json({ ok: true, proposal: enriched[0], needL0 });
+      return res.json({ ok: true, proposal: sanitizeApprovalForViewer(enriched[0], aReq.user), needL0 });
     }
 
     const fullyApproved = l2 === "APPROVED" && (!needL0 || l0 === "APPROVED");
@@ -2198,12 +2140,12 @@ router.post("/:id/decide", requireAnyAuth, requireWorkspace, requireProposalView
       } catch { /* non-blocking */ }
 
       const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
-      return res.json({ ok: true, proposal: enriched[0], needL0 });
+      return res.json({ ok: true, proposal: sanitizeApprovalForViewer(enriched[0], aReq.user), needL0 });
     }
 
     await doc.save();
     const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
-    return res.json({ ok: true, proposal: enriched[0], needL0 });
+    return res.json({ ok: true, proposal: sanitizeApprovalForViewer(enriched[0], aReq.user), needL0 });
   } catch (err) {
     next(err);
   }
@@ -2252,7 +2194,7 @@ router.post("/:id/action", requireAnyAuth, requireWorkspace, requireProposalView
     await doc.save();
 
     const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
-    return res.json({ ok: true, proposal: enriched[0] });
+    return res.json({ ok: true, proposal: sanitizeApprovalForViewer(enriched[0], aReq.user) });
   } catch (err) {
     next(err);
   }
@@ -2279,28 +2221,26 @@ router.get("/:id", requireAnyAuth, requireWorkspace, requireProposalViewer, asyn
     const enrichedList = await enrichProposalsWithRequestData([{ ...(p as any) }]);
     const enriched = enrichedList[0] || (p as any);
 
-    // L1 owner (request submitter, not an approver): strip internal cost/margin fields
+    // Every customer-side viewer (L1 owner, L2, L0): no price at any depth —
+    // booking.bookingAmount / booking.actualBookingPrice included (the old
+    // owner-only stripper deleted root keys and missed booking.*).
+    const priceFree: any = sanitizeApprovalForViewer(enriched, aReq.user);
+
+    // L1 owner (request submitter, not an approver): also drop internal notes/history
     if (isOwner && !myRoles.length) {
-      const sanitized: any = { ...(enriched as any) };
+      const sanitized: any = { ...priceFree };
 
       if (Array.isArray(sanitized.options)) {
         sanitized.options = sanitized.options.map((opt: any) => {
           const clean = { ...opt };
-          delete clean.netAmount;
-          delete clean.margin;
-          delete clean.supplierCost;
-          delete clean.costBreakdown;
           delete clean.internalNotes;
           return clean;
         });
       }
 
-      delete sanitized.margins;
       delete sanitized.supplierNotes;
       delete sanitized.history;
       delete sanitized.internalComments;
-      delete sanitized.bookingActualPrice;
-      delete sanitized.bookingAmount;
 
       return res.json({
         ok: true,
@@ -2316,7 +2256,7 @@ router.get("/:id", requireAnyAuth, requireWorkspace, requireProposalViewer, asyn
     return res.json({
       ok: true,
       proposal: {
-        ...(enriched as any),
+        ...priceFree,
         _myRoles: myRoles,
         _isOwner: isOwner,
       },
