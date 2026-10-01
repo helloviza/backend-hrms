@@ -2,7 +2,8 @@
 //
 // Live TBO search for the approval request form, mounted at
 // /api/approvals/search INSIDE the approvals router, so requireAuth,
-// requireWorkspace and requireFeature("approvalFlowEnabled") have already run.
+// requireWorkspace and requireAnyFeature("approvalFlowEnabled", "approvalDirectEnabled") have
+// already run.
 //
 // Gate order (each refuses before the next runs):
 //   1. demo / impersonation session → 403 "contact sales" (before anything else)

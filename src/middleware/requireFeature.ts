@@ -16,6 +16,15 @@ const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
  * handlers don't re-fetch.
  */
 export const requireFeature = (featureKey: keyof WorkspaceFeatures) =>
+  requireAnyFeature(featureKey);
+
+/**
+ * requireAnyFeature — same gate and bypasses as requireFeature, but admits
+ * the workspace when AT LEAST ONE of the named flags is on. Used where two
+ * flows share one surface (approvals: Flow 2 approvalFlowEnabled, Flow 3
+ * approvalDirectEnabled).
+ */
+export const requireAnyFeature = (...featureKeys: Array<keyof WorkspaceFeatures>) =>
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     // ── SUPERADMIN bypass ──
     if (isSuperAdmin(req)) return next();
@@ -44,10 +53,11 @@ export const requireFeature = (featureKey: keyof WorkspaceFeatures) =>
         return;
       }
 
-      if (!workspace.config?.features?.[featureKey]) {
+      const features = workspace.config?.features;
+      if (!featureKeys.some((key) => features?.[key])) {
         res.status(403).json({
           success: false,
-          error: `Feature '${featureKey}' not enabled for this workspace`,
+          error: `Feature '${featureKeys.join("' or '")}' not enabled for this workspace`,
         });
         return;
       }

@@ -241,6 +241,7 @@ vi.mock("../middleware/travelModeGuard.js", () => ({
 }));
 vi.mock("../middleware/requireFeature.js", () => ({
   requireFeature: () => (_req: any, _res: any, next: any) => next(),
+  requireAnyFeature: () => (_req: any, _res: any, next: any) => next(),
 }));
 vi.mock("../middleware/scopedFindById.js", () => ({
   scopedFindById: async (model: any) => (model?.__isProposal ? currentProposal() : null),

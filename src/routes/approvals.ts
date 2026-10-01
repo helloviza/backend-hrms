@@ -8,7 +8,7 @@ import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
-import { requireFeature } from "../middleware/requireFeature.js";
+import { requireAnyFeature } from "../middleware/requireFeature.js";
 
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import TravelBooking from "../models/TravelBooking.js";
@@ -107,7 +107,10 @@ function sendSelectionError(res: any, e: SelectionError) {
 const router = Router();
 router.use(requireAuth);
 router.use(requireWorkspace);
-router.use(requireFeature("approvalFlowEnabled"));
+// Flow 2 (approvalFlowEnabled) and Flow 3 (approvalDirectEnabled) share this
+// router: request form, search, my requests, inbox, booking history. Which
+// flow a route serves is decided per-route by requireTravelMode.
+router.use(requireAnyFeature("approvalFlowEnabled", "approvalDirectEnabled"));
 
 // Live TBO search for the request form (price-free). Own gates inside.
 router.use("/search", approvalSearchRouter);
