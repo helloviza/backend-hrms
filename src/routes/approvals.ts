@@ -55,7 +55,16 @@ import {
   collectRoles,
   sanitizeApprovalForViewer,
   stripPriceText,
+  checkCanRaiseRequest,
 } from "./approvals.security.js";
+import approvalSearchRouter from "./approvals.search.js";
+import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
+import {
+  prepareCartSelections,
+  writeSelectionSnapshots,
+  cartHasOptionRefs,
+  SelectionError,
+} from "../services/approvalSearch/cartSelections.js";
 
 import {
   buildAdminProcessedEmailHtml,
@@ -91,10 +100,17 @@ async function syncProposalBookingStatus(proposalId: string, status: "IN_PROGRES
   }
 }
 
+function sendSelectionError(res: any, e: SelectionError) {
+  return res.status(e.status).json({ error: e.message, code: e.code, itemIndex: e.itemIndex });
+}
+
 const router = Router();
 router.use(requireAuth);
 router.use(requireWorkspace);
 router.use(requireFeature("approvalFlowEnabled"));
+
+// Live TBO search for the request form (price-free). Own gates inside.
+router.use("/search", approvalSearchRouter);
 
 /* ───────────────────────── uploads (PDF attachments) ───────────────────────── */
 
@@ -359,33 +375,30 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
 
     // SBT users must book directly — block approval flow
     // WORKSPACE_LEADER always bypasses SBT/canRaiseRequest restrictions
-    const isWL = (req.user?.roles || [])
-      .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
-      .includes("WORKSPACELEADER");
+    const refusal = await checkCanRaiseRequest(req);
+    if (refusal) return res.status(refusal.status).json(refusal.body);
 
-    if (sub && !isWL) {
-      const sbtCheck = await User.findOne({ _id: sub, workspaceId: req.workspaceObjectId }).select("sbtEnabled canRaiseRequest").lean();
-      if (sbtCheck?.sbtEnabled === true) {
-        return res.status(403).json({
-          error: "Direct booking is enabled for your account. Please use the Self Booking Tool.",
-          code: "SBT_USER_CANNOT_RAISE_REQUEST",
-        });
-      }
-      if (sbtCheck?.canRaiseRequest === false) {
-        return res.status(403).json({
-          error: "You don't have permission to raise travel requests.",
-          code: "RAISE_REQUEST_DISABLED",
-        });
-      }
-    }
-
-    const { customerId, cartItems, comments, ticketId } = req.body || {};
+    const { customerId, cartItems: rawCartItems, comments, ticketId } = req.body || {};
     const cid = String(customerId || "").trim();
 
     if (!cid) return res.status(400).json({ error: "customerId is required" });
-    if (!Array.isArray(cartItems) || cartItems.length === 0) {
+    if (!Array.isArray(rawCartItems) || rawCartItems.length === 0) {
       return res.status(400).json({ error: "cartItems is required" });
     }
+
+    // Client-sent meta.selection is dropped; meta.optionRef → server-built selection.
+    let prepared: Awaited<ReturnType<typeof prepareCartSelections>>;
+    try {
+      prepared = await prepareCartSelections({
+        cartItems: rawCartItems,
+        userId: sub,
+        workspaceId: req.workspaceObjectId,
+      });
+    } catch (e) {
+      if (e instanceof SelectionError) return sendSelectionError(res, e);
+      throw e;
+    }
+    const { cartItems, snapshots } = prepared;
 
     const { ws, approverEmail, leaderEmails } = await pickApproverEmail({
       customerId: cid,
@@ -509,6 +522,16 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
           : []),
       ],
     });
+
+    if (snapshots.length) {
+      await writeSelectionSnapshots({
+        requestId: doc._id,
+        workspaceId: req.workspaceObjectId,
+        userId: sub,
+        snapshots,
+        prune: false,
+      });
+    }
 
     const tokenApprove = signEmailActionToken({
       rid: String(doc._id),
@@ -767,7 +790,21 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
     const userName = normStr(user?.name || user?.firstName || "");
     const sub = String(user?.sub || user?._id || "");
 
-    doc.cartItems = cartItems;
+    let prepared: Awaited<ReturnType<typeof prepareCartSelections>>;
+    try {
+      prepared = await prepareCartSelections({
+        cartItems,
+        userId: sub,
+        workspaceId: req.workspaceObjectId,
+        requestId: doc._id,
+      });
+    } catch (e) {
+      if (e instanceof SelectionError) return sendSelectionError(res, e);
+      throw e;
+    }
+
+    const hadOptionRefs = cartHasOptionRefs(doc.cartItems);
+    doc.cartItems = prepared.cartItems;
     if (typeof comments === "string") doc.comments = comments;
 
     doc.history = Array.isArray(doc.history) ? doc.history : [];
@@ -781,6 +818,15 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
     });
 
     await doc.save();
+    if (hadOptionRefs || prepared.snapshots.length) {
+      await writeSelectionSnapshots({
+        requestId: doc._id,
+        workspaceId: req.workspaceObjectId,
+        userId: sub,
+        snapshots: prepared.snapshots,
+        prune: true,
+      });
+    }
     res.json({ ok: true, request: sanitizeApprovalForViewer(doc, req.user), message: "Updated" });
   } catch (err) {
     next(err);
@@ -1161,6 +1207,33 @@ router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj,
     res.json(sanitizeApprovalForViewer(doc, req.user));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Staff only: the raw live-search option(s) attached to this request's items,
+ * prices included. Deliberately NOT requireApprovalsAdminRead — that also
+ * admits Workspace Leaders.
+ */
+router.get("/admin/requests/:id/selection-snapshot", async (req: AnyObj, res, next) => {
+  try {
+    if (!isStaffAdmin(req.user)) {
+      return res.status(403).json({ error: "Staff only", reason: "NOT_STAFF_ADMIN" });
+    }
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid request id" });
+    }
+    const exists = await ApprovalRequest.exists({ _id: id, workspaceId: req.workspaceObjectId });
+    if (!exists) return res.status(404).json({ error: "Request not found" });
+
+    const rows = await ApprovalSelectionSnapshot.find({ requestId: id, workspaceId: req.workspaceObjectId })
+      .sort({ itemKey: 1 })
+      .lean();
+    setNoStore(res);
+    res.json({ ok: true, snapshots: rows });
+  } catch (err) {
+    next(err);
   }
 });
 
@@ -2054,8 +2127,20 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
       stage: "REQUEST_RAISED",
       "meta.revoked": false,
     };
+    let preparedResubmit: Awaited<ReturnType<typeof prepareCartSelections>> | null = null;
     if (Array.isArray(cartItems) && cartItems.length > 0) {
-      setFields.cartItems = cartItems;
+      try {
+        preparedResubmit = await prepareCartSelections({
+          cartItems,
+          userId: sub,
+          workspaceId: req.workspaceObjectId,
+          requestId: id,
+        });
+      } catch (e) {
+        if (e instanceof SelectionError) return sendSelectionError(res, e);
+        throw e;
+      }
+      setFields.cartItems = preparedResubmit.cartItems;
     }
 
     const updated: any = await ApprovalRequest.findOneAndUpdate(
@@ -2076,6 +2161,16 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
       },
       { new: true }
     );
+
+    if (preparedResubmit && (preparedResubmit.snapshots.length || cartHasOptionRefs(doc.cartItems))) {
+      await writeSelectionSnapshots({
+        requestId: id,
+        workspaceId: req.workspaceObjectId,
+        userId: sub,
+        snapshots: preparedResubmit.snapshots,
+        prune: true,
+      });
+    }
 
     // Re-send approval email to L2
     try {

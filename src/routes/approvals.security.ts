@@ -516,6 +516,58 @@ export async function requireApprovalsAdminWrite(req: AnyObj, res: any, next: an
 }
 
 /* ────────────────────────────────────────────────────────────────
+ * Who may raise a travel request (POST /requests and /search/*)
+ *
+ * WORKSPACE_LEADER always passes. Anyone else is refused when their
+ * User row in this workspace has sbtEnabled (they book directly) or
+ * canRaiseRequest === false. No row found → allowed, as before.
+ * ──────────────────────────────────────────────────────────────── */
+
+export type RaiseRequestRefusal = { status: 403; body: { error: string; code: string } };
+
+export async function checkCanRaiseRequest(req: AnyObj): Promise<RaiseRequestRefusal | null> {
+  const sub = String(req.user?.sub || req.user?._id || "");
+  const isWL = (req.user?.roles || [])
+    .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
+    .includes("WORKSPACELEADER");
+
+  if (!sub || isWL) return null;
+
+  const sbtCheck: any = await User.findOne({ _id: sub, workspaceId: req.workspaceObjectId })
+    .select("sbtEnabled canRaiseRequest")
+    .lean();
+  if (sbtCheck?.sbtEnabled === true) {
+    return {
+      status: 403,
+      body: {
+        error: "Direct booking is enabled for your account. Please use the Self Booking Tool.",
+        code: "SBT_USER_CANNOT_RAISE_REQUEST",
+      },
+    };
+  }
+  if (sbtCheck?.canRaiseRequest === false) {
+    return {
+      status: 403,
+      body: {
+        error: "You don't have permission to raise travel requests.",
+        code: "RAISE_REQUEST_DISABLED",
+      },
+    };
+  }
+  return null;
+}
+
+export async function requireCanRaiseRequest(req: AnyObj, res: any, next: any) {
+  try {
+    const refusal = await checkCanRaiseRequest(req);
+    if (refusal) return res.status(refusal.status).json(refusal.body);
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────
  * Leader scope helper for admin read endpoints
  * ──────────────────────────────────────────────────────────────── */
 

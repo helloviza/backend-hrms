@@ -42,6 +42,7 @@ const TRAVEL_BLOCKED_PREFIXES: BlockedPrefix[] = [
   { prefix: "/api/approvals/admin", allowFlags: ["approvalFlowEnabled", "approvalDirectEnabled"] },
 
   // HOUSE-only — always blocked for SAAS_HRMS regardless of flags
+  { prefix: "/api/approvals/search" },
   { prefix: "/api/v1/flights" },
   { prefix: "/api/travel-forms" },
   { prefix: "/api/booking-history" },
