@@ -396,7 +396,7 @@ describe("edit and resubmit", () => {
 /* ── staff-only snapshot read ────────────────────────────────────────────── */
 
 describe("GET /admin/requests/:id/selection-snapshot", () => {
-  it("staff get the raw option with prices; Workspace Leader and requester get 403; other workspace 404", async () => {
+  it("staff get the raw option with prices (from any workspace — the ops queue is cross-tenant); Workspace Leader and requester get 403", async () => {
     const sid = await flightSession(U.req, WS);
     await createReq(U.req, WS, [flightItem({ optionRef: optionRefFor(sid, 0) })]);
     const id = String((await col("approvalrequests").findOne({}))!._id);
@@ -412,7 +412,11 @@ describe("GET /admin/requests/:id/selection-snapshot", () => {
     expect(JSON.stringify(wl.body)).not.toMatch(/5432/);
     expect((await as(request(app).get(url), U.req, WS)).status).toBe(403);
 
-    expect((await as(request(app).get(url), oid(), WS2, ["ADMIN"])).status).toBe(404);
+    // Staff whose token carries another workspace (HOUSE in prod) still see it,
+    // and the snapshots come from the request's own workspace.
+    const otherWs = await as(request(app).get(url), oid(), WS2, ["ADMIN"]);
+    expect(otherWs.status).toBe(200);
+    expect(otherWs.body.snapshots).toHaveLength(1);
   });
 });
 

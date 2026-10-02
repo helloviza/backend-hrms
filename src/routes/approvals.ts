@@ -123,6 +123,17 @@ function sendTravellerError(res: any, e: TravellerError) {
 }
 
 /**
+ * Lookup for one request. Plumtrips staff work every tenant's requests from
+ * one ops queue (the queue lists are already cross-tenant), but their token
+ * carries the HOUSE workspace — scoping their lookups to it 404'd every
+ * customer request (7ea09c05 fixed this once; 9d16b4e5 re-scoped it). Staff
+ * look up by id; anyone else stays inside their own workspace.
+ */
+function requestFilterFor(req: AnyObj, id: string) {
+  return isStaffAdmin(req.user) ? { _id: id } : { _id: id, workspaceId: req.workspaceObjectId };
+}
+
+/**
  * What this router returns for a request: customers through the one
  * sanitiser (no prices, passport last 4); staff keep prices but also get
  * passport last 4 — the full number only via the audited passport-reveal.
@@ -830,9 +841,7 @@ router.get("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
       return res.status(400).json({ error: "Invalid request id" });
     }
 
-    const detailQuery = isStaffAdmin(req.user) && !req.workspaceObjectId
-      ? { _id: id }
-      : { _id: id, workspaceId: req.workspaceObjectId };
+    const detailQuery = requestFilterFor(req, id);
     const doc: any = await ApprovalRequest.findOne(detailQuery).lean().exec();
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
@@ -1207,7 +1216,7 @@ router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res
 router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj, res, next) => {
   try {
     const doc = await ApprovalRequest
-      .findOne({ _id: req.params.id, workspaceId: req.workspaceObjectId })
+      .findOne(requestFilterFor(req, String(req.params.id || "")))
       .populate("workspaceId", "name companyName config")
       .lean();
 
@@ -1233,10 +1242,10 @@ router.get("/admin/requests/:id/selection-snapshot", async (req: AnyObj, res, ne
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ error: "Invalid request id" });
     }
-    const exists = await ApprovalRequest.exists({ _id: id, workspaceId: req.workspaceObjectId });
-    if (!exists) return res.status(404).json({ error: "Request not found" });
+    const found: any = await ApprovalRequest.findOne(requestFilterFor(req, id)).select("workspaceId").lean();
+    if (!found) return res.status(404).json({ error: "Request not found" });
 
-    const rows = await ApprovalSelectionSnapshot.find({ requestId: id, workspaceId: req.workspaceObjectId })
+    const rows = await ApprovalSelectionSnapshot.find({ requestId: id, workspaceId: found.workspaceId })
       .sort({ itemKey: 1 })
       .lean();
     setNoStore(res);
@@ -1265,7 +1274,7 @@ router.post("/admin/requests/:id/passport-reveal", requireApprovalsAdminWrite, a
       return res.status(400).json({ error: "itemIndex and travellerIndex are required" });
     }
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId })
+    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id))
       .select("cartItems")
       .lean();
     if (!doc) return res.status(404).json({ error: "Request not found" });
@@ -1288,7 +1297,7 @@ router.post("/admin/requests/:id/passport-reveal", requireApprovalsAdminWrite, a
     };
     // timestamps:false — a reveal must not move "Last update" or the queue order.
     const written = await ApprovalRequest.updateOne(
-      { _id: id, workspaceId: req.workspaceObjectId },
+      requestFilterFor(req, id),
       { $push: { passportReveals: entry } },
       { timestamps: false },
     );
@@ -1310,7 +1319,7 @@ router.get("/admin/requests/:id/passport-reveals", requireApprovalsAdminWrite, a
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ error: "Invalid request id" });
     }
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId })
+    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id))
       .select("+passportReveals")
       .lean();
     if (!doc) return res.status(404).json({ error: "Request not found" });
@@ -1328,7 +1337,7 @@ router.get("/admin/requests/:id/passport-reveals", requireApprovalsAdminWrite, a
 
 router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
   try {
-    const doc: any = await ApprovalRequest.findOne({ _id: req.params.id, workspaceId: req.workspaceObjectId });
+    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, String(req.params.id || "")));
     if (!doc) return res.status(404).json({ error: "Not found" });
     const wasInProgress = doc.stage === "BOOKING_IN_PROGRESS";
 
@@ -1359,7 +1368,7 @@ router.put("/admin/:id/assign", requireApprovalsAdminWrite, async (req: AnyObj, 
     const id = String(req.params.id || "");
     const { agentType, agentName, comment } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     doc.adminState = "assigned";
@@ -1397,7 +1406,7 @@ router.put(
       const id = String(req.params.id || "");
       const { comment } = req.body || {};
 
-      const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+      const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
       if (!doc) return res.status(404).json({ error: "Request not found" });
 
       const st = String(doc.stage || "").toUpperCase();
@@ -1449,7 +1458,7 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
     const id = String(req.params.id || "");
     const { comment, notifyEmail, bookingAmount, actualBookingPrice } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     if (doc.stage !== "BOOKING_IN_PROGRESS") {
@@ -1503,7 +1512,7 @@ router.post(
 
       if (!file) return res.status(400).json({ error: "File is required" });
 
-      const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+      const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
       if (!doc) return res.status(404).json({ error: "Request not found" });
 
       const base = (process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 8080}`).replace(
@@ -1622,7 +1631,7 @@ router.put("/admin/:id/on-hold", requireApprovalsAdminWrite, async (req: AnyObj,
     const id = String(req.params.id || "");
     const { comment } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     const wasOnHold = doc.adminState === "on_hold";
@@ -1658,7 +1667,7 @@ router.put("/admin/:id/cancel", requireApprovalsAdminWrite, async (req: AnyObj, 
     const id = String(req.params.id || "");
     const { comment } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     doc.adminState = "cancelled";

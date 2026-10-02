@@ -281,6 +281,31 @@ describe("manual travellers — any role, on this request only", () => {
   });
 });
 
+describe("staff work every tenant's requests from the ops queue", () => {
+  // STAFF's token workspace (WS_FLOW here, HOUSE in prod) is not the request's
+  // workspace (WS_DIRECT). Ops actions must still find the request.
+  it("staff from another workspace can open, assign and reveal; a Workspace Leader from another workspace cannot", async () => {
+    const r = await submit(REQUESTER, [manual()]);
+    const id = r.body.request._id;
+    await col("approvalrequests").updateOne({ _id: new mongoose.Types.ObjectId(String(id)) }, { $set: { status: "approved", adminState: "pending" } });
+
+    expect((await as(request(app).get(`/api/approvals/admin/requests/${id}`), STAFF, WS_FLOW)).status).toBe(200);
+    expect((await as(request(app).get(`/api/approvals/requests/${id}`), STAFF, WS_FLOW)).status).toBe(200);
+    expect((await as(request(app).get(`/api/approvals/admin/requests/${id}/selection-snapshot`), STAFF, WS_FLOW)).status).toBe(200);
+    const assign = await as(request(app).put(`/api/approvals/admin/${id}/assign`), STAFF, WS_FLOW).send({ agentName: "Desk" });
+    expect(assign.status).toBe(200);
+    const reveal = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, WS_FLOW)
+      .send({ itemIndex: 0, travellerIndex: 0 });
+    expect([reveal.status, reveal.body.passportNumber]).toEqual([200, MANUAL_PASSPORT]);
+    const hold = await as(request(app).put(`/api/approvals/admin/${id}/on-hold`), STAFF, WS_FLOW).send({ comment: "waiting" });
+    expect(hold.status).toBe(200);
+
+    // Non-staff stay inside their own workspace.
+    expect((await as(request(app).get(`/api/approvals/admin/requests/${id}`), LEADER_USER, WS_FLOW)).status).toBe(404);
+    expect((await as(request(app).get(`/api/approvals/requests/${id}`), APPROVER_USER, WS_FLOW)).status).toBe(404);
+  });
+});
+
 describe("passport masking", () => {
   it("customer-side viewers and staff payloads get last 4 (staff read the full number only through the audited reveal)", async () => {
     const r = await submit(REQUESTER, [{ kind: "self" }, manual()]);
