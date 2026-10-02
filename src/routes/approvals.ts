@@ -100,6 +100,23 @@ function sendSelectionError(res: any, e: SelectionError) {
   return res.status(e.status).json({ error: e.message, code: e.code, itemIndex: e.itemIndex });
 }
 
+/**
+ * A one-way flight never carries a return date. The request form's default
+ * flight state always held one (today + 8) and sent it even when "One Way"
+ * hid the field, so one-way requests showed a Return date (REQ-563ECF).
+ */
+function withoutOneWayReturnDate(items: any[]): any[] {
+  return (Array.isArray(items) ? items : []).map((it: any) => {
+    const meta = it?.meta;
+    const isFlight = String(it?.type || "").toLowerCase() === "flight";
+    const roundTrip = String(meta?.tripType || "").toLowerCase() === "roundtrip";
+    if (!isFlight || roundTrip || !meta || !("returnDate" in meta)) return it;
+    const { returnDate: _drop, ...rest } = meta;
+    void _drop;
+    return { ...it, meta: rest };
+  });
+}
+
 function sendTravellerError(res: any, e: TravellerError) {
   return res.status(e.status).json({ error: e.message, code: e.code, missing: e.missing });
 }
@@ -427,7 +444,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     try {
       prepared = await prepareCartSelections({
         cartItems: await prepareCartTravellers({
-          cartItems: rawCartItems,
+          cartItems: withoutOneWayReturnDate(rawCartItems),
           workspaceId: req.workspaceObjectId,
           ownerUserId: sub,
         }),
@@ -864,7 +881,7 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
     try {
       prepared = await prepareCartSelections({
         cartItems: await prepareCartTravellers({
-          cartItems,
+          cartItems: withoutOneWayReturnDate(cartItems),
           workspaceId: req.workspaceObjectId,
           ownerUserId: String(doc.frontlinerId || ""),
           existingCartItems: JSON.parse(JSON.stringify(doc.cartItems || [])),
@@ -1675,7 +1692,7 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
     let preparedResubmit: Awaited<ReturnType<typeof prepareCartSelections>> | null = null;
     try {
       const withTravellers = await prepareCartTravellers({
-        cartItems: Array.isArray(cartItems) && cartItems.length > 0 ? cartItems : storedCart,
+        cartItems: withoutOneWayReturnDate(Array.isArray(cartItems) && cartItems.length > 0 ? cartItems : storedCart),
         workspaceId: req.workspaceObjectId,
         ownerUserId: String(doc.frontlinerId || ""),
         existingCartItems: storedCart,

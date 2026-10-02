@@ -564,3 +564,24 @@ describe("Ops record the customer's proposal decision on their behalf", () => {
     expect(sent.some((m) => /sent back for changes/.test(m.subject) && m.to.includes(LEADER) && m.to.includes(APPROVER))).toBe(true);
   });
 });
+
+describe("one-way flights never store or email a return date (REQ-563ECF)", () => {
+  it("create and edit drop returnDate on one-way; a round trip keeps it; the approver email shows no Return Date for one-way", async () => {
+    const oneWay = { ...flightItem, meta: { ...flightItem.meta, tripType: "oneway", returnDate: "2026-10-10" } };
+    sent.length = 0;
+    const r = await as(request(app).post("/api/approvals/requests"), R).send({ customerId: CUSTOMER_ID, cartItems: [oneWay] });
+    expect(r.status).toBe(200);
+    const id = String(r.body.request._id);
+    expect("returnDate" in (await reqDoc(id)).cartItems[0].meta).toBe(false);
+    const mail = sent.find((m) => m.to === APPROVER && /Approval Needed/.test(m.subject))!;
+    expect(mail.html).not.toContain("Return Date");
+
+    const e = await as(request(app).put(`/api/approvals/requests/${id}`), R).send({ cartItems: [oneWay] });
+    expect(e.status).toBe(200);
+    expect("returnDate" in (await reqDoc(id)).cartItems[0].meta).toBe(false);
+
+    const rt = { ...flightItem, meta: { ...flightItem.meta, tripType: "roundtrip", returnDate: "2026-10-15" } };
+    const r2 = await as(request(app).post("/api/approvals/requests"), R).send({ customerId: CUSTOMER_ID, cartItems: [rt] });
+    expect((await reqDoc(r2.body.request._id)).cartItems[0].meta.returnDate).toBe("2026-10-15");
+  });
+});

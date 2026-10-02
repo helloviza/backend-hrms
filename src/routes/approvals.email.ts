@@ -848,9 +848,10 @@ function buildCleanItemHtml(it: any): string {
     : escapeHtml(safeStr(it?.title || it?.description) || "Flight");
 
   const departDate    = safeStr(m?.departDate || m?.travelDate || m?.departureDate || it?.departDate || it?.travelDate);
-  const returnDate    = safeStr(m?.returnDate || it?.returnDate);
-
   const tripTypeRaw   = safeStr(m?.tripType || it?.tripType || it?.TripType);
+  // A one-way flight shows no return date, whatever an older request stored.
+  const isRoundTrip   = ["roundtrip", "return", "round_trip"].includes(tripTypeRaw.toLowerCase());
+  const returnDate    = isRoundTrip ? safeStr(m?.returnDate || it?.returnDate) : "";
   const tripType      = tripTypeRaw.toLowerCase() === "oneway"    ? "One Way"
                       : tripTypeRaw.toLowerCase() === "roundtrip" ? "Return"
                       : tripTypeRaw.toLowerCase() === "return"    ? "Return"
