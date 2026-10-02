@@ -432,12 +432,27 @@ export async function applyProposalDecision(opts: {
   actor: DecisionActor;
   action: ProposalDecisionAction;
   reason?: string;
+  /**
+   * Ops recording a decision the customer gave them some other way (phone,
+   * email to ops…). Staff-only — the route checks isStaffAdmin. The note is
+   * required and says who decided, how and when; the "who may decide" check
+   * is skipped because the decider is the customer, not the staff member,
+   * but the first-decision-wins rule and every email are unchanged.
+   */
+  recordedOnBehalf?: boolean;
 }): Promise<{ proposal: any; request: any }> {
   const { actor, action } = opts;
-  const reason = str(opts.reason);
+  const onBehalf = opts.recordedOnBehalf === true;
+  const note = str(opts.reason);
   if (!["approve", "decline", "request_changes"].includes(action)) {
     throw new DecisionError(400, "INVALID_ACTION", "Invalid action");
   }
+  if (onBehalf && !note) {
+    throw new DecisionError(400, "NOTE_REQUIRED", "Say who decided, how and when.");
+  }
+  const reason = onBehalf
+    ? `Recorded by ${str(actor.name) || norm(actor.email)} on behalf of the customer: ${note}`
+    : note;
   if (action === "decline" && !reason) {
     throw new DecisionError(400, "REASON_REQUIRED", "A reason is required to decline.");
   }
@@ -455,7 +470,7 @@ export async function applyProposalDecision(opts: {
   const ar: any = await ApprovalRequest.findOne({ _id: p.requestId }).lean().exec();
   if (!ar) throw new DecisionError(404, "NOT_FOUND", "Request not found for this proposal");
 
-  await assertActorMayDecide(await proposalDeciders(ar), actor, ar.frontlinerEmail);
+  if (!onBehalf) await assertActorMayDecide(await proposalDeciders(ar), actor, ar.frontlinerEmail);
 
   const email = norm(actor.email);
   const name = str(actor.name) || email;
@@ -469,7 +484,7 @@ export async function applyProposalDecision(opts: {
           customer: { action: "needs_changes", note: reason, at: new Date(), byEmail: email, byName: name },
         },
         $push: {
-          history: { action: `${actor.via === "email" ? "EMAIL_" : ""}CHANGES_REQUESTED`, at: new Date(), byEmail: email, byName: name, note: reason },
+          history: { action: `${onBehalf ? "RECORDED_" : actor.via === "email" ? "EMAIL_" : ""}CHANGES_REQUESTED`, at: new Date(), byEmail: email, byName: name, note: reason },
         },
       },
       { new: true },
@@ -480,6 +495,8 @@ export async function applyProposalDecision(opts: {
     }
     await setProposalPhaseStage(ar._id, "PROPOSAL_CHANGES_REQUESTED");
     await notifyOpsOfProposalOutcome(back, ar, "CHANGES_REQUESTED", name, reason);
+    // A decision recorded by ops is news to the approver and leaders.
+    if (onBehalf) await notifyDecidersOfProposalDecision(ar, back, "CHANGES_REQUESTED", name, reason);
     return { proposal: back, request: ar };
   }
 
@@ -497,7 +514,7 @@ export async function applyProposalDecision(opts: {
       $set: { status: decision.decision, "approvals.l2": decision, "approvals.l0": decision },
       $push: {
         history: {
-          action: `${actor.via === "email" ? "EMAIL_" : ""}${decision.decision}`,
+          action: `${onBehalf ? "RECORDED_" : actor.via === "email" ? "EMAIL_" : ""}${decision.decision}`,
           at: new Date(),
           byEmail: email,
           byName: name,
@@ -585,11 +602,17 @@ function proposalCode(ar: AnyObj) {
 }
 
 /** The approver and every Workspace Leader hear the final proposal decision. */
-async function notifyDecidersOfProposalDecision(ar: AnyObj, proposal: AnyObj, decision: "APPROVED" | "DECLINED", byName: string, reason: string) {
+async function notifyDecidersOfProposalDecision(
+  ar: AnyObj,
+  proposal: AnyObj,
+  decision: "APPROVED" | "DECLINED" | "CHANGES_REQUESTED",
+  byName: string,
+  reason: string,
+) {
   if (DISABLE_EMAILS) return;
   const to = await proposalDeciders(ar);
   if (!to.length) return;
-  const verb = decision === "APPROVED" ? "approved" : "declined";
+  const verb = decision === "APPROVED" ? "approved" : decision === "DECLINED" ? "declined" : "sent back for changes";
   try {
     await sendMail({
       kind: "APPROVALS",
@@ -601,11 +624,11 @@ async function notifyDecidersOfProposalDecision(ar: AnyObj, proposal: AnyObj, de
           <div style="font-size:13px;line-height:1.65;color:#334155;">
             The proposal (v${escapeHtml(String(proposal?.version ?? ""))}) for ${escapeHtml(str(ar?.frontlinerName) || "the requester")}'s
             request <b>${escapeHtml(proposalCode(ar))}</b> was <b>${verb}</b> by <b>${escapeHtml(byName)}</b>.
-            ${reason ? `<br/><br/><b>Reason:</b> ${escapeHtml(stripPriceText(reason))}` : ""}
+            ${reason ? `<br/><br/><b>Note:</b> ${escapeHtml(stripPriceText(reason))}` : ""}
             <br/><br/>No action is needed from you.
           </div>
         `)}`,
-        { title: `Proposal ${verb}`, badgeText: verb.toUpperCase(), badgeColor: decision === "APPROVED" ? "#10b981" : "#dc2626" },
+        { title: `Proposal ${verb}`, badgeText: decision.replace("_", " "), badgeColor: decision === "APPROVED" ? "#10b981" : decision === "DECLINED" ? "#dc2626" : "#f59e0b" },
       ),
     } as any);
   } catch {

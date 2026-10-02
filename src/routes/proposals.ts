@@ -1606,6 +1606,53 @@ router.post(
 /**
  * POST /api/proposals/:id/decide (existing UI decisions)
  */
+/**
+ * POST /api/proposals/:id/record-decision — staff only.
+ * Ops record a decision the customer gave them outside Plumbox (phone, email
+ * to ops). { decision: APPROVED | DECLINED | CHANGES_REQUESTED, note } — the
+ * note is required (who decided, how, when). Same first-decision-wins rule
+ * and the same emails as a customer decision; history reads "Recorded by
+ * <ops user> on behalf of the customer: <note>".
+ */
+router.post("/:id/record-decision", requireAnyAuth, requireWorkspace, requireStaff, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    setNoStore(res);
+    const aReq = req as AuthedReq;
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
+
+    const body = (req as any).body || {};
+    const d = String(body?.decision || "").trim().toUpperCase();
+    const action = d === "APPROVED" ? "approve" : d === "DECLINED" ? "decline" : d === "CHANGES_REQUESTED" ? "request_changes" : "";
+    if (!action) return res.status(400).json({ error: "Invalid decision" });
+
+    try {
+      const { proposal } = await applyProposalDecision({
+        proposalId: id,
+        workspaceId: (req as any).workspaceObjectId,
+        actor: {
+          email: normEmail(aReq.user?.email),
+          name: normStr(aReq.user?.name || aReq.user?.firstName || "") || normEmail(aReq.user?.email),
+          sub: String(aReq.user?.sub || ""),
+          via: "app",
+        },
+        action,
+        reason: normStr(body?.note || ""),
+        recordedOnBehalf: true,
+      });
+      const enriched = await enrichProposalsWithRequestData([proposal.toObject ? proposal.toObject() : proposal]);
+      return res.json({ ok: true, proposal: enriched[0] });
+    } catch (e) {
+      if (e instanceof DecisionError) {
+        return res.status(e.status).json({ error: e.message, code: e.code, ...(e.extra || {}) });
+      }
+      throw e;
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/:id/decide", requireAnyAuth, requireWorkspace, requireProposalViewer, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);

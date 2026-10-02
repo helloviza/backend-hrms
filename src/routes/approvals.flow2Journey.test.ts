@@ -502,3 +502,65 @@ describe("Proposals list (GET /proposals/mine) is by workspace membership, not l
     expect(JSON.stringify(a.body)).not.toMatch(/unitPrice|totalPrice/);
   });
 });
+
+describe("Ops record the customer's proposal decision on their behalf", () => {
+  const STAFF = { email: "ops@plumtrips.test", roles: ["OPS"] };
+
+  it("needs a note; non-staff cannot use it", async () => {
+    const rid = await approvedRequest();
+    const pid = await submittedProposal(rid);
+    const noNote = await as(request(app).post(`/api/proposals/${pid}/record-decision`), STAFF).send({ decision: "APPROVED" });
+    expect([noNote.status, noNote.body.code]).toEqual([400, "NOTE_REQUIRED"]);
+    for (const who of [A, L, R]) {
+      const r = await as(request(app).post(`/api/proposals/${pid}/record-decision`), who).send({ decision: "APPROVED", note: "x" });
+      expect(r.status, who.email).toBe(403);
+    }
+    expect((await propDoc(pid)).status).toBe("SUBMITTED");
+  });
+
+  it("records the decision with 'Recorded by … on behalf of the customer', emails as usual, and blocks later customer decisions", async () => {
+    const rid = await approvedRequest();
+    const pid = await submittedProposal(rid);
+    sent.length = 0;
+    const r = await as(request(app).post(`/api/proposals/${pid}/record-decision`), STAFF).send({
+      decision: "APPROVED",
+      note: "Kavya approved by phone, 3 Oct 11:00",
+    });
+    expect(r.status).toBe(200);
+    const p = await propDoc(pid);
+    expect(p.status).toBe("APPROVED");
+    const h = p.history.at(-1);
+    expect(h.action).toBe("RECORDED_APPROVED");
+    expect(h.note).toBe("Recorded by ops on behalf of the customer: Kavya approved by phone, 3 Oct 11:00");
+    expect((await reqDoc(rid)).stage).toBe("PROPOSAL_APPROVED");
+
+    const fyi = sent.find((m) => /^Proposal approved/.test(m.subject) && m.to.includes(APPROVER))!;
+    expect(fyi.to.split(",").sort()).toEqual([APPROVER, LEADER].sort());
+    expect(fyi.html).toContain("on behalf of the customer: Kavya approved by phone");
+    expect(sent.some((m) => m.to === REQUESTER && /Proposal Has Been Approved/.test(m.subject))).toBe(true);
+
+    const late = await as(request(app).post(`/api/proposals/${pid}/decide`), A).send({ decision: "DECLINED", reason: "x" });
+    expect([late.status, late.body.code]).toEqual([409, "ALREADY_DECIDED"]);
+    const link = await request(app).post(linkFor("proposal", pid, LEADER)).send({ action: "approve" });
+    expect([link.status, link.body.code]).toEqual([409, "ALREADY_DECIDED"]);
+  });
+
+  it("a customer decision first means ops cannot record over it; changes requested tells approver and leaders", async () => {
+    const rid = await approvedRequest();
+    const pid = await submittedProposal(rid);
+    await as(request(app).post(`/api/proposals/${pid}/decide`), L).send({ decision: "APPROVED" });
+    const r = await as(request(app).post(`/api/proposals/${pid}/record-decision`), STAFF).send({ decision: "DECLINED", note: "x" });
+    expect([r.status, r.body.code]).toEqual([409, "ALREADY_DECIDED"]);
+
+    const rid2 = await approvedRequest();
+    const pid2 = await submittedProposal(rid2);
+    sent.length = 0;
+    const c = await as(request(app).post(`/api/proposals/${pid2}/record-decision`), STAFF).send({
+      decision: "CHANGES_REQUESTED",
+      note: "Lata asked on email for a later flight",
+    });
+    expect(c.status).toBe(200);
+    expect((await propDoc(pid2)).status).toBe("CHANGES_REQUESTED");
+    expect(sent.some((m) => /sent back for changes/.test(m.subject) && m.to.includes(LEADER) && m.to.includes(APPROVER))).toBe(true);
+  });
+});
