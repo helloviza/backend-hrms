@@ -38,7 +38,7 @@ import {
 import { sanitizeApprovalForViewer, frontendBaseUrl as appFrontendBaseUrl } from "./approvals.security.js";
 
 type AnyObj = Record<string, any>;
-type ProposalStatus = "DRAFT" | "SUBMITTED" | "APPROVED" | "DECLINED" | "EXPIRED";
+type ProposalStatus = "DRAFT" | "SUBMITTED" | "APPROVED" | "DECLINED" | "CHANGES_REQUESTED" | "EXPIRED";
 type ApprovalDecision = "PENDING" | "APPROVED" | "DECLINED";
 type BookingStatus = "NOT_STARTED" | "IN_PROGRESS" | "DONE" | "CANCELLED";
 
@@ -998,7 +998,7 @@ router.get("/queue", requireAnyAuth, requireWorkspace, requireStaff, async (req:
     const bookingStatus = normStr(req.query?.bookingStatus || "").toUpperCase();
 
     const q: AnyObj = { workspaceId: (req as any).workspaceObjectId };
-    if (["DRAFT", "SUBMITTED", "APPROVED", "DECLINED", "EXPIRED"].includes(status)) q.status = status;
+    if (["DRAFT", "SUBMITTED", "APPROVED", "DECLINED", "CHANGES_REQUESTED", "EXPIRED"].includes(status)) q.status = status;
     if (["PENDING", "APPROVED", "DECLINED"].includes(l2)) q["approvals.l2.decision"] = l2;
     if (["PENDING", "APPROVED", "DECLINED"].includes(l0)) q["approvals.l0.decision"] = l0;
     if (["NOT_STARTED", "IN_PROGRESS", "DONE", "CANCELLED"].includes(bookingStatus)) q["booking.status"] = bookingStatus;
@@ -1713,7 +1713,14 @@ router.post("/:id/decide", requireAnyAuth, requireWorkspace, requireProposalView
 
     const body = (req as any).body || {};
     const decisionRaw = String(body?.decision || "").trim().toUpperCase();
-    const action = decisionRaw === "APPROVED" ? "approve" : decisionRaw === "DECLINED" ? "decline" : "";
+    const action =
+      decisionRaw === "APPROVED"
+        ? "approve"
+        : decisionRaw === "DECLINED"
+        ? "decline"
+        : decisionRaw === "CHANGES_REQUESTED"
+        ? "request_changes"
+        : "";
     if (!action) return res.status(400).json({ error: "Invalid decision" });
 
     try {

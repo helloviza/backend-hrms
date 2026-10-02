@@ -239,11 +239,12 @@ describe("Flow 2 (APPROVAL_FLOW) — same self-approval rule, otherwise unchange
     expect([after.status, after.stage, after.adminState]).toEqual(["approved", "PROPOSAL_PENDING", "pending"]);
   });
 
-  it("on hold, then decline with a reason", async () => {
+  it("On Hold is gone for approvers (ask a question instead); decline needs a reason", async () => {
     const { doc } = await submit(REQUESTER, WS_FLOW);
-    expect((await act(doc._id, { email: APPROVER }, WS_FLOW, "on_hold", "Which hotel?")).status).toBe(200);
+    const hold = await act(doc._id, { email: APPROVER }, WS_FLOW, "on_hold", "Which hotel?");
+    expect([hold.status, hold.body.code]).toEqual([400, "HOLD_REMOVED"]);
     let after: any = await col("approvalrequests").findOne({ _id: doc._id });
-    expect([after.status, after.stage]).toEqual(["pending", "REQUEST_ON_HOLD"]);
+    expect([after.status, after.stage]).toEqual(["pending", "REQUEST_RAISED"]);
     // A decline needs a reason.
     const bare = await act(doc._id, { email: APPROVER }, WS_FLOW, "declined");
     expect([bare.status, bare.body.code]).toEqual([400, "REASON_REQUIRED"]);

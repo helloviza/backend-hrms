@@ -27,9 +27,14 @@ import { frontendBaseUrl, DISABLE_EMAILS } from "../routes/approvals.security.js
 import {
   buildRequesterApprovedHtml,
   buildRequestDeclinedEmailHtml,
-  buildRequestOnHoldEmailHtml,
   buildProposalApprovedEmailHtml,
   buildProposalDeclinedEmailHtml,
+  buildApproverEmailHtml,
+  buildEmailShell,
+  eBtn,
+  eCard,
+  eLabel,
+  escapeHtml,
 } from "../routes/approvals.email.js";
 
 type AnyObj = Record<string, any>;
@@ -150,7 +155,12 @@ export function decisionLinkUrl(
 
 /* ───────────────────────── request decision ───────────────────────── */
 
-export type RequestDecisionAction = "approved" | "declined" | "on_hold";
+/**
+ * "clarify" (Ask for clarification) replaced the customer approver's one-way
+ * "On Hold": the request goes to the requester with a question and comes back
+ * to the same approver when they reply. Ops keep their own internal hold.
+ */
+export type RequestDecisionAction = "approved" | "declined" | "clarify";
 
 function approvedStageFor(ar: AnyObj) {
   return ar?.meta?.travelFlow === "APPROVAL_DIRECT" ? "REQUEST_APPROVED" : "PROPOSAL_PENDING";
@@ -182,11 +192,17 @@ export async function applyRequestDecision(opts: {
 }): Promise<any> {
   const { actor, action } = opts;
   const reason = str(opts.reason);
-  if (!["approved", "declined", "on_hold"].includes(action)) {
+  if ((action as string) === "on_hold") {
+    throw new DecisionError(400, "HOLD_REMOVED", "On Hold is no longer available — ask the requester a question instead.");
+  }
+  if (!["approved", "declined", "clarify"].includes(action)) {
     throw new DecisionError(400, "INVALID_ACTION", "Invalid action");
   }
   if (action === "declined" && !reason) {
     throw new DecisionError(400, "REASON_REQUIRED", "A reason is required to decline.");
+  }
+  if (action === "clarify" && !reason) {
+    throw new DecisionError(400, "QUESTION_REQUIRED", "Write the question for the requester.");
   }
 
   const filter: AnyObj = { _id: opts.requestId };
@@ -210,8 +226,8 @@ export async function applyRequestDecision(opts: {
       ? { status: "approved", stage: approvedStageFor(ar), adminState: "pending" }
       : action === "declined"
       ? { status: "declined", stage: "REQUEST_DECLINED", adminState: "cancelled" }
-      : { status: "pending", stage: "REQUEST_ON_HOLD", adminState: "on_hold" };
-  if (action !== "on_hold") Object.assign(set, { approvedByEmail: email, approvedByName: name });
+      : { status: "pending", stage: "REQUEST_NEEDS_CLARIFICATION" };
+  if (action !== "clarify") Object.assign(set, { approvedByEmail: email, approvedByName: name });
 
   // First decision wins: only a still-actionable request is updated.
   const claimed = await ApprovalRequest.findOneAndUpdate(
@@ -227,17 +243,88 @@ export async function applyRequestDecision(opts: {
   // Reload as a document so the model's save hook keeps the FSM in step.
   const doc: any = await ApprovalRequest.findOne({ _id: ar._id }).exec();
   doc.history = Array.isArray(doc.history) ? doc.history : [];
+  const historyAction = action === "clarify" ? "clarification_requested" : action;
   doc.history.push({
-    action: actor.via === "email" ? `email_${action}` : action,
+    action: actor.via === "email" ? `email_${historyAction}` : historyAction,
     at: new Date(),
     by: actor.via === "email" ? `email:${email}` : actor.sub || "unknown",
     comment: reason || undefined,
     userEmail: email,
     userName: name,
   });
+  if (action === "clarify") {
+    doc.clarifications = Array.isArray(doc.clarifications) ? doc.clarifications : [];
+    doc.clarifications.push({ kind: "question", text: reason, at: new Date(), byEmail: email, byName: name });
+  }
   await doc.save();
 
   await notifyRequesterOfRequestDecision(doc, action, name, email, reason);
+  return doc;
+}
+
+/**
+ * The requester answers the approver's question (and may have edited the
+ * request in the same step). The request goes back to the same approver,
+ * pending, and they get fresh decision links.
+ */
+export async function replyToClarification(opts: {
+  requestId: string;
+  workspaceId?: any;
+  actor: DecisionActor;
+  reply: string;
+  edited?: boolean;
+}): Promise<any> {
+  const reply = str(opts.reply);
+  if (!reply) throw new DecisionError(400, "REPLY_REQUIRED", "Write a reply to the approver's question.");
+
+  const filter: AnyObj = { _id: opts.requestId, stage: "REQUEST_NEEDS_CLARIFICATION", status: "pending" };
+  if (opts.workspaceId) filter.workspaceId = opts.workspaceId;
+  const claimed = await ApprovalRequest.findOneAndUpdate(filter, { $set: { stage: "REQUEST_RAISED" } }, { new: true }).exec();
+  if (!claimed) throw new DecisionError(409, "NOT_WAITING_FOR_REPLY", "This request is not waiting for your reply.");
+
+  const doc: any = await ApprovalRequest.findOne({ _id: (claimed as any)._id }).exec();
+  const email = norm(opts.actor.email);
+  const name = str(opts.actor.name) || str(doc.frontlinerName) || email;
+  doc.clarifications = Array.isArray(doc.clarifications) ? doc.clarifications : [];
+  const question = [...doc.clarifications].reverse().find((c: any) => c?.kind === "question");
+  doc.clarifications.push({ kind: "reply", text: reply, at: new Date(), byEmail: email, byName: name, edited: !!opts.edited });
+  doc.history = Array.isArray(doc.history) ? doc.history : [];
+  doc.history.push({
+    action: "clarification_replied",
+    at: new Date(),
+    by: opts.actor.sub || "unknown",
+    comment: reply,
+    userEmail: email,
+    userName: name,
+  });
+  await doc.save();
+
+  if (!DISABLE_EMAILS) {
+    const approverEmail = norm(doc.managerEmail);
+    const ws = await workspaceOf(doc);
+    try {
+      await sendMail({
+        kind: "REQUESTS",
+        to: approverEmail,
+        replyTo: email || undefined,
+        subject: `Reply received — Approval Needed — ${doc.customerName || "Workspace"}${doc.ticketId ? ` (${doc.ticketId})` : ""}`,
+        html: buildApproverEmailHtml({
+          requestId: String(doc._id),
+          requesterName: name,
+          requesterEmail: email,
+          customerName: doc.customerName || "Workspace",
+          ticketId: doc.ticketId,
+          items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
+          comments: `Your question: ${question?.text || ""}\nReply${opts.edited ? " (request edited)" : ""}: ${reply}`,
+          approveUrl: decisionLinkUrl("request", String(doc._id), approverEmail, ws, "approve"),
+          declineUrl: decisionLinkUrl("request", String(doc._id), approverEmail, ws, "decline"),
+          clarifyUrl: decisionLinkUrl("request", String(doc._id), approverEmail, ws, "clarify"),
+        }),
+      } as any);
+    } catch {
+      /* non-blocking */
+    }
+  }
   return doc;
 }
 
@@ -281,8 +368,22 @@ async function notifyRequesterOfRequestDecision(
       await sendMail({
         kind: "CONFIRMATIONS",
         to,
-        subject: `Your Travel Request is On Hold — ${doc.ticketId || ""}`,
-        html: buildRequestOnHoldEmailHtml({ ticketId: doc.ticketId, requesterName, managerName: approverName, comment: reason, loginUrl }),
+        replyTo: approverEmail || undefined,
+        subject: `Your approver has a question — ${doc.ticketId || "your travel request"}`,
+        html: buildEmailShell(
+          `${eCard(`
+            ${eLabel("Question from your approver")}
+            <div style="font-size:13px;line-height:1.65;color:#334155;">
+              Hi <b style="color:#0f172a;">${escapeHtml(requesterName)}</b>,<br/><br/>
+              <b style="color:#0f172a;">${escapeHtml(approverName)}</b> needs more information before deciding on
+              your travel request${doc.ticketId ? ` <b style="color:#d06549;">(${escapeHtml(doc.ticketId)})</b>` : ""}:
+              <div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;white-space:pre-wrap;">${escapeHtml(reason)}</div>
+            </div>
+          `)}
+          <div style="margin-top:16px;">${eBtn("Reply in My Requests", loginUrl, "#00477f", "#ffffff")}</div>
+          <div style="margin-top:12px;color:#94a3b8;font-size:12px;">You can also edit the request before replying. Your reply goes back to the same approver.</div>`,
+          { title: "Your approver has a question", badgeText: "NEEDS YOUR REPLY", badgeColor: "#f59e0b" },
+        ),
       } as any);
     }
   } catch {
@@ -292,9 +393,14 @@ async function notifyRequesterOfRequestDecision(
 
 /* ───────────────────────── proposal decision ───────────────────────── */
 
-export type ProposalDecisionAction = "approve" | "decline";
+/** request_changes: back to ops with a note; ops revise and resubmit. */
+export type ProposalDecisionAction = "approve" | "decline" | "request_changes";
 
 export function proposalDecidedBy(p: AnyObj) {
+  if (str(p?.status) === "CHANGES_REQUESTED") {
+    const c = p?.customer || {};
+    return { status: "CHANGES_REQUESTED", decision: "CHANGES_REQUESTED", byName: str(c.byName), byEmail: str(c.byEmail), at: c.at || null };
+  }
   const d = p?.approvals?.l2 || {};
   return {
     status: str(p?.status),
@@ -329,11 +435,14 @@ export async function applyProposalDecision(opts: {
 }): Promise<{ proposal: any; request: any }> {
   const { actor, action } = opts;
   const reason = str(opts.reason);
-  if (!["approve", "decline"].includes(action)) {
+  if (!["approve", "decline", "request_changes"].includes(action)) {
     throw new DecisionError(400, "INVALID_ACTION", "Invalid action");
   }
   if (action === "decline" && !reason) {
     throw new DecisionError(400, "REASON_REQUIRED", "A reason is required to decline.");
+  }
+  if (action === "request_changes" && !reason) {
+    throw new DecisionError(400, "NOTE_REQUIRED", "Say what should change.");
   }
 
   const pFilter: AnyObj = { _id: opts.proposalId };
@@ -350,6 +459,30 @@ export async function applyProposalDecision(opts: {
 
   const email = norm(actor.email);
   const name = str(actor.name) || email;
+
+  if (action === "request_changes") {
+    const back: any = await Proposal.findOneAndUpdate(
+      { _id: p._id, status: "SUBMITTED" },
+      {
+        $set: {
+          status: "CHANGES_REQUESTED",
+          customer: { action: "needs_changes", note: reason, at: new Date(), byEmail: email, byName: name },
+        },
+        $push: {
+          history: { action: `${actor.via === "email" ? "EMAIL_" : ""}CHANGES_REQUESTED`, at: new Date(), byEmail: email, byName: name, note: reason },
+        },
+      },
+      { new: true },
+    ).exec();
+    if (!back) {
+      const now: any = await Proposal.findOne({ _id: p._id }).lean().exec();
+      throw new DecisionError(409, "ALREADY_DECIDED", "This proposal has already been decided.", { decided: proposalDecidedBy(now || p) });
+    }
+    await setProposalPhaseStage(ar._id, "PROPOSAL_CHANGES_REQUESTED");
+    await notifyOpsOfProposalOutcome(back, ar, "CHANGES_REQUESTED", name, reason);
+    return { proposal: back, request: ar };
+  }
+
   const decision = {
     decision: action === "approve" ? "APPROVED" : "DECLINED",
     at: new Date(),
@@ -381,6 +514,7 @@ export async function applyProposalDecision(opts: {
 
   await setProposalPhaseStage(ar._id, action === "approve" ? "PROPOSAL_APPROVED" : "PROPOSAL_DECLINED");
   await notifyRequesterOfProposalDecision(ar, action);
+  await notifyOpsOfProposalOutcome(updated, ar, decision.decision, name, reason);
   return { proposal: updated, request: ar };
 }
 
@@ -399,6 +533,46 @@ async function notifyRequesterOfProposalDecision(ar: AnyObj, action: ProposalDec
         action === "approve"
           ? buildProposalApprovedEmailHtml({ requesterName, ticketId: ar.ticketId, loginUrl })
           : buildProposalDeclinedEmailHtml({ requesterName, ticketId: ar.ticketId, loginUrl }),
+    } as any);
+  } catch {
+    /* non-blocking */
+  }
+}
+
+/**
+ * "Ops" for a proposal: the staff who submitted it (latest SUBMITTED entry)
+ * and the staff who drafted it. No shared ops mailbox exists in config.
+ */
+export function proposalOpsEmails(p: AnyObj): string[] {
+  const hist = Array.isArray(p?.history) ? p.history : [];
+  const submitter = [...hist].reverse().find((h: any) => str(h?.action) === "SUBMITTED");
+  return Array.from(new Set([norm(submitter?.byEmail), norm(p?.requesterEmail)].filter(Boolean)));
+}
+
+async function notifyOpsOfProposalOutcome(p: AnyObj, ar: AnyObj, outcome: string, byName: string, note: string) {
+  if (DISABLE_EMAILS) return;
+  const to = proposalOpsEmails(p);
+  if (!to.length) return;
+  const code = str(ar?.ticketId) || String(ar?._id || "").slice(-6).toUpperCase();
+  const label = outcome === "APPROVED" ? "approved" : outcome === "DECLINED" ? "declined" : "sent back with changes requested";
+  const url = `${frontendBaseUrl()}/admin/proposals/by-request?requestId=${encodeURIComponent(String(ar?._id || ""))}`;
+  try {
+    await sendMail({
+      kind: "REQUESTS",
+      to: to.join(","),
+      subject: `Proposal ${outcome === "CHANGES_REQUESTED" ? "changes requested" : label} — ${code}`,
+      html: buildEmailShell(
+        `${eCard(`
+          ${eLabel(`Proposal v${p?.version ?? ""} ${label}`)}
+          <div style="font-size:13px;line-height:1.65;color:#334155;">
+            Request <b>${escapeHtml(code)}</b> (${escapeHtml(str(ar?.customerName) || "Workspace")}) — proposal ${label}
+            by <b>${escapeHtml(byName)}</b>.
+            ${note ? `<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;white-space:pre-wrap;">${escapeHtml(note)}</div>` : ""}
+          </div>
+        `)}
+        <div style="margin-top:16px;">${eBtn("Open the proposal", url, "#00477f", "#ffffff")}</div>`,
+        { title: `Proposal ${label}`, badgeText: outcome.replace("_", " "), badgeColor: outcome === "APPROVED" ? "#10b981" : outcome === "DECLINED" ? "#dc2626" : "#f59e0b" },
+      ),
     } as any);
   } catch {
     /* non-blocking */

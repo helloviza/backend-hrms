@@ -920,6 +920,8 @@ export function buildApproverEmailHtml(opts: {
   /** Email decision links; "" when links are not configured → "Open Plumbox". */
   approveUrl: string;
   declineUrl: string;
+  /** "Ask a question" — sends the request back to the requester. */
+  clarifyUrl?: string;
   inboxUrl?: string;
 }) {
   const brand = "#00477f";
@@ -1028,6 +1030,10 @@ export function buildApproverEmailHtml(opts: {
             style="display:inline-block;background:#ffffff;color:#dc2626;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;border:1.5px solid #fca5a5;margin-right:10px;">
             &#10005; Decline
           </a>
+          ${opts.clarifyUrl ? `<a href="${opts.clarifyUrl}"
+            style="display:inline-block;background:#ffffff;color:#92400e;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;border:1.5px solid #fcd34d;">
+            ? Ask a question
+          </a>` : ""}
         </td>
       </tr>
       <tr>

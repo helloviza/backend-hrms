@@ -26,10 +26,12 @@ export type ApprovalStage =
   | "REQUEST_APPROVED"
   | "REQUEST_DECLINED"
   | "REQUEST_ON_HOLD"
+  | "REQUEST_NEEDS_CLARIFICATION"
   | "PROPOSAL_PENDING"
   | "PROPOSAL_SUBMITTED"
   | "PROPOSAL_APPROVED"
   | "PROPOSAL_DECLINED"
+  | "PROPOSAL_CHANGES_REQUESTED"
   | "BOOKING_IN_PROGRESS"
   | "BOOKING_ON_HOLD"
   | "BOOKING_DONE"
@@ -141,6 +143,14 @@ export interface ApprovalRequestDocument extends Document {
   approvedByEmail?: string;
 
   history?: ApprovalHistoryItem[];
+  clarifications?: Array<{
+    kind: "question" | "reply";
+    text: string;
+    at: Date;
+    byEmail?: string;
+    byName?: string;
+    edited?: boolean;
+  }>;
   meta?: any;
 
   // pricing (admin write; viewer sanitization happens in routes)
@@ -170,11 +180,13 @@ const STAGE_ENUM: ApprovalStage[] = [
   "REQUEST_APPROVED",
   "REQUEST_DECLINED",
   "REQUEST_ON_HOLD",
+  "REQUEST_NEEDS_CLARIFICATION",
 
   "PROPOSAL_PENDING",
   "PROPOSAL_SUBMITTED",
   "PROPOSAL_APPROVED",
   "PROPOSAL_DECLINED",
+  "PROPOSAL_CHANGES_REQUESTED",
 
   "BOOKING_IN_PROGRESS",
   "BOOKING_ON_HOLD",
@@ -190,6 +202,7 @@ const REQUEST_STAGES = new Set<ApprovalStage>([
   "REQUEST_APPROVED",
   "REQUEST_DECLINED",
   "REQUEST_ON_HOLD",
+  "REQUEST_NEEDS_CLARIFICATION",
 ]);
 
 const ADVANCED_STAGES = new Set<ApprovalStage>([
@@ -197,6 +210,7 @@ const ADVANCED_STAGES = new Set<ApprovalStage>([
   "PROPOSAL_SUBMITTED",
   "PROPOSAL_APPROVED",
   "PROPOSAL_DECLINED",
+  "PROPOSAL_CHANGES_REQUESTED",
   "BOOKING_IN_PROGRESS",
   "BOOKING_ON_HOLD",
   "BOOKING_DONE",
@@ -259,7 +273,7 @@ function fsmFromLegacy(stage: ApprovalStage | undefined, status: any): ApprovalF
     requestStage = "REQUEST_DECLINED_BY_L2";
   } else if (st === "REQUEST_APPROVED" || s === "approved") {
     requestStage = "REQUEST_APPROVED_BY_L2";
-  } else if (st === "REQUEST_ON_HOLD" || s === "on_hold") {
+  } else if (st === "REQUEST_ON_HOLD" || st === "REQUEST_NEEDS_CLARIFICATION" || s === "on_hold") {
     requestStage = "AWAITING_L2_REQUEST_APPROVAL";
   }
 
@@ -268,6 +282,8 @@ function fsmFromLegacy(stage: ApprovalStage | undefined, status: any): ApprovalF
     proposalStage = "PROPOSAL_POSTED"; // effectively ready for proposal team
   } else if (st === "PROPOSAL_SUBMITTED") {
     proposalStage = "AWAITING_PROPOSAL_APPROVAL_L2_L0";
+  } else if (st === "PROPOSAL_CHANGES_REQUESTED") {
+    proposalStage = "PROPOSAL_POSTED"; // back with the proposal team
   } else if (st === "PROPOSAL_APPROVED") {
     proposalStage = "PROPOSAL_APPROVED";
   } else if (st === "PROPOSAL_DECLINED") {
@@ -310,12 +326,12 @@ function deriveFsmCurrent(fsm: ApprovalFSM, legacyStage: ApprovalStage | undefin
   if (st === "PROPOSAL_DECLINED") return "PROPOSAL_DECLINED";
   if (st === "PROPOSAL_APPROVED") return "PROPOSAL_APPROVED";
   if (st === "PROPOSAL_SUBMITTED") return "AWAITING_PROPOSAL_APPROVAL_L2_L0";
-  if (st === "PROPOSAL_PENDING") return "PROPOSAL_POSTED";
+  if (st === "PROPOSAL_PENDING" || st === "PROPOSAL_CHANGES_REQUESTED") return "PROPOSAL_POSTED";
 
   // request
   if (st === "REQUEST_DECLINED") return "REQUEST_DECLINED_BY_L2";
   if (st === "REQUEST_APPROVED") return "REQUEST_APPROVED_BY_L2";
-  if (st === "REQUEST_ON_HOLD" || st === "REQUEST_RAISED") return "AWAITING_L2_REQUEST_APPROVAL";
+  if (st === "REQUEST_ON_HOLD" || st === "REQUEST_RAISED" || st === "REQUEST_NEEDS_CLARIFICATION") return "AWAITING_L2_REQUEST_APPROVAL";
 
   // fallback
   return fsm.request?.stage || "REQUEST_SUBMITTED";
@@ -349,6 +365,24 @@ const HistorySchema = new Schema<ApprovalHistoryItem>(
     userName: { type: String },
     userEmail: { type: String },
     tokenHash: { type: String, default: "" },
+  },
+  { _id: false },
+);
+
+/**
+ * Approver ↔ requester questions at the request-approval step. A question
+ * moves the request to REQUEST_NEEDS_CLARIFICATION; the reply returns it to
+ * the same approver. Visible to the requester, the approver and ops.
+ */
+const ClarificationSchema = new Schema(
+  {
+    kind: { type: String, enum: ["question", "reply"], required: true },
+    text: { type: String, required: true },
+    at: { type: Date, required: true, default: () => new Date() },
+    byEmail: { type: String, default: "" },
+    byName: { type: String, default: "" },
+    /** A reply that came with an edit to the request itself. */
+    edited: { type: Boolean, default: false },
   },
   { _id: false },
 );
@@ -414,6 +448,8 @@ const ApprovalRequestSchema = new Schema<ApprovalRequestDocument>(
     approvedByEmail: { type: String },
 
     history: { type: [HistorySchema], default: [] },
+
+    clarifications: { type: [ClarificationSchema], default: [] },
 
     // ✅ CRITICAL: meta must always exist (attachments, ccLeaders, revoked, etc.)
     meta: { type: Schema.Types.Mixed, default: {} },

@@ -506,7 +506,7 @@ describe("email decision link (no login)", () => {
       requesterName: "Riya Requester",
       tripSummary: "DEL → BOM",
       state: "OPEN",
-      actions: ["approve", "decline"],
+      actions: ["approve", "decline", "clarify"],
     });
     expectPriceFree(res.body);
     expect(JSON.stringify(res.body)).not.toMatch(/@cust\.com/);

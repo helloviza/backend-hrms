@@ -71,7 +71,13 @@ async function requestView(ar: AnyObj, email: string) {
     comments: stripPriceText(str(ar.comments)) || undefined,
     state: actionable ? (allowed ? "OPEN" : "NOT_ALLOWED") : "DECIDED",
     decided: actionable ? undefined : decidedBy(ar),
-    actions: actionable && allowed ? ["approve", "decline"] : [],
+    actions: actionable && allowed ? ["approve", "decline", "clarify"] : [],
+    clarifications: (Array.isArray(ar.clarifications) ? ar.clarifications : []).map((c: any) => ({
+      kind: c.kind,
+      text: c.text,
+      at: c.at,
+      byName: str(c.byName),
+    })),
   };
 }
 
@@ -100,7 +106,7 @@ async function proposalView(p: AnyObj, email: string) {
     options,
     state: open ? (allowed ? "OPEN" : "NOT_ALLOWED") : "DECIDED",
     decided: open ? undefined : proposalDecidedBy(p),
-    actions: open && allowed ? ["approve", "decline"] : [],
+    actions: open && allowed ? ["approve", "decline", "request_changes"] : [],
   };
 }
 
@@ -140,15 +146,15 @@ router.post("/:token", async (req, res) => {
     const actor = { email: link.email, name: await displayName(link.email), via: "email" as const };
     let targetId: any;
     if (link.kind === "request") {
-      const map: AnyObj = { approve: "approved", decline: "declined" };
+      const map: AnyObj = { approve: "approved", decline: "declined", clarify: "clarify" };
       if (!map[action]) return res.status(400).json({ ok: false, error: "Invalid action", code: "INVALID_ACTION" });
       const doc = await applyRequestDecision({ requestId: link.id, actor, action: map[action], reason });
       targetId = doc._id;
     } else {
-      if (action !== "approve" && action !== "decline") {
+      if (!["approve", "decline", "request_changes"].includes(action)) {
         return res.status(400).json({ ok: false, error: "Invalid action", code: "INVALID_ACTION" });
       }
-      const out = await applyProposalDecision({ proposalId: link.id, actor, action, reason });
+      const out = await applyProposalDecision({ proposalId: link.id, actor, action: action as any, reason });
       targetId = out.proposal._id;
     }
 

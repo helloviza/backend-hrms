@@ -307,3 +307,110 @@ describe("email links", () => {
     expect([p.status, p.body.code]).toEqual([403, "NOT_AN_APPROVER"]);
   });
 });
+
+describe("Phase B — clarification at the request step", () => {
+  it("approver asks → requester edits and replies → back to the same approver, thread visible to all", async () => {
+    const rid = await submitRequest();
+
+    const noQ = await as(request(app).put(`/api/approvals/requests/${rid}/action`), A).send({ action: "clarify" });
+    expect([noQ.status, noQ.body.code]).toEqual([400, "QUESTION_REQUIRED"]);
+
+    sent.length = 0;
+    const q = await as(request(app).put(`/api/approvals/requests/${rid}/action`), A).send({ action: "clarify", comment: "Why business class?" });
+    expect(q.status).toBe(200);
+    let doc = await reqDoc(rid);
+    expect([doc.status, doc.stage]).toEqual(["pending", "REQUEST_NEEDS_CLARIFICATION"]);
+    expect(sent.some((m) => m.to === REQUESTER && /has a question/.test(m.subject) && m.html.includes("Why business class?"))).toBe(true);
+
+    // Not in the approver's inbox while it waits for the requester.
+    const inbox = await as(request(app).get("/api/approvals/requests/inbox"), A);
+    expect(inbox.body.rows.map((r: any) => String(r._id))).not.toContain(rid);
+    // The approver cannot decide it while the question is open.
+    const early = await as(request(app).put(`/api/approvals/requests/${rid}/action`), A).send({ action: "approved" });
+    expect([early.status, early.body.code]).toEqual([409, "ALREADY_DECIDED"]);
+
+    // Only the requester replies; they may edit first.
+    const notOwner = await as(request(app).post(`/api/approvals/requests/${rid}/clarification`), A).send({ reply: "x" });
+    expect(notOwner.status).toBe(403);
+    const edit = await as(request(app).put(`/api/approvals/requests/${rid}`), R).send({ cartItems: [flightItem], comments: "Economy is fine" });
+    expect(edit.status).toBe(200);
+    const empty = await as(request(app).post(`/api/approvals/requests/${rid}/clarification`), R).send({ reply: " " });
+    expect([empty.status, empty.body.code]).toEqual([400, "REPLY_REQUIRED"]);
+
+    sent.length = 0;
+    const reply = await as(request(app).post(`/api/approvals/requests/${rid}/clarification`), R).send({ reply: "Changed to economy." });
+    expect(reply.status).toBe(200);
+    doc = await reqDoc(rid);
+    expect([doc.status, doc.stage, doc.managerEmail]).toEqual(["pending", "REQUEST_RAISED", APPROVER]);
+    expect(doc.clarifications.map((c: any) => [c.kind, c.text, c.edited])).toEqual([
+      ["question", "Why business class?", false],
+      ["reply", "Changed to economy.", true],
+    ]);
+    const back = sent.find((m) => m.to === APPROVER && /Reply received/.test(m.subject))!;
+    expect(back.html).toContain("Changed to economy.");
+    expect(back.html).toMatch(/\/approval\/email\?token=/);
+
+    // Thread is visible to requester, approver and ops.
+    for (const who of [R, A]) {
+      const g = await as(request(app).get(`/api/approvals/requests/${rid}`), who);
+      expect(g.body.request.clarifications.map((c: any) => c.kind)).toEqual(["question", "reply"]);
+    }
+    const ops = await as(request(app).get(`/api/approvals/admin/requests/${rid}`), { email: "ops@plumtrips.test", roles: ["SUPERADMIN"] });
+    expect(ops.body.clarifications.length).toBe(2);
+
+    // Back in the inbox; the approver decides.
+    expect((await as(request(app).get("/api/approvals/requests/inbox"), A)).body.rows.map((r: any) => String(r._id))).toContain(rid);
+    expect((await as(request(app).put(`/api/approvals/requests/${rid}/action`), A).send({ action: "approved" })).status).toBe(200);
+  });
+
+  it("the approver can ask by email link too", async () => {
+    const rid = await submitRequest();
+    const link = linkFor("request", rid, APPROVER);
+    expect((await request(app).get(link)).body.link.actions).toEqual(["approve", "decline", "clarify"]);
+    const p = await request(app).post(link).send({ action: "clarify", reason: "Which dates exactly?" });
+    expect(p.status).toBe(200);
+    expect((await reqDoc(rid)).stage).toBe("REQUEST_NEEDS_CLARIFICATION");
+  });
+
+  it("On Hold is no longer an approver action", async () => {
+    const rid = await submitRequest();
+    const h = await as(request(app).put(`/api/approvals/requests/${rid}/action`), A).send({ action: "on_hold", comment: "x" });
+    expect([h.status, h.body.code]).toEqual([400, "HOLD_REMOVED"]);
+  });
+});
+
+describe("Phase B — request changes at the proposal step", () => {
+  it("leader requests changes → ops notified → ops revise and resubmit → approver approves", async () => {
+    const rid = await approvedRequest();
+    const pid = await submittedProposal(rid);
+
+    const noNote = await as(request(app).post(`/api/proposals/${pid}/decide`), L).send({ decision: "CHANGES_REQUESTED" });
+    expect([noNote.status, noNote.body.code]).toEqual([400, "NOTE_REQUIRED"]);
+
+    sent.length = 0;
+    const back = await request(app).post(linkFor("proposal", pid, LEADER)).send({ action: "request_changes", reason: "Need a later flight" });
+    expect(back.status).toBe(200);
+    expect((await propDoc(pid)).status).toBe("CHANGES_REQUESTED");
+    expect((await reqDoc(rid)).stage).toBe("PROPOSAL_CHANGES_REQUESTED");
+    const opsMail = sent.find((m) => m.to.includes(OPS.email) && /changes requested/i.test(m.subject))!;
+    expect(opsMail.html).toContain("Need a later flight");
+
+    // The approver's decision now comes too late, and says who sent it back.
+    const late = await as(request(app).post(`/api/proposals/${pid}/decide`), A).send({ decision: "APPROVED" });
+    expect([late.status, late.body.decided?.decision, late.body.decided?.byEmail]).toEqual([409, "CHANGES_REQUESTED", LEADER]);
+
+    // Ops revise into v2 and resubmit; the approver and leaders are asked again.
+    const d2 = await as(request(app).post(`/api/proposals/by-request/${rid}/draft`), OPS).send({});
+    expect([d2.status, d2.body.proposal.version]).toEqual([200, 2]);
+    expect((await reqDoc(rid)).stage).toBe("PROPOSAL_PENDING");
+    sent.length = 0;
+    const s2 = await as(request(app).post(`/api/proposals/${d2.body.proposal._id}/submit`), OPS).send({});
+    expect(s2.status).toBe(200);
+    expect((await reqDoc(rid)).stage).toBe("PROPOSAL_SUBMITTED");
+    expect(sent.filter((m) => /Proposal Approval Needed/.test(m.subject)).map((m) => m.to).sort()).toEqual([APPROVER, LEADER].sort());
+
+    const ok = await as(request(app).post(`/api/proposals/${d2.body.proposal._id}/decide`), A).send({ decision: "APPROVED" });
+    expect(ok.status).toBe(200);
+    expect((await reqDoc(rid)).stage).toBe("PROPOSAL_APPROVED");
+  });
+});

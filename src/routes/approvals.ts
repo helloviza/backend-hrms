@@ -20,6 +20,7 @@ import Proposal from "../models/Proposal.js";
 import { sendMail } from "../utils/mailer.js";
 import {
   applyRequestDecision,
+  replyToClarification,
   decisionLinkUrl,
   DecisionError,
 } from "../services/approvalDecisions.js";
@@ -587,6 +588,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     // Email decision links: no login, single-use, bound to the approver.
     const approveUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "approve");
     const declineUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "decline");
+    const clarifyUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "clarify");
 
     const subject = `Approval Needed — ${customerName}${doc.ticketId ? ` (${doc.ticketId})` : ""}`;
 
@@ -608,6 +610,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
               comments: doc.comments,
               approveUrl,
               declineUrl,
+              clarifyUrl,
             }),
           });
         } else {
@@ -834,8 +837,11 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
     const status = String(doc.status || "").toLowerCase();
     const stage = String(doc.stage || "").toUpperCase();
 
+    // Also while the approver's question is open: the requester may fix the
+    // request before replying (the reply sends it back to the approver).
     const editable =
-      status === "pending" && (stage === "REQUEST_RAISED" || stage === "REQUEST_ON_HOLD" || !stage);
+      status === "pending" &&
+      (stage === "REQUEST_RAISED" || stage === "REQUEST_ON_HOLD" || stage === "REQUEST_NEEDS_CLARIFICATION" || !stage);
 
     if (!editable) {
       return res.status(400).json({ error: "Only pending / on-hold requests can be edited" });
@@ -907,14 +913,15 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
     const sub = String(req.user?.sub || req.user?._id || "");
     const email = normEmail(req.user?.email);
     const userName = normStr(req.user?.name || req.user?.firstName || "");
-    const action = normalizeAction(req.body?.action);
+    const rawAction = String(req.body?.action || "").trim().toLowerCase();
+    const action: string = rawAction === "clarify" ? "clarify" : normalizeAction(req.body?.action);
     const comment = normStr(req.body?.comment || "") || undefined;
 
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ error: "Invalid request id" });
     }
 
-    if (!["approved", "declined", "on_hold", "resend_email"].includes(String(action))) {
+    if (!["approved", "declined", "clarify", "on_hold", "resend_email"].includes(String(action))) {
       return res.status(400).json({ error: "Invalid action" });
     }
 
@@ -961,6 +968,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
 
       const approveUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "approve");
       const declineUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "decline");
+      const clarifyUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "clarify");
 
       const subject = `Approval Needed — ${doc.customerName || "Workspace"}${
         doc.ticketId ? ` (${doc.ticketId})` : ""
@@ -983,6 +991,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
               comments: doc.comments,
               approveUrl,
               declineUrl,
+              clarifyUrl,
             }),
           });
         }
@@ -1031,6 +1040,52 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
     }
 
     res.json({ ok: true, request: sanitizeApprovalForViewer(decided, req.user), message: "Updated" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
+ * Requester answers the approver's question
+ * POST /requests/:id/clarification  { reply }
+ * The request goes back to the same approver as pending. Edits made while the
+ * question was open (PUT /requests/:id) are flagged on the reply.
+ * ──────────────────────────────────────────────────────────────── */
+
+router.post("/requests/:id/clarification", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid request id" });
+
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId }).lean();
+    if (!doc) return res.status(404).json({ error: "Request not found" });
+    if (!isOwnerOfRequest(doc, req.user)) {
+      return res.status(403).json({ error: "Only the requester can reply" });
+    }
+
+    const lastQuestionAt = [...(doc.clarifications || [])].reverse().find((c: any) => c?.kind === "question")?.at;
+    const edited = (doc.history || []).some(
+      (h: any) => h?.action === "edited" && lastQuestionAt && new Date(h.at) > new Date(lastQuestionAt),
+    );
+
+    try {
+      const updated = await replyToClarification({
+        requestId: id,
+        workspaceId: req.workspaceObjectId,
+        actor: {
+          email: normEmail(req.user?.email),
+          name: normStr(req.user?.name || req.user?.firstName || ""),
+          sub: String(req.user?.sub || req.user?._id || ""),
+          via: "app",
+        },
+        reply: req.body?.reply,
+        edited,
+      });
+      return res.json({ ok: true, request: sanitizeApprovalForViewer(updated, req.user), message: "Reply sent to your approver" });
+    } catch (e) {
+      if (e instanceof DecisionError) return res.status(e.status).json({ error: e.message, code: e.code });
+      throw e;
+    }
   } catch (err) {
     next(err);
   }
@@ -1828,6 +1883,7 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
 
         const approveUrl = decisionLinkUrl("request", id, approverEmail, req.workspace || null, "approve");
         const declineUrl = decisionLinkUrl("request", id, approverEmail, req.workspace || null, "decline");
+        const clarifyUrl = decisionLinkUrl("request", id, approverEmail, req.workspace || null, "clarify");
 
         await sendMail({
           kind: "REQUESTS",
@@ -1844,6 +1900,7 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
             comments: updated.comments,
             approveUrl,
             declineUrl,
+            clarifyUrl,
           }),
         });
       }

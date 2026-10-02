@@ -16,6 +16,7 @@ export type ProposalStatus =
   | "SUBMITTED"
   | "APPROVED"
   | "DECLINED"
+  | "CHANGES_REQUESTED"
   | "EXPIRED";
 export type ApprovalDecision = "PENDING" | "APPROVED" | "DECLINED";
 export type BookingStatus = "NOT_STARTED" | "IN_PROGRESS" | "DONE" | "CANCELLED";
@@ -224,7 +225,8 @@ const proposalSchema = new Schema(
 
     status: {
       type: String,
-      enum: ["DRAFT", "SUBMITTED", "APPROVED", "DECLINED", "EXPIRED"],
+      // CHANGES_REQUESTED: the approver/leader sent it back to ops with a note.
+      enum: ["DRAFT", "SUBMITTED", "APPROVED", "DECLINED", "CHANGES_REQUESTED", "EXPIRED"],
       required: true,
       default: "DRAFT",
       index: true,
