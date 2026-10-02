@@ -32,10 +32,9 @@ import {
   eLabel,
   eCard,
   eRow,
-  buildAdminProcessedEmailHtml,
-  sanitizeAdminCommentForEmail,
 } from "./approvals.email.js";
 import { sanitizeApprovalForViewer, frontendBaseUrl as appFrontendBaseUrl } from "./approvals.security.js";
+import { markRequestDone, notifyRequesterProgress, notifyProposalReady } from "../services/approvalProgress.js";
 
 type AnyObj = Record<string, any>;
 type ProposalStatus = "DRAFT" | "SUBMITTED" | "APPROVED" | "DECLINED" | "CHANGES_REQUESTED" | "EXPIRED";
@@ -1259,6 +1258,8 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
       await doc.save();
     }
 
+    await notifyProposalReady(ar, doc);
+
     const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
     return res.json({ ok: true, proposal: enriched[0], emailedTo: deciders });
   } catch (err) {
@@ -1505,6 +1506,7 @@ router.post(
       if (doc.requestId) ar = await ApprovalRequest.findById(doc.requestId);
       if (!ar) return res.status(404).json({ error: "Linked approval request not found" });
 
+      const wasInProgress = ar.stage === "BOOKING_IN_PROGRESS";
       ar.adminState = "in_progress";
       ar.stage = "BOOKING_IN_PROGRESS";
       ar.history = Array.isArray(ar.history) ? ar.history : [];
@@ -1515,6 +1517,7 @@ router.post(
         note: "Booking started via proposal",
       });
       await ar.save();
+      if (!wasInProgress) await notifyRequesterProgress(ar, "booking_started");
 
       doc.booking = doc.booking || {};
       doc.booking.status = "IN_PROGRESS";
@@ -1556,56 +1559,26 @@ router.post(
       if (doc.requestId) ar = await ApprovalRequest.findById(doc.requestId);
       if (!ar) return res.status(404).json({ error: "Linked approval request not found" });
 
-      const adminUser: AnyObj = (req as AuthedReq).user || {};
-      const adminEmail = normEmail(adminUser.email || "");
-      const adminName = normStr(adminUser.name || adminUser.firstName || "");
-
-      ar.adminState = "done";
-      ar.stage = "COMPLETED";
-      ar.history = Array.isArray(ar.history) ? ar.history : [];
-      ar.history.push({
-        action: "admin_done",
-        by: String(adminUser.sub || adminUser._id || ""),
-        at: new Date(),
-        userEmail: adminEmail,
-        userName: adminName,
-      });
-      await ar.save();
-
-      doc.booking = doc.booking || {};
-      doc.booking.status = "DONE";
-      doc.history = ensureArray(doc.history);
-      doc.history.push(pushHistory(adminUser, "BOOKING_DONE", ""));
-      doc.markModified("booking");
-      await doc.save();
-
-      // Notify L1 (frontliner)
-      const to = normEmail(ar.frontlinerEmail || "");
-      if (to) {
-        try {
-          const sendMail = sendMailAny as any;
-          const subject = `Your Booking has been Processed — ${ar.customerName || "Workspace"}${ar.ticketId ? ` (${ar.ticketId})` : ""}`;
-          await sendMail({
-            kind: "CONFIRMATIONS",
-            to,
-            subject,
-            replyTo: adminEmail || undefined,
-            html: buildAdminProcessedEmailHtml({
-              customerName: ar.customerName || "Workspace",
-              ticketId: ar.ticketId,
-              requesterEmail: to,
-              processedByEmail: adminEmail,
-              processedByName: adminName,
-              comment: sanitizeAdminCommentForEmail(""),
-              items: Array.isArray(ar.cartItems) ? ar.cartItems : [],
-            }),
-          });
-        } catch {
-          // non-blocking
-        }
+      if (ar.stage !== "BOOKING_IN_PROGRESS") {
+        return res.status(400).json({ error: "Start the booking before marking it done" });
       }
-
-      return res.json({ ok: true });
+      // Same path as the queue's Mark Done: request COMPLETED, proposal DONE,
+      // one email to the requester with the approver and leaders copied.
+      const adminUser: AnyObj = (req as AuthedReq).user || {};
+      const body = (req as any).body || {};
+      const out = await markRequestDone({
+        doc: ar,
+        admin: {
+          sub: String(adminUser.sub || adminUser._id || ""),
+          email: normEmail(adminUser.email || ""),
+          name: normStr(adminUser.name || adminUser.firstName || ""),
+        },
+        comment: normStr(body?.note || body?.comment || ""),
+        notifyEmail: body?.notifyEmail,
+        bookingAmount: body?.bookingAmount,
+        actualBookingPrice: body?.actualBookingPrice,
+      });
+      return res.json({ ok: true, message: out.message });
     } catch (err) {
       next(err);
     }
@@ -1660,38 +1633,7 @@ router.post(
       doc.markModified("booking");
       await doc.save();
 
-      // Notify L1 (frontliner)
-      const to = normEmail(ar.frontlinerEmail || "");
-      if (to) {
-        try {
-          const sendMail = sendMailAny as any;
-          const routeLabel = String(doc.options?.[0]?.title || ar.cartItems?.[0]?.title || ar.cartItems?.[0]?.meta?.origin && ar.cartItems?.[0]?.meta?.destination ? `${ar.cartItems[0].meta.origin} → ${ar.cartItems[0].meta.destination}` : "");
-          const cancelBody = buildEmailShell(
-            `<div style="font-size:14px;color:#334155;line-height:1.65;">
-              <p>Hi,</p>
-              <p>We wanted to let you know that your booking request has been cancelled${routeLabel ? ` for <b>${escHtml(routeLabel)}</b>` : ""}.</p>
-              ${reason ? `<p><b>Reason:</b> ${escHtml(reason)}</p>` : ""}
-              <p>If you'd like to raise a new request, please click below.</p>
-              <div style="margin-top:20px;">
-                ${eBtn("Raise a New Request", `${process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com"}/sbt/my-requests`, "#4f46e5", "#ffffff")}
-              </div>
-            </div>`,
-            {
-              title: "Booking Update — Request Cancelled",
-              badgeText: "CANCELLED",
-              badgeColor: "#dc2626",
-            }
-          );
-          await sendMail({
-            kind: "REQUESTS",
-            to,
-            subject: `Booking Update — Request Cancelled${ar.ticketId ? ` (${ar.ticketId})` : ""}`,
-            html: cancelBody,
-          });
-        } catch {
-          // non-blocking
-        }
-      }
+      await notifyRequesterProgress(ar, "cancelled", reason);
 
       return res.json({ ok: true });
     } catch (err) {
@@ -1797,6 +1739,7 @@ router.get("/:id", requireAnyAuth, requireWorkspace, requireProposalViewer, asyn
           ...sanitized,
           _myRoles: myRoles,
           _isOwner: true,
+          _canDecide: false,
           _sanitized: true,
         },
       });

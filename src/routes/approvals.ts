@@ -10,7 +10,6 @@ import { requireTravelMode } from "../middleware/travelModeGuard.js";
 import { requireAnyFeature } from "../middleware/requireFeature.js";
 
 import ApprovalRequest from "../models/ApprovalRequest.js";
-import TravelBooking from "../models/TravelBooking.js";
 import MasterData from "../models/MasterData.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
@@ -49,7 +48,6 @@ import {
   requireApprovalsAdminRead,
   requireApprovalsAdminWrite,
   setNoStore,
-  uniqEmails,
   collectRoles,
   sanitizeApprovalForViewer,
   stripPriceText,
@@ -57,6 +55,7 @@ import {
 } from "./approvals.security.js";
 import approvalSearchRouter from "./approvals.search.js";
 import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
+import { markRequestDone, notifyRequesterProgress, latestProposalsFor } from "../services/approvalProgress.js";
 import {
   prepareCartSelections,
   writeSelectionSnapshots,
@@ -70,16 +69,13 @@ import {
 } from "../services/approvalTravellers.js";
 
 import {
-  buildAdminProcessedEmailHtml,
   buildApproverEmailHtml,
   buildLeaderFyiHtml,
-  buildEmailAttachmentsFromMeta,
   buildEmailShell,
   eLabel,
   eCard,
   eRow,
   eBtn,
-  sanitizeAdminCommentForEmail,
   sumBookingAmount,
   pickTripSummary,
   getItemBookingAmount,
@@ -736,7 +732,13 @@ router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("A
       .lean()
       .exec();
 
-    const safeRows = rows.map((r: any) => sanitizeApprovalForViewer(r, req.user));
+    // The latest submitted-or-later proposal per request, so My Requests can
+    // link to the requester's read-only proposal view.
+    const proposals = await latestProposalsFor(rows.map((r: any) => r._id));
+    const safeRows = rows.map((r: any) => ({
+      ...sanitizeApprovalForViewer(r, req.user),
+      _proposal: proposals.get(String(r._id)) || undefined,
+    }));
     res.json({ rows: safeRows });
   } catch (err) {
     next(err);
@@ -1225,6 +1227,7 @@ router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: A
   try {
     const doc: any = await ApprovalRequest.findOne({ _id: req.params.id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Not found" });
+    const wasInProgress = doc.stage === "BOOKING_IN_PROGRESS";
 
     doc.adminState = "in_progress";
     doc.stage = "BOOKING_IN_PROGRESS";
@@ -1238,6 +1241,7 @@ router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: A
       },
     ];
     await doc.save();
+    if (!wasInProgress) await notifyRequesterProgress(doc, "booking_started");
 
     res.json({ success: true, doc });
   } catch (err: any) {
@@ -1305,6 +1309,7 @@ router.put(
         });
       }
 
+      const wasInProgress = st === "BOOKING_IN_PROGRESS";
       doc.stage = "BOOKING_IN_PROGRESS";
       doc.adminState = "in_progress";
 
@@ -1319,6 +1324,7 @@ router.put(
       });
 
       await doc.save();
+      if (!wasInProgress) await notifyRequesterProgress(doc, "booking_started");
 
       // Sync proposal booking status if a proposal is linked
       const linkedProposalUp = await Proposal.findOne({ requestId: doc._id }).select("_id").lean();
@@ -1347,178 +1353,20 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
       return res.status(400).json({ error: "Only in-progress bookings can be marked done" });
     }
 
-    const adminSub = String(req.user?.sub || req.user?._id || "");
-    const adminEmail = normEmail(req.user?.email);
-    const adminName = normStr(req.user?.name || req.user?.firstName || "");
-
-    if (Number.isFinite(Number(bookingAmount))) doc.bookingAmount = Number(bookingAmount);
-    if (Number.isFinite(Number(actualBookingPrice))) doc.actualBookingPrice = Number(actualBookingPrice);
-
-    doc.adminState = "done";
-    doc.stage = "COMPLETED";
-
-    doc.history = Array.isArray(doc.history) ? doc.history : [];
-    doc.history.push({
-      action: "admin_done",
-      at: new Date(),
-      by: adminSub || "unknown",
-      comment: String(comment || "").trim() || undefined,
-      userEmail: adminEmail,
-      userName: adminName,
+    // The one "booking done" path (also used by the proposal page's Done).
+    const out = await markRequestDone({
+      doc,
+      admin: {
+        sub: String(req.user?.sub || req.user?._id || ""),
+        email: normEmail(req.user?.email),
+        name: normStr(req.user?.name || req.user?.firstName || ""),
+      },
+      comment,
+      notifyEmail,
+      bookingAmount,
+      actualBookingPrice,
     });
-
-    await doc.save();
-
-    // Sync proposal booking status if a proposal is linked
-    try {
-      const linkedProposalDone = await Proposal.findOne({ requestId: doc._id }).select("_id").lean();
-      if (linkedProposalDone) {
-        await syncProposalBookingStatus(String((linkedProposalDone as any)._id), "DONE");
-      }
-    } catch {
-      // non-blocking
-    }
-
-    // Auto-create TravelBooking for concierge booking
-    try {
-      const adminComment = String(comment || "");
-      const serviceMatch = adminComment.match(/\[SERVICE:(\w+)\]/i);
-      const amountMatch = adminComment.match(/\[BOOKING_AMOUNT:(\d+(?:\.\d+)?)\]/i);
-
-      if (serviceMatch && amountMatch) {
-        const service = serviceMatch[1].toUpperCase();
-        const amount = parseFloat(amountMatch[1]);
-        const validServices = [
-          "FLIGHT", "HOTEL", "VISA", "CAB",
-          "FOREX", "ESIM", "HOLIDAY", "MICE",
-        ];
-
-        if (validServices.includes(service) && amount > 0) {
-          await TravelBooking.findOneAndUpdate(
-            { reference: doc._id },
-            {
-              tenantId: doc.customerId || "default",
-              service,
-              amount,
-              userId: doc.frontlinerId,
-              status: "CONFIRMED",
-              source: "CONCIERGE",
-              reference: doc._id,
-              referenceModel: "ApprovalRequest",
-              bookedAt: new Date(),
-              metadata: { approvalId: doc._id },
-            },
-            { upsert: true, new: true },
-          );
-        }
-      }
-    } catch {
-      // non-blocking — booking sync failure should not break the done flow
-    }
-
-    const shouldNotify =
-      notifyEmail === false || notifyEmail === "false" || notifyEmail === 0 || notifyEmail === "0"
-        ? false
-        : true;
-
-    if (!shouldNotify) {
-      doc.history.push({
-        action: "admin_notify_skipped",
-        at: new Date(),
-        by: adminSub || "unknown",
-        comment: "NOTIFY_EMAIL not requested",
-        userEmail: adminEmail,
-        userName: adminName,
-      });
-      await doc.save();
-      return res.json({ ok: true, request: doc, message: "Marked done (notification skipped)" });
-    }
-
-    if (DISABLE_EMAILS) {
-      doc.history.push({
-        action: "admin_notify_skipped",
-        at: new Date(),
-        by: adminSub || "unknown",
-        comment: "DISABLE_EMAILS enabled — skipped admin notification email.",
-        userEmail: adminEmail,
-        userName: adminName,
-      });
-      await doc.save();
-      return res.json({ ok: true, request: doc, message: "Marked done (emails disabled)" });
-    }
-
-    const to = normEmail(doc.frontlinerEmail || "");
-    const cc = uniqEmails([
-      normEmail(doc.managerEmail || ""),
-      ...(Array.isArray(doc?.meta?.ccLeaders) ? doc.meta.ccLeaders : []),
-    ]).filter((e) => e && e !== to);
-
-    if (!to) {
-      doc.history.push({
-        action: "admin_notify_failed",
-        at: new Date(),
-        by: adminSub || "unknown",
-        comment: "Requester email missing; cannot notify.",
-        userEmail: adminEmail,
-        userName: adminName,
-      });
-      await doc.save();
-      return res.json({ ok: true, request: doc, message: "Marked done (no requester email)" });
-    }
-
-    const emailAtts = buildEmailAttachmentsFromMeta(doc);
-    const attachmentsForHtml = emailAtts.map((a) => ({ filename: a.filename || "attachment.pdf" }));
-
-    const subject = `Your Booking has been Processed — ${doc.customerName || "Workspace"}${
-      doc.ticketId ? ` (${doc.ticketId})` : ""
-    }`;
-
-    try {
-      const mailPayload: any = {
-        kind: "CONFIRMATIONS",
-        to,
-        cc: cc.length ? cc : undefined,
-        subject,
-        replyTo: adminEmail || undefined,
-        html: buildAdminProcessedEmailHtml({
-          customerName: doc.customerName || "Workspace",
-          ticketId: doc.ticketId,
-          requesterEmail: to,
-          processedByEmail: adminEmail,
-          processedByName: adminName,
-          comment: sanitizeAdminCommentForEmail(comment),
-          items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
-          attachments: attachmentsForHtml,
-        }),
-        attachments: emailAtts.length ? emailAtts : undefined,
-      };
-
-      await (sendMail as any)(mailPayload);
-
-      doc.history.push({
-        action: "admin_notify_sent",
-        at: new Date(),
-        by: adminSub || "unknown",
-        comment: `Notified: to=${to}${cc.length ? ` cc=${cc.join(",")}` : ""}${
-          emailAtts.length ? ` attachments=${emailAtts.length}` : ""
-        }`,
-        userEmail: adminEmail,
-        userName: adminName,
-      });
-      await doc.save();
-    } catch (e: any) {
-      doc.history.push({
-        action: "admin_notify_failed",
-        at: new Date(),
-        by: adminSub || "unknown",
-        comment: `Notify send failed: ${String(e?.message || e)}`,
-        userEmail: adminEmail,
-        userName: adminName,
-      });
-      await doc.save();
-    }
-
-    return res.json({ ok: true, request: doc, message: "Marked done" });
+    return res.json({ ok: true, request: out.doc, message: out.message });
   } catch (err) {
     next(err);
   }
@@ -1674,6 +1522,7 @@ router.put("/admin/:id/on-hold", requireApprovalsAdminWrite, async (req: AnyObj,
     const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
+    const wasOnHold = doc.adminState === "on_hold";
     doc.adminState = "on_hold";
 
     doc.history = Array.isArray(doc.history) ? doc.history : [];
@@ -1687,6 +1536,7 @@ router.put("/admin/:id/on-hold", requireApprovalsAdminWrite, async (req: AnyObj,
     });
 
     await doc.save();
+    if (!wasOnHold) await notifyRequesterProgress(doc, "ops_on_hold", comment);
     res.json({ ok: true, request: doc, message: "Placed on hold" });
   } catch (err) {
     next(err);
@@ -1722,6 +1572,7 @@ router.put("/admin/:id/cancel", requireApprovalsAdminWrite, async (req: AnyObj, 
     });
 
     await doc.save();
+    await notifyRequesterProgress(doc, "cancelled", comment);
     res.json({ ok: true, request: doc, message: "Cancelled" });
   } catch (err) {
     next(err);

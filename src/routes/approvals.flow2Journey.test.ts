@@ -22,7 +22,7 @@ import { MongoMemoryServer } from "mongodb-memory-server";
 process.env.NODE_ENV = "test";
 process.env.JWT_SECRET ||= "jwt-secret-for-tests";
 
-const sent: Array<{ to: string; subject: string; html: string }> = [];
+const sent: Array<{ to: string; subject: string; html: string; cc?: string[] }> = [];
 
 vi.mock("../middleware/auth.js", () => {
   const requireAuth = (req: any, _res: any, next: any) => {
@@ -45,7 +45,7 @@ vi.mock("../middleware/requireWorkspace.js", () => ({
 }));
 vi.mock("../utils/mailer.js", () => ({
   sendMail: async (m: any) => {
-    sent.push({ to: String(m.to), subject: String(m.subject), html: String(m.html || "") });
+    sent.push({ to: String(m.to), subject: String(m.subject), html: String(m.html || ""), cc: m.cc });
     return { messageId: "test" };
   },
 }));
@@ -412,5 +412,76 @@ describe("Phase B — request changes at the proposal step", () => {
     const ok = await as(request(app).post(`/api/proposals/${d2.body.proposal._id}/decide`), A).send({ decision: "APPROVED" });
     expect(ok.status).toBe(200);
     expect((await reqDoc(rid)).stage).toBe("PROPOSAL_APPROVED");
+  });
+});
+
+describe("Phase C — notifications and the one 'booking done' path", () => {
+  it("full journey: proposal ready → approved (approver + leaders told) → booking started → done from the proposal page", async () => {
+    const rid = await approvedRequest();
+    sent.length = 0;
+    const pid = await submittedProposal(rid);
+    const ready = sent.find((m) => m.to === REQUESTER && /proposal is ready/i.test(m.subject))!;
+    expect(ready.html).toContain(`/customer/approvals/proposal/${pid}`);
+    expect(ready.html).not.toMatch(/₹|INR|5000/);
+
+    // The requester can open the read-only, price-free proposal.
+    const view = await as(request(app).get(`/api/proposals/${pid}`), R);
+    expect(view.status).toBe(200);
+    expect(JSON.stringify(view.body)).not.toMatch(/unitPrice|totalPrice|5000/);
+    expect(view.body.proposal._canDecide).toBe(false);
+    // My Requests links to it.
+    const mine = await as(request(app).get("/api/approvals/requests/mine"), R);
+    expect(mine.body.rows.find((r: any) => String(r._id) === rid)._proposal).toMatchObject({ id: pid, status: "SUBMITTED" });
+
+    sent.length = 0;
+    expect((await as(request(app).post(`/api/proposals/${pid}/decide`), A).send({ decision: "APPROVED" })).status).toBe(200);
+    const fyi = sent.find((m) => /^Proposal approved/.test(m.subject) && m.to.includes(LEADER))!;
+    expect(fyi.to.split(",").sort()).toEqual([APPROVER, LEADER].sort());
+    expect(sent.some((m) => m.to.includes(OPS.email) && /Proposal approved/.test(m.subject))).toBe(true);
+    expect(sent.some((m) => m.to === REQUESTER && /Proposal Has Been Approved/.test(m.subject))).toBe(true);
+
+    // Done before start is refused on the proposal page too (one path, one rule).
+    const early = await as(request(app).post(`/api/proposals/${pid}/booking/done`), OPS).send({});
+    expect(early.status).toBe(400);
+
+    sent.length = 0;
+    expect((await as(request(app).post(`/api/proposals/${pid}/booking/start`), OPS).send({})).status).toBe(200);
+    expect(sent.some((m) => m.to === REQUESTER && /Booking in progress/.test(m.subject))).toBe(true);
+
+    sent.length = 0;
+    const done = await as(request(app).post(`/api/proposals/${pid}/booking/done`), OPS).send({ note: "Tickets attached" });
+    expect(done.status).toBe(200);
+    expect([(await reqDoc(rid)).stage, (await reqDoc(rid)).adminState]).toEqual(["COMPLETED", "done"]);
+    expect((await propDoc(pid)).booking.status).toBe("DONE");
+    const processed = sent.filter((m) => /Your Booking has been Processed/.test(m.subject));
+    expect(processed.map((m) => m.to)).toEqual([REQUESTER]);
+    expect([...(processed[0].cc || [])].sort()).toEqual([APPROVER, LEADER].sort());
+  });
+
+  it("the queue's Mark Done copies the approver and Workspace Leaders", async () => {
+    const rid = await approvedRequest();
+    const pid = await submittedProposal(rid);
+    await as(request(app).post(`/api/proposals/${pid}/decide`), A).send({ decision: "APPROVED" });
+    await as(request(app).put(`/api/approvals/admin/${rid}/under-process`), { email: "ops@plumtrips.test", roles: ["SUPERADMIN"] }).send({});
+    sent.length = 0;
+    const d = await as(request(app).put(`/api/approvals/admin/${rid}/done`), { email: "ops@plumtrips.test", roles: ["SUPERADMIN"] }).send({ comment: "Booked" });
+    expect(d.status).toBe(200);
+    const processed = sent.find((m) => m.to === REQUESTER && /Processed/.test(m.subject))!;
+    expect([...(processed.cc || [])].sort()).toEqual([APPROVER, LEADER].sort());
+    expect((await propDoc(pid)).booking.status).toBe("DONE");
+  });
+
+  it("ops hold and cancel tell the requester; the cancel email links to a new request", async () => {
+    const rid = await approvedRequest();
+    const STAFF = { email: "ops@plumtrips.test", roles: ["SUPERADMIN"] };
+    sent.length = 0;
+    expect((await as(request(app).put(`/api/approvals/admin/${rid}/on-hold`), STAFF).send({ comment: "Waiting on fares" })).status).toBe(200);
+    expect(sent.some((m) => m.to === REQUESTER && /on hold/i.test(m.subject) && m.html.includes("Waiting on fares"))).toBe(true);
+
+    sent.length = 0;
+    expect((await as(request(app).put(`/api/approvals/admin/${rid}/cancel`), STAFF).send({ comment: "Trip called off" })).status).toBe(200);
+    const c = sent.find((m) => m.to === REQUESTER && /Cancelled/.test(m.subject))!;
+    expect(c.html).toContain("/customer/approvals/new");
+    expect(c.html).toContain("Trip called off");
   });
 });

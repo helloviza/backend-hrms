@@ -23,7 +23,7 @@ import CustomerMember from "../models/CustomerMember.js";
 import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
 import { signApprovalLink, approvalLinkExpiryHours, type ApprovalLinkKind } from "../utils/approvalLinkToken.js";
-import { frontendBaseUrl, DISABLE_EMAILS } from "../routes/approvals.security.js";
+import { frontendBaseUrl, DISABLE_EMAILS, stripPriceText } from "../routes/approvals.security.js";
 import {
   buildRequesterApprovedHtml,
   buildRequestDeclinedEmailHtml,
@@ -515,6 +515,7 @@ export async function applyProposalDecision(opts: {
   await setProposalPhaseStage(ar._id, action === "approve" ? "PROPOSAL_APPROVED" : "PROPOSAL_DECLINED");
   await notifyRequesterOfProposalDecision(ar, action);
   await notifyOpsOfProposalOutcome(updated, ar, decision.decision, name, reason);
+  await notifyDecidersOfProposalDecision(ar, updated, decision.decision as any, name, reason);
   return { proposal: updated, request: ar };
 }
 
@@ -578,3 +579,37 @@ async function notifyOpsOfProposalOutcome(p: AnyObj, ar: AnyObj, outcome: string
     /* non-blocking */
   }
 }
+
+function proposalCode(ar: AnyObj) {
+  return str(ar?.ticketId) || String(ar?._id || "").slice(-6).toUpperCase();
+}
+
+/** The approver and every Workspace Leader hear the final proposal decision. */
+async function notifyDecidersOfProposalDecision(ar: AnyObj, proposal: AnyObj, decision: "APPROVED" | "DECLINED", byName: string, reason: string) {
+  if (DISABLE_EMAILS) return;
+  const to = await proposalDeciders(ar);
+  if (!to.length) return;
+  const verb = decision === "APPROVED" ? "approved" : "declined";
+  try {
+    await sendMail({
+      kind: "APPROVALS",
+      to: to.join(","),
+      subject: `Proposal ${verb} — ${proposalCode(ar)}`,
+      html: buildEmailShell(
+        `${eCard(`
+          ${eLabel(`Proposal ${verb}`)}
+          <div style="font-size:13px;line-height:1.65;color:#334155;">
+            The proposal (v${escapeHtml(String(proposal?.version ?? ""))}) for ${escapeHtml(str(ar?.frontlinerName) || "the requester")}'s
+            request <b>${escapeHtml(proposalCode(ar))}</b> was <b>${verb}</b> by <b>${escapeHtml(byName)}</b>.
+            ${reason ? `<br/><br/><b>Reason:</b> ${escapeHtml(stripPriceText(reason))}` : ""}
+            <br/><br/>No action is needed from you.
+          </div>
+        `)}`,
+        { title: `Proposal ${verb}`, badgeText: verb.toUpperCase(), badgeColor: decision === "APPROVED" ? "#10b981" : "#dc2626" },
+      ),
+    } as any);
+  } catch {
+    /* non-blocking */
+  }
+}
+
