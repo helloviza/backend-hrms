@@ -3,6 +3,7 @@ import { requireAuth } from "../middleware/auth.js";
 import User from "../models/User.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import CustomerMember from "../models/CustomerMember.js";
+import { maskTailId } from "../utils/piiMask.js";
 
 export type AnyObj = Record<string, any>;
 export type EmailAction = "approved" | "declined" | "on_hold" | "resend_email";
@@ -330,9 +331,25 @@ function stripPricesDeep(v: any, keep?: Set<string>): any {
   return out;
 }
 
+/** Traveller passport numbers (meta.travellers[]) → last 4, at any depth. */
+function maskPassportsDeep(v: any): any {
+  if (!v || typeof v !== "object") return v;
+  if (Array.isArray(v)) return v.map(maskPassportsDeep);
+  const out: AnyObj = {};
+  for (const k of Object.keys(v)) {
+    const val = v[k];
+    out[k] =
+      (k === "passportNumber" || k === "passportNo") && typeof val === "string" && val
+        ? maskTailId(val)
+        : maskPassportsDeep(val);
+  }
+  return out;
+}
+
 /**
- * The one price sanitiser for customer-side viewers. Used for approval
- * requests (approvals.ts, bookingHistory.ts) and proposals (proposals.ts).
+ * The one sanitiser for customer-side viewers: no prices, passport numbers
+ * last 4 only. Used for approval requests (approvals.ts, bookingHistory.ts)
+ * and proposals (proposals.ts). Staff see everything.
  */
 export function sanitizeApprovalForViewer(doc: any, user: any) {
   // Admins can see everything
@@ -341,7 +358,7 @@ export function sanitizeApprovalForViewer(doc: any, user: any) {
 
   // Clone (works for lean objects + mongoose docs), then drop every money key
   // at any depth and every currency figure in any string.
-  const safe = stripPricesDeep(JSON.parse(JSON.stringify(doc)));
+  const safe = maskPassportsDeep(stripPricesDeep(JSON.parse(JSON.stringify(doc))));
 
   // Proposal option PDFs are supplier quotes (they carry prices) — staff only.
   // Booking documents (safe.booking.attachments) stay.

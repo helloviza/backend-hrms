@@ -101,7 +101,10 @@ const as = (r: request.Test, who: Who, wsId: any) =>
 
 const flightItem = {
   type: "flight", title: "BLR → BOM", qty: 1, price: 0,
-  meta: { origin: "BLR", destination: "BOM", departDate: "2026-10-12" },
+  meta: {
+    origin: "BLR", destination: "BOM", departDate: "2026-10-12",
+    travellers: [{ kind: "manual", firstName: "Asha", lastName: "Rao" }],
+  },
 };
 const cid = (wsId: any) => (wsId === WS_DIRECT ? "D1" : wsId === WS_FLOW ? "F1" : "N1");
 

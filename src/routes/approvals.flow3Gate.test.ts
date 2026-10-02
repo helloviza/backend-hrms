@@ -96,7 +96,10 @@ const as = (r: request.Test, sub: any, wsId: any, roles: string[] = ["EMPLOYEE"]
 
 const flightItem = {
   type: "flight", title: "BLR → BOM", qty: 1, price: 0,
-  meta: { origin: "BLR", destination: "BOM", departDate: "2026-10-12" },
+  meta: {
+    origin: "BLR", destination: "BOM", departDate: "2026-10-12",
+    travellers: [{ kind: "manual", firstName: "Asha", lastName: "Rao" }],
+  },
 };
 
 const FEATURE_REFUSED = "Feature 'approvalFlowEnabled' or 'approvalDirectEnabled' not enabled for this workspace";

@@ -65,6 +65,11 @@ import {
   cartHasOptionRefs,
   SelectionError,
 } from "../services/approvalSearch/cartSelections.js";
+import {
+  prepareCartTravellers,
+  loadSelfTraveller,
+  TravellerError,
+} from "../services/approvalTravellers.js";
 
 import {
   buildAdminProcessedEmailHtml,
@@ -102,6 +107,10 @@ async function syncProposalBookingStatus(proposalId: string, status: "IN_PROGRES
 
 function sendSelectionError(res: any, e: SelectionError) {
   return res.status(e.status).json({ error: e.message, code: e.code, itemIndex: e.itemIndex });
+}
+
+function sendTravellerError(res: any, e: TravellerError) {
+  return res.status(e.status).json({ error: e.message, code: e.code, missing: e.missing });
 }
 
 const router = Router();
@@ -426,14 +435,20 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     }
 
     // Client-sent meta.selection is dropped; meta.optionRef → server-built selection.
+    // Self traveller comes from the requester's own profile, never the client.
     let prepared: Awaited<ReturnType<typeof prepareCartSelections>>;
     try {
       prepared = await prepareCartSelections({
-        cartItems: rawCartItems,
+        cartItems: await prepareCartTravellers({
+          cartItems: rawCartItems,
+          workspaceId: req.workspaceObjectId,
+          ownerUserId: sub,
+        }),
         userId: sub,
         workspaceId: req.workspaceObjectId,
       });
     } catch (e) {
+      if (e instanceof TravellerError) return sendTravellerError(res, e);
       if (e instanceof SelectionError) return sendSelectionError(res, e);
       throw e;
     }
@@ -705,6 +720,27 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
   }
 });
 
+/**
+ * GET /api/approvals/self-traveller — the caller's own traveller details for
+ * the request form's read-only "You" card: their claimed profile (My Profile),
+ * passport last 4 for customers, plus what is missing. Never the company
+ * travellers list.
+ */
+router.get("/self-traveller", requireAuth, requireWorkspace, async (req: AnyObj, res, next) => {
+  try {
+    const sub = String(req.user?.sub || req.user?._id || "");
+    const result = await loadSelfTraveller(req.workspaceObjectId, sub);
+    setNoStore(res);
+    res.json({
+      ok: true,
+      ...result,
+      traveller: result.traveller ? sanitizeApprovalForViewer(result.traveller, req.user) : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     // SBT users must not access approval flow
@@ -841,15 +877,23 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
     const userName = normStr(user?.name || user?.firstName || "");
     const sub = String(user?.sub || user?._id || "");
 
+    // Self = the request owner's profile (also when staff edit); masked
+    // passports sent back by a customer are restored from the stored request.
     let prepared: Awaited<ReturnType<typeof prepareCartSelections>>;
     try {
       prepared = await prepareCartSelections({
-        cartItems,
+        cartItems: await prepareCartTravellers({
+          cartItems,
+          workspaceId: req.workspaceObjectId,
+          ownerUserId: String(doc.frontlinerId || ""),
+          existingCartItems: JSON.parse(JSON.stringify(doc.cartItems || [])),
+        }),
         userId: sub,
         workspaceId: req.workspaceObjectId,
         requestId: doc._id,
       });
     } catch (e) {
+      if (e instanceof TravellerError) return sendTravellerError(res, e);
       if (e instanceof SelectionError) return sendSelectionError(res, e);
       throw e;
     }
@@ -2189,20 +2233,32 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
       stage: "REQUEST_RAISED",
       "meta.revoked": false,
     };
+    // Travellers are rebuilt on every resubmit — with the stored items when
+    // none are sent — so self always reflects the owner's current profile.
+    const storedCart = JSON.parse(JSON.stringify(doc.cartItems || []));
     let preparedResubmit: Awaited<ReturnType<typeof prepareCartSelections>> | null = null;
-    if (Array.isArray(cartItems) && cartItems.length > 0) {
-      try {
+    try {
+      const withTravellers = await prepareCartTravellers({
+        cartItems: Array.isArray(cartItems) && cartItems.length > 0 ? cartItems : storedCart,
+        workspaceId: req.workspaceObjectId,
+        ownerUserId: String(doc.frontlinerId || ""),
+        existingCartItems: storedCart,
+      });
+      if (Array.isArray(cartItems) && cartItems.length > 0) {
         preparedResubmit = await prepareCartSelections({
-          cartItems,
+          cartItems: withTravellers,
           userId: sub,
           workspaceId: req.workspaceObjectId,
           requestId: id,
         });
-      } catch (e) {
-        if (e instanceof SelectionError) return sendSelectionError(res, e);
-        throw e;
+        setFields.cartItems = preparedResubmit.cartItems;
+      } else {
+        setFields.cartItems = withTravellers;
       }
-      setFields.cartItems = preparedResubmit.cartItems;
+    } catch (e) {
+      if (e instanceof TravellerError) return sendTravellerError(res, e);
+      if (e instanceof SelectionError) return sendSelectionError(res, e);
+      throw e;
     }
 
     const updated: any = await ApprovalRequest.findOneAndUpdate(

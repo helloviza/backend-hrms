@@ -127,9 +127,11 @@ async function flightSession(sub: any, wsId: any, opts: { expired?: boolean } = 
   return s.sid;
 }
 
+// Every request needs a traveller; a manual one keeps these tests about selections.
+const TRAV = [{ kind: "manual", firstName: "Asha", lastName: "Rao" }];
 const flightItem = (meta: any = {}) => ({
   type: "flight", title: "BLR → BOM", qty: 1, price: 0,
-  meta: { origin: "BLR", destination: "BOM", departDate: "2026-10-12", ...meta },
+  meta: { origin: "BLR", destination: "BOM", departDate: "2026-10-12", travellers: TRAV, ...meta },
 });
 
 const createReq = (sub: any, wsId: any, cartItems: any[], roles?: string[]) =>
@@ -321,7 +323,7 @@ describe("optionRef → server-built selection", () => {
 
   it("hotel ref resolves to the chosen room", async () => {
     const h = await createSearchSession({ workspaceId: WS, userId: String(U.req), kind: "hotel", params: { CheckIn: "2026-10-12", CheckOut: "2026-10-14" }, results: [hotelRaw] });
-    const r = await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { city: "Mumbai", optionRef: optionRefFor(h.sid, 0, 0) } }]);
+    const r = await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { travellers: TRAV, city: "Mumbai", optionRef: optionRefFor(h.sid, 0, 0) } }]);
     expect(r.status).toBe(200);
     const doc: any = await col("approvalrequests").findOne({});
     expect(doc.cartItems[0].meta.selection).toMatchObject({ kind: "hotel", name: "Taj Lands End", stars: 5, roomName: "Luxury Room", mealPlan: "Breakfast", checkOut: "2026-10-14" });
@@ -619,7 +621,7 @@ describe("POST /search/hotels", () => {
     expectNoPrices(r.body);
 
     // attach a room: selection rebuilt server-side from the session
-    const created = await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { city: "Mumbai", optionRef: h3.rooms[1].optionRef } }]);
+    const created = await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { travellers: TRAV, city: "Mumbai", optionRef: h3.rooms[1].optionRef } }]);
     expect(created.status).toBe(200);
     const doc: any = await col("approvalrequests").findOne({});
     expect(doc.cartItems[0].meta.selection).toMatchObject({ kind: "hotel", name: "Hotel 003", roomName: "Luxury", stars: 5, checkIn: "2026-10-12" });
@@ -692,7 +694,7 @@ describe("the picked option in emails, and no snapshot for a Workspace Leader", 
       workspaceId: WS, userId: String(U.req), kind: "hotel", params: { CheckIn: "2026-10-12", CheckOut: "2026-10-14" },
       results: [{ ...hotelRaw, Rooms: [{ ...hotelRaw.Rooms[0], CancelPolicies: [{ FromDate: "10-10-2026 00:00:00", CancellationCharge: 100 }] }] }],
     });
-    await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { city: "Mumbai", checkIn: "2026-10-12", checkOut: "2026-10-14", optionRef: optionRefFor(h.sid, 0, 0) } }]);
+    await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { travellers: TRAV, city: "Mumbai", checkIn: "2026-10-12", checkOut: "2026-10-14", optionRef: optionRefFor(h.sid, 0, 0) } }]);
     const approver = mails.find((m) => String(m.to).includes("approver@cust.test"));
     expect(approver!.html).toContain("Taj Lands End (5★)");
     expect(approver!.html).toContain("Luxury Room · Breakfast");
