@@ -11,16 +11,20 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import Proposal from "../models/Proposal.js";
-import ApprovalRequest, { type ApprovalStage } from "../models/ApprovalRequest.js";
+import ApprovalRequest from "../models/ApprovalRequest.js";
 import User from "../models/User.js";
 
 // ✅ reuse existing utilities (same as approvals flow)
 // NOTE: signatures may vary in your codebase; we call as `any` safely.
 import { sendMail as sendMailAny } from "../utils/mailer.js";
 import {
-  signEmailActionToken as signEmailActionTokenAny,
-  verifyEmailActionToken as verifyEmailActionTokenAny,
-} from "../utils/emailActionToken.js";
+  applyProposalDecision,
+  proposalDeciders,
+  decisionLinkUrl,
+  workspaceOf,
+  setProposalPhaseStage,
+  DecisionError,
+} from "../services/approvalDecisions.js";
 import {
   buildEmailShell,
   eBtn,
@@ -29,11 +33,9 @@ import {
   eCard,
   eRow,
   buildAdminProcessedEmailHtml,
-  buildProposalApprovedEmailHtml,
-  buildProposalDeclinedEmailHtml,
   sanitizeAdminCommentForEmail,
 } from "./approvals.email.js";
-import { sanitizeApprovalForViewer } from "./approvals.security.js";
+import { sanitizeApprovalForViewer, frontendBaseUrl as appFrontendBaseUrl } from "./approvals.security.js";
 
 type AnyObj = Record<string, any>;
 type ProposalStatus = "DRAFT" | "SUBMITTED" | "APPROVED" | "DECLINED" | "EXPIRED";
@@ -50,6 +52,7 @@ type AuthedReq = Request & {
   _proposalIsOwner?: boolean;
   _proposalIsWorkspaceL0?: boolean;
   _proposalWorkspaceId?: string;
+  _proposalCanDecide?: boolean;
 };
 
 const router = Router();
@@ -224,9 +227,10 @@ function getPublicRequestCode(ar: AnyObj | null | undefined): string {
 function cloneToDraftFromLatest(
   latest: AnyObj,
   requestId: mongoose.Types.ObjectId,
-  version: number
+  version: number,
+  workspaceId: any
 ) {
-  const base = defaultProposalDoc({ requestId, version });
+  const base = defaultProposalDoc({ requestId, version, workspaceId });
 
   return {
     ...base,
@@ -543,8 +547,10 @@ function isRequestFullyApproved(ar: AnyObj): boolean {
  * Defaults / fetch helpers
  * ──────────────────────────────────────────────────────────────── */
 
-function defaultProposalDoc(input: { requestId: mongoose.Types.ObjectId; version: number }) {
+// workspaceId is schema-required (F2-01): every draft takes the request's.
+function defaultProposalDoc(input: { requestId: mongoose.Types.ObjectId; version: number; workspaceId: any }) {
   return {
+    workspaceId: input.workspaceId,
     requestId: input.requestId,
     version: input.version,
     status: "DRAFT" as ProposalStatus,
@@ -578,60 +584,6 @@ async function nextVersionForRequest(requestId: mongoose.Types.ObjectId) {
   const last = await Proposal.findOne({ requestId }).sort({ version: -1 }).lean();
   const v = Number((last as any)?.version || 0);
   return Math.max(1, v + 1);
-}
-
-/* ───────────────────────── Stage sync (ApprovalRequest.stage) ───────────────────────── */
-
-const STAGE_RANK: Partial<Record<ApprovalStage, number>> = {
-  REQUEST_RAISED: 10,
-  REQUEST_APPROVED: 20,
-  REQUEST_ON_HOLD: 30,
-  REQUEST_DECLINED: 40,
-
-  PROPOSAL_PENDING: 50,
-  PROPOSAL_SUBMITTED: 60,
-  PROPOSAL_APPROVED: 70,
-  PROPOSAL_DECLINED: 80,
-
-  BOOKING_IN_PROGRESS: 90,
-  BOOKING_ON_HOLD: 95,
-  BOOKING_DONE: 100,
-  BOOKING_CANCELLED: 110,
-
-  COMPLETED: 120,
-  CANCELLED: 130,
-};
-
-function isApprovalStage(v: any): v is ApprovalStage {
-  return typeof v === "string" && (v as ApprovalStage) in (STAGE_RANK as AnyObj);
-}
-
-async function safeAdvanceStage(
-  requestId: mongoose.Types.ObjectId,
-  nextStage: ApprovalStage,
-  opts?: { force?: boolean; workspaceId?: string }
-) {
-  const force = Boolean(opts?.force);
-
-  const reqDoc: any = await scopedFindById(ApprovalRequest, requestId, opts?.workspaceId ?? "");
-  if (!reqDoc) return;
-
-  const current = String(reqDoc.stage || "").trim();
-  const currentStage = isApprovalStage(current) ? (current as ApprovalStage) : undefined;
-
-  if (!currentStage || force) {
-    reqDoc.stage = nextStage;
-    await reqDoc.save();
-    return;
-  }
-
-  const curRank = Number(STAGE_RANK[currentStage] ?? 0);
-  const nextRank = Number(STAGE_RANK[nextStage] ?? 0);
-
-  if (nextRank >= curRank) {
-    reqDoc.stage = nextStage;
-    await reqDoc.save();
-  }
 }
 
 /* ────────────────────────────────────────────────────────────────
@@ -688,11 +640,13 @@ const requireProposalViewer: RequestHandler = async (req: Request, res: Response
 
     const myRoles = computeMyRolesFromAR(ar, userEmail);
     const owner = isOwnerOfRequest(ar, userEmail);
+    const canDecide = (await proposalDeciders(ar)).includes(userEmail);
 
-    if (!myRoles.length && !owner) {
+    if (!myRoles.length && !owner && !canDecide) {
       return res.status(403).json({ error: "Not allowed" });
     }
 
+    aReq._proposalCanDecide = canDecide;
     aReq._proposal = p;
     aReq._proposalMyRoles = myRoles;
     aReq._proposalIsOwner = owner;
@@ -748,44 +702,8 @@ const requireProposalViewerFromDownloadPath: RequestHandler = async (req: Reques
 };
 
 /* ────────────────────────────────────────────────────────────────
- * L0 requirement policy
- * ──────────────────────────────────────────────────────────────── */
-
-function requiresL0Approval(ar: AnyObj | null | undefined, proposal: AnyObj | null | undefined): boolean {
-  const explicit =
-    ar?.meta?.requireL0Approval ??
-    ar?.requireL0Approval ??
-    ar?.approvalPolicy?.requireL0Approval;
-
-  if (explicit === true) return true;
-  if (explicit === false) return false;
-
-  const threshold = Number(process.env.PROPOSAL_L0_THRESHOLD || 0);
-  if (Number.isFinite(threshold) && threshold > 0) {
-    const amt = Number(proposal?.totalAmount ?? 0);
-    if (Number.isFinite(amt) && amt >= threshold) return true;
-  }
-
-  return false;
-}
-
-/* ────────────────────────────────────────────────────────────────
  * Email helpers
  * ──────────────────────────────────────────────────────────────── */
-
-function frontendBaseUrl() {
-  return (
-    process.env.FRONTEND_PUBLIC_URL ||
-    process.env.PUBLIC_FRONTEND_URL ||
-    process.env.PUBLIC_WEB_URL ||
-    "http://localhost:5173"
-  ).replace(/\/$/, "");
-}
-
-function buildEmailActionUrl(token: string) {
-  const base = publicBaseUrl().replace(/\/$/, "");
-  return `${base}/api/proposals/email-action?token=${encodeURIComponent(token)}`;
-}
 
 function itemLabel(li: any): string {
   const origin = String(li?.meta?.origin || li?.from || li?.origin || "").trim();
@@ -862,23 +780,6 @@ function buildProposalSummaryHtml(p: any) {
 }
 
 
-function buttonHtml(label: string, url: string, kind: "green" | "red" | "gray") {
-  const bg = kind === "green" ? "#16a34a" : kind === "red" ? "#dc2626" : "#6b7280";
-  return `
-    <a href="${url}" style="
-      display:inline-block;
-      padding:10px 14px;
-      margin-right:10px;
-      border-radius:10px;
-      background:${bg};
-      color:#fff;
-      text-decoration:none;
-      font-weight:700;
-      font-family:Arial,sans-serif;
-    ">${label}</a>
-  `;
-}
-
 function extractRelativeUploadPathFromAttachmentUrl(u: string): string {
   const s = String(u || "").trim();
   if (!s) return "";
@@ -930,137 +831,15 @@ router.get(
 );
 
 /**
- * ✅ Public email action endpoint (token-based)
- * GET /api/proposals/email-action?token=...
- * Verifies token, updates proposal, redirects to frontend confirmation page.
+ * Retired: GET /api/proposals/email-action used to APPROVE on a plain GET
+ * (link scanners could approve) with a reusable token. Proposal emails now
+ * carry single-use links to the confirm page (routes/approvalLinks.ts); an
+ * old link only says so.
  */
-router.get("/email-action", async (req: Request, res: Response) => {
-  try {
-    setNoStore(res);
-
-    const token = String(req.query?.token || "").trim();
-    if (!token) return res.status(400).send("Missing token");
-
-    const verify = verifyEmailActionTokenAny as any;
-    const payload = await verify(token); // expected { proposalId, action, role, ... }
-
-    const proposalId = String(payload?.proposalId || payload?.id || "").trim();
-    const action = String(payload?.action || "").trim().toLowerCase(); // approve|decline|hold
-    const role = String(payload?.role || "L2").trim().toUpperCase(); // L2/L0
-    const byEmail = normEmail(payload?.email || payload?.byEmail || "");
-    const byName = normStr(payload?.name || payload?.byName || "");
-
-    if (!mongoose.Types.ObjectId.isValid(proposalId)) {
-      return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=0&msg=Invalid%20proposal`);
-    }
-
-    const doc: any = await Proposal.findById(proposalId);
-    if (!doc) {
-      return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=0&msg=Proposal%20not%20found`);
-    }
-
-    if (String(doc.status || "") !== "SUBMITTED") {
-      return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=0&msg=Proposal%20not%20in%20SUBMITTED`);
-    }
-
-    // Map action
-    const decision: ApprovalDecision =
-      action === "approve" || action === "approved" ? "APPROVED" :
-      action === "decline" || action === "reject" || action === "declined" ? "DECLINED" :
-      action === "hold" || action === "on_hold" ? "PENDING" :
-      "PENDING";
-
-    // Apply decision
-    doc.approvals = doc.approvals || {};
-    doc.approvals.l2 = doc.approvals.l2 || { decision: "PENDING" };
-    doc.approvals.l0 = doc.approvals.l0 || { decision: "PENDING" };
-
-    const key = role === "L0" ? "l0" : "l2";
-    doc.approvals[key] = {
-      decision,
-      at: new Date(),
-      byEmail,
-      byName,
-      comment: action === "hold" ? "On hold (email action)" : "",
-    };
-
-    doc.history = ensureArray(doc.history);
-    doc.history.push(
-      pushHistory(
-        { email: byEmail, name: byName },
-        `EMAIL_${role}_${decision}`,
-        action
-      )
-    );
-
-    // Determine final proposal status
-    let ar: any = null;
-    if (doc.requestId) ar = await ApprovalRequest.findOne({ _id: doc.requestId, workspaceId: doc.workspaceId }).lean();
-    const needL0 = requiresL0Approval(ar, doc);
-
-    const l2 = String(doc.approvals?.l2?.decision || "PENDING").toUpperCase();
-    const l0 = String(doc.approvals?.l0?.decision || "PENDING").toUpperCase();
-
-    const shouldDecline = l2 === "DECLINED" || (needL0 && l0 === "DECLINED");
-    if (shouldDecline) {
-      doc.status = "DECLINED";
-      await doc.save();
-      if (doc.requestId) await safeAdvanceStage(doc.requestId, "PROPOSAL_DECLINED", { workspaceId: doc.workspaceId });
-
-      // Notify L1
-      try {
-        const arDecline: any = doc.requestId ? await ApprovalRequest.findById(doc.requestId).select("frontlinerEmail frontlinerName ticketId").lean() : null;
-        if (arDecline?.frontlinerEmail) {
-          const sendMail = sendMailAny as any;
-          await sendMail({
-            kind: "CONFIRMATIONS",
-            to: normEmail(arDecline.frontlinerEmail),
-            subject: `Your Travel Proposal Has Been Declined — ${arDecline.ticketId || ""}`,
-            html: buildProposalDeclinedEmailHtml({
-              requesterName: normStr(arDecline.frontlinerName || ""),
-              ticketId: arDecline.ticketId,
-              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
-            }),
-          });
-        }
-      } catch { /* non-blocking */ }
-
-      return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=1&status=DECLINED`);
-    }
-
-    const fullyApproved = l2 === "APPROVED" && (!needL0 || l0 === "APPROVED");
-    if (fullyApproved) {
-      doc.status = "APPROVED";
-      await doc.save();
-      if (doc.requestId) await safeAdvanceStage(doc.requestId, "PROPOSAL_APPROVED", { workspaceId: doc.workspaceId });
-
-      // Notify L1
-      try {
-        const arApprove: any = doc.requestId ? await ApprovalRequest.findById(doc.requestId).select("frontlinerEmail frontlinerName ticketId").lean() : null;
-        if (arApprove?.frontlinerEmail) {
-          const sendMail = sendMailAny as any;
-          await sendMail({
-            kind: "CONFIRMATIONS",
-            to: normEmail(arApprove.frontlinerEmail),
-            subject: `Your Travel Proposal Has Been Approved — ${arApprove.ticketId || ""}`,
-            html: buildProposalApprovedEmailHtml({
-              requesterName: normStr(arApprove.frontlinerName || ""),
-              ticketId: arApprove.ticketId,
-              loginUrl: `${frontendBaseUrl()}/customer/approvals/proposals`,
-            }),
-          });
-        }
-      } catch { /* non-blocking */ }
-
-      return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=1&status=APPROVED`);
-    }
-
-    await doc.save();
-    return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=1&status=UPDATED`);
-  } catch (e: any) {
-    const msg = encodeURIComponent(String(e?.message || "Invalid/expired token"));
-    return res.redirect(`${frontendBaseUrl()}/proposal-action?ok=0&msg=${msg}`);
-  }
+router.get("/email-action", (_req: Request, res: Response) => {
+  setNoStore(res);
+  const msg = encodeURIComponent("This link is no longer valid. Use the link in the latest email, or open Plumbox.");
+  return res.redirect(`${appFrontendBaseUrl()}/proposal-action?ok=0&msg=${msg}`);
 });
 
 /**
@@ -1077,7 +856,6 @@ router.get("/inbox", requireAnyAuth, requireWorkspace, async (req: Request, res:
     const proposalFilter: any = {
       status: "SUBMITTED",
       workspaceId: (req as any).workspaceObjectId,
-      $or: [{ "approvals.l2.decision": "PENDING" }, { "approvals.l0.decision": "PENDING" }],
     };
     const proposals = await Proposal.find(proposalFilter)
       .sort({ updatedAt: -1 })
@@ -1104,28 +882,9 @@ router.get("/inbox", requireAnyAuth, requireWorkspace, async (req: Request, res:
       const ar = reqMap.get(rid);
       if (!ar) continue;
 
-      const myRoles = computeMyRolesFromAR(ar, userEmail);
-      if (!myRoles.length) continue;
+      if (!(await proposalDeciders(ar)).includes(userEmail)) continue;
 
-      const l2Decision = String(p?.approvals?.l2?.decision || "PENDING").toUpperCase();
-      const l0Decision = String(p?.approvals?.l0?.decision || "PENDING").toUpperCase();
-
-      const needL0 = requiresL0Approval(ar, p);
-
-      const needsL2 = l2Decision === "PENDING";
-      const needsL0 = needL0 && l0Decision === "PENDING";
-
-      let actionable = false;
-      if (myRoles.includes("L2") && needsL2) actionable = true;
-      if (myRoles.includes("L0") && needsL0) actionable = true;
-
-      if (!actionable) continue;
-
-      out.push({
-        ...(p as any),
-        _myRoles: myRoles,
-        _isSelfApproval: myRoles.includes("L2") && isOwnerOfRequest(ar, userEmail),
-      });
+      out.push({ ...(p as any), _canDecide: true });
     }
 
     const enriched = await enrichProposalsWithRequestData(out);
@@ -1294,8 +1053,11 @@ router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, re
 
     if (!isRequestFullyApproved(ar)) {
       return res.status(403).json({
-        error: "Request must be approved by L2 and L0 before proposal can be created.",
+        error: "The request must be approved before a proposal can be created.",
       });
+    }
+    if (["BOOKING_IN_PROGRESS", "BOOKING_ON_HOLD", "BOOKING_DONE", "BOOKING_CANCELLED", "COMPLETED", "CANCELLED"].includes(String(ar.stage || ""))) {
+      return res.status(400).json({ error: "Booking has already started for this request." });
     }
 
     // Resolve requester identity from the authenticated user
@@ -1320,7 +1082,7 @@ router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, re
       }
 
       const version = await nextVersionForRequest(rid);
-      const cloned = cloneToDraftFromLatest((latest as any).toObject?.() ?? latest, rid, version);
+      const cloned = cloneToDraftFromLatest((latest as any).toObject?.() ?? latest, rid, version, ar.workspaceId);
 
       const doc: any = await Proposal.create(cloned);
       doc.history = ensureArray(doc.history);
@@ -1340,14 +1102,14 @@ router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, re
       doc.requesterName = requesterName;
 
       await doc.save();
-      await safeAdvanceStage(rid, "PROPOSAL_PENDING", { workspaceId: (req as any).workspaceObjectId });
+      await setProposalPhaseStage(rid, "PROPOSAL_PENDING");
 
       const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
       return res.json({ ok: true, proposal: enriched[0], created: true });
     }
 
     const version = await nextVersionForRequest(rid);
-    const doc: any = await Proposal.create(defaultProposalDoc({ requestId: rid, version }));
+    const doc: any = await Proposal.create(defaultProposalDoc({ requestId: rid, version, workspaceId: ar.workspaceId }));
 
     const currency = normStr((req as any).body?.currency || "");
     if (currency) doc.currency = currency.toUpperCase();
@@ -1360,7 +1122,7 @@ router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, re
     doc.history.push(pushHistory((req as AuthedReq).user || {}, "DRAFT_CREATED", `Draft created v${doc.version}`));
 
     await doc.save();
-    await safeAdvanceStage(rid, "PROPOSAL_PENDING", { workspaceId: (req as any).workspaceObjectId });
+    await setProposalPhaseStage(rid, "PROPOSAL_PENDING");
 
     const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
     return res.json({ ok: true, proposal: enriched[0], created: true });
@@ -1428,8 +1190,12 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
     if (doc.requestId) ar = await ApprovalRequest.findOne({ _id: doc.requestId, workspaceId: (req as any).workspaceObjectId }).lean();
     if (!ar) return res.status(400).json({ error: "ApprovalRequest not found for proposal" });
 
-    const { l2Email, l0Emails } = extractApproversFromApprovalRequest(ar);
-    if (!l2Email) return res.status(400).json({ error: "Could not resolve L2 approver email" });
+    // Either the request's approver or any Workspace Leader decides — whoever
+    // acts first. Each gets their own single-use link.
+    const deciders = await proposalDeciders(ar);
+    if (!deciders.length) {
+      return res.status(400).json({ error: "No approver or Workspace Leader can decide this proposal." });
+    }
 
     doc.status = "SUBMITTED" as ProposalStatus;
     doc.approvals = doc.approvals || {};
@@ -1441,151 +1207,60 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
     doc.history.push(pushHistory((req as AuthedReq).user || {}, "SUBMITTED", normStr(body?.note || "")));
 
     await doc.save();
-    if (doc.requestId) await safeAdvanceStage(doc.requestId, "PROPOSAL_SUBMITTED", { workspaceId: (req as any).workspaceObjectId });
+    if (doc.requestId) await setProposalPhaseStage(doc.requestId, "PROPOSAL_SUBMITTED");
 
-    // Build email action tokens
-    const sign = signEmailActionTokenAny as any;
-
-    const approveToken = await sign({
-      proposalId: String(doc._id),
-      action: "approve",
-      role: "L2",
-      email: l2Email,
-    });
-
-    const declineToken = await sign({
-      proposalId: String(doc._id),
-      action: "decline",
-      role: "L2",
-      email: l2Email,
-    });
-
-    const holdToken = await sign({
-      proposalId: String(doc._id),
-      action: "hold",
-      role: "L2",
-      email: l2Email,
-    });
-
-    const approveUrl = buildEmailActionUrl(approveToken);
-    const declineUrl = buildEmailActionUrl(declineToken);
-    const holdUrl = buildEmailActionUrl(holdToken);
-
+    const ws = await workspaceOf(ar);
     const reqCode = getPublicRequestCode(ar);
     const summaryHtml = buildProposalSummaryHtml(doc);
 
-    const proposalEmailBody = `
-      <div style="font-size:12px;color:#64748b;margin-bottom:14px;">
-        Request: <b style="color:#0f172a;">${escHtml(reqCode || String(doc.requestId || ""))}</b>
-      </div>
-
-      ${summaryHtml}
-
-      <div style="margin-top:20px;">
-        ${eBtn("✓ Approve", approveUrl, "#4f46e5", "#ffffff")}
-        ${eBtn("✕ Reject", declineUrl, "#ffffff", "#dc2626", "#fca5a5")}
-        ${eBtn("▮ On Hold", holdUrl, "#ffffff", "#92400e", "#fcd34d")}
-      </div>
-
-      <div style="margin-top:20px;padding:12px 14px;border-radius:14px;background:#0b1220;color:#e2e8f0;">
-        <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:900;color:#94a3b8;">Security</div>
-        <div style="margin-top:6px;font-size:13px;line-height:1.55;">
-          Do not forward this email. Action links are intended for the assigned approver only.
-        </div>
-      </div>
-    `;
-
-    const html = buildEmailShell(proposalEmailBody, {
-      title: "Proposal Approval Needed",
-      subtitle: "Review the proposal and take action",
-      badgeText: "AWAITING APPROVAL",
-      badgeColor: "#f59e0b",
-    });
-
-    // Send email (signature may vary; we call as any)
     try {
       const sendMail = sendMailAny as any;
-      // No option PDFs: L2 and L0 are customer-side and the PDFs carry prices.
+      // No option PDFs: approvers and leaders are customer-side and the PDFs carry prices.
+      for (const to of deciders) {
+        const approveUrl = decisionLinkUrl("proposal", String(doc._id), to, ws, "approve");
+        const declineUrl = decisionLinkUrl("proposal", String(doc._id), to, ws, "decline");
+        const ctas = approveUrl
+          ? `${eBtn("✓ Approve", approveUrl, "#4f46e5", "#ffffff")}
+             ${eBtn("✕ Decline", declineUrl, "#ffffff", "#dc2626", "#fca5a5")}
+             <div style="margin-top:8px;font-size:12px;color:#64748b;">Each button opens a page where you confirm. The link works once.</div>`
+          : eBtn("Open Plumbox to decide", `${appFrontendBaseUrl()}/customer/approvals/proposals`, "#4f46e5", "#ffffff");
 
-      // Send L2 email with L2 tokens
-      await sendMail({
-        kind: "REQUESTS",
-        to: l2Email,
-        subject: `Proposal Approval Needed — ${reqCode || "Request"}`,
-        html,
-      });
-
-      // Send separate L0 emails with L0-specific tokens
-      const l0List = ensureArray(l0Emails).filter(Boolean);
-      for (const l0Addr of l0List) {
-        const l0ApproveToken = await sign({
-          proposalId: String(doc._id),
-          action: "approve",
-          role: "L0",
-          email: l0Addr,
-        });
-        const l0DeclineToken = await sign({
-          proposalId: String(doc._id),
-          action: "decline",
-          role: "L0",
-          email: l0Addr,
-        });
-        const l0HoldToken = await sign({
-          proposalId: String(doc._id),
-          action: "hold",
-          role: "L0",
-          email: l0Addr,
-        });
-
-        const l0ApproveUrl = buildEmailActionUrl(l0ApproveToken);
-        const l0DeclineUrl = buildEmailActionUrl(l0DeclineToken);
-        const l0HoldUrl = buildEmailActionUrl(l0HoldToken);
-
-        const l0EmailBody = `
+        const html = buildEmailShell(
+          `
           <div style="font-size:12px;color:#64748b;margin-bottom:14px;">
             Request: <b style="color:#0f172a;">${escHtml(reqCode || String(doc.requestId || ""))}</b>
           </div>
-
           ${summaryHtml}
-
-          <div style="margin-top:20px;">
-            ${eBtn("✓ Approve", l0ApproveUrl, "#4f46e5", "#ffffff")}
-            ${eBtn("✕ Reject", l0DeclineUrl, "#ffffff", "#dc2626", "#fca5a5")}
-            ${eBtn("▮ On Hold", l0HoldUrl, "#ffffff", "#92400e", "#fcd34d")}
+          <div style="margin-top:20px;">${ctas}</div>
+          <div style="margin-top:16px;font-size:12px;color:#64748b;line-height:1.55;">
+            The request's approver and every Workspace Leader receive this. The first decision counts;
+            after that the links show who decided.
           </div>
-
-          <div style="margin-top:20px;padding:12px 14px;border-radius:14px;background:#0b1220;color:#e2e8f0;">
-            <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:900;color:#94a3b8;">Security</div>
-            <div style="margin-top:6px;font-size:13px;line-height:1.55;">
-              Do not forward this email. Action links are intended for the assigned approver only.
-            </div>
-          </div>
-        `;
-
-        const l0Html = buildEmailShell(l0EmailBody, {
-          title: "Proposal Approval Needed",
-          subtitle: "Review the proposal and take action",
-          badgeText: "AWAITING APPROVAL",
-          badgeColor: "#f59e0b",
-        });
+        `,
+          {
+            title: "Proposal Approval Needed",
+            subtitle: "Review the proposal and decide",
+            badgeText: "AWAITING APPROVAL",
+            badgeColor: "#f59e0b",
+          }
+        );
 
         await sendMail({
           kind: "REQUESTS",
-          to: l0Addr,
+          to,
           subject: `Proposal Approval Needed — ${reqCode || "Request"}`,
-          html: l0Html,
+          html,
         });
       }
-
     } catch (e) {
-      // Do not fail submit if SMTP misconfigured; you can enforce later if needed.
+      // Do not fail submit if SMTP misconfigured.
       doc.history = ensureArray(doc.history);
       doc.history.push(pushHistory((req as AuthedReq).user || {}, "EMAIL_SEND_FAILED", String((e as any)?.message || e)));
       await doc.save();
     }
 
     const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
-    return res.json({ ok: true, proposal: enriched[0], emailedTo: l2Email });
+    return res.json({ ok: true, proposal: enriched[0], emailedTo: deciders });
   } catch (err) {
     next(err);
   }
@@ -2033,168 +1708,35 @@ router.post("/:id/decide", requireAnyAuth, requireWorkspace, requireProposalView
     setNoStore(res);
 
     const aReq = req as AuthedReq;
-    if (!isStaffAdmin(aReq.user) && !ensureArray(aReq._proposalMyRoles).length) {
-      return res.status(403).json({ error: "Only assigned approvers can decide proposals" });
-    }
-
     const id = String(req.params.id || "");
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
 
     const body = (req as any).body || {};
     const decisionRaw = String(body?.decision || "").trim().toUpperCase();
-    const roleRaw = String(body?.role || "").trim().toUpperCase();
-    const comment = normStr(body?.comment || body?.note || "");
+    const action = decisionRaw === "APPROVED" ? "approve" : decisionRaw === "DECLINED" ? "decline" : "";
+    if (!action) return res.status(400).json({ error: "Invalid decision" });
 
-    if (!["APPROVED", "DECLINED"].includes(decisionRaw)) return res.status(400).json({ error: "Invalid decision" });
-    if (!["L2", "L0"].includes(roleRaw)) return res.status(400).json({ error: "Invalid role" });
-
-    if (!isStaffAdmin(aReq.user)) {
-      const myRoles = ensureArray(aReq._proposalMyRoles);
-      if (!myRoles.includes(roleRaw as RoleForProposal)) {
-        return res.status(403).json({ error: "You are not assigned to this approval role" });
+    try {
+      const { proposal } = await applyProposalDecision({
+        proposalId: id,
+        workspaceId: (req as any).workspaceObjectId,
+        actor: {
+          email: normEmail(aReq.user?.email),
+          name: normStr(aReq.user?.name || aReq.user?.firstName || ""),
+          sub: String(aReq.user?.sub || ""),
+          via: "app",
+        },
+        action,
+        reason: normStr(body?.reason || body?.comment || body?.note || ""),
+      });
+      const enriched = await enrichProposalsWithRequestData([proposal.toObject ? proposal.toObject() : proposal]);
+      return res.json({ ok: true, proposal: sanitizeApprovalForViewer(enriched[0], aReq.user) });
+    } catch (e) {
+      if (e instanceof DecisionError) {
+        return res.status(e.status).json({ error: e.message, code: e.code, ...(e.extra || {}) });
       }
+      throw e;
     }
-
-    const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
-    if (!doc) return res.status(404).json({ error: "Proposal not found" });
-    if (String(doc.status || "") !== "SUBMITTED") return res.status(400).json({ error: "Only SUBMITTED proposals can be decided" });
-
-    let ar: any = null;
-    if (doc.requestId) ar = await ApprovalRequest.findOne({ _id: doc.requestId, workspaceId: (req as any).workspaceObjectId }).lean();
-
-    const needL0 = requiresL0Approval(ar, doc);
-
-    doc.approvals = doc.approvals || {};
-    doc.approvals.l2 = doc.approvals.l2 || { decision: "PENDING" as ApprovalDecision };
-    doc.approvals.l0 = doc.approvals.l0 || { decision: "PENDING" as ApprovalDecision };
-
-    const byEmail = normEmail(aReq.user?.email);
-    const byName = normStr(aReq.user?.name || aReq.user?.firstName || "");
-
-    const key = roleRaw === "L2" ? "l2" : "l0";
-    doc.approvals[key] = {
-      decision: decisionRaw as ApprovalDecision,
-      at: new Date(),
-      byEmail,
-      byName,
-      comment,
-    };
-
-    doc.history = ensureArray(doc.history);
-    doc.history.push(pushHistory(aReq.user || {}, `${roleRaw}_${decisionRaw}`, comment));
-
-    const l2 = String(doc.approvals?.l2?.decision || "PENDING").toUpperCase();
-    const l0 = String(doc.approvals?.l0?.decision || "PENDING").toUpperCase();
-
-    const shouldDecline = l2 === "DECLINED" || (needL0 && l0 === "DECLINED");
-
-    if (shouldDecline) {
-      doc.status = "DECLINED" as ProposalStatus;
-      await doc.save();
-      if (doc.requestId) await safeAdvanceStage(doc.requestId, "PROPOSAL_DECLINED", { workspaceId: (req as any).workspaceObjectId });
-
-      // Notify L1 (frontliner)
-      try {
-        const arForNotify: any = ar || (doc.requestId ? await ApprovalRequest.findById(doc.requestId).select("frontlinerEmail frontlinerName ticketId").lean() : null);
-        if (arForNotify?.frontlinerEmail) {
-          const sendMail = sendMailAny as any;
-          await sendMail({
-            kind: "CONFIRMATIONS",
-            to: normEmail(arForNotify.frontlinerEmail),
-            subject: `Your Travel Proposal Has Been Declined — ${arForNotify.ticketId || ""}`,
-            html: buildProposalDeclinedEmailHtml({
-              requesterName: normStr(arForNotify.frontlinerName || ""),
-              ticketId: arForNotify.ticketId,
-              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
-            }),
-          });
-        }
-      } catch { /* non-blocking */ }
-
-      const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
-      return res.json({ ok: true, proposal: sanitizeApprovalForViewer(enriched[0], aReq.user), needL0 });
-    }
-
-    const fullyApproved = l2 === "APPROVED" && (!needL0 || l0 === "APPROVED");
-    if (fullyApproved) {
-      doc.status = "APPROVED" as ProposalStatus;
-      await doc.save();
-      if (doc.requestId) await safeAdvanceStage(doc.requestId, "PROPOSAL_APPROVED", { workspaceId: (req as any).workspaceObjectId });
-
-      // Notify L1 (frontliner)
-      try {
-        const arForNotify: any = ar || (doc.requestId ? await ApprovalRequest.findById(doc.requestId).select("frontlinerEmail frontlinerName ticketId").lean() : null);
-        if (arForNotify?.frontlinerEmail) {
-          const sendMail = sendMailAny as any;
-          await sendMail({
-            kind: "CONFIRMATIONS",
-            to: normEmail(arForNotify.frontlinerEmail),
-            subject: `Your Travel Proposal Has Been Approved — ${arForNotify.ticketId || ""}`,
-            html: buildProposalApprovedEmailHtml({
-              requesterName: normStr(arForNotify.frontlinerName || ""),
-              ticketId: arForNotify.ticketId,
-              loginUrl: `${frontendBaseUrl()}/customer/approvals/proposals`,
-            }),
-          });
-        }
-      } catch { /* non-blocking */ }
-
-      const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
-      return res.json({ ok: true, proposal: sanitizeApprovalForViewer(enriched[0], aReq.user), needL0 });
-    }
-
-    await doc.save();
-    const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
-    return res.json({ ok: true, proposal: sanitizeApprovalForViewer(enriched[0], aReq.user), needL0 });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * ✅ POST /api/proposals/:id/action (customer action)
- */
-router.post("/:id/action", requireAnyAuth, requireWorkspace, requireProposalViewer, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    setNoStore(res);
-
-    const aReq = req as AuthedReq;
-    if (!aReq._proposalIsOwner && !isStaffAdmin(aReq.user)) {
-      return res.status(403).json({ error: "Only request owner can take customer action" });
-    }
-
-    const id = String(req.params.id || "");
-    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
-
-    const body = (req as any).body || {};
-    const action = String(body?.action || "").trim().toLowerCase() as CustomerProposalAction;
-    const note = normStr(body?.note || "");
-
-    if (!["accept", "reject", "needs_changes"].includes(action)) return res.status(400).json({ error: "Invalid action" });
-
-    const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
-    if (!doc) return res.status(404).json({ error: "Proposal not found" });
-
-    const st = String(doc.status || "").toUpperCase();
-    if (!["SUBMITTED", "APPROVED", "DECLINED"].includes(st)) {
-      return res.status(400).json({ error: "Customer action not allowed in current proposal status" });
-    }
-
-    doc.customer = doc.customer || {};
-    doc.customer.action = action;
-    doc.customer.note = note;
-    doc.customer.at = new Date();
-    doc.customer.byEmail = normEmail(aReq.user?.email);
-    doc.customer.byName = normStr(aReq.user?.name || aReq.user?.firstName || "");
-
-    doc.history = ensureArray(doc.history);
-    doc.history.push(pushHistory(aReq.user || {}, `CUSTOMER_${action.toUpperCase()}`, note));
-
-    doc.markModified("customer");
-    await doc.save();
-
-    const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
-    return res.json({ ok: true, proposal: sanitizeApprovalForViewer(enriched[0], aReq.user) });
   } catch (err) {
     next(err);
   }
@@ -2259,6 +1801,7 @@ router.get("/:id", requireAnyAuth, requireWorkspace, requireProposalViewer, asyn
         ...priceFree,
         _myRoles: myRoles,
         _isOwner: isOwner,
+        _canDecide: Boolean(aReq._proposalCanDecide) && String((p as any).status) === "SUBMITTED",
       },
     });
   } catch (err) {

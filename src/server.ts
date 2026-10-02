@@ -49,6 +49,7 @@ import flightRoutes from "./routes/flightRoutes.js";
 
 // ✅ Approvals (MUST be statically mounted; do NOT safeMount)
 import approvalsRouter from "./routes/approvals.js";
+import approvalLinksRouter from "./routes/approvalLinks.js";
 
 // ✅ Booking History (Booked/Cancelled outcomes + admin PDFs)
 import bookingHistory from "./routes/bookingHistory.js";
@@ -1079,6 +1080,9 @@ app.use("/api/permissions", permissionsRouter);
 
 // Approvals & booking history
 if (env.DEPLOYMENT_MODE === "plumbox") {
+  // Email decision links (no login) — request + proposal approval. Under
+  // /api/public so workspace scoping skips it; token-bound, single-use.
+  app.use("/api/public/approval-links", approvalLinksRouter);
   // SHARED_API — Approvals router (will be exposed via tenant API in Phase 4)
   app.use("/api/approvals", approvalsRouter);
   // KEEP_IN_PLUMBOX — Booking history (Plumtrips Travel-specific outcomes + admin PDFs)

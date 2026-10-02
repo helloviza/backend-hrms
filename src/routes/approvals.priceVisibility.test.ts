@@ -252,6 +252,7 @@ vi.mock("../models/ApprovalRequest.js", () => ({
     find: () => chain(() => [currentDoc()]),
     findOne: () => chain(() => currentDoc()),
     findOneAndUpdate: () => chain(() => currentDoc()),
+    updateOne: () => chain(() => ({ acknowledged: true })),
     create: async (data: any) => {
       const d: any = { ...baseFixture(), ...data, _id: RID };
       Object.defineProperty(d, "save", { value: async () => d, enumerable: false });
@@ -291,6 +292,7 @@ vi.mock("../models/Proposal.js", () => ({
     // approvals.ts asks for the proposal linked to a request ({ requestId }) — none there.
     findOne: (q: any) => chain(() => (q && "requestId" in q ? null : currentProposal())),
     findById: () => chain(() => currentProposal()),
+    findOneAndUpdate: () => chain(() => currentProposal()),
     aggregate: async () => [JSON.parse(JSON.stringify(currentProposal()))],
   },
 }));
@@ -302,18 +304,20 @@ vi.mock("../utils/mailer.js", () => ({
     state.mails.push({ to: m.to, subject: m.subject, html: String(m.html || ""), attachments: m.attachments });
   },
 }));
-vi.mock("../utils/emailActionToken.js", () => ({
-  signEmailActionToken: () => "tok",
-  verifyEmailActionToken: (t: string) => ({ rid: RID, approverEmail: "mgr@cust.com", action: t === "tok-hold" ? "on_hold" : "approved" }),
+vi.mock("../models/ApprovalLinkUse.js", () => ({
+  default: { findOne: () => chain(() => null), create: async () => ({}) },
 }));
 
 const { default: approvalsRouter } = await import("./approvals.js");
 const { default: bookingHistoryRouter } = await import("./bookingHistory.js");
 const { default: proposalsRouter } = await import("./proposals.js");
+const { default: approvalLinksRouter } = await import("./approvalLinks.js");
+const { signApprovalLink } = await import("../utils/approvalLinkToken.js");
 const { sanitizeApprovalForViewer, stripPriceText, isPriceKey } = await import("./approvals.security.js");
 
 const app = express();
 app.use(express.json());
+app.use("/api/public/approval-links", approvalLinksRouter);
 app.use("/api/approvals", approvalsRouter);
 app.use("/api/approvals", bookingHistoryRouter);
 app.use("/api/booking-history", bookingHistoryRouter);
@@ -488,30 +492,39 @@ describe("approval endpoints — customer-side callers get no prices", () => {
   });
 });
 
-/* ── /email/consume ──────────────────────────────────────────────────────── */
+/* ── email decision links (no login) ─────────────────────────────────────── */
 
-describe("POST /email/consume", () => {
-  it("returns only the trimmed decision shape", async () => {
-    const res = await request(app).post("/api/approvals/email/consume").send({ token: "tok", action: "approved" });
+describe("email decision link (no login)", () => {
+  const link = (kind: "request" | "proposal", id: string) =>
+    `/api/public/approval-links/${signApprovalLink({ kind, id, email: "mgr@cust.com" }, 72)}`;
+
+  it("GET shows a price-free view with no one's email, and changes nothing", async () => {
+    const res = await request(app).get(link("request", RID));
     expect(res.status).toBe(200);
-    expect(Object.keys(res.body.request).sort()).toEqual(
-      ["allowedActions", "customerName", "id", "requesterName", "stage", "status", "ticketId", "tripSummary"].sort(),
-    );
-    expect(res.body.request).toMatchObject({
-      id: RID,
+    expect(res.body.link).toMatchObject({
+      kind: "request",
       requesterName: "Riya Requester",
       tripSummary: "DEL → BOM",
-      status: "approved",
-      allowedActions: [],
+      state: "OPEN",
+      actions: ["approve", "decline"],
     });
     expectPriceFree(res.body);
     expect(JSON.stringify(res.body)).not.toMatch(/@cust\.com/);
+    expect(state.saved).toBeNull();
   });
 
-  it("on hold leaves approve/decline open", async () => {
-    const res = await request(app).post("/api/approvals/email/consume").send({ token: "tok-hold", action: "on_hold" });
+  it("POST records the decision and returns no document", async () => {
+    const res = await request(app).post(link("request", RID)).send({ action: "approve" });
     expect(res.status).toBe(200);
-    expect(res.body.request.allowedActions).toEqual(["approved", "declined"]);
+    expect(Object.keys(res.body).sort()).toEqual(["message", "ok"]);
+  });
+
+  it("proposal link view is price-free", async () => {
+    const res = await request(app).get(link("proposal", PID));
+    expect(res.status).toBe(200);
+    expect(res.body.link.kind).toBe("proposal");
+    expectPriceFree(res.body);
+    expect(JSON.stringify(res.body)).not.toMatch(/@cust\.com/);
   });
 });
 
@@ -653,14 +666,13 @@ describe("proposal endpoints — customer-side callers get no prices", () => {
     }
   });
 
-  it("POST /proposals/:id/decide and /:id/action responses", async () => {
-    const decide = await request(app).post(`/api/proposals/${PID}/decide`).set(as(APPROVER)).send({ decision: "APPROVED", role: "L2" });
+  it("POST /proposals/:id/decide response; the requester cannot decide", async () => {
+    const decide = await request(app).post(`/api/proposals/${PID}/decide`).set(as(APPROVER)).send({ decision: "APPROVED" });
     expect(decide.status).toBe(200);
     expectPriceFree(decide.body);
 
-    const action = await request(app).post(`/api/proposals/${PID}/action`).set(as(REQUESTER)).send({ action: "accept" });
-    expect(action.status).toBe(200);
-    expectPriceFree(action.body);
+    const own = await request(app).post(`/api/proposals/${PID}/decide`).set(as(REQUESTER)).send({ decision: "APPROVED" });
+    expect([own.status, own.body.code]).toEqual([403, "SELF_APPROVAL_NOT_ALLOWED"]);
   });
 
   it("staff get the full proposal", async () => {

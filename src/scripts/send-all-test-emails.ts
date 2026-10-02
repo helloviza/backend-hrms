@@ -217,7 +217,6 @@ async function sendApprovalNeededEmail(doc: any) {
     comments: doc.comments,
     approveUrl: "https://example.com/approve",
     declineUrl: "https://example.com/decline",
-    holdUrl: "https://example.com/hold",
   });
 
   return sendMail({

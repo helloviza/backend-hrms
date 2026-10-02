@@ -1,7 +1,7 @@
 // apps/backend/src/routes/approvals.email.ts
 import fs from "fs";
 import path from "path";
-import { stripPriceText } from "./approvals.security.js";
+import { stripPriceText, frontendBaseUrl } from "./approvals.security.js";
 
 export type AnyObj = Record<string, any>;
 
@@ -917,9 +917,10 @@ export function buildApproverEmailHtml(opts: {
   ticketId?: string;
   items: any[];
   comments?: string;
+  /** Email decision links; "" when links are not configured → "Open Plumbox". */
   approveUrl: string;
   declineUrl: string;
-  holdUrl: string;
+  inboxUrl?: string;
 }) {
   const brand = "#00477f";
   const accent = "#d06549";
@@ -1014,7 +1015,8 @@ export function buildApproverEmailHtml(opts: {
       </div>
     `;
 
-  const ctas = `
+  const ctas = opts.approveUrl
+    ? `
     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:18px;">
       <tr>
         <td align="left" style="padding:0;">
@@ -1024,11 +1026,24 @@ export function buildApproverEmailHtml(opts: {
           </a>
           <a href="${opts.declineUrl}"
             style="display:inline-block;background:#ffffff;color:#dc2626;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;border:1.5px solid #fca5a5;margin-right:10px;">
-            &#10005; Reject
+            &#10005; Decline
           </a>
-          <a href="${opts.holdUrl}"
-            style="display:inline-block;background:#ffffff;color:#92400e;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;border:1.5px solid #fcd34d;">
-            &#9646; On Hold
+        </td>
+      </tr>
+      <tr>
+        <td style="padding-top:8px;color:#64748b;font-size:12px;">
+          Each button opens a page where you confirm; nothing is decided until you do. The link works once.
+        </td>
+      </tr>
+    </table>
+  `
+    : `
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:18px;">
+      <tr>
+        <td align="left" style="padding:0;">
+          <a href="${opts.inboxUrl || `${frontendBaseUrl()}/customer/approvals/inbox`}"
+            style="display:inline-block;background:#4f46e5;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;padding:12px 24px;border-radius:8px;">
+            Open Plumbox to decide
           </a>
         </td>
       </tr>

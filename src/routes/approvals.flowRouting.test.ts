@@ -23,7 +23,6 @@ process.env.NODE_ENV = "test";
 process.env.JWT_SECRET ||= "jwt-secret-for-tests";
 
 const sent: Array<{ to: string; subject: string }> = [];
-let tokenPayload: any = null;
 
 vi.mock("../middleware/auth.js", () => {
   const requireAuth = (req: any, _res: any, next: any) => {
@@ -58,19 +57,20 @@ vi.mock("../services/tbo.hotel.search.service.js", async (orig) => {
   const { vi: v } = await import("vitest");
   return { ...(await orig<any>()), searchHotels: v.fn() };
 });
-vi.mock("../utils/emailActionToken.js", () => ({
-  signEmailActionToken: () => "tok",
-  verifyEmailActionToken: () => tokenPayload,
-  hashToken: () => "hash",
-}));
 
 const { default: approvalsRouter } = await import("./approvals.js");
 const { default: proposalsRouter } = await import("./proposals.js");
+const { default: approvalLinksRouter } = await import("./approvalLinks.js");
+const { signApprovalLink } = await import("../utils/approvalLinkToken.js");
 
 const app = express();
 app.use(express.json());
+app.use("/api/public/approval-links", approvalLinksRouter);
 app.use("/api/proposals", proposalsRouter);
 app.use("/api/approvals", approvalsRouter);
+
+/** The single-use link an approver gets by email (no login needed to use it). */
+const requestLink = (id: any, email: string) => signApprovalLink({ kind: "request", id: String(id), email }, 72)!;
 
 let mongod: MongoMemoryServer;
 const col = (n: string) => mongoose.connection.db!.collection(n);
@@ -140,7 +140,6 @@ afterAll(async () => {
 beforeEach(async () => {
   await col("approvalrequests").deleteMany({});
   sent.length = 0;
-  tokenPayload = null;
 });
 
 describe("Flow 3 (APPROVAL_DIRECT) requires approver approval", () => {
@@ -177,11 +176,9 @@ describe("Flow 3 (APPROVAL_DIRECT) requires approver approval", () => {
     expect([draft.status, draft.body.error]).toEqual([403, "This flow is not enabled for your workspace"]);
   });
 
-  it("approval by email link also lands on REQUEST_APPROVED", async () => {
+  it("approval by email link (no login) also lands on REQUEST_APPROVED", async () => {
     const { doc } = await submit(REQUESTER, WS_DIRECT);
-    tokenPayload = { rid: String(doc._id), approverEmail: APPROVER, action: "approved" };
-    // The router-level requireAuth/requireWorkspace also sit in front of /email/consume.
-    const c = await as(request(app).post("/api/approvals/email/consume"), { email: APPROVER }, WS_DIRECT).send({ token: "t-approve", action: "approved" });
+    const c = await request(app).post(`/api/public/approval-links/${requestLink(doc._id, APPROVER)}`).send({ action: "approve" });
     expect(c.status).toBe(200);
     const after: any = await col("approvalrequests").findOne({ _id: doc._id });
     expect([after.status, after.stage, after.adminState]).toEqual(["approved", "REQUEST_APPROVED", "pending"]);
@@ -242,12 +239,15 @@ describe("Flow 2 (APPROVAL_FLOW) — same self-approval rule, otherwise unchange
     expect([after.status, after.stage, after.adminState]).toEqual(["approved", "PROPOSAL_PENDING", "pending"]);
   });
 
-  it("on hold and decline behave as before", async () => {
+  it("on hold, then decline with a reason", async () => {
     const { doc } = await submit(REQUESTER, WS_FLOW);
     expect((await act(doc._id, { email: APPROVER }, WS_FLOW, "on_hold", "Which hotel?")).status).toBe(200);
     let after: any = await col("approvalrequests").findOne({ _id: doc._id });
     expect([after.status, after.stage]).toEqual(["pending", "REQUEST_ON_HOLD"]);
-    expect((await act(doc._id, { email: APPROVER }, WS_FLOW, "declined")).status).toBe(200);
+    // A decline needs a reason.
+    const bare = await act(doc._id, { email: APPROVER }, WS_FLOW, "declined");
+    expect([bare.status, bare.body.code]).toEqual([400, "REASON_REQUIRED"]);
+    expect((await act(doc._id, { email: APPROVER }, WS_FLOW, "declined", "Over budget")).status).toBe(200);
     after = await col("approvalrequests").findOne({ _id: doc._id });
     expect([after.status, after.stage]).toEqual(["declined", "REQUEST_DECLINED"]);
   });
@@ -277,9 +277,8 @@ describe("Flow 2 (APPROVAL_FLOW) — same self-approval rule, otherwise unchange
   it("an email link cannot be used to approve one's own request", async () => {
     const { doc } = await submit(REQUESTER, WS_FLOW);
     await col("approvalrequests").updateOne({ _id: doc._id }, { $set: { managerEmail: REQUESTER.email } });
-    tokenPayload = { rid: String(doc._id), approverEmail: REQUESTER.email, action: "approved" };
-    const c = await as(request(app).post("/api/approvals/email/consume"), REQUESTER, WS_FLOW).send({ token: "t-self", action: "approved" });
-    expect(c.status).toBe(403);
+    const c = await request(app).post(`/api/public/approval-links/${requestLink(doc._id, REQUESTER.email)}`).send({ action: "approve" });
+    expect([c.status, c.body.code]).toEqual([403, "SELF_APPROVAL_NOT_ALLOWED"]);
     const after: any = await col("approvalrequests").findOne({ _id: doc._id });
     expect(after.status).toBe("pending");
   });

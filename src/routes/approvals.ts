@@ -1,7 +1,6 @@
 // apps/backend/src/routes/approvals.ts
 import { Router } from "express";
 import mongoose from "mongoose";
-import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import multer from "multer";
@@ -20,9 +19,10 @@ import Proposal from "../models/Proposal.js";
 
 import { sendMail } from "../utils/mailer.js";
 import {
-  signEmailActionToken,
-  verifyEmailActionToken,
-} from "../utils/emailActionToken.js";
+  applyRequestDecision,
+  decisionLinkUrl,
+  DecisionError,
+} from "../services/approvalDecisions.js";
 
 import { scopedFindById } from "../middleware/scopedFindById.js";
 
@@ -31,9 +31,6 @@ import {
   EmailAction,
   DISABLE_EMAILS,
   applyLeaderScopeIfNeeded,
-  assertEmailAction,
-  buildEmailUiActionUrl,
-  emailUiPath,
   exactIRegex,
   escapeRegExp,
   frontendBaseUrl,
@@ -75,9 +72,6 @@ import {
   buildAdminProcessedEmailHtml,
   buildApproverEmailHtml,
   buildLeaderFyiHtml,
-  buildRequesterApprovedHtml,
-  buildRequestDeclinedEmailHtml,
-  buildRequestOnHoldEmailHtml,
   buildEmailAttachmentsFromMeta,
   buildEmailShell,
   eLabel,
@@ -264,10 +258,6 @@ function hasWorkspaceLeaderRole(user: AnyObj) {
     .includes("WORKSPACELEADER");
 }
 
-/** Stage an approved request moves to: Flow 3 skips the proposal step. */
-function approvedStageFor(doc: AnyObj) {
-  return doc?.meta?.travelFlow === "APPROVAL_DIRECT" ? "REQUEST_APPROVED" : "PROPOSAL_PENDING";
-}
 
 /* ────────────────────────────────────────────────────────────────
  * Admin queue query helpers
@@ -594,25 +584,9 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       });
     }
 
-    const tokenApprove = signEmailActionToken({
-      rid: String(doc._id),
-      approverEmail,
-      action: "approved",
-    });
-    const tokenDecline = signEmailActionToken({
-      rid: String(doc._id),
-      approverEmail,
-      action: "declined",
-    });
-    const tokenHold = signEmailActionToken({
-      rid: String(doc._id),
-      approverEmail,
-      action: "on_hold",
-    });
-
-    const approveUrl = buildEmailUiActionUrl(tokenApprove, "approved");
-    const declineUrl = buildEmailUiActionUrl(tokenDecline, "declined");
-    const holdUrl = buildEmailUiActionUrl(tokenHold, "on_hold");
+    // Email decision links: no login, single-use, bound to the approver.
+    const approveUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "approve");
+    const declineUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "decline");
 
     const subject = `Approval Needed — ${customerName}${doc.ticketId ? ` (${doc.ticketId})` : ""}`;
 
@@ -634,7 +608,6 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
               comments: doc.comments,
               approveUrl,
               declineUrl,
-              holdUrl,
             }),
           });
         } else {
@@ -986,25 +959,8 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
         return res.status(400).json({ error: "Approver email missing on this request" });
       }
 
-      const tokenApprove = signEmailActionToken({
-        rid: String(doc._id),
-        approverEmail,
-        action: "approved",
-      });
-      const tokenDecline = signEmailActionToken({
-        rid: String(doc._id),
-        approverEmail,
-        action: "declined",
-      });
-      const tokenHold = signEmailActionToken({
-        rid: String(doc._id),
-        approverEmail,
-        action: "on_hold",
-      });
-
-      const approveUrl = buildEmailUiActionUrl(tokenApprove, "approved");
-      const declineUrl = buildEmailUiActionUrl(tokenDecline, "declined");
-      const holdUrl = buildEmailUiActionUrl(tokenHold, "on_hold");
+      const approveUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "approve");
+      const declineUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "decline");
 
       const subject = `Approval Needed — ${doc.customerName || "Workspace"}${
         doc.ticketId ? ` (${doc.ticketId})` : ""
@@ -1027,7 +983,6 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
               comments: doc.comments,
               approveUrl,
               declineUrl,
-              holdUrl,
             }),
           });
         }
@@ -1057,157 +1012,25 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
       }
     }
 
-    // normal approver action
-    // WORKSPACE_LEADER can approve any request in their workspace
-    const isWLAction = (req.user?.roles || [])
-      .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
-      .includes("WORKSPACELEADER");
-
-    if (!isWLAction && !exactIRegex(email).test(String(doc.managerEmail || ""))) {
-      return res.status(403).json({ error: "Not allowed (not assigned approver)" });
-    }
-
-    if (email && exactIRegex(email).test(String(doc.frontlinerEmail || ""))) {
-      return res.status(403).json({
-        error: "You cannot approve, decline or hold your own request",
-        code: "SELF_APPROVAL_NOT_ALLOWED",
+    // Approver decision — the same service the email links use: who may
+    // decide is re-checked now, first decision wins, a decline needs a reason.
+    let decided: any;
+    try {
+      decided = await applyRequestDecision({
+        requestId: id,
+        workspaceId: req.workspaceObjectId,
+        actor: { email, name: userName, sub, via: "app" },
+        action: action as any,
+        reason: comment,
       });
-    }
-
-    const statusNow = String(doc.status || "").toLowerCase();
-    const stageNow = String(doc.stage || "").toUpperCase();
-
-    const actionable =
-      statusNow === "pending" &&
-      (stageNow === "REQUEST_RAISED" ||
-        stageNow === "REQUEST_ON_HOLD" ||
-        stageNow === "" ||
-        stageNow === "UNDEFINED");
-
-    if (!actionable) {
-      return res.status(400).json({ error: "Request is not actionable" });
-    }
-
-    if (action === "on_hold") {
-      doc.status = "pending";
-    } else {
-      doc.status = action;
-    }
-
-    if (action === "approved") doc.stage = approvedStageFor(doc);
-    if (action === "declined") doc.stage = "REQUEST_DECLINED";
-    if (action === "on_hold") doc.stage = "REQUEST_ON_HOLD";
-
-    if (action === "approved") doc.adminState = "pending";
-    if (action === "declined") doc.adminState = "cancelled";
-    if (action === "on_hold") doc.adminState = "on_hold";
-
-    doc.approvedByEmail = email;
-    doc.approvedByName = userName || doc.managerName || "Approver";
-
-    doc.history = Array.isArray(doc.history) ? doc.history : [];
-    doc.history.push({
-      action,
-      at: new Date(),
-      by: sub || "unknown",
-      comment,
-      userEmail: email,
-      userName,
-    });
-
-    await doc.save();
-
-    // ✅ Notify requester when approved
-    if (action === "approved" && !DISABLE_EMAILS) {
-      const requesterEmail = normEmail(doc.frontlinerEmail || "");
-      if (requesterEmail) {
-        const subject2 = `Approved — moved to Admin Queue — ${doc.customerName || "Workspace"}${
-          doc.ticketId ? ` (${doc.ticketId})` : ""
-        }`;
-
-        try {
-          await sendMail({
-            kind: "APPROVALS",
-            to: requesterEmail,
-            replyTo: email || undefined,
-            subject: subject2,
-            html: buildRequesterApprovedHtml({
-              customerName: doc.customerName || "Workspace",
-              ticketId: doc.ticketId,
-              requesterName: frontlinerDisplayName,
-              requesterEmail,
-              approverName: doc.approvedByName || userName || doc.managerName,
-              approverEmail: email,
-              items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
-            }),
-          });
-
-          doc.history.push({
-            action: "l2_approved_email_sent",
-            at: new Date(),
-            by: sub || "unknown",
-            comment: `Approval mail sent to requester: ${requesterEmail}`,
-            userEmail: email,
-            userName,
-          });
-          await doc.save();
-        } catch (e: any) {
-          doc.history.push({
-            action: "l2_approved_email_failed",
-            at: new Date(),
-            by: sub || "unknown",
-            comment: `Failed sending approval mail to requester: ${String(e?.message || e)}`,
-            userEmail: email,
-            userName,
-          });
-          await doc.save();
-        }
+    } catch (e) {
+      if (e instanceof DecisionError) {
+        return res.status(e.status).json({ error: e.message, code: e.code, ...(e.extra || {}) });
       }
+      throw e;
     }
 
-    // Notify requester when declined
-    if (action === "declined" && !DISABLE_EMAILS) {
-      const requesterEmailDecl = normEmail(doc.frontlinerEmail || "");
-      if (requesterEmailDecl) {
-        try {
-          await sendMail({
-            kind: "CONFIRMATIONS",
-            to: requesterEmailDecl,
-            subject: `Your Travel Request Has Been Declined — ${doc.ticketId || ""}`,
-            html: buildRequestDeclinedEmailHtml({
-              ticketId: doc.ticketId,
-              requesterName: frontlinerDisplayName,
-              managerName: userName || doc.managerName || "Approver",
-              comment: comment || "",
-              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
-            }),
-          });
-        } catch { /* non-blocking */ }
-      }
-    }
-
-    // Notify requester when on hold
-    if (action === "on_hold" && !DISABLE_EMAILS) {
-      const requesterEmailHld = normEmail(doc.frontlinerEmail || "");
-      if (requesterEmailHld) {
-        try {
-          await sendMail({
-            kind: "CONFIRMATIONS",
-            to: requesterEmailHld,
-            subject: `Your Travel Request is On Hold — ${doc.ticketId || ""}`,
-            html: buildRequestOnHoldEmailHtml({
-              ticketId: doc.ticketId,
-              requesterName: frontlinerDisplayName,
-              managerName: userName || doc.managerName || "Approver",
-              comment: comment || "",
-              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
-            }),
-          });
-        } catch { /* non-blocking */ }
-      }
-    }
-
-    res.json({ ok: true, request: sanitizeApprovalForViewer(doc, req.user), message: "Updated" });
+    res.json({ ok: true, request: sanitizeApprovalForViewer(decided, req.user), message: "Updated" });
   } catch (err) {
     next(err);
   }
@@ -1775,304 +1598,11 @@ router.get("/attachments/:filename/download", requireAuth, async (req: AnyObj, r
 });
 
 /* ────────────────────────────────────────────────────────────────
- * EMAIL ACTION (public)
+ * EMAIL DECISION LINKS live in routes/approvalLinks.ts (public, no login,
+ * mounted at /api/public/approval-links). The old /email/action and
+ * /email/consume pair sat behind requireAuth here, so emailed links never
+ * worked for a logged-out approver.
  * ──────────────────────────────────────────────────────────────── */
-
-router.get("/email/action", async (req: AnyObj, res) => {
-  try {
-    setNoStore(res);
-
-    const token = String(req.query?.t || req.query?.token || "");
-    const action = normalizeAction(req.query?.a || req.query?.action);
-
-    if (!token) return res.status(400).send("Missing token");
-    if (!["approved", "declined", "on_hold"].includes(String(action))) {
-      return res.status(400).send("Invalid action");
-    }
-
-    try {
-      verifyEmailActionToken(token);
-    } catch {
-      return res.status(400).send("Invalid or expired token");
-    }
-
-    const base = frontendBaseUrl() || "";
-    const uiPath = emailUiPath() || "/approval/email";
-
-    if (base) {
-      const url = `${base}${uiPath}?t=${encodeURIComponent(token)}&a=${encodeURIComponent(
-        String(action),
-      )}`;
-      return res.redirect(302, url);
-    }
-
-    return res.status(200).type("html").send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Approval Decision</title>
-</head>
-<body style="font-family:Arial,sans-serif;background:#f5f7fb;padding:24px;">
-  <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e8eef6;border-radius:16px;padding:18px;">
-    <h2 style="margin:0 0 8px 0;color:#0f172a;">Decision link opened</h2>
-    <p style="margin:0 0 14px 0;color:#475569;line-height:1.5;">
-      This server doesn’t know your frontend URL. We can still record your decision.
-    </p>
-    <button id="btn" style="background:#00477f;color:#fff;border:none;border-radius:10px;padding:10px 14px;font-weight:800;cursor:pointer;">
-      Confirm: ${String(action).toUpperCase()}
-    </button>
-    <div id="msg" style="margin-top:12px;color:#334155;"></div>
-  </div>
-<script>
-  const token = ${JSON.stringify(token)};
-  const action = ${JSON.stringify(action)};
-  document.getElementById('btn').addEventListener('click', async () => {
-    const msg = document.getElementById('msg');
-    msg.textContent = 'Submitting...';
-    const r = await fetch('./consume', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ token, action })
-    });
-    const j = await r.json().catch(() => ({}));
-    msg.textContent = r.ok ? 'Done. You can close this tab.' : (j.error || 'Failed.');
-  });
-</script>
-</body>
-</html>`);
-  } catch {
-    return res.status(500).send("Server error");
-  }
-});
-
-router.post("/email/consume", async (req: AnyObj, res) => {
-  try {
-    setNoStore(res);
-
-    const token = String(req.body?.token || "");
-    if (!token) return res.status(400).json({ error: "Missing token" });
-
-    const action = assertEmailAction(req.body?.action);
-    const comment = String(req.body?.comment || "").trim() || undefined;
-
-    const payload: any = verifyEmailActionToken(token);
-    const rid = String(payload?.rid || "");
-    const approverEmail = normEmail(payload?.approverEmail || "");
-    const tokenAction = normalizeAction(payload?.action);
-
-    if (!rid || !approverEmail) {
-      return res.status(400).json({ error: "Invalid token payload" });
-    }
-
-    if (tokenAction && tokenAction !== action) {
-      return res.status(400).json({ error: "Token/action mismatch" });
-    }
-
-    const doc: any = await ApprovalRequest.findOne({ _id: rid });
-    if (!doc) return res.status(404).json({ error: "Request not found" });
-
-    // Single-use token enforcement
-    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
-    if (Array.isArray(doc.history) && doc.history.some((h: any) => h.tokenHash && h.tokenHash === tokenHash)) {
-      return res.status(409).json({ error: "This approval link has already been used." });
-    }
-
-    // Resolve frontliner display name from DB if stored name is missing or was "User"
-    let frontlinerDisplayNameEmail = normStr(doc.frontlinerName || "");
-    if (!frontlinerDisplayNameEmail || frontlinerDisplayNameEmail === "User") {
-      const dbFrontliner2 = doc.frontlinerId
-        ? await User.findById(doc.frontlinerId).select("name firstName lastName").lean()
-        : doc.frontlinerEmail
-          ? await User.findOne({ email: exactIRegex(normEmail(doc.frontlinerEmail)) }).select("name firstName lastName").lean()
-          : null;
-      if (dbFrontliner2) {
-        frontlinerDisplayNameEmail = normStr(
-          (dbFrontliner2 as any).name ||
-          [(dbFrontliner2 as any).firstName || "", (dbFrontliner2 as any).lastName || ""]
-            .filter(Boolean).join(" ")
-        ) || frontlinerDisplayNameEmail;
-      }
-    }
-    if (!frontlinerDisplayNameEmail) frontlinerDisplayNameEmail = normEmail(doc.frontlinerEmail)?.split("@")[0] || "User";
-
-    if (!exactIRegex(approverEmail).test(String(doc.managerEmail || ""))) {
-      return res.status(403).json({ error: "Token not valid for this request" });
-    }
-
-    if (exactIRegex(approverEmail).test(String(doc.frontlinerEmail || ""))) {
-      return res.status(403).json({ error: "You cannot approve, decline or hold your own request" });
-    }
-
-    const statusNow = String(doc.status || "").toLowerCase();
-    const stageNow = String(doc.stage || "").toUpperCase();
-
-    const actionable =
-      statusNow === "pending" &&
-      (stageNow === "REQUEST_RAISED" ||
-        stageNow === "REQUEST_ON_HOLD" ||
-        stageNow === "" ||
-        stageNow === "UNDEFINED");
-
-    if (!actionable) {
-      return res.status(400).json({ error: "Request is not actionable" });
-    }
-
-    if (action === "on_hold") {
-      doc.status = "pending";
-    } else {
-      doc.status = action;
-    }
-
-    if (action === "approved") doc.stage = approvedStageFor(doc);
-    if (action === "declined") doc.stage = "REQUEST_DECLINED";
-    if (action === "on_hold") doc.stage = "REQUEST_ON_HOLD";
-
-    if (action === "approved") doc.adminState = "pending";
-    if (action === "declined") doc.adminState = "cancelled";
-    if (action === "on_hold") doc.adminState = "on_hold";
-
-    doc.approvedByEmail = approverEmail;
-    doc.approvedByName = doc.approvedByName || doc.managerName || "Approver";
-
-    doc.history = Array.isArray(doc.history) ? doc.history : [];
-    doc.history.push({
-      action: `email_${action}`,
-      at: new Date(),
-      by: `email:${approverEmail}`,
-      comment,
-      userEmail: approverEmail,
-      userName: doc.managerName || "Approver",
-      tokenHash,
-    });
-
-    await doc.save();
-
-    // notify requester if approved via email link
-    if (action === "approved" && !DISABLE_EMAILS) {
-      const requesterEmail = normEmail(doc.frontlinerEmail || "");
-      if (requesterEmail) {
-        const subject2 = `Approved — moved to Admin Queue — ${doc.customerName || "Workspace"}${
-          doc.ticketId ? ` (${doc.ticketId})` : ""
-        }`;
-
-        try {
-          await sendMail({
-            kind: "APPROVALS",
-            to: requesterEmail,
-            replyTo: approverEmail || undefined,
-            subject: subject2,
-            html: buildRequesterApprovedHtml({
-              customerName: doc.customerName || "Workspace",
-              ticketId: doc.ticketId,
-              requesterName: frontlinerDisplayNameEmail,
-              requesterEmail,
-              approverName: doc.approvedByName || doc.managerName || "Approver",
-              approverEmail: approverEmail,
-              items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
-            }),
-          });
-
-          doc.history = Array.isArray(doc.history) ? doc.history : [];
-          doc.history.push({
-            action: "l2_approved_email_sent",
-            at: new Date(),
-            by: `email:${approverEmail}`,
-            comment: `Approval mail sent to requester: ${requesterEmail}`,
-            userEmail: approverEmail,
-            userName: doc.managerName || "Approver",
-          });
-          await doc.save();
-        } catch (e: any) {
-          doc.history = Array.isArray(doc.history) ? doc.history : [];
-          doc.history.push({
-            action: "l2_approved_email_failed",
-            at: new Date(),
-            by: `email:${approverEmail}`,
-            comment: `Failed sending approval mail to requester: ${String(e?.message || e)}`,
-            userEmail: approverEmail,
-            userName: doc.managerName || "Approver",
-          });
-          await doc.save();
-        }
-      }
-    }
-
-    // notify requester if declined via email link
-    if (action === "declined" && !DISABLE_EMAILS) {
-      const requesterEmailDecline = normEmail(doc.frontlinerEmail || "");
-      if (requesterEmailDecline) {
-        try {
-          await sendMail({
-            kind: "CONFIRMATIONS",
-            to: requesterEmailDecline,
-            subject: `Your Travel Request Has Been Declined — ${doc.ticketId || ""}`,
-            html: buildRequestDeclinedEmailHtml({
-              ticketId: doc.ticketId,
-              requesterName: frontlinerDisplayNameEmail,
-              managerName: doc.managerName || "Approver",
-              comment: comment || "",
-              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
-            }),
-          });
-        } catch { /* non-blocking */ }
-      }
-    }
-
-    // notify requester if on_hold via email link
-    if (action === "on_hold" && !DISABLE_EMAILS) {
-      const requesterEmailHold = normEmail(doc.frontlinerEmail || "");
-      if (requesterEmailHold) {
-        try {
-          await sendMail({
-            kind: "CONFIRMATIONS",
-            to: requesterEmailHold,
-            subject: `Your Travel Request is On Hold — ${doc.ticketId || ""}`,
-            html: buildRequestOnHoldEmailHtml({
-              ticketId: doc.ticketId,
-              requesterName: frontlinerDisplayNameEmail,
-              managerName: doc.managerName || "Approver",
-              comment: comment || "",
-              loginUrl: `${frontendBaseUrl()}/customer/approvals/mine`,
-            }),
-          });
-        } catch { /* non-blocking */ }
-      }
-    }
-
-    // Public, token-only caller: return just what the decision page needs.
-    // Never the request document — it carries prices and everyone's emails.
-    const safe = sanitizeApprovalForViewer(doc, null);
-    const stageAfter = String(safe.stage || "").toUpperCase();
-    return res.json({
-      ok: true,
-      request: {
-        id: String(safe._id),
-        ticketId: safe.ticketId || undefined,
-        requesterName: frontlinerDisplayNameEmail,
-        customerName: safe.customerName || undefined,
-        tripSummary: stripPriceText(pickTripSummary(safe.cartItems || []).seg),
-        status: safe.status,
-        stage: safe.stage,
-        allowedActions:
-          String(safe.status || "").toLowerCase() === "pending" && stageAfter === "REQUEST_ON_HOLD"
-            ? ["approved", "declined"]
-            : [],
-      },
-      message: "Decision recorded successfully.",
-    });
-  } catch (err: any) {
-    const code = Number(err?.statusCode) || 500;
-    const msg = err?.publicMessage || "Failed to process decision.";
-    return res.status(code).json({
-      error: msg,
-      debug:
-        process.env.NODE_ENV !== "production"
-          ? { message: String(err?.message || err), stack: err?.stack }
-          : undefined,
-    });
-  }
-});
 
 /* ────────────────────────────────────────────────────────────────
  * Admin: on-hold
@@ -2296,13 +1826,8 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
         const requesterDisplayName = normStr(doc.frontlinerName || email.split("@")[0] || "User");
         const items = Array.isArray(updated.cartItems) ? updated.cartItems : Array.isArray(doc.cartItems) ? doc.cartItems : [];
 
-        const tokenApprove = signEmailActionToken({ rid: id, approverEmail, action: "approved" });
-        const tokenDecline = signEmailActionToken({ rid: id, approverEmail, action: "declined" });
-        const tokenHold = signEmailActionToken({ rid: id, approverEmail, action: "on_hold" });
-
-        const approveUrl = buildEmailUiActionUrl(tokenApprove, "approved");
-        const declineUrl = buildEmailUiActionUrl(tokenDecline, "declined");
-        const holdUrl = buildEmailUiActionUrl(tokenHold, "on_hold");
+        const approveUrl = decisionLinkUrl("request", id, approverEmail, req.workspace || null, "approve");
+        const declineUrl = decisionLinkUrl("request", id, approverEmail, req.workspace || null, "decline");
 
         await sendMail({
           kind: "REQUESTS",
@@ -2319,7 +1844,6 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
             comments: updated.comments,
             approveUrl,
             declineUrl,
-            holdUrl,
           }),
         });
       }
