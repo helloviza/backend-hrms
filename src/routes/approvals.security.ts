@@ -347,6 +347,16 @@ function maskPassportsDeep(v: any): any {
 }
 
 /**
+ * Staff payloads from the approvals router: everything kept (prices too),
+ * passport numbers last 4. Staff get a full number only through the audited
+ * POST /admin/requests/:id/passport-reveal.
+ */
+export function maskPassportsForStaff(doc: any) {
+  if (!doc) return doc;
+  return maskPassportsDeep(JSON.parse(JSON.stringify(doc)));
+}
+
+/**
  * The one sanitiser for customer-side viewers: no prices, passport numbers
  * last 4 only. Used for approval requests (approvals.ts, bookingHistory.ts)
  * and proposals (proposals.ts). Staff see everything.
@@ -359,6 +369,8 @@ export function sanitizeApprovalForViewer(doc: any, user: any) {
   // Clone (works for lean objects + mongoose docs), then drop every money key
   // at any depth and every currency figure in any string.
   const safe = maskPassportsDeep(stripPricesDeep(JSON.parse(JSON.stringify(doc))));
+  // Staff-only audit of passport reveals (select:false, so normally absent).
+  if (safe && typeof safe === "object") delete safe.passportReveals;
 
   // Proposal option PDFs are supplier quotes (they carry prices) — staff only.
   // Booking documents (safe.booking.attachments) stay.

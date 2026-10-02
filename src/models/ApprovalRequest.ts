@@ -91,6 +91,16 @@ export interface ApprovalCartItem {
   meta?: any;
 }
 
+export interface PassportRevealEntry {
+  at: Date;
+  byUserId?: string;
+  byEmail?: string;
+  byName?: string;
+  itemIndex: number;
+  travellerIndex: number;
+  travellerName?: string;
+}
+
 export interface ApprovalHistoryItem {
   action: string;
   at?: Date;
@@ -151,6 +161,8 @@ export interface ApprovalRequestDocument extends Document {
     byName?: string;
     edited?: boolean;
   }>;
+  /** Staff only (select:false): every full-passport reveal in the ops drawer. */
+  passportReveals?: PassportRevealEntry[];
   meta?: any;
 
   // pricing (admin write; viewer sanitization happens in routes)
@@ -369,6 +381,19 @@ const HistorySchema = new Schema<ApprovalHistoryItem>(
   { _id: false },
 );
 
+const PassportRevealSchema = new Schema<PassportRevealEntry>(
+  {
+    at: { type: Date, required: true },
+    byUserId: { type: String },
+    byEmail: { type: String },
+    byName: { type: String },
+    itemIndex: { type: Number, required: true },
+    travellerIndex: { type: Number, required: true },
+    travellerName: { type: String },
+  },
+  { _id: false },
+);
+
 /**
  * Approver ↔ requester questions at the request-approval step. A question
  * moves the request to REQUEST_NEEDS_CLARIFICATION; the reply returns it to
@@ -450,6 +475,13 @@ const ApprovalRequestSchema = new Schema<ApprovalRequestDocument>(
     history: { type: [HistorySchema], default: [] },
 
     clarifications: { type: [ClarificationSchema], default: [] },
+
+    // Audit of full-passport reveals (POST /admin/requests/:id/passport-reveal).
+    // A field of its own, not `history`: history's latest comment drives the
+    // booking-history parse, and customers read history. select:false keeps it
+    // out of every query that does not ask for it; no default, so requests
+    // nobody revealed carry nothing.
+    passportReveals: { type: [PassportRevealSchema], default: undefined, select: false },
 
     // ✅ CRITICAL: meta must always exist (attachments, ccLeaders, revoked, etc.)
     meta: { type: Schema.Types.Mixed, default: {} },

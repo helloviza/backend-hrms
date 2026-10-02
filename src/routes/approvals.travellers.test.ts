@@ -282,7 +282,7 @@ describe("manual travellers — any role, on this request only", () => {
 });
 
 describe("passport masking", () => {
-  it("customer-side viewers get last 4; staff get the full number", async () => {
+  it("customer-side viewers and staff payloads get last 4 (staff read the full number only through the audited reveal)", async () => {
     const r = await submit(REQUESTER, [{ kind: "self" }, manual()]);
     const id = r.body.request._id;
     expect(r.body.request.cartItems[0].meta.travellers.map((t: any) => t.passportNumber)).toEqual(["****6543", "****4567"]);
@@ -298,7 +298,10 @@ describe("passport masking", () => {
     expect(JSON.stringify(mine.body)).not.toContain(MANUAL_PASSPORT);
 
     const staff = await as(request(app).get(`/api/approvals/requests/${id}`), STAFF, WS_DIRECT);
-    expect(staff.body.request.cartItems[0].meta.travellers.map((t: any) => t.passportNumber)).toEqual([PROFILE_PASSPORT, MANUAL_PASSPORT]);
+    expect(staff.body.request.cartItems[0].meta.travellers.map((t: any) => t.passportNumber)).toEqual(["****6543", "****4567"]);
+    const staffQueue = await as(request(app).get("/api/approvals/admin/pending"), STAFF, WS_DIRECT);
+    expect(staffQueue.status).toBe(200);
+    expect(JSON.stringify(staffQueue.body)).not.toMatch(new RegExp(`${PROFILE_PASSPORT}|${MANUAL_PASSPORT}`));
   });
 
   it("emails never carry a passport number", async () => {
@@ -321,6 +324,72 @@ describe("passport masking", () => {
     expect(put.status).toBe(200);
     const trs = await stored(id);
     expect(trs.map((t) => t.passportNumber)).toEqual([PROFILE_PASSPORT, MANUAL_PASSPORT]);
+  });
+
+  it("customers (requester, approver, Workspace Leader) cannot call the reveal endpoints; nothing is recorded", async () => {
+    const r = await submit(REQUESTER, [{ kind: "self" }, manual()]);
+    const id = r.body.request._id;
+    for (const who of [REQUESTER, APPROVER_USER, LEADER_USER]) {
+      const reveal = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), who, WS_DIRECT)
+        .send({ itemIndex: 0, travellerIndex: 1 });
+      expect(reveal.status).toBe(403);
+      expect(JSON.stringify(reveal.body)).not.toContain(MANUAL_PASSPORT);
+      const audit = await as(request(app).get(`/api/approvals/admin/requests/${id}/passport-reveals`), who, WS_DIRECT);
+      expect(audit.status).toBe(403);
+    }
+    const raw: any = await col("approvalrequests").findOne({ _id: new mongoose.Types.ObjectId(String(id)) });
+    expect(raw.passportReveals).toBeUndefined();
+  });
+
+  it("staff reveal returns the full number and records who, which request, which traveller, when", async () => {
+    const r = await submit(REQUESTER, [{ kind: "self" }, manual()]);
+    const id = r.body.request._id;
+    const before: any = await col("approvalrequests").findOne({ _id: new mongoose.Types.ObjectId(String(id)) });
+
+    const reveal = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, WS_DIRECT)
+      .send({ itemIndex: 0, travellerIndex: 1 });
+    expect(reveal.status).toBe(200);
+    expect(reveal.body.passportNumber).toBe(MANUAL_PASSPORT);
+    expect(reveal.headers["cache-control"]).toMatch(/no-store/);
+
+    const raw: any = await col("approvalrequests").findOne({ _id: new mongoose.Types.ObjectId(String(id)) });
+    expect(raw.passportReveals).toHaveLength(1);
+    expect(raw.passportReveals[0]).toMatchObject({
+      byUserId: STAFF.sub, byEmail: STAFF.email, itemIndex: 0, travellerIndex: 1, travellerName: "Asha Guest",
+    });
+    expect(raw.passportReveals[0].at).toBeInstanceOf(Date);
+    // Not in history (customers read it; booking history parses its latest entry) and no "Last update" bump.
+    expect(raw.history.map((h: any) => h.action)).not.toContain("passport_revealed");
+    expect(raw.history).toHaveLength(before.history.length);
+    expect(raw.updatedAt.getTime()).toBe(before.updatedAt.getTime());
+
+    const audit = await as(request(app).get(`/api/approvals/admin/requests/${id}/passport-reveals`), STAFF, WS_DIRECT);
+    expect(audit.status).toBe(200);
+    expect(audit.body.reveals).toHaveLength(1);
+    expect(audit.body.reveals[0]).toMatchObject({ byEmail: STAFF.email, travellerName: "Asha Guest" });
+
+    // Customers never see the audit, nor the number, after a reveal.
+    for (const who of [REQUESTER, APPROVER_USER, LEADER_USER]) {
+      const got = await as(request(app).get(`/api/approvals/requests/${id}`), who, WS_DIRECT);
+      const body = JSON.stringify(got.body);
+      expect(body).not.toContain(MANUAL_PASSPORT);
+      expect(body).not.toContain("passportReveals");
+    }
+    const leaderQueue = await as(request(app).get("/api/approvals/admin/pending"), LEADER_USER, WS_DIRECT);
+    expect(JSON.stringify(leaderQueue.body)).not.toMatch(new RegExp(`${MANUAL_PASSPORT}|passportReveals`));
+  });
+
+  it("reveal refuses a traveller with no passport and a bad index, recording nothing", async () => {
+    const r = await submit(REQUESTER, [{ kind: "manual", firstName: "No", lastName: "Passport" }], { scope: "domestic" });
+    const id = r.body.request._id;
+    const none = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, WS_DIRECT)
+      .send({ itemIndex: 0, travellerIndex: 0 });
+    expect(none.status).toBe(404);
+    const bad = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, WS_DIRECT)
+      .send({ itemIndex: "x", travellerIndex: 0 });
+    expect(bad.status).toBe(400);
+    const raw: any = await col("approvalrequests").findOne({ _id: new mongoose.Types.ObjectId(String(id)) });
+    expect(raw.passportReveals).toBeUndefined();
   });
 
   it("a masked passport that matches nothing stored must be re-entered", async () => {

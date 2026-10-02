@@ -50,6 +50,7 @@ import {
   setNoStore,
   collectRoles,
   sanitizeApprovalForViewer,
+  maskPassportsForStaff,
   stripPriceText,
   checkCanRaiseRequest,
 } from "./approvals.security.js";
@@ -119,6 +120,15 @@ function withoutOneWayReturnDate(items: any[]): any[] {
 
 function sendTravellerError(res: any, e: TravellerError) {
   return res.status(e.status).json({ error: e.message, code: e.code, missing: e.missing });
+}
+
+/**
+ * What this router returns for a request: customers through the one
+ * sanitiser (no prices, passport last 4); staff keep prices but also get
+ * passport last 4 — the full number only via the audited passport-reveal.
+ */
+function forViewer(doc: any, user: any) {
+  return isStaffAdmin(user) ? maskPassportsForStaff(doc) : sanitizeApprovalForViewer(doc, user);
 }
 
 const router = Router();
@@ -703,7 +713,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       await doc.save();
     }
 
-    res.json({ ok: true, request: sanitizeApprovalForViewer(doc, req.user), message: "Submitted for approval" });
+    res.json({ ok: true, request: forViewer(doc, req.user), message: "Submitted for approval" });
   } catch (err) {
     next(err);
   }
@@ -723,7 +733,7 @@ router.get("/self-traveller", requireAuth, requireWorkspace, async (req: AnyObj,
     res.json({
       ok: true,
       ...result,
-      traveller: result.traveller ? sanitizeApprovalForViewer(result.traveller, req.user) : null,
+      traveller: result.traveller ? forViewer(result.traveller, req.user) : null,
     });
   } catch (err) {
     next(err);
@@ -753,7 +763,7 @@ router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("A
     // link to the requester's read-only proposal view.
     const proposals = await latestProposalsFor(rows.map((r: any) => r._id));
     const safeRows = rows.map((r: any) => ({
-      ...sanitizeApprovalForViewer(r, req.user),
+      ...forViewer(r, req.user),
       _proposal: proposals.get(String(r._id)) || undefined,
     }));
     res.json({ rows: safeRows });
@@ -806,7 +816,7 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
       .lean()
       .exec();
 
-    const safeRows = rows.map((r: any) => sanitizeApprovalForViewer(r, req.user));
+    const safeRows = rows.map((r: any) => forViewer(r, req.user));
     res.json({ rows: safeRows });
   } catch (err) {
     next(err);
@@ -832,7 +842,7 @@ router.get("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
 
     if (!canView) return res.status(403).json({ error: "Not allowed" });
 
-    res.json({ ok: true, request: sanitizeApprovalForViewer(doc, user) });
+    res.json({ ok: true, request: forViewer(doc, user) });
   } catch (err) {
     next(err);
   }
@@ -920,7 +930,7 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
         prune: true,
       });
     }
-    res.json({ ok: true, request: sanitizeApprovalForViewer(doc, req.user), message: "Updated" });
+    res.json({ ok: true, request: forViewer(doc, req.user), message: "Updated" });
   } catch (err) {
     next(err);
   }
@@ -1030,7 +1040,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
         doc.meta.resendCount = Number(doc.meta.resendCount || 0) + 1;
 
         await doc.save();
-        return res.json({ ok: true, request: sanitizeApprovalForViewer(doc, req.user), message: "Resent approval email" });
+        return res.json({ ok: true, request: forViewer(doc, req.user), message: "Resent approval email" });
       } catch (e) {
         if (process.env.NODE_ENV !== "production") {
           // eslint-disable-next-line no-console
@@ -1058,7 +1068,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
       throw e;
     }
 
-    res.json({ ok: true, request: sanitizeApprovalForViewer(decided, req.user), message: "Updated" });
+    res.json({ ok: true, request: forViewer(decided, req.user), message: "Updated" });
   } catch (err) {
     next(err);
   }
@@ -1100,7 +1110,7 @@ router.post("/requests/:id/clarification", requireAuth, requireWorkspace, requir
         reply: req.body?.reply,
         edited,
       });
-      return res.json({ ok: true, request: sanitizeApprovalForViewer(updated, req.user), message: "Reply sent to your approver" });
+      return res.json({ ok: true, request: forViewer(updated, req.user), message: "Reply sent to your approver" });
     } catch (e) {
       if (e instanceof DecisionError) return res.status(e.status).json({ error: e.message, code: e.code });
       throw e;
@@ -1125,7 +1135,7 @@ router.get("/admin/pending", requireApprovalsAdminRead, async (req: AnyObj, res,
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows: rows.map((r: any) => sanitizeApprovalForViewer(r, req.user)) });
+    res.json({ rows: rows.map((r: any) => forViewer(r, req.user)) });
   } catch (err) {
     next(err);
   }
@@ -1150,7 +1160,7 @@ router.get("/admin/approved", requireApprovalsAdminRead, async (req: AnyObj, res
       .lean()
       .exec();
 
-    res.json({ rows: rows.map((r: any) => sanitizeApprovalForViewer(r, req.user)) });
+    res.json({ rows: rows.map((r: any) => forViewer(r, req.user)) });
   } catch (err) {
     next(err);
   }
@@ -1167,7 +1177,7 @@ router.get("/admin/done", requireApprovalsAdminRead, async (req: AnyObj, res, ne
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows: rows.map((r: any) => sanitizeApprovalForViewer(r, req.user)) });
+    res.json({ rows: rows.map((r: any) => forViewer(r, req.user)) });
   } catch (err) {
     next(err);
   }
@@ -1184,7 +1194,7 @@ router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows: rows.map((r: any) => sanitizeApprovalForViewer(r, req.user)) });
+    res.json({ rows: rows.map((r: any) => forViewer(r, req.user)) });
   } catch (err) {
     next(err);
   }
@@ -1203,7 +1213,7 @@ router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj,
 
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
-    res.json(sanitizeApprovalForViewer(doc, req.user));
+    res.json(forViewer(doc, req.user));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1236,6 +1246,82 @@ router.get("/admin/requests/:id/selection-snapshot", async (req: AnyObj, res, ne
   }
 });
 
+/**
+ * Staff only: one traveller's full passport number on this request. Every
+ * payload above masks it (last 4); this is the one way to read it, and each
+ * read is recorded in passportReveals (who, which request, which traveller,
+ * when) BEFORE the number is returned — no audit, no number. Customers and
+ * Workspace Leaders get 403 (requireApprovalsAdminWrite = isStaffAdmin).
+ */
+router.post("/admin/requests/:id/passport-reveal", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid request id" });
+    }
+    const itemIndex = Number(req.body?.itemIndex);
+    const travellerIndex = Number(req.body?.travellerIndex);
+    if (!Number.isInteger(itemIndex) || itemIndex < 0 || !Number.isInteger(travellerIndex) || travellerIndex < 0) {
+      return res.status(400).json({ error: "itemIndex and travellerIndex are required" });
+    }
+
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId })
+      .select("cartItems")
+      .lean();
+    if (!doc) return res.status(404).json({ error: "Request not found" });
+
+    const t = doc.cartItems?.[itemIndex]?.meta?.travellers?.[travellerIndex];
+    const full = String(t?.passportNumber || t?.passportNo || "").trim();
+    if (!t || !full || full.startsWith("*")) {
+      return res.status(404).json({ error: "No passport number on this traveller" });
+    }
+
+    const user = req.user || {};
+    const entry = {
+      at: new Date(),
+      byUserId: String(user.sub || user._id || ""),
+      byEmail: normEmail(user.email),
+      byName: normStr(user.name || user.firstName || ""),
+      itemIndex,
+      travellerIndex,
+      travellerName: [t.firstName, t.middleName, t.lastName].map((v: any) => normStr(v)).filter(Boolean).join(" "),
+    };
+    // timestamps:false — a reveal must not move "Last update" or the queue order.
+    const written = await ApprovalRequest.updateOne(
+      { _id: id, workspaceId: req.workspaceObjectId },
+      { $push: { passportReveals: entry } },
+      { timestamps: false },
+    );
+    if (!written.modifiedCount) {
+      return res.status(500).json({ error: "Could not record the reveal" });
+    }
+
+    setNoStore(res);
+    res.json({ ok: true, passportNumber: full, travellerName: entry.travellerName, reveal: entry });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Staff only: the passport-reveal audit for this request, newest first. */
+router.get("/admin/requests/:id/passport-reveals", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid request id" });
+    }
+    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId })
+      .select("+passportReveals")
+      .lean();
+    if (!doc) return res.status(404).json({ error: "Request not found" });
+    const reveals = (Array.isArray(doc.passportReveals) ? doc.passportReveals : []).slice().reverse();
+    setNoStore(res);
+    res.json({ ok: true, reveals });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /* ────────────────────────────────────────────────────────────────
  * Admin: actions (WRITE — STAFF ONLY)
  * ──────────────────────────────────────────────────────────────── */
@@ -1260,7 +1346,7 @@ router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: A
     await doc.save();
     if (!wasInProgress) await notifyRequesterProgress(doc, "booking_started");
 
-    res.json({ success: true, doc });
+    res.json({ success: true, doc: forViewer(doc, req.user) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1295,7 +1381,7 @@ router.put("/admin/:id/assign", requireApprovalsAdminWrite, async (req: AnyObj, 
     });
 
     await doc.save();
-    res.json({ ok: true, request: doc, message: "Assigned" });
+    res.json({ ok: true, request: forViewer(doc, req.user), message: "Assigned" });
   } catch (err) {
     next(err);
   }
@@ -1349,7 +1435,7 @@ router.put(
         await syncProposalBookingStatus(String((linkedProposalUp as any)._id), "IN_PROGRESS");
       }
 
-      return res.json({ ok: true, request: doc, message: "Marked as under process" });
+      return res.json({ ok: true, request: forViewer(doc, req.user), message: "Marked as under process" });
     } catch (err) {
       next(err);
     }
@@ -1383,7 +1469,7 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
       bookingAmount,
       actualBookingPrice,
     });
-    return res.json({ ok: true, request: out.doc, message: out.message });
+    return res.json({ ok: true, request: forViewer(out.doc, req.user), message: out.message });
   } catch (err) {
     next(err);
   }
@@ -1554,7 +1640,7 @@ router.put("/admin/:id/on-hold", requireApprovalsAdminWrite, async (req: AnyObj,
 
     await doc.save();
     if (!wasOnHold) await notifyRequesterProgress(doc, "ops_on_hold", comment);
-    res.json({ ok: true, request: doc, message: "Placed on hold" });
+    res.json({ ok: true, request: forViewer(doc, req.user), message: "Placed on hold" });
   } catch (err) {
     next(err);
   }
@@ -1590,7 +1676,7 @@ router.put("/admin/:id/cancel", requireApprovalsAdminWrite, async (req: AnyObj, 
 
     await doc.save();
     await notifyRequesterProgress(doc, "cancelled", comment);
-    res.json({ ok: true, request: doc, message: "Cancelled" });
+    res.json({ ok: true, request: forViewer(doc, req.user), message: "Cancelled" });
   } catch (err) {
     next(err);
   }
@@ -1641,7 +1727,7 @@ router.put("/requests/:id/revoke", requireAuth, requireWorkspace, async (req: An
       { new: true }
     );
 
-    res.json({ ok: true, request: sanitizeApprovalForViewer(updated, req.user), message: "Request revoked" });
+    res.json({ ok: true, request: forViewer(updated, req.user), message: "Request revoked" });
   } catch (err) {
     next(err);
   }
@@ -1774,7 +1860,7 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
       }
     } catch { /* non-blocking */ }
 
-    res.json({ ok: true, request: sanitizeApprovalForViewer(updated, req.user), message: "Resubmitted" });
+    res.json({ ok: true, request: forViewer(updated, req.user), message: "Resubmitted" });
   } catch (err) {
     next(err);
   }
