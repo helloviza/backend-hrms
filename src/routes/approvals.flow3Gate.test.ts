@@ -4,7 +4,7 @@
 // The approvals router used to demand approvalFlowEnabled, so every
 // /api/approvals/* call — search included — was refused for them. The router
 // gate now admits either flag:
-//   - Flow-3-only workspace: search, create (auto-approved), my requests,
+//   - Flow-3-only workspace: search, create (pending approval), my requests,
 //     inbox and booking history all work
 //   - proposals stay Flow 2 only (requireTravelMode("APPROVAL_FLOW"))
 //   - a workspace with neither flag is still refused; HOUSE still bypasses
@@ -133,14 +133,14 @@ describe("Flow 3 workspace with ONLY approvalDirectEnabled", () => {
     }
   });
 
-  it("creates a request that is auto-approved, sees it in My Requests, and the inbox loads", async () => {
+  it("creates a request that waits for approval, sees it in My Requests, and the inbox loads", async () => {
     const created = await as(request(app).post("/api/approvals/requests"), REQ, WS_DIRECT).send({ customerId: "D1", cartItems: [flightItem] });
     expect(created.status).toBe(200);
 
     const doc: any = await col("approvalrequests").findOne({ workspaceId: WS_DIRECT });
-    expect(doc.status).toBe("approved");
-    expect(doc.stage).toBe("REQUEST_APPROVED");
-    expect(doc.meta?.autoApproved).toBe(true);
+    expect(doc.status).toBe("pending");
+    expect(doc.stage).toBe("REQUEST_RAISED");
+    expect(doc.meta?.travelFlow).toBe("APPROVAL_DIRECT");
 
     const mine = await as(request(app).get("/api/approvals/requests/mine"), REQ, WS_DIRECT);
     expect(mine.status).toBe(200);
@@ -152,7 +152,7 @@ describe("Flow 3 workspace with ONLY approvalDirectEnabled", () => {
 
   it("sees its booking history on both mounts", async () => {
     await as(request(app).post("/api/approvals/requests"), REQ, WS_DIRECT).send({ customerId: "D1", cartItems: [flightItem] });
-    await col("approvalrequests").updateMany({ workspaceId: WS_DIRECT }, { $set: { adminState: "done" } });
+    await col("approvalrequests").updateMany({ workspaceId: WS_DIRECT }, { $set: { status: "approved", adminState: "done" } });
 
     for (const path of ["/api/approvals/history", "/api/booking-history/history"]) {
       const r = await as(request(app).get(path), REQ, WS_DIRECT);

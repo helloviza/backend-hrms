@@ -224,6 +224,42 @@ async function pickApproverEmail(opts: { customerId: string; actorEmail: string 
   return { ws, approverEmail, leaderEmails };
 }
 
+/**
+ * Nobody approves their own request (Flow 2 and Flow 3 alike):
+ *   - requester is a Workspace Leader → auto-approved, there is no one above
+ *   - requester is the resolved approver → routed to a Workspace Leader
+ *   - otherwise → the resolved approver
+ * Returns approverEmail "" when the requester is the approver and the
+ * workspace has no other leader to route to.
+ */
+function resolveSubmitRouting(opts: {
+  approverEmail: string;
+  leaderEmails: string[];
+  actorEmail: string;
+  actorIsLeader: boolean;
+}) {
+  const actor = normEmail(opts.actorEmail);
+  if (opts.actorIsLeader) {
+    return { approverEmail: actor, autoApprove: true, routedToLeader: false };
+  }
+  if (normEmail(opts.approverEmail) === actor) {
+    const leader = opts.leaderEmails.map(normEmail).find((e) => e && e !== actor) || "";
+    return { approverEmail: leader, autoApprove: false, routedToLeader: true };
+  }
+  return { approverEmail: normEmail(opts.approverEmail), autoApprove: false, routedToLeader: false };
+}
+
+function hasWorkspaceLeaderRole(user: AnyObj) {
+  return (user?.roles || [])
+    .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
+    .includes("WORKSPACELEADER");
+}
+
+/** Stage an approved request moves to: Flow 3 skips the proposal step. */
+function approvedStageFor(doc: AnyObj) {
+  return doc?.meta?.travelFlow === "APPROVAL_DIRECT" ? "REQUEST_APPROVED" : "PROPOSAL_PENDING";
+}
+
 /* ────────────────────────────────────────────────────────────────
  * Admin queue query helpers
  * ──────────────────────────────────────────────────────────────── */
@@ -403,12 +439,20 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     }
     const { cartItems, snapshots } = prepared;
 
-    const { ws, approverEmail, leaderEmails } = await pickApproverEmail({
+    const picked = await pickApproverEmail({
       customerId: cid,
       actorEmail: email,
     });
+    const { ws, leaderEmails } = picked;
 
-    const isSelfApproval = Boolean(approverEmail && normEmail(approverEmail) === normEmail(email));
+    const routing = resolveSubmitRouting({
+      approverEmail: picked.approverEmail,
+      leaderEmails,
+      actorEmail: email,
+      actorIsLeader: leaderEmails.includes(email) || hasWorkspaceLeaderRole(user),
+    });
+    const approverEmail = routing.approverEmail;
+    const isSelfApproval = routing.autoApprove;
 
     let customerName = "Workspace";
     let customerEmailDomain = "";
@@ -428,6 +472,14 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
           getEmailDomain(normEmail((legacy.doc as any).email)) ||
           getEmailDomain(normEmail((legacy.doc as any)?.payload?.email));
       }
+    }
+
+    if (!approverEmail && routing.routedToLeader) {
+      return res.status(400).json({
+        error:
+          "You are this workspace's approver and there is no Workspace Leader to approve your request. Ask your admin to add a Workspace Leader.",
+        code: "NO_APPROVER_ABOVE_REQUESTER",
+      });
     }
 
     if (!approverEmail) {
@@ -475,9 +527,9 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       managerEmail: approverEmail,
       managerName,
 
-      status: isSelfApproval || isDirectFlow ? "approved" : "pending",
-      adminState: isSelfApproval || isDirectFlow ? "pending" : undefined,
-      stage: isSelfApproval ? "PROPOSAL_PENDING" : isDirectFlow ? "REQUEST_APPROVED" : "REQUEST_RAISED",
+      status: isSelfApproval ? "approved" : "pending",
+      adminState: isSelfApproval ? "pending" : undefined,
+      stage: !isSelfApproval ? "REQUEST_RAISED" : isDirectFlow ? "REQUEST_APPROVED" : "PROPOSAL_PENDING",
       cartItems,
       comments: comments ? String(comments) : undefined,
 
@@ -490,7 +542,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
         ccLeaders: leaderEmails,
         travelFlow: wsTravelFlow || "APPROVAL_FLOW",
         ...(isSelfApproval ? { selfApproved: true, selfApprovedReason: "WL_IS_REQUESTER" } : {}),
-        ...(isDirectFlow ? { autoApproved: true, autoApprovedReason: "APPROVAL_DIRECT" } : {}),
+        ...(routing.routedToLeader ? { routedToLeaderReason: "REQUESTER_IS_APPROVER" } : {}),
       },
 
       history: [
@@ -508,18 +560,9 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
                 action: "approved",
                 at: new Date(),
                 by: sub || "unknown",
-                comment: "Self-approved — requester is the designated approver for this workspace.",
+                comment: "Auto-approved — requester is a Workspace Leader (no one above to approve).",
                 userEmail: email,
                 userName: name,
-              },
-            ]
-          : isDirectFlow
-          ? [
-              {
-                action: "auto_approved",
-                at: new Date(),
-                by: "system",
-                comment: "Auto-approved — APPROVAL_DIRECT workspace (no manager approval required).",
               },
             ]
           : []),
@@ -613,7 +656,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
 
         const leaderTargets = leaderEmails
           .map(normEmail)
-          .filter((x) => x && x !== normEmail(approverEmail));
+          .filter((x) => x && x !== normEmail(approverEmail) && x !== email);
 
         for (const leaderEmail of leaderTargets) {
           await sendMail({
@@ -703,11 +746,15 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
       .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
       .includes("WORKSPACELEADER");
 
+    // Nobody sees their own request as something to approve.
+    const notOwn = { frontlinerEmail: { $not: exactIRegex(email) } };
+
     const inboxQuery = isWLInbox
       ? {
           status: "pending",
           stage: { $in: ["REQUEST_RAISED", "REQUEST_ON_HOLD"] },
           workspaceId: req.workspaceObjectId,
+          ...notOwn,
         }
       : {
           $and: [
@@ -715,6 +762,7 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
               status: "pending",
               stage: { $in: ["REQUEST_RAISED", "REQUEST_ON_HOLD"] },
               workspaceId: req.workspaceObjectId,
+              ...notOwn,
             },
             {
               $or: [{ managerEmail: exactIRegex(email) }, { "meta.ccLeaders": exactIRegex(email) }],
@@ -975,6 +1023,13 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
       return res.status(403).json({ error: "Not allowed (not assigned approver)" });
     }
 
+    if (email && exactIRegex(email).test(String(doc.frontlinerEmail || ""))) {
+      return res.status(403).json({
+        error: "You cannot approve, decline or hold your own request",
+        code: "SELF_APPROVAL_NOT_ALLOWED",
+      });
+    }
+
     const statusNow = String(doc.status || "").toLowerCase();
     const stageNow = String(doc.stage || "").toUpperCase();
 
@@ -995,7 +1050,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
       doc.status = action;
     }
 
-    if (action === "approved") doc.stage = "PROPOSAL_PENDING";
+    if (action === "approved") doc.stage = approvedStageFor(doc);
     if (action === "declined") doc.stage = "REQUEST_DECLINED";
     if (action === "on_hold") doc.stage = "REQUEST_ON_HOLD";
 
@@ -1801,6 +1856,10 @@ router.post("/email/consume", async (req: AnyObj, res) => {
       return res.status(403).json({ error: "Token not valid for this request" });
     }
 
+    if (exactIRegex(approverEmail).test(String(doc.frontlinerEmail || ""))) {
+      return res.status(403).json({ error: "You cannot approve, decline or hold your own request" });
+    }
+
     const statusNow = String(doc.status || "").toLowerCase();
     const stageNow = String(doc.stage || "").toUpperCase();
 
@@ -1821,7 +1880,7 @@ router.post("/email/consume", async (req: AnyObj, res) => {
       doc.status = action;
     }
 
-    if (action === "approved") doc.stage = "PROPOSAL_PENDING";
+    if (action === "approved") doc.stage = approvedStageFor(doc);
     if (action === "declined") doc.stage = "REQUEST_DECLINED";
     if (action === "on_hold") doc.stage = "REQUEST_ON_HOLD";
 
