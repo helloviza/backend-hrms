@@ -485,3 +485,20 @@ describe("Phase C — notifications and the one 'booking done' path", () => {
     expect(c.html).toContain("Trip called off");
   });
 });
+
+describe("Proposals list (GET /proposals/mine) is by workspace membership, not login roles", () => {
+  it("the approver and a leader whose logins carry no approver role still see it; drafts stay hidden", async () => {
+    const rid = await approvedRequest();
+    const d = await as(request(app).post(`/api/proposals/by-request/${rid}/draft`), OPS).send({});
+    const plain = (email: string) => ({ email, roles: ["CUSTOMER"] });
+    expect((await as(request(app).get("/api/proposals/mine"), plain(APPROVER))).body.items).toEqual([]);
+
+    await as(request(app).put(`/api/proposals/${d.body.proposal._id}`), OPS).send({ options: [option] });
+    await as(request(app).post(`/api/proposals/${d.body.proposal._id}/submit`), OPS).send({});
+    const a = await as(request(app).get("/api/proposals/mine"), plain(APPROVER));
+    expect([a.status, a.body.scope, a.body.items.map((p: any) => String(p._id))]).toEqual([200, "USER", [String(d.body.proposal._id)]]);
+    const l = await as(request(app).get("/api/proposals/mine"), plain(LEADER));
+    expect([l.status, l.body.scope, l.body.items.length]).toEqual([200, "WORKSPACE_L0", 1]);
+    expect(JSON.stringify(a.body)).not.toMatch(/unitPrice|totalPrice/);
+  });
+});

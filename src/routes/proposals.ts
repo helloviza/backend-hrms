@@ -22,6 +22,7 @@ import {
   proposalDeciders,
   decisionLinkUrl,
   workspaceOf,
+  activeLeaderEmails,
   setProposalPhaseStage,
   DecisionError,
 } from "../services/approvalDecisions.js";
@@ -904,67 +905,27 @@ router.get("/mine", requireAnyAuth, requireWorkspace, async (req: Request, res: 
     const userEmail = normEmail(aReq.user?.email);
     if (!userEmail) return res.status(401).json({ error: "Unauthenticated" });
 
-    const userRoles: string[] = (aReq.user?.roles || []).map((r: string) => String(r).toUpperCase());
-    const isL1Only =
-      !userRoles.some((r) =>
-        ["ADMIN", "SUPERADMIN", "HR", "OPS", "MANAGER", "WORKSPACE_LEADER", "APPROVER"].includes(r)
-      ) &&
-      !String(aReq.user?.sbtRole || "").toUpperCase().includes("L2") &&
-      String(aReq.user?.sbtRole || "").toUpperCase() !== "BOTH";
+    // Who sees what is decided by workspace membership, not login roles:
+    // approver and leader roles live on CustomerMember, so a role gate here
+    // locked every approver and Workspace Leader out of this list.
+    //   Workspace Leader → every proposal in the workspace
+    //   otherwise        → requests they raised, approve, or are cc'd on
+    const workspaceId = (req as any).workspaceObjectId;
+    const ws = await workspaceOf({ workspaceId });
+    const isLeader = (await activeLeaderEmails(ws)).includes(userEmail);
 
-    if (isL1Only) {
-      return res.status(403).json({ message: "Proposals are not accessible to requestors" });
-    }
+    const reqFilter: AnyObj = isLeader
+      ? { workspaceId }
+      : {
+          workspaceId,
+          $or: [{ frontlinerEmail: userEmail }, { managerEmail: userEmail }, { "meta.ccLeaders": userEmail }],
+        };
+    const requestIds = (await ApprovalRequest.find(reqFilter).select({ _id: 1 }).limit(1000).lean()).map((x: any) => x._id);
+    if (!requestIds.length) return res.json({ ok: true, items: [], scope: isLeader ? "WORKSPACE_L0" : "USER" });
 
-    const candidateRequests = await ApprovalRequest.find({
-      $or: [{ frontlinerEmail: userEmail }, { managerEmail: userEmail }, { "meta.ccLeaders": userEmail }],
-      workspaceId: (req as any).workspaceObjectId,
-    })
-      .sort({ updatedAt: -1, createdAt: -1 })
-      .limit(1000)
-      .lean();
-
-    if (!candidateRequests.length) return res.json({ ok: true, items: [] });
-
-    const l0WorkspaceIds = new Set<string>();
-    for (const ar of candidateRequests as any[]) {
-      const l0List = ensureArray(ar?.meta?.ccLeaders).map(normEmail);
-      if (l0List.includes(userEmail)) {
-        const ws = String(ar?.meta?.customerWorkspaceId || "").trim();
-        if (ws) l0WorkspaceIds.add(ws);
-      }
-    }
-
-    let requestIds: mongoose.Types.ObjectId[] = [];
-
-    if (l0WorkspaceIds.size) {
-      const wsRequests = await ApprovalRequest.find({
-        "meta.customerWorkspaceId": { $in: Array.from(l0WorkspaceIds) },
-      })
-        .select({ _id: 1 })
-        .lean();
-
-      requestIds = wsRequests.map((x: any) => x._id);
-    } else {
-      const allowed = new Set<string>();
-
-      for (const ar of candidateRequests as any[]) {
-        const rid = String(ar?._id || "");
-        if (!mongoose.Types.ObjectId.isValid(rid)) continue;
-
-        const isOwner = normEmail(ar?.frontlinerEmail) === userEmail;
-        const isL2 = normEmail(ar?.managerEmail) === userEmail;
-
-        if (isOwner || isL2) allowed.add(rid);
-      }
-
-      requestIds = Array.from(allowed).map((id) => new mongoose.Types.ObjectId(id));
-    }
-
-    if (!requestIds.length) return res.json({ ok: true, items: [] });
-
+    // Latest version per request; drafts are ops' work in progress.
     const items = await Proposal.aggregate([
-      { $match: { requestId: { $in: requestIds } } },
+      { $match: { requestId: { $in: requestIds }, status: { $ne: "DRAFT" } } },
       { $sort: { requestId: 1, version: -1, updatedAt: -1, createdAt: -1 } },
       { $group: { _id: "$requestId", doc: { $first: "$$ROOT" } } },
       { $replaceRoot: { newRoot: "$doc" } },
@@ -976,7 +937,7 @@ router.get("/mine", requireAnyAuth, requireWorkspace, async (req: Request, res: 
 
     return res.json({
       ok: true,
-      scope: l0WorkspaceIds.size ? "WORKSPACE_L0" : "USER",
+      scope: isLeader ? "WORKSPACE_L0" : "USER",
       items: enriched.map((p: AnyObj) => sanitizeApprovalForViewer(p, aReq.user)),
     });
   } catch (err) {
