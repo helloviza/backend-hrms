@@ -36,6 +36,17 @@ export function approvalLinkSecret(): string {
   return crypto.createHash("sha256").update(`approval-links:${jwtSecret || "dev"}`).digest("hex");
 }
 
+/**
+ * Which setting supplies the link secret — for the boot log. Never the value.
+ * "none" in production means email decision links are disabled.
+ */
+export function approvalLinkSecretSource(): "APPROVAL_LINK_SECRET" | "EMAIL_ACTION_SECRET" | "dev-derived" | "none" {
+  const jwtSecret = process.env.JWT_SECRET || "";
+  if (process.env.APPROVAL_LINK_SECRET && process.env.APPROVAL_LINK_SECRET !== jwtSecret) return "APPROVAL_LINK_SECRET";
+  if (process.env.EMAIL_ACTION_SECRET && process.env.EMAIL_ACTION_SECRET !== jwtSecret) return "EMAIL_ACTION_SECRET";
+  return process.env.NODE_ENV === "production" ? "none" : "dev-derived";
+}
+
 /** Workspace config.tokenExpiryHours when it is a sane number, else 72h. */
 export function approvalLinkExpiryHours(ws: any): number {
   const h = Number(ws?.config?.tokenExpiryHours);

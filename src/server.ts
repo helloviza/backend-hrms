@@ -50,6 +50,7 @@ import flightRoutes from "./routes/flightRoutes.js";
 // ✅ Approvals (MUST be statically mounted; do NOT safeMount)
 import approvalsRouter from "./routes/approvals.js";
 import approvalLinksRouter from "./routes/approvalLinks.js";
+import { approvalLinkSecretSource } from "./utils/approvalLinkToken.js";
 
 // ✅ Booking History (Booked/Cancelled outcomes + admin PDFs)
 import bookingHistory from "./routes/bookingHistory.js";
@@ -1342,6 +1343,18 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
 
       const server = app.listen(env.PORT, () => {
         logger.info("API running", { port: env.PORT });
+
+        // Email decision links (routes/approvalLinks.ts): say which setting
+        // signs them — the NAME only, never the value. Read after
+        // loadSecrets has merged APP_SECRETS, so a key in the bundle counts.
+        const linkSecret = approvalLinkSecretSource();
+        if (linkSecret === "none") {
+          logger.warn(
+            "[approval-links] APPROVAL_LINK_SECRET missing (or equal to JWT_SECRET) — email decision links are disabled; emails will say 'Open Plumbox to decide'",
+          );
+        } else {
+          logger.info(`[approval-links] link secret source: ${linkSecret}`);
+        }
 
         /* ── WARM THE GEO DATABASE ────────────────────────────────────
          * The MaxMind database is fetched lazily, by the FIRST location
