@@ -22,6 +22,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
+import { autoAllocate } from "./travelDesk.js";
 import { signApprovalLink, approvalLinkExpiryHours, type ApprovalLinkKind } from "../utils/approvalLinkToken.js";
 import { frontendBaseUrl, DISABLE_EMAILS, stripPriceText } from "../routes/approvals.security.js";
 import {
@@ -259,6 +260,12 @@ export async function applyRequestDecision(opts: {
   await doc.save();
 
   await notifyRequesterOfRequestDecision(doc, action, name, email, reason);
+
+  // Approved → it is now in the ops queue: Travel Desk auto-allocation (never throws).
+  if (action === "approved") {
+    const allocated = await autoAllocate(String(doc._id));
+    if (allocated.assignedTo || allocated.flagged) return (await ApprovalRequest.findById(doc._id).exec()) || doc;
+  }
   return doc;
 }
 

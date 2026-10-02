@@ -346,6 +346,9 @@ function maskPassportsDeep(v: any): any {
   return out;
 }
 
+/** Travel Desk history rows customers never see (they keep "admin_assigned"). */
+export const STAFF_ONLY_HISTORY_ACTIONS = new Set(["admin_auto_assigned", "admin_reassigned", "admin_unassigned"]);
+
 /**
  * Staff payloads from the approvals router: everything kept (prices too),
  * passport numbers last 4. Staff get a full number only through the audited
@@ -371,6 +374,22 @@ export function sanitizeApprovalForViewer(doc: any, user: any) {
   const safe = maskPassportsDeep(stripPricesDeep(JSON.parse(JSON.stringify(doc))));
   // Staff-only audit of passport reveals (select:false, so normally absent).
   if (safe && typeof safe === "object") delete safe.passportReveals;
+
+  // Travel Desk assignment is staff-only: who holds the case, why, and the
+  // "no agent available" flag. Customers keep today's one "Assigned" history
+  // row (actor + note) and nothing more.
+  if (safe?.meta && typeof safe.meta === "object") {
+    delete safe.meta.adminAssigned;
+    delete safe.meta.assignmentFlag;
+  }
+  if (Array.isArray(safe?.history)) {
+    safe.history = safe.history
+      .filter((h: any) => !STAFF_ONLY_HISTORY_ACTIONS.has(String(h?.action || "")))
+      .map((h: any) => {
+        if (h && typeof h === "object") delete h.staffNote;
+        return h;
+      });
+  }
 
   // Proposal option PDFs are supplier quotes (they carry prices) — staff only.
   // Booking documents (safe.booking.attachments) stay.

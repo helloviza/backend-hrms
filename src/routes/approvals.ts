@@ -55,6 +55,8 @@ import {
   checkCanRaiseRequest,
 } from "./approvals.security.js";
 import approvalSearchRouter from "./approvals.search.js";
+import travelDeskRouter from "./approvals.travelDesk.js";
+import { assignCase, autoAllocate, TravelDeskError } from "../services/travelDesk.js";
 import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
 import { markRequestDone, notifyRequesterProgress, latestProposalsFor } from "../services/approvalProgress.js";
 import {
@@ -152,6 +154,8 @@ router.use(requireAnyFeature("approvalFlowEnabled", "approvalDirectEnabled"));
 
 // Live TBO search for the request form (price-free). Own gates inside.
 router.use("/search", approvalSearchRouter);
+// Travel Desk team settings + Assign picker (staff only, own guard inside).
+router.use("/travel-desk", travelDeskRouter);
 
 /* ───────────────────────── uploads (PDF attachments) ───────────────────────── */
 
@@ -618,6 +622,10 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
         prune: false,
       });
     }
+
+    // Auto-approved (Workspace Leader is the requester) → straight into the
+    // ops queue: Travel Desk auto-allocation (never throws).
+    if (isSelfApproval) await autoAllocate(String(doc._id));
 
     // Email decision links: no login, single-use, bound to the approver.
     const approveUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "approve");
@@ -1361,37 +1369,68 @@ router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: A
   }
 });
 
+function sendTravelDeskError(res: any, e: TravelDeskError) {
+  return res.status(e.status).json({ error: e.message, code: e.code });
+}
+
+/**
+ * Assign (or reassign) a case to a Travel Desk agent. `agentUserId` must be an
+ * eligible agent on the team (Away agents may be picked by hand; only
+ * auto-allocation skips them). The assignee is emailed; the change is a
+ * history row with a staff-only note.
+ */
 router.put("/admin/:id/assign", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
   try {
     setNoStore(res);
-
     const id = String(req.params.id || "");
-    const { agentType, agentName, comment } = req.body || {};
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid request id" });
+    const agentUserId = String(req.body?.agentUserId || "").trim();
+    if (!agentUserId) return res.status(400).json({ error: "Pick a Travel Desk agent", code: "AGENT_REQUIRED" });
 
-    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
-    if (!doc) return res.status(404).json({ error: "Request not found" });
+    const exists = await ApprovalRequest.exists(requestFilterFor(req, id));
+    if (!exists) return res.status(404).json({ error: "Request not found" });
 
-    doc.adminState = "assigned";
-    doc.meta = doc.meta || {};
-    doc.meta.adminAssigned = {
-      agentType: agentType || "human",
-      agentName: String(agentName || "").trim(),
-      at: new Date().toISOString(),
-    };
-
-    doc.history = Array.isArray(doc.history) ? doc.history : [];
-    doc.history.push({
-      action: "admin_assigned",
-      at: new Date(),
-      by: String(req.user?.sub || req.user?._id || ""),
-      comment: String(comment || "").trim() || undefined,
-      userEmail: normEmail(req.user?.email),
-      userName: req.user?.name || req.user?.firstName || "",
+    const doc = await assignCase({
+      requestId: id,
+      agentUserId,
+      actor: {
+        sub: String(req.user?.sub || req.user?._id || ""),
+        email: normEmail(req.user?.email),
+        name: normStr(req.user?.name || req.user?.firstName || ""),
+      },
+      note: req.body?.comment,
+      via: "manual",
     });
-
-    await doc.save();
     res.json({ ok: true, request: forViewer(doc, req.user), message: "Assigned" });
   } catch (err) {
+    if (err instanceof TravelDeskError) return sendTravelDeskError(res, err);
+    next(err);
+  }
+});
+
+/** Unassign: the case goes back to Unassigned (adminState assigned → pending). */
+router.put("/admin/:id/unassign", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
+  try {
+    setNoStore(res);
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid request id" });
+    const exists = await ApprovalRequest.exists(requestFilterFor(req, id));
+    if (!exists) return res.status(404).json({ error: "Request not found" });
+
+    const doc = await assignCase({
+      requestId: id,
+      agentUserId: null,
+      actor: {
+        sub: String(req.user?.sub || req.user?._id || ""),
+        email: normEmail(req.user?.email),
+        name: normStr(req.user?.name || req.user?.firstName || ""),
+      },
+      note: req.body?.comment,
+      via: "manual",
+    });
+    res.json({ ok: true, request: forViewer(doc, req.user), message: "Unassigned" });
+  } catch (err) {
+    if (err instanceof TravelDeskError) return sendTravelDeskError(res, err);
     next(err);
   }
 });

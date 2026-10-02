@@ -307,6 +307,12 @@ vi.mock("../utils/mailer.js", () => ({
 vi.mock("../models/ApprovalLinkUse.js", () => ({
   default: { findOne: () => chain(() => null), create: async () => ({}) },
 }));
+// Models here are in-memory stubs (no DB); Travel Desk allocation is covered by
+// approvals.travelDesk.test.ts — here it is simply off.
+vi.mock("../services/travelDesk.js", async (orig) => ({
+  ...(await orig<any>()),
+  autoAllocate: async () => ({ skipped: "off" }),
+}));
 
 const { default: approvalsRouter } = await import("./approvals.js");
 const { default: bookingHistoryRouter } = await import("./bookingHistory.js");

@@ -115,6 +115,8 @@ export interface ApprovalHistoryItem {
   userName?: string;
   userEmail?: string;
   tokenHash?: string;
+  /** Staff only (stripped for customers): e.g. who a case was assigned to and why. */
+  staffNote?: string;
 }
 
 export interface ApprovalRequestDocument extends Document {
@@ -377,6 +379,7 @@ const HistorySchema = new Schema<ApprovalHistoryItem>(
     userName: { type: String },
     userEmail: { type: String },
     tokenHash: { type: String, default: "" },
+    staffNote: { type: String },
   },
   { _id: false },
 );

@@ -292,8 +292,9 @@ describe("staff work every tenant's requests from the ops queue", () => {
     expect((await as(request(app).get(`/api/approvals/admin/requests/${id}`), STAFF, WS_FLOW)).status).toBe(200);
     expect((await as(request(app).get(`/api/approvals/requests/${id}`), STAFF, WS_FLOW)).status).toBe(200);
     expect((await as(request(app).get(`/api/approvals/admin/requests/${id}/selection-snapshot`), STAFF, WS_FLOW)).status).toBe(200);
-    const assign = await as(request(app).put(`/api/approvals/admin/${id}/assign`), STAFF, WS_FLOW).send({ agentName: "Desk" });
-    expect(assign.status).toBe(200);
+    // Found (a 404 would mean the lookup failed); refused only because the user is not on the Travel Desk.
+    const assign = await as(request(app).put(`/api/approvals/admin/${id}/assign`), STAFF, WS_FLOW).send({ agentUserId: String(oid()) });
+    expect([assign.status, assign.body.code]).toEqual([400, "NOT_TEAM_AGENT"]);
     const reveal = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, WS_FLOW)
       .send({ itemIndex: 0, travellerIndex: 0 });
     expect([reveal.status, reveal.body.passportNumber]).toEqual([200, MANUAL_PASSPORT]);
