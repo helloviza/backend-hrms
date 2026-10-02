@@ -365,19 +365,42 @@ export function editableFieldsForRole(
   return self; // REQUESTER — and any unrecognised role, which the row gate already refused
 }
 
+/** A field value reduced for "did it change?": empty (null, "", [], {}) → "". */
+function lockCompareValue(v: any): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return v.trim();
+  if (v instanceof mongoose.Types.ObjectId || v instanceof Date) return String(v);
+  if (Array.isArray(v)) return v.length ? JSON.stringify(v) : "";
+  if (typeof v === "object") return Object.keys(v).length ? JSON.stringify(v) : "";
+  return String(v);
+}
+
 /**
- * Which keys in this body the actor is not allowed to set. Uses `"key" in
- * body` semantics, matching PUT /:id's existing "an absent key means leave
- * alone" contract — so a preset that never emits a field can never trip
- * this, which is exactly why the compact /visa/apply payload stays valid.
+ * Which keys in this body the actor is not allowed to set — judged on a real
+ * CHANGE, not on presence. A form that renders a locked field still sends it
+ * (as "" when blank, or as the stored value), and a 403 over a key the user
+ * never touched blocked every save on the form (2026-10-02: requesters could
+ * not set up My Profile because the create sent designationId /
+ * costCenterId / workLocation as ""). A locked key whose value equals what is
+ * stored (`stored` = the existing record; {} at create, so only a non-empty
+ * value counts) is DELETED from the body, so nothing downstream writes it.
+ * A locked key that would change something is returned and refused as before.
+ * An absent key still means "leave alone".
  */
 function disallowedFieldsInBody(
   body: Record<string, any>,
   allowed: EditableTravellerField[],
+  stored: Record<string, any>,
 ): string[] {
   const allowedSet = new Set<string>(allowed);
   const candidates = [...SELF_EDITABLE_FIELDS, ...ADMIN_ONLY_FIELDS] as readonly string[];
-  return candidates.filter((k) => k in body && !allowedSet.has(k));
+  const changed: string[] = [];
+  for (const k of candidates) {
+    if (!(k in body) || allowedSet.has(k)) continue;
+    if (lockCompareValue(body[k]) === lockCompareValue(stored?.[k])) delete body[k];
+    else changed.push(k);
+  }
+  return changed;
 }
 
 /* ── ACT-FOR CONTROL 2: a REQUESTER may only create THEMSELVES ────────
@@ -2202,7 +2225,7 @@ router.post("/", async (req: any, res: any) => {
       ...editableFieldsForRole(member, true),
       ...CREATE_ONLY_SELF_SETTABLE, // see that constant's note — naming yourself once is not renaming
     ] as EditableTravellerField[];
-    const disallowedAtCreate = disallowedFieldsInBody(body, allowedAtCreate);
+    const disallowedAtCreate = disallowedFieldsInBody(body, allowedAtCreate, {});
     if (disallowedAtCreate.length) {
       return res.status(403).json({
         error: `You cannot set ${disallowedAtCreate.join(", ")} on a profile. Ask a workspace leader.`,
@@ -2374,7 +2397,7 @@ router.put("/:id", async (req: any, res: any) => {
     // assigned, so a payload carrying one disallowed field changes nothing
     // at all — never a partial save with the locked key quietly ignored.
     const allowedFields = editableFieldsForRole(member, approverCanManage);
-    const disallowed = disallowedFieldsInBody(body, allowedFields);
+    const disallowed = disallowedFieldsInBody(body, allowedFields, traveller);
     if (disallowed.length) {
       return res.status(403).json({
         error: `You cannot change ${disallowed.join(", ")} on this profile. Ask a workspace leader.`,
