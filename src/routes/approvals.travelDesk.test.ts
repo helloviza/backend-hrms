@@ -31,7 +31,8 @@ vi.mock("../middleware/auth.js", () => {
   };
   return { requireAuth, default: requireAuth };
 });
-vi.mock("../middleware/requireWorkspace.js", () => ({
+vi.mock("../middleware/requireWorkspace.js", async (orig) => ({
+  ...(await orig<any>()),
   requireWorkspace: async (req: any, res: any, next: any) => {
     const { default: mg } = await import("mongoose");
     const id = String(req.headers["x-test-ws"] || "");
@@ -64,11 +65,13 @@ vi.mock("../utils/emailActionToken.js", () => ({
 }));
 
 const { default: approvalsRouter } = await import("./approvals.js");
+const { default: customersRouter } = await import("./customers.js");
 const { autoAllocate } = await import("../services/travelDesk.js");
 
 const app = express();
 app.use(express.json());
 app.use("/api/approvals", approvalsRouter);
+app.use("/api/customers", customersRouter);
 
 let mongod: MongoMemoryServer;
 const col = (n: string) => mongoose.connection.db!.collection(n);
@@ -153,6 +156,10 @@ beforeEach(async () => {
   sent.length = 0;
   await col("approvalrequests").deleteMany({});
   await col("traveldesksettings").deleteMany({});
+  await col("customers").updateOne(
+    { _id: CUSTOMER_ID },
+    { $set: { accountTeam: { accountManager: { userId: new mongoose.Types.ObjectId(RAVI.sub), name: "Ravi", email: RAVI.email } } } },
+  );
 });
 
 describe("team and picker", () => {
@@ -324,6 +331,15 @@ describe("auto-allocation when a request enters the ops queue", () => {
     expect((await stored(await approvedRequest())).meta.adminAssigned.reason).toBe("round_robin");
     await setDesk({ rmFirst: false, agents: [{ userId: ASHA.sub }, { userId: RAVI.sub }] });
     expect((await stored(await approvedRequest())).meta.adminAssigned.reason).toBe("round_robin");
+  });
+
+  it("an Account Manager set by staff in the Account Team editor is picked first (customer stored on its own workspace)", async () => {
+    // Staff (HOUSE ADMIN) change Acme's Account Manager to Chit through the real editor.
+    const set = await asStaff(request(app).patch(`/api/customers/${CUSTOMER_ID}/account-team`)).send({ accountManager: { userId: CHIT.sub } });
+    expect(set.status).toBe(200);
+    await setDesk({ mode: "round_robin", rmFirst: true, agents: [{ userId: ASHA.sub }, { userId: CHIT.sub }] });
+    const id = await approvedRequest();
+    expect([await assignee(id), (await stored(id)).meta.adminAssigned.reason]).toEqual([CHIT.sub, "rm"]);
   });
 
   it("no available agent: left unassigned and flagged for the queue; the flag clears when someone takes it", async () => {

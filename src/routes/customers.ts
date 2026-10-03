@@ -16,6 +16,19 @@ import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMe
 
 const router = Router();
 
+const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
+
+/**
+ * Plumtrips staff: SUPERADMIN, or a caller signed in to the HOUSE workspace
+ * (each route's own role guard still applies). Staff manage every customer,
+ * wherever the Customer row is stored — scoping them to HOUSE hid (and 404'd)
+ * customers stored on their own workspace. Anyone else — including tenant
+ * admins, which requireAdmin also admits — stays inside their own workspace.
+ */
+function isPlumtripsStaff(req: any): boolean {
+  return isSuperAdmin(req) || String(req.workspaceId || req.workspaceObjectId || "") === PLUMTRIPS_HOUSE_WORKSPACE_ID;
+}
+
 /**
  * Top-level Customer schema path names (e.g. "address.street" → "address"),
  * computed once. Used to reject any PATCH body key that doesn't map to
@@ -36,7 +49,7 @@ function findUnrecognizedCustomerFields(body: Record<string, any>): string[] {
 
 router.get("/", requireAuth, requireWorkspace, requireAdmin, async (_req: any, res, next) => {
   try {
-    const custFilter = isSuperAdmin(_req) ? {} : { workspaceId: _req.workspaceObjectId };
+    const custFilter = isPlumtripsStaff(_req) ? {} : { workspaceId: _req.workspaceObjectId };
     const docs = await Customer.find(custFilter)
       .sort({ updatedAt: -1 })
       .lean()
@@ -82,7 +95,7 @@ router.get(
   requireRoles("ADMIN", "SUPERADMIN") as any,
   async (_req: any, res, next) => {
     try {
-      const allFilter = isSuperAdmin(_req) ? {} : { workspaceId: _req.workspaceObjectId };
+      const allFilter = isPlumtripsStaff(_req) ? {} : { workspaceId: _req.workspaceObjectId };
       const customers = await Customer.find(allFilter).sort({ updatedAt: -1 }).lean().exec();
       const vendors = await Vendor.find(allFilter).sort({ updatedAt: -1 }).lean().exec();
 
@@ -290,7 +303,7 @@ router.patch(
 
       // Try Customer (workspace-scoped)
       const acctQuery: any = { _id: id };
-      if (!isSuperAdmin(req) && req.workspaceObjectId) acctQuery.workspaceId = req.workspaceObjectId;
+      if (!isPlumtripsStaff(req) && req.workspaceObjectId) acctQuery.workspaceId = req.workspaceObjectId;
 
       let doc: any = await Customer.findOneAndUpdate(
         acctQuery,
