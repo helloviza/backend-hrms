@@ -159,6 +159,8 @@ router.get("/", async (req: Request, res: Response) => {
     // Demo Platform — demo users see only demo bookings (their seeded universe);
     // real users see only real bookings. Mirrors the conditional pattern used
     // across user-facing SBT endpoints.
+    // Internal test bookings never appear in anyone's history.
+    match.isTest = { $ne: true };
     if ((req as any).user?.isDemoUser) {
       match.isDemo = true;
     } else {

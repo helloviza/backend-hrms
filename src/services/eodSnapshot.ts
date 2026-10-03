@@ -315,6 +315,7 @@ async function getPipelineMetrics(todayEnd: Date): Promise<PipelineMetrics> {
       status: "HELD",
       lastVoucherDate: { $gte: todayEnd, $lte: tomorrowEnd },
       isDemo: { $ne: true },
+      isTest: { $ne: true },
     }),
   ]);
 
@@ -361,6 +362,7 @@ async function getAlerts(
       status: "HELD",
       lastVoucherDate: { $gte: todayEnd, $lte: tomorrowEnd },
       isDemo: { $ne: true },
+      isTest: { $ne: true },
     })
       .select("hotelName lastVoucherDate guests")
       .sort({ lastVoucherDate: 1 })

@@ -65,6 +65,7 @@ async function runHoldReminders() {
     status: "HELD",
     lastVoucherDate: { $gte: in1hFrom, $lte: in24hTo },
     isDemo: { $ne: true },
+    isTest: { $ne: true }, // no customer reminders for internal test holds
   }).lean();
 
   for (const booking of candidates) {

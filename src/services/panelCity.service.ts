@@ -44,6 +44,7 @@ async function resolveFromBooking(userId: string): Promise<string | null> {
   const bookings = await TravelBooking.find({
     userId,
     isDemo: { $ne: true },
+    isTest: { $ne: true },
     isActive: { $ne: false },
     status: { $ne: "CANCELLED" },
     destinationCity: { $ne: null },

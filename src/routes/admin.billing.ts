@@ -90,6 +90,8 @@ function buildFilter(q: Record<string, any>, sbtCustomerId?: string) {
   if (dateRange) filter.bookedAt = dateRange;
   // Demo Platform — exclude demo bookings from the legacy admin billing panel.
   filter.isDemo = { $ne: true };
+  // Internal test bookings (scripts/mark-sbt-test-data.ts) never count.
+  filter.isTest = { $ne: true };
   return filter;
 }
 
@@ -121,6 +123,8 @@ function buildMatchStage(q: Record<string, any>, sbtCustomerId?: string): any {
   if (dateRange) match.bookedAt = dateRange;
   // Demo Platform — exclude demo bookings from the legacy admin billing panel.
   match.isDemo = { $ne: true };
+  // Internal test bookings (scripts/mark-sbt-test-data.ts) never count.
+  match.isTest = { $ne: true };
   return match;
 }
 
@@ -515,6 +519,7 @@ router.get("/spend-by-service", requireAdminOrSBT, async (req: any, res: any) =>
     if (dateRange) baseMatch.bookedAt = dateRange;
     // Demo Platform — inline baseMatch bypasses buildFilter/buildMatchStage, so add the demo filter directly.
     baseMatch.isDemo = { $ne: true };
+    baseMatch.isTest = { $ne: true }; // internal test bookings never count
 
     const statusPipeline = (statuses: string[]): any[] => [
       { $match: { ...baseMatch, status: { $in: statuses } } },

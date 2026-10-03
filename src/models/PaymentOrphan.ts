@@ -9,6 +9,8 @@ export interface IPaymentOrphan extends Document {
   resolvedAt?: Date;
   resolvedBy?: string;
   notes?: string;
+  // Internal test payment — excluded from the orphans console and reconciliation.
+  isTest?: boolean;
   createdAt: Date;
 }
 
@@ -22,6 +24,7 @@ const PaymentOrphanSchema = new Schema(
     resolvedAt: { type: Date },
     resolvedBy: { type: String },
     notes: { type: String },
+    isTest: { type: Boolean, default: false, index: true },
   },
   { timestamps: true },
 );

@@ -1133,6 +1133,7 @@ router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req
       SBTBooking.find({
         status: { $in: ["CONFIRMED", "PENDING", "CANCELLED"] },
         isDemo: { $ne: true },
+        isTest: { $ne: true }, // internal test bookings are never invoiced
       })
         .populate("workspaceId", "name companyName customerId")
         .sort({ createdAt: -1 })
@@ -1141,6 +1142,7 @@ router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req
       SBTHotelBooking.find({
         status: { $in: ["CONFIRMED", "PENDING", "HELD", "CANCELLED"] },
         isDemo: { $ne: true },
+        isTest: { $ne: true },
       })
         .populate("workspaceId", "name companyName customerId")
         .sort({ createdAt: -1 })
@@ -2442,6 +2444,12 @@ router.post("/import-from-sbt", requirePermission("manualBookings", "FULL"), asy
         if (!sbtDoc) {
           failed++;
           details.push({ bookingId, status: "failed", error: "source booking not found" });
+          continue;
+        }
+        // Internal test bookings are never imported (and so never invoiced).
+        if (sbtDoc.isTest === true) {
+          failed++;
+          details.push({ bookingId, status: "failed", error: "test booking — not imported" });
           continue;
         }
 

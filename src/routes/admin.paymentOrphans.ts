@@ -10,7 +10,7 @@ router.use(requireAdmin);
 // GET /api/admin/payment-orphans — list unresolved orphans
 router.get("/", async (_req: Request, res: Response) => {
   try {
-    const orphans = await PaymentOrphan.find({ resolvedAt: { $exists: false } })
+    const orphans = await PaymentOrphan.find({ resolvedAt: { $exists: false }, isTest: { $ne: true } })
       .sort({ createdAt: -1 })
       .lean();
     res.json({ ok: true, orphans });

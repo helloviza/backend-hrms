@@ -216,7 +216,8 @@ router.get("/", async (req: any, res: any) => {
     const cols = type === "hotel" ? HOTEL_COLUMNS : AIR_COLUMNS;
 
     // Date range on bookedAt (IST day boundaries, same helpers as manual-bookings export).
-    const filter: Record<string, any> = {};
+    // Internal test bookings (scripts/mark-sbt-test-data.ts) are not in the register.
+    const filter: Record<string, any> = { isTest: { $ne: true } };
     const from = req.query.dateFrom ? parseISTStart(String(req.query.dateFrom)) : null;
     const to = req.query.dateTo ? parseISTEnd(String(req.query.dateTo)) : null;
     if (from || to) {

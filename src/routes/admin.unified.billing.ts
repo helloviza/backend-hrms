@@ -149,6 +149,8 @@ function buildScopedMatch(req: any): any {
 
   // Demo Platform — exclude demo bookings from production travel-spend views.
   match.isDemo = { $ne: true };
+  // Internal test bookings (scripts/mark-sbt-test-data.ts) never count.
+  match.isTest = { $ne: true };
 
   // A soft-deleted source ManualBooking must not keep counting here, in any
   // status bucket (CONFIRMED, CANCELLED, or PENDING) — applied once here so

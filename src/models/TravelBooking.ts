@@ -105,6 +105,9 @@ const TravelBookingSchema = new Schema(
     // Demo Platform — mirror flags so demo bookings are filterable on the customer side
     isDemo: { type: Boolean, default: false, index: true },
     createdByDemoUser: { type: Boolean, default: false, index: true },
+    // Internal test booking (mirrors the SBT source's isTest) — excluded from
+    // billing, analytics and customer history. scripts/mark-sbt-test-data.ts.
+    isTest: { type: Boolean, default: false, index: true },
     // Mirrors ManualBooking.isActive — a soft-deleted source booking must not
     // keep counting as CONFIRMED (or any other status) here. See
     // syncManualBookingToMirror (ManualBooking.ts) and buildScopedMatch
