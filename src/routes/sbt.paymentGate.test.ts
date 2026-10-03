@@ -58,6 +58,14 @@ const tbo = vi.hoisted(() => ({
   getSSR: vi.fn(),
   ticketLCC: vi.fn(),
   getBookingDetails: vi.fn(async () => null),
+  searchFlights: vi.fn(),
+  ticketReissue: vi.fn(),
+}));
+const mail = vi.hoisted(() => ({ sendMail: vi.fn(async () => ({})) }));
+vi.mock("../utils/mailer.js", async (orig) => ({ ...(await orig<any>()), sendMail: mail.sendMail }));
+vi.mock("../utils/companySettings.js", async (orig) => ({
+  ...(await orig<any>()),
+  getCompanySettings: async () => ({ opsEmail: "ops@test", supportEmail: "support@test", accountManagerEmail: "" }),
 }));
 vi.mock("../services/tbo.flight.service.js", async (orig) => ({
   ...(await orig<any>()),
@@ -65,6 +73,8 @@ vi.mock("../services/tbo.flight.service.js", async (orig) => ({
   getSSR: tbo.getSSR,
   ticketLCC: tbo.ticketLCC,
   getBookingDetails: tbo.getBookingDetails,
+  searchFlights: tbo.searchFlights,
+  ticketReissue: tbo.ticketReissue,
 }));
 
 const rzp = vi.hoisted(() => ({
@@ -95,10 +105,12 @@ const BOOKER = oid();
 const L1 = oid();
 const OTHER = oid();
 
-const as = (r: request.Test, userId: mongoose.Types.ObjectId, opts: { sbt?: boolean } = {}) =>
+const HOUSE = "69679a7628330a58d29f2254"; // Plumtrips Travel Desk workspace
+
+const as = (r: request.Test, userId: mongoose.Types.ObjectId, opts: { sbt?: boolean; ws?: string } = {}) =>
   r
     .set("x-test-user", JSON.stringify({ _id: String(userId), id: String(userId), sub: String(userId), email: "u@test", roles: ["CUSTOMER"] }))
-    .set("x-test-ws", String(WS))
+    .set("x-test-ws", opts.ws ?? String(WS))
     .set("x-test-sbt", opts.sbt === false ? "off" : "on");
 
 const sign = (orderId: string, paymentId: string) =>
@@ -124,7 +136,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const c of ["users", "customerworkspaces", "sbtquotes", "sbtpayments", "sbtssrsnapshots", "sbthotelbookings", "sbtbookings"]) {
+  for (const c of ["users", "customerworkspaces", "sbtquotes", "sbtpayments", "sbtssrsnapshots", "sbthotelbookings", "sbtbookings", "sbtmulticitytraces"]) {
     await col(c).deleteMany({});
   }
   await col("users").insertMany([
@@ -158,6 +170,12 @@ beforeEach(async () => {
   }));
   tbo.ticketLCC.mockImplementation(async () => ({
     Response: { ResponseStatus: 1, TraceId: "T1", Response: { BookingId: 777001, PNR: "ABC123" } },
+  }));
+  tbo.searchFlights.mockImplementation(async () => ({
+    Response: { ResponseStatus: 1, TraceId: "MC-T1", Results: [[{ ResultIndex: "MC-RI-1" }]] },
+  }));
+  tbo.ticketReissue.mockImplementation(async () => ({
+    Response: { ResponseStatus: 1, Response: { PNR: "NEWPNR", BookingId: 888001, Fare: { BaseFare: 9000, Tax: 1000, TotalFare: 10000 } } },
   }));
   rzp.createRazorpayOrder.mockImplementation(async (amountPaise: number) => ({
     id: `order_${++orderSeq}`, amount: amountPaise, currency: "INR",
@@ -415,5 +433,122 @@ describe("hotel bookings/save is scoped to the caller", () => {
     const res = await as(request(app).post("/api/sbt/hotels/book"), BOOKER)
       .send({ BookingCode: "BC-1", bookingMode: "voucher", destinationCountryCode: "IN" });
     expect(res.status).toBe(402);
+  });
+});
+
+describe("multi-city is Travel Desk only", () => {
+  const MC = "For multi-city trips, please contact the Travel Desk";
+
+  async function quoteMultiCity(ws?: string) {
+    const search = await as(request(app).post("/api/sbt/flights/search-multi-city"), BOOKER, { ws })
+      .send({ legs: [{ Origin: "DEL", Destination: "BOM" }, { Origin: "BOM", Destination: "GOI" }] });
+    expect(search.status).toBe(200);
+    const fq = await as(request(app).post("/api/sbt/flights/farequote"), BOOKER, { ws })
+      .send({ TraceId: "MC-T1", ResultIndex: "RI-1" });
+    return fq.body.Response.Results.quoteId as string;
+  }
+
+  it("self-service: no payment order for a multi-city quote, even without the browser's flag", async () => {
+    const q = await quoteMultiCity();
+    const res = await as(request(app).post("/api/sbt/flights/payment/create-order"), BOOKER).send({ quoteIds: [q] });
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("MULTI_CITY_TRAVEL_DESK");
+    expect(res.body.error).toBe(MC);
+    expect(rzp.createRazorpayOrder).not.toHaveBeenCalled();
+  });
+
+  it("self-service: no business-wallet ticket for a multi-city quote, TBO never called", async () => {
+    const q = await quoteMultiCity();
+    const t = await ticket(BOOKER, { paymentMode: "official", quoteIds: [q] });
+    expect(t.status).toBe(403);
+    expect(t.body.error).toBe(MC);
+    expect(tbo.ticketLCC).not.toHaveBeenCalled();
+  });
+
+  it("self-service: a ticket flagged multi-city is refused", async () => {
+    const q = await quoteFlight();
+    const t = await ticket(BOOKER, { paymentMode: "official", quoteIds: [q], isMultiCity: true });
+    expect(t.status).toBe(403);
+    expect(t.body.code).toBe("MULTI_CITY_TRAVEL_DESK");
+    expect(tbo.ticketLCC).not.toHaveBeenCalled();
+  });
+
+  it("the Travel Desk (HOUSE) can still take payment for multi-city", async () => {
+    const q = await quoteMultiCity(HOUSE);
+    const res = await as(request(app).post("/api/sbt/flights/payment/create-order"), BOOKER, { ws: HOUSE }).send({ quoteIds: [q] });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe("reissue: a fare difference goes to the Travel Desk", () => {
+  const FD = "A fare difference applies \u2014 our Travel Desk will contact you";
+  const BOOKING = oid();
+
+  beforeEach(async () => {
+    await col("sbtbookings").insertOne({
+      _id: BOOKING, userId: BOOKER, workspaceId: WS, pnr: "OLDPNR", bookingId: "777001",
+      status: "CONFIRMED", ticketingStatus: "TICKETED", isLCC: true,
+      origin: { code: "DEL", city: "Delhi" }, destination: { code: "BOM", city: "Mumbai" },
+      departureTime: "2026-11-01T06:00:00", arrivalTime: "2026-11-01T08:00:00",
+      airlineCode: "6E", airlineName: "IndiGo", flightNumber: "101",
+      passengers: [{ firstName: "A", lastName: "B", paxType: "adult", isLead: true }],
+      baseFare: 9000, taxes: 1000, extras: 0, totalFare: 10000, paymentMode: "personal",
+    } as any);
+  });
+
+  const reissue = (body: Record<string, unknown>) =>
+    as(request(app).post(`/api/sbt/flights/bookings/${BOOKING}/reissue`), BOOKER)
+      .send({ ResultIndex: "RI-NEW", TraceId: "T1", ...body });
+
+  it("a positive difference is refused for self-service, raises ONE ops request, never calls TBO, even if the browser says 0", async () => {
+    await as(request(app).post("/api/sbt/flights/farequote"), BOOKER).send({ TraceId: "T1", ResultIndex: "RI-NEW" }); // 11999.50
+    const r1 = await reissue({ priceDiff: 0 });
+    expect(r1.status).toBe(409);
+    expect(r1.body.code).toBe("FARE_DIFFERENCE_TRAVEL_DESK");
+    expect(r1.body.error).toBe(FD);
+    expect(tbo.ticketReissue).not.toHaveBeenCalled();
+    const r2 = await reissue({ priceDiff: 0 });
+    expect(r2.status).toBe(409);
+    const doc: any = await col("sbtbookings").findOne({ _id: BOOKING });
+    const reqs = (doc.changeRequests || []).filter((c: any) => c.requestType === "reissue-fare-difference");
+    expect(reqs).toHaveLength(1);
+    expect(reqs[0].status).toBe("submitted");
+    expect(reqs[0].remarks).toContain("2000");
+    expect(mail.sendMail).toHaveBeenCalledTimes(1);
+    expect(doc.status).toBe("CONFIRMED");
+  });
+
+  it("self-service cannot open a payment for a fare difference", async () => {
+    const r = await as(request(app).post(`/api/sbt/flights/bookings/${BOOKING}/reissue-order`), BOOKER).send({ priceDiff: 2000 });
+    expect(r.status).toBe(409);
+    expect(r.body.error).toBe(FD);
+    expect(rzp.createRazorpayOrder).not.toHaveBeenCalled();
+  });
+
+  it("a zero difference stays self-service", async () => {
+    tbo.getFareQuote.mockImplementationOnce(async (body: any) => ({
+      Response: { ResponseStatus: 1, TraceId: body.TraceId, Results: { ResultIndex: body.ResultIndex, Fare: { PublishedFare: 10000, OfferedFare: 9600 } } },
+    }));
+    await as(request(app).post("/api/sbt/flights/farequote"), BOOKER).send({ TraceId: "T1", ResultIndex: "RI-NEW" });
+    const r = await reissue({ priceDiff: 0 });
+    expect(r.status).toBe(200);
+    expect(tbo.ticketReissue).toHaveBeenCalledTimes(1);
+    expect(mail.sendMail).not.toHaveBeenCalled();
+  });
+
+  it("supplier reissue charges count toward the difference", async () => {
+    tbo.getFareQuote.mockImplementationOnce(async (body: any) => ({
+      Response: { ResponseStatus: 1, TraceId: body.TraceId, Results: { ResultIndex: body.ResultIndex, Fare: { PublishedFare: 10000, OfferedFare: 9600, SupplierReissueCharges: 1500 } } },
+    }));
+    await as(request(app).post("/api/sbt/flights/farequote"), BOOKER).send({ TraceId: "T1", ResultIndex: "RI-NEW" });
+    const r = await reissue({ priceDiff: 0 });
+    expect(r.status).toBe(409);
+    expect(tbo.ticketReissue).not.toHaveBeenCalled();
+  });
+
+  it("a reissue onto a flight the caller never quoted is refused", async () => {
+    const r = await reissue({ priceDiff: 0, ResultIndex: "RI-UNQUOTED" });
+    expect(r.status).toBe(410);
+    expect(tbo.ticketReissue).not.toHaveBeenCalled();
   });
 });

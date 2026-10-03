@@ -58,6 +58,11 @@ import {
   paymentFactsForSave,
   reserveOfficial,
   isRefusal,
+  isTravelDeskCaller,
+  rememberMultiCityTraces,
+  isMultiCityTrace,
+  reissueFareDifference,
+  FARE_DIFFERENCE_MESSAGE,
 } from "../services/sbtPaymentGate.js";
 
 const router = express.Router();
@@ -485,6 +490,10 @@ router.post("/search-multi-city", requireSBT, requireFlightAccess, async (req: a
       }
     }
 
+    // Multi-city is Travel Desk only for self-service: remember these traces so
+    // a booking on them is recognised without trusting the browser.
+    await rememberMultiCityTraces(legResults.map((r) => r.traceId));
+
     res.json({ legs: legResults });
   } catch (err: any) {
     sbtLogger.error("Multi-city parallel search failed", { userId: req.user?.id, error: err.message });
@@ -802,6 +811,9 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
       const fqSourceRef = `${req.body?.TraceId ?? ""}:${req.body?.ResultIndex ?? ""}`;
       try {
         const fqScope = callerScope(req);
+        const fqIsMultiCity =
+          req.body?.isMultiCity === true || (await isMultiCityTrace([req.body?.TraceId]));
+        if (fqIsMultiCity) await rememberMultiCityTraces([result?.Response?.TraceId]);
         await SBTQuote.create({
           quoteId: fqQuoteId,
           product: "FLIGHT",
@@ -814,6 +826,9 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
           resultIndexes: [req.body?.ResultIndex, fareResults?.ResultIndex].filter(Boolean).map(String),
           // What the customer is charged for this leg (margined PublishedFare).
           sellingFare: Number(fqQuoteFare.PublishedFare) || 0,
+          isMultiCity: fqIsMultiCity,
+          supplierReissueCharges:
+            Number(fqQuoteFare.SupplierReissueCharges || fareResults?.FareBreakdown?.[0]?.SupplierReissueCharges) || 0,
         });
         // Carried to the payment page inside the Results the frontend keeps.
         fareResults.quoteId = fqQuoteId;
@@ -2739,6 +2754,67 @@ router.post("/bookings/:id/manual-reissue", requireSBT, async (req: any, res: an
   }
 });
 
+/**
+ * A self-service reissue with a fare difference becomes a Travel Desk request:
+ * a "reissue-fare-difference" entry on the booking's changeRequests (the Booking
+ * Register shows these) + an email to ops. TBO is NOT called. One open request
+ * per booking — a repeat attempt neither duplicates it nor re-emails.
+ */
+async function raiseReissueTravelDeskRequest(
+  req: any,
+  doc: any,
+  info: { resultIndex: string; diff: number; newFare: number; reissueCharges: number; newFlightInfo?: any },
+) {
+  const open = (doc.changeRequests || []).some(
+    (c: any) => c?.requestType === "reissue-fare-difference" && c?.status === "submitted",
+  );
+  if (open) return;
+  const nf = info.newFlightInfo && typeof info.newFlightInfo === "object" ? info.newFlightInfo : {};
+  const newFlight = [nf.airline, nf.flightNo].filter(Boolean).map(String).join(" ").slice(0, 40);
+  const newDeparture = typeof nf.departure === "string" ? nf.departure.slice(0, 40) : "";
+  const remarks =
+    `Self-service reschedule stopped: fare difference ₹${info.diff} ` +
+    `(new fare ₹${Math.ceil(info.newFare)}, reissue charges ₹${info.reissueCharges}). ` +
+    `${newFlight ? `Requested flight ${newFlight}. ` : ""}Travel Desk to contact the customer.`;
+  await SBTBooking.updateOne(
+    { _id: doc._id },
+    { $push: { changeRequests: {
+      requestType: "reissue-fare-difference",
+      requestedNewDate: newDeparture,
+      remarks,
+      status: "submitted",
+      raisedAt: new Date(),
+      raisedBy: req.user?._id ?? req.user?.id,
+    } } },
+  );
+  try {
+    const settings = await getCompanySettings();
+    await sendMail({
+      to: settings.opsEmail,
+      cc: settings.accountManagerEmail ? [settings.accountManagerEmail] : [],
+      from: settings.supportEmail,
+      subject: `Reschedule needs Travel Desk — fare difference ₹${info.diff} — PNR: ${doc.pnr}`,
+      html: `
+        <h2 style="color:#00477f">Reschedule request — fare difference</h2>
+        <p>A customer tried to reschedule online; the new fare costs more, so it was stopped for the Travel Desk.</p>
+        <table style="border-collapse:collapse;width:100%;max-width:560px">
+          ${eRow("PNR", escapeHtml(doc.pnr || "N/A"))}
+          ${eRow("Route", escapeHtml(`${doc.origin?.code || "?"} → ${doc.destination?.code || "?"}`))}
+          ${eRow("Original departure", escapeHtml(String(doc.departureTime || "N/A")))}
+          ${eRow("Requested flight", escapeHtml(newFlight || "—"))}
+          ${eRow("Requested departure", escapeHtml(newDeparture || "—"))}
+          ${eRow("Fare difference", escapeHtml(`₹${info.diff}`))}
+          ${eRow("Requested by", escapeHtml(req.user?.email || "—"))}
+          ${eRow("Booking", escapeHtml(String(doc._id)))}
+        </table>
+        <p style="margin-top:16px;color:#64748b;font-size:13px">Please contact the customer to collect the difference and reschedule.</p>
+      `,
+    });
+  } catch (emailErr: any) {
+    sbtLogger.error("Reissue Travel Desk email failed", { bookingId: doc._id, error: emailErr?.message });
+  }
+}
+
 // POST /api/sbt/flights/bookings/:id/reissue-farequote — farequote for a reissue result
 router.post("/bookings/:id/reissue-farequote", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
@@ -2813,6 +2889,12 @@ router.post("/bookings/:id/reissue-order", requireAuth, requireSBT, requireFligh
     const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
+    // Paying a fare difference online is Travel Desk only; self-service reissues
+    // with a difference are raised to ops from /reissue.
+    if (!isTravelDeskCaller(req)) {
+      return res.status(409).json({ error: FARE_DIFFERENCE_MESSAGE, code: "FARE_DIFFERENCE_TRAVEL_DESK" });
+    }
+
     const { priceDiff } = req.body;
     if (!priceDiff || Number(priceDiff) <= 0) {
       return res.status(400).json({ error: "Invalid price difference — must be positive" });
@@ -2851,7 +2933,7 @@ router.post("/bookings/:id/reissue-order", requireAuth, requireSBT, requireFligh
 });
 
 // POST /api/sbt/flights/bookings/:id/reissue — execute reissue (TicketReissue)
-router.post("/bookings/:id/reissue", requireAuth, requireSBT, async (req: any, res: any) => {
+router.post("/bookings/:id/reissue", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "flight-reissue")) return;
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
@@ -2920,7 +3002,22 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, async (req: any, r
       return res.status(400).json({ error: "No passenger data found for this booking" });
     }
 
-    const numericPriceDiff = Number(priceDiff ?? 0);
+    // The fare difference is the server's (caller's FareQuote of the new flight),
+    // never the browser's priceDiff. Self-service reissues that cost more go to the
+    // Travel Desk; zero / negative differences stay self-service.
+    const fareDiff = await reissueFareDifference(req, doc, ResultIndex);
+    if (isRefusal(fareDiff)) return res.status(fareDiff.status).json({ error: fareDiff.error, code: fareDiff.code });
+    if (fareDiff.diff > 0 && !isTravelDeskCaller(req)) {
+      await raiseReissueTravelDeskRequest(req, doc, {
+        resultIndex: String(ResultIndex), diff: fareDiff.diff, newFare: fareDiff.newFare,
+        reissueCharges: fareDiff.reissueCharges, newFlightInfo: req.body?.newFlightInfo,
+      });
+      return res.status(409).json({
+        error: FARE_DIFFERENCE_MESSAGE, code: "FARE_DIFFERENCE_TRAVEL_DESK", requestRaised: true,
+      });
+    }
+    void priceDiff;
+    const numericPriceDiff = Math.max(0, fareDiff.diff);
 
     // ── Payment handling for reissue ──────────────────────────────────
     if (numericPriceDiff > 0 && paymentMode) {

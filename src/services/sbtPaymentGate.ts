@@ -20,7 +20,9 @@ import SBTSsrSnapshot, { type SsrPriceItem } from "../models/SBTSsrSnapshot.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
+import SBTMultiCityTrace from "../models/SBTMultiCityTrace.js";
 import { requireFeature } from "../middleware/requireFeature.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { sbtLogger } from "../utils/logger.js";
 import {
   razorpayConfigured,
@@ -56,6 +58,48 @@ export function callerScope(req: Request | AnyObj): { workspaceId: string; userI
 const monthKeyNow = () => new Date().toISOString().slice(0, 7); // same key the wallet routes use
 
 /* ───────────────────────── guards ───────────────────────── */
+
+const HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254"; // Plumtrips HOUSE (same literal as requireHouse)
+
+/** Plumtrips Travel Desk: SUPERADMIN, or anyone working in the HOUSE workspace.
+ *  Everyone else is self-service. */
+export function isTravelDeskCaller(req: Request | AnyObj): boolean {
+  if (isSuperAdmin(req as Request)) return true;
+  const r = req as AnyObj;
+  return String(r.workspaceId || r.workspace?._id || "") === HOUSE_WORKSPACE_ID;
+}
+
+export const MULTI_CITY_MESSAGE = "For multi-city trips, please contact the Travel Desk";
+export const FARE_DIFFERENCE_MESSAGE = "A fare difference applies — our Travel Desk will contact you";
+
+/** Remember the TraceIds of a multi-city search (best effort). */
+export async function rememberMultiCityTraces(traceIds: unknown[]) {
+  const ids = [...new Set(traceIds.filter(Boolean).map(String))];
+  if (!ids.length) return;
+  try {
+    await SBTMultiCityTrace.insertMany(ids.map((traceId) => ({ traceId })), { ordered: false });
+  } catch (err: any) {
+    sbtLogger.warn("[sbt-pay] multi-city traces not stored", { err: err?.message });
+  }
+}
+
+export async function isMultiCityTrace(traceIds: unknown[]): Promise<boolean> {
+  const ids = traceIds.filter(Boolean).map(String);
+  if (!ids.length) return false;
+  return !!(await SBTMultiCityTrace.exists({ traceId: { $in: ids } }));
+}
+
+/** Self-service may not book or pay for a multi-city trip. Recognised by the
+ *  quote (stamped at FareQuote), the TraceId, or the request's own flag. */
+export async function multiCityRefusal(req: Request | AnyObj, quoteIsMultiCity = false): Promise<Refusal | null> {
+  if (isTravelDeskCaller(req)) return null;
+  const b = ((req as AnyObj).body || {}) as AnyObj;
+  if (quoteIsMultiCity || b.isMultiCity === true || b.tripType === "multi-city"
+    || await isMultiCityTrace([b.TraceId, b.returnTraceId])) {
+    return refuse(403, "MULTI_CITY_TRAVEL_DESK", MULTI_CITY_MESSAGE);
+  }
+  return null;
+}
 
 function isPrivilegedSBTUser(req: AnyObj): boolean {
   const roles = (req.user?.roles || []).map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""));
@@ -200,6 +244,7 @@ const FARE_EXPIRED = refuse(410, "FARE_EXPIRED", "Fare expired, please search ag
 
 export interface FlightPrice {
   ok: true; amount: number; base: number; addOn: number; quoteIds: string[]; resultIndexes: string[];
+  isMultiCity: boolean;
 }
 
 /** ceil(Σ margined PublishedFare of the quoted legs) + add-ons. */
@@ -211,18 +256,20 @@ export async function priceFlight(
   const ids = Array.isArray(quoteIds) ? quoteIds.filter((q) => typeof q === "string" && q) as string[] : [];
   if (ids.length === 0) return FARE_EXPIRED;
   let fare = 0;
+  let isMultiCity = false;
   const resultIndexes = new Set<string>();
   for (const id of ids) {
     const q = await loadScopedQuote(scope, id, "FLIGHT");
     if (!q || !(Number(q.sellingFare) > 0)) return FARE_EXPIRED;
     fare += Number(q.sellingFare);
+    if (q.isMultiCity === true) isMultiCity = true;
     for (const ri of (q.resultIndexes || []) as string[]) if (ri) resultIndexes.add(String(ri));
   }
   const base = Math.ceil(fare);
   const ris = [...resultIndexes];
   const add = await priceAddOns(scope, ris, passengerLists);
   if (isRefusal(add)) return add;
-  return { ok: true, amount: base + add.amount, base, addOn: add.amount, quoteIds: ids, resultIndexes: ris };
+  return { ok: true, amount: base + add.amount, base, addOn: add.amount, quoteIds: ids, resultIndexes: ris, isMultiCity };
 }
 
 export async function priceHotelQuote(
@@ -355,6 +402,8 @@ export function createOrderHandler(product: Product) {
       if (product === "FLIGHT") {
         const p = await priceFlight(scope, b.quoteIds, [b.Passengers, b.returnPassengers]);
         if (isRefusal(p)) return send(res, p);
+        const mc = await multiCityRefusal(req, p.isMultiCity);
+        if (mc) return send(res, mc);
         return await persistOrder(res, {
           product, ...scope, quoteIds: p.quoteIds, resultIndexes: p.resultIndexes,
           amount: p.amount, baseAmount: p.base, addOnAmount: p.addOn,
@@ -562,9 +611,13 @@ export function paymentGate(kind: GateKind) {
       } else if (kind === "flight-ticket-lcc" || kind === "flight-book") {
         const ris = ticketedResultIndexes(b);
         const lists = [b.Passengers, b.returnPassengers];
+        const mc = await multiCityRefusal(req);
+        if (mc) return send(res, mc);
         if (b.paymentMode === "official") {
           const p = await priceFlight(scope, b.quoteIds, lists);
           if (isRefusal(p)) return send(res, p);
+          const mcQuote = await multiCityRefusal(req, p.isMultiCity);
+          if (mcQuote) return send(res, mcQuote);
           if (!ris.length || ris.some((ri) => !p.resultIndexes.includes(ri))) return send(res, FARE_EXPIRED);
           claim = await claimOfficial(req, scope, {
             product: "FLIGHT", quoteIds: p.quoteIds, resultIndexes: p.resultIndexes,
@@ -656,6 +709,33 @@ export function paymentGate(kind: GateKind) {
       return res.status(500).json({ error: "Payment check failed" });
     }
   };
+}
+
+/* ───────────────────────── reissue ───────────────────────── */
+
+/**
+ * The fare difference of reissuing `booking` onto the quoted ResultIndex, from
+ * the caller's own FareQuote of the new flight — never the browser's priceDiff:
+ *   ceil(new selling fare + supplier reissue charges) − ceil(fare paid, excl. add-ons)
+ * Positive = the customer owes more.
+ */
+export async function reissueFareDifference(
+  req: Request | AnyObj,
+  booking: AnyObj,
+  resultIndex: unknown,
+): Promise<{ ok: true; diff: number; newFare: number; reissueCharges: number } | Refusal> {
+  const scope = callerScope(req);
+  const ri = String(resultIndex ?? "");
+  if (!ri) return FARE_EXPIRED;
+  const q = (await SBTQuote.findOne({
+    product: "FLIGHT", userId: scope.userId, workspaceId: scope.workspaceId, resultIndexes: ri,
+  }).sort({ createdAt: -1 }).lean()) as AnyObj | null;
+  const age = q ? Date.now() - new Date(q.createdAt).getTime() : -1;
+  if (!q || !(age >= 0 && age <= QUOTE_TTL_MS) || !(Number(q.sellingFare) > 0)) return FARE_EXPIRED;
+  const reissueCharges = Number(q.supplierReissueCharges) || 0;
+  const newFare = Number(q.sellingFare);
+  const paidFare = (Number(booking.totalFare) || 0) - (Number(booking.extras) || 0);
+  return { ok: true, diff: Math.ceil(newFare + reissueCharges) - Math.ceil(paidFare), newFare, reissueCharges };
 }
 
 /* ───────────────────────── booking save ───────────────────────── */

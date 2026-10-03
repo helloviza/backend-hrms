@@ -54,6 +54,8 @@ vi.mock("../utils/margin.js", async () => {
   };
 });
 vi.mock("../models/SBTQuote.js", () => ({ default: { create: async () => ({}) } }));
+// farequote also checks whether its TraceId came from a multi-city search.
+vi.mock("../models/SBTMultiCityTrace.js", () => ({ default: { exists: async () => null, insertMany: async () => [] } }));
 vi.mock("../utils/tboFileLogger.js", () => ({
   logTBOCall: () => {},
   listTBOLogs: () => [],

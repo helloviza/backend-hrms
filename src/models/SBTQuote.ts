@@ -25,6 +25,10 @@ export interface ISBTQuote extends Document {
   // FLIGHT — margined PublishedFare: what the customer is charged for the fare
   // (services/sbtPaymentGate.ts ceils the sum across legs).
   sellingFare?: number;
+  // FLIGHT — quoted from a multi-city search (self-service may not book these).
+  isMultiCity?: boolean;
+  // FLIGHT — TBO's SupplierReissueCharges on this quote (reissue fare difference).
+  supplierReissueCharges?: number;
   createdAt: Date;
 }
 
@@ -39,6 +43,8 @@ const SBTQuoteSchema = new Schema<ISBTQuote>({
   traceIds: { type: [String], default: undefined },
   resultIndexes: { type: [String], default: undefined },
   sellingFare: { type: Number },
+  isMultiCity: { type: Boolean },
+  supplierReissueCharges: { type: Number },
   // TTL: rows self-expire 60 min after creation. This exceeds the
   // quote→pay→book window with margin; tunable if that window ever grows.
   createdAt: { type: Date, default: Date.now, expires: 3600 },
