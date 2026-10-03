@@ -585,3 +585,54 @@ describe("one-way flights never store or email a return date (REQ-563ECF)", () =
     expect((await reqDoc(r2.body.request._id)).cartItems[0].meta.returnDate).toBe("2026-10-15");
   });
 });
+
+describe("Plumtrips staff (HOUSE login) work a customer's proposal", () => {
+  // Prod shape: the staff token carries the HOUSE workspace, not the customer's.
+  // (The other tests here run ops inside the customer's workspace, which is
+  // why the HOUSE-scoped lookups looked fine until prod.)
+  const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
+  const OTHER_WS = oid();
+  const HOUSE_ADMIN: Who = { email: "desk@plumtrips.test", roles: ["ADMIN"] };
+  const OUTSIDER: Who = { email: "someone@other.test" };
+  const asIn = (r: request.Test, who: Who, ws: any) =>
+    r
+      .set("x-test-user", JSON.stringify({ sub: String(oid()), email: who.email, name: who.email.split("@")[0], roles: who.roles || ["EMPLOYEE"] }))
+      .set("x-test-ws", String(ws));
+
+  beforeEach(async () => {
+    await col("customerworkspaces").insertMany([
+      { _id: HOUSE, customerId: "PLUMTRIPS-HOUSE", name: "Plumtrips", status: "ACTIVE", config: { features: {} } },
+      { _id: OTHER_WS, customerId: "O1", name: "Other Co", status: "ACTIVE", tenantType: "CORPORATE", config: { travelFlow: "APPROVAL_FLOW", features: { approvalFlowEnabled: true } } },
+    ] as any[]);
+  });
+
+  it("creates, edits, submits, views and records a decision; a customer from another workspace still gets 404", async () => {
+    const rid = await approvedRequest();
+
+    const d = await asIn(request(app).post(`/api/proposals/by-request/${rid}/draft`), HOUSE_ADMIN, HOUSE).send({});
+    expect([d.status, d.body.created]).toEqual([200, true]);
+    const pid = String(d.body.proposal._id);
+    expect(String((await propDoc(pid)).workspaceId)).toBe(String(WS)); // stored on the customer's workspace
+
+    expect((await asIn(request(app).put(`/api/proposals/${pid}`), HOUSE_ADMIN, HOUSE).send({ options: [option] })).status).toBe(200);
+    expect((await asIn(request(app).post(`/api/proposals/${pid}/submit`), HOUSE_ADMIN, HOUSE).send({})).status).toBe(200);
+
+    const queue = await asIn(request(app).get("/api/proposals/queue"), HOUSE_ADMIN, HOUSE);
+    expect(queue.body.items.map((p: any) => String(p._id))).toContain(pid);
+    expect((await asIn(request(app).get(`/api/proposals/by-request/${rid}`), HOUSE_ADMIN, HOUSE)).body.proposal?._id).toBe(pid);
+    expect((await asIn(request(app).get(`/api/proposals/${pid}`), HOUSE_ADMIN, HOUSE)).status).toBe(200);
+
+    const rec = await asIn(request(app).post(`/api/proposals/${pid}/record-decision`), HOUSE_ADMIN, HOUSE)
+      .send({ decision: "APPROVED", note: "Lata approved on the phone" });
+    expect(rec.status).toBe(200);
+    expect((await propDoc(pid)).status).toBe("APPROVED");
+
+    const start = await asIn(request(app).post(`/api/proposals/${pid}/booking/start`), HOUSE_ADMIN, HOUSE).send({});
+    expect(start.status).toBe(200);
+
+    // The customer's own approver sees it; someone from another workspace does not.
+    expect((await as(request(app).get(`/api/proposals/${pid}`), A)).status).toBe(200);
+    expect((await asIn(request(app).get(`/api/proposals/${pid}`), OUTSIDER, OTHER_WS)).status).toBe(404);
+    expect((await asIn(request(app).post(`/api/proposals/${pid}/decide`), OUTSIDER, OTHER_WS).send({ decision: "DECLINED", reason: "x" })).status).toBe(404);
+  });
+});

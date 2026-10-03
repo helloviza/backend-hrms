@@ -9,7 +9,6 @@ import path from "path";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
-import { scopedFindById } from "../middleware/scopedFindById.js";
 import Proposal from "../models/Proposal.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import User from "../models/User.js";
@@ -607,6 +606,20 @@ const requireAnyAuth: RequestHandler = (req: Request, res: Response, next: NextF
   return requireAuth(req as any, res as any, next as any);
 };
 
+/**
+ * Plumtrips staff work every tenant's proposals from the ops queue, but their
+ * token carries the HOUSE workspace — scoping their lookups to it 404'd every
+ * customer proposal (same fix as approvals.ts requestFilterFor). Staff look up
+ * by id; anyone else stays inside their own workspace.
+ */
+function staffWorkspaceScope(req: Request): any {
+  return isStaffAdmin((req as AuthedReq).user) ? undefined : (req as any).workspaceObjectId;
+}
+function byIdFor(req: Request, id: any) {
+  const ws = staffWorkspaceScope(req);
+  return ws ? { _id: id, workspaceId: ws } : { _id: id };
+}
+
 const requireStaff: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
   const u = (req as AuthedReq).user;
 
@@ -957,7 +970,7 @@ router.get("/queue", requireAnyAuth, requireWorkspace, requireStaff, async (req:
     const l0 = normStr(req.query?.l0 || "").toUpperCase();
     const bookingStatus = normStr(req.query?.bookingStatus || "").toUpperCase();
 
-    const q: AnyObj = { workspaceId: (req as any).workspaceObjectId };
+    const q: AnyObj = staffWorkspaceScope(req) ? { workspaceId: staffWorkspaceScope(req) } : {};
     if (["DRAFT", "SUBMITTED", "APPROVED", "DECLINED", "CHANGES_REQUESTED", "EXPIRED"].includes(status)) q.status = status;
     if (["PENDING", "APPROVED", "DECLINED"].includes(l2)) q["approvals.l2.decision"] = l2;
     if (["PENDING", "APPROVED", "DECLINED"].includes(l0)) q["approvals.l0.decision"] = l0;
@@ -1003,7 +1016,7 @@ router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, re
     if (!mongoose.Types.ObjectId.isValid(requestId)) return res.status(400).json({ error: "Invalid requestId" });
     const rid = new mongoose.Types.ObjectId(requestId);
 
-    const ar: any = await ApprovalRequest.findOne({ _id: rid, workspaceId: (req as any).workspaceObjectId }).lean();
+    const ar: any = await ApprovalRequest.findOne(byIdFor(req, rid)).lean();
     if (!ar) return res.status(404).json({ error: "ApprovalRequest not found" });
 
     const arTravelFlow = String(ar?.meta?.travelFlow || ar?.travelFlow || "").toUpperCase();
@@ -1101,7 +1114,7 @@ router.put("/:id", requireAnyAuth, requireWorkspace, requireStaff, async (req: R
     const id = String(req.params.id || "");
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
 
-    const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+    const doc: any = await Proposal.findOne(byIdFor(req, id));
     if (!doc) return res.status(404).json({ error: "Proposal not found" });
 
     if (String(doc.status || "") !== "DRAFT") {
@@ -1137,7 +1150,7 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
     const id = String(req.params.id || "");
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
 
-    const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+    const doc: any = await Proposal.findOne(byIdFor(req, id));
     if (!doc) return res.status(404).json({ error: "Proposal not found" });
 
     if (String(doc.status || "") !== "DRAFT") return res.status(400).json({ error: "Only DRAFT proposals can be submitted" });
@@ -1147,7 +1160,7 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
 
     // Resolve L2 from ApprovalRequest
     let ar: any = null;
-    if (doc.requestId) ar = await ApprovalRequest.findOne({ _id: doc.requestId, workspaceId: (req as any).workspaceObjectId }).lean();
+    if (doc.requestId) ar = await ApprovalRequest.findOne(byIdFor(req, doc.requestId)).lean();
     if (!ar) return res.status(400).json({ error: "ApprovalRequest not found for proposal" });
 
     // Either the request's approver or any Workspace Leader decides — whoever
@@ -1286,7 +1299,7 @@ router.post(
       const files = extractUploadedFiles(req);
       if (!files.length) return res.status(400).json({ error: "At least one PDF file is required" });
 
-      const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+      const doc: any = await Proposal.findOne(byIdFor(req, id));
       if (!doc) return res.status(404).json({ error: "Proposal not found" });
 
       const st = String(doc.status || "").toUpperCase();
@@ -1348,7 +1361,7 @@ router.post(
       const files = extractUploadedFiles(req);
       if (!files.length) return res.status(400).json({ error: "File is required" });
 
-      const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+      const doc: any = await Proposal.findOne(byIdFor(req, id));
       if (!doc) return res.status(404).json({ error: "Proposal not found" });
 
       const st = String(doc.status || "").toUpperCase();
@@ -1409,7 +1422,7 @@ router.post(
       const file = (req as any).file as { filename: string; originalname: string } | undefined;
       if (!file) return res.status(400).json({ error: "File is required" });
 
-      const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+      const doc: any = await Proposal.findOne(byIdFor(req, id));
       if (!doc) return res.status(404).json({ error: "Proposal not found" });
 
       if (String(doc.status || "") !== "APPROVED") {
@@ -1456,7 +1469,7 @@ router.post(
       const id = String(req.params.id || "");
       if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
 
-      const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+      const doc: any = await Proposal.findOne(byIdFor(req, id));
       if (!doc) return res.status(404).json({ error: "Proposal not found" });
 
       if (String(doc.status || "") !== "APPROVED") {
@@ -1509,7 +1522,7 @@ router.post(
       const id = String(req.params.id || "");
       if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
 
-      const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+      const doc: any = await Proposal.findOne(byIdFor(req, id));
       if (!doc) return res.status(404).json({ error: "Proposal not found" });
 
       if (String(doc.status || "") !== "APPROVED") {
@@ -1561,7 +1574,7 @@ router.post(
       const id = String(req.params.id || "");
       if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
 
-      const doc: any = await scopedFindById(Proposal, id, (req as any).workspaceObjectId);
+      const doc: any = await Proposal.findOne(byIdFor(req, id));
       if (!doc) return res.status(404).json({ error: "Proposal not found" });
 
       let ar: any = null;
@@ -1629,7 +1642,7 @@ router.post("/:id/record-decision", requireAnyAuth, requireWorkspace, requireSta
     try {
       const { proposal } = await applyProposalDecision({
         proposalId: id,
-        workspaceId: (req as any).workspaceObjectId,
+        workspaceId: staffWorkspaceScope(req),
         actor: {
           email: normEmail(aReq.user?.email),
           name: normStr(aReq.user?.name || aReq.user?.firstName || "") || normEmail(aReq.user?.email),
@@ -1710,7 +1723,7 @@ router.get("/:id", requireAnyAuth, requireWorkspace, requireProposalViewer, asyn
     const id = String(req.params.id || "");
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid proposal id" });
 
-    const p = await Proposal.findOne({ _id: id, workspaceId: (req as any).workspaceObjectId }).lean();
+    const p = await Proposal.findOne(byIdFor(req, id)).lean();
     if (!p) return res.status(404).json({ error: "Proposal not found" });
 
     const aReq = req as AuthedReq;
