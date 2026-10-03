@@ -82,11 +82,11 @@ export function invokeHandler(name: FulfilHandlerName, req: AnyObj): Promise<{ s
 
 const send = (res: Response, r: Refusal) => res.status(r.status).json({ error: r.error, code: r.code });
 
-/** The booker as the route handlers expect req.user — JSON-safe copy. */
+/** The booker as the route handlers expect req.user — JSON-safe copy. Keeps
+ *  isDemoUser: a Demo Platform booking must reach the simulator inside each
+ *  handler (maybeRouteToDemoSimulator), never TBO. */
 function actorOf(req: AnyObj): AnyObj {
-  const u = JSON.parse(JSON.stringify(req.user || {}));
-  delete u.isDemoUser;
-  return u;
+  return JSON.parse(JSON.stringify(req.user || {}));
 }
 
 async function fakeRequest(row: AnyObj, body: AnyObj, extra: AnyObj = {}): Promise<AnyObj> {
@@ -579,6 +579,12 @@ export function createCheckoutHandler(product: "FLIGHT" | "HOTEL") {
       row.actor = actorOf(req);
       row.amountPaise = Math.round(row.amount * 100);
 
+      if (mode === "official" && (req as AnyObj).user?.isDemoUser === true) {
+        // Demo Platform: the simulator inside each handler deducts the demo wallet.
+        const _id = new mongoose.Types.ObjectId();
+        await SBTPayment.create({ ...row, _id, mode: "OFFICIAL", status: "PAID", paidAt: new Date(), isDemo: true });
+        return res.json(await fulfilCheckout(_id, "browser"));
+      }
       if (mode === "official") {
         const _id = new mongoose.Types.ObjectId();
         const reserved = await reserveOfficial(req, row.amount, {

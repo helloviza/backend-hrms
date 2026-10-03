@@ -362,6 +362,20 @@ describe("business wallet — atomic, ledgered, credited back", () => {
   });
 });
 
+describe("Demo Platform", () => {
+  it("a demo user's checkout never reaches TBO and never moves the wallet counter", async () => {
+    const q = await quote();
+    const r = await request(app).post("/api/sbt/flights/checkout")
+      .set("x-test-user", JSON.stringify({ _id: String(BOOKER), id: String(BOOKER), sub: String(BOOKER), email: "d@test", roles: ["CUSTOMER"], isDemoUser: true }))
+      .set("x-test-ws", String(WS))
+      .send({ kind: "FLIGHT_LCC", mode: "official", quoteIds: [q], request: { TraceId: "T1", ResultIndex: "RI-1", Passengers: pax() }, save: saveInfo });
+    expect(r.status).toBe(200);
+    expect(tbo.ticketLCC).not.toHaveBeenCalled();
+    expect(await spend()).toBe(0);
+    expect(await col("sbtwalletledgers").countDocuments({})).toBe(0);
+  });
+});
+
 describe("multi-city — every leg quoted, priced, ticketed", () => {
   const mc = async (q1: string, q2: string) => as(request(app).post("/api/sbt/flights/checkout"), BOOKER).send({
     kind: "FLIGHT_MULTI", mode: "official", quoteIds: [q1, q2],

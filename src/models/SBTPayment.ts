@@ -85,6 +85,9 @@ export interface ISBTPayment extends Document {
   fulfilledVia?: "browser" | "webhook" | "retry";
   lastPaymentFailure?: string;
   opsAlertedAt?: Date;
+  // Demo Platform checkout: the simulator moves the demo wallet itself, so the
+  // server never reserves or credits the limit for these rows.
+  isDemo?: boolean;
   isTest: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -132,6 +135,7 @@ const SBTPaymentSchema = new Schema<ISBTPayment>(
     fulfilledVia: { type: String },
     lastPaymentFailure: { type: String },
     opsAlertedAt: { type: Date },
+    isDemo: { type: Boolean, default: false },
     isTest: { type: Boolean, default: false, index: true },
   },
   { timestamps: true },

@@ -475,7 +475,8 @@ export async function refundPaymentRow(
   if (!reserved) return { ok: true, refundedPaise: 0 }; // already refunded (or more than was paid)
   try {
     if (row.mode === "OFFICIAL") {
-      await creditOfficial(row.workspaceId, amt / 100, row.monthKey, {
+      // Demo rows never reserved the limit (the simulator moves the demo wallet).
+      if (row.isDemo !== true) await creditOfficial(row.workspaceId, amt / 100, row.monthKey, {
         key: `credit:${row._id}:${reason}:${amt}`, reason, paymentId: String(row._id), product: row.product,
       });
       await SBTPayment.updateOne({ _id: row._id }, { $push: { refunds: {
