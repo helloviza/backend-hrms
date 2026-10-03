@@ -211,10 +211,34 @@ describe("manual assign / reassign / unassign", () => {
     expect(acts).toEqual(expect.arrayContaining([
       ["admin_assigned", expect.stringContaining(`Assigned to Asha <${ASHA.email}>`)],
       ["admin_reassigned", expect.stringContaining("(was Asha)")],
-      ["admin_unassigned", "Unassigned from Ben"],
+      ["admin_unassigned", "Unassigned from Ben — Note: back to pool"],
     ]));
-    // Today's customer-visible row keeps only the actor and the note.
-    expect(doc.history.find((h: any) => h.action === "admin_assigned").comment).toBe("Corporate fare");
+    // The note is staff-only: in staffNote, never in the comment customers can read.
+    const assignedRow = doc.history.find((h: any) => h.action === "admin_assigned");
+    expect(assignedRow.comment).toBeUndefined();
+    expect(assignedRow.staffNote).toContain("Note: Corporate fare");
+  });
+
+  it("customers see only a bare \"Assigned\" row — no agent, no assigner, no note (old rows too)", async () => {
+    await setDesk({ mode: "off", agents: [{ userId: ASHA.sub }] });
+    const id = await approvedRequest();
+    await asStaff(request(app).put(`/api/approvals/admin/${id}/assign`)).send({ agentUserId: ASHA.sub, comment: "VIP — call before booking" });
+    // An older row written before this change: note in the comment, staff name/email on it.
+    await col("approvalrequests").updateOne(
+      { _id: new mongoose.Types.ObjectId(id) },
+      { $push: { history: { action: "admin_assigned", at: new Date(), by: BEN.sub, comment: "Legacy note", userName: "Ben", userEmail: BEN.email } } } as any,
+    );
+    for (const who of [REQUESTER, APPROVER_USER, LEADER]) {
+      const got = await as(request(app).get(`/api/approvals/requests/${id}`), who, WS);
+      const rows = got.body.request.history.filter((h: any) => h.action === "admin_assigned");
+      expect(rows).toHaveLength(2);
+      for (const r of rows) expect(Object.keys(r).sort()).toEqual(["action", "at"]);
+      const body = JSON.stringify(got.body);
+      // (The traveller is "Asha Guest", so the agent is checked by email and id.)
+      for (const leak of ["VIP", "Legacy note", "\"Ben\"", BEN.email, ASHA.email, ASHA.sub, BEN.sub]) expect(body, leak).not.toContain(leak);
+    }
+    const staff = await asStaff(request(app).get(`/api/approvals/admin/requests/${id}`));
+    expect(JSON.stringify(staff.body)).toContain("Note: VIP — call before booking");
   });
 
   it("emails the assignee: request no, customer, route/dates and a link to the ops queue item", async () => {

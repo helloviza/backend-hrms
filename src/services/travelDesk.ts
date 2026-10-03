@@ -227,12 +227,13 @@ export async function assignCase(opts: {
     staffNote = `Unassigned from ${str(prev.agentName) || "previous agent"}`;
   }
 
+  // The note is staff-only: it lives in staffNote, never in the customer-visible comment.
+  if (note) staffNote += ` — Note: ${note}`;
   doc.history = Array.isArray(doc.history) ? doc.history : [];
   doc.history.push({
     action,
     at: new Date(),
     by: opts.actor?.sub || "system:travel-desk",
-    comment: note || undefined,
     userEmail: opts.actor?.email || "",
     userName: opts.actor?.name || (opts.via === "auto" ? "Travel Desk (auto)" : ""),
     staffNote,

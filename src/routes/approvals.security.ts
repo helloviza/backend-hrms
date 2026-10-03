@@ -386,7 +386,11 @@ export function sanitizeApprovalForViewer(doc: any, user: any) {
     safe.history = safe.history
       .filter((h: any) => !STAFF_ONLY_HISTORY_ACTIONS.has(String(h?.action || "")))
       .map((h: any) => {
-        if (h && typeof h === "object") delete h.staffNote;
+        if (!h || typeof h !== "object") return h;
+        // "Assigned" is all a customer learns: no agent, no assigner, no note
+        // (older rows may carry a note or a staff name in these fields).
+        if (String(h.action || "") === "admin_assigned") return { action: "admin_assigned", at: h.at };
+        delete h.staffNote;
         return h;
       });
   }
