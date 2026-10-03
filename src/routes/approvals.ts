@@ -5,7 +5,7 @@ import fs from "fs";
 import path from "path";
 import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
-import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { requireWorkspace, resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
 import { requireAnyFeature } from "../middleware/requireFeature.js";
 
@@ -492,10 +492,32 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     const refusal = await checkCanRaiseRequest(req);
     if (refusal) return res.status(refusal.status).json(refusal.body);
 
-    const { customerId, cartItems: rawCartItems, comments, ticketId } = req.body || {};
-    const cid = String(customerId || "").trim();
+    const { customerId: bodyCustomerId, cartItems: rawCartItems, comments, ticketId } = req.body || {};
 
-    if (!cid) return res.status(400).json({ error: "customerId is required" });
+    // Customer + workspace come from the login, never the body: a body
+    // customerId used to pick another company's approver, leaders and name.
+    // (SUPERADMIN skips requireWorkspace's lookup, so resolve theirs here.)
+    const loginWs: any = req.workspace?._id ? req.workspace : await resolveWorkspaceForUser(user);
+    if (!loginWs?._id) {
+      return res.status(400).json({
+        error: "Your login isn't linked to a customer workspace. Ask your admin to link it.",
+        code: "NO_CUSTOMER_WORKSPACE",
+      });
+    }
+    const cid = String(loginWs.customerId || loginWs._id);
+
+    // Staff have no raise-on-behalf path: a request naming another customer
+    // (or another workspace) is refused rather than filed under the wrong one.
+    // Anyone else's stray customerId is ignored.
+    const otherCustomer = normStr(bodyCustomerId);
+    const namesOther = Boolean(otherCustomer) && otherCustomer !== cid && otherCustomer !== String(loginWs._id);
+    if (hasQueueView(req) && (namesOther || String(req.workspaceObjectId || "") !== String(loginWs._id))) {
+      return res.status(403).json({
+        error: "Requests can't be raised on behalf of a customer. The customer's own user must raise it.",
+        code: "STAFF_ON_BEHALF_NOT_SUPPORTED",
+      });
+    }
+
     if (!Array.isArray(rawCartItems) || rawCartItems.length === 0) {
       return res.status(400).json({ error: "cartItems is required" });
     }
