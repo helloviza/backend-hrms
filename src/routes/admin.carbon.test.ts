@@ -22,8 +22,13 @@ vi.mock("../middleware/requireWorkspace.js", () => ({
   default: (_req: any, _res: any, next: any) => next(),
 }));
 
-const WS_A = "aaaaaaaaaaaaaaaaaaaaaaaa";
+const WS_A = "aaaaaaaaaaaaaaaaaaaaaaaa"; // a tenant's CustomerWorkspace._id
 const WS_B = "bbbbbbbbbbbbbbbbbbbbbbbb";
+// CarbonRecord.workspaceId is a CUSTOMER id: the tenant's own records carry
+// CUST_A (WS_A.customerId), never WS_A itself.
+const CUST_A = "cccccccccccccccccccccccc";
+const CUST_B = "dddddddddddddddddddddddd";
+const HOUSE = "69679a7628330a58d29f2254";
 
 /** Every aggregate pipeline handed to CarbonRecord, in order. */
 const pipelines: any[][] = [];
@@ -63,12 +68,14 @@ import request from "supertest";
 import router, { carbonScope, buildCarbonMatch } from "./admin.carbon.js";
 import { CARBON_CALCULATION_VERSION } from "../services/carbonEngine.service.js";
 
-function appAs(user: any, workspaceObjectId?: string) {
+function appAs(user: any, workspaceObjectId?: string, customerId?: string) {
   const app = express();
   app.use(express.json());
   app.use((req: any, _res, next) => {
     req.user = user;
     req.workspaceObjectId = workspaceObjectId;
+    req.workspaceId = workspaceObjectId;
+    req.workspace = workspaceObjectId ? { _id: workspaceObjectId, customerId } : undefined;
     next();
   });
   app.use("/api/admin/carbon", router);
@@ -77,6 +84,9 @@ function appAs(user: any, workspaceObjectId?: string) {
 
 const SUPERADMIN = { _id: "super000000000000000001", roles: ["SUPERADMIN"] };
 const TENANT_ADMIN = { _id: "tenant00000000000000001", roles: ["ADMIN"] };
+const HOUSE_OPS = { _id: "houseops000000000000001", roles: ["OPS"] };
+/** A tenant admin's request as requireWorkspace leaves it. */
+const tenantReq = (extra: any = {}) => ({ user: TENANT_ADMIN, workspaceObjectId: WS_A, workspace: { _id: WS_A, customerId: CUST_A }, ...extra });
 const EMPLOYEE = { _id: "emp00000000000000000001", roles: ["EMPLOYEE"] };
 
 /** The $match of the first pipeline issued during a request. */
@@ -100,14 +110,30 @@ describe("carbon aggregation — access", () => {
     expect(m.workspaceId).toBeUndefined();
   });
 
-  it("a tenant admin's $match contains ONLY their own workspace", async () => {
-    const res = await request(appAs(TENANT_ADMIN, WS_A)).get("/api/admin/carbon/overview");
+  it("a tenant admin's $match contains ONLY their own Customer (the id CarbonRecord carries), never the workspace id", async () => {
+    const res = await request(appAs(TENANT_ADMIN, WS_A, CUST_A)).get("/api/admin/carbon/overview");
     expect(res.status).toBe(200);
 
     const m = firstMatch();
     expect(Object.prototype.hasOwnProperty.call(m, "workspaceId")).toBe(true);
-    expect(String(m.workspaceId)).toBe(WS_A);
-    expect(String(m.workspaceId)).not.toBe(WS_B);
+    expect(String(m.workspaceId)).toBe(CUST_A);
+    expect(String(m.workspaceId)).not.toBe(WS_A); // the old comparison, which matched no record
+  });
+
+  it("Plumtrips staff (HOUSE ADMIN/HR/OPS) report across every customer and can narrow to one", async () => {
+    const all = await request(appAs(HOUSE_OPS, HOUSE)).get("/api/admin/carbon/overview");
+    expect(all.status).toBe(200);
+    expect(Object.prototype.hasOwnProperty.call(firstMatch(), "workspaceId")).toBe(false);
+
+    pipelines.length = 0;
+    await request(appAs(HOUSE_OPS, HOUSE)).get(`/api/admin/carbon/overview?workspaceId=${CUST_B}`);
+    expect(String(firstMatch().workspaceId)).toBe(CUST_B);
+  });
+
+  it("a tenant admin whose workspace is not linked to a customer is refused, never widened", async () => {
+    const res = await request(appAs(TENANT_ADMIN, WS_A, "not-an-id")).get("/api/admin/carbon/overview");
+    expect(res.status).toBe(403);
+    expect(pipelines).toHaveLength(0);
   });
 
   it("a non-admin is refused outright, and nothing is aggregated", async () => {
@@ -119,20 +145,20 @@ describe("carbon aggregation — access", () => {
   it("every endpoint carries the same scope — none is left unscoped", async () => {
     for (const path of ["overview", "trend", "by-airline", "by-haul-band", "top-routes", "data-quality"]) {
       pipelines.length = 0;
-      const res = await request(appAs(TENANT_ADMIN, WS_A)).get(`/api/admin/carbon/${path}`);
+      const res = await request(appAs(TENANT_ADMIN, WS_A, CUST_A)).get(`/api/admin/carbon/${path}`);
       expect(res.status, path).toBe(200);
-      // Every pipeline this endpoint issued must be pinned to WS_A.
+      // Every pipeline this endpoint issued must be pinned to the tenant's Customer.
       for (const p of pipelines) {
         const m = p.find((s: any) => s.$match).$match;
-        expect(String(m.workspaceId), `${path} $match`).toBe(WS_A);
+        expect(String(m.workspaceId), `${path} $match`).toBe(CUST_A);
       }
     }
   });
 
   it("the document-grain query in data-quality is scoped too", async () => {
-    await request(appAs(TENANT_ADMIN, WS_A)).get("/api/admin/carbon/data-quality");
+    await request(appAs(TENANT_ADMIN, WS_A, CUST_A)).get("/api/admin/carbon/data-quality");
     expect(docCountFilters).toHaveLength(1);
-    expect(String(docCountFilters[0].workspaceId)).toBe(WS_A);
+    expect(String(docCountFilters[0].workspaceId)).toBe(CUST_A);
   });
 
   it("the SuperAdmin document-grain query has no workspace key either", async () => {
@@ -141,8 +167,8 @@ describe("carbon aggregation — access", () => {
   });
 
   it("the workspace-options list is scoped by the same branch", async () => {
-    await request(appAs(TENANT_ADMIN, WS_A)).get("/api/admin/carbon/workspaces");
-    expect(String(distinctScopes[0].workspaceId)).toBe(WS_A);
+    await request(appAs(TENANT_ADMIN, WS_A, CUST_A)).get("/api/admin/carbon/workspaces");
+    expect(String(distinctScopes[0].workspaceId)).toBe(CUST_A);
 
     distinctScopes.length = 0;
     await request(appAs(SUPERADMIN)).get("/api/admin/carbon/workspaces");
@@ -151,8 +177,14 @@ describe("carbon aggregation — access", () => {
 });
 
 describe("scope layering — layer 2 holds independently of the route guard", () => {
-  it("a non-SuperAdmin's scope is their own workspace, never {}", () => {
-    expect(carbonScope({ user: TENANT_ADMIN, workspaceObjectId: WS_A })).toEqual({ workspaceId: WS_A });
+  it("a tenant admin's scope is their own Customer, never {}", () => {
+    expect(String((carbonScope(tenantReq()) as any).workspaceId)).toBe(CUST_A);
+  });
+
+  it("Plumtrips staff's scope is an explicit, empty object", () => {
+    const s = carbonScope({ user: HOUSE_OPS, workspaceObjectId: HOUSE, workspaceId: HOUSE });
+    expect(s).toEqual({});
+    expect(Object.prototype.hasOwnProperty.call(s, "workspaceId")).toBe(false);
   });
 
   it("a real SuperAdmin's scope is an explicit, empty object", () => {
@@ -167,13 +199,9 @@ describe("scope layering — layer 2 holds independently of the route guard", ()
   });
 
   it("a caller-supplied workspaceId cannot widen a tenant caller's own scope", () => {
-    const m = buildCarbonMatch({
-      user: TENANT_ADMIN,
-      workspaceObjectId: WS_A,
-      query: { workspaceId: WS_B },
-    });
-    expect(String(m.workspaceId)).toBe(WS_A);
-    expect(String(m.workspaceId)).not.toBe(WS_B);
+    const m = buildCarbonMatch(tenantReq({ query: { workspaceId: CUST_B } }));
+    expect(String(m.workspaceId)).toBe(CUST_A);
+    expect(String(m.workspaceId)).not.toBe(CUST_B);
   });
 
   it("a SuperAdmin CAN drill into one workspace", () => {

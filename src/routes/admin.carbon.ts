@@ -34,8 +34,9 @@ import { CARBON_CALCULATION_VERSION } from "../services/carbonEngine.service.js"
  * Two independent layers, so neither is load-bearing alone:
  *   1. adminOrSuperAdmin — the route is admin-facing to begin with.
  *   2. carbonScope()     — even if layer 1 were bypassed or reordered, a
- *      non-SuperAdmin is pinned to their own workspace, and tenantScope()
- *      THROWS rather than widen when there is no workspace context.
+ *      tenant admin is pinned to their own Customer, and tenantScope()
+ *      THROWS rather than widen when there is no workspace context. Plumtrips
+ *      staff (HOUSE) get the same explicit `{}` as a SuperAdmin.
  *
  * ── Honest denominators ──
  *
@@ -61,23 +62,43 @@ function adminOrSuperAdmin(req: any, res: any, next: any) {
 }
 router.use(adminOrSuperAdmin);
 
-/** Read the tenancy boundary. Throws rather than ever returning undefined. */
+const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
+
+/** Plumtrips staff: signed in to the HOUSE workspace (layer 1 already required ADMIN/HR/OPS). */
+function isPlumtripsStaff(req: any): boolean {
+  return String(req.workspaceId || req.workspaceObjectId || "") === PLUMTRIPS_HOUSE_WORKSPACE_ID;
+}
+
+/**
+ * Read the tenancy boundary — in CUSTOMER id space. CarbonRecord.workspaceId
+ * (and ExtractedDocument.workspaceId) hold a Customer._id despite the name, so
+ * the caller's own Customer is their workspace's customerId, never the
+ * CustomerWorkspace._id (comparing that matched nothing: every admin below
+ * SuperAdmin saw an empty dashboard). Throws rather than ever returning
+ * undefined.
+ */
 function tenantScope(req: any): mongoose.Types.ObjectId {
-  const ws = req.workspaceObjectId;
-  if (!ws) {
+  if (!req.workspaceObjectId) {
     throw Object.assign(new Error("Workspace context missing"), { status: 403 });
   }
-  return ws;
+  const customerId = String(req.workspace?.customerId || "");
+  if (!mongoose.isValidObjectId(customerId)) {
+    throw Object.assign(new Error("Workspace is not linked to a customer"), { status: 403 });
+  }
+  return new mongoose.Types.ObjectId(customerId);
 }
 
 /**
  * The tenancy clause for every aggregation in this file.
  *
- * `{}` for a real SuperAdmin is a deliberate, readable "no workspace
- * restriction" — not the absence of a filter.
+ * `{}` for a real SuperAdmin, and for Plumtrips staff (HOUSE), who report
+ * across every customer as they work every customer's bookings — a deliberate,
+ * readable "no workspace restriction", not the absence of a filter. Anyone
+ * else is pinned to their own Customer.
  */
 export function carbonScope(req: any): Record<string, unknown> {
   if (isSuperAdmin(req)) return {};
+  if (isPlumtripsStaff(req)) return {};
   return { workspaceId: tenantScope(req) };
 }
 
@@ -115,10 +136,10 @@ export function buildCarbonMatch(req: any): Record<string, any> {
     if (to) match.travelMonth.$lte = to;
   }
 
-  // The tenancy clause, applied LAST so it always wins. For a non-SuperAdmin
-  // this overwrites any caller-supplied workspaceId with their own. For a real
-  // SuperAdmin it is `{}`, so the narrowing above stands. This ordering is the
-  // load-bearing line in the file.
+  // The tenancy clause, applied LAST so it always wins. For a tenant admin
+  // this overwrites any caller-supplied workspaceId with their own Customer.
+  // For a real SuperAdmin or Plumtrips staff it is `{}`, so the narrowing above
+  // stands. This ordering is the load-bearing line in the file.
   Object.assign(match, carbonScope(req));
 
   return match;
