@@ -238,6 +238,7 @@ vi.mock("../middleware/travelModeGuard.js", () => ({
     req.workspace = { config: { travelFlow: "APPROVAL_FLOW" } };
     next();
   },
+  requireTravelModeFor: () => (_req: any, _res: any, next: any) => next(),
 }));
 vi.mock("../middleware/requireFeature.js", () => ({
   requireFeature: () => (_req: any, _res: any, next: any) => next(),

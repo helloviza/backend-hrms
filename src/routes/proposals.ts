@@ -8,7 +8,7 @@ import path from "path";
 
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
-import { requireTravelMode } from "../middleware/travelModeGuard.js";
+import { requireTravelMode, requireTravelModeFor } from "../middleware/travelModeGuard.js";
 import Proposal from "../models/Proposal.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import User from "../models/User.js";
@@ -620,6 +620,23 @@ function byIdFor(req: Request, id: any) {
   return ws ? { _id: id, workspaceId: ws } : { _id: id };
 }
 
+/** Workspace that owns the request / proposal a staff route acts on (null if not found). */
+async function requestWorkspaceOf(req: Request) {
+  const id = String(req.params.requestId || "");
+  if (!mongoose.Types.ObjectId.isValid(id)) return null;
+  const ar: any = await ApprovalRequest.findById(id).select("workspaceId").lean();
+  return ar?.workspaceId || null;
+}
+async function proposalWorkspaceOf(req: Request) {
+  const id = String(req.params.id || "");
+  if (!mongoose.Types.ObjectId.isValid(id)) return null;
+  const p: any = await Proposal.findById(id).select("workspaceId").lean();
+  return p?.workspaceId || null;
+}
+// Staff are checked against the CUSTOMER's flow (their own is HOUSE).
+const requireFlow2ForRequest = requireTravelModeFor({ isStaff: isStaffAdmin, resolveWorkspaceId: requestWorkspaceOf }, "APPROVAL_FLOW");
+const requireFlow2ForProposal = requireTravelModeFor({ isStaff: isStaffAdmin, resolveWorkspaceId: proposalWorkspaceOf }, "APPROVAL_FLOW");
+
 const requireStaff: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
   const u = (req as AuthedReq).user;
 
@@ -1008,7 +1025,7 @@ router.get("/by-request/:requestId", requireAnyAuth, requireWorkspace, requireSt
 /**
  * POST /api/proposals/by-request/:requestId/draft (staff-only)
  */
-router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, requireStaff, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
+router.post("/by-request/:requestId/draft", requireAnyAuth, requireWorkspace, requireStaff, requireFlow2ForRequest, async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1143,7 +1160,7 @@ router.put("/:id", requireAnyAuth, requireWorkspace, requireStaff, async (req: R
  * - Sets status SUBMITTED
  * - Sends email to L2 with token actions
  */
-router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
+router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requireFlow2ForProposal, async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
 
@@ -1627,7 +1644,7 @@ router.post(
  * and the same emails as a customer decision; history reads "Recorded by
  * <ops user> on behalf of the customer: <note>".
  */
-router.post("/:id/record-decision", requireAnyAuth, requireWorkspace, requireStaff, requireTravelMode("APPROVAL_FLOW"), async (req: Request, res: Response, next: NextFunction) => {
+router.post("/:id/record-decision", requireAnyAuth, requireWorkspace, requireStaff, requireFlow2ForProposal, async (req: Request, res: Response, next: NextFunction) => {
   try {
     setNoStore(res);
     const aReq = req as AuthedReq;

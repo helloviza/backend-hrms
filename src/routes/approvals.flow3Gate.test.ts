@@ -164,8 +164,12 @@ describe("Flow 3 workspace with ONLY approvalDirectEnabled", () => {
     }
   });
 
-  it("proposals stay Flow 2 only", async () => {
-    const r = await as(request(app).post(`/api/proposals/by-request/${String(oid())}/draft`), oid(), WS_DIRECT, ["OPS"]);
+  it("proposals stay Flow 2 only (staff are checked against the request's workspace flow)", async () => {
+    const ar = await col("approvalrequests").insertOne({
+      workspaceId: WS_DIRECT, customerId: "D1", frontlinerId: String(oid()), status: "approved", stage: "REQUEST_APPROVED",
+      adminState: "pending", cartItems: [], meta: {}, history: [],
+    } as any);
+    const r = await as(request(app).post(`/api/proposals/by-request/${String(ar.insertedId)}/draft`), oid(), WS_DIRECT, ["OPS"]);
     expect([r.status, r.body.error]).toEqual([403, "This flow is not enabled for your workspace"]);
   });
 });

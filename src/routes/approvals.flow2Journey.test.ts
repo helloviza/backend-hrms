@@ -636,3 +636,44 @@ describe("Plumtrips staff (HOUSE login) work a customer's proposal", () => {
     expect((await asIn(request(app).post(`/api/proposals/${pid}/decide`), OUTSIDER, OTHER_WS).send({ decision: "DECLINED", reason: "x" })).status).toBe(404);
   });
 });
+
+describe("travel-mode gate: staff are checked against the CUSTOMER's flow, not HOUSE", () => {
+  const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
+  const WS3 = oid(); // a Flow 3 (APPROVAL_DIRECT) customer
+  const HOUSE_OPS: Who = { email: "agent@plumtrips.test", roles: ["OPS"] }; // not ADMIN: no blanket bypass
+  const asIn = (r: request.Test, who: Who, ws: any) =>
+    r
+      .set("x-test-user", JSON.stringify({ sub: String(oid()), email: who.email, name: who.email.split("@")[0], roles: who.roles || ["EMPLOYEE"] }))
+      .set("x-test-ws", String(ws));
+
+  beforeEach(async () => {
+    await col("customerworkspaces").insertMany([
+      // HOUSE has no travel flow of its own — the old gate refused OPS agents on that.
+      { _id: HOUSE, customerId: "PLUMTRIPS-HOUSE", name: "Plumtrips", status: "ACTIVE", config: { features: {} } },
+      { _id: WS3, customerId: "D3", name: "Direct Co", status: "ACTIVE", tenantType: "CORPORATE", config: { travelFlow: "APPROVAL_DIRECT", features: { approvalDirectEnabled: true } } },
+    ] as any[]);
+  });
+
+  it("an OPS-role HOUSE user drafts, submits and records a decision on a Flow 2 customer's proposal", async () => {
+    const rid = await approvedRequest();
+    const d = await asIn(request(app).post(`/api/proposals/by-request/${rid}/draft`), HOUSE_OPS, HOUSE).send({});
+    expect([d.status, d.body.created]).toEqual([200, true]);
+    const pid = String(d.body.proposal._id);
+    expect((await asIn(request(app).put(`/api/proposals/${pid}`), HOUSE_OPS, HOUSE).send({ options: [option] })).status).toBe(200);
+    expect((await asIn(request(app).post(`/api/proposals/${pid}/submit`), HOUSE_OPS, HOUSE).send({})).status).toBe(200);
+    const rec = await asIn(request(app).post(`/api/proposals/${pid}/record-decision`), HOUSE_OPS, HOUSE)
+      .send({ decision: "APPROVED", note: "Approved on a call" });
+    expect(rec.status).toBe(200);
+    expect((await propDoc(pid)).status).toBe("APPROVED");
+  });
+
+  it("the same OPS user is refused a proposal draft on a Flow 3 customer's request (the customer's flow decides)", async () => {
+    const r3 = await col("approvalrequests").insertOne({
+      workspaceId: WS3, customerId: "D3", customerName: "Direct Co", frontlinerId: String(oid()), frontlinerEmail: "x@d3.test",
+      status: "approved", stage: "REQUEST_APPROVED", adminState: "pending", cartItems: [flightItem], meta: { travelFlow: "APPROVAL_FLOW" }, history: [],
+    } as any);
+    const d = await asIn(request(app).post(`/api/proposals/by-request/${r3.insertedId}/draft`), HOUSE_OPS, HOUSE).send({});
+    expect([d.status, d.body.workspaceFlow]).toEqual([403, "APPROVAL_DIRECT"]);
+    expect(await col("proposals").countDocuments({ requestId: r3.insertedId })).toBe(0);
+  });
+});
