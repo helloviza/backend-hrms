@@ -234,6 +234,12 @@ vi.mock("../middleware/requireWorkspace.js", () => ({
     req.workspaceId = req.workspaceObjectId;
     next();
   },
+  // Booking History resolves the caller's workspace itself (it has no
+  // requireWorkspace): staff (S1) sign in to HOUSE, everyone else to the customer.
+  resolveWorkspaceForUser: async (u: any) => ({
+    _id: u?.sub === "S1" ? "69679a7628330a58d29f2254" : "64b0000000000000000000ff",
+    status: "ACTIVE",
+  }),
 }));
 vi.mock("../middleware/travelModeGuard.js", () => ({
   requireTravelMode: () => (req: any, _res: any, next: any) => {
@@ -344,7 +350,9 @@ afterAll(() => fs.rmSync(uploadsDir, { recursive: true, force: true }));
 const REQUESTER = { sub: "U1", email: "req@cust.com", name: "Riya Requester", roles: ["EMPLOYEE"] };
 const APPROVER = { sub: "U2", email: "mgr@cust.com", name: "Manoj Manager", roles: ["MANAGER"] };
 const LEADER = { sub: "U3", email: "wl@cust.com", name: "Wendy Leader", roles: ["WORKSPACE_LEADER", "CUSTOMER"] };
-const L1_ROLE = { sub: "U4", email: "l1@cust.com", name: "L One", roles: ["L1"] };
+// customerId as middleware/auth normalizeWorkspaceIds puts on every real token. The L1 role once
+// unlocked the all-tenant staff history; it now gets its own customer view (staff = Admin Queue grant).
+const L1_ROLE = { sub: "U4", email: "l1@cust.com", name: "L One", roles: ["L1"], customerId: "C1" };
 const STAFF = { sub: "S1", email: "ops@plumtrips.com", name: "Ops", roles: ["ADMIN"] };
 
 const HOUSE_WS = "69679a7628330a58d29f2254";

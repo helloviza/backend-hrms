@@ -6,7 +6,8 @@ import fs from "fs";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { requireAuth } from "../middleware/auth.js";
-import { sanitizeApprovalForViewer } from "./approvals.security.js";
+import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
+import { sanitizeApprovalForViewer, adminQueueAccess, queueCaseScope } from "./approvals.security.js";
 
 const router = Router();
 
@@ -50,14 +51,29 @@ function isAdmin(user: any): boolean {
   );
 }
 
-function isStaffViewer(user: any): boolean {
-  return (
-    isAdmin(user) ||
-    hasRole(user, "hr") ||
-    hasRole(user, "l0") ||
-    hasRole(user, "l1") ||
-    hasRole(user, "l2")
-  );
+/**
+ * The staff (all-tenant) view: the Admin Queue rule, not roles —
+ * adminQueueAccess (grant READ+, or SUPERADMIN / HOUSE ADMIN), held to the
+ * grant's scope by queueCaseScope (OWN = only requests assigned to them).
+ * This router only runs requireAuth, so the caller's workspace (which
+ * adminQueueAccess needs to recognise HOUSE) is resolved here, softly: no
+ * workspace simply means no staff view, never a 403.
+ */
+async function isQueueViewer(req: any): Promise<boolean> {
+  // Fails closed: any error here means no staff view (and never an unhandled
+  // rejection — these handlers have no try/catch, so a throw would hang).
+  try {
+    if (!req.workspaceId) {
+      const ws: any = await resolveWorkspaceForUser(req.user, "_id status");
+      if (ws?._id && ws.status === "ACTIVE") {
+        req.workspaceId = String(ws._id);
+        req.workspaceObjectId = ws._id;
+      }
+    }
+    return (await adminQueueAccess(req)).view;
+  } catch {
+    return false;
+  }
 }
 
 function isCustomerViewer(user: any): boolean {
@@ -73,8 +89,8 @@ function isRequesterViewer(user: any): boolean {
   return hasRole(user, "requester") || hasRole(user, "employee") || hasRole(user, "staff");
 }
 
-function canViewBookingHistory(user: any): boolean {
-  return isStaffViewer(user) || isCustomerViewer(user) || isRequesterViewer(user);
+function canViewBookingHistory(user: any, queueViewer: boolean): boolean {
+  return queueViewer || isCustomerViewer(user) || isRequesterViewer(user);
 }
 
 function getCustomerIdFromToken(user: any): string {
@@ -344,18 +360,17 @@ async function buildTravelerIdMap(rows: any[]): Promise<Map<string, string>> {
  * ──────────────────────────────────────────────────────────────── */
 
 /**
- * GET /api/booking-history/admin/history?states=done,cancelled   (Admin only)
+ * GET /api/booking-history/admin/history?states=done,cancelled   (Admin Queue only, scoped)
  */
 router.get("/admin/history", requireAuth, async (req: Request, res: Response) => {
-  const user = (req as any).user;
-  if (!isAdmin(user)) return res.status(403).json({ ok: false, error: "Forbidden" });
+  if (!(await isQueueViewer(req))) return res.status(403).json({ ok: false, error: "Forbidden" });
 
   const states = String(req.query.states || "done,cancelled")
     .split(",")
     .map((s: string) => s.trim())
     .filter(Boolean);
 
-  const rows = await ApprovalRequest.find({ adminState: { $in: states } } as any)
+  const rows = await ApprovalRequest.find({ adminState: { $in: states }, ...queueCaseScope(req) } as any)
     .sort({ updatedAt: -1 })
     .lean();
 
@@ -391,14 +406,15 @@ router.get("/admin/history", requireAuth, async (req: Request, res: Response) =>
 
 /**
  * GET /api/booking-history/history?states=done,cancelled
- * - Staff (L0/L1/L2/HR/Admin) => can see all
+ * - Staff (Admin Queue grant / oversight) => every tenant, within their queue scope
  * - Workspace Leader (Customer/Business) => org-wide view (resolved via email)
  * - Requester => email-scoped view
  */
 router.get("/history", requireAuth, async (req: Request, res: Response) => {
   const user = (req as any).user;
+  const queueViewer = await isQueueViewer(req);
 
-  if (!canViewBookingHistory(user)) {
+  if (!canViewBookingHistory(user, queueViewer)) {
     return res.status(403).json({ ok: false, error: "Forbidden" });
   }
 
@@ -409,9 +425,9 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
 
   const base: any = { adminState: { $in: states } };
 
-  // Staff sees all
-  if (isStaffViewer(user)) {
-    const rows = await ApprovalRequest.find(base as any).sort({ updatedAt: -1 }).lean();
+  // Staff (Admin Queue): every tenant, held to their queue scope
+  if (queueViewer) {
+    const rows = await ApprovalRequest.find({ ...base, ...queueCaseScope(req) } as any).sort({ updatedAt: -1 }).lean();
     const travelerMap = await buildTravelerIdMap(rows);
     return res.json({
       ok: true,
@@ -555,7 +571,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
  */
 router.get("/attachments/:file/download", requireAuth, async (req: Request, res: Response) => {
   const user = (req as any).user;
-  if (!canViewBookingHistory(user)) {
+  if (!canViewBookingHistory(user, await isQueueViewer(req))) {
     return res.status(403).json({ ok: false, error: "Forbidden" });
   }
 

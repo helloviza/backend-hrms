@@ -28,7 +28,8 @@ vi.mock("../middleware/auth.js", () => {
   };
   return { requireAuth, default: requireAuth };
 });
-vi.mock("../middleware/requireWorkspace.js", () => ({
+vi.mock("../middleware/requireWorkspace.js", async (orig) => ({
+  ...(await orig<any>()),
   requireWorkspace: async (req: any, res: any, next: any) => {
     const { default: mg } = await import("mongoose");
     const id = String(req.headers["x-test-ws"] || "");

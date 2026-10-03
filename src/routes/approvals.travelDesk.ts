@@ -1,17 +1,41 @@
 // apps/backend/src/routes/approvals.travelDesk.ts
 //
 // Travel Desk team settings + the agent list for the Assign picker. Mounted
-// at /api/approvals/travel-desk; staff only (requireApprovalsAdminWrite =
-// isStaffAdmin) — customers and Workspace Leaders get 403.
+// at /api/approvals/travel-desk; Admin Queue WRITE+ only
+// (requireApprovalsAdminWrite) — customers and Workspace Leaders get 403.
+//
+// Desk settings (team, mode, Account Manager first, anyone else's
+// Available/Away) also need a queue scope wider than OWN — TEAM / WORKSPACE /
+// ALL, or SUPERADMIN / HOUSE ADMIN oversight (canManageDesk). An OWN agent
+// keeps the Assign picker and may set their OWN Available/Away.
 import { Router } from "express";
 import mongoose from "mongoose";
 import TravelDeskSettings, { ALLOCATION_MODES, type AllocationMode } from "../models/TravelDeskSettings.js";
-import { requireApprovalsAdminWrite, setNoStore, normEmail } from "./approvals.security.js";
+import { requireApprovalsAdminWrite, setNoStore, normEmail, adminQueueAccess } from "./approvals.security.js";
 import { candidatePool, getSettings, teamView } from "../services/travelDesk.js";
 
 type AnyObj = Record<string, any>;
 const router = Router();
 router.use(requireApprovalsAdminWrite);
+
+/** May this caller change the desk? Queue work with a scope wider than OWN (oversight counts). */
+async function canManageDesk(req: AnyObj): Promise<boolean> {
+  const a = await adminQueueAccess(req);
+  return a.work && a.scope === "all";
+}
+
+function refuseDesk(res: any) {
+  return res.status(403).json({ error: "Travel Desk settings need Admin Queue with Team or All scope", code: "DESK_SCOPE_REQUIRED" });
+}
+
+async function requireDeskManager(req: AnyObj, res: any, next: any) {
+  try {
+    if (await canManageDesk(req)) return next();
+    return refuseDesk(res);
+  } catch (err) {
+    next(err);
+  }
+}
 
 async function settingsPayload() {
   const settings = await getSettings();
@@ -20,7 +44,7 @@ async function settingsPayload() {
 }
 
 /** Settings page: mode, RM-first, the team (with load + eligibility) and who can be added. */
-router.get("/settings", async (_req, res, next) => {
+router.get("/settings", requireDeskManager, async (_req, res, next) => {
   try {
     setNoStore(res);
     res.json({ ok: true, ...(await settingsPayload()) });
@@ -30,7 +54,7 @@ router.get("/settings", async (_req, res, next) => {
 });
 
 /** Replace mode / RM-first / the team. Every agent must be in the candidate pool. */
-router.put("/settings", async (req: AnyObj, res, next) => {
+router.put("/settings", requireDeskManager, async (req: AnyObj, res, next) => {
   try {
     const body = req.body || {};
     const set: AnyObj = { updatedByEmail: normEmail(req.user?.email) };
@@ -72,6 +96,9 @@ router.patch("/agents/:userId", async (req: AnyObj, res, next) => {
     const id = String(req.params.userId || "");
     if (!mongoose.isValidObjectId(id)) return res.status(400).json({ error: "Invalid user id" });
     if (typeof req.body?.available !== "boolean") return res.status(400).json({ error: "available must be true or false" });
+    // Their own toggle is always allowed; anyone else's is a desk setting.
+    const self = String(req.user?.sub || req.user?._id || req.user?.id || "");
+    if (id !== self && !(await canManageDesk(req))) return refuseDesk(res);
     const r = await TravelDeskSettings.updateOne(
       { key: "default", "agents.userId": new mongoose.Types.ObjectId(id) },
       { $set: { "agents.$.available": req.body.available, updatedByEmail: normEmail(req.user?.email) } },
