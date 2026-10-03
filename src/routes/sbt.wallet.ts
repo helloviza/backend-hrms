@@ -4,6 +4,7 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
 import { getAgencyBalance } from "../services/tbo.auth.service.js";
+import { sbtBookerGuards } from "../services/sbtPaymentGate.js";
 
 const router = express.Router();
 
@@ -29,7 +30,9 @@ async function requireSBT(req: any, res: any, next: any) {
 }
 
 // GET /api/sbt/wallet/check?amount=XXXX
-router.get("/check", requireSBT, async (req: any, res: any) => {
+// Read-only sufficiency check; the reservation itself happens at book/ticket
+// time (services/sbtPaymentGate.ts reserveOfficial).
+router.get("/check", requireSBT, ...sbtBookerGuards, async (req: any, res: any) => {
   try {
     console.log("[wallet-check-debug]", {
       userKeys: Object.keys((req as any).user || {}),

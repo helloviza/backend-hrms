@@ -48,6 +48,15 @@ import {
 import { runDeferredStatusCheck } from "../jobs/deferred-status-check.js";
 import { BLOCKED_CORPORATE_PANS } from "../config/corporate-pan-blocklist.js";
 import { maybeRouteToDemoSimulator } from "../utils/demoSimulator.js";
+import {
+  callerScope,
+  sbtBookerGuards,
+  paymentGate,
+  createOrderHandler,
+  verifyHandler,
+  paymentFactsForSave,
+  latestHotelQuoteFor,
+} from "../services/sbtPaymentGate.js";
 import { TBO_URLS } from "../config/tboUrls.js";
 
 // TBO cert Item 31 — TBO recommends ≥120s before calling GetBookingDetail.
@@ -1065,6 +1074,8 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
         serverDisplayFare: displayTotalFare,
         serverNetFare: netAmount,
         sourceRef: BookingCode,
+        workspaceId: callerScope(req).workspaceId,
+        userId: callerScope(req).userId,
       });
     } catch (qErr: any) {
       // Quote persistence is best-effort scaffolding; never block PreBook.
@@ -1102,7 +1113,7 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
 // Called by frontend BEFORE Razorpay create-order. Returns {valid:true} or
 // {valid:false, errors:[...]} so the UI can block Pay Now and show all issues.
 
-router.post("/validate-before-payment", requireSBT, requireHotelAccess, async (req: any, res: any) => {
+router.post("/validate-before-payment", requireSBT, requireHotelAccess, ...sbtBookerGuards, async (req: any, res: any) => {
   try {
     const {
       BookingCode,
@@ -1202,94 +1213,20 @@ router.post("/validate-before-payment", requireSBT, requireHotelAccess, async (r
 
 // ─── 4. POST /payment/create-order ───────────────────────────────────────────
 
-router.post("/payment/create-order", requireAuth, async (req: any, res: any) => {
-  try {
-    const { amount, currency = "INR", receipt } = req.body;
-    if (!amount || amount <= 0)
-      return res.status(400).json({ error: "Invalid amount" });
-
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!keyId || !keySecret) {
-      return res
-        .status(503)
-        .json({ error: "Payment gateway not configured" });
-    }
-
-    const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
-    const orderRes = await fetch("https://api.razorpay.com/v1/orders", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Basic ${auth}`,
-      },
-      body: JSON.stringify({
-        amount: Math.round(amount * 100),
-        currency,
-        receipt: receipt || `sbt_htl_${Date.now()}`,
-      }),
-    });
-    const order = (await orderRes.json()) as any;
-    if (!orderRes.ok) {
-      return res.status(502).json({
-        error: order?.error?.description || "Razorpay order creation failed",
-      });
-    }
-    res.json({
-      ok: true,
-      orderId: order.id,
-      amount: order.amount,
-      currency: order.currency,
-      keyId,
-    });
-  } catch (err: unknown) {
-    const msg =
-      err instanceof Error ? err.message : "Payment order creation failed";
-    res.status(500).json({ error: msg });
-  }
-});
+// Razorpay order for the SERVER amount: the PreBook quote's displayTotalFare
+// (body: quoteId), or a held booking's server price (body: heldBookingId).
+// Any client amount is ignored. See services/sbtPaymentGate.ts.
+router.post("/payment/create-order", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, createOrderHandler("HOTEL"));
 
 // ─── 5. POST /payment/verify ─────────────────────────────────────────────────
 
-router.post("/payment/verify", requireAuth, async (req: any, res: any) => {
-  try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
-      req.body;
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      return res
-        .status(400)
-        .json({ error: "Missing payment verification fields" });
-    }
-
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!keySecret) {
-      return res
-        .status(503)
-        .json({ error: "Payment gateway not configured" });
-    }
-
-    const { createHmac } = await import("crypto");
-    const expectedSignature = createHmac("sha256", keySecret)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest("hex");
-
-    if (expectedSignature !== razorpay_signature) {
-      return res
-        .status(400)
-        .json({ error: "Payment verification failed — signature mismatch" });
-    }
-
-    res.json({ ok: true, verified: true });
-  } catch (err: unknown) {
-    const msg =
-      err instanceof Error ? err.message : "Payment verification failed";
-    res.status(500).json({ error: msg });
-  }
-});
+// Signature + the payment fetched from Razorpay must be captured, on this
+// order, for exactly the server amount.
+router.post("/payment/verify", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, verifyHandler("HOTEL"));
 
 // ─── 6. POST /book ───────────────────────────────────────────────────────────
 
-router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) => {
+router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, paymentGate("hotel-book"), async (req: any, res: any) => {
   let clientRef = "";
   try {
     if (await maybeRouteToDemoSimulator(req, res, "hotel-book")) return;
@@ -1627,12 +1564,19 @@ router.post("/book", requireSBT, requireHotelAccess, async (req: any, res: any) 
     // Pre-persist pattern: create a PENDING skeleton record BEFORE calling TBO.
     // The unique sparse index on clientReferenceId serializes concurrent identical requests,
     // closing the race window between TBO call and save.
+    // Server price of this room (the caller's PreBook quote), stamped on the
+    // booking so vouchering a hold later is charged this — never a browser figure.
+    const _sellingQuote = await latestHotelQuoteFor(callerScope(req), String(BookingCode));
+    if (bookingMode === "hold" && !_sellingQuote) {
+      return res.status(410).json({ code: "FARE_EXPIRED", error: "Fare expired, please search again" });
+    }
     const _bookUserId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (_bookUserId && req.workspaceObjectId) {
       try {
         await SBTHotelBooking.create({
           clientReferenceId: clientRef,
           status: "PENDING",
+          ...(_sellingQuote ? { serverSellingTotal: Math.round(Number(_sellingQuote.serverDisplayFare) || 0) } : {}),
           userId: _bookUserId,
           workspaceId: req.workspaceObjectId,
           bookingId: "",
@@ -2409,7 +2353,7 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
 
 // ─── 6c. POST /bookings/:id/generate-voucher ─────────────────────────────────
 
-router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (req: any, res: any) => {
+router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, paymentGate("hotel-voucher"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "hotel-generate-voucher")) return;
     const booking = await SBTHotelBooking.findOne({
@@ -2450,22 +2394,18 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
       panData?: { isCorporate?: boolean; passengers: Array<{ paxId: string; PAN: string }> };
     };
 
-    if (walletPayment && req.workspaceObjectId) {
-      // Deduct from agency wallet before calling TBO
-      try {
-        await CustomerWorkspace.findOneAndUpdate(
-          { _id: req.workspaceObjectId },
-          { $inc: { 'sbtOfficialBooking.currentMonthSpend': booking.netAmount ?? 0 } },
-          { runValidators: false },
-        );
-      } catch (walletErr) {
-        sbtLogger.error('[GEN-VOUCHER] Failed to deduct wallet spend', { bookingId: booking.bookingId, error: walletErr });
-      }
-    }
-
-    if (paymentId) {
-      // Save Razorpay payment ID against the booking before generating
-      await SBTHotelBooking.findByIdAndUpdate(booking._id, { razorpayPaymentId: paymentId }).catch(() => {});
+    // Payment is enforced by paymentGate("hotel-voucher") before this handler runs:
+    // a verified Razorpay payment for this booking, or the business-wallet limit
+    // reserved for its server price. Record which one paid.
+    const voucherPay = (req as any).sbtPayment;
+    void paymentId; void walletPayment;
+    if (voucherPay) {
+      await SBTHotelBooking.findByIdAndUpdate(booking._id, { $set: {
+        paymentMode: voucherPay.mode === "OFFICIAL" ? "official" : "personal",
+        paymentStatus: "paid",
+        ...(voucherPay.razorpayPaymentId ? { paymentId: voucherPay.razorpayPaymentId } : {}),
+        ...(voucherPay.razorpayOrderId ? { razorpayOrderId: voucherPay.razorpayOrderId, razorpayAmount: voucherPay.amountPaise } : {}),
+      } }).catch(() => {});
     }
 
     // POST-001: Build PAN payload for HOLD+PanMandatory bookings.
@@ -2696,7 +2636,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, async (re
 
 // ─── 7. POST /bookings/save ──────────────────────────────────────────────────
 
-router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any) => {
+router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
@@ -2705,7 +2645,7 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
 
     // Task 7: Check if webhook already created/confirmed this booking
     if (b.razorpayOrderId) {
-      const existing = await SBTHotelBooking.findOne({ razorpayOrderId: b.razorpayOrderId });
+      const existing = await SBTHotelBooking.findOne({ razorpayOrderId: b.razorpayOrderId, userId, workspaceId: req.workspaceObjectId });
       if (existing && existing.status === "CONFIRMED") {
         // Webhook beat the frontend — update with any missing details
         existing.bookingId = b.bookingId || existing.bookingId;
@@ -2719,6 +2659,14 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
         return res.json({ ok: true, booking: existing, webhookRecovered: true });
       }
     }
+
+    // Payment facts come from the server's payment row (services/sbtPaymentGate.ts),
+    // never the body.
+    const payFacts = b.isHeld ? null : await paymentFactsForSave(req, "HOTEL", {
+      razorpayOrderId: b.razorpayOrderId,
+      clientReferenceId: b.clientReferenceId,
+      tboBookingId: b.bookingId,
+    });
 
     // GAP-01: Shared booking data for both pre-persist update and fresh create paths.
     const _bookingData = {
@@ -2741,7 +2689,7 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       guests: b.guests || [],
       roomName: b.roomName || "",
       mealType: b.mealType || "",
-      totalFare: b.totalFare,
+      totalFare: payFacts ? payFacts.amount : b.totalFare,
       netAmount: b.netAmount || b.totalFare || 0,
       recommendedSellingRate:
         typeof b.recommendedSellingRate === "number" ? b.recommendedSellingRate : null,
@@ -2752,15 +2700,15 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       cancelPolicies: b.cancelPolicies || [],
       status: b.isHeld ? "HELD" : (b.status || "CONFIRMED"),
       failureReason: b.failureReason || "",
-      paymentStatus: b.paymentStatus || "paid",
-      paymentId: b.paymentId || "",
-      razorpayOrderId: b.razorpayOrderId || "",
-      razorpayAmount: b.razorpayAmount || 0,
+      paymentStatus: payFacts ? "paid" : "pending",
+      paymentId: payFacts?.razorpayPaymentId || "",
+      razorpayOrderId: payFacts?.razorpayOrderId || "",
+      razorpayAmount: payFacts?.razorpayAmount || 0,
       isVouchered: b.isHeld ? false : (b.isVouchered ?? true),
       isHeld: b.isHeld ?? false,
       lastVoucherDate: parseTBODate(b.lastVoucherDate) ?? undefined,
       lastCancellationDate: parseTBODate(b.lastCancellationDate),
-      paymentMode: b.paymentMode === "official" ? "official" : "personal",
+      paymentMode: payFacts?.paymentMode ?? (b.paymentMode === "official" ? "official" : "personal"),
       raw: b.raw ?? null,
       inclusion: typeof b.inclusion === "string" ? b.inclusion : "",
       rateConditions: Array.isArray(b.rateConditions) ? b.rateConditions.map(String) : [],
@@ -2780,8 +2728,10 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
     // Using existing.set().save() triggers the TravelBooking post-save sync hook.
     let doc: any;
     const b_cref = typeof b.clientReferenceId === "string" ? b.clientReferenceId : "";
+    // Only the caller's own bookings, in this workspace, can be filled in or updated.
+    const ownScope = { userId, workspaceId: req.workspaceObjectId };
     if (b_cref) {
-      const prePersist = await SBTHotelBooking.findOne({ clientReferenceId: b_cref });
+      const prePersist = await SBTHotelBooking.findOne({ clientReferenceId: b_cref, ...ownScope });
       if (prePersist) {
         if (prePersist.hotelName) {
           // Already fully saved — idempotent return (e.g. double submit, webhook race).
@@ -2798,17 +2748,23 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       // for TBO-failed bookings (bookingId "0" or empty) since those are
       // legitimately separate documents.
       const hasRealBookingId = !!_bookingData.bookingId && String(_bookingData.bookingId) !== "0";
-      if (hasRealBookingId) {
-        doc = await SBTHotelBooking.findOneAndUpdate(
-          { bookingId: String(_bookingData.bookingId) },
-          { $set: { ...(b_cref ? { clientReferenceId: b_cref } : {}), ..._bookingData } },
-          { upsert: true, new: true, setDefaultsOnInsert: true },
-        );
-      } else {
-        doc = await SBTHotelBooking.create({
-          ...(b_cref ? { clientReferenceId: b_cref } : {}),
-          ..._bookingData,
-        });
+      try {
+        if (hasRealBookingId) {
+          doc = await SBTHotelBooking.findOneAndUpdate(
+            { bookingId: String(_bookingData.bookingId), ...ownScope },
+            { $set: { ...(b_cref ? { clientReferenceId: b_cref } : {}), ..._bookingData } },
+            { upsert: true, new: true, setDefaultsOnInsert: true },
+          );
+        } else {
+          doc = await SBTHotelBooking.create({
+            ...(b_cref ? { clientReferenceId: b_cref } : {}),
+            ..._bookingData,
+          });
+        }
+      } catch (dupErr: any) {
+        // The booking id / reference belongs to someone else's booking.
+        if (dupErr?.code === 11000) return res.status(409).json({ error: "Booking reference already in use" });
+        throw dupErr;
       }
       sbtLogger.info("[SAVE] Booking persisted via " + (hasRealBookingId ? "upsert" : "create"), {
         bookingId: _bookingData.bookingId,
@@ -2817,22 +2773,8 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       });
     }
 
-    // Increment workspace monthly spend for official bookings — never for hold bookings
-    if (b.paymentMode === "official" && !b.isHeld && req.workspaceObjectId) {
-      try {
-        await CustomerWorkspace.findOneAndUpdate(
-          { _id: req.workspaceObjectId },
-          { $inc: { 'sbtOfficialBooking.currentMonthSpend': b.netAmount ?? b.totalFare ?? 0 } },
-          { runValidators: false },
-        );
-      } catch (spendErr) {
-        sbtLogger.error('[OfficialBooking] Failed to track spend', {
-          workspaceId: req.workspaceObjectId,
-          amount: b.totalFare,
-          error: spendErr,
-        });
-      }
-    }
+    // Official (business wallet) spend is reserved by the payment gate before TBO
+    // is called (services/sbtPaymentGate.ts reserveOfficial) — never counted here.
 
     // If this booking fulfils an SBT request, mark it as BOOKED and notify L1
     if (b.sbtRequestId) {

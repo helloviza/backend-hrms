@@ -1,0 +1,419 @@
+// apps/backend/src/routes/sbt.paymentGate.test.ts
+//
+// SBT payment containment: the server prices the order, proves the payment
+// with Razorpay, and books with TBO only after that (or after reserving the
+// business-wallet limit itself).
+//
+// Real: flights + hotels routers, requireSBT / requireFlightAccess /
+//   requireFeature, services/sbtPaymentGate, SBTQuote / SBTPayment /
+//   CustomerWorkspace / SBTHotelBooking, in-memory Mongo, checkout signature.
+// Stubbed: requireAuth / requireWorkspace (from headers), TBO calls, Razorpay
+//   network calls (create order / fetch / capture).
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
+import express from "express";
+import request from "supertest";
+import mongoose from "mongoose";
+import { createHmac } from "crypto";
+import { MongoMemoryServer } from "mongodb-memory-server";
+
+process.env.NODE_ENV = "test";
+process.env.JWT_SECRET ||= "jwt-secret-for-tests";
+process.env.RAZORPAY_KEY_ID = "rzp_test_key";
+process.env.RAZORPAY_KEY_SECRET = "rzp_test_secret";
+delete process.env.TBO_ENV;
+
+vi.mock("../middleware/auth.js", () => {
+  const requireAuth = (req: any, _res: any, next: any) => {
+    req.user = JSON.parse(String(req.headers["x-test-user"] || "{}"));
+    next();
+  };
+  return { requireAuth, default: requireAuth };
+});
+vi.mock("../middleware/requireWorkspace.js", async (orig) => ({
+  ...(await orig<any>()),
+  requireWorkspace: (req: any, _res: any, next: any) => {
+    const id = String(req.headers["x-test-ws"] || "");
+    const sbt = req.headers["x-test-sbt"] !== "off";
+    req.workspaceId = id;
+    req.workspaceObjectId = new mongoose.Types.ObjectId(id);
+    req.workspace = {
+      _id: req.workspaceObjectId,
+      status: "ACTIVE",
+      tenantType: "CORPORATE",
+      config: { features: { sbtEnabled: sbt, flightBookingEnabled: true, hotelBookingEnabled: true } },
+    };
+    next();
+  },
+}));
+vi.mock("../utils/tboFileLogger.js", () => ({ logTBOCall: () => {}, listTBOLogs: () => [], readTBOLog: () => null }));
+vi.mock("../services/tbo.log.consolidator.js", () => ({ consolidateCertificationLogs: async () => {} }));
+vi.mock("../jobs/static-data-refresh.js", () => ({
+  resolveCityCodeAgainstCatalog: () => null,
+  resolveCityCode: () => null,
+  TBOHotelMaster: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
+}));
+
+const tbo = vi.hoisted(() => ({
+  getFareQuote: vi.fn(),
+  getSSR: vi.fn(),
+  ticketLCC: vi.fn(),
+  getBookingDetails: vi.fn(async () => null),
+}));
+vi.mock("../services/tbo.flight.service.js", async (orig) => ({
+  ...(await orig<any>()),
+  getFareQuote: tbo.getFareQuote,
+  getSSR: tbo.getSSR,
+  ticketLCC: tbo.ticketLCC,
+  getBookingDetails: tbo.getBookingDetails,
+}));
+
+const rzp = vi.hoisted(() => ({
+  createRazorpayOrder: vi.fn(),
+  fetchRazorpayPayment: vi.fn(),
+  captureRazorpayPayment: vi.fn(),
+}));
+vi.mock("../services/sbtRazorpay.js", async (orig) => ({
+  ...(await orig<any>()),
+  createRazorpayOrder: rzp.createRazorpayOrder,
+  fetchRazorpayPayment: rzp.fetchRazorpayPayment,
+  captureRazorpayPayment: rzp.captureRazorpayPayment,
+}));
+
+const { default: flightsRouter } = await import("./sbt.flights.js");
+const { default: hotelsRouter } = await import("./sbt.hotels.js");
+const app = express();
+app.use(express.json());
+app.use("/api/sbt/flights", flightsRouter);
+app.use("/api/sbt/hotels", hotelsRouter);
+
+let mongod: MongoMemoryServer;
+const col = (n: string) => mongoose.connection.db!.collection(n);
+const oid = () => new mongoose.Types.ObjectId();
+
+const WS = oid();
+const BOOKER = oid();
+const L1 = oid();
+const OTHER = oid();
+
+const as = (r: request.Test, userId: mongoose.Types.ObjectId, opts: { sbt?: boolean } = {}) =>
+  r
+    .set("x-test-user", JSON.stringify({ _id: String(userId), id: String(userId), sub: String(userId), email: "u@test", roles: ["CUSTOMER"] }))
+    .set("x-test-ws", String(WS))
+    .set("x-test-sbt", opts.sbt === false ? "off" : "on");
+
+const sign = (orderId: string, paymentId: string) =>
+  createHmac("sha256", "rzp_test_secret").update(`${orderId}|${paymentId}`).digest("hex");
+
+let orderSeq = 0;
+
+beforeAll(async () => {
+  mongod = await MongoMemoryServer.create();
+  await mongoose.connect(mongod.getUri("sbt-payment-gate-test"));
+  await mongoose.model("SBTPayment").syncIndexes();
+  // Only the hotel index the overwrite test relies on (the model also declares
+  // clientReferenceId twice, which makes a full syncIndexes fail).
+  await col("sbthotelbookings").createIndex(
+    { bookingId: 1 },
+    { unique: true, partialFilterExpression: { bookingId: { $type: "string", $gt: "0" } }, name: "bookingId_unique_partial" },
+  );
+}, 120_000);
+
+afterAll(async () => {
+  await mongoose.disconnect();
+  await mongod?.stop();
+});
+
+beforeEach(async () => {
+  for (const c of ["users", "customerworkspaces", "sbtquotes", "sbtpayments", "sbtssrsnapshots", "sbthotelbookings", "sbtbookings"]) {
+    await col(c).deleteMany({});
+  }
+  await col("users").insertMany([
+    { _id: BOOKER, email: "booker@test", sbtEnabled: true, sbtRole: null },
+    { _id: L1, email: "l1@test", sbtEnabled: true, sbtRole: "L1" },
+    { _id: OTHER, email: "other@test", sbtEnabled: true, sbtRole: "L2" },
+  ] as any[]);
+  await col("customerworkspaces").insertOne({
+    _id: WS, status: "ACTIVE",
+    sbtOfficialBooking: { enabled: true, monthlyLimit: 20000, currentMonthSpend: 0, lastResetMonth: new Date().toISOString().slice(0, 7) },
+  } as any);
+
+  vi.clearAllMocks();
+  tbo.getFareQuote.mockImplementation(async (body: any) => ({
+    Response: {
+      ResponseStatus: 1,
+      TraceId: body.TraceId,
+      Results: { ResultIndex: body.ResultIndex, IsLCC: true, Fare: { PublishedFare: 11999.5, OfferedFare: 11500, Currency: "INR" } },
+    },
+  }));
+  tbo.getSSR.mockImplementation(async () => ({
+    Response: {
+      ResponseStatus: 1,
+      SeatDynamic: [{ SegmentSeat: [{ RowSeats: [{ Seats: [
+        { Code: "12A", Price: 500, Origin: "DEL", Destination: "BOM" },
+        { Code: "12B", Price: 0, Origin: "DEL", Destination: "BOM" },
+      ] }] }] }],
+      MealDynamic: [[{ Code: "VGML", Price: 300, Origin: "DEL", Destination: "BOM" }]],
+      Baggage: [[{ Code: "XBPA", Price: 1000, Origin: "DEL", Destination: "BOM" }]],
+    },
+  }));
+  tbo.ticketLCC.mockImplementation(async () => ({
+    Response: { ResponseStatus: 1, TraceId: "T1", Response: { BookingId: 777001, PNR: "ABC123" } },
+  }));
+  rzp.createRazorpayOrder.mockImplementation(async (amountPaise: number) => ({
+    id: `order_${++orderSeq}`, amount: amountPaise, currency: "INR",
+  }));
+});
+
+/** FareQuote + SSR as the booking pages do; returns the quoteId. */
+async function quoteFlight(userId = BOOKER, ri = "RI-1") {
+  const fq = await as(request(app).post("/api/sbt/flights/farequote"), userId).send({ TraceId: "T1", ResultIndex: ri });
+  expect(fq.status).toBe(200);
+  await as(request(app).post("/api/sbt/flights/ssr"), userId).send({ TraceId: "T1", ResultIndex: ri });
+  return fq.body.Response.Results.quoteId as string;
+}
+
+const seatPax = (seat: string, price: number) => [{
+  FirstName: "A", LastName: "B", PaxType: 1, IsLeadPax: true,
+  SeatDynamic: [{ SegmentSeat: [{ RowSeats: [{ Seats: [{ Code: seat, Price: price, Origin: "DEL", Destination: "BOM" }] }] }] }],
+}];
+
+/** create-order → Razorpay checkout (stubbed) → verify. Returns the order id. */
+async function payFlight(quoteId: string, passengers: any[] = [], paidPaise?: number) {
+  const order = await as(request(app).post("/api/sbt/flights/payment/create-order"), BOOKER)
+    .send({ quoteIds: [quoteId], Passengers: passengers, amount: 1 });
+  expect(order.status).toBe(200);
+  const paymentId = `pay_${order.body.orderId}`;
+  rzp.fetchRazorpayPayment.mockResolvedValueOnce({
+    id: paymentId, order_id: order.body.orderId, amount: paidPaise ?? order.body.amount, currency: "INR", status: "captured",
+  });
+  const verify = await as(request(app).post("/api/sbt/flights/payment/verify"), BOOKER).send({
+    razorpay_order_id: order.body.orderId, razorpay_payment_id: paymentId, razorpay_signature: sign(order.body.orderId, paymentId),
+  });
+  return { order, verify, paymentId };
+}
+
+const ticket = (userId: mongoose.Types.ObjectId, body: Record<string, unknown>) =>
+  as(request(app).post("/api/sbt/flights/ticket-lcc"), userId).send({
+    TraceId: "T1", ResultIndex: "RI-1", Passengers: [{ FirstName: "A", LastName: "B", PaxType: 1, IsLeadPax: true }], ...body,
+  });
+
+describe("create-order — the server sets the amount", () => {
+  it("ignores a tampered client amount and charges ceil(selling fare) + TBO add-on prices", async () => {
+    const q = await quoteFlight();
+    // Browser claims the seat is free and sends amount ₹1.
+    const res = await as(request(app).post("/api/sbt/flights/payment/create-order"), BOOKER)
+      .send({ quoteIds: [q], Passengers: seatPax("12A", 0), amount: 1 });
+    expect(res.status).toBe(200);
+    expect(res.body.serverAmount).toBe(12000 + 500);
+    expect(rzp.createRazorpayOrder).toHaveBeenCalledWith(1250000, expect.any(String));
+  });
+
+  it("refuses an unknown or someone else's quote", async () => {
+    const q = await quoteFlight(OTHER);
+    const res = await as(request(app).post("/api/sbt/flights/payment/create-order"), BOOKER).send({ quoteIds: [q] });
+    expect(res.status).toBe(410);
+    expect(res.body.code).toBe("FARE_EXPIRED");
+    expect(rzp.createRazorpayOrder).not.toHaveBeenCalled();
+  });
+
+  it("refuses an add-on TBO never priced", async () => {
+    const q = await quoteFlight();
+    const res = await as(request(app).post("/api/sbt/flights/payment/create-order"), BOOKER)
+      .send({ quoteIds: [q], Passengers: seatPax("99Z", 50) });
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("ADDON_NOT_PRICED");
+  });
+});
+
+describe("verify + ticket — paid before TBO", () => {
+  it("tickets after a captured payment for the server amount, and records it", async () => {
+    const q = await quoteFlight();
+    const { verify, order } = await payFlight(q);
+    expect(verify.status).toBe(200);
+    const t = await ticket(BOOKER, { razorpayOrderId: order.body.orderId });
+    expect(t.status).toBe(200);
+    expect(tbo.ticketLCC).toHaveBeenCalledTimes(1);
+    const row: any = await col("sbtpayments").findOne({ razorpayOrderId: order.body.orderId });
+    expect(row.status).toBe("TICKETED");
+    expect(row.tboBookingId).toBe("777001");
+  });
+
+  it("refuses a ₹1 payment against the server's ₹12,000 order — and no ticket", async () => {
+    const q = await quoteFlight();
+    const { verify, order } = await payFlight(q, [], 100);
+    expect(verify.status).toBe(400);
+    expect(verify.body.code).toBe("AMOUNT_MISMATCH");
+    const t = await ticket(BOOKER, { razorpayOrderId: order.body.orderId });
+    expect(t.status).toBe(402);
+    expect(tbo.ticketLCC).not.toHaveBeenCalled();
+  });
+
+  it("refuses a payment that was never captured", async () => {
+    const q = await quoteFlight();
+    const order = await as(request(app).post("/api/sbt/flights/payment/create-order"), BOOKER).send({ quoteIds: [q] });
+    rzp.fetchRazorpayPayment.mockResolvedValueOnce({ id: "pay_x", order_id: order.body.orderId, amount: order.body.amount, currency: "INR", status: "failed" });
+    const v = await as(request(app).post("/api/sbt/flights/payment/verify"), BOOKER).send({
+      razorpay_order_id: order.body.orderId, razorpay_payment_id: "pay_x", razorpay_signature: sign(order.body.orderId, "pay_x"),
+    });
+    expect(v.status).toBe(402);
+  });
+
+  it("refuses a forged signature without asking Razorpay", async () => {
+    const q = await quoteFlight();
+    const order = await as(request(app).post("/api/sbt/flights/payment/create-order"), BOOKER).send({ quoteIds: [q] });
+    const v = await as(request(app).post("/api/sbt/flights/payment/verify"), BOOKER).send({
+      razorpay_order_id: order.body.orderId, razorpay_payment_id: "pay_y", razorpay_signature: "f".repeat(64),
+    });
+    expect(v.status).toBe(400);
+    expect(rzp.fetchRazorpayPayment).not.toHaveBeenCalled();
+  });
+
+  it("refuses a ticket with no payment at all", async () => {
+    await quoteFlight();
+    const t = await ticket(BOOKER, {});
+    expect(t.status).toBe(402);
+    expect(t.body.code).toBe("PAYMENT_REQUIRED");
+    expect(tbo.ticketLCC).not.toHaveBeenCalled();
+  });
+
+  it("refuses a ticket for a flight the payment was not made for", async () => {
+    const q = await quoteFlight();
+    const { order } = await payFlight(q);
+    await quoteFlight(BOOKER, "RI-PRICIER");
+    const t = await ticket(BOOKER, { razorpayOrderId: order.body.orderId, ResultIndex: "RI-PRICIER" });
+    expect(t.status).toBe(409);
+    expect(tbo.ticketLCC).not.toHaveBeenCalled();
+  });
+
+  it("refuses add-ons at ticket time that the payment did not cover", async () => {
+    const q = await quoteFlight();
+    const { order } = await payFlight(q); // paid fare only
+    const t = await ticket(BOOKER, { razorpayOrderId: order.body.orderId, Passengers: seatPax("12A", 0) });
+    expect(t.status).toBe(409);
+    expect(t.body.code).toBe("AMOUNT_NOT_COVERED");
+    expect(tbo.ticketLCC).not.toHaveBeenCalled();
+  });
+
+  it("refuses a replayed payment: one payment, one ticket", async () => {
+    const q = await quoteFlight();
+    const { order, paymentId } = await payFlight(q);
+    expect((await ticket(BOOKER, { razorpayOrderId: order.body.orderId })).status).toBe(200);
+    const again = await ticket(BOOKER, { razorpayOrderId: order.body.orderId });
+    expect(again.status).toBe(409);
+    expect(again.body.code).toBe("PAYMENT_ALREADY_USED");
+    expect(tbo.ticketLCC).toHaveBeenCalledTimes(1);
+
+    // The same captured payment presented against a second order.
+    const q2 = await quoteFlight();
+    const order2 = await as(request(app).post("/api/sbt/flights/payment/create-order"), BOOKER).send({ quoteIds: [q2] });
+    rzp.fetchRazorpayPayment.mockResolvedValueOnce({
+      id: paymentId, order_id: order.body.orderId, amount: order2.body.amount, currency: "INR", status: "captured",
+    });
+    const v2 = await as(request(app).post("/api/sbt/flights/payment/verify"), BOOKER).send({
+      razorpay_order_id: order2.body.orderId, razorpay_payment_id: paymentId, razorpay_signature: sign(order2.body.orderId, paymentId),
+    });
+    expect(v2.status).toBe(400);
+    expect(v2.body.code).toBe("ORDER_MISMATCH");
+  });
+
+  it("a failed TBO ticket leaves the payment usable for a retry", async () => {
+    const q = await quoteFlight();
+    const { order } = await payFlight(q);
+    tbo.ticketLCC.mockResolvedValueOnce({ Response: { ResponseStatus: 2, Error: { ErrorCode: 3, ErrorMessage: "Fare not available" } } });
+    await ticket(BOOKER, { razorpayOrderId: order.body.orderId });
+    const row: any = await col("sbtpayments").findOne({ razorpayOrderId: order.body.orderId });
+    expect(row.status).toBe("PAID");
+    expect((await ticket(BOOKER, { razorpayOrderId: order.body.orderId })).status).toBe(200);
+  });
+});
+
+describe("who may book", () => {
+  it("refuses an L1 requester at create-order and at ticket", async () => {
+    const q = await quoteFlight(L1);
+    const o = await as(request(app).post("/api/sbt/flights/payment/create-order"), L1).send({ quoteIds: [q] });
+    expect(o.status).toBe(403);
+    expect(o.body.code).toBe("NOT_BOOKER");
+    const t = await ticket(L1, { paymentMode: "official", quoteIds: [q] });
+    expect(t.status).toBe(403);
+    expect(tbo.ticketLCC).not.toHaveBeenCalled();
+  });
+
+  it("refuses a workspace that is not on SBT", async () => {
+    const q = await quoteFlight();
+    const t = await as(request(app).post("/api/sbt/flights/ticket-lcc"), BOOKER, { sbt: false })
+      .send({ TraceId: "T1", ResultIndex: "RI-1", Passengers: [], paymentMode: "official", quoteIds: [q] });
+    expect(t.status).toBe(403);
+    const w = await as(request(app).get("/api/sbt/wallet/check?amount=100"), BOOKER, { sbt: false });
+    expect([403, 404]).toContain(w.status);
+    expect(tbo.ticketLCC).not.toHaveBeenCalled();
+  });
+});
+
+describe("business wallet (official booking)", () => {
+  const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.currentMonthSpend;
+
+  it("reserves the server amount before TBO and credits it back when TBO fails", async () => {
+    const q = await quoteFlight();
+    tbo.ticketLCC.mockResolvedValueOnce({ Response: { ResponseStatus: 2, Error: { ErrorMessage: "fail" } } });
+    await ticket(BOOKER, { paymentMode: "official", quoteIds: [q] });
+    expect(await spend()).toBe(0);
+    const t = await ticket(BOOKER, { paymentMode: "official", quoteIds: [q] });
+    expect(t.status).toBe(200);
+    expect(await spend()).toBe(12000);
+  });
+
+  it("refuses when the booking would exceed the monthly limit — TBO never called", async () => {
+    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.currentMonthSpend": 9000 } });
+    const q = await quoteFlight();
+    const t = await ticket(BOOKER, { paymentMode: "official", quoteIds: [q] });
+    expect(t.status).toBe(402);
+    expect(t.body.code).toBe("LIMIT_EXCEEDED");
+    expect(await spend()).toBe(9000);
+    expect(tbo.ticketLCC).not.toHaveBeenCalled();
+  });
+
+  it("two concurrent bookings cannot both pass the limit", async () => {
+    const q = await quoteFlight();
+    const [a, b] = await Promise.all([
+      ticket(BOOKER, { paymentMode: "official", quoteIds: [q] }),
+      ticket(BOOKER, { paymentMode: "official", quoteIds: [q] }),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([200, 402]);
+    expect(await spend()).toBe(12000);
+  });
+});
+
+describe("hotel bookings/save is scoped to the caller", () => {
+  it("cannot overwrite another user's booking with the same booking id or reference", async () => {
+    const theirs = oid();
+    await col("sbthotelbookings").insertOne({
+      _id: theirs, userId: OTHER, workspaceId: WS, bookingId: "555", clientReferenceId: "PLM-theirs",
+      hotelName: "Their Hotel", status: "CONFIRMED", totalFare: 9000,
+    } as any);
+    const byId = await as(request(app).post("/api/sbt/hotels/bookings/save"), BOOKER)
+      .send({ bookingId: "555", hotelName: "Hijack", totalFare: 1, checkIn: "2026-11-01", checkOut: "2026-11-02" });
+    expect(byId.status).toBe(409);
+    // Their reference is not found in the caller's scope, so it is never filled in.
+    await as(request(app).post("/api/sbt/hotels/bookings/save"), BOOKER)
+      .send({ clientReferenceId: "PLM-theirs", hotelName: "Hijack", totalFare: 1, checkIn: "2026-11-01", checkOut: "2026-11-02" });
+    const doc: any = await col("sbthotelbookings").findOne({ _id: theirs });
+    expect(doc.hotelName).toBe("Their Hotel");
+    expect(doc.totalFare).toBe(9000);
+  });
+
+  it("hotel create-order charges the PreBook quote's server total, not the client's", async () => {
+    await col("sbtquotes").insertOne({
+      quoteId: "hq-1", product: "HOTEL", serverDisplayFare: 8450, serverNetFare: 8000, sourceRef: "BC-1",
+      userId: String(BOOKER), workspaceId: String(WS), createdAt: new Date(),
+    } as any);
+    const res = await as(request(app).post("/api/sbt/hotels/payment/create-order"), BOOKER).send({ quoteId: "hq-1", amount: 1 });
+    expect(res.status).toBe(200);
+    expect(rzp.createRazorpayOrder).toHaveBeenCalledWith(845000, expect.any(String));
+  });
+
+  it("hotel voucher booking without payment is refused before TBO", async () => {
+    const res = await as(request(app).post("/api/sbt/hotels/book"), BOOKER)
+      .send({ BookingCode: "BC-1", bookingMode: "voucher", destinationCountryCode: "IN" });
+    expect(res.status).toBe(402);
+  });
+});

@@ -37,6 +37,8 @@ export interface ISBTHotelBooking extends Document {
   mealType: string;
   totalFare: number;
   netAmount: number;
+  // Server's PreBook selling total, stamped at /book — what vouchering a hold costs.
+  serverSellingTotal?: number;
   recommendedSellingRate?: number | null;
   cancellationPolicyText?: string | null;
   isPublishedFare?: boolean;
@@ -159,6 +161,7 @@ const SBTHotelBookingSchema = new Schema(
     mealType: { type: String, default: "" },
     totalFare: { type: Number, default: 0 },
     netAmount: { type: Number, default: 0 },
+    serverSellingTotal: { type: Number },
     recommendedSellingRate: { type: Number, default: null },
     cancellationPolicyText: { type: String, default: null },
     isPublishedFare: { type: Boolean, default: false },

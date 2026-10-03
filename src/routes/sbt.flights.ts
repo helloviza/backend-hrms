@@ -10,6 +10,7 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTQuote from "../models/SBTQuote.js";
+import SBTPayment from "../models/SBTPayment.js";
 import { reconcileQuoteShadow } from "../utils/priceRecon.js";
 import SBTRequest from "../models/SBTRequest.js";
 import SBTConfig from "../models/SBTConfig.js";
@@ -47,6 +48,17 @@ import {
 import { consolidateCertificationLogs } from "../services/tbo.log.consolidator.js";
 import { getCompanySettings } from "../utils/companySettings.js";
 import { maybeRouteToDemoSimulator } from "../utils/demoSimulator.js";
+import {
+  callerScope,
+  sbtBookerGuards,
+  paymentGate,
+  rememberSsr,
+  createOrderHandler,
+  verifyHandler,
+  paymentFactsForSave,
+  reserveOfficial,
+  isRefusal,
+} from "../services/sbtPaymentGate.js";
 
 const router = express.Router();
 
@@ -789,13 +801,22 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
       const fqNetFare = fqQuoteFare._netOfferedFare ?? fqDisplayFare;
       const fqSourceRef = `${req.body?.TraceId ?? ""}:${req.body?.ResultIndex ?? ""}`;
       try {
+        const fqScope = callerScope(req);
         await SBTQuote.create({
           quoteId: fqQuoteId,
           product: "FLIGHT",
           serverDisplayFare: fqDisplayFare,
           serverNetFare: fqNetFare,
           sourceRef: fqSourceRef,
+          workspaceId: fqScope.workspaceId,
+          userId: fqScope.userId,
+          traceIds: [req.body?.TraceId, result?.Response?.TraceId].filter(Boolean).map(String),
+          resultIndexes: [req.body?.ResultIndex, fareResults?.ResultIndex].filter(Boolean).map(String),
+          // What the customer is charged for this leg (margined PublishedFare).
+          sellingFare: Number(fqQuoteFare.PublishedFare) || 0,
         });
+        // Carried to the payment page inside the Results the frontend keeps.
+        fareResults.quoteId = fqQuoteId;
       } catch (qErr: any) {
         // Quote persistence is best-effort scaffolding; never block FareQuote.
         sbtLogger.error("[price-recon] quote persist failed", {
@@ -867,7 +888,7 @@ router.post("/farerule", requireAuth, requireSBT, async (req: any, res: any) => 
 });
 
 // POST /api/sbt/flights/book
-router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any) => {
+router.post("/book", requireSBT, requireFlightAccess, ...sbtBookerGuards, paymentGate("flight-book"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "flight-book")) return;
     // Guard: LCC flights must use /ticket-lcc, not /book
@@ -1008,7 +1029,7 @@ router.post("/book", requireSBT, requireFlightAccess, async (req: any, res: any)
 });
 
 // POST /api/sbt/flights/ticket
-router.post("/ticket", requireAuth, requireSBT, async (req: any, res: any) => {
+router.post("/ticket", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, paymentGate("flight-ticket"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "flight-ticket")) return;
     // Validate ticket-level PAN/passport requirements
@@ -1101,6 +1122,9 @@ router.post("/ssr", requireSBT, async (req: any, res: any) => {
       });
     }
     const result = await getSSR(req.body);
+    // Keep TBO's add-on prices server-side: create-order / ticket price seats,
+    // meals and bags from this, not from the browser.
+    await rememberSsr(req, req.body?.TraceId, req.body?.ResultIndex, result as any);
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1108,7 +1132,7 @@ router.post("/ssr", requireSBT, async (req: any, res: any) => {
 });
 
 // POST /api/sbt/flights/ticket-lcc
-router.post("/ticket-lcc", requireAuth, requireSBT, async (req: any, res: any) => {
+router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, paymentGate("flight-ticket-lcc"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "flight-ticket-lcc")) return;
     const { isReturn, returnResultIndex, returnTraceId, returnPassengers, isSpecialReturn, isReturnGDS } = req.body;
@@ -1653,7 +1677,7 @@ router.get("/booking/pnr/:pnr", requireAuth, async (req: any, res: any) => {
 // ─── Booking persistence routes ──────────────────────────────────────────────
 
 // POST /api/sbt/flights/bookings/save — persist a confirmed booking
-router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any) => {
+router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, async (req: any, res: any) => {
   try {
     const rawId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!rawId) return res.status(401).json({ error: "Not authenticated" });
@@ -1695,7 +1719,7 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
 
     // Task 7: Check if webhook already created/confirmed this booking
     if (b.razorpayOrderId) {
-      const existing = await SBTBooking.findOne({ razorpayOrderId: b.razorpayOrderId });
+      const existing = await SBTBooking.findOne({ razorpayOrderId: b.razorpayOrderId, userId: bookingUserId, workspaceId: req.workspaceObjectId });
       if (existing && existing.status === "CONFIRMED") {
         // Webhook beat the frontend — update with any missing details
         existing.pnr = b.pnr || existing.pnr;
@@ -1777,7 +1801,13 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
         err: normErr?.message,
       });
     }
-    const normTotalFare = Number(b.totalFare) || 0;
+    // Payment facts come from the server's payment row (services/sbtPaymentGate.ts),
+    // never the body: the charged amount, mode and Razorpay ids.
+    const payFacts = await paymentFactsForSave(req, "FLIGHT", {
+      razorpayOrderId: b.razorpayOrderId,
+      tboBookingId: b.bookingId,
+    });
+    const normTotalFare = payFacts ? payFacts.amount : Number(b.totalFare) || 0;
     // Guard: only compute margin when net resolved (>0). If unresolved, leave 0 rather
     // than write a wrong margin from a missing net.
     const normMarginAmount = normNetAmount > 0 ? normTotalFare - normNetAmount : 0;
@@ -1809,7 +1839,7 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       baseFare: b.baseFare,
       taxes: b.taxes ?? 0,
       extras: b.extras ?? 0,
-      totalFare: b.totalFare,
+      totalFare: payFacts ? payFacts.amount : b.totalFare,
       // Keystone normalize (see block above): durable supplier net + margin.
       netAmount: normNetAmount,
       displayAmount: normTotalFare,
@@ -1817,12 +1847,12 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       marginPercent: normMarginPercent,
       currency: b.currency ?? "INR",
       isLCC: b.isLCC ?? false,
-      razorpayPaymentId: b.razorpayPaymentId ?? "",
-      razorpayOrderId: b.razorpayOrderId ?? "",
-      razorpayAmount: b.razorpayAmount ?? 0,
-      paymentStatus: b.paymentStatus ?? "pending",
-      paymentTimestamp: b.paymentTimestamp ? new Date(b.paymentTimestamp) : undefined,
-      paymentMode: b.paymentMode === "official" ? "official" : "personal",
+      razorpayPaymentId: payFacts?.razorpayPaymentId ?? "",
+      razorpayOrderId: payFacts?.razorpayOrderId ?? "",
+      razorpayAmount: payFacts?.razorpayAmount ?? 0,
+      paymentStatus: payFacts ? "paid" : "pending",
+      paymentTimestamp: payFacts?.paidAt ? new Date(payFacts.paidAt) : undefined,
+      paymentMode: payFacts?.paymentMode ?? (b.paymentMode === "official" ? "official" : "personal"),
       fareBreakdown: b.fareBreakdown || undefined,
       ticketingStatus: b.ticketingStatus || "NOT_ATTEMPTED",
       bookedAt: new Date(),
@@ -1855,22 +1885,8 @@ router.post("/bookings/save", requireAuth, requireSBT, async (req: any, res: any
       })(),
     });
 
-    // Increment workspace monthly spend for official bookings
-    if (b.paymentMode === "official" && req.workspaceObjectId) {
-      try {
-        await CustomerWorkspace.findOneAndUpdate(
-          { _id: req.workspaceObjectId },
-          { $inc: { 'sbtOfficialBooking.currentMonthSpend': b.totalFare ?? 0 } },
-          { runValidators: false },
-        );
-      } catch (spendErr) {
-        sbtLogger.error('[OfficialBooking] Failed to track spend', {
-          workspaceId: req.workspaceObjectId,
-          amount: b.totalFare,
-          error: spendErr,
-        });
-      }
-    }
+    // Official (business wallet) spend is reserved by the payment gate before TBO
+    // is called (services/sbtPaymentGate.ts reserveOfficial) — never counted here.
 
     // If this booking fulfils an SBT request, mark it as BOOKED and notify L1
     if (b.sbtRequestId) {
@@ -2791,7 +2807,7 @@ router.get("/bookings/:id/reissue-preview", requireAuth, requireSBT, async (req:
 });
 
 // POST /api/sbt/flights/bookings/:id/reissue-order — create Razorpay order for price difference
-router.post("/bookings/:id/reissue-order", requireAuth, requireSBT, async (req: any, res: any) => {
+router.post("/bookings/:id/reissue-order", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
@@ -2820,6 +2836,13 @@ router.post("/bookings/:id/reissue-order", requireAuth, requireSBT, async (req: 
     if (!orderRes.ok) {
       return res.status(502).json({ error: order?.error?.description || "Razorpay order creation failed" });
     }
+    // Recorded so /payment/verify can check this order against Razorpay. It covers
+    // no ResultIndex, so it can never be claimed for a new booking.
+    await SBTPayment.create({
+      product: "FLIGHT", mode: "RAZORPAY", status: "CREATED", ...callerScope(req),
+      amount: Number(order.amount) / 100, amountPaise: Number(order.amount), baseAmount: Number(order.amount) / 100,
+      razorpayOrderId: order.id, reissueOfBookingId: String(booking._id),
+    });
     res.json({ ok: true, orderId: order.id, amount: order.amount, currency: order.currency, keyId });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Reissue order creation failed";
@@ -2914,25 +2937,21 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, async (req: any, r
         if (expectedSig !== razorpaySignature) {
           return res.status(400).json({ error: "Payment verification failed — signature mismatch" });
         }
-      } else if (paymentMode === "WALLET") {
-        const wsId = workspaceId ?? (doc as any).workspaceId;
-        const workspace = await CustomerWorkspace.findById(wsId).lean();
-        const ob = (workspace as any)?.sbtOfficialBooking;
-        if (!ob?.enabled) {
-          return res.status(400).json({ error: "Official booking (wallet) is not enabled for this workspace" });
-        }
-        const monthKey = new Date().toISOString().slice(0, 7);
-        let currentSpend = ob.currentMonthSpend ?? 0;
-        if (ob.lastResetMonth !== monthKey) currentSpend = 0;
-        const monthlyLimit = ob.monthlyLimit ?? 0;
-        if (monthlyLimit > 0 && currentSpend + numericPriceDiff > monthlyLimit) {
-          return res.status(400).json({ error: "This reissue would exceed your monthly travel limit" });
-        }
-        await CustomerWorkspace.findOneAndUpdate(
-          { _id: wsId },
-          { $inc: { "sbtOfficialBooking.currentMonthSpend": numericPriceDiff } },
-          { runValidators: false },
+        // One verified payment pays for one reissue of THIS booking (verify marked it PAID).
+        const reissuePayment = await SBTPayment.findOneAndUpdate(
+          {
+            razorpayOrderId: String(razorpayOrderId), razorpayPaymentId: String(razorpayPaymentId),
+            reissueOfBookingId: String(doc._id), status: "PAID", ...callerScope(req),
+          },
+          { $set: { status: "CLAIMED", claimedAt: new Date() } },
         );
+        if (!reissuePayment) {
+          return res.status(402).json({ error: "Payment not verified or already used", code: "PAYMENT_REQUIRED" });
+        }
+      } else if (paymentMode === "WALLET") {
+        // Conditional reservation: spend + diff ≤ monthly limit, in one update.
+        const reserved = await reserveOfficial(req, numericPriceDiff);
+        if (isRefusal(reserved)) return res.status(400).json({ error: reserved.error, code: reserved.code });
       }
     }
 
@@ -3044,70 +3063,14 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, async (req: any, r
 
 // ─── Razorpay Payment ───────────────────────────────────────────────────────
 
-// POST /api/sbt/flights/payment/create-order
-router.post("/payment/create-order", requireAuth, async (req: any, res: any) => {
-  try {
-    const { amount, currency = "INR", receipt } = req.body;
-    if (!amount || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+// POST /api/sbt/flights/payment/create-order — Razorpay order for the SERVER
+// price of the quoted fare(s) + add-ons (body: quoteIds, Passengers,
+// returnPassengers). Any client amount is ignored. See services/sbtPaymentGate.ts.
+router.post("/payment/create-order", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, createOrderHandler("FLIGHT"));
 
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!keyId || !keySecret) {
-      return res.status(503).json({ error: "Payment gateway not configured" });
-    }
-
-    const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
-    const orderRes = await fetch("https://api.razorpay.com/v1/orders", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Basic ${auth}`,
-      },
-      body: JSON.stringify({
-        amount: Math.round(amount * 100), // paise
-        currency,
-        receipt: receipt || `sbt_${Date.now()}`,
-      }),
-    });
-    const order = await orderRes.json() as any;
-    if (!orderRes.ok) {
-      return res.status(502).json({ error: order?.error?.description || "Razorpay order creation failed" });
-    }
-    res.json({ ok: true, orderId: order.id, amount: order.amount, currency: order.currency, keyId });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Payment order creation failed";
-    res.status(500).json({ error: msg });
-  }
-});
-
-// POST /api/sbt/flights/payment/verify
-router.post("/payment/verify", requireAuth, async (req: any, res: any) => {
-  try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      return res.status(400).json({ error: "Missing payment verification fields" });
-    }
-
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!keySecret) {
-      return res.status(503).json({ error: "Payment gateway not configured" });
-    }
-
-    const { createHmac } = await import("crypto");
-    const expectedSignature = createHmac("sha256", keySecret)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest("hex");
-
-    if (expectedSignature !== razorpay_signature) {
-      return res.status(400).json({ error: "Payment verification failed — signature mismatch" });
-    }
-
-    res.json({ ok: true, verified: true });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Payment verification failed";
-    res.status(500).json({ error: msg });
-  }
-});
+// POST /api/sbt/flights/payment/verify — signature + the payment fetched from
+// Razorpay must be captured, on this order, for exactly the server amount.
+router.post("/payment/verify", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, verifyHandler("FLIGHT"));
 
 // GET /api/sbt/flights/landing-config — auth-only: recents/promos slot mode + active flight promos
 // Feeds the "Recent trips" landing slot. Reads the same SBTConfig "offers" doc that the

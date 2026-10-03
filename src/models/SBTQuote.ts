@@ -15,6 +15,16 @@ export interface ISBTQuote extends Document {
   serverDisplayFare: number; // margined, customer-facing total
   serverNetFare: number; // raw TBO cost, pre-margin
   sourceRef: string; // hotel: BookingCode | flight: `${TraceId}:${ResultIndex}`
+  // Scope: a quote is usable only by the workspace + user that created it.
+  workspaceId: string;
+  userId: string;
+  // FLIGHT — the TraceId / ResultIndex pairs the quote is valid for (request and
+  // response sides; TBO may re-issue both).
+  traceIds?: string[];
+  resultIndexes?: string[];
+  // FLIGHT — margined PublishedFare: what the customer is charged for the fare
+  // (services/sbtPaymentGate.ts ceils the sum across legs).
+  sellingFare?: number;
   createdAt: Date;
 }
 
@@ -24,6 +34,11 @@ const SBTQuoteSchema = new Schema<ISBTQuote>({
   serverDisplayFare: { type: Number, required: true },
   serverNetFare: { type: Number, required: true },
   sourceRef: { type: String, required: true },
+  workspaceId: { type: String, default: "" },
+  userId: { type: String, default: "" },
+  traceIds: { type: [String], default: undefined },
+  resultIndexes: { type: [String], default: undefined },
+  sellingFare: { type: Number },
   // TTL: rows self-expire 60 min after creation. This exceeds the
   // quote→pay→book window with margin; tunable if that window ever grows.
   createdAt: { type: Date, default: Date.now, expires: 3600 },
