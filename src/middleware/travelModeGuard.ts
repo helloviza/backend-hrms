@@ -12,7 +12,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
  * is left to the route (which answers 404).
  */
 export function requireTravelModeFor(
-  opts: { isStaff: (user: any) => boolean; resolveWorkspaceId: (req: Request) => Promise<unknown> },
+  opts: { isStaff: (req: Request) => boolean; resolveWorkspaceId: (req: Request) => Promise<unknown> },
   ...allowedFlows: string[]
 ) {
   const forCaller = requireTravelMode(...allowedFlows);
@@ -20,7 +20,7 @@ export function requireTravelModeFor(
     try {
       const user = (req as any).user;
       if (!user) return res.status(401).json({ error: "Unauthorized" });
-      if (!opts.isStaff(user)) return forCaller(req, res, next);
+      if (!opts.isStaff(req)) return forCaller(req, res, next);
 
       const wsId = await opts.resolveWorkspaceId(req);
       if (!wsId) return next();

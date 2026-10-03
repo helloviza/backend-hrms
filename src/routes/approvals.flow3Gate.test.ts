@@ -169,7 +169,8 @@ describe("Flow 3 workspace with ONLY approvalDirectEnabled", () => {
       workspaceId: WS_DIRECT, customerId: "D1", frontlinerId: String(oid()), status: "approved", stage: "REQUEST_APPROVED",
       adminState: "pending", cartItems: [], meta: {}, history: [],
     } as any);
-    const r = await as(request(app).post(`/api/proposals/by-request/${String(ar.insertedId)}/draft`), oid(), WS_DIRECT, ["OPS"]);
+    // Plumtrips staff sign in to HOUSE (a HOUSE ADMIN has queue access for oversight).
+    const r = await as(request(app).post(`/api/proposals/by-request/${String(ar.insertedId)}/draft`), oid(), HOUSE, ["ADMIN"]);
     expect([r.status, r.body.error]).toEqual([403, "This flow is not enabled for your workspace"]);
   });
 });

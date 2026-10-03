@@ -141,6 +141,14 @@ beforeAll(async () => {
       _id: new mongoose.Types.ObjectId(u.sub), workspaceId: HOUSE, email: u.email, name: u.name, roles: u.roles, status: "ACTIVE",
     })) as any[],
   );
+  // The booking team = Access Console "Admin Queue" grant (WRITE). The plain
+  // HOUSE employee has none.
+  await col("userpermissions").insertMany(
+    [ASHA, BEN, CHIT, RAVI].map((u) => ({
+      userId: u.sub, email: u.email, workspaceId: String(HOUSE), universe: "STAFF", status: "active", source: "manual",
+      level: { code: "L1", name: "Employee", designation: "" }, modules: { adminQueue: { access: "WRITE", scope: "ALL" } },
+    })) as any[],
+  );
   await col("customers").insertOne({
     _id: CUSTOMER_ID, name: "Acme", workspaceId: WS,
     accountTeam: { accountManager: { userId: new mongoose.Types.ObjectId(RAVI.sub), name: "Ravi", email: RAVI.email } },

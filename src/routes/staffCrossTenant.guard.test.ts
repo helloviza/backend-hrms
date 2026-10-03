@@ -68,9 +68,9 @@ describe("staff ops actions are never scoped to the staff member's own workspace
 
   it("the helpers keep their staff branch (staff by id, everyone else in their own workspace)", () => {
     const a = src("approvals.ts");
-    expect(a).toMatch(/function requestFilterFor\([^)]*\)\s*\{\s*return isStaffAdmin\(req\.user\) \? \{ _id: id \} : \{ _id: id, workspaceId: req\.workspaceObjectId \};/);
+    expect(a).toMatch(/function requestFilterFor\([^)]*\)\s*\{\s*return hasQueueView\(req\) \? \{ _id: id \} : \{ _id: id, workspaceId: req\.workspaceObjectId \};/);
     const p = src("proposals.ts");
-    expect(p).toMatch(/function staffWorkspaceScope\([^)]*\)[^{]*\{\s*return isStaffAdmin\(\(req as AuthedReq\)\.user\) \? undefined : \(req as any\)\.workspaceObjectId;/);
+    expect(p).toMatch(/function staffWorkspaceScope\([^)]*\)[^{]*\{\s*return hasQueueView\(req\) \? undefined : \(req as any\)\.workspaceObjectId;/);
     expect(p).toMatch(/function byIdFor\([^)]*\)\s*\{\s*const ws = staffWorkspaceScope\(req\);\s*return ws \? \{ _id: id, workspaceId: ws \} : \{ _id: id \};/);
   });
 });
@@ -92,7 +92,7 @@ describe("follow-up routes keep acting on the customer's record for staff", () =
     }
     const guard = readFileSync(path.join(here, "../middleware/travelModeGuard.ts"), "utf8");
     expect(guard).toMatch(/export function requireTravelModeFor/);
-    expect(guard).toMatch(/if \(!opts\.isStaff\(user\)\) return forCaller\(req, res, next\);/);
+    expect(guard).toMatch(/if \(!opts\.isStaff\(req\)\) return forCaller\(req, res, next\);/);
     expect(guard).toMatch(/opts\.resolveWorkspaceId\(req\)/);
   });
 
@@ -116,5 +116,32 @@ describe("follow-up routes keep acting on the customer's record for staff", () =
     expect(c).toMatch(/const customerId = String\(req\.workspace\?\.customerId \|\| ""\);/);
     // The bug was returning the CustomerWorkspace id as the CarbonRecord scope.
     expect(c, "tenantScope returns the workspace id again (CarbonRecord.workspaceId is a Customer id)").not.toMatch(/return ws;/);
+  });
+});
+
+/* ── Queue access = the Access Console "Admin Queue" grant (fix/travel-desk-access-permission) ── */
+
+describe("ops queue access comes from the Admin Queue grant, never from roles alone", () => {
+  it("the queue gates resolve adminQueueAccess (grant via holdsCapability; HOUSE only; ADMIN/SUPERADMIN oversight)", () => {
+    const sec = src("approvals.security.ts");
+    expect(sec).toMatch(/holdsCapability\(req, "adminQueue", "READ"\)/);
+    expect(sec).toMatch(/holdsCapability\(req, "adminQueue", "WRITE"\)/);
+    expect(sec).toMatch(/=== PLUMTRIPS_HOUSE_WORKSPACE_ID\)/);
+    expect(sec, "read gate").toMatch(/if \(\(await adminQueueAccess\(req\)\)\.view\) return next\(\);/);
+    expect(sec, "write gate").toMatch(/if \(!\(await adminQueueAccess\(req\)\)\.work\) \{/);
+    expect(src("proposals.ts"), "proposals requireStaff").toMatch(/const a = await adminQueueAccess\(req\);\s*if \(req\.method === "GET" \? a\.view : a\.work\) return next\(\);/);
+  });
+
+  it("no role-based staff test is left in the queue code (approvals, proposals, Travel Desk)", () => {
+    for (const f of ["approvals.ts", "proposals.ts", "approvals.travelDesk.ts", "../services/travelDesk.ts"]) {
+      expect(src(f), f).not.toMatch(/isStaffAdmin\s*\(/);
+    }
+  });
+
+  it("the Travel Desk pool is the grant (WRITE+), with no role filter", () => {
+    const td = src("../services/travelDesk.ts");
+    expect(td).toMatch(/"modules\.adminQueue\.access": \{ \$in: AGENT_ACCESS \}/);
+    expect(td).toMatch(/const AGENT_ACCESS = \["WRITE", "FULL"\];/);
+    expect(td).not.toMatch(/roles: STAFF_ROLE_RE|hrmsAccessRole: STAFF_ROLE_RE/);
   });
 });

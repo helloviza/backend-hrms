@@ -79,16 +79,27 @@ const APPROVER = "approver@cust.test";
 const LEADER = "leader@cust.test";
 const REQUESTER = "requestor@cust.test";
 
-type Who = { email: string; roles?: string[] };
+type Who = { email: string; roles?: string[]; sub?: string; ws?: any };
 const R: Who = { email: REQUESTER };
 const A: Who = { email: APPROVER };
 const L: Who = { email: LEADER, roles: ["WORKSPACE_LEADER"] };
-const OPS: Who = { email: "ops@plumtrips.test", roles: ["OPS"] };
+// Plumtrips ops: signed in to HOUSE, role EMPLOYEE, with the Access Console
+// "Admin Queue" grant (WRITE) — the booking team is defined by that grant.
+const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
+const OPS_SUB = String(oid());
+const OPS: Who = { email: "ops@plumtrips.test", roles: ["EMPLOYEE"], sub: OPS_SUB, ws: HOUSE };
 
 const as = (r: request.Test, who: Who) =>
   r
-    .set("x-test-user", JSON.stringify({ sub: String(oid()), email: who.email, name: who.email.split("@")[0], roles: who.roles || ["EMPLOYEE"] }))
-    .set("x-test-ws", String(WS));
+    .set("x-test-user", JSON.stringify({ sub: who.sub || String(oid()), email: who.email, name: who.email.split("@")[0], roles: who.roles || ["EMPLOYEE"] }))
+    .set("x-test-ws", String(who.ws || WS));
+
+/** An Access Console grant of the "Admin Queue" module. */
+const grantAdminQueue = (sub: string, email: string, access = "WRITE") =>
+  col("userpermissions").insertOne({
+    userId: sub, email, workspaceId: String(HOUSE), universe: "STAFF", status: "active", source: "manual",
+    level: { code: "L1", name: "Employee", designation: "" }, modules: { adminQueue: { access, scope: "ALL" } },
+  } as any);
 
 const flightItem = {
   type: "flight", title: "BLR → BOM", qty: 1, price: 0,
@@ -152,6 +163,8 @@ beforeEach(async () => {
     config: { travelFlow: "APPROVAL_FLOW", tokenExpiryHours: 12, features: { approvalFlowEnabled: true } },
   } as any);
   await col("customermembers").insertOne({ customerId: CUSTOMER_ID, email: LEADER, role: "WORKSPACE_LEADER", isActive: true } as any);
+  await col("customerworkspaces").insertOne({ _id: HOUSE, customerId: "PLUMTRIPS-HOUSE", name: "Plumtrips", status: "ACTIVE", config: { features: {} } } as any);
+  await grantAdminQueue(OPS_SUB, OPS.email);
   await col("users").insertMany([
     { email: APPROVER, name: "Anil Approver", roles: ["CUSTOMER"] },
     { email: LEADER, name: "Lata Leader", roles: ["CUSTOMER"] },
@@ -504,7 +517,7 @@ describe("Proposals list (GET /proposals/mine) is by workspace membership, not l
 });
 
 describe("Ops record the customer's proposal decision on their behalf", () => {
-  const STAFF = { email: "ops@plumtrips.test", roles: ["OPS"] };
+  const STAFF = OPS;
 
   it("needs a note; non-staff cannot use it", async () => {
     const rid = await approvedRequest();
@@ -590,18 +603,16 @@ describe("Plumtrips staff (HOUSE login) work a customer's proposal", () => {
   // Prod shape: the staff token carries the HOUSE workspace, not the customer's.
   // (The other tests here run ops inside the customer's workspace, which is
   // why the HOUSE-scoped lookups looked fine until prod.)
-  const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
   const OTHER_WS = oid();
   const HOUSE_ADMIN: Who = { email: "desk@plumtrips.test", roles: ["ADMIN"] };
   const OUTSIDER: Who = { email: "someone@other.test" };
   const asIn = (r: request.Test, who: Who, ws: any) =>
     r
-      .set("x-test-user", JSON.stringify({ sub: String(oid()), email: who.email, name: who.email.split("@")[0], roles: who.roles || ["EMPLOYEE"] }))
+      .set("x-test-user", JSON.stringify({ sub: who.sub || String(oid()), email: who.email, name: who.email.split("@")[0], roles: who.roles || ["EMPLOYEE"] }))
       .set("x-test-ws", String(ws));
 
   beforeEach(async () => {
     await col("customerworkspaces").insertMany([
-      { _id: HOUSE, customerId: "PLUMTRIPS-HOUSE", name: "Plumtrips", status: "ACTIVE", config: { features: {} } },
       { _id: OTHER_WS, customerId: "O1", name: "Other Co", status: "ACTIVE", tenantType: "CORPORATE", config: { travelFlow: "APPROVAL_FLOW", features: { approvalFlowEnabled: true } } },
     ] as any[]);
   });
@@ -638,18 +649,16 @@ describe("Plumtrips staff (HOUSE login) work a customer's proposal", () => {
 });
 
 describe("travel-mode gate: staff are checked against the CUSTOMER's flow, not HOUSE", () => {
-  const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
   const WS3 = oid(); // a Flow 3 (APPROVAL_DIRECT) customer
-  const HOUSE_OPS: Who = { email: "agent@plumtrips.test", roles: ["OPS"] }; // not ADMIN: no blanket bypass
+  const HOUSE_OPS: Who = OPS; // EMPLOYEE + Admin Queue grant: not ADMIN, no blanket bypass
   const asIn = (r: request.Test, who: Who, ws: any) =>
     r
-      .set("x-test-user", JSON.stringify({ sub: String(oid()), email: who.email, name: who.email.split("@")[0], roles: who.roles || ["EMPLOYEE"] }))
+      .set("x-test-user", JSON.stringify({ sub: who.sub || String(oid()), email: who.email, name: who.email.split("@")[0], roles: who.roles || ["EMPLOYEE"] }))
       .set("x-test-ws", String(ws));
 
   beforeEach(async () => {
+    // HOUSE (no travel flow of its own — the old gate refused OPS agents on that) exists for every test.
     await col("customerworkspaces").insertMany([
-      // HOUSE has no travel flow of its own — the old gate refused OPS agents on that.
-      { _id: HOUSE, customerId: "PLUMTRIPS-HOUSE", name: "Plumtrips", status: "ACTIVE", config: { features: {} } },
       { _id: WS3, customerId: "D3", name: "Direct Co", status: "ACTIVE", tenantType: "CORPORATE", config: { travelFlow: "APPROVAL_DIRECT", features: { approvalDirectEnabled: true } } },
     ] as any[]);
   });

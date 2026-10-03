@@ -75,6 +75,9 @@ let mongod: MongoMemoryServer;
 const col = (n: string) => mongoose.connection.db!.collection(n);
 const oid = () => new mongoose.Types.ObjectId();
 
+// Plumtrips staff sign in to HOUSE (prod shape). STAFF is a HOUSE ADMIN —
+// queue access for oversight, no Admin Queue grant needed.
+const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
 const WS_DIRECT = oid(); // Flow 3
 const WS_FLOW = oid(); // Flow 2
 const APPROVER = "approver@cust.test";
@@ -147,7 +150,11 @@ beforeAll(async () => {
   mongod = await MongoMemoryServer.create();
   await mongoose.connect(mongod.getUri("approval-travellers-test"));
   await mongoose.connection.db!.dropDatabase();
-  await col("customerworkspaces").insertMany([ws(WS_DIRECT, "D1", "APPROVAL_DIRECT"), ws(WS_FLOW, "F1", "APPROVAL_FLOW")] as any[]);
+  await col("customerworkspaces").insertMany([
+    ws(WS_DIRECT, "D1", "APPROVAL_DIRECT"),
+    ws(WS_FLOW, "F1", "APPROVAL_FLOW"),
+    { _id: HOUSE, customerId: "PLUMTRIPS-HOUSE", name: "Plumtrips", status: "ACTIVE", config: { features: {} } },
+  ] as any[]);
   await col("customermembers").insertMany([
     { customerId: "D1", email: LEADER, role: "WORKSPACE_LEADER", isActive: true },
     { customerId: "F1", email: LEADER, role: "WORKSPACE_LEADER", isActive: true },
@@ -282,23 +289,23 @@ describe("manual travellers — any role, on this request only", () => {
 });
 
 describe("staff work every tenant's requests from the ops queue", () => {
-  // STAFF's token workspace (WS_FLOW here, HOUSE in prod) is not the request's
-  // workspace (WS_DIRECT). Ops actions must still find the request.
+  // STAFF's token workspace (HOUSE) is not the request's workspace
+  // (WS_DIRECT). Ops actions must still find the request.
   it("staff from another workspace can open, assign and reveal; a Workspace Leader from another workspace cannot", async () => {
     const r = await submit(REQUESTER, [manual()]);
     const id = r.body.request._id;
     await col("approvalrequests").updateOne({ _id: new mongoose.Types.ObjectId(String(id)) }, { $set: { status: "approved", adminState: "pending" } });
 
-    expect((await as(request(app).get(`/api/approvals/admin/requests/${id}`), STAFF, WS_FLOW)).status).toBe(200);
-    expect((await as(request(app).get(`/api/approvals/requests/${id}`), STAFF, WS_FLOW)).status).toBe(200);
-    expect((await as(request(app).get(`/api/approvals/admin/requests/${id}/selection-snapshot`), STAFF, WS_FLOW)).status).toBe(200);
+    expect((await as(request(app).get(`/api/approvals/admin/requests/${id}`), STAFF, HOUSE)).status).toBe(200);
+    expect((await as(request(app).get(`/api/approvals/requests/${id}`), STAFF, HOUSE)).status).toBe(200);
+    expect((await as(request(app).get(`/api/approvals/admin/requests/${id}/selection-snapshot`), STAFF, HOUSE)).status).toBe(200);
     // Found (a 404 would mean the lookup failed); refused only because the user is not on the Travel Desk.
-    const assign = await as(request(app).put(`/api/approvals/admin/${id}/assign`), STAFF, WS_FLOW).send({ agentUserId: String(oid()) });
+    const assign = await as(request(app).put(`/api/approvals/admin/${id}/assign`), STAFF, HOUSE).send({ agentUserId: String(oid()) });
     expect([assign.status, assign.body.code]).toEqual([400, "NOT_TEAM_AGENT"]);
-    const reveal = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, WS_FLOW)
+    const reveal = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, HOUSE)
       .send({ itemIndex: 0, travellerIndex: 0 });
     expect([reveal.status, reveal.body.passportNumber]).toEqual([200, MANUAL_PASSPORT]);
-    const hold = await as(request(app).put(`/api/approvals/admin/${id}/on-hold`), STAFF, WS_FLOW).send({ comment: "waiting" });
+    const hold = await as(request(app).put(`/api/approvals/admin/${id}/on-hold`), STAFF, HOUSE).send({ comment: "waiting" });
     expect(hold.status).toBe(200);
 
     // Non-staff stay inside their own workspace.
@@ -323,9 +330,9 @@ describe("passport masking", () => {
     const mine = await as(request(app).get("/api/approvals/requests/mine"), REQUESTER, WS_DIRECT);
     expect(JSON.stringify(mine.body)).not.toContain(MANUAL_PASSPORT);
 
-    const staff = await as(request(app).get(`/api/approvals/requests/${id}`), STAFF, WS_DIRECT);
+    const staff = await as(request(app).get(`/api/approvals/requests/${id}`), STAFF, HOUSE);
     expect(staff.body.request.cartItems[0].meta.travellers.map((t: any) => t.passportNumber)).toEqual(["****6543", "****4567"]);
-    const staffQueue = await as(request(app).get("/api/approvals/admin/pending"), STAFF, WS_DIRECT);
+    const staffQueue = await as(request(app).get("/api/approvals/admin/pending"), STAFF, HOUSE);
     expect(staffQueue.status).toBe(200);
     expect(JSON.stringify(staffQueue.body)).not.toMatch(new RegExp(`${PROFILE_PASSPORT}|${MANUAL_PASSPORT}`));
   });
@@ -372,7 +379,7 @@ describe("passport masking", () => {
     const id = r.body.request._id;
     const before: any = await col("approvalrequests").findOne({ _id: new mongoose.Types.ObjectId(String(id)) });
 
-    const reveal = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, WS_DIRECT)
+    const reveal = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, HOUSE)
       .send({ itemIndex: 0, travellerIndex: 1 });
     expect(reveal.status).toBe(200);
     expect(reveal.body.passportNumber).toBe(MANUAL_PASSPORT);
@@ -389,7 +396,7 @@ describe("passport masking", () => {
     expect(raw.history).toHaveLength(before.history.length);
     expect(raw.updatedAt.getTime()).toBe(before.updatedAt.getTime());
 
-    const audit = await as(request(app).get(`/api/approvals/admin/requests/${id}/passport-reveals`), STAFF, WS_DIRECT);
+    const audit = await as(request(app).get(`/api/approvals/admin/requests/${id}/passport-reveals`), STAFF, HOUSE);
     expect(audit.status).toBe(200);
     expect(audit.body.reveals).toHaveLength(1);
     expect(audit.body.reveals[0]).toMatchObject({ byEmail: STAFF.email, travellerName: "Asha Guest" });
@@ -408,10 +415,10 @@ describe("passport masking", () => {
   it("reveal refuses a traveller with no passport and a bad index, recording nothing", async () => {
     const r = await submit(REQUESTER, [{ kind: "manual", firstName: "No", lastName: "Passport" }], { scope: "domestic" });
     const id = r.body.request._id;
-    const none = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, WS_DIRECT)
+    const none = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, HOUSE)
       .send({ itemIndex: 0, travellerIndex: 0 });
     expect(none.status).toBe(404);
-    const bad = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, WS_DIRECT)
+    const bad = await as(request(app).post(`/api/approvals/admin/requests/${id}/passport-reveal`), STAFF, HOUSE)
       .send({ itemIndex: "x", travellerIndex: 0 });
     expect(bad.status).toBe(400);
     const raw: any = await col("approvalrequests").findOne({ _id: new mongoose.Types.ObjectId(String(id)) });

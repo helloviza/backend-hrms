@@ -229,7 +229,9 @@ vi.mock("../middleware/auth.js", () => {
 });
 vi.mock("../middleware/requireWorkspace.js", () => ({
   requireWorkspace: (req: any, _res: any, next: any) => {
-    req.workspaceObjectId = "64b0000000000000000000ff";
+    // Plumtrips staff sign in to HOUSE (x-test-ws); customers to their own workspace.
+    req.workspaceObjectId = String(req.headers["x-test-ws"] || "64b0000000000000000000ff");
+    req.workspaceId = req.workspaceObjectId;
     next();
   },
 }));
@@ -345,7 +347,9 @@ const LEADER = { sub: "U3", email: "wl@cust.com", name: "Wendy Leader", roles: [
 const L1_ROLE = { sub: "U4", email: "l1@cust.com", name: "L One", roles: ["L1"] };
 const STAFF = { sub: "S1", email: "ops@plumtrips.com", name: "Ops", roles: ["ADMIN"] };
 
-const as = (u: any) => ({ "x-test-user": JSON.stringify(u) });
+const HOUSE_WS = "69679a7628330a58d29f2254";
+// STAFF is a HOUSE ADMIN: Admin Queue access for oversight, resolved from the role (no DB here).
+const as = (u: any) => ({ "x-test-user": JSON.stringify(u), ...(u === STAFF ? { "x-test-ws": HOUSE_WS } : {}) });
 
 beforeEach(() => {
   state.overrides = {};

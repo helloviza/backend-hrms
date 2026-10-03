@@ -77,6 +77,7 @@ let mongod: MongoMemoryServer;
 const col = (n: string) => mongoose.connection.db!.collection(n);
 const oid = () => new mongoose.Types.ObjectId();
 
+const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254"); // Plumtrips staff sign in here
 const WS = oid();
 const WS2 = oid();
 const WS_SAAS = oid();
@@ -150,6 +151,7 @@ beforeAll(async () => {
     ws(WS_HYBRID, "C4", "HYBRID"),
     ws(WS_SBT, "C5", "SBT"),
     ws(WS_DIRECT, "C6", "APPROVAL_DIRECT", { features: { approvalDirectEnabled: true } }),
+    { _id: HOUSE, customerId: "PLUMTRIPS-HOUSE", name: "Plumtrips", status: "ACTIVE", config: { features: {} } },
   ] as any[]);
   await col("users").insertMany([
     { _id: U.req, email: `${U.req}@cust.test`, workspaceId: WS, roles: ["EMPLOYEE"] },
@@ -364,7 +366,7 @@ describe("edit and resubmit", () => {
     expect(doc.cartItems[0].meta.selection.legs[0].segments[0].flightNumber).toBe("5321");
     expect(doc.cartItems[0].meta.selection.injected).toBeUndefined();
 
-    const staffEdit = await as(request(app).put(`/api/approvals/requests/${id}`), oid(), WS, ["ADMIN"])
+    const staffEdit = await as(request(app).put(`/api/approvals/requests/${id}`), oid(), HOUSE, ["ADMIN"])
       .send({ cartItems: [flightItem({ optionRef: ref })] });
     expect(staffEdit.status).toBe(200);
     expect(await col("approvalselectionsnapshots").countDocuments()).toBe(1);
@@ -402,19 +404,21 @@ describe("GET /admin/requests/:id/selection-snapshot", () => {
     const id = String((await col("approvalrequests").findOne({}))!._id);
     const url = `/api/approvals/admin/requests/${id}/selection-snapshot`;
 
-    const staff = await as(request(app).get(url), oid(), WS, ["ADMIN"]);
+    const staff = await as(request(app).get(url), oid(), HOUSE, ["ADMIN"]);
     expect(staff.status).toBe(200);
     expect(staff.body.snapshots).toHaveLength(1);
     expect(staff.body.snapshots[0].rawOption.out.Fare.PublishedFare).toBe(5432);
 
     const wl = await as(request(app).get(url), U.wl, WS, ["WORKSPACE_LEADER"]);
-    expect([wl.status, wl.body.reason]).toEqual([403, "NOT_STAFF_ADMIN"]);
+    expect([wl.status, wl.body.reason]).toEqual([403, "NO_ADMIN_QUEUE_ACCESS"]);
     expect(JSON.stringify(wl.body)).not.toMatch(/5432/);
     expect((await as(request(app).get(url), U.req, WS)).status).toBe(403);
 
     // Staff whose token carries another workspace (HOUSE in prod) still see it,
     // and the snapshots come from the request's own workspace.
-    const otherWs = await as(request(app).get(url), oid(), WS2, ["ADMIN"]);
+    // A customer workspace's ADMIN (tenant admin) is not Plumtrips staff.
+    expect((await as(request(app).get(url), oid(), WS2, ["ADMIN"])).status).toBe(403);
+    const otherWs = await as(request(app).get(url), oid(), HOUSE, ["ADMIN"]);
     expect(otherWs.status).toBe(200);
     expect(otherWs.body.snapshots).toHaveLength(1);
   });

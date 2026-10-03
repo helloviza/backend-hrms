@@ -4,6 +4,8 @@ import User from "../models/User.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { maskTailId } from "../utils/piiMask.js";
+import { holdsCapability } from "../services/capabilityProbe.js";
+import { isSuperAdmin as isSuperAdminReq } from "../middleware/isSuperAdmin.js";
 
 export type AnyObj = Record<string, any>;
 export type EmailAction = "approved" | "declined" | "on_hold" | "resend_email";
@@ -506,6 +508,72 @@ export async function resolveLeaderCustomerIds(email: string): Promise<string[]>
   return Array.from(new Set(ids));
 }
 
+/* ────────────────────────────────────────────────────────────────
+ * Ops queue access — the /admin/access "Admin Queue" grant (adminQueue)
+ *
+ * The booking team is whoever holds adminQueue on their UserPermission
+ * (Access Console), not whoever carries an ops role. Resolved per request
+ * (the token carries roles[] only) through holdsCapability, which reads the
+ * live grant with status "active" — a revoked (deleted) or suspended grant
+ * stops working on the next request.
+ *
+ *   view   adminQueue READ+   — open the queue, see requests and proposals
+ *   work   adminQueue WRITE+  — assign, book, proposals, passport reveal,
+ *                               and be a Travel Desk agent
+ *
+ * Only callers signed in to HOUSE are considered: a customer user with any
+ * role (including a tenant admin carrying ADMIN) gets neither. SUPERADMIN,
+ * and ADMIN signed in to HOUSE, keep both for oversight — they are never
+ * Travel Desk agents unless they also hold the grant.
+ * ──────────────────────────────────────────────────────────────── */
+
+export const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
+
+export type AdminQueueAccess = { view: boolean; work: boolean; via: "superadmin" | "admin-role" | "permission" | "none" };
+const NO_QUEUE_ACCESS: AdminQueueAccess = { view: false, work: false, via: "none" };
+
+/**
+ * Resolve once per request and stamp it on `req` (not req.user: a route-level
+ * requireAuth replaces req.user with a fresh object, which would drop it).
+ */
+export async function adminQueueAccess(req: AnyObj): Promise<AdminQueueAccess> {
+  const user = req?.user;
+  if (!user) return NO_QUEUE_ACCESS;
+  if (req.__adminQueue) return req.__adminQueue as AdminQueueAccess;
+
+  let out: AdminQueueAccess = NO_QUEUE_ACCESS;
+  if (isSuperAdminReq(req as any)) {
+    out = { view: true, work: true, via: "superadmin" };
+  } else if (String(req.workspaceId || req.workspaceObjectId || "") === PLUMTRIPS_HOUSE_WORKSPACE_ID) {
+    const roles = (Array.isArray(user.roles) ? user.roles : []).map((r: any) => String(r).trim().toUpperCase());
+    if (roles.includes("ADMIN")) {
+      out = { view: true, work: true, via: "admin-role" };
+    } else if (await holdsCapability(req, "adminQueue", "READ")) {
+      out = { view: true, work: await holdsCapability(req, "adminQueue", "WRITE"), via: "permission" };
+    }
+  }
+  Object.defineProperty(req, "__adminQueue", { value: out, enumerable: false, configurable: true });
+  return out;
+}
+
+/** Router-level: resolve queue access for every request on the router. */
+export async function stampAdminQueueAccess(req: AnyObj, _res: any, next: any) {
+  try {
+    await adminQueueAccess(req);
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** Sync readers of the stamp on req (false when nothing resolved — the safe side). */
+export function hasQueueView(req: any): boolean {
+  return req?.__adminQueue?.view === true;
+}
+export function hasQueueWork(req: any): boolean {
+  return req?.__adminQueue?.work === true;
+}
+
 export async function requireApprovalsAdminRead(req: AnyObj, res: any, next: any) {
   try {
     return requireAuth(req as any, res as any, async () => {
@@ -513,7 +581,7 @@ export async function requireApprovalsAdminRead(req: AnyObj, res: any, next: any
       user = await hydrateUserFromDb(user);
       (req as AnyObj).user = user;
 
-      if (isStaffAdmin(user)) return next();
+      if ((await adminQueueAccess(req)).view) return next();
 
       const leaderCustomerIds = await resolveLeaderCustomerIds(user?.email);
       if (!leaderCustomerIds.length) {
@@ -546,10 +614,10 @@ export async function requireApprovalsAdminWrite(req: AnyObj, res: any, next: an
       user = await hydrateUserFromDb(user);
       (req as AnyObj).user = user;
 
-      if (!isStaffAdmin(user)) {
+      if (!(await adminQueueAccess(req)).work) {
         return res.status(403).json({
-          error: "Admin access required",
-          reason: "NOT_STAFF_ADMIN",
+          error: "Admin Queue access required",
+          reason: "NO_ADMIN_QUEUE_ACCESS",
           debug:
             process.env.NODE_ENV !== "production"
               ? { email: user?.email, roles: collectRoles(user), sub: user?.sub }
@@ -624,8 +692,9 @@ export async function requireCanRaiseRequest(req: AnyObj, res: any, next: any) {
  * ──────────────────────────────────────────────────────────────── */
 
 export function applyLeaderScopeIfNeeded(req: AnyObj, baseFilter: AnyObj) {
-  const user = req.user;
-  if (isStaffAdmin(user)) return baseFilter;
+  // Ops queue access (Admin Queue grant / oversight) sees every customer;
+  // anyone else here is a Workspace Leader, scoped to their customers.
+  if (hasQueueView(req)) return baseFilter;
 
   const ids: string[] = Array.isArray(req.__leaderCustomerIds) ? req.__leaderCustomerIds : [];
   if (!ids.length) return { $and: [baseFilter, { _id: null }] };

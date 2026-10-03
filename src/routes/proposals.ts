@@ -33,7 +33,13 @@ import {
   eCard,
   eRow,
 } from "./approvals.email.js";
-import { sanitizeApprovalForViewer, frontendBaseUrl as appFrontendBaseUrl } from "./approvals.security.js";
+import {
+  sanitizeApprovalForViewer,
+  frontendBaseUrl as appFrontendBaseUrl,
+  adminQueueAccess,
+  hasQueueView,
+  hasQueueWork,
+} from "./approvals.security.js";
 import { markRequestDone, notifyRequesterProgress, notifyProposalReady } from "../services/approvalProgress.js";
 
 type AnyObj = Record<string, any>;
@@ -162,31 +168,6 @@ function pushHistory(by: AnyObj, action: string, note?: string) {
     byName: name,
     note: String(note || "").trim(),
   };
-}
-
-function collectRoles(u: any): string[] {
-  const roles: string[] = [];
-  if (Array.isArray(u?.roles)) roles.push(...u.roles);
-  if (u?.role) roles.push(u.role);
-  if (u?.accountType) roles.push(u.accountType);
-  if (u?.userType) roles.push(u.userType);
-  if (u?.hrmsAccessRole) roles.push(u.hrmsAccessRole);
-  if (u?.hrmsAccessLevel) roles.push(u.hrmsAccessLevel);
-  if (u?.memberRole) roles.push(u.memberRole);
-  if (u?.approvalRole) roles.push(u.approvalRole);
-  return roles.map((r) => String(r).trim().toUpperCase()).filter(Boolean);
-}
-
-function isStaffAdmin(u: any): boolean {
-  const r = collectRoles(u);
-  return (
-    r.includes("ADMIN") ||
-    r.includes("SUPERADMIN") ||
-    r.includes("SUPER_ADMIN") ||
-    r.includes("HR_ADMIN") ||
-    r.includes("OPS") ||
-    r.includes("OPS_ADMIN")
-  );
 }
 
 /**
@@ -613,7 +594,7 @@ const requireAnyAuth: RequestHandler = (req: Request, res: Response, next: NextF
  * by id; anyone else stays inside their own workspace.
  */
 function staffWorkspaceScope(req: Request): any {
-  return isStaffAdmin((req as AuthedReq).user) ? undefined : (req as any).workspaceObjectId;
+  return hasQueueView(req) ? undefined : (req as any).workspaceObjectId;
 }
 function byIdFor(req: Request, id: any) {
   const ws = staffWorkspaceScope(req);
@@ -634,16 +615,24 @@ async function proposalWorkspaceOf(req: Request) {
   return p?.workspaceId || null;
 }
 // Staff are checked against the CUSTOMER's flow (their own is HOUSE).
-const requireFlow2ForRequest = requireTravelModeFor({ isStaff: isStaffAdmin, resolveWorkspaceId: requestWorkspaceOf }, "APPROVAL_FLOW");
-const requireFlow2ForProposal = requireTravelModeFor({ isStaff: isStaffAdmin, resolveWorkspaceId: proposalWorkspaceOf }, "APPROVAL_FLOW");
+const requireFlow2ForRequest = requireTravelModeFor({ isStaff: (req) => hasQueueWork(req), resolveWorkspaceId: requestWorkspaceOf }, "APPROVAL_FLOW");
+const requireFlow2ForProposal = requireTravelModeFor({ isStaff: (req) => hasQueueWork(req), resolveWorkspaceId: proposalWorkspaceOf }, "APPROVAL_FLOW");
 
-const requireStaff: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
-  const u = (req as AuthedReq).user;
-
-  if (!u) return res.status(401).json({ error: "Unauthenticated" });
-  if (isStaffAdmin(u)) return next();
-
-  return res.status(403).json({ error: "Admin access required" });
+/**
+ * Staff proposal routes: the Access Console "Admin Queue" grant (READ to view,
+ * WRITE to draft / submit / book / record), or SUPERADMIN / HOUSE ADMIN for
+ * oversight — the same rule as the approvals queue (adminQueueAccess).
+ */
+const requireStaff: RequestHandler = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const u = (req as AuthedReq).user;
+    if (!u) return res.status(401).json({ error: "Unauthenticated" });
+    const a = await adminQueueAccess(req);
+    if (req.method === "GET" ? a.view : a.work) return next();
+    return res.status(403).json({ error: "Admin Queue access required", reason: "NO_ADMIN_QUEUE_ACCESS" });
+  } catch (e) {
+    return next(e);
+  }
 };
 
 const requireProposalViewer: RequestHandler = async (req: Request, res: Response, next: NextFunction) => {
@@ -651,7 +640,7 @@ const requireProposalViewer: RequestHandler = async (req: Request, res: Response
     const aReq = req as AuthedReq;
 
     if (!aReq.user) return res.status(401).json({ error: "Unauthenticated" });
-    if (isStaffAdmin(aReq.user)) return next();
+    if ((await adminQueueAccess(req)).view) return next();
 
     const userEmail = normEmail(aReq.user?.email);
     if (!userEmail) return res.status(401).json({ error: "Unauthenticated" });
@@ -692,7 +681,7 @@ const requireProposalViewerFromDownloadPath: RequestHandler = async (req: Reques
     const aReq = req as AuthedReq;
 
     if (!aReq.user) return res.status(401).json({ error: "Unauthenticated" });
-    if (isStaffAdmin(aReq.user)) return next();
+    if ((await adminQueueAccess(req)).view) return next();
 
     const userEmail = normEmail(aReq.user?.email);
     if (!userEmail) return res.status(401).json({ error: "Unauthenticated" });
@@ -1744,7 +1733,7 @@ router.get("/:id", requireAnyAuth, requireWorkspace, requireProposalViewer, asyn
     if (!p) return res.status(404).json({ error: "Proposal not found" });
 
     const aReq = req as AuthedReq;
-    const myRoles = isStaffAdmin(aReq.user) ? (["L2", "L0"] as RoleForProposal[]) : ensureArray(aReq._proposalMyRoles);
+    const myRoles = hasQueueView(req) ? (["L2", "L0"] as RoleForProposal[]) : ensureArray(aReq._proposalMyRoles);
     const isOwner = Boolean(aReq._proposalIsOwner);
 
     const enrichedList = await enrichProposalsWithRequestData([{ ...(p as any) }]);

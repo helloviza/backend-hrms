@@ -76,6 +76,7 @@ let mongod: MongoMemoryServer;
 const col = (n: string) => mongoose.connection.db!.collection(n);
 const oid = () => new mongoose.Types.ObjectId();
 
+const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254"); // Plumtrips staff sign in here
 const WS_DIRECT = oid(); // Flow 3
 const WS_FLOW = oid(); // Flow 2
 const WS_NO_LEADER = oid(); // Flow 3, approver set, no Workspace Leader
@@ -124,6 +125,7 @@ beforeAll(async () => {
     ws(WS_DIRECT, "D1", "APPROVAL_DIRECT"),
     ws(WS_FLOW, "F1", "APPROVAL_FLOW"),
     ws(WS_NO_LEADER, "N1", "APPROVAL_DIRECT"),
+    { _id: HOUSE, customerId: "PLUMTRIPS-HOUSE", name: "Plumtrips", status: "ACTIVE", config: { features: {} } },
   ] as any[]);
   await col("customermembers").insertMany([
     { customerId: "D1", email: LEADER, role: "WORKSPACE_LEADER", isActive: true },
@@ -172,7 +174,8 @@ describe("Flow 3 (APPROVAL_DIRECT) requires approver approval", () => {
     const row = queue.body.rows.find((x: any) => String(x._id) === String(doc._id));
     expect(row?.meta?.travelFlow).toBe("APPROVAL_DIRECT");
 
-    const draft = await as(request(app).post(`/api/proposals/by-request/${String(doc._id)}/draft`), { email: "ops@plumtrips.test", roles: ["OPS"] }, WS_DIRECT);
+    // Plumtrips staff sign in to HOUSE; the customer's flow (Flow 3) refuses a proposal.
+    const draft = await as(request(app).post(`/api/proposals/by-request/${String(doc._id)}/draft`), { email: "ops@plumtrips.test", roles: ["ADMIN"] }, HOUSE);
     expect([draft.status, draft.body.error]).toEqual([403, "This flow is not enabled for your workspace"]);
   });
 

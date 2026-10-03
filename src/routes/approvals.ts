@@ -38,8 +38,11 @@ import {
   hydrateUserFromDb,
   isManagerOrLeaderOfRequest,
   isOwnerOfRequest,
-  isStaffAdmin,
   isValidObjectId,
+  adminQueueAccess,
+  stampAdminQueueAccess,
+  hasQueueView,
+  hasQueueWork,
   normEmail,
   normStr,
   normalizeAction,
@@ -56,7 +59,7 @@ import {
 } from "./approvals.security.js";
 import approvalSearchRouter from "./approvals.search.js";
 import travelDeskRouter from "./approvals.travelDesk.js";
-import { assignCase, autoAllocate, TravelDeskError } from "../services/travelDesk.js";
+import { assignCase, autoAllocate, TravelDeskError, flagNeedsReassignment } from "../services/travelDesk.js";
 import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
 import { markRequestDone, notifyRequesterProgress, latestProposalsFor } from "../services/approvalProgress.js";
 import {
@@ -132,7 +135,7 @@ function sendTravellerError(res: any, e: TravellerError) {
  * look up by id; anyone else stays inside their own workspace.
  */
 function requestFilterFor(req: AnyObj, id: string) {
-  return isStaffAdmin(req.user) ? { _id: id } : { _id: id, workspaceId: req.workspaceObjectId };
+  return hasQueueView(req) ? { _id: id } : { _id: id, workspaceId: req.workspaceObjectId };
 }
 
 /**
@@ -140,13 +143,16 @@ function requestFilterFor(req: AnyObj, id: string) {
  * sanitiser (no prices, passport last 4); staff keep prices but also get
  * passport last 4 — the full number only via the audited passport-reveal.
  */
-function forViewer(doc: any, user: any) {
-  return isStaffAdmin(user) ? maskPassportsForStaff(doc) : sanitizeApprovalForViewer(doc, user);
+function forViewer(doc: any, req: AnyObj) {
+  return hasQueueView(req) ? maskPassportsForStaff(doc) : sanitizeApprovalForViewer(doc, req.user);
 }
 
 const router = Router();
 router.use(requireAuth);
 router.use(requireWorkspace);
+// Ops queue access (Access Console "Admin Queue" grant, or SUPERADMIN / HOUSE
+// ADMIN for oversight), resolved once for every route below.
+router.use(stampAdminQueueAccess);
 // Flow 2 (approvalFlowEnabled) and Flow 3 (approvalDirectEnabled) share this
 // router: request form, search, my requests, inbox, booking history. Which
 // flow a route serves is decided per-route by requireTravelMode.
@@ -156,6 +162,17 @@ router.use(requireAnyFeature("approvalFlowEnabled", "approvalDirectEnabled"));
 router.use("/search", approvalSearchRouter);
 // Travel Desk team settings + Assign picker (staff only, own guard inside).
 router.use("/travel-desk", travelDeskRouter);
+
+/**
+ * The caller's ops-queue access — the ONE rule the queue page, its nav link
+ * and every queue API share (adminQueueAccess in approvals.security.ts), so
+ * page and API can never disagree. Customers get { view: false, work: false }.
+ */
+router.get("/queue-access", async (req: AnyObj, res) => {
+  setNoStore(res);
+  const a = await adminQueueAccess(req);
+  res.json({ ok: true, view: a.view, work: a.work, via: a.via });
+});
 
 /* ───────────────────────── uploads (PDF attachments) ───────────────────────── */
 
@@ -732,7 +749,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       await doc.save();
     }
 
-    res.json({ ok: true, request: forViewer(doc, req.user), message: "Submitted for approval" });
+    res.json({ ok: true, request: forViewer(doc, req), message: "Submitted for approval" });
   } catch (err) {
     next(err);
   }
@@ -752,7 +769,7 @@ router.get("/self-traveller", requireAuth, requireWorkspace, async (req: AnyObj,
     res.json({
       ok: true,
       ...result,
-      traveller: result.traveller ? forViewer(result.traveller, req.user) : null,
+      traveller: result.traveller ? forViewer(result.traveller, req) : null,
     });
   } catch (err) {
     next(err);
@@ -782,7 +799,7 @@ router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("A
     // link to the requester's read-only proposal view.
     const proposals = await latestProposalsFor(rows.map((r: any) => r._id));
     const safeRows = rows.map((r: any) => ({
-      ...forViewer(r, req.user),
+      ...forViewer(r, req),
       _proposal: proposals.get(String(r._id)) || undefined,
     }));
     res.json({ rows: safeRows });
@@ -835,7 +852,7 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
       .lean()
       .exec();
 
-    const safeRows = rows.map((r: any) => forViewer(r, req.user));
+    const safeRows = rows.map((r: any) => forViewer(r, req));
     res.json({ rows: safeRows });
   } catch (err) {
     next(err);
@@ -855,11 +872,11 @@ router.get("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
 
     const user = req.user;
     const canView =
-      isStaffAdmin(user) || isOwnerOfRequest(doc, user) || isManagerOrLeaderOfRequest(doc, user);
+      hasQueueView(req) || isOwnerOfRequest(doc, user) || isManagerOrLeaderOfRequest(doc, user);
 
     if (!canView) return res.status(403).json({ error: "Not allowed" });
 
-    res.json({ ok: true, request: forViewer(doc, user) });
+    res.json({ ok: true, request: forViewer(doc, req) });
   } catch (err) {
     next(err);
   }
@@ -872,11 +889,12 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
       return res.status(400).json({ error: "Invalid request id" });
     }
 
-    const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
+    // Staff (Admin Queue) edit any tenant's request; everyone else their own.
+    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     const user = req.user;
-    if (!isOwnerOfRequest(doc, user) && !isStaffAdmin(user)) {
+    if (!isOwnerOfRequest(doc, user) && !hasQueueWork(req)) {
       return res.status(403).json({ error: "Only requester can edit this" });
     }
 
@@ -909,12 +927,12 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
       prepared = await prepareCartSelections({
         cartItems: await prepareCartTravellers({
           cartItems: withoutOneWayReturnDate(cartItems),
-          workspaceId: req.workspaceObjectId,
+          workspaceId: doc.workspaceId,
           ownerUserId: String(doc.frontlinerId || ""),
           existingCartItems: JSON.parse(JSON.stringify(doc.cartItems || [])),
         }),
         userId: sub,
-        workspaceId: req.workspaceObjectId,
+        workspaceId: doc.workspaceId,
         requestId: doc._id,
       });
     } catch (e) {
@@ -941,13 +959,13 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
     if (hadOptionRefs || prepared.snapshots.length) {
       await writeSelectionSnapshots({
         requestId: doc._id,
-        workspaceId: req.workspaceObjectId,
+        workspaceId: doc.workspaceId,
         userId: sub,
         snapshots: prepared.snapshots,
         prune: true,
       });
     }
-    res.json({ ok: true, request: forViewer(doc, req.user), message: "Updated" });
+    res.json({ ok: true, request: forViewer(doc, req), message: "Updated" });
   } catch (err) {
     next(err);
   }
@@ -994,7 +1012,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
 
     // resend logic (unchanged)
     if (action === "resend_email") {
-      if (!isOwnerOfRequest(doc, req.user) && !isStaffAdmin(req.user)) {
+      if (!isOwnerOfRequest(doc, req.user) && !hasQueueWork(req)) {
         return res.status(403).json({ error: "Only requester can resend approval email" });
       }
 
@@ -1057,7 +1075,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
         doc.meta.resendCount = Number(doc.meta.resendCount || 0) + 1;
 
         await doc.save();
-        return res.json({ ok: true, request: forViewer(doc, req.user), message: "Resent approval email" });
+        return res.json({ ok: true, request: forViewer(doc, req), message: "Resent approval email" });
       } catch (e) {
         if (process.env.NODE_ENV !== "production") {
           // eslint-disable-next-line no-console
@@ -1085,7 +1103,7 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
       throw e;
     }
 
-    res.json({ ok: true, request: forViewer(decided, req.user), message: "Updated" });
+    res.json({ ok: true, request: forViewer(decided, req), message: "Updated" });
   } catch (err) {
     next(err);
   }
@@ -1127,7 +1145,7 @@ router.post("/requests/:id/clarification", requireAuth, requireWorkspace, requir
         reply: req.body?.reply,
         edited,
       });
-      return res.json({ ok: true, request: forViewer(updated, req.user), message: "Reply sent to your approver" });
+      return res.json({ ok: true, request: forViewer(updated, req), message: "Reply sent to your approver" });
     } catch (e) {
       if (e instanceof DecisionError) return res.status(e.status).json({ error: e.message, code: e.code });
       throw e;
@@ -1152,7 +1170,8 @@ router.get("/admin/pending", requireApprovalsAdminRead, async (req: AnyObj, res,
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows: rows.map((r: any) => forViewer(r, req.user)) });
+    if (hasQueueView(req)) await flagNeedsReassignment(rows as any[]);
+    res.json({ rows: rows.map((r: any) => forViewer(r, req)) });
   } catch (err) {
     next(err);
   }
@@ -1176,8 +1195,9 @@ router.get("/admin/approved", requireApprovalsAdminRead, async (req: AnyObj, res
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
+    if (hasQueueView(req)) await flagNeedsReassignment(rows as any[]);
 
-    res.json({ rows: rows.map((r: any) => forViewer(r, req.user)) });
+    res.json({ rows: rows.map((r: any) => forViewer(r, req)) });
   } catch (err) {
     next(err);
   }
@@ -1194,7 +1214,7 @@ router.get("/admin/done", requireApprovalsAdminRead, async (req: AnyObj, res, ne
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows: rows.map((r: any) => forViewer(r, req.user)) });
+    res.json({ rows: rows.map((r: any) => forViewer(r, req)) });
   } catch (err) {
     next(err);
   }
@@ -1211,7 +1231,7 @@ router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows: rows.map((r: any) => forViewer(r, req.user)) });
+    res.json({ rows: rows.map((r: any) => forViewer(r, req)) });
   } catch (err) {
     next(err);
   }
@@ -1230,7 +1250,7 @@ router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj,
 
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
-    res.json(forViewer(doc, req.user));
+    res.json(forViewer(doc, req));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1243,8 +1263,8 @@ router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj,
  */
 router.get("/admin/requests/:id/selection-snapshot", async (req: AnyObj, res, next) => {
   try {
-    if (!isStaffAdmin(req.user)) {
-      return res.status(403).json({ error: "Staff only", reason: "NOT_STAFF_ADMIN" });
+    if (!hasQueueView(req)) {
+      return res.status(403).json({ error: "Admin Queue access required", reason: "NO_ADMIN_QUEUE_ACCESS" });
     }
     const id = String(req.params.id || "");
     if (!mongoose.Types.ObjectId.isValid(id)) {
@@ -1268,7 +1288,7 @@ router.get("/admin/requests/:id/selection-snapshot", async (req: AnyObj, res, ne
  * payload above masks it (last 4); this is the one way to read it, and each
  * read is recorded in passportReveals (who, which request, which traveller,
  * when) BEFORE the number is returned — no audit, no number. Customers and
- * Workspace Leaders get 403 (requireApprovalsAdminWrite = isStaffAdmin).
+ * Workspace Leaders get 403 (requireApprovalsAdminWrite = Admin Queue WRITE).
  */
 router.post("/admin/requests/:id/passport-reveal", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
   try {
@@ -1363,7 +1383,7 @@ router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: A
     await doc.save();
     if (!wasInProgress) await notifyRequesterProgress(doc, "booking_started");
 
-    res.json({ success: true, doc: forViewer(doc, req.user) });
+    res.json({ success: true, doc: forViewer(doc, req) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1401,7 +1421,7 @@ router.put("/admin/:id/assign", requireApprovalsAdminWrite, async (req: AnyObj, 
       note: req.body?.comment,
       via: "manual",
     });
-    res.json({ ok: true, request: forViewer(doc, req.user), message: "Assigned" });
+    res.json({ ok: true, request: forViewer(doc, req), message: "Assigned" });
   } catch (err) {
     if (err instanceof TravelDeskError) return sendTravelDeskError(res, err);
     next(err);
@@ -1428,7 +1448,7 @@ router.put("/admin/:id/unassign", requireApprovalsAdminWrite, async (req: AnyObj
       note: req.body?.comment,
       via: "manual",
     });
-    res.json({ ok: true, request: forViewer(doc, req.user), message: "Unassigned" });
+    res.json({ ok: true, request: forViewer(doc, req), message: "Unassigned" });
   } catch (err) {
     if (err instanceof TravelDeskError) return sendTravelDeskError(res, err);
     next(err);
@@ -1483,7 +1503,7 @@ router.put(
         await syncProposalBookingStatus(String((linkedProposalUp as any)._id), "IN_PROGRESS");
       }
 
-      return res.json({ ok: true, request: forViewer(doc, req.user), message: "Marked as under process" });
+      return res.json({ ok: true, request: forViewer(doc, req), message: "Marked as under process" });
     } catch (err) {
       next(err);
     }
@@ -1517,7 +1537,7 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
       bookingAmount,
       actualBookingPrice,
     });
-    return res.json({ ok: true, request: forViewer(out.doc, req.user), message: out.message });
+    return res.json({ ok: true, request: forViewer(out.doc, req), message: out.message });
   } catch (err) {
     next(err);
   }
@@ -1631,7 +1651,7 @@ router.get("/attachments/:filename/download", requireAuth, async (req: AnyObj, r
     if (!doc) return res.status(404).json({ error: "Attachment not found" });
 
     const canView =
-      isStaffAdmin(req.user) || isOwnerOfRequest(doc, req.user) || isManagerOrLeaderOfRequest(doc, req.user);
+      hasQueueView(req) || isOwnerOfRequest(doc, req.user) || isManagerOrLeaderOfRequest(doc, req.user);
 
     if (!canView) return res.status(403).json({ error: "Not allowed" });
 
@@ -1688,7 +1708,7 @@ router.put("/admin/:id/on-hold", requireApprovalsAdminWrite, async (req: AnyObj,
 
     await doc.save();
     if (!wasOnHold) await notifyRequesterProgress(doc, "ops_on_hold", comment);
-    res.json({ ok: true, request: forViewer(doc, req.user), message: "Placed on hold" });
+    res.json({ ok: true, request: forViewer(doc, req), message: "Placed on hold" });
   } catch (err) {
     next(err);
   }
@@ -1724,7 +1744,7 @@ router.put("/admin/:id/cancel", requireApprovalsAdminWrite, async (req: AnyObj, 
 
     await doc.save();
     await notifyRequesterProgress(doc, "cancelled", comment);
-    res.json({ ok: true, request: forViewer(doc, req.user), message: "Cancelled" });
+    res.json({ ok: true, request: forViewer(doc, req), message: "Cancelled" });
   } catch (err) {
     next(err);
   }
@@ -1745,7 +1765,7 @@ router.put("/requests/:id/revoke", requireAuth, requireWorkspace, async (req: An
     const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
-    if (!isOwnerOfRequest(doc, req.user) && !isStaffAdmin(req.user)) {
+    if (!isOwnerOfRequest(doc, req.user) && !hasQueueWork(req)) {
       return res.status(403).json({ error: "Only the requester can revoke this request" });
     }
 
@@ -1775,7 +1795,7 @@ router.put("/requests/:id/revoke", requireAuth, requireWorkspace, async (req: An
       { new: true }
     );
 
-    res.json({ ok: true, request: forViewer(updated, req.user), message: "Request revoked" });
+    res.json({ ok: true, request: forViewer(updated, req), message: "Request revoked" });
   } catch (err) {
     next(err);
   }
@@ -1796,7 +1816,7 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
     const doc: any = await ApprovalRequest.findOne({ _id: id, workspaceId: req.workspaceObjectId });
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
-    if (!isOwnerOfRequest(doc, req.user) && !isStaffAdmin(req.user)) {
+    if (!isOwnerOfRequest(doc, req.user) && !hasQueueWork(req)) {
       return res.status(403).json({ error: "Only the requester can resubmit this request" });
     }
 
@@ -1908,7 +1928,7 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
       }
     } catch { /* non-blocking */ }
 
-    res.json({ ok: true, request: forViewer(updated, req.user), message: "Resubmitted" });
+    res.json({ ok: true, request: forViewer(updated, req), message: "Resubmitted" });
   } catch (err) {
     next(err);
   }

@@ -19,12 +19,17 @@ import Customer from "../models/Customer.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { sendMail } from "../utils/mailer.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
-import { isStaffAdmin, frontendBaseUrl, DISABLE_EMAILS } from "../routes/approvals.security.js";
+import { frontendBaseUrl, DISABLE_EMAILS, PLUMTRIPS_HOUSE_WORKSPACE_ID } from "../routes/approvals.security.js";
+import { UserPermission } from "../models/UserPermission.js";
 
-export const HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
+export const HOUSE_WORKSPACE_ID = PLUMTRIPS_HOUSE_WORKSPACE_ID;
 
-/** Ops roles the approvals queue honours (isStaffAdmin), any case. */
-const STAFF_ROLE_RE = /^(admin|superadmin|super_admin|hr_admin|ops|ops_admin)$/i;
+/**
+ * The booking team: Access Console "Admin Queue" grant at WRITE or above
+ * (WRITE = may act on cases; READ only views). Roles play no part — an ADMIN
+ * or SUPERADMIN is an agent only if they hold the grant too.
+ */
+const AGENT_ACCESS = ["WRITE", "FULL"];
 
 /** A case counts toward an agent's load until it is done or cancelled. */
 export const OPEN_ADMIN_STATES = ["assigned", "in_progress", "on_hold"];
@@ -54,19 +59,47 @@ function displayName(u: any) {
   return str(u?.name) || [str(u?.firstName), str(u?.lastName)].filter(Boolean).join(" ") || str(u?.email) || "Unnamed";
 }
 
-/** Who may be put on the desk: active HOUSE users the ops queue lets act on a case. */
+/**
+ * Who may be put on the desk: active HOUSE users whose Admin Queue grant is
+ * active at WRITE+ (live read — a revoked, suspended or downgraded grant, or a
+ * deactivated user, drops out on the next call; nothing is cached).
+ */
 export async function candidatePool(): Promise<Person[]> {
+  const grants = (await UserPermission.find({
+    status: "active",
+    universe: "STAFF",
+    "modules.adminQueue.access": { $in: AGENT_ACCESS },
+  })
+    .select("userId")
+    .lean()) as any[];
+  const ids = grants.map((g) => String(g.userId || "")).filter((id) => mongoose.isValidObjectId(id));
+  if (!ids.length) return [];
   const users = (await User.find({
+    _id: { $in: ids },
     workspaceId: new mongoose.Types.ObjectId(HOUSE_WORKSPACE_ID),
     ...activeUserFilter(),
-    $or: [{ roles: STAFF_ROLE_RE }, { hrmsAccessRole: STAFF_ROLE_RE }],
   })
-    .select("_id name firstName lastName email roles hrmsAccessRole")
+    .select("_id name firstName lastName email")
     .lean()) as any[];
   return users
-    .filter((u) => isStaffAdmin(u))
     .map((u) => ({ userId: String(u._id), name: displayName(u), email: str(u.email).toLowerCase() }))
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Staff queue rows: mark open cases whose assignee no longer has queue access
+ * (grant revoked / suspended / below WRITE, or user deactivated) as
+ * `needsReassignment` — computed on read, so it is never stale and never
+ * silently left with someone who cannot work it.
+ */
+export async function flagNeedsReassignment<T extends Record<string, any>>(rows: T[]): Promise<T[]> {
+  const held = rows.filter((r) => str(r?.meta?.adminAssigned?.userId) && !["done", "cancelled"].includes(str(r?.adminState).toLowerCase()));
+  if (!held.length) return rows;
+  const eligible = new Set((await candidatePool()).map((p) => p.userId));
+  for (const r of held) {
+    if (!eligible.has(str(r.meta.adminAssigned.userId))) (r as any).needsReassignment = true;
+  }
+  return rows;
 }
 
 export async function getSettings(): Promise<DeskSettings> {
