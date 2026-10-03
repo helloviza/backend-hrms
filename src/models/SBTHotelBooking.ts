@@ -126,6 +126,8 @@ export interface ISBTHotelBooking extends Document {
   closedAt?: Date;
   reminders?: Array<{ type: "24h" | "1h"; sentAt: Date }>;
   isDemo?: boolean;
+  // Internal test data — see scripts/mark-sbt-test-data.ts.
+  isTest?: boolean;
   createdByDemoUser?: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -257,6 +259,7 @@ const SBTHotelBookingSchema = new Schema(
     }],
     // Demo Platform — booking authored under impersonation / seeded for a demo workspace
     isDemo: { type: Boolean, default: false, index: true },
+    isTest: { type: Boolean, default: false, index: true },
     createdByDemoUser: { type: Boolean, default: false, index: true },
   },
   { timestamps: true },
@@ -307,6 +310,9 @@ SBTHotelBookingSchema.post("save", async function (doc: any) {
         source: "SBT",
         reference: doc._id,
         referenceModel: "SBTHotelBooking",
+        // Mirror the flags every TravelBooking reader filters on.
+        isDemo: doc.isDemo === true,
+        isTest: doc.isTest === true,
         destination: doc.cityName || "",
         // Cities-only Top Destinations: carry the authoritative source city +
         // country through (previously countryCode was dropped). countryCode is

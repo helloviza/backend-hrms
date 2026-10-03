@@ -51,3 +51,9 @@ export function fetchRazorpayPayment(paymentId: string): Promise<any> {
 export function captureRazorpayPayment(paymentId: string, amountPaise: number): Promise<any> {
   return call("POST", `/payments/${encodeURIComponent(paymentId)}/capture`, { amount: amountPaise, currency: "INR" });
 }
+
+/** Refund (part of) a captured payment. Razorpay processes it asynchronously;
+ *  the refund.processed webhook confirms it. */
+export function refundRazorpayPayment(paymentId: string, amountPaise: number, notes: Record<string, string> = {}): Promise<any> {
+  return call("POST", `/payments/${encodeURIComponent(paymentId)}/refund`, { amount: amountPaise, speed: "normal", notes });
+}

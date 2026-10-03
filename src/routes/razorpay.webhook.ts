@@ -30,6 +30,8 @@ import VisaD2CLead from "../models/VisaD2CLead.js";
 import { logVisaActivity } from "../models/VisaActivityLog.js";
 import { issueD2CInvoiceForApplication } from "../services/d2cInvoicing.js";
 import { webhookLogger } from "../utils/logger.js";
+import SBTPayment from "../models/SBTPayment.js";
+import { markPaidFromWebhook } from "../services/sbtFulfil.js";
 
 const router = Router();
 
@@ -470,6 +472,14 @@ router.post("/razorpay", async (req: Request, res: Response) => {
       const amount: number = paymentEntity.amount || 0;
       const currency: string = paymentEntity.currency || "INR";
 
+      // SBT checkout orders (services/sbtFulfil.ts): marked PAID only when the
+      // captured amount matches the server order, then booked server-side — this
+      // is what completes a booking whose browser closed after paying.
+      if (await markPaidFromWebhook(paymentEntity)) {
+        webhookLogger.info("payment.captured — SBT checkout", { razorpayOrderId });
+        return res.status(200).json({ received: true });
+      }
+
       const booking = await findBookingByOrderId(razorpayOrderId);
       if (isD2C(booking)) {
         // Branches BEFORE the SBT mutation below: a VisaApplication does
@@ -511,15 +521,37 @@ router.post("/razorpay", async (req: Request, res: Response) => {
         payload?.payload?.payment?.entity?.error?.description ||
         "Payment failed";
 
+      // SBT checkout: a failed attempt changes nothing — the customer can retry
+      // on the same order, and only a captured payment moves it. Noted for ops.
+      const checkout = await SBTPayment.updateOne(
+        { razorpayOrderId, status: "CREATED" },
+        { $set: { lastPaymentFailure: String(failureReason).slice(0, 300) } },
+      );
+      if (checkout.matchedCount > 0) {
+        webhookLogger.info("payment.failed — SBT checkout attempt failed (order stays open)", { razorpayOrderId });
+        return res.status(200).json({ received: true });
+      }
+
       const booking = await findBookingByOrderId(razorpayOrderId);
       if (isD2C(booking)) {
         await handleD2CPaymentFailed(booking!.doc as any, paymentEntity);
       } else if (booking) {
-        booking.doc.status = "FAILED";
-        (booking.doc as any).failureReason = failureReason;
-        (booking.doc as any).webhookProcessed = true;
-        await booking.doc.save();
-        webhookLogger.info("payment.failed — booking marked failed", { type: booking.type, razorpayOrderId });
+        /* Never demote a confirmed booking. Razorpay can deliver a failed
+         * attempt AFTER a successful retry on the same order (and late in
+         * general); applying it in arrival order used to flip a CONFIRMED,
+         * ticketed booking to FAILED. Only a booking still awaiting payment
+         * moves. */
+        if (booking.doc.status === "PENDING") {
+          booking.doc.status = "FAILED";
+          (booking.doc as any).failureReason = failureReason;
+          (booking.doc as any).webhookProcessed = true;
+          await booking.doc.save();
+          webhookLogger.info("payment.failed — booking marked failed", { type: booking.type, razorpayOrderId });
+        } else {
+          webhookLogger.warn("payment.failed — ignored, booking is not awaiting payment", {
+            type: booking.type, razorpayOrderId, status: booking.doc.status,
+          });
+        }
       }
 
       return res.status(200).json({ received: true });
@@ -529,6 +561,19 @@ router.post("/razorpay", async (req: Request, res: Response) => {
     if (event === "refund.processed") {
       const refundEntity = payload?.payload?.refund?.entity || {};
       const razorpayOrderId: string = refundEntity.order_id || paymentEntity.order_id || "";
+
+      // SBT checkout refund (automatic or partial) — mark that refund processed.
+      if (refundEntity.id) {
+        const r = await SBTPayment.collection.updateOne(
+          { "refunds.refundId": String(refundEntity.id) },
+          { $set: { "refunds.$[r].status": "PROCESSED", "refunds.$[r].processedAt": new Date() } },
+          { arrayFilters: [{ "r.refundId": String(refundEntity.id) }] },
+        );
+        if (r.matchedCount > 0) {
+          webhookLogger.info("refund.processed — SBT checkout refund", { refundId: refundEntity.id });
+          return res.status(200).json({ received: true });
+        }
+      }
 
       const booking = await findBookingByOrderId(razorpayOrderId);
       if (isD2C(booking)) {

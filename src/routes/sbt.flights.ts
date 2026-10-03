@@ -57,6 +57,9 @@ import {
   verifyHandler,
   paymentFactsForSave,
   reserveOfficial,
+  creditOfficial,
+  claimOfficial,
+  refundPaymentRow,
   isRefusal,
   isTravelDeskCaller,
   rememberMultiCityTraces,
@@ -64,8 +67,25 @@ import {
   reissueFareDifference,
   FARE_DIFFERENCE_MESSAGE,
 } from "../services/sbtPaymentGate.js";
+import { createRazorpayOrder, razorpayConfigured, razorpayKeyId } from "../services/sbtRazorpay.js";
+import {
+  registerFulfilHandlers,
+  createCheckoutHandler,
+  payCheckoutHandler,
+  retryCheckoutHandler,
+  getCheckoutHandler,
+} from "../services/sbtFulfil.js";
 
 const router = express.Router();
+
+// TBO reported a fare change at Book/Ticket. Nothing was ticketed: the customer
+// paid the quoted fare, so the booking stops here (checkout refunds and asks for
+// a fresh search). Price changes are never auto-accepted — see
+// services/tbo.flight.service.ts acceptPriceChange.
+const FARE_CHANGED_BODY = {
+  code: "FARE_CHANGED",
+  error: "The fare changed before your ticket could be issued. Please search again for the latest fare.",
+};
 
 /* ── Duplicate booking prevention (24-hour window) ─────────────────────── */
 async function checkDuplicateBooking(params: {
@@ -1054,7 +1074,13 @@ router.post("/ticket", requireAuth, requireSBT, requireFlightAccess, ...sbtBooke
       if (ticketValErr) return res.status(400).json({ error: ticketValErr });
     }
 
-    const result = await ticketFlight(req.body) as any;
+    const result = await ticketFlight({
+      TraceId: req.body?.TraceId,
+      PNR: req.body?.PNR,
+      BookingId: Number(req.body?.BookingId),
+      acceptPriceChange: false,
+    }) as any;
+    if (result?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: result?.Response ?? null });
 
     // TBO certification: call GetBookingDetails after successful Ticket
     const ticketStatus = result?.Response?.ResponseStatus;
@@ -1285,6 +1311,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         ResultIndex: req.body.ResultIndex,
         Passengers: obPassengers,
         IsPriceChangeAccepted: true,
+        acceptPriceChange: false,
         isNDC: ticketIsNDC,
         isInternational: lccIsInternational,
         airlineCode: lccAirlineCode,
@@ -1295,6 +1322,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
         ...corpParams,
       }) as any;
+      if (result?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: result?.Response ?? null });
 
       const ticketStatus = result?.Response?.ResponseStatus;
       const traceId = result?.Response?.TraceId || req.body?.TraceId;
@@ -1332,11 +1360,14 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
 
       // 1. Ticket OB leg
       sbtLogger.info('[TICKET-LCC] Ticketing OB leg...');
+      // Which add-ons TBO made us drop (seat / everything) — the checkout refunds them.
+      let obSsrStripped = "";
       const obPayload = {
         TraceId: req.body.TraceId,
         ResultIndex: req.body.ResultIndex,
         Passengers: obPassengers,
         IsPriceChangeAccepted: true,
+        acceptPriceChange: false,
         isNDC: ticketIsNDC,
         isInternational: lccIsInternational,
         airlineCode: lccAirlineCode,
@@ -1354,6 +1385,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         ?? obResult?.Response?.Response?.Error?.ErrorMessage ?? "";
       if (obResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(obErr) || /meal.*mandatory/i.test(obErr) || /mandatory.*meal/i.test(obErr) || /seat/i.test(obErr))) {
         sbtLogger.info('[TICKET-LCC] OB SSR error — retry 1: strip seat, keep meal', { module: 'sbt', error: obErr });
+        obSsrStripped = "seat";
         const obPassengersNoSeat = obPassengers.map((p: any) => ({ ...p, SeatDynamic: [] }));
         obResult = await ticketLCC({
           ...obPayload,
@@ -1365,6 +1397,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
           ?? obResult?.Response?.Response?.Error?.ErrorMessage ?? "";
         if (obResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(obErr2) || /meal.*mandatory/i.test(obErr2) || /mandatory.*meal/i.test(obErr2) || /seat/i.test(obErr2))) {
           sbtLogger.info('[TICKET-LCC] OB SSR error — retry 2: strip seat and meal', { module: 'sbt', error: obErr2 });
+          obSsrStripped = "all";
           const obPassengersNoSSR = obPassengers.map((p: any) => ({
             ...p, SeatDynamic: [], MealDynamic: [], Baggage: [],
           }));
@@ -1376,6 +1409,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         }
       }
 
+      if (obResult?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: obResult?.Response ?? null });
       const obStatus = obResult?.Response?.ResponseStatus;
       const obBookingId = obResult?.Response?.Response?.BookingId
         ?? obResult?.Response?.Response?.FlightItinerary?.BookingId;
@@ -1395,6 +1429,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
       let ibResult: any;
       let ibBookingId: any;
       let ibPNR: string = "";
+      let ibSsrStripped = "";
 
       if (isReturnGDS) {
         // ── Mixed carrier: IB is GDS → Book first, then Ticket ──
@@ -1436,6 +1471,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
           TraceId: ibTraceId,
           PNR: ibPNR,
           BookingId: Number(ibBookingId),
+          acceptPriceChange: false,
         }) as any;
 
         sbtLogger.info('[TICKET-LCC] IB GDS Ticket complete', {
@@ -1453,6 +1489,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
           ResultIndex: returnResultIndex,
           Passengers: ibPassengers,
           IsPriceChangeAccepted: true,
+          acceptPriceChange: false,
           isNDC: ticketIsNDC,
           isInternational: lccIsInternational,
           airlineCode: lccAirlineCode,
@@ -1470,6 +1507,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
           ?? ibResult?.Response?.Response?.Error?.ErrorMessage ?? "";
         if (ibResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(ibErr) || /meal.*mandatory/i.test(ibErr) || /mandatory.*meal/i.test(ibErr) || /seat/i.test(ibErr))) {
           sbtLogger.info('[TICKET-LCC] IB SSR error — retry 1: strip seat, keep meal', { module: 'sbt', error: ibErr });
+          ibSsrStripped = "seat";
           const ibPassengersNoSeat = ibPassengers.map((p: any) => ({ ...p, SeatDynamic: [] }));
           ibResult = await ticketLCC({
             ...ibPayload,
@@ -1481,6 +1519,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
             ?? ibResult?.Response?.Response?.Error?.ErrorMessage ?? "";
           if (ibResult?.Response?.ResponseStatus !== 1 && (/invalid meal/i.test(ibErr2) || /meal.*mandatory/i.test(ibErr2) || /mandatory.*meal/i.test(ibErr2) || /seat/i.test(ibErr2))) {
             sbtLogger.info('[TICKET-LCC] IB SSR error — retry 2: strip seat and meal', { module: 'sbt', error: ibErr2 });
+            ibSsrStripped = "all";
             const ibPassengersNoSSR = ibPassengers.map((p: any) => ({
               ...p, SeatDynamic: [], MealDynamic: [], Baggage: [],
             }));
@@ -1498,6 +1537,9 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
           ?? ibResult?.Response?.Response?.FlightItinerary?.PNR ?? "";
       }
 
+      // A fare change on the return leg: outbound is ticketed, return is not.
+      const ibFareChanged = ibResult?._priceChanged === true;
+      if (ibFareChanged) { ibBookingId = undefined; ibPNR = ""; }
       const ibStatus = ibResult?.Response?.ResponseStatus;
       sbtLogger.info('[TICKET-LCC] IB leg result', {
         ibStatus, isReturnGDS: !!isReturnGDS,
@@ -1553,12 +1595,17 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         returnTicketResult: ibResult,
         BookingDetails: obDetails,
         ReturnBookingDetails: ibDetails,
+        ssrStripped: obSsrStripped,
+        returnSsrStripped: ibSsrStripped,
+        ...(ibFareChanged ? { returnFareChanged: true, returnError: FARE_CHANGED_BODY.error } : {}),
       });
     }
 
     // ── One-way LCC (existing logic) ──
+    let onewaySsrStripped = "";
     let result = await ticketLCC({
       ...req.body,
+      acceptPriceChange: false,
       isInternational: lccIsInternational,
       airlineCode: lccAirlineCode,
       destinationCode: lccDestCode,
@@ -1575,9 +1622,11 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
       (/invalid meal/i.test(onewayErr) || /meal.*mandatory/i.test(onewayErr) || /mandatory.*meal/i.test(onewayErr) || /seat/i.test(onewayErr))
     ) {
       sbtLogger.info('[TICKET-LCC] One-way SSR error — retry 1: strip seat, keep meal', { module: 'sbt', error: onewayErr });
+      onewaySsrStripped = "seat";
       const passengersNoSeat = obPassengers.map((p: any) => ({ ...p, SeatDynamic: [] }));
       result = await ticketLCC({
         ...req.body,
+        acceptPriceChange: false,
         Passengers: passengersNoSeat,
         isInternational: lccIsInternational,
         airlineCode: lccAirlineCode,
@@ -1595,11 +1644,13 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         (/invalid meal/i.test(onewayErr2) || /meal.*mandatory/i.test(onewayErr2) || /mandatory.*meal/i.test(onewayErr2) || /seat/i.test(onewayErr2))
       ) {
         sbtLogger.info('[TICKET-LCC] One-way SSR error — retry 2: strip seat and meal', { module: 'sbt', error: onewayErr2 });
+        onewaySsrStripped = "all";
         const passengersNoSSR = obPassengers.map((p: any) => ({
           ...p, SeatDynamic: [], MealDynamic: [], Baggage: [],
         }));
         result = await ticketLCC({
           ...req.body,
+          acceptPriceChange: false,
           Passengers: passengersNoSSR,
           isInternational: lccIsInternational,
           airlineCode: lccAirlineCode,
@@ -1610,6 +1661,8 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         }) as any;
       }
     }
+
+    if (result?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: result?.Response ?? null });
 
     // TBO certification: call GetBookingDetails after successful LCC Ticket
     const ticketStatus = result?.Response?.ResponseStatus;
@@ -1635,7 +1688,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
       } finally {
         consolidateCertificationLogs(traceId, bookingId, pnr, lccCaseLabel).catch(() => {});
       }
-      return res.json({ ...result, BookingDetails: bookingDetails });
+      return res.json({ ...result, BookingDetails: bookingDetails, ssrStripped: onewaySsrStripped });
     }
 
     res.json(result);
@@ -1822,7 +1875,15 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
       razorpayOrderId: b.razorpayOrderId,
       tboBookingId: b.bookingId,
     });
-    const normTotalFare = payFacts ? payFacts.amount : Number(b.totalFare) || 0;
+    // Server-side fulfilment (services/sbtFulfil.ts) saves one booking per
+    // multi-city leg, each with its share of the charge. Set only in-process.
+    const fulfilCtx = (req as any).sbtFulfil as
+      | { legAmount?: number; multiCityGroupId?: string; legIndex?: number; legCount?: number }
+      | undefined;
+    const chargedAmount = payFacts
+      ? (typeof fulfilCtx?.legAmount === "number" ? fulfilCtx.legAmount : payFacts.amount)
+      : Number(b.totalFare) || 0;
+    const normTotalFare = chargedAmount;
     // Guard: only compute margin when net resolved (>0). If unresolved, leave 0 rather
     // than write a wrong margin from a missing net.
     const normMarginAmount = normNetAmount > 0 ? normTotalFare - normNetAmount : 0;
@@ -1854,7 +1915,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
       baseFare: b.baseFare,
       taxes: b.taxes ?? 0,
       extras: b.extras ?? 0,
-      totalFare: payFacts ? payFacts.amount : b.totalFare,
+      totalFare: payFacts ? chargedAmount : b.totalFare,
       // Keystone normalize (see block above): durable supplier net + margin.
       netAmount: normNetAmount,
       displayAmount: normTotalFare,
@@ -1871,6 +1932,11 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
       fareBreakdown: b.fareBreakdown || undefined,
       ticketingStatus: b.ticketingStatus || "NOT_ATTEMPTED",
       bookedAt: new Date(),
+      returnPnr: b.returnPnr || "",
+      ...(Number(b.returnBookingId) > 0 ? { returnBookingId: Number(b.returnBookingId) } : {}),
+      ...(fulfilCtx?.multiCityGroupId ? {
+        multiCityGroupId: fulfilCtx.multiCityGroupId, legIndex: fulfilCtx.legIndex, legCount: fulfilCtx.legCount,
+      } : {}),
       // Demo Platform — defensive tagging if the simulator-created doc was lost.
       isDemo: req.user?.isDemoUser === true,
       createdByDemoUser: req.user?.isDemoUser === true,
@@ -1982,6 +2048,7 @@ router.get("/my-bookings", requireAuth, async (req: any, res: any) => {
     if (status) filter.status = String(status).toUpperCase();
 
     // Demo Platform — demo users see only their demo bookings; real users see real bookings.
+    filter.isTest = { $ne: true }; // internal test bookings never appear in history
     if (req.user?.isDemoUser) {
       filter.isDemo = true;
     } else {
@@ -2009,7 +2076,8 @@ router.get("/bookings", requireSBT, async (req: any, res: any) => {
       req.user?.customerMemberRole === 'WORKSPACE_LEADER';
 
     // Demo Platform — demo users see only their demo bookings; real users see real bookings.
-    const demoClause = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
+    // Internal test bookings (scripts/mark-sbt-test-data.ts) never appear in booking history.
+    const demoClause = { ...(req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } }), isTest: { $ne: true } };
 
     let bookings;
     if (isWL) {
@@ -2095,6 +2163,7 @@ router.get("/bookings/orphaned", requireAuth, requireAdmin, async (_req: any, re
       razorpayPaymentId: { $ne: "" },
       razorpayAmount: { $gt: 0 },
       isDemo: { $ne: true },
+      isTest: { $ne: true },
     }).sort({ createdAt: -1 }).lean();
     res.json({ ok: true, count: docs.length, bookings: docs });
   } catch (err: any) {
@@ -2118,6 +2187,7 @@ router.post("/bookings/refund-orphaned", requireAuth, requireAdmin, async (req: 
       razorpayPaymentId: { $ne: "" },
       razorpayAmount: { $gt: 0 },
       isDemo: { $ne: true },
+      isTest: { $ne: true },
     };
     if (bookingId) filter._id = bookingId;
     if (razorpayPaymentId) filter.razorpayPaymentId = razorpayPaymentId;
@@ -2143,7 +2213,12 @@ router.post("/bookings/refund-orphaned", requireAuth, requireAdmin, async (req: 
               Authorization: `Basic ${auth}`,
             },
             body: JSON.stringify({
-              amount: Math.round((doc.razorpayAmount || doc.totalFare) * 100), // paise
+              // razorpayAmount is already PAISE (the Razorpay order amount); only the
+              // totalFare fallback is rupees. Multiplying both by 100 asked Razorpay
+              // for 100× the payment, which it always refused.
+              amount: Number(doc.razorpayAmount) > 0
+                ? Math.round(Number(doc.razorpayAmount))
+                : Math.round(Number(doc.totalFare) * 100),
             }),
           },
         );
@@ -2157,7 +2232,7 @@ router.post("/bookings/refund-orphaned", requireAuth, requireAdmin, async (req: 
             refundProcessedAt: new Date(),
             failureReason: `Payment refunded: ${refundData.id}`,
           });
-          details.push({ pnr: doc.pnr, amount: doc.razorpayAmount || doc.totalFare, refundId: refundData.id });
+          details.push({ pnr: doc.pnr, amount: Number(doc.razorpayAmount) > 0 ? Number(doc.razorpayAmount) / 100 : doc.totalFare, refundId: refundData.id });
           refunded++;
           sbtLogger.info("Flight orphan refund OK", { pnr: doc.pnr, refundId: refundData.id });
         } else {
@@ -2165,12 +2240,12 @@ router.post("/bookings/refund-orphaned", requireAuth, requireAdmin, async (req: 
           await SBTBooking.findByIdAndUpdate(doc._id, {
             failureReason: `Refund attempt failed: ${errMsg}`,
           });
-          details.push({ pnr: doc.pnr, amount: doc.razorpayAmount || doc.totalFare, error: errMsg });
+          details.push({ pnr: doc.pnr, amount: Number(doc.razorpayAmount) > 0 ? Number(doc.razorpayAmount) / 100 : doc.totalFare, error: errMsg });
           failed++;
           sbtLogger.warn("Flight orphan refund failed", { pnr: doc.pnr, error: errMsg });
         }
       } catch (e: any) {
-        details.push({ pnr: doc.pnr, amount: doc.razorpayAmount || doc.totalFare, error: e.message });
+        details.push({ pnr: doc.pnr, amount: Number(doc.razorpayAmount) > 0 ? Number(doc.razorpayAmount) / 100 : doc.totalFare, error: e.message });
         failed++;
         sbtLogger.error("Flight orphan refund error", { pnr: doc.pnr, error: e.message });
       }
@@ -2430,27 +2505,19 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
       await doc.save();
     }
 
-    // Decrement spend if official booking in same calendar month
+    // Give the business-wallet spend back (selling total, same calendar month —
+    // an earlier month's counter was already reset). Ledger-backed: once per booking.
     if ((doc as any).paymentMode === "official" && (doc as any).workspaceId) {
-      const bookingMonth = doc.createdAt.toISOString().slice(0, 7);
-      const currentMonth = new Date().toISOString().slice(0, 7);
-      if (bookingMonth === currentMonth) {
-        try {
-          await CustomerWorkspace.findOneAndUpdate(
-            { _id: (doc as any).workspaceId },
-            [{ $set: {
-              "sbtOfficialBooking.currentMonthSpend": {
-                $max: [0, { $subtract: ["$sbtOfficialBooking.currentMonthSpend", totalFare] }],
-              },
-            }}],
-            { runValidators: false },
-          );
-          sbtLogger.info("[OfficialBooking] Spend reversed on cancellation", {
-            bookingId: doc._id, amount: totalFare, workspaceId: (doc as any).workspaceId,
-          });
-        } catch (err) {
-          sbtLogger.error("[OfficialBooking] Failed to reverse spend on cancellation", { bookingId: doc._id, error: err });
-        }
+      try {
+        const credited = await creditOfficial((doc as any).workspaceId, Number(totalFare) || 0, doc.createdAt.toISOString().slice(0, 7), {
+          key: `cancel:${doc._id}`, reason: "CANCELLATION", bookingDocId: String(doc._id), product: "FLIGHT",
+          actorUserId: String(req.user?._id ?? req.user?.id ?? ""),
+        });
+        sbtLogger.info("[OfficialBooking] Spend reversed on cancellation", {
+          bookingId: doc._id, amount: totalFare, workspaceId: (doc as any).workspaceId, credited,
+        });
+      } catch (err) {
+        sbtLogger.error("[OfficialBooking] Failed to reverse spend on cancellation", { bookingId: doc._id, error: err });
       }
     }
 
@@ -2895,35 +2962,26 @@ router.post("/bookings/:id/reissue-order", requireAuth, requireSBT, requireFligh
       return res.status(409).json({ error: FARE_DIFFERENCE_MESSAGE, code: "FARE_DIFFERENCE_TRAVEL_DESK" });
     }
 
-    const { priceDiff } = req.body;
-    if (!priceDiff || Number(priceDiff) <= 0) {
-      return res.status(400).json({ error: "Invalid price difference — must be positive" });
+    // The amount is the SERVER's fare difference for the new flight (the
+    // caller's FareQuote of it) — the browser's priceDiff is ignored.
+    const { ResultIndex: reissueRI } = req.body || {};
+    const orderDiff = await reissueFareDifference(req, booking, reissueRI);
+    if (isRefusal(orderDiff)) return res.status(orderDiff.status).json({ error: orderDiff.error, code: orderDiff.code });
+    if (!(orderDiff.diff > 0)) {
+      return res.status(400).json({ error: "No fare difference to pay for this flight", code: "NO_DIFFERENCE" });
     }
+    const priceDiff = orderDiff.diff;
 
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!keyId || !keySecret) return res.status(503).json({ error: "Payment gateway not configured" });
-
-    const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
-    const orderRes = await fetch("https://api.razorpay.com/v1/orders", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Basic ${auth}` },
-      body: JSON.stringify({
-        amount: Math.round(Number(priceDiff) * 100),
-        currency: "INR",
-        receipt: `reissue_${req.params.id}_${Date.now()}`,
-      }),
-    });
-    const order = await orderRes.json() as any;
-    if (!orderRes.ok) {
-      return res.status(502).json({ error: order?.error?.description || "Razorpay order creation failed" });
-    }
-    // Recorded so /payment/verify can check this order against Razorpay. It covers
-    // no ResultIndex, so it can never be claimed for a new booking.
+    if (!razorpayConfigured()) return res.status(503).json({ error: "Payment gateway not configured" });
+    const order = await createRazorpayOrder(Math.round(Number(priceDiff) * 100), `reissue_${req.params.id}_${Date.now()}`);
+    const keyId = razorpayKeyId();
+    // Recorded so /payment/verify checks it against Razorpay and /reissue can
+    // claim it — for THIS booking and THIS new flight only (reissueOfBookingId is
+    // never claimable for a new booking).
     await SBTPayment.create({
       product: "FLIGHT", mode: "RAZORPAY", status: "CREATED", ...callerScope(req),
       amount: Number(order.amount) / 100, amountPaise: Number(order.amount), baseAmount: Number(order.amount) / 100,
-      razorpayOrderId: order.id, reissueOfBookingId: String(booking._id),
+      razorpayOrderId: order.id, reissueOfBookingId: String(booking._id), resultIndexes: [String(reissueRI)],
     });
     res.json({ ok: true, orderId: order.id, amount: order.amount, currency: order.currency, keyId });
   } catch (err: unknown) {
@@ -3018,9 +3076,14 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, requireFlightAcces
     }
     void priceDiff;
     const numericPriceDiff = Math.max(0, fareDiff.diff);
+    // The money row backing this reissue (refunded if TBO does not reissue).
+    let reissuePaymentRow: any = null;
 
     // ── Payment handling for reissue ──────────────────────────────────
-    if (numericPriceDiff > 0 && paymentMode) {
+    if (numericPriceDiff > 0) {
+      if (paymentMode !== "GATEWAY" && paymentMode !== "WALLET") {
+        return res.status(402).json({ error: "The fare difference must be paid before rescheduling", code: "PAYMENT_REQUIRED" });
+      }
       if (paymentMode === "GATEWAY") {
         if (!razorpayPaymentId || !razorpayOrderId || !razorpaySignature) {
           return res.status(400).json({ error: "Payment details required for gateway payment" });
@@ -3034,21 +3097,28 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, requireFlightAcces
         if (expectedSig !== razorpaySignature) {
           return res.status(400).json({ error: "Payment verification failed — signature mismatch" });
         }
-        // One verified payment pays for one reissue of THIS booking (verify marked it PAID).
-        const reissuePayment = await SBTPayment.findOneAndUpdate(
+        // One verified payment pays for one reissue of THIS booking onto THIS
+        // flight, and must cover the server's difference (verify marked it PAID).
+        reissuePaymentRow = await SBTPayment.findOneAndUpdate(
           {
             razorpayOrderId: String(razorpayOrderId), razorpayPaymentId: String(razorpayPaymentId),
-            reissueOfBookingId: String(doc._id), status: "PAID", ...callerScope(req),
+            reissueOfBookingId: String(doc._id), resultIndexes: String(ResultIndex),
+            amount: { $gte: numericPriceDiff }, status: "PAID", ...callerScope(req),
           },
           { $set: { status: "CLAIMED", claimedAt: new Date() } },
-        );
-        if (!reissuePayment) {
-          return res.status(402).json({ error: "Payment not verified or already used", code: "PAYMENT_REQUIRED" });
+          { new: true },
+        ).lean();
+        if (!reissuePaymentRow) {
+          return res.status(402).json({ error: "Payment not verified, already used, or less than the fare difference", code: "PAYMENT_REQUIRED" });
         }
-      } else if (paymentMode === "WALLET") {
-        // Conditional reservation: spend + diff ≤ monthly limit, in one update.
-        const reserved = await reserveOfficial(req, numericPriceDiff);
-        if (isRefusal(reserved)) return res.status(400).json({ error: reserved.error, code: reserved.code });
+      } else {
+        // Business wallet: the difference reserved in one conditional update, with a ledger DEBIT.
+        const claimed = await claimOfficial(req, callerScope(req), {
+          product: "FLIGHT", reissueOfBookingId: String(doc._id), resultIndexes: [String(ResultIndex)],
+          amount: numericPriceDiff, baseAmount: numericPriceDiff,
+        });
+        if (isRefusal(claimed)) return res.status(400).json({ error: claimed.error, code: claimed.code });
+        reissuePaymentRow = claimed.row;
       }
     }
 
@@ -3091,6 +3161,12 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, requireFlightAcces
         ?? reissueResult?.Response?.Response?.Error?.ErrorMessage
         ?? "Reissue failed";
       sbtLogger.error("TicketReissue TBO error", { bookingId: doc._id, tboErr });
+      if (reissuePaymentRow) {
+        const refunded = await refundPaymentRow(reissuePaymentRow, Number(reissuePaymentRow.amountPaise), "REISSUE_FAILED");
+        await SBTPayment.updateOne({ _id: reissuePaymentRow._id }, { $set: {
+          status: refunded.ok ? "REFUNDED" : "NEEDS_OPS", failureCode: "SUPPLIER_FAILED", failureReason: String(tboErr).slice(0, 300),
+        } });
+      }
       return res.status(502).json({
         error: "Online rescheduling is not available for this booking. Please contact Plumtrips support to reschedule.",
       });
@@ -3131,7 +3207,9 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, requireFlightAcces
       baseFare: Number(inner?.Fare?.BaseFare ?? doc.baseFare),
       taxes: Number(inner?.Fare?.Tax ?? doc.taxes),
       extras: 0,
-      totalFare: Number(inner?.Fare?.TotalFare ?? doc.totalFare),
+      // Selling total: what was paid for the fare before, plus the difference
+      // collected now (TBO's TotalFare is our net cost, never the customer's price).
+      totalFare: Math.max(0, (Number(doc.totalFare) || 0) - (Number((doc as any).extras) || 0)) + numericPriceDiff,
       currency: doc.currency,
       isLCC: true,
       ticketingStatus: "TICKETED",
@@ -3146,6 +3224,11 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, requireFlightAcces
 
     const newBooking = new SBTBooking(newBookingData);
     await newBooking.save();
+    if (reissuePaymentRow) {
+      await SBTPayment.updateOne({ _id: reissuePaymentRow._id }, { $set: {
+        status: "TICKETED", tboBookingId: newBookingId, bookingDocIds: [String(newBooking._id)], completedAt: new Date(),
+      } });
+    }
 
     sbtLogger.info("Reissue complete", {
       originalBookingId: doc._id, originalPNR, newPnr, newBookingId,
@@ -3168,6 +3251,17 @@ router.post("/payment/create-order", requireAuth, requireSBT, requireFlightAcces
 // POST /api/sbt/flights/payment/verify — signature + the payment fetched from
 // Razorpay must be captured, on this order, for exactly the server amount.
 router.post("/payment/verify", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, verifyHandler("FLIGHT"));
+
+// ─── Checkout (server-side fulfilment) ─────────────────────────────────────
+// The browser starts a checkout (server prices it), pays, and the SERVER books
+// with TBO and saves — the same path the Razorpay webhook takes when the browser
+// never comes back. Multi-city: every leg is quoted, priced and ticketed here.
+// See services/sbtFulfil.ts.
+const flightCheckoutGuards = [requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards];
+router.post("/checkout", ...flightCheckoutGuards, createCheckoutHandler("FLIGHT"));
+router.post("/checkout/:id/pay", ...flightCheckoutGuards, payCheckoutHandler("FLIGHT"));
+router.post("/checkout/:id/fulfil", ...flightCheckoutGuards, retryCheckoutHandler("FLIGHT"));
+router.get("/checkout/:id", ...flightCheckoutGuards, getCheckoutHandler("FLIGHT"));
 
 // GET /api/sbt/flights/landing-config — auth-only: recents/promos slot mode + active flight promos
 // Feeds the "Recent trips" landing slot. Reads the same SBTConfig "offers" doc that the
@@ -3196,6 +3290,22 @@ router.get("/offer", async (_req: any, res: any) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Server-side fulfilment runs these exact route handlers (after their guards),
+// so the certified TBO flow has one implementation. See services/sbtFulfil.ts.
+function routeHandler(path: string, method: "post" | "get") {
+  const layer = (router as any).stack.find((l: any) => l.route?.path === path && l.route.methods?.[method]);
+  const stack = layer?.route?.stack;
+  const handle = stack?.[stack.length - 1]?.handle;
+  if (!handle) throw new Error(`route handler not found: ${method.toUpperCase()} ${path}`);
+  return handle;
+}
+registerFulfilHandlers({
+  flightTicketLcc: routeHandler("/ticket-lcc", "post"),
+  flightBook: routeHandler("/book", "post"),
+  flightTicket: routeHandler("/ticket", "post"),
+  flightSave: routeHandler("/bookings/save", "post"),
 });
 
 export default router;

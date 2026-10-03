@@ -1326,6 +1326,10 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
         const { startOrphanPendingCleanupCron } = await import("./jobs/orphan-pending-cleanup.js");
         startOrphanPendingCleanupCron();
 
+        // SBT checkout backstop: paid-but-not-booked → refund + ops alert (every 5 min)
+        const { startSbtCheckoutSweepCron } = await import("./jobs/sbt-checkout-sweep.js");
+        startSbtCheckoutSweepCron();
+
         // TICKETING: Auto-ingest Gmail → tickets (every 60s)
         const { startTicketIngestionCron } = await import("./jobs/ticketIngestionCron.js");
         startTicketIngestionCron();

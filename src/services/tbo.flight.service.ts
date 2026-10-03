@@ -748,6 +748,10 @@ export async function ticketFlight(params: {
   TraceId: string;
   PNR: string;
   BookingId: number;
+  /** Re-send with IsPriceChangeAccepted:true when TBO reports a fare change.
+   *  Default OFF: a changed fare comes back marked `_priceChanged` and nothing
+   *  is ticketed — the customer was charged the quoted fare. */
+  acceptPriceChange?: boolean;
 }) {
   const token = await getTBOToken();
 
@@ -765,7 +769,10 @@ export async function ticketFlight(params: {
   const gdsChanged = gdsResult?.Response?.IsPriceChanged === true
     || gdsResult?.Response?.Response?.IsPriceChanged === true;
   if (gdsChanged) {
-    return post("/Ticket", { ...gdsPayload, IsPriceChangeAccepted: true }, false, FLIGHT_BOOKING_BASE);
+    if (params.acceptPriceChange === true) {
+      return post("/Ticket", { ...gdsPayload, IsPriceChangeAccepted: true }, false, FLIGHT_BOOKING_BASE);
+    }
+    return { ...gdsResult, _priceChanged: true };
   }
   return gdsResult;
 }
@@ -937,6 +944,8 @@ export async function ticketLCC(params: {
     };
   }>;
   IsPriceChangeAccepted?: boolean;
+  /** See ticketFlight.acceptPriceChange — default OFF. */
+  acceptPriceChange?: boolean;
   isNDC?: boolean;
   isInternational?: boolean;
   airlineCode?: string;
@@ -1220,7 +1229,10 @@ export async function ticketLCC(params: {
   const lccChanged = lccResult?.Response?.IsPriceChanged === true
     || lccResult?.Response?.Response?.IsPriceChanged === true;
   if (lccChanged) {
-    return post("/Ticket", { ...payload, IsPriceChangeAccepted: true }, false, FLIGHT_BOOKING_BASE);
+    if (params.acceptPriceChange === true) {
+      return post("/Ticket", { ...payload, IsPriceChangeAccepted: true }, false, FLIGHT_BOOKING_BASE);
+    }
+    return { ...lccResult, _priceChanged: true };
   }
   return lccResult;
 }

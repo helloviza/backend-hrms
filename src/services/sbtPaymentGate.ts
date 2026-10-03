@@ -21,6 +21,8 @@ import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
 import SBTMultiCityTrace from "../models/SBTMultiCityTrace.js";
+import SBTWalletLedger from "../models/SBTWalletLedger.js";
+import mongoose from "mongoose";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { sbtLogger } from "../utils/logger.js";
@@ -31,6 +33,7 @@ import {
   createRazorpayOrder,
   fetchRazorpayPayment,
   captureRazorpayPayment,
+  refundRazorpayPayment,
 } from "./sbtRazorpay.js";
 
 type AnyObj = Record<string, any>;
@@ -195,7 +198,7 @@ export async function priceAddOns(
   scope: { userId: string; workspaceId: string },
   resultIndexes: string[],
   passengerLists: unknown[],
-): Promise<{ ok: true; amount: number } | Refusal> {
+): Promise<{ ok: true; amount: number; breakdown: { seat: number; meal: number; baggage: number } } | Refusal> {
   const chosen = new Map<string, SsrPriceItem>();
   for (const list of passengerLists) {
     if (!Array.isArray(list)) continue;
@@ -203,7 +206,7 @@ export async function priceAddOns(
       for (const it of priceItemsOf(pax)) chosen.set(`${i}|${itemKey(it)}`, it);
     });
   }
-  if (chosen.size === 0) return { ok: true, amount: 0 };
+  if (chosen.size === 0) return { ok: true, amount: 0, breakdown: { seat: 0, meal: 0, baggage: 0 } };
 
   const snaps = (await SBTSsrSnapshot.find({
     userId: scope.userId, workspaceId: scope.workspaceId, resultIndex: { $in: resultIndexes },
@@ -225,7 +228,8 @@ export async function priceAddOns(
     }
     totals[it.kind] += p;
   }
-  return { ok: true, amount: Math.ceil(totals.seat) + Math.ceil(totals.baggage) + Math.ceil(totals.meal) };
+  const breakdown = { seat: Math.ceil(totals.seat), meal: Math.ceil(totals.meal), baggage: Math.ceil(totals.baggage) };
+  return { ok: true, amount: breakdown.seat + breakdown.baggage + breakdown.meal, breakdown };
 }
 
 /* ───────────────────────── quote pricing ───────────────────────── */
@@ -245,6 +249,9 @@ const FARE_EXPIRED = refuse(410, "FARE_EXPIRED", "Fare expired, please search ag
 export interface FlightPrice {
   ok: true; amount: number; base: number; addOn: number; quoteIds: string[]; resultIndexes: string[];
   isMultiCity: boolean;
+  addOnBreakdown: { seat: number; meal: number; baggage: number };
+  // One entry per quote (leg): what it covers and its selling fare.
+  legs: Array<{ resultIndexes: string[]; sellingFare: number }>;
 }
 
 /** ceil(Σ margined PublishedFare of the quoted legs) + add-ons. */
@@ -258,18 +265,23 @@ export async function priceFlight(
   let fare = 0;
   let isMultiCity = false;
   const resultIndexes = new Set<string>();
+  const legs: Array<{ resultIndexes: string[]; sellingFare: number }> = [];
   for (const id of ids) {
     const q = await loadScopedQuote(scope, id, "FLIGHT");
     if (!q || !(Number(q.sellingFare) > 0)) return FARE_EXPIRED;
     fare += Number(q.sellingFare);
     if (q.isMultiCity === true) isMultiCity = true;
+    legs.push({ resultIndexes: ((q.resultIndexes || []) as string[]).map(String), sellingFare: Number(q.sellingFare) });
     for (const ri of (q.resultIndexes || []) as string[]) if (ri) resultIndexes.add(String(ri));
   }
   const base = Math.ceil(fare);
   const ris = [...resultIndexes];
   const add = await priceAddOns(scope, ris, passengerLists);
   if (isRefusal(add)) return add;
-  return { ok: true, amount: base + add.amount, base, addOn: add.amount, quoteIds: ids, resultIndexes: ris, isMultiCity };
+  return {
+    ok: true, amount: base + add.amount, base, addOn: add.amount, quoteIds: ids, resultIndexes: ris, isMultiCity,
+    addOnBreakdown: add.breakdown, legs,
+  };
 }
 
 export async function priceHotelQuote(
@@ -327,10 +339,24 @@ function isWalletAdmin(req: AnyObj): boolean {
   return roles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR_ADMIN"].includes(r));
 }
 
-/** Reserve `amount` against the workspace's monthly official-booking limit in
- *  ONE conditional update (spend + amount ≤ limit; limit 0 = unlimited, as in
- *  routes/sbt.wallet.ts). Concurrent reservations cannot both pass. */
-export async function reserveOfficial(req: Request | AnyObj, amount: number): Promise<{ ok: true; monthKey: string } | Refusal> {
+export interface LedgerRef {
+  key: string; // idempotency key — one DEBIT per payment row
+  reason: string;
+  paymentId?: string;
+  bookingDocId?: string;
+  product?: "FLIGHT" | "HOTEL";
+}
+
+/** Reserve `amount` (the SELLING total, flights and hotels alike) against the
+ *  workspace's monthly official-booking limit in ONE conditional update
+ *  (spend + amount ≤ limit; limit 0 = unlimited, as in routes/sbt.wallet.ts).
+ *  Concurrent reservations cannot both pass. Recorded as a DEBIT in
+ *  SBTWalletLedger. */
+export async function reserveOfficial(
+  req: Request | AnyObj,
+  amount: number,
+  ledger?: LedgerRef,
+): Promise<{ ok: true; monthKey: string } | Refusal> {
   const wsId = (req as AnyObj).workspaceObjectId;
   if (!wsId) return refuse(400, "WORKSPACE_REQUIRED", "Workspace required");
   const monthKey = monthKeyNow();
@@ -358,7 +384,23 @@ export async function reserveOfficial(req: Request | AnyObj, amount: number): Pr
     { $inc: { "sbtOfficialBooking.currentMonthSpend": amount } },
     { runValidators: false },
   );
-  if (r.modifiedCount === 1) return { ok: true, monthKey };
+  if (r.modifiedCount === 1) {
+    if (ledger) {
+      const after = (await CustomerWorkspace.findById(wsId).select("sbtOfficialBooking.currentMonthSpend").lean()) as AnyObj | null;
+      try {
+        await SBTWalletLedger.create({
+          workspaceId: String(wsId), type: "DEBIT", amount, monthKey,
+          spendAfter: Number(after?.sbtOfficialBooking?.currentMonthSpend) || undefined,
+          reason: ledger.reason, paymentId: ledger.paymentId, bookingDocId: ledger.bookingDocId,
+          product: ledger.product, actorUserId: callerScope(req).userId, idempotencyKey: ledger.key,
+        });
+      } catch (err: any) {
+        // The limit was reserved; a missing ledger row is an audit gap, never a reason to un-reserve.
+        sbtLogger.error("[sbt-pay] wallet DEBIT reserved but ledger write failed", { key: ledger.key, err: err?.message });
+      }
+    }
+    return { ok: true, monthKey };
+  }
   const ws = (await CustomerWorkspace.findById(wsId).select("sbtOfficialBooking").lean()) as AnyObj | null;
   if (!admin && !ws?.sbtOfficialBooking?.enabled) {
     return refuse(403, "WALLET_DISABLED", "Business wallet is not enabled for this workspace");
@@ -366,15 +408,97 @@ export async function reserveOfficial(req: Request | AnyObj, amount: number): Pr
   return refuse(402, "LIMIT_EXCEEDED", "This booking would exceed your company's monthly travel limit");
 }
 
-export async function releaseOfficial(workspaceId: unknown, amount: number, monthKey?: string) {
-  // A new month has already reset the counter — nothing to give back.
-  if (!workspaceId || !(amount > 0) || monthKey !== monthKeyNow()) return;
+/**
+ * Give `amount` back to the workspace's monthly spend, exactly once per
+ * `ledger.key`: the CREDIT ledger row is written FIRST (unique key), so a
+ * retried release or a replayed cancellation credits nothing the second time.
+ * A credit for an earlier month is recorded but moves no counter — that month's
+ * spend was already reset. Returns false when the key was already used.
+ */
+export async function creditOfficial(
+  workspaceId: unknown,
+  amount: number,
+  monthKey: string | undefined,
+  ledger: LedgerRef & { actorUserId?: string },
+): Promise<boolean> {
+  if (!workspaceId || !(amount > 0)) return false;
+  const month = monthKey || monthKeyNow();
+  try {
+    await SBTWalletLedger.create({
+      workspaceId: String(workspaceId), type: "CREDIT", amount, monthKey: month,
+      reason: ledger.reason, paymentId: ledger.paymentId, bookingDocId: ledger.bookingDocId,
+      product: ledger.product, actorUserId: ledger.actorUserId, idempotencyKey: ledger.key,
+    });
+  } catch (err: any) {
+    if (err?.code === 11000) return false; // already credited
+    throw err;
+  }
+  if (month !== monthKeyNow()) return true;
   await CustomerWorkspace.updateOne(
     { _id: workspaceId },
     [{ $set: { "sbtOfficialBooking.currentMonthSpend": {
       $max: [0, { $subtract: [{ $ifNull: ["$sbtOfficialBooking.currentMonthSpend", 0] }, amount] }],
     } } }],
   );
+  return true;
+}
+
+/** Release a payment row's whole reservation (supplier failure etc.). */
+export async function releaseOfficial(row: AnyObj, reason: string): Promise<boolean> {
+  return creditOfficial(row.workspaceId, Number(row.amount), row.monthKey, {
+    key: `credit:${row._id}`, reason, paymentId: String(row._id), product: row.product,
+  });
+}
+
+/* ───────────────────────── refunds ───────────────────────── */
+
+/**
+ * Return `amountPaise` of a payment row to the customer — Razorpay refund, or a
+ * business-wallet credit. The amount is reserved on the row FIRST with a
+ * conditional update (refundedPaise + amount ≤ amountPaise), so two callers
+ * (fulfilment, webhook, sweep) can never refund the same money twice and a
+ * refund can never exceed what was paid. If Razorpay refuses, the reservation
+ * is undone and the caller gets ok:false (→ NEEDS_OPS + alert).
+ */
+export async function refundPaymentRow(
+  row: AnyObj,
+  amountPaise: number,
+  reason: string,
+): Promise<{ ok: boolean; refundedPaise: number; refundId?: string; error?: string }> {
+  const amt = Math.round(amountPaise);
+  if (!(amt > 0)) return { ok: true, refundedPaise: 0 };
+  const reserved = await SBTPayment.findOneAndUpdate(
+    { _id: row._id, $expr: { $lte: [{ $add: [{ $ifNull: ["$refundedPaise", 0] }, amt] }, "$amountPaise"] } },
+    { $inc: { refundedPaise: amt } },
+    { new: true },
+  ).lean();
+  if (!reserved) return { ok: true, refundedPaise: 0 }; // already refunded (or more than was paid)
+  try {
+    if (row.mode === "OFFICIAL") {
+      await creditOfficial(row.workspaceId, amt / 100, row.monthKey, {
+        key: `credit:${row._id}:${reason}:${amt}`, reason, paymentId: String(row._id), product: row.product,
+      });
+      await SBTPayment.updateOne({ _id: row._id }, { $push: { refunds: {
+        amountPaise: amt, reason, status: "CREDITED", at: new Date(),
+      } } });
+      return { ok: true, refundedPaise: amt };
+    }
+    if (!row.razorpayPaymentId) throw new Error("no captured Razorpay payment on this row");
+    const refund = await refundRazorpayPayment(String(row.razorpayPaymentId), amt, {
+      sbtPaymentId: String(row._id), reason,
+    });
+    await SBTPayment.updateOne({ _id: row._id }, { $push: { refunds: {
+      refundId: String(refund?.id ?? ""), amountPaise: amt, reason, status: "INITIATED", at: new Date(),
+    } } });
+    return { ok: true, refundedPaise: amt, refundId: refund?.id };
+  } catch (err: any) {
+    await SBTPayment.updateOne({ _id: row._id }, {
+      $inc: { refundedPaise: -amt },
+      $push: { refunds: { amountPaise: amt, reason, status: "FAILED", at: new Date() } },
+    });
+    sbtLogger.error("[sbt-pay] refund FAILED — needs ops", { paymentRowId: String(row._id), amt, reason, err: err?.message });
+    return { ok: false, refundedPaise: 0, error: err?.message };
+  }
 }
 
 /* ───────────────────────── create-order / verify ───────────────────────── */
@@ -428,53 +552,68 @@ export function createOrderHandler(product: Product) {
   };
 }
 
-/** POST …/payment/verify — PAID only when Razorpay itself says this payment was
- *  captured, on this order, for exactly the amount the server set. */
+/**
+ * PAID only when Razorpay itself says this payment was captured, on this order,
+ * for exactly the amount the server set (an authorized payment is captured for
+ * that amount). Idempotent for the same payment id; a payment id can back one
+ * row only (unique index).
+ */
+export async function verifyPayment(
+  scope: { userId: string; workspaceId: string },
+  product: Product,
+  orderId: unknown,
+  paymentId: unknown,
+  sig: unknown,
+): Promise<{ ok: true; row: AnyObj } | Refusal> {
+  if (!orderId || !paymentId || !sig) return refuse(400, "MISSING_FIELDS", "Missing payment verification fields");
+  if (!razorpayConfigured()) return refuse(503, "GATEWAY_NOT_CONFIGURED", "Payment gateway not configured");
+  const row = await SBTPayment.findOne({ razorpayOrderId: String(orderId), product, ...scope });
+  if (!row) return refuse(404, "PAYMENT_NOT_FOUND", "Payment order not found");
+  if (row.razorpayPaymentId) {
+    if (row.razorpayPaymentId === String(paymentId)) return { ok: true, row: row.toObject() };
+    return refuse(409, "PAYMENT_ALREADY_USED", "This order is already paid");
+  }
+  if (!checkoutSignatureValid(String(orderId), String(paymentId), String(sig))) {
+    return refuse(400, "BAD_SIGNATURE", "Payment verification failed — signature mismatch");
+  }
+
+  let payment = await fetchRazorpayPayment(String(paymentId));
+  if (String(payment?.order_id ?? "") !== row.razorpayOrderId) {
+    return refuse(400, "ORDER_MISMATCH", "Payment does not belong to this order");
+  }
+  if (Number(payment?.amount) !== row.amountPaise || String(payment?.currency ?? "INR") !== "INR") {
+    sbtLogger.error("[sbt-pay] payment amount differs from server order", {
+      orderId, paymentId, paid: payment?.amount, expected: row.amountPaise,
+    });
+    return refuse(400, "AMOUNT_MISMATCH", "Payment amount does not match the booking amount");
+  }
+  if (payment?.status === "authorized") payment = await captureRazorpayPayment(String(paymentId), row.amountPaise);
+  if (payment?.status !== "captured") return refuse(402, "NOT_CAPTURED", "Payment not completed");
+
+  try {
+    const updated = await SBTPayment.findOneAndUpdate(
+      { _id: row._id, status: "CREATED" },
+      { $set: { status: "PAID", razorpayPaymentId: String(paymentId), paidAt: new Date() } },
+      { new: true },
+    ).lean();
+    if (updated) return { ok: true, row: updated as AnyObj };
+    // The webhook may have marked it PAID with this same payment a moment ago.
+    const now = (await SBTPayment.findById(row._id).lean()) as AnyObj | null;
+    if (now?.razorpayPaymentId === String(paymentId)) return { ok: true, row: now };
+    return refuse(409, "PAYMENT_ALREADY_USED", "This order is already paid");
+  } catch (err: any) {
+    if (err?.code === 11000) return refuse(409, "PAYMENT_ALREADY_USED", "This payment has already been used");
+    throw err;
+  }
+}
+
+/** POST …/payment/verify — see verifyPayment. */
 export function verifyHandler(product: Product) {
   return async (req: Request, res: Response) => {
     try {
       const { razorpay_order_id: orderId, razorpay_payment_id: paymentId, razorpay_signature: sig } = (req.body || {}) as AnyObj;
-      if (!orderId || !paymentId || !sig) return res.status(400).json({ error: "Missing payment verification fields" });
-      if (!razorpayConfigured()) return res.status(503).json({ error: "Payment gateway not configured" });
-      const scope = callerScope(req);
-      const row = await SBTPayment.findOne({ razorpayOrderId: String(orderId), product, ...scope });
-      if (!row) return res.status(404).json({ error: "Payment order not found", code: "PAYMENT_NOT_FOUND" });
-      if (row.razorpayPaymentId) {
-        if (row.razorpayPaymentId === String(paymentId)) return res.json({ ok: true, verified: true });
-        return res.status(409).json({ error: "This order is already paid", code: "PAYMENT_ALREADY_USED" });
-      }
-      if (!checkoutSignatureValid(String(orderId), String(paymentId), String(sig))) {
-        return res.status(400).json({ error: "Payment verification failed — signature mismatch", code: "BAD_SIGNATURE" });
-      }
-
-      let payment = await fetchRazorpayPayment(String(paymentId));
-      if (String(payment?.order_id ?? "") !== row.razorpayOrderId) {
-        return res.status(400).json({ error: "Payment does not belong to this order", code: "ORDER_MISMATCH" });
-      }
-      if (Number(payment?.amount) !== row.amountPaise || String(payment?.currency ?? "INR") !== "INR") {
-        sbtLogger.error("[sbt-pay] payment amount differs from server order", {
-          orderId, paymentId, paid: payment?.amount, expected: row.amountPaise,
-        });
-        return res.status(400).json({ error: "Payment amount does not match the booking amount", code: "AMOUNT_MISMATCH" });
-      }
-      if (payment?.status === "authorized") payment = await captureRazorpayPayment(String(paymentId), row.amountPaise);
-      if (payment?.status !== "captured") {
-        return res.status(402).json({ error: "Payment not completed", code: "NOT_CAPTURED" });
-      }
-
-      try {
-        const updated = await SBTPayment.findOneAndUpdate(
-          { _id: row._id, status: "CREATED" },
-          { $set: { status: "PAID", razorpayPaymentId: String(paymentId), paidAt: new Date() } },
-          { new: true },
-        );
-        if (!updated) return res.status(409).json({ error: "This order is already paid", code: "PAYMENT_ALREADY_USED" });
-      } catch (err: any) {
-        if (err?.code === 11000) {
-          return res.status(409).json({ error: "This payment has already been used", code: "PAYMENT_ALREADY_USED" });
-        }
-        throw err;
-      }
+      const v = await verifyPayment(callerScope(req), product, orderId, paymentId, sig);
+      if (isRefusal(v)) return send(res, v);
       return res.json({ ok: true, verified: true });
     } catch (err: any) {
       sbtLogger.error("[sbt-pay] verify failed", { product, err: err?.message });
@@ -564,15 +703,18 @@ async function claimRazorpay(
   return { ok: true, row: claimed as AnyObj };
 }
 
-async function claimOfficial(
+export async function claimOfficial(
   req: Request,
   scope: { userId: string; workspaceId: string },
   row: AnyObj,
 ): Promise<{ ok: true; row: AnyObj } | Refusal> {
-  const reserved = await reserveOfficial(req, row.amount);
+  const _id = new mongoose.Types.ObjectId();
+  const reserved = await reserveOfficial(req, row.amount, {
+    key: `debit:${_id}`, reason: "BOOKING", paymentId: String(_id), product: row.product,
+  });
   if (isRefusal(reserved)) return reserved;
   const doc = await SBTPayment.create({
-    ...row, ...scope, mode: "OFFICIAL", status: "CLAIMED", amountPaise: Math.round(row.amount * 100),
+    ...row, ...scope, _id, mode: "OFFICIAL", status: "CLAIMED", amountPaise: Math.round(row.amount * 100),
     monthKey: reserved.monthKey, claimedAt: new Date(),
   });
   return { ok: true, row: doc.toObject() };
@@ -696,7 +838,7 @@ export function paymentGate(kind: GateKind) {
         if (onFail === "BACK_TO_BOOKED") {
           await SBTPayment.updateOne({ _id: row._id }, { $set: { status: "BOOKED", failureReason: reason } });
         } else if (row.mode === "OFFICIAL") {
-          await releaseOfficial(row.workspaceId, Number(row.amount), row.monthKey);
+          await releaseOfficial(row, `RELEASE_${String(body?.code || "SUPPLIER_FAILED")}`);
           await SBTPayment.updateOne({ _id: row._id }, { $set: { status: "RELEASED", failureReason: reason } });
         } else {
           // Paid but not booked: the payment stays usable for a retry.
@@ -748,6 +890,9 @@ export async function paymentFactsForSave(
 ): Promise<AnyObj | null> {
   const scope = callerScope(req);
   const or: AnyObj[] = [];
+  // Server-side fulfilment names its own row (set in-process, never from the body).
+  const ownRowId = (req as AnyObj).sbtFulfil?.paymentRowId;
+  if (typeof ownRowId === "string" && /^[a-f0-9]{24}$/i.test(ownRowId)) or.push({ _id: new mongoose.Types.ObjectId(ownRowId) });
   if (typeof ref.razorpayOrderId === "string" && ref.razorpayOrderId) or.push({ razorpayOrderId: ref.razorpayOrderId });
   if (ref.tboBookingId != null && String(ref.tboBookingId) !== "" && String(ref.tboBookingId) !== "0") {
     or.push({ tboBookingId: String(ref.tboBookingId) });

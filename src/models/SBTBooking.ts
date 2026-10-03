@@ -15,6 +15,13 @@ export interface ISBTBooking extends Document {
   isReturn?: boolean;
   returnPnr?: string;
   returnBookingId?: number;
+  // Multi-city: one booking per leg, grouped by the checkout (SBTPayment) id.
+  multiCityGroupId?: string;
+  legIndex?: number;
+  legCount?: number;
+  // Internal test data — excluded from invoices, analytics, reconciliation and
+  // customer history (scripts/mark-sbt-test-data.ts).
+  isTest?: boolean;
   returnTraceId?: string;
   status: "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" | "REISSUED";
   origin: { code: string; city: string };
@@ -130,6 +137,10 @@ const SBTBookingSchema = new Schema(
     isReturn: { type: Boolean, default: false },
     returnPnr: { type: String, default: "" },
     returnBookingId: { type: Number },
+    multiCityGroupId: { type: String, index: true },
+    legIndex: { type: Number },
+    legCount: { type: Number },
+    isTest: { type: Boolean, default: false, index: true },
     returnTraceId: { type: String, default: "" },
     status: {
       type: String,
@@ -285,6 +296,9 @@ SBTBookingSchema.post("save", async function (doc: any) {
         source: "SBT",
         reference: doc._id,
         referenceModel: "SBTBooking",
+        // Mirror the flags every TravelBooking reader filters on.
+        isDemo: doc.isDemo === true,
+        isTest: doc.isTest === true,
         destination: doc.destination?.city || "",
         destinationCity: destCity,
         destinationCountry: destCountry,

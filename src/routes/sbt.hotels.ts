@@ -56,7 +56,15 @@ import {
   verifyHandler,
   paymentFactsForSave,
   latestHotelQuoteFor,
+  creditOfficial,
 } from "../services/sbtPaymentGate.js";
+import {
+  registerFulfilHandlers,
+  createCheckoutHandler,
+  payCheckoutHandler,
+  retryCheckoutHandler,
+  getCheckoutHandler,
+} from "../services/sbtFulfil.js";
 import { TBO_URLS } from "../config/tboUrls.js";
 
 // TBO cert Item 31 — TBO recommends ≥120s before calling GetBookingDetail.
@@ -136,7 +144,8 @@ const getHotelBookingsHandler = async (req: any, res: any) => {
       req.user?.customerMemberRole === 'WORKSPACE_LEADER';
 
     // Demo Platform — demo users see only their demo bookings; real users see real bookings.
-    const demoClause = req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } };
+    // Internal test bookings (scripts/mark-sbt-test-data.ts) never appear in booking history.
+    const demoClause = { ...(req.user?.isDemoUser ? { isDemo: true } : { isDemo: { $ne: true } }), isTest: { $ne: true } };
 
     let bookings;
     if (isWL) {
@@ -1224,6 +1233,16 @@ router.post("/payment/create-order", requireAuth, requireSBT, requireHotelAccess
 // order, for exactly the server amount.
 router.post("/payment/verify", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, verifyHandler("HOTEL"));
 
+// ─── Checkout (server-side fulfilment) ────────────────────────────────────────
+// Voucher bookings and vouchering a hold: the server prices, the customer pays,
+// the SERVER books with TBO and saves (browser, webhook or retry — once).
+// Holds themselves commit no money and still go straight to /book.
+const hotelCheckoutGuards = [requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards];
+router.post("/checkout", ...hotelCheckoutGuards, createCheckoutHandler("HOTEL"));
+router.post("/checkout/:id/pay", ...hotelCheckoutGuards, payCheckoutHandler("HOTEL"));
+router.post("/checkout/:id/fulfil", ...hotelCheckoutGuards, retryCheckoutHandler("HOTEL"));
+router.get("/checkout/:id", ...hotelCheckoutGuards, getCheckoutHandler("HOTEL"));
+
 // ─── 6. POST /book ───────────────────────────────────────────────────────────
 
 router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, paymentGate("hotel-book"), async (req: any, res: any) => {
@@ -2094,6 +2113,22 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
         const newNetAmount: number | undefined =
           result?.NetAmount ??
           result?.HotelResult?.[0]?.Rooms?.[0]?.NetAmount;
+        // A higher supplier price is never accepted: the customer paid the quoted
+        // price, so stop (the checkout refunds and asks for a fresh search). A lower
+        // one is re-sent as TBO requires.
+        if (typeof newNetAmount === "number" && typeof NetAmount === "number" && newNetAmount > NetAmount) {
+          sbtLogger.warn("Book IsPriceChanged=true with a HIGHER price — not accepted", {
+            original: NetAmount, updated: newNetAmount, userId: req.user?.id, clientRef,
+          });
+          SBTHotelBooking.findOneAndUpdate(
+            { clientReferenceId: clientRef },
+            { $set: { status: "FAILED", failureReason: `FARE_CHANGED: supplier price rose ${NetAmount} → ${newNetAmount}`, ..._failedAudit } },
+          ).catch(() => {});
+          return res.status(409).json({
+            code: "FARE_CHANGED",
+            error: "The room price went up before your booking could be confirmed. Please search again for the latest price.",
+          });
+        }
         if (typeof newNetAmount === "number" && newNetAmount > 0) {
           priceChangedDuringBook = true;
           priceChangeAmount = newNetAmount - (typeof NetAmount === "number" ? NetAmount : 0);
@@ -3035,6 +3070,7 @@ router.post("/bookings/refund-orphaned", requireAdmin, async (req: any, res: any
       bookingId: "",
       paymentId: { $ne: "" },
       isDemo: { $ne: true },
+      isTest: { $ne: true },
     });
 
     if (orphaned.length === 0) {
@@ -3277,15 +3313,11 @@ async function pollCancelStatusBackground(
     });
     sbtLogger.info("[CANCEL-BG] Booking marked CANCELLED", { mongoId, changeRequestId, cancellationCharge });
 
+    // Business-wallet spend back (selling total, same month); ledger-backed, once per booking.
     if (paymentMode === "official" && workspaceId) {
-      const bookingMonth = createdAt.toISOString().slice(0, 7);
-      if (bookingMonth === new Date().toISOString().slice(0, 7)) {
-        await CustomerWorkspace.findOneAndUpdate(
-          { _id: workspaceId },
-          [{ $set: { "sbtOfficialBooking.currentMonthSpend": { $max: [0, { $subtract: ["$sbtOfficialBooking.currentMonthSpend", totalFare] }] } } }],
-          { runValidators: false }
-        ).catch((e: any) => sbtLogger.error("[CANCEL-BG] Spend reversal failed", { mongoId, error: e?.message }));
-      }
+      await creditOfficial(workspaceId, Number(totalFare) || 0, createdAt.toISOString().slice(0, 7), {
+        key: `cancel:${mongoId}`, reason: "CANCELLATION", bookingDocId: String(mongoId), product: "HOTEL",
+      }).catch((e: any) => sbtLogger.error("[CANCEL-BG] Spend reversal failed", { mongoId, error: e?.message }));
     }
   } else if (cancelStatus === 4) {
     // Rejected — restore CONFIRMED so ops can decide
@@ -3997,6 +4029,21 @@ router.post("/admin/date-change-requests/:id/update", requireAdmin, async (req: 
     sbtLogger.error("Admin date-change-request update failed", { id: req.params.id, error: msg });
     return res.status(500).json({ error: msg });
   }
+});
+
+// Server-side fulfilment runs these exact route handlers (after their guards),
+// so the certified TBO flow has one implementation. See services/sbtFulfil.ts.
+function routeHandler(path: string, method: "post" | "get") {
+  const layer = (router as any).stack.find((l: any) => l.route?.path === path && l.route.methods?.[method]);
+  const stack = layer?.route?.stack;
+  const handle = stack?.[stack.length - 1]?.handle;
+  if (!handle) throw new Error(`route handler not found: ${method.toUpperCase()} ${path}`);
+  return handle;
+}
+registerFulfilHandlers({
+  hotelBook: routeHandler("/book", "post"),
+  hotelVoucher: routeHandler("/bookings/:id/generate-voucher", "post"),
+  hotelSave: routeHandler("/bookings/save", "post"),
 });
 
 export default router;
