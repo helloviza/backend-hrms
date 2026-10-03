@@ -39,6 +39,8 @@ import {
   adminQueueAccess,
   hasQueueView,
   hasQueueWork,
+  queueCaseScope,
+  requestInQueueScope,
 } from "./approvals.security.js";
 import { markRequestDone, notifyRequesterProgress, notifyProposalReady } from "../services/approvalProgress.js";
 
@@ -628,24 +630,43 @@ const requireStaff: RequestHandler = async (req: Request, res: Response, next: N
     const u = (req as AuthedReq).user;
     if (!u) return res.status(401).json({ error: "Unauthenticated" });
     const a = await adminQueueAccess(req);
-    if (req.method === "GET" ? a.view : a.work) return next();
-    return res.status(403).json({ error: "Admin Queue access required", reason: "NO_ADMIN_QUEUE_ACCESS" });
+    if (!(req.method === "GET" ? a.view : a.work)) {
+      return res.status(403).json({ error: "Admin Queue access required", reason: "NO_ADMIN_QUEUE_ACCESS" });
+    }
+    // Queue scope: an OWN grant reaches only proposals on cases assigned to the
+    // caller (queueCaseScope). /queue has no case id and filters its list instead.
+    if (a.scope === "all") return next();
+    const requestId = req.params.requestId ?? (req.params.id ? await proposalRequestId(req.params.id) : undefined);
+    if (requestId === undefined) return next();
+    if (await requestInQueueScope(req, requestId)) return next();
+    return res.status(404).json({ error: "Not found" });
   } catch (e) {
     return next(e);
   }
 };
+
+/** The request a proposal belongs to ("" when the proposal or its link is missing). */
+async function proposalRequestId(proposalId: any): Promise<string> {
+  if (!mongoose.Types.ObjectId.isValid(String(proposalId || ""))) return "";
+  const p: any = await Proposal.findById(String(proposalId)).select("requestId").lean();
+  return String(p?.requestId || "");
+}
 
 const requireProposalViewer: RequestHandler = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const aReq = req as AuthedReq;
 
     if (!aReq.user) return res.status(401).json({ error: "Unauthenticated" });
-    if ((await adminQueueAccess(req)).view) return next();
+    // Staff inside their queue scope (an OWN grant: cases assigned to them).
+    // Outside it they are checked like anyone else below.
+    if ((await adminQueueAccess(req)).view && (await requestInQueueScope(req, await proposalRequestId(aReq.params?.id)))) {
+      return next();
+    }
 
     const userEmail = normEmail(aReq.user?.email);
     if (!userEmail) return res.status(401).json({ error: "Unauthenticated" });
 
-    const proposalId = normStr(aReq.params?.id || "");
+    const proposalId =normStr(aReq.params?.id || "");
     if (!mongoose.Types.ObjectId.isValid(proposalId)) {
       return res.status(400).json({ error: "Invalid proposal id" });
     }
@@ -681,12 +702,17 @@ const requireProposalViewerFromDownloadPath: RequestHandler = async (req: Reques
     const aReq = req as AuthedReq;
 
     if (!aReq.user) return res.status(401).json({ error: "Unauthenticated" });
-    if ((await adminQueueAccess(req)).view) return next();
+    // Staff inside their queue scope (an OWN grant: cases assigned to them).
+    // Outside it they are checked like anyone else below.
+    const scopeParts = String(req.query?.path || "").trim().split(/[\\/]/);
+    if ((await adminQueueAccess(req)).view && (await requestInQueueScope(req, await proposalRequestId(scopeParts[1])))) {
+      return next();
+    }
 
     const userEmail = normEmail(aReq.user?.email);
     if (!userEmail) return res.status(401).json({ error: "Unauthenticated" });
 
-    const rel = String(req.query?.path || "").trim().replace(/\\/g, "/");
+    const rel =String(req.query?.path || "").trim().replace(/\\/g, "/");
     if (!rel.startsWith("proposals/")) return res.status(400).json({ error: "Invalid path" });
 
     const parts = rel.split("/");
@@ -977,6 +1003,12 @@ router.get("/queue", requireAnyAuth, requireWorkspace, requireStaff, async (req:
     const bookingStatus = normStr(req.query?.bookingStatus || "").toUpperCase();
 
     const q: AnyObj = staffWorkspaceScope(req) ? { workspaceId: staffWorkspaceScope(req) } : {};
+    // Queue scope: an OWN grant lists only proposals on cases assigned to the caller.
+    const caseScope = queueCaseScope(req);
+    if (Object.keys(caseScope).length) {
+      const mine = await ApprovalRequest.find(caseScope).select("_id").lean();
+      q.requestId = { $in: mine.map((r: any) => r._id) };
+    }
     if (["DRAFT", "SUBMITTED", "APPROVED", "DECLINED", "CHANGES_REQUESTED", "EXPIRED"].includes(status)) q.status = status;
     if (["PENDING", "APPROVED", "DECLINED"].includes(l2)) q["approvals.l2.decision"] = l2;
     if (["PENDING", "APPROVED", "DECLINED"].includes(l0)) q["approvals.l0.decision"] = l0;

@@ -43,6 +43,8 @@ import {
   stampAdminQueueAccess,
   hasQueueView,
   hasQueueWork,
+  queueCaseScope,
+  caseInQueueScope,
   normEmail,
   normStr,
   normalizeAction,
@@ -135,7 +137,21 @@ function sendTravellerError(res: any, e: TravellerError) {
  * look up by id; anyone else stays inside their own workspace.
  */
 function requestFilterFor(req: AnyObj, id: string) {
-  return hasQueueView(req) ? { _id: id } : { _id: id, workspaceId: req.workspaceObjectId };
+  if (!hasQueueView(req)) return { _id: id, workspaceId: req.workspaceObjectId };
+  const scope = queueCaseScope(req);
+  if (!Object.keys(scope).length) return { _id: id };
+  // OWN grant: the caller's cases, plus (as for anyone) their own workspace's.
+  return { _id: id, $or: [scope, { workspaceId: req.workspaceObjectId }] };
+}
+
+/**
+ * Lookup for one request on an /admin (queue) route: staff are held to their
+ * queue scope (queueCaseScope — an OWN grant reaches only cases assigned to
+ * them; anything else is "not found"). Workspace Leaders on the read routes
+ * stay inside their own workspace.
+ */
+function queueCaseFilter(req: AnyObj, id: string) {
+  return hasQueueView(req) ? { _id: id, ...queueCaseScope(req) } : { _id: id, workspaceId: req.workspaceObjectId };
 }
 
 /**
@@ -171,7 +187,7 @@ router.use("/travel-desk", travelDeskRouter);
 router.get("/queue-access", async (req: AnyObj, res) => {
   setNoStore(res);
   const a = await adminQueueAccess(req);
-  res.json({ ok: true, view: a.view, work: a.work, via: a.via });
+  res.json({ ok: true, view: a.view, work: a.work, via: a.via, scope: a.scope });
 });
 
 /* ───────────────────────── uploads (PDF attachments) ───────────────────────── */
@@ -1244,7 +1260,7 @@ router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res
 router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj, res, next) => {
   try {
     const doc = await ApprovalRequest
-      .findOne(requestFilterFor(req, String(req.params.id || "")))
+      .findOne(queueCaseFilter(req, String(req.params.id || "")))
       .populate("workspaceId", "name companyName config")
       .lean();
 
@@ -1270,7 +1286,7 @@ router.get("/admin/requests/:id/selection-snapshot", async (req: AnyObj, res, ne
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ error: "Invalid request id" });
     }
-    const found: any = await ApprovalRequest.findOne(requestFilterFor(req, id)).select("workspaceId").lean();
+    const found: any = await ApprovalRequest.findOne(queueCaseFilter(req, id)).select("workspaceId").lean();
     if (!found) return res.status(404).json({ error: "Request not found" });
 
     const rows = await ApprovalSelectionSnapshot.find({ requestId: id, workspaceId: found.workspaceId })
@@ -1302,7 +1318,7 @@ router.post("/admin/requests/:id/passport-reveal", requireApprovalsAdminWrite, a
       return res.status(400).json({ error: "itemIndex and travellerIndex are required" });
     }
 
-    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id))
+    const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, id))
       .select("cartItems")
       .lean();
     if (!doc) return res.status(404).json({ error: "Request not found" });
@@ -1325,7 +1341,7 @@ router.post("/admin/requests/:id/passport-reveal", requireApprovalsAdminWrite, a
     };
     // timestamps:false — a reveal must not move "Last update" or the queue order.
     const written = await ApprovalRequest.updateOne(
-      requestFilterFor(req, id),
+      queueCaseFilter(req, id),
       { $push: { passportReveals: entry } },
       { timestamps: false },
     );
@@ -1347,7 +1363,7 @@ router.get("/admin/requests/:id/passport-reveals", requireApprovalsAdminWrite, a
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ error: "Invalid request id" });
     }
-    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id))
+    const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, id))
       .select("+passportReveals")
       .lean();
     if (!doc) return res.status(404).json({ error: "Request not found" });
@@ -1365,7 +1381,7 @@ router.get("/admin/requests/:id/passport-reveals", requireApprovalsAdminWrite, a
 
 router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
   try {
-    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, String(req.params.id || "")));
+    const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, String(req.params.id || "")));
     if (!doc) return res.status(404).json({ error: "Not found" });
     const wasInProgress = doc.stage === "BOOKING_IN_PROGRESS";
 
@@ -1407,7 +1423,7 @@ router.put("/admin/:id/assign", requireApprovalsAdminWrite, async (req: AnyObj, 
     const agentUserId = String(req.body?.agentUserId || "").trim();
     if (!agentUserId) return res.status(400).json({ error: "Pick a Travel Desk agent", code: "AGENT_REQUIRED" });
 
-    const exists = await ApprovalRequest.exists(requestFilterFor(req, id));
+    const exists = await ApprovalRequest.exists(queueCaseFilter(req, id));
     if (!exists) return res.status(404).json({ error: "Request not found" });
 
     const doc = await assignCase({
@@ -1434,7 +1450,7 @@ router.put("/admin/:id/unassign", requireApprovalsAdminWrite, async (req: AnyObj
     setNoStore(res);
     const id = String(req.params.id || "");
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid request id" });
-    const exists = await ApprovalRequest.exists(requestFilterFor(req, id));
+    const exists = await ApprovalRequest.exists(queueCaseFilter(req, id));
     if (!exists) return res.status(404).json({ error: "Request not found" });
 
     const doc = await assignCase({
@@ -1465,7 +1481,7 @@ router.put(
       const id = String(req.params.id || "");
       const { comment } = req.body || {};
 
-      const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
+      const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, id));
       if (!doc) return res.status(404).json({ error: "Request not found" });
 
       const st = String(doc.stage || "").toUpperCase();
@@ -1517,7 +1533,7 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
     const id = String(req.params.id || "");
     const { comment, notifyEmail, bookingAmount, actualBookingPrice } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
+    const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, id));
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     if (doc.stage !== "BOOKING_IN_PROGRESS") {
@@ -1546,6 +1562,17 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
 router.post(
   "/admin/:id/attachment",
   requireApprovalsAdminWrite,
+  // Scope check BEFORE multer, so a refused upload never lands on disk.
+  async (req: AnyObj, res, next) => {
+    try {
+      const id = String(req.params.id || "");
+      if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid request id" });
+      if (!(await ApprovalRequest.exists(queueCaseFilter(req, id)))) return res.status(404).json({ error: "Request not found" });
+      next();
+    } catch (err) {
+      next(err);
+    }
+  },
   (req, res, next) => {
     approvalsUpload.single("file")(req as any, res as any, (err: any) => {
       if (err) {
@@ -1571,7 +1598,7 @@ router.post(
 
       if (!file) return res.status(400).json({ error: "File is required" });
 
-      const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
+      const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, id));
       if (!doc) return res.status(404).json({ error: "Request not found" });
 
       const base = (process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 8080}`).replace(
@@ -1651,7 +1678,7 @@ router.get("/attachments/:filename/download", requireAuth, async (req: AnyObj, r
     if (!doc) return res.status(404).json({ error: "Attachment not found" });
 
     const canView =
-      hasQueueView(req) || isOwnerOfRequest(doc, req.user) || isManagerOrLeaderOfRequest(doc, req.user);
+      caseInQueueScope(req, doc) || isOwnerOfRequest(doc, req.user) || isManagerOrLeaderOfRequest(doc, req.user);
 
     if (!canView) return res.status(403).json({ error: "Not allowed" });
 
@@ -1690,7 +1717,7 @@ router.put("/admin/:id/on-hold", requireApprovalsAdminWrite, async (req: AnyObj,
     const id = String(req.params.id || "");
     const { comment } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
+    const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, id));
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     const wasOnHold = doc.adminState === "on_hold";
@@ -1726,7 +1753,7 @@ router.put("/admin/:id/cancel", requireApprovalsAdminWrite, async (req: AnyObj, 
     const id = String(req.params.id || "");
     const { comment } = req.body || {};
 
-    const doc: any = await ApprovalRequest.findOne(requestFilterFor(req, id));
+    const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, id));
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
     doc.adminState = "cancelled";

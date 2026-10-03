@@ -4,7 +4,9 @@ import User from "../models/User.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { maskTailId } from "../utils/piiMask.js";
-import { holdsCapability } from "../services/capabilityProbe.js";
+import { readCapability } from "../services/capabilityProbe.js";
+import { hasAccess } from "../models/UserPermission.js";
+import ApprovalRequest from "../models/ApprovalRequest.js";
 import { isSuperAdmin as isSuperAdminReq } from "../middleware/isSuperAdmin.js";
 
 export type AnyObj = Record<string, any>;
@@ -513,7 +515,7 @@ export async function resolveLeaderCustomerIds(email: string): Promise<string[]>
  *
  * The booking team is whoever holds adminQueue on their UserPermission
  * (Access Console), not whoever carries an ops role. Resolved per request
- * (the token carries roles[] only) through holdsCapability, which reads the
+ * (the token carries roles[] only) through readCapability, which reads the
  * live grant with status "active" — a revoked (deleted) or suspended grant
  * stops working on the next request.
  *
@@ -525,12 +527,25 @@ export async function resolveLeaderCustomerIds(email: string): Promise<string[]>
  * role (including a tenant admin carrying ADMIN) gets neither. SUPERADMIN,
  * and ADMIN signed in to HOUSE, keep both for oversight — they are never
  * Travel Desk agents unless they also hold the grant.
+ *
+ * Scope (the grant's scope in Access Console):
+ *   OWN                     — only cases assigned to the caller
+ *                             (meta.adminAssigned.userId)
+ *   TEAM / WORKSPACE / ALL  — every case
+ * Oversight (SUPERADMIN / HOUSE ADMIN) is always "all". queueCaseScope(req)
+ * is the one filter every queue list and every per-case route applies.
  * ──────────────────────────────────────────────────────────────── */
 
 export const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
 
-export type AdminQueueAccess = { view: boolean; work: boolean; via: "superadmin" | "admin-role" | "permission" | "none" };
-const NO_QUEUE_ACCESS: AdminQueueAccess = { view: false, work: false, via: "none" };
+export type QueueScope = "all" | "own";
+export type AdminQueueAccess = {
+  view: boolean;
+  work: boolean;
+  via: "superadmin" | "admin-role" | "permission" | "none";
+  scope: QueueScope;
+};
+const NO_QUEUE_ACCESS: AdminQueueAccess = { view: false, work: false, via: "none", scope: "own" };
 
 /**
  * Resolve once per request and stamp it on `req` (not req.user: a route-level
@@ -543,13 +558,21 @@ export async function adminQueueAccess(req: AnyObj): Promise<AdminQueueAccess> {
 
   let out: AdminQueueAccess = NO_QUEUE_ACCESS;
   if (isSuperAdminReq(req as any)) {
-    out = { view: true, work: true, via: "superadmin" };
+    out = { view: true, work: true, via: "superadmin", scope: "all" };
   } else if (String(req.workspaceId || req.workspaceObjectId || "") === PLUMTRIPS_HOUSE_WORKSPACE_ID) {
     const roles = (Array.isArray(user.roles) ? user.roles : []).map((r: any) => String(r).trim().toUpperCase());
     if (roles.includes("ADMIN")) {
-      out = { view: true, work: true, via: "admin-role" };
-    } else if (await holdsCapability(req, "adminQueue", "READ")) {
-      out = { view: true, work: await holdsCapability(req, "adminQueue", "WRITE"), via: "permission" };
+      out = { view: true, work: true, via: "admin-role", scope: "all" };
+    } else {
+      const grant = await readCapability(req, "adminQueue");
+      if (hasAccess(grant.access, "READ")) {
+        out = {
+          view: true,
+          work: hasAccess(grant.access, "WRITE"),
+          via: "permission",
+          scope: grant.scope === "OWN" ? "own" : "all",
+        };
+      }
     }
   }
   Object.defineProperty(req, "__adminQueue", { value: out, enumerable: false, configurable: true });
@@ -572,6 +595,43 @@ export function hasQueueView(req: any): boolean {
 }
 export function hasQueueWork(req: any): boolean {
   return req?.__adminQueue?.work === true;
+}
+
+/** The caller's user id as Travel Desk stores it (meta.adminAssigned.userId). */
+function queueCallerId(req: any): string {
+  return String(req?.user?.sub || req?.user?._id || req?.user?.id || "");
+}
+
+/**
+ * THE queue scope filter — every queue list and every per-case staff route
+ * (approvals + proposals) goes through this. `{}` = every case; an OWN grant =
+ * only cases assigned to the caller. Callers without queue view get a filter
+ * that matches nothing (they are never meant to reach a queue path).
+ */
+export function queueCaseScope(req: any): AnyObj {
+  const a: AdminQueueAccess | undefined = req?.__adminQueue;
+  if (!a?.view) return { _id: null };
+  if (a.scope === "all") return {};
+  const me = queueCallerId(req);
+  return me ? { "meta.adminAssigned.userId": me } : { _id: null };
+}
+
+/** Same rule as queueCaseScope, for a request document already in hand. */
+export function caseInQueueScope(req: any, doc: any): boolean {
+  const a: AdminQueueAccess | undefined = req?.__adminQueue;
+  if (!a?.view) return false;
+  if (a.scope === "all") return true;
+  const me = queueCallerId(req);
+  return !!me && String(doc?.meta?.adminAssigned?.userId || "") === me;
+}
+
+/** Is request `requestId` inside the caller's queue scope? (one indexed read when OWN) */
+export async function requestInQueueScope(req: any, requestId: any): Promise<boolean> {
+  const a: AdminQueueAccess | undefined = req?.__adminQueue;
+  if (!a?.view) return false;
+  if (a.scope === "all") return true;
+  if (!isValidObjectId(requestId)) return false;
+  return !!(await ApprovalRequest.exists({ _id: String(requestId), ...queueCaseScope(req) }));
 }
 
 export async function requireApprovalsAdminRead(req: AnyObj, res: any, next: any) {
@@ -692,9 +752,13 @@ export async function requireCanRaiseRequest(req: AnyObj, res: any, next: any) {
  * ──────────────────────────────────────────────────────────────── */
 
 export function applyLeaderScopeIfNeeded(req: AnyObj, baseFilter: AnyObj) {
-  // Ops queue access (Admin Queue grant / oversight) sees every customer;
-  // anyone else here is a Workspace Leader, scoped to their customers.
-  if (hasQueueView(req)) return baseFilter;
+  // Ops queue access (Admin Queue grant / oversight) sees every customer —
+  // narrowed to the caller's own cases on an OWN grant; anyone else here is
+  // a Workspace Leader, scoped to their customers.
+  if (hasQueueView(req)) {
+    const scope = queueCaseScope(req);
+    return Object.keys(scope).length ? { $and: [baseFilter, scope] } : baseFilter;
+  }
 
   const ids: string[] = Array.isArray(req.__leaderCustomerIds) ? req.__leaderCustomerIds : [];
   if (!ids.length) return { $and: [baseFilter, { _id: null }] };

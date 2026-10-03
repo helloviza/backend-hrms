@@ -68,7 +68,13 @@ describe("staff ops actions are never scoped to the staff member's own workspace
 
   it("the helpers keep their staff branch (staff by id, everyone else in their own workspace)", () => {
     const a = src("approvals.ts");
-    expect(a).toMatch(/function requestFilterFor\([^)]*\)\s*\{\s*return hasQueueView\(req\) \? \{ _id: id \} : \{ _id: id, workspaceId: req\.workspaceObjectId \};/);
+    // Staff by id, held to their Admin Queue scope (queueCaseScope); everyone else in their own workspace.
+    expect(a).toMatch(/function requestFilterFor\([^)]*\)\s*\{\s*if \(!hasQueueView\(req\)\) return \{ _id: id, workspaceId: req\.workspaceObjectId \};\s*const scope = queueCaseScope\(req\);\s*if \(!Object\.keys\(scope\)\.length\) return \{ _id: id \};/);
+    expect(a).toMatch(/function queueCaseFilter\([^)]*\)\s*\{\s*return hasQueueView\(req\) \? \{ _id: id, \.\.\.queueCaseScope\(req\) \} : \{ _id: id, workspaceId: req\.workspaceObjectId \};/);
+    // Every /admin route looks a case up through the scoped filter, never the unscoped one.
+    const admin = routeBlocks(a).filter((b) => b.path.startsWith("/admin/") && /:id/.test(b.path));
+    expect(admin.filter((b) => /requestFilterFor\(/.test(b.text)).map((b) => `${b.method} ${b.path}`), "an /admin route skips the queue scope").toEqual([]);
+    expect(admin.filter((b) => !/queueCaseFilter\(/.test(b.text)).map((b) => `${b.method} ${b.path}`), "an /admin case route has no scoped lookup").toEqual([]);
     const p = src("proposals.ts");
     expect(p).toMatch(/function staffWorkspaceScope\([^)]*\)[^{]*\{\s*return hasQueueView\(req\) \? undefined : \(req as any\)\.workspaceObjectId;/);
     expect(p).toMatch(/function byIdFor\([^)]*\)\s*\{\s*const ws = staffWorkspaceScope\(req\);\s*return ws \? \{ _id: id, workspaceId: ws \} : \{ _id: id \};/);
@@ -122,14 +128,19 @@ describe("follow-up routes keep acting on the customer's record for staff", () =
 /* ── Queue access = the Access Console "Admin Queue" grant (fix/travel-desk-access-permission) ── */
 
 describe("ops queue access comes from the Admin Queue grant, never from roles alone", () => {
-  it("the queue gates resolve adminQueueAccess (grant via holdsCapability; HOUSE only; ADMIN/SUPERADMIN oversight)", () => {
+  it("the queue gates resolve adminQueueAccess (grant via readCapability; HOUSE only; ADMIN/SUPERADMIN oversight; scope)", () => {
     const sec = src("approvals.security.ts");
-    expect(sec).toMatch(/holdsCapability\(req, "adminQueue", "READ"\)/);
-    expect(sec).toMatch(/holdsCapability\(req, "adminQueue", "WRITE"\)/);
+    expect(sec).toMatch(/const grant = await readCapability\(req, "adminQueue"\);/);
+    expect(sec).toMatch(/hasAccess\(grant\.access, "READ"\)/);
+    expect(sec).toMatch(/work: hasAccess\(grant\.access, "WRITE"\)/);
+    expect(sec).toMatch(/scope: grant\.scope === "OWN" \? "own" : "all"/);
     expect(sec).toMatch(/=== PLUMTRIPS_HOUSE_WORKSPACE_ID\)/);
     expect(sec, "read gate").toMatch(/if \(\(await adminQueueAccess\(req\)\)\.view\) return next\(\);/);
     expect(sec, "write gate").toMatch(/if \(!\(await adminQueueAccess\(req\)\)\.work\) \{/);
-    expect(src("proposals.ts"), "proposals requireStaff").toMatch(/const a = await adminQueueAccess\(req\);\s*if \(req\.method === "GET" \? a\.view : a\.work\) return next\(\);/);
+    expect(sec, "lists are scoped").toMatch(/if \(hasQueueView\(req\)\) \{\s*const scope = queueCaseScope\(req\);/);
+    const prop = src("proposals.ts");
+    expect(prop, "proposals requireStaff").toMatch(/const a = await adminQueueAccess\(req\);\s*if \(!\(req\.method === "GET" \? a\.view : a\.work\)\) \{/);
+    expect(prop, "proposals requireStaff scope").toMatch(/if \(await requestInQueueScope\(req, requestId\)\) return next\(\);/);
   });
 
   it("no role-based staff test is left in the queue code (approvals, proposals, Travel Desk)", () => {

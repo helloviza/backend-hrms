@@ -53,7 +53,28 @@
 import mongoose from "mongoose";
 
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
-import { UserPermission, hasAccess, type AccessLevel } from "../models/UserPermission.js";
+import { UserPermission, hasAccess, type AccessLevel, type ScopeLevel } from "../models/UserPermission.js";
+
+/**
+ * The caller's own active grant on `moduleKey` ({ access, scope }), NONE/NONE
+ * when there is none. Same rules as holdsCapability (status "active", one
+ * projected read) but WITHOUT the SUPERADMIN bypass: this reports the grant
+ * itself, so callers that need the scope decide oversight themselves.
+ */
+export async function readCapability(
+  req: unknown,
+  moduleKey: string,
+): Promise<{ access: AccessLevel; scope: ScopeLevel }> {
+  const user = (req as any)?.user;
+  const userId = String(user?._id || user?.id || user?.sub || "");
+  if (!mongoose.isValidObjectId(userId)) return { access: "NONE", scope: "NONE" };
+
+  const perm = await UserPermission.findOne({ userId, status: "active" })
+    .select(`modules.${moduleKey}`)
+    .lean();
+  const m = (perm as any)?.modules?.[moduleKey];
+  return { access: (m?.access as AccessLevel) || "NONE", scope: (m?.scope as ScopeLevel) || "NONE" };
+}
 
 /**
  * True when this caller holds `moduleKey` at `min` access or above.
@@ -78,16 +99,8 @@ export async function holdsCapability(
   // file header for why this is isSuperAdmin(req) and not a roles check.
   if (isSuperAdmin(req as any)) return true;
 
-  const user = (req as any)?.user;
-  const userId = String(user?._id || user?.id || user?.sub || "");
-  if (!mongoose.isValidObjectId(userId)) return false;
-
-  const perm = await UserPermission.findOne({ userId, status: "active" })
-    // Projected to the one path, so a probe cannot become an accidental
-    // reader of the whole permission document.
-    .select(`modules.${moduleKey}`)
-    .lean();
-
-  const access: AccessLevel = ((perm as any)?.modules?.[moduleKey]?.access as AccessLevel) || "NONE";
+  // Projected to the one path (readCapability), so a probe cannot become an
+  // accidental reader of the whole permission document.
+  const { access } = await readCapability(req, moduleKey);
   return hasAccess(access, min);
 }
