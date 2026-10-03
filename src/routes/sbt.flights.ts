@@ -62,6 +62,8 @@ import {
   refundPaymentRow,
   isRefusal,
   isTravelDeskCaller,
+  isSBTStaff,
+  requireSBTStaffDirect,
   rememberMultiCityTraces,
   isMultiCityTrace,
   reissueFareDifference,
@@ -923,7 +925,7 @@ router.post("/farerule", requireAuth, requireSBT, async (req: any, res: any) => 
 });
 
 // POST /api/sbt/flights/book
-router.post("/book", requireSBT, requireFlightAccess, ...sbtBookerGuards, paymentGate("flight-book"), async (req: any, res: any) => {
+router.post("/book", requireSBT, requireFlightAccess, ...sbtBookerGuards, requireSBTStaffDirect, paymentGate("flight-book"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "flight-book")) return;
     // Guard: LCC flights must use /ticket-lcc, not /book
@@ -1064,7 +1066,7 @@ router.post("/book", requireSBT, requireFlightAccess, ...sbtBookerGuards, paymen
 });
 
 // POST /api/sbt/flights/ticket
-router.post("/ticket", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, paymentGate("flight-ticket"), async (req: any, res: any) => {
+router.post("/ticket", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, requireSBTStaffDirect, paymentGate("flight-ticket"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "flight-ticket")) return;
     // Validate ticket-level PAN/passport requirements
@@ -1173,7 +1175,7 @@ router.post("/ssr", requireSBT, async (req: any, res: any) => {
 });
 
 // POST /api/sbt/flights/ticket-lcc
-router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, paymentGate("flight-ticket-lcc"), async (req: any, res: any) => {
+router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, requireSBTStaffDirect, paymentGate("flight-ticket-lcc"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "flight-ticket-lcc")) return;
     const { isReturn, returnResultIndex, returnTraceId, returnPassengers, isSpecialReturn, isReturnGDS } = req.body;
@@ -2956,9 +2958,10 @@ router.post("/bookings/:id/reissue-order", requireAuth, requireSBT, requireFligh
     const booking = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-    // Paying a fare difference online is Travel Desk only; self-service reissues
-    // with a difference are raised to ops from /reissue.
-    if (!isTravelDeskCaller(req)) {
+    // Paying a fare difference online is Plumtrips staff only (Admin Queue grant
+    // / SUPERADMIN); self-service reissues with a difference are raised to ops
+    // from /reissue.
+    if (!(await isSBTStaff(req))) {
       return res.status(409).json({ error: FARE_DIFFERENCE_MESSAGE, code: "FARE_DIFFERENCE_TRAVEL_DESK" });
     }
 
@@ -3246,11 +3249,11 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, requireFlightAcces
 // POST /api/sbt/flights/payment/create-order — Razorpay order for the SERVER
 // price of the quoted fare(s) + add-ons (body: quoteIds, Passengers,
 // returnPassengers). Any client amount is ignored. See services/sbtPaymentGate.ts.
-router.post("/payment/create-order", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, createOrderHandler("FLIGHT"));
+router.post("/payment/create-order", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, requireSBTStaffDirect, createOrderHandler("FLIGHT"));
 
 // POST /api/sbt/flights/payment/verify — signature + the payment fetched from
 // Razorpay must be captured, on this order, for exactly the server amount.
-router.post("/payment/verify", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, verifyHandler("FLIGHT"));
+router.post("/payment/verify", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, requireSBTStaffDirect, verifyHandler("FLIGHT"));
 
 // ─── Checkout (server-side fulfilment) ─────────────────────────────────────
 // The browser starts a checkout (server prices it), pays, and the SERVER books

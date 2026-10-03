@@ -89,6 +89,18 @@ vi.mock("../services/sbtRazorpay.js", async (orig) => ({
   captureRazorpayPayment: rzp.captureRazorpayPayment,
 }));
 
+// The old direct routes are Plumtrips staff only (requireSBTStaffDirect). This
+// suite tests the payment gate BEHIND that lock, so here the staff check reads
+// a header (callers are staff unless x-test-queue: none). The lock itself runs
+// against real Admin Queue grants in sbt.staffDirectRoutes.test.ts.
+vi.mock("./approvals.security.js", async (orig) => ({
+  ...(await orig<any>()),
+  adminQueueAccess: async (req: any) => {
+    const work = req.headers?.["x-test-queue"] !== "none";
+    return { view: work, work, via: work ? "permission" : "none", scope: "all" };
+  },
+}));
+
 const { default: flightsRouter } = await import("./sbt.flights.js");
 const { default: hotelsRouter } = await import("./sbt.hotels.js");
 const app = express();
@@ -107,11 +119,12 @@ const OTHER = oid();
 
 const HOUSE = "69679a7628330a58d29f2254"; // Plumtrips Travel Desk workspace
 
-const as = (r: request.Test, userId: mongoose.Types.ObjectId, opts: { sbt?: boolean; ws?: string } = {}) =>
+const as = (r: request.Test, userId: mongoose.Types.ObjectId, opts: { sbt?: boolean; ws?: string; staff?: boolean } = {}) =>
   r
     .set("x-test-user", JSON.stringify({ _id: String(userId), id: String(userId), sub: String(userId), email: "u@test", roles: ["CUSTOMER"] }))
     .set("x-test-ws", opts.ws ?? String(WS))
-    .set("x-test-sbt", opts.sbt === false ? "off" : "on");
+    .set("x-test-sbt", opts.sbt === false ? "off" : "on")
+    .set("x-test-queue", opts.staff === false ? "none" : "work");
 
 const sign = (orderId: string, paymentId: string) =>
   createHmac("sha256", "rzp_test_secret").update(`${orderId}|${paymentId}`).digest("hex");
@@ -519,7 +532,7 @@ describe("reissue: a fare difference goes to the Travel Desk", () => {
   });
 
   it("self-service cannot open a payment for a fare difference", async () => {
-    const r = await as(request(app).post(`/api/sbt/flights/bookings/${BOOKING}/reissue-order`), BOOKER).send({ priceDiff: 2000 });
+    const r = await as(request(app).post(`/api/sbt/flights/bookings/${BOOKING}/reissue-order`), BOOKER, { staff: false }).send({ priceDiff: 2000 });
     expect(r.status).toBe(409);
     expect(r.body.error).toBe(FD);
     expect(rzp.createRazorpayOrder).not.toHaveBeenCalled();

@@ -57,6 +57,7 @@ import {
   paymentFactsForSave,
   latestHotelQuoteFor,
   creditOfficial,
+  requireSBTStaffDirect,
 } from "../services/sbtPaymentGate.js";
 import {
   registerFulfilHandlers,
@@ -1225,13 +1226,13 @@ router.post("/validate-before-payment", requireSBT, requireHotelAccess, ...sbtBo
 // Razorpay order for the SERVER amount: the PreBook quote's displayTotalFare
 // (body: quoteId), or a held booking's server price (body: heldBookingId).
 // Any client amount is ignored. See services/sbtPaymentGate.ts.
-router.post("/payment/create-order", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, createOrderHandler("HOTEL"));
+router.post("/payment/create-order", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, requireSBTStaffDirect, createOrderHandler("HOTEL"));
 
 // ─── 5. POST /payment/verify ─────────────────────────────────────────────────
 
 // Signature + the payment fetched from Razorpay must be captured, on this
 // order, for exactly the server amount.
-router.post("/payment/verify", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, verifyHandler("HOTEL"));
+router.post("/payment/verify", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, requireSBTStaffDirect, verifyHandler("HOTEL"));
 
 // ─── Checkout (server-side fulfilment) ────────────────────────────────────────
 // Voucher bookings and vouchering a hold: the server prices, the customer pays,
@@ -2388,7 +2389,7 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
 
 // ─── 6c. POST /bookings/:id/generate-voucher ─────────────────────────────────
 
-router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, paymentGate("hotel-voucher"), async (req: any, res: any) => {
+router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHotelAccess, ...sbtBookerGuards, requireSBTStaffDirect, paymentGate("hotel-voucher"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "hotel-generate-voucher")) return;
     const booking = await SBTHotelBooking.findOne({

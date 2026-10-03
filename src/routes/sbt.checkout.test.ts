@@ -122,7 +122,7 @@ afterAll(async () => { await mongoose.disconnect(); await mongod?.stop(); });
 
 beforeEach(async () => {
   for (const c of ["users", "customerworkspaces", "sbtquotes", "sbtpayments", "sbtssrsnapshots", "sbtbookings",
-    "sbthotelbookings", "sbtwalletledgers", "sbtmulticitytraces", "travelbookings", "paymentorphans"]) {
+    "sbthotelbookings", "sbtwalletledgers", "sbtmulticitytraces", "travelbookings", "paymentorphans", "userpermissions"]) {
     await col(c).deleteMany({});
   }
   await col("users").insertMany([
@@ -477,6 +477,11 @@ describe("reissue — priced by the server end to end (Travel Desk)", () => {
       destination: { code: "BOM", city: "Mumbai" }, departureTime: "x", arrivalTime: "y", airlineCode: "6E",
       airlineName: "IndiGo", flightNumber: "1", passengers: [{ firstName: "A", lastName: "B", paxType: "adult", isLead: true }],
       baseFare: 9000, taxes: 1000, extras: 0, totalFare: 10000, paymentMode: "personal",
+    } as any);
+    // A Travel Desk agent: HOUSE + Access Console "Admin Queue" WRITE.
+    await col("userpermissions").insertOne({
+      userId: String(BOOKER), email: "booker@test", workspaceId: HOUSE, universe: "STAFF", status: "active", source: "manual",
+      level: { code: "L1", name: "Employee", designation: "" }, modules: { adminQueue: { access: "WRITE", scope: "ALL" } },
     } as any);
   });
 

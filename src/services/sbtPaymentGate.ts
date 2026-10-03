@@ -25,6 +25,7 @@ import SBTWalletLedger from "../models/SBTWalletLedger.js";
 import mongoose from "mongoose";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { adminQueueAccess } from "../routes/approvals.security.js";
 import { sbtLogger } from "../utils/logger.js";
 import {
   razorpayConfigured,
@@ -70,6 +71,27 @@ export function isTravelDeskCaller(req: Request | AnyObj): boolean {
   if (isSuperAdmin(req as Request)) return true;
   const r = req as AnyObj;
   return String(r.workspaceId || r.workspace?._id || "") === HOUSE_WORKSPACE_ID;
+}
+
+/** Plumtrips booking staff: Admin Queue WRITE grant (HOUSE), HOUSE ADMIN or
+ *  SUPERADMIN — the same test as the ops queue (adminQueueAccess). */
+export async function isSBTStaff(req: Request | AnyObj): Promise<boolean> {
+  return (await adminQueueAccess(req as AnyObj)).work;
+}
+
+export const CHECKOUT_REQUIRED_MESSAGE = "Please book and pay through checkout";
+
+/** The old direct routes (ticket-lcc, book, ticket, payment/create-order,
+ *  payment/verify, generate-voucher) are Plumtrips staff only; customers use
+ *  POST /checkout. Checkout fulfilment runs only each route's final handler
+ *  (registerFulfilHandlers), so it never passes through this guard. */
+export async function requireSBTStaffDirect(req: Request, res: Response, next: NextFunction) {
+  try {
+    if (await isSBTStaff(req)) return next();
+    return res.status(403).json({ error: CHECKOUT_REQUIRED_MESSAGE, code: "CHECKOUT_REQUIRED" });
+  } catch (err) {
+    next(err);
+  }
 }
 
 export const MULTI_CITY_MESSAGE = "For multi-city trips, please contact the Travel Desk";
