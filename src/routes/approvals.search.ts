@@ -16,8 +16,8 @@
 // is the contract). Raw TBO results go only to ApprovalSearchSession.
 //
 // /flights and /hotels call TBO through services/approvalSearch/search.ts.
-// /hotel-cities is not built yet (501): the form sends the typed city, which
-// the hotel search resolves against the local catalog.
+// /hotel-cities is the hotel city / hotel name typeahead: the local catalogue
+// only (services/hotelCatalogSearch.ts), never a TBO call.
 
 import { Router, type Request, type Response, type NextFunction } from "express";
 import rateLimit from "express-rate-limit";
@@ -29,6 +29,9 @@ import {
   searchHotelsForApproval,
   type SearchReply,
 } from "../services/approvalSearch/search.js";
+import { searchHotelCatalog } from "../services/hotelCatalogSearch.js";
+import { parseStars } from "../services/approvalSearch/selection.js";
+import { normalizeSearch } from "../jobs/static-data-refresh.js";
 
 const MIN = 60 * 1000;
 
@@ -36,6 +39,8 @@ const MIN = 60 * 1000;
 export const SEARCH_LIMITS = {
   flight: { perUser: 20, perUserWindowMs: 10 * MIN, perWorkspace: 200, perWorkspaceWindowMs: 60 * MIN },
   hotel: { perUser: 10, perUserWindowMs: 10 * MIN, perWorkspace: 100, perWorkspaceWindowMs: 60 * MIN },
+  // Typeahead: one call per pause in typing, a database read only.
+  hotelCity: { perUser: 120, perUserWindowMs: 10 * MIN, perWorkspace: 2000, perWorkspaceWindowMs: 60 * MIN },
 } as const;
 
 const userKey = (req: Request) => `user:${String((req as any).user?.sub || (req as any).user?._id || "")}`;
@@ -96,8 +101,58 @@ const run = (search: (input: any, c: ReturnType<typeof caller>) => Promise<Searc
     }
   };
 
-const notYet = (what: string) => (_req: Request, res: Response) =>
-  res.status(501).json({ error: `${what} search is not available yet.`, code: "NOT_IMPLEMENTED" });
+/** Typeahead result: a city or a specific hotel. No prices exist in the catalogue. */
+export type HotelPlaceOption = {
+  type: "city" | "hotel";
+  name: string;
+  city: string;
+  country: string;
+  countryCode: string;
+  cityCode: string;
+  hotelCode?: string;
+  stars?: number | null;
+};
+
+export const TYPEAHEAD_MIN_CHARS = 2;
+const TYPEAHEAD_MAX_CHARS = 80;
+const TYPEAHEAD_CAP = 10;
+
+/** GET /hotel-cities?q= — cities and hotels from the local catalogue. */
+export async function hotelCityTypeahead(req: Request, res: Response, next: NextFunction) {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    const q = String(req.query?.q ?? "").trim().slice(0, TYPEAHEAD_MAX_CHARS);
+    if (normalizeSearch(q).length < TYPEAHEAD_MIN_CHARS) return res.json({ ok: true, results: [] });
+
+    // Ranking hint only (India first on ties); never a filter.
+    const priorityCode = String(req.query?.countryCode || "IN").trim().toUpperCase().slice(0, 2) || "IN";
+    const { cities, hotels } = await searchHotelCatalog(q, { priorityCode, cityCap: TYPEAHEAD_CAP, hotelCap: TYPEAHEAD_CAP });
+
+    const results: HotelPlaceOption[] = [
+      ...cities.map((c) => ({
+        type: "city" as const,
+        name: c.name,
+        city: c.name,
+        country: c.countryName,
+        countryCode: c.countryCode,
+        cityCode: c.code,
+      })),
+      ...hotels.map((h) => ({
+        type: "hotel" as const,
+        name: h.hotelName,
+        city: h.cityName,
+        country: h.countryCode ? h.countryName : h.cityCountryName,
+        countryCode: h.countryCode || h.cityCountryCode,
+        cityCode: h.cityCode,
+        hotelCode: h.hotelCode,
+        stars: parseStars(h.rating),
+      })),
+    ];
+    res.json({ ok: true, results });
+  } catch (err) {
+    next(err);
+  }
+}
 
 /** A fresh router (fresh limiter counters) — the app mounts the default instance. */
 export function buildApprovalSearchRouter(): Router {
@@ -110,7 +165,7 @@ export function buildApprovalSearchRouter(): Router {
 
   router.post("/flights", ...limitsFor("flight"), run(searchFlightsForApproval));
   router.post("/hotels", ...limitsFor("hotel"), run(searchHotelsForApproval));
-  router.get("/hotel-cities", notYet("Hotel city"));
+  router.get("/hotel-cities", ...limitsFor("hotelCity"), hotelCityTypeahead);
 
   return router;
 }

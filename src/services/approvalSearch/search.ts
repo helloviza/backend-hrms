@@ -172,20 +172,57 @@ export async function searchFlightsForApproval(input: any, caller: Caller): Prom
 
 /* ── hotels ──────────────────────────────────────────────────────────────── */
 
-/** Typed city → TBO city from the local catalog (exact name first, then prefix; shortest name wins). */
-export async function findCatalogCity(cityText: string, countryCode: string): Promise<{ code: string; name: string } | null> {
+type CatalogCityRef = { code: string; name: string; countryCode: string };
+
+/**
+ * Typed city → TBO city from the local catalog (exact name first, then
+ * prefix; shortest name wins). countryCode null = any country.
+ */
+export async function findCatalogCity(cityText: string, countryCode: string | null): Promise<CatalogCityRef | null> {
   const q = normalizeSearch(cityText);
   if (!q) return null;
-  const exact: any = await (TBOCity as any).findOne({ countryCode, searchName: q }).select("code name").lean();
-  if (exact) return { code: String(exact.code), name: String(exact.name) };
+  const inCountry = countryCode ? { countryCode } : {};
+  const exact: any = await (TBOCity as any).findOne({ ...inCountry, searchName: q }).select("code name countryCode").lean();
+  if (exact) return { code: String(exact.code), name: String(exact.name), countryCode: String(exact.countryCode) };
   const prefixed: any[] = await (TBOCity as any)
-    .find({ countryCode, searchName: { $gte: q, $lt: `${q}￿` } })
-    .select("code name searchName")
+    .find({ ...inCountry, searchName: { $gte: q, $lt: `${q}￿` } })
+    .select("code name searchName countryCode")
     .limit(20)
     .lean();
   if (!prefixed.length) return null;
   prefixed.sort((a, b) => String(a.searchName).length - String(b.searchName).length);
-  return { code: String(prefixed[0].code), name: String(prefixed[0].name) };
+  return { code: String(prefixed[0].code), name: String(prefixed[0].name), countryCode: String(prefixed[0].countryCode) };
+}
+
+/**
+ * The city to search: a picked catalogue city (cityCode) or the picked
+ * hotel's city (hotelCode), else the typed text — an older draft's free-text
+ * city — in the given country, or India first and then any country.
+ */
+async function resolveSearchCity(input: any): Promise<{ city: CatalogCityRef; hotelCode: string } | SearchReply> {
+  const notFound = bad("City not found — check spelling", "CITY_NOT_FOUND");
+  const hotelCode = String(input?.hotelCode ?? "").trim();
+  let cityCode = String(input?.cityCode ?? "").trim();
+
+  if (hotelCode) {
+    const hotel: any = await (TBOHotelMaster as any).findOne({ hotelCode }).select("cityCode").lean();
+    if (!hotel) return bad("That hotel isn't in our catalogue — pick it again from the list.", "HOTEL_NOT_FOUND");
+    cityCode ||= String(hotel.cityCode || "");
+  }
+
+  if (cityCode) {
+    const c: any = await (TBOCity as any).findOne({ code: cityCode }).select("code name countryCode").lean();
+    if (!c) return notFound;
+    return { city: { code: String(c.code), name: String(c.name), countryCode: String(c.countryCode) }, hotelCode };
+  }
+
+  const cityText = String(input?.city ?? "").trim();
+  if (!cityText) return bad("Enter a city.");
+  const given = String(input?.countryCode ?? "").trim().toUpperCase();
+  const city = given
+    ? await findCatalogCity(cityText, given)
+    : (await findCatalogCity(cityText, "IN")) || (await findCatalogCity(cityText, null));
+  return city ? { city, hotelCode } : notFound;
 }
 
 function paxRooms(rooms: number, adults: number, children: number) {
@@ -199,12 +236,10 @@ function paxRooms(rooms: number, adults: number, children: number) {
 }
 
 export async function searchHotelsForApproval(input: any, caller: Caller): Promise<SearchReply> {
-  const cityText = String(input?.city ?? "").trim();
-  const countryCode = String(input?.countryCode ?? "IN").trim().toUpperCase() || "IN";
   const checkIn = String(input?.checkIn ?? "").trim();
   const checkOut = String(input?.checkOut ?? "").trim();
 
-  if (!cityText) return bad("Enter a city.");
+  if (!["city", "cityCode", "hotelCode"].some((k) => String(input?.[k] ?? "").trim())) return bad("Enter a city.");
   if (!DAY.test(checkIn) || !DAY.test(checkOut) || checkOut <= checkIn) {
     return bad("Enter a check-out date after the check-in date.");
   }
@@ -212,17 +247,22 @@ export async function searchHotelsForApproval(input: any, caller: Caller): Promi
   const adults = Math.max(rooms, int(input?.adults, 1, 1, 24));
   const children = int(input?.children, 0, 0, 6);
 
-  const city = await findCatalogCity(cityText, countryCode);
-  if (!city) return bad("City not found — check spelling", "CITY_NOT_FOUND");
+  const resolved = await resolveSearchCity(input);
+  if ("status" in resolved) return resolved;
+  const { city, hotelCode: pickedCode } = resolved;
+  const countryCode = city.countryCode;
 
   // Top 100 of the city's catalog hotels by stars → priced by TBO. Same catalog
-  // the SBT search ranks from; the cap is applied before TBO is called.
+  // the SBT search ranks from; the cap is applied before TBO is called. A
+  // picked hotel is always priced, even when it is outside the top 100.
   const catalog: any[] = await (TBOHotelMaster as any)
     .find({ cityCode: city.code })
     .select("hotelCode hotelName rating address")
     .lean();
   catalog.sort((a, b) => (parseStars(b.rating) ?? 0) - (parseStars(a.rating) ?? 0));
   const top = catalog.slice(0, HOTEL_SEARCH_CAP);
+  const picked = pickedCode ? catalog.find((h) => String(h.hotelCode) === pickedCode) : undefined;
+  if (picked && !top.includes(picked)) top.splice(HOTEL_SEARCH_CAP - 1, 1, picked);
   const meta = new Map(top.map((h) => [String(h.hotelCode), h]));
 
   const params = {
@@ -264,8 +304,16 @@ export async function searchHotelsForApproval(input: any, caller: Caller): Promi
       (a: any, b: any) =>
         (parseStars(b.HotelRating) ?? 0) - (parseStars(a.HotelRating) ?? 0) ||
         String(a.HotelName ?? "").localeCompare(String(b.HotelName ?? "")),
-    )
-    .slice(0, HOTEL_SEARCH_CAP);
+    );
+  // The picked hotel goes first; the rest of its city follows.
+  const pinnedAt = pickedCode ? hotels.findIndex((h: any) => String(h?.HotelCode) === pickedCode) : -1;
+  if (pinnedAt > 0) hotels.unshift(...hotels.splice(pinnedAt, 1));
+  hotels.splice(HOTEL_SEARCH_CAP);
+  const pin = !pickedCode
+    ? {}
+    : pinnedAt >= 0
+      ? { pinnedHotelCode: pickedCode }
+      : { message: `${picked?.hotelName || "The hotel you picked"} has no rooms for these dates — showing other hotels in ${city.name}.` };
 
   if (!hotels.length) {
     return { status: 200, body: { ok: true, city: { name: city.name, countryCode }, hotels: [], message: "No hotels found" } };
@@ -285,6 +333,6 @@ export async function searchHotelsForApproval(input: any, caller: Caller): Promi
 
   return {
     status: 200,
-    body: { ok: true, city: { name: city.name, countryCode }, hotels: out, searchedAt: (session.createdAt ?? new Date()).toISOString() },
+    body: { ok: true, city: { name: city.name, countryCode }, hotels: out, ...pin, searchedAt: (session.createdAt ?? new Date()).toISOString() },
   };
 }

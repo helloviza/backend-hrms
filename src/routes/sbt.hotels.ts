@@ -33,12 +33,7 @@ import {
   PRIORITY_COUNTRY_CODES,
 } from "../services/tbo.hotel.shared.js";
 import { searchHotels, isHotelSearchError } from "../services/tbo.hotel.search.service.js";
-import {
-  TBOCity,
-  TBOHotelMaster,
-  TBOCountry,
-  normalizeSearch,
-} from "../jobs/static-data-refresh.js";
+import { searchHotelCatalog } from "../services/hotelCatalogSearch.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 import ManualDateChangeRequest from "../models/ManualDateChangeRequest.js";
 import {
@@ -656,125 +651,29 @@ const IMAGE_CACHE_TTL = 12 * 60 * 60 * 1000; // 12 hours
 
 // ─── 1. GET /cities?q=Mumbai ─────────────────────────────────────────────────
 
-// Phase 2: local Mongo catalog (tbocities + tbohotelmasters) read-path.
-//
-// Hybrid match: prefix-range query on the searchName_1 index (catches "del" →
-// "delhi") + a $text query on the searchName text index (catches mid-string
-// words like "marina" in "dubai marina"). Results are merged, deduped, and
-// ranked deterministically: exact → prefix → contains, then a soft-priority
-// boost for the requested country, then shorter/alphabetical. countryCode is
-// NEVER used to filter — only to break ranking ties.
-
-const MAX_PREFIX_CHAR = "￿"; // searchName is normalized to [a-z0-9 ], so this caps any prefix range
-
-function rankByMatch<T extends { searchName?: string; countryCode?: string }>(
-  docs: T[],
-  nq: string,
-  priorityCode: string,
-  keyOf: (d: T) => string,
-): T[] {
-  const seen = new Set<string>();
-  const deduped: T[] = [];
-  for (const d of docs) {
-    const k = keyOf(d);
-    if (!k || seen.has(k)) continue;
-    seen.add(k);
-    deduped.push(d);
-  }
-  const tier = (sn: string) => (sn === nq ? 0 : sn.startsWith(nq) ? 1 : 2);
-  return deduped.sort((a, b) => {
-    const sa = a.searchName ?? "";
-    const sb = b.searchName ?? "";
-    const ta = tier(sa);
-    const tb = tier(sb);
-    if (ta !== tb) return ta - tb; // exact, then prefix, then contains
-    const pa = (a.countryCode ?? "").toUpperCase() === priorityCode ? 0 : 1;
-    const pb = (b.countryCode ?? "").toUpperCase() === priorityCode ? 0 : 1;
-    if (pa !== pb) return pa - pb; // soft-priority boost within the same tier
-    if (sa.length !== sb.length) return sa.length - sb.length; // shorter name first
-    return sa.localeCompare(sb);
-  });
-}
+// Phase 2: local Mongo catalog (tbocities + tbohotelmasters) read-path. The
+// search itself is shared with the approval request form
+// (services/hotelCatalogSearch.ts); this maps it to the SBT response shape.
 
 async function searchLocalCatalog(q: string, priorityCode: string): Promise<any[]> {
-  const nq = normalizeSearch(q);
-  if (!nq) return [];
+  const { cities, hotels } = await searchHotelCatalog(q, { priorityCode, cityCap: 10, hotelCap: 8 });
 
-  const CITY_CAP = 10;
-  const HOTEL_CAP = 8;
-  const POOL = 60; // over-fetch per source, then rank and cap
-  const upper = nq + MAX_PREFIX_CHAR;
-
-  // Cities — prefix-range (indexed) + text (indexed), in parallel.
-  const [cityPrefix, cityText] = await Promise.all([
-    (TBOCity as any).find({ searchName: { $gte: nq, $lt: upper } }).limit(POOL).lean(),
-    (TBOCity as any)
-      .find({ $text: { $search: nq } })
-      .limit(POOL)
-      .lean()
-      .catch(() => [] as any[]),
-  ]);
-  const rankedCities = rankByMatch(
-    [...cityPrefix, ...cityText],
-    nq,
-    priorityCode,
-    (d: any) => d.code,
-  ).slice(0, CITY_CAP);
-
-  // Hotels — same hybrid, separate cap so a hotel-name query still surfaces.
-  const [hotelPrefix, hotelText] = await Promise.all([
-    (TBOHotelMaster as any).find({ searchName: { $gte: nq, $lt: upper } }).limit(POOL).lean(),
-    (TBOHotelMaster as any)
-      .find({ $text: { $search: nq } })
-      .limit(POOL)
-      .lean()
-      .catch(() => [] as any[]),
-  ]);
-  const rankedHotels = rankByMatch(
-    [...hotelPrefix, ...hotelText],
-    nq,
-    priorityCode,
-    (d: any) => d.hotelCode,
-  ).slice(0, HOTEL_CAP);
-
-  if (!rankedCities.length && !rankedHotels.length) return [];
-
-  // Resolve display labels: CountryName for both, CityName for hotels (the hotel
-  // master stores cityCode but not cityName).
-  const countryCodes = new Set<string>();
-  for (const c of rankedCities) countryCodes.add(c.countryCode);
-  for (const h of rankedHotels) countryCodes.add(h.countryCode);
-  const hotelCityCodes = [...new Set(rankedHotels.map((h: any) => h.cityCode).filter(Boolean))];
-
-  const [countries, hotelCities] = await Promise.all([
-    (TBOCountry as any).find({ code: { $in: [...countryCodes] } }).lean(),
-    hotelCityCodes.length
-      ? (TBOCity as any).find({ code: { $in: hotelCityCodes } }).lean()
-      : Promise.resolve([] as any[]),
-  ]);
-  const countryNameByCode = new Map<string, string>(
-    (countries as any[]).map((c) => [c.code, c.name]),
-  );
-  const cityNameByCode = new Map<string, string>(
-    (hotelCities as any[]).map((c) => [c.code, c.name]),
-  );
-
-  const cityResults = rankedCities.map((c: any) => ({
+  const cityResults = cities.map((c) => ({
     type: "city" as const,
     CityId: c.code,
     CityName: c.name,
     CountryCode: c.countryCode,
-    CountryName: countryNameByCode.get(c.countryCode) ?? "",
+    CountryName: c.countryName,
   }));
 
-  const hotelResults = rankedHotels.map((h: any) => ({
+  const hotelResults = hotels.map((h) => ({
     type: "hotel" as const,
     HotelCode: h.hotelCode,
     HotelName: h.hotelName,
-    CityName: cityNameByCode.get(h.cityCode) ?? "",
+    CityName: h.cityName,
     CityCode: h.cityCode,
     CountryCode: h.countryCode || "IN",
-    CountryName: countryNameByCode.get(h.countryCode) ?? "",
+    CountryName: h.countryName,
   }));
 
   return [...cityResults, ...hotelResults];

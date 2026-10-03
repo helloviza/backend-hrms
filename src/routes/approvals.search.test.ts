@@ -60,6 +60,13 @@ vi.mock("../services/tbo.hotel.search.service.js", async (orig) => {
   tbo.hotels = v.fn();
   return { ...(await orig<any>()), searchHotels: tbo.hotels };
 });
+// The SBT typeahead's live TBO city list — the approvals typeahead must never reach it.
+const liveCities = vi.hoisted(() => ({ fetchCityList: null as any }));
+vi.mock("../services/tbo.hotel.shared.js", async (orig) => {
+  const { vi: v } = await import("vitest");
+  liveCities.fetchCityList = v.fn(async () => []);
+  return { ...(await orig<any>()), fetchCityList: liveCities.fetchCityList };
+});
 vi.mock("../utils/emailActionToken.js", () => ({
   signEmailActionToken: () => "tok",
   verifyEmailActionToken: () => null,
@@ -186,7 +193,7 @@ describe("/api/approvals/search gates", () => {
       expect([r.status, r.body.code]).toEqual([400, "BAD_REQUEST"]);
     }
     const cities = await as(request(app).get("/api/approvals/search/hotel-cities"), U.req, WS);
-    expect([cities.status, cities.body.code]).toEqual([501, "NOT_IMPLEMENTED"]);
+    expect([cities.status, cities.body]).toEqual([200, { ok: true, results: [] }]);
     expect(tbo.flights).not.toHaveBeenCalled();
   });
 
@@ -654,6 +661,138 @@ describe("POST /search/hotels", () => {
     tbo.hotels.mockResolvedValueOnce({ ok: false, status: 404, code: "NO_HOTELS_FOUND", message: "x" });
     r = await searchHotelsAs(U.req, hotelBody());
     expect([r.status, r.body.message, r.body.hotels]).toEqual([200, "No hotels found", []]);
+  });
+});
+
+/* ── hotel city / hotel picker ───────────────────────────────────────────── */
+
+describe("hotel picker: GET /search/hotel-cities and a picked city or hotel", () => {
+  const DXB = "115936";
+  const GOA = "G-100";
+  const typeahead = (q: string, sub: any = U.req, wsId: any = WS, roles?: string[], extra?: any) =>
+    as(request(app).get(`/api/approvals/search/hotel-cities?q=${encodeURIComponent(q)}`), sub, wsId, roles, extra);
+  const room = { Name: ["Deluxe"], MealType: "BreakFast", IsRefundable: true, TotalFare: 18000, DayRates: [[{ BasePrice: 9000 }]], CancelPolicies: [] };
+  // A fresh requester per search: U.req's hotel budget is spent by earlier suites.
+  const searchHotelsAs = (body: any) =>
+    as(request(app).post("/api/approvals/search/hotels"), oid(), WS).send({ checkIn: "2026-11-12", checkOut: "2026-11-14", adults: 2, rooms: 1, ...body });
+
+  beforeAll(async () => {
+    const { TBOCity, TBOHotelMaster, TBOCountry } = await import("../jobs/static-data-refresh.js");
+    await Promise.all([(TBOCity as any).init(), (TBOHotelMaster as any).init(), (TBOCountry as any).init()]);
+    await col("tbocountries").insertMany([
+      { code: "IN", name: "India", searchName: "india" },
+      { code: "AE", name: "United Arab Emirates", searchName: "united arab emirates" },
+    ]);
+    await col("tbocities").insertMany([
+      { code: GOA, name: "Goa", searchName: "goa", countryCode: "IN" },
+      { code: DXB, name: "Dubai", searchName: "dubai", countryCode: "AE" },
+      { code: "115999", name: "Dubai Marina", searchName: "dubai marina", countryCode: "AE" },
+    ]);
+    await col("tbohotelmasters").insertMany([
+      { hotelCode: "T1", hotelName: "Taj Fort Aguada", searchName: "taj fort aguada", cityCode: GOA, countryCode: "IN", rating: "FiveStar", address: "Sinquerim" },
+      { hotelCode: "T2", hotelName: "Taj Dubai", searchName: "taj dubai", cityCode: DXB, countryCode: "AE", rating: "FourStar", address: "Burj Khalifa St" },
+      // No countryCode on the row: the picker takes the hotel's city's country.
+      { hotelCode: "A1", hotelName: "Atlantis The Palm", searchName: "atlantis the palm", cityCode: DXB, countryCode: "", rating: "FiveStar", address: "Palm Jumeirah" },
+    ]);
+  });
+  beforeEach(() => {
+    tbo.hotels.mockReset();
+    liveCities.fetchCityList.mockClear();
+  });
+
+  it("returns cities and hotels from the local catalogue, labelled, with no prices and no TBO call", async () => {
+    const r = await typeahead("taj");
+    expect(r.status).toBe(200);
+    expect(r.headers["cache-control"]).toBe("no-store");
+    expect(r.body.results).toEqual([
+      // same match tier → India first (a ranking hint, never a filter)
+      { type: "hotel", name: "Taj Fort Aguada", city: "Goa", country: "India", countryCode: "IN", cityCode: GOA, hotelCode: "T1", stars: 5 },
+      { type: "hotel", name: "Taj Dubai", city: "Dubai", country: "United Arab Emirates", countryCode: "AE", cityCode: DXB, hotelCode: "T2", stars: 4 },
+    ]);
+
+    const dxb = await typeahead("dubai");
+    expect(dxb.body.results.map((x: any) => [x.type, x.name, x.countryCode])).toEqual([
+      ["city", "Dubai", "AE"],
+      ["city", "Dubai Marina", "AE"],
+      ["hotel", "Taj Dubai", "AE"],
+    ]);
+    expect((await typeahead("atlantis")).body.results[0]).toMatchObject({ type: "hotel", country: "United Arab Emirates", countryCode: "AE" });
+
+    expectNoPrices(r.body);
+    expect(tbo.hotels).not.toHaveBeenCalled();
+    expect(tbo.flights).not.toHaveBeenCalled();
+    expect(liveCities.fetchCityList).not.toHaveBeenCalled();
+  });
+
+  it("under 2 characters returns nothing; zero catalogue hits return nothing — never a live TBO fallback", async () => {
+    expect((await typeahead("g")).body).toEqual({ ok: true, results: [] });
+    expect((await typeahead("zzqx")).body).toEqual({ ok: true, results: [] });
+    expect(liveCities.fetchCityList).not.toHaveBeenCalled();
+    expect(tbo.hotels).not.toHaveBeenCalled();
+  });
+
+  it("sits behind every /search gate: SBT user, canRaiseRequest=false, demo, SaaS, non-approval workspace", async () => {
+    expect((await typeahead("goa", U.sbt)).body.code).toBe("SBT_USER_CANNOT_RAISE_REQUEST");
+    expect((await typeahead("goa", U.noRaise)).body.code).toBe("RAISE_REQUEST_DISABLED");
+    expect((await typeahead("goa", U.req, WS, ["EMPLOYEE"], { isDemoUser: true })).body.code).toBe("DEMO_SEARCH_BLOCKED");
+    expect((await typeahead("goa", oid(), WS_SAAS)).body.error).toBe("TRAVEL_MODULE_BLOCKED");
+    for (const wsId of [WS_HYBRID, WS_SBT]) {
+      expect((await typeahead("goa", oid(), wsId)).status).toBe(403);
+    }
+    expect((await typeahead("goa", oid(), WS_DIRECT)).status).toBe(200);
+  });
+
+  it(`has its own per-user limit (${SEARCH_LIMITS.hotelCity.perUser} per 10 min), separate from hotel searches`, async () => {
+    const wsId = oid();
+    await col("customerworkspaces").insertOne(ws(wsId, "L9", "APPROVAL_FLOW") as any);
+    const a = oid();
+    for (let i = 0; i < SEARCH_LIMITS.hotelCity.perUser; i++) {
+      expect((await typeahead("go", a, wsId)).status).toBe(200);
+    }
+    expect((await typeahead("go", a, wsId)).body.code).toBe("SEARCH_RATE_LIMITED_USER");
+    expect((await as(request(app).post("/api/approvals/search/hotels"), a, wsId)).status).toBe(400); // hotel budget untouched
+  }, 60_000);
+
+  it("a picked international city searches that city in its own country", async () => {
+    tbo.hotels.mockResolvedValue({ ok: true, hotels: [{ HotelCode: "T2", Rooms: [room] }] });
+    const r = await searchHotelsAs({ city: "Dubai, United Arab Emirates", cityCode: DXB, countryCode: "AE" });
+    expect(r.status).toBe(200);
+    expect(tbo.hotels.mock.calls[0][0]).toMatchObject({ CityCode: DXB, CityName: "Dubai", CountryCode: "AE" });
+    expect(r.body.city).toEqual({ name: "Dubai", countryCode: "AE" });
+    expectNoPrices(r.body);
+  });
+
+  it("an older draft's typed city with no country still resolves (India first, then any country)", async () => {
+    tbo.hotels.mockResolvedValue({ ok: true, hotels: [{ HotelCode: "T2", Rooms: [room] }] });
+    const r = await searchHotelsAs({ city: "Dubai" });
+    expect(r.status).toBe(200);
+    expect(tbo.hotels.mock.calls[0][0]).toMatchObject({ CityCode: DXB, CountryCode: "AE" });
+    expect((await searchHotelsAs({ city: "Goa" })).body.city).toEqual({ name: "Goa", countryCode: "IN" });
+  });
+
+  it("a picked hotel searches its city and is pinned first; if it has no rooms, the city's hotels show with a note", async () => {
+    tbo.hotels.mockResolvedValue({ ok: true, hotels: [{ HotelCode: "A1", Rooms: [room] }, { HotelCode: "T2", Rooms: [room] }] });
+    const r = await searchHotelsAs({ city: "Taj Dubai", hotelCode: "T2" });
+    expect(r.status).toBe(200);
+    expect(tbo.hotels.mock.calls[0][0]).toMatchObject({ CityCode: DXB, CountryCode: "AE" });
+    expect(tbo.hotels.mock.calls[0][0].HotelCodes).toContain("T2");
+    expect(r.body.pinnedHotelCode).toBe("T2");
+    expect(r.body.hotels.map((h: any) => h.name)).toEqual(["Taj Dubai", "Atlantis The Palm"]); // five-star Atlantis would otherwise lead
+    expectNoPrices(r.body);
+
+    tbo.hotels.mockResolvedValue({ ok: true, hotels: [{ HotelCode: "A1", Rooms: [room] }] });
+    const none = await searchHotelsAs({ city: "Taj Dubai", hotelCode: "T2" });
+    expect(none.body.pinnedHotelCode).toBeUndefined();
+    expect(none.body.message).toBe("Taj Dubai has no rooms for these dates — showing other hotels in Dubai.");
+    expect(none.body.hotels.map((h: any) => h.name)).toEqual(["Atlantis The Palm"]);
+  });
+
+  it("an unknown hotel or city code is a clear 400 and TBO is not called", async () => {
+    const h = await searchHotelsAs({ city: "x", hotelCode: "NOPE" });
+    expect([h.status, h.body.code]).toEqual([400, "HOTEL_NOT_FOUND"]);
+    const c = await searchHotelsAs({ city: "x", cityCode: "NOPE" });
+    expect([c.status, c.body.code]).toEqual([400, "CITY_NOT_FOUND"]);
+    expect(tbo.hotels).not.toHaveBeenCalled();
   });
 });
 
