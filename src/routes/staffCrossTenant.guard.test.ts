@@ -74,3 +74,47 @@ describe("staff ops actions are never scoped to the staff member's own workspace
     expect(p).toMatch(/function byIdFor\([^)]*\)\s*\{\s*const ws = staffWorkspaceScope\(req\);\s*return ws \? \{ _id: id, workspaceId: ws \} : \{ _id: id \};/);
   });
 });
+
+/* ── Follow-ups (fix/staff-scope-followups): the same bug class elsewhere ── */
+
+const block = (file: string, method: string, p: string) => {
+  const b = routeBlocks(src(file)).find((x) => x.method === method && x.path === p);
+  if (!b) throw new Error(`${file}: ${method} ${p} not found — update this guard`);
+  return b.text;
+};
+
+describe("follow-up routes keep acting on the customer's record for staff", () => {
+  it("proposals: the staff travel-mode gate checks the CUSTOMER's flow (requireTravelModeFor), not the caller's", () => {
+    for (const [method, p] of [["POST", "/by-request/:requestId/draft"], ["POST", "/:id/submit"], ["POST", "/:id/record-decision"]] as const) {
+      const head = block("proposals.ts", method, p).slice(0, 300);
+      expect(head, `${method} ${p}: caller-based requireTravelMode is back`).not.toMatch(/requireTravelMode\(/);
+      expect(head, `${method} ${p}`).toMatch(/requireFlow2For(Request|Proposal)/);
+    }
+    const guard = readFileSync(path.join(here, "../middleware/travelModeGuard.ts"), "utf8");
+    expect(guard).toMatch(/export function requireTravelModeFor/);
+    expect(guard).toMatch(/if \(!opts\.isStaff\(user\)\) return forCaller\(req, res, next\);/);
+    expect(guard).toMatch(/opts\.resolveWorkspaceId\(req\)/);
+  });
+
+  it("customers: Account Team editor and the staff lists treat HOUSE staff as platform-wide", () => {
+    const c = src("customers.ts");
+    expect(c).toMatch(/function isPlumtripsStaff\(req: any\): boolean \{\s*return isSuperAdmin\(req\) \|\| String\(req\.workspaceId \|\| req\.workspaceObjectId \|\| ""\) === PLUMTRIPS_HOUSE_WORKSPACE_ID;/);
+    expect(block("customers.ts", "GET", "/")).toMatch(/isPlumtripsStaff\(_req\) \? \{\} :/);
+    expect(block("customers.ts", "GET", "/admin/all")).toMatch(/isPlumtripsStaff\(_req\) \? \{\} :/);
+    expect(block("customers.ts", "PATCH", "/:id/account-team")).toMatch(/if \(!isPlumtripsStaff\(req\) && req\.workspaceObjectId\) acctQuery\.workspaceId/);
+  });
+
+  it("sbt hotels: staff mark-failed finds the booking by id", () => {
+    const b = block("sbt.hotels.ts", "POST", "/bookings/:id/mark-failed");
+    expect(b, WHY).toMatch(/isPlumtripsStaffCaller\(req\)\s*\?\s*await SBTHotelBooking\.findById\(req\.params\.id\)/);
+    expect(src("sbt.hotels.ts")).toMatch(/function isPlumtripsStaffCaller\(req: any\): boolean \{\s*return isSuperAdmin\(req\) \|\| String\(req\.workspaceId \|\| req\.workspaceObjectId \|\| ""\) === MARK_FAILED_HOUSE_WORKSPACE_ID;/);
+  });
+
+  it("carbon: tenants are scoped in Customer id space; Plumtrips staff get an explicit {}", () => {
+    const c = src("admin.carbon.ts");
+    expect(c).toMatch(/if \(isPlumtripsStaff\(req\)\) return \{\};/);
+    expect(c).toMatch(/const customerId = String\(req\.workspace\?\.customerId \|\| ""\);/);
+    // The bug was returning the CustomerWorkspace id as the CarbonRecord scope.
+    expect(c, "tenantScope returns the workspace id again (CarbonRecord.workspaceId is a Customer id)").not.toMatch(/return ws;/);
+  });
+});
