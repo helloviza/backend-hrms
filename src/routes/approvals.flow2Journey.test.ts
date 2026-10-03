@@ -544,7 +544,9 @@ describe("Ops record the customer's proposal decision on their behalf", () => {
     expect(p.status).toBe("APPROVED");
     const h = p.history.at(-1);
     expect(h.action).toBe("RECORDED_APPROVED");
-    expect(h.note).toBe("Recorded by ops on behalf of the customer: Kavya approved by phone, 3 Oct 11:00");
+    // Customers read this note: the travel desk, not the staff member — who is on the row's actor.
+    expect(h.note).toBe("Recorded by Plumtrips Travel Desk on behalf of the customer: Kavya approved by phone, 3 Oct 11:00");
+    expect(h.actorKind).toBe("staff");
     expect((await reqDoc(rid)).stage).toBe("PROPOSAL_APPROVED");
 
     const fyi = sent.find((m) => /^Proposal approved/.test(m.subject) && m.to.includes(APPROVER))!;

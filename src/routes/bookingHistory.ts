@@ -7,9 +7,13 @@ import ApprovalRequest from "../models/ApprovalRequest.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { requireAuth } from "../middleware/auth.js";
 import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
-import { sanitizeApprovalForViewer, adminQueueAccess, queueCaseScope } from "./approvals.security.js";
+import { sanitizeApprovalForViewer, adminQueueAccess, queueCaseScope, hasQueueView } from "./approvals.security.js";
+import { actorNamesOnResponse } from "../services/actorNames.js";
 
 const router = Router();
+// Activity rows name people, never ids; customers see staff as "Plumtrips
+// Travel Desk". The staff answer is the one isQueueViewer stamped on req.
+router.use(actorNamesOnResponse((req) => hasQueueView(req)));
 
 /* ────────────────────────────────────────────────────────────────
  * helpers

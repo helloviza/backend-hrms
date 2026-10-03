@@ -21,6 +21,7 @@ import { sendMail } from "../utils/mailer.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import { frontendBaseUrl, DISABLE_EMAILS, PLUMTRIPS_HOUSE_WORKSPACE_ID } from "../routes/approvals.security.js";
 import { UserPermission } from "../models/UserPermission.js";
+import { actorStamp, personName, SYSTEM_ACTOR, SYSTEM_NAME } from "./actorNames.js";
 
 export const HOUSE_WORKSPACE_ID = PLUMTRIPS_HOUSE_WORKSPACE_ID;
 
@@ -55,8 +56,9 @@ export class TravelDeskError extends Error {
 
 const str = (v: any) => (v === null || v === undefined ? "" : String(v).trim());
 
+/** Profile name (first + last, else `name` — services/actorNames.personName), else the email. */
 function displayName(u: any) {
-  return str(u?.name) || [str(u?.firstName), str(u?.lastName)].filter(Boolean).join(" ") || str(u?.email) || "Unnamed";
+  return personName(u) || str(u?.email) || "Unnamed";
 }
 
 /**
@@ -263,12 +265,17 @@ export async function assignCase(opts: {
   // The note is staff-only: it lives in staffNote, never in the customer-visible comment.
   if (note) staffNote += ` — Note: ${note}`;
   doc.history = Array.isArray(doc.history) ? doc.history : [];
+  // The actor is the person who clicked (a staff member), or System for
+  // auto-allocation; the assignee is who the case went to / came from.
+  const target = assignee || (prev ? { name: str(prev.agentName), email: str(prev.agentEmail) } : null);
   doc.history.push({
     action,
     at: new Date(),
     by: opts.actor?.sub || "system:travel-desk",
     userEmail: opts.actor?.email || "",
-    userName: opts.actor?.name || (opts.via === "auto" ? "Travel Desk (auto)" : ""),
+    userName: opts.actor?.name || (opts.via === "auto" ? SYSTEM_NAME : ""),
+    ...(opts.actor && opts.via !== "auto" ? actorStamp(opts.actor, "staff") : SYSTEM_ACTOR),
+    ...(target ? { assigneeName: target.name, assigneeEmail: target.email } : {}),
     staffNote,
   });
   doc.markModified("meta");

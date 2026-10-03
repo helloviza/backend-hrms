@@ -103,6 +103,10 @@ export type ProposalHistoryEntry = {
   byEmail?: string;
   byName?: string;
   note?: string;
+  /** Who did it (services/actorNames.ts): user id, profile name, customer | staff | system. */
+  actorId?: string;
+  actorName?: string;
+  actorKind?: "customer" | "staff" | "system";
 };
 
 /* ───────────────────────── Sub Schemas ───────────────────────── */
@@ -204,6 +208,9 @@ const historySchema = new Schema<ProposalHistoryEntry>(
     byEmail: { type: String, default: "" },
     byName: { type: String, default: "" },
     note: { type: String, default: "" },
+    actorId: { type: String },
+    actorName: { type: String },
+    actorKind: { type: String },
   },
   { _id: false }
 );

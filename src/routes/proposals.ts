@@ -43,6 +43,7 @@ import {
   requestInQueueScope,
 } from "./approvals.security.js";
 import { markRequestDone, notifyRequesterProgress, notifyProposalReady } from "../services/approvalProgress.js";
+import { actorNamesOnResponse } from "../services/actorNames.js";
 
 type AnyObj = Record<string, any>;
 type ProposalStatus = "DRAFT" | "SUBMITTED" | "APPROVED" | "DECLINED" | "CHANGES_REQUESTED" | "EXPIRED";
@@ -63,6 +64,9 @@ type AuthedReq = Request & {
 };
 
 const router = Router();
+// Activity rows (history, decisions, booking) name people, never ids;
+// customers see staff as "Plumtrips Travel Desk" (services/actorNames.ts).
+router.use(actorNamesOnResponse(async (req) => (await adminQueueAccess(req)).view));
 // NOTE: requireWorkspace is applied per-route AFTER requireAnyAuth
 // (it needs req.user which requireAnyAuth sets)
 
@@ -168,6 +172,8 @@ function pushHistory(by: AnyObj, action: string, note?: string) {
     at: new Date(),
     byEmail: email,
     byName: name,
+    // Kind is resolved on read (services/actorNames.ts); the id lets it find the profile.
+    actorId: String(by?.sub || by?._id || by?.id || "").trim(),
     note: String(note || "").trim(),
   };
 }
@@ -761,7 +767,12 @@ function itemLabel(li: any): string {
   return String(li?.description || li?.title || li?.name || li?.category || "Travel Service");
 }
 
-function buildProposalSummaryHtml(p: any) {
+/**
+ * `requester` is the person who raised the request (ApprovalRequest frontliner).
+ * proposal.requesterName/Email hold whoever created the draft — a staff member —
+ * and this email goes to customer approvers, so they are never used here.
+ */
+function buildProposalSummaryHtml(p: any, requester: { name: string; email: string }) {
   const options = ensureArray(p?.options).slice().sort((a: any, b: any) => Number(a?.optionNo || 0) - Number(b?.optionNo || 0));
 
   const optBlocks = options
@@ -801,13 +812,13 @@ function buildProposalSummaryHtml(p: any) {
     .join("");
 
   const requesterSectionHtml =
-    p?.requesterName || p?.requesterEmail
+    requester.name || requester.email
       ? `<div style="margin-bottom:16px;">
           ${eLabel("Requested By")}
           ${eCard(`
             <table cellpadding="0" cellspacing="0" width="100%">
-              ${p?.requesterName ? eRow("Name", escHtml(p.requesterName)) : ""}
-              ${p?.requesterEmail ? eRow("Email", escHtml(p.requesterEmail)) : ""}
+              ${requester.name ? eRow("Name", escHtml(requester.name)) : ""}
+              ${requester.email ? eRow("Email", escHtml(requester.email)) : ""}
             </table>
           `)}
         </div>`
@@ -1222,7 +1233,10 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
 
     const ws = await workspaceOf(ar);
     const reqCode = getPublicRequestCode(ar);
-    const summaryHtml = buildProposalSummaryHtml(doc);
+    const summaryHtml = buildProposalSummaryHtml(doc, {
+      name: normStr(ar?.frontlinerName),
+      email: normEmail(ar?.frontlinerEmail),
+    });
 
     try {
       const sendMail = sendMailAny as any;

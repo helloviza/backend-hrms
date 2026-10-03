@@ -117,6 +117,13 @@ export interface ApprovalHistoryItem {
   tokenHash?: string;
   /** Staff only (stripped for customers): e.g. who a case was assigned to and why. */
   staffNote?: string;
+  /** Who did it (services/actorNames.ts): user id, profile name, customer | staff | system. */
+  actorId?: string;
+  actorName?: string;
+  actorKind?: "customer" | "staff" | "system";
+  /** Travel Desk rows (staff only): who the case went to / came from. */
+  assigneeName?: string;
+  assigneeEmail?: string;
 }
 
 export interface ApprovalRequestDocument extends Document {
@@ -380,6 +387,11 @@ const HistorySchema = new Schema<ApprovalHistoryItem>(
     userEmail: { type: String },
     tokenHash: { type: String, default: "" },
     staffNote: { type: String },
+    actorId: { type: String },
+    actorName: { type: String },
+    actorKind: { type: String },
+    assigneeName: { type: String },
+    assigneeEmail: { type: String },
   },
   { _id: false },
 );

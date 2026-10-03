@@ -14,6 +14,7 @@
 //
 // Every email here is price-free.
 
+import { actorStamp, TRAVEL_DESK_NAME } from "./actorNames.js";
 import fs from "fs";
 import path from "path";
 import Proposal from "../models/Proposal.js";
@@ -77,6 +78,7 @@ export async function markRequestDone(opts: {
   const adminEmail = norm(admin.email);
   const adminName = str(admin.name);
   const by = admin.sub || "unknown";
+  const staffActor = actorStamp({ sub: admin.sub, name: adminName }, "staff");
 
   if (Number.isFinite(Number(opts.bookingAmount))) doc.bookingAmount = Number(opts.bookingAmount);
   if (Number.isFinite(Number(opts.actualBookingPrice))) doc.actualBookingPrice = Number(opts.actualBookingPrice);
@@ -84,7 +86,7 @@ export async function markRequestDone(opts: {
   doc.adminState = "done";
   doc.stage = "COMPLETED";
   doc.history = Array.isArray(doc.history) ? doc.history : [];
-  doc.history.push({ action: "admin_done", at: new Date(), by, comment: comment.trim() || undefined, userEmail: adminEmail, userName: adminName });
+  doc.history.push({ action: "admin_done", at: new Date(), by, comment: comment.trim() || undefined, userEmail: adminEmail, userName: adminName, ...staffActor });
   await doc.save();
 
   // The linked proposal (latest version) is done too.
@@ -100,7 +102,7 @@ export async function markRequestDone(opts: {
       if (Number.isFinite(Number(opts.bookingAmount))) proposal.booking.bookingAmount = Number(opts.bookingAmount);
       if (Number.isFinite(Number(opts.actualBookingPrice))) proposal.booking.actualBookingPrice = Number(opts.actualBookingPrice);
       proposal.history = Array.isArray(proposal.history) ? proposal.history : [];
-      proposal.history.push({ action: "BOOKING_DONE", at: new Date(), byEmail: adminEmail, byName: adminName, note: "" });
+      proposal.history.push({ action: "BOOKING_DONE", at: new Date(), byEmail: adminEmail, byName: adminName, note: "", ...staffActor });
       proposal.markModified?.("booking");
       await proposal.save();
     }
@@ -140,7 +142,7 @@ export async function markRequestDone(opts: {
 
   const notify = !(opts.notifyEmail === false || opts.notifyEmail === "false" || opts.notifyEmail === 0 || opts.notifyEmail === "0");
   const skip = async (why: string, message: string) => {
-    doc.history.push({ action: "admin_notify_skipped", at: new Date(), by, comment: why, userEmail: adminEmail, userName: adminName });
+    doc.history.push({ action: "admin_notify_skipped", at: new Date(), by, comment: why, userEmail: adminEmail, userName: adminName, ...staffActor });
     await doc.save();
     return { doc, message };
   };
@@ -149,7 +151,7 @@ export async function markRequestDone(opts: {
 
   const to = norm(doc.frontlinerEmail);
   if (!to) {
-    doc.history.push({ action: "admin_notify_failed", at: new Date(), by, comment: "Requester email missing; cannot notify.", userEmail: adminEmail, userName: adminName });
+    doc.history.push({ action: "admin_notify_failed", at: new Date(), by, comment: "Requester email missing; cannot notify.", userEmail: adminEmail, userName: adminName, ...staffActor });
     await doc.save();
     return { doc, message: "Marked done (no requester email)" };
   }
@@ -170,8 +172,9 @@ export async function markRequestDone(opts: {
         customerName: doc.customerName || "Workspace",
         ticketId: doc.ticketId,
         requesterEmail: to,
-        processedByEmail: adminEmail,
-        processedByName: adminName,
+        // Customer email: staff show as the travel desk, never by name or email.
+        processedByEmail: "",
+        processedByName: TRAVEL_DESK_NAME,
         comment: sanitizeAdminCommentForEmail(comment),
         items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
         attachments: emailAtts.map((a) => ({ filename: a.filename || "attachment.pdf" })),
@@ -185,10 +188,11 @@ export async function markRequestDone(opts: {
       comment: `Notified: to=${to}${cc.length ? ` cc=${cc.join(",")}` : ""}${emailAtts.length ? ` attachments=${emailAtts.length}` : ""}`,
       userEmail: adminEmail,
       userName: adminName,
+      ...staffActor,
     });
     await doc.save();
   } catch (e: any) {
-    doc.history.push({ action: "admin_notify_failed", at: new Date(), by, comment: `Notify send failed: ${String(e?.message || e)}`, userEmail: adminEmail, userName: adminName });
+    doc.history.push({ action: "admin_notify_failed", at: new Date(), by, comment: `Notify send failed: ${String(e?.message || e)}`, userEmail: adminEmail, userName: adminName, ...staffActor });
     await doc.save();
   }
   return { doc, message: "Marked done" };

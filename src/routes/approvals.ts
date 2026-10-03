@@ -60,6 +60,7 @@ import {
   checkCanRaiseRequest,
 } from "./approvals.security.js";
 import approvalSearchRouter from "./approvals.search.js";
+import { actorNamesOnResponse, actorStamp, SYSTEM_ACTOR } from "../services/actorNames.js";
 import travelDeskRouter from "./approvals.travelDesk.js";
 import { assignCase, autoAllocate, TravelDeskError, flagNeedsReassignment } from "../services/travelDesk.js";
 import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
@@ -169,6 +170,9 @@ router.use(requireWorkspace);
 // Ops queue access (Access Console "Admin Queue" grant, or SUPERADMIN / HOUSE
 // ADMIN for oversight), resolved once for every route below.
 router.use(stampAdminQueueAccess);
+// Activity rows name people (profile name), never ids; customers see staff as
+// "Plumtrips Travel Desk" (services/actorNames.ts).
+router.use(actorNamesOnResponse((req) => hasQueueView(req)));
 // Flow 2 (approvalFlowEnabled) and Flow 3 (approvalDirectEnabled) share this
 // router: request form, search, my requests, inbox, booking history. Which
 // flow a route serves is decided per-route by requireTravelMode.
@@ -630,6 +634,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
           comment: comments ? String(comments).trim() : undefined,
           userEmail: email,
           userName: name,
+          ...actorStamp(req.user, hasQueueView(req) ? "staff" : "customer"),
         },
         ...(isSelfApproval
           ? [
@@ -640,6 +645,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
                 comment: "Auto-approved — requester is a Workspace Leader (no one above to approve).",
                 userEmail: email,
                 userName: name,
+                ...SYSTEM_ACTOR,
               },
             ]
           : []),
@@ -1394,6 +1400,8 @@ router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: A
         by: (req as AnyObj).user?.email || "admin",
         at: new Date(),
         note: "Admin started direct booking via SBT",
+        userEmail: normEmail(req.user?.email),
+        ...actorStamp(req.user, "staff"),
       },
     ];
     await doc.save();
@@ -1508,6 +1516,7 @@ router.put(
         comment: String(comment || "").trim() || undefined,
         userEmail: normEmail(req.user?.email),
         userName: req.user?.name || req.user?.firstName || "",
+        ...actorStamp(req.user, "staff"),
       });
 
       await doc.save();
@@ -1633,6 +1642,7 @@ router.post(
         by: String(req.user?.sub || req.user?._id || ""),
         userEmail: normEmail(req.user?.email),
         userName: req.user?.name || req.user?.firstName || "",
+        ...actorStamp(req.user, "staff"),
         comment: `Attachment uploaded: ${file.originalname}`,
       });
 
@@ -1731,6 +1741,7 @@ router.put("/admin/:id/on-hold", requireApprovalsAdminWrite, async (req: AnyObj,
       comment: String(comment || "").trim() || undefined,
       userEmail: normEmail(req.user?.email),
       userName: req.user?.name || req.user?.firstName || "",
+      ...actorStamp(req.user, "staff"),
     });
 
     await doc.save();
@@ -1767,6 +1778,7 @@ router.put("/admin/:id/cancel", requireApprovalsAdminWrite, async (req: AnyObj, 
       comment: String(comment || "").trim() || undefined,
       userEmail: normEmail(req.user?.email),
       userName: req.user?.name || req.user?.firstName || "",
+      ...actorStamp(req.user, "staff"),
     });
 
     await doc.save();

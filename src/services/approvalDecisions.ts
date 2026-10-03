@@ -25,6 +25,7 @@ import { sendMail } from "../utils/mailer.js";
 import { autoAllocate } from "./travelDesk.js";
 import { signApprovalLink, approvalLinkExpiryHours, type ApprovalLinkKind } from "../utils/approvalLinkToken.js";
 import { frontendBaseUrl, DISABLE_EMAILS, stripPriceText } from "../routes/approvals.security.js";
+import { actorStamp, TRAVEL_DESK_NAME } from "./actorNames.js";
 import {
   buildRequesterApprovedHtml,
   buildRequestDeclinedEmailHtml,
@@ -458,7 +459,9 @@ export async function applyProposalDecision(opts: {
     throw new DecisionError(400, "NOTE_REQUIRED", "Say who decided, how and when.");
   }
   const reason = onBehalf
-    ? `Recorded by ${str(actor.name) || norm(actor.email)} on behalf of the customer: ${note}`
+    ? // Customers read this note: the travel desk, never a staff name or email
+      // (staff see who recorded it from the row's actor).
+      `Recorded by ${TRAVEL_DESK_NAME} on behalf of the customer: ${note}`
     : note;
   if (action === "decline" && !reason) {
     throw new DecisionError(400, "REASON_REQUIRED", "A reason is required to decline.");
@@ -491,7 +494,7 @@ export async function applyProposalDecision(opts: {
           customer: { action: "needs_changes", note: reason, at: new Date(), byEmail: email, byName: name },
         },
         $push: {
-          history: { action: `${onBehalf ? "RECORDED_" : actor.via === "email" ? "EMAIL_" : ""}CHANGES_REQUESTED`, at: new Date(), byEmail: email, byName: name, note: reason },
+          history: { action: `${onBehalf ? "RECORDED_" : actor.via === "email" ? "EMAIL_" : ""}CHANGES_REQUESTED`, at: new Date(), byEmail: email, byName: name, note: reason, ...actorStamp(actor, onBehalf ? "staff" : "customer") },
         },
       },
       { new: true },
@@ -503,7 +506,7 @@ export async function applyProposalDecision(opts: {
     await setProposalPhaseStage(ar._id, "PROPOSAL_CHANGES_REQUESTED");
     await notifyOpsOfProposalOutcome(back, ar, "CHANGES_REQUESTED", name, reason);
     // A decision recorded by ops is news to the approver and leaders.
-    if (onBehalf) await notifyDecidersOfProposalDecision(ar, back, "CHANGES_REQUESTED", name, reason);
+    if (onBehalf) await notifyDecidersOfProposalDecision(ar, back, "CHANGES_REQUESTED", TRAVEL_DESK_NAME, reason);
     return { proposal: back, request: ar };
   }
 
@@ -526,6 +529,7 @@ export async function applyProposalDecision(opts: {
           byEmail: email,
           byName: name,
           note: reason,
+          ...actorStamp(actor, onBehalf ? "staff" : "customer"),
         },
       },
     },
@@ -539,7 +543,7 @@ export async function applyProposalDecision(opts: {
   await setProposalPhaseStage(ar._id, action === "approve" ? "PROPOSAL_APPROVED" : "PROPOSAL_DECLINED");
   await notifyRequesterOfProposalDecision(ar, action);
   await notifyOpsOfProposalOutcome(updated, ar, decision.decision, name, reason);
-  await notifyDecidersOfProposalDecision(ar, updated, decision.decision as any, name, reason);
+  await notifyDecidersOfProposalDecision(ar, updated, decision.decision as any, onBehalf ? TRAVEL_DESK_NAME : name, reason);
   return { proposal: updated, request: ar };
 }
 
