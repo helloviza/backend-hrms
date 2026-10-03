@@ -14,7 +14,7 @@
 //
 // Every email here is price-free.
 
-import { actorStamp, TRAVEL_DESK_NAME } from "./actorNames.js";
+import { actorStamp, TRAVEL_DESK_NAME, DESK_EMAIL, userNames } from "./actorNames.js";
 import fs from "fs";
 import path from "path";
 import Proposal from "../models/Proposal.js";
@@ -160,6 +160,10 @@ export async function markRequestDone(opts: {
     (e) => e && e !== to,
   );
   const emailAtts = [...buildEmailAttachmentsFromMeta(doc), ...proposalBookingAttachments(proposal)];
+  // The requester's profile name (services/actorNames.ts), else the stored name.
+  const requesterLookup = await userNames([doc.frontlinerId, to]);
+  const requesterName =
+    requesterLookup.get(String(doc.frontlinerId || "")) || requesterLookup.get(to) || str(doc.frontlinerName);
 
   try {
     await (sendMail as any)({
@@ -167,11 +171,13 @@ export async function markRequestDone(opts: {
       to,
       cc: cc.length ? cc : undefined,
       subject: `Your Booking has been Processed — ${doc.customerName || "Workspace"}${doc.ticketId ? ` (${doc.ticketId})` : ""}`,
-      replyTo: adminEmail || undefined,
+      // The desk mailbox, never the staff member's own address.
+      replyTo: DESK_EMAIL,
       html: buildAdminProcessedEmailHtml({
         customerName: doc.customerName || "Workspace",
         ticketId: doc.ticketId,
         requesterEmail: to,
+        requesterName: requesterName,
         // Customer email: staff show as the travel desk, never by name or email.
         processedByEmail: "",
         processedByName: TRAVEL_DESK_NAME,

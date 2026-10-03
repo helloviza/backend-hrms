@@ -5,6 +5,7 @@
 // the hot read paths (list / summary / dashboard) can stay a plain field
 // filter instead of a per-row report join.
 
+import { nameOrUnknown } from "./actorNames.js";
 import mongoose from "mongoose";
 import Expense from "../models/Expense.js";
 import Report, {
@@ -1019,7 +1020,7 @@ export async function submitReport(
     note: engineDecision
       ? engineDecision.explain.join(" ")
       : routing.chosen
-          .map((c: any) => `L${c.level} → ${c.name || c.userId} (${String(c.via).replace(/_/g, " ")})`)
+          .map((c: any) => `L${c.level} → ${nameOrUnknown(c.name)} (${String(c.via).replace(/_/g, " ")})`)
           .join(" · "),
     details: routing,
   });

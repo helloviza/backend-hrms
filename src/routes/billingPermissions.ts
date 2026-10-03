@@ -1,4 +1,5 @@
 // apps/backend/src/routes/billingPermissions.ts
+import { userNames, nameOrUnknown } from "../services/actorNames.js";
 import express from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireSuperAdmin } from "../middleware/requireSuperAdmin.js";
@@ -184,21 +185,14 @@ router.get("/list", async (req: any, res: any) => {
 
     const docs = await BillingPermission.find(filter).sort({ grantedAt: -1 }).lean();
 
-    // Populate display names from User collection where possible
-    const userIds = docs.map((d) => d.userId).filter(Boolean);
-    let userMap: Record<string, string> = {};
-    if (userIds.length > 0) {
-      const users = await (User as any)
-        .find({ _id: { $in: userIds } }, { _id: 1, name: 1, email: 1 })
-        .lean();
-      for (const u of users) {
-        userMap[String(u._id)] = u.name || u.email || "";
-      }
-    }
+    // Grantee and granter as profile names (services/actorNames.ts) — one
+    // lookup; "Granted by" is never the stored id.
+    const names = await userNames(docs.flatMap((d: any) => [d.userId, d.grantedBy]));
 
-    const enriched = docs.map((d) => ({
+    const enriched = docs.map((d: any) => ({
       ...d,
-      displayName: userMap[d.userId] || "",
+      displayName: names.get(String(d.userId || "")) || "",
+      grantedByName: d.grantedBy ? nameOrUnknown(names.get(String(d.grantedBy))) : "",
     }));
 
     return res.json({ success: true, docs: enriched });

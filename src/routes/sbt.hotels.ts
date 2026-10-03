@@ -1,4 +1,5 @@
 import express from "express";
+import { userNames, isRawId, TRAVEL_DESK_NAME } from "../services/actorNames.js";
 import { randomUUID } from "crypto";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
@@ -3938,6 +3939,15 @@ router.post("/bookings/:id/request-date-change", requireSBT, async (req: any, re
 
 // ─── 12. GET /admin/date-change-requests ─────────────────────────────────────
 
+function resolvedByName(stored: any, names: Map<string, string>): string {
+  const v = String(stored || "").trim();
+  if (!v) return "";
+  const byLookup = names.get(v.toLowerCase()) || names.get(v);
+  if (byLookup) return byLookup;
+  if (v.includes("@") || v.toLowerCase() === "ops" || isRawId(v)) return TRAVEL_DESK_NAME;
+  return v;
+}
+
 router.get("/admin/date-change-requests", requireAdmin, async (req: any, res: any) => {
   try {
     const { status, bookingId, from, to, page = "1", limit = "50" } = req.query as Record<string, string>;
@@ -3965,7 +3975,12 @@ router.get("/admin/date-change-requests", requireAdmin, async (req: any, res: an
       ManualDateChangeRequest.countDocuments(filter),
     ]);
 
-    return res.json({ ok: true, requests, total, page: pageNum, limit: pageSize });
+    // "Resolved by" as a profile name: older rows stored a name, an email or
+    // "ops"; an email resolves to the person, anything else unknown is the desk.
+    const resolverNames = await userNames((requests as any[]).map((r) => r.resolvedBy));
+    const shown = (requests as any[]).map((r) => ({ ...r, resolvedByName: resolvedByName(r.resolvedBy, resolverNames) }));
+
+    return res.json({ ok: true, requests: shown, total, page: pageNum, limit: pageSize });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Fetch failed";
     sbtLogger.error("Admin date-change-requests list failed", { error: msg });
@@ -3990,7 +4005,9 @@ router.post("/admin/date-change-requests/:id/update", requireAdmin, async (req: 
     if (status) dcr.status = status;
     if (typeof opsNotes === "string") dcr.opsNotes = opsNotes.slice(0, 2000).trim();
     if (status === "RESOLVED" || status === "APPROVED" || status === "DENIED") {
-      dcr.resolvedBy = req.user?.name || req.user?.email || "ops";
+      // The resolver's profile name (services/actorNames.ts); the desk if unknown.
+      const me = String(req.user?.sub || req.user?._id || req.user?.id || "");
+      dcr.resolvedBy = (await userNames([me])).get(me) || TRAVEL_DESK_NAME;
       dcr.resolvedAt = new Date();
     }
     await dcr.save();

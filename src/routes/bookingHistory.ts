@@ -8,7 +8,7 @@ import CustomerMember from "../models/CustomerMember.js";
 import { requireAuth } from "../middleware/auth.js";
 import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import { sanitizeApprovalForViewer, adminQueueAccess, queueCaseScope, hasQueueView } from "./approvals.security.js";
-import { actorNamesOnResponse } from "../services/actorNames.js";
+import { actorNamesOnResponse, userNames, nameOrUnknown } from "../services/actorNames.js";
 
 const router = Router();
 // Activity rows name people, never ids; customers see staff as "Plumtrips
@@ -359,6 +359,26 @@ async function buildTravelerIdMap(rows: any[]): Promise<Map<string, string>> {
   );
 }
 
+/**
+ * Requester and approver as profile names (services/actorNames.ts) — the list
+ * and drawer show names, never an id or a bare email. One lookup per page.
+ */
+async function peopleNames(rows: any[]): Promise<Map<string, string>> {
+  return userNames(
+    rows.flatMap((r: any) => [r.frontlinerId, r.frontlinerEmail, r.requesterEmail, r.approvedByEmail, r.managerEmail]),
+  );
+}
+function peopleOf(r: any, names: Map<string, string>) {
+  const get = (k: any) => names.get(String(k || "").trim().toLowerCase()) || names.get(String(k || "").trim());
+  const approverEmail = r.approvedByEmail || r.managerEmail;
+  return {
+    requesterName: nameOrUnknown(get(r.frontlinerId), get(r.frontlinerEmail || r.requesterEmail), r.frontlinerName),
+    approverName: approverEmail || r.approvedByName || r.managerName
+      ? nameOrUnknown(get(approverEmail), r.approvedByName, r.managerName)
+      : "",
+  };
+}
+
 /* ────────────────────────────────────────────────────────────────
  * Routes
  * ──────────────────────────────────────────────────────────────── */
@@ -379,6 +399,7 @@ router.get("/admin/history", requireAuth, async (req: Request, res: Response) =>
     .lean();
 
   const travelerMap = await buildTravelerIdMap(rows);
+    const people = await peopleNames(rows);
 
   const out = rows.map((r: any) => {
     const hist = Array.isArray(r?.history) ? r.history : [];
@@ -392,6 +413,7 @@ router.get("/admin/history", requireAuth, async (req: Request, res: Response) =>
     return {
       ...r,
       requesterTravelerId: travelerMap.get(requesterEmail) || "",
+          ...peopleOf(r, people),
       _latestParsed: {
         mode: parsed.mode,
         service: parsed.service,
@@ -433,6 +455,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
   if (queueViewer) {
     const rows = await ApprovalRequest.find({ ...base, ...queueCaseScope(req) } as any).sort({ updatedAt: -1 }).lean();
     const travelerMap = await buildTravelerIdMap(rows);
+    const people = await peopleNames(rows);
     return res.json({
       ok: true,
       rows: rows.map((r: any) => {
@@ -447,6 +470,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
         return sanitizeApprovalForViewer({
           ...r,
           requesterTravelerId: travelerMap.get(requesterEmail) || "",
+          ...peopleOf(r, people),
           _latestParsed: {
             mode: parsed.mode,
             service: parsed.service,
@@ -482,6 +506,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
 
     const rows = await ApprovalRequest.find(query).sort({ updatedAt: -1 }).lean();
     const travelerMap = await buildTravelerIdMap(rows);
+    const people = await peopleNames(rows);
 
     const out = rows.map((r: any) => {
       const hist = Array.isArray(r?.history) ? r.history : [];
@@ -505,6 +530,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
         ...r,
         history: safeHist,
         requesterTravelerId: travelerMap.get(requesterEmail) || "",
+          ...peopleOf(r, people),
         _latestParsed: {
           mode: parsed.mode,
           service: parsed.service,
@@ -530,6 +556,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
 
   const rows = await ApprovalRequest.find(query).sort({ updatedAt: -1 }).lean();
   const travelerMap = await buildTravelerIdMap(rows);
+    const people = await peopleNames(rows);
 
   const out = rows.map((r: any) => {
     const hist = Array.isArray(r?.history) ? r.history : [];
@@ -552,6 +579,7 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
       ...r,
       history: safeHist,
       requesterTravelerId: travelerMap.get(requesterEmail) || "",
+          ...peopleOf(r, people),
       _latestParsed: {
         mode: parsed.mode,
         service: parsed.service,

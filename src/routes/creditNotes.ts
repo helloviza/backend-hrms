@@ -1,3 +1,4 @@
+import { userNames, nameOrUnknown } from "../services/actorNames.js";
 import express from "express";
 import ExcelJS from "exceljs";
 import mongoose from "mongoose";
@@ -456,7 +457,7 @@ const CN_COLUMNS = [
   "IRN Generated At",
 ];
 
-function cnToRow(cn: any, workspaceName: string): (string | number | undefined)[] {
+function cnToRow(cn: any, workspaceName: string, issuerNames: Map<string, string>): (string | number | undefined)[] {
   return [
     cn.creditNoteNo,
     cn.creditNoteDate ? new Date(cn.creditNoteDate).toLocaleDateString("en-IN") : "",
@@ -480,7 +481,8 @@ function cnToRow(cn: any, workspaceName: string): (string | number | undefined)[
     cn.supplyType,
     cn.placeOfSupply || "",
     cn.issuedAt ? new Date(cn.issuedAt).toLocaleDateString("en-IN") : "",
-    cn.issuedBy ? String(cn.issuedBy) : "",
+    // "Issued By" as a profile name (services/actorNames.ts), never the stored id.
+    cn.issuedBy ? nameOrUnknown(issuerNames.get(String(cn.issuedBy))) : "",
     cn.cancelledAt ? new Date(cn.cancelledAt).toLocaleDateString("en-IN") : "",
     cn.cancellationReason || "",
     cn.isDemo ? "Yes" : "No",
@@ -640,13 +642,14 @@ router.get("/export", requirePermission("creditnotes", "READ"), async (req: any,
 
     const format = req.query.format === "xlsx" ? "xlsx" : "csv";
     const docs = await CreditNote.find(filter).sort({ generatedAt: -1 }).limit(5000).lean();
+    const issuerNames = await userNames(docs.map((cn: any) => cn.issuedBy));
     const wsNames = await resolveWorkspaceNames(docs);
 
     if (format === "csv") {
       res.setHeader("Content-Type", "text/csv");
       res.setHeader("Content-Disposition", 'attachment; filename="credit-notes-export.csv"');
       res.write(csvRow(CN_COLUMNS));
-      for (const cn of docs) res.write(csvRow(cnToRow(cn, wsNames.get(String(cn.workspaceId)) || "")));
+      for (const cn of docs) res.write(csvRow(cnToRow(cn, wsNames.get(String(cn.workspaceId)) || "", issuerNames)));
       res.end();
       return;
     }
@@ -657,7 +660,7 @@ router.get("/export", requirePermission("creditnotes", "READ"), async (req: any,
     headerRow.font = { bold: true };
     // Monetary columns: Subtotal=14, CGST=15, SGST=16, IGST=17, Total GST=18, Grand Total=19
     [14, 15, 16, 17, 18, 19].forEach((ci) => { sheet.getColumn(ci).numFmt = "#,##0.00"; });
-    for (const cn of docs) sheet.addRow(cnToRow(cn, wsNames.get(String(cn.workspaceId)) || ""));
+    for (const cn of docs) sheet.addRow(cnToRow(cn, wsNames.get(String(cn.workspaceId)) || "", issuerNames));
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", 'attachment; filename="credit-notes-export.xlsx"');

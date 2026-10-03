@@ -16,6 +16,7 @@
 // request/resubmit are owner-only; approve/decline/clarify are approver-or-admin;
 // disburse is finance-only with whole-chain SoD (canDisburse).
 
+import { nameOrUnknown, idsToNamesInText } from "../services/actorNames.js";
 import express from "express";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
@@ -343,7 +344,7 @@ router.post("/", async (req: any, res: any) => {
       actorType: "system",
       note: engineDecision
         ? engineDecision.explain.join(" ")
-        : routing.chosen.map((c: any) => `L${c.level} → ${c.name || c.userId} (${String(c.via).replace(/_/g, " ")})`).join(" · "),
+        : routing.chosen.map((c: any) => `L${c.level} → ${nameOrUnknown(c.name)} (${String(c.via).replace(/_/g, " ")})`).join(" · "),
       details: routing,
     });
     if (botApproved && engineDecision) {
@@ -1031,13 +1032,15 @@ router.get("/:id", async (req: any, res: any) => {
     })
       .sort({ createdAt: 1 })
       .lean();
+    // Older routing notes stored a user id where the approver had no name.
+    const namedNote = await idsToNamesInText(activityDocs.map((a: any) => a.note));
     const activity = activityDocs.map((a: any) => ({
       _id: String(a._id),
       event: a.event,
       actorName: a.actorName,
       actorId: a.actorId ? String(a.actorId) : null,
       actorType: normalizeActorType(a),
-      note: a.note ?? null,
+      note: a.note ? namedNote(a.note) : (a.note ?? null),
       elapsedMs: a.elapsedMs ?? null,
       heldMs: a.heldMs ?? null,
       details: a.details ?? null,

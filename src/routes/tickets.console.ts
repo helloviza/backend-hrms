@@ -1,4 +1,5 @@
 import express from "express";
+import { nameOrUnknown, personName, idsToNamesInText } from "../services/actorNames.js";
 import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
@@ -276,7 +277,11 @@ router.get("/:id", requirePermission("supportTickets", "READ"), async (req, res)
       TicketAttachment.find({ ticketId: ticket._id }).lean(),
     ]);
 
-    return res.json({ success: true, ticket, messages, lead, attachments });
+    // Older system notes stored a user id where the name was missing.
+    const named = await idsToNamesInText((messages as any[]).filter((m) => m.channel === "SYSTEM").map((m) => m.bodyText));
+    const shown = (messages as any[]).map((m) => (m.channel === "SYSTEM" && m.bodyText ? { ...m, bodyText: named(m.bodyText) } : m));
+
+    return res.json({ success: true, ticket, messages: shown, lead, attachments });
   } catch (err) {
     logger.error("[TicketsConsole] getById error", { err });
     return res.status(500).json({ success: false, error: "Failed to load ticket" });
@@ -645,10 +650,11 @@ router.patch("/:id/assign", requirePermission("supportTickets", "WRITE"), async 
     await ticket.save();
 
     const assignedUser = assignUserId
-      ? await User.findById(assignUserId, "name email").lean()
+      ? await User.findById(assignUserId, "firstName lastName name email").lean()
       : null;
+    // A name, never the id (services/actorNames.ts).
     const noteText = assignUserId
-      ? `Assigned to ${(assignedUser as any)?.name || assignUserId}`
+      ? `Assigned to ${nameOrUnknown(personName(assignedUser), (assignedUser as any)?.email)}`
       : "Unassigned";
 
     await TicketMessage.create({

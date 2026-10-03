@@ -1,4 +1,5 @@
 // apps/backend/src/routes/leaves.ts
+import { UNKNOWN_USER } from "../services/actorNames.js";
 import { Router, Request, Response, NextFunction } from "express";
 import { z } from "zod";
 import Leave from "../models/LeaveRequest.js";
@@ -592,7 +593,7 @@ r.get(
         const userName =
           u?.firstName && u?.lastName
             ? `${u.firstName} ${u.lastName}`
-            : u?.name || u?.email || String(lr.userId);
+            : u?.name || u?.email || UNKNOWN_USER; // never the id
 
         const fromDate = new Date(lr.from);
         const toDate = new Date(lr.to);
@@ -845,7 +846,7 @@ r.get(
         const userName =
           u?.firstName && u?.lastName
             ? `${u.firstName} ${u.lastName}`
-            : u?.name || u?.email || String(b.userId);
+            : u?.name || u?.email || UNKNOWN_USER; // never the id
 
         return {
           userId: u?._id || b.userId,

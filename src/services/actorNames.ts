@@ -25,6 +25,12 @@ import User from "../models/User.js";
 
 export type ActorKind = "customer" | "staff" | "system";
 export const TRAVEL_DESK_NAME = "Plumtrips Travel Desk";
+/**
+ * The travel desk's mailbox: the reply-to on customer emails sent on behalf of
+ * a staff member, so a customer's reply never goes to (or reveals) a personal
+ * address. One constant; DESK_EMAIL in the environment overrides it.
+ */
+export const DESK_EMAIL = String(process.env.DESK_EMAIL || "").trim() || "ops@plumtrips.com";
 export const SYSTEM_NAME = "System";
 
 const HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
@@ -38,6 +44,74 @@ const lower = (v: any) => str(v).toLowerCase();
 export function personName(u: any): string {
   const full = [str(u?.firstName), str(u?.lastName)].filter(Boolean).join(" ");
   return full || str(u?.name) || str(u?.fullName);
+}
+
+/** What a name slot shows when nobody can be named — never an id. */
+export const UNKNOWN_USER = "Unknown user";
+
+/** The first candidate that is a real name (not empty, not a raw id), else UNKNOWN_USER. */
+export function nameOrUnknown(...candidates: any[]): string {
+  for (const c of candidates) {
+    const s = str(c);
+    if (s && !HEX24.test(s)) return s;
+  }
+  return UNKNOWN_USER;
+}
+
+/** Is this a bare Mongo id (a value that must never be shown as a name)? */
+export function isRawId(v: any): boolean {
+  return HEX24.test(str(v));
+}
+
+/**
+ * Profile names for a set of user ids (or emails), in ONE query: id/email →
+ * personName, falling back to the email. Unknown keys are simply absent.
+ */
+export async function userNames(keys: any[]): Promise<Map<string, string>> {
+  const ids = new Set<string>();
+  const emails = new Set<string>();
+  for (const k of keys) {
+    const v = str(k);
+    if (HEX24.test(v)) ids.add(v);
+    else if (v.includes("@")) emails.add(v.toLowerCase());
+  }
+  const out = new Map<string, string>();
+  if (!ids.size && !emails.size) return out;
+  const or: any[] = [];
+  if (ids.size) or.push({ _id: { $in: [...ids].map((i) => new mongoose.Types.ObjectId(i)) } });
+  if (emails.size) or.push({ email: { $in: [...emails] } });
+  let users: any[] = [];
+  try {
+    users = (await User.find({ $or: or }).select("firstName lastName name email").lean()) as any[];
+  } catch (err: any) {
+    // Names are display-only: a failed lookup must never fail the page —
+    // callers fall back to "Unknown user", still never an id.
+    console.error("[actor-names] user lookup failed", err?.message || err);
+  }
+  for (const u of users) {
+    const name = personName(u) || str(u.email);
+    if (!name) continue;
+    out.set(String(u._id), name);
+    if (u.email) out.set(lower(u.email), name);
+  }
+  return out;
+}
+
+/**
+ * Free-text notes that older code wrote with a user id where a name was
+ * missing ("Assigned to 69dc05e1…", "L1 → 69a7f38d…"). Returns a function that
+ * rewrites such text: every id that is a user becomes their profile name; an
+ * id in an "Assigned to" / "→" slot that is not a user becomes "Unknown user".
+ * Other ids are left alone. One lookup for all the texts given.
+ */
+export async function idsToNamesInText(texts: any[]): Promise<(t: any) => string> {
+  const ids = new Set<string>();
+  for (const t of texts) for (const m of str(t).matchAll(/\b[a-f0-9]{24}\b/gi)) ids.add(m[0]);
+  const names = ids.size ? await userNames([...ids]) : new Map<string, string>();
+  return (t: any) =>
+    str(t)
+      .replace(/(Assigned to |→ )([a-f0-9]{24})\b/gi, (_all, lead, id) => `${lead}${names.get(id) || UNKNOWN_USER}`)
+      .replace(/\b[a-f0-9]{24}\b/gi, (id) => names.get(id) || id);
 }
 
 /** Fields to spread into a row written by `user` (a JWT user or a User doc). */

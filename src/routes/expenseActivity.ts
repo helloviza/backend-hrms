@@ -30,6 +30,7 @@
 // The label is entity-aware (a claim "approved the claim" vs an advance
 // "approved the advance") and capitalized for a standalone table cell.
 
+import { idsToNamesInText } from "../services/actorNames.js";
 import express from "express";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
@@ -230,6 +231,8 @@ router.get("/", async (req: any, res: any) => {
         : Promise.resolve(),
     ]);
 
+    // Older routing notes stored a user id where the approver had no name.
+    const namedNote = await idsToNamesInText(docs.map((a: any) => a.note));
     const rows = docs.map((a: any) => {
       const isAdvance = !!a.advanceId;
       const u = a.actorId ? userMap.get(String(a.actorId)) : null;
@@ -251,7 +254,7 @@ router.get("/", async (req: any, res: any) => {
         ref,
         // Normalized to "" (never null) to match the CSV/XLSX cell behavior and
         // keep the JSON contract uniform.
-        detail: a.note ?? "",
+        detail: a.note ? namedNote(a.note) : "",
         actorType: normalizeActorType(a),
         elapsed: fmtDuration(a.elapsedMs) || "",
         held: fmtDuration(a.heldMs) || "",

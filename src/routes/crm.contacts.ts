@@ -1,4 +1,5 @@
 import express from "express";
+import { nameOrUnknown, personName, idsToNamesInText } from "../services/actorNames.js";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
 import CRMContact from "../models/CRMContact.js";
@@ -325,7 +326,9 @@ router.get("/:id", async (req, res) => {
       }
     }
 
-    return res.json({ contact: { ...(contact as any), assignedToName }, linkedLead, opportunity });
+    // Older "[Assigned to …]" notes stored a user id where the name was missing.
+    const named = await idsToNamesInText([(contact as any).notes]);
+    return res.json({ contact: { ...(contact as any), notes: (contact as any).notes ? named((contact as any).notes) : (contact as any).notes, assignedToName }, linkedLead, opportunity });
   } catch (err) {
     logger.error("crm.contacts GET /:id error", { err });
     return res.status(500).json({ error: "Failed to get contact." });
@@ -425,7 +428,7 @@ router.post("/:id/assign", async (req, res) => {
       return res.status(400).json({ error: "Valid userId is required." });
     }
 
-    const rep = (await User.findById(repId).select("name").lean()) as any;
+    const rep = (await User.findById(repId).select("firstName lastName name email").lean()) as any;
     if (!rep) return res.status(404).json({ error: "User not found." });
 
     const contact = await CRMContact.findById(req.params.id);
@@ -433,9 +436,11 @@ router.post("/:id/assign", async (req, res) => {
 
     contact.assignedTo = new mongoose.Types.ObjectId(String(repId));
     const prevNote = contact.notes || "";
+    // A name, never the id (services/actorNames.ts).
+    const repName = nameOrUnknown(personName(rep), rep.email);
     contact.notes = prevNote.length > 0
-      ? `${prevNote}\n[Assigned to ${rep.name || repId}]`
-      : `[Assigned to ${rep.name || repId}]`;
+      ? `${prevNote}\n[Assigned to ${repName}]`
+      : `[Assigned to ${repName}]`;
 
     await contact.save();
     return res.json({ contact });

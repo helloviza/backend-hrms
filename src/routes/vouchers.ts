@@ -16,6 +16,8 @@ import {
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 
 import VoucherExtraction from "../models/VoucherExtraction.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { userNames, nameOrUnknown } from "../services/actorNames.js";
 import type { VoucherType } from "../types/index.js";
 
 import { uploadBufferToS3, deleteObject } from "../utils/s3Upload.js";
@@ -749,12 +751,27 @@ router.post("/:id/render", canWriteVouchers, async (req: any, res) => {
  * tenancy boundary and must be in the filter directly.
  */
 router.get("/", canReadVouchers, async (req: any, res) => {
-  const rows = await VoucherExtraction.find({ ...voucherScope(req) })
+  const rows = (await VoucherExtraction.find({ ...voucherScope(req) })
     .sort({ createdAt: -1 })
     .limit(200)
-    .lean();
+    .lean()) as any[];
 
-  return res.json(rows);
+  // Who uploaded it and for which company, as names (never ids): one user
+  // lookup and one workspace lookup for the whole page.
+  const names = await userNames(rows.map((r) => r.createdBy));
+  const wsIds = [...new Set(rows.map((r) => String(r.workspaceId || "")).filter((id) => mongoose.isValidObjectId(id)))];
+  const workspaces = wsIds.length
+    ? ((await CustomerWorkspace.find({ _id: { $in: wsIds } }).select("name companyName").lean()) as any[])
+    : [];
+  const wsName = new Map(workspaces.map((w) => [String(w._id), String(w.companyName || w.name || "").trim()]));
+
+  return res.json(
+    rows.map((r) => ({
+      ...r,
+      createdByName: nameOrUnknown(names.get(String(r.createdBy || ""))),
+      customerName: wsName.get(String(r.workspaceId || "")) || "",
+    })),
+  );
 });
 
 /**

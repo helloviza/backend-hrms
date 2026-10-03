@@ -9,6 +9,7 @@
 // owner-only in Layer 2 (employeeId === caller) — approve/reject/reimburse +
 // approver routing are Layer 3.
 
+import { idsToNamesInText } from "../services/actorNames.js";
 import express from "express";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
@@ -703,6 +704,8 @@ router.get("/:id", async (req: any, res: any) => {
     })
       .sort({ createdAt: 1 })
       .lean();
+    // Older routing notes stored a user id where the approver had no name.
+    const namedNote = await idsToNamesInText(activityDocs.map((a: any) => a.note));
     const activity = activityDocs.map((a: any) => ({
       _id: String(a._id),
       event: a.event,
@@ -710,7 +713,7 @@ router.get("/:id", async (req: any, res: any) => {
       actorId: a.actorId ? String(a.actorId) : null,
       actorType: normalizeActorType(a), // rows from before sub-step 2 normalise by name
       expenseId: a.expenseId ? String(a.expenseId) : null,
-      note: a.note ?? null,
+      note: a.note ? namedNote(a.note) : (a.note ?? null),
       elapsedMs: a.elapsedMs ?? null,
       heldMs: a.heldMs ?? null,
       details: a.details ?? null,

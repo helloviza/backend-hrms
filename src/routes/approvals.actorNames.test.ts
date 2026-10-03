@@ -23,7 +23,7 @@ import { MongoMemoryServer } from "mongodb-memory-server";
 process.env.NODE_ENV = "test";
 process.env.JWT_SECRET ||= "jwt-secret-for-tests";
 
-const mails: Array<{ to: string; subject: string; html: string }> = [];
+const mails: Array<{ to: string; subject: string; html: string; replyTo?: string }> = [];
 
 vi.mock("../middleware/auth.js", () => {
   const requireAuth = (req: any, _res: any, next: any) => {
@@ -47,7 +47,7 @@ vi.mock("../middleware/requireWorkspace.js", async (orig) => ({
 }));
 vi.mock("../utils/mailer.js", () => ({
   sendMail: async (m: any) => {
-    mails.push({ to: String(m?.to || ""), subject: String(m?.subject || ""), html: String(m?.html || "") });
+    mails.push({ to: String(m?.to || ""), subject: String(m?.subject || ""), html: String(m?.html || ""), replyTo: m?.replyTo });
     return { messageId: "test" };
   },
 }));
@@ -264,3 +264,38 @@ describe("customer-side responses and emails never name staff", () => {
     expect(rec).toMatchObject({ actorName: "Neel Bhatia", actorKind: "staff" });
   });
 });
+
+describe("Booking History and the booking-processed email name people (items 3, 9, 13)", () => {
+  it("history rows carry requester and approver names for staff and customers — never ids", async () => {
+    const id = await submitAndApprove();
+    expect((await as(request(app).put(`/api/approvals/admin/${id}/start-booking`), NEEL).send({})).status).toBe(200);
+    expect((await as(request(app).put(`/api/approvals/admin/${id}/done`), NEEL).send({ comment: "Ticketed" })).status).toBe(200);
+
+    for (const [path, who] of [
+      ["/api/booking-history/history", NEEL],
+      ["/api/booking-history/admin/history", NEEL],
+      ["/api/booking-history/history", ASHA],
+    ] as const) {
+      const res = await as(request(app).get(path), who);
+      expect(res.status, path).toBe(200);
+      const row = res.body.rows.find((r: any) => String(r._id) === id);
+      expect([row.requesterName, row.approverName], `${path} (${who.first})`).toEqual(["Asha Rao", "Meera Iyer"]);
+      for (const v of [row.requesterName, row.approverName, row.customerName]) expect(String(v || "")).not.toMatch(HEX);
+    }
+  });
+
+  it("the booking-processed email names the requester and replies to the desk mailbox, not the staff member", async () => {
+    const id = await submitAndApprove();
+    expect((await as(request(app).put(`/api/approvals/admin/${id}/start-booking`), NEEL).send({})).status).toBe(200);
+    mails.length = 0;
+    expect((await as(request(app).put(`/api/approvals/admin/${id}/done`), NEEL).send({ comment: "Ticketed" })).status).toBe(200);
+
+    const processed = mails.find((m) => /Processed/i.test(m.subject));
+    expect(processed).toBeTruthy();
+    expect(processed!.replyTo).toBe("ops@plumtrips.com");
+    expect(processed!.html).toMatch(/Requester:<\/b>\s*Asha Rao/);
+    expect(processed!.html).not.toMatch(HEX);
+    for (const s of STAFF_STRINGS) expect(processed!.html, `email leaks "${s}"`).not.toContain(s);
+  });
+});
+

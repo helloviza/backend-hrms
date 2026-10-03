@@ -7,6 +7,7 @@ import SBTConfig from "../models/SBTConfig.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 import { invalidateMarginCache, DEFAULT_MARGINS, type MarginConfig } from "../utils/margin.js";
+import { userNames, nameOrUnknown } from "../services/actorNames.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
@@ -182,12 +183,20 @@ router.get("/margins", async (_req: any, res: any) => {
   try {
     const doc = await SBTConfig.findOne({ key: "margins" }).lean();
     const value = (doc?.value as MarginConfig) ?? DEFAULT_MARGINS;
-    res.json({ ok: true, margins: value });
+    res.json({ ok: true, margins: await withUpdatedByName(value) });
   } catch (err: any) {
     console.error("[Admin SBT Margins GET]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
+
+/** "Last updated by" as a profile name (services/actorNames.ts), never the stored id. */
+async function withUpdatedByName(value: any) {
+  const by = String(value?.updatedBy || "");
+  if (!by) return value;
+  const names = await userNames([by]);
+  return { ...value, updatedByName: nameOrUnknown(names.get(by)) };
+}
 
 // PUT /api/admin/sbt/margins — upsert margin config
 router.put("/margins", async (req: any, res: any) => {
@@ -215,7 +224,7 @@ router.put("/margins", async (req: any, res: any) => {
     );
 
     invalidateMarginCache();
-    res.json({ ok: true, margins: value });
+    res.json({ ok: true, margins: await withUpdatedByName(value) });
   } catch (err: any) {
     console.error("[Admin SBT Margins PUT]", err.message);
     res.status(500).json({ error: err.message });

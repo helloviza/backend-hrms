@@ -40,6 +40,7 @@ import { buildFlightAutofill } from "../services/flightAutofill.js";
 import { buildHotelAutofill } from "../services/hotelAutofill.js";
 import { bookingTripType, bookingLegRoute, bookingLegDetail } from "../utils/bookingLegs.js";
 import type { VoucherType } from "../types/index.js";
+import { userNames, nameOrUnknown, personName } from "../services/actorNames.js";
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -657,7 +658,8 @@ function bookingToRow(
     fmtDateDMY(b.reqDate),
     paxNames,
     travelerId,
-    b.bookedBy?.email ?? b.bookedBy?.name ?? "",
+    // "Booked By": the profile name (services/actorNames.ts), not the email.
+    b.bookedBy ? nameOrUnknown(personName(b.bookedBy), b.bookedBy.email) : "",
     b.givenBy ?? "",
     b.type ?? "",
     sector,
@@ -937,10 +939,19 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     const accessCtx = bookingAccessContextFromReq(req);
     const seeInternals = canSeeBookingInternals(req);
 
+    // "Created by" as a profile name (never an id; the email only as a hover):
+    // one user lookup for the page (services/actorNames.ts).
+    const creatorNames = await userNames(docs.flatMap((b: any) => [b.createdBy, b.createdByEmail]));
+
     const enriched = docs.map((b: any) => {
       const row = {
         ...b,
         clientName: clientNameMap[b.workspaceId?.toString()] || "",
+        createdByName: nameOrUnknown(
+          creatorNames.get(String(b.createdBy || "")),
+          creatorNames.get(String(b.createdByEmail || "").toLowerCase()),
+          b.createdByEmail,
+        ),
         invoicePendingDays: invoicePendingDays(b),
         // panNo/passportNo masked to last-4 unless the caller is SUPERADMIN —
         // this list is reachable by any manualBookings:READ holder, not just
@@ -991,7 +1002,7 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     const format = req.query.format === "xlsx" ? "xlsx" : "csv";
     const docs = await ManualBooking.find(filter)
       .sort({ createdAt: -1 })
-      .populate("bookedBy", "name email")
+      .populate("bookedBy", "firstName lastName name email")
       .populate("workspaceId", "name companyName")
       .populate("invoiceId", "invoiceNo status invoiceDate")
       .lean();

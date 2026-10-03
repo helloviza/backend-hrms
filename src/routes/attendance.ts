@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
+import { UNKNOWN_USER } from "../services/actorNames.js";
 import requireAuth from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireRoles } from "../middleware/roles.js";
@@ -391,7 +392,7 @@ r.get(
         const userName =
           user?.firstName && user?.lastName
             ? `${user.firstName} ${user.lastName}`
-            : user?.name || user?.email || String(doc.userId);
+            : user?.name || user?.email || UNKNOWN_USER; // never the id
 
         for (const od of doc.odRequests || []) {
           items.push({
@@ -632,7 +633,7 @@ r.get(
         const userName =
           u.firstName && u.lastName
             ? `${u.firstName} ${u.lastName}`
-            : u.name || u.email || uid;
+            : u.name || u.email || UNKNOWN_USER; // never the id
 
         let present = 0;
         let halfDay = 0;
@@ -824,7 +825,7 @@ r.get(
         const uid = String((u as any)._id);
         const userName = (u as any).firstName && (u as any).lastName
           ? `${(u as any).firstName} ${(u as any).lastName}`
-          : (u as any).name || (u as any).email || uid;
+          : (u as any).name || (u as any).email || UNKNOWN_USER; // never the id
 
         let present = 0, halfDay = 0, late = 0, overtime = 0, totalHours = 0;
 

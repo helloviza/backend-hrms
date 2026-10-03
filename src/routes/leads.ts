@@ -1,4 +1,5 @@
 import express from "express";
+import { nameOrUnknown, personName, idsToNamesInText } from "../services/actorNames.js";
 import mongoose from "mongoose";
 import ExcelJS from "exceljs";
 import Lead, { LEAD_STAGES, LEAD_SOURCES, effectiveLeadStatus } from "../models/Lead.js";
@@ -1737,6 +1738,7 @@ router.get("/export/activities", async (req, res) => {
     sheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
     sheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF00477F" } };
 
+    const namedNote = await idsToNamesInText((activities as any[]).map((a) => a.note));
     for (const activity of activities as any[]) {
       const lead = leadMap.get(activity.leadId?.toString());
       sheet.addRow({
@@ -1745,7 +1747,7 @@ router.get("/export/activities", async (req, res) => {
         contact: lead?.contactName || "—",
         stage: lead?.stage || "—",
         type: activity.type || "—",
-        note: activity.note || "—",
+        note: activity.note ? namedNote(activity.note) : "—",
         fromStage: activity.fromStage || "—",
         toStage: activity.toStage || "—",
         createdByName: activity.createdByName ||
@@ -1948,7 +1950,11 @@ router.get("/:id", async (req, res) => {
         ? await Opportunity.findById((lead as any).opportunityId).lean()
         : null;
 
-    return res.json({ lead, activities, ...(opportunity ? { opportunity } : {}) });
+    // Older assignment notes stored a user id where the name was missing.
+    const named = await idsToNamesInText((activities as any[]).map((a) => a.note));
+    const shownActivities = (activities as any[]).map((a) => (a.note ? { ...a, note: named(a.note) } : a));
+
+    return res.json({ lead, activities: shownActivities, ...(opportunity ? { opportunity } : {}) });
   } catch (err) {
     logger.error("leads GET /:id error", { err });
     return res.status(500).json({ error: "Failed to get lead." });
@@ -2282,7 +2288,7 @@ router.post("/:id/assign", async (req, res) => {
       return res.status(400).json({ error: "Valid userId is required." });
     }
 
-    const rep = (await User.findById(repId).select("name").lean()) as any;
+    const rep = (await User.findById(repId).select("firstName lastName name email").lean()) as any;
     if (!rep) return res.status(404).json({ error: "User not found." });
 
     const lead = await Lead.findById(req.params.id);
@@ -2297,7 +2303,8 @@ router.post("/:id/assign", async (req, res) => {
     await LeadActivity.create({
       leadId: lead._id,
       type: "assignment" as ActivityType,
-      note: `Assigned to ${rep.name || repId}`,
+      // A name, never the id (services/actorNames.ts).
+      note: `Assigned to ${nameOrUnknown(personName(rep), rep.email)}`,
       createdBy: mongoose.isValidObjectId(userId(user))
         ? new mongoose.Types.ObjectId(userId(user))
         : undefined,

@@ -451,6 +451,8 @@ export function buildAdminProcessedEmailHtml(opts: {
   customerName: string;
   ticketId?: string;
   requesterEmail: string;
+  /** The requester's name; shown instead of the email (the email only if there is no name). */
+  requesterName?: string;
   processedByEmail: string;
   processedByName?: string;
   comment?: string;
@@ -458,7 +460,7 @@ export function buildAdminProcessedEmailHtml(opts: {
   attachments?: Array<{ url?: string; filename?: string }>;
 }) {
   const ticketId = escapeHtml(opts.ticketId || "");
-  const requesterEmail = escapeHtml(opts.requesterEmail || "");
+  const requester = escapeHtml(String(opts.requesterName || "").trim() || opts.requesterEmail || "");
   const processedByEmail = escapeHtml(opts.processedByEmail || "");
   const processedByName = escapeHtml(opts.processedByName || "");
 
@@ -495,7 +497,7 @@ export function buildAdminProcessedEmailHtml(opts: {
     ${eCard(`
       ${eLabel("Summary")}
       <div style="font-size:13px;line-height:1.65;color:#334155;">
-        <b style="color:#0f172a;">Requester:</b> ${requesterEmail}<br/>
+        <b style="color:#0f172a;">Requester:</b> ${requester}<br/>
         <b style="color:#0f172a;">Processed by:</b> ${processedByName || processedByEmail}
         ${ticketId ? `<br/><b style="color:#0f172a;">Ticket:</b> ${ticketId}` : ""}
       </div>
