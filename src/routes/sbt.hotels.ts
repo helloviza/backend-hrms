@@ -15,6 +15,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { sendMail } from "../utils/mailer.js";
 import { logTBOCall } from "../utils/tboFileLogger.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { getMarginConfig, applyMargin, applyMarginWithFloor, violatesRspFloor } from "../utils/margin.js";
 import { getTBOToken, logoutTBO } from "../services/tbo.auth.service.js";
@@ -3152,12 +3153,22 @@ router.post("/bookings/refund-orphaned", requireAdmin, async (req: any, res: any
 // ─── 9e. POST /bookings/:id/mark-failed ──────────────────────────────────────
 // ADMIN ONLY — mark a stuck pending booking as failed
 
+// Plumtrips staff (SUPERADMIN, or signed in to HOUSE) fail a customer's stuck
+// booking, which is stored on the customer's workspace — so they find it by id.
+// requireAdmin also admits tenant admins; they stay inside their own workspace.
+const MARK_FAILED_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
+function isPlumtripsStaffCaller(req: any): boolean {
+  return isSuperAdmin(req) || String(req.workspaceId || req.workspaceObjectId || "") === MARK_FAILED_HOUSE_WORKSPACE_ID;
+}
+
 router.post("/bookings/:id/mark-failed", requireAdmin, async (req: any, res: any) => {
   try {
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
-    const doc = await scopedFindById(SBTHotelBooking, req.params.id, req.workspaceObjectId);
+    const doc = isPlumtripsStaffCaller(req)
+      ? await SBTHotelBooking.findById(req.params.id)
+      : await scopedFindById(SBTHotelBooking, req.params.id, req.workspaceObjectId);
     if (!doc) return res.status(404).json({ error: "Booking not found" });
 
     if (doc.bookingId && doc.bookingId.length > 0) {
