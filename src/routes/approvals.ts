@@ -77,6 +77,7 @@ import {
   TravellerError,
 } from "../services/approvalTravellers.js";
 import { checkCartItems, CartItemError } from "../services/approvalCartItems.js";
+import { inboxBucket, requesterProfiles } from "../services/approvalInbox.js";
 
 import {
   buildApproverEmailHtml,
@@ -924,6 +925,53 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
             },
           ],
         };
+
+    // ?view=all — the inbox page's tabs: also the requests waiting on the
+    // requester's reply (same scope as pending) and the ones this approver
+    // decided. Each row carries its tab (_bucket) and the requester's profile
+    // line (_requester: designation / department / cost centre when set).
+    if (String(req.query?.view || "") === "all") {
+      const openStages = { status: "pending", stage: { $in: ["REQUEST_RAISED", "REQUEST_ON_HOLD", "REQUEST_NEEDS_CLARIFICATION"] } };
+      const openQuery = isWLInbox
+        ? { ...openStages, workspaceId: req.workspaceObjectId, ...notOwn }
+        : {
+            $and: [
+              { ...openStages, workspaceId: req.workspaceObjectId, ...notOwn },
+              { $or: [{ managerEmail: exactIRegex(email) }, { "meta.ccLeaders": exactIRegex(email) }] },
+            ],
+          };
+      const [open, decided] = await Promise.all([
+        ApprovalRequest.find(openQuery).sort({ updatedAt: -1, createdAt: -1 }).lean().exec(),
+        ApprovalRequest.find({
+          workspaceId: req.workspaceObjectId,
+          approvedByEmail: exactIRegex(email),
+          status: { $in: ["approved", "declined"] },
+          // A Workspace Leader's own auto-approved request is not an approval.
+          ...notOwn,
+        })
+          .sort({ updatedAt: -1, createdAt: -1 })
+          .limit(200)
+          .lean()
+          .exec(),
+      ]);
+      const seen = new Set<string>();
+      const all = [...open, ...decided].filter((r: any) => {
+        const k = String(r._id);
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      const profiles = await requesterProfiles(req.workspaceObjectId, all);
+      const out = all
+        .map((r: any) => ({ r, bucket: inboxBucket(r, email) }))
+        .filter((x) => x.bucket)
+        .map(({ r, bucket }) => ({
+          ...forViewer(r, req),
+          _bucket: bucket,
+          _requester: profiles.get(String(r.frontlinerId || "")) || undefined,
+        }));
+      return res.json({ rows: out });
+    }
 
     const rows = await ApprovalRequest.find(inboxQuery)
       .sort({ updatedAt: -1, createdAt: -1 })
