@@ -9,6 +9,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import { sanitizeApprovalForViewer, adminQueueAccess, queueCaseScope, hasQueueView } from "./approvals.security.js";
 import { actorNamesOnResponse, userNames, nameOrUnknown } from "../services/actorNames.js";
+import { dateRangeOr400, withDateRange } from "../utils/dateRange.js";
 
 const router = Router();
 // Activity rows name people, never ids; customers see staff as "Plumtrips
@@ -394,7 +395,11 @@ router.get("/admin/history", requireAuth, async (req: Request, res: Response) =>
     .map((s: string) => s.trim())
     .filter(Boolean);
 
-  const rows = await ApprovalRequest.find({ adminState: { $in: states }, ...queueCaseScope(req) } as any)
+  // ?from&to&by — narrows only (utils/dateRange.ts).
+  const range = dateRangeOr400(req, res);
+  if (range === false) return;
+
+  const rows = await ApprovalRequest.find(withDateRange({ adminState: { $in: states }, ...queueCaseScope(req) }, range) as any)
     .sort({ updatedAt: -1 })
     .lean();
 
@@ -449,7 +454,10 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
     .map((s: string) => s.trim())
     .filter(Boolean);
 
-  const base: any = { adminState: { $in: states } };
+  // ?from&to&by — narrows every branch below (utils/dateRange.ts).
+  const range = dateRangeOr400(req, res);
+  if (range === false) return;
+  const base: any = withDateRange({ adminState: { $in: states } }, range);
 
   // Staff (Admin Queue): every tenant, held to their queue scope
   if (queueViewer) {

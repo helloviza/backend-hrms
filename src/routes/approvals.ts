@@ -78,6 +78,7 @@ import {
 } from "../services/approvalTravellers.js";
 import { checkCartItems, CartItemError } from "../services/approvalCartItems.js";
 import { inboxBucket, requesterProfiles } from "../services/approvalInbox.js";
+import { dateRangeOr400, withDateRange } from "../utils/dateRange.js";
 
 import {
   buildApproverEmailHtml,
@@ -865,11 +866,19 @@ router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("A
 
     const sub = String(req.user?.sub || req.user?._id || "");
     const email = normEmail(req.user?.email);
+    // ?from&to&by — narrows only (utils/dateRange.ts).
+    const range = dateRangeOr400(req, res);
+    if (range === false) return;
 
-    const rows = await ApprovalRequest.find({
-      $or: [{ frontlinerId: sub }, { frontlinerEmail: exactIRegex(email) }],
-      workspaceId: req.workspaceObjectId,
-    })
+    const rows = await ApprovalRequest.find(
+      withDateRange(
+        {
+          $or: [{ frontlinerId: sub }, { frontlinerEmail: exactIRegex(email) }],
+          workspaceId: req.workspaceObjectId,
+        },
+        range,
+      ),
+    )
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
@@ -896,6 +905,9 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
     }
 
     const email = normEmail(req.user?.email);
+    // ?from&to&by — narrows every tab (utils/dateRange.ts).
+    const range = dateRangeOr400(req, res);
+    if (range === false) return;
 
     // WORKSPACE_LEADER sees all pending requests in their workspace
     const isWLInbox = (req.user?.roles || [])
@@ -941,14 +953,19 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
             ],
           };
       const [open, decided] = await Promise.all([
-        ApprovalRequest.find(openQuery).sort({ updatedAt: -1, createdAt: -1 }).lean().exec(),
-        ApprovalRequest.find({
-          workspaceId: req.workspaceObjectId,
-          approvedByEmail: exactIRegex(email),
-          status: { $in: ["approved", "declined"] },
-          // A Workspace Leader's own auto-approved request is not an approval.
-          ...notOwn,
-        })
+        ApprovalRequest.find(withDateRange(openQuery, range)).sort({ updatedAt: -1, createdAt: -1 }).lean().exec(),
+        ApprovalRequest.find(
+          withDateRange(
+            {
+              workspaceId: req.workspaceObjectId,
+              approvedByEmail: exactIRegex(email),
+              status: { $in: ["approved", "declined"] },
+              // A Workspace Leader's own auto-approved request is not an approval.
+              ...notOwn,
+            },
+            range,
+          ),
+        )
           .sort({ updatedAt: -1, createdAt: -1 })
           .limit(200)
           .lean()
@@ -973,7 +990,7 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
       return res.json({ rows: out });
     }
 
-    const rows = await ApprovalRequest.find(inboxQuery)
+    const rows = await ApprovalRequest.find(withDateRange(inboxQuery, range))
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
@@ -1297,7 +1314,9 @@ router.get("/admin/pending", requireApprovalsAdminRead, async (req: AnyObj, res,
     const baseFilter = adminQueueFilter("pending");
     const qsWs = String(req.query?.workspaceId || "").trim();
     if (qsWs && mongoose.Types.ObjectId.isValid(qsWs)) (baseFilter as any).workspaceId = new mongoose.Types.ObjectId(qsWs);
-    const scoped = applyLeaderScopeIfNeeded(req, baseFilter);
+    const range = dateRangeOr400(req, res);
+    if (range === false) return;
+    const scoped = applyLeaderScopeIfNeeded(req, withDateRange(baseFilter, range));
     const rows = await ApprovalRequest.find(scoped)
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
@@ -1322,7 +1341,9 @@ router.get("/admin/approved", requireApprovalsAdminRead, async (req: AnyObj, res
 
     }
 
-    const scoped = applyLeaderScopeIfNeeded(req, filter);
+    const range = dateRangeOr400(req, res);
+    if (range === false) return;
+    const scoped = applyLeaderScopeIfNeeded(req, withDateRange(filter, range));
     const rows = await ApprovalRequest.find(scoped)
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
@@ -1341,7 +1362,9 @@ router.get("/admin/done", requireApprovalsAdminRead, async (req: AnyObj, res, ne
     const doneFilter = adminQueueFilter("done");
     const qsWsDone = String(req.query?.workspaceId || "").trim();
     if (qsWsDone && mongoose.Types.ObjectId.isValid(qsWsDone)) (doneFilter as any).workspaceId = new mongoose.Types.ObjectId(qsWsDone);
-    const scoped = applyLeaderScopeIfNeeded(req, doneFilter);
+    const range = dateRangeOr400(req, res);
+    if (range === false) return;
+    const scoped = applyLeaderScopeIfNeeded(req, withDateRange(doneFilter, range));
     const rows = await ApprovalRequest.find(scoped)
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
@@ -1358,7 +1381,9 @@ router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res
     const rejFilter = adminQueueFilter("rejected");
     const qsWsRej = String(req.query?.workspaceId || "").trim();
     if (qsWsRej && mongoose.Types.ObjectId.isValid(qsWsRej)) (rejFilter as any).workspaceId = new mongoose.Types.ObjectId(qsWsRej);
-    const scoped = applyLeaderScopeIfNeeded(req, rejFilter);
+    const range = dateRangeOr400(req, res);
+    if (range === false) return;
+    const scoped = applyLeaderScopeIfNeeded(req, withDateRange(rejFilter, range));
     const rows = await ApprovalRequest.find(scoped)
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
