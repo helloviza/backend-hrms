@@ -13,26 +13,15 @@ import Proposal from "../models/Proposal.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import User from "../models/User.js";
 
-// ✅ reuse existing utilities (same as approvals flow)
-// NOTE: signatures may vary in your codebase; we call as `any` safely.
-import { sendMail as sendMailAny } from "../utils/mailer.js";
 import {
   applyProposalDecision,
   proposalDeciders,
-  decisionLinkUrl,
   workspaceOf,
   activeLeaderEmails,
   setProposalPhaseStage,
   DecisionError,
 } from "../services/approvalDecisions.js";
-import {
-  buildEmailShell,
-  eBtn,
-  escapeHtml as escHtml,
-  eLabel,
-  eCard,
-  eRow,
-} from "./approvals.email.js";
+import { notifySafely } from "../services/approvalEmails/dispatch.js";
 import {
   sanitizeApprovalForViewer,
   frontendBaseUrl as appFrontendBaseUrl,
@@ -42,7 +31,7 @@ import {
   queueCaseScope,
   requestInQueueScope,
 } from "./approvals.security.js";
-import { markRequestDone, notifyRequesterProgress, notifyProposalReady } from "../services/approvalProgress.js";
+import { markRequestDone, notifyRequesterProgress, notifyProposalReady, closedCaseRefusal } from "../services/approvalProgress.js";
 import { actorNamesOnResponse } from "../services/actorNames.js";
 
 type AnyObj = Record<string, any>;
@@ -752,90 +741,6 @@ const requireProposalViewerFromDownloadPath: RequestHandler = async (req: Reques
   }
 };
 
-/* ────────────────────────────────────────────────────────────────
- * Email helpers
- * ──────────────────────────────────────────────────────────────── */
-
-function itemLabel(li: any): string {
-  const origin = String(li?.meta?.origin || li?.from || li?.origin || "").trim();
-  const dest   = String(li?.meta?.destination || li?.to || li?.destination || "").trim();
-  const raw    = String(li?.meta?.tripType || li?.tripType || "").trim();
-  const trip   = raw.toLowerCase() === "oneway" ? "One Way"
-               : raw.toLowerCase() === "roundtrip" ? "Round Trip"
-               : raw || "";
-  if (origin && dest) return `${origin} → ${dest}${trip ? ` (${trip})` : ""}`;
-  return String(li?.description || li?.title || li?.name || li?.category || "Travel Service");
-}
-
-/**
- * `requester` is the person who raised the request (ApprovalRequest frontliner).
- * proposal.requesterName/Email hold whoever created the draft — a staff member —
- * and this email goes to customer approvers, so they are never used here.
- */
-function buildProposalSummaryHtml(p: any, requester: { name: string; email: string }) {
-  const options = ensureArray(p?.options).slice().sort((a: any, b: any) => Number(a?.optionNo || 0) - Number(b?.optionNo || 0));
-
-  const optBlocks = options
-    .map((opt: any) => {
-      const lines = ensureArray(opt?.lineItems);
-
-      const rows = lines
-        .map((li: any) => {
-          // Goes to L2/L0 (customer-side): itinerary only, no unit/line price.
-          const title = itemLabel(li);
-          const qty = Number(li?.qty || 1);
-          return `<tr>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">${title}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${qty}</td>
-          </tr>`;
-        })
-        .join("");
-
-      return `
-        <div style="border:1px solid #eee;border-radius:10px;padding:14px;margin-top:12px;">
-          <div style="font-weight:800;margin-bottom:6px;">
-            Option ${String(opt?.optionNo || "")} — ${String(opt?.title || "Option")}
-          </div>
-
-          <table style="width:100%;border-collapse:collapse;">
-            <thead>
-              <tr>
-                <th style="text-align:left;padding:6px 8px;border-bottom:1px solid #eee;">Item</th>
-                <th style="text-align:right;padding:6px 8px;border-bottom:1px solid #eee;">Qty</th>
-              </tr>
-            </thead>
-            <tbody>${rows || ""}</tbody>
-          </table>
-        </div>
-      `;
-    })
-    .join("");
-
-  const requesterSectionHtml =
-    requester.name || requester.email
-      ? `<div style="margin-bottom:16px;">
-          ${eLabel("Requested By")}
-          ${eCard(`
-            <table cellpadding="0" cellspacing="0" width="100%">
-              ${requester.name ? eRow("Name", escHtml(requester.name)) : ""}
-              ${requester.email ? eRow("Email", escHtml(requester.email)) : ""}
-            </table>
-          `)}
-        </div>`
-      : "";
-
-  return `
-    <div style="font-family:Arial,sans-serif;max-width:720px;">
-      <h2 style="margin:0 0 8px;">Proposal submitted for approval</h2>
-      ${requesterSectionHtml}
-      <div style="color:#666;margin-bottom:10px;">Proposal ID: <b>${String(p?._id || "")}</b></div>
-
-      ${optBlocks || `<div style="color:#666;">No options</div>`}
-    </div>
-  `;
-}
-
-
 function extractRelativeUploadPathFromAttachmentUrl(u: string): string {
   const s = String(u || "").trim();
   if (!s) return "";
@@ -1231,63 +1136,14 @@ router.post("/:id/submit", requireAnyAuth, requireWorkspace, requireStaff, requi
     await doc.save();
     if (doc.requestId) await setProposalPhaseStage(doc.requestId, "PROPOSAL_SUBMITTED");
 
-    const ws = await workspaceOf(ar);
-    const reqCode = getPublicRequestCode(ar);
-    const summaryHtml = buildProposalSummaryHtml(doc, {
-      name: normStr(ar?.frontlinerName),
-      email: normEmail(ar?.frontlinerEmail),
-    });
-
-    try {
-      const sendMail = sendMailAny as any;
-      // No option PDFs: approvers and leaders are customer-side and the PDFs carry prices.
-      for (const to of deciders) {
-        const approveUrl = decisionLinkUrl("proposal", String(doc._id), to, ws, "approve");
-        const declineUrl = decisionLinkUrl("proposal", String(doc._id), to, ws, "decline");
-        const ctas = approveUrl
-          ? `${eBtn("✓ Approve", approveUrl, "#4f46e5", "#ffffff")}
-             ${eBtn("✕ Decline", declineUrl, "#ffffff", "#dc2626", "#fca5a5")}
-             <div style="margin-top:8px;font-size:12px;color:#64748b;">Each button opens a page where you confirm. The link works once.</div>`
-          : eBtn("Open Plumbox to decide", `${appFrontendBaseUrl()}/customer/approvals/proposals`, "#4f46e5", "#ffffff");
-
-        const html = buildEmailShell(
-          `
-          <div style="font-size:12px;color:#64748b;margin-bottom:14px;">
-            Request: <b style="color:#0f172a;">${escHtml(reqCode || String(doc.requestId || ""))}</b>
-          </div>
-          ${summaryHtml}
-          <div style="margin-top:20px;">${ctas}</div>
-          <div style="margin-top:16px;font-size:12px;color:#64748b;line-height:1.55;">
-            The request's approver and every Workspace Leader receive this. The first decision counts;
-            after that the links show who decided.
-          </div>
-        `,
-          {
-            title: "Proposal Approval Needed",
-            subtitle: "Review the proposal and decide",
-            badgeText: "AWAITING APPROVAL",
-            badgeColor: "#f59e0b",
-          }
-        );
-
-        await sendMail({
-          kind: "REQUESTS",
-          to,
-          subject: `Proposal Approval Needed — ${reqCode || "Request"}`,
-          html,
-        });
-      }
-    } catch (e) {
-      // Do not fail submit if SMTP misconfigured.
-      doc.history = ensureArray(doc.history);
-      doc.history.push(pushHistory((req as AuthedReq).user || {}, "EMAIL_SEND_FAILED", String((e as any)?.message || e)));
-      await doc.save();
-    }
+    // Each decider gets their own single-use links (approvalEmails/map.ts:
+    // proposal_submitted); the requester hears it is ready unless they decide it.
+    const sent = await notifySafely("proposal_submitted", { ar, proposal: doc.toObject() });
 
     await notifyProposalReady(ar, doc);
 
     const enriched = await enrichProposalsWithRequestData([doc.toObject()]);
-    return res.json({ ok: true, proposal: enriched[0], emailedTo: deciders });
+    return res.json({ ok: true, proposal: enriched[0], emailedTo: sent?.to ?? [] });
   } catch (err) {
     next(err);
   }
@@ -1632,6 +1488,10 @@ router.post(
       let ar: any = null;
       if (doc.requestId) ar = await ApprovalRequest.findById(doc.requestId);
       if (!ar) return res.status(404).json({ error: "Linked approval request not found" });
+
+      // A case that is already closed is not cancelled (or emailed) again.
+      const closed = closedCaseRefusal(ar);
+      if (closed) return res.status(409).json(closed);
 
       const adminUser: AnyObj = (req as AuthedReq).user || {};
       const adminEmail = normEmail(adminUser.email || "");

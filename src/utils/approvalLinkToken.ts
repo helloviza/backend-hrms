@@ -24,7 +24,12 @@ export type ApprovalLinkPayload = {
   email: string;
 };
 
-const DEFAULT_EXPIRY_HOURS = 72;
+/**
+ * Every decision link is valid for 72 hours (Imran, 2026-10-04) — the workspace
+ * config.tokenExpiryHours (schema default 12h) no longer shortens it. Every
+ * email carrying a link states the expiry.
+ */
+export const APPROVAL_LINK_EXPIRY_HOURS = 72;
 
 export function approvalLinkSecret(): string {
   const jwtSecret = process.env.JWT_SECRET || "";
@@ -47,10 +52,9 @@ export function approvalLinkSecretSource(): "APPROVAL_LINK_SECRET" | "EMAIL_ACTI
   return process.env.NODE_ENV === "production" ? "none" : "dev-derived";
 }
 
-/** Workspace config.tokenExpiryHours when it is a sane number, else 72h. */
-export function approvalLinkExpiryHours(ws: any): number {
-  const h = Number(ws?.config?.tokenExpiryHours);
-  return Number.isFinite(h) && h >= 1 && h <= 24 * 30 ? h : DEFAULT_EXPIRY_HOURS;
+/** Always APPROVAL_LINK_EXPIRY_HOURS; the workspace argument is kept for callers. */
+export function approvalLinkExpiryHours(_ws?: any): number {
+  return APPROVAL_LINK_EXPIRY_HOURS;
 }
 
 /** Returns null when no link secret is configured (production without one). */

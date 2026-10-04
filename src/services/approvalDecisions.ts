@@ -15,29 +15,26 @@
 //     decided.
 //   - a decline needs a reason.
 
-import mongoose from "mongoose";
+//
+// Who hears about each decision is the email map (approvalEmails/map.ts);
+// this file only says WHICH event happened.
+
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import Proposal from "../models/Proposal.js";
-import CustomerWorkspace from "../models/CustomerWorkspace.js";
-import CustomerMember from "../models/CustomerMember.js";
-import User from "../models/User.js";
-import { sendMail } from "../utils/mailer.js";
 import { autoAllocate } from "./travelDesk.js";
-import { signApprovalLink, approvalLinkExpiryHours, type ApprovalLinkKind } from "../utils/approvalLinkToken.js";
-import { frontendBaseUrl, DISABLE_EMAILS, stripPriceText } from "../routes/approvals.security.js";
 import { actorStamp, TRAVEL_DESK_NAME } from "./actorNames.js";
 import {
-  buildRequesterApprovedHtml,
-  buildRequestDeclinedEmailHtml,
-  buildProposalApprovedEmailHtml,
-  buildProposalDeclinedEmailHtml,
-  buildApproverEmailHtml,
-  buildEmailShell,
-  eBtn,
-  eCard,
-  eLabel,
-  escapeHtml,
-} from "../routes/approvals.email.js";
+  workspaceOf,
+  activeLeaderEmails,
+  isUserInactive,
+  requestDeciders,
+  proposalDeciders,
+  proposalOpsEmails,
+} from "./approvalDeciders.js";
+import { notifySafely } from "./approvalEmails/dispatch.js";
+
+export { workspaceOf, activeLeaderEmails, requestDeciders, proposalDeciders, proposalOpsEmails };
+export { decisionLinkUrl } from "./approvalEmails/links.js";
 
 type AnyObj = Record<string, any>;
 
@@ -62,69 +59,6 @@ export const REQUEST_ACTIONABLE_STAGES = ["REQUEST_RAISED", "REQUEST_ON_HOLD", n
 
 /* ───────────────────────── who may decide ───────────────────────── */
 
-export async function workspaceOf(ar: AnyObj): Promise<AnyObj | null> {
-  const id = ar?.workspaceId || ar?.meta?.customerWorkspaceId;
-  if (!id || !mongoose.Types.ObjectId.isValid(String(id))) return null;
-  return (await CustomerWorkspace.findOne({ _id: id }).lean().exec()) as AnyObj | null;
-}
-
-export async function activeLeaderEmails(ws: AnyObj | null, ar?: AnyObj): Promise<string[]> {
-  const customerId = str(ws?.customerId || ar?.customerId);
-  if (!customerId) return [];
-  const rows: any[] = await CustomerMember.find({
-    customerId,
-    role: "WORKSPACE_LEADER",
-    isActive: { $ne: false },
-  })
-    .lean()
-    .exec();
-  return Array.from(new Set(rows.map((r) => norm(r.email)).filter(Boolean)));
-}
-
-async function isUserInactive(email: string): Promise<boolean> {
-  if (!email) return true;
-  const rx = new RegExp(`^${email.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
-  const u: any = await User.findOne({ email: rx }).select("status").lean().exec();
-  return String(u?.status || "").toUpperCase() === "INACTIVE";
-}
-
-/**
- * Who may decide this request now: the assigned approver while still a
- * workspace approver (defaultApproverEmails) or leader, plus every active
- * Workspace Leader. The requester is never on the list.
- */
-export async function requestDeciders(ar: AnyObj): Promise<string[]> {
-  const ws = await workspaceOf(ar);
-  const leaders = await activeLeaderEmails(ws, ar);
-  const approvers: string[] = (Array.isArray(ws?.defaultApproverEmails) ? ws!.defaultApproverEmails : []).map(norm);
-  const manager = norm(ar?.managerEmail);
-  const requester = norm(ar?.frontlinerEmail);
-  const out: string[] = [];
-  if (manager && (!ws || approvers.includes(manager) || leaders.includes(manager))) out.push(manager);
-  for (const l of leaders) if (!out.includes(l)) out.push(l);
-  return out.filter((e) => e && e !== requester);
-}
-
-/**
- * Who may decide this request's proposal: the request's approver OR any
- * active Workspace Leader — whoever acts first. The requester is excluded,
- * except a Workspace Leader requester when nobody else could decide (their
- * own request was auto-approved for the same reason: no one above them).
- */
-export async function proposalDeciders(ar: AnyObj): Promise<string[]> {
-  const ws = await workspaceOf(ar);
-  const leaders = await activeLeaderEmails(ws, ar);
-  const approvers: string[] = (Array.isArray(ws?.defaultApproverEmails) ? ws!.defaultApproverEmails : []).map(norm);
-  const manager = norm(ar?.managerEmail);
-  const requester = norm(ar?.frontlinerEmail);
-  const all: string[] = [];
-  if (manager && (!ws || approvers.includes(manager) || leaders.includes(manager))) all.push(manager);
-  for (const l of leaders) if (!all.includes(l)) all.push(l);
-  const others = all.filter((e) => e && e !== requester);
-  if (others.length) return others;
-  return leaders.includes(requester) ? [requester] : [];
-}
-
 async function assertActorMayDecide(deciders: string[], actor: DecisionActor, requesterEmail: string) {
   const email = norm(actor.email);
   if (email && email === norm(requesterEmail) && !deciders.includes(email)) {
@@ -136,23 +70,6 @@ async function assertActorMayDecide(deciders: string[], actor: DecisionActor, re
   if (await isUserInactive(email)) {
     throw new DecisionError(403, "NOT_AN_APPROVER", "Your account is not active.");
   }
-}
-
-/* ───────────────────────── email links ───────────────────────── */
-
-/** Confirm-page URL for one recipient, or "" when links are not configured. */
-export function decisionLinkUrl(
-  kind: ApprovalLinkKind,
-  id: string,
-  recipient: string,
-  ws: AnyObj | null,
-  intent?: string,
-): string {
-  const token = signApprovalLink({ kind, id, email: recipient }, approvalLinkExpiryHours(ws));
-  if (!token) return "";
-  return `${frontendBaseUrl()}/approval/email?token=${encodeURIComponent(token)}${
-    intent ? `&intent=${encodeURIComponent(intent)}` : ""
-  }`;
 }
 
 /* ───────────────────────── request decision ───────────────────────── */
@@ -260,14 +177,43 @@ export async function applyRequestDecision(opts: {
   }
   await doc.save();
 
-  await notifyRequesterOfRequestDecision(doc, action, name, email, reason);
-
-  // Approved → it is now in the ops queue: Travel Desk auto-allocation (never throws).
+  const ctx = { ar: doc, actorEmail: email, actorName: name, reason };
   if (action === "approved") {
-    const allocated = await autoAllocate(String(doc._id));
+    await Promise.all([notifySafely("request_approved", ctx), notifySafely("request_approved_fyi", ctx)]);
+  } else if (action === "declined") {
+    await Promise.all([notifySafely("request_declined", ctx), notifySafely("request_declined_fyi", ctx)]);
+  } else {
+    await notifySafely("clarification_asked", ctx);
+  }
+
+  // Approved → it is now in the ops queue: Travel Desk auto-allocation, and the desk hears.
+  if (action === "approved") {
+    const allocated = await enterOpsQueue(doc, name);
     if (allocated.assignedTo || allocated.flagged) return (await ApprovalRequest.findById(doc._id).exec()) || doc;
   }
   return doc;
+}
+
+/**
+ * A request has just entered the ops queue (approved, or auto-approved at
+ * submit): Travel Desk auto-allocation (never throws), then one email to the
+ * ops desk — "new case" (saying who it went to), or "no agent available"
+ * when allocation found nobody.
+ */
+export async function enterOpsQueue(ar: AnyObj, approvedByName?: string) {
+  const allocated = await autoAllocate(String(ar._id));
+  try {
+    const fresh: any = (await ApprovalRequest.findById(ar._id).lean().exec()) || ar;
+    await notifySafely(allocated.flagged ? "ops_no_agent" : "ops_new_case", {
+      ar: fresh,
+      actorName: approvedByName,
+      assignedToName: str(fresh?.meta?.adminAssigned?.agentName),
+    });
+  } catch (err: any) {
+    // Never fails the approval that put it in the queue.
+    console.error("[approval-emails] ops desk notice failed", { requestId: String(ar?._id || ""), error: err?.message });
+  }
+  return allocated;
 }
 
 /**
@@ -307,96 +253,20 @@ export async function replyToClarification(opts: {
   });
   await doc.save();
 
-  if (!DISABLE_EMAILS) {
-    const approverEmail = norm(doc.managerEmail);
-    const ws = await workspaceOf(doc);
-    try {
-      await sendMail({
-        kind: "REQUESTS",
-        to: approverEmail,
-        replyTo: email || undefined,
-        subject: `Reply received — Approval Needed — ${doc.customerName || "Workspace"}${doc.ticketId ? ` (${doc.ticketId})` : ""}`,
-        html: buildApproverEmailHtml({
-          requestId: String(doc._id),
-          requesterName: name,
-          requesterEmail: email,
-          customerName: doc.customerName || "Workspace",
-          ticketId: doc.ticketId,
-          items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
-          comments: `Your question: ${question?.text || ""}\nReply${opts.edited ? " (request edited)" : ""}: ${reply}`,
-          approveUrl: decisionLinkUrl("request", String(doc._id), approverEmail, ws, "approve"),
-          declineUrl: decisionLinkUrl("request", String(doc._id), approverEmail, ws, "decline"),
-          clarifyUrl: decisionLinkUrl("request", String(doc._id), approverEmail, ws, "clarify"),
-        }),
-      } as any);
-    } catch {
-      /* non-blocking */
-    }
-  }
+  // The reply goes back to whoever asked (a Workspace Leader may have asked,
+  // not the assigned approver) — while they can still decide.
+  const deciders = await requestDeciders(doc);
+  const askedBy = norm(question?.byEmail);
+  const manager = norm(doc.managerEmail);
+  const asker = deciders.includes(askedBy) ? askedBy : deciders.includes(manager) ? manager : deciders[0] || manager;
+  await notifySafely("clarification_answered", {
+    ar: doc,
+    asker,
+    question: str(question?.text),
+    reply,
+    edited: !!opts.edited,
+  });
   return doc;
-}
-
-async function notifyRequesterOfRequestDecision(
-  doc: AnyObj,
-  action: RequestDecisionAction,
-  approverName: string,
-  approverEmail: string,
-  reason: string,
-) {
-  if (DISABLE_EMAILS) return;
-  const to = norm(doc.frontlinerEmail);
-  if (!to) return;
-  const requesterName = str(doc.frontlinerName) || to.split("@")[0];
-  const loginUrl = `${frontendBaseUrl()}/customer/approvals/mine`;
-  try {
-    if (action === "approved") {
-      await sendMail({
-        kind: "APPROVALS",
-        to,
-        replyTo: approverEmail || undefined,
-        subject: `Approved — moved to Admin Queue — ${doc.customerName || "Workspace"}${doc.ticketId ? ` (${doc.ticketId})` : ""}`,
-        html: buildRequesterApprovedHtml({
-          customerName: doc.customerName || "Workspace",
-          ticketId: doc.ticketId,
-          requesterName,
-          requesterEmail: to,
-          approverName,
-          approverEmail,
-          items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
-        }),
-      } as any);
-    } else if (action === "declined") {
-      await sendMail({
-        kind: "CONFIRMATIONS",
-        to,
-        subject: `Your Travel Request Has Been Declined — ${doc.ticketId || ""}`,
-        html: buildRequestDeclinedEmailHtml({ ticketId: doc.ticketId, requesterName, managerName: approverName, comment: reason, loginUrl }),
-      } as any);
-    } else {
-      await sendMail({
-        kind: "CONFIRMATIONS",
-        to,
-        replyTo: approverEmail || undefined,
-        subject: `Your approver has a question — ${doc.ticketId || "your travel request"}`,
-        html: buildEmailShell(
-          `${eCard(`
-            ${eLabel("Question from your approver")}
-            <div style="font-size:13px;line-height:1.65;color:#334155;">
-              Hi <b style="color:#0f172a;">${escapeHtml(requesterName)}</b>,<br/><br/>
-              <b style="color:#0f172a;">${escapeHtml(approverName)}</b> needs more information before deciding on
-              your travel request${doc.ticketId ? ` <b style="color:#d06549;">(${escapeHtml(doc.ticketId)})</b>` : ""}:
-              <div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;white-space:pre-wrap;">${escapeHtml(reason)}</div>
-            </div>
-          `)}
-          <div style="margin-top:16px;">${eBtn("Reply in My Requests", loginUrl, "#00477f", "#ffffff")}</div>
-          <div style="margin-top:12px;color:#94a3b8;font-size:12px;">You can also edit the request before replying. Your reply goes back to the same approver.</div>`,
-          { title: "Your approver has a question", badgeText: "NEEDS YOUR REPLY", badgeColor: "#f59e0b" },
-        ),
-      } as any);
-    }
-  } catch {
-    /* non-blocking */
-  }
 }
 
 /* ───────────────────────── proposal decision ───────────────────────── */
@@ -404,17 +274,27 @@ async function notifyRequesterOfRequestDecision(
 /** request_changes: back to ops with a note; ops revise and resubmit. */
 export type ProposalDecisionAction = "approve" | "decline" | "request_changes";
 
+/**
+ * Who decided a proposal, as customer-side readers may see it. A decision ops
+ * recorded on the customer's behalf (history RECORDED_*) carries the staff
+ * member's name and email in the decision slot — shown as the Travel Desk.
+ */
 export function proposalDecidedBy(p: AnyObj) {
+  const last = [...(Array.isArray(p?.history) ? p.history : [])]
+    .reverse()
+    .find((h: any) => /^(RECORDED_|EMAIL_)?(APPROVED|DECLINED|CHANGES_REQUESTED)$/.test(str(h?.action)));
+  const recorded = /^RECORDED_/.test(str(last?.action));
+  const who = (byName: any, byEmail: any) =>
+    recorded ? { byName: TRAVEL_DESK_NAME, byEmail: "" } : { byName: str(byName), byEmail: str(byEmail) };
   if (str(p?.status) === "CHANGES_REQUESTED") {
     const c = p?.customer || {};
-    return { status: "CHANGES_REQUESTED", decision: "CHANGES_REQUESTED", byName: str(c.byName), byEmail: str(c.byEmail), at: c.at || null };
+    return { status: "CHANGES_REQUESTED", decision: "CHANGES_REQUESTED", ...who(c.byName, c.byEmail), at: c.at || null };
   }
   const d = p?.approvals?.l2 || {};
   return {
     status: str(p?.status),
     decision: str(d.decision),
-    byName: str(d.byName),
-    byEmail: str(d.byEmail),
+    ...who(d.byName, d.byEmail),
     at: d.at || null,
   };
 }
@@ -504,9 +384,7 @@ export async function applyProposalDecision(opts: {
       throw new DecisionError(409, "ALREADY_DECIDED", "This proposal has already been decided.", { decided: proposalDecidedBy(now || p) });
     }
     await setProposalPhaseStage(ar._id, "PROPOSAL_CHANGES_REQUESTED");
-    await notifyOpsOfProposalOutcome(back, ar, "CHANGES_REQUESTED", name, reason);
-    // A decision recorded by ops is news to the approver and leaders.
-    if (onBehalf) await notifyDecidersOfProposalDecision(ar, back, "CHANGES_REQUESTED", TRAVEL_DESK_NAME, reason);
+    await announceProposalDecision(ar, back, "CHANGES_REQUESTED", { email, name, onBehalf, reason, note });
     return { proposal: back, request: ar };
   }
 
@@ -541,109 +419,44 @@ export async function applyProposalDecision(opts: {
   }
 
   await setProposalPhaseStage(ar._id, action === "approve" ? "PROPOSAL_APPROVED" : "PROPOSAL_DECLINED");
-  await notifyRequesterOfProposalDecision(ar, action);
-  await notifyOpsOfProposalOutcome(updated, ar, decision.decision, name, reason);
-  await notifyDecidersOfProposalDecision(ar, updated, decision.decision as any, onBehalf ? TRAVEL_DESK_NAME : name, reason);
+  await announceProposalDecision(ar, updated, decision.decision as "APPROVED" | "DECLINED", { email, name, onBehalf, reason, note });
   return { proposal: updated, request: ar };
 }
 
-async function notifyRequesterOfProposalDecision(ar: AnyObj, action: ProposalDecisionAction) {
-  if (DISABLE_EMAILS) return;
-  const to = norm(ar.frontlinerEmail);
-  if (!to) return;
-  const requesterName = str(ar.frontlinerName);
-  const loginUrl = `${frontendBaseUrl()}/customer/approvals/mine`;
-  try {
-    await sendMail({
-      kind: "CONFIRMATIONS",
-      to,
-      subject: `Your Travel Proposal Has Been ${action === "approve" ? "Approved" : "Declined"} — ${ar.ticketId || ""}`,
-      html:
-        action === "approve"
-          ? buildProposalApprovedEmailHtml({ requesterName, ticketId: ar.ticketId, loginUrl })
-          : buildProposalDeclinedEmailHtml({ requesterName, ticketId: ar.ticketId, loginUrl }),
-    } as any);
-  } catch {
-    /* non-blocking */
-  }
-}
-
 /**
- * "Ops" for a proposal: the staff who submitted it (latest SUBMITTED entry)
- * and the staff who drafted it. No shared ops mailbox exists in config.
+ * One proposal decision, three audiences (approvalEmails/map.ts):
+ *   - the requester (approved / declined / changes requested);
+ *   - the other deciders, FYI — never the person who decided. Recorded on
+ *     the customer's behalf: shown as the Travel Desk and nobody is skipped;
+ *   - the ops desk, copying the assigned agent and the proposal's staff.
  */
-export function proposalOpsEmails(p: AnyObj): string[] {
-  const hist = Array.isArray(p?.history) ? p.history : [];
-  const submitter = [...hist].reverse().find((h: any) => str(h?.action) === "SUBMITTED");
-  return Array.from(new Set([norm(submitter?.byEmail), norm(p?.requesterEmail)].filter(Boolean)));
-}
-
-async function notifyOpsOfProposalOutcome(p: AnyObj, ar: AnyObj, outcome: string, byName: string, note: string) {
-  if (DISABLE_EMAILS) return;
-  const to = proposalOpsEmails(p);
-  if (!to.length) return;
-  const code = str(ar?.ticketId) || String(ar?._id || "").slice(-6).toUpperCase();
-  const label = outcome === "APPROVED" ? "approved" : outcome === "DECLINED" ? "declined" : "sent back with changes requested";
-  const url = `${frontendBaseUrl()}/admin/proposals/by-request?requestId=${encodeURIComponent(String(ar?._id || ""))}`;
-  try {
-    await sendMail({
-      kind: "REQUESTS",
-      to: to.join(","),
-      subject: `Proposal ${outcome === "CHANGES_REQUESTED" ? "changes requested" : label} — ${code}`,
-      html: buildEmailShell(
-        `${eCard(`
-          ${eLabel(`Proposal v${p?.version ?? ""} ${label}`)}
-          <div style="font-size:13px;line-height:1.65;color:#334155;">
-            Request <b>${escapeHtml(code)}</b> (${escapeHtml(str(ar?.customerName) || "Workspace")}) — proposal ${label}
-            by <b>${escapeHtml(byName)}</b>.
-            ${note ? `<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;white-space:pre-wrap;">${escapeHtml(note)}</div>` : ""}
-          </div>
-        `)}
-        <div style="margin-top:16px;">${eBtn("Open the proposal", url, "#00477f", "#ffffff")}</div>`,
-        { title: `Proposal ${label}`, badgeText: outcome.replace("_", " "), badgeColor: outcome === "APPROVED" ? "#10b981" : outcome === "DECLINED" ? "#dc2626" : "#f59e0b" },
-      ),
-    } as any);
-  } catch {
-    /* non-blocking */
-  }
-}
-
-function proposalCode(ar: AnyObj) {
-  return str(ar?.ticketId) || String(ar?._id || "").slice(-6).toUpperCase();
-}
-
-/** The approver and every Workspace Leader hear the final proposal decision. */
-async function notifyDecidersOfProposalDecision(
+async function announceProposalDecision(
   ar: AnyObj,
   proposal: AnyObj,
   decision: "APPROVED" | "DECLINED" | "CHANGES_REQUESTED",
-  byName: string,
-  reason: string,
+  who: { email: string; name: string; onBehalf: boolean; reason: string; note: string },
 ) {
-  if (DISABLE_EMAILS) return;
-  const to = await proposalDeciders(ar);
-  if (!to.length) return;
-  const verb = decision === "APPROVED" ? "approved" : decision === "DECLINED" ? "declined" : "sent back for changes";
-  try {
-    await sendMail({
-      kind: "APPROVALS",
-      to: to.join(","),
-      subject: `Proposal ${verb} — ${proposalCode(ar)}`,
-      html: buildEmailShell(
-        `${eCard(`
-          ${eLabel(`Proposal ${verb}`)}
-          <div style="font-size:13px;line-height:1.65;color:#334155;">
-            The proposal (v${escapeHtml(String(proposal?.version ?? ""))}) for ${escapeHtml(str(ar?.frontlinerName) || "the requester")}'s
-            request <b>${escapeHtml(proposalCode(ar))}</b> was <b>${verb}</b> by <b>${escapeHtml(byName)}</b>.
-            ${reason ? `<br/><br/><b>Note:</b> ${escapeHtml(stripPriceText(reason))}` : ""}
-            <br/><br/>No action is needed from you.
-          </div>
-        `)}`,
-        { title: `Proposal ${verb}`, badgeText: decision.replace("_", " "), badgeColor: decision === "APPROVED" ? "#10b981" : decision === "DECLINED" ? "#dc2626" : "#f59e0b" },
-      ),
-    } as any);
-  } catch {
-    /* non-blocking */
-  }
+  const customerSide = {
+    ar,
+    proposal,
+    decision,
+    reason: who.reason,
+    actorEmail: who.onBehalf ? "" : who.email,
+    actorName: who.onBehalf ? TRAVEL_DESK_NAME : who.name,
+  };
+  await Promise.all([
+    notifySafely(
+      decision === "APPROVED" ? "proposal_approved" : decision === "DECLINED" ? "proposal_declined" : "proposal_changes_requested",
+      customerSide,
+    ),
+    notifySafely("proposal_decision_fyi", customerSide),
+    notifySafely("ops_proposal_outcome", {
+      ar,
+      proposal,
+      decision,
+      reason: who.onBehalf ? who.note : who.reason,
+      actorEmail: who.email,
+      actorName: who.onBehalf ? `${who.name || who.email} (recorded on the customer's behalf)` : who.name,
+    }),
+  ]);
 }
-

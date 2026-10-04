@@ -167,7 +167,7 @@ describe("Flow 3 (APPROVAL_DIRECT) requires approver approval", () => {
     const after: any = await col("approvalrequests").findOne({ _id: doc._id });
     expect([after.status, after.stage, after.adminState]).toEqual(["approved", "REQUEST_APPROVED", "pending"]);
     expect(after.approvedByEmail).toBe(APPROVER);
-    expect(sent.some((m) => m.to === REQUESTER.email && /^Approved — moved to Admin Queue/.test(m.subject))).toBe(true);
+    expect(sent.some((m) => m.to === REQUESTER.email && /^Request approved — /.test(m.subject))).toBe(true);
 
     const queue = await as(request(app).get("/api/approvals/admin/pending"), { email: "ops@plumtrips.test", roles: ["SUPERADMIN"] }, WS_DIRECT);
     expect(queue.status).toBe(200);

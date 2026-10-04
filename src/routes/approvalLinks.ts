@@ -43,9 +43,18 @@ function travellerNames(cartItems: any[]): string[] {
     .filter(Boolean);
 }
 
+/** The public page names who decided — never their email (no contact details here). */
+function publicDecided(d: AnyObj | undefined) {
+  if (!d) return undefined;
+  const { byEmail: _drop, ...rest } = d;
+  return rest;
+}
+
 function sendError(res: any, e: any) {
   if (e instanceof ApprovalLinkError || e instanceof DecisionError) {
-    return res.status(e.status).json({ ok: false, error: e.message, code: e.code, ...((e as any).extra || {}) });
+    const extra: AnyObj = { ...((e as any).extra || {}) };
+    if (extra.decided) extra.decided = publicDecided(extra.decided);
+    return res.status(e.status).json({ ok: false, error: e.message, code: e.code, ...extra });
   }
   return res.status(500).json({ ok: false, error: "Something went wrong. Open Plumbox to decide." });
 }
@@ -70,7 +79,7 @@ async function requestView(ar: AnyObj, email: string) {
     travellers: travellerNames(ar.cartItems || []),
     comments: stripPriceText(str(ar.comments)) || undefined,
     state: actionable ? (allowed ? "OPEN" : "NOT_ALLOWED") : "DECIDED",
-    decided: actionable ? undefined : decidedBy(ar),
+    decided: actionable ? undefined : publicDecided(decidedBy(ar)),
     actions: actionable && allowed ? ["approve", "decline", "clarify"] : [],
     clarifications: (Array.isArray(ar.clarifications) ? ar.clarifications : []).map((c: any) => ({
       kind: c.kind,
@@ -105,7 +114,7 @@ async function proposalView(p: AnyObj, email: string) {
     version: p.version,
     options,
     state: open ? (allowed ? "OPEN" : "NOT_ALLOWED") : "DECIDED",
-    decided: open ? undefined : proposalDecidedBy(p),
+    decided: open ? undefined : publicDecided(proposalDecidedBy(p)),
     actions: open && allowed ? ["approve", "decline", "request_changes"] : [],
   };
 }

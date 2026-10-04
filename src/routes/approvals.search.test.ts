@@ -826,11 +826,13 @@ describe("the picked option in emails, and no snapshot for a Workspace Leader", 
     expect(approver!.html).toMatch(/Economy · 15 Kg \+ 7 Kg cabin · Saver · Refundable/);
     expect(approver!.html).toContain("Non-refundable");
 
-    const fyi = mails.find((m) => /^FYI/.test(m.subject));
-    expect(fyi, mails.map((m) => m.subject).join(" | ")).toBeTruthy();
-    expect(fyi!.html).toContain("Selected: 6E 5321 BLR 06:10 → BOM 07:55");
+    // Workspace Leaders may decide too: they get the same approval email, with their own links.
+    const leader = mails.find((m) => String(m.to).includes(`${U.wl}@cust.test`) && /^Approval Needed/.test(m.subject));
+    expect(leader, mails.map((m) => m.subject).join(" | ")).toBeTruthy();
+    expect(leader!.html).toContain("IndiGo 6E 5321");
+    expect(leader!.html).toMatch(/BLR 06:10 → BOM 07:55 · 12 Mar 2027/);
 
-    for (const m of [approver!, fyi!]) {
+    for (const m of [approver!, leader!]) {
       expect(m.html).not.toMatch(/₹|&#8377;|\bINR\b|\bRs\.?\s*\d/);
       expect(m.html).not.toMatch(/5432|5280|4632|Fare|fare/);
     }

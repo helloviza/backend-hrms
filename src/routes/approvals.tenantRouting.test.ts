@@ -190,7 +190,8 @@ describe("POST /requests — the customer comes from the login", () => {
     const rs = await as(request(app).put(`/api/approvals/requests/${id}/resubmit`), owner).send({ customerId: "B1", cartItems: [flightItem] });
     expect(rs.status).toBe(200);
     expectFiledUnderA(await reqDoc(id));
-    expect(sent.map((m) => m.to)).toEqual(["approver@a.test"]);
+    // A resubmit goes to everyone who may decide A's request now — never B's people.
+    expect(sent.map((m) => m.to).sort()).toEqual(["approver@a.test", "leader@a.test"]);
   });
 });
 

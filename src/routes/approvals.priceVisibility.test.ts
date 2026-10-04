@@ -261,6 +261,7 @@ vi.mock("../models/ApprovalRequest.js", () => ({
   default: {
     find: () => chain(() => [currentDoc()]),
     findOne: () => chain(() => currentDoc()),
+    findById: () => chain(() => currentDoc()),
     findOneAndUpdate: () => chain(() => currentDoc()),
     updateOne: () => chain(() => ({ acknowledged: true })),
     create: async (data: any) => {
@@ -274,6 +275,8 @@ vi.mock("../models/User.js", () => ({
   default: {
     findOne: () => chain(() => ({ email: "mgr@cust.com", name: "Manoj Manager" })),
     findById: () => chain(() => null),
+    // Deactivated-recipient check (approvalDeciders.inactiveEmails): nobody is inactive.
+    find: () => chain(() => []),
   },
 }));
 vi.mock("../models/CustomerMember.js", () => ({
@@ -312,6 +315,15 @@ vi.mock("../models/TravelBooking.js", () => ({
 vi.mock("../utils/mailer.js", () => ({
   sendMail: async (m: any) => {
     state.mails.push({ to: m.to, subject: m.subject, html: String(m.html || ""), attachments: m.attachments });
+  },
+}));
+// The email outbox (services/emailOutbox.ts) records each send; in memory here.
+vi.mock("../models/EmailOutbox.js", () => ({
+  default: {
+    create: async (d: any) => ({ ...d, _id: "64b0000000000000000000e1" }),
+    updateOne: () => chain(() => ({ acknowledged: true })),
+    find: () => chain(() => []),
+    findOneAndUpdate: () => chain(() => null),
   },
 }));
 vi.mock("../models/ApprovalLinkUse.js", () => ({
@@ -576,12 +588,12 @@ describe("staff callers still get prices", () => {
 describe("approval emails carry no price", () => {
   const PRICE_IN_EMAIL = /Fare<|>Fare|Booking Amount|₹|&#8377;|\bINR\b\s*\d/;
 
-  it("approver email + leader FYI on submit", async () => {
+  it("approver + leader approval emails and the requester's confirmation on submit", async () => {
     await request(app)
       .post("/api/approvals/requests")
       .set(as(REQUESTER))
       .send({ customerId: "C1", cartItems: baseFixture().cartItems, comments: baseFixture().comments });
-    expect(state.mails.map((m) => m.to).sort()).toEqual(["mgr@cust.com", "wl@cust.com"]);
+    expect(state.mails.map((m) => m.to).sort()).toEqual(["mgr@cust.com", "req@cust.com", "wl@cust.com"]);
     for (const m of state.mails) {
       expect(m.html, m.subject).not.toMatch(PRICE_IN_EMAIL);
       expect(m.html).toContain("DEL");

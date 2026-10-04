@@ -1330,6 +1330,14 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
         const { startSbtCheckoutSweepCron } = await import("./jobs/sbt-checkout-sweep.js");
         startSbtCheckoutSweepCron();
 
+        // Approval flows: reminders for undecided requests/proposals (every 15 min)
+        const { startApprovalRemindersCron } = await import("./jobs/approval-reminders.js");
+        startApprovalRemindersCron();
+
+        // Approval-flow email outbox: retry failed sends, alert the desk on a permanent failure (every minute)
+        const { startEmailOutboxWorker } = await import("./jobs/email-outbox-worker.js");
+        startEmailOutboxWorker();
+
         // TICKETING: Auto-ingest Gmail → tickets (every 60s)
         const { startTicketIngestionCron } = await import("./jobs/ticketIngestionCron.js");
         startTicketIngestionCron();

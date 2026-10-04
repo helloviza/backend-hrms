@@ -266,7 +266,8 @@ describe("manual travellers — any role, on this request only", () => {
     const counts = async () => {
       const out: Record<string, number> = {};
       for (const c of await mongoose.connection.db!.listCollections().toArray()) {
-        if (c.name !== "approvalrequests") out[c.name] = await col(c.name).countDocuments();
+        // emailoutboxes: the sent-email log (services/emailOutbox.ts), not a people store.
+        if (c.name !== "approvalrequests" && c.name !== "emailoutboxes") out[c.name] = await col(c.name).countDocuments();
       }
       return out;
     };

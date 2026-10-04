@@ -16,13 +16,14 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import Proposal from "../models/Proposal.js";
 
-import { sendMail } from "../utils/mailer.js";
 import {
   applyRequestDecision,
   replyToClarification,
-  decisionLinkUrl,
+  enterOpsQueue,
   DecisionError,
 } from "../services/approvalDecisions.js";
+import { notifySafely } from "../services/approvalEmails/dispatch.js";
+import { listEmailFailures } from "../services/emailOutbox.js";
 
 import { scopedFindById } from "../middleware/scopedFindById.js";
 
@@ -62,9 +63,9 @@ import {
 import approvalSearchRouter from "./approvals.search.js";
 import { actorNamesOnResponse, actorStamp, SYSTEM_ACTOR } from "../services/actorNames.js";
 import travelDeskRouter from "./approvals.travelDesk.js";
-import { assignCase, autoAllocate, TravelDeskError, flagNeedsReassignment } from "../services/travelDesk.js";
+import { assignCase, TravelDeskError, flagNeedsReassignment } from "../services/travelDesk.js";
 import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
-import { markRequestDone, notifyRequesterProgress, latestProposalsFor } from "../services/approvalProgress.js";
+import { markRequestDone, notifyRequesterProgress, latestProposalsFor, closedCaseRefusal } from "../services/approvalProgress.js";
 import {
   prepareCartSelections,
   writeSelectionSnapshots,
@@ -81,13 +82,6 @@ import { inboxBucket, requesterProfiles } from "../services/approvalInbox.js";
 import { dateRangeOr400, withDateRange } from "../utils/dateRange.js";
 
 import {
-  buildApproverEmailHtml,
-  buildLeaderFyiHtml,
-  buildEmailShell,
-  eLabel,
-  eCard,
-  eRow,
-  eBtn,
   sumBookingAmount,
   pickTripSummary,
   getItemBookingAmount,
@@ -680,109 +674,27 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       });
     }
 
-    // Auto-approved (Workspace Leader is the requester) → straight into the
-    // ops queue: Travel Desk auto-allocation (never throws).
-    if (isSelfApproval) await autoAllocate(String(doc._id));
-
-    // Email decision links: no login, single-use, bound to the approver.
-    const approveUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "approve");
-    const declineUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "decline");
-    const clarifyUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "clarify");
-
-    const subject = `Approval Needed — ${customerName}${doc.ticketId ? ` (${doc.ticketId})` : ""}`;
-
-    try {
-      if (!DISABLE_EMAILS) {
-        if (!isSelfApproval) {
-          await sendMail({
-            kind: "REQUESTS",
-            to: approverEmail,
-            subject,
-            replyTo: email || undefined,
-            html: buildApproverEmailHtml({
-              requestId: String(doc._id),
-              requesterName: requesterDisplayName,
-              requesterEmail: email,
-              customerName,
-              ticketId: doc.ticketId,
-              items: cartItems,
-              comments: doc.comments,
-              approveUrl,
-              declineUrl,
-              clarifyUrl,
-            }),
-          });
-        } else {
-          const frontendUrl = (process.env.FRONTEND_ORIGIN || "https://plumbox.plumtrips.com").replace(/\/+$/, "");
-          const html = buildEmailShell(
-            `${eLabel("Request Auto-Approved")}
-             ${eCard(`
-               <table cellpadding="0" cellspacing="0" width="100%">
-                 ${eRow("Request ID", escapeHtml(doc.ticketId || doc._id.toString()))}
-                 ${eRow("Status", "Approved — Sent to Admin Queue")}
-                 ${eRow("Travel Flow", escapeHtml(doc.meta?.travelFlow || "—"))}
-               </table>
-             `)}
-             ${eBtn(
-               "View My Requests",
-               frontendUrl + "/approvals/requests/mine",
-               "#10b981",
-               "#ffffff"
-             )}`,
-            {
-              title: "Your Request Has Been Approved",
-              subtitle: "Your request has been auto-approved and sent to the admin queue for processing.",
-              badgeText: "APPROVED",
-              badgeColor: "#10b981",
-            }
-          );
-          sendMail({
-            kind: "APPROVALS",
-            to: normEmail(email),
-            subject: `Request Approved — ${doc.ticketId || "New Request"}`,
-            html,
-          }).catch(() => {});
-        }
-
-        const leaderTargets = leaderEmails
-          .map(normEmail)
-          .filter((x) => x && x !== normEmail(approverEmail) && x !== email);
-
-        for (const leaderEmail of leaderTargets) {
-          await sendMail({
-            kind: "REQUESTS",
-            to: leaderEmail,
-            subject: `FYI — New Request Submitted — ${customerName}`,
-            replyTo: email || undefined,
-            html: buildLeaderFyiHtml({
-              requesterName: requesterDisplayName,
-              requesterEmail: email,
-              customerName,
-              ticketId: doc.ticketId,
-              items: cartItems,
-              comments: doc.comments,
-            }),
-          });
-        }
-      } else {
-        doc.history = Array.isArray(doc.history) ? doc.history : [];
-        doc.history.push({
-          action: "email_skipped",
-          at: new Date(),
-          by: sub || "unknown",
-          comment: "DISABLE_EMAILS enabled — skipped sending emails.",
-          userEmail: email,
-          userName: name,
-        });
-        await doc.save();
-      }
-    } catch (_e) {
+    // Who hears about a submit is the email map (services/approvalEmails/map.ts).
+    if (isSelfApproval) {
+      // Auto-approved (Workspace Leader is the requester): the requester is
+      // told, and it goes straight into the ops queue (auto-allocation + the
+      // desk hears). Leaders get no "approval needed" — nothing to decide.
+      await notifySafely("request_auto_approved", { ar: doc });
+      await enterOpsQueue(doc, managerName);
+    } else {
+      await Promise.all([
+        notifySafely("request_submitted_approver", { ar: doc }),
+        notifySafely("request_submitted_leaders", { ar: doc }),
+        notifySafely("request_submitted_confirmation", { ar: doc }),
+      ]);
+    }
+    if (DISABLE_EMAILS) {
       doc.history = Array.isArray(doc.history) ? doc.history : [];
       doc.history.push({
-        action: "email_failed",
+        action: "email_skipped",
         at: new Date(),
         by: sub || "unknown",
-        comment: "Email send failed (non-blocking).",
+        comment: "DISABLE_EMAILS enabled — skipped sending emails.",
         userEmail: email,
         userName: name,
       });
@@ -1179,59 +1091,39 @@ router.put("/requests/:id/action", requireAuth, requireWorkspace, requireTravelM
         return res.status(400).json({ error: "Approver email missing on this request" });
       }
 
-      const approveUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "approve");
-      const declineUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "decline");
-      const clarifyUrl = decisionLinkUrl("request", String(doc._id), approverEmail, req.workspace || null, "clarify");
-
-      const subject = `Approval Needed — ${doc.customerName || "Workspace"}${
-        doc.ticketId ? ` (${doc.ticketId})` : ""
-      }`;
-
-      try {
-        if (!DISABLE_EMAILS) {
-          await sendMail({
-            kind: "REQUESTS",
-            to: approverEmail,
-            subject,
-            replyTo: normEmail(doc.frontlinerEmail) || undefined,
-            html: buildApproverEmailHtml({
-              requestId: String(doc._id),
-              requesterName: frontlinerDisplayName,
-              requesterEmail: normEmail(doc.frontlinerEmail),
-              customerName: doc.customerName || "Workspace",
-              ticketId: doc.ticketId,
-              items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
-              comments: doc.comments,
-              approveUrl,
-              declineUrl,
-              clarifyUrl,
-            }),
+      // Everyone who may decide NOW (recomputed — not the stored approver alone).
+      let sent: Awaited<ReturnType<typeof notifySafely>> = null;
+      if (!DISABLE_EMAILS) {
+        sent = await notifySafely("request_resent", { ar: doc });
+        if (!sent?.to.length) {
+          return res.status(400).json({
+            error: "Nobody can approve this request right now (the approver and Workspace Leaders are inactive or missing).",
+            code: "NO_ACTIVE_APPROVER",
           });
         }
-
-        doc.history = Array.isArray(doc.history) ? doc.history : [];
-        doc.history.push({
-          action: "resend_email",
-          at: new Date(),
-          by: sub || "unknown",
-          comment: comment || "Approval email resent by requester",
-          userEmail: email,
-          userName,
-        });
-
-        doc.meta = doc.meta || {};
-        doc.meta.lastResentAt = new Date().toISOString();
-        doc.meta.resendCount = Number(doc.meta.resendCount || 0) + 1;
-
-        await doc.save();
-        return res.json({ ok: true, request: forViewer(doc, req), message: "Resent approval email" });
-      } catch (e) {
-        if (process.env.NODE_ENV !== "production") {
-          // eslint-disable-next-line no-console
-          console.error("[approvals] resend_email failed", e);
-        }
-        return res.status(500).json({ error: "Failed to resend approval email" });
       }
+
+      doc.history = Array.isArray(doc.history) ? doc.history : [];
+      doc.history.push({
+        action: "resend_email",
+        at: new Date(),
+        by: sub || "unknown",
+        comment: comment || "Approval email resent by requester",
+        userEmail: email,
+        userName,
+      });
+
+      doc.meta = doc.meta || {};
+      doc.meta.lastResentAt = new Date().toISOString();
+      doc.meta.resendCount = Number(doc.meta.resendCount || 0) + 1;
+      doc.markModified("meta");
+
+      await doc.save();
+      return res.json({
+        ok: true,
+        request: forViewer(doc, req),
+        message: sent && !sent.delivered ? "Resend queued — the email will be retried" : "Resent approval email",
+      });
     }
 
     // Approver decision — the same service the email links use: who may
@@ -1888,6 +1780,22 @@ router.put("/admin/:id/on-hold", requireApprovalsAdminWrite, async (req: AnyObj,
 });
 
 /* ────────────────────────────────────────────────────────────────
+ * Admin: email failures — approval emails that failed every retry
+ * GET /admin/email-failures (staff with queue access)
+ * ──────────────────────────────────────────────────────────────── */
+
+router.get("/admin/email-failures", requireApprovalsAdminRead, async (req: AnyObj, res, next) => {
+  try {
+    setNoStore(res);
+    if (!hasQueueView(req)) return res.status(403).json({ error: "Not allowed" });
+    const limit = Number(req.query?.limit) || 100;
+    res.json({ ok: true, failures: await listEmailFailures(limit) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
  * Admin: cancel
  * PUT /admin/:id/cancel
  * ──────────────────────────────────────────────────────────────── */
@@ -1901,6 +1809,10 @@ router.put("/admin/:id/cancel", requireApprovalsAdminWrite, async (req: AnyObj, 
 
     const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, id));
     if (!doc) return res.status(404).json({ error: "Request not found" });
+
+    // A case that is already closed is not cancelled (or emailed) again.
+    const closed = closedCaseRefusal(doc);
+    if (closed) return res.status(409).json(closed);
 
     doc.adminState = "cancelled";
     doc.stage = "BOOKING_CANCELLED";
@@ -2076,36 +1988,8 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
       });
     }
 
-    // Re-send approval email to L2
-    try {
-      if (!DISABLE_EMAILS) {
-        const requesterDisplayName = normStr(doc.frontlinerName || email.split("@")[0] || "User");
-        const items = Array.isArray(updated.cartItems) ? updated.cartItems : Array.isArray(doc.cartItems) ? doc.cartItems : [];
-
-        const approveUrl = decisionLinkUrl("request", id, approverEmail, req.workspace || null, "approve");
-        const declineUrl = decisionLinkUrl("request", id, approverEmail, req.workspace || null, "decline");
-        const clarifyUrl = decisionLinkUrl("request", id, approverEmail, req.workspace || null, "clarify");
-
-        await sendMail({
-          kind: "REQUESTS",
-          to: approverEmail,
-          subject: `Approval Needed (Resubmit) — ${doc.customerName || "Workspace"}${doc.ticketId ? ` (${doc.ticketId})` : ""}`,
-          replyTo: email || undefined,
-          html: buildApproverEmailHtml({
-            requestId: id,
-            requesterName: requesterDisplayName,
-            requesterEmail: email,
-            customerName: doc.customerName || "Workspace",
-            ticketId: updated.ticketId,
-            items,
-            comments: updated.comments,
-            approveUrl,
-            declineUrl,
-            clarifyUrl,
-          }),
-        });
-      }
-    } catch { /* non-blocking */ }
+    // Back to everyone who may decide now (recomputed, not the stored approver alone).
+    await notifySafely("request_resubmitted", { ar: updated });
 
     res.json({ ok: true, request: forViewer(updated, req), message: "Resubmitted" });
   } catch (err) {

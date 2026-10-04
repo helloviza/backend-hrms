@@ -78,6 +78,8 @@ const CUSTOMER_ID = "F1";
 const APPROVER = "approver@cust.test";
 const LEADER = "leader@cust.test";
 const REQUESTER = "requestor@cust.test";
+/** The ops desk mailbox (DESK_EMAIL default). */
+const DESK = "ops@plumtrips.com";
 
 type Who = { email: string; roles?: string[]; sub?: string; ws?: any };
 const R: Who = { email: REQUESTER };
@@ -405,7 +407,8 @@ describe("Phase B — request changes at the proposal step", () => {
     expect(back.status).toBe(200);
     expect((await propDoc(pid)).status).toBe("CHANGES_REQUESTED");
     expect((await reqDoc(rid)).stage).toBe("PROPOSAL_CHANGES_REQUESTED");
-    const opsMail = sent.find((m) => m.to.includes(OPS.email) && /changes requested/i.test(m.subject))!;
+    // The ops desk is told, copying the staff who drafted/submitted the proposal.
+    const opsMail = sent.find((m) => m.to === DESK && (m.cc || []).includes(OPS.email) && /changes requested/i.test(m.subject))!;
     expect(opsMail.html).toContain("Need a later flight");
 
     // The approver's decision now comes too late, and says who sent it back.
@@ -448,9 +451,10 @@ describe("Phase C — notifications and the one 'booking done' path", () => {
 
     sent.length = 0;
     expect((await as(request(app).post(`/api/proposals/${pid}/decide`), A).send({ decision: "APPROVED" })).status).toBe(200);
+    // The other deciders hear — not the approver who just decided.
     const fyi = sent.find((m) => /^Proposal approved/.test(m.subject) && m.to.includes(LEADER))!;
-    expect(fyi.to.split(",").sort()).toEqual([APPROVER, LEADER].sort());
-    expect(sent.some((m) => m.to.includes(OPS.email) && /Proposal approved/.test(m.subject))).toBe(true);
+    expect(fyi.to.split(",").sort()).toEqual([LEADER]);
+    expect(sent.some((m) => m.to === DESK && (m.cc || []).includes(OPS.email) && /Proposal approved/.test(m.subject))).toBe(true);
     expect(sent.some((m) => m.to === REQUESTER && /Proposal Has Been Approved/.test(m.subject))).toBe(true);
 
     // Done before start is refused on the proposal page too (one path, one rule).

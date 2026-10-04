@@ -272,6 +272,10 @@ const proposalSchema = new Schema(
 
     history: { type: [historySchema], required: true, default: [] },
 
+    // Decision reminders sent for the current submit round
+    // (services/approvalReminders.ts): { key: submit time ISO, count, lastAt }.
+    reminder: { type: Schema.Types.Mixed, default: null },
+
     createdBy: { type: Schema.Types.ObjectId, ref: "User" },
     requesterEmail: { type: String, default: "" },
     requesterName: { type: String, default: "" },

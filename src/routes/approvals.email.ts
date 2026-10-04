@@ -393,6 +393,8 @@ export function buildRequesterApprovedHtml(opts: {
   approverName?: string;
   approverEmail?: string;
   items: any[];
+  /** "APPROVAL_DIRECT" (Flow 3) books straight away; otherwise a proposal comes first. */
+  travelFlow?: string;
 }) {
   const accent = "#d06549";
   const ink = "#0f172a";
@@ -417,7 +419,7 @@ export function buildRequesterApprovedHtml(opts: {
       PlumTrips • Approval Update
     </div>
     <div style="margin-top:8px;font-size:20px;font-weight:900;color:${ink};">
-      Approved ✅ (Moved to Admin Queue)
+      Approved ✅
     </div>
 
     <div style="margin-top:10px;padding:12px 14px;border-radius:14px;background:#f8fafc;border:1px solid #e8eef6;">
@@ -428,7 +430,7 @@ export function buildRequesterApprovedHtml(opts: {
         <b style="color:${ink};">Trip:</b> ${escapeHtml(seg)}<br/>
         <b style="color:${ink};">Requested by:</b> ${requesterName}<br/>
         ${
-          approverEmail
+          approverName || approverEmail
             ? `<b style="color:${ink};">Approved by:</b> ${approverName || approverEmail} <br/>`
             : ""
         }
@@ -436,7 +438,11 @@ export function buildRequesterApprovedHtml(opts: {
     </div>
 
     <div style="margin-top:14px;color:${slate};font-size:13px;line-height:1.6;">
-      Admin team will now process this request. Once processed, you will receive a confirmation email with itinerary details and the attached PDF (if uploaded).
+      ${
+        opts.travelFlow === "APPROVAL_DIRECT"
+          ? "The Plumtrips Travel Desk will now book it. Once it is booked, you will receive a confirmation email with your itinerary and documents."
+          : "The Plumtrips Travel Desk will now prepare a proposal, which goes to your approver for a final decision. You will hear from us at each step."
+      }
     </div>
 
     <div style="margin-top:16px;color:#94a3b8;font-size:12px;line-height:1.6;">
@@ -926,6 +932,12 @@ export function buildApproverEmailHtml(opts: {
   /** "Ask a question" — sends the request back to the requester. */
   clarifyUrl?: string;
   inboxUrl?: string;
+  /** The request code people use (ticket id / REQ-xxxxxx) — shown instead of the database id. */
+  code?: string;
+  /** One line above the itinerary, e.g. "Reminder 2 of 3" or "The requester replied". Plain text. */
+  notice?: string;
+  /** When the decision links stop working (plain text). */
+  expiresText?: string;
 }) {
   const brand = "#00477f";
   const accent = "#d06549";
@@ -937,7 +949,9 @@ export function buildApproverEmailHtml(opts: {
   const customerName = escapeHtml(opts.customerName || "Workspace");
   const ticketId = escapeHtml(opts.ticketId || "");
   const comments = escapeHtml(stripPriceText(opts.comments || ""));
-  const requestId = escapeHtml(opts.requestId || "");
+  const code = escapeHtml(opts.code || opts.ticketId || "");
+  const notice = escapeHtml(opts.notice || "");
+  const expiresText = escapeHtml(opts.expiresText || "");
 
   const items = Array.isArray(opts.items) ? opts.items : [];
   const { seg } = pickTripSummary(items);
@@ -1041,7 +1055,7 @@ export function buildApproverEmailHtml(opts: {
       </tr>
       <tr>
         <td style="padding-top:8px;color:#64748b;font-size:12px;">
-          Each button opens a page where you confirm; nothing is decided until you do. The link works once.
+          Each button opens a page where you confirm; nothing is decided until you do.${expiresText ? ` ${expiresText}` : " The link works once."}
         </td>
       </tr>
     </table>
@@ -1087,7 +1101,7 @@ export function buildApproverEmailHtml(opts: {
                         Approval Needed
                       </div>
                       <div style="font-family:Arial,sans-serif;font-size:13px;line-height:1.55;color:rgba(255,255,255,.9);margin-top:8px;">
-                        Review the complete itinerary below. Your action routes the request to Admin for fulfilment.
+                        Review the complete itinerary below. Once approved, the Plumtrips Travel Desk takes it from there.
                       </div>
                       <div style="height:12px;"></div>
                       <div style="font-family:Arial,sans-serif;">
@@ -1108,6 +1122,7 @@ export function buildApproverEmailHtml(opts: {
                   <tr>
                     <td style="padding:18px;font-family:Arial,sans-serif;">
 
+                      ${notice ? `<div style="margin-top:4px;padding:12px 14px;border:1px solid #fcd34d;background:#fffbeb;border-radius:16px;font-size:14px;font-weight:700;color:#92400e;">${notice}</div>` : ""}
                       ${summaryBlock}
                       ${commentBlock}
                       ${itemsBlock}
@@ -1121,11 +1136,11 @@ export function buildApproverEmailHtml(opts: {
                           Security
                         </div>
                         <div style="margin-top:6px;font-size:13px;line-height:1.55;">
-                          Do not forward this email. Action links are intended for the assigned approver only.
+                          Do not forward this email. The action links are for you only; who may decide is checked again when you click.
                         </div>
-                        <div style="margin-top:8px;font-size:12px;color:#94a3b8;">
-                          Request ID: <span style="color:#ffffff;font-weight:900;">${requestId}</span>
-                        </div>
+                        ${code ? `<div style="margin-top:8px;font-size:12px;color:#94a3b8;">
+                          Request: <span style="color:#ffffff;font-weight:900;">${code}</span>
+                        </div>` : ""}
                       </div>
 
                       <div style="height:8px;"></div>
@@ -1134,7 +1149,7 @@ export function buildApproverEmailHtml(opts: {
                 </table>
 
                 <div style="padding:14px 6px 0 6px;font-family:Arial,sans-serif;font-size:12px;color:#94a3b8;line-height:1.6;text-align:center;">
-                  You’re receiving this because you’re listed as an approver for a PlumTrips request.
+                  You’re receiving this because you’re an approver or Workspace Leader for this PlumTrips workspace.
                 </div>
               </td>
             </tr>
@@ -1142,169 +1157,6 @@ export function buildApproverEmailHtml(opts: {
           </table>
         </td>
       </tr>
-    </table>
-  </body>
-  </html>
-  `;
-}
-
-export function buildLeaderFyiHtml(opts: {
-  requesterName: string;
-  requesterEmail: string;
-  customerName: string;
-  ticketId?: string;
-  items: any[];
-  comments?: string;
-}) {
-  const brand = "#00477f";
-  const accent = "#d06549";
-  const ink = "#0f172a";
-  const slate = "#475569";
-
-  const requesterName = escapeHtml(opts.requesterName || "User");
-  const requesterEmail = escapeHtml(opts.requesterEmail || "");
-  const customerName = escapeHtml(opts.customerName || "Workspace");
-  const ticketId = escapeHtml(opts.ticketId || "");
-  const comments = escapeHtml(stripPriceText(opts.comments || ""));
-
-  const items = Array.isArray(opts.items) ? opts.items : [];
-  const { seg } = pickTripSummary(items);
-
-  const bullets = items
-    .slice(0, 8)
-    .map((it, idx) => {
-      const title = escapeHtml(stripPriceText(String(it?.title || it?.type || "Item").trim()));
-      const desc = escapeHtml(firstLine(stripPriceText(it?.description || ""), 110));
-      const picked = escapeHtml(selectionEmailLine(pickMeta(it)));
-      const typeLabel = escapeHtml(serviceTypeOfItem(it).toUpperCase());
-      return `
-        <tr>
-          <td style="padding:10px 0;border-top:${idx === 0 ? "none" : "1px solid #eef2f7"};">
-            <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#64748b;font-weight:900;">
-              ${typeLabel}
-            </div>
-            <div style="margin-top:6px;font-size:14px;color:${ink};font-weight:900;line-height:1.25;">
-              ${title}
-            </div>
-            ${
-              picked
-                ? `<div style="margin-top:6px;font-size:13px;line-height:1.55;color:${ink};">Selected: ${picked}</div>`
-                : ""
-            }
-            ${
-              desc
-                ? `<div style="margin-top:6px;font-size:13px;line-height:1.55;color:${slate};">${desc}</div>`
-                : ""
-            }
-          </td>
-        </tr>
-      `;
-    })
-    .join("");
-
-  const commentBlock = comments
-    ? `
-      <div style="margin-top:12px;padding:12px 14px;border:1px solid #fde6df;background:#fff7f4;border-radius:16px;">
-        <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:${accent};font-weight:900;">
-          Request note
-        </div>
-        <div style="margin-top:8px;font-size:13px;line-height:1.6;color:${ink};">
-          ${comments}
-        </div>
-      </div>
-    `
-    : "";
-
-  return `
-  <!doctype html>
-  <html>
-  <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="x-apple-disable-message-reformatting" /></head>
-  <body style="margin:0;padding:0;background:#f5f7fb;">
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f5f7fb;padding:28px 12px;">
-      <tr><td align="center">
-        <table width="600" cellpadding="0" cellspacing="0" role="presentation" style="width:600px;max-width:600px;">
-
-          <tr>
-            <td style="padding:0 6px 12px 6px;">
-              <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
-                style="border-radius:20px;overflow:hidden;background: linear-gradient(135deg, ${brand} 0%, #052b57 55%, ${accent} 140%);">
-                <tr>
-                  <td style="padding:18px;">
-                    <div style="font-family:Arial,sans-serif;font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:rgba(255,255,255,.82);font-weight:900;">
-                      PlumTrips • AI Travel Ops
-                    </div>
-                    <div style="font-family:Arial,sans-serif;font-size:22px;line-height:1.2;color:#fff;font-weight:900;margin-top:8px;">
-                      FYI: New Request Submitted
-                    </div>
-                    <div style="font-family:Arial,sans-serif;font-size:13px;line-height:1.55;color:rgba(255,255,255,.9);margin-top:8px;">
-                      Action buttons are sent only to the assigned approver.
-                    </div>
-                  </td>
-                </tr>
-                <tr><td style="height:4px;background:${accent};"></td></tr>
-              </table>
-            </td>
-          </tr>
-
-          <tr>
-            <td style="padding:0 6px;">
-              <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
-                style="background:#fff;border:1px solid #e8eef6;border-radius:20px;box-shadow:0 10px 28px rgba(15,23,42,.08);">
-                <tr>
-                  <td style="padding:18px;font-family:Arial,sans-serif;">
-                    <div style="display:inline-block;padding:8px 10px;border-radius:999px;background:#eff6ff;border:1px solid #dbeafe;color:${brand};font-size:12px;font-weight:900;">
-                      ${customerName}
-                    </div>
-                    ${
-                      ticketId
-                        ? `<span style="display:inline-block;margin-left:8px;padding:8px 10px;border-radius:999px;background:#fff7f4;border:1px solid #fde6df;color:${accent};font-size:12px;font-weight:900;">
-                            Ticket: ${ticketId}
-                          </span>`
-                        : ""
-                    }
-
-                    <div style="margin-top:12px;padding:14px;border-radius:16px;background:#f8fafc;border:1px solid #e8eef6;">
-                      <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#64748b;font-weight:900;">
-                        Trip / Service Snapshot
-                      </div>
-                      <div style="margin-top:8px;font-size:16px;color:${ink};font-weight:900;line-height:1.25;">
-                        ${escapeHtml(seg)}
-                      </div>
-                      <div style="margin-top:8px;font-size:13px;color:${slate};line-height:1.55;">
-                        <b style="color:${ink};">Requested by:</b> ${requesterName}
-                      </div>
-                    </div>
-
-                    ${commentBlock}
-
-                    <div style="height:14px;"></div>
-
-                    <div style="font-size:12px;color:#64748b;letter-spacing:.12em;text-transform:uppercase;font-weight:900;">
-                      Items (preview)
-                    </div>
-
-                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:8px;">
-                      ${
-                        bullets ||
-                        `<tr><td style="padding:10px 0;color:#64748b;font-size:13px;">No items</td></tr>`
-                      }
-                    </table>
-
-                    <div style="margin-top:16px;font-size:12px;color:#64748b;line-height:1.55;">
-                      This is an FYI notification for workspace leaders.
-                    </div>
-                  </td>
-                </tr>
-              </table>
-
-              <div style="padding:14px 6px 0 6px;font-family:Arial,sans-serif;font-size:12px;color:#94a3b8;line-height:1.6;text-align:center;">
-                You’re receiving this because you’re listed as a workspace leader for PlumTrips approvals.
-              </div>
-            </td>
-          </tr>
-
-        </table>
-      </td></tr>
     </table>
   </body>
   </html>
@@ -1402,10 +1254,10 @@ export function buildProposalApprovedEmailHtml(opts: {
       <div style="font-size:13px;line-height:1.65;color:#334155;">
         Hi <b style="color:#0f172a;">${requesterName}</b>,<br/><br/>
         Great news! The travel proposal for your request${ticketId ? ` <b style="color:#d06549;">(${ticketId})</b>` : ""} has been <b style="color:#10b981;">approved</b>.
-        <br/><br/>Our team will now proceed with booking your travel arrangements.
+        <br/><br/>The Plumtrips Travel Desk will book it next; you will hear from us when booking starts.
       </div>
     `)}
-    ${loginUrl ? `<div style="margin-top:16px;">${eBtn("View Proposals", loginUrl, "#10b981", "#ffffff")}</div>` : ""}
+    ${loginUrl ? `<div style="margin-top:16px;">${eBtn("View My Requests", loginUrl, "#10b981", "#ffffff")}</div>` : ""}
     <div style="margin-top:16px;color:#94a3b8;font-size:12px;line-height:1.6;">
       You will receive a confirmation email once the booking is complete.
     </div>
@@ -1413,7 +1265,7 @@ export function buildProposalApprovedEmailHtml(opts: {
 
   return buildEmailShell(bodyContent, {
     title: "Proposal Approved",
-    subtitle: "Your travel proposal has been approved and booking is in progress.",
+    subtitle: "Your travel proposal has been approved.",
     badgeText: "APPROVED",
     badgeColor: "#10b981",
   });
@@ -1434,7 +1286,7 @@ export function buildProposalDeclinedEmailHtml(opts: {
       <div style="font-size:13px;line-height:1.65;color:#334155;">
         Hi <b style="color:#0f172a;">${requesterName}</b>,<br/><br/>
         The travel proposal for your request${ticketId ? ` <b style="color:#d06549;">(${ticketId})</b>` : ""} has been <b style="color:#dc2626;">declined</b>.
-        <br/><br/>Our team may reach out to discuss alternatives or submit a revised proposal.
+        <br/><br/>The Plumtrips Travel Desk may reach out to discuss alternatives or send a revised proposal.
       </div>
     `)}
     ${loginUrl ? `<div style="margin-top:16px;">${eBtn("View My Requests", loginUrl, "#00477f", "#ffffff")}</div>` : ""}

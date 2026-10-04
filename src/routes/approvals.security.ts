@@ -304,15 +304,27 @@ export function isPriceKey(key: string): boolean {
 
 /**
  * Currency figures in free text: "₹5,432", "(₹ 5,432)", "INR 5432.00",
- * "Rs. 500", "5,432 INR", "₹4,200/nt", plus admin tags like
- * "[BOOKING_AMOUNT:26000]" / "[ACTUAL_PRICE:32000]".
+ * "Rs. 500", "5,432 INR", "₹4,200/nt", "Rs 5000/-", "5000/-", "5,000 rupees",
+ * "rupees 5000", "₹1.2 lakh", "INR 3 cr", "₹5k", "Fare: 12,400", "total 9800",
+ * plus admin tags like "[BOOKING_AMOUNT:26000]" / "[ACTUAL_PRICE:32000]".
  */
+const AMOUNT = String.raw`[\d,]*\d(?:\.\d+)?`;
+const SCALE = String.raw`(?:\s*(?:k|lakhs?|lacs?|crores?|cr|l)\b)?`;
+const PER = String.raw`(?:\s*\/\s*(?:nt|night|-))?`;
+// (?![a-z]) rather than \b so "Rs500" / "INR5000" still match, but "Rsl Grand" does not.
+const RUPEE = String.raw`(?:₹|&#8377;|\bINR(?![a-z])|\bRs(?![a-z])\.?|\brupees?(?![a-z]))`;
 const PRICE_TEXT_PATTERNS: RegExp[] = [
   /\[\s*(?:ACTUAL[_ ]?)?(?:BOOKING[_ ]?)?(?:PRICE|AMOUNT|FARE|COST)\s*:[^\]]*\]/gi,
   /\b(?:ACTUAL|BOOKING)[_ ]?(?:PRICE|AMOUNT)\s*:\s*[\d,]+(?:\.\d+)?/gi,
-  /\(\s*(?:₹|&#8377;|INR|Rs\.?)\s*[\d,]+(?:\.\d+)?\s*(?:\/\s*(?:nt|night))?\s*\)/gi,
-  /(?:₹|&#8377;|\bINR|\bRs\.?)\s*[\d,]+(?:\.\d+)?(?:\s*\/\s*(?:nt|night))?/gi,
-  /\b[\d,]+(?:\.\d+)?\s*(?:₹|INR\b)/gi,
+  new RegExp(String.raw`\(\s*${RUPEE}\s*${AMOUNT}${SCALE}${PER}\s*\)`, "gi"),
+  // "₹ 5,432", "Rs. 500/-", "rupees 5000", "INR 1.2 lakh", "₹4,200/nt"
+  new RegExp(String.raw`${RUPEE}\s*${AMOUNT}${SCALE}${PER}`, "gi"),
+  // "5,432 INR", "5000 rupees", "1.5 lakh rupees", "500 Rs"
+  new RegExp(String.raw`\b${AMOUNT}${SCALE}\s*${RUPEE}`, "gi"),
+  // "5000/-": the Indian "no paise" mark is only ever written after money
+  new RegExp(String.raw`\b${AMOUNT}\s*\/-`, "g"),
+  // "Fare: 12,400", "Total - 9800", "price 4500.00": a price word, then a figure of 3+ digits
+  new RegExp(String.raw`\b(?:price|fare|cost|total|amount|tariff|charges?)s?\s*[:=\-–]?\s*\d[\d,]{2,}(?:\.\d+)?${SCALE}`, "gi"),
 ];
 
 export function stripPriceText(input: any): string {

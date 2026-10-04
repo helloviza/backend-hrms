@@ -6,41 +6,29 @@
 //     and the proposal page's Done both land here: request COMPLETED, linked
 //     proposal booking DONE, and one email to the requester with the
 //     approver and Workspace Leaders copied, carrying the booking documents
-//     (queue uploads and proposal booking uploads).
+//     (queue uploads and proposal booking uploads). "Notified" is recorded
+//     only once that email is actually sent (the outbox retries a failure).
 //   - notifyRequesterProgress: booking started / on hold with Plumtrips /
 //     cancelled.
 //   - notifyProposalReady: the requester hears a proposal is ready, with a
 //     link to a read-only, price-free view.
 //
+// Recipients for all of these are in the email map (approvalEmails/map.ts).
 // Every email here is price-free.
 
-import { actorStamp, TRAVEL_DESK_NAME, DESK_EMAIL, userNames } from "./actorNames.js";
+import { actorStamp, userNames } from "./actorNames.js";
 import fs from "fs";
 import path from "path";
+import ApprovalRequest from "../models/ApprovalRequest.js";
 import Proposal from "../models/Proposal.js";
 import TravelBooking from "../models/TravelBooking.js";
-import { sendMail } from "../utils/mailer.js";
-import { frontendBaseUrl, DISABLE_EMAILS, uniqEmails, stripPriceText } from "../routes/approvals.security.js";
-import {
-  buildAdminProcessedEmailHtml,
-  buildEmailAttachmentsFromMeta,
-  sanitizeAdminCommentForEmail,
-  buildEmailShell,
-  eBtn,
-  eCard,
-  eLabel,
-  escapeHtml,
-  pickTripSummary,
-} from "../routes/approvals.email.js";
-import { activeLeaderEmails, workspaceOf } from "./approvalDecisions.js";
+import { DISABLE_EMAILS } from "../routes/approvals.security.js";
+import { buildEmailAttachmentsFromMeta, sanitizeAdminCommentForEmail } from "../routes/approvals.email.js";
+import { notifySafely, recipientsFor } from "./approvalEmails/dispatch.js";
 
 type AnyObj = Record<string, any>;
 const norm = (v: any) => String(v ?? "").trim().toLowerCase();
 const str = (v: any) => String(v ?? "").trim();
-
-function code(ar: AnyObj) {
-  return str(ar?.ticketId) || String(ar?._id || "").slice(-6).toUpperCase();
-}
 
 /* ───────────────────────── booking done ───────────────────────── */
 
@@ -155,145 +143,81 @@ export async function markRequestDone(opts: {
     await doc.save();
     return { doc, message: "Marked done (no requester email)" };
   }
-  const leaders = await activeLeaderEmails(await workspaceOf(doc), doc);
-  const cc = uniqEmails([norm(doc.managerEmail), ...(Array.isArray(doc?.meta?.ccLeaders) ? doc.meta.ccLeaders : []), ...leaders]).filter(
-    (e) => e && e !== to,
-  );
   const emailAtts = [...buildEmailAttachmentsFromMeta(doc), ...proposalBookingAttachments(proposal)];
   // The requester's profile name (services/actorNames.ts), else the stored name.
   const requesterLookup = await userNames([doc.frontlinerId, to]);
   const requesterName =
     requesterLookup.get(String(doc.frontlinerId || "")) || requesterLookup.get(to) || str(doc.frontlinerName);
 
-  try {
-    await (sendMail as any)({
-      kind: "CONFIRMATIONS",
-      to,
-      cc: cc.length ? cc : undefined,
-      subject: `Your Booking has been Processed — ${doc.customerName || "Workspace"}${doc.ticketId ? ` (${doc.ticketId})` : ""}`,
-      // The desk mailbox, never the staff member's own address.
-      replyTo: DESK_EMAIL,
-      html: buildAdminProcessedEmailHtml({
-        customerName: doc.customerName || "Workspace",
-        ticketId: doc.ticketId,
-        requesterEmail: to,
-        requesterName: requesterName,
-        // Customer email: staff show as the travel desk, never by name or email.
-        processedByEmail: "",
-        processedByName: TRAVEL_DESK_NAME,
-        comment: sanitizeAdminCommentForEmail(comment),
-        items: Array.isArray(doc.cartItems) ? doc.cartItems : [],
-        attachments: emailAtts.map((a) => ({ filename: a.filename || "attachment.pdf" })),
-      }),
-      attachments: emailAtts.length ? emailAtts : undefined,
-    });
-    doc.history.push({
+  const ctx = {
+    ar: { ...doc.toObject(), frontlinerName: requesterName || doc.frontlinerName },
+    doneComment: sanitizeAdminCommentForEmail(comment),
+    attachmentNames: emailAtts.map((a) => a.filename || "attachment.pdf"),
+  };
+  const who = await recipientsFor("booking_done", ctx);
+  const row = { by, userEmail: adminEmail, userName: adminName, ...staffActor };
+  const sent = await notifySafely("booking_done", ctx, {
+    attachments: emailAtts,
+    // Pushed by the outbox only when the email is actually sent / finally fails.
+    onSent: {
       action: "admin_notify_sent",
-      at: new Date(),
-      by,
-      comment: `Notified: to=${to}${cc.length ? ` cc=${cc.join(",")}` : ""}${emailAtts.length ? ` attachments=${emailAtts.length}` : ""}`,
-      userEmail: adminEmail,
-      userName: adminName,
-      ...staffActor,
-    });
-    await doc.save();
-  } catch (e: any) {
-    doc.history.push({ action: "admin_notify_failed", at: new Date(), by, comment: `Notify send failed: ${String(e?.message || e)}`, userEmail: adminEmail, userName: adminName, ...staffActor });
-    await doc.save();
+      ...row,
+      comment: `Notified: to=${who.to.join(",")}${who.cc.length ? ` cc=${who.cc.join(",")}` : ""}${emailAtts.length ? ` attachments=${emailAtts.length}` : ""}`,
+    },
+    onFailed: { action: "admin_notify_failed", ...row, comment: "Booking email could not be delivered after retries" },
+  });
+
+  let message = "Marked done";
+  if (!sent || sent.skipped === "no-recipients") {
+    await ApprovalRequest.updateOne(
+      { _id: doc._id },
+      { $push: { history: { action: "admin_notify_skipped", at: new Date(), ...row, comment: "No active recipient to notify." } } },
+    ).exec();
+    message = "Marked done (nobody to notify)";
+  } else if (!sent.delivered) {
+    await ApprovalRequest.updateOne(
+      { _id: doc._id },
+      { $push: { history: { action: "admin_notify_queued", at: new Date(), ...row, comment: "Booking email failed to send; retrying automatically." } } },
+    ).exec();
+    message = "Marked done (email will be retried)";
   }
-  return { doc, message: "Marked done" };
+  // History rows above were written by the outbox / updateOne: return the stored request.
+  const fresh = await ApprovalRequest.findById(doc._id).exec();
+  return { doc: fresh || doc, message };
+}
+
+/**
+ * Why a case can't be cancelled (already cancelled, declined or revoked), or
+ * null. The queue's cancel and the proposal page's cancel both check it, so a
+ * closed case is never cancelled — or its requester emailed — twice.
+ */
+export function closedCaseRefusal(doc: AnyObj): { error: string; code: string } | null {
+  if (str(doc?.adminState) === "cancelled" || str(doc?.stage).toUpperCase() === "BOOKING_CANCELLED") {
+    return { error: "This request is already cancelled.", code: "ALREADY_CANCELLED" };
+  }
+  if (doc?.meta?.revoked || str(doc?.status).toLowerCase() === "declined") {
+    return { error: "This request was declined or revoked; there is nothing to cancel.", code: "NOT_CANCELLABLE" };
+  }
+  return null;
 }
 
 /* ───────────────────────── requester updates ───────────────────────── */
 
 export type ProgressKind = "booking_started" | "ops_on_hold" | "cancelled";
 
+const PROGRESS_EVENT = {
+  booking_started: "booking_started",
+  ops_on_hold: "booking_on_hold",
+  cancelled: "booking_cancelled",
+} as const;
+
 export async function notifyRequesterProgress(ar: AnyObj, kind: ProgressKind, note?: string) {
-  if (DISABLE_EMAILS) return;
-  const to = norm(ar?.frontlinerEmail);
-  if (!to) return;
-  const name = str(ar?.frontlinerName) || to.split("@")[0];
-  const trip = stripPriceText(pickTripSummary(ar?.cartItems || []).seg);
-  const reason = stripPriceText(str(note));
-  const base = frontendBaseUrl();
-  const copy: Record<ProgressKind, { subject: string; title: string; badge: string; color: string; body: string; cta: [string, string] }> = {
-    booking_started: {
-      subject: `Booking in progress — ${code(ar)}`,
-      title: "We're booking your trip",
-      badge: "BOOKING IN PROGRESS",
-      color: "#4f46e5",
-      body: "Our team has started booking your trip. You will get your tickets and vouchers by email when it is done.",
-      cta: ["View My Requests", `${base}/customer/approvals/mine`],
-    },
-    ops_on_hold: {
-      subject: `Your booking is on hold — ${code(ar)}`,
-      title: "Booking on hold",
-      badge: "ON HOLD",
-      color: "#f59e0b",
-      body: "Our team has paused the booking for now. We will be in touch, or continue as soon as we can.",
-      cta: ["View My Requests", `${base}/customer/approvals/mine`],
-    },
-    cancelled: {
-      subject: `Booking Update — Request Cancelled — ${code(ar)}`,
-      title: "Booking Update — Request Cancelled",
-      badge: "CANCELLED",
-      color: "#dc2626",
-      body: "Your travel request has been cancelled by our team.",
-      cta: ["Raise a New Request", `${base}/customer/approvals/new`],
-    },
-  };
-  const c = copy[kind];
-  try {
-    await sendMail({
-      kind: "CONFIRMATIONS",
-      to,
-      subject: c.subject,
-      html: buildEmailShell(
-        `${eCard(`
-          ${eLabel(c.title)}
-          <div style="font-size:13px;line-height:1.65;color:#334155;">
-            Hi <b style="color:#0f172a;">${escapeHtml(name)}</b>,<br/><br/>
-            ${escapeHtml(c.body)}${trip ? `<br/><br/><b style="color:#0f172a;">${escapeHtml(trip)}</b> (${escapeHtml(code(ar))})` : ""}
-            ${reason ? `<br/><br/><b style="color:#0f172a;">${kind === "cancelled" ? "Reason" : "Note"}:</b> ${escapeHtml(reason)}` : ""}
-          </div>
-        `)}
-        <div style="margin-top:16px;">${eBtn(c.cta[0], c.cta[1], "#00477f", "#ffffff")}</div>`,
-        { title: c.title, badgeText: c.badge, badgeColor: c.color },
-      ),
-    } as any);
-  } catch {
-    /* non-blocking */
-  }
+  await notifySafely(PROGRESS_EVENT[kind], { ar, reason: str(note) });
 }
 
 /** The requester hears that a proposal is ready (read-only, price-free view). */
 export async function notifyProposalReady(ar: AnyObj, proposal: AnyObj) {
-  if (DISABLE_EMAILS) return;
-  const to = norm(ar?.frontlinerEmail);
-  if (!to) return;
-  const name = str(ar?.frontlinerName) || to.split("@")[0];
-  const url = `${frontendBaseUrl()}/customer/approvals/proposal/${encodeURIComponent(String(proposal?._id || ""))}`;
-  try {
-    await sendMail({
-      kind: "CONFIRMATIONS",
-      to,
-      subject: `Your travel proposal is ready — ${code(ar)}`,
-      html: buildEmailShell(
-        `${eCard(`
-          ${eLabel("Proposal ready")}
-          <div style="font-size:13px;line-height:1.65;color:#334155;">
-            Hi <b style="color:#0f172a;">${escapeHtml(name)}</b>,<br/><br/>
-            Our team has prepared a proposal for your trip (${escapeHtml(code(ar))}). It is with your approver now —
-            your approver or a Workspace Leader will decide. You can view it below.
-          </div>
-        `)}
-        <div style="margin-top:16px;">${eBtn("View the proposal", url, "#00477f", "#ffffff")}</div>`,
-        { title: "Your proposal is ready", badgeText: "PROPOSAL READY", badgeColor: "#4f46e5" },
-      ),
-    } as any);
-  } catch {
-    /* non-blocking */
-  }
+  await notifySafely("proposal_ready", { ar, proposal });
 }
 
 /** Requester's own requests: the latest submitted-or-later proposal per request. */

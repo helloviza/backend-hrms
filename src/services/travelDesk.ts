@@ -17,11 +17,11 @@ import TravelDeskSettings, { type AllocationMode } from "../models/TravelDeskSet
 import User from "../models/User.js";
 import Customer from "../models/Customer.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
-import { sendMail } from "../utils/mailer.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
-import { frontendBaseUrl, DISABLE_EMAILS, PLUMTRIPS_HOUSE_WORKSPACE_ID } from "../routes/approvals.security.js";
+import { PLUMTRIPS_HOUSE_WORKSPACE_ID } from "../routes/approvals.security.js";
 import { UserPermission } from "../models/UserPermission.js";
 import { actorStamp, personName, SYSTEM_ACTOR, SYSTEM_NAME } from "./actorNames.js";
+import { notifySafely } from "./approvalEmails/dispatch.js";
 
 export const HOUSE_WORKSPACE_ID = PLUMTRIPS_HOUSE_WORKSPACE_ID;
 
@@ -322,9 +322,6 @@ export async function autoAllocate(requestId: string): Promise<{ assignedTo?: st
 
 /* ───────────────────────── assignee email ───────────────────────── */
 
-const esc = (s: any) =>
-  String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
-
 function isRoundTrip(meta: any) {
   return ["roundtrip", "round_trip", "return"].includes(str(meta?.tripType).toLowerCase());
 }
@@ -349,28 +346,12 @@ export function caseLines(doc: any): string[] {
 }
 
 async function notifyAssignee(doc: any, agent: TeamAgent, via: "manual" | "auto", reason: AssignReason, note: string) {
-  if (DISABLE_EMAILS || !agent.email) return;
-  const code = str(doc.ticketId) || `REQ-${String(doc._id).slice(-6).toUpperCase()}`;
-  const customer = str(doc.customerName) || "Customer";
-  const link = `${frontendBaseUrl()}/admin/approvals?request=${encodeURIComponent(String(doc._id))}`;
-  const lines = caseLines(doc);
-  const why = via === "auto" ? `Auto-assigned (${REASON_LABEL[reason]})` : "Assigned by a colleague";
-  const html = `
-<div style="font-family:Inter,Arial,sans-serif;font-size:14px;color:#131b2e;line-height:1.5">
-  <p>Hi ${esc(agent.name)},</p>
-  <p>A travel request has been assigned to you on the Plumtrips Travel Desk.</p>
-  <table style="border-collapse:collapse;margin:8px 0">
-    <tr><td style="padding:2px 12px 2px 0;color:#505f76">Request</td><td><b>${esc(code)}</b></td></tr>
-    <tr><td style="padding:2px 12px 2px 0;color:#505f76">Customer</td><td>${esc(customer)}</td></tr>
-    <tr><td style="padding:2px 12px 2px 0;color:#505f76;vertical-align:top">Trip</td><td>${lines.map(esc).join("<br>") || "—"}</td></tr>
-    <tr><td style="padding:2px 12px 2px 0;color:#505f76">Why you</td><td>${esc(why)}</td></tr>
-    ${note ? `<tr><td style="padding:2px 12px 2px 0;color:#505f76;vertical-align:top">Note</td><td>${esc(note)}</td></tr>` : ""}
-  </table>
-  <p><a href="${esc(link)}" style="display:inline-block;background:#00488d;color:#fff;text-decoration:none;padding:8px 16px;border-radius:999px;font-weight:600">Open in the ops queue</a></p>
-</div>`;
-  try {
-    await sendMail({ kind: "APPROVALS", to: agent.email, subject: `Assigned to you — ${code} — ${customer}`, html } as any);
-  } catch (err: any) {
-    console.error("[travel-desk] assignee email failed", { requestId: String(doc._id), error: err?.message });
-  }
+  if (!agent.email) return;
+  await notifySafely("case_assigned", {
+    ar: doc,
+    agent: { name: agent.name, email: agent.email },
+    assignWhy: via === "auto" ? `Auto-assigned (${REASON_LABEL[reason]})` : "Assigned by a colleague",
+    assignNote: note,
+    tripLines: caseLines(doc),
+  });
 }
