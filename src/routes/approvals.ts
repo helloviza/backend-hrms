@@ -76,6 +76,7 @@ import {
   loadSelfTraveller,
   TravellerError,
 } from "../services/approvalTravellers.js";
+import { checkCartItems, CartItemError } from "../services/approvalCartItems.js";
 
 import {
   buildApproverEmailHtml,
@@ -109,21 +110,9 @@ function sendSelectionError(res: any, e: SelectionError) {
   return res.status(e.status).json({ error: e.message, code: e.code, itemIndex: e.itemIndex });
 }
 
-/**
- * A one-way flight never carries a return date. The request form's default
- * flight state always held one (today + 8) and sent it even when "One Way"
- * hid the field, so one-way requests showed a Return date (REQ-563ECF).
- */
-function withoutOneWayReturnDate(items: any[]): any[] {
-  return (Array.isArray(items) ? items : []).map((it: any) => {
-    const meta = it?.meta;
-    const isFlight = String(it?.type || "").toLowerCase() === "flight";
-    const roundTrip = String(meta?.tripType || "").toLowerCase() === "roundtrip";
-    if (!isFlight || roundTrip || !meta || !("returnDate" in meta)) return it;
-    const { returnDate: _drop, ...rest } = meta;
-    void _drop;
-    return { ...it, meta: rest };
-  });
+function sendCartItemError(res: any, e: CartItemError) {
+  const missing = e.issues[0]?.missing;
+  return res.status(e.status).json({ error: e.message, code: e.code, itemIndex: e.itemIndex, field: e.field, missing, issues: e.issues });
 }
 
 function sendTravellerError(res: any, e: TravellerError) {
@@ -526,17 +515,22 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     // Self traveller comes from the requester's own profile, never the client.
     let prepared: Awaited<ReturnType<typeof prepareCartSelections>>;
     try {
-      prepared = await prepareCartSelections({
-        cartItems: await prepareCartTravellers({
-          cartItems: withoutOneWayReturnDate(rawCartItems),
+      // Same per-service rules as the request form (approvalItemRules.ts).
+      const checked = checkCartItems(
+        await prepareCartTravellers({
+          cartItems: rawCartItems,
           workspaceId: req.workspaceObjectId,
           ownerUserId: sub,
         }),
+      );
+      prepared = await prepareCartSelections({
+        cartItems: checked,
         userId: sub,
         workspaceId: req.workspaceObjectId,
       });
     } catch (e) {
       if (e instanceof TravellerError) return sendTravellerError(res, e);
+      if (e instanceof CartItemError) return sendCartItemError(res, e);
       if (e instanceof SelectionError) return sendSelectionError(res, e);
       throw e;
     }
@@ -820,6 +814,46 @@ router.get("/self-traveller", requireAuth, requireWorkspace, async (req: AnyObj,
   }
 });
 
+/**
+ * GET /api/approvals/request-context — what the request form shows around the
+ * cart: the company's name and who a new request goes to, resolved with the
+ * same routing POST /requests uses. Names only: never an email or an id.
+ *   approver.status  ok         — goes to approver.name
+ *                    auto       — requester is a Workspace Leader; approved on submit
+ *                    no_leader  — requester is the approver and no leader is above them
+ *                    none       — no approver configured
+ */
+router.get("/request-context", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
+  try {
+    setNoStore(res);
+    const user = req.user;
+    const email = normEmail(user?.email);
+    const loginWs: any = req.workspace?._id ? req.workspace : await resolveWorkspaceForUser(user);
+    if (!loginWs?._id) return res.json({ ok: true, companyName: "", approver: { status: "none" } });
+
+    const picked = await pickApproverEmail({ customerId: String(loginWs.customerId || loginWs._id), actorEmail: email });
+    const routing = resolveSubmitRouting({
+      approverEmail: picked.approverEmail,
+      leaderEmails: picked.leaderEmails,
+      actorEmail: email,
+      actorIsLeader: picked.leaderEmails.includes(email) || hasWorkspaceLeaderRole(user),
+    });
+    const companyName = normStr((picked.ws as any)?.name || (picked.ws as any)?.displayName || loginWs.name || "");
+
+    let approver: { status: string; name?: string };
+    if (routing.autoApprove) approver = { status: "auto" };
+    else if (!routing.approverEmail) approver = { status: routing.routedToLeader ? "no_leader" : "none" };
+    else {
+      const u: any = await User.findOne({ email: exactIRegex(routing.approverEmail) }).select("name firstName lastName").lean();
+      const name = normStr(u?.name) || normStr([u?.firstName, u?.lastName].filter(Boolean).join(" "));
+      approver = { status: "ok", name: name || "Your approver" };
+    }
+    res.json({ ok: true, companyName, approver });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     // SBT users must not access approval flow
@@ -968,19 +1002,25 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
     // passports sent back by a customer are restored from the stored request.
     let prepared: Awaited<ReturnType<typeof prepareCartSelections>>;
     try {
-      prepared = await prepareCartSelections({
-        cartItems: await prepareCartTravellers({
-          cartItems: withoutOneWayReturnDate(cartItems),
+      const existingCartItems = JSON.parse(JSON.stringify(doc.cartItems || []));
+      const checked = checkCartItems(
+        await prepareCartTravellers({
+          cartItems,
           workspaceId: doc.workspaceId,
           ownerUserId: String(doc.frontlinerId || ""),
-          existingCartItems: JSON.parse(JSON.stringify(doc.cartItems || [])),
+          existingCartItems,
         }),
+        { existingCartItems },
+      );
+      prepared = await prepareCartSelections({
+        cartItems: checked,
         userId: sub,
         workspaceId: doc.workspaceId,
         requestId: doc._id,
       });
     } catch (e) {
       if (e instanceof TravellerError) return sendTravellerError(res, e);
+      if (e instanceof CartItemError) return sendCartItemError(res, e);
       if (e instanceof SelectionError) return sendSelectionError(res, e);
       throw e;
     }
@@ -1906,12 +1946,16 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
     const storedCart = JSON.parse(JSON.stringify(doc.cartItems || []));
     let preparedResubmit: Awaited<ReturnType<typeof prepareCartSelections>> | null = null;
     try {
-      const withTravellers = await prepareCartTravellers({
-        cartItems: withoutOneWayReturnDate(Array.isArray(cartItems) && cartItems.length > 0 ? cartItems : storedCart),
-        workspaceId: req.workspaceObjectId,
-        ownerUserId: String(doc.frontlinerId || ""),
-        existingCartItems: storedCart,
-      });
+      // A resubmitted request meets today's rules too (no past dates).
+      const withTravellers = checkCartItems(
+        await prepareCartTravellers({
+          cartItems: Array.isArray(cartItems) && cartItems.length > 0 ? cartItems : storedCart,
+          workspaceId: req.workspaceObjectId,
+          ownerUserId: String(doc.frontlinerId || ""),
+          existingCartItems: storedCart,
+        }),
+        { existingCartItems: storedCart },
+      );
       if (Array.isArray(cartItems) && cartItems.length > 0) {
         preparedResubmit = await prepareCartSelections({
           cartItems: withTravellers,
@@ -1925,6 +1969,7 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
       }
     } catch (e) {
       if (e instanceof TravellerError) return sendTravellerError(res, e);
+      if (e instanceof CartItemError) return sendCartItemError(res, e);
       if (e instanceof SelectionError) return sendSelectionError(res, e);
       throw e;
     }

@@ -47,7 +47,7 @@ function baseFixture(): any {
         meta: {
           origin: "DEL",
           destination: "BOM",
-          departDate: "2026-10-20",
+          departDate: "2027-03-20",
           cabinClass: "Economy",
           adults: 2,
           children: 1,
@@ -73,17 +73,18 @@ function baseFixture(): any {
         price: 8000,
         meta: {
           city: "Mumbai",
-          checkIn: "2026-10-20",
-          checkOut: "2026-10-22",
+          checkIn: "2027-03-20",
+          checkOut: "2027-03-22",
           rooms: 2,
           nights: 2,
           totalNights: 2,
-          starRating: "5",
+          starRating: "5 Star",
           roomType: "Deluxe",
           mealPlan: "Breakfast",
           notes: "Hotel: Taj Lands End (₹8,000/nt)",
           markupAmount: 900,
           netAmount: 7100,
+          travellers: [{ firstName: "Riya", lastName: "R" }, { firstName: "Asha", lastName: "G" }],
         },
       },
       {
@@ -91,7 +92,7 @@ function baseFixture(): any {
         title: "USD • 2000 forex",
         qty: 1,
         price: 0,
-        meta: { currency: "USD", amount: 2000, deliveryMode: "Cash", city: "Delhi", requiredBy: "2026-10-18", rate: 84.2 },
+        meta: { currency: "USD", amount: 2000, deliveryMode: "Cash", city: "Delhi", requiredBy: "2027-03-18", rate: 84.2, pan: "ABCDE1234F", travellers: [{ firstName: "Riya", lastName: "R" }] },
       },
     ],
     history: [
@@ -618,7 +619,7 @@ describe("non-price keys survive for customer callers", () => {
     const [flight, hotel] = res.body.request.cartItems;
     expect(flight.qty).toBe(1);
     expect(flight.meta).toMatchObject({ adults: 2, children: 1, infants: 0, totalTravellers: 3, cabinClass: "Economy" });
-    expect(hotel.meta).toMatchObject({ rooms: 2, nights: 2, totalNights: 2, starRating: "5", roomType: "Deluxe", mealPlan: "Breakfast" });
+    expect(hotel.meta).toMatchObject({ rooms: 2, nights: 2, totalNights: 2, starRating: "5 Star", roomType: "Deluxe", mealPlan: "Breakfast" });
   });
 
   it("forex: the requested currency quantity reaches the approver; its rate does not", async () => {

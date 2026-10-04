@@ -99,7 +99,7 @@ const as = (r: request.Test, who: Who) =>
 async function submitAndApprove(by: Who = ASHA) {
   const created = await as(request(app).post("/api/approvals/requests"), by).send({
     customerId: String(CUSTOMER_ID),
-    cartItems: [{ type: "flight", title: "BLR → DEL", qty: 1, price: 0, meta: { origin: "BLR", destination: "DEL", tripType: "oneway", departDate: "2026-11-02", travelScope: "domestic", travellers: [{ kind: "manual", firstName: "Asha", lastName: "Rao" }] } }],
+    cartItems: [{ type: "flight", title: "BLR → DEL", qty: 1, price: 0, meta: { origin: "BLR", destination: "DEL", tripType: "oneway", departDate: "2027-04-02", travelScope: "domestic", travellers: [{ kind: "manual", firstName: "Asha", lastName: "Rao" }] } }],
     comments: "For Client Visit",
   });
   expect(created.status).toBe(200);

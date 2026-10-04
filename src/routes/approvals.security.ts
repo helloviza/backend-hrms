@@ -277,6 +277,10 @@ export const NON_PRICE_KEYS = new Set([
   "mode", "location", "enddate", "travelmode", "addons", "foodpref", "servicesneeded",
   // every service
   "notes", "priority", "needby", "travelscope",
+  // service forms (2026-10-04): multi-city legs, cab hours, forex PAN + holder,
+  // holiday/MICE lead contact, picked country / place codes
+  "legs", "date", "hours", "pan", "holder", "leadname", "leadphone", "leademail",
+  "destinationcountrycode", "countrycode", "citycode", "hotelcode", "hotelname", "cityname", "placetype", "flightnumber",
 ]);
 
 /** A forex item's requested currency quantity ("USD 2,000") is the request itself, not a price. */
@@ -378,6 +382,12 @@ export function sanitizeApprovalForViewer(doc: any, user: any) {
   const safe = maskPassportsDeep(stripPricesDeep(JSON.parse(JSON.stringify(doc))));
   // Staff-only audit of passport reveals (select:false, so normally absent).
   if (safe && typeof safe === "object") delete safe.passportReveals;
+  // A forex item's PAN: last 4 for customer-side viewers (like passports).
+  if (Array.isArray(safe?.cartItems)) {
+    for (const it of safe.cartItems) {
+      if (it?.meta && typeof it.meta.pan === "string" && it.meta.pan) it.meta.pan = maskTailId(it.meta.pan);
+    }
+  }
 
   // Travel Desk assignment is staff-only: who holds the case, why, and the
   // "no agent available" flag. Customers keep today's one "Assigned" history

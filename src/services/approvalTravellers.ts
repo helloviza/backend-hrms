@@ -47,15 +47,6 @@ export class TravellerError extends Error {
 const SELF_ALWAYS = ["firstName", "lastName", "dob"] as const;
 const INTERNATIONAL = ["passportNumber", "passportExpiry", "nationality"] as const;
 
-const FIELD_LABELS: Record<string, string> = {
-  firstName: "first name",
-  lastName: "last name",
-  dob: "date of birth",
-  passportNumber: "passport number",
-  passportExpiry: "passport expiry",
-  nationality: "nationality",
-};
-
 function str(v: any, max = 120): string {
   return String(v ?? "").trim().slice(0, max);
 }
@@ -146,10 +137,18 @@ function restorePassport(incoming: string, t: any, stored: any[]): string {
   );
 }
 
-function manualTraveller(raw: any, stored: any[]): RequestTraveller {
+/** Same person (name + DOB + passport) on several items of one request → one id. */
+function personKey(raw: any) {
+  return [raw?.firstName, raw?.lastName, raw?.dob, raw?.passportNumber ?? raw?.passportNo].map((v) => str(v).toLowerCase()).join("|");
+}
+
+function manualTraveller(raw: any, stored: any[], ids: Map<string, string> = new Map()): RequestTraveller {
   const idIn = str(raw?.travellerId, 64);
+  const key = personKey(raw);
+  const id = /^m-[a-f0-9]{16}$/.test(idIn) ? idIn : ids.get(key) || `m-${crypto.randomBytes(8).toString("hex")}`;
+  if (!ids.has(key)) ids.set(key, id);
   const t: RequestTraveller = {
-    travellerId: /^m-[a-f0-9]{16}$/.test(idIn) ? idIn : `m-${crypto.randomBytes(8).toString("hex")}`,
+    travellerId: id,
     kind: "manual",
     firstName: str(raw?.firstName),
     middleName: str(raw?.middleName) || undefined,
@@ -166,22 +165,12 @@ function manualTraveller(raw: any, stored: any[]): RequestTraveller {
   return t;
 }
 
-function requireFields(t: RequestTraveller, international: boolean, label: string) {
-  const need = ["firstName", "lastName", ...(international ? ["dob", ...INTERNATIONAL] : [])];
-  const missing = need.filter((k) => !(t as any)[k]);
-  if (missing.length) {
-    throw new TravellerError(
-      "TRAVELLER_INCOMPLETE",
-      `${label}: ${missing.map((k) => FIELD_LABELS[k] || k).join(", ")} required${international ? " for international travel" : ""}.`,
-      missing,
-    );
-  }
-}
-
 /**
  * Rebuilds meta.travellers on every cart item: self (from the owner's profile)
- * when the client marked it included, then the manual travellers, validated.
- * Refuses a request with no traveller on any item.
+ * when the client marked it included, then the manual travellers. Which
+ * fields each service needs, and whether a traveller is needed at all, is
+ * checked afterwards per item (approvalCartItems.checkCartItems), so a forex,
+ * eSIM, holiday or MICE item isn't held to flight rules.
  */
 export async function prepareCartTravellers(opts: {
   cartItems: any[];
@@ -191,12 +180,12 @@ export async function prepareCartTravellers(opts: {
 }): Promise<any[]> {
   const stored = storedTravellers(opts.existingCartItems || []);
   let self: SelfTravellerResult | null = null;
+  const ids = new Map<string, string>();
 
   const out: any[] = [];
   for (const item of opts.cartItems) {
     const meta = item?.meta && typeof item.meta === "object" ? item.meta : {};
     const incoming: any[] = Array.isArray(meta.travellers) ? meta.travellers.filter((t: any) => t && typeof t === "object") : [];
-    const international = String(meta.travelScope || "").toLowerCase() === "international";
     const includeSelf = incoming.some((t) => t.kind === "self");
 
     const travellers: RequestTraveller[] = [];
@@ -208,27 +197,14 @@ export async function prepareCartTravellers(opts: {
           "More than one traveller profile is linked to your login. Fix this in My Profile, or untick yourself.",
         );
       }
-      const missing = [...self.missing, ...(international ? self.missingInternational : [])];
-      if (self.status !== "ok" || missing.length) {
-        throw new TravellerError(
-          "SELF_PROFILE_INCOMPLETE",
-          `Complete your profile to continue: ${missing.map((k) => FIELD_LABELS[k] || k).join(", ")} missing in My Profile.`,
-          missing,
-        );
-      }
-      travellers.push({ ...self.traveller! });
+      // No profile yet: an empty self, which the item rules report as
+      // "Complete your profile" for the services that need one.
+      travellers.push(self.traveller ? { ...self.traveller } : { travellerId: "self", kind: "self", firstName: "", lastName: "" });
     }
 
-    for (const raw of incoming.filter((t) => t.kind !== "self")) {
-      const t = manualTraveller(raw, stored);
-      requireFields(t, international, `Traveller ${travellers.length + 1}`);
-      travellers.push(t);
-    }
+    for (const raw of incoming.filter((t) => t.kind !== "self")) travellers.push(manualTraveller(raw, stored, ids));
 
     out.push({ ...item, meta: { ...meta, travellers } });
-  }
-  if (!out.some((it) => it.meta.travellers.length)) {
-    throw new TravellerError("NO_TRAVELLERS", "Add at least one traveller: include yourself or add a traveller.");
   }
   return out;
 }

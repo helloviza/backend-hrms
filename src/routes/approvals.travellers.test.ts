@@ -134,7 +134,7 @@ const manual = (extra: Record<string, any> = {}) => ({
 
 const item = (travellers: any[], travelScope = "international") => ({
   type: "flight", title: "BLR → DXB", qty: 1, price: 0,
-  meta: { origin: "BLR", destination: "DXB", departDate: "2026-10-12", travelScope, travellers },
+  meta: { origin: "BLR", destination: "DXB", departDate: "2027-03-12", travelScope, travellers },
 });
 
 const submit = (who: Who, travellers: any[], opts: { wsId?: any; scope?: string } = {}) =>

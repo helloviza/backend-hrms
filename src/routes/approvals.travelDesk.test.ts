@@ -110,7 +110,7 @@ async function approvedRequest() {
     comments: "Client visit",
     cartItems: [{
       type: "flight", title: "BLR → DEL", qty: 1, price: 0,
-      meta: { origin: "BLR", destination: "DEL", tripType: "oneway", departDate: "2026-11-02", travelScope: "domestic",
+      meta: { origin: "BLR", destination: "DEL", tripType: "oneway", departDate: "2027-04-02", travelScope: "domestic",
         travellers: [{ kind: "manual", firstName: "Asha", lastName: "Guest" }] },
     }],
   });
@@ -267,7 +267,7 @@ describe("manual assign / reassign / unassign", () => {
     // Same code the ops queue shows (ticketId, else REQ- + last 6 of the id).
     expect(mail.subject).toContain(doc.ticketId || `REQ-${String(id).slice(-6).toUpperCase()}`);
     expect(mail.subject).toContain("Acme");
-    expect(mail.html).toContain("Flight BLR → DEL · 2026-11-02");
+    expect(mail.html).toContain("Flight BLR → DEL · 2027-04-02");
     expect(mail.html).toContain(`/admin/approvals?request=${id}`);
     expect(mail.html).not.toMatch(/₹|INR/);
   });

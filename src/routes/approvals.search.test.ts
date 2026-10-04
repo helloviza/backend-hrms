@@ -115,8 +115,8 @@ const flightRaw = (no: string) => ({
   Fare: { PublishedFare: 5432, OfferedFare: 5280, TotalFare: 5432, Tax: 800 }, _netPublishedFare: 5100, _marginAmount: 332,
   Segments: [[{
     Airline: { AirlineCode: "6E", AirlineName: "IndiGo", FlightNumber: no },
-    Origin: { Airport: { AirportCode: "BLR", CityName: "Bengaluru", Terminal: "1" }, DepTime: "2026-10-12T06:10:00" },
-    Destination: { Airport: { AirportCode: "BOM", CityName: "Mumbai", Terminal: "2" }, ArrTime: "2026-10-12T07:55:00" },
+    Origin: { Airport: { AirportCode: "BLR", CityName: "Bengaluru", Terminal: "1" }, DepTime: "2027-03-12T06:10:00" },
+    Destination: { Airport: { AirportCode: "BOM", CityName: "Mumbai", Terminal: "2" }, ArrTime: "2027-03-12T07:55:00" },
     Duration: 105, GroundTime: 0, Baggage: "15 Kg", CabinBaggage: "7 Kg", CabinClass: 2,
   }]],
 });
@@ -128,7 +128,7 @@ const hotelRaw = {
 async function flightSession(sub: any, wsId: any, opts: { expired?: boolean } = {}) {
   const s = await createSearchSession({
     workspaceId: wsId, userId: String(sub), kind: "flight",
-    params: { origin: "BLR", destination: "BOM", departDate: "2026-10-12" },
+    params: { origin: "BLR", destination: "BOM", departDate: "2027-03-12" },
     traceId: "trace-1", results: [flightRaw("5321"), flightRaw("6123")],
   });
   if (opts.expired) await col("approvalsearchsessions").updateOne({ sid: s.sid }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
@@ -139,7 +139,7 @@ async function flightSession(sub: any, wsId: any, opts: { expired?: boolean } = 
 const TRAV = [{ kind: "manual", firstName: "Asha", lastName: "Rao" }];
 const flightItem = (meta: any = {}) => ({
   type: "flight", title: "BLR → BOM", qty: 1, price: 0,
-  meta: { origin: "BLR", destination: "BOM", departDate: "2026-10-12", travellers: TRAV, ...meta },
+  meta: { origin: "BLR", destination: "BOM", departDate: "2027-03-12", travellers: TRAV, ...meta },
 });
 
 const createReq = (sub: any, wsId: any, cartItems: any[], roles?: string[]) =>
@@ -321,7 +321,7 @@ describe("optionRef → server-built selection", () => {
     expect((await createReq(U.req, WS, [flightItem({ optionRef: "not-a-ref" })])).body.code).toBe("OPTION_REF_INVALID");
     expect((await createReq(U.req, WS, [flightItem({ optionRef: `${sid}.9` })])).body.code).toBe("OPTION_REF_INVALID");
 
-    const h = await createSearchSession({ workspaceId: WS, userId: String(U.req), kind: "hotel", params: { CheckIn: "2026-10-12", CheckOut: "2026-10-14" }, results: [hotelRaw] });
+    const h = await createSearchSession({ workspaceId: WS, userId: String(U.req), kind: "hotel", params: { CheckIn: "2027-03-12", CheckOut: "2027-03-14" }, results: [hotelRaw] });
     const wrongKind = await createReq(U.req, WS, [flightItem({ optionRef: optionRefFor(h.sid, 0, 0) })]);
     expect([wrongKind.status, wrongKind.body.itemIndex]).toEqual([400, 0]);
 
@@ -331,11 +331,11 @@ describe("optionRef → server-built selection", () => {
   });
 
   it("hotel ref resolves to the chosen room", async () => {
-    const h = await createSearchSession({ workspaceId: WS, userId: String(U.req), kind: "hotel", params: { CheckIn: "2026-10-12", CheckOut: "2026-10-14" }, results: [hotelRaw] });
-    const r = await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { travellers: TRAV, city: "Mumbai", optionRef: optionRefFor(h.sid, 0, 0) } }]);
+    const h = await createSearchSession({ workspaceId: WS, userId: String(U.req), kind: "hotel", params: { CheckIn: "2027-03-12", CheckOut: "2027-03-14" }, results: [hotelRaw] });
+    const r = await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { travellers: TRAV, city: "Mumbai", checkIn: "2027-03-12", checkOut: "2027-03-14", rooms: 1, optionRef: optionRefFor(h.sid, 0, 0) } }]);
     expect(r.status).toBe(200);
     const doc: any = await col("approvalrequests").findOne({});
-    expect(doc.cartItems[0].meta.selection).toMatchObject({ kind: "hotel", name: "Taj Lands End", stars: 5, roomName: "Luxury Room", mealPlan: "Breakfast", checkOut: "2026-10-14" });
+    expect(doc.cartItems[0].meta.selection).toMatchObject({ kind: "hotel", name: "Taj Lands End", stars: 5, roomName: "Luxury Room", mealPlan: "Breakfast", checkOut: "2027-03-14" });
     const snap: any = await col("approvalselectionsnapshots").findOne({});
     expect(snap.rawOption.room.TotalFare).toBe(28400);
     expect(snap.rawOption.hotel.Rooms).toBeUndefined();
@@ -470,7 +470,7 @@ const tboFlight = (idx: string, segs: any[][], extra: any = {}) => ({
 const tboOk = (results: any[]) => ({ Response: { ResponseStatus: 1, TraceId: "trace-x", Results: results } });
 
 const flightBody = (extra: any = {}) => ({
-  origin: "blr", destination: "bom", departDate: "2026-10-12", tripType: "oneway", adults: 2, cabinClass: "Business", ...extra,
+  origin: "blr", destination: "bom", departDate: "2027-03-12", tripType: "oneway", adults: 2, cabinClass: "Business", ...extra,
 });
 const searchFlightsAs = (sub: any, body: any) => as(request(app).post("/api/approvals/search/flights"), sub, WS).send(body);
 
@@ -483,15 +483,15 @@ describe("POST /search/flights", () => {
   it("one-way: calls the shared searchFlights, returns price-free options in departure order with optionRefs", async () => {
     // TBO order is by price; ours must not be.
     tbo.flights.mockResolvedValue(tboOk([[
-      tboFlight("OB3", [[tboSeg("1101", "BLR", "BOM", "2026-10-12T13:45:00", "2026-10-12T15:30:00")]]),
-      tboFlight("OB1", [[tboSeg("5321", "BLR", "BOM", "2026-10-12T06:10:00", "2026-10-12T07:55:00", 3)]], { FareClassification: { Type: "Flexi" } }),
-      tboFlight("OB2", [[tboSeg("639", "BLR", "BOM", "2026-10-12T09:00:00", "2026-10-12T10:50:00")]], { IsRefundable: false }),
+      tboFlight("OB3", [[tboSeg("1101", "BLR", "BOM", "2027-03-12T13:45:00", "2027-03-12T15:30:00")]]),
+      tboFlight("OB1", [[tboSeg("5321", "BLR", "BOM", "2027-03-12T06:10:00", "2027-03-12T07:55:00", 3)]], { FareClassification: { Type: "Flexi" } }),
+      tboFlight("OB2", [[tboSeg("639", "BLR", "BOM", "2027-03-12T09:00:00", "2027-03-12T10:50:00")]], { IsRefundable: false }),
     ]]));
     const u = oid();
     const r = await searchFlightsAs(u, flightBody());
     expect(r.status).toBe(200);
     expect(tbo.flights).toHaveBeenCalledWith(expect.objectContaining({
-      origin: "BLR", destination: "BOM", departDate: "2026-10-12", JourneyType: 1, adults: 2, cabinClass: 4,
+      origin: "BLR", destination: "BOM", departDate: "2027-03-12", JourneyType: 1, adults: 2, cabinClass: 4,
     }));
     expect(r.body.tripKind).toBe("OW");
     expect(r.body.outbound.map((o: any) => o.legs[0].segments[0].flightNumber)).toEqual(["5321", "639", "1101"]);
@@ -508,11 +508,11 @@ describe("POST /search/flights", () => {
 
   it("domestic return: both directions listed; attaching out + return builds a two-leg selection", async () => {
     tbo.flights.mockResolvedValue(tboOk([
-      [tboFlight("OB1", [[tboSeg("5321", "BLR", "BOM", "2026-10-12T06:10:00", "2026-10-12T07:55:00")]])],
-      [tboFlight("IB1", [[tboSeg("640", "BOM", "BLR", "2026-10-15T18:00:00", "2026-10-15T19:50:00")]], { IsRefundable: false })],
+      [tboFlight("OB1", [[tboSeg("5321", "BLR", "BOM", "2027-03-12T06:10:00", "2027-03-12T07:55:00")]])],
+      [tboFlight("IB1", [[tboSeg("640", "BOM", "BLR", "2027-03-15T18:00:00", "2027-03-15T19:50:00")]], { IsRefundable: false })],
     ]));
-    const r = await searchFlightsAs(U.req, flightBody({ tripType: "roundtrip", returnDate: "2026-10-15" }));
-    expect(tbo.flights).toHaveBeenCalledWith(expect.objectContaining({ JourneyType: 2, returnDate: "2026-10-15" }));
+    const r = await searchFlightsAs(U.req, flightBody({ tripType: "roundtrip", returnDate: "2027-03-15" }));
+    expect(tbo.flights).toHaveBeenCalledWith(expect.objectContaining({ JourneyType: 2, returnDate: "2027-03-15" }));
     expect(r.body.tripKind).toBe("RT_DOM");
     expect(r.body.inbound[0].legs[0]).toMatchObject({ direction: "back", refundable: false });
     expectNoPrices(r.body);
@@ -531,11 +531,11 @@ describe("POST /search/flights", () => {
   it("international return: one list, each option carries both legs", async () => {
     tbo.flights.mockResolvedValue(tboOk([[
       tboFlight("OB7", [
-        [tboSeg("507", "BOM", "DXB", "2026-11-01T04:30:00", "2026-11-01T06:15:00")],
-        [tboSeg("500", "DXB", "BOM", "2026-11-08T21:40:00", "2026-11-09T02:10:00")],
+        [tboSeg("507", "BOM", "DXB", "2027-04-01T04:30:00", "2027-04-01T06:15:00")],
+        [tboSeg("500", "DXB", "BOM", "2027-04-08T21:40:00", "2027-04-09T02:10:00")],
       ]),
     ]]));
-    const r = await searchFlightsAs(U.req, flightBody({ origin: "BOM", destination: "DXB", departDate: "2026-11-01", tripType: "roundtrip", returnDate: "2026-11-08" }));
+    const r = await searchFlightsAs(U.req, flightBody({ origin: "BOM", destination: "DXB", departDate: "2027-04-01", tripType: "roundtrip", returnDate: "2027-04-08" }));
     expect(r.body.tripKind).toBe("RT_INTL");
     expect(r.body.outbound[0].legs.map((l: any) => l.direction)).toEqual(["out", "back"]);
     expect(r.body.inbound).toEqual([]);
@@ -603,7 +603,7 @@ describe("POST /search/hotels", () => {
   });
   beforeEach(() => tbo.hotels.mockReset());
 
-  const hotelBody = (extra: any = {}) => ({ city: "mumbai", checkIn: "2026-10-12", checkOut: "2026-10-14", adults: 3, rooms: 2, ...extra });
+  const hotelBody = (extra: any = {}) => ({ city: "mumbai", checkIn: "2027-03-12", checkOut: "2027-03-14", adults: 3, rooms: 2, ...extra });
   const searchHotelsAs = (sub: any, body: any) => as(request(app).post("/api/approvals/search/hotels"), sub, WS).send(body);
 
   it("resolves the city from the catalog, prices only the top 100 by stars, returns price-free hotels by stars then name", async () => {
@@ -622,7 +622,7 @@ describe("POST /search/hotels", () => {
     const call = tbo.hotels.mock.calls[0][0];
     expect(call.HotelCodes).toHaveLength(100);
     expect(call.HotelCodes.slice(0, 20).sort()).toEqual(Array.from({ length: 20 }, (_, i) => String(1000 + i)).sort());
-    expect(call).toMatchObject({ CityCode: CITY, CountryCode: "IN", CheckIn: "2026-10-12", CheckOut: "2026-10-14" });
+    expect(call).toMatchObject({ CityCode: CITY, CountryCode: "IN", CheckIn: "2027-03-12", CheckOut: "2027-03-14" });
     expect(call.Rooms).toEqual([{ Adults: 2, Children: 0, ChildrenAges: null }, { Adults: 1, Children: 0, ChildrenAges: null }]);
 
     expect(r.body.city).toEqual({ name: "Mumbai", countryCode: "IN" });
@@ -636,10 +636,10 @@ describe("POST /search/hotels", () => {
     expectNoPrices(r.body);
 
     // attach a room: selection rebuilt server-side from the session
-    const created = await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { travellers: TRAV, city: "Mumbai", optionRef: h3.rooms[1].optionRef } }]);
+    const created = await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { travellers: TRAV, city: "Mumbai", checkIn: "2027-03-12", checkOut: "2027-03-14", rooms: 1, optionRef: h3.rooms[1].optionRef } }]);
     expect(created.status).toBe(200);
     const doc: any = await col("approvalrequests").findOne({});
-    expect(doc.cartItems[0].meta.selection).toMatchObject({ kind: "hotel", name: "Hotel 003", roomName: "Luxury", stars: 5, checkIn: "2026-10-12" });
+    expect(doc.cartItems[0].meta.selection).toMatchObject({ kind: "hotel", name: "Hotel 003", roomName: "Luxury", stars: 5, checkIn: "2027-03-12" });
     const snap: any = await col("approvalselectionsnapshots").findOne({});
     expect(snap.rawOption.room.TotalFare).toBe(28400);
   });
@@ -674,7 +674,7 @@ describe("hotel picker: GET /search/hotel-cities and a picked city or hotel", ()
   const room = { Name: ["Deluxe"], MealType: "BreakFast", IsRefundable: true, TotalFare: 18000, DayRates: [[{ BasePrice: 9000 }]], CancelPolicies: [] };
   // A fresh requester per search: U.req's hotel budget is spent by earlier suites.
   const searchHotelsAs = (body: any) =>
-    as(request(app).post("/api/approvals/search/hotels"), oid(), WS).send({ checkIn: "2026-11-12", checkOut: "2026-11-14", adults: 2, rooms: 1, ...body });
+    as(request(app).post("/api/approvals/search/hotels"), oid(), WS).send({ checkIn: "2027-04-12", checkOut: "2027-04-14", adults: 2, rooms: 1, ...body });
 
   beforeAll(async () => {
     const { TBOCity, TBOHotelMaster, TBOCountry } = await import("../jobs/static-data-refresh.js");
@@ -806,12 +806,12 @@ describe("the picked option in emails, and no snapshot for a Workspace Leader", 
 
   it("approver email and leader FYI show the selected flight, with no price", async () => {
     tbo.flights.mockResolvedValue(tboOk([
-      [tboFlight("OB1", [[tboSeg("5321", "BLR", "BOM", "2026-10-12T06:10:00", "2026-10-12T07:55:00")]])],
-      [tboFlight("IB1", [[tboSeg("640", "BOM", "BLR", "2026-10-15T18:00:00", "2026-10-15T19:50:00")]], { IsRefundable: false })],
+      [tboFlight("OB1", [[tboSeg("5321", "BLR", "BOM", "2027-03-12T06:10:00", "2027-03-12T07:55:00")]])],
+      [tboFlight("IB1", [[tboSeg("640", "BOM", "BLR", "2027-03-15T18:00:00", "2027-03-15T19:50:00")]], { IsRefundable: false })],
     ]));
-    const r = await searchFlightsAs(U.req, flightBody({ tripType: "roundtrip", returnDate: "2026-10-15" }));
+    const r = await searchFlightsAs(U.req, flightBody({ tripType: "roundtrip", returnDate: "2027-03-15" }));
     const created = await createReq(U.req, WS, [flightItem({
-      tripType: "roundtrip", returnDate: "2026-10-15",
+      tripType: "roundtrip", returnDate: "2027-03-15",
       optionRef: r.body.outbound[0].optionRef, returnOptionRef: r.body.inbound[0].optionRef,
     })]);
     expect(created.status).toBe(200);
@@ -822,7 +822,7 @@ describe("the picked option in emails, and no snapshot for a Workspace Leader", 
     expect(approver!.html).toContain("IndiGo 6E 5321");
     expect(approver!.html).toContain("Return flight");
     expect(approver!.html).toContain("6E 640");
-    expect(approver!.html).toMatch(/BLR 06:10 → BOM 07:55 · 12 Oct 2026 · 1h 45m · Non-stop/);
+    expect(approver!.html).toMatch(/BLR 06:10 → BOM 07:55 · 12 Mar 2027 · 1h 45m · Non-stop/);
     expect(approver!.html).toMatch(/Economy · 15 Kg \+ 7 Kg cabin · Saver · Refundable/);
     expect(approver!.html).toContain("Non-refundable");
 
@@ -838,10 +838,10 @@ describe("the picked option in emails, and no snapshot for a Workspace Leader", 
 
   it("hotel selection in the approver email: name, stars, room, meal plan, cancel-by", async () => {
     const h = await createSearchSession({
-      workspaceId: WS, userId: String(U.req), kind: "hotel", params: { CheckIn: "2026-10-12", CheckOut: "2026-10-14" },
+      workspaceId: WS, userId: String(U.req), kind: "hotel", params: { CheckIn: "2027-03-12", CheckOut: "2027-03-14" },
       results: [{ ...hotelRaw, Rooms: [{ ...hotelRaw.Rooms[0], CancelPolicies: [{ FromDate: "10-10-2026 00:00:00", CancellationCharge: 100 }] }] }],
     });
-    await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { travellers: TRAV, city: "Mumbai", checkIn: "2026-10-12", checkOut: "2026-10-14", optionRef: optionRefFor(h.sid, 0, 0) } }]);
+    await createReq(U.req, WS, [{ type: "hotel", title: "Mumbai", qty: 1, meta: { travellers: TRAV, city: "Mumbai", checkIn: "2027-03-12", checkOut: "2027-03-14", rooms: 1, optionRef: optionRefFor(h.sid, 0, 0) } }]);
     const approver = mails.find((m) => String(m.to).includes("approver@cust.test"));
     expect(approver!.html).toContain("Taj Lands End (5★)");
     expect(approver!.html).toContain("Luxury Room · Breakfast");

@@ -97,7 +97,7 @@ const grant = (who: Who, access: string, scope: string) =>
 async function approvedRequest() {
   const created = await as(request(app).post("/api/approvals/requests"), REQUESTER).send({
     customerId: String(CUSTOMER_ID),
-    cartItems: [{ type: "flight", title: "BLR → DEL", qty: 1, price: 0, meta: { origin: "BLR", destination: "DEL", tripType: "oneway", departDate: "2026-11-02", travelScope: "domestic", travellers: [{ kind: "manual", firstName: "Asha", lastName: "Guest" }] } }],
+    cartItems: [{ type: "flight", title: "BLR → DEL", qty: 1, price: 0, meta: { origin: "BLR", destination: "DEL", tripType: "oneway", departDate: "2027-04-02", travelScope: "domestic", travellers: [{ kind: "manual", firstName: "Asha", lastName: "Guest" }] } }],
   });
   expect(created.status).toBe(200);
   const id = String(created.body.request._id);
