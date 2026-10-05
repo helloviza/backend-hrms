@@ -1,5 +1,6 @@
 // apps/backend/src/services/syncCustomerFromOnboarding.ts
 import Customer from "../models/Customer.js";
+import { gstStatusFromForm } from "../utils/customerGst.js";
 
 // Only a SUBMITTED form describes a company. An invite that was merely sent,
 // opened or expired has no form data, so a stub made from it is junk keyed on
@@ -47,6 +48,7 @@ async function createStub(invite: any, p: any) {
     // ---------- Business master ----------
     legalName: p.legalName || p.companyName || "",
     gstNumber: p.gstNumber || p.gstin || "",
+    gstStatus: gstStatusFromForm(p),
     panNumber: p.panNumber || "",
     industry: p.industry || "",
 

@@ -474,6 +474,12 @@ export async function generateInvoicePdf(
       if ((client as any).gstin) {
         doc.text(`GSTIN: ${(client as any).gstin}`, billToX, billY, { width: rightColW });
         billY += 13;
+      } else if ((client as any).gstStatus === "UNREGISTERED") {
+        // B2C client (affiliate / agent / individual): no GSTIN by design.
+        // Other blanks print nothing, as before — the staff-only flags for
+        // them live in the admin invoice view, never on the client's PDF.
+        doc.text("GSTIN: Unregistered (B2C)", billToX, billY, { width: rightColW });
+        billY += 13;
       }
     } else {
       doc.fontSize(10).font(FONT_NORMAL).fillColor(C_MID)

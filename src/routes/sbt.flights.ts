@@ -94,6 +94,7 @@ import {
   retryCheckoutHandler,
   getCheckoutHandler,
 } from "../services/sbtFulfil.js";
+import { stripSbtGstIfUnregistered } from "../utils/customerGst.js";
 
 const router = express.Router();
 
@@ -892,6 +893,8 @@ router.post("/farerule", requireAuth, requireSBT, async (req: any, res: any) => 
 router.post("/book", requireSBT, requireFlightAccess, ...sbtBookerGuards, requireSBTStaffDirect, paymentGate("flight-book"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "flight-book")) return;
+    // UNREGISTERED (B2C) company: no GST details go to TBO.
+    await stripSbtGstIfUnregistered(req);
     // Guard: LCC flights must use /ticket-lcc, not /book
     if (req.body?.isLCC === true) {
       return res.status(400).json({
@@ -1136,6 +1139,8 @@ router.post("/ssr", requireSBT, async (req: any, res: any) => {
 router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, requireSBTStaffDirect, paymentGate("flight-ticket-lcc"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "flight-ticket-lcc")) return;
+    // UNREGISTERED (B2C) company: no GST details go to TBO (both legs).
+    await stripSbtGstIfUnregistered(req);
 
     // Every passenger's TBO net Fare comes from the server's FareQuote of its leg
     // (services/sbtQuote.ts) — any client Fare is replaced before anything reads it.

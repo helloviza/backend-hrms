@@ -271,6 +271,13 @@ const CustomerSchema = new Schema(
     gstRegisteredState: { type: String, trim: true },
     gstRegisteredStateCode: { type: String, trim: true },
 
+    // REGISTERED | UNREGISTERED (B2C — affiliates, agents, individuals: no
+    // GSTIN, never flagged) | NOT_SET. Deliberately NO default: a company
+    // without the field reads as NOT_SET (utils/customerGst.ts), which is
+    // exactly the pre-status behaviour, and a default would be written back
+    // on any unrelated save before the migration has looked at the company.
+    gstStatus: { type: String, enum: ["REGISTERED", "UNREGISTERED", "NOT_SET"] },
+
     /* ============================================================
        MULTI-GST: PER-CLIENT DEFAULT SELLER REGISTRATION
        ============================================================ */

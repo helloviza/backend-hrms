@@ -26,6 +26,12 @@ import { UserPermission } from "../models/UserPermission.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { generateTravelerId } from "../utils/travelerId.js";
 import { GST_STATE_CODES } from "../utils/gstDetection.js";
+import {
+  GST_STATUSES,
+  normalizeGstStatus,
+  gstStatusFromForm,
+  validateRegisteredGstin,
+} from "../utils/customerGst.js";
 
 
 const router = Router();
@@ -551,6 +557,11 @@ function buildBusinessFormPayload(
   set("pan", b.pan || b.panNumber); // back-compat alias
   set("cin", b.cin);
   set("gstRegisteredState", b.gstRegisteredState);
+  // Staff-set GST status — kept on the form too so a not-yet-promoted record
+  // carries it into promote (gstStatusFromForm).
+  if (b.gstStatus !== undefined && b.gstStatus !== null && b.gstStatus !== "") {
+    out.gstStatus = normalizeGstStatus(b.gstStatus);
+  }
   set("entityType", b.entityType);
   set("industry", b.industry || b.segment);
   set("website", b.website);
@@ -736,6 +747,13 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
     const body = req.body || {};
     const rawType = String(body.type || "Vendor");
     const type = rawType.trim().toLowerCase();
+
+    // A business created as REGISTERED needs a valid GSTIN; UNREGISTERED /
+    // NOT_SET need none (same rule as the edit route).
+    if ((type === "business" || type === "customer") && normalizeGstStatus(body.gstStatus) === "REGISTERED") {
+      const gstErr = validateRegisteredGstin(body.gstNumber ?? body.gstin, body.panNumber ?? body.pan);
+      if (gstErr) return res.status(400).json({ error: gstErr, code: "GSTIN_INVALID" });
+    }
 
     const companyName =
       body.companyName ||
@@ -952,6 +970,48 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
     }
 
     const originalType = String(onboardingDoc.type || body.type || "").toLowerCase();
+    const isBusinessRecord = originalType === "business" || originalType === "customer";
+
+    // ----- GST status + GSTIN validation (business records only) -----
+    // Checked BEFORE anything is written. Only a REGISTERED company's GSTIN is
+    // validated (format + check digit + PAN match when a PAN is set); an
+    // UNREGISTERED (B2C) or NOT_SET company saves with no GSTIN, as before.
+    const linkedCustomer: any = isBusinessRecord
+      ? await Customer.findOne({ onboardingId: onboardingDoc._id }).exec()
+      : null;
+    if (isBusinessRecord) {
+      if (
+        body.gstStatus !== undefined &&
+        !(GST_STATUSES as readonly string[]).includes(String(body.gstStatus).trim().toUpperCase())
+      ) {
+        return res.status(400).json({ error: "GST status must be REGISTERED, UNREGISTERED or NOT_SET", code: "GST_STATUS_INVALID" });
+      }
+      const fp: any = onboardingDoc.formPayload || {};
+      const effectiveStatus = normalizeGstStatus(body.gstStatus ?? linkedCustomer?.gstStatus ?? fp.gstStatus);
+      const gstSent = body.gstNumber ?? body.gstin;
+      if (effectiveStatus === "REGISTERED" && (body.gstStatus !== undefined || gstSent !== undefined)) {
+        // A blank field keeps the Customer's GSTIN (it is never wiped — see
+        // the sync below), so that kept value is what must be valid.
+        const gstToCheck = typeof gstSent === "string" && gstSent.trim()
+          ? gstSent
+          : linkedCustomer?.gstNumber || fp.gstNumber || fp.gstin;
+        const panSent = body.panNumber ?? body.pan;
+        const panToCheck = typeof panSent === "string" && panSent.trim() ? panSent : linkedCustomer?.panNumber || fp.panNumber || fp.pan;
+        const gstErr = validateRegisteredGstin(gstToCheck, panToCheck);
+        if (gstErr) return res.status(400).json({ error: gstErr, code: "GSTIN_INVALID" });
+      }
+      // The legal name now reaches the Customer (invoices print it); refuse a
+      // rename onto another company's name before anything is saved.
+      if (linkedCustomer && typeof body.legalName === "string" && body.legalName.trim()) {
+        const clash = await Customer.findOne({
+          legalNameNormalized: normalizeCustomerLegalName({ legalName: body.legalName }),
+          _id: { $ne: linkedCustomer._id },
+        }).select("_id").lean();
+        if (clash) {
+          return res.status(409).json({ error: `Another company already has the legal name "${body.legalName.trim()}".`, code: "LEGAL_NAME_TAKEN" });
+        }
+      }
+    }
 
     const companyName =
       body.companyName ||
@@ -1149,30 +1209,49 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
         if (contactMobile) vendor.phone = contactMobile;
         await vendor.save();
       }
-    } else if (originalType === "business" || originalType === "customer") {
-      const customer = await Customer.findOne({
-        onboardingId: saved._id,
-      }).exec();
+    } else if (isBusinessRecord) {
+      const customer = linkedCustomer;
       if (customer) {
         if (companyName) customer.name = companyName;
         if (email) customer.email = email;
         if (contactMobile) customer.phone = contactMobile;
+        // F1: the fields invoice generation reads must follow a Business
+        // Master edit. A non-empty value is written; an empty one never wipes
+        // what the Customer already holds (the edit form shows the onboarding
+        // copy, which can be blank while the Customer has the real value).
+        const gstSent = body.gstNumber ?? body.gstin;
+        if (typeof gstSent === "string" && gstSent.trim()) {
+          (customer as any).gstNumber = gstSent.trim().toUpperCase();
+        }
+        if (typeof body.legalName === "string" && body.legalName.trim()) {
+          (customer as any).legalName = body.legalName.trim();
+        }
+        if (body.gstStatus !== undefined) {
+          (customer as any).gstStatus = normalizeGstStatus(body.gstStatus);
+        }
         if (body.gstRegisteredState) {
           (customer as any).gstRegisteredState = String(body.gstRegisteredState).trim();
           (customer as any).gstRegisteredStateCode = GST_STATE_CODES[String(body.gstRegisteredState).trim()] || "";
         }
-        // Sync structured address to Customer.address.*
-        const hasAddrUpdate = body.addressLine1 !== undefined || body.addressLine2 !== undefined ||
-          body.city !== undefined || body.country !== undefined || body.pincode !== undefined;
-        if (hasAddrUpdate) {
+        // Sync structured address to Customer.address.* — Business Master
+        // sends the nested address{} shape; flat keys kept for other callers.
+        const a = body.address && typeof body.address === "object" ? body.address : {};
+        const line1 = body.addressLine1 ?? a.street;
+        const line2 = body.addressLine2 ?? a.street2;
+        const city = body.city ?? a.city;
+        const country = body.country ?? a.country;
+        const pincode = body.pincode ?? a.pincode;
+        // Same rule as the GSTIN: a blank form field never wipes a value.
+        const filled = (v: unknown) => typeof v === "string" && v.trim() !== "";
+        if ([line1, line2, city, country, pincode, body.gstRegisteredState].some(filled)) {
           const existing = (customer as any).address || {};
           (customer as any).address = {
-            street:  body.addressLine1 !== undefined ? body.addressLine1 : (existing.street  || ""),
-            street2: body.addressLine2 !== undefined ? body.addressLine2 : (existing.street2 || ""),
-            city:    body.city         !== undefined ? body.city         : (existing.city    || ""),
-            state:   body.gstRegisteredState         || existing.state   || "",
-            country: body.country      !== undefined ? body.country      : (existing.country || "India"),
-            pincode: body.pincode      !== undefined ? body.pincode       : (existing.pincode  || ""),
+            street:  filled(line1)   ? line1   : (existing.street  || ""),
+            street2: filled(line2)   ? line2   : (existing.street2 || ""),
+            city:    filled(city)    ? city    : (existing.city    || ""),
+            state:   body.gstRegisteredState || existing.state || "",
+            country: filled(country) ? country : (existing.country || "India"),
+            pincode: filled(pincode) ? pincode : (existing.pincode  || ""),
           };
         }
         if (body.registeredAddress) {
@@ -1924,6 +2003,9 @@ router.post(
     onboardingDoc.pan ||
     "",
 
+  // "Not registered" / URP → UNREGISTERED, a GSTIN → REGISTERED, else NOT_SET.
+  gstStatus: gstStatusFromForm(form),
+
   // Addresses
   registeredAddress:
     form.registeredAddress ||
@@ -1994,6 +2076,9 @@ router.post(
       if (existingCustomer) {
         Object.assign(existingCustomer, {
           ...base,
+          // A status staff already set on the customer stands unless the form
+          // itself carries an explicit one.
+          ...(existingCustomer.gstStatus && !form.gstStatus ? { gstStatus: existingCustomer.gstStatus } : {}),
           workspaceId: workspaceId || String(req.workspaceObjectId),
         });
         customer = await existingCustomer.save();

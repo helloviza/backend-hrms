@@ -13,6 +13,7 @@ import { scopedFindById } from "../middleware/scopedFindById.js";
 import { validateObjectId } from "../middleware/validateObjectId.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMemberRoles.js";
+import { GST_STATUSES, normalizeGstStatus, validateRegisteredGstin } from "../utils/customerGst.js";
 
 const router = Router();
 
@@ -70,6 +71,7 @@ router.get("/", requireAuth, requireWorkspace, requireAdmin, async (_req: any, r
         phone: c.phone || c.mobile || "",
         mobile: c.mobile || "",
         gstNumber: c.gstNumber || "",
+        gstStatus: normalizeGstStatus(c.gstStatus),
         legalName: c.legalName || c.name,
         website: c.website || "",
         address: c.address || {},
@@ -387,6 +389,31 @@ router.patch(
           });
         }
         req.body.defaultSellerGstin = gstin;
+      }
+
+      // GST status: REGISTERED needs a valid GSTIN (format + check digit +
+      // PAN match when a PAN is set); UNREGISTERED (B2C) / NOT_SET need none
+      // and nothing is deleted. Checked only when this save touches GST.
+      const gstSent = req.body.gstNumber ?? req.body.gstin;
+      if (req.body.gstStatus !== undefined || gstSent !== undefined) {
+        if (
+          req.body.gstStatus !== undefined &&
+          !(GST_STATUSES as readonly string[]).includes(String(req.body.gstStatus).trim().toUpperCase())
+        ) {
+          return res.status(400).json({ error: "GST status must be REGISTERED, UNREGISTERED or NOT_SET", code: "GST_STATUS_INVALID" });
+        }
+        if (req.body.gstStatus !== undefined) req.body.gstStatus = normalizeGstStatus(req.body.gstStatus);
+        const current: any = await Customer.findById(id).select("gstStatus gstNumber panNumber").lean();
+        const status = normalizeGstStatus(req.body.gstStatus ?? current?.gstStatus);
+        if (status === "REGISTERED") {
+          const panSent = req.body.panNumber ?? req.body.pan;
+          const gstErr = validateRegisteredGstin(
+            gstSent !== undefined ? gstSent : current?.gstNumber,
+            typeof panSent === "string" && panSent.trim() ? panSent : current?.panNumber,
+          );
+          if (gstErr) return res.status(400).json({ error: gstErr, code: "GSTIN_INVALID" });
+          if (typeof gstSent === "string") req.body.gstNumber = gstSent.trim().toUpperCase();
+        }
       }
 
       const updated = await Customer.findOneAndUpdate(

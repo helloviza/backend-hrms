@@ -122,6 +122,10 @@ router.post(
         phone:                phone ? String(phone).trim() : undefined,
         address:              normalizedAddress,
         gstNumber:            gstNumber ? String(gstNumber).toUpperCase().trim() : undefined,
+        // A GSTIN given here was format-checked above → REGISTERED. Without
+        // one the status stays unset (NOT_SET) for staff to mark — never
+        // assumed UNREGISTERED.
+        gstStatus:            gstNumber ? "REGISTERED" : undefined,
         gstRegisteredState:   gstState,
         gstRegisteredStateCode: gstState ? (GST_STATE_CODES[gstState] || "") : undefined,
         panNumber:            panNumber ? String(panNumber).toUpperCase().trim() : undefined,

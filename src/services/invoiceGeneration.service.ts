@@ -310,7 +310,10 @@ function buildInvoiceContext(
 
   const clientDetails = {
     companyName:    cust.legalName || cust.companyName || cust.name || "",
-    gstin:          cust.gstNumber || cust.gstin || "",
+    // An UNREGISTERED (B2C) client's invoice carries no GSTIN even if an old
+    // one is still on file — the line reads "Unregistered (B2C)". Tax is
+    // untouched: it was already decided above from state alone.
+    gstin:          cust.gstStatus === "UNREGISTERED" ? "" : (cust.gstNumber || cust.gstin || ""),
     billingAddress: cust.registeredAddress || cust.billingAddress ||
       buildAddressStr({ addressLine1: custAddrLine1, addressLine2: custAddrLine2, city: custCity, state: detection.customerState, country: custCountry, pincode: custPincode }),
     addressLine1:   custAddrLine1,

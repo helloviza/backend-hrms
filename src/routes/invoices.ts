@@ -234,6 +234,7 @@ import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { isHouseCallerContext } from "../utils/bookingAccess.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { buildInvoiceQueryFilter } from "./invoices.filters.js";
+import { normalizeGstStatus } from "../utils/customerGst.js";
 
 
 /** Today's IST calendar date as YYYY-MM-DD, for the "settled today" stat.
@@ -376,6 +377,10 @@ async function buildInvoiceReadFilter(req: any): Promise<Record<string, any>> {
 // Snapshot wins for any non-empty field (preserves audit trail).
 // Live data fills gaps — handles old invoices where some fields were not
 // snapshotted, and the Molnlycke-pattern where address only exists on CWS.
+// EXCEPT the GSTIN: an issued invoice shows the GSTIN it was raised with, never
+// whatever the customer record says today (a blank stays blank). gstStatus is
+// the company's current GST status, for the "Unregistered (B2C)" line and the
+// staff-only flags — it never alters the stored invoice.
 export async function enrichClientDetails(invoice: any): Promise<any> {
   const snap = invoice.clientDetails ?? {};
   const wsIdStr = invoice.workspaceId?.toString();
@@ -407,7 +412,8 @@ export async function enrichClientDetails(invoice: any): Promise<any> {
 
   const merged: any = {
     companyName:    snap.companyName    || (liveCustomer as any)?.legalName    || (liveCustomer as any)?.companyName || (liveCustomer as any)?.name || "",
-    gstin:          snap.gstin          || (liveCustomer as any)?.gstNumber    || (liveCustomer as any)?.gstin || "",
+    gstin:          snap.gstin          || "",
+    gstStatus:      normalizeGstStatus((liveCustomer as any)?.gstStatus),
     state:          snap.state          || (liveCustomer as any)?.gstRegisteredState || custAddr.state || addrSrc.state  || "",
     addressLine1:   snap.addressLine1   || custAddr.street  || addrSrc.line1   || "",
     addressLine2:   snap.addressLine2   || custAddr.street2 || addrSrc.line2   || "",

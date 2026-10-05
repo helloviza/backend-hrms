@@ -4,6 +4,7 @@ import { requireWorkspace, isCustomerUser } from "../middleware/requireWorkspace
 import { requireRoles } from "../middleware/roles.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
+import { normalizeGstStatus, type GstStatus } from "../utils/customerGst.js";
 
 const r = Router();
 
@@ -13,6 +14,9 @@ r.use(requireAuth, requireWorkspace);
 // convention used in requireHouse.ts / requireFeature.ts / requireWorkspace.ts
 // (no shared exported constant). NEVER write to it.
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
+
+// Body keys a client may never set through workspace settings (see PATCH /pan).
+const GST_KEYS = ["gstNumber", "gstin", "gstStatus", "gstRegisteredState", "gstRegisteredStateCode"];
 
 /* ─── PUT /payroll-enable — Enable/disable payroll feature flag ─── */
 r.put(
@@ -187,6 +191,19 @@ r.patch(
         return res.status(400).json({ success: false, error: "No workspace context." });
       }
 
+      // GST details are Plumtrips-managed: a client (Workspace Leader /
+      // Workspace Admin) can't change GSTIN or GST status here — the GSTIN set
+      // here went straight to TBO with no validation. Staff edit GST in
+      // Business Master. PAN stays client-editable.
+      const user = (req as any).user;
+      if (isCustomerUser(user) && GST_KEYS.some((k) => req.body?.[k] !== undefined)) {
+        return res.status(403).json({
+          success: false,
+          code: "GST_LOCKED",
+          error: "GST details are managed by Plumtrips. Contact Plumtrips to change them.",
+        });
+      }
+
       const update: Record<string, any> = {};
       if (typeof req.body.pan === "string") {
         update.pan = req.body.pan.trim().toUpperCase();
@@ -239,10 +256,12 @@ r.get(
 
       let companyEmail = "";
       let companyPhone = "";
+      let gstStatus: GstStatus = "NOT_SET";
       if (ws && !isHouseForCustomer && (ws as any).customerId) {
         const cust = await Customer.findOne({ _id: (ws as any).customerId })
-          .select("email phone billingPhone")
+          .select("email phone billingPhone gstStatus")
           .lean();
+        gstStatus = normalizeGstStatus((cust as any)?.gstStatus);
         // billingPhone is the dedicated accounts/billing contact number
         // (populated from onboarding + Zoho "Billing Phone" import); phone
         // is the general primary contact. No equivalent billingEmail field
@@ -255,7 +274,10 @@ r.get(
         payrollConfig: (ws as any)?.payrollConfig || {},
         attendanceConfig: (ws as any)?.attendanceConfig || {},
         pan: isHouseForCustomer ? "" : (ws as any)?.pan || "",
-        gstNumber: isHouseForCustomer ? "" : (ws as any)?.gstNumber || "",
+        // UNREGISTERED (B2C): no GSTIN to pre-fill, and SBT hides its GST
+        // block — the booking routes also drop any GST detail server-side.
+        gstNumber: isHouseForCustomer || gstStatus === "UNREGISTERED" ? "" : (ws as any)?.gstNumber || "",
+        gstStatus,
         companyName: isHouseForCustomer ? "" : (ws as any)?.companyName || "",
         address: isHouseForCustomer ? null : (ws as any)?.address || null,
         companyEmail,

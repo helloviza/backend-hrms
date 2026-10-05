@@ -78,6 +78,7 @@ import {
   getCheckoutHandler,
 } from "../services/sbtFulfil.js";
 import { TBO_URLS } from "../config/tboUrls.js";
+import { stripSbtGstIfUnregistered } from "../utils/customerGst.js";
 
 // TBO cert Item 31 — TBO recommends ≥120s before calling GetBookingDetail.
 const DEFERRED_STATUS_CHECK_DELAY_MS = 120_000;
@@ -1057,6 +1058,8 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
 
 router.post("/validate-before-payment", requireSBT, requireHotelAccess, ...sbtBookerGuards, async (req: any, res: any) => {
   try {
+    // UNREGISTERED (B2C) company: GST details are neither validated nor sent.
+    await stripSbtGstIfUnregistered(req);
     const {
       BookingCode,
       HotelRoomsDetails: hotelRoomsDetails,
@@ -1164,6 +1167,8 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
   let clientRef = "";
   try {
     if (await maybeRouteToDemoSimulator(req, res, "hotel-book")) return;
+    // UNREGISTERED (B2C) company: no GST details go to TBO.
+    await stripSbtGstIfUnregistered(req);
     const {
       BookingCode,
       GuestNationality: _reqNationality,
