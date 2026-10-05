@@ -448,12 +448,18 @@ router.get("/margins/history", requireSuperAdmin, async (req: any, res: any) => 
       filter.workspaceId = new mongoose.Types.ObjectId(wsId);
     }
     const rows = (await SBTMarginChange.find(filter).sort({ at: -1, _id: -1 }).limit(300).lean()) as any[];
+    // Who made the change, by their CURRENT profile name (services/actorNames.ts)
+    // — resolved from the stored user id now, so old rows follow a rename. The
+    // name stored at write time is only the fallback (a setup script, a deleted user).
+    const names = await userNames(rows.map((r) => r.actorId).filter(Boolean));
     res.json({
       ok: true,
       changes: rows.map((r) => ({
         id: String(r._id), scope: r.scope, action: r.action,
         workspaceId: r.workspaceId ? String(r.workspaceId) : null, workspaceName: r.workspaceName,
-        before: r.before, after: r.after, reason: r.reason, actorName: r.actorName, at: r.at,
+        before: r.before, after: r.after, reason: r.reason,
+        actorName: nameOrUnknown(names.get(String(r.actorId || "")), r.actorName),
+        at: r.at,
       })),
     });
   } catch (err: any) {

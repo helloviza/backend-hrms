@@ -52,10 +52,20 @@ export function isPlaceholderName(v: any): boolean {
 }
 const real = (v: any) => (isPlaceholderName(v) ? "" : str(v));
 
-/** A person's display name from their profile: first + last, else `name`. Placeholders don't count. */
+/**
+ * A person's display name — the name their profile page shows (GET
+ * /users/profile: `name`, else firstName): `name` first, because it is the
+ * only name a person edits themselves (My Profile writes `name`, never
+ * firstName / lastName), so a renamed account's firstName can be stale. Then
+ * first + last, then `fullName`. When `name` is just the first name and a last
+ * name exists, first + last is the fuller same name. Placeholders don't count,
+ * nor does a `name` holding an email address (accounts created with name = email).
+ */
 export function personName(u: any): string {
-  const full = [real(u?.firstName), str(u?.lastName)].filter(Boolean).join(" ");
-  return real(full) || real(u?.name) || real(u?.fullName);
+  const name = str(u?.name).includes("@") ? "" : real(u?.name);
+  const full = real([real(u?.firstName), str(u?.lastName)].filter(Boolean).join(" "));
+  if (name && !(full && lower(name) === lower(u?.firstName) && str(u?.lastName))) return name;
+  return full || name || real(u?.fullName);
 }
 
 /**
@@ -84,17 +94,20 @@ export type RealName = { firstName: string; lastName: string; name: string; sour
 
 /**
  * A user's real name, the one rule for the login session and the placeholder
- * backfill: their profile (first + last, else `name`) → the traveller profile
- * they claimed → (only when `allowEmail`) their email's local part. Never a
- * placeholder like "Workspace User". `source: "none"` when nothing better exists.
+ * backfill: their profile (personName: `name`, else first + last) → the
+ * traveller profile they claimed → (only when `allowEmail`) their email's local
+ * part. Never a placeholder like "Workspace User". `source: "none"` when
+ * nothing better exists.
  */
 export async function resolveRealName(user: any, opts: { allowEmail?: boolean } = {}): Promise<RealName> {
   const first = real(user?.firstName);
   const last = str(user?.lastName);
-  const full = [first, last].filter(Boolean).join(" ");
-  if (real(full)) return { firstName: first || last, lastName: first ? last : "", name: full, source: "profile" };
-  const named = real(user?.name) || real(user?.fullName);
+  const named = personName(user);
   if (named) {
+    // The stored first / last when they ARE this name, else split the name.
+    if (lower([first, last].filter(Boolean).join(" ")) === lower(named)) {
+      return { firstName: first || last, lastName: first ? last : "", name: named, source: "profile" };
+    }
     const [f, ...rest] = named.split(/\s+/);
     return { firstName: f, lastName: rest.join(" "), name: named, source: "profile" };
   }

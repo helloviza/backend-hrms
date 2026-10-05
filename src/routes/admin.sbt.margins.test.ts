@@ -247,4 +247,44 @@ describe("company overrides and the change log", () => {
     await expect(SBTMarginChange.deleteMany({})).rejects.toThrow(/append-only/);
     expect(await col("sbtmarginchanges").countDocuments()).toBe(1);
   });
+
+  /* The profile page shows User.name (My Profile edits only `name`); an account
+   * whose firstName is still "Test" must read as its profile name everywhere. */
+  describe("who changed it: the profile name, resolved now", () => {
+    const setUser = (fields: Record<string, unknown>) =>
+      col("users").updateOne({ _id: SUPER }, { $set: fields });
+
+    it("'Last changed' on defaults + overrides and the history show the profile name, not firstName 'Test'", async () => {
+      await setUser({ firstName: "Test", lastName: "", name: "Plumtrips Admin", email: "admin@plumtrips.com" });
+      await request(app).put("/api/admin/sbt/margins").set("x-test-user", SA).send({ ...VALID, reason: "r" });
+      await putOv(OVERRIDE);
+      const g = await request(app).get("/api/admin/sbt/margins").set("x-test-user", SA);
+      expect(g.body.margins.updatedByName).toBe("Plumtrips Admin");
+      expect(g.body.overrides[0].updatedByName).toBe("Plumtrips Admin");
+      const h = await request(app).get("/api/admin/sbt/margins/history").set("x-test-user", SA);
+      expect(h.body.changes.map((c: any) => c.actorName)).toEqual(["Plumtrips Admin", "Plumtrips Admin"]);
+    });
+
+    it("old rows follow the CURRENT name (resolved from the user id, not the text stored at write time)", async () => {
+      await setUser({ firstName: "Test", lastName: "", name: "" });
+      await putOv(OVERRIDE);
+      expect(((await col("sbtmarginchanges").findOne({})) as any).actorName).toBe("Test"); // what was stored then
+      await setUser({ name: "Plumtrips Admin" }); // renamed later on My Profile
+      const h = await request(app).get("/api/admin/sbt/margins/history").set("x-test-user", SA);
+      expect(h.body.changes[0].actorName).toBe("Plumtrips Admin");
+      const g = await request(app).get("/api/admin/sbt/margins").set("x-test-user", SA);
+      expect(g.body.overrides[0].updatedByName).toBe("Plumtrips Admin");
+    });
+
+    it("a row whose user no longer exists keeps its stored name; a script row reads 'Setup script'", async () => {
+      await col("sbtmarginchanges").insertMany([
+        { scope: "WORKSPACE", action: "CREATE", workspaceId: ACME, workspaceName: "Acme Corp", before: null, after: {}, reason: "x",
+          actorId: String(new mongoose.Types.ObjectId()), actorName: "Former Staffer", at: new Date(Date.now() - 2000) },
+        { scope: "WORKSPACE", action: "CREATE", workspaceId: ACME, workspaceName: "Acme Corp", before: null, after: {}, reason: "y",
+          actorId: "script:seed-house-margin-override", actorName: "Setup script", at: new Date(Date.now() - 1000) },
+      ] as any[]);
+      const h = await request(app).get("/api/admin/sbt/margins/history").set("x-test-user", SA);
+      expect(h.body.changes.map((c: any) => c.actorName)).toEqual(["Setup script", "Former Staffer"]);
+    });
+  });
 });
