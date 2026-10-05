@@ -274,6 +274,49 @@ export interface FlightPrice {
   addOnBreakdown: { seat: number; meal: number; baggage: number };
   // One entry per quote (leg): what it covers and its selling fare.
   legs: Array<{ resultIndexes: string[]; sellingFare: number }>;
+  // The margin the quotes recorded (null for a quote taken before margins were recorded).
+  margin: PaymentMargin | null;
+}
+
+/** The margin a quote recorded at quote time (services/sbtMargin.ts marginRecord). */
+export interface QuoteMargin {
+  quoteId: string;
+  resultIndexes: string[];
+  marginPct: number;
+  marginSource: string;
+  marginOverrideId: string | null;
+  marginVersion: number;
+  isInternational: boolean;
+  marginAmount: number;
+}
+
+/** What a payment row records: the first leg's rule, the total margin amount,
+ *  and every leg's own record (multi-city legs save one booking each). */
+export type PaymentMargin = Omit<QuoteMargin, "quoteId" | "resultIndexes"> & { legs: QuoteMargin[] };
+
+export function quoteMargin(q: AnyObj | null | undefined): QuoteMargin | null {
+  if (!q || typeof q.marginPct !== "number" || typeof q.marginSource !== "string") return null;
+  return {
+    quoteId: String(q.quoteId),
+    resultIndexes: ((q.resultIndexes || []) as unknown[]).map(String),
+    marginPct: q.marginPct,
+    marginSource: q.marginSource,
+    marginOverrideId: q.marginOverrideId ? String(q.marginOverrideId) : null,
+    marginVersion: Number(q.marginVersion) || 0,
+    isInternational: q.isInternational === true,
+    marginAmount: Number(q.marginAmount) || 0,
+  };
+}
+
+export function paymentMargin(legs: Array<QuoteMargin | null>): PaymentMargin | null {
+  if (!legs.length || legs.some((l) => !l)) return null;
+  const all = legs as QuoteMargin[];
+  const { quoteId: _q, resultIndexes: _r, ...first } = all[0];
+  return {
+    ...first,
+    marginAmount: Math.round(all.reduce((s, l) => s + l.marginAmount, 0) * 100) / 100,
+    legs: all,
+  };
 }
 
 /** ceil(Σ margined PublishedFare of the quoted legs) + add-ons. */
@@ -288,10 +331,12 @@ export async function priceFlight(
   let isMultiCity = false;
   const resultIndexes = new Set<string>();
   const legs: Array<{ resultIndexes: string[]; sellingFare: number }> = [];
+  const margins: Array<QuoteMargin | null> = [];
   for (const id of ids) {
     const q = await loadScopedQuote(scope, id, "FLIGHT");
     if (!q || !(Number(q.sellingFare) > 0)) return FARE_EXPIRED;
     fare += Number(q.sellingFare);
+    margins.push(quoteMargin(q));
     if (q.isMultiCity === true) isMultiCity = true;
     legs.push({ resultIndexes: ((q.resultIndexes || []) as string[]).map(String), sellingFare: Number(q.sellingFare) });
     for (const ri of (q.resultIndexes || []) as string[]) if (ri) resultIndexes.add(String(ri));
@@ -302,18 +347,18 @@ export async function priceFlight(
   if (isRefusal(add)) return add;
   return {
     ok: true, amount: base + add.amount, base, addOn: add.amount, quoteIds: ids, resultIndexes: ris, isMultiCity,
-    addOnBreakdown: add.breakdown, legs,
+    addOnBreakdown: add.breakdown, legs, margin: paymentMargin(margins),
   };
 }
 
 export async function priceHotelQuote(
   scope: { userId: string; workspaceId: string },
   quoteId: unknown,
-): Promise<{ ok: true; amount: number; bookingCode: string; quoteId: string } | Refusal> {
+): Promise<{ ok: true; amount: number; bookingCode: string; quoteId: string; margin: PaymentMargin | null } | Refusal> {
   const q = await loadScopedQuote(scope, quoteId, "HOTEL");
   const amount = Math.round(Number(q?.serverDisplayFare) || 0);
   if (!q || !(amount > 0)) return FARE_EXPIRED;
-  return { ok: true, amount, bookingCode: String(q.sourceRef), quoteId: String(quoteId) };
+  return { ok: true, amount, bookingCode: String(q.sourceRef), quoteId: String(quoteId), margin: paymentMargin([quoteMargin(q)]) };
 }
 
 /** The latest scoped hotel quote for a BookingCode (hold → voucher pricing). */
@@ -588,7 +633,7 @@ export function createOrderHandler(product: Product) {
         if (mc) return send(res, mc);
         return await persistOrder(res, {
           product, ...scope, quoteIds: p.quoteIds, resultIndexes: p.resultIndexes,
-          amount: p.amount, baseAmount: p.base, addOnAmount: p.addOn,
+          amount: p.amount, baseAmount: p.base, addOnAmount: p.addOn, margin: p.margin,
         }, `sbt_${Date.now()}`);
       }
       if (b.heldBookingId) {
@@ -602,6 +647,7 @@ export function createOrderHandler(product: Product) {
       if (isRefusal(p)) return send(res, p);
       return await persistOrder(res, {
         product, ...scope, quoteIds: [p.quoteId], bookingCode: p.bookingCode, amount: p.amount, baseAmount: p.amount,
+        margin: p.margin,
       }, `sbt_htl_${Date.now()}`);
     } catch (err: any) {
       sbtLogger.error("[sbt-pay] create-order failed", { product, err: err?.message });
@@ -821,7 +867,7 @@ export function paymentGate(kind: GateKind) {
           if (!ris.length || ris.some((ri) => !p.resultIndexes.includes(ri))) return send(res, FARE_EXPIRED);
           claim = await claimOfficial(req, scope, {
             product: "FLIGHT", quoteIds: p.quoteIds, resultIndexes: p.resultIndexes,
-            amount: p.amount, baseAmount: p.base, addOnAmount: p.addOn,
+            amount: p.amount, baseAmount: p.base, addOnAmount: p.addOn, margin: p.margin,
           });
         } else {
           claim = await claimRazorpay(scope, "FLIGHT", b.razorpayOrderId, async (row) => {
@@ -845,6 +891,7 @@ export function paymentGate(kind: GateKind) {
           claim = await claimOfficial(req, scope, {
             product: "HOTEL", quoteIds: [p.quoteId], bookingCode: code, amount: p.amount, baseAmount: p.amount,
             clientReferenceId: typeof b.ClientReferenceId === "string" ? b.ClientReferenceId : undefined,
+            margin: p.margin,
           });
         } else {
           claim = await claimRazorpay(scope, "HOTEL", b.razorpayOrderId, async (row) =>
@@ -972,5 +1019,7 @@ export async function paymentFactsForSave(
     // The supplier's full Book / Ticket responses (services/sbtQuote.ts
     // keepSupplierResponse) — the booking's raw and net come from these.
     supplierResponses: Array.isArray(row.supplierResponses) ? row.supplierResponses : [],
+    // The margin the quotes recorded (services/sbtMargin.ts) — the booking's margin.
+    margin: row.margin && typeof row.margin === "object" ? (row.margin as PaymentMargin) : null,
   };
 }

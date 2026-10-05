@@ -579,7 +579,7 @@ export function createCheckoutHandler(product: "FLIGHT" | "HOTEL") {
         row = {
           product, ...scope, quoteIds: p.quoteIds, resultIndexes: p.resultIndexes,
           amount: p.amount, baseAmount: p.base, addOnAmount: p.addOn, addOnBreakdown: p.addOnBreakdown,
-          legAmounts: legShares(p.legs, p.base),
+          legAmounts: legShares(p.legs, p.base), margin: p.margin,
         };
       } else if (kind === "HOTEL_VOUCHER") {
         const p = await priceHeldHotel(scope, b.heldBookingId);
@@ -594,6 +594,7 @@ export function createCheckoutHandler(product: "FLIGHT" | "HOTEL") {
         row = {
           product, ...scope, quoteIds: [p.quoteId], bookingCode: p.bookingCode, amount: p.amount, baseAmount: p.amount,
           clientReferenceId: typeof request.ClientReferenceId === "string" ? request.ClientReferenceId : undefined,
+          margin: p.margin,
         };
       }
 

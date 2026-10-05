@@ -2429,6 +2429,25 @@ router.post(
 
 /* ── Import from SBT ─────────────────────────────────────────────── */
 
+/**
+ * Invoice pricing for an imported SBT booking. A booking priced by the margin
+ * engine carries the margin its quote recorded (marginSource set): the client
+ * paid totalFare, of which marginAmount is our markup — so cost = paid − markup
+ * and the GST-on-markup is on exactly that markup (none when it is ≤ 0).
+ * Older bookings keep the stored net / display figures.
+ */
+export function sbtImportPricing(sbtDoc: any) {
+  const recorded = typeof sbtDoc.marginSource === "string" && sbtDoc.marginSource !== "";
+  const paid = Number(sbtDoc.totalFare) || 0;
+  return {
+    actualPrice: recorded ? paid - (Number(sbtDoc.marginAmount) || 0) : sbtDoc.netAmount || sbtDoc.totalFare || 0,
+    quotedPrice: recorded ? paid : sbtDoc.displayAmount || sbtDoc.totalFare || 0,
+    gstMode: "ON_MARKUP",
+    gstPercent: 18,
+    currency: "INR",
+  };
+}
+
 // POST /api/admin/manual-bookings/import-from-sbt
 router.post("/import-from-sbt", requirePermission("manualBookings", "FULL"), async (req: any, res: any) => {
   try {
@@ -2514,13 +2533,7 @@ router.post("/import-from-sbt", requirePermission("manualBookings", "FULL"), asy
                     ? "INFANT"
                     : "ADULT",
             })),
-            pricing: {
-              actualPrice: sbtDoc.netAmount || sbtDoc.totalFare || 0,
-              quotedPrice: sbtDoc.displayAmount || sbtDoc.totalFare || 0,
-              gstMode: "ON_MARKUP",
-              gstPercent: 18,
-              currency: "INR",
-            },
+            pricing: sbtImportPricing(sbtDoc),
             supplierName: sbtDoc.airlineName || "TBO",
             supplierPNR: sbtDoc.pnr || sbtDoc.bookingId,
             status: "CONFIRMED",
@@ -2559,13 +2572,7 @@ router.post("/import-from-sbt", requirePermission("manualBookings", "FULL"), asy
               name: `${g.FirstName || ""} ${g.LastName || ""}`.trim(),
               type: "ADULT",
             })),
-            pricing: {
-              actualPrice: sbtDoc.netAmount || sbtDoc.totalFare || 0,
-              quotedPrice: sbtDoc.displayAmount || sbtDoc.totalFare || 0,
-              gstMode: "ON_MARKUP",
-              gstPercent: 18,
-              currency: "INR",
-            },
+            pricing: sbtImportPricing(sbtDoc),
             supplierName: "TBO",
             supplierPNR: sbtDoc.confirmationNo || sbtDoc.bookingRefNo || sbtDoc.bookingId,
             status: "CONFIRMED",

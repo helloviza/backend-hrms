@@ -4,17 +4,25 @@ export interface MarginConfig {
   enabled: boolean;
   flight: { domestic: number; international: number };
   hotel: { domestic: number; international: number };
+  /** +1 on every change to the defaults; stamped on each quote. */
+  version?: number;
 }
 
 export const DEFAULT_MARGINS: MarginConfig = {
   enabled: false,
   flight: { domestic: 0, international: 0 },
   hotel: { domestic: 0, international: 0 },
+  version: 0,
 };
 
 /** Allowed range for every margin percent the admin API accepts. */
 export const MARGIN_MIN_PCT = -10;
 export const MARGIN_MAX_PCT = 50;
+
+/** A margin percent the admin API accepts: a real number in [MIN, MAX]. */
+export function isValidMarginPct(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v >= MARGIN_MIN_PCT && v <= MARGIN_MAX_PCT;
+}
 
 /**
  * Validate a margin settings body. Each of the four percents must be a real
@@ -35,7 +43,7 @@ export function parseMarginInput(
   for (const product of ["flight", "hotel"] as const) {
     for (const region of ["domestic", "international"] as const) {
       const v = body?.[product]?.[region];
-      if (typeof v !== "number" || !Number.isFinite(v) || v < MARGIN_MIN_PCT || v > MARGIN_MAX_PCT) {
+      if (!isValidMarginPct(v)) {
         return {
           ok: false,
           error: `${product} ${region} margin must be a number between ${MARGIN_MIN_PCT} and ${MARGIN_MAX_PCT}`,
@@ -49,24 +57,28 @@ export function parseMarginInput(
 
 let marginCache: MarginConfig | null = null;
 let marginCacheTime = 0;
-const CACHE_TTL = 5 * 60 * 1000;
+// Short on purpose: a save on one App Runner instance reaches every other
+// instance within this window (the admin page says "within a minute").
+export const MARGIN_CACHE_TTL_MS = 30 * 1000;
 
-// Safety guard: local/dev/staging share the production MongoDB cluster, so the
-// `margins` SBTConfig document is shared across environments. Without this
-// guard, toggling margins locally would apply markup to live production
-// pricing within the 5-min cache window. Only a process explicitly started
-// with NODE_ENV=production may read the real config — every other environment
-// gets a forced-disabled config regardless of the DB value.
+// Safety guard: margins only apply in a process started with
+// NODE_ENV=production. Local dev may opt in with SBT_MARGINS_LOCAL=1 (off by
+// default) to exercise margins against a LOCAL database — never set it on a
+// machine whose MONGO_URI points at production.
 let nonProdGuardLogged = false;
 
+export function marginsLiveHere(): boolean {
+  return process.env.NODE_ENV === "production" || process.env.SBT_MARGINS_LOCAL === "1";
+}
+
 export async function getMarginConfig(): Promise<MarginConfig> {
-  if (process.env.NODE_ENV !== "production") {
+  if (!marginsLiveHere()) {
     if (!nonProdGuardLogged) {
       // eslint-disable-next-line no-console
       console.info(
         `[MARGIN] Non-production environment (NODE_ENV=${
           process.env.NODE_ENV ?? "<unset>"
-        }) — margins force-disabled`
+        }) — margins force-disabled (SBT_MARGINS_LOCAL=1 turns them on locally)`
       );
       nonProdGuardLogged = true;
     }
@@ -74,11 +86,12 @@ export async function getMarginConfig(): Promise<MarginConfig> {
       enabled: false,
       flight: { domestic: 0, international: 0 },
       hotel: { domestic: 0, international: 0 },
+      version: 0,
     };
   }
 
   const now = Date.now();
-  if (marginCache && now - marginCacheTime < CACHE_TTL) {
+  if (marginCache && now - marginCacheTime < MARGIN_CACHE_TTL_MS) {
     return marginCache;
   }
   try {
@@ -96,20 +109,24 @@ export function invalidateMarginCache() {
   marginCacheTime = 0;
 }
 
-export function applyMargin(netPrice: number, marginPercent: number): number {
-  if (!marginPercent || marginPercent <= 0) return netPrice;
-  return Math.round(netPrice * (1 + marginPercent / 100) * 100) / 100;
+/** Whole rupee, rounded UP (paise first, so 11000.000000002 stays 11000). */
+export function ceilRupee(n: number): number {
+  return Math.ceil(Math.round(n * 100) / 100);
 }
 
 /**
- * Apply margin to a net price, then clamp to a floor if provided.
- * Returns the greater of (net + margin) and floor.
- *
- * @param netPrice     TBO TotalFare for the rate
- * @param marginPercent Configured markup percent (may be 0 or negative)
- * @param floor         Optional minimum selling price (e.g. RSP).
- *                      When null/undefined/<=0, behaves identically to
- *                      applyMargin.
+ * The selling price for a net price: net × (1 + pct/100), rounded UP to the
+ * whole rupee. Every percent applies — 0 sells at net, a negative percent
+ * sells below net (Plumtrips absorbs the difference).
+ */
+export function applyMargin(netPrice: number, marginPercent: number): number {
+  const p = Number(marginPercent) || 0;
+  return ceilRupee(netPrice * (1 + p / 100));
+}
+
+/**
+ * applyMargin, never below a floor (hotels: the supplier's recommended selling
+ * price, itself rounded up to the whole rupee). No floor when null / <= 0.
  */
 export function applyMarginWithFloor(
   netPrice: number,
@@ -118,7 +135,7 @@ export function applyMarginWithFloor(
 ): number {
   const withMargin = applyMargin(netPrice, marginPercent);
   if (floor == null || floor <= 0) return withMargin;
-  return Math.max(withMargin, floor);
+  return Math.max(withMargin, Math.ceil(floor));
 }
 
 /**
@@ -134,13 +151,4 @@ export function violatesRspFloor(
   // values that are mathematically equal (e.g. 541.6 vs 541.5999...).
   const EPSILON = 0.01;
   return customerChargedAmount + EPSILON < rsp;
-}
-
-export function removeMargin(displayPrice: number, marginPercent: number): number {
-  if (!marginPercent || marginPercent <= 0) return displayPrice;
-  return Math.round((displayPrice / (1 + marginPercent / 100)) * 100) / 100;
-}
-
-export function isDomestic(originCountry?: string, destCountry?: string): boolean {
-  return (originCountry || "IN") === "IN" && (destCountry || "IN") === "IN";
 }

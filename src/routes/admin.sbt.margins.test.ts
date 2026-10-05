@@ -117,3 +117,134 @@ describe("margin settings — server-side validation", () => {
     });
   }
 });
+
+/* ═════════════════ company overrides + change log ═════════════════ */
+
+describe("company overrides and the change log", () => {
+  const ACME = new mongoose.Types.ObjectId();
+  const SA = user(["SUPERADMIN"]);
+  const putOv = (body: unknown, u = SA, ws = String(ACME)) =>
+    request(app).put(`/api/admin/sbt/margins/overrides/${ws}`).set("x-test-user", u).send(body as any);
+  const OVERRIDE = { flight: { domestic: 2, international: null }, hotel: { domestic: -5, international: null }, reason: "Q4 retention deal" };
+
+  beforeEach(async () => {
+    for (const c of ["sbtmarginoverrides", "sbtmarginchanges", "customerworkspaces", "users"]) await col(c).deleteMany({});
+    await col("customerworkspaces").insertMany([
+      { _id: ACME, customerId: "CUST-ACME", companyName: "Acme Corp", status: "ACTIVE" },
+      { _id: new mongoose.Types.ObjectId(), customerId: "CUST-BETA", companyName: "Beta Ltd", status: "ACTIVE" },
+    ] as any[]);
+    await col("users").insertOne({ _id: SUPER, email: "x@test", firstName: "Imran", lastName: "Ali" } as any);
+  });
+
+  it("only a SUPERADMIN can read or change overrides and history", async () => {
+    for (const u of [user(["ADMIN"]), user(["TENANT_ADMIN"]), user(["HR"]), user(["OPS"]), user(["SUPERADMIN"], { _demoImpersonation: true })]) {
+      expect((await putOv(OVERRIDE, u)).status).toBe(403);
+      expect((await request(app).delete(`/api/admin/sbt/margins/overrides/${ACME}`).set("x-test-user", u).send({ reason: "x" })).status).toBe(403);
+      const h = await request(app).get("/api/admin/sbt/margins/history").set("x-test-user", u);
+      expect(h.status).toBe(403);
+      expect(h.body.changes).toBeUndefined();
+      expect((await request(app).get("/api/admin/sbt/margins/companies").set("x-test-user", u)).status).toBe(403);
+    }
+    expect(await col("sbtmarginoverrides").countDocuments()).toBe(0);
+    expect(await col("sbtmarginchanges").countDocuments()).toBe(0);
+  });
+
+  it("add → edit → remove: each change is logged with who, when, old → new and the reason", async () => {
+    const add = await putOv(OVERRIDE);
+    expect(add.status).toBe(200);
+    const row: any = await col("sbtmarginoverrides").findOne({ workspaceId: ACME });
+    expect(row).toMatchObject({
+      flight: { domestic: 2, international: null }, hotel: { domestic: -5, international: null },
+      reason: "Q4 retention deal", validUntil: null,
+    });
+
+    const edit = await putOv({ ...OVERRIDE, flight: { domestic: 3, international: 4 }, reason: "Renewed", validUntil: "2099-12-31" });
+    expect(edit.status).toBe(200);
+    const edited: any = await col("sbtmarginoverrides").findOne({ workspaceId: ACME });
+    expect(edited.flight).toEqual({ domestic: 3, international: 4 });
+    // A date = the end of that day in India.
+    expect(new Date(edited.validUntil).toISOString()).toBe("2099-12-31T18:29:59.999Z");
+
+    const del = await request(app).delete(`/api/admin/sbt/margins/overrides/${ACME}`).set("x-test-user", SA).send({ reason: "Contract ended" });
+    expect(del.status).toBe(200);
+    expect(await col("sbtmarginoverrides").countDocuments()).toBe(0);
+
+    const h = await request(app).get(`/api/admin/sbt/margins/history?workspaceId=${ACME}`).set("x-test-user", SA);
+    expect(h.status).toBe(200);
+    expect(h.body.changes.map((c: any) => c.action)).toEqual(["REMOVE", "UPDATE", "CREATE"]);
+    const [removed, updated, created] = h.body.changes;
+    expect(created).toMatchObject({ scope: "WORKSPACE", workspaceName: "Acme Corp", before: null, reason: "Q4 retention deal", actorName: "Imran Ali" });
+    expect(created.after.flight).toEqual({ domestic: 2, international: null });
+    expect(updated.before.flight).toEqual({ domestic: 2, international: null });
+    expect(updated.after.flight).toEqual({ domestic: 3, international: 4 });
+    expect(updated.reason).toBe("Renewed");
+    expect(removed).toMatchObject({ after: null, reason: "Contract ended" });
+    expect(Number.isNaN(Date.parse(removed.at))).toBe(false);
+  });
+
+  it("the defaults: version goes up on every save, and the change is logged", async () => {
+    await request(app).put("/api/admin/sbt/margins").set("x-test-user", SA).send({ ...VALID, reason: "Annual review" });
+    await request(app).put("/api/admin/sbt/margins").set("x-test-user", SA).send({ ...VALID, enabled: false });
+    expect((await stored()).version).toBe(2);
+    const h = await request(app).get("/api/admin/sbt/margins/history").set("x-test-user", SA);
+    expect(h.body.changes).toHaveLength(2);
+    expect(h.body.changes[1]).toMatchObject({ scope: "DEFAULTS", reason: "Annual review" });
+    expect(h.body.changes[1].before.flight).toEqual({ domestic: 1, international: 1 });
+    expect(h.body.changes[1].after).toMatchObject({ enabled: true, version: 1, flight: { domestic: 3, international: 5 } });
+    expect(h.body.changes[0].after).toMatchObject({ enabled: false, version: 2 });
+  });
+
+  it("GET lists each override with its company, 'use default' cells as null, and expiry", async () => {
+    await putOv(OVERRIDE);
+    await col("sbtmarginoverrides").updateOne({ workspaceId: ACME }, { $set: { validUntil: new Date(Date.now() - 1000) } });
+    const g = await request(app).get("/api/admin/sbt/margins").set("x-test-user", SA);
+    expect(g.status).toBe(200);
+    expect(g.body.limits).toEqual({ min: -10, max: 50 });
+    expect(g.body.overrides).toHaveLength(1);
+    expect(g.body.overrides[0]).toMatchObject({
+      workspaceId: String(ACME), companyName: "Acme Corp", flight: { domestic: 2, international: null },
+      reason: "Q4 retention deal", expired: true, updatedByName: "Imran Ali",
+    });
+  });
+
+  it("company search marks companies that already have an override", async () => {
+    await putOv(OVERRIDE);
+    const r = await request(app).get("/api/admin/sbt/margins/companies?q=acme").set("x-test-user", SA);
+    expect(r.body.companies).toEqual([{ workspaceId: String(ACME), companyName: "Acme Corp", isHouse: false, hasOverride: true }]);
+  });
+
+  const badOverrides: Array<[string, unknown]> = [
+    ["no reason", { ...OVERRIDE, reason: "  " }],
+    ["below −10", { ...OVERRIDE, hotel: { domestic: -11, international: null } }],
+    ["above 50", { ...OVERRIDE, flight: { domestic: 51, international: null } }],
+    ["a numeric string", { ...OVERRIDE, flight: { domestic: "2", international: null } }],
+    ["nothing set", { flight: { domestic: null, international: null }, hotel: { domestic: null, international: null }, reason: "x" }],
+    ["an end date in the past", { ...OVERRIDE, validUntil: "2020-01-01" }],
+    ["a bad end date", { ...OVERRIDE, validUntil: "soon" }],
+  ];
+  for (const [what, body] of badOverrides) {
+    it(`override refused: ${what} — nothing saved, nothing logged`, async () => {
+      const r = await putOv(body);
+      expect(r.status).toBe(400);
+      expect(r.body.error).toBeTruthy();
+      expect(await col("sbtmarginoverrides").countDocuments()).toBe(0);
+      expect(await col("sbtmarginchanges").countDocuments()).toBe(0);
+    });
+  }
+
+  it("unknown company → 404; removing needs a reason", async () => {
+    expect((await putOv(OVERRIDE, SA, String(new mongoose.Types.ObjectId()))).status).toBe(404);
+    await putOv(OVERRIDE);
+    const r = await request(app).delete(`/api/admin/sbt/margins/overrides/${ACME}`).set("x-test-user", SA).send({});
+    expect(r.status).toBe(400);
+    expect(await col("sbtmarginoverrides").countDocuments()).toBe(1);
+  });
+
+  it("the change log cannot be edited or deleted through the model", async () => {
+    await putOv(OVERRIDE);
+    const SBTMarginChange = mongoose.model("SBTMarginChange");
+    await expect(SBTMarginChange.updateOne({}, { $set: { reason: "rewritten" } })).rejects.toThrow(/append-only/);
+    await expect(SBTMarginChange.deleteMany({})).rejects.toThrow(/append-only/);
+    expect(await col("sbtmarginchanges").countDocuments()).toBe(1);
+  });
+});

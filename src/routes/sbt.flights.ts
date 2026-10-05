@@ -22,7 +22,14 @@ import { requireFeature } from "../middleware/requireFeature.js";
 import { sendMail } from "../utils/mailer.js";
 import { buildEmailShell, eRow, eCard, eBtn, eLabel, escapeHtml } from "./approvals.email.js";
 import { clearTBOToken, logoutTBO, getTBOTokenStatus, getAgencyBalance } from "../services/tbo.auth.service.js";
-import { getMarginConfig, applyMargin, isDomestic } from "../utils/margin.js";
+import { applyMargin } from "../utils/margin.js";
+import {
+  resolveMargin,
+  flightRouteMargins,
+  isInternationalFlight,
+  isInternationalRoute,
+  marginRecord,
+} from "../services/sbtMargin.js";
 import { toCustomerSafeFlight } from "../utils/customerSafeBooking.js";
 import { listTBOLogs, readTBOLog, logTBOCall } from "../utils/tboFileLogger.js";
 import {
@@ -74,8 +81,6 @@ import { createRazorpayOrder, razorpayConfigured, razorpayKeyId } from "../servi
 import {
   sellingFlightResults,
   stripFlightBookingFares,
-  flightMarginPct,
-  countryOfAirport,
   loadFlightNet,
   applyQuoteFares,
   keepSupplierResponse,
@@ -539,15 +544,10 @@ router.post("/search-multi-city", requireSBT, requireFlightAccess, async (req: a
     await rememberMultiCityTraces(legResults.map((r) => r.traceId));
 
     // Selling prices only (services/sbtQuote.ts), with the margin each leg's
-    // FareQuote will charge.
-    const mcLegs = await Promise.all(legResults.map(async (r, i) => {
-      const leg = legs[i] || {};
-      const pct = await flightMarginPct(
-        req.body?.originCountry ?? countryOfAirport(leg.Origin ?? leg.origin),
-        req.body?.destCountry ?? countryOfAirport(leg.Destination ?? leg.destination),
-      );
-      return { ...r, results: sellingFlightResults(r.results, pct) };
-    }));
+    // FareQuote will charge: this workspace's percent, domestic or international
+    // by each result's own route (services/sbtMargin.ts).
+    const mcMargins = await flightRouteMargins(req.workspaceObjectId);
+    const mcLegs = legResults.map((r) => ({ ...r, results: sellingFlightResults(r.results, mcMargins) }));
     res.json({ legs: mcLegs });
   } catch (err: any) {
     sbtLogger.error("Multi-city parallel search failed", { userId: req.user?.id, error: err.message });
@@ -577,20 +577,14 @@ router.post("/calendar", requireSBT, requireFlightAccess, async (req: any, res: 
     // DISPLAY-ONLY: clicking a date only sets the search date; the bookable fare
     // comes from /search + /farequote (which stash net for the TBO payload), so no
     // net-stash is needed here. Whole-rupee ceil to match the rest of the flight UI.
-    const calMargins = await getMarginConfig();
-    let calMarginPct = 0;
-    if (calMargins.enabled) {
-      const { originCountry, destCountry } = req.body;
-      calMarginPct = isDomestic(originCountry, destCountry)
-        ? calMargins.flight.domestic
-        : calMargins.flight.international;
-    }
+    // The workspace's percent; domestic when both airports are in India.
+    const calMargin = await resolveMargin(req.workspaceObjectId, "flight", isInternationalRoute([origin, destination]));
 
     for (const r of results) {
       const dateKey = r.DepartureDate?.slice(0, 10);
       if (dateKey) {
         fareMap[dateKey] = {
-          fare: Math.ceil(calMarginPct > 0 ? applyMargin(r.Fare, calMarginPct) : r.Fare),
+          fare: applyMargin(Number(r.Fare) || 0, calMargin.pct),
           isLowest: r.IsLowestFareOfMonth === true,
           airline: r.AirlineCode,
           airlineName: r.AirlineName,
@@ -643,7 +637,7 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
           tboStatus: mcStatus,
         });
       }
-      return res.json(sellingFlightResults(result, await flightMarginPct(req.body?.originCountry, req.body?.destCountry)));
+      return res.json(sellingFlightResults(result, await flightRouteMargins(req.workspaceObjectId)));
     }
     const jt = Number(JourneyType) || 1;
     // JT=4 (AdvanceSearch): don't force Sources — let TBO return all results,
@@ -674,7 +668,7 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
       const hasResults = Array.isArray(result?.Response?.Results) && result.Response.Results.length > 0;
       if (hasResults) {
         sbtLogger.warn("TBO search returned results with non-success status", { tboStatus });
-        return res.json(sellingFlightResults(result, await flightMarginPct(req.body?.originCountry, req.body?.destCountry)));
+        return res.json(sellingFlightResults(result, await flightRouteMargins(req.workspaceObjectId)));
       }
       const errMsg = result?.Response?.Error?.ErrorMessage || "Unknown error";
       const errCode = result?.Response?.Error?.ErrorCode ?? "unknown";
@@ -691,8 +685,8 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
 
     // Customer-facing: selling price only — no net, commission or margin fields
     // (services/sbtQuote.ts). The net is read again by /farequote and stored.
-    const marginPct = await flightMarginPct((req.body as any).originCountry, (req.body as any).destCountry);
-    res.json(sellingFlightResults(result, marginPct));
+    // The workspace's percent, domestic or international by each result's route.
+    res.json(sellingFlightResults(result, await flightRouteMargins(req.workspaceObjectId)));
     return;
   } catch (err: any) {
     sbtLogger.error("Flight search failed", { userId: req.user?.id, error: err.message });
@@ -785,13 +779,17 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
     // the selling price only (services/sbtQuote.ts sellingFlight); TBO's own
     // Fare + FareBreakdown — what Book / Ticket must send — stay on the SBTQuote
     // and are read back by the server at booking time, never from the browser.
-    const marginPct = await flightMarginPct((req.body as any).originCountry, (req.body as any).destCountry);
+    // The percent is this workspace's (services/sbtMargin.ts), domestic or
+    // international by the quoted flight's own segments — and recorded on the quote.
+    const margin = await resolveMargin(req.workspaceObjectId, "flight", isInternationalFlight(fareResults));
+    const marginPct = margin.pct;
     const rawFare = fareResults?.Fare;
     let fqQuoteId: string | undefined;
     if (rawFare) {
       fqQuoteId = randomUUID();
       const netPublished = Number(rawFare.PublishedFare) || 0;
       const netOffered = Number(rawFare.OfferedFare ?? rawFare.PublishedFare) || 0;
+      const fqSelling = applyMargin(netPublished, marginPct);
       const fqSourceRef = `${req.body?.TraceId ?? ""}:${req.body?.ResultIndex ?? ""}`;
       try {
         const fqScope = callerScope(req);
@@ -801,7 +799,7 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
         await SBTQuote.create({
           quoteId: fqQuoteId,
           product: "FLIGHT",
-          serverDisplayFare: marginPct > 0 ? applyMargin(netOffered, marginPct) : netOffered,
+          serverDisplayFare: applyMargin(netOffered, marginPct),
           serverNetFare: netOffered,
           sourceRef: fqSourceRef,
           workspaceId: fqScope.workspaceId,
@@ -809,7 +807,9 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
           traceIds: [req.body?.TraceId, result?.Response?.TraceId].filter(Boolean).map(String),
           resultIndexes: [req.body?.ResultIndex, fareResults?.ResultIndex].filter(Boolean).map(String),
           // What the customer is charged for this leg (margined PublishedFare).
-          sellingFare: marginPct > 0 ? applyMargin(netPublished, marginPct) : netPublished,
+          sellingFare: fqSelling,
+          // Which margin priced it (reports and invoices read this, never selling − net).
+          ...marginRecord(margin, fqSelling - netPublished),
           isMultiCity: fqIsMultiCity,
           supplierReissueCharges:
             Number(rawFare.SupplierReissueCharges || fareResults?.FareBreakdown?.[0]?.SupplierReissueCharges) || 0,
@@ -856,7 +856,7 @@ router.post("/price-rbd", requireAuth, requireSBT, async (req: any, res: any) =>
       request: req.body,
       response: result,
     });
-    res.json(sellingFlightResults(result, await flightMarginPct(req.body?.originCountry, req.body?.destCountry)));
+    res.json(sellingFlightResults(result, await flightRouteMargins(req.workspaceObjectId)));
   } catch (err: any) {
     sbtLogger.error("[PRICE-RBD] error", { error: err.message });
     res.status(500).json({ error: err.message });
@@ -1881,11 +1881,24 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
       ? (typeof fulfilCtx?.legAmount === "number" ? fulfilCtx.legAmount : payFacts.amount)
       : Number(b.totalFare) || 0;
     const normTotalFare = chargedAmount;
-    // Guard: only compute margin when net resolved (>0). If unresolved, leave 0 rather
-    // than write a wrong margin from a missing net.
-    const normMarginAmount = normNetAmount > 0 ? normTotalFare - normNetAmount : 0;
-    const normMarginPercent =
-      normNetAmount > 0 ? Math.round((normMarginAmount / normNetAmount) * 100 * 100) / 100 : 0;
+    // The margin is the one the quote recorded (services/sbtMargin.ts), carried on
+    // the payment row — never charged − net (that counted add-ons as margin). A
+    // multi-city leg takes its own quote's record; one booking covering a return
+    // takes the sum of its quotes.
+    const recorded = payFacts?.margin ?? null;
+    const legMargin = recorded && typeof fulfilCtx?.legIndex === "number"
+      ? (recorded.legs || []).find((l: any) => (l.resultIndexes || []).includes(String(reconResultIndex)))
+        ?? recorded.legs?.[fulfilCtx.legIndex] ?? null
+      : null;
+    const marginRec = legMargin ?? recorded;
+    // No record (a quote from before margins were recorded, or the demo
+    // simulator): charged − net, as before, only when the net resolved.
+    const normMarginAmount = marginRec
+      ? marginRec.marginAmount
+      : normNetAmount > 0 ? normTotalFare - normNetAmount : 0;
+    const normMarginPercent = marginRec
+      ? marginRec.marginPct
+      : normNetAmount > 0 ? Math.round((normMarginAmount / normNetAmount) * 100 * 100) / 100 : 0;
 
     const doc = await SBTBooking.create({
       userId: bookingUserId,
@@ -1920,6 +1933,11 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
       displayAmount: normTotalFare,
       marginAmount: normMarginAmount,
       marginPercent: normMarginPercent,
+      ...(marginRec ? {
+        marginSource: marginRec.marginSource,
+        marginOverrideId: marginRec.marginOverrideId ?? undefined,
+        marginVersion: marginRec.marginVersion,
+      } : {}),
       currency: b.currency ?? "INR",
       isLCC: b.isLCC ?? false,
       razorpayPaymentId: payFacts?.razorpayPaymentId ?? "",
@@ -2652,9 +2670,8 @@ router.get("/bookings/:id/reissue-search", requireAuth, requireSBT, async (req: 
     }
 
     // Selling prices only, with the margin this route's FareQuote charges.
-    const reissuePct = await flightMarginPct(countryOfAirport(booking.origin?.code), countryOfAirport(booking.destination?.code));
     return res.json({
-      searchResult: sellingFlightResults(searchResult, reissuePct),
+      searchResult: sellingFlightResults(searchResult, await flightRouteMargins(req.workspaceObjectId)),
       originalBooking: {
         _id: booking._id,
         pnr: booking.pnr,
@@ -2888,8 +2905,8 @@ router.post("/bookings/:id/reissue-farequote", requireAuth, requireSBT, async (r
     }
 
     const fareQuoteResult = await getFareQuote({ TraceId, ResultIndex });
-    const rfqPct = await flightMarginPct(countryOfAirport(booking.origin?.code), countryOfAirport(booking.destination?.code));
-    return res.json({ fareQuoteResult: sellingFlightResults(fareQuoteResult, rfqPct), originalBooking: { pnr: booking.pnr, bookingId: booking.bookingId } });
+    const rfqMargins = await flightRouteMargins(req.workspaceObjectId);
+    return res.json({ fareQuoteResult: sellingFlightResults(fareQuoteResult, rfqMargins), originalBooking: { pnr: booking.pnr, bookingId: booking.bookingId } });
   } catch (err: any) {
     sbtLogger.error("Reissue-farequote failed", { bookingId: req.params.id, error: err.message });
     res.status(500).json({ error: err.message });

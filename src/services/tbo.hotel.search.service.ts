@@ -26,10 +26,8 @@ import {
   chunk,
   CITY_CACHE_TTL,
 } from "./tbo.hotel.shared.js";
-import {
-  getMarginConfig,
-  applyMarginWithFloor,
-} from "../utils/margin.js";
+import { applyMarginWithFloor } from "../utils/margin.js";
+import { resolveMargin, hotelCountries, isInternationalCountry } from "./sbtMargin.js";
 import { sbtLogger } from "../utils/logger.js";
 import { TBO_URLS } from "../config/tboUrls.js";
 
@@ -52,6 +50,8 @@ export interface HotelSearchInput {
     MealType?: string;
     StarRating?: number;
   };
+  /** The caller's workspace (server-resolved) — whose margin prices the results. */
+  workspaceId?: unknown;
 }
 
 export interface HotelSearchOutput {
@@ -160,6 +160,9 @@ export async function searchHotels(
   // 1. Build hotel metadata map and collect codes to search
   const hotelMeta = new Map<string, HotelCodeEntry>();
   let allCodes: string[];
+  // The city the server actually priced (city searches only) — its country
+  // decides domestic vs international for hotels the master doesn't know.
+  let searchedCityCode = "";
 
   if (directCodes.length) {
     for (const entry of hotelNameIndex) {
@@ -190,6 +193,7 @@ export async function searchHotels(
         );
       }
     }
+    searchedCityCode = resolvedCityCode;
     // PRIMARY (Phase 4): read the city's hotel codes from the local catalog
     // (tbohotelmasters), rank by star rating desc, and price only the TOP-N.
     // Step-1 verification confirmed the resolved cityCode equals the cityCode
@@ -452,27 +456,36 @@ export async function searchHotels(
     };
   }
 
-  // 10. Margin (RSP-floor aware)
-  const margins = await getMarginConfig();
-  const isHotelDomestic = (CountryCode || "IN") === "IN";
-  const marginPct = margins.enabled
-    ? (isHotelDomestic ? margins.hotel.domestic : margins.hotel.international)
-    : 0;
-  const hotelsWithMargin: any[] = allResults.map((hotel: any) => ({
-    ...hotel,
-    Rooms: hotel.Rooms?.map((room: any) => {
-      const net = room.TotalFare ?? 0;
-      const rsp = typeof room.recommendedSellingRate === "number"
-        ? room.recommendedSellingRate
-        : null;
-      // Customer-facing (SBT /search): only the selling price is added. No
-      // _netAmount/_markupAmount/_marginPercent/_rsp/_rspClamped.
-      return {
-        ...room,
-        _displayTotalFare: applyMarginWithFloor(net, marginPct, rsp),
-      };
-    }),
-  }));
+  // 10. Margin (RSP-floor aware): the workspace's percent (services/sbtMargin.ts),
+  // domestic or international per hotel from the hotel / city master — never
+  // the request's CountryCode. Each hotel carries its percent as
+  // `_marginPercent` (a cost key: customerHotelResults reads it, never sends it).
+  const countries = await hotelCountries(allResults.map((h: any) => h?.HotelCode), searchedCityCode);
+  const [domestic, international] = await Promise.all([
+    resolveMargin(input.workspaceId, "hotel", false),
+    resolveMargin(input.workspaceId, "hotel", true),
+  ]);
+  const hotelsWithMargin: any[] = allResults.map((hotel: any) => {
+    const intl = isInternationalCountry(countries.get(String(hotel?.HotelCode ?? "")));
+    const pct = (intl ? international : domestic).pct;
+    return {
+      ...hotel,
+      _marginPercent: pct,
+      _isInternational: intl,
+      Rooms: hotel.Rooms?.map((room: any) => {
+        const net = room.TotalFare ?? 0;
+        const rsp = typeof room.recommendedSellingRate === "number"
+          ? room.recommendedSellingRate
+          : null;
+        return {
+          ...room,
+          _displayTotalFare: applyMarginWithFloor(net, pct, rsp),
+        };
+      }),
+    };
+  });
+  // Domestic percent for anything not classified per hotel.
+  const marginPct = domestic.pct;
 
   return {
     ok: true,

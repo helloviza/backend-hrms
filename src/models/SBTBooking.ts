@@ -94,7 +94,12 @@ export interface ISBTBooking extends Document {
   displayAmount?: number;
   marginPercent?: number;
   marginAmount?: number;
-  ticketingStatus: "NOT_ATTEMPTED" | "TICKETED" | "FAILED" | "TICKET_FAILED" | "PENDING";
+  // Which margin rule priced the booking (from its quote): DEFAULT / OVERRIDE /
+  // OFF, the override row and the defaults version. Absent on older bookings.
+  marginSource?: string;
+  marginOverrideId?: string | null;
+  marginVersion?: number;
+  ticketingStatus:"NOT_ATTEMPTED" | "TICKETED" | "FAILED" | "TICKET_FAILED" | "PENDING";
   ticketingError?: string;
   raw?: unknown;
   cancelPolicies?: any[];
@@ -227,6 +232,9 @@ const SBTBookingSchema = new Schema(
     displayAmount: { type: Number, default: 0 },
     marginPercent: { type: Number, default: 0 },
     marginAmount: { type: Number, default: 0 },
+    marginSource: { type: String },
+    marginOverrideId: { type: String },
+    marginVersion: { type: Number },
     ticketingStatus: {
       type: String,
       enum: ["NOT_ATTEMPTED", "TICKETED", "FAILED", "TICKET_FAILED", "PENDING"],

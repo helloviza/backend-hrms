@@ -83,7 +83,7 @@ describe("searchFlightsForChat — discriminated result", () => {
     expect(result.flights[0].fare.published).toBe(5000);
     expect(result.flights[0].fare.offered).toBe(5000);
 
-    const margined = await searchFlightsForChat({ ...baseParams, marginPct: 10 });
+    const margined = await searchFlightsForChat({ ...baseParams, margins: 10 });
     expect(margined.flights[0].fare.published).toBe(5500);
     expect(margined.flights[0].fare.offered).toBe(5500);
   });

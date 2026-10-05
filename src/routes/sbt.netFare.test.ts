@@ -472,7 +472,9 @@ describe("flight booking: the server supplies the net, the browser's is ignored"
     const row = reg.body.rows[0];
     expect(row.net).toBe(NET_FARE.OfferedFare);
     expect(row.fare).toBe(NET_FARE.BaseFare);
-    expect(row.margin).toBe(Math.ceil(sellingOf(9800)) - NET_FARE.OfferedFare);
+    // The margin the FareQuote recorded (selling − the PublishedFare it was
+    // applied to) — not charged − OfferedFare, which also counted commission.
+    expect(row.margin).toBe(Math.ceil(sellingOf(9800)) - NET_FARE.PublishedFare);
   });
 });
 

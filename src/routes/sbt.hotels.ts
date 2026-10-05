@@ -18,7 +18,14 @@ import { logTBOCall } from "../utils/tboFileLogger.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { requireFeature } from "../middleware/requireFeature.js";
-import { getMarginConfig, applyMargin, applyMarginWithFloor, violatesRspFloor } from "../utils/margin.js";
+import { applyMarginWithFloor, violatesRspFloor } from "../utils/margin.js";
+import {
+  resolveMargin,
+  marginRecord,
+  hotelCountries,
+  hotelCodeOfBookingCode,
+  isInternationalCountry,
+} from "../services/sbtMargin.js";
 import { getTBOToken, logoutTBO } from "../services/tbo.auth.service.js";
 import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
 import { getCompanySettings } from "../utils/companySettings.js";
@@ -60,7 +67,6 @@ import {
   customerRoom,
   customerHotelResults,
   customerHotelBooking,
-  hotelMarginPct,
   policiesWithoutAmounts,
   stripHotelCost,
 } from "../services/sbtQuote.js";
@@ -307,9 +313,30 @@ function validateBookingCodeAge(bookingCode: string): boolean {
   if (!ts) return false;
   if (Date.now() - ts > HOTEL_SESSION_TTL_MS) {
     bookingCodeTimestamps.delete(bookingCode);
+    bookingCodeInternational.delete(bookingCode);
     return false;
   }
   return true;
+}
+
+// Domestic / international of each BookingCode as /search or /rooms classified
+// it on the server (hotel / city master), so /prebook prices the room the way
+// it was shown. Same lifetime and instance affinity as bookingCodeTimestamps.
+const bookingCodeInternational = new Map<string, boolean>();
+// The same per hotel code, from city searches (a hotel the master does not
+// know is classified by the searched city) — read by /rooms.
+const hotelCodeInternational = new Map<string, boolean>();
+
+/** Server-side domestic / international for a BookingCode or hotel: what
+ *  search saw, else the hotel master; unknown → international. */
+async function bookingCodeIsInternational(bookingCode: string, hotelCode?: unknown): Promise<boolean> {
+  const seen = bookingCode ? bookingCodeInternational.get(bookingCode) : undefined;
+  if (typeof seen === "boolean") return seen;
+  const code = String(hotelCode ?? "") || hotelCodeOfBookingCode(bookingCode);
+  const seenHotel = hotelCodeInternational.get(code);
+  if (typeof seenHotel === "boolean") return seenHotel;
+  const countries = await hotelCountries([code]);
+  return isInternationalCountry(countries.get(code));
 }
 
 // ─── GAP-40: Shared booking validation (single source of truth) ───────────────
@@ -817,6 +844,7 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       CountryCode: req.body?.CountryCode,
       HotelCodes: req.body?.HotelCodes,
       Filters: req.body?.Filters,
+      workspaceId: req.workspaceObjectId,
     });
 
     if (isHotelSearchError(result)) {
@@ -833,19 +861,25 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
     // /prebook and /book. Concierge's read-only search path does not need
     // this — it never proceeds to prebook on its own endpoint.
     searchCache.set(result.searchId, { data: result.hotels, ts: result.searchTs });
+    if (hotelCodeInternational.size > 50_000) hotelCodeInternational.clear();
     for (const h of result.hotels as any[]) {
+      if (typeof h?._isInternational === "boolean" && h?.HotelCode) hotelCodeInternational.set(String(h.HotelCode), h._isInternational);
       if (Array.isArray(h?.Rooms)) {
         for (const r of h.Rooms) {
-          if (r?.BookingCode) bookingCodeTimestamps.set(r.BookingCode, result.searchTs);
+          if (r?.BookingCode) {
+            bookingCodeTimestamps.set(r.BookingCode, result.searchTs);
+            if (typeof h._isInternational === "boolean") bookingCodeInternational.set(r.BookingCode, h._isInternational);
+          }
         }
       }
     }
 
     // Rooms from an allow-list: selling total + per-night selling rate, no net,
-    // DayRates, RSP or commission (services/sbtQuote.ts customerRoom).
+    // DayRates, RSP or commission (services/sbtQuote.ts customerRoom). Each
+    // hotel is priced at the percent the search service resolved for it.
     res.json({
       TraceId: "",
-      Hotels: customerHotelResults(result.hotels, result.marginPct ?? (await hotelMarginPct(req.body?.CountryCode))),
+      Hotels: customerHotelResults(result.hotels, result.marginPct),
       SearchId: result.searchId,
       CityName: result.cityName,
     });
@@ -938,34 +972,23 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
     });
 
     // Markup for display; NetAmount (what TBO Book needs) stays on the server quote.
-    const prebookMarginPct = await hotelMarginPct((req.body as any).countryCode || "IN");
-    // RSP floor (TBO cert spec lines 1415/1746/1760): clamp display to RSP if present.
-    // Round half-up to whole rupee (568.45→568, 568.50→569): the customer-facing
-    // total must equal the exact Razorpay charge (no paise drift).
-    //
-    // RSP-floor clamp: a bare round can drop below a fractional RSP floor
-    // (round(568.40)=568 < 568.40) and trip a false RSP_FLOOR_VIOLATED at booking.
-    // So we floor-clamp to Math.ceil(RSP) — the smallest whole rupee that is still
-    // >= the supplier's recommended minimum — guaranteeing charged >= floor.
-    const rspFloorCeil =
-      typeof recommendedSellingRate === "number" && recommendedSellingRate > 0
-        ? Math.ceil(recommendedSellingRate)
-        : 0;
-    const displayTotalFare = Math.max(
-      Math.round(
-        applyMarginWithFloor(
-          prebookTotalFare,
-          prebookMarginPct,
-          recommendedSellingRate,
-        ),
-      ),
-      rspFloorCeil,
+    // The workspace's percent (services/sbtMargin.ts), domestic or international
+    // as search classified this room on the server — never the request's country.
+    const prebookMargin = await resolveMargin(
+      req.workspaceObjectId,
+      "hotel",
+      await bookingCodeIsInternational(String(BookingCode), prebookHotel?.HotelCode),
     );
+    const prebookMarginPct = prebookMargin.pct;
+    // Whole rupee, rounded UP, never below the supplier's RSP (TBO cert spec
+    // lines 1415/1746/1760) rounded up — so the charge is >= the floor even
+    // when the percent is negative. The customer total is the exact charge.
+    const displayTotalFare = applyMarginWithFloor(prebookTotalFare, prebookMarginPct, recommendedSellingRate);
 
     // Price change: the browser sends the SELLING total it showed (search
     // _displayTotalFare); compare it with the same selling computation now.
     const PRICE_CHANGE_TOLERANCE = 1; // rupees — below this is rounding noise
-    const prebookSelling = applyMarginWithFloor(prebookTotalFare, prebookMarginPct, recommendedSellingRate);
+    const prebookSelling = displayTotalFare;
     const priceChanged = typeof searchPrice === "number" && searchPrice > 0
       ? Math.abs(prebookSelling - searchPrice) > PRICE_CHANGE_TOLERANCE
       : false;
@@ -998,6 +1021,8 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
         tds,
         isPublishedFare,
         cancelPolicies,
+        // Which margin priced it; the amount is selling − the room total it was applied to.
+        ...marginRecord(prebookMargin, displayTotalFare - Number(prebookTotalFare || 0)),
       });
     } catch (qErr: any) {
       sbtLogger.error("[sbt-quote] hotel quote not stored — PreBook refused", {
@@ -1495,6 +1520,16 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
           agentCommission: Number(bookQuote.agentCommission) || 0,
           tds: Number(bookQuote.tds) || 0,
           isPublishedFare: bookQuote.isPublishedFare === true,
+          // The margin the PreBook quote recorded (services/sbtMargin.ts) —
+          // reports and invoices read this, never selling − net.
+          ...(typeof bookQuote.marginPct === "number" ? {
+            marginPercent: bookQuote.marginPct,
+            marginAmount: Number(bookQuote.marginAmount) || 0,
+            marginSource: bookQuote.marginSource,
+            marginOverrideId: bookQuote.marginOverrideId || undefined,
+            marginVersion: Number(bookQuote.marginVersion) || 0,
+            displayAmount: Math.round(Number(bookQuote.serverDisplayFare) || 0),
+          } : {}),
           userId: _bookUserId,
           workspaceId: req.workspaceObjectId,
           bookingId: "",
@@ -3676,15 +3711,20 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
     // Register BookingCodes so /prebook + /book pass the 40-min session-age
     // gate. The /search route already does this for the city-wide flow; we
     // mirror it here so concierge handoff (skips SBT /search) still works.
+    // Margin (RSP-floor aware), same as /search: the workspace's percent,
+    // domestic or international from the server's hotel data (the body's
+    // countryCode is ignored). /rooms is the concierge-handoff path (skips SBT
+    // /search): rooms from the same allow-list, selling only.
+    const roomsIntl = await bookingCodeIsInternational("", hotelCode);
     const roomsTs = Date.now();
     for (const r of match.Rooms as any[]) {
-      if (r?.BookingCode) bookingCodeTimestamps.set(r.BookingCode, roomsTs);
+      if (r?.BookingCode) {
+        bookingCodeTimestamps.set(r.BookingCode, roomsTs);
+        bookingCodeInternational.set(r.BookingCode, roomsIntl);
+      }
     }
-
-    // Margin (RSP-floor aware), same as /search. /rooms is the concierge-handoff
-    // path (skips SBT /search): rooms from the same allow-list, selling only.
-    const roomsMarginPct = await hotelMarginPct(countryCode || "IN");
-    res.json({ ok: true, rooms: (match.Rooms as any[]).map((room: any) => customerRoom(room, roomsMarginPct)) });
+    const roomsMargin = await resolveMargin(req.workspaceObjectId, "hotel", roomsIntl);
+    res.json({ ok: true, rooms: (match.Rooms as any[]).map((room: any) => customerRoom(room, roomsMargin.pct)) });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Room fetch failed";
     sbtLogger.error("Hotel rooms fetch failed", { error: msg });

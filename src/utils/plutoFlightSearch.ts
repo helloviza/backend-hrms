@@ -17,6 +17,7 @@ import {
 } from "../services/policyEvaluator.js";
 import { recordFareObservations } from "../services/fareObservations.js";
 import { sellingFlight } from "../services/sbtQuote.js";
+import { flightRouteMargins, type RouteMargins } from "../services/sbtMargin.js";
 
 // In-policy first, then needs-approval, then out-of-policy. Stable, so the
 // within-rank fare ordering from dedupeRawTBOFlights is preserved.
@@ -198,9 +199,10 @@ export interface ChatFlightSearchResult {
  * Round-trip: pass journeyType:2 with a returnDate to search both legs; the
  * inbound options are mapped from TBO Results[1] exactly as the hardened
  * /flights/search path does. One-way (journeyType:1, the default) is unchanged.
- * Prices are SELLING prices: `marginPct` (the route's flight margin, as SBT
- * search applies it) is folded in and every net / commission field dropped
- * before mapping (services/sbtQuote.ts sellingFlight).
+ * Prices are SELLING prices: `margins` (the workspace's flight percents, as SBT
+ * search applies them — resolved from `workspaceObjectId` when not given) are
+ * folded in and every net / commission field dropped before mapping
+ * (services/sbtQuote.ts sellingFlight).
  */
 export async function searchFlightsForChat(params: {
   origin: string;
@@ -216,7 +218,7 @@ export async function searchFlightsForChat(params: {
   requestId?: string;
   policyRules?: PolicyRules | null;
   workspaceObjectId?: any;
-  marginPct?: number;
+  margins?: number | RouteMargins;
 }): Promise<ChatFlightSearchResult> {
   const {
     origin, destination, departDate, returnDate,
@@ -227,7 +229,6 @@ export async function searchFlightsForChat(params: {
     requestId = "",
     policyRules = null,
     workspaceObjectId = null,
-    marginPct = 0,
   } = params;
 
   try {
@@ -263,7 +264,8 @@ export async function searchFlightsForChat(params: {
     const resultsArr: any[] = Array.isArray(tboResult?.Response?.Results)
       ? tboResult.Response.Results
       : [];
-    const sell = (rows: unknown): any[] => (Array.isArray(rows) ? rows.map((r: any) => sellingFlight(r, marginPct)) : []);
+    const margins = params.margins ?? (await flightRouteMargins(workspaceObjectId));
+    const sell = (rows: unknown): any[] => (Array.isArray(rows) ? rows.map((r: any) => sellingFlight(r, margins)) : []);
     const outboundRaw: any[] = sell(resultsArr[0]);
     const inboundRaw: any[] = sell(resultsArr[1]);
 

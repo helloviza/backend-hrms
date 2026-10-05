@@ -66,6 +66,10 @@ export interface ISBTHotelBooking extends Document {
   paymentMode?: "official" | "personal";
   marginPercent?: number;
   marginAmount?: number;
+  // Which margin rule priced the booking (from its PreBook quote). Absent on older bookings.
+  marginSource?: string;
+  marginOverrideId?: string | null;
+  marginVersion?: number;
   displayAmount?: number;
   raw?: unknown;
   tboVoucherData?: unknown;
@@ -199,6 +203,9 @@ const SBTHotelBookingSchema = new Schema(
     paymentMode: { type: String, enum: ["official", "personal"], default: "personal" },
     marginPercent: { type: Number, default: 0 },
     marginAmount: { type: Number, default: 0 },
+    marginSource: { type: String },
+    marginOverrideId: { type: String },
+    marginVersion: { type: Number },
     displayAmount: { type: Number, default: 0 },
     raw: { type: Schema.Types.Mixed, default: null },
     tboVoucherData: { type: Schema.Types.Mixed, default: null },

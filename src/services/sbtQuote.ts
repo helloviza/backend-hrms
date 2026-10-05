@@ -13,11 +13,9 @@
 //   hotels    customerRoom / customerHotelResults     search, rooms, prebook (room allow-list)
 //             stripHotelCost                          any other hotel payload (book, voucher…)
 //   bookings  customerFlightBooking / customerHotelBooking   booking documents sent to customers
-import { readFileSync } from "fs";
-import { fileURLToPath } from "url";
-import path from "path";
 import SBTPayment from "../models/SBTPayment.js";
-import { applyMargin, applyMarginWithFloor, getMarginConfig, isDomestic } from "../utils/margin.js";
+import { applyMargin, applyMarginWithFloor } from "../utils/margin.js";
+import { pctForFlight, type RouteMargins } from "./sbtMargin.js";
 import { callerScope, loadScopedQuote, FARE_EXPIRED, type Refusal } from "./sbtPaymentGate.js";
 import { sbtLogger } from "../utils/logger.js";
 
@@ -32,39 +30,7 @@ const isObj = (v: unknown): v is AnyObj => {
   return proto === Object.prototype || proto === null;
 };
 
-/* ───────────────────────── margins ───────────────────────── */
-
-let airportCountry: Map<string, string> | null = null;
-
-/** ISO country of an airport (data/airports.json), "" when unknown. */
-export function countryOfAirport(iata: unknown): string {
-  if (!airportCountry) {
-    airportCountry = new Map();
-    try {
-      const file = path.join(path.dirname(fileURLToPath(import.meta.url)), "../data/airports.json");
-      for (const a of JSON.parse(readFileSync(file, "utf-8")) as AnyObj[]) {
-        if (a?.code) airportCountry.set(String(a.code).toUpperCase(), String(a.countryCode || ""));
-      }
-    } catch (err: any) {
-      sbtLogger.warn("[sbt-quote] airports.json not readable", { err: err?.message });
-    }
-  }
-  return airportCountry.get(String(iata ?? "").toUpperCase()) || "";
-}
-
-/** The flight margin percent for a route (0 when margins are off). */
-export async function flightMarginPct(originCountry?: string, destCountry?: string): Promise<number> {
-  const m = await getMarginConfig();
-  if (!m.enabled) return 0;
-  return isDomestic(originCountry, destCountry) ? m.flight.domestic : m.flight.international;
-}
-
-/** The hotel margin percent for a destination country (0 when margins are off). */
-export async function hotelMarginPct(countryCode?: string): Promise<number> {
-  const m = await getMarginConfig();
-  if (!m.enabled) return 0;
-  return (countryCode || "IN") === "IN" ? m.hotel.domestic : m.hotel.international;
-}
+// Margin percents are decided in services/sbtMargin.ts (resolveMargin).
 
 /* ───────────────────────── flights ───────────────────────── */
 
@@ -87,7 +53,7 @@ function dropKeys(o: AnyObj, keys: readonly string[]): AnyObj {
  *  rows add up to exactly `amount`. */
 function foldIntoBreakdown(rows: unknown[], amount: number): unknown[] {
   const clean = rows.map((r) => (isObj(r) ? dropKeys(r, FLIGHT_FARE_COST_KEYS) : r));
-  if (!(amount > 0) || clean.length === 0) return clean;
+  if (!amount || clean.length === 0) return clean;
   const total: number = clean.reduce((s: number, r) => s + (isObj(r) ? num(r.BaseFare) : 0), 0) as number;
   let given = 0;
   return clean.map((r, i) => {
@@ -106,18 +72,21 @@ function foldIntoBreakdown(rows: unknown[], amount: number): unknown[] {
  * TBO's net-of-commission figure — never shown), the cost keys are gone, and
  * the margin is folded into BaseFare (top-level and FareBreakdown) so
  * BaseFare + Tax adds up to the total. `flight.Fare` must be TBO's raw fare.
- * Only a positive margin is applied — the same rule search and FareQuote use.
+ * `margins` is one percent, or the workspace's domestic / international pair
+ * picked by the flight's own route (services/sbtMargin.ts). Selling = net ×
+ * (1 + pct), whole rupee rounded up — the figure FareQuote stores. A negative
+ * percent sells below net; TBO is still paid the net held on the server.
  */
-export function sellingFlight<T extends AnyObj>(flight: T, marginPct: number): T {
+export function sellingFlight<T extends AnyObj>(flight: T, margins: number | RouteMargins): T {
   const fare = flight?.Fare;
   if (!isObj(fare)) return flight;
   const netPublished = num(fare.PublishedFare);
-  const selling = marginPct > 0 ? applyMargin(netPublished, marginPct) : netPublished;
+  const selling = applyMargin(netPublished, pctForFlight(flight, margins));
   const margin = round2(selling - netPublished);
   const sellingFare: AnyObj = dropKeys(fare, FLIGHT_FARE_COST_KEYS);
   sellingFare.PublishedFare = selling;
   sellingFare.OfferedFare = selling;
-  if (margin > 0) sellingFare.BaseFare = round2(num(fare.BaseFare) + margin);
+  if (margin) sellingFare.BaseFare = round2(num(fare.BaseFare) + margin);
   return {
     ...flight,
     Fare: sellingFare,
@@ -129,21 +98,21 @@ export function sellingFlight<T extends AnyObj>(flight: T, marginPct: number): T
  *  round-trip [[ob],[ib]], a single Results object, multi-city legs, PriceRBD).
  *  A flight result = an object with Fare and ResultIndex or Segments. Any other
  *  cost key found on the way is dropped too. Returns a copy. */
-export function sellingFlightResults(node: unknown, marginPct: number): any {
-  if (Array.isArray(node)) return node.map((n) => sellingFlightResults(n, marginPct));
+export function sellingFlightResults(node: unknown, margins: number | RouteMargins): any {
+  if (Array.isArray(node)) return node.map((n) => sellingFlightResults(n, margins));
   if (!isObj(node)) return node;
   if ("Fare" in node && ("ResultIndex" in node || "Segments" in node)) {
-    const sold = sellingFlight(node, marginPct);
+    const sold = sellingFlight(node, margins);
     const out: AnyObj = {};
     for (const [k, v] of Object.entries(sold)) {
-      out[k] = k === "Fare" || k === "FareBreakdown" ? v : sellingFlightResults(v, marginPct);
+      out[k] = k === "Fare" || k === "FareBreakdown" ? v : sellingFlightResults(v, margins);
     }
     return out;
   }
   const out: AnyObj = {};
   for (const [k, v] of Object.entries(node)) {
     if ((FLIGHT_FARE_COST_KEYS as readonly string[]).includes(k)) continue;
-    out[k] = sellingFlightResults(v, marginPct);
+    out[k] = sellingFlightResults(v, margins);
   }
   return out;
 }
@@ -292,6 +261,7 @@ export const HOTEL_COST_KEYS = [
   "RecommendedSellingRate", "recommendedSellingRate", "MinimumRate",
   "netAmount", "agentCommission", "tds", "isPublishedFare",
   "marginAmount", "marginPercent", "_markupAmount", "_netAmount", "_rsp", "_rspClamped", "_marginPercent",
+  "marginSource", "marginOverrideId", "marginVersion", "_isInternational",
 ] as const;
 
 /** Drop hotel cost keys at every depth. Returns a copy. */
@@ -369,10 +339,12 @@ export function customerRoom(room: AnyObj, marginPct: number, selling?: number):
 }
 
 /** Hotel search / rooms / prebook payloads: every `Rooms` array is rebuilt with
- *  customerRoom, every other node loses its cost keys. */
+ *  customerRoom, every other node loses its cost keys. A hotel the search
+ *  service classified carries its own percent (`_marginPercent`, never sent). */
 export function customerHotelResults(node: unknown, marginPct: number, firstRoomSelling?: number): any {
   if (Array.isArray(node)) return node.map((n) => customerHotelResults(n, marginPct, firstRoomSelling));
   if (!isObj(node)) return node;
+  if (typeof node._marginPercent === "number") marginPct = node._marginPercent;
   const out: AnyObj = {};
   for (const [k, v] of Object.entries(node)) {
     if ((HOTEL_COST_KEYS as readonly string[]).includes(k)) continue;
@@ -397,7 +369,10 @@ const toPlain = (doc: any): AnyObj => (doc && typeof doc.toObject === "function"
  */
 export function customerFlightBooking(doc: any): AnyObj {
   const d = { ...toPlain(doc) };
-  for (const k of ["netAmount", "marginAmount", "marginPercent", "fareBreakdown", "commissionEarned", "tds"]) delete d[k];
+  for (const k of [
+    "netAmount", "marginAmount", "marginPercent", "marginSource", "marginOverrideId", "marginVersion",
+    "fareBreakdown", "commissionEarned", "tds",
+  ]) delete d[k];
   if (Array.isArray(d.passengers)) {
     d.passengers = d.passengers.map((p: AnyObj) => {
       if (!isObj(p)) return p;

@@ -40,6 +40,16 @@ export interface ISBTQuote extends Document {
   tds?: number;
   isPublishedFare?: boolean;
   cancelPolicies?: Array<Record<string, unknown>>;
+  // The margin that priced this quote (services/sbtMargin.ts marginRecord):
+  // percent, DEFAULT / OVERRIDE / OFF, the override row, the defaults version,
+  // domestic or international (server-decided), and selling − the net it was
+  // applied to (flights: PublishedFare; hotels: room TotalFare).
+  marginPct?: number;
+  marginSource?: "DEFAULT" | "OVERRIDE" | "OFF";
+  marginOverrideId?: string | null;
+  marginVersion?: number;
+  isInternational?: boolean;
+  marginAmount?: number;
   createdAt: Date;
 }
 
@@ -64,6 +74,12 @@ const SBTQuoteSchema = new Schema<ISBTQuote>({
   tds: { type: Number },
   isPublishedFare: { type: Boolean },
   cancelPolicies: { type: Schema.Types.Mixed, default: undefined },
+  marginPct: { type: Number },
+  marginSource: { type: String, enum: ["DEFAULT", "OVERRIDE", "OFF"] },
+  marginOverrideId: { type: String, default: undefined },
+  marginVersion: { type: Number },
+  isInternational: { type: Boolean },
+  marginAmount: { type: Number },
   // TTL: rows self-expire 60 min after creation. This exceeds the
   // quote→pay→book window with margin; tunable if that window ever grows.
   createdAt: { type: Date, default: Date.now, expires: 3600 },

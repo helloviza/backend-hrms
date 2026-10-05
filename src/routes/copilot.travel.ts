@@ -46,13 +46,8 @@ import {
 
 import { searchFlights as tboSearchFlights } from "../services/tbo.flight.service.js";
 import { searchHotels, isHotelSearchError } from "../services/tbo.hotel.search.service.js";
-import {
-  sellingFlight,
-  flightMarginPct,
-  countryOfAirport,
-  customerHotelResults,
-  hotelMarginPct,
-} from "../services/sbtQuote.js";
+import { sellingFlight, customerHotelResults } from "../services/sbtQuote.js";
+import { flightRouteMargins } from "../services/sbtMargin.js";
 import {
   CABIN_LABELS,
   dedupeRawTBOFlights,
@@ -123,7 +118,6 @@ import Itinerary from "../models/Itinerary.js";
 import { assembleItinerary, type ItineraryItemInput } from "../services/itineraryAssembly.js";
 import { sendMail } from "../utils/mailer.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
-import { getMarginConfig, applyMargin, isDomestic } from "../utils/margin.js";
 
 // ✅ VIDEO CONTEXT ADAPTER (AUTHORITATIVE)
 import {
@@ -464,13 +458,12 @@ router.post("/flights/search", async (req, res) => {
     // Workspace margin parity with SBT: the same TBO ResultIndex is quoted at the
     // same SELLING price via concierge and via SBT, and nothing net, commission
     // or margin reaches the browser (services/sbtQuote.ts sellingFlight).
-    const flightMarginPctForRoute = await flightMarginPct(
-      (req.body as any).originCountry,
-      (req.body as any).destCountry,
-    );
+    // This workspace's percent, domestic or international by each result's own
+    // route (services/sbtMargin.ts) — the body's originCountry/destCountry are ignored.
+    const routeMargins = await flightRouteMargins((req as any).workspaceObjectId);
     for (let i = 0; i < resultsArr.length; i++) {
       if (Array.isArray(resultsArr[i])) {
-        resultsArr[i] = resultsArr[i].map((flight: any) => sellingFlight(flight, flightMarginPctForRoute));
+        resultsArr[i] = resultsArr[i].map((flight: any) => sellingFlight(flight, routeMargins));
       }
     }
 
@@ -555,6 +548,7 @@ router.post("/hotels/search", async (req, res) => {
       CountryCode: req.body?.CountryCode,
       HotelCodes: req.body?.HotelCodes,
       Filters: req.body?.Filters,
+      workspaceId: (req as any).workspaceObjectId,
     });
 
     if (isHotelSearchError(result)) {
@@ -573,9 +567,10 @@ router.post("/hotels/search", async (req, res) => {
     const hotelPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
     // Rooms from the customer allow-list (selling total only — no net TotalFare,
     // DayRates, RSP or commission); policy is evaluated before the rooms are shaped.
-    const hotelMarginPctForSearch = result.marginPct ?? (await hotelMarginPct(req.body?.CountryCode));
+    // Each hotel at the percent the search service resolved for it (workspace,
+    // domestic / international from the hotel master — services/sbtMargin.ts).
     const annotatedHotels = (result.hotels || []).map((h: any) => ({
-      ...customerHotelResults(h, hotelMarginPctForSearch),
+      ...customerHotelResults(h, result.marginPct),
       policy: evaluateHotelPolicy(hotelForPolicyFromResult(h, nights), hotelPolicyRules),
     }));
     const inPolicyCount = annotatedHotels.filter((h: any) => h?.policy?.status === "IN_POLICY").length;
@@ -1023,7 +1018,7 @@ async function runConciergeTurn(
           policyRules: chatPolicyRules,
           workspaceObjectId: (req as any).workspaceObjectId,
           // Selling prices, the same margin SBT search / FareQuote apply.
-          marginPct: await flightMarginPct(countryOfAirport(originIATA), countryOfAirport(destIATA)),
+          margins: await flightRouteMargins((req as any).workspaceObjectId),
         });
         if (chatResult.ok) {
           chatFlights = chatResult.flights;

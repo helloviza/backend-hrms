@@ -737,8 +737,9 @@ ManualBookingSchema.pre("save", async function (next) {
 
     if (gstMode === "ON_MARKUP") {
       // Markup is tax-inclusive — back-calculate GST from markup
-      // GST = diff × 18/118
-      gstAmount  = parseFloat((diff * gstPercent / (100 + gstPercent)).toFixed(2));
+      // GST = diff × 18/118. No markup (sold at or below cost) → no GST: never
+      // a negative GST on the record (the invoice already bills 0 GST then).
+      gstAmount  = diff > 0 ? parseFloat((diff * gstPercent / (100 + gstPercent)).toFixed(2)) : 0;
       basePrice  = parseFloat((diff - gstAmount).toFixed(2));
       grandTotal = parseFloat(quotedPrice.toFixed(2));
       // Client pays quotedPrice — GST is embedded within the markup
