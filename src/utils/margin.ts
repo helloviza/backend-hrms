@@ -12,6 +12,41 @@ export const DEFAULT_MARGINS: MarginConfig = {
   hotel: { domestic: 0, international: 0 },
 };
 
+/** Allowed range for every margin percent the admin API accepts. */
+export const MARGIN_MIN_PCT = -10;
+export const MARGIN_MAX_PCT = 50;
+
+/**
+ * Validate a margin settings body. Each of the four percents must be a real
+ * number within [MARGIN_MIN_PCT, MARGIN_MAX_PCT] and `enabled` a boolean —
+ * anything else is refused, never coerced (a "" or "abc" used to become 0/NaN).
+ */
+export function parseMarginInput(
+  body: any,
+): { ok: true; value: MarginConfig } | { ok: false; error: string } {
+  if (typeof body?.enabled !== "boolean") {
+    return { ok: false, error: "enabled must be true or false" };
+  }
+  const value: MarginConfig = {
+    enabled: body.enabled,
+    flight: { domestic: 0, international: 0 },
+    hotel: { domestic: 0, international: 0 },
+  };
+  for (const product of ["flight", "hotel"] as const) {
+    for (const region of ["domestic", "international"] as const) {
+      const v = body?.[product]?.[region];
+      if (typeof v !== "number" || !Number.isFinite(v) || v < MARGIN_MIN_PCT || v > MARGIN_MAX_PCT) {
+        return {
+          ok: false,
+          error: `${product} ${region} margin must be a number between ${MARGIN_MIN_PCT} and ${MARGIN_MAX_PCT}`,
+        };
+      }
+      value[product][region] = v;
+    }
+  }
+  return { ok: true, value };
+}
+
 let marginCache: MarginConfig | null = null;
 let marginCacheTime = 0;
 const CACHE_TTL = 5 * 60 * 1000;

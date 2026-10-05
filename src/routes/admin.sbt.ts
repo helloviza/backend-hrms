@@ -6,7 +6,8 @@ import { requireAdmin } from "../middleware/rbac.js";
 import SBTConfig from "../models/SBTConfig.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
-import { invalidateMarginCache, DEFAULT_MARGINS, type MarginConfig } from "../utils/margin.js";
+import { invalidateMarginCache, DEFAULT_MARGINS, parseMarginInput, type MarginConfig } from "../utils/margin.js";
+import { requireSuperAdmin } from "../middleware/requireSuperAdmin.js";
 import { userNames, nameOrUnknown } from "../services/actorNames.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -178,8 +179,9 @@ router.patch("/config", async (req: any, res: any) => {
   }
 });
 
-// GET /api/admin/sbt/margins — read margin config
-router.get("/margins", async (_req: any, res: any) => {
+// GET /api/admin/sbt/margins — read margin config (SUPERADMIN only: it is
+// Plumtrips' markup on every customer's fares)
+router.get("/margins", requireSuperAdmin, async (_req: any, res: any) => {
   try {
     const doc = await SBTConfig.findOne({ key: "margins" }).lean();
     const value = (doc?.value as MarginConfig) ?? DEFAULT_MARGINS;
@@ -198,21 +200,15 @@ async function withUpdatedByName(value: any) {
   return { ...value, updatedByName: nameOrUnknown(names.get(by)) };
 }
 
-// PUT /api/admin/sbt/margins — upsert margin config
-router.put("/margins", async (req: any, res: any) => {
+// PUT /api/admin/sbt/margins — upsert margin config (SUPERADMIN only; every
+// value validated here, never trusted from the page)
+router.put("/margins", requireSuperAdmin, async (req: any, res: any) => {
   try {
-    const { enabled, flight, hotel } = req.body;
+    const parsed = parseMarginInput(req.body);
+    if ("error" in parsed) return res.status(400).json({ ok: false, error: parsed.error });
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub ?? "";
     const value: MarginConfig = {
-      enabled: !!enabled,
-      flight: {
-        domestic: Number(flight?.domestic ?? 0),
-        international: Number(flight?.international ?? 0),
-      },
-      hotel: {
-        domestic: Number(hotel?.domestic ?? 0),
-        international: Number(hotel?.international ?? 0),
-      },
+      ...parsed.value,
       updatedBy: String(userId),
       updatedAt: new Date().toISOString(),
     } as any;
@@ -224,6 +220,8 @@ router.put("/margins", async (req: any, res: any) => {
     );
 
     invalidateMarginCache();
+    // Last editor is stored on the doc; this line is the only trail of earlier edits.
+    console.info("[Admin SBT Margins PUT] updated", { by: String(userId), margins: parsed.value });
     res.json({ ok: true, margins: await withUpdatedByName(value) });
   } catch (err: any) {
     console.error("[Admin SBT Margins PUT]", err.message);
