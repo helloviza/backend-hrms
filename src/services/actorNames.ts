@@ -80,6 +80,46 @@ async function claimedProfileNames(userIds: string[]): Promise<Map<string, strin
   return out;
 }
 
+export type RealName = { firstName: string; lastName: string; name: string; source: "profile" | "traveller" | "email" | "none" };
+
+/**
+ * A user's real name, the one rule for the login session and the placeholder
+ * backfill: their profile (first + last, else `name`) → the traveller profile
+ * they claimed → (only when `allowEmail`) their email's local part. Never a
+ * placeholder like "Workspace User". `source: "none"` when nothing better exists.
+ */
+export async function resolveRealName(user: any, opts: { allowEmail?: boolean } = {}): Promise<RealName> {
+  const first = real(user?.firstName);
+  const last = str(user?.lastName);
+  const full = [first, last].filter(Boolean).join(" ");
+  if (real(full)) return { firstName: first || last, lastName: first ? last : "", name: full, source: "profile" };
+  const named = real(user?.name) || real(user?.fullName);
+  if (named) {
+    const [f, ...rest] = named.split(/\s+/);
+    return { firstName: f, lastName: rest.join(" "), name: named, source: "profile" };
+  }
+
+  const id = str(user?._id || user?.id || user?.sub);
+  if (HEX24.test(id)) {
+    try {
+      const p: any = await TravellerProfile.findOne({ claimedBy: new mongoose.Types.ObjectId(id) })
+        .select("firstName lastName")
+        .sort({ claimedAt: -1 })
+        .lean();
+      const pf = str(p?.firstName);
+      const pl = str(p?.lastName);
+      const pn = [pf, pl].filter(Boolean).join(" ");
+      if (real(pn)) return { firstName: pf || pl, lastName: pf ? pl : "", name: pn, source: "traveller" };
+    } catch (err: any) {
+      console.error("[actor-names] traveller profile lookup failed", err?.message || err);
+    }
+  }
+
+  const local = lower(user?.email).split("@")[0];
+  if (opts.allowEmail && local) return { firstName: local, lastName: "", name: local, source: "email" };
+  return { firstName: "", lastName: "", name: "", source: "none" };
+}
+
 /** What a name slot shows when nobody can be named — never an id. */
 export const UNKNOWN_USER = "Unknown user";
 

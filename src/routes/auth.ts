@@ -1,5 +1,6 @@
 // apps/backend/src/routes/auth.ts
 import { Router } from "express";
+import { isPlaceholderName, resolveRealName } from "../services/actorNames.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
@@ -473,7 +474,45 @@ async function findLinkedCustomerVendor(userId: any, email: string) {
   return { customer, vendor };
 }
 
+/**
+ * The session user (login, refresh, /me) with a REAL display name: profile
+ * name → claimed traveller profile → email local part — never the "Workspace
+ * User" placeholder some accounts were created with. Header, chat and every
+ * screen reading user.name / firstName get it. Session object only; the stored
+ * account is fixed by scripts/backfill-placeholder-user-names.ts.
+ */
 async function buildAuthSafeUser(userDoc: any) {
+  const built = await buildAuthSafeUserCore(userDoc);
+  await applyRealName(built.safe);
+  return built;
+}
+
+async function applyRealName(safe: any) {
+  if (!safe || typeof safe !== "object") return;
+  try {
+    const r = await resolveRealName(safe, { allowEmail: true });
+    if (r.source === "none") return;
+    if (r.source === "profile") {
+      // Real values stay as stored; only placeholder (or empty) slots are filled.
+      if (isPlaceholderName(safe.firstName) || !String(safe.firstName || "").trim()) {
+        safe.firstName = r.firstName;
+        if (!String(safe.lastName || "").trim()) safe.lastName = r.lastName;
+      }
+      if (isPlaceholderName(safe.name) || !String(safe.name || "").trim()) safe.name = r.name;
+      if (isPlaceholderName(safe.fullName)) safe.fullName = r.name;
+      return;
+    }
+    safe.firstName = r.firstName;
+    safe.lastName = r.lastName;
+    safe.name = r.name;
+    safe.fullName = r.name;
+  } catch (err: any) {
+    // Display only: a failed lookup never fails login.
+    console.error("[auth] display name resolution failed", err?.message || err);
+  }
+}
+
+async function buildAuthSafeUserCore(userDoc: any) {
   const base = userDoc?.toJSON ? userDoc.toJSON() : userDoc;
 
   const email = normalizeEmail(base?.email || "");
