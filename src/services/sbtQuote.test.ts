@@ -56,7 +56,7 @@ describe("flights", () => {
 
   it("applyQuoteFares: per pax type from the quote; the client's Fare is discarded", () => {
     const quote = { netFare: FARE, netFareBreakdown: BREAKDOWN };
-    const out = applyQuoteFares([{ PaxType: 1, Fare: { OfferedFare: 1 } }, { PaxType: 2 }, { PaxType: 3 }], quote);
+    const out: any[] = applyQuoteFares([{ PaxType: 1, Fare: { OfferedFare: 1 } }, { PaxType: 2 }, { PaxType: 3 }] as any[], quote);
     expect(out[0].Fare.BaseFare).toBe(6000);
     expect(out[0].Fare.OfferedFare).toBe(9500);
     expect(out[0].Fare.CommissionEarned).toBe(250);
