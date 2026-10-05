@@ -8,6 +8,7 @@ import { getAgencyBalance } from "../services/tbo.auth.service.js";
 import { sbtBookerGuards } from "../services/sbtPaymentGate.js";
 import { walletState, statement, statementCsv, statementXlsx } from "../services/sbtWallet.js";
 import { dateRangeOr400 } from "../utils/dateRange.js";
+import { companyNameFor } from "../services/companyNames.js";
 
 // The company's SBT Business Wallet — a credit line (services/sbtWallet.ts).
 //   GET /check?amount=     can this booking be paid from the wallet?
@@ -101,11 +102,11 @@ router.get("/check", requireSBT, ...sbtBookerGuards, async (req: any, res: any) 
 // GET /api/sbt/wallet/summary
 router.get("/summary", requireSBT, async (req: any, res: any) => {
   try {
-    const ws = (await CustomerWorkspace.findById(req.workspaceObjectId).select("sbtOfficialBooking companyName").lean()) as any;
+    const ws = (await CustomerWorkspace.findById(req.workspaceObjectId).select("sbtOfficialBooking companyName customerId slug").lean()) as any;
     const s = walletState(ws);
     res.json({
       ok: true,
-      companyName: ws?.companyName || "",
+      companyName: ws ? await companyNameFor(ws) : "",
       enabled: s.enabled,
       creditLimit: s.creditLimit,
       used: s.used,
@@ -143,7 +144,7 @@ router.get("/statement", requireSBT, async (req: any, res: any) => {
     });
     const format = String(req.query.format || "");
     if (format === "csv" || format === "xlsx") {
-      const ws = (await CustomerWorkspace.findById(req.workspaceObjectId).select("companyName").lean()) as any;
+      const ws = (await CustomerWorkspace.findById(req.workspaceObjectId).select("companyName customerId slug").lean()) as any;
       const base = `business-wallet-${new Date().toISOString().slice(0, 10)}`;
       if (format === "csv") {
         res.setHeader("Content-Type", "text/csv; charset=utf-8");
@@ -152,7 +153,7 @@ router.get("/statement", requireSBT, async (req: any, res: any) => {
       }
       res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
       res.setHeader("Content-Disposition", `attachment; filename="${base}.xlsx"`);
-      return res.send(await statementXlsx(rows, `Business Wallet statement — ${ws?.companyName || ""}`));
+      return res.send(await statementXlsx(rows, `Business Wallet statement — ${await companyNameFor(ws)}`));
     }
     res.json({ ok: true, wholeCompany: whole, rows });
   } catch (err: any) {

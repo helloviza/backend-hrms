@@ -30,10 +30,17 @@ import { enqueueEmail } from "./emailOutbox.js";
 import { buildEmailShell } from "../routes/approvals.email.js";
 import { istDayStart, addDays } from "../utils/dateRange.js";
 import { sbtLogger } from "../utils/logger.js";
+import { companyNameFor } from "./companyNames.js";
 
 type AnyObj = Record<string, any>;
 
 export const USAGE_ALERT_RATIO = 0.8;
+/** Adjustment wording for Plumtrips staff: the House panel, the staff statement and staff downloads. */
+export const ADJUSTMENT_LABEL = { CREDIT: "Reduce what they owe (credit)", DEBIT: "Add to what they owe (debit)" } as const;
+/** The same adjustments as the company sees them: their statement, downloads and emails. */
+export const CUSTOMER_ADJUSTMENT_LABEL = { CREDIT: "Credit — reduces what you owe", DEBIT: "Charge — adds to what you owe" } as const;
+export const adjustmentLabel = (direction: "CREDIT" | "DEBIT", staff: boolean) =>
+  (staff ? ADJUSTMENT_LABEL : CUSTOMER_ADJUSTMENT_LABEL)[direction];
 const round2 = (n: number) => Math.round(n * 100) / 100;
 const num = (v: unknown) => Number(v) || 0;
 const monthKeyNow = () => new Date().toISOString().slice(0, 7);
@@ -126,7 +133,7 @@ export function creditLineFromLegacy(ob: AnyObj | null | undefined, used: number
  */
 export async function checkUsageAlert(workspaceId: unknown): Promise<void> {
   try {
-    const ws = (await CustomerWorkspace.findById(String(workspaceId)).select("sbtOfficialBooking customerId companyName").lean()) as AnyObj | null;
+    const ws = (await CustomerWorkspace.findById(String(workspaceId)).select("sbtOfficialBooking customerId companyName slug").lean()) as AnyObj | null;
     if (!ws) return;
     const s = walletState(ws);
     const over = s.creditLimit > 0 && s.used >= s.creditLimit * USAGE_ALERT_RATIO;
@@ -165,13 +172,14 @@ async function mailLeaders(ws: AnyObj, m: { event: string; subject: string; titl
     sbtLogger.warn("[sbt-wallet] no active Workspace Leader to email", { workspaceId: String(ws._id), event: m.event });
     return;
   }
+  const name = await companyNameFor(ws);
   const html = buildEmailShell(`<div style="font-size:14px;line-height:1.6;color:#1f2937">${m.body}</div>`, {
     title: m.title,
-    subtitle: String(ws.companyName || ""),
+    subtitle: name,
     badgeText: "Business Wallet",
   });
   for (const r of to) {
-    await enqueueEmail({ event: m.event, kind: "NOTIFICATIONS", to: [r], replyTo: DESK_EMAIL, subject: m.subject, html, customerName: String(ws.companyName || "") });
+    await enqueueEmail({ event: m.event, kind: "NOTIFICATIONS", to: [r], replyTo: DESK_EMAIL, subject: m.subject, html, customerName: name });
   }
 }
 
@@ -185,7 +193,7 @@ const validAmount = (v: unknown): v is number => typeof v === "number" && Number
 
 async function companyOrNull(workspaceId: unknown) {
   if (!mongoose.Types.ObjectId.isValid(String(workspaceId))) return null;
-  return (await CustomerWorkspace.findById(String(workspaceId)).select("sbtOfficialBooking customerId companyName").lean()) as AnyObj | null;
+  return (await CustomerWorkspace.findById(String(workspaceId)).select("sbtOfficialBooking customerId companyName slug").lean()) as AnyObj | null;
 }
 
 /**
@@ -256,7 +264,7 @@ export async function adjust(
   const ws = await companyOrNull(workspaceId);
   if (!ws) return fail(404, "Unknown company");
   const direction = String(input.direction || "").toUpperCase();
-  if (direction !== "CREDIT" && direction !== "DEBIT") return fail(400, "Choose credit (lowers used) or debit (raises used)");
+  if (direction !== "CREDIT" && direction !== "DEBIT") return fail(400, `Choose "${ADJUSTMENT_LABEL.CREDIT}" or "${ADJUSTMENT_LABEL.DEBIT}"`);
   if (!validAmount(input.amount)) return fail(400, "Enter the amount");
   const reason = cleanText(input.reason);
   if (!reason) return fail(400, "A reason is required");
@@ -330,11 +338,10 @@ const DESCRIPTIONS: Record<string, string> = {
   CANCELLATION: "Cancellation refund",
   PAYMENT: "Payment received",
   LIMIT_CHANGE: "Credit limit changed",
-  ADJUSTMENT_CREDIT: "Adjustment (credit)",
-  ADJUSTMENT_DEBIT: "Adjustment (debit)",
 };
-function describe(e: AnyObj, type: WalletEntryType): string {
+function describe(e: AnyObj, type: WalletEntryType, staff: boolean): string {
   const r = String(e.reason || "");
+  if (r === "ADJUSTMENT_CREDIT" || r === "ADJUSTMENT_DEBIT") return adjustmentLabel(r === "ADJUSTMENT_CREDIT" ? "CREDIT" : "DEBIT", staff);
   if (DESCRIPTIONS[r]) return DESCRIPTIONS[r];
   if (type === "CANCELLATION_REFUND") return "Booking not completed — amount released";
   return r;
@@ -458,8 +465,8 @@ export async function statement(workspaceId: unknown, opts: StatementQuery = {})
       trip,
       bookedBy: row?.userId ? nameOrUnknown(names.get(String(row.userId))) : "",
       description: type === "ADJUSTMENT" || type === "LIMIT_CHANGE" || type === "PAYMENT_RECEIVED"
-        ? [describe(e, type), e.remark].filter(Boolean).join(" — ")
-        : describe(e, type),
+        ? [describe(e, type, opts.staff === true), e.remark].filter(Boolean).join(" — ")
+        : describe(e, type, opts.staff === true),
       payment: e.payment?.mode
         ? { mode: e.payment.mode, reference: e.payment.reference || "", paymentDate: e.payment.paymentDate || null }
         : null,
@@ -494,6 +501,9 @@ const TYPE_LABEL: Record<WalletEntryType, string> = {
   LIMIT_CHANGE: "Limit change",
 };
 export const typeLabel = (t: WalletEntryType) => TYPE_LABEL[t] || t;
+/** A row's type as the statement and downloads print it (adjustments say which way). */
+export const rowTypeLabel = (r: Pick<StatementRow, "type" | "direction">, staff: boolean) =>
+  r.type === "ADJUSTMENT" && (r.direction === "CREDIT" || r.direction === "DEBIT") ? adjustmentLabel(r.direction, staff) : typeLabel(r.type);
 
 /** Signed effect on `used`: + raises it, − lowers it. */
 export const signedAmount = (r: StatementRow) => (r.direction === "DEBIT" ? r.amount : r.direction === "CREDIT" ? -r.amount : 0);
@@ -501,7 +511,7 @@ export const signedAmount = (r: StatementRow) => (r.direction === "DEBIT" ? r.am
 function columns(staff: boolean): Array<[string, (r: StatementRow) => string | number]> {
   const cols: Array<[string, (r: StatementRow) => string | number]> = [
     ["Date", (r) => new Date(r.at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })],
-    ["Type", (r) => typeLabel(r.type)],
+    ["Type", (r) => rowTypeLabel(r, staff)],
     ["Description", (r) => r.description],
     ["Booking no.", (r) => r.bookingRef],
     ["Travellers", (r) => r.travellers],

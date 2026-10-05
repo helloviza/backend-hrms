@@ -28,18 +28,20 @@ import {
 import { parseTypes } from "./sbt.wallet.js";
 import { dateRangeOr400 } from "../utils/dateRange.js";
 import { HOUSE_WORKSPACE_ID } from "../utils/bookingAccess.js";
+import { companyNames, companyNameFor, UNNAMED_COMPANY } from "../services/companyNames.js";
 
 const router = express.Router();
 router.use(requireAuth, requireSuperAdmin);
 
 const actorOf = (req: any) => String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? "");
-const nameOf = (w: any) => String(w?.companyName || "").trim() || String(w?.customerId || "") || "Unnamed company";
+const WS_FIELDS = "companyName customerId slug sbtOfficialBooking";
 
-function companyRow(w: any) {
+/** `name` comes from services/companyNames.ts — never an id. */
+function companyRow(w: any, name: string) {
   const s = walletState(w);
   return {
     workspaceId: String(w._id),
-    companyName: nameOf(w),
+    companyName: name,
     isHouse: String(w._id) === HOUSE_WORKSPACE_ID,
     enabled: s.enabled,
     creditLimit: s.creditLimit,
@@ -51,24 +53,27 @@ function companyRow(w: any) {
   };
 }
 
-// GET /api/admin/business-wallets
+// GET /api/admin/business-wallets — wallet-ON companies; ?walletOff=include adds
+// the switched-off ones that have a limit or a balance. ?q searches the name.
 router.get("/", async (req: any, res: any) => {
   try {
-    const filter: any = {
-      status: { $ne: "DELETED" },
-      $or: [
-        { "sbtOfficialBooking.enabled": true },
-        { "sbtOfficialBooking.creditLimit": { $gt: 0 } },
-        { "sbtOfficialBooking.used": { $ne: 0, $exists: true } },
-      ],
-    };
-    const q = String(req.query?.q || "").trim().slice(0, 80);
-    if (q) {
-      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-      filter.$and = [{ $or: [{ companyName: rx }, { customerId: rx }] }];
-    }
-    const rows = ((await CustomerWorkspace.find(filter).select("companyName customerId sbtOfficialBooking").lean()) as any[])
-      .map(companyRow)
+    const includeOff = String(req.query?.walletOff || "") === "include";
+    const filter: any = includeOff
+      ? {
+          status: { $ne: "DELETED" },
+          $or: [
+            { "sbtOfficialBooking.enabled": true },
+            { "sbtOfficialBooking.creditLimit": { $gt: 0 } },
+            { "sbtOfficialBooking.used": { $ne: 0, $exists: true } },
+          ],
+        }
+      : { status: { $ne: "DELETED" }, "sbtOfficialBooking.enabled": true };
+    const docs = (await CustomerWorkspace.find(filter).select(WS_FIELDS).lean()) as any[];
+    const names = await companyNames(docs);
+    const q = String(req.query?.q || "").trim().toLowerCase().slice(0, 80);
+    const rows = docs
+      .map((w) => companyRow(w, names.get(String(w._id)) || UNNAMED_COMPANY))
+      .filter((r) => !q || r.companyName.toLowerCase().includes(q))
       .sort((a, b) => b.usagePct - a.usagePct || a.companyName.localeCompare(b.companyName));
 
     const format = String(req.query.format || "");
@@ -108,14 +113,15 @@ router.get("/:workspaceId", async (req: any, res: any) => {
     if (range === false) return;
     const id = String(req.params.workspaceId || "");
     if (!/^[a-f0-9]{24}$/i.test(id)) return res.status(404).json({ error: "Unknown company" });
-    const ws = (await CustomerWorkspace.findById(id).select("companyName customerId sbtOfficialBooking").lean()) as any;
+    const ws = (await CustomerWorkspace.findById(id).select(WS_FIELDS).lean()) as any;
     if (!ws) return res.status(404).json({ error: "Unknown company" });
+    const name = await companyNameFor(ws);
     const rows = await statement(id, {
       from: range?.from, to: range?.to, types: parseTypes(req.query.types), q: String(req.query.q || ""), staff: true,
     });
     const format = String(req.query.format || "");
     if (format === "csv" || format === "xlsx") {
-      const base = `business-wallet-${nameOf(ws).replace(/[^A-Za-z0-9]+/g, "-").toLowerCase()}-${new Date().toISOString().slice(0, 10)}`;
+      const base = `business-wallet-${name.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "").toLowerCase() || "company"}-${new Date().toISOString().slice(0, 10)}`;
       if (format === "csv") {
         res.setHeader("Content-Type", "text/csv; charset=utf-8");
         res.setHeader("Content-Disposition", `attachment; filename="${base}.csv"`);
@@ -123,9 +129,9 @@ router.get("/:workspaceId", async (req: any, res: any) => {
       }
       res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
       res.setHeader("Content-Disposition", `attachment; filename="${base}.xlsx"`);
-      return res.send(await statementXlsx(rows, `Business Wallet statement — ${nameOf(ws)}`, true));
+      return res.send(await statementXlsx(rows, `Business Wallet statement — ${name}`, true));
     }
-    res.json({ ok: true, company: companyRow(ws), rows });
+    res.json({ ok: true, company: companyRow(ws, name), rows });
   } catch (err: any) {
     console.error("[Business Wallet statement]", err.message);
     res.status(500).json({ error: "Could not load the statement" });
