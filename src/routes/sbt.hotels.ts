@@ -55,6 +55,7 @@ import {
   requireSBTStaffDirect,
   loadScopedQuote,
 } from "../services/sbtPaymentGate.js";
+import { bookableRequest, markRequestBooked } from "../services/sbtRequestBooking.js";
 import {
   customerRoom,
   customerHotelResults,
@@ -2443,6 +2444,9 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
             });
             throw persistErr;
           }
+          if ((booking as any).sbtRequestId) {
+            await markRequestBooked((booking as any).sbtRequestId, booking.workspaceId, { hotelBookingId: booking._id }, booking.toObject());
+          }
           return res.json({
             ok: true,
             voucherStatus: "GENERATED",
@@ -2549,6 +2553,10 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
         bookingId: booking.bookingId,
         userId: req.user?.id,
       });
+      // The hold is now paid and vouchered: its L1 request (linked at hold time) is BOOKED.
+      if ((booking as any).sbtRequestId) {
+        await markRequestBooked((booking as any).sbtRequestId, booking.workspaceId, { hotelBookingId: booking._id }, booking.toObject());
+      }
       return res.json({
         ok: true,
         voucherStatus: classified.derivedOnSuccess.voucherStatus,
@@ -2577,6 +2585,13 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
     const b = req.body;
+
+    // Booking an L1's request: only its assigned booker / a Workspace Leader may,
+    // only while PENDING (services/sbtRequestBooking.ts); any other id is not linked.
+    const linkedRequest = b.sbtRequestId ? await bookableRequest(req, b.sbtRequestId, "hotel") : null;
+    if (b.sbtRequestId && !linkedRequest) {
+      sbtLogger.warn("[hotel-save] sbtRequestId not bookable by this user — not linked", { sbtRequestId: String(b.sbtRequestId) });
+    }
 
     // Task 7: Check if webhook already created/confirmed this booking
     if (b.razorpayOrderId) {
@@ -2626,7 +2641,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
     const _bookingData = {
       userId,
       customerId: (req.user as any)?.customerId ?? undefined,
-      sbtRequestId: b.sbtRequestId || undefined,
+      sbtRequestId: linkedRequest ? linkedRequest._id : undefined,
       workspaceId: req.workspaceObjectId,
       bookingId: b.bookingId || "",
       confirmationNo: b.confirmationNo || "",
@@ -2734,29 +2749,13 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
     // Official (business wallet) spend is reserved by the payment gate before TBO
     // is called (services/sbtPaymentGate.ts reserveOfficial) — never counted here.
 
-    // If this booking fulfils an SBT request, mark it as BOOKED and notify L1
-    if (b.sbtRequestId) {
-      try {
-        const sbtReq = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceObjectId);
-        if (sbtReq && sbtReq.status === "PENDING") {
-          sbtReq.status = "BOOKED";
-          (sbtReq as any).hotelBookingId = doc._id;
-          sbtReq.actedAt = new Date();
-          await sbtReq.save();
-
-          // Confirmation email moved into deferred-status-check.ts success path.
-          // TBO recommends waiting ≥120s before trusting the Book response state, so
-          // emailing the SBT requester at T+0 risks sending a "your hotel is booked"
-          // notice for a booking that TBO later flips to Failed/Cancelled. The email
-          // now fires from runDeferredStatusCheck after GetBookingDetail confirms the
-          // booking. Idempotency is enforced via SBTHotelBooking.confirmationEmailSentAt.
-          sbtLogger.info("SBT request marked BOOKED via hotel booking", {
-            sbtRequestId: b.sbtRequestId, bookingDocId: doc._id,
-          });
-        }
-      } catch (reqErr: any) {
-        sbtLogger.warn("Failed to update SBT request after hotel booking", { error: reqErr?.message });
-      }
+    // A paid booking for an L1's request moves it to BOOKED — a hold is unpaid,
+    // so it only links (generate-voucher moves it when the hold is paid). Inside a
+    // checkout, services/sbtFulfil.ts moves it once the checkout is complete.
+    // The requester's email fires from the deferred status check (TBO asks to
+    // wait ≥120s before trusting the Book state).
+    if (linkedRequest && !b.isHeld && (payFacts || req.user?.isDemoUser === true) && !(req as any).sbtFulfil) {
+      await markRequestBooked(linkedRequest._id, req.workspaceObjectId, { hotelBookingId: doc._id }, doc.toObject());
     }
 
     res.json({ ok: true, booking: customerHotelBooking(doc) });

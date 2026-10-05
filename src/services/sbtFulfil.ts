@@ -37,6 +37,9 @@ import {
   type Refusal,
 } from "./sbtPaymentGate.js";
 import { createRazorpayOrder, razorpayConfigured, razorpayKeyId } from "./sbtRazorpay.js";
+import { requestBookingRefusal, markRequestBooked } from "./sbtRequestBooking.js";
+import SBTBooking from "../models/SBTBooking.js";
+import SBTHotelBooking from "../models/SBTHotelBooking.js";
 
 type AnyObj = Record<string, any>;
 type Handler = (req: any, res: any) => unknown;
@@ -161,6 +164,19 @@ async function refundAll(row: AnyObj, failureCode: string, reason: string, opsNo
   await alertOps(row, `Booking not completed — refunded (${failureCode})`, [
     `Reason: ${reason}`, `Refunded automatically: ₹${(left / 100).toFixed(2)}.`, ...opsNote,
   ]);
+}
+
+/** A ticketed checkout that booked an L1's request moves it to BOOKED. The
+ *  request id is the one the booking save validated and stored — never the
+ *  body's. */
+async function markCheckoutRequestBooked(product: "FLIGHT" | "HOTEL", bookingDocIds: string[], workspaceId: unknown) {
+  const id = bookingDocIds.find(Boolean);
+  if (!id) return;
+  const Model: any = product === "FLIGHT" ? SBTBooking : SBTHotelBooking;
+  const doc = (await Model.findById(id).lean()) as AnyObj | null;
+  if (!doc?.sbtRequestId) return;
+  await markRequestBooked(doc.sbtRequestId, workspaceId,
+    product === "FLIGHT" ? { bookingId: doc._id } : { hotelBookingId: doc._id }, doc);
 }
 
 /* ───────────────────────── fulfil ───────────────────────── */
@@ -372,6 +388,7 @@ export async function fulfilCheckout(
       await SBTPayment.updateOne({ _id: row._id }, { $set: {
         status: "TICKETED", completedAt: new Date(), bookingDocIds: [docId], result: { ...hotelData, bookingDocId: docId },
       } });
+      await markCheckoutRequestBooked("HOTEL", [docId], row.workspaceId);
       return checkoutView(row._id);
     }
 
@@ -476,6 +493,7 @@ export async function fulfilCheckout(
       ...(failure ? { failureCode: `PARTIAL_${failure.code}`, failureReason: failure.reason } : {}),
       result: { ...first, legs: legResults, partialRefundAmount: toRefund / 100 },
     } });
+    if (!needsOps) await markCheckoutRequestBooked("FLIGHT", bookingDocIds, row.workspaceId);
     if (needsOps || partialNotes.length) {
       await alertOps(row, needsOps ? "Booking needs action" : "Booking completed with a partial refund", [
         ...partialNotes,
@@ -539,6 +557,10 @@ export function createCheckoutHandler(product: "FLIGHT" | "HOTEL") {
       }
       const request = (b.request && typeof b.request === "object") ? b.request : {};
       const save = (b.save && typeof b.save === "object") ? b.save : {};
+      // Booking an L1's request: only its assigned booker / a Workspace Leader,
+      // only while PENDING — refused here, before any money moves.
+      const notBookable = await requestBookingRefusal(req, save, product === "FLIGHT" ? "flight" : "hotel");
+      if (notBookable) return res.status(notBookable.status).json({ error: notBookable.error, code: notBookable.code });
       let row: AnyObj;
 
       if (product === "FLIGHT") {

@@ -69,6 +69,7 @@ import {
   reissueFareDifference,
   FARE_DIFFERENCE_MESSAGE,
 } from "../services/sbtPaymentGate.js";
+import { bookableRequest, markRequestBooked } from "../services/sbtRequestBooking.js";
 import { createRazorpayOrder, razorpayConfigured, razorpayKeyId } from "../services/sbtRazorpay.js";
 import {
   sellingFlightResults,
@@ -1727,12 +1728,16 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
 
     const b = req.body;
 
-    // When booking on behalf of an L1 requester, use their ID as the owner
+    // Booking an L1's request: only its assigned booker / a Workspace Leader may,
+    // only while PENDING (services/sbtRequestBooking.ts). Then the requester owns
+    // the booking. Any other sbtRequestId is not linked — the ticket already
+    // exists, so the booking is still saved, under the booker.
     let bookingUserId: any = bookerId;
-    if (b.sbtRequestId) {
-      const sbtReqForUser = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceObjectId);
-      if (sbtReqForUser?.requesterId) bookingUserId = sbtReqForUser.requesterId;
+    const linkedRequest = b.sbtRequestId ? await bookableRequest(req, b.sbtRequestId, "flight") : null;
+    if (b.sbtRequestId && !linkedRequest) {
+      sbtLogger.warn("[booking-save] sbtRequestId not bookable by this user — not linked", { sbtRequestId: String(b.sbtRequestId) });
     }
+    if (linkedRequest?.requesterId) bookingUserId = linkedRequest.requesterId;
 
     // Demo Platform — the simulator already persisted the SBTBooking under the
     // synthetic PNR (see utils/demoSimulator.ts handleFlightBook / handleFlightTicketLCC).
@@ -1885,7 +1890,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
     const doc = await SBTBooking.create({
       userId: bookingUserId,
       customerId: (req.user as any)?.customerId ?? undefined,
-      sbtRequestId: b.sbtRequestId || undefined,
+      sbtRequestId: linkedRequest ? linkedRequest._id : undefined,
       workspaceId: req.workspaceObjectId,
       traceId: b.traceId || "",
       pnr: b.pnr,
@@ -1963,23 +1968,16 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
     // Official (business wallet) spend is reserved by the payment gate before TBO
     // is called (services/sbtPaymentGate.ts reserveOfficial) — never counted here.
 
-    // If this booking fulfils an SBT request, mark it as BOOKED and notify L1
-    if (b.sbtRequestId) {
-      try {
-        const sbtReq = await scopedFindById(SBTRequest, b.sbtRequestId, req.workspaceObjectId);
-        if (sbtReq && sbtReq.status === "PENDING") {
-          sbtReq.status = "BOOKED";
-          (sbtReq as any).bookingId = doc._id;
-          sbtReq.actedAt = new Date();
-          await sbtReq.save();
-
-          // Send confirmation email to L1 requester
-          const requester = await User.findById(sbtReq.requesterId)
+    // A paid booking for an L1's request: notify the requester (once per
+    // checkout — multi-city saves one booking per leg). The request moves to
+    // BOOKED when the whole checkout is ticketed (services/sbtFulfil.ts); a
+    // booking saved outside a checkout (staff direct route, demo) moves it here.
+    if (linkedRequest && (payFacts || req.user?.isDemoUser === true)) {
+      if (!fulfilCtx) await markRequestBooked(linkedRequest._id, req.workspaceObjectId, { bookingId: doc._id }, doc.toObject());
+      if (!fulfilCtx?.legIndex) {
+        try {
+          const requester = await User.findById(linkedRequest.requesterId)
             .select("name email customerId").lean() as any;
-          sbtLogger.info("[SBT EMAIL] Attempting to send to:", { userId: sbtReq.requesterId, email: requester?.email, event: "booking_saved" });
-          if (!requester) {
-            sbtLogger.warn("[SBT EMAIL] User not found:", { userId: sbtReq.requesterId, event: "booking_saved" });
-          }
           if (requester?.email) {
             const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
             const confirmedBody = `
@@ -2012,12 +2010,9 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
               html,
             }).catch((e: any) => sbtLogger.error("[SBT EMAIL FAILED]", { event: "booking_saved", recipient: requester.email, error: e?.message || e }));
           }
-          sbtLogger.info("SBT request marked BOOKED via flight booking", {
-            sbtRequestId: b.sbtRequestId, bookingDocId: doc._id,
-          });
+        } catch (reqErr: any) {
+          sbtLogger.warn("Failed to notify the SBT requester after booking", { error: reqErr?.message });
         }
-      } catch (reqErr: any) {
-        sbtLogger.warn("Failed to update SBT request after booking", { error: reqErr?.message });
       }
     }
 
