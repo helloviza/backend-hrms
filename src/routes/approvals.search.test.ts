@@ -822,7 +822,9 @@ describe("the picked option in emails, and no snapshot for a Workspace Leader", 
     expect(approver!.html).toContain("IndiGo 6E 5321");
     expect(approver!.html).toContain("Return flight");
     expect(approver!.html).toContain("6E 640");
-    expect(approver!.html).toMatch(/BLR 06:10 → BOM 07:55 · 12 Mar 2027 · 1h 45m · Non-stop/);
+    expect(approver!.html).toContain("IndiGo 6E 5321 · 06:10–07:55");
+    expect(approver!.html).toContain("12 Mar 2027");
+    expect(approver!.html).toMatch(/1h 45m · Non-stop/);
     expect(approver!.html).toMatch(/Economy · 15 Kg \+ 7 Kg cabin · Saver · Refundable/);
     expect(approver!.html).toContain("Non-refundable");
 
@@ -830,7 +832,7 @@ describe("the picked option in emails, and no snapshot for a Workspace Leader", 
     const leader = mails.find((m) => String(m.to).includes(`${U.wl}@cust.test`) && /^Approval Needed/.test(m.subject));
     expect(leader, mails.map((m) => m.subject).join(" | ")).toBeTruthy();
     expect(leader!.html).toContain("IndiGo 6E 5321");
-    expect(leader!.html).toMatch(/BLR 06:10 → BOM 07:55 · 12 Mar 2027/);
+    expect(leader!.html).toContain("06:10–07:55");
 
     for (const m of [approver!, leader!]) {
       expect(m.html).not.toMatch(/₹|&#8377;|\bINR\b|\bRs\.?\s*\d/);

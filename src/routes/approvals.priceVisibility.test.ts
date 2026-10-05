@@ -660,7 +660,7 @@ describe("non-price keys survive for customer callers", () => {
       .set(as(REQUESTER))
       .send({ customerId: "C1", cartItems: baseFixture().cartItems, comments: "" });
     const mail = state.mails.find((m) => m.to === "mgr@cust.com");
-    expect(mail!.html).toContain("USD 2,000 requested");
+    expect(mail!.html).toContain("USD 2,000");
   });
 });
 

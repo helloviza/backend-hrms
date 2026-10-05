@@ -293,7 +293,7 @@ describe("Booking History and the booking-processed email name people (items 3, 
     const processed = mails.find((m) => /Processed/i.test(m.subject));
     expect(processed).toBeTruthy();
     expect(processed!.replyTo).toBe("ops@plumtrips.com");
-    expect(processed!.html).toMatch(/Requester:<\/b>\s*Asha Rao/);
+    expect(processed!.html).toMatch(/Requested by<\/div>\s*<div[^>]*>Asha Rao</);
     expect(processed!.html).not.toMatch(HEX);
     for (const s of STAFF_STRINGS) expect(processed!.html, `email leaks "${s}"`).not.toContain(s);
   });

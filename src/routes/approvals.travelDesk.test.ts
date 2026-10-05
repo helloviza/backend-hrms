@@ -267,7 +267,8 @@ describe("manual assign / reassign / unassign", () => {
     // Same code the ops queue shows (ticketId, else REQ- + last 6 of the id).
     expect(mail.subject).toContain(doc.ticketId || `REQ-${String(id).slice(-6).toUpperCase()}`);
     expect(mail.subject).toContain("Acme");
-    expect(mail.html).toContain("Flight BLR → DEL · 2027-04-02");
+    expect(mail.html).toContain("Flight · BLR → DEL");
+    expect(mail.html).toContain("2 Apr 2027");
     expect(mail.html).toContain(`/admin/approvals?request=${id}`);
     expect(mail.html).not.toMatch(/₹|INR/);
   });

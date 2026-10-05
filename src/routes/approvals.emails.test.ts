@@ -77,6 +77,7 @@ const { APPROVAL_EMAIL_MAP } = await import("../services/approvalEmails/map.js")
 const { renderApprovalEmail } = await import("../services/approvalEmails/templates.js");
 const { renderApprovalEmailsDoc, DOC_PATH } = await import("../scripts/gen-approval-emails-doc.js");
 const { stripPriceText } = await import("./approvals.security.js");
+const layoutMod = await import("../services/approvalEmails/layout.js");
 
 const app = express();
 app.use(express.json());
@@ -139,7 +140,11 @@ const outbox = async (): Promise<any[]> => col("emailoutboxes").find({}).toArray
 /** Everyone emailed (To + CC), sorted and unique. */
 const everyone = (mails = sent) => Array.from(new Set(mails.flatMap((m) => [...m.to, ...m.cc]))).sort();
 const to = (email: string, mails = sent) => mails.filter((m) => m.to.includes(email));
-const tokenHrefs = (html: string) => [...html.matchAll(/approval\/email\?token=([^"&]+)/g)].map((m) => decodeURIComponent(m[1]));
+// Each button carries its link twice (Outlook VML + the normal link): count distinct links.
+const tokenHrefs = (html: string) =>
+  [...new Set([...html.matchAll(/approval\/email\?token=([^"&]+)(?:&intent=([a-z_]+))?/g)].map((m) => `${m[2] || ""}:${m[1]}`))].map((k) =>
+    decodeURIComponent(k.slice(k.indexOf(":") + 1)),
+  );
 
 async function submit(who: Who = R, ws: any = WS) {
   const r = await as(request(app).post("/api/approvals/requests"), who, ws).send({ cartItems: [flightItem], comments: "Client visit" });
@@ -236,6 +241,95 @@ describe("the email map", () => {
   });
 });
 
+/* ───────────────────────── design ───────────────────────── */
+
+describe("the email design (one layout for every email)", () => {
+  const TONE: Record<string, string> = {
+    request_submitted_approver: "orange", request_submitted_leaders: "orange", request_resent: "orange", request_resubmitted: "orange",
+    request_reminder: "orange", clarification_answered: "orange", clarification_asked: "orange", proposal_submitted: "orange",
+    proposal_reminder: "orange", proposal_ready: "orange",
+    request_approved: "green", request_approved_fyi: "green", proposal_approved: "green", booking_done: "green",
+    request_declined: "red", request_declined_fyi: "red", proposal_declined: "red", booking_cancelled: "red", ops_customer_cancelled: "red",
+    request_submitted_confirmation: "blue", request_auto_approved: "blue", booking_started: "blue", booking_on_hold: "blue",
+    case_assigned: "blue", ops_no_agent: "blue", ops_new_case: "blue", email_send_failed_alert: "blue", proposal_changes_requested: "blue",
+  };
+  const ctxFor = (event: string): any => ({
+    ar: { _id: oid(), ticketId: "TKT-777", customerName: "Acme", frontlinerName: "Rita Requester", comments: "Window seat", cartItems: [flightItem] },
+    proposal: { _id: oid(), version: 1, options: [{ optionNo: 1, title: "Morning flight", lineItems: [{ category: "flight", title: "BLR → BOM", qty: 1 }] }] },
+    decision: event === "ops_proposal_outcome" ? "CHANGES_REQUESTED" : "APPROVED",
+    reminderNo: 1,
+    actorName: "Anil Approver",
+    failure: { event: "booking_done", subject: "x", to: [REQUESTER], cc: [], attempts: 3, error: "421" },
+  });
+  /** What a mail app shows with images off: no <img>, no background image, no Outlook-only VML. */
+  const imagesOff = (html: string) =>
+    html
+      .replace(/<!--\[if (?:gte )?mso[^\]]*\]>[\s\S]*?<!\[endif\]-->/g, "")
+      .replace(/<img\b[^>]*>/g, "")
+      .replace(/\sbackground="[^"]*"/g, "")
+      .replace(/background-image:url\([^)]*\)/g, "");
+  const text = (html: string) => html.replace(/<style[\s\S]*?<\/style>/g, "").replace(/<[^>]+>/g, " ").replace(/&#39;/g, "'").replace(/\s+/g, " ");
+
+  it("every email keeps its headline, request number and buttons with images off", () => {
+    for (const event of Object.keys(APPROVAL_EMAIL_MAP) as any[]) {
+      const html = renderApprovalEmail(event, ctxFor(event), APPROVER).html;
+      const off = imagesOff(html);
+      const h1 = off.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/)?.[1] || "";
+      expect(text(h1).trim(), event).not.toBe("");
+      expect(text(off), event).toContain("TKT-777");
+      const links = [...off.matchAll(/<a href="([^"]+)"[^>]*class="btn /g)].map((m) => m[1]);
+      expect(links.length, event).toBeGreaterThan(0);
+      // Every image says what it is or is marked decorative; the logo falls back to the name.
+      for (const tag of html.match(/<img\b[^>]*>/g) || []) expect(tag, event).toMatch(/\salt="[^"]*"/);
+      expect(html, event).toContain('alt="PLUMTRIPS"');
+    }
+  });
+
+  it("only the single-colour land map and the brand icons are used — never a political map", () => {
+    const { EMAIL_ASSETS, assetBase } = layoutMod;
+    for (const event of Object.keys(APPROVAL_EMAIL_MAP) as any[]) {
+      const html = renderApprovalEmail(event, ctxFor(event), APPROVER).html;
+      const srcs = [...html.matchAll(/(?:src|background)="([^"]+)"|url\('([^']+)'\)/g)].map((m) => m[1] || m[2]);
+      for (const src of srcs) {
+        expect(src.startsWith(`${assetBase()}/`), `${event}: ${src}`).toBe(true);
+        expect(EMAIL_ASSETS, `${event}: ${src}`).toContain(src.slice(assetBase().length + 1));
+      }
+      expect(html, event).not.toMatch(/political|countries|borders|<svg/i);
+    }
+    // The hero is drawn from the land outline only (world-atlas land-110m): no borders to draw.
+    const gen = fs.readFileSync(new URL("../scripts/gen-email-assets.ts", import.meta.url), "utf8");
+    expect(gen).toContain("land-110m.json");
+    expect(gen).not.toMatch(/countries-\d+m/);
+    // The images exist where the frontend serves them (the GitHub subtree has no frontend).
+    const dir = new URL("../../../frontend/public/email-assets/", import.meta.url);
+    if (fs.existsSync(dir)) for (const f of EMAIL_ASSETS) expect(fs.existsSync(new URL(f, dir)), f).toBe(true);
+  });
+
+  it("badge colour by type, and the right buttons: request decision, proposal decision, else one View request", () => {
+    for (const event of Object.keys(APPROVAL_EMAIL_MAP) as any[]) {
+      const html = renderApprovalEmail(event, ctxFor(event), APPROVER).html;
+      const tone = TONE[event] ?? (event === "ops_proposal_outcome" ? "orange" : event === "proposal_decision_fyi" ? "green" : "");
+      expect(html, event).toContain(`class="badge-${tone}"`);
+      const labels = [...imagesOff(html).matchAll(/class="btn [^"]*"[^>]*>([^<]*)</g)].map((m) => text(m[1]).replace(/^(?:&#1000[35];)?(?:&nbsp;)*/, "").trim());
+      const spec: any = (APPROVAL_EMAIL_MAP as any)[event];
+      if (spec.link === "decision-request") expect(labels, event).toEqual(["Approve request", "Decline", "Ask a question"]);
+      else if (spec.link === "decision-proposal") expect(labels, event).toEqual(["Approve proposal", "Request changes", "Decline"]);
+      else expect(labels, event).toEqual(["View request"]);
+    }
+  });
+
+  it("customer emails carry the ops@ footer; staff-only emails the internal one", () => {
+    for (const [event, spec] of Object.entries(APPROVAL_EMAIL_MAP) as Array<[any, any]>) {
+      const html = renderApprovalEmail(event, ctxFor(event), APPROVER).html;
+      if (spec.audience === "customer") {
+        expect(html, event).toContain('href="mailto:ops@plumtrips.com"');
+        expect(html, event).toContain("Your Travel Operations Partner for Businesses That Move");
+      } else expect(html, event).toContain("internal notification for the ops team");
+      expect(html, event).not.toMatch(/linear-gradient/);
+    }
+  });
+});
+
 /* ───────────────────────── submit ───────────────────────── */
 
 describe("submit", () => {
@@ -245,7 +339,7 @@ describe("submit", () => {
     for (const who of [APPROVER, LEADER, LEADER2]) {
       const [m] = to(who);
       expect(m.subject).toMatch(/^Approval Needed — Acme Corp/);
-      expect(m.html).toContain("These links expire in 72 hours");
+      expect(m.html).toContain("valid for 72 hours");
       const tokens = tokenHrefs(m.html);
       expect(tokens.length).toBe(3);
       for (const t of tokens) {
@@ -344,7 +438,7 @@ describe("proposals", () => {
     for (const who of [APPROVER, LEADER, LEADER2]) {
       const [m] = to(who);
       expect(m.subject).toMatch(/^Proposal Approval Needed/);
-      expect(m.html).toContain("These links expire in 72 hours");
+      expect(m.html).toContain("valid for 72 hours");
       expect(m.html).toContain("IndiGo &lt;b&gt;fast&lt;/b&gt;");
       expect(m.html).not.toContain("<b>fast</b>");
       expect(m.html).not.toContain("<script>");
@@ -532,7 +626,7 @@ describe("reminders", () => {
     expect(await runApprovalReminders(new Date(t0 + 95 * H))).toEqual({ requests: 0, proposals: 0 });
     expect(everyone()).toEqual([APPROVER, LEADER, LEADER2].sort());
     expect(to(LEADER).map((m) => m.subject.split(":")[0])).toEqual(["Reminder 1 of 3", "Reminder 2 of 3", "Reminder 3 of 3"]);
-    expect(to(LEADER)[0].html).toContain("These links expire in 72 hours");
+    expect(to(LEADER)[0].html).toContain("valid for 72 hours");
   });
 
   it("request: stops once decided, revoked, or waiting on the requester's reply", async () => {

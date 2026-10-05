@@ -488,7 +488,7 @@ describe("Phase C — notifications and the one 'booking done' path", () => {
     expect((await propDoc(pid)).booking.status).toBe("DONE");
   });
 
-  it("ops hold and cancel tell the requester; the cancel email links to a new request", async () => {
+  it("ops hold and cancel tell the requester; the cancel email links to My Requests", async () => {
     const rid = await approvedRequest();
     const STAFF = { email: "ops@plumtrips.test", roles: ["SUPERADMIN"] };
     sent.length = 0;
@@ -498,7 +498,7 @@ describe("Phase C — notifications and the one 'booking done' path", () => {
     sent.length = 0;
     expect((await as(request(app).put(`/api/approvals/admin/${rid}/cancel`), STAFF).send({ comment: "Trip called off" })).status).toBe(200);
     const c = sent.find((m) => m.to === REQUESTER && /Cancelled/.test(m.subject))!;
-    expect(c.html).toContain("/customer/approvals/new");
+    expect(c.html).toContain("/customer/approvals/mine");
     expect(c.html).toContain("Trip called off");
   });
 });

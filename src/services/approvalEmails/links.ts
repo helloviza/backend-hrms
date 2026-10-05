@@ -22,7 +22,7 @@ export function decisionLinkUrl(
   }`;
 }
 
-/** "These links expire in 72 hours (by Tue, 6 Oct, 10:15 pm IST)." */
+/** "These links are unique, secure and valid for 72 hours (by Thu, 8 Oct, 10:00 am IST) and can only be used once." */
 export function linkExpiryText(now = new Date()): string {
   const until = new Date(now.getTime() + APPROVAL_LINK_EXPIRY_HOURS * 3600_000);
   const when = until.toLocaleString("en-IN", {
@@ -34,7 +34,7 @@ export function linkExpiryText(now = new Date()): string {
     minute: "2-digit",
     hour12: true,
   });
-  return `These links expire in ${APPROVAL_LINK_EXPIRY_HOURS} hours (by ${when} IST) and each works once. After that, open Plumbox to decide.`;
+  return `These links are unique, secure and valid for ${APPROVAL_LINK_EXPIRY_HOURS} hours (by ${when} IST) and can only be used once.`;
 }
 
 /** The requester's own requests (FE route customer/approvals/mine). */

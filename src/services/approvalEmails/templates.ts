@@ -5,26 +5,16 @@
 // recipients, and src/scripts/render-approval-emails.ts renders every event to
 // files for review.
 //
+// Every email is the one layout (layout.ts) in the same order — header, hero,
+// summary strip, trip summary, note, itinerary, buttons, expiry box, footer —
+// so each template below only says WHAT goes in it.
+//
 // Customer-facing output is price-free (stripPriceText on all free text),
 // HTML-escaped, names people (never ids) and shows staff as "Plumtrips Travel
 // Desk". Each email with decision links states when they expire.
 import type { MailKind } from "../../utils/mailer.js";
 import { stripPriceText } from "../../routes/approvals.security.js";
-import {
-  buildApproverEmailHtml,
-  buildRequesterApprovedHtml,
-  buildRequestDeclinedEmailHtml,
-  buildProposalApprovedEmailHtml,
-  buildProposalDeclinedEmailHtml,
-  buildAdminProcessedEmailHtml,
-  buildEmailShell,
-  eBtn,
-  eCard,
-  eLabel,
-  eRow,
-  escapeHtml,
-  pickTripSummary,
-} from "../../routes/approvals.email.js";
+import { escapeHtml, sanitizeAdminCommentForEmail } from "../../routes/approvals.email.js";
 import { TRAVEL_DESK_NAME } from "../actorNames.js";
 import {
   caseCode,
@@ -33,16 +23,29 @@ import {
   deciderProposalsUrl,
   linkExpiryText,
   myRequestsUrl,
-  newRequestUrl,
   proposalViewUrl,
   staffCaseUrl,
 } from "./links.js";
+import {
+  buttonGroup,
+  card,
+  expiryBox,
+  factsGrid,
+  itinerary,
+  noteBox,
+  requestHeading,
+  renderLayout,
+  sectionLabel,
+  summaryStrip,
+  type Fact,
+  type Hero,
+  type ItineraryRow,
+} from "./layout.js";
+import { safe, serviceOf, SERVICE_LABEL, tripModel, type TripModel } from "./tripModel.js";
 import type { ApprovalEmailEvent } from "./map.js";
 
 type AnyObj = Record<string, any>;
 const str = (v: any) => String(v ?? "").trim();
-/** Free text for a customer email: price-stripped, then escaped. */
-const clean = (v: any) => escapeHtml(stripPriceText(str(v)));
 
 export type ProposalDecision = "APPROVED" | "DECLINED" | "CHANGES_REQUESTED";
 
@@ -86,240 +89,308 @@ export type Rendered = { subject: string; html: string; kind: MailKind };
 
 const customerName = (ar: AnyObj) => str(ar?.customerName) || "your company";
 const requesterName = (ar: AnyObj) => str(ar?.frontlinerName) || str(ar?.frontlinerEmail).split("@")[0] || "the requester";
-const trip = (ar: AnyObj) => stripPriceText(pickTripSummary(ar?.cartItems || []).seg);
-const firstName = (ar: AnyObj) => requesterName(ar);
 
-function para(html: string) {
-  return `<div style="font-size:13px;line-height:1.65;color:#334155;">${html}</div>`;
+/* ───────────────────────── shared pieces ───────────────────────── */
+
+/** "trip to Mumbai", "forex request", "event in Goa" — escaped. */
+function thing(t: TripModel): string {
+  if (!t.destination) return escapeHtml(t.noun);
+  if (t.noun === "trip") return `trip to ${safe(t.destination)}`;
+  if (t.noun === "event") return `event in ${safe(t.destination)}`;
+  return escapeHtml(t.noun);
+}
+/** "Asha Rao's trip" — escaped. */
+const theirs = (ar: AnyObj, t: TripModel) => `${safe(requesterName(ar))}'s ${escapeHtml(t.noun)}`;
+/** "Your trip to Mumbai" — escaped. */
+const yours = (t: TripModel) => `Your ${thing(t)}`;
+
+function strip(ar: AnyObj, t: TripModel) {
+  return summaryStrip([
+    { icon: "i-workspace.png", label: "Workspace", value: safe(customerName(ar)) },
+    { icon: "i-user.png", label: "Requested by", value: safe(requesterName(ar)) },
+    { icon: "i-items.png", label: "Items", value: t.itemsLabel },
+  ]);
 }
 
-function noteBox(text: string) {
-  return text
-    ? `<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;white-space:pre-wrap;">${text}</div>`
-    : "";
+const requestNote = (ar: AnyObj) => noteBox("Request note", safe(ar?.comments));
+
+function viewButton(href: string) {
+  return buttonGroup({ label: "View request", href });
 }
 
-function tripLine(ar: AnyObj) {
-  const t = trip(ar);
-  return t ? `<br/><br/><b style="color:#0f172a;">${escapeHtml(t)}</b> (${escapeHtml(caseCode(ar))})` : ` (${escapeHtml(caseCode(ar))})`;
+/** Standard body: strip, trip summary, notes, itinerary, then whatever comes after. */
+function body(ar: AnyObj, t: TripModel, href: string, opts: { notes?: string[]; after?: string[]; itineraryRows?: ItineraryRow[]; itineraryLabel?: string } = {}) {
+  return [
+    strip(ar, t),
+    // No items: the request number still shows, in its own heading.
+    t.summaryHtml || card(requestHeading("Request", caseCode(ar))),
+    ...(opts.notes || []),
+    itinerary(opts.itineraryRows || t.itinerary, href, opts.itineraryLabel),
+    ...(opts.after || []),
+  ];
 }
 
-const footerReply = `<div style="margin-top:16px;color:#94a3b8;font-size:12px;line-height:1.6;">Questions? Reply to this email to reach the ${TRAVEL_DESK_NAME}.</div>`;
+function doc(opts: { title: string; preheader: string; hero: Hero; blocks: string[]; staff?: boolean }) {
+  return renderLayout({
+    title: opts.title,
+    preheader: opts.preheader,
+    hero: opts.hero,
+    blocks: opts.blocks,
+    footer: opts.staff ? "staff" : "customer",
+  });
+}
+
+/** A titled card of label / value facts (staff case details, the failure alert). */
+function factsCard(label: string, facts: Fact[]) {
+  return card(`${sectionLabel(escapeHtml(label))}<div style="height:6px;line-height:6px;font-size:0;">&nbsp;</div>${factsGrid(facts)}`);
+}
 
 /* ───────────────────────── request phase ───────────────────────── */
 
 function approverRequestHtml(event: ApprovalEmailEvent, ctx: EmailCtx, recipient: string): string {
   const ar = ctx.ar;
+  const t = tripModel(ar);
   const id = String(ar?._id || "");
-  const notice =
+  const who = safe(requesterName(ar));
+  const approveUrl = decisionLinkUrl("request", id, recipient, null, "approve");
+
+  const hero: Hero =
     event === "request_reminder"
-      ? `Reminder ${ctx.reminderNo || 1} of 3 — this request is still waiting for a decision.`
+      ? { badge: `Reminder ${ctx.reminderNo || 1} of 3`, tone: "orange", headline: `${theirs(ar, t)} is still waiting for your approval`, instruction: "Please approve, decline or ask a question below." }
       : event === "request_resubmitted"
-      ? "The requester resubmitted this request after it was declined."
-      : event === "request_resent"
-      ? "The requester sent this request to you again."
+      ? { badge: "Resubmitted", tone: "orange", headline: `${theirs(ar, t)} is back for your approval`, instruction: `${who} edited and resubmitted it after it was declined.` }
       : event === "clarification_answered"
-      ? `${requesterName(ar)} replied to the question${ctx.edited ? " and edited the request" : ""}.`
-      : "";
-  const comments =
+      ? { badge: "Approval needed", tone: "orange", headline: `${who} answered your question`, instruction: `Review the reply${ctx.edited ? " and the edited request" : ""}, then approve, decline or ask again.` }
+      : event === "request_resent"
+      ? { badge: "Approval needed", tone: "orange", headline: `${theirs(ar, t)} needs your approval`, instruction: `${who} sent this request to you again. Please review it and take action.` }
+      : { badge: "Approval needed", tone: "orange", headline: `${theirs(ar, t)} needs your approval`, instruction: "Please review the details below and take action." };
+
+  const notes =
     event === "clarification_answered"
-      ? `Question: ${str(ctx.question)}\nReply${ctx.edited ? " (request edited)" : ""}: ${str(ctx.reply)}`
-      : str(ar?.comments);
-  return buildApproverEmailHtml({
-    requestId: id,
-    code: caseCode(ar),
-    requesterName: requesterName(ar),
-    requesterEmail: "",
-    customerName: str(ar?.customerName) || "Workspace",
-    ticketId: ar?.ticketId,
-    items: Array.isArray(ar?.cartItems) ? ar.cartItems : [],
-    comments,
-    approveUrl: decisionLinkUrl("request", id, recipient, null, "approve"),
-    declineUrl: decisionLinkUrl("request", id, recipient, null, "decline"),
-    clarifyUrl: decisionLinkUrl("request", id, recipient, null, "clarify"),
-    inboxUrl: deciderInboxUrl(),
-    notice,
-    expiresText: linkExpiryText(ctx.now),
+      ? [noteBox("Your question", safe(ctx.question)), noteBox(`${requesterName(ar)}'s reply${ctx.edited ? " (request edited)" : ""}`, safe(ctx.reply))]
+      : [requestNote(ar)];
+
+  const buttons = approveUrl
+    ? buttonGroup({ label: "Approve request", href: approveUrl, glyph: "&#10003;" }, [
+        { label: "Decline", href: decisionLinkUrl("request", id, recipient, null, "decline"), style: "danger", glyph: "&#10005;" },
+        { label: "Ask a question", href: decisionLinkUrl("request", id, recipient, null, "clarify"), style: "warn" },
+      ])
+    : buttonGroup({ label: "Open Plumbox to decide", href: deciderInboxUrl() });
+
+  return doc({
+    title: "Approval needed",
+    preheader: `${requesterName(ar)}'s travel request needs your decision — approve, decline or ask a question.`,
+    hero,
+    blocks: body(ar, t, deciderInboxUrl(), { notes, after: [buttons, approveUrl ? expiryBox(linkExpiryText(ctx.now)) : ""] }),
   });
 }
 
 function submitConfirmationHtml(ctx: EmailCtx) {
   const ar = ctx.ar;
+  const t = tripModel(ar);
   const approver = str(ar?.managerName) && str(ar?.managerName) !== "Approver" ? str(ar.managerName) : "your approver";
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel("Request received")}
-      ${para(`Hi <b style="color:#0f172a;">${escapeHtml(firstName(ar))}</b>,<br/><br/>
-        We've received your travel request${tripLine(ar)}. It is with <b style="color:#0f172a;">${escapeHtml(approver)}</b>
-        for approval; a Workspace Leader may also decide. We'll email you as soon as it is decided.`)}
-    `)}
-    <div style="margin-top:16px;">${eBtn("View My Requests", myRequestsUrl(), "#00477f", "#ffffff")}</div>
-    ${footerReply}`,
-    { title: "We've received your request", badgeText: "AWAITING APPROVAL", badgeColor: "#f59e0b" },
-  );
+  return doc({
+    title: "Request received",
+    preheader: `Your travel request ${caseCode(ar)} is with ${approver} for approval.`,
+    hero: {
+      badge: "Submitted",
+      tone: "blue",
+      headline: `${yours(t)} has been sent for approval`,
+      instruction: `It's with ${safe(approver)} now; a Workspace Leader may also decide. We'll email you as soon as it's decided.`,
+    },
+    blocks: body(ar, t, myRequestsUrl(), { notes: [requestNote(ar)], after: [viewButton(myRequestsUrl())] }),
+  });
 }
 
 function autoApprovedHtml(ctx: EmailCtx) {
   const ar = ctx.ar;
+  const t = tripModel(ar);
   const direct = ar?.meta?.travelFlow === "APPROVAL_DIRECT";
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel("Request approved")}
-      ${para(`Hi <b style="color:#0f172a;">${escapeHtml(firstName(ar))}</b>,<br/><br/>
-        Your travel request${tripLine(ar)} is approved — as a Workspace Leader, nobody else needs to approve it.
-        ${direct ? `The ${TRAVEL_DESK_NAME} will now book it.` : `The ${TRAVEL_DESK_NAME} will now prepare a proposal for you.`}`)}
-    `)}
-    <div style="margin-top:16px;">${eBtn("View My Requests", myRequestsUrl(), "#10b981", "#ffffff")}</div>
-    ${footerReply}`,
-    { title: "Your request is approved", badgeText: "APPROVED", badgeColor: "#10b981" },
-  );
+  return doc({
+    title: "Request approved",
+    preheader: `Your travel request ${caseCode(ar)} is approved.`,
+    hero: {
+      badge: "Auto-approved",
+      tone: "blue",
+      headline: `${yours(t)} is approved`,
+      instruction: `As a Workspace Leader, nobody else needs to approve it. The ${TRAVEL_DESK_NAME} will now ${direct ? "book it" : "prepare a proposal for you"}.`,
+    },
+    blocks: body(ar, t, myRequestsUrl(), { after: [viewButton(myRequestsUrl())] }),
+  });
 }
 
 function requestApprovedHtml(ctx: EmailCtx) {
   const ar = ctx.ar;
-  return buildRequesterApprovedHtml({
-    customerName: str(ar?.customerName) || "Workspace",
-    ticketId: caseCode(ar),
-    requesterName: requesterName(ar),
-    requesterEmail: "",
-    approverName: str(ctx.actorName),
-    approverEmail: "",
-    items: Array.isArray(ar?.cartItems) ? ar.cartItems : [],
-    travelFlow: ar?.meta?.travelFlow,
+  const t = tripModel(ar);
+  const direct = ar?.meta?.travelFlow === "APPROVAL_DIRECT";
+  const by = safe(ctx.actorName) || "Your approver";
+  return doc({
+    title: "Request approved",
+    preheader: `Your travel request ${caseCode(ar)} was approved.`,
+    hero: {
+      badge: "Approved",
+      tone: "green",
+      headline: `${yours(t)} is approved`,
+      instruction: `${by} approved it. The ${TRAVEL_DESK_NAME} will now ${direct ? "book it" : "prepare a proposal for you"}.`,
+    },
+    blocks: body(ar, t, myRequestsUrl(), { after: [viewButton(myRequestsUrl())] }),
   });
 }
 
 function requestDeclinedHtml(ctx: EmailCtx) {
   const ar = ctx.ar;
-  return buildRequestDeclinedEmailHtml({
-    ticketId: caseCode(ar),
-    requesterName: requesterName(ar),
-    managerName: str(ctx.actorName) || "your approver",
-    comment: stripPriceText(str(ctx.reason)),
-    loginUrl: myRequestsUrl(),
+  const t = tripModel(ar);
+  const by = safe(ctx.actorName) || "Your approver";
+  return doc({
+    title: "Request declined",
+    preheader: `Your travel request ${caseCode(ar)} was declined.`,
+    hero: {
+      badge: "Declined",
+      tone: "red",
+      headline: `${yours(t)} was declined`,
+      instruction: `${by} declined it. You can edit and resubmit it from My Requests.`,
+    },
+    blocks: body(ar, t, myRequestsUrl(), { notes: [noteBox("Reason", safe(ctx.reason))], after: [viewButton(myRequestsUrl())] }),
   });
 }
 
 function clarificationAskedHtml(ctx: EmailCtx) {
   const ar = ctx.ar;
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel("Question from your approver")}
-      ${para(`Hi <b style="color:#0f172a;">${escapeHtml(firstName(ar))}</b>,<br/><br/>
-        <b style="color:#0f172a;">${escapeHtml(str(ctx.actorName) || "Your approver")}</b> needs more information before deciding on
-        your travel request${tripLine(ar)}:
-        ${noteBox(clean(ctx.reason))}`)}
-    `)}
-    <div style="margin-top:16px;">${eBtn("Reply in My Requests", myRequestsUrl(), "#00477f", "#ffffff")}</div>
-    <div style="margin-top:12px;color:#94a3b8;font-size:12px;">You can also edit the request before replying. Your reply goes back to whoever asked.</div>
-    ${footerReply}`,
-    { title: "Your approver has a question", badgeText: "NEEDS YOUR REPLY", badgeColor: "#f59e0b" },
-  );
+  const t = tripModel(ar);
+  const by = safe(ctx.actorName) || "Your approver";
+  return doc({
+    title: "A question about your request",
+    preheader: `${str(ctx.actorName) || "Your approver"} needs more information before deciding.`,
+    hero: {
+      badge: "Needs your reply",
+      tone: "orange",
+      headline: `${by} has a question about your ${escapeHtml(t.noun)}`,
+      instruction: "Reply from My Requests — you can also edit the request first. Your reply goes back to whoever asked.",
+    },
+    blocks: body(ar, t, myRequestsUrl(), { notes: [noteBox("Question", safe(ctx.reason))], after: [viewButton(myRequestsUrl())] }),
+  });
 }
 
 /** FYI to the other deciders: request approved/declined, or a proposal decision. */
 function decisionFyiHtml(event: ApprovalEmailEvent, ctx: EmailCtx) {
   const ar = ctx.ar;
+  const t = tripModel(ar);
   const isProposal = event === "proposal_decision_fyi";
-  const verb = isProposal
-    ? ctx.decision === "APPROVED"
-      ? "approved"
-      : ctx.decision === "DECLINED"
-      ? "declined"
-      : "sent back for changes"
-    : event === "request_approved_fyi"
-    ? "approved"
-    : "declined";
-  const what = isProposal
-    ? `The proposal${ctx.proposal?.version ? ` (v${escapeHtml(String(ctx.proposal.version))})` : ""} for ${escapeHtml(requesterName(ar))}'s request`
-    : `${escapeHtml(requesterName(ar))}'s travel request`;
-  const color = verb === "approved" ? "#10b981" : verb === "declined" ? "#dc2626" : "#f59e0b";
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel(`${isProposal ? "Proposal" : "Request"} ${verb}`)}
-      ${para(`${what}${tripLine(ar)} was <b>${verb}</b> by <b>${escapeHtml(str(ctx.actorName) || "an approver")}</b>.
-        ${ctx.reason ? `<br/><br/><b>Note:</b> ${clean(ctx.reason)}` : ""}
-        <br/><br/>No action is needed from you.`)}
-    `)}
-    <div style="margin-top:16px;">${eBtn("Open Plumbox", deciderInboxUrl(), "#00477f", "#ffffff")}</div>`,
-    { title: `${isProposal ? "Proposal" : "Request"} ${verb}`, badgeText: verb.toUpperCase(), badgeColor: color },
-  );
+  const outcome: "approved" | "declined" | "changes" =
+    isProposal ? (ctx.decision === "APPROVED" ? "approved" : ctx.decision === "DECLINED" ? "declined" : "changes") : event === "request_approved_fyi" ? "approved" : "declined";
+  const subject = isProposal ? `${theirs(ar, t)} proposal` : theirs(ar, t);
+  const headline =
+    outcome === "approved" ? `${subject} was approved` : outcome === "declined" ? `${subject} was declined` : `${subject} was sent back for changes`;
+  const by = safe(ctx.actorName) || "An approver";
+  const href = isProposal ? deciderProposalsUrl() : deciderInboxUrl();
+  return doc({
+    title: isProposal ? "Proposal decided" : "Request decided",
+    preheader: `${str(ctx.actorName) || "An approver"} decided ${caseCode(ar)}. No action is needed from you.`,
+    hero: {
+      badge: outcome === "approved" ? "Approved" : outcome === "declined" ? "Declined" : "Changes requested",
+      tone: outcome === "approved" ? "green" : outcome === "declined" ? "red" : "blue",
+      headline,
+      instruction: `Decided by ${by}. No action is needed from you.`,
+    },
+    blocks: body(ar, t, href, { notes: [noteBox("Note", safe(ctx.reason))], after: [viewButton(href)] }),
+  });
 }
 
 /* ───────────────────────── ops (staff) ───────────────────────── */
 
-function staffCaseTable(ar: AnyObj, extra: Array<[string, string]> = [], tripLines?: string[]) {
-  return `<table cellpadding="0" cellspacing="0" width="100%">
-    ${eRow("Request", escapeHtml(caseCode(ar)))}
-    ${eRow("Customer", escapeHtml(customerName(ar)))}
-    ${eRow("Requested by", escapeHtml(requesterName(ar)))}
-    ${eRow("Trip", tripLines?.length ? tripLines.map((l) => escapeHtml(stripPriceText(l))).join("<br/>") : escapeHtml(trip(ar)))}
-    ${eRow("Flow", ar?.meta?.travelFlow === "APPROVAL_DIRECT" ? "Flow 3 — book directly" : "Flow 2 — proposal first")}
-    ${extra.map(([k, v]) => eRow(k, v)).join("")}
-  </table>`;
+function flowFact(ar: AnyObj): Fact {
+  return { label: "Flow", value: ar?.meta?.travelFlow === "APPROVAL_DIRECT" ? "Flow 3 — book directly" : "Flow 2 — proposal first" };
 }
 
 function deskNewCaseHtml(event: ApprovalEmailEvent, ctx: EmailCtx) {
   const ar = ctx.ar;
+  const t = tripModel(ar);
   const noAgent = event === "ops_no_agent";
   const cancelled = event === "ops_customer_cancelled";
-  const auto = ar?.meta?.selfApproved ? "Auto-approved (requester is a Workspace Leader)" : `Approved by ${escapeHtml(str(ctx.actorName) || str(ar?.approvedByName) || "the approver")}`;
-  const assigned = noAgent
-    ? `<b style="color:#dc2626;">No agent available</b> — auto-allocation found nobody; assign it by hand.`
+  const approval = ar?.meta?.selfApproved
+    ? "Auto-approved (requester is a Workspace Leader)"
+    : `Approved by ${safe(str(ctx.actorName) || str(ar?.approvedByName) || "the approver")}`;
+  const assignment = noAgent
+    ? "No agent available — auto-allocation found nobody"
     : ctx.assignedToName
-    ? `Auto-assigned to <b>${escapeHtml(ctx.assignedToName)}</b>`
-    : "Unassigned (auto-allocation is off) — pick it up from the queue.";
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel(cancelled ? "Customer cancelled" : noAgent ? "New case — no agent available" : "New case in the ops queue")}
-      ${staffCaseTable(ar, cancelled ? [["Reason", clean(ctx.reason)]] : [["Approval", auto], ["Assignment", assigned]])}
-    `)}
-    <div style="margin-top:16px;">${eBtn("Open in the ops queue", staffCaseUrl(ar?._id), "#00477f", "#ffffff")}</div>`,
-    {
-      title: cancelled ? "Customer cancelled" : noAgent ? "Unassigned case" : "New case",
-      badgeText: cancelled ? "CANCELLED" : noAgent ? "NO AGENT" : "NEW",
-      badgeColor: cancelled || noAgent ? "#dc2626" : "#4f46e5",
-    },
-  );
+    ? `Auto-assigned to ${safe(ctx.assignedToName)}`
+    : "Unassigned (auto-allocation is off)";
+  const hero: Hero = cancelled
+    ? { badge: "Cancelled", tone: "red", headline: `${theirs(ar, t)} was cancelled by the customer`, instruction: "Stop any booking work and release holds." }
+    : noAgent
+    ? { badge: "No agent available", tone: "blue", headline: `Nobody is free to take ${theirs(ar, t)}`, instruction: "Assign it by hand from the ops queue." }
+    : { badge: "New case", tone: "blue", headline: `New case: ${theirs(ar, t)}${t.destination ? ` to ${safe(t.destination)}` : ""}`, instruction: ctx.assignedToName ? `Auto-assigned to ${safe(ctx.assignedToName)}.` : "Unassigned — pick it up from the queue." };
+  const facts: Fact[] = cancelled
+    ? [flowFact(ar)]
+    : [flowFact(ar), { label: "Approval", value: approval }, { label: "Assignment", value: assignment }];
+  const href = staffCaseUrl(ar?._id);
+  return doc({
+    title: cancelled ? "Customer cancelled" : noAgent ? "Unassigned case" : "New case",
+    preheader: `${caseCode(ar)} — ${customerName(ar)}`,
+    hero,
+    staff: true,
+    blocks: body(ar, t, href, {
+      notes: cancelled ? [noteBox("Reason", safe(ctx.reason))] : [requestNote(ar)],
+      after: [factsCard("Case", facts), viewButton(href)],
+    }),
+  });
 }
 
 function assigneeHtml(ctx: EmailCtx) {
   const ar = ctx.ar;
+  const t = tripModel(ar);
   const agent = ctx.agent || { name: "", email: "" };
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel("Assigned to you")}
-      ${para(`Hi ${escapeHtml(agent.name || "there")},<br/><br/>A travel request has been assigned to you on the ${TRAVEL_DESK_NAME}.`)}
-      <div style="margin-top:10px;">${staffCaseTable(ar, [
-        ["Why you", escapeHtml(str(ctx.assignWhy) || "Assigned by a colleague")],
-        ...(ctx.assignNote ? ([["Note", escapeHtml(str(ctx.assignNote))]] as Array<[string, string]>) : []),
-      ], ctx.tripLines)}</div>
-    `)}
-    <div style="margin-top:16px;">${eBtn("Open in the ops queue", staffCaseUrl(ar?._id), "#00477f", "#ffffff")}</div>`,
-    { title: "Case assigned to you", badgeText: "ASSIGNED", badgeColor: "#4f46e5" },
-  );
+  const href = staffCaseUrl(ar?._id);
+  return doc({
+    title: "Case assigned to you",
+    preheader: `${caseCode(ar)} — ${customerName(ar)} is assigned to you.`,
+    hero: {
+      badge: "Case assigned",
+      tone: "blue",
+      headline: `${theirs(ar, t)}${t.destination ? ` to ${safe(t.destination)}` : ""} is yours`,
+      instruction: `Hi ${safe(agent.name) || "there"}, this case is assigned to you on the ${TRAVEL_DESK_NAME}.`,
+    },
+    staff: true,
+    blocks: body(ar, t, href, {
+      notes: [requestNote(ar), noteBox("Note from the assigner", escapeHtml(str(ctx.assignNote)))],
+      after: [
+        factsCard("Case", [flowFact(ar), { label: "Why you", value: escapeHtml(str(ctx.assignWhy) || "Assigned by a colleague") }]),
+        viewButton(href),
+      ],
+    }),
+  });
 }
 
 function deskProposalOutcomeHtml(ctx: EmailCtx) {
   const ar = ctx.ar;
+  const t = tripModel(ar);
   const p = ctx.proposal || {};
-  const label = ctx.decision === "APPROVED" ? "approved" : ctx.decision === "DECLINED" ? "declined" : "changes requested";
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel(`Proposal v${escapeHtml(String(p?.version ?? ""))} ${label}`)}
-      ${staffCaseTable(ar, [
-        ["Decided by", escapeHtml(str(ctx.actorName) || "—")],
-        ...(ctx.reason ? ([["Note", escapeHtml(str(ctx.reason))]] as Array<[string, string]>) : []),
-        ["Next", ctx.decision === "APPROVED" ? "Start the booking." : ctx.decision === "DECLINED" ? "Talk to the customer; send a revised proposal if wanted." : "Revise the proposal and submit it again."],
-      ])}
-    `)}
-    <div style="margin-top:16px;">${eBtn("Open in the ops queue", staffCaseUrl(ar?._id), "#00477f", "#ffffff")}</div>`,
-    {
-      title: `Proposal ${label}`,
-      badgeText: String(ctx.decision || "").replace("_", " "),
-      badgeColor: ctx.decision === "APPROVED" ? "#10b981" : ctx.decision === "DECLINED" ? "#dc2626" : "#f59e0b",
+  const d = ctx.decision;
+  const href = staffCaseUrl(ar?._id);
+  const headline =
+    d === "APPROVED" ? `${theirs(ar, t)} proposal was approved` : d === "DECLINED" ? `${theirs(ar, t)} proposal was declined` : `${theirs(ar, t)} proposal needs changes`;
+  const next = d === "APPROVED" ? "Start the booking." : d === "DECLINED" ? "Talk to the customer; send a revised proposal if wanted." : "Revise the proposal and submit it again.";
+  return doc({
+    title: "Proposal outcome",
+    preheader: `${caseCode(ar)} — proposal ${d === "APPROVED" ? "approved" : d === "DECLINED" ? "declined" : "changes requested"}`,
+    hero: {
+      badge: d === "APPROVED" ? "Approved" : d === "DECLINED" ? "Declined" : "Changes requested",
+      tone: d === "APPROVED" ? "green" : d === "DECLINED" ? "red" : "orange",
+      headline,
+      instruction: next,
     },
-  );
+    staff: true,
+    blocks: body(ar, t, href, {
+      notes: [noteBox(d === "CHANGES_REQUESTED" ? "Changes asked for" : "Note", escapeHtml(str(ctx.reason)))],
+      after: [
+        factsCard("Case", [
+          { label: "Proposal", value: p?.version ? `v${escapeHtml(String(p.version))}` : "—" },
+          { label: "Decided by", value: escapeHtml(str(ctx.actorName) || "—") },
+        ]),
+        viewButton(href),
+      ],
+    }),
+  });
 }
 
 export function buildSendFailureAlertHtml(f: {
@@ -333,24 +404,28 @@ export function buildSendFailureAlertHtml(f: {
   customerName: string;
   requestId: string;
 }) {
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel("An email could not be delivered")}
-      <table cellpadding="0" cellspacing="0" width="100%">
-        ${eRow("Request", escapeHtml(f.caseCode || "—"))}
-        ${eRow("Customer", escapeHtml(f.customerName || "—"))}
-        ${eRow("Email", escapeHtml(f.event))}
-        ${eRow("Subject", escapeHtml(f.subject))}
-        ${eRow("To", escapeHtml(f.to.join(", ")))}
-        ${f.cc.length ? eRow("CC", escapeHtml(f.cc.join(", "))) : ""}
-        ${eRow("Tries", escapeHtml(String(f.attempts)))}
-        ${eRow("Last error", escapeHtml(f.error))}
-      </table>
-      ${para(`<br/>Nobody on the list above has this email. Contact them another way if it matters; the failure is also listed under "Email failures" on the ops queue.`)}
-    `)}
-    ${f.requestId ? `<div style="margin-top:16px;">${eBtn("Open the case", staffCaseUrl(f.requestId), "#00477f", "#ffffff")}</div>` : ""}`,
-    { title: "Email not delivered", badgeText: "SEND FAILED", badgeColor: "#dc2626" },
-  );
+  const facts: Fact[] = [
+    { label: "Request", value: escapeHtml(f.caseCode || "—") },
+    { label: "Customer", value: escapeHtml(f.customerName || "—") },
+    { label: "Email", value: escapeHtml(f.event) },
+    { label: "Subject", value: escapeHtml(f.subject) },
+    { label: "To", value: escapeHtml(f.to.join(", ")) },
+    ...(f.cc.length ? [{ label: "CC", value: escapeHtml(f.cc.join(", ")) }] : []),
+    { label: "Tries", value: escapeHtml(String(f.attempts)) },
+    { label: "Last error", value: escapeHtml(f.error) },
+  ];
+  return doc({
+    title: "Email not delivered",
+    preheader: `${f.caseCode || "Approval flow"}: "${f.subject}" could not be delivered.`,
+    hero: {
+      badge: "Email failure",
+      tone: "blue",
+      headline: "An approval email could not be delivered",
+      instruction: "Nobody listed below has it. Reach them another way if it matters; it's also under “Email failures” on the ops queue.",
+    },
+    staff: true,
+    blocks: [factsCard("Failed email", facts), f.requestId ? viewButton(staffCaseUrl(f.requestId)) : ""],
+  });
 }
 
 /* ───────────────────────── proposal phase ───────────────────────── */
@@ -360,148 +435,140 @@ function lineLabel(li: AnyObj): string {
   const origin = str(m.origin || li?.from || li?.origin);
   const dest = str(m.destination || li?.to || li?.destination);
   const raw = str(m.tripType || li?.tripType).toLowerCase();
-  const tripType = raw === "oneway" ? "One Way" : raw === "roundtrip" ? "Round Trip" : "";
+  const tripType = raw === "oneway" ? "One way" : raw === "roundtrip" ? "Round trip" : "";
   if (origin && dest) return `${origin} → ${dest}${tripType ? ` (${tripType})` : ""}`;
   return str(li?.title || li?.description || li?.name || li?.category) || "Travel service";
 }
 
-/** The proposal's options for customer-side eyes: no prices, every text stripped AND escaped. */
-export function proposalOptionsHtml(p: AnyObj): string {
+/** The proposal's options as itinerary rows: no prices, every text stripped AND escaped. */
+export function proposalOptionRows(p: AnyObj): ItineraryRow[] {
   const options = (Array.isArray(p?.options) ? p.options : [])
     .slice()
     .sort((a: any, b: any) => Number(a?.optionNo || 0) - Number(b?.optionNo || 0));
-  if (!options.length) return `<div style="color:#64748b;font-size:13px;">No options</div>`;
-  return options
-    .map((opt: AnyObj) => {
-      const rows = (Array.isArray(opt?.lineItems) ? opt.lineItems : [])
-        .map(
-          (li: AnyObj) => `<tr>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:13px;color:#0f172a;">${clean(lineLabel(li))}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;font-size:13px;color:#0f172a;">${escapeHtml(String(Number(li?.qty || 1)))}</td>
-          </tr>`,
-        )
-        .join("");
-      const notes = clean(opt?.notes);
-      return `<div style="border:1px solid #e8eef6;border-radius:12px;padding:14px;margin-top:12px;">
-        <div style="font-weight:800;margin-bottom:6px;font-size:14px;color:#0f172a;">Option ${escapeHtml(String(opt?.optionNo || ""))} — ${clean(opt?.title) || "Option"}</div>
-        ${notes ? `<div style="font-size:12px;color:#475569;margin-bottom:6px;">${notes}</div>` : ""}
-        <table style="width:100%;border-collapse:collapse;">
-          <thead><tr>
-            <th style="text-align:left;padding:6px 8px;border-bottom:1px solid #eee;font-size:11px;color:#64748b;">Item</th>
-            <th style="text-align:right;padding:6px 8px;border-bottom:1px solid #eee;font-size:11px;color:#64748b;">Qty</th>
-          </tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>`;
-    })
-    .join("");
+  return options.map((opt: AnyObj) => {
+    const lines: AnyObj[] = Array.isArray(opt?.lineItems) ? opt.lineItems : [];
+    const first = lines[0] ? serviceOf(lines[0]) : "other";
+    return {
+      service: SERVICE_LABEL[first] ? first : "other",
+      title: `Option ${escapeHtml(String(opt?.optionNo || ""))} — ${safe(opt?.title) || "Option"}`,
+      lines: [
+        ...(str(opt?.notes) ? [safe(opt.notes)] : []),
+        ...lines.map((li) => {
+          const qty = Number(li?.qty || 1);
+          return `${safe(lineLabel(li))}${qty > 1 ? ` × ${escapeHtml(String(qty))}` : ""}`;
+        }),
+      ].filter(Boolean),
+    };
+  });
 }
 
 function proposalApprovalHtml(event: ApprovalEmailEvent, ctx: EmailCtx, recipient: string) {
   const ar = ctx.ar;
+  const t = tripModel(ar);
   const p = ctx.proposal || {};
   const pid = String(p?._id || "");
   const approveUrl = decisionLinkUrl("proposal", pid, recipient, null, "approve");
-  const declineUrl = decisionLinkUrl("proposal", pid, recipient, null, "decline");
-  const changesUrl = decisionLinkUrl("proposal", pid, recipient, null, "request_changes");
-  const ctas = approveUrl
-    ? `${eBtn("✓ Approve", approveUrl, "#4f46e5", "#ffffff")}
-       ${eBtn("✕ Decline", declineUrl, "#ffffff", "#dc2626", "#fca5a5")}
-       ${eBtn("Request changes", changesUrl, "#ffffff", "#92400e", "#fcd34d")}
-       <div style="margin-top:8px;font-size:12px;color:#64748b;">Each button opens a page where you confirm. ${escapeHtml(linkExpiryText(ctx.now))}</div>`
-    : eBtn("Open Plumbox to decide", deciderProposalsUrl(), "#4f46e5", "#ffffff");
-  const reminder =
-    event === "proposal_reminder"
-      ? `<div style="margin-bottom:12px;padding:12px 14px;border:1px solid #fcd34d;background:#fffbeb;border-radius:14px;font-size:14px;font-weight:700;color:#92400e;">Reminder ${escapeHtml(String(ctx.reminderNo || 1))} of 3 — this proposal is still waiting for a decision.</div>`
-      : "";
-  return buildEmailShell(
-    `${reminder}
-    ${eCard(`
-      <table cellpadding="0" cellspacing="0" width="100%">
-        ${eRow("Request", escapeHtml(caseCode(ar)))}
-        ${eRow("Requested by", escapeHtml(requesterName(ar)))}
-        ${eRow("Trip", escapeHtml(trip(ar)))}
-        ${p?.version ? eRow("Proposal", `v${escapeHtml(String(p.version))}`) : ""}
-      </table>
-    `)}
-    <div style="margin-top:14px;">${eLabel("Options")}${proposalOptionsHtml(p)}</div>
-    <div style="margin-top:20px;">${ctas}</div>
-    <div style="margin-top:16px;font-size:12px;color:#64748b;line-height:1.55;">
-      The request's approver and every Workspace Leader receive this. The first decision counts;
-      after that the links show who decided. Do not forward this email.
-    </div>`,
-    { title: "Proposal Approval Needed", subtitle: "Review the proposal and decide", badgeText: "AWAITING APPROVAL", badgeColor: "#f59e0b" },
-  );
+  const reminder = event === "proposal_reminder";
+  const buttons = approveUrl
+    ? buttonGroup({ label: "Approve proposal", href: approveUrl, glyph: "&#10003;" }, [
+        { label: "Request changes", href: decisionLinkUrl("proposal", pid, recipient, null, "request_changes"), style: "warn" },
+        { label: "Decline", href: decisionLinkUrl("proposal", pid, recipient, null, "decline"), style: "danger", glyph: "&#10005;" },
+      ])
+    : buttonGroup({ label: "Open Plumbox to decide", href: deciderProposalsUrl() });
+  const rows = proposalOptionRows(p);
+  return doc({
+    title: "Proposal approval needed",
+    preheader: `The ${TRAVEL_DESK_NAME} sent a proposal for ${requesterName(ar)}'s request — approve, request changes or decline.`,
+    hero: {
+      badge: reminder ? `Reminder ${ctx.reminderNo || 1} of 3` : "Proposal approval needed",
+      tone: "orange",
+      headline: reminder ? `${theirs(ar, t)} proposal is still waiting for your approval` : `${theirs(ar, t)} proposal needs your approval`,
+      instruction: `Review the option${rows.length === 1 ? "" : "s"} below, then approve, request changes or decline. The first decision counts.`,
+    },
+    blocks: body(ar, t, deciderProposalsUrl(), {
+      itineraryRows: rows.length ? rows : [{ service: "other", title: "No options", lines: [] }],
+      itineraryLabel: `Proposal${p?.version ? ` v${String(p.version)}` : ""} — options`,
+      after: [buttons, approveUrl ? expiryBox(linkExpiryText(ctx.now)) : ""],
+    }),
+  });
 }
 
 function proposalReadyHtml(ctx: EmailCtx) {
   const ar = ctx.ar;
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel("Proposal ready")}
-      ${para(`Hi <b style="color:#0f172a;">${escapeHtml(firstName(ar))}</b>,<br/><br/>
-        The ${TRAVEL_DESK_NAME} has prepared a proposal for your trip${tripLine(ar)}. It is with your approver now —
-        your approver or a Workspace Leader will decide. You can view it below.`)}
-    `)}
-    <div style="margin-top:16px;">${eBtn("View the proposal", proposalViewUrl(ctx.proposal?._id), "#00477f", "#ffffff")}</div>
-    ${footerReply}`,
-    { title: "Your proposal is ready", badgeText: "PROPOSAL READY", badgeColor: "#4f46e5" },
-  );
+  const t = tripModel(ar);
+  const href = proposalViewUrl(ctx.proposal?._id);
+  return doc({
+    title: "Your proposal is ready",
+    preheader: `The ${TRAVEL_DESK_NAME} has prepared a proposal for your request ${caseCode(ar)}.`,
+    hero: {
+      badge: "Proposal ready",
+      tone: "orange",
+      headline: `${yours(t)} has a proposal`,
+      instruction: `The ${TRAVEL_DESK_NAME} prepared it; your approver or a Workspace Leader will decide. We'll email you the outcome.`,
+    },
+    blocks: body(ar, t, href, { after: [viewButton(href)] }),
+  });
 }
 
-function proposalChangesRequestedHtml(ctx: EmailCtx) {
+function proposalOutcomeHtml(event: ApprovalEmailEvent, ctx: EmailCtx) {
   const ar = ctx.ar;
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel("Changes requested")}
-      ${para(`Hi <b style="color:#0f172a;">${escapeHtml(firstName(ar))}</b>,<br/><br/>
-        <b style="color:#0f172a;">${escapeHtml(str(ctx.actorName) || "Your approver")}</b> asked for changes to the proposal for your trip${tripLine(ar)}.
-        The ${TRAVEL_DESK_NAME} will revise it and send it for approval again.
-        ${noteBox(clean(ctx.reason))}`)}
-    `)}
-    <div style="margin-top:16px;">${eBtn("View My Requests", myRequestsUrl(), "#00477f", "#ffffff")}</div>
-    ${footerReply}`,
-    { title: "Changes requested on your proposal", badgeText: "CHANGES REQUESTED", badgeColor: "#f59e0b" },
-  );
+  const t = tripModel(ar);
+  const by = safe(ctx.actorName) || "Your approver";
+  const c =
+    event === "proposal_approved"
+      ? { title: "Proposal approved", badge: "Approved", tone: "green" as const, headline: `The proposal for your ${thing(t)} was approved`, instruction: `The ${TRAVEL_DESK_NAME} will now book it. Your tickets and vouchers will come by email.`, note: "" }
+      : event === "proposal_declined"
+      ? { title: "Proposal declined", badge: "Declined", tone: "red" as const, headline: `The proposal for your ${thing(t)} was declined`, instruction: `${by} declined it. The ${TRAVEL_DESK_NAME} will be in touch about next steps.`, note: "Reason" }
+      : { title: "Changes requested", badge: "Changes requested", tone: "blue" as const, headline: `Changes were requested on the proposal for your ${thing(t)}`, instruction: `${by} asked for changes. The ${TRAVEL_DESK_NAME} will revise it and send it for approval again.`, note: "What to change" };
+  return doc({
+    title: c.title,
+    preheader: `${c.title} — ${caseCode(ar)}`,
+    hero: { badge: c.badge, tone: c.tone, headline: c.headline, instruction: c.instruction },
+    blocks: body(ar, t, myRequestsUrl(), { notes: c.note ? [noteBox(c.note, safe(ctx.reason))] : [], after: [viewButton(myRequestsUrl())] }),
+  });
 }
 
 /* ───────────────────────── booking ───────────────────────── */
 
 function progressHtml(event: ApprovalEmailEvent, ctx: EmailCtx) {
   const ar = ctx.ar;
-  const reason = clean(ctx.reason);
+  const t = tripModel(ar);
   const c =
     event === "booking_started"
-      ? { title: "We're booking your trip", badge: "BOOKING IN PROGRESS", color: "#4f46e5", body: "Our team has started booking your trip. You will get your tickets and vouchers by email when it is done.", cta: ["View My Requests", myRequestsUrl()] }
+      ? { title: "Booking in progress", badge: "Booking started", tone: "blue" as const, headline: `We're booking your ${thing(t)}`, instruction: "You'll get your tickets and vouchers by email when it's done.", note: "Note" }
       : event === "booking_on_hold"
-      ? { title: "Booking on hold", badge: "ON HOLD", color: "#f59e0b", body: "Our team has paused the booking for now. We will be in touch, or continue as soon as we can.", cta: ["View My Requests", myRequestsUrl()] }
-      : { title: "Booking update — request cancelled", badge: "CANCELLED", color: "#dc2626", body: `Your travel request has been cancelled by the ${TRAVEL_DESK_NAME}.`, cta: ["Raise a new request", newRequestUrl()] };
-  return buildEmailShell(
-    `${eCard(`
-      ${eLabel(c.title)}
-      ${para(`Hi <b style="color:#0f172a;">${escapeHtml(firstName(ar))}</b>,<br/><br/>
-        ${escapeHtml(c.body)}${tripLine(ar)}
-        ${reason ? `<br/><br/><b style="color:#0f172a;">${event === "booking_cancelled" ? "Reason" : "Note"}:</b> ${reason}` : ""}`)}
-    `)}
-    <div style="margin-top:16px;">${eBtn(c.cta[0], c.cta[1], "#00477f", "#ffffff")}</div>
-    ${footerReply}`,
-    { title: c.title, badgeText: c.badge, badgeColor: c.color },
-  );
+      ? { title: "Booking on hold", badge: "On hold", tone: "blue" as const, headline: `${yours(t)} is on hold`, instruction: `The ${TRAVEL_DESK_NAME} paused the booking for now and will continue as soon as it can.`, note: "Why" }
+      : { title: "Request cancelled", badge: "Cancelled", tone: "red" as const, headline: `${yours(t)} was cancelled`, instruction: `The ${TRAVEL_DESK_NAME} cancelled this request.`, note: "Reason" };
+  return doc({
+    title: c.title,
+    preheader: `${c.title} — ${caseCode(ar)}`,
+    hero: { badge: c.badge, tone: c.tone, headline: c.headline, instruction: c.instruction },
+    blocks: body(ar, t, myRequestsUrl(), { notes: [noteBox(c.note, safe(ctx.reason))], after: [viewButton(myRequestsUrl())] }),
+  });
 }
 
 function bookingDoneHtml(ctx: EmailCtx) {
   const ar = ctx.ar;
-  return buildAdminProcessedEmailHtml({
-    customerName: str(ar?.customerName) || "Workspace",
-    ticketId: caseCode(ar),
-    requesterEmail: "",
-    requesterName: requesterName(ar),
-    // Customer email: staff show as the travel desk, never by name or email.
-    processedByEmail: "",
-    processedByName: TRAVEL_DESK_NAME,
-    comment: str(ctx.doneComment),
-    items: Array.isArray(ar?.cartItems) ? ar.cartItems : [],
-    attachments: (ctx.attachmentNames || []).map((filename) => ({ filename })),
+  const t = tripModel(ar);
+  const files = (ctx.attachmentNames || []).map(str).filter(Boolean);
+  const docs = files.length
+    ? card(`${sectionLabel("Attached to this email")}<div style="height:6px;line-height:6px;font-size:0;">&nbsp;</div>${factsGrid(
+        files.map((f, i) => ({ label: `Document ${i + 1}`, value: escapeHtml(f) })),
+      )}`)
+    : "";
+  return doc({
+    title: "Booking processed",
+    preheader: `Your booking ${caseCode(ar)} is done.${files.length ? " Your documents are attached." : ""}`,
+    hero: {
+      badge: "Booked",
+      tone: "green",
+      headline: `${yours(t)} is booked`,
+      instruction: files.length ? "Your tickets and vouchers are attached to this email." : `The ${TRAVEL_DESK_NAME} has completed your booking.`,
+    },
+    blocks: body(ar, t, myRequestsUrl(), {
+      notes: [noteBox(`Message from the ${TRAVEL_DESK_NAME}`, safe(sanitizeAdminCommentForEmail(ctx.doneComment)))],
+      after: [docs, viewButton(myRequestsUrl())],
+    }),
   });
 }
 
@@ -644,13 +711,9 @@ export function renderApprovalEmail(event: ApprovalEmailEvent, ctx: EmailCtx, re
       html = proposalReadyHtml(ctx);
       break;
     case "proposal_approved":
-      html = buildProposalApprovedEmailHtml({ requesterName: requesterName(ctx.ar), ticketId: caseCode(ctx.ar), loginUrl: myRequestsUrl() });
-      break;
     case "proposal_declined":
-      html = buildProposalDeclinedEmailHtml({ requesterName: requesterName(ctx.ar), ticketId: caseCode(ctx.ar), loginUrl: myRequestsUrl() });
-      break;
     case "proposal_changes_requested":
-      html = proposalChangesRequestedHtml(ctx);
+      html = proposalOutcomeHtml(event, ctx);
       break;
     case "ops_proposal_outcome":
       html = deskProposalOutcomeHtml(ctx);
