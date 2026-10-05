@@ -177,9 +177,20 @@ export interface CustomerWorkspaceDocument extends Document {
     minHoursForPresent: number;
   };
 
-  // SBT Official Booking (per-workspace TBO wallet)
+  // SBT Business Wallet — a CREDIT LINE per company (services/sbtWallet.ts):
+  // available = creditLimit − used. Bookings raise `used`; cancellation
+  // refunds, payments received and credit adjustments lower it. No monthly
+  // reset. Every move is an SBTWalletLedger row.
   sbtOfficialBooking?: {
     enabled: boolean;
+    creditLimit?: number;
+    used?: number;
+    /** The ≥80% usage email went out; cleared once usage drops below 80%. */
+    usageAlertSent?: boolean;
+    lastPaymentAt?: Date | null;
+    /** Set by scripts/migrate-wallet-credit-line.ts. */
+    creditLineMigratedAt?: Date | null;
+    /** LEGACY (monthly model) — read only by the migration. */
     monthlyLimit: number;
     currentMonthSpend: number;
     lastResetMonth: string;
@@ -389,6 +400,13 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
     // ── SBT Official Booking (per-workspace TBO wallet) ──
     sbtOfficialBooking: {
       enabled: { type: Boolean, default: false },
+      // Credit line (no default: a company has no credit until Plumtrips sets a limit).
+      creditLimit: { type: Number },
+      used: { type: Number },
+      usageAlertSent: { type: Boolean },
+      lastPaymentAt: { type: Date },
+      creditLineMigratedAt: { type: Date },
+      // LEGACY monthly model — kept for the migration; nothing else reads them.
       monthlyLimit: { type: Number, default: 100000 },
       currentMonthSpend: { type: Number, default: 0 },
       lastResetMonth: { type: String, default: '' },

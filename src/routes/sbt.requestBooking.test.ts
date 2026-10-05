@@ -173,7 +173,7 @@ beforeEach(async () => {
   ] as any[]);
   await col("customerworkspaces").insertOne({
     _id: WS, status: "ACTIVE", customerId: CUSTOMER,
-    sbtOfficialBooking: { enabled: true, monthlyLimit: 0, currentMonthSpend: 0, lastResetMonth: new Date().toISOString().slice(0, 7) },
+    sbtOfficialBooking: { enabled: true, creditLimit: 10000000, used: 0 },
   } as any);
   for (const m of [...Object.values(tbo), ...Object.values(rzp)]) (m as any).mockReset();
   hotelBookBodies = [];

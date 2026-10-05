@@ -575,9 +575,11 @@ router.put("/workspaces/:workspaceId/official-booking", async (req: any, res) =>
   try {
     const { enabled, monthlyLimit } = req.body as { enabled?: boolean; monthlyLimit?: number };
 
+    // Only the switch here: the credit limit changes on the Business Wallets
+    // page (ledger entry + reason). A limit sent from here is ignored.
+    void monthlyLimit;
     const update: Record<string, any> = {};
     if (typeof enabled === "boolean") update["sbtOfficialBooking.enabled"] = enabled;
-    if (typeof monthlyLimit === "number" && monthlyLimit >= 0) update["sbtOfficialBooking.monthlyLimit"] = monthlyLimit;
 
     const workspace = await CustomerWorkspace.findByIdAndUpdate(
       req.params.workspaceId,
@@ -603,29 +605,14 @@ router.put("/workspaces/:workspaceId/official-booking", async (req: any, res) =>
 
 /* ── POST /workspaces/:workspaceId/reset-spend ───────────────────── */
 
-router.post("/workspaces/:workspaceId/reset-spend", async (req: any, res) => {
-  try {
-    const monthKey = new Date().toISOString().slice(0, 7);
-    const workspace = await CustomerWorkspace.findOneAndUpdate(
-      { _id: req.params.workspaceId },
-      { $set: {
-        'sbtOfficialBooking.currentMonthSpend': 0,
-        'sbtOfficialBooking.lastResetMonth': monthKey,
-      }},
-      { new: true, runValidators: false },
-    );
-    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
-
-    logger.info("SUPERADMIN reset monthly spend", {
-      workspaceId: req.params.workspaceId,
-      resetBy: req.user?._id,
-    });
-
-    res.json({ success: true, message: "Monthly spend reset to 0" });
-  } catch (err: any) {
-    logger.error("POST /workspaces/:workspaceId/reset-spend failed");
-    res.status(500).json({ error: err.message });
-  }
+// Retired: the Business Wallet is a credit line with no monthly spend to reset.
+// Balances move only through ledger entries (Business Wallets page: payment
+// received, adjustment with a reason).
+router.post("/workspaces/:workspaceId/reset-spend", (_req: any, res) => {
+  res.status(410).json({
+    error: "The Business Wallet no longer resets monthly. Record a payment or an adjustment on the Business Wallets page.",
+    code: "RESET_RETIRED",
+  });
 });
 
 /* ── POST /workspaces/:workspaceId/impersonate ───────────────────── */

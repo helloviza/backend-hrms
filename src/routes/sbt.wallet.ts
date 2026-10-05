@@ -3,9 +3,20 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
+import { WALLET_ENTRY_TYPES, type WalletEntryType } from "../models/SBTWalletLedger.js";
 import { getAgencyBalance } from "../services/tbo.auth.service.js";
 import { sbtBookerGuards } from "../services/sbtPaymentGate.js";
+import { walletState, statement, statementCsv, statementXlsx } from "../services/sbtWallet.js";
+import { dateRangeOr400 } from "../utils/dateRange.js";
 
+// The company's SBT Business Wallet — a credit line (services/sbtWallet.ts).
+//   GET /check?amount=     can this booking be paid from the wallet?
+//   GET /summary           credit limit · used · available
+//   GET /statement         the ledger as a statement (?from&to, ?types, ?q,
+//                          ?format=csv|xlsx). Workspace Leaders (and Plumtrips
+//                          admins) see the whole company; everyone else only
+//                          their own bookings' entries. Selling amounts only —
+//                          never our net, margin or commission.
 const router = express.Router();
 
 router.use(requireAuth, requireWorkspace);
@@ -17,7 +28,7 @@ async function requireSBT(req: any, res: any, next: any) {
         roles.includes("WORKSPACELEADER") || req.user?.customerMemberRole === "WORKSPACE_LEADER") {
       return next();
     }
-    const userId = req.user?.id || req.user?._id;
+    const userId = req.user?.id || req.user?._id || req.user?.sub;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
     const user = await User.findById(userId).select("sbtEnabled").lean();
     if (!user || !(user as any).sbtEnabled) {
@@ -29,129 +40,124 @@ async function requireSBT(req: any, res: any, next: any) {
   }
 }
 
+/** Sees the whole company's statement: a Workspace Leader, or a Plumtrips admin on their own workspace. */
+function seesWholeCompany(req: any): boolean {
+  const roles = (req.user?.roles || []).map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""));
+  return roles.includes("WORKSPACELEADER") || req.user?.customerMemberRole === "WORKSPACE_LEADER" ||
+    roles.includes("SUPERADMIN") || roles.includes("ADMIN") || roles.includes("HRADMIN");
+}
+
 // GET /api/sbt/wallet/check?amount=XXXX
-// Read-only sufficiency check; the reservation itself happens at book/ticket
-// time (services/sbtPaymentGate.ts reserveOfficial).
+// Read-only availability check; the reservation itself happens at checkout
+// (services/sbtPaymentGate.ts reserveOfficial, conditional on available).
 router.get("/check", requireSBT, ...sbtBookerGuards, async (req: any, res: any) => {
   try {
-    console.log("[wallet-check-debug]", {
-      userKeys: Object.keys((req as any).user || {}),
-      isDemoUser: (req as any).user?.isDemoUser,
-      userId: (req as any).user?.sub || (req as any).user?._id,
-      hasJwt: !!(req as any).user,
-    });
-    if ((req as any).user?.isDemoUser === true) {
-      // Demo path — compute sufficiency from the workspace's own sbtOfficialBooking
-      // config. Never calls TBO. Mirrors the real route's response shape exactly,
-      // except it skips the GetAgencyBalance (step 3) TBO egress.
-      const demoAmount = parseFloat(req.query.amount as string);
-      if (!demoAmount || demoAmount <= 0) {
-        return res.status(400).json({ error: "Invalid amount" });
-      }
-
-      const demoRoles = (req.user?.roles || []).map((r: string) => String(r).toUpperCase());
-      const demoIsAdminUser = demoRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR_ADMIN"].includes(r));
-
-      const demoWorkspace = await CustomerWorkspace.findById(req.workspaceObjectId).lean();
-      const demoOfficialBooking = (demoWorkspace as any)?.sbtOfficialBooking ?? {};
-
-      if (!demoIsAdminUser && !demoOfficialBooking?.enabled) {
-        return res.json({ sufficient: false, reason: "wallet_disabled" });
-      }
-
-      const demoMonthKey = new Date().toISOString().slice(0, 7); // "2026-03"
-      let demoCurrentMonthSpend = demoOfficialBooking.currentMonthSpend ?? 0;
-
-      if (demoOfficialBooking.lastResetMonth !== demoMonthKey) {
-        await CustomerWorkspace.findOneAndUpdate(
-          { _id: req.workspaceObjectId },
-          { $set: {
-            'sbtOfficialBooking.currentMonthSpend': 0,
-            'sbtOfficialBooking.lastResetMonth': demoMonthKey,
-          }},
-          { runValidators: false },
-        );
-        demoCurrentMonthSpend = 0;
-      }
-
-      const demoMonthlyLimit: number = demoOfficialBooking.monthlyLimit ?? 0;
-
-      if (demoMonthlyLimit > 0 && demoCurrentMonthSpend + demoAmount > demoMonthlyLimit) {
-        return res.json({
-          sufficient: false,
-          reason: "limit_exceeded",
-          bookingAmount: demoAmount,
-          currentSpend: demoCurrentMonthSpend,
-          limit: demoMonthlyLimit,
-          remaining: demoMonthlyLimit - demoCurrentMonthSpend,
-        });
-      }
-
-      // Demo path skips step 3 (TBO GetAgencyBalance). Treat as sufficient.
-      return res.json({ sufficient: true, bookingAmount: demoAmount, isDemo: true });
-    }
-
     const amount = parseFloat(req.query.amount as string);
     if (!amount || amount <= 0) {
       return res.status(400).json({ error: "Invalid amount" });
     }
 
-    // 1. Check per-workspace official booking config
     const roles = (req.user?.roles || []).map((r: string) => String(r).toUpperCase());
     const isAdminUser = roles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR_ADMIN"].includes(r));
+    const workspace = await CustomerWorkspace.findById(req.workspaceObjectId).select("sbtOfficialBooking").lean();
+    const s = walletState(workspace as any);
 
-    const workspace = await CustomerWorkspace.findById(req.workspaceObjectId).lean();
-    const officialBooking = (workspace as any)?.sbtOfficialBooking ?? {};
-
-    if (!isAdminUser && !officialBooking?.enabled) {
+    if (!isAdminUser && !s.enabled) {
       return res.json({ sufficient: false, reason: "wallet_disabled" });
     }
 
-    // 2. Monthly limit check — auto-reset on new month
-    const monthKey = new Date().toISOString().slice(0, 7); // "2026-03"
-    let currentMonthSpend = officialBooking.currentMonthSpend ?? 0;
-
-    if (officialBooking.lastResetMonth !== monthKey) {
-      await CustomerWorkspace.findOneAndUpdate(
-        { _id: req.workspaceObjectId },
-        { $set: {
-          'sbtOfficialBooking.currentMonthSpend': 0,
-          'sbtOfficialBooking.lastResetMonth': monthKey,
-        }},
-        { runValidators: false },
-      );
-      currentMonthSpend = 0;
-    }
-
-    const monthlyLimit: number = officialBooking.monthlyLimit ?? 0;
-
-    if (monthlyLimit > 0 && currentMonthSpend + amount > monthlyLimit) {
+    if (amount > s.available) {
       return res.json({
         sufficient: false,
         reason: "limit_exceeded",
         bookingAmount: amount,
-        currentSpend: currentMonthSpend,
-        limit: monthlyLimit,
-        remaining: monthlyLimit - currentMonthSpend,
+        creditLimit: s.creditLimit,
+        used: s.used,
+        available: Math.max(0, s.available),
+        // Old names, same numbers.
+        currentSpend: s.used,
+        limit: s.creditLimit,
+        remaining: Math.max(0, s.available),
       });
     }
 
-    // 3. TBO agency balance check
+    // Demo users never reach TBO.
+    if (req.user?.isDemoUser === true) return res.json({ sufficient: true, bookingAmount: amount, isDemo: true });
+
+    // TBO agency balance — Plumtrips' own deposit with the supplier.
     const balanceRes = (await getAgencyBalance()) as any;
     const cashBalance: number = balanceRes?.CashBalance ?? 0;
-
     if (cashBalance < amount) {
-      return res.json({
-        sufficient: false,
-        reason: "low_balance",
-        bookingAmount: amount,
-      });
+      return res.json({ sufficient: false, reason: "low_balance", bookingAmount: amount });
     }
 
     return res.json({ sufficient: true, bookingAmount: amount });
   } catch (err: any) {
     console.error("[SBT Wallet Check]", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sbt/wallet/summary
+router.get("/summary", requireSBT, async (req: any, res: any) => {
+  try {
+    const ws = (await CustomerWorkspace.findById(req.workspaceObjectId).select("sbtOfficialBooking companyName").lean()) as any;
+    const s = walletState(ws);
+    res.json({
+      ok: true,
+      companyName: ws?.companyName || "",
+      enabled: s.enabled,
+      creditLimit: s.creditLimit,
+      used: s.used,
+      available: s.available,
+      usagePct: s.usagePct,
+      lastPaymentAt: s.lastPaymentAt,
+      wholeCompany: seesWholeCompany(req),
+    });
+  } catch (err: any) {
+    console.error("[SBT Wallet Summary]", err.message);
+    res.status(500).json({ error: "Could not load the wallet" });
+  }
+});
+
+export function parseTypes(v: unknown): WalletEntryType[] {
+  return String(v || "")
+    .split(",")
+    .map((t) => t.trim().toUpperCase())
+    .filter((t): t is WalletEntryType => (WALLET_ENTRY_TYPES as string[]).includes(t));
+}
+
+// GET /api/sbt/wallet/statement
+router.get("/statement", requireSBT, async (req: any, res: any) => {
+  try {
+    const range = dateRangeOr400(req, res);
+    if (range === false) return;
+    const whole = seesWholeCompany(req);
+    const rows = await statement(req.workspaceObjectId, {
+      from: range?.from,
+      to: range?.to,
+      types: parseTypes(req.query.types),
+      q: String(req.query.q || ""),
+      ownerUserId: whole ? null : String(req.user?.sub || req.user?._id || req.user?.id || "") || "none",
+      staff: false,
+    });
+    const format = String(req.query.format || "");
+    if (format === "csv" || format === "xlsx") {
+      const ws = (await CustomerWorkspace.findById(req.workspaceObjectId).select("companyName").lean()) as any;
+      const base = `business-wallet-${new Date().toISOString().slice(0, 10)}`;
+      if (format === "csv") {
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="${base}.csv"`);
+        return res.send(statementCsv(rows));
+      }
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="${base}.xlsx"`);
+      return res.send(await statementXlsx(rows, `Business Wallet statement — ${ws?.companyName || ""}`));
+    }
+    res.json({ ok: true, wholeCompany: whole, rows });
+  } catch (err: any) {
+    console.error("[SBT Wallet Statement]", err.message);
+    res.status(500).json({ error: "Could not load the statement" });
   }
 });
 

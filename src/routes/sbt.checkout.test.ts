@@ -110,7 +110,7 @@ const waitFor = async (fn: () => Promise<boolean>, ms = 4000) => {
 };
 let seq = 0;
 const row = async (id: string) => (await col("sbtpayments").findOne({ _id: new mongoose.Types.ObjectId(id) })) as any;
-const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.currentMonthSpend;
+const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.used;
 
 beforeAll(async () => {
   mongod = await MongoMemoryServer.create();
@@ -131,7 +131,7 @@ beforeEach(async () => {
   ] as any[]);
   await col("customerworkspaces").insertOne({
     _id: WS, status: "ACTIVE", customerId: oid(),
-    sbtOfficialBooking: { enabled: true, monthlyLimit: 30000, currentMonthSpend: 0, lastResetMonth: new Date().toISOString().slice(0, 7) },
+    sbtOfficialBooking: { enabled: true, creditLimit: 30000, used: 0 },
   } as any);
   // Reset, not clear: a queued mockResolvedValueOnce left unused by one test
   // (e.g. /pay short-circuits for a known payment) must not leak into the next.
@@ -344,7 +344,7 @@ describe("business wallet — atomic, ledgered, credited back", () => {
   });
 
   it("over the limit is refused before TBO; two concurrent checkouts cannot both pass", async () => {
-    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.currentMonthSpend": 10000 } });
+    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.used": 10000 } });
     const q = await quote();
     const [a, b] = await Promise.all([lccCheckout(q, "official"), lccCheckout(q, "official")]);
     expect([a.status, b.status].sort()).toEqual([200, 402]);
@@ -354,7 +354,7 @@ describe("business wallet — atomic, ledgered, credited back", () => {
 
   it("cancellation credit is ledgered and applied once", async () => {
     const { creditOfficial } = await import("../services/sbtPaymentGate.js");
-    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.currentMonthSpend": 5000 } });
+    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.used": 5000 } });
     const month = new Date().toISOString().slice(0, 7);
     expect(await creditOfficial(WS, 3000, month, { key: "cancel:X", reason: "CANCELLATION" })).toBe(true);
     expect(await creditOfficial(WS, 3000, month, { key: "cancel:X", reason: "CANCELLATION" })).toBe(false);
@@ -500,7 +500,7 @@ describe("reissue — priced by the server end to end (Travel Desk)", () => {
   it("wallet reissue reserves the difference and credits it back when TBO fails", async () => {
     await col("customerworkspaces").insertOne({
       _id: new mongoose.Types.ObjectId(HOUSE), status: "ACTIVE", customerId: oid(),
-      sbtOfficialBooking: { enabled: true, monthlyLimit: 0, currentMonthSpend: 0, lastResetMonth: new Date().toISOString().slice(0, 7) },
+      sbtOfficialBooking: { enabled: true, creditLimit: 10000000, used: 0 },
     } as any);
     await quote("RI-NEW", BOOKER, HOUSE);
     tbo.ticketReissue.mockResolvedValueOnce({ Response: { ResponseStatus: 2, Error: { ErrorMessage: "no" } } });

@@ -959,10 +959,13 @@ import adminSBTRouter from "./routes/admin.sbt.js";
 import adminBillingRouter from "./routes/admin.billing.js";
 // Unified Billing (TravelBooking — all services)
 import unifiedBillingRoutes from "./routes/admin.unified.billing.js";
+// SBT Business Wallets — every company's credit line (SUPERADMIN only)
+import adminBusinessWalletsRouter from "./routes/admin.businessWallets.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Travel admin (SBT config, billing console, unified billing)
   app.use("/api/admin/sbt", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), adminSBTRouter);
+  app.use("/api/admin/business-wallets", adminBusinessWalletsRouter);
   app.use("/api/admin/billing", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), adminBillingRouter);
   // NO requireFeature — same reasoning as /api/my-bookings. These are READ-ONLY
   // travel-spend aggregations over the cost-free TravelBooking mirror, and the

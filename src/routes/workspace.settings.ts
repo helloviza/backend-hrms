@@ -153,9 +153,15 @@ r.put(
         });
       }
 
+      // The credit limit is Plumtrips' to set (Super Admin, Business Wallets
+      // page, logged with a reason) — a limit sent from here is ignored.
+      void monthlyLimit;
       const update: Record<string, any> = {};
       if (typeof enabled === "boolean") update["sbtOfficialBooking.enabled"] = enabled;
-      if (typeof monthlyLimit === "number" && monthlyLimit >= 0) update["sbtOfficialBooking.monthlyLimit"] = monthlyLimit;
+      if (!Object.keys(update).length) {
+        const cur = await CustomerWorkspace.findById(workspaceId).select("sbtOfficialBooking").lean();
+        return res.json({ success: true, sbtOfficialBooking: (cur as any)?.sbtOfficialBooking });
+      }
 
       const ws = await CustomerWorkspace.findByIdAndUpdate(
         workspaceId,

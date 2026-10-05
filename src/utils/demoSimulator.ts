@@ -91,49 +91,38 @@ async function simulateWalletDeduct(
 
   if (!ob?.enabled) return { ok: false, reason: "wallet_disabled" };
 
-  const monthKey = new Date().toISOString().slice(0, 7);
-  let currentMonthSpend: number = ob.currentMonthSpend ?? 0;
-  if (ob.lastResetMonth !== monthKey) {
-    await CustomerWorkspace.findOneAndUpdate(
-      { _id: workspaceId },
-      {
-        $set: {
-          "sbtOfficialBooking.currentMonthSpend": 0,
-          "sbtOfficialBooking.lastResetMonth": monthKey,
-        },
+  // Same credit line as real companies (services/sbtWallet.ts): used + amount ≤ creditLimit.
+  const used: number = Number(ob.used) || 0;
+  const creditLimit: number = Number(ob.creditLimit) || 0;
+  const after = await CustomerWorkspace.findOneAndUpdate(
+    {
+      _id: workspaceId,
+      $expr: {
+        $lte: [
+          { $add: [{ $ifNull: ["$sbtOfficialBooking.used", 0] }, amount] },
+          { $ifNull: ["$sbtOfficialBooking.creditLimit", 0] },
+        ],
       },
-      { runValidators: false },
-    );
-    currentMonthSpend = 0;
+    },
+    { $inc: { "sbtOfficialBooking.used": amount } },
+    { new: true, runValidators: false },
+  ).lean();
+  if (!after) {
+    return { ok: false, reason: "limit_exceeded", remaining: Math.max(0, creditLimit - used) };
   }
 
-  const monthlyLimit: number = ob.monthlyLimit ?? 0;
-  if (monthlyLimit > 0 && currentMonthSpend + amount > monthlyLimit) {
-    return {
-      ok: false,
-      reason: "limit_exceeded",
-      remaining: Math.max(0, monthlyLimit - currentMonthSpend),
-    };
-  }
-
-  await CustomerWorkspace.findOneAndUpdate(
-    { _id: workspaceId },
-    { $inc: { "sbtOfficialBooking.currentMonthSpend": amount } },
-    { runValidators: false },
-  );
-
-  return { ok: true, spendAfter: currentMonthSpend + amount, monthlyLimit };
+  return { ok: true, spendAfter: Number((after as any)?.sbtOfficialBooking?.used) || used + amount, monthlyLimit: creditLimit };
 }
 
 async function refundDemoWallet(workspaceId: any, amount: number): Promise<void> {
   if (!workspaceId || amount <= 0) return;
   const ws: any = await CustomerWorkspace.findById(workspaceId).select("sbtOfficialBooking").lean();
-  const current: number = ws?.sbtOfficialBooking?.currentMonthSpend ?? 0;
+  const current: number = ws?.sbtOfficialBooking?.used ?? 0;
   const cappedRefund = Math.min(amount, current); // never below zero
   if (cappedRefund <= 0) return;
   await CustomerWorkspace.findOneAndUpdate(
     { _id: workspaceId },
-    { $inc: { "sbtOfficialBooking.currentMonthSpend": -cappedRefund } },
+    { $inc: { "sbtOfficialBooking.used": -cappedRefund } },
     { runValidators: false },
   );
 }

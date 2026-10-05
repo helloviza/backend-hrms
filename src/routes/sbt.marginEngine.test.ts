@@ -233,7 +233,7 @@ beforeEach(async () => {
   const month = new Date().toISOString().slice(0, 7);
   await col("customerworkspaces").insertMany([WS, WS2].map((_id, i) => ({
     _id, status: "ACTIVE", customerId: `C${i}`, companyName: i ? "Beta" : "Acme",
-    sbtOfficialBooking: { enabled: true, monthlyLimit: 0, currentMonthSpend: 0, lastResetMonth: month },
+    sbtOfficialBooking: { enabled: true, creditLimit: 10000000, used: 0 },
   })) as any[]);
   for (const m of [...Object.values(tbo), ...Object.values(rzp)]) (m as any).mockReset();
   hotelBookBodies = [];

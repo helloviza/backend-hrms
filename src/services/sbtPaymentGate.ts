@@ -22,6 +22,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
 import SBTMultiCityTrace from "../models/SBTMultiCityTrace.js";
 import SBTWalletLedger from "../models/SBTWalletLedger.js";
+import { checkUsageAlert, walletState } from "./sbtWallet.js";
 import mongoose from "mongoose";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
@@ -414,11 +415,11 @@ export interface LedgerRef {
   product?: "FLIGHT" | "HOTEL";
 }
 
-/** Reserve `amount` (the SELLING total, flights and hotels alike) against the
- *  workspace's monthly official-booking limit in ONE conditional update
- *  (spend + amount ≤ limit; limit 0 = unlimited, as in routes/sbt.wallet.ts).
- *  Concurrent reservations cannot both pass. Recorded as a DEBIT in
- *  SBTWalletLedger. */
+/** Reserve `amount` (the SELLING total, flights and hotels alike) on the
+ *  company's credit line in ONE conditional update: used + amount ≤ creditLimit
+ *  (services/sbtWallet.ts). Concurrent reservations cannot both pass, and a
+ *  company with no limit set has nothing available. Recorded as a BOOKING
+ *  (DEBIT) in SBTWalletLedger with the balance after it. */
 export async function reserveOfficial(
   req: Request | AnyObj,
   amount: number,
@@ -427,60 +428,58 @@ export async function reserveOfficial(
   const wsId = (req as AnyObj).workspaceObjectId;
   if (!wsId) return refuse(400, "WORKSPACE_REQUIRED", "Workspace required");
   const monthKey = monthKeyNow();
-  // Lazy month reset — conditional, so a racing reset can't wipe a fresh reservation.
-  await CustomerWorkspace.updateOne(
-    { _id: wsId, "sbtOfficialBooking.lastResetMonth": { $ne: monthKey } },
-    { $set: { "sbtOfficialBooking.currentMonthSpend": 0, "sbtOfficialBooking.lastResetMonth": monthKey } },
-    { runValidators: false },
-  );
+  const amt = Math.round(Number(amount) * 100) / 100;
+  if (!(amt > 0)) return refuse(400, "INVALID_AMOUNT", "Invalid amount");
   const admin = isWalletAdmin(req as AnyObj);
-  const r = await CustomerWorkspace.updateOne(
+  const after = (await CustomerWorkspace.findOneAndUpdate(
     {
       _id: wsId,
       ...(admin ? {} : { "sbtOfficialBooking.enabled": true }),
       $expr: {
-        $let: {
-          vars: {
-            lim: { $ifNull: ["$sbtOfficialBooking.monthlyLimit", 0] },
-            spend: { $ifNull: ["$sbtOfficialBooking.currentMonthSpend", 0] },
-          },
-          in: { $or: [{ $lte: ["$$lim", 0] }, { $lte: [{ $add: ["$$spend", amount] }, "$$lim"] }] },
-        },
+        $lte: [
+          { $add: [{ $ifNull: ["$sbtOfficialBooking.used", 0] }, amt] },
+          { $ifNull: ["$sbtOfficialBooking.creditLimit", 0] },
+        ],
       },
     },
-    { $inc: { "sbtOfficialBooking.currentMonthSpend": amount } },
-    { runValidators: false },
-  );
-  if (r.modifiedCount === 1) {
+    { $inc: { "sbtOfficialBooking.used": amt } },
+    { new: true, runValidators: false },
+  ).select("sbtOfficialBooking.used").lean()) as AnyObj | null;
+  if (after) {
     if (ledger) {
-      const after = (await CustomerWorkspace.findById(wsId).select("sbtOfficialBooking.currentMonthSpend").lean()) as AnyObj | null;
       try {
         await SBTWalletLedger.create({
-          workspaceId: String(wsId), type: "DEBIT", amount, monthKey,
-          spendAfter: Number(after?.sbtOfficialBooking?.currentMonthSpend) || undefined,
+          workspaceId: String(wsId), type: "DEBIT", entryType: "BOOKING", amount: amt, monthKey,
+          usedAfter: Math.round(Number(after?.sbtOfficialBooking?.used) * 100) / 100,
           reason: ledger.reason, paymentId: ledger.paymentId, bookingDocId: ledger.bookingDocId,
           product: ledger.product, actorUserId: callerScope(req).userId, idempotencyKey: ledger.key,
         });
       } catch (err: any) {
-        // The limit was reserved; a missing ledger row is an audit gap, never a reason to un-reserve.
+        // The credit was reserved; a missing ledger row is an audit gap, never a reason to un-reserve.
         sbtLogger.error("[sbt-pay] wallet DEBIT reserved but ledger write failed", { key: ledger.key, err: err?.message });
       }
     }
+    void checkUsageAlert(wsId);
     return { ok: true, monthKey };
   }
   const ws = (await CustomerWorkspace.findById(wsId).select("sbtOfficialBooking").lean()) as AnyObj | null;
   if (!admin && !ws?.sbtOfficialBooking?.enabled) {
     return refuse(403, "WALLET_DISABLED", "Business wallet is not enabled for this workspace");
   }
-  return refuse(402, "LIMIT_EXCEEDED", "This booking would exceed your company's monthly travel limit");
+  const available = Math.max(0, walletState(ws).available);
+  return refuse(
+    402,
+    "LIMIT_EXCEEDED",
+    `This booking (₹${amt.toLocaleString("en-IN")}) is more than your company's available travel credit (₹${available.toLocaleString("en-IN")})`,
+  );
 }
 
 /**
- * Give `amount` back to the workspace's monthly spend, exactly once per
- * `ledger.key`: the CREDIT ledger row is written FIRST (unique key), so a
- * retried release or a replayed cancellation credits nothing the second time.
- * A credit for an earlier month is recorded but moves no counter — that month's
- * spend was already reset. Returns false when the key was already used.
+ * Give `amount` back to the company's credit line (lowers `used`), exactly once
+ * per `ledger.key`: the CREDIT ledger row (CANCELLATION_REFUND) is written
+ * FIRST (unique key), so a retried release or a replayed cancellation credits
+ * nothing the second time. Returns false when the key was already used.
+ * `monthKey` is the reserving row's month — kept on the row for reference.
  */
 export async function creditOfficial(
   workspaceId: unknown,
@@ -489,24 +488,31 @@ export async function creditOfficial(
   ledger: LedgerRef & { actorUserId?: string },
 ): Promise<boolean> {
   if (!workspaceId || !(amount > 0)) return false;
-  const month = monthKey || monthKeyNow();
+  const amt = Math.round(Number(amount) * 100) / 100;
+  let entry: AnyObj;
   try {
-    await SBTWalletLedger.create({
-      workspaceId: String(workspaceId), type: "CREDIT", amount, monthKey: month,
+    entry = (await SBTWalletLedger.create({
+      workspaceId: String(workspaceId), type: "CREDIT", entryType: "CANCELLATION_REFUND", amount: amt,
+      monthKey: monthKey || monthKeyNow(),
       reason: ledger.reason, paymentId: ledger.paymentId, bookingDocId: ledger.bookingDocId,
       product: ledger.product, actorUserId: ledger.actorUserId, idempotencyKey: ledger.key,
-    });
+    })).toObject();
   } catch (err: any) {
     if (err?.code === 11000) return false; // already credited
     throw err;
   }
-  if (month !== monthKeyNow()) return true;
-  await CustomerWorkspace.updateOne(
+  const ws = (await CustomerWorkspace.findOneAndUpdate(
     { _id: workspaceId },
-    [{ $set: { "sbtOfficialBooking.currentMonthSpend": {
-      $max: [0, { $subtract: [{ $ifNull: ["$sbtOfficialBooking.currentMonthSpend", 0] }, amount] }],
-    } } }],
-  );
+    { $inc: { "sbtOfficialBooking.used": -amt } },
+    { new: true, runValidators: false },
+  ).select("sbtOfficialBooking.used").lean()) as AnyObj | null;
+  if (ws) {
+    await SBTWalletLedger.collection.updateOne(
+      { _id: entry._id },
+      { $set: { usedAfter: Math.round(Number(ws.sbtOfficialBooking?.used) * 100) / 100 } },
+    );
+  }
+  void checkUsageAlert(workspaceId);
   return true;
 }
 

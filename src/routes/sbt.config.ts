@@ -3,6 +3,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
+import { walletState } from "../services/sbtWallet.js";
 
 const router = express.Router();
 
@@ -27,7 +28,9 @@ async function requireSBT(req: any, res: any, next: any) {
   }
 }
 
-// GET /api/sbt/config/wallet — per-workspace official booking config
+// GET /api/sbt/config/wallet — the company's Business Wallet (a credit line:
+// services/sbtWallet.ts). monthlyLimit / currentMonthSpend / remaining are the
+// same numbers under their old names, for screens not yet updated.
 router.get("/wallet", requireSBT, async (req: any, res: any) => {
   try {
     const roles = (req.user?.roles || []).map((r: string) => String(r).toUpperCase());
@@ -36,32 +39,16 @@ router.get("/wallet", requireSBT, async (req: any, res: any) => {
     const workspace = await CustomerWorkspace.findById(req.workspaceObjectId)
       .select("sbtOfficialBooking")
       .lean();
-
-    const ob = (workspace as any)?.sbtOfficialBooking;
-    const monthKey = new Date().toISOString().slice(0, 7); // "2026-03"
-
-    let currentMonthSpend = ob?.currentMonthSpend ?? 0;
-
-    // Lazy reset if new month
-    if (ob?.lastResetMonth && ob.lastResetMonth !== monthKey) {
-      await CustomerWorkspace.findOneAndUpdate(
-        { _id: req.workspaceObjectId },
-        { $set: {
-          'sbtOfficialBooking.currentMonthSpend': 0,
-          'sbtOfficialBooking.lastResetMonth': monthKey,
-        }},
-        { runValidators: false },
-      );
-      currentMonthSpend = 0;
-    }
-
-    const monthlyLimit = ob?.monthlyLimit ?? 100000;
+    const s = walletState(workspace as any);
 
     return res.json({
-      tboWalletEnabled: isAdminUser || (ob?.enabled ?? false),
-      monthlyLimit,
-      currentMonthSpend,
-      remaining: Math.max(0, monthlyLimit - currentMonthSpend),
+      tboWalletEnabled: isAdminUser || s.enabled,
+      creditLimit: s.creditLimit,
+      used: s.used,
+      available: s.available,
+      monthlyLimit: s.creditLimit,
+      currentMonthSpend: s.used,
+      remaining: Math.max(0, s.available),
     });
   } catch (err: any) {
     console.error("[SBT Config Wallet]", err.message);

@@ -136,7 +136,7 @@ beforeEach(async () => {
   })) as any[]);
   await col("customerworkspaces").insertOne({
     _id: WS, status: "ACTIVE", customerId: oid(),
-    sbtOfficialBooking: { enabled: true, monthlyLimit: 30000, currentMonthSpend: 0, lastResetMonth: new Date().toISOString().slice(0, 7) },
+    sbtOfficialBooking: { enabled: true, creditLimit: 30000, used: 0 },
   } as any);
   await col("sbtbookings").insertOne({
     _id: BOOKING, userId: CUSTOMER, workspaceId: WS, pnr: "OLD", bookingId: "777", status: "CONFIRMED",

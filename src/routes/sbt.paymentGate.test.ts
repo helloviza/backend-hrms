@@ -159,7 +159,7 @@ beforeEach(async () => {
   ] as any[]);
   await col("customerworkspaces").insertOne({
     _id: WS, status: "ACTIVE",
-    sbtOfficialBooking: { enabled: true, monthlyLimit: 20000, currentMonthSpend: 0, lastResetMonth: new Date().toISOString().slice(0, 7) },
+    sbtOfficialBooking: { enabled: true, creditLimit: 20000, used: 0 },
   } as any);
 
   vi.clearAllMocks();
@@ -381,7 +381,7 @@ describe("who may book", () => {
 });
 
 describe("business wallet (official booking)", () => {
-  const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.currentMonthSpend;
+  const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.used;
 
   it("reserves the server amount before TBO and credits it back when TBO fails", async () => {
     const q = await quoteFlight();
@@ -394,7 +394,7 @@ describe("business wallet (official booking)", () => {
   });
 
   it("refuses when the booking would exceed the monthly limit — TBO never called", async () => {
-    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.currentMonthSpend": 9000 } });
+    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.used": 9000 } });
     const q = await quoteFlight();
     const t = await ticket(BOOKER, { paymentMode: "official", quoteIds: [q] });
     expect(t.status).toBe(402);
@@ -568,8 +568,8 @@ describe("reissue: a fare difference goes to the Travel Desk", () => {
 });
 
 describe("booking save + cancel: the business wallet moves only by the ledger", () => {
-  const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.currentMonthSpend;
-  const setSpend = (n: number) => col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.currentMonthSpend": n } });
+  const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.used;
+  const setSpend = (n: number) => col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.used": n } });
   const credits = () => col("sbtwalletledgers").find({ type: "CREDIT" }).toArray();
   const FLIGHT = {
     origin: { city: "Delhi", code: "DEL" }, destination: { city: "Mumbai", code: "BOM" },
@@ -648,7 +648,7 @@ describe("booking save + cancel: the business wallet moves only by the ledger", 
 
 describe("creditCancelledBooking (hotel cancel + multi-leg rows)", () => {
   const month = new Date().toISOString().slice(0, 7);
-  const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.currentMonthSpend;
+  const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.used;
   const officialRow = async (amount: number, extra: Record<string, unknown>) => {
     const _id = oid();
     await col("sbtpayments").insertOne({
@@ -664,7 +664,7 @@ describe("creditCancelledBooking (hotel cancel + multi-leg rows)", () => {
 
   it("a vouchered hold gives back the row's reserved amount; an unpaid hold gives back nothing", async () => {
     const { creditCancelledBooking } = await import("../services/sbtPaymentGate.js");
-    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.currentMonthSpend": 10000 } });
+    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.used": 10000 } });
     const held = oid();
     await officialRow(8450, { heldBookingId: String(held) });
     expect((await creditCancelledBooking("HOTEL", { _id: held, workspaceId: WS, totalFare: 99999 })).credited).toBe(8450);
@@ -675,7 +675,7 @@ describe("creditCancelledBooking (hotel cancel + multi-leg rows)", () => {
 
   it("legs sharing one row give back at most what the row reserved", async () => {
     const { creditCancelledBooking } = await import("../services/sbtPaymentGate.js");
-    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.currentMonthSpend": 10000 } });
+    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.used": 10000 } });
     const a = oid();
     const b = oid();
     await officialRow(10000, { product: "FLIGHT", bookingDocIds: [String(a), String(b)] });

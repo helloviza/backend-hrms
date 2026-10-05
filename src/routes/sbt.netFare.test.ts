@@ -225,9 +225,9 @@ beforeEach(async () => {
   const month = new Date().toISOString().slice(0, 7);
   await col("customerworkspaces").insertMany([
     { _id: WS, status: "ACTIVE", customerId: oid(), companyName: "Acme",
-      sbtOfficialBooking: { enabled: true, monthlyLimit: 0, currentMonthSpend: 0, lastResetMonth: month } },
+      sbtOfficialBooking: { enabled: true, creditLimit: 10000000, used: 0 } },
     { _id: new mongoose.Types.ObjectId(HOUSE), status: "ACTIVE", customerId: oid(), companyName: "Plumtrips",
-      sbtOfficialBooking: { enabled: true, monthlyLimit: 0, currentMonthSpend: 0, lastResetMonth: month } },
+      sbtOfficialBooking: { enabled: true, creditLimit: 10000000, used: 0 } },
   ] as any[]);
   for (const m of [...Object.values(tbo), ...Object.values(rzp)]) (m as any).mockReset();
   hotelBookBodies = [];
