@@ -61,11 +61,12 @@ import {
   checkCanRaiseRequest,
 } from "./approvals.security.js";
 import approvalSearchRouter from "./approvals.search.js";
-import { actorNamesOnResponse, actorStamp, SYSTEM_ACTOR } from "../services/actorNames.js";
+import { actorNamesOnResponse, actorStamp, SYSTEM_ACTOR, isPlaceholderName, userNames } from "../services/actorNames.js";
 import travelDeskRouter from "./approvals.travelDesk.js";
 import { assignCase, TravelDeskError, flagNeedsReassignment } from "../services/travelDesk.js";
 import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
 import { markRequestDone, notifyRequesterProgress, latestProposalsFor, closedCaseRefusal } from "../services/approvalProgress.js";
+import { requestDocumentsVisibleTo, sendRequestDocument } from "../services/bookingDocuments.js";
 import {
   prepareCartSelections,
   writeSelectionSnapshots,
@@ -454,23 +455,19 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     const user = req.user;
     const sub = String(user?.sub || user?._id || "");
     const email = normEmail(user?.email);
-    const name = normStr(user?.name || user?.firstName || "");
-
-    // Resolve requester display name — JWT may omit name if token was issued before profile was set
-    let requesterDisplayName = name;
-    if (!requesterDisplayName && (sub || email)) {
-      const dbFrontliner = await User.findOne(
-        sub ? { _id: sub } : { email: exactIRegex(email) }
-      ).select("name firstName lastName").lean();
-      if (dbFrontliner) {
-        requesterDisplayName = normStr(
-          (dbFrontliner as any).name ||
-          [(dbFrontliner as any).firstName || "", (dbFrontliner as any).lastName || ""]
-            .filter(Boolean).join(" ")
-        );
-      }
-    }
-    if (!requesterDisplayName) requesterDisplayName = email?.split("@")[0] || "User";
+    // The requester's real name, from the profile (first + last, else the
+    // claimed traveller profile) — never the token's name, which can be stale
+    // or the "Workspace User" placeholder an account was created with.
+    const profileNames = await userNames([sub, email]);
+    const tokenName = normStr(user?.name || user?.firstName || "");
+    const notEmail = (v: any) => (v && !String(v).includes("@") ? String(v) : "");
+    const requesterDisplayName =
+      notEmail(profileNames.get(sub)) ||
+      notEmail(profileNames.get(email)) ||
+      (tokenName && !isPlaceholderName(tokenName) ? tokenName : "") ||
+      email?.split("@")[0] ||
+      "User";
+    const name = requesterDisplayName;
 
     // SBT users must book directly — block approval flow
     // WORKSPACE_LEADER always bypasses SBT/canRaiseRequest restrictions
@@ -647,6 +644,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
           userEmail: email,
           userName: name,
           ...actorStamp(req.user, hasQueueView(req) ? "staff" : "customer"),
+          actorName: name,
         },
         ...(isSelfApproval
           ? [
@@ -1417,6 +1415,15 @@ router.put("/admin/:id/start-booking", requireApprovalsAdminWrite, async (req: A
     const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, String(req.params.id || "")));
     if (!doc) return res.status(404).json({ error: "Not found" });
     const wasInProgress = doc.stage === "BOOKING_IN_PROGRESS";
+    // Idempotent: Book Now clicked again (or from another tab) changes nothing
+    // and writes no second "Booking started".
+    if (wasInProgress && doc.adminState === "in_progress") {
+      return res.json({ success: true, doc: forViewer(doc, req) });
+    }
+    const closed = closedCaseRefusal(doc);
+    if (closed || doc.stage === "COMPLETED") {
+      return res.status(409).json(closed || { error: "This request is already booked.", code: "ALREADY_BOOKED" });
+    }
 
     doc.adminState = "in_progress";
     doc.stage = "BOOKING_IN_PROGRESS";
@@ -1532,6 +1539,10 @@ router.put(
       }
 
       const wasInProgress = st === "BOOKING_IN_PROGRESS";
+      // Already in progress and nothing new to say: no repeat "Booking started".
+      if (wasInProgress && doc.adminState === "in_progress" && !String(comment || "").trim()) {
+        return res.json({ ok: true, request: forViewer(doc, req), message: "Already under process" });
+      }
       doc.stage = "BOOKING_IN_PROGRESS";
       doc.adminState = "in_progress";
 
@@ -1590,6 +1601,85 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
       actualBookingPrice,
     });
     return res.json({ ok: true, request: forViewer(out.doc, req), message: out.message });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Mark Processed — outcomes WITHOUT a booking (cancelled by the client, not
+ * available, duplicate, handled elsewhere). Reason + note only: no prices, no
+ * upload. The request closes as Cancelled with that reason, and the requester
+ * hears through the usual "cancelled" email. A booked outcome is never made
+ * here: saving the manual booking as Done completes the request
+ * (services/bookingDocuments.ts).
+ */
+export const CLOSE_REASONS: Record<string, string> = {
+  CANCELLED_BY_CLIENT: "Cancelled by the client",
+  NOT_AVAILABLE: "Not available",
+  DUPLICATE: "Duplicate request",
+  HANDLED_ELSEWHERE: "Handled outside Plumbox",
+};
+
+router.put("/admin/:id/close", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
+  try {
+    setNoStore(res);
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid request id" });
+    const reason = String(req.body?.reason || "").trim().toUpperCase();
+    const note = String(req.body?.note || "").trim().slice(0, 1000);
+    if (!CLOSE_REASONS[reason]) {
+      return res.status(400).json({ error: "Pick a reason", code: "REASON_REQUIRED", reasons: Object.keys(CLOSE_REASONS) });
+    }
+
+    const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, id));
+    if (!doc) return res.status(404).json({ error: "Request not found" });
+    const closed = closedCaseRefusal(doc);
+    if (closed) return res.status(409).json(closed);
+    if (doc.stage === "COMPLETED" || doc.adminState === "done") {
+      return res.status(409).json({ error: "This request is already booked.", code: "ALREADY_BOOKED" });
+    }
+
+    const text = [CLOSE_REASONS[reason], note].filter(Boolean).join(" — ");
+    doc.adminState = "cancelled";
+    doc.stage = "BOOKING_CANCELLED";
+    doc.meta = doc.meta || {};
+    doc.meta.closedReason = reason;
+    doc.markModified("meta");
+    doc.history = Array.isArray(doc.history) ? doc.history : [];
+    doc.history.push({
+      action: "admin_closed",
+      at: new Date(),
+      by: String(req.user?.sub || req.user?._id || ""),
+      comment: text,
+      userEmail: normEmail(req.user?.email),
+      userName: req.user?.name || req.user?.firstName || "",
+      ...actorStamp(req.user, "staff"),
+    });
+    await doc.save();
+    await notifyRequesterProgress(doc, "cancelled", text);
+    res.json({ ok: true, request: forViewer(doc, req), message: "Closed" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Booking documents (tickets, vouchers) of a request — the one permission-
+ * checked download for customers: the requester, the approver, Workspace
+ * Leaders of that company, and staff inside their queue scope. Anyone else,
+ * an unknown document id, a proposal option PDF or an internal file: 404.
+ */
+router.get("/requests/:id/documents/:docId/download", requireAuth, async (req: AnyObj, res, next) => {
+  try {
+    setNoStore(res);
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(404).json({ error: "Document not found" });
+    const doc: any = await ApprovalRequest.findById(id).lean();
+    if (!doc || !(await requestDocumentsVisibleTo(req, doc))) return res.status(404).json({ error: "Document not found" });
+    if (!(await sendRequestDocument(res, doc, String(req.params.docId || "")))) {
+      return res.status(404).json({ error: "Document not found" });
+    }
   } catch (err) {
     next(err);
   }
@@ -1714,10 +1804,8 @@ router.get("/attachments/:filename/download", requireAuth, async (req: AnyObj, r
 
     if (!doc) return res.status(404).json({ error: "Attachment not found" });
 
-    const canView =
-      caseInQueueScope(req, doc) || isOwnerOfRequest(doc, req.user) || isManagerOrLeaderOfRequest(doc, req.user);
-
-    if (!canView) return res.status(403).json({ error: "Not allowed" });
+    // The one booking-documents rule (services/bookingDocuments.ts).
+    if (!(await requestDocumentsVisibleTo(req, doc))) return res.status(404).json({ error: "Attachment not found" });
 
     const filePath = path.join(approvalsUploadRoot, filename);
     if (!fs.existsSync(filePath)) {

@@ -53,6 +53,19 @@ function proposalBookingAttachments(p: AnyObj | null) {
   return out;
 }
 
+/** Manual booking type → the concierge TravelBooking service (or "" to skip). */
+function conciergeService(type: any): string {
+  const t = str(type).toUpperCase();
+  if (t.includes("FLIGHT")) return "FLIGHT";
+  if (t.includes("HOTEL")) return "HOTEL";
+  if (t.includes("VISA")) return "VISA";
+  if (t === "CAB" || t === "TRANSFER") return "CAB";
+  if (t === "FOREX" || t === "ESIM") return t;
+  if (t === "HOLIDAYS") return "HOLIDAY";
+  if (t === "EVENTS") return "MICE";
+  return "";
+}
+
 export async function markRequestDone(opts: {
   doc: any; // ApprovalRequest document (not lean)
   admin: { sub?: string; email: string; name: string };
@@ -60,6 +73,10 @@ export async function markRequestDone(opts: {
   notifyEmail?: any;
   bookingAmount?: any;
   actualBookingPrice?: any;
+  /** Booking documents in S3 (a manual booking's ticket / voucher), fetched at send time. */
+  extraAttachments?: Array<{ filename: string; s3Key: string; contentType?: string }>;
+  /** Manual booking type (FLIGHT, HOTEL…) when the comment carries no [SERVICE:] tag. */
+  service?: string;
 }): Promise<{ doc: any; message: string }> {
   const { doc, admin } = opts;
   const comment = String(opts.comment || "");
@@ -102,9 +119,9 @@ export async function markRequestDone(opts: {
   try {
     const serviceMatch = comment.match(/\[SERVICE:(\w+)\]/i);
     const amountMatch = comment.match(/\[BOOKING_AMOUNT:(\d+(?:\.\d+)?)\]/i);
-    if (serviceMatch && amountMatch) {
-      const service = serviceMatch[1].toUpperCase();
-      const amount = parseFloat(amountMatch[1]);
+    const service = serviceMatch ? serviceMatch[1].toUpperCase() : conciergeService(opts.service);
+    const amount = amountMatch ? parseFloat(amountMatch[1]) : Number(opts.bookingAmount) || 0;
+    if (service && amount) {
       if (["FLIGHT", "HOTEL", "VISA", "CAB", "FOREX", "ESIM", "HOLIDAY", "MICE"].includes(service) && amount > 0) {
         await TravelBooking.findOneAndUpdate(
           { reference: doc._id },
@@ -143,7 +160,11 @@ export async function markRequestDone(opts: {
     await doc.save();
     return { doc, message: "Marked done (no requester email)" };
   }
-  const emailAtts = [...buildEmailAttachmentsFromMeta(doc), ...proposalBookingAttachments(proposal)];
+  const emailAtts: Array<{ filename: string; path?: string; s3Key?: string; contentType?: string }> = [
+    ...buildEmailAttachmentsFromMeta(doc),
+    ...proposalBookingAttachments(proposal),
+    ...(opts.extraAttachments || []),
+  ];
   // The requester's profile name (services/actorNames.ts), else the stored name.
   const requesterLookup = await userNames([doc.frontlinerId, to]);
   const requesterName =

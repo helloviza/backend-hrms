@@ -26,7 +26,8 @@ type AnyObj = Record<string, any>;
 const norm = (v: any) => String(v ?? "").trim().toLowerCase();
 
 export type NotifyOpts = {
-  attachments?: MailAttachment[];
+  /** `s3Key` attachments are read from S3 at send time (services/emailOutbox.ts). */
+  attachments?: Array<MailAttachment & { s3Key?: string }>;
   /** History rows for the request: pushed only once the send succeeds / finally fails. */
   onSent?: AnyObj | null;
   onFailed?: AnyObj | null;

@@ -7,8 +7,9 @@ import ApprovalRequest from "../models/ApprovalRequest.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { requireAuth } from "../middleware/auth.js";
 import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
-import { sanitizeApprovalForViewer, adminQueueAccess, queueCaseScope, hasQueueView } from "./approvals.security.js";
-import { actorNamesOnResponse, userNames, nameOrUnknown } from "../services/actorNames.js";
+import { sanitizeApprovalForViewer, adminQueueAccess, queueCaseScope, hasQueueView, resolveLeaderCustomerIds } from "./approvals.security.js";
+import { actorNamesOnResponse, userNames, nameOrUnknown, collectActorRows, resolveActors, maskStaffActors } from "../services/actorNames.js";
+import { publicDocuments, requestDocumentsVisibleTo } from "../services/bookingDocuments.js";
 import { dateRangeOr400, withDateRange } from "../utils/dateRange.js";
 
 const router = Router();
@@ -493,144 +494,122 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
     });
   }
 
-  // Customer/Workspace Leader => resolve org ids and show org-wide history
-  if (isCustomerViewer(user)) {
-    const email = userEmail(user);
-    const tokenCid = getCustomerIdFromToken(user);
-
-    // ✅ key fix: resolve real workspace ids using their email
-    const resolvedOrgIds = await resolveWorkspaceIdsForUser(user);
-
-    // also include token customerId if present
-    if (tokenCid) resolvedOrgIds.push(tokenCid);
-
+  // Customer side: a Workspace Leader sees their company's bookings, everyone
+  // else their own. Rows are the customer-safe shape (customerHistoryRow).
+  const email = userEmail(user);
+  const sub = String(user?.sub || user?._id || user?.id || "");
+  const leaderOf = await resolveLeaderCustomerIds(email);
+  const leader = leaderOf.length > 0 || isWorkspaceLeaderRole(user);
+  let scope: any;
+  if (leader) {
     const ors: any[] = [];
-
-    for (const id of resolvedOrgIds) ors.push(...buildOrgScopeOrs(id));
-    // also allow their own email scope (optional)
-    ors.push(...buildEmailScopeOrs(email));
-
-    const query = ors.length ? ({ ...base, $or: ors } as any) : (base as any);
-
-    const rows = await ApprovalRequest.find(query).sort({ updatedAt: -1 }).lean();
-    const travelerMap = await buildTravelerIdMap(rows);
-    const people = await peopleNames(rows);
-
-    const out = rows.map((r: any) => {
-      const hist = Array.isArray(r?.history) ? r.history : [];
-
-      // sanitize for non-admin
-      const safeHist = isAdmin(user)
-        ? hist
-        : hist.map((h: any) => ({
-            ...h,
-            comment: stripActualPriceToken(h?.comment || ""),
-          }));
-
-      const latest = safeHist.length ? safeHist[safeHist.length - 1] : null;
-      const parsed = parseAdminComment(latest?.comment || "");
-
-      const pdfCandidate = pickPdfCandidate({ ...r, history: safeHist });
-      const attachmentDownloadUrl = pdfCandidate ? makeAttachmentDownloadUrl(pdfCandidate) : "";
-      const requesterEmail = String(r.requesterEmail || r.frontlinerEmail || "").toLowerCase();
-
-      return sanitizeApprovalForViewer({
-        ...r,
-        history: safeHist,
-        requesterTravelerId: travelerMap.get(requesterEmail) || "",
-          ...peopleOf(r, people),
-        _latestParsed: {
-          mode: parsed.mode,
-          service: parsed.service,
-          reason: parsed.reason,
-          note: parsed.note,
-          bookingAmount: parsed.bookingAmount,
-          attachmentDownloadUrl,
-          raw: parsed.raw,
-        },
-      }, user);
-    });
-
-    // Optional debug (helps you verify what ids were used)
-    const debug = req.query.debug ? { email, tokenCid, resolvedOrgIds: [...new Set(resolvedOrgIds)] } : undefined;
-
-    return res.json({ ok: true, rows: out, ...(debug ? { debug } : {}) });
+    if (leaderOf.length) ors.push({ customerId: { $in: leaderOf } });
+    if ((req as any).workspaceObjectId) ors.push({ workspaceId: (req as any).workspaceObjectId });
+    scope = ors.length ? { $or: ors } : ownScope(sub, email);
+  } else {
+    scope = ownScope(sub, email);
   }
 
-  // Requester-only => email scoped
-  const email = userEmail(user);
-  const emailOrs = buildEmailScopeOrs(email);
-  const query = emailOrs.length ? ({ ...base, $or: emailOrs } as any) : (base as any);
-
-  const rows = await ApprovalRequest.find(query).sort({ updatedAt: -1 }).lean();
-  const travelerMap = await buildTravelerIdMap(rows);
-    const people = await peopleNames(rows);
-
-  const out = rows.map((r: any) => {
-    const hist = Array.isArray(r?.history) ? r.history : [];
-
-    const safeHist = isAdmin(user)
-      ? hist
-      : hist.map((h: any) => ({
-          ...h,
-          comment: stripActualPriceToken(h?.comment || ""),
-        }));
-
-    const latest = safeHist.length ? safeHist[safeHist.length - 1] : null;
-    const parsed = parseAdminComment(latest?.comment || "");
-
-    const pdfCandidate = pickPdfCandidate({ ...r, history: safeHist });
-    const attachmentDownloadUrl = pdfCandidate ? makeAttachmentDownloadUrl(pdfCandidate) : "";
-    const requesterEmail = String(r.requesterEmail || r.frontlinerEmail || "").toLowerCase();
-
-    return sanitizeApprovalForViewer({
-      ...r,
-      history: safeHist,
-      requesterTravelerId: travelerMap.get(requesterEmail) || "",
-          ...peopleOf(r, people),
-      _latestParsed: {
-        mode: parsed.mode,
-        service: parsed.service,
-        reason: parsed.reason,
-        note: parsed.note,
-        bookingAmount: parsed.bookingAmount,
-        attachmentDownloadUrl,
-        raw: parsed.raw,
-      },
-    }, user);
-  });
+  const rows = await ApprovalRequest.find({ ...base, ...scope } as any).sort({ updatedAt: -1 }).lean();
+  const people = await peopleNames(rows);
+  const out = rows.map((r: any) => customerHistoryRow(r, user, people));
+  // Names resolved and staff masked here, then every email that is not the
+  // viewer's own removed — the response hook then has nothing left to change.
+  const actorRows = collectActorRows(out);
+  try {
+    await resolveActors(actorRows.map((x) => x.row));
+  } catch (err: any) {
+    console.error("[booking-history] could not resolve actors", err?.message || err);
+  }
+  maskStaffActors(actorRows);
+  for (const r of out) stripOtherEmails(r, email);
 
   return res.json({ ok: true, rows: out });
 });
 
+function isWorkspaceLeaderRole(user: any): boolean {
+  return (Array.isArray(user?.roles) ? user.roles : [])
+    .map((r: any) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
+    .includes("WORKSPACELEADER");
+}
+
+/** The caller's own requests (by user id, or the email they raised it with). */
+function ownScope(sub: string, email: string) {
+  const ors: any[] = [];
+  if (sub) ors.push({ frontlinerId: sub });
+  if (email) ors.push({ frontlinerEmail: email });
+  return ors.length ? { $or: ors } : { _id: null };
+}
+
+/** When the request was booked / closed: the first done or cancel row, else the last update. */
+function closedAt(r: any): any {
+  const hist: any[] = Array.isArray(r?.history) ? r.history : [];
+  const row = hist.find((h) => ["admin_done", "admin_closed", "admin_cancelled"].includes(String(h?.action || "")));
+  return row?.at || r?.updatedAt || r?.createdAt;
+}
+
 /**
- * Protected download:
- * GET /api/booking-history/attachments/:file/download
- *
- * ✅ Also searches multiple safe dirs so “PDF must be available at all stages”.
+ * One booking for a customer-side viewer: what the card and the drawer need —
+ * no prices, no internal notes, no ids of people, no URLs (documents as
+ * { id, name, type, size }; download through the guarded approvals route).
+ */
+function customerHistoryRow(r: any, user: any, people: Map<string, string>) {
+  const safe: any = sanitizeApprovalForViewer({ ...r, ...peopleOf(r, people) }, user);
+  return {
+    _id: safe._id,
+    ticketId: safe.ticketId,
+    status: safe.status,
+    stage: safe.stage,
+    adminState: safe.adminState,
+    customerName: safe.customerName,
+    requesterName: safe.requesterName,
+    approverName: safe.approverName,
+    frontlinerName: safe.requesterName,
+    frontlinerEmail: safe.frontlinerEmail,
+    cartItems: safe.cartItems,
+    comments: safe.comments,
+    createdAt: safe.createdAt,
+    updatedAt: safe.updatedAt,
+    bookedAt: closedAt(r),
+    history: safe.history,
+    meta: { travelFlow: safe.meta?.travelFlow, revoked: safe.meta?.revoked || undefined },
+    _documents: safe._documents || publicDocuments(r),
+  };
+}
+
+const EMAIL_KEYS = ["userEmail", "byEmail", "actorEmail", "doneByEmail", "requesterEmail", "frontlinerEmail", "assigneeEmail"];
+/** Remove every email that is not the viewer's own (the row, its history). */
+function stripOtherEmails(row: any, own: string) {
+  const strip = (o: any) => {
+    if (!o || typeof o !== "object") return;
+    for (const k of EMAIL_KEYS) if (k in o && String(o[k] || "").toLowerCase() !== own) delete o[k];
+    if (typeof o.by === "string" && o.by.includes("@") && o.by.toLowerCase() !== own) delete o.by;
+  };
+  strip(row);
+  for (const h of Array.isArray(row.history) ? row.history : []) strip(h);
+}
+
+/**
+ * Legacy download links (/api/booking-history/attachments/<file>/download):
+ * served only to someone who may see that request's booking documents — the
+ * same rule as GET /api/approvals/requests/:id/documents/:docId/download.
+ * Anything else (another company's file, a file on no request): 404.
  */
 router.get("/attachments/:file/download", requireAuth, async (req: Request, res: Response) => {
-  const user = (req as any).user;
-  if (!canViewBookingHistory(user, await isQueueViewer(req))) {
-    return res.status(403).json({ ok: false, error: "Forbidden" });
+  try {
+    await isQueueViewer(req); // resolves the caller's workspace + queue scope
+    const safeFile = path.basename(String(req.params.file || ""));
+    if (!safeFile || safeFile !== String(req.params.file || "")) return res.status(404).json({ error: "Not found" });
+    const doc: any = await ApprovalRequest.findOne({ "meta.attachments.path": `/uploads/approvals/${safeFile}` }).lean();
+    if (!doc || !(await requestDocumentsVisibleTo(req, doc))) return res.status(404).json({ error: "Not found" });
+    const fullPath = path.join(process.cwd(), "uploads", "approvals", safeFile);
+    if (!fs.existsSync(fullPath)) return res.status(404).json({ error: "Not found" });
+    const att = (doc.meta?.attachments || []).find((a: any) => String(a?.path || "") === `/uploads/approvals/${safeFile}`);
+    res.setHeader("Content-Type", "application/pdf");
+    return res.download(fullPath, String(att?.filename || safeFile));
+  } catch {
+    return res.status(404).json({ error: "Not found" });
   }
-
-  const file = String(req.params.file || "");
-  const safeFile = path.basename(file);
-  if (!safeFile) return res.status(400).send("Bad file");
-
-  const candidates = [
-    path.join(process.cwd(), "uploads", "approvals", safeFile),
-    path.join(process.cwd(), "uploads", "booking-history", safeFile),
-    path.join(process.cwd(), "uploads", safeFile),
-  ];
-
-  const fullPath = candidates.find((p) => fs.existsSync(p));
-  if (!fullPath) return res.status(404).send("Not found");
-
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"`);
-  fs.createReadStream(fullPath).pipe(res);
 });
 
 export default router;

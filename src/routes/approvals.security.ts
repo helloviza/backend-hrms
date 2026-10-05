@@ -1,5 +1,7 @@
 // apps/backend/src/routes/approvals.security.ts
 import { requireAuth } from "../middleware/auth.js";
+import { plainActivity, CUSTOMER_HIDDEN_ACTIONS } from "../services/activityText.js";
+import { publicDocuments } from "../services/requestDocumentList.js";
 import User from "../models/User.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import CustomerMember from "../models/CustomerMember.js";
@@ -376,7 +378,14 @@ export const STAFF_ONLY_HISTORY_ACTIONS = new Set(["admin_auto_assigned", "admin
  */
 export function maskPassportsForStaff(doc: any) {
   if (!doc) return doc;
-  return maskPassportsDeep(JSON.parse(JSON.stringify(doc)));
+  const out = maskPassportsDeep(JSON.parse(JSON.stringify(doc)));
+  if (looksLikeRequest(out)) out._documents = publicDocuments(out);
+  return out;
+}
+
+/** An approval request (not a proposal or a list wrapper). */
+function looksLikeRequest(d: any): boolean {
+  return !!d && typeof d === "object" && Array.isArray(d.cartItems) && "frontlinerEmail" in d;
 }
 
 /**
@@ -411,14 +420,32 @@ export function sanitizeApprovalForViewer(doc: any, user: any) {
   if (Array.isArray(safe?.history)) {
     safe.history = safe.history
       .filter((h: any) => !STAFF_ONLY_HISTORY_ACTIONS.has(String(h?.action || "")))
+      // Delivery bookkeeping names recipients' emails; internal uploads are noise.
+      .filter((h: any) => !CUSTOMER_HIDDEN_ACTIONS.has(String(h?.action || "")))
       .map((h: any) => {
         if (!h || typeof h !== "object") return h;
         // "Assigned" is all a customer learns: no agent, no assigner, no note
         // (older rows may carry a note or a staff name in these fields).
         if (String(h.action || "") === "admin_assigned") return { action: "admin_assigned", at: h.at };
         delete h.staffNote;
+        delete h.tokenHash;
+        // Plain English: no [MODE:…] tags, no URLs — an attachment is a file name.
+        if (h.comment) {
+          const plain = plainActivity(h.comment);
+          h.comment = plain.text || undefined;
+          if (plain.documentName) h.documentName = plain.documentName;
+        }
         return h;
       });
+  }
+
+  // Booking documents: the list only (name, type, size) — never an S3 key,
+  // a path, a URL or the manual booking's id. Download goes through
+  // GET /api/approvals/requests/:id/documents/:docId/download.
+  if (looksLikeRequest(safe)) safe._documents = publicDocuments(safe);
+  if (safe?.meta && typeof safe.meta === "object") {
+    delete safe.meta.bookingDocuments;
+    delete safe.meta.manualBookingId;
   }
 
   // Proposal option PDFs are supplier quotes (they carry prices) — staff only.

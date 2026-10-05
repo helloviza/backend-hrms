@@ -12,6 +12,8 @@ const AttachmentSchema = new Schema(
   {
     filename: { type: String, default: "" },
     path: { type: String, default: "" },
+    /** A file in S3 (booking documents): read at send time, so a retry re-reads it. */
+    s3Key: { type: String, default: "" },
     contentType: { type: String, default: "" },
   },
   { _id: false },

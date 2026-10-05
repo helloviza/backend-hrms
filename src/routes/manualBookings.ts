@@ -41,6 +41,8 @@ import { buildHotelAutofill } from "../services/hotelAutofill.js";
 import { bookingTripType, bookingLegRoute, bookingLegDetail } from "../utils/bookingLegs.js";
 import type { VoucherType } from "../types/index.js";
 import { userNames, nameOrUnknown, personName } from "../services/actorNames.js";
+import ApprovalRequest from "../models/ApprovalRequest.js";
+import { syncRequestFromManualBooking } from "../services/bookingDocuments.js";
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -816,6 +818,20 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
 
+    // Book Now: a booking for an approval request is for THAT request's
+    // customer — the Client is locked to it, and an unknown request is refused
+    // rather than silently booked unlinked.
+    if (source === "ADMIN_QUEUE" && body.sourceBookingId) {
+      const rid = String(body.sourceBookingId);
+      const linked: any = mongoose.isValidObjectId(rid)
+        ? await ApprovalRequest.findById(rid).select("customerId").lean()
+        : null;
+      if (!linked) return res.status(400).json({ error: "The approval request for this booking was not found", code: "REQUEST_NOT_FOUND" });
+      if (String(linked.customerId || "") !== String(body.workspaceId)) {
+        return res.status(400).json({ error: "The client must be the request's company", code: "CLIENT_MISMATCH" });
+      }
+    }
+
     // No row exists yet, so attachments[] is [] by construction — a gated
     // type asking to be born CONFIRMED is refused here, before any write.
     const gateErr = attachmentGateError(null, { ...body, source, status, attachments: [] });
@@ -851,7 +867,10 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
       }).catch(() => {});
     }
 
-    res.status(201).json({ ok: true, booking });
+    // Book Now: the linked request moves to "Booking in progress" (or Booked).
+    const requestSync = await syncRequestFromManualBooking(booking, req.user);
+
+    res.status(201).json({ ok: true, booking, requestSync });
   } catch (err: any) {
     console.error("[ManualBookings POST]", err.message);
     res.status(500).json({ error: err.message });
@@ -1932,7 +1951,10 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
     if (gateErr) return res.status(400).json({ error: gateErr, code: "ATTACHMENT_REQUIRED" });
 
     await booking.save();
-    res.json({ ok: true, booking });
+    // Saved Done → the linked request is Booked (documents + email); Pending /
+    // WIP → it stays "Booking in progress". services/bookingDocuments.ts.
+    const requestSync = await syncRequestFromManualBooking(booking, req.user);
+    res.json({ ok: true, booking, requestSync });
   } catch (err: any) {
     console.error("[ManualBookings PUT]", err.message);
     res.status(500).json({ error: err.message });
@@ -2124,6 +2146,8 @@ router.post(
       await booking.save();
 
       const created = booking.attachments[booking.attachments.length - 1];
+      // A booked request's documents follow its booking (a replaced ticket).
+      await syncRequestFromManualBooking(booking, req.user);
       res.status(201).json({ ok: true, attachment: created });
 
       // Queue AI extraction for PDFs/images. Deliberately AFTER the response
@@ -2252,6 +2276,7 @@ router.delete(
 
       attachment.deleteOne();
       await booking.save();
+      await syncRequestFromManualBooking(booking, req.user);
 
       res.json({ ok: true });
     } catch (err: any) {

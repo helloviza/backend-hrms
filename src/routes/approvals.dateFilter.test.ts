@@ -276,6 +276,10 @@ describe("scope is unchanged with a date filter", () => {
       ...done, workspaceId: WS2, customerId: C2, frontlinerEmail: "someone@other.test", frontlinerId: "x", meta: { adminAssigned: { userId: ALL.sub } },
     });
 
+    // CUST is this company's Workspace Leader: Booking History shows the
+    // company's bookings (a plain requester sees only their own).
+    await col("customermembers").insertOne({ email: CUST.email, customerId: C1, role: "WORKSPACE_LEADER", isActive: true } as any);
+
     const q = "?from=2026-10-01&to=2026-10-07";
     const cust = await as(request(app).get(`/api/booking-history/history${q}`), CUST);
     expect([cust.status, tags(cust.body)]).toEqual([200, ["C1-IN"]]);

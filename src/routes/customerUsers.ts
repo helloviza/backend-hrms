@@ -818,7 +818,10 @@ export async function ensureAuthUserForCustomer(params: {
       officialEmail: email,
       personalEmail: email,
       name: name || undefined,
-      firstName: name || "Workspace User",
+      // No placeholder: an unnamed account shows its claimed traveller
+      // profile's name, else its email (services/actorNames.ts) — never
+      // "Workspace User" on requests and activity.
+      firstName: name || undefined,
       lastName: "",
       roles,
       passwordHash,

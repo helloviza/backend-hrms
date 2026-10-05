@@ -22,6 +22,12 @@ import { buildSendFailureAlertHtml } from "./approvalEmails/templates.js";
 
 type AnyObj = Record<string, any>;
 
+/** S3 bytes, loaded lazily: utils/s3Upload reads config/env on import. */
+async function s3Bytes(key: string): Promise<Buffer> {
+  const { getObjectBuffer } = await import("../utils/s3Upload.js");
+  return getObjectBuffer(key);
+}
+
 /** Wait after try N fails (index 0 = after try 1). The array length + 1 is the try count. */
 export const RETRY_DELAYS_MS = [2 * 60_000, 10 * 60_000];
 export const MAX_ATTEMPTS = RETRY_DELAYS_MS.length + 1;
@@ -38,7 +44,8 @@ export type OutboxMessage = {
   replyTo?: string;
   subject: string;
   html: string;
-  attachments?: MailAttachment[];
+  /** `s3Key`: a file in S3 (booking documents), fetched on every try so retries re-read it. */
+  attachments?: Array<MailAttachment & { s3Key?: string }>;
   requestId?: any;
   proposalId?: any;
   caseCode?: string;
@@ -58,9 +65,23 @@ async function pushHistory(requestId: any, row: AnyObj | null | undefined, extra
   }
 }
 
+/** Outbox attachments as the mailer takes them: S3 files become bytes. */
+async function mailAttachments(list: AnyObj[] | undefined) {
+  if (!list?.length) return undefined;
+  return Promise.all(
+    list.map(async (a: AnyObj) =>
+      a.s3Key
+        ? { filename: a.filename, content: await s3Bytes(a.s3Key), contentType: a.contentType || undefined }
+        : { filename: a.filename, path: a.path, contentType: a.contentType || undefined },
+    ),
+  );
+}
+
 async function trySend(row: AnyObj): Promise<{ ok: boolean; error: string }> {
   try {
     const to: string[] = row.to || [];
+    // An unreadable S3 file fails this try (and is retried), never sends without it.
+    const attachments = await mailAttachments(row.attachments);
     const r: any = await sendMail({
       kind: row.kind,
       to: to.length === 1 ? to[0] : to,
@@ -68,9 +89,7 @@ async function trySend(row: AnyObj): Promise<{ ok: boolean; error: string }> {
       replyTo: row.replyTo || undefined,
       subject: row.subject,
       html: row.html,
-      attachments: row.attachments?.length
-        ? row.attachments.map((a: AnyObj) => ({ filename: a.filename, path: a.path, contentType: a.contentType || undefined }))
-        : undefined,
+      attachments,
     });
     // utils/mailer.ts reports SMTP errors as { ok: false } rather than throwing.
     if (r && r.ok === false) return { ok: false, error: String(r.error || "send failed") };
@@ -130,7 +149,7 @@ export async function enqueueEmail(msg: OutboxMessage, opts: { maxAttempts?: num
     replyTo: msg.replyTo || "",
     subject: msg.subject,
     html: msg.html,
-    attachments: (msg.attachments || []).map((a) => ({ filename: a.filename || "", path: a.path || "", contentType: a.contentType || "" })),
+    attachments: (msg.attachments || []).map((a) => ({ filename: a.filename || "", path: a.path || "", s3Key: a.s3Key || "", contentType: a.contentType || "" })),
     maxAttempts,
     requestId: msg.requestId || null,
     proposalId: msg.proposalId || null,

@@ -391,7 +391,8 @@ describe("sanitizeApprovalForViewer", () => {
     expect(out.cartItems[0].meta.notes).toBe("Flight: IndiGo");
     expect(out.cartItems[1].meta.notes).toBe("Hotel: Taj Lands End");
     expect(out.cartItems[0].description).toBe("Pre-selected from Pluto AI: IndiGo 6E-201");
-    expect(out.history[1].comment).toBe("[SERVICE:FLIGHT] booked");
+    // Customers read plain English: internal [TAG:…] markers are stripped.
+    expect(out.history[1].comment).toBe("booked");
   });
 
   it("returns the document untouched for staff", () => {

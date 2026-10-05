@@ -22,6 +22,7 @@
 // response of a router passes through (res.json), so no route can forget.
 import mongoose from "mongoose";
 import User from "../models/User.js";
+import TravellerProfile from "../models/TravellerProfile.js";
 
 export type ActorKind = "customer" | "staff" | "system";
 export const TRAVEL_DESK_NAME = "Plumtrips Travel Desk";
@@ -40,10 +41,43 @@ const HEX24 = /^[a-f0-9]{24}$/i;
 const str = (v: any) => (v === null || v === undefined ? "" : String(v).trim());
 const lower = (v: any) => str(v).toLowerCase();
 
-/** A person's display name from their profile: first + last, else `name`. */
+/**
+ * Names an account was created with when nobody typed one (customerUsers.ts
+ * used to store firstName "Workspace User"). Never shown when a real name
+ * exists anywhere.
+ */
+const PLACEHOLDER_NAMES = new Set(["workspace user", "user", "customer", "traveller", "traveler"]);
+export function isPlaceholderName(v: any): boolean {
+  return PLACEHOLDER_NAMES.has(lower(v));
+}
+const real = (v: any) => (isPlaceholderName(v) ? "" : str(v));
+
+/** A person's display name from their profile: first + last, else `name`. Placeholders don't count. */
 export function personName(u: any): string {
-  const full = [str(u?.firstName), str(u?.lastName)].filter(Boolean).join(" ");
-  return full || str(u?.name) || str(u?.fullName);
+  const full = [real(u?.firstName), str(u?.lastName)].filter(Boolean).join(" ");
+  return real(full) || real(u?.name) || real(u?.fullName);
+}
+
+/**
+ * user id → name on the traveller profile they claimed (My Profile), for users
+ * whose account carries no real name. One query for the batch.
+ */
+async function claimedProfileNames(userIds: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const ids = userIds.filter((i) => HEX24.test(i));
+  if (!ids.length) return out;
+  try {
+    const rows = (await TravellerProfile.find({ claimedBy: { $in: ids.map((i) => new mongoose.Types.ObjectId(i)) } })
+      .select("claimedBy firstName lastName")
+      .lean()) as any[];
+    for (const r of rows) {
+      const name = [str(r.firstName), str(r.lastName)].filter(Boolean).join(" ");
+      if (name && !out.has(String(r.claimedBy))) out.set(String(r.claimedBy), name);
+    }
+  } catch (err: any) {
+    console.error("[actor-names] traveller profile lookup failed", err?.message || err);
+  }
+  return out;
 }
 
 /** What a name slot shows when nobody can be named — never an id. */
@@ -88,8 +122,9 @@ export async function userNames(keys: any[]): Promise<Map<string, string>> {
     // callers fall back to "Unknown user", still never an id.
     console.error("[actor-names] user lookup failed", err?.message || err);
   }
+  const claimed = await claimedProfileNames(users.filter((u) => !personName(u)).map((u) => String(u._id)));
   for (const u of users) {
-    const name = personName(u) || str(u.email);
+    const name = personName(u) || claimed.get(String(u._id)) || str(u.email);
     if (!name) continue;
     out.set(String(u._id), name);
     if (u.email) out.set(lower(u.email), name);
@@ -202,7 +237,9 @@ export async function resolveActors(rows: any[]): Promise<void> {
     if (ids.size) or.push({ _id: { $in: [...ids].map((i) => new mongoose.Types.ObjectId(i)) } });
     if (emails.size) or.push({ email: { $in: [...emails] } });
     const users = (await User.find({ $or: or }).select("firstName lastName name email workspaceId").lean()) as any[];
+    const claimed = await claimedProfileNames(users.filter((u) => !personName(u)).map((u) => String(u._id)));
     for (const u of users) {
+      if (!personName(u) && claimed.has(String(u._id))) u.name = claimed.get(String(u._id));
       byId.set(String(u._id), u);
       if (u.email) byEmail.set(lower(u.email), u);
     }
@@ -225,7 +262,7 @@ export async function resolveActors(rows: any[]): Promise<void> {
     // Never a raw id: the profile name wins (a renamed user shows their current
     // name), else the name stored on the row, else the email.
     e.actorName =
-      personName(u) || str(e.actorName) || str(e.userName) || str(e.byName) || str(e.doneByName) || str(e.requesterName) || email || "Unknown user";
+      personName(u) || real(e.actorName) || real(e.userName) || real(e.byName) || real(e.doneByName) || real(e.requesterName) || email || "Unknown user";
   }
 }
 
@@ -237,7 +274,7 @@ function resolveWithoutLookup(rows: any[]): void {
       e.actorKind = isSystemRow(e) ? "system" : STAFF_EMAIL_DOMAINS.has(email.split("@")[1] || "") ? "staff" : "customer";
     }
     if (!str(e.actorName)) {
-      e.actorName = e.actorKind === "system" ? SYSTEM_NAME : str(e.userName) || str(e.byName) || str(e.doneByName) || email || "Unknown user";
+      e.actorName = e.actorKind === "system" ? SYSTEM_NAME : real(e.userName) || real(e.byName) || real(e.doneByName) || email || "Unknown user";
     }
   }
 }
@@ -260,6 +297,33 @@ export function maskStaffActors(rows: Array<{ row: any; workspaceId: string }>):
   }
 }
 
+/** Request documents whose stored requester name is a placeholder (or missing). */
+function collectPlaceholderRequesters(body: any): any[] {
+  const out: any[] = [];
+  const walk = (node: any, depth: number) => {
+    if (!node || typeof node !== "object" || depth > 8) return;
+    if (Array.isArray(node)) {
+      for (const n of node) walk(n, depth + 1);
+      return;
+    }
+    if ("frontlinerName" in node && (node.frontlinerId || node.frontlinerEmail) && !real(node.frontlinerName)) out.push(node);
+    for (const k of Object.keys(node)) if (node[k] && typeof node[k] === "object") walk(node[k], depth + 1);
+  };
+  walk(body, 0);
+  return out;
+}
+
+/** Placeholder requester names → the profile / claimed-traveller name (one lookup). */
+async function fixRequesterNames(docs: any[]): Promise<void> {
+  if (!docs.length) return;
+  const names = await userNames(docs.flatMap((d) => [d.frontlinerId, d.frontlinerEmail]));
+  for (const d of docs) {
+    const n = names.get(str(d.frontlinerId)) || names.get(lower(d.frontlinerEmail));
+    // userNames falls back to the email; a name slot never becomes an address.
+    if (n && !n.includes("@")) d.frontlinerName = n;
+  }
+}
+
 /**
  * Router middleware: every JSON body this router sends gets actor names
  * resolved, and — unless `isStaffViewer(req)` — staff actors masked. Errors
@@ -277,8 +341,14 @@ export function actorNamesOnResponse(isStaffViewer: (req: any) => boolean | Prom
         return send(body);
       }
       const rows = collectActorRows(plain);
-      if (!rows.length) return send(plain);
+      const requesters = collectPlaceholderRequesters(plain);
+      if (!rows.length && !requesters.length) return send(plain);
       (async () => {
+        try {
+          await fixRequesterNames(requesters);
+        } catch (err: any) {
+          console.error("[actor-names] could not resolve requester names", err?.message || err);
+        }
         try {
           await resolveActors(rows.map((r) => r.row));
         } catch (err: any) {
