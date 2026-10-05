@@ -78,6 +78,9 @@ export interface ISBTPayment extends Document {
   legAmounts?: Array<{ resultIndex: string; amount: number }>;
   bookingDocIds: string[];
   result?: Record<string, any>; // summary the browser shows (PNRs, confirmation no.)
+  // FLIGHT — the supplier's full Book / Ticket response per TBO BookingId. The
+  // customer's copy is stripped of fares; /bookings/save reads the net from here.
+  supplierResponses?: Array<{ bookingId: string; response: unknown; at: Date }>;
   refunds: SBTRefund[];
   refundedPaise: number;
   failureCode?: string; // FARE_CHANGED, SUPPLIER_FAILED, BOOKING_TERMS_CHANGED, …
@@ -128,6 +131,7 @@ const SBTPaymentSchema = new Schema<ISBTPayment>(
     legAmounts: { type: Schema.Types.Mixed },
     bookingDocIds: { type: [String], default: [] },
     result: { type: Schema.Types.Mixed },
+    supplierResponses: { type: Schema.Types.Mixed },
     refunds: { type: Schema.Types.Mixed, default: [] } as any,
     refundedPaise: { type: Number, default: 0 },
     failureCode: { type: String },

@@ -1,13 +1,14 @@
 import { Schema, model, type Document } from "mongoose";
 
 /**
- * SBTQuote — short-lived server-side record of the price a server computed at
- * quote time (FareQuote for flights, PreBook for hotels). Written unconditionally
- * so that a later step (price reconciliation) can compare the amount the client
- * sends at create-order / book against what the server actually quoted.
+ * SBTQuote — short-lived server-side record of what the server quoted at quote
+ * time (FareQuote for flights, PreBook for hotels). It is the ONLY source of the
+ * supplier net at booking time: customers never receive our cost, so Book /
+ * Ticket read the net fare (flights) and NetAmount + RSP floor (hotels) from
+ * here, by quote, scoped to the caller's workspace + user (services/sbtQuote.ts).
  *
- * This is step 1 (persistence only). Nothing reads these rows to branch behaviour
- * yet — see utils/priceRecon.ts for the step-2 mode scaffold.
+ * serverDisplayFare / serverNetFare / sourceRef also feed price reconciliation
+ * (utils/priceRecon.ts).
  */
 export interface ISBTQuote extends Document {
   quoteId: string;
@@ -29,6 +30,16 @@ export interface ISBTQuote extends Document {
   isMultiCity?: boolean;
   // FLIGHT — TBO's SupplierReissueCharges on this quote (reissue fare difference).
   supplierReissueCharges?: number;
+  // FLIGHT — TBO's FareQuote Fare and FareBreakdown, untouched (pre-margin).
+  netFare?: Record<string, unknown> | null;
+  netFareBreakdown?: Array<Record<string, unknown>>;
+  // HOTEL — PreBook cost figures for room 0 (NetAmount is what TBO Book needs).
+  netAmount?: number;
+  recommendedSellingRate?: number | null;
+  agentCommission?: number;
+  tds?: number;
+  isPublishedFare?: boolean;
+  cancelPolicies?: Array<Record<string, unknown>>;
   createdAt: Date;
 }
 
@@ -45,6 +56,14 @@ const SBTQuoteSchema = new Schema<ISBTQuote>({
   sellingFare: { type: Number },
   isMultiCity: { type: Boolean },
   supplierReissueCharges: { type: Number },
+  netFare: { type: Schema.Types.Mixed, default: undefined },
+  netFareBreakdown: { type: Schema.Types.Mixed, default: undefined },
+  netAmount: { type: Number },
+  recommendedSellingRate: { type: Number },
+  agentCommission: { type: Number },
+  tds: { type: Number },
+  isPublishedFare: { type: Boolean },
+  cancelPolicies: { type: Schema.Types.Mixed, default: undefined },
   // TTL: rows self-expire 60 min after creation. This exceeds the
   // quote→pay→book window with margin; tunable if that window ever grows.
   createdAt: { type: Date, default: Date.now, expires: 3600 },

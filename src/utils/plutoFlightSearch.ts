@@ -16,6 +16,7 @@ import {
   type PolicyRules,
 } from "../services/policyEvaluator.js";
 import { recordFareObservations } from "../services/fareObservations.js";
+import { sellingFlight } from "../services/sbtQuote.js";
 
 // In-policy first, then needs-approval, then out-of-policy. Stable, so the
 // within-rank fare ordering from dedupeRawTBOFlights is preserved.
@@ -149,8 +150,10 @@ export function mapTBOFlight(
     duration: `${h}h ${m}m`,
     stops: segs.length - 1,
     fare: {
+      // Both carry the SELLING total: TBO's OfferedFare is our net-of-commission
+      // cost and is never shown (callers pass rows through sellingFlight first).
       published: r.Fare?.PublishedFare || r.Fare?.TotalFare || r.FareBreakdown?.[0]?.BaseFare || 0,
-      offered: r.Fare?.OfferedFare || r.Fare?.PublishedFare || r.Fare?.TotalFare || 0,
+      offered: r.Fare?.PublishedFare || r.Fare?.TotalFare || 0,
       currency: r.Fare?.Currency || "INR",
     },
     cabin: CABIN_LABELS[first.CabinClass] || opts.cabinLabel,
@@ -195,8 +198,9 @@ export interface ChatFlightSearchResult {
  * Round-trip: pass journeyType:2 with a returnDate to search both legs; the
  * inbound options are mapped from TBO Results[1] exactly as the hardened
  * /flights/search path does. One-way (journeyType:1, the default) is unchanged.
- * No workspace margin is applied here — margin parity remains owned by the
- * hardened /flights/search path only.
+ * Prices are SELLING prices: `marginPct` (the route's flight margin, as SBT
+ * search applies it) is folded in and every net / commission field dropped
+ * before mapping (services/sbtQuote.ts sellingFlight).
  */
 export async function searchFlightsForChat(params: {
   origin: string;
@@ -212,6 +216,7 @@ export async function searchFlightsForChat(params: {
   requestId?: string;
   policyRules?: PolicyRules | null;
   workspaceObjectId?: any;
+  marginPct?: number;
 }): Promise<ChatFlightSearchResult> {
   const {
     origin, destination, departDate, returnDate,
@@ -222,6 +227,7 @@ export async function searchFlightsForChat(params: {
     requestId = "",
     policyRules = null,
     workspaceObjectId = null,
+    marginPct = 0,
   } = params;
 
   try {
@@ -257,8 +263,9 @@ export async function searchFlightsForChat(params: {
     const resultsArr: any[] = Array.isArray(tboResult?.Response?.Results)
       ? tboResult.Response.Results
       : [];
-    const outboundRaw: any[] = Array.isArray(resultsArr[0]) ? resultsArr[0] : [];
-    const inboundRaw: any[] = Array.isArray(resultsArr[1]) ? resultsArr[1] : [];
+    const sell = (rows: unknown): any[] => (Array.isArray(rows) ? rows.map((r: any) => sellingFlight(r, marginPct)) : []);
+    const outboundRaw: any[] = sell(resultsArr[0]);
+    const inboundRaw: any[] = sell(resultsArr[1]);
 
     const opts = { traceId, originIATA: origin, destIATA: destination, cabinLabel };
     // Dedupe by SBT's exact key (airline + flightNo + DepTime + ArrTime),

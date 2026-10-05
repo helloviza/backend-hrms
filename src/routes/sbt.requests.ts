@@ -16,8 +16,25 @@ import { requireFeature } from "../middleware/requireFeature.js";
 import { buildEmailShell, eCard, eRow, eLabel, eBtn, escapeHtml } from "./approvals.email.js";
 import TravelForm from "../models/TravelForm.js";
 import { maybeRouteToDemoSimulator } from "../utils/demoSimulator.js";
+import {
+  sellingFlightResults,
+  stripHotelCost,
+  customerFlightBooking,
+  customerHotelBooking,
+} from "../services/sbtQuote.js";
 
 const router = express.Router();
+
+/** A request as its requester / booker / Workspace Leader sees it: the option
+ *  they picked without any supplier net, commission or margin field (the stored
+ *  selectedOption is untouched). */
+function customerRequest(request: any) {
+  if (!request) return request;
+  const r = typeof request.toObject === "function" ? request.toObject() : { ...request };
+  if (r.selectedOption) r.selectedOption = stripHotelCost(sellingFlightResults(r.selectedOption, 0));
+  return r;
+}
+
 router.use(requireAuth);
 router.use(requireWorkspace);
 router.use(requireFeature("sbtEnabled"));
@@ -206,7 +223,7 @@ router.post("/", async (req: any, res: any) => {
       type,
     });
 
-    res.status(201).json(request);
+    res.status(201).json(customerRequest(request));
   } catch (err: any) {
     sbtLogger.error("SBT request creation failed", { error: err.message });
     res.status(500).json({ error: "Failed to create request" });
@@ -238,7 +255,7 @@ router.get("/my", async (req: any, res: any) => {
       .sort({ requestedAt: -1 })
       .lean();
 
-    res.json({ ok: true, requests });
+    res.json({ ok: true, requests: (requests as any[]).map(customerRequest) });
   } catch (err: any) {
     sbtLogger.error("SBT my requests failed", { error: err.message });
     res.status(500).json({ error: "Failed to load requests" });
@@ -266,7 +283,7 @@ router.delete("/:id/cancel", async (req: any, res: any) => {
       requesterId: uid,
     });
 
-    res.json(request);
+    res.json(customerRequest(request));
   } catch (err: any) {
     sbtLogger.error("SBT request cancel failed", { error: err.message });
     res.status(500).json({ error: "Failed to cancel request" });
@@ -336,7 +353,7 @@ router.get("/inbox", async (req: any, res: any) => {
       requesterTravelerId: inboxTidMap[String(r.requesterId?.email || "").toLowerCase()] || "",
     }));
 
-    res.json({ ok: true, requests: enriched });
+    res.json({ ok: true, requests: enriched.map(customerRequest) });
   } catch (err: any) {
     sbtLogger.error("SBT inbox failed", { error: err.message });
     res.status(500).json({ error: "Failed to load inbox" });
@@ -367,7 +384,7 @@ router.get("/:id", async (req: any, res: any) => {
       return res.status(403).json({ error: "Access denied" });
     }
 
-    res.json(request);
+    res.json(customerRequest(request));
   } catch (err: any) {
     sbtLogger.error("SBT request detail failed", { error: err.message });
     res.status(500).json({ error: "Failed to load request" });
@@ -746,7 +763,10 @@ router.post("/:id/book", async (req: any, res: any) => {
       bookerId: uid,
     });
 
-    res.json({ request, booking });
+    res.json({
+      request: customerRequest(request),
+      booking: request.type === "flight" ? customerFlightBooking(booking) : customerHotelBooking(booking),
+    });
   } catch (err: any) {
     sbtLogger.error("SBT request booking failed", { error: err.message });
     res.status(500).json({ error: "Failed to book request" });
@@ -841,7 +861,7 @@ router.post("/:id/reject", async (req: any, res: any) => {
       reason: rejectionReason,
     });
 
-    res.json(request);
+    res.json(customerRequest(request));
   } catch (err: any) {
     sbtLogger.error("SBT request rejection failed", { error: err.message });
     res.status(500).json({ error: "Failed to reject request" });

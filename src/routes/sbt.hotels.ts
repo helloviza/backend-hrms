@@ -53,7 +53,16 @@ import {
   latestHotelQuoteFor,
   creditCancelledBooking,
   requireSBTStaffDirect,
+  loadScopedQuote,
 } from "../services/sbtPaymentGate.js";
+import {
+  customerRoom,
+  customerHotelResults,
+  customerHotelBooking,
+  hotelMarginPct,
+  policiesWithoutAmounts,
+  stripHotelCost,
+} from "../services/sbtQuote.js";
 import {
   registerFulfilHandlers,
   createCheckoutHandler,
@@ -167,7 +176,7 @@ const getHotelBookingsHandler = async (req: any, res: any) => {
       }
     }
 
-    res.json({ ok: true, bookings });
+    res.json({ ok: true, bookings: (bookings as any[]).map(customerHotelBooking) });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Failed to list hotel bookings";
     sbtLogger.error("Hotel bookings list failed", { userId: req.user?.id, error: msg });
@@ -831,9 +840,11 @@ router.post("/search", requireSBT, requireHotelAccess, async (req: any, res: any
       }
     }
 
+    // Rooms from an allow-list: selling total + per-night selling rate, no net,
+    // DayRates, RSP or commission (services/sbtQuote.ts customerRoom).
     res.json({
       TraceId: "",
-      Hotels: result.hotels,
+      Hotels: customerHotelResults(result.hotels, result.marginPct ?? (await hotelMarginPct(req.body?.CountryCode))),
       SearchId: result.searchId,
       CityName: result.cityName,
     });
@@ -925,23 +936,11 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       bookingCode: req.body?.BookingCode,
     });
 
-    // RC2: compare TBO-raw TotalFare on both sides (searchPrice is now raw TBO TotalFare from frontend)
-    const PRICE_CHANGE_TOLERANCE = 1; // rupees — below this is rounding noise
-    const priceChanged = typeof searchPrice === "number" && searchPrice > 0
-      ? Math.abs(prebookTotalFare - searchPrice) > PRICE_CHANGE_TOLERANCE
-      : false;
-    const priceDiff = priceChanged ? prebookTotalFare - searchPrice : 0;
-
-    // Markup for display (NetAmount stays TBO-raw for Book payload)
-    const prebookMargins = await getMarginConfig();
-    const isPrebookDomestic = ((req.body as any).countryCode || "IN") === "IN";
-    const prebookMarginPct = prebookMargins.enabled
-      ? (isPrebookDomestic ? prebookMargins.hotel.domestic : prebookMargins.hotel.international)
-      : 0;
+    // Markup for display; NetAmount (what TBO Book needs) stays on the server quote.
+    const prebookMarginPct = await hotelMarginPct((req.body as any).countryCode || "IN");
     // RSP floor (TBO cert spec lines 1415/1746/1760): clamp display to RSP if present.
     // Round half-up to whole rupee (568.45→568, 568.50→569): the customer-facing
-    // total must equal the exact Razorpay charge (no paise drift). Applies ONLY to
-    // the displayed total — NetAmount (line ~797, sent to TBO Book) stays bit-exact.
+    // total must equal the exact Razorpay charge (no paise drift).
     //
     // RSP-floor clamp: a bare round can drop below a fractional RSP floor
     // (round(568.40)=568 < 568.40) and trip a false RSP_FLOOR_VIOLATED at booking.
@@ -962,6 +961,15 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       rspFloorCeil,
     );
 
+    // Price change: the browser sends the SELLING total it showed (search
+    // _displayTotalFare); compare it with the same selling computation now.
+    const PRICE_CHANGE_TOLERANCE = 1; // rupees — below this is rounding noise
+    const prebookSelling = applyMarginWithFloor(prebookTotalFare, prebookMarginPct, recommendedSellingRate);
+    const priceChanged = typeof searchPrice === "number" && searchPrice > 0
+      ? Math.abs(prebookSelling - searchPrice) > PRICE_CHANGE_TOLERANCE
+      : false;
+    const priceDiff = priceChanged ? Math.round((prebookSelling - searchPrice) * 100) / 100 : 0;
+
     // RC3a: Published Fare TDS extraction from PriceBreakUp node
     const priceBreakup: any[] = room0?.PriceBreakUp ?? [];
     const firstBreakup = priceBreakup[0] ?? {};
@@ -971,11 +979,9 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
       ? Math.round(agentCommission * 0.02 * 100) / 100 : 0;
     const isPublishedFare: boolean = agentCommission > 0 && netAmount > prebookTotalFare + 0.5;
 
-    // Price-recon step 1: persist the server-quoted fares unconditionally so a
-    // later step can compare what the client sends at create-order/book against
-    // what the server actually quoted. Additive — only adds quoteId to the
-    // response below; no existing field changes.
-    let prebookQuoteId: string | undefined = randomUUID();
+    // The quote is the ONLY place the net lives: /book, validate-before-payment and
+    // bookings/save read NetAmount, the RSP floor, commission and TDS from it.
+    const prebookQuoteId = randomUUID();
     try {
       await SBTQuote.create({
         quoteId: prebookQuoteId,
@@ -985,30 +991,31 @@ router.post("/prebook", requireAuth, requireSBT, async (req: any, res: any) => {
         sourceRef: BookingCode,
         workspaceId: callerScope(req).workspaceId,
         userId: callerScope(req).userId,
+        netAmount,
+        ...(typeof recommendedSellingRate === "number" ? { recommendedSellingRate } : {}),
+        agentCommission,
+        tds,
+        isPublishedFare,
+        cancelPolicies,
       });
     } catch (qErr: any) {
-      // Quote persistence is best-effort scaffolding; never block PreBook.
-      sbtLogger.error("[price-recon] quote persist failed", {
-        product: "HOTEL",
+      sbtLogger.error("[sbt-quote] hotel quote not stored — PreBook refused", {
         sourceRef: BookingCode,
         err: qErr?.message,
       });
-      prebookQuoteId = undefined;
+      return res.status(503).json({ error: "Could not confirm this room's price. Please try again.", code: "QUOTE_UNAVAILABLE" });
     }
 
+    // Customer copy: rooms from the allow-list (room 0 carries the charge), no
+    // NetAmount / TotalFare / DayRates / RSP / commission / TDS anywhere.
     res.json({
-      ...data,
+      ...customerHotelResults(data, prebookMarginPct, displayTotalFare),
       priceChanged,
       priceDiff,
-      netAmount,
-      recommendedSellingRate,
       supplements,
-      cancelPolicies,
+      cancelPolicies: policiesWithoutAmounts(cancelPolicies, netAmount),
       isRefundable,
       displayTotalFare,
-      tds,
-      agentCommission,
-      isPublishedFare,
       quoteId: prebookQuoteId,
     });
   } catch (err: unknown) {
@@ -1075,20 +1082,13 @@ router.post("/validate-before-payment", requireSBT, requireHotelAccess, ...sbtBo
       return res.status(400).json({ valid: false, errors });
     }
 
-    // RSP floor enforcement (TBO cert spec lines 1415/1746/1760).
-    // No server-side prebook cache exists — RSP and customerChargedAmount are forwarded
-    // by the frontend from the /prebook response. Defensive: if the field is absent,
-    // log a warning and skip — the /book gate below fails closed.
+    // RSP floor enforcement (TBO cert spec lines 1415/1746/1760), from the
+    // server's PreBook quote: its RSP and the price the server will charge.
+    // Browser values are ignored, and the floor never appears in a response.
+    const vbpQuote = BookingCode ? await latestHotelQuoteFor(callerScope(req), String(BookingCode)) : null;
     const rspFloor: number | null =
-      typeof req.body?.recommendedSellingRate === "number"
-        ? req.body.recommendedSellingRate
-        : null;
-    const customerChargedAmount: number = Number(
-      req.body?.customerChargedAmount ??
-      req.body?.displayAmount ??
-      req.body?.totalAmount ??
-      0,
-    );
+      typeof (vbpQuote as any)?.recommendedSellingRate === "number" ? (vbpQuote as any).recommendedSellingRate : null;
+    const customerChargedAmount = Math.round(Number((vbpQuote as any)?.serverDisplayFare) || 0);
     if (rspFloor != null && customerChargedAmount > 0) {
       if (violatesRspFloor(customerChargedAmount, rspFloor)) {
         return res.status(400).json({
@@ -1098,19 +1098,8 @@ router.post("/validate-before-payment", requireSBT, requireHotelAccess, ...sbtBo
           message:
             "Selling price is below the supplier's recommended minimum. " +
             "Please refresh the search and try again.",
-          details: {
-            rsp: rspFloor,
-            customerChargedAmount,
-            shortfall: Math.round((rspFloor - customerChargedAmount) * 100) / 100,
-          },
         });
       }
-    } else {
-      sbtLogger.warn("[validate-before-payment] RSP floor check skipped — missing fields", {
-        hasRsp: rspFloor != null,
-        hasChargedAmount: customerChargedAmount > 0,
-        BookingCode: BookingCode || "",
-      });
     }
 
     return res.status(200).json({ valid: true });
@@ -1152,18 +1141,15 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
     const {
       BookingCode,
       GuestNationality: _reqNationality,
-      NetAmount,
       Guests,
       PaymentId,
       bookingMode = "voucher",
     } = req.body;
 
-    // RSP snapshot from PreBook, forwarded by frontend. Persisted on CONFIRMED/HELD/FAILED
-    // for audit trail and downstream price-floor enforcement.
-    const bookingRecommendedSellingRate: number | null =
-      typeof req.body?.recommendedSellingRate === "number"
-        ? req.body.recommendedSellingRate
-        : null;
+    // NetAmount and the RSP floor come from the server's PreBook quote (set below),
+    // never from the browser.
+    let NetAmount = 0;
+    let bookingRecommendedSellingRate: number | null = null;
 
     // GuestNationality must equal Search-time value — never derive from per-guest field (TBO cert rule).
     const GuestNationality: string = _reqNationality || "IN";
@@ -1185,20 +1171,28 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
       });
     }
 
-    // Price-recon step 2: SHADOW both the customer-charged total and the net we're
-    // about to send TBO against the server's stored PreBook quote. Both are present
-    // here: NetAmount (TBO-net) and customerChargedAmount (display), keyed by
-    // BookingCode. Log-only; never blocks the booking.
-    {
-      const reconCharged = Number(req.body?.customerChargedAmount);
-      const reconNet = Number(NetAmount);
-      await reconcileQuoteShadow({
-        product: "HOTEL",
-        sourceRef: BookingCode,
-        chargedTotal: Number.isFinite(reconCharged) && reconCharged > 0 ? reconCharged : undefined,
-        tboNet: Number.isFinite(reconNet) && reconNet > 0 ? reconNet : undefined,
-      });
+    // The caller's own PreBook quote for this room: the checkout's (payment row),
+    // else the latest for this BookingCode. It holds NetAmount — what TBO Book
+    // needs — and the RSP floor. No quote → no booking (never a browser value).
+    const scopeForQuote = callerScope(req);
+    let bookQuote: any = null;
+    const rowQuoteId = Array.isArray((req as any).sbtPayment?.quoteIds) ? (req as any).sbtPayment.quoteIds[0] : undefined;
+    if (rowQuoteId) {
+      const q: any = await loadScopedQuote(scopeForQuote, rowQuoteId, "HOTEL");
+      if (q && String(q.sourceRef) === String(BookingCode)) bookQuote = q;
+    } else {
+      bookQuote = await latestHotelQuoteFor(scopeForQuote, String(BookingCode));
     }
+    if (!bookQuote || !(Number(bookQuote.netAmount) > 0)) {
+      sbtLogger.warn("[BOOK] no server PreBook quote with a net amount — refused", { hasQuote: !!bookQuote });
+      return res.status(410).json({ code: "FARE_EXPIRED", error: "Fare expired, please search again" });
+    }
+    NetAmount = Number(bookQuote.netAmount);
+    bookingRecommendedSellingRate =
+      typeof bookQuote.recommendedSellingRate === "number" ? bookQuote.recommendedSellingRate : null;
+    // What the customer pays: the payment row's amount, else (a hold) the quote's price.
+    const serverChargedAmount =
+      Number((req as any).sbtPayment?.amount) || Math.round(Number(bookQuote.serverDisplayFare) || 0);
 
     // GAP-36a: block hold for non-refundable rates (spec FAQ: "non refundable bookings can not be put on hold")
     // Refundability tri-state from frontend: true | false | null (unknown).
@@ -1229,6 +1223,7 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
     // Tracks whether TBO triggered a price change on the Book response (persisted for finance reporting)
     let priceChangedDuringBook = false;
     let priceChangeAmount = 0;
+    let bookedNetAmount = 0; // set once the quote is loaded; a lower re-quote at Book replaces it
 
     if (typeof GuestNationality !== "string" || GuestNationality.length !== 2) {
       return res.status(400).json({ error: "Valid guest nationality is required." });
@@ -1485,10 +1480,7 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
     // closing the race window between TBO call and save.
     // Server price of this room (the caller's PreBook quote), stamped on the
     // booking so vouchering a hold later is charged this — never a browser figure.
-    const _sellingQuote = await latestHotelQuoteFor(callerScope(req), String(BookingCode));
-    if (bookingMode === "hold" && !_sellingQuote) {
-      return res.status(410).json({ code: "FARE_EXPIRED", error: "Fare expired, please search again" });
-    }
+    const _sellingQuote = bookQuote;
     const _bookUserId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     if (_bookUserId && req.workspaceObjectId) {
       try {
@@ -1496,6 +1488,12 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
           clientReferenceId: clientRef,
           status: "PENDING",
           ...(_sellingQuote ? { serverSellingTotal: Math.round(Number(_sellingQuote.serverDisplayFare) || 0) } : {}),
+          // Our cost, from the server quote — bookings/save never takes these from the body.
+          netAmount: NetAmount,
+          ...(bookingRecommendedSellingRate != null ? { recommendedSellingRate: bookingRecommendedSellingRate } : {}),
+          agentCommission: Number(bookQuote.agentCommission) || 0,
+          tds: Number(bookQuote.tds) || 0,
+          isPublishedFare: bookQuote.isPublishedFare === true,
           userId: _bookUserId,
           workspaceId: req.workspaceObjectId,
           bookingId: "",
@@ -1508,7 +1506,7 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
           currency: "INR",
           guests: [],
           rooms: 1,
-          cancelPolicies: [],
+          cancelPolicies: Array.isArray(bookQuote.cancelPolicies) ? bookQuote.cancelPolicies : [],
           paymentStatus: "pending",
           paymentId: PaymentId || "",
           razorpayOrderId: "",
@@ -1558,6 +1556,7 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
       }
     }
 
+    bookedNetAmount = NetAmount;
     const tboPayload: Record<string, unknown> = {
       EndUserIp: process.env.TBO_EndUserIp || "1.1.1.1",
       BookingCode,
@@ -1695,6 +1694,12 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
             // GetBookingDetail, but on rare responses it's already present here.
             // The deferred check at T+120s will populate it for the common case.
             ...(bookResponseTboRefNo ? { tboReferenceNo: bookResponseTboRefNo } : {}),
+            // What we actually pay TBO (a lower price at Book replaces the quoted net)
+            netAmount: bookedNetAmount,
+            priceChangedDuringBook,
+            priceChangeAmount,
+            // The supplier's own Book response, kept server-side (the customer's copy is stripped)
+            raw: data,
             // Selling rate / cancellation text
             ...(bookingRecommendedSellingRate != null ? { recommendedSellingRate: bookingRecommendedSellingRate } : {}),
             ...(_bookCancellationPolicyText ? { cancellationPolicyText: _bookCancellationPolicyText } : {}),
@@ -1720,9 +1725,8 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
         isHeld,
         lastVoucherDate,
         priceChangedDuringBook,
-        priceChangeAmount,
         clientReferenceId: clientRef,
-        raw: data,
+        raw: stripHotelCost(data),
       });
 
       const tboBookingId = Number(result?.BookingId);
@@ -1829,12 +1833,7 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
     // mark the pre-persist record FAILED, and surface RSP_FLOOR_VIOLATED so the frontend
     // can trigger a refund flow if Razorpay already charged.
     {
-      const _chargedAmount = Number(
-        req.body?.customerChargedAmount ??
-        req.body?.displayAmount ??
-        req.body?.totalAmount ??
-        0,
-      );
+      const _chargedAmount = serverChargedAmount;
       if (
         bookingRecommendedSellingRate != null &&
         _chargedAmount > 0 &&
@@ -1867,7 +1866,6 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
           message:
             "Booking blocked: selling price is below the supplier's " +
             "recommended minimum. Refund will be processed.",
-          details: { rsp: bookingRecommendedSellingRate, chargedAmount: _chargedAmount },
         });
       }
     }
@@ -2035,6 +2033,7 @@ router.post("/book", requireSBT, requireHotelAccess, ...sbtBookerGuards, payment
           sbtLogger.info("Book IsPriceChanged=true — retrying with new NetAmount", {
             original: NetAmount, updated: newNetAmount, userId: req.user?.id,
           });
+          bookedNetAmount = newNetAmount;
           const retryPayload = { ...tboPayload, NetAmount: newNetAmount };
           try {
             const retryController = new AbortController();
@@ -2232,8 +2231,7 @@ function extractVoucherSummary(voucherData: any) {
     checkOut: gvr.HotelDetails?.CheckOutDate ?? null,
     guestName: gvr.HotelDetails?.GuestName ?? null,
     roomType: gvr.HotelDetails?.RoomTypeName ?? null,
-    totalFare: gvr.HotelDetails?.TotalFare ?? null,
-    netAmount: gvr.HotelDetails?.NetAmount ?? null,
+    // No TotalFare / NetAmount: the supplier figures are our cost, not the customer price.
   };
 }
 
@@ -2253,7 +2251,7 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
       return res.json({
         ok: true,
         voucherStatus: booking.voucherStatus || "GENERATED",
-        voucherData: booking.tboVoucherData ?? null,
+        voucherData: stripHotelCost(booking.tboVoucherData ?? null),
         deduplicated: true,
       });
     }
@@ -2262,7 +2260,7 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
       return res.json({
         ok: true,
         voucherStatus: booking.voucherStatus,
-        voucherData: booking.tboVoucherData,
+        voucherData: stripHotelCost(booking.tboVoucherData),
         voucherSummary: extractVoucherSummary(booking.tboVoucherData),
       });
     }
@@ -2279,7 +2277,7 @@ router.get("/voucher/:bookingId", requireAuth, async (req: any, res: any) => {
       voucherStatus: status,
     }).catch(() => {});
 
-    res.json({ ok: true, voucherStatus: status, voucherData: voucherRes, voucherSummary: extractVoucherSummary(voucherRes) });
+    res.json({ ok: true, voucherStatus: status, voucherData: stripHotelCost(voucherRes), voucherSummary: extractVoucherSummary(voucherRes) });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Voucher retrieval failed";
     res.status(500).json({ error: msg });
@@ -2307,7 +2305,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
       return res.json({
         ok: true,
         voucherStatus: booking.voucherStatus || "GENERATED",
-        voucherData: booking.tboVoucherData ?? null,
+        voucherData: stripHotelCost(booking.tboVoucherData ?? null),
         deduplicated: true,
       });
     }
@@ -2391,7 +2389,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
       });
       return res.status(402).json({
         requiresPayment: true,
-        amount: booking.netAmount ?? booking.totalFare ?? 0,
+        amount: booking.totalFare ?? 0,
         bookingId: booking._id,
         message: "Agency wallet balance insufficient to confirm this booking",
         code: "PAYMENT_REQUIRED",
@@ -2449,8 +2447,8 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
             ok: true,
             voucherStatus: "GENERATED",
             reconciled: true,
-            voucherData: voucherRes,
-            bookingDetail: detail,
+            voucherData: stripHotelCost(voucherRes),
+            bookingDetail: stripHotelCost(detail),
           });
         }
         // Detail says the voucher is NOT confirmed — surface as failure but do not corrupt state.
@@ -2461,8 +2459,8 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
         });
         return res.status(502).json({
           error: "Voucher state could not be reconciled — please retry or contact support",
-          voucherData: voucherRes,
-          bookingDetail: detail,
+          voucherData: stripHotelCost(voucherRes),
+          bookingDetail: stripHotelCost(detail),
         });
       } catch (reconcileErr: any) {
         sbtLogger.error("GetBookingDetail reconciliation failed", {
@@ -2471,7 +2469,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
         });
         return res.status(502).json({
           error: "Voucher reconciliation failed — please retry",
-          voucherData: voucherRes,
+          voucherData: stripHotelCost(voucherRes),
         });
       }
     }
@@ -2554,7 +2552,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
       return res.json({
         ok: true,
         voucherStatus: classified.derivedOnSuccess.voucherStatus,
-        voucherData: voucherRes,
+        voucherData: stripHotelCost(voucherRes),
       });
     }
 
@@ -2564,7 +2562,7 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
     await SBTHotelBooking.findByIdAndUpdate(booking._id, {
       $set: { voucherStatus: "FAILED", tboVoucherData: voucherRes },
     });
-    return res.status(502).json({ error: errMsg, voucherData: voucherRes });
+    return res.status(502).json({ error: errMsg, voucherData: stripHotelCost(voucherRes) });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Voucher generation failed";
     res.status(500).json({ error: msg });
@@ -2593,7 +2591,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
         existing.hotelName = b.hotelName || existing.hotelName;
         existing.roomName = b.roomName || existing.roomName;
         await existing.save();
-        return res.json({ ok: true, booking: existing, webhookRecovered: true });
+        return res.json({ ok: true, booking: customerHotelBooking(existing), webhookRecovered: true });
       }
     }
 
@@ -2646,9 +2644,9 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
       roomName: b.roomName || "",
       mealType: b.mealType || "",
       totalFare: payFacts ? payFacts.amount : b.isHeld ? heldServerTotal : b.totalFare,
-      netAmount: b.netAmount || b.totalFare || 0,
-      recommendedSellingRate:
-        typeof b.recommendedSellingRate === "number" ? b.recommendedSellingRate : null,
+      // netAmount / recommendedSellingRate / agentCommission / tds / isPublishedFare,
+      // the price change at Book and the supplier's raw Book response were written
+      // by /book from the server quote — never taken from this body.
       cancellationPolicyText:
         typeof b.cancellationPolicyText === "string" ? b.cancellationPolicyText : null,
       currency: b.currency || "INR",
@@ -2665,17 +2663,11 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
       lastVoucherDate: parseTBODate(b.lastVoucherDate) ?? undefined,
       lastCancellationDate: parseTBODate(b.lastCancellationDate),
       paymentMode: payFacts?.paymentMode ?? (b.isHeld ? "personal" : b.paymentMode === "official" ? "official" : "personal"),
-      raw: b.raw ?? null,
       inclusion: typeof b.inclusion === "string" ? b.inclusion : "",
       rateConditions: Array.isArray(b.rateConditions) ? b.rateConditions.map(String) : [],
       amenities: Array.isArray(b.amenities) ? b.amenities.map(String) : [],
       supplements: Array.isArray(b.supplements) ? b.supplements : [],
-      priceChangedDuringBook: b.priceChangedDuringBook === true,
-      priceChangeAmount: typeof b.priceChangeAmount === "number" ? b.priceChangeAmount : 0,
-      isPublishedFare: b.isPublishedFare === true,
-      tds: typeof b.tds === "number" ? b.tds : 0,
       ...(b.rebookFromBookingId ? { rebookFromBookingId: String(b.rebookFromBookingId) } : {}),
-      agentCommission: typeof b.agentCommission === "number" ? b.agentCommission : 0,
       bookedAt: new Date(),
     };
 
@@ -2686,15 +2678,22 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
     const b_cref = typeof b.clientReferenceId === "string" ? b.clientReferenceId : "";
     // Only the caller's own bookings, in this workspace, can be filled in or updated.
     const ownScope = { userId, workspaceId: req.workspaceObjectId };
+    // The supplier's real cancellation tiers (amounts included) were stamped by
+    // /book from the quote; the browser only has the amount-free copy.
+    const withServerPolicies = (existing: any) => {
+      const data: Record<string, unknown> = { ..._bookingData };
+      if (Array.isArray(existing?.cancelPolicies) && existing.cancelPolicies.length) delete data.cancelPolicies;
+      return data;
+    };
     if (b_cref) {
       const prePersist = await SBTHotelBooking.findOne({ clientReferenceId: b_cref, ...ownScope });
       if (prePersist) {
         if (prePersist.hotelName) {
           // Already fully saved — idempotent return (e.g. double submit, webhook race).
-          return res.json({ ok: true, booking: prePersist.toJSON(), idempotent: true });
+          return res.json({ ok: true, booking: customerHotelBooking(prePersist), idempotent: true });
         }
         // Pre-persist skeleton — update with full booking data and save (triggers post-save hook).
-        prePersist.set(_bookingData);
+        prePersist.set(withServerPolicies(prePersist));
         doc = await prePersist.save();
       }
     }
@@ -2706,15 +2705,18 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
       const hasRealBookingId = !!_bookingData.bookingId && String(_bookingData.bookingId) !== "0";
       try {
         if (hasRealBookingId) {
+          const existingById = await SBTHotelBooking.findOne({ bookingId: String(_bookingData.bookingId), ...ownScope })
+            .select("cancelPolicies").lean();
           doc = await SBTHotelBooking.findOneAndUpdate(
             { bookingId: String(_bookingData.bookingId), ...ownScope },
-            { $set: { ...(b_cref ? { clientReferenceId: b_cref } : {}), ..._bookingData } },
+            { $set: { ...(b_cref ? { clientReferenceId: b_cref } : {}), ...withServerPolicies(existingById) } },
             { upsert: true, new: true, setDefaultsOnInsert: true },
           );
         } else {
           doc = await SBTHotelBooking.create({
             ...(b_cref ? { clientReferenceId: b_cref } : {}),
             ..._bookingData,
+            raw: stripHotelCost(b.raw ?? null),
           });
         }
       } catch (dupErr: any) {
@@ -2757,7 +2759,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
       }
     }
 
-    res.json({ ok: true, booking: doc });
+    res.json({ ok: true, booking: customerHotelBooking(doc) });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Failed to save hotel booking";
     res.status(500).json({ error: msg });
@@ -3410,11 +3412,10 @@ router.get("/bookings/:id/voucher-summary", requireAuth, async (req: any, res: a
         roomName: booking.roomName,
         mealType: booking.mealType,
         totalFare: booking.totalFare,
-        netAmount: booking.netAmount,
         displayAmount: booking.displayAmount,
         currency: booking.currency,
         isRefundable: booking.isRefundable,
-        cancelPolicies: booking.cancelPolicies,
+        cancelPolicies: policiesWithoutAmounts(booking.cancelPolicies, Number(booking.netAmount) || Number(booking.totalFare) || 0),
         status: booking.status,
         paymentStatus: booking.paymentStatus,
         confirmationNo: booking.confirmationNo,
@@ -3423,7 +3424,7 @@ router.get("/bookings/:id/voucher-summary", requireAuth, async (req: any, res: a
         isVouchered: booking.isVouchered,
         voucherStatus: booking.voucherStatus,
         bookedAt: booking.bookedAt,
-        bookingDetailRaw: booking.bookingDetailRaw ?? null,
+        bookingDetailRaw: stripHotelCost(booking.bookingDetailRaw ?? null),
         // Reconciliation gate (see voucher-premature-display audit 2026-05-13).
         statusCheckDone: !!(booking as any).statusCheckDone,
         bookingDetailFetched: !!(booking as any).bookingDetailFetched,
@@ -3681,29 +3682,10 @@ router.post("/rooms", requireAuth, requireSBT, requireHotelAccess, async (req: a
       if (r?.BookingCode) bookingCodeTimestamps.set(r.BookingCode, roomsTs);
     }
 
-    // Margin (RSP-floor aware) — mirrors tbo.hotel.search.service.ts:334-360.
-    // /rooms is the concierge-handoff path (skips SBT /search), so without
-    // this it leaks the raw TBO rate. match.Rooms is raw TBO (no
-    // normalizeRoom), hence PascalCase RecommendedSellingRate.
-    const roomMargins = await getMarginConfig();
-    const isRoomsDomestic = (countryCode || "IN") === "IN";
-    const roomsMarginPct = roomMargins.enabled
-      ? (isRoomsDomestic ? roomMargins.hotel.domestic : roomMargins.hotel.international)
-      : 0;
-    const roomsWithMargin = (match.Rooms as any[]).map((room: any) => {
-      const net = room.TotalFare ?? 0;
-      const _rsp =
-        typeof room.RecommendedSellingRate === "number"
-          ? room.RecommendedSellingRate
-          : null;
-      // Customer-facing: selling price only (see tbo.hotel.search.service).
-      return {
-        ...room,
-        _displayTotalFare: applyMarginWithFloor(net, roomsMarginPct, _rsp),
-      };
-    });
-
-    res.json({ ok: true, rooms: roomsWithMargin });
+    // Margin (RSP-floor aware), same as /search. /rooms is the concierge-handoff
+    // path (skips SBT /search): rooms from the same allow-list, selling only.
+    const roomsMarginPct = await hotelMarginPct(countryCode || "IN");
+    res.json({ ok: true, rooms: (match.Rooms as any[]).map((room: any) => customerRoom(room, roomsMarginPct)) });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Room fetch failed";
     sbtLogger.error("Hotel rooms fetch failed", { error: msg });

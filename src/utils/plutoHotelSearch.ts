@@ -52,7 +52,6 @@ export interface HotelListing {
   Longitude: number | null;
   Rooms: Array<{
     RoomTypeName: string;
-    TotalFare: number;
     _displayTotalFare: number;
     isRefundable: boolean | null;
   }>;
@@ -373,7 +372,7 @@ export function mapHotelForChat(h: any, nights: number): HotelListing {
       ? [
           {
             RoomTypeName: String(cheapest.RoomTypeName ?? ""),
-            TotalFare: Number(cheapest.TotalFare ?? 0) || 0,
+            // Selling total only — TBO's TotalFare is our net and never sent.
             _displayTotalFare: Number(total ?? 0) || 0,
             isRefundable:
               typeof cheapest.isRefundable === "boolean" ? cheapest.isRefundable : null,

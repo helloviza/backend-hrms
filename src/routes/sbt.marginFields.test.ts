@@ -3,10 +3,8 @@
 // _rsp, _rspClamped). Margin is forced ON here — outside production
 // getMarginConfig always returns disabled, which would hide the leak.
 //
-// What this does NOT cover, on purpose: flight _netPublishedFare/_netOfferedFare
-// and hotel TotalFare/NetAmount are still returned, because the live Book/Ticket
-// path sends them back to TBO as the net fare (SBTReview.tsx:307-308,
-// SBTHotelReview.tsx:241/446). Removing them needs a server-side net lookup.
+// The net fields themselves (flight _net*, commission, TDS; hotel NetAmount,
+// TotalFare, DayRates, RSP) are covered by sbt.netFare.test.ts.
 //
 // NO DATABASE, NO TBO — services, models, auth and fetch are mocked.
 import { describe, it, expect, vi, afterEach } from "vitest";
@@ -128,8 +126,10 @@ describe("SBT flights — no margin fields, selling price kept", () => {
     expect(res.status).toBe(200);
     expect(strippedKeyPaths(res.body)).toEqual([]);
     const fare = res.body.Response.Results[0][0].Fare;
-    expect(fare.OfferedFare).toBe(5170); // 4700 + 10% — the selling price
-    expect(fare.PublishedFare).toBe(5390);
+    // OfferedFare is TBO's net-of-commission figure: it now carries the selling
+    // total too, so neither field reveals our cost.
+    expect(fare.PublishedFare).toBe(5390); // 4900 + 10%
+    expect(fare.OfferedFare).toBe(5390);
   });
 
   it("POST /farequote", async () => {
@@ -138,7 +138,7 @@ describe("SBT flights — no margin fields, selling price kept", () => {
       .send({ TraceId: "T1", ResultIndex: "OB1", originCountry: "IN", destCountry: "IN" });
     expect(res.status).toBe(200);
     expect(strippedKeyPaths(res.body)).toEqual([]);
-    expect(res.body.Response.Results.Fare.OfferedFare).toBe(5170);
+    expect(res.body.Response.Results.Fare.OfferedFare).toBe(5390);
   });
 });
 

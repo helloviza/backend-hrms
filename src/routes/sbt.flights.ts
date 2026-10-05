@@ -71,6 +71,17 @@ import {
 } from "../services/sbtPaymentGate.js";
 import { createRazorpayOrder, razorpayConfigured, razorpayKeyId } from "../services/sbtRazorpay.js";
 import {
+  sellingFlightResults,
+  stripFlightBookingFares,
+  flightMarginPct,
+  countryOfAirport,
+  loadFlightNet,
+  applyQuoteFares,
+  keepSupplierResponse,
+  supplierResponseFor,
+  customerFlightBooking,
+} from "../services/sbtQuote.js";
+import {
   registerFulfilHandlers,
   createCheckoutHandler,
   payCheckoutHandler,
@@ -88,6 +99,16 @@ const FARE_CHANGED_BODY = {
   code: "FARE_CHANGED",
   error: "The fare changed before your ticket could be issued. Please search again for the latest fare.",
 };
+
+/** A successful Book / Ticket answer: the full supplier response is kept on the
+ *  payment row (bookings/save reads TBO's fare from there); the customer gets
+ *  it without fares, commission or TDS (services/sbtQuote.ts). */
+async function sendBookingResponse(req: any, res: any, body: any) {
+  const r = body?.Response?.Response ?? body?.Response ?? body;
+  const bookingId = r?.BookingId ?? r?.FlightItinerary?.BookingId ?? body?.BookingId;
+  await keepSupplierResponse(req, bookingId, body);
+  return res.json(stripFlightBookingFares(body));
+}
 
 /* ── Duplicate booking prevention (24-hour window) ─────────────────────── */
 async function checkDuplicateBooking(params: {
@@ -516,7 +537,17 @@ router.post("/search-multi-city", requireSBT, requireFlightAccess, async (req: a
     // a booking on them is recognised without trusting the browser.
     await rememberMultiCityTraces(legResults.map((r) => r.traceId));
 
-    res.json({ legs: legResults });
+    // Selling prices only (services/sbtQuote.ts), with the margin each leg's
+    // FareQuote will charge.
+    const mcLegs = await Promise.all(legResults.map(async (r, i) => {
+      const leg = legs[i] || {};
+      const pct = await flightMarginPct(
+        req.body?.originCountry ?? countryOfAirport(leg.Origin ?? leg.origin),
+        req.body?.destCountry ?? countryOfAirport(leg.Destination ?? leg.destination),
+      );
+      return { ...r, results: sellingFlightResults(r.results, pct) };
+    }));
+    res.json({ legs: mcLegs });
   } catch (err: any) {
     sbtLogger.error("Multi-city parallel search failed", { userId: req.user?.id, error: err.message });
     res.status(500).json({ error: err.message });
@@ -611,7 +642,7 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
           tboStatus: mcStatus,
         });
       }
-      return res.json(result);
+      return res.json(sellingFlightResults(result, await flightMarginPct(req.body?.originCountry, req.body?.destCountry)));
     }
     const jt = Number(JourneyType) || 1;
     // JT=4 (AdvanceSearch): don't force Sources — let TBO return all results,
@@ -642,7 +673,7 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
       const hasResults = Array.isArray(result?.Response?.Results) && result.Response.Results.length > 0;
       if (hasResults) {
         sbtLogger.warn("TBO search returned results with non-success status", { tboStatus });
-        return res.json(result);
+        return res.json(sellingFlightResults(result, await flightMarginPct(req.body?.originCountry, req.body?.destCountry)));
       }
       const errMsg = result?.Response?.Error?.ErrorMessage || "Unknown error";
       const errCode = result?.Response?.Error?.ErrorCode ?? "unknown";
@@ -657,49 +688,11 @@ router.post("/search", requireSBT, requireFlightAccess, async (req: any, res: an
       });
     }
 
-    // Apply margin to flight fares (server-side only)
-    const flightMargins = await getMarginConfig();
-    if (flightMargins.enabled) {
-      const originCountry = (req.body as any).originCountry;
-      const destCountry = (req.body as any).destCountry;
-      const isFlightDomestic = isDomestic(originCountry, destCountry);
-      const marginPct = isFlightDomestic
-        ? flightMargins.flight.domestic
-        : flightMargins.flight.international;
-
-      if (marginPct > 0 && result?.Response?.Results) {
-        const applyToFlightArray = (arr: any[]): any[] =>
-          arr.map((flight: any) => {
-            const fare = flight?.Fare;
-            if (!fare) return flight;
-            const netPublished = fare.PublishedFare ?? 0;
-            const netOffered = fare.OfferedFare ?? 0;
-            return {
-              ...flight,
-              Fare: {
-                ...fare,
-                _netPublishedFare: netPublished,
-                _netOfferedFare: netOffered,
-                PublishedFare: applyMargin(netPublished, marginPct),
-                OfferedFare: applyMargin(netOffered, marginPct),
-                // No _marginPercent/_marginAmount: the customer sees this
-                // response. _net* stay — SBTReview sends them as the TBO
-                // Book/Ticket net fare.
-              },
-            };
-          });
-
-        const raw = result.Response.Results;
-        if (Array.isArray(raw[0])) {
-          // Round-trip: [[outbound], [inbound]]
-          result.Response.Results = raw.map((leg: any[]) => applyToFlightArray(leg));
-        } else {
-          result.Response.Results = applyToFlightArray(raw);
-        }
-      }
-    }
-
-    res.json(result);
+    // Customer-facing: selling price only — no net, commission or margin fields
+    // (services/sbtQuote.ts). The net is read again by /farequote and stored.
+    const marginPct = await flightMarginPct((req.body as any).originCountry, (req.body as any).destCountry);
+    res.json(sellingFlightResults(result, marginPct));
+    return;
   } catch (err: any) {
     sbtLogger.error("Flight search failed", { userId: req.user?.id, error: err.message });
     res.status(500).json({ error: err.message });
@@ -784,52 +777,20 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
       });
     }
     const result = await getFareQuote(req.body) as any;
-
-    // Apply margin at the authoritative FareQuote point (server-side only) so
-    // display/charge/store inherit it. Mirrors the search transform
-    // (sbt.flights.ts ~line 614). The marked-up PublishedFare/OfferedFare are
-    // for DISPLAY + customer charge; _netPublishedFare/_netOfferedFare preserve
-    // the TBO-raw net so the Book/Ticket payload sends net (never the markup) —
-    // TBO rejects on price mismatch (IsPriceChangeAccepted:false).
-    const fqMargins = await getMarginConfig();
-    if (fqMargins.enabled) {
-      const originCountry = (req.body as any).originCountry;
-      const destCountry = (req.body as any).destCountry;
-      const isFlightDomestic = isDomestic(originCountry, destCountry);
-      const marginPct = isFlightDomestic
-        ? fqMargins.flight.domestic
-        : fqMargins.flight.international;
-
-      const fqFare = result?.Response?.Results?.Fare;
-      if (marginPct > 0 && fqFare) {
-        const netPublished = fqFare.PublishedFare ?? 0;
-        const netOffered = fqFare.OfferedFare ?? 0;
-        result.Response.Results.Fare = {
-          ...fqFare,
-          _netPublishedFare: netPublished,
-          _netOfferedFare: netOffered,
-          PublishedFare: applyMargin(netPublished, marginPct),
-          OfferedFare: applyMargin(netOffered, marginPct),
-          // No _marginPercent/_marginAmount (customer-facing); see /search.
-        };
-      }
-    }
-
     const fareResults = result?.Response?.Results;
-    const corporateBookingAllowed =
-      fareResults?.CorporateBookingAllowed || false;
+    const corporateBookingAllowed = fareResults?.CorporateBookingAllowed || false;
 
-    // Price-recon step 1: persist the server-quoted fares unconditionally so a
-    // later step can compare what the client sends at create-order/book against
-    // what the server actually quoted. Additive — does not alter the response
-    // shape below beyond the additive quoteId field. When margin is off/zero the
-    // raw OfferedFare is also the customer-facing total, so net == display.
-    const fqQuoteFare = fareResults?.Fare;
+    // The margin is applied here, at the authoritative quote: the customer gets
+    // the selling price only (services/sbtQuote.ts sellingFlight); TBO's own
+    // Fare + FareBreakdown — what Book / Ticket must send — stay on the SBTQuote
+    // and are read back by the server at booking time, never from the browser.
+    const marginPct = await flightMarginPct((req.body as any).originCountry, (req.body as any).destCountry);
+    const rawFare = fareResults?.Fare;
     let fqQuoteId: string | undefined;
-    if (fqQuoteFare) {
+    if (rawFare) {
       fqQuoteId = randomUUID();
-      const fqDisplayFare = fqQuoteFare.OfferedFare ?? 0;
-      const fqNetFare = fqQuoteFare._netOfferedFare ?? fqDisplayFare;
+      const netPublished = Number(rawFare.PublishedFare) || 0;
+      const netOffered = Number(rawFare.OfferedFare ?? rawFare.PublishedFare) || 0;
       const fqSourceRef = `${req.body?.TraceId ?? ""}:${req.body?.ResultIndex ?? ""}`;
       try {
         const fqScope = callerScope(req);
@@ -839,34 +800,36 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
         await SBTQuote.create({
           quoteId: fqQuoteId,
           product: "FLIGHT",
-          serverDisplayFare: fqDisplayFare,
-          serverNetFare: fqNetFare,
+          serverDisplayFare: marginPct > 0 ? applyMargin(netOffered, marginPct) : netOffered,
+          serverNetFare: netOffered,
           sourceRef: fqSourceRef,
           workspaceId: fqScope.workspaceId,
           userId: fqScope.userId,
           traceIds: [req.body?.TraceId, result?.Response?.TraceId].filter(Boolean).map(String),
           resultIndexes: [req.body?.ResultIndex, fareResults?.ResultIndex].filter(Boolean).map(String),
           // What the customer is charged for this leg (margined PublishedFare).
-          sellingFare: Number(fqQuoteFare.PublishedFare) || 0,
+          sellingFare: marginPct > 0 ? applyMargin(netPublished, marginPct) : netPublished,
           isMultiCity: fqIsMultiCity,
           supplierReissueCharges:
-            Number(fqQuoteFare.SupplierReissueCharges || fareResults?.FareBreakdown?.[0]?.SupplierReissueCharges) || 0,
+            Number(rawFare.SupplierReissueCharges || fareResults?.FareBreakdown?.[0]?.SupplierReissueCharges) || 0,
+          netFare: rawFare,
+          netFareBreakdown: Array.isArray(fareResults?.FareBreakdown) ? fareResults.FareBreakdown : [],
         });
-        // Carried to the payment page inside the Results the frontend keeps.
-        fareResults.quoteId = fqQuoteId;
       } catch (qErr: any) {
-        // Quote persistence is best-effort scaffolding; never block FareQuote.
-        sbtLogger.error("[price-recon] quote persist failed", {
-          product: "FLIGHT",
+        // Booking needs this quote (the net lives only here): no quote, no fare.
+        sbtLogger.error("[sbt-quote] flight quote not stored — FareQuote refused", {
           sourceRef: fqSourceRef,
           err: qErr?.message,
         });
-        fqQuoteId = undefined;
+        return res.status(503).json({ error: "Could not confirm this fare. Please try again.", code: "QUOTE_UNAVAILABLE" });
       }
     }
 
+    const customer = sellingFlightResults(result, marginPct);
+    // Carried to the payment page inside the Results the frontend keeps.
+    if (fqQuoteId && customer?.Response?.Results) customer.Response.Results.quoteId = fqQuoteId;
     res.json({
-      ...result,
+      ...customer,
       isPriceChanged: fareResults?.IsPriceChanged || false,
       isTimeChanged: fareResults?.IsTimeChanged || false,
       flightDetailChangeInfo: fareResults?.FlightDetailChangeInfo || null,
@@ -892,7 +855,7 @@ router.post("/price-rbd", requireAuth, requireSBT, async (req: any, res: any) =>
       request: req.body,
       response: result,
     });
-    res.json(result);
+    res.json(sellingFlightResults(result, await flightMarginPct(req.body?.originCountry, req.body?.destCountry)));
   } catch (err: any) {
     sbtLogger.error("[PRICE-RBD] error", { error: err.message });
     res.status(500).json({ error: err.message });
@@ -981,22 +944,13 @@ router.post("/book", requireSBT, requireFlightAccess, ...sbtBookerGuards, requir
     }
     const bookIsCorporate = req.body.corporateBookingAllowed === true && !!bookCorporatePAN;
 
-    // Price-recon step 2: SHADOW the net we're about to send TBO against the
-    // server's stored FareQuote. Each pax Fare carries the itinerary-level net
-    // (buildPerPaxFareMap, not divided), so the lead pax OfferedFare == serverNetFare.
-    // Log-only; never blocks. The charged display total is not available here — its
-    // check lives in /bookings/save (totalFare, incl. ancillaries).
-    {
-      const reconFare = bookPassengers?.[0]?.Fare;
-      const reconNet = Number(reconFare?.OfferedFare ?? reconFare?.PublishedFare);
-      await reconcileQuoteShadow({
-        product: "FLIGHT",
-        sourceRef: `${req.body?.TraceId ?? ""}:${req.body?.ResultIndex ?? ""}`,
-        tboNet: Number.isFinite(reconNet) && reconNet > 0 ? reconNet : undefined,
-      });
-    }
+    // The TBO net fare comes from the server's FareQuote (services/sbtQuote.ts),
+    // never from the browser: any client Passengers[].Fare is replaced.
+    const bookNet = await loadFlightNet(req, { resultIndex: req.body?.ResultIndex });
+    if (isRefusal(bookNet)) return res.status(bookNet.status).json({ error: bookNet.error, code: bookNet.code });
+    const bookNetPassengers = applyQuoteFares(bookPassengers, bookNet.ob);
 
-    const data = await bookFlight({ ...req.body, isNDC: bookIsNDC, airlineCode: bookAirlineCode, destinationCode: req.body?.destinationCode, isCorporate: bookIsCorporate, corporatePAN: bookCorporatePAN }) as any;
+    const data = await bookFlight({ ...req.body, Passengers: bookNetPassengers, isNDC: bookIsNDC, airlineCode: bookAirlineCode, destinationCode: req.body?.destinationCode, isCorporate: bookIsCorporate, corporatePAN: bookCorporatePAN }) as any;
 
     // Check for TBO-level failure
     const responseStatus = data?.Response?.ResponseStatus;
@@ -1037,7 +991,7 @@ router.post("/book", requireSBT, requireFlightAccess, ...sbtBookerGuards, requir
       isPriceRBD: req.body?.isPriceRBD === true || req.body?.isAdvanceSearch === true,
     });
 
-    res.json({
+    const bookBody = {
       ...(data as object),
       // Surface extracted fields at top level for easy frontend access
       PNR: pnr,
@@ -1045,14 +999,17 @@ router.post("/book", requireSBT, requireFlightAccess, ...sbtBookerGuards, requir
       BookedPassengers: bookedPassengers,
       caseLabel: bookCaseLabel,
       isPriceChanged: bookIsPriceChanged,
-    });
+    };
+    await keepSupplierResponse(req, bookingId, bookBody);
+    // Customer copy: no TBO Fare / FareBreakdown / commission (selling total is ours).
+    res.json(stripFlightBookingFares(bookBody));
   } catch (err: any) {
     // Timeout recovery: poll GetBookingDetails to check if TBO processed it
     if (isTBOTimeoutError(err)) {
       sbtLogger.warn("TBO Book timeout — starting polling recovery", { traceId: req.body?.TraceId });
       const pollResult = await pollBookingOnTimeout(req.body?.lastKnownBookingId, req.body?.TraceId);
       if (pollResult.found) {
-        return res.json({ ...pollResult.data, recoveredFromTimeout: true });
+        return sendBookingResponse(req, res, { ...pollResult.data, recoveredFromTimeout: true });
       }
       return res.status(504).json({
         status: "timeout_unconfirmed",
@@ -1082,7 +1039,7 @@ router.post("/ticket", requireAuth, requireSBT, requireFlightAccess, ...sbtBooke
       BookingId: Number(req.body?.BookingId),
       acceptPriceChange: false,
     }) as any;
-    if (result?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: result?.Response ?? null });
+    if (result?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: stripFlightBookingFares(result?.Response ?? null) });
 
     // TBO certification: call GetBookingDetails after successful Ticket
     const ticketStatus = result?.Response?.ResponseStatus;
@@ -1109,16 +1066,16 @@ router.post("/ticket", requireAuth, requireSBT, requireFlightAccess, ...sbtBooke
       } finally {
         consolidateCertificationLogs(traceId, bookingId, pnr, gdsCaseLabel).catch(() => {});
       }
-      return res.json({ ...result, BookingDetails: bookingDetails });
+      return sendBookingResponse(req, res, { ...result, BookingDetails: bookingDetails });
     }
 
-    res.json(result);
+    res.json(stripFlightBookingFares(result));
   } catch (err: any) {
     if (isTBOTimeoutError(err)) {
       sbtLogger.warn("TBO Ticket timeout — starting polling recovery", { bookingId: req.body?.BookingId });
       const pollResult = await pollBookingOnTimeout(req.body?.BookingId?.toString(), req.body?.TraceId);
       if (pollResult.found) {
-        return res.json({ ...pollResult.data, recoveredFromTimeout: true });
+        return sendBookingResponse(req, res, { ...pollResult.data, recoveredFromTimeout: true });
       }
       return res.status(504).json({
         status: "timeout_unconfirmed",
@@ -1136,7 +1093,7 @@ router.post("/ticket", requireAuth, requireSBT, requireFlightAccess, ...sbtBooke
 router.get("/booking/:id", requireAuth, requireSBT, async (req: any, res: any) => {
   try {
     const result = await getBookingDetails({ bookingId: req.params.id });
-    res.json(result);
+    res.json(stripFlightBookingFares(result));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1178,6 +1135,20 @@ router.post("/ssr", requireSBT, async (req: any, res: any) => {
 router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtBookerGuards, requireSBTStaffDirect, paymentGate("flight-ticket-lcc"), async (req: any, res: any) => {
   try {
     if (await maybeRouteToDemoSimulator(req, res, "flight-ticket-lcc")) return;
+
+    // Every passenger's TBO net Fare comes from the server's FareQuote of its leg
+    // (services/sbtQuote.ts) — any client Fare is replaced before anything reads it.
+    {
+      const b = req.body || {};
+      const splitReturn = b.isReturn && !b.isSpecialReturn && b.returnResultIndex;
+      const net = await loadFlightNet(req, {
+        resultIndex: b.ResultIndex,
+        returnResultIndex: splitReturn ? b.returnResultIndex : undefined,
+      });
+      if (isRefusal(net)) return res.status(net.status).json({ error: net.error, code: net.code });
+      b.Passengers = applyQuoteFares(b.Passengers, net.ob);
+      if (splitReturn && net.ib) b.returnPassengers = applyQuoteFares(b.returnPassengers, net.ib);
+    }
     const { isReturn, returnResultIndex, returnTraceId, returnPassengers, isSpecialReturn, isReturnGDS } = req.body;
 
     // NDC detection for ticket-lcc — primary signal is req.body.isNDC,
@@ -1324,7 +1295,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
         ...corpParams,
       }) as any;
-      if (result?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: result?.Response ?? null });
+      if (result?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: stripFlightBookingFares(result?.Response ?? null) });
 
       const ticketStatus = result?.Response?.ResponseStatus;
       const traceId = result?.Response?.TraceId || req.body?.TraceId;
@@ -1350,9 +1321,9 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         } finally {
           consolidateCertificationLogs(traceId, bookingId, pnr, lccCaseLabel).catch(() => {});
         }
-        return res.json({ ...result, isSpecialReturn: true, BookingDetails: bookingDetails });
+        return sendBookingResponse(req, res, { ...result, isSpecialReturn: true, BookingDetails: bookingDetails });
       }
-      return res.json({ ...result, isSpecialReturn: true });
+      return res.json(stripFlightBookingFares({ ...result, isSpecialReturn: true }));
     }
 
     // ── Return LCC: two separate ticketLCC calls (OB + IB) ──
@@ -1411,7 +1382,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         }
       }
 
-      if (obResult?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: obResult?.Response ?? null });
+      if (obResult?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: stripFlightBookingFares(obResult?.Response ?? null) });
       const obStatus = obResult?.Response?.ResponseStatus;
       const obBookingId = obResult?.Response?.Response?.BookingId
         ?? obResult?.Response?.Response?.FlightItinerary?.BookingId;
@@ -1422,7 +1393,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         const obError = obResult?.Response?.Error?.ErrorMessage
           ?? obResult?.Response?.Response?.Error?.ErrorMessage ?? "OB ticketing failed";
         sbtLogger.error('[TICKET-LCC] OB leg failed', { error: obError });
-        return res.json(obResult);
+        return res.json(stripFlightBookingFares(obResult));
       }
       sbtLogger.info('[TICKET-LCC] OB leg success');
 
@@ -1457,7 +1428,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
             ?? ibBookResult?.Response?.Response?.Error?.ErrorMessage ?? "IB GDS Book failed";
           sbtLogger.error('[TICKET-LCC] IB GDS Book failed', { error: ibBookError });
           // OB succeeded but IB Book failed — return OB result with IB error
-          return res.json({
+          return sendBookingResponse(req, res, {
             ...obResult,
             isReturn: true,
             returnPnr: "",
@@ -1587,8 +1558,8 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         { traceId: ibTraceId, bookingId: ibBookingId, pnr: ibPNR },
       ).catch(() => {});
 
-      // Return combined response
-      return res.json({
+      // Return combined response (kept under the OB BookingId; IB is inside)
+      return sendBookingResponse(req, res, {
         ...obResult,
         isReturn: true,
         returnPnr: ibPNR,
@@ -1664,7 +1635,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
       }
     }
 
-    if (result?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: result?.Response ?? null });
+    if (result?._priceChanged) return res.status(409).json({ ...FARE_CHANGED_BODY, tboResponse: stripFlightBookingFares(result?.Response ?? null) });
 
     // TBO certification: call GetBookingDetails after successful LCC Ticket
     const ticketStatus = result?.Response?.ResponseStatus;
@@ -1690,16 +1661,16 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
       } finally {
         consolidateCertificationLogs(traceId, bookingId, pnr, lccCaseLabel).catch(() => {});
       }
-      return res.json({ ...result, BookingDetails: bookingDetails, ssrStripped: onewaySsrStripped });
+      return sendBookingResponse(req, res, { ...result, BookingDetails: bookingDetails, ssrStripped: onewaySsrStripped });
     }
 
-    res.json(result);
+    res.json(stripFlightBookingFares(result));
   } catch (err: any) {
     if (isTBOTimeoutError(err)) {
       sbtLogger.warn("TBO TicketLCC timeout — starting polling recovery", { traceId: req.body?.TraceId });
       const pollResult = await pollBookingOnTimeout(req.body?.lastKnownBookingId, req.body?.TraceId);
       if (pollResult.found) {
-        return res.json({ ...pollResult.data, recoveredFromTimeout: true });
+        return sendBookingResponse(req, res, { ...pollResult.data, recoveredFromTimeout: true });
       }
       return res.status(504).json({
         status: "timeout_unconfirmed",
@@ -1719,7 +1690,7 @@ router.post("/release", requireAuth, requireSBT, async (req: any, res: any) => {
     if (await maybeRouteToDemoSimulator(req, res, "flight-release")) return;
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const result = await releasePNR(body);
-    res.json(result);
+    res.json(stripFlightBookingFares(result));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1738,7 +1709,7 @@ router.get("/booking/pnr/:pnr", requireAuth, async (req: any, res: any) => {
       FirstName: firstName,
       LastName: lastName,
     });
-    res.json(result);
+    res.json(stripFlightBookingFares(result));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1783,7 +1754,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
         existingDemo.raw = b.raw ?? existingDemo.raw;
         existingDemo.fareBreakdown = b.fareBreakdown || existingDemo.fareBreakdown;
         await existingDemo.save();
-        return res.json({ ok: true, booking: existingDemo, demoRecovered: true });
+        return res.json({ ok: true, booking: customerFlightBooking(existingDemo), demoRecovered: true });
       }
     }
 
@@ -1803,9 +1774,9 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
         existing.passengers = b.passengers?.length ? b.passengers : existing.passengers;
         existing.contactEmail = b.contactEmail || existing.contactEmail;
         existing.contactPhone = b.contactPhone || existing.contactPhone;
-        existing.raw = b.raw ?? existing.raw;
+        existing.raw = existing.raw ?? b.raw;
         await existing.save();
-        return res.json({ ok: true, booking: existing, webhookRecovered: true });
+        return res.json({ ok: true, booking: customerFlightBooking(existing), webhookRecovered: true });
       }
     }
 
@@ -1837,19 +1808,44 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
     // while totalFare includes SSR seat/meal/baggage extras. When ancillaries are
     // present, marginAmount below absorbs them and OVERSTATES true margin — this is
     // flagged for review, NOT silently adjusted here.
+    // Payment facts come from the server's payment row (services/sbtPaymentGate.ts),
+    // never the body: the charged amount, mode and Razorpay ids.
+    const payFacts = await paymentFactsForSave(req, "FLIGHT", {
+      razorpayOrderId: b.razorpayOrderId,
+      tboBookingId: b.bookingId,
+    });
+    // No server payment row (Razorpay claim or wallet reservation) → no booking:
+    // the amount and "official" flag would otherwise come from the browser, and
+    // a cancellation would credit them back to the monthly limit.
+    if (!payFacts && req.user?.isDemoUser !== true) {
+      return res.status(402).json({ error: "Payment is required before this booking can be saved", code: "PAYMENT_REQUIRED" });
+    }
+    // The supplier's own Book / Ticket response, kept server-side when it was
+    // made (services/sbtQuote.ts keepSupplierResponse). The browser's copy has no
+    // fares, so it is only a fallback for the demo simulator.
+    const serverRaw = supplierResponseFor(payFacts?.supplierResponses, b.bookingId);
+    const saveRaw: any = serverRaw ?? b.raw;
+
     let normNetAmount = 0;
+    let tboBaseFare: number | null = null;
+    let tboTax: number | null = null;
     try {
-      const rawForFare = b.raw as any;
       // GDS Ticket double-nests (Response.Response.FlightItinerary); LCC TicketLCC
       // single-nests (Response.FlightItinerary). Mirror the fix-zero-fares reader below.
-      const tboFare =
-        rawForFare?.Response?.Response?.FlightItinerary?.Fare ??
-        rawForFare?.Response?.FlightItinerary?.Fare ??
-        rawForFare?.FlightItinerary?.Fare ??
-        rawForFare?.Fare ??
+      const fareOf = (r: any) =>
+        r?.Response?.Response?.FlightItinerary?.Fare ??
+        r?.Response?.FlightItinerary?.Fare ??
+        r?.FlightItinerary?.Fare ??
+        r?.Fare ??
         null;
+      // Split return: the inbound ticket is inside the outbound's response.
+      const fares = [fareOf(saveRaw), saveRaw?.returnTicketResult ? fareOf(saveRaw.returnTicketResult) : null].filter(Boolean);
       // OfferedFare is the net we actually pay TBO (Published − commission); prefer it.
-      const rawNet = Number(tboFare?.OfferedFare || tboFare?.PublishedFare || tboFare?.TotalFare || 0);
+      const rawNet = fares.reduce((sum: number, f: any) => sum + Number(f?.OfferedFare || f?.PublishedFare || f?.TotalFare || 0), 0);
+      if (fares.length) {
+        tboBaseFare = fares.reduce((sum: number, f: any) => sum + (Number(f?.BaseFare) || 0), 0);
+        tboTax = fares.reduce((sum: number, f: any) => sum + (Number(f?.Tax) || 0), 0);
+      }
       if (Number.isFinite(rawNet) && rawNet > 0) {
         normNetAmount = rawNet;
       } else if (b.traceId && reconResultIndex) {
@@ -1870,18 +1866,6 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
         traceId: b.traceId,
         err: normErr?.message,
       });
-    }
-    // Payment facts come from the server's payment row (services/sbtPaymentGate.ts),
-    // never the body: the charged amount, mode and Razorpay ids.
-    const payFacts = await paymentFactsForSave(req, "FLIGHT", {
-      razorpayOrderId: b.razorpayOrderId,
-      tboBookingId: b.bookingId,
-    });
-    // No server payment row (Razorpay claim or wallet reservation) → no booking:
-    // the amount and "official" flag would otherwise come from the browser, and
-    // a cancellation would credit them back to the monthly limit.
-    if (!payFacts && req.user?.isDemoUser !== true) {
-      return res.status(402).json({ error: "Payment is required before this booking can be saved", code: "PAYMENT_REQUIRED" });
     }
     // Server-side fulfilment (services/sbtFulfil.ts) saves one booking per
     // multi-city leg, each with its share of the charge. Set only in-process.
@@ -1920,8 +1904,10 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
       passengers: b.passengers ?? [],
       contactEmail: b.contactEmail ?? "",
       contactPhone: b.contactPhone ?? "",
-      baseFare: b.baseFare,
-      taxes: b.taxes ?? 0,
+      // TBO's real BaseFare / Tax from the supplier response (the browser only
+      // ever sees the selling base); the body is a fallback when none was kept.
+      baseFare: tboBaseFare ?? b.baseFare,
+      taxes: tboTax ?? b.taxes ?? 0,
       extras: b.extras ?? 0,
       totalFare: payFacts ? chargedAmount : b.totalFare,
       // Keystone normalize (see block above): durable supplier net + margin.
@@ -1949,7 +1935,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
       isDemo: req.user?.isDemoUser === true,
       createdByDemoUser: req.user?.isDemoUser === true,
       raw: (() => {
-        const r = b.raw as any;
+        const r = saveRaw as any;
         if (!r || typeof r !== 'object') return r;
         const fi = r?.Response?.Response?.FlightItinerary
           ?? r?.Response?.FlightItinerary
@@ -1961,13 +1947,13 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
         };
       })(),
       cancelPolicies: (() => {
-        const raw = b.raw as any;
+        const raw = saveRaw as any;
         return raw?.Response?.Response?.FlightItinerary?.FareRules
           ?? raw?.Response?.FlightItinerary?.FareRules
           ?? [];
       })(),
       isRefundable: (() => {
-        const raw = b.raw as any;
+        const raw = saveRaw as any;
         const v = raw?.Response?.Response?.FlightItinerary?.IsRefundable
           ?? raw?.Response?.FlightItinerary?.IsRefundable;
         return v != null ? Boolean(v) : undefined;
@@ -2035,7 +2021,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
       }
     }
 
-    res.json({ ok: true, booking: doc });
+    res.json({ ok: true, booking: customerFlightBooking(doc) });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Failed to save booking";
     res.status(500).json({ error: msg });
@@ -2110,7 +2096,7 @@ router.get("/bookings", requireSBT, async (req: any, res: any) => {
       return { ...booking, onlineReissueAllowed, hasOpenRescheduleRequest };
     });
 
-    res.json({ ok: true, bookings: bookingsWithReissue });
+    res.json({ ok: true, bookings: bookingsWithReissue.map(customerFlightBooking) });
   } catch (err: any) {
     sbtLogger.error("Bookings list failed", { userId: req.user?.id, error: err.message });
     res.status(500).json({ error: err.message });
@@ -2271,7 +2257,7 @@ router.get("/bookings/:id", requireSBT, async (req: any, res: any) => {
     const userId = req.user?._id ?? req.user?.id ?? req.user?.sub;
     const doc = await SBTBooking.findOne({ _id: req.params.id, userId }).lean();
     if (!doc) return res.status(404).json({ error: "Booking not found" });
-    res.json({ ok: true, booking: doc });
+    res.json({ ok: true, booking: customerFlightBooking(doc) });
   } catch (err: any) {
     sbtLogger.error("Booking detail failed", { userId: req.user?.id, bookingId: req.params.id, error: err.message });
     res.status(500).json({ error: err.message });
@@ -2527,7 +2513,7 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
       }
     }
 
-    res.json({ ok: true, booking: doc });
+    res.json({ ok: true, booking: customerFlightBooking(doc) });
   } catch (err: any) {
     sbtLogger.error("Booking cancel failed", { userId: req.user?.id, bookingId: req.params.id, error: err.message });
     res.status(500).json({ error: err.message });
@@ -2670,8 +2656,10 @@ router.get("/bookings/:id/reissue-search", requireAuth, requireSBT, async (req: 
       });
     }
 
+    // Selling prices only, with the margin this route's FareQuote charges.
+    const reissuePct = await flightMarginPct(countryOfAirport(booking.origin?.code), countryOfAirport(booking.destination?.code));
     return res.json({
-      searchResult,
+      searchResult: sellingFlightResults(searchResult, reissuePct),
       originalBooking: {
         _id: booking._id,
         pnr: booking.pnr,
@@ -2905,7 +2893,8 @@ router.post("/bookings/:id/reissue-farequote", requireAuth, requireSBT, async (r
     }
 
     const fareQuoteResult = await getFareQuote({ TraceId, ResultIndex });
-    return res.json({ fareQuoteResult, originalBooking: { pnr: booking.pnr, bookingId: booking.bookingId } });
+    const rfqPct = await flightMarginPct(countryOfAirport(booking.origin?.code), countryOfAirport(booking.destination?.code));
+    return res.json({ fareQuoteResult: sellingFlightResults(fareQuoteResult, rfqPct), originalBooking: { pnr: booking.pnr, bookingId: booking.bookingId } });
   } catch (err: any) {
     sbtLogger.error("Reissue-farequote failed", { bookingId: req.params.id, error: err.message });
     res.status(500).json({ error: err.message });
@@ -3241,7 +3230,7 @@ router.post("/bookings/:id/reissue", requireAuth, requireSBT, requireFlightAcces
       originalBookingId: doc._id, originalPNR, newPnr, newBookingId,
     });
 
-    return res.json({ ok: true, newBooking, originalBookingId: doc._id });
+    return res.json({ ok: true, newBooking: customerFlightBooking(newBooking), originalBookingId: doc._id });
   } catch (err: any) {
     sbtLogger.error("Reissue failed", { bookingId: req.params.id, error: err.message });
     res.status(500).json({ error: err.message });

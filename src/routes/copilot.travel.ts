@@ -47,6 +47,13 @@ import {
 import { searchFlights as tboSearchFlights } from "../services/tbo.flight.service.js";
 import { searchHotels, isHotelSearchError } from "../services/tbo.hotel.search.service.js";
 import {
+  sellingFlight,
+  flightMarginPct,
+  countryOfAirport,
+  customerHotelResults,
+  hotelMarginPct,
+} from "../services/sbtQuote.js";
+import {
   CABIN_LABELS,
   dedupeRawTBOFlights,
   mapTBOFlight,
@@ -454,45 +461,16 @@ router.post("/flights/search", async (req, res) => {
       }
     }
 
-    // Apply workspace margin parity with SBT (sbt.flights.ts:649-687) so
-    // the same TBO ResultIndex is quoted at the same price via concierge
-    // and via SBT. Mutates resultsArr in place so the mapping below reads
-    // margin-applied PublishedFare / OfferedFare.
-    const flightMargins = await getMarginConfig();
-    if (flightMargins.enabled) {
-      const originCountry = (req.body as any).originCountry;
-      const destCountry = (req.body as any).destCountry;
-      const isFlightDomestic = isDomestic(originCountry, destCountry);
-      const marginPct = isFlightDomestic
-        ? flightMargins.flight.domestic
-        : flightMargins.flight.international;
-
-      if (marginPct > 0) {
-        const applyToFlightArray = (arr: any[]): any[] =>
-          arr.map((flight: any) => {
-            const fare = flight?.Fare;
-            if (!fare) return flight;
-            const netPublished = fare.PublishedFare ?? 0;
-            const netOffered = fare.OfferedFare ?? 0;
-            return {
-              ...flight,
-              Fare: {
-                ...fare,
-                _netPublishedFare: netPublished,
-                _netOfferedFare: netOffered,
-                PublishedFare: applyMargin(netPublished, marginPct),
-                OfferedFare: applyMargin(netOffered, marginPct),
-                _marginPercent: marginPct,
-                _marginAmount: applyMargin(netOffered, marginPct) - netOffered,
-              },
-            };
-          });
-
-        for (let i = 0; i < resultsArr.length; i++) {
-          if (Array.isArray(resultsArr[i])) {
-            resultsArr[i] = applyToFlightArray(resultsArr[i]);
-          }
-        }
+    // Workspace margin parity with SBT: the same TBO ResultIndex is quoted at the
+    // same SELLING price via concierge and via SBT, and nothing net, commission
+    // or margin reaches the browser (services/sbtQuote.ts sellingFlight).
+    const flightMarginPctForRoute = await flightMarginPct(
+      (req.body as any).originCountry,
+      (req.body as any).destCountry,
+    );
+    for (let i = 0; i < resultsArr.length; i++) {
+      if (Array.isArray(resultsArr[i])) {
+        resultsArr[i] = resultsArr[i].map((flight: any) => sellingFlight(flight, flightMarginPctForRoute));
       }
     }
 
@@ -593,8 +571,11 @@ router.post("/hotels/search", async (req, res) => {
     // is estimated from stay length; star cap always applies.
     const nights = hotelNights(req.body?.CheckIn, req.body?.CheckOut);
     const hotelPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
+    // Rooms from the customer allow-list (selling total only — no net TotalFare,
+    // DayRates, RSP or commission); policy is evaluated before the rooms are shaped.
+    const hotelMarginPctForSearch = result.marginPct ?? (await hotelMarginPct(req.body?.CountryCode));
     const annotatedHotels = (result.hotels || []).map((h: any) => ({
-      ...h,
+      ...customerHotelResults(h, hotelMarginPctForSearch),
       policy: evaluateHotelPolicy(hotelForPolicyFromResult(h, nights), hotelPolicyRules),
     }));
     const inPolicyCount = annotatedHotels.filter((h: any) => h?.policy?.status === "IN_POLICY").length;
@@ -1041,6 +1022,8 @@ async function runConciergeTurn(
           requestId,
           policyRules: chatPolicyRules,
           workspaceObjectId: (req as any).workspaceObjectId,
+          // Selling prices, the same margin SBT search / FareQuote apply.
+          marginPct: await flightMarginPct(countryOfAirport(originIATA), countryOfAirport(destIATA)),
         });
         if (chatResult.ok) {
           chatFlights = chatResult.flights;

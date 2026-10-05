@@ -73,15 +73,19 @@ describe("searchFlightsForChat — discriminated result", () => {
     expect(result.inbound).toEqual([]);
   });
 
-  it("margin is NOT applied on the chat path — fare mirrors raw TBO OfferedFare", async () => {
+  it("chat fares are selling prices — TBO's net OfferedFare is never shown", async () => {
     mockedSearch.mockResolvedValue({
       Response: { TraceId: "T1", ResponseStatus: 1, Results: [[rawFlight()]] },
     });
 
     const result = await searchFlightsForChat(baseParams);
     expect(result.ok).toBe(true);
-    expect(result.flights[0].fare.offered).toBe(4800);
     expect(result.flights[0].fare.published).toBe(5000);
+    expect(result.flights[0].fare.offered).toBe(5000);
+
+    const margined = await searchFlightsForChat({ ...baseParams, marginPct: 10 });
+    expect(margined.flights[0].fare.published).toBe(5500);
+    expect(margined.flights[0].fare.offered).toBe(5500);
   });
 
   it("TBO non-success ResponseStatus → ok:false reason TBO_ERROR (not empty results)", async () => {

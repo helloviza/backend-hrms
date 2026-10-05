@@ -256,7 +256,7 @@ export async function priceAddOns(
 
 /* ───────────────────────── quote pricing ───────────────────────── */
 
-async function loadScopedQuote(scope: { userId: string; workspaceId: string }, quoteId: unknown, product: Product) {
+export async function loadScopedQuote(scope: { userId: string; workspaceId: string }, quoteId: unknown, product: Product) {
   if (typeof quoteId !== "string" || !quoteId) return null;
   const q = (await SBTQuote.findOne({ quoteId }).lean()) as AnyObj | null;
   if (!q || q.product !== product) return null;
@@ -266,7 +266,7 @@ async function loadScopedQuote(scope: { userId: string; workspaceId: string }, q
   return q;
 }
 
-const FARE_EXPIRED = refuse(410, "FARE_EXPIRED", "Fare expired, please search again");
+export const FARE_EXPIRED = refuse(410, "FARE_EXPIRED", "Fare expired, please search again");
 
 export interface FlightPrice {
   ok: true; amount: number; base: number; addOn: number; quoteIds: string[]; resultIndexes: string[];
@@ -969,5 +969,8 @@ export async function paymentFactsForSave(
     razorpayPaymentId: row.razorpayPaymentId || "",
     razorpayAmount: row.mode === "RAZORPAY" ? Number(row.amountPaise) : 0,
     paidAt: row.paidAt || row.claimedAt,
+    // The supplier's full Book / Ticket responses (services/sbtQuote.ts
+    // keepSupplierResponse) — the booking's raw and net come from these.
+    supplierResponses: Array.isArray(row.supplierResponses) ? row.supplierResponses : [],
   };
 }
