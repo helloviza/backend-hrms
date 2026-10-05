@@ -465,6 +465,41 @@ export async function creditOfficial(
   return true;
 }
 
+/**
+ * Give a cancelled booking's business-wallet spend back — only what the server
+ * reserved for it: its OFFICIAL payment row's ledger DEBITs less the CREDITs
+ * already made against that row (refunds, releases, earlier cancellations).
+ * Never the booking's own totalFare/paymentMode, which older saves took from the
+ * browser. No OFFICIAL row or nothing left on the ledger → credits nothing.
+ * A row shared by several bookings (multi-city legs) gives back at most this
+ * booking's server-set share.
+ */
+export async function creditCancelledBooking(
+  product: Product,
+  booking: AnyObj,
+  actorUserId?: string,
+): Promise<{ credited: number; paymentRowId?: string }> {
+  const id = String(booking?._id ?? "");
+  const wsId = String(booking?.workspaceId ?? "");
+  if (!id || !wsId) return { credited: 0 };
+  const or: AnyObj[] = [{ bookingDocIds: id }, { heldBookingId: id }];
+  const tboId = String(booking.bookingId ?? "");
+  if (tboId && tboId !== "0") or.push({ tboBookingId: tboId });
+  const row = (await SBTPayment.findOne({
+    product, mode: "OFFICIAL", workspaceId: wsId, isDemo: { $ne: true }, $or: or,
+  }).sort({ createdAt: -1 }).lean()) as AnyObj | null;
+  if (!row) return { credited: 0 };
+  const moves = (await SBTWalletLedger.find({ paymentId: String(row._id) }).select("type amount").lean()) as AnyObj[];
+  const remaining = moves.reduce((sum, m) => sum + (m.type === "DEBIT" ? 1 : -1) * (Number(m.amount) || 0), 0);
+  const shared = Array.isArray(row.bookingDocIds) && row.bookingDocIds.length > 1;
+  const amount = Math.round(Math.min(remaining, shared ? Number(booking.totalFare) || 0 : remaining) * 100) / 100;
+  if (!(amount > 0)) return { credited: 0, paymentRowId: String(row._id) };
+  const ok = await creditOfficial(row.workspaceId, amount, row.monthKey, {
+    key: `cancel:${id}`, reason: "CANCELLATION", paymentId: String(row._id), bookingDocId: id, product, actorUserId,
+  });
+  return { credited: ok ? amount : 0, paymentRowId: String(row._id) };
+}
+
 /** Release a payment row's whole reservation (supplier failure etc.). */
 export async function releaseOfficial(row: AnyObj, reason: string): Promise<boolean> {
   return creditOfficial(row.workspaceId, Number(row.amount), row.monthKey, {

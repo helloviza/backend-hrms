@@ -51,7 +51,7 @@ import {
   verifyHandler,
   paymentFactsForSave,
   latestHotelQuoteFor,
-  creditOfficial,
+  creditCancelledBooking,
   requireSBTStaffDirect,
 } from "../services/sbtPaymentGate.js";
 import {
@@ -2338,6 +2338,8 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
       await SBTHotelBooking.findByIdAndUpdate(booking._id, { $set: {
         paymentMode: voucherPay.mode === "OFFICIAL" ? "official" : "personal",
         paymentStatus: "paid",
+        // What the payment row charged for this voucher — never the hold's browser figure.
+        totalFare: Number(voucherPay.amount) || 0,
         ...(voucherPay.razorpayPaymentId ? { paymentId: voucherPay.razorpayPaymentId } : {}),
         ...(voucherPay.razorpayOrderId ? { razorpayOrderId: voucherPay.razorpayOrderId, razorpayAmount: voucherPay.amountPaise } : {}),
       } }).catch(() => {});
@@ -2602,6 +2604,25 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
       clientReferenceId: b.clientReferenceId,
       tboBookingId: b.bookingId,
     });
+    // No server payment row (Razorpay claim or wallet reservation) → no paid
+    // booking: the amount and "official" flag would otherwise come from the
+    // browser, and a cancellation would credit them back to the monthly limit.
+    if (!b.isHeld && !payFacts && req.user?.isDemoUser !== true) {
+      return res.status(402).json({ error: "Payment is required before this booking can be saved", code: "PAYMENT_REQUIRED" });
+    }
+    // A hold is unpaid: its amount is the server price /book stamped on the
+    // booking (serverSellingTotal), and it is not an official booking until
+    // generate-voucher records the payment row that paid for it.
+    let heldServerTotal = 0;
+    if (b.isHeld) {
+      const heldRefs: any[] = [];
+      if (typeof b.clientReferenceId === "string" && b.clientReferenceId) heldRefs.push({ clientReferenceId: b.clientReferenceId });
+      if (b.bookingId && String(b.bookingId) !== "0") heldRefs.push({ bookingId: String(b.bookingId) });
+      const held: any = heldRefs.length
+        ? await SBTHotelBooking.findOne({ userId, workspaceId: req.workspaceObjectId, $or: heldRefs }).select("serverSellingTotal").lean()
+        : null;
+      heldServerTotal = Math.round(Number(held?.serverSellingTotal) || 0);
+    }
 
     // GAP-01: Shared booking data for both pre-persist update and fresh create paths.
     const _bookingData = {
@@ -2624,7 +2645,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
       guests: b.guests || [],
       roomName: b.roomName || "",
       mealType: b.mealType || "",
-      totalFare: payFacts ? payFacts.amount : b.totalFare,
+      totalFare: payFacts ? payFacts.amount : b.isHeld ? heldServerTotal : b.totalFare,
       netAmount: b.netAmount || b.totalFare || 0,
       recommendedSellingRate:
         typeof b.recommendedSellingRate === "number" ? b.recommendedSellingRate : null,
@@ -2643,7 +2664,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
       isHeld: b.isHeld ?? false,
       lastVoucherDate: parseTBODate(b.lastVoucherDate) ?? undefined,
       lastCancellationDate: parseTBODate(b.lastCancellationDate),
-      paymentMode: payFacts?.paymentMode ?? (b.paymentMode === "official" ? "official" : "personal"),
+      paymentMode: payFacts?.paymentMode ?? (b.isHeld ? "personal" : b.paymentMode === "official" ? "official" : "personal"),
       raw: b.raw ?? null,
       inclusion: typeof b.inclusion === "string" ? b.inclusion : "",
       rateConditions: Array.isArray(b.rateConditions) ? b.rateConditions.map(String) : [],
@@ -3213,11 +3234,12 @@ async function pollCancelStatusBackground(
     });
     sbtLogger.info("[CANCEL-BG] Booking marked CANCELLED", { mongoId, changeRequestId, cancellationCharge });
 
-    // Business-wallet spend back (selling total, same month); ledger-backed, once per booking.
-    if (paymentMode === "official" && workspaceId) {
-      await creditOfficial(workspaceId, Number(totalFare) || 0, createdAt.toISOString().slice(0, 7), {
-        key: `cancel:${mongoId}`, reason: "CANCELLATION", bookingDocId: String(mongoId), product: "HOTEL",
-      }).catch((e: any) => sbtLogger.error("[CANCEL-BG] Spend reversal failed", { mongoId, error: e?.message }));
+    // Business-wallet spend back — only what the server reserved for this booking
+    // on the ledger, never its own totalFare/paymentMode. Once per booking.
+    if (workspaceId) {
+      await creditCancelledBooking("HOTEL", { _id: mongoId, workspaceId, bookingId: tboBookingId })
+        .then(({ credited, paymentRowId }) => sbtLogger.info("[CANCEL-BG] Spend reversed", { mongoId, credited, paymentRowId }))
+        .catch((e: any) => sbtLogger.error("[CANCEL-BG] Spend reversal failed", { mongoId, error: e?.message }));
     }
   } else if (cancelStatus === 4) {
     // Rejected — restore CONFIRMED so ops can decide

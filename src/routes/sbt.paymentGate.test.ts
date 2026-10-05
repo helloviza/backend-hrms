@@ -149,7 +149,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const c of ["users", "customerworkspaces", "sbtquotes", "sbtpayments", "sbtssrsnapshots", "sbthotelbookings", "sbtbookings", "sbtmulticitytraces"]) {
+  for (const c of ["users", "customerworkspaces", "sbtquotes", "sbtpayments", "sbtssrsnapshots", "sbthotelbookings", "sbtbookings", "sbtmulticitytraces", "sbtwalletledgers"]) {
     await col(c).deleteMany({});
   }
   await col("users").insertMany([
@@ -421,12 +421,13 @@ describe("hotel bookings/save is scoped to the caller", () => {
       _id: theirs, userId: OTHER, workspaceId: WS, bookingId: "555", clientReferenceId: "PLM-theirs",
       hotelName: "Their Hotel", status: "CONFIRMED", totalFare: 9000,
     } as any);
+    // isHeld: a hold is the only save that needs no payment row (an unpaid save is 402).
     const byId = await as(request(app).post("/api/sbt/hotels/bookings/save"), BOOKER)
-      .send({ bookingId: "555", hotelName: "Hijack", totalFare: 1, checkIn: "2026-11-01", checkOut: "2026-11-02" });
+      .send({ isHeld: true, bookingId: "555", hotelName: "Hijack", totalFare: 1, checkIn: "2026-11-01", checkOut: "2026-11-02" });
     expect(byId.status).toBe(409);
     // Their reference is not found in the caller's scope, so it is never filled in.
     await as(request(app).post("/api/sbt/hotels/bookings/save"), BOOKER)
-      .send({ clientReferenceId: "PLM-theirs", hotelName: "Hijack", totalFare: 1, checkIn: "2026-11-01", checkOut: "2026-11-02" });
+      .send({ isHeld: true, clientReferenceId: "PLM-theirs", hotelName: "Hijack", totalFare: 1, checkIn: "2026-11-01", checkOut: "2026-11-02" });
     const doc: any = await col("sbthotelbookings").findOne({ _id: theirs });
     expect(doc.hotelName).toBe("Their Hotel");
     expect(doc.totalFare).toBe(9000);
@@ -563,5 +564,123 @@ describe("reissue: a fare difference goes to the Travel Desk", () => {
     const r = await reissue({ priceDiff: 0, ResultIndex: "RI-UNQUOTED" });
     expect(r.status).toBe(410);
     expect(tbo.ticketReissue).not.toHaveBeenCalled();
+  });
+});
+
+describe("booking save + cancel: the business wallet moves only by the ledger", () => {
+  const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.currentMonthSpend;
+  const setSpend = (n: number) => col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.currentMonthSpend": n } });
+  const credits = () => col("sbtwalletledgers").find({ type: "CREDIT" }).toArray();
+  const FLIGHT = {
+    origin: { city: "Delhi", code: "DEL" }, destination: { city: "Mumbai", code: "BOM" },
+    departureTime: "2026-11-01T06:00:00", arrivalTime: "2026-11-01T08:00:00",
+    airlineCode: "6E", airlineName: "IndiGo", flightNumber: "6E 101", baseFare: 10000,
+  };
+
+  it("a flight save with no payment record is refused — browser amount and official flag never stored", async () => {
+    const res = await as(request(app).post("/api/sbt/flights/bookings/save"), BOOKER)
+      .send({ pnr: "FAKE01", bookingId: "424242", totalFare: 50000, paymentMode: "official", ticketingStatus: "NOT_ATTEMPTED" });
+    expect(res.status).toBe(402);
+    expect(res.body.code).toBe("PAYMENT_REQUIRED");
+    expect(await col("sbtbookings").countDocuments({})).toBe(0);
+  });
+
+  it("a paid hotel save with no payment record is refused", async () => {
+    const res = await as(request(app).post("/api/sbt/hotels/bookings/save"), BOOKER)
+      .send({ bookingId: "H-FAKE", hotelName: "Fake", totalFare: 50000, paymentMode: "official", checkIn: "2026-11-01", checkOut: "2026-11-02" });
+    expect(res.status).toBe(402);
+    expect(await col("sbthotelbookings").countDocuments({})).toBe(0);
+  });
+
+  it("a hold keeps the server price /book stamped, not the browser's, and is not official until paid", async () => {
+    await col("sbthotelbookings").insertOne({
+      userId: BOOKER, workspaceId: WS, clientReferenceId: "PLM-h1", bookingId: "H-1", serverSellingTotal: 8450,
+      hotelName: "", status: "HELD", totalFare: 0,
+    } as any);
+    const res = await as(request(app).post("/api/sbt/hotels/bookings/save"), BOOKER).send({
+      isHeld: true, bookingId: "H-1", hotelName: "Held Hotel", totalFare: 999999, paymentMode: "official",
+      checkIn: "2026-11-01", checkOut: "2026-11-02",
+    });
+    expect(res.status).toBe(200);
+    const doc: any = await col("sbthotelbookings").findOne({ bookingId: "H-1" });
+    expect(doc.totalFare).toBe(8450);
+    expect(doc.paymentMode).toBe("personal");
+  });
+
+  it("cancel credits only the ledger amount reserved for the booking, never its stored totalFare", async () => {
+    const q = await quoteFlight();
+    const t = await ticket(BOOKER, { paymentMode: "official", quoteIds: [q] });
+    expect(t.status).toBe(200);
+    const saved = await as(request(app).post("/api/sbt/flights/bookings/save"), BOOKER)
+      .send({ ...FLIGHT, pnr: "ABC123", bookingId: "777001", totalFare: 1, paymentMode: "personal", ticketingStatus: "NOT_ATTEMPTED" });
+    expect(saved.status).toBe(200);
+    expect(saved.body.booking.totalFare).toBe(12000);
+    expect(saved.body.booking.paymentMode).toBe("official");
+    // Other bookings this month, and a booking record tampered upwards.
+    await setSpend(15000);
+    await col("sbtbookings").updateOne({ pnr: "ABC123" }, { $set: { totalFare: 50000 } });
+
+    const c = await as(request(app).post(`/api/sbt/flights/bookings/${saved.body.booking._id}/cancel`), BOOKER).send({});
+    expect(c.status).toBe(200);
+    expect(await spend()).toBe(3000);
+    const cr = await credits();
+    expect(cr.map((x: any) => x.amount)).toEqual([12000]);
+  });
+
+  it("a fabricated official booking + cancel cannot raise the available limit", async () => {
+    await setSpend(15000);
+    const fake = oid();
+    // A record as an older save could write it from the browser — no payment row, no ledger.
+    await col("sbtbookings").insertOne({
+      ...FLIGHT, _id: fake, userId: BOOKER, workspaceId: WS, pnr: "FAKE02", bookingId: "424243", status: "CONFIRMED",
+      ticketingStatus: "NOT_ATTEMPTED", paymentMode: "official", totalFare: 50000, createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    const c = await as(request(app).post(`/api/sbt/flights/bookings/${fake}/cancel`), BOOKER).send({});
+    expect(c.status).toBe(200);
+    expect(await spend()).toBe(15000);
+    expect(await credits()).toHaveLength(0);
+    // Cancelling again changes nothing either.
+    await col("sbtbookings").updateOne({ _id: fake }, { $set: { status: "CONFIRMED" } });
+    await as(request(app).post(`/api/sbt/flights/bookings/${fake}/cancel`), BOOKER).send({});
+    expect(await spend()).toBe(15000);
+  });
+});
+
+describe("creditCancelledBooking (hotel cancel + multi-leg rows)", () => {
+  const month = new Date().toISOString().slice(0, 7);
+  const spend = async () => ((await col("customerworkspaces").findOne({ _id: WS })) as any).sbtOfficialBooking.currentMonthSpend;
+  const officialRow = async (amount: number, extra: Record<string, unknown>) => {
+    const _id = oid();
+    await col("sbtpayments").insertOne({
+      _id, product: "HOTEL", mode: "OFFICIAL", status: "TICKETED", userId: String(BOOKER), workspaceId: String(WS),
+      amount, amountPaise: amount * 100, monthKey: month, bookingDocIds: [], createdAt: new Date(), ...extra,
+    } as any);
+    await col("sbtwalletledgers").insertOne({
+      workspaceId: String(WS), type: "DEBIT", amount, monthKey: month, reason: "BOOKING",
+      paymentId: String(_id), idempotencyKey: `debit:${_id}`, createdAt: new Date(),
+    } as any);
+    return _id;
+  };
+
+  it("a vouchered hold gives back the row's reserved amount; an unpaid hold gives back nothing", async () => {
+    const { creditCancelledBooking } = await import("../services/sbtPaymentGate.js");
+    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.currentMonthSpend": 10000 } });
+    const held = oid();
+    await officialRow(8450, { heldBookingId: String(held) });
+    expect((await creditCancelledBooking("HOTEL", { _id: held, workspaceId: WS, totalFare: 99999 })).credited).toBe(8450);
+    expect(await spend()).toBe(1550);
+    expect((await creditCancelledBooking("HOTEL", { _id: oid(), workspaceId: WS, totalFare: 99999 })).credited).toBe(0);
+    expect(await spend()).toBe(1550);
+  });
+
+  it("legs sharing one row give back at most what the row reserved", async () => {
+    const { creditCancelledBooking } = await import("../services/sbtPaymentGate.js");
+    await col("customerworkspaces").updateOne({ _id: WS }, { $set: { "sbtOfficialBooking.currentMonthSpend": 10000 } });
+    const a = oid();
+    const b = oid();
+    await officialRow(10000, { product: "FLIGHT", bookingDocIds: [String(a), String(b)] });
+    expect((await creditCancelledBooking("FLIGHT", { _id: a, workspaceId: WS, totalFare: 6000 })).credited).toBe(6000);
+    expect((await creditCancelledBooking("FLIGHT", { _id: b, workspaceId: WS, totalFare: 6000 })).credited).toBe(4000);
+    expect(await spend()).toBe(0);
   });
 });

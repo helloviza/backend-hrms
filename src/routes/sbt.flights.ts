@@ -57,7 +57,7 @@ import {
   verifyHandler,
   paymentFactsForSave,
   reserveOfficial,
-  creditOfficial,
+  creditCancelledBooking,
   claimOfficial,
   refundPaymentRow,
   isRefusal,
@@ -1877,6 +1877,12 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
       razorpayOrderId: b.razorpayOrderId,
       tboBookingId: b.bookingId,
     });
+    // No server payment row (Razorpay claim or wallet reservation) → no booking:
+    // the amount and "official" flag would otherwise come from the browser, and
+    // a cancellation would credit them back to the monthly limit.
+    if (!payFacts && req.user?.isDemoUser !== true) {
+      return res.status(402).json({ error: "Payment is required before this booking can be saved", code: "PAYMENT_REQUIRED" });
+    }
     // Server-side fulfilment (services/sbtFulfil.ts) saves one booking per
     // multi-city leg, each with its share of the charge. Set only in-process.
     const fulfilCtx = (req as any).sbtFulfil as
@@ -2507,16 +2513,14 @@ router.post("/bookings/:id/cancel", requireSBT, async (req: any, res: any) => {
       await doc.save();
     }
 
-    // Give the business-wallet spend back (selling total, same calendar month —
-    // an earlier month's counter was already reset). Ledger-backed: once per booking.
-    if ((doc as any).paymentMode === "official" && (doc as any).workspaceId) {
+    // Give the business-wallet spend back — only what the server reserved for this
+    // booking on the ledger (an earlier month's counter was already reset), never
+    // the booking's own totalFare/paymentMode. Once per booking.
+    if ((doc as any).workspaceId) {
       try {
-        const credited = await creditOfficial((doc as any).workspaceId, Number(totalFare) || 0, doc.createdAt.toISOString().slice(0, 7), {
-          key: `cancel:${doc._id}`, reason: "CANCELLATION", bookingDocId: String(doc._id), product: "FLIGHT",
-          actorUserId: String(req.user?._id ?? req.user?.id ?? ""),
-        });
+        const { credited, paymentRowId } = await creditCancelledBooking("FLIGHT", doc.toObject(), String(req.user?._id ?? req.user?.id ?? ""));
         sbtLogger.info("[OfficialBooking] Spend reversed on cancellation", {
-          bookingId: doc._id, amount: totalFare, workspaceId: (doc as any).workspaceId, credited,
+          bookingId: doc._id, credited, paymentRowId, workspaceId: (doc as any).workspaceId,
         });
       } catch (err) {
         sbtLogger.error("[OfficialBooking] Failed to reverse spend on cancellation", { bookingId: doc._id, error: err });
