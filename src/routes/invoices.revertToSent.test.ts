@@ -20,6 +20,7 @@ vi.mock("../middleware/rbac.js", () => ({
 }));
 vi.mock("../middleware/requirePermission.js", () => ({
   requirePermission: () => (_req: any, _res: any, next: any) => next(),
+  requireAnyPermission: () => (_req: any, _res: any, next: any) => next(),
 }));
 
 let currentInvoice: any = null;

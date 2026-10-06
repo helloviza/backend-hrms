@@ -25,9 +25,16 @@ const HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
 
 const norm = (v: unknown) => String(v ?? "").trim().toUpperCase().replace(/[\s\-_]/g, "");
 
+// Customer / vendor ACCOUNT markers. Travel roles (REQUESTER, APPROVER,
+// TRAVELLER, WORKSPACE_LEADER) are deliberately NOT here: Plumtrips staff carry
+// them on User.roles for the approval / booking flows, and the staff access
+// token copies User.roles verbatim (routes/auth.ts buildAuthSafeUser), so
+// listing them refused real staff — e.g. an EMPLOYEE + REQUESTER with
+// invoices FULL got requireAdmin's "Admin access required" (2026-10-07).
+// A real customer member is still caught: its token carries
+// customerMemberRole (never set on staff tokens) and CUSTOMER/BUSINESS roles.
 const EXTERNAL_MARKERS = new Set([
   "CUSTOMER", "BUSINESS", "CLIENT", "CORPORATE", "VENDOR", "SUPPLIER",
-  "WORKSPACELEADER", "REQUESTER", "APPROVER", "TRAVELLER", "TRAVELER",
 ]);
 
 /** A customer / vendor account — never staff, whatever its workspace. */

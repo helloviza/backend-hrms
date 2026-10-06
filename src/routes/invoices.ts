@@ -8,7 +8,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requireBillingStaff } from "../middleware/requireBillingStaff.js";
-import { requirePermission } from "../middleware/requirePermission.js";
+import { requirePermission, requireAnyPermission } from "../middleware/requirePermission.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import Invoice from "../models/Invoice.js";
 import User from "../models/User.js";
@@ -628,6 +628,35 @@ function invoiceToRow(inv: any): (string | number | undefined)[] {
 
 // GST bypass resolution (BYPASS_UT_LIST / resolveGstWithBypass) now lives in
 // services/invoiceGeneration.service.ts alongside the generation logic.
+
+/* ── Billing document settings (read-only) ───────────────────────────
+ * GET /api/admin/invoices/document-settings
+ *
+ * The company fields the invoice / credit-note screens render — letterhead,
+ * logo, bank block — and the active seller GST registrations the Generate
+ * Invoice modal offers. /admin/company-settings is the full, editable record
+ * behind requireAdmin + the companySettings grant, so an invoices /
+ * creditnotes grantee without either got "Admin access required" there; the
+ * screens fall back to this lookup when that call is refused. Read-only, only
+ * these fields; the company-settings route and its gates are unchanged. */
+const DOCUMENT_SETTING_FIELDS = [
+  "companyName", "logoUrl", "address", "addressLine1", "addressLine2", "city", "state",
+  "supplierState", "pincode", "country", "gstin", "email", "website",
+  "bankName", "bankAccountHolder", "bankAccountNumber", "bankIfsc",
+] as const;
+
+router.get("/document-settings", requireAnyPermission(["invoices", "creditnotes"], "READ"), async (_req: any, res: any) => {
+  try {
+    const cs: any = await getCompanySettings();
+    const settings: Record<string, unknown> = {};
+    for (const f of DOCUMENT_SETTING_FIELDS) if (cs?.[f] !== undefined) settings[f] = cs[f];
+    settings.gstProfiles = (cs?.gstProfiles ?? []).filter((p: any) => p?.active);
+    res.json({ ok: true, settings });
+  } catch (err: any) {
+    console.error("[Invoices document-settings]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /* ── Generate Invoice ───────────────────────────────────────────── */
 
