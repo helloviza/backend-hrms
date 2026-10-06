@@ -48,6 +48,9 @@ function makeApp() {
   app.use(express.json());
   app.use((req: any, _res, next) => {
     req.user = { sub: "staff1", _id: "staff1", roles: ["ADMIN"] };
+    // server.ts runs requireWorkspace first; this is Plumtrips staff (HOUSE).
+    // Tenant scoping of these routes: invoices.byIdTenantScope.test.ts.
+    req.workspaceObjectId = "69679a7628330a58d29f2254";
     next();
   });
   app.use("/", router);

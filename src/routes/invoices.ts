@@ -345,6 +345,42 @@ function withInvoiceTenantScope(
   return { ...base, $and: [...(base.$and ?? []), gate] };
 }
 
+/**
+ * The tenant gate for ONE already-loaded invoice — the by-id routes (detail,
+ * PDF, edit, cancel, status, reverts, add/eligible bookings) and the bulk mark
+ * routes. Same rule as invoiceTenantClause, evaluated on the document: true
+ * for Super Admin / HOUSE staff, otherwise the invoice's workspaceId must be
+ * the caller's workspace in either id-space. Fails closed. Callers answer an
+ * out-of-scope invoice exactly like a missing one (404 / "not found"), so a
+ * tenant cannot even learn that another workspace's id exists.
+ */
+function invoiceInTenantScope(req: any, invoice: any): boolean {
+  const gate = invoiceTenantClause(req);
+  if (!gate) return true;
+  const allowed = (gate.$or ?? []).map((c: any) => String(c.workspaceId));
+  return allowed.includes(String(invoice?.workspaceId ?? ""));
+}
+
+/**
+ * Generation guard: true when any of these bookings belongs to a workspace
+ * outside the caller's scope (ManualBooking.workspaceId shares the invoice
+ * id-spaces, so the same clause applies). Unknown / malformed ids are left to
+ * the generation service, which reports them as it always has.
+ */
+async function bookingsOutsideTenantScope(req: any, bookingIds: unknown[]): Promise<boolean> {
+  const gate = invoiceTenantClause(req);
+  if (!gate) return false;
+  const ids = [...new Set(bookingIds.map(String))]
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+  if (!ids.length) return false;
+  const [all, inScope] = await Promise.all([
+    ManualBooking.countDocuments({ _id: { $in: ids } }),
+    ManualBooking.countDocuments({ _id: { $in: ids }, $and: [gate] }),
+  ]);
+  return inScope < all;
+}
+
 
 /**
  * THE single filter builder for the admin invoice read paths that take
@@ -646,6 +682,11 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       return res.status(400).json({ error: "bookingIds array is required" });
     }
 
+    // A tenant caller may only invoice its own workspace's bookings.
+    if (await bookingsOutsideTenantScope(req, bookingIds)) {
+      return res.status(404).json({ error: "One or more booking IDs not found" });
+    }
+
     // Resolve invoiceDate — no restrictions, default to today if omitted
     const resolvedInvoiceDate = invoiceDate ? new Date(invoiceDate) : new Date();
     resolvedInvoiceDate.setHours(0, 0, 0, 0);
@@ -708,6 +749,12 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
 
     if (!Array.isArray(bookingIds) || !bookingIds.length) {
       return res.status(400).json({ error: "bookingIds array is required" });
+    }
+
+    // A tenant caller may only invoice its own workspace's bookings — the whole
+    // batch is refused, nothing is generated.
+    if (await bookingsOutsideTenantScope(req, bookingIds)) {
+      return res.status(404).json({ error: "One or more booking IDs not found" });
     }
 
     // GST bypass payload — applies to all invoices in the batch.
@@ -1007,10 +1054,10 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
       return res.status(400).json({ error: "bookingIds array is required" });
     }
 
-    const invoice = await Invoice.collection.findOne({
-      _id: new mongoose.Types.ObjectId(req.params.id),
-    });
-    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    const invoice = mongoose.Types.ObjectId.isValid(req.params.id)
+      ? await Invoice.collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) })
+      : null;
+    if (!invoice || !invoiceInTenantScope(req, invoice)) return res.status(404).json({ error: "Invoice not found" });
 
     if (invoice.status === "PAID" || invoice.status === "CANCELLED" || invoice.status === "PAYMENT_DECLARED") {
       return res.status(400).json({ error: "Cannot add bookings to a PAID, PAYMENT_DECLARED, or CANCELLED invoice" });
@@ -1274,7 +1321,7 @@ router.post("/:id/cancel", requirePermission("invoices", "FULL"), async (req: an
     }
 
     const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (!invoice || !invoiceInTenantScope(req, invoice)) return res.status(404).json({ error: "Invoice not found" });
 
     if (invoice.status === "CANCELLED") {
       return res.status(400).json({ error: "Invoice is already cancelled" });
@@ -1401,7 +1448,7 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
 
     await session.withTransaction(async () => {
       const invoice = await Invoice.findById(req.params.id).session(session);
-      if (!invoice) throw new HttpError(404, "Invoice not found");
+      if (!invoice || !invoiceInTenantScope(req, invoice)) throw new HttpError(404, "Invoice not found");
       if (invoice.status !== "DRAFT") {
         throw new HttpError(400, "Cannot edit non-draft invoice. Use cancel + reissue.");
       }
@@ -1646,7 +1693,7 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
 router.get("/:id/eligible-bookings", requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
     const invoice = await Invoice.findById(req.params.id).lean();
-    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (!invoice || !invoiceInTenantScope(req, invoice)) return res.status(404).json({ error: "Invoice not found" });
 
     const customerIds = await invoiceCustomerIds(invoice, null);
     const currentIds = ((invoice as any).bookingIds ?? []).map((x: any) => String(x));
@@ -1710,7 +1757,7 @@ router.get("/:id/credit-notes", requirePermission("invoices", "READ"), async (re
 router.get("/:id", requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
     const invoice = await Invoice.findById(req.params.id).lean();
-    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (!invoice || !invoiceInTenantScope(req, invoice)) return res.status(404).json({ error: "Invoice not found" });
     const enrichedClient = await enrichClientDetails(invoice);
     res.json({ ok: true, invoice: { ...invoice, clientDetails: enrichedClient } });
   } catch (err: any) {
@@ -1744,7 +1791,7 @@ router.put("/:id/status", requirePermission("invoices", "WRITE"), async (req: an
     };
 
     const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (!invoice || !invoiceInTenantScope(req, invoice)) return res.status(404).json({ error: "Invoice not found" });
 
     const prev = invoice.status;
 
@@ -1812,7 +1859,8 @@ router.post("/bulk-mark-sent", requirePermission("invoices", "WRITE"), async (re
     const skipped: Array<{ id: string; reason: string }> = [];
     const blocked: Array<{ id: string; reason: string }> = [];
 
-    const invoices = await Invoice.find({ _id: { $in: ids } });
+    // Out-of-scope ids read exactly like missing ones and are never touched.
+    const invoices = (await Invoice.find({ _id: { $in: ids } })).filter((i) => invoiceInTenantScope(req, i));
     const found = new Set(invoices.map((i) => String(i._id)));
     for (const id of ids) if (!found.has(String(id))) blocked.push({ id, reason: "not found" });
 
@@ -1868,7 +1916,8 @@ router.post("/bulk-mark-paid", requirePermission("invoices", "WRITE"), async (re
     const skipped: Array<{ id: string; reason: string }> = [];
     const blocked: Array<{ id: string; reason: string }> = [];
 
-    const invoices = await Invoice.find({ _id: { $in: ids } });
+    // Out-of-scope ids read exactly like missing ones and are never touched.
+    const invoices = (await Invoice.find({ _id: { $in: ids } })).filter((i) => invoiceInTenantScope(req, i));
     const found = new Set(invoices.map((i) => String(i._id)));
     for (const id of ids) if (!found.has(String(id))) blocked.push({ id, reason: "not found" });
 
@@ -1916,7 +1965,7 @@ router.post("/:id/revert-to-sent", requirePermission("invoices", "WRITE"), async
       return res.status(400).json({ error: "Reason is required" });
     }
     const invoice: any = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (!invoice || !invoiceInTenantScope(req, invoice)) return res.status(404).json({ error: "Invoice not found" });
     if (invoice.status !== "PAID" && invoice.status !== "PAYMENT_DECLARED") {
       return res.status(400).json({ error: "Only PAID or PAYMENT_DECLARED invoices can be reverted to SENT." });
     }
@@ -1965,7 +2014,7 @@ router.post("/:id/revert-to-draft", requirePermission("invoices", "WRITE"), asyn
       return res.status(400).json({ error: "Reason is required" });
     }
     const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (!invoice || !invoiceInTenantScope(req, invoice)) return res.status(404).json({ error: "Invoice not found" });
     if (invoice.status !== "SENT") {
       return res.status(400).json({ error: "Only SENT invoices can be reverted to DRAFT." });
     }
@@ -1995,10 +2044,10 @@ router.post("/:id/revert-to-draft", requirePermission("invoices", "WRITE"), asyn
 // POST /api/admin/invoices/:id/pdf
 router.post("/:id/pdf", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
   try {
-    const invoice = await Invoice.collection.findOne({
-      _id: new mongoose.Types.ObjectId(req.params.id),
-    });
-    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    const invoice = mongoose.Types.ObjectId.isValid(req.params.id)
+      ? await Invoice.collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) })
+      : null;
+    if (!invoice || !invoiceInTenantScope(req, invoice)) return res.status(404).json({ error: "Invoice not found" });
 
     const enrichedClient = await enrichClientDetails(invoice);
     // Settled invoices read AMOUNT PAID / STATUS: Paid rather than BALANCE
