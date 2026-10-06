@@ -994,6 +994,15 @@ app.use("/api/admin/demo", adminDemoRouter);
 // these paths before manualBookingsRouter (which uses billing-access
 // instead of requireAdmin to allow RM-scoped access).
 import manualBookingsRouter from "./routes/manualBookings.js";
+// Invoices + Credit Notes (staff) and the notification bell sit before the
+// broad /api/admin routers for the same reason: adminAnalyticsRouter's
+// router.use(requireAdmin) refused Plumtrips staff (EMPLOYEE in HOUSE) holding
+// the invoices / creditnotes grant before requireBillingStaff ever ran
+// (chirag@, 2026-10-07). Their own gates decide; see server.adminMount.test.ts.
+import invoicesRouter, { workspaceRouter as invoicesWorkspaceRouter } from "./routes/invoices.js";
+import creditNotesAdminRouter, { workspaceRouter as creditNotesWorkspaceRouter } from "./routes/creditNotes.js";
+import notificationsRouter from "./routes/notifications.js";
+import { requireBillingStaff } from "./middleware/requireBillingStaff.js";
 import adminTravellersRouter from "./routes/admin.travellers.js";
 import extractedDocumentsRouter from "./routes/admin.extractedDocuments.js";
 import carbonRouter from "./routes/admin.carbon.js";
@@ -1021,6 +1030,17 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // before the broad /api/admin routers for the same interception reason, and
   // carries its own requireAuth/requireWorkspace + admin guard.
   app.use("/api/admin/carbon", carbonRouter);
+  // Staff invoices / credit notes: requireBillingStaff (router-level) admits
+  // Super Admin, requireAdmin's roles, and HOUSE staff that are not customer /
+  // vendor accounts; requirePermission per route then applies the grant.
+  app.use("/api/admin/invoices", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), invoicesRouter);
+  app.use("/api/admin/credit-notes", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), creditNotesAdminRouter);
+}
+// Notification bell — every row is the caller's own (userId-scoped in the
+// router). requireBillingStaff is the same door the blanket requireAdmin was,
+// plus HOUSE staff, so customer / vendor / tenant non-admins stay refused.
+app.use("/api/admin/notifications", requireAuth, requireBillingStaff, notificationsRouter);
+if (env.DEPLOYMENT_MODE === "plumbox") {
   // Admin
   app.use("/api/admin", adminRouter);
   app.use("/api/admin", adminAnalyticsRouter);
@@ -1053,9 +1073,8 @@ import ticketsAdminRouter from "./routes/tickets.admin.js";
 import ticketsConsoleRouter from "./routes/tickets.console.js";
 // Email templates (workspace-scoped, supportTickets permission)
 import emailTemplatesRouter from "./routes/emailTemplates.js";
-// Invoices, Reports, Company Settings (admin-only via router-level requireAdmin)
-import invoicesRouter, { workspaceRouter as invoicesWorkspaceRouter } from "./routes/invoices.js";
-import creditNotesAdminRouter, { workspaceRouter as creditNotesWorkspaceRouter } from "./routes/creditNotes.js";
+// Reports, Company Settings (admin-only via router-level requireAdmin).
+// Staff invoices / credit-notes are mounted above the broad /api/admin routers.
 import reportsRouter from "./routes/reports.js";
 import companySettingsRouter from "./routes/companySettings.js";
 // Billing Permissions (Super Admin grant/revoke + my-access for all users)
@@ -1069,10 +1088,8 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/admin/tickets", requireAuth, requireWorkspace, requireFeature("ticketsEnabled"), ticketsConsoleRouter);
   app.use("/api/admin/email-templates", emailTemplatesRouter);
   app.use("/api/invoices/workspace", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), invoicesWorkspaceRouter);
-  app.use("/api/admin/invoices", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), invoicesRouter);
   // Credit Notes — child of the invoice surface; reuse the invoicesEnabled feature flag.
   app.use("/api/credit-notes/workspace", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), creditNotesWorkspaceRouter);
-  app.use("/api/admin/credit-notes", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), creditNotesAdminRouter);
   app.use("/api/admin/reports", reportsRouter);
   app.use("/api/admin/company-settings", companySettingsRouter);
   app.use("/api/billing-permissions", billingPermissionsRouter);
@@ -1155,9 +1172,7 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/admin/task-automations", taskAutomationsRouter);
 }
 
-// In-app notifications
-import notificationsRouter from "./routes/notifications.js";
-app.use("/api/admin/notifications", notificationsRouter);
+// In-app notifications — mounted above the broad /api/admin routers.
 
 // Plumbox internal chat (SSE + conversations + messages)
 import chatRouter from "./routes/chat.js";
