@@ -77,7 +77,13 @@ const MID_DAY = istDay(Date.now() - 10 * DAY_MS);
 
 const app = express();
 app.use(express.json());
-app.use("/api/admin/credit-notes", creditNotesRouter);
+// server.ts runs requireWorkspace before this router; every caller here is
+// Plumtrips finance staff, so their workspace is HOUSE (credit notes are
+// tenant-scoped — see creditNotes.tenantScope.test.ts for tenants).
+app.use("/api/admin/credit-notes", (req: any, _res: any, next: any) => {
+  req.workspaceObjectId = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
+  next();
+}, creditNotesRouter);
 app.use("/api/permissions", (req: any, _res: any, next: any) => {
   req.user = JSON.parse(String(req.headers["x-test-user"] || "{}"));
   req.isPlatformSuperAdmin = true;

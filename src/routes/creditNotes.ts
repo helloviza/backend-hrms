@@ -15,8 +15,28 @@ import { uploadAndPresign } from "../utils/s3Upload.js";
 import { generateCreditNotePdf } from "../utils/creditNotePdf.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import { istDateString, todayIST } from "../utils/dateIST.js";
+import { invoiceTenantClause } from "./invoices.js";
 
 /* ── Shared helpers ──────────────────────────────────────────────── */
+
+/* ── Tenant scope — the SAME rule as Invoices ─────────────────────────
+ * invoiceTenantClause (routes/invoices.ts): Super Admin and Plumtrips (HOUSE)
+ * staff see every workspace; anyone else only credit notes whose workspaceId
+ * is their own workspace (either id-space — a credit note copies its
+ * invoice's workspaceId verbatim). Fails closed. ANDed via $and so it can
+ * never be overwritten by a caller-supplied workspaceId / search $or. */
+function withCreditNoteTenantScope(req: any, base: Record<string, any> = {}): Record<string, any> {
+  const gate = invoiceTenantClause(req);
+  if (!gate) return base;
+  return { ...base, $and: [...(base.$and ?? []), gate] };
+}
+
+// One credit note by id, inside the caller's scope. null for a malformed id —
+// another workspace's credit note and a missing one both answer 404.
+function creditNoteByIdInScope(req: any, id: string): Record<string, any> | null {
+  if (!mongoose.Types.ObjectId.isValid(String(id))) return null;
+  return withCreditNoteTenantScope(req, { _id: new mongoose.Types.ObjectId(String(id)) });
+}
 
 // Demo Platform — demo admins/users see only demo data; real users protected.
 function demoClause(req: any): Record<string, any> {
@@ -242,7 +262,9 @@ async function validateAndBuild(req: any, body: any): Promise<{ payload: Partial
   }
 
   // Invoice exists
-  const invoice = await Invoice.findById(originalInvoiceId).lean();
+  const invoice = await Invoice.findOne(
+    withCreditNoteTenantScope(req, { _id: new mongoose.Types.ObjectId(originalInvoiceId) }),
+  ).lean();
   if (!invoice) throw new HttpError(404, "Original invoice not found");
 
   // Invoice status — only SENT or PAID invoices can be credited
@@ -654,9 +676,10 @@ router.get("/", requirePermission("creditnotes", "READ"), async (req: any, res: 
       filter.$or = [{ creditNoteNo: rx }, { originalInvoiceNo: rx }, { reasonText: rx }];
     }
 
+    const scoped = withCreditNoteTenantScope(req, filter);
     const [docs, total] = await Promise.all([
-      CreditNote.find(filter).sort({ generatedAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).lean(),
-      CreditNote.countDocuments(filter),
+      CreditNote.find(scoped).sort({ generatedAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).lean(),
+      CreditNote.countDocuments(scoped),
     ]);
 
     const wsNames = await resolveWorkspaceNames(docs);
@@ -690,7 +713,7 @@ router.get("/export", requirePermission("creditnotes", "READ"), async (req: any,
     }
 
     const format = req.query.format === "xlsx" ? "xlsx" : "csv";
-    const docs = await CreditNote.find(filter).sort({ generatedAt: -1 }).limit(5000).lean();
+    const docs = await CreditNote.find(withCreditNoteTenantScope(req, filter)).sort({ generatedAt: -1 }).limit(5000).lean();
     const issuerNames = await userNames(docs.map((cn: any) => cn.issuedBy));
     const wsNames = await resolveWorkspaceNames(docs);
 
@@ -737,7 +760,7 @@ function timeAgo(date: Date): string {
 // GET /api/admin/credit-notes/activity
 router.get("/activity", requirePermission("creditnotes", "READ"), async (req: any, res: any) => {
   try {
-    const docs = await CreditNote.find({ ...demoClause(req) }).sort({ updatedAt: -1 }).limit(10).lean();
+    const docs = await CreditNote.find(withCreditNoteTenantScope(req, { ...demoClause(req) })).sort({ updatedAt: -1 }).limit(10).lean();
     const result = docs.map((cn: any) => {
       let action: string;
       let label: string;
@@ -776,7 +799,7 @@ router.get("/insight", requirePermission("creditnotes", "READ"), async (req: any
   try {
     const now = new Date();
     const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const baseMatch = { ...demoClause(req), status: "ISSUED", issuedAt: { $gte: thisMonthStart } };
+    const baseMatch = withCreditNoteTenantScope(req, { ...demoClause(req), status: "ISSUED", issuedAt: { $gte: thisMonthStart } });
 
     const [issuedAgg, byCategory, byReasonCode] = await Promise.all([
       CreditNote.aggregate([
@@ -823,7 +846,8 @@ router.get("/insight", requirePermission("creditnotes", "READ"), async (req: any
 // POST /api/admin/credit-notes/:id/issue
 router.post("/:id/issue", requirePermission("creditnotes", "FULL"), async (req: any, res: any) => {
   try {
-    const cn = await CreditNote.findById(req.params.id);
+    const byId = creditNoteByIdInScope(req, req.params.id);
+    const cn = byId ? await CreditNote.findOne(byId) : null;
     if (!cn) return res.status(404).json({ error: "Credit note not found" });
     if (cn.status !== "DRAFT") {
       return res.status(400).json({ error: `Only DRAFT credit notes can be issued (current: ${cn.status}).` });
@@ -949,7 +973,8 @@ router.post("/:id/cancel", requirePermission("creditnotes", "FULL"), async (req:
       return res.status(400).json({ error: "Cancellation reason is required" });
     }
 
-    const cn = await CreditNote.findById(req.params.id);
+    const byId = creditNoteByIdInScope(req, req.params.id);
+    const cn = byId ? await CreditNote.findOne(byId) : null;
     if (!cn) return res.status(404).json({ error: "Credit note not found" });
     if (cn.status === "CANCELLED") return res.status(400).json({ error: "Credit note is already cancelled" });
     if (cn.status !== "ISSUED") {
@@ -1004,7 +1029,8 @@ router.post("/:id/cancel", requirePermission("creditnotes", "FULL"), async (req:
 // PATCH /api/admin/credit-notes/:id
 router.patch("/:id", requirePermission("creditnotes", "WRITE"), async (req: any, res: any) => {
   try {
-    const cn = await CreditNote.findById(req.params.id);
+    const byId = creditNoteByIdInScope(req, req.params.id);
+    const cn = byId ? await CreditNote.findOne(byId) : null;
     if (!cn) return res.status(404).json({ error: "Credit note not found" });
     if (cn.status !== "DRAFT") {
       return res.status(400).json({ error: "Cannot edit a non-draft credit note. Cancel + reissue instead." });
@@ -1173,7 +1199,8 @@ router.patch("/:id", requirePermission("creditnotes", "WRITE"), async (req: any,
 // GET /api/admin/credit-notes/:id/pdf
 router.get("/:id/pdf", requirePermission("creditnotes", "READ"), async (req: any, res: any) => {
   try {
-    const cn = await CreditNote.findById(req.params.id).lean();
+    const byId = creditNoteByIdInScope(req, req.params.id);
+    const cn = byId ? await CreditNote.findOne(byId).lean() : null;
     if (!cn) return res.status(404).json({ error: "Credit note not found" });
 
     const buf = await generateCreditNotePdf(cn as any);
@@ -1191,7 +1218,8 @@ router.get("/:id/pdf", requirePermission("creditnotes", "READ"), async (req: any
 // GET /api/admin/credit-notes/:id
 router.get("/:id", requirePermission("creditnotes", "READ"), async (req: any, res: any) => {
   try {
-    const cn = await CreditNote.findById(req.params.id).lean();
+    const byId = creditNoteByIdInScope(req, req.params.id);
+    const cn = byId ? await CreditNote.findOne(byId).lean() : null;
     if (!cn) return res.status(404).json({ error: "Credit note not found" });
 
     const [originalInvoiceDoc, siblings] = await Promise.all([

@@ -298,8 +298,12 @@ router.use(requireBillingStaff);
  * `_id: {$in: []}` — an empty result — never an absent clause. An absent clause
  * is what "return everything" looks like, and is the precise shape of the bug
  * being fixed.
+ *
+ * Credit notes use this SAME rule (routes/creditNotes.ts): a credit note's
+ * workspaceId is copied verbatim from its invoice, so it lives in the same
+ * mixed id-space.
  */
-function invoiceTenantClause(req: any): Record<string, any> | null {
+export function invoiceTenantClause(req: any): Record<string, any> | null {
   if (isSuperAdmin(req)) return null;
 
   const ctx = {
@@ -1686,7 +1690,10 @@ router.get("/:id/credit-notes", requirePermission("invoices", "READ"), async (re
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ error: "Invalid invoice id" });
     }
-    const creditNotes = await CreditNote.find({ originalInvoiceId: req.params.id })
+    // Same tenant gate as every credit-note read: a tenant caller only ever
+    // sees credit notes of its own workspace, whatever invoice id it passes.
+    const gate = invoiceTenantClause(req);
+    const creditNotes = await CreditNote.find({ originalInvoiceId: req.params.id, ...(gate ? { $and: [gate] } : {}) })
       .select("creditNoteNo status grandTotal reasonText issuedAt createdAt isDemo")
       .sort({ createdAt: -1 })
       .lean();
