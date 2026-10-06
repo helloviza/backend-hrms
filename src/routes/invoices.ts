@@ -7,7 +7,7 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/rbac.js";
+import { requireBillingStaff } from "../middleware/requireBillingStaff.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import Invoice from "../models/Invoice.js";
@@ -250,7 +250,8 @@ function todayIST(): string {
 const router = express.Router();
 
 router.use(requireAuth);
-router.use(requireAdmin);
+// Staff door only; the per-route requirePermission grant decides access.
+router.use(requireBillingStaff);
 
 /* ── Admin read-path scoping ──────────────────────────────────────────
  *

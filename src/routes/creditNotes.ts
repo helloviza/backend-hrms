@@ -3,7 +3,7 @@ import express from "express";
 import ExcelJS from "exceljs";
 import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/rbac.js";
+import { requireBillingStaff } from "../middleware/requireBillingStaff.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import CreditNote from "../models/CreditNote.js";
@@ -457,7 +457,8 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
 const router = express.Router();
 
 router.use(requireAuth);
-router.use(requireAdmin);
+// Staff door only; the per-route requirePermission grant decides access.
+router.use(requireBillingStaff);
 
 /* ── CSV/XLSX export helpers (mirror invoices.ts) ─────────────────── */
 
