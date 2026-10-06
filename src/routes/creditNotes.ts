@@ -14,6 +14,7 @@ import { calculateGSTAmounts, type GSTType } from "../utils/gstDetection.js";
 import { uploadAndPresign } from "../utils/s3Upload.js";
 import { generateCreditNotePdf } from "../utils/creditNotePdf.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
+import { istDateString, todayIST } from "../utils/dateIST.js";
 
 /* ── Shared helpers ──────────────────────────────────────────────── */
 
@@ -78,6 +79,48 @@ async function getRemainingCreditableAmount(invoiceId: string): Promise<number> 
   const invoice = await Invoice.findById(invoiceId).select("grandTotal").lean();
   if (!invoice) throw new HttpError(404, "Original invoice not found");
   return Math.max(0, (invoice.grandTotal ?? 0) - alreadyIssued);
+}
+
+/* ── Credit-note date ─────────────────────────────────────────────
+ * The date printed on the credit note. The API takes an IST calendar day
+ * ("YYYY-MM-DD", utils/dateIST.ts contract) and stores it at 12:00 IST, so the
+ * same day reads back on the UTC server (PDF, export) and in an IST browser.
+ * Range: not before the original invoice's date, not after today (IST). */
+const YMD = /^\d{4}-\d{2}-\d{2}$/;
+
+function fmtDay(day: string): string {
+  const [y, m, d] = day.split("-");
+  return `${d}/${m}/${y}`;
+}
+
+function assertCreditNoteDayInRange(day: string, originalInvoiceDate: Date | string | undefined, now: Date = new Date()): void {
+  if (day > todayIST(now)) {
+    throw new HttpError(400, "Credit note date cannot be in the future");
+  }
+  if (originalInvoiceDate) {
+    const invDay = istDateString(new Date(originalInvoiceDate));
+    if (day < invDay) {
+      throw new HttpError(400, `Credit note date cannot be before the original invoice date (${fmtDay(invDay)})`);
+    }
+  }
+}
+
+// Resolve + range-check a requested credit-note date. Omitted = today (IST).
+function resolveCreditNoteDate(raw: unknown, originalInvoiceDate: Date | string | undefined, now: Date = new Date()): { day: string; date: Date } {
+  let day: string;
+  if (raw === undefined || raw === null || raw === "") {
+    day = todayIST(now);
+  } else {
+    const s = String(raw).trim();
+    const at = YMD.test(s) ? new Date(`${s}T12:00:00.000+05:30`) : null;
+    // Round-trip so an impossible day ("2026-02-31") is refused, not rolled over.
+    if (!at || isNaN(at.getTime()) || istDateString(at) !== s) {
+      throw new HttpError(400, "creditNoteDate must be a valid date (YYYY-MM-DD)");
+    }
+    day = s;
+  }
+  assertCreditNoteDayInRange(day, originalInvoiceDate, now);
+  return { day, date: new Date(`${day}T12:00:00.000+05:30`) };
 }
 
 async function validateCreditableAmount(invoiceId: string, requestedAmount: number): Promise<void> {
@@ -238,6 +281,10 @@ async function validateAndBuild(req: any, body: any): Promise<{ payload: Partial
   // Aggregate: total credited cannot exceed remaining creditable on the invoice
   await validateCreditableAmount(originalInvoiceId, grandTotal);
 
+  // Credit-note date (default today) — within [original invoice date, today].
+  const originalInvoiceDate = invoice.invoiceDate ?? invoice.generatedAt;
+  const { date: creditNoteDate } = resolveCreditNoteDate(body.creditNoteDate, originalInvoiceDate);
+
   // GST reason resolution (master + optional override)
   const gst = deriveGstFromReason(reason, body.gstReasonCodeOverride, body.gstReasonOverrideReason);
 
@@ -272,8 +319,9 @@ async function validateAndBuild(req: any, body: any): Promise<{ payload: Partial
 
     originalInvoiceId: invoice._id,
     originalInvoiceNo: invoice.invoiceNo,
-    originalInvoiceDate: invoice.invoiceDate ?? invoice.generatedAt,
+    originalInvoiceDate,
     originalInvoiceAmount: invoice.grandTotal ?? 0,
+    creditNoteDate,
 
     serviceCategory: (reason as any).category,
     reasonId: reason._id,
@@ -780,9 +828,28 @@ router.post("/:id/issue", requirePermission("creditnotes", "FULL"), async (req: 
       return res.status(400).json({ error: `Only DRAFT credit notes can be issued (current: ${cn.status}).` });
     }
 
-    // Re-validate the creditable balance at issue time (a sibling CN may have
-    // been issued since this draft was created).
+    // Re-run every check at issue time — the draft may be days old: the invoice
+    // may have moved out of SENT/PAID, a sibling CN may have been issued, and
+    // the date range is judged against today, not the day it was drafted.
+    const invoice = await Invoice.findById(cn.originalInvoiceId).select("status invoiceDate generatedAt").lean();
+    if (!invoice) return res.status(404).json({ error: "Original invoice not found" });
+    if (invoice.status !== "SENT" && invoice.status !== "PAID") {
+      return res.status(400).json({ error: `Cannot credit an invoice in ${invoice.status} status. Only SENT or PAID invoices can be credited.` });
+    }
+    const lines: any[] = Array.isArray(cn.lineItems) ? (cn.lineItems as any[]) : [];
+    if (lines.length === 0 || r2(cn.grandTotal ?? 0) <= 0) {
+      return res.status(400).json({ error: "Credit note must have at least one line with a positive credited amount" });
+    }
+    for (const l of lines) {
+      if (Number.isFinite(l.originalAmount) && r2(l.creditedAmount ?? l.amount ?? 0) > r2(l.originalAmount) + 0.01) {
+        return res.status(400).json({ error: `Credited amount ₹${r2(l.creditedAmount)} exceeds original line amount ₹${r2(l.originalAmount)} for "${l.description}"` });
+      }
+    }
     await validateCreditableAmount(String(cn.originalInvoiceId), cn.grandTotal ?? 0);
+    assertCreditNoteDayInRange(
+      istDateString(new Date(cn.creditNoteDate ?? Date.now())),
+      cn.originalInvoiceDate ?? (invoice as any).invoiceDate ?? (invoice as any).generatedAt,
+    );
 
     const now = new Date();
     cn.status = "ISSUED";
@@ -973,6 +1040,18 @@ router.patch("/:id", requirePermission("creditnotes", "WRITE"), async (req: any,
       cn.terms = body.terms;
     }
 
+    // Credit-note date — same range check as at creation; logged as IST days.
+    if (body.creditNoteDate !== undefined) {
+      const { day, date } = resolveCreditNoteDate(body.creditNoteDate, cn.originalInvoiceDate);
+      const oldDay = cn.creditNoteDate ? istDateString(new Date(cn.creditNoteDate)) : "";
+      if (day !== oldDay) {
+        oldValues.creditNoteDate = oldDay;
+        newValues.creditNoteDate = day;
+        fieldsChanged.push("creditNoteDate");
+        cn.creditNoteDate = date;
+      }
+    }
+
     // Reason change (re-derives GST reason code/text from the master)
     if (body.reasonId !== undefined && String(body.reasonId) !== String(cn.reasonId)) {
       if (!mongoose.Types.ObjectId.isValid(body.reasonId)) {
@@ -1132,7 +1211,15 @@ router.get("/:id", requirePermission("creditnotes", "READ"), async (req: any, re
         }
       : null;
 
-    res.json({ ok: true, creditNote: cn, originalInvoice, siblingCreditNotes: siblings });
+    // Edit history names who made each change (a profile name, never the id).
+    const history: any[] = Array.isArray((cn as any).editHistory) ? (cn as any).editHistory : [];
+    const editorNames = await userNames(history.map((h) => h.editedBy));
+    const creditNote = {
+      ...cn,
+      editHistory: history.map((h) => ({ ...h, editedByName: h.editedBy ? nameOrUnknown(editorNames.get(String(h.editedBy))) : "" })),
+    };
+
+    res.json({ ok: true, creditNote, originalInvoice, siblingCreditNotes: siblings });
   } catch (err: any) {
     console.error("[CreditNotes GET one]", err.message);
     res.status(500).json({ error: err.message });

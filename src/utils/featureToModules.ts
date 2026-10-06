@@ -33,6 +33,9 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   adminQueue:        ["sbtEnabled", "approvalDirectEnabled"],
   manualBookings:    ["sbtEnabled", "approvalDirectEnabled", "invoicesEnabled"],
   invoices:          ["invoicesEnabled"],
+  // Credit notes are credited against invoices and their routes mount behind
+  // requireFeature("invoicesEnabled") (server.ts), so they follow that flag.
+  creditnotes:       ["invoicesEnabled"],
   reports:           ["sbtEnabled", "approvalDirectEnabled", "invoicesEnabled", "vouchersEnabled"],
   companySettings:   ["sbtEnabled", "approvalDirectEnabled"],
   adminVouchers:     ["vouchersEnabled"],
