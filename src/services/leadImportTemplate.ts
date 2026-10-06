@@ -66,7 +66,7 @@ const FIELD_HELP: Record<ImportField, string> = {
   budget: "Optional free text.",
   dealValue: "Optional number (no currency symbol needed; 1,80,000 is fine). Becomes the opportunity value on Interested / Onboarded rows.",
   currency: "Optional. INR (default), USD or AED.",
-  nextFollowUpDate: "dd-mm-yyyy or ISO. REQUIRED for 'Call Back Time Given' and 'Follow up Required'; kept as the lead's next follow-up otherwise.",
+  nextFollowUpDate: "dd-mm-yyyy or ISO. REQUIRED for 'Call Back Time Given', 'Follow up Required', 'Switched off' and 'Ringing Only'; kept as the lead's next follow-up otherwise.",
   followUpNotes: "Optional. Stored as the follow-up note (and as the disposition note when the row has one).",
   createdDate: "dd-mm-yyyy or ISO date-time. PRESERVED as the lead's created date (not the import day). Blank = import time. Not in the future.",
   dispositionDate: "dd-mm-yyyy or ISO date-time. When the disposition happened — stamps dispositionAt / wonDate / opportunity closed date. Blank = import time. Not before createdDate.",
@@ -185,7 +185,7 @@ export function buildImportTemplate(input: TemplateInput): ExcelJS.Workbook {
     ["Dates", "dd-mm-yyyy (read as UTC midnight), yyyy-mm-dd, or a full ISO date-time (2026-03-14T09:30:00.000Z). Keep the cells as TEXT — the template already formats them."],
     ["createdDate", "PRESERVED as the lead's created date. Blank = import time. Rejected if in the future or before 2000."],
     ["dispositionDate", "When the disposition happened. Stamps dispositionAt, wonDate and a new opportunity's created/closed date. Blank = import time (the same as a live disposition — so a re-import without it reads as 'dispositioned today'). Rejected if before createdDate."],
-    ["nextFollowUpDate", "REQUIRED for 'Call Back Time Given' and 'Follow up Required'. Kept on the lead for every row."],
+    ["nextFollowUpDate", "REQUIRED for 'Call Back Time Given', 'Follow up Required', 'Switched off' and 'Ringing Only'. Kept on the lead for every row."],
     ["Duplicates", "A row whose company already has an OPEN lead is still imported, tagged as a possible duplicate (advisory)."],
   ].forEach(([k, v]) => { const r = av.addRow([k, v]); r.getCell(1).font = { bold: true }; r.getCell(2).alignment = { wrapText: true, vertical: "top" }; av.mergeCells(r.number, 2, r.number, 8); });
   gap();

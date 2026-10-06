@@ -87,8 +87,8 @@ export const CORPORATE_CALLING_SET: DispositionEntry[] = [
   { disposition: "Not Interested", subDisposition: "No Use Case Available", ...LOST, nextTouch: false, opportunityEffect: "lost", leadStatus: "LOST", legacyStage: "lost" },
   // Not Connected
   { disposition: "Not Connected", subDisposition: "Number Does not Exist", ...LOST, nextTouch: false, opportunityEffect: "lost", leadStatus: "LOST", legacyStage: "lost" },
-  { disposition: "Not Connected", subDisposition: "Switched off", ...NC_OPEN, nextTouch: false, opportunityEffect: "none", leadStatus: "CONTACTED", legacyStage: "contacted" },
-  { disposition: "Not Connected", subDisposition: "Ringing Only", ...NC_OPEN, nextTouch: false, opportunityEffect: "none", leadStatus: "CONTACTED", legacyStage: "contacted" },
+  { disposition: "Not Connected", subDisposition: "Switched off", ...NC_OPEN, nextTouch: true, opportunityEffect: "none", leadStatus: "CONTACTED", legacyStage: "contacted" },
+  { disposition: "Not Connected", subDisposition: "Ringing Only", ...NC_OPEN, nextTouch: true, opportunityEffect: "none", leadStatus: "CONTACTED", legacyStage: "contacted" },
   { disposition: "Not Connected", subDisposition: "Temp out of Service", ...LOST, nextTouch: false, opportunityEffect: "lost", leadStatus: "LOST", legacyStage: "lost" },
   // Onboarded
   { disposition: "Onboarded", subDisposition: "Onboarded", stage: "Onboarded", status: "Won", nextTouch: false, opportunityEffect: "won", leadStatus: "CONVERTED", legacyStage: "won" },

@@ -92,6 +92,10 @@ describe("Corporate Calling disposition set (from the sheet)", () => {
     expect(by("Not Connected").map((e) => [e.subDisposition, e.stage, e.status])).toEqual([
       ["Number Does not Exist", "Lost", "Lost"], ["Switched off", "NC", "Open"], ["Ringing Only", "NC", "Open"], ["Temp out of Service", "Lost", "Lost"],
     ]);
+    // a reachable number that didn't answer → schedule the callback
+    expect(CORPORATE_CALLING_SET.filter((e) => e.nextTouch).map((e) => e.subDisposition)).toEqual([
+      "Call Back Time Given", "Follow up Required", "Switched off", "Ringing Only",
+    ]);
     expect(by("Onboarded")).toHaveLength(1);
     expect(by("Onboarded")[0]).toMatchObject({ stage: "Onboarded", status: "Won", opportunityEffect: "won" });
     // derived pairs
@@ -229,10 +233,16 @@ describe("applyDisposition — derivation, activity, shadow opportunity", () => 
     expect(await Opportunity.countDocuments({})).toBe(1);
   });
 
-  it("Not Connected: Switched off → NC/Open; Number Does not Exist → Lost; Onboarded first → won deal created", async () => {
+  it("Not Connected: Switched off / Ringing Only need a follow-up date → NC/Open; Number Does not Exist → Lost; Onboarded first → won deal created", async () => {
     const a = await freshLead();
-    expect((await applyDisposition(a, { subDisposition: "Switched off", actor: ACTOR })).to).toMatchObject({ stage: "NC", status: "Open" });
-    expect((await Lead.collection.findOne({ _id: a._id }))!.stage).toBe("contacted");
+    await expect(applyDisposition(a, { subDisposition: "Switched off", actor: ACTOR })).rejects.toThrow(/"Switched off" needs a next follow-up date/);
+    const due = new Date(Date.now() + 86400000);
+    expect((await applyDisposition(a, { subDisposition: "Switched off", nextFollowUpDate: due, actor: ACTOR })).to).toMatchObject({ stage: "NC", status: "Open" });
+    expect(await Lead.collection.findOne({ _id: a._id })).toMatchObject({ stage: "contacted", nextFollowUpDate: due });
+    const d = await freshLead({ contactName: "D" });
+    await expect(applyDisposition(d, { subDisposition: "Ringing Only", actor: ACTOR })).rejects.toThrow(/"Ringing Only" needs a next follow-up date/);
+    expect((await applyDisposition(d, { subDisposition: "Ringing Only", nextFollowUpDate: due, actor: ACTOR })).to).toMatchObject({ stage: "NC", status: "Open" });
+    expect((await Lead.collection.findOne({ _id: d._id }))!.nextFollowUpDate).toEqual(due);
     const b = await freshLead({ contactName: "B" });
     expect((await applyDisposition(b, { subDisposition: "Number Does not Exist", actor: ACTOR })).to).toMatchObject({ stage: "Lost", status: "Lost" });
     const c = await freshLead({ contactName: "C" });
