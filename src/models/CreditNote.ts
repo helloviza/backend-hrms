@@ -24,6 +24,9 @@ export interface ICreditNoteEditHistoryEntry {
   fieldsChanged: string[];
   oldValues: Record<string, unknown>;
   newValues: Record<string, unknown>;
+  /** Super Admin override (POST /:id/override) — with its required reason. */
+  override?: boolean;
+  reason?: string;
 }
 
 export interface ICreditNote extends Document {
@@ -259,6 +262,8 @@ const CreditNoteSchema = new Schema<ICreditNote>(
       fieldsChanged: [String],
       oldValues: { type: Schema.Types.Mixed },
       newValues: { type: Schema.Types.Mixed },
+      override: { type: Boolean },
+      reason: { type: String },
     }],
   },
   { timestamps: true },

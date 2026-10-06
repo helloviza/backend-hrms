@@ -16,6 +16,7 @@ import { generateCreditNotePdf } from "../utils/creditNotePdf.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import { istDateString, todayIST } from "../utils/dateIST.js";
 import { invoiceTenantClause } from "./invoices.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 
 /* ── Shared helpers ──────────────────────────────────────────────── */
 
@@ -1190,6 +1191,207 @@ router.patch("/:id", requirePermission("creditnotes", "WRITE"), async (req: any,
   } catch (err: any) {
     if (err instanceof HttpError) return res.status(err.httpStatus).json({ error: err.message });
     console.error("[CreditNotes PATCH]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Super Admin override ─────────────────────────────────────────────
+ * POST /api/admin/credit-notes/:id/override
+ *
+ * Imran's decision (2026-10-07): Super Admin ONLY — checked here, never via a
+ * grant, so no creditnotes level (FULL included) and no tenant admin reaches
+ * it — may, on a credit note in ANY status:
+ *   • edit amount (line items), credit-note date, GST reason code, reason
+ *     note, notes, terms;
+ *   • set status to DRAFT / ISSUED / CANCELLED — incl. restoring a CANCELLED
+ *     note to ISSUED under its SAME number.
+ * Body: { reason (required), changes: { …fields…, status? } }.
+ *
+ * The books stay consistent:
+ *   • GST rebuilt exactly as at creation (buildCreditedLineItems +
+ *     calculateGSTAmounts on the note's own supplyType);
+ *   • ISSUED notes on the invoice may not total more than the invoice — the
+ *     override is refused with the figures;
+ *   • the invoice's creditedAmount is RECOMPUTED (sum of ISSUED notes), not
+ *     $inc'd, so it is right after any combination of amount + status change;
+ *   • the number never changes; the date may not precede the invoice date;
+ *   • one edit-history entry (override: true, reason, old → new for every
+ *     field and status); the PDF is re-rendered.
+ * The normal DRAFT / issue / cancel routes above are untouched. */
+router.post("/:id/override", async (req: any, res: any) => {
+  try {
+    if (!isSuperAdmin(req)) {
+      return res.status(403).json({ error: "Only a Super Admin can override a credit note." });
+    }
+    const byId = creditNoteByIdInScope(req, req.params.id);
+    const cn: any = byId ? await CreditNote.findOne(byId) : null;
+    if (!cn) return res.status(404).json({ error: "Credit note not found" });
+
+    const reason = String(req.body?.reason ?? "").trim();
+    if (!reason) return res.status(400).json({ error: "A reason is required for an override." });
+    if (reason.length > 500) return res.status(400).json({ error: "Reason must be 500 characters or fewer." });
+    const changes: any = req.body?.changes ?? {};
+
+    const invoice: any = await Invoice.findById(cn.originalInvoiceId).lean();
+    if (!invoice) return res.status(404).json({ error: "Original invoice not found" });
+
+    const oldValues: Record<string, unknown> = {};
+    const newValues: Record<string, unknown> = {};
+    const fieldsChanged: string[] = [];
+    const note = (field: string, from: unknown, to: unknown) => {
+      oldValues[field] = from;
+      newValues[field] = to;
+      fieldsChanged.push(field);
+    };
+
+    // Text fields
+    for (const [field, max] of [["reasonNote", 500], ["notes", 1000], ["terms", 2000]] as const) {
+      if (changes[field] === undefined) continue;
+      const next = String(changes[field] ?? "").slice(0, max);
+      if (next !== (cn[field] ?? "")) { note(field, cn[field] ?? "", next); cn[field] = next; }
+    }
+
+    // Credit-note date — a real day, not before the original invoice's date.
+    if (changes.creditNoteDate !== undefined) {
+      const day = String(changes.creditNoteDate ?? "").trim();
+      const at = YMD.test(day) ? new Date(`${day}T12:00:00.000+05:30`) : null;
+      if (!at || isNaN(at.getTime()) || istDateString(at) !== day) {
+        return res.status(400).json({ error: "creditNoteDate must be a valid date (YYYY-MM-DD)" });
+      }
+      const invDay = istDateString(new Date(cn.originalInvoiceDate ?? invoice.invoiceDate ?? invoice.generatedAt));
+      if (day < invDay) {
+        return res.status(400).json({ error: `Credit note date cannot be before the original invoice date (${fmtDay(invDay)})` });
+      }
+      const oldDay = cn.creditNoteDate ? istDateString(new Date(cn.creditNoteDate)) : "";
+      if (day !== oldDay) { note("creditNoteDate", oldDay, day); cn.creditNoteDate = at; }
+    }
+
+    // GST reason code (01–07). Re-derived against the note's reason master, so
+    // "overridden" is true only when it differs from the master's own code.
+    if (changes.gstReasonCode !== undefined) {
+      const code = String(changes.gstReasonCode);
+      if (!GST_REASON_TEXT[code]) return res.status(400).json({ error: "gstReasonCode must be 01–07" });
+      if (code !== cn.gstReasonCode) {
+        const master = await CreditNoteReason.findById(cn.reasonId).lean();
+        const gst = master
+          ? deriveGstFromReason(master, code, reason)
+          : { gstReasonCode: code, gstReasonText: GST_REASON_TEXT[code], gstReasonOverridden: true, gstReasonOverrideReason: reason };
+        note("gstReasonCode", cn.gstReasonCode, gst.gstReasonCode);
+        cn.gstReasonCode = gst.gstReasonCode;
+        cn.gstReasonText = gst.gstReasonText;
+        cn.gstReasonOverridden = gst.gstReasonOverridden;
+        cn.gstReasonOverrideBy = gst.gstReasonOverridden ? req.user._id : undefined;
+        cn.gstReasonOverrideReason = gst.gstReasonOverridden ? gst.gstReasonOverrideReason : undefined;
+      }
+    }
+
+    // Amount — line items rebuilt + GST recomputed exactly as at creation.
+    if (changes.lineItems !== undefined || changes.isFullCredit !== undefined) {
+      const isFullCredit = changes.isFullCredit !== undefined ? changes.isFullCredit === true : cn.isFullCredit;
+      const built = buildCreditedLineItems(invoice, { isFullCredit, lineItems: changes.lineItems ?? cn.lineItems });
+      if (built.lines.length === 0 || built.grandTotal <= 0) {
+        return res.status(400).json({ error: "Credit note must keep at least one line with a positive credited amount" });
+      }
+      for (const l of built.lines) {
+        if (r2(l.creditedAmount) > r2(l.originalAmount) + 0.01) {
+          return res.status(400).json({ error: `Credited amount ₹${r2(l.creditedAmount)} exceeds original line amount ₹${r2(l.originalAmount)} for "${l.description}"` });
+        }
+      }
+      if (r2(built.grandTotal) !== r2(cn.grandTotal ?? 0) || isFullCredit !== cn.isFullCredit) {
+        const gstAmounts = calculateGSTAmounts(built.totalGST, cn.supplyType as GSTType);
+        note("totals",
+          { subtotal: cn.subtotal, totalGST: cn.totalGST, grandTotal: cn.grandTotal },
+          { subtotal: built.subtotal, totalGST: built.totalGST, grandTotal: built.grandTotal });
+        fieldsChanged.push("lineItems");
+        cn.isFullCredit = isFullCredit;
+        cn.lineItems = built.lines;
+        cn.markModified("lineItems");
+        cn.subtotal = built.subtotal;
+        cn.totalGST = built.totalGST;
+        cn.grandTotal = built.grandTotal;
+        cn.cgstAmount = gstAmounts.cgst;
+        cn.sgstAmount = gstAmounts.sgst;
+        cn.utgstAmount = gstAmounts.utgst;
+        cn.igstAmount = gstAmounts.igst;
+      }
+    }
+
+    // Status — any of DRAFT / ISSUED / CANCELLED; the number never changes.
+    const now = new Date();
+    if (changes.status !== undefined && changes.status !== cn.status) {
+      const to = String(changes.status);
+      if (!["DRAFT", "ISSUED", "CANCELLED"].includes(to)) {
+        return res.status(400).json({ error: "status must be DRAFT, ISSUED or CANCELLED" });
+      }
+      const from = cn.status;
+      note("status", from, to);
+      if (to === "ISSUED") {
+        if (!cn.issuedAt) { cn.issuedAt = now; cn.issuedBy = req.user._id; }
+        if (from === "CANCELLED") {
+          note("cancellation",
+            { cancelledAt: cn.cancelledAt, cancellationReason: cn.cancellationReason ?? "" },
+            { cancelledAt: null, cancellationReason: "" });
+          cn.cancelledAt = undefined; cn.cancelledBy = undefined; cn.cancellationReason = undefined; cn.cancellationNote = undefined;
+        }
+      } else if (to === "CANCELLED") {
+        cn.cancelledAt = now;
+        cn.cancelledBy = req.user._id;
+        cn.cancellationReason = reason;
+      } else {
+        // → DRAFT: clear the issued / cancelled stamps (the history keeps them).
+        if (cn.issuedAt) note("issuedAt", cn.issuedAt, null);
+        if (from === "CANCELLED") {
+          note("cancellation",
+            { cancelledAt: cn.cancelledAt, cancellationReason: cn.cancellationReason ?? "" },
+            { cancelledAt: null, cancellationReason: "" });
+        }
+        cn.issuedAt = undefined; cn.issuedBy = undefined;
+        cn.cancelledAt = undefined; cn.cancelledBy = undefined; cn.cancellationReason = undefined; cn.cancellationNote = undefined;
+      }
+      cn.status = to;
+    }
+
+    if (!fieldsChanged.length) return res.status(400).json({ error: "Nothing to change." });
+
+    // Over-credit: ISSUED notes on this invoice may not exceed its amount.
+    const others = await CreditNote.aggregate([
+      { $match: { originalInvoiceId: cn.originalInvoiceId, status: "ISSUED", _id: { $ne: cn._id } } },
+      { $group: { _id: null, total: { $sum: "$grandTotal" } } },
+    ]);
+    const credited = r2((others[0]?.total ?? 0) + (cn.status === "ISSUED" ? cn.grandTotal ?? 0 : 0));
+    const invoiceTotal = r2(invoice.grandTotal ?? 0);
+    if (credited > invoiceTotal + 0.01) {
+      return res.status(400).json({
+        error: `Refused: issued credit notes would total ₹${credited} against invoice ${invoice.invoiceNo} of ₹${invoiceTotal}. Reduce the amount or cancel another credit note first.`,
+      });
+    }
+
+    cn.editedAt = now;
+    cn.editedBy = req.user._id;
+    if (!cn.editHistory) cn.editHistory = [];
+    cn.editHistory.push({ editedAt: now, editedBy: req.user._id, fieldsChanged, oldValues, newValues, override: true, reason });
+    await cn.save();
+
+    // Invoice credited total = sum of its ISSUED notes, recomputed.
+    await Invoice.collection.updateOne({ _id: invoice._id }, { $set: { creditedAmount: credited } });
+
+    // PDF re-rendered with the new figures / status. The override itself is
+    // already saved; a render failure is reported, and GET /:id/pdf re-renders
+    // on demand anyway.
+    let pdfUrl: string | undefined;
+    let pdfError: string | undefined;
+    try {
+      ({ pdfUrl } = await attemptPdfWithRetry(cn.toObject()));
+      await CreditNote.collection.updateOne({ _id: cn._id }, { $set: { pdfUrl } });
+    } catch (err: any) {
+      pdfError = err?.message || "PDF render failed";
+      console.error("[CreditNotes override] PDF render failed:", pdfError);
+    }
+
+    res.json({ ok: true, creditNote: cn.toObject(), creditedAmount: credited, pdfUrl, pdfError });
+  } catch (err: any) {
+    if (err instanceof HttpError) return res.status(err.httpStatus).json({ error: err.message });
+    console.error("[CreditNotes override]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
