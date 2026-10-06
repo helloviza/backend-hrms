@@ -86,7 +86,7 @@ beforeAll(async () => {
 afterAll(async () => { await mongoose.disconnect(); await mongod?.stop(); });
 
 beforeEach(async () => {
-  for (const c of ["invoices", "creditnotes", "creditnotereasons", "users", "userpermissions", "counters", "companysettings"]) await col(c).deleteMany({});
+  for (const c of ["invoices", "creditnotes", "creditnotereasons", "users", "userpermissions", "counters", "companysettings", "manualbookings"]) await col(c).deleteMany({});
   await col("creditnotereasons").insertOne({ _id: REASON, category: "FLIGHT", reason: "Flight cancelled", code: "FLT",
     gstReasonCode: "01", gstReasonText: "Sales Return", isActive: true, displayOrder: 1 } as any);
   await col("invoices").insertOne({
@@ -107,6 +107,10 @@ describe("HOUSE staff with travel roles: the grant decides", () => {
     "EMPLOYEE + %s with invoices + creditnotes FULL (scope OWN) — every page call works",
     async (travelRole) => {
       const u = await person(["EMPLOYEE", travelRole], HOUSE, { invoices: "FULL", creditnotes: "FULL" });
+      // Scope OWN (2026-10-07): the invoice is theirs because they created its booking.
+      const b1 = oid();
+      await col("manualbookings").insertOne({ _id: b1, bookingRef: "B1", createdBy: u.user._id, bookedBy: oid(String(u.user._id)) } as any);
+      await col("invoices").updateOne({ _id: INV }, { $set: { bookingIds: [b1] } });
       expect((await get(u, "/api/admin/invoices")).status).toBe(200);
       expect((await get(u, `/api/admin/invoices/${INV}`)).status).toBe(200);
       expect((await get(u, "/api/admin/invoices/activity")).status).toBe(200);
