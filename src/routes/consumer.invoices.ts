@@ -249,8 +249,8 @@ router.get("/:invoiceId/pdf", async (req: any, res: any) => {
      *   2. no bank-details card — Razorpay already took this money, and
      *      printing account numbers on the receipt invites a second,
      *      duplicate payment;
-     *   3. it reads as settled — "AMOUNT PAID" and "STATUS / Paid" rather
-     *      than "BALANCE DUE" and a due date.
+     *   3. it reads as settled — BALANCE DUE "Paid" and DUE DATE "NA"
+     *      rather than an amount and a due date.
      *
      * `paid: true` is a safe assertion at this call site and not a guess:
      * the list query and the ownership clause above both require

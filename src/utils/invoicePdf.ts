@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 import type { IInvoice } from "../models/Invoice.js";
 import { getCompanySettings, type ICompanySettings } from "../models/CompanySettings.js";
 import { numberToWords } from "./numberToWords.js";
+import { invoiceHeaderDisplay } from "./invoiceHeaderDisplay.js";
 import logger from "./logger.js";
 
 /* ── Font paths — resolved relative to this file ───── */
@@ -138,9 +139,9 @@ export async function prefetchInvoiceAssets(): Promise<InvoicePdfPrefetch> {
  *   - the bank-details card is drawn whether or not the settings behind it
  *     are populated (blanking them yields a card full of em-dashes, which
  *     is worse than the card itself), and
- *   - "BALANCE DUE" is a literal string paired with invoice.grandTotal, so
- *     no input can turn it into a settled figure without also corrupting
- *     the Total.
+ *   - the BALANCE DUE / DUE DATE boxes follow the invoice's status (see
+ *     utils/invoiceHeaderDisplay.ts), and a receipt's status is not the
+ *     whole story — a D2C receipt is settled by its Razorpay capture.
  *
  * Hence flags rather than input shaping.
  *
@@ -162,13 +163,13 @@ export interface InvoicePdfOptions {
    */
   hideBankDetails?: boolean;
   /**
-   * Present the document as SETTLED: the top-left stat box reads "AMOUNT
-   * PAID" instead of "BALANCE DUE", and the box beside it reads
-   * "STATUS / Paid" instead of a due date.
+   * Present the document as SETTLED: render the header as for a PAID
+   * invoice — BALANCE DUE "Paid", DUE DATE "NA" — whatever the stored
+   * status (utils/invoiceHeaderDisplay.ts holds the rule). Without it the
+   * header follows invoice.status, so CANCELLED still reads "Cancelled".
    *
-   * The AMOUNT is unchanged either way — it is still invoice.grandTotal,
-   * because on a settled document the amount due and the amount paid are
-   * the same number. This flag relabels; it never re-computes.
+   * The Total is unchanged either way — it is still invoice.grandTotal.
+   * This flag relabels; it never re-computes.
    *
    * NOTE this renderer has no notion of PARTIAL payment and this flag does
    * not add one. It is a caller's assertion that the whole invoice is
@@ -342,22 +343,25 @@ export async function generateInvoicePdf(
     const BOX1_X = BOX2_X - BOX_W - BOX_GAP;
     const BOX_Y = M;
 
-    // Box 1: BALANCE DUE — or AMOUNT PAID on a settled document. Same
-    // figure, same geometry, same colours; only the caption changes.
+    // Box 1: BALANCE DUE / Box 2: DUE DATE. On a PAID or CANCELLED invoice
+    // they read "Paid"/"Cancelled" and "NA" (utils/invoiceHeaderDisplay.ts,
+    // shared with the staff page). Same geometry and colours either way.
+    const header = invoiceHeaderDisplay({
+      status: renderAsPaid ? "PAID" : invoice.status,
+      grandTotal: invoice.grandTotal,
+    });
     doc.rect(BOX1_X, BOX_Y, BOX_W, BOX_H).fill(C_PRIMARY);
     doc.fillColor("#aab4c4").fontSize(9).font(FONT_NORMAL)
-      .text(renderAsPaid ? "AMOUNT PAID" : "BALANCE DUE", BOX1_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
+      .text("BALANCE DUE", BOX1_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
     doc.fillColor("#ffffff").fontSize(14).font(FONT_BOLD)
-      .text(fmtCur(invoice.grandTotal ?? 0), BOX1_X + 8, BOX_Y + 24, { width: BOX_W - 16, lineBreak: false });
+      .text(header.balanceDueText ?? fmtCur(header.balanceDueAmount), BOX1_X + 8, BOX_Y + 24, { width: BOX_W - 16, lineBreak: false });
 
-    // Box 2: DUE DATE — or STATUS/Paid. A due date on a settled receipt
-    // ("On Receipt", against money already received) reads as a demand.
     doc.rect(BOX2_X, BOX_Y, BOX_W, BOX_H).fill(C_SURF_LOW);
     doc.fillColor(C_MID).fontSize(9).font(FONT_NORMAL)
-      .text(renderAsPaid ? "STATUS" : "DUE DATE", BOX2_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
+      .text("DUE DATE", BOX2_X + 8, BOX_Y + 9, { width: BOX_W - 16, lineBreak: false });
     const dueDateStr = invoice.dueDate ? fmtDate(invoice.dueDate) : "On Receipt";
     doc.fillColor(C_PRIMARY).fontSize(11).font(FONT_BOLD)
-      .text(renderAsPaid ? "Paid" : dueDateStr, BOX2_X + 8, BOX_Y + 26, { width: BOX_W - 16, lineBreak: false });
+      .text(header.dueDateText ?? dueDateStr, BOX2_X + 8, BOX_Y + 26, { width: BOX_W - 16, lineBreak: false });
 
     y = Math.max(leftTitleBottomY, BOX_Y + BOX_H) + 24;
 

@@ -123,8 +123,9 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
     const enrichedClient = await enrichClientDetails(invoice);
-    // A settled invoice must not print "BALANCE DUE" — relabel the top boxes
-    // to AMOUNT PAID / STATUS: Paid. PAID only: PAYMENT_DECLARED is the
+    // A settled invoice must not print an amount due — the top boxes read
+    // BALANCE DUE "Paid" / DUE DATE "NA" (utils/invoiceHeaderDisplay.ts;
+    // CANCELLED follows from the status). PAID only: PAYMENT_DECLARED is the
     // customer's own claim awaiting finance (see declare-payment below), and
     // printing it as paid would let the payer settle their own invoice.
     // Unlike the D2C receipt, a B2B invoice KEEPS its bank block.
@@ -2147,8 +2148,8 @@ router.post("/:id/pdf", requirePermission("invoices", "WRITE"), async (req: any,
     if (!invoice || !(await invoiceInCallerScope(req, invoice))) return res.status(404).json({ error: "Invoice not found" });
 
     const enrichedClient = await enrichClientDetails(invoice);
-    // Settled invoices read AMOUNT PAID / STATUS: Paid rather than BALANCE
-    // DUE; PAID only, for the reason given on the workspace /pdf route above.
+    // Settled invoices read BALANCE DUE "Paid" / DUE DATE "NA"; PAID only,
+    // for the reason given on the workspace /pdf route above.
     const pdfBuffer = await generateInvoicePdf(
       { ...invoice, clientDetails: enrichedClient } as any,
       undefined,
