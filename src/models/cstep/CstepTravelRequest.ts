@@ -154,6 +154,10 @@ export interface ICstepTravelRequest extends Document {
   // outcome CLOSE -> SETTLED (nothing owed, closed), outcome TO_FINANCE ->
   // TRANSFERRED_TO_FINANCE (money owed, reusing the status already defined
   // above).
+  // Step 6 — REIMBURSED is the terminal state for the paid-out case: the
+  // Finance user (TravellerProfile.financeUserId) or a CSTEP Admin marks
+  // the reimbursement done (POST /requests/:id/finance/settle). Distinct
+  // from SETTLED, which stays "closed with nothing owed".
   status:
     | "DRAFT"
     | "SUBMITTED"
@@ -165,6 +169,7 @@ export interface ICstepTravelRequest extends Document {
     | "REPORT_SUBMITTED"
     | "TRANSFERRED_TO_FINANCE"
     | "SETTLED"
+    | "REIMBURSED"
     | "REJECTED"
     | "CANCELLED";
   claimReference?: string; // set on approval — TOUR_PROPOSAL only, see routes/cstep.ts's approve handler
@@ -327,6 +332,7 @@ const CstepTravelRequestSchema = new Schema<ICstepTravelRequest>(
         "REPORT_SUBMITTED",
         "TRANSFERRED_TO_FINANCE",
         "SETTLED",
+        "REIMBURSED",
         "REJECTED",
         "CANCELLED",
       ],

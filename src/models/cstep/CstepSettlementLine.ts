@@ -48,7 +48,7 @@ export interface ICstepSettlementLine extends Document {
   classificationOverrideReason?: string;
 
   verified: boolean;
-  attachmentId?: mongoose.Types.ObjectId; // ref CstepAttachment — carried over from the source report leg, if any; ARRANGEMENT-sourced lines have none
+  attachmentId?: mongoose.Types.ObjectId; // ref CstepAttachment — carried over from the source report leg, if any; an ARRANGEMENT-sourced line carries the document of the SEEDED CSTEP-paid leg that mirrors it (paired at seed time by order + travelMode)
 
   createdBy: mongoose.Types.ObjectId; // ref User — who ran /settlement/start (the seeding action)
   verifiedBy?: mongoose.Types.ObjectId; // ref User

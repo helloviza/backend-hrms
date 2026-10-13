@@ -20,6 +20,7 @@ import ExcelJS from "exceljs";
 import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { requireFeature } from "../middleware/requireFeature.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import TravellerProfile, {
@@ -1394,7 +1395,11 @@ router.get("/", async (req: any, res: any) => {
  * so it must come first or Express would match "tour-approver-candidates"
  * as an :id. */
 
-router.get("/tour-approver-candidates", async (req: any, res: any) => {
+// CSTEP's own routing concept — only meaningful where the workspace has
+// CSTEP switched on, so both mapping routes sit behind the same feature
+// gate as /api/cstep itself (a leader of a non-CSTEP tenant otherwise
+// saw and could set Approver/Official/Finance slots that nothing reads).
+router.get("/tour-approver-candidates", requireFeature("cstepEnabled"), async (req: any, res: any) => {
   try {
     if (!isCstepAdmin(req)) {
       return res.status(403).json({ error: "Only a CSTEP Admin can view Tour Approver candidates" });
@@ -3470,7 +3475,7 @@ async function resolveCstepMappingSlot(
   return { ok: true, value: user._id };
 }
 
-router.patch("/:id/tour-approver", async (req: any, res: any) => {
+router.patch("/:id/tour-approver", requireFeature("cstepEnabled"), async (req: any, res: any) => {
   try {
     if (!isCstepAdmin(req)) {
       return res.status(403).json({ error: "Only a CSTEP Admin can set the Approver/Official user/Finance user mapping" });

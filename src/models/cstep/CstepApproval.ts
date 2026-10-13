@@ -47,7 +47,13 @@ export type CstepApprovalAction =
   | "SETTLE"
   // Step 6 — hand-off to Finance (not built yet; defined ahead of time so
   // the Processing board's "Transferred to Finance" stage/tab can exist).
-  | "TRANSFER_TO_FINANCE";
+  | "TRANSFER_TO_FINANCE"
+  // Step 6 — Finance marks the reimbursement paid out (REIMBURSED).
+  | "FINANCE_SETTLE"
+  // Exit/bounce paths — send-backs after approval. The approval-stage
+  // send-back stays RETURN; reject at that stage is REJECT (above).
+  | "RETURN_REPORT" // Official → traveller: REPORT_SUBMITTED → REPORT_PENDING
+  | "RETURN_TO_OFFICIAL"; // Finance → Official: TRANSFERRED_TO_FINANCE → REPORT_SUBMITTED
 
 export interface ICstepApproval extends Document {
   workspaceId: mongoose.Types.ObjectId;
@@ -95,6 +101,9 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "VERIFY_LINE",
       "SETTLE",
       "TRANSFER_TO_FINANCE",
+      "FINANCE_SETTLE",
+      "RETURN_REPORT",
+      "RETURN_TO_OFFICIAL",
     ],
     required: true,
   },

@@ -53,6 +53,8 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   crmContacts:       ["crmEnabled"],
   crmCompanies:      ["crmEnabled"],
   leads:             ["crmEnabled"],
+  // CSTEP TRAVEL & CLAIM PORTAL
+  cstep:             ["cstepEnabled"],
   // PLUMCONNECT (Slice 7) — the WhatsApp inbox, one key per department line
   // + one for no-line threads; all on the inbox's own workspace feature.
   plumconnectPlumtrips: ["plumconnectEnabled"],

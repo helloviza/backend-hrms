@@ -263,6 +263,28 @@ export function clearDemoRefreshCookie(res: any) {
   });
 }
 
+/**
+ * A fresh login must always win over whatever refresh cookie the browser
+ * already holds for this origin — a prior person's session on a shared
+ * machine, or a leftover demo-impersonation cookie (which /refresh checks
+ * FIRST and would otherwise silently re-mint the previous identity right
+ * after the new login's own post-login refresh). Clears every variant we
+ * have ever issued under this name; the caller then sets the new one.
+ */
+function clearStaleRefreshCookies(res: any) {
+  clearDemoRefreshCookie(res);
+  // Legacy root-path variant (a root-scoped cookie is also sent to
+  // /api/auth/refresh and, sorting after the current path-scoped one, is
+  // what cookie-parser would fall back to once the current one is gone).
+  res.clearCookie(REFRESH_COOKIE_NAME, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
+    path: "/",
+    ...cookieDomainOption(),
+  });
+}
+
 function setAccessCookie(res: any, accessToken: string) {
   res.cookie(ACCESS_COOKIE_NAME, accessToken, {
     httpOnly: true,
@@ -974,6 +996,7 @@ r.post("/login", loginLimiter, async (req, res) => {
 
     const refreshToken = signRefresh(user);
 
+    clearStaleRefreshCookies(res);
     setRefreshCookie(res, refreshToken);
     setAccessCookie(res, accessToken);
 
@@ -1034,6 +1057,35 @@ r.post("/refresh", async (req, res) => {
     if (!token) return res.status(401).json({ error: "Missing refresh token" });
 
     const payload: any = verifyRefresh(token);
+
+    // A refresh may bump a session's token, never change WHO the session is.
+    // When the caller presents its current access token (expired is fine —
+    // that is the normal refresh case), its subject must match the cookie's.
+    // A mismatch means the cookie belongs to someone else (a stale cookie
+    // from a prior person on this browser): refuse instead of silently
+    // swapping the signed-in user. A caller with no access token (fresh
+    // boot, deep link) is unaffected — the cookie alone still restores.
+    const presented = authHeaderBearer(req);
+    if (presented) {
+      let current: any = null;
+      try {
+        current = jwt.verify(presented, safeEnv("JWT_SECRET"), { ignoreExpiration: true });
+      } catch {
+        current = null; // unverifiable/foreign token — no opinion, fall through
+      }
+      if (current?.sub && current._demoImpersonation !== true && String(current.sub) !== String(payload.sub)) {
+        authLogger.warn("Refresh refused: refresh cookie belongs to a different user than the session", {
+          sessionUserId: String(current.sub),
+          cookieUserId: String(payload.sub),
+          ip: req.ip,
+        });
+        return res.status(401).json({
+          error: "This browser holds a sign-in for a different account. Please sign in again.",
+          code: "SESSION_MISMATCH",
+        });
+      }
+    }
+
     // NOTE: pre-auth lookup, workspace not yet available
     const user: any = await User.findById(payload.sub);
     if (!user) return res.status(401).json({ error: "User not found" });
@@ -1357,6 +1409,7 @@ r.post("/reset-password", async (req, res) => {
  * ─────────────────────────────────────────────── */
 r.post("/logout", (_req, res) => {
   clearRefreshCookie(res);
+  clearStaleRefreshCookies(res);
   clearAccessCookie(res);
   res.json({ ok: true });
 });

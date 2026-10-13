@@ -65,6 +65,11 @@ import { uploadCstepPacketPdf, type CstepPacketReportLeg } from "../utils/cstepP
 import { presignGetObject } from "../utils/s3Presign.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { getLiveRate } from "../utils/exchangeRate.js";
+import {
+  buildTravelRegisterWorkbook,
+  resolveRegisterPeriod,
+  type RegisterTrip,
+} from "../utils/cstepTravelRegister.js";
 import { env } from "../config/env.js";
 
 const router = Router();
@@ -101,9 +106,14 @@ const REPORT_DOCUMENT_TYPE_BY_MODE: Record<CstepServiceType, CstepDocumentType> 
 const TIME_BANDS = ["BEFORE_6AM", "6AM_12PM", "12PM_6PM", "AFTER_6PM"];
 const MODES = ["AIR", "RAIL", "ROAD", "OTHER"];
 const EDITABLE_STATUSES = new Set(["DRAFT", "RETURNED"]);
-// Step 1 Polish (Part B) — an APPROVED trip is never silently cancellable
-// here; that's later, separate work. DRAFT/SUBMITTED/RETURNED only.
-const CANCELLABLE_STATUSES = new Set(["DRAFT", "SUBMITTED", "RETURNED"]);
+// Step 1 Polish (Part B) cancelled DRAFT/SUBMITTED/RETURNED. Exit paths
+// extend it to an approved trip up to and including REPORT_PENDING (APPROVED/
+// ARRANGING/ARRANGED/REPORT_PENDING) — a reason is mandatory there.
+// REPORT_PENDING is included because report/start auto-fires just by opening
+// the report page, so it doesn't mean the report was filed. Never once the
+// report is submitted or money has moved (REPORT_SUBMITTED onwards).
+const CANCELLABLE_STATUSES = new Set(["DRAFT", "SUBMITTED", "RETURNED", "APPROVED", "ARRANGING", "ARRANGED", "REPORT_PENDING"]);
+const POST_APPROVAL_CANCELLABLE = new Set(["APPROVED", "ARRANGING", "ARRANGED", "REPORT_PENDING"]);
 const FORM_TYPES = new Set<CstepFormType>(["TOUR_PROPOSAL", "EVENT_REQUEST"]);
 
 /** Resolves the formType for a create payload — defaults to TOUR_PROPOSAL
@@ -152,6 +162,48 @@ async function callerCanArrangeForTraveller(req: any, travelerProfileId: any): P
     .lean();
   if (!traveller?.officialUserId) return false;
   return String(traveller.officialUserId) === ownerId(req);
+}
+
+/**
+ * Step 6 — per-request FINANCE authority: a CSTEP Admin (any request), or
+ * the specific User this traveller has assigned as their Finance user
+ * (TravellerProfile.financeUserId) — only that traveller's requests. Same
+ * shape as the Approver/Official checks above; the third slot in the
+ * Traveller → Approver → Official → Finance mapping.
+ */
+async function callerCanFinanceForTraveller(req: any, travelerProfileId: any): Promise<boolean> {
+  if (isCstepAdmin(req)) return true;
+  const traveller: any = await TravellerProfile.findOne({
+    _id: travelerProfileId,
+    workspaceId: req.workspaceObjectId,
+  })
+    .select("financeUserId")
+    .lean();
+  if (!traveller?.financeUserId) return false;
+  return String(traveller.financeUserId) === ownerId(req);
+}
+
+/**
+ * READ authority over a traveller's case for anyone in its pipeline: a
+ * CSTEP Admin, or the traveller's mapped Approver, Official or Finance
+ * user. Used by the read-only routes (activity log, proposal PDF, packet,
+ * travel report) — before Step 6 those admitted only owner/approver (+
+ * official for report/packet), so a non-admin Finance user opening a case
+ * from their own queue was refused the activity log.
+ */
+async function callerCanViewTraveller(req: any, travelerProfileId: any): Promise<boolean> {
+  if (isCstepAdmin(req)) return true;
+  const traveller: any = await TravellerProfile.findOne({
+    _id: travelerProfileId,
+    workspaceId: req.workspaceObjectId,
+  })
+    .select("tourApproverId officialUserId financeUserId")
+    .lean();
+  if (!traveller) return false;
+  const uid = ownerId(req);
+  return [traveller.tourApproverId, traveller.officialUserId, traveller.financeUserId].some(
+    (id) => id && String(id) === uid,
+  );
 }
 
 /** "<MM><YY>" for the current date, e.g. July 2026 -> "0726". Used only in
@@ -522,6 +574,28 @@ function buildSeedArrangementRows(doc: any): Array<{
  * POST /requests/:id/report/start) — re-opening an in-progress report
  * never re-seeds and never duplicates rows.
  */
+/**
+ * F6 — is this arrangement line something the Official actually arranged?
+ * The Step 3 seeder puts down one PENDING row per requested mode/service,
+ * and a row nobody touches (mode "Road" seeding a BUS beside the Cab that
+ * "Transport required" already seeded, say) used to flow all the way down:
+ * a Bus leg the traveller had to delete, then a ₹0 "No document"
+ * settlement line. Downstream seeders take a line only if it was marked
+ * ARRANGED or carries an amount — an amount typed by an Official who
+ * forgot the toggle still counts; an untouched PENDING row never does.
+ */
+function arrangementIsReal(a: any): boolean {
+  return a.status === "ARRANGED" || Number(a.amount) > 0;
+}
+
+/** F6 — the seed rows an Official never touched at all: still PENDING, no
+ * amount, no details of their own (a seeded Cab/Hotel carries the
+ * traveller's note as details; a seeded mode row has none). These are
+ * dropped at mark-arranged rather than frozen into the case. */
+function arrangementIsUntouchedSeed(a: any): boolean {
+  return a.source === "REQUESTED" && a.status === "PENDING" && !(Number(a.amount) > 0) && !String(a.details || "").trim();
+}
+
 function buildSeedReportLegs(arrangements: any[]): Array<{
   direction: "ONWARD";
   travelMode: CstepServiceType;
@@ -531,7 +605,7 @@ function buildSeedReportLegs(arrangements: any[]): Array<{
   remarks?: string;
   source: "SEEDED";
 }> {
-  return arrangements.map((a) => ({
+  return arrangements.filter(arrangementIsReal).map((a) => ({
     direction: "ONWARD" as const,
     travelMode: a.arrangedType,
     fare: a.amount,
@@ -760,9 +834,30 @@ async function buildSeedSettlementLines(
   }>
 > {
   const [arrangements, legs] = await Promise.all([
-    CstepArrangement.find({ workspaceId, requestId }).lean(),
-    CstepReportLeg.find({ workspaceId, requestId }).lean(),
+    CstepArrangement.find({ workspaceId, requestId }).sort({ createdAt: 1, _id: 1 }).lean(),
+    CstepReportLeg.find({ workspaceId, requestId }).sort({ createdAt: 1, _id: 1 }).lean(),
   ]);
+
+  // Carry the traveller's uploaded document onto ARRANGEMENT-sourced lines.
+  // The receipt/boarding pass for a CSTEP-paid service is uploaded on the
+  // Step 4 report leg that was SEEDED from that arrangement (report/start
+  // creates one SEEDED leg per arrangement, in arrangement order, with
+  // travelMode = arrangedType). Those legs are deliberately NOT turned into
+  // their own settlement lines below (they would double-count the
+  // arrangement), so without this their attachment never reached Step 5 and
+  // the Official saw "No document" on every official line. There is no
+  // stored back-link from leg to arrangement, so pair them the same way they
+  // were seeded: in creation order, matched on travelMode === arrangedType,
+  // each leg consumed at most once. A SEEDED leg the traveller has since
+  // re-typed, deleted, or flipped to SELF simply does not pair (SELF legs
+  // become their own PERSONAL line, attachment included, further down).
+  const seededCstepLegsByMode = new Map<string, any[]>();
+  for (const leg of legs as any[]) {
+    if (leg.source !== "SEEDED" || leg.paidBy !== "CSTEP") continue;
+    const bucket = seededCstepLegsByMode.get(leg.travelMode) ?? [];
+    bucket.push(leg);
+    seededCstepLegsByMode.set(leg.travelMode, bucket);
+  }
 
   const lines: Array<{
     source: CstepSettlementLineSource;
@@ -777,6 +872,8 @@ async function buildSeedSettlementLines(
   }> = [];
 
   for (const a of arrangements as any[]) {
+    if (!arrangementIsReal(a)) continue; // F6 — never seeded a leg either, so nothing to pair
+    const pairedLeg = seededCstepLegsByMode.get(a.arrangedType)?.shift();
     lines.push({
       source: "ARRANGEMENT",
       sourceId: a._id,
@@ -786,6 +883,7 @@ async function buildSeedSettlementLines(
       classification: "OFFICIAL",
       classificationOverridden: false,
       verified: false,
+      attachmentId: pairedLeg?.attachmentId || undefined,
     });
   }
 
@@ -888,6 +986,21 @@ router.post("/requests", async (req: any, res: any) => {
     });
     await doc.save();
 
+    // A request created straight as SUBMITTED gets the same SUBMIT entry
+    // the explicit draft → POST /submit path writes, so every submitted
+    // request carries a complete trail whichever way it got there.
+    if (status === "SUBMITTED") {
+      await CstepApproval.create({
+        workspaceId: req.workspaceObjectId,
+        entityType: "REQUEST",
+        entityId: doc._id,
+        stage: "TRAVELER",
+        actor: new mongoose.Types.ObjectId(uid),
+        action: "SUBMIT",
+        at: new Date().toISOString(),
+      });
+    }
+
     res.status(201).json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
     console.error("[CSTEP requests POST]", err?.message);
@@ -964,6 +1077,15 @@ router.get("/requests/:id", async (req: any, res: any) => {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
 
+    // Same read gate as /activity, /pdf, /packet, /report: the owner, a
+    // CSTEP Admin, or the traveller's mapped Approver/Official/Finance
+    // user. Any other member of the workspace gets a 403 — a plain
+    // requester must not be able to read a colleague's proposal by id.
+    const uid = ownerId(req);
+    if (String(doc.createdBy) !== uid && !(await callerCanViewTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Not authorized to view this travel request" });
+    }
+
     const admin = isCstepAdmin(req);
     const canApprove =
       doc.status === "SUBMITTED" && (admin || (await callerCanActOnTraveller(req, doc.travelerProfileId)));
@@ -977,8 +1099,26 @@ router.get("/requests/:id", async (req: any, res: any) => {
     // it's fetched via GET /settlement, same pattern as canArrange narrowing
     // via request.status === "ARRANGING".
     const canSettle =
-      (doc.status === "REPORT_SUBMITTED" || doc.status === "TRANSFERRED_TO_FINANCE" || doc.status === "SETTLED") &&
+      (doc.status === "REPORT_SUBMITTED" ||
+        doc.status === "TRANSFERRED_TO_FINANCE" ||
+        doc.status === "SETTLED" ||
+        doc.status === "REIMBURSED") &&
       (admin || (await callerCanArrangeForTraveller(req, doc.travelerProfileId)));
+    // Step 6 — may this caller mark the reimbursement paid? Only while the
+    // case is actually with Finance; the Finance user's own queue is the
+    // usual way in (GET /finance-queue).
+    const canFinance =
+      doc.status === "TRANSFERRED_TO_FINANCE" && (await callerCanFinanceForTraveller(req, doc.travelerProfileId));
+    // The figure Finance pays out — read off the finalized settlement so the
+    // Finance user's card can show it without needing the Official-only
+    // GET /settlement. Present only while the case is with Finance.
+    let financeAmountClaimed: number | undefined;
+    if (doc.status === "TRANSFERRED_TO_FINANCE") {
+      const fin: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id })
+        .select("amountClaimed")
+        .lean();
+      if (fin) financeAmountClaimed = Number(fin.amountClaimed || 0);
+    }
 
     const arrangements = await CstepArrangement.find({
       workspaceId: req.workspaceObjectId,
@@ -987,7 +1127,17 @@ router.get("/requests/:id", async (req: any, res: any) => {
       .sort({ createdAt: 1 })
       .lean();
 
-    res.json({ ok: true, request: doc.toObject(), canApprove, isAdmin: admin, canArrange, canSettle, arrangements });
+    res.json({
+      ok: true,
+      request: doc.toObject(),
+      canApprove,
+      isAdmin: admin,
+      canArrange,
+      canSettle,
+      canFinance,
+      financeAmountClaimed,
+      arrangements,
+    });
   } catch (err: any) {
     console.error("[CSTEP requests GET one]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load travel request" });
@@ -1126,10 +1276,15 @@ router.post("/requests/:id/withdraw", async (req: any, res: any) => {
 
 /* ─────────────────────────────────────────────────────────────────────
  * POST /requests/:id/cancel — owner-only or CSTEP Admin. Allowed from DRAFT,
- * SUBMITTED, or RETURNED — never from APPROVED (an approved trip can't be
- * silently cancelled here; that's later, separate work). The proposal is
- * NOT deleted — it stays visible in My Tours with a CANCELLED status for
- * the record. Logs a CANCEL entry (append-only), reason optional.
+ * SUBMITTED, or RETURNED (reason optional), and from APPROVED, ARRANGING,
+ * ARRANGED or REPORT_PENDING (reason mandatory). Never from REPORT_SUBMITTED
+ * onwards — the report is with the Office, or money has moved. A
+ * post-approval cancel is a status
+ * + audit change only: arrangements are booked outside this app, so there
+ * is nothing to unwind here; the TOUR_PROPOSAL's claim (opened at approve)
+ * goes to CANCELLED alongside. The proposal is NOT deleted — it stays
+ * visible in My Tours with a CANCELLED status for the record. Logs a CANCEL
+ * entry (append-only).
  * ───────────────────────────────────────────────────────────────────── */
 router.post("/requests/:id/cancel", async (req: any, res: any) => {
   try {
@@ -1143,13 +1298,25 @@ router.post("/requests/:id/cancel", async (req: any, res: any) => {
       return res.status(403).json({ error: "Only the creator or a CSTEP Admin can cancel this travel request" });
     }
     if (!CANCELLABLE_STATUSES.has(doc.status)) {
-      return res.status(409).json({ error: "Only a draft, submitted, or returned travel request can be cancelled" });
+      return res.status(409).json({
+        error: "This travel request can no longer be cancelled — its travel report has started or it is with settlement",
+      });
     }
+
+    const reason = String(req.body?.reason || "").trim();
+    const postApproval = POST_APPROVAL_CANCELLABLE.has(doc.status);
+    if (postApproval && !reason) return res.status(400).json({ error: "reason is required" });
 
     doc.status = "CANCELLED";
     await doc.save();
 
-    const reason = String(req.body?.reason || "").trim();
+    if (postApproval) {
+      await CstepClaim.updateMany(
+        { workspaceId: req.workspaceObjectId, travelRequestId: doc._id },
+        { $set: { status: "CANCELLED" } },
+      );
+    }
+
     await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
@@ -1231,6 +1398,23 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
  * flag — their query is already scoped to only their own assigned
  * travellers, so "unassigned" isn't a concept that applies to their view.
  * ───────────────────────────────────────────────────────────────────── */
+/** Queue-list addition — each row gets `travellerName` (the referenced
+ * TravellerProfile's first + last name, same format as the PDF routes) so
+ * the queue cards can say whose request it is. Additive to the response,
+ * no schema change; the lookup is workspace-scoped like every other read
+ * here, so a profile outside the caller's workspace never resolves. */
+async function withTravellerNames(req: any, docs: any[]): Promise<any[]> {
+  if (docs.length === 0) return docs;
+  const ids = [...new Set(docs.map((d) => String(d.travelerProfileId)))];
+  const travellers = await TravellerProfile.find({ _id: { $in: ids }, workspaceId: req.workspaceObjectId })
+    .select("_id firstName lastName")
+    .lean();
+  const names = new Map(
+    (travellers as any[]).map((t) => [String(t._id), [t.firstName, t.lastName].filter(Boolean).join(" ").trim()]),
+  );
+  return docs.map((d) => ({ ...d, travellerName: names.get(String(d.travelerProfileId)) || undefined }));
+}
+
 router.get("/approvals", async (req: any, res: any) => {
   try {
     const admin = isCstepAdmin(req);
@@ -1250,7 +1434,7 @@ router.get("/approvals", async (req: any, res: any) => {
       filter.travelerProfileId = { $in: myTravellers.map((t: any) => t._id) };
     }
 
-    const docs = await CstepTravelRequest.find(filter).sort({ createdAt: 1 }).lean();
+    const docs = await withTravellerNames(req, await CstepTravelRequest.find(filter).sort({ createdAt: 1 }).lean());
 
     if (!admin) {
       return res.json({ ok: true, requests: docs, unassignedCount: 0 });
@@ -1331,6 +1515,7 @@ const OFFICIAL_QUEUE_STAGES = [
   "REPORT_SUBMITTED",
   "TRANSFERRED_TO_FINANCE",
   "SETTLED",
+  "REIMBURSED",
 ] as const;
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -1367,7 +1552,7 @@ router.get("/official-queue", async (req: any, res: any) => {
       filter.travelerProfileId = { $in: myTravellers.map((t: any) => t._id) };
     }
 
-    const docs = await CstepTravelRequest.find(filter).sort({ updatedAt: -1 }).lean();
+    const docs = await withTravellerNames(req, await CstepTravelRequest.find(filter).sort({ updatedAt: -1 }).lean());
     const stageCounts: Record<string, number> = { ...emptyStageCounts };
     for (const d of docs as any[]) {
       if (stageCounts[d.status] !== undefined) stageCounts[d.status]++;
@@ -1382,19 +1567,19 @@ router.get("/official-queue", async (req: any, res: any) => {
 
 /* ─────────────────────────────────────────────────────────────────────
  * GET /finance-queue — the Finance user's queue (CSTEP mapping addition):
- * same shape as GET /official-queue, financeUserId slot instead. The
- * request-status schema has no separate "processing"/"finance" pipeline
- * stage yet (see module note) — both Official and Finance queues currently
- * filter on the same APPROVED status, scoped to each caller's own mapped
- * travellers; they're two different people's views into the same event,
- * not two different statuses. Splitting APPROVED into finer stages is
- * later, separate work — this route only adds a read filter, it does not
- * change status/approve/audit logic.
+ * same shape as GET /official-queue, financeUserId slot instead. Lists
+ * the cases actually waiting on Finance — TRANSFERRED_TO_FINANCE, i.e.
+ * settlement finalized with money owed to the traveller — scoped to the
+ * caller's own mapped travellers (a CSTEP Admin sees every one). The
+ * Finance user closes a case from here with
+ * POST /requests/:id/finance/settle (→ REIMBURSED). (Before Step 6 this
+ * filtered on APPROVED, a leftover from when no finance stage existed,
+ * so a case at the finance stage could never appear in the Finance tab.)
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/finance-queue", async (req: any, res: any) => {
   try {
     const admin = isCstepAdmin(req);
-    const filter: any = { workspaceId: req.workspaceObjectId, status: "APPROVED" };
+    const filter: any = { workspaceId: req.workspaceObjectId, status: "TRANSFERRED_TO_FINANCE" };
 
     if (!admin) {
       const uid = ownerId(req);
@@ -1410,11 +1595,154 @@ router.get("/finance-queue", async (req: any, res: any) => {
       filter.travelerProfileId = { $in: myTravellers.map((t: any) => t._id) };
     }
 
-    const docs = await CstepTravelRequest.find(filter).sort({ updatedAt: -1 }).lean();
+    const docs = await withTravellerNames(req, await CstepTravelRequest.find(filter).sort({ updatedAt: -1 }).lean());
     res.json({ ok: true, requests: docs });
   } catch (err: any) {
     console.error("[CSTEP finance-queue GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to list the finance queue" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /reports/travel-register — the finance team's Travel Register as an
+ * .xlsx (layout + row rules: utils/cstepTravelRegister.ts). Read-only — every
+ * query here is a find; nothing is opened, started or stamped.
+ *
+ * Who: a CSTEP Admin gets the whole workspace; a Finance user (financeUserId
+ * on at least one traveller) gets only those travellers' trips — the same
+ * scoping as GET /finance-queue. Anyone else is refused.
+ *
+ * Query: period=week|month|quarter|fy|custom (default fy), anchor=YYYY-MM-DD
+ * (any day inside the wanted period; default today IST), from/to for custom
+ * (max 24 months), includeDrafts=1 to add DRAFT trips (left out by default).
+ * A trip falls in the period by its departureDate — or, if it has none yet,
+ * by the IST date it was created.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/reports/travel-register", async (req: any, res: any) => {
+  try {
+    const admin = isCstepAdmin(req);
+    let scopedTravellerIds: mongoose.Types.ObjectId[] | null = null;
+    if (!admin) {
+      const mine = await TravellerProfile.find({
+        workspaceId: req.workspaceObjectId,
+        financeUserId: new mongoose.Types.ObjectId(ownerId(req)),
+      })
+        .select("_id")
+        .lean();
+      if (mine.length === 0) {
+        return res.status(403).json({ error: "Only a CSTEP Admin or Finance user can export the Travel Register" });
+      }
+      scopedTravellerIds = (mine as any[]).map((t) => t._id);
+    }
+
+    const generatedAt = new Date();
+    const period = resolveRegisterPeriod(req.query, generatedAt);
+    if ("error" in period) return res.status(400).json({ error: period.error });
+    const includeDrafts = ["1", "true"].includes(String(req.query.includeDrafts || "").toLowerCase());
+
+    const filter: any = {
+      workspaceId: req.workspaceObjectId,
+      $or: [
+        { departureDate: { $gte: period.from, $lte: period.to } },
+        {
+          departureDate: { $in: [null, ""] },
+          createdAt: {
+            $gte: new Date(`${period.from}T00:00:00.000+05:30`),
+            $lte: new Date(`${period.to}T23:59:59.999+05:30`),
+          },
+        },
+      ],
+    };
+    if (!includeDrafts) filter.status = { $ne: "DRAFT" };
+    if (scopedTravellerIds) filter.travelerProfileId = { $in: scopedTravellerIds };
+
+    const requests: any[] = await CstepTravelRequest.find(filter).lean();
+    const requestIds = requests.map((r) => r._id);
+
+    const [travellers, arrangements, settlements, lines, trail] = await Promise.all([
+      TravellerProfile.find({
+        _id: { $in: [...new Set(requests.map((r) => String(r.travelerProfileId)))] },
+        workspaceId: req.workspaceObjectId,
+      })
+        .select("_id firstName lastName")
+        .lean(),
+      CstepArrangement.find({ workspaceId: req.workspaceObjectId, requestId: { $in: requestIds } })
+        .sort({ createdAt: 1 })
+        .lean(),
+      CstepSettlement.find({ workspaceId: req.workspaceObjectId, requestId: { $in: requestIds } }).lean(),
+      CstepSettlementLine.find({ workspaceId: req.workspaceObjectId, requestId: { $in: requestIds } })
+        .sort({ createdAt: 1 })
+        .lean(),
+      CstepApproval.find({
+        workspaceId: req.workspaceObjectId,
+        entityType: "REQUEST",
+        entityId: { $in: requestIds },
+        action: { $in: ["SUBMIT", "RESUBMIT", "SUBMIT_REPORT"] },
+      })
+        .select("entityId action at")
+        .lean(),
+    ]);
+
+    const legIds = (lines as any[]).filter((l) => l.source === "REPORT_LEG").map((l) => l.sourceId);
+    const legs: any[] = legIds.length
+      ? await CstepReportLeg.find({ workspaceId: req.workspaceObjectId, _id: { $in: legIds } })
+          .select("_id fromLocation toLocation fromDate toDate")
+          .lean()
+      : [];
+
+    const nameOf = new Map(
+      (travellers as any[]).map((t) => [String(t._id), [t.firstName, t.lastName].filter(Boolean).join(" ").trim()]),
+    );
+    const legById = new Map(legs.map((l) => [String(l._id), l]));
+    const group = <T,>(rows: T[], key: (r: T) => string) => {
+      const m = new Map<string, T[]>();
+      for (const r of rows) m.set(key(r), [...(m.get(key(r)) || []), r]);
+      return m;
+    };
+    const arrangementsBy = group(arrangements as any[], (a) => String(a.requestId));
+    const linesBy = group(lines as any[], (l) => String(l.requestId));
+    const settlementBy = new Map((settlements as any[]).map((s) => [String(s.requestId), s]));
+    const latest = (entityId: string, actions: string[]) =>
+      (trail as any[])
+        .filter((t) => String(t.entityId) === entityId && actions.includes(t.action))
+        .map((t) => String(t.at))
+        .sort()
+        .pop();
+
+    const trips: RegisterTrip[] = requests.map((r) => {
+      const id = String(r._id);
+      const settlement = settlementBy.get(id);
+      return {
+        request: r,
+        travellerName: nameOf.get(String(r.travelerProfileId)) || "",
+        submittedAt: latest(id, ["SUBMIT", "RESUBMIT"]),
+        reportSubmittedAt: latest(id, ["SUBMIT_REPORT"]),
+        arrangements: (arrangementsBy.get(id) || []).filter(arrangementIsReal),
+        settlement: settlement
+          ? { status: settlement.status, perDiem: settlement.perDiem, totalCostOfTour: settlement.totalCostOfTour }
+          : undefined,
+        settlementLines: settlement
+          ? (linesBy.get(id) || []).map((l: any) => ({
+              source: l.source,
+              mode: l.mode,
+              description: l.description,
+              amountInr: l.amountInr,
+              classification: l.classification,
+              leg: l.source === "REPORT_LEG" ? legById.get(String(l.sourceId)) : undefined,
+            }))
+          : [],
+      };
+    });
+
+    const { workbook } = buildTravelRegisterWorkbook(trips, period, generatedAt);
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="cstep-travel-register-${period.fileTag}.xlsx"`);
+    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (err: any) {
+    console.error("[CSTEP travel-register GET]", err?.message);
+    if (!res.headersSent) res.status(500).json({ error: err?.message || "Failed to build the Travel Register" });
   }
 });
 
@@ -1631,6 +1959,48 @@ router.post("/requests/:id/return", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP requests return]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to return travel request" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /requests/:id/reject — approver-only, SUBMITTED → REJECTED
+ * (terminal). Distinct from /return: return = "fix and resubmit", reject =
+ * "denied, closed" — nothing reopens a rejected request. reason is
+ * mandatory. No TIN or claim exists yet at SUBMITTED, so there is nothing
+ * else to close.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/requests/:id/reject", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerCanActOnTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Tour Approver or a CSTEP Admin can perform this action" });
+    }
+    if (doc.status !== "SUBMITTED") {
+      return res.status(409).json({ error: "Only a submitted travel request can be rejected" });
+    }
+
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) return res.status(400).json({ error: "reason is required" });
+
+    doc.status = "REJECTED";
+    await doc.save();
+
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "APPROVER",
+      actor: new mongoose.Types.ObjectId(ownerId(req)),
+      action: "REJECT",
+      comment: reason,
+      at: new Date().toISOString(),
+    });
+
+    res.json({ ok: true, request: doc.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests reject]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to reject travel request" });
   }
 });
 
@@ -1901,7 +2271,11 @@ router.post("/requests/:id/arrangements", async (req: any, res: any) => {
  * POST /requests/:id/mark-arranged — Official/Admin marks the whole
  * request arranged: ARRANGING -> ARRANGED. Logs MARK_ARRANGED. Does NOT
  * hard-block on incomplete lines (still PENDING) — the Official's
- * judgement call, matching the spec.
+ * judgement call, matching the spec. F6: seed rows the Official never
+ * touched (PENDING, no amount, no details) are removed here instead of
+ * being frozen into the case, and the entry says what was dropped; a
+ * PENDING row they DID touch is kept as their call (it still only reaches
+ * the report/settlement if it carries an amount — see arrangementIsReal).
  * ───────────────────────────────────────────────────────────────────── */
 router.post("/requests/:id/mark-arranged", async (req: any, res: any) => {
   try {
@@ -1914,6 +2288,17 @@ router.post("/requests/:id/mark-arranged", async (req: any, res: any) => {
       return res.status(409).json({ error: "Only a request currently being arranged can be marked arranged" });
     }
 
+    const untouched: any[] = (
+      await CstepArrangement.find({ workspaceId: req.workspaceObjectId, requestId: doc._id }).lean()
+    ).filter(arrangementIsUntouchedSeed);
+    if (untouched.length > 0) {
+      await CstepArrangement.deleteMany({
+        workspaceId: req.workspaceObjectId,
+        requestId: doc._id,
+        _id: { $in: untouched.map((a) => a._id) },
+      });
+    }
+
     doc.status = "ARRANGED";
     await doc.save();
 
@@ -1924,6 +2309,10 @@ router.post("/requests/:id/mark-arranged", async (req: any, res: any) => {
       stage: "OFFICIAL",
       actor: new mongoose.Types.ObjectId(ownerId(req)),
       action: "MARK_ARRANGED",
+      comment:
+        untouched.length > 0
+          ? `Dropped ${untouched.length} untouched seed line(s): ${untouched.map((a) => a.arrangedType).join(", ")}`
+          : undefined,
       at: new Date().toISOString(),
     });
 
@@ -2032,7 +2421,7 @@ router.get("/requests/:id/report", async (req: any, res: any) => {
 
     const uid = ownerId(req);
     const isOwner = String(doc.createdBy) === uid;
-    if (!isOwner && !isCstepAdmin(req) && !(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
+    if (!isOwner && !(await callerCanViewTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Not authorized to view this travel report" });
     }
 
@@ -2493,7 +2882,7 @@ router.get("/requests/:id/activity", async (req: any, res: any) => {
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
 
     const uid = ownerId(req);
-    if (String(doc.createdBy) !== uid && !(await callerCanActOnTraveller(req, doc.travelerProfileId))) {
+    if (String(doc.createdBy) !== uid && !(await callerCanViewTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Not authorized to view this activity log" });
     }
 
@@ -2567,7 +2956,7 @@ router.get("/requests/:id/pdf", async (req: any, res: any) => {
 
     const uid = ownerId(req);
     const isOwner = String(doc.createdBy) === uid;
-    if (!isOwner && !isCstepAdmin(req) && !(await callerCanActOnTraveller(req, doc.travelerProfileId))) {
+    if (!isOwner && !(await callerCanViewTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Not authorized to view this proposal" });
     }
 
@@ -2672,11 +3061,7 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
 
     const uid = ownerId(req);
     const isOwner = String(doc.createdBy) === uid;
-    const authorized =
-      isOwner ||
-      isCstepAdmin(req) ||
-      (await callerCanActOnTraveller(req, doc.travelerProfileId)) ||
-      (await callerCanArrangeForTraveller(req, doc.travelerProfileId));
+    const authorized = isOwner || (await callerCanViewTraveller(req, doc.travelerProfileId));
     if (!authorized) {
       return res.status(403).json({ error: "Not authorized to view this packet" });
     }
@@ -3122,6 +3507,67 @@ router.patch("/requests/:id/settlement/perdiem", async (req: any, res: any) => {
 });
 
 /**
+ * POST /requests/:id/report/return — the Official (or a CSTEP Admin) sends a
+ * submitted Travel Report back to the traveller for a fix:
+ * REPORT_SUBMITTED → REPORT_PENDING, reason mandatory, logs RETURN_REPORT
+ * (stage OFFICIAL). The report legs become editable again and the owner
+ * resubmits via POST /report/submit.
+ *
+ * Any settlement still VERIFYING is discarded with its lines: its lines are
+ * seeded once, from the report legs, at /settlement/start — after the
+ * traveller's fix they'd be stale, so verification starts afresh (the next
+ * /settlement/start re-seeds) once the report comes back. A FINALIZED
+ * settlement can't be sitting under REPORT_SUBMITTED (finalize moves the
+ * request on; a Finance send-back reopens it to VERIFYING), so that is
+ * refused rather than discarded.
+ */
+router.post("/requests/:id/report/return", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+    }
+    if (doc.status !== "REPORT_SUBMITTED") {
+      return res.status(409).json({ error: "Only a submitted travel report can be sent back to the traveller" });
+    }
+
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) return res.status(400).json({ error: "reason is required" });
+
+    const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id })
+      .select("status")
+      .lean();
+    if (settlement && settlement.status !== "VERIFYING") {
+      return res.status(409).json({ error: "This settlement has already been finalized" });
+    }
+    if (settlement) {
+      await CstepSettlementLine.deleteMany({ workspaceId: req.workspaceObjectId, settlementId: settlement._id });
+      await CstepSettlement.deleteMany({ workspaceId: req.workspaceObjectId, _id: settlement._id });
+    }
+
+    doc.status = "REPORT_PENDING";
+    await doc.save();
+
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "OFFICIAL",
+      actor: new mongoose.Types.ObjectId(ownerId(req)),
+      action: "RETURN_REPORT",
+      comment: reason,
+      at: new Date().toISOString(),
+    });
+
+    res.json({ ok: true, request: doc.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests report return]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to send the travel report back" });
+  }
+});
+
+/**
  * POST /requests/:id/settlement/finalize — Official/Admin finalizes: a
  * final recompute from the current lines/per-diem, sets outcome
  * (TO_FINANCE if amountClaimed > 0, else CLOSE), settlement -> FINALIZED,
@@ -3176,6 +3622,32 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
     doc.status = outcome === "TO_FINANCE" ? "TRANSFERRED_TO_FINANCE" : "SETTLED";
     await doc.save();
 
+    // The claim (what the TIN points at, opened at approve time) mirrors the
+    // finalized figures — it is the record anything outside this settlement
+    // reads (claim status, totals). Without this it stayed CLAIM_IN_PROGRESS
+    // at ₹0 forever. ADMIN_VERIFIED = the Official/Admin has verified and the
+    // money is now with Finance; SETTLED = nothing owed, closed here.
+    // amountDueByCstep is what CSTEP owes the traveller — the claimed
+    // (reimbursable) figure; advances are not modelled in this flow, so
+    // nothing is due back to CSTEP. TOUR_PROPOSAL only: an EVENT_REQUEST
+    // never opens a claim, so this matches nothing there — by design.
+    const claimStatus = outcome === "TO_FINANCE" ? "ADMIN_VERIFIED" : "SETTLED";
+    const claim: any = await CstepClaim.findOneAndUpdate(
+      { workspaceId: req.workspaceObjectId, travelRequestId: doc._id },
+      {
+        $set: {
+          status: claimStatus,
+          totalCostOfTour,
+          amountClaimed,
+          amountDueByCstep: amountClaimed,
+          amountDueToCstep: 0,
+        },
+      },
+      { new: true },
+    )
+      .select("claimReference status")
+      .lean();
+
     const now = new Date().toISOString();
     await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
@@ -3184,7 +3656,9 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
       stage: "OFFICIAL",
       actor: new mongoose.Types.ObjectId(uid),
       action: "SETTLE",
-      comment: `Total cost of tour: ₹${totalCostOfTour} | Amount claimed: ₹${amountClaimed} | Outcome: ${outcome}`,
+      comment:
+        `Total cost of tour: ₹${totalCostOfTour} | Amount claimed: ₹${amountClaimed} | Outcome: ${outcome}` +
+        (claim ? ` | Claim ${claim.claimReference}: ${claim.status}` : ""),
       at: now,
     });
     if (outcome === "TO_FINANCE") {
@@ -3204,6 +3678,136 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP requests settlement finalize]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to finalize the settlement" });
+  }
+});
+
+/**
+ * Step 6 — POST /requests/:id/finance/settle — the Finance user (this
+ * traveller's financeUserId) or a CSTEP Admin marks the reimbursement paid
+ * out: TRANSFERRED_TO_FINANCE → REIMBURSED (terminal). The finalized
+ * settlement is the source of the amount; nothing on it is recomputed or
+ * edited here. Optional body: { reference, note } — a payment/UTR
+ * reference and a remark, both folded into the FINANCE_SETTLE audit
+ * comment. The linked CstepClaim goes to SETTLED (its own terminal "paid"
+ * state — mirrors finalize keeping the claim in step with reality).
+ */
+router.post("/requests/:id/finance/settle", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerCanFinanceForTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Finance user or a CSTEP Admin can perform this action" });
+    }
+    if (doc.status !== "TRANSFERRED_TO_FINANCE") {
+      return res.status(409).json({ error: "Only a request transferred to Finance can be marked reimbursed" });
+    }
+
+    const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id })
+      .select("status amountClaimed")
+      .lean();
+    if (!settlement || settlement.status !== "FINALIZED") {
+      return res.status(409).json({ error: "The settlement has not been finalized yet" });
+    }
+
+    const reference = String(req.body?.reference || "").trim();
+    const note = String(req.body?.note || "").trim();
+    const uid = ownerId(req);
+    const amount = Number(settlement.amountClaimed || 0);
+
+    doc.status = "REIMBURSED";
+    await doc.save();
+
+    const claim: any = await CstepClaim.findOneAndUpdate(
+      { workspaceId: req.workspaceObjectId, travelRequestId: doc._id },
+      { $set: { status: "SETTLED" } },
+      { new: true },
+    )
+      .select("claimReference status")
+      .lean();
+
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "FINANCE",
+      actor: new mongoose.Types.ObjectId(uid),
+      action: "FINANCE_SETTLE",
+      comment:
+        `₹${amount} reimbursed to the traveller` +
+        (reference ? ` | Ref: ${reference}` : "") +
+        (note ? ` | ${note}` : "") +
+        (claim ? ` | Claim ${claim.claimReference}: ${claim.status}` : ""),
+      at: new Date().toISOString(),
+    });
+
+    res.json({ ok: true, request: doc.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests finance settle]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to mark the reimbursement" });
+  }
+});
+
+/**
+ * POST /requests/:id/finance/return — the Finance user (or a CSTEP Admin)
+ * sends a case back to the Official when the claim looks wrong:
+ * TRANSFERRED_TO_FINANCE → REPORT_SUBMITTED, reason mandatory, logs
+ * RETURN_TO_OFFICIAL (stage FINANCE). It goes to the Official, not the
+ * traveller — the Official can send it on to the traveller themselves
+ * (POST /report/return) if the fix is theirs.
+ *
+ * Undoes what finalize froze, so the Official can correct and re-finalize:
+ * the settlement reopens to VERIFYING (outcome/finalizedBy/finalizedAt
+ * cleared; lines and per diem kept as they were), and the claim goes from
+ * ADMIN_VERIFIED back to CLAIM_IN_PROGRESS. The next finalize rewrites both.
+ */
+router.post("/requests/:id/finance/return", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerCanFinanceForTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Finance user or a CSTEP Admin can perform this action" });
+    }
+    if (doc.status !== "TRANSFERRED_TO_FINANCE") {
+      return res.status(409).json({ error: "Only a request transferred to Finance can be sent back to the Official" });
+    }
+
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) return res.status(400).json({ error: "reason is required" });
+
+    const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id });
+    if (!settlement || settlement.status !== "FINALIZED") {
+      return res.status(409).json({ error: "The settlement has not been finalized yet" });
+    }
+
+    settlement.status = "VERIFYING";
+    settlement.outcome = undefined;
+    settlement.finalizedBy = undefined;
+    settlement.finalizedAt = undefined;
+    await settlement.save();
+
+    doc.status = "REPORT_SUBMITTED";
+    await doc.save();
+
+    await CstepClaim.updateMany(
+      { workspaceId: req.workspaceObjectId, travelRequestId: doc._id },
+      { $set: { status: "CLAIM_IN_PROGRESS" } },
+    );
+
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "FINANCE",
+      actor: new mongoose.Types.ObjectId(ownerId(req)),
+      action: "RETURN_TO_OFFICIAL",
+      comment: reason,
+      at: new Date().toISOString(),
+    });
+
+    res.json({ ok: true, request: doc.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests finance return]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to send the case back to the Official" });
   }
 });
 

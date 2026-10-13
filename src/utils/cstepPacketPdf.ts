@@ -31,6 +31,7 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { PDFDocument as PdfLibDocument, StandardFonts, rgb, type PDFFont } from "pdf-lib";
+import fontkit from "@pdf-lib/fontkit";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { env } from "../config/env.js";
 import { getObjectBuffer } from "./s3Upload.js";
@@ -260,13 +261,58 @@ function wrapText(text: string, font: PDFFont, size: number, maxWidth: number): 
   return lines;
 }
 
+/**
+ * The fonts the pdf-lib-drawn pages (captions, placeholders) use. NotoSans
+ * embedded through fontkit so Unicode in leg captions ("Bengaluru → New
+ * Delhi", "₹") renders — pdf-lib's built-in Helvetica is WinAnsi-only and
+ * threw `WinAnsi cannot encode "→"` on the first packet with a real route.
+ * Falls back to Helvetica only if the font files are missing on disk, the
+ * same way generateItineraryPdf's pdfkit path does.
+ */
+async function embedPacketFonts(pdf: PdfLibDocument): Promise<{ font: PDFFont; boldFont: PDFFont }> {
+  if (fs.existsSync(FONT_PATH) && fs.existsSync(FONT_BOLD_PATH)) {
+    pdf.registerFontkit(fontkit);
+    const [font, boldFont] = await Promise.all([
+      pdf.embedFont(fs.readFileSync(FONT_PATH), { subset: true }),
+      pdf.embedFont(fs.readFileSync(FONT_BOLD_PATH), { subset: true }),
+    ]);
+    return { font, boldFont };
+  }
+  const [font, boldFont] = await Promise.all([
+    pdf.embedFont(StandardFonts.Helvetica),
+    pdf.embedFont(StandardFonts.HelveticaBold),
+  ]);
+  return { font, boldFont };
+}
+
+/**
+ * Text as this font can actually encode it. Anything outside the font's
+ * character set (a script NotoSans-Regular doesn't carry, or anything at
+ * all beyond WinAnsi on the Helvetica fallback) is swapped for a readable
+ * stand-in instead of throwing — a divider caption must never be the
+ * reason a whole packet fails to generate.
+ */
+const TEXT_FALLBACKS: Record<string, string> = { "→": "to", "←": "from", "₹": "Rs.", "…": "...", "—": "-", "–": "-", "·": "-" };
+function encodable(font: PDFFont, text: string): string {
+  let out = "";
+  for (const ch of text) {
+    try {
+      font.encodeText(ch);
+      out += ch;
+    } catch {
+      out += TEXT_FALLBACKS[ch] ?? "?";
+    }
+  }
+  return out;
+}
+
 function appendCaptionPage(pdf: PdfLibDocument, font: PDFFont, boldFont: PDFFont, caption: string, subtitle?: string) {
   const page = pdf.addPage([PG_W, PG_H]);
   const topY = PG_H - M - 40;
   page.drawText("SUPPORTING DOCUMENT", { x: M, y: topY, size: 9, font: boldFont, color: rgb(0.45, 0.45, 0.45) });
-  page.drawText(caption, { x: M, y: topY - 24, size: 15, font: boldFont, color: rgb(0.05, 0.08, 0.15) });
+  page.drawText(encodable(boldFont, caption), { x: M, y: topY - 24, size: 15, font: boldFont, color: rgb(0.05, 0.08, 0.15) });
   if (subtitle) {
-    page.drawText(subtitle, { x: M, y: topY - 44, size: 9.5, font, color: rgb(0.4, 0.4, 0.4) });
+    page.drawText(encodable(font, subtitle), { x: M, y: topY - 44, size: 9.5, font, color: rgb(0.4, 0.4, 0.4) });
   }
   page.drawLine({
     start: { x: M, y: topY - 56 },
@@ -281,7 +327,7 @@ function appendPlaceholderMessage(pdf: PdfLibDocument, font: PDFFont, boldFont: 
   const midY = PG_H / 2 + 20;
   page.drawText("Document unavailable", { x: M, y: midY, size: 13, font: boldFont, color: rgb(0.6, 0.15, 0.15) });
   let y = midY - 22;
-  for (const line of wrapText(message, font, 9.5, CW)) {
+  for (const line of wrapText(encodable(font, message), font, 9.5, CW)) {
     page.drawText(line, { x: M, y, size: 9.5, font, color: rgb(0.35, 0.35, 0.35) });
     y -= 14;
   }
@@ -369,8 +415,7 @@ export async function generateCstepPacketPdf(
   ];
 
   const pdf = await PdfLibDocument.create();
-  const font = await pdf.embedFont(StandardFonts.Helvetica);
-  const boldFont = await pdf.embedFont(StandardFonts.HelveticaBold);
+  const { font, boldFont } = await embedPacketFonts(pdf);
 
   // 1. Itinerary
   const itineraryBytes = await generateItineraryPdf(request, orderedLegs);
