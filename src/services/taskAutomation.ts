@@ -43,10 +43,32 @@ async function resolveAssignee(
   return null
 }
 
+/**
+ * Why a trigger did or did not produce a task. `automation_missing` (no row)
+ * and `automation_disabled` (row toggled off) are the cases that used to be
+ * indistinguishable from success to anyone but the database — callers that
+ * face a user (the disposition route) surface them instead of swallowing them.
+ */
+export type TaskAutomationOutcome =
+  | 'created'
+  | 'automation_missing'
+  | 'automation_disabled'
+  | 'open_task_exists'
+  | 'no_assignee'
+  | 'error'
+
 export async function triggerTaskAutomation(
   triggerKey: string,
   context: TriggerContext
 ): Promise<InstanceType<typeof Task> | null> {
+  return (await runTaskAutomation(triggerKey, context)).task
+}
+
+/** triggerTaskAutomation, plus the outcome. Never throws. */
+export async function runTaskAutomation(
+  triggerKey: string,
+  context: TriggerContext
+): Promise<{ task: InstanceType<typeof Task> | null; outcome: TaskAutomationOutcome }> {
   try {
     // Slice 2: a new-taxonomy key resolves to its own row first, then to the
     // legacy alias row that may already exist in prod (config/
@@ -65,7 +87,15 @@ export async function triggerTaskAutomation(
       if (automation) break
     }
 
-    if (!automation) return null
+    if (!automation) {
+      // Tell a toggled-off row from a missing one — one extra read, and only
+      // on the path that creates nothing.
+      const disabled = await TaskAutomation.exists({
+        workspaceId: context.workspaceId,
+        triggerKey: { $in: keys },
+      })
+      return { task: null, outcome: disabled ? 'automation_disabled' : 'automation_missing' }
+    }
 
     // Dedup: skip if an open auto-task for this trigger+entity already exists
     const existing = await Task.findOne({
@@ -80,7 +110,7 @@ export async function triggerTaskAutomation(
         entityId: context.entityId,
         existingTaskId: existing._id,
       })
-      return null
+      return { task: null, outcome: 'open_task_exists' }
     }
 
     const title = renderTemplate(automation.titleTemplate, context.variables)
@@ -94,7 +124,7 @@ export async function triggerTaskAutomation(
     const assigneeId = await resolveAssignee(automation.assigneeRule as any, context)
     if (!assigneeId) {
       logger.warn('[TaskAutomation] Could not resolve assignee — skipping task creation', { triggerKey })
-      return null
+      return { task: null, outcome: 'no_assignee' }
     }
 
     // Use first admin as createdBy for auto-tasks
@@ -128,10 +158,10 @@ export async function triggerTaskAutomation(
       entityId: context.entityId,
     })
 
-    return task
+    return { task, outcome: 'created' }
   } catch (err) {
     // Never throw — task automation failures must not break entity creation
     logger.error('[TaskAutomation] triggerTaskAutomation error', { triggerKey, err })
-    return null
+    return { task: null, outcome: 'error' }
   }
 }

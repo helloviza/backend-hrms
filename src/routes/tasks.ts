@@ -7,6 +7,8 @@ import Lead from '../models/Lead.js'
 import User from '../models/User.js'
 import logger from '../utils/logger.js'
 import { notifyUser } from '../services/notificationDispatch.js'
+import { UserPermission } from '../models/UserPermission.js'
+import { normalizeScope, findVisibleLead, ownsOpportunity, contactMatch, type ScopeCtx } from '../services/crmScope.js'
 
 const router = express.Router()
 
@@ -19,6 +21,73 @@ function uid(user: AnyObj): string {
 }
 
 /* ── helpers ──────────────────────────────────────────────── */
+
+/**
+ * Row scope for a non-FULL caller: tasks assigned to them or created by them —
+ * the rule GET /:id already applied. FULL callers see every task (the router
+ * is HOUSE-only at the mount). The UserPermission scope field is NOT read here
+ * yet; that is a separate, known gap.
+ */
+function ownOrCreated(myId: string): AnyObj {
+  if (!mongoose.isValidObjectId(myId)) return { _id: null }
+  const me = new mongoose.Types.ObjectId(myId)
+  return { $or: [{ assignedTo: me }, { createdBy: me }] }
+}
+
+function isOwnOrCreated(task: AnyObj, myId: string): boolean {
+  const assignedId = String(task.assignedTo?._id || task.assignedTo || '')
+  const createdId = String(task.createdBy?._id || task.createdBy || '')
+  return !!myId && (assignedId === myId || createdId === myId)
+}
+
+const CRM_LINKED_TYPES = ['LEAD', 'OPPORTUNITY', 'CONTACT', 'COMPANY']
+
+/**
+ * May the caller open this CRM record? Mirrors each module's own GET /:id
+ * (services/crmScope): lead → findVisibleLead on the leads scope, opportunity
+ * → ownsOpportunity on the leads scope, contact → contactMatch on the
+ * crmContacts scope, company → any crmCompanies access (a company is a shared
+ * entity). ADMIN / SUPERADMIN are ALL, exactly as the CRM gates set them.
+ */
+async function canSeeCrmRecord(user: AnyObj, linkedType: string, linkedId: string): Promise<boolean> {
+  const roles = ((user.roles || []) as string[]).map((r) => String(r).toUpperCase())
+  const raw = String(user.id || user.sub || user._id || '')
+  const userId = mongoose.isValidObjectId(raw) ? new mongoose.Types.ObjectId(raw) : null
+  let modules: AnyObj = {}
+  if (!roles.includes('ADMIN') && !roles.includes('SUPERADMIN')) {
+    const perm = await UserPermission.findOne({ userId: raw }).select('modules').lean() as AnyObj | null
+    modules = perm?.modules || {}
+  }
+  const ctxFor = (module: string): ScopeCtx | null => {
+    if (roles.includes('ADMIN') || roles.includes('SUPERADMIN')) return { userId, access: 'FULL', scope: 'ALL' }
+    const mod = modules[module]
+    if (!mod?.access || mod.access === 'NONE') return null
+    return { userId, access: String(mod.access), scope: normalizeScope(mod.scope) }
+  }
+
+  if (linkedType === 'LEAD') {
+    const ctx = ctxFor('leads')
+    return !!ctx && !!(await findVisibleLead(ctx, linkedId))
+  }
+  if (linkedType === 'OPPORTUNITY') {
+    const ctx = ctxFor('leads')
+    if (!ctx) return false
+    const { default: Opportunity } = await import('../models/Opportunity.js')
+    return ownsOpportunity(ctx, await Opportunity.findById(linkedId).select('ownerUserId').lean() as AnyObj | null)
+  }
+  if (linkedType === 'CONTACT') {
+    const ctx = ctxFor('crmContacts')
+    if (!ctx) return false
+    const { default: CRMContact } = await import('../models/CRMContact.js')
+    return !!(await CRMContact.exists({ _id: linkedId, ...contactMatch(ctx) }))
+  }
+  if (linkedType === 'COMPANY') {
+    if (!ctxFor('crmCompanies')) return false
+    const { default: CRMCompany } = await import('../models/CRMCompany.js')
+    return !!(await CRMCompany.exists({ _id: linkedId }))
+  }
+  return false
+}
 
 function isOverdue(task: AnyObj): boolean {
   if (!task.dueDate) return false
@@ -144,7 +213,20 @@ router.get('/', requirePermission('tasks', 'READ'), async (req, res) => {
       if (mongoose.isValidObjectId(myId)) {
         filter.assignedTo = new mongoose.Types.ObjectId(myId)
       }
-    } else if (assignedTo !== 'all') {
+    } else if (assignedTo === 'all') {
+      // 'all' + FULL → no assignee filter. A non-FULL caller gets every task on
+      // ONE CRM record they can open (the shared lead / opportunity / contact /
+      // company timeline); anything else narrows to their own-or-created rows.
+      if (access !== 'FULL') {
+        const linkedType = String(q.linkedType || '')
+        const linkedId = String(q.linkedId || '')
+        const recordView =
+          CRM_LINKED_TYPES.includes(linkedType) &&
+          mongoose.isValidObjectId(linkedId) &&
+          (await canSeeCrmRecord(user, linkedType, linkedId))
+        if (!recordView) Object.assign(filter, ownOrCreated(myId))
+      }
+    } else {
       if (access !== 'FULL') {
         // Non-FULL users can only see their own
         if (mongoose.isValidObjectId(myId)) {
@@ -154,7 +236,6 @@ router.get('/', requirePermission('tasks', 'READ'), async (req, res) => {
         filter.assignedTo = new mongoose.Types.ObjectId(String(assignedTo))
       }
     }
-    // 'all' + FULL → no assignee filter
 
     if (q.status) {
       const statuses = String(q.status).split(',').filter(Boolean)
@@ -323,12 +404,8 @@ router.get('/:id', requirePermission('tasks', 'READ'), async (req, res) => {
     if (!task) return res.status(404).json({ error: 'Task not found' })
 
     // Non-FULL users may only see tasks assigned to or created by them
-    if (access !== 'FULL') {
-      const assignedId = String(task.assignedTo?._id || task.assignedTo)
-      const createdId = String(task.createdBy?._id || task.createdBy)
-      if (assignedId !== myId && createdId !== myId) {
-        return res.status(403).json({ error: 'Access denied' })
-      }
+    if (access !== 'FULL' && !isOwnOrCreated(task, myId)) {
+      return res.status(403).json({ error: 'Access denied' })
     }
 
     return res.json({ task })
@@ -354,6 +431,12 @@ router.patch('/:id', requirePermission('tasks', 'WRITE'), async (req, res) => {
 
     const task = await Task.findOne({ _id: req.params.id, isActive: true })
     if (!task) return res.status(404).json({ error: 'Task not found' })
+
+    // Non-FULL users may only edit tasks assigned to or created by them (the
+    // GET /:id rule) — seeing a task on a shared timeline is not editing it.
+    if (access !== 'FULL' && !isOwnOrCreated(task, myId)) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
 
     // Reassignment requires FULL permission or being the creator
     if (body.assignedTo && String(body.assignedTo) !== String(task.assignedTo)) {

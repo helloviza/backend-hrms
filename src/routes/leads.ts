@@ -2211,6 +2211,7 @@ router.post("/:id/disposition", async (req, res) => {
       contact: result.contact,
       pipeline: result.pipeline,
       activityId: result.activityId,
+      followUpTask: result.followUpTask,
     });
   } catch (err: any) {
     if (err instanceof DispositionError) return res.status(err.status).json({ error: err.message });

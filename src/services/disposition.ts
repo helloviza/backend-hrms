@@ -48,7 +48,8 @@ import CRMCompany from "../models/CRMCompany.js";
 import { resolveOrCreateCompany } from "../utils/crmCompany.js";
 import { closedStage, isClosedOpportunityStage, MILESTONES } from "../models/crmTaxonomy.js";
 import { FRESH_DISPOSITION, type DispositionEntry } from "../models/crmDisposition.js";
-import { triggerTaskAutomation } from "./taskAutomation.js";
+import { triggerTaskAutomation, runTaskAutomation, type TaskAutomationOutcome } from "./taskAutomation.js";
+import logger from "../utils/logger.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import { resolvePipelineForLead, findEntry, canWorkPipeline, type PipelineActor } from "./crmPipelines.js";
 
@@ -81,6 +82,9 @@ export interface ApplyDispositionResult {
   contact: null | { id: string; companyId: string | null; how: "created" | "existing_email" | "already_converted" };
   activityId: string;
   pipeline: { id: string; key: string; name: string };
+  /** Follow-up task for a nextTouch disposition; null when there was no
+   *  follow-up date, so nothing was attempted. */
+  followUpTask: null | { taskCreated: boolean; reason: TaskAutomationOutcome };
 }
 
 /**
@@ -337,8 +341,12 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
     }
   }
 
+  // Awaited (runTaskAutomation never throws) so the rep is told when the
+  // follow-up task was not created — a toggled-off or missing automation row
+  // used to skip silently while the disposition reported success.
+  let followUpTask: ApplyDispositionResult["followUpTask"] = null;
   if (followUp) {
-    triggerTaskAutomation("lead.next_followup", {
+    const { task, outcome } = await runTaskAutomation("lead.next_followup", {
       workspaceId: SYSTEM_WORKSPACE_ID,
       entityType: "LEAD",
       entityId: lead._id as mongoose.Types.ObjectId,
@@ -346,7 +354,18 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
       ownerId: lead.assignedTo,
       eventDate: followUp,
       variables: { leadName: lead.contactName || lead.companyName || "Lead" },
-    }).catch(() => {});
+    });
+    followUpTask = { taskCreated: !!task, reason: outcome };
+    if (outcome === "automation_missing" || outcome === "automation_disabled") {
+      logger.warn("[Disposition] Follow-up task NOT created — lead.next_followup automation is " +
+        (outcome === "automation_disabled" ? "disabled" : "missing"), {
+        leadId: String(lead._id),
+        leadCode: lead.leadCode,
+        subDisposition: entry.subDisposition,
+        actorId: input.actor.id,
+        workspaceId: SYSTEM_WORKSPACE_ID,
+      });
+    }
   }
 
   return {
@@ -358,5 +377,6 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
     contact,
     activityId: String(act._id),
     pipeline: { id: String(pipeline._id), key: pipeline.key, name: pipeline.name },
+    followUpTask,
   };
 }

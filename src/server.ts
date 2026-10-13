@@ -1006,6 +1006,10 @@ import { requireBillingStaff } from "./middleware/requireBillingStaff.js";
 import adminTravellersRouter from "./routes/admin.travellers.js";
 import extractedDocumentsRouter from "./routes/admin.extractedDocuments.js";
 import carbonRouter from "./routes/admin.carbon.js";
+// Tasks / Reminders
+import tasksRouter from "./routes/tasks.js";
+// Task Automations (settings)
+import taskAutomationsRouter from "./routes/admin.task-automations.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Manual bookings + broad /api/admin routers (Plumtrips Travel).
@@ -1035,6 +1039,17 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // vendor accounts; requirePermission per route then applies the grant.
   app.use("/api/admin/invoices", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), invoicesRouter);
   app.use("/api/admin/credit-notes", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), creditNotesAdminRouter);
+  // KEEP_IN_PLUMBOX — Tasks & task automations (Plumtrips Travel ops). Mounted
+  // before the broad /api/admin routers for the same interception reason as
+  // manual-bookings above: tasksRouter gates per route on requirePermission
+  // ("tasks", READ/WRITE/FULL), so CRM reps holding the grant must reach it.
+  // taskAutomationsRouter carries its own requireAuth + requireAdmin.
+  // requireHouse: tasks are Plumtrips-internal and the router filters by owner,
+  // not by workspace — a tenant user holding a tasks grant must never reach it.
+  app.use("/api/admin/tasks", requireAuth, requireWorkspace, requireHouse, tasksRouter);
+  // Same HOUSE gate: requireAdmin alone admits a tenant admin from another
+  // workspace, who could then switch Plumtrips' SYSTEM automations off.
+  app.use("/api/admin/task-automations", requireAuth, requireWorkspace, requireHouse, taskAutomationsRouter);
 }
 // Notification bell — every row is the caller's own (userId-scoped in the
 // router). requireBillingStaff is the same door the blanket requireAdmin was,
@@ -1159,17 +1174,6 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/training/report", requireAuth, requireWorkspace, requireHouse, trainingReportRouter);
   app.use("/api/training", requireAuth, requireWorkspace, requireHouse, trainingRouter);
   app.use("/api/opportunities", requireAuth, requireWorkspace, requireFeature("crmEnabled"), opportunitiesRouter);
-}
-
-// Tasks / Reminders
-import tasksRouter from "./routes/tasks.js";
-// Task Automations (settings)
-import taskAutomationsRouter from "./routes/admin.task-automations.js";
-
-if (env.DEPLOYMENT_MODE === "plumbox") {
-  // KEEP_IN_PLUMBOX — Tasks & task automations (Plumtrips Travel ops)
-  app.use("/api/admin/tasks", tasksRouter);
-  app.use("/api/admin/task-automations", taskAutomationsRouter);
 }
 
 // In-app notifications — mounted above the broad /api/admin routers.

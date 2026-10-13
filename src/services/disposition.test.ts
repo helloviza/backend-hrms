@@ -414,3 +414,65 @@ describe("routes", () => {
     expect(e.body.lead.dispositionStatus).toBe("Open");
   });
 });
+
+/* ───────── follow-up task: a switched-off automation is not silent ───────── */
+
+describe("follow-up task outcome (lead.next_followup)", () => {
+  let TaskAutomation: any, Task: any;
+  beforeAll(async () => {
+    ({ default: TaskAutomation } = await import("../models/TaskAutomation.js"));
+    ({ default: Task } = await import("../models/Task.js"));
+  });
+  beforeEach(async () => {
+    await Promise.all([TaskAutomation.deleteMany({}), Task.deleteMany({})]);
+  });
+  const row = (enabled: boolean) => TaskAutomation.create({
+    workspaceId: "SYSTEM", triggerKey: "lead.next_followup", label: "Lead has next follow-up date", entityType: "LEAD",
+    enabled, titleTemplate: "Follow up: {{leadName}}", dueOffsetMinutes: 0, priority: "MEDIUM", assigneeRule: { type: "OWNER" }, tags: ["auto"],
+  });
+  const tomorrow = () => new Date(Date.now() + 86400000);
+
+  it("no row → taskCreated:false, automation_missing; the disposition still saves", async () => {
+    const lead = await freshLead();
+    const r = await applyDisposition(lead, { subDisposition: "Call Back Time Given", nextFollowUpDate: tomorrow(), actor: ACTOR });
+    expect(r.followUpTask).toEqual({ taskCreated: false, reason: "automation_missing" });
+    expect(r.to.subDisposition).toBe("Call Back Time Given");
+    expect(await Task.countDocuments({})).toBe(0);
+  });
+
+  it("row switched off → taskCreated:false, automation_disabled", async () => {
+    await row(false);
+    const r = await applyDisposition(await freshLead(), { subDisposition: "Call Back Time Given", nextFollowUpDate: tomorrow(), actor: ACTOR });
+    expect(r.followUpTask).toEqual({ taskCreated: false, reason: "automation_disabled" });
+    expect(await Task.countDocuments({})).toBe(0);
+  });
+
+  it("row enabled → task created as before (taskCreated:true); dedup unchanged on the second date", async () => {
+    await row(true);
+    const lead = await freshLead();
+    const due = tomorrow();
+    const r = await applyDisposition(lead, { subDisposition: "Call Back Time Given", nextFollowUpDate: due, actor: ACTOR });
+    expect(r.followUpTask).toEqual({ taskCreated: true, reason: "created" });
+    const t = await Task.findOne({ linkedId: lead._id }).lean();
+    expect(t).toMatchObject({ autoTriggerKey: "lead.next_followup", status: "OPEN", title: "Follow up: Priya", workspaceId: "SYSTEM" });
+    expect(String(t.assignedTo)).toBe(ADMIN_ID);
+    expect(new Date(t.dueDate).getTime()).toBe(due.getTime());
+
+    const r2 = await applyDisposition(lead, { subDisposition: "Call Back Time Given", nextFollowUpDate: new Date(Date.now() + 3 * 86400000), actor: ACTOR });
+    expect(r2.followUpTask).toEqual({ taskCreated: false, reason: "open_task_exists" });
+    expect(await Task.countDocuments({ linkedId: lead._id })).toBe(1);
+  });
+
+  it("no follow-up date → nothing attempted, followUpTask null", async () => {
+    const r = await applyDisposition(await freshLead(), { subDisposition: "Introduction Email Sent", actor: ACTOR });
+    expect(r.followUpTask).toBeNull();
+  });
+
+  it("POST /:id/disposition carries followUpTask to the client", async () => {
+    await row(false);
+    const lead = await freshLead();
+    const res = await request(app()).post(`/api/leads/${lead._id}/disposition`).send({ subDisposition: "Call Back Time Given", nextFollowUpDate: tomorrow().toISOString() });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.followUpTask).toEqual({ taskCreated: false, reason: "automation_disabled" });
+  });
+});
