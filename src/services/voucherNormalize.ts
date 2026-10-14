@@ -107,7 +107,77 @@ function normalizePolicyNotes(v: any): string[] {
   return toStringArray(bucket, 80);
 }
 
-function inferIsNonRefundable(v: any, notes: string[]): boolean {
+/**
+ * A note that clearly says the BOOKING is non-refundable. Deliberately narrow:
+ * "a non-refundable surcharge/fee/deposit" is about a charge, not the booking,
+ * and "no refund" turns up in no-show and ID-proof boilerplate on refundable
+ * stays — neither is a non-refundable signal.
+ */
+export function notesSayNonRefundable(notes: string[]): boolean {
+  return notes.some((n) =>
+    /\bnon[- ]?refundable\b(?!\s+(?:surcharge|fee|fees|deposit|charge|charges|amount|convenience))/i.test(n),
+  );
+}
+
+/**
+ * The note matcher voucherExtractorGemini.ts uses when the model leaves
+ * is_non_refundable null. Copied (not imported) so that file — shared with
+ * manual-bookings extraction — stays untouched; used only to recognise a
+ * stored value that came from it rather than from an operator.
+ */
+function legacyExtractorInference(notes: string[]): boolean {
+  const text = notes.join(" ").toLowerCase();
+  return (
+    text.includes("non refundable") ||
+    text.includes("non-refundable") ||
+    text.includes("nonrefundable") ||
+    text.includes("no refund") ||
+    text.includes("non refund") ||
+    text.includes("cannot be refunded")
+  );
+}
+
+/**
+ * What the document actually said about refundability: true / false / null.
+ *
+ * The shared extractor collapses "the model found nothing" (null) into a
+ * boolean via a loose note match — so a stored `false` usually means "not
+ * stated", and a stored `true` can come from "no refund for no-shows". This
+ * reads the model's own flag from rawModelResponse.raw_candidate instead:
+ *   - model said true/false → that.
+ *   - model said nothing    → true only on a clear non-refundable note, else null.
+ * A stored value that differs from what the extractor would have produced
+ * was set by an operator in /admin/vouchers and is kept as-is. Records with
+ * no raw candidate keep their stored value.
+ */
+export function statedNonRefundable(record: {
+  extractedJson?: any;
+  rawModelResponse?: any;
+}): boolean | null {
+  const stored = record?.extractedJson?.policies?.is_non_refundable;
+  const storedValue: boolean | null = typeof stored === "boolean" ? stored : null;
+  const raw = record?.rawModelResponse?.raw_candidate;
+  if (!raw || typeof raw !== "object") return storedValue;
+
+  const rawFlag = raw?.policies?.is_non_refundable;
+  const notes: string[] = Array.isArray(record?.extractedJson?.policies?.important_notes)
+    ? record.extractedJson.policies.important_notes.filter((n: unknown) => typeof n === "string")
+    : [];
+
+  if (typeof rawFlag === "boolean") {
+    return storedValue !== null && storedValue !== rawFlag ? storedValue : rawFlag;
+  }
+  const extractorWouldSay = legacyExtractorInference(notes);
+  if (storedValue !== extractorWouldSay) return storedValue; // operator-set (or already three-state)
+  return notesSayNonRefundable(notes) ? true : null;
+}
+
+/**
+ * Three-state: an explicit flag (boolean or a string flag) wins; otherwise true
+ * only on a clear non-refundable statement in the notes; otherwise null — the
+ * document said nothing, and that must not be read as "refundable".
+ */
+function inferIsNonRefundable(v: any, notes: string[]): boolean | null {
   // Priority: explicit boolean
   if (typeof v?.policies?.is_non_refundable === "boolean") return v.policies.is_non_refundable;
 
@@ -119,15 +189,8 @@ function inferIsNonRefundable(v: any, notes: string[]): boolean {
     if (["false", "no", "n", "refundable"].includes(x)) return false;
   }
 
-  // Fallback: infer from notes
-  const t = notes.join(" ").toLowerCase();
-  return (
-    t.includes("non refundable") ||
-    t.includes("non-refundable") ||
-    t.includes("nonrefundable") ||
-    t.includes("no refund") ||
-    t.includes("cannot be refunded")
-  );
+  // Fallback: a clear statement in the notes, else unknown
+  return notesSayNonRefundable(notes) ? true : null;
 }
 
 function normalizeFlightSegment(seg: any) {
@@ -221,7 +284,7 @@ export function normalizePlumtripsVoucher(input: any, docType: VoucherType): Plu
     custom_logo: toStrOrNull(v?.booking_info?.custom_logo),
   };
 
-  // Backend schema: boolean required (NOT nullable)
+  // true | false | null (unknown) — see Policies.is_non_refundable
   const is_non_refundable = inferIsNonRefundable(v, important_notes_raw);
 
   const policies = {

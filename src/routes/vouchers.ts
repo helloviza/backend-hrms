@@ -25,7 +25,7 @@ import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 
 import { extractVoucherViaGemini } from "../services/voucherExtractorGemini.js";
-import { normalizePlumtripsVoucher } from "../services/voucherNormalize.js";
+import { normalizePlumtripsVoucher, statedNonRefundable } from "../services/voucherNormalize.js";
 import { generateTravelPDF } from "../services/pdfService.js";
 import { adaptFlight, adaptHotel } from "../services/voucherAdapter.js";
 import {
@@ -300,18 +300,24 @@ async function repairPassViaGemini(args: {
  * deployed html→pdf Lambda. Used only when VOUCHER_RENDER_VIA_LAMBDA is on.
  * Throws on any adapter/template/Lambda failure so the caller can fall back.
  */
-async function renderViaSbtLambda(record: any): Promise<Buffer> {
+async function renderViaSbtLambda(record: any, warnings: string[]): Promise<Buffer> {
   // Demo Platform — merge VoucherExtraction.isDemo (DB column, set at extraction time
   // from req.user.isDemoUser) into the adapter input so the template renders the
   // SAMPLE watermark + disclaimer. NOT persisted back into extractedJson.
   const v = { ...(record?.extractedJson ?? {}), isDemo: !!record?.isDemo };
+  // Refundability as the document stated it (true / false / null) — older
+  // records stored a collapsed boolean. Read-only here; never persisted.
+  v.policies = { ...(v.policies ?? {}), is_non_refundable: statedNonRefundable(record) };
+  // createdAt anchors the year for dates the voucher prints without one;
+  // anything ops should double-check lands in `warnings`.
+  const ctx = { createdAt: record?.createdAt ?? null, warnings };
   if (record?.docType === "flight") {
-    const { booking, returnBooking } = adaptFlight(v);
+    const { booking, returnBooking } = adaptFlight(v, ctx);
     // showPrintButton=false; logoUrl=undefined → template's parameterized default.
     const html = await generateTicketHTML(booking, [], returnBooking, undefined, false);
     return invokeRendererLambda(html);
   }
-  const params = adaptHotel(v);
+  const params = adaptHotel(v, ctx);
   const html = await generateHotelVoucherHTML(params);
   return invokeRendererLambda(html);
 }
@@ -340,6 +346,9 @@ async function generateAndStoreRenderedPdf(args: {
   // Generate the PDF — choose path and tag it so we can tell SBT from fallback.
   let pdfBuffer: Buffer;
   let renderedTemplateVersion: string;
+  // Data the adapter had to infer or could not reconcile (e.g. a date printed
+  // without a year). Never blocks the render; shown to ops on the record.
+  const renderWarnings: string[] = [];
 
   // Demo Platform — demo bookings MUST go through the SBT shared template path
   // (the only one with watermark + disclaimer code). No fallback to pdfkit for
@@ -349,7 +358,7 @@ async function generateAndStoreRenderedPdf(args: {
 
   if (VOUCHER_RENDER_VIA_LAMBDA || isDemo) {
     try {
-      pdfBuffer = await renderViaSbtLambda(record);
+      pdfBuffer = await renderViaSbtLambda(record, renderWarnings);
       renderedTemplateVersion = "v2-sbt";
     } catch (err: any) {
       if (isDemo) {
@@ -391,6 +400,9 @@ async function generateAndStoreRenderedPdf(args: {
   record.renderedBy = new mongoose.Types.ObjectId(actorUserId);
   record.renderedTemplateVersion = renderedTemplateVersion;
   record.renderedRevision = (record.renderedRevision || 0) + 1;
+  // Replaced on every render so a fixed record doesn't keep stale warnings.
+  record.meta = { ...(record.meta || {}), renderWarnings };
+  record.markModified?.("meta");
 
   await record.save();
   return renderedS3;
@@ -517,6 +529,7 @@ router.post("/extract", requireResolvedWorkspace, canUploadVouchers, upload.sing
       const t1 = Date.now();
 
       let normalized = normalizePlumtripsVoucher(first.parsed, voucherType);
+      let usedRaw = first.raw;
 
       debug.stages.normalize = {
         ms: Date.now() - t1,
@@ -556,6 +569,7 @@ router.post("/extract", requireResolvedWorkspace, canUploadVouchers, upload.sing
         const t3 = Date.now();
 
         normalized = normalizePlumtripsVoucher(repaired.parsed, voucherType);
+        usedRaw = repaired.raw;
 
         debug.stages.normalize_repaired = {
           ms: Date.now() - t3,
@@ -581,6 +595,13 @@ router.post("/extract", requireResolvedWorkspace, canUploadVouchers, upload.sing
       // 7) Save SUCCESS extraction
       debug.stage = "DB_SAVE_SUCCESS";
       record.status = "SUCCESS";
+      // Store refundability three-state (see statedNonRefundable): the shared
+      // extractor turns "not stated" into false, which the voucher would print
+      // as free cancellation.
+      normalized.policies.is_non_refundable = statedNonRefundable({
+        extractedJson: normalized,
+        rawModelResponse: usedRaw,
+      });
       record.extractedJson = normalized;
       record.rawModelResponse = first.raw;
       record.error = undefined;

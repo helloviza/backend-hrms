@@ -59,5 +59,35 @@ export interface HotelVoucherParams {
     reconciled: boolean;
     showPrintButton?: boolean;
     isDemo?: boolean;
+    /**
+     * Where the booking data came from. "sbt" (default): our own TBO booking —
+     * rendered exactly as before. "extracted": read off a third party's voucher
+     * in /admin/vouchers — the template then claims nothing the document didn't
+     * state (cancellation wording, fixed policy lines, ID labels, section names).
+     */
+    source?: "sbt" | "extracted";
+    /** Hotel phone as printed on the source voucher; rendered under the address. */
+    hotelPhone?: string | null;
+    /** Stay facts as stated on the source; each part prints only when present. */
+    stayFacts?: {
+        nights?: number | null;
+        adults?: number | null;
+        children?: number | null;
+        /** Head count when the source gives only a total. */
+        guests?: number | null;
+        rooms?: number | null;
+    } | null;
+    specialRequests?: string | null;
+    /**
+     * Extracted only: the cancellation deadline as the source states it.
+     * With no cancellation tiers it prints as a neutral line (a deadline alone
+     * doesn't make cancelling before it free); with a free tier and a date-only
+     * deadline it names the free chip's end so the date printed is the date
+     * stated ("before 21 Jun 2026", not "until 20 Jun 2026 23:59").
+     */
+    cancellationDeadline?: {
+        stated: string;
+        dateOnly: boolean;
+    } | null;
 }
 export declare function generateHotelVoucherHTML(params: HotelVoucherParams): Promise<string>;

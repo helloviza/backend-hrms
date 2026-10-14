@@ -9,6 +9,7 @@
    suppress the print FAB later.
    ────────────────────────────────────────────────────────────────────────── */
 import QRCode from "qrcode";
+import { chipIcon, iconArrowRight, iconCheck, iconPin, iconPrinter, iconWarning } from "./icons.js";
 import { buildCancellationChips, TONE_PALETTE, parseTBODate, formatDateShort, isCancelDateValid as _isCancelDateValid, } from "./cancellationPolicy.js";
 async function generateQRDataUrl(text) {
     try {
@@ -31,6 +32,46 @@ export function formatCancelDate(dateStr) {
     if (!d)
         return "N/A";
     return formatDateShort(d);
+}
+/**
+ * The calendar day a check-in/out string names, as a UTC-midnight Date.
+ *
+ * A leading `YYYY-MM-DD` is read field by field rather than through
+ * `new Date(s)`: a bare "2026-10-15" parses as UTC midnight while
+ * "2026-10-15T00:00:00" parses as LOCAL midnight, so formatting either in the
+ * wrong zone can print the day before (a browser west of UTC, or an IST string
+ * formatted on a UTC server). Formatting the result with timeZone "UTC" prints
+ * exactly the day written.
+ */
+function calendarDay(d) {
+    const m = String(d || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m)
+        return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+    const dt = new Date(d);
+    if (isNaN(dt.getTime()))
+        return null;
+    return new Date(Date.UTC(dt.getFullYear(), dt.getMonth(), dt.getDate()));
+}
+/**
+ * Voucher check-in/out day: "15 Oct 2026". The year is always printed so a
+ * wrong one can't hide. Template-private — SBTHotelConfirmed imports the
+ * exported fmtDateShort below for its own page and keeps its behaviour.
+ */
+function voucherDay(d) {
+    if (!d)
+        return "";
+    const dt = calendarDay(d);
+    if (!dt)
+        return d;
+    return dt.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+}
+function voucherWeekday(d) {
+    if (!d)
+        return "";
+    const dt = calendarDay(d);
+    if (!dt)
+        return "";
+    return dt.toLocaleDateString("en-IN", { weekday: "long", timeZone: "UTC" });
 }
 export function fmtDateShort(d) {
     if (!d)
@@ -140,7 +181,12 @@ export async function generateHotelVoucherHTML(params) {
         throw new Error("Cannot generate voucher: booking has not been reconciled with hotel. " +
             "Please wait for confirmation to complete.");
     }
-    const { hotelName, hotelAddress, checkIn, checkOut, roomName, bookingId, confirmationNo, bookingRefNo, invoiceNumber, tboReferenceNo, roomDescription, rateConditions, amenities, guestFirstName, leadGuestName, allGuestNames, inclusions, cancelPolicies, displayVoucherStatus, totalFare, logoBodyBase64, offers, hotelPolicies, additionalConditions, supportEmail = "hello@plumtrips.com", showPrintButton = true, isDemo = false, } = params;
+    const { hotelName, hotelAddress, checkIn, checkOut, roomName, bookingId, confirmationNo, bookingRefNo, invoiceNumber, tboReferenceNo, roomDescription, rateConditions, amenities, guestFirstName, leadGuestName, allGuestNames, inclusions, cancelPolicies, displayVoucherStatus, totalFare, logoBodyBase64, offers, hotelPolicies, additionalConditions, supportEmail = "hello@plumtrips.com", showPrintButton = true, isDemo = false, source = "sbt", hotelPhone, stayFacts, specialRequests, cancellationDeadline, } = params;
+    const isExtracted = source === "extracted";
+    // Times come only from data: the extracted voucher's own stay times, or the
+    // TBO rate conditions SBT parses (parseHotelPolicies). No data → date only.
+    const checkInTime = (hotelPolicies?.checkInTime || "").trim();
+    const checkOutTime = (hotelPolicies?.checkOutTime || "").trim();
     const demoWatermarkHtml = isDemo
         ? `<div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) rotate(-30deg);font-size:120px;font-weight:bold;color:rgba(208,101,73,0.15);z-index:9999;pointer-events:none;white-space:nowrap;">SAMPLE — NOT A REAL RESERVATION</div>`
         : "";
@@ -189,6 +235,62 @@ export async function generateHotelVoucherHTML(params) {
         }
         return out;
     })();
+    // "1 night · 1 adult · 1 room" — only the parts the source stated.
+    const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+    const stayParts = [];
+    if (stayFacts?.nights)
+        stayParts.push(plural(stayFacts.nights, "night", "nights"));
+    if (stayFacts?.adults)
+        stayParts.push(plural(stayFacts.adults, "adult", "adults"));
+    else if (stayFacts?.guests)
+        stayParts.push(plural(stayFacts.guests, "guest", "guests"));
+    if (stayFacts?.children)
+        stayParts.push(plural(stayFacts.children, "child", "children"));
+    if (stayFacts?.rooms)
+        stayParts.push(plural(stayFacts.rooms, "room", "rooms"));
+    const fullRow = (label, value) => `<div style="grid-column:1/-1;margin-top:2px;padding-top:12px;border-top:1px solid #e2e4e7;">
+          <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:4px;">${label}</div>
+          <div style="font-weight:700;color:#002a58;font-size:12px;line-height:1.5;">${value}</div>
+        </div>`;
+    const stayRowHtml = stayParts.length > 0 ? fullRow("Stay", stayParts.map((x) => esc(x)).join(" &middot; ")) : "";
+    const specialRequestsHtml = (specialRequests || "").trim() ? fullRow("Special requests", esc((specialRequests || "").trim())) : "";
+    const phoneHtml = (hotelPhone || "").trim()
+        ? `<div style="font-size:12px;color:#6B7280;line-height:1.5;margin:-18px 0 24px 0;">Tel: ${esc((hotelPhone || "").trim())}</div>`
+        : "";
+    /**
+     * Reference boxes in the dark sidebar.
+     *
+     * SBT: unchanged — the TBO hotel reference, then our own booking ID for
+     * support. Extracted: the IDs are a third party's, so each is shown under
+     * its own honest label (the summary card already shows the booking ID),
+     * identical values are shown once, empties are hidden, and support is asked
+     * to quote the booking ID rather than calling it a Plumtrips ID.
+     */
+    const refBox = (label, value, gold) => gold
+        ? `<div style="background:#C5A059;padding:12px;border-radius:10px;">
+        <div style="font-size:9px;font-weight:700;color:rgba(0,0,0,0.6);margin-bottom:3px;text-transform:uppercase;letter-spacing:1px;">${label}</div>
+        <div style="font-size:16px;font-weight:900;letter-spacing:2px;color:#1a1a1a;word-break:break-all;">${esc(value)}</div>
+      </div>`
+        : `<div style="background:#004080;padding:12px;border-radius:10px;">
+        <div style="font-size:9px;opacity:0.6;margin-bottom:3px;text-transform:uppercase;">${label}</div>
+        <div style="font-size:12px;font-weight:900;letter-spacing:0.3px;word-break:break-all;">${esc(value)}</div>
+      </div>`;
+    const extractedRefsHtml = (() => {
+        const seen = new Set([String(bookingId || "").trim()].filter(Boolean));
+        const out = [];
+        const add = (label, value, gold) => {
+            const v = String(value ?? "").trim();
+            if (!v || seen.has(v))
+                return;
+            seen.add(v);
+            out.push(refBox(label, v, gold));
+        };
+        add("Hotel confirmation no. — show at check-in", confirmationNo, true);
+        add("Supplier voucher no.", bookingRefNo, false);
+        const id = String(bookingId || "").trim();
+        out.push(`<div style="font-size:9px;opacity:0.7;text-align:center;padding:6px 0 2px;">Need help? hello@plumtrips.com${id ? ` — quote booking ID ${esc(id)}` : ""}</div>`);
+        return out.join("\n      ");
+    })();
     const additionalGuestsHtml = guestList.length > 1
         ? `<div style="grid-column:1/-1;margin-top:2px;padding-top:12px;border-top:1px solid #e2e4e7;">
           <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:4px;">Guests (${guestList.length})</div>
@@ -198,33 +300,47 @@ export async function generateHotelVoucherHTML(params) {
     const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent((hotelName || "") + " " + (hotelAddress || ""))}`;
     const qrDataUrl = await generateQRDataUrl(mapsUrl);
     const chips = buildCancellationChips(cancelPolicies, { checkOut });
-    const cancelSectionHtml = cancelPolicies.length > 0
+    // Extracted vouchers always state their cancellation position; when the
+    // document gave none, the honest line is "ask the supplier", never "free".
+    const infoChip = (text) => `<div style="background:${TONE_PALETTE.info.background};color:${TONE_PALETTE.info.color};border:1px solid ${TONE_PALETTE.info.border};padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;line-height:1.4;display:inline-block;">${esc(text)}</div>`;
+    const deadlineStated = isExtracted ? (cancellationDeadline?.stated || "").trim() : "";
+    const supplierPolicyChip = deadlineStated
+        ? infoChip(`Cancellation deadline: ${deadlineStated}. Charges may apply after this, as per supplier policy.`)
+        : infoChip("As per supplier policy — contact support");
+    // A date-only deadline ends free cancellation at the start of that day; the
+    // generic chip would print the second before ("until 20 Jun 2026 23:59").
+    const chipLabel = (c) => deadlineStated && cancellationDeadline?.dateOnly && c.isFree && c.label.startsWith("Free cancellation until ")
+        ? `Free cancellation before ${deadlineStated}`
+        : c.label;
+    const cancelSectionHtml = cancelPolicies.length > 0 || isExtracted
         ? `<div style="margin-bottom:20px;">
-  <h2 style="font-family:'DM Sans',system-ui,sans-serif;font-size:11px;letter-spacing:1.5px;color:#0A1628;margin:0 0 16px 0;text-transform:uppercase;">Cancellation Policy</h2>
-  <div style="font-family:'DM Sans',system-ui,sans-serif;font-size:10px;color:#1a1a1a;line-height:1.6;display:flex;flex-direction:column;gap:6px;">
+  <h2 style="font-family:'Manrope',system-ui,sans-serif;font-size:11px;letter-spacing:1.5px;color:#0A1628;margin:0 0 16px 0;text-transform:uppercase;">Cancellation Policy</h2>
+  <div style="font-family:'Manrope',system-ui,sans-serif;font-size:10px;color:#1a1a1a;line-height:1.6;display:flex;flex-direction:column;gap:6px;">
     ${chips.length > 0
             ? chips.map((c) => {
                 const palette = TONE_PALETTE[c.tone];
-                return `<div style="background:${palette.background};color:${palette.color};border:1px solid ${palette.border};padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;line-height:1.4;display:inline-block;">${esc(palette.iconChar)} ${esc(c.label)}</div>`;
+                return `<div style="background:${palette.background};color:${palette.color};border:1px solid ${palette.border};padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;line-height:1.4;display:inline-block;">${chipIcon(c.tone)} ${esc(chipLabel(c))}</div>`;
             }).join("")
-            : `<div style="background:${TONE_PALETTE.success.background};color:${TONE_PALETTE.success.color};border:1px solid ${TONE_PALETTE.success.border};padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;line-height:1.4;display:inline-block;">${TONE_PALETTE.success.iconChar} Free cancellation available</div>`}
+            : isExtracted
+                ? supplierPolicyChip
+                : `<div style="background:${TONE_PALETTE.success.background};color:${TONE_PALETTE.success.color};border:1px solid ${TONE_PALETTE.success.border};padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;line-height:1.4;display:inline-block;">${chipIcon("success")} Free cancellation available</div>`}
   </div>
 </div>
 <div style="height:1px;background:#e5e2db;margin-bottom:24px;"></div>`
         : "";
     void totalFare;
     const inclusionsHtml = inclusions.length > 0
-        ? inclusions.map((inc) => `<li style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:12px;color:#374151;"><span style="color:#065f46;flex-shrink:0;">&#10003;</span><span>${esc(inc)}</span></li>`).join("")
+        ? inclusions.map((inc) => `<li style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:12px;color:#374151;"><span style="color:#065f46;flex-shrink:0;">${iconCheck(12)}</span><span>${esc(inc)}</span></li>`).join("")
         : `<li style="font-size:12px;color:#6B7280;padding:4px 0;">Standard room — see hotel for amenities</li>`;
     const enabledOffers = (offers ?? []).filter((o) => o.enabled);
     const hotelOffersHtml = enabledOffers.length > 0
-        ? enabledOffers.map((o) => `<div style="margin-top:20px;padding:14px 0;border-top:1px solid #e5e2db;border-bottom:1px solid #e5e2db;font-family:'DM Sans',system-ui,sans-serif;display:flex;align-items:center;justify-content:space-between;gap:16px;">
+        ? enabledOffers.map((o) => `<div style="margin-top:20px;padding:14px 0;border-top:1px solid #e5e2db;border-bottom:1px solid #e5e2db;font-family:'Manrope',system-ui,sans-serif;display:flex;align-items:center;justify-content:space-between;gap:16px;">
       <div style="flex:1;min-width:0;">
         <div style="font-size:9px;font-weight:700;color:#fe6a34;text-transform:uppercase;letter-spacing:2px;margin-bottom:4px;">PARTNER EXCLUSIVE</div>
         <div style="font-size:12px;font-weight:600;color:#0A1628;line-height:1.3;margin-bottom:2px;">${esc(o.title)}</div>
         ${o.description ? `<div style="font-size:10px;color:#4a4a4a;line-height:1.4;">${esc(o.description)}</div>` : ''}
       </div>
-      ${o.ctaUrl ? `<a href="${esc(o.ctaUrl)}" target="_blank" rel="noopener" style="flex-shrink:0;font-size:10px;font-weight:700;color:#0A1628;text-decoration:none;padding:6px 12px;border:1.5px solid #B89968;border-radius:4px;letter-spacing:1px;text-transform:uppercase;white-space:nowrap;">${esc(o.ctaText || 'Learn More')} →</a>` : ''}
+      ${o.ctaUrl ? `<a href="${esc(o.ctaUrl)}" target="_blank" rel="noopener" style="flex-shrink:0;font-size:10px;font-weight:700;color:#0A1628;text-decoration:none;padding:6px 12px;border:1.5px solid #B89968;border-radius:4px;letter-spacing:1px;text-transform:uppercase;white-space:nowrap;">${esc(o.ctaText || 'Learn More')} ${iconArrowRight(10)}</a>` : ''}
     </div>`).join('')
         : '';
     const additionalConditionsHtml = additionalConditions ? (() => {
@@ -238,17 +354,30 @@ export async function generateHotelVoucherHTML(params) {
             ? `<div style="margin-bottom:0;"><strong>Note:</strong> ${esc(additionalConditions.earlyCheckOutNote)}</div>`
             : "";
         return `<div style="margin-bottom:20px;padding:10px 14px;background:#FBF9F4;border-left:3px solid #B89968;border-radius:4px;">
-  <h2 style="font-family:'DM Sans',system-ui,sans-serif;font-size:11px;letter-spacing:1.5px;color:#0A1628;margin:0 0 12px 0;text-transform:uppercase;">
-    &#9888; Additional Fees &#8212; Payable Directly at Hotel
+  <h2 style="font-family:'Manrope',system-ui,sans-serif;font-size:11px;letter-spacing:1.5px;color:#0A1628;margin:0 0 12px 0;text-transform:uppercase;">
+    ${iconWarning(12)} Additional Fees &#8212; Payable Directly at Hotel
   </h2>
-  <p style="font-family:'DM Sans',system-ui,sans-serif;font-size:10.5px;color:#4a4a4a;line-height:1.6;margin:0 0 10px 0;font-style:italic;">
+  <p style="font-family:'Manrope',system-ui,sans-serif;font-size:10.5px;color:#4a4a4a;line-height:1.6;margin:0 0 10px 0;font-style:italic;">
     The following are NOT included in your Plumtrips booking and will be settled directly with the property:
   </p>
-  <div style="font-family:'DM Sans',system-ui,sans-serif;font-size:10.5px;color:#1a1a1a;line-height:1.7;">
+  <div style="font-family:'Manrope',system-ui,sans-serif;font-size:10.5px;color:#1a1a1a;line-height:1.7;">
     ${feeLine}${cardLine}${noteLine}
   </div>
 </div>`;
     })() : "";
+    /**
+     * Extracted vouchers: the source's own notes, under an honest heading, at
+     * the top of the T&C page. On page 1 they sat below the cards and, on 61 of
+     * 100 shipped PDFs, ran past the page and spilled onto a page of their own
+     * before the forced T&C break; here they share the page that has room.
+     */
+    const importantInfoHtml = isExtracted && rateConditions && rateConditions.length > 0
+        ? `<div style="margin-bottom:20px;">
+  <h2 style="font-family:'Manrope',system-ui,sans-serif;font-size:11px;letter-spacing:1.5px;color:#0A1628;margin:0 0 12px 0;text-transform:uppercase;">Important information</h2>
+  <ul style="list-style:none;padding:0;margin:0;font-family:'Manrope',system-ui,sans-serif;font-size:10.5px;color:#1a1a1a;line-height:1.5;">${rateConditions.map((c) => `<li style="display:flex;align-items:flex-start;gap:8px;padding:3px 0;"><span style="color:#92400e;flex-shrink:0;">&#8226;</span><span>${esc(c)}</span></li>`).join("")}</ul>
+</div>
+<div style="height:1px;background:#e5e2db;margin-bottom:24px;"></div>`
+        : "";
     const hotelPoliciesHtml = hotelPolicies ? (() => {
         const ciLine = hotelPolicies.checkInTime
             ? `<div style="margin-bottom:6px;"><span style="color:#6b6b6b;">Check-in:</span> <strong>${esc(hotelPolicies.checkInTime)} onwards</strong></div>`
@@ -257,9 +386,9 @@ export async function generateHotelVoucherHTML(params) {
             ? `<div style="margin-bottom:6px;"><span style="color:#6b6b6b;">Check-out:</span> <strong>by ${esc(hotelPolicies.checkOutTime)}</strong></div>`
             : "";
         return `<div style="margin-bottom:20px;">
-  <h2 style="font-family:'DM Sans',system-ui,sans-serif;font-size:11px;letter-spacing:1.5px;color:#0A1628;margin:0 0 16px 0;text-transform:uppercase;">Hotel Policies</h2>
-  <div style="font-family:'DM Sans',system-ui,sans-serif;font-size:10px;color:#1a1a1a;line-height:1.6;">
-    ${ciLine}${coLine}<div style="margin-bottom:6px;"><span style="color:#6b6b6b;">Minimum age:</span> <strong>18 years</strong> — government-issued ID required</div>
+  <h2 style="font-family:'Manrope',system-ui,sans-serif;font-size:11px;letter-spacing:1.5px;color:#0A1628;margin:0 0 16px 0;text-transform:uppercase;">Hotel Policies</h2>
+  <div style="font-family:'Manrope',system-ui,sans-serif;font-size:10px;color:#1a1a1a;line-height:1.6;">
+    ${ciLine}${coLine}${isExtracted ? "" : `<div style="margin-bottom:6px;"><span style="color:#6b6b6b;">Minimum age:</span> <strong>18 years</strong> — government-issued ID required</div>`}
     <div style="margin-bottom:6px;"><span style="color:#6b6b6b;">At check-in:</span> Present this voucher at reception</div>
   </div>
 </div>
@@ -267,7 +396,7 @@ export async function generateHotelVoucherHTML(params) {
     })() : "";
     const printButtonHtml = showPrintButton
         ? `<div class="no-print" style="position:fixed;bottom:24px;right:24px;z-index:999;">
-  <button onclick="window.print()" style="background:#002a58;color:#ffffff;border:none;border-radius:10px;padding:12px 24px;font-size:13px;font-weight:700;font-family:Manrope,sans-serif;cursor:pointer;box-shadow:0 4px 20px rgba(0,42,88,0.3);">&#128438; Print / Save PDF</button>
+  <button onclick="window.print()" style="background:#002a58;color:#ffffff;border:none;border-radius:10px;padding:12px 24px;font-size:13px;font-weight:700;font-family:Manrope,sans-serif;cursor:pointer;box-shadow:0 4px 20px rgba(0,42,88,0.3);">${iconPrinter(14)} Print / Save PDF</button>
 </div>`
         : "";
     const __html = `<!DOCTYPE html>
@@ -309,7 +438,7 @@ ${printButtonHtml}
     <p style="font-size:14px;color:#6B7280;">Your reservation at ${esc(hotelName)} is confirmed.</p>
   </div>
 
-  <div style="display:flex;gap:0;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 20px 40px rgba(0,42,88,0.06);margin-bottom:20px;">
+  <div style="display:flex;gap:0;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 20px 40px rgba(0,42,88,0.06);margin-bottom:20px;break-inside:avoid;page-break-inside:avoid;">
     <div style="flex:3;padding:32px;border-right:1px dashed rgba(195,198,210,0.5);">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;">
         <div>
@@ -324,22 +453,19 @@ ${printButtonHtml}
         </div>
       </div>
       <div style="position:relative;">
-        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:flex-start;pointer-events:none;overflow:hidden;">
-          <span style="font-size:120px;font-weight:900;color:#002a58;opacity:0.03;white-space:nowrap;font-family:'Playfair Display',serif;">&#127970;</span>
-        </div>
         <div style="font-size:52px;font-weight:700;color:#002a58;margin-bottom:10px;font-family:'Playfair Display',serif;font-style:italic;line-height:1.2;position:relative;">${esc(hotelName)}</div>
       </div>
-      ${hotelAddress ? `<div style="display:flex;align-items:flex-start;gap:4px;margin-bottom:24px;"><span>&#128205;</span><div style="font-size:12px;color:#6B7280;line-height:1.5;">${esc(hotelAddress)}</div></div>` : ""}
+      ${hotelAddress ? `<div style="display:flex;align-items:flex-start;gap:4px;margin-bottom:24px;"><span style="color:#6B7280;">${iconPin(12)}</span><div style="font-size:12px;color:#6B7280;line-height:1.5;">${esc(hotelAddress)}</div></div>` : ""}${phoneHtml}
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px;">
         <div>
           <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:2px;margin-bottom:6px;">Check-in</div>
-          <div style="font-size:26px;font-weight:900;color:#002a58;line-height:1;">${esc(fmtDateShort(checkIn))}</div>
-          <div style="font-size:12px;color:#6B7280;margin-top:3px;">${esc(fmtDayOfWeek(checkIn))}${checkIn ? ", 14:00" : ""}</div>
+          <div style="font-size:26px;font-weight:900;color:#002a58;line-height:1;">${esc(voucherDay(checkIn))}</div>
+          <div style="font-size:12px;color:#6B7280;margin-top:3px;">${esc(voucherWeekday(checkIn))}${checkIn && checkInTime ? `, ${esc(checkInTime)}` : ""}</div>
         </div>
         <div>
           <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:2px;margin-bottom:6px;">Check-out</div>
-          <div style="font-size:26px;font-weight:900;color:#002a58;line-height:1;">${esc(fmtDateShort(checkOut))}</div>
-          <div style="font-size:12px;color:#6B7280;margin-top:3px;">${esc(fmtDayOfWeek(checkOut))}${checkOut ? ", 12:00" : ""}</div>
+          <div style="font-size:26px;font-weight:900;color:#002a58;line-height:1;">${esc(voucherDay(checkOut))}</div>
+          <div style="font-size:12px;color:#6B7280;margin-top:3px;">${esc(voucherWeekday(checkOut))}${checkOut && checkOutTime ? `, ${esc(checkOutTime)}` : ""}</div>
         </div>
       </div>
       <div style="background:#f3f4f5;border-radius:10px;padding:14px;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;">
@@ -355,12 +481,12 @@ ${printButtonHtml}
           <div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:3px;">Primary Guest</div>
           <div style="font-weight:700;color:#002a58;font-size:12px;">${esc(leadGuestName)}</div>
         </div>
-        ${additionalGuestsHtml}
+        ${additionalGuestsHtml}${stayRowHtml}${specialRequestsHtml}
       </div>
     </div>
     <div style="flex:1;background:#002a58;padding:28px;color:#ffffff;display:flex;flex-direction:column;gap:10px;min-width:170px;box-shadow:inset 0 0 30px rgba(0,64,128,0.5),0 20px 40px rgba(0,42,88,0.3);">
       <div style="font-size:9px;font-weight:700;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:3px;margin-bottom:2px;">Reservation Reference</div>
-      ${tboReferenceNo ? `<div style="background:#C5A059;padding:12px;border-radius:10px;">
+      ${isExtracted ? extractedRefsHtml : `${tboReferenceNo ? `<div style="background:#C5A059;padding:12px;border-radius:10px;">
         <div style="font-size:9px;font-weight:700;color:rgba(0,0,0,0.6);margin-bottom:3px;text-transform:uppercase;letter-spacing:1px;">HOTEL REFERENCE — SHOW AT CHECK-IN</div>
         <div style="font-size:16px;font-weight:900;letter-spacing:2px;color:#1a1a1a;">${esc(tboReferenceNo)}</div>
       </div>` : ""}
@@ -368,7 +494,7 @@ ${printButtonHtml}
         <div style="font-size:9px;opacity:0.6;margin-bottom:3px;">PLUMTRIPS BOOKING ID — FOR SUPPORT INQUIRIES</div>
         <div style="font-size:14px;font-weight:900;letter-spacing:1px;">${esc(bookingId || "—")}</div>
       </div>
-      <div style="font-size:9px;opacity:0.7;text-align:center;padding:6px 0 2px;">Need help? Email hello@plumtrips.com</div>
+      <div style="font-size:9px;opacity:0.7;text-align:center;padding:6px 0 2px;">Need help? Email hello@plumtrips.com</div>`}
       <div style="background:#ffffff;padding:10px;border-radius:10px;text-align:center;margin-top:4px;">
         ${qrDataUrl ? `<img src="${qrDataUrl}" style="width:108px;height:108px;border-radius:4px;display:block;margin:0 auto;" alt="Hotel Directions QR"/>` : `<div style="width:108px;height:108px;background:#f0f0f0;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:10px;color:#002a58;text-align:center;margin:0 auto;">Directions</div>`}
         <div style="font-size:9px;font-weight:700;color:#002a58;text-transform:uppercase;letter-spacing:2px;margin-top:6px;">SCAN FOR DIRECTIONS</div>
@@ -380,16 +506,16 @@ ${printButtonHtml}
   </div>
 
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
-    <div style="background:#ffffff;border-radius:12px;padding:20px;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
+    <div style="background:#ffffff;border-radius:12px;padding:20px;break-inside:avoid;page-break-inside:avoid;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
       <div style="font-size:10px;font-weight:800;color:#002a58;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px;">What&apos;s Included</div>
       <ul style="list-style:none;padding:0;margin:0;">${inclusionsHtml}</ul>
     </div>
-    <div style="background:#ffffff;border-radius:12px;padding:20px;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
+    <div style="background:#ffffff;border-radius:12px;padding:20px;break-inside:avoid;page-break-inside:avoid;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
       <div style="font-size:10px;font-weight:800;color:#002a58;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px;">Check-in Information</div>
       <ul style="list-style:none;padding:0;margin:0;">
-        <li style="display:flex;gap:8px;padding:4px 0;font-size:12px;color:#374151;"><span>&#8226;</span><span>Check-in from 14:00 onwards</span></li>
-        <li style="display:flex;gap:8px;padding:4px 0;font-size:12px;color:#374151;"><span>&#8226;</span><span>Early check-in subject to availability</span></li>
-        <li style="display:flex;gap:8px;padding:4px 0;font-size:12px;color:#374151;"><span>&#8226;</span><span>Government ID required at check-in</span></li>
+        ${checkInTime ? `<li style="display:flex;gap:8px;padding:4px 0;font-size:12px;color:#374151;"><span>&#8226;</span><span>Check-in from ${esc(checkInTime)} onwards</span></li>` : ""}
+        ${checkOutTime ? `<li style="display:flex;gap:8px;padding:4px 0;font-size:12px;color:#374151;"><span>&#8226;</span><span>Check-out by ${esc(checkOutTime)}</span></li>` : ""}
+        <li style="display:flex;gap:8px;padding:4px 0;font-size:12px;color:#374151;"><span>&#8226;</span><span>Carry a government photo ID</span></li>
         <li style="display:flex;gap:8px;padding:4px 0;font-size:12px;color:#374151;"><span>&#8226;</span><span>Present this voucher at reception</span></li>
       </ul>
     </div>
@@ -397,17 +523,17 @@ ${printButtonHtml}
 
   ${hotelOffersHtml}
 
-  ${roomDescription ? `<div style="background:#ffffff;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
+  ${roomDescription ? `<div style="background:#ffffff;border-radius:12px;padding:20px;break-inside:avoid;page-break-inside:avoid;margin-bottom:16px;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
     <div style="font-size:10px;font-weight:800;color:#002a58;text-transform:uppercase;letter-spacing:2px;margin-bottom:10px;">Room Description</div>
     <p style="font-size:12px;color:#374151;line-height:1.6;margin:0;">${esc(roomDescription)}</p>
   </div>` : ""}
 
-  ${rateConditions && rateConditions.length > 0 ? `<div style="background:#ffffff;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
+  ${!isExtracted && rateConditions && rateConditions.length > 0 ? `<div style="background:#ffffff;border-radius:12px;padding:20px;break-inside:avoid;page-break-inside:avoid;margin-bottom:16px;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
     <div style="font-size:10px;font-weight:800;color:#002a58;text-transform:uppercase;letter-spacing:2px;margin-bottom:10px;">Rate Conditions</div>
     <ul style="list-style:none;padding:0;margin:0;">${rateConditions.map((c) => `<li style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:12px;color:#374151;"><span style="color:#92400e;flex-shrink:0;">&#8226;</span><span>${esc(c)}</span></li>`).join("")}</ul>
   </div>` : ""}
 
-  ${amenities && amenities.length > 0 ? `<div style="background:#ffffff;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
+  ${amenities && amenities.length > 0 ? `<div style="background:#ffffff;border-radius:12px;padding:20px;break-inside:avoid;page-break-inside:avoid;margin-bottom:16px;box-shadow:0 4px 20px rgba(0,42,88,0.04);">
     <div style="font-size:10px;font-weight:800;color:#002a58;text-transform:uppercase;letter-spacing:2px;margin-bottom:10px;">Amenities</div>
     <p style="font-size:12px;color:#374151;margin:0;">${amenities.map((a) => esc(a)).join(" &bull; ")}</p>
   </div>` : ""}
@@ -420,15 +546,17 @@ ${printButtonHtml}
     ${esc(hotelName.toUpperCase())} &bull; TERMS &amp; CONDITIONS
   </div>
 
-  <h1 style="font-family:'Cormorant Garamond',Georgia,serif;font-size:32px;color:#0A1628;margin:0 0 8px 0;">
+  <h1 style="font-family:'Playfair Display',Georgia,serif;font-weight:700;font-size:32px;color:#0A1628;margin:0 0 8px 0;">
     Important Booking Terms &amp; Conditions
   </h1>
 
-  <p style="font-family:'DM Sans',system-ui,sans-serif;font-size:11px;color:#6b6b6b;font-style:italic;margin:0 0 28px 0;">
+  <p style="font-family:'Manrope',system-ui,sans-serif;font-size:11px;color:#6b6b6b;font-style:italic;margin:0 0 28px 0;">
     Please read carefully. By proceeding with this booking, you accept these terms.
   </p>
 
   <div style="height:2px;background:linear-gradient(to right,#B89968,transparent);margin-bottom:24px;"></div>
+
+  ${importantInfoHtml}
 
   ${cancelSectionHtml}
 
@@ -436,7 +564,7 @@ ${printButtonHtml}
 
   ${additionalConditionsHtml}
 
-  <ol style="font-family:'DM Sans',system-ui,sans-serif;font-size:10.5px;color:#1a1a1a;line-height:1.45;padding-left:20px;margin:0;">
+  <ol style="font-family:'Manrope',system-ui,sans-serif;font-size:10.5px;color:#1a1a1a;line-height:1.45;padding-left:20px;margin:0;">
     <li style="margin-bottom:6px;">You must present a photo ID at the time of check-in. Hotel may ask for credit card or cash deposit for extra services at the time of check-in.</li>
     <li style="margin-bottom:6px;">All extra charges should be collected directly from clients prior to departure such as parking, phone calls, room service, city tax, etc.</li>
     <li style="margin-bottom:6px;">We don&apos;t accept any responsibility for additional expenses due to changes or delays in air, road, rail, sea or indeed of any other causes; all such expenses will have to be borne by passengers.</li>
@@ -449,11 +577,11 @@ ${printButtonHtml}
     <li style="margin-bottom:6px;">For any assistance, please contact Plumtrips support at hello@plumtrips.com or via your account dashboard.</li>
   </ol>
 
-  <p style="font-family:'Cormorant Garamond',Georgia,serif;font-size:14px;color:#0A1628;font-style:italic;text-align:center;margin:20px 0 0 0;">
+  <p style="font-family:'Playfair Display',Georgia,serif;font-weight:700;font-size:14px;color:#0A1628;font-style:italic;text-align:center;margin:20px 0 0 0;">
     Thank you for booking with Plumtrips. We wish you a pleasant stay.
   </p>
   ${demoFooterDisclaimerHtml}
-  <div style="font-family:'DM Sans',system-ui,sans-serif;font-size:8px;color:#9ca3af;text-align:center;margin-top:16px;padding-top:12px;border-top:1px solid #e5e2db;">
+  <div style="font-family:'Manrope',system-ui,sans-serif;font-size:8px;color:#9ca3af;text-align:center;margin-top:16px;padding-top:12px;border-top:1px solid #e5e2db;">
     &copy; ${new Date().getFullYear()} Peachmint Trips and Planners Pvt. Ltd.
   </div>
 

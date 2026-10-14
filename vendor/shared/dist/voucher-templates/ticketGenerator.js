@@ -9,6 +9,7 @@
    exact current S3 default so frontend callers passing nothing are unaffected.
    ────────────────────────────────────────────────────────────────────────── */
 import QRCode from "qrcode";
+import { iconArrowRight, iconPassport, iconPlane, iconPrinter } from "./icons.js";
 const DEFAULT_LOGO_URL = "https://plumtrips-assets.s3.amazonaws.com/email/plumtrips-email-logo.png";
 async function generateQRDataUrl(text) {
     try {
@@ -195,7 +196,7 @@ export function generateFlightSection(b, segmentLabel) {
       <div style="height:1px;background:#E5E7EB;position:relative;">
         <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%) rotate(45deg);width:7px;height:7px;background:#ffffff;border:1.5px solid #002a58;"></div>
       </div>
-      <div style="font-size:22px;margin-top:10px;color:#002a58;">&#9992;</div>
+      <div style="font-size:22px;margin-top:10px;color:#002a58;">${iconPlane(22, "#002a58")}</div>
     </div>
     <div style="text-align:right;">
       <div style="font-size:72px;font-weight:900;color:#002a58;letter-spacing:-2px;line-height:1;">${esc(b.destination.code)}</div>
@@ -283,7 +284,7 @@ export async function generateReturnPageHTML(rb, logoUrl = DEFAULT_LOGO_URL, opt
     <div style="margin-bottom:24px;">
       <div style="font-size:10px;font-weight:700;color:#002a58;text-transform:uppercase;letter-spacing:3px;border:1px solid rgba(0,42,88,0.2);display:inline-block;padding:3px 10px;border-radius:20px;background:rgba(0,42,88,0.05);margin-bottom:12px;">${esc(legLabel)} Journey</div>
       <h1 style="font-size:28px;font-weight:900;color:#002a58;letter-spacing:-1px;line-height:1.1;margin-bottom:6px;font-family:Manrope,sans-serif;">Welcome Back, ${rbFirstName}.</h1>
-      <p style="font-size:14px;color:#6B7280;">${esc(rbOriginCity)} &rarr; ${esc(rbDestCity)} &bull; Booking ID: ${esc(rb.bookingId)}</p>
+      <p style="font-size:14px;color:#6B7280;">${esc(rbOriginCity)} ${iconArrowRight(12)} ${esc(rbDestCity)} &bull; Booking ID: ${esc(rb.bookingId)}</p>
     </div>
 
     <div style="display:flex;gap:24px;align-items:flex-start;margin-bottom:24px;">
@@ -414,7 +415,7 @@ export async function generateTicketHTML(b, offers = [], returnBooking, logoUrl 
           <div style="font-size:9px;font-weight:700;color:#fe6a34;text-transform:uppercase;letter-spacing:3px;margin-bottom:8px;">PARTNER EXCLUSIVE</div>
           <div style="font-size:18px;font-weight:800;color:#ffffff;margin-bottom:8px;line-height:1.3;">${esc(o.title)}</div>
           <div style="font-size:12px;color:rgba(255,255,255,0.75);margin-bottom:16px;line-height:1.5;">${esc(o.description)}</div>
-          <a href="${esc(o.ctaUrl)}" target="_blank" rel="noopener" style="font-size:10px;font-weight:700;color:#ffffff;text-decoration:underline;text-transform:uppercase;letter-spacing:2px;">${esc(o.ctaText)} &rarr;</a>
+          <a href="${esc(o.ctaUrl)}" target="_blank" rel="noopener" style="font-size:10px;font-weight:700;color:#ffffff;text-decoration:underline;text-transform:uppercase;letter-spacing:2px;">${esc(o.ctaText)} ${iconArrowRight(10)}</a>
         </div>
         <div style="flex:2;overflow:hidden;min-height:160px;position:relative;">
           ${imgHtml}
@@ -427,10 +428,10 @@ export async function generateTicketHTML(b, offers = [], returnBooking, logoUrl 
         <div style="font-size:9px;font-weight:700;color:#fe6a34;text-transform:uppercase;letter-spacing:3px;margin-bottom:8px;">PARTNER EXCLUSIVE</div>
         <div style="font-size:18px;font-weight:800;color:#ffffff;margin-bottom:8px;line-height:1.3;">Effortless eVisa with Helloviza</div>
         <div style="font-size:12px;color:rgba(255,255,255,0.75);margin-bottom:16px;line-height:1.5;">20% privilege discount on all visa processing fees.</div>
-        <a href="https://helloviza.com" target="_blank" rel="noopener" style="font-size:10px;font-weight:700;color:#ffffff;text-decoration:underline;text-transform:uppercase;letter-spacing:2px;">EXPLORE PRIVILEGES &rarr;</a>
+        <a href="https://helloviza.com" target="_blank" rel="noopener" style="font-size:10px;font-weight:700;color:#ffffff;text-decoration:underline;text-transform:uppercase;letter-spacing:2px;">EXPLORE PRIVILEGES ${iconArrowRight(10)}</a>
       </div>
       <div style="flex:2;overflow:hidden;min-height:160px;position:relative;">
-        <div style="width:100%;height:100%;background:linear-gradient(135deg,#001a38,#002a58);display:flex;align-items:center;justify-content:center;min-height:160px;"><span style="font-size:80px;opacity:0.15;">&#x1F6C2;</span></div>
+        <div style="width:100%;height:100%;background:linear-gradient(135deg,#001a38,#002a58);display:flex;align-items:center;justify-content:center;min-height:160px;"><span style="opacity:0.15;color:#ffffff;">${iconPassport(80)}</span></div>
         <div style="position:absolute;inset:0;background:linear-gradient(to right,#004080 0%,transparent 70%);pointer-events:none;"></div>
       </div>
     </div>`;
@@ -443,7 +444,7 @@ export async function generateTicketHTML(b, offers = [], returnBooking, logoUrl 
     const returnPageHtml = (await Promise.all(onwardLegs.map((leg, i) => generateReturnPageHTML(leg, logoUrl, { pageIndex: i + 2, totalPages })))).join("");
     const printButtonHtml = showPrintButton
         ? `<div class="no-print" style="position:fixed;bottom:24px;right:24px;z-index:999;">
-  <button onclick="window.print()" style="background:#002a58;color:#ffffff;border:none;border-radius:10px;padding:12px 24px;font-size:13px;font-weight:700;font-family:Manrope,sans-serif;cursor:pointer;box-shadow:0 4px 20px rgba(0,42,88,0.3);">&#128438; Print / Save PDF</button>
+  <button onclick="window.print()" style="background:#002a58;color:#ffffff;border:none;border-radius:10px;padding:12px 24px;font-size:13px;font-weight:700;font-family:Manrope,sans-serif;cursor:pointer;box-shadow:0 4px 20px rgba(0,42,88,0.3);">${iconPrinter(14)} Print / Save PDF</button>
 </div>`
         : "";
     return `<!DOCTYPE html>

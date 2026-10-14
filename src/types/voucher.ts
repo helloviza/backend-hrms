@@ -91,7 +91,12 @@ export interface FlightDetails {
 
 export interface Policies {
   cancellation_deadline?: string | null;
-  is_non_refundable: boolean;
+  /**
+   * Three-state: true / false only when the document says so (an explicit
+   * flag, or for true a clear "non-refundable" statement); null when it states
+   * nothing. Null must never be rendered as refundable / free cancellation.
+   */
+  is_non_refundable: boolean | null;
   important_notes: string[];
 }
 

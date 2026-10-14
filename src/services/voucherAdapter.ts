@@ -43,6 +43,14 @@ import {
   type CancelPolicy,
 } from "@plumtrips/shared/voucher-templates/cancellationPolicy";
 import logger from "../utils/logger.js";
+import {
+  buildDateContext,
+  fmtDay,
+  isoDate,
+  resolveStayDates,
+  resolveVoucherDate,
+  type DateContext,
+} from "./voucherDates.js";
 
 /* ───────────────────────── small helpers ───────────────────────── */
 
@@ -52,57 +60,6 @@ function nz(x: unknown): string {
 }
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
-
-const MONTHS: Record<string, number> = {
-  jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
-  apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6,
-  aug: 7, august: 7, sep: 8, sept: 8, september: 8, oct: 9, october: 9,
-  nov: 10, november: 10, dec: 11, december: 11,
-};
-
-/**
- * Parse a free-form extracted date string into a Date (time set to local
- * midnight). Handles the common voucher shapes; returns null if unparseable.
- *   "14 Jun 2026" · "14 June 2026" · "14-06-2026" · "14/06/2026" ·
- *   "2026-06-14" · "Jun 14, 2026" · "14.06.2026"
- * Numeric DMY is assumed day-first (India / European vouchers).
- */
-function parseLooseDate(input?: string | null): Date | null {
-  const s = (input || "").trim();
-  if (!s) return null;
-
-  // ISO yyyy-mm-dd (optionally with time we ignore here)
-  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (m) {
-    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  // DD <Mon> YYYY  (e.g. "14 Jun 2026", "14-June-2026")
-  m = s.match(/^(\d{1,2})[ \-./]+([A-Za-z]+)[ \-./,]+(\d{4})$/);
-  if (m && MONTHS[m[2].toLowerCase()] !== undefined) {
-    const d = new Date(Number(m[3]), MONTHS[m[2].toLowerCase()], Number(m[1]));
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  // <Mon> DD, YYYY  (e.g. "Jun 14, 2026")
-  m = s.match(/^([A-Za-z]+)[ \-./]+(\d{1,2})[ \-./,]+(\d{4})$/);
-  if (m && MONTHS[m[1].toLowerCase()] !== undefined) {
-    const d = new Date(Number(m[3]), MONTHS[m[1].toLowerCase()], Number(m[2]));
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  // DD MM YYYY numeric, day-first (e.g. "14/06/2026", "14-06-2026", "14.06.2026")
-  m = s.match(/^(\d{1,2})[\-/.](\d{1,2})[\-/.](\d{4})$/);
-  if (m) {
-    const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  // Last resort — let the engine try (covers RFC/ISO-with-time strings).
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
-}
 
 /** Parse a free-form time string into {h, m}; null if none/unparseable. */
 function parseLooseTime(input?: string | null): { h: number; m: number } | null {
@@ -141,28 +98,43 @@ function parseLooseTime(input?: string | null): { h: number; m: number } | null 
   return null;
 }
 
-/** Local ISO `YYYY-MM-DDTHH:mm:ss` that `new Date(...)` parses reliably. */
-function toLocalIso(d: Date): string {
-  return (
-    `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` +
-    `T${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
-  );
-}
-
-/** Date-only local ISO `YYYY-MM-DD`. */
-function toLocalIsoDate(d: Date): string {
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+/**
+ * Wall-clock `YYYY-MM-DDTHH:mm:ss` (no zone) from a UTC-midnight calendar day
+ * plus a time. The ticket template reads it back with `new Date(...)` and
+ * formats it in the same zone, so the printed day and time are exactly these.
+ */
+function wallClockIso(day: Date, time: { h: number; m: number } | null): string {
+  return `${isoDate(day)}T${pad2(time?.h ?? 0)}:${pad2(time?.m ?? 0)}:00`;
 }
 
 /**
- * Combine a leg's separate date + time strings into an ISO datetime the
- * template's `new Date(...)` parses cleanly (so fmtTime/fmtDate format and the
- * duration computes). Returns "" — NOT the raw string and NOT NaN — when the
- * date can't be parsed, so the template renders blank rather than junk.
+ * Optional render context. `createdAt` anchors the year for dates printed
+ * without one; `warnings` collects anything ops should double-check (shown on
+ * the record in /admin/vouchers). Both optional — callers that pass nothing
+ * get today as the anchor and the warnings are discarded.
  */
-function buildLegDateTime(leg: FlightLeg | undefined, label: string): string {
-  const date = parseLooseDate(leg?.date);
-  if (!date) {
+export interface AdaptContext {
+  createdAt?: Date | string | null;
+  warnings?: string[];
+}
+
+function dateContextFor(v: PlumtripsVoucher, ctx?: AdaptContext): DateContext {
+  return buildDateContext(v?.booking_info?.booking_date, ctx?.createdAt, ctx?.warnings ?? []);
+}
+
+/**
+ * Resolve a leg's date (inferring a missing year — see voucherDates.ts) and
+ * combine it with the leg's time. Returns "" — NOT the raw string and NOT NaN —
+ * when the date can't be read, so the template renders blank rather than junk.
+ */
+function buildLegDateTime(
+  leg: FlightLeg | undefined,
+  label: string,
+  dctx: DateContext,
+  notBefore: Date | null,
+): { iso: string; day: Date | null } {
+  const day = resolveVoucherDate(leg?.date, dctx, { label, notBefore });
+  if (!day) {
     if (nz(leg?.date) || nz(leg?.time)) {
       logger.warn("[voucher-adapter] unparseable leg datetime; rendering blank", {
         label,
@@ -170,11 +142,9 @@ function buildLegDateTime(leg: FlightLeg | undefined, label: string): string {
         time: nz(leg?.time),
       });
     }
-    return "";
+    return { iso: "", day: null };
   }
-  const time = parseLooseTime(leg?.time);
-  date.setHours(time?.h ?? 0, time?.m ?? 0, 0, 0);
-  return toLocalIso(date);
+  return { iso: wallClockIso(day, parseLooseTime(leg?.time)), day };
 }
 
 /* ───────────────────────── flight bits ───────────────────────── */
@@ -320,6 +290,7 @@ function buildBookingFromSegment(
   v: PlumtripsVoucher,
   seg: FlightSegment | undefined,
   shared: { ticketId: string; createdAt: string },
+  times: { departureTime: string; arrivalTime: string },
   legLabel?: string,
 ): TicketBooking {
   const origin = seg?.origin;
@@ -333,8 +304,8 @@ function buildBookingFromSegment(
     // Guard (b): code coerced null→"" so cityName()/airportFullName() never throw.
     origin: { code: nz(origin?.code), city: nz(origin?.city) },
     destination: { code: nz(dest?.code), city: nz(dest?.city) },
-    departureTime: buildLegDateTime(origin, "departure"),
-    arrivalTime: buildLegDateTime(dest, "arrival"),
+    departureTime: times.departureTime,
+    arrivalTime: times.arrivalTime,
     airlineCode: "", // not rendered by the template
     airlineName: nz(seg?.airline),
     flightNumber: nz(seg?.flight_no),
@@ -369,7 +340,10 @@ function buildBookingFromSegment(
  * The final leg is titled "Return" only when it actually lands back where the
  * itinerary began; otherwise it is "Onward". Legs in between are "Connecting".
  */
-export function adaptFlight(v: PlumtripsVoucher): {
+export function adaptFlight(
+  v: PlumtripsVoucher,
+  ctx?: AdaptContext,
+): {
   booking: TicketBooking;
   returnBooking?: TicketBooking | TicketBooking[];
 } {
@@ -382,8 +356,21 @@ export function adaptFlight(v: PlumtripsVoucher): {
     createdAt: new Date().toISOString(),
   };
 
+  // Legs are resolved in order: a leg printed without a year can't precede the
+  // one before it, so it rolls into the next year (a Dec 31 → Jan 1 itinerary).
+  const dctx = dateContextFor(v, ctx);
+  let prev: Date | null = null;
+  const legTimes = segs.map((seg, i) => {
+    const n = segs.length > 1 ? ` (segment ${i + 1})` : "";
+    const dep = buildLegDateTime(seg?.origin, `Departure date${n}`, dctx, prev);
+    const arr = buildLegDateTime(seg?.destination, `Arrival date${n}`, dctx, dep.day ?? prev);
+    prev = arr.day ?? dep.day ?? prev;
+    return { departureTime: dep.iso, arrivalTime: arr.iso };
+  });
+  const noTimes = { departureTime: "", arrivalTime: "" };
+
   if (segs.length <= 1) {
-    return { booking: buildBookingFromSegment(v, segs[0], shared) };
+    return { booking: buildBookingFromSegment(v, segs[0], shared, legTimes[0] ?? noTimes) };
   }
 
   const onward = segs.slice(1);
@@ -392,7 +379,7 @@ export function adaptFlight(v: PlumtripsVoucher): {
   const onwardBookings = onward.map((seg, i) => {
     const isFinalLeg = i === onward.length - 1;
     const legLabel = isFinalLeg ? (isRoundTrip ? "Return" : "Onward") : "Connecting";
-    return buildBookingFromSegment(v, seg, shared, legLabel);
+    return buildBookingFromSegment(v, seg, shared, legTimes[i + 1], legLabel);
   });
 
   if (segs.length > 2) {
@@ -406,7 +393,7 @@ export function adaptFlight(v: PlumtripsVoucher): {
   }
 
   return {
-    booking: buildBookingFromSegment(v, segs[0], shared),
+    booking: buildBookingFromSegment(v, segs[0], shared, legTimes[0]),
     // Single extra leg stays a bare object — the shape existing callers expect.
     returnBooking: onwardBookings.length === 1 ? onwardBookings[0] : onwardBookings,
   };
@@ -423,18 +410,103 @@ function stripRepairNotes(notes?: string[] | null): string[] {
 }
 
 /**
- * Issue-2 mitigation (snapshot-safe, adapter-only — no template change): a lone
- * trivial optional bullet renders a section HEADER + a single line that strands
- * onto a near-empty page in the paginated PDF. Suppress such sparse optional
- * sections — keep genuinely informative content (≥2 items, or a single
- * substantial line ≥60 chars). Returns undefined when the section should be
- * omitted entirely (template hides the section when the array is undefined/empty).
+ * A stay perk the voucher lists among its notes ("Early check-in up to 2
+ * hours (subject to availability)", "Late Checkout Subject to Availability").
+ * Gemini files these under notes, which printed them under "Rate Conditions"
+ * apart from the rest of what's included. Deliberately narrow: the WHOLE line
+ * must be the perk itself — optionally "up to / until …" and "(subject to
+ * availability)" — and mention no fee. So these stay notes:
+ *   "Special requests (bed type, early check-in, late check-out …) are not guaranteed"
+ *   "Early Check-in and Late Check-out will attract 50% of room tariff."
+ *   "Early check-in and late check-out are subject to availability and hotel policy."
+ *   "Optional fees: … late check-out (CHF 20)"
  */
-function meaningfulOptionalList(items?: string[] | null): string[] | undefined {
-  const cleaned = (items || []).map((s) => (s || "").trim()).filter(Boolean);
-  if (cleaned.length === 0) return undefined;
-  if (cleaned.length === 1 && cleaned[0].length < 60) return undefined;
-  return cleaned;
+const PERK = String.raw`(?:early\s*check[- ]?in|late\s*check[- ]?out)`;
+const PERK_LINE_RE = new RegExp(
+  String.raw`^\s*(?:complimentary\s+|free\s+)?${PERK}(?:\s+(?:and|&)\s+${PERK})?` +
+    String.raw`(?:\s+(?:up\s*to|till|until)\s+[\w\s:.]+?)?` +
+    String.raw`\s*(?:[(,-]?\s*subject\s+to\s+availability\s*\)?)?\s*\.?\s*$`,
+  "i",
+);
+const PERK_EXCLUDE_RE = /\b(?:fee|fees|charge|charges|chargeable|cost|payable|paid|tariff|rate|extra)\b|%|[₹$€£]/i;
+export function isStayPerk(note: string): boolean {
+  const s = (note || "").trim();
+  return s.length > 0 && s.length <= 90 && PERK_LINE_RE.test(s) && !PERK_EXCLUDE_RE.test(s);
+}
+
+/**
+ * A note that states what the booking cost or what was paid for it ("Complete
+ * payment to avoid auto cancellation. Amount ₹ 58,530 by 25 Dec", "Booking.com
+ * paid 716.67 of this booking … 10,035.57 as the total price"). The extracted
+ * voucher goes to the traveller, who must never see the supplier's price, so
+ * these are dropped. Needs both a price/payment word AND an amount, and loses
+ * to anything about fees the guest pays at the hotel — city/tourist tax,
+ * resort fee, deposit, "payable at the property" — which is the guest's to
+ * know. Anything else that mentions money stays.
+ */
+const PRICE_WORD_RE =
+  /\b(?:amount|total|grand\s+total|booking\s+(?:amount|value|price)|paid|payment|net\s+rate|price)\b/i;
+const AMOUNT_RE =
+  /[₹$€£]\s*\d|\b(?:inr|rs\.?|usd|eur|euro|aed|chf|gbp|sar|aud|sgd|thb|myr)\s*\d|\d\s*(?:inr|usd|eur|euros?|aed|chf|gbp|sar|aud|sgd|thb|myr)\b|\b\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\b|\b\d+\.\d{2}\b/i;
+const AT_HOTEL_FEE_RE =
+  /\b(?:city|tourist|tourism)\s+(?:tax|fee)|\bresort\s+fee|\bdeposit|\bpayable\b|\b(?:paid|pay|collected|charged)\s+(?:directly\s+)?(?:at|to|by)\s+(?:the\s+)?(?:hotel|property)|\bat\s+(?:the\s+)?(?:hotel|property)\b|\bon\s+arrival\b|\bat\s+check[- ]?(?:in|out)\b|\bsupplements?\b/i;
+export function isPriceNote(note: string): boolean {
+  const s = note || "";
+  return PRICE_WORD_RE.test(s) && AMOUNT_RE.test(s) && !AT_HOTEL_FEE_RE.test(s);
+}
+
+/** Notes → { perks for "What's included", the rest for "Important information" }. */
+function splitPerks(notes: string[], inclusions: string[]): { inclusions: string[]; notes: string[] } {
+  const seen = new Set(inclusions.map((i) => i.trim().toLowerCase()));
+  const outInc = [...inclusions];
+  const outNotes: string[] = [];
+  for (const n of notes) {
+    const t = (n || "").trim();
+    if (!t) continue;
+    if (isStayPerk(t)) {
+      if (!seen.has(t.toLowerCase())) {
+        seen.add(t.toLowerCase());
+        outInc.push(t);
+      }
+    } else {
+      outNotes.push(t);
+    }
+  }
+  return { inclusions: outInc, notes: outNotes };
+}
+
+/**
+ * The hotel's phone number(s) out of the extracted contact line, which mixes
+ * phones, emails and URLs ("9151915166, 05224606555, reservations@…"). Keeps
+ * up to two numbers — later ones are often an aggregator's support lines —
+ * and treats "+919880888999" and "9880888999" as one. Returns null for the
+ * literal "null" older records hold, and for a contact block carrying a
+ * plumtrips.com address: that is our own agent's line, not the hotel's.
+ */
+export function hotelPhoneFrom(x: unknown): string | null {
+  const s = nz(x).trim();
+  if (!s || /plumtrips\.com/i.test(s)) return null;
+  const seen = new Set<string>();
+  const phones: string[] = [];
+  for (const part of s.split(/[,;|/]|\s{2,}/)) {
+    const t = part.replace(/^\s*(?:phone|tel|telephone|mobile|mob|ph|contact)\s*[:.-]?\s*/i, "").trim();
+    if (!t || /@|https?:|www\./i.test(t) || !/^[+\d\s().-]+$/.test(t)) continue;
+    const digits = t.replace(/\D/g, "");
+    if (digits.length < 6) continue;
+    const key = digits.slice(-10);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    phones.push(t);
+    if (phones.length === 2) break;
+  }
+  return phones.length ? phones.join(", ") : null;
+}
+
+/** A count the voucher states ("2", "2 rooms", 3); null for 0 / absent / unreadable. */
+function positiveInt(x: unknown): number | null {
+  const m = String(x ?? "").match(/\d+/);
+  const n = m ? Number(m[0]) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 /** First name for the greeting (mirrors the template's own extractFirstName). */
@@ -445,122 +517,185 @@ function firstNameOf(fullName?: string | null): string {
   return cleaned.split(/\s+/)[0] || "Valued Guest";
 }
 
-/** Date-only normalization for hotel check-in/out → "" (blank) if unparseable. */
-function hotelDate(input: string | null | undefined, label: string): string {
-  const d = parseLooseDate(input);
-  if (!d) {
-    if (nz(input)) {
-      logger.warn("[voucher-adapter] unparseable hotel date; rendering blank", {
-        label,
-        value: nz(input),
-      });
-    }
-    return "";
-  }
-  return toLocalIsoDate(d);
-}
-
 /** TBO-format a Date as "DD-MM-YYYY HH:mm:ss" (what parseTBODate expects). */
 function tboFormat(d: Date): string {
+  // Calendar fields only (the dates here are UTC-midnight days from voucherDates).
   return (
-    `${pad2(d.getDate())}-${pad2(d.getMonth() + 1)}-${d.getFullYear()} ` +
-    `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
+    `${pad2(d.getUTCDate())}-${pad2(d.getUTCMonth() + 1)}-${d.getUTCFullYear()} ` +
+    `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`
   );
 }
 
+/** Sorts before any real tier and survives the FromDate ≤ check-out filter; never displayed. */
+const FROM_BOOKING = new Date(Date.UTC(2000, 0, 1));
+
+/** "Free cancellation …" said in so many words by the document. */
+const FREE_STATEMENT_RE =
+  /\bfree\s+cancell?ation\b|\bcancell?ation\s+(?:is\s+)?free\b|\bcancel(?:led)?\s+free\s+of\s+charge\b/i;
+/** …and with no condition attached. */
+const FREE_ANY_TIME_RE = /\bfree\s+cancell?ation\s+(?:at\s+)?any\s*time\b/i;
+
+/** "10 days prior to arrival", "48 hours before check-in". */
+const RELATIVE_DEADLINE_RE =
+  /(\d{1,3})\s*(days?|hours?|hrs?)\s*(?:prior|before)\s*(?:to\s*)?(?:the\s*)?(?:arrival|check[- ]?in)/i;
+
 /**
- * Guard (c): synthesize cancelPolicies[] from the only structured signals the
- * extract carries (is_non_refundable + cancellation_deadline). All FromDates
- * are emitted in valid TBO format. For a NON-REFUNDABLE booking we then verify
- * with buildCancellationChips that the result never renders as free-cancellable;
- * if it would (empty chips, or any free chip), we hide the section ([]) rather
- * than emit the misleading "Free cancellation available" fallback.
+ * The moment cancellation charges begin, from cancellation_deadline:
+ *   - a relative deadline counts back from check-in (at the check-in time when
+ *     the voucher gives one, else from the start of the check-in day — the
+ *     earlier, safer reading);
+ *   - an absolute deadline keeps a time the document printed; a date with no
+ *     time ends free cancellation at the START of that day, so "free before
+ *     21 Jun" is never stretched into 21 Jun.
+ * Alongside it, the deadline as the document states it, for printing:
+ * "25 Dec 2026, 11:59 PM IST", "21 Jun 2026", "10 days prior to arrival" —
+ * the stated day and time, with the year filled in the way stay dates get it.
+ * `dateOnly` marks a deadline with no time, whose charges begin at the start
+ * of that day. Returns null when the voucher gives no deadline.
+ */
+interface Deadline {
+  /** When charges begin; null when the stated deadline can't be read. */
+  chargesFrom: Date | null;
+  stated: string;
+  dateOnly: boolean;
+}
+function readDeadline(
+  v: PlumtripsVoucher,
+  checkIn: Date | null,
+  checkInTime: { h: number; m: number } | null,
+  dctx: DateContext,
+): Deadline | null {
+  const raw = nz(v?.policies?.cancellation_deadline).trim();
+  if (!raw || /^null$/i.test(raw)) return null;
+
+  const rel = raw.match(RELATIVE_DEADLINE_RE);
+  if (rel) {
+    if (!checkIn) return { chargesFrom: null, stated: raw, dateOnly: false };
+    const n = Number(rel[1]);
+    const ms = /^d/i.test(rel[2]) ? n * 86_400_000 : n * 3_600_000;
+    const arrival = checkIn.getTime() + ((checkInTime?.h ?? 0) * 60 + (checkInTime?.m ?? 0)) * 60_000;
+    return { chargesFrom: new Date(arrival - ms), stated: raw, dateOnly: false };
+  }
+
+  const day = resolveVoucherDate(raw, dctx, { label: "Cancellation deadline" });
+  if (!day) return { chargesFrom: null, stated: raw, dateOnly: false };
+  const t = raw.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp]\.?[Mm]\.?)?(?:\s*\b(IST|GMT|UTC|CET|CEST|BST|GST)\b)?/);
+  const time = t ? parseLooseTime(`${t[1]}:${t[2]}${t[3] ? " " + t[3].replace(/\./g, "") : ""}`) : null;
+  // start of the deadline day
+  if (!time) return { chargesFrom: day, stated: fmtDay(day), dateOnly: true };
+  const statedTime = `${t![1]}:${t![2]}${t![3] ? " " + t![3].toUpperCase() : ""}${t![4] ? " " + t![4] : ""}`;
+  return {
+    // The chip prints "until <next tier − 1s>"; starting charges at :59 makes
+    // that read exactly the time the document gave ("until 12:59").
+    chargesFrom: new Date(day.getTime() + (time.h * 60 + time.m) * 60_000 + 59_000),
+    stated: `${fmtDay(day)}, ${statedTime}`,
+    dateOnly: false,
+  };
+}
+
+/**
+ * Guard (c): cancelPolicies[] from what the document actually states. Free
+ * cancellation is never inferred:
+ *   - non-refundable (true)                              → one 100% tier ("Non-refundable …")
+ *   - refundable (false) + a deadline                    → free until the deadline, then 100%
+ *   - an explicit free-cancellation statement + deadline → the same
+ *   - "free cancellation any time", stated as such       → free any time
+ *   - a deadline and nothing else (refundability unstated) → [] plus the
+ *     deadline: the template prints "Cancellation deadline: <date>. Charges
+ *     may apply after this, as per supplier policy." — a deadline alone is
+ *     not a promise that cancelling before it is free
+ *   - anything else (unknown)                            → [] — the template prints
+ *     "As per supplier policy — contact support" for extracted vouchers.
+ * All FromDates are TBO format. `deadline` is returned for every case except
+ * non-refundable, which the deadline can't soften.
  */
 function synthesizeCancelPolicies(
   v: PlumtripsVoucher,
+  checkIn: Date | null,
+  checkInTime: { h: number; m: number } | null,
   checkOut: string,
-): CancelPolicy[] {
-  const isNonRefundable = !!v?.policies?.is_non_refundable;
-  const deadline = parseLooseDate(v?.policies?.cancellation_deadline);
-  const bookingDate = parseLooseDate(v?.booking_info?.booking_date);
+  dctx: DateContext,
+): { policies: CancelPolicy[]; deadline: Deadline | null } {
+  const flag = v?.policies?.is_non_refundable;
+  const notes = stripRepairNotes(v?.policies?.important_notes);
+  const freeStatement = notes.some((n) => FREE_STATEMENT_RE.test(n));
+  const freeAnyTime = notes.some((n) => FREE_ANY_TIME_RE.test(n));
 
-  // A safe "from booking" anchor that always sorts before any later tier and is
-  // far enough in the past to survive the checkout ≥ FromDate filter. The
-  // template never displays this anchor date (the labels are fixed text or the
-  // deadline), so a sentinel is fine.
-  const anchor = bookingDate && (!deadline || bookingDate < deadline)
-    ? bookingDate
-    : new Date(2000, 0, 1);
-
-  let policies: CancelPolicy[];
-
-  if (isNonRefundable) {
-    // Single 100% tier → "Non-refundable · 100% charge from booking date".
-    policies = [
-      { FromDate: tboFormat(anchor), ChargeType: "Percentage", CancellationCharge: 100 },
+  if (flag === true) {
+    const policies: CancelPolicy[] = [
+      { FromDate: tboFormat(FROM_BOOKING), ChargeType: "Percentage", CancellationCharge: 100 },
     ];
-  } else if (deadline) {
-    // Free until the deadline, then 100% — give the deadline an end-of-day time
-    // when none was carried so the "until …" label reads naturally.
-    if (deadline.getHours() === 0 && deadline.getMinutes() === 0 && deadline.getSeconds() === 0) {
-      deadline.setHours(23, 59, 59, 0);
-    }
-    policies = [
-      { FromDate: tboFormat(anchor), ChargeType: "Percentage", CancellationCharge: 0 },
-      { FromDate: tboFormat(deadline), ChargeType: "Percentage", CancellationCharge: 100 },
-    ];
-  } else {
-    // Refundable, no deadline → free any time.
-    policies = [
-      { FromDate: tboFormat(anchor), ChargeType: "Percentage", CancellationCharge: 0 },
-    ];
-  }
-
-  if (isNonRefundable) {
     const chips = buildCancellationChips(policies, { checkOut });
-    const safe = chips.length > 0 && chips.every((c) => !c.isFree);
-    if (!safe) {
-      logger.warn("[voucher-adapter] non-refundable cancel synthesis unsafe; hiding section", {
-        bookingId: nz(v?.booking_info?.booking_id),
-        chipCount: chips.length,
-      });
-      return []; // hide rather than render a misleading "free cancellation"
-    }
+    if (chips.length > 0 && chips.every((c) => !c.isFree)) return { policies, deadline: null };
+    logger.warn("[voucher-adapter] non-refundable cancel synthesis unsafe; printing supplier-policy line", {
+      bookingId: nz(v?.booking_info?.booking_id),
+      chipCount: chips.length,
+    });
+    return { policies: [], deadline: null };
   }
 
-  return policies;
+  const deadline = readDeadline(v, checkIn, checkInTime, dctx);
+  if ((flag === false || freeStatement) && deadline?.chargesFrom) {
+    return {
+      policies: [
+        { FromDate: tboFormat(FROM_BOOKING), ChargeType: "Percentage", CancellationCharge: 0 },
+        { FromDate: tboFormat(deadline.chargesFrom), ChargeType: "Percentage", CancellationCharge: 100 },
+      ],
+      deadline,
+    };
+  }
+  if (freeAnyTime) {
+    return {
+      policies: [{ FromDate: tboFormat(FROM_BOOKING), ChargeType: "Percentage", CancellationCharge: 0 }],
+      deadline: null,
+    };
+  }
+  return { policies: [], deadline };
 }
 
 /** Map an extracted hotel voucher to the shared template's params. */
-export function adaptHotel(v: PlumtripsVoucher): HotelVoucherParams {
+export function adaptHotel(v: PlumtripsVoucher, ctx?: AdaptContext): HotelVoucherParams {
   const h = v?.hotel_details || ({} as NonNullable<PlumtripsVoucher["hotel_details"]>);
   const stay = v?.stay_details || ({} as NonNullable<PlumtripsVoucher["stay_details"]>);
   const guest = v?.guest_details || ({} as NonNullable<PlumtripsVoucher["guest_details"]>);
   const room = v?.room_details || ({} as NonNullable<PlumtripsVoucher["room_details"]>);
 
-  const checkIn = hotelDate(stay.check_in_date, "check_in");
-  const checkOut = hotelDate(stay.check_out_date, "check_out");
+  const dctx = dateContextFor(v, ctx);
+  const stayDates = resolveStayDates(stay.check_in_date, stay.check_out_date, stay.total_nights, dctx);
+  const checkIn = stayDates.checkIn ? isoDate(stayDates.checkIn) : "";
+  const checkOut = stayDates.checkOut ? isoDate(stayDates.checkOut) : "";
 
   const cleanNotes = stripRepairNotes(v?.policies?.important_notes);
+  // Perks go with the inclusions; every other note prints, even a lone short
+  // one — the T&C page has room for it (the old <60-char suppression hid data)
+  // — except one stating the booking's price or payment (isPriceNote).
+  const sorted = splitPerks(
+    cleanNotes.filter((n) => !isPriceNote(n)),
+    Array.isArray(room.inclusions) ? room.inclusions : [],
+  );
   const supplierConf = nz(v?.booking_info?.supplier_conf_no);
 
   const ci = nz(stay.check_in_time);
   const co = nz(stay.check_out_time);
+  const cancel = synthesizeCancelPolicies(v, stayDates.checkIn, parseLooseTime(ci), checkOut, dctx);
 
   return {
     hotelName: nz(h.name),
     hotelAddress: nz(h.address),
+    hotelPhone: hotelPhoneFrom(h.contact),
     checkIn,
     checkOut,
     roomName: nz(room.room_type),
     bookingId: nz(v?.booking_info?.booking_id),
-    confirmationNo: supplierConf, // required by type; not rendered in body
-    bookingRefNo: nz(v?.booking_info?.voucher_no), // required by type; not rendered
+    // Extracted vouchers print these under their own labels ("Hotel
+    // confirmation no.", "Supplier voucher no."), deduped against booking ID.
+    confirmationNo: supplierConf,
+    bookingRefNo: nz(v?.booking_info?.voucher_no),
     // Visible "HOTEL REFERENCE — SHOW AT CHECK-IN" box; omit when absent.
     tboReferenceNo: supplierConf || null,
-    // important_notes surfaced as Rate Conditions (repair notes already stripped).
-    // A lone trivial note is suppressed so it doesn't strand a near-empty page.
-    rateConditions: meaningfulOptionalList(cleanNotes),
+    // important_notes (repair notes stripped, perks moved to inclusions):
+    // the template prints them as "Important information" on the T&C page.
+    rateConditions: sorted.notes.length > 0 ? sorted.notes : undefined,
     guestFirstName: firstNameOf(guest.primary_guest),
     leadGuestName: nz(guest.primary_guest),
     // The co-guests. The extract has carried all_guest_names[] all along —
@@ -569,8 +704,18 @@ export function adaptHotel(v: PlumtripsVoucher): HotelVoucherParams {
     // travelling. Same miss as the flight baggage fields: data present, never
     // mapped. The template de-duplicates the lead out of this list.
     allGuestNames: Array.isArray(guest.all_guest_names) ? guest.all_guest_names : [],
-    inclusions: Array.isArray(room.inclusions) ? room.inclusions : [],
-    cancelPolicies: synthesizeCancelPolicies(v, checkOut), // Guard (c)
+    inclusions: sorted.inclusions,
+    // Each part prints only when the voucher states it (H-05).
+    stayFacts: {
+      nights: positiveInt(stay.total_nights),
+      adults: positiveInt(guest.adults),
+      children: positiveInt(guest.children),
+      guests: positiveInt(guest.total_pax),
+      rooms: positiveInt(room.no_of_rooms),
+    },
+    specialRequests: nz(room.special_requests) || null,
+    cancelPolicies: cancel.policies, // Guard (c)
+    cancellationDeadline: cancel.deadline ? { stated: cancel.deadline.stated, dateOnly: cancel.deadline.dateOnly } : null,
     displayVoucherStatus: "CONFIRMED",
     qrUrl: "", // template builds its own maps QR; this field is ignored
     reconciled: true, // Guard (a): generateHotelVoucherHTML throws otherwise
@@ -579,5 +724,8 @@ export function adaptHotel(v: PlumtripsVoucher): HotelVoucherParams {
     // Demo Platform — render the SAMPLE watermark + footer disclaimer when the
     // source VoucherExtraction was captured under impersonation. See Sprint 2 audit P5.
     isDemo: !!v?.isDemo,
+    // Extracted from a third party's voucher: the template words cancellation,
+    // fixed policy text and ID labels so nothing is claimed the source didn't say.
+    source: "extracted",
   };
 }
