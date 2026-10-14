@@ -26,7 +26,17 @@ import { env } from "../config/env.js";
 
 import { extractVoucherViaGemini } from "../services/voucherExtractorGemini.js";
 import { normalizePlumtripsVoucher, statedNonRefundable } from "../services/voucherNormalize.js";
+import {
+  LIST_PROJECTION,
+  NEEDS_REVIEW_REASONS,
+  listSummary,
+  needsReviewFilter,
+  notRenderedFilter,
+  queueFilter,
+  type ReviewReason,
+} from "../services/voucherQueue.js";
 import { generateTravelPDF } from "../services/pdfService.js";
+import { voucherDisplayDates } from "../services/voucherDisplayDates.js";
 import { adaptFlight, adaptHotel } from "../services/voucherAdapter.js";
 import {
   VOUCHER_RENDER_VIA_LAMBDA,
@@ -419,6 +429,7 @@ async function generateAndStoreRenderedPdf(args: {
 // the x-workspace-id header, per requireWorkspace); the read paths below are
 // the ones that go unscoped.
 router.post("/extract", requireResolvedWorkspace, canUploadVouchers, upload.single("file"), async (req: any, res) => {
+  const tStart = Date.now();
   const correlationId =
     req.headers["x-request-id"] ||
     req.headers["x-correlation-id"] ||
@@ -611,6 +622,18 @@ router.post("/extract", requireResolvedWorkspace, canUploadVouchers, upload.sing
       record.renderedAt = undefined;
       record.renderedBy = undefined;
 
+      // Timings and whether the repair pass ran, kept for later analysis only
+      // (nothing displays them). extractMs runs from the first model call to a
+      // validated result, repair pass included. repairPassUsed is THIS route's
+      // repair pass (repairPassViaGemini); the shared extractor's own internal
+      // retry is not visible from here without changing it, so it isn't claimed.
+      const extractMeta: Record<string, unknown> = {
+        extractMs: Date.now() - t0,
+        repairPassUsed: !!debug.stages.repair,
+      };
+      record.meta = { ...(record.meta || {}), extract: extractMeta };
+      record.markModified?.("meta");
+
       await record.save();
 
       // ✅ 8) AUTO-RENDER PDF (non-blocking)
@@ -647,6 +670,19 @@ router.post("/extract", requireResolvedWorkspace, canUploadVouchers, upload.sing
           debugStages: debug.stages,
         });
         await record.save();
+      }
+
+      // Render time (successful or not) and the whole request, upload included.
+      extractMeta.renderMs = debug.stages.render.ms;
+      extractMeta.totalMs = Date.now() - tStart;
+      record.meta = { ...(record.meta || {}), extract: extractMeta };
+      record.markModified?.("meta");
+      // Bookkeeping only: a failed write here must not turn a good extraction
+      // into FAILED (the catch below would), so it is logged and dropped.
+      try {
+        await record.save();
+      } catch (metaErr: any) {
+        logger.warn("[vouchers] could not save extraction timings", { correlationId, message: metaErr?.message });
       }
 
       return res.json({
@@ -772,19 +808,17 @@ router.post("/:id/render", canWriteVouchers, async (req: any, res) => {
  * tenancy boundary and must be in the filter directly.
  */
 router.get("/", canReadVouchers, async (req: any, res) => {
+  // DEPRECATED — the pre-redesign page's list. Kept, in its original array
+  // shape, only so that page keeps working between the backend and frontend
+  // deploys; the redesigned page reads GET /queue. The raw model response is
+  // never shown by that page, so it no longer ships here either.
   const rows = (await VoucherExtraction.find({ ...voucherScope(req) })
+    .select("-rawModelResponse")
     .sort({ createdAt: -1 })
     .limit(200)
     .lean()) as any[];
 
-  // Who uploaded it and for which company, as names (never ids): one user
-  // lookup and one workspace lookup for the whole page.
-  const names = await userNames(rows.map((r) => r.createdBy));
-  const wsIds = [...new Set(rows.map((r) => String(r.workspaceId || "")).filter((id) => mongoose.isValidObjectId(id)))];
-  const workspaces = wsIds.length
-    ? ((await CustomerWorkspace.find({ _id: { $in: wsIds } }).select("name companyName").lean()) as any[])
-    : [];
-  const wsName = new Map(workspaces.map((w) => [String(w._id), String(w.companyName || w.name || "").trim()]));
+  const { names, wsName } = await listNames(rows);
 
   return res.json(
     rows.map((r) => ({
@@ -793,6 +827,126 @@ router.get("/", canReadVouchers, async (req: any, res) => {
       customerName: wsName.get(String(r.workspaceId || "")) || "",
     })),
   );
+});
+
+/**
+ * Who uploaded each row and for which company, as names (never ids): one user
+ * lookup and one workspace lookup for the whole page.
+ */
+async function listNames(rows: any[]) {
+  const names = await userNames(rows.map((r) => r.createdBy));
+  const wsIds = [...new Set(rows.map((r) => String(r.workspaceId || "")).filter((id) => mongoose.isValidObjectId(id)))];
+  const workspaces = wsIds.length
+    ? ((await CustomerWorkspace.find({ _id: { $in: wsIds } }).select("name companyName").lean()) as any[])
+    : [];
+  const wsName = new Map(workspaces.map((w) => [String(w._id), String(w.companyName || w.name || "").trim()]));
+  return { names, wsName };
+}
+
+const QUEUE_PAGE_DEFAULT = 50;
+const QUEUE_PAGE_MAX = 100;
+
+/**
+ * GET /api/vouchers/queue — the list the voucher page reads.
+ *
+ * Query: page (1-based), limit (≤100), status, type, review
+ * (needs_review | not_rendered), q (search over the card summary fields).
+ * Rows carry only what a list card shows — no extractedJson, rawModelResponse
+ * or errorDetails; the detail pane reads GET /:id.
+ */
+router.get("/queue", canReadVouchers, async (req: any, res) => {
+  const page = Math.max(1, Math.floor(Number(req.query.page) || 1));
+  const limit = Math.min(QUEUE_PAGE_MAX, Math.max(1, Math.floor(Number(req.query.limit) || QUEUE_PAGE_DEFAULT)));
+  const filter = queueFilter(voucherScope(req), {
+    status: String(req.query.status || ""),
+    type: String(req.query.type || ""),
+    review: String(req.query.review || ""),
+    q: String(req.query.q || ""),
+  });
+
+  const [rows, total] = await Promise.all([
+    VoucherExtraction.find(filter)
+      .select(LIST_PROJECTION)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean() as Promise<any[]>,
+    VoucherExtraction.countDocuments(filter),
+  ]);
+
+  // Per-card review reasons come from the same filters as the Needs-review
+  // count and list filter — one query per reason, over this page's ids only.
+  const ids = rows.map((r) => r._id);
+  const reasonIds = await Promise.all(
+    (Object.keys(NEEDS_REVIEW_REASONS) as ReviewReason[]).map(async (reason) => {
+      const hit = ids.length
+        ? await VoucherExtraction.distinct("_id", { _id: { $in: ids }, ...NEEDS_REVIEW_REASONS[reason] })
+        : [];
+      return [reason, new Set(hit.map(String))] as const;
+    }),
+  );
+
+  const { names, wsName } = await listNames(rows);
+
+  return res.json({
+    page,
+    limit,
+    total,
+    items: rows.map((r) => {
+      const reviewReasons = reasonIds.filter(([, set]) => set.has(String(r._id))).map(([reason]) => reason);
+      return {
+        _id: r._id,
+        status: r.status,
+        docType: r.docType,
+        error: typeof r.error === "string" ? r.error.slice(0, 300) : null,
+        file: { originalName: r.file?.originalName || "", size: r.file?.size ?? null, mime: r.file?.mime || "" },
+        createdAt: r.createdAt,
+        createdByName: nameOrUnknown(names.get(String(r.createdBy || ""))),
+        customerName: wsName.get(String(r.workspaceId || "")) || "",
+        rendered: !!r.renderedS3?.key,
+        renderWarningCount: Array.isArray(r.meta?.renderWarnings) ? r.meta.renderWarnings.length : 0,
+        needsReview: reviewReasons.length > 0,
+        reviewReasons,
+        summary: listSummary(r),
+      };
+    }),
+  });
+});
+
+/**
+ * GET /api/vouchers/counts — the page's four stat cards and the filter chips.
+ * Same scope as the list; Needs review is the same filter the list applies.
+ */
+router.get("/counts", canReadVouchers, async (req: any, res) => {
+  const scope = voucherScope(req);
+  const now = Date.now();
+  const since7 = new Date(now - 7 * 24 * 60 * 60 * 1000);
+  const since30 = new Date(now - 30 * 24 * 60 * 60 * 1000);
+  const count = (f: Record<string, unknown>) => VoucherExtraction.countDocuments({ $and: [scope, f] });
+
+  const [
+    total, extracted, failed, processing, needsReview, notRendered, hotel, flight,
+    last7, last7Hotel, last7Flight, last30,
+  ] = await Promise.all([
+    count({}),
+    count({ status: "SUCCESS" }),
+    count({ status: "FAILED" }),
+    count({ status: "PROCESSING" }),
+    count(needsReviewFilter()),
+    count(notRenderedFilter()),
+    count({ docType: "hotel" }),
+    count({ docType: "flight" }),
+    count({ createdAt: { $gte: since7 } }),
+    count({ createdAt: { $gte: since7 }, docType: "hotel" }),
+    count({ createdAt: { $gte: since7 }, docType: "flight" }),
+    count({ createdAt: { $gte: since30 } }),
+  ]);
+
+  return res.json({
+    total, extracted, failed, processing, needsReview, notRendered, hotel, flight,
+    last7: { total: last7, hotel: last7Hotel, flight: last7Flight },
+    last30: { total: last30 },
+  });
 });
 
 /**
@@ -805,7 +959,9 @@ router.get("/:id", canReadVouchers, async (req: any, res) => {
   const row: any = await findVoucherInScope(req, id).lean();
   if (!row) return res.status(404).json({ message: "Not found" });
 
-  return res.json(row);
+  // The dates as the PDF resolves them (year inferred where the voucher gave
+  // none), for the page's Summary. Read-only; never persisted.
+  return res.json({ ...row, displayDates: voucherDisplayDates(row) });
 });
 
 /**

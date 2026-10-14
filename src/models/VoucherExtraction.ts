@@ -105,6 +105,8 @@ const VoucherExtractionSchema = new Schema(
 
 VoucherExtractionSchema.plugin(workspaceScopePlugin);
 VoucherExtractionSchema.index({ workspaceId: 1, bookingId: 1 });
+// The voucher queue: every list and count is workspace-pinned, newest first.
+VoucherExtractionSchema.index({ workspaceId: 1, createdAt: -1 });
 
 // Helpful compound index for listing + filtering
 VoucherExtractionSchema.index({ customerId: 1, createdAt: -1 });
