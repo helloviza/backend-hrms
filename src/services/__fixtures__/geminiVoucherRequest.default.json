@@ -1,0 +1,1880 @@
+{
+  "manualBookings.flightHint": [
+    {
+      "model": "gemini-2.5-flash",
+      "contents": {
+        "parts": [
+          {
+            "text": "Extract this voucher into the RAW contract schema (not final PlumtripsVoucher).\nVoucher type hint: flight.\nPortal hint: unknown."
+          },
+          {
+            "inlineData": {
+              "data": "JVBERi0xLjQgZ29sZGVuIHJlcXVlc3QgZml4dHVyZQ==",
+              "mimeType": "application/pdf"
+            }
+          }
+        ]
+      },
+      "config": {
+        "systemInstruction": "You are PlumTrips enterprise voucher extraction.\nReturn ONLY valid JSON matching the provided response schema.\n\nRules:\n- Missing scalars: null. Missing arrays: [].\n- Do NOT output empty strings.\n- Do NOT output the string \"null\".\n- detected_type must be: hotel | flight | unknown\n\nPolicy consolidation:\n- Extract cancellation/terms/check-in/important information into policies.notes[] as concise bullet lines.\n- Remove duplicates.\n\nFlights:\n- Preserve segment order.\n- Extract baggage/seat/meal where present.\n- If you see a scannable barcode/BCBP payload as TEXT (often long alphanumeric), include it in barcode_candidates[].\n  Use kind=BCBP when it looks like a boarding pass BCBP payload.\n\nHotels:\n- Extract hotel details including contact if present.\n- Extract guest summary (adults/children/guest names) if present.\n- Extract room inclusions.\n- Extract stay dates/times/nights.\n\nNever invent values.\nBranding/logo is handled by backend = \"https://plumtrips.com/assets/brand/plumtrips-logo.png\".",
+        "responseMimeType": "application/json",
+        "responseSchema": {
+          "type": "OBJECT",
+          "properties": {
+            "detected_type": {
+              "type": "STRING",
+              "enum": [
+                "hotel",
+                "flight",
+                "unknown"
+              ]
+            },
+            "booking_info": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "booking_id": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "booking_date": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "voucher_no": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "supplier_conf_no": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "pnr": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "fare_type": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "ocr_data_line": {
+                  "type": "STRING",
+                  "nullable": true
+                }
+              }
+            },
+            "policies": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "cancellation_deadline": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "is_non_refundable": {
+                  "type": "BOOLEAN",
+                  "nullable": true
+                },
+                "notes": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                }
+              }
+            },
+            "flight": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "segments": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                      "airline": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "flight_no": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "class": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "duration": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "layover_duration": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "origin": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "city": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "code": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "time": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "date": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "terminal": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      },
+                      "destination": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "city": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "code": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "time": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "date": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "terminal": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      },
+                      "ancillaries": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "cabin_bag": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "checkin_bag": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "seat": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "meal": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "barcode_string": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "passengers": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                      "name": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "type": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "ticket_no": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "phone": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "email": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "baggage_check_in": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "baggage_cabin": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "seat": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "meal": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "barcode_string": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "special_service": {
+                        "type": "STRING",
+                        "nullable": true
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "hotel": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "name": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "address": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "city": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "country": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "contact": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "primary_guest": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "total_pax": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "adults": {
+                  "type": "NUMBER",
+                  "nullable": true
+                },
+                "children": {
+                  "type": "NUMBER",
+                  "nullable": true
+                },
+                "all_guest_names": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                },
+                "room_type": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "no_of_rooms": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "inclusions": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                },
+                "special_requests": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "stay": {
+                  "type": "OBJECT",
+                  "nullable": true,
+                  "properties": {
+                    "check_in_date": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_in_time": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_out_date": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_out_time": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "total_nights": {
+                      "type": "STRING",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            },
+            "barcode_candidates": {
+              "type": "ARRAY",
+              "items": {
+                "type": "OBJECT",
+                "properties": {
+                  "kind": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "value": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "source": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "page": {
+                    "type": "INTEGER",
+                    "nullable": true
+                  },
+                  "confidence": {
+                    "type": "NUMBER",
+                    "nullable": true
+                  }
+                }
+              }
+            }
+          },
+          "required": [
+            "detected_type"
+          ]
+        }
+      }
+    }
+  ],
+  "manualBookings.hotelHint": [
+    {
+      "model": "gemini-2.5-flash",
+      "contents": {
+        "parts": [
+          {
+            "text": "Extract this voucher into the RAW contract schema (not final PlumtripsVoucher).\nVoucher type hint: hotel.\nPortal hint: unknown."
+          },
+          {
+            "inlineData": {
+              "data": "JVBERi0xLjQgZ29sZGVuIHJlcXVlc3QgZml4dHVyZQ==",
+              "mimeType": "image/png"
+            }
+          }
+        ]
+      },
+      "config": {
+        "systemInstruction": "You are PlumTrips enterprise voucher extraction.\nReturn ONLY valid JSON matching the provided response schema.\n\nRules:\n- Missing scalars: null. Missing arrays: [].\n- Do NOT output empty strings.\n- Do NOT output the string \"null\".\n- detected_type must be: hotel | flight | unknown\n\nPolicy consolidation:\n- Extract cancellation/terms/check-in/important information into policies.notes[] as concise bullet lines.\n- Remove duplicates.\n\nFlights:\n- Preserve segment order.\n- Extract baggage/seat/meal where present.\n- If you see a scannable barcode/BCBP payload as TEXT (often long alphanumeric), include it in barcode_candidates[].\n  Use kind=BCBP when it looks like a boarding pass BCBP payload.\n\nHotels:\n- Extract hotel details including contact if present.\n- Extract guest summary (adults/children/guest names) if present.\n- Extract room inclusions.\n- Extract stay dates/times/nights.\n\nNever invent values.\nBranding/logo is handled by backend = \"https://plumtrips.com/assets/brand/plumtrips-logo.png\".",
+        "responseMimeType": "application/json",
+        "responseSchema": {
+          "type": "OBJECT",
+          "properties": {
+            "detected_type": {
+              "type": "STRING",
+              "enum": [
+                "hotel",
+                "flight",
+                "unknown"
+              ]
+            },
+            "booking_info": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "booking_id": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "booking_date": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "voucher_no": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "supplier_conf_no": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "pnr": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "fare_type": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "ocr_data_line": {
+                  "type": "STRING",
+                  "nullable": true
+                }
+              }
+            },
+            "policies": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "cancellation_deadline": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "is_non_refundable": {
+                  "type": "BOOLEAN",
+                  "nullable": true
+                },
+                "notes": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                }
+              }
+            },
+            "flight": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "segments": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                      "airline": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "flight_no": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "class": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "duration": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "layover_duration": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "origin": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "city": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "code": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "time": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "date": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "terminal": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      },
+                      "destination": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "city": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "code": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "time": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "date": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "terminal": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      },
+                      "ancillaries": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "cabin_bag": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "checkin_bag": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "seat": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "meal": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "barcode_string": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "passengers": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                      "name": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "type": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "ticket_no": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "phone": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "email": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "baggage_check_in": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "baggage_cabin": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "seat": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "meal": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "barcode_string": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "special_service": {
+                        "type": "STRING",
+                        "nullable": true
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "hotel": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "name": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "address": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "city": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "country": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "contact": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "primary_guest": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "total_pax": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "adults": {
+                  "type": "NUMBER",
+                  "nullable": true
+                },
+                "children": {
+                  "type": "NUMBER",
+                  "nullable": true
+                },
+                "all_guest_names": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                },
+                "room_type": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "no_of_rooms": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "inclusions": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                },
+                "special_requests": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "stay": {
+                  "type": "OBJECT",
+                  "nullable": true,
+                  "properties": {
+                    "check_in_date": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_in_time": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_out_date": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_out_time": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "total_nights": {
+                      "type": "STRING",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            },
+            "barcode_candidates": {
+              "type": "ARRAY",
+              "items": {
+                "type": "OBJECT",
+                "properties": {
+                  "kind": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "value": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "source": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "page": {
+                    "type": "INTEGER",
+                    "nullable": true
+                  },
+                  "confidence": {
+                    "type": "NUMBER",
+                    "nullable": true
+                  }
+                }
+              }
+            }
+          },
+          "required": [
+            "detected_type"
+          ]
+        }
+      }
+    }
+  ],
+  "manualBookings.invalidJsonRetry": [
+    {
+      "model": "gemini-2.5-flash",
+      "contents": {
+        "parts": [
+          {
+            "text": "Extract this voucher into the RAW contract schema (not final PlumtripsVoucher).\nVoucher type hint: flight.\nPortal hint: unknown."
+          },
+          {
+            "inlineData": {
+              "data": "JVBERi0xLjQgZ29sZGVuIHJlcXVlc3QgZml4dHVyZQ==",
+              "mimeType": "application/pdf"
+            }
+          }
+        ]
+      },
+      "config": {
+        "systemInstruction": "You are PlumTrips enterprise voucher extraction.\nReturn ONLY valid JSON matching the provided response schema.\n\nRules:\n- Missing scalars: null. Missing arrays: [].\n- Do NOT output empty strings.\n- Do NOT output the string \"null\".\n- detected_type must be: hotel | flight | unknown\n\nPolicy consolidation:\n- Extract cancellation/terms/check-in/important information into policies.notes[] as concise bullet lines.\n- Remove duplicates.\n\nFlights:\n- Preserve segment order.\n- Extract baggage/seat/meal where present.\n- If you see a scannable barcode/BCBP payload as TEXT (often long alphanumeric), include it in barcode_candidates[].\n  Use kind=BCBP when it looks like a boarding pass BCBP payload.\n\nHotels:\n- Extract hotel details including contact if present.\n- Extract guest summary (adults/children/guest names) if present.\n- Extract room inclusions.\n- Extract stay dates/times/nights.\n\nNever invent values.\nBranding/logo is handled by backend = \"https://plumtrips.com/assets/brand/plumtrips-logo.png\".",
+        "responseMimeType": "application/json",
+        "responseSchema": {
+          "type": "OBJECT",
+          "properties": {
+            "detected_type": {
+              "type": "STRING",
+              "enum": [
+                "hotel",
+                "flight",
+                "unknown"
+              ]
+            },
+            "booking_info": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "booking_id": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "booking_date": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "voucher_no": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "supplier_conf_no": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "pnr": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "fare_type": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "ocr_data_line": {
+                  "type": "STRING",
+                  "nullable": true
+                }
+              }
+            },
+            "policies": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "cancellation_deadline": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "is_non_refundable": {
+                  "type": "BOOLEAN",
+                  "nullable": true
+                },
+                "notes": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                }
+              }
+            },
+            "flight": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "segments": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                      "airline": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "flight_no": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "class": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "duration": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "layover_duration": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "origin": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "city": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "code": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "time": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "date": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "terminal": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      },
+                      "destination": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "city": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "code": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "time": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "date": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "terminal": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      },
+                      "ancillaries": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "cabin_bag": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "checkin_bag": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "seat": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "meal": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "barcode_string": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "passengers": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                      "name": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "type": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "ticket_no": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "phone": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "email": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "baggage_check_in": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "baggage_cabin": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "seat": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "meal": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "barcode_string": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "special_service": {
+                        "type": "STRING",
+                        "nullable": true
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "hotel": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "name": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "address": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "city": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "country": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "contact": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "primary_guest": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "total_pax": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "adults": {
+                  "type": "NUMBER",
+                  "nullable": true
+                },
+                "children": {
+                  "type": "NUMBER",
+                  "nullable": true
+                },
+                "all_guest_names": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                },
+                "room_type": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "no_of_rooms": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "inclusions": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                },
+                "special_requests": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "stay": {
+                  "type": "OBJECT",
+                  "nullable": true,
+                  "properties": {
+                    "check_in_date": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_in_time": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_out_date": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_out_time": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "total_nights": {
+                      "type": "STRING",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            },
+            "barcode_candidates": {
+              "type": "ARRAY",
+              "items": {
+                "type": "OBJECT",
+                "properties": {
+                  "kind": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "value": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "source": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "page": {
+                    "type": "INTEGER",
+                    "nullable": true
+                  },
+                  "confidence": {
+                    "type": "NUMBER",
+                    "nullable": true
+                  }
+                }
+              }
+            }
+          },
+          "required": [
+            "detected_type"
+          ]
+        }
+      }
+    },
+    {
+      "model": "gemini-2.5-flash",
+      "contents": {
+        "parts": [
+          {
+            "text": "Extract this voucher into the RAW contract schema (not final PlumtripsVoucher).\nVoucher type hint: flight.\nPortal hint: unknown.\nRepair focus:\nPrevious attempt returned invalid JSON. Output strictly valid JSON only."
+          },
+          {
+            "inlineData": {
+              "data": "JVBERi0xLjQgZ29sZGVuIHJlcXVlc3QgZml4dHVyZQ==",
+              "mimeType": "application/pdf"
+            }
+          }
+        ]
+      },
+      "config": {
+        "systemInstruction": "You are PlumTrips enterprise voucher extraction.\nReturn ONLY valid JSON matching the provided response schema.\n\nRules:\n- Missing scalars: null. Missing arrays: [].\n- Do NOT output empty strings.\n- Do NOT output the string \"null\".\n- detected_type must be: hotel | flight | unknown\n\nPolicy consolidation:\n- Extract cancellation/terms/check-in/important information into policies.notes[] as concise bullet lines.\n- Remove duplicates.\n\nFlights:\n- Preserve segment order.\n- Extract baggage/seat/meal where present.\n- If you see a scannable barcode/BCBP payload as TEXT (often long alphanumeric), include it in barcode_candidates[].\n  Use kind=BCBP when it looks like a boarding pass BCBP payload.\n\nHotels:\n- Extract hotel details including contact if present.\n- Extract guest summary (adults/children/guest names) if present.\n- Extract room inclusions.\n- Extract stay dates/times/nights.\n\nNever invent values.\nBranding/logo is handled by backend = \"https://plumtrips.com/assets/brand/plumtrips-logo.png\".",
+        "responseMimeType": "application/json",
+        "responseSchema": {
+          "type": "OBJECT",
+          "properties": {
+            "detected_type": {
+              "type": "STRING",
+              "enum": [
+                "hotel",
+                "flight",
+                "unknown"
+              ]
+            },
+            "booking_info": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "booking_id": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "booking_date": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "voucher_no": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "supplier_conf_no": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "pnr": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "fare_type": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "ocr_data_line": {
+                  "type": "STRING",
+                  "nullable": true
+                }
+              }
+            },
+            "policies": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "cancellation_deadline": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "is_non_refundable": {
+                  "type": "BOOLEAN",
+                  "nullable": true
+                },
+                "notes": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                }
+              }
+            },
+            "flight": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "segments": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                      "airline": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "flight_no": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "class": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "duration": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "layover_duration": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "origin": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "city": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "code": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "time": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "date": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "terminal": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      },
+                      "destination": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "city": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "code": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "time": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "date": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "terminal": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      },
+                      "ancillaries": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "cabin_bag": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "checkin_bag": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "seat": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "meal": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "barcode_string": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "passengers": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                      "name": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "type": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "ticket_no": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "phone": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "email": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "baggage_check_in": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "baggage_cabin": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "seat": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "meal": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "barcode_string": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "special_service": {
+                        "type": "STRING",
+                        "nullable": true
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "hotel": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "name": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "address": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "city": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "country": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "contact": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "primary_guest": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "total_pax": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "adults": {
+                  "type": "NUMBER",
+                  "nullable": true
+                },
+                "children": {
+                  "type": "NUMBER",
+                  "nullable": true
+                },
+                "all_guest_names": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                },
+                "room_type": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "no_of_rooms": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "inclusions": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                },
+                "special_requests": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "stay": {
+                  "type": "OBJECT",
+                  "nullable": true,
+                  "properties": {
+                    "check_in_date": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_in_time": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_out_date": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_out_time": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "total_nights": {
+                      "type": "STRING",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            },
+            "barcode_candidates": {
+              "type": "ARRAY",
+              "items": {
+                "type": "OBJECT",
+                "properties": {
+                  "kind": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "value": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "source": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "page": {
+                    "type": "INTEGER",
+                    "nullable": true
+                  },
+                  "confidence": {
+                    "type": "NUMBER",
+                    "nullable": true
+                  }
+                }
+              }
+            }
+          },
+          "required": [
+            "detected_type"
+          ]
+        }
+      }
+    }
+  ],
+  "geminiService.withHints": [
+    {
+      "model": "gemini-2.5-flash",
+      "contents": {
+        "parts": [
+          {
+            "text": "Extract this voucher into the RAW contract schema (not final PlumtripsVoucher).\nVoucher type hint: hotel.\nPortal hint: Agoda."
+          },
+          {
+            "inlineData": {
+              "data": "JVBERi0xLjQgZ29sZGVuIHJlcXVlc3QgZml4dHVyZQ==",
+              "mimeType": "application/pdf"
+            }
+          }
+        ]
+      },
+      "config": {
+        "systemInstruction": "You are PlumTrips enterprise voucher extraction.\nReturn ONLY valid JSON matching the provided response schema.\n\nRules:\n- Missing scalars: null. Missing arrays: [].\n- Do NOT output empty strings.\n- Do NOT output the string \"null\".\n- detected_type must be: hotel | flight | unknown\n\nPolicy consolidation:\n- Extract cancellation/terms/check-in/important information into policies.notes[] as concise bullet lines.\n- Remove duplicates.\n\nFlights:\n- Preserve segment order.\n- Extract baggage/seat/meal where present.\n- If you see a scannable barcode/BCBP payload as TEXT (often long alphanumeric), include it in barcode_candidates[].\n  Use kind=BCBP when it looks like a boarding pass BCBP payload.\n\nHotels:\n- Extract hotel details including contact if present.\n- Extract guest summary (adults/children/guest names) if present.\n- Extract room inclusions.\n- Extract stay dates/times/nights.\n\nNever invent values.\nBranding/logo is handled by backend = \"https://example.com/logo.png\".",
+        "responseMimeType": "application/json",
+        "responseSchema": {
+          "type": "OBJECT",
+          "properties": {
+            "detected_type": {
+              "type": "STRING",
+              "enum": [
+                "hotel",
+                "flight",
+                "unknown"
+              ]
+            },
+            "booking_info": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "booking_id": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "booking_date": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "voucher_no": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "supplier_conf_no": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "pnr": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "fare_type": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "ocr_data_line": {
+                  "type": "STRING",
+                  "nullable": true
+                }
+              }
+            },
+            "policies": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "cancellation_deadline": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "is_non_refundable": {
+                  "type": "BOOLEAN",
+                  "nullable": true
+                },
+                "notes": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                }
+              }
+            },
+            "flight": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "segments": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                      "airline": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "flight_no": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "class": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "duration": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "layover_duration": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "origin": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "city": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "code": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "time": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "date": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "terminal": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      },
+                      "destination": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "city": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "code": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "time": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "date": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "terminal": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      },
+                      "ancillaries": {
+                        "type": "OBJECT",
+                        "nullable": true,
+                        "properties": {
+                          "cabin_bag": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "checkin_bag": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "seat": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "meal": {
+                            "type": "STRING",
+                            "nullable": true
+                          },
+                          "barcode_string": {
+                            "type": "STRING",
+                            "nullable": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "passengers": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                      "name": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "type": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "ticket_no": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "phone": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "email": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "baggage_check_in": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "baggage_cabin": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "seat": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "meal": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "barcode_string": {
+                        "type": "STRING",
+                        "nullable": true
+                      },
+                      "special_service": {
+                        "type": "STRING",
+                        "nullable": true
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "hotel": {
+              "type": "OBJECT",
+              "nullable": true,
+              "properties": {
+                "name": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "address": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "city": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "country": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "contact": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "primary_guest": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "total_pax": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "adults": {
+                  "type": "NUMBER",
+                  "nullable": true
+                },
+                "children": {
+                  "type": "NUMBER",
+                  "nullable": true
+                },
+                "all_guest_names": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                },
+                "room_type": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "no_of_rooms": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "inclusions": {
+                  "type": "ARRAY",
+                  "items": {
+                    "type": "STRING"
+                  }
+                },
+                "special_requests": {
+                  "type": "STRING",
+                  "nullable": true
+                },
+                "stay": {
+                  "type": "OBJECT",
+                  "nullable": true,
+                  "properties": {
+                    "check_in_date": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_in_time": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_out_date": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "check_out_time": {
+                      "type": "STRING",
+                      "nullable": true
+                    },
+                    "total_nights": {
+                      "type": "STRING",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            },
+            "barcode_candidates": {
+              "type": "ARRAY",
+              "items": {
+                "type": "OBJECT",
+                "properties": {
+                  "kind": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "value": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "source": {
+                    "type": "STRING",
+                    "nullable": true
+                  },
+                  "page": {
+                    "type": "INTEGER",
+                    "nullable": true
+                  },
+                  "confidence": {
+                    "type": "NUMBER",
+                    "nullable": true
+                  }
+                }
+              }
+            }
+          },
+          "required": [
+            "detected_type"
+          ]
+        }
+      }
+    }
+  ]
+}

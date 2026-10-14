@@ -43,6 +43,7 @@ import {
   type CancelPolicy,
 } from "@plumtrips/shared/voucher-templates/cancellationPolicy";
 import logger from "../utils/logger.js";
+import { statedNonRefundable } from "./voucherNormalize.js";
 import {
   buildDateContext,
   fmtDay,
@@ -116,6 +117,21 @@ function wallClockIso(day: Date, time: { h: number; m: number } | null): string 
 export interface AdaptContext {
   createdAt?: Date | string | null;
   warnings?: string[];
+}
+
+/**
+ * What the adapters are given for a stored record — the one preparation both
+ * the PDF render (routes/vouchers.ts renderViaSbtLambda) and the page's
+ * Summary (voucherDisplayDates) use:
+ *   - isDemo from the record (VoucherExtraction.isDemo, set at extraction),
+ *     so the template renders the SAMPLE watermark; never persisted;
+ *   - refundability as the document stated it (true / false / null) — older
+ *     records stored a collapsed boolean (statedNonRefundable).
+ */
+export function adapterInput(record: any): PlumtripsVoucher {
+  const v: any = { ...(record?.extractedJson ?? {}), isDemo: !!record?.isDemo };
+  v.policies = { ...(v.policies ?? {}), is_non_refundable: statedNonRefundable(record) };
+  return v;
 }
 
 function dateContextFor(v: PlumtripsVoucher, ctx?: AdaptContext): DateContext {
@@ -298,7 +314,9 @@ function buildBookingFromSegment(
   const anc = seg?.ancillaries;
   return {
     pnr: nz(v?.booking_info?.pnr),
-    bookingId: nz(v?.booking_info?.booking_id),
+    // H-12: empty when the source states no booking ID; the template then
+    // leaves the box out (the PNR has its own box).
+    bookingId: nz(v?.booking_info?.booking_id).trim(),
     ticketId: shared.ticketId,
     status: "CONFIRMED", // extract has no status; template also defaults this
     // Guard (b): code coerced null→"" so cityName()/airportFullName() never throw.

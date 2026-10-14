@@ -1,5 +1,12 @@
 // apps/backend/src/utils/s3Upload.ts
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+  DeleteObjectsCommand,
+  ListObjectVersionsCommand,
+} from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import crypto from "crypto";
 import { env } from "../config/env.js";
@@ -155,8 +162,67 @@ export async function getObjectBuffer(key: string): Promise<Buffer> {
  * passport image once its VisaDocument row is being deleted — the only
  * caller of this today, but generic enough for future hard-delete paths.
  */
-export async function deleteObject(key: string): Promise<void> {
-  await s3.send(new DeleteObjectCommand({ Bucket: env.S3_BUCKET, Key: key }));
+export async function deleteObject(key: string, bucket: string = env.S3_BUCKET): Promise<void> {
+  // `bucket` is for callers holding a stored {bucket, key} pointer (voucher
+  // retention); every older caller passes the key alone, as before.
+  await s3.send(new DeleteObjectCommand({ Bucket: bucket || env.S3_BUCKET, Key: key }));
+}
+
+/** The only prefix deleteAllObjectVersions will touch. */
+export const VOUCHER_OBJECT_PREFIX = "hrms/vouchers/";
+
+/**
+ * Permanently remove ONE object from a versioned bucket: every version of that
+ * exact key and every delete marker on it. The voucher bucket has versioning
+ * on and no lifecycle rule, so a plain DeleteObject only adds a delete marker
+ * and the bytes stay forever (voucher retention, decision 2).
+ *
+ * - Lists versions with Prefix = key and keeps only entries whose Key is
+ *   EXACTLY the key, so a neighbour sharing the prefix ("…/a.pdf" vs
+ *   "…/a.pdf.bak") is never touched.
+ * - Refuses any key outside hrms/vouchers/ (the IAM grant is limited to it).
+ * - Throws if S3 reports an error or anything of the key is still listed
+ *   afterwards, so the caller leaves the record unstamped and retries.
+ * Needs s3:ListBucketVersions + s3:DeleteObjectVersion. Returns how many
+ * versions/markers were removed (0 when the key was already gone).
+ */
+export async function deleteAllObjectVersions(
+  key: string,
+  bucket: string = env.S3_BUCKET,
+  client: { send: (cmd: any) => Promise<any> } = s3,
+): Promise<number> {
+  if (!key || !key.startsWith(VOUCHER_OBJECT_PREFIX) || key.includes("..")) {
+    throw new Error(`deleteAllObjectVersions: refusing key outside ${VOUCHER_OBJECT_PREFIX}: ${key}`);
+  }
+  const Bucket = bucket || env.S3_BUCKET;
+
+  const listExact = async () => {
+    const found: { Key: string; VersionId?: string }[] = [];
+    let KeyMarker: string | undefined;
+    let VersionIdMarker: string | undefined;
+    do {
+      const r = await client.send(new ListObjectVersionsCommand({ Bucket, Prefix: key, KeyMarker, VersionIdMarker }));
+      for (const v of [...(r.Versions ?? []), ...(r.DeleteMarkers ?? [])]) {
+        if (v.Key === key) found.push({ Key: key, VersionId: v.VersionId });
+      }
+      KeyMarker = r.IsTruncated ? r.NextKeyMarker : undefined;
+      VersionIdMarker = r.IsTruncated ? r.NextVersionIdMarker : undefined;
+    } while (KeyMarker);
+    return found;
+  };
+
+  const all = await listExact();
+  for (let i = 0; i < all.length; i += 1000) {
+    const r = await client.send(
+      new DeleteObjectsCommand({ Bucket, Delete: { Objects: all.slice(i, i + 1000), Quiet: true } }),
+    );
+    if (r.Errors?.length) {
+      throw new Error(`deleteAllObjectVersions: ${r.Errors.length} version(s) of ${key} not deleted: ${r.Errors[0]?.Code} ${r.Errors[0]?.Message}`);
+    }
+  }
+  const left = await listExact();
+  if (left.length) throw new Error(`deleteAllObjectVersions: ${left.length} version(s) of ${key} still listed after delete`);
+  return all.length;
 }
 
 /**

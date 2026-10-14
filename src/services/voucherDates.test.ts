@@ -221,3 +221,35 @@ describe("adaptFlight — leg dates", () => {
     expect((returnBooking as any).departureTime.startsWith("2027-01-01")).toBe(true);
   });
 });
+
+describe("a weekday printed with the date (voucher prompt keeps it)", () => {
+  const ctxFor = (bookingDate: string | null, createdAt = "2026-09-15T10:00:00Z") => buildDateContext(bookingDate, createdAt, []);
+
+  it("'Tue 29 Sept' with no year: the year is inferred and the Tuesday confirms it — no warning", () => {
+    const ctx = ctxFor(null);
+    const d = resolveVoucherDate("Tue 29 Sept", ctx, { label: "Departure date" });
+    expect(d!.toISOString().slice(0, 10)).toBe("2026-09-29");
+    expect(ctx.warnings).toEqual([]);
+  });
+
+  it("a weekday that doesn't match the inferred year is flagged for ops", () => {
+    const ctx = ctxFor("1 Sep 2026");
+    const d = resolveVoucherDate("Sun 29 Sept", ctx, { label: "Departure date" });
+    expect(d!.toISOString().slice(0, 10)).toBe("2026-09-29");
+    expect(ctx.warnings.join(" ")).toMatch(/says Sunday, but .* is a Tuesday — check the date/);
+  });
+
+  it("a weekday with a printed year is checked too ('Fri, Oct 02 2026' ok; 'Mon, Oct 02 2026' flagged)", () => {
+    const ok = ctxFor(null);
+    expect(resolveVoucherDate("Fri, Oct 02 2026", ok, { label: "Departure date" })!.toISOString().slice(0, 10)).toBe("2026-10-02");
+    expect(ok.warnings).toEqual([]);
+    const bad = ctxFor(null);
+    resolveVoucherDate("Mon, Oct 02 2026", bad, { label: "Departure date" });
+    expect(bad.warnings.join(" ")).toMatch(/says Monday/);
+  });
+
+  it("parseDateParts reads the weekday and no year from 'Tue 29 Sept' / 'Wed, 30 September'", () => {
+    expect(parseDateParts("Tue 29 Sept")).toMatchObject({ y: null, m: 8, d: 29, weekday: 2 });
+    expect(parseDateParts("Wed, 30 September")).toMatchObject({ y: null, m: 8, d: 30, weekday: 3 });
+  });
+});

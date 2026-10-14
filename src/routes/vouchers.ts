@@ -25,6 +25,7 @@ import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 
 import { extractVoucherViaGemini } from "../services/voucherExtractorGemini.js";
+import { rejectedFileMessage, sniffVoucherFile } from "../services/voucherFileType.js";
 import { normalizePlumtripsVoucher, statedNonRefundable } from "../services/voucherNormalize.js";
 import {
   LIST_PROJECTION,
@@ -33,11 +34,14 @@ import {
   needsReviewFilter,
   notRenderedFilter,
   queueFilter,
+  stuckProcessingFilter,
+  timedOutUpdate,
   type ReviewReason,
 } from "../services/voucherQueue.js";
 import { generateTravelPDF } from "../services/pdfService.js";
 import { voucherDisplayDates } from "../services/voucherDisplayDates.js";
-import { adaptFlight, adaptHotel } from "../services/voucherAdapter.js";
+import { adapterInput, adaptFlight, adaptHotel } from "../services/voucherAdapter.js";
+import { TRIP_DATE_UNKNOWN_WARNING, voucherTripEnd } from "../services/voucherRetention.js";
 import {
   VOUCHER_RENDER_VIA_LAMBDA,
   invokeRendererLambda,
@@ -191,6 +195,13 @@ function safeStr(x: any): string | null {
   return s;
 }
 
+/** "15 Oct 2026" in IST — the date ops see in "Removed on … (retention policy)". */
+function fmtRetentionDate(d: any): string {
+  const dt = new Date(d);
+  if (isNaN(dt.getTime())) return "an earlier date";
+  return dt.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "Asia/Kolkata" });
+}
+
 function pickKeys(obj: any) {
   if (!obj || typeof obj !== "object") return [];
   return Object.keys(obj);
@@ -300,10 +311,23 @@ async function repairPassViaGemini(args: {
     voucherType: args.voucherType,
     customLogoUrl: args.customLogoUrl,
     portalHint,
+    promptVariant: "voucher",
   });
 }
 
 /* ───────────────────────── PDF rendering ───────────────────────── */
+
+/**
+ * The record's current PDF is about to be replaced or dropped: list it in
+ * supersededRenders so the retention run deletes the S3 object (F-08). Before
+ * this, every re-render and correction left the old PDF in the bucket for good.
+ */
+function supersedeRender(record: any) {
+  const key = record?.renderedS3?.key;
+  if (!key) return;
+  const list = Array.isArray(record.supersededRenders) ? record.supersededRenders : [];
+  record.supersededRenders = [...list, { bucket: record.renderedS3.bucket, key, supersededAt: new Date() }];
+}
 
 /**
  * Render the voucher via the SHARED SBT template (adapter → HTML) and the
@@ -311,13 +335,9 @@ async function repairPassViaGemini(args: {
  * Throws on any adapter/template/Lambda failure so the caller can fall back.
  */
 async function renderViaSbtLambda(record: any, warnings: string[]): Promise<Buffer> {
-  // Demo Platform — merge VoucherExtraction.isDemo (DB column, set at extraction time
-  // from req.user.isDemoUser) into the adapter input so the template renders the
-  // SAMPLE watermark + disclaimer. NOT persisted back into extractedJson.
-  const v = { ...(record?.extractedJson ?? {}), isDemo: !!record?.isDemo };
-  // Refundability as the document stated it (true / false / null) — older
-  // records stored a collapsed boolean. Read-only here; never persisted.
-  v.policies = { ...(v.policies ?? {}), is_non_refundable: statedNonRefundable(record) };
+  // isDemo (SAMPLE watermark) and stated refundability merged in; never
+  // persisted. The page's Summary reads the same input (voucherDisplayDates).
+  const v = adapterInput(record);
   // createdAt anchors the year for dates the voucher prints without one;
   // anything ops should double-check lands in `warnings`.
   const ctx = { createdAt: record?.createdAt ?? null, warnings };
@@ -359,6 +379,10 @@ async function generateAndStoreRenderedPdf(args: {
   // Data the adapter had to infer or could not reconcile (e.g. a date printed
   // without a year). Never blocks the render; shown to ops on the record.
   const renderWarnings: string[] = [];
+  // Retention keeps the files of a voucher whose trip date can't be resolved
+  // and flags it for review; every render (either path) keeps the flag, since
+  // it replaces meta.renderWarnings.
+  if (!voucherTripEnd(record)) renderWarnings.push(TRIP_DATE_UNKNOWN_WARNING);
 
   // Demo Platform — demo bookings MUST go through the SBT shared template path
   // (the only one with watermark + disclaimer code). No fallback to pdfkit for
@@ -405,6 +429,7 @@ async function generateAndStoreRenderedPdf(args: {
     createdBy: actorUserId,
   });
 
+  supersedeRender(record);
   record.renderedS3 = renderedS3;
   record.renderedAt = new Date();
   record.renderedBy = new mongoose.Types.ObjectId(actorUserId);
@@ -438,6 +463,15 @@ router.post("/extract", requireResolvedWorkspace, canUploadVouchers, upload.sing
   try {
     const file = req.file;
     if (!file) return res.status(400).json({ message: "file is required", correlationId });
+
+    // F-14: what the file IS, from its bytes — checked before anything is
+    // stored in S3 or sent to Gemini. The detected type replaces the
+    // browser's claim everywhere below (S3 ContentType, record, model call).
+    const detectedMime = sniffVoucherFile(file.buffer);
+    if (!detectedMime) {
+      return res.status(415).json({ message: rejectedFileMessage(file.originalname), code: "UNSUPPORTED_FILE_TYPE" });
+    }
+    file.mimetype = detectedMime;
 
     const voucherType = assertVoucherType(req.body?.voucherType);
     const customLogoUrl = safeStr(req.body?.customLogoUrl) || null;
@@ -521,12 +555,17 @@ router.post("/extract", requireResolvedWorkspace, canUploadVouchers, upload.sing
       debug.stage = "GEMINI_EXTRACT";
       const t0 = Date.now();
 
+      // The voucher prompt variant (dates as printed — YYYY-MM-DD only with a
+      // printed year — perks with the inclusions, a pay-by date is not a
+      // cancellation deadline, temperature 0). The shared default prompt —
+      // manual-bookings autofill — is left as it was.
       const first = await extractVoucherViaGemini({
         buffer: file.buffer,
         mimeType: file.mimetype,
         voucherType,
         customLogoUrl,
         portalHint,
+        promptVariant: "voucher",
       });
 
       debug.stages.gemini = {
@@ -616,8 +655,15 @@ router.post("/extract", requireResolvedWorkspace, canUploadVouchers, upload.sing
       record.extractedJson = normalized;
       record.rawModelResponse = first.raw;
       record.error = undefined;
+      // A request that outlived the 15-minute F-05 sweep still finishes: the
+      // late result wins, and the "Timed out" marks go.
+      if (record.timedOutAt) {
+        record.timedOutAt = undefined;
+        if (record.errorDetails?.stage === "TIMED_OUT") record.errorDetails = undefined;
+      }
 
       // clear any old rendered info (fresh extraction = new truth)
+      supersedeRender(record);
       record.renderedS3 = undefined;
       record.renderedAt = undefined;
       record.renderedBy = undefined;
@@ -795,41 +841,6 @@ router.post("/:id/render", canWriteVouchers, async (req: any, res) => {
 });
 
 /**
- * GET /api/vouchers — the workspace queue.
- *
- * This replaces the old pair of listings: GET /my (own records) and GET /
- * (admin, everything in the workspace). They returned different slices of the
- * same collection under different guards, which is what made "who can see
- * what" ambiguous. There is now one list, scoped to the caller's workspace,
- * behind one grant.
- *
- * Explicit workspaceId filter: this route doesn't set the _workspaceId query
- * option, so the workspaceScope plugin won't auto-inject — workspaceId is the
- * tenancy boundary and must be in the filter directly.
- */
-router.get("/", canReadVouchers, async (req: any, res) => {
-  // DEPRECATED — the pre-redesign page's list. Kept, in its original array
-  // shape, only so that page keeps working between the backend and frontend
-  // deploys; the redesigned page reads GET /queue. The raw model response is
-  // never shown by that page, so it no longer ships here either.
-  const rows = (await VoucherExtraction.find({ ...voucherScope(req) })
-    .select("-rawModelResponse")
-    .sort({ createdAt: -1 })
-    .limit(200)
-    .lean()) as any[];
-
-  const { names, wsName } = await listNames(rows);
-
-  return res.json(
-    rows.map((r) => ({
-      ...r,
-      createdByName: nameOrUnknown(names.get(String(r.createdBy || ""))),
-      customerName: wsName.get(String(r.workspaceId || "")) || "",
-    })),
-  );
-});
-
-/**
  * Who uploaded each row and for which company, as names (never ids): one user
  * lookup and one workspace lookup for the whole page.
  */
@@ -852,7 +863,11 @@ const QUEUE_PAGE_MAX = 100;
  * Query: page (1-based), limit (≤100), status, type, review
  * (needs_review | not_rendered), q (search over the card summary fields).
  * Rows carry only what a list card shows — no extractedJson, rawModelResponse
- * or errorDetails; the detail pane reads GET /:id.
+ * or errorDetails; the detail pane reads GET /:id. This is the only list: the
+ * old GET / (newest 200 full documents) is gone.
+ *
+ * The workspace filter is explicit (voucherScope): these queries don't set the
+ * _workspaceId option, so the workspaceScope plugin won't inject one.
  */
 router.get("/queue", canReadVouchers, async (req: any, res) => {
   const page = Math.max(1, Math.floor(Number(req.query.page) || 1));
@@ -904,6 +919,8 @@ router.get("/queue", canReadVouchers, async (req: any, res) => {
         createdByName: nameOrUnknown(names.get(String(r.createdBy || ""))),
         customerName: wsName.get(String(r.workspaceId || "")) || "",
         rendered: !!r.renderedS3?.key,
+        // Retention removed the PDF; the card says so instead of "No PDF".
+        renderRemovedAt: !r.renderedS3?.key && r.renderDeletedAt ? r.renderDeletedAt : null,
         renderWarningCount: Array.isArray(r.meta?.renderWarnings) ? r.meta.renderWarnings.length : 0,
         needsReview: reviewReasons.length > 0,
         reviewReasons,
@@ -919,6 +936,11 @@ router.get("/queue", canReadVouchers, async (req: any, res) => {
  */
 router.get("/counts", canReadVouchers, async (req: any, res) => {
   const scope = voucherScope(req);
+  // F-05, on page load: the page reads /counts on load and on every poll.
+  // Records stuck in PROCESSING for 15+ minutes are failed ("Timed out")
+  // first, so the Processing count — which drives the page's polling — only
+  // counts extractions that can still finish. Same sweep as the daily job.
+  await VoucherExtraction.updateMany({ $and: [scope, stuckProcessingFilter()] }, timedOutUpdate());
   const now = Date.now();
   const since7 = new Date(now - 7 * 24 * 60 * 60 * 1000);
   const since30 = new Date(now - 30 * 24 * 60 * 60 * 1000);
@@ -959,9 +981,10 @@ router.get("/:id", canReadVouchers, async (req: any, res) => {
   const row: any = await findVoucherInScope(req, id).lean();
   if (!row) return res.status(404).json({ message: "Not found" });
 
-  // The dates as the PDF resolves them (year inferred where the voucher gave
-  // none), for the page's Summary. Read-only; never persisted.
-  return res.json({ ...row, displayDates: voucherDisplayDates(row) });
+  // The dates — and the hotel's cancellation lines — as the PDF resolves
+  // them, plus the refundability the PDF uses (three-state; older records
+  // stored a collapsed boolean), for the page's Summary. Read-only.
+  return res.json({ ...row, displayDates: voucherDisplayDates(row), statedNonRefundable: statedNonRefundable(row) });
 });
 
 /**
@@ -975,6 +998,13 @@ router.get("/:id/open", canReadVouchers, async (req: any, res) => {
 
     const row: any = await findVoucherInScope(req, id).lean();
     if (!row) return res.status(404).json({ message: "Not found" });
+
+    if (row.sourceDeletedAt) {
+      return res.status(410).json({
+        message: `Removed on ${fmtRetentionDate(row.sourceDeletedAt)} (retention policy)`,
+        sourceDeletedAt: row.sourceDeletedAt,
+      });
+    }
 
     const bucket = String(row?.s3?.bucket || env.S3_BUCKET);
     const key = String(row?.s3?.key || "");
@@ -1009,6 +1039,12 @@ router.get("/:id/open-rendered", canReadVouchers, async (req: any, res) => {
     const key = String(row?.renderedS3?.key || "");
 
     if (!bucket || !key) {
+      if (row.renderDeletedAt) {
+        return res.status(410).json({
+          message: `Removed on ${fmtRetentionDate(row.renderDeletedAt)} (retention policy). Regenerate it from the saved data.`,
+          renderDeletedAt: row.renderDeletedAt,
+        });
+      }
       return res.status(404).json({
         message: "Rendered PDF not available yet. Call POST /api/vouchers/:id/render",
       });
@@ -1057,6 +1093,7 @@ router.patch("/:id", canWriteVouchers, async (req: any, res) => {
     row.correctedAt = new Date();
 
     // ✅ Invalidate rendered PDF when corrected (forces re-render)
+    supersedeRender(row);
     row.renderedS3 = undefined;
     row.renderedAt = undefined;
     row.renderedBy = undefined;

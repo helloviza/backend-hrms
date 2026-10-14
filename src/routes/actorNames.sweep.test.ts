@@ -126,13 +126,13 @@ describe("Voucher Ops list (item 1)", () => {
       { workspaceId: WS, customerId: "ACME", createdBy: NEEL._id, docType: "flight", status: "SUCCESS", file: { originalName: "a.pdf" }, createdAt: new Date() },
       { workspaceId: WS, customerId: "ACME", createdBy: GONE_ID, docType: "hotel", status: "SUCCESS", file: { originalName: "b.pdf" }, createdAt: new Date() },
     ] as any[]);
-    const r = await as(request(app).get("/api/vouchers"));
+    const r = await as(request(app).get("/api/vouchers/queue"));
     expect(r.status).toBe(200);
-    expect(r.body.map((v: any) => [v.createdByName, v.customerName]).sort()).toEqual([
+    expect(r.body.items.map((v: any) => [v.createdByName, v.customerName]).sort()).toEqual([
       ["Neel Bhatia", "Acme Corp"],
       ["Unknown user", "Acme Corp"],
     ]);
-    expectNoRawIds("voucher list", r.body.flatMap((v: any) => [v.createdByName, v.customerName]));
+    expectNoRawIds("voucher list", r.body.items.flatMap((v: any) => [v.createdByName, v.customerName]));
   });
 });
 

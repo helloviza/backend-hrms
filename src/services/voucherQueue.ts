@@ -26,6 +26,8 @@ const RENDER_FAILED = {
   status: "SUCCESS",
   "errorDetails.stage": /RENDER/,
   "renderedS3.key": { $in: [null, ""] },
+  // A PDF removed by retention is not a failed render.
+  renderDeletedAt: null,
 };
 
 /** The last render left "Check before sending" warnings. */
@@ -44,9 +46,13 @@ export function needsReviewFilter(): Record<string, unknown> {
   return { $or: Object.values(NEEDS_REVIEW_REASONS) };
 }
 
-/** Extracted, with no rendered PDF. Separate from Needs review. */
+/**
+ * Extracted, with no rendered PDF. Separate from Needs review. A PDF that
+ * retention removed (renderDeletedAt) doesn't count: it was rendered, and
+ * Regenerate PDF brings it back from the JSON.
+ */
 export function notRenderedFilter(): Record<string, unknown> {
-  return { status: "SUCCESS", "renderedS3.key": { $in: [null, ""] } };
+  return { status: "SUCCESS", "renderedS3.key": { $in: [null, ""] }, renderDeletedAt: null };
 }
 
 const ESCAPE = /[.*+?^${}()|[\]\\]/g;
@@ -112,6 +118,7 @@ export const LIST_PROJECTION = {
   "file.mime": 1,
   createdAt: 1,
   "renderedS3.key": 1,
+  renderDeletedAt: 1,
   "meta.renderWarnings": 1,
   "extractedJson.hotel_details.name": 1,
   "extractedJson.hotel_details.city": 1,
@@ -183,5 +190,29 @@ export function listSummary(row: any) {
     nights: Number.isFinite(nights) && nights > 0 ? nights : null,
     leadGuest: str(v.guest_details?.primary_guest),
     paxCount: Number.isFinite(pax) && pax > 0 ? pax : null,
+  };
+}
+
+/**
+ * F-05. Extraction runs inside the upload request, so a record still
+ * PROCESSING 15 minutes after upload belongs to a request that died (crash,
+ * restart, abort, timeout). Nothing will ever finish it; without this the
+ * page polled it forever.
+ */
+export const PROCESSING_TIMEOUT_MS = 15 * 60 * 1000;
+
+export function stuckProcessingFilter(now: Date = new Date()): Record<string, unknown> {
+  return { status: "PROCESSING", createdAt: { $lt: new Date(now.getTime() - PROCESSING_TIMEOUT_MS) } };
+}
+
+/** What a timed-out record is set to. Applied with updateMany by the caller. */
+export function timedOutUpdate(now: Date = new Date()) {
+  return {
+    $set: {
+      status: "FAILED",
+      error: "Timed out",
+      errorDetails: { stage: "TIMED_OUT", message: "Still PROCESSING 15 minutes after upload; the extraction request never finished." },
+      timedOutAt: now,
+    },
   };
 }

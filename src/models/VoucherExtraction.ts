@@ -96,6 +96,35 @@ const VoucherExtractionSchema = new Schema(
     correctedBy: { type: Schema.Types.ObjectId, ref: "User", default: undefined },
     correctedAt: { type: Date, default: undefined },
 
+    /**
+     * Retention (services/voucherRetention.ts). A PDF replaced by a re-render,
+     * a correction or a fresh extraction is listed in supersededRenders until
+     * the retention run deletes it (deletedAt). The *DeletedAt / rawPurgedAt
+     * stamps record what retention removed and when; `s3` stays as the
+     * pointer to a deleted source (the schema requires it), renderedS3 is
+     * cleared when the PDF is removed.
+     */
+    supersededRenders: {
+      type: [
+        new Schema(
+          {
+            bucket: { type: String },
+            key: { type: String, required: true },
+            supersededAt: { type: Date, required: true },
+            deletedAt: { type: Date, default: undefined },
+          },
+          { _id: false },
+        ),
+      ],
+      default: undefined,
+    },
+    sourceDeletedAt: { type: Date, default: undefined },
+    renderDeletedAt: { type: Date, default: undefined },
+    rawPurgedAt: { type: Date, default: undefined },
+
+    /** Set when a record stuck in PROCESSING was failed with "Timed out" (F-05). */
+    timedOutAt: { type: Date, default: undefined },
+
     // Demo Platform — captured at extraction time from req.user.isDemoUser so the
     // voucher render path can watermark output without a downstream DB lookup.
     isDemo: { type: Boolean, default: false, index: true },

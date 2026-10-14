@@ -77,11 +77,13 @@ export interface TicketBooking {
 export declare function getWebCheckInUrl(airline: string, pnr: string): string;
 export declare function generateFlightSection(b: TicketBooking, segmentLabel: string): string;
 /**
- * One extra page for a leg beyond the first. `opts` lets a 3+ leg itinerary
- * title each page and number it correctly; the defaults reproduce the original
- * two-page round-trip wording exactly.
+ * One extra page for a leg beyond the first, titled by `rb.legLabel`.
+ *
+ * There is no "Page X of N": the HTML can't know how many pages the printer
+ * will make (one leg's content can run past A4), and counting legs printed
+ * "Page 1 of 1" on two-page PDFs. `_opts` is accepted for older callers.
  */
-export declare function generateReturnPageHTML(rb: TicketBooking, logoUrl?: string, opts?: {
+export declare function generateReturnPageHTML(rb: TicketBooking, logoUrl?: string, _opts?: {
     pageIndex?: number;
     totalPages?: number;
 }): Promise<string>;

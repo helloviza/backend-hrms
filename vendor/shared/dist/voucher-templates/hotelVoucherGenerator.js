@@ -172,6 +172,41 @@ export function parseAdditionalConditions(raw) {
         earlyCheckOutNote: "Early check-out will attract full cancellation charges unless otherwise specified.",
     };
 }
+/**
+ * The Cancellation Policy section's lines — the one place they are worked
+ * out. generateHotelVoucherHTML renders these, and the voucher page's Summary
+ * shows the same lines (backend voucherDisplayDates), so the two can't differ.
+ * null when the voucher prints no Cancellation Policy section at all.
+ */
+export function cancellationPolicyLines(p) {
+    const isExtracted = p.source === "extracted";
+    const cancelPolicies = p.cancelPolicies;
+    if (!(cancelPolicies.length > 0 || isExtracted))
+        return null;
+    const chips = buildCancellationChips(cancelPolicies, { checkOut: p.checkOut });
+    const deadlineStated = isExtracted ? (p.cancellationDeadline?.stated || "").trim() : "";
+    // A date-only deadline ends free cancellation at the start of that day; the
+    // generic chip would print the second before ("until 20 Jun 2026 23:59").
+    const chipLabel = (c) => deadlineStated && p.cancellationDeadline?.dateOnly && c.isFree && c.label.startsWith("Free cancellation until ")
+        ? `Free cancellation before ${deadlineStated}`
+        : c.label;
+    if (chips.length > 0)
+        return chips.map((c) => ({ text: chipLabel(c), tone: c.tone, kind: "chip" }));
+    // Extracted vouchers always state their cancellation position; when the
+    // document gave none, the honest line is "ask the supplier", never "free".
+    if (isExtracted) {
+        return [
+            {
+                text: deadlineStated
+                    ? `Cancellation deadline: ${deadlineStated}. Charges may apply after this, as per supplier policy.`
+                    : "As per supplier policy — contact support",
+                tone: "info",
+                kind: "info",
+            },
+        ];
+    }
+    return [{ text: "Free cancellation available", tone: "success", kind: "chip" }];
+}
 export async function generateHotelVoucherHTML(params) {
     // Defensive guard — protects against direct-URL bypass where a user could load
     // the voucher page before the booking has been reconciled with the hotel.
@@ -299,31 +334,17 @@ export async function generateHotelVoucherHTML(params) {
         : "";
     const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent((hotelName || "") + " " + (hotelAddress || ""))}`;
     const qrDataUrl = await generateQRDataUrl(mapsUrl);
-    const chips = buildCancellationChips(cancelPolicies, { checkOut });
-    // Extracted vouchers always state their cancellation position; when the
-    // document gave none, the honest line is "ask the supplier", never "free".
-    const infoChip = (text) => `<div style="background:${TONE_PALETTE.info.background};color:${TONE_PALETTE.info.color};border:1px solid ${TONE_PALETTE.info.border};padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;line-height:1.4;display:inline-block;">${esc(text)}</div>`;
-    const deadlineStated = isExtracted ? (cancellationDeadline?.stated || "").trim() : "";
-    const supplierPolicyChip = deadlineStated
-        ? infoChip(`Cancellation deadline: ${deadlineStated}. Charges may apply after this, as per supplier policy.`)
-        : infoChip("As per supplier policy — contact support");
-    // A date-only deadline ends free cancellation at the start of that day; the
-    // generic chip would print the second before ("until 20 Jun 2026 23:59").
-    const chipLabel = (c) => deadlineStated && cancellationDeadline?.dateOnly && c.isFree && c.label.startsWith("Free cancellation until ")
-        ? `Free cancellation before ${deadlineStated}`
-        : c.label;
-    const cancelSectionHtml = cancelPolicies.length > 0 || isExtracted
+    const cancelLines = cancellationPolicyLines({ cancelPolicies, checkOut, cancellationDeadline, source });
+    const cancelLineHtml = (l) => {
+        const palette = TONE_PALETTE[l.tone];
+        const icon = l.kind === "chip" ? `${chipIcon(l.tone)} ` : "";
+        return `<div style="background:${palette.background};color:${palette.color};border:1px solid ${palette.border};padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;line-height:1.4;display:inline-block;">${icon}${esc(l.text)}</div>`;
+    };
+    const cancelSectionHtml = cancelLines
         ? `<div style="margin-bottom:20px;">
   <h2 style="font-family:'Manrope',system-ui,sans-serif;font-size:11px;letter-spacing:1.5px;color:#0A1628;margin:0 0 16px 0;text-transform:uppercase;">Cancellation Policy</h2>
   <div style="font-family:'Manrope',system-ui,sans-serif;font-size:10px;color:#1a1a1a;line-height:1.6;display:flex;flex-direction:column;gap:6px;">
-    ${chips.length > 0
-            ? chips.map((c) => {
-                const palette = TONE_PALETTE[c.tone];
-                return `<div style="background:${palette.background};color:${palette.color};border:1px solid ${palette.border};padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;line-height:1.4;display:inline-block;">${chipIcon(c.tone)} ${esc(chipLabel(c))}</div>`;
-            }).join("")
-            : isExtracted
-                ? supplierPolicyChip
-                : `<div style="background:${TONE_PALETTE.success.background};color:${TONE_PALETTE.success.color};border:1px solid ${TONE_PALETTE.success.border};padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;line-height:1.4;display:inline-block;">${chipIcon("success")} Free cancellation available</div>`}
+    ${cancelLines.map(cancelLineHtml).join("")}
   </div>
 </div>
 <div style="height:1px;background:#e5e2db;margin-bottom:24px;"></div>`

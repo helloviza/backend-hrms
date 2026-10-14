@@ -1,5 +1,5 @@
 import type { OfferItem } from "./ticketGenerator.js";
-import { parseTBODate, isCancelDateValid as _isCancelDateValid } from "./cancellationPolicy.js";
+import { parseTBODate, isCancelDateValid as _isCancelDateValid, type CancellationTone } from "./cancellationPolicy.js";
 export declare const parseCancelDate: typeof parseTBODate;
 export declare const isCancelDateValid: typeof _isCancelDateValid;
 export declare function formatCancelDate(dateStr: string | null | undefined): string;
@@ -90,4 +90,21 @@ export interface HotelVoucherParams {
         dateOnly: boolean;
     } | null;
 }
+/**
+ * One line of the voucher's "Cancellation Policy" section, exactly as the PDF
+ * prints it. "chip" lines carry the tone's icon; "info" lines are a plain
+ * statement with no icon (the supplier-policy / stated-deadline line).
+ */
+export interface CancellationLine {
+    text: string;
+    tone: CancellationTone;
+    kind: "chip" | "info";
+}
+/**
+ * The Cancellation Policy section's lines — the one place they are worked
+ * out. generateHotelVoucherHTML renders these, and the voucher page's Summary
+ * shows the same lines (backend voucherDisplayDates), so the two can't differ.
+ * null when the voucher prints no Cancellation Policy section at all.
+ */
+export declare function cancellationPolicyLines(p: Pick<HotelVoucherParams, "cancelPolicies" | "checkOut" | "cancellationDeadline" | "source">): CancellationLine[] | null;
 export declare function generateHotelVoucherHTML(params: HotelVoucherParams): Promise<string>;

@@ -1371,6 +1371,11 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
         // TASKS: Daily digest at 10:00 AM IST
         const { startTaskDigestCron } = await import("./jobs/taskDigestCron.js");
         startTaskDigestCron();
+
+        // VOUCHERS: daily retention at 03:30 IST — deletes nothing unless
+        // VOUCHER_RETENTION_ENABLED=true (shipped off)
+        const { startVoucherRetentionCron } = await import("./jobs/voucherRetentionCron.js");
+        startVoucherRetentionCron();
       } else {
         logger.info("[WA-HOST] WA_HOST=true — running EOD + Sales Pulse crons only; all other crons/workers skipped on this host");
       }

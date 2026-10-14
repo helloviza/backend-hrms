@@ -265,6 +265,16 @@ export type RawCandidate = {
   }>;
 };
 
+/**
+ * Which instructions the extractor runs with.
+ *  - "default": the prompt every caller has always had. Manual-bookings
+ *    autofill (documentExtraction.service) and GeminiService use it, and its
+ *    request is pinned byte for byte by voucherExtractorGemini.request.test.ts.
+ *  - "voucher": /api/vouchers only. Adds VOUCHER_RULES to the system prompt
+ *    and temperature 0; nothing else about the request changes.
+ */
+export type VoucherPromptVariant = "default" | "voucher";
+
 /* ───────────────────────── Gemini response schema for RAW contract ───────────────────────── */
 
 const nstr = { type: Type.STRING, nullable: true } as const;
@@ -426,6 +436,24 @@ const rawSchema = {
   },
   required: ["detected_type"],
 } as const;
+
+/**
+ * Appended to the default system prompt for the "voucher" variant. The output
+ * becomes a document the traveller carries. Every date is copied exactly as
+ * printed — never reformatted — so the model has no occasion to supply a
+ * year: voucherDates parses the printed text, infers a missing year, checks
+ * it against the weekday and marks it "(year assumed)". (Tested: a
+ * model-picked year was wrong — Tue 29 Sept → 2024, a Sunday — and asking
+ * for YYYY-MM-DD led it to copy the booking date's year onto year-less dates.) Stay perks belong with what's included, and a payment
+ * deadline must never read as the last day to cancel for free.
+ */
+const VOUCHER_RULES = `
+Voucher rules (this extraction becomes the traveller's voucher):
+- Dates and times: copy every date and time exactly as printed on the document, including any weekday, month word, separators and time zone (e.g. "Tue 29 Sept", "OCT 15", "15-Oct-2026", "Fri, Oct 02 2026", "25 Dec, 11:59 PM IST"). Never reformat a date, and never add, guess or infer a year — not even from another date on the page.
+- Keep a relative cancellation deadline as written (e.g. "10 days prior to arrival").
+- Stay perks — early check-in, late check-out, Wi-Fi, meals such as breakfast — go in hotel.inclusions[], not in policies.notes[]. A perk that costs extra stays in policies.notes[].
+- A pay-by date, payment deadline or "complete payment before" date is NOT a cancellation deadline. Never put it in policies.cancellation_deadline. Fill cancellation_deadline only when the document says when free cancellation ends or when cancellation charges begin.
+`.trim();
 
 /* ───────────────────────── validate normalized voucher (strict shape) ───────────────────────── */
 
@@ -685,8 +713,10 @@ async function generateRawCandidate(args: {
   portalHint?: string | null;
   logo: string;
   repairFocus?: string | null;
+  promptVariant: VoucherPromptVariant;
 }): Promise<{ raw: RawCandidate; rawText: string }> {
-  const { ai, model, base64, mimeType, voucherTypeHint, portalHint, logo, repairFocus } = args;
+  const { ai, model, base64, mimeType, voucherTypeHint, portalHint, logo, repairFocus, promptVariant } = args;
+  const isVoucher = promptVariant === "voucher";
 
   const systemPrompt = `
 You are PlumTrips enterprise voucher extraction.
@@ -717,6 +747,8 @@ Hotels:
 Never invent values.
 Branding/logo is handled by backend = "${logo}".
 `.trim();
+  // The default prompt above is untouched; the voucher variant only appends.
+  const systemInstruction = isVoucher ? `${systemPrompt}\n\n${VOUCHER_RULES}` : systemPrompt;
 
   const userText = `
 Extract this voucher into the RAW contract schema (not final PlumtripsVoucher).
@@ -731,9 +763,12 @@ ${repairFocus ? `Repair focus:\n${repairFocus}\n` : ""}
       parts: [{ text: userText }, { inlineData: { data: base64, mimeType } }],
     },
     config: {
-      systemInstruction: systemPrompt,
+      systemInstruction,
       responseMimeType: "application/json",
       responseSchema: rawSchema as any,
+      // Voucher variant only: the same document should read the same way
+      // every time. The default request carries no temperature (unchanged).
+      ...(isVoucher ? { temperature: 0 } : {}),
     },
   });
 
@@ -758,8 +793,11 @@ export async function extractVoucherViaGemini(opts: {
   voucherType: VoucherType;
   customLogoUrl?: string | null;
   portalHint?: string | null;
+  /** Omit (or "default") for the unchanged prompt; /api/vouchers passes "voucher". */
+  promptVariant?: VoucherPromptVariant;
 }): Promise<{ parsed: PlumtripsVoucher; raw: any }> {
   const ai = getAI();
+  const promptVariant: VoucherPromptVariant = opts.promptVariant === "voucher" ? "voucher" : "default";
   const modelName = (process.env.GEMINI_MODEL && process.env.GEMINI_MODEL.trim()) || DEFAULT_MODEL;
 
   const logo = safeLogo(opts.customLogoUrl);
@@ -778,6 +816,7 @@ export async function extractVoucherViaGemini(opts: {
       voucherTypeHint: opts.voucherType,
       portalHint: opts.portalHint,
       logo,
+      promptVariant,
       repairFocus: null,
     });
     raw1 = r1.raw;
@@ -792,6 +831,7 @@ export async function extractVoucherViaGemini(opts: {
       voucherTypeHint: opts.voucherType,
       portalHint: opts.portalHint,
       logo,
+      promptVariant,
       repairFocus: "Previous attempt returned invalid JSON. Output strictly valid JSON only.",
     });
     raw1 = r2.raw;
@@ -823,6 +863,7 @@ export async function extractVoucherViaGemini(opts: {
       voucherTypeHint: opts.voucherType,
       portalHint: opts.portalHint,
       logo,
+      promptVariant,
       repairFocus: focus,
     });
 

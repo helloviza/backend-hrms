@@ -276,13 +276,11 @@ describe("filters, search, paging", () => {
   });
 });
 
-describe("legacy GET /api/vouchers (kept for the deploy gap)", () => {
-  it("keeps its array shape but no longer ships the raw model response", async () => {
+describe("the old GET /api/vouchers list", () => {
+  it("is gone — the page reads /queue", async () => {
     await col().insertOne(hotel());
     const r = await asA(request(app).get("/api/vouchers"));
-    expect(Array.isArray(r.body)).toBe(true);
-    expect(r.body[0].extractedJson).toBeTruthy(); // the old page edits it
-    expect(r.body[0]).not.toHaveProperty("rawModelResponse");
+    expect(r.status).toBe(404);
   });
 });
 
@@ -300,7 +298,8 @@ describe("GET /api/vouchers/counts — the stat cards", () => {
       hotel({ createdAt: ago(10), meta: { renderWarnings: ["Check-out year inferred"] } }),
       flight({ createdAt: ago(3), status: "FAILED" }),
       flight({ createdAt: ago(40) }),
-      hotel({ createdAt: ago(2), status: "PROCESSING" }),
+      // still inside the 15-minute window, so /counts doesn't time it out (F-05)
+      hotel({ createdAt: new Date(Date.now() - 60_000), status: "PROCESSING" }),
       // another workspace — must never be counted for WS_A
       hotel({ workspaceId: WS_B, createdAt: ago(1), status: "FAILED" }),
     ]);
