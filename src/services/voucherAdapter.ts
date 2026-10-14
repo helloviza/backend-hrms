@@ -44,6 +44,7 @@ import {
 } from "@plumtrips/shared/voucher-templates/cancellationPolicy";
 import logger from "../utils/logger.js";
 import { statedNonRefundable } from "./voucherNormalize.js";
+import { leadingCount } from "@plumtrips/shared/voucher-templates/counts";
 import {
   buildDateContext,
   fmtDay,
@@ -494,12 +495,23 @@ function splitPerks(notes: string[], inclusions: string[]): { inclusions: string
 }
 
 /**
+ * Booking-agency support lines that suppliers' pages show where the hotel's
+ * number should be. Never printed as the hotel's phone. Keyed on the last 10
+ * digits, so "0124-4998999", "+91 124 4998999" and "1244998999" all match.
+ */
+export const AGENCY_SUPPORT_NUMBERS: Readonly<Record<string, string>> = {
+  "1244998999": "TBO support (\"Call us at\" on TBO booking pages; seen on 11 different hotels)",
+  "8826843266": "Plumtrips (the agent's own line)",
+};
+
+/**
  * The hotel's phone number(s) out of the extracted contact line, which mixes
  * phones, emails and URLs ("9151915166, 05224606555, reservations@…"). Keeps
  * up to two numbers — later ones are often an aggregator's support lines —
  * and treats "+919880888999" and "9880888999" as one. Returns null for the
  * literal "null" older records hold, and for a contact block carrying a
- * plumtrips.com address: that is our own agent's line, not the hotel's.
+ * plumtrips.com address: that is our own agent's line, not the hotel's. A
+ * known agency support number (AGENCY_SUPPORT_NUMBERS) is skipped too.
  */
 export function hotelPhoneFrom(x: unknown): string | null {
   const s = nz(x).trim();
@@ -512,7 +524,7 @@ export function hotelPhoneFrom(x: unknown): string | null {
     const digits = t.replace(/\D/g, "");
     if (digits.length < 6) continue;
     const key = digits.slice(-10);
-    if (seen.has(key)) continue;
+    if (seen.has(key) || AGENCY_SUPPORT_NUMBERS[key]) continue;
     seen.add(key);
     phones.push(t);
     if (phones.length === 2) break;
@@ -520,12 +532,6 @@ export function hotelPhoneFrom(x: unknown): string | null {
   return phones.length ? phones.join(", ") : null;
 }
 
-/** A count the voucher states ("2", "2 rooms", 3); null for 0 / absent / unreadable. */
-function positiveInt(x: unknown): number | null {
-  const m = String(x ?? "").match(/\d+/);
-  const n = m ? Number(m[0]) : NaN;
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
 
 /** First name for the greeting (mirrors the template's own extractFirstName). */
 function firstNameOf(fullName?: string | null): string {
@@ -725,11 +731,12 @@ export function adaptHotel(v: PlumtripsVoucher, ctx?: AdaptContext): HotelVouche
     inclusions: sorted.inclusions,
     // Each part prints only when the voucher states it (H-05).
     stayFacts: {
-      nights: positiveInt(stay.total_nights),
-      adults: positiveInt(guest.adults),
-      children: positiveInt(guest.children),
-      guests: positiveInt(guest.total_pax),
-      rooms: positiveInt(room.no_of_rooms),
+      // Counts arrive as printed ("1 night", "2 adults"); leadingCount is the one reader.
+      nights: leadingCount(stay.total_nights),
+      adults: leadingCount(guest.adults),
+      children: leadingCount(guest.children),
+      guests: leadingCount(guest.total_pax),
+      rooms: leadingCount(room.no_of_rooms),
     },
     specialRequests: nz(room.special_requests) || null,
     cancelPolicies: cancel.policies, // Guard (c)

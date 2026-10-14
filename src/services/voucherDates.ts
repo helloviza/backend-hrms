@@ -20,6 +20,8 @@
 //   - Anything a person should double-check is pushed to `warnings` as one
 //     plain sentence for ops. Nothing here throws or blocks a render.
 
+import { leadingCount } from "@plumtrips/shared/voucher-templates/counts";
+
 const MONTHS: Record<string, number> = {
   jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
   apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6,
@@ -248,8 +250,10 @@ export function resolveStayDates(
   totalNights: string | number | null | undefined,
   ctx: DateContext,
 ): { checkIn: Date | null; checkOut: Date | null } {
-  const nights = Number.parseInt(String(totalNights ?? ""), 10);
-  const hasNights = Number.isFinite(nights) && nights > 0;
+  // "1 night" / "3 Nights" / 3 → the stated count (leadingCount); "one night" → none.
+  const stated = leadingCount(totalNights);
+  const nights = stated ?? NaN;
+  const hasNights = stated !== null;
 
   const ciParts = parseDateParts(checkInRaw);
   const coParts = parseDateParts(checkOutRaw);

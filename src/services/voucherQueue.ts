@@ -12,6 +12,8 @@
 // warnings. "Not rendered" (SUCCESS with no rendered PDF) is a separate
 // filter and is NOT part of Needs review.
 
+import { leadingCount } from "@plumtrips/shared/voucher-templates/counts";
+
 /** A record whose extraction failed. */
 const FAILED = { status: "FAILED" };
 
@@ -179,17 +181,18 @@ export function listSummary(row: any) {
       paxCount: pax.length || null,
     };
   }
-  const nights = Number(v.stay_details?.total_nights);
-  const pax = Number(v.guest_details?.total_pax);
+  // Counts arrive as printed ("1 night"); leadingCount reads them like the PDF does.
+  const nights = leadingCount(v.stay_details?.total_nights);
+  const pax = leadingCount(v.guest_details?.total_pax);
   return {
     ...common,
     hotel: str(v.hotel_details?.name),
     city: str(v.hotel_details?.city),
     checkIn: str(v.stay_details?.check_in_date),
     checkOut: str(v.stay_details?.check_out_date),
-    nights: Number.isFinite(nights) && nights > 0 ? nights : null,
+    nights,
     leadGuest: str(v.guest_details?.primary_guest),
-    paxCount: Number.isFinite(pax) && pax > 0 ? pax : null,
+    paxCount: pax,
   };
 }
 
